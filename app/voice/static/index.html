@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HR Screening — Browser Test</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { font-family: system-ui, sans-serif; background:#0b0f17; color:#e6edf3;
+           display:grid; place-items:center; min-height:100vh; margin:0; }
+    .card { background:#131a26; border:1px solid #243044; border-radius:16px;
+            padding:32px; width:min(420px,90vw); text-align:center; }
+    h1 { font-size:1.2rem; margin:0 0 4px; }
+    p { color:#9aa7b8; font-size:.9rem; margin:.25rem 0 1.25rem; }
+    button { font-size:1rem; padding:12px 22px; border-radius:10px; border:0;
+             cursor:pointer; background:#3b82f6; color:#fff; }
+    button:disabled { opacity:.5; cursor:default; }
+    #status { margin-top:16px; font-size:.85rem; color:#9aa7b8; min-height:1.2em; }
+    .dot { display:inline-block; width:8px; height:8px; border-radius:50%;
+           background:#475569; margin-right:6px; }
+    .dot.live { background:#22c55e; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Screening with Maya</h1>
+    <p>Click start, allow your mic, and talk. Maya screens you and the call is recorded.</p>
+    <button id="btn">Start screening</button>
+    <div id="status"><span class="dot" id="dot"></span><span id="msg">idle</span></div>
+  </div>
+  <audio id="audio" autoplay></audio>
+
+  <script>
+    const btn = document.getElementById('btn');
+    const msg = document.getElementById('msg');
+    const dot = document.getElementById('dot');
+    let pc;
+
+    function setStatus(t, live=false) { msg.textContent = t; dot.classList.toggle('live', live); }
+
+    btn.onclick = async () => {
+      btn.disabled = true; setStatus('requesting mic…');
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: false,
+        }
+      });
+      pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+      // pipecat's client opens a data channel (RTVI/app messages) — create it BEFORE
+      // the offer so the m-line is negotiated.
+      pc.createDataChannel('pipecat');
+      // ONE audio transceiver at index 0 (sendrecv): mic in AND bot audio out share it.
+      stream.getTracks().forEach(t => pc.addTrack(t, stream));
+      pc.ontrack = (e) => { document.getElementById('audio').srcObject = e.streams[0]; };
+      pc.onconnectionstatechange = () => setStatus(pc.connectionState, pc.connectionState === 'connected');
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      // Wait for ICE gathering to COMPLETE so the offer carries candidates
+      // (we don't trickle). Without this the server can't receive our mic media.
+      await new Promise((resolve) => {
+        if (pc.iceGatheringState === 'complete') return resolve();
+        const check = () => {
+          if (pc.iceGatheringState === 'complete') {
+            pc.removeEventListener('icegatheringstatechange', check);
+            resolve();
+          }
+        };
+        pc.addEventListener('icegatheringstatechange', check);
+        setTimeout(resolve, 3000); // safety fallback
+      });
+
+      // personalize via query string: ?candidate_id=&role_id=&name=&role=
+      const q = Object.fromEntries(new URLSearchParams(location.search));
+      setStatus('connecting…');
+      const res = await fetch('/api/offer', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type, ...q }),
+      });
+      const answer = await res.json();
+      await pc.setRemoteDescription(answer);
+    };
+  </script>
+</body>
+</html>

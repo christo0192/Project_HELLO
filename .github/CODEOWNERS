@@ -1,0 +1,10 @@
+# Bootstrap owner. Replace or extend with company-controlled Engineering and
+# Security teams when those teams exist. See .github/BRANCH_PROTECTION.md.
+* @christo0192
+
+# Security-sensitive paths require the security owner as well as engineering.
+/.github/ @christo0192
+/app/api/ @christo0192
+/app/supabase/ @christo0192
+/app/voice-livekit/ @christo0192
+/infra/ @christo0192

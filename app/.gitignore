@@ -1,0 +1,18 @@
+# secrets
+**/.env
+!**/.env.example
+
+# python
+voice/.venv/
+**/__pycache__/
+*.pyc
+
+# node
+api/node_modules/
+web/node_modules/
+web/dist/
+api/dist/
+
+# runtime
+voice/recordings/
+*.log

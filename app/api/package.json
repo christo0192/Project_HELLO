@@ -1,0 +1,36 @@
+{
+  "name": "hr-screening-bot-api",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Backend API for the AI HR screening bot (claude -p brain + Supabase screening_v2). Voice handled by a separate Python service.",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "seed": "tsx scripts/seed.ts",
+    "seed:advisor": "tsx scripts/seed-program-advisor.ts",
+    "smoke:brain": "tsx scripts/smoke-brain.ts",
+    "smoke:http": "tsx scripts/smoke-http.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "libphonenumber-js": "^1.11.0",
+    "livekit-server-sdk": "^2.16.0",
+    "mammoth": "^1.8.0",
+    "multer": "^2.2.0",
+    "pdf-parse": "^1.1.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/multer": "^1.4.13",
+    "@types/node": "^20.14.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  }
+}

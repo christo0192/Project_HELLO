@@ -1,0 +1,76 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+!**/.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+credentials*.json
+service-account*.json
+
+# JavaScript dependencies and build output
+node_modules/
+dist/
+dist-ssr/
+build/
+.vite/
+.turbo/
+.next/
+coverage/
+*.tsbuildinfo
+
+# Python environments and generated files
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.bak
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+
+# Runtime data and logs
+recordings/
+uploads/
+exports/
+tmp/
+temp/
+*.log
+*.pid
+*.sqlite
+*.sqlite3
+
+# Historical implementations and stale planning are quarantined until reviewed
+_archive/
+.gsd/
+REBUILD_PLAN.md
+docs/session-handover-*.md
+
+# Candidate media and generated evidence are quarantined until FND-03
+docs/HELLO.html
+docs/HELLO.md
+docs/hello-assets/
+docs/*.pdf
+*.webm
+*.wav
+*.m4a
+*.mp4
+*.mov
+*.mp3
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.sw?
+*.suo
+*.ntvs*
+*.njsproj
+*.sln

@@ -1,0 +1,12 @@
+title = "Screening bot secret scanning"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Unmistakable documentation placeholders"
+regexTarget = "match"
+regexes = [
+  '''(?i)replace[_-]?me''',
+  '''(?i)example[._ -]?(company|candidate|project|role)''',
+]

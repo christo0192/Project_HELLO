@@ -1,0 +1,14 @@
+# Voice service (Python / Pipecat). Runs the live screening call.
+# pipecat module paths shift between minor versions; pin and expect minor import tweaks.
+pipecat-ai[silero,anthropic,sarvam,webrtc,local]==1.4.0
+
+sarvamai>=0.1.6          # Sarvam STT streaming SDK (saaras:v3)
+python-dotenv>=1.0
+loguru>=0.7
+supabase>=2.4            # persistence via REST (schema screening_v2)
+fastapi>=0.115           # browser (WebRTC) signaling server
+uvicorn[standard]>=0.30
+
+# LocalAudioTransport (run_local.py) needs PortAudio bindings.
+# Windows: if `pip install pyaudio` fails -> `pip install pipwin && pipwin install pyaudio`
+pyaudio>=0.2.14
