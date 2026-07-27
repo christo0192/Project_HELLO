@@ -1,6 +1,6 @@
 # Project Handover
 
-**Last updated:** 2026-07-27 14:59 UTC
+**Last updated:** 2026-07-27 15:04 UTC
 
 **Repository:** `https://github.com/christo0192/Project_HELLO`
 
@@ -11,9 +11,9 @@
 ## Resume Here
 
 The repository is on branch `feat/sec-05-api-validation`, based on `main` commit
-`4955736`. SEC-05 request validation is implemented and is being prepared for a
-pull request. Do not treat SEC-05 as complete until that PR is reviewed and
-merged.
+`4955736`. SEC-05 request validation is implemented in
+[PR #3](https://github.com/christo0192/Project_HELLO/pull/3). Do not treat SEC-05
+as complete until that PR is reviewed and merged.
 
 When resuming after the PR is merged:
 
@@ -37,7 +37,7 @@ to `main`.
 | FND-01 repository setup | Partial | Git/CODEOWNERS/PR workflow exist; branch protection is unavailable on the current private GitHub plan |
 | FND-04 environment contract | Complete | [PR #1](https://github.com/christo0192/Project_HELLO/pull/1), merged 2026-07-27 |
 | FND-07 architecture decisions | Complete | [PR #2](https://github.com/christo0192/Project_HELLO/pull/2), merged 2026-07-27 |
-| SEC-05 API input validation | In review | Branch `feat/sec-05-api-validation`; PR link will be added after creation |
+| SEC-05 API input validation | In review | [PR #3](https://github.com/christo0192/Project_HELLO/pull/3), opened 2026-07-27 |
 
 SEC-05 adds strict Zod schemas for accepted body, path, query, and multipart
 field inputs; stable malformed/oversized request responses; sanitized unexpected
