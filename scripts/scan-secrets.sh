@@ -4,18 +4,22 @@ set -eu
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 gitleaks_image=${GITLEAKS_IMAGE:-zricethezav/gitleaks:v8.30.1}
+verbose_flag=
+if [ "${GITLEAKS_VERBOSE:-0}" = "1" ]; then
+  verbose_flag=--verbose
+fi
 
 if [ "${1:-}" = "--staged" ]; then
   if command -v gitleaks >/dev/null 2>&1; then
     git diff --cached --no-ext-diff --binary | \
-      gitleaks stdin --redact --config .gitleaks.toml
+      gitleaks stdin --redact $verbose_flag --config .gitleaks.toml
     exit $?
   fi
 
   if command -v docker >/dev/null 2>&1; then
     git diff --cached --no-ext-diff --binary | \
       docker run --rm -i -v "$repo_root:/repo:ro" -w /repo \
-        "$gitleaks_image" stdin --redact --config .gitleaks.toml
+        "$gitleaks_image" stdin --redact $verbose_flag --config .gitleaks.toml
     exit $?
   fi
 
@@ -44,14 +48,14 @@ else
 fi
 
 if command -v gitleaks >/dev/null 2>&1; then
-  gitleaks dir --redact --max-archive-depth=1 --max-decode-depth=2 \
+  gitleaks dir --redact $verbose_flag --max-archive-depth=1 --max-decode-depth=2 \
     --config .gitleaks.toml "$scan_root"
   exit $?
 fi
 
 if command -v docker >/dev/null 2>&1; then
   docker run --rm -v "$repo_root:/repo:ro" -v "$scan_root:/scan:ro" \
-    -w /repo "$gitleaks_image" dir --redact --max-archive-depth=1 \
+    -w /repo "$gitleaks_image" dir --redact $verbose_flag --max-archive-depth=1 \
     --max-decode-depth=2 --config .gitleaks.toml /scan
   exit $?
 fi
