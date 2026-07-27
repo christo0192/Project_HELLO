@@ -28,9 +28,9 @@ jobs:
         run: node scripts/check-env-contract.mjs && node scripts/check-env-contract.test.mjs
       - name: Validate architecture decision records
         run: node scripts/check-adrs.mjs
-      - name: Install and typecheck API
+      - name: Install, typecheck, and test API
         working-directory: app/api
-        run: npm ci && npm run typecheck
+        run: npm ci && npm run typecheck && npm test
       - name: Install, lint, and build web
         working-directory: app/web
         run: npm ci && npm run lint && npm run build

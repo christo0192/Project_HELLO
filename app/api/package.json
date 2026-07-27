@@ -11,7 +11,8 @@
     "seed:advisor": "tsx scripts/seed-program-advisor.ts",
     "smoke:brain": "tsx scripts/smoke-brain.ts",
     "smoke:http": "tsx scripts/smoke-http.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
@@ -30,7 +31,11 @@
     "@types/express": "^4.17.21",
     "@types/multer": "^1.4.13",
     "@types/node": "^20.14.0",
+    "@types/supertest": "^7.2.1",
+    "fast-check": "^4.9.0",
+    "supertest": "^7.2.2",
     "tsx": "^4.16.0",
-    "typescript": "^5.5.0"
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.10"
   }
 }
