@@ -26,6 +26,8 @@ jobs:
             app/web/package-lock.json
       - name: Validate environment contract
         run: node scripts/check-env-contract.mjs && node scripts/check-env-contract.test.mjs
+      - name: Validate architecture decision records
+        run: node scripts/check-adrs.mjs
       - name: Install and typecheck API
         working-directory: app/api
         run: npm ci && npm run typecheck
