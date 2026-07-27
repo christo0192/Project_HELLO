@@ -154,11 +154,11 @@ def _metadata_from_livekit(ctx: Any) -> dict[str, Any]:
 
 
 def _metadata_from_env() -> dict[str, Any]:
-    merged = _json_object(os.getenv("GOPU_CONTEXT_JSON") or os.getenv("MAYA_CONTEXT_JSON"))
-    merged.setdefault("candidate_name", os.getenv("GOPU_CANDIDATE_NAME") or os.getenv("MAYA_CANDIDATE_NAME"))
-    merged.setdefault("role_title", os.getenv("GOPU_ROLE_TITLE") or os.getenv("MAYA_ROLE_TITLE"))
-    merged.setdefault("role_focus", os.getenv("GOPU_ROLE_FOCUS") or os.getenv("MAYA_ROLE_FOCUS"))
-    merged.setdefault("resume_facts", os.getenv("GOPU_RESUME_FACTS") or os.getenv("MAYA_RESUME_FACTS"))
+    merged = _json_object(os.getenv("GOPU_CONTEXT_JSON"))
+    merged.setdefault("candidate_name", os.getenv("GOPU_CANDIDATE_NAME"))
+    merged.setdefault("role_title", os.getenv("GOPU_ROLE_TITLE"))
+    merged.setdefault("role_focus", os.getenv("GOPU_ROLE_FOCUS"))
+    merged.setdefault("resume_facts", os.getenv("GOPU_RESUME_FACTS"))
     return {key: _clean_text(value) for key, value in merged.items() if value not in (None, "")}
 
 

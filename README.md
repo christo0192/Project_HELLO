@@ -12,6 +12,7 @@ P0 gates in `PLAN.md` are complete.
 - `PLAN.md`: production-readiness roadmap, architecture, decisions, and launch
   gates.
 - `app/README.md`: current runtime map and local development entry points.
+- `docs/configuration.md`: environment separation and validation contract.
 - `docs/repository-inventory.md`: Foundation inventory and quarantine state.
 
 Phase 0 Foundation is active. Historical implementation notes and candidate
