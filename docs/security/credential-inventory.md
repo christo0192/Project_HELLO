@@ -36,7 +36,8 @@ does not count as rotation.
 ## Scanner state
 
 - A redacted gitleaks configuration, native pre-commit hook, and CI workflow are
-  present.
-- The local gitleaks binary is not currently installed, so a clean tool-produced
-  report has not yet been captured.
-- Placeholder CODEOWNERS and the absent private remote prevent CI enforcement.
+  present. The hook falls back to pinned Docker image `v8.30.1`.
+- The bootstrap/commit-eligible tree passed a redacted tool scan with zero
+  findings; the GitHub secret-scan workflow also passed on `main`.
+- Local ignored credentials and quarantined evidence remain outside that clean
+  commit set and still require provider rotation and FND-03 disposition.

@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "components": {
+    "api": {
+      "example": "app/api/.env.example",
+      "sourceRoots": ["app/api/src"],
+      "variables": {
+        "SUPABASE_URL": { "requiredInProduction": true, "secret": false },
+        "SUPABASE_SERVICE_ROLE_KEY": { "requiredInProduction": true, "secret": true },
+        "SUPABASE_SCHEMA": { "requiredInProduction": true, "secret": false },
+        "CLAUDE_MODEL": { "requiredInProduction": true, "secret": false },
+        "CLAUDE_SCORING_MODEL": { "requiredInProduction": true, "secret": false },
+        "COMPANY_NAME": { "requiredInProduction": true, "secret": false },
+        "CLAUDE_BIN": { "requiredInProduction": true, "secret": false },
+        "CLAUDE_TIMEOUT_MS": { "requiredInProduction": true, "secret": false },
+        "PORT": { "requiredInProduction": true, "secret": false },
+        "WEB_ORIGIN": { "requiredInProduction": true, "secret": false },
+        "LIVEKIT_URL": { "requiredInProduction": true, "secret": false },
+        "LIVEKIT_API_KEY": { "requiredInProduction": true, "secret": true },
+        "LIVEKIT_API_SECRET": { "requiredInProduction": true, "secret": true },
+        "RECORDINGS_BUCKET": { "requiredInProduction": true, "secret": false }
+      }
+    },
+    "web": {
+      "example": "app/web/.env.example",
+      "sourceRoots": ["app/web/src"],
+      "variables": {
+        "VITE_API_BASE": { "requiredInProduction": true, "secret": false },
+        "VITE_SUPABASE_URL": { "requiredInProduction": true, "secret": false },
+        "VITE_SUPABASE_ANON_KEY": { "requiredInProduction": true, "secret": false }
+      }
+    },
+    "voice-livekit": {
+      "example": "app/voice-livekit/.env.example",
+      "sourceRoots": ["app/voice-livekit"],
+      "variables": {
+        "ANTHROPIC_API_KEY": { "requiredInProduction": true, "secret": true, "external": true },
+        "SARVAM_API_KEY": { "requiredInProduction": true, "secret": true, "external": true },
+        "COMPANY_NAME": { "requiredInProduction": true, "secret": false },
+        "ANTHROPIC_MODEL": { "requiredInProduction": true, "secret": false },
+        "SARVAM_STT_MODEL": { "requiredInProduction": true, "secret": false },
+        "SARVAM_LANGUAGE": { "requiredInProduction": true, "secret": false },
+        "SARVAM_TTS_MODEL": { "requiredInProduction": true, "secret": false },
+        "SARVAM_TTS_VOICE": { "requiredInProduction": true, "secret": false },
+        "LIVEKIT_VAD_ACTIVATION_THRESHOLD": { "requiredInProduction": true, "secret": false },
+        "LIVEKIT_VAD_MIN_SPEECH_DURATION": { "requiredInProduction": true, "secret": false },
+        "LIVEKIT_VAD_MIN_SILENCE_DURATION": { "requiredInProduction": true, "secret": false },
+        "LIVEKIT_VAD_PREFIX_PADDING_DURATION": { "requiredInProduction": true, "secret": false },
+        "LIVEKIT_MIN_ENDPOINTING_DELAY": { "requiredInProduction": true, "secret": false },
+        "LIVEKIT_MAX_ENDPOINTING_DELAY": { "requiredInProduction": true, "secret": false },
+        "LIVEKIT_MIN_INTERRUPTION_DURATION": { "requiredInProduction": true, "secret": false },
+        "LIVEKIT_MIN_INTERRUPTION_WORDS": { "requiredInProduction": true, "secret": false },
+        "LIVEKIT_FALSE_INTERRUPTION_TIMEOUT": { "requiredInProduction": true, "secret": false },
+        "GOPU_CANDIDATE_NAME": { "requiredInProduction": false, "secret": false, "productionAllowed": false },
+        "GOPU_ROLE_TITLE": { "requiredInProduction": false, "secret": false, "productionAllowed": false },
+        "GOPU_ROLE_FOCUS": { "requiredInProduction": false, "secret": false, "productionAllowed": false },
+        "GOPU_RESUME_FACTS": { "requiredInProduction": false, "secret": false, "productionAllowed": false },
+        "GOPU_CONTEXT_JSON": { "requiredInProduction": false, "secret": false, "productionAllowed": false },
+        "LIVEKIT_URL": { "requiredInProduction": true, "secret": false, "external": true },
+        "LIVEKIT_API_KEY": { "requiredInProduction": true, "secret": true, "external": true },
+        "LIVEKIT_API_SECRET": { "requiredInProduction": true, "secret": true, "external": true },
+        "SUPABASE_URL": { "requiredInProduction": true, "secret": false },
+        "SUPABASE_SERVICE_ROLE_KEY": { "requiredInProduction": true, "secret": true },
+        "SUPABASE_SCHEMA": { "requiredInProduction": true, "secret": false },
+        "API_BASE": { "requiredInProduction": true, "secret": false }
+      }
+    }
+  }
+}

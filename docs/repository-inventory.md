@@ -4,7 +4,7 @@
 
 **Plan task:** FND-01
 
-**State:** Git initialized locally on `main`; no commit. GitHub `origin` configured.
+**State:** Bootstrap pushed to private GitHub `main`; PR workflow active by convention.
 
 ## Maintained product areas
 
@@ -37,7 +37,9 @@ review and must not be committed in their current form:
 
 ## External completion required
 
-FND-01 is not complete until an Engineering Lead confirms the company-controlled
-private remote, adds company teams to CODEOWNERS when available, configures the
-`main` rules in `.github/BRANCH_PROTECTION.md`, and captures enforcement evidence.
-The first commit remains prohibited until FND-02 and FND-03 pass.
+The private remote and bootstrap CODEOWNER are configured. GitHub returned HTTP
+403 when branch protection was applied because the private repository's current
+plan does not include that feature. FND-01 remains incomplete until the plan is
+upgraded (or an approved equivalent control is selected), company teams are
+added, the rules in `.github/BRANCH_PROTECTION.md` are enforced, and evidence is
+captured.
