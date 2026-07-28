@@ -1,6 +1,6 @@
 # Project Handover
 
-**Last updated:** 2026-07-28 07:00 UTC
+**Last updated:** 2026-07-28 07:46 UTC
 
 **Repository:** `https://github.com/christo0192/Project_HELLO`
 
@@ -12,7 +12,8 @@
 
 The repository is on branch `feat/sec-10-dependency-policy`, based on merge
 commit `8d54a7092759ad72b7da9750bc9a4c54de5de33c` (PR #3 merged). SEC-10
-dependency policy is in progress on this branch.
+dependency policy is in review in
+[PR #4](https://github.com/christo0192/Project_HELLO/pull/4).
 
 When resuming after the branch is merged:
 
@@ -34,7 +35,7 @@ cat docs/HANDOVER.md
 | FND-04 environment contract | Complete | [PR #1](https://github.com/christo0192/Project_HELLO/pull/1), merged 2026-07-27 |
 | FND-07 architecture decisions | Complete | [PR #2](https://github.com/christo0192/Project_HELLO/pull/2), merged 2026-07-27 |
 | SEC-05 API input validation | Complete | [PR #3](https://github.com/christo0192/Project_HELLO/pull/3), merged 2026-07-28 |
-| SEC-10 dependency policy | In progress | Branch `feat/sec-10-dependency-policy`; lockfile audit, CycloneDX SBOM, exception registry, and seeded policy tests implemented |
+| SEC-10 dependency policy | In review | [PR #4](https://github.com/christo0192/Project_HELLO/pull/4); lockfile audit, CycloneDX SBOM, exception registry, and seeded policy tests implemented |
 
 SEC-05 adds strict Zod schemas for accepted body, path, query, and multipart
 field inputs; stable malformed/oversized request responses; sanitized unexpected
@@ -94,7 +95,7 @@ Latest SEC-10 branch results:
 ## Remaining Production Work
 
 FND-04, FND-07, and SEC-05 are complete plan tasks. FND-01 is partial and
-SEC-10 is in progress on `feat/sec-10-dependency-policy`. All other P0 tasks
+SEC-10 is in review in [PR #4](https://github.com/christo0192/Project_HELLO/pull/4). All other P0 tasks
 in `PLAN.md` remain open unless a later handover explicitly marks them
 complete.
 
