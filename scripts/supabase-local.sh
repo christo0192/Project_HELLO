@@ -4,8 +4,8 @@
 #
 # Prerequisites:
 #   - Docker running
-#   - supabase CLI installed (https://supabase.com/docs/guides/cli)
-#   - Node.js >= 22 (for npx supabase)
+#   - supabase CLI installed: npm install supabase --save-dev
+#   - Node.js >= 22
 #
 # Usage:
 #   scripts/supabase-local.sh start    — start local Supabase
@@ -17,11 +17,17 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-SUPABASE_DIR="app/supabase"
 export SUPABASE_INTERNAL_IMAGE_REGISTRY="${SUPABASE_INTERNAL_IMAGE_REGISTRY:-public.ecr.aws}"
 
 log()  { echo "[supabase-local] $(date -u +%H:%M:%S) $*"; }
 die()  { log "ERROR: $*"; exit 1; }
+
+# Symlink app/supabase -> supabase (CLI needs ./supabase/)
+ensure_link() {
+  if [ ! -L supabase ] && [ ! -d supabase ]; then
+    ln -s app/supabase supabase
+  fi
+}
 
 require_cli() {
   if ! npx supabase --version >/dev/null 2>&1; then
@@ -38,44 +44,44 @@ require_docker() {
 cmd_start() {
   require_cli
   require_docker
+  ensure_link
   log "Starting local Supabase..."
-  npx supabase start --workdir "$SUPABASE_DIR"
+  npx supabase start
   log "Local Supabase is running."
-  npx supabase status --workdir "$SUPABASE_DIR"
+  npx supabase status
 }
 
 cmd_reset() {
   require_cli
+  ensure_link
   log "Resetting local Supabase database (re-applies all migrations)..."
-  npx supabase db reset --workdir "$SUPABASE_DIR"
+  npx supabase db reset
   log "Reset complete. All migrations re-applied."
 }
 
 cmd_test() {
   require_cli
+  ensure_link
   log "Running policy tests..."
-  # Run the test migration against the local DB
-  npx supabase db test --workdir "$SUPABASE_DIR" 2>/dev/null || {
-    # Fallback: run test SQL directly via psql
-    log "Running policy tests via local PG connection..."
-    PGPASSWORD=postgres psql \
-      -h localhost -p 54322 -U postgres -d postgres \
-      -f "$SUPABASE_DIR/migrations/0005_policy_tests.sql" \
-      -v ON_ERROR_STOP=1
-  }
+  PGPASSWORD=postgres psql \
+    -h localhost -p 54322 -U postgres -d postgres \
+    -f app/supabase/migrations/0005_policy_tests.sql \
+    -v ON_ERROR_STOP=1
   log "Policy tests passed."
 }
 
 cmd_stop() {
   require_cli
+  ensure_link
   log "Stopping local Supabase..."
-  npx supabase stop --workdir "$SUPABASE_DIR"
+  npx supabase stop
   log "Stopped."
 }
 
 cmd_status() {
   require_cli
-  npx supabase status --workdir "$SUPABASE_DIR"
+  ensure_link
+  npx supabase status
 }
 
 case "${1:-}" in
