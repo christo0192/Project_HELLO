@@ -4,15 +4,31 @@ import { AccessToken, RoomServiceClient } from 'livekit-server-sdk';
 import { supabase } from '../lib/supabase.js';
 import { env } from '../lib/env.js';
 import { formatResumeFacts } from '../lib/prompts.js';
+import {
+  requireUploadedFile,
+  validateBody,
+  validateBodyFields,
+  validateParams,
+} from '../lib/validation.js';
+import {
+  livekitStartSchema,
+  livekitRecordingBodySchema,
+  livekitRecordingParamSchema,
+} from '../schemas/livekit.js';
 import type { ScreeningQuestion } from '../lib/types.js';
 
 export const livekitRouter = Router();
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 100 * 1024 * 1024, fields: 0, files: 1, parts: 2 },
+});
 
 function requireLiveKit() {
   if (!env.livekitUrl || !env.livekitApiKey || !env.livekitApiSecret) {
-    throw new Error('LIVEKIT_URL, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET must be set in app/api/.env');
+    throw new Error(
+      'LIVEKIT_URL, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET must be set in app/api/.env',
+    );
   }
 }
 
@@ -57,7 +73,7 @@ async function loadCandidateContext(candidateId: string) {
 }
 
 // POST /api/livekit/start { candidate_id }
-livekitRouter.post('/start', async (req, res) => {
+livekitRouter.post('/start', validateBody(livekitStartSchema), async (req, res, next) => {
   try {
     requireLiveKit();
     const candidateId = req.body?.candidate_id as string;
@@ -75,10 +91,14 @@ livekitRouter.post('/start', async (req, res) => {
       })
       .select()
       .single();
-    if (sErr || !session) return res.status(500).json({ error: sErr?.message ?? 'failed to create session' });
+    if (sErr || !session) return next(sErr ?? new Error('failed to create session'));
 
     const roomName = `screening-${session.id}`;
-    const roomMetadata = JSON.stringify({ ...metadata, session_id: session.id, room_name: roomName });
+    const roomMetadata = JSON.stringify({
+      ...metadata,
+      session_id: session.id,
+      room_name: roomName,
+    });
     const rooms = new RoomServiceClient(env.livekitUrl, env.livekitApiKey, env.livekitApiSecret);
     try {
       await rooms.createRoom({
@@ -116,39 +136,49 @@ livekitRouter.post('/start', async (req, res) => {
       url: env.livekitUrl,
       token: await token.toJwt(),
     });
-  } catch (e: any) {
-    res.status(500).json({ error: e?.message ?? 'failed to start LiveKit screening' });
+  } catch (error) {
+    next(error);
   }
 });
 
 // POST /api/livekit/:sessionId/recording multipart field "file"
-livekitRouter.post('/:sessionId/recording', upload.single('file'), async (req, res) => {
-  try {
-    const sessionId = req.params.sessionId;
-    if (!req.file) return res.status(400).json({ error: 'file is required' });
+livekitRouter.post(
+  '/:sessionId/recording',
+  validateParams(livekitRecordingParamSchema),
+  upload.single('file'),
+  validateBodyFields(livekitRecordingBodySchema),
+  requireUploadedFile,
+  async (req, res, next) => {
+    try {
+      const sessionId = req.params.sessionId;
+      const file = req.file!;
 
-    const extension = req.file.mimetype.includes('mpeg')
-      ? 'mp3'
-      : req.file.mimetype.includes('mp4')
-        ? 'mp4'
-        : 'webm';
-    const path = `${sessionId}.${extension}`;
-    const { error: upErr } = await supabase.storage
-      .from(env.recordingsBucket)
-      .upload(path, req.file.buffer, {
-        contentType: req.file.mimetype || 'audio/webm',
-        upsert: true,
-      });
-    if (upErr) return res.status(500).json({ error: upErr.message });
+      const extension = file.mimetype.includes('mpeg')
+        ? 'mp3'
+        : file.mimetype.includes('mp4')
+          ? 'mp4'
+          : 'webm';
+      const path = `${sessionId}.${extension}`;
+      const { error: upErr } = await supabase.storage
+        .from(env.recordingsBucket)
+        .upload(path, file.buffer, {
+          contentType: file.mimetype || 'audio/webm',
+          upsert: true,
+        });
+      if (upErr) return next(upErr);
 
-    const { data, error: signErr } = await supabase.storage
-      .from(env.recordingsBucket)
-      .createSignedUrl(path, 60 * 60 * 24 * 365);
-    if (signErr || !data?.signedUrl) return res.status(500).json({ error: signErr?.message ?? 'sign failed' });
+      const { data, error: signErr } = await supabase.storage
+        .from(env.recordingsBucket)
+        .createSignedUrl(path, 60 * 60 * 24 * 365);
+      if (signErr || !data?.signedUrl) return next(signErr ?? new Error('sign failed'));
 
-    await supabase.from('call_sessions').update({ recording_url: data.signedUrl }).eq('id', sessionId);
-    res.json({ recording_url: data.signedUrl });
-  } catch (e: any) {
-    res.status(500).json({ error: e?.message ?? 'recording upload failed' });
-  }
-});
+      await supabase
+        .from('call_sessions')
+        .update({ recording_url: data.signedUrl })
+        .eq('id', sessionId);
+      res.json({ recording_url: data.signedUrl });
+    } catch (error) {
+      next(error);
+    }
+  },
+);

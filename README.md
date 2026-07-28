@@ -15,6 +15,8 @@ P0 gates in `PLAN.md` are complete.
 - `docs/configuration.md`: environment separation and validation contract.
 - `docs/adr/`: current and proposed architecture decision records.
 - `docs/repository-inventory.md`: Foundation inventory and quarantine state.
+- `docs/HANDOVER.md`: current delivery state, production blockers, and exact
+  next-step resume instructions.
 
 Phase 0 Foundation is active. Historical implementation notes and candidate
 evidence remain local and quarantined from Git pending security review.
