@@ -2,7 +2,7 @@
 # =====================================================================
 # supabase-test.sh — Run Supabase policy and constraint tests in CI.
 #
-# Starts a local Supabase instance, applies all migrations (0001-0005),
+# Starts a local Supabase instance, applies all migrations (0001-0004),
 # runs policy tests via psql, verifies anon denial via REST, and stops.
 # No production/candidate data involved — local ephemeral containers only.
 # =====================================================================
@@ -39,7 +39,7 @@ for i in $(seq 1 30); do
   sleep 2
 done
 
-# 3. Apply all migrations (0001→0005)
+# 3. Apply all migrations (0001→0004)
 log "Applying migrations (db reset)..."
 npx supabase db reset
 
@@ -47,7 +47,7 @@ npx supabase db reset
 log "Running policy tests..."
 PGPASSWORD=postgres psql \
   -h localhost -p 54322 -U postgres -d postgres \
-  -f app/supabase/migrations/0005_policy_tests.sql \
+  -f app/supabase/tests/policy_tests.sql \
   -v ON_ERROR_STOP=1 2>&1 | tee "$RESULTS_FILE"
 
 # 5. Verify no failures

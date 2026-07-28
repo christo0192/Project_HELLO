@@ -65,7 +65,7 @@ cmd_test() {
   log "Running policy tests..."
   PGPASSWORD=postgres psql \
     -h localhost -p 54322 -U postgres -d postgres \
-    -f app/supabase/migrations/0005_policy_tests.sql \
+    -f app/supabase/tests/policy_tests.sql \
     -v ON_ERROR_STOP=1
   log "Policy tests passed."
 }
