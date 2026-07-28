@@ -37,10 +37,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Validate shell and diff hygiene
+      - name: Validate shell and text hygiene
         run: |
           bash -n scripts/supabase-local.sh scripts/supabase-test.sh
-          git diff --check HEAD^ HEAD
+          if git grep -n -I -E '[[:blank:]]+$' -- \
+            app/supabase scripts/supabase-local.sh scripts/supabase-test.sh \
+            docs/runbooks/supabase-migration-strategy.md \
+            docs/runbooks/supabase-prod-apply.md; then
+            echo 'ERROR: trailing whitespace found'
+            exit 1
+          fi
       - name: Reject unsafe migration patterns
         run: |
           python3 - <<'PY'
