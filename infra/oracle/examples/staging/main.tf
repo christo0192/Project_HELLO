@@ -31,11 +31,11 @@ module "queue" {
   project_name          = var.project_name
   notification_topic_id = module.observability.notification_topic_id
 
-  primary_queue_name         = "session-jobs-staging"
-  dead_letter_queue_name     = "session-jobs-dlq-staging"
-  dead_letter_delivery_count = 3
-  message_retention_seconds  = 86400 # 1 day
-  visibility_timeout_seconds = 300
+  primary_queue_name           = "session-jobs-staging"
+  dead_letter_delivery_count   = 3
+  message_retention_seconds    = 86400 # 1 day
+  visibility_timeout_seconds   = 300
+  queue_monthly_cost_threshold = 5 # USD — OCI Queue is pay-per-request, NOT Always Free
 }
 
 module "observability" {
@@ -47,14 +47,11 @@ module "observability" {
   environment    = "staging"
   project_name   = var.project_name
 
-  # Budget: staging-friendly low threshold
-  monthly_budget_amount  = 100 # USD — free-allowance aware
-  budget_alert_threshold = 50  # alert at 50%
-  notification_email     = var.alert_email
+  foundation_budget_id = module.foundation.budget_id
+  notification_email   = var.alert_email
 
   # Log retention (staging: shorter)
   log_retention_days = 30
 
-  # APM: staging-only sampling
-  apm_trace_sampling_percent = 10
+  # Trace sampling is configured at the APM agent/collector level, not here.
 }

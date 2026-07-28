@@ -1,48 +1,20 @@
-# Budget and cost guardrails specific to observability services
-# Separate from foundation module's compartment budget.
+# Budget cost alarm for observability services — references the single authoritative
+# compartment budget created by the foundation module.
+# No separate budget is created here to avoid duplication.
+# The foundation module owns the single authoritative compartment budget.
 
-# Budget alert for overall observability cost
-resource "oci_budget_budget" "this" {
-  compartment_id = var.tenancy_ocid
-  target_type    = "COMPARTMENT"
-  targets        = [var.compartment_id]
-  amount         = var.monthly_budget_amount
-  reset_period   = "MONTHLY"
-  display_name   = "${var.project_name}-${var.environment}-obs-budget"
-
-  description = "Monthly budget for ${var.environment} observability services"
-
-  freeform_tags = {
-    environment = var.environment
-    project     = var.project_name
-    managed_by  = "terraform"
-  }
-}
-
-resource "oci_budget_alert_rule" "this" {
-  budget_id      = oci_budget_budget.this.id
-  type           = "ACTUAL"
-  threshold      = var.budget_alert_threshold
-  threshold_type = "PERCENTAGE"
-  display_name   = "${var.project_name}-${var.environment}-obs-budget-alert"
-  message        = "Observability budget: ${var.project_name} ${var.environment} at ${var.budget_alert_threshold}% of monthly allowance"
-  recipients     = var.notification_email
-}
-
-# Free-allowance alarm: combined OCI Observability services
-# Covers Logging (10GB/month free), Monitoring (500M datapoints), APM (varies)
-resource "oci_monitoring_alarm" "free_allowance_cost" {
+resource "oci_monitoring_alarm" "daily_spend" {
   compartment_id        = var.compartment_id
-  display_name          = "${var.project_name}-${var.environment}-free-tier-cost"
+  display_name          = "${var.project_name}-${var.environment}-daily-spend"
   metric_compartment_id = var.compartment_id
   namespace             = "oci_budgets"
-  query                 = "BudgetActualSpend[1d]{budgetId = '${oci_budget_budget.this.id}'}.sum() > 1"
+  query                 = "BudgetActualSpend[1d]{budgetId = '${var.foundation_budget_id}'}.sum() > 1"
   severity              = "WARNING"
   is_enabled            = true
   pending_duration      = "PT1H"
   destinations          = [oci_ons_notification_topic.this.id]
 
-  body = "${var.project_name} ${var.environment} observability spending has exceeded $1/day. Check for free-tier overage."
+  body = "${var.project_name} ${var.environment} daily spend has exceeded $1. Check the compartment budget in OCI Console for service-level details."
 
   freeform_tags = {
     environment = var.environment

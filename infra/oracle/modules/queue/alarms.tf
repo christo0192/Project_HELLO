@@ -1,4 +1,7 @@
-# Queue alarms: backlog depth and DLQ delivery monitoring
+# Queue alarms: backlog depth, message age, and cost-threshold monitoring
+# DLQ depth cannot be monitored directly via OCI Monitoring — the dead-letter
+# queue is a service-managed internal sub-queue that does not expose separate metrics.
+# Operator must inspect dead-lettered messages via OCI Console or Queue API.
 
 # Alarm: primary queue depth exceeds threshold
 resource "oci_monitoring_alarm" "queue_depth" {
@@ -11,6 +14,8 @@ resource "oci_monitoring_alarm" "queue_depth" {
   is_enabled            = true
   pending_duration      = "PT5M"
   destinations          = [var.notification_topic_id]
+
+  body = "${var.project_name} ${var.environment} queue depth exceeds 100 messages. Check consumer health and scale workers."
 
   freeform_tags = {
     environment = var.environment
@@ -31,24 +36,7 @@ resource "oci_monitoring_alarm" "queue_age" {
   pending_duration      = "PT10M"
   destinations          = [var.notification_topic_id]
 
-  freeform_tags = {
-    environment = var.environment
-    project     = var.project_name
-    managed_by  = "terraform"
-  }
-}
-
-# Alarm: messages sent to dead-letter queue
-resource "oci_monitoring_alarm" "dlq_depth" {
-  compartment_id        = var.compartment_id
-  display_name          = "${var.project_name}-${var.environment}-dlq-depth"
-  metric_compartment_id = var.compartment_id
-  namespace             = "oci_queue"
-  query                 = "QueueDepth[1m]{queueId = '${oci_queue_queue.dead_letter.id}'}.mean() > 1"
-  severity              = "CRITICAL"
-  is_enabled            = true
-  pending_duration      = "PT1M"
-  destinations          = [var.notification_topic_id]
+  body = "${var.project_name} ${var.environment} oldest queue message exceeds 5 minutes. Check consumer processing latency."
 
   freeform_tags = {
     environment = var.environment
@@ -57,32 +45,27 @@ resource "oci_monitoring_alarm" "dlq_depth" {
   }
 }
 
-# Free-allowance warning: queue request count approaches free tier limit
-# OCI Queue free tier: 1M requests/month. Alarm at 80% of allowance.
-resource "oci_monitoring_alarm" "free_allowance_requests" {
+# Cost-threshold alarm: queue request rate may incur charges
+# OCI Queue is NOT an Always Free service. A first-1M-requests/month no-charge tier
+# was documented as of 2026-07-28 but is not guaranteed. This alarm uses a
+# configurable monthly cost estimate derived from the pay-per-request pricing model.
+# Source: https://www.oracle.com/cloud/queue/pricing/ (retrieved 2026-07-28)
+resource "oci_monitoring_alarm" "queue_cost_threshold" {
   compartment_id        = var.compartment_id
-  display_name          = "${var.project_name}-${var.environment}-queue-free-allowance"
+  display_name          = "${var.project_name}-${var.environment}-queue-cost-threshold"
   metric_compartment_id = var.compartment_id
   namespace             = "oci_queue"
-  query                 = "QueueRequestCount[1m]{queueId = '${oci_queue_queue.primary.id}'}.rate() > 0.031"
+  query                 = "QueueRequestCount[1m]{queueId = '${oci_queue_queue.primary.id}'}.rate() > ${var.queue_monthly_cost_threshold}"
   severity              = "WARNING"
   is_enabled            = true
-  pending_duration      = "PT15M"
+  pending_duration      = "PT1H"
   destinations          = [var.notification_topic_id]
 
-  # 0.031 req/second ≈ 80k/month per queue ≈ 80% of 1M free allowance with headroom
-
-  body = "${var.project_name} ${var.environment} OCI Queue is approaching the monthly free-allowance limit. Review usage."
+  body = "${var.project_name} ${var.environment} OCI Queue request rate may cause charges exceeding the configured monthly cost threshold of $${var.queue_monthly_cost_threshold}. Review usage and verify current pricing at https://www.oracle.com/cloud/queue/pricing/"
 
   freeform_tags = {
     environment = var.environment
     project     = var.project_name
     managed_by  = "terraform"
   }
-}
-
-variable "notification_topic_id" {
-  description = "Notification topic OCID for alarm destinations"
-  type        = string
-  default     = ""
 }

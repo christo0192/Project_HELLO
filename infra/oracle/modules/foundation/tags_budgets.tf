@@ -66,3 +66,8 @@ variable "budget_alert_email" {
   type        = string
   default     = "alerts@example.com"
 }
+
+output "budget_id" {
+  description = "Compartment budget OCID — referenced by observability alarms"
+  value       = oci_budget_budget.this.id
+}

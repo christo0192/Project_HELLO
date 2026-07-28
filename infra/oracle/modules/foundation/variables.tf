@@ -54,3 +54,9 @@ variable "create_nat_gateway" {
   type        = bool
   default     = true
 }
+
+variable "enable_http_ingress" {
+  description = "Temporarily open port 80 for certificate validation (ACME HTTP-01). Set to false after provisioning."
+  type        = bool
+  default     = false
+}

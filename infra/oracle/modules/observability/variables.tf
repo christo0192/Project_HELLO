@@ -1,5 +1,6 @@
 # Observability module: OCI Logging, Monitoring, APM, Notifications, budget guardrails
 # Region is always an input.
+# Budget is managed by the foundation module — this module only creates a daily-spend alarm.
 
 variable "region" {
   description = "OCI region"
@@ -28,16 +29,9 @@ variable "project_name" {
   default     = "hr-screening"
 }
 
-variable "monthly_budget_amount" {
-  description = "Monthly budget in USD"
-  type        = number
-  default     = 500
-}
-
-variable "budget_alert_threshold" {
-  description = "Budget alert threshold percentage (1-100)"
-  type        = number
-  default     = 80
+variable "foundation_budget_id" {
+  description = "OCID of the authoritative compartment budget created by the foundation module"
+  type        = string
 }
 
 variable "notification_email" {
@@ -50,16 +44,6 @@ variable "log_retention_days" {
   description = "Log retention in days"
   type        = number
   default     = 30
-}
-
-variable "apm_trace_sampling_percent" {
-  description = "APM trace sampling percentage (1-100)"
-  type        = number
-  default     = 10
-  validation {
-    condition     = var.apm_trace_sampling_percent > 0 && var.apm_trace_sampling_percent <= 100
-    error_message = "apm_trace_sampling_percent must be between 1 and 100"
-  }
 }
 
 # PII/secret redaction patterns — configurable per environment

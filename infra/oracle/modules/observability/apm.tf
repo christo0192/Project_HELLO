@@ -1,5 +1,6 @@
 # OCI APM: Application Performance Monitoring domain
-# Trace sampling is configurable per environment.
+# Trace sampling is configured at the APM agent/collector level, not the domain resource.
+# Configure sampling in the application's APM agent/OTEL configuration.
 
 resource "oci_apm_apm_domain" "this" {
   compartment_id = var.compartment_id

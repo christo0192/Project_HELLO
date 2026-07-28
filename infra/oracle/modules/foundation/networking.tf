@@ -105,18 +105,21 @@ resource "oci_core_security_list" "public" {
     description = "Allow HTTPS from internet"
   }
 
-  # Ingress: HTTP (temporary, for cert provisioning)
-  ingress_security_rules {
-    protocol    = "6"
-    source      = "0.0.0.0/0"
-    source_type = "CIDR_BLOCK"
-    stateless   = false
+  # Ingress: HTTP (certificate validation — gated behind enable_http_ingress)
+  dynamic "ingress_security_rules" {
+    for_each = var.enable_http_ingress ? [1] : []
+    content {
+      protocol    = "6"
+      source      = "0.0.0.0/0"
+      source_type = "CIDR_BLOCK"
+      stateless   = false
 
-    tcp_options {
-      min = 80
-      max = 80
+      tcp_options {
+        min = 80
+        max = 80
+      }
+      description = "Allow HTTP for certificate validation (ACME HTTP-01)"
     }
-    description = "Allow HTTP for certificate validation"
   }
 
   # Egress: all outbound
