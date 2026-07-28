@@ -15,8 +15,35 @@ import {
   finalErrorHandler,
 } from './lib/validation.js';
 
-export function createApp() {
+export interface CreateAppOptions {
+  /** Override NODE_ENV for testing. Defaults to process.env.NODE_ENV. */
+  nodeEnv?: string;
+}
+
+export function createApp(opts: CreateAppOptions = {}) {
   const app = express();
+  const nodeEnv = opts.nodeEnv ?? process.env.NODE_ENV;
+
+  // Suppress Express fingerprinting.
+  app.disable('x-powered-by');
+
+  // ── Security headers (SEC-09) ──────────────────────────────────
+  // Must run before CORS so headers cover OPTIONS preflight and
+  // CORS-blocked responses as well as normal routes.
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    if (nodeEnv === 'production') {
+      res.setHeader(
+        'Strict-Transport-Security',
+        'max-age=31536000; includeSubDomains',
+      );
+    }
+    next();
+  });
+
   const allowedOrigins = new Set(
     env.webOrigin
       .split(',')
@@ -35,21 +62,6 @@ export function createApp() {
       },
     }),
   );
-
-  // ── Security headers (SEC-09) ──────────────────────────────────
-  app.use((_req, res, next) => {
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('X-Frame-Options', 'DENY');
-    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
-    if (process.env.NODE_ENV === 'production') {
-      res.setHeader(
-        'Strict-Transport-Security',
-        'max-age=31536000; includeSubDomains',
-      );
-    }
-    next();
-  });
 
   app.use(express.json({ limit: '2mb' }));
 
