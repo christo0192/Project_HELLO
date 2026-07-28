@@ -1,0 +1,33 @@
+# Supabase local development configuration
+# Used by supabase-cli: supabase init / supabase start / supabase db reset
+
+project_id: "screening-bot-local"
+
+db:
+  port: 54322
+  # Schema migrations run in order from migrations/
+  major_version: 15
+
+auth:
+  enabled: true
+  # Single-org: email/password with MFA (hardened in production)
+  site_url: http://localhost:5173
+  additional_redirect_urls:
+    - http://localhost:8787
+  jwt_expiry: 3600
+  email:
+    enable_confirmations: false  # dev convenience; production requires confirmations
+
+api:
+  port: 54321
+  extra_headers:
+    Access-Control-Allow-Origin: http://localhost:5173
+
+realtime:
+  enabled: true
+
+storage:
+  enabled: true
+  file_size_limit: "50MiB"
+
+# All settings are for local dev only — no production values

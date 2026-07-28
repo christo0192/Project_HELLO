@@ -1,0 +1,80 @@
+name: Supabase Migration & Policy Validation
+
+on:
+  pull_request:
+    paths:
+      - 'app/supabase/**'
+  push:
+    branches: [main]
+    paths:
+      - 'app/supabase/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  supabase-check:
+    name: supabase-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Supabase CLI
+        run: npm install supabase --save-dev
+
+      - name: Start Supabase & run tests
+        run: bash scripts/supabase-test.sh
+
+  supabase-syntax:
+    name: supabase-syntax
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate SQL syntax (static check)
+        run: |
+          echo "Checking SQL syntax..."
+          for f in app/supabase/migrations/*.sql; do
+            echo "  $f"
+            # Basic SQL syntax check: all statements end with ;
+            awk '!/^--/ && NF>0 && !/;$/{print "WARNING: line "NR" missing semicolon"}' "$f" \
+              | grep -v '^\s*$' && echo "  ^ potential issues in $f" || true
+          done
+          echo "SQL syntax check complete."
+
+  supabase-diff:
+    name: supabase-diff
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check migration file naming convention
+        run: |
+          echo "Validating migration filenames..."
+          for f in app/supabase/migrations/*.sql; do
+            base=$(basename "$f")
+            if ! echo "$base" | grep -qE '^[0-9]{4}_.*\.sql$'; then
+              echo "ERROR: $base does not match pattern NNNN_name.sql"
+              exit 1
+            fi
+          done
+          echo "All migration filenames valid."
+
+      - name: Check for duplicate migration numbers
+        run: |
+          dups=$(ls app/supabase/migrations/*.sql | sed 's|.*/||' | cut -d_ -f1 | sort | uniq -d)
+          if [ -n "$dups" ]; then
+            echo "ERROR: Duplicate migration numbers: $dups"
+            exit 1
+          fi
+          echo "No duplicate migration numbers."
