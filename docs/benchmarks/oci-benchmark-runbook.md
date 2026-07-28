@@ -120,6 +120,9 @@ export HYDERABAD_AD="$(oci iam availability-domain list \
   --query 'data[0].name' --raw-output \
   --region ap-hyderabad-1)"
 
+# Initialize timestamp independently (this block must work standalone)
+export TAG_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+
 # Launch probe and capture instance OCID — must not be blank
 HYDERABAD_INSTANCE_ID="$(oci compute instance launch \
   --compartment-id "${HYDERABAD_COMPARTMENT_ID}" \
@@ -138,9 +141,15 @@ HYDERABAD_INSTANCE_ID="$(oci compute instance launch \
 # Fail if OCID is blank
 if [ -z "${HYDERABAD_INSTANCE_ID}" ]; then
   echo "FATAL: HYDERABAD_INSTANCE_ID is blank — launch failed or returned no ID" >&2
-  # Emergency: terminate Mumbai if Hyderabad fails
+  # Emergency: terminate Mumbai probe, wait for TERMINATED, and verify
   if [ -n "${MUMBAI_INSTANCE_ID}" ]; then
-    oci compute instance terminate --instance-id "${MUMBAI_INSTANCE_ID}" --force --region ap-mumbai-1
+    echo "Terminating Mumbai probe due to Hyderabad launch failure..."
+    oci compute instance terminate \
+      --instance-id "${MUMBAI_INSTANCE_ID}" \
+      --force \
+      --region ap-mumbai-1 \
+      --wait-for-state TERMINATED
+    echo "Mumbai probe terminated."
   fi
   exit 1
 fi
@@ -266,11 +275,12 @@ echo "Verifying no benchmark probes remain in Mumbai..."
 MUMBAI_REMAINING="$(oci compute instance list \
   --compartment-id "${MUMBAI_COMPARTMENT_ID}" \
   --region ap-mumbai-1 \
-  --query "data[?\"lifecycle-state\"!='TERMINATED'].displayName" \
-  --all --raw-output | grep 'oci-benchmark-probe' || true)"
+  --query "join('\n', data[?\"lifecycle-state\"!='TERMINATED' && \"freeform-tags\".purpose == 'oci-region-benchmark'].id)" \
+  --all --raw-output)"
 
 if [ -n "${MUMBAI_REMAINING}" ]; then
-  echo "FATAL: Non-terminated benchmark probes remain in Mumbai: ${MUMBAI_REMAINING}" >&2
+  echo "FATAL: Non-terminated benchmark probes remain in Mumbai:" >&2
+  echo "${MUMBAI_REMAINING}" >&2
   echo "Run emergency teardown before collecting evidence." >&2
   exit 1
 fi
@@ -280,11 +290,12 @@ echo "Verifying no benchmark probes remain in Hyderabad..."
 HYDERABAD_REMAINING="$(oci compute instance list \
   --compartment-id "${HYDERABAD_COMPARTMENT_ID}" \
   --region ap-hyderabad-1 \
-  --query "data[?\"lifecycle-state\"!='TERMINATED'].displayName" \
-  --all --raw-output | grep 'oci-benchmark-probe' || true)"
+  --query "join('\n', data[?\"lifecycle-state\"!='TERMINATED' && \"freeform-tags\".purpose == 'oci-region-benchmark'].id)" \
+  --all --raw-output)"
 
 if [ -n "${HYDERABAD_REMAINING}" ]; then
-  echo "FATAL: Non-terminated benchmark probes remain in Hyderabad: ${HYDERABAD_REMAINING}" >&2
+  echo "FATAL: Non-terminated benchmark probes remain in Hyderabad:" >&2
+  echo "${HYDERABAD_REMAINING}" >&2
   echo "Run emergency teardown before collecting evidence." >&2
   exit 1
 fi
@@ -323,7 +334,7 @@ echo "=== Emergency teardown: Mumbai ==="
 MUMBAI_IDS="$(oci compute instance list \
   --compartment-id "${MUMBAI_COMPARTMENT_ID}" \
   --region ap-mumbai-1 \
-  --query "data[?contains(\"display-name\",'oci-benchmark-probe')].id" \
+  --query "join('\n', data[?\"freeform-tags\".purpose == 'oci-region-benchmark' && \"lifecycle-state\"!='TERMINATED'].id)" \
   --all --raw-output)"
 
 if [ -n "${MUMBAI_IDS}" ]; then
@@ -346,7 +357,7 @@ echo "=== Emergency teardown: Hyderabad ==="
 HYDERABAD_IDS="$(oci compute instance list \
   --compartment-id "${HYDERABAD_COMPARTMENT_ID}" \
   --region ap-hyderabad-1 \
-  --query "data[?contains(\"display-name\",'oci-benchmark-probe')].id" \
+  --query "join('\n', data[?\"freeform-tags\".purpose == 'oci-region-benchmark' && \"lifecycle-state\"!='TERMINATED'].id)" \
   --all --raw-output)"
 
 if [ -n "${HYDERABAD_IDS}" ]; then
@@ -364,17 +375,17 @@ else
   echo "No benchmark probes found in Hyderabad."
 fi
 
-# Verify both regions clean
+# Verify both regions clean — queries freeform-tags, no error suppression
 echo ""
 echo "Final verification across both regions..."
 MUMBAI_LEFT="$(oci compute instance list \
   --compartment-id "${MUMBAI_COMPARTMENT_ID}" --region ap-mumbai-1 \
-  --query "data[?\"lifecycle-state\"!='TERMINATED' && contains(\"display-name\",'oci-benchmark-probe')].displayName" \
-  --all --raw-output 2>/dev/null || true)"
+  --query "join('\n', data[?\"freeform-tags\".purpose == 'oci-region-benchmark' && \"lifecycle-state\"!='TERMINATED'].id)" \
+  --all --raw-output)"
 HYDERABAD_LEFT="$(oci compute instance list \
   --compartment-id "${HYDERABAD_COMPARTMENT_ID}" --region ap-hyderabad-1 \
-  --query "data[?\"lifecycle-state\"!='TERMINATED' && contains(\"display-name\",'oci-benchmark-probe')].displayName" \
-  --all --raw-output 2>/dev/null || true)"
+  --query "join('\n', data[?\"freeform-tags\".purpose == 'oci-region-benchmark' && \"lifecycle-state\"!='TERMINATED'].id)" \
+  --all --raw-output)"
 
 if [ -z "${MUMBAI_LEFT}" ] && [ -z "${HYDERABAD_LEFT}" ]; then
   echo "All regions clean — emergency teardown complete."

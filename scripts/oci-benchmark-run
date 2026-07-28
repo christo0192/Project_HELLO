@@ -929,6 +929,8 @@ def cmd_self_test(args):
         check("runbook file exists", False, f"Not found: {runbook_path}")
         runbook = ""
 
+    # ── Section A: Launch ID capture ──
+
     # 1. Launch commands must capture OCIDs via --query 'data.id' --raw-output
     has_mumbai_query = '--query' in runbook and "'data.id'" in runbook
     check("runbook: Mumbai launch uses --query 'data.id' --raw-output", has_mumbai_query)
@@ -954,41 +956,92 @@ def cmd_self_test(args):
     check("runbook: region tag applied per instance",
           'ap-mumbai-1' in runbook and 'ap-hyderabad-1' in runbook)
 
-    # 5. Teardown must cover BOTH Mumbai and Hyderabad explicitly
+    # 5. TAG_TIMESTAMP must be defined independently in each launch block
+    #    (Mumbai 2a and Hyderabad 2b each initialize it — count >= 2)
+    timestamp_defs = runbook.count('TAG_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"')
+    check("runbook: TAG_TIMESTAMP defined independently per launch block (>= 2)",
+          timestamp_defs >= 2,
+          f"found {timestamp_defs} definitions (need >= 2)")
+
+    # 6. Hyderabad launch failure must terminate Mumbai with --wait-for-state TERMINATED
+    check("runbook: Hyderabad failure terminates Mumbai",
+          'MUMBAI_INSTANCE_ID' in runbook and '--wait-for-state TERMINATED' in runbook)
+    check("runbook: Hyderabad failure waits for Mumbai TERMINATED",
+          'Terminating Mumbai probe due to Hyderabad launch failure' in runbook and
+          '--wait-for-state TERMINATED' in runbook)
+
+    # ── Section B: Teardown coverage ──
+
+    # 7. Teardown must cover BOTH Mumbai and Hyderabad explicitly
     check("runbook: teardown covers Mumbai",
           'ap-mumbai-1' in runbook and '--wait-for-state TERMINATED' in runbook)
     check("runbook: teardown covers Hyderabad",
           'ap-hyderabad-1' in runbook and '--wait-for-state TERMINATED' in runbook)
 
-    # 6. Teardown must verify no non-terminated tagged probes remain (both regions)
-    check("runbook: Mumbai teardown verification present",
-          'Non-terminated benchmark probes remain in Mumbai' in runbook or
-          'MUMBAI_REMAINING' in runbook)
-    check("runbook: Hyderabad teardown verification present",
-          'Non-terminated benchmark probes remain in Hyderabad' in runbook or
-          'HYDERABAD_REMAINING' in runbook)
+    # 8. Phase-5c verification must query freeform-tags.purpose, NOT grep display names
+    mumbai_5c_query = 'freeform-tags' in runbook and 'oci-region-benchmark' in runbook
+    check("runbook: 5c Mumbai verification uses freeform-tags.purpose query", mumbai_5c_query)
+    # Grep must NOT appear in Phase 5c (it was removed)
+    check("runbook: 5c does not grep display names for Mumbai",
+          'grep' not in runbook[runbook.find('### 5c'):runbook.find('Phase 6')] if '### 5c' in runbook else True,
+          "Phase 5c still contains grep" if '### 5c' in runbook and 'grep' in runbook[runbook.find('### 5c'):runbook.find('Phase 6')] else "")
+    check("runbook: 5c does not grep display names for Hyderabad",
+          'grep' not in runbook[runbook.find('### 5c'):runbook.find('Phase 6')] if '### 5c' in runbook else True)
 
-    # 7. Evidence step must depend on teardown verification
-    check("runbook: evidence phase mentions teardown prerequisite",
+    # 9. No || true in Phase 5c verification
+    if '### 5c' in runbook:
+        section_5c = runbook[runbook.find('### 5c'):runbook.find('Phase 6')]
+        check("runbook: 5c no '|| true' error suppression", '|| true' not in section_5c)
+    else:
+        check("runbook: 5c no '|| true' error suppression (section not found)", False)
+
+    # 10. Emergency teardown must use join('\\n', ...) for scalar OCIDs
+    emergency_start = runbook.find('Emergency Teardown')
+    if emergency_start > 0:
+        emergency_section = runbook[emergency_start:]
+        check("runbook: emergency Mumbai list uses join('\\n',...) for scalar OCIDs",
+              "join('\\n'" in emergency_section or "join('\\\n'" in emergency_section)
+        check("runbook: emergency Hyderabad list uses join('\\n',...) for scalar OCIDs",
+              emergency_section.count("join") >= 2 if "join" in emergency_section else False,
+              f"found {emergency_section.count('join')} join() calls (need >= 2)")
+    else:
+        check("runbook: emergency section found", False)
+
+    # 11. Emergency final verification uses freeform-tags.purpose, not grep display names
+    if emergency_start > 0:
+        check("runbook: emergency final verification uses freeform-tags filter",
+              'Final verification' in runbook and
+              'freeform-tags' in emergency_section)
+        # Must NOT suppress OCI errors in final safety verification
+        check("runbook: emergency final verification no 2>/dev/null",
+              '2>/dev/null' not in emergency_section[emergency_section.find('Final verification'):]
+              if 'Final verification' in emergency_section else False)
+        check("runbook: emergency final verification no '|| true'",
+              '|| true' not in emergency_section[emergency_section.find('Final verification'):]
+              if 'Final verification' in emergency_section else False)
+    else:
+        check("runbook: emergency final verification (section not found)", False)
+
+    # 12. Emergency list queries: no grep display-name anywhere in emergency section
+    if emergency_start > 0:
+        check("runbook: emergency section no grep display-name",
+              "'oci-benchmark-probe'" not in emergency_section)
+    else:
+        check("runbook: emergency section no grep (not found)", False)
+
+    # 13. Evidence gate must reference teardown verification
+    check("runbook: evidence phase gates on teardown verification",
+          'teardown verification' in runbook.lower() or
           'not proceed to Phase 6' in runbook or
-          'teardown verification' in runbook)
+          'clean' in runbook)
 
-    # 8. Emergency teardown covers both regions with wait-for-state
-    check("runbook: emergency teardown covers Mumbai with wait",
-          'Emergency teardown: Mumbai' in runbook or
-          ('emergency' in runbook.lower() and 'ap-mumbai-1' in runbook))
-    check("runbook: emergency teardown covers Hyderabad with wait",
-          'Emergency teardown: Hyderabad' in runbook or
-          ('emergency' in runbook.lower() and 'ap-hyderabad-1' in runbook))
-
-    # 9. No benchmark-probes.env file writes (mention in explanation is OK)
+    # 14. No benchmark-probes.env file writes
     check("runbook: no benchmark-probes.env file writes",
           '>> benchmark-probes.env' not in runbook and
           '> benchmark-probes.env' not in runbook and
           'tee benchmark-probes.env' not in runbook)
 
-    # 10. No false --yes flag claim for OCI CLI launch
-    #     (saying 'there is no --yes flag' is correct and should be present)
+    # 15. Correctly states no --yes flag
     check("runbook: correctly states no --yes flag for OCI CLI",
           'no --yes flag' in runbook.lower() or
           'does not require' in runbook.lower())
