@@ -1,0 +1,79 @@
+name: OCI Infra Plan (Manual)
+
+# Plan-only workflow. Requires OCI credentials (stored as GitHub secrets).
+# Apply is EXPLICITLY impossible in this workflow.
+# Only runs on manual workflow_dispatch — never automatic.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      region:
+        description: 'OCI region (e.g., ap-mumbai-1)'
+        required: true
+        type: string
+        default: 'placeholder-region'
+
+jobs:
+  terraform-plan:
+    name: Terraform Plan (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    environment:
+      name: oci-${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5"
+
+      - name: Terraform Init
+        working-directory: infra/oracle/examples/${{ inputs.environment }}
+        env:
+          TF_VAR_region: ${{ inputs.region }}
+          TF_VAR_tenancy_ocid: ${{ secrets.OCI_TENANCY_OCID }}
+        run: terraform init
+
+      - name: Terraform Plan
+        working-directory: infra/oracle/examples/${{ inputs.environment }}
+        env:
+          TF_VAR_region: ${{ inputs.region }}
+          TF_VAR_tenancy_ocid: ${{ secrets.OCI_TENANCY_OCID }}
+        run: |
+          terraform plan -out=tfplan \
+            -var="region=${{ inputs.region }}" \
+            -detailed-exitcode \
+            | tee plan-output.txt
+          EXIT_CODE=${PIPESTATUS[0]}
+          if [ "$EXIT_CODE" -eq 2 ]; then
+            echo "Plan shows changes — manual review required."
+          elif [ "$EXIT_CODE" -eq 1 ]; then
+            echo "ERROR: Terraform plan failed."
+            exit 1
+          else
+            echo "No changes detected."
+          fi
+
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: infra/oracle/examples/${{ inputs.environment }}/tfplan
+
+      - name: Upload Plan Output
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan-output-${{ inputs.environment }}
+          path: infra/oracle/examples/${{ inputs.environment }}/plan-output.txt
+
+  # Note: There is NO terraform-apply job in this workflow.
+  # Apply is performed only through a separate, access-controlled runbook
+  # with manual approval and change-control authorization.
+  # See docs/runbooks/oci-platform-operator.md

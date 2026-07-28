@@ -1,0 +1,120 @@
+name: OCI Infra Validate
+
+# Non-mutating CI: format, validate, security, and static checks for OCI Terraform.
+# No OCI credentials required. Apply is impossible in this workflow.
+# Runs on every PR that touches infra/oracle/**, plus manual dispatch.
+
+on:
+  pull_request:
+    paths:
+      - 'infra/oracle/**'
+      - '.github/workflows/oci-infra-*.yml'
+  workflow_dispatch:
+
+jobs:
+  terraform-validate:
+    name: Terraform Format & Validate
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        example: [staging, production]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5"
+
+      - name: Terraform Format Check
+        working-directory: infra/oracle/examples/${{ matrix.example }}
+        run: terraform fmt -check -recursive -diff
+
+      - name: Terraform Init
+        working-directory: infra/oracle/examples/${{ matrix.example }}
+        # Init with placeholder backend (local) — no remote state or credentials
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        working-directory: infra/oracle/examples/${{ matrix.example }}
+        run: terraform validate
+
+      - name: Terraform Validate (root modules)
+        working-directory: infra/oracle
+        run: |
+          for mod in modules/foundation modules/queue modules/observability; do
+            echo "=== Validating $mod ==="
+            terraform -chdir="$mod" init -backend=false
+            terraform -chdir="$mod" validate
+          done
+
+  secret-scan:
+    name: Secret & Credential Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect OCIDs and credential-like patterns
+        run: |
+          # Check that no real OCIDs are committed (only placeholder/example patterns)
+          ! grep -rn --include='*.tf' --include='*.md' \
+            -E 'ocid1\.(tenancy|compartment|vault|secret)\.[a-z0-9]+' \
+            infra/oracle/ \
+            | grep -v '__CHANGE_ME__' \
+            | grep -v 'placeholder' \
+            | grep -v 'ocid1\.tenancy\.oc1\.\.' \
+            || { echo "FAIL: Real OCID detected in committed files"; exit 1; }
+
+      - name: Detect private key patterns
+        run: |
+          ! grep -rn --include='*.tf' --include='*.md' --include='*.json' \
+            -E '-----BEGIN (RSA|EC|OPENSSH|DSA) PRIVATE KEY-----' \
+            infra/oracle/ \
+            || { echo "FAIL: Private key detected in committed files"; exit 1; }
+
+  diff-check:
+    name: Repository Diff & Boundary Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify changes stay within OCI Terraform boundaries
+        run: |
+          # Only infra/oracle/**, .github/workflows/oci-infra-*.yml, docs/runbooks/oci-platform-*.md
+          CHANGED=$(git diff --name-only origin/main...HEAD)
+          for f in $CHANGED; do
+            case "$f" in
+              infra/oracle/*) ;;
+              .github/workflows/oci-infra-*.yml) ;;
+              docs/runbooks/oci-platform-*.md) ;;
+              *)
+                echo "FAIL: Out-of-boundary change: $f"
+                echo "Only infra/oracle/**, .github/workflows/oci-infra-*.yml, docs/runbooks/oci-platform-*.md allowed"
+                exit 1
+                ;;
+            esac
+          done
+          echo "All changes within approved boundaries."
+
+  terraform-docs:
+    name: Terraform Docs Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify module README/doc coverage
+        run: |
+          for mod in infra/oracle/modules/foundation infra/oracle/modules/queue infra/oracle/modules/observability; do
+            if [ ! -f "$mod/variables.tf" ]; then
+              echo "FAIL: $mod missing variables.tf"
+              exit 1
+            fi
+            # Every variable must have a description
+            UNDOCUMENTED=$(grep -A1 '^variable "' "$mod/variables.tf" | grep -v 'description' | grep 'variable' || true)
+            if [ -n "$UNDOCUMENTED" ]; then
+              echo "WARNING: Some variables in $mod may be missing descriptions"
+            fi
+          done
+          echo "Module documentation check complete."

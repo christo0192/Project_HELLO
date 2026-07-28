@@ -1,0 +1,8 @@
+# Production terraform.tfvars template — copy to terraform.tfvars and fill in real values
+# WARNING: terraform.tfvars is gitignored. Never commit real OCIDs or credentials.
+
+region        = "placeholder-region"
+tenancy_ocid  = "ocid1.tenancy.oc1..__CHANGE_ME__"
+project_name  = "hr-screening"
+cost_center   = "engineering"
+alert_email   = "alerts@example.com"
