@@ -22,8 +22,8 @@ Date: 2026-07-28 | Branch: feat/mig-03-supabase-local-baseline
 | 7 | `recommendation` column in assessments has no CHECK constraint | `0001_init.sql` |
 | 8 | Missing unique constraint on `transcript_turns(session_id, turn_index)` — duplicate turns possible | `0001_init.sql` |
 | 9 | Missing `updated_at` trigger on call_sessions, roles, resumes, assessments | `0001_init.sql` |
-| 10 | No RLS policies for `authenticated` role — no recruiter auth seam exists | All migrations |
-| 11 | Storage objects (resumes_v2, recordings_v2) have no RLS policies — access control relies only on bucket `public=false` flag | `0001_init.sql` |
+| 10 | No active recruiter-membership gate exists; a Supabase account alone must not imply organizational access | All migrations |
+| 11 | Private bucket flags need explicit verification; direct browser policies must remain absent until authorized short-TTL API access exists | `0001_init.sql` |
 
 ### P2 — Compatibility risks
 
@@ -38,16 +38,16 @@ Date: 2026-07-28 | Branch: feat/mig-03-supabase-local-baseline
 | Consumer | Role | Tables accessed | Risk |
 |----------|------|----------------|------|
 | `app/api` (Express) | `service_role` | candidates, roles, call_sessions, transcript_turns, assessments, resumes | Bypasses RLS — correct for server but no application-level auth |
-| `app/web` (React dashboard) | `anon` | call_sessions, transcript_turns, assessments, candidates (via Realtime) | Reads PII via blanket anon policies — **critical risk** |
+| `app/web` (React dashboard) | currently `anon` | call_sessions, transcript_turns, assessments, candidates (via Realtime) | Production-safe migrations intentionally block this prototype path until Supabase Auth integration exists |
 | `app/voice-livekit` (Python worker) | `service_role` | transcript_turns, call_sessions | Bypasses RLS — correct for worker |
 
 ## Required hardening (this PR)
 
-1. Replace blanket anon read policies with `authenticated`-only policies
-2. Narrow grants: remove `all privileges` from anon/authenticated; keep only `service_role`
-3. Remove `alter default privileges` for anon/authenticated
-4. Add CHECK constraints on status, speaker, recommendation columns
-5. Add unique constraint on transcript_turns(session_id, turn_index)
-6. Add updated_at triggers to all mutable tables
-7. Add storage RLS policies for private buckets
-8. Add explicit authenticated role policies (single-org read access)
+1. Remove blanket anon policies and broad browser-role grants from the fresh migration history.
+2. Require both Supabase Auth and an active server-provisioned single-org recruiter membership.
+3. Keep browser access read-only and limited to the five dashboard tables.
+4. Keep resumes and recordings server-only until authorized short-TTL access is implemented.
+5. Add and validate domain CHECK constraints and transcript position uniqueness.
+6. Add `updated_at` triggers to mutable tables.
+7. Exercise effective RLS with synthetic member, non-member, and revoked-member tests.
+8. Preserve Realtime only for the three required dashboard streams under the same RLS gate.

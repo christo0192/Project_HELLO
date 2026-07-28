@@ -1,81 +1,63 @@
 #!/usr/bin/env bash
-# =====================================================================
-# supabase-test.sh — Run Supabase policy and constraint tests in CI.
-#
-# Starts a local Supabase instance, applies all migrations (0001-0004),
-# runs policy tests via psql, verifies anon denial via REST, and stops.
-# No production/candidate data involved — local ephemeral containers only.
-# =====================================================================
+# CI/local integration test for the production-boundary migrations.
+# Starts only ephemeral local containers and uses synthetic identities/data.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-RESULTS_FILE="/tmp/supabase-test-results.txt"
+readonly SUPABASE_CLI_VERSION="${SUPABASE_CLI_VERSION:-2.110.0}"
+readonly SUPABASE_DB_CONTAINER="${SUPABASE_DB_CONTAINER:-supabase_db_screening-bot-local}"
+readonly RESULTS_FILE="$(mktemp)"
+log() { printf '[supabase-ci] %s %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 
-log()  { echo "[supabase-ci] $(date -u +%H:%M:%S) $*"; }
+supabase_cli() {
+  npx --yes "supabase@${SUPABASE_CLI_VERSION}" --workdir app "$@"
+}
+cleanup() {
+  supabase_cli stop --no-backup >/dev/null 2>&1 || true
+  rm -f "$RESULTS_FILE"
+}
+trap cleanup EXIT INT TERM
 
-# 0. Symlink app/supabase -> supabase (CLI expects ./supabase/)
-if [ ! -L supabase ] && [ ! -d supabase ]; then
-  log "Creating symlink: supabase -> app/supabase"
-  ln -s app/supabase supabase
-fi
-trap 'rm -f supabase' EXIT
+command -v docker >/dev/null || { log 'ERROR: Docker is required.'; exit 1; }
+command -v curl >/dev/null || { log 'ERROR: curl is required.'; exit 1; }
+docker info >/dev/null 2>&1 || { log 'ERROR: Docker is not running.'; exit 1; }
 
-# 1. Start Supabase
-log "Starting Supabase..."
-npx supabase start
+log "Starting local Supabase with CLI ${SUPABASE_CLI_VERSION}..."
+supabase_cli start
 
-# 2. Wait for healthy
-log "Waiting for Supabase to be healthy..."
-for i in $(seq 1 30); do
-  if curl -s http://localhost:54321/rest/v1/ >/dev/null 2>&1; then
-    log "Supabase is healthy."
-    break
-  fi
-  if [ "$i" = "30" ]; then
-    log "ERROR: Supabase did not become healthy after 30 attempts."
-    npx supabase status || true
-    exit 1
-  fi
-  sleep 2
-done
+log 'Resetting the database and applying migrations...'
+supabase_cli db reset
 
-# 3. Apply all migrations (0001→0004)
-log "Applying migrations (db reset)..."
-npx supabase db reset
+log 'Running SQL policy and schema tests...'
+docker inspect "$SUPABASE_DB_CONTAINER" >/dev/null 2>&1 \
+  || { log "ERROR: Database container not found: $SUPABASE_DB_CONTAINER"; exit 1; }
+docker exec -i "$SUPABASE_DB_CONTAINER" \
+  psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+  < app/supabase/tests/policy_tests.sql 2>&1 | tee "$RESULTS_FILE"
 
-# 4. Run policy tests via psql
-log "Running policy tests..."
-PGPASSWORD=postgres psql \
-  -h localhost -p 54322 -U postgres -d postgres \
-  -f app/supabase/tests/policy_tests.sql \
-  -v ON_ERROR_STOP=1 2>&1 | tee "$RESULTS_FILE"
-
-# 5. Verify no failures
-if grep -q 'FAIL' "$RESULTS_FILE"; then
-  log "FAILURE: Some policy tests failed."
-  grep 'FAIL' "$RESULTS_FILE"
+if grep -Eq '[[:space:]]FAIL([[:space:]]|$)' "$RESULTS_FILE"; then
+  log 'ERROR: SQL policy suite reported a failure.'
   exit 1
 fi
-log "All policy tests PASSED."
 
-# 6. Test anon denial: try to query candidates as anon
-log "Testing anon access denial..."
-ANON_KEY=$(npx supabase status 2>/dev/null | grep 'anon key' | awk '{print $3}' || echo "")
-if [ -n "$ANON_KEY" ]; then
-  HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
-    -H "apikey: $ANON_KEY" \
-    "http://localhost:54321/rest/v1/candidates?limit=1" || echo "000")
-  if [ "$HTTP_CODE" = "200" ]; then
-    log "FAILURE: Anon can still read candidates (HTTP $HTTP_CODE)."
-    exit 1
-  fi
-  log "Anon access correctly denied (HTTP $HTTP_CODE)."
-else
-  log "WARNING: Could not retrieve anon key. Skipping live anon test."
+log 'Verifying custom-schema anon denial through PostgREST...'
+ANON_KEY="$(supabase_cli status -o env 2>/dev/null \
+  | sed -n 's/^ANON_KEY="\(.*\)"$/\1/p' | head -1)"
+if [ -z "$ANON_KEY" ]; then
+  log 'ERROR: Could not read the ephemeral local anon key.'
+  exit 1
 fi
 
-# 7. Stop Supabase
-log "Stopping Supabase..."
-npx supabase stop
+HTTP_CODE="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+  --header "apikey: ${ANON_KEY}" \
+  --header 'Accept-Profile: screening_v2' \
+  'http://127.0.0.1:54321/rest/v1/candidates?select=id&limit=1')"
+case "$HTTP_CODE" in
+  401|403) log "Anon access denied as expected (HTTP ${HTTP_CODE})." ;;
+  *)
+    log "ERROR: Expected custom-schema anon denial, received HTTP ${HTTP_CODE}."
+    exit 1
+    ;;
+esac
 
-log "All Supabase CI tests PASSED."
+log 'All local Supabase migration and policy checks passed.'

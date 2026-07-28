@@ -1,78 +1,82 @@
-# Supabase Migration Apply Runbook
+# Supabase Production Migration Apply Runbook
 
-**Target**: Single-org production Supabase project (MIG-01)  
-**Owner**: DB Admin + Security (review required)  
-**Status**: Pending production project provisioning
+**Target:** New single-org production Supabase project in Mumbai
 
----
+**Owner:** Repository owner with DB Admin and Security review
 
-## Preflight (local rehearsal — every apply)
+**Status:** Code rehearsal only; production application is not yet approved
 
-- [ ] `docker info` — Docker is running
-- [ ] `npx supabase --version` — CLI is available
-- [ ] `scripts/supabase-local.sh test` — all policy tests pass on local
-- [ ] `git diff --stat origin/main...HEAD -- app/supabase/` — changes scoped to supabase only
-- [ ] No `.env` file modifications in the diff
-- [ ] `scripts/supabase-local.sh reset` — clean reset succeeds
-- [ ] Synthetic data only in local DB
+## Mandatory prerequisites
 
-## Preflight (production — before applying)
+- [ ] Project belongs to the company-controlled Supabase organization.
+- [ ] Two named administrators have MFA enabled and break-glass ownership is documented.
+- [ ] Region, plan, PITR/backup capability, RPO/RTO, and billing alerts have written evidence.
+- [ ] The project contains no application/candidate rows and is not serving traffic.
+- [ ] Supabase Auth is configured for administrator-provisioned recruiters; public signup is disabled.
+- [ ] A production secret manager/runtime-injection path exists. No credential is placed in this repository or chat.
+- [ ] PR is merged and the exact commit is approved for application.
 
-- [ ] Production Supabase project exists (MIG-01)
-- [ ] At least 2 MFA-enabled administrators in the Supabase org (MIG-02)
-- [ ] PITR backup enabled and verified
-- [ ] Manual backup taken: `pg_dump` with `--schema=screening_v2` encrypted and stored
-- [ ] `supabase db diff` against staging shows expected changes only
-- [ ] Notification sent to #eng-deploy channel
-- [ ] Approved reviewer sign-off on this PR
-
-## Apply
+## Local rehearsal
 
 ```bash
-# 1. Link to production project (one-time)
-supabase link --project-ref <PROD_REF>
+SUPABASE_CLI_VERSION=2.110.0 scripts/supabase-local.sh start
+SUPABASE_CLI_VERSION=2.110.0 scripts/supabase-local.sh reset
+SUPABASE_CLI_VERSION=2.110.0 scripts/supabase-local.sh test
+SUPABASE_CLI_VERSION=2.110.0 scripts/supabase-local.sh stop
+```
 
-# 2. Push migrations
+Required results:
+
+- Fresh migrations complete without warnings/errors.
+- Effective RLS tests prove account-without-membership denial, active-member read access, immediate inactive-member revocation, and no browser writes/storage access.
+- `git diff --check` and the committable secret scan pass.
+
+## Non-empty database preflight
+
+The new project is expected to be empty. If it is not, stop and investigate. Before `0004`, queries for invalid domain values and duplicate transcript positions must return zero rows. Never silently delete or rewrite unexplained records.
+
+## Controlled apply
+
+The repository owner authenticates the Supabase CLI directly in an approved shell. Do not paste tokens or database passwords into chat, command history, files, or CI logs.
+
+```bash
+supabase link --project-ref <PROJECT_REF>
+supabase db push --dry-run
+# Review the complete dry-run output and obtain the apply approval.
 supabase db push
-
-# 3. Verify schema
-supabase db diff
 ```
 
-## Verify (post-apply)
+Hosted project settings must also be checked explicitly because local `config.toml` is not a production control:
 
-- [ ] `scripts/supabase-local.sh test` — policy tests pass locally (same migration state)
-- [ ] Manual SQL check: `SELECT * FROM pg_policies WHERE schemaname = 'screening_v2' AND roles @> ARRAY['anon'::name];` — returns 0 rows
-- [ ] Manual SQL check: `SELECT * FROM information_schema.role_table_grants WHERE grantee = 'anon' AND table_schema = 'screening_v2';` — returns 0 rows
-- [ ] API smoke test: `curl https://<PROD>/rest/v1/candidates?limit=1` with anon key → HTTP 401/403
-- [ ] Authenticated test: Login as recruiter → dashboard loads candidates, sessions, transcripts
-- [ ] Realtime test: Subscribe to call_sessions channel → receives updates
-- [ ] Storage test: Upload/download to resumes_v2 as authenticated user
+- Exposed schemas include `screening_v2` only as required by the dashboard.
+- Public email/phone signup and anonymous sign-in are disabled.
+- Password/MFA/session policies match SEC-01 approval.
+- Storage buckets `resumes_v2` and `recordings_v2` are private.
+- Network restrictions, backups/PITR, Auth redirect URLs, and Realtime limits match the approved environment record.
 
-## Rollback
+## Post-apply verification
 
-```bash
-# If hardening migration (0004) causes issues:
-# 1. Link to production project
-supabase link --project-ref <PROD_REF>
+- [ ] No policy in `screening_v2` targets `anon` or `PUBLIC`.
+- [ ] `anon` has no effective privilege on any `screening_v2` table.
+- [ ] `authenticated` has no INSERT/UPDATE/DELETE privilege.
+- [ ] An authenticated synthetic account without membership reads zero dashboard rows.
+- [ ] An owner-provisioned active synthetic membership can read dashboard rows and only its own membership record.
+- [ ] Deactivating that membership removes access immediately.
+- [ ] Realtime sends only authorized session/transcript/assessment rows.
+- [ ] Direct browser access to both private storage buckets fails.
+- [ ] No production candidate data is introduced during verification.
 
-# 2. Repair migration table to mark 0004 as not applied
-#    (manual SQL via Supabase Dashboard SQL Editor)
-update supabase_migrations.schema_migrations
-  set version = '0003'
-  where version = '0004';
-delete from supabase_migrations.schema_migrations where version = '0004';
+Application login/MFA, RBAC, invite exchange, and authorized storage-download smoke tests remain blocked on SEC-01 through SEC-04 and MIG-06; this database PR must not claim those gates complete.
 
-# 3. Re-run 0001-0003 manually if needed
-supabase db push  # will only push 0001-0003
-```
+## Failure and recovery
 
-## Notifications
+Do **not** modify `supabase_migrations.schema_migrations` and do not attempt to undo a migration by rerunning older files.
 
-- [ ] Post-apply report in #eng-deploy: migrations applied, verifications passed
-- [ ] If rollback executed: incident report with timeline and root cause
+Before traffic/data:
 
----
+1. Stop the apply and preserve logs.
+2. If the transaction rolled back, fix forward in a reviewed PR and rehearse locally.
+3. If partial external configuration exists, reconcile it explicitly.
+4. Recreate/reset the unused project only with DB Admin/Security approval.
 
-**Note**: This runbook is for **manual execution by the repository owner** after PR review.
-No automated production apply is configured. All production changes require explicit owner action.
+After any data or traffic exists, stop processing and use the approved backup/restore or forward-repair runbook. Production cutover is out of scope for this PR.

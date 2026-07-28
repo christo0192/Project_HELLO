@@ -4,10 +4,16 @@ on:
   pull_request:
     paths:
       - 'app/supabase/**'
+      - 'scripts/supabase-*.sh'
+      - 'docs/runbooks/supabase-*.md'
+      - '.github/workflows/supabase-*.yml'
   push:
     branches: [main]
     paths:
       - 'app/supabase/**'
+      - 'scripts/supabase-*.sh'
+      - 'docs/runbooks/supabase-*.md'
+      - '.github/workflows/supabase-*.yml'
   workflow_dispatch:
 
 permissions:
@@ -15,66 +21,64 @@ permissions:
 
 jobs:
   supabase-check:
-    name: supabase-check
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
-
-      - name: Install Supabase CLI
-        run: npm install supabase --save-dev
-
-      - name: Start Supabase & run tests
+      - name: Run fresh migration and effective RLS tests
+        env:
+          SUPABASE_CLI_VERSION: 2.110.0
         run: bash scripts/supabase-test.sh
 
-  supabase-syntax:
-    name: supabase-syntax
+  supabase-static-security:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Validate SQL syntax (static check)
+      - uses: actions/checkout@v4
+      - name: Validate shell and diff hygiene
         run: |
-          echo "Checking SQL syntax..."
-          for f in app/supabase/migrations/*.sql; do
-            echo "  $f"
-            # Basic SQL syntax check: all statements end with ;
-            awk '!/^--/ && NF>0 && !/;$/{print "WARNING: line "NR" missing semicolon"}' "$f" \
-              | grep -v '^\s*$' && echo "  ^ potential issues in $f" || true
-          done
-          echo "SQL syntax check complete."
-
-  supabase-diff:
-    name: supabase-diff
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Check migration file naming convention
+          bash -n scripts/supabase-local.sh scripts/supabase-test.sh
+          git diff --check HEAD^ HEAD
+      - name: Reject unsafe migration patterns
         run: |
-          echo "Validating migration filenames..."
-          for f in app/supabase/migrations/*.sql; do
-            base=$(basename "$f")
-            if ! echo "$base" | grep -qE '^[0-9]{4}_.*\.sql$'; then
-              echo "ERROR: $base does not match pattern NNNN_name.sql"
-              exit 1
-            fi
-          done
-          echo "All migration filenames valid."
+          python3 - <<'PY'
+          import pathlib, re, sys
 
-      - name: Check for duplicate migration numbers
-        run: |
-          dups=$(ls app/supabase/migrations/*.sql | sed 's|.*/||' | cut -d_ -f1 | sort | uniq -d)
-          if [ -n "$dups" ]; then
-            echo "ERROR: Duplicate migration numbers: $dups"
-            exit 1
-          fi
-          echo "No duplicate migration numbers."
+          errors = []
+          migration_dir = pathlib.Path('app/supabase/migrations')
+          files = sorted(migration_dir.glob('*.sql'))
+          numbers = []
+          for path in files:
+              match = re.fullmatch(r'(\d{4})_[a-z0-9_]+\.sql', path.name)
+              if not match:
+                  errors.append(f'{path}: invalid migration filename')
+                  continue
+              numbers.append(match.group(1))
+              text = path.read_text(encoding='utf-8')
+              statements = [s.lower() for s in text.split(';')]
+              for statement in statements:
+                  compact = ' '.join(statement.split())
+                  if re.search(r'grant all privileges .* to .*\b(anon|authenticated)\b', compact):
+                      errors.append(f'{path}: broad browser-role GRANT')
+                  if 'create policy' in compact and re.search(r'\bto\s+(anon|public)\b', compact):
+                      errors.append(f'{path}: anon/PUBLIC policy')
+                  if 'create policy' in compact and ' to authenticated' in compact and re.search(r'for (insert|update|delete|all)', compact):
+                      errors.append(f'{path}: direct authenticated write policy')
+                  if 'using (true)' in compact or 'with check (true)' in compact:
+                      errors.append(f'{path}: unconditional RLS expression')
+          if len(numbers) != len(set(numbers)):
+              errors.append('duplicate migration number')
+
+          config = pathlib.Path('app/supabase/config.toml').read_text(encoding='utf-8')
+          if 'schemas = ["public", "graphql_public", "screening_v2"]' not in config:
+              errors.append('config.toml: screening_v2 is not exposed locally')
+          if not re.search(r'\[auth\].*?enable_signup = false', config, re.S):
+              errors.append('config.toml: public Auth signup is not disabled')
+
+          if errors:
+              print('\n'.join(f'ERROR: {e}' for e in errors))
+              sys.exit(1)
+          print(f'Validated {len(files)} migrations and local Auth configuration.')
+          PY

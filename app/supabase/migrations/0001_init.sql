@@ -165,17 +165,19 @@ alter table screening_v2.call_queue       enable row level security;
 alter table screening_v2.sms_follow_ups   enable row level security;
 alter table screening_v2.ats_sync_log     enable row level security;
 
--- ---------- Grant API roles access to the new schema ----------------
--- A custom schema doesn't inherit public's grants. Backend uses service_role
--- (bypasses RLS); anon/authenticated are granted too but still blocked by the
--- deny-by-default RLS above (no policies = no access).
-grant usage on schema screening_v2 to anon, authenticated, service_role;
-grant all privileges on all tables    in schema screening_v2 to anon, authenticated, service_role;
-grant all privileges on all sequences in schema screening_v2 to anon, authenticated, service_role;
-grant all privileges on all functions in schema screening_v2 to anon, authenticated, service_role;
-alter default privileges in schema screening_v2 grant all on tables    to anon, authenticated, service_role;
-alter default privileges in schema screening_v2 grant all on sequences to anon, authenticated, service_role;
-alter default privileges in schema screening_v2 grant all on functions to anon, authenticated, service_role;
+-- ---------- Server-only baseline grants -----------------------------
+-- The initial production state is deny-by-default for browser roles.
+-- Migration 0004 grants narrowly scoped authenticated read access only
+-- after an active recruiter-membership check. Backend services use the
+-- server-only service_role, which bypasses RLS.
+revoke all on schema screening_v2 from anon, authenticated;
+grant usage on schema screening_v2 to service_role;
+grant all privileges on all tables    in schema screening_v2 to service_role;
+grant all privileges on all sequences in schema screening_v2 to service_role;
+grant all privileges on all functions in schema screening_v2 to service_role;
+alter default privileges in schema screening_v2 grant all on tables    to service_role;
+alter default privileges in schema screening_v2 grant all on sequences to service_role;
+alter default privileges in schema screening_v2 grant all on functions to service_role;
 
 -- ---------- Storage buckets (global; v2-suffixed to avoid v1 clash) -
 insert into storage.buckets (id, name, public)
