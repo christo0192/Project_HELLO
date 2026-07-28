@@ -55,11 +55,10 @@ variable "visibility_timeout_seconds" {
   default     = 600 # 10 minutes
 }
 
-variable "queue_monthly_cost_threshold" {
-  description = "Monthly cost threshold in USD for queue cost alarm (OCI Queue is pay-per-request, NOT Always Free)"
-  type        = number
-  default     = 5
-}
+# No per-request cost alarm is provisioned — the compartment budget alert rule
+# in the foundation module is the authoritative cost guardrail.
+# OCI Queue pricing: first 1M requests/month no-charge as of 2026-07-28
+# (not an Always Free guarantee; see https://www.oracle.com/cloud/queue/pricing/)
 
 variable "notification_topic_id" {
   description = "Notification topic OCID for alarm destinations"

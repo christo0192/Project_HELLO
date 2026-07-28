@@ -21,7 +21,6 @@ variable "cost_center" {
 }
 
 variable "alert_email" {
-  description = "Email address for budget and alarm notifications"
+  description = "Email address for budget and alarm notifications (required — no default)"
   type        = string
-  default     = "alerts@example.com"
 }

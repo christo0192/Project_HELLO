@@ -1,7 +1,7 @@
 # OCI Terraform Module Audit
 
 **Date:** 2026-07-28
-**Updated:** 2026-07-28 (repair: DLQ, pricing, budget, APM, port-80)
+**Updated:** 2026-07-28 (repair r2: real OCI metrics, remove budget alarm, REL-04 honest, email required)
 **Plan references:** FND-05/06, REL-01/04, OBS-01..06, DEP-02..07
 
 ## PLAN cross-reference
@@ -10,8 +10,8 @@
 |---------|-------------|-------------------|
 | FND-05 | Secret manager/KMS | `modules/foundation/vault.tf` — OCI Vault + key references |
 | FND-06 | Least-privilege service accounts | `modules/foundation/iam.tf` — dynamic groups + policies |
-| REL-01 | Durable job queue | `modules/queue/` — OCI Queue with service-managed internal DLQ |
-| REL-04 | Retry/DLQ | `modules/queue/` — `dead_letter_queue_delivery_count` on primary queue |
+| REL-01 | Durable job queue | `modules/queue/` — OCI Queue with `MessagesInQueueCount` + `ConsumerLag` alarms |
+| REL-04 | Retry/DLQ | PARTIAL — `dead_letter_queue_delivery_count` configures service-managed internal DLQ; automated DLQ detection/alert remains PENDING a queue consumer or custom-metric integration (the internal DLQ sub-queue has no separate Monitoring metric) |
 | OBS-01..02 | Structured logging + correlation | `modules/observability/logging.tf` — OCI Logging |
 | OBS-03..04 | Metrics + distributed tracing | `modules/observability/monitoring.tf` + `apm.tf` |
 | OBS-05..06 | SLI/SLO + alerting | `modules/observability/alarms.tf` + notifications |
@@ -37,10 +37,15 @@ All resources below are from `hashicorp/oci` provider ≥ 5.x and are stable.
 
 ### Queue — Confirmed
 - `oci_queue_queue` — OCI Queue service (GA)
+- Metrics use authoritative namespace `oci_queue`, dimensions `resourceId` (queue OCID) and `isVisible`:
+  - `MessagesInQueueCount` with `isVisible = 'true'` for queue-depth alarm
+  - `ConsumerLag` (minutes) for consumer-lag alarm
 - Dead-letter is the OCI service-managed internal sub-queue, controlled by `dead_letter_queue_delivery_count` on the primary queue
 - No separate DLQ queue resource is provisioned (the OCI provider does not expose a `dead_letter_queue_id` attribute to cross-reference queues)
-- DLQ inspection requires OCI Console or Queue API — no separate Monitoring metric exists for the internal sub-queue
+- DLQ inspection requires OCI Console or Queue API — the internal DLQ sub-queue has no separate Monitoring metric
+- REL-04 is PARTIALLY addressed: internal DLQ is configured, but automated DLQ detection/alert is PENDING a queue consumer or custom-metric integration
 - OCI Queue is NOT an Always Free service. A first-1M-requests/month no-charge tier was documented as of 2026-07-28 but is not an Always Free guarantee. Pricing: https://www.oracle.com/cloud/queue/pricing/
+- No per-request cost alarm is provisioned — the compartment `oci_budget_alert_rule` is the authoritative cost guardrail
 
 ### Observability — Confirmed
 - `oci_logging_log_group`, `oci_logging_log`
@@ -56,9 +61,10 @@ All resources below are from `hashicorp/oci` provider ≥ 5.x and are stable.
 - No Service Connector Hub — log groups capture directly
 - No direct credential values — Vault references are placeholder ARNs only
 - No separate DLQ queue resource — OCI uses service-managed internal DLQ sub-queue
-- No duplicate compartment budgets — foundation module owns the single authoritative budget
+- No duplicate compartment budgets or budget alarms — foundation `oci_budget_alert_rule` is the only cost alarm
 - Port 80 ingress is gated behind `enable_http_ingress` (default false)
 - APM trace sampling is agent/collector-level configuration, not a domain attribute
+- All alert email variables are required (no `alerts@example.com` default)
 
 ## App boundary validation
 

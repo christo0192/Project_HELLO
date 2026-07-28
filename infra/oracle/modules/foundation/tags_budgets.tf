@@ -62,12 +62,6 @@ variable "budget_alert_threshold" {
 }
 
 variable "budget_alert_email" {
-  description = "Email recipient for budget alerts"
+  description = "Email recipient for budget alerts (required — no default)"
   type        = string
-  default     = "alerts@example.com"
-}
-
-output "budget_id" {
-  description = "Compartment budget OCID — referenced by observability alarms"
-  value       = oci_budget_budget.this.id
 }

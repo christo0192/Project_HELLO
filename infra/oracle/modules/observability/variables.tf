@@ -1,6 +1,6 @@
-# Observability module: OCI Logging, Monitoring, APM, Notifications, budget guardrails
+# Observability module: OCI Logging, Monitoring, APM, Notifications
 # Region is always an input.
-# Budget is managed by the foundation module — this module only creates a daily-spend alarm.
+# The foundation module owns the single authoritative compartment budget and alert rule.
 
 variable "region" {
   description = "OCI region"
@@ -29,15 +29,9 @@ variable "project_name" {
   default     = "hr-screening"
 }
 
-variable "foundation_budget_id" {
-  description = "OCID of the authoritative compartment budget created by the foundation module"
-  type        = string
-}
-
 variable "notification_email" {
-  description = "Email address for budget and alarm notifications"
+  description = "Email address for alarm notifications (required — no default)"
   type        = string
-  default     = "alerts@example.com"
 }
 
 variable "log_retention_days" {

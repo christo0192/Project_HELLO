@@ -204,20 +204,20 @@ control, and a verified rollback window.
 
 ## Alarm Reference
 
-| Alarm | Condition | Severity | Action |
-|-------|-----------|----------|--------|
-| Queue depth > 100 | Backlog | CRITICAL | Check consumers, scale workers |
-| Queue message age > 5 min | Processing delay | WARNING | Check worker health |
-| Queue cost threshold | Request rate may exceed monthly cost estimate | WARNING | Review queue usage and current pricing |
-| Monitoring ingestion rate | > 1000 dp/min | WARNING | Check for metric storm |
-| Log ingestion rate | > 1 MB/min | WARNING | Check for log flood, PII leak |
-| Daily spend > $1 | Compartment daily spend | WARNING | Review spend in OCI Console |
-| Budget > threshold % | Cost | WARNING | Review spend, check for unused resources |
+| Alarm | Metric | Condition | Severity | Action |
+|-------|--------|-----------|----------|--------|
+| Queue depth | `MessagesInQueueCount` | Visible messages > 100 | CRITICAL | Check consumers, scale workers |
+| Consumer lag | `ConsumerLag` | Lag > 5 minutes | WARNING | Check consumer processing latency |
+| Monitoring ingestion rate | `IngestionDatapoints` | > 1000 dp/min | WARNING | Check for metric storm |
+| Log ingestion rate | `LogIngestionBytes` | > 1 MB/min | WARNING | Check for log flood, PII leak |
+| Budget > threshold % | `oci_budget_alert_rule` | Actual spend > threshold % | WARNING | Review spend, check for unused resources |
 
 **DLQ note:** OCI Queue uses a service-managed internal dead-letter sub-queue.
-Dead-lettered messages cannot be monitored via OCI Monitoring alarms.
+Dead-lettered messages are NOT surfaced as separate Monitoring metrics.
 Operators must inspect the DLQ via OCI Console → Queue → Dead Letter Queue tab or use the Queue API.
-See `modules/queue/alarms.tf` for details.
+
+**REL-04 status:** Internal DLQ is configured (`dead_letter_queue_delivery_count`).
+Automated DLQ detection/alert is PENDING a queue consumer or custom-metric integration.
 
 ### Dead-Letter Queue Inspection
 
@@ -225,8 +225,7 @@ See `modules/queue/alarms.tf` for details.
 # List queues to find the primary queue OCID
 oci queue queue list --compartment-id "${COMPARTMENT_ID}"
 
-# View dead-letter messages via Queue API (requires queue messages endpoint)
-# The DLQ is a sub-queue of the primary; use the Queue Console or REST API:
+# View dead-letter messages via Queue API
 # GET https://{queue-messages-endpoint}/deadLetterQueue/messages
 ```
 

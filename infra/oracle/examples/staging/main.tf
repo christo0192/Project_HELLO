@@ -8,11 +8,12 @@
 module "foundation" {
   source = "../../modules/foundation"
 
-  region       = var.region
-  tenancy_ocid = var.tenancy_ocid
-  environment  = "staging"
-  project_name = var.project_name
-  cost_center  = var.cost_center
+  region             = var.region
+  tenancy_ocid       = var.tenancy_ocid
+  environment        = "staging"
+  project_name       = var.project_name
+  cost_center        = var.cost_center
+  budget_alert_email = var.alert_email
 
   # Staging: single availability domain, smaller CIDR blocks
   vcn_cidr            = "10.1.0.0/16"
@@ -31,11 +32,10 @@ module "queue" {
   project_name          = var.project_name
   notification_topic_id = module.observability.notification_topic_id
 
-  primary_queue_name           = "session-jobs-staging"
-  dead_letter_delivery_count   = 3
-  message_retention_seconds    = 86400 # 1 day
-  visibility_timeout_seconds   = 300
-  queue_monthly_cost_threshold = 5 # USD — OCI Queue is pay-per-request, NOT Always Free
+  primary_queue_name         = "session-jobs-staging"
+  dead_letter_delivery_count = 3
+  message_retention_seconds  = 86400 # 1 day
+  visibility_timeout_seconds = 300
 }
 
 module "observability" {
@@ -47,8 +47,7 @@ module "observability" {
   environment    = "staging"
   project_name   = var.project_name
 
-  foundation_budget_id = module.foundation.budget_id
-  notification_email   = var.alert_email
+  notification_email = var.alert_email
 
   # Log retention (staging: shorter)
   log_retention_days = 30

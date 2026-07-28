@@ -8,11 +8,12 @@
 module "foundation" {
   source = "../../modules/foundation"
 
-  region       = var.region
-  tenancy_ocid = var.tenancy_ocid
-  environment  = "production"
-  project_name = var.project_name
-  cost_center  = var.cost_center
+  region             = var.region
+  tenancy_ocid       = var.tenancy_ocid
+  environment        = "production"
+  project_name       = var.project_name
+  cost_center        = var.cost_center
+  budget_alert_email = var.alert_email
 
   # Production: larger CIDR blocks, NAT gateway
   vcn_cidr            = "10.0.0.0/16"
@@ -31,11 +32,10 @@ module "queue" {
   project_name          = var.project_name
   notification_topic_id = module.observability.notification_topic_id
 
-  primary_queue_name           = "session-jobs-prod"
-  dead_letter_delivery_count   = 5
-  message_retention_seconds    = 1209600 # 14 days
-  visibility_timeout_seconds   = 600
-  queue_monthly_cost_threshold = 5 # USD — OCI Queue is pay-per-request, NOT Always Free
+  primary_queue_name         = "session-jobs-prod"
+  dead_letter_delivery_count = 5
+  message_retention_seconds  = 1209600 # 14 days
+  visibility_timeout_seconds = 600
 }
 
 module "observability" {
@@ -47,8 +47,7 @@ module "observability" {
   environment    = "production"
   project_name   = var.project_name
 
-  foundation_budget_id = module.foundation.budget_id
-  notification_email   = var.alert_email
+  notification_email = var.alert_email
 
   # Log retention (production: longer)
   log_retention_days = 90
