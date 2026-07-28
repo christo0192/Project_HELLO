@@ -843,3 +843,122 @@ describe('security-sensitive endpoints', () => {
     expect(hasNoStacktrace(res)).toBe(true);
   });
 });
+
+// ===================================================================
+//  SECURITY HEADERS (SEC-09)
+// ===================================================================
+
+describe('security headers', () => {
+  // ── Reusable compact assertions ─────────────────────────────────
+
+  /** Assert the four always-on headers are present with correct values. */
+  function assertBaseHeaders(res: request.Response, extra: Record<string, string | null> = {}) {
+    expect(res.headers['x-content-type-options']).toBe('nosniff');
+    expect(res.headers['x-frame-options']).toBe('DENY');
+    expect(res.headers['referrer-policy']).toBe('strict-origin-when-cross-origin');
+    expect(res.headers['permissions-policy']).toBe('camera=(), microphone=(), geolocation=()');
+    for (const [k, v] of Object.entries(extra)) {
+      if (v === null) expect(res.headers[k]).toBeUndefined();
+      else expect(res.headers[k]).toBe(v);
+    }
+  }
+
+  /** Assert X-Powered-By is absent. */
+  function assertNoPoweredBy(res: request.Response) {
+    expect(res.headers['x-powered-by']).toBeUndefined();
+  }
+
+  // ── Happy path: GET + HEAD on health endpoint ──────────────────
+
+  it('sets all base headers on GET /api/health', async () => {
+    const res = await request(app).get('/api/health');
+    assertNoPoweredBy(res);
+    assertBaseHeaders(res, { 'strict-transport-security': null });
+    expect(res.status).toBe(200);
+  });
+
+  it('sets all base headers on HEAD /api/health', async () => {
+    const res = await request(app).head('/api/health');
+    assertNoPoweredBy(res);
+    assertBaseHeaders(res, { 'strict-transport-security': null });
+  });
+
+  // ── OPTIONS preflight must carry headers ───────────────────────
+
+  it('sets base headers on OPTIONS preflight', async () => {
+    const res = await request(app)
+      .options('/api/health')
+      .set('Origin', 'http://localhost:5173')
+      .set('Access-Control-Request-Method', 'GET');
+    assertNoPoweredBy(res);
+    assertBaseHeaders(res);
+  });
+
+  // ── HSTS: production vs non-production (no global env mutation) ─
+
+  it('does NOT set HSTS in non-production (default)', async () => {
+    const res = await request(app).get('/api/health');
+    expect(res.headers['strict-transport-security']).toBeUndefined();
+  });
+
+  it('sets HSTS when nodeEnv is production', async () => {
+    const prodApp = createApp({ nodeEnv: 'production' });
+    const res = await request(prodApp).get('/api/health');
+    assertBaseHeaders(res, {
+      'strict-transport-security': 'max-age=31536000; includeSubDomains',
+    });
+  });
+
+  // ── Error paths must still carry security headers ──────────────
+
+  it('sets base headers on malformed JSON 400', async () => {
+    const res = await request(app)
+      .post('/api/roles')
+      .set('Content-Type', 'application/json')
+      .send('not-json');
+    assertNoPoweredBy(res);
+    assertBaseHeaders(res);
+    expect(res.status).toBe(400);
+    expect(res.body?.error?.type).toBe('malformed_request');
+  });
+
+  it('sets base headers on CORS-blocked error', async () => {
+    const res = await request(app)
+      .get('/api/health')
+      .set('Origin', 'https://evil.example.com');
+    // CORS rejects before route handling; the final handler sanitizes the error.
+    assertNoPoweredBy(res);
+    assertBaseHeaders(res);
+    // The response should come through the finalErrorHandler
+    expect(res.status).toBe(500);
+    expect(res.body?.error?.type).toBe('internal_error');
+    expect(JSON.stringify(res.body)).not.toContain('stack');
+  });
+
+  it('sets base headers on sanitized 500 error', async () => {
+    // Trigger a 500 via finalErrorHandler: supabase returns a truthy error
+    // (not null) that the list route forwards via next(error). finalErrorHandler
+    // sanitizes it to a 500 with internal_error type.
+    supabaseMock.from.mockReturnValue(chainable({ data: null, error: { code: 'PGRST999' } }));
+    const res = await request(app).get('/api/roles');
+    assertNoPoweredBy(res);
+    assertBaseHeaders(res);
+    expect(res.status).toBe(500);
+    expect(res.body?.error?.type).toBe('internal_error');
+    expect(JSON.stringify(res.body)).not.toContain('stack');
+  });
+
+  // ── X-Powered-By must never appear ─────────────────────────────
+
+  it('never sends X-Powered-By header', async () => {
+    const paths = ['/api/health', '/api/roles'];
+    supabaseMock.from.mockReturnValue(chainable({ data: [], error: null }));
+
+    for (const path of paths) {
+      const res = await request(app).get(path);
+      expect(res.headers['x-powered-by']).toBeUndefined();
+      expect(res.headers['x-content-type-options']).toBe('nosniff');
+      expect(res.headers['x-frame-options']).toBe('DENY');
+    }
+  });
+});

@@ -1,6 +1,6 @@
 # Project Handover
 
-**Last updated:** 2026-07-28 07:46 UTC
+**Last updated:** 2026-07-28 08:45 UTC
 
 **Repository:** `https://github.com/christo0192/Project_HELLO`
 
@@ -10,10 +10,9 @@
 
 ## Resume Here
 
-The repository is on branch `feat/sec-10-dependency-policy`, based on merge
-commit `8d54a7092759ad72b7da9750bc9a4c54de5de33c` (PR #3 merged). SEC-10
-dependency policy is in review in
-[PR #4](https://github.com/christo0192/Project_HELLO/pull/4).
+PR #4 (SEC-10) is merged. Branch `feat/sec-09-security-headers` is based on
+`main` commit `6d75b5b`. SEC-09 security headers are in review in
+[PR #5](https://github.com/christo0192/Project_HELLO/pull/5).
 
 When resuming after the branch is merged:
 
@@ -35,7 +34,8 @@ cat docs/HANDOVER.md
 | FND-04 environment contract | Complete | [PR #1](https://github.com/christo0192/Project_HELLO/pull/1), merged 2026-07-27 |
 | FND-07 architecture decisions | Complete | [PR #2](https://github.com/christo0192/Project_HELLO/pull/2), merged 2026-07-27 |
 | SEC-05 API input validation | Complete | [PR #3](https://github.com/christo0192/Project_HELLO/pull/3), merged 2026-07-28 |
-| SEC-10 dependency policy | In review | [PR #4](https://github.com/christo0192/Project_HELLO/pull/4); lockfile audit, CycloneDX SBOM, exception registry, and seeded policy tests implemented |
+| SEC-10 dependency policy | Complete | [PR #4](https://github.com/christo0192/Project_HELLO/pull/4), merged 2026-07-28 |
+| SEC-09 security headers | In review | [PR #5](https://github.com/christo0192/Project_HELLO/pull/5) |
 
 SEC-05 adds strict Zod schemas for accepted body, path, query, and multipart
 field inputs; stable malformed/oversized request responses; sanitized unexpected
@@ -53,6 +53,20 @@ metadata and expiry, stale exceptions, architecture invariants, and cyclic
 references); postcss remediated in the web lockfile (8.5.23); and react-router RSC
 advisory excepted with an automated invariant guard and project scoping to
 app/web.
+
+SEC-09 adds Express middleware that sets X-Content-Type-Options (nosniff),
+X-Frame-Options (DENY), Referrer-Policy (strict-origin-when-cross-origin),
+and Permissions-Policy (camera/microphone/geolocation disabled) on every
+response — including OPTIONS preflight, CORS-blocked, and error responses.
+Express X-Powered-By is disabled. Strict-Transport-Security
+(max-age=31536000; includeSubDomains) is set only when NODE_ENV=production,
+keeping local development unaffected. NODE_ENV is registered in the
+environment schema and example. Production deployment verification via
+Mozilla Observatory (target: B+) is still pending and will likely require
+coordination with the SEC-07 Content-Security-Policy implementation.
+`createApp()` accepts an optional `nodeEnv` parameter so tests can verify
+HSTS behaviour without mutating global `process.env`. SEC-09 remains incomplete
+until the deployed endpoint reaches the required Mozilla Observatory B+ score.
 
 ## Current Verification
 
@@ -74,10 +88,11 @@ bash scripts/sbom.sh
 git diff --check
 ```
 
-Latest SEC-10 branch results:
+Latest SEC-09 branch results:
 
 - API TypeScript typecheck: passed.
-- API tests: passed.
+- API tests: 63 passed, including GET, HEAD, preflight, malformed-request,
+  CORS-error, sanitized-500, HSTS-gating, and fingerprint-suppression coverage.
 - API dependency audit: passing (no vulnerabilities, no stale exceptions).
 - Web lint and production build: passed.
 - Web dependency audit: passing with a documented exception for react-router
@@ -94,10 +109,11 @@ Latest SEC-10 branch results:
 
 ## Remaining Production Work
 
-FND-04, FND-07, and SEC-05 are complete plan tasks. FND-01 is partial and
-SEC-10 is in review in [PR #4](https://github.com/christo0192/Project_HELLO/pull/4). All other P0 tasks
-in `PLAN.md` remain open unless a later handover explicitly marks them
-complete.
+FND-04, FND-07, SEC-05, and SEC-10 are complete plan tasks. FND-01 is partial,
+and SEC-09 is in review in
+[PR #5](https://github.com/christo0192/Project_HELLO/pull/5), with deployed
+Mozilla Observatory B+ verification still pending. All other P0 tasks in
+`PLAN.md` remain open unless a later handover explicitly marks them complete.
 
 Immediate external blockers:
 
@@ -121,8 +137,7 @@ Highest-risk engineering gaps:
 
 - No recruiter authentication, MFA, RBAC, tenant isolation, or candidate invite
   exchange (SEC-01 through SEC-04).
-- No rate limiting, exact production CORS/CSP policy, security headers, or CSRF
-  decision (SEC-06 through SEC-09).
+- No rate limiting, exact production CORS/CSP policy, or CSRF decision (SEC-06 through SEC-08).
 - The web build retains a known chunk-size warning.
 - Sensitive candidate/resume/rubric context is still placed in client-visible
   LiveKit metadata (SEC-13).
@@ -136,9 +151,9 @@ Highest-risk engineering gaps:
 
 ## Next Step
 
-After SEC-10 is merged, the next independent engineering PR should implement
-SEC-09 (security headers), then SEC-07 (exact CORS and CSP). SEC-01 through
-SEC-04 follow the approved authentication and tenancy decisions.
+After SEC-09 is merged, the next independent engineering PR should implement
+SEC-07 (exact CORS and CSP). SEC-01 through SEC-04 follow the approved
+authentication and tenancy decisions.
 
 ## Working Rules
 
