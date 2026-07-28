@@ -843,3 +843,63 @@ describe('security-sensitive endpoints', () => {
     expect(hasNoStacktrace(res)).toBe(true);
   });
 });
+
+// ===================================================================
+//  SECURITY HEADERS (SEC-09)
+// ===================================================================
+
+describe('security headers', () => {
+  it('sets X-Content-Type-Options: nosniff', async () => {
+    const res = await request(app).get('/api/health');
+    expect(res.headers['x-content-type-options']).toBe('nosniff');
+  });
+
+  it('sets X-Frame-Options: DENY', async () => {
+    const res = await request(app).get('/api/health');
+    expect(res.headers['x-frame-options']).toBe('DENY');
+  });
+
+  it('sets Referrer-Policy: strict-origin-when-cross-origin', async () => {
+    const res = await request(app).get('/api/health');
+    expect(res.headers['referrer-policy']).toBe('strict-origin-when-cross-origin');
+  });
+
+  it('sets Permissions-Policy restricting sensitive features', async () => {
+    const res = await request(app).get('/api/health');
+    expect(res.headers['permissions-policy']).toBe(
+      'camera=(), microphone=(), geolocation=()',
+    );
+  });
+
+  it('does NOT set HSTS in non-production (default NODE_ENV)', async () => {
+    const res = await request(app).get('/api/health');
+    expect(res.headers['strict-transport-security']).toBeUndefined();
+  });
+
+  it('sets HSTS when NODE_ENV is production', async () => {
+    const prev = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      const prodApp = createApp();
+      const res = await request(prodApp).get('/api/health');
+      expect(res.headers['strict-transport-security']).toBe(
+        'max-age=31536000; includeSubDomains',
+      );
+    } finally {
+      process.env.NODE_ENV = prev;
+    }
+  });
+
+  it('all security headers present on multiple API routes', async () => {
+    // Headers are set by middleware before route handlers — test two paths
+    supabaseMock.from.mockReturnValue(chainable({ data: [], error: null }));
+
+    for (const path of ['/api/health', '/api/roles']) {
+      const res = await request(app).get(path);
+      expect(res.headers['x-content-type-options']).toBe('nosniff');
+      expect(res.headers['x-frame-options']).toBe('DENY');
+      expect(res.headers['referrer-policy']).toBe('strict-origin-when-cross-origin');
+      expect(res.headers['permissions-policy']).toBeDefined();
+    }
+  });
+});

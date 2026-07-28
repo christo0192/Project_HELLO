@@ -18,7 +18,8 @@
         "LIVEKIT_URL": { "requiredInProduction": true, "secret": false },
         "LIVEKIT_API_KEY": { "requiredInProduction": true, "secret": true },
         "LIVEKIT_API_SECRET": { "requiredInProduction": true, "secret": true },
-        "RECORDINGS_BUCKET": { "requiredInProduction": true, "secret": false }
+        "RECORDINGS_BUCKET": { "requiredInProduction": true, "secret": false },
+        "NODE_ENV": { "requiredInProduction": false, "secret": false }
       }
     },
     "web": {

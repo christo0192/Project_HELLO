@@ -1,6 +1,6 @@
 # Project Handover
 
-**Last updated:** 2026-07-28 07:46 UTC
+**Last updated:** 2026-07-28 08:15 UTC
 
 **Repository:** `https://github.com/christo0192/Project_HELLO`
 
@@ -10,10 +10,9 @@
 
 ## Resume Here
 
-The repository is on branch `feat/sec-10-dependency-policy`, based on merge
-commit `8d54a7092759ad72b7da9750bc9a4c54de5de33c` (PR #3 merged). SEC-10
-dependency policy is in review in
-[PR #4](https://github.com/christo0192/Project_HELLO/pull/4).
+PR #4 (SEC-10) is merged. The repository is on `main` at commit `6d75b5b`.
+SEC-09 security headers are in review in
+[PR #5](https://github.com/christo0192/Project_HELLO/pull/5).
 
 When resuming after the branch is merged:
 
@@ -35,7 +34,8 @@ cat docs/HANDOVER.md
 | FND-04 environment contract | Complete | [PR #1](https://github.com/christo0192/Project_HELLO/pull/1), merged 2026-07-27 |
 | FND-07 architecture decisions | Complete | [PR #2](https://github.com/christo0192/Project_HELLO/pull/2), merged 2026-07-27 |
 | SEC-05 API input validation | Complete | [PR #3](https://github.com/christo0192/Project_HELLO/pull/3), merged 2026-07-28 |
-| SEC-10 dependency policy | In review | [PR #4](https://github.com/christo0192/Project_HELLO/pull/4); lockfile audit, CycloneDX SBOM, exception registry, and seeded policy tests implemented |
+| SEC-10 dependency policy | Complete | [PR #4](https://github.com/christo0192/Project_HELLO/pull/4), merged 2026-07-28 |
+| SEC-09 security headers | In review | [PR #5](https://github.com/christo0192/Project_HELLO/pull/5) |
 
 SEC-05 adds strict Zod schemas for accepted body, path, query, and multipart
 field inputs; stable malformed/oversized request responses; sanitized unexpected
@@ -53,6 +53,13 @@ metadata and expiry, stale exceptions, architecture invariants, and cyclic
 references); postcss remediated in the web lockfile (8.5.23); and react-router RSC
 advisory excepted with an automated invariant guard and project scoping to
 app/web.
+
+SEC-09 adds Express middleware that sets X-Content-Type-Options (nosniff),
+X-Frame-Options (DENY), Referrer-Policy (strict-origin-when-cross-origin),
+and Permissions-Policy (camera/microphone/geolocation disabled) on every
+response. Strict-Transport-Security (max-age=31536000; includeSubDomains)
+is set only when NODE_ENV=production, keeping local development unaffected.
+NODE_ENV is registered in the environment schema and example.
 
 ## Current Verification
 
@@ -74,7 +81,7 @@ bash scripts/sbom.sh
 git diff --check
 ```
 
-Latest SEC-10 branch results:
+Latest SEC-09 branch results:
 
 - API TypeScript typecheck: passed.
 - API tests: passed.
@@ -136,9 +143,9 @@ Highest-risk engineering gaps:
 
 ## Next Step
 
-After SEC-10 is merged, the next independent engineering PR should implement
-SEC-09 (security headers), then SEC-07 (exact CORS and CSP). SEC-01 through
-SEC-04 follow the approved authentication and tenancy decisions.
+After SEC-09 is merged, the next independent engineering PR should implement
+SEC-07 (exact CORS and CSP). SEC-01 through SEC-04 follow the approved
+authentication and tenancy decisions.
 
 ## Working Rules
 
