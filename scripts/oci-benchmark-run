@@ -540,14 +540,24 @@ ALWAYS_FREE_LIMITS = {
         "service": "Application Performance Monitoring",
         "always_free": True,
     },
-    # OCI Queue is NOT Always Free — explicitly documented
+    # OCI Queue is NOT Always Free — explicitly documented.
+    # Current pricing (retrieved 2026-07-28) may include a first-1M-requests/month
+    # no-charge tier for some tenancies; this is NOT guaranteed and may change.
     "queue_requests": {
         "limit": 0,  # Zero = not always free
         "unit": "requests/month",
         "description": "OCI Queue API requests (NOT Always Free)",
         "service": "Queue",
         "always_free": False,
-        "pricing_note": "Queue is NOT included in Always Free tier. See https://www.oracle.com/cloud/queue/pricing/",
+        "pricing_note": (
+            "Queue is NOT included in the Always Free tier. "
+            "Current OCI Queue pricing (retrieved 2026-07-28) may include "
+            "a first 1,000,000 requests/month no-charge tier; this is not "
+            "guaranteed and is separate from Always Free. "
+            "See https://www.oracle.com/cloud/queue/pricing/ for current pricing."
+        ),
+        "pricing_source": "https://www.oracle.com/cloud/queue/pricing/",
+        "pricing_retrieved": "2026-07-28",
     },
 }
 
@@ -861,7 +871,11 @@ def cmd_self_test(args):
 
     # Test: queue is correctly marked as NOT always free
     check("queue is NOT always free", not ALWAYS_FREE_LIMITS["queue_requests"]["always_free"])
-    check("queue has pricing note", "NOT included" in ALWAYS_FREE_LIMITS["queue_requests"]["pricing_note"])
+    check("queue has pricing note mentioning no-charge tier",
+          "NOT included" in ALWAYS_FREE_LIMITS["queue_requests"]["pricing_note"] and
+          "1,000,000" in ALWAYS_FREE_LIMITS["queue_requests"]["pricing_note"])
+    check("queue pricing source is dated",
+          ALWAYS_FREE_LIMITS["queue_requests"].get("pricing_retrieved") == "2026-07-28")
 
     # Test: 0 sessions — should be 0% usage
     r_zero = calculate_allowances({"sessions_per_month": 0, "avg_session_minutes": 0})
@@ -900,6 +914,84 @@ def cmd_self_test(args):
     output = json.dumps({"disclaimer": DISCLAIMER})
     check("disclaimer mentions 2026-07-28", "2026-07-28" in DISCLAIMER)
     check("disclaimer mentions not a guarantee", "not a guarantee" in DISCLAIMER)
+
+    print("── Runbook integrity tests (static verification) ──")
+
+    # Locate the runbook
+    runbook_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "docs", "benchmarks", "oci-benchmark-runbook.md"
+    )
+    try:
+        with open(runbook_path) as f:
+            runbook = f.read()
+    except FileNotFoundError:
+        check("runbook file exists", False, f"Not found: {runbook_path}")
+        runbook = ""
+
+    # 1. Launch commands must capture OCIDs via --query 'data.id' --raw-output
+    has_mumbai_query = '--query' in runbook and "'data.id'" in runbook
+    check("runbook: Mumbai launch uses --query 'data.id' --raw-output", has_mumbai_query)
+
+    # 2. Instance ID must be captured into MUMBAI_INSTANCE_ID / HYDERABAD_INSTANCE_ID
+    check("runbook: MUMBAI_INSTANCE_ID captured from launch output",
+          'MUMBAI_INSTANCE_ID="$(oci compute instance launch' in runbook or
+          'MUMBAI_INSTANCE_ID="$(oci' in runbook)
+    check("runbook: HYDERABAD_INSTANCE_ID captured from launch output",
+          'HYDERABAD_INSTANCE_ID="$(oci compute instance launch' in runbook or
+          'HYDERABAD_INSTANCE_ID="$(oci' in runbook)
+
+    # 3. Launch must fail if OCID is blank
+    check("runbook: MUMBAI_INSTANCE_ID blank check present",
+          '-z "${MUMBAI_INSTANCE_ID}"' in runbook)
+    check("runbook: HYDERABAD_INSTANCE_ID blank check present",
+          '-z "${HYDERABAD_INSTANCE_ID}"' in runbook)
+
+    # 4. Tags must be applied (purpose, ttl, region)
+    has_tags = 'freeform-tags' in runbook and 'oci-region-benchmark' in runbook
+    check("runbook: OCI freeform-tags applied with purpose=oci-region-benchmark", has_tags)
+    check("runbook: ttl tag applied", 'ttl' in runbook and '4h' in runbook)
+    check("runbook: region tag applied per instance",
+          'ap-mumbai-1' in runbook and 'ap-hyderabad-1' in runbook)
+
+    # 5. Teardown must cover BOTH Mumbai and Hyderabad explicitly
+    check("runbook: teardown covers Mumbai",
+          'ap-mumbai-1' in runbook and '--wait-for-state TERMINATED' in runbook)
+    check("runbook: teardown covers Hyderabad",
+          'ap-hyderabad-1' in runbook and '--wait-for-state TERMINATED' in runbook)
+
+    # 6. Teardown must verify no non-terminated tagged probes remain (both regions)
+    check("runbook: Mumbai teardown verification present",
+          'Non-terminated benchmark probes remain in Mumbai' in runbook or
+          'MUMBAI_REMAINING' in runbook)
+    check("runbook: Hyderabad teardown verification present",
+          'Non-terminated benchmark probes remain in Hyderabad' in runbook or
+          'HYDERABAD_REMAINING' in runbook)
+
+    # 7. Evidence step must depend on teardown verification
+    check("runbook: evidence phase mentions teardown prerequisite",
+          'not proceed to Phase 6' in runbook or
+          'teardown verification' in runbook)
+
+    # 8. Emergency teardown covers both regions with wait-for-state
+    check("runbook: emergency teardown covers Mumbai with wait",
+          'Emergency teardown: Mumbai' in runbook or
+          ('emergency' in runbook.lower() and 'ap-mumbai-1' in runbook))
+    check("runbook: emergency teardown covers Hyderabad with wait",
+          'Emergency teardown: Hyderabad' in runbook or
+          ('emergency' in runbook.lower() and 'ap-hyderabad-1' in runbook))
+
+    # 9. No benchmark-probes.env file writes (mention in explanation is OK)
+    check("runbook: no benchmark-probes.env file writes",
+          '>> benchmark-probes.env' not in runbook and
+          '> benchmark-probes.env' not in runbook and
+          'tee benchmark-probes.env' not in runbook)
+
+    # 10. No false --yes flag claim for OCI CLI launch
+    #     (saying 'there is no --yes flag' is correct and should be present)
+    check("runbook: correctly states no --yes flag for OCI CLI",
+          'no --yes flag' in runbook.lower() or
+          'does not require' in runbook.lower())
 
     # ── summary ──
     print(f"\n{'='*50}")

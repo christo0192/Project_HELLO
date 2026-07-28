@@ -1,17 +1,19 @@
 # OCI Region Benchmark — Operator Runbook
 
-**Version:** 1.0.0
+**Version:** 1.1.0
 **Date:** 2026-07-28
 **Status:** Ready for operator use — no cloud change is made by default
 
-## ⚠️  Safety Rules
+## ⚠️ Safety Rules
 
-1. **No cloud change is made by default.** Every OCI provisioning or probe command
-   requires an explicit `--yes` flag or operator-confirmed endpoint.
+1. **No cloud change is made by default.** Every OCI provisioning command requires
+   operator-supplied compartment/subnet/image IDs. There is no `--yes` flag on OCI
+   CLI instance launch — provisioning is opt-in by supplying valid resource OCIDs.
 2. **No credentials, API keys, or project endpoints are hardcoded.** All targets are
-   operator-supplied via CLI arguments or environment variables.
-3. **Destroy temporary probes after every run.** This runbook includes teardown
-   commands that must be executed before the benchmark is considered complete.
+   operator-supplied via environment variables.
+3. **Destroy temporary probes after every run.** Teardown must explicitly cover both
+   Mumbai and Hyderabad regions, wait for TERMINATED state, and verify no non-terminated
+   tagged probe remains before benchmark evidence is considered valid.
 4. **All evidence is synthetic until real probes run.** The benchmark schema and
    CLI enforce a `NOT-YET-MEASURED` state until real data is collected.
 
@@ -30,7 +32,7 @@
 Verify the CLI works without any cloud resources:
 
 ```bash
-# Run self-tests
+# Run self-tests (includes teardown-path coverage tests)
 python3 scripts/oci-benchmark-run self-test
 
 # Generate synthetic fixture data (no network calls)
@@ -64,60 +66,91 @@ capacity" errors appear, document the error and date.
 
 ## Phase 2: Provision Temporary Probe Instances
 
-> **⚠️  THIS PROVISIONS REAL OCI RESOURCES.** Only run when you are ready to incur
+> **⚠️ THIS PROVISIONS REAL OCI RESOURCES.** Only run when you are ready to incur
 > usage (even within Always Free limits). Always destroy probes when done.
+> Provisioning does not require a `--yes` flag — it runs immediately once valid
+> resource OCIDs are supplied.
 
 ### 2a. Provision in Mumbai
 
 ```bash
-# Set variables — operator must supply these
+# REQUIRED: Operator must supply these values
 export MUMBAI_COMPARTMENT_ID="ocid1.compartment.oc1..__CHANGE_ME__"
 export MUMBAI_SUBNET_ID="ocid1.subnet.oc1.ap-mumbai-1.__CHANGE_ME__"
-export MUMBAI_AD="$(oci iam availability-domain list --compartment-id "${MUMBAI_COMPARTMENT_ID}" --query 'data[0].name' --raw-output --region ap-mumbai-1)"
-export MUMBAI_IMAGE_ID="ocid1.image.oc1.ap-mumbai-1.__CHANGE_ME__"  # Oracle Linux 8
+export MUMBAI_IMAGE_ID="ocid1.image.oc1.ap-mumbai-1.__CHANGE_ME__"
+export MUMBAI_AD="$(oci iam availability-domain list \
+  --compartment-id "${MUMBAI_COMPARTMENT_ID}" \
+  --query 'data[0].name' --raw-output \
+  --region ap-mumbai-1)"
 
-# Create probe instance
-oci compute instance launch \
+export TAG_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+
+# Launch probe and capture instance OCID — must not be blank
+MUMBAI_INSTANCE_ID="$(oci compute instance launch \
   --compartment-id "${MUMBAI_COMPARTMENT_ID}" \
   --availability-domain "${MUMBAI_AD}" \
   --subnet-id "${MUMBAI_SUBNET_ID}" \
   --shape "VM.Standard.A1.Flex" \
   --shape-config '{"ocpus":1,"memoryInGBs":6}' \
   --image-id "${MUMBAI_IMAGE_ID}" \
-  --display-name "oci-benchmark-probe-mumbai-$(date +%Y%m%d-%H%M)" \
+  --display-name "oci-benchmark-probe-mumbai-${TAG_TIMESTAMP}" \
   --assign-public-ip true \
+  --freeform-tags '{"purpose":"oci-region-benchmark","ttl":"4h","region":"ap-mumbai-1"}' \
   --wait-for-state RUNNING \
-  --region ap-mumbai-1
+  --region ap-mumbai-1 \
+  --query 'data.id' --raw-output)"
+
+# Fail if OCID is blank
+if [ -z "${MUMBAI_INSTANCE_ID}" ]; then
+  echo "FATAL: MUMBAI_INSTANCE_ID is blank — launch failed or returned no ID" >&2
+  exit 1
+fi
+echo "Mumbai probe launched: ${MUMBAI_INSTANCE_ID}"
 ```
 
 ### 2b. Provision in Hyderabad
 
 ```bash
+# REQUIRED: Operator must supply these values
 export HYDERABAD_COMPARTMENT_ID="ocid1.compartment.oc1..__CHANGE_ME__"
 export HYDERABAD_SUBNET_ID="ocid1.subnet.oc1.ap-hyderabad-1.__CHANGE_ME__"
-export HYDERABAD_AD="$(oci iam availability-domain list --compartment-id "${HYDERABAD_COMPARTMENT_ID}" --query 'data[0].name' --raw-output --region ap-hyderabad-1)"
 export HYDERABAD_IMAGE_ID="ocid1.image.oc1.ap-hyderabad-1.__CHANGE_ME__"
+export HYDERABAD_AD="$(oci iam availability-domain list \
+  --compartment-id "${HYDERABAD_COMPARTMENT_ID}" \
+  --query 'data[0].name' --raw-output \
+  --region ap-hyderabad-1)"
 
-oci compute instance launch \
+# Launch probe and capture instance OCID — must not be blank
+HYDERABAD_INSTANCE_ID="$(oci compute instance launch \
   --compartment-id "${HYDERABAD_COMPARTMENT_ID}" \
   --availability-domain "${HYDERABAD_AD}" \
   --subnet-id "${HYDERABAD_SUBNET_ID}" \
   --shape "VM.Standard.A1.Flex" \
   --shape-config '{"ocpus":1,"memoryInGBs":6}' \
   --image-id "${HYDERABAD_IMAGE_ID}" \
-  --display-name "oci-benchmark-probe-hyderabad-$(date +%Y%m%d-%H%M)" \
+  --display-name "oci-benchmark-probe-hyderabad-${TAG_TIMESTAMP}" \
   --assign-public-ip true \
+  --freeform-tags '{"purpose":"oci-region-benchmark","ttl":"4h","region":"ap-hyderabad-1"}' \
   --wait-for-state RUNNING \
-  --region ap-hyderabad-1
+  --region ap-hyderabad-1 \
+  --query 'data.id' --raw-output)"
+
+# Fail if OCID is blank
+if [ -z "${HYDERABAD_INSTANCE_ID}" ]; then
+  echo "FATAL: HYDERABAD_INSTANCE_ID is blank — launch failed or returned no ID" >&2
+  # Emergency: terminate Mumbai if Hyderabad fails
+  if [ -n "${MUMBAI_INSTANCE_ID}" ]; then
+    oci compute instance terminate --instance-id "${MUMBAI_INSTANCE_ID}" --force --region ap-mumbai-1
+  fi
+  exit 1
+fi
+echo "Hyderabad probe launched: ${HYDERABAD_INSTANCE_ID}"
 ```
 
-### 2c. Record Instance IDs
-
-```bash
-# Save instance IDs for teardown — critical
-echo "MUMBAI_INSTANCE_ID=${MUMBAI_INSTANCE_ID}" >> benchmark-probes.env
-echo "HYDERABAD_INSTANCE_ID=${HYDERABAD_INSTANCE_ID}" >> benchmark-probes.env
-```
+> **Note:** Instance OCIDs are captured directly from `oci compute instance launch
+> --query 'data.id' --raw-output`. No `benchmark-probes.env` file is written.
+> OCIDs must be exported as environment variables and verified non-blank before
+> proceeding to subsequent phases.
 
 ## Phase 3: Run Network Probes
 
@@ -188,42 +221,92 @@ python3 scripts/oci-benchmark-run schema-validate benchmark-result.json
 
 ## Phase 5: Destroy Temporary Probes
 
-> **⚠️  MANDATORY.** Every provisioning run must end with teardown. Temporary
-> probes should not remain running after benchmark data is collected.
+> **⚠️ MANDATORY.** Every provisioning run must end with teardown covering both
+> Mumbai and Hyderabad regions. Evidence collection (Phase 6) fails unless
+> teardown verification passes.
+
+### 5a. Terminate Mumbai Probe and Wait
 
 ```bash
-# Terminate Mumbai probe
-oci compute instance terminate \
-  --instance-id "${MUMBAI_INSTANCE_ID}" \
-  --force \
-  --region ap-mumbai-1
+if [ -n "${MUMBAI_INSTANCE_ID}" ]; then
+  echo "Terminating Mumbai probe: ${MUMBAI_INSTANCE_ID}"
+  oci compute instance terminate \
+    --instance-id "${MUMBAI_INSTANCE_ID}" \
+    --force \
+    --region ap-mumbai-1 \
+    --wait-for-state TERMINATED
 
-# Terminate Hyderabad probe
-oci compute instance terminate \
-  --instance-id "${HYDERABAD_INSTANCE_ID}" \
-  --force \
-  --region ap-hyderabad-1
-
-# Verify termination
-oci compute instance list \
-  --compartment-id "${COMPARTMENT_ID}" \
-  --display-name "oci-benchmark-probe-*" \
-  --query "data[?\"lifecycle-state\"!='TERMINATED'].displayName"
-
-# Clean up
-rm -f benchmark-probes.env
+  echo "Mumbai probe terminated."
+else
+  echo "WARNING: MUMBAI_INSTANCE_ID not set — cannot terminate Mumbai probe"
+fi
 ```
+
+### 5b. Terminate Hyderabad Probe and Wait
+
+```bash
+if [ -n "${HYDERABAD_INSTANCE_ID}" ]; then
+  echo "Terminating Hyderabad probe: ${HYDERABAD_INSTANCE_ID}"
+  oci compute instance terminate \
+    --instance-id "${HYDERABAD_INSTANCE_ID}" \
+    --force \
+    --region ap-hyderabad-1 \
+    --wait-for-state TERMINATED
+
+  echo "Hyderabad probe terminated."
+else
+  echo "WARNING: HYDERABAD_INSTANCE_ID not set — cannot terminate Hyderabad probe"
+fi
+```
+
+### 5c. Verify No Tagged Probes Remain (Both Regions)
+
+```bash
+echo "Verifying no benchmark probes remain in Mumbai..."
+MUMBAI_REMAINING="$(oci compute instance list \
+  --compartment-id "${MUMBAI_COMPARTMENT_ID}" \
+  --region ap-mumbai-1 \
+  --query "data[?\"lifecycle-state\"!='TERMINATED'].displayName" \
+  --all --raw-output | grep 'oci-benchmark-probe' || true)"
+
+if [ -n "${MUMBAI_REMAINING}" ]; then
+  echo "FATAL: Non-terminated benchmark probes remain in Mumbai: ${MUMBAI_REMAINING}" >&2
+  echo "Run emergency teardown before collecting evidence." >&2
+  exit 1
+fi
+echo "Mumbai: clean — no benchmark probes remain."
+
+echo "Verifying no benchmark probes remain in Hyderabad..."
+HYDERABAD_REMAINING="$(oci compute instance list \
+  --compartment-id "${HYDERABAD_COMPARTMENT_ID}" \
+  --region ap-hyderabad-1 \
+  --query "data[?\"lifecycle-state\"!='TERMINATED'].displayName" \
+  --all --raw-output | grep 'oci-benchmark-probe' || true)"
+
+if [ -n "${HYDERABAD_REMAINING}" ]; then
+  echo "FATAL: Non-terminated benchmark probes remain in Hyderabad: ${HYDERABAD_REMAINING}" >&2
+  echo "Run emergency teardown before collecting evidence." >&2
+  exit 1
+fi
+echo "Hyderabad: clean — no benchmark probes remain."
+```
+
+> **Evidence gate:** Do not proceed to Phase 6 unless both region verifications
+> return clean. The benchmark evidence is invalid if any tagged probe remains
+> running after teardown.
 
 ## Phase 6: Collect Evidence
 
-After probes are destroyed, record:
+**Only after Phase 5 teardown verification passes for both regions:**
 
 1. **Benchmark result JSON** — validate with `schema-validate`
 2. **OCI console screenshots** showing:
    - Instance lifecycle states (RUNNING during test, TERMINATED after)
    - Region availability report
    - Billing/cost explorer (even at $0 for Always Free)
-3. **Operator notes:**
+3. **Teardown verification output** — terminal output from Phase 5c proving both
+   regions are clean
+4. **Operator notes:**
    - Date and time of test
    - OCI regions tested
    - Any provisioning errors (e.g., "out of host capacity")
@@ -231,23 +314,76 @@ After probes are destroyed, record:
 
 ## Emergency Teardown
 
-If something goes wrong and you need to destroy everything immediately:
+If something goes wrong and you need to destroy everything immediately across
+both regions:
 
 ```bash
-# Find all benchmark probe instances
-oci compute instance list \
-  --compartment-id "${COMPARTMENT_ID}" \
+# ── Mumbai ──
+echo "=== Emergency teardown: Mumbai ==="
+MUMBAI_IDS="$(oci compute instance list \
+  --compartment-id "${MUMBAI_COMPARTMENT_ID}" \
+  --region ap-mumbai-1 \
   --query "data[?contains(\"display-name\",'oci-benchmark-probe')].id" \
-  --all
+  --all --raw-output)"
 
-# Terminate each instance by ID
-for id in $(oci compute instance list \
-  --compartment-id "${COMPARTMENT_ID}" \
+if [ -n "${MUMBAI_IDS}" ]; then
+  for id in ${MUMBAI_IDS}; do
+    echo "Terminating Mumbai: ${id}"
+    oci compute instance terminate --instance-id "${id}" --force --region ap-mumbai-1
+  done
+  # Wait for all Mumbai probes to terminate
+  for id in ${MUMBAI_IDS}; do
+    oci compute instance get --instance-id "${id}" --region ap-mumbai-1 \
+      --wait-for-state TERMINATED --query 'data."lifecycle-state"' --raw-output
+  done
+  echo "Mumbai emergency teardown complete."
+else
+  echo "No benchmark probes found in Mumbai."
+fi
+
+# ── Hyderabad ──
+echo "=== Emergency teardown: Hyderabad ==="
+HYDERABAD_IDS="$(oci compute instance list \
+  --compartment-id "${HYDERABAD_COMPARTMENT_ID}" \
+  --region ap-hyderabad-1 \
   --query "data[?contains(\"display-name\",'oci-benchmark-probe')].id" \
-  --all --raw-output); do
-  echo "Terminating $id"
-  oci compute instance terminate --instance-id "$id" --force
-done
+  --all --raw-output)"
+
+if [ -n "${HYDERABAD_IDS}" ]; then
+  for id in ${HYDERABAD_IDS}; do
+    echo "Terminating Hyderabad: ${id}"
+    oci compute instance terminate --instance-id "${id}" --force --region ap-hyderabad-1
+  done
+  # Wait for all Hyderabad probes to terminate
+  for id in ${HYDERABAD_IDS}; do
+    oci compute instance get --instance-id "${id}" --region ap-hyderabad-1 \
+      --wait-for-state TERMINATED --query 'data."lifecycle-state"' --raw-output
+  done
+  echo "Hyderabad emergency teardown complete."
+else
+  echo "No benchmark probes found in Hyderabad."
+fi
+
+# Verify both regions clean
+echo ""
+echo "Final verification across both regions..."
+MUMBAI_LEFT="$(oci compute instance list \
+  --compartment-id "${MUMBAI_COMPARTMENT_ID}" --region ap-mumbai-1 \
+  --query "data[?\"lifecycle-state\"!='TERMINATED' && contains(\"display-name\",'oci-benchmark-probe')].displayName" \
+  --all --raw-output 2>/dev/null || true)"
+HYDERABAD_LEFT="$(oci compute instance list \
+  --compartment-id "${HYDERABAD_COMPARTMENT_ID}" --region ap-hyderabad-1 \
+  --query "data[?\"lifecycle-state\"!='TERMINATED' && contains(\"display-name\",'oci-benchmark-probe')].displayName" \
+  --all --raw-output 2>/dev/null || true)"
+
+if [ -z "${MUMBAI_LEFT}" ] && [ -z "${HYDERABAD_LEFT}" ]; then
+  echo "All regions clean — emergency teardown complete."
+else
+  echo "WARNING: Some probes may still be running!"
+  [ -n "${MUMBAI_LEFT}" ] && echo "  Mumbai: ${MUMBAI_LEFT}"
+  [ -n "${HYDERABAD_LEFT}" ] && echo "  Hyderabad: ${HYDERABAD_LEFT}"
+  exit 1
+fi
 ```
 
 ## Default Behavior Summary
@@ -258,10 +394,12 @@ done
 | `fixture --scenario X` | **No** | **No** |
 | `schema-validate FILE` | **No** | **No** |
 | `reduce FILES...` | **No** | **No** |
-| `probe --target-host HOST` | **No cloud change** (only network probes) | **No** (needs outbound network) |
+| `calculator` | **No** | **No** |
+| `probe --target-host HOST` | **No cloud change** (only outbound network probes) | **No** (needs outbound network) |
 | `oci compute instance launch` | **YES** | OCI CLI configured |
 | `oci compute instance terminate` | **YES** | OCI CLI configured |
 
 **All provisioning commands require explicit OCI CLI invocation with
-operator-supplied compartment/subnet/image IDs.** No `scripts/oci-benchmark-run`
+operator-supplied compartment/subnet/image IDs.** There is no `--yes` flag —
+provisioning is opt-in by supplying valid resource OCIDs. No `scripts/oci-benchmark-run`
 subcommand provisions or destroys cloud resources.
