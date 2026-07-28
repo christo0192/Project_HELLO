@@ -232,16 +232,11 @@ select _policy_tests.assert(
 );
 
 -- =====================================================================
--- 8. AUTHENTICATED HAS USAGE ON SCHEMA
+-- 8. AUTHENTICATED HAS USAGE ON SCHEMA (check effective privilege)
 -- =====================================================================
 select _policy_tests.assert(
   'authenticated has USAGE on schema screening_v2',
-  exists (
-    select 1 from information_schema.usage_privileges
-    where grantee = 'authenticated'
-      and object_type = 'SCHEMA'
-      and object_name = 'screening_v2'
-  ),
+  has_schema_privilege('authenticated', 'screening_v2', 'USAGE'),
   'Expected authenticated to have USAGE on screening_v2'
 );
 
