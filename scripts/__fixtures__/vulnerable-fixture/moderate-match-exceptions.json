@@ -1,0 +1,13 @@
+{
+  "exceptions": [
+    {
+      "id": "GHSA-ffff-ffff-ffff",
+      "package": "moderate-only-pkg",
+      "owner": "TestOwner",
+      "rationale": "This exception matches only a moderate advisory — should be flagged as stale",
+      "compensating_control": "N/A",
+      "expiry": "2099-12-31",
+      "review_trigger": "Remove since below threshold"
+    }
+  ]
+}

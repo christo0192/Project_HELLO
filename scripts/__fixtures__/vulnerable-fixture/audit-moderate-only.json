@@ -1,0 +1,27 @@
+{
+  "auditReportVersion": 2,
+  "vulnerabilities": {
+    "moderate-only-pkg": {
+      "name": "moderate-only-pkg",
+      "severity": "moderate",
+      "isDirect": true,
+      "via": [
+        {
+          "source": 333,
+          "name": "moderate-only-pkg",
+          "dependency": "moderate-only-pkg",
+          "title": "A moderate advisory with an exception that should be stale",
+          "url": "https://github.com/advisories/GHSA-ffff-ffff-ffff",
+          "severity": "moderate",
+          "cwe": ["CWE-79"],
+          "cvss": { "score": 4.0 },
+          "range": "<=1.0.0"
+        }
+      ],
+      "effects": [],
+      "range": "<=1.0.0",
+      "nodes": ["node_modules/moderate-only-pkg"],
+      "fixAvailable": true
+    }
+  }
+}

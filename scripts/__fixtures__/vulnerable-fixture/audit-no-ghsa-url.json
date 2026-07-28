@@ -1,0 +1,27 @@
+{
+  "auditReportVersion": 2,
+  "vulnerabilities": {
+    "evil-pkg": {
+      "name": "evil-pkg",
+      "severity": "high",
+      "isDirect": true,
+      "via": [
+        {
+          "source": 999999,
+          "name": "evil-pkg",
+          "dependency": "evil-pkg",
+          "title": "Critical vulnerability without a GHSA URL",
+          "url": "https://github.com/advisories/CVE-2099-99999",
+          "severity": "high",
+          "cwe": ["CWE-79"],
+          "cvss": { "score": 8.0 },
+          "range": "<=1.0.0"
+        }
+      ],
+      "effects": [],
+      "range": "<=1.0.0",
+      "nodes": ["node_modules/evil-pkg"],
+      "fixAvailable": true
+    }
+  }
+}

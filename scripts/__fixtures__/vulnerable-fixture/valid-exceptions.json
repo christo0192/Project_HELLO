@@ -1,0 +1,22 @@
+{
+  "exceptions": [
+    {
+      "id": "GHSA-35jh-r3h4-6jhm",
+      "package": "lodash",
+      "owner": "TestOwner",
+      "rationale": "Synthetic test — command injection not exploitable in this context",
+      "compensating_control": "Input is sanitized before reaching lodash template functions",
+      "expiry": "2099-12-31",
+      "review_trigger": "Re-evaluate if lodash.template is introduced"
+    },
+    {
+      "id": "GHSA-p6mc-m468-83gw",
+      "package": "lodash",
+      "owner": "TestOwner",
+      "rationale": "Synthetic test — prototype pollution path not reachable",
+      "compensating_control": "All user objects are created with Object.create(null)",
+      "expiry": "2099-12-31",
+      "review_trigger": "Re-evaluate if deep merge of user input is introduced"
+    }
+  ]
+}

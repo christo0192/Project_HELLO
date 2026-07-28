@@ -1,0 +1,38 @@
+{
+  "auditReportVersion": 2,
+  "vulnerabilities": {
+    "mixed-pkg": {
+      "name": "mixed-pkg",
+      "severity": "high",
+      "isDirect": true,
+      "via": [
+        {
+          "source": 111,
+          "name": "mixed-pkg",
+          "dependency": "mixed-pkg",
+          "title": "High-severity advisory that needs an exception",
+          "url": "https://github.com/advisories/GHSA-aaaa-aaaa-aaaa",
+          "severity": "high",
+          "cwe": ["CWE-79"],
+          "cvss": { "score": 8.0 },
+          "range": "<=1.0.0"
+        },
+        {
+          "source": 222,
+          "name": "sub-dep",
+          "dependency": "sub-dep",
+          "title": "Moderate advisory — should NOT require exception",
+          "url": "https://github.com/advisories/GHSA-bbbb-bbbb-bbbb",
+          "severity": "moderate",
+          "cwe": ["CWE-79"],
+          "cvss": { "score": 4.0 },
+          "range": "<=1.0.0"
+        }
+      ],
+      "effects": [],
+      "range": "<=1.0.0",
+      "nodes": ["node_modules/mixed-pkg"],
+      "fixAvailable": true
+    }
+  }
+}

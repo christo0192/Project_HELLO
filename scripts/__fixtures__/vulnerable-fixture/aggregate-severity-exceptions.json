@@ -1,0 +1,13 @@
+{
+  "exceptions": [
+    {
+      "id": "GHSA-aaaa-aaaa-aaaa",
+      "package": "mixed-pkg",
+      "owner": "TestOwner",
+      "rationale": "Covering the high advisory in mixed-pkg",
+      "compensating_control": "Safe wrapper in place",
+      "expiry": "2099-12-31",
+      "review_trigger": "Re-evaluate on update"
+    }
+  ]
+}

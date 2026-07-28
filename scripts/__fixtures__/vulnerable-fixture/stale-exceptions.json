@@ -1,0 +1,13 @@
+{
+  "exceptions": [
+    {
+      "id": "GHSA-cccc-cccc-cccc",
+      "package": "nonexistent-package",
+      "owner": "TestOwner",
+      "rationale": "This exception does not match any current vulnerability",
+      "compensating_control": "N/A",
+      "expiry": "2099-12-31",
+      "review_trigger": "Remove if no longer needed"
+    }
+  ]
+}

@@ -21,6 +21,7 @@ build/
 .next/
 coverage/
 *.tsbuildinfo
+sbom-artifacts/
 
 # Python environments and generated files
 .venv/
