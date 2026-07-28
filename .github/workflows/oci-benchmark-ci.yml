@@ -35,7 +35,46 @@ jobs:
       - name: Validate schema with synthetic fixture
         run: |
           python3 scripts/oci-benchmark-run fixture --scenario mumbai-low-latency -o json > /tmp/fixture.json
-          python3 scripts/oci-benchmark-run schema-validate /tmp/fixture.json
+          # Build a complete NOT-YET-MEASURED benchmark document for schema validation
+          python3 -c "
+import json
+from datetime import datetime, timezone
+now = datetime.now(timezone.utc).isoformat()
+fixture = json.load(open('/tmp/fixture.json'))
+doc = {
+    'schemaVersion': '1.0.0',
+    'benchmarkId': 'oci-region-bench-ci-20260728',
+    'timestamp': now,
+    'operator': 'ci',
+    'regions': [
+        {'regionId': 'ap-mumbai-1', 'displayName': 'Mumbai', 'provisioned': False},
+        {'regionId': 'ap-hyderabad-1', 'displayName': 'Hyderabad', 'provisioned': False}
+    ],
+    'paths': [{
+        'pathId': 'oci-mum-sup',
+        'sourceRegion': 'ap-mumbai-1',
+        'targetName': 'Supabase Mumbai',
+        'targetType': 'supabase',
+        'targetHost': 'ci-test.example.com',
+        'targetPort': 443,
+        'latencyResults': fixture
+    }],
+    'computeAvailability': {
+        'regionsChecked': [
+            {'regionId': 'ap-mumbai-1', 'a1Available': False, 'checkedAt': now}
+        ]
+    },
+    'probeDetails': {'probeCount': 100, 'probeIntervalMs': 200, 'timeoutMs': 5000, 'protocols': ['TCP', 'TLS', 'HTTPS']},
+    'summary': {
+        'status': 'NOT-YET-MEASURED',
+        'notYetMeasuredReason': 'CI synthetic test',
+        'regionComparison': 'NOT-YET-MEASURED'
+    }
+}
+json.dump(doc, open('/tmp/benchmark-doc.json', 'w'), indent=2)
+print('Document:', json.dumps({k: type(v).__name__ for k, v in doc.items()}))
+"
+          python3 scripts/oci-benchmark-run schema-validate /tmp/benchmark-doc.json
 
       - name: Run calculator boundary tests
         run: |
@@ -58,7 +97,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run gitleaks on benchmark paths
+      - name: Run secret scan on benchmark files
         uses: gitleaks/gitleaks-action@v2
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_CONFIG: .gitleaks.toml
