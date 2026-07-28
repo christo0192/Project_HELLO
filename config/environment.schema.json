@@ -19,7 +19,7 @@
         "LIVEKIT_API_KEY": { "requiredInProduction": true, "secret": true },
         "LIVEKIT_API_SECRET": { "requiredInProduction": true, "secret": true },
         "RECORDINGS_BUCKET": { "requiredInProduction": true, "secret": false },
-        "NODE_ENV": { "requiredInProduction": false, "secret": false }
+        "NODE_ENV": { "requiredInProduction": true, "secret": false }
       }
     },
     "web": {
@@ -28,7 +28,10 @@
       "variables": {
         "VITE_API_BASE": { "requiredInProduction": true, "secret": false },
         "VITE_SUPABASE_URL": { "requiredInProduction": true, "secret": false },
-        "VITE_SUPABASE_ANON_KEY": { "requiredInProduction": true, "secret": false }
+        "VITE_SUPABASE_ANON_KEY": { "requiredInProduction": true, "secret": false },
+        "VITE_LIVEKIT_URL": { "requiredInProduction": true, "secret": false, "external": true },
+        "VITE_CSP_MODE": { "requiredInProduction": true, "secret": false, "external": true },
+        "VITE_CSP_REPORT_ENDPOINT": { "requiredInProduction": true, "secret": false, "external": true }
       }
     },
     "voice-livekit": {

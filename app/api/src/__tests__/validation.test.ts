@@ -902,7 +902,10 @@ describe('security headers', () => {
   });
 
   it('sets HSTS when nodeEnv is production', async () => {
-    const prodApp = createApp({ nodeEnv: 'production' });
+    const prodApp = createApp({
+      nodeEnv: 'production',
+      webOrigin: 'https://dashboard.example.com',
+    });
     const res = await request(prodApp).get('/api/health');
     assertBaseHeaders(res, {
       'strict-transport-security': 'max-age=31536000; includeSubDomains',
@@ -922,17 +925,16 @@ describe('security headers', () => {
     expect(res.body?.error?.type).toBe('malformed_request');
   });
 
-  it('sets base headers on CORS-blocked error', async () => {
+  it('sets base headers on CORS-blocked response', async () => {
     const res = await request(app)
       .get('/api/health')
       .set('Origin', 'https://evil.example.com');
-    // CORS rejects before route handling; the final handler sanitizes the error.
+    // Disallowed origins get callback(null, false) — no ACAO, 200 OK.
+    // The browser blocks the response; the API does NOT 500.
     assertNoPoweredBy(res);
     assertBaseHeaders(res);
-    // The response should come through the finalErrorHandler
-    expect(res.status).toBe(500);
-    expect(res.body?.error?.type).toBe('internal_error');
-    expect(JSON.stringify(res.body)).not.toContain('stack');
+    expect(res.status).toBe(200);
+    expect(res.headers['access-control-allow-origin']).toBeUndefined();
   });
 
   it('sets base headers on sanitized 500 error', async () => {

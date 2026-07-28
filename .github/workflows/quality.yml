@@ -36,6 +36,8 @@ jobs:
       - name: Install, lint, and build web
         working-directory: app/web
         run: npm ci && npm run lint && npm run build
+      - name: Smoke-test CSP header
+        run: node scripts/smoke-test-csp.mjs
       - name: Audit web dependencies
         run: bash scripts/audit-deps.sh --dir app/web
       - name: Run seeded dependency-policy test

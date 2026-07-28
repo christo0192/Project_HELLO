@@ -1,6 +1,6 @@
 # Project Handover
 
-**Last updated:** 2026-07-28 08:45 UTC
+**Last updated:** 2026-07-28 09:45 UTC
 
 **Repository:** `https://github.com/christo0192/Project_HELLO`
 
@@ -10,9 +10,8 @@
 
 ## Resume Here
 
-PR #4 (SEC-10) is merged. Branch `feat/sec-09-security-headers` is based on
-`main` commit `6d75b5b`. SEC-09 security headers are in review in
-[PR #5](https://github.com/christo0192/Project_HELLO/pull/5).
+PR #5 (SEC-09) is merged. The repository is on `main` at commit `ae2098b`.
+SEC-07 (CORS + CSP) is in progress on branch `feat/sec-07-cors-csp`.
 
 When resuming after the branch is merged:
 
@@ -35,7 +34,8 @@ cat docs/HANDOVER.md
 | FND-07 architecture decisions | Complete | [PR #2](https://github.com/christo0192/Project_HELLO/pull/2), merged 2026-07-27 |
 | SEC-05 API input validation | Complete | [PR #3](https://github.com/christo0192/Project_HELLO/pull/3), merged 2026-07-28 |
 | SEC-10 dependency policy | Complete | [PR #4](https://github.com/christo0192/Project_HELLO/pull/4), merged 2026-07-28 |
-| SEC-09 security headers | In review | [PR #5](https://github.com/christo0192/Project_HELLO/pull/5) |
+| SEC-09 security headers | Merged, acceptance pending | [PR #5](https://github.com/christo0192/Project_HELLO/pull/5), merged 2026-07-28. Code complete; Observatory B+ gate pending deployment. |
+| SEC-07 CORS + CSP | In progress | Branch `feat/sec-07-cors-csp` |
 
 SEC-05 adds strict Zod schemas for accepted body, path, query, and multipart
 field inputs; stable malformed/oversized request responses; sanitized unexpected
@@ -59,14 +59,41 @@ X-Frame-Options (DENY), Referrer-Policy (strict-origin-when-cross-origin),
 and Permissions-Policy (camera/microphone/geolocation disabled) on every
 response — including OPTIONS preflight, CORS-blocked, and error responses.
 Express X-Powered-By is disabled. Strict-Transport-Security
-(max-age=31536000; includeSubDomains) is set only when NODE_ENV=production,
-keeping local development unaffected. NODE_ENV is registered in the
-environment schema and example. Production deployment verification via
-Mozilla Observatory (target: B+) is still pending and will likely require
-coordination with the SEC-07 Content-Security-Policy implementation.
-`createApp()` accepts an optional `nodeEnv` parameter so tests can verify
-HSTS behaviour without mutating global `process.env`. SEC-09 remains incomplete
-until the deployed endpoint reaches the required Mozilla Observatory B+ score.
+(max-age=31536000; includeSubDomains) is set only when NODE_ENV=production.
+`createApp()` accepts an optional `nodeEnv` parameter for testable HSTS
+gating without mutating global `process.env`. NODE_ENV is registered in
+the environment contract. PR #5 is merged; the code is complete but
+acceptance is pending the Mozilla Observatory B+ score, which requires
+deployed CSP (SEC-07) for a full evaluation.
+
+SEC-07 (code foundation): CORS enforces exact canonical WEB_ORIGIN entries in
+production (no trailing slash, path, query, hash, or credentials); localhost
+fallback is non-production only; disallowed origins receive no
+Access-Control-Allow-Origin (not a 500). CSP is emitted on dashboard HTML
+responses via a Vite plugin using loadEnv/defineConfig, report-only by
+default with exact enforce/report-only mode parsing. No unsafe-inline or
+unsafe-eval. connect-src covers API, Supabase (REST + Realtime WSS), and
+LiveKit (signalling WSS, required — no silent fallback to Supabase).
+media-src includes blob: and Supabase for signed recording URLs. Origins
+use standard URL.origin semantics (default ports omitted). LiveKit
+accepts native ws(s):// or http(s)→ws(s) conversion. Injection vectors
+(semicolons, control chars, wildcards, unsafe keywords) are rejected at
+construction time. The 64 KiB CSP report endpoint validates legacy and
+Reporting API shapes, requires document-uri plus a directive, returns
+exact 413/400 under the stable error contract, and logs structured JSON
+via console.warn with URL origins only (no paths/queries/fragments/
+credentials/raw bodies). VITE_LIVEKIT_URL, VITE_CSP_MODE, and
+VITE_CSP_REPORT_ENDPOINT are registered as required production controls.
+NODE_ENV is requiredInProduction (exact production CORS and HSTS gate).
+Vite preview is documented as non-production. A lightweight Node smoke
+test asserts the CSP header on built preview HTML (scripts/smoke-test-csp.mjs).
+
+Pending SEC-07 gates: real deployed HTML CSP header, real-browser
+unapproved-origin CORS denial, approved media/connect smoke with enforced
+CSP, owner-approved clean CSP report window, enforce deployment, and
+Mozilla Observatory verification. These require deployment infrastructure;
+the code foundation passes all automated tests (186 total: 63 validation +
+123 CORS/CSP/policy).
 
 ## Current Verification
 
@@ -88,32 +115,58 @@ bash scripts/sbom.sh
 git diff --check
 ```
 
-Latest SEC-09 branch results:
+Latest SEC-07 branch results:
 
 - API TypeScript typecheck: passed.
-- API tests: 63 passed, including GET, HEAD, preflight, malformed-request,
-  CORS-error, sanitized-500, HSTS-gating, and fingerprint-suppression coverage.
-- API dependency audit: passing (no vulnerabilities, no stale exceptions).
-- Web lint and production build: passed.
-- Web dependency audit: passing with a documented exception for react-router
-  (GHSA-qwww-vcr4-c8h2, RSC CSRF bypass — not exploitable in Vite SPA;
-  architecture invariant guard active). Postcss remediated to 8.5.23.
-- Seeded dependency-policy tests: 33 passed, covering accepted and rejected
-  advisories, exception validation and expiry, malformed audit shapes, direct
-  and inherited vulnerabilities, architecture invariants, and cyclic references.
+- API tests: 186 passed (63 validation + 123 CORS/CSP/policy), covering:
+  - CORS: exact match, no-trailing-slash rejection, no-Origin, preflight,
+    production-vs-dev, webOrigin override, malformed config rejection
+    (path, query, hash, credentials, non-http scheme, empty), config
+    error never echoes raw value, NODE_ENV validation (reject invalid),
+    production rejects loopback entries (localhost, 127/8, ::1, 0.0.0.0)
+    even if explicitly in WEB_ORIGIN, production requires https (rejects
+    http:// even for non-loopback), all production config errors are
+    generic (never echo raw values).
+  - CSP reports: legacy/Reporting API shapes, application/csp-report and
+    application/reports+json content types, exact 413 oversized, exact 400
+    malformed JSON, structured JSON log via console.warn, URL-origin-only
+    logging, path/query/fragment stripping, credential stripping,
+    control-char truncation, log injection via newline sanitised.
+  - CSP policy construction: URL.origin semantics (default ports omitted),
+    http→ws/https→wss conversion, ws/wss native pass-through,
+    banned keywords rejected (unsafe-inline, unsafe-eval, strict-dynamic,
+    wildcard, unsafe-hashes, report-sample), injection rejection,
+    mode parsing, malformed endpoint → undefined, report-endpoint
+    validation (absolute HTTP(S), path allowed, no credentials/query/
+    fragment/semicolon), buildCspHeader canonical round-trip enforcement
+    (rejects API/Supabase with path/query/hash/credentials, rejects
+    non-canonical LiveKit), object-src 'none' included.
+- Web TypeScript typecheck and lint: passed.
+- Web production build: passed (CSP plugin uses loadEnv, matches HTML
+  documents only, precomputes header at config resolution, fails on
+  invalid mode/canonical origins, requires VITE_LIVEKIT_URL explicitly,
+  blocks enforce mode on non-production Vite servers, requires both
+  cached header and name — no fallback string).
+- CSP smoke test (Node.js against vite preview): passed — CSP header
+  present on HTML, no unsafe directives, object-src 'none' present,
+  absent on JS assets; fails (exits 1) when no JS asset found in build.
+- Environment contract: valid; NODE_ENV requiredInProduction=true.
+- API dependency audit: passing (no vulnerabilities).
+- Web dependency audit: passing (react-router excepted).
+- Seeded dependency-policy tests: 33 passed.
 - SBOM generation: CycloneDX 1.5 for API (273 components) and web (177 components).
-- Environment contract, negative contract tests, seven ADR checks, and LiveKit
-  worker Python compilation: passed.
-- Commit-eligible secret scan: passed.
+- Environment contract: valid for api, web, voice-livekit.
+- Seven ADR checks, LiveKit worker Python compilation: passed.
+- Secret scan (`--committable`): passed.
 - `git diff --check`: passed.
 
 ## Remaining Production Work
 
-FND-04, FND-07, SEC-05, and SEC-10 are complete plan tasks. FND-01 is partial,
-and SEC-09 is in review in
-[PR #5](https://github.com/christo0192/Project_HELLO/pull/5), with deployed
-Mozilla Observatory B+ verification still pending. All other P0 tasks in
-`PLAN.md` remain open unless a later handover explicitly marks them complete.
+FND-04, FND-07, SEC-05, and SEC-10 are complete plan tasks. SEC-09 code is
+merged (PR #5) with Observatory B+ pending. FND-01 is partial. SEC-07 code
+foundation is in progress on branch `feat/sec-07-cors-csp`. All other P0
+tasks in `PLAN.md` remain open unless a later handover explicitly marks them
+complete.
 
 Immediate external blockers:
 
@@ -137,7 +190,10 @@ Highest-risk engineering gaps:
 
 - No recruiter authentication, MFA, RBAC, tenant isolation, or candidate invite
   exchange (SEC-01 through SEC-04).
-- No rate limiting, exact production CORS/CSP policy, or CSRF decision (SEC-06 through SEC-08).
+- No rate limiting or CSRF decision (SEC-06, SEC-08).
+- Unauthenticated CSP report endpoint has no rate limiting (pending SEC-06).
+- CSP is foundation-only (SEC-07); deployed enforcement, real-browser
+  denial test, and clean report window are pending.
 - The web build retains a known chunk-size warning.
 - Sensitive candidate/resume/rubric context is still placed in client-visible
   LiveKit metadata (SEC-13).
@@ -151,9 +207,10 @@ Highest-risk engineering gaps:
 
 ## Next Step
 
-After SEC-09 is merged, the next independent engineering PR should implement
-SEC-07 (exact CORS and CSP). SEC-01 through SEC-04 follow the approved
-authentication and tenancy decisions.
+Complete SEC-07: deploy with report-only CSP, evidence clean report window,
+then enforce. The next independent engineering PR after SEC-07 merges should
+implement SEC-08 (CSRF decision) or SEC-06 (rate limiting). SEC-01 through
+SEC-04 follow the approved authentication and tenancy decisions.
 
 ## Working Rules
 
