@@ -1,0 +1,13 @@
+{
+  "exceptions": [
+    {
+      "id": "GHSA-eeee-eeee-eeee",
+      "package": "some-pkg",
+      "owner": "TestOwner",
+      "rationale": "This exception has expired — should fail even with empty audit",
+      "compensating_control": "N/A",
+      "expiry": "2000-01-01",
+      "review_trigger": "Remove"
+    }
+  ]
+}

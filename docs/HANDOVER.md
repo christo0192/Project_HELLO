@@ -1,6 +1,6 @@
 # Project Handover
 
-**Last updated:** 2026-07-27 15:04 UTC
+**Last updated:** 2026-07-28 07:00 UTC
 
 **Repository:** `https://github.com/christo0192/Project_HELLO`
 
@@ -10,12 +10,11 @@
 
 ## Resume Here
 
-The repository is on branch `feat/sec-05-api-validation`, based on `main` commit
-`4955736`. SEC-05 request validation is implemented in
-[PR #3](https://github.com/christo0192/Project_HELLO/pull/3). Do not treat SEC-05
-as complete until that PR is reviewed and merged.
+The repository is on branch `feat/sec-10-dependency-policy`, based on merge
+commit `8d54a7092759ad72b7da9750bc9a4c54de5de33c` (PR #3 merged). SEC-10
+dependency policy is in progress on this branch.
 
-When resuming after the PR is merged:
+When resuming after the branch is merged:
 
 ```bash
 git fetch origin
@@ -26,9 +25,6 @@ gh pr list --state all --limit 10
 cat docs/HANDOVER.md
 ```
 
-Then start the next scoped branch from the updated `main`. Do not push directly
-to `main`.
-
 ## Completed Work
 
 | Work | State | Evidence |
@@ -37,12 +33,25 @@ to `main`.
 | FND-01 repository setup | Partial | Git/CODEOWNERS/PR workflow exist; branch protection is unavailable on the current private GitHub plan |
 | FND-04 environment contract | Complete | [PR #1](https://github.com/christo0192/Project_HELLO/pull/1), merged 2026-07-27 |
 | FND-07 architecture decisions | Complete | [PR #2](https://github.com/christo0192/Project_HELLO/pull/2), merged 2026-07-27 |
-| SEC-05 API input validation | In review | [PR #3](https://github.com/christo0192/Project_HELLO/pull/3), opened 2026-07-27 |
+| SEC-05 API input validation | Complete | [PR #3](https://github.com/christo0192/Project_HELLO/pull/3), merged 2026-07-28 |
+| SEC-10 dependency policy | In progress | Branch `feat/sec-10-dependency-policy`; lockfile audit, CycloneDX SBOM, exception registry, and seeded policy tests implemented |
 
 SEC-05 adds strict Zod schemas for accepted body, path, query, and multipart
 field inputs; stable malformed/oversized request responses; sanitized unexpected
 errors; real JSON and multipart size-limit tests; seeded property tests; and API
 tests in the quality workflow.
+
+SEC-10 adds lockfile-aware `npm audit` blocking on high/critical vulnerabilities in CI;
+a per-GHSA+package exception registry with concrete owner, compensating control,
+through-end-of-day-UTC expiry, review trigger, and project scoping; automated
+architecture-invariant checks that invalidate stale exceptions; CycloneDX 1.5
+SBOM generation and 90-day retention; deterministic seeded policy-violation
+tests using synthetic audit fixtures (33 tests covering per-advisory severity,
+package matching, inherited dependency chains, malformed audit data, exception
+metadata and expiry, stale exceptions, architecture invariants, and cyclic
+references); postcss remediated in the web lockfile (8.5.23); and react-router RSC
+advisory excepted with an automated invariant guard and project scoping to
+app/web.
 
 ## Current Verification
 
@@ -56,18 +65,27 @@ cd ../..
 node scripts/check-env-contract.mjs
 node scripts/check-env-contract.test.mjs
 node scripts/check-adrs.mjs
+node scripts/audit-seeded-vuln.test.mjs
+bash scripts/audit-deps.sh --dir app/api
+bash scripts/audit-deps.sh --dir app/web
+bash scripts/sbom.sh
 ./scripts/scan-secrets.sh --committable
 git diff --check
 ```
 
-Latest SEC-05 branch results:
+Latest SEC-10 branch results:
 
 - API TypeScript typecheck: passed.
-- API tests: 54 passed, including deterministic happy paths, exact 413
-  responses, multipart validation, and 500 response sanitization.
-- API dependency audit: zero known vulnerabilities after the lockfile update.
-- Web lint and production build: passed; the build retains a known chunk-size
-  warning.
+- API tests: passed.
+- API dependency audit: passing (no vulnerabilities, no stale exceptions).
+- Web lint and production build: passed.
+- Web dependency audit: passing with a documented exception for react-router
+  (GHSA-qwww-vcr4-c8h2, RSC CSRF bypass — not exploitable in Vite SPA;
+  architecture invariant guard active). Postcss remediated to 8.5.23.
+- Seeded dependency-policy tests: 33 passed, covering accepted and rejected
+  advisories, exception validation and expiry, malformed audit shapes, direct
+  and inherited vulnerabilities, architecture invariants, and cyclic references.
+- SBOM generation: CycloneDX 1.5 for API (273 components) and web (177 components).
 - Environment contract, negative contract tests, seven ADR checks, and LiveKit
   worker Python compilation: passed.
 - Commit-eligible secret scan: passed.
@@ -75,9 +93,10 @@ Latest SEC-05 branch results:
 
 ## Remaining Production Work
 
-Only FND-04 and FND-07 are complete plan tasks. FND-01 is partial and SEC-05 is
-not complete until merged. All other P0 tasks in `PLAN.md` remain open unless a
-later handover explicitly marks them complete.
+FND-04, FND-07, and SEC-05 are complete plan tasks. FND-01 is partial and
+SEC-10 is in progress on `feat/sec-10-dependency-policy`. All other P0 tasks
+in `PLAN.md` remain open unless a later handover explicitly marks them
+complete.
 
 Immediate external blockers:
 
@@ -93,14 +112,17 @@ Immediate external blockers:
 4. FND-03: sanitize or permanently quarantine ignored prototype evidence and
    complete PII/DLP review.
 
+In parallel, the repository owner must complete the FND-02 credential rotations
+and drive FND-08 decisions. Authentication and tenancy work should not begin
+until D-001 and D-011 have approved owners and outcomes.
+
 Highest-risk engineering gaps:
 
 - No recruiter authentication, MFA, RBAC, tenant isolation, or candidate invite
   exchange (SEC-01 through SEC-04).
 - No rate limiting, exact production CORS/CSP policy, security headers, or CSRF
   decision (SEC-06 through SEC-09).
-- The web dependency audit currently reports three high-severity findings;
-  dependency policy, remediation, SBOM, and CI enforcement remain SEC-10.
+- The web build retains a known chunk-size warning.
 - Sensitive candidate/resume/rubric context is still placed in client-visible
   LiveKit metadata (SEC-13).
 - Resume and browser recording uploads are unauthenticated and memory-buffered;
@@ -113,18 +135,9 @@ Highest-risk engineering gaps:
 
 ## Next Step
 
-After SEC-05 is merged, the next independent engineering PR should implement
-SEC-10: remediate the known web dependency findings and add lockfile-aware CI
-policy that blocks unaccepted high/critical vulnerabilities. Keep exceptions
-explicit, owned, and time-limited.
-
-In parallel, the repository owner must complete the FND-02 credential rotations
-and drive FND-08 decisions. Authentication and tenancy work should not begin
-until D-001 and D-011 have approved owners and outcomes.
-
-After SEC-10, the next low-dependency security sequence is SEC-09 (security
-headers), then SEC-07 (exact CORS and CSP). SEC-01 through SEC-04 follow the
-approved authentication and tenancy decisions.
+After SEC-10 is merged, the next independent engineering PR should implement
+SEC-09 (security headers), then SEC-07 (exact CORS and CSP). SEC-01 through
+SEC-04 follow the approved authentication and tenancy decisions.
 
 ## Working Rules
 

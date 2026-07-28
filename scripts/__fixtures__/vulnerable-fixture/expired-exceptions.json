@@ -1,0 +1,22 @@
+{
+  "exceptions": [
+    {
+      "id": "GHSA-35jh-r3h4-6jhm",
+      "package": "lodash",
+      "owner": "TestOwner",
+      "rationale": "Synthetic test",
+      "compensating_control": "N/A",
+      "expiry": "2000-01-01",
+      "review_trigger": "N/A"
+    },
+    {
+      "id": "GHSA-p6mc-m468-83gw",
+      "package": "lodash",
+      "owner": "TestOwner",
+      "rationale": "Synthetic test",
+      "compensating_control": "N/A",
+      "expiry": "2000-01-01",
+      "review_trigger": "N/A"
+    }
+  ]
+}

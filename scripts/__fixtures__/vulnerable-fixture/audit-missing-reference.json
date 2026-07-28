@@ -1,0 +1,15 @@
+{
+  "auditReportVersion": 2,
+  "vulnerabilities": {
+    "parent-pkg": {
+      "name": "parent-pkg",
+      "severity": "high",
+      "isDirect": true,
+      "via": ["nonexistent-pkg"],
+      "effects": [],
+      "range": "<=1.0.0",
+      "nodes": ["node_modules/parent-pkg"],
+      "fixAvailable": true
+    }
+  }
+}

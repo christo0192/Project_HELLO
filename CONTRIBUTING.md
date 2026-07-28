@@ -17,6 +17,41 @@ every pull request and keep changes scoped to one reviewable outcome.
 6. Keep production secrets in the approved secret manager and expose only the
    minimum variable names described by the configuration contract.
 
+## Dependency policy (SEC-10)
+
+Every PR is audited for high and critical npm vulnerabilities in CI. A
+lockfile-aware scan runs on pull requests and pushes to main; findings that
+are not covered by a non-expired exception block the build.
+
+### Accepting an exception
+
+Add an entry to `.github/audit-exceptions.json`. Every entry **must** include:
+
+| Field | Requirement |
+|---|---|
+| `id` | GHSA advisory ID (e.g. `GHSA-xxxx-xxxx-xxxx`) |
+| `package` | npm package name |
+| `owner` | Accountable team or person |
+| `rationale` | Why the CVE is not exploitable in this project |
+| `compensating_control` | Architecture or operational control that prevents exploitation; prefer automated invariants |
+| `expiry` | UTC date in `YYYY-MM-DD` form (e.g. `2026-10-01`). The exception is valid through the end of that date. Exceptions are never permanent. |
+| `review_trigger` | Concrete condition that should cause re-evaluation (e.g. version upgrade, feature introduction) |
+| `projects` | Optional non-empty array limiting the exception to specific project paths, such as `app/web` |
+
+Exceptions are matched **per advisory** (not per package). If one package has
+three CVEs and only two are excepted, the third still blocks CI.
+
+Expired or stale exceptions fail the policy check and must be removed or renewed.
+An exception can also be invalidated before expiry if a CI invariant check fails
+(e.g. the react-router RSC exception is invalidated if
+`react-router.config.ts` appears).
+
+### SBOM
+
+A CycloneDX 1.5 Software Bill of Materials is generated for the API and web
+projects on pull requests and pushes to `main`, then retained as a build artifact
+for 90 days. Run `bash scripts/sbom.sh` locally to preview.
+
 The repository owner authorized a one-time bootstrap push on 2026-07-27 after
 the commit-eligible tree passed redacted secret and PII checks. Account-side
 credential rotation and quarantined evidence remain production blockers.

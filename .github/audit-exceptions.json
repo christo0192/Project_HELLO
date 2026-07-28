@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Dependency Audit Exceptions",
+  "description": "High/critical vulnerabilities that are accepted for a limited time with documented compensating controls. Every entry must include owner, rationale, compensating_control, ISO 8601 expiry, and review_trigger. Only GHSA advisories are accepted; unmatched advisories always fail closed.",
+  "exceptions": [
+    {
+      "id": "GHSA-qwww-vcr4-c8h2",
+      "package": "react-router",
+      "owner": "christo0192 <christo.b@interviewkickstart.com>",
+      "rationale": "This CVE (RSC Mode CSRF Bypass) only affects React Server Components mode. This project is a Vite SPA; it does not use React Router framework mode, server rendering, or any RSC (React Server Components) API. There is no react-router.config.ts file, no server entry point, and no 'use server' directives.",
+      "compensating_control": "ARCHITECTURE INVARIANT (automated in CI): No react-router.config.{ts,js,mjs} file exists in app/web/. If one is added, this exception is invalidated immediately regardless of expiry. The project uses @vitejs/plugin-react with a standard client-side SPA entry point.",
+      "expiry": "2026-10-01",
+      "review_trigger": "Re-evaluate when react-router-dom >=8.3.0 ships with the fix, OR if SSR/RSC framework (Next.js/Remix/React Router framework mode) is introduced. Also re-evaluate if react-router.config.{ts,js,mjs} appears in the web directory.",
+      "projects": ["app/web"]
+    }
+  ]
+}

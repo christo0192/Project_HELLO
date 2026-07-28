@@ -1,0 +1,60 @@
+{
+  "auditReportVersion": 2,
+  "vulnerabilities": {
+    "lodash": {
+      "name": "lodash",
+      "severity": "high",
+      "isDirect": true,
+      "via": [
+        {
+          "source": 123456,
+          "name": "lodash",
+          "dependency": "lodash",
+          "title": "Command Injection in lodash",
+          "url": "https://github.com/advisories/GHSA-35jh-r3h4-6jhm",
+          "severity": "high",
+          "cwe": ["CWE-77"],
+          "cvss": { "score": 7.2 },
+          "range": "<=4.17.23"
+        },
+        {
+          "source": 123457,
+          "name": "lodash",
+          "dependency": "lodash",
+          "title": "Prototype Pollution in lodash",
+          "url": "https://github.com/advisories/GHSA-p6mc-m468-83gw",
+          "severity": "high",
+          "cwe": ["CWE-1321"],
+          "cvss": { "score": 7.5 },
+          "range": "<=4.17.23"
+        }
+      ],
+      "effects": [],
+      "range": "<=4.17.23",
+      "nodes": ["node_modules/lodash"],
+      "fixAvailable": true
+    },
+    "minimist": {
+      "name": "minimist",
+      "severity": "critical",
+      "isDirect": false,
+      "via": [
+        {
+          "source": 223458,
+          "name": "minimist",
+          "dependency": "minimist",
+          "title": "Prototype Pollution in minimist",
+          "url": "https://github.com/advisories/GHSA-xvch-5gv4-984h",
+          "severity": "critical",
+          "cwe": ["CWE-1321"],
+          "cvss": { "score": 9.8 },
+          "range": "<1.2.6"
+        }
+      ],
+      "effects": ["lodash"],
+      "range": "<1.2.6",
+      "nodes": ["node_modules/minimist"],
+      "fixAvailable": true
+    }
+  }
+}

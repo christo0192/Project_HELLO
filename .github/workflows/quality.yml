@@ -31,8 +31,22 @@ jobs:
       - name: Install, typecheck, and test API
         working-directory: app/api
         run: npm ci && npm run typecheck && npm test
+      - name: Audit API dependencies
+        run: bash scripts/audit-deps.sh --dir app/api
       - name: Install, lint, and build web
         working-directory: app/web
         run: npm ci && npm run lint && npm run build
+      - name: Audit web dependencies
+        run: bash scripts/audit-deps.sh --dir app/web
+      - name: Run seeded dependency-policy test
+        run: node scripts/audit-seeded-vuln.test.mjs
+      - name: Generate SBOMs
+        run: bash scripts/sbom.sh
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sboms
+          path: sbom-artifacts/*.cdx.json
+          retention-days: 90
       - name: Compile LiveKit worker
         run: python3 -m py_compile app/voice-livekit/agent.py app/voice-livekit/persistence.py app/voice-livekit/prompting.py

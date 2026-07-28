@@ -1,0 +1,13 @@
+{
+  "exceptions": [
+    {
+      "id": "GHSA-35jh-r3h4-6jhm",
+      "package": "react-router",
+      "owner": "TestOwner",
+      "rationale": "Exception filed under wrong package — should NOT match lodash advisory",
+      "compensating_control": "N/A",
+      "expiry": "2099-12-31",
+      "review_trigger": "N/A"
+    }
+  ]
+}
