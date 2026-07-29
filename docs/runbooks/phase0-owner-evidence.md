@@ -45,9 +45,11 @@ Always work on `config/phase0-evidence.local.json` and keep it local.
    the approved restricted storage (outside Git). Record each item's location
    as a `restricted://FND02/...` reference.
 
-3. **Review and sanitize artifacts** for FND-03. For each quarantined artifact
-   (recordings, scorecards, screenshots, etc.), determine whether it is clean,
-   replaced with synthetic data, or quarantined. Record the disposition.
+3. **Review and sanitize artifacts** for FND-03. For each artifact
+   (recordings, scorecards, screenshots, etc.), determine whether it is clean
+   (no PII found), or has been replaced with synthetic data. Quarantined
+   artifacts MUST remain in status=pending — they cannot pass exit‑0
+   validation until a clean or synthetic replacement replaces them.
 
 4. **Write the manifest** at `config/phase0-evidence.local.json` following the
    schema and example. See Section 3 for the schema reference.
@@ -153,8 +155,10 @@ node scripts/check-phase0-evidence.mjs config/phase0-evidence.example.json
 - No duplicate group IDs
 - No placeholder claims
 - Evidence refs follow `restricted://FND02/...` or `restricted://FND03/...` grammar
-- FND-03 outcome combinations are valid (clean + pending-review and
-  quarantined + deleted-after-replacement are contradictions)
+- FND-03 outcome combinations are valid. Only 3 combos exit 0:
+  `clean:retained-restricted`, `replaced-synthetic:retained-restricted`,
+  and `replaced-synthetic:deleted-after-replacement`. Quarantined artifacts
+  must remain in status=pending (external handling)
 - If status=pending, verification must be absent; if status=verified,
   verification must be present with all required fields
 

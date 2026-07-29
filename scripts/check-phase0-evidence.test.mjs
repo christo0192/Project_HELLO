@@ -242,12 +242,11 @@ describe('check-phase0-evidence.mjs', () => {
     d.artifactGroups[0].verification.dispositionStatus = 'deleted-after-replacement';
     assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
   });
-  it('31. All allowed combos pass', () => {
+  it('31. All allowed combos (excluding quarantined) pass', () => {
     const allowed = [
       ['clean', 'retained-restricted'],
       ['replaced-synthetic', 'retained-restricted'],
       ['replaced-synthetic', 'deleted-after-replacement'],
-      ['quarantined', 'retained-restricted'],
     ];
     for (const [outcome, disposition] of allowed) {
       const d = complete();
@@ -408,6 +407,17 @@ describe('check-phase0-evidence.mjs', () => {
     const { code, stderr } = runCLI(writeTemp(d));
     assert.strictEqual(code, 1);
     assert.ok(!stderr.includes('user@example.org'), 'stderr must not contain email');
+  });
+
+  // Through-path for safety scanner: token prefix inside valid evidenceRef shape
+  it('59a. Token prefix in evidenceRef path: exit 1, SECRET_VALUE category, no value leak', () => {
+    const TOKEN_REF = `restricted://FND02/${TOK_PREFIX}/v1`;
+    const d = complete();
+    d.credentialGroups[0].verification.evidenceRef = TOKEN_REF;
+    const { code, stderr } = runCLI(writeTemp(d));
+    assert.strictEqual(code, 1);
+    assert.ok(stderr.includes('SECRET_VALUE'), 'stderr must contain SECRET_VALUE category');
+    assert.ok(!stderr.includes(TOK_PREFIX), 'stderr must not contain token value');
   });
 
   // === 14. PENDING STATE ===

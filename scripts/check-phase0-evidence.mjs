@@ -77,11 +77,14 @@ const ART_GROUP_TYPE_MAP = Object.freeze({
 });
 
 // ---- Business: allowed (outcome, disposition) pairs for verified FND-03 ----
+// Only 3 combos exit 0. quarantined does NOT — it only proves the original
+// was found, not that a sanitized/replaced shareable artifact exists.
+// Quarantine belongs in status:pending until a clean or replaced-synthetic
+// artifact replaces it (external handling).
 const ALLOWED_ARTIFACT_COMBOS = new Set([
   'clean:retained-restricted',
   'replaced-synthetic:retained-restricted',
   'replaced-synthetic:deleted-after-replacement',
-  'quarantined:retained-restricted',
 ]);
 
 // ---- Security patterns ----
