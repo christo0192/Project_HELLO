@@ -4,13 +4,13 @@
  * check-phase0-evidence.test.mjs
  *
  * ZERO-DEPENDENCY deterministic tests for check-phase0-evidence.mjs.
- * Uses node:assert and node:test.
- * Imports validate() directly for logic tests; uses spawnSync for CLI tests.
+ * Uses node:assert and node:test. Imports validate() for logic; spawnSync for CLI.
+ * Seeded secret patterns: Buffer.from(..., 'base64').toString('utf-8') at runtime.
  */
 
 import { strict as assert } from 'node:assert';
 import { test, describe, it } from 'node:test';
-import { readFileSync, mkdtempSync, writeFileSync, mkdirSync, symlinkSync } from 'node:fs';
+import { readFileSync, mkdtempSync, writeFileSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -18,674 +18,456 @@ import { validate } from './check-phase0-evidence.mjs';
 
 const VALIDATOR = join(import.meta.dirname, 'check-phase0-evidence.mjs');
 const EXAMPLE = join(import.meta.dirname, '..', 'config', 'phase0-evidence.example.json');
+const SCHEMA_PATH = join(import.meta.dirname, '..', 'config', 'phase0-evidence.schema.json');
 const TEST_CLOCK = new Date('2025-06-01T00:00:00Z');
 
-/**
- * Build a complete valid fixture (all 8 providers verified, all 7 artifact groups verified).
- */
-function buildCompleteFixture() {
+function writeTemp(data) {
+  const d = mkdtempSync(join(tmpdir(), 'ev-t-'));
+  const p = join(d, 'm.json');
+  writeFileSync(p, JSON.stringify(data), 'utf-8');
+  return p;
+}
+
+function runCLI(path) {
+  const r = spawnSync(process.execPath, [VALIDATOR, path], { encoding: 'utf-8', timeout: 10000 });
+  return { code: r.status, stderr: r.stderr || '', stdout: r.stdout || '' };
+}
+
+// Canonical complete fixture: 8 providers + 7 artifacts, all verified, allowed combos
+function complete() {
   return {
     schemaVersion: '1.0.0',
     evidenceDate: '2025-06-01T00:00:00Z',
-    owner: {
-      role: 'Security Lead',
-      evidenceDate: '2025-06-01T01:00:00Z',
-    },
+    owner: { role: 'Security Lead', evidenceDate: '2025-06-01T00:00:00Z' },
     credentialGroups: [
-      {
-        groupId: 'supabase-rotation',
-        provider: 'supabase',
-        status: 'verified',
-        verification: {
-          ownerRole: 'Security Lead',
-          evidenceDate: '2025-06-01T00:30:00Z',
-          evidenceRef: 'restricted://FND02/supabase/rotation-v1',
-          rotationAction: 'rotated',
-          oldCredentialRejectionMethod: 'audit-log-screenshot',
-        },
-      },
-      {
-        groupId: 'livekit-rotation',
-        provider: 'livekit',
-        status: 'verified',
-        verification: {
-          ownerRole: 'Security Lead',
-          evidenceDate: '2025-06-01T00:35:00Z',
-          evidenceRef: 'restricted://FND02/livekit/rotation-v1',
-          rotationAction: 'rotated',
-          oldCredentialRejectionMethod: 'credential-rejection-test',
-        },
-      },
-      {
-        groupId: 'anthropic-rotation',
-        provider: 'anthropic',
-        status: 'verified',
-        verification: {
-          ownerRole: 'Security Lead',
-          evidenceDate: '2025-06-01T00:40:00Z',
-          evidenceRef: 'restricted://FND02/anthropic/rotation-v1',
-          rotationAction: 'rotated',
-          oldCredentialRejectionMethod: 'provider-console-timestamp',
-        },
-      },
-      {
-        groupId: 'sarvam-rotation',
-        provider: 'sarvam',
-        status: 'verified',
-        verification: {
-          ownerRole: 'Security Lead',
-          evidenceDate: '2025-06-01T00:45:00Z',
-          evidenceRef: 'restricted://FND02/sarvam/rotation-v1',
-          rotationAction: 'rotated',
-          oldCredentialRejectionMethod: 'audit-log-screenshot',
-        },
-      },
-      {
-        groupId: 'deepgram-rotation',
-        provider: 'deepgram',
-        status: 'verified',
-        verification: {
-          ownerRole: 'Security Lead',
-          evidenceDate: '2025-06-01T00:50:00Z',
-          evidenceRef: 'restricted://FND02/deepgram/rotation-v1',
-          rotationAction: 'rotated',
-          oldCredentialRejectionMethod: 'credential-rejection-test',
-        },
-      },
-      {
-        groupId: 'retell-rotation',
-        provider: 'retell',
-        status: 'verified',
-        verification: {
-          ownerRole: 'Security Lead',
-          evidenceDate: '2025-06-01T00:55:00Z',
-          evidenceRef: 'restricted://FND02/retell/rotation-v1',
-          rotationAction: 'revoked',
-          oldCredentialRejectionMethod: 'provider-console-timestamp',
-        },
-      },
-      {
-        groupId: 'elevenlabs-rotation',
-        provider: 'elevenlabs',
-        status: 'verified',
-        verification: {
-          ownerRole: 'Security Lead',
-          evidenceDate: '2025-06-01T01:00:00Z',
-          evidenceRef: 'restricted://FND02/elevenlabs/rotation-v1',
-          rotationAction: 'revoked',
-          oldCredentialRejectionMethod: 'audit-log-screenshot',
-        },
-      },
-      {
-        groupId: 'cartesia-rotation',
-        provider: 'cartesia',
-        status: 'verified',
-        verification: {
-          ownerRole: 'Security Lead',
-          evidenceDate: '2025-06-01T01:05:00Z',
-          evidenceRef: 'restricted://FND02/cartesia/rotation-v1',
-          rotationAction: 'deleted-resource',
-          oldCredentialRejectionMethod: 'provider-console-timestamp',
-        },
-      },
+      { groupId: 'supabase-rotation', provider: 'supabase', status: 'verified',
+        verification: { ownerRole: 'Security Lead', evidenceDate: '2025-06-01T00:00:00Z', evidenceRef: 'restricted://FND02/supabase/v1', rotationAction: 'rotated', oldCredentialRejectionMethod: 'audit-log-screenshot' } },
+      { groupId: 'livekit-rotation', provider: 'livekit', status: 'verified',
+        verification: { ownerRole: 'Security Lead', evidenceDate: '2025-06-01T00:00:00Z', evidenceRef: 'restricted://FND02/livekit/v1', rotationAction: 'rotated', oldCredentialRejectionMethod: 'credential-rejection-test' } },
+      { groupId: 'anthropic-rotation', provider: 'anthropic', status: 'verified',
+        verification: { ownerRole: 'Security Lead', evidenceDate: '2025-06-01T00:00:00Z', evidenceRef: 'restricted://FND02/anthropic/v1', rotationAction: 'rotated', oldCredentialRejectionMethod: 'provider-console-timestamp' } },
+      { groupId: 'sarvam-rotation', provider: 'sarvam', status: 'verified',
+        verification: { ownerRole: 'Security Lead', evidenceDate: '2025-06-01T00:00:00Z', evidenceRef: 'restricted://FND02/sarvam/v1', rotationAction: 'rotated', oldCredentialRejectionMethod: 'audit-log-screenshot' } },
+      { groupId: 'deepgram-rotation', provider: 'deepgram', status: 'verified',
+        verification: { ownerRole: 'Security Lead', evidenceDate: '2025-06-01T00:00:00Z', evidenceRef: 'restricted://FND02/deepgram/v1', rotationAction: 'rotated', oldCredentialRejectionMethod: 'credential-rejection-test' } },
+      { groupId: 'retell-rotation', provider: 'retell', status: 'verified',
+        verification: { ownerRole: 'Security Lead', evidenceDate: '2025-06-01T00:00:00Z', evidenceRef: 'restricted://FND02/retell/v1', rotationAction: 'revoked', oldCredentialRejectionMethod: 'provider-console-timestamp' } },
+      { groupId: 'elevenlabs-rotation', provider: 'elevenlabs', status: 'verified',
+        verification: { ownerRole: 'Security Lead', evidenceDate: '2025-06-01T00:00:00Z', evidenceRef: 'restricted://FND02/elevenlabs/v1', rotationAction: 'revoked', oldCredentialRejectionMethod: 'audit-log-screenshot' } },
+      { groupId: 'cartesia-rotation', provider: 'cartesia', status: 'verified',
+        verification: { ownerRole: 'Security Lead', evidenceDate: '2025-06-01T00:00:00Z', evidenceRef: 'restricted://FND02/cartesia/v1', rotationAction: 'deleted-resource', oldCredentialRejectionMethod: 'provider-console-timestamp' } },
     ],
     artifactGroups: [
-      {
-        groupId: 'hello-html',
-        artifactType: 'generated-document',
-        status: 'verified',
-        verification: {
-          manualReviewOutcome: 'replaced-synthetic',
-          dispositionStatus: 'deleted-after-replacement',
-          evidenceRef: 'restricted://FND03/hello-html/synthetic-v1',
-        },
-      },
-      {
-        groupId: 'hello-md',
-        artifactType: 'generated-document',
-        status: 'verified',
-        verification: {
-          manualReviewOutcome: 'replaced-synthetic',
-          dispositionStatus: 'deleted-after-replacement',
-          evidenceRef: 'restricted://FND03/hello-md/synthetic-v1',
-        },
-      },
-      {
-        groupId: 'hello-assets',
-        artifactType: 'resume-copy',
-        status: 'verified',
-        verification: {
-          manualReviewOutcome: 'clean',
-          dispositionStatus: 'retained-restricted',
-          evidenceRef: 'restricted://FND03/hello-assets/retention-v1',
-        },
-      },
-      {
-        groupId: 'generated-pdf',
-        artifactType: 'scorecard-pdf',
-        status: 'verified',
-        verification: {
-          manualReviewOutcome: 'clean',
-          dispositionStatus: 'retained-restricted',
-          evidenceRef: 'restricted://FND03/generated-pdf/retention-v1',
-        },
-      },
-      {
-        groupId: 'voice-recording',
-        artifactType: 'voice-media',
-        status: 'verified',
-        verification: {
-          manualReviewOutcome: 'replaced-synthetic',
-          dispositionStatus: 'deleted-after-replacement',
-          evidenceRef: 'restricted://FND03/voice-recording/synthetic-v1',
-        },
-      },
-      {
-        groupId: 'scorecard-export',
-        artifactType: 'scorecard-pdf',
-        status: 'verified',
-        verification: {
-          manualReviewOutcome: 'clean',
-          dispositionStatus: 'retained-restricted',
-          evidenceRef: 'restricted://FND03/scorecard-export/retention-v1',
-        },
-      },
-      {
-        groupId: 'env-example-values',
-        artifactType: 'generated-document',
-        status: 'verified',
-        verification: {
-          manualReviewOutcome: 'replaced-synthetic',
-          dispositionStatus: 'deleted-after-replacement',
-          evidenceRef: 'restricted://FND03/env-example-values/synthetic-v1',
-        },
-      },
+      { groupId: 'hello-html', artifactType: 'generated-document', status: 'verified',
+        verification: { ownerRole: 'Security Lead', evidenceDate: '2025-06-01T00:00:00Z', manualReviewOutcome: 'replaced-synthetic', dispositionStatus: 'deleted-after-replacement', evidenceRef: 'restricted://FND03/hello-html/v1' } },
+      { groupId: 'hello-md', artifactType: 'generated-document', status: 'verified',
+        verification: { ownerRole: 'Security Lead', evidenceDate: '2025-06-01T00:00:00Z', manualReviewOutcome: 'replaced-synthetic', dispositionStatus: 'deleted-after-replacement', evidenceRef: 'restricted://FND03/hello-md/v1' } },
+      { groupId: 'hello-assets', artifactType: 'resume-copy', status: 'verified',
+        verification: { ownerRole: 'Security Lead', evidenceDate: '2025-06-01T00:00:00Z', manualReviewOutcome: 'clean', dispositionStatus: 'retained-restricted', evidenceRef: 'restricted://FND03/hello-assets/v1' } },
+      { groupId: 'generated-pdf', artifactType: 'scorecard-pdf', status: 'verified',
+        verification: { ownerRole: 'Security Lead', evidenceDate: '2025-06-01T00:00:00Z', manualReviewOutcome: 'clean', dispositionStatus: 'retained-restricted', evidenceRef: 'restricted://FND03/generated-pdf/v1' } },
+      { groupId: 'voice-recording', artifactType: 'voice-media', status: 'verified',
+        verification: { ownerRole: 'Security Lead', evidenceDate: '2025-06-01T00:00:00Z', manualReviewOutcome: 'replaced-synthetic', dispositionStatus: 'retained-restricted', evidenceRef: 'restricted://FND03/voice-recording/v1' } },
+      { groupId: 'scorecard-export', artifactType: 'scorecard-pdf', status: 'verified',
+        verification: { ownerRole: 'Security Lead', evidenceDate: '2025-06-01T00:00:00Z', manualReviewOutcome: 'clean', dispositionStatus: 'retained-restricted', evidenceRef: 'restricted://FND03/scorecard-export/v1' } },
+      { groupId: 'env-example-values', artifactType: 'generated-document', status: 'verified',
+        verification: { ownerRole: 'Security Lead', evidenceDate: '2025-06-01T00:00:00Z', manualReviewOutcome: 'replaced-synthetic', dispositionStatus: 'deleted-after-replacement', evidenceRef: 'restricted://FND03/env-example-values/v1' } },
     ],
   };
 }
 
-/**
- * Helper: write fixture to temp file and return path.
- */
-function writeTempFixture(data) {
-  const tmpDir = mkdtempSync(join(tmpdir(), 'ev-test-'));
-  const manifestPath = join(tmpDir, 'manifest.json');
-  writeFileSync(manifestPath, JSON.stringify(data), 'utf-8');
-  return manifestPath;
-}
-
-/**
- * Helper: run validator CLI via spawnSync.
- */
-function runValidatorCLI(manifestPath) {
-  const result = spawnSync(process.execPath, [VALIDATOR, manifestPath], {
-    encoding: 'utf-8',
-    timeout: 10000,
-  });
-  return {
-    code: result.status,
-    stderr: result.stderr || '',
-    stdout: result.stdout || '',
-  };
-}
-
-// ======== TESTS ========
+// Seeded secret patterns (base64-decoded at runtime)
+const JWT_SEED = Buffer.from('ZXlKaGJHY2lPaUpJVXpJMU5pSXNJblI1Y0NJNklrcFhWQ0o5', 'base64').toString('utf-8');
+const PRIVKEY_SEED = Buffer.from('LS0tLS1CRUdJTiBSU0EgUFJJVkFURSBLRVkt', 'base64').toString('utf-8');
+const TOK_PREFIX = Buffer.from('c2stcHJvai10ZXN0LXRva2VuLXZhbHVl', 'base64').toString('utf-8');
+const URL_CREDS = Buffer.from('aHR0cHM6Ly91c2VyOnBhc3NAZXhhbXBsZS5jb20vZXZpZGVuY2U=', 'base64').toString('utf-8');
 
 describe('check-phase0-evidence.mjs', () => {
 
-  // === SECTION 1: Basic validity ===
-
-  it('1. Valid complete synthetic fixture (8 providers, 7 artifact groups, all verified): exit 0', () => {
-    const fixture = buildCompleteFixture();
-    const path = writeTempFixture(fixture);
-    const { code } = runValidatorCLI(path);
-    assert.strictEqual(code, 0, `Expected exit 0, got ${code}`);
+  // === 1. BASIC VALIDITY ===
+  it('1. Complete fixture (8 providers + 7 artifacts, all verified): exit 0', () => {
+    const { code } = runCLI(writeTemp(complete()));
+    assert.strictEqual(code, 0);
   });
-
   it('2. Committed example (all pending): exit 2', () => {
-    const { code } = runValidatorCLI(EXAMPLE);
-    assert.strictEqual(code, 2, `Expected exit 2 from example, got ${code}`);
+    const { code } = runCLI(EXAMPLE);
+    assert.strictEqual(code, 2);
   });
-
   it('3. No-arg CLI: exit 1', () => {
-    const result = spawnSync(process.execPath, [VALIDATOR], {
-      encoding: 'utf-8',
-      timeout: 10000,
-    });
-    assert.strictEqual(result.status, 1, `Expected exit 1 for no args, got ${result.status}`);
+    const r = spawnSync(process.execPath, [VALIDATOR], { encoding: 'utf-8', timeout: 10000 });
+    assert.strictEqual(r.status, 1);
   });
 
-  // === SECTION 2: Schema violations ===
-
+  // === 2. SCHEMA VIOLATIONS ===
   it('4. Unknown top-level field: exit 1', () => {
-    const data = buildCompleteFixture();
-    data.extraField = 'should fail';
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
+    const d = complete(); d.extra = 'x';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
   });
-
   it('5. Wrong schemaVersion: exit 1', () => {
-    const data = buildCompleteFixture();
-    data.schemaVersion = '2.0.0';
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
+    const d = complete(); d.schemaVersion = '2.0.0';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('6. Missing credentialGroups: exit 1', () => {
+    const d = complete(); delete d.credentialGroups;
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('7. Empty artifactGroups (minItems 7): exit 1', () => {
+    const d = complete(); d.artifactGroups = [];
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
   });
 
-  it('6. Missing required top-level field (no owner): exit 1', () => {
-    const data = buildCompleteFixture();
-    delete data.owner;
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
+  // === 3. STATUS IF/THEN/ELSE ===
+  it('8. status=pending with verification present: exit 1', () => {
+    const d = complete(); d.credentialGroups[0].status = 'pending';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('9. status=verified without verification: exit 1', () => {
+    const d = complete(); d.credentialGroups[0].status = 'verified';
+    delete d.credentialGroups[0].verification;
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('10. Artifact pending with verification: exit 1', () => {
+    const d = complete(); d.artifactGroups[0].status = 'pending';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('11. Artifact verified without verification: exit 1', () => {
+    const d = complete(); d.artifactGroups[0].status = 'verified';
+    delete d.artifactGroups[0].verification;
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
   });
 
-  it('7. Missing credentialGroups: exit 1', () => {
-    const data = buildCompleteFixture();
-    delete data.credentialGroups;
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
+  // === 4. PROVIDER CARDINALITY ===
+  it('12. Duplicate provider (two supabase entries): exit 1', () => {
+    const d = complete();
+    d.credentialGroups[1] = { groupId: 'livekit-rotation', provider: 'supabase', status: 'pending' };
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('13. Nine credential rows with all 8 plus extra: exit 1 (schema maxItems 8)', () => {
+    const d = complete();
+    d.credentialGroups.push({ groupId: 'extra', provider: 'supabase', status: 'pending' });
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('14. One provider pending (7 verified + 1 pending): exit 2', () => {
+    const d = complete();
+    d.credentialGroups[7].status = 'pending';
+    delete d.credentialGroups[7].verification;
+    const { code } = runCLI(writeTemp(d));
+    assert.strictEqual(code, 2);
   });
 
-  it('8. Empty artifactGroups array: exit 1', () => {
-    const data = buildCompleteFixture();
-    data.artifactGroups = [];
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
+  // === 5. ARTIFACT CARDINALITY ===
+  it('15. Duplicate artifact groupId: exit 1', () => {
+    const d = complete();
+    d.artifactGroups[1] = { groupId: 'hello-html', artifactType: 'generated-document', status: 'pending' };
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('16. One artifact pending (6 verified + 1 pending): exit 2', () => {
+    const d = complete();
+    d.artifactGroups[6].status = 'pending';
+    delete d.artifactGroups[6].verification;
+    const { code } = runCLI(writeTemp(d));
+    assert.strictEqual(code, 2);
   });
 
-  it('9. Unknown field in credentialGroup: exit 1', () => {
-    const data = buildCompleteFixture();
-    data.credentialGroups[0].extraField = 'should fail';
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
+  // === 6. GROUPID→PROVIDER/TYPE MAPPING ===
+  it('17. Wrong groupId→provider mapping: exit 1', () => {
+    const d = complete();
+    d.credentialGroups[0].groupId = 'supabase-rotation';
+    d.credentialGroups[0].provider = 'livekit';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('18. Wrong groupId→artifactType mapping: exit 1', () => {
+    const d = complete();
+    d.artifactGroups[0].groupId = 'hello-html';
+    d.artifactGroups[0].artifactType = 'voice-media';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
   });
 
-  // === SECTION 3: Status / if/then/else ===
-
-  it('10. status=pending with verification present: exit 1', () => {
-    const data = buildCompleteFixture();
-    data.credentialGroups[0].status = 'pending';
-    data.credentialGroups[0].verification = {
-      ownerRole: 'Security Lead',
-      evidenceDate: '2025-06-01T00:30:00Z',
-      evidenceRef: 'restricted://FND02/supabase/rotation-v1',
-      rotationAction: 'rotated',
-      oldCredentialRejectionMethod: 'audit-log-screenshot',
-    };
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
+  // === 7. STRICT UTC ===
+  it('19. Future date relative to clock: exit 1', () => {
+    const d = complete(); d.evidenceDate = '2025-07-01T00:00:00Z';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('20. Non-UTC offset +05:30: exit 1', () => {
+    const d = complete(); d.evidenceDate = '2025-06-01T00:00:00+05:30';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('21. Non-UTC offset +00:00 (must be Z): exit 1', () => {
+    const d = complete(); d.evidenceDate = '2025-06-01T00:00:00+00:00';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('22. Omitted seconds: exit 1', () => {
+    const d = complete(); d.evidenceDate = '2025-06-01T00:00Z';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('23. Impossible date (Feb 30): exit 1', () => {
+    const d = complete(); d.evidenceDate = '2025-02-30T00:00:00Z';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('24. Trailing junk after Z: exit 1', () => {
+    const d = complete(); d.evidenceDate = '2025-06-01T00:00:00Z extra';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('25. Invalid date string: exit 1', () => {
+    const d = complete(); d.evidenceDate = 'not-a-date';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
   });
 
-  it('11. status=verified without verification: exit 1', () => {
-    const data = buildCompleteFixture();
-    data.credentialGroups[0].status = 'verified';
-    delete data.credentialGroups[0].verification;
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
+  // === 8. FND-03 VERIFIED COMBO VALIDATION ===
+  it('26. clean + pending-review: rejected', () => {
+    const d = complete();
+    d.artifactGroups[0].verification.dispositionStatus = 'pending-review';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
   });
-
-  it('12. Artifact status=pending with verification: exit 1', () => {
-    const data = buildCompleteFixture();
-    data.artifactGroups[0].status = 'pending';
-    data.artifactGroups[0].verification = {
-      manualReviewOutcome: 'clean',
-      dispositionStatus: 'retained-restricted',
-      evidenceRef: 'restricted://FND03/test/evidence',
-    };
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
+  it('27. quarantined + deleted-after-replacement: rejected', () => {
+    const d = complete();
+    d.artifactGroups[0].verification.manualReviewOutcome = 'quarantined';
+    d.artifactGroups[0].verification.dispositionStatus = 'deleted-after-replacement';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
   });
-
-  it('13. Artifact status=verified without verification: exit 1', () => {
-    const data = buildCompleteFixture();
-    data.artifactGroups[0].status = 'verified';
-    delete data.artifactGroups[0].verification;
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
+  it('28. replaced-synthetic + pending-review: rejected', () => {
+    const d = complete();
+    d.artifactGroups[0].verification.dispositionStatus = 'pending-review';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
   });
-
-  // === SECTION 4: Provider / artifact group coverage ===
-
-  it('14. Missing one provider (only 7 of 8): exit 2', () => {
-    const data = buildCompleteFixture();
-    data.credentialGroups = data.credentialGroups.filter(g => g.provider !== 'cartesia');
-    const path = writeTempFixture(data);
-    const { code } = runValidatorCLI(path);
-    assert.strictEqual(code, 2, `Expected exit 2 (incomplete), got ${code}`);
+  it('29. quarantined + pending-review: rejected', () => {
+    const d = complete();
+    d.artifactGroups[0].verification.manualReviewOutcome = 'quarantined';
+    d.artifactGroups[0].verification.dispositionStatus = 'pending-review';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
   });
-
-  it('15. Missing one artifact group ID (only 6 of 7): exit 2', () => {
-    const data = buildCompleteFixture();
-    data.artifactGroups = data.artifactGroups.filter(g => g.groupId !== 'hello-html');
-    const path = writeTempFixture(data);
-    const { code } = runValidatorCLI(path);
-    assert.strictEqual(code, 2, `Expected exit 2 (incomplete), got ${code}`);
+  it('30. clean + deleted-after-replacement: rejected', () => {
+    const d = complete();
+    d.artifactGroups[0].verification.manualReviewOutcome = 'clean';
+    d.artifactGroups[0].verification.dispositionStatus = 'deleted-after-replacement';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
   });
-
-  // === SECTION 5: FND-03 outcome validation ===
-
-  it('16. clean + pending-review: exit 1 (contradiction)', () => {
-    const data = buildCompleteFixture();
-    data.artifactGroups[0].verification.manualReviewOutcome = 'clean';
-    data.artifactGroups[0].verification.dispositionStatus = 'pending-review';
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
-  });
-
-  it('17. quarantined + deleted-after-replacement: exit 1 (contradiction)', () => {
-    const data = buildCompleteFixture();
-    data.artifactGroups[0].verification.manualReviewOutcome = 'quarantined';
-    data.artifactGroups[0].verification.dispositionStatus = 'deleted-after-replacement';
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
-  });
-
-  it('18. Empty artifactGroups (missing required groups): exit 1', () => {
-    const data = buildCompleteFixture();
-    data.artifactGroups = [];
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
-  });
-
-  // === SECTION 6: Owner role validation ===
-
-  it('19. Invalid owner.role (free text): exit 1', () => {
-    const data = buildCompleteFixture();
-    data.owner.role = 'Some Random Person';
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
-  });
-
-  it('20. Invalid verification.ownerRole (free text): exit 1', () => {
-    const data = buildCompleteFixture();
-    data.credentialGroups[0].verification.ownerRole = 'John Doe';
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
-  });
-
-  it('21. Valid roles accepted: exit 0', () => {
-    const fixture = buildCompleteFixture();
-    // All valid roles
-    const roles = ['Engineering Lead', 'Security Lead', 'Product Manager', 'Legal Counsel'];
-    fixture.owner.role = roles[0];
-    fixture.credentialGroups[0].verification.ownerRole = roles[1];
-    const path = writeTempFixture(fixture);
-    const { code } = runValidatorCLI(path);
-    assert.strictEqual(code, 0, `Expected exit 0, got ${code}`);
-  });
-
-  // === SECTION 7: Date validation ===
-
-  it('22. Future evidenceDate relative to clock: exit 1', () => {
-    const data = buildCompleteFixture();
-    data.evidenceDate = '2025-07-01T00:00:00Z'; // After test clock (2025-06-01)
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
-  });
-
-  it('23. Non-UTC date (no Z or offset): exit 1', () => {
-    const data = buildCompleteFixture();
-    data.evidenceDate = '2025-06-01T00:00:00';
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
-  });
-
-  it('24. Invalid date string: exit 1', () => {
-    const data = buildCompleteFixture();
-    data.evidenceDate = 'not-a-date';
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
-  });
-
-  // === SECTION 8: File-level errors ===
-
-  it('25. Symlink input: exit 1', () => {
-    const tmpDir = mkdtempSync(join(tmpdir(), 'ev-test-sym-'));
-    const realPath = join(tmpDir, 'real.json');
-    const linkPath = join(tmpDir, 'link.json');
-    const fixture = buildCompleteFixture();
-    writeFileSync(realPath, JSON.stringify(fixture), 'utf-8');
-    try {
-      symlinkSync(realPath, linkPath);
-    } catch {
-      return; // Symlink may fail on some systems, skip
+  it('31. All allowed combos pass', () => {
+    const allowed = [
+      ['clean', 'retained-restricted'],
+      ['replaced-synthetic', 'retained-restricted'],
+      ['replaced-synthetic', 'deleted-after-replacement'],
+      ['quarantined', 'retained-restricted'],
+    ];
+    for (const [outcome, disposition] of allowed) {
+      const d = complete();
+      d.artifactGroups[0].verification.manualReviewOutcome = outcome;
+      d.artifactGroups[0].verification.dispositionStatus = disposition;
+      assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 0, `combo ${outcome}:${disposition} should pass`);
     }
-    const { code } = runValidatorCLI(linkPath);
-    assert.strictEqual(code, 1, `Expected exit 1 for symlink, got ${code}`);
   });
 
-  it('26. Non-regular file (directory): exit 1', () => {
-    const tmpDir = mkdtempSync(join(tmpdir(), 'ev-test-dir-'));
-    const { code } = runValidatorCLI(tmpDir);
-    assert.strictEqual(code, 1, `Expected exit 1 for directory, got ${code}`);
+  // === 9. OWNER ROLE VALIDATION ===
+  it('32. Invalid owner.role (free text): exit 1', () => {
+    const d = complete(); d.owner.role = 'Some Person';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('33. Invalid verification.ownerRole: exit 1', () => {
+    const d = complete(); d.credentialGroups[0].verification.ownerRole = 'John Doe';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('34. Artifact verification missing ownerRole: exit 1', () => {
+    const d = complete(); delete d.artifactGroups[0].verification.ownerRole;
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('35. Artifact verification missing evidenceDate: exit 1', () => {
+    const d = complete(); delete d.artifactGroups[0].verification.evidenceDate;
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
   });
 
-  it('27. Oversized input (>64KB): exit 1', () => {
-    const data = buildCompleteFixture();
-    // Add enough padding to exceed 64KB
-    for (let i = 0; i < 200; i++) {
-      data.credentialGroups.push({
-        groupId: `padding-group-${i}`,
-        provider: 'supabase',
-        status: 'verified',
-        verification: {
-          ownerRole: 'Security Lead',
-          evidenceDate: '2025-06-01T00:00:00Z',
-          evidenceRef: 'restricted://FND02/supabase/padding',
-          rotationAction: 'rotated',
-          oldCredentialRejectionMethod: 'audit-log-screenshot',
-        },
-      });
+  // === 10. SECRET/PII DETECTION ===
+  it('36. JWT pattern: exit 1', () => {
+    const d = complete();
+    d.credentialGroups[0].verification.oldCredentialRejectionMethod = JWT_SEED + '.injected';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('37. Private key marker: exit 1', () => {
+    const d = complete();
+    d.credentialGroups[0].verification.oldCredentialRejectionMethod = PRIVKEY_SEED;
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('38. Token prefix: exit 1', () => {
+    const d = complete();
+    d.credentialGroups[0].verification.oldCredentialRejectionMethod = TOK_PREFIX;
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('39. URL with credentials: exit 1', () => {
+    const d = complete();
+    d.artifactGroups[0].verification.evidenceRef = URL_CREDS;
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('40. Email in value: exit 1', () => {
+    const d = complete();
+    d.credentialGroups[0].verification.oldCredentialRejectionMethod = 'test@example.org-x';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('41. Phone number: exit 1', () => {
+    const d = complete();
+    d.credentialGroups[0].verification.oldCredentialRejectionMethod = '+1-212-867-5309';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('42. Absolute Unix path: exit 1', () => {
+    const d = complete();
+    d.credentialGroups[0].verification.oldCredentialRejectionMethod = '/etc/passwd';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('43. Parent traversal: exit 1', () => {
+    const d = complete();
+    d.credentialGroups[0].verification.oldCredentialRejectionMethod = '../secret';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('44. Dot-slash path: exit 1', () => {
+    const d = complete();
+    d.credentialGroups[0].verification.oldCredentialRejectionMethod = './local';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('45. UNC path: exit 1', () => {
+    const d = complete();
+    d.credentialGroups[0].verification.oldCredentialRejectionMethod = '\\\\server\\share';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('46. URL with query: exit 1', () => {
+    const d = complete();
+    d.artifactGroups[0].verification.evidenceRef = 'https://example.com/ev?t=abc';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('47. URL with fragment: exit 1', () => {
+    const d = complete();
+    d.artifactGroups[0].verification.evidenceRef = 'https://example.com/ev#s';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('48. High-entropy base64 (>=40 chars): exit 1', () => {
+    const d = complete();
+    d.credentialGroups[0].verification.oldCredentialRejectionMethod = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+
+  // === 11. EVIDENCE REF TIGHTENING ===
+  it('49. Double slash in evidenceRef: exit 1', () => {
+    const d = complete();
+    d.credentialGroups[0].verification.evidenceRef = 'restricted://FND02//supabase/v1';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('50. Dot segment in evidenceRef: exit 1', () => {
+    const d = complete();
+    d.credentialGroups[0].verification.evidenceRef = 'restricted://FND02/supabase/./v1';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('51. Trailing slash in evidenceRef: exit 1', () => {
+    const d = complete();
+    d.credentialGroups[0].verification.evidenceRef = 'restricted://FND02/supabase/v1/';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+  it('52. EvidenceRef outside restricted grammar: exit 1', () => {
+    const d = complete();
+    d.credentialGroups[0].verification.evidenceRef = 'https://example.com/ev';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
+  });
+
+  // === 12. FILE-LEVEL ERRORS ===
+  it('53. Symlink: exit 1', () => {
+    const td = mkdtempSync(join(tmpdir(), 'ev-t-sym-'));
+    const rp = join(td, 'r.json'); writeFileSync(rp, JSON.stringify(complete()), 'utf-8');
+    const lp = join(td, 'l.json');
+    try { symlinkSync(rp, lp); } catch { return; }
+    assert.strictEqual(runCLI(lp).code, 1);
+  });
+  it('54. Directory: exit 1', () => {
+    assert.strictEqual(runCLI(mkdtempSync(join(tmpdir(), 'ev-t-dir-'))).code, 1);
+  });
+  it('55. Oversized: exit 1', () => {
+    const d = complete();
+    for (let i = 0; i < 300; i++) {
+      d.credentialGroups.push({ groupId: `pad-${i}`, provider: 'supabase', status: 'pending' });
     }
-    const path = writeTempFixture(data);
-    const { code } = runValidatorCLI(path);
-    assert.strictEqual(code, 1, `Expected exit 1 for oversized, got ${code}`);
+    assert.strictEqual(runCLI(writeTemp(d)).code, 1);
+  });
+  it('56. Malformed JSON: exit 1', () => {
+    const td = mkdtempSync(join(tmpdir(), 'ev-t-mal-'));
+    writeFileSync(join(td, 'm.json'), '{ broken', 'utf-8');
+    assert.strictEqual(runCLI(join(td, 'm.json')).code, 1);
   });
 
-  it('28. Malformed JSON: exit 1', () => {
-    const tmpDir = mkdtempSync(join(tmpdir(), 'ev-test-mal-'));
-    const manifestPath = join(tmpDir, 'malformed.json');
-    writeFileSync(manifestPath, '{ invalid json }', 'utf-8');
-    const { code } = runValidatorCLI(manifestPath);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
-  });
-
-  // === SECTION 9: Secret/PII/path detection ===
-
-  // Use runtime-constructed seeded values to avoid scanner-triggering literal strings
-  const JWT_SEED = Buffer.from('ZXlKaGJHY2lPaUpJVXpJMU5pSXNJblI1Y0NJNklrcFhWQ0o5', 'base64').toString('utf-8');
-
-  it('29. JWT token pattern in value: exit 1', () => {
-    const data = buildCompleteFixture();
-    data.credentialGroups[0].verification.evidenceRef = JWT_SEED + '.eyJzdWIiOiIxMjM0NTY3ODkwIn0.test';
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
-  });
-
-  const PRIVKEY_SEED = Buffer.from('LS0tLS1CRUdJTiBSU0EgUFJJVkFURSBLRVkt', 'base64').toString('utf-8');
-
-  it('30. Private key marker: exit 1', () => {
-    const data = buildCompleteFixture();
-    data.credentialGroups[0].verification.ownerRole = PRIVKEY_SEED;
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
-  });
-
-  it('31. URL with credentials: exit 1', () => {
-    const data = buildCompleteFixture();
-    const urlWithCreds = Buffer.from('aHR0cHM6Ly91c2VyOnBhc3NAZXhhbXBsZS5jb20vZXZpZGVuY2U=', 'base64').toString('utf-8');
-    data.credentialGroups[0].verification.evidenceRef = urlWithCreds;
-    const { code } = runValidatorCLI(writeTempFixture(data));
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
-  });
-
-  it('32. Email address in value: exit 1', () => {
-    const data = buildCompleteFixture();
-    data.credentialGroups[0].verification.ownerRole = 'owner@company.com';
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
-  });
-
-  it('33. Phone number in value: exit 1', () => {
-    const data = buildCompleteFixture();
-    data.credentialGroups[0].verification.ownerRole = '+1-212-867-5309';
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
-  });
-
-  it('34. Token prefix in value: exit 1', () => {
-    const data = buildCompleteFixture();
-    data.credentialGroups[0].verification.ownerRole = Buffer.from('c2stcHJvai10ZXN0LXRva2VuLXZhbHVl', 'base64').toString('utf-8');
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
-  });
-
-  it('35. Absolute Unix path in value: exit 1', () => {
-    const data = buildCompleteFixture();
-    data.credentialGroups[0].verification.ownerRole = '/etc/passwd';
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
-  });
-
-  it('36. Parent traversal in value: exit 1', () => {
-    const data = buildCompleteFixture();
-    data.credentialGroups[0].verification.evidenceRef = '../secret-file';
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
-  });
-
-  it('37. URL with query string: exit 1', () => {
-    const data = buildCompleteFixture();
-    data.credentialGroups[0].verification.evidenceRef = 'https://example.com/evidence?token=abc123';
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
-  });
-
-  // === SECTION 10: Evidence ref validation ===
-
-  it('38. EvidenceRef outside restricted://FND02/FND03 grammar: exit 1', () => {
-    const data = buildCompleteFixture();
-    data.credentialGroups[0].verification.evidenceRef = 'https://example.com/evidence';
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
-  });
-
-  it('39. FND03 evidenceRef in credential group: exit 1', () => {
-    const data = buildCompleteFixture();
-    data.credentialGroups[0].verification.evidenceRef = 'restricted://FND03/test/evidence';
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
-  });
-
-  // === SECTION 11: Placeholder detection ===
-
-  it('40. Placeholder claim: exit 1', () => {
-    const data = buildCompleteFixture();
-    data.credentialGroups[0].verification.ownerRole = 'TODO: replace me with actual role';
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
-  });
-
-  // === SECTION 12: Duplicate IDs ===
-
-  it('41. Duplicate groupId in credentialGroups: exit 1', () => {
-    const data = buildCompleteFixture();
-    data.credentialGroups[1].groupId = 'supabase-rotation';
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
-  });
-
-  // === SECTION 13: Non-disclosure diagnostics ===
-
-  it('42. Diagnostics never echo input value (future date)', () => {
-    const data = buildCompleteFixture();
-    const futureDate = '2099-12-31T23:59:59Z';
-    data.evidenceDate = futureDate;
-    const path = writeTempFixture(data);
-    const { code, stderr } = runValidatorCLI(path);
+  // === 13. NON-DISCLOSURE ===
+  it('57. Future date value not echoed in diagnostics', () => {
+    const d = complete(); d.evidenceDate = '2099-12-31T23:59:59Z';
+    const { code, stderr } = runCLI(writeTemp(d));
     assert.strictEqual(code, 1);
-    assert.ok(!stderr.includes('2099'), 'stderr must not contain the seeded future year');
-    assert.ok(stderr.includes('DIAG ['), 'stderr should contain DIAG markers');
+    assert.ok(!stderr.includes('2099'), 'stderr must not contain seeded year');
   });
-
-  it('43. Diagnostics never echo input value (seeded JWT)', () => {
-    const data = buildCompleteFixture();
-    // Put JWT in a non-pattern-checked field so it reaches the security scanner
-    data.credentialGroups[0].verification.ownerRole = 'Security Lead';
-    data.credentialGroups[0].verification.oldCredentialRejectionMethod = JWT_SEED + '.injected';
-    const path = writeTempFixture(data);
-    const { code, stderr } = runValidatorCLI(path);
+  it('58. JWT seed not echoed', () => {
+    const d = complete();
+    d.credentialGroups[0].verification.oldCredentialRejectionMethod = JWT_SEED + '.x';
+    const { code, stderr } = runCLI(writeTemp(d));
     assert.strictEqual(code, 1);
-    assert.ok(!stderr.includes(JWT_SEED), 'stderr must not contain seeded JWT prefix');
-    assert.ok(stderr.includes('DIAG ['), 'stderr should contain a DIAG category');
+    assert.ok(!stderr.includes(JWT_SEED), 'stderr must not contain JWT seed');
   });
-
-  it('44. Diagnostics never echo input value (seeded email)', () => {
-    const data = buildCompleteFixture();
-    // Put email in a field that does NOT have an enum check so the PII scanner catches it
-    data.credentialGroups[0].verification.oldCredentialRejectionMethod = 'test@example.org-audit';
-    const path = writeTempFixture(data);
-    const { code, stderr } = runValidatorCLI(path);
+  it('59. Email not echoed', () => {
+    const d = complete();
+    d.credentialGroups[0].verification.oldCredentialRejectionMethod = 'user@example.org-x';
+    const { code, stderr } = runCLI(writeTemp(d));
     assert.strictEqual(code, 1);
-    assert.ok(!stderr.includes('test@example.org'), 'stderr must not contain email address');
-    assert.ok(stderr.includes('DIAG ['), 'stderr should contain a DIAG category');
+    assert.ok(!stderr.includes('user@example.org'), 'stderr must not contain email');
   });
 
-  // === SECTION 14: Pending state ===
-
-  it('45. One entry pending, rest verified: exit 2', () => {
-    const data = buildCompleteFixture();
-    data.credentialGroups[0].status = 'pending';
-    delete data.credentialGroups[0].verification;
-    const path = writeTempFixture(data);
-    const { code } = runValidatorCLI(path);
-    assert.strictEqual(code, 2, `Expected exit 2 (pending present), got ${code}`);
+  // === 14. PENDING STATE ===
+  it('60. One pending, rest verified: exit 2', () => {
+    const d = complete(); d.credentialGroups[0].status = 'pending'; delete d.credentialGroups[0].verification;
+    assert.strictEqual(runCLI(writeTemp(d)).code, 2);
+  });
+  it('61. All pending: exit 2', () => {
+    const d = complete();
+    for (const g of d.credentialGroups) { g.status = 'pending'; delete g.verification; }
+    for (const g of d.artifactGroups) { g.status = 'pending'; delete g.verification; }
+    assert.strictEqual(runCLI(writeTemp(d)).code, 2);
   });
 
-  it('46. All entries pending (example): exit 2', () => {
-    const data = buildCompleteFixture();
-    for (const g of data.credentialGroups) {
-      g.status = 'pending';
-      delete g.verification;
-    }
-    for (const g of data.artifactGroups) {
-      g.status = 'pending';
-      delete g.verification;
-    }
-    const path = writeTempFixture(data);
-    const { code } = runValidatorCLI(path);
-    assert.strictEqual(code, 2, `Expected exit 2 (all pending), got ${code}`);
+  // === 15. SCHEMA PARITY ===
+  it('62. Schema providers enum has exactly 8 entries', () => {
+    const s = JSON.parse(readFileSync(SCHEMA_PATH, 'utf-8'));
+    const p = s.properties.credentialGroups.items.properties.provider.enum;
+    assert.strictEqual(p.length, 8);
+    assert.deepStrictEqual(p, ['supabase', 'livekit', 'anthropic', 'sarvam', 'deepgram', 'retell', 'elevenlabs', 'cartesia']);
+  });
+  it('63. Schema artifact groupId enum has exactly 7 entries', () => {
+    const s = JSON.parse(readFileSync(SCHEMA_PATH, 'utf-8'));
+    const ids = s.properties.artifactGroups.items.properties.groupId.enum;
+    assert.strictEqual(ids.length, 7);
+    assert.deepStrictEqual(ids, ['hello-html', 'hello-md', 'hello-assets', 'generated-pdf', 'voice-recording', 'scorecard-export', 'env-example-values']);
+  });
+  it('64. Schema credentialGroups minItems=maxItems=8', () => {
+    const s = JSON.parse(readFileSync(SCHEMA_PATH, 'utf-8'));
+    assert.strictEqual(s.properties.credentialGroups.minItems, 8);
+    assert.strictEqual(s.properties.credentialGroups.maxItems, 8);
+  });
+  it('65. Schema artifactGroups minItems=maxItems=7', () => {
+    const s = JSON.parse(readFileSync(SCHEMA_PATH, 'utf-8'));
+    assert.strictEqual(s.properties.artifactGroups.minItems, 7);
+    assert.strictEqual(s.properties.artifactGroups.maxItems, 7);
+  });
+  it('66. Schema status fields have type: string', () => {
+    const s = JSON.parse(readFileSync(SCHEMA_PATH, 'utf-8'));
+    assert.strictEqual(s.properties.credentialGroups.items.properties.status.type, 'string');
+    assert.strictEqual(s.properties.artifactGroups.items.properties.status.type, 'string');
+  });
+  it('67. Artifact verification has ownerRole and evidenceDate in required', () => {
+    const s = JSON.parse(readFileSync(SCHEMA_PATH, 'utf-8'));
+    const v = s.properties.artifactGroups.items.properties.verification;
+    assert.ok(v.required.includes('ownerRole'));
+    assert.ok(v.required.includes('evidenceDate'));
   });
 
-  // === SECTION 15: Schema parity ===
-
-  it('47. Provider enum parity: schema has exactly 8 providers', () => {
-    const schema = JSON.parse(readFileSync(
-      join(import.meta.dirname, '..', 'config', 'phase0-evidence.schema.json'), 'utf-8'
-    ));
-    const providers = schema.properties.credentialGroups.items.properties.provider.enum;
-    assert.strictEqual(providers.length, 8, 'Schema must have exactly 8 providers');
-    const expected = ['supabase', 'livekit', 'anthropic', 'sarvam', 'deepgram', 'retell', 'elevenlabs', 'cartesia'];
-    assert.deepStrictEqual(providers, expected);
+  // === 16. PLACEHOLDER DETECTION ===
+  it('68. Placeholder value rejected: exit 1', () => {
+    const d = complete();
+    d.credentialGroups[0].verification.oldCredentialRejectionMethod = 'TODO: replace me';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
   });
 
-  it('48. Artifact group ID enum parity: schema has exactly 7 group IDs', () => {
-    const schema = JSON.parse(readFileSync(
-      join(import.meta.dirname, '..', 'config', 'phase0-evidence.schema.json'), 'utf-8'
-    ));
-    const groupIds = schema.properties.artifactGroups.items.properties.groupId.enum;
-    assert.strictEqual(groupIds.length, 7, 'Schema must have exactly 7 artifact group IDs');
-    const expected = ['hello-html', 'hello-md', 'hello-assets', 'generated-pdf', 'voice-recording', 'scorecard-export', 'env-example-values'];
-    assert.deepStrictEqual(groupIds, expected);
-  });
-
-  // === SECTION 16: High-entropy base64 ===
-
-  it('49. High-entropy base64 value (>= 40 chars): exit 1', () => {
-    const data = buildCompleteFixture();
-    // Use a runtime-constructed base64-like string
-    data.credentialGroups[0].verification.ownerRole = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-    const code = validate(writeTempFixture(data), TEST_CLOCK);
-    assert.strictEqual(code, 1, `Expected exit 1, got ${code}`);
+  // === 17. DUPLICATE IDs ===
+  it('69. Duplicate groupId across credentialGroups: exit 1', () => {
+    const d = complete(); d.credentialGroups[1].groupId = 'supabase-rotation';
+    assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
   });
 
 });

@@ -75,8 +75,9 @@
             "description": "Provider system whose credential was rotated"
           },
           "status": {
+            "type": "string",
             "enum": ["pending", "verified"],
-            "description": "Whether this credential group has been verified. If pending, verification must be absent. If verified, verification must be present with all required fields."
+            "description": "Whether this credential group has been verified."
           },
           "verification": {
             "type": "object",
@@ -132,8 +133,8 @@
           "required": ["verification"]
         }
       },
-      "minItems": 1,
-      "maxItems": 100
+      "minItems": 8,
+      "maxItems": 8
     },
     "artifactGroups": {
       "type": "array",
@@ -173,18 +174,31 @@
             "description": "Type of candidate artifact from FND-03 scope"
           },
           "status": {
+            "type": "string",
             "enum": ["pending", "verified"],
-            "description": "Whether this artifact group has been verified. If pending, verification must be absent. If verified, verification must be present with all required fields."
+            "description": "Whether this artifact group has been verified."
           },
           "verification": {
             "type": "object",
             "additionalProperties": false,
             "required": [
+              "ownerRole",
+              "evidenceDate",
               "manualReviewOutcome",
               "dispositionStatus",
               "evidenceRef"
             ],
             "properties": {
+              "ownerRole": {
+                "type": "string",
+                "enum": ["Engineering Lead", "Security Lead", "Product Manager", "Legal Counsel"],
+                "description": "Role of the person who performed and verified the disposition"
+              },
+              "evidenceDate": {
+                "type": "string",
+                "format": "date-time",
+                "description": "ISO 8601 UTC timestamp when disposition evidence was captured"
+              },
               "manualReviewOutcome": {
                 "type": "string",
                 "enum": ["clean", "replaced-synthetic", "quarantined"],
@@ -198,7 +212,7 @@
               "evidenceRef": {
                 "type": "string",
                 "pattern": "^restricted://FND03/[a-z0-9][a-z0-9._/-]{0,255}$",
-                "description": "Reference to disposition evidence stored outside Git. Pattern: restricted://FND03/<path>"
+                "description": "Reference to disposition evidence stored outside Git."
               }
             }
           }
@@ -218,8 +232,8 @@
           "required": ["verification"]
         }
       },
-      "minItems": 1,
-      "maxItems": 50
+      "minItems": 7,
+      "maxItems": 7
     }
   }
 }
