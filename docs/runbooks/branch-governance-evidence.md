@@ -43,7 +43,8 @@ GITHUB_TOKEN="$GH_TOKEN" GITHUB_REPOSITORY="christo0192/Project_HELLO" \
 ```
 
 The verifier fetches classic branch protection, the separate
-`required_signatures` endpoint, the paginated rulesets list, and each
+`required_signatures` endpoint, the paginated rulesets list (with
+`includes_parents=true` to include inherited rulesets), and each
 individual ruleset detail. Pagination is bounded to 3 pages; if more pages
 exist, the verifier treats it as a pagination failure and fails closed.
 

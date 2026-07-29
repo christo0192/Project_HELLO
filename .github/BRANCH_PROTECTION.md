@@ -20,9 +20,9 @@ evidence in the launch evidence store.
 - Require every review conversation to be resolved.
 - Require signed commits and linear history.
 - Block force pushes and branch deletion.
-- Apply the rules to administrators. Rulesets must have zero bypass_actors.
-  Break-glass access, if required, must be managed through an audited out-of-band
-  process, not through GitHub ruleset bypass permissions.
+- Apply the rules to administrators. Rulesets must have zero `bypass_actors`.
+  Break-glass access, if required, must be managed through an audited
+  out-of-band process, not through GitHub ruleset bypass permissions.
 - Require successful status checks. Add each check only after its workflow is
   merged and has reported at least once:
   - `quality`
@@ -64,20 +64,29 @@ These are external owner actions; they cannot close solely through additional im
 
 ## Branch governance verifier (evidence-only)
 
-The offline verifier in `scripts/check-branch-governance.mjs` reads a local
-GitHub API evidence snapshot (`$INFORMER_PATH` or
-`.github/branch-governance-evidence.json`) or runs in live mode when
-`GITHUB_TOKEN` is set, and reports which of the 12 required controls in
-`.github/branch-governance-policy.json` are enforced.
+The verifier in `scripts/check-branch-governance.mjs` supports two modes:
+- **Live** (`GITHUB_TOKEN`): read-only collection from classic protection,
+  separate required-signatures endpoint, repo metadata (default branch),
+  ruleset list with `includes_parents=true` and pagination, and individual
+  ruleset details. Inherited rulesets are included. Raw responses stay in
+  memory only — never persisted or uploaded.
+- **Offline** (`$INFORMER_PATH` or CLI arg): reads a local evidence JSON file.
 
-- **Exit 0:** All controls ENFORCED.
-- **Exit 1:** One or more controls NOT ENFORCED (fail-closed).
-- **Exit 2:** Input malformed, file not found, or parse error.
+Collection errors of any kind (401, 403, 404 on ruleset detail, 429, 5xx,
+network failure, malformed response, pagination ambiguity, hostile URL origin)
+→ all 12 controls NOT ENFORCED (fail-closed). Only 404 on classic
+protection or required-signatures is treated as "control absent" (not error).
+
+Output is a fixed-schema redacted JSON summary. Repository and branch are
+redacted (the Actions run context already identifies them). Never prints
+tokens, Authorization headers, raw API bodies, error messages, or file paths.
+
+Exit codes: **0** all enforced, **1** not enforced (fail-closed), **2** input
+or configuration error.
 
 **FND-01 remains blocked** until hosted enforcement (GitHub private-plan
 upgrade or equivalent) is confirmed AND the `quality` and `secret-scan` status
 checks are enforced on `main`, AND direct pushes to `main` are rejected.
 The verifier is an evidence-collection tool — it does not enforce anything.
 
-See `docs/runbooks/branch-governance-evidence.md` for the collection and
-interpretation runbook.
+See `docs/runbooks/branch-governance-evidence.md` for the collection runbook.

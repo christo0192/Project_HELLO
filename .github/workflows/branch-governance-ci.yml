@@ -1,5 +1,5 @@
 name: Branch Governance CI
-
+# No GITHUB_TOKEN, no network calls — unit/fixture tests only.
 on:
   pull_request:
     paths:
@@ -14,8 +14,6 @@ on:
       - '.github/branch-governance-policy.json'
   workflow_dispatch:
 
-# NOTE: This workflow has NO GITHUB_TOKEN and makes NO network calls.
-# All tests use inline fixtures and mock HTTP servers.
 permissions:
   contents: read
 
@@ -23,6 +21,7 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

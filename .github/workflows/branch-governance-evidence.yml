@@ -1,11 +1,10 @@
 name: Branch Governance Evidence
-
+# Read-only evidence collection via GITHUB_TOKEN.
+# Current private plan may return 403 — this is expected fail-closed
+# behavior, not a workflow bug. The redacted summary is always uploaded.
 on:
   workflow_dispatch:
 
-# Read-only collection with GITHUB_TOKEN.
-# NOTE: The current private plan may return 403 — this is expected fail-closed
-# behavior, not a workflow bug. The redacted summary is always uploaded.
 permissions:
   contents: read
 
@@ -13,19 +12,17 @@ jobs:
   collect-evidence:
     name: collect-evidence
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Live-collect branch governance evidence
+      - name: Run verifier (live mode via GITHUB_TOKEN)
         id: verifier
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Live mode: GITHUB_TOKEN triggers read-only API collection.
-          # Raw API responses go only to RUNNER_TEMP mode 0600 (never uploaded).
-          # The verifier writes redacted summary to stdout (pass) or stderr (fail).
           REDACTED="$(mktemp)"
           set +e
           node scripts/check-branch-governance.mjs > "$REDACTED" 2>&1
@@ -34,12 +31,13 @@ jobs:
           cp "$REDACTED" ./redacted-branch-governance-summary.json
           if [ "$EXIT" -ne 0 ]; then
             echo "::error::FND-01 controls NOT ENFORCED (exit $EXIT). See redacted summary artifact."
+            # Fail the job — controls absent. Artifact still uploaded below.
+            exit 1
           fi
-      # Always upload the redacted summary (on pass AND fail)
-      - name: Upload redacted evidence summary (never raw API bodies)
+      - name: Upload redacted evidence summary
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: branch-governance-evidence
           path: redacted-branch-governance-summary.json
           retention-days: 90
-        if: always()
