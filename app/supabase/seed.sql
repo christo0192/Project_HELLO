@@ -261,7 +261,7 @@ on conflict (id) do nothing;
 --   • recommendation -> advance|hold|reject
 --   • resume_conflicts -> array of discrepancy objects
 -- =============================================================================
-insert into screening_v2.assessments (id, session_id, candidate_id, english, tone, communication, motivation, role_fit, resume_conflicts, overall_score, recommendation, summary, raw, created_at, updated_at) values
+insert into screening_v2.assessments (id, session_id, candidate_id, english, tone, communication, motivation, role_fit, resume_conflicts, overall_score, recommendation, summary, raw, provenance, created_at, updated_at) values
 (
   '60000000-0000-4000-a000-000000000051',
   '60000000-0000-4000-a000-000000000031',
@@ -276,11 +276,12 @@ insert into screening_v2.assessments (id, session_id, candidate_id, english, ton
   'advance',
   'SYNTHETIC DEMO: Candidate demonstrated strong testing methodology knowledge.',
   '{"is_synthetic":true,"version":"gov-06-synthetic-v1","source":"demo_seed","communication":{"score":8,"clarity":8,"structure":7,"listening":9,"rapport":8,"english_proficiency":{"band":"C1","grammar":8,"vocabulary":7,"fluency":9,"coherence":8,"notes":"Strong English proficiency"},"filler_usage":{"level":"low","examples":["um","like"],"impact_score":8,"notes":"Minimal filler words"},"native_language_usage":{"level":"low","examples":[],"impact_score":9,"notes":"No noticeable native language interference"},"notes":"Good communication overall"},"motivation":{"score":7,"notes":"Showed moderate enthusiasm for the role"},"resume_conflicts":[]}'::jsonb,
+  '{"schema_version":1,"provider":"anthropic","requestedModel":"claude-sonnet-4-20250514","workload":"scoring","prompt_template_version":"2026-07-28.1","timestamp":"2026-01-15T10:16:00Z"}'::jsonb,
   '2026-01-15T10:16:00Z'::timestamptz,
   '2026-01-15T10:16:00Z'::timestamptz
 ) on conflict (id) do nothing;
 
-insert into screening_v2.assessments (id, session_id, candidate_id, english, tone, communication, motivation, role_fit, resume_conflicts, overall_score, recommendation, summary, raw, created_at, updated_at) values
+insert into screening_v2.assessments (id, session_id, candidate_id, english, tone, communication, motivation, role_fit, resume_conflicts, overall_score, recommendation, summary, raw, provenance, created_at, updated_at) values
 (
   '60000000-0000-4000-a000-000000000052',
   '60000000-0000-4000-a000-000000000032',
@@ -295,6 +296,7 @@ insert into screening_v2.assessments (id, session_id, candidate_id, english, ton
   'advance',
   'SYNTHETIC DEMO: Candidate showed strong data science foundation.',
   '{"is_synthetic":true,"version":"gov-06-synthetic-v1","source":"demo_seed","communication":{"score":9,"clarity":9,"structure":9,"listening":9,"rapport":8,"english_proficiency":{"band":"C2","grammar":9,"vocabulary":9,"fluency":10,"coherence":9,"notes":"Excellent English proficiency"},"filler_usage":{"level":"low","examples":[],"impact_score":9,"notes":"Very few filler words"},"native_language_usage":{"level":"none","examples":[],"impact_score":10,"notes":"No native language interference"},"notes":"Excellent communication skills"},"motivation":{"score":8,"notes":"Good motivation for the role and company"},"resume_conflicts":[]}'::jsonb,
+  '{"schema_version":1,"provider":"anthropic","requestedModel":"claude-sonnet-4-20250514","workload":"scoring","prompt_template_version":"2026-07-28.1","timestamp":"2026-01-15T11:16:00Z"}'::jsonb,
   '2026-01-15T11:16:00Z'::timestamptz,
   '2026-01-15T11:16:00Z'::timestamptz
 ) on conflict (id) do nothing;

@@ -32,12 +32,13 @@ cat docs/HANDOVER.md
 | CORS + CSP foundation | SEC-07 | Code complete; deployment-gated | PR #6, merged 2026-07-29. Automated API CORS tests + built-HTML CSP smoke pass locally. CSP is report-only. Real-browser denial test, clean CSP report window, and Observatory B+ require deployment. |
 | OCI managed-services Terraform foundation | Infrastructure | Code merged; apply-gated | PR #7 (`e8584b0`), merged 2026-07-29. Scaffold only; `terraform apply` has not been run. |
 | OCI region benchmark harness | Infrastructure | Code merged; not yet measured | PR #8 (`726ce56`), merged 2026-07-29. Harness and fail-closed runbook exist; no benchmark data has been collected. |
+| LLM-06 model provenance (branch) | LLM-06 | Code complete on `feat/llm-06-provenance`; **not merged, not deployed** | Requested-model provenance for API simulation/scoring and LiveKit worker claim, SQL validator, immutability triggers, TS/Python validation. Local checks passed: API 275 tests, Python 63 tests, Supabase 46 policy/schema tests + PostgREST anon denial. Production migration apply and deployed provider evidence remain pending. |
 | Supabase local baseline | MIG-03 / partial MIG-04 | Code merged; production apply pending | PR #9 (`4d103ea`), merged 2026-07-29. Unused Mumbai project exists but MIG-01/MIG-02 admin acceptance pending; this is MIG-03/partial MIG-04. Membership-gated RLS and local validation; MIG-01/MIG-02 administrative acceptance plus controlled production connection/application and MIG-13 cutover are future gates. |
 | Synthetic demo seed foundation | GOV-06 | Code merged; production/demo acceptance pending | PR #14 (`7cbc962`), merged 2026-07-29. Deterministic local `app/supabase/seed.sql`, offline validator, 65 validator tests, 62 SQL integration assertions, runbook, and Supabase CI wiring are present. This is local synthetic-data scaffolding only; screenshots/demo artifact replacement and owner FND-03 evidence remain pending. |
 | OBS-01 / OBS-02 structured logging + correlation | OBS-01, OBS-02 | Code merged; deployment acceptance pending | PR #15 (`de133c6`), merged 2026-07-29. Structured JSON logger (JS+Python parity), UUID v4 correlation middleware, envelope validation, redaction/defense scanning, scoring taxonomy, and component defense are present. Managed log export, dashboards, alarms, queue/provider tracing, and deployed acceptance remain pending. |
-| Accessibility test foundation | TST-07 | Partial — automation scaffold complete (101 unit tests, strict axe matcher, fail-closed network trap, keyboard focus assertions); manual AT/contrast/reflow/browser gates and candidate consent/call flow remain external/dependent | Branch `test/tst-07-accessibility`. Runbook at `docs/runbooks/accessibility-testing.md`. CI gate: `npm run test:typecheck && npm test` added to quality.yml. Not a launch gate until all manual checks and candidate consent (GOV-08/Legal) are resolved. |
+| Accessibility test foundation | TST-07 | Automation scaffold merged; manual/dependent acceptance pending | PR #16 (`db20b4a`), merged 2026-07-29. Includes 101 unit tests, strict axe matcher, fail-closed network trap, and keyboard focus assertions. Manual AT/contrast/reflow/browser gates and candidate consent/call flow remain external/dependent, so this is not launch-gate acceptance. |
 
-PRs #14 and #15 were merged into `main` on 2026-07-29 with their required checks passing. Aggregate `main` verification after the remaining sequential merges is still pending.
+PRs #14–#16 were merged into `main` on 2026-07-29 with their required checks passing. Aggregate `main` verification after the remaining sequential merges is still pending.
 
 ## Phase-0 Foundation Status (FND-01, FND-02, FND-03)
 
@@ -80,7 +81,7 @@ node scripts/check-adrs.mjs
 node scripts/check-synthetic-seed.mjs app/supabase/seed.sql
 node scripts/check-synthetic-seed.test.mjs
 bash scripts/supabase-test.sh
-python3 -m py_compile app/voice-livekit/agent.py app/voice-livekit/persistence.py app/voice-livekit/observability.py
+python3 -m py_compile app/voice-livekit/agent.py app/voice-livekit/persistence.py app/voice-livekit/observability.py app/voice-livekit/provenance.py
 (cd app/voice-livekit && python3 -m unittest discover -s tests -p 'test_*.py' -v)
 node scripts/audit-seeded-vuln.test.mjs
 bash scripts/audit-deps.sh --dir app/api

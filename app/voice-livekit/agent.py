@@ -1,6 +1,7 @@
 """
-    SPIKE: LiveKit Agents voice worker (Gopu screening interviewer).
+    LLM-06: LiveKit Agents voice worker (Gopu screening interviewer).
 Sarvam STT/TTS + local multilingual turn-detector model + Anthropic Haiku LLM.
+Model provenance is claimed before any provider construction.
 
 Run (PowerShell, venv activated):
     python agent.py download-files   # one-time model download
@@ -22,6 +23,10 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 import persistence
 from observability import set_correlation_id, reset_correlation_id
 from prompting import build_prompt_context, collect_prompt_metadata
+
+# ── LLM-06: Provenance import ──────────────────────────────────────────
+from provenance import screening_provenance
+from persistence import set_session_provenance, ClaimResult
 
 load_dotenv()
 
@@ -46,6 +51,9 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+
+
 class Gopu(Agent):
     def __init__(self, instructions: str) -> None:
         super().__init__(instructions=instructions)
@@ -67,14 +75,17 @@ async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect()
     meta = collect_prompt_metadata(ctx)
     session_id = meta.get("session_id") or meta.get("sessionId")
-    # OBS-02: initialise correlation context for this session.
-    # The room creator (API /livekit/start) writes an opaque UUID v4 into room
-    # metadata; the worker validates it before accepting.  A fresh UUID is
-    # generated if the value is absent, invalid, or candidate-controlled.
-    # This correlation_id is distinct from the API request that created the room.
-    # The returned Token is used in finally to restore the previous context.
+    # OBS-02: initialise correlation context for this session. The room creator
+    # writes an opaque UUID v4 into metadata; invalid or absent values are
+    # replaced. The Token is restored in finally to prevent cross-job leakage.
     _cid_token = set_correlation_id(meta.get("correlation_id"))
     try:
+        # LLM-06: claim provenance before constructing STT, TTS, LLM, or VAD.
+        provenance = screening_provenance(ANTHROPIC_MODEL)
+        claim = await set_session_provenance(session_id, provenance)
+        if claim not in {ClaimResult.CLAIMED, ClaimResult.ALREADY_MATCHING}:
+            raise RuntimeError(f"provenance claim failed: {claim}")
+
         system_text, opening_text = build_prompt_context(ctx)
 
         session = AgentSession(
@@ -86,7 +97,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 model=os.getenv("SARVAM_TTS_MODEL", "bulbul:v3"),
                 speaker=os.getenv("SARVAM_TTS_VOICE", "shubh"),
             ),
-            llm=anthropic.LLM(model=os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")),
+            llm=anthropic.LLM(model=ANTHROPIC_MODEL),
             vad=silero.VAD.load(
                 activation_threshold=_float_env("LIVEKIT_VAD_ACTIVATION_THRESHOLD", 0.7),
                 min_speech_duration=_float_env("LIVEKIT_VAD_MIN_SPEECH_DURATION", 0.3),
