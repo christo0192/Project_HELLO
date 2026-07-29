@@ -13,7 +13,7 @@
 | **Reviewers** | [Security Lead — placeholder], [Product Manager — placeholder], [Legal Counsel — placeholder] |
 | **Target** | Browser-first production launch (no PSTN) |
 | **Non-goals** | Telephony/PSTN production (see Phase 13, §6.17); multi-tenant SaaS; mobile app |
-| **Last updated** | 2026-07-27 |
+| **Last updated** | 2026-07-28 |
 | **Next review** | After owners are assigned and D-001 through D-011 receive initial decisions |
 
 ### Assumptions
@@ -31,17 +31,17 @@
 
 | ID | Decision | Owner | Status | Date |
 |----|----------|-------|--------|------|
-| D-001 | Auth provider: WorkOS vs Supabase Auth vs Clerk | Eng Lead | Open | — |
-| D-002 | Queue/worker platform (Cloud Tasks, BullMQ+Redis, SQS, RabbitMQ) | Eng Lead | Open | — |
-| D-003 | Production cloud provider and region for compute | Eng Lead | Open | — |
+| D-001 | Auth provider: WorkOS vs Supabase Auth vs Clerk | Eng Lead + Product | Direction: Supabase Auth; formal approval pending | 2026-07-28 |
+| D-002 | Queue/worker platform (Cloud Tasks, BullMQ+Redis, SQS, RabbitMQ) | Eng Lead | Direction: OCI Queue; formal approval pending | 2026-07-28 |
+| D-003 | Production cloud provider and region for compute | Eng Lead + Legal + Security | Direction: OCI; Mumbai/Hyderabad region pending measured/legal evidence; formal approval pending | 2026-07-28 |
 | D-004 | Scoring provider/hosting: retain current `claude -p` or adopt an evaluated, compliant API/hosted alternative | Eng Lead + Legal | Open | — |
 | D-005 | LiveKit: stay Cloud vs self-host; region availability TBD | Eng Lead | Open | — |
 | D-006 | Backup strategy: PITR only vs PITR + daily snapshot export | Eng Lead | Open | — |
 | D-007 | Recording storage: Supabase Storage vs S3-compatible | Eng Lead | Open | — |
-| D-008 | SIEM/log aggregator choice | Eng Lead | Open | — |
+| D-008 | SIEM/log aggregator choice | Eng Lead + Security | Direction: OCI managed observability (Logging/Monitoring/APM/Notifications); security-log/SIEM acceptance pending; formal approval pending | 2026-07-28 |
 | D-009 | PII retention period (post-interview) | Legal | Open | — |
 | D-010 | DPDP consent mechanism and record-keeping | Legal | Open | — |
-| D-011 | Tenancy model: single-org launch vs org_id schema for future multi-tenancy | Eng Lead + Product | Open | — |
+| D-011 | Tenancy model: single-org launch vs org_id schema for future multi-tenancy | Eng Lead + Product | Direction: single-org launch; formal approval pending | 2026-07-28 |
 
 ---
 

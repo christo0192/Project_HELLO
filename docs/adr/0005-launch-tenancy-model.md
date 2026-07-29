@@ -2,6 +2,12 @@
 
 **Status:** Proposed
 
+**Direction confirmed (2026-07-28):** Single-organization launch selected as
+technical direction. No `org_id` schema isolation. Authenticated roles, RLS,
+and authorization matrix still required. Formal owner approval and evidence
+pending. This is a selected direction, not stakeholder sign-off, and does not
+constitute FND-08 acceptance.
+
 **Decision owner:** Engineering Lead and Product Manager (unassigned)
 
 **Plan references:** D-011, FND-08, SEC-03, MIG-03, MIG-04

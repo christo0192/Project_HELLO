@@ -2,6 +2,11 @@
 
 **Status:** Proposed
 
+**Direction confirmed (2026-07-28):** OCI Queue selected as technical direction
+with OCI Logging, Monitoring, APM, and Notifications for observability. Formal
+owner approval and evidence pending. This is a selected direction, not
+stakeholder sign-off, and does not constitute FND-08 acceptance.
+
 **Decision owner:** Engineering Lead (unassigned)
 
 **Plan references:** D-002, REL-01, REL-02, REL-03

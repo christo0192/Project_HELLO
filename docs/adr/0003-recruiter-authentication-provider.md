@@ -28,6 +28,13 @@ SEC-01 through SEC-04 remain blocked, and every current privileged endpoint is a
 production P0. Deferring avoids embedding an auth model that conflicts with the
 tenancy or transport decision.
 
+## Direction
+
+**Direction confirmed (2026-07-28):** Supabase Auth selected as technical direction
+for email/password + SSO + MFA. This is a selected direction, not stakeholder
+sign-off, and does not constitute FND-08 acceptance. See
+`docs/decisions/fnd-08-inputs.md`.
+
 ## Evidence
 
 Required before acceptance: scored provider matrix, threat-model update, proof
