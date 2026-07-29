@@ -4,6 +4,10 @@
 
 ---
 
+> **Implementation status (2026-07-29):** Branch `feat/rel-07-08-session-lifecycle` implements REL-07/REL-08 session lifecycle and graceful-shutdown scaffolding with local API, Python, and Supabase tests. This does **not** close production reliability acceptance: REL-09 reconciliation, durable scoring queue, deployed signal-drain proof, live SDK/room evidence, and launch gates remain pending.
+
+---
+
 ## 1. Document Control
 
 | Field | Value |

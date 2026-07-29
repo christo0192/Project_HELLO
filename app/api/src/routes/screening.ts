@@ -17,6 +17,7 @@ import {
   screeningTurnSchema,
   screeningSessionIdParamSchema,
 } from '../schemas/screening.js';
+import { createSession, transitionSession, ERR_INSERT_FAILED, ERR_DB_FAILED } from '../lib/session-lifecycle.js';
 
 export const screeningRouter = Router();
 
@@ -80,15 +81,17 @@ async function getTranscript(sessionId: string): Promise<TranscriptTurn[]> {
   return (data ?? []).map((t) => ({ speaker: t.speaker as 'bot' | 'candidate', text: t.text }));
 }
 
+/** Insert a transcript turn. Throws on Supabase error. */
 async function appendTurn(
   sessionId: string,
   index: number,
   speaker: 'bot' | 'candidate',
   text: string,
-) {
-  await supabase
+): Promise<void> {
+  const { error } = await supabase
     .from('transcript_turns')
     .insert({ session_id: sessionId, turn_index: index, speaker, text });
+  if (error) throw new Error('ERR_TRANSCRIPT_INSERT_FAILED');
 }
 
 // POST /api/screening/start  { candidate_id }
@@ -99,27 +102,51 @@ screeningRouter.post('/start', validateBody(startScreeningSchema), async (req, r
 
     const { ctxBase, roleId } = await loadContext(candidateId);
 
-    const { data: session, error } = await supabase
-      .from('call_sessions')
-      .insert({
-        candidate_id: candidateId,
-        role_id: roleId,
-        mode: 'simulation',
-        status: 'in_progress',
-      })
-      .select()
-      .single();
-    if (error) return next(error);
+    // REL-07: create in `created` state.
+    const { data: session, error: insertErr } = await createSession({
+      candidate_id: candidateId,
+      role_id: roleId,
+      mode: 'simulation',
+    });
+    if (insertErr || !session) return next(insertErr ?? new Error(ERR_INSERT_FAILED));
 
-    // Deterministic opening — guarantees the mandatory AI disclosure.
     const opening = buildOpeningMessage({
       candidateName: ctxBase.candidateName,
       roleTitle: ctxBase.roleTitle,
       company: env.companyName,
     });
 
-    await appendTurn(session.id, 0, 'bot', opening);
-    await supabase.from('candidates').update({ status: 'screening' }).eq('id', candidateId);
+    // Write opening turn; on failure, attempt to terminate the row.
+    // appendTurn throws on Supabase error now (detected via {error}).
+    try {
+      await appendTurn(session.id, 0, 'bot', opening);
+    } catch {
+      const termResult = await transitionSession(
+        session.id, 'created', 'failed', 'worker_crash',
+      );
+      if (!termResult.ok && !termResult.conflict) {
+        return next(new Error('opening turn failed and session could not be terminated — reconciliation required'));
+      }
+      return next(new Error('opening turn insert failed'));
+    }
+
+    // Candidate status is best-effort — use await+check, not .catch().
+    {
+      const { error: candErr } = await supabase
+        .from('candidates')
+        .update({ status: 'screening' })
+        .eq('id', candidateId);
+      if (candErr) {
+        // Candidate status is not critical; proceed with session start.
+        // Documented in runbook as best-effort.
+      }
+    }
+
+    // CAS: created → in_progress
+    const tr = await transitionSession(session.id, 'created', 'in_progress');
+    if (!tr.ok) {
+      return next(new Error('session transition conflict: could not activate session'));
+    }
 
     res.status(201).json({ session_id: session.id, message: opening, done: false });
   } catch (error) {
@@ -150,11 +177,9 @@ screeningRouter.post(
       const { ctxBase } = await loadContext(session.candidate_id);
       const transcript = await getTranscript(sessionId);
 
-      // record candidate's answer
       await appendTurn(sessionId, transcript.length, 'candidate', text);
       transcript.push({ speaker: 'candidate', text });
 
-      // generate bot's next message
       const reply = await runClaudeJSON<BotReply>(
         buildConversationPrompt({ ...ctxBase, transcript }),
         { system: SCREENING_SYSTEM },
@@ -162,20 +187,52 @@ screeningRouter.post(
       await appendTurn(sessionId, transcript.length, 'bot', reply.message);
 
       let assessment = null;
+      let scoringStatus: 'pending' | 'done' | 'error' = reply.done ? 'pending' : 'done';
+
       if (reply.done) {
-        await supabase
-          .from('call_sessions')
-          .update({ status: 'completed', ended_at: new Date().toISOString() })
-          .eq('id', sessionId);
-        try {
-          assessment = await runAssessment(sessionId);
-        } catch {
-          // don't fail the turn if scoring hiccups; surface a flag
-          assessment = { error: 'assessment failed' } as any;
+        // REL-07: CAS to completed FIRST (ownership), THEN assess.
+        // Only the CAS winner triggers assessment.
+        // Assessment failure does NOT rewrite completed → failed.
+        // Instead, scoringStatus='error' is returned so the caller knows
+        // the session completed but scoring needs retry.
+        const tr = await transitionSession(
+          session.id, 'in_progress', 'completed', 'conversation_complete',
+        );
+
+        if (tr.ok) {
+          // This caller won the CAS — owns post-session work.
+          try {
+            assessment = await runAssessment(sessionId);
+            scoringStatus = 'done';
+          } catch {
+            scoringStatus = 'error';
+            assessment = null;
+          }
+        } else if (tr.conflict) {
+          // Another writer already completed this session.
+          // Fetch the current terminal state to verify what happened.
+          const { data: curSession } = await supabase
+            .from('call_sessions')
+            .select('status')
+            .eq('id', sessionId)
+            .single();
+          if (curSession && curSession.status !== 'completed') {
+            // Another terminal state (failed/cancelled/expired) — not completed.
+            scoringStatus = 'error';
+            assessment = null;
+          } else {
+            // Already completed by another writer — safe.
+            scoringStatus = 'pending';
+            assessment = null;
+          }
+        } else {
+          // CAS returned ERROR or DISABLED — must not return HTTP 200 with done:true.
+          // The session may be in an unknown state; fail closed.
+          return next(new Error('ERR_DB_FAILED — session transition failed'));
         }
       }
 
-      res.json({ message: reply.message, done: reply.done, assessment });
+      res.json({ message: reply.message, done: reply.done, assessment, scoringStatus });
     } catch (error) {
       next(error);
     }

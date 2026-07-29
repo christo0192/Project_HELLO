@@ -8,14 +8,18 @@
 
 **Roadmap source of truth:** [`PLAN.md`](../PLAN.md)
 
+**Implementation status:** Partial — REL-07/REL-08 session lifecycle code complete on `feat/rel-07-08-session-lifecycle`. REL-09 reconciler, durable scoring, deployed signal drain, live SDK integration, and external acceptance pending; 0/17 launch gates complete.
+
+## Branch: feat/rel-07-08-session-lifecycle
+
+Base: `fd58f81` (FND-02/FND-03 non-secret owner-evidence pack). Not yet merged to `main`.
+
 ## Resume Here
 
 ```bash
 git fetch origin
-git switch main
-git pull --ff-only origin main
+git checkout feat/rel-07-08-session-lifecycle
 git log --oneline --decorate -10
-gh pr list --state all --limit 10
 cat docs/HANDOVER.md
 ```
 
@@ -33,8 +37,12 @@ cat docs/HANDOVER.md
 | OCI managed-services Terraform foundation | Infrastructure | Code merged; apply-gated | PR #7 (`e8584b0`), merged 2026-07-29. Scaffold only; `terraform apply` has not been run. |
 | OCI region benchmark harness | Infrastructure | Code merged; not yet measured | PR #8 (`726ce56`), merged 2026-07-29. Harness and fail-closed runbook exist; no benchmark data has been collected. |
 | Supabase local baseline | MIG-03 / partial MIG-04 | Code merged; production apply pending | PR #9 (`4d103ea`), merged 2026-07-29. Unused Mumbai project exists but MIG-01/MIG-02 admin acceptance pending; this is MIG-03/partial MIG-04. Membership-gated RLS and local validation; MIG-01/MIG-02 administrative acceptance plus controlled production connection/application and MIG-13 cutover are future gates. |
+| Session lifecycle (REL-07) | Session lifecycle | Code complete on `feat/rel-07-08-session-lifecycle`; **not merged, not deployed** | API 253 tests pass; Python 71 tests pass; Supabase 38 policy/schema tests pass. State machine with required reasons, stable error codes, CAS semantics, graceful shutdown. |
+| Graceful shutdown (REL-08) | Graceful shutdown | Code complete on `feat/rel-07-08-session-lifecycle`; **not merged, not deployed** | Shutdown regression tests cover in-flight race, sync close throw, socket cleanup, duplicate signals, and forced drain timeout. |
+| Migration SQL (0006) | Migration | Code complete on feat/rel-07-08-session-lifecycle | Default `created`, `legacy_unknown` backfill, per-state conditional constraint, transition triggers. |
 
 CI on `main` at `4d103ea`: Quality, Secret scan, and Supabase checks all passed on 2026-07-29.
+Local validation on `feat/rel-07-08-session-lifecycle`: API `npm test` → 253 pass; Python `python3 -m unittest discover` → 71 pass; `bash scripts/supabase-test.sh` → 38 policy/schema tests plus PostgREST anon denial pass.
 
 ## Phase-0 Foundation Status (FND-01, FND-02, FND-03)
 

@@ -1,5 +1,14 @@
 import 'dotenv/config';
 
+// Keep direct process.env reads visible to the env-contract checker for vars
+// parsed through helper functions below.
+const _contractVisibleEnvReads = [
+  process.env.CLAUDE_TIMEOUT_MS,
+  process.env.PORT,
+  process.env.SHUTDOWN_GRACE_MS,
+];
+void _contractVisibleEnvReads;
+
 function required(name: string): string {
   const v = process.env[name];
   if (!v || v === 'replace_me') {
@@ -8,21 +17,42 @@ function required(name: string): string {
   return v;
 }
 
+/**
+ * Parse a positive integer environment variable.
+ * Throws at import time (before server.listen) for NaN, Infinity, negative, zero, fraction, or out-of-range.
+ */
+function positiveInt(name: string, defaultVal: number, min: number, max: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return defaultVal;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) {
+    throw new Error(`${name} must be a finite number, got "${raw}"`);
+  }
+  if (!Number.isInteger(n)) {
+    throw new Error(`${name} must be an integer, got "${raw}"`);
+  }
+  if (n < min || n > max) {
+    throw new Error(`${name} must be between ${min} and ${max}, got ${n}`);
+  }
+  return n;
+}
+
 export const env = {
   supabaseUrl: required('SUPABASE_URL'),
   supabaseServiceRoleKey: required('SUPABASE_SERVICE_ROLE_KEY'),
-  // Postgres schema that holds the v2 tables (NOT public).
   supabaseSchema: process.env.SUPABASE_SCHEMA ?? 'screening_v2',
   claudeModel: process.env.CLAUDE_MODEL ?? 'haiku',
-  // Scoring needs accuracy -> default to a stronger model (still via claude -p).
   claudeScoringModel: process.env.CLAUDE_SCORING_MODEL ?? 'sonnet',
   companyName: process.env.COMPANY_NAME ?? 'the hiring team',
   claudeBin: process.env.CLAUDE_BIN ?? 'claude',
-  claudeTimeoutMs: Number(process.env.CLAUDE_TIMEOUT_MS ?? 120000),
-  port: Number(process.env.PORT ?? 8787),
+  claudeTimeoutMs: positiveInt('CLAUDE_TIMEOUT_MS', 120000, 1, 300000),
+  // PORT 0 = ephemeral (OS-assigned), 1-65535 = explicit
+  port: positiveInt('PORT', 8787, 0, 65535),
   webOrigin: process.env.WEB_ORIGIN ?? 'http://localhost:5173',
   livekitUrl: process.env.LIVEKIT_URL ?? '',
   livekitApiKey: process.env.LIVEKIT_API_KEY ?? '',
   livekitApiSecret: process.env.LIVEKIT_API_SECRET ?? '',
   recordingsBucket: process.env.RECORDINGS_BUCKET ?? 'recordings_v2',
+  /** REL-08: grace period (ms) before forced connection teardown. */
+  shutdownGraceMs: positiveInt('SHUTDOWN_GRACE_MS', 30000, 100, 300000),
 };

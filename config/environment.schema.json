@@ -19,7 +19,8 @@
         "LIVEKIT_API_KEY": { "requiredInProduction": true, "secret": true },
         "LIVEKIT_API_SECRET": { "requiredInProduction": true, "secret": true },
         "RECORDINGS_BUCKET": { "requiredInProduction": true, "secret": false },
-        "NODE_ENV": { "requiredInProduction": true, "secret": false }
+        "NODE_ENV": { "requiredInProduction": true, "secret": false },
+        "SHUTDOWN_GRACE_MS": { "requiredInProduction": false, "secret": false }
       }
     },
     "web": {
@@ -55,6 +56,7 @@
         "LIVEKIT_MIN_INTERRUPTION_DURATION": { "requiredInProduction": true, "secret": false },
         "LIVEKIT_MIN_INTERRUPTION_WORDS": { "requiredInProduction": true, "secret": false },
         "LIVEKIT_FALSE_INTERRUPTION_TIMEOUT": { "requiredInProduction": true, "secret": false },
+        "LIVEKIT_WORKER_DRAIN_SEC": { "requiredInProduction": true, "secret": false },
         "GOPU_CANDIDATE_NAME": { "requiredInProduction": false, "secret": false, "productionAllowed": false },
         "GOPU_ROLE_TITLE": { "requiredInProduction": false, "secret": false, "productionAllowed": false },
         "GOPU_ROLE_FOCUS": { "requiredInProduction": false, "secret": false, "productionAllowed": false },
