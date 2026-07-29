@@ -98,4 +98,81 @@ upgrade or equivalent) is confirmed AND the `quality` and `secret-scan` status
 checks are enforced on `main`, AND direct pushes to `main` are rejected.
 The verifier is an evidence-collection tool — it does not enforce anything.
 
+## Commit provenance verifier (compensating control)
+
+**⚠️  DETECTION ONLY — does NOT prevent direct pushes.**
+
+Because hosted branch protection is unavailable on the current private
+repository plan, the provenance verifier in
+`scripts/check-main-provenance.mjs` provides compensating governance by
+detecting non-PR commits on `main` after the fact.
+
+### Detection logic
+
+Each commit pushed to `main` is classified:
+
+| Classification | Condition | Verdict |
+|----------------|-----------|--------|
+| **Squash-merge PR** | 1 parent + `(#N)` in message | ✅ Accepted |
+| **Direct push** | 1 parent, no PR reference | ❌ Rejected |
+| **Merge commit** | 2+ parents | ❌ Rejected |
+| **Root/error** | 0 parents or missing metadata | ❌ Rejected |
+
+- **Squash-merge** is the accepted PR provenance. GitHub squash-merges
+  produce a single-parent commit with `(#N)` in the message.
+- **Merge commits** (GitHub merge-commit strategy) have 2+ parents and are
+  always rejected, even if the message contains a PR reference.
+- **Direct pushes** (no PR flow) produce 1-parent commits with no PR
+  reference in the message and are rejected.
+- **Rebase merges** (GitHub rebase-merge strategy) produce 1-parent commits.
+  If they lack `(#N)` in every commit message, they are rejected as
+  direct-push (fail-closed).
+
+### How it works
+
+1. **Monitor workflow** (`.github/workflows/branch-governance-monitor.yml`):
+   On every push to `main`, the verifier reads the push event payload
+   (`GITHUB_EVENT_PATH`) and runs `git rev-list` to enumerate all pushed
+   commits. Each commit's parent count and message are checked for PR
+   provenance.
+2. **Output**: Fixed-schema redacted JSON — no SHA, no commit message, no
+   repository name. Artifact uploaded on every run.
+3. **Exit codes**: `0` = all commits have PR provenance; `1` = one or more
+   commits lack PR provenance (detected, not prevented).
+4. **Fail-closed**: Malformed event payload, missing `GITHUB_EVENT_PATH`,
+   empty commit list, or `git rev-list` failure → exit code 1.
+
+See `docs/runbooks/branch-governance-evidence.md` for the collection runbook.
+
+## Free-tier alternatives considered and rejected
+
+| Alternative | Rejection rationale |
+|-------------|-------------------|
+| **Git hooks (server-side)** | Not available on GitHub Free; no custom hook endpoint on `push` to `main` |
+| **`git push` hook via Actions** | A workflow triggered on `push` runs *after* the push, not before — cannot prevent |
+| **`pre-receive` hook** | Requires self-hosted runner with filesystem access; violates out-of-scope for self-hosting |
+| **Branch protection via API + cron** | Would require write token and mutation, violating invariant 1 (Action cannot prevent) |
+| **CODEOWNERS restriction** | Requires branch protection to enforce on `main`; not available on Free plan |
+| **Require signed commits (UI)** | Uses classic protection — confirmed unavailable via 403 |
+| **GitHub Pro/Team upgrade** | Paid tier — out of scope (free repository constraint) |
+| **Public repo** | Out of scope (private repo required) |
+| **External forge (GitLab, etc.)** | Out of scope (GitHub Free constraint) |
+
+The only viable no-cost compensating control is **post-push detection** with
+redacted evidence upload. This does **NOT** close FND-01; hosted-enforcement
+rejection tests are still required.
+
+## Residual limitations
+
+1. The provenance verifier does **not** prevent direct pushes — it detects
+   them after they land on `main`.
+2. A squash-merge commit crafted with a fake `(#N)` in the message would
+   pass the heuristic check (though this is unlikely from an adversarial
+   direct push since the adversary would need to guess or know an existing
+   PR number).
+3. `GITHUB_EVENT_PATH` is only available in `push` event workflows. The
+   verifier cannot run as a standalone API check.
+4. The monitor workflow requires `fetch-depth: 0` for `git rev-list` to
+   work across the full commit range.
+
 See `docs/runbooks/branch-governance-evidence.md` for the collection runbook.

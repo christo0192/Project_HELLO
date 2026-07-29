@@ -1,0 +1,51 @@
+name: Branch Governance Monitor
+# DETECTION ONLY — does not prevent direct pushes.
+# Monitors push events to main for commit provenance.
+# On detection of non-PR provenance, warns and uploads evidence
+# (detection-only, does not fail). This is compensating governance for the
+# unavailable hosted branch protection on GitHub Free private repositories.
+#
+# ⚠️  This workflow does NOT prevent direct pushes. It detects and reports
+# them after the fact. FND-01 remains hosted-enforcement pending.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-provenance:
+    name: check-provenance
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run provenance verifier (live mode via GITHUB_EVENT_PATH)
+        id: verifier
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REDACTED="$(mktemp)"
+          set +e
+          node scripts/check-main-provenance.mjs > "$REDACTED" 2>&1
+          EXIT="$?"
+          set -e
+          cp "$REDACTED" ./redacted-provenance-evidence.json
+          if [ "$EXIT" -ne 0 ]; then
+            echo "::warning::Non-PR provenance detected on main (exit $EXIT). See redacted provenance artifact."
+            # Do NOT fail — detection only. FND-01 remains hosted-enforcement pending.
+          fi
+      - name: Upload redacted provenance evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: branch-provenance-evidence
+          path: redacted-provenance-evidence.json
+          retention-days: 90
