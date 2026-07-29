@@ -989,6 +989,26 @@ describe('ClaudeRunner', () => {
     expect(spawnFn).toHaveBeenCalledTimes(2);
   });
 
+  it('runClaudeJSONWithProvenance uses the breaker-managed path and reports requested model', async () => {
+    const child = createFakeChild();
+    const spawnFn: SpawnFn = vi.fn(() => child) as any;
+    const runner = createClaudeRunner({ spawnFn });
+
+    const resultPromise = runner.runClaudeJSONWithProvenance<{ ok: boolean }>(
+      'prompt',
+      { ...opts, model: 'claude-test-model' },
+    );
+    await tick();
+    child.emitStdout(Buffer.from('{"ok":true}'));
+    child.emitClose(0);
+
+    await expect(resultPromise).resolves.toEqual({
+      data: { ok: true },
+      requestedModel: 'claude-test-model',
+    });
+    expect(spawnFn).toHaveBeenCalledTimes(1);
+  });
+
   // ── Finding 5: runtime override validation ──
 
   describe('runtime override validation (finding 5/6)', () => {

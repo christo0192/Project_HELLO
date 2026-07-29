@@ -45,19 +45,14 @@ cat docs/HANDOVER.md
 | CORS + CSP foundation | SEC-07 | Code complete; deployment-gated | PR #6, merged 2026-07-29. Automated API CORS tests + built-HTML CSP smoke pass locally. CSP is report-only. Real-browser denial test, clean CSP report window, and Observatory B+ require deployment. |
 | OCI managed-services Terraform foundation | Infrastructure | Code merged; apply-gated | PR #7 (`e8584b0`), merged 2026-07-29. Scaffold only; `terraform apply` has not been run. |
 | OCI region benchmark harness | Infrastructure | Code merged; not yet measured | PR #8 (`726ce56`), merged 2026-07-29. Harness and fail-closed runbook exist; no benchmark data has been collected. |
+| LLM-06 model provenance | LLM-06 | Code merged; production migration/deployment acceptance pending | PR #17 (`8439bda`), merged 2026-07-29. Requested-model provenance covers API simulation/scoring and LiveKit worker claims with SQL validation and immutability. Hosted migration application and deployed provider evidence remain pending. |
 | Supabase local baseline | MIG-03 / partial MIG-04 | Code merged; production apply pending | PR #9 (`4d103ea`), merged 2026-07-29. Unused Mumbai project exists but MIG-01/MIG-02 admin acceptance pending; this is MIG-03/partial MIG-04. Membership-gated RLS and local validation; MIG-01/MIG-02 administrative acceptance plus controlled production connection/application and MIG-13 cutover are future gates. |
-| Provider resilience foundation | REL-05, REL-06 | Code complete on `feat/rel-05-06-provider-resilience`; **not merged, not deployed** | Circuit breaker (closed/open/half-open), hardened Node claude runner (shell:false, runtime validation, stdin EPIPE handling, two-phase settle state machine, stable stream-error categories, non_zero_exit counted by breaker, platform-safe kill), Python scoring HTTP with explicit timeouts/lazy transport/async close, circuit_open distinct category, BusinessError resets consecutive failures, closed reason-code mapping for fail_session. Local validation passed: API 274 tests, provider-resilience API 88 tests, Python 98 tests. See `docs/runbooks/provider-resilience.md` for gaps (SDK-internal calls not controlled, no pinned Python requirements, no reconciliation/deployed proof).
-**Prospective PR:** assigned by GitHub on merge. This row will be updated when the PR is opened/merged. |
+| Synthetic demo seed foundation | GOV-06 | Code merged; production/demo acceptance pending | PR #14 (`7cbc962`), merged 2026-07-29. Deterministic local seed, offline validator, SQL integration assertions, runbook, and Supabase CI wiring are present. Artifact replacement and owner FND-03 evidence remain pending. |
+| OBS-01 / OBS-02 structured logging + correlation | OBS-01, OBS-02 | Code merged; deployment acceptance pending | PR #15 (`de133c6`), merged 2026-07-29. Structured logging and UUID v4 correlation scaffolding are present; managed export, dashboards, alarms, and deployed acceptance remain pending. |
+| Accessibility test foundation | TST-07 | Automation scaffold merged; manual/dependent acceptance pending | PR #16 (`db20b4a`), merged 2026-07-29. Automated axe, network-trap, and keyboard checks are present. Manual AT/browser gates and candidate consent/call flow remain pending. |
+| Provider resilience foundation | REL-05, REL-06 | Code complete on `feat/rel-05-06-provider-resilience`; **not merged, not deployed** | Circuit breakers, hardened Claude runner, explicit scoring HTTP timeouts/lazy transport, typed failure outcomes, correlation propagation, and closed failure-reason mapping are implemented. See `docs/runbooks/provider-resilience.md`; SDK-internal calls, reconciliation, and deployed drills remain pending. |
 
-CI on `main` at `4d103ea`: Quality, Secret scan, and Supabase checks all passed on 2026-07-29.
-
-The following PRs are merged into the current branch `feat/rel-05-06-provider-resilience` (based on `fd58f81`):
-- PR #10 (docs: Phase-0 governance status)
-- PR #11 (docs: FND-08 technical directions)
-- PR #12 (FND-01 branch-governance evidence verifier — completed-tooling)
-- PR #13 (FND-02/FND-03 — eight-provider rotation evidence, seven-group sanitization — completed-tooling)
-
-PR #12 and #13 add deterministic CI checks for branch governance and secret/PII sanitization. Acceptance remains blocked on hosted enforcement (FND-01) and owner-rotation evidence (FND-02).
+PRs #14–#17 were merged into `main` on 2026-07-29 with their required checks passing. Aggregate `main` verification after the remaining sequential merges is still pending.
 
 ## Phase-0 Foundation Status (FND-01, FND-02, FND-03)
 
@@ -69,7 +64,16 @@ external-blockers summary.
 |---|---|---|
 | FND-01 | Repository controls merged | **Blocked**: hosted enforcement blocked — private-plan GitHub API returned 403 |
 | FND-02 | Scanner controls merged | **Blocked**: owner rotation evidence pending for eight provider systems; non-secret revocation evidence required |
-| FND-03 | Containment controls merged | **Blocked**: sanitization, synthetic, and restricted-storage disposition pending |
+| FND-03 | Containment controls and GOV-06 local synthetic seed tooling merged | **Blocked**: authentic sanitization, screenshot/demo replacement, and restricted-storage disposition evidence pending |
+
+## OBS-01/OBS-02 Status (code merged in PR #15; deployed acceptance pending)
+
+| Item | Status | Notes |
+|------|--------|-------|
+| Structured logging/correlation | Code merged | JS/Python redaction and UUID v4 correlation scaffolding are present |
+| Managed export, dashboards, alarms | **Pending** | No production platform or deployed proof |
+| Queue/provider tracing | **Pending** | ADR-0004 queue not yet implemented |
+| Launch gates (0/17) | **0 complete** | Implementation does not equal production acceptance |
 
 ## Current Verification
 
@@ -80,21 +84,22 @@ cd app/api && npm ci && npm run typecheck && npm test
 npx vitest run src/__tests__/provider-resilience.test.ts
 
 # Web
-cd ../web && npm ci && npm run lint && npm run build
+cd ../web && npm ci && npm run test:typecheck && npm test && npm run lint && npm run build
 cd ../..
 
 # Contracts, ADRs, audits
 node scripts/check-env-contract.mjs
 node scripts/check-env-contract.test.mjs
 node scripts/check-adrs.mjs
+node scripts/check-synthetic-seed.mjs app/supabase/seed.sql
+node scripts/check-synthetic-seed.test.mjs
+bash scripts/supabase-test.sh
+python3 -m py_compile app/voice-livekit/agent.py app/voice-livekit/persistence.py app/voice-livekit/observability.py app/voice-livekit/provenance.py app/voice-livekit/provider_resilience.py
+(cd app/voice-livekit && python3 -m unittest discover -s tests -p 'test_*.py' -v)
 node scripts/audit-seeded-vuln.test.mjs
 bash scripts/audit-deps.sh --dir app/api
 bash scripts/audit-deps.sh --dir app/web
 bash scripts/sbom.sh
-
-# Python compile + tests (no external deps required for stdlib tests)
-python3 -m py_compile app/voice-livekit/provider_resilience.py app/voice-livekit/persistence.py
-python3 -m pytest app/voice-livekit/tests/test_provider_resilience.py -v --tb=short
 
 # Security
 ./scripts/scan-secrets.sh --committable
@@ -104,8 +109,10 @@ git diff --check
 ### Current Test Counts
 | Suite | Count | Notes |
 |---|---|---|
-| API (Node) | **274 tests** (239 full suite + 35 new/adversarial) | 88 provider-resilience (53 breaker/collectBounded + 35 ClaudeRunner/race/validation) + 186 validation/security |
-| Provider resilience (Python) | **98 tests** (54 original + 44 adversarial/transport/classification) | Uses `python3 -m unittest`; no httpx dependency for unit tests using FakeTransport — httpx only needed for tests that exercise `trigger_scoring()` (TestTriggerScoringBreakerOpen). No pinned `requirements.txt` / `pyproject.toml` — gap for future PR. |
+| API (Node) | **597 tests** | Includes 89 provider-resilience tests plus validation, observability, provenance, and CORS/CSP suites; deterministic fakes avoid real CLI/provider calls. |
+| LiveKit worker (Python) | **217 tests** | Combined resilience, observability, provenance, correlation, and persistence coverage using `unittest` and fake transports; no real provider calls. |
+| Web | **101 tests** | Accessibility scaffold plus typecheck, lint, and production build. |
+| Supabase | **46 policy/provenance + 62 synthetic SQL assertions** | Local ephemeral stack only; includes anonymous denial and idempotent seed replay. |
 
 ## Remaining Production Work
 

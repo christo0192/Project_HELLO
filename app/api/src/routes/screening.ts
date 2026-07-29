@@ -17,6 +17,7 @@ import {
   screeningTurnSchema,
   screeningSessionIdParamSchema,
 } from '../schemas/screening.js';
+import { screeningProvenance } from '../lib/model-provenance.js';
 
 export const screeningRouter = Router();
 
@@ -99,6 +100,11 @@ screeningRouter.post('/start', validateBody(startScreeningSchema), async (req, r
 
     const { ctxBase, roleId } = await loadContext(candidateId);
 
+    // Build provenance reflecting the *requested* Anthropic model for simulation.
+    // The screening route requests env.claudeModel; this is the design intent,
+    // not a runtime-resolved value.  For LiveKit the worker claims the actual model.
+    const provenance = screeningProvenance(env.claudeModel);
+
     const { data: session, error } = await supabase
       .from('call_sessions')
       .insert({
@@ -106,6 +112,7 @@ screeningRouter.post('/start', validateBody(startScreeningSchema), async (req, r
         role_id: roleId,
         mode: 'simulation',
         status: 'in_progress',
+        provenance,
       })
       .select()
       .single();
@@ -154,7 +161,7 @@ screeningRouter.post(
       await appendTurn(sessionId, transcript.length, 'candidate', text);
       transcript.push({ speaker: 'candidate', text });
 
-      // generate bot's next message
+      // generate bot's next message (original runClaudeJSON contract: returns T directly)
       const reply = await runClaudeJSON<BotReply>(
         buildConversationPrompt({ ...ctxBase, transcript }),
         { system: SCREENING_SYSTEM },

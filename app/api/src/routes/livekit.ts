@@ -3,6 +3,7 @@ import multer from 'multer';
 import { AccessToken, RoomServiceClient } from 'livekit-server-sdk';
 import { supabase } from '../lib/supabase.js';
 import { env } from '../lib/env.js';
+import { getCorrelationId } from '../lib/correlation.js';
 import { formatResumeFacts } from '../lib/prompts.js';
 import {
   requireUploadedFile,
@@ -80,6 +81,11 @@ livekitRouter.post('/start', validateBody(livekitStartSchema), async (req, res, 
     if (!candidateId) return res.status(400).json({ error: 'candidate_id is required' });
 
     const { candidate, metadata } = await loadCandidateContext(candidateId);
+
+    // LiveKit sessions leave provenance null initially.  The LiveKit worker
+    // will atomically set provenance to the actual model it uses before any
+    // inference.  The API must NOT fabricate a "best guess" — the worker
+    // owns the ground truth.
     const { data: session, error: sErr } = await supabase
       .from('call_sessions')
       .insert({
@@ -88,16 +94,22 @@ livekitRouter.post('/start', validateBody(livekitStartSchema), async (req, res, 
         mode: 'browser',
         provider: 'livekit',
         status: 'in_progress',
+        // provenance intentionally omitted — worker will set it
       })
       .select()
       .single();
     if (sErr || !session) return next(sErr ?? new Error('failed to create session'));
 
     const roomName = `screening-${session.id}`;
+    // OBS-02: propagate the API request correlation ID into room metadata so
+    // the LiveKit worker can inherit it for the session.  The ID is opaque
+    // (UUID v4, no PII) but is visible to room participants; it is not a
+    // secret.  The worker validates the value before accepting it.
     const roomMetadata = JSON.stringify({
       ...metadata,
       session_id: session.id,
       room_name: roomName,
+      correlation_id: getCorrelationId() ?? undefined,
     });
     const rooms = new RoomServiceClient(env.livekitUrl, env.livekitApiKey, env.livekitApiSecret);
     try {

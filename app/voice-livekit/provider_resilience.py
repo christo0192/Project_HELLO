@@ -555,7 +555,9 @@ async def call_with_breaker(
     breaker: CircuitBreaker,
     transport: AsyncTransport,
     json_body: Any = None,
+    headers: Optional[dict[str, str]] = None,
     endpoint_hint: str = "",
+    log_failures: bool = True,
 ) -> Any:
     """Make an HTTP call through a circuit breaker.
 
@@ -570,11 +572,12 @@ async def call_with_breaker(
     """
     try:
         response = await breaker.call(lambda: _call_and_classify(
-            transport, method, url, json_body,
+            transport, method, url, json_body, headers,
         ))
         return response
     except ProviderError as exc:
-        logger.warning(redacted_log_message(exc.category, endpoint_hint))
+        if log_failures:
+            logger.warning(redacted_log_message(exc.category, endpoint_hint))
         raise
     except BusinessError:
         raise
@@ -585,9 +588,15 @@ async def _call_and_classify(
     method: str,
     url: str,
     json_body: Any,
+    headers: Optional[dict[str, str]],
 ) -> Any:
     """Transport request + status classification — runs INSIDE breaker.call()."""
-    response = await transport.request(method=method, url=url, json=json_body)
+    response = await transport.request(
+        method=method,
+        url=url,
+        json=json_body,
+        headers=headers,
+    )
     cls = _classify_http_status(response.status_code)
     if cls is ProviderError:
         raise ProviderError("protocol")

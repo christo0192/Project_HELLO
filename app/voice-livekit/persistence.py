@@ -5,107 +5,114 @@ existing ``screening_v2.call_sessions.id``; this worker writes live transcript
 turns against that id, completes the session, and triggers the same API scoring
 route used by the old Pipecat flow.
 
-OUTBOUND BOUNDARIES:
-  1. Supabase DB queries (via sync supabase-py client in asyncio.to_thread).
-     NOTE: supabase-py is a local library dependency; no circuit breaker wraps
-     it. A future PR should add per-query timeouts and a backoff wrapper.
-  2. HTTP POST to API_BASE/api/assess/{session_id} for scoring trigger.
-     This uses the circuit breaker in provider_resilience.py with explicit
-     connect/read/write/pool timeouts and non-disclosing diagnostics.
-
-LOGGING: All log messages use stable event codes — no session IDs,
-transcript excerpts, raw exceptions, or candidate identifiers.
-FAIL_SESSION: Uses a closed reason-code mapping; never stores raw reason text.
+LLM-06 adds provenance claiming via ``set_session_provenance()`` with
+compare-and-set semantics. OBS-01/OBS-02 route output through the redacting
+``StructuredLogger`` and propagate ``X-Correlation-ID``. REL-05/REL-06 protect
+the scoring trigger with a circuit breaker, explicit transport timeouts, lazy
+transport construction, typed outcomes, and a closed failure-reason mapping.
+No transcript text, raw exceptions, session IDs, URLs, response bodies, or raw
+provenance values are logged.
 """
 
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 from provider_resilience import (
+    BusinessError,
     CircuitBreaker,
     CircuitBreakerConfig,
     CircuitState,
+    ProviderError,
+    RealClock,
     call_with_breaker,
-    get_scoring_transport,
     configure_scoring_transport,
+    get_scoring_transport,
     parse_env_float,
     parse_env_int,
-    RealClock,
-    ProviderError,
-    BusinessError,
-    redacted_log_message,
 )
 
 try:
     from supabase import create_client
-except ImportError:  # pragma: no cover - keeps console mode usable without persistence deps
+except ImportError:  # pragma: no cover — keeps console mode usable without persistence deps
     create_client = None
 
+from observability import StructuredLogger, get_correlation_id
 
 SCHEMA = os.getenv("SUPABASE_SCHEMA", "screening_v2")
 API_BASE = os.getenv("API_BASE", "http://localhost:8787")
-logger = logging.getLogger("voice-livekit.persistence")
+
+_log = StructuredLogger("persistence")
 _client = None
 
 
-# ── Closed reason-code mapping for fail_session ───────────────────
-# Never store raw reason text from exceptions or candidate data.
-_FAIL_REASON_CODES: dict[str, str] = {
-    "error": "error",
-    "timeout": "timeout",
-    "disconnect": "disconnect",
-    "unknown": "unknown",
-}
+# ── Provenance claim result enum ───────────────────────────────────────
 
+class ClaimResult:
+    """Result of a provenance claim attempt."""
 
-def _safe_reason_code(reason: str) -> str:
-    """Map a reason to a closed set of codes. Never exposes raw text."""
-    code = reason.strip().lower().replace(" ", "_")
-    if code in _FAIL_REASON_CODES:
-        return _FAIL_REASON_CODES[code]
-    # Not in allowlist — map to "unknown"
-    return "unknown"
-
-
-# ── Circuit breaker for scoring-trigger HTTP ─────────────────────
-
-# Configure transport lazily — does NOT construct httpx at import time
-_SCORING_BREAKER_THRESHOLD = parse_env_int(os.getenv("SCORING_BREAKER_THRESHOLD"), 3, min_val=1, max_val=100)
-_SCORING_BREAKER_COOLDOWN = parse_env_float(os.getenv("SCORING_BREAKER_COOLDOWN_SEC"), 30.0, min_val=1.0, max_val=600.0)
-_SCORING_BREAKER_TIMEOUT = parse_env_float(os.getenv("SCORING_BREAKER_TIMEOUT_SEC"), 180.0, min_val=1.0, max_val=600.0, allow_zero=False)
-
-_SCORING_BREAKER = CircuitBreaker(CircuitBreakerConfig(
-    failure_threshold=_SCORING_BREAKER_THRESHOLD,
-    cooldown_sec=_SCORING_BREAKER_COOLDOWN,
-    timeout_sec=_SCORING_BREAKER_TIMEOUT,
-    clock=RealClock(),
-))
-
-# Configure transport parameters (lazy — httpx constructed on first call)
-configure_scoring_transport(
-    connect_timeout=parse_env_float(os.getenv("SCORING_HTTP_CONNECT_TIMEOUT"), 10.0, min_val=1.0, max_val=120.0),
-    read_timeout=parse_env_float(os.getenv("SCORING_HTTP_READ_TIMEOUT"), 180.0, min_val=1.0, max_val=600.0),
-    write_timeout=parse_env_float(os.getenv("SCORING_HTTP_WRITE_TIMEOUT"), 30.0, min_val=1.0, max_val=120.0),
-    pool_timeout=parse_env_float(os.getenv("SCORING_HTTP_POOL_TIMEOUT"), 10.0, min_val=1.0, max_val=120.0),
-)
+    CLAIMED = "claimed"
+    ALREADY_MATCHING = "already_matching"
+    CONFLICT = "conflict"
+    MISSING = "missing"
+    ERROR = "error"
 
 
 class TriggerOutcome(Enum):
-    """Typed outcome for trigger_scoring — lets callers/test know what happened."""
+    """Typed result of the breaker-protected scoring trigger."""
+
     SUCCESS = "success"
     BREAKER_OPEN = "breaker_open"
     TRANSPORT_FAILURE = "transport_failure"
-    BUSINESS_ERROR = "business_error"  # e.g. 404, session not found
+    BUSINESS_ERROR = "business_error"
 
 
-# ── Supabase client ─────────────────────────────────────────────
+_FAIL_REASON_CODES = frozenset({"error", "timeout", "disconnect", "unknown"})
 
+
+def _safe_reason_code(reason: str) -> str:
+    code = reason.strip().lower().replace(" ", "_")
+    return code if code in _FAIL_REASON_CODES else "unknown"
+
+
+_SCORING_BREAKER = CircuitBreaker(CircuitBreakerConfig(
+    failure_threshold=parse_env_int(
+        os.getenv("SCORING_BREAKER_THRESHOLD"), 3, min_val=1, max_val=100,
+    ),
+    cooldown_sec=parse_env_float(
+        os.getenv("SCORING_BREAKER_COOLDOWN_SEC"), 30.0, min_val=1.0, max_val=600.0,
+    ),
+    timeout_sec=parse_env_float(
+        os.getenv("SCORING_BREAKER_TIMEOUT_SEC"),
+        180.0,
+        min_val=1.0,
+        max_val=600.0,
+        allow_zero=False,
+    ),
+    clock=RealClock(),
+))
+
+configure_scoring_transport(
+    connect_timeout=parse_env_float(
+        os.getenv("SCORING_HTTP_CONNECT_TIMEOUT"), 10.0, min_val=1.0, max_val=120.0,
+    ),
+    read_timeout=parse_env_float(
+        os.getenv("SCORING_HTTP_READ_TIMEOUT"), 180.0, min_val=1.0, max_val=600.0,
+    ),
+    write_timeout=parse_env_float(
+        os.getenv("SCORING_HTTP_WRITE_TIMEOUT"), 30.0, min_val=1.0, max_val=120.0,
+    ),
+    pool_timeout=parse_env_float(
+        os.getenv("SCORING_HTTP_POOL_TIMEOUT"), 10.0, min_val=1.0, max_val=120.0,
+    ),
+)
+
+
+# ── Internal client ────────────────────────────────────────────────────
 
 def _get_client():
     global _client
@@ -114,7 +121,7 @@ def _get_client():
     url = os.getenv("SUPABASE_URL")
     key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
     if not (url and key and create_client):
-        logger.warning("[livekit-db] unconfigured")
+        _log.warn("db_error", error_category="supabase_creds_missing")
         return None
     _client = create_client(url, key)
     return _client
@@ -125,8 +132,84 @@ def _table(name: str):
     return client.schema(SCHEMA).table(name) if client else None
 
 
-# ── Persistence operations ────────────────────────────────────────
+# ── Provenance claiming (LLM-06) ──────────────────────────────────────
 
+async def set_session_provenance(
+    session_id: Optional[str],
+    provenance: dict[str, Any],
+) -> str:
+    """
+    Atomically claim provenance for a LiveKit session (compare-and-set).
+
+    Uses an exact one-row UPDATE: ``WHERE id = ? AND provenance IS NULL``
+    with ``.select("id")`` to confirm exactly one row affected.
+    This ensures only the first claim succeeds.
+
+    Returns one of ``ClaimResult.*`` values.
+
+    Never logs the raw provenance dict or session identifier.
+    """
+    if not session_id:
+        _log.warn("db_error", error_category="provenance_session_missing")
+        return ClaimResult.MISSING
+
+    def run():
+        table = _table("call_sessions")
+        if not table:
+            return None
+        result = (
+            table.update({"provenance": provenance})
+            .eq("id", session_id)
+            .is_("provenance", "null")
+            .select("id")
+            .execute()
+        )
+        return result
+
+    try:
+        result = await asyncio.to_thread(run)
+    except Exception:  # noqa: BLE001
+        _log.warn("db_error", error_category="provenance_claim_failed")
+        return ClaimResult.ERROR
+
+    if result is None:
+        _log.warn("db_error", error_category="provenance_store_missing")
+        return ClaimResult.MISSING
+
+    rows = result.data if hasattr(result, "data") else None
+    if rows and len(rows) > 0:
+        return ClaimResult.CLAIMED
+
+    # Rows affected = 0 — provenance was not null.  Read current value to
+    # distinguish ALREADY_MATCHING from CONFLICT.
+    try:
+        def read_provenance():
+            tbl = _table("call_sessions")
+            if not tbl:
+                return None
+            return tbl.select("provenance").eq("id", session_id).single().execute()
+
+        session_result = await asyncio.to_thread(read_provenance)
+    except Exception:  # noqa: BLE001
+        _log.warn("db_error", error_category="provenance_read_failed")
+        return ClaimResult.MISSING
+
+    existing = None
+    if session_result and hasattr(session_result, "data") and session_result.data:
+        existing = session_result.data.get("provenance")
+
+    if existing is None:
+        _log.warn("db_error", error_category="provenance_claim_race")
+        return ClaimResult.ERROR
+
+    if existing == provenance:
+        return ClaimResult.ALREADY_MATCHING
+
+    _log.warn("db_error", error_category="provenance_conflict")
+    return ClaimResult.CONFLICT
+
+
+# ── Transcript persistence ─────────────────────────────────────────────
 
 async def save_turn(session_id: Optional[str], turn_index: int, speaker: str, text: str) -> None:
     if not (session_id and text.strip()):
@@ -147,9 +230,10 @@ async def save_turn(session_id: Optional[str], turn_index: int, speaker: str, te
 
     try:
         await asyncio.to_thread(run)
-        logger.info("[livekit-transcript] ok")
+        # No transcript text or session ID logged.
+        _log.info("db_turn_saved", turn_index=turn_index, speaker=speaker)
     except Exception:  # noqa: BLE001
-        logger.warning("[livekit-db] turn_save_failed")
+        _log.warn("db_error", error_category="save_turn_failed")
 
 
 async def complete_session(session_id: Optional[str], duration_sec: Optional[int] = None) -> None:
@@ -170,16 +254,14 @@ async def complete_session(session_id: Optional[str], duration_sec: Optional[int
 
     try:
         await asyncio.to_thread(run)
-        logger.info("[livekit-db] session_completed")
+        # No session ID logged.
+        _log.info("session_complete", duration_sec=duration_sec)
     except Exception:  # noqa: BLE001
-        logger.warning("[livekit-db] complete_failed")
+        _log.warn("db_error", error_category="complete_session_failed")
 
 
 async def fail_session(session_id: Optional[str], reason: str) -> None:
-    """Mark a session as failed using a closed reason-code mapping.
-
-    The `reason` is mapped to a safe allowlisted code — never stores raw
-    reason text, exception messages, or candidate data."""
+    """Mark a session failed without persisting raw provider/error text."""
     if not session_id:
         return
 
@@ -199,52 +281,54 @@ async def fail_session(session_id: Optional[str], reason: str) -> None:
 
     try:
         await asyncio.to_thread(run)
-        logger.info("[livekit-db] session_failed")
+        _log.info("session_fail")
     except Exception:  # noqa: BLE001
-        logger.warning("[livekit-db] fail_failed")
+        _log.warn("db_error", error_category="fail_session_failed")
 
 
 async def trigger_scoring(session_id: Optional[str]) -> TriggerOutcome:
-    """Trigger scoring via circuit-breaker-protected HTTP call.
-
-    Returns a typed TriggerOutcome for callers/tests. The transport is
-    constructed lazily — httpx import happens only on first actual scoring
-    call, not at module import time.
-
-    Logging happens at the call_with_breaker level — no double-log here.
-
-    NOTE: reconciliation (REL-09) is not implemented. A failed trigger
-    is logged but not automatically retried or re-queued at this stage.
-    """
+    """Trigger scoring through the shared typed circuit-breaker boundary."""
     if not session_id:
         return TriggerOutcome.BUSINESS_ERROR
 
-    # Consult the breaker before constructing lazy HTTP transport. This ensures
-    # an open breaker rejects without importing/constructing httpx and preserves
-    # BREAKER_OPEN classification even in minimal CI environments.
+    # Reject before lazy httpx construction so open-state classification is
+    # preserved even in minimal environments without the transport dependency.
     if _SCORING_BREAKER.state == CircuitState.OPEN:
+        _log.warn("scoring_failed", error_category="circuit_open")
         return TriggerOutcome.BREAKER_OPEN
 
     try:
         transport = get_scoring_transport()
     except Exception:  # noqa: BLE001
-        # Construction failure (e.g., httpx not installed, config error)
-        # counts as transport failure through the breaker.
-        logger.warning(redacted_log_message("connection", "assess"))
+        _log.warn("scoring_failed", error_category="connection")
         return TriggerOutcome.TRANSPORT_FAILURE
 
+    headers: dict[str, str] = {}
+    correlation_id = get_correlation_id()
+    if correlation_id:
+        headers["X-Correlation-ID"] = correlation_id
+
     try:
-        await call_with_breaker(
+        response = await call_with_breaker(
             "POST",
             f"{API_BASE}/api/assess/{session_id}",
             breaker=_SCORING_BREAKER,
             transport=transport,
+            headers=headers,
             endpoint_hint="assess",
+            log_failures=False,
         )
+        status = getattr(response, "status_code", None)
+        if isinstance(status, int):
+            _log.info("scoring_trigger", http_status=status)
+        else:
+            _log.info("scoring_trigger")
         return TriggerOutcome.SUCCESS
     except ProviderError as exc:
+        _log.warn("scoring_failed", error_category=exc.category)
         if exc.category == "circuit_open":
             return TriggerOutcome.BREAKER_OPEN
         return TriggerOutcome.TRANSPORT_FAILURE
     except BusinessError:
+        _log.warn("scoring_failed", error_category="business_error")
         return TriggerOutcome.BUSINESS_ERROR

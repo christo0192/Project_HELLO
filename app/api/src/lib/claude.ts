@@ -98,6 +98,10 @@ export type SpawnFn = (
 export interface ClaudeRunner {
   runClaude(prompt: string, opts?: ClaudeOptions): Promise<string>;
   runClaudeJSON<T>(prompt: string, opts?: ClaudeOptions): Promise<T>;
+  runClaudeJSONWithProvenance<T>(
+    prompt: string,
+    opts?: ClaudeOptions,
+  ): Promise<{ data: T; requestedModel: string }>;
 }
 
 export interface ClaudeRunnerDeps {
@@ -366,7 +370,20 @@ export function createClaudeRunner(deps?: Partial<ClaudeRunnerDeps>): ClaudeRunn
     }
   }
 
-  return { runClaude, runClaudeJSON };
+  /**
+   * Run the same breaker-managed JSON path while returning the configured
+   * design-intent model. This does not claim the provider's resolved model.
+   */
+  async function runClaudeJSONWithProvenance<T = unknown>(
+    prompt: string,
+    opts: ClaudeOptions = {},
+  ): Promise<{ data: T; requestedModel: string }> {
+    const requestedModel = opts.model ?? env.claudeModel;
+    const data = await runClaudeJSON<T>(prompt, opts);
+    return { data, requestedModel };
+  }
+
+  return { runClaude, runClaudeJSON, runClaudeJSONWithProvenance };
 }
 
 // ── Default singleton (production use, configured from env) ──────
@@ -374,3 +391,4 @@ export function createClaudeRunner(deps?: Partial<ClaudeRunnerDeps>): ClaudeRunn
 const defaultRunner = createClaudeRunner();
 export const runClaude = defaultRunner.runClaude;
 export const runClaudeJSON = defaultRunner.runClaudeJSON;
+export const runClaudeJSONWithProvenance = defaultRunner.runClaudeJSONWithProvenance;
