@@ -1,5 +1,5 @@
-# IAM: Dynamic groups and least-privilege policies for service identity.
-# Policies grant access only to resources within the environment compartment.
+# IAM baseline: role-separated, fail-closed dynamic groups scoped to the environment compartment.
+# Queue permissions are producer/consumer-specific. Secret-bundle access remains compartment-wide until real secret OCIDs exist and must be narrowed before deployment acceptance.
 # No static user credentials or API keys are provisioned.
 #
 # Fail-closed matching: the api_tier and worker_tier dynamic groups use distinct
@@ -28,12 +28,12 @@ resource "oci_identity_dynamic_group" "worker_tier" {
   matching_rule = "All {instance.compartment.id = '${oci_identity_compartment.this.id}', tag.${oci_identity_tag_namespace.this.name}.${oci_identity_tag.workload_role.name}.value = 'worker'}"
 }
 
-# Policy: API tier — least privilege
+# Policy: API tier — role-separated baseline
 # Official OCI Queue verbs: 'use queue-push' (QUEUE_PRODUCE) for publishers.
 resource "oci_identity_policy" "api_tier" {
   compartment_id = var.tenancy_ocid
   name           = "${var.project_name}-${var.environment}-api-policy"
-  description    = "Least-privilege policy for ${var.environment} API/web tier"
+  description    = "Role-separated baseline policy for ${var.environment} API/web tier"
 
   statements = [
     # Queue: publish messages (scoring, notifications)
@@ -47,12 +47,12 @@ resource "oci_identity_policy" "api_tier" {
   ]
 }
 
-# Policy: Worker tier — least privilege
+# Policy: Worker tier — role-separated baseline
 # Official OCI Queue verbs: 'use queue-pull' (QUEUE_CONSUME + QUEUE_DELETE) for consumers.
 resource "oci_identity_policy" "worker_tier" {
   compartment_id = var.tenancy_ocid
   name           = "${var.project_name}-${var.environment}-worker-policy"
-  description    = "Least-privilege policy for ${var.environment} worker tier"
+  description    = "Role-separated baseline policy for ${var.environment} worker tier"
 
   statements = [
     # Queue: consume and delete messages

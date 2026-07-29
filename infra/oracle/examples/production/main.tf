@@ -7,11 +7,8 @@
 #
 # ===========================================================================
 # BLOCKED: Production plan & apply both FAIL until:
-#   1. Remote encrypted state is configured (OCI Object Storage + SSE).
-#      Replace the backend block below with a real S3-compat remote backend.
-#   2. production_apply_enabled is explicitly set to true in terraform.tfvars.
-#
-# See comments on backend and production_apply_enabled below.
+#   1. Protected encrypted remote state is configured.
+#   2. remote_state_configured is explicitly set true after state migration.
 # ===========================================================================
 
 terraform {
@@ -99,40 +96,33 @@ variable "monthly_budget_amount" {
 }
 
 # ===========================================================================
-# PRODUCTION APPLY GATE
-# 
-# This terraform_data resource BLOCKS both plan and apply until the operator
-# explicitly sets production_apply_enabled = true in terraform.tfvars.
+# REMOTE-STATE SAFETY GATE
 #
-# To unblock production:
-#   1. Replace backend "local" with a real encrypted remote backend (see above).
-#   2. Run: terraform init  (to migrate state to remote backend).
-#   3. Set production_apply_enabled = true in terraform.tfvars.
-#   4. Re-run terraform plan.
+# This blocks both plan and apply until the operator replaces the local backend,
+# migrates state, and explicitly acknowledges that protected remote state exists.
 # ===========================================================================
 
-variable "production_apply_enabled" {
-  description = "EXPLICITLY set to true after configuring remote encrypted state. Plan and apply will fail until this is true."
+variable "remote_state_configured" {
+  description = "Set true only after replacing the local backend with protected encrypted remote state."
   type        = bool
   default     = false
 }
 
-resource "terraform_data" "production_apply_gate" {
+resource "terraform_data" "remote_state_gate" {
   lifecycle {
     precondition {
-      condition     = var.production_apply_enabled == true
+      condition     = var.remote_state_configured
       error_message = <<-EOT
-PRODUCTION APPLY BLOCKED.
+PRODUCTION PLAN/APPLY BLOCKED.
 
 To unblock:
-1. Replace backend "local" in this file with a real encrypted remote backend
-   (OCI Object Storage + SSE).  See the commented example above.
-2. Run:  terraform init   (to migrate state to the remote backend).
-3. Set production_apply_enabled = true in terraform.tfvars.
+1. Replace backend "local" with a protected encrypted remote backend.
+2. Run terraform init to migrate state.
+3. Set remote_state_configured = true only after verifying the remote backend.
 4. Re-run terraform plan.
 
-Local state must never hold production metadata (APM data keys, queue URLs,
-compartment OCIDs).  See docs/runbooks/oci-platform-operator.md for details.
+Local state must never hold production metadata or APM data keys.
+See docs/runbooks/oci-platform-operator.md.
 EOT
     }
   }
@@ -143,7 +133,6 @@ EOT
 module "foundation" {
   source = "../../modules/foundation"
 
-  region                = var.region
   tenancy_ocid          = var.tenancy_ocid
   environment           = "production"
   project_name          = var.project_name

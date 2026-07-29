@@ -11,7 +11,7 @@
 | Plan ID | Requirement | Status | Terraform mapping |
 |---------|-------------|--------|-------------------|
 | FND-05 | Secret manager/KMS | PARTIAL | Vault + key provisioned; no secret resources, loading, rotation policies, or application integration — compute shapes not parameterized, no deployed instances consume secrets |
-| FND-06 | Least-privilege service accounts | OK | `modules/foundation/iam.tf` — distinct workload-role defined-tag dynamic groups with official queue-push/queue-pull verbs |
+| FND-06 | Least-privilege service accounts | PARTIAL | Distinct fail-closed workload-role dynamic groups and queue-push/queue-pull policies exist; secret-bundle access is still compartment-wide and must be narrowed/tested when real secret OCIDs and compute roles exist |
 | REL-01 | Durable job queue | PARTIAL | OCI Queue with alarms provisioned; durability depends on deployed consumer + DLQ monitoring parity |
 | REL-04 | Retry/DLQ | PARTIAL | Internal DLQ configured via `dead_letter_queue_delivery_count`; automated DLQ detection/alert is PENDING a queue consumer or custom-metric integration |
 | OBS-01..02 | Structured logging + correlation | PARTIAL | Log group provisioned; app logs and correlation IDs require agent-managed CUSTOM logs from deployed compute instances — NOT provisioned yet |
@@ -71,12 +71,12 @@ Both staging and production example roots are self-contained:
 - `required_providers` pinned to `hashicorp/oci` `~> 8.23.0`
 - `provider "oci"` block with `region = var.region`
 - Committed `.terraform.lock.hcl` files for reproducible init
-- Production root blocks apply AND plan via `terraform_data` precondition until `production_apply_enabled = true` is explicitly set
+- Both roots block plan/apply via `terraform_data.remote_state_gate` until protected remote state is verified and `remote_state_configured = true`
 
 ## State isolation
 
-- Staging: local state acceptable (non-production data)
-- Production: plan and apply BLOCKED until remote encrypted state (S3 + SSE) is configured and the explicit gate is enabled
+- Persistent staging and production: plan/apply BLOCKED until separate protected encrypted remote state is configured and each explicit gate is enabled
+- Committed local backends are validation-only placeholders; APM data keys and infrastructure metadata must not enter persistent local state
 - Each environment has its own `terraform.tfvars` (gitignored)
 - `.terraform.lock.hcl` is committed; `.terraform/` provider caches are NOT
 

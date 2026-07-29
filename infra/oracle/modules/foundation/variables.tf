@@ -1,10 +1,6 @@
-# Foundation module: compartments, networking, IAM, Vault, tags, budgets
-# Region is always an input. No tenancy/compartment/credential is hardcoded.
-
-variable "region" {
-  description = "OCI region"
-  type        = string
-}
+# Foundation module: compartments, networking, IAM, Vault, tags, budgets.
+# Region is inherited from the self-contained root provider configuration.
+# No tenancy, compartment, or credential is hardcoded.
 
 variable "tenancy_ocid" {
   description = "OCI tenancy OCID"

@@ -5,4 +5,5 @@ region               = "placeholder-region"
 tenancy_ocid         = "ocid1.tenancy.oc1..__CHANGE_ME__"
 project_name         = "hr-screening"
 alert_email          = "__CHANGE_ME__"
-monthly_budget_amount = 25   # conservative for OCI free-tier; owner must approve
+monthly_budget_amount  = 25    # conservative starting value; owner must approve
+remote_state_configured = false # set true only after protected remote-state migration

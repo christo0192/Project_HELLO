@@ -1,9 +1,7 @@
-# Staging example root — isolated, scaled-down, non-production data only.
-# Usage:
-#   cd infra/oracle/examples/staging
-#   cp terraform.tfvars.example terraform.tfvars   # edit with real OCIDs
-#   terraform init
-#   terraform plan   # always plan-only; apply needs manual approval
+# Staging example root — isolated, scaled-down, synthetic data only.
+# Persistent shared staging still requires protected encrypted remote state.
+# Plan and apply are gated until the local backend below is replaced and
+# remote_state_configured is explicitly enabled.
 
 terraform {
   required_version = ">= 1.5, < 2.0"
@@ -15,8 +13,8 @@ terraform {
     }
   }
 
-  # Local state acceptable for staging.
-  # Production MUST use remote encrypted state — see production root.
+  # Validation-only placeholder. Replace with a protected encrypted remote
+  # backend before any persistent staging plan/apply. State can contain APM keys.
   backend "local" {}
 }
 
@@ -78,12 +76,26 @@ variable "monthly_budget_amount" {
   }
 }
 
+variable "remote_state_configured" {
+  description = "Set true only after replacing the local backend with protected encrypted remote state."
+  type        = bool
+  default     = false
+}
+
+resource "terraform_data" "remote_state_gate" {
+  lifecycle {
+    precondition {
+      condition     = var.remote_state_configured
+      error_message = "STAGING PLAN/APPLY BLOCKED: configure protected encrypted remote state, migrate with terraform init, then set remote_state_configured=true."
+    }
+  }
+}
+
 # --- modules ---
 
 module "foundation" {
   source = "../../modules/foundation"
 
-  region                = var.region
   tenancy_ocid          = var.tenancy_ocid
   environment           = "staging"
   project_name          = var.project_name

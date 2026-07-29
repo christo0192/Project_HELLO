@@ -13,9 +13,7 @@
 requires explicit manual approval, change-control authorization, and the
 production operator role.
 
-**Production plan AND apply are both BLOCKED** until `production_apply_enabled = true`
-is explicitly set after encrypted remote state (OCI Object Storage + SSE)
-is configured. See State Isolation below.
+**Persistent staging and production plan/apply are BLOCKED** until each environment uses protected encrypted remote state and `remote_state_configured = true` is explicitly set after migration verification. Local backends are validation-only placeholders.
 
 ---
 
@@ -53,34 +51,19 @@ Untagged instances have zero rights.
 
 ---
 
-## State Isolation
+## State Isolation (Both Environments Blocked)
 
-### Staging
-Local state is acceptable. Init uses `backend "local"` with no special config.
+Persistent Oracle staging is shared infrastructure, and both environments can place APM data keys and infrastructure metadata in Terraform state. Therefore, neither environment may be planned/applied persistently with the committed local backend.
 
-### Production (BLOCKED)
+For **each** environment:
 
-Production plan AND apply are both blocked by a `terraform_data` precondition.
-To unblock:
+1. Create a separate protected OCI Object Storage state bucket/key with encryption, versioning, restricted IAM, and recovery controls.
+2. Replace that environment's `backend "local"` with its reviewed remote backend configuration. Never share staging and production state keys.
+3. Configure backend credentials outside Git and run `terraform init` to migrate/verify state.
+4. Confirm state access and recovery, then set `remote_state_configured = true` through the environment's protected input.
+5. Run a reviewed plan. The committed `terraform_data.remote_state_gate` fails closed while the acknowledgement remains false.
 
-1. Create an OCI Object Storage bucket with SSE enabled.
-2. Replace the local backend in `examples/production/main.tf` with:
-   ```hcl
-   backend "s3" {
-     bucket                      = "<prod-state-bucket>"
-     key                         = "oci-platform/production/terraform.tfstate"
-     region                      = "<region>"
-     endpoint                    = "https://<ns>.compat.objectstorage.<region>.oraclecloud.com"
-     skip_region_validation      = true
-     skip_credentials_validation = true
-     skip_metadata_api_check     = true
-     force_path_style            = true
-     encrypt                     = true
-   }
-   ```
-3. Run `terraform init` against the remote backend.
-4. Set `production_apply_enabled = true` in `terraform.tfvars`.
-5. Never use local state for production — it can contain APM data keys.
+The commented S3-compatible OCI Object Storage example in `examples/production/main.tf` is a template only; operators must verify current Terraform/OCI backend arguments before enabling it.
 
 ---
 
