@@ -4,14 +4,20 @@ on:
   pull_request:
     paths:
       - 'app/supabase/**'
+      - 'scripts/*synthetic*'
+      - 'scripts/*seed*'
       - 'scripts/supabase-*.sh'
+      - 'docs/runbooks/synthetic-*.md'
       - 'docs/runbooks/supabase-*.md'
       - '.github/workflows/supabase-*.yml'
   push:
     branches: [main]
     paths:
       - 'app/supabase/**'
+      - 'scripts/*synthetic*'
+      - 'scripts/*seed*'
       - 'scripts/supabase-*.sh'
+      - 'docs/runbooks/synthetic-*.md'
       - 'docs/runbooks/supabase-*.md'
       - '.github/workflows/supabase-*.yml'
   workflow_dispatch:
@@ -28,7 +34,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Run fresh migration and effective RLS tests
+      - name: Run migrations, policy tests, seed apply, rerun, SQL integration
         env:
           SUPABASE_CLI_VERSION: 2.110.0
         run: bash scripts/supabase-test.sh
@@ -37,11 +43,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Validate shell and text hygiene
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Validate shell, JS, and text hygiene
         run: |
           bash -n scripts/supabase-local.sh scripts/supabase-test.sh
+          # JS syntax check for all .mjs files
+          for f in scripts/*.mjs; do node -c "$f" 2>&1 || exit 1; done
           if git grep -n -I -E '[[:blank:]]+$' -- \
-            app/supabase scripts/supabase-local.sh scripts/supabase-test.sh \
+            app/supabase/seed.sql \
+            app/supabase/tests/synthetic_seed_tests.sql \
+            app/supabase/config.toml \
+            scripts/supabase-local.sh scripts/supabase-test.sh \
+            scripts/check-synthetic-seed.mjs \
+            scripts/check-synthetic-seed.test.mjs \
+            docs/runbooks/synthetic-demo-data.md \
             docs/runbooks/supabase-migration-strategy.md \
             docs/runbooks/supabase-prod-apply.md; then
             echo 'ERROR: trailing whitespace found'
@@ -88,3 +105,7 @@ jobs:
               sys.exit(1)
           print(f'Validated {len(files)} migrations and local Auth configuration.')
           PY
+      - name: GOV-06 offline synthetic seed validation
+        run: node scripts/check-synthetic-seed.mjs
+      - name: GOV-06 mutation-based self-tests (zero network)
+        run: node scripts/check-synthetic-seed.test.mjs

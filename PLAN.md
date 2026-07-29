@@ -4,6 +4,10 @@
 
 ---
 
+> **Implementation status (2026-07-29):** Branch `feat/gov-06-synthetic-data` implements GOV-06 local synthetic demo seed tooling and tests (offline validator, local Supabase seed, SQL integration checks, runbook). This does **not** close production/demo acceptance by itself: FND-03 owner evidence, authentic shareable-artifact replacement, restricted-storage disposition, and launch gates remain pending.
+
+---
+
 ## 1. Document Control
 
 | Field | Value |

@@ -33,6 +33,7 @@ cat docs/HANDOVER.md
 | OCI managed-services Terraform foundation | Infrastructure | Code merged; apply-gated | PR #7 (`e8584b0`), merged 2026-07-29. Scaffold only; `terraform apply` has not been run. |
 | OCI region benchmark harness | Infrastructure | Code merged; not yet measured | PR #8 (`726ce56`), merged 2026-07-29. Harness and fail-closed runbook exist; no benchmark data has been collected. |
 | Supabase local baseline | MIG-03 / partial MIG-04 | Code merged; production apply pending | PR #9 (`4d103ea`), merged 2026-07-29. Unused Mumbai project exists but MIG-01/MIG-02 admin acceptance pending; this is MIG-03/partial MIG-04. Membership-gated RLS and local validation; MIG-01/MIG-02 administrative acceptance plus controlled production connection/application and MIG-13 cutover are future gates. |
+| Synthetic demo seed foundation | GOV-06 | Implementation complete on branch; production/demo acceptance pending | Branch `feat/gov-06-synthetic-data` adds deterministic local `app/supabase/seed.sql`, offline validator, 65 validator tests, 62 SQL integration assertions, runbook, and Supabase CI wiring. This is local synthetic-data scaffolding only; screenshots/demo artifact replacement and owner FND-03 evidence remain pending. |
 
 CI on `main` at `4d103ea`: Quality, Secret scan, and Supabase checks all passed on 2026-07-29.
 
@@ -45,8 +46,8 @@ external-blockers summary.
 | Task | Code / merge state | Acceptance state |
 |---|---|---|
 | FND-01 | Repository controls merged | **Blocked**: hosted enforcement blocked — private-plan GitHub API returned 403 |
-| FND-02 | Scanner controls merged | **Blocked**: owner rotation evidence pending for six provider systems; non-secret revocation evidence required |
-| FND-03 | Containment controls merged | **Blocked**: sanitization, synthetic, and restricted-storage disposition pending |
+| FND-02 | Scanner controls merged | **Blocked**: owner rotation evidence pending for eight provider systems; non-secret revocation evidence required |
+| FND-03 | Containment controls merged plus GOV-06 local synthetic seed branch | **Blocked**: authentic sanitization, screenshot/demo replacement, and restricted-storage disposition evidence pending |
 
 ## Current Verification
 
@@ -57,6 +58,9 @@ cd ../..
 node scripts/check-env-contract.mjs
 node scripts/check-env-contract.test.mjs
 node scripts/check-adrs.mjs
+node scripts/check-synthetic-seed.mjs app/supabase/seed.sql
+node scripts/check-synthetic-seed.test.mjs
+bash scripts/supabase-test.sh
 node scripts/audit-seeded-vuln.test.mjs
 bash scripts/audit-deps.sh --dir app/api
 bash scripts/audit-deps.sh --dir app/web
