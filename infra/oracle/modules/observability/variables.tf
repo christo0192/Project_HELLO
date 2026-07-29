@@ -1,19 +1,8 @@
 # Observability module: OCI Logging, Monitoring, APM, Notifications.
-# Region is always an input.
+# Region is inherited from the root provider block — no separate region variable.
 # The foundation module owns the single authoritative compartment budget and alert rule.
 # Log group is the only logging resource — agent-managed CUSTOM logs are onboarded
 # when compute instances are deployed.
-
-variable "region" {
-  description = "OCI region"
-  type        = string
-}
-
-variable "tenancy_ocid" {
-  description = "OCI tenancy OCID"
-  type        = string
-  sensitive   = true
-}
 
 variable "compartment_id" {
   description = "Compartment OCID for observability resources"
@@ -40,11 +29,9 @@ variable "notification_email" {
   type        = string
 }
 
-variable "log_retention_days" {
-  description = "Log retention in days"
-  type        = number
-  default     = 30
-}
+# Log retention is defined at the oci_logging_log resource level, not the log group.
+# When CUSTOM logs are onboarded (agent-managed, post compute deployment), retention
+# will be configured on those individual log resources.
 
 # PII/secret redaction is NOT applied by Terraform — there is no OCISERVICE
 # source to attach redaction patterns to. Redaction MUST be implemented at the

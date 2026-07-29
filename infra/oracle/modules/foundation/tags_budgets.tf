@@ -2,8 +2,9 @@
 # Tag namespace is UNIQUE per environment (staging and production never collide).
 # Names use underscores (not hyphens) for OCI dynamic-group grammar compatibility.
 #
-# ONS email subscription requires manual confirmation — the recipient MUST click
-# the confirmation link in the OCI Notifications email before alarms will deliver.
+# Budget alert recipients receive email directly — NO ONS subscription confirmation needed.
+# Observability alarms use ONS notification topics which DO require manual subscription
+# confirmation. See modules/observability/notifications.tf.
 # Budgets alert only; they do NOT cap or block spend.
 
 locals {
@@ -43,6 +44,7 @@ resource "oci_identity_tag" "workload_role" {
 
 # Monthly budget with alert rule.
 # Budgets ALERT only — they do not cap or block spending in OCI.
+# Budget alerts send directly to the recipient email — no ONS subscription needed.
 # Amount should be deliberately set per environment, not hidden at default.
 resource "oci_budget_budget" "this" {
   compartment_id = var.tenancy_ocid
@@ -62,7 +64,7 @@ resource "oci_budget_budget" "this" {
 }
 
 # Budget alert rule — percentage-based threshold.
-# ONS email subscription must be manually confirmed by the recipient.
+# Recipient receives alert email directly (no ONS confirmation needed).
 resource "oci_budget_alert_rule" "this" {
   budget_id      = oci_budget_budget.this.id
   type           = "ACTUAL"
@@ -76,6 +78,10 @@ resource "oci_budget_alert_rule" "this" {
 variable "monthly_budget_amount" {
   description = "Monthly budget amount in USD (required — no default; set deliberately per environment)"
   type        = number
+  validation {
+    condition     = var.monthly_budget_amount > 0
+    error_message = "monthly_budget_amount must be greater than 0."
+  }
 }
 
 variable "budget_alert_threshold" {

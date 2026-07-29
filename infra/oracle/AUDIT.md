@@ -3,13 +3,14 @@
 **Date:** 2026-07-28
 **Updated:** 2026-07-28 (repair r3: self-contained roots, IAM, metrics, logging, state, CI assertions)
 **Updated:** 2026-07-29 (repair r4: DG grammar, production gate, budget validations, project-name validation)
+**Updated:** 2026-07-29 (final: hashcorp/oci ~> 8.23, unused vars removed, budget >0, audit parity)
 **Plan references:** FND-05/06, REL-01/04, OBS-01..06, DEP-02..07
 
 ## PLAN cross-reference
 
 | Plan ID | Requirement | Status | Terraform mapping |
 |---------|-------------|--------|-------------------|
-| FND-05 | Secret manager/KMS | PARTIAL | Vault + key provisioned; compute shapes not yet parameterized — no instances exist to consume secrets |
+| FND-05 | Secret manager/KMS | PARTIAL | Vault + key provisioned; no secret resources, loading, rotation policies, or application integration — compute shapes not parameterized, no deployed instances consume secrets |
 | FND-06 | Least-privilege service accounts | OK | `modules/foundation/iam.tf` — distinct workload-role defined-tag dynamic groups with official queue-push/queue-pull verbs |
 | REL-01 | Durable job queue | PARTIAL | OCI Queue with alarms provisioned; durability depends on deployed consumer + DLQ monitoring parity |
 | REL-04 | Retry/DLQ | PARTIAL | Internal DLQ configured via `dead_letter_queue_delivery_count`; automated DLQ detection/alert is PENDING a queue consumer or custom-metric integration |
@@ -18,7 +19,7 @@
 | OBS-05..06 | SLI/SLO + alerting | PARTIAL | Queue alarms + log ingestion alarm active; SLI/SLO definitions are pending app metrics |
 | DEP-02 | Provisioned capacity with headroom | PENDING | Compute shapes are NOT parameterized — no compute instances, autoscaling configs, or instance pools exist |
 | DEP-03 | HA decision | PENDING | Subnet/VCN design supports multi-AD; single-AD default has no HA |
-| DEP-04..05 | IaC + environment parity | PARTIAL | Staging/production example roots, shared modules, distinct tag namespaces exist; parity verified only at plan level — no deployed compute |
+| DEP-04..05 | IaC + environment parity | PARTIAL | Staging/production example roots, shared modules, distinct tag namespaces exist; terraform validate/config consistency verified — no deployed compute to confirm functional parity |
 | DEP-06 | Canary/blue-green | PENDING | CI runbook documents plan-only default; no deployment pipeline exists |
 | DEP-07 | Artifact provenance | PENDING | Not in Terraform scope; CI path is defined but no build pipeline exists |
 

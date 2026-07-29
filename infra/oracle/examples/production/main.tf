@@ -20,7 +20,7 @@ terraform {
   required_providers {
     oci = {
       source  = "hashicorp/oci"
-      version = "~> 6.0"
+      version = "~> 8.23.0"
     }
   }
 
@@ -162,8 +162,6 @@ module "foundation" {
 module "queue" {
   source = "../../modules/queue"
 
-  region                = var.region
-  tenancy_ocid          = var.tenancy_ocid
   compartment_id        = module.foundation.compartment_id
   environment           = "production"
   project_name          = var.project_name
@@ -179,11 +177,8 @@ module "queue" {
 module "observability" {
   source = "../../modules/observability"
 
-  region             = var.region
-  tenancy_ocid       = var.tenancy_ocid
   compartment_id     = module.foundation.compartment_id
   environment        = "production"
   project_name       = var.project_name
   notification_email = var.alert_email
-  log_retention_days = 90
 }

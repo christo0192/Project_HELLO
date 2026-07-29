@@ -1,19 +1,8 @@
 # Queue module: OCI Queue service with service-managed dead-letter, IAM, and alarms.
-# Region is always an input.
+# Region is inherited from the root provider block — no separate region variable.
 # OCI Queue is NOT an Always Free service. Pricing is pay-per-request.
 # A first-1M-requests/month no-charge tier was documented as of 2026-07-28 but is
 # not an Always Free guarantee and may change. See https://www.oracle.com/cloud/queue/pricing/
-
-variable "region" {
-  description = "OCI region"
-  type        = string
-}
-
-variable "tenancy_ocid" {
-  description = "OCI tenancy OCID"
-  type        = string
-  sensitive   = true
-}
 
 variable "compartment_id" {
   description = "Compartment OCID for queue resources"
