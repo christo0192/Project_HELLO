@@ -13,28 +13,28 @@
 | **Reviewers** | [Security Lead — placeholder], [Product Manager — placeholder], [Legal Counsel — placeholder] |
 | **Target** | Browser-first production launch (no PSTN) |
 | **Non-goals** | Telephony/PSTN production (see Phase 13, §6.17); multi-tenant SaaS; mobile app |
-| **Last updated** | 2026-07-28 |
+| **Last updated** | 2026-07-29 |
 | **Next review** | After owners are assigned and D-001 through D-011 receive initial decisions |
 
 ### Assumptions
 
-1.  The user/org controls a billing account with Supabase, LiveKit Cloud, and a cloud provider (AWS/GCP/Azure/Oracle — provider TBD by capacity bench).
-2.  A new Supabase production project will be provisioned later under a company-controlled production email and organization (§6.5). At least two named administrators must have MFA-enabled access so ownership does not depend on one personal account.
-3.  Recruiter users will authenticate via email/password or SSO (provider TBD) — not phone-only.
+1.  The user/org controls a billing account with Supabase, LiveKit Cloud, and Oracle Cloud Infrastructure (region TBD after Mumbai/Hyderabad benchmark).
+2.  A Supabase production project already exists unused in Mumbai (`ap-south-1`). Company-org transfer, second MFA admin, plan, PITR, billing-alert, and break-glass acceptance are pending.
+3.  Recruiter users will authenticate via Supabase Auth (direction selected; auth modes, MFA enforcement, lifecycle, and DPA evidence pending formal owner approval) — not phone-only.
 4.  Candidate join flow remains browser-based; candidates do not authenticate (token-gated join).
 5.  Browser-first production launch occurs before any telephony integration.
 6.  DLT registration, consent automation, and legal review for outbound calling will gate the telephony phase (§6.17).
 7.  India data residency is an open legal/security requirement, not a confirmed fact. During provisioning, verify whether an India region (Mumbai) is available from Supabase, LiveKit, and the compute provider. If an India region is unavailable for any critical service, escalate as a go/no-go decision with Legal and Eng Lead. Contractual and technical evidence of data region is required for every processor before launch (LLM-05, GOV-07).
 8.  This document does not replace legal DPDP review; it identifies what legal must answer.
 
-### Decision Log (Placeholder)
+### Decision Log (Directions selected 2026-07-28; all formal approvals pending)
 
 | ID | Decision | Owner | Status | Date |
 |----|----------|-------|--------|------|
 | D-001 | Auth provider: WorkOS vs Supabase Auth vs Clerk | Eng Lead + Product | Direction: Supabase Auth; formal approval pending | 2026-07-28 |
 | D-002 | Queue/worker platform (Cloud Tasks, BullMQ+Redis, SQS, RabbitMQ) | Eng Lead | Direction: OCI Queue; formal approval pending | 2026-07-28 |
 | D-003 | Production cloud provider and region for compute | Eng Lead + Legal + Security | Direction: OCI; Mumbai/Hyderabad region pending measured/legal evidence; formal approval pending | 2026-07-28 |
-| D-004 | Scoring provider/hosting: retain current `claude -p` or adopt an evaluated, compliant API/hosted alternative | Eng Lead + Legal | Open | — |
+| D-004 | Scoring provider/hosting: current `claude -p` is prototype-only; an evaluated, compliant API/hosted alternative must be selected and approved before production (LLM-03/LLM-04) | Eng Lead + Legal | Open | — |
 | D-005 | LiveKit: stay Cloud vs self-host; region availability TBD | Eng Lead | Open | — |
 | D-006 | Backup strategy: PITR only vs PITR + daily snapshot export | Eng Lead | Open | — |
 | D-007 | Recording storage: Supabase Storage vs S3-compatible | Eng Lead | Open | — |
@@ -50,6 +50,10 @@
 The current MVP demonstrates a working voice-screening loop: a candidate opens a browser link, LiveKit streams audio, an Anthropic Haiku agent conducts a structured interview, turns are persisted, a recording is uploaded from the browser, and a scorecard is generated via `claude -p`. The system produced a real end-to-end transcript, recording, and assessment.
 
 **The current artifact is a prototype — not production.** It lacks authentication, authorization, rate limiting, audit trails, durable job processing, structured observability, CI/CD, IaC, credential hygiene, PII governance, reliability engineering, and a tested migration path. The repository has no Git history, `docs/HELLO.html` embeds real candidate PII, and service-role credentials sit in local env files.
+
+> **Note:** The Current-vs-Target table below represents the original MVP audit
+> baseline. For current implementation status (completed PRs, in-progress
+> scaffolds, and remaining blockers), see `docs/HANDOVER.md`.
 
 ### Current vs Target
 

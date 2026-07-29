@@ -3,10 +3,13 @@
 **Status:** Proposed
 
 **Direction confirmed (2026-07-28):** Single-organization launch selected as
-technical direction. No `org_id` schema isolation. Authenticated roles, RLS,
-and authorization matrix still required. Formal owner approval and evidence
-pending. This is a selected direction, not stakeholder sign-off, and does not
-constitute FND-08 acceptance.
+technical direction. No multi-tenant `org_id` isolation required for launch;
+does not permanently ban future multi-tenancy. The merged membership-gated RLS
+baseline (PR #9) provides a production-safe local seam, but full app
+authentication, API authorization, RBAC, storage authorization, and hosted role
+configuration are still pending. Formal
+owner approval and evidence pending. This is a selected direction, not
+stakeholder sign-off, and does not constitute FND-08 acceptance.
 
 **Decision owner:** Engineering Lead and Product Manager (unassigned)
 

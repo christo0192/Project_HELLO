@@ -19,15 +19,21 @@ the scorecard, and retries can duplicate side effects. Production requires a
 transactional outbox, idempotent consumers, retry/backoff, dead-letter handling,
 replay, and backlog observability.
 
+**Direction (2026-07-28):** OCI Queue (with OCI Logging, Monitoring, APM, and
+Notifications) has been selected as the technical direction. Formal owner
+approval, failure-injection prototype, and evidence are pending. See
+`docs/decisions/fnd-08-inputs.md`.
+
 ## Decision
 
-Do not select Cloud Tasks, BullMQ/Redis, SQS, RabbitMQ, or another queue until
-D-002 is approved. Benchmark the smallest operationally credible options against
-the selected cloud, workload identity, ordering needs, delayed retries, DLQ and
-replay support, local testability, regional availability, cost, and operator
-burden. The application contract is provider-neutral: a durable session
-transition writes an outbox event, and an idempotent scoring consumer owns the
-assessment side effect.
+Do not commit to a final queue implementation until D-002 receives formal owner
+approval. The OCI Queue direction informs architecture planning and the
+foundation Terraform scaffold, but does not authorize production implementation.
+The application contract remains provider-neutral: a durable session transition
+writes an outbox event, and an idempotent scoring consumer owns the assessment
+side effect. Benchmark OCI Queue against workload identity, ordering needs,
+delayed retries, DLQ and replay support, local testability, regional
+availability, cost, and operator burden before acceptance.
 
 ## Consequences
 

@@ -11,29 +11,29 @@
 The prototype has no recruiter authentication or authorization. Production
 requires MFA, lifecycle management, short-lived sessions, RBAC integration, and
 a documented cookie-versus-bearer transport decision. WorkOS, Supabase Auth, and
-Clerk are listed candidates; none is approved.
+Clerk are listed candidates.
+
+**Direction (2026-07-28):** Supabase Auth has been selected as the technical
+direction. Auth modes, MFA enforcement, account lifecycle, session management,
+and contractual/DPA evidence remain pending formal owner approval. See
+`docs/decisions/fnd-08-inputs.md`.
 
 ## Decision
 
-Do not implement a provider-specific production login until D-001 is approved.
-Evaluate candidates against MFA enforcement, SSO needs, account lifecycle,
-session revocation, audit events, regional/contractual evidence, integration with
-API authorization, operational ownership, and total cost. The selected provider
-must be the token authority; do not create an unrelated application signing key
-when standards-based verification is sufficient.
+Do not implement a provider-specific production login until D-001 receives
+formal owner approval. The Supabase Auth direction informs architecture planning
+but does not authorize production implementation. Evaluate the selected provider
+against MFA enforcement, SSO needs, account lifecycle, session revocation, audit
+events, regional/contractual evidence, integration with API authorization,
+operational ownership, and total cost. The selected provider must be the token
+authority; do not create an unrelated application signing key when
+standards-based verification is sufficient.
 
 ## Consequences
 
 SEC-01 through SEC-04 remain blocked, and every current privileged endpoint is a
 production P0. Deferring avoids embedding an auth model that conflicts with the
 tenancy or transport decision.
-
-## Direction
-
-**Direction confirmed (2026-07-28):** Supabase Auth selected as technical direction
-for email/password + SSO + MFA. This is a selected direction, not stakeholder
-sign-off, and does not constitute FND-08 acceptance. See
-`docs/decisions/fnd-08-inputs.md`.
 
 ## Evidence
 

@@ -22,11 +22,23 @@ Cloud versus self-hosting, launch concurrency, residency requirements, RPO/RTO,
 and HA posture are all open. An India region is an unverified requirement and
 must not be assumed from marketing labels or endpoint names.
 
+**Direction (2026-07-28):** OCI has been selected as the cloud provider.
+Compute-region selection requires preliminary Mumbai (`ap-mumbai-1`) and
+Hyderabad (`ap-hyderabad-1`) measured/legal evidence. Formal DEP-01 acceptance
+depends on TST-09 (load/soak), REL-01 (durable queue), and OBS-03 (metrics).
+Production Supabase already exists unused in Mumbai (`ap-south-1`). Target 5
+concurrent sessions, validate to 10. These are selected directions, not
+stakeholder sign-off. Production provisioning remains blocked. See
+`docs/decisions/fnd-08-inputs.md`.
+
 ## Decision
 
 Do not provision production compute or choose LiveKit hosting until FND-08 defines
-residency/data-flow constraints, RPO/RTO, concurrency, and owners. Evaluate cloud
-and LiveKit options using contractual and technical region evidence, measured
+residency/data-flow constraints, RPO/RTO, concurrency, and owners. The OCI cloud
+direction informs architecture planning, and a preliminary owner-approved
+Mumbai/Hyderabad synthetic probe with teardown may run for region discovery, but
+does not constitute formal DEP-01 acceptance. Production provisioning still
+requires contractual and technical region evidence, measured
 candidate-to-worker/provider latency, Egress support, quota/capacity, workload
 identity and secret-manager integration, backup/restore, failure domains,
 operations burden, support, and cost. Document the explicit HA or accepted
