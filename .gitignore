@@ -64,6 +64,9 @@ docs/*.pdf
 *.mov
 *.mp3
 
+# Synthetic demo artifacts are safe and committed; track all files under docs/demo/
+!docs/demo/
+
 # Editors and operating systems
 .DS_Store
 Thumbs.db

@@ -1,0 +1,15 @@
+{
+  "is_synthetic": true,
+  "synthetic_id": "demo-voice-v1-2025-06-15",
+  "generated_at": "2025-06-15T10:00:00Z",
+  "group": "voice-recording",
+  "replacement_type": "generated-non-speech-tone",
+  "specification": {
+    "frequency_hz": 440,
+    "duration_seconds": 3,
+    "sample_rate_hz": 22050,
+    "channels": 1,
+    "encoding": "PCM 16-bit signed LE",
+    "notes": "Non-speech synthetic tone. No human voice or biometric data."
+  }
+}

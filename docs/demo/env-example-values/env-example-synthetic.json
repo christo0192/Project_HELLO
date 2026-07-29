@@ -1,0 +1,24 @@
+{
+  "is_synthetic": true,
+  "synthetic_id": "demo-env-v1-2025-06-15",
+  "generated_at": "2025-06-15T10:00:00Z",
+  "group": "env-example-values",
+  "variables": [
+    {
+      "name": "SUPABASE_URL",
+      "example": "https://placeholder-project-id.example.com"
+    },
+    {
+      "name": "SUPABASE_SERVICE_KEY",
+      "example": "placeholder-service-role-key"
+    },
+    {
+      "name": "ANTHROPIC_API_KEY",
+      "example": "placeholder-anthropic-key"
+    },
+    {
+      "name": "NODE_ENV",
+      "example": "development"
+    }
+  ]
+}

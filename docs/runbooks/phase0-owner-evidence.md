@@ -189,7 +189,49 @@ or FND-03 are complete. The following must still happen outside the tool:
 
 ---
 
-## 6. Restricted Evidence
+## 6. Synthetic Demo Artifacts
+
+Synthetic demo replacements for all 7 FND-03 artifact groups live under
+`docs/demo/`. These are safe, shareable, deterministic replacements that
+contain no PII, secrets, or real candidate data.
+
+| Group ID | Synthetic Path | Type |
+|----------|---------------|------|
+| hello-html | `docs/demo/hello.html` | Static offline HTML |
+| hello-md | `docs/demo/hello.md` | Markdown document |
+| hello-assets | `docs/demo/hello-assets/` | Synthetic resume JSON |
+| generated-pdf | `docs/demo/generated-pdf/` | Scorecard JSON + template |
+| voice-recording | `docs/demo/voice-recording/` | Non-speech tone metadata |
+| scorecard-export | `docs/demo/scorecard-export/` | Scorecard export JSON |
+| env-example-values | `docs/demo/env-example-values/` | Env var placeholder schema |
+
+### Validating demo artifacts
+
+```bash
+node scripts/check-demo-artifacts.mjs
+node scripts/check-demo-artifacts.test.mjs
+```
+
+The validator checks for:
+- All 7 group files exist and are well-formed
+- No PII (all emails use `@example.invalid`, phone fields are null/absent)
+- No secrets, tokens, private keys, or credentials
+- No live external network destinations (only reserved `example.invalid`, `example.com`, `example.org`, `example.net`, `example.edu`, and local `localhost` references are allowed in documentation fields)
+- No scripts, event handlers, data URLs, or external resource attributes in HTML files
+- No path traversal or symlinks
+- JSON files have `is_synthetic: true` markers
+- Timestamps are deterministic (all set to `2025-06-15T10:00:00Z`)
+- File sizes are bounded (max 1 MB per file, 5 MB total)
+
+### Regeneration
+
+```bash
+node scripts/generate-demo-artifacts.mjs
+```
+
+All generators are deterministic — running twice produces identical checksums.
+
+## 7. Restricted Evidence
 
 All non-secret evidence (screenshots, logs, test output) remains **outside Git**
 in the approved restricted storage. The manifest only contains references
