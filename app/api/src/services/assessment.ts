@@ -6,7 +6,14 @@ import type { Assessment, TranscriptTurn } from '../lib/types.js';
 
 /**
  * Score a completed screening session and persist the assessment.
- * Idempotent-ish: inserts a new assessment row each call.
+ *
+ * The inference call (runClaudeJSON) goes through the single default
+ * circuit breaker configured in claude.ts from environment variables.
+ * There is no separate breaker here — nesting breakers would double-count
+ * failures and defeat the single policy.
+ *
+ * Business/validation errors (JSON parse failure) do NOT count toward
+ * the breaker threshold; only provider-availability failures do.
  */
 export async function runAssessment(sessionId: string): Promise<Assessment & { id: string }> {
   const { data: session, error: sErr } = await supabase
@@ -47,6 +54,8 @@ export async function runAssessment(sessionId: string): Promise<Assessment & { i
     .eq('id', session.candidate_id)
     .single();
 
+  // Inference goes through claude.ts's single circuit breaker.
+  // runClaudeJSON retries once on JSON parse error (BusinessError, no breaker effect).
   const assessment = await runClaudeJSON<Assessment>(
     buildAssessmentPrompt({
       roleTitle,

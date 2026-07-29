@@ -12,14 +12,17 @@
         "CLAUDE_SCORING_MODEL": { "requiredInProduction": true, "secret": false },
         "COMPANY_NAME": { "requiredInProduction": true, "secret": false },
         "CLAUDE_BIN": { "requiredInProduction": true, "secret": false },
-        "CLAUDE_TIMEOUT_MS": { "requiredInProduction": true, "secret": false },
         "PORT": { "requiredInProduction": true, "secret": false },
         "WEB_ORIGIN": { "requiredInProduction": true, "secret": false },
         "LIVEKIT_URL": { "requiredInProduction": true, "secret": false },
         "LIVEKIT_API_KEY": { "requiredInProduction": true, "secret": true },
         "LIVEKIT_API_SECRET": { "requiredInProduction": true, "secret": true },
         "RECORDINGS_BUCKET": { "requiredInProduction": true, "secret": false },
-        "NODE_ENV": { "requiredInProduction": true, "secret": false }
+        "NODE_ENV": { "requiredInProduction": true, "secret": false },
+        "BREAKER_FAILURE_THRESHOLD": { "requiredInProduction": false, "secret": false },
+        "BREAKER_COOLDOWN_MS": { "requiredInProduction": false, "secret": false },
+        "BREAKER_TIMEOUT_MS": { "requiredInProduction": false, "secret": false },
+        "CLAUDE_MAX_OUTPUT_BYTES": { "requiredInProduction": false, "secret": false }
       }
     },
     "web": {
@@ -66,7 +69,14 @@
         "SUPABASE_URL": { "requiredInProduction": true, "secret": false },
         "SUPABASE_SERVICE_ROLE_KEY": { "requiredInProduction": true, "secret": true },
         "SUPABASE_SCHEMA": { "requiredInProduction": true, "secret": false },
-        "API_BASE": { "requiredInProduction": true, "secret": false }
+        "API_BASE": { "requiredInProduction": true, "secret": false },
+        "SCORING_BREAKER_THRESHOLD": { "requiredInProduction": false, "secret": false },
+        "SCORING_BREAKER_COOLDOWN_SEC": { "requiredInProduction": false, "secret": false },
+        "SCORING_BREAKER_TIMEOUT_SEC": { "requiredInProduction": false, "secret": false },
+        "SCORING_HTTP_CONNECT_TIMEOUT": { "requiredInProduction": false, "secret": false },
+        "SCORING_HTTP_READ_TIMEOUT": { "requiredInProduction": false, "secret": false },
+        "SCORING_HTTP_WRITE_TIMEOUT": { "requiredInProduction": false, "secret": false },
+        "SCORING_HTTP_POOL_TIMEOUT": { "requiredInProduction": false, "secret": false }
       }
     }
   }

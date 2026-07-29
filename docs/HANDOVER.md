@@ -2,6 +2,8 @@
 
 **Last updated:** 2026-07-29
 
+**Current branch:** `feat/rel-05-06-provider-resilience` (worktreed from `fd58f81` / PR #13, not yet merged to `main`)
+
 **Repository:** `https://github.com/christo0192/Project_HELLO`
 
 **Production status:** Pre-production; do not use real candidate data
@@ -19,6 +21,17 @@ gh pr list --state all --limit 10
 cat docs/HANDOVER.md
 ```
 
+## Defensible Metrics
+
+| Metric | Value |
+|--------|-------|
+| Completed launch gates | 0/17 — all FND-02, FND-03, and REL acceptance criteria remain unverified at production level |
+| Implementation coverage | REL-05/REL-06 code + tests exist on branch; strict acceptance is separate from implementation coverage |
+| Branch base | `fd58f81c184af7ae7b15138537ff735070d116ad` (PR #13 FND-02/FND-03) |
+| Branch state | In progress; not merged |
+
+> **Note:** The 25% completion figure sometimes seen in earlier summaries is NOT claimed. Zero launch gates are confirmed complete. Implementation coverage and acceptance verification are distinct gates.
+
 ## Completed Work
 
 | Work | Plan task | State | Evidence |
@@ -33,8 +46,18 @@ cat docs/HANDOVER.md
 | OCI managed-services Terraform foundation | Infrastructure | Code merged; apply-gated | PR #7 (`e8584b0`), merged 2026-07-29. Scaffold only; `terraform apply` has not been run. |
 | OCI region benchmark harness | Infrastructure | Code merged; not yet measured | PR #8 (`726ce56`), merged 2026-07-29. Harness and fail-closed runbook exist; no benchmark data has been collected. |
 | Supabase local baseline | MIG-03 / partial MIG-04 | Code merged; production apply pending | PR #9 (`4d103ea`), merged 2026-07-29. Unused Mumbai project exists but MIG-01/MIG-02 admin acceptance pending; this is MIG-03/partial MIG-04. Membership-gated RLS and local validation; MIG-01/MIG-02 administrative acceptance plus controlled production connection/application and MIG-13 cutover are future gates. |
+| Provider resilience foundation | REL-05, REL-06 | Code complete on `feat/rel-05-06-provider-resilience`; **not merged, not deployed** | Circuit breaker (closed/open/half-open), hardened Node claude runner (shell:false, runtime validation, stdin EPIPE handling, two-phase settle state machine, stable stream-error categories, non_zero_exit counted by breaker, platform-safe kill), Python scoring HTTP with explicit timeouts/lazy transport/async close, circuit_open distinct category, BusinessError resets consecutive failures, closed reason-code mapping for fail_session. Local validation passed: API 274 tests, provider-resilience API 88 tests, Python 98 tests. See `docs/runbooks/provider-resilience.md` for gaps (SDK-internal calls not controlled, no pinned Python requirements, no reconciliation/deployed proof).
+**Prospective PR:** assigned by GitHub on merge. This row will be updated when the PR is opened/merged. |
 
 CI on `main` at `4d103ea`: Quality, Secret scan, and Supabase checks all passed on 2026-07-29.
+
+The following PRs are merged into the current branch `feat/rel-05-06-provider-resilience` (based on `fd58f81`):
+- PR #10 (docs: Phase-0 governance status)
+- PR #11 (docs: FND-08 technical directions)
+- PR #12 (FND-01 branch-governance evidence verifier — completed-tooling)
+- PR #13 (FND-02/FND-03 — eight-provider rotation evidence, seven-group sanitization — completed-tooling)
+
+PR #12 and #13 add deterministic CI checks for branch governance and secret/PII sanitization. Acceptance remains blocked on hosted enforcement (FND-01) and owner-rotation evidence (FND-02).
 
 ## Phase-0 Foundation Status (FND-01, FND-02, FND-03)
 
@@ -45,15 +68,22 @@ external-blockers summary.
 | Task | Code / merge state | Acceptance state |
 |---|---|---|
 | FND-01 | Repository controls merged | **Blocked**: hosted enforcement blocked — private-plan GitHub API returned 403 |
-| FND-02 | Scanner controls merged | **Blocked**: owner rotation evidence pending for six provider systems; non-secret revocation evidence required |
+| FND-02 | Scanner controls merged | **Blocked**: owner rotation evidence pending for eight provider systems; non-secret revocation evidence required |
 | FND-03 | Containment controls merged | **Blocked**: sanitization, synthetic, and restricted-storage disposition pending |
 
 ## Current Verification
 
 ```bash
+# API (Node)
 cd app/api && npm ci && npm run typecheck && npm test
+# Provider-resilience specific (deterministic, no real CLI)
+npx vitest run src/__tests__/provider-resilience.test.ts
+
+# Web
 cd ../web && npm ci && npm run lint && npm run build
 cd ../..
+
+# Contracts, ADRs, audits
 node scripts/check-env-contract.mjs
 node scripts/check-env-contract.test.mjs
 node scripts/check-adrs.mjs
@@ -61,9 +91,21 @@ node scripts/audit-seeded-vuln.test.mjs
 bash scripts/audit-deps.sh --dir app/api
 bash scripts/audit-deps.sh --dir app/web
 bash scripts/sbom.sh
+
+# Python compile + tests (no external deps required for stdlib tests)
+python3 -m py_compile app/voice-livekit/provider_resilience.py app/voice-livekit/persistence.py
+python3 -m pytest app/voice-livekit/tests/test_provider_resilience.py -v --tb=short
+
+# Security
 ./scripts/scan-secrets.sh --committable
 git diff --check
 ```
+
+### Current Test Counts
+| Suite | Count | Notes |
+|---|---|---|
+| API (Node) | **274 tests** (239 full suite + 35 new/adversarial) | 88 provider-resilience (53 breaker/collectBounded + 35 ClaudeRunner/race/validation) + 186 validation/security |
+| Provider resilience (Python) | **98 tests** (54 original + 44 adversarial/transport/classification) | Uses `python3 -m unittest`; no httpx dependency for unit tests using FakeTransport — httpx only needed for tests that exercise `trigger_scoring()` (TestTriggerScoringBreakerOpen). No pinned `requirements.txt` / `pyproject.toml` — gap for future PR. |
 
 ## Remaining Production Work
 

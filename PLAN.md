@@ -4,6 +4,10 @@
 
 ---
 
+> **Implementation status (2026-07-29):** Branch `feat/rel-05-06-provider-resilience` (based on `fd58f81` / PR #13) adds REL-05/REL-06 provider-resilience foundation. See `docs/HANDOVER.md` and `docs/runbooks/provider-resilience.md` for scope, gaps, and acceptance status. This note is for awareness only — acceptance criteria in this document are NOT marked complete.
+
+---
+
 ## 1. Document Control
 
 | Field | Value |

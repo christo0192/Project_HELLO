@@ -15,3 +15,8 @@ process.env.LIVEKIT_URL = 'http://livekit-test:7880';
 process.env.LIVEKIT_API_KEY = 'test-livekit-key';
 process.env.LIVEKIT_API_SECRET = 'test-livekit-secret';
 process.env.RECORDINGS_BUCKET = 'recordings_v2';
+// Provider resilience env vars
+process.env.BREAKER_FAILURE_THRESHOLD = '5';
+process.env.BREAKER_COOLDOWN_MS = '30000';
+process.env.BREAKER_TIMEOUT_MS = '60000';
+process.env.CLAUDE_MAX_OUTPUT_BYTES = '5242880';
