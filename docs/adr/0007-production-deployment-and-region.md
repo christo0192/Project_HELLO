@@ -13,6 +13,12 @@ FND-08 acceptance.
 
 **Decision owner:** Engineering Lead, Security Lead, and Legal Counsel (unassigned)
 
+**Owner-approval update (2026-07-29):** The sole Product/Engineering owner has
+DEFERRED this decision for internal engineering. Application components run
+locally; an already-provisioned development LiveKit service may be used, but no
+production cloud provisioning, region selection, or compute deployment is approved. See
+[`docs/decisions/fnd-08-owner-approval.md`](../decisions/fnd-08-owner-approval.md).
+
 **Plan references:** D-003, D-005, FND-08, GOV-07, DEP-01, DEP-02, DEP-03
 
 ## Context

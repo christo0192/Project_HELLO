@@ -13,6 +13,12 @@ stakeholder sign-off, and does not constitute FND-08 acceptance.
 
 **Decision owner:** Engineering Lead and Product Manager (unassigned)
 
+**Owner-approval update (2026-07-29):** The sole Product/Engineering owner has
+approved the single-org tenancy model for internal synthetic browser-only
+evaluation under a no-cost posture. Production tenancy remains BLOCKED FOR
+PRODUCTION. See
+[`docs/decisions/fnd-08-owner-approval.md`](../decisions/fnd-08-owner-approval.md).
+
 **Plan references:** D-011, FND-08, SEC-03, MIG-03, MIG-04
 
 ## Context

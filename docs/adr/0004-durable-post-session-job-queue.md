@@ -9,6 +9,11 @@ stakeholder sign-off, and does not constitute FND-08 acceptance.
 
 **Decision owner:** Engineering Lead (unassigned)
 
+**Owner-approval update (2026-07-29):** The sole Product/Engineering owner has
+DEFERRED this decision for internal engineering. The synchronous scoring path is
+adequate for synthetic evaluation. See
+[`docs/decisions/fnd-08-owner-approval.md`](../decisions/fnd-08-owner-approval.md).
+
 **Plan references:** D-002, REL-01, REL-02, REL-03
 
 ## Context
