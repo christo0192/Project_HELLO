@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # CI/local integration test for the production-boundary migrations.
 # Starts only ephemeral local containers and uses synthetic identities/data.
+# Also applies the GOV-06 synthetic seed, verifies idempotent rerun, and
+# runs SQL integration tests — all within the same local-stack lifetime.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -25,8 +27,25 @@ docker info >/dev/null 2>&1 || { log 'ERROR: Docker is not running.'; exit 1; }
 log "Starting local Supabase with CLI ${SUPABASE_CLI_VERSION}..."
 supabase_cli start
 
-log 'Resetting the database and applying migrations...'
+log 'Resetting the database — this also applies config.toml-enabled seed...'
 supabase_cli db reset
+# Note: db reset ran migrations AND auto-applied the GOV-06 seed
+# (config.toml: seed.sql_paths = ["./seed.sql"]).  The reset output
+# above confirms seed auto-apply.  Any "already applied" messages for
+# seed INSERTs confirm the ON CONFLICT DO NOTHING guard.
+
+log 'GOV-06: Verifying seed was auto-applied by db reset (proving config.toml wired seed)...'
+# This is empty-seed-scenario proof: if db reset did NOT auto-apply the seed,
+# the expected GOV-06 rows will be missing.  Check one canonical row per table.
+docker exec "$SUPABASE_DB_CONTAINER" \
+  psql -U postgres -d postgres -t -A -c \
+  "select count(*) from screening_v2.roles where id = '60000000-0000-4000-a000-000000000001'" \
+  | grep -q '^1$' || { log 'ERROR: Seed was NOT auto-applied after db reset'; exit 1; }
+docker exec "$SUPABASE_DB_CONTAINER" \
+  psql -U postgres -d postgres -t -A -c \
+  "select count(*) from screening_v2.candidates where id = '60000000-0000-4000-a000-000000000021'" \
+  | grep -q '^1$' || { log 'ERROR: Seed was NOT auto-applied after db reset'; exit 1; }
+log 'GOV-06: db reset auto-seed verified — seed present immediately after reset'
 
 log 'Running SQL policy and schema tests...'
 docker inspect "$SUPABASE_DB_CONTAINER" >/dev/null 2>&1 \
@@ -60,4 +79,60 @@ case "$HTTP_CODE" in
     ;;
 esac
 
-log 'All local Supabase migration and policy checks passed.'
+# ===================================================================
+# GOV-06: First explicit seed re-apply (seed already applied by db reset
+# via config.toml), then full rerun to prove idempotency, then SQL tests
+# ===================================================================
+log 'GOV-06: Applying seed on top of auto-applied seed (idempotency proof)...'
+docker exec -i "$SUPABASE_DB_CONTAINER" \
+  psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+  < app/supabase/seed.sql
+# The seed was ALREADY applied by supabase db reset (due to config.toml
+# seed.sql_paths).  This explicit apply with ON CONFLICT DO NOTHING
+# must not change cardinality.  We label this as the explicit baseline.
+
+log 'GOV-06: Recording manifest-scoped canonical digest...'
+declare -A BEFORE
+for TABLE in roles resumes candidates call_sessions transcript_turns assessments consent_records; do
+  # Count only GOV-06 namespace rows, not total table count (tolerates unrelated fixtures)
+  BEFORE["$TABLE"]="$(docker exec "$SUPABASE_DB_CONTAINER" \
+    psql -U postgres -d postgres -t -A \
+    -c "select count(*) from screening_v2.${TABLE} where id >= '60000000-0000-4000-a000-000000000001'")"
+done
+
+log 'GOV-06: Re-running seed (idempotent test)...'
+docker exec -i "$SUPABASE_DB_CONTAINER" \
+  psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+  < app/supabase/seed.sql
+
+log 'GOV-06: Verifying cardinality unchanged after rerun...'
+FAILED=0
+for TABLE in roles resumes candidates call_sessions transcript_turns assessments consent_records; do
+  COUNT="$(docker exec "$SUPABASE_DB_CONTAINER" \
+    psql -U postgres -d postgres -t -A \
+    -c "select count(*) from screening_v2.${TABLE} where id >= '60000000-0000-4000-a000-000000000001'")"
+  if [ "$COUNT" != "${BEFORE[$TABLE]}" ]; then
+    log "FAIL: ${TABLE} cardinality changed from ${BEFORE[$TABLE]} to ${COUNT}"
+    FAILED=1
+  else
+    log "PASS: ${TABLE} cardinality stable at ${COUNT}"
+  fi
+done
+if [ "$FAILED" = "1" ]; then
+  log 'GOV-06: SEED RERUN TEST FAILED — seed is not idempotent'
+  exit 1
+fi
+log 'GOV-06: Seed rerun test passed — idempotent'
+
+log 'GOV-06: Running synthetic seed SQL integration tests...'
+docker exec -i "$SUPABASE_DB_CONTAINER" \
+  psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+  < app/supabase/tests/synthetic_seed_tests.sql 2>&1 | tee -a "$RESULTS_FILE"
+
+if grep -Eq '[[:space:]]FAIL([[:space:]]|$)' "$RESULTS_FILE"; then
+  log 'ERROR: Synthetic seed SQL tests reported a failure.'
+  exit 1
+fi
+log 'GOV-06: Synthetic seed SQL integration tests passed.'
+
+log 'All local Supabase migration, policy, and synthetic seed checks passed.'

@@ -4,7 +4,7 @@
 
 ---
 
-> **Implementation status (2026-07-29):** Branch `feat/obs-01-02-logging-correlation` implements OBS-01/OBS-02 structured logging and correlation scaffolding across API and voice workers with local tests. This does **not** close deployed observability acceptance: managed log export, dashboards, alarms, SLOs, production correlation proof, and launch gates remain pending.
+> **Implementation status (2026-07-29):** GOV-06 local synthetic demo seed tooling and tests are merged in PR #14. Branch `feat/obs-01-02-logging-correlation` implements OBS-01/OBS-02 structured logging and correlation scaffolding across API and voice workers with local tests. These implementations do **not** close production acceptance: FND-03 owner evidence, authentic shareable-artifact replacement, restricted-storage disposition, managed log export, dashboards, alarms, SLOs, deployed correlation proof, and launch gates remain pending.
 
 ---
 
