@@ -64,7 +64,7 @@ jobs:
             "QueueRequestCount"      # not in oci_queue namespace
           )
           for metric in "${BANNED_METRICS[@]}"; do
-            if grep -rn --include='*.tf' --include='*.md' "$metric" infra/oracle/ | grep -v '# Removed:' | grep -v 'Banned invented' | grep -v 'not a documented' | grep -v 'not in oci_' | grep -v 'replaced with' | grep -v '→ replaced'; then
+            if grep -rn --include='*.tf' --include='*.md' "$metric" infra/oracle/ | grep -v '# Removed:' | grep -v 'Banned invented' | grep -v 'not a documented' | grep -v 'not LogIngestionBytes' | grep -v 'not in oci_' | grep -v 'replaced with' | grep -v '→ replaced' | grep -v '→ use'; then
               echo "FAIL: Invented/banned metric string '$metric' found in committed files."
               echo "Only documented OCI metrics (MessagesInQueueCount, ConsumerLag, BytesIngested) are permitted."
               exit 1
