@@ -19,24 +19,61 @@ jobs:
         with:
           node-version: 20
 
-      - name: Validate example manifest (expected exit 2 — all pending, valid shape)
+      - name: Validate example manifest (expected exit 2 — all credential and artifact groups pending)
         id: validate-example
         run: |
           exit_code=0
           node scripts/check-phase0-evidence.mjs config/phase0-evidence.example.json || exit_code=$?
           if [ "$exit_code" -eq 2 ]; then
-            echo "PASS: example exits 2 (valid shape, all pending)"
+            echo "PASS: example exits 2 (valid shape, all groups pending — owner review/restricted-storage disposition pending)"
           elif [ "$exit_code" -eq 0 ]; then
-            echo "FAIL: example exited 0 (unexpected — should be all-pending)"
+            echo "FAIL: example exited 0 (unexpected — credentials should be pending)"
             exit 1
           else
             echo "FAIL: example exited $exit_code (expected 2)"
             exit 1
           fi
 
-      - name: Run deterministic tests
+      - name: Run evidence validator tests
         run: |
           node scripts/check-phase0-evidence.test.mjs
+
+      - name: Validate demo artifacts
+        run: |
+          node scripts/check-demo-artifacts.mjs
+
+      - name: Run demo artifacts tests
+        run: |
+          node scripts/check-demo-artifacts.test.mjs
+
+      - name: Verify generator determinism — two-run checksum comparison
+        run: |
+          echo "=== Run 1: verify against canonical manifest ==="
+          node scripts/generate-demo-artifacts.mjs --verify
+          echo "=== Run 2: regenerate all artifacts and verify again ==="
+          node scripts/generate-demo-artifacts.mjs
+          node scripts/generate-demo-artifacts.mjs --verify
+          echo "=== Checksum diff check (manifest vs artifacts) ==="
+          node -e "
+          const { readFileSync } = require('fs');
+          const { resolve } = require('path');
+          const { createHash } = require('crypto');
+          const manifest = JSON.parse(readFileSync(resolve('docs/demo/manifest.json'), 'utf-8'));
+          const expected = manifest.checksums;
+          let failures = 0;
+          for (const [file, expectedHash] of Object.entries(expected)) {
+            const content = readFileSync(resolve('docs/demo', file), 'utf-8');
+            const actual = createHash('sha256').update(content, 'utf-8').digest('hex');
+            if (actual !== expectedHash) {
+              console.error('FAIL: ' + file + ' expected ' + expectedHash + ' got ' + actual);
+              failures++;
+            } else {
+              console.log('OK: ' + file + ' ' + actual);
+            }
+          }
+          if (failures > 0) { process.exit(1); }
+          console.log('All ' + Object.keys(expected).length + ' checksums match manifest.');
+          "
 
       - name: Git diff whitespace check (against merge base)
         run: git diff --check origin/main...HEAD

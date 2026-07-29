@@ -1,0 +1,17 @@
+{
+  "is_synthetic": true,
+  "synthetic_id": "demo-manifest-v1-2025-06-15",
+  "generated_at": "2025-06-15T10:00:00Z",
+  "version": 1,
+  "description": "Canonical SHA-256 checksums for FND-03 synthetic demo artifacts. Generated deterministically; used by generate-demo-artifacts.mjs --verify.",
+  "generatedAt": "2025-06-15T10:00:00Z",
+  "checksums": {
+    "hello.html": "416b24b1b04a1a0ad31d5e02b8531e981f9ddf700b1505df71a84f6fc07eae35",
+    "hello.md": "eb1ba55d8e4db56651bd878d6fd1d449ef8176530d46594d181368fcb3b7f894",
+    "hello-assets/manifest.json": "266d7871fd821dc94bc54d92990b219469f0f90e018fbcb3853d8a918e492ee7",
+    "generated-pdf/generated-pdf-synthetic.json": "f74bfc1076b91cc467b10ef4239b682137bdfa7869582baf98ab0db88863cd93",
+    "voice-recording/voice-tone-info.json": "6e12c900ab88b0e71dd78f6ffcad2067913ea983959b0511bb56867b6e0115d1",
+    "scorecard-export/scorecard-export-synthetic.json": "592b76c9fdf5b9cebf27b89f8e9bf6151288faf33c2ce60148a2bf858bbd28b1",
+    "env-example-values/env-example-synthetic.json": "8c86bdec655fd51faa1ed510311f38c09ebb728b55ac864d5df162602dd4ed89"
+  }
+}

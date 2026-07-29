@@ -1,0 +1,19 @@
+{
+  "is_synthetic": true,
+  "synthetic_id": "demo-scorecard-v1-2025-06-15",
+  "generated_at": "2025-06-15T10:00:00Z",
+  "group": "scorecard-export",
+  "description": "Synthetic scorecard export for demo. Contact: demo.alpha@example.invalid",
+  "scorecards": [
+    {
+      "candidate_id": "DEMO-001",
+      "overall_score": 82,
+      "evaluated_at": "2026-01-15T14:30:00Z"
+    },
+    {
+      "candidate_id": "DEMO-002",
+      "overall_score": 88,
+      "evaluated_at": "2026-01-15T15:00:00Z"
+    }
+  ]
+}

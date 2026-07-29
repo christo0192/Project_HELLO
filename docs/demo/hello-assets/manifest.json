@@ -1,0 +1,23 @@
+{
+  "is_synthetic": true,
+  "synthetic_id": "demo-assets-v1-2025-06-15",
+  "generated_at": "2025-06-15T10:00:00Z",
+  "description": "Synthetic resume copy replacement",
+  "personas": [
+    {
+      "candidate_id": "DEMO-001",
+      "email": "demo.alpha@example.invalid",
+      "phone": null
+    },
+    {
+      "candidate_id": "DEMO-002",
+      "email": "demo.beta@example.invalid",
+      "phone": null
+    },
+    {
+      "candidate_id": "DEMO-003",
+      "email": "demo.gamma@example.invalid",
+      "phone": null
+    }
+  ]
+}

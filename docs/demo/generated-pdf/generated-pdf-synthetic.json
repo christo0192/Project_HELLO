@@ -1,0 +1,18 @@
+{
+  "is_synthetic": true,
+  "synthetic_id": "demo-pdf-v1-2025-06-15",
+  "generated_at": "2025-06-15T10:00:00Z",
+  "group": "generated-pdf",
+  "scorecards": [
+    {
+      "candidate_id": "DEMO-001",
+      "candidate_email": "demo.alpha@example.invalid",
+      "overall_score": 82
+    },
+    {
+      "candidate_id": "DEMO-002",
+      "candidate_email": "demo.beta@example.invalid",
+      "overall_score": 88
+    }
+  ]
+}

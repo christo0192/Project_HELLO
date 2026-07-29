@@ -480,4 +480,35 @@ describe('check-phase0-evidence.mjs', () => {
     assert.strictEqual(validate(writeTemp(d), TEST_CLOCK), 1);
   });
 
+  // === 18. FND03-01: All example artifacts pending, no deleted-after-replacement claim ===
+  it('FND03-01a: Committed example has all 7 artifact groups in pending status', () => {
+    const example = JSON.parse(readFileSync(EXAMPLE, 'utf-8'));
+    assert.strictEqual(example.artifactGroups.length, 7);
+    for (let i = 0; i < example.artifactGroups.length; i++) {
+      const g = example.artifactGroups[i];
+      assert.strictEqual(g.status, 'pending', `artifactGroups[${i}].groupId=${g.groupId} must be pending`);
+    }
+  });
+  it('FND03-01b: Committed example has no artifact verification objects (no disposition claims)', () => {
+    const example = JSON.parse(readFileSync(EXAMPLE, 'utf-8'));
+    for (let i = 0; i < example.artifactGroups.length; i++) {
+      const g = example.artifactGroups[i];
+      assert.strictEqual(g.verification, undefined, `artifactGroups[${i}].groupId=${g.groupId} must not have verification`);
+    }
+  });
+  it('FND03-01c: Committed example has no deleted-after-replacement claim anywhere', () => {
+    const raw = readFileSync(EXAMPLE, 'utf-8');
+    assert.ok(!raw.includes('deleted-after-replacement'), 'Example must not contain deleted-after-replacement claim');
+  });
+  it('FND03-01d: Committed example exits 2 (valid shape, all pending — owner review pending)', () => {
+    const { code, stderr } = runCLI(EXAMPLE);
+    assert.strictEqual(code, 2, `Expected exit 2, got ${code}; stderr: ${stderr}`);
+  });
+  it('FND03-01e: All 7 artifact groupIds present and pending in committed example', () => {
+    const example = JSON.parse(readFileSync(EXAMPLE, 'utf-8'));
+    const expectedIds = ['hello-html', 'hello-md', 'hello-assets', 'generated-pdf', 'voice-recording', 'scorecard-export', 'env-example-values'];
+    const actualIds = example.artifactGroups.map(g => g.groupId);
+    assert.deepStrictEqual(actualIds, expectedIds);
+  });
+
 });
