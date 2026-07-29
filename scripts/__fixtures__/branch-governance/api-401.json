@@ -1,0 +1,13 @@
+{
+  "metadata": {
+    "repository": "owner/repo",
+    "branch": "main",
+    "fetched_at": "2026-07-29T12:00:00Z",
+    "error": {
+      "status": 401,
+      "message": "Bad credentials"
+    }
+  },
+  "classic_branch_protection": null,
+  "rulesets": []
+}

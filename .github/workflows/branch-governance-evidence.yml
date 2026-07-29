@@ -1,0 +1,47 @@
+name: Branch Governance Evidence
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  collect-evidence:
+    name: collect-evidence
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run branch governance verifier (redacted output only)
+        id: verifier
+        env:
+          INFORMER_PATH: .github/branch-governance-evidence.json
+        run: |
+          # Run verifier; capture redacted summary to a temp file.
+          # Exit 0 = all enforced; exit 1 = controls absent (fail red).
+          # The redacted output goes to stdout on success, stderr on failure.
+          REDACTED_OUTPUT="$(mktemp)"
+          set +e
+          node scripts/check-branch-governance.mjs > "$REDACTED_OUTPUT" 2>&1
+          EXIT_CODE=$?
+          set -e
+          # Always make the redacted output available for artifact upload.
+          # The verifier never prints tokens or raw API bodies.
+          cp "$REDACTED_OUTPUT" ./redacted-branch-governance-summary.json
+          if [ "$EXIT_CODE" -ne 0 ]; then
+            echo "::error::FND-01 controls NOT ENFORCED (exit $EXIT_CODE). See redacted summary artifact."
+            exit 1
+          fi
+      - name: Upload redacted evidence summary (never raw API bodies)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: branch-governance-evidence
+          path: redacted-branch-governance-summary.json
+          retention-days: 90
+        if: always()

@@ -54,3 +54,22 @@ FND01 repository controls merged/hosted enforcement blocked; FND02 scanner contr
   authored; original evidence disposition is pending.
 
 These are external owner actions; they cannot close solely through additional implementation code.
+
+## Branch governance verifier (evidence-only)
+
+The offline verifier in `scripts/check-branch-governance.mjs` reads a local
+GitHub API evidence snapshot (`.github/branch-governance-evidence.json` or path
+in `$INFORMER_PATH`) and reports which of the 12 required controls in
+`.github/branch-governance-policy.json` are enforced.
+
+- **Exit 0:** All controls ENFORCED.
+- **Exit 1:** One or more controls NOT ENFORCED (fail-closed).
+- **Exit 2:** Input malformed, file not found, or parse error.
+
+**FND-01 remains blocked** until hosted enforcement (GitHub private-plan
+upgrade or equivalent) is confirmed AND the `quality` and `secret-scan` status
+checks are enforced on `main`, AND direct pushes to `main` are rejected.
+The verifier is an evidence-collection tool — it does not enforce anything.
+
+See `docs/runbooks/branch-governance-evidence.md` for the collection and
+interpretation runbook.
