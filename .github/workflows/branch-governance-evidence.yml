@@ -1,0 +1,43 @@
+name: Branch Governance Evidence
+# Read-only evidence collection via GITHUB_TOKEN.
+# Raw API responses stay in memory only — never persisted or uploaded.
+# Current private plan may return 403 — expected fail-closed, not a bug.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  collect-evidence:
+    name: collect-evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run verifier (live mode via GITHUB_TOKEN)
+        id: verifier
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REDACTED="$(mktemp)"
+          set +e
+          node scripts/check-branch-governance.mjs > "$REDACTED" 2>&1
+          EXIT="$?"
+          set -e
+          cp "$REDACTED" ./redacted-branch-governance-summary.json
+          if [ "$EXIT" -ne 0 ]; then
+            echo "::error::FND-01 controls NOT ENFORCED (exit $EXIT). See redacted summary artifact."
+            # Fail the job — controls absent. Artifact still uploaded below.
+            exit 1
+          fi
+      - name: Upload redacted evidence summary
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: branch-governance-evidence
+          path: redacted-branch-governance-summary.json
+          retention-days: 90

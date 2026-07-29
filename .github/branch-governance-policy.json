@@ -1,0 +1,138 @@
+{
+  "version": "1.0.0",
+  "policy_name": "FND-01 Branch Governance",
+  "description": "Required branch protection controls for the main branch",
+  "target_branch": "main",
+  "required_status_checks": ["quality", "secret-scan"],
+  "controls": [
+    {
+      "id": "require_pull_requests",
+      "name": "Require PRs before merging",
+      "severity": "critical",
+      "classic_field": "required_pull_request_reviews",
+      "classic_check": "exists",
+      "ruleset_type": "pull_request",
+      "ruleset_check": "rule_exists",
+      "description": "Pull requests must be required before merging to main"
+    },
+    {
+      "id": "require_two_approvals",
+      "name": "Require 2 approvals",
+      "severity": "critical",
+      "classic_field": "required_pull_request_reviews.required_approving_review_count",
+      "classic_check": "min_value",
+      "min_value": 2,
+      "ruleset_type": "pull_request",
+      "ruleset_param": "required_approving_review_count",
+      "ruleset_check": "min_value",
+      "description": "At least 2 approving reviews are required"
+    },
+    {
+      "id": "require_codeowner_review",
+      "name": "Require CODEOWNER review",
+      "severity": "critical",
+      "classic_field": "required_pull_request_reviews.require_code_owner_reviews",
+      "classic_check": "bool_true",
+      "ruleset_type": "pull_request",
+      "ruleset_param": "require_code_owner_review",
+      "ruleset_check": "bool_true",
+      "description": "A CODEOWNER must approve pull requests"
+    },
+    {
+      "id": "dismiss_stale_approvals",
+      "name": "Dismiss stale approvals on new commits",
+      "severity": "high",
+      "classic_field": "required_pull_request_reviews.dismiss_stale_reviews",
+      "classic_check": "bool_true",
+      "ruleset_type": "pull_request",
+      "ruleset_param": "dismiss_stale_reviews_on_push",
+      "ruleset_check": "bool_true",
+      "description": "Stale approvals are dismissed when new commits are pushed"
+    },
+    {
+      "id": "require_last_push_approval",
+      "name": "Require approval of most recent reviewable push",
+      "severity": "high",
+      "classic_field": "required_pull_request_reviews.require_last_push_approval",
+      "classic_check": "bool_true",
+      "ruleset_type": "pull_request",
+      "ruleset_param": "require_last_push_approval",
+      "ruleset_check": "bool_true",
+      "description": "The most recent reviewable push requires approval"
+    },
+    {
+      "id": "require_conversation_resolution",
+      "name": "Require conversation resolution",
+      "severity": "medium",
+      "classic_field": "required_conversation_resolution.enabled",
+      "classic_check": "bool_true",
+      "ruleset_type": "pull_request",
+      "ruleset_param": "required_review_thread_resolution",
+      "ruleset_check": "bool_true",
+      "description": "All review conversations must be resolved"
+    },
+    {
+      "id": "admin_enforcement",
+      "name": "Enforce for administrators",
+      "severity": "critical",
+      "classic_field": "enforce_admins.enabled",
+      "classic_check": "bool_true",
+      "ruleset_type": null,
+      "ruleset_check": "no_bypass_actors",
+      "description": "Branch protections apply to administrators; no bypass actors allowed"
+    },
+    {
+      "id": "signed_commits",
+      "name": "Require signed commits",
+      "severity": "high",
+      "classic_field": "required_signatures.enabled",
+      "classic_check": "bool_true",
+      "classic_separate_endpoint": true,
+      "ruleset_type": "required_signatures",
+      "ruleset_check": "rule_exists",
+      "description": "Commits must be signed"
+    },
+    {
+      "id": "linear_history",
+      "name": "Require linear history",
+      "severity": "medium",
+      "classic_field": "required_linear_history.enabled",
+      "classic_check": "bool_true",
+      "ruleset_type": "required_linear_history",
+      "ruleset_check": "rule_exists",
+      "description": "Linear history is required (no merge commits)"
+    },
+    {
+      "id": "force_push_disabled",
+      "name": "Force push disabled",
+      "severity": "critical",
+      "classic_field": "allow_force_pushes.enabled",
+      "classic_check": "bool_false",
+      "ruleset_type": "non_fast_forward",
+      "ruleset_check": "rule_exists",
+      "description": "Force pushes are not allowed on main"
+    },
+    {
+      "id": "deletion_disabled",
+      "name": "Branch deletion disabled",
+      "severity": "critical",
+      "classic_field": "allow_deletions.enabled",
+      "classic_check": "bool_false",
+      "ruleset_type": "deletion",
+      "ruleset_check": "rule_exists",
+      "description": "Branch deletion is not allowed"
+    },
+    {
+      "id": "required_status_checks",
+      "name": "Required status checks",
+      "severity": "critical",
+      "classic_field": "required_status_checks.contexts",
+      "classic_check": "status_checks_includes",
+      "ruleset_type": "required_status_checks",
+      "ruleset_param": "required_status_checks",
+      "ruleset_check": "status_checks_includes",
+      "expected_checks": ["quality", "secret-scan"],
+      "description": "Required status checks must include quality and secret-scan"
+    }
+  ]
+}

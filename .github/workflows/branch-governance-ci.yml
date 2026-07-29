@@ -1,0 +1,31 @@
+name: Branch Governance CI
+# No GITHUB_TOKEN, no network calls — unit/fixture tests only.
+on:
+  pull_request:
+    paths:
+      - 'scripts/check-branch-governance.mjs'
+      - 'scripts/check-branch-governance.test.mjs'
+      - '.github/branch-governance-policy.json'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/check-branch-governance.mjs'
+      - 'scripts/check-branch-governance.test.mjs'
+      - '.github/branch-governance-policy.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run branch governance unit/fixture tests
+        run: node scripts/check-branch-governance.test.mjs
