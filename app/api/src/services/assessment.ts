@@ -24,8 +24,10 @@ export function injectAssessmentRunner(fn: AssessmentRunner | null): void {
 /**
  * Score a completed screening session and persist the assessment.
  * Idempotent-ish: inserts a new assessment row each call.
- *
  * Delegates to the injected runner (default: real implementation).
+ * The default provenance-aware inference call uses claude.ts's single circuit
+ * breaker; no nested breaker is added here. Provider failures affect that
+ * breaker, while invalid JSON is a BusinessError and does not.
  */
 export async function runAssessment(sessionId: string): Promise<Assessment & { id: string }> {
   return _runAssessment(sessionId);
@@ -72,8 +74,8 @@ async function runAssessmentImpl(sessionId: string): Promise<Assessment & { id: 
     .eq('id', session.candidate_id)
     .single();
 
-  // Use runClaudeJSONWithProvenance to get both the parsed assessment and
-  // the requested model identifier.
+  // The provenance-aware call uses claude.ts's single breaker-managed runner
+  // and returns the configured design-intent model for immutable provenance.
   const { data: assessment, requestedModel: scoringModel } = await runClaudeJSONWithProvenance<Assessment>(
     buildAssessmentPrompt({
       roleTitle,

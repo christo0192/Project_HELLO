@@ -2,6 +2,8 @@
 
 **Last updated:** 2026-07-29
 
+**Current branch:** `feat/rel-05-06-provider-resilience` (worktreed from `fd58f81` / PR #13, not yet merged to `main`)
+
 **Repository:** `https://github.com/christo0192/Project_HELLO`
 
 **Production status:** Pre-production; do not use real candidate data
@@ -19,6 +21,17 @@ gh pr list --state all --limit 10
 cat docs/HANDOVER.md
 ```
 
+## Defensible Metrics
+
+| Metric | Value |
+|--------|-------|
+| Completed launch gates | 0/17 — all FND-02, FND-03, and REL acceptance criteria remain unverified at production level |
+| Implementation coverage | REL-05/REL-06 code + tests exist on branch; strict acceptance is separate from implementation coverage |
+| Branch base | `fd58f81c184af7ae7b15138537ff735070d116ad` (PR #13 FND-02/FND-03) |
+| Branch state | In progress; not merged |
+
+> **Note:** The 25% completion figure sometimes seen in earlier summaries is NOT claimed. Zero launch gates are confirmed complete. Implementation coverage and acceptance verification are distinct gates.
+
 ## Completed Work
 
 | Work | Plan task | State | Evidence |
@@ -32,13 +45,14 @@ cat docs/HANDOVER.md
 | CORS + CSP foundation | SEC-07 | Code complete; deployment-gated | PR #6, merged 2026-07-29. Automated API CORS tests + built-HTML CSP smoke pass locally. CSP is report-only. Real-browser denial test, clean CSP report window, and Observatory B+ require deployment. |
 | OCI managed-services Terraform foundation | Infrastructure | Code merged; apply-gated | PR #7 (`e8584b0`), merged 2026-07-29. Scaffold only; `terraform apply` has not been run. |
 | OCI region benchmark harness | Infrastructure | Code merged; not yet measured | PR #8 (`726ce56`), merged 2026-07-29. Harness and fail-closed runbook exist; no benchmark data has been collected. |
-| LLM-06 model provenance (branch) | LLM-06 | Code complete on `feat/llm-06-provenance`; **not merged, not deployed** | Requested-model provenance for API simulation/scoring and LiveKit worker claim, SQL validator, immutability triggers, TS/Python validation. Local checks passed: API 275 tests, Python 63 tests, Supabase 46 policy/schema tests + PostgREST anon denial. Production migration apply and deployed provider evidence remain pending. |
+| LLM-06 model provenance | LLM-06 | Code merged; production migration/deployment acceptance pending | PR #17 (`8439bda`), merged 2026-07-29. Requested-model provenance covers API simulation/scoring and LiveKit worker claims with SQL validation and immutability. Hosted migration application and deployed provider evidence remain pending. |
 | Supabase local baseline | MIG-03 / partial MIG-04 | Code merged; production apply pending | PR #9 (`4d103ea`), merged 2026-07-29. Unused Mumbai project exists but MIG-01/MIG-02 admin acceptance pending; this is MIG-03/partial MIG-04. Membership-gated RLS and local validation; MIG-01/MIG-02 administrative acceptance plus controlled production connection/application and MIG-13 cutover are future gates. |
-| Synthetic demo seed foundation | GOV-06 | Code merged; production/demo acceptance pending | PR #14 (`7cbc962`), merged 2026-07-29. Deterministic local `app/supabase/seed.sql`, offline validator, 65 validator tests, 62 SQL integration assertions, runbook, and Supabase CI wiring are present. This is local synthetic-data scaffolding only; screenshots/demo artifact replacement and owner FND-03 evidence remain pending. |
-| OBS-01 / OBS-02 structured logging + correlation | OBS-01, OBS-02 | Code merged; deployment acceptance pending | PR #15 (`de133c6`), merged 2026-07-29. Structured JSON logger (JS+Python parity), UUID v4 correlation middleware, envelope validation, redaction/defense scanning, scoring taxonomy, and component defense are present. Managed log export, dashboards, alarms, queue/provider tracing, and deployed acceptance remain pending. |
-| Accessibility test foundation | TST-07 | Automation scaffold merged; manual/dependent acceptance pending | PR #16 (`db20b4a`), merged 2026-07-29. Includes 101 unit tests, strict axe matcher, fail-closed network trap, and keyboard focus assertions. Manual AT/contrast/reflow/browser gates and candidate consent/call flow remain external/dependent, so this is not launch-gate acceptance. |
+| Synthetic demo seed foundation | GOV-06 | Code merged; production/demo acceptance pending | PR #14 (`7cbc962`), merged 2026-07-29. Deterministic local seed, offline validator, SQL integration assertions, runbook, and Supabase CI wiring are present. Artifact replacement and owner FND-03 evidence remain pending. |
+| OBS-01 / OBS-02 structured logging + correlation | OBS-01, OBS-02 | Code merged; deployment acceptance pending | PR #15 (`de133c6`), merged 2026-07-29. Structured logging and UUID v4 correlation scaffolding are present; managed export, dashboards, alarms, and deployed acceptance remain pending. |
+| Accessibility test foundation | TST-07 | Automation scaffold merged; manual/dependent acceptance pending | PR #16 (`db20b4a`), merged 2026-07-29. Automated axe, network-trap, and keyboard checks are present. Manual AT/browser gates and candidate consent/call flow remain pending. |
+| Provider resilience foundation | REL-05, REL-06 | Code complete on `feat/rel-05-06-provider-resilience`; **not merged, not deployed** | Circuit breakers, hardened Claude runner, explicit scoring HTTP timeouts/lazy transport, typed failure outcomes, correlation propagation, and closed failure-reason mapping are implemented. See `docs/runbooks/provider-resilience.md`; SDK-internal calls, reconciliation, and deployed drills remain pending. |
 
-PRs #14–#16 were merged into `main` on 2026-07-29 with their required checks passing. Aggregate `main` verification after the remaining sequential merges is still pending.
+PRs #14–#17 were merged into `main` on 2026-07-29 with their required checks passing. Aggregate `main` verification after the remaining sequential merges is still pending.
 
 ## Phase-0 Foundation Status (FND-01, FND-02, FND-03)
 
@@ -56,40 +70,49 @@ external-blockers summary.
 
 | Item | Status | Notes |
 |------|--------|-------|
-| Structured JSON logger (JS) | Code complete | `app/api/src/lib/logger.ts` — schema, envelope validation, redaction, defense scanning, calendar-valid timestamps |
-| Correlation ID middleware (JS) | Code complete | `app/api/src/lib/correlation.ts` — UUID v4 validation, AsyncLocalStorage isolation, response header on all paths |
-| Structured logger (Python) | Code complete | `app/voice-livekit/observability.py` — token-based ContextVar, parity with JS schema |
-| Persistence scoring trigger | Code complete | `app/voice-livekit/persistence.py` — taxonomy with http_redirect/http_client_error/http_server_error |
-| JS test suite | 419 tests | Vitest; schema, redaction matrix, origin validation, correlation middleware, concurrent isolation, network trap |
-| Python test suite | 56 tests | unittest; schema, redaction matrix, token-based set/reset, concurrent tasks, origin validation, network trap |
-| Managed log export | **Pending** | Not chosen; no dashboard, no alert rules |
-| Dashboards / alarms | **Pending** | No platform selected |
+| Structured logging/correlation | Code merged | JS/Python redaction and UUID v4 correlation scaffolding are present |
+| Managed export, dashboards, alarms | **Pending** | No production platform or deployed proof |
 | Queue/provider tracing | **Pending** | ADR-0004 queue not yet implemented |
-| Deployed acceptance | **Pending** | Tests pass in CI-like local run only; no staging/production deployment |
-| Launch gates (0/17) | **0 complete** | All 17 launch gates remain open; unit test pass does not equal phase completion |
-
+| Launch gates (0/17) | **0 complete** | Implementation does not equal production acceptance |
 
 ## Current Verification
 
 ```bash
+# API (Node)
 cd app/api && npm ci && npm run typecheck && npm test
-cd ../web && npm ci && npm run lint && npm run build
+# Provider-resilience specific (deterministic, no real CLI)
+npx vitest run src/__tests__/provider-resilience.test.ts
+
+# Web
+cd ../web && npm ci && npm run test:typecheck && npm test && npm run lint && npm run build
 cd ../..
+
+# Contracts, ADRs, audits
 node scripts/check-env-contract.mjs
 node scripts/check-env-contract.test.mjs
 node scripts/check-adrs.mjs
 node scripts/check-synthetic-seed.mjs app/supabase/seed.sql
 node scripts/check-synthetic-seed.test.mjs
 bash scripts/supabase-test.sh
-python3 -m py_compile app/voice-livekit/agent.py app/voice-livekit/persistence.py app/voice-livekit/observability.py app/voice-livekit/provenance.py
+python3 -m py_compile app/voice-livekit/agent.py app/voice-livekit/persistence.py app/voice-livekit/observability.py app/voice-livekit/provenance.py app/voice-livekit/provider_resilience.py
 (cd app/voice-livekit && python3 -m unittest discover -s tests -p 'test_*.py' -v)
 node scripts/audit-seeded-vuln.test.mjs
 bash scripts/audit-deps.sh --dir app/api
 bash scripts/audit-deps.sh --dir app/web
 bash scripts/sbom.sh
+
+# Security
 ./scripts/scan-secrets.sh --committable
 git diff --check
 ```
+
+### Current Test Counts
+| Suite | Count | Notes |
+|---|---|---|
+| API (Node) | **597 tests** | Includes 89 provider-resilience tests plus validation, observability, provenance, and CORS/CSP suites; deterministic fakes avoid real CLI/provider calls. |
+| LiveKit worker (Python) | **217 tests** | Combined resilience, observability, provenance, correlation, and persistence coverage using `unittest` and fake transports; no real provider calls. |
+| Web | **101 tests** | Accessibility scaffold plus typecheck, lint, and production build. |
+| Supabase | **46 policy/provenance + 62 synthetic SQL assertions** | Local ephemeral stack only; includes anonymous denial and idempotent seed replay. |
 
 ## Remaining Production Work
 

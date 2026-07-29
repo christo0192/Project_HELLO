@@ -4,7 +4,7 @@
 
 ---
 
-> **Implementation status (2026-07-29):** GOV-06, OBS-01/OBS-02, and the TST-07 automated accessibility scaffold are merged in PRs #14–#16. Branch `feat/llm-06-provenance` implements requested-model provenance across the API, LiveKit worker, and local Supabase migrations/tests. These implementations do **not** close production acceptance: hosted migration application, deployed provider/observability evidence, manual accessibility review, owner/legal/security approvals, and all launch gates remain pending.
+> **Implementation status (2026-07-29):** GOV-06, OBS-01/OBS-02, TST-07 automation, and LLM-06 provenance are merged in PRs #14–#17. Branch `feat/rel-05-06-provider-resilience` adds the REL-05/REL-06 provider-resilience foundation. These implementations do **not** close production acceptance: hosted migration/deployment evidence, managed observability, manual accessibility review, provider drills, owner/legal/security approvals, and all launch gates remain pending.
 
 ---
 

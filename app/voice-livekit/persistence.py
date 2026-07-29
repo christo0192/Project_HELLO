@@ -6,8 +6,10 @@ turns against that id, completes the session, and triggers the same API scoring
 route used by the old Pipecat flow.
 
 LLM-06 adds provenance claiming via ``set_session_provenance()`` with
-compare-and-set semantics. OBS-01/OBS-02 route all output through the redacting
-``StructuredLogger`` and propagate ``X-Correlation-ID`` to the scoring API.
+compare-and-set semantics. OBS-01/OBS-02 route output through the redacting
+``StructuredLogger`` and propagate ``X-Correlation-ID``. REL-05/REL-06 protect
+the scoring trigger with a circuit breaker, explicit transport timeouts, lazy
+transport construction, typed outcomes, and a closed failure-reason mapping.
 No transcript text, raw exceptions, session IDs, URLs, response bodies, or raw
 provenance values are logged.
 """
@@ -17,12 +19,22 @@ from __future__ import annotations
 import asyncio
 import os
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Optional
 
-try:
-    import httpx
-except ImportError:  # pragma: no cover — keeps syntax-check mode usable
-    httpx = None  # type: ignore[assignment]
+from provider_resilience import (
+    BusinessError,
+    CircuitBreaker,
+    CircuitBreakerConfig,
+    CircuitState,
+    ProviderError,
+    RealClock,
+    call_with_breaker,
+    configure_scoring_transport,
+    get_scoring_transport,
+    parse_env_float,
+    parse_env_int,
+)
 
 try:
     from supabase import create_client
@@ -41,19 +53,63 @@ _client = None
 # ── Provenance claim result enum ───────────────────────────────────────
 
 class ClaimResult:
-    """Result of a provenance claim attempt.
+    """Result of a provenance claim attempt."""
 
-    - CLAIMED: first-time claim succeeded (null → value)
-    - ALREADY_MATCHING: provenance already set to the exact same value
-    - CONFLICT: provenance already set to a DIFFERENT value (immutable conflict)
-    - MISSING: expected table/column not found
-    - ERROR: transport or server error
-    """
     CLAIMED = "claimed"
     ALREADY_MATCHING = "already_matching"
     CONFLICT = "conflict"
     MISSING = "missing"
     ERROR = "error"
+
+
+class TriggerOutcome(Enum):
+    """Typed result of the breaker-protected scoring trigger."""
+
+    SUCCESS = "success"
+    BREAKER_OPEN = "breaker_open"
+    TRANSPORT_FAILURE = "transport_failure"
+    BUSINESS_ERROR = "business_error"
+
+
+_FAIL_REASON_CODES = frozenset({"error", "timeout", "disconnect", "unknown"})
+
+
+def _safe_reason_code(reason: str) -> str:
+    code = reason.strip().lower().replace(" ", "_")
+    return code if code in _FAIL_REASON_CODES else "unknown"
+
+
+_SCORING_BREAKER = CircuitBreaker(CircuitBreakerConfig(
+    failure_threshold=parse_env_int(
+        os.getenv("SCORING_BREAKER_THRESHOLD"), 3, min_val=1, max_val=100,
+    ),
+    cooldown_sec=parse_env_float(
+        os.getenv("SCORING_BREAKER_COOLDOWN_SEC"), 30.0, min_val=1.0, max_val=600.0,
+    ),
+    timeout_sec=parse_env_float(
+        os.getenv("SCORING_BREAKER_TIMEOUT_SEC"),
+        180.0,
+        min_val=1.0,
+        max_val=600.0,
+        allow_zero=False,
+    ),
+    clock=RealClock(),
+))
+
+configure_scoring_transport(
+    connect_timeout=parse_env_float(
+        os.getenv("SCORING_HTTP_CONNECT_TIMEOUT"), 10.0, min_val=1.0, max_val=120.0,
+    ),
+    read_timeout=parse_env_float(
+        os.getenv("SCORING_HTTP_READ_TIMEOUT"), 180.0, min_val=1.0, max_val=600.0,
+    ),
+    write_timeout=parse_env_float(
+        os.getenv("SCORING_HTTP_WRITE_TIMEOUT"), 30.0, min_val=1.0, max_val=120.0,
+    ),
+    pool_timeout=parse_env_float(
+        os.getenv("SCORING_HTTP_POOL_TIMEOUT"), 10.0, min_val=1.0, max_val=120.0,
+    ),
+)
 
 
 # ── Internal client ────────────────────────────────────────────────────
@@ -205,8 +261,11 @@ async def complete_session(session_id: Optional[str], duration_sec: Optional[int
 
 
 async def fail_session(session_id: Optional[str], reason: str) -> None:
+    """Mark a session failed without persisting raw provider/error text."""
     if not session_id:
         return
+
+    safe_code = _safe_reason_code(reason)
 
     def run():
         table = _table("call_sessions")
@@ -216,7 +275,7 @@ async def fail_session(session_id: Optional[str], reason: str) -> None:
             {
                 "status": "failed",
                 "ended_at": datetime.now(timezone.utc).isoformat(),
-                "external_call_id": reason[:200],
+                "external_call_id": safe_code,
             }
         ).eq("id", session_id).execute()
 
@@ -227,43 +286,49 @@ async def fail_session(session_id: Optional[str], reason: str) -> None:
         _log.warn("db_error", error_category="fail_session_failed")
 
 
-async def trigger_scoring(session_id: Optional[str]) -> bool:
-    """Post to the scoring API; return True on 2xx, False otherwise."""
+async def trigger_scoring(session_id: Optional[str]) -> TriggerOutcome:
+    """Trigger scoring through the shared typed circuit-breaker boundary."""
     if not session_id:
-        return False
-    if httpx is None:  # pragma: no cover
-        _log.warn("db_error", error_category="httpx_unavailable")
-        return False
+        return TriggerOutcome.BUSINESS_ERROR
 
-    # Propagate correlation ID to the API (OBS-02).
-    headers: dict[str, str] = {}
-    cid = get_correlation_id()
-    if cid:
-        headers["X-Correlation-ID"] = cid
+    # Reject before lazy httpx construction so open-state classification is
+    # preserved even in minimal environments without the transport dependency.
+    if _SCORING_BREAKER.state == CircuitState.OPEN:
+        _log.warn("scoring_failed", error_category="circuit_open")
+        return TriggerOutcome.BREAKER_OPEN
 
     try:
-        async with httpx.AsyncClient(timeout=180) as client:
-            response = await client.post(
-                f"{API_BASE}/api/assess/{session_id}",
-                headers=headers,
-            )
-            # Log HTTP status only — no URL, response body, or session ID.
-            sc = response.status_code
-            if isinstance(sc, int) and 200 <= sc < 300:
-                _log.info("scoring_trigger", http_status=sc)
-                return True
-            if not isinstance(sc, int) or sc < 100 or sc > 599:
-                cat = "invalid_status"
-            elif 100 <= sc < 200:
-                cat = "http_informational"
-            elif 300 <= sc < 400:
-                cat = "http_redirect"
-            elif 400 <= sc < 500:
-                cat = "http_client_error"
-            else:
-                cat = "http_server_error"
-            _log.warn("scoring_failed", http_status=sc, error_category=cat)
-            return False
+        transport = get_scoring_transport()
     except Exception:  # noqa: BLE001
-        _log.warn("scoring_failed", error_category="http_error")
-        return False
+        _log.warn("scoring_failed", error_category="connection")
+        return TriggerOutcome.TRANSPORT_FAILURE
+
+    headers: dict[str, str] = {}
+    correlation_id = get_correlation_id()
+    if correlation_id:
+        headers["X-Correlation-ID"] = correlation_id
+
+    try:
+        response = await call_with_breaker(
+            "POST",
+            f"{API_BASE}/api/assess/{session_id}",
+            breaker=_SCORING_BREAKER,
+            transport=transport,
+            headers=headers,
+            endpoint_hint="assess",
+            log_failures=False,
+        )
+        status = getattr(response, "status_code", None)
+        if isinstance(status, int):
+            _log.info("scoring_trigger", http_status=status)
+        else:
+            _log.info("scoring_trigger")
+        return TriggerOutcome.SUCCESS
+    except ProviderError as exc:
+        _log.warn("scoring_failed", error_category=exc.category)
+        if exc.category == "circuit_open":
+            return TriggerOutcome.BREAKER_OPEN
+        return TriggerOutcome.TRANSPORT_FAILURE
+    except BusinessError:
+        _log.warn("scoring_failed", error_category="business_error")
+        return TriggerOutcome.BUSINESS_ERROR

@@ -741,249 +741,85 @@ class TestPersistenceLogging(unittest.IsolatedAsyncioTestCase):
 class TestTriggerScoringHeaderPropagation(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         reset_correlation()
+        persistence._SCORING_BREAKER.reset()
+
+    @staticmethod
+    def _transport(status: int, captured: Optional[dict] = None):
+        class FakeTransport:
+            async def request(self, **kwargs):  # noqa: ANN003
+                if captured is not None:
+                    captured.update(kwargs)
+                return types.SimpleNamespace(status_code=status)
+        return FakeTransport()
+
+    async def _invoke(self, status: int, *, session_id: str = "session-id"):
+        lines: list[str] = []
+        original_writer = persistence._log._writer
+        persistence._log._writer = lambda line: lines.append(line)
+        try:
+            with patch.object(
+                persistence, "get_scoring_transport", return_value=self._transport(status)
+            ):
+                result = await persistence.trigger_scoring(session_id)
+        finally:
+            persistence._log._writer = original_writer
+        return result, lines
 
     async def test_correlation_id_sent_as_request_header(self) -> None:
         expected_cid = "550e8400-e29b-41d4-a716-446655440000"
         set_correlation_id(expected_cid)
-
         captured: dict = {}
-
-        class _FakeResponse:
-            status_code = 202
-
-        class _FakeClient:
-            async def post(self, url: str, **kwargs):  # noqa: ANN001
-                captured["headers"] = dict(kwargs.get("headers", {}))
-                return _FakeResponse()
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *_):
-                pass
-
-        class _FakeHttpx:
-            @staticmethod
-            def AsyncClient(**_kwargs):
-                return _FakeClient()
-
-        with patch.object(persistence, "httpx", _FakeHttpx):
-            await persistence.trigger_scoring("session-id-irrelevant")
-
-        self.assertIn("X-Correlation-ID", captured.get("headers", {}))
+        with patch.object(
+            persistence, "get_scoring_transport", return_value=self._transport(202, captured)
+        ):
+            result = await persistence.trigger_scoring("session-id-irrelevant")
+        self.assertEqual(result, persistence.TriggerOutcome.SUCCESS)
         self.assertEqual(captured["headers"]["X-Correlation-ID"], expected_cid)
 
     async def test_no_url_or_session_id_in_log_output(self) -> None:
-        set_correlation_id(None)
-        lines: list[str] = []
-
-        class _FakeResponse:
-            status_code = 200
-
-        class _FakeClient:
-            async def post(self, url: str, **kwargs):  # noqa: ANN001
-                return _FakeResponse()
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *_):
-                pass
-
-        class _FakeHttpx:
-            @staticmethod
-            def AsyncClient(**_kwargs):
-                return _FakeClient()
-
-        original_writer = persistence._log._writer
-        persistence._log._writer = lambda line: lines.append(line)
-        try:
-            with patch.object(persistence, "httpx", _FakeHttpx):
-                await persistence.trigger_scoring("secret-session-id-123")
-        finally:
-            persistence._log._writer = original_writer
-
+        result, lines = await self._invoke(200, session_id="secret-session-id-123")
+        self.assertEqual(result, persistence.TriggerOutcome.SUCCESS)
         self.assertGreater(len(lines), 0)
         for line in lines:
-            self.assertNotIn("api/assess", line, f"URL found in log: {line}")
-            self.assertNotIn("secret-session-id-123", line, f"Session ID in log: {line}")
+            self.assertNotIn("api/assess", line)
+            self.assertNotIn("secret-session-id-123", line)
+        self.assertEqual(json.loads(lines[0])["event"], "scoring_trigger")
 
-        parsed = json.loads(lines[0])
-        self.assertEqual(parsed["event"], "scoring_trigger")
-        self.assertIn("http_status", parsed)
+    async def test_transport_error_logs_stable_category_only(self) -> None:
+        class ErrorTransport:
+            async def request(self, **_kwargs):  # noqa: ANN003
+                raise persistence.ProviderError("connection")
 
-    async def test_http_error_logs_category_only(self) -> None:
-        set_correlation_id(None)
         lines: list[str] = []
-
-        class _ErrorHttpx:
-            class AsyncClient:
-                def __init__(self, **_):
-                    pass
-
-                async def post(self, *_a, **_kw):
-                    raise RuntimeError("Connection refused — MUST NOT APPEAR IN LOG")
-
-                async def __aenter__(self):
-                    return self
-
-                async def __aexit__(self, *_):
-                    pass
-
         original_writer = persistence._log._writer
         persistence._log._writer = lambda line: lines.append(line)
         try:
-            with patch.object(persistence, "httpx", _ErrorHttpx):
-                await persistence.trigger_scoring("session-id")
-        finally:
-            persistence._log._writer = original_writer
-
-        self.assertGreater(len(lines), 0)
-        for line in lines:
-            self.assertNotIn("Connection refused", line)
-            self.assertNotIn("MUST NOT APPEAR", line)
-
-        parsed = json.loads(lines[0])
-        self.assertEqual(parsed["event"], "scoring_failed")
-        self.assertEqual(parsed["error_category"], "http_error")
-
-    async def test_scoring_returns_false_for_400(self) -> None:
-        set_correlation_id(None)
-        lines: list[str] = []
-
-        class _Fake400Response:
-            status_code = 400
-
-        class _FakeClient400:
-            async def post(self, url: str, **kwargs):  # noqa: ANN001
-                return _Fake400Response()
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *_):
-                pass
-
-        class _FakeHttpx400:
-            @staticmethod
-            def AsyncClient(**_kwargs):
-                return _FakeClient400()
-
-        original_writer = persistence._log._writer
-        persistence._log._writer = lambda line: lines.append(line)
-        try:
-            with patch.object(persistence, "httpx", _FakeHttpx400):
+            with patch.object(persistence, "get_scoring_transport", return_value=ErrorTransport()):
                 result = await persistence.trigger_scoring("session-id")
         finally:
             persistence._log._writer = original_writer
+        self.assertEqual(result, persistence.TriggerOutcome.TRANSPORT_FAILURE)
+        self.assertEqual(json.loads(lines[0])["error_category"], "connection")
+        self.assertNotIn("session-id", lines[0])
 
-        self.assertFalse(result)
-        parsed = json.loads(lines[0])
-        self.assertEqual(parsed["event"], "scoring_failed")
-        self.assertEqual(parsed["http_status"], 400)
-        self.assertEqual(parsed["error_category"], "http_client_error")
+    async def test_400_is_business_error(self) -> None:
+        result, lines = await self._invoke(400)
+        self.assertEqual(result, persistence.TriggerOutcome.BUSINESS_ERROR)
+        self.assertEqual(json.loads(lines[0])["error_category"], "business_error")
 
-    async def test_scoring_returns_false_for_429(self) -> None:
-        set_correlation_id(None)
-        lines: list[str] = []
+    async def test_429_is_transport_failure(self) -> None:
+        result, lines = await self._invoke(429)
+        self.assertEqual(result, persistence.TriggerOutcome.TRANSPORT_FAILURE)
+        self.assertEqual(json.loads(lines[0])["error_category"], "protocol")
 
-        class _Fake429Response:
-            status_code = 429
+    async def test_500_is_transport_failure(self) -> None:
+        result, lines = await self._invoke(500)
+        self.assertEqual(result, persistence.TriggerOutcome.TRANSPORT_FAILURE)
+        self.assertEqual(json.loads(lines[0])["error_category"], "protocol")
 
-        class _FakeClient429:
-            async def post(self, url: str, **kwargs):  # noqa: ANN001
-                return _Fake429Response()
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *_):
-                pass
-
-        class _FakeHttpx429:
-            @staticmethod
-            def AsyncClient(**_kwargs):
-                return _FakeClient429()
-
-        original_writer = persistence._log._writer
-        persistence._log._writer = lambda line: lines.append(line)
-        try:
-            with patch.object(persistence, "httpx", _FakeHttpx429):
-                result = await persistence.trigger_scoring("session-id")
-        finally:
-            persistence._log._writer = original_writer
-
-        self.assertFalse(result)
-        parsed = json.loads(lines[0])
-        self.assertEqual(parsed["event"], "scoring_failed")
-        self.assertEqual(parsed["http_status"], 429)
-
-    async def test_scoring_returns_false_for_500(self) -> None:
-        set_correlation_id(None)
-        lines: list[str] = []
-
-        class _Fake500Response:
-            status_code = 500
-
-        class _FakeClient500:
-            async def post(self, url: str, **kwargs):  # noqa: ANN001
-                return _Fake500Response()
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *_):
-                pass
-
-        class _FakeHttpx500:
-            @staticmethod
-            def AsyncClient(**_kwargs):
-                return _FakeClient500()
-
-        original_writer = persistence._log._writer
-        persistence._log._writer = lambda line: lines.append(line)
-        try:
-            with patch.object(persistence, "httpx", _FakeHttpx500):
-                result = await persistence.trigger_scoring("session-id")
-        finally:
-            persistence._log._writer = original_writer
-
-        self.assertFalse(result)
-        parsed = json.loads(lines[0])
-        self.assertEqual(parsed["event"], "scoring_failed")
-        self.assertEqual(parsed["http_status"], 500)
-
-    async def test_scoring_returns_true_for_202(self) -> None:
-        set_correlation_id(None)
-        lines: list[str] = []
-
-        class _Fake202Response:
-            status_code = 202
-
-        class _FakeClient202:
-            async def post(self, url: str, **kwargs):  # noqa: ANN001
-                return _Fake202Response()
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *_):
-                pass
-
-        class _FakeHttpx202:
-            @staticmethod
-            def AsyncClient(**_kwargs):
-                return _FakeClient202()
-
-        original_writer = persistence._log._writer
-        persistence._log._writer = lambda line: lines.append(line)
-        try:
-            with patch.object(persistence, "httpx", _FakeHttpx202):
-                result = await persistence.trigger_scoring("session-id")
-        finally:
-            persistence._log._writer = original_writer
-
-        self.assertTrue(result)
+    async def test_202_is_success(self) -> None:
+        result, lines = await self._invoke(202)
+        self.assertEqual(result, persistence.TriggerOutcome.SUCCESS)
         parsed = json.loads(lines[0])
         self.assertEqual(parsed["event"], "scoring_trigger")
         self.assertEqual(parsed["http_status"], 202)
