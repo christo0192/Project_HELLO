@@ -33,9 +33,9 @@ jobs:
         run: npm ci && npm run typecheck && npm test
       - name: Audit API dependencies
         run: bash scripts/audit-deps.sh --dir app/api
-      - name: Install, lint, and build web
+      - name: Install, lint, test, and build web
         working-directory: app/web
-        run: npm ci && npm run lint && npm run build
+        run: npm ci && npm run lint && npm run test:typecheck && npm test && npm run build
       - name: Smoke-test CSP header
         run: node scripts/smoke-test-csp.mjs
       - name: Audit web dependencies

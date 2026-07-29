@@ -33,6 +33,7 @@ cat docs/HANDOVER.md
 | OCI managed-services Terraform foundation | Infrastructure | Code merged; apply-gated | PR #7 (`e8584b0`), merged 2026-07-29. Scaffold only; `terraform apply` has not been run. |
 | OCI region benchmark harness | Infrastructure | Code merged; not yet measured | PR #8 (`726ce56`), merged 2026-07-29. Harness and fail-closed runbook exist; no benchmark data has been collected. |
 | Supabase local baseline | MIG-03 / partial MIG-04 | Code merged; production apply pending | PR #9 (`4d103ea`), merged 2026-07-29. Unused Mumbai project exists but MIG-01/MIG-02 admin acceptance pending; this is MIG-03/partial MIG-04. Membership-gated RLS and local validation; MIG-01/MIG-02 administrative acceptance plus controlled production connection/application and MIG-13 cutover are future gates. |
+| Accessibility test foundation | TST-07 | Partial — automation scaffold complete (101 unit tests, strict axe matcher, fail-closed network trap, keyboard focus assertions); manual AT/contrast/reflow/browser gates and candidate consent/call flow remain external/dependent | Branch `test/tst-07-accessibility`. Runbook at `docs/runbooks/accessibility-testing.md`. CI gate: `npm run test:typecheck && npm test` added to quality.yml. Not a launch gate until all manual checks and candidate consent (GOV-08/Legal) are resolved. |
 
 CI on `main` at `4d103ea`: Quality, Secret scan, and Supabase checks all passed on 2026-07-29.
 
