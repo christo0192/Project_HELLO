@@ -22,26 +22,50 @@ Logging policy:
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 import re
 from datetime import datetime, timezone
-from typing import Optional
+from enum import Enum
+from typing import Any, Optional
 
-try:
-    import httpx
-except ImportError:  # pragma: no cover - scoring trigger disabled without optional dep
-    httpx = None
+from provider_resilience import (
+    BusinessError,
+    CircuitBreaker,
+    CircuitBreakerConfig,
+    CircuitState,
+    ProviderError,
+    RealClock,
+    call_with_breaker,
+    configure_scoring_transport,
+    get_scoring_transport,
+    parse_env_float,
+    parse_env_int,
+)
 
 try:
     from supabase import create_client
 except ImportError:  # pragma: no cover
     create_client = None
 
+from observability import StructuredLogger, get_correlation_id
+
 
 SCHEMA = os.getenv("SUPABASE_SCHEMA", "screening_v2")
 API_BASE = os.getenv("API_BASE", "http://localhost:8787")
-logger = logging.getLogger("voice-livekit.persistence")
+_log = StructuredLogger("persistence")
+
+
+class _LifecycleLogger:
+    """Compatibility shim that emits only structured, fixed-category events."""
+
+    def warning(self, *_args: Any, **_kwargs: Any) -> None:
+        _log.warn("db_error", error_category="lifecycle_error")
+
+    def info(self, *_args: Any, **_kwargs: Any) -> None:
+        _log.info("unknown_event")
+
+
+logger = _LifecycleLogger()
 _client = None
 
 _DRAIN_TIMEOUT_SEC = int(os.getenv("LIVEKIT_WORKER_DRAIN_SEC", "10"))
@@ -113,6 +137,67 @@ class LifecycleError(Exception):
     """Fixed internal error code for lifecycle operations — no dynamic values."""
 
 
+class ClaimResult:
+    """Result of an immutable provenance claim attempt."""
+
+    CLAIMED = "claimed"
+    ALREADY_MATCHING = "already_matching"
+    CONFLICT = "conflict"
+    MISSING = "missing"
+    ERROR = "error"
+
+
+class TriggerOutcome(Enum):
+    """Typed result of the breaker-protected scoring trigger."""
+
+    SUCCESS = "success"
+    BREAKER_OPEN = "breaker_open"
+    TRANSPORT_FAILURE = "transport_failure"
+    BUSINESS_ERROR = "business_error"
+
+
+_SAFE_LEGACY_REASON_CODES = frozenset({"error", "timeout", "disconnect", "unknown"})
+
+
+def _safe_reason_code(reason: str) -> str:
+    """Compatibility helper for closed reason-code validation tests."""
+    code = reason.strip().lower().replace(" ", "_")
+    return code if code in _SAFE_LEGACY_REASON_CODES else "unknown"
+
+
+_SCORING_BREAKER = CircuitBreaker(CircuitBreakerConfig(
+    failure_threshold=parse_env_int(
+        os.getenv("SCORING_BREAKER_THRESHOLD"), 3, min_val=1, max_val=100,
+    ),
+    cooldown_sec=parse_env_float(
+        os.getenv("SCORING_BREAKER_COOLDOWN_SEC"), 30.0, min_val=1.0, max_val=600.0,
+    ),
+    timeout_sec=parse_env_float(
+        os.getenv("SCORING_BREAKER_TIMEOUT_SEC"),
+        180.0,
+        min_val=1.0,
+        max_val=600.0,
+        allow_zero=False,
+    ),
+    clock=RealClock(),
+))
+
+configure_scoring_transport(
+    connect_timeout=parse_env_float(
+        os.getenv("SCORING_HTTP_CONNECT_TIMEOUT"), 10.0, min_val=1.0, max_val=120.0,
+    ),
+    read_timeout=parse_env_float(
+        os.getenv("SCORING_HTTP_READ_TIMEOUT"), 180.0, min_val=1.0, max_val=600.0,
+    ),
+    write_timeout=parse_env_float(
+        os.getenv("SCORING_HTTP_WRITE_TIMEOUT"), 30.0, min_val=1.0, max_val=120.0,
+    ),
+    pool_timeout=parse_env_float(
+        os.getenv("SCORING_HTTP_POOL_TIMEOUT"), 10.0, min_val=1.0, max_val=120.0,
+    ),
+)
+
+
 def _get_client():
     global _client
     if _client is not None:
@@ -133,6 +218,61 @@ def _get_client():
 def _table(name: str):
     client = _get_client()
     return client.schema(SCHEMA).table(name) if client else None
+
+
+async def set_session_provenance(
+    session_id: Optional[str],
+    provenance: dict[str, Any],
+) -> str:
+    """Atomically claim immutable model provenance without logging values or IDs."""
+    if not session_id:
+        _log.warn("db_error", error_category="provenance_session_missing")
+        return ClaimResult.MISSING
+
+    def claim():
+        table = _table("call_sessions")
+        if not table:
+            return None
+        return (
+            table.update({"provenance": provenance})
+            .eq("id", session_id)
+            .is_("provenance", "null")
+            .select("id")
+            .execute()
+        )
+
+    try:
+        result = await asyncio.to_thread(claim)
+    except Exception:  # noqa: BLE001
+        _log.warn("db_error", error_category="provenance_claim_failed")
+        return ClaimResult.ERROR
+    if result is None:
+        return ClaimResult.MISSING
+    rows = getattr(result, "data", None)
+    if isinstance(rows, list) and len(rows) == 1:
+        return ClaimResult.CLAIMED
+    if rows is not None and (not isinstance(rows, list) or len(rows) > 1):
+        return ClaimResult.ERROR
+
+    def read_existing():
+        table = _table("call_sessions")
+        if not table:
+            return None
+        return table.select("provenance").eq("id", session_id).single().execute()
+
+    try:
+        current = await asyncio.to_thread(read_existing)
+    except Exception:  # noqa: BLE001
+        _log.warn("db_error", error_category="provenance_read_failed")
+        return ClaimResult.MISSING
+    data = getattr(current, "data", None) if current is not None else None
+    existing = data.get("provenance") if isinstance(data, dict) else None
+    if existing is None:
+        return ClaimResult.ERROR
+    if existing == provenance:
+        return ClaimResult.ALREADY_MATCHING
+    _log.warn("db_error", error_category="provenance_conflict")
+    return ClaimResult.CONFLICT
 
 
 # ── Runtime validation helpers ───────────────────────────────────────
@@ -250,7 +390,12 @@ async def save_turn(
         if hasattr(result, "error") and result.error:
             raise LifecycleError(_ERR_WRITE_FAILED)
 
-    await asyncio.to_thread(run)
+    try:
+        await asyncio.to_thread(run)
+        _log.info("db_turn_saved", turn_index=turn_index, speaker=speaker)
+    except LifecycleError:
+        _log.warn("db_error", error_category="save_turn_failed")
+        raise
 
 
 async def activate_session(session_id: Optional[str]) -> LifecycleOutcome:
@@ -386,18 +531,49 @@ async def fail_session(
         return LifecycleOutcome(LifecycleOutcome.ERROR)
 
 
-async def trigger_scoring(session_id: Optional[str]) -> None:
+async def trigger_scoring(session_id: Optional[str]) -> TriggerOutcome:
+    """Trigger scoring through the shared typed circuit-breaker boundary."""
     if not session_id:
-        return
-    if httpx is None:
-        logger.warning("[livekit-score] scoring trigger disabled")
-        return
+        return TriggerOutcome.BUSINESS_ERROR
+    if _SCORING_BREAKER.state == CircuitState.OPEN:
+        _log.warn("scoring_failed", error_category="circuit_open")
+        return TriggerOutcome.BREAKER_OPEN
+
     try:
-        async with httpx.AsyncClient(timeout=180) as client:
-            response = await client.post(f"{API_BASE}/api/assess/{session_id}")
-            logger.info("[livekit-score] scoring triggered: HTTP %s", response.status_code)
+        transport = get_scoring_transport()
     except Exception:  # noqa: BLE001
-        logger.warning("[livekit-score] scoring trigger failed")
+        _log.warn("scoring_failed", error_category="connection")
+        return TriggerOutcome.TRANSPORT_FAILURE
+
+    headers: dict[str, str] = {}
+    correlation_id = get_correlation_id()
+    if correlation_id:
+        headers["X-Correlation-ID"] = correlation_id
+
+    try:
+        response = await call_with_breaker(
+            "POST",
+            f"{API_BASE}/api/assess/{session_id}",
+            breaker=_SCORING_BREAKER,
+            transport=transport,
+            headers=headers,
+            endpoint_hint="assess",
+            log_failures=False,
+        )
+        status = getattr(response, "status_code", None)
+        if isinstance(status, int):
+            _log.info("scoring_trigger", http_status=status)
+        else:
+            _log.info("scoring_trigger")
+        return TriggerOutcome.SUCCESS
+    except ProviderError as exc:
+        _log.warn("scoring_failed", error_category=exc.category)
+        if exc.category == "circuit_open":
+            return TriggerOutcome.BREAKER_OPEN
+        return TriggerOutcome.TRANSPORT_FAILURE
+    except BusinessError:
+        _log.warn("scoring_failed", error_category="business_error")
+        return TriggerOutcome.BUSINESS_ERROR
 
 
 # ── Shutdown drain helper ─────────────────────────────────────────────

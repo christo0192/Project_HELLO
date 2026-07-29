@@ -146,6 +146,8 @@ export interface SessionInsertFields {
   role_id: string | null;
   mode: 'browser' | 'live' | 'simulation';
   provider?: string;
+  /** Validated model provenance for simulation sessions; omitted for LiveKit until worker claim. */
+  provenance?: object;
 }
 
 export interface SessionRow {
@@ -201,6 +203,9 @@ export async function createSession(
   };
   if (fields.provider !== undefined) {
     payload.provider = fields.provider;
+  }
+  if (fields.provenance !== undefined) {
+    payload.provenance = fields.provenance;
   }
 
   const { data, error } = await supabase

@@ -2,6 +2,8 @@
 
 **Last updated:** 2026-07-29
 
+**Current branch:** `feat/rel-07-08-session-lifecycle` (merged with `main` through PR #18; PR #19 not yet merged)
+
 **Repository:** `https://github.com/christo0192/Project_HELLO`
 
 **Production status:** Pre-production; do not use real candidate data
@@ -12,7 +14,7 @@
 
 ## Branch: feat/rel-07-08-session-lifecycle
 
-Base: `fd58f81` (FND-02/FND-03 non-secret owner-evidence pack). Not yet merged to `main`.
+Integrated base: `e5c1051` (PR #18 provider resilience). PR #19 is not yet merged to `main`.
 
 ## Resume Here
 
@@ -22,6 +24,17 @@ git checkout feat/rel-07-08-session-lifecycle
 git log --oneline --decorate -10
 cat docs/HANDOVER.md
 ```
+
+## Defensible Metrics
+
+| Metric | Value |
+|--------|-------|
+| Completed launch gates | 0/17 — all FND-02, FND-03, and REL acceptance criteria remain unverified at production level |
+| Implementation coverage | REL-07/REL-08 code and aggregate tests exist on branch; strict acceptance is separate from implementation coverage |
+| Integrated base | `e5c1051` (PR #18) |
+| Branch state | In progress; not merged |
+
+> **Note:** The 25% completion figure sometimes seen in earlier summaries is NOT claimed. Zero launch gates are confirmed complete. Implementation coverage and acceptance verification are distinct gates.
 
 ## Completed Work
 
@@ -36,13 +49,16 @@ cat docs/HANDOVER.md
 | CORS + CSP foundation | SEC-07 | Code complete; deployment-gated | PR #6, merged 2026-07-29. Automated API CORS tests + built-HTML CSP smoke pass locally. CSP is report-only. Real-browser denial test, clean CSP report window, and Observatory B+ require deployment. |
 | OCI managed-services Terraform foundation | Infrastructure | Code merged; apply-gated | PR #7 (`e8584b0`), merged 2026-07-29. Scaffold only; `terraform apply` has not been run. |
 | OCI region benchmark harness | Infrastructure | Code merged; not yet measured | PR #8 (`726ce56`), merged 2026-07-29. Harness and fail-closed runbook exist; no benchmark data has been collected. |
+| LLM-06 model provenance | LLM-06 | Code merged; production migration/deployment acceptance pending | PR #17 (`8439bda`), merged 2026-07-29. Requested-model provenance covers API simulation/scoring and LiveKit worker claims with SQL validation and immutability. Hosted migration application and deployed provider evidence remain pending. |
 | Supabase local baseline | MIG-03 / partial MIG-04 | Code merged; production apply pending | PR #9 (`4d103ea`), merged 2026-07-29. Unused Mumbai project exists but MIG-01/MIG-02 admin acceptance pending; this is MIG-03/partial MIG-04. Membership-gated RLS and local validation; MIG-01/MIG-02 administrative acceptance plus controlled production connection/application and MIG-13 cutover are future gates. |
-| Session lifecycle (REL-07) | Session lifecycle | Code complete on `feat/rel-07-08-session-lifecycle`; **not merged, not deployed** | API 253 tests pass; Python 71 tests pass; Supabase 38 policy/schema tests pass. State machine with required reasons, stable error codes, CAS semantics, graceful shutdown. |
-| Graceful shutdown (REL-08) | Graceful shutdown | Code complete on `feat/rel-07-08-session-lifecycle`; **not merged, not deployed** | Shutdown regression tests cover in-flight race, sync close throw, socket cleanup, duplicate signals, and forced drain timeout. |
-| Migration SQL (0006) | Migration | Code complete on feat/rel-07-08-session-lifecycle | Default `created`, `legacy_unknown` backfill, per-state conditional constraint, transition triggers. |
+| Synthetic demo seed foundation | GOV-06 | Code merged; production/demo acceptance pending | PR #14 (`7cbc962`), merged 2026-07-29. Deterministic local seed, validators, SQL assertions, runbook, and CI wiring are present; artifact replacement and owner evidence remain pending. |
+| OBS-01 / OBS-02 structured logging + correlation | OBS-01, OBS-02 | Code merged; deployment acceptance pending | PR #15 (`de133c6`), merged 2026-07-29. Structured logging and UUID v4 correlation are present; managed export, dashboards, alarms, and deployed proof remain pending. |
+| Accessibility test foundation | TST-07 | Automation scaffold merged; manual/dependent acceptance pending | PR #16 (`db20b4a`), merged 2026-07-29. Automated axe/network/keyboard checks are present; manual AT/browser and candidate-flow gates remain pending. |
+| Provider resilience foundation | REL-05, REL-06 | Code merged; deployed drills pending | PR #18 (`e5c1051`), merged 2026-07-29. Circuit breakers, hardened Claude runner, explicit scoring HTTP timeouts/lazy transport, typed outcomes, and correlation propagation are present. |
+| Session lifecycle | REL-07 | Code complete on `feat/rel-07-08-session-lifecycle`; **not merged, not deployed** | Required terminal reasons, stable error codes, compare-and-set transitions, fail-closed worker activation, write draining, and migration `0006` are implemented. |
+| Graceful shutdown | REL-08 | Code complete on `feat/rel-07-08-session-lifecycle`; **not merged, not deployed** | Shutdown tests cover in-flight races, synchronous close failures, socket cleanup, duplicate signals, and forced drain timeout. |
 
-CI on `main` at `4d103ea`: Quality, Secret scan, and Supabase checks all passed on 2026-07-29.
-Local validation on `feat/rel-07-08-session-lifecycle`: API `npm test` → 253 pass; Python `python3 -m unittest discover` → 71 pass; `bash scripts/supabase-test.sh` → 38 policy/schema tests plus PostgREST anon denial pass.
+PRs #14–#18 were merged into `main` on 2026-07-29 with required checks passing. Aggregate `main` verification after PR #19 remains pending.
 
 ## Phase-0 Foundation Status (FND-01, FND-02, FND-03)
 
@@ -53,25 +69,56 @@ external-blockers summary.
 | Task | Code / merge state | Acceptance state |
 |---|---|---|
 | FND-01 | Repository controls merged | **Blocked**: hosted enforcement blocked — private-plan GitHub API returned 403 |
-| FND-02 | Scanner controls merged | **Blocked**: owner rotation evidence pending for six provider systems; non-secret revocation evidence required |
-| FND-03 | Containment controls merged | **Blocked**: sanitization, synthetic, and restricted-storage disposition pending |
+| FND-02 | Scanner controls merged | **Blocked**: owner rotation evidence pending for eight provider systems; non-secret revocation evidence required |
+| FND-03 | Containment controls and GOV-06 local synthetic seed tooling merged | **Blocked**: authentic sanitization, screenshot/demo replacement, and restricted-storage disposition evidence pending |
+
+## OBS-01/OBS-02 Status (code merged in PR #15; deployed acceptance pending)
+
+| Item | Status | Notes |
+|------|--------|-------|
+| Structured logging/correlation | Code merged | JS/Python redaction and UUID v4 correlation scaffolding are present |
+| Managed export, dashboards, alarms | **Pending** | No production platform or deployed proof |
+| Queue/provider tracing | **Pending** | ADR-0004 queue not yet implemented |
+| Launch gates (0/17) | **0 complete** | Implementation does not equal production acceptance |
 
 ## Current Verification
 
 ```bash
+# API (Node)
 cd app/api && npm ci && npm run typecheck && npm test
-cd ../web && npm ci && npm run lint && npm run build
+# Provider-resilience specific (deterministic, no real CLI)
+npx vitest run src/__tests__/provider-resilience.test.ts
+
+# Web
+cd ../web && npm ci && npm run test:typecheck && npm test && npm run lint && npm run build
 cd ../..
+
+# Contracts, ADRs, audits
 node scripts/check-env-contract.mjs
 node scripts/check-env-contract.test.mjs
 node scripts/check-adrs.mjs
+node scripts/check-synthetic-seed.mjs app/supabase/seed.sql
+node scripts/check-synthetic-seed.test.mjs
+bash scripts/supabase-test.sh
+python3 -m py_compile app/voice-livekit/agent.py app/voice-livekit/persistence.py app/voice-livekit/observability.py app/voice-livekit/provenance.py app/voice-livekit/provider_resilience.py
+(cd app/voice-livekit && python3 -m unittest discover -s tests -p 'test_*.py' -v)
 node scripts/audit-seeded-vuln.test.mjs
 bash scripts/audit-deps.sh --dir app/api
 bash scripts/audit-deps.sh --dir app/web
 bash scripts/sbom.sh
+
+# Security
 ./scripts/scan-secrets.sh --committable
 git diff --check
 ```
+
+### Current Test Counts
+| Suite | Count | Notes |
+|---|---|---|
+| API (Node) | **664 tests** | Includes lifecycle/shutdown, provider resilience, validation, observability, provenance, and CORS/CSP suites; deterministic fakes avoid real CLI/provider calls. |
+| LiveKit worker (Python) | **289 tests** | Combined lifecycle, resilience, observability, provenance, correlation, and persistence coverage using `unittest` and fake transports. |
+| Web | **101 tests** | Accessibility scaffold plus typecheck, lint, and production build. |
+| Supabase | **69 policy/provenance/lifecycle + 62 synthetic SQL assertions** | Local ephemeral stack only; includes anonymous denial, legal transition fixtures, and idempotent seed replay. |
 
 ## Remaining Production Work
 

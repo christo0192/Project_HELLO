@@ -434,7 +434,7 @@ begin
     insert into screening_v2.call_sessions
       (candidate_id, mode, status, terminal_reason)
     values (v_candidate_id, 'simulation', 'completed', 'room_create_error');
-  exception when check_violation then
+  exception when check_violation or raise_exception then
     rejected_room_in_completed := true;
   end;
 
@@ -443,7 +443,7 @@ begin
     insert into screening_v2.call_sessions
       (candidate_id, mode, status, terminal_reason)
     values (v_candidate_id, 'simulation', 'cancelled', 'worker_crash');
-  exception when check_violation then
+  exception when check_violation or raise_exception then
     rejected_worker_in_cancelled := true;
   end;
 
@@ -452,7 +452,7 @@ begin
     insert into screening_v2.call_sessions
       (candidate_id, mode, status, terminal_reason)
     values (v_candidate_id, 'simulation', 'in_progress', 'worker_crash');
-  exception when check_violation then
+  exception when check_violation or raise_exception then
     rejected_reason_on_nonterminal := true;
   end;
 
@@ -461,7 +461,7 @@ begin
     insert into screening_v2.call_sessions
       (candidate_id, mode, status, terminal_reason)
     values (v_candidate_id, 'simulation', 'completed', null);
-  exception when check_violation then
+  exception when check_violation or raise_exception then
     rejected_null_for_completed := true;
   end;
 
@@ -520,7 +520,7 @@ declare
   rejected boolean := false;
 begin
   insert into screening_v2.call_sessions (candidate_id, mode, status)
-  select c.id, 'simulation', 'in_progress'
+  select c.id, 'simulation', 'created'
     from screening_v2.candidates c limit 1
   returning id into v_id;
 
@@ -533,6 +533,10 @@ begin
     );
     return;
   end if;
+
+  update screening_v2.call_sessions
+     set status = 'in_progress'
+   where id = v_id;
 
   begin
     update screening_v2.call_sessions
@@ -624,11 +628,18 @@ begin
     return;
   end if;
 
-  -- Create a row and move it to completed (terminal) with required reason.
+  -- Create a row and move it through the legal lifecycle into completed.
   insert into screening_v2.call_sessions
-    (candidate_id, mode, status, terminal_reason)
-  values (v_id, 'simulation', 'completed', 'assessment_done')
+    (candidate_id, mode, status)
+  values (v_id, 'simulation', 'created')
   returning id into v_id;
+
+  update screening_v2.call_sessions
+     set status = 'in_progress'
+   where id = v_id;
+  update screening_v2.call_sessions
+     set status = 'completed', terminal_reason = 'assessment_done'
+   where id = v_id;
 
   -- Attempt illegal status change on terminal row.
   begin
@@ -683,6 +694,355 @@ delete from screening_v2.roles
  where id = '20000000-0000-0000-0000-000000000001';
 delete from auth.users
  where id = '10000000-0000-0000-0000-000000000001';
+
+-- ── LLM-06 provenance validation tests ─────────────────────────────────
+
+-- Helper: canonical valid current provenance
+create or replace function _policy_tests.valid_provenance_json()
+returns jsonb
+language sql immutable
+as $$
+select '{"schema_version":1,"provider":"anthropic","requestedModel":"claude-haiku-4-5-20251001","workload":"screening","prompt_template_version":"2026-07-28.1","timestamp":"2026-07-28T12:00:00.000Z"}'::jsonb
+$$;
+
+-- Positive: valid current provenance
+select _policy_tests.assert(
+  'LLM-06: valid current provenance accepted',
+  screening_v2.valid_model_provenance(_policy_tests.valid_provenance_json()),
+  'current shape must be accepted'
+);
+
+-- Positive: valid with inference params
+select _policy_tests.assert(
+  'LLM-06: valid provenance with inference_params accepted',
+  screening_v2.valid_model_provenance(
+    '{"schema_version":1,"provider":"anthropic","requestedModel":"claude-sonnet-4-20250514","workload":"scoring","prompt_template_version":"2026-07-28.1","timestamp":"2026-07-28T12:00:00Z","inference_params":{"temperature":0.7,"max_tokens":4096}}'::jsonb
+  ),
+  'inference_params should be accepted'
+);
+
+-- Positive: valid ms timestamp
+select _policy_tests.assert(
+  'LLM-06: valid ms timestamp accepted',
+  screening_v2.valid_model_provenance(
+    '{"schema_version":1,"provider":"anthropic","requestedModel":"claude","workload":"screening","prompt_template_version":"v1","timestamp":"2026-07-28T12:00:00.000Z"}'::jsonb
+  ),
+  'ms timestamp should be accepted'
+);
+
+-- Positive: exact legacy sentinel
+select _policy_tests.assert(
+  'LLM-06: exact legacy sentinel accepted',
+  screening_v2.valid_model_provenance(
+    '{"schema_version":0,"provider":"legacy","requestedModel":"unknown","workload":"unknown","prompt_template_version":"legacy","timestamp":"1970-01-01T00:00:00Z"}'::jsonb
+  ),
+  'exact legacy sentinel must be accepted'
+);
+
+-- Positive: scoring workload
+select _policy_tests.assert(
+  'LLM-06: scoring workload accepted',
+  screening_v2.valid_model_provenance(
+    '{"schema_version":1,"provider":"anthropic","requestedModel":"claude-sonnet","workload":"scoring","prompt_template_version":"v1","timestamp":"2026-07-28T12:00:00Z"}'::jsonb
+  ),
+  'scoring workload must be accepted'
+);
+
+-- Negative: null
+select _policy_tests.assert(
+  'LLM-06: null rejected',
+  not screening_v2.valid_model_provenance(null::jsonb),
+  'null input must be rejected'
+);
+
+-- Negative: array
+select _policy_tests.assert(
+  'LLM-06: array rejected',
+  not screening_v2.valid_model_provenance('[]'::jsonb),
+  'array must be rejected'
+);
+
+-- Negative: string
+select _policy_tests.assert(
+  'LLM-06: string rejected',
+  not screening_v2.valid_model_provenance('"hello"'::jsonb),
+  'string must be rejected'
+);
+
+-- Negative: missing schema_version
+select _policy_tests.assert(
+  'LLM-06: missing schema_version rejected',
+  not screening_v2.valid_model_provenance(
+    '{"provider":"anthropic","requestedModel":"claude","workload":"screening","prompt_template_version":"v1","timestamp":"2026-07-28T12:00:00Z"}'::jsonb
+  ),
+  'missing schema_version must be rejected'
+);
+
+-- Negative: missing provider
+select _policy_tests.assert(
+  'LLM-06: missing provider rejected',
+  not screening_v2.valid_model_provenance(
+    '{"schema_version":1,"requestedModel":"claude","workload":"screening","prompt_template_version":"v1","timestamp":"2026-07-28T12:00:00Z"}'::jsonb
+  ),
+  'missing provider must be rejected'
+);
+
+-- Negative: wrong provider
+select _policy_tests.assert(
+  'LLM-06: wrong provider (openai) rejected',
+  not screening_v2.valid_model_provenance(
+    '{"schema_version":1,"provider":"openai","requestedModel":"claude","workload":"screening","prompt_template_version":"v1","timestamp":"2026-07-28T12:00:00Z"}'::jsonb
+  ),
+  'non-anthropic provider must be rejected'
+);
+
+-- Negative: wrong workload
+select _policy_tests.assert(
+  'LLM-06: wrong workload (deployment) rejected',
+  not screening_v2.valid_model_provenance(
+    '{"schema_version":1,"provider":"anthropic","requestedModel":"claude","workload":"deployment","prompt_template_version":"v1","timestamp":"2026-07-28T12:00:00Z"}'::jsonb
+  ),
+  'non-screening/scoring workload must be rejected'
+);
+
+-- Negative: wrong schema_version
+select _policy_tests.assert(
+  'LLM-06: schema_version 2 rejected',
+  not screening_v2.valid_model_provenance(
+    '{"schema_version":2,"provider":"anthropic","requestedModel":"claude","workload":"screening","prompt_template_version":"v1","timestamp":"2026-07-28T12:00:00Z"}'::jsonb
+  ),
+  'schema_version != 1 must be rejected'
+);
+
+-- Negative: extra top-level key
+select _policy_tests.assert(
+  'LLM-06: extra key rejected',
+  not screening_v2.valid_model_provenance(
+    '{"schema_version":1,"provider":"anthropic","requestedModel":"claude","workload":"screening","prompt_template_version":"v1","timestamp":"2026-07-28T12:00:00Z","extra":"bad"}'::jsonb
+  ),
+  'extra top-level keys must be rejected'
+);
+
+-- Negative: extra key on legacy sentinel
+select _policy_tests.assert(
+  'LLM-06: extra key on legacy rejected',
+  not screening_v2.valid_model_provenance(
+    '{"schema_version":0,"provider":"legacy","requestedModel":"unknown","workload":"unknown","prompt_template_version":"legacy","timestamp":"1970-01-01T00:00:00Z","extra":true}'::jsonb
+  ),
+  'legacy sentinel with extra keys must be rejected'
+);
+
+-- Negative: non-UTC timestamp
+select _policy_tests.assert(
+  'LLM-06: non-UTC timestamp rejected',
+  not screening_v2.valid_model_provenance(
+    '{"schema_version":1,"provider":"anthropic","requestedModel":"claude","workload":"screening","prompt_template_version":"v1","timestamp":"2026-07-28T12:00:00+00:00"}'::jsonb
+  ),
+  'timezone-offset timestamps must be rejected'
+);
+
+-- Negative: impossible date
+select _policy_tests.assert(
+  'LLM-06: impossible date (month 13) rejected',
+  not screening_v2.valid_model_provenance(
+    '{"schema_version":1,"provider":"anthropic","requestedModel":"claude","workload":"screening","prompt_template_version":"v1","timestamp":"2026-13-28T12:00:00Z"}'::jsonb
+  ),
+  'impossible month must be rejected'
+);
+
+-- Negative: empty requestedModel
+select _policy_tests.assert(
+  'LLM-06: empty requestedModel rejected',
+  not screening_v2.valid_model_provenance(
+    '{"schema_version":1,"provider":"anthropic","requestedModel":"","workload":"screening","prompt_template_version":"v1","timestamp":"2026-07-28T12:00:00Z"}'::jsonb
+  ),
+  'empty model string must be rejected'
+);
+
+-- Negative: inference_params as array
+select _policy_tests.assert(
+  'LLM-06: inference_params array rejected',
+  not screening_v2.valid_model_provenance(
+    '{"schema_version":1,"provider":"anthropic","requestedModel":"claude","workload":"screening","prompt_template_version":"v1","timestamp":"2026-07-28T12:00:00Z","inference_params":["bad"]}'::jsonb
+  ),
+  'array inference_params must be rejected'
+);
+
+-- Negative: unknown inference param key
+select _policy_tests.assert(
+  'LLM-06: unknown inference param key rejected',
+  not screening_v2.valid_model_provenance(
+    '{"schema_version":1,"provider":"anthropic","requestedModel":"claude","workload":"screening","prompt_template_version":"v1","timestamp":"2026-07-28T12:00:00Z","inference_params":{"temperature":0.5,"bad_key":1}}'::jsonb
+  ),
+  'unknown inference keys must be rejected'
+);
+
+-- Negative: temperature out of range
+select _policy_tests.assert(
+  'LLM-06: temperature > 2 rejected',
+  not screening_v2.valid_model_provenance(
+    '{"schema_version":1,"provider":"anthropic","requestedModel":"claude","workload":"screening","prompt_template_version":"v1","timestamp":"2026-07-28T12:00:00Z","inference_params":{"temperature":3}}'::jsonb
+  ),
+  'temperature > 2 must be rejected'
+);
+
+-- Negative: max_tokens out of range
+select _policy_tests.assert(
+  'LLM-06: max_tokens > 100000 rejected',
+  not screening_v2.valid_model_provenance(
+    '{"schema_version":1,"provider":"anthropic","requestedModel":"claude","workload":"screening","prompt_template_version":"v1","timestamp":"2026-07-28T12:00:00Z","inference_params":{"max_tokens":100001}}'::jsonb
+  ),
+  'max_tokens > 100000 must be rejected'
+);
+
+-- Negative: oversized payload. JSONB normalizes whitespace, so construct an
+-- actually oversized string field rather than appending spaces to JSON text.
+select _policy_tests.assert(
+  'LLM-06: oversized payload rejected',
+  not screening_v2.valid_model_provenance(
+    jsonb_build_object(
+      'schema_version', 1,
+      'provider', 'anthropic',
+      'requestedModel', repeat('a', 2049),
+      'workload', 'screening',
+      'prompt_template_version', 'v1',
+      'timestamp', '2026-07-28T12:00:00Z'
+    )
+  ),
+  'payload > 2048 bytes must be rejected'
+);
+
+-- ── LLM-06 migration order tests ───────────────────────────────────────
+
+select _policy_tests.assert(
+  'LLM-06: chk_call_sessions_provenance_type allows null',
+  position('provenance IS NULL' in (
+    select pg_get_constraintdef(oid)
+      from pg_constraint
+     where conname = 'chk_call_sessions_provenance_type'
+  )) > 0,
+  'call_sessions provenance CHECK must allow null'
+);
+
+select _policy_tests.assert(
+  'LLM-06: chk_assessments_provenance_not_null exists',
+  exists (
+    select 1 from pg_constraint
+     where conname = 'chk_assessments_provenance_not_null'
+       and contype = 'c'
+  ),
+  'assessments must have NOT NULL provenance constraint'
+);
+
+-- ── LLM-06 immutability trigger tests ─────────────────────────────────
+
+drop table if exists _policy_tests._test_provenance;
+create table _policy_tests._test_provenance (
+  id int primary key,
+  provenance jsonb
+);
+
+-- Apply the real trigger function on an isolated test-schema table.
+drop trigger if exists trg_test_prevent_provenance_change on _policy_tests._test_provenance;
+create trigger trg_test_prevent_provenance_change
+  before update of provenance on _policy_tests._test_provenance
+  for each row
+  execute function screening_v2.prevent_provenance_change();
+
+insert into _policy_tests._test_provenance (id, provenance) values (1, _policy_tests.valid_provenance_json());
+
+-- Test same-value no-op (should succeed)
+do $$
+begin
+  update _policy_tests._test_provenance set provenance = provenance where id = 1;
+  insert into _policy_tests.results(test, passed, detail)
+  values ('LLM-06: same-value no-op update', true, 'no-op update did not raise');
+exception when others then
+  insert into _policy_tests.results(test, passed, detail)
+  values ('LLM-06: same-value no-op update', false, 'no-op unexpectedly raised: ' || sqlerrm);
+end $$;
+
+-- Test non-null→different (must raise)
+do $$
+begin
+  update _policy_tests._test_provenance set provenance = '{"schema_version":1,"provider":"anthropic","requestedModel":"different","workload":"screening","prompt_template_version":"v1","timestamp":"2026-07-28T12:00:00Z"}'::jsonb where id = 1;
+  insert into _policy_tests.results(test, passed, detail)
+  values ('LLM-06: non-null→different rejected', false, 'should have raised exception');
+exception when others then
+  if sqlerrm like '%provenance: immutable once set%' then
+    insert into _policy_tests.results(test, passed, detail)
+    values ('LLM-06: non-null→different rejected', true, 'correctly raised: ' || sqlerrm);
+  else
+    insert into _policy_tests.results(test, passed, detail)
+    values ('LLM-06: non-null→different rejected', false, 'wrong exception: ' || sqlerrm);
+  end if;
+end $$;
+
+-- Test null→validated (should succeed)
+insert into _policy_tests._test_provenance (id, provenance) values (2, null);
+do $$
+begin
+  update _policy_tests._test_provenance set provenance = _policy_tests.valid_provenance_json() where id = 2;
+  insert into _policy_tests.results(test, passed, detail)
+  values ('LLM-06: null→validated allowed', true, 'null transition succeeded');
+exception when others then
+  insert into _policy_tests.results(test, passed, detail)
+  values ('LLM-06: null→validated allowed', false, 'null transition raised: ' || sqlerrm);
+end $$;
+
+-- Test null→null (should succeed)
+insert into _policy_tests._test_provenance (id, provenance) values (3, null);
+do $$
+begin
+  update _policy_tests._test_provenance set provenance = null where id = 3;
+  insert into _policy_tests.results(test, passed, detail)
+  values ('LLM-06: null→null allowed', true, 'null→null succeeded');
+exception when others then
+  insert into _policy_tests.results(test, passed, detail)
+  values ('LLM-06: null→null allowed', false, 'null→null raised: ' || sqlerrm);
+end $$;
+
+-- ── LLM-06 function security ──────────────────────────────────────────
+
+select _policy_tests.assert(
+  'LLM-06: valid_model_provenance not executable by anon/public',
+  not exists (
+    select 1 from pg_proc p
+     join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname = 'valid_model_provenance'
+       and has_function_privilege('public', p.oid, 'EXECUTE')
+  )
+  and not exists (
+    select 1 from pg_proc p
+     join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname = 'valid_model_provenance'
+       and has_function_privilege('anon', p.oid, 'EXECUTE')
+  ),
+  'only service_role should execute valid_model_provenance'
+);
+
+select _policy_tests.assert(
+  'LLM-06: prevent_provenance_change not executable by anon/public',
+  not exists (
+    select 1 from pg_proc p
+     join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname = 'prevent_provenance_change'
+       and has_function_privilege('public', p.oid, 'EXECUTE')
+  )
+  and not exists (
+    select 1 from pg_proc p
+     join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname = 'prevent_provenance_change'
+       and has_function_privilege('anon', p.oid, 'EXECUTE')
+  ),
+  'only service_role should execute prevent_provenance_change'
+);
+
+-- ── Verdict ────────────────────────────────────────────────────────────
 
 select test, case when passed then 'PASS' else 'FAIL' end as result, detail
   from _policy_tests.results order by id;

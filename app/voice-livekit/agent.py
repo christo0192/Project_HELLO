@@ -9,9 +9,6 @@ import os
 import time
 import asyncio
 from typing import Any
-import time
-import asyncio
-from typing import Any
 
 from dotenv import load_dotenv
 
@@ -20,10 +17,14 @@ from livekit.plugins import anthropic, sarvam, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 import persistence
-from persistence import LifecycleOutcome, LifecycleError
+from observability import reset_correlation_id, set_correlation_id
+from persistence import LifecycleError
 from prompting import build_prompt_context, collect_prompt_metadata
+from provenance import screening_provenance
 
 load_dotenv()
+
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 
 
 def _float_env(name: str, default: float) -> float:
@@ -127,6 +128,26 @@ async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect()
     meta = collect_prompt_metadata(ctx)
     session_id = meta.get("session_id") or meta.get("sessionId")
+    cid_token = set_correlation_id(meta.get("correlation_id"))
+    try:
+        await _run_session(ctx, started_at, session_id)
+    finally:
+        reset_correlation_id(cid_token)
+
+
+async def _run_session(ctx: JobContext, started_at: float, session_id: Any) -> None:
+    # LLM-06: claim provenance before any provider construction. The same
+    # configured model is then supplied to Anthropic below.
+    claim = await persistence.set_session_provenance(
+        session_id,
+        screening_provenance(ANTHROPIC_MODEL),
+    )
+    if claim not in {
+        persistence.ClaimResult.CLAIMED,
+        persistence.ClaimResult.ALREADY_MATCHING,
+    }:
+        return
+
     system_text, opening_text = build_prompt_context(ctx)
 
     # REL-07: separate write-task set from the finalizer.
@@ -215,7 +236,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 model=os.getenv("SARVAM_TTS_MODEL", "bulbul:v3"),
                 speaker=os.getenv("SARVAM_TTS_VOICE", "shubh"),
             ),
-            llm=anthropic.LLM(model=os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")),
+            llm=anthropic.LLM(model=ANTHROPIC_MODEL),
             vad=silero.VAD.load(
                 activation_threshold=_float_env("LIVEKIT_VAD_ACTIVATION_THRESHOLD", 0.7),
                 min_speech_duration=_float_env("LIVEKIT_VAD_MIN_SPEECH_DURATION", 0.3),

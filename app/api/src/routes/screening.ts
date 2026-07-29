@@ -18,6 +18,7 @@ import {
   screeningSessionIdParamSchema,
 } from '../schemas/screening.js';
 import { createSession, transitionSession, ERR_INSERT_FAILED, ERR_DB_FAILED } from '../lib/session-lifecycle.js';
+import { screeningProvenance } from '../lib/model-provenance.js';
 
 export const screeningRouter = Router();
 
@@ -102,11 +103,13 @@ screeningRouter.post('/start', validateBody(startScreeningSchema), async (req, r
 
     const { ctxBase, roleId } = await loadContext(candidateId);
 
-    // REL-07: create in `created` state.
+    // REL-07: create in `created` state. LLM-06 records the configured
+    // design-intent model for this API-owned simulation inference path.
     const { data: session, error: insertErr } = await createSession({
       candidate_id: candidateId,
       role_id: roleId,
       mode: 'simulation',
+      provenance: screeningProvenance(env.claudeModel),
     });
     if (insertErr || !session) return next(insertErr ?? new Error(ERR_INSERT_FAILED));
 

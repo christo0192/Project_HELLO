@@ -13,6 +13,9 @@
 
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
+import { createLogger } from '../lib/logger.js';
+
+const cspLogger = createLogger('csp');
 
 export const cspReportRouter = Router();
 
@@ -96,15 +99,13 @@ function sanitizeDirective(raw: string): string {
 }
 
 function emitViolationLog(shape: string, fields: Record<string, string>) {
-  // Structured JSON via console.warn — the established project
-  // pattern for operational events that are not debug noise.
-  const event = {
-    event: 'csp_violation',
+  cspLogger.warn('csp_violation', {
     shape,
-    ...fields,
-    timestamp: new Date().toISOString(),
-  };
-  console.warn(JSON.stringify(event));
+    document_origin: fields['document_origin'] ?? '',
+    violated_directive: fields['violated_directive'] ?? '',
+    effective_directive: fields['effective_directive'] ?? '',
+    blocked_origin: fields['blocked_origin'] ?? '',
+  });
 }
 
 // ── Route ─────────────────────────────────────────────────────────────

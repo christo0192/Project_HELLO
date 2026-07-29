@@ -17,6 +17,7 @@ import {
 } from '../schemas/livekit.js';
 import type { ScreeningQuestion } from '../lib/types.js';
 import { createSession, transitionSession } from '../lib/session-lifecycle.js';
+import { getCorrelationId } from '../lib/correlation.js';
 
 export const livekitRouter = Router();
 
@@ -96,6 +97,8 @@ livekitRouter.post('/start', validateBody(livekitStartSchema), async (req, res, 
       ...metadata,
       session_id: session.id,
       room_name: roomName,
+      // Opaque UUID v4 only; worker validates before accepting it.
+      correlation_id: getCorrelationId() ?? undefined,
     });
     const rooms = new RoomServiceClient(env.livekitUrl, env.livekitApiKey, env.livekitApiSecret);
 

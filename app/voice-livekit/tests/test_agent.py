@@ -123,6 +123,10 @@ _orig_prompting = sys.modules.get("prompting")
 _mock_persistence = types.ModuleType("persistence")
 _mock_persistence.LifecycleOutcome = MagicMock()
 _mock_persistence.LifecycleError = type("LifecycleError", (Exception,), {})
+_mock_persistence.ClaimResult = types.SimpleNamespace(
+    CLAIMED="claimed", ALREADY_MATCHING="already_matching"
+)
+_mock_persistence.set_session_provenance = AsyncMock(return_value="claimed")
 sys.modules["persistence"] = _mock_persistence
 
 # Mock prompting module
@@ -240,6 +244,7 @@ class TestEntrypointActivationFailClosed(unittest.TestCase):
 
     def setUp(self):
         # Reset persistence mock
+        _mock_persistence.set_session_provenance = AsyncMock(return_value="claimed")
         _mock_persistence.activate_session = AsyncMock()
         _mock_persistence.save_turn = AsyncMock()
         _mock_persistence.drain_pending_writes = AsyncMock(return_value=True)
@@ -258,6 +263,18 @@ class TestEntrypointActivationFailClosed(unittest.TestCase):
         ctx = agent_mod.JobContext()
         await agent_mod.entrypoint(ctx)
         return ctx
+
+    def test_provenance_conflict_aborts_before_activation(self):
+        """A mismatched immutable model claim must fail closed before activation."""
+        async def _test():
+            _mock_persistence.set_session_provenance.return_value = "conflict"
+            ctx = agent_mod.JobContext()
+            await agent_mod.entrypoint(ctx)
+            return ctx
+
+        ctx = asyncio.run(_test())
+        self.assertTrue(ctx._connected)
+        _mock_persistence.activate_session.assert_not_awaited()
 
     def test_activation_conflict_aborts(self):
         """CONFLICT → entrypoint returns without constructing providers."""
@@ -289,6 +306,7 @@ class TestFinalizerTracking(unittest.TestCase):
     """nonlocal _finalizer_task is tracked and awaited."""
 
     def setUp(self):
+        _mock_persistence.set_session_provenance = AsyncMock(return_value="claimed")
         _mock_persistence.activate_session = AsyncMock()
         _mock_persistence.save_turn = AsyncMock()
         _mock_persistence.drain_pending_writes = AsyncMock(return_value=True)

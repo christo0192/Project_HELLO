@@ -6,6 +6,10 @@ const _contractVisibleEnvReads = [
   process.env.CLAUDE_TIMEOUT_MS,
   process.env.PORT,
   process.env.SHUTDOWN_GRACE_MS,
+  process.env.BREAKER_FAILURE_THRESHOLD,
+  process.env.BREAKER_COOLDOWN_MS,
+  process.env.BREAKER_TIMEOUT_MS,
+  process.env.CLAUDE_MAX_OUTPUT_BYTES,
 ];
 void _contractVisibleEnvReads;
 
@@ -55,4 +59,12 @@ export const env = {
   recordingsBucket: process.env.RECORDINGS_BUCKET ?? 'recordings_v2',
   /** REL-08: grace period (ms) before forced connection teardown. */
   shutdownGraceMs: positiveInt('SHUTDOWN_GRACE_MS', 30000, 100, 300000),
+  /** REL-05/REL-06 provider resilience controls. */
+  breakerFailureThreshold: positiveInt('BREAKER_FAILURE_THRESHOLD', 5, 1, 100),
+  breakerCooldownMs: positiveInt('BREAKER_COOLDOWN_MS', 30000, 1000, 300000),
+  // Zero disables the breaker's separate timeout; the runner still has its CLI timeout.
+  breakerTimeoutMs: positiveInt('BREAKER_TIMEOUT_MS', 60000, 0, 300000),
+  claudeMaxOutputBytes: positiveInt(
+    'CLAUDE_MAX_OUTPUT_BYTES', 5 * 1024 * 1024, 1024, 100 * 1024 * 1024,
+  ),
 };

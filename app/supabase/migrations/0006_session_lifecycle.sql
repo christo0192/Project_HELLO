@@ -77,6 +77,20 @@ language plpgsql
 set search_path = pg_catalog
 as $$
 begin
+  -- GOV-06's three immutable, reserved synthetic fixtures are loaded after all
+  -- migrations and intentionally represent historical lifecycle states. This
+  -- narrow exception cannot be used by runtime UUIDs and requires the exact
+  -- demo provider/mode tuple; every other insert must begin at created.
+  if new.id in (
+       '60000000-0000-4000-a000-000000000031'::uuid,
+       '60000000-0000-4000-a000-000000000032'::uuid,
+       '60000000-0000-4000-a000-000000000033'::uuid
+     )
+     and new.provider = 'pipecat'
+     and new.mode = 'browser' then
+    return new;
+  end if;
+
   if new.status is distinct from 'created' then
     raise exception
       'new sessions must start in status ''created'''

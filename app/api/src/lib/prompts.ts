@@ -1,5 +1,13 @@
 import type { ParsedResume, ScreeningQuestion, TranscriptTurn } from './types.js';
 
+// ── LLM-06: Prompt template version identifiers ────────────────────────
+// These are the canonical version constants for provenance tracking.
+// Bump the version identifier when the corresponding template function
+// changes in a semantically meaningful way (structure, scoring, behavior).
+
+export const SCREENING_PROMPT_TEMPLATE_VERSION = '2026-07-28.1';
+export const SCORING_PROMPT_TEMPLATE_VERSION = '2026-07-28.1';
+
 // Resume extraction
 export function buildExtractionPrompt(resumeText: string): string {
   return `You are a resume parser. Extract structured data from the resume text below.
