@@ -30,6 +30,7 @@ from typing import Optional
 from provider_resilience import (
     CircuitBreaker,
     CircuitBreakerConfig,
+    CircuitState,
     call_with_breaker,
     get_scoring_transport,
     configure_scoring_transport,
@@ -217,6 +218,12 @@ async def trigger_scoring(session_id: Optional[str]) -> TriggerOutcome:
     """
     if not session_id:
         return TriggerOutcome.BUSINESS_ERROR
+
+    # Consult the breaker before constructing lazy HTTP transport. This ensures
+    # an open breaker rejects without importing/constructing httpx and preserves
+    # BREAKER_OPEN classification even in minimal CI environments.
+    if _SCORING_BREAKER.state == CircuitState.OPEN:
+        return TriggerOutcome.BREAKER_OPEN
 
     try:
         transport = get_scoring_transport()
