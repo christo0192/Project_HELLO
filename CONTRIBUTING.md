@@ -71,3 +71,18 @@ See `docs/repository-inventory.md` for per-task detail and
 
 `PLAN.md` is the production-readiness source of truth. These blockers must be
 resolved before FND-01, FND-02, and FND-03 can be marked complete.
+
+## Phase-0 evidence CI workflow
+
+The repository includes a CI workflow (`.github/workflows/phase0-evidence-ci.yml`)
+that validates the evidence example and runs deterministic tests on every pull
+request and push to `main`. The workflow:
+
+1. Validates `config/phase0-evidence.example.json` (expected exit 2 — valid
+   shape but incomplete). Does not fail on exit 2.
+2. Runs `scripts/check-phase0-evidence.test.mjs` (fails on non-zero).
+3. Runs gitleaks secret scan.
+4. Runs `git diff --check` for whitespace issues.
+
+Real evidence manifests (`config/phase0-evidence.json`) are gitignored and
+must be validated locally before acceptance review.

@@ -1,0 +1,43 @@
+{
+  "schemaVersion": "1.0.0",
+  "evidenceDate": "2025-06-15T10:00:00Z",
+  "owner": {
+    "role": "Engineering Lead (synthetic example)",
+    "evidenceDate": "2025-06-15T10:30:00Z"
+  },
+  "credentialGroups": [
+    {
+      "groupId": "supabase-example-group",
+      "provider": "supabase",
+      "verification": {
+        "ownerRole": "Engineering Lead (synthetic example)",
+        "evidenceDate": "2025-06-15T09:00:00Z",
+        "evidenceRef": "restricted://FND02/supabase/synthetic-example-not-real",
+        "rotationAction": "rotated",
+        "oldCredentialRejectionMethod": "audit-log-screenshot"
+      }
+    },
+    {
+      "groupId": "livekit-example-group",
+      "provider": "livekit",
+      "verification": {
+        "ownerRole": "Engineering Lead (synthetic example)",
+        "evidenceDate": "2025-06-15T09:15:00Z",
+        "evidenceRef": "restricted://FND02/livekit/synthetic-example-not-real",
+        "rotationAction": "rotated",
+        "oldCredentialRejectionMethod": "provider-console-timestamp"
+      }
+    }
+  ],
+  "artifactGroups": [
+    {
+      "groupId": "recording-example-group",
+      "artifactType": "interview-recording",
+      "verification": {
+        "manualReviewOutcome": "replaced-synthetic",
+        "dispositionStatus": "deleted-after-replacement",
+        "evidenceRef": "restricted://FND03/recording/synthetic-example-not-real"
+      }
+    }
+  ]
+}

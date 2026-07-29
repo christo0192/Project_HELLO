@@ -1,0 +1,45 @@
+name: Phase-0 Evidence Validation
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  validate-evidence:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Validate example manifest (expected exit 2 — valid but incomplete)
+        id: validate-example
+        continue-on-error: true
+        run: |
+          node scripts/check-phase0-evidence.mjs config/phase0-evidence.example.json
+          exit_code=$?
+          if [ "$exit_code" -eq 2 ]; then
+            echo "PASS: example exits $exit_code (valid shape, incomplete)"
+          else
+            echo "UNEXPECTED: example exited $exit_code (expected 2)"
+            exit "$exit_code"
+          fi
+
+      - name: Run deterministic tests
+        run: |
+          node scripts/check-phase0-evidence.test.mjs
+
+      - name: Secret scan (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        continue-on-error: false
+        with:
+          config-path: .gitleaks.toml
+          detect-args: --no-git -v
+
+      - name: Git diff whitespace check
+        run: git diff --check

@@ -1,0 +1,180 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/christo0192/Project_HELLO/config/phase0-evidence.schema.json",
+  "title": "Phase-0 Evidence Manifest",
+  "description": "Schema for FND-02 (credential rotation) and FND-03 (candidate-artifact disposition) evidence manifests. Rejects secret-like field names, secret values, PII, and placeholder claims.",
+  "version": "1.0.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "evidenceDate",
+    "owner",
+    "credentialGroups",
+    "artifactGroups"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "description": "Semantic version of this schema"
+    },
+    "evidenceDate": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC timestamp of evidence capture. Must not be in the future."
+    },
+    "owner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "evidenceDate"
+      ],
+      "properties": {
+        "role": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Role of the person providing the evidence (e.g. Engineering Lead)"
+        },
+        "evidenceDate": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 UTC timestamp when the owner recorded their attestation"
+        }
+      }
+    },
+    "credentialGroups": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "groupId",
+          "provider",
+          "verification"
+        ],
+        "properties": {
+          "groupId": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]+$",
+            "description": "Unique identifier for this credential group"
+          },
+          "provider": {
+            "type": "string",
+            "enum": [
+              "supabase",
+              "livekit",
+              "anthropic",
+              "sarvam",
+              "deepgram",
+              "retell-elevenlabs-cartesia"
+            ],
+            "description": "Provider system whose credential was rotated"
+          },
+          "verification": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ownerRole",
+              "evidenceDate",
+              "evidenceRef",
+              "rotationAction",
+              "oldCredentialRejectionMethod"
+            ],
+            "properties": {
+              "ownerRole": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "description": "Role of the person who performed and verified the rotation"
+              },
+              "evidenceDate": {
+                "type": "string",
+                "format": "date-time",
+                "description": "ISO 8601 UTC timestamp when rotation evidence was captured"
+              },
+              "evidenceRef": {
+                "type": "string",
+                "pattern": "^restricted://FND02/[a-z0-9][a-z0-9._/-]{0,255}$",
+                "description": "Reference to non-secret evidence stored outside Git. Pattern: restricted://FND02/<path>"
+              },
+              "rotationAction": {
+                "type": "string",
+                "enum": ["rotated", "revoked", "deleted-resource"],
+                "description": "Action taken on the old credential"
+              },
+              "oldCredentialRejectionMethod": {
+                "type": "string",
+                "enum": ["audit-log-screenshot", "provider-console-timestamp", "credential-rejection-test"],
+                "description": "Method used to prove the old credential no longer works"
+              }
+            }
+          }
+        }
+      },
+      "minItems": 1,
+      "maxItems": 100
+    },
+    "artifactGroups": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "groupId",
+          "artifactType",
+          "verification"
+        ],
+        "properties": {
+          "groupId": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]+$",
+            "description": "Unique identifier for this artifact group"
+          },
+          "artifactType": {
+            "type": "string",
+            "enum": [
+              "interview-recording",
+              "scorecard-pdf",
+              "candidate-screenshot",
+              "resume-copy",
+              "voice-media",
+              "generated-document",
+              "browser-recording"
+            ],
+            "description": "Type of candidate artifact from FND-03 scope"
+          },
+          "verification": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "manualReviewOutcome",
+              "dispositionStatus",
+              "evidenceRef"
+            ],
+            "properties": {
+              "manualReviewOutcome": {
+                "type": "string",
+                "enum": ["clean", "replaced-synthetic", "quarantined"],
+                "description": "Outcome of manual review for this artifact"
+              },
+              "dispositionStatus": {
+                "type": "string",
+                "enum": ["retained-restricted", "deleted-after-replacement", "pending-review"],
+                "description": "Current disposition status of the original evidence"
+              },
+              "evidenceRef": {
+                "type": "string",
+                "pattern": "^restricted://FND03/[a-z0-9][a-z0-9._/-]{0,255}$",
+                "description": "Reference to disposition evidence stored outside Git. Pattern: restricted://FND03/<path>"
+              }
+            }
+          }
+        }
+      },
+      "maxItems": 50
+    }
+  }
+}

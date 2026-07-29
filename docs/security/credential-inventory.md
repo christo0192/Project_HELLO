@@ -53,3 +53,22 @@ the old credential is rejected. Deleting a local file or ignoring it via
   findings; the GitHub secret-scan workflow passed on `main`.
 - Quarantined local credentials and media are outside the committed set and
   require owner action for rotation and disposition respectively.
+
+## Phase-0 Evidence Validation
+
+FND-02 and FND-03 acceptance requires a structured evidence manifest that
+records credential rotation and artifact disposition. The following tooling
+is available to validate the manifest shape:
+
+| Artifact | Location |
+|----------|----------|
+| Schema | `config/phase0-evidence.schema.json` |
+| Example (incomplete) | `config/phase0-evidence.example.json` |
+| Validator (zero-dependency) | `scripts/check-phase0-evidence.mjs` |
+| Deterministic tests | `scripts/check-phase0-evidence.test.mjs` |
+| CI workflow | `.github/workflows/phase0-evidence-ci.yml` |
+| Owner runbook | `docs/runbooks/phase0-owner-evidence.md` |
+
+The real manifest (`config/phase0-evidence.json`) is gitignored and must
+never be committed. See `docs/runbooks/phase0-owner-evidence.md` for the
+offline procedure.
