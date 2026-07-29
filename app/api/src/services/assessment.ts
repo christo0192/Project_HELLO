@@ -1,14 +1,39 @@
 import { supabase } from '../lib/supabase.js';
-import { runClaudeJSON } from '../lib/claude.js';
+import { runClaudeJSONWithProvenance } from '../lib/claude.js';
 import { env } from '../lib/env.js';
 import { buildAssessmentPrompt, formatResumeFacts } from '../lib/prompts.js';
 import type { Assessment, TranscriptTurn } from '../lib/types.js';
+import { scoringProvenance } from '../lib/model-provenance.js';
+
+// ── Runner abstraction for testability ──────────────────────────────────
+
+export interface AssessmentRunner {
+  (sessionId: string): Promise<Assessment & { id: string }>;
+}
+
+/**
+ * Default runner: connects to real Supabase and Claude CLI.
+ * Override in tests via injectAssessmentRunner() to avoid network/CLI calls.
+ */
+let _runAssessment: AssessmentRunner = runAssessmentImpl;
+
+export function injectAssessmentRunner(fn: AssessmentRunner | null): void {
+  _runAssessment = fn ?? runAssessmentImpl;
+}
 
 /**
  * Score a completed screening session and persist the assessment.
  * Idempotent-ish: inserts a new assessment row each call.
+ *
+ * Delegates to the injected runner (default: real implementation).
  */
 export async function runAssessment(sessionId: string): Promise<Assessment & { id: string }> {
+  return _runAssessment(sessionId);
+}
+
+// ── Real implementation ─────────────────────────────────────────────────
+
+async function runAssessmentImpl(sessionId: string): Promise<Assessment & { id: string }> {
   const { data: session, error: sErr } = await supabase
     .from('call_sessions')
     .select('id,candidate_id,role_id')
@@ -47,7 +72,9 @@ export async function runAssessment(sessionId: string): Promise<Assessment & { i
     .eq('id', session.candidate_id)
     .single();
 
-  const assessment = await runClaudeJSON<Assessment>(
+  // Use runClaudeJSONWithProvenance to get both the parsed assessment and
+  // the requested model identifier.
+  const { data: assessment, requestedModel: scoringModel } = await runClaudeJSONWithProvenance<Assessment>(
     buildAssessmentPrompt({
       roleTitle,
       requiredSkills,
@@ -64,6 +91,9 @@ export async function runAssessment(sessionId: string): Promise<Assessment & { i
   assessment.overall_score = overall;
   assessment.recommendation = recommendation;
 
+  // Build scoring provenance using the requested model.
+  const scoringProvenanceValue = scoringProvenance(scoringModel);
+
   const basePayload: Record<string, unknown> = {
     session_id: sessionId,
     candidate_id: session.candidate_id,
@@ -77,6 +107,7 @@ export async function runAssessment(sessionId: string): Promise<Assessment & { i
     recommendation: assessment.recommendation,
     summary: assessment.summary,
     raw: assessment, // full object (fallback if optional columns absent)
+    provenance: scoringProvenanceValue, // LLM-06 provenance — required, fail closed if missing
   };
 
   let { data: row, error: aErr } = await supabase
@@ -85,8 +116,10 @@ export async function runAssessment(sessionId: string): Promise<Assessment & { i
     .select()
     .single();
 
-  // If optional columns haven't been migrated yet, retry with base columns only
-  // (the full object is always preserved in `raw`).
+  // If optional communication/motivation columns haven't been migrated yet,
+  // retry with those columns only.  Provenance is *never* dropped — it must
+  // exist in the schema.  If the provenance column itself is missing, the
+  // insert fails closed (the migration is a prerequisite).
   if (aErr && /(resume_conflicts|communication|motivation)/i.test(aErr.message)) {
     const { resume_conflicts, communication, motivation, ...base } = basePayload;
     ({ data: row, error: aErr } = await supabase

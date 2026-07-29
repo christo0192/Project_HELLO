@@ -32,6 +32,7 @@ cat docs/HANDOVER.md
 | CORS + CSP foundation | SEC-07 | Code complete; deployment-gated | PR #6, merged 2026-07-29. Automated API CORS tests + built-HTML CSP smoke pass locally. CSP is report-only. Real-browser denial test, clean CSP report window, and Observatory B+ require deployment. |
 | OCI managed-services Terraform foundation | Infrastructure | Code merged; apply-gated | PR #7 (`e8584b0`), merged 2026-07-29. Scaffold only; `terraform apply` has not been run. |
 | OCI region benchmark harness | Infrastructure | Code merged; not yet measured | PR #8 (`726ce56`), merged 2026-07-29. Harness and fail-closed runbook exist; no benchmark data has been collected. |
+| LLM-06 model provenance (branch) | LLM-06 | Code complete on `feat/llm-06-provenance`; **not merged, not deployed** | Requested-model provenance for API simulation/scoring and LiveKit worker claim, SQL validator, immutability triggers, TS/Python validation. Local checks passed: API 275 tests, Python 63 tests, Supabase 46 policy/schema tests + PostgREST anon denial. Production migration apply and deployed provider evidence remain pending. |
 | Supabase local baseline | MIG-03 / partial MIG-04 | Code merged; production apply pending | PR #9 (`4d103ea`), merged 2026-07-29. Unused Mumbai project exists but MIG-01/MIG-02 admin acceptance pending; this is MIG-03/partial MIG-04. Membership-gated RLS and local validation; MIG-01/MIG-02 administrative acceptance plus controlled production connection/application and MIG-13 cutover are future gates. |
 
 CI on `main` at `4d103ea`: Quality, Secret scan, and Supabase checks all passed on 2026-07-29.
@@ -57,6 +58,9 @@ cd ../..
 node scripts/check-env-contract.mjs
 node scripts/check-env-contract.test.mjs
 node scripts/check-adrs.mjs
+bash scripts/supabase-test.sh
+(cd app/voice-livekit && python3 -m unittest discover -s tests -p 'test_*.py' -v)
+python3 -m py_compile app/voice-livekit/agent.py app/voice-livekit/persistence.py app/voice-livekit/provenance.py
 node scripts/audit-seeded-vuln.test.mjs
 bash scripts/audit-deps.sh --dir app/api
 bash scripts/audit-deps.sh --dir app/web

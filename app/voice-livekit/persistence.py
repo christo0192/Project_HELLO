@@ -4,6 +4,9 @@ LiveKit rooms are created by the dashboard API. The room metadata carries the
 existing ``screening_v2.call_sessions.id``; this worker writes live transcript
 turns against that id, completes the session, and triggers the same API scoring
 route used by the old Pipecat flow.
+
+LLM-06: Adds provenance claiming via set_session_provenance() with
+compare-and-set CAS semantics.
 """
 
 from __future__ import annotations
@@ -12,7 +15,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 
@@ -27,6 +30,26 @@ API_BASE = os.getenv("API_BASE", "http://localhost:8787")
 logger = logging.getLogger("voice-livekit.persistence")
 _client = None
 
+
+# ── Provenance claim result enum ───────────────────────────────────────
+
+class ClaimResult:
+    """Result of a provenance claim attempt.
+
+    - CLAIMED: first-time claim succeeded (null → value)
+    - ALREADY_MATCHING: provenance already set to the exact same value
+    - CONFLICT: provenance already set to a DIFFERENT value (immutable conflict)
+    - MISSING: expected table/column not found
+    - ERROR: transport or server error
+    """
+    CLAIMED = "claimed"
+    ALREADY_MATCHING = "already_matching"
+    CONFLICT = "conflict"
+    MISSING = "missing"
+    ERROR = "error"
+
+
+# ── Internal client ────────────────────────────────────────────────────
 
 def _get_client():
     global _client
@@ -45,6 +68,87 @@ def _table(name: str):
     client = _get_client()
     return client.schema(SCHEMA).table(name) if client else None
 
+
+# ── Provenance claiming (LLM-06) ──────────────────────────────────────
+
+async def set_session_provenance(
+    session_id: Optional[str],
+    provenance: dict[str, Any],
+) -> str:
+    """
+    Atomically claim provenance for a LiveKit session (compare-and-set).
+
+    Uses an exact one-row UPDATE: ``WHERE id = ? AND provenance IS NULL``
+    with ``.select("id")`` to confirm exactly one row affected.
+    This ensures only the first claim succeeds.
+
+    Returns one of ``ClaimResult.*`` values.
+
+    Never logs the raw provenance dict — only the session_id and result type.
+    """
+    if not session_id:
+        logger.warning("set_session_provenance MISSING session_id none")
+        return ClaimResult.MISSING
+
+    def run():
+        table = _table("call_sessions")
+        if not table:
+            return None
+        result = (
+            table.update({"provenance": provenance})
+            .eq("id", session_id)
+            .is_("provenance", "null")
+            .select("id")
+            .execute()
+        )
+        return result
+
+    try:
+        result = await asyncio.to_thread(run)
+    except Exception:
+        logger.warning("set_session_provenance ERROR session=%s", session_id)
+        return ClaimResult.ERROR
+
+    if result is None:
+        logger.warning("set_session_provenance MISSING session=%s", session_id)
+        return ClaimResult.MISSING
+
+    rows = result.data if hasattr(result, "data") else None
+    if rows and len(rows) > 0:
+        logger.info("set_session_provenance CLAIMED session=%s", session_id)
+        return ClaimResult.CLAIMED
+
+    # Rows affected = 0 — provenance was not null.  Read current value to
+    # distinguish ALREADY_MATCHING from CONFLICT.
+    try:
+        def read_provenance():
+            tbl = _table("call_sessions")
+            if not tbl:
+                return None
+            return tbl.select("provenance").eq("id", session_id).single().execute()
+
+        session_result = await asyncio.to_thread(read_provenance)
+    except Exception:
+        logger.warning("set_session_provenance MISSING session=%s", session_id)
+        return ClaimResult.MISSING
+
+    existing = None
+    if session_result and hasattr(session_result, "data") and session_result.data:
+        existing = session_result.data.get("provenance")
+
+    if existing is None:
+        logger.warning("set_session_provenance ERROR session=%s race", session_id)
+        return ClaimResult.ERROR
+
+    if existing == provenance:
+        logger.info("set_session_provenance ALREADY_MATCHING session=%s", session_id)
+        return ClaimResult.ALREADY_MATCHING
+
+    logger.warning("set_session_provenance CONFLICT session=%s", session_id)
+    return ClaimResult.CONFLICT
+
+
+# ── Transcript persistence ─────────────────────────────────────────────
 
 async def save_turn(session_id: Optional[str], turn_index: int, speaker: str, text: str) -> None:
     if not (session_id and text.strip()):
@@ -65,9 +169,9 @@ async def save_turn(session_id: Optional[str], turn_index: int, speaker: str, te
 
     try:
         await asyncio.to_thread(run)
-        logger.info(f"[livekit-transcript] {speaker}: {text[:80]}")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(f"[livekit-db] save_turn failed: {exc}")
+        logger.info("save_turn session=%s turn=%d speaker=%s", session_id, turn_index, speaker)
+    except Exception as exc:
+        logger.warning("save_turn failed session=%s: %s", session_id, exc)
 
 
 async def complete_session(session_id: Optional[str], duration_sec: Optional[int] = None) -> None:
@@ -88,9 +192,9 @@ async def complete_session(session_id: Optional[str], duration_sec: Optional[int
 
     try:
         await asyncio.to_thread(run)
-        logger.info(f"[livekit-db] call_session {session_id} completed")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(f"[livekit-db] complete_session failed: {exc}")
+        logger.info("call_session %s completed", session_id)
+    except Exception as exc:
+        logger.warning("complete_session failed session=%s: %s", session_id, exc)
 
 
 async def fail_session(session_id: Optional[str], reason: str) -> None:
@@ -111,8 +215,8 @@ async def fail_session(session_id: Optional[str], reason: str) -> None:
 
     try:
         await asyncio.to_thread(run)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(f"[livekit-db] fail_session failed: {exc}")
+    except Exception as exc:
+        logger.warning("fail_session failed session=%s: %s", session_id, exc)
 
 
 async def trigger_scoring(session_id: Optional[str]) -> None:
@@ -121,6 +225,6 @@ async def trigger_scoring(session_id: Optional[str]) -> None:
     try:
         async with httpx.AsyncClient(timeout=180) as client:
             response = await client.post(f"{API_BASE}/api/assess/{session_id}")
-            logger.info(f"[livekit-score] triggered for {session_id}: HTTP {response.status_code}")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(f"[livekit-score] scoring trigger failed: {exc}")
+            logger.info("scoring triggered session=%s HTTP %d", session_id, response.status_code)
+    except Exception as exc:
+        logger.warning("scoring trigger failed session=%s: %s", session_id, exc)

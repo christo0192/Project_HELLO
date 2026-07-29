@@ -4,6 +4,10 @@
 
 ---
 
+> **Implementation status (2026-07-29):** Branch `feat/llm-06-provenance` implements LLM-06 requested-model provenance scaffolding across API, LiveKit worker, and local Supabase migrations/tests. This does **not** close production acceptance: migration application to a controlled hosted project, deployed provider evidence, owner/legal/security approvals, and launch gates remain pending.
+
+---
+
 ## 1. Document Control
 
 | Field | Value |
@@ -432,7 +436,7 @@ Workstreams may run in parallel, but **Phase 12 has no shortcut**: every P0 task
 | **LLM-03** | Haiku → Gemini 2.5 Flash-Lite: run full evaluation suite. Compare latency, cost, quality. Only migrate if eval passes | P1 | Backend Eng | LLM-02 | M | Eval report: Gemini meets or exceeds Haiku on all metrics. Latency and cost documented | Revert to Haiku |
 | **LLM-04** | claude → DeepSeek scoring: run full evaluation suite. Compare score quality, explainability, consistency. Only migrate if eval passes | P1 | Backend Eng | LLM-02 | M | Eval report: DeepSeek meets or exceeds Claude on scoring accuracy and consistency | Revert to Claude |
 | **LLM-05** | For every provider used at launch or proposed later, obtain contractual/vendor evidence of processing and storage regions and validate endpoint configuration; latency/IP observations alone do not prove residency | P0 | Eng Lead + Legal + Security | GOV-07 | M | DPA/subprocessor/retention/region evidence and configured endpoint screenshots are approved; any unmet mandatory residency requirement blocks provider selection | Keep approved current provider or choose compliant alternative |
-| **LLM-06** | Store model/provider, prompt/template version, safety configuration and relevant inference parameters per session without storing secrets | P0 | Backend Eng | — | S | Assessment/session can be reproduced within documented model limitations and traced to an immutable prompt/eval artifact | N/A |
+| **LLM-06** | Store model/provider, prompt/template version and relevant inference parameters per session without storing secrets | P0 | Backend Eng | — | S | **PARTIAL**: code complete on `feat/llm-06-provenance` branch (SQL validator, immutability triggers, TS/Python validation, worker claim). Migration NOT applied to production Supabase. Real deployed provider evidence and full policy test against populated tables pending. 0/17 plan phases complete. See docs/HANDOVER.md | N/A |
 | **LLM-07** | Run legally approved fairness testing across accents/languages and other relevant cohorts using only voluntary, consented, de-identified labels; never infer protected traits such as gender from voice | P0 | QA + Product + Legal | LLM-02, GOV-07 | L | Methodology protects small cohorts, reports uncertainty and material disparities, has human review and defined remediation/launch thresholds; unresolved harmful disparity blocks launch | Keep scores advisory/hidden or revert model while remediating |
 | **LLM-08** | Treat resumes, job descriptions, speech and transcripts as untrusted model input: delimit data, prohibit instruction override/data exfiltration, minimize tools, validate structured output and add prompt-injection/adversarial regression tests | P0 | Backend + Security + QA | LLM-02, SEC-14 | M | Seeded resume/transcript injection cannot reveal system prompt/secrets, alter rubric/weights, invoke unauthorized action or bypass human review; malformed output is rejected/quarantined | Disable affected model workflow and use manual review |
 
