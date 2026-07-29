@@ -22,7 +22,6 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-// Re-exported so tests can reference the exact expected origins
 export const GITHUB_ORIGIN = "https://api.github.com";
 const MAX_RULESET_PAGES = 3;
 const RULESET_PER_PAGE = 100;
@@ -60,42 +59,37 @@ function get(obj, dotpath) {
 }
 
 function validateGitHubName(name, label) {
-  if (typeof name !== "string" || name.length === 0) {
-    throw new Error(`invalid-${label}`);
-  }
-  if (!/^[a-zA-Z0-9._-]+$/.test(name)) {
-    throw new Error(`invalid-${label}`);
-  }
+  if (typeof name !== "string" || name.length === 0) throw new Error(`invalid-${label}`);
+  if (!/^[a-zA-Z0-9._-]+$/.test(name)) throw new Error(`invalid-${label}`);
 }
 
-/**
- * Validate that repoSlug has exactly two safe segments: "owner/repo".
- * No third segment, no leading/trailing slashes, no empty segments.
- */
 function validateRepositorySlug(slug) {
   if (typeof slug !== "string") return false;
   const parts = slug.split("/");
   if (parts.length !== 2) return false;
-  try {
-    validateGitHubName(parts[0], "owner");
-    validateGitHubName(parts[1], "repo");
-    return true;
-  } catch {
-    return false;
-  }
+  try { validateGitHubName(parts[0], "owner"); validateGitHubName(parts[1], "repo"); return true; }
+  catch { return false; }
 }
 
 /**
- * Exact origin comparison. Parses the URL and checks `.origin`.
- * `expectedOrigin` must be a bare origin like "https://api.github.com".
+ * Exact origin comparison via URL parsing. All absolute URLs must pass this;
+ * no string-prefix trust path exists elsewhere.
  */
 function urlOriginMatches(urlStr, expectedOrigin) {
-  try {
-    const u = new URL(urlStr);
-    return u.origin === expectedOrigin;
-  } catch {
-    return false;
+  try { return new URL(urlStr).origin === expectedOrigin; }
+  catch { return false; }
+}
+
+/**
+ * Resolve a possibly-relative URL to absolute. If already absolute, validate
+ * origin exactly. If relative, prepend apiOrigin.
+ */
+function resolveUrl(urlPath, apiOrigin) {
+  if (urlPath.startsWith("http://") || urlPath.startsWith("https://")) {
+    if (!urlOriginMatches(urlPath, apiOrigin)) return { _foreign_origin: true };
+    return urlPath;
   }
+  return `${apiOrigin}${urlPath}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -108,26 +102,16 @@ async function ghFetch(token, urlPath, opts = {}) {
   const timeoutMs = opts.timeout != null ? opts.timeout : DEFAULT_TIMEOUT_MS;
   const parentSignal = opts.signal || null;
 
-  let url;
-  if (urlPath.startsWith(apiOrigin)) {
-    url = urlPath;
-  } else if (urlPath.startsWith("http")) {
-    // Foreign origin
-    if (!urlOriginMatches(urlPath, apiOrigin)) return { _foreign_origin: true };
-    url = urlPath;
-  } else {
-    url = `${apiOrigin}${urlPath}`;
-  }
+  const resolved = resolveUrl(urlPath, apiOrigin);
+  if (typeof resolved !== "string") return resolved; // _foreign_origin
+  const url = resolved;
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(new DOMException("timeout", "AbortError")), timeoutMs);
 
   let cleanupParent;
   if (parentSignal) {
-    if (parentSignal.aborted) {
-      clearTimeout(timeout);
-      return { _network_error: true };
-    }
+    if (parentSignal.aborted) { clearTimeout(timeout); return { _network_error: true }; }
     const onAbort = () => controller.abort(parentSignal.reason);
     parentSignal.addEventListener("abort", onAbort, { once: true });
     cleanupParent = () => parentSignal.removeEventListener("abort", onAbort);
@@ -145,13 +129,11 @@ async function ghFetch(token, urlPath, opts = {}) {
       signal: controller.signal,
     });
   } catch (err) {
-    clearTimeout(timeout);
-    if (cleanupParent) cleanupParent();
+    clearTimeout(timeout); if (cleanupParent) cleanupParent();
     if (err.name === "AbortError") return { _network_error: true };
     return { _network_error: true };
   } finally {
-    clearTimeout(timeout);
-    if (cleanupParent) cleanupParent();
+    clearTimeout(timeout); if (cleanupParent) cleanupParent();
   }
 
   let text;
@@ -160,17 +142,23 @@ async function ghFetch(token, urlPath, opts = {}) {
   let body;
   try { body = JSON.parse(text); } catch { return { _malformed: true, _status: resp.status }; }
 
-  body._status = resp.status;
-  return body;
+  // Attach status only if body is a non-null, non-array object.
+  // Otherwise return malformed with a reason.
+  if (body && typeof body === "object" && !Array.isArray(body)) {
+    body._status = resp.status;
+    return body;
+  }
+  const reason = body === null ? "null-parsed-body" : Array.isArray(body) ? "array-parsed-body" : "non-object-parsed-body";
+  return { _malformed: true, _status: resp.status, _reason: reason };
 }
 
 async function ghFetchAll(token, urlPath, opts = {}) {
+  const fetcher = opts.fetch || globalThis.fetch;
   const apiOrigin = opts.baseUrl || GITHUB_ORIGIN;
   const timeoutMs = opts.timeout != null ? opts.timeout : DEFAULT_TIMEOUT_MS;
   const parentSignal = opts.signal || null;
 
   const results = [];
-  // Build initial URL: if path has query params, append per_page; otherwise add
   const separator = urlPath.includes("?") ? "&" : "?";
   let nextUrl = `${urlPath}${separator}per_page=${RULESET_PER_PAGE}`;
   let pages = 0;
@@ -178,23 +166,16 @@ async function ghFetchAll(token, urlPath, opts = {}) {
   while (nextUrl && pages < MAX_RULESET_PAGES) {
     pages++;
 
-    let url;
-    if (nextUrl.startsWith("http")) {
-      if (!urlOriginMatches(nextUrl, apiOrigin)) return { _foreign_origin: true };
-      url = nextUrl;
-    } else {
-      url = `${apiOrigin}${nextUrl}`;
-    }
+    const resolved = resolveUrl(nextUrl, apiOrigin);
+    if (typeof resolved !== "string") return { _foreign_origin: true };
+    const url = resolved;
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(new DOMException("timeout", "AbortError")), timeoutMs);
 
     let cleanupParent;
     if (parentSignal) {
-      if (parentSignal.aborted) {
-        clearTimeout(timeout);
-        return { _network_error: true };
-      }
+      if (parentSignal.aborted) { clearTimeout(timeout); return { _network_error: true }; }
       const onAbort = () => controller.abort(parentSignal.reason);
       parentSignal.addEventListener("abort", onAbort, { once: true });
       cleanupParent = () => parentSignal.removeEventListener("abort", onAbort);
@@ -202,7 +183,7 @@ async function ghFetchAll(token, urlPath, opts = {}) {
 
     let resp;
     try {
-      resp = await globalThis.fetch(url, {
+      resp = await fetcher(url, {
         headers: {
           Authorization: `Bearer ${token}`,
           Accept: "application/vnd.github+json",
@@ -212,12 +193,10 @@ async function ghFetchAll(token, urlPath, opts = {}) {
         signal: controller.signal,
       });
     } catch (err) {
-      clearTimeout(timeout);
-      if (cleanupParent) cleanupParent();
+      clearTimeout(timeout); if (cleanupParent) cleanupParent();
       return { _network_error: true };
     } finally {
-      clearTimeout(timeout);
-      if (cleanupParent) cleanupParent();
+      clearTimeout(timeout); if (cleanupParent) cleanupParent();
     }
 
     let text;
@@ -235,25 +214,55 @@ async function ghFetchAll(token, urlPath, opts = {}) {
     if (link) {
       const match = link.match(/<([^>]+)>;\s*rel="next"/);
       nextUrl = match ? match[1] : null;
-    } else {
-      nextUrl = null;
-    }
+    } else { nextUrl = null; }
   }
 
-  if (pages >= MAX_RULESET_PAGES && nextUrl) {
-    results._pagination_truncated = true;
-  }
-
+  if (pages >= MAX_RULESET_PAGES && nextUrl) results._pagination_truncated = true;
   return results;
 }
 
-/**
- * Validate that a 200 body is a non-null, non-array object.
- */
 function validateObjectBody(body, label) {
   if (body === null || body === undefined) return `null-${label}`;
   if (Array.isArray(body)) return `array-${label}`;
   if (typeof body !== "object") return `non-object-${label}`;
+  return null;
+}
+
+/**
+ * Validate a ruleset detail body beyond just "non-null object".
+ * Returns null if valid, or an error reason string.
+ */
+function validateRulesetDetailShape(detail) {
+  // id: finite number >= 1
+  if (typeof detail.id !== "number" || !Number.isFinite(detail.id) || detail.id < 1) return "invalid-id";
+  // enforcement: must be "active" or "evaluate" (or absent — defaults to inactive, but we accept it)
+  if (detail.enforcement !== undefined && typeof detail.enforcement !== "string") return "invalid-enforcement";
+  // target: if present must be "branch"
+  if (detail.target !== undefined && detail.target !== "branch") return "invalid-target"; // non-string caught in filter
+
+  // bypass_actors: if present must be array
+  if (detail.bypass_actors !== undefined && !Array.isArray(detail.bypass_actors)) return "invalid-bypass_actors";
+
+  // conditions.ref_name: if present, include/exclude must be string arrays
+  const refName = detail.conditions?.ref_name;
+  if (refName) {
+    if (refName.include !== undefined && !Array.isArray(refName.include)) return "invalid-conditions-include";
+    if (refName.exclude !== undefined && !Array.isArray(refName.exclude)) return "invalid-conditions-exclude";
+    // Validate array elements are strings
+    if (Array.isArray(refName.include) && refName.include.some(e => typeof e !== "string")) return "invalid-conditions-include-element";
+    if (Array.isArray(refName.exclude) && refName.exclude.some(e => typeof e !== "string")) return "invalid-conditions-exclude-element";
+  }
+
+  // rules: must be array of objects
+  if (!Array.isArray(detail.rules)) return "invalid-rules-array";
+  for (const rule of detail.rules) {
+    if (!rule || typeof rule !== "object") return "invalid-rule-entry";
+    if (typeof rule.type !== "string") return "invalid-rule-type";
+    // parameters: if present must be object
+    if (rule.parameters !== undefined && (typeof rule.parameters !== "object" || rule.parameters === null || Array.isArray(rule.parameters))) {
+      return "invalid-rule-parameters";
+    }
+  }
   return null;
 }
 
@@ -276,12 +285,7 @@ export async function collectLive(token, owner, repo, branch, opts = {}) {
   const dOpts = { fetch: fetcher, baseUrl, timeout, signal: totalController.signal };
 
   const evidence = {
-    metadata: {
-      repository: `${owner}/${repo}`,
-      branch,
-      fetched_at: new Date().toISOString(),
-      default_branch: null,
-    },
+    metadata: { repository: `${owner}/${repo}`, branch, fetched_at: new Date().toISOString(), default_branch: null },
     classic_branch_protection: null,
     classic_required_signatures: null,
     rulesets: [],
@@ -295,136 +299,92 @@ export async function collectLive(token, owner, repo, branch, opts = {}) {
   };
 
   try {
-    // 0. Fetch repo metadata for default_branch
+    // 0. Repo metadata
     const repoMeta = await ghFetch(token, `/repos/${owner}/${repo}`, dOpts);
     const repoMetaStatus = repoMeta._status;
     delete repoMeta._status;
 
-    if (repoMeta._network_error || repoMeta._foreign_origin) {
-      pushErr("repo_metadata", 0);
-    } else if (repoMeta._malformed || repoMetaStatus !== 200) {
-      pushErr("repo_metadata", repoMetaStatus || 0);
-    } else {
+    if (repoMeta._network_error || repoMeta._foreign_origin) { pushErr("repo_metadata", 0); }
+    else if (repoMeta._malformed || repoMetaStatus !== 200) { pushErr("repo_metadata", repoMetaStatus || 0, repoMeta._reason ? { reason: repoMeta._reason } : undefined); }
+    else {
       const bodyErr = validateObjectBody(repoMeta, "repo-meta");
-      if (bodyErr) {
-        pushErr("repo_metadata", 200, { reason: bodyErr });
-      } else if (typeof repoMeta.default_branch !== "string" || repoMeta.default_branch.length === 0) {
-        pushErr("repo_metadata", 200, { reason: "missing-default-branch" });
-      } else {
-        evidence.metadata.default_branch = repoMeta.default_branch;
-      }
+      if (bodyErr) { pushErr("repo_metadata", 200, { reason: bodyErr }); }
+      else if (typeof repoMeta.default_branch !== "string" || repoMeta.default_branch.length === 0) { pushErr("repo_metadata", 200, { reason: "missing-default-branch" }); }
+      else { evidence.metadata.default_branch = repoMeta.default_branch; }
     }
+    // Proceed — errors already recorded
 
-    if (totalController.signal.aborted) throw totalController.signal.reason;
-
-    // 1. Classic branch protection
+    // 1. Classic
     const classic = await ghFetch(token, `/repos/${owner}/${repo}/branches/${encodeURIComponent(branch)}/protection`, dOpts);
     const classicStatus = classic._status;
     delete classic._status;
 
-    if (classic._network_error || classic._foreign_origin) {
-      pushErr("classic", 0);
-    } else if (classic._malformed) {
-      pushErr("classic", classicStatus || 0);
-    } else if (classicStatus === 404) {
-      evidence.classic_branch_protection = null;
-    } else if (classicStatus === 401 || classicStatus === 403) {
-      pushErr("classic", classicStatus);
-    } else if (classicStatus === 200) {
+    if (classic._network_error || classic._foreign_origin) { pushErr("classic", 0); }
+    else if (classic._malformed) { pushErr("classic", classicStatus || 0, classic._reason ? { reason: classic._reason } : undefined); }
+    else if (classicStatus === 404) { evidence.classic_branch_protection = null; }
+    else if (classicStatus === 401 || classicStatus === 403) { pushErr("classic", classicStatus); }
+    else if (classicStatus === 200) {
       const bodyErr = validateObjectBody(classic, "classic");
-      if (bodyErr) {
-        pushErr("classic", 200, { reason: bodyErr });
-        evidence.classic_branch_protection = null;
-      } else {
-        evidence.classic_branch_protection = classic;
-      }
-    } else {
-      pushErr("classic", classicStatus || 0);
-    }
+      if (bodyErr) { pushErr("classic", 200, { reason: bodyErr }); evidence.classic_branch_protection = null; }
+      else { evidence.classic_branch_protection = classic; }
+    } else { pushErr("classic", classicStatus || 0); }
+    // Proceed — errors already recorded
 
-    if (totalController.signal.aborted) throw totalController.signal.reason;
-
-    // 2. Classic required signatures
+    // 2. Signatures
     const sigs = await ghFetch(token, `/repos/${owner}/${repo}/branches/${encodeURIComponent(branch)}/protection/required_signatures`, dOpts);
     const sigsStatus = sigs._status;
     delete sigs._status;
 
-    if (sigs._network_error || sigs._foreign_origin) {
-      pushErr("required_signatures", 0);
-    } else if (sigs._malformed) {
-      pushErr("required_signatures", sigsStatus || 0);
-    } else if (sigsStatus === 200) {
+    if (sigs._network_error || sigs._foreign_origin) { pushErr("required_signatures", 0); }
+    else if (sigs._malformed) { pushErr("required_signatures", sigsStatus || 0, sigs._reason ? { reason: sigs._reason } : undefined); }
+    else if (sigsStatus === 200) {
       const bodyErr = validateObjectBody(sigs, "sigs");
-      if (bodyErr) {
-        pushErr("required_signatures", 200, { reason: bodyErr });
-      } else {
-        evidence.classic_required_signatures = sigs;
-      }
-    } else if (sigsStatus === 404) {
-      evidence.classic_required_signatures = null;
-    } else {
-      pushErr("required_signatures", sigsStatus || 0);
-    }
+      if (bodyErr) { pushErr("required_signatures", 200, { reason: bodyErr }); }
+      else { evidence.classic_required_signatures = sigs; }
+    } else if (sigsStatus === 404) { evidence.classic_required_signatures = null; }
+    else { pushErr("required_signatures", sigsStatus || 0); }
+    // Proceed — errors already recorded
 
-    if (totalController.signal.aborted) throw totalController.signal.reason;
-
-    // 3. Rulesets list (paginated, with inherited)
+    // 3. Rulesets list
     const rulesetList = await ghFetchAll(token, `/repos/${owner}/${repo}/rulesets?includes_parents=true`, dOpts);
 
-    if (rulesetList._network_error || rulesetList._foreign_origin) {
-      pushErr("rulesets_list", 0);
-    } else if (rulesetList._malformed) {
-      pushErr("rulesets_list", rulesetList._status || 0);
-    } else if (Array.isArray(rulesetList)) {
+    if (rulesetList._network_error || rulesetList._foreign_origin) { pushErr("rulesets_list", 0); }
+    else if (rulesetList._malformed) { pushErr("rulesets_list", rulesetList._status || 0); }
+    else if (Array.isArray(rulesetList)) {
       const truncated = rulesetList._pagination_truncated;
       delete rulesetList._pagination_truncated;
-      if (truncated) {
-        pushErr("rulesets_pagination", 0);
-      }
+      if (truncated) pushErr("rulesets_pagination", 0);
       if (!totalController.signal.aborted) {
-        // 4. Fetch each ruleset detail
         for (const rsSummary of rulesetList) {
-          if (!rsSummary || typeof rsSummary !== "object") {
-            pushErr("ruleset_detail", 0, { reason: "invalid-list-entry" });
-            continue;
-          }
-          if (typeof rsSummary.id !== "number" || rsSummary.id < 1 || !Number.isFinite(rsSummary.id)) {
-            pushErr("ruleset_detail", 0, { reason: "non-numeric-id" });
-            continue;
-          }
+          if (!rsSummary || typeof rsSummary !== "object") { pushErr("ruleset_detail", 0, { reason: "invalid-list-entry" }); continue; }
+          if (typeof rsSummary.id !== "number" || rsSummary.id < 1 || !Number.isFinite(rsSummary.id)) { pushErr("ruleset_detail", 0, { reason: "non-numeric-id" }); continue; }
 
           let detailUrl;
           const selfHref = rsSummary._links?.self?.href;
           if (selfHref) {
             if (typeof selfHref !== "string" || (!urlOriginMatches(selfHref, baseUrl) && !selfHref.startsWith("/"))) {
-              pushErr("ruleset_detail", 0, { ruleset_id: rsSummary.id, reason: "hostile-self-href" });
-              continue;
+              pushErr("ruleset_detail", 0, { ruleset_id: rsSummary.id, reason: "hostile-self-href" }); continue;
             }
             detailUrl = selfHref;
-          } else {
-            detailUrl = `/repos/${owner}/${repo}/rulesets/${rsSummary.id}`;
-          }
+          } else { detailUrl = `/repos/${owner}/${repo}/rulesets/${rsSummary.id}`; }
 
           const detail = await ghFetch(token, detailUrl, dOpts);
           const detailStatus = detail._status;
           delete detail._status;
 
-          if (detail._network_error || detail._foreign_origin) {
-            pushErr("ruleset_detail", detail._network_error ? 0 : 0, { ruleset_id: rsSummary.id });
-          } else if (detail._malformed) {
-            pushErr("ruleset_detail", detailStatus || 0, { ruleset_id: rsSummary.id });
-          } else if (detailStatus === 200) {
+          if (detail._network_error || detail._foreign_origin) { pushErr("ruleset_detail", 0, { ruleset_id: rsSummary.id }); }
+          else if (detail._malformed) { pushErr("ruleset_detail", detailStatus || 0, { ...(detail._reason ? { reason: detail._reason } : {}), ruleset_id: rsSummary.id }); }
+          else if (detailStatus === 200) {
             const bodyErr = validateObjectBody(detail, "ruleset-detail");
-            if (bodyErr) {
-              pushErr("ruleset_detail", 200, { ruleset_id: rsSummary.id, reason: bodyErr });
-            } else {
-              evidence.rulesets.push(detail);
+            if (bodyErr) { pushErr("ruleset_detail", 200, { ruleset_id: rsSummary.id, reason: bodyErr }); }
+            else {
+              const shapeErr = validateRulesetDetailShape(detail);
+              if (shapeErr) { pushErr("ruleset_detail", 200, { ruleset_id: rsSummary.id, reason: shapeErr }); }
+              else { evidence.rulesets.push(detail); }
             }
-          } else {
-            pushErr("ruleset_detail", detailStatus || 0, { ruleset_id: rsSummary.id });
-          }
+          } else { pushErr("ruleset_detail", detailStatus || 0, { ruleset_id: rsSummary.id }); }
 
-          if (totalController.signal.aborted) break;
+          if (totalController.signal.aborted) continue;
         }
       }
     }
@@ -440,13 +400,6 @@ export async function collectLive(token, owner, repo, branch, opts = {}) {
 // Ruleset helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Classify a ref pattern against target branch.
- * Returns:
- *   "match"    — definitely matches
- *   "nomatch"  — definitely does not match
- *   "unknown"  — cannot determine (fail-safe)
- */
 function classifyRef(pattern, targetBranch, knownDefaultBranch) {
   if (pattern === `refs/heads/${targetBranch}`) return "match";
   if (pattern === "~ALL") return "match";
@@ -490,10 +443,6 @@ function activeRulesetsForBranch(evidence, targetBranch, knownDefaultBranch) {
   });
 }
 
-/**
- * Check if ANY rule across ALL rulesets matches ruleType AND predicate.
- * predicate receives the rule object. If predicate is absent, just checks type.
- */
 function anyRulesetRule(rulesets, ruleType, predicate) {
   for (const rs of rulesets) {
     const rules = rs.rules;
@@ -508,36 +457,20 @@ function anyRulesetRule(rulesets, ruleType, predicate) {
   return false;
 }
 
-/** Predicate: rule.parameters[paramName] === true */
 function paramBoolPredicate(paramName) {
-  return (rule) => {
-    const p = rule.parameters;
-    return p && typeof p === "object" && p[paramName] === true;
-  };
+  return (rule) => { const p = rule.parameters; return p && typeof p === "object" && p[paramName] === true; };
 }
-
-/** Predicate: rule.parameters[paramName] >= minVal */
 function paramMinPredicate(paramName, minVal) {
-  return (rule) => {
-    const p = rule.parameters;
-    const v = p && typeof p === "object" ? p[paramName] : undefined;
-    return typeof v === "number" && v >= minVal;
-  };
+  return (rule) => { const p = rule.parameters; const v = p && typeof p === "object" ? p[paramName] : undefined; return typeof v === "number" && v >= minVal; };
 }
-
-/** Predicate: rule.parameters[paramName] is an array that includes all expected checks */
 function statusChecksPredicate(paramName, expected) {
-  return (rule) => {
-    const p = rule.parameters;
-    if (!p || typeof p !== "object") return false;
-    const raw = p[paramName];
-    return statusChecksInclude(raw, expected);
-  };
+  return (rule) => { const p = rule.parameters; if (!p || typeof p !== "object") return false; return statusChecksInclude(p[paramName], expected); };
 }
 
 function rulesetHasBypassActors(rulesets) {
   for (const rs of rulesets) {
     if (!rs || typeof rs !== "object") continue;
+    // Must be an actual array — string "not-an-array" is ignored (not a bypass)
     if (Array.isArray(rs.bypass_actors) && rs.bypass_actors.length > 0) return true;
   }
   return false;
@@ -560,82 +493,89 @@ function statusChecksInclude(contexts, expected) {
   const names = parseStatusCheckContexts(contexts);
   if (names.length === 0) return false;
   const unique = [...new Set(names)];
-  for (const exp of expected) {
-    if (!unique.includes(exp)) return false;
-  }
+  for (const exp of expected) if (!unique.includes(exp)) return false;
   return true;
 }
 
 // ---------------------------------------------------------------------------
-// Core check function (deterministic — no ambient env)
+// Core check function
 // ---------------------------------------------------------------------------
+
+/**
+ * Validate a ruleset entry shape for offline evidence.
+ * Returns null if ok, else error reason. Conservative: absent fields where
+ * the code handles defaults are not errors.
+ */
+function validateOfflineRulesetEntry(r) {
+  if (!r || typeof r !== "object") return "not-object";
+  if (typeof r.id !== "number" || !Number.isFinite(r.id) || r.id < 1) return "invalid-id";
+  if (!Array.isArray(r.rules)) return "invalid-rules-array";
+  // enforcement: if present must be string
+  if (r.enforcement !== undefined && typeof r.enforcement !== "string") return "invalid-enforcement";
+  // bypass_actors: if present must be array
+  if (r.bypass_actors !== undefined && !Array.isArray(r.bypass_actors)) return "invalid-bypass_actors";
+  // conditions.ref_name depth check
+  const refName = r.conditions?.ref_name;
+  if (refName) {
+    if (refName.include !== undefined && !Array.isArray(refName.include)) return "invalid-conditions-include";
+    if (refName.exclude !== undefined && !Array.isArray(refName.exclude)) return "invalid-conditions-exclude";
+  }
+  // rules entries
+  for (const rule of r.rules) {
+    if (!rule || typeof rule !== "object") return "invalid-rule-entry";
+    if (typeof rule.type !== "string") return "invalid-rule-type";
+    if (rule.parameters !== undefined && (typeof rule.parameters !== "object" || rule.parameters === null || Array.isArray(rule.parameters))) {
+      return "invalid-rule-parameters";
+    }
+  }
+  return null;
+}
 
 export function check(evidence, policy, ctx = {}) {
   const repository = ctx.repository || "redacted";
   const branch = ctx.branch || policy?.target_branch || "main";
   const isOffline = ctx.source === "offline";
 
-  // Offline structural validation: root shape
   if (isOffline) {
-    if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) {
+    if (!evidence || typeof evidence !== "object" || Array.isArray(evidence))
       return { passed: false, controls: {}, failed: [], summary: "FAILED: evidence not an object", repository, branch, _error: "malformed-evidence" };
-    }
 
-    // metadata required
     const meta = evidence.metadata;
-    if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    if (!meta || typeof meta !== "object" || Array.isArray(meta))
       return { passed: false, controls: {}, failed: [], summary: "FAILED: metadata missing or invalid", repository, branch, _error: "malformed-evidence" };
-    }
-
-    // metadata.branch must exactly match
-    if (meta.branch !== branch) {
+    if (meta.branch !== branch)
       return { passed: false, controls: {}, failed: [], summary: "FAILED: metadata.branch does not match policy.target_branch", repository, branch, _error: "branch-mismatch" };
-    }
-
-    // Validate metadata.default_branch shape if present
-    if (meta.default_branch != null && typeof meta.default_branch !== "string") {
+    if (meta.default_branch != null && typeof meta.default_branch !== "string")
       return { passed: false, controls: {}, failed: [], summary: "FAILED: metadata.default_branch not a string", repository, branch, _error: "malformed-evidence" };
-    }
 
-    // Validate classic_branch_protection
     const cbp = evidence.classic_branch_protection;
-    if (cbp !== null && cbp !== undefined && (typeof cbp !== "object" || Array.isArray(cbp))) {
+    if (cbp !== null && cbp !== undefined && (typeof cbp !== "object" || Array.isArray(cbp)))
       return { passed: false, controls: {}, failed: [], summary: "FAILED: classic_branch_protection not an object", repository, branch, _error: "malformed-evidence" };
-    }
 
-    // Validate classic_required_signatures
     const cs = evidence.classic_required_signatures;
-    if (cs !== null && cs !== undefined && (typeof cs !== "object" || Array.isArray(cs))) {
+    if (cs !== null && cs !== undefined && (typeof cs !== "object" || Array.isArray(cs)))
       return { passed: false, controls: {}, failed: [], summary: "FAILED: classic_required_signatures not an object", repository, branch, _error: "malformed-evidence" };
-    }
 
-    // Validate rulesets array
     const rs = evidence.rulesets;
-    if (rs !== null && rs !== undefined && !Array.isArray(rs)) {
+    if (rs !== null && rs !== undefined && !Array.isArray(rs))
       return { passed: false, controls: {}, failed: [], summary: "FAILED: rulesets not an array", repository, branch, _error: "malformed-evidence" };
-    }
 
-    // Validate _errors array
     const er = evidence._errors;
-    if (er !== null && er !== undefined && !Array.isArray(er)) {
+    if (er !== null && er !== undefined && !Array.isArray(er))
       return { passed: false, controls: {}, failed: [], summary: "FAILED: _errors not an array", repository, branch, _error: "malformed-evidence" };
-    }
 
-    // Per-element validation: _errors entries
     if (Array.isArray(er)) {
       for (const e of er) {
-        if (!e || typeof e !== "object" || typeof e.phase !== "string" || typeof e.status !== "number") {
+        if (!e || typeof e !== "object" || typeof e.phase !== "string" || typeof e.status !== "number")
           return { passed: false, controls: {}, failed: [], summary: "FAILED: malformed _errors entry", repository, branch, _error: "malformed-evidence" };
-        }
       }
     }
 
-    // Per-element validation: rulesets entries
     if (Array.isArray(rs)) {
       for (const r of rs) {
-        if (!r || typeof r !== "object" || typeof r.id !== "number" || !Array.isArray(r.rules) || typeof r.enforcement !== "string") {
+        const shapeErr = validateOfflineRulesetEntry(r);
+        if (shapeErr)
           return { passed: false, controls: {}, failed: [], summary: "FAILED: malformed ruleset entry", repository, branch, _error: "malformed-evidence" };
-        }
       }
     }
   }
@@ -643,25 +583,17 @@ export function check(evidence, policy, ctx = {}) {
   const controls = {};
   const failed = [];
 
-  // ANY _errors entry → fail closed (all controls NOT ENFORCED)
   const errs = evidence?._errors || [];
   if (errs.length > 0) {
-    for (const ctrl of policy.controls) {
-      controls[ctrl.id] = { enforced: false, source: "error" };
-    }
+    for (const ctrl of policy.controls) controls[ctrl.id] = { enforced: false, source: "error" };
     failed.push(...policy.controls.map(c => c.id));
-    return {
-      passed: false, controls, failed,
-      summary: `FAILED: collection errors — all ${policy.controls.length} controls NOT ENFORCED`,
-      repository, branch,
-    };
+    return { passed: false, controls, failed, summary: `FAILED: collection errors — all ${policy.controls.length} controls NOT ENFORCED`, repository, branch };
   }
 
   const classic = evidence?.classic_branch_protection || null;
   const classicSigs = evidence?.classic_required_signatures || null;
   const knownDefaultBranch = evidence?.metadata?.default_branch || null;
 
-  // Split rulesets: clean vs bypassed
   const allRulesets = activeRulesetsForBranch(evidence, branch, knownDefaultBranch);
   const cleanRulesets = allRulesets.filter(rs => !(Array.isArray(rs.bypass_actors) && rs.bypass_actors.length > 0));
   const bypassedRulesets = allRulesets.filter(rs => Array.isArray(rs.bypass_actors) && rs.bypass_actors.length > 0);
@@ -671,14 +603,10 @@ export function check(evidence, policy, ctx = {}) {
     let enforced = false;
     let source = null;
 
-    // ---- Classic check ----
     if (ctrl.classic_check) {
       let val;
-      if (ctrl.classic_separate_endpoint) {
-        val = classicSigs ? get(classicSigs, "enabled") : undefined;
-      } else {
-        val = classic ? get(classic, ctrl.classic_field) : undefined;
-      }
+      if (ctrl.classic_separate_endpoint) val = classicSigs ? get(classicSigs, "enabled") : undefined;
+      else val = classic ? get(classic, ctrl.classic_field) : undefined;
 
       switch (ctrl.classic_check) {
         case "exists": enforced = val !== undefined && val !== null; break;
@@ -686,51 +614,30 @@ export function check(evidence, policy, ctx = {}) {
         case "bool_false": enforced = val === false; break;
         case "min_value": enforced = typeof val === "number" && val >= (ctrl.min_value || 0); break;
         case "status_checks_includes":
-        case "status_checks":
-          enforced = statusChecksInclude(val, ctrl.expected_checks || []); break;
+        case "status_checks": enforced = statusChecksInclude(val, ctrl.expected_checks || []); break;
       }
       if (enforced) source = "classic";
     }
 
-    // ---- Ruleset check (clean rulesets only) ----
     if (ctrl.ruleset_check && ctrl.ruleset_type && ctrl.id !== "admin_enforcement") {
       if (!enforced && cleanRulesets.length > 0) {
         switch (ctrl.ruleset_check) {
           case "rule_exists":
-            if (anyRulesetRule(cleanRulesets, ctrl.ruleset_type)) { enforced = true; source = "ruleset"; }
-            break;
-          case "bool_true": {
-            if (anyRulesetRule(cleanRulesets, ctrl.ruleset_type, paramBoolPredicate(ctrl.ruleset_param))) {
-              enforced = true; source = "ruleset";
-            }
-            break;
-          }
-          case "min_value": {
-            if (anyRulesetRule(cleanRulesets, ctrl.ruleset_type, paramMinPredicate(ctrl.ruleset_param, ctrl.min_value || 0))) {
-              enforced = true; source = "ruleset";
-            }
-            break;
-          }
+            if (anyRulesetRule(cleanRulesets, ctrl.ruleset_type)) { enforced = true; source = "ruleset"; } break;
+          case "bool_true":
+            if (anyRulesetRule(cleanRulesets, ctrl.ruleset_type, paramBoolPredicate(ctrl.ruleset_param))) { enforced = true; source = "ruleset"; } break;
+          case "min_value":
+            if (anyRulesetRule(cleanRulesets, ctrl.ruleset_type, paramMinPredicate(ctrl.ruleset_param, ctrl.min_value || 0))) { enforced = true; source = "ruleset"; } break;
           case "status_checks_includes":
-          case "status_checks": {
-            if (anyRulesetRule(cleanRulesets, ctrl.ruleset_type, statusChecksPredicate(ctrl.ruleset_param, ctrl.expected_checks || []))) {
-              enforced = true; source = "ruleset";
-            }
-            break;
-          }
+          case "status_checks":
+            if (anyRulesetRule(cleanRulesets, ctrl.ruleset_type, statusChecksPredicate(ctrl.ruleset_param, ctrl.expected_checks || []))) { enforced = true; source = "ruleset"; } break;
         }
       }
     }
 
-    // ---- admin_enforcement: ANY bypass → fail ----
     if (ctrl.id === "admin_enforcement") {
-      if (hasAnyBypass) {
-        enforced = false;
-        source = null;
-      } else if (!enforced && cleanRulesets.length > 0) {
-        enforced = true;
-        source = "ruleset";
-      }
+      if (hasAnyBypass) { enforced = false; source = null; }
+      else if (!enforced && cleanRulesets.length > 0) { enforced = true; source = "ruleset"; }
     }
 
     const result = { enforced };
@@ -740,10 +647,7 @@ export function check(evidence, policy, ctx = {}) {
   }
 
   const passed = failed.length === 0;
-  const summary = passed
-    ? `ALL ${policy.controls.length} controls ENFORCED`
-    : `FAILED: ${failed.length} of ${policy.controls.length} controls NOT ENFORCED`;
-
+  const summary = passed ? `ALL ${policy.controls.length} controls ENFORCED` : `FAILED: ${failed.length} of ${policy.controls.length} controls NOT ENFORCED`;
   return { passed, controls, failed, summary, repository, branch };
 }
 
@@ -753,8 +657,7 @@ export function check(evidence, policy, ctx = {}) {
 
 function redactedOutput(result) {
   return {
-    repository: "redacted",
-    branch: "redacted",
+    repository: "redacted", branch: "redacted",
     passed: result.passed,
     controls: result.controls,
     failed_count: result.failed ? result.failed.length : 0,
@@ -766,16 +669,11 @@ function redactedOutput(result) {
 // CLI
 // ---------------------------------------------------------------------------
 
-/**
- * Exported for test injection.
- * @param {object} opts — { token?, repository?, evidencePath?, injectCollectLive? }
- */
 export async function main(opts = {}) {
   const policy = await loadPolicy();
   const branch = policy.target_branch || "main";
 
-  let evidence;
-  let source;
+  let evidence, source;
 
   const token = opts.token ?? process.env.GITHUB_TOKEN;
   const repository = opts.repository ?? process.env.GITHUB_REPOSITORY ?? "";
@@ -796,7 +694,7 @@ export async function main(opts = {}) {
     }
   } else {
     source = "offline";
-    const evidencePath = process.env.INFORMER_PATH || process.argv[2] || ".github/branch-governance-evidence.json";
+    const evidencePath = opts.evidencePath || process.env.INFORMER_PATH || process.argv[2] || ".github/branch-governance-evidence.json";
     let raw;
     try { raw = await readFile(evidencePath, "utf8"); } catch {
       process.stderr.write(JSON.stringify({ error: "evidence-read-failed" }) + "\n");
@@ -813,7 +711,6 @@ export async function main(opts = {}) {
   }
 
   const result = check(evidence, policy, { source, repository: "redacted", branch });
-
   if (result._error) {
     process.stderr.write(JSON.stringify({ error: result._error }) + "\n");
     return 2;
@@ -821,14 +718,8 @@ export async function main(opts = {}) {
 
   const output = redactedOutput(result);
   const json = JSON.stringify(output, null, 2);
-
-  if (result.passed) {
-    process.stdout.write(json + "\n");
-    return 0;
-  } else {
-    process.stderr.write(json + "\n");
-    return 1;
-  }
+  if (result.passed) { process.stdout.write(json + "\n"); return 0; }
+  else { process.stderr.write(json + "\n"); return 1; }
 }
 
 // Run if called directly

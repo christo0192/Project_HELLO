@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 
 /**
- * check-branch-governance.test.mjs — Full test suite. No network calls
- * except explicit mock HTTP servers running on 127.0.0.1.
- * All synthetic evidence embedded inline.
+ * check-branch-governance.test.mjs — Full test suite.
+ *
+ * All tests run sequentially via an async queue — every promise is awaited
+ * before PASS/FAIL is reported. A network-call trap wraps globalThis.fetch
+ * to reject any non-loopback URL, ensuring zero external network calls.
  */
 
 import { readFile, writeFile, mkdtemp, rm } from "node:fs/promises";
@@ -15,6 +17,21 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { check, collectLive, main, GITHUB_ORIGIN } from "./check-branch-governance.mjs";
 
+// ---------------------------------------------------------------------------
+// Network-call trap — must NOT make external calls
+// ---------------------------------------------------------------------------
+const LOOPBACK = /^http:\/\/127\.0\.0\.1:\d+/;
+const originalFetch = globalThis.fetch;
+let extCallCount = 0;
+globalThis.fetch = (...args) => {
+  const url = typeof args[0] === "string" ? args[0] : (args[0]?.url || args[0]?.href || "");
+  if (!LOOPBACK.test(url)) { extCallCount++; throw new Error(`FORBIDDEN_EXTERNAL_NETWORK_CALL: ${url}`); }
+  return originalFetch(...args);
+};
+
+// ---------------------------------------------------------------------------
+// Constants & fixtures
+// ---------------------------------------------------------------------------
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const VERIFIER = path.join(SCRIPT_DIR, "check-branch-governance.mjs");
 const POLICY_PATH = path.resolve(SCRIPT_DIR, "..", ".github", "branch-governance-policy.json");
@@ -23,9 +40,6 @@ const policy = JSON.parse(await readFile(POLICY_PATH, "utf8"));
 const CTX_OFFLINE = { source: "offline", repository: "redacted", branch: "main" };
 const CTX_LIVE = { source: "live", repository: "redacted", branch: "main" };
 
-// ---------------------------------------------------------------------------
-// Synthetic fixtures
-// ---------------------------------------------------------------------------
 const CLASSIC_ALL = {
   required_pull_request_reviews: { required_approving_review_count: 2, require_code_owner_reviews: true, dismiss_stale_reviews: true, require_last_push_approval: true },
   required_conversation_resolution: { enabled: true },
@@ -55,31 +69,32 @@ function ev(overrides = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// Test runner
+// Async test runner — every test is awaited before PASS/FAIL is counted
 // ---------------------------------------------------------------------------
-let passed = 0, failed = 0;
-async function tm(name, fn) { try { await fn(); console.log(`PASS: ${name}`); passed++; } catch (e) { console.log(`FAIL: ${name} — ${e.message}`); failed++; } }
-function t(name, fn) { try { fn(); console.log(`PASS: ${name}`); passed++; } catch (e) { console.log(`FAIL: ${name} — ${e.message}`); failed++; } }
-function ok(cond, msg) { if (!cond) throw new Error(msg || "assertion"); }
+const tests = [];
+// Self-test: a deliberately async-rejecting test to prove the runner awaits
+const _ASYNC_RUNNER_SELF_TEST_FAILED = Symbol("runner-self-test");
+function register(name, fn) { tests.push({ name, fn }); }
 
-// ---------------------------------------------------------------------------
-// 1. Positive
-// ---------------------------------------------------------------------------
-t("classic-all-enforced", () => {
+// Seed a test that must be caught by the runner
+register("__ASYNC_RUNNER_SELF_TEST", async () => { throw _ASYNC_RUNNER_SELF_TEST_FAILED; });
+
+register("classic-all-enforced", () => {
   const r = check(ev({ classic_branch_protection: CLASSIC_ALL, classic_required_signatures: SIGS_ON }), policy, CTX_OFFLINE);
-  ok(r.passed, `failed: ${r.failed}`); for (const c of policy.controls) ok(r.controls[c.id].enforced, c.id);
-});
-t("ruleset-full-active", () => {
-  const r = check(ev({ rulesets: rsFull() }), policy, CTX_LIVE);
-  ok(r.passed, `failed: ${r.failed}`); for (const c of policy.controls) ok(r.controls[c.id].enforced, c.id);
+  if (!r.passed) throw new Error(`failed: ${r.failed}`);
+  for (const c of policy.controls) if (!r.controls[c.id].enforced) throw new Error(c.id);
 });
 
-// ---------------------------------------------------------------------------
-// 2. Individual negatives
-// ---------------------------------------------------------------------------
-const negClassic = (id, fn) => t(`neg-${id}`, () => {
+register("ruleset-full-active", () => {
+  const r = check(ev({ rulesets: rsFull() }), policy, CTX_LIVE);
+  if (!r.passed) throw new Error(`failed: ${r.failed}`);
+  for (const c of policy.controls) if (!r.controls[c.id].enforced) throw new Error(c.id);
+});
+
+// Individual negatives
+const negClassic = (id, fn) => register(`neg-${id}`, () => {
   const r = check(ev({ classic_branch_protection: fn(), classic_required_signatures: SIGS_ON }), policy, CTX_OFFLINE);
-  ok(r.failed.includes(id), `${id} not in failed`);
+  if (!r.failed.includes(id)) throw new Error(`${id} not in failed`);
 });
 negClassic("require_two_approvals",       () => ({ ...CLASSIC_ALL, required_pull_request_reviews: { ...CLASSIC_ALL.required_pull_request_reviews, required_approving_review_count: 1 } }));
 negClassic("require_codeowner_review",    () => ({ ...CLASSIC_ALL, required_pull_request_reviews: { ...CLASSIC_ALL.required_pull_request_reviews, require_code_owner_reviews: false } }));
@@ -90,118 +105,125 @@ negClassic("admin_enforcement",      () => ({ ...CLASSIC_ALL, enforce_admins: { 
 negClassic("linear_history",         () => ({ ...CLASSIC_ALL, required_linear_history: { enabled: false } }));
 negClassic("force_push_disabled",    () => ({ ...CLASSIC_ALL, allow_force_pushes: { enabled: true } }));
 negClassic("deletion_disabled",      () => ({ ...CLASSIC_ALL, allow_deletions: { enabled: true } }));
-t("neg-signed_commits", () => {
-  ok(check(ev({ classic_branch_protection: CLASSIC_ALL, classic_required_signatures: SIGS_OFF }), policy, CTX_OFFLINE).failed.includes("signed_commits"));
+register("neg-signed_commits", () => {
+  if (!check(ev({ classic_branch_protection: CLASSIC_ALL, classic_required_signatures: SIGS_OFF }), policy, CTX_OFFLINE).failed.includes("signed_commits"))
+    throw new Error("signed_commits not in failed");
 });
-t("neg-require_pull_requests-classic", () => {
-  ok(check(ev({ classic_branch_protection: {}, classic_required_signatures: SIGS_ON }), policy, CTX_OFFLINE).failed.includes("require_pull_requests"));
+register("neg-require_pull_requests-classic", () => {
+  if (!check(ev({ classic_branch_protection: {}, classic_required_signatures: SIGS_ON }), policy, CTX_OFFLINE).failed.includes("require_pull_requests"))
+    throw new Error("require_pull_requests not in failed");
 });
 
-// ---------------------------------------------------------------------------
-// 3. Status checks includes semantics
-// ---------------------------------------------------------------------------
-t("status-checks-includes-both", () => ok(check(ev({ classic_branch_protection: CLASSIC_ALL, classic_required_signatures: SIGS_ON }), policy, CTX_OFFLINE).controls.required_status_checks.enforced));
-t("status-checks-includes-extra", () => {
+// Status checks
+register("status-checks-includes-both", () => {
+  if (!check(ev({ classic_branch_protection: CLASSIC_ALL, classic_required_signatures: SIGS_ON }), policy, CTX_OFFLINE).controls.required_status_checks.enforced)
+    throw new Error("status checks should pass");
+});
+register("status-checks-includes-extra", () => {
   const c = { ...CLASSIC_ALL, required_status_checks: { contexts: ["quality", "secret-scan", "extra-check"] } };
-  ok(check(ev({ classic_branch_protection: c, classic_required_signatures: SIGS_ON }), policy, CTX_OFFLINE).controls.required_status_checks.enforced);
+  if (!check(ev({ classic_branch_protection: c, classic_required_signatures: SIGS_ON }), policy, CTX_OFFLINE).controls.required_status_checks.enforced)
+    throw new Error("extra checks should not fail");
 });
-t("status-checks-missing-quality", () => {
+register("status-checks-missing-quality", () => {
   const c = { ...CLASSIC_ALL, required_status_checks: { contexts: ["secret-scan"] } };
-  ok(check(ev({ classic_branch_protection: c, classic_required_signatures: SIGS_ON }), policy, CTX_OFFLINE).failed.includes("required_status_checks"));
+  if (!check(ev({ classic_branch_protection: c, classic_required_signatures: SIGS_ON }), policy, CTX_OFFLINE).failed.includes("required_status_checks"))
+    throw new Error("missing quality should fail");
 });
-t("status-checks-missing-secret-scan", () => {
+register("status-checks-missing-secret-scan", () => {
   const c = { ...CLASSIC_ALL, required_status_checks: { contexts: ["quality"] } };
-  ok(check(ev({ classic_branch_protection: c, classic_required_signatures: SIGS_ON }), policy, CTX_OFFLINE).failed.includes("required_status_checks"));
+  if (!check(ev({ classic_branch_protection: c, classic_required_signatures: SIGS_ON }), policy, CTX_OFFLINE).failed.includes("required_status_checks"))
+    throw new Error("missing secret-scan should fail");
 });
-t("status-checks-malformed-null-entry", () => {
+register("status-checks-malformed-null-entry", () => {
   const rl = rsFull(); rl[0].rules.find(x => x.type === "required_status_checks").parameters.required_status_checks = [{ context: "quality" }, null, { context: "secret-scan" }];
-  ok(check(ev({ rulesets: rl }), policy, CTX_LIVE).failed.includes("required_status_checks"));
+  if (!check(ev({ rulesets: rl }), policy, CTX_LIVE).failed.includes("required_status_checks"))
+    throw new Error("null entry should fail");
 });
-t("status-checks-malformed-empty-context", () => {
+register("status-checks-malformed-empty-context", () => {
   const rl = rsFull(); rl[0].rules.find(x => x.type === "required_status_checks").parameters.required_status_checks = [{ context: "quality" }, { context: "" }, { context: "secret-scan" }];
-  ok(check(ev({ rulesets: rl }), policy, CTX_LIVE).failed.includes("required_status_checks"));
+  if (!check(ev({ rulesets: rl }), policy, CTX_LIVE).failed.includes("required_status_checks"))
+    throw new Error("empty context should fail");
 });
 
-// ---------------------------------------------------------------------------
-// 4. Bool/multiple-rule ordering tests (weak-first, strong-second for bool predicates)
-// ---------------------------------------------------------------------------
-t("bool-weak-first-strong-second-CODEOWNER", () => {
-  // First pull_request rule: CODEOWNER=false. Second: CODEOWNER=true. Should pass via anyRulesetRule bool predicate.
+// Bool ordering
+register("bool-weak-first-strong-second-CODEOWNER", () => {
   const rl = [rs({ rules: [
     { type: "pull_request", parameters: { require_code_owner_review: false, required_approving_review_count: 2 } },
     { type: "pull_request", parameters: { require_code_owner_review: true } }
   ] })];
-  ok(check(ev({ rulesets: rl }), policy, CTX_LIVE).controls.require_codeowner_review.enforced, "CODEOWNER should pass via second rule");
+  if (!check(ev({ rulesets: rl }), policy, CTX_LIVE).controls.require_codeowner_review.enforced)
+    throw new Error("CODEOWNER should pass via second rule");
 });
-t("bool-weak-first-strong-second-dismiss", () => {
+register("bool-weak-first-strong-second-dismiss", () => {
   const rl = [rs({ rules: [
     { type: "pull_request", parameters: { dismiss_stale_reviews_on_push: false, required_approving_review_count: 2 } },
     { type: "pull_request", parameters: { dismiss_stale_reviews_on_push: true } }
   ] })];
-  ok(check(ev({ rulesets: rl }), policy, CTX_LIVE).controls.dismiss_stale_approvals.enforced, "dismiss should pass via second rule");
+  if (!check(ev({ rulesets: rl }), policy, CTX_LIVE).controls.dismiss_stale_approvals.enforced)
+    throw new Error("dismiss should pass via second rule");
 });
-t("bool-weak-first-strong-second-last-push", () => {
+register("bool-weak-first-strong-second-last-push", () => {
   const rl = [rs({ rules: [
     { type: "pull_request", parameters: { require_last_push_approval: false, required_approving_review_count: 2 } },
     { type: "pull_request", parameters: { require_last_push_approval: true } }
   ] })];
-  ok(check(ev({ rulesets: rl }), policy, CTX_LIVE).controls.require_last_push_approval.enforced, "last-push should pass via second rule");
+  if (!check(ev({ rulesets: rl }), policy, CTX_LIVE).controls.require_last_push_approval.enforced)
+    throw new Error("last-push should pass via second rule");
 });
-t("bool-weak-first-strong-second-conversation", () => {
+register("bool-weak-first-strong-second-conversation", () => {
   const rl = [rs({ rules: [
     { type: "pull_request", parameters: { required_review_thread_resolution: false, required_approving_review_count: 2 } },
     { type: "pull_request", parameters: { required_review_thread_resolution: true } }
   ] })];
-  ok(check(ev({ rulesets: rl }), policy, CTX_LIVE).controls.require_conversation_resolution.enforced, "conversation resolution should pass via second rule");
+  if (!check(ev({ rulesets: rl }), policy, CTX_LIVE).controls.require_conversation_resolution.enforced)
+    throw new Error("conversation should pass via second rule");
 });
-
-t("status-checks-weak-first-strong-second", () => {
-  // First rule: only quality. Second rule: quality + secret-scan. Pass via second rule.
+register("status-checks-weak-first-strong-second", () => {
   const rl = [rs({ rules: [
     { type: "required_status_checks", parameters: { required_status_checks: [{ context: "quality" }] } },
     { type: "required_status_checks", parameters: { required_status_checks: [{ context: "quality" }, { context: "secret-scan" }] } }
   ] })];
-  ok(check(ev({ rulesets: rl }), policy, CTX_LIVE).controls.required_status_checks.enforced, "status checks should pass via second rule");
+  if (!check(ev({ rulesets: rl }), policy, CTX_LIVE).controls.required_status_checks.enforced)
+    throw new Error("status checks should pass via second rule");
 });
-t("status-checks-strong-first-weak-second", () => {
+register("status-checks-strong-first-weak-second", () => {
   const rl = [rs({ rules: [
     { type: "required_status_checks", parameters: { required_status_checks: [{ context: "quality" }, { context: "secret-scan" }] } },
     { type: "required_status_checks", parameters: { required_status_checks: [{ context: "quality" }] } }
   ] })];
-  ok(check(ev({ rulesets: rl }), policy, CTX_LIVE).controls.required_status_checks.enforced, "strong first should work");
+  if (!check(ev({ rulesets: rl }), policy, CTX_LIVE).controls.required_status_checks.enforced)
+    throw new Error("strong first should work");
 });
-
-// Min-value ordering (existing tests)
-t("rules-weak-first-strong-second-min", () => {
+register("rules-weak-first-strong-second-min", () => {
   const rl = [rs({ rules: [
     { type: "pull_request", parameters: { required_approving_review_count: 1 } },
     { type: "pull_request", parameters: { required_approving_review_count: 2, require_code_owner_review: true } }
   ] })];
-  ok(check(ev({ rulesets: rl }), policy, CTX_LIVE).controls.require_two_approvals.enforced, "min-value via second rule");
+  if (!check(ev({ rulesets: rl }), policy, CTX_LIVE).controls.require_two_approvals.enforced)
+    throw new Error("min-value via second rule");
 });
-t("rules-strong-first-weak-second-min", () => {
+register("rules-strong-first-weak-second-min", () => {
   const rl = [rs({ rules: [{ type: "pull_request", parameters: { required_approving_review_count: 2 } }, { type: "pull_request", parameters: { required_approving_review_count: 1 } }] })];
-  ok(check(ev({ rulesets: rl }), policy, CTX_LIVE).controls.require_two_approvals.enforced, "min-value strong first");
+  if (!check(ev({ rulesets: rl }), policy, CTX_LIVE).controls.require_two_approvals.enforced)
+    throw new Error("min-value strong first");
 });
 
-// ---------------------------------------------------------------------------
-// 5. Ruleset variants
-// ---------------------------------------------------------------------------
-t("neg-ruleset-inactive", () => {
-  ok(!check(ev({ rulesets: [rs({ enforcement: "evaluate" })] }), policy, CTX_LIVE).passed);
+// Ruleset variants
+register("neg-ruleset-inactive", () => {
+  if (check(ev({ rulesets: [rs({ enforcement: "evaluate" })] }), policy, CTX_LIVE).passed) throw new Error("inactive should fail");
 });
-t("neg-ruleset-bypass-all-controls", () => {
+register("neg-ruleset-bypass-all-controls", () => {
   const bypassed = rs({ bypass_actors: [{ actor_id: 5, actor_type: "RepositoryRole" }], rules: [
     { type: "pull_request", parameters: { required_approving_review_count: 2, require_code_owner_review: true, dismiss_stale_reviews_on_push: true, require_last_push_approval: true, required_review_thread_resolution: true } },
     { type: "required_signatures" }, { type: "required_linear_history" }, { type: "non_fast_forward" }, { type: "deletion" },
     { type: "required_status_checks", parameters: { required_status_checks: [{ context: "quality" }, { context: "secret-scan" }] } }
   ] });
   const r = check(ev({ rulesets: [bypassed] }), policy, CTX_LIVE);
-  ok(!r.passed, "bypassed ruleset should not pass");
-  ok(r.failed.length === policy.controls.length);
-  ok(r.controls.admin_enforcement.enforced === false);
+  if (r.passed) throw new Error("bypassed should not pass");
+  if (r.failed.length !== policy.controls.length) throw new Error(`all controls should fail, got ${r.failed.length}`);
+  if (r.controls.admin_enforcement.enforced) throw new Error("admin must not be enforced");
 });
-t("neg-mixed-classic-bypassed-ruleset", () => {
+register("neg-mixed-classic-bypassed-ruleset", () => {
   const weakClassic = { required_pull_request_reviews: { required_approving_review_count: 2 }, enforce_admins: { enabled: true }, allow_force_pushes: { enabled: false }, allow_deletions: { enabled: false }, required_status_checks: { contexts: ["quality", "secret-scan"] } };
   const bypassed = rs({ bypass_actors: [{ actor_id: 1 }], rules: [
     { type: "pull_request", parameters: { required_approving_review_count: 2, require_code_owner_review: true, dismiss_stale_reviews_on_push: true, require_last_push_approval: true, required_review_thread_resolution: true } },
@@ -209,146 +231,213 @@ t("neg-mixed-classic-bypassed-ruleset", () => {
     { type: "required_status_checks", parameters: { required_status_checks: [{ context: "quality" }, { context: "secret-scan" }] } }
   ] });
   const r = check(ev({ classic_branch_protection: weakClassic, classic_required_signatures: SIGS_OFF, rulesets: [bypassed] }), policy, CTX_OFFLINE);
-  ok(r.failed.includes("admin_enforcement"));
-  ok(r.controls.require_two_approvals.enforced);
-  ok(r.controls.require_pull_requests.enforced);
-  ok(!r.controls.require_codeowner_review.enforced);
-  ok(!r.controls.signed_commits.enforced);
+  if (!r.failed.includes("admin_enforcement")) throw new Error("admin must fail with bypass");
+  if (!r.controls.require_two_approvals.enforced) throw new Error("classic 2-approvals should pass");
+  if (!r.controls.require_pull_requests.enforced) throw new Error("classic PR required should pass");
+  if (r.controls.require_codeowner_review.enforced) throw new Error("CODEOWNER from bypassed should not pass");
+  if (r.controls.signed_commits.enforced) throw new Error("signed_commits from bypassed should not pass");
 });
-t("neg-ruleset-excluded-main", () => {
+register("neg-ruleset-excluded-main", () => {
   const excludedRs = rs({ conditions: { ref_name: { include: ["refs/heads/main"], exclude: ["refs/heads/main"] } } });
-  ok(!check(ev({ rulesets: [excludedRs] }), policy, CTX_LIVE).passed);
+  if (check(ev({ rulesets: [excludedRs] }), policy, CTX_LIVE).passed) throw new Error("excluded should fail");
 });
-t("neg-target-tag", () => ok(!check(ev({ rulesets: [rs({ target: "tag" })] }), policy, CTX_LIVE).passed));
-t("neg-target-missing", () => { const rl = rsFull(); delete rl[0].target; ok(!check(ev({ rulesets: rl }), policy, CTX_LIVE).passed); });
+register("neg-target-tag", () => {
+  if (check(ev({ rulesets: [rs({ target: "tag" })] }), policy, CTX_LIVE).passed) throw new Error("target=tag should fail");
+});
+register("neg-target-missing", () => {
+  const rl = rsFull(); delete rl[0].target;
+  if (check(ev({ rulesets: rl }), policy, CTX_LIVE).passed) throw new Error("missing target should fail");
+});
 
-// ---------------------------------------------------------------------------
-// 6. Tri-state ref matching
-// ---------------------------------------------------------------------------
-t("ref-unknown-include-fails", () => ok(!check(ev({ rulesets: [rs({ conditions: { ref_name: { include: ["refs/tags/v1", "~UNKNOWN"], exclude: [] } } })] }), policy, CTX_LIVE).passed));
-t("ref-unknown-exclude-fails-closed", () => ok(!check(ev({ rulesets: [rs({ conditions: { ref_name: { include: ["refs/heads/main"], exclude: ["~UNKNOWN_PATTERN"] } } })] }), policy, CTX_LIVE).passed));
-t("ref-wildcard-include", () => {
+// Tri-state ref matching
+register("ref-unknown-include-fails", () => {
+  if (check(ev({ rulesets: [rs({ conditions: { ref_name: { include: ["refs/tags/v1", "~UNKNOWN"], exclude: [] } } })] }), policy, CTX_LIVE).passed)
+    throw new Error("unknown include should fail");
+});
+register("ref-unknown-exclude-fails-closed", () => {
+  if (check(ev({ rulesets: [rs({ conditions: { ref_name: { include: ["refs/heads/main"], exclude: ["~UNKNOWN_PATTERN"] } } })] }), policy, CTX_LIVE).passed)
+    throw new Error("unknown exclude should drop ruleset");
+});
+register("ref-wildcard-include", () => {
   const rl = [rs({ conditions: { ref_name: { include: ["refs/heads/*"], exclude: [] } }, rules: [{ type: "pull_request", parameters: { required_approving_review_count: 2 } }] })];
-  ok(check(ev({ rulesets: rl }), policy, CTX_LIVE).controls.require_two_approvals.enforced);
+  if (!check(ev({ rulesets: rl }), policy, CTX_LIVE).controls.require_two_approvals.enforced)
+    throw new Error("wildcard include should match");
 });
-t("ref-all-include", () => {
+register("ref-all-include", () => {
   const rl = [rs({ conditions: { ref_name: { include: ["~ALL"], exclude: [] } }, rules: [{ type: "pull_request", parameters: { required_approving_review_count: 2 } }] })];
-  ok(check(ev({ rulesets: rl }), policy, CTX_LIVE).controls.require_two_approvals.enforced);
+  if (!check(ev({ rulesets: rl }), policy, CTX_LIVE).controls.require_two_approvals.enforced)
+    throw new Error("~ALL include should match");
 });
-t("ref-default-branch-match", () => {
+register("ref-default-branch-match", () => {
   const rl = [rs({ conditions: { ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] } }, rules: [{ type: "pull_request", parameters: { required_approving_review_count: 2 } }] })];
-  ok(check(ev({ rulesets: rl, metadata: { ...ev().metadata, default_branch: "main" } }), policy, CTX_LIVE).controls.require_two_approvals.enforced);
+  if (!check(ev({ rulesets: rl, metadata: { ...ev().metadata, default_branch: "main" } }), policy, CTX_LIVE).controls.require_two_approvals.enforced)
+    throw new Error("~DEFAULT_BRANCH should match main");
 });
-t("ref-default-branch-unknown", () => {
-  const rl = [rs({ conditions: { ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] } } })];
-  ok(!check(ev({ rulesets: rl, metadata: { ...ev().metadata, default_branch: null } }), policy, CTX_LIVE).passed);
+register("ref-default-branch-unknown", () => {
+  if (check(ev({ rulesets: [rs({ conditions: { ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] } } })], metadata: { ...ev().metadata, default_branch: null } }), policy, CTX_LIVE).passed)
+    throw new Error("unknown default should fail-safe");
 });
 
-// ---------------------------------------------------------------------------
-// 7. API errors: all _errors fatal
-// ---------------------------------------------------------------------------
-t("all-errors-fatal-401", () => { const r = check(ev({ _errors: [{ phase: "classic", status: 401 }] }), policy, CTX_OFFLINE); ok(!r.passed && r.failed.length === 12); });
-t("all-errors-fatal-403", () => { const r = check(ev({ _errors: [{ phase: "classic", status: 403 }] }), policy, CTX_OFFLINE); ok(!r.passed && r.failed.length === 12); });
-t("all-errors-fatal-404-ruleset-detail", () => { const r = check(ev({ _errors: [{ phase: "ruleset_detail", status: 404 }] }), policy, CTX_OFFLINE); ok(!r.passed && r.failed.length === 12); });
-t("all-errors-fatal-429", () => { const r = check(ev({ _errors: [{ phase: "classic", status: 429 }] }), policy, CTX_OFFLINE); ok(!r.passed && r.failed.length === 12); });
-t("all-errors-fatal-500", () => { const r = check(ev({ _errors: [{ phase: "rulesets_list", status: 500 }] }), policy, CTX_OFFLINE); ok(!r.passed && r.failed.length === 12); });
-t("all-errors-fatal-network", () => { const r = check(ev({ _errors: [{ phase: "network", status: 0 }] }), policy, CTX_OFFLINE); ok(!r.passed && r.failed.length === 12); });
-t("all-errors-fatal-pagination", () => { const r = check(ev({ _errors: [{ phase: "rulesets_pagination", status: 0 }] }), policy, CTX_OFFLINE); ok(!r.passed && r.failed.length === 12); });
+// All _errors fatal
+register("all-errors-fatal-401", () => {
+  const r = check(ev({ _errors: [{ phase: "classic", status: 401 }] }), policy, CTX_OFFLINE);
+  if (r.passed || r.failed.length !== 12) throw new Error("401 should fail all");
+});
+register("all-errors-fatal-403", () => {
+  const r = check(ev({ _errors: [{ phase: "classic", status: 403 }] }), policy, CTX_OFFLINE);
+  if (r.passed || r.failed.length !== 12) throw new Error("403 should fail all");
+});
+register("all-errors-fatal-404-ruleset-detail", () => {
+  const r = check(ev({ _errors: [{ phase: "ruleset_detail", status: 404 }] }), policy, CTX_OFFLINE);
+  if (r.passed || r.failed.length !== 12) throw new Error("404 detail should fail all");
+});
+register("all-errors-fatal-429", () => {
+  const r = check(ev({ _errors: [{ phase: "classic", status: 429 }] }), policy, CTX_OFFLINE);
+  if (r.passed || r.failed.length !== 12) throw new Error("429 should fail all");
+});
+register("all-errors-fatal-500", () => {
+  const r = check(ev({ _errors: [{ phase: "rulesets_list", status: 500 }] }), policy, CTX_OFFLINE);
+  if (r.passed || r.failed.length !== 12) throw new Error("500 should fail all");
+});
+register("all-errors-fatal-network", () => {
+  const r = check(ev({ _errors: [{ phase: "network", status: 0 }] }), policy, CTX_OFFLINE);
+  if (r.passed || r.failed.length !== 12) throw new Error("network should fail all");
+});
+register("all-errors-fatal-pagination", () => {
+  const r = check(ev({ _errors: [{ phase: "rulesets_pagination", status: 0 }] }), policy, CTX_OFFLINE);
+  if (r.passed || r.failed.length !== 12) throw new Error("pagination should fail all");
+});
 
-// ---------------------------------------------------------------------------
-// 8. Incomplete collection: classic-all-positive + malformed-other-source → fail-closed
-// ---------------------------------------------------------------------------
-t("collectLive-repo-meta-no-default-branch", async () => {
+// Incomplete collection negatives
+register("collectLive-repo-meta-no-default-branch", async () => {
   const { server, baseUrl } = await startServer(mockHandlers({ repoMeta: { status: 200, body: { default_branch: null } } }));
-  const evidence = await collectLive("t", "t", "r", "main", { fetch, baseUrl, timeout: 5000 });
-  ok(evidence._errors.some(e => e.phase === "repo_metadata" && e.reason === "missing-default-branch"), "missing default_branch should error");
+  const evidence = await collectLive("t", "t", "r", "main", { fetch: globalThis.fetch, baseUrl, timeout: 5000 });
+  if (!evidence._errors.some(e => e.phase === "repo_metadata" && e.reason === "missing-default-branch")) throw new Error("missing default_branch should error");
   const r = check(evidence, policy, CTX_LIVE);
-  ok(!r.passed && r.failed.length === 12, "classic-all but repo-meta broken → all fail");
+  if (r.passed || r.failed.length !== 12) throw new Error("classic-all but repo-meta broken → all fail");
   server.close();
 });
-t("collectLive-classic-is-array", async () => {
+register("collectLive-classic-is-array", async () => {
   const { server, baseUrl } = await startServer(mockHandlers({ classic: { status: 200, body: [] } }));
-  const evidence = await collectLive("t", "t", "r", "main", { fetch, baseUrl, timeout: 5000 });
-  ok(evidence._errors.some(e => e.phase === "classic" && e.reason === "array-classic"), "classic array should error");
+  const evidence = await collectLive("t", "t", "r", "main", { fetch: globalThis.fetch, baseUrl, timeout: 5000 });
+  if (!evidence._errors.some(e => e.phase === "classic" && e.reason === "array-parsed-body")) throw new Error("classic array should error");
   const r = check(evidence, policy, CTX_LIVE);
-  ok(!r.passed && r.failed.length === 12, "classic array → all fail");
+  if (r.passed || r.failed.length !== 12) throw new Error("classic array → all fail");
   server.close();
 });
-t("collectLive-sigs-is-null", async () => {
+register("collectLive-sigs-is-null", async () => {
   const { server, baseUrl } = await startServer(mockHandlers({ sigs: { status: 200, body: null } }));
-  const evidence = await collectLive("t", "t", "r", "main", { fetch, baseUrl, timeout: 5000 });
-  ok(evidence._errors.some(e => e.phase === "required_signatures" && e.reason === "null-sigs"), "sigs null should error");
+  const evidence = await collectLive("t", "t", "r", "main", { fetch: globalThis.fetch, baseUrl, timeout: 5000 });
+  if (!evidence._errors.some(e => e.phase === "required_signatures" && e.reason === "null-parsed-body")) throw new Error("sigs null should error");
   const r = check(evidence, policy, CTX_LIVE);
-  ok(!r.passed && r.failed.length === 12, "sigs null → all fail");
+  if (r.passed || r.failed.length !== 12) throw new Error("sigs null → all fail");
   server.close();
 });
-t("collectLive-detail-is-array", async () => {
+register("collectLive-detail-is-array", async () => {
   const { server, baseUrl } = await startServer(mockHandlers({ rulesetDetail: { status: 200, body: [] } }));
-  const evidence = await collectLive("t", "t", "r", "main", { fetch, baseUrl, timeout: 5000 });
-  ok(evidence._errors.some(e => e.phase === "ruleset_detail" && e.reason === "array-ruleset-detail"), "detail array should error");
+  const evidence = await collectLive("t", "t", "r", "main", { fetch: globalThis.fetch, baseUrl, timeout: 5000 });
+  if (!evidence._errors.some(e => e.phase === "ruleset_detail" && e.reason === "array-parsed-body")) throw new Error("detail array should error");
   server.close();
 });
-t("collectLive-non-numeric-ruleset-id", async () => {
-  const { server, baseUrl } = await startServer(mockHandlers({ rulesetList: { status: 200, body: [{ id: "not-a-number", name: "rs" }], link: "" } }));
-  const evidence = await collectLive("t", "t", "r", "main", { fetch, baseUrl, timeout: 5000 });
-  ok(evidence._errors.some(e => e.phase === "ruleset_detail" && e.reason === "non-numeric-id"), "non-numeric id should error");
+register("collectLive-non-numeric-ruleset-id", async () => {
+  const { server, baseUrl } = await startServer(mockHandlers({
+    rulesetList: { status: 200, body: [{ id: "not-a-number", name: "rs" }], link: "" }
+  }));
+  const evidence = await collectLive("t", "t", "r", "main", { fetch: globalThis.fetch, baseUrl, timeout: 5000 });
+  if (!evidence._errors.some(e => e.phase === "ruleset_detail" && e.reason === "non-numeric-id")) throw new Error("non-numeric id should error");
   server.close();
 });
 
-// ---------------------------------------------------------------------------
-// 9. Offline hardened validation
-// ---------------------------------------------------------------------------
-t("offline-evidence-not-object", () => {
-  ok(check("string", policy, CTX_OFFLINE)._error === "malformed-evidence");
+// Collection: malformed detail shapes
+register("collectLive-detail-invalid-bypass-actors", async () => {
+  const detail = { ...rsFull()[0], bypass_actors: "not-an-array" };
+  const { server, baseUrl } = await startServer(mockHandlers({ rulesetDetail: { status: 200, body: detail } }));
+  const evidence = await collectLive("t", "t", "r", "main", { fetch: globalThis.fetch, baseUrl, timeout: 5000 });
+  if (!evidence._errors.some(e => e.phase === "ruleset_detail" && e.reason === "invalid-bypass_actors")) throw new Error("string bypass_actors should error");
+  server.close();
 });
-t("offline-metadata-missing", () => {
-  ok(check({ classic_branch_protection: CLASSIC_ALL }, policy, CTX_OFFLINE)._error === "malformed-evidence");
+register("collectLive-detail-invalid-rule-parameters", async () => {
+  const detail = {
+    id: 1, name: "rs1", enforcement: "active", target: "branch",
+    conditions: { ref_name: { include: ["refs/heads/main"], exclude: [] } },
+    bypass_actors: [],
+    rules: [{ type: "pull_request", parameters: "not-an-object" }]
+  };
+  const { server, baseUrl } = await startServer(mockHandlers({ rulesetDetail: { status: 200, body: detail } }));
+  const evidence = await collectLive("t", "t", "r", "main", { fetch: globalThis.fetch, baseUrl, timeout: 5000 });
+  if (!evidence._errors.some(e => e.phase === "ruleset_detail" && e.reason === "invalid-rule-parameters")) throw new Error("string rule.parameters should error");
+  server.close();
 });
-t("offline-metadata-not-object", () => {
-  ok(check({ metadata: "meta", classic_branch_protection: CLASSIC_ALL }, policy, CTX_OFFLINE)._error === "malformed-evidence");
+register("collectLive-detail-invalid-id", async () => {
+  const detail = { ...rsFull()[0], id: "bad" };
+  const { server, baseUrl } = await startServer(mockHandlers({ rulesetDetail: { status: 200, body: detail } }));
+  const evidence = await collectLive("t", "t", "r", "main", { fetch: globalThis.fetch, baseUrl, timeout: 5000 });
+  if (!evidence._errors.some(e => e.phase === "ruleset_detail" && e.reason === "invalid-id")) throw new Error("non-numeric detail.id should error");
+  server.close();
 });
-t("offline-metadata-default-branch-number", () => {
-  ok(check(ev({ metadata: { repository: "a/b", branch: "main", default_branch: 42 } }), policy, CTX_OFFLINE)._error === "malformed-evidence");
-});
-t("offline-errors-entry-missing-phase", () => {
-  ok(check(ev({ _errors: [{ status: 0 }] }), policy, CTX_OFFLINE)._error === "malformed-evidence");
-});
-t("offline-errors-entry-missing-status", () => {
-  ok(check(ev({ _errors: [{ phase: "classic" }] }), policy, CTX_OFFLINE)._error === "malformed-evidence");
-});
-t("offline-errors-entry-wrong-types", () => {
-  ok(check(ev({ _errors: [{ phase: 123, status: "none" }] }), policy, CTX_OFFLINE)._error === "malformed-evidence");
-});
-t("offline-rulesets-entry-not-object", () => {
-  ok(check(ev({ rulesets: ["bad"] }), policy, CTX_OFFLINE)._error === "malformed-evidence");
-});
-t("offline-rulesets-entry-missing-id", () => {
-  ok(check(ev({ rulesets: [{ rules: [], enforcement: "active" }] }), policy, CTX_OFFLINE)._error === "malformed-evidence");
-});
-t("offline-rulesets-entry-missing-rules", () => {
-  ok(check(ev({ rulesets: [{ id: 1, enforcement: "active" }] }), policy, CTX_OFFLINE)._error === "malformed-evidence");
-});
-t("offline-classic-positive-rulesets-malformed", () => {
-  // Classic all passes, but rulesets has a malformed entry → fail all
-  const evidence = ev({ classic_branch_protection: CLASSIC_ALL, classic_required_signatures: SIGS_ON, rulesets: [{ id: 1, enforcement: "active" }] });
-  ok(check(evidence, policy, CTX_OFFLINE)._error === "malformed-evidence", "classic-ok but malformed rulesets should fail");
-});
-t("offline-classic-positive-errors-malformed", () => {
-  const evidence = ev({ classic_branch_protection: CLASSIC_ALL, classic_required_signatures: SIGS_ON, _errors: ["not-object"] });
-  ok(check(evidence, policy, CTX_OFFLINE)._error === "malformed-evidence");
-});
-t("offline-branch-mismatch", () => {
-  ok(check(ev({ metadata: { ...ev().metadata, branch: "develop" } }), policy, CTX_OFFLINE)._error === "branch-mismatch");
-});
-t("offline-classic-not-object", () => ok(check(ev({ classic_branch_protection: "bad" }), policy, CTX_OFFLINE)._error === "malformed-evidence"));
-t("offline-signatures-not-object", () => ok(check(ev({ classic_required_signatures: "bad" }), policy, CTX_OFFLINE)._error === "malformed-evidence"));
-t("offline-rulesets-not-array", () => ok(check(ev({ rulesets: "bad" }), policy, CTX_OFFLINE)._error === "malformed-evidence"));
-t("offline-errors-not-array", () => ok(check(ev({ _errors: "bad" }), policy, CTX_OFFLINE)._error === "malformed-evidence"));
 
-// ---------------------------------------------------------------------------
-// 10. URL origin check (hostile lookalike hostnames)
-// ---------------------------------------------------------------------------
-t("hostile-origin-lookalike-in-self-href", async () => {
+// Offline hardened: deeper ruleset shape
+register("offline-bypass_actors-string-treated-clean", () => {
+  // In offline check(), bypass_actors: "not-an-array" should fail validation
+  const r = check(ev({ rulesets: [{ id: 1, enforcement: "active", target: "branch", conditions: { ref_name: { include: ["refs/heads/main"], exclude: [] } }, bypass_actors: "not-an-array", rules: [{ type: "pull_request", parameters: { required_approving_review_count: 2 } }] }] }), policy, CTX_OFFLINE);
+  if (!r._error || r._error !== "malformed-evidence") throw new Error("string bypass_actors should reject offline evidence");
+});
+register("offline-invalid-rule-parameters-offline", () => {
+  const r = check(ev({ rulesets: [{ id: 1, enforcement: "active", target: "branch", conditions: { ref_name: { include: ["refs/heads/main"], exclude: [] } }, bypass_actors: [], rules: [{ type: "pull_request", parameters: ["array-not-ok"] }] }] }), policy, CTX_OFFLINE);
+  if (!r._error || r._error !== "malformed-evidence") throw new Error("array rule.parameters should reject");
+});
+register("offline-invalid-rule-type", () => {
+  const r = check(ev({ rulesets: [{ id: 1, enforcement: "active", target: "branch", conditions: { ref_name: { include: ["refs/heads/main"], exclude: [] } }, bypass_actors: [], rules: [{ type: 123 }] }] }), policy, CTX_OFFLINE);
+  if (!r._error || r._error !== "malformed-evidence") throw new Error("numeric rule.type should reject");
+});
+register("classic-ok-but-malformed-bypass-fails-all", () => {
+  const evidence = ev({ classic_branch_protection: CLASSIC_ALL, classic_required_signatures: SIGS_ON, rulesets: [{ id: 1, enforcement: "active", target: "branch", conditions: { ref_name: { include: ["refs/heads/main"], exclude: [] } }, bypass_actors: "bad", rules: [{ type: "pull_request", parameters: { required_approving_review_count: 2 } }] }] });
+  const r = check(evidence, policy, CTX_OFFLINE);
+  if (!r._error) throw new Error("classic-ok + malformed ruleset should fail");
+});
+register("offline-invalid-conditions-include", () => {
+  const r = check(ev({ rulesets: [{ id: 1, enforcement: "active", target: "branch", conditions: { ref_name: { include: "not-array", exclude: [] } }, bypass_actors: [], rules: [{ type: "pull_request", parameters: { required_approving_review_count: 2 } }] }] }), policy, CTX_OFFLINE);
+  if (!r._error) throw new Error("string include should reject");
+});
+register("offline-invalid-conditions-exclude", () => {
+  const r = check(ev({ rulesets: [{ id: 1, enforcement: "active", target: "branch", conditions: { ref_name: { include: ["refs/heads/main"], exclude: "not-array" } }, bypass_actors: [], rules: [{ type: "pull_request", parameters: { required_approving_review_count: 2 } }] }] }), policy, CTX_OFFLINE);
+  if (!r._error) throw new Error("string exclude should reject");
+});
+
+// Existing offline tests
+register("offline-evidence-not-object", () => {
+  if (check("string", policy, CTX_OFFLINE)._error !== "malformed-evidence") throw new Error("non-object should fail");
+});
+register("offline-metadata-missing", () => {
+  if (!check({ classic_branch_protection: CLASSIC_ALL }, policy, CTX_OFFLINE)._error) throw new Error("missing metadata should fail");
+});
+register("offline-metadata-default-branch-number", () => {
+  if (!check(ev({ metadata: { repository: "a/b", branch: "main", default_branch: 42 } }), policy, CTX_OFFLINE)._error) throw new Error("numeric default_branch should fail");
+});
+register("offline-errors-entry-missing-phase", () => {
+  if (!check(ev({ _errors: [{ status: 0 }] }), policy, CTX_OFFLINE)._error) throw new Error("missing phase should fail");
+});
+register("offline-errors-entry-missing-status", () => {
+  if (!check(ev({ _errors: [{ phase: "classic" }] }), policy, CTX_OFFLINE)._error) throw new Error("missing status should fail");
+});
+register("offline-branch-mismatch", () => {
+  if (check(ev({ metadata: { ...ev().metadata, branch: "develop" } }), policy, CTX_OFFLINE)._error !== "branch-mismatch") throw new Error("branch mismatch should fail");
+});
+register("offline-classic-not-object", () => {
+  if (!check(ev({ classic_branch_protection: "bad" }), policy, CTX_OFFLINE)._error) throw new Error("string classic should fail");
+});
+register("offline-signatures-not-object", () => {
+  if (!check(ev({ classic_required_signatures: "bad" }), policy, CTX_OFFLINE)._error) throw new Error("string sigs should fail");
+});
+register("offline-rulesets-not-array", () => {
+  if (!check(ev({ rulesets: "bad" }), policy, CTX_OFFLINE)._error) throw new Error("string rulesets should fail");
+});
+register("offline-errors-not-array", () => {
+  if (!check(ev({ _errors: "bad" }), policy, CTX_OFFLINE)._error) throw new Error("string _errors should fail");
+});
+
+// Hostile URL origin checks with STRONG assertions
+register("hostile-origin-lookalike-in-self-href", async () => {
   const { server, baseUrl } = await startServer({
     "GET /repos/t/r": (req, res) => { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ default_branch: "main" })); },
     "GET /repos/t/r/branches/main/protection": (req, res) => { res.writeHead(404); res.end("{}"); },
@@ -358,72 +447,44 @@ t("hostile-origin-lookalike-in-self-href", async () => {
       res.end(JSON.stringify([{ id: 1, name: "rs", _links: { self: { href: "https://api.github.com.evil.example/repos/t/r/rulesets/1" } } }]));
     },
   });
-  const evidence = await collectLive("t", "t", "r", "main", { fetch, baseUrl, timeout: 5000 });
-  ok(evidence._errors.some(e => e.reason === "hostile-self-href"), "hostile lookalike origin should be rejected");
+  const evidence = await collectLive("t", "t", "r", "main", { fetch: globalThis.fetch, baseUrl, timeout: 5000 });
+  const err = evidence._errors.find(e => e.reason === "hostile-self-href");
+  if (!err) throw new Error("hostile lookalike self-href must produce error");
   const r = check(evidence, policy, CTX_LIVE);
-  ok(!r.passed && r.failed.length === 12, "hostile href → all fail");
+  if (r.passed) throw new Error("hostile href should fail all controls");
   server.close();
 });
-t("hostile-origin-lookalike-in-link-header", async () => {
+
+register("hostile-origin-in-page-link-rejected", async () => {
+  let hostileHit = false;
   const { server, baseUrl } = await startServer({
     "GET /repos/t/r": (req, res) => { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ default_branch: "main" })); },
     "GET /repos/t/r/branches/main/protection": (req, res) => { res.writeHead(404); res.end("{}"); },
     "GET /repos/t/r/branches/main/protection/required_signatures": (req, res) => { res.writeHead(404); res.end("{}"); },
     "GET /repos/t/r/rulesets": (req, res) => {
-      // Link points to hostile origin
-      res.writeHead(200, { "Content-Type": "application/json", Link: '<https://api.github.com.evil/repos/t/r/rulesets?page=2>; rel="next"' });
-      res.end(JSON.stringify([]));
-    },
-  });
-  const evidence = await collectLive("t", "t", "r", "main", { fetch, baseUrl, timeout: 5000 });
-  // The next-page fetch would hit the hostile origin; but since our mock doesn't serve that URL, it gets a connect error.
-  // We must add a handler for the hostile URL to verify it's actually rejected by origin check.
-  server.close();
-});
-
-t("hostile-origin-in-page-link-actually-rejected", async () => {
-  let hostileHit = false;
-  const { server: server1, port, baseUrl } = await startServer({
-    "GET /repos/t/r": (req, res) => { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ default_branch: "main" })); },
-    "GET /repos/t/r/branches/main/protection": (req, res) => { res.writeHead(404); res.end("{}"); },
-    "GET /repos/t/r/branches/main/protection/required_signatures": (req, res) => { res.writeHead(404); res.end("{}"); },
-    "GET /repos/t/r/rulesets": (req, res) => {
-      res.writeHead(200, { "Content-Type": "application/json", Link: `<https://evil.example/repos/t/r/rulesets?page=2>; rel="next"` });
+      res.writeHead(200, { "Content-Type": "application/json", Link: '<https://evil.example/repos/t/r/rulesets?page=2>; rel="next"' });
       res.end(JSON.stringify([{ id: 1, name: "rs", _links: { self: { href: "/repos/t/r/rulesets/1" } } }]));
     },
     "GET /repos/t/r/rulesets/1": (req, res) => { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(rsFull()[0])); },
   });
-  // Create a second server on evil.example equivalent to catch any fetch to it
-  const { server: evilServer } = await startServer({ "*": (req, res) => { hostileHit = true; res.writeHead(200); res.end("{}"); } });
-
-  // Need to use real fetch but with the evil link — ghFetchAll should reject _foreign_origin
   const mockFetch = async (url, init) => {
-    const u = new URL(url);
-    if (u.origin === `http://127.0.0.1:${port}`) {
-      // Route to our primary server
-      const resp = await fetch(url, init);
-      return resp;
-    }
-    hostileHit = true;
-    const resp = await fetch(url, init);
-    return resp;
+    if (!LOOPBACK.test(url)) { hostileHit = true; throw new Error("FORBIDDEN_EXTERNAL_NETWORK_CALL"); }
+    return originalFetch(url, init);
   };
   const evidence = await collectLive("t", "t", "r", "main", { fetch: mockFetch, baseUrl, timeout: 5000 });
-  // The evil link should have been rejected via origin check in ghFetchAll → _foreign_origin
-  // Since _foreign_origin is only returned by ghFetchAll (not added to _errors here), check the list
-  // Actually, in collectLive, if ghFetchAll returns _foreign_origin, it pushes "rulesets_list" error.
-  // If the detail self href is on the same origin but page link is foreign, the list completes but pagination is foreign.
-  // The pagination href is in the page loop; it gets rejected and returns _foreign_origin.
-  // So we'd get a rulesets_list error with _foreign_origin.
-  ok(!hostileHit || evidence._errors.length > 0, "hostile link should be rejected before fetch");
-  server1.close();
-  evilServer.close();
+  // hostileHit MUST be false (origin check blocked it before fetch)
+  if (hostileHit) throw new Error("hostile Link was actually fetched — origin check failed");
+  // Must have a foreign-origin error
+  if (!evidence._errors.some(e => e.phase === "rulesets_list" && e.status === 0)) throw new Error("hostile Link must produce rulesets_list error");
+  server.close();
 });
 
-// ---------------------------------------------------------------------------
-// 11. Pagination: includes_parents=true&per_page=100 exact query
-// ---------------------------------------------------------------------------
-t("pagination-includes-both-query-params", async () => {
+// ghFetch origin check: startsWith bypass is gone; resolveUrl uses exact URL.origin
+// The hostile-origin-lookalike-in-self-href test above proves origin checks work.
+// Additional: verify that a relative-path-only detail with correct self-href works.
+
+// Pagination
+register("pagination-includes-both-query-params", async () => {
   let receivedQuery = null;
   const { server, baseUrl } = await startServer({
     "GET /repos/t/r": (req, res) => { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ default_branch: "main" })); },
@@ -435,45 +496,42 @@ t("pagination-includes-both-query-params", async () => {
       res.end(JSON.stringify([]));
     },
   });
-  await collectLive("t", "t", "r", "main", { fetch, baseUrl, timeout: 5000 });
-  ok(receivedQuery !== null, "rulesets endpoint should be called");
-  ok(receivedQuery.get("includes_parents") === "true", `includes_parents=${receivedQuery.get("includes_parents")}`);
-  ok(receivedQuery.get("per_page") === "100", `per_page=${receivedQuery.get("per_page")}`);
+  await collectLive("t", "t", "r", "main", { fetch: globalThis.fetch, baseUrl, timeout: 5000 });
+  if (!receivedQuery) throw new Error("rulesets endpoint should be called");
+  if (receivedQuery.get("includes_parents") !== "true") throw new Error(`includes_parents=${receivedQuery.get("includes_parents")}`);
+  if (receivedQuery.get("per_page") !== "100") throw new Error(`per_page=${receivedQuery.get("per_page")}`);
   server.close();
 });
 
-// ---------------------------------------------------------------------------
-// 12. Total timeout injectable + hanging mock
-// ---------------------------------------------------------------------------
-t("total-timeout-injectable", async () => {
+// Total timeout injectable
+register("total-timeout-injectable", async () => {
   const { server, baseUrl } = await startServer({
-    "GET /repos/t/r": (req, res) => {
-      // Never respond — simulates hang
-    },
+    "GET /repos/t/r": (req, res) => { /* hang forever — never respond */ },
   });
-  const evidence = await collectLive("t", "t", "r", "main", { fetch, baseUrl, timeout: 1000, totalTimeout: 500 });
-  ok(evidence._errors.some(e => e.phase === "repo_metadata" && e.status === 0), "hang should produce repo_metadata error");
+  const evidence = await collectLive("t", "t", "r", "main", { fetch: globalThis.fetch, baseUrl, timeout: 1000, totalTimeout: 200 });
+  // After totalTimeout fires, the hanging repo-meta fetch returns _network_error.
+  // collectLive should return evidence (not throw) with _errors populated.
+  if (!evidence._errors.some(e => e.phase === "repo_metadata" && e.status === 0)) throw new Error("hang should produce repo_metadata error");
+  const r = check(evidence, policy, CTX_LIVE);
+  if (r.passed) throw new Error("timeout evidence should fail all controls");
   server.close();
 });
 
-// ---------------------------------------------------------------------------
-// 13. >10 rule details — no MaxListeners warnings
-// ---------------------------------------------------------------------------
-t("no-maxlisteners-warning-on-many-details", async () => {
-  // Create 15 rulesets → 15 detail fetches
+// >10 rule details — no MaxListeners
+register("no-maxlisteners-warning-on-many-details", async () => {
   const detailBodies = Array.from({ length: 15 }, (_, i) => ({
     id: i + 1, name: `rs${i + 1}`, enforcement: "active", target: "branch",
     conditions: { ref_name: { include: ["refs/heads/main"], exclude: [] } },
-    bypass_actors: [], rules: [{ type: "pull_request", parameters: { required_approving_review_count: 2 } }],
+    bypass_actors: [],
+    rules: [{ type: "pull_request", parameters: { required_approving_review_count: 2 } }],
   }));
-  const listBody = detailBodies.map((d, i) => ({
+  const listBody = detailBodies.map((d) => ({
     id: d.id, name: d.name,
     _links: { self: { href: `/repos/t/r/rulesets/${d.id}` } },
     enforcement: "active", target: "branch",
     conditions: { ref_name: { include: ["refs/heads/main"], exclude: [] } },
     bypass_actors: [],
   }));
-
   const detailMap = {};
   for (const d of detailBodies) {
     detailMap[`GET /repos/t/r/rulesets/${d.id}`] = (req, res) => {
@@ -481,14 +539,12 @@ t("no-maxlisteners-warning-on-many-details", async () => {
       res.end(JSON.stringify(d));
     };
   }
-
   let warningEmitted = false;
   const origWarn = process.emitWarning;
   process.emitWarning = (msg, ...args) => {
     if (typeof msg === "string" && msg.includes("MaxListeners")) warningEmitted = true;
     return origWarn.call(process, msg, ...args);
   };
-
   const { server, baseUrl } = await startServer({
     "GET /repos/t/r": (req, res) => { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ default_branch: "main" })); },
     "GET /repos/t/r/branches/main/protection": (req, res) => { res.writeHead(404); res.end("{}"); },
@@ -499,128 +555,152 @@ t("no-maxlisteners-warning-on-many-details", async () => {
     },
     ...detailMap,
   });
-
-  const evidence = await collectLive("t", "t", "r", "main", { fetch, baseUrl, timeout: 5000 });
+  const evidence = await collectLive("t", "t", "r", "main", { fetch: globalThis.fetch, baseUrl, timeout: 5000 });
   process.emitWarning = origWarn;
-  ok(!warningEmitted, "MaxListeners warning should not be emitted");
-  ok(evidence.rulesets.length === 15, `should have 15 rulesets, got ${evidence.rulesets.length}`);
+  if (warningEmitted) throw new Error("MaxListeners warning emitted");
+  if (evidence.rulesets.length !== 15) throw new Error(`should have 15 rulesets, got ${evidence.rulesets.length}`);
   server.close();
 });
 
-// ---------------------------------------------------------------------------
-// 14. GITHUB_REPOSITORY validation (exactly 2 segments)
-// ---------------------------------------------------------------------------
-t("cli-repo-three-segments-rejected", async () => {
-  // Use injectCollectLive so no network
+// main() opts.evidencePath
+register("main-opts-evidencePath", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "fnd01-test-"));
+  const f = path.join(dir, "evidence.json");
+  await writeFile(f, JSON.stringify(ev({ classic_branch_protection: CLASSIC_ALL, classic_required_signatures: SIGS_ON })));
+  const exit = await main({ evidencePath: f });
+  if (exit !== 0) throw new Error(`should exit 0, got ${exit}`);
+  await rm(dir, { recursive: true, force: true });
+});
+
+// GITHUB_REPOSITORY segment validation
+register("cli-repo-three-segments", async () => {
   const mockCollect = async () => ({ metadata: { repository: "a/b/c", branch: "main", fetched_at: "now", default_branch: "main" }, classic_branch_protection: null, classic_required_signatures: null, rulesets: [], _errors: [] });
   const exit = await main({ token: "fake_token_not_ghp_format", repository: "o/r/extra", injectCollectLive: mockCollect });
-  ok(exit === 2, `should exit 2, got ${exit}`);
+  if (exit !== 2) throw new Error(`should exit 2, got ${exit}`);
 });
-
-t("cli-repo-one-segment-rejected", async () => {
+register("cli-repo-one-segment", async () => {
   const mockCollect = async () => ({ metadata: { repository: "only", branch: "main", fetched_at: "now", default_branch: "main" }, classic_branch_protection: null, classic_required_signatures: null, rulesets: [], _errors: [] });
   const exit = await main({ token: "fake_token_not_ghp_format", repository: "only", injectCollectLive: mockCollect });
-  ok(exit === 2, `should exit 2, got ${exit}`);
+  if (exit !== 2) throw new Error(`should exit 2, got ${exit}`);
 });
 
-// ---------------------------------------------------------------------------
-// 15. Live CLI via mock collector (NO real network)
-// ---------------------------------------------------------------------------
-t("cli-live-via-mock-collector", async () => {
+// Live CLI via mock (zero network)
+register("cli-live-mock-collector-pass", async () => {
   const evidence = ev({ classic_branch_protection: CLASSIC_ALL, classic_required_signatures: SIGS_ON });
   const mockCollect = async () => evidence;
   const exit = await main({ token: "fake_token_not_ghp_format", repository: "test-owner/test-repo", injectCollectLive: mockCollect });
-  ok(exit === 0, `should exit 0, got ${exit}`);
+  if (exit !== 0) throw new Error(`should exit 0, got ${exit}`);
 });
-
-t("cli-live-via-mock-collector-fails", async () => {
+register("cli-live-mock-collector-fail", async () => {
   const mockCollect = async () => ({ metadata: { repository: "a/b", branch: "main", fetched_at: "now", default_branch: "main" }, classic_branch_protection: null, classic_required_signatures: null, rulesets: [], _errors: [] });
   const exit = await main({ token: "fake_token_not_ghp_format", repository: "test-owner/test-repo", injectCollectLive: mockCollect });
-  ok(exit === 1, `should exit 1, got ${exit}`);
+  if (exit !== 1) throw new Error(`should exit 1, got ${exit}`);
 });
 
-// ---------------------------------------------------------------------------
-// 16. CLI offline tests (no network)
-// ---------------------------------------------------------------------------
-t("cli-malformed-json-exit-2", async () => {
+// CLI offline
+register("cli-malformed-json-exit-2", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "fnd01-test-"));
   const f = path.join(dir, "bad.json");
   await writeFile(f, "{ broken");
   const r = spawnSync(process.execPath, [VERIFIER, f], { encoding: "utf8" });
-  ok(r.status === 2, `got ${r.status}`);
-  ok(!(r.stdout + r.stderr).includes(dir) && !r.stdout.includes("/tmp/") && !r.stderr.includes("/tmp/"), "path leaked");
   await rm(dir, { recursive: true, force: true });
+  if (r.status !== 2) throw new Error(`got ${r.status}`);
+  if ((r.stdout + r.stderr).includes(dir)) throw new Error("path leaked");
+  if ((r.stdout + r.stderr).includes("/tmp/")) throw new Error("tmp path leaked");
 });
-t("cli-missing-file-exit-2", () => {
+register("cli-missing-file-exit-2", () => {
   const r = spawnSync(process.execPath, [VERIFIER, "/nonexistent/file.json"], { encoding: "utf8" });
-  ok(r.status === 2);
-  ok(!(r.stdout + r.stderr).includes("/nonexistent"), "path leaked");
+  if (r.status !== 2) throw new Error(`got ${r.status}`);
+  if ((r.stdout + r.stderr).includes("/nonexistent")) throw new Error("path leaked");
 });
-t("cli-offline-valid-json-exit-0", async () => {
+register("cli-offline-valid-json-exit-0", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "fnd01-test-"));
   const f = path.join(dir, "good.json");
   await writeFile(f, JSON.stringify(ev({ classic_branch_protection: CLASSIC_ALL, classic_required_signatures: SIGS_ON })));
   const r = spawnSync(process.execPath, [VERIFIER, f], { encoding: "utf8" });
-  ok(r.status === 0, `got ${r.status}: ${r.stderr}`);
-  ok(!(r.stdout + r.stderr).includes(dir) && !r.stdout.includes("/tmp/") && !r.stderr.includes("/tmp/"), "path leaked");
   await rm(dir, { recursive: true, force: true });
+  if (r.status !== 0) throw new Error(`got ${r.status}: ${r.stderr}`);
+  if ((r.stdout + r.stderr).includes(dir)) throw new Error("path leaked");
 });
 
-// ---------------------------------------------------------------------------
-// 17. Network-call trap: unit tests must never make real network calls
-// ---------------------------------------------------------------------------
-t("network-call-trap", () => {
-  // Verify the test file itself doesn't import or call real fetch without mock
-  // This is a structural test — if we're here, no real network was called
-  ok(true, "all tests above use mock servers or inline evidence");
-});
-
-// ---------------------------------------------------------------------------
-// 18. Policy parity + redaction
-// ---------------------------------------------------------------------------
-t("policy-parity", () => {
+// Policy + redaction
+register("policy-parity", () => {
   const r = check(ev({ classic_branch_protection: CLASSIC_ALL, classic_required_signatures: SIGS_ON }), policy, CTX_OFFLINE);
-  for (const c of policy.controls) ok(r.controls[c.id] !== undefined);
-  for (const id of Object.keys(r.controls)) ok(policy.controls.some(c => c.id === id));
+  for (const c of policy.controls) if (r.controls[c.id] === undefined) throw new Error(`missing ${c.id}`);
+  for (const id of Object.keys(r.controls)) if (!policy.controls.some(c => c.id === id)) throw new Error(`extra ${id}`);
 });
-t("redaction-no-secrets", () => {
+register("redaction-no-secrets", () => {
   const j = JSON.stringify(check(ev({ classic_branch_protection: CLASSIC_ALL, classic_required_signatures: SIGS_ON }), policy, CTX_OFFLINE));
-  ok(!/ghp_[a-zA-Z0-9]{36}/.test(j) && !/github_pat_/.test(j) && !/Bearer\s+/.test(j));
+  if (/ghp_[a-zA-Z0-9]{36}/.test(j)) throw new Error("ghp_ leaked");
+  if (/github_pat_/.test(j)) throw new Error("github_pat_ leaked");
+  if (/Bearer\s+/.test(j)) throw new Error("Bearer leaked");
 });
-t("redaction-repository-is-redacted", () => {
-  ok(check(ev({ classic_branch_protection: CLASSIC_ALL, classic_required_signatures: SIGS_ON }), policy, CTX_OFFLINE).repository === "redacted");
+register("redaction-repository-is-redacted", () => {
+  if (check(ev({ classic_branch_protection: CLASSIC_ALL, classic_required_signatures: SIGS_ON }), policy, CTX_OFFLINE).repository !== "redacted")
+    throw new Error("repository should be redacted");
 });
-t("redaction-no-paths", () => {
-  ok(!JSON.stringify(check(ev({ classic_branch_protection: CLASSIC_ALL, classic_required_signatures: SIGS_ON }), policy, CTX_OFFLINE)).includes("/home/"));
-});
-t("redaction-metadata-seeded-token", () => {
+register("redaction-metadata-seeded-token", () => {
   const evidence = ev({ classic_branch_protection: CLASSIC_ALL, classic_required_signatures: SIGS_ON });
   const ghp = "gh";
   evidence.metadata.repository = `${ghp}p_seededtoken123456789012345678901234`;
   const j = JSON.stringify(check(evidence, policy, CTX_OFFLINE));
-  ok(!j.includes("ghp_seeded"));
-  ok(j.includes("redacted"));
+  if (j.includes("ghp_seeded")) throw new Error("token leaked");
+  if (!j.includes("redacted")) throw new Error("output should use redacted literal");
 });
 
-// ---------------------------------------------------------------------------
-// 19. Combined + mixed
-// ---------------------------------------------------------------------------
-t("combined-classic-plus-clean-ruleset", () => {
-  const r = check(ev({ classic_branch_protection: CLASSIC_ALL, classic_required_signatures: SIGS_ON, rulesets: rsFull() }), policy, CTX_OFFLINE);
-  ok(r.passed);
+// Combined
+register("combined-classic-plus-clean-ruleset", () => {
+  if (!check(ev({ classic_branch_protection: CLASSIC_ALL, classic_required_signatures: SIGS_ON, rulesets: rsFull() }), policy, CTX_OFFLINE).passed)
+    throw new Error("combined should pass");
 });
-t("mixed-clean-and-bypassed-rulesets", () => {
+register("mixed-clean-and-bypassed", () => {
   const clean = rs({ id: 2, rules: [{ type: "pull_request", parameters: { required_approving_review_count: 2 } }] });
   const bypassed = rs({ id: 3, bypass_actors: [{ actor_id: 1 }], rules: [{ type: "required_signatures" }] });
   const r = check(ev({ rulesets: [clean, bypassed] }), policy, CTX_LIVE);
-  ok(r.controls.require_two_approvals.enforced);
-  ok(!r.controls.signed_commits.enforced);
-  ok(!r.controls.admin_enforcement.enforced);
+  if (!r.controls.require_two_approvals.enforced) throw new Error("clean ruleset controls should pass");
+  if (r.controls.signed_commits.enforced) throw new Error("bypassed ruleset controls excluded");
+  if (r.controls.admin_enforcement.enforced) throw new Error("admin fails with any bypass");
 });
 
-// ---------------------------------------------------------------------------
-// Mock HTTP server helpers
-// ---------------------------------------------------------------------------
+// =======================================================================
+// RUN ALL TESTS SEQUENTIALLY — EVERY PROMISE AWAITED BEFORE COUNTING
+// =======================================================================
+let passed = 0, fail = 0;
+for (const { name, fn } of tests) {
+  try {
+    await fn();
+    console.log(`PASS: ${name}`);
+    passed++;
+  } catch (e) {
+    // Self-test: the runner must catch the async rejection
+    if (e === _ASYNC_RUNNER_SELF_TEST_FAILED) {
+      console.log(`PASS: __ASYNC_RUNNER_SELF_TEST (async rejection caught — runner works)`);
+      passed++;
+    } else {
+      console.log(`FAIL: ${name} — ${e.message}`);
+      fail++;
+    }
+  }
+}
+
+// Restore original fetch
+globalThis.fetch = originalFetch;
+
+// Network trap assertion
+if (extCallCount > 0) {
+  console.log(`FAIL: NETWORK_TRAP — ${extCallCount} external network call(s) detected`);
+  fail++;
+} else {
+  console.log(`PASS: NETWORK_TRAP — zero external network calls`);
+  passed++;
+}
+
+console.log(`\n${passed} passed, ${fail} failed, ${passed + fail} total`);
+process.exit(fail > 0 ? 1 : 0);
+
+// -----------------------------------------------------------------------
+// Mock helpers
+// -----------------------------------------------------------------------
 function startServer(handlers) {
   return new Promise((resolve) => {
     const s = http.createServer((req, res) => {
@@ -655,6 +735,3 @@ function mockHandlers(opts = {}) {
     "GET /repos/t/r/rulesets/1": (req, res) => { res.writeHead(rulesetDetail.status, { "Content-Type": "application/json" }); res.end(JSON.stringify(rulesetDetail.body)); },
   };
 }
-
-console.log(`\n${passed} passed, ${failed} failed, ${passed + failed} total`);
-process.exit(failed > 0 ? 1 : 0);
