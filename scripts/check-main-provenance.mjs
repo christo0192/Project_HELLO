@@ -352,12 +352,15 @@ export async function main(opts = {}) {
 
   let evidence, source;
 
+  const evidencePath = opts.evidencePath || process.env.INFORMER_PATH || process.argv[2];
   const eventPath = opts.eventPath ?? process.env.GITHUB_EVENT_PATH;
 
-  if (eventPath || opts.token || process.env.GITHUB_TOKEN) {
+  // Explicit offline evidence always wins over ambient GitHub Actions
+  // variables. This keeps fixture/replay checks deterministic inside CI.
+  if (!evidencePath && eventPath) {
     source = "live";
     try {
-      const result = await collectLive(opts);
+      const result = await collectLive({ ...opts, eventPath });
       if (result._error) {
         process.stderr.write(JSON.stringify({ error: "collection-failed", reason: result._error.reason }) + "\n");
         return 1;
@@ -369,7 +372,6 @@ export async function main(opts = {}) {
     }
   } else {
     source = "offline";
-    const evidencePath = opts.evidencePath || process.env.INFORMER_PATH || process.argv[2];
     if (!evidencePath) {
       process.stderr.write(JSON.stringify({ error: "no-evidence-source" }) + "\n");
       return 2;

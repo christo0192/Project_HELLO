@@ -378,7 +378,10 @@ register("cli-offline-missing-file-exit-2", () => {
 });
 
 register("cli-offline-no-arg-exit-2", () => {
-  const r = spawnSync(process.execPath, [VERIFIER], { encoding: "utf8", env: { ...process.env, INFORMER_PATH: "" } });
+  const env = { ...process.env, INFORMER_PATH: "" };
+  delete env.GITHUB_EVENT_PATH;
+  delete env.GITHUB_TOKEN;
+  const r = spawnSync(process.execPath, [VERIFIER], { encoding: "utf8", env });
   if (r.status !== 2) throw new Error(`expected exit 2, got ${r.status}`);
 });
 
@@ -435,7 +438,7 @@ register("main-opts-evidencePath-malformed", async () => {
 });
 
 register("main-opts-no-source", async () => {
-  const exit = await main({});
+  const exit = await main({ eventPath: "", token: "" });
   if (exit !== 2) throw new Error(`expected exit 2, got ${exit}`);
 });
 
