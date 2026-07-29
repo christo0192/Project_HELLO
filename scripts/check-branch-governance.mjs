@@ -1,99 +1,293 @@
 #!/usr/bin/env node
 
 /**
- * check-branch-governance.mjs — Zero-dependency offline branch governance verifier.
+ * check-branch-governance.mjs — Zero-dependency branch governance verifier.
  *
- * Reads GitHub API evidence from a local JSON file (INFORMER_PATH env or first CLI arg,
- * default .github/branch-governance-evidence.json) and verifies all required branch
- * protection / ruleset controls for the 'main' branch.
+ * Two modes:
+ *   LIVE:   GITHUB_TOKEN env var set → read-only GitHub API collection
+ *   OFFLINE: INFORMER_PATH env or CLI arg → local evidence JSON file
  *
- * NEVER calls the GitHub API directly. This is a read-only offline verifier.
+ * Policy is loaded from .github/branch-governance-policy.json at runtime.
+ * Raw API responses go only to memory (or RUNNER_TEMP mode 0600 in CI).
+ * Output is a fixed-schema redacted JSON summary. Never prints tokens,
+ * Authorization headers, raw API bodies, error messages, or file paths.
  *
  * Exit codes:
  *   0 — all controls ENFORCED
  *   1 — one or more controls NOT ENFORCED (fail-closed)
  *   2 — input malformed, file not found, or parse error
- *   3 — network/API error (reserved for future live-fetch mode)
  */
 
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 
-// ---- Policy definition (mirrors .github/branch-governance-policy.json) ----
+// ---------------------------------------------------------------------------
+// Policy loading
+// ---------------------------------------------------------------------------
 
-const POLICY = {
-  required_status_checks: ["quality", "secret-scan"],
-  controls: [
-    { id: "require_pull_requests",         classic: "required_pull_request_reviews",                       ruleset: "required_pull_request",                             check: "exists" },
-    { id: "require_two_approvals",         classic: "required_pull_request_reviews.required_approving_review_count", ruleset: "required_pull_request", rulesetParam: "required_approving_review_count", check: "min_value", minValue: 2 },
-    { id: "require_codeowner_review",      classic: "required_pull_request_reviews.require_code_owner_reviews",       ruleset: "required_pull_request", rulesetParam: "require_code_owner_review",        check: "true" },
-    { id: "dismiss_stale_approvals",       classic: "required_pull_request_reviews.dismiss_stale_reviews",           ruleset: "required_pull_request", rulesetParam: "dismiss_stale_reviews_on_push",    check: "true" },
-    { id: "require_last_push_approval",    classic: "required_pull_request_reviews.require_last_push_approval",      ruleset: "required_pull_request", rulesetParam: "require_last_push_approval",         check: "true" },
-    { id: "require_conversation_resolution", classic: "required_conversation_resolution.enabled",                   ruleset: "required_conversation_resolution",                 check: "true" },
-    { id: "admin_enforcement",             classic: "enforce_admins.enabled",                                      ruleset: "bypass_allowances",                               check: "enforce_admins" },
-    { id: "signed_commits",                classic: "required_signatures.enabled",                                  ruleset: "required_signatures",                             check: "true" },
-    { id: "linear_history",                classic: "required_linear_history.enabled",                              ruleset: "non_fast_forward",                                check: "true" },
-    { id: "force_push_disabled",           classic: "allow_force_pushes.enabled",                                   ruleset: "allow_force_pushes",                              check: "false" },
-    { id: "deletion_disabled",             classic: "allow_deletions.enabled",                                      ruleset: "deletion",                                        check: "false" },
-    { id: "required_status_checks",        classic: "required_status_checks.contexts",                              ruleset: "required_status_checks", rulesetParam: "required_status_checks", check: "status_checks", expectedChecks: ["quality", "secret-scan"] },
-  ],
-};
+function resolvePolicyPath() {
+  const scriptPath = fileURLToPath(import.meta.url);
+  const scriptDir = path.dirname(scriptPath);
+  return path.resolve(scriptDir, "..", ".github", "branch-governance-policy.json");
+}
 
-// ---- Helpers ----
+async function loadPolicy() {
+  const raw = await readFile(resolvePolicyPath(), "utf8");
+  return JSON.parse(raw);
+}
 
-function get(obj, path) {
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function get(obj, dotpath) {
   if (!obj || typeof obj !== "object") return undefined;
-  const parts = path.split(".");
-  let current = obj;
-  for (const part of parts) {
-    if (current == null || typeof current !== "object") return undefined;
-    current = current[part];
+  const parts = dotpath.split(".");
+  let cur = obj;
+  for (const p of parts) {
+    if (cur == null || typeof cur !== "object") return undefined;
+    cur = cur[p];
   }
-  return current;
+  return cur;
 }
 
-function hasClassicProtection(evidence) {
-  return evidence && evidence.classic_branch_protection && typeof evidence.classic_branch_protection === "object";
+// ---------------------------------------------------------------------------
+// Live collector (GitHub API)
+// ---------------------------------------------------------------------------
+
+const GITHUB_API = "https://api.github.com";
+const MAX_RULESET_PAGES = 3;
+const RULESET_PER_PAGE = 100;
+
+async function ghFetch(token, urlPath) {
+  const url = `${GITHUB_API}${urlPath}`;
+  let resp;
+  try {
+    resp = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "fnd01-branch-governance-verifier/1.0",
+      },
+    });
+  } catch {
+    // Network failure: return sentinel
+    return { _network_error: true };
+  }
+
+  let body;
+  try {
+    body = await resp.json();
+  } catch {
+    return { _malformed: true, _status: resp.status };
+  }
+
+  // Attach status for error checks
+  body._status = resp.status;
+  return body;
 }
 
-function getRulesets(evidence) {
+async function ghFetchAll(token, urlPath) {
+  const results = [];
+  let nextUrl = urlPath.includes("?") ? urlPath : `${urlPath}?per_page=${RULESET_PER_PAGE}`;
+  let pages = 0;
+
+  while (nextUrl && pages < MAX_RULESET_PAGES) {
+    pages++;
+    const url = nextUrl.startsWith("http") ? nextUrl : `${GITHUB_API}${nextUrl}`;
+
+    let resp;
+    try {
+      resp = await fetch(url, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+          "User-Agent": "fnd01-branch-governance-verifier/1.0",
+        },
+      });
+    } catch {
+      return { _network_error: true };
+    }
+
+    let body;
+    try {
+      body = await resp.json();
+    } catch {
+      return { _malformed: true, _status: resp.status };
+    }
+
+    if (!Array.isArray(body)) {
+      // Paginated endpoint returned non-array → malformed
+      return { _malformed: true, _status: resp.status };
+    }
+
+    results.push(...body);
+
+    // Parse Link header for next page
+    const link = resp.headers.get("link");
+    if (link) {
+      const match = link.match(/<([^>]+)>;\s*rel="next"/);
+      nextUrl = match ? match[1] : null;
+    } else {
+      nextUrl = null;
+    }
+  }
+
+  if (pages >= MAX_RULESET_PAGES && nextUrl) {
+    // More pages exist but we stopped — pagination ambiguity
+    results._pagination_truncated = true;
+  }
+
+  return results;
+}
+
+async function collectLive(token, owner, repo, branch) {
+  const evidence = {
+    metadata: {
+      repository: `${owner}/${repo}`,
+      branch,
+      fetched_at: new Date().toISOString(),
+    },
+    classic_branch_protection: null,
+    classic_required_signatures: null,
+    rulesets: [],
+    _errors: [],
+  };
+
+  // 1. Classic branch protection
+  const classic = await ghFetch(
+    token,
+    `/repos/${owner}/${repo}/branches/${encodeURIComponent(branch)}/protection`
+  );
+
+  const classicStatus = classic._status;
+  delete classic._status;
+  delete classic._network_error;
+  delete classic._malformed;
+
+  if (classicStatus === 404) {
+    // No protection configured — not an error, just absent
+    evidence.classic_branch_protection = null;
+  } else if (classicStatus === 401 || classicStatus === 403) {
+    evidence._errors.push({ phase: "classic", status: classicStatus });
+    evidence.classic_branch_protection = null;
+  } else if (classicStatus === 200) {
+    evidence.classic_branch_protection = classic;
+  } else {
+    // Network error, malformed, or unexpected status
+    evidence._errors.push({ phase: "classic", status: classicStatus || 0 });
+    evidence.classic_branch_protection = null;
+  }
+
+  // 2. Classic required signatures (separate endpoint)
+  const sigs = await ghFetch(
+    token,
+    `/repos/${owner}/${repo}/branches/${encodeURIComponent(branch)}/protection/required_signatures`
+  );
+
+  const sigsStatus = sigs._status;
+  delete sigs._status;
+  delete sigs._network_error;
+  delete sigs._malformed;
+
+  if (sigsStatus === 200) {
+    evidence.classic_required_signatures = sigs;
+  } else if (sigsStatus === 404) {
+    evidence.classic_required_signatures = null;
+  } else {
+    evidence._errors.push({ phase: "required_signatures", status: sigsStatus || 0 });
+    evidence.classic_required_signatures = null;
+  }
+
+  // 3. Rulesets list (paginated)
+  const rulesetList = await ghFetchAll(
+    token,
+    `/repos/${owner}/${repo}/rulesets`
+  );
+
+  if (rulesetList._network_error) {
+    evidence._errors.push({ phase: "rulesets_list", status: 0 });
+  } else if (rulesetList._malformed) {
+    evidence._errors.push({ phase: "rulesets_list", status: rulesetList._status || 0 });
+  } else if (Array.isArray(rulesetList)) {
+    const truncated = rulesetList._pagination_truncated;
+    delete rulesetList._pagination_truncated;
+
+    if (truncated) {
+      evidence._errors.push({ phase: "rulesets_pagination", status: 0 });
+    }
+
+    // 4. Fetch each ruleset detail
+    for (const rsSummary of rulesetList) {
+      if (!rsSummary || !rsSummary.id || !rsSummary._links?.self?.href) continue;
+
+      const detail = await ghFetch(token, rsSummary._links.self.href);
+      const detailStatus = detail._status;
+      delete detail._status;
+      delete detail._network_error;
+      delete detail._malformed;
+
+      if (detailStatus === 200) {
+        evidence.rulesets.push(detail);
+      } else {
+        // Individual ruleset fetch failure → fail closed
+        evidence._errors.push({
+          phase: "ruleset_detail",
+          ruleset_id: rsSummary.id,
+          status: detailStatus || 0,
+        });
+      }
+    }
+  }
+
+  // Store raw evidence to RUNNER_TEMP in CI (mode 0600), never uploaded
+  if (process.env.GITHUB_ACTIONS === "true" && process.env.RUNNER_TEMP) {
+    try {
+      await mkdir(path.join(process.env.RUNNER_TEMP, "fnd01"), { recursive: true });
+      const rawPath = path.join(process.env.RUNNER_TEMP, "fnd01", "raw-evidence.json");
+      await writeFile(rawPath, JSON.stringify(evidence, null, 2), { mode: 0o600 });
+    } catch {
+      // Best-effort; never fail on temp-file writes
+    }
+  }
+
+  return evidence;
+}
+
+// ---------------------------------------------------------------------------
+// Ruleset helpers (corrected semantics)
+// ---------------------------------------------------------------------------
+
+/**
+ * Filter rulesets targeting main:
+ * - enforcement === "active" only
+ * - conditions.ref_name.include contains "refs/heads/main" or "~DEFAULT_BRANCH"
+ * - conditions.ref_name.exclude does NOT contain the matching ref
+ */
+function activeRulesetsForMain(evidence) {
   if (!evidence || !Array.isArray(evidence.rulesets)) return [];
   return evidence.rulesets.filter((rs) => {
-    const include = get(rs, "conditions.ref_name.include");
-    return Array.isArray(include) && include.some((r) => r === "refs/heads/main" || r === "~DEFAULT_BRANCH");
+    if (rs.enforcement !== "active") return false;
+    const cond = get(rs, "conditions.ref_name");
+    if (!cond) return false;
+    const include = Array.isArray(cond.include) ? cond.include : [];
+    const exclude = Array.isArray(cond.exclude) ? cond.exclude : [];
+    const targetsMain =
+      include.includes("refs/heads/main") || include.includes("~DEFAULT_BRANCH");
+    const excludesMain =
+      exclude.includes("refs/heads/main") || exclude.includes("~DEFAULT_BRANCH");
+    return targetsMain && !excludesMain;
   });
 }
 
-function hasRulesetRule(rulesets, ruleType, paramName, expectedValue) {
+function findRulesetRule(rulesets, ruleType) {
   for (const rs of rulesets) {
-    const rules = get(rs, "rules");
-    if (!Array.isArray(rules)) continue;
-    for (const rule of rules) {
-      if (rule.type !== ruleType) continue;
-      if (paramName === undefined) return true;
-      const val = get(rule, `parameters.${paramName}`);
-      if (val === expectedValue) return true;
-    }
-  }
-  return false;
-}
-
-function rulesetRuleValue(rulesets, ruleType, paramName) {
-  for (const rs of rulesets) {
-    const rules = get(rs, "rules");
-    if (!Array.isArray(rules)) continue;
-    for (const rule of rules) {
-      if (rule.type !== ruleType) continue;
-      const val = get(rule, `parameters.${paramName}`);
-      if (val !== undefined) return val;
-    }
-  }
-  return undefined;
-}
-
-function rulesetFindFirstRule(rulesets, ruleType) {
-  for (const rs of rulesets) {
-    const rules = get(rs, "rules");
+    const rules = rs.rules;
     if (!Array.isArray(rules)) continue;
     for (const rule of rules) {
       if (rule.type === ruleType) return rule;
@@ -102,211 +296,274 @@ function rulesetFindFirstRule(rulesets, ruleType) {
   return null;
 }
 
-function rulesetBypassAllowed(rulesets) {
-  // If any ruleset targeting main has non-empty bypass_allowances, admins can bypass
+function rulesetRuleParam(rulesets, ruleType, paramName) {
+  const rule = findRulesetRule(rulesets, ruleType);
+  if (!rule || !rule.parameters) return undefined;
+  return rule.parameters[paramName];
+}
+
+function rulesetHasBypassActors(rulesets) {
   for (const rs of rulesets) {
-    const bypass = get(rs, "bypass_allowances");
-    if (bypass) {
-      const users = bypass.users || [];
-      const teams = bypass.teams || [];
-      const apps = bypass.apps || [];
-      if (users.length > 0 || teams.length > 0 || apps.length > 0) return true;
-    }
+    const actors = rs.bypass_actors;
+    if (Array.isArray(actors) && actors.length > 0) return true;
   }
   return false;
 }
 
-function checkStatusChecks(contexts, expected) {
-  if (!Array.isArray(contexts)) return false;
-  const sorted = [...contexts].sort();
-  const expectedSorted = [...expected].sort();
-  return sorted.length === expectedSorted.length && sorted.every((v, i) => v === expectedSorted[i]);
+function parseStatusCheckContexts(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((entry) => {
+      if (typeof entry === "string") return entry;
+      if (entry && typeof entry === "object" && typeof entry.context === "string") return entry.context;
+      return null;
+    })
+    .filter(Boolean);
 }
 
-function checkStatusChecksRuleset(rulesets, expected) {
-  const checks = rulesetRuleValue(rulesets, "required_status_checks", "required_status_checks");
-  if (!Array.isArray(checks)) return false;
-  return checkStatusChecks(checks, expected);
+function statusChecksMatch(contexts, expected) {
+  const names = parseStatusCheckContexts(contexts);
+  if (names.length === 0) return false;
+  const sorted = [...names].sort();
+  const exp = [...expected].sort();
+  return sorted.length === exp.length && sorted.every((v, i) => v === exp[i]);
 }
 
-// ---- Core check function ----
+// ---------------------------------------------------------------------------
+// Core check function
+// ---------------------------------------------------------------------------
 
 /**
- * @param {object} evidence - Parsed evidence JSON
- * @returns {{ passed: boolean, controls: object, failed: string[], summary: string, repository: string, branch: string }}
+ * @param {object} evidence  — collected or loaded evidence
+ * @param {object} policy    — parsed branch-governance-policy.json
+ * @returns {{ passed: boolean, controls: Record<string,{enforced:boolean,source?:string}>, failed: string[], summary: string, repository: string, branch: string }}
  */
-export function check(evidence) {
+export function check(evidence, policy) {
   const repository = evidence?.metadata?.repository || "unknown";
-  const branch = evidence?.metadata?.branch || "main";
+  const branch = evidence?.metadata?.branch || policy?.target_branch || "main";
   const controls = {};
   const failed = [];
 
-  // If evidence has an error field set (401/403/404), all controls fail
-  const err = evidence?.metadata?.error;
-  if (err && err.status && err.status >= 400) {
-    for (const ctrl of POLICY.controls) {
-      controls[ctrl.id] = { enforced: false, source: "error", reason: `API error ${err.status}: ${err.message || "unknown"}` };
+  // If any collection-phase error with 401/403 → all controls NOT ENFORCED
+  const fatalError = (evidence?._errors || []).find(
+    (e) => e.status === 401 || e.status === 403 || e.status === 404
+  );
+  if (fatalError) {
+    for (const ctrl of policy.controls) {
+      controls[ctrl.id] = { enforced: false, source: "error" };
       failed.push(ctrl.id);
     }
     return {
       passed: false,
       controls,
       failed,
-      summary: `FAILED: API error ${err.status} — all ${POLICY.controls.length} controls NOT ENFORCED`,
+      summary: `FAILED: API status ${fatalError.status} — all ${policy.controls.length} controls NOT ENFORCED`,
       repository,
       branch,
     };
   }
 
-  const classic = hasClassicProtection(evidence) ? evidence.classic_branch_protection : null;
-  const rulesets = getRulesets(evidence);
-
-  for (const ctrl of POLICY.controls) {
-    let enforced = false;
-    let source = null;
-    let details = null;
-
-    // Check via classic branch protection
-    if (classic) {
-      const classicValue = get(classic, ctrl.classic);
-      switch (ctrl.check) {
-        case "exists":
-          enforced = classicValue !== undefined && classicValue !== null;
-          if (enforced) source = "classic";
-          break;
-        case "true":
-          enforced = classicValue === true;
-          if (enforced) source = "classic";
-          else if (ctrl.id === "require_last_push_approval" && classicValue === undefined) {
-            // Field may not exist in older API versions — stay not enforced
-          }
-          break;
-        case "false":
-          enforced = classicValue === false;
-          if (enforced) source = "classic";
-          break;
-        case "min_value":
-          enforced = typeof classicValue === "number" && classicValue >= ctrl.minValue;
-          if (enforced) { source = "classic"; details = classicValue; }
-          break;
-        case "enforce_admins":
-          enforced = classicValue === true;
-          if (enforced) source = "classic";
-          break;
-        case "status_checks":
-          enforced = checkStatusChecks(classicValue, ctrl.expectedChecks);
-          if (enforced) source = "classic";
-          break;
-      }
-    }
-
-    // If not enforced via classic, check via rulesets
-    if (!enforced && rulesets.length > 0) {
-      switch (ctrl.check) {
-        case "exists":
-          enforced = hasRulesetRule(rulesets, ctrl.ruleset);
-          if (enforced) source = "ruleset";
-          break;
-        case "true":
-          enforced = hasRulesetRule(rulesets, ctrl.ruleset, ctrl.rulesetParam, true);
-          if (enforced) source = "ruleset";
-          break;
-        case "false":
-          if (ctrl.id === "force_push_disabled") {
-            const fpRule = rulesetFindFirstRule(rulesets, "allow_force_pushes");
-            if (fpRule) {
-              enforced = get(fpRule, "parameters.allow_force_pushes") === false;
-              if (enforced) source = "ruleset";
-            }
-          } else if (ctrl.id === "deletion_disabled") {
-            const delRule = rulesetFindFirstRule(rulesets, "deletion");
-            if (delRule) {
-              enforced = true;
-              source = "ruleset";
-            }
-          }
-          break;
-        case "min_value":
-          const val = rulesetRuleValue(rulesets, ctrl.ruleset, ctrl.rulesetParam);
-          enforced = typeof val === "number" && val >= ctrl.minValue;
-          if (enforced) { source = "ruleset"; details = val; }
-          break;
-        case "enforce_admins":
-          enforced = !rulesetBypassAllowed(rulesets);
-          if (enforced) source = "ruleset";
-          break;
-        case "status_checks":
-          enforced = checkStatusChecksRuleset(rulesets, ctrl.expectedChecks);
-          if (enforced) source = "ruleset";
-          break;
-      }
-    }
-
-    // Build result
-    const result = { enforced };
-    if (source) result.source = source;
-    if (details !== null) result.details = details;
-    if (!enforced) {
-      result.reason = `not enforced via classic or ruleset`;
+  // Network/malformed errors (non-401/403/404) also fail closed
+  if ((evidence?._errors || []).length > 0) {
+    for (const ctrl of policy.controls) {
+      controls[ctrl.id] = { enforced: false, source: "error" };
       failed.push(ctrl.id);
     }
+    return {
+      passed: false,
+      controls,
+      failed,
+      summary: `FAILED: collection error — all ${policy.controls.length} controls NOT ENFORCED`,
+      repository,
+      branch,
+    };
+  }
+
+  const classic = evidence?.classic_branch_protection || null;
+  const classicSigs = evidence?.classic_required_signatures || null;
+  const rulesets = activeRulesetsForMain(evidence);
+
+  for (const ctrl of policy.controls) {
+    let enforced = false;
+    let source = null;
+
+    // ---- Classic check ----
+    if (ctrl.classic_check) {
+      let val;
+      // signed_commits uses separate endpoint for classic
+      if (ctrl.classic_separate_endpoint) {
+        val = classicSigs ? get(classicSigs, "enabled") : undefined;
+      } else {
+        val = classic ? get(classic, ctrl.classic_field) : undefined;
+      }
+
+      switch (ctrl.classic_check) {
+        case "exists":
+          enforced = val !== undefined && val !== null;
+          break;
+        case "bool_true":
+          enforced = val === true;
+          break;
+        case "bool_false":
+          enforced = val === false;
+          break;
+        case "min_value":
+          enforced = typeof val === "number" && val >= (ctrl.min_value || 0);
+          break;
+        case "status_checks":
+          enforced = statusChecksMatch(val, ctrl.expected_checks || []);
+          break;
+      }
+      if (enforced) source = "classic";
+    }
+
+    // ---- Ruleset check (only if not already enforced) ----
+    if (!enforced && ctrl.ruleset_check && rulesets.length > 0) {
+      switch (ctrl.ruleset_check) {
+        case "rule_exists": {
+          const rule = findRulesetRule(rulesets, ctrl.ruleset_type);
+          if (rule) { enforced = true; source = "ruleset"; }
+          break;
+        }
+        case "bool_true": {
+          const v = rulesetRuleParam(rulesets, ctrl.ruleset_type, ctrl.ruleset_param);
+          if (v === true) { enforced = true; source = "ruleset"; }
+          break;
+        }
+        case "min_value": {
+          const v = rulesetRuleParam(rulesets, ctrl.ruleset_type, ctrl.ruleset_param);
+          if (typeof v === "number" && v >= (ctrl.min_value || 0)) {
+            enforced = true;
+            source = "ruleset";
+          }
+          break;
+        }
+        case "status_checks": {
+          const raw = rulesetRuleParam(rulesets, ctrl.ruleset_type, ctrl.ruleset_param);
+          if (statusChecksMatch(raw, ctrl.expected_checks || [])) {
+            enforced = true;
+            source = "ruleset";
+          }
+          break;
+        }
+        case "no_bypass_actors": {
+          if (!rulesetHasBypassActors(rulesets)) {
+            enforced = true;
+            source = "ruleset";
+          }
+          break;
+        }
+      }
+    }
+
+    const result = { enforced };
+    if (source) result.source = source;
+    if (!enforced) failed.push(ctrl.id);
     controls[ctrl.id] = result;
   }
 
   const passed = failed.length === 0;
   const summary = passed
-    ? `ALL ${POLICY.controls.length} controls ENFORCED`
-    : `FAILED: ${failed.length} of ${POLICY.controls.length} controls NOT ENFORCED`;
+    ? `ALL ${policy.controls.length} controls ENFORCED`
+    : `FAILED: ${failed.length} of ${policy.controls.length} controls NOT ENFORCED`;
 
   return { passed, controls, failed, summary, repository, branch };
 }
 
-// ---- CLI ----
+// ---------------------------------------------------------------------------
+// Redacted output (fixed schema — never raw bodies, tokens, paths, messages)
+// ---------------------------------------------------------------------------
 
-async function main() {
-  const evidencePath = process.env.INFORMER_PATH || process.argv[2] || ".github/branch-governance-evidence.json";
-
-  let raw;
-  try {
-    raw = await readFile(evidencePath, "utf8");
-  } catch (err) {
-    if (err.code === "ENOENT") {
-      process.stderr.write(JSON.stringify({ error: "evidence-file-not-found", path: evidencePath }) + "\n");
-      return 2;
-    }
-    if (err.code === "EACCES" || err.code === "EISDIR") {
-      process.stderr.write(JSON.stringify({ error: "cannot-read-evidence-file", path: evidencePath, detail: err.code }) + "\n");
-      return 2;
-    }
-    process.stderr.write(JSON.stringify({ error: "file-read-error", path: evidencePath, detail: err.message }) + "\n");
-    return 2;
-  }
-
-  let evidence;
-  try {
-    evidence = JSON.parse(raw);
-  } catch {
-    process.stderr.write(JSON.stringify({ error: "malformed-json", path: evidencePath }) + "\n");
-    return 2;
-  }
-
-  // Validate basic structure
-  if (!evidence || typeof evidence !== "object") {
-    process.stderr.write(JSON.stringify({ error: "invalid-evidence-structure", path: evidencePath }) + "\n");
-    return 2;
-  }
-
-  const result = check(evidence);
-
-  // Build redacted output — NO raw API bodies, NO tokens, NO secrets
-  const output = {
+function redactedOutput(result) {
+  return {
     repository: result.repository,
     branch: result.branch,
     passed: result.passed,
     controls: result.controls,
+    failed_count: result.failed.length,
     summary: result.summary,
   };
+}
 
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
+
+async function main() {
+  const policy = await loadPolicy();
+
+  let evidence;
+
+  // Live mode
+  if (process.env.GITHUB_TOKEN) {
+    const repo =
+      process.env.GITHUB_REPOSITORY ||
+      process.env.FND01_REPOSITORY ||
+      "";
+    const [owner, repoName] = repo.split("/");
+    const branch =
+      process.env.GITHUB_REF_NAME ||
+      process.env.FND01_BRANCH ||
+      policy.target_branch ||
+      "main";
+
+    if (!owner || !repoName) {
+      process.stderr.write(
+        JSON.stringify({
+          error: "missing-repository",
+        }) + "\n"
+      );
+      return 2;
+    }
+
+    evidence = await collectLive(process.env.GITHUB_TOKEN, owner, repoName, branch);
+  } else {
+    // Offline mode: read evidence file
+    const evidencePath =
+      process.env.INFORMER_PATH ||
+      process.argv[2] ||
+      ".github/branch-governance-evidence.json";
+
+    let raw;
+    try {
+      raw = await readFile(evidencePath, "utf8");
+    } catch (err) {
+      // Redacted: never include path in output
+      process.stderr.write(
+        JSON.stringify({ error: "evidence-read-failed" }) + "\n"
+      );
+      return 2;
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      process.stderr.write(
+        JSON.stringify({ error: "malformed-evidence" }) + "\n"
+      );
+      return 2;
+    }
+
+    if (!parsed || typeof parsed !== "object") {
+      process.stderr.write(
+        JSON.stringify({ error: "invalid-evidence-structure" }) + "\n"
+      );
+      return 2;
+    }
+
+    // Treat explicit error status in offline evidence
+    const errStatus = parsed?.metadata?.error?.status;
+    if (errStatus === 401 || errStatus === 403 || errStatus === 404) {
+      parsed._errors = parsed._errors || [];
+      parsed._errors.push({ phase: "offline", status: errStatus });
+    }
+
+    evidence = parsed;
+  }
+
+  const result = check(evidence, policy);
+  const output = redactedOutput(result);
   const json = JSON.stringify(output, null, 2);
 
   if (result.passed) {
@@ -319,9 +576,16 @@ async function main() {
 }
 
 // Run if called directly
-if (process.argv[1] && (process.argv[1] === import.meta.url?.replace("file://", "") || process.argv[1].endsWith("check-branch-governance.mjs"))) {
-  main().then((code) => process.exit(code)).catch((err) => {
-    process.stderr.write(JSON.stringify({ error: "unexpected-error", detail: err.message }) + "\n");
+const thisScript = fileURLToPath(import.meta.url);
+if (
+  process.argv[1] &&
+  (process.argv[1] === thisScript ||
+    process.argv[1].endsWith("check-branch-governance.mjs"))
+) {
+  main().then((code) => process.exit(code)).catch(() => {
+    process.stderr.write(
+      JSON.stringify({ error: "unexpected-error" }) + "\n"
+    );
     process.exit(2);
   });
 }

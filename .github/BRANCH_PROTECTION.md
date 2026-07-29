@@ -26,10 +26,16 @@ evidence in the launch evidence store.
   merged and has reported at least once:
   - `quality`
   - `secret-scan`
-  - `dependency-review`
-  - `migration-check`
 - Require deployments to the production environment to use a separate,
   reviewer-approved environment gate.
+
+### Path-scoped checks
+
+Additional checks (e.g. `dependency-review`, `migration-check`) may exist in
+the repository but are NOT listed as required hosted checks because they are
+path-scoped — they only trigger when specific files change and therefore do
+not report on every pull request. Only `quality` and `secret-scan` are
+always-present current checks suitable for required status enforcement.
 
 ## Review rules
 
@@ -58,8 +64,9 @@ These are external owner actions; they cannot close solely through additional im
 ## Branch governance verifier (evidence-only)
 
 The offline verifier in `scripts/check-branch-governance.mjs` reads a local
-GitHub API evidence snapshot (`.github/branch-governance-evidence.json` or path
-in `$INFORMER_PATH`) and reports which of the 12 required controls in
+GitHub API evidence snapshot (`$INFORMER_PATH` or
+`.github/branch-governance-evidence.json`) or runs in live mode when
+`GITHUB_TOKEN` is set, and reports which of the 12 required controls in
 `.github/branch-governance-policy.json` are enforced.
 
 - **Exit 0:** All controls ENFORCED.

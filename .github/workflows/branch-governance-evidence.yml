@@ -12,30 +12,26 @@ jobs:
     name: collect-evidence
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Run branch governance verifier (redacted output only)
+      - name: Live-collect branch governance evidence
         id: verifier
         env:
-          INFORMER_PATH: .github/branch-governance-evidence.json
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Run verifier; capture redacted summary to a temp file.
-          # Exit 0 = all enforced; exit 1 = controls absent (fail red).
-          # The redacted output goes to stdout on success, stderr on failure.
-          REDACTED_OUTPUT="$(mktemp)"
+          # Live mode: GITHUB_TOKEN triggers read-only API collection.
+          # Raw API responses go only to RUNNER_TEMP mode 0600 (never uploaded).
+          # The verifier writes redacted summary to stdout (pass) or stderr (fail).
+          REDACTED="$(mktemp)"
           set +e
-          node scripts/check-branch-governance.mjs > "$REDACTED_OUTPUT" 2>&1
-          EXIT_CODE=$?
+          node scripts/check-branch-governance.mjs > "$REDACTED" 2>&1
+          EXIT="$?"
           set -e
-          # Always make the redacted output available for artifact upload.
-          # The verifier never prints tokens or raw API bodies.
-          cp "$REDACTED_OUTPUT" ./redacted-branch-governance-summary.json
-          if [ "$EXIT_CODE" -ne 0 ]; then
-            echo "::error::FND-01 controls NOT ENFORCED (exit $EXIT_CODE). See redacted summary artifact."
+          cp "$REDACTED" ./redacted-branch-governance-summary.json
+          if [ "$EXIT" -ne 0 ]; then
+            echo "::error::FND-01 controls NOT ENFORCED (exit $EXIT). See redacted summary artifact."
             exit 1
           fi
       - name: Upload redacted evidence summary (never raw API bodies)

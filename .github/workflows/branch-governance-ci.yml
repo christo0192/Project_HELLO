@@ -5,14 +5,12 @@ on:
     paths:
       - 'scripts/check-branch-governance.mjs'
       - 'scripts/check-branch-governance.test.mjs'
-      - 'scripts/__fixtures__/branch-governance/**'
       - '.github/branch-governance-policy.json'
   push:
     branches: [main]
     paths:
       - 'scripts/check-branch-governance.mjs'
       - 'scripts/check-branch-governance.test.mjs'
-      - 'scripts/__fixtures__/branch-governance/**'
       - '.github/branch-governance-policy.json'
   workflow_dispatch:
 
@@ -24,10 +22,8 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
       - name: Run branch governance unit/fixture tests
