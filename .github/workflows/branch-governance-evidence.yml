@@ -1,7 +1,7 @@
 name: Branch Governance Evidence
 # Read-only evidence collection via GITHUB_TOKEN.
-# Current private plan may return 403 — this is expected fail-closed
-# behavior, not a workflow bug. The redacted summary is always uploaded.
+# Raw API responses stay in memory only — never persisted or uploaded.
+# Current private plan may return 403 — expected fail-closed, not a bug.
 on:
   workflow_dispatch:
 

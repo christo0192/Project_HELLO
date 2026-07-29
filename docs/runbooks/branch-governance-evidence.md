@@ -6,60 +6,72 @@ The branch governance verifier (`scripts/check-branch-governance.mjs`) checks
 whether the 12 required branch-protection controls for the policy's target
 branch are enforced. It supports two modes:
 
-- **Live mode:** When `GITHUB_TOKEN` is set in the environment, it performs
-  read-only GitHub API collection (classic protection, required signatures
-  separate endpoint, paginated rulesets with individual detail fetches).
-  Branch is always taken from `policy.target_branch` (default `"main"`).
-  Raw API responses go only to memory (or `$RUNNER_TEMP/fnd01/` mode 0600 in
-  CI) and are **never** uploaded or printed.
+- **Live mode:** When `GITHUB_TOKEN` is set, it performs read-only GitHub API
+  collection (repo metadata, classic protection, required signatures separate
+  endpoint, paginated rulesets including inherited, individual ruleset
+  details). Branch is always from `policy.target_branch` (default `"main"`).
+  Raw responses stay in memory only — **never persisted, never uploaded**.
 
-- **Offline mode:** When `GITHUB_TOKEN` is not set, it reads a local evidence
-  JSON file (`$INFORMER_PATH`, first CLI argument, or
-  `.github/branch-governance-evidence.json`). The metadata.branch in the
-  offline file is validated against policy.target_branch; a mismatch fails
-  closed with exit code 2 (`branch-mismatch`). The repository in the output
-  is always the literal string `"offline"` (never from user-controlled data).
+- **Offline mode:** Reads a local evidence JSON file (`$INFORMER_PATH`, first
+  CLI argument, or `.github/branch-governance-evidence.json`). The
+  `metadata.branch` must exactly equal `policy.target_branch`; mismatch
+  → exit code 2 (`branch-mismatch`). The file is structurally validated
+  (root shape, metadata, per-entry `_errors` and `rulesets` shapes).
 
 Either way, the verifier outputs a **fixed-schema redacted JSON summary**
-containing only: repository, branch, passed boolean, per-control
-enforced+source, failed_count, and a generic summary string. It never prints
-tokens, Authorization headers, raw API bodies, error messages, or file paths.
+containing only: `repository` (literal `"redacted"`), `branch` (literal
+`"redacted"`), `passed`, per-control `enforced`+`source`, `failed_count`,
+and a generic `summary` string. It never prints tokens, Authorization
+headers, raw API bodies, error messages, exception stacks, or file paths.
 
 ## Prerequisites
 
 - Node.js 22+
 - For live mode: a GitHub personal access token with `repo` scope set as
-  `GITHUB_TOKEN` (or a `$GITHUB_TOKEN` environment variable present in CI)
+  `GITHUB_TOKEN`; `GITHUB_REPOSITORY` in `owner/repo` format (exactly two
+  segments — a third segment is rejected)
 
 ## Collecting evidence
 
-### Live mode (recommended)
-
-Set `GITHUB_TOKEN` and optionally `GITHUB_REPOSITORY` (owner/repo format):
+### Live mode
 
 ```bash
 GITHUB_TOKEN="$GH_TOKEN" GITHUB_REPOSITORY="christo0192/Project_HELLO" \
   node scripts/check-branch-governance.mjs
 ```
 
-The verifier fetches classic branch protection, the separate
-`required_signatures` endpoint, the paginated rulesets list (with
-`includes_parents=true` to include inherited rulesets), and each
-individual ruleset detail. Pagination is bounded to 3 pages; if more pages
-exist, the verifier treats it as a pagination failure and fails closed.
+The verifier fetches:
+1. `GET /repos/{owner}/{repo}` — repo metadata (extracts `default_branch`)
+2. `GET /repos/{owner}/{repo}/branches/{branch}/protection` — classic branch protection
+3. `GET …/protection/required_signatures` — separate signatures endpoint
+4. `GET /repos/{owner}/{repo}/rulesets?includes_parents=true&per_page=100` — paginated rulesets (up to 3 pages; more pages → pagination error)
+5. `GET /repos/{owner}/{repo}/rulesets/{id}` — each individual ruleset detail
 
-Live mode always uses `policy.target_branch` (default `"main"`) — never
-`GITHUB_REF_NAME` or any environment variable for the branch.
+Every API response is validated:
+- HTTP 200 bodies must be non-null, non-array objects
+- Repo metadata must contain a string `default_branch`
+- Ruleset list entries must have numeric IDs
+- Ruleset detail bodies must be objects
+- Self-href and Link header URLs are checked against the expected origin
+  (`https://api.github.com`) via exact `.origin` comparison; lookalike
+  origins (`https://api.github.com.evil.example/…`) are rejected
+
+Collection errors of any kind (401, 403, 404 on ruleset detail, 429, 5xx,
+network failure, malformed response, pagination ambiguity, hostile URL
+origin, missing default_branch, non-object 200 bodies, non-numeric ruleset
+IDs) → all 12 controls NOT ENFORCED (fail-closed). Only 404 on classic
+protection or required-signatures is treated as "control absent" (not error).
+
+Total collection is bounded to a configurable timeout (default 60 s);
+per-request timeout is 10 s. Timeout → collection errors.
 
 ### Offline mode
-
-If you have a pre-collected evidence JSON file:
 
 ```bash
 # Default path (.github/branch-governance-evidence.json)
 node scripts/check-branch-governance.mjs
 
-# Custom path via environment variable
+# Custom path via env
 INFORMER_PATH=/path/to/evidence.json node scripts/check-branch-governance.mjs
 
 # Custom path via CLI argument
@@ -69,14 +81,13 @@ node scripts/check-branch-governance.mjs /path/to/evidence.json
 ### Manual evidence collection (workflow_dispatch)
 
 Navigate to **Actions → Branch Governance Evidence → Run workflow**. The
-workflow uses the repository's `GITHUB_TOKEN` (read-only permissions) to
-collect evidence live and uploads only the redacted verifier summary as a
-build artifact. Raw API responses are written to `$RUNNER_TEMP` mode 0600
-and are **never** included in the artifact.
+workflow uses the repository's `GITHUB_TOKEN` (read-only permissions) to run
+the verifier live and uploads only the redacted summary as a build artifact.
+Raw API responses stay in memory and are **never** included in the artifact.
 
 **Note:** The current private plan may return HTTP 403. This is expected
 fail-closed behavior, not a workflow bug. The redacted summary is always
-uploaded (on pass AND fail).
+uploaded (on pass AND fail, via `if: always()`).
 
 ## Interpreting results
 
@@ -85,8 +96,8 @@ uploaded (on pass AND fail).
 Output (stdout):
 ```json
 {
-  "repository": "owner/repo",
-  "branch": "main",
+  "repository": "redacted",
+  "branch": "redacted",
   "passed": true,
   "controls": {
     "require_pull_requests": { "enforced": true, "source": "classic" },
@@ -103,27 +114,24 @@ Output (stdout):
 Output (stderr):
 ```json
 {
-  "repository": "owner/repo",
-  "branch": "main",
+  "repository": "redacted",
+  "branch": "redacted",
   "passed": false,
-  "controls": {
-    "require_two_approvals": { "enforced": false },
-    ...
-  },
-  "failed_count": 2,
-  "summary": "FAILED: 2 of 12 controls NOT ENFORCED"
+  "controls": { ... },
+  "failed_count": 3,
+  "summary": "FAILED: 3 of 12 controls NOT ENFORCED"
 }
 ```
 
 ### Exit code 2 — Input error
 
-The evidence source is missing, malformed, unreadable, or branch mismatch.
-Output (stderr) is a generic fixed error code — never the file path, raw
-body, token, or exception stack. Error codes:
+The evidence source is missing, malformed, unreadable, structural validation
+failed, or repository format invalid. Output (stderr) is a generic fixed
+error code — never the file path, raw body, token, or stack. Error codes:
 
 - `evidence-read-failed`
 - `malformed-evidence`
-- `missing-repository`
+- `invalid-repository-format`
 - `branch-mismatch`
 - `unexpected-error`
 
@@ -132,58 +140,40 @@ body, token, or exception stack. Error codes:
 | # | Control | Severity | Classic field | Ruleset type |
 |---|---------|----------|---------------|--------------|
 | 1 | Require PRs before merging | critical | `required_pull_request_reviews` exists | `pull_request` rule exists |
-| 2 | Require 2 approvals | critical | `required_approving_review_count >= 2` | `pull_request.required_approving_review_count >= 2` |
-| 3 | Require CODEOWNER review | critical | `require_code_owner_reviews == true` | `pull_request.require_code_owner_review == true` |
-| 4 | Dismiss stale approvals | high | `dismiss_stale_reviews == true` | `pull_request.dismiss_stale_reviews_on_push == true` |
-| 5 | Require last push approval | high | `require_last_push_approval == true` | `pull_request.require_last_push_approval == true` |
-| 6 | Require conversation resolution | medium | `required_conversation_resolution.enabled == true` | `pull_request.required_review_thread_resolution == true` |
-| 7 | Enforce for administrators | critical | `enforce_admins.enabled == true` | `bypass_actors` is empty (intersection: any ruleset with non-empty bypass_actors fails) |
-| 8 | Require signed commits | high | separate `required_signatures` endpoint `enabled == true` | `required_signatures` rule exists |
+| 2 | Require 2 approvals | critical | `required_approving_review_count >= 2` | `pull_request.required_approving_review_count >= 2` (any rule) |
+| 3 | Require CODEOWNER review | critical | `require_code_owner_reviews == true` | any `pull_request` rule with `require_code_owner_review: true` |
+| 4 | Dismiss stale approvals | high | `dismiss_stale_reviews == true` | any `pull_request` rule with `dismiss_stale_reviews_on_push: true` |
+| 5 | Require last push approval | high | `require_last_push_approval == true` | any `pull_request` rule with `require_last_push_approval: true` |
+| 6 | Require conversation resolution | medium | `required_conversation_resolution.enabled == true` | any `pull_request` rule with `required_review_thread_resolution: true` |
+| 7 | Enforce for administrators | critical | `enforce_admins.enabled == true` | Every active ruleset has empty `bypass_actors` |
+| 8 | Require signed commits | high | separate signatures endpoint `enabled == true` | `required_signatures` rule exists |
 | 9 | Require linear history | medium | `required_linear_history.enabled == true` | `required_linear_history` rule exists |
 | 10 | Force push disabled | critical | `allow_force_pushes.enabled == false` | `non_fast_forward` rule exists |
 | 11 | Branch deletion disabled | critical | `allow_deletions.enabled == false` | `deletion` rule exists |
-| 12 | Required status checks | critical | `required_status_checks.contexts` includes `"quality"` AND `"secret-scan"` (extra checks ok) | `required_status_checks` with entries matching `quality` + `secret-scan` |
+| 12 | Required status checks | critical | `required_status_checks.contexts` includes `"quality"` AND `"secret-scan"` (extra checks ok) | any `required_status_checks` rule whose contexts include both |
 
 ### Ruleset filtering semantics
 
-- Only rulesets with `enforcement === "active"` and `target === "branch"` (or
-  missing target) are considered.
-- The include patterns are matched: `refs/heads/main`, `~DEFAULT_BRANCH`
-  (resolved via `GET /repos/{owner}/{repo}` in live mode), `~ALL`,
-  `refs/heads/*`, and `refs/heads/main*` prefix patterns.
-- Unknown/ambiguous patterns like `refs/tags/*`, `~UNKNOWN` → ignored
-  (fail-safe).
-- Exclude patterns that match the target branch → ruleset is dropped.
-- Multiple rulesets with the same rule type: a control passes if ANY
-  applicable ruleset provides it (union).
-- Bypass actors: `admin_enforcement` fails if ANY applicable ruleset has
-  non-empty `bypass_actors` (intersection — the most permissive wins for
-  bypass).
+- Only rulesets with `enforcement === "active"` AND `target === "branch"`
+  (strictly — missing or non-branch targets are dropped) are considered.
+- Include patterns: `refs/heads/main`, `~ALL`, `refs/heads/*`,
+  `refs/heads/main*`, and `~DEFAULT_BRANCH` (resolved against repo metadata).
+  Unknown patterns → ruleset dropped (fail-safe).
+- Exclude patterns: any match OR any unknown → ruleset dropped (fail-closed).
+- Multiple rulesets are unioned: a control passes if ANY clean (non-bypassed)
+  active ruleset provides it. Within a ruleset, any matching rule works
+  (weak-first/strong-second ordering is handled correctly).
+- Bypass actors: rulesets with non-empty `bypass_actors` are excluded from
+  non-admin controls. `admin_enforcement` fails if ANY active ruleset has
+  `bypass_actors` (intersection — the most permissive wins for bypass).
 
-## Current status (2026-07-29)
+### Collection completeness
 
-As documented in `.github/BRANCH_PROTECTION.md`, GitHub returned HTTP 403 when
-branch protection was applied. The current private-repository plan does not
-include the ruleset feature. **FND-01 remains blocked** until hosted
-enforcement (private-plan upgrade or equivalent) is confirmed AND the `quality`
-and `secret-scan` status checks are enforced on `main`, AND direct pushes to
-`main` are rejected.
-
-## Security notes
-
-- **Never share raw API output.** The raw evidence contains repository
-  structure details. Share only the verifier's redacted JSON summary.
-- The verifier **never prints**: tokens, `Authorization` headers, raw API
-  bodies, error messages, file paths, or exception stacks.
-- The evidence workflow writes raw API responses only to `$RUNNER_TEMP/fnd01/`
-  with mode 0600. This directory is ephemeral and never uploaded.
-- The uploaded artifact contains only the redacted verifier summary.
-- For local live runs, raw API responses stay in memory only.
-- Do **not** store raw evidence JSON inside the repository.
-- Do **not** embed tokens or credentials in evidence files.
-- In offline mode, `metadata.repository` and `metadata.branch` are
-  attacker-controlled fields and are **never** echoed in the verifier output.
-  Repository is always `"offline"`, branch is always `policy.target_branch`.
+A control only passes if evidence is collected without errors. Any collection
+error entry in `_errors` → all 12 controls fail closed. This prevents
+incomplete evidence (e.g. missing default_branch, malformed ruleset detail
+bodies, failed ruleset-detail 404 fetches) from producing false-positive
+passes.
 
 ## Running tests
 
@@ -191,15 +181,44 @@ and `secret-scan` status checks are enforced on `main`, AND direct pushes to
 node scripts/check-branch-governance.test.mjs
 ```
 
-All synthetic fixtures are embedded inline in the test file — no separate
-fixture directory. Tests cover: classic positive, ruleset positive, 12
-individual control negatives, inactive/evaluate ruleset, bypass actors,
-excluded-main conditions, status-check include semantics (including extras
-ok, missing one fails, duplicates ok, malformed null fails), separate
-signatures endpoint, 401/403 fatal, 404 non-fatal on classic, network/malformed
-errors, pagination truncation, policy parity, secret/path/error-message
-redaction, metadata redaction (repository + branch + raw error body), fixed
-error codes, offline structural validation, live collector mock HTTP with
-all 4 endpoints, per-request timeout, multi-page rulesets, bounded-pagination
-failure, HTTP failures (401/403/404/429/500/malformed/timeout), owner/repo/
-branch validation, and mixed classic+bypass ruleset regression.
+All synthetic evidence is embedded inline. 89 tests cover:
+- Classic and ruleset full-positive and 12 individual-control negatives
+- Bool-parameter weak-first/strong-second ordering (CODEOWNER, dismiss,
+  last-push, conversation resolution)
+- Status-checks parameter ordering (weak-first/strong-second)
+- Min-value parameter ordering
+- Tri-state ref matching (~ALL, ~DEFAULT_BRANCH, wildcard, unknown patterns)
+- Target validation (tag, missing)
+- Bypass actors (all controls excluded, mixed classic+bypassed)
+- Excluded-main conditions
+- All `_errors` entries fatal (401, 403, 404-detail, 429, 500, network, pagination)
+- Collection malformation (missing default_branch, classic array, sigs null,
+  detail array, non-numeric ruleset IDs)
+- Offline structural validation (root shape, metadata required,
+  metadata.default_branch type, per-entry _errors shape, per-entry rulesets
+  shape, contradictory malformed + passing classic)
+- Hostile origin lookalike rejection (self-href, Link header)
+- Pagination exact query (`includes_parents=true&per_page=100`)
+- Total collection timeout (injectable, hanging mock)
+- >10 rule details without MaxListeners warnings
+- GITHUB_REPOSITORY segment validation (1, 2, and 3 segments)
+- Live CLI via injectable mock collector (zero network)
+- Offline CLI via temp files (malformed JSON, valid JSON, missing file)
+- Policy parity, redaction, path/slug leak checks
+- Combined classic+ruleset and mixed clean/bypassed regression
+
+## Security notes
+
+- **Never share raw API output.** The raw evidence contains repository
+  structure details. Share only the verifier's redacted JSON summary.
+- The verifier **never prints**: tokens, `Authorization` headers, raw API
+  bodies, error messages, file paths, or exception stacks.
+- Raw API responses stay in memory only — **never persisted, never uploaded**.
+- The uploaded evidence artifact contains only the redacted verifier summary.
+- Do **not** store raw evidence JSON inside the repository.
+- Do **not** embed tokens or credentials in evidence files.
+- `GITHUB_REPOSITORY` must have exactly two `/`-separated segments. Both
+  segments must match `^[a-zA-Z0-9._-]+$`. A third segment (or single segment)
+  is rejected before any API call.
+- Repository and branch in the output are always the literal `"redacted"`.
+  User-controlled metadata values are never echoed.

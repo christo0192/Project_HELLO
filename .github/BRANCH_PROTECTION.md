@@ -65,24 +65,33 @@ These are external owner actions; they cannot close solely through additional im
 ## Branch governance verifier (evidence-only)
 
 The verifier in `scripts/check-branch-governance.mjs` supports two modes:
-- **Live** (`GITHUB_TOKEN`): read-only collection from classic protection,
-  separate required-signatures endpoint, repo metadata (default branch),
-  ruleset list with `includes_parents=true` and pagination, and individual
-  ruleset details. Inherited rulesets are included. Raw responses stay in
-  memory only — never persisted or uploaded.
-- **Offline** (`$INFORMER_PATH` or CLI arg): reads a local evidence JSON file.
+- **Live** (`GITHUB_TOKEN`): read-only collection from repo metadata
+  (default branch), classic protection, separate required-signatures
+  endpoint, ruleset list with `includes_parents=true&per_page=100` and
+  pagination (up to 3 pages), and individual ruleset details. Inherited
+  rulesets are included. Every 200 response body is validated (non-null,
+  non-array object); missing `default_branch`, non-numeric ruleset IDs,
+  and malformed detail bodies produce collection errors. Hostile URL
+  origins (lookalike hostnames) are rejected via exact `.origin` comparison.
+  Raw responses stay in memory only — never persisted or uploaded.
+- **Offline** (`$INFORMER_PATH` or CLI arg): reads a local evidence JSON file
+  with full structural validation (root shape, metadata object required,
+  metadata.branch must exactly match, per-entry `_errors` and `rulesets`
+  shapes).
 
 Collection errors of any kind (401, 403, 404 on ruleset detail, 429, 5xx,
-network failure, malformed response, pagination ambiguity, hostile URL origin)
-→ all 12 controls NOT ENFORCED (fail-closed). Only 404 on classic
-protection or required-signatures is treated as "control absent" (not error).
+network failure, malformed response, missing default_branch, non-object 200
+body, non-numeric ruleset ID, pagination ambiguity, hostile URL origin,
+total timeout) → all 12 controls NOT ENFORCED (fail-closed). Only 404 on
+classic protection or required-signatures is treated as "control absent"
+(not error).
 
 Output is a fixed-schema redacted JSON summary. Repository and branch are
-redacted (the Actions run context already identifies them). Never prints
-tokens, Authorization headers, raw API bodies, error messages, or file paths.
+always the literal string `"redacted"`. Never prints tokens, Authorization
+headers, raw API bodies, error messages, or file paths.
 
 Exit codes: **0** all enforced, **1** not enforced (fail-closed), **2** input
-or configuration error.
+or configuration error (including `GITHUB_REPOSITORY` with ≠ 2 segments).
 
 **FND-01 remains blocked** until hosted enforcement (GitHub private-plan
 upgrade or equivalent) is confirmed AND the `quality` and `secret-scan` status
