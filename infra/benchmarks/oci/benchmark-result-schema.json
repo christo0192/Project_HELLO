@@ -1,0 +1,600 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/christo0192/Project_HELLO/infra/benchmarks/oci/benchmark-result-schema.json",
+  "title": "OCI Region Benchmark Result",
+  "description": "Versioned schema for OCI region benchmark results. Rejects malformed or secret-bearing evidence.",
+  "version": "1.0.0",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "benchmarkId",
+    "timestamp",
+    "operator",
+    "regions",
+    "paths",
+    "computeAvailability",
+    "probeDetails",
+    "summary"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "description": "Semantic version of this schema"
+    },
+    "benchmarkId": {
+      "type": "string",
+      "pattern": "^oci-region-bench-[a-z0-9]+-[0-9]{8}$",
+      "description": "Unique benchmark run identifier, e.g. oci-region-bench-a1b2c3-20260728"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC timestamp of benchmark run start"
+    },
+    "operator": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Operator identifier (human or CI run ID)"
+    },
+    "regions": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 10,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "required": ["regionId", "displayName", "provisioned"],
+        "properties": {
+          "regionId": {
+            "type": "string",
+            "enum": ["ap-mumbai-1", "ap-hyderabad-1", "ap-south-1"],
+            "description": "OCI region identifier"
+          },
+          "displayName": {
+            "type": "string",
+            "description": "Human-readable region name"
+          },
+          "provisioned": {
+            "type": "boolean",
+            "description": "Whether compute was successfully provisioned in this region"
+          },
+          "availabilityDomain": {
+            "type": "string",
+            "description": "AD used for the probe instance"
+          },
+          "shape": {
+            "type": "string",
+            "description": "Compute shape used, e.g. VM.Standard.A1.Flex"
+          },
+          "ocpuCount": {
+            "type": "number",
+            "minimum": 0.125,
+            "maximum": 64
+          },
+          "memoryGB": {
+            "type": "number",
+            "minimum": 0.5,
+            "maximum": 512
+          },
+          "instanceId": {
+            "type": "string",
+            "description": "OCI instance OCID (non-sensitive, but do not include in public reports)"
+          },
+          "provisionError": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "Error message if provisioning failed (must not contain credentials)"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "paths": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["pathId", "sourceRegion", "targetName", "targetType", "latencyResults"],
+        "properties": {
+          "pathId": {
+            "type": "string",
+            "pattern": "^oci-[a-z0-9]+-[a-z0-9]+$",
+            "description": "Unique path identifier, e.g. oci-mum-sup"
+          },
+          "sourceRegion": {
+            "type": "string",
+            "description": "Region of source probe"
+          },
+          "targetName": {
+            "type": "string",
+            "description": "Human-readable target endpoint description (NOT the raw URL/hostname)"
+          },
+          "targetType": {
+            "type": "string",
+            "enum": ["supabase", "candidate", "oci-control", "external-api"],
+            "description": "Type of target: supabase (OCI→Supabase Mumbai), candidate (OCI→Bangalore simulator), oci-control (within OCI), external-api (Sarvam/Anthropic)"
+          },
+          "targetHost": {
+            "type": "string",
+            "maxLength": 253,
+            "description": "Hostname only (no protocol, no path, no credentials). Must be operator-supplied."
+          },
+          "targetPort": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535,
+            "description": "Target port for TCP/TLS/HTTP probes"
+          },
+          "latencyResults": {
+            "type": "object",
+            "required": ["dns", "tcp", "tls", "http"],
+            "properties": {
+              "dns": {
+                "$ref": "#/$defs/latencyStats",
+                "description": "DNS resolution latency in milliseconds"
+              },
+              "tcp": {
+                "$ref": "#/$defs/latencyStats",
+                "description": "TCP connect latency in milliseconds"
+              },
+              "tls": {
+                "$ref": "#/$defs/latencyStats",
+                "description": "TLS handshake latency in milliseconds (null if no TLS)"
+              },
+              "http": {
+                "$ref": "#/$defs/latencyStats",
+                "description": "HTTP request-response latency in milliseconds"
+              }
+            },
+            "additionalProperties": false
+          },
+          "failureResults": {
+            "type": "object",
+            "properties": {
+              "totalProbes": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "failures": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "timeouts": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "failureRate": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "lastError": {
+                "type": "string",
+                "maxLength": 300,
+                "description": "Last observed error (must not contain credentials or PII)"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "computeAvailability": {
+      "type": "object",
+      "required": ["regionsChecked"],
+      "properties": {
+        "regionsChecked": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["regionId", "a1Available"],
+            "properties": {
+              "regionId": {
+                "type": "string"
+              },
+              "a1Available": {
+                "type": "boolean",
+                "description": "Whether A1.Flex shape was available for provisioning"
+              },
+              "checkedAt": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "errorMessage": {
+                "type": "string",
+                "maxLength": 300
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "usageInputs": {
+      "type": "object",
+      "properties": {
+        "sessionCount": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Number of concurrent sessions tested"
+        },
+        "sessionDurationMinutes": {
+          "type": "number",
+          "minimum": 0.1,
+          "description": "Duration of each simulated session in minutes"
+        },
+        "totalTestMinutes": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Total test minutes across all sessions"
+        },
+        "computeOCPUHours": {
+          "type": "number",
+          "minimum": 0,
+          "description": "OCPU-hours consumed during benchmark"
+        },
+        "computeGBHours": {
+          "type": "number",
+          "minimum": 0,
+          "description": "GB-hours consumed during benchmark"
+        },
+        "networkEgressGB": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Network egress in GB during benchmark"
+        },
+        "queueRequestCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "OCI Queue request count if queue was tested"
+        },
+        "loggingIngestedGB": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Log data ingested during benchmark"
+        },
+        "monitoringDataPoints": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Monitoring data points generated"
+        },
+        "notificationCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Notification count triggered"
+        },
+        "apmTraceCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "APM tracing events generated"
+        }
+      },
+      "additionalProperties": false
+    },
+    "costInputs": {
+      "type": "object",
+      "properties": {
+        "currency": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 3,
+          "description": "ISO 4217 currency code"
+        },
+        "pricingSource": {
+          "type": "string",
+          "format": "uri",
+          "description": "URL of the pricing page used"
+        },
+        "pricingRetrievedAt": {
+          "type": "string",
+          "format": "date",
+          "description": "Date pricing was retrieved"
+        },
+        "pricingDisclaimer": {
+          "type": "string",
+          "const": "Pricing is sourced from public documentation as of the retrieval date and is not a guarantee of future cost. Always verify current pricing before provisioning.",
+          "description": "Mandatory disclaimer — must match exactly"
+        },
+        "costPerOCPUHour": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Cost per OCPU hour in specified currency"
+        },
+        "costPerGBHour": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Cost per GB hour in specified currency"
+        },
+        "costPerEgressGB": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Cost per GB of network egress"
+        },
+        "costPerQueueMillionRequests": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Cost per million queue requests"
+        },
+        "estimatedMonthlyCost": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Operator-calculated monthly estimate"
+        },
+        "alwaysFreeExceeded": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "compute-ocpu",
+              "compute-gb",
+              "block-volume",
+              "monitoring-ingestion",
+              "monitoring-retrieval",
+              "notifications-https",
+              "notifications-email",
+              "apm-traces",
+              "apm-synthetics",
+              "queue"
+            ]
+          },
+          "description": "List of Always Free limits that would be exceeded at tested concurrency"
+        }
+      },
+      "additionalProperties": false
+    },
+    "probeDetails": {
+      "type": "object",
+      "required": ["probeCount", "probeIntervalMs", "timeoutMs", "protocols"],
+      "properties": {
+        "probeCount": {
+          "type": "integer",
+          "minimum": 5,
+          "maximum": 10000,
+          "description": "Number of probes per path"
+        },
+        "probeIntervalMs": {
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 60000,
+          "description": "Interval between probes in milliseconds"
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 60000,
+          "description": "Per-probe timeout in milliseconds"
+        },
+        "protocols": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["TCP", "TLS", "HTTPS"]
+          }
+        },
+        "toolVersion": {
+          "type": "string",
+          "description": "Version of the benchmark CLI tool used"
+        }
+      },
+      "additionalProperties": false
+    },
+    "summary": {
+      "type": "object",
+      "required": ["status", "regionComparison"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["COMPLETED", "PARTIAL", "FAILED", "NOT-YET-MEASURED"],
+          "description": "Overall benchmark status. Must be NOT-YET-MEASURED until real probes run."
+        },
+        "notYetMeasuredReason": {
+          "type": "string",
+          "description": "Required when status is NOT-YET-MEASURED"
+        },
+        "regionComparison": {
+          "type": "string",
+          "enum": [
+            "NOT-YET-MEASURED",
+            "MUMBAI_PREFERRED",
+            "HYDERABAD_PREFERRED",
+            "EQUAL_WITHIN_TOLERANCE",
+            "INSUFFICIENT_DATA"
+          ],
+          "description": "Region comparison result. MUST be NOT-YET-MEASURED until real measurements exist."
+        },
+        "comparisonNotes": {
+          "type": "string",
+          "maxLength": 2000,
+          "description": "Narrative explanation of comparison"
+        },
+        "failureHighlight": {
+          "type": "string",
+          "maxLength": 1000,
+          "description": "Key failure or risk to call out"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "latencyStats": {
+      "type": "object",
+      "required": ["count", "unit"],
+      "properties": {
+        "count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of measurements"
+        },
+        "unit": {
+          "type": "string",
+          "const": "ms",
+          "description": "Unit is always milliseconds"
+        },
+        "min": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Minimum observed latency"
+        },
+        "max": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Maximum observed latency"
+        },
+        "mean": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Arithmetic mean"
+        },
+        "p50": {
+          "type": "number",
+          "minimum": 0,
+          "description": "50th percentile (median)"
+        },
+        "p95": {
+          "type": "number",
+          "minimum": 0,
+          "description": "95th percentile"
+        },
+        "p99": {
+          "type": "number",
+          "minimum": 0,
+          "description": "99th percentile"
+        },
+        "stddev": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Standard deviation"
+        },
+        "jitterMean": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Mean packet-to-packet jitter (for sequential probes)"
+        },
+        "jitterMax": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Maximum observed jitter"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "summary": {
+            "properties": {
+              "status": {
+                "const": "NOT-YET-MEASURED"
+              }
+            },
+            "required": ["status"]
+          }
+        },
+        "required": ["summary"]
+      },
+      "then": {
+        "required": ["summary"],
+        "properties": {
+          "summary": {
+            "required": ["notYetMeasuredReason"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "summary": {
+            "properties": {
+              "regionComparison": {
+                "not": {
+                  "const": "NOT-YET-MEASURED"
+                }
+              }
+            },
+            "required": ["regionComparison"]
+          }
+        },
+        "required": ["summary"]
+      },
+      "then": {
+        "required": ["paths", "computeAvailability"],
+        "properties": {
+          "paths": {
+            "minItems": 1
+          },
+          "computeAvailability": {
+            "required": ["regionsChecked"],
+            "properties": {
+              "regionsChecked": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false,
+  "not": {
+    "anyOf": [
+      {
+        "description": "Reject documents containing secrets, credentials, or API keys",
+        "properties": {
+          "paths": {
+            "contains": {
+              "properties": {
+                "targetHost": {
+                  "pattern": "(?i)(api[_-]?key|token|secret|password|credential|auth|bearer|access[_-]?key|private[_-]?key)"
+                }
+              },
+              "required": ["targetHost"]
+            }
+          }
+        }
+      },
+      {
+        "properties": {
+          "paths": {
+            "contains": {
+              "properties": {
+                "targetHost": {
+                  "pattern": "(@|://.*@)"
+                }
+              },
+              "required": ["targetHost"]
+            }
+          }
+        }
+      },
+      {
+        "properties": {
+          "computeAvailability": {
+            "properties": {
+              "regionsChecked": {
+                "contains": {
+                  "properties": {
+                    "errorMessage": {
+                      "pattern": "(?i)(api[_-]?key|token|secret|password|credential|auth|bearer|Unauthorized|403|401)"
+                    }
+                  },
+                  "required": ["errorMessage"]
+                }
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}

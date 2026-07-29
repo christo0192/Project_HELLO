@@ -1,0 +1,65 @@
+name: OCI Benchmark Quality
+
+permissions:
+  contents: read
+  pull-requests: read
+
+on:
+  pull_request:
+    paths:
+      - 'infra/benchmarks/oci/**'
+      - 'scripts/oci-benchmark-run'
+      - 'docs/benchmarks/oci-*.md'
+      - '.github/workflows/oci-benchmark-ci.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'infra/benchmarks/oci/**'
+      - 'scripts/oci-benchmark-run'
+      - 'docs/benchmarks/oci-*.md'
+      - '.github/workflows/oci-benchmark-ci.yml'
+
+jobs:
+  benchmark-tests:
+    name: Benchmark CLI tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install jsonschema
+        run: pip install jsonschema
+
+      - name: Run benchmark self-tests
+        run: python3 scripts/oci-benchmark-run self-test
+
+      - name: Validate schema with synthetic fixture
+        run: python3 scripts/oci-benchmark-run fixture --scenario mumbai-low-latency -o json
+
+      - name: Run calculator boundary tests
+        run: python3 scripts/oci-benchmark-run calculator -o json
+
+      - name: Check NOT-YET-MEASURED claims
+        run: |
+          grep -q "NOT-YET-MEASURED" docs/benchmarks/oci-region-report-template.md
+          grep -q "no measurements yet" docs/benchmarks/oci-region-benchmark-audit.md
+          grep -q "MUMBAI_PREFERRED" docs/benchmarks/oci-region-report-template.md && echo "FAIL: MUMBAI_PREFERRED found in template" && exit 1 || true
+          grep -q "HYDERABAD_PREFERRED" docs/benchmarks/oci-region-report-template.md && echo "FAIL: HYDERABAD_PREFERRED found in template" && exit 1 || true
+          echo "NOT-YET-MEASURED checks passed"
+
+  secret-scan:
+    name: Secret scan (benchmark files)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run secret scan on benchmark files
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
