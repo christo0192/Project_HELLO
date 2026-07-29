@@ -1149,7 +1149,8 @@ echo "Mumbai: clean"
         check("mock-oci: oci list failure never prints 'clean' (skipped)", True)
 
     # Test 2: Launch command failure with 'if ! ID=' invokes display-name
-    # cleanup (does NOT skip to blank-ID check due to set -e killing the script)
+    # cleanup (does NOT skip to blank-ID check due to set -e killing the script).
+    # Also: stderr is NOT redirected into the variable (no 2>&1).
     mock_launch_fail = '''#!/usr/bin/env bash
 set -euo pipefail
 DISPLAY_NAME="oci-benchmark-probe-mumbai-testonly"
@@ -1178,7 +1179,7 @@ if ! MUMBAI_INSTANCE_ID="$(oci compute instance launch \
     --compartment-id "${MUMBAI_COMPARTMENT_ID}" \
     --display-name "${DISPLAY_NAME}" \
     --region ap-mumbai-1 \
-    --query 'data.id' --raw-output 2>&1)"; then
+    --query 'data.id' --raw-output)"; then
   echo "Launch failed — running display-name cleanup for ${DISPLAY_NAME}"
   cleanup_called=yes
   ORPHAN_IDS="$(oci compute instance list \
@@ -1217,6 +1218,75 @@ echo "UNREACHABLE: cleanup_called=${cleanup_called}"
         check("mock-oci: launch failure invokes cleanup (skipped)", True)
         check("mock-oci: launch failure exits nonzero (skipped)", True)
         check("mock-oci: launch failure does NOT print UNREACHABLE (skipped)", True)
+
+    # Test 3: Launch succeeds but writes a warning to stderr → captured ID
+    # must NOT be contaminated by stderr (no 2>&1 on command substitution).
+    mock_stderr_warning = '''#!/usr/bin/env bash
+set -euo pipefail
+oci() {
+  echo "WARNING: deprecated shape option" >&2
+  echo "ocid1.instance.oc1.ap-mumbai-1.aaaa123456"
+  return 0
+}
+export -f oci
+if ! INSTANCE_ID="$(oci compute instance launch \
+    --compartment-id "ocid1.test.oc1..fake" \
+    --display-name "test-probe" \
+    --region ap-mumbai-1 \
+    --query 'data.id' --raw-output)"; then
+  echo "FATAL: launch failed" >&2
+  exit 1
+fi
+if echo "${INSTANCE_ID}" | grep -q "WARNING"; then
+  echo "FATAL: ID contaminated by stderr: ${INSTANCE_ID}" >&2
+  exit 1
+fi
+echo "OK: ${INSTANCE_ID}"
+'''
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
+            f.write(mock_stderr_warning)
+            tmp_path = f.name
+        result = subprocess.run(['bash', tmp_path], capture_output=True, text=True, timeout=10)
+        os.unlink(tmp_path)
+        check("mock-oci: launch success with stderr warning returns 0",
+              result.returncode == 0,
+              f"exit code {result.returncode}")
+        check("mock-oci: captured ID is not contaminated by stderr warning",
+              'WARNING' not in result.stdout,
+              f"stdout: {result.stdout.strip()}")
+        check("mock-oci: captured ID is a valid-lookind OCID",
+              'ocid1.instance' in result.stdout,
+              f"stdout: {result.stdout.strip()}")
+    except Exception as e:
+        check("mock-oci: stderr-warning regression ran", False, str(e))
+        check("mock-oci: launch success with stderr warning (skipped)", True)
+        check("mock-oci: captured ID not contaminated (skipped)", True)
+        check("mock-oci: captured ID is valid OCID (skipped)", True)
+
+    # 62. No double-backslash in any join query (structural: "\\n" means literal
+    #     backslash+n, not newline — all queries must use "\n" exactly)
+    check("runbook: no join query has double-backslash separator",
+          'join(`"\\\\n"`' not in runbook,
+          f"double-backslash found — all queries must use `\"\\n\"` not `\"\\\\n\"`")
+
+    # 63. UNIQ_SUFFIX provides same-second collision avoidance
+    check("runbook: UNIQ_SUFFIX used (timestamp+random, not OCI retry-token)",
+          'UNIQ_SUFFIX=' in runbook and 'head -c 9 /dev/urandom' in runbook)
+    check("runbook: DISPLAY_NAME uses UNIQ_SUFFIX",
+          'UNIQ_SUFFIX}' in launch_mumbai and 'UNIQ_SUFFIX}' in launch_hyderabad)
+
+    # 64. Retry loop for eventually-consistent OCI list
+    check("runbook: launch-failure cleanup has bounded retry loop",
+          'for attempt in 1 2 3' in runbook)
+    check("runbook: cleanup warns about eventual consistency",
+          'best-effort; OCI eventual consistency' in runbook)
+    check("runbook: cleanup requires final tagged teardown verification",
+          'MUST run tagged teardown verification' in runbook)
+
+    # 65. Stderr warning comment present
+    check("runbook: warns not to redirect stderr into OCID variable",
+          'Do NOT redirect stderr' in runbook)
 
     # ── JMESPath semantics (optional) ──
     try:

@@ -112,11 +112,14 @@ export MUMBAI_AD="$(oci iam availability-domain list \
   --region ap-mumbai-1)"
 
 export TAG_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
-DISPLAY_NAME="oci-benchmark-probe-mumbai-${TAG_TIMESTAMP}"
+UNIQ_SUFFIX="${TAG_TIMESTAMP}-$(head -c 9 /dev/urandom | base64 | tr '/+' 'AB' | tr -dc 'a-zA-Z0-9')"
+DISPLAY_NAME="oci-benchmark-probe-mumbai-${UNIQ_SUFFIX}"
 
 # ── Step 1: Launch (do NOT wait here) ──
 # Use 'if !' so that a nonzero exit enters the cleanup branch
-# (plain assignment with set -e would exit before the blank-ID check)
+# (plain assignment with set -e would exit before the blank-ID check).
+# Do NOT redirect stderr into the variable — CLI warnings would
+# contaminate the captured OCID.
 if ! MUMBAI_INSTANCE_ID="$(oci compute instance launch \
     --compartment-id "${MUMBAI_COMPARTMENT_ID}" \
     --availability-domain "${MUMBAI_AD}" \
@@ -129,44 +132,61 @@ if ! MUMBAI_INSTANCE_ID="$(oci compute instance launch \
     --ssh-authorized-keys-file "${SSH_PUBLIC_KEY_FILE}" \
     --freeform-tags '{"purpose":"oci-region-benchmark","ttl":"4h","region":"ap-mumbai-1"}' \
     --region ap-mumbai-1 \
-    --query 'data.id' --raw-output 2>&1)"; then
-  echo "FATAL: Mumbai launch command failed for ${DISPLAY_NAME}" >&2
-  echo "Output: ${MUMBAI_INSTANCE_ID}" >&2
-  # Clean up any instance provisioned with this display-name
-  ORPHAN_IDS="$(oci compute instance list \
-    --compartment-id "${MUMBAI_COMPARTMENT_ID}" \
-    --display-name "${DISPLAY_NAME}" \
-    --region ap-mumbai-1 \
-    --all \
-    --query 'join(`"\\n"`, data[?"lifecycle-state" != `"TERMINATED"`].id)' \
-    --raw-output)"
+    --query 'data.id' --raw-output)"; then
+    echo "FATAL: Mumbai launch command failed for ${DISPLAY_NAME}" >&2
+  echo "Output: ${ap-mumbai-1_INSTANCE_ID}" >&2
+  # Clean up any instance provisioned with this display-name.
+  # OCI list is eventually consistent — retry up to 3 times.
+  ORPHAN_IDS=""
+  for attempt in 1 2 3; do
+    ORPHAN_IDS="$(oci compute instance list \
+      --compartment-id "${MUMBAI_COMPARTMENT_ID}" \
+      --display-name "${DISPLAY_NAME}" \
+      --region ap-mumbai-1 \
+      --all \
+      --query 'join(`"\n"`, data[?"lifecycle-state" != `"TERMINATED"`].id)' \
+      --raw-output)"
+    [ -n "${ORPHAN_IDS}" ] && break
+    sleep 2
+  done
   if [ -n "${ORPHAN_IDS}" ]; then
     for id in ${ORPHAN_IDS}; do
       echo "Terminating orphan: ${id}"
       oci compute instance terminate --instance-id "${id}" --force \
         --region ap-mumbai-1 --wait-for-state TERMINATED
     done
+  else
+    echo "No orphan found for ${DISPLAY_NAME} (best-effort; OCI eventual consistency)" >&2
+    echo "MUST run tagged teardown verification (Phase 5c or Emergency) before trusting region is clean." >&2
   fi
   exit 1
 fi
 
 # ── Step 2: Validate OCID immediately (before waiting) ──
 if [ -z "${MUMBAI_INSTANCE_ID}" ]; then
-  echo "FATAL: MUMBAI_INSTANCE_ID is blank for ${DISPLAY_NAME}" >&2
+    echo "FATAL: MUMBAI_INSTANCE_ID is blank for ${DISPLAY_NAME}" >&2
   # Same display-name cleanup for blank-ID case
-  ORPHAN_IDS="$(oci compute instance list \
-    --compartment-id "${MUMBAI_COMPARTMENT_ID}" \
-    --display-name "${DISPLAY_NAME}" \
-    --region ap-mumbai-1 \
-    --all \
-    --query 'join(`"\\n"`, data[?"lifecycle-state" != `"TERMINATED"`].id)' \
-    --raw-output)"
+  ORPHAN_IDS=""
+  for attempt in 1 2 3; do
+    ORPHAN_IDS="$(oci compute instance list \
+      --compartment-id "${MUMBAI_COMPARTMENT_ID}" \
+      --display-name "${DISPLAY_NAME}" \
+      --region ap-mumbai-1 \
+      --all \
+      --query 'join(`"\n"`, data[?"lifecycle-state" != `"TERMINATED"`].id)' \
+      --raw-output)"
+    [ -n "${ORPHAN_IDS}" ] && break
+    sleep 2
+  done
   if [ -n "${ORPHAN_IDS}" ]; then
     for id in ${ORPHAN_IDS}; do
       echo "Terminating orphan: ${id}"
       oci compute instance terminate --instance-id "${id}" --force \
         --region ap-mumbai-1 --wait-for-state TERMINATED
     done
+  else
+    echo "No orphan found for ${DISPLAY_NAME} (best-effort; OCI eventual consistency)" >&2
+    echo "MUST run tagged teardown verification (Phase 5c or Emergency) before trusting region is clean." >&2
   fi
   exit 1
 fi
@@ -214,10 +234,14 @@ export HYDERABAD_AD="$(oci iam availability-domain list \
   --region ap-hyderabad-1)"
 
 export TAG_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
-DISPLAY_NAME="oci-benchmark-probe-hyderabad-${TAG_TIMESTAMP}"
+UNIQ_SUFFIX="${TAG_TIMESTAMP}-$(head -c 9 /dev/urandom | base64 | tr '/+' 'AB' | tr -dc 'a-zA-Z0-9')"
+DISPLAY_NAME="oci-benchmark-probe-hyderabad-${UNIQ_SUFFIX}"
 
 # ── Step 1: Launch (do NOT wait here) ──
 # Use 'if !' so that a nonzero exit enters the cleanup branch
+# (plain assignment with set -e would exit before the blank-ID check).
+# Do NOT redirect stderr into the variable — CLI warnings would
+# contaminate the captured OCID.
 if ! HYDERABAD_INSTANCE_ID="$(oci compute instance launch \
     --compartment-id "${HYDERABAD_COMPARTMENT_ID}" \
     --availability-domain "${HYDERABAD_AD}" \
@@ -230,23 +254,32 @@ if ! HYDERABAD_INSTANCE_ID="$(oci compute instance launch \
     --ssh-authorized-keys-file "${SSH_PUBLIC_KEY_FILE}" \
     --freeform-tags '{"purpose":"oci-region-benchmark","ttl":"4h","region":"ap-hyderabad-1"}' \
     --region ap-hyderabad-1 \
-    --query 'data.id' --raw-output 2>&1)"; then
-  echo "FATAL: Hyderabad launch command failed for ${DISPLAY_NAME}" >&2
-  echo "Output: ${HYDERABAD_INSTANCE_ID}" >&2
-  # Clean up any instance provisioned with this display-name
-  ORPHAN_IDS="$(oci compute instance list \
-    --compartment-id "${HYDERABAD_COMPARTMENT_ID}" \
-    --display-name "${DISPLAY_NAME}" \
-    --region ap-hyderabad-1 \
-    --all \
-    --query 'join(`"\n"`, data[?"lifecycle-state" != `"TERMINATED"`].id)' \
-    --raw-output)"
+    --query 'data.id' --raw-output)"; then
+    echo "FATAL: Hyderabad launch command failed for ${DISPLAY_NAME}" >&2
+  echo "Output: ${ap-hyderabad-1_INSTANCE_ID}" >&2
+  # Clean up any instance provisioned with this display-name.
+  # OCI list is eventually consistent — retry up to 3 times.
+  ORPHAN_IDS=""
+  for attempt in 1 2 3; do
+    ORPHAN_IDS="$(oci compute instance list \
+      --compartment-id "${HYDERABAD_COMPARTMENT_ID}" \
+      --display-name "${DISPLAY_NAME}" \
+      --region ap-hyderabad-1 \
+      --all \
+      --query 'join(`"\n"`, data[?"lifecycle-state" != `"TERMINATED"`].id)' \
+      --raw-output)"
+    [ -n "${ORPHAN_IDS}" ] && break
+    sleep 2
+  done
   if [ -n "${ORPHAN_IDS}" ]; then
     for id in ${ORPHAN_IDS}; do
       echo "Terminating orphan: ${id}"
       oci compute instance terminate --instance-id "${id}" --force \
         --region ap-hyderabad-1 --wait-for-state TERMINATED
     done
+  else
+    echo "No orphan found for ${DISPLAY_NAME} (best-effort; OCI eventual consistency)" >&2
+    echo "MUST run tagged teardown verification (Phase 5c or Emergency) before trusting region is clean." >&2
   fi
   # Also roll back Mumbai if it was provisioned
   if [ -n "${MUMBAI_INSTANCE_ID:-}" ]; then
@@ -263,21 +296,29 @@ fi
 
 # ── Step 2: Validate OCID immediately (before waiting) ──
 if [ -z "${HYDERABAD_INSTANCE_ID}" ]; then
-  echo "FATAL: HYDERABAD_INSTANCE_ID is blank for ${DISPLAY_NAME}" >&2
+    echo "FATAL: HYDERABAD_INSTANCE_ID is blank for ${DISPLAY_NAME}" >&2
   # Same display-name cleanup for blank-ID case
-  ORPHAN_IDS="$(oci compute instance list \
-    --compartment-id "${HYDERABAD_COMPARTMENT_ID}" \
-    --display-name "${DISPLAY_NAME}" \
-    --region ap-hyderabad-1 \
-    --all \
-    --query 'join(`"\n"`, data[?"lifecycle-state" != `"TERMINATED"`].id)' \
-    --raw-output)"
+  ORPHAN_IDS=""
+  for attempt in 1 2 3; do
+    ORPHAN_IDS="$(oci compute instance list \
+      --compartment-id "${HYDERABAD_COMPARTMENT_ID}" \
+      --display-name "${DISPLAY_NAME}" \
+      --region ap-hyderabad-1 \
+      --all \
+      --query 'join(`"\n"`, data[?"lifecycle-state" != `"TERMINATED"`].id)' \
+      --raw-output)"
+    [ -n "${ORPHAN_IDS}" ] && break
+    sleep 2
+  done
   if [ -n "${ORPHAN_IDS}" ]; then
     for id in ${ORPHAN_IDS}; do
       echo "Terminating orphan: ${id}"
       oci compute instance terminate --instance-id "${id}" --force \
         --region ap-hyderabad-1 --wait-for-state TERMINATED
     done
+  else
+    echo "No orphan found for ${DISPLAY_NAME} (best-effort; OCI eventual consistency)" >&2
+    echo "MUST run tagged teardown verification (Phase 5c or Emergency) before trusting region is clean." >&2
   fi
   # Also roll back Mumbai
   if [ -n "${MUMBAI_INSTANCE_ID:-}" ]; then
