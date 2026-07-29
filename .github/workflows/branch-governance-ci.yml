@@ -5,12 +5,16 @@ on:
     paths:
       - 'scripts/check-branch-governance.mjs'
       - 'scripts/check-branch-governance.test.mjs'
+      - 'scripts/check-main-provenance.mjs'
+      - 'scripts/check-main-provenance.test.mjs'
       - '.github/branch-governance-policy.json'
   push:
     branches: [main]
     paths:
       - 'scripts/check-branch-governance.mjs'
       - 'scripts/check-branch-governance.test.mjs'
+      - 'scripts/check-main-provenance.mjs'
+      - 'scripts/check-main-provenance.test.mjs'
       - '.github/branch-governance-policy.json'
   workflow_dispatch:
 
@@ -21,7 +25,7 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -29,3 +33,5 @@ jobs:
           node-version: 22
       - name: Run branch governance unit/fixture tests
         run: node scripts/check-branch-governance.test.mjs
+      - name: Run commit provenance unit/fixture tests
+        run: node scripts/check-main-provenance.test.mjs

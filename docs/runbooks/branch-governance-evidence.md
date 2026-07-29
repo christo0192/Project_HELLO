@@ -209,6 +209,113 @@ All synthetic evidence is embedded inline. 102 sequentially awaited tests cover:
 - Policy parity, redaction, path/slug leak checks
 - Combined classic+ruleset and mixed clean/bypassed regression
 
+## Commit provenance verifier (`check-main-provenance.mjs`)
+
+### Overview
+
+The commit provenance verifier (`scripts/check-main-provenance.mjs`) is a
+**compensating control** for unavailable hosted branch protection on GitHub
+Free private repositories. It detects, after the fact, whether commits
+arriving on `main` originated from a GitHub squash-merged pull request.
+
+**⚠️  This verifier does NOT prevent direct pushes.** It detects and records
+evidence of non-PR provenance. FND-01 remains hosted-enforcement pending.
+
+### Supported merge strategies
+
+| Strategy | Parent count | PR ref in message | Verdict |
+|----------|-------------|-------------------|--------|
+| Squash merge | 1 | `(#N)` | ✅ Accepted |
+| Direct push | 1 | No | ❌ Rejected |
+| Merge commit | 2+ | Any | ❌ Rejected |
+| Rebase merge (with GitHub `(#N)`) | 1 | `(#N)` | ✅ Accepted |
+| Rebase merge (no `(#N)`) | 1 | No | ❌ Rejected (fail-closed) |
+| Root commit | 0 | — | ❌ Rejected |
+
+### Modes
+
+- **Live mode:** Reads `GITHUB_EVENT_PATH` (push event payload JSON),
+  enumerates commits via `git rev-list`, and classifies each.
+- **Offline mode:** Reads a local evidence JSON file (via `$INFORMER_PATH`,
+  first CLI argument) containing a `commits` array with `parents` and
+  `message` fields per commit.
+
+### Offline evidence schema
+
+```json
+{
+  "metadata": {
+    "branch": "main",
+    "checked_at": "2026-01-01T00:00:00Z"
+  },
+  "commits": [
+    {
+      "parents": ["abc123"],
+      "message": "feat: add login page (#42)"
+    }
+  ]
+}
+```
+
+### Exit codes
+
+- `0` — ALL commits have acceptable PR provenance (squash-merge)
+- `1` — One or more commits lack acceptable provenance (fail-closed)
+- `2` — Input malformed, file not found, parse error
+
+### Output (redacted)
+
+```json
+{
+  "passed": true,
+  "provenance": {
+    "total_commits": 5,
+    "accepted_count": 5,
+    "rejected_count": 0,
+    "direct_push_count": 0,
+    "merge_commit_count": 0,
+    "ambiguous_count": 0,
+    "error_count": 0
+  },
+  "summary": "ALL 5 commits have acceptable PR provenance (squash-merge)"
+}
+```
+
+### Monitor workflow
+
+`.github/workflows/branch-governance-monitor.yml` runs on every `push` to
+`main`, executes the provenance verifier, and uploads the redacted evidence
+as a build artifact. It uses `contents: read` (least privilege) and never
+fails the workflow (detection only).
+
+### Limitations
+
+1. **Detection only** — does not prevent the push from landing.
+2. **Heuristic-based** — a crafted commit with a fake `(#N)` in the
+   message passes the check.
+3. **Requires `fetch-depth: 0`** in the checkout step for `git rev-list`
+   to resolve the full commit range.
+4. **Single event source** — only works from `push` event context
+   (`GITHUB_EVENT_PATH`).
+
+### Running tests
+
+```bash
+node scripts/check-main-provenance.test.mjs
+```
+
+Offline tests cover:
+- Unit: classifyCommit() for all verdicts + error cases
+- Integration: single/multiple squash-merge, direct push, merge commit,
+  mixed provenance
+- Edge cases: empty message, non-numeric hash in message, hash not at end,
+  multiple parents with PR ref
+- Malformed evidence: null, non-object, missing metadata, missing commits,
+  empty commits, branch mismatch
+- Redaction: no SHA, message, PR number, or repo name in output
+- CLI: valid accepted/rejected exit codes, malformed JSON, missing file,
+  branch mismatch, path leak prevention
+
 ## Security notes
 
 - **Never share raw API output.** The raw evidence contains repository
