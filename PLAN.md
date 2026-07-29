@@ -4,7 +4,7 @@
 
 ---
 
-> **Implementation status (2026-07-29):** Branch `feat/gov-06-synthetic-data` implements GOV-06 local synthetic demo seed tooling and tests (offline validator, local Supabase seed, SQL integration checks, runbook). This does **not** close production/demo acceptance by itself: FND-03 owner evidence, authentic shareable-artifact replacement, restricted-storage disposition, and launch gates remain pending.
+> **Implementation status (2026-07-29):** GOV-06 local synthetic demo seed tooling and tests are merged in PR #14. Branch `feat/obs-01-02-logging-correlation` implements OBS-01/OBS-02 structured logging and correlation scaffolding across API and voice workers with local tests. These implementations do **not** close production acceptance: FND-03 owner evidence, authentic shareable-artifact replacement, restricted-storage disposition, managed log export, dashboards, alarms, SLOs, deployed correlation proof, and launch gates remain pending.
 
 ---
 
