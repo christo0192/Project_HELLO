@@ -63,7 +63,7 @@ Phase-0 Foundation tasks: FND01 repository controls merged/hosted enforcement bl
 | Blocker | Plan task | Required action | Evidence needed |
 |---------|-----------|-----------------|-----------------|
 | Branch protection not enforced | FND-01 | GitHub private-plan upgrade or equivalent control approved by repository owner | Ruleset URL or exported settings evidence; status checks enforced on `main` |
-| Credential rotation pending (6 providers) | FND-02 | Authorized owner rotates each credential in-provider | Non-secret revocation evidence per provider (audit log, rotation timestamp, or old-credential-rejection test) |
+| Credential rotation pending (8 providers) | FND-02 | Authorized owner rotates each credential in-provider | Non-secret revocation evidence per provider (audit log, rotation timestamp, or old-credential-rejection test) |
 | Candidate artifacts not sanitized | FND-03 | Synthetic replacements authored for all quarantined media | Shareable synthetic assets committed; original evidence dispositioned to approved restricted storage with evidence |
 
 See `docs/repository-inventory.md` for per-task detail and
@@ -71,3 +71,25 @@ See `docs/repository-inventory.md` for per-task detail and
 
 `PLAN.md` is the production-readiness source of truth. These blockers must be
 resolved before FND-01, FND-02, and FND-03 can be marked complete.
+
+## Phase-0 evidence CI workflow
+
+The repository includes a CI workflow (`.github/workflows/phase0-evidence-ci.yml`)
+that validates the evidence example and runs deterministic tests on every pull
+request and push to `main`. The workflow:
+
+1. Validates `config/phase0-evidence.example.json` (expected exit 2 — valid
+   shape, all pending). Passes on exit 2; fails on 0, 1, or any other.
+2. Runs `scripts/check-phase0-evidence.test.mjs` (fails on non-zero).
+3. Runs `git diff --check origin/main...HEAD` for whitespace issues (requires
+   `fetch-depth: 0`).
+4. Documents that secret scanning is handled by the repository-level
+   `.github/workflows/secret-scan.yml` — not by this workflow.
+
+Secret scanning via gitleaks is handled by the repository-level secret-scan
+workflow. The phase-0 evidence workflow runs **deterministic offline tests only**
+and never reads local evidence, env files, ignored artifacts, secrets, or
+production resources.
+
+Real evidence manifests (`config/phase0-evidence.local.json`) are gitignored and
+must be validated locally before acceptance review.

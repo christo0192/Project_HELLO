@@ -75,3 +75,6 @@ Thumbs.db
 *.ntvs*
 *.njsproj
 *.sln
+
+# Phase-0 evidence manifest (real evidence stays local; only the example is committed)
+config/phase0-evidence.local.json

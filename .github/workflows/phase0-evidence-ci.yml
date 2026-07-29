@@ -1,0 +1,49 @@
+name: Phase-0 Evidence Validation
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  validate-evidence:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Validate example manifest (expected exit 2 — all pending, valid shape)
+        id: validate-example
+        run: |
+          exit_code=0
+          node scripts/check-phase0-evidence.mjs config/phase0-evidence.example.json || exit_code=$?
+          if [ "$exit_code" -eq 2 ]; then
+            echo "PASS: example exits 2 (valid shape, all pending)"
+          elif [ "$exit_code" -eq 0 ]; then
+            echo "FAIL: example exited 0 (unexpected — should be all-pending)"
+            exit 1
+          else
+            echo "FAIL: example exited $exit_code (expected 2)"
+            exit 1
+          fi
+
+      - name: Run deterministic tests
+        run: |
+          node scripts/check-phase0-evidence.test.mjs
+
+      - name: Git diff whitespace check (against merge base)
+        run: git diff --check origin/main...HEAD
+
+      - name: Document secret-scan dependency
+        run: |
+          echo "Secret scanning is handled by the repository-level secret-scan workflow"
+          echo "(.github/workflows/secret-scan.yml). This workflow runs offline"
+          echo "deterministic tests only and never reads local evidence, env files,"
+          echo "ignored artifacts, secrets, or production resources."

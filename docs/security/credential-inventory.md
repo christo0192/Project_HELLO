@@ -13,6 +13,11 @@ No credential values are recorded in this document. Local `.env` files are
 excluded from Git. Non-secret revocation evidence is required for each system
 before FND-02 can close.
 
+FND-02 covers **8 provider systems**. Retell, ElevenLabs, and Cartesia are
+tracked as three separate entries because each has an independent provider
+account and credential lifecycle; the schema treats each as a separate
+`provider` value.
+
 | System | Known local locations | Required action | Rotation status |
 |--------|-----------------------|-----------------|-----------------|
 | Supabase | `app/api/.env`, `app/voice/.env`, `app/voice-livekit/.env`, archived server env | Rotate project/service/database credentials; update only approved local runtimes | Owner verification pending |
@@ -20,7 +25,9 @@ before FND-02 can close.
 | Anthropic | Current and archived voice env files | Rotate API keys | Owner verification pending |
 | Sarvam | Current and archived voice env files | Rotate API keys | Owner verification pending |
 | Deepgram | Previous and archived voice env files | Rotate API keys | Owner verification pending |
-| Retell, ElevenLabs, Cartesia | Archived env files | Revoke or rotate; delete unused resources where approved | Owner verification pending |
+| Retell | Archived env files | Revoke or rotate; delete unused resources where approved | Owner verification pending |
+| ElevenLabs | Archived env files | Revoke or rotate; delete unused resources where approved | Owner verification pending |
+| Cartesia | Archived env files | Revoke or rotate; delete unused resources where approved | Owner verification pending |
 
 Rotation must be performed in each provider account by an authorized owner.
 Acceptable non-secret evidence includes a provider audit-log screenshot, a
@@ -42,6 +49,10 @@ the old credential is rejected. Deleting a local file or ignoring it via
   Disposition of original evidence into approved restricted storage is pending;
   governed archival evidence not recorded in repo. `PLAN.md` acceptance criteria for
   FND-03 are not met.
+- **FND-03 artifact scope** (7 fixed group IDs matching `PLAN.md`):
+  `hello-html`, `hello-md`, `hello-assets`, `generated-pdf`, `voice-recording`,
+  `scorecard-export`, `env-example-values`. All are required; the validator
+  rejects manifests missing any.
 
 ## Scanner state
 
@@ -53,3 +64,26 @@ the old credential is rejected. Deleting a local file or ignoring it via
   findings; the GitHub secret-scan workflow passed on `main`.
 - Quarantined local credentials and media are outside the committed set and
   require owner action for rotation and disposition respectively.
+
+## Phase-0 Evidence Validation
+
+FND-02 and FND-03 acceptance requires a structured evidence manifest that
+records credential rotation and artifact disposition. The following tooling
+is available to validate the manifest shape:
+
+| Artifact | Location |
+|----------|----------|
+| Schema | `config/phase0-evidence.schema.json` |
+| Example (all pending) | `config/phase0-evidence.example.json` |
+| Validator (zero-dependency) | `scripts/check-phase0-evidence.mjs` |
+| Deterministic tests | `scripts/check-phase0-evidence.test.mjs` |
+| CI workflow | `.github/workflows/phase0-evidence-ci.yml` |
+| Owner runbook | `docs/runbooks/phase0-owner-evidence.md` |
+
+The real manifest (`config/phase0-evidence.local.json`) is gitignored and must
+never be committed. See `docs/runbooks/phase0-owner-evidence.md` for the
+offline procedure.
+
+FND-02 and FND-03 remain **owner verification pending** as of this writing.
+No code change alone can close these tasks; each requires human action at the
+provider account and restricted-storage level.

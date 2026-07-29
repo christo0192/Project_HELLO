@@ -1,0 +1,239 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/christo0192/Project_HELLO/config/phase0-evidence.schema.json",
+  "title": "Phase-0 Evidence Manifest",
+  "description": "Schema for FND-02 (credential rotation) and FND-03 (candidate-artifact disposition) evidence manifests. Rejects secret-like field names, secret values, PII, and placeholder claims.",
+  "version": "1.0.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "evidenceDate",
+    "owner",
+    "credentialGroups",
+    "artifactGroups"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "enum": ["1.0.0"],
+      "description": "Schema version must be exactly 1.0.0"
+    },
+    "evidenceDate": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC timestamp of evidence capture. Must not be in the future."
+    },
+    "owner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "evidenceDate"
+      ],
+      "properties": {
+        "role": {
+          "type": "string",
+          "enum": ["Engineering Lead", "Security Lead", "Product Manager", "Legal Counsel"],
+          "description": "Role of the person providing the evidence. Must be one of the approved roles."
+        },
+        "evidenceDate": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 UTC timestamp when the owner recorded their attestation"
+        }
+      }
+    },
+    "credentialGroups": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "groupId",
+          "provider",
+          "status"
+        ],
+        "properties": {
+          "groupId": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]+$",
+            "description": "Unique identifier for this credential group"
+          },
+          "provider": {
+            "type": "string",
+            "enum": [
+              "supabase",
+              "livekit",
+              "anthropic",
+              "sarvam",
+              "deepgram",
+              "retell",
+              "elevenlabs",
+              "cartesia"
+            ],
+            "description": "Provider system whose credential was rotated"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["pending", "verified"],
+            "description": "Whether this credential group has been verified."
+          },
+          "verification": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ownerRole",
+              "evidenceDate",
+              "evidenceRef",
+              "rotationAction",
+              "oldCredentialRejectionMethod"
+            ],
+            "properties": {
+              "ownerRole": {
+                "type": "string",
+                "enum": ["Engineering Lead", "Security Lead", "Product Manager", "Legal Counsel"],
+                "description": "Role of the person who performed and verified the rotation"
+              },
+              "evidenceDate": {
+                "type": "string",
+                "format": "date-time",
+                "description": "ISO 8601 UTC timestamp when rotation evidence was captured"
+              },
+              "evidenceRef": {
+                "type": "string",
+                "pattern": "^restricted://FND02/[a-z0-9][a-z0-9._/-]{0,255}$",
+                "description": "Reference to non-secret evidence stored outside Git. Pattern: restricted://FND02/<path>"
+              },
+              "rotationAction": {
+                "type": "string",
+                "enum": ["rotated", "revoked", "deleted-resource"],
+                "description": "Action taken on the old credential"
+              },
+              "oldCredentialRejectionMethod": {
+                "type": "string",
+                "enum": ["audit-log-screenshot", "provider-console-timestamp", "credential-rejection-test"],
+                "description": "Method used to prove the old credential no longer works"
+              }
+            }
+          }
+        },
+        "if": {
+          "properties": {
+            "status": { "const": "pending" }
+          },
+          "required": ["status"]
+        },
+        "then": {
+          "properties": {
+            "verification": false
+          }
+        },
+        "else": {
+          "required": ["verification"]
+        }
+      },
+      "minItems": 8,
+      "maxItems": 8
+    },
+    "artifactGroups": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "groupId",
+          "artifactType",
+          "status"
+        ],
+        "properties": {
+          "groupId": {
+            "type": "string",
+            "enum": [
+              "hello-html",
+              "hello-md",
+              "hello-assets",
+              "generated-pdf",
+              "voice-recording",
+              "scorecard-export",
+              "env-example-values"
+            ],
+            "description": "Fixed artifact group ID matching PLAN.md scope"
+          },
+          "artifactType": {
+            "type": "string",
+            "enum": [
+              "interview-recording",
+              "scorecard-pdf",
+              "candidate-screenshot",
+              "resume-copy",
+              "voice-media",
+              "generated-document",
+              "browser-recording"
+            ],
+            "description": "Type of candidate artifact from FND-03 scope"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["pending", "verified"],
+            "description": "Whether this artifact group has been verified."
+          },
+          "verification": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ownerRole",
+              "evidenceDate",
+              "manualReviewOutcome",
+              "dispositionStatus",
+              "evidenceRef"
+            ],
+            "properties": {
+              "ownerRole": {
+                "type": "string",
+                "enum": ["Engineering Lead", "Security Lead", "Product Manager", "Legal Counsel"],
+                "description": "Role of the person who performed and verified the disposition"
+              },
+              "evidenceDate": {
+                "type": "string",
+                "format": "date-time",
+                "description": "ISO 8601 UTC timestamp when disposition evidence was captured"
+              },
+              "manualReviewOutcome": {
+                "type": "string",
+                "enum": ["clean", "replaced-synthetic", "quarantined"],
+                "description": "Outcome of manual review for this artifact"
+              },
+              "dispositionStatus": {
+                "type": "string",
+                "enum": ["retained-restricted", "deleted-after-replacement", "pending-review"],
+                "description": "Current disposition status of the original evidence"
+              },
+              "evidenceRef": {
+                "type": "string",
+                "pattern": "^restricted://FND03/[a-z0-9][a-z0-9._/-]{0,255}$",
+                "description": "Reference to disposition evidence stored outside Git."
+              }
+            }
+          }
+        },
+        "if": {
+          "properties": {
+            "status": { "const": "pending" }
+          },
+          "required": ["status"]
+        },
+        "then": {
+          "properties": {
+            "verification": false
+          }
+        },
+        "else": {
+          "required": ["verification"]
+        }
+      },
+      "minItems": 7,
+      "maxItems": 7
+    }
+  }
+}

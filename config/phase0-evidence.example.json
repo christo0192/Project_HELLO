@@ -1,0 +1,87 @@
+{
+  "schemaVersion": "1.0.0",
+  "evidenceDate": "2025-06-15T10:00:00Z",
+  "owner": {
+    "role": "Engineering Lead",
+    "evidenceDate": "2025-06-15T10:30:00Z"
+  },
+  "credentialGroups": [
+    {
+      "groupId": "supabase-rotation",
+      "provider": "supabase",
+      "status": "pending"
+    },
+    {
+      "groupId": "livekit-rotation",
+      "provider": "livekit",
+      "status": "pending"
+    },
+    {
+      "groupId": "anthropic-rotation",
+      "provider": "anthropic",
+      "status": "pending"
+    },
+    {
+      "groupId": "sarvam-rotation",
+      "provider": "sarvam",
+      "status": "pending"
+    },
+    {
+      "groupId": "deepgram-rotation",
+      "provider": "deepgram",
+      "status": "pending"
+    },
+    {
+      "groupId": "retell-rotation",
+      "provider": "retell",
+      "status": "pending"
+    },
+    {
+      "groupId": "elevenlabs-rotation",
+      "provider": "elevenlabs",
+      "status": "pending"
+    },
+    {
+      "groupId": "cartesia-rotation",
+      "provider": "cartesia",
+      "status": "pending"
+    }
+  ],
+  "artifactGroups": [
+    {
+      "groupId": "hello-html",
+      "artifactType": "generated-document",
+      "status": "pending"
+    },
+    {
+      "groupId": "hello-md",
+      "artifactType": "generated-document",
+      "status": "pending"
+    },
+    {
+      "groupId": "hello-assets",
+      "artifactType": "resume-copy",
+      "status": "pending"
+    },
+    {
+      "groupId": "generated-pdf",
+      "artifactType": "scorecard-pdf",
+      "status": "pending"
+    },
+    {
+      "groupId": "voice-recording",
+      "artifactType": "voice-media",
+      "status": "pending"
+    },
+    {
+      "groupId": "scorecard-export",
+      "artifactType": "scorecard-pdf",
+      "status": "pending"
+    },
+    {
+      "groupId": "env-example-values",
+      "artifactType": "generated-document",
+      "status": "pending"
+    }
+  ]
+}
