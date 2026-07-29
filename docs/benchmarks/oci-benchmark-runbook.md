@@ -75,6 +75,15 @@ capacity" errors appear, document the error and date.
 > Provisioning does not require a `--yes` flag — it runs immediately once valid
 > resource OCIDs are supplied.
 >
+> **⚠️ Do not blindly retry launch** after an ambiguous CLI or network failure.
+> The `oci compute instance launch` command does not support idempotency tokens
+> (no `--opc-retry-token`; `--opc-client-request-id` is a tracing header, not
+> idempotency — ref: `oci compute instance launch --help`, retrieved 2026-07-29).
+> A failed launch may still have provisioned a billable instance. Before retrying,
+> run a display-name-targeted cleanup: list instances matching your unique
+> `DISPLAY_NAME` in that compartment/region, and terminate any matches.  Each
+> launch block below includes this cleanup on failure.
+>
 > **Network prerequisite:** The subnet must allow inbound TCP/22 (SSH) from the
 > operator's trusted CIDR **temporarily**. Remove this ingress rule after teardown.
 > Never expose SSH to 0.0.0.0/0.
@@ -103,27 +112,62 @@ export MUMBAI_AD="$(oci iam availability-domain list \
   --region ap-mumbai-1)"
 
 export TAG_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
-export RETRY_TOKEN="probe-mumbai-${TAG_TIMESTAMP}-$(uuidgen 2>/dev/null || head -c 16 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9')"
+DISPLAY_NAME="oci-benchmark-probe-mumbai-${TAG_TIMESTAMP}"
 
 # ── Step 1: Launch (do NOT wait here) ──
-MUMBAI_INSTANCE_ID="$(oci compute instance launch \
-  --compartment-id "${MUMBAI_COMPARTMENT_ID}" \
-  --availability-domain "${MUMBAI_AD}" \
-  --subnet-id "${MUMBAI_SUBNET_ID}" \
-  --shape "VM.Standard.A1.Flex" \
-  --shape-config '{"ocpus":1,"memoryInGBs":6}' \
-  --image-id "${MUMBAI_IMAGE_ID}" \
-  --display-name "oci-benchmark-probe-mumbai-${TAG_TIMESTAMP}" \
-  --assign-public-ip true \
-  --ssh-authorized-keys-file "${SSH_PUBLIC_KEY_FILE}" \
-  --freeform-tags '{"purpose":"oci-region-benchmark","ttl":"4h","region":"ap-mumbai-1"}' \
-  --opc-retry-token "${RETRY_TOKEN}" \
-  --region ap-mumbai-1 \
-  --query 'data.id' --raw-output)"
+# Use 'if !' so that a nonzero exit enters the cleanup branch
+# (plain assignment with set -e would exit before the blank-ID check)
+if ! MUMBAI_INSTANCE_ID="$(oci compute instance launch \
+    --compartment-id "${MUMBAI_COMPARTMENT_ID}" \
+    --availability-domain "${MUMBAI_AD}" \
+    --subnet-id "${MUMBAI_SUBNET_ID}" \
+    --shape "VM.Standard.A1.Flex" \
+    --shape-config '{"ocpus":1,"memoryInGBs":6}' \
+    --image-id "${MUMBAI_IMAGE_ID}" \
+    --display-name "${DISPLAY_NAME}" \
+    --assign-public-ip true \
+    --ssh-authorized-keys-file "${SSH_PUBLIC_KEY_FILE}" \
+    --freeform-tags '{"purpose":"oci-region-benchmark","ttl":"4h","region":"ap-mumbai-1"}' \
+    --region ap-mumbai-1 \
+    --query 'data.id' --raw-output 2>&1)"; then
+  echo "FATAL: Mumbai launch command failed for ${DISPLAY_NAME}" >&2
+  echo "Output: ${MUMBAI_INSTANCE_ID}" >&2
+  # Clean up any instance provisioned with this display-name
+  ORPHAN_IDS="$(oci compute instance list \
+    --compartment-id "${MUMBAI_COMPARTMENT_ID}" \
+    --display-name "${DISPLAY_NAME}" \
+    --region ap-mumbai-1 \
+    --all \
+    --query 'join(`"\\n"`, data[?"lifecycle-state" != `"TERMINATED"`].id)' \
+    --raw-output)"
+  if [ -n "${ORPHAN_IDS}" ]; then
+    for id in ${ORPHAN_IDS}; do
+      echo "Terminating orphan: ${id}"
+      oci compute instance terminate --instance-id "${id}" --force \
+        --region ap-mumbai-1 --wait-for-state TERMINATED
+    done
+  fi
+  exit 1
+fi
 
 # ── Step 2: Validate OCID immediately (before waiting) ──
 if [ -z "${MUMBAI_INSTANCE_ID}" ]; then
-  echo "FATAL: MUMBAI_INSTANCE_ID is blank — launch returned no ID" >&2
+  echo "FATAL: MUMBAI_INSTANCE_ID is blank for ${DISPLAY_NAME}" >&2
+  # Same display-name cleanup for blank-ID case
+  ORPHAN_IDS="$(oci compute instance list \
+    --compartment-id "${MUMBAI_COMPARTMENT_ID}" \
+    --display-name "${DISPLAY_NAME}" \
+    --region ap-mumbai-1 \
+    --all \
+    --query 'join(`"\\n"`, data[?"lifecycle-state" != `"TERMINATED"`].id)' \
+    --raw-output)"
+  if [ -n "${ORPHAN_IDS}" ]; then
+    for id in ${ORPHAN_IDS}; do
+      echo "Terminating orphan: ${id}"
+      oci compute instance terminate --instance-id "${id}" --force \
+        --region ap-mumbai-1 --wait-for-state TERMINATED
+    done
+  fi
   exit 1
 fi
 echo "Mumbai probe OCID captured: ${MUMBAI_INSTANCE_ID}"
@@ -170,28 +214,72 @@ export HYDERABAD_AD="$(oci iam availability-domain list \
   --region ap-hyderabad-1)"
 
 export TAG_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
-export RETRY_TOKEN="probe-hyderabad-${TAG_TIMESTAMP}-$(uuidgen 2>/dev/null || head -c 16 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9')"
+DISPLAY_NAME="oci-benchmark-probe-hyderabad-${TAG_TIMESTAMP}"
 
 # ── Step 1: Launch (do NOT wait here) ──
-HYDERABAD_INSTANCE_ID="$(oci compute instance launch \
-  --compartment-id "${HYDERABAD_COMPARTMENT_ID}" \
-  --availability-domain "${HYDERABAD_AD}" \
-  --subnet-id "${HYDERABAD_SUBNET_ID}" \
-  --shape "VM.Standard.A1.Flex" \
-  --shape-config '{"ocpus":1,"memoryInGBs":6}' \
-  --image-id "${HYDERABAD_IMAGE_ID}" \
-  --display-name "oci-benchmark-probe-hyderabad-${TAG_TIMESTAMP}" \
-  --assign-public-ip true \
-  --ssh-authorized-keys-file "${SSH_PUBLIC_KEY_FILE}" \
-  --freeform-tags '{"purpose":"oci-region-benchmark","ttl":"4h","region":"ap-hyderabad-1"}' \
-  --opc-retry-token "${RETRY_TOKEN}" \
-  --region ap-hyderabad-1 \
-  --query 'data.id' --raw-output)"
+# Use 'if !' so that a nonzero exit enters the cleanup branch
+if ! HYDERABAD_INSTANCE_ID="$(oci compute instance launch \
+    --compartment-id "${HYDERABAD_COMPARTMENT_ID}" \
+    --availability-domain "${HYDERABAD_AD}" \
+    --subnet-id "${HYDERABAD_SUBNET_ID}" \
+    --shape "VM.Standard.A1.Flex" \
+    --shape-config '{"ocpus":1,"memoryInGBs":6}' \
+    --image-id "${HYDERABAD_IMAGE_ID}" \
+    --display-name "${DISPLAY_NAME}" \
+    --assign-public-ip true \
+    --ssh-authorized-keys-file "${SSH_PUBLIC_KEY_FILE}" \
+    --freeform-tags '{"purpose":"oci-region-benchmark","ttl":"4h","region":"ap-hyderabad-1"}' \
+    --region ap-hyderabad-1 \
+    --query 'data.id' --raw-output 2>&1)"; then
+  echo "FATAL: Hyderabad launch command failed for ${DISPLAY_NAME}" >&2
+  echo "Output: ${HYDERABAD_INSTANCE_ID}" >&2
+  # Clean up any instance provisioned with this display-name
+  ORPHAN_IDS="$(oci compute instance list \
+    --compartment-id "${HYDERABAD_COMPARTMENT_ID}" \
+    --display-name "${DISPLAY_NAME}" \
+    --region ap-hyderabad-1 \
+    --all \
+    --query 'join(`"\n"`, data[?"lifecycle-state" != `"TERMINATED"`].id)' \
+    --raw-output)"
+  if [ -n "${ORPHAN_IDS}" ]; then
+    for id in ${ORPHAN_IDS}; do
+      echo "Terminating orphan: ${id}"
+      oci compute instance terminate --instance-id "${id}" --force \
+        --region ap-hyderabad-1 --wait-for-state TERMINATED
+    done
+  fi
+  # Also roll back Mumbai if it was provisioned
+  if [ -n "${MUMBAI_INSTANCE_ID:-}" ]; then
+    echo "Terminating Mumbai probe due to Hyderabad launch failure..." >&2
+    oci compute instance terminate \
+      --instance-id "${MUMBAI_INSTANCE_ID}" \
+      --force \
+      --region ap-mumbai-1 \
+      --wait-for-state TERMINATED
+    echo "Mumbai probe terminated." >&2
+  fi
+  exit 1
+fi
 
 # ── Step 2: Validate OCID immediately (before waiting) ──
 if [ -z "${HYDERABAD_INSTANCE_ID}" ]; then
-  echo "FATAL: HYDERABAD_INSTANCE_ID is blank — launch returned no ID" >&2
-  # Terminate Mumbai before exiting
+  echo "FATAL: HYDERABAD_INSTANCE_ID is blank for ${DISPLAY_NAME}" >&2
+  # Same display-name cleanup for blank-ID case
+  ORPHAN_IDS="$(oci compute instance list \
+    --compartment-id "${HYDERABAD_COMPARTMENT_ID}" \
+    --display-name "${DISPLAY_NAME}" \
+    --region ap-hyderabad-1 \
+    --all \
+    --query 'join(`"\n"`, data[?"lifecycle-state" != `"TERMINATED"`].id)' \
+    --raw-output)"
+  if [ -n "${ORPHAN_IDS}" ]; then
+    for id in ${ORPHAN_IDS}; do
+      echo "Terminating orphan: ${id}"
+      oci compute instance terminate --instance-id "${id}" --force \
+        --region ap-hyderabad-1 --wait-for-state TERMINATED
+    done
+  fi
+  # Also roll back Mumbai
   if [ -n "${MUMBAI_INSTANCE_ID:-}" ]; then
     echo "Terminating Mumbai probe due to Hyderabad launch failure..." >&2
     oci compute instance terminate \
@@ -234,13 +322,16 @@ fi
 echo "Hyderabad probe RUNNING: ${HYDERABAD_INSTANCE_ID}"
 ```
 
-> **Note:** Instance OCIDs are captured from `oci compute instance launch
-> --query 'data.id' --raw-output` **without** `--wait-for-state RUNNING`.
-> The OCID is validated immediately, then a separate `oci compute instance get
-> --wait-for-state RUNNING` call waits for the instance.  If the waiter fails,
-> the known OCID is terminated with `--wait-for-state TERMINATED` before
-> exit — this prevents orphaned billable instances.  The `--opc-retry-token`
-> makes launch idempotent.
+> **Note:** Each launch uses `if ! ID="$(oci compute instance launch ...)"` so
+> a nonzero CLI exit triggers display-name-targeted cleanup before exiting
+> (plain assignment with `set -e` would exit before the blank-ID check).
+> Instance OCIDs are captured from the launch output **without**
+> `--wait-for-state RUNNING`.  The OCID is validated immediately, then a
+> separate `oci compute instance get --wait-for-state RUNNING` call waits.
+> If the waiter fails, the known OCID is terminated before exit — this
+> prevents orphaned billable instances.  There is no idempotency token
+> (`--opc-retry-token` is not accepted by `oci compute instance launch`;
+> ref: `oci compute instance launch --help`, 2026-07-29).
 >
 > No `benchmark-probes.env` file is written.  OCIDs must be exported as
 > environment variables and verified non-blank before proceeding.

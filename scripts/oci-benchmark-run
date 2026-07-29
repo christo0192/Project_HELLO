@@ -1009,13 +1009,35 @@ def cmd_self_test(args):
     check("runbook: --ssh-authorized-keys-file passed to launch",
           '--ssh-authorized-keys-file' in runbook)
 
-    # 11. Retry token for idempotent launch
-    check("runbook: Mumbai launch uses --opc-retry-token",
-          '--opc-retry-token' in launch_mumbai and 'RETRY_TOKEN' in launch_mumbai)
-    check("runbook: Hyderabad launch uses --opc-retry-token",
-          '--opc-retry-token' in launch_hyderabad and 'RETRY_TOKEN' in launch_hyderabad)
+    # 11. Launch uses 'if ! ID="$(...)"' so nonzero exit triggers cleanup
+    #     (plain assignment with set -e would exit before the blank-ID check)
+    check("runbook: Mumbai launch uses 'if ! ID=...' pattern",
+          'if ! MUMBAI_INSTANCE_ID="$(oci compute instance launch' in launch_mumbai)
+    check("runbook: Hyderabad launch uses 'if ! ID=...' pattern",
+          'if ! HYDERABAD_INSTANCE_ID="$(oci compute instance launch' in launch_hyderabad)
 
-    # 12. set -euo pipefail on launch blocks
+    # 12. Launch failure does display-name cleanup in that region
+    check("runbook: Mumbai launch failure does --display-name cleanup",
+          'ORPHAN_IDS' in launch_mumbai and '--display-name' in launch_mumbai)
+    check("runbook: Hyderabad launch failure does --display-name cleanup",
+          'ORPHAN_IDS' in launch_hyderabad and '--display-name' in launch_hyderabad)
+
+    # 13. No --opc-retry-token in actual usage (not supported by OCI CLI;
+    #     ref: oci compute instance launch --help, 2026-07-29).
+    #     Explanatory mentions in prose are fine.
+    check("runbook: no --opc-retry-token usage (only prose mentions)",
+          '--opc-retry-token "${RETRY_TOKEN}"' not in runbook and
+          '--opc-retry-token "$' not in runbook)
+    check("runbook: no RETRY_TOKEN anywhere",
+          'RETRY_TOKEN' not in runbook)
+
+    # 14. DISPLAY_NAME variable used so cleanup targets exact name
+    check("runbook: DISPLAY_NAME set before Mumbai launch",
+          'DISPLAY_NAME="oci-benchmark-probe-mumbai-' in launch_mumbai)
+    check("runbook: DISPLAY_NAME set before Hyderabad launch",
+          'DISPLAY_NAME="oci-benchmark-probe-hyderabad-' in launch_hyderabad)
+
+    # 15. set -euo pipefail on launch blocks
     check("runbook: Mumbai launch block has set -euo pipefail",
           'set -euo pipefail' in launch_mumbai)
     check("runbook: Hyderabad launch block has set -euo pipefail",
@@ -1095,16 +1117,14 @@ def cmd_self_test(args):
           'no `--yes` flag' in runbook or 'does not require a `--yes`' in runbook)
 
     # ── Section D: Mock-OCI shell regression (fail-closed) ──
-    # Prove: with set -euo pipefail, an oci list failure exits nonzero
-    # and never prints "clean".
-    mock_script = '''#!/usr/bin/env bash
+    # Test 1: oci list failure exits nonzero and never prints "clean"
+    # (Phase 5c verification pattern with set -euo pipefail)
+    mock_list_fail = '''#!/usr/bin/env bash
 set -euo pipefail
-# Mock oci that always fails
 oci() { echo "OCI CLI error: network timeout" >&2; return 1; }
 export -f oci
 MUMBAI_COMPARTMENT_ID="ocid1.test.oc1..fake"
-# Simulate 5c verification pattern
-MUMBAI_REMAINING="$(oci compute instance list --compartment-id "${MUMBAI_COMPARTMENT_ID}" --region ap-mumbai-1 --query 'data[].id' --raw-output)"
+MUMBAI_REMAINING="$(oci compute instance list --compartment-id "${MUMBAI_COMPARTMENT_ID}" --region ap-mumbai-1 --query 'data[].id' --raw-output 2>&1)"
 if [ -n "${MUMBAI_REMAINING}" ]; then
   echo "FATAL: found probes"
   exit 1
@@ -1113,7 +1133,7 @@ echo "Mumbai: clean"
 '''
     try:
         with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
-            f.write(mock_script)
+            f.write(mock_list_fail)
             tmp_path = f.name
         result = subprocess.run(['bash', tmp_path], capture_output=True, text=True, timeout=10)
         os.unlink(tmp_path)
@@ -1124,9 +1144,79 @@ echo "Mumbai: clean"
               'clean' not in result.stdout,
               f"printed: {result.stdout.strip()}")
     except Exception as e:
-        check("mock-oci: regression test ran", False, str(e))
+        check("mock-oci: list-fail regression ran", False, str(e))
         check("mock-oci: oci list failure exits nonzero (skipped)", True)
         check("mock-oci: oci list failure never prints 'clean' (skipped)", True)
+
+    # Test 2: Launch command failure with 'if ! ID=' invokes display-name
+    # cleanup (does NOT skip to blank-ID check due to set -e killing the script)
+    mock_launch_fail = '''#!/usr/bin/env bash
+set -euo pipefail
+DISPLAY_NAME="oci-benchmark-probe-mumbai-testonly"
+MUMBAI_COMPARTMENT_ID="ocid1.test.oc1..fake"
+# oci launch fails; oci list succeeds with no matches (clean)
+oci() {
+  case "${1:-}" in
+    compute)
+      case "${2:-}" in
+        instance)
+          case "${3:-}" in
+            launch) echo "Service error" >&2; return 1 ;;
+            list)
+              # Return no matching instances (clean)
+              echo ""
+              return 0
+              ;;
+            terminate) echo "Terminated" >&2; return 0 ;;
+          esac ;;
+      esac ;;
+  esac
+}
+export -f oci
+cleanup_called=no
+if ! MUMBAI_INSTANCE_ID="$(oci compute instance launch \
+    --compartment-id "${MUMBAI_COMPARTMENT_ID}" \
+    --display-name "${DISPLAY_NAME}" \
+    --region ap-mumbai-1 \
+    --query 'data.id' --raw-output 2>&1)"; then
+  echo "Launch failed — running display-name cleanup for ${DISPLAY_NAME}"
+  cleanup_called=yes
+  ORPHAN_IDS="$(oci compute instance list \
+    --compartment-id "${MUMBAI_COMPARTMENT_ID}" \
+    --display-name "${DISPLAY_NAME}" \
+    --region ap-mumbai-1 \
+    --all \
+    --query 'data[].id' \
+    --raw-output)"
+  if [ -n "${ORPHAN_IDS}" ]; then
+    for id in ${ORPHAN_IDS}; do
+      oci compute instance terminate --instance-id "${id}" --force --region ap-mumbai-1
+    done
+  fi
+  exit 1
+fi
+echo "UNREACHABLE: cleanup_called=${cleanup_called}"
+'''
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
+            f.write(mock_launch_fail)
+            tmp_path = f.name
+        result = subprocess.run(['bash', tmp_path], capture_output=True, text=True, timeout=10)
+        os.unlink(tmp_path)
+        check("mock-oci: launch failure invokes cleanup (if ! ID= pattern)",
+              'cleanup_called=yes' in result.stdout or 'Launch failed' in result.stdout,
+              f"stdout: {result.stdout.strip()}")
+        check("mock-oci: launch failure exits nonzero after cleanup",
+              result.returncode != 0,
+              f"exit code {result.returncode}")
+        check("mock-oci: launch failure does NOT print UNREACHABLE",
+              'UNREACHABLE' not in result.stdout,
+              f"stdout: {result.stdout.strip()}")
+    except Exception as e:
+        check("mock-oci: launch-fail regression ran", False, str(e))
+        check("mock-oci: launch failure invokes cleanup (skipped)", True)
+        check("mock-oci: launch failure exits nonzero (skipped)", True)
+        check("mock-oci: launch failure does NOT print UNREACHABLE (skipped)", True)
 
     # ── JMESPath semantics (optional) ──
     try:
