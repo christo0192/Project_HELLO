@@ -275,7 +275,7 @@ echo "Verifying no benchmark probes remain in Mumbai..."
 MUMBAI_REMAINING="$(oci compute instance list \
   --compartment-id "${MUMBAI_COMPARTMENT_ID}" \
   --region ap-mumbai-1 \
-  --query "join('\n', data[?\"lifecycle-state\"!='TERMINATED' && \"freeform-tags\".purpose == 'oci-region-benchmark'].id)" \
+  --query 'join(`"\n"`, data[?"lifecycle-state" != `"TERMINATED"` && "freeform-tags".purpose == `"oci-region-benchmark"`].id)' \
   --all --raw-output)"
 
 if [ -n "${MUMBAI_REMAINING}" ]; then
@@ -290,7 +290,7 @@ echo "Verifying no benchmark probes remain in Hyderabad..."
 HYDERABAD_REMAINING="$(oci compute instance list \
   --compartment-id "${HYDERABAD_COMPARTMENT_ID}" \
   --region ap-hyderabad-1 \
-  --query "join('\n', data[?\"lifecycle-state\"!='TERMINATED' && \"freeform-tags\".purpose == 'oci-region-benchmark'].id)" \
+  --query 'join(`"\n"`, data[?"lifecycle-state" != `"TERMINATED"` && "freeform-tags".purpose == `"oci-region-benchmark"`].id)' \
   --all --raw-output)"
 
 if [ -n "${HYDERABAD_REMAINING}" ]; then
@@ -334,7 +334,7 @@ echo "=== Emergency teardown: Mumbai ==="
 MUMBAI_IDS="$(oci compute instance list \
   --compartment-id "${MUMBAI_COMPARTMENT_ID}" \
   --region ap-mumbai-1 \
-  --query "join('\n', data[?\"freeform-tags\".purpose == 'oci-region-benchmark' && \"lifecycle-state\"!='TERMINATED'].id)" \
+  --query 'join(`"\n"`, data[?"freeform-tags".purpose == `"oci-region-benchmark"` && "lifecycle-state" != `"TERMINATED"`].id)' \
   --all --raw-output)"
 
 if [ -n "${MUMBAI_IDS}" ]; then
@@ -357,7 +357,7 @@ echo "=== Emergency teardown: Hyderabad ==="
 HYDERABAD_IDS="$(oci compute instance list \
   --compartment-id "${HYDERABAD_COMPARTMENT_ID}" \
   --region ap-hyderabad-1 \
-  --query "join('\n', data[?\"freeform-tags\".purpose == 'oci-region-benchmark' && \"lifecycle-state\"!='TERMINATED'].id)" \
+  --query 'join(`"\n"`, data[?"freeform-tags".purpose == `"oci-region-benchmark"` && "lifecycle-state" != `"TERMINATED"`].id)' \
   --all --raw-output)"
 
 if [ -n "${HYDERABAD_IDS}" ]; then
@@ -380,11 +380,11 @@ echo ""
 echo "Final verification across both regions..."
 MUMBAI_LEFT="$(oci compute instance list \
   --compartment-id "${MUMBAI_COMPARTMENT_ID}" --region ap-mumbai-1 \
-  --query "join('\n', data[?\"freeform-tags\".purpose == 'oci-region-benchmark' && \"lifecycle-state\"!='TERMINATED'].id)" \
+  --query 'join(`"\n"`, data[?"freeform-tags".purpose == `"oci-region-benchmark"` && "lifecycle-state" != `"TERMINATED"`].id)' \
   --all --raw-output)"
 HYDERABAD_LEFT="$(oci compute instance list \
   --compartment-id "${HYDERABAD_COMPARTMENT_ID}" --region ap-hyderabad-1 \
-  --query "join('\n', data[?\"freeform-tags\".purpose == 'oci-region-benchmark' && \"lifecycle-state\"!='TERMINATED'].id)" \
+  --query 'join(`"\n"`, data[?"freeform-tags".purpose == `"oci-region-benchmark"` && "lifecycle-state" != `"TERMINATED"`].id)' \
   --all --raw-output)"
 
 if [ -z "${MUMBAI_LEFT}" ] && [ -z "${HYDERABAD_LEFT}" ]; then
