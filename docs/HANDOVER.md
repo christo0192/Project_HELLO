@@ -34,9 +34,10 @@ cat docs/HANDOVER.md
 | OCI region benchmark harness | Infrastructure | Code merged; not yet measured | PR #8 (`726ce56`), merged 2026-07-29. Harness and fail-closed runbook exist; no benchmark data has been collected. |
 | Supabase local baseline | MIG-03 / partial MIG-04 | Code merged; production apply pending | PR #9 (`4d103ea`), merged 2026-07-29. Unused Mumbai project exists but MIG-01/MIG-02 admin acceptance pending; this is MIG-03/partial MIG-04. Membership-gated RLS and local validation; MIG-01/MIG-02 administrative acceptance plus controlled production connection/application and MIG-13 cutover are future gates. |
 | Synthetic demo seed foundation | GOV-06 | Code merged; production/demo acceptance pending | PR #14 (`7cbc962`), merged 2026-07-29. Deterministic local `app/supabase/seed.sql`, offline validator, 65 validator tests, 62 SQL integration assertions, runbook, and Supabase CI wiring are present. This is local synthetic-data scaffolding only; screenshots/demo artifact replacement and owner FND-03 evidence remain pending. |
-| OBS-01 / OBS-02 structured logging + correlation | OBS-01, OBS-02 | Code complete on `feat/obs-01-02-logging-correlation`; **not merged, not deployed** | Structured JSON logger (JS+Python parity), UUID v4 correlation middleware, envelope validation, redaction/defense scanning, scoring taxonomy, component defense. 419 API Vitest assertions + 56 Python unittest cases pass locally. Managed log export, dashboards, alarms, queue/provider tracing, and deployed acceptance **pending**. |
+| OBS-01 / OBS-02 structured logging + correlation | OBS-01, OBS-02 | Code merged; deployment acceptance pending | PR #15 (`de133c6`), merged 2026-07-29. Structured JSON logger (JS+Python parity), UUID v4 correlation middleware, envelope validation, redaction/defense scanning, scoring taxonomy, and component defense are present. Managed log export, dashboards, alarms, queue/provider tracing, and deployed acceptance remain pending. |
+| Accessibility test foundation | TST-07 | Partial — automation scaffold complete (101 unit tests, strict axe matcher, fail-closed network trap, keyboard focus assertions); manual AT/contrast/reflow/browser gates and candidate consent/call flow remain external/dependent | Branch `test/tst-07-accessibility`. Runbook at `docs/runbooks/accessibility-testing.md`. CI gate: `npm run test:typecheck && npm test` added to quality.yml. Not a launch gate until all manual checks and candidate consent (GOV-08/Legal) are resolved. |
 
-PR #14 was merged into `main` at `7cbc962` on 2026-07-29; its required checks passed. Aggregate `main` verification after the remaining sequential merges is still pending.
+PRs #14 and #15 were merged into `main` on 2026-07-29 with their required checks passing. Aggregate `main` verification after the remaining sequential merges is still pending.
 
 ## Phase-0 Foundation Status (FND-01, FND-02, FND-03)
 
@@ -50,7 +51,7 @@ external-blockers summary.
 | FND-02 | Scanner controls merged | **Blocked**: owner rotation evidence pending for eight provider systems; non-secret revocation evidence required |
 | FND-03 | Containment controls and GOV-06 local synthetic seed tooling merged | **Blocked**: authentic sanitization, screenshot/demo replacement, and restricted-storage disposition evidence pending |
 
-## OBS-01/OBS-02 Status (not merged — branch `feat/obs-01-02-logging-correlation`)
+## OBS-01/OBS-02 Status (code merged in PR #15; deployed acceptance pending)
 
 | Item | Status | Notes |
 |------|--------|-------|
