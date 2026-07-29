@@ -64,10 +64,12 @@ enabled = true
 schema_paths = []
 
 [db.seed]
-# Synthetic fixtures are created and removed by the policy test suite.
-enabled = false
-# No seed file is loaded automatically.
-sql_paths = []
+# GOV-06 deterministic synthetic demo seed.
+# Enabled only for local development. The seed is INSERT-only with
+# ON CONFLICT DO NOTHING and uses a reserved UUID namespace.
+enabled = true
+# Synthetic demo seed for local Supabase rehearsal.
+sql_paths = ["./seed.sql"]
 
 [db.network_restrictions]
 # Enable management of network restrictions.
