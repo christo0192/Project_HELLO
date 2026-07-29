@@ -1,9 +1,15 @@
 # Main Branch Protection
 
-This file defines the required hosted-repository settings for FND-01. It does
-not apply them automatically. The bootstrap owner is `@christo0192`; the
-Engineering Lead must add company-controlled teams when available and record the
-ruleset URL or exported evidence in the launch evidence store.
+This file defines the required hosted-repository settings for FND-01.
+
+**⚠️  NOT ENFORCED.** GitHub returned HTTP 403 when branch protection was
+applied; the current private-repository plan does not include the ruleset
+feature. The settings below are documentation only until the plan is upgraded
+or an equivalent control is selected and evidenced.
+
+The bootstrap owner is `@christo0192`; the Engineering Lead must add
+company-controlled teams when available and record the ruleset URL or exported
+evidence in the launch evidence store.
 
 ## Required settings for `main`
 
@@ -37,10 +43,14 @@ ruleset URL or exported evidence in the launch evidence store.
 
 ## First-commit gate
 
-Do not create or push the first commit until FND-02 and FND-03 are complete:
-all discovered credentials have been rotated, secret scanning is clean, and
-candidate PII/evidence has been removed or replaced with approved synthetic data.
-
 The repository owner authorized a one-time bootstrap push on 2026-07-27 after
-the commit-eligible tree passed redacted secret and PII checks. Account-side
-credential rotation and quarantined local evidence remain open production gates.
+the commit-eligible tree passed redacted secret and PII checks. Subsequent
+commits and PRs (#1–#9) passed secret-scan and quality CI on `main`.
+
+FND01 repository controls merged/hosted enforcement blocked; FND02 scanner controls merged/owner rotation evidence pending; FND03 containment controls merged/sanitization+synthetic+restricted-storage disposition pending:
+- Credential rotation status for six provider systems is **owner verification
+  pending** (see `docs/security/credential-inventory.md`).
+- Synthetic replacements for quarantined candidate artifacts have not been
+  authored; original evidence disposition is pending.
+
+These are external owner actions; they cannot close solely through additional implementation code.
