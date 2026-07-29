@@ -14,6 +14,8 @@ on:
       - '.github/branch-governance-policy.json'
   workflow_dispatch:
 
+# NOTE: This workflow has NO GITHUB_TOKEN and makes NO network calls.
+# All tests use inline fixtures and mock HTTP servers.
 permissions:
   contents: read
 

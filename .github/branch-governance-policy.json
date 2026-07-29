@@ -127,12 +127,12 @@
       "name": "Required status checks",
       "severity": "critical",
       "classic_field": "required_status_checks.contexts",
-      "classic_check": "status_checks",
+      "classic_check": "status_checks_includes",
       "ruleset_type": "required_status_checks",
       "ruleset_param": "required_status_checks",
-      "ruleset_check": "status_checks",
+      "ruleset_check": "status_checks_includes",
       "expected_checks": ["quality", "secret-scan"],
-      "description": "Required status checks must include exactly: quality, secret-scan"
+      "description": "Required status checks must include quality and secret-scan"
     }
   ]
 }

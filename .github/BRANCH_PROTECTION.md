@@ -20,8 +20,9 @@ evidence in the launch evidence store.
 - Require every review conversation to be resolved.
 - Require signed commits and linear history.
 - Block force pushes and branch deletion.
-- Apply the rules to administrators; bypass is limited to a named break-glass
-  role and every use must be audited.
+- Apply the rules to administrators. Rulesets must have zero bypass_actors.
+  Break-glass access, if required, must be managed through an audited out-of-band
+  process, not through GitHub ruleset bypass permissions.
 - Require successful status checks. Add each check only after its workflow is
   merged and has reported at least once:
   - `quality`
