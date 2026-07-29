@@ -267,6 +267,22 @@ Workstreams may run in parallel, but **Phase 12 has no shortcut**: every P0 task
 | **FND-08** | Resolve launch-blocking policy inputs: tenancy (D-011), residency/data-flow constraints, initial RPO/RTO, launch concurrency and accountable owners | P0 | Product + Legal + Security + Eng Lead | — | S | Signed decision record gives MIG/SEC/DEP teams testable requirements; unresolved mandatory residency or ownership question is a no-go | Reopen decision under change control |
 | **FND-09** | Replace stale `.gsd`/README/architecture status with one maintained current-state source, ADR links and evidence dates; clearly label current versus target providers/recording/telephony | P1 | Eng Lead + Product | FND-01 | S | A reviewer can identify deployed version, current providers, runbooks and open gates without contradictory docs; doc check runs in release process | Revert inaccurate doc change |
 
+**Phase 0 execution status (2026-07-29):**
+
+| Task | Implementation/evidence state | Strict acceptance state |
+|---|---|---|
+| FND-01 | Repository controls merged; PR #21 adds no-cost detection-only main-provenance monitoring | Hosted enforcement remains blocked on GitHub Free private repositories |
+| FND-02 | Scanner controls merged; PR #20 adds full reachable-history scanning | Eight-provider rotation/revocation evidence remains pending |
+| FND-03 | PR #23 adds deterministic replacements for all seven artifact groups | Original restricted-storage disposition and owner review remain pending |
+| FND-04 | Merged in PR #1 | Implementation complete |
+| FND-05 | Partial unapplied OCI Vault/KMS scaffold | Parked/pending by owner |
+| FND-06 | Partial unapplied OCI IAM scaffold | Parked/pending by owner |
+| FND-07 | Seven ADRs merged in PR #2 | Implementation complete; downstream decisions remain gated |
+| FND-08 | PR #22 records sole-owner internal synthetic-engineering decisions | Production Legal/Security/residency/RPO/RTO evidence remains blocked |
+| FND-09 | Current-state manifest and drift checker implemented in the FND-09 closure PR | Complete after merge and green CI |
+
+Implementation progress does not change the repository-wide **0/17 launch gates complete** or **0/14 roadmap phases accepted** status.
+
 ---
 
 ### Phase 1: Security Core (P0)

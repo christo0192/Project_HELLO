@@ -24,6 +24,8 @@ jobs:
           cache-dependency-path: |
             app/api/package-lock.json
             app/web/package-lock.json
+      - name: Validate current-state manifest
+        run: node scripts/check-current-state.mjs && node scripts/check-current-state.test.mjs
       - name: Validate environment contract
         run: node scripts/check-env-contract.mjs && node scripts/check-env-contract.test.mjs
       - name: Validate architecture decision records

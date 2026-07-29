@@ -1,0 +1,120 @@
+{
+  "manifestVersion": 1,
+  "evidenceDate": "2026-07-29",
+  "status": {
+    "production": "pre-production",
+    "dataStage": "synthetic-only",
+    "scope": "browser-only"
+  },
+  "runtime": {
+    "activeComponents": {
+      "api": {
+        "path": "app/api",
+        "purpose": "Express/TypeScript API, Supabase access, resume parsing, LiveKit room creation, transcript/session APIs, assessment generation",
+        "language": "TypeScript",
+        "productionStatus": "pre-production"
+      },
+      "web": {
+        "path": "app/web",
+        "purpose": "React/Vite recruiter dashboard and browser LiveKit client",
+        "language": "React/Vite",
+        "productionStatus": "pre-production"
+      },
+      "voice-livekit": {
+        "path": "app/voice-livekit",
+        "purpose": "LiveKit Agents Python worker with Sarvam STT/TTS, Anthropic Haiku, Silero VAD, and multilingual turn detection",
+        "language": "Python",
+        "productionStatus": "pre-production"
+      },
+      "supabase": {
+        "path": "app/supabase",
+        "purpose": "Local Supabase prototype schema (screening_v2) and ephemeral migrations",
+        "language": "PostgreSQL",
+        "productionStatus": "pre-production"
+      }
+    },
+    "staleComponents": {
+      "voice-pipecat": {
+        "path": "app/voice",
+        "purpose": "Previous Pipecat voice implementation retained during migration",
+        "retentionReason": "Local rollback/reference path during LiveKit migration; not active production fallback"
+      },
+      "retell-archived": {
+        "path": "_archive/v1-retell",
+        "purpose": "Archived Retell implementation",
+        "retentionReason": "Quarantined from Git pending security review; not active or referenced"
+      }
+    }
+  },
+  "gates": {
+    "launchGatesComplete": 0,
+    "launchGatesTotal": 17
+  },
+  "phases": {
+    "acceptedPhasesComplete": 0,
+    "acceptedPhasesTotal": 14
+  },
+  "providers": {
+    "active": [
+      {
+        "name": "LiveKit",
+        "status": "current",
+        "evidenceDate": "2026-07-29"
+      },
+      {
+        "name": "Sarvam AI",
+        "status": "current",
+        "evidenceDate": "2026-07-29"
+      },
+      {
+        "name": "Anthropic (Claude/Haiku)",
+        "status": "current",
+        "evidenceDate": "2026-07-29"
+      },
+      {
+        "name": "Supabase",
+        "status": "current",
+        "evidenceDate": "2026-07-29"
+      }
+    ],
+    "stale": [
+      {
+        "name": "Pipecat",
+        "status": "stale/reference"
+      },
+      {
+        "name": "Retell AI",
+        "status": "archived"
+      },
+      {
+        "name": "ElevenLabs",
+        "status": "stale/reference"
+      },
+      {
+        "name": "Cartesia",
+        "status": "stale/reference"
+      },
+      {
+        "name": "Deepgram",
+        "status": "stale/reference"
+      }
+    ]
+  },
+  "docsStatus": {
+    "mandatoryDocsPresent": [
+      "README.md",
+      "app/README.md",
+      "docs/HANDOVER.md",
+      "docs/repository-inventory.md",
+      "docs/current-state.md",
+      "CONTRIBUTING.md",
+      "PLAN.md"
+    ]
+  },
+  "constraints": {
+    "noProductionClaim": true,
+    "noTelephonyCurrent": true,
+    "noGateCountDrift": true,
+    "noProviderBackslide": true
+  }
+}

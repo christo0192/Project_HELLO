@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-07-29
 
-**Current branch:** `feat/rel-07-08-session-lifecycle` (merged with `main` through PR #18; PR #19 not yet merged)
+**Current baseline:** `main` through PR #19 (`0c06fc0`); the Phase 0 closure wave is under review on isolated feature branches.
 
 **Repository:** `https://github.com/christo0192/Project_HELLO`
 
@@ -10,17 +10,21 @@
 
 **Roadmap source of truth:** [`PLAN.md`](../PLAN.md)
 
-**Implementation status:** Partial — REL-07/REL-08 session lifecycle code complete on `feat/rel-07-08-session-lifecycle`. REL-09 reconciler, durable scoring, deployed signal drain, live SDK integration, and external acceptance pending; 0/17 launch gates complete.
+**Current-state manifest:** [`config/current-state.json`](../config/current-state.json)
+(automated drift checks enforce consistency)
 
-## Branch: feat/rel-07-08-session-lifecycle
+**Implementation status:** Partial — REL-07/REL-08 lifecycle and shutdown code merged in PR #19. REL-09 reconciliation, durable scoring, deployed signal drain, live SDK integration, and external acceptance remain pending; 0/17 launch gates complete and 0/14 roadmap phases are accepted.
 
-Integrated base: `e5c1051` (PR #18 provider resilience). PR #19 is not yet merged to `main`.
+## Baseline
+
+PR #19 was squash-merged to `main` as `0c06fc0` on 2026-07-29. Phase 0 closure PRs are implementation/evidence work only and do not alter production acceptance without authentic external evidence.
 
 ## Resume Here
 
 ```bash
 git fetch origin
-git checkout feat/rel-07-08-session-lifecycle
+git switch main
+git pull --ff-only origin main
 git log --oneline --decorate -10
 cat docs/HANDOVER.md
 ```
@@ -31,8 +35,8 @@ cat docs/HANDOVER.md
 |--------|-------|
 | Completed launch gates | 0/17 — all FND-02, FND-03, and REL acceptance criteria remain unverified at production level |
 | Implementation coverage | REL-07/REL-08 code and aggregate tests exist on branch; strict acceptance is separate from implementation coverage |
-| Integrated base | `e5c1051` (PR #18) |
-| Branch state | In progress; not merged |
+| Integrated baseline | `0c06fc0` (PR #19) |
+| Main state | PRs #1–#19 merged; Phase 0 closure wave pending review |
 
 > **Note:** The 25% completion figure sometimes seen in earlier summaries is NOT claimed. Zero launch gates are confirmed complete. Implementation coverage and acceptance verification are distinct gates.
 
@@ -55,22 +59,29 @@ cat docs/HANDOVER.md
 | OBS-01 / OBS-02 structured logging + correlation | OBS-01, OBS-02 | Code merged; deployment acceptance pending | PR #15 (`de133c6`), merged 2026-07-29. Structured logging and UUID v4 correlation are present; managed export, dashboards, alarms, and deployed proof remain pending. |
 | Accessibility test foundation | TST-07 | Automation scaffold merged; manual/dependent acceptance pending | PR #16 (`db20b4a`), merged 2026-07-29. Automated axe/network/keyboard checks are present; manual AT/browser and candidate-flow gates remain pending. |
 | Provider resilience foundation | REL-05, REL-06 | Code merged; deployed drills pending | PR #18 (`e5c1051`), merged 2026-07-29. Circuit breakers, hardened Claude runner, explicit scoring HTTP timeouts/lazy transport, typed outcomes, and correlation propagation are present. |
-| Session lifecycle | REL-07 | Code complete on `feat/rel-07-08-session-lifecycle`; **not merged, not deployed** | Required terminal reasons, stable error codes, compare-and-set transitions, fail-closed worker activation, write draining, and migration `0006` are implemented. |
-| Graceful shutdown | REL-08 | Code complete on `feat/rel-07-08-session-lifecycle`; **not merged, not deployed** | Shutdown tests cover in-flight races, synchronous close failures, socket cleanup, duplicate signals, and forced drain timeout. |
+| Session lifecycle | REL-07 | Code merged in PR #19; **not deployed** | Required terminal reasons, stable error codes, compare-and-set transitions, fail-closed worker activation, write draining, and migration `0006` are implemented. |
+| Graceful shutdown | REL-08 | Code merged in PR #19; **not deployed** | Shutdown tests cover in-flight races, synchronous close failures, socket cleanup, duplicate signals, and forced drain timeout. |
 
-PRs #14–#18 were merged into `main` on 2026-07-29 with required checks passing. Aggregate `main` verification after PR #19 remains pending.
+PRs #14–#19 were merged into `main` on 2026-07-29 with required checks passing. Aggregate post-PR19 local verification passed; production/deployed acceptance remains pending.
 
-## Phase-0 Foundation Status (FND-01, FND-02, FND-03)
+## Phase-0 Foundation Status (FND-01 through FND-09)
 
-These tasks were defined as first-commit gates; after the documented bootstrap exception, they remain production-acceptance blockers. Assessed in `docs/repository-inventory.md`
-and `docs/security/credential-inventory.md`. See also `CONTRIBUTING.md` for the
-external-blockers summary.
+The five-PR closure wave is deliberately path-isolated: #20 FND-02, #21 FND-01,
+#22 FND-08, #23 FND-03, followed by the FND-09 current-state PR. These are open
+implementation PRs until the owner squash-merges them; they do not themselves
+satisfy external or production acceptance.
 
-| Task | Code / merge state | Acceptance state |
+| Task | Implementation state | Acceptance state |
 |---|---|---|
-| FND-01 | Repository controls merged | **Blocked**: hosted enforcement blocked — private-plan GitHub API returned 403 |
-| FND-02 | Scanner controls merged | **Blocked**: owner rotation evidence pending for eight provider systems; non-secret revocation evidence required |
-| FND-03 | Containment controls and GOV-06 local synthetic seed tooling merged | **Blocked**: authentic sanitization, screenshot/demo replacement, and restricted-storage disposition evidence pending |
+| FND-01 | Repository controls merged; PR #21 adds free detection-only provenance monitoring | **Blocked**: private GitHub Free API still returns 403 for enforceable protection; direct-push rejection cannot be proven |
+| FND-02 | Scanner controls merged; PR #20 adds full reachable-history scanning | **Blocked**: owner rotation/revocation evidence pending for eight provider systems |
+| FND-03 | Containment and GOV-06 seed merged; PR #23 adds seven ground-up synthetic demo replacements | **Blocked**: original restricted-storage disposition and owner manual-review evidence pending |
+| FND-04 | Environment contract merged in PR #1 | Implementation complete; production environment evidence remains later-phase work |
+| FND-05 | Partial unapplied OCI Vault/KMS scaffold exists | **Parked/pending** by owner; no approved secret manager/runtime injection |
+| FND-06 | Partial unapplied OCI IAM scaffold exists | **Parked/pending** by owner; no deployed least-privilege service identities |
+| FND-07 | Seven ADRs merged in PR #2 | Implementation complete; individual production decisions retain their own gates |
+| FND-08 | PR #22 records sole-owner internal-engineering decisions for D-001–D-011 | Internal synthetic engineering only; production Legal/Security/residency/RPO/RTO evidence remains blocked |
+| FND-09 | Current-state manifest and deterministic drift gate implemented in this PR | Complete only after this PR is merged and its CI is green |
 
 ## OBS-01/OBS-02 Status (code merged in PR #15; deployed acceptance pending)
 
@@ -97,6 +108,12 @@ cd ../..
 node scripts/check-env-contract.mjs
 node scripts/check-env-contract.test.mjs
 node scripts/check-adrs.mjs
+node scripts/check-current-state.mjs
+node scripts/check-current-state.test.mjs
+node scripts/check-main-provenance.test.mjs
+bash scripts/scan-git-history.test.sh
+node scripts/check-demo-artifacts.mjs
+node scripts/check-demo-artifacts.test.mjs
 node scripts/check-synthetic-seed.mjs app/supabase/seed.sql
 node scripts/check-synthetic-seed.test.mjs
 bash scripts/supabase-test.sh
@@ -119,6 +136,7 @@ git diff --check
 | LiveKit worker (Python) | **289 tests** | Combined lifecycle, resilience, observability, provenance, correlation, and persistence coverage using `unittest` and fake transports. |
 | Web | **101 tests** | Accessibility scaffold plus typecheck, lint, and production build. |
 | Supabase | **69 policy/provenance/lifecycle + 62 synthetic SQL assertions** | Local ephemeral stack only; includes anonymous denial, legal transition fixtures, and idempotent seed replay. |
+| Phase 0 closure | **82 provenance + 102 governance + 5 history + 75 evidence + 40 demo + 16 current-state tests** | Distributed across PRs #20–#23 and this FND-09 PR; each suite is deterministic and offline except the scanner binary/container itself. |
 
 ## Remaining Production Work
 
@@ -126,11 +144,13 @@ Most remaining P0 tasks in `PLAN.md` Phases 1–12 remain open. The most urgent 
 
 1. **FND-02 credential rotation**: An authorized account owner must rotate every provider credential listed in `docs/security/credential-inventory.md` and provide non-secret revocation evidence. Deleting local `.env` files does not count.
 2. **FND-01 branch protection**: Requires a GitHub plan upgrade or equivalent control approved by the repository owner. Documented rules are not enforced.
-3. **FND-03 disposition**: Quarantined candidate artifacts require synthetic replacement and disposition of originals into approved restricted storage with evidence.
-4. **FND-08 policy inputs**: Technical directions selected but owners, approvals, residency, RPO/RTO, and open decisions pending.
+3. **FND-03 disposition**: Ground-up replacements are in PR #23; originals still require restricted-storage disposition and owner evidence.
+4. **FND-05/FND-06**: Secret management and service identities are explicitly parked; production engineering depending on them remains blocked.
+5. **FND-08 production inputs**: Sole-owner internal directions are in PR #22, but independent Legal/Security, residency, production RPO/RTO, retention, and vendor evidence remain unresolved.
 
-Engineering work on authentication, tenancy, and authorization (SEC-01 through SEC-04)
-must not start until D-001 and D-011 have approved owners and outcomes.
+D-001 and D-011 are approved only for internal synthetic engineering. Production
+authentication, tenancy, and authorization acceptance retains the named security,
+privacy, migration, and deployment gates in `PLAN.md`.
 
 Highest-risk unaddressed gaps:
 - No recruiter authentication, MFA, RBAC, tenant isolation, or candidate invite exchange (SEC-01–SEC-04)
