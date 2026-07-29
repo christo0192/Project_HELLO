@@ -1,11 +1,15 @@
 import { createApp } from './app.js';
 import { env } from './lib/env.js';
+import { createLogger } from './lib/logger.js';
 
+const startupLogger = createLogger('startup');
 const app = createApp();
 
 app.listen(env.port, () => {
-  console.log(`\n  HR screening bot API → http://localhost:${env.port}`);
-  console.log(`  Brain: claude -p --model ${env.claudeModel}`);
-  console.log(`  Supabase schema: ${env.supabaseSchema}`);
-  console.log(`  CORS origin: ${env.webOrigin}\n`);
+  // Log safe identifiers only — no origins, URLs, or credentials.
+  startupLogger.info('startup_listen', {
+    port: env.port,
+    model: env.claudeModel,
+    schema: env.supabaseSchema,
+  });
 });

@@ -4,6 +4,10 @@
 
 ---
 
+> **Implementation status (2026-07-29):** Branch `feat/obs-01-02-logging-correlation` implements OBS-01/OBS-02 structured logging and correlation scaffolding across API and voice workers with local tests. This does **not** close deployed observability acceptance: managed log export, dashboards, alarms, SLOs, production correlation proof, and launch gates remain pending.
+
+---
+
 ## 1. Document Control
 
 | Field | Value |
