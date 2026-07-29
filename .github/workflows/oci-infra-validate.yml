@@ -119,15 +119,15 @@ jobs:
             exit 1
           fi
           # Also verify each rule contains the workload-role tag check
-          if ! echo "$API_RULE" | grep -q 'workload-role'; then
-            echo "FAIL: api_tier dynamic group must match on workload-role tag."
+          if ! echo "$API_RULE" | grep -q 'workload_role'; then
+            echo "FAIL: api_tier dynamic group must match on workload_role tag."
             exit 1
           fi
-          if ! echo "$WORKER_RULE" | grep -q 'workload-role'; then
-            echo "FAIL: worker_tier dynamic group must match on workload-role tag."
+          if ! echo "$WORKER_RULE" | grep -q 'workload_role'; then
+            echo "FAIL: worker_tier dynamic group must match on workload_role tag."
             exit 1
           fi
-          echo "Dynamic groups have distinct workload-role tag matching rules."
+          echo "Dynamic groups have distinct workload_role tag matching rules."
 
       - name: Ban alerts@example.com in code (not doc references)
         run: |
