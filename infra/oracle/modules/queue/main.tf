@@ -1,7 +1,7 @@
-# OCI Queue resource: primary queue with service-managed dead-letter
-# OCI Queue uses an internal dead-letter sub-queue — no separate queue resource exists.
-# dead_letter_queue_delivery_count controls how many delivery attempts occur before
-# messages are moved to the service-managed DLQ sub-queue.
+# OCI Queue resource: primary queue with service-managed dead-letter sub-queue.
+# channel_consumption_limit: OCI default (unlimited) is 100, not 0.
+# visibility_in_seconds: message invisibility after consume before retry.
+# timeout_in_seconds: long-poll timeout for consume requests (distinct from visibility).
 # Producer/consumer IAM is handled by the foundation module's dynamic groups.
 
 resource "oci_queue_queue" "primary" {
@@ -10,11 +10,11 @@ resource "oci_queue_queue" "primary" {
 
   retention_in_seconds      = var.message_retention_seconds
   visibility_in_seconds     = var.visibility_timeout_seconds
-  timeout_in_seconds        = var.visibility_timeout_seconds
-  channel_consumption_limit = 0 # unlimited
+  timeout_in_seconds        = var.polling_timeout_seconds
+  channel_consumption_limit = 100 # OCI default/unlimited
 
   # Internal dead-letter: after N delivery attempts, messages move to the
-  # service-managed dead-letter sub-queue (not a separately-provisioned queue).
+  # service-managed dead-letter sub-queue.
   dead_letter_queue_delivery_count = var.dead_letter_delivery_count
 
   freeform_tags = {

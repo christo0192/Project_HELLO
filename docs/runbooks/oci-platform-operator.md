@@ -1,6 +1,6 @@
 # OCI Platform Operator Runbook
 
-**Last updated:** 2026-07-28
+**Last updated:** 2026-07-28 (r3: self-contained roots, IAM tags, logging, remote state)
 **Scope:** OCI managed-services foundation (staging + production)
 **Terraform root:** `infra/oracle/examples/{staging,production}`
 
@@ -12,9 +12,8 @@
 requires explicit manual approval, change-control authorization, and the
 production operator role.
 
-Apply is **impossible** in CI pull-request jobs. The `oci-infra-validate.yml`
-workflow has no credentials. The `oci-infra-plan.yml` workflow is
-`workflow_dispatch`-only and stops at plan output.
+**Production apply is BLOCKED** until encrypted remote state (OCI Object Storage
++ SSE) is configured. See State Isolation below.
 
 ---
 
@@ -22,199 +21,92 @@ workflow has no credentials. The `oci-infra-plan.yml` workflow is
 
 1. OCI CLI configured with user credentials (API key pair).
 2. Terraform ≥ 1.5 installed.
-3. GitHub repository cloned with `feat/oci-managed-services-foundation` branch.
+3. GitHub repository cloned.
 4. `terraform.tfvars` populated (copy from `.example`, never commit):
    ```bash
    cd infra/oracle/examples/staging   # or production
    cp terraform.tfvars.example terraform.tfvars
-   # Edit terraform.tfvars with real tenancy OCID and region
+   # Edit terraform.tfvars with real tenancy OCID, region, alert_email
    ```
 
-### Port 80 / Certificate Validation
+### Compute Instance Tagging (REQUIRED)
 
-Port 80 is gated behind `enable_http_ingress` (default `false`). To provision
-TLS certificates via ACME HTTP-01 challenge:
+Every compute instance MUST carry a workload-role defined tag or IAM will grant
+no queue/vault/metrics rights (fail-closed):
 
 ```hcl
-# In your terraform.tfvars, temporarily enable:
-enable_http_ingress = true
+# For API/web instances:
+defined_tags = {
+  "hr-screening-staging-tags.workload-role" = "api"
+}
+
+# For worker/queue-consumer instances:
+defined_tags = {
+  "hr-screening-staging-tags.workload-role" = "worker"
+}
 ```
 
-After certificate provisioning, set `enable_http_ingress = false` and re-apply.
-Never leave port 80 open permanently.
-
----
-
-## Planning a Change
-
-### Local plan (staging)
-
-```bash
-cd infra/oracle/examples/staging
-terraform init
-terraform plan -out=tfplan
-```
-
-### Local plan (production)
-
-```bash
-cd infra/oracle/examples/production
-terraform init
-terraform plan -out=tfplan
-```
-
-### CI plan (manual dispatch)
-
-Go to **Actions → OCI Infra Plan → Run workflow**, select environment, enter
-region, and submit. Download artifacts for review.
-
----
-
-## Applying a Change
-
-**⚠️ Apply requires:**
-1. Plan reviewed and approved by a second operator.
-2. Change-control ticket approved.
-3. Production apply: explicit go-ahead from Engineering Lead.
-4. Window with no active candidate screening sessions.
-
-### Apply (staging)
-
-```bash
-cd infra/oracle/examples/staging
-terraform apply tfplan
-```
-
-### Apply (production)
-
-```bash
-cd infra/oracle/examples/production
-terraform apply tfplan
-```
-
-After apply, capture the output and verify:
-```bash
-terraform output
-terraform state list
-```
-
----
-
-## Verification Commands
-
-### Format check
-```bash
-terraform fmt -check -recursive -diff
-```
-
-### Validate (no credentials needed)
-```bash
-cd infra/oracle/examples/staging
-terraform init -backend=false
-terraform validate
-```
-
-### Validate all modules
-```bash
-for mod in infra/oracle/modules/{foundation,queue,observability}; do
-  echo "=== $mod ==="
-  terraform -chdir="$mod" init -backend=false
-  terraform -chdir="$mod" validate
-done
-```
-
-### Secret/diff check before commit
-```bash
-# From repository root
-! grep -rn --include='*.tf' -E 'ocid1\.(tenancy|compartment|vault|secret)\.[a-z0-9]+' infra/oracle/ | grep -v '__CHANGE_ME__' | grep -v 'placeholder'
-git diff --check
-git diff --stat origin/main...HEAD
-```
+Dynamic group matching rules are documented in `modules/foundation/iam.tf`.
+Untagged instances have zero rights.
 
 ---
 
 ## State Isolation
 
-Each environment has its own state file and `terraform.tfvars`. The
-production and staging example roots are **independent** — they import
-shared modules but manage separate state.
+### Staging
+Local state is acceptable. Init uses `backend "local"` with no special config.
 
-### Remote state (when configured)
+### Production (BLOCKED)
+Production apply is blocked by a throw-if backend guard. To unblock:
 
-Uncomment the `backend "s3"` block in `infra/oracle/terraform.tf` and
-replace placeholders with real OCI Object Storage bucket details. Use
-separate state keys per environment:
-```
-key = "oci-platform/staging/terraform.tfstate"
-key = "oci-platform/production/terraform.tfstate"
-```
+1. Create an OCI Object Storage bucket with SSE enabled.
+2. Replace the local backend in `examples/production/main.tf` with:
+   ```hcl
+   backend "s3" {
+     bucket                      = "<prod-state-bucket>"
+     key                         = "oci-platform/production/terraform.tfstate"
+     region                      = "<region>"
+     endpoint                    = "https://<ns>.compat.objectstorage.<region>.oraclecloud.com"
+     skip_region_validation      = true
+     skip_credentials_validation = true
+     skip_metadata_api_check     = true
+     force_path_style            = true
+     encrypt                     = true
+   }
+   ```
+3. Run `terraform init` against the remote backend.
+4. Never use local state for production — it can contain APM data keys.
 
 ---
 
-## Rollback Procedure
+## Log Source Onboarding (PENDING)
 
-### Terraform-managed rollback
+Application and audit logs are NOT provisioned by Terraform yet.
+A log group exists (`<project>-<env>-logs`). When compute instances with the
+OCI Logging agent are deployed:
 
-1. Identify the last known-good state:
-   ```bash
-   terraform state list
-   ```
-2. If the change is simple (tag, alarm), revert the Terraform change and apply.
-3. If infrastructure resources were created, use targeted destroy:
-   ```bash
-   terraform destroy -target=<resource_address>
-   ```
-4. Validate with `terraform plan` that drift is zero.
-
-### Emergency rollback
-
-1. **Do not manually delete resources in the OCI Console** — this causes state drift.
-2. If Terraform state is corrupted, restore from backend version history (S3/Object
-   Storage versioning must be enabled on the state bucket).
-3. Contact the OCI administrator if resources need manual intervention.
-
----
-
-## Destroy Limitations
-
-**This Terraform defines network, IAM, and observability infrastructure.**
-Destroying compartments or VCNs will delete all dependent resources including
-compute instances, logs, and alarms.
-
-### Before destroying any environment
-
-1. Ensure no compute instances are running in the target compartment.
-2. Ensure no candidate sessions are active.
-3. Export audit logs and metrics for retention.
-4. Take a manual backup of the Terraform state.
-
-### Destroy (staging only — never production without change control)
-
-```bash
-cd infra/oracle/examples/staging
-terraform plan -destroy -out=destroy-plan
-# Review destroy plan carefully
-terraform apply destroy-plan
-```
-
-**Production destroy requires:** Engineering Lead + Security approval, change
-control, and a verified rollback window.
+1. Add a `CUSTOM` `oci_logging_log` resource per service in the observability
+   module with `source_type = "OCISERVICE"` and the agent's resource OCID.
+2. Configure PII/secret redaction at the application logging library level
+   (structured JSON logging with sensitive-field stripping) and/or the OCI
+   Logging agent configuration (`/etc/oci-logging/agent.conf`).
+3. OCI Audit logs are automatic at the tenancy level — no Terraform action needed.
 
 ---
 
 ## Alarm Reference
 
-| Alarm | Metric | Condition | Severity | Action |
-|-------|--------|-----------|----------|--------|
-| Queue depth | `MessagesInQueueCount` | Visible messages > 100 | CRITICAL | Check consumers, scale workers |
-| Consumer lag | `ConsumerLag` | Lag > 5 minutes | WARNING | Check consumer processing latency |
-| Monitoring ingestion rate | `IngestionDatapoints` | > 1000 dp/min | WARNING | Check for metric storm |
-| Log ingestion rate | `LogIngestionBytes` | > 1 MB/min | WARNING | Check for log flood, PII leak |
-| Budget > threshold % | `oci_budget_alert_rule` | Actual spend > threshold % | WARNING | Review spend, check for unused resources |
+| Alarm | Namespace | Metric | Condition | Severity | Action |
+|-------|-----------|--------|-----------|----------|--------|
+| Queue depth | `oci_queue` | `MessagesInQueueCount` (isVisible="true") | > 100 visible | CRITICAL | Check consumers, scale workers |
+| Consumer lag | `oci_queue` | `ConsumerLag` | > 5 min | WARNING | Check consumer processing latency |
+| Log ingestion | `oci_logging` | `BytesIngested` | > 1 MB/min | WARNING | Check for log floods |
+| Budget | `oci_budget_alert_rule` | actual spend | > threshold % | WARNING | Review spend |
 
 **DLQ note:** OCI Queue uses a service-managed internal dead-letter sub-queue.
 Dead-lettered messages are NOT surfaced as separate Monitoring metrics.
-Operators must inspect the DLQ via OCI Console → Queue → Dead Letter Queue tab or use the Queue API.
+Operators must inspect the DLQ via OCI Console → Queue → Dead Letter Queue tab
+or use the Queue API.
 
 **REL-04 status:** Internal DLQ is configured (`dead_letter_queue_delivery_count`).
 Automated DLQ detection/alert is PENDING a queue consumer or custom-metric integration.
@@ -222,10 +114,7 @@ Automated DLQ detection/alert is PENDING a queue consumer or custom-metric integ
 ### Dead-Letter Queue Inspection
 
 ```bash
-# List queues to find the primary queue OCID
 oci queue queue list --compartment-id "${COMPARTMENT_ID}"
-
-# View dead-letter messages via Queue API
 # GET https://{queue-messages-endpoint}/deadLetterQueue/messages
 ```
 
@@ -235,5 +124,5 @@ oci queue queue list --compartment-id "${COMPARTMENT_ID}"
 
 - **Infrastructure owner:** [Engineering Lead — TBD]
 - **OCI tenancy admin:** [TBD]
-- **On-call rotation:** [TBD — PagerDuty/Opsgenie]
+- **On-call rotation:** [TBD]
 - **Emergency procedure:** See incident response runbook (OBS-09, pending)

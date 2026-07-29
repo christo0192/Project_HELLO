@@ -1,83 +1,82 @@
 # OCI Terraform Module Audit
 
 **Date:** 2026-07-28
-**Updated:** 2026-07-28 (repair r2: real OCI metrics, remove budget alarm, REL-04 honest, email required)
+**Updated:** 2026-07-28 (repair r3: self-contained roots, IAM, metrics, logging, state, CI assertions)
 **Plan references:** FND-05/06, REL-01/04, OBS-01..06, DEP-02..07
 
 ## PLAN cross-reference
 
-| Plan ID | Requirement | Terraform mapping |
-|---------|-------------|-------------------|
-| FND-05 | Secret manager/KMS | `modules/foundation/vault.tf` — OCI Vault + key references |
-| FND-06 | Least-privilege service accounts | `modules/foundation/iam.tf` — dynamic groups + policies |
-| REL-01 | Durable job queue | `modules/queue/` — OCI Queue with `MessagesInQueueCount` + `ConsumerLag` alarms |
-| REL-04 | Retry/DLQ | PARTIAL — `dead_letter_queue_delivery_count` configures service-managed internal DLQ; automated DLQ detection/alert remains PENDING a queue consumer or custom-metric integration (the internal DLQ sub-queue has no separate Monitoring metric) |
-| OBS-01..02 | Structured logging + correlation | `modules/observability/logging.tf` — OCI Logging |
-| OBS-03..04 | Metrics + distributed tracing | `modules/observability/monitoring.tf` + `apm.tf` |
-| OBS-05..06 | SLI/SLO + alerting | `modules/observability/alarms.tf` + notifications |
-| DEP-02 | Provisioned capacity with headroom | example roots parameterize compute shapes/scale |
-| DEP-03 | HA decision | subnet/VCN design supports multi-AD; single-AD default |
-| DEP-04..05 | IaC + environment parity | staging/production example roots, shared modules |
-| DEP-06 | Canary/blue-green | CI runbook documents plan-only default + manual approval |
-| DEP-07 | Artifact provenance | Not in Terraform scope; documented in CI runbook |
+| Plan ID | Requirement | Status | Terraform mapping |
+|---------|-------------|--------|-------------------|
+| FND-05 | Secret manager/KMS | OK | `modules/foundation/vault.tf` — OCI Vault + key references |
+| FND-06 | Least-privilege service accounts | OK | `modules/foundation/iam.tf` — distinct workload-role defined-tag dynamic groups with official queue-push/queue-pull verbs |
+| REL-01 | Durable job queue | OK | `modules/queue/` — OCI Queue with MessagesInQueueCount + ConsumerLag alarms |
+| REL-04 | Retry/DLQ | PARTIAL | Internal DLQ configured via `dead_letter_queue_delivery_count`; automated DLQ detection/alert is PENDING a queue consumer or custom-metric integration |
+| OBS-01..02 | Structured logging + correlation | PARTIAL | Log group provisioned; app logs and correlation IDs require agent-managed CUSTOM logs from deployed compute instances — NOT provisioned yet |
+| OBS-03..04 | Metrics + distributed tracing | PARTIAL | APM domain + BytesIngested rate alarm provisioned; application metrics require app-side instrumentation — NOT provisoned yet |
+| OBS-05..06 | SLI/SLO + alerting | PARTIAL | Queue alarms + log ingestion alarm active; SLI/SLO definitions are pending app metrics |
+| DEP-02 | Provisioned capacity with headroom | PENDING | Compute shapes are parameterized in example roots but no compute instances exist |
+| DEP-03 | HA decision | PENDING | Subnet/VCN design supports multi-AD; single-AD default has no HA |
+| DEP-04..05 | IaC + environment parity | OK | Staging/production example roots, shared modules, distinct tag namespaces |
+| DEP-06 | Canary/blue-green | PENDING | CI runbook documents plan-only default; no deployment pipeline exists |
+| DEP-07 | Artifact provenance | PENDING | Not in Terraform scope; CI path is defined but no build pipeline exists |
 
 ## OCI Terraform provider resource verification
 
-All resources below are from `hashicorp/oci` provider ≥ 5.x and are stable.
-
 ### Foundation — Confirmed
-- `oci_identity_compartment` — compartment hierarchy
-- `oci_core_vcn`, `oci_core_subnet`, `oci_core_internet_gateway`, `oci_core_nat_gateway`
-- `oci_core_route_table`, `oci_core_route_table_attachment`
-- `oci_core_security_list`, `oci_core_network_security_group`, `oci_core_network_security_group_security_rule`
-- `oci_identity_dynamic_group`, `oci_identity_policy`
+- `oci_identity_compartment`, `oci_identity_dynamic_group`, `oci_identity_policy`
+- `oci_identity_tag_namespace`, `oci_identity_tag` — unique per environment
+- `oci_core_vcn` (dns_label explicit, validated), `oci_core_subnet`, `oci_core_internet_gateway`, `oci_core_nat_gateway`
+- `oci_core_route_table`, `oci_core_security_list`
 - `oci_kms_vault`, `oci_kms_key`
 - `oci_budget_budget`, `oci_budget_alert_rule`
-- `oci_identity_tag_namespace`, `oci_identity_tag`
+
+### IAM key decisions
+- Dynamic groups use fail-closed workload-role defined-tag matching (not compartment-only)
+- Every compute instance MUST carry workload-role = "api" or "worker"
+- Untagged instances match NEITHER group → no rights
+- Official OCI Queue verbs: `use queue-push` (publishers), `use queue-pull` (consumers)
+- Metrics: `use metrics` without invented conditions
+- Tag namespace is `${project_name}-${environment}-tags` → unique per environment
 
 ### Queue — Confirmed
-- `oci_queue_queue` — OCI Queue service (GA)
-- Metrics use authoritative namespace `oci_queue`, dimensions `resourceId` (queue OCID) and `isVisible`:
-  - `MessagesInQueueCount` with `isVisible = 'true'` for queue-depth alarm
-  - `ConsumerLag` (minutes) for consumer-lag alarm
-- Dead-letter is the OCI service-managed internal sub-queue, controlled by `dead_letter_queue_delivery_count` on the primary queue
-- No separate DLQ queue resource is provisioned (the OCI provider does not expose a `dead_letter_queue_id` attribute to cross-reference queues)
-- DLQ inspection requires OCI Console or Queue API — the internal DLQ sub-queue has no separate Monitoring metric
-- REL-04 is PARTIALLY addressed: internal DLQ is configured, but automated DLQ detection/alert is PENDING a queue consumer or custom-metric integration
-- OCI Queue is NOT an Always Free service. A first-1M-requests/month no-charge tier was documented as of 2026-07-28 but is not an Always Free guarantee. Pricing: https://www.oracle.com/cloud/queue/pricing/
-- No per-request cost alarm is provisioned — the compartment `oci_budget_alert_rule` is the authoritative cost guardrail
+- `oci_queue_queue` — `channel_consumption_limit = 100` (OCI default/unlimited)
+- `timeout_in_seconds` = long-poll timeout (separate from visibility_in_seconds)
+- Alarms: `MessagesInQueueCount` (isVisible="true"), `ConsumerLag` (minutes)
+- MQL dimensions use escaped double-quoted values per OCI syntax
+- Dead-letter: service-managed internal sub-queue, no separate Monitoring metric
+- `notification_topic_id` required (no default)
 
 ### Observability — Confirmed
-- `oci_logging_log_group`, `oci_logging_log`
-- `oci_monitoring_alarm`
-- `oci_apm_apm_domain`
-- `oci_ons_notification_topic`, `oci_ons_subscription`
-- Service Connector Hub not implemented — OCI Logging captures service logs natively
+- `oci_logging_log_group` — log group only; app/service CUSTOM logs are agent-managed, not provisioned
+- `oci_monitoring_alarm` — `BytesIngested` (oci_logging namespace, not LogIngestionBytes)
+- `oci_apm_apm_domain`, `oci_ons_notification_topic`, `oci_ons_subscription`
+- OCI Audit is automatic at tenancy level — no Terraform resource needed
+- PII/secret redaction is application/agent responsibility — no Terraform redaction patterns
 
-### Unsupported or avoided
-- No `oci_secrets_secret` resource creation (credentials must not be committed)
-- No `oci_containerengine_cluster` (OKE) — out of scope for this PR
-- No `oci_core_instance` / compute provisioning — infrastructure foundation only
-- No Service Connector Hub — log groups capture directly
-- No direct credential values — Vault references are placeholder ARNs only
-- No separate DLQ queue resource — OCI uses service-managed internal DLQ sub-queue
-- No duplicate compartment budgets or budget alarms — foundation `oci_budget_alert_rule` is the only cost alarm
-- Port 80 ingress is gated behind `enable_http_ingress` (default false)
-- APM trace sampling is agent/collector-level configuration, not a domain attribute
-- All alert email variables are required (no `alerts@example.com` default)
+### Removed (unsupported or dead code)
+- `IngestionDatapoints` alarm — not a documented oci_metrics metric
+- `LogIngestionBytes` → replaced with `BytesIngested`
+- Fake OCISERVICE application/audit logs with non-OCID resource values
+- `log_redaction_patterns` variable — no source to attach redaction to
+- METRIC_PUSH condition → use `use metrics` without conditions
+- `alerts@example.com` defaults — all email variables are required
+- Parent-level `terraform.tf` / `variables.tf` — roots are self-contained
 
-## App boundary validation
+## Example roots — pinned provider, lockfiles
 
-Current app components and their OCI infrastructure needs:
+Both staging and production example roots are self-contained:
+- `required_providers` pinned to `hashicorp/oci` `~> 6.0`
+- `provider "oci"` block with `region = var.region`
+- Committed `.terraform.lock.hcl` files for reproducible init
+- Production root blocks apply until remote encrypted state is configured
 
-| App component | Path | OCI dependency |
-|---------------|------|----------------|
-| API server | `app/api/` | Compute subnet, Vault secret refs, queue publish IAM |
-| Web dashboard | `app/web/` | CDN/object storage (out of scope) |
-| Voice agent | `app/voice-livekit/` | Compute subnet, STT/TTS/LLM API egress, queue publish IAM |
-| Scoring worker | queue consumer | Compute subnet, queue consume IAM, Vault secret refs |
+## State isolation
 
-All boundaries respected. No app code modified.
+- Staging: local state acceptable (non-production data)
+- Production: apply BLOCKED until remote encrypted state (S3 + SSE) is configured
+- Each environment has its own `terraform.tfvars` (gitignored)
+- `.terraform.lock.hcl` is committed; `.terraform/` provider caches are NOT
 
 ## Region parameterization
 

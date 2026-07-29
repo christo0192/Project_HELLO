@@ -5,7 +5,7 @@ resource "oci_core_vcn" "this" {
   compartment_id = oci_identity_compartment.this.id
   cidr_blocks    = [var.vcn_cidr]
   display_name   = "${var.project_name}-${var.environment}-vcn"
-  dns_label      = "${var.project_name}${var.environment}"
+  dns_label      = var.vcn_dns_label
 
   freeform_tags = {
     environment = var.environment

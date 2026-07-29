@@ -60,3 +60,9 @@ variable "enable_http_ingress" {
   type        = bool
   default     = false
 }
+
+variable "vcn_dns_label" {
+  description = "VCN DNS label (max 15 chars, alphanumeric, must start with letter)"
+  type        = string
+  default     = "hrplatform"
+}

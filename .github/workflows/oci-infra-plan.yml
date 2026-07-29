@@ -3,6 +3,11 @@ name: OCI Infra Plan (Manual)
 # Plan-only workflow. Requires OCI credentials (stored as GitHub secrets).
 # Apply is EXPLICITLY impossible in this workflow.
 # Only runs on manual workflow_dispatch — never automatic.
+#
+# DISABLED status: this workflow is defined but will fail until OCI auth secrets
+# and a valid alert_email are configured. Unblock by setting GitHub environment
+# secrets: OCI_TENANCY_OCID, OCI_USER_OCID, OCI_FINGERPRINT, OCI_PRIVATE_KEY,
+# OCI_REGION, and providing a real alert_email at dispatch time.
 
 on:
   workflow_dispatch:
@@ -19,6 +24,11 @@ on:
         required: true
         type: string
         default: 'placeholder-region'
+      alert_email:
+        description: 'Alert notification email (required — replaces __CHANGE_ME__)'
+        required: true
+        type: string
+        default: '__CHANGE_ME__'
 
 jobs:
   terraform-plan:
@@ -39,6 +49,7 @@ jobs:
         env:
           TF_VAR_region: ${{ inputs.region }}
           TF_VAR_tenancy_ocid: ${{ secrets.OCI_TENANCY_OCID }}
+          TF_VAR_alert_email: ${{ inputs.alert_email }}
         run: terraform init
 
       - name: Terraform Plan
@@ -46,9 +57,11 @@ jobs:
         env:
           TF_VAR_region: ${{ inputs.region }}
           TF_VAR_tenancy_ocid: ${{ secrets.OCI_TENANCY_OCID }}
+          TF_VAR_alert_email: ${{ inputs.alert_email }}
         run: |
-          terraform plan -out=tfplan \
+          terraform plan \
             -var="region=${{ inputs.region }}" \
+            -var="alert_email=${{ inputs.alert_email }}" \
             -detailed-exitcode \
             | tee plan-output.txt
           EXIT_CODE=${PIPESTATUS[0]}
@@ -61,19 +74,15 @@ jobs:
             echo "No changes detected."
           fi
 
-      - name: Upload Plan Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: tfplan-${{ inputs.environment }}
-          path: infra/oracle/examples/${{ inputs.environment }}/tfplan
-
-      - name: Upload Plan Output
+      - name: Upload Plan Output (text only — NO binary plan)
         uses: actions/upload-artifact@v4
         with:
           name: plan-output-${{ inputs.environment }}
           path: infra/oracle/examples/${{ inputs.environment }}/plan-output.txt
 
   # Note: There is NO terraform-apply job in this workflow.
+  # Binary plan files (tfplan) are NEVER uploaded as artifacts — they can
+  # contain sensitive state metadata.
   # Apply is performed only through a separate, access-controlled runbook
   # with manual approval and change-control authorization.
   # See docs/runbooks/oci-platform-operator.md

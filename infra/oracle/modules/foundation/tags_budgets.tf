@@ -1,19 +1,33 @@
-# Tags and budgets for cost governance
-# Free-tier conscious with configurable alert thresholds
+# Tags and budgets for cost governance.
+# Tag namespace is UNIQUE per environment (staging and production never collide).
 
-# Tag namespace — applied at tenancy level for consistent tagging
+# Tag namespace — one per environment, applied at tenancy level.
 resource "oci_identity_tag_namespace" "this" {
   compartment_id = var.tenancy_ocid
-  name           = "${var.project_name}-tags"
-  description    = "Tag namespace for ${var.project_name} resources"
+  name           = "${var.project_name}-${var.environment}-tags"
+  description    = "Tag namespace for ${var.project_name} ${var.environment} (environment-scoped)"
 }
 
-# Environment tag definition
+# Environment tag definition (informational)
 resource "oci_identity_tag" "environment" {
   tag_namespace_id = oci_identity_tag_namespace.this.id
   name             = "environment"
   description      = "Deployment environment: staging or production"
   is_cost_tracking = true
+}
+
+# Workload-role tag — fail-closed IAM gating (see iam.tf)
+resource "oci_identity_tag" "workload_role" {
+  tag_namespace_id = oci_identity_tag_namespace.this.id
+  name             = "workload-role"
+  description      = "Compute workload role: api or worker. MUST be set on every instance for IAM to grant rights."
+
+  validator {
+    validator_type = "ENUM"
+    values         = ["api", "worker"]
+  }
+
+  is_cost_tracking = false
 }
 
 # Monthly budget with alert rule
