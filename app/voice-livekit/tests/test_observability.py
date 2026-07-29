@@ -696,12 +696,15 @@ class TestPersistenceLogging(unittest.IsolatedAsyncioTestCase):
 
     async def test_save_turn_does_not_log_transcript_text(self) -> None:
         lines: list[str] = []
+        table = MagicMock()
+        table.insert.return_value.execute.return_value = types.SimpleNamespace(error=None)
         original_writer = persistence._log._writer
         persistence._log._writer = lambda line: lines.append(line)
         try:
-            await persistence.save_turn(
-                "test-session-id", 0, "bot", "Hello this is secret candidate text"
-            )
+            with patch.object(persistence, "_table", return_value=table):
+                await persistence.save_turn(
+                    "test-session-id", 0, "bot", "Hello this is secret candidate text"
+                )
         finally:
             persistence._log._writer = original_writer
 
@@ -711,10 +714,13 @@ class TestPersistenceLogging(unittest.IsolatedAsyncioTestCase):
 
     async def test_save_turn_does_not_log_session_id(self) -> None:
         lines: list[str] = []
+        table = MagicMock()
+        table.insert.return_value.execute.return_value = types.SimpleNamespace(error=None)
         original_writer = persistence._log._writer
         persistence._log._writer = lambda line: lines.append(line)
         try:
-            await persistence.save_turn("my-secret-session-id", 1, "candidate", "text")
+            with patch.object(persistence, "_table", return_value=table):
+                await persistence.save_turn("my-secret-session-id", 1, "candidate", "text")
         finally:
             persistence._log._writer = original_writer
 

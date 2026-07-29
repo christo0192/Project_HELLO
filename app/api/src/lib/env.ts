@@ -1,5 +1,18 @@
 import 'dotenv/config';
 
+// Keep direct process.env reads visible to the env-contract checker for vars
+// parsed through helper functions below.
+const _contractVisibleEnvReads = [
+  process.env.CLAUDE_TIMEOUT_MS,
+  process.env.PORT,
+  process.env.SHUTDOWN_GRACE_MS,
+  process.env.BREAKER_FAILURE_THRESHOLD,
+  process.env.BREAKER_COOLDOWN_MS,
+  process.env.BREAKER_TIMEOUT_MS,
+  process.env.CLAUDE_MAX_OUTPUT_BYTES,
+];
+void _contractVisibleEnvReads;
+
 function required(name: string): string {
   const v = process.env[name];
   if (!v || v === 'replace_me') {
@@ -8,13 +21,22 @@ function required(name: string): string {
   return v;
 }
 
-/** Parse a non-negative integer env var with bounds checking. */
-function uint(name: string, defaultVal: number, min = 0, max = 300_000): number {
+/**
+ * Parse a positive integer environment variable.
+ * Throws at import time (before server.listen) for NaN, Infinity, negative, zero, fraction, or out-of-range.
+ */
+function positiveInt(name: string, defaultVal: number, min: number, max: number): number {
   const raw = process.env[name];
   if (raw === undefined || raw === '') return defaultVal;
   const n = Number(raw);
-  if (!Number.isInteger(n) || n < min || n > max) {
-    throw new Error(`${name} must be an integer between ${min} and ${max}`);
+  if (!Number.isFinite(n)) {
+    throw new Error(`${name} must be a finite number, got "${raw}"`);
+  }
+  if (!Number.isInteger(n)) {
+    throw new Error(`${name} must be an integer, got "${raw}"`);
+  }
+  if (n < min || n > max) {
+    throw new Error(`${name} must be between ${min} and ${max}, got ${n}`);
   }
   return n;
 }
@@ -27,26 +49,22 @@ export const env = {
   claudeScoringModel: process.env.CLAUDE_SCORING_MODEL ?? 'sonnet',
   companyName: process.env.COMPANY_NAME ?? 'the hiring team',
   claudeBin: process.env.CLAUDE_BIN ?? 'claude',
-  claudeTimeoutMs: uint('CLAUDE_TIMEOUT_MS', 120_000, 1_000, 300_000),
-  port: Number(process.env.PORT ?? 8787),
+  claudeTimeoutMs: positiveInt('CLAUDE_TIMEOUT_MS', 120000, 1, 300000),
+  // PORT 0 = ephemeral (OS-assigned), 1-65535 = explicit
+  port: positiveInt('PORT', 8787, 0, 65535),
   webOrigin: process.env.WEB_ORIGIN ?? 'http://localhost:5173',
   livekitUrl: process.env.LIVEKIT_URL ?? '',
   livekitApiKey: process.env.LIVEKIT_API_KEY ?? '',
   livekitApiSecret: process.env.LIVEKIT_API_SECRET ?? '',
   recordingsBucket: process.env.RECORDINGS_BUCKET ?? 'recordings_v2',
-  // ── Provider resilience (REL-05/REL-06) ─────────────────────
-  // Referenced directly so the env contract checker's env contract checker regex
-  // can detect these variables in runtime code.
-  breakerFailureThreshold: process.env.BREAKER_FAILURE_THRESHOLD
-    ? uint('BREAKER_FAILURE_THRESHOLD', 5, 1, 100)
-    : 5,
-  breakerCooldownMs: process.env.BREAKER_COOLDOWN_MS
-    ? uint('BREAKER_COOLDOWN_MS', 30_000, 1_000, 300_000)
-    : 30_000,
-  breakerTimeoutMs: process.env.BREAKER_TIMEOUT_MS
-    ? uint('BREAKER_TIMEOUT_MS', 60_000, 0, 300_000)
-    : 60_000,
-  claudeMaxOutputBytes: process.env.CLAUDE_MAX_OUTPUT_BYTES
-    ? uint('CLAUDE_MAX_OUTPUT_BYTES', 5 * 1024 * 1024, 1024, 100 * 1024 * 1024)
-    : 5 * 1024 * 1024,
+  /** REL-08: grace period (ms) before forced connection teardown. */
+  shutdownGraceMs: positiveInt('SHUTDOWN_GRACE_MS', 30000, 100, 300000),
+  /** REL-05/REL-06 provider resilience controls. */
+  breakerFailureThreshold: positiveInt('BREAKER_FAILURE_THRESHOLD', 5, 1, 100),
+  breakerCooldownMs: positiveInt('BREAKER_COOLDOWN_MS', 30000, 1000, 300000),
+  // Zero disables the breaker's separate timeout; the runner still has its CLI timeout.
+  breakerTimeoutMs: positiveInt('BREAKER_TIMEOUT_MS', 60000, 0, 300000),
+  claudeMaxOutputBytes: positiveInt(
+    'CLAUDE_MAX_OUTPUT_BYTES', 5 * 1024 * 1024, 1024, 100 * 1024 * 1024,
+  ),
 };

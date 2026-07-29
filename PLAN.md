@@ -4,7 +4,7 @@
 
 ---
 
-> **Implementation status (2026-07-29):** GOV-06, OBS-01/OBS-02, TST-07 automation, and LLM-06 provenance are merged in PRs #14–#17. Branch `feat/rel-05-06-provider-resilience` adds the REL-05/REL-06 provider-resilience foundation. These implementations do **not** close production acceptance: hosted migration/deployment evidence, managed observability, manual accessibility review, provider drills, owner/legal/security approvals, and all launch gates remain pending.
+> **Implementation status (2026-07-29):** GOV-06, OBS-01/OBS-02, TST-07 automation, LLM-06 provenance, and REL-05/REL-06 provider resilience are merged in PRs #14–#18. Branch `feat/rel-07-08-session-lifecycle` implements session lifecycle and graceful-shutdown scaffolding. These implementations do **not** close production reliability acceptance: REL-09 reconciliation, durable scoring, deployed signal-drain/provider proof, live SDK/room evidence, owner approvals, and all launch gates remain pending.
 
 ---
 

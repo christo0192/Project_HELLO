@@ -57,7 +57,7 @@ insert into screening_v2.candidates (id, role_id, name, email, phone_e164, phone
   ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000000', 'Synth External Candidate', 'ext.synth@example.invalid', null, false, '["testing"]'::jsonb, 3, '{"is_synthetic":true}'::jsonb, 'screened', 'test', '2026-06-01T00:00:00Z'::timestamptz, '2026-06-01T00:00:00Z'::timestamptz, '2026-06-01T00:00:00Z'::timestamptz)
   on conflict (id) do nothing;
 insert into screening_v2.call_sessions (id, candidate_id, role_id, mode, status, started_at, updated_at) values
-  ('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000000', 'browser', 'completed', '2026-06-01T00:00:00Z'::timestamptz, '2026-06-01T00:00:00Z'::timestamptz)
+  ('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000000', 'browser', 'created', '2026-06-01T00:00:00Z'::timestamptz, '2026-06-01T00:00:00Z'::timestamptz)
   on conflict (id) do nothing;
 
 -- =============================================================================

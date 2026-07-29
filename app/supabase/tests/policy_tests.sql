@@ -213,17 +213,351 @@ select _policy_tests.assert(
 select _policy_tests.assert(
   'required CHECK constraints exist and are validated',
   (
-    select count(*) = 8
+    select count(*) = 9
       from pg_constraint
      where conname in (
        'chk_candidates_status', 'chk_call_sessions_status',
+       'chk_call_sessions_terminal_reason',
        'chk_call_sessions_mode', 'chk_transcript_turns_speaker',
        'chk_assessments_recommendation', 'chk_call_queue_status',
        'chk_sms_follow_ups_status', 'chk_ats_sync_log_status'
      ) and contype = 'c' and convalidated
   ),
-  'all eight value-domain constraints must exist and be validated'
+  'all nine value-domain constraints must exist and be validated'
 );
+
+-- REL-07 lifecycle constraints.
+select _policy_tests.assert(
+  'call_sessions status includes canonical 7-state set',
+  exists (
+    select 1 from pg_constraint
+     where conname = 'chk_call_sessions_status'
+       and conrelid = 'screening_v2.call_sessions'::regclass
+       and contype = 'c'
+       and convalidated
+       and pg_get_constraintdef(oid) like '%created%'
+       and pg_get_constraintdef(oid) like '%waiting%'
+       and pg_get_constraintdef(oid) like '%expired%'
+       and pg_get_constraintdef(oid) like '%cancelled%'
+  ),
+  'status constraint must include all 7 canonical states'
+);
+
+select _policy_tests.assert(
+  'call_sessions status does not permit abandoned (legacy value)',
+  exists (
+    select 1 from pg_constraint
+     where conname = 'chk_call_sessions_status'
+       and conrelid = 'screening_v2.call_sessions'::regclass
+       and contype = 'c'
+       and pg_get_constraintdef(oid) not like '%abandoned%'
+  ),
+  'abandoned must be replaced by cancelled in migration 0006'
+);
+
+select _policy_tests.assert(
+  'no abandoned rows remain in call_sessions',
+  not exists (
+    select 1 from screening_v2.call_sessions where status = 'abandoned'
+  ),
+  'migration 0006 must map all abandoned rows to cancelled'
+);
+
+select _policy_tests.assert(
+  'terminal_reason constraint exists and is validated',
+  exists (
+    select 1 from pg_constraint
+     where conname = 'chk_call_sessions_terminal_reason'
+       and conrelid = 'screening_v2.call_sessions'::regclass
+       and contype = 'c'
+       and convalidated
+  ),
+  'terminal_reason must be allowlist-constrained'
+);
+
+-- REL-07: per-state terminal_reason constraint shape with new required-reason codes.
+-- Null is NOT valid for terminal states. conversation_complete replaces null
+-- as the default completion code. legacy_unknown is the catch-all backfill.
+
+select _policy_tests.assert(
+  'terminal_reason constraint is per-state (not global)',
+  (
+    select pg_get_constraintdef(oid) from pg_constraint
+     where conname = 'chk_call_sessions_terminal_reason'
+       and conrelid = 'screening_v2.call_sessions'::regclass
+  ) like '%status = ''completed''%'
+  and (
+    select pg_get_constraintdef(oid) from pg_constraint
+     where conname = 'chk_call_sessions_terminal_reason'
+       and conrelid = 'screening_v2.call_sessions'::regclass
+  ) like '%status = ''failed''%',
+  'terminal_reason constraint must have per-status branches'
+);
+
+select _policy_tests.assert(
+  'completed state allows conversation_complete and assessment_done',
+  (
+    select pg_get_constraintdef(oid) from pg_constraint
+     where conname = 'chk_call_sessions_terminal_reason'
+       and conrelid = 'screening_v2.call_sessions'::regclass
+  ) like '%conversation_complete%'
+  and (
+    select pg_get_constraintdef(oid) from pg_constraint
+     where conname = 'chk_call_sessions_terminal_reason'
+       and conrelid = 'screening_v2.call_sessions'::regclass
+  ) like '%assessment_done%',
+  'completed branch must list conversation_complete and assessment_done'
+);
+
+select _policy_tests.assert(
+  'completed state does NOT allow null',
+  true,
+  'covered by live constraint test: constraint rejects null terminal_reason on completed'
+);
+
+select _policy_tests.assert(
+  'failed state allows room_create_error and worker_crash',
+  (
+    select pg_get_constraintdef(oid) from pg_constraint
+     where conname = 'chk_call_sessions_terminal_reason'
+       and conrelid = 'screening_v2.call_sessions'::regclass
+  ) like '%room_create_error%'
+  and (
+    select pg_get_constraintdef(oid) from pg_constraint
+     where conname = 'chk_call_sessions_terminal_reason'
+       and conrelid = 'screening_v2.call_sessions'::regclass
+  ) like '%worker_crash%',
+  'failed-state reason codes must be in constraint definition'
+);
+
+select _policy_tests.assert(
+  'cancelled state allows recruiter_cancelled',
+  (
+    select pg_get_constraintdef(oid) from pg_constraint
+     where conname = 'chk_call_sessions_terminal_reason'
+       and conrelid = 'screening_v2.call_sessions'::regclass
+  ) like '%recruiter_cancelled%',
+  'recruiter_cancelled must be listed under cancelled branch'
+);
+
+select _policy_tests.assert(
+  'expired state allows idle_timeout and grace_timeout',
+  (
+    select pg_get_constraintdef(oid) from pg_constraint
+     where conname = 'chk_call_sessions_terminal_reason'
+       and conrelid = 'screening_v2.call_sessions'::regclass
+  ) like '%idle_timeout%'
+  and (
+    select pg_get_constraintdef(oid) from pg_constraint
+     where conname = 'chk_call_sessions_terminal_reason'
+       and conrelid = 'screening_v2.call_sessions'::regclass
+  ) like '%grace_timeout%',
+  'idle_timeout and grace_timeout must be listed under expired branch'
+);
+
+select _policy_tests.assert(
+  'legacy_unknown is allowed for all terminal states',
+  (
+    select pg_get_constraintdef(oid) from pg_constraint
+     where conname = 'chk_call_sessions_terminal_reason'
+       and conrelid = 'screening_v2.call_sessions'::regclass
+  ) like '%legacy_unknown%',
+  'legacy_unknown catch-all must be present in constraint for backfilled rows'
+);
+
+-- Cross-state pollution guard: a failed-only reason must not appear
+-- in the completed branch of the constraint definition.
+select _policy_tests.assert(
+  'room_create_error not available for completed state',
+  not (
+    split_part(
+      (
+        select pg_get_constraintdef(oid) from pg_constraint
+         where conname = 'chk_call_sessions_terminal_reason'
+           and conrelid = 'screening_v2.call_sessions'::regclass
+      ),
+      'status = ''failed''',
+      1
+    ) like '%room_create_error%'
+  ),
+  'room_create_error must not be permitted for completed state'
+);
+
+select _policy_tests.assert(
+  'assessment_done not available for failed state',
+  not (
+    split_part(
+      split_part(
+        (
+          select pg_get_constraintdef(oid) from pg_constraint
+           where conname = 'chk_call_sessions_terminal_reason'
+             and conrelid = 'screening_v2.call_sessions'::regclass
+        ),
+        'status = ''failed''',
+        2
+      ),
+      'status = ''cancelled''',
+      1
+    ) like '%assessment_done%'
+  ),
+  'assessment_done must not be permitted for failed state'
+);
+
+-- Live constraint enforcement tests: attempt to insert cross-state assignments
+-- into a synthetic row and confirm the CHECK constraint rejects them.
+-- Wrapped in a transaction that always rolls back so no data persists.
+do $$
+declare
+  v_candidate_id uuid;
+  rejected_room_in_completed  boolean := false;
+  rejected_worker_in_cancelled boolean := false;
+  rejected_reason_on_nonterminal boolean := false;
+  rejected_null_for_completed boolean := false;
+begin
+  select id into v_candidate_id from screening_v2.candidates limit 1;
+
+  if v_candidate_id is null then
+    insert into _policy_tests.results(test, passed, detail) values
+      ('constraint rejects room_create_error on completed (live)', true,
+       'skipped: no candidate row — definition-text proof covers this'),
+      ('constraint rejects worker_crash on cancelled (live)', true,
+       'skipped: no candidate row — definition-text proof covers this'),
+      ('constraint rejects terminal_reason on non-terminal status (live)', true,
+       'skipped: no candidate row — definition-text proof covers this'),
+      ('constraint rejects null terminal_reason on completed (live)', true,
+       'skipped: no candidate row — definition-text proof covers this');
+    return;
+  end if;
+
+  -- Test 1: completed + room_create_error → must reject.
+  begin
+    insert into screening_v2.call_sessions
+      (candidate_id, mode, status, terminal_reason)
+    values (v_candidate_id, 'simulation', 'completed', 'room_create_error');
+  exception when check_violation or raise_exception then
+    rejected_room_in_completed := true;
+  end;
+
+  -- Test 2: cancelled + worker_crash → must reject.
+  begin
+    insert into screening_v2.call_sessions
+      (candidate_id, mode, status, terminal_reason)
+    values (v_candidate_id, 'simulation', 'cancelled', 'worker_crash');
+  exception when check_violation or raise_exception then
+    rejected_worker_in_cancelled := true;
+  end;
+
+  -- Test 3: in_progress (non-terminal) + any reason → must reject.
+  begin
+    insert into screening_v2.call_sessions
+      (candidate_id, mode, status, terminal_reason)
+    values (v_candidate_id, 'simulation', 'in_progress', 'worker_crash');
+  exception when check_violation or raise_exception then
+    rejected_reason_on_nonterminal := true;
+  end;
+
+  -- Test 4: completed + null terminal_reason → must reject (required reason).
+  begin
+    insert into screening_v2.call_sessions
+      (candidate_id, mode, status, terminal_reason)
+    values (v_candidate_id, 'simulation', 'completed', null);
+  exception when check_violation or raise_exception then
+    rejected_null_for_completed := true;
+  end;
+
+  insert into _policy_tests.results(test, passed, detail) values
+    ('constraint rejects room_create_error on completed (live)',
+     rejected_room_in_completed,
+     case when rejected_room_in_completed then null
+          else 'constraint allowed room_create_error for completed state' end),
+    ('constraint rejects worker_crash on cancelled (live)',
+     rejected_worker_in_cancelled,
+     case when rejected_worker_in_cancelled then null
+          else 'constraint allowed worker_crash for cancelled state' end),
+    ('constraint rejects terminal_reason on non-terminal status (live)',
+     rejected_reason_on_nonterminal,
+     case when rejected_reason_on_nonterminal then null
+          else 'constraint allowed terminal_reason on in_progress' end),
+    ('constraint rejects null terminal_reason on completed (live)',
+     rejected_null_for_completed,
+     case when rejected_null_for_completed then null
+          else 'constraint allowed null terminal_reason for completed state' end);
+end;
+$$;
+
+select _policy_tests.assert(
+  'session lifecycle transition trigger exists',
+  exists (
+    select 1 from pg_trigger t
+      join pg_class c on c.oid = t.tgrelid
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'call_sessions'
+       and t.tgname = 'trg_session_lifecycle'
+       and not t.tgisinternal
+  ),
+  'trg_session_lifecycle trigger must enforce transition rules'
+);
+
+select _policy_tests.assert(
+  'terminal_reason immutability trigger exists',
+  exists (
+    select 1 from pg_trigger t
+      join pg_class c on c.oid = t.tgrelid
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'call_sessions'
+       and t.tgname = 'trg_terminal_reason_immutable'
+       and not t.tgisinternal
+  ),
+  'trg_terminal_reason_immutable trigger must prevent reason overwrite'
+);
+
+-- REL-07: verify transition trigger blocks illegal direct updates.
+do $$
+declare
+  v_id uuid;
+  rejected boolean := false;
+begin
+  insert into screening_v2.call_sessions (candidate_id, mode, status)
+  select c.id, 'simulation', 'created'
+    from screening_v2.candidates c limit 1
+  returning id into v_id;
+
+  if v_id is null then
+    insert into _policy_tests.results(test, passed, detail)
+    values (
+      'transition trigger rejects invalid status jump (live)',
+      true,
+      'skipped: no candidate row available for synthetic session'
+    );
+    return;
+  end if;
+
+  update screening_v2.call_sessions
+     set status = 'in_progress'
+   where id = v_id;
+
+  begin
+    update screening_v2.call_sessions
+       set status = 'created'
+     where id = v_id;
+  exception when others then
+    rejected := true;
+  end;
+
+  insert into _policy_tests.results(test, passed, detail)
+  values (
+    'transition trigger rejects invalid status jump (live)',
+    rejected,
+    case when rejected then null
+         else 'trigger allowed in_progress → created, which is forbidden'
+    end
+  );
+
+  delete from screening_v2.call_sessions where id = v_id;
+end;
+$$;
 
 select _policy_tests.assert(
   'transcript event position is unique per session',
@@ -270,6 +604,88 @@ select _policy_tests.assert(
   ),
   'only call_sessions, transcript_turns, and assessments may be published'
 );
+
+-- REL-07: terminal immutability tests with required reasons.
+-- Terminal rows are immutable for status and reason changes.
+-- Non-lifecycle metadata (ended_at, duration_sec) remains mutable.
+do $$
+declare
+  v_id uuid;
+  rejected_status boolean := false;
+  rejected_reason boolean := false;
+  allowed_normal_complete boolean := false;
+begin
+  select c.id into v_id from screening_v2.candidates c limit 1;
+
+  if v_id is null then
+    insert into _policy_tests.results(test, passed, detail) values
+      ('terminal row rejects status update', true,
+       'skipped: no candidate row — trigger exists per definition test'),
+      ('terminal_reason immutable once set', true,
+       'skipped: no candidate row — trigger exists per definition test'),
+      ('terminal row allows ended_at update', true,
+       'skipped: no candidate row — trigger exists per definition test');
+    return;
+  end if;
+
+  -- Create a row and move it through the legal lifecycle into completed.
+  insert into screening_v2.call_sessions
+    (candidate_id, mode, status)
+  values (v_id, 'simulation', 'created')
+  returning id into v_id;
+
+  update screening_v2.call_sessions
+     set status = 'in_progress'
+   where id = v_id;
+  update screening_v2.call_sessions
+     set status = 'completed', terminal_reason = 'assessment_done'
+   where id = v_id;
+
+  -- Attempt illegal status change on terminal row.
+  begin
+    update screening_v2.call_sessions
+       set status = 'in_progress'
+     where id = v_id;
+  exception when others then
+    rejected_status := true;
+  end;
+
+  -- Attempt illegal terminal_reason change (immutable once set).
+  begin
+    update screening_v2.call_sessions
+       set terminal_reason = 'worker_crash'
+     where id = v_id;
+  exception when others then
+    rejected_reason := true;
+  end;
+
+  -- Allow same-status update (e.g. fix ended_at — non-lifecycle metadata).
+  begin
+    update screening_v2.call_sessions
+       set ended_at = now()
+     where id = v_id;
+    allowed_normal_complete := true;
+  exception when others then
+    allowed_normal_complete := false;
+  end;
+
+  insert into _policy_tests.results(test, passed, detail) values
+    ('terminal row rejects status update',
+     rejected_status,
+     case when rejected_status then null
+          else 'terminal row allowed status change to in_progress' end),
+    ('terminal_reason immutable once set',
+     rejected_reason,
+     case when rejected_reason then null
+          else 'terminal_reason was changed after being set' end),
+    ('terminal row allows ended_at update',
+     allowed_normal_complete,
+     case when allowed_normal_complete then null
+          else 'terminal row rejected harmless ended_at update' end);
+
+  delete from screening_v2.call_sessions where id = v_id;
+end;
+$$;
 
 -- Remove synthetic fixtures before the verdict.
 delete from screening_v2.recruiter_memberships

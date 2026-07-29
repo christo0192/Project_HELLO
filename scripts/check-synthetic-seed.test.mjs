@@ -156,8 +156,8 @@ async function f3() {
 
   // Duration mismatch
   await testMutation(SEED, s => s.replace(
-    "900,\n  '2026-01-15T10:15:00Z'::timestamptz\n) on conflict (id) do nothing;\n\ninsert into screening_v2.call_sessions (id, candidate_id, role_id, mode, provider, status, current_question_index, started_at, ended_at, duration_sec, updated_at) values",
-    "600,\n  '2026-01-15T10:15:00Z'::timestamptz\n) on conflict (id) do nothing;\n\ninsert into screening_v2.call_sessions (id, candidate_id, role_id, mode, provider, status, current_question_index, started_at, ended_at, duration_sec, updated_at) values"),
+    "900,\n  '2026-01-15T10:15:00Z'::timestamptz\n) on conflict (id) do nothing;\n\ninsert into screening_v2.call_sessions (id, candidate_id, role_id, mode, provider, status, terminal_reason, current_question_index, started_at, ended_at, duration_sec, updated_at) values",
+    "600,\n  '2026-01-15T10:15:00Z'::timestamptz\n) on conflict (id) do nothing;\n\ninsert into screening_v2.call_sessions (id, candidate_id, role_id, mode, provider, status, terminal_reason, current_question_index, started_at, ended_at, duration_sec, updated_at) values"),
     CODE.BAD_TIMESTAMP, "F3-duration-mismatch-rejected");
 
   // now() in consent

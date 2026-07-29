@@ -181,7 +181,7 @@ insert into screening_v2.candidates (id, role_id, resume_id, name, email, phone_
 -- =============================================================================
 -- 4. CALL SESSIONS (browser mode only — no telephony)
 -- =============================================================================
-insert into screening_v2.call_sessions (id, candidate_id, role_id, mode, provider, status, current_question_index, started_at, ended_at, duration_sec, updated_at) values
+insert into screening_v2.call_sessions (id, candidate_id, role_id, mode, provider, status, terminal_reason, current_question_index, started_at, ended_at, duration_sec, updated_at) values
 (
   '60000000-0000-4000-a000-000000000031',
   '60000000-0000-4000-a000-000000000021',
@@ -189,6 +189,7 @@ insert into screening_v2.call_sessions (id, candidate_id, role_id, mode, provide
   'browser',
   'pipecat',
   'completed',
+  'conversation_complete',
   3,
   '2026-01-15T10:00:00Z'::timestamptz,
   '2026-01-15T10:15:00Z'::timestamptz,
@@ -196,7 +197,7 @@ insert into screening_v2.call_sessions (id, candidate_id, role_id, mode, provide
   '2026-01-15T10:15:00Z'::timestamptz
 ) on conflict (id) do nothing;
 
-insert into screening_v2.call_sessions (id, candidate_id, role_id, mode, provider, status, current_question_index, started_at, ended_at, duration_sec, updated_at) values
+insert into screening_v2.call_sessions (id, candidate_id, role_id, mode, provider, status, terminal_reason, current_question_index, started_at, ended_at, duration_sec, updated_at) values
 (
   '60000000-0000-4000-a000-000000000032',
   '60000000-0000-4000-a000-000000000022',
@@ -204,6 +205,7 @@ insert into screening_v2.call_sessions (id, candidate_id, role_id, mode, provide
   'browser',
   'pipecat',
   'completed',
+  'conversation_complete',
   3,
   '2026-01-15T11:00:00Z'::timestamptz,
   '2026-01-15T11:15:00Z'::timestamptz,
@@ -211,7 +213,7 @@ insert into screening_v2.call_sessions (id, candidate_id, role_id, mode, provide
   '2026-01-15T11:15:00Z'::timestamptz
 ) on conflict (id) do nothing;
 
-insert into screening_v2.call_sessions (id, candidate_id, role_id, mode, provider, status, current_question_index, started_at, ended_at, duration_sec, updated_at) values
+insert into screening_v2.call_sessions (id, candidate_id, role_id, mode, provider, status, terminal_reason, current_question_index, started_at, ended_at, duration_sec, updated_at) values
 (
   '60000000-0000-4000-a000-000000000033',
   '60000000-0000-4000-a000-000000000023',
@@ -219,6 +221,7 @@ insert into screening_v2.call_sessions (id, candidate_id, role_id, mode, provide
   'browser',
   'pipecat',
   'in_progress',
+  null,
   1,
   '2026-01-15T11:45:00Z'::timestamptz,
   null,

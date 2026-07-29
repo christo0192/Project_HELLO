@@ -269,6 +269,7 @@ describe('validation happy paths', () => {
   });
 
   it('POST /api/screening/start returns 201 on happy path', async () => {
+    let callSessionCalls = 0;
     supabaseMock.from.mockImplementation((table: string) => {
       if (table === 'candidates') {
         return chainable({
@@ -277,7 +278,11 @@ describe('validation happy paths', () => {
         });
       }
       if (table === 'call_sessions') {
-        return chainable({ data: mockSession, error: null });
+        callSessionCalls++;
+        return chainable({
+          data: callSessionCalls === 1 ? mockSession : [{ id: mockSession.id }],
+          error: null,
+        });
       }
       if (table === 'transcript_turns') {
         return chainable({ data: null, error: null });
@@ -597,7 +602,8 @@ describe('multipart validation', () => {
   });
 
   it('livekit recording accepts a file without metadata fields', async () => {
-    supabaseMock.from.mockReturnValue(chainable({ data: null, error: null }));
+    // Recording update needs to match a row (data with id)
+    supabaseMock.from.mockReturnValue(chainable({ data: [{ id: validUUID() }], error: null }));
 
     const res = await request(app)
       .post(`/api/livekit/${validUUID()}/recording`)
@@ -1017,6 +1023,9 @@ describe('LLM-06 provenance integration', () => {
           },
           error: null,
         });
+        // REL-07 activation is a CAS update and therefore requires an array
+        // response proving exactly one row transitioned.
+        orig.update = () => chainable({ data: [{ id: mockSession.id }], error: null });
         return orig;
       }
       if (table === 'transcript_turns') {

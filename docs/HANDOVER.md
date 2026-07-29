@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-07-29
 
-**Current branch:** `feat/rel-05-06-provider-resilience` (worktreed from `fd58f81` / PR #13, not yet merged to `main`)
+**Current branch:** `feat/rel-07-08-session-lifecycle` (merged with `main` through PR #18; PR #19 not yet merged)
 
 **Repository:** `https://github.com/christo0192/Project_HELLO`
 
@@ -10,14 +10,18 @@
 
 **Roadmap source of truth:** [`PLAN.md`](../PLAN.md)
 
+**Implementation status:** Partial — REL-07/REL-08 session lifecycle code complete on `feat/rel-07-08-session-lifecycle`. REL-09 reconciler, durable scoring, deployed signal drain, live SDK integration, and external acceptance pending; 0/17 launch gates complete.
+
+## Branch: feat/rel-07-08-session-lifecycle
+
+Integrated base: `e5c1051` (PR #18 provider resilience). PR #19 is not yet merged to `main`.
+
 ## Resume Here
 
 ```bash
 git fetch origin
-git switch main
-git pull --ff-only origin main
+git checkout feat/rel-07-08-session-lifecycle
 git log --oneline --decorate -10
-gh pr list --state all --limit 10
 cat docs/HANDOVER.md
 ```
 
@@ -26,8 +30,8 @@ cat docs/HANDOVER.md
 | Metric | Value |
 |--------|-------|
 | Completed launch gates | 0/17 — all FND-02, FND-03, and REL acceptance criteria remain unverified at production level |
-| Implementation coverage | REL-05/REL-06 code + tests exist on branch; strict acceptance is separate from implementation coverage |
-| Branch base | `fd58f81c184af7ae7b15138537ff735070d116ad` (PR #13 FND-02/FND-03) |
+| Implementation coverage | REL-07/REL-08 code and aggregate tests exist on branch; strict acceptance is separate from implementation coverage |
+| Integrated base | `e5c1051` (PR #18) |
 | Branch state | In progress; not merged |
 
 > **Note:** The 25% completion figure sometimes seen in earlier summaries is NOT claimed. Zero launch gates are confirmed complete. Implementation coverage and acceptance verification are distinct gates.
@@ -47,12 +51,14 @@ cat docs/HANDOVER.md
 | OCI region benchmark harness | Infrastructure | Code merged; not yet measured | PR #8 (`726ce56`), merged 2026-07-29. Harness and fail-closed runbook exist; no benchmark data has been collected. |
 | LLM-06 model provenance | LLM-06 | Code merged; production migration/deployment acceptance pending | PR #17 (`8439bda`), merged 2026-07-29. Requested-model provenance covers API simulation/scoring and LiveKit worker claims with SQL validation and immutability. Hosted migration application and deployed provider evidence remain pending. |
 | Supabase local baseline | MIG-03 / partial MIG-04 | Code merged; production apply pending | PR #9 (`4d103ea`), merged 2026-07-29. Unused Mumbai project exists but MIG-01/MIG-02 admin acceptance pending; this is MIG-03/partial MIG-04. Membership-gated RLS and local validation; MIG-01/MIG-02 administrative acceptance plus controlled production connection/application and MIG-13 cutover are future gates. |
-| Synthetic demo seed foundation | GOV-06 | Code merged; production/demo acceptance pending | PR #14 (`7cbc962`), merged 2026-07-29. Deterministic local seed, offline validator, SQL integration assertions, runbook, and Supabase CI wiring are present. Artifact replacement and owner FND-03 evidence remain pending. |
-| OBS-01 / OBS-02 structured logging + correlation | OBS-01, OBS-02 | Code merged; deployment acceptance pending | PR #15 (`de133c6`), merged 2026-07-29. Structured logging and UUID v4 correlation scaffolding are present; managed export, dashboards, alarms, and deployed acceptance remain pending. |
-| Accessibility test foundation | TST-07 | Automation scaffold merged; manual/dependent acceptance pending | PR #16 (`db20b4a`), merged 2026-07-29. Automated axe, network-trap, and keyboard checks are present. Manual AT/browser gates and candidate consent/call flow remain pending. |
-| Provider resilience foundation | REL-05, REL-06 | Code complete on `feat/rel-05-06-provider-resilience`; **not merged, not deployed** | Circuit breakers, hardened Claude runner, explicit scoring HTTP timeouts/lazy transport, typed failure outcomes, correlation propagation, and closed failure-reason mapping are implemented. See `docs/runbooks/provider-resilience.md`; SDK-internal calls, reconciliation, and deployed drills remain pending. |
+| Synthetic demo seed foundation | GOV-06 | Code merged; production/demo acceptance pending | PR #14 (`7cbc962`), merged 2026-07-29. Deterministic local seed, validators, SQL assertions, runbook, and CI wiring are present; artifact replacement and owner evidence remain pending. |
+| OBS-01 / OBS-02 structured logging + correlation | OBS-01, OBS-02 | Code merged; deployment acceptance pending | PR #15 (`de133c6`), merged 2026-07-29. Structured logging and UUID v4 correlation are present; managed export, dashboards, alarms, and deployed proof remain pending. |
+| Accessibility test foundation | TST-07 | Automation scaffold merged; manual/dependent acceptance pending | PR #16 (`db20b4a`), merged 2026-07-29. Automated axe/network/keyboard checks are present; manual AT/browser and candidate-flow gates remain pending. |
+| Provider resilience foundation | REL-05, REL-06 | Code merged; deployed drills pending | PR #18 (`e5c1051`), merged 2026-07-29. Circuit breakers, hardened Claude runner, explicit scoring HTTP timeouts/lazy transport, typed outcomes, and correlation propagation are present. |
+| Session lifecycle | REL-07 | Code complete on `feat/rel-07-08-session-lifecycle`; **not merged, not deployed** | Required terminal reasons, stable error codes, compare-and-set transitions, fail-closed worker activation, write draining, and migration `0006` are implemented. |
+| Graceful shutdown | REL-08 | Code complete on `feat/rel-07-08-session-lifecycle`; **not merged, not deployed** | Shutdown tests cover in-flight races, synchronous close failures, socket cleanup, duplicate signals, and forced drain timeout. |
 
-PRs #14–#17 were merged into `main` on 2026-07-29 with their required checks passing. Aggregate `main` verification after the remaining sequential merges is still pending.
+PRs #14–#18 were merged into `main` on 2026-07-29 with required checks passing. Aggregate `main` verification after PR #19 remains pending.
 
 ## Phase-0 Foundation Status (FND-01, FND-02, FND-03)
 
@@ -109,10 +115,10 @@ git diff --check
 ### Current Test Counts
 | Suite | Count | Notes |
 |---|---|---|
-| API (Node) | **597 tests** | Includes 89 provider-resilience tests plus validation, observability, provenance, and CORS/CSP suites; deterministic fakes avoid real CLI/provider calls. |
-| LiveKit worker (Python) | **217 tests** | Combined resilience, observability, provenance, correlation, and persistence coverage using `unittest` and fake transports; no real provider calls. |
+| API (Node) | **664 tests** | Includes lifecycle/shutdown, provider resilience, validation, observability, provenance, and CORS/CSP suites; deterministic fakes avoid real CLI/provider calls. |
+| LiveKit worker (Python) | **289 tests** | Combined lifecycle, resilience, observability, provenance, correlation, and persistence coverage using `unittest` and fake transports. |
 | Web | **101 tests** | Accessibility scaffold plus typecheck, lint, and production build. |
-| Supabase | **46 policy/provenance + 62 synthetic SQL assertions** | Local ephemeral stack only; includes anonymous denial and idempotent seed replay. |
+| Supabase | **69 policy/provenance/lifecycle + 62 synthetic SQL assertions** | Local ephemeral stack only; includes anonymous denial, legal transition fixtures, and idempotent seed replay. |
 
 ## Remaining Production Work
 

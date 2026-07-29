@@ -49,7 +49,7 @@ const CANONICAL_COLUMNS = {
   roles:                 ["id","title","jd","required_skills","screening_template","is_active","created_at","updated_at"],
   resumes:               ["id","file_path","file_name","mime_type","text_extracted","parsed","created_at","updated_at"],
   candidates:            ["id","role_id","resume_id","name","email","phone_raw","phone_e164","phone_valid","skills","experience_years","parsed","status","consent_source","consent_at","created_at","updated_at"],
-  call_sessions:         ["id","candidate_id","role_id","mode","provider","status","current_question_index","started_at","ended_at","duration_sec","updated_at"],
+  call_sessions:         ["id","candidate_id","role_id","mode","provider","status","terminal_reason","current_question_index","started_at","ended_at","duration_sec","updated_at"],
   transcript_turns:      ["id","session_id","turn_index","speaker","text","created_at"],
   assessments:           ["id","session_id","candidate_id","english","tone","communication","motivation","role_fit","resume_conflicts","overall_score","recommendation","summary","raw","provenance","created_at","updated_at"],
   consent_records:       ["id","candidate_id","source","proof","created_at"],

@@ -1,13 +1,9 @@
 """
-    LLM-06: LiveKit Agents voice worker (Gopu screening interviewer).
+    SPIKE: LiveKit Agents voice worker (Gopu screening interviewer).
 Sarvam STT/TTS + local multilingual turn-detector model + Anthropic Haiku LLM.
-Model provenance is claimed before any provider construction.
-
-Run (PowerShell, venv activated):
-    python agent.py download-files   # one-time model download
-    python agent.py console          # talk to it via local mic/speakers (no LiveKit creds needed)
-    python agent.py dev              # connect as a worker to LiveKit Cloud (needs .env creds)
 """
+
+from __future__ import annotations
 
 import os
 import time
@@ -21,14 +17,14 @@ from livekit.plugins import anthropic, sarvam, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 import persistence
-from observability import set_correlation_id, reset_correlation_id
+from observability import reset_correlation_id, set_correlation_id
+from persistence import LifecycleError
 from prompting import build_prompt_context, collect_prompt_metadata
-
-# ── LLM-06: Provenance import ──────────────────────────────────────────
 from provenance import screening_provenance
-from persistence import set_session_provenance, ClaimResult
 
 load_dotenv()
+
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 
 
 def _float_env(name: str, default: float) -> float:
@@ -51,9 +47,6 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
-
-
 class Gopu(Agent):
     def __init__(self, instructions: str) -> None:
         super().__init__(instructions=instructions)
@@ -70,23 +63,169 @@ def _item_text(item: Any) -> str:
     return "".join(chunks).strip()
 
 
+# ── Explicit close-reason mapping (SDK enum values only) ──────────────
+# None value → conversation_complete (normal completion with explicit signal)
+# str value → terminal_reason code (fail case)
+_CLOSE_REASON_TO_TERMINAL: dict[str | None, str | None] = {
+    None: None,
+    "completed": None,
+    "normal": None,
+    "shutdown": "shutdown_forced",
+    "cancelled": "shutdown_forced",
+    "timeout": "shutdown_forced",
+    "disconnected": "shutdown_forced",
+    "provider_error": "provider_error",
+    "stt_error": "provider_error",
+    "tts_error": "provider_error",
+    "llm_error": "provider_error",
+}
+
+# Mapping of SDK error type names to terminal_reason codes.
+_CLOSE_ERROR_NAME_TO_TERMINAL: dict[str, str | None] = {
+    "livekiterror": None,
+    "timeouterror": "shutdown_forced",
+    "cancellederror": "shutdown_forced",
+    "connectionerror": "shutdown_forced",
+}
+
+
+def _classify_close_event(event: Any) -> str | None:
+    """Classify a close event into terminal_reason or None (normal complete).
+
+    Uses an explicit mapping of SDK close-status values only.
+    Never inspects raw reason text.
+
+    Returns:
+      None → conversation_complete (requires explicit completion signal).
+      str  → terminal_reason code (fail/shutdown).
+
+    Unknown or missing close reason → worker_crash (fail closed).
+    A completed interview requires an explicit completion signal;
+    arbitrary participant disconnect without evidence is NOT completion.
+    """
+    error = getattr(event, "error", None)
+    if error is not None:
+        error_name = type(error).__name__.lower()
+        # Check key existence explicitly — None is a valid mapped value
+        # (meaning conversation_complete), distinct from "key not found".
+        if error_name in _CLOSE_ERROR_NAME_TO_TERMINAL:
+            return _CLOSE_ERROR_NAME_TO_TERMINAL[error_name]
+        return "worker_crash"
+
+    reason = getattr(event, "reason", None)
+    if reason is not None:
+        reason_str = str(getattr(reason, "name", reason)).lower()
+        if reason_str in _CLOSE_REASON_TO_TERMINAL:
+            return _CLOSE_REASON_TO_TERMINAL[reason_str]
+        return "worker_crash"
+
+    # No error and no explicit close reason → not a confirmed completion
+    return "worker_crash"
+
+
 async def entrypoint(ctx: JobContext) -> None:
     started_at = time.monotonic()
     await ctx.connect()
     meta = collect_prompt_metadata(ctx)
     session_id = meta.get("session_id") or meta.get("sessionId")
-    # OBS-02: initialise correlation context for this session. The room creator
-    # writes an opaque UUID v4 into metadata; invalid or absent values are
-    # replaced. The Token is restored in finally to prevent cross-job leakage.
-    _cid_token = set_correlation_id(meta.get("correlation_id"))
+    cid_token = set_correlation_id(meta.get("correlation_id"))
     try:
-        # LLM-06: claim provenance before constructing STT, TTS, LLM, or VAD.
-        provenance = screening_provenance(ANTHROPIC_MODEL)
-        claim = await set_session_provenance(session_id, provenance)
-        if claim not in {ClaimResult.CLAIMED, ClaimResult.ALREADY_MATCHING}:
-            raise RuntimeError(f"provenance claim failed: {claim}")
+        await _run_session(ctx, started_at, session_id)
+    finally:
+        reset_correlation_id(cid_token)
 
-        system_text, opening_text = build_prompt_context(ctx)
+
+async def _run_session(ctx: JobContext, started_at: float, session_id: Any) -> None:
+    # LLM-06: claim provenance before any provider construction. The same
+    # configured model is then supplied to Anthropic below.
+    claim = await persistence.set_session_provenance(
+        session_id,
+        screening_provenance(ANTHROPIC_MODEL),
+    )
+    if claim not in {
+        persistence.ClaimResult.CLAIMED,
+        persistence.ClaimResult.ALREADY_MATCHING,
+    }:
+        return
+
+    system_text, opening_text = build_prompt_context(ctx)
+
+    # REL-07: separate write-task set from the finalizer.
+    # ONLY transcript writes go here; complete_once is never added.
+    _write_tasks: set[asyncio.Task] = set()
+    _finalizer_task: asyncio.Task | None = None
+
+    def tracked_write(coro) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        _write_tasks.add(task)
+        task.add_done_callback(_write_tasks.discard)
+        return task
+
+    # REL-07: activate session — fail closed on ANY non-SUCCESS outcome.
+    activate_result = await persistence.activate_session(session_id)
+    if not activate_result.ok:
+        # CONFLICT, ERROR, DISABLED, or missing session_id — abort before
+        # any provider construction or session.start() call.
+        return
+    _activation_applied: bool = True
+
+    _cleanup_started = False
+    _close_event = asyncio.Event()
+
+    async def complete_once(failed_reason: str | None = None) -> None:
+        """Terminate the session exactly once.
+
+        Drains _write_tasks then marks the session terminal.
+        If terminal CAS returns ERROR/DISABLED, raises LifecycleError.
+        """
+        nonlocal _cleanup_started
+        if _cleanup_started:
+            return
+        _cleanup_started = True
+        duration = int(time.monotonic() - started_at)
+        activated = _activation_applied
+
+        drained = await persistence.drain_pending_writes(_write_tasks)
+        expected = "in_progress" if activated else "waiting"
+
+        if not drained:
+            result = await persistence.fail_session(
+                session_id, "shutdown_forced", expected_status=expected,
+            )
+            if not result.ok:
+                raise LifecycleError(f"terminal CAS failed after drain timeout: {result.kind}")
+            return
+
+        if failed_reason:
+            result = await persistence.fail_session(
+                session_id, failed_reason, expected_status=expected,
+            )
+            if not result.ok:
+                raise LifecycleError(f"terminal CAS failed for {failed_reason}: {result.kind}")
+            return
+
+        if activated:
+            result = await persistence.complete_session(
+                session_id, duration, terminal_reason="conversation_complete"
+            )
+            if not result.ok:
+                raise LifecycleError(f"terminal CAS failed for complete: {result.kind}")
+            await persistence.trigger_scoring(session_id)
+
+    # ── Provider lifecycle — wrapped in try/finally ────────────────
+    try:
+        turn_index = 0
+
+        def _next_turn_index() -> int:
+            nonlocal turn_index
+            idx = turn_index
+            turn_index += 1
+            return idx
+
+        async def record_turn(speaker: str, text: str) -> None:
+            if not text:
+                return
+            await persistence.save_turn(session_id, _next_turn_index(), speaker, text)
 
         session = AgentSession(
             stt=sarvam.STT(
@@ -114,29 +253,6 @@ async def entrypoint(ctx: JobContext) -> None:
             allow_interruptions=True,
         )
 
-        turn_index = 0
-        cleanup_started = False
-
-        async def record_turn(speaker: str, text: str) -> None:
-            nonlocal turn_index
-            if not text:
-                return
-            idx = turn_index
-            turn_index += 1
-            await persistence.save_turn(session_id, idx, speaker, text)
-
-        async def complete_once(failed_reason: str | None = None) -> None:
-            nonlocal cleanup_started
-            if cleanup_started:
-                return
-            cleanup_started = True
-            duration = int(time.monotonic() - started_at)
-            if failed_reason:
-                await persistence.fail_session(session_id, failed_reason)
-                return
-            await persistence.complete_session(session_id, duration)
-            await persistence.trigger_scoring(session_id)
-
         @session.on("conversation_item_added")
         def _on_conversation_item(event):  # noqa: ANN001
             item = getattr(event, "item", None)
@@ -147,14 +263,14 @@ async def entrypoint(ctx: JobContext) -> None:
                 return
             text = _item_text(item)
             speaker = "bot" if role == "assistant" else "candidate"
-            asyncio.create_task(record_turn(speaker, text))
+            tracked_write(record_turn(speaker, text))
 
         @session.on("close")
         def _on_close(event):  # noqa: ANN001
-            reason = str(getattr(event, "reason", "") or "")
-            error = getattr(event, "error", None)
-            failed = f"{reason}: {error}" if error else None
-            asyncio.create_task(complete_once(failed))
+            nonlocal _finalizer_task  # *** CRITICAL: outer scope assignment ***
+            failed_reason = _classify_close_event(event)
+            _finalizer_task = asyncio.create_task(complete_once(failed_reason))
+            _close_event.set()
 
         await session.start(
             agent=Gopu(system_text),
@@ -162,13 +278,21 @@ async def entrypoint(ctx: JobContext) -> None:
             record={"audio": True, "transcript": True, "traces": False, "logs": False},
         )
         await session.generate_reply(instructions=opening_text)
+
+        # Await session closure — keeps entrypoint alive until close fires
+        await _close_event.wait()
+
+    except Exception:
+        # Provider construction/start/generate failed before close event
+        await complete_once("worker_crash")
     finally:
-        # Token-based restore: reverts the ContextVar to its value *before*
-        # set_correlation_id was called above, so sequential jobs cannot
-        # inherit a stale correlation ID.  Created asyncio Tasks (callbacks)
-        # hold their own Context snapshot at creation time and are unaffected
-        # by this restore.
-        reset_correlation_id(_cid_token)
+        if _finalizer_task is not None and not _finalizer_task.done():
+            try:
+                await _finalizer_task
+            except LifecycleError:
+                raise
+            except Exception:  # noqa: BLE001
+                pass
 
 
 if __name__ == "__main__":
