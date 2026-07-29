@@ -19,7 +19,7 @@
 ### Assumptions
 
 1.  The user/org controls a billing account with Supabase, LiveKit Cloud, and Oracle Cloud Infrastructure (region TBD after Mumbai/Hyderabad benchmark).
-2.  A Supabase production project already exists unused in Mumbai (`ap-south-1`). Company-org transfer, second MFA admin, plan, PITR, billing-alert, and break-glass acceptance are pending.
+2.  A Supabase production project already exists unused in Mumbai (`ap-south-1`). Company-controlled organization ownership evidence and access configuration pending; second MFA admin, plan, PITR, billing-alert, and break-glass acceptance are pending.
 3.  Recruiter users will authenticate via Supabase Auth (direction selected; auth modes, MFA enforcement, lifecycle, and DPA evidence pending formal owner approval) — not phone-only.
 4.  Candidate join flow remains browser-based; candidates do not authenticate (token-gated join).
 5.  Browser-first production launch occurs before any telephony integration.

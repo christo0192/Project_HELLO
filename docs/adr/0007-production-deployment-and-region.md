@@ -3,12 +3,13 @@
 **Status:** Proposed
 
 **Direction confirmed (2026-07-28):** OCI selected as cloud provider. Mumbai
-(`ap-mumbai-1`) and Hyderabad (`ap-hyderabad-1`) must be benchmarked (DEP-01)
-before region selection; measured latency and contractual/legal evidence
-required. Production Supabase is Mumbai `ap-south-1`. Target 5 concurrent
-sessions, validate to 10. Formal owner approval and evidence pending. This is
-a selected direction, not stakeholder sign-off, and does not constitute FND-08
-acceptance.
+(`ap-mumbai-1`) and Hyderabad (`ap-hyderabad-1`) require preliminary
+region-discovery evidence (owner-approved synthetic probe with teardown) before
+region selection; formal DEP-01 capacity acceptance depends on
+TST-09/REL-01/OBS-03. Production Supabase is Mumbai `ap-south-1`. Target 5
+concurrent sessions, validate to 10. Formal owner approval and evidence pending.
+This is a selected direction, not stakeholder sign-off, and does not constitute
+FND-08 acceptance.
 
 **Decision owner:** Engineering Lead, Security Lead, and Legal Counsel (unassigned)
 

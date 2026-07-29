@@ -19,18 +19,19 @@ stakeholder sign-off, and does not constitute FND-08 acceptance.
 
 Multi-tenant SaaS is a launch non-goal, but the production schema and RLS design
 depend on whether launch is explicitly single-organization or must preserve
-future organization isolation through `org_id`. The current schema has neither
-authenticated ownership nor tenant isolation.
+future organization isolation through `org_id`. The original prototype had
+neither authenticated ownership nor tenant isolation. The merged membership-gated
+RLS baseline (PR #9) gates limited read-only dashboard access by active recruiter
+membership, but full application Auth, API RBAC, and hosted role authorization
+remain pending (SEC-01 through SEC-04, MIG-05, MIG-06).
 
 ## Decision
 
-Recommend a documented single-organization launch unless Product approves a
-concrete multi-tenant requirement before schema hardening. A single-org decision
-still requires authenticated roles, least-privilege API authorization, RLS, and
-tests proving anonymous and unauthorized access fail. If multi-tenancy is
-approved, add immutable organization ownership to every scoped row and enforce
-it in API queries, RLS, Realtime, storage paths, jobs, and audit events before
-production data migration.
+Proceed with the single-organization launch technical direction. No multi-tenant
+`org_id` isolation is required for launch; this does not permanently ban future
+multi-tenancy. Formal acceptance still requires signed owner approval, a
+complete authorization matrix, representative RLS/Realtime/storage tests,
+migration impact assessment, and a named organization administration process.
 
 ## Consequences
 
