@@ -11,5 +11,5 @@ tenancy_ocid              = "ocid1.tenancy.oc1..__CHANGE_ME__"
 project_name              = "hr-screening"
 cost_center               = "engineering"
 alert_email               = "__CHANGE_ME__"
-monthly_budget_amount      = 500
+monthly_budget_amount      = 100   # conservative for OCI free-tier; owner must approve
 production_apply_enabled   = false   # set to true after remote state is configured

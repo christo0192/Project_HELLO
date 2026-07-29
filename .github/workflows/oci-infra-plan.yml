@@ -6,7 +6,8 @@ name: OCI Infra Plan (Manual)
 #
 # Required GitHub environment secrets (per environment: oci-staging, oci-production):
 #   OCI_TENANCY_OCID, OCI_USER_OCID, OCI_FINGERPRINT, OCI_PRIVATE_KEY
-# Alert email is also required via environment secret, NOT a plaintext dispatch input.
+#   ALERT_EMAIL           — budget/alarm notification recipient
+#   MONTHLY_BUDGET_AMOUNT — monthly budget in USD (owner-approved before provisioning)
 
 on:
   workflow_dispatch:
@@ -44,6 +45,7 @@ jobs:
           TF_VAR_region: ${{ inputs.region }}
           TF_VAR_tenancy_ocid: ${{ secrets.OCI_TENANCY_OCID }}
           TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+          TF_VAR_monthly_budget_amount: ${{ secrets.MONTHLY_BUDGET_AMOUNT }}
           OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
           OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
           OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
@@ -56,15 +58,18 @@ jobs:
           TF_VAR_region: ${{ inputs.region }}
           TF_VAR_tenancy_ocid: ${{ secrets.OCI_TENANCY_OCID }}
           TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+          TF_VAR_monthly_budget_amount: ${{ secrets.MONTHLY_BUDGET_AMOUNT }}
           OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
           OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
           OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
           OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
         run: |
+          set +e
           terraform plan \
             -var="region=${{ inputs.region }}" \
             -detailed-exitcode
           EXIT_CODE=$?
+          set -e
           if [ "$EXIT_CODE" -eq 2 ]; then
             echo "Plan shows changes — manual review required."
           elif [ "$EXIT_CODE" -eq 1 ]; then

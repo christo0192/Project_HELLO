@@ -39,8 +39,13 @@ variable "tenancy_ocid" {
 }
 
 variable "project_name" {
-  type    = string
-  default = "hr-screening"
+  description = "Project name (lowercase letter start, then lowercase alnum/hyphens, 1-30 chars). Used as prefix for OCI resources and tag namespaces."
+  type        = string
+  default     = "hr-screening"
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9-]{0,29}$", var.project_name))
+    error_message = "project_name must start with lowercase letter, contain only lowercase alphanumeric/hyphens, and be 1-30 chars."
+  }
 }
 
 variable "cost_center" {
@@ -65,8 +70,12 @@ variable "vcn_dns_label" {
 }
 
 variable "monthly_budget_amount" {
-  description = "Monthly budget for staging in USD (required — set deliberately)"
+  description = "Monthly budget for staging in USD (required — owner must approve before provisioning). Conservative starting value: $25 for OCI free-tier services."
   type        = number
+  validation {
+    condition     = var.monthly_budget_amount > 0
+    error_message = "monthly_budget_amount must be greater than 0."
+  }
 }
 
 # --- modules ---
@@ -74,13 +83,13 @@ variable "monthly_budget_amount" {
 module "foundation" {
   source = "../../modules/foundation"
 
-  region               = var.region
-  tenancy_ocid         = var.tenancy_ocid
-  environment          = "staging"
-  project_name         = var.project_name
-  cost_center          = var.cost_center
-  budget_alert_email   = var.alert_email
-  vcn_dns_label        = var.vcn_dns_label
+  region                = var.region
+  tenancy_ocid          = var.tenancy_ocid
+  environment           = "staging"
+  project_name          = var.project_name
+  cost_center           = var.cost_center
+  budget_alert_email    = var.alert_email
+  vcn_dns_label         = var.vcn_dns_label
   monthly_budget_amount = var.monthly_budget_amount
 
   # Staging: single AD, smaller CIDRs

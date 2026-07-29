@@ -5,4 +5,4 @@ region               = "placeholder-region"
 tenancy_ocid         = "ocid1.tenancy.oc1..__CHANGE_ME__"
 project_name         = "hr-screening"
 alert_email          = "__CHANGE_ME__"
-monthly_budget_amount = 200
+monthly_budget_amount = 25   # conservative for OCI free-tier; owner must approve

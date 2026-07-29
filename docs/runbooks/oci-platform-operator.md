@@ -1,6 +1,7 @@
 # OCI Platform Operator Runbook
 
 **Last updated:** 2026-07-28 (r3: self-contained roots, IAM tags, logging, remote state)
+**Updated:** 2026-07-29 (r4: terraform_data production gate, underscore tags, budget validations, project-name constraints)
 **Scope:** OCI managed-services foundation (staging + production)
 **Terraform root:** `infra/oracle/examples/{staging,production}`
 
@@ -12,8 +13,9 @@
 requires explicit manual approval, change-control authorization, and the
 production operator role.
 
-**Production apply is BLOCKED** until encrypted remote state (OCI Object Storage
-+ SSE) is configured. See State Isolation below.
+**Production plan AND apply are both BLOCKED** until `production_apply_enabled = true`
+is explicitly set after encrypted remote state (OCI Object Storage + SSE)
+is configured. See State Isolation below.
 
 ---
 
@@ -35,14 +37,14 @@ Every compute instance MUST carry a workload-role defined tag or IAM will grant
 no queue/vault/metrics rights (fail-closed):
 
 ```hcl
-# For API/web instances:
+# For API/web instances (tag key uses underscore, not hyphen):
 defined_tags = {
-  "hr-screening-staging-tags.workload-role" = "api"
+  "hr_screening_staging_tags.workload_role" = "api"
 }
 
 # For worker/queue-consumer instances:
 defined_tags = {
-  "hr-screening-staging-tags.workload-role" = "worker"
+  "hr_screening_staging_tags.workload_role" = "worker"
 }
 ```
 
@@ -57,7 +59,9 @@ Untagged instances have zero rights.
 Local state is acceptable. Init uses `backend "local"` with no special config.
 
 ### Production (BLOCKED)
-Production apply is blocked by a throw-if backend guard. To unblock:
+
+Production plan AND apply are both blocked by a `terraform_data` precondition.
+To unblock:
 
 1. Create an OCI Object Storage bucket with SSE enabled.
 2. Replace the local backend in `examples/production/main.tf` with:
@@ -75,7 +79,8 @@ Production apply is blocked by a throw-if backend guard. To unblock:
    }
    ```
 3. Run `terraform init` against the remote backend.
-4. Never use local state for production — it can contain APM data keys.
+4. Set `production_apply_enabled = true` in `terraform.tfvars`.
+5. Never use local state for production — it can contain APM data keys.
 
 ---
 
@@ -100,7 +105,7 @@ OCI Logging agent are deployed:
 |-------|-----------|--------|-----------|----------|--------|
 | Queue depth | `oci_queue` | `MessagesInQueueCount` (isVisible="true") | > 100 visible | CRITICAL | Check consumers, scale workers |
 | Consumer lag | `oci_queue` | `ConsumerLag` | > 5 min | WARNING | Check consumer processing latency |
-| Log ingestion | `oci_logging` | `BytesIngested` | > 1 MB/min | WARNING | Check for log floods |
+| Log ingestion | `oci_logging` | `BytesIngested` | ~1 MiB/min (17476 bytes/s rate) | WARNING | Check for log floods |
 | Budget | `oci_budget_alert_rule` | actual spend | > threshold % | WARNING | Review spend |
 
 **DLQ note:** OCI Queue uses a service-managed internal dead-letter sub-queue.

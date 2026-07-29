@@ -26,9 +26,13 @@ variable "environment" {
 }
 
 variable "project_name" {
-  description = "Project name prefix"
+  description = "Project name prefix (lowercase letter start, then lowercase alnum/hyphens, 1-30 chars)"
   type        = string
   default     = "hr-screening"
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9-]{0,29}$", var.project_name))
+    error_message = "project_name must start with lowercase letter, contain only lowercase alphanumeric/hyphens, and be 1-30 chars."
+  }
 }
 
 variable "notification_email" {
