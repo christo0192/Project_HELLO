@@ -3,30 +3,29 @@
 # No static user credentials or API keys are provisioned.
 #
 # Fail-closed matching: the api_tier and worker_tier dynamic groups use distinct
-# defined-tag matching rules. Every compute instance MUST be tagged with
-# workload-role = "api" or workload-role = "worker" at launch time.
-# An untagged instance matches NEITHER group and has no rights.
+# defined-tag matching rules per the official OCI grammar:
+#   All {condition1, condition2, ...}
+# The tag namespace and key use underscore-safe names for parser compatibility.
+#
+# Every compute instance MUST be tagged with workload_role = "api" or "worker":
+#   defined_tags = { "${local.project_name_safe}_${var.environment}_tags.workload_role" = "api" }
 
-# Defined tag: workload-role (fail-closed)
-# Assumes a tag namespace unique to this environment (see tags_budgets.tf).
-# The workload-role tag MUST be set on every compute instance at launch:
-#   defined_tags = { "${var.project_name}-${var.environment}-tags.workload-role" = "api"  }
-#   defined_tags = { "${var.project_name}-${var.environment}-tags.workload-role" = "worker" }
-
-# Dynamic group for the API/web tier — matches only instances tagged workload-role=api
+# Dynamic group for the API/web tier
 resource "oci_identity_dynamic_group" "api_tier" {
   compartment_id = var.tenancy_ocid
   name           = "${var.project_name}-${var.environment}-api-dg"
-  description    = "Dynamic group for ${var.environment} API/web compute instances (tag: workload-role=api)"
-  matching_rule  = "ALL {instance.compartment.id = '${oci_identity_compartment.this.id}'} AND ALL {instance.tags.namespace = '${var.project_name}-${var.environment}-tags', instance.tags.key = 'workload-role', instance.tags.value = 'api'}"
+  description    = "Dynamic group for ${var.environment} API/web compute instances (tag: workload_role=api)"
+
+  matching_rule = "All {instance.compartment.id = '${oci_identity_compartment.this.id}', tag.${oci_identity_tag_namespace.this.name}.${oci_identity_tag.workload_role.name}.value = 'api'}"
 }
 
-# Dynamic group for the worker tier — matches only instances tagged workload-role=worker
+# Dynamic group for the worker tier
 resource "oci_identity_dynamic_group" "worker_tier" {
   compartment_id = var.tenancy_ocid
   name           = "${var.project_name}-${var.environment}-worker-dg"
-  description    = "Dynamic group for ${var.environment} worker/queue-consumer instances (tag: workload-role=worker)"
-  matching_rule  = "ALL {instance.compartment.id = '${oci_identity_compartment.this.id}'} AND ALL {instance.tags.namespace = '${var.project_name}-${var.environment}-tags', instance.tags.key = 'workload-role', instance.tags.value = 'worker'}"
+  description    = "Dynamic group for ${var.environment} worker/queue-consumer instances (tag: workload_role=worker)"
+
+  matching_rule = "All {instance.compartment.id = '${oci_identity_compartment.this.id}', tag.${oci_identity_tag_namespace.this.name}.${oci_identity_tag.workload_role.name}.value = 'worker'}"
 }
 
 # Policy: API tier — least privilege
@@ -68,26 +67,26 @@ resource "oci_identity_policy" "worker_tier" {
 }
 
 output "api_dynamic_group_name" {
-  description = "API tier dynamic group name — reference in compute provisioning"
+  description = "API tier dynamic group name"
   value       = oci_identity_dynamic_group.api_tier.name
 }
 
 output "worker_dynamic_group_name" {
-  description = "Worker tier dynamic group name — reference in compute provisioning"
+  description = "Worker tier dynamic group name"
   value       = oci_identity_dynamic_group.worker_tier.name
 }
 
-output "required_compute_tag_key" {
-  description = "workload-role defined-tag key that every compute instance MUST set in defined_tags"
-  value       = "workload-role"
+output "tag_namespace_name" {
+  description = "Tag namespace name for defined_tags on compute instances"
+  value       = oci_identity_tag_namespace.this.name
 }
 
-output "required_compute_tag_namespace" {
-  description = "Tag namespace that every compute instance MUST reference in defined_tags"
-  value       = "${var.project_name}-${var.environment}-tags"
+output "workload_role_tag_key" {
+  description = "workload_role defined-tag key — MUST be set on every compute instance"
+  value       = oci_identity_tag.workload_role.name
 }
 
-output "required_compute_tag_values" {
-  description = "Valid workload-role values: api or worker"
-  value       = "api | worker"
+output "required_compute_tag" {
+  description = "Example defined_tags entry for compute instances"
+  value       = "${oci_identity_tag_namespace.this.name}.${oci_identity_tag.workload_role.name} = api | worker"
 }

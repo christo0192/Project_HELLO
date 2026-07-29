@@ -1,13 +1,12 @@
 name: OCI Infra Plan (Manual)
 
-# Plan-only workflow. Requires OCI credentials (stored as GitHub secrets).
-# Apply is EXPLICITLY impossible in this workflow.
+# Plan-only workflow. Requires OCI credentials (stored as GitHub environment secrets).
+# Apply is EXPLICITLY impossible in this workflow — there is NO terraform-apply job.
 # Only runs on manual workflow_dispatch — never automatic.
 #
-# DISABLED status: this workflow is defined but will fail until OCI auth secrets
-# and a valid alert_email are configured. Unblock by setting GitHub environment
-# secrets: OCI_TENANCY_OCID, OCI_USER_OCID, OCI_FINGERPRINT, OCI_PRIVATE_KEY,
-# OCI_REGION, and providing a real alert_email at dispatch time.
+# Required GitHub environment secrets (per environment: oci-staging, oci-production):
+#   OCI_TENANCY_OCID, OCI_USER_OCID, OCI_FINGERPRINT, OCI_PRIVATE_KEY
+# Alert email is also required via environment secret, NOT a plaintext dispatch input.
 
 on:
   workflow_dispatch:
@@ -24,11 +23,6 @@ on:
         required: true
         type: string
         default: 'placeholder-region'
-      alert_email:
-        description: 'Alert notification email (required — replaces __CHANGE_ME__)'
-        required: true
-        type: string
-        default: '__CHANGE_ME__'
 
 jobs:
   terraform-plan:
@@ -49,7 +43,11 @@ jobs:
         env:
           TF_VAR_region: ${{ inputs.region }}
           TF_VAR_tenancy_ocid: ${{ secrets.OCI_TENANCY_OCID }}
-          TF_VAR_alert_email: ${{ inputs.alert_email }}
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
         run: terraform init
 
       - name: Terraform Plan
@@ -57,14 +55,16 @@ jobs:
         env:
           TF_VAR_region: ${{ inputs.region }}
           TF_VAR_tenancy_ocid: ${{ secrets.OCI_TENANCY_OCID }}
-          TF_VAR_alert_email: ${{ inputs.alert_email }}
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
         run: |
           terraform plan \
             -var="region=${{ inputs.region }}" \
-            -var="alert_email=${{ inputs.alert_email }}" \
-            -detailed-exitcode \
-            | tee plan-output.txt
-          EXIT_CODE=${PIPESTATUS[0]}
+            -detailed-exitcode
+          EXIT_CODE=$?
           if [ "$EXIT_CODE" -eq 2 ]; then
             echo "Plan shows changes — manual review required."
           elif [ "$EXIT_CODE" -eq 1 ]; then
@@ -74,15 +74,9 @@ jobs:
             echo "No changes detected."
           fi
 
-      - name: Upload Plan Output (text only — NO binary plan)
-        uses: actions/upload-artifact@v4
-        with:
-          name: plan-output-${{ inputs.environment }}
-          path: infra/oracle/examples/${{ inputs.environment }}/plan-output.txt
-
-  # Note: There is NO terraform-apply job in this workflow.
-  # Binary plan files (tfplan) are NEVER uploaded as artifacts — they can
-  # contain sensitive state metadata.
-  # Apply is performed only through a separate, access-controlled runbook
-  # with manual approval and change-control authorization.
-  # See docs/runbooks/oci-platform-operator.md
+  # NOTE: No plan-output.txt artifact is uploaded. The plan output is visible
+  # in the job log. No binary tfplan file is ever created or uploaded.
+  #
+  # There is NO terraform-apply job in this workflow. Apply is performed only
+  # through a separate, access-controlled runbook with manual approval and
+  # change-control authorization. See docs/runbooks/oci-platform-operator.md

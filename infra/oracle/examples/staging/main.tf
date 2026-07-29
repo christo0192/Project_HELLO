@@ -16,7 +16,7 @@ terraform {
   }
 
   # Local state acceptable for staging.
-  # Production MUST use remote encrypted state — see production root for details.
+  # Production MUST use remote encrypted state — see production root.
   backend "local" {}
 }
 
@@ -58,6 +58,15 @@ variable "vcn_dns_label" {
   description = "VCN DNS label (max 15 alphanumeric, no hyphen at start/end)"
   type        = string
   default     = "hstaging"
+  validation {
+    condition     = can(regex("^[a-zA-Z][a-zA-Z0-9]{0,14}$", var.vcn_dns_label))
+    error_message = "vcn_dns_label must be 1-15 chars, start with letter, alphanumeric only."
+  }
+}
+
+variable "monthly_budget_amount" {
+  description = "Monthly budget for staging in USD (required — set deliberately)"
+  type        = number
 }
 
 # --- modules ---
@@ -65,13 +74,14 @@ variable "vcn_dns_label" {
 module "foundation" {
   source = "../../modules/foundation"
 
-  region             = var.region
-  tenancy_ocid       = var.tenancy_ocid
-  environment        = "staging"
-  project_name       = var.project_name
-  cost_center        = var.cost_center
-  budget_alert_email = var.alert_email
-  vcn_dns_label      = var.vcn_dns_label
+  region               = var.region
+  tenancy_ocid         = var.tenancy_ocid
+  environment          = "staging"
+  project_name         = var.project_name
+  cost_center          = var.cost_center
+  budget_alert_email   = var.alert_email
+  vcn_dns_label        = var.vcn_dns_label
+  monthly_budget_amount = var.monthly_budget_amount
 
   # Staging: single AD, smaller CIDRs
   vcn_cidr            = "10.1.0.0/16"

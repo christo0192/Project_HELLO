@@ -1,11 +1,21 @@
 # Tags and budgets for cost governance.
 # Tag namespace is UNIQUE per environment (staging and production never collide).
+# Names use underscores (not hyphens) for OCI dynamic-group grammar compatibility.
+#
+# ONS email subscription requires manual confirmation — the recipient MUST click
+# the confirmation link in the OCI Notifications email before alarms will deliver.
+# Budgets alert only; they do NOT cap or block spend.
+
+locals {
+  # Derive parser-safe names (underscores) from project_name (may contain hyphens)
+  project_name_safe = replace(var.project_name, "-", "_")
+}
 
 # Tag namespace — one per environment, applied at tenancy level.
 resource "oci_identity_tag_namespace" "this" {
   compartment_id = var.tenancy_ocid
-  name           = "${var.project_name}-${var.environment}-tags"
-  description    = "Tag namespace for ${var.project_name} ${var.environment} (environment-scoped)"
+  name           = "${local.project_name_safe}_${var.environment}_tags"
+  description    = "Tag namespace for ${var.project_name} ${var.environment} (environment-scoped, underscore-safe)"
 }
 
 # Environment tag definition (informational)
@@ -16,10 +26,11 @@ resource "oci_identity_tag" "environment" {
   is_cost_tracking = true
 }
 
-# Workload-role tag — fail-closed IAM gating (see iam.tf)
+# Workload-role tag — fail-closed IAM gating (see iam.tf).
+# MUST use underscore-safe key name for dynamic-group compatibility.
 resource "oci_identity_tag" "workload_role" {
   tag_namespace_id = oci_identity_tag_namespace.this.id
-  name             = "workload-role"
+  name             = "workload_role"
   description      = "Compute workload role: api or worker. MUST be set on every instance for IAM to grant rights."
 
   validator {
@@ -30,7 +41,9 @@ resource "oci_identity_tag" "workload_role" {
   is_cost_tracking = false
 }
 
-# Monthly budget with alert rule
+# Monthly budget with alert rule.
+# Budgets ALERT only — they do not cap or block spending in OCI.
+# Amount should be deliberately set per environment, not hidden at default.
 resource "oci_budget_budget" "this" {
   compartment_id = var.tenancy_ocid
   target_type    = "COMPARTMENT"
@@ -39,7 +52,7 @@ resource "oci_budget_budget" "this" {
   reset_period   = "MONTHLY"
   display_name   = "${var.project_name}-${var.environment}-budget"
 
-  description = "Monthly budget for ${var.environment} compartment"
+  description = "Monthly budget for ${var.environment} compartment (alerts only, does not cap spend)"
 
   freeform_tags = {
     environment = var.environment
@@ -48,21 +61,21 @@ resource "oci_budget_budget" "this" {
   }
 }
 
-# Budget alert rule — percentage-based threshold
+# Budget alert rule — percentage-based threshold.
+# ONS email subscription must be manually confirmed by the recipient.
 resource "oci_budget_alert_rule" "this" {
   budget_id      = oci_budget_budget.this.id
   type           = "ACTUAL"
   threshold      = var.budget_alert_threshold
   threshold_type = "PERCENTAGE"
   display_name   = "${var.project_name}-${var.environment}-budget-alert-${var.budget_alert_threshold}pct"
-  message        = "Budget alert: ${var.project_name} ${var.environment} has reached ${var.budget_alert_threshold}% of monthly budget"
+  message        = "Budget alert: ${var.project_name} ${var.environment} has reached ${var.budget_alert_threshold}% of monthly budget.  Budgets alert only — spend is NOT capped."
   recipients     = var.budget_alert_email
 }
 
 variable "monthly_budget_amount" {
-  description = "Monthly budget amount in USD"
+  description = "Monthly budget amount in USD (required — no default; set deliberately per environment)"
   type        = number
-  default     = 500
 }
 
 variable "budget_alert_threshold" {

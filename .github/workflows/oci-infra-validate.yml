@@ -89,6 +89,22 @@ jobs:
           done
           echo "No banned policy verbs found."
 
+      - name: Ban invalid dynamic-group grammar
+        run: |
+          # Reject invalid DG grammar patterns that would silently fail at apply time.
+          BANNED_DG_PATTERNS=(
+            "instance.tags."    # not valid OCI dynamic-group grammar; use tag.<ns>.<key>.value
+            "} AND ALL {"      # must be All {cond1, cond2} not ALL {..} AND ALL {..}
+          )
+          for pattern in "${BANNED_DG_PATTERNS[@]}"; do
+            if grep -rn --include='*.tf' --include='*.md' "$pattern" infra/oracle/ | grep -v 'Banned invented' | grep -v 'not valid OCI' | grep -v 'must be All'; then
+              echo "FAIL: Invalid dynamic-group grammar pattern '$pattern' found."
+              echo "Use official OCI grammar: All {instance.compartment.id = '...', tag.<ns>.<key>.value = 'api'}"
+              exit 1
+            fi
+          done
+          echo "No invalid dynamic-group grammar patterns found."
+
       - name: Ban identical dynamic-group matching rules
         run: |
           # The api_tier and worker_tier DGs must have distinct matching rules.

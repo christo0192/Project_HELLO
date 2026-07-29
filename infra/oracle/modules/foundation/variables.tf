@@ -65,4 +65,8 @@ variable "vcn_dns_label" {
   description = "VCN DNS label (max 15 chars, alphanumeric, must start with letter)"
   type        = string
   default     = "hrplatform"
+  validation {
+    condition     = can(regex("^[a-zA-Z][a-zA-Z0-9]{0,14}$", var.vcn_dns_label))
+    error_message = "vcn_dns_label must be 1-15 chars, start with letter, alphanumeric only."
+  }
 }

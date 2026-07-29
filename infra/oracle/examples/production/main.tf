@@ -4,11 +4,15 @@
 #   cp terraform.tfvars.example terraform.tfvars   # edit with real OCIDs
 #   terraform init
 #   terraform plan   # always plan-only; apply needs change control
-
-# BLOCKED: Production apply is unavailable until encrypted remote state is configured.
-# Local state can contain APM data keys and must never hold production metadata.
-# To unblock: replace the throw-if backend below with a real remote backend
-# (OCI Object Storage + SSE) and set BLOCK_PRODUCTION_APPLY=false.
+#
+# ===========================================================================
+# BLOCKED: Production plan & apply both FAIL until:
+#   1. Remote encrypted state is configured (OCI Object Storage + SSE).
+#      Replace the backend block below with a real S3-compat remote backend.
+#   2. production_apply_enabled is explicitly set to true in terraform.tfvars.
+#
+# See comments on backend and production_apply_enabled below.
+# ===========================================================================
 
 terraform {
   required_version = ">= 1.5, < 2.0"
@@ -20,8 +24,7 @@ terraform {
     }
   }
 
-  # THROW: remove this block and configure a real encrypted remote backend
-  # before applying in production. Example remote backend for production:
+  # REMOTE STATE REQUIRED for production.  Replace this local backend with:
   #
   # backend "s3" {
   #   bucket                      = "<prod-state-bucket>"
@@ -35,10 +38,7 @@ terraform {
   #   encrypt                     = true
   # }
 
-  backend "local" {
-    # Intentional: init will fail until BLOCK_PRODUCTION_APPLY is explicitly
-    # set to false (this block is a guard, not a working backend).
-  }
+  backend "local" {}
 }
 
 provider "oci" {
@@ -78,6 +78,55 @@ variable "vcn_dns_label" {
   description = "VCN DNS label (max 15 alphanumeric, no hyphen at start/end)"
   type        = string
   default     = "hproduction"
+  validation {
+    condition     = can(regex("^[a-zA-Z][a-zA-Z0-9]{0,14}$", var.vcn_dns_label))
+    error_message = "vcn_dns_label must be 1-15 chars, start with letter, alphanumeric only."
+  }
+}
+
+variable "monthly_budget_amount" {
+  description = "Monthly budget for production in USD (required — set deliberately)"
+  type        = number
+}
+
+# ===========================================================================
+# PRODUCTION APPLY GATE
+# 
+# This terraform_data resource BLOCKS both plan and apply until the operator
+# explicitly sets production_apply_enabled = true in terraform.tfvars.
+#
+# To unblock production:
+#   1. Replace backend "local" with a real encrypted remote backend (see above).
+#   2. Run: terraform init  (to migrate state to remote backend).
+#   3. Set production_apply_enabled = true in terraform.tfvars.
+#   4. Re-run terraform plan.
+# ===========================================================================
+
+variable "production_apply_enabled" {
+  description = "EXPLICITLY set to true after configuring remote encrypted state. Plan and apply will fail until this is true."
+  type        = bool
+  default     = false
+}
+
+resource "terraform_data" "production_apply_gate" {
+  lifecycle {
+    precondition {
+      condition     = var.production_apply_enabled == true
+      error_message = <<-EOT
+PRODUCTION APPLY BLOCKED.
+
+To unblock:
+1. Replace backend "local" in this file with a real encrypted remote backend
+   (OCI Object Storage + SSE).  See the commented example above.
+2. Run:  terraform init   (to migrate state to the remote backend).
+3. Set production_apply_enabled = true in terraform.tfvars.
+4. Re-run terraform plan.
+
+Local state must never hold production metadata (APM data keys, queue URLs,
+compartment OCIDs).  See docs/runbooks/oci-platform-operator.md for details.
+EOT
+    }
+  }
 }
 
 # --- modules ---
@@ -85,13 +134,14 @@ variable "vcn_dns_label" {
 module "foundation" {
   source = "../../modules/foundation"
 
-  region             = var.region
-  tenancy_ocid       = var.tenancy_ocid
-  environment        = "production"
-  project_name       = var.project_name
-  cost_center        = var.cost_center
-  budget_alert_email = var.alert_email
-  vcn_dns_label      = var.vcn_dns_label
+  region               = var.region
+  tenancy_ocid         = var.tenancy_ocid
+  environment          = "production"
+  project_name         = var.project_name
+  cost_center          = var.cost_center
+  budget_alert_email   = var.alert_email
+  vcn_dns_label        = var.vcn_dns_label
+  monthly_budget_amount = var.monthly_budget_amount
 
   # Production: larger CIDRs, NAT gateway
   vcn_cidr            = "10.0.0.0/16"
