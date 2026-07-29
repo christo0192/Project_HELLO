@@ -1,0 +1,18 @@
+# Terraform local state — NEVER commit
+*.tfstate
+*.tfstate.*
+
+# Provider caches — NEVER commit (use committed lockfiles only)
+.terraform/
+
+# Variable files with real values — NEVER commit
+terraform.tfvars
+*.auto.tfvars
+
+# Crash logs
+crash.log
+crash.*.log
+
+# Plan files — NEVER commit (may contain sensitive state data)
+*.tfplan
+plan-output.txt

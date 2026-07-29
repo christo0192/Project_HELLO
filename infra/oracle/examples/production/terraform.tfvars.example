@@ -1,0 +1,15 @@
+# Production terraform.tfvars template — copy to terraform.tfvars and fill in real values
+# WARNING: terraform.tfvars is gitignored. Never commit real OCIDs or credentials.
+#
+# PRODUCTION PLAN/APPLY IS BLOCKED. To unblock:
+#   1. Replace backend "local" with protected encrypted remote state.
+#   2. Run terraform init to migrate state and verify the backend.
+#   3. Set remote_state_configured = true below.
+
+region                    = "placeholder-region"
+tenancy_ocid              = "ocid1.tenancy.oc1..__CHANGE_ME__"
+project_name              = "hr-screening"
+cost_center               = "engineering"
+alert_email               = "__CHANGE_ME__"
+monthly_budget_amount  = 100   # conservative starting value; owner must approve
+remote_state_configured = false # set true only after protected remote-state migration

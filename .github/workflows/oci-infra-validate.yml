@@ -1,0 +1,206 @@
+name: OCI Infra Validate
+
+# Non-mutating CI: format, validate, security, static assertions for OCI Terraform.
+# No OCI credentials required. Apply is impossible in this workflow.
+# Runs on every PR that touches infra/oracle/**, plus manual dispatch.
+
+on:
+  pull_request:
+    paths:
+      - 'infra/oracle/**'
+      - '.github/workflows/oci-infra-*.yml'
+  workflow_dispatch:
+
+jobs:
+  terraform-validate:
+    name: Terraform Format & Validate
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        example: [staging, production]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5"
+
+      - name: Terraform Format Check
+        working-directory: infra/oracle/examples/${{ matrix.example }}
+        run: terraform fmt -check -recursive -diff
+
+      - name: Terraform Init (deployable root)
+        working-directory: infra/oracle/examples/${{ matrix.example }}
+        # Init with pinned provider — validates lockfile + required_providers
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        working-directory: infra/oracle/examples/${{ matrix.example }}
+        run: terraform validate
+
+      - name: Terraform Validate (library modules)
+        working-directory: infra/oracle
+        run: |
+          for mod in modules/foundation modules/queue modules/observability; do
+            echo "=== Validating $mod ==="
+            terraform -chdir="$mod" init -backend=false
+            terraform -chdir="$mod" validate
+          done
+
+  static-assertions:
+    name: Static Assertions (invented metrics, policies, DG rules)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ban invented OCI metrics
+        run: |
+          BANNED_METRICS=(
+            "IngestionDatapoints"   # not in oci_metrics namespace
+            "LogIngestionBytes"      # not in oci_logging namespace
+            "QueueDepth"             # not in oci_queue namespace
+            "QueueOldestMessageAge"  # not in oci_queue namespace
+            "QueueRequestCount"      # not in oci_queue namespace
+          )
+          for metric in "${BANNED_METRICS[@]}"; do
+            if grep -rn --include='*.tf' --include='*.md' "$metric" infra/oracle/ | grep -v '# Removed:' | grep -v 'Banned invented' | grep -v 'not a documented' | grep -v 'not LogIngestionBytes' | grep -v 'not in oci_' | grep -v 'replaced with' | grep -v '→ replaced' | grep -v '→ use'; then
+              echo "FAIL: Invented/banned metric string '$metric' found in committed files."
+              echo "Only documented OCI metrics (MessagesInQueueCount, ConsumerLag, BytesIngested) are permitted."
+              exit 1
+            fi
+          done
+          echo "No banned metric strings found."
+
+      - name: Ban invented IAM policy verbs
+        run: |
+          BANNED_VERBS=(
+            "QUEUE_PUSH_MESSAGES"
+            "QUEUE_CONSUME_MESSAGES"
+            "QUEUE_DELETE_MESSAGES"
+            "METRIC_PUSH"
+          )
+          for verb in "${BANNED_VERBS[@]}"; do
+            if grep -rn --include='*.tf' --include='*.md' "$verb" infra/oracle/ | grep -v 'Banned invented' | grep -v 'Remove invented' | grep -v '→ use'; then
+              echo "FAIL: Invented/banned policy verb '$verb' found."
+              echo "Use official OCI verbs: 'use queue-push', 'use queue-pull', 'use metrics'."
+              exit 1
+            fi
+          done
+          echo "No banned policy verbs found."
+
+      - name: Ban invalid dynamic-group grammar
+        run: |
+          # Reject invalid DG grammar patterns that would silently fail at apply time.
+          BANNED_DG_PATTERNS=(
+            "instance.tags."    # not valid OCI dynamic-group grammar; use tag.<ns>.<key>.value
+            "} AND ALL {"      # must be All {cond1, cond2} not ALL {..} AND ALL {..}
+          )
+          for pattern in "${BANNED_DG_PATTERNS[@]}"; do
+            if grep -rn --include='*.tf' --include='*.md' "$pattern" infra/oracle/ | grep -v 'Banned invented' | grep -v 'not valid OCI' | grep -v 'must be All'; then
+              echo "FAIL: Invalid dynamic-group grammar pattern '$pattern' found."
+              echo "Use official OCI grammar: All {instance.compartment.id = '...', tag.<ns>.<key>.value = 'api'}"
+              exit 1
+            fi
+          done
+          echo "No invalid dynamic-group grammar patterns found."
+
+      - name: Ban identical dynamic-group matching rules
+        run: |
+          # The api_tier and worker_tier DGs must have distinct matching rules.
+          # If they are identical (compartment-only), all instances get the union of rights.
+          # Extract matching_rule lines for api_tier and worker_tier DGs
+          IAM_FILE="infra/oracle/modules/foundation/iam.tf"
+          API_RULE=$(awk '/resource.*dynamic_group.*api_tier/,/^}/' "$IAM_FILE" | grep 'matching_rule' || echo "")
+          WORKER_RULE=$(awk '/resource.*dynamic_group.*worker_tier/,/^}/' "$IAM_FILE" | grep 'matching_rule' || echo "")
+          if [ -n "$API_RULE" ] && [ -n "$WORKER_RULE" ] && [ "$API_RULE" = "$WORKER_RULE" ]; then
+            echo "FAIL: api_tier and worker_tier dynamic groups have identical matching rules."
+            echo "They must use distinct fail-closed workload-role defined-tag matching."
+            exit 1
+          fi
+          # Also verify each rule contains the workload-role tag check
+          if ! echo "$API_RULE" | grep -q 'workload_role'; then
+            echo "FAIL: api_tier dynamic group must match on workload_role tag."
+            exit 1
+          fi
+          if ! echo "$WORKER_RULE" | grep -q 'workload_role'; then
+            echo "FAIL: worker_tier dynamic group must match on workload_role tag."
+            exit 1
+          fi
+          echo "Dynamic groups have distinct workload_role tag matching rules."
+
+      - name: Ban alerts@example.com in code (not doc references)
+        run: |
+          if grep -rn 'alerts@example.com' infra/oracle/*.tf infra/oracle/*/*.tf infra/oracle/*/*/*.tf 2>/dev/null; then
+            echo "FAIL: alerts@example.com default found in Terraform code."
+            exit 1
+          fi
+          echo "No alerts@example.com defaults in Terraform code."
+
+  secret-scan:
+    name: Secret & Credential Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect OCIDs and credential-like patterns
+        run: |
+          ! grep -rn --include='*.tf' --include='*.md' \
+            -E 'ocid1\.(tenancy|compartment|vault|secret)\.[a-z0-9]+' \
+            infra/oracle/ \
+            | grep -v '__CHANGE_ME__' \
+            | grep -v 'placeholder' \
+            | grep -v 'ocid1\.tenancy\.oc1\.\.' \
+            || { echo "FAIL: Real OCID detected in committed files"; exit 1; }
+
+      - name: Detect private key patterns
+        run: |
+          ! grep -rn --include='*.tf' --include='*.md' --include='*.json' \
+            -E '-----BEGIN (RSA|EC|OPENSSH|DSA) PRIVATE KEY-----' \
+            infra/oracle/ \
+            || { echo "FAIL: Private key detected in committed files"; exit 1; }
+
+  diff-check:
+    name: Repository Diff & Boundary Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify changes stay within OCI Terraform boundaries
+        run: |
+          CHANGED=$(git diff --name-only origin/main...HEAD)
+          for f in $CHANGED; do
+            case "$f" in
+              infra/oracle/*) ;;
+              .github/workflows/oci-infra-*.yml) ;;
+              docs/runbooks/oci-platform-*.md) ;;
+              *)
+                echo "FAIL: Out-of-boundary change: $f"
+                echo "Only infra/oracle/**, .github/workflows/oci-infra-*.yml, docs/runbooks/oci-platform-*.md allowed"
+                exit 1
+                ;;
+            esac
+          done
+          echo "All changes within approved boundaries."
+
+  terraform-docs:
+    name: Terraform Docs Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify module variable documentation
+        run: |
+          for mod in infra/oracle/modules/foundation infra/oracle/modules/queue infra/oracle/modules/observability; do
+            if [ ! -f "$mod/variables.tf" ]; then
+              echo "FAIL: $mod missing variables.tf"
+              exit 1
+            fi
+            UNDOCUMENTED=$(grep -A1 '^variable "' "$mod/variables.tf" | grep -v 'description' | grep 'variable' || true)
+            if [ -n "$UNDOCUMENTED" ]; then
+              echo "WARNING: Some variables in $mod may be missing descriptions"
+            fi
+          done
+          echo "Module documentation check complete."
