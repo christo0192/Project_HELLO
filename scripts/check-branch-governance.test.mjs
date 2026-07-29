@@ -375,6 +375,55 @@ register("collectLive-detail-invalid-id", async () => {
   if (!evidence._errors.some(e => e.phase === "ruleset_detail" && e.reason === "invalid-id")) throw new Error("non-numeric detail.id should error");
   server.close();
 });
+register("collectLive-detail-missing-bypass-actors", async () => {
+  const detail = { ...rsFull()[0] };
+  delete detail.bypass_actors;
+  const { server, baseUrl } = await startServer(mockHandlers({ rulesetDetail: { status: 200, body: detail } }));
+  const evidence = await collectLive("t", "t", "r", "main", { fetch: globalThis.fetch, baseUrl, timeout: 5000 });
+  if (!evidence._errors.some(e => e.reason === "invalid-bypass_actors")) throw new Error("missing bypass_actors should error");
+  server.close();
+});
+register("collectLive-detail-missing-target", async () => {
+  const detail = { ...rsFull()[0] };
+  delete detail.target;
+  const { server, baseUrl } = await startServer(mockHandlers({ rulesetDetail: { status: 200, body: detail } }));
+  const evidence = await collectLive("t", "t", "r", "main", { fetch: globalThis.fetch, baseUrl, timeout: 5000 });
+  if (!evidence._errors.some(e => e.reason === "invalid-target")) throw new Error("missing target should error");
+  server.close();
+});
+register("collectLive-detail-missing-enforcement", async () => {
+  const detail = { ...rsFull()[0] };
+  delete detail.enforcement;
+  const { server, baseUrl } = await startServer(mockHandlers({ rulesetDetail: { status: 200, body: detail } }));
+  const evidence = await collectLive("t", "t", "r", "main", { fetch: globalThis.fetch, baseUrl, timeout: 5000 });
+  if (!evidence._errors.some(e => e.reason === "invalid-enforcement")) throw new Error("missing enforcement should error");
+  server.close();
+});
+register("collectLive-tag-ruleset-is-valid-but-ignored", async () => {
+  const detail = { ...rsFull()[0], target: "tag", conditions: { ref_name: { include: ["refs/tags/*"], exclude: [] } } };
+  const { server, baseUrl } = await startServer(mockHandlers({
+    classic: { status: 404, body: {} },
+    sigs: { status: 404, body: {} },
+    rulesetDetail: { status: 200, body: detail },
+  }));
+  const evidence = await collectLive("t", "t", "r", "main", { fetch: globalThis.fetch, baseUrl, timeout: 5000 });
+  if (evidence._errors.length !== 0) throw new Error(`legitimate tag ruleset rejected: ${JSON.stringify(evidence._errors)}`);
+  if (check(evidence, policy, CTX_LIVE).passed) throw new Error("tag ruleset must not enforce branch controls");
+  server.close();
+});
+register("collectLive-classic-malformed-review-shape", async () => {
+  const classic = { ...CLASSIC_ALL, required_pull_request_reviews: "required" };
+  const { server, baseUrl } = await startServer(mockHandlers({ classic: { status: 200, body: classic } }));
+  const evidence = await collectLive("t", "t", "r", "main", { fetch: globalThis.fetch, baseUrl, timeout: 5000 });
+  if (!evidence._errors.some(e => e.reason === "invalid-pull-request-reviews")) throw new Error("malformed classic reviews should error");
+  server.close();
+});
+register("collectLive-signatures-malformed-enabled", async () => {
+  const { server, baseUrl } = await startServer(mockHandlers({ sigs: { status: 200, body: { enabled: "true" } } }));
+  const evidence = await collectLive("t", "t", "r", "main", { fetch: globalThis.fetch, baseUrl, timeout: 5000 });
+  if (!evidence._errors.some(e => e.reason === "invalid-signatures-enabled")) throw new Error("malformed signatures should error");
+  server.close();
+});
 
 // Offline hardened: deeper ruleset shape
 register("offline-bypass_actors-string-treated-clean", () => {
@@ -402,6 +451,29 @@ register("offline-invalid-conditions-include", () => {
 register("offline-invalid-conditions-exclude", () => {
   const r = check(ev({ rulesets: [{ id: 1, enforcement: "active", target: "branch", conditions: { ref_name: { include: ["refs/heads/main"], exclude: "not-array" } }, bypass_actors: [], rules: [{ type: "pull_request", parameters: { required_approving_review_count: 2 } }] }] }), policy, CTX_OFFLINE);
   if (!r._error) throw new Error("string exclude should reject");
+});
+register("offline-missing-bypass-actors", () => {
+  const malformed = rsFull()[0];
+  delete malformed.bypass_actors;
+  if (!check(ev({ rulesets: [malformed] }), policy, CTX_OFFLINE)._error) throw new Error("missing bypass_actors should reject");
+});
+register("offline-missing-default-branch", () => {
+  const metadata = { ...ev().metadata };
+  delete metadata.default_branch;
+  if (!check(ev({ metadata }), policy, CTX_OFFLINE)._error) throw new Error("missing default branch should reject");
+});
+register("offline-required-arrays-missing", () => {
+  const evidence = ev();
+  delete evidence.rulesets;
+  delete evidence._errors;
+  if (!check(evidence, policy, CTX_OFFLINE)._error) throw new Error("missing evidence arrays should reject");
+});
+register("offline-malformed-classic-review-shape", () => {
+  const classic = { ...CLASSIC_ALL, required_pull_request_reviews: "required" };
+  if (!check(ev({ classic_branch_protection: classic }), policy, CTX_OFFLINE)._error) throw new Error("malformed classic should reject");
+});
+register("offline-malformed-signatures-shape", () => {
+  if (!check(ev({ classic_required_signatures: { enabled: "true" } }), policy, CTX_OFFLINE)._error) throw new Error("malformed signatures should reject");
 });
 
 // Existing offline tests

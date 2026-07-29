@@ -228,37 +228,57 @@ function validateObjectBody(body, label) {
   return null;
 }
 
-/**
- * Validate a ruleset detail body beyond just "non-null object".
- * Returns null if valid, or an error reason string.
- */
-function validateRulesetDetailShape(detail) {
-  // id: finite number >= 1
-  if (typeof detail.id !== "number" || !Number.isFinite(detail.id) || detail.id < 1) return "invalid-id";
-  // enforcement: must be "active" or "evaluate" (or absent — defaults to inactive, but we accept it)
-  if (detail.enforcement !== undefined && typeof detail.enforcement !== "string") return "invalid-enforcement";
-  // target: if present must be "branch"
-  if (detail.target !== undefined && detail.target !== "branch") return "invalid-target"; // non-string caught in filter
-
-  // bypass_actors: if present must be array
-  if (detail.bypass_actors !== undefined && !Array.isArray(detail.bypass_actors)) return "invalid-bypass_actors";
-
-  // conditions.ref_name: if present, include/exclude must be string arrays
-  const refName = detail.conditions?.ref_name;
-  if (refName) {
-    if (refName.include !== undefined && !Array.isArray(refName.include)) return "invalid-conditions-include";
-    if (refName.exclude !== undefined && !Array.isArray(refName.exclude)) return "invalid-conditions-exclude";
-    // Validate array elements are strings
-    if (Array.isArray(refName.include) && refName.include.some(e => typeof e !== "string")) return "invalid-conditions-include-element";
-    if (Array.isArray(refName.exclude) && refName.exclude.some(e => typeof e !== "string")) return "invalid-conditions-exclude-element";
+function validateClassicProtectionShape(classic) {
+  const review = classic.required_pull_request_reviews;
+  if (review != null) {
+    if (typeof review !== "object" || Array.isArray(review)) return "invalid-pull-request-reviews";
+    for (const key of ["require_code_owner_reviews", "dismiss_stale_reviews", "require_last_push_approval"]) {
+      if (review[key] !== undefined && typeof review[key] !== "boolean") return `invalid-${key}`;
+    }
+    const count = review.required_approving_review_count;
+    if (count !== undefined && (!Number.isInteger(count) || count < 0)) return "invalid-approval-count";
   }
 
-  // rules: must be array of objects
+  for (const key of ["required_conversation_resolution", "enforce_admins", "required_linear_history", "allow_force_pushes", "allow_deletions"]) {
+    const control = classic[key];
+    if (control == null) continue;
+    if (typeof control !== "object" || Array.isArray(control) || typeof control.enabled !== "boolean") return `invalid-${key}`;
+  }
+
+  const checks = classic.required_status_checks;
+  if (checks != null) {
+    if (typeof checks !== "object" || Array.isArray(checks)) return "invalid-required-status-checks";
+    if (checks.contexts !== undefined && (!Array.isArray(checks.contexts) || checks.contexts.some(context => typeof context !== "string"))) {
+      return "invalid-status-check-contexts";
+    }
+  }
+  return null;
+}
+
+function validateSignaturesShape(signatures) {
+  return typeof signatures.enabled === "boolean" ? null : "invalid-signatures-enabled";
+}
+
+/** Validate a complete ruleset detail without rejecting legitimate tag/push rulesets. */
+function validateRulesetDetailShape(detail) {
+  if (typeof detail.id !== "number" || !Number.isFinite(detail.id) || detail.id < 1) return "invalid-id";
+  if (!["active", "evaluate", "disabled"].includes(detail.enforcement)) return "invalid-enforcement";
+  if (!["branch", "tag", "push"].includes(detail.target)) return "invalid-target";
+  if (!Array.isArray(detail.bypass_actors)) return "invalid-bypass_actors";
   if (!Array.isArray(detail.rules)) return "invalid-rules-array";
+
+  if (detail.target === "branch" || detail.target === "tag") {
+    const refName = detail.conditions?.ref_name;
+    if (!refName || typeof refName !== "object" || Array.isArray(refName)) return "invalid-conditions-ref-name";
+    if (!Array.isArray(refName.include)) return "invalid-conditions-include";
+    if (!Array.isArray(refName.exclude)) return "invalid-conditions-exclude";
+    if (refName.include.some(value => typeof value !== "string")) return "invalid-conditions-include-element";
+    if (refName.exclude.some(value => typeof value !== "string")) return "invalid-conditions-exclude-element";
+  }
+
   for (const rule of detail.rules) {
-    if (!rule || typeof rule !== "object") return "invalid-rule-entry";
+    if (!rule || typeof rule !== "object" || Array.isArray(rule)) return "invalid-rule-entry";
     if (typeof rule.type !== "string") return "invalid-rule-type";
-    // parameters: if present must be object
     if (rule.parameters !== undefined && (typeof rule.parameters !== "object" || rule.parameters === null || Array.isArray(rule.parameters))) {
       return "invalid-rule-parameters";
     }
@@ -324,7 +344,7 @@ export async function collectLive(token, owner, repo, branch, opts = {}) {
     else if (classicStatus === 404) { evidence.classic_branch_protection = null; }
     else if (classicStatus === 401 || classicStatus === 403) { pushErr("classic", classicStatus); }
     else if (classicStatus === 200) {
-      const bodyErr = validateObjectBody(classic, "classic");
+      const bodyErr = validateObjectBody(classic, "classic") || validateClassicProtectionShape(classic);
       if (bodyErr) { pushErr("classic", 200, { reason: bodyErr }); evidence.classic_branch_protection = null; }
       else { evidence.classic_branch_protection = classic; }
     } else { pushErr("classic", classicStatus || 0); }
@@ -338,7 +358,7 @@ export async function collectLive(token, owner, repo, branch, opts = {}) {
     if (sigs._network_error || sigs._foreign_origin) { pushErr("required_signatures", 0); }
     else if (sigs._malformed) { pushErr("required_signatures", sigsStatus || 0, sigs._reason ? { reason: sigs._reason } : undefined); }
     else if (sigsStatus === 200) {
-      const bodyErr = validateObjectBody(sigs, "sigs");
+      const bodyErr = validateObjectBody(sigs, "sigs") || validateSignaturesShape(sigs);
       if (bodyErr) { pushErr("required_signatures", 200, { reason: bodyErr }); }
       else { evidence.classic_required_signatures = sigs; }
     } else if (sigsStatus === 404) { evidence.classic_required_signatures = null; }
@@ -507,28 +527,7 @@ function statusChecksInclude(contexts, expected) {
  * the code handles defaults are not errors.
  */
 function validateOfflineRulesetEntry(r) {
-  if (!r || typeof r !== "object") return "not-object";
-  if (typeof r.id !== "number" || !Number.isFinite(r.id) || r.id < 1) return "invalid-id";
-  if (!Array.isArray(r.rules)) return "invalid-rules-array";
-  // enforcement: if present must be string
-  if (r.enforcement !== undefined && typeof r.enforcement !== "string") return "invalid-enforcement";
-  // bypass_actors: if present must be array
-  if (r.bypass_actors !== undefined && !Array.isArray(r.bypass_actors)) return "invalid-bypass_actors";
-  // conditions.ref_name depth check
-  const refName = r.conditions?.ref_name;
-  if (refName) {
-    if (refName.include !== undefined && !Array.isArray(refName.include)) return "invalid-conditions-include";
-    if (refName.exclude !== undefined && !Array.isArray(refName.exclude)) return "invalid-conditions-exclude";
-  }
-  // rules entries
-  for (const rule of r.rules) {
-    if (!rule || typeof rule !== "object") return "invalid-rule-entry";
-    if (typeof rule.type !== "string") return "invalid-rule-type";
-    if (rule.parameters !== undefined && (typeof rule.parameters !== "object" || rule.parameters === null || Array.isArray(rule.parameters))) {
-      return "invalid-rule-parameters";
-    }
-  }
-  return null;
+  return validateRulesetDetailShape(r);
 }
 
 export function check(evidence, policy, ctx = {}) {
@@ -545,16 +544,23 @@ export function check(evidence, policy, ctx = {}) {
       return { passed: false, controls: {}, failed: [], summary: "FAILED: metadata missing or invalid", repository, branch, _error: "malformed-evidence" };
     if (meta.branch !== branch)
       return { passed: false, controls: {}, failed: [], summary: "FAILED: metadata.branch does not match policy.target_branch", repository, branch, _error: "branch-mismatch" };
-    if (meta.default_branch != null && typeof meta.default_branch !== "string")
-      return { passed: false, controls: {}, failed: [], summary: "FAILED: metadata.default_branch not a string", repository, branch, _error: "malformed-evidence" };
+    if (typeof meta.default_branch !== "string" || meta.default_branch.length === 0)
+      return { passed: false, controls: {}, failed: [], summary: "FAILED: metadata.default_branch missing or invalid", repository, branch, _error: "malformed-evidence" };
+
+    if (!Array.isArray(evidence.rulesets) || !Array.isArray(evidence._errors))
+      return { passed: false, controls: {}, failed: [], summary: "FAILED: required evidence arrays missing", repository, branch, _error: "malformed-evidence" };
 
     const cbp = evidence.classic_branch_protection;
     if (cbp !== null && cbp !== undefined && (typeof cbp !== "object" || Array.isArray(cbp)))
       return { passed: false, controls: {}, failed: [], summary: "FAILED: classic_branch_protection not an object", repository, branch, _error: "malformed-evidence" };
+    if (cbp && validateClassicProtectionShape(cbp))
+      return { passed: false, controls: {}, failed: [], summary: "FAILED: malformed classic protection", repository, branch, _error: "malformed-evidence" };
 
     const cs = evidence.classic_required_signatures;
     if (cs !== null && cs !== undefined && (typeof cs !== "object" || Array.isArray(cs)))
       return { passed: false, controls: {}, failed: [], summary: "FAILED: classic_required_signatures not an object", repository, branch, _error: "malformed-evidence" };
+    if (cs && validateSignaturesShape(cs))
+      return { passed: false, controls: {}, failed: [], summary: "FAILED: malformed required signatures", repository, branch, _error: "malformed-evidence" };
 
     const rs = evidence.rulesets;
     if (rs !== null && rs !== undefined && !Array.isArray(rs))

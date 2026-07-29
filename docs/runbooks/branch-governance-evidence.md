@@ -48,10 +48,12 @@ The verifier fetches:
 5. `GET /repos/{owner}/{repo}/rulesets/{id}` — each individual ruleset detail
 
 Every API response is validated:
-- HTTP 200 bodies must be non-null, non-array objects
+- HTTP 200 object endpoints must return non-null, non-array objects; the ruleset-list endpoint must return an array
 - Repo metadata must contain a string `default_branch`
+- Classic-protection and required-signatures fields used by the policy must have their documented types
 - Ruleset list entries must have numeric IDs
-- Ruleset detail bodies must be objects
+- Ruleset details must include a supported enforcement mode and target, an explicit `bypass_actors` array, valid ref conditions for branch/tag targets, and well-formed rule objects
+- Legitimate tag/push rulesets are collected but cannot enforce branch controls
 - Self-href and Link header URLs are checked against the expected origin
   (`https://api.github.com`) via exact `.origin` comparison; lookalike
   origins (`https://api.github.com.evil.example/…`) are rejected
@@ -181,7 +183,7 @@ passes.
 node scripts/check-branch-governance.test.mjs
 ```
 
-All synthetic evidence is embedded inline. 89 tests cover:
+All synthetic evidence is embedded inline. 102 sequentially awaited tests cover:
 - Classic and ruleset full-positive and 12 individual-control negatives
 - Bool-parameter weak-first/strong-second ordering (CODEOWNER, dismiss,
   last-push, conversation resolution)
@@ -192,11 +194,11 @@ All synthetic evidence is embedded inline. 89 tests cover:
 - Bypass actors (all controls excluded, mixed classic+bypassed)
 - Excluded-main conditions
 - All `_errors` entries fatal (401, 403, 404-detail, 429, 500, network, pagination)
-- Collection malformation (missing default_branch, classic array, sigs null,
-  detail array, non-numeric ruleset IDs)
-- Offline structural validation (root shape, metadata required,
-  metadata.default_branch type, per-entry _errors shape, per-entry rulesets
-  shape, contradictory malformed + passing classic)
+- Collection malformation (missing default_branch, malformed classic/signature fields,
+  array/null bodies, non-numeric ruleset IDs, absent bypass/target/enforcement, and malformed rule details)
+- Offline structural validation (root shape, required metadata/default branch and arrays,
+  typed classic/signature fields, per-entry `_errors`, complete ruleset shape,
+  and contradictory malformed evidence alongside otherwise passing classic controls)
 - Hostile origin lookalike rejection (self-href, Link header)
 - Pagination exact query (`includes_parents=true&per_page=100`)
 - Total collection timeout (injectable, hanging mock)

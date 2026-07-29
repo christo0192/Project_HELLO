@@ -69,9 +69,9 @@ The verifier in `scripts/check-branch-governance.mjs` supports two modes:
   (default branch), classic protection, separate required-signatures
   endpoint, ruleset list with `includes_parents=true&per_page=100` and
   pagination (up to 3 pages), and individual ruleset details. Inherited
-  rulesets are included. Every 200 response body is validated (non-null,
-  non-array object); missing `default_branch`, non-numeric ruleset IDs,
-  and malformed detail bodies produce collection errors. Hostile URL
+  rulesets are included. Object endpoints and the ruleset-list array are
+  type-checked; missing `default_branch`, malformed classic/signature fields,
+  non-numeric ruleset IDs, and incomplete detail bodies produce collection errors. Hostile URL
   origins (lookalike hostnames) are rejected via exact `.origin` comparison.
   Raw responses stay in memory only — never persisted or uploaded.
 - **Offline** (`$INFORMER_PATH` or CLI arg): reads a local evidence JSON file
