@@ -133,8 +133,7 @@ if ! MUMBAI_INSTANCE_ID="$(oci compute instance launch \
     --freeform-tags '{"purpose":"oci-region-benchmark","ttl":"4h","region":"ap-mumbai-1"}' \
     --region ap-mumbai-1 \
     --query 'data.id' --raw-output)"; then
-    echo "FATAL: Mumbai launch command failed for ${DISPLAY_NAME}" >&2
-  echo "Output: ${ap-mumbai-1_INSTANCE_ID}" >&2
+  echo "FATAL: Mumbai launch command failed for ${DISPLAY_NAME}" >&2
   # Clean up any instance provisioned with this display-name.
   # OCI list is eventually consistent — retry up to 3 times.
   ORPHAN_IDS=""
@@ -164,7 +163,7 @@ fi
 
 # ── Step 2: Validate OCID immediately (before waiting) ──
 if [ -z "${MUMBAI_INSTANCE_ID}" ]; then
-    echo "FATAL: MUMBAI_INSTANCE_ID is blank for ${DISPLAY_NAME}" >&2
+  echo "FATAL: MUMBAI_INSTANCE_ID is blank for ${DISPLAY_NAME}" >&2
   # Same display-name cleanup for blank-ID case
   ORPHAN_IDS=""
   for attempt in 1 2 3; do
@@ -255,8 +254,7 @@ if ! HYDERABAD_INSTANCE_ID="$(oci compute instance launch \
     --freeform-tags '{"purpose":"oci-region-benchmark","ttl":"4h","region":"ap-hyderabad-1"}' \
     --region ap-hyderabad-1 \
     --query 'data.id' --raw-output)"; then
-    echo "FATAL: Hyderabad launch command failed for ${DISPLAY_NAME}" >&2
-  echo "Output: ${ap-hyderabad-1_INSTANCE_ID}" >&2
+  echo "FATAL: Hyderabad launch command failed for ${DISPLAY_NAME}" >&2
   # Clean up any instance provisioned with this display-name.
   # OCI list is eventually consistent — retry up to 3 times.
   ORPHAN_IDS=""
@@ -296,7 +294,7 @@ fi
 
 # ── Step 2: Validate OCID immediately (before waiting) ──
 if [ -z "${HYDERABAD_INSTANCE_ID}" ]; then
-    echo "FATAL: HYDERABAD_INSTANCE_ID is blank for ${DISPLAY_NAME}" >&2
+  echo "FATAL: HYDERABAD_INSTANCE_ID is blank for ${DISPLAY_NAME}" >&2
   # Same display-name cleanup for blank-ID case
   ORPHAN_IDS=""
   for attempt in 1 2 3; do

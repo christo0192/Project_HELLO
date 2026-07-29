@@ -1284,9 +1284,12 @@ echo "OK: ${INSTANCE_ID}"
     check("runbook: cleanup requires final tagged teardown verification",
           'MUST run tagged teardown verification' in runbook)
 
-    # 65. Stderr warning comment present
+    # 65. Stderr warning comment present and no malformed shell variables
     check("runbook: warns not to redirect stderr into OCID variable",
           'Do NOT redirect stderr' in runbook)
+    check("runbook: no region-name shell variable substitutions",
+          '${ap-' not in runbook,
+          "region names with hyphens are invalid shell variable names")
 
     # ── JMESPath semantics (optional) ──
     try:
