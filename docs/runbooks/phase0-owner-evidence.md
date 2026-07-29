@@ -11,7 +11,7 @@ candidate data into the Git repository.
 
 ## 1. Overview
 
-The Phase-0 evidence manifest (`config/phase0-evidence.json`, **never
+The Phase-0 evidence manifest (`config/phase0-evidence.local.json`, **never
 committed**) is a structured JSON document that records:
 
 - Which provider credentials were rotated (FND-02), by whom, and what proof exists
@@ -20,7 +20,9 @@ committed**) is a structured JSON document that records:
 The schema enforces a strict shape. The validator (`scripts/check-phase0-evidence.mjs`)
 checks that the shape is valid, but **does not verify the truth of the evidence**.
 Acceptance still requires human/provider action (e.g. confirming the audit log
-screenshot is authentic).
+screenshot is authentic). The validator also uses regex heuristics to detect
+common secret and PII patterns; these heuristics **cannot prove the absence** of
+all secrets or PII — acceptance still needs human review.
 
 ---
 
@@ -28,14 +30,14 @@ screenshot is authentic).
 
 ### 2.1. Never commit the real manifest
 
-The real manifest file `config/phase0-evidence.json` is listed in `.gitignore`.
+The real manifest file `config/phase0-evidence.local.json` is listed in `.gitignore`.
 Only the **example** file `config/phase0-evidence.example.json` is committed.
-Always work on `config/phase0-evidence.json` and keep it local.
+Always work on `config/phase0-evidence.local.json` and keep it local.
 
 ### 2.2. Procedure
 
 1. **Rotate credentials** in each provider account (Supabase, LiveKit,
-   Anthropic, Sarvam, Deepgram, Retell/ElevenLabs/Cartesia). Capture
+   Anthropic, Sarvam, Deepgram, Retell, ElevenLabs, Cartesia). Capture
    non-secret evidence for each (audit-log screenshot, provider-console
    timestamp, or credential-rejection test).
 
@@ -47,18 +49,19 @@ Always work on `config/phase0-evidence.json` and keep it local.
    (recordings, scorecards, screenshots, etc.), determine whether it is clean,
    replaced with synthetic data, or quarantined. Record the disposition.
 
-4. **Write the manifest** at `config/phase0-evidence.json` following the
+4. **Write the manifest** at `config/phase0-evidence.local.json` following the
    schema and example. See Section 3 for the schema reference.
 
 5. **Validate locally**:
 
    ```bash
-   node scripts/check-phase0-evidence.mjs config/phase0-evidence.json
+   node scripts/check-phase0-evidence.mjs config/phase0-evidence.local.json
    ```
 
-   Expected exit code: `0` (complete + valid).
+   Expected exit code: `0` (complete + valid, all 8 providers + 7 artifact
+   groups verified, none pending).
 
-6. **Do NOT stage or commit `config/phase0-evidence.json`.** It is gitignored.
+6. **Do NOT stage or commit `config/phase0-evidence.local.json`.** It is gitignored.
 
 ---
 
@@ -70,19 +73,28 @@ See `config/phase0-evidence.schema.json` (draft 2020-12) for the full schema.
 
 | Field | Required | Type | Description |
 |-------|----------|------|-------------|
-| `schemaVersion` | Yes | string (semver) | Version of this schema, e.g. `1.0.0` |
+| `schemaVersion` | Yes | string (enum) | Must be exactly `1.0.0` |
 | `evidenceDate` | Yes | string (date-time UTC) | When the evidence was captured |
 | `owner` | Yes | object | Role and evidence date of the attesting owner |
 | `credentialGroups` | Yes | array | Array of FND-02 credential rotation entries |
 | `artifactGroups` | Yes | array | Array of FND-03 artifact disposition entries |
+
+### Owner
+
+| Field | Required | Type | Constraints |
+|-------|----------|------|-------------|
+| `role` | Yes | string (enum) | One of: Engineering Lead, Security Lead, Product Manager, Legal Counsel |
+| `evidenceDate` | Yes | string (date-time UTC) | When the owner recorded their attestation |
 
 ### Credential group
 
 | Field | Required | Type | Constraints |
 |-------|----------|------|-------------|
 | `groupId` | Yes | string | Pattern: `^[a-z][a-z0-9-]+$` |
-| `provider` | Yes | string | One of: supabase, livekit, anthropic, sarvam, deepgram, retell-elevenlabs-cartesia |
-| `verification.ownerRole` | Yes | string | Role of the verifier |
+| `provider` | Yes | string (enum) | One of: supabase, livekit, anthropic, sarvam, deepgram, retell, elevenlabs, cartesia |
+| `status` | Yes | string (enum) | `pending` or `verified` |
+| `verification` | Conditional | object | Required if status=verified; must be absent if status=pending |
+| `verification.ownerRole` | Yes | string (enum) | One of: Engineering Lead, Security Lead, Product Manager, Legal Counsel |
 | `verification.evidenceDate` | Yes | string (date-time UTC) | When rotation evidence was captured |
 | `verification.evidenceRef` | Yes | string | Pattern: `restricted://FND02/...` |
 | `verification.rotationAction` | Yes | string | One of: rotated, revoked, deleted-resource |
@@ -92,8 +104,10 @@ See `config/phase0-evidence.schema.json` (draft 2020-12) for the full schema.
 
 | Field | Required | Type | Constraints |
 |-------|----------|------|-------------|
-| `groupId` | Yes | string | Pattern: `^[a-z][a-z0-9-]+$` |
+| `groupId` | Yes | string (enum) | One of: hello-html, hello-md, hello-assets, generated-pdf, voice-recording, scorecard-export, env-example-values |
 | `artifactType` | Yes | string | One of: interview-recording, scorecard-pdf, candidate-screenshot, resume-copy, voice-media, generated-document, browser-recording |
+| `status` | Yes | string (enum) | `pending` or `verified` |
+| `verification` | Conditional | object | Required if status=verified; must be absent if status=pending |
 | `verification.manualReviewOutcome` | Yes | string | One of: clean, replaced-synthetic, quarantined |
 | `verification.dispositionStatus` | Yes | string | One of: retained-restricted, deleted-after-replacement, pending-review |
 | `verification.evidenceRef` | Yes | string | Pattern: `restricted://FND03/...` |
@@ -104,7 +118,7 @@ See `config/phase0-evidence.schema.json` (draft 2020-12) for the full schema.
 
 ```bash
 # Validate a specific manifest
-node scripts/check-phase0-evidence.mjs config/phase0-evidence.json
+node scripts/check-phase0-evidence.mjs config/phase0-evidence.local.json
 
 # Validate the example (for CI / smoke test)
 node scripts/check-phase0-evidence.mjs config/phase0-evidence.example.json
@@ -114,23 +128,35 @@ node scripts/check-phase0-evidence.mjs config/phase0-evidence.example.json
 
 | Code | Meaning | Action |
 |------|---------|--------|
-| 0 | Complete + valid. All 6 providers covered, all groups verified. | Manifest is ready for review/acceptance |
-| 2 | Valid shape but incomplete. Some providers missing or groups not fully verified. | Add missing provider entries or complete verification fields |
+| 0 | Complete + valid. All 8 providers covered, all 7 artifact group IDs present, all entries verified. | Manifest is ready for review/acceptance |
+| 2 | Valid shape but at least one entry has status="pending". | Complete remaining entries and re-validate |
 | 1 | Invalid / unsafe / tool error. Schema violation, secret-like content, PII, or file error. | Fix the reported category; check diagnostics for guidance |
 
 ### What the validator validates
 
-- File is a regular file ≤ 64 KB
+- File is a regular file ≤ 64 KB (not a symlink or directory)
 - JSON is well-formed
+- `schemaVersion` matches the schema's own version (currently `1.0.0`)
 - Schema fields and types are correct
 - No unknown fields (strict `additionalProperties: false`)
-- No secret-like field names or values (JWT, private keys, URLs with creds, etc.)
+- All 8 providers have exactly one credential group entry (supabase, livekit,
+  anthropic, sarvam, deepgram, retell, elevenlabs, cartesia)
+- All 7 artifact group IDs are present (hello-html, hello-md, hello-assets,
+  generated-pdf, voice-recording, scorecard-export, env-example-values)
+- Owner role is one of the approved enum values (no free text, no person names)
+- Verification ownerRole is also one of the approved enum values
+- All dates are valid ISO 8601 UTC timestamps and are not in the future
+- No secret-like field names or values (JWT, private keys, token prefixes,
+  high-entropy base64, URLs with creds, URLs with query/fragment)
 - No PII (emails, phone numbers)
-- No future dates
+- No absolute paths or parent-traversal paths
 - No duplicate group IDs
-- No placeholder claims marked as verified
-- All 6 providers have at least one credential group
-- All credential groups have complete verification
+- No placeholder claims
+- Evidence refs follow `restricted://FND02/...` or `restricted://FND03/...` grammar
+- FND-03 outcome combinations are valid (clean + pending-review and
+  quarantined + deleted-after-replacement are contradictions)
+- If status=pending, verification must be absent; if status=verified,
+  verification must be present with all required fields
 
 ### What the validator does NOT validate
 
@@ -138,6 +164,8 @@ node scripts/check-phase0-evidence.mjs config/phase0-evidence.example.json
 - Whether the owner actually performed the rotation
 - Whether the evidence references point to real files
 - Content of externally-stored evidence
+- **Regex heuristics cannot prove the absence of all PII or secrets** — human
+  review is still required
 
 ---
 
@@ -169,5 +197,6 @@ Never commit:
 - Audit log exports
 - Old credential rejection test results
 - Original candidate artifacts
+- The real evidence manifest (`config/phase0-evidence.local.json`)
 
 These belong in restricted storage, not in the repository.

@@ -2,42 +2,86 @@
   "schemaVersion": "1.0.0",
   "evidenceDate": "2025-06-15T10:00:00Z",
   "owner": {
-    "role": "Engineering Lead (synthetic example)",
+    "role": "Engineering Lead",
     "evidenceDate": "2025-06-15T10:30:00Z"
   },
   "credentialGroups": [
     {
-      "groupId": "supabase-example-group",
+      "groupId": "supabase-rotation",
       "provider": "supabase",
-      "verification": {
-        "ownerRole": "Engineering Lead (synthetic example)",
-        "evidenceDate": "2025-06-15T09:00:00Z",
-        "evidenceRef": "restricted://FND02/supabase/synthetic-example-not-real",
-        "rotationAction": "rotated",
-        "oldCredentialRejectionMethod": "audit-log-screenshot"
-      }
+      "status": "pending"
     },
     {
-      "groupId": "livekit-example-group",
+      "groupId": "livekit-rotation",
       "provider": "livekit",
-      "verification": {
-        "ownerRole": "Engineering Lead (synthetic example)",
-        "evidenceDate": "2025-06-15T09:15:00Z",
-        "evidenceRef": "restricted://FND02/livekit/synthetic-example-not-real",
-        "rotationAction": "rotated",
-        "oldCredentialRejectionMethod": "provider-console-timestamp"
-      }
+      "status": "pending"
+    },
+    {
+      "groupId": "anthropic-rotation",
+      "provider": "anthropic",
+      "status": "pending"
+    },
+    {
+      "groupId": "sarvam-rotation",
+      "provider": "sarvam",
+      "status": "pending"
+    },
+    {
+      "groupId": "deepgram-rotation",
+      "provider": "deepgram",
+      "status": "pending"
+    },
+    {
+      "groupId": "retell-rotation",
+      "provider": "retell",
+      "status": "pending"
+    },
+    {
+      "groupId": "elevenlabs-rotation",
+      "provider": "elevenlabs",
+      "status": "pending"
+    },
+    {
+      "groupId": "cartesia-rotation",
+      "provider": "cartesia",
+      "status": "pending"
     }
   ],
   "artifactGroups": [
     {
-      "groupId": "recording-example-group",
-      "artifactType": "interview-recording",
-      "verification": {
-        "manualReviewOutcome": "replaced-synthetic",
-        "dispositionStatus": "deleted-after-replacement",
-        "evidenceRef": "restricted://FND03/recording/synthetic-example-not-real"
-      }
+      "groupId": "hello-html",
+      "artifactType": "generated-document",
+      "status": "pending"
+    },
+    {
+      "groupId": "hello-md",
+      "artifactType": "generated-document",
+      "status": "pending"
+    },
+    {
+      "groupId": "hello-assets",
+      "artifactType": "resume-copy",
+      "status": "pending"
+    },
+    {
+      "groupId": "generated-pdf",
+      "artifactType": "scorecard-pdf",
+      "status": "pending"
+    },
+    {
+      "groupId": "voice-recording",
+      "artifactType": "voice-media",
+      "status": "pending"
+    },
+    {
+      "groupId": "scorecard-export",
+      "artifactType": "scorecard-pdf",
+      "status": "pending"
+    },
+    {
+      "groupId": "env-example-values",
+      "artifactType": "generated-document",
+      "status": "pending"
     }
   ]
 }

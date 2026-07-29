@@ -16,8 +16,8 @@
   "properties": {
     "schemaVersion": {
       "type": "string",
-      "pattern": "^\\d+\\.\\d+\\.\\d+$",
-      "description": "Semantic version of this schema"
+      "enum": ["1.0.0"],
+      "description": "Schema version must be exactly 1.0.0"
     },
     "evidenceDate": {
       "type": "string",
@@ -34,9 +34,8 @@
       "properties": {
         "role": {
           "type": "string",
-          "minLength": 1,
-          "maxLength": 128,
-          "description": "Role of the person providing the evidence (e.g. Engineering Lead)"
+          "enum": ["Engineering Lead", "Security Lead", "Product Manager", "Legal Counsel"],
+          "description": "Role of the person providing the evidence. Must be one of the approved roles."
         },
         "evidenceDate": {
           "type": "string",
@@ -53,7 +52,7 @@
         "required": [
           "groupId",
           "provider",
-          "verification"
+          "status"
         ],
         "properties": {
           "groupId": {
@@ -69,9 +68,15 @@
               "anthropic",
               "sarvam",
               "deepgram",
-              "retell-elevenlabs-cartesia"
+              "retell",
+              "elevenlabs",
+              "cartesia"
             ],
             "description": "Provider system whose credential was rotated"
+          },
+          "status": {
+            "enum": ["pending", "verified"],
+            "description": "Whether this credential group has been verified. If pending, verification must be absent. If verified, verification must be present with all required fields."
           },
           "verification": {
             "type": "object",
@@ -86,8 +91,7 @@
             "properties": {
               "ownerRole": {
                 "type": "string",
-                "minLength": 1,
-                "maxLength": 128,
+                "enum": ["Engineering Lead", "Security Lead", "Product Manager", "Legal Counsel"],
                 "description": "Role of the person who performed and verified the rotation"
               },
               "evidenceDate": {
@@ -112,6 +116,20 @@
               }
             }
           }
+        },
+        "if": {
+          "properties": {
+            "status": { "const": "pending" }
+          },
+          "required": ["status"]
+        },
+        "then": {
+          "properties": {
+            "verification": false
+          }
+        },
+        "else": {
+          "required": ["verification"]
         }
       },
       "minItems": 1,
@@ -125,13 +143,21 @@
         "required": [
           "groupId",
           "artifactType",
-          "verification"
+          "status"
         ],
         "properties": {
           "groupId": {
             "type": "string",
-            "pattern": "^[a-z][a-z0-9-]+$",
-            "description": "Unique identifier for this artifact group"
+            "enum": [
+              "hello-html",
+              "hello-md",
+              "hello-assets",
+              "generated-pdf",
+              "voice-recording",
+              "scorecard-export",
+              "env-example-values"
+            ],
+            "description": "Fixed artifact group ID matching PLAN.md scope"
           },
           "artifactType": {
             "type": "string",
@@ -145,6 +171,10 @@
               "browser-recording"
             ],
             "description": "Type of candidate artifact from FND-03 scope"
+          },
+          "status": {
+            "enum": ["pending", "verified"],
+            "description": "Whether this artifact group has been verified. If pending, verification must be absent. If verified, verification must be present with all required fields."
           },
           "verification": {
             "type": "object",
@@ -172,8 +202,23 @@
               }
             }
           }
+        },
+        "if": {
+          "properties": {
+            "status": { "const": "pending" }
+          },
+          "required": ["status"]
+        },
+        "then": {
+          "properties": {
+            "verification": false
+          }
+        },
+        "else": {
+          "required": ["verification"]
         }
       },
+      "minItems": 1,
       "maxItems": 50
     }
   }

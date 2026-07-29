@@ -11,35 +11,39 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Validate example manifest (expected exit 2 — valid but incomplete)
+      - name: Validate example manifest (expected exit 2 — all pending, valid shape)
         id: validate-example
         continue-on-error: true
         run: |
+          set +e
           node scripts/check-phase0-evidence.mjs config/phase0-evidence.example.json
           exit_code=$?
+          set -e
           if [ "$exit_code" -eq 2 ]; then
-            echo "PASS: example exits $exit_code (valid shape, incomplete)"
+            echo "PASS: example exits $exit_code (valid shape, all pending)"
           else
             echo "UNEXPECTED: example exited $exit_code (expected 2)"
-            exit "$exit_code"
+            exit 1
           fi
 
       - name: Run deterministic tests
         run: |
           node scripts/check-phase0-evidence.test.mjs
 
-      - name: Secret scan (gitleaks)
-        uses: gitleaks/gitleaks-action@v2
-        continue-on-error: false
-        with:
-          config-path: .gitleaks.toml
-          detect-args: --no-git -v
+      - name: Git diff whitespace check (against merge base)
+        run: git diff --check origin/main...HEAD
 
-      - name: Git diff whitespace check
-        run: git diff --check
+      - name: Document secret-scan dependency
+        run: |
+          echo "Secret scanning is handled by the repository-level secret-scan workflow"
+          echo "(.github/workflows/secret-scan.yml). This workflow runs offline"
+          echo "deterministic tests only and never reads local evidence, env files,"
+          echo "ignored artifacts, secrets, or production resources."
