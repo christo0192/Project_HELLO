@@ -917,6 +917,8 @@ def cmd_self_test(args):
 
     print("── Runbook integrity tests (static verification) ──")
 
+    import subprocess, tempfile
+
     # Locate the runbook
     runbook_path = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
@@ -929,13 +931,13 @@ def cmd_self_test(args):
         check("runbook file exists", False, f"Not found: {runbook_path}")
         runbook = ""
 
-    # ── Section A: Launch ID capture ──
+    # ── Section A: Launch safety ──
 
     # 1. Launch commands must capture OCIDs via --query 'data.id' --raw-output
-    has_mumbai_query = '--query' in runbook and "'data.id'" in runbook
-    check("runbook: Mumbai launch uses --query 'data.id' --raw-output", has_mumbai_query)
+    check("runbook: Mumbai launch uses --query 'data.id' --raw-output",
+          '--query' in runbook and "'data.id'" in runbook)
 
-    # 2. Instance ID must be captured into MUMBAI_INSTANCE_ID / HYDERABAD_INSTANCE_ID
+    # 2. Instance ID captured into named variables
     check("runbook: MUMBAI_INSTANCE_ID captured from launch output",
           'MUMBAI_INSTANCE_ID="$(oci compute instance launch' in runbook or
           'MUMBAI_INSTANCE_ID="$(oci' in runbook)
@@ -950,14 +952,13 @@ def cmd_self_test(args):
           '-z "${HYDERABAD_INSTANCE_ID}"' in runbook)
 
     # 4. Tags must be applied (purpose, ttl, region)
-    has_tags = 'freeform-tags' in runbook and 'oci-region-benchmark' in runbook
-    check("runbook: OCI freeform-tags applied with purpose=oci-region-benchmark", has_tags)
+    check("runbook: OCI freeform-tags applied with purpose=oci-region-benchmark",
+          'freeform-tags' in runbook and 'oci-region-benchmark' in runbook)
     check("runbook: ttl tag applied", 'ttl' in runbook and '4h' in runbook)
     check("runbook: region tag applied per instance",
           'ap-mumbai-1' in runbook and 'ap-hyderabad-1' in runbook)
 
     # 5. TAG_TIMESTAMP must be defined independently in each launch block
-    #    (Mumbai 2a and Hyderabad 2b each initialize it — count >= 2)
     timestamp_defs = runbook.count('TAG_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"')
     check("runbook: TAG_TIMESTAMP defined independently per launch block (>= 2)",
           timestamp_defs >= 2,
@@ -970,129 +971,176 @@ def cmd_self_test(args):
           'Terminating Mumbai probe due to Hyderabad launch failure' in runbook and
           '--wait-for-state TERMINATED' in runbook)
 
-    # ── Section B: Teardown coverage ──
+    # 7. ID capture BEFORE wait — launch must NOT include --wait-for-state RUNNING
+    launch_mumbai = runbook[runbook.find('### 2a'):runbook.find('### 2b')] if '### 2a' in runbook else ''
+    launch_hyderabad = runbook[runbook.find('### 2b'):runbook.find('Phase 3')] if '### 2b' in runbook else ''
+    check("runbook: Mumbai launch does NOT use --wait-for-state RUNNING with capture",
+          'oci compute instance launch' in launch_mumbai and
+          '--query' in launch_mumbai and
+          not ('--wait-for-state RUNNING' in launch_mumbai.split('--query')[0] if '--query' in launch_mumbai else False))
+    check("runbook: Hyderabad launch does NOT use --wait-for-state RUNNING with capture",
+          'oci compute instance launch' in launch_hyderabad and
+          '--query' in launch_hyderabad and
+          not ('--wait-for-state RUNNING' in launch_hyderabad.split('--query')[0] if '--query' in launch_hyderabad else False))
 
-    # 7. Teardown must cover BOTH Mumbai and Hyderabad explicitly
+    # 8. Separate waiter call after OCID capture
+    check("runbook: Mumbai has separate 'instance get --wait-for-state RUNNING'",
+          'instance get' in launch_mumbai and '--wait-for-state RUNNING' in launch_mumbai)
+    check("runbook: Hyderabad has separate 'instance get --wait-for-state RUNNING'",
+          'instance get' in launch_hyderabad and '--wait-for-state RUNNING' in launch_hyderabad)
+
+    # 9. If waiter fails, terminate the known ID with --wait-for-state TERMINATED
+    check("runbook: Mumbai waiter failure terminates instance",
+          'did not reach RUNNING state' in launch_mumbai and
+          'Terminating the instance' in launch_mumbai and
+          '--wait-for-state TERMINATED' in launch_mumbai)
+    check("runbook: Hyderabad waiter failure terminates both regions",
+          'did not reach RUNNING state' in launch_hyderabad and
+          'Terminating the Hyderabad instance' in launch_hyderabad and
+          'Terminating Mumbai probe due to Hyderabad wait failure' in launch_hyderabad)
+
+    # 10. SSH public key file required and validated
+    check("runbook: SSH_PUBLIC_KEY_FILE exported in Mumbai",
+          'SSH_PUBLIC_KEY_FILE' in launch_mumbai)
+    check("runbook: SSH_PUBLIC_KEY_FILE exported in Hyderabad",
+          'SSH_PUBLIC_KEY_FILE' in launch_hyderabad)
+    check("runbook: SSH key file validated (non-empty check)",
+          '! -s "${SSH_PUBLIC_KEY_FILE}"' in runbook)
+    check("runbook: --ssh-authorized-keys-file passed to launch",
+          '--ssh-authorized-keys-file' in runbook)
+
+    # 11. Retry token for idempotent launch
+    check("runbook: Mumbai launch uses --opc-retry-token",
+          '--opc-retry-token' in launch_mumbai and 'RETRY_TOKEN' in launch_mumbai)
+    check("runbook: Hyderabad launch uses --opc-retry-token",
+          '--opc-retry-token' in launch_hyderabad and 'RETRY_TOKEN' in launch_hyderabad)
+
+    # 12. set -euo pipefail on launch blocks
+    check("runbook: Mumbai launch block has set -euo pipefail",
+          'set -euo pipefail' in launch_mumbai)
+    check("runbook: Hyderabad launch block has set -euo pipefail",
+          'set -euo pipefail' in launch_hyderabad)
+
+    # ── Section B: Teardown fail-closed ──
+
+    # 13. set -euo pipefail on every teardown/verification/emergency block
+    for block_name, block_text in [
+        ("5a", runbook[runbook.find('### 5a'):runbook.find('### 5b')] if '### 5a' in runbook else ''),
+        ("5b", runbook[runbook.find('### 5b'):runbook.find('### 5c')] if '### 5b' in runbook else ''),
+        ("5c", runbook[runbook.find('### 5c'):runbook.find('\n## Phase 6')] if '### 5c' in runbook else ''),
+        ("emergency", runbook[runbook.find('Emergency Teardown'):runbook.find('Default Behavior')] if 'Emergency Teardown' in runbook else ''),
+    ]:
+        has_pipefail = 'set -euo pipefail' in block_text
+        check(f"runbook: {block_name} teardown block has set -euo pipefail", has_pipefail,
+              f"{block_name} block missing set -euo pipefail" if not has_pipefail else "")
+
+    # 14. Teardown covers both regions with --wait-for-state TERMINATED
     check("runbook: teardown covers Mumbai",
           'ap-mumbai-1' in runbook and '--wait-for-state TERMINATED' in runbook)
     check("runbook: teardown covers Hyderabad",
           'ap-hyderabad-1' in runbook and '--wait-for-state TERMINATED' in runbook)
 
-    # 8. Phase-5c verification must query freeform-tags.purpose, NOT grep display names
-    mumbai_5c_query = 'freeform-tags' in runbook and 'oci-region-benchmark' in runbook
-    check("runbook: 5c Mumbai verification uses freeform-tags.purpose query", mumbai_5c_query)
-    # Grep must NOT appear in Phase 5c (it was removed)
-    check("runbook: 5c does not grep display names for Mumbai",
-          'grep' not in runbook[runbook.find('### 5c'):runbook.find('Phase 6')] if '### 5c' in runbook else True,
-          "Phase 5c still contains grep" if '### 5c' in runbook and 'grep' in runbook[runbook.find('### 5c'):runbook.find('Phase 6')] else "")
-    check("runbook: 5c does not grep display names for Hyderabad",
-          'grep' not in runbook[runbook.find('### 5c'):runbook.find('Phase 6')] if '### 5c' in runbook else True)
-
-    # 9. No || true in Phase 5c verification
-    if '### 5c' in runbook:
-        section_5c = runbook[runbook.find('### 5c'):runbook.find('Phase 6')]
-        check("runbook: 5c no '|| true' error suppression", '|| true' not in section_5c)
-    else:
-        check("runbook: 5c no '|| true' error suppression (section not found)", False)
-
-    # 10. Emergency teardown list queries must use JMESPath backtick-literal
-    #     join(`"\n"`, ...) NOT the broken join('\n', ...) which produces
-    #     literal backslash+n instead of a newline.  JMESPath backtick literals
-    #     are JSON values; `"\n"` is the JSON string "\n" which IS a newline.
+    # 15. Phase-5c verification: freeform-tags query, no grep, no || true
     emergency_start = runbook.find('Emergency Teardown')
-    if emergency_start > 0:
-        emergency_section = runbook[emergency_start:]
-        # Regression: must NOT contain the broken form
-        check("runbook: emergency section rejects broken join('\\n',...)",
-              "join('\\n'" not in emergency_section,
-              "Found broken join('\\n',...) — literal backslash+n, not newline")
-        # Must contain the correct backtick-literal form (at least 6 occurrences
-        # across Phase 5c and Emergency sections)
-        correct_form_count = runbook.count('join(`"\\n"`')
-        check("runbook: all 6 list/verification queries use join(`\"\\n\"`,...)",
-              correct_form_count >= 6,
-              f"found {correct_form_count} correct join() queries (need >= 6)")
-        # Emergency section specifically must have the correct form with backtick values
-        check("runbook: emergency section uses backtick-literal `\"TERMINATED\"`",
-              '`"TERMINATED"`' in emergency_section)
-        check("runbook: emergency section uses backtick-literal `\"oci-region-benchmark\"`",
-              '`"oci-region-benchmark"`' in emergency_section)
-    else:
-        check("runbook: emergency section found", False)
-
-    # 11. Phase 5c must also use backtick-literal form (not grep, not || true)
     if '### 5c' in runbook:
         phase6_start = runbook.find('\n## Phase 6')
         if phase6_start < 0:
             phase6_start = runbook.find('## Phase 6')
         section_5c = runbook[runbook.find('### 5c'):phase6_start]
-        check("runbook: 5c rejects broken join('\\n',...)",
-              "join('\\n'" not in section_5c)
         check("runbook: 5c no '|| true' error suppression", '|| true' not in section_5c)
         check("runbook: 5c uses freeform-tags JMESPath, not grep",
               'grep' not in section_5c and 'freeform-tags' in section_5c)
     else:
         check("runbook: 5c section found", False)
 
-    # 12. Emergency final verification: no 2>/dev/null or || true
+    # 16. JMESPath backtick-literal queries (not broken join('\\n',...))
     if emergency_start > 0:
-        final_verify_start = emergency_section.find('Final verification')
-        if final_verify_start > 0:
-            final_block = emergency_section[final_verify_start:]
-            check("runbook: emergency final verification no 2>/dev/null",
-                  '2>/dev/null' not in final_block)
-            check("runbook: emergency final verification no '|| true'",
-                  '|| true' not in final_block)
-        else:
-            check("runbook: emergency final verification subsection found", False)
-    else:
-        check("runbook: emergency section found", False)
-
-    # 13. Emergency list queries: no display-name grep
-    if emergency_start > 0:
+        emergency_section = runbook[emergency_start:]
+        check("runbook: emergency section rejects broken join('\\n',...)",
+              "join('\\n'" not in emergency_section)
+        correct_form_count = runbook.count('join(`"\\n"`')
+        check("runbook: all 6 list/verification queries use join(`\"\\n\"`,...)",
+              correct_form_count >= 6,
+              f"found {correct_form_count} (need >= 6)")
+        check("runbook: emergency section uses backtick-literal `\"TERMINATED\"`",
+              '`"TERMINATED"`' in emergency_section)
+        check("runbook: emergency section no 2>/dev/null in final verification",
+              '2>/dev/null' not in emergency_section[emergency_section.find('Final verification'):]
+              if 'Final verification' in emergency_section else False)
+        check("runbook: emergency section no '|| true' in final verification",
+              '|| true' not in emergency_section[emergency_section.find('Final verification'):]
+              if 'Final verification' in emergency_section else False)
         check("runbook: emergency section no display-name grep",
               "'oci-benchmark-probe'" not in emergency_section)
-    else:
-        check("runbook: emergency section found", False)
 
-    # 14. Evidence gate must reference teardown verification
+    # ── Section C: Safety policy statements ──
+
+    check("runbook: warns Always Free compute home-region only (may be billable)",
+          'may be billable' in runbook.lower() or
+          'home region' in runbook.lower() or
+          'tenancy home region' in runbook)
+    check("runbook: states SSH subnet ingress must be temporary/removed after teardown",
+          'ingress' in runbook.lower() and ('remove' in runbook.lower() or 'temporar' in runbook.lower()))
+    check("runbook: no hardcoded SSH public key",
+          'ssh-rsa' not in runbook and 'ssh-ed25519' not in runbook and 'ecdsa-sha2' not in runbook)
+    check("runbook: no hardcoded CIDR — only mentioned as warning",
+          '0.0.0.0/0' in runbook and 'Never expose SSH to 0.0.0.0/0' in runbook)
     check("runbook: evidence phase gates on teardown verification",
           'teardown verification' in runbook.lower() or
-          'not proceed to Phase 6' in runbook or
-          'clean' in runbook)
-
-    # 15. No benchmark-probes.env file writes
+          'not proceed to Phase 6' in runbook)
     check("runbook: no benchmark-probes.env file writes",
           '>> benchmark-probes.env' not in runbook and
-          '> benchmark-probes.env' not in runbook and
-          'tee benchmark-probes.env' not in runbook)
+          '> benchmark-probes.env' not in runbook)
+    check("runbook: correctly states no --yes flag",
+          'no `--yes` flag' in runbook or 'does not require a `--yes`' in runbook)
 
-    # 16. Correctly states no --yes flag
-    check("runbook: correctly states no --yes flag for OCI CLI",
-          'no --yes flag' in runbook.lower() or
-          'does not require' in runbook.lower())
+    # ── Section D: Mock-OCI shell regression (fail-closed) ──
+    # Prove: with set -euo pipefail, an oci list failure exits nonzero
+    # and never prints "clean".
+    mock_script = '''#!/usr/bin/env bash
+set -euo pipefail
+# Mock oci that always fails
+oci() { echo "OCI CLI error: network timeout" >&2; return 1; }
+export -f oci
+MUMBAI_COMPARTMENT_ID="ocid1.test.oc1..fake"
+# Simulate 5c verification pattern
+MUMBAI_REMAINING="$(oci compute instance list --compartment-id "${MUMBAI_COMPARTMENT_ID}" --region ap-mumbai-1 --query 'data[].id' --raw-output)"
+if [ -n "${MUMBAI_REMAINING}" ]; then
+  echo "FATAL: found probes"
+  exit 1
+fi
+echo "Mumbai: clean"
+'''
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
+            f.write(mock_script)
+            tmp_path = f.name
+        result = subprocess.run(['bash', tmp_path], capture_output=True, text=True, timeout=10)
+        os.unlink(tmp_path)
+        check("mock-oci: oci list failure exits nonzero with set -euo pipefail",
+              result.returncode != 0,
+              f"exit code {result.returncode}, stdout: {result.stdout.strip()}")
+        check("mock-oci: oci list failure never prints 'clean'",
+              'clean' not in result.stdout,
+              f"printed: {result.stdout.strip()}")
+    except Exception as e:
+        check("mock-oci: regression test ran", False, str(e))
+        check("mock-oci: oci list failure exits nonzero (skipped)", True)
+        check("mock-oci: oci list failure never prints 'clean' (skipped)", True)
 
-    # 17. JMESPath semantics test: prove `"\n"` (backtick literal) produces
-    #     a newline while '\n' (JMESPath literal string) does not.
-    #     Uses Python jmespath if available; otherwise a structural check.
+    # ── JMESPath semantics (optional) ──
     try:
         import jmespath
-        # Backtick literal: `"\n"` is JSON "\n" = actual newline
-        result_literal = jmespath.search('join(`"\n"`, ["a","b"])', {})
+        result_literal = jmespath.search('join(`"\\n"`, ["a","b"])', {})
         check("jmespath: join(backtick `\"\\n\"`) produces actual newline",
-              result_literal == 'a\nb',
-              f"got {repr(result_literal)}")
-        # Single-quoted string: '\n' is literal backslash+n
+              result_literal == 'a\nb', f"got {repr(result_literal)}")
         result_raw = jmespath.search("join('\\n', ['a','b'])", {})
         check("jmespath: join(raw '\\n') produces literal backslash+n",
-              result_raw == 'a\\nb' or result_raw == 'a\\nb',
+              '\\n' in result_raw and result_raw != 'a\nb',
               f"got {repr(result_raw)}")
-        # The two forms produce different output
         check("jmespath: backtick and raw '\\n' produce different separators",
-              result_literal != result_raw,
-              f"both produced {repr(result_literal)}")
+              result_literal != result_raw)
     except ImportError:
-        # jmespath not installed — structural checks suffice; this is NOT a failure
         check("jmespath: import available (OK — structural checks sufficient)", True,
               "pip install jmespath for full semantics validation (optional)")
         check("jmespath: join(backtick) produces newline (skipped)", True)

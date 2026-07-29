@@ -67,25 +67,45 @@ capacity" errors appear, document the error and date.
 ## Phase 2: Provision Temporary Probe Instances
 
 > **⚠️ THIS PROVISIONS REAL OCI RESOURCES.** Only run when you are ready to incur
-> usage (even within Always Free limits). Always destroy probes when done.
+> usage. Always Free compute (Ampere A1) applies only in your **tenancy home
+> region**; the non-home comparison region **may be billable** even if both are
+> Always Free shapes. Check your tenancy home region in the OCI Console before
+> provisioning.
+>
 > Provisioning does not require a `--yes` flag — it runs immediately once valid
 > resource OCIDs are supplied.
+>
+> **Network prerequisite:** The subnet must allow inbound TCP/22 (SSH) from the
+> operator's trusted CIDR **temporarily**. Remove this ingress rule after teardown.
+> Never expose SSH to 0.0.0.0/0.
 
 ### 2a. Provision in Mumbai
 
 ```bash
+set -euo pipefail
+
 # REQUIRED: Operator must supply these values
 export MUMBAI_COMPARTMENT_ID="ocid1.compartment.oc1..__CHANGE_ME__"
 export MUMBAI_SUBNET_ID="ocid1.subnet.oc1.ap-mumbai-1.__CHANGE_ME__"
 export MUMBAI_IMAGE_ID="ocid1.image.oc1.ap-mumbai-1.__CHANGE_ME__"
+export SSH_PUBLIC_KEY_FILE="${HOME}/.ssh/id_rsa.pub"   # operator-supplied path
+
+# Validate SSH public key file exists and is non-empty
+if [ ! -s "${SSH_PUBLIC_KEY_FILE}" ]; then
+  echo "FATAL: SSH_PUBLIC_KEY_FILE '${SSH_PUBLIC_KEY_FILE}' does not exist or is empty" >&2
+  echo "Generate one with: ssh-keygen -t rsa -b 4096 -f ~/.ssh/id_rsa -N ''" >&2
+  exit 1
+fi
+
 export MUMBAI_AD="$(oci iam availability-domain list \
   --compartment-id "${MUMBAI_COMPARTMENT_ID}" \
   --query 'data[0].name' --raw-output \
   --region ap-mumbai-1)"
 
 export TAG_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+export RETRY_TOKEN="probe-mumbai-${TAG_TIMESTAMP}-$(uuidgen 2>/dev/null || head -c 16 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9')"
 
-# Launch probe and capture instance OCID — must not be blank
+# ── Step 1: Launch (do NOT wait here) ──
 MUMBAI_INSTANCE_ID="$(oci compute instance launch \
   --compartment-id "${MUMBAI_COMPARTMENT_ID}" \
   --availability-domain "${MUMBAI_AD}" \
@@ -95,35 +115,64 @@ MUMBAI_INSTANCE_ID="$(oci compute instance launch \
   --image-id "${MUMBAI_IMAGE_ID}" \
   --display-name "oci-benchmark-probe-mumbai-${TAG_TIMESTAMP}" \
   --assign-public-ip true \
+  --ssh-authorized-keys-file "${SSH_PUBLIC_KEY_FILE}" \
   --freeform-tags '{"purpose":"oci-region-benchmark","ttl":"4h","region":"ap-mumbai-1"}' \
-  --wait-for-state RUNNING \
+  --opc-retry-token "${RETRY_TOKEN}" \
   --region ap-mumbai-1 \
   --query 'data.id' --raw-output)"
 
-# Fail if OCID is blank
+# ── Step 2: Validate OCID immediately (before waiting) ──
 if [ -z "${MUMBAI_INSTANCE_ID}" ]; then
-  echo "FATAL: MUMBAI_INSTANCE_ID is blank — launch failed or returned no ID" >&2
+  echo "FATAL: MUMBAI_INSTANCE_ID is blank — launch returned no ID" >&2
   exit 1
 fi
-echo "Mumbai probe launched: ${MUMBAI_INSTANCE_ID}"
+echo "Mumbai probe OCID captured: ${MUMBAI_INSTANCE_ID}"
+
+# ── Step 3: Wait for RUNNING (separate call — if it fails, terminate the known ID) ──
+if ! oci compute instance get \
+    --instance-id "${MUMBAI_INSTANCE_ID}" \
+    --region ap-mumbai-1 \
+    --wait-for-state RUNNING \
+    --query 'data."lifecycle-state"' --raw-output > /dev/null 2>&1; then
+  echo "FATAL: Mumbai probe ${MUMBAI_INSTANCE_ID} did not reach RUNNING state" >&2
+  echo "Terminating the instance to avoid an orphaned billable resource..." >&2
+  oci compute instance terminate \
+    --instance-id "${MUMBAI_INSTANCE_ID}" \
+    --force \
+    --region ap-mumbai-1 \
+    --wait-for-state TERMINATED
+  echo "Mumbai probe terminated." >&2
+  exit 1
+fi
+echo "Mumbai probe RUNNING: ${MUMBAI_INSTANCE_ID}"
 ```
 
 ### 2b. Provision in Hyderabad
 
 ```bash
+set -euo pipefail
+
 # REQUIRED: Operator must supply these values
 export HYDERABAD_COMPARTMENT_ID="ocid1.compartment.oc1..__CHANGE_ME__"
 export HYDERABAD_SUBNET_ID="ocid1.subnet.oc1.ap-hyderabad-1.__CHANGE_ME__"
 export HYDERABAD_IMAGE_ID="ocid1.image.oc1.ap-hyderabad-1.__CHANGE_ME__"
+export SSH_PUBLIC_KEY_FILE="${HOME}/.ssh/id_rsa.pub"   # same key as Mumbai
+
+# Validate SSH public key file exists and is non-empty
+if [ ! -s "${SSH_PUBLIC_KEY_FILE}" ]; then
+  echo "FATAL: SSH_PUBLIC_KEY_FILE '${SSH_PUBLIC_KEY_FILE}' does not exist or is empty" >&2
+  exit 1
+fi
+
 export HYDERABAD_AD="$(oci iam availability-domain list \
   --compartment-id "${HYDERABAD_COMPARTMENT_ID}" \
   --query 'data[0].name' --raw-output \
   --region ap-hyderabad-1)"
 
-# Initialize timestamp independently (this block must work standalone)
 export TAG_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+export RETRY_TOKEN="probe-hyderabad-${TAG_TIMESTAMP}-$(uuidgen 2>/dev/null || head -c 16 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9')"
 
-# Launch probe and capture instance OCID — must not be blank
+# ── Step 1: Launch (do NOT wait here) ──
 HYDERABAD_INSTANCE_ID="$(oci compute instance launch \
   --compartment-id "${HYDERABAD_COMPARTMENT_ID}" \
   --availability-domain "${HYDERABAD_AD}" \
@@ -133,38 +182,76 @@ HYDERABAD_INSTANCE_ID="$(oci compute instance launch \
   --image-id "${HYDERABAD_IMAGE_ID}" \
   --display-name "oci-benchmark-probe-hyderabad-${TAG_TIMESTAMP}" \
   --assign-public-ip true \
+  --ssh-authorized-keys-file "${SSH_PUBLIC_KEY_FILE}" \
   --freeform-tags '{"purpose":"oci-region-benchmark","ttl":"4h","region":"ap-hyderabad-1"}' \
-  --wait-for-state RUNNING \
+  --opc-retry-token "${RETRY_TOKEN}" \
   --region ap-hyderabad-1 \
   --query 'data.id' --raw-output)"
 
-# Fail if OCID is blank
+# ── Step 2: Validate OCID immediately (before waiting) ──
 if [ -z "${HYDERABAD_INSTANCE_ID}" ]; then
-  echo "FATAL: HYDERABAD_INSTANCE_ID is blank — launch failed or returned no ID" >&2
-  # Emergency: terminate Mumbai probe, wait for TERMINATED, and verify
-  if [ -n "${MUMBAI_INSTANCE_ID}" ]; then
-    echo "Terminating Mumbai probe due to Hyderabad launch failure..."
+  echo "FATAL: HYDERABAD_INSTANCE_ID is blank — launch returned no ID" >&2
+  # Terminate Mumbai before exiting
+  if [ -n "${MUMBAI_INSTANCE_ID:-}" ]; then
+    echo "Terminating Mumbai probe due to Hyderabad launch failure..." >&2
     oci compute instance terminate \
       --instance-id "${MUMBAI_INSTANCE_ID}" \
       --force \
       --region ap-mumbai-1 \
       --wait-for-state TERMINATED
-    echo "Mumbai probe terminated."
+    echo "Mumbai probe terminated." >&2
   fi
   exit 1
 fi
-echo "Hyderabad probe launched: ${HYDERABAD_INSTANCE_ID}"
+echo "Hyderabad probe OCID captured: ${HYDERABAD_INSTANCE_ID}"
+
+# ── Step 3: Wait for RUNNING (separate call — if it fails, terminate BOTH regions) ──
+if ! oci compute instance get \
+    --instance-id "${HYDERABAD_INSTANCE_ID}" \
+    --region ap-hyderabad-1 \
+    --wait-for-state RUNNING \
+    --query 'data."lifecycle-state"' --raw-output > /dev/null 2>&1; then
+  echo "FATAL: Hyderabad probe ${HYDERABAD_INSTANCE_ID} did not reach RUNNING state" >&2
+  echo "Terminating the Hyderabad instance..." >&2
+  oci compute instance terminate \
+    --instance-id "${HYDERABAD_INSTANCE_ID}" \
+    --force \
+    --region ap-hyderabad-1 \
+    --wait-for-state TERMINATED
+  echo "Hyderabad probe terminated." >&2
+  # Also terminate Mumbai
+  if [ -n "${MUMBAI_INSTANCE_ID:-}" ]; then
+    echo "Terminating Mumbai probe due to Hyderabad wait failure..." >&2
+    oci compute instance terminate \
+      --instance-id "${MUMBAI_INSTANCE_ID}" \
+      --force \
+      --region ap-mumbai-1 \
+      --wait-for-state TERMINATED
+    echo "Mumbai probe terminated." >&2
+  fi
+  exit 1
+fi
+echo "Hyderabad probe RUNNING: ${HYDERABAD_INSTANCE_ID}"
 ```
 
-> **Note:** Instance OCIDs are captured directly from `oci compute instance launch
-> --query 'data.id' --raw-output`. No `benchmark-probes.env` file is written.
-> OCIDs must be exported as environment variables and verified non-blank before
-> proceeding to subsequent phases.
+> **Note:** Instance OCIDs are captured from `oci compute instance launch
+> --query 'data.id' --raw-output` **without** `--wait-for-state RUNNING`.
+> The OCID is validated immediately, then a separate `oci compute instance get
+> --wait-for-state RUNNING` call waits for the instance.  If the waiter fails,
+> the known OCID is terminated with `--wait-for-state TERMINATED` before
+> exit — this prevents orphaned billable instances.  The `--opc-retry-token`
+> makes launch idempotent.
+>
+> No `benchmark-probes.env` file is written.  OCIDs must be exported as
+> environment variables and verified non-blank before proceeding.
 
 ## Phase 3: Run Network Probes
 
-Once instances are RUNNING and you have SSH access, run probes from each instance.
-
+> **Prerequisites:** Both instances must be RUNNING (from Phase 2).  SSH access
+> requires the public key passed via `--ssh-authorized-keys-file` in Phases 2a/2b.
+> The subnet must have a temporary ingress rule for TCP/22 from the operator's
+> trusted CIDR — **remove this ingress rule after teardown**.
+>
 > **All target endpoints must be operator-supplied.** No Supabase project URL,
 > candidate endpoint, or credential is hardcoded in the CLI.
 
@@ -237,7 +324,9 @@ python3 scripts/oci-benchmark-run schema-validate benchmark-result.json
 ### 5a. Terminate Mumbai Probe and Wait
 
 ```bash
-if [ -n "${MUMBAI_INSTANCE_ID}" ]; then
+set -euo pipefail
+
+if [ -n "${MUMBAI_INSTANCE_ID:-}" ]; then
   echo "Terminating Mumbai probe: ${MUMBAI_INSTANCE_ID}"
   oci compute instance terminate \
     --instance-id "${MUMBAI_INSTANCE_ID}" \
@@ -254,7 +343,9 @@ fi
 ### 5b. Terminate Hyderabad Probe and Wait
 
 ```bash
-if [ -n "${HYDERABAD_INSTANCE_ID}" ]; then
+set -euo pipefail
+
+if [ -n "${HYDERABAD_INSTANCE_ID:-}" ]; then
   echo "Terminating Hyderabad probe: ${HYDERABAD_INSTANCE_ID}"
   oci compute instance terminate \
     --instance-id "${HYDERABAD_INSTANCE_ID}" \
@@ -271,6 +362,8 @@ fi
 ### 5c. Verify No Tagged Probes Remain (Both Regions)
 
 ```bash
+set -euo pipefail
+
 echo "Verifying no benchmark probes remain in Mumbai..."
 MUMBAI_REMAINING="$(oci compute instance list \
   --compartment-id "${MUMBAI_COMPARTMENT_ID}" \
@@ -329,6 +422,8 @@ If something goes wrong and you need to destroy everything immediately across
 both regions:
 
 ```bash
+set -euo pipefail
+
 # ── Mumbai ──
 echo "=== Emergency teardown: Mumbai ==="
 MUMBAI_IDS="$(oci compute instance list \
