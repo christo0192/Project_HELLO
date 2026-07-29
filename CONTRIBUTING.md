@@ -55,3 +55,19 @@ for 90 days. Run `bash scripts/sbom.sh` locally to preview.
 The repository owner authorized a one-time bootstrap push on 2026-07-27 after
 the commit-eligible tree passed redacted secret and PII checks. Account-side
 credential rotation and quarantined evidence remain production blockers.
+
+## External blockers (Phase 0)
+
+Phase-0 Foundation tasks: FND01 repository controls merged/hosted enforcement blocked; FND02 scanner controls merged/owner rotation evidence pending; FND03 containment controls merged/sanitization+synthetic+restricted-storage disposition pending. Each requires owner action outside the working tree and cannot close solely through additional implementation code.
+
+| Blocker | Plan task | Required action | Evidence needed |
+|---------|-----------|-----------------|-----------------|
+| Branch protection not enforced | FND-01 | GitHub private-plan upgrade or equivalent control approved by repository owner | Ruleset URL or exported settings evidence; status checks enforced on `main` |
+| Credential rotation pending (6 providers) | FND-02 | Authorized owner rotates each credential in-provider | Non-secret revocation evidence per provider (audit log, rotation timestamp, or old-credential-rejection test) |
+| Candidate artifacts not sanitized | FND-03 | Synthetic replacements authored for all quarantined media | Shareable synthetic assets committed; original evidence dispositioned to approved restricted storage with evidence |
+
+See `docs/repository-inventory.md` for per-task detail and
+`docs/security/credential-inventory.md` for the per-provider rotation table.
+
+`PLAN.md` is the production-readiness source of truth. These blockers must be
+resolved before FND-01, FND-02, and FND-03 can be marked complete.
