@@ -33,9 +33,9 @@ jobs:
         run: npm ci && npm run typecheck && npm test
       - name: Audit API dependencies
         run: bash scripts/audit-deps.sh --dir app/api
-      - name: Install, lint, and build web
+      - name: Install, lint, test, and build web
         working-directory: app/web
-        run: npm ci && npm run lint && npm run build
+        run: npm ci && npm run lint && npm run test:typecheck && npm test && npm run build
       - name: Smoke-test CSP header
         run: node scripts/smoke-test-csp.mjs
       - name: Audit web dependencies
@@ -51,4 +51,6 @@ jobs:
           path: sbom-artifacts/*.cdx.json
           retention-days: 90
       - name: Compile LiveKit worker
-        run: python3 -m py_compile app/voice-livekit/agent.py app/voice-livekit/persistence.py app/voice-livekit/prompting.py
+        run: python3 -m py_compile app/voice-livekit/agent.py app/voice-livekit/persistence.py app/voice-livekit/prompting.py app/voice-livekit/observability.py
+      - name: Test LiveKit observability
+        run: python3 -m unittest discover -s app/voice-livekit/tests -p "test_*.py" -v

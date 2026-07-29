@@ -5,29 +5,36 @@ existing ``screening_v2.call_sessions.id``; this worker writes live transcript
 turns against that id, completes the session, and triggers the same API scoring
 route used by the old Pipecat flow.
 
-LLM-06: Adds provenance claiming via set_session_provenance() with
-compare-and-set CAS semantics.
+LLM-06 adds provenance claiming via ``set_session_provenance()`` with
+compare-and-set semantics. OBS-01/OBS-02 route all output through the redacting
+``StructuredLogger`` and propagate ``X-Correlation-ID`` to the scoring API.
+No transcript text, raw exceptions, session IDs, URLs, response bodies, or raw
+provenance values are logged.
 """
 
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-import httpx
+try:
+    import httpx
+except ImportError:  # pragma: no cover — keeps syntax-check mode usable
+    httpx = None  # type: ignore[assignment]
 
 try:
     from supabase import create_client
-except ImportError:  # pragma: no cover - keeps console mode usable without persistence deps
+except ImportError:  # pragma: no cover — keeps console mode usable without persistence deps
     create_client = None
 
+from observability import StructuredLogger, get_correlation_id
 
 SCHEMA = os.getenv("SUPABASE_SCHEMA", "screening_v2")
 API_BASE = os.getenv("API_BASE", "http://localhost:8787")
-logger = logging.getLogger("voice-livekit.persistence")
+
+_log = StructuredLogger("persistence")
 _client = None
 
 
@@ -58,7 +65,7 @@ def _get_client():
     url = os.getenv("SUPABASE_URL")
     key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
     if not (url and key and create_client):
-        logger.warning("[livekit-db] Supabase creds missing - persistence disabled")
+        _log.warn("db_error", error_category="supabase_creds_missing")
         return None
     _client = create_client(url, key)
     return _client
@@ -84,10 +91,10 @@ async def set_session_provenance(
 
     Returns one of ``ClaimResult.*`` values.
 
-    Never logs the raw provenance dict — only the session_id and result type.
+    Never logs the raw provenance dict or session identifier.
     """
     if not session_id:
-        logger.warning("set_session_provenance MISSING session_id none")
+        _log.warn("db_error", error_category="provenance_session_missing")
         return ClaimResult.MISSING
 
     def run():
@@ -105,17 +112,16 @@ async def set_session_provenance(
 
     try:
         result = await asyncio.to_thread(run)
-    except Exception:
-        logger.warning("set_session_provenance ERROR session=%s", session_id)
+    except Exception:  # noqa: BLE001
+        _log.warn("db_error", error_category="provenance_claim_failed")
         return ClaimResult.ERROR
 
     if result is None:
-        logger.warning("set_session_provenance MISSING session=%s", session_id)
+        _log.warn("db_error", error_category="provenance_store_missing")
         return ClaimResult.MISSING
 
     rows = result.data if hasattr(result, "data") else None
     if rows and len(rows) > 0:
-        logger.info("set_session_provenance CLAIMED session=%s", session_id)
         return ClaimResult.CLAIMED
 
     # Rows affected = 0 — provenance was not null.  Read current value to
@@ -128,8 +134,8 @@ async def set_session_provenance(
             return tbl.select("provenance").eq("id", session_id).single().execute()
 
         session_result = await asyncio.to_thread(read_provenance)
-    except Exception:
-        logger.warning("set_session_provenance MISSING session=%s", session_id)
+    except Exception:  # noqa: BLE001
+        _log.warn("db_error", error_category="provenance_read_failed")
         return ClaimResult.MISSING
 
     existing = None
@@ -137,14 +143,13 @@ async def set_session_provenance(
         existing = session_result.data.get("provenance")
 
     if existing is None:
-        logger.warning("set_session_provenance ERROR session=%s race", session_id)
+        _log.warn("db_error", error_category="provenance_claim_race")
         return ClaimResult.ERROR
 
     if existing == provenance:
-        logger.info("set_session_provenance ALREADY_MATCHING session=%s", session_id)
         return ClaimResult.ALREADY_MATCHING
 
-    logger.warning("set_session_provenance CONFLICT session=%s", session_id)
+    _log.warn("db_error", error_category="provenance_conflict")
     return ClaimResult.CONFLICT
 
 
@@ -169,9 +174,10 @@ async def save_turn(session_id: Optional[str], turn_index: int, speaker: str, te
 
     try:
         await asyncio.to_thread(run)
-        logger.info("save_turn session=%s turn=%d speaker=%s", session_id, turn_index, speaker)
-    except Exception as exc:
-        logger.warning("save_turn failed session=%s: %s", session_id, exc)
+        # No transcript text or session ID logged.
+        _log.info("db_turn_saved", turn_index=turn_index, speaker=speaker)
+    except Exception:  # noqa: BLE001
+        _log.warn("db_error", error_category="save_turn_failed")
 
 
 async def complete_session(session_id: Optional[str], duration_sec: Optional[int] = None) -> None:
@@ -192,9 +198,10 @@ async def complete_session(session_id: Optional[str], duration_sec: Optional[int
 
     try:
         await asyncio.to_thread(run)
-        logger.info("call_session %s completed", session_id)
-    except Exception as exc:
-        logger.warning("complete_session failed session=%s: %s", session_id, exc)
+        # No session ID logged.
+        _log.info("session_complete", duration_sec=duration_sec)
+    except Exception:  # noqa: BLE001
+        _log.warn("db_error", error_category="complete_session_failed")
 
 
 async def fail_session(session_id: Optional[str], reason: str) -> None:
@@ -215,16 +222,48 @@ async def fail_session(session_id: Optional[str], reason: str) -> None:
 
     try:
         await asyncio.to_thread(run)
-    except Exception as exc:
-        logger.warning("fail_session failed session=%s: %s", session_id, exc)
+        _log.info("session_fail")
+    except Exception:  # noqa: BLE001
+        _log.warn("db_error", error_category="fail_session_failed")
 
 
-async def trigger_scoring(session_id: Optional[str]) -> None:
+async def trigger_scoring(session_id: Optional[str]) -> bool:
+    """Post to the scoring API; return True on 2xx, False otherwise."""
     if not session_id:
-        return
+        return False
+    if httpx is None:  # pragma: no cover
+        _log.warn("db_error", error_category="httpx_unavailable")
+        return False
+
+    # Propagate correlation ID to the API (OBS-02).
+    headers: dict[str, str] = {}
+    cid = get_correlation_id()
+    if cid:
+        headers["X-Correlation-ID"] = cid
+
     try:
         async with httpx.AsyncClient(timeout=180) as client:
-            response = await client.post(f"{API_BASE}/api/assess/{session_id}")
-            logger.info("scoring triggered session=%s HTTP %d", session_id, response.status_code)
-    except Exception as exc:
-        logger.warning("scoring trigger failed session=%s: %s", session_id, exc)
+            response = await client.post(
+                f"{API_BASE}/api/assess/{session_id}",
+                headers=headers,
+            )
+            # Log HTTP status only — no URL, response body, or session ID.
+            sc = response.status_code
+            if isinstance(sc, int) and 200 <= sc < 300:
+                _log.info("scoring_trigger", http_status=sc)
+                return True
+            if not isinstance(sc, int) or sc < 100 or sc > 599:
+                cat = "invalid_status"
+            elif 100 <= sc < 200:
+                cat = "http_informational"
+            elif 300 <= sc < 400:
+                cat = "http_redirect"
+            elif 400 <= sc < 500:
+                cat = "http_client_error"
+            else:
+                cat = "http_server_error"
+            _log.warn("scoring_failed", http_status=sc, error_category=cat)
+            return False
+    except Exception:  # noqa: BLE001
+        _log.warn("scoring_failed", error_category="http_error")
+        return False
