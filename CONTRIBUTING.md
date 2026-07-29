@@ -3,6 +3,11 @@
 `PLAN.md` is the production-readiness source of truth. Reference its task ID in
 every pull request and keep changes scoped to one reviewable outcome.
 
+`config/current-state.json` is the machine-readable current implementation and
+deployment status manifest. It is enforced by automated drift checks in CI.
+Update it whenever the runtime, provider status, or gate counts change.
+See `docs/current-state.md` for the update procedure.
+
 ## Repository rules
 
 1. Never commit `.env` files, credentials, provider keys, production project

@@ -11,9 +11,13 @@ P0 gates in `PLAN.md` are complete.
 
 - `PLAN.md`: production-readiness roadmap, architecture, decisions, and launch
   gates.
+- `config/current-state.json`: machine-readable current implementation and
+  deployment status (not a second roadmap).
 - `app/README.md`: current runtime map and local development entry points.
 - `docs/configuration.md`: environment separation and validation contract.
 - `docs/adr/`: current and proposed architecture decision records.
+- `docs/current-state.md`: documentation of the current-state manifest schema
+  and invariants.
 - `docs/repository-inventory.md`: Foundation inventory and quarantine state.
 - `docs/HANDOVER.md`: current delivery state, production blockers, and exact
   next-step resume instructions.

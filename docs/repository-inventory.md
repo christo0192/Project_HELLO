@@ -17,6 +17,8 @@ tasks. See `CONTRIBUTING.md` for the external-blockers summary.
 | `app/voice-livekit/` | Current LiveKit voice agent | Python |
 | `app/supabase/` | Current database migrations | PostgreSQL |
 | `app/voice/` | Previous Pipecat voice implementation retained during migration | Python |
+| `config/` | Current-state manifest and schema; environment schema | JSON |
+| `scripts/` | Drift checkers, contract validators, test suites | JavaScript |
 | `docs/` | Architecture, handover, and prototype evidence | Documentation/media |
 | `_archive/v1-retell/` | Archived Retell implementation; quarantined from Git pending review | Mixed |
 | `.gsd/` | Historical planning state; quarantined and superseded by `PLAN.md` | Documentation |

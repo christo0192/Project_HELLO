@@ -1,0 +1,170 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "version": 1,
+  "title": "Project HELLO Current State Manifest",
+  "description": "Machine-readable current implementation and deployment status. This is NOT a roadmap — PLAN.md remains the roadmap authority.",
+  "type": "object",
+  "required": [
+    "manifestVersion",
+    "evidenceDate",
+    "status",
+    "runtime",
+    "gates",
+    "phases",
+    "providers",
+    "docsStatus",
+    "constraints"
+  ],
+  "properties": {
+    "manifestVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Schema version for forward-compatibility checks"
+    },
+    "evidenceDate": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "description": "ISO-8601 date this manifest was last verified accurate"
+    },
+    "status": {
+      "type": "object",
+      "required": ["production", "dataStage", "scope"],
+      "properties": {
+        "production": {
+          "type": "string",
+          "enum": ["pre-production"],
+          "description": "No deployed production version exists"
+        },
+        "dataStage": {
+          "type": "string",
+          "enum": ["synthetic-only"],
+          "description": "Only synthetic data in repository; no real candidate PII"
+        },
+        "scope": {
+          "type": "string",
+          "enum": ["browser-only"],
+          "description": "Current scope is browser-first; telephony is future/separately gated"
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "required": ["activeComponents", "staleComponents"],
+      "properties": {
+        "activeComponents": {
+          "type": "object",
+          "description": "Currently maintained and targeted runtime components",
+          "patternProperties": {
+            "^[a-z][a-z0-9_-]+$": {
+              "type": "object",
+              "required": ["path", "purpose", "language"],
+              "properties": {
+                "path": { "type": "string" },
+                "purpose": { "type": "string" },
+                "language": { "type": "string", "enum": ["TypeScript", "Python", "PostgreSQL", "React/TypeScript", "React/Vite"] },
+                "productionStatus": { "type": "string", "enum": ["pre-production"] }
+              }
+            }
+          },
+          "minProperties": 1
+        },
+        "staleComponents": {
+          "type": "object",
+          "description": "Previously active components retained as reference only",
+          "patternProperties": {
+            "^[a-z][a-z0-9_-]+$": {
+              "type": "object",
+              "required": ["path", "purpose", "retentionReason"],
+              "properties": {
+                "path": { "type": "string" },
+                "purpose": { "type": "string" },
+                "retentionReason": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "gates": {
+      "type": "object",
+      "required": ["launchGatesComplete", "launchGatesTotal"],
+      "properties": {
+        "launchGatesComplete": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "launchGatesTotal": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "phases": {
+      "type": "object",
+      "required": ["acceptedPhasesComplete", "acceptedPhasesTotal"],
+      "description": "Roadmap phases defined in PLAN.md",
+      "properties": {
+        "acceptedPhasesComplete": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "acceptedPhasesTotal": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "providers": {
+      "type": "object",
+      "required": ["active", "stale"],
+      "properties": {
+        "active": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "status", "evidenceDate"],
+            "properties": {
+              "name": { "type": "string" },
+              "status": { "type": "string", "enum": ["current"] },
+              "evidenceDate": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" }
+            }
+          }
+        },
+        "stale": {
+          "type": "array",
+          "description": "Providers that are known-stale or archived — NOT active production fallbacks",
+          "items": {
+            "type": "object",
+            "required": ["name", "status"],
+            "properties": {
+              "name": { "type": "string" },
+              "status": { "type": "string", "enum": ["stale/reference", "archived"] }
+            }
+          }
+        }
+      }
+    },
+    "docsStatus": {
+      "type": "object",
+      "required": ["mandatoryDocsPresent"],
+      "properties": {
+        "mandatoryDocsPresent": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Paths that must exist and contain load-bearing statements"
+        }
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "description": "Known invariants the drift checker enforces",
+      "required": ["noProductionClaim", "noTelephonyCurrent", "noGateCountDrift", "noProviderBackslide"],
+      "properties": {
+        "noProductionClaim": { "type": "boolean", "const": true },
+        "noTelephonyCurrent": { "type": "boolean", "const": true },
+        "noGateCountDrift": { "type": "boolean", "const": true },
+        "noProviderBackslide": { "type": "boolean", "const": true }
+      }
+    }
+  }
+}

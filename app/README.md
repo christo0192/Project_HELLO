@@ -6,6 +6,9 @@ data outside an approved development environment.
 
 ## Current runtime
 
+See also `config/current-state.json` for the machine-readable manifest
+and `docs/current-state.md` for schema documentation.
+
 - `api/`: Express/TypeScript API, Supabase access, resume parsing, LiveKit room
   creation, transcript/session APIs, and prototype assessment generation.
 - `web/`: React/Vite recruiter dashboard and browser LiveKit client.
