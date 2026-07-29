@@ -3,7 +3,7 @@
 **Date:** 2026-07-28
 **Updated:** 2026-07-28 (repair r3: self-contained roots, IAM, metrics, logging, state, CI assertions)
 **Updated:** 2026-07-29 (repair r4: DG grammar, production gate, budget validations, project-name validation)
-**Updated:** 2026-07-29 (final: hashcorp/oci ~> 8.23, unused vars removed, budget >0, audit parity)
+**Updated:** 2026-07-29 (final: hashicorp/oci ~> 8.23, unused vars removed, budget >0, audit parity)
 **Plan references:** FND-05/06, REL-01/04, OBS-01..06, DEP-02..07
 
 ## PLAN cross-reference
@@ -15,7 +15,7 @@
 | REL-01 | Durable job queue | PARTIAL | OCI Queue with alarms provisioned; durability depends on deployed consumer + DLQ monitoring parity |
 | REL-04 | Retry/DLQ | PARTIAL | Internal DLQ configured via `dead_letter_queue_delivery_count`; automated DLQ detection/alert is PENDING a queue consumer or custom-metric integration |
 | OBS-01..02 | Structured logging + correlation | PARTIAL | Log group provisioned; app logs and correlation IDs require agent-managed CUSTOM logs from deployed compute instances — NOT provisioned yet |
-| OBS-03..04 | Metrics + distributed tracing | PARTIAL | APM domain + BytesIngested rate alarm provisioned; application metrics require app-side instrumentation — NOT provisoned yet |
+| OBS-03..04 | Metrics + distributed tracing | PARTIAL | APM domain + BytesIngested rate alarm provisioned; application metrics require app-side instrumentation — NOT provisioned yet |
 | OBS-05..06 | SLI/SLO + alerting | PARTIAL | Queue alarms + log ingestion alarm active; SLI/SLO definitions are pending app metrics |
 | DEP-02 | Provisioned capacity with headroom | PENDING | Compute shapes are NOT parameterized — no compute instances, autoscaling configs, or instance pools exist |
 | DEP-03 | HA decision | PENDING | Subnet/VCN design supports multi-AD; single-AD default has no HA |
@@ -68,7 +68,7 @@
 ## Example roots — pinned provider, lockfiles
 
 Both staging and production example roots are self-contained:
-- `required_providers` pinned to `hashicorp/oci` `~> 6.0`
+- `required_providers` pinned to `hashicorp/oci` `~> 8.23.0`
 - `provider "oci"` block with `region = var.region`
 - Committed `.terraform.lock.hcl` files for reproducible init
 - Production root blocks apply AND plan via `terraform_data` precondition until `production_apply_enabled = true` is explicitly set
@@ -76,11 +76,10 @@ Both staging and production example roots are self-contained:
 ## State isolation
 
 - Staging: local state acceptable (non-production data)
-- Production: apply BLOCKED until remote encrypted state (S3 + SSE) is configured
+- Production: plan and apply BLOCKED until remote encrypted state (S3 + SSE) is configured and the explicit gate is enabled
 - Each environment has its own `terraform.tfvars` (gitignored)
 - `.terraform.lock.hcl` is committed; `.terraform/` provider caches are NOT
 
 ## Region parameterization
 
-Every module accepts `region` as a variable. No region is hardcoded.
-Example roots default to `placeholder-region` — must be overridden.
+Each self-contained example root configures `provider "oci"` from its required `region` input. Child modules inherit that provider; they do not expose misleading no-op region variables. No deployment region is hardcoded.

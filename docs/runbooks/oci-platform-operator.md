@@ -90,12 +90,10 @@ Application and audit logs are NOT provisioned by Terraform yet.
 A log group exists (`<project>-<env>-logs`). When compute instances with the
 OCI Logging agent are deployed:
 
-1. Add a `CUSTOM` `oci_logging_log` resource per service in the observability
-   module with `source_type = "OCISERVICE"` and the agent's resource OCID.
-2. Configure PII/secret redaction at the application logging library level
-   (structured JSON logging with sensitive-field stripping) and/or the OCI
-   Logging agent configuration (`/etc/oci-logging/agent.conf`).
-3. OCI Audit logs are automatic at the tenancy level — no Terraform action needed.
+1. Follow the current OCI custom-log and Unified Monitoring Agent documentation when compute exists; create each `CUSTOM` log and agent configuration from real resource identifiers rather than placeholder service sources.
+2. Set retention on each real `oci_logging_log`; log groups themselves do not enforce retention.
+3. Configure PII/secret redaction at the application logging library level (structured JSON logging with sensitive-field stripping) and/or the OCI Logging agent configuration.
+4. OCI Audit logs are automatic at the tenancy level — no fabricated service-log resource is needed.
 
 ---
 
@@ -107,6 +105,8 @@ OCI Logging agent are deployed:
 | Consumer lag | `oci_queue` | `ConsumerLag` | > 5 min | WARNING | Check consumer processing latency |
 | Log ingestion | `oci_logging` | `BytesIngested` | ~1 MiB/min (17476 bytes/s rate) | WARNING | Check for log floods |
 | Budget | `oci_budget_alert_rule` | actual spend | > threshold % | WARNING | Review spend |
+
+After apply, the observability ONS email recipient must accept OCI's subscription-confirmation email before queue/log alarms can deliver. Verify the subscription is `ACTIVE`. Budget alert recipients are configured directly; budgets alert but do **not** cap or block spend.
 
 **DLQ note:** OCI Queue uses a service-managed internal dead-letter sub-queue.
 Dead-lettered messages are NOT surfaced as separate Monitoring metrics.

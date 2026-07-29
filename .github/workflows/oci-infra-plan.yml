@@ -8,7 +8,7 @@ name: OCI Infra Plan (Manual)
 #   OCI_TENANCY_OCID, OCI_USER_OCID, OCI_FINGERPRINT, OCI_PRIVATE_KEY
 #   ALERT_EMAIL                   — budget/alarm notification recipient
 #   MONTHLY_BUDGET_AMOUNT         — monthly budget in USD (owner-approved before provisioning)
-#   PRODUCTION_APPLY_ENABLED      — "true" to unblock production plan/apply after remote state (production env only; staging safely ignores)
+#   PRODUCTION_APPLY_ENABLED      — optional; defaults to "false". Set "true" only after production remote state is configured.
 
 on:
   workflow_dispatch:
@@ -47,7 +47,7 @@ jobs:
           TF_VAR_tenancy_ocid: ${{ secrets.OCI_TENANCY_OCID }}
           TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
           TF_VAR_monthly_budget_amount: ${{ secrets.MONTHLY_BUDGET_AMOUNT }}
-          TF_VAR_production_apply_enabled: ${{ secrets.PRODUCTION_APPLY_ENABLED }}
+          TF_VAR_production_apply_enabled: ${{ secrets.PRODUCTION_APPLY_ENABLED || 'false' }}
           OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
           OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
           OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
@@ -61,7 +61,7 @@ jobs:
           TF_VAR_tenancy_ocid: ${{ secrets.OCI_TENANCY_OCID }}
           TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
           TF_VAR_monthly_budget_amount: ${{ secrets.MONTHLY_BUDGET_AMOUNT }}
-          TF_VAR_production_apply_enabled: ${{ secrets.PRODUCTION_APPLY_ENABLED }}
+          TF_VAR_production_apply_enabled: ${{ secrets.PRODUCTION_APPLY_ENABLED || 'false' }}
           OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
           OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
           OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
