@@ -1,5 +1,8 @@
 import type { NextFunction, Request, Response } from 'express';
 import { ZodError, type ZodSchema } from 'zod';
+import { createLogger } from './logger.js';
+
+const validationLogger = createLogger('validation');
 
 export interface ValidationErrorDetail {
   field: string;
@@ -162,7 +165,17 @@ export function zodErrorHandler(err: unknown, _req: Request, res: Response, next
   next(err);
 }
 
+/** Known Error subclass names that are safe to log as-is. */
+const SAFE_ERROR_NAMES = new Set([
+  'Error', 'EvalError', 'RangeError', 'ReferenceError',
+  'SyntaxError', 'TypeError', 'URIError',
+  'ValidationError', 'ZodError',
+]);
+
 export function finalErrorHandler(err: unknown, _req: Request, res: Response, _next: NextFunction) {
-  console.error('[unhandled request error]', err instanceof Error ? err.name : typeof err);
+  // Map to a fixed safe category — err.name can be attacker-controlled.
+  const rawName = err instanceof Error ? err.name : 'UnknownError';
+  const errorCategory = SAFE_ERROR_NAMES.has(rawName) ? rawName : 'UnknownError';
+  validationLogger.error('error_unhandled', { error_category: errorCategory });
   return sendError(res, 500, 'internal_error', 'Internal server error');
 }

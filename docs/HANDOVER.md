@@ -33,9 +33,11 @@ cat docs/HANDOVER.md
 | OCI managed-services Terraform foundation | Infrastructure | Code merged; apply-gated | PR #7 (`e8584b0`), merged 2026-07-29. Scaffold only; `terraform apply` has not been run. |
 | OCI region benchmark harness | Infrastructure | Code merged; not yet measured | PR #8 (`726ce56`), merged 2026-07-29. Harness and fail-closed runbook exist; no benchmark data has been collected. |
 | Supabase local baseline | MIG-03 / partial MIG-04 | Code merged; production apply pending | PR #9 (`4d103ea`), merged 2026-07-29. Unused Mumbai project exists but MIG-01/MIG-02 admin acceptance pending; this is MIG-03/partial MIG-04. Membership-gated RLS and local validation; MIG-01/MIG-02 administrative acceptance plus controlled production connection/application and MIG-13 cutover are future gates. |
+| Synthetic demo seed foundation | GOV-06 | Code merged; production/demo acceptance pending | PR #14 (`7cbc962`), merged 2026-07-29. Deterministic local `app/supabase/seed.sql`, offline validator, 65 validator tests, 62 SQL integration assertions, runbook, and Supabase CI wiring are present. This is local synthetic-data scaffolding only; screenshots/demo artifact replacement and owner FND-03 evidence remain pending. |
+| OBS-01 / OBS-02 structured logging + correlation | OBS-01, OBS-02 | Code merged; deployment acceptance pending | PR #15 (`de133c6`), merged 2026-07-29. Structured JSON logger (JS+Python parity), UUID v4 correlation middleware, envelope validation, redaction/defense scanning, scoring taxonomy, and component defense are present. Managed log export, dashboards, alarms, queue/provider tracing, and deployed acceptance remain pending. |
 | Accessibility test foundation | TST-07 | Partial — automation scaffold complete (101 unit tests, strict axe matcher, fail-closed network trap, keyboard focus assertions); manual AT/contrast/reflow/browser gates and candidate consent/call flow remain external/dependent | Branch `test/tst-07-accessibility`. Runbook at `docs/runbooks/accessibility-testing.md`. CI gate: `npm run test:typecheck && npm test` added to quality.yml. Not a launch gate until all manual checks and candidate consent (GOV-08/Legal) are resolved. |
 
-CI on `main` at `4d103ea`: Quality, Secret scan, and Supabase checks all passed on 2026-07-29.
+PRs #14 and #15 were merged into `main` on 2026-07-29 with their required checks passing. Aggregate `main` verification after the remaining sequential merges is still pending.
 
 ## Phase-0 Foundation Status (FND-01, FND-02, FND-03)
 
@@ -46,8 +48,25 @@ external-blockers summary.
 | Task | Code / merge state | Acceptance state |
 |---|---|---|
 | FND-01 | Repository controls merged | **Blocked**: hosted enforcement blocked — private-plan GitHub API returned 403 |
-| FND-02 | Scanner controls merged | **Blocked**: owner rotation evidence pending for six provider systems; non-secret revocation evidence required |
-| FND-03 | Containment controls merged | **Blocked**: sanitization, synthetic, and restricted-storage disposition pending |
+| FND-02 | Scanner controls merged | **Blocked**: owner rotation evidence pending for eight provider systems; non-secret revocation evidence required |
+| FND-03 | Containment controls and GOV-06 local synthetic seed tooling merged | **Blocked**: authentic sanitization, screenshot/demo replacement, and restricted-storage disposition evidence pending |
+
+## OBS-01/OBS-02 Status (code merged in PR #15; deployed acceptance pending)
+
+| Item | Status | Notes |
+|------|--------|-------|
+| Structured JSON logger (JS) | Code complete | `app/api/src/lib/logger.ts` — schema, envelope validation, redaction, defense scanning, calendar-valid timestamps |
+| Correlation ID middleware (JS) | Code complete | `app/api/src/lib/correlation.ts` — UUID v4 validation, AsyncLocalStorage isolation, response header on all paths |
+| Structured logger (Python) | Code complete | `app/voice-livekit/observability.py` — token-based ContextVar, parity with JS schema |
+| Persistence scoring trigger | Code complete | `app/voice-livekit/persistence.py` — taxonomy with http_redirect/http_client_error/http_server_error |
+| JS test suite | 419 tests | Vitest; schema, redaction matrix, origin validation, correlation middleware, concurrent isolation, network trap |
+| Python test suite | 56 tests | unittest; schema, redaction matrix, token-based set/reset, concurrent tasks, origin validation, network trap |
+| Managed log export | **Pending** | Not chosen; no dashboard, no alert rules |
+| Dashboards / alarms | **Pending** | No platform selected |
+| Queue/provider tracing | **Pending** | ADR-0004 queue not yet implemented |
+| Deployed acceptance | **Pending** | Tests pass in CI-like local run only; no staging/production deployment |
+| Launch gates (0/17) | **0 complete** | All 17 launch gates remain open; unit test pass does not equal phase completion |
+
 
 ## Current Verification
 
@@ -58,6 +77,11 @@ cd ../..
 node scripts/check-env-contract.mjs
 node scripts/check-env-contract.test.mjs
 node scripts/check-adrs.mjs
+node scripts/check-synthetic-seed.mjs app/supabase/seed.sql
+node scripts/check-synthetic-seed.test.mjs
+bash scripts/supabase-test.sh
+python3 -m py_compile app/voice-livekit/agent.py app/voice-livekit/persistence.py app/voice-livekit/observability.py
+(cd app/voice-livekit && python3 -m unittest discover -s tests -p 'test_*.py' -v)
 node scripts/audit-seeded-vuln.test.mjs
 bash scripts/audit-deps.sh --dir app/api
 bash scripts/audit-deps.sh --dir app/web

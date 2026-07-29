@@ -4,6 +4,10 @@
 
 ---
 
+> **Implementation status (2026-07-29):** GOV-06 local synthetic demo seed tooling and OBS-01/OBS-02 structured logging/correlation scaffolding are merged in PRs #14 and #15. Branch `test/tst-07-accessibility` adds the TST-07 automated accessibility scaffold. These implementations do **not** close production acceptance: FND-03 owner evidence, authentic artifact replacement, managed observability, manual assistive-technology review, candidate consent/call-flow coverage, deployed proof, and all launch gates remain pending.
+
+---
+
 ## 1. Document Control
 
 | Field | Value |

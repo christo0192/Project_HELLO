@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import { env } from './lib/env.js';
+import { correlationMiddleware } from './lib/correlation.js';
 import { rolesRouter } from './routes/roles.js';
 import { resumesRouter } from './routes/resumes.js';
 import { candidatesRouter } from './routes/candidates.js';
@@ -71,6 +72,11 @@ export function createApp(opts: CreateAppOptions = {}) {
     }
     next();
   });
+
+  // ── OBS-02: Correlation ID middleware ─────────────────────────────
+  // Must run before CORS so X-Correlation-ID is set on every response
+  // including preflight, CORS-blocked, and all error paths.
+  app.use(correlationMiddleware);
 
   // ── Parse and validate allowed origins ─────────────────────────
   // Reject credentials, path, query, hash. Fail closed on empty production set.

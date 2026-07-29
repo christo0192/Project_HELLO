@@ -3,6 +3,7 @@ import multer from 'multer';
 import { AccessToken, RoomServiceClient } from 'livekit-server-sdk';
 import { supabase } from '../lib/supabase.js';
 import { env } from '../lib/env.js';
+import { getCorrelationId } from '../lib/correlation.js';
 import { formatResumeFacts } from '../lib/prompts.js';
 import {
   requireUploadedFile,
@@ -94,10 +95,15 @@ livekitRouter.post('/start', validateBody(livekitStartSchema), async (req, res, 
     if (sErr || !session) return next(sErr ?? new Error('failed to create session'));
 
     const roomName = `screening-${session.id}`;
+    // OBS-02: propagate the API request correlation ID into room metadata so
+    // the LiveKit worker can inherit it for the session.  The ID is opaque
+    // (UUID v4, no PII) but is visible to room participants; it is not a
+    // secret.  The worker validates the value before accepting it.
     const roomMetadata = JSON.stringify({
       ...metadata,
       session_id: session.id,
       room_name: roomName,
+      correlation_id: getCorrelationId() ?? undefined,
     });
     const rooms = new RoomServiceClient(env.livekitUrl, env.livekitApiKey, env.livekitApiSecret);
     try {
