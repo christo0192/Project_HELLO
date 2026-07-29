@@ -1,6 +1,6 @@
 # FND-08 Launch-Blocking Policy Inputs — Decision Status Matrix
 
-**Date:** 2026-07-28
+**Date:** 2026-07-28 (updated 2026-07-29)
 
 **Plan reference:** FND-08 (P0 — blocks everything)
 
@@ -10,6 +10,13 @@ directions have been selected by the repository owner during project alignment
 to unblock architecture and scaffolding work. They are **NOT** signed
 stakeholder/Legal/Security approval, do **NOT** constitute FND-08 acceptance,
 and do **NOT** resolve the named-owner requirement.
+
+**Owner-approval update (2026-07-29):** The sole Product/Engineering owner has
+reviewed all D-001..D-011 decisions and issued formal internal-engineering
+approvals, deferrals, and production blocks in
+[`fnd-08-owner-approval.md`](fnd-08-owner-approval.md). This predecessor document
+continues to record the original selected technical directions; the owner-approval
+record supersedes it for decision authority.
 
 ## Direction Status (Selected Technical Directions — Not Approved)
 
@@ -72,6 +79,7 @@ and do **NOT** resolve the named-owner requirement.
 3. Legal provides India-residency go/no-go, DPDP applicability assessment, and retention period.
 4. Engineering may run an owner-approved preliminary Mumbai/Hyderabad synthetic probe (teardown after) for region discovery; formal DEP-01 acceptance requires TST-09/REL-01/OBS-03 integration.
 5. Product approves launch concurrency target (5 → validate to 10).
-6. All 11 D-xxx decisions receive formal signed approval before FND-08 is marked complete.
+6. All 11 D-xxx decisions receive formal signed approval from all four accountable roles (Engineering Lead, Product Manager, Security Lead, Legal Counsel) before FND-08 is marked complete.
+7. The sole-owner record in [`fnd-08-owner-approval.md`](fnd-08-owner-approval.md) unblocks internal engineering work but does not satisfy item 6.
 
 **This document is a status tracker. It does not constitute FND-08 acceptance.**

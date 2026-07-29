@@ -4,6 +4,12 @@
 
 **Decision owner:** Engineering Lead, Product Manager, and Legal Counsel (unassigned)
 
+**Owner-approval update (2026-07-29):** The sole Product/Engineering owner has
+approved browser MediaRecorder capture for internal synthetic browser-only
+evaluation under a no-cost prototype mechanism. Production recording remains
+BLOCKED FOR PRODUCTION. See
+[`docs/decisions/fnd-08-owner-approval.md`](../decisions/fnd-08-owner-approval.md).
+
 **Plan references:** D-007, Q-09, REC-01, REC-02, REC-03, MIG-06
 
 ## Context

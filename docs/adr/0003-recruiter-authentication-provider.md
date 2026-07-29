@@ -6,6 +6,11 @@
 
 **Plan references:** D-001, SEC-01, SEC-02, SEC-08
 
+**Owner-approval update (2026-07-29):** The sole Product/Engineering owner has
+approved Supabase Auth for internal synthetic browser-only evaluation under a
+no-cost posture. Production auth remains BLOCKED FOR PRODUCTION. See
+[`docs/decisions/fnd-08-owner-approval.md`](../decisions/fnd-08-owner-approval.md).
+
 ## Context
 
 The prototype has no recruiter authentication or authorization. Production
