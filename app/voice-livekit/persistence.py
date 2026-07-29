@@ -28,7 +28,10 @@ import re
 from datetime import datetime, timezone
 from typing import Optional
 
-import httpx
+try:
+    import httpx
+except ImportError:  # pragma: no cover - scoring trigger disabled without optional dep
+    httpx = None
 
 try:
     from supabase import create_client
@@ -385,6 +388,9 @@ async def fail_session(
 
 async def trigger_scoring(session_id: Optional[str]) -> None:
     if not session_id:
+        return
+    if httpx is None:
+        logger.warning("[livekit-score] scoring trigger disabled")
         return
     try:
         async with httpx.AsyncClient(timeout=180) as client:
