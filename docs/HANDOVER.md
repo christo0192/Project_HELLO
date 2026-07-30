@@ -1,8 +1,8 @@
 # Project Handover
 
-**Last updated:** 2026-07-30 (owner decisions reconciled)
+**Last updated:** 2026-07-30 (Phase 3-5 foundations integrated, unmerged)
 
-**Current baseline:** `main` through PR #26 (`1ac8b4d`) — Phase 1 security-core (PR #25, `63f8ba1`) and Phase 2 Supabase migration foundations (PR #26, `1ac8b4d`) are merged.
+**Current baseline:** `main` through PR #26 (`1ac8b4d`) — Phase 1 security-core (PR #25, `63f8ba1`) and Phase 2 Supabase migration foundations (PR #26, `1ac8b4d`) are merged. Branch `feat/phase3-5-foundations` (base `de4d25c`) uncommitted.
 
 **Repository:** `https://github.com/christo0192/Project_HELLO`
 
@@ -13,11 +13,44 @@
 **Current-state manifest:** [`config/current-state.json`](../config/current-state.json)
 (automated drift checks enforce consistency)
 
-**Implementation status:** Partial — Phase 0 closure PRs #20–#24 are merged; Phase 1 security-core merged as PR #25 (`63f8ba1`) implementing local/synthetic auth, RBAC, ownership, invites, rate limits, audit foundations, metadata minimization and resume defenses. Phase 2 Supabase migration foundations merged as PR #26 (`1ac8b4d`) adding schema hardening (`0008`), RLS matrix, recruiter recording-download route, export/reconcile/storage tooling, and migration runbooks. External/production acceptance remains pending; 0/17 launch gates complete and 0/14 roadmap phases are accepted.
+**Implementation status:** Partial — Phase 0 closure PRs #20–#24 are merged; Phase 1 security-core merged as PR #25 (`63f8ba1`) implementing local/synthetic auth, RBAC, ownership, invites, rate limits, audit foundations, metadata minimization and resume defenses. Phase 2 Supabase migration foundations merged as PR #26 (`1ac8b4d`) adding schema hardening (`0008`), RLS matrix, recruiter recording-download route, export/reconcile/storage tooling, and migration runbooks. Phase 3-5 foundations (queue, outbox, reconciliation, governance/DSAR, consent/privacy, metrics/tracing) are implemented in the unmerged `feat/phase3-5-foundations` branch (PR #27). External/production acceptance remains pending; 0/17 launch gates complete and 0/14 roadmap phases are accepted.
 
 ## Baseline
 
-PR #26 (Phase 2 Supabase migration foundations) was squash-merged to `main` as `1ac8b4d`; PR #25 (Phase 1 security-core) was squash-merged as `63f8ba1`; PR #24 was squash-merged as `bf35b58` on 2026-07-29; PR #19 was previously squash-merged as `0c06fc0`. Phase 0, Phase 1 and Phase 2 implementation/evidence do not alter production acceptance without authentic external evidence.
+PR #26 (Phase 2 Supabase migration foundations) was squash-merged to `main` as `1ac8b4d`; PR #25 (Phase 1 security-core) was squash-merged as `63f8ba1`; PR #24 was squash-merged as `bf35b58` on 2026-07-29; PR #19 was previously squash-merged as `0c06fc0`. PR #27 (Phase 3-5 foundations) is in the unmerged `feat/phase3-5-foundations` branch. Phase 0, Phase 1, Phase 2 and Phase 3-5 implementation/evidence do not alter production acceptance without authentic external evidence.
+
+## Phase 3-5 Build Foundations (feat/phase3-5-foundations)
+
+Branch `feat/phase3-5-foundations` (base `de4d25c`, PR #27) adds local/synthetic Phase 3–5 implementation foundations. The branch is **unmerged** and **not accepted** for production. All evidence is local/synthetic only.
+
+| Area | Files | Status | Evidence |
+|---|---|---|---|
+| L1 Queue | `app/api/src/lib/queue/` (types, index, memory-adapter, pg-adapter), migration 0009, `app/api/src/__tests__/queue.test.ts` | Implemented (synthetic) | Idempotent enqueue via dedupKey, exponential backoff+jitter, DLQ replay, SKIP LOCKED dequeue, 397 test assertions |
+| Outbox/Ordered Ingestion | `app/api/src/lib/outbox.ts`, migration 0010, `app/api/src/__tests__/outbox.test.ts`, Python `persistence.py` outbox helpers | Implemented (synthetic) | Idempotent upsert (ON CONFLICT DO NOTHING), transactional outbox, poll/mark pattern, 399 test assertions |
+| Reconciliation | `app/api/src/lib/reconciliation.ts`, migration 0011, `app/api/src/__tests__/reconciliation.test.ts`, runbook `docs/runbooks/session-reconciliation.md` | Implemented (synthetic) | 5 detectors, read-only detection, CAS-based safe repair, idempotent quarantine, 762 test assertions |
+| Governance/DSAR | `app/api/src/lib/retention.ts`, `app/api/src/lib/dsar.ts`, `app/api/src/routes/dsar.ts`, migration 0012, `app/api/src/__tests__/governance.test.ts` | Implemented (synthetic) | Legal-hold CRUD, retention policies, DSAR export/delete/correct, append-only audit trail, 738 test assertions |
+| Consent/Privacy | `app/api/src/routes/consent.ts`, `app/api/src/schemas/consent.ts`, `app/web/src/pages/CandidateJoinPage.tsx`, `app/web/src/pages/PrivacyNoticePage.tsx`, migration 0013, `app/api/src/__tests__/consent.test.ts` | Implemented (synthetic) | Consent versioning, hasConsentFor (refuses job_application for AI/recording), join gating, privacy notice page (placeholder copy), 351 test assertions |
+| Metrics/Tracing | `app/api/src/lib/metrics.ts`, `app/api/src/lib/tracing.ts`, `app/api/src/__tests__/observability-metrics-tracing.test.ts`, Python `observability.py` metrics/tracing, `docs/runbooks/observability-foundation.md`, `docs/runbooks/slo-error-budget.md`, `docs/runbooks/incident-response.md` | Implemented (synthetic, no external wiring) | PII redaction on labels/attributes, no-op by default, no Axiom/Slack/PagerDuty wired, 406 test assertions |
+| ADR 0009 | `docs/adr/0009-governance-field-protection.md` | Documented | Governance field protection rationale |
+
+### Test Totals (Phase 3-5 additions, all pass locally)
+
+| Suite | Count | Notes |
+|---|---|---|
+| API (Node) | 1024 tests (19 files) | Includes queue, outbox, reconciliation, governance, consent, observability-metrics-tracing |
+| Web | 171 tests (18 files) | Includes CandidateJoinPage 7 tests with consent-unknown/granted/declined states |
+| Python (voice-livekit) | 360 tests | Includes outbox/persistence and observability metrics |
+| Phase 1 security SQL | 66 assertions | Pass |
+| Current-state | 16 negative tests | Pass |
+| Phase0-2 build-status | 11 negative tests | Pass |
+| Environment contract | Negative tests | Pass |
+| ADRs | 9 records | Validated |
+| Secrets scan | Clean | No leaks |
+| git diff --check | Clean | No whitespace errors |
+
+### Remaining Go-Live Gates (unwaived)
+
+All Legal/Security/external wiring/tabletop/live dashboard/provider gates remain GO-LIVE only, not build blockers. Key unwaived gates: FND-05 (secret manager), FND-06 (service identities), D-008 (SIEM), D-009 (retention period), D-010 (DPDP consent mechanism), D-004 (scoring provider), FND-08 (production evidence).
 
 ## Resume Here
 

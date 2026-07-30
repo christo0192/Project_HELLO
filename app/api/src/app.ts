@@ -10,6 +10,8 @@ import { assessRouter } from './routes/assess.js';
 import { livekitRouter } from './routes/livekit.js';
 import { invitesRouter } from './routes/invites.js';
 import { recordingsRouter } from './routes/recordings.js';
+import { dsarRouter } from './routes/dsar.js';
+import { consentRouter } from './routes/consent.js';
 import { cspReportRouter } from './routes/csp.js';
 import {
   malformedJsonHandler,
@@ -235,6 +237,13 @@ export function createApp(opts: CreateAppOptions = {}) {
   app.use('/api/resumes', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'resumes:', useUserKey: true }));
   app.use('/api/livekit', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'livekit:', useUserKey: true }));
   app.use('/api/recordings', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'recordings:', useUserKey: true }));
+  app.use('/api/dsar', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'dsar:', useUserKey: true }));
+  // GOV-08/09/10: consent routes are recruiter/authenticated-only (fail-closed).
+  // Candidate consent-before-join is a synthetic client-side mechanism (see
+  // CandidateJoinPage) — these API routes carry no per-candidate grant and are
+  // deliberately NOT added to the public allowlist. Legal D-010 remains an
+  // unwaived go-live gate.
+  app.use('/api/consent', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'consent:', useUserKey: true }));
 
   // Public: health endpoint (no auth)
   app.get('/api/health', (_req, res) => res.json({ ok: true, model: env.claudeModel }));
@@ -259,6 +268,8 @@ export function createApp(opts: CreateAppOptions = {}) {
   app.use('/api/livekit', invitesRouter);
   app.use('/api/livekit', livekitRouter);
   app.use('/api/recordings', recordingsRouter);
+  app.use('/api/dsar', dsarRouter);
+  app.use('/api', consentRouter);
   app.use('/api/assess', assessRouter);
 
   // ── 401/403/429 error paths still carry existing headers (CORS/CSP) ─

@@ -748,3 +748,162 @@ async def resolve_worker_context(
         return _ERR_CONTEXT_NOT_FOUND
     except Exception:  # noqa: BLE001
         return _ERR_CONTEXT_API_ERROR
+
+
+# ── REL-02/03 outbox/ingestion helpers ─────────────────────────────────
+
+_ERR_TRANSCRIPT_EVENT_FAILED = "transcript event upsert failed"
+_ERR_OUTBOX_FAILED = "outbox entry creation failed"
+_ERR_TRANSCRIPT_EVENT_FETCH_FAILED = "transcript event fetch failed"
+_OUTBOX_AGGREGATE_TYPE = "transcript_event"
+_OUTBOX_EVENT_TYPE = "transcript_turn.created"
+
+
+def _get_next_sequence(session_id: str) -> int:
+    """Get the next sequence number for a session's transcript events.
+    Returns 1 if no events exist yet."""
+    table = _table("transcript_events")
+    if not table:
+        return 1
+    try:
+        result = (
+            table.select("sequence")
+            .eq("session_id", session_id)
+            .order("sequence", desc=True)
+            .limit(1)
+            .maybe_single()
+            .execute()
+        )
+        data = getattr(result, "data", None)
+        if isinstance(data, dict) and "sequence" in data:
+            return data["sequence"] + 1
+        return 1
+    except Exception:  # noqa: BLE001
+        return 1
+
+
+async def save_transcript_event(
+    session_id: str,
+    turn_index: int,
+    speaker: str,
+    text: str,
+) -> str:
+    """Upsert a transcript event with outbox entry.
+
+    Dedup key is (session_id, turn_index). Duplicate delivery of the same turn
+    is silently ignored (idempotent). Out-of-order events insert cleanly.
+
+    Returns '' (empty string) on success, or a stable error code on failure.
+    Unlike save_turn, this does NOT raise LifecycleError — failures are
+    returned as error codes so callers can decide whether to fail closed.
+    """
+    if not session_id or not text.strip():
+        return ""
+
+    def run() -> str:
+        table_events = _table("transcript_events")
+        table_outbox = _table("outbox")
+        if not table_events or not table_outbox:
+            return _ERR_PERSISTENCE_DISABLED
+
+        # Compute next sequence
+        seq = _get_next_sequence(session_id)
+
+        # Upsert transcript event (ignore duplicates)
+        try:
+            result = (
+                table_events.upsert(
+                    {
+                        "session_id": session_id,
+                        "turn_index": turn_index,
+                        "speaker": speaker,
+                        "text": text.strip(),
+                        "sequence": seq,
+                    },
+                    on_conflict="session_id, turn_index",
+                    ignore_duplicates=True,
+                )
+                .select()
+                .single()
+                .execute()
+            )
+        except Exception:  # noqa: BLE001
+            return _ERR_TRANSCRIPT_EVENT_FAILED
+
+        data = getattr(result, "data", None)
+        if not isinstance(data, dict):
+            return _ERR_TRANSCRIPT_EVENT_FAILED
+
+        event_id = data.get("id")
+        if not event_id:
+            return _ERR_TRANSCRIPT_EVENT_FAILED
+
+        # Create pending outbox entry
+        try:
+            table_outbox.insert(
+                {
+                    "aggregate_type": _OUTBOX_AGGREGATE_TYPE,
+                    "aggregate_id": event_id,
+                    "event_type": _OUTBOX_EVENT_TYPE,
+                    "payload": {
+                        "sessionId": session_id,
+                        "turnIndex": turn_index,
+                        "speaker": speaker,
+                        "text": text.strip(),
+                        "sequence": seq,
+                    },
+                    "status": "pending",
+                }
+            ).execute()
+        except Exception:  # noqa: BLE001
+            # Event is durable even if outbox insert fails
+            _log.warn("db_error", error_category="outbox_insert_failed")
+            return _ERR_OUTBOX_FAILED
+
+        return ""
+
+    try:
+        error = await asyncio.to_thread(run)
+        if error:
+            _log.warn("db_error", error_category="save_transcript_event_failed")
+        else:
+            _log.info("db_turn_saved", turn_index=turn_index, speaker=speaker)
+        return error
+    except Exception:  # noqa: BLE001
+        _log.warn("db_error", error_category="save_transcript_event_failed")
+        return _ERR_TRANSCRIPT_EVENT_FAILED
+
+
+async def get_transcript_events(
+    session_id: str,
+) -> list[dict]:
+    """Retrieve all transcript events for a session in sequence order.
+
+    Returns an empty list on any error (never None). Callers should check
+    the list length rather than relying on error signalling.
+    """
+    if not session_id:
+        return []
+
+    def run() -> list[dict]:
+        table = _table("transcript_events")
+        if not table:
+            return []
+        try:
+            result = (
+                table.select("*")
+                .eq("session_id", session_id)
+                .order("sequence", desc=False)
+                .execute()
+            )
+            data = getattr(result, "data", None)
+            if isinstance(data, list):
+                return data
+            return []
+        except Exception:  # noqa: BLE001
+            return []
+
+    try:
+        return await asyncio.to_thread(run)
+    except Exception:  # noqa: BLE001
+        return []
