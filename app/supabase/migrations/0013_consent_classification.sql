@@ -42,7 +42,7 @@ alter table screening_v2.consent_records
   add column if not exists version text not null default '1.0';
 
 alter table screening_v2.consent_records
-  add column if not exists consents consent_type[] not null default '{}';
+  add column if not exists consents screening_v2.consent_type[] not null default '{}';
 
 alter table screening_v2.consent_records
   add column if not exists status text not null default 'granted'
@@ -95,7 +95,7 @@ comment on column screening_v2.consent_records.classification_level is
 
 create or replace function screening_v2.has_consent(
   p_candidate_id uuid,
-  p_consent_type consent_type
+  p_consent_type screening_v2.consent_type
 ) returns boolean
   language sql
   stable
@@ -130,7 +130,7 @@ create table if not exists screening_v2.consent_templates (
   locale        text not null default 'en-IN',
   title         text not null default 'Privacy Notice',
   body_md       text not null default '<!-- PLACEHOLDER – Legal copy unapproved. Do not use in production. -->',
-  required_consents consent_type[] not null default '{ai_interview,recording,purpose,data_processing,retention,rights}',
+  required_consents screening_v2.consent_type[] not null default '{ai_interview,recording,purpose,data_processing,retention,rights}',
   is_active     boolean not null default false,
   created_at    timestamptz not null default now(),
   updated_at    timestamptz not null default now()
