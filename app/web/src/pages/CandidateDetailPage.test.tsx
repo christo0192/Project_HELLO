@@ -10,7 +10,7 @@
  *   - LiveKit call card and LiveCallPanel integration
  */
 
-import { render, screen } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { CandidateDetailPage } from './CandidateDetailPage';
@@ -18,11 +18,13 @@ import { mockCandidateDetail } from '../test/helpers';
 
 const mockApi = {
   getCandidate: vi.fn(),
+  getRecordingDownloadUrl: vi.fn(),
 };
 
 vi.mock('../api', () => ({
   api: {
     getCandidate: (...args: any[]) => mockApi.getCandidate(...args),
+    getRecordingDownloadUrl: (...args: any[]) => mockApi.getRecordingDownloadUrl(...args),
     startLiveKitScreening: vi.fn().mockRejectedValue(new Error('mock')),
     getSession: vi.fn().mockResolvedValue({
       session: { status: 'completed' },
@@ -150,5 +152,36 @@ describe('CandidateDetailPage', () => {
     const { container } = renderDetailPage();
     await screen.findByText('Jane Doe');
     await expect(container).toHaveNoViolations();
+  });
+
+  // ── MIG-06: on-demand recording download (explicit user action only) ──
+  describe('recording download (MIG-06)', () => {
+    it('does NOT fetch a recording URL on render (no auto-fetch)', async () => {
+      mockApi.getCandidate.mockResolvedValue(mockCandidateDetail);
+      mockApi.getRecordingDownloadUrl.mockResolvedValue({ url: 'https://x.invalid/rec' });
+      renderDetailPage();
+      // Wait for a completed session (which renders the Play button) to appear.
+      expect(await screen.findByText('Play recording')).toBeInTheDocument();
+      // The signed URL must NOT be requested until the recruiter clicks.
+      expect(mockApi.getRecordingDownloadUrl).not.toHaveBeenCalled();
+    });
+
+    it('fetches the signed URL only when Play recording is clicked', async () => {
+      mockApi.getCandidate.mockResolvedValue(mockCandidateDetail);
+      mockApi.getRecordingDownloadUrl.mockResolvedValue({ url: 'https://x.invalid/rec' });
+      renderDetailPage();
+      const btn = await screen.findByText('Play recording');
+      fireEvent.click(btn);
+      await waitFor(() => expect(mockApi.getRecordingDownloadUrl).toHaveBeenCalledTimes(1));
+    });
+
+    it('shows an error when the recording fetch fails', async () => {
+      mockApi.getCandidate.mockResolvedValue(mockCandidateDetail);
+      mockApi.getRecordingDownloadUrl.mockRejectedValue({ message: 'expired' });
+      renderDetailPage();
+      const btn = await screen.findByText('Play recording');
+      fireEvent.click(btn);
+      expect(await screen.findByText('expired')).toBeInTheDocument();
+    });
   });
 });

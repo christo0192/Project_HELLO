@@ -347,6 +347,30 @@ Phase 1 is **not accepted**. The local/synthetic implementation wave adds the se
 | **MIG-14** | Maintain a time-bounded rollback window in which the old project and credentials remain intact but tightly access-controlled; define how writes made after cutover are reversed or reconciled | P0 | Eng Lead + DB Admin | MIG-13 | S | Go/no-go owner closes rollback only after the configured stability window and reconciliation pass; rollback drill demonstrates bounded data recovery | Execute MIG-13 rollback procedure |
 | **MIG-15** | After rollback closes, revoke old keys, export/archive or delete data according to Legal retention, remove integrations, and decommission the old project with dual approval | P1 | Security + DB Admin + Legal | MIG-14, GOV-04 | S | Dependency scan shows zero old-project traffic; old credentials fail; archive/deletion evidence and approval are retained | Decommission is irreversible; restore only from approved archive if legally permitted |
 
+#### Phase 2 implementation status — 2026-07-30
+
+Phase 2 is **not accepted**. This local/synthetic wave adds migration-foundation code, tooling and runbooks only. No hosted Supabase project is created, no migration is applied to any hosted project, and no production, backup, residency or independent-Security evidence exists. All MIGRATION/BACKUP/SECURITY launch gates remain **red**. See `docs/runbooks/supabase-migration-strategy.md`, `docs/runbooks/mig-export-reconcile.md`, `docs/runbooks/mig-cutover-rehearsal.md`, `docs/runbooks/mig-rollback-window.md`, `docs/runbooks/mig-decommission.md` and `docs/data-classification.md`.
+
+| Task | Implementation status | Residual acceptance gate (external evidence, NOT obtained) |
+|---|---|---|
+| MIG-01 | Not implemented (hosted) | Company-controlled project, region/backup evidence, 2 MFA admins, break-glass — blocked on FND-08 |
+| MIG-02 | Not implemented (hosted) | Least-privilege org access review; unauthorized-account test — blocked on MIG-01 |
+| MIG-03 | Local: `0008` hardening + ephemeral `db diff` drift proof in `supabase-test.sh` | Hosted fresh-build + schema-diff evidence |
+| MIG-04 | Local: `0008` completes the membership-gated RLS matrix (consent/queue/SMS/ATS/resume reads) with least-privilege policy tests (+693 assertions) | Production RLS proof, FND-06 service identities, D-011 residency/tenancy approval |
+| MIG-05 | Local: publication-membership + RLS-enabled + no-anon assertions for the 3 dashboard tables | Hosted Realtime RLS enforcement and websocket-authz E2E proof |
+| MIG-06 | Local: recruiter authorized-download route (bearer+AAL2+RBAC+ownership, bounded TTL, no durable URL, audited), `recording_url` NULL-guard CHECK, on-demand web fetch | Hosted private-bucket + live signed-URL TTL/revocation proof |
+| MIG-07 | Local: deterministic export-manifest tooling (schema version, counts, canonical digests, allowlists, PII redaction) on fixtures | GOV-01 doc, live `--db` mode, encrypted-artifact implementation, hosted export |
+| MIG-08 | Local: reconcile tooling (counts/digests, FK/orphan, relational smoke) on fixtures | Hosted isolated rehearsal project + signed reconciliation |
+| MIG-09 | Local: storage manifest/verify tooling (key/size/content-type/digest, symlink-safe) on fixtures | Hosted stream-copy + destination verification |
+| MIG-10 | Local: rehearsal runbook only | Signed production-volume rehearsal meeting RTO/RPO |
+| MIG-11 | Local: consistency-strategy design only | Rehearsal proving no omitted writes |
+| MIG-12 | Not implemented (hosted) | Secret-manager credential deploy — blocked on FND-05 (parked) |
+| MIG-13 | Not implemented (hosted) | Signed no-data-loss cutover — blocked on MIG-11/12 |
+| MIG-14 | Not implemented (hosted) | Bounded rollback-window drill — blocked on MIG-13 |
+| MIG-15 | Local: decommission runbook only | Dual-approval decommission + Legal retention evidence |
+
+**Unresolved Phase 2 blockers (owner/external):** FND-08 production inputs (residency, RPO/RTO, named owners); FND-05 secret manager (parked); FND-06 service identities (parked); SEC-03/D-011 production tenancy approval; GOV-01 data-classification acceptance; D-004 redactor test + Legal memo + DeepSeek DPA (conditionally blocked); D-009 retention period and D-010 DPDP consent (open, pending Legal). Supabase Free constraints (no PITR/24h backup granularity; 2 active projects/org → old/new/rehearsal must be sequential; 500MB DB / 1GB storage; ~7-day inactivity pause) further bound MIG-06/07/08/10.
+
 ---
 
 ### Phase 3: Data Governance & PII (P0)

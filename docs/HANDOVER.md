@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-07-30
 
-**Current baseline:** `main` through PR #24 (`bf35b58`); the Phase 1 security-core implementation is on `feat/phase1-security-core` pending owner review.
+**Current baseline:** `main` through PR #25 (`63f8ba1`, Phase 1 security-core); the Phase 2 Supabase migration foundations are on `feat/phase2-supabase-migration-local` pending owner review.
 
 **Repository:** `https://github.com/christo0192/Project_HELLO`
 
@@ -13,11 +13,11 @@
 **Current-state manifest:** [`config/current-state.json`](../config/current-state.json)
 (automated drift checks enforce consistency)
 
-**Implementation status:** Partial — Phase 0 closure PRs #20–#24 are merged, and the Phase 1 branch implements local/synthetic auth, RBAC, ownership, invites, rate limits, audit foundations, metadata minimization and resume defenses. External/production acceptance remains pending; 0/17 launch gates complete and 0/14 roadmap phases are accepted.
+**Implementation status:** Partial — Phase 0 closure PRs #20–#24 are merged; Phase 1 security-core merged as PR #25 (`63f8ba1`) implementing local/synthetic auth, RBAC, ownership, invites, rate limits, audit foundations, metadata minimization and resume defenses. The Phase 2 branch adds local/synthetic Supabase migration foundations (schema hardening `0008`, RLS matrix, recruiter recording-download route, export/reconcile/storage tooling, and migration runbooks). External/production acceptance remains pending; 0/17 launch gates complete and 0/14 roadmap phases are accepted.
 
 ## Baseline
 
-PR #24 was squash-merged to `main` as `bf35b58` on 2026-07-29. PR #19 was previously squash-merged as `0c06fc0`. Phase 0 and Phase 1 implementation/evidence do not alter production acceptance without authentic external evidence.
+PR #25 (Phase 1 security-core) was squash-merged to `main` as `63f8ba1`; PR #24 was squash-merged as `bf35b58` on 2026-07-29; PR #19 was previously squash-merged as `0c06fc0`. Phase 0, Phase 1 and Phase 2 implementation/evidence do not alter production acceptance without authentic external evidence.
 
 ## Resume Here
 
@@ -34,9 +34,9 @@ cat docs/HANDOVER.md
 | Metric | Value |
 |--------|-------|
 | Completed launch gates | 0/17 — Foundation, Security and production acceptance criteria remain externally unverified |
-| Implementation coverage | Phase 1 local/synthetic foundations exist on `feat/phase1-security-core`; strict acceptance is separate |
-| Integrated baseline | `bf35b58` (PR #24) |
-| Main state | PRs #1–#24 merged; Phase 1 implementation PR pending owner review |
+| Implementation coverage | Phase 1 merged (PR #25); Phase 2 local/synthetic migration foundations exist on `feat/phase2-supabase-migration-local`; strict acceptance is separate |
+| Integrated baseline | `63f8ba1` (PR #25) |
+| Main state | PRs #1–#25 merged; Phase 2 implementation PR pending owner review |
 
 > **Note:** The 25% completion figure sometimes seen in earlier summaries is NOT claimed. Zero launch gates are confirmed complete. Implementation coverage and acceptance verification are distinct gates.
 

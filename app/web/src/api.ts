@@ -17,6 +17,7 @@ import type {
   CandidateInviteExchangeResult,
   CandidateInviteResult,
   HealthResult,
+  RecordingDownloadResponse,
   Role,
   RoleInput,
   SessionDetail,
@@ -94,4 +95,8 @@ export const api = {
     request<SessionDetail>(`/api/screening/${sessionId}`),
   assess: (sessionId: string) =>
     request<Assessment>(`/api/assess/${sessionId}`, { method: 'POST' }),
+
+  // MIG-06: On-demand recruiter recording download URL
+  getRecordingDownloadUrl: (sessionId: string) =>
+    request<RecordingDownloadResponse>(`/api/recordings/${sessionId}/download`),
 };

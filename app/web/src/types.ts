@@ -64,6 +64,7 @@ export interface Session {
   status: string;
   done?: boolean;
   mode?: string;                 // "simulation" | "live"
+  /** @deprecated MIG-03/04/05 — use getRecordingDownloadUrl() for on-demand signed URL. */
   recording_url?: string | null;
   duration_sec?: number | null;
   created_at: string;
@@ -191,6 +192,11 @@ export interface SessionDetail {
   session: Session;
   transcript: TranscriptLine[];
   assessment: Assessment | null;
+}
+
+export interface RecordingDownloadResponse {
+  /** Short-lived signed URL for the recording. Must not be cached/stored. */
+  url: string;
 }
 
 export interface HealthResult {

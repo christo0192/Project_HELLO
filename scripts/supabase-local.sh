@@ -36,6 +36,21 @@ case "${1:-}" in
     require_tools
     log 'Resetting the local database and applying all migrations...'
     supabase_cli db reset
+    # MIG-03: Post-reset schema drift guard.
+    # Compare the local database schema against committed migration files.
+    # Clean diff (no output, exit 0) = migrations fully describe the schema.
+    # Any output = drift.  See supabase-test.sh for the full implementation.
+    if supabase_cli db diff --use-pg-delta --schema public,screening_v2 > /tmp/supabase-diff-local.txt 2>&1; then
+      if [ -s /tmp/supabase-diff-local.txt ]; then
+        die "Schema drift detected after db reset. Diff follows:
+$(cat /tmp/supabase-diff-local.txt)
+Run 'supabase db reset' to restore parity, then investigate."
+      fi
+      log 'Schema drift check: PASS (no drift)'
+    else
+      log 'Schema drift check: SKIPPED (--use-pg-delta unavailable)'
+    fi
+    rm -f /tmp/supabase-diff-local.txt
     ;;
   test)
     require_tools

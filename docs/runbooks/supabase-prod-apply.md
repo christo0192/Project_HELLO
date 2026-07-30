@@ -1,10 +1,32 @@
 # Supabase Production Migration Apply Runbook
 
-**Target:** New single-org production Supabase project in Mumbai
+**Target:** New single-org production Supabase project (region TBD per Legal/Security; production location is not yet selected)
 
 **Owner:** Repository owner with DB Admin and Security review
 
-**Status:** Code rehearsal only; production application is not yet approved
+**Status:** ✅ Local-only Phase 2 implementation rehearsed in CI and local Supabase.
+❌ Production application is **not yet approved** and remains **BLOCKED** until
+MIG-01 through MIG-11 are complete and the production project is provisioned
+under change control.
+
+## Phase 2 implementation context
+
+This runbook covers the **local-only Phase 2 implementation** as delivered in
+PR25 (63f8ba1). The following migrations and tooling are implemented and
+rehearsable locally:
+
+| Area | Status | Notes |
+|------|--------|-------|
+| `0001`–`0008` migrations | ✅ Rehearsed locally | Full schema, RLS, Realtime, policies |
+| `recording_object_key` storage | ✅ LiveKit route stores object key | Short-TTL signed URL minted on download (MIG-06) |
+| `recording_url` column | 🟡 DEPRECATED — present in schema, null by default | Legacy; no write path sets it |
+| LiveKit provider | ✅ Active | Room token, recording upload, session lifecycle |
+| Pipecat provider | 🗄️ Stale | Referenced in legacy schema; not an active production fallback |
+| Local Supabase CI | ✅ `supabase-ci.yml` | Migrations, RLS tests, security checks |
+| Production apply | ❌ BLOCKED | Gated on MIG-01 through MIG-11 completion |
+
+**No production Supabase project credentials, project refs, or hosted actions
+are placed in this repository.**
 
 ## Mandatory prerequisites
 
@@ -53,6 +75,14 @@ Hosted project settings must also be checked explicitly because local `config.to
 - Password/MFA/session policies match SEC-01 approval.
 - Storage buckets `resumes_v2` and `recordings_v2` are private.
 - Network restrictions, backups/PITR, Auth redirect URLs, and Realtime limits match the approved environment record.
+
+### Recording storage note
+
+The Phase 2 implementation stores `recording_object_key` (object key only, not
+a signed URL) in `call_sessions`. The legacy `recording_url` column remains in
+the schema (nullable, deprecated) and is **not written** by any active code path.
+Short-TTL signed URLs are minted at download time. This applies to **LiveKit**
+(active provider); **Pipecat** (stale) is not a production fallback.
 
 ## Post-apply verification
 

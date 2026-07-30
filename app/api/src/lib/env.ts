@@ -10,6 +10,7 @@ const _contractVisibleEnvReads = [
   process.env.BREAKER_COOLDOWN_MS,
   process.env.BREAKER_TIMEOUT_MS,
   process.env.CLAUDE_MAX_OUTPUT_BYTES,
+  process.env.RECORDING_DOWNLOAD_TTL_SEC,
 ];
 void _contractVisibleEnvReads;
 
@@ -57,6 +58,8 @@ export const env = {
   livekitApiKey: process.env.LIVEKIT_API_KEY ?? '',
   livekitApiSecret: process.env.LIVEKIT_API_SECRET ?? '',
   recordingsBucket: process.env.RECORDINGS_BUCKET ?? 'recordings_v2',
+  /** MIG-06: TTL (seconds) for recruiter recording download signed URLs. Range 60..900. */
+  recordingDownloadTtlSec: positiveInt('RECORDING_DOWNLOAD_TTL_SEC', 300, 60, 900),
   /** REL-08: grace period (ms) before forced connection teardown. */
   shutdownGraceMs: positiveInt('SHUTDOWN_GRACE_MS', 30000, 100, 300000),
   /** REL-05/REL-06 provider resilience controls. */

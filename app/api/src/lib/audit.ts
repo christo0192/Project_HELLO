@@ -37,7 +37,8 @@ export type AuditEvent =
   | 'resource.list'
   | 'rate_limit.exceeded'
   | 'audit.sink_failure'
-  | 'audit.configuration_error';
+  | 'audit.configuration_error'
+  | 'recording.download';
 
 /** Events that, when they fail to record for a privileged mutation,
  *  should block the mutation (fail-closed). */
@@ -60,6 +61,7 @@ export const FAIL_OPEN_EVENTS: ReadonlySet<string> = new Set([
   'rate_limit.exceeded',
   'audit.sink_failure',
   'audit.configuration_error',
+  'recording.download',
 ]);
 
 // ── PII redaction patterns ──────────────────────────────────────────

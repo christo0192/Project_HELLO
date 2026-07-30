@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api, ApiError } from "../api";
 import type { CandidateDetail } from "../types";
@@ -12,6 +12,7 @@ import {
   LoadingState,
   PageHeader,
 } from "../components/ui";
+
 
 export function CandidateDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -162,17 +163,8 @@ export function CandidateDetailPage() {
                         </Link>
                       </div>
                     </div>
-                    {s.recording_url && (
-                      <audio
-                        controls
-                        preload="none"
-                        src={s.recording_url}
-                        className="mt-2 h-9 w-full"
-                      >
-                        <a href={s.recording_url} target="_blank" rel="noreferrer">
-                          Download recording
-                        </a>
-                      </audio>
+                    {s.status === "completed" && (
+                      <RecordingDownloadButton sessionId={s.id} />
                     )}
                   </div>
                 ))}
@@ -181,6 +173,81 @@ export function CandidateDetailPage() {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * MIG-06: On-demand recording download button.
+ * Fetches a short-lived signed URL only when clicked.
+ * Never auto-fetches on list render.
+ */
+function RecordingDownloadButton({ sessionId }: { sessionId: string }) {
+  const [url, setUrl] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const mountedRef = useRef(true);
+  const reqIdRef = useRef(0);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  // On-demand fetch — only ever runs from an explicit click. Repeated
+  // clicks re-mint a fresh short-TTL URL (handles expiry); stale responses
+  // are ignored via a generation counter.
+  const handleClick = useCallback(() => {
+    const reqId = ++reqIdRef.current;
+    setLoading(true);
+    setError(null);
+    api
+      .getRecordingDownloadUrl(sessionId)
+      .then((res) => {
+        if (!mountedRef.current || reqId !== reqIdRef.current) return;
+        setUrl(res.url);
+        setLoading(false);
+      })
+      .catch((e: ApiError) => {
+        if (!mountedRef.current || reqId !== reqIdRef.current) return;
+        setError(e.message || "Failed to load recording");
+        setLoading(false);
+      });
+  }, [sessionId]);
+
+  if (url && !loading) {
+    return (
+      <div className="mt-2 space-y-1">
+        <audio controls preload="none" src={url} className="h-9 w-full">
+          <a href={url} target="_blank" rel="noreferrer">
+            Download recording
+          </a>
+        </audio>
+        <button
+          type="button"
+          onClick={handleClick}
+          className="text-xs font-medium text-accent-600 hover:text-accent-700"
+        >
+          Refresh link
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-2">
+      <button
+        type="button"
+        onClick={handleClick}
+        disabled={loading}
+        className="rounded bg-accent-600 px-3 py-1 text-xs font-medium text-white hover:bg-accent-700 disabled:opacity-50"
+      >
+        {loading ? "Loading…" : "Play recording"}
+      </button>
+      {error && <p className="mt-1 text-xs text-red-600">{error}</p>}
     </div>
   );
 }
