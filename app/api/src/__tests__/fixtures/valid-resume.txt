@@ -1,0 +1,13 @@
+Name: Jane Doe
+Email: jane.doe@example.com
+Phone: +1-555-123-4567
+
+Summary: Experienced software engineer with 8 years of experience.
+
+Skills: TypeScript, React, Node.js, PostgreSQL
+
+Experience: Senior Software Engineer at Tech Corp (2020-present)
+  Led development of microservices architecture.
+  Improved deployment pipeline efficiency by 40%.
+
+Education: B.S. Computer Science, University of Technology

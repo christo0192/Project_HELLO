@@ -1,13 +1,16 @@
-import { useEffect, useState } from "react";
-import { NavLink, Outlet } from "react-router-dom";
-import { api } from "../api";
+import { useEffect, useState } from 'react';
+import { NavLink, Outlet, useNavigate } from 'react-router-dom';
+import { api } from '../api';
+import { useAuth } from '../lib/auth';
 
 const navItems = [
-  { to: "/roles", label: "Roles", icon: BriefcaseIcon },
-  { to: "/candidates", label: "Candidates", icon: UsersIcon },
+  { to: '/roles', label: 'Roles', icon: BriefcaseIcon },
+  { to: '/candidates', label: 'Candidates', icon: UsersIcon },
 ];
 
 export function Layout() {
+  const { user, signOut, isAuthenticated } = useAuth();
+  const navigate = useNavigate();
   const [model, setModel] = useState<string | null>(null);
   const [online, setOnline] = useState<boolean | null>(null);
 
@@ -28,6 +31,11 @@ export function Layout() {
     };
   }, []);
 
+  async function handleLogout() {
+    await signOut();
+    navigate('/login', { replace: true });
+  }
+
   return (
     <div className="flex min-h-screen">
       <aside className="flex w-60 shrink-0 flex-col border-r border-gray-200 bg-white">
@@ -41,7 +49,7 @@ export function Layout() {
           </div>
         </div>
 
-        <nav className="flex-1 space-y-1 px-3">
+        <nav className="flex-1 space-y-1 px-3" aria-label="Main navigation">
           {navItems.map((item) => (
             <NavLink
               key={item.to}
@@ -49,8 +57,8 @@ export function Layout() {
               className={({ isActive }) =>
                 `flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors ${
                   isActive
-                    ? "bg-accent-50 text-accent-700"
-                    : "text-gray-600 hover:bg-gray-50 hover:text-gray-900"
+                    ? 'bg-accent-50 text-accent-700'
+                    : 'text-gray-600 hover:bg-gray-50 hover:text-gray-900'
                 }`
               }
             >
@@ -61,28 +69,43 @@ export function Layout() {
         </nav>
 
         <div className="border-t border-gray-200 p-4">
+          {isAuthenticated && user && (
+            <div className="mb-3 truncate text-xs text-gray-500" title={user.email ?? ''}>
+              {user.email}
+            </div>
+          )}
+
           <div className="flex items-center gap-2">
             <span
               className={`h-2 w-2 rounded-full ${
                 online === null
-                  ? "bg-gray-300"
+                  ? 'bg-gray-300'
                   : online
-                    ? "bg-emerald-500"
-                    : "bg-red-500"
+                    ? 'bg-emerald-500'
+                    : 'bg-red-500'
               }`}
             />
             <span className="text-xs text-gray-500">
               {online === null
-                ? "Checking…"
+                ? 'Checking…'
                 : online
-                  ? "API online"
-                  : "API offline"}
+                  ? 'API online'
+                  : 'API offline'}
             </span>
           </div>
           {model && (
             <p className="mt-1 truncate text-[11px] text-gray-400" title={model}>
               {model}
             </p>
+          )}
+
+          {isAuthenticated && (
+            <button
+              onClick={handleLogout}
+              className="mt-3 w-full rounded-lg px-3 py-1.5 text-left text-xs font-medium text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-700"
+            >
+              Sign out
+            </button>
           )}
         </div>
       </aside>

@@ -20,6 +20,7 @@ decision. Proposed ADRs are not authority to deploy their option.
 - [ADR-0005: Launch tenancy model](0005-launch-tenancy-model.md)
 - [ADR-0006: Recording capture and storage](0006-recording-capture-and-storage.md)
 - [ADR-0007: Production deployment and region](0007-production-deployment-and-region.md)
+- [ADR-0008: Recruiter authentication transport](0008-recruiter-auth-transport.md)
 
 Create new records from [the template](template.md). Never rewrite an accepted
 decision's outcome; supersede it with a new ADR so the history remains legible.

@@ -34,6 +34,7 @@ from provider_resilience import (
     CircuitBreakerConfig,
     CircuitState,
     ProviderError,
+    HttpxTransport,
     RealClock,
     call_with_breaker,
     configure_scoring_transport,
@@ -41,6 +42,7 @@ from provider_resilience import (
     parse_env_float,
     parse_env_int,
 )
+
 
 try:
     from supabase import create_client
@@ -624,3 +626,125 @@ async def drain_pending_writes(
             return False
 
     return True
+
+
+# ── Worker context resolution ────────────────────────────────────────
+# Worker context comes from authenticated server-side Supabase/persistence lookup
+# using strict session/room UUID binding — never from client-visible metadata.
+
+_API_TIMEOUT_SEC = float(os.getenv("WORKER_CONTEXT_TIMEOUT_SEC", "5"))
+
+
+def _get_worker_context_transport():
+    """Create the existing lazy HTTP transport with bounded context timeouts."""
+    return HttpxTransport(
+        connect_timeout=5.0,
+        read_timeout=_API_TIMEOUT_SEC,
+        write_timeout=5.0,
+        pool_timeout=5.0,
+        pool_connections=2,
+        pool_maxsize=2,
+    )
+
+
+_ERR_CONTEXT_NOT_FOUND = "context_not_found"
+_ERR_CONTEXT_BINDING = "context_binding_mismatch"
+_ERR_CONTEXT_INACTIVE = "context_not_active"
+_ERR_CONTEXT_API_ERROR = "context_api_error"
+
+
+class WorkerContext:
+    """Minimal server-side worker context — no PII, no resume data."""
+
+    __slots__ = ("session_id", "candidate_id", "role_id", "candidate_name", "room_name", "status")
+
+    def __init__(
+        self,
+        session_id: str,
+        candidate_id: str,
+        role_id: str | None,
+        candidate_name: str | None,
+        room_name: str,
+        status: str,
+    ) -> None:
+        self.session_id = session_id
+        self.candidate_id = candidate_id
+        self.role_id = role_id
+        self.candidate_name = candidate_name
+        self.room_name = room_name
+        self.status = status
+
+
+def parse_worker_context(data: dict) -> WorkerContext:
+    """Parse a worker context dict into a WorkerContext object."""
+    return WorkerContext(
+        session_id=str(data.get("session_id", "")),
+        candidate_id=str(data.get("candidate_id", "")),
+        role_id=data.get("role_id"),
+        candidate_name=data.get("candidate_name"),
+        room_name=str(data.get("room_name", "")),
+        status=str(data.get("status", "")),
+    )
+
+
+async def resolve_worker_context(
+    session_id: str,
+    room_name: str,
+) -> WorkerContext | str:
+    """Resolve worker context from the API via server-side lookup.
+
+    Returns a WorkerContext on success, or an error code string on failure.
+    Error codes are stable strings — never echo runtime values.
+
+    This is called by the worker to get the minimal context needed for the
+    interview (candidate name for prompting, etc.) without relying on
+    client-visible room/participant metadata.
+    """
+    if not session_id or not _is_valid_uuid(session_id):
+        return _ERR_CONTEXT_NOT_FOUND
+
+    # HIGH SEC-13: fail closed before constructing a network transport unless
+    # a worker-only bearer credential exists.
+    worker_secret = os.getenv("WORKER_CONTEXT_SECRET")
+    if not worker_secret or len(worker_secret) < 32:
+        return _ERR_CONTEXT_API_ERROR
+
+    try:
+        transport = _get_worker_context_transport()
+    except Exception:  # noqa: BLE001
+        return _ERR_CONTEXT_API_ERROR
+
+    correlation_id = get_correlation_id()
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+    }
+    headers["Authorization"] = f"Bearer {worker_secret}"
+    if correlation_id:
+        headers["X-Correlation-ID"] = correlation_id
+
+    try:
+        # call_with_breaker raises BusinessError for 4xx responses
+        # and ProviderError for 5xx/transport errors.
+        # 200 OK is returned normally.
+        response = await call_with_breaker(
+            "POST",
+            f"{API_BASE}/api/livekit/worker-context",
+            transport=transport,
+            headers=headers,
+            json_body={
+                "session_id": session_id,
+                "room_name": room_name,
+            },
+            endpoint_hint="worker-context",
+            log_failures=False,
+        )
+        data = getattr(response, "json", lambda: {})()
+        if isinstance(data, dict) and data.get("ok"):
+            return parse_worker_context(data.get("context", {}))
+        return _ERR_CONTEXT_NOT_FOUND
+    except ProviderError:
+        return _ERR_CONTEXT_API_ERROR
+    except BusinessError:
+        return _ERR_CONTEXT_NOT_FOUND
+    except Exception:  # noqa: BLE001
+        return _ERR_CONTEXT_API_ERROR

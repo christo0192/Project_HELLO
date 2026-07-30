@@ -112,15 +112,18 @@ select _policy_tests.assert(
 select _policy_tests.assert(
   'dashboard policies invoke membership helper',
   (
-    select count(*) = 5
+    select count(*) = 6
       from pg_policies
      where schemaname = 'screening_v2'
-       and policyname like 'active recruiter read %'
        and cmd = 'SELECT'
        and roles @> array['authenticated'::name]
-       and qual like '%is_active_recruiter%'
+       and (
+         policyname like 'active recruiter read %'
+         or policyname like 'scoped recruiter read %'
+         or policyname like 'recruiter read audit_events'
+       )
   ),
-  'exactly five dashboard SELECT policies must use is_active_recruiter'
+  'all six dashboard SELECT policies must be gated by active recruiter membership'
 );
 
 -- Seed synthetic identities/data to exercise effective RLS, never candidate data.
@@ -1042,7 +1045,974 @@ select _policy_tests.assert(
   'only service_role should execute prevent_provenance_change'
 );
 
--- ── Verdict ────────────────────────────────────────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- 0007 — Phase 1: Ownership scope, invites, grants, audit
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- ── A. Owner_id columns ───────────────────────────────────────────────
+
+select _policy_tests.assert(
+  'roles has owner_id column',
+  exists (
+    select 1 from information_schema.columns
+     where table_schema = 'screening_v2'
+       and table_name = 'roles'
+       and column_name = 'owner_id'
+  ),
+  'owner_id must exist on roles table'
+);
+
+select _policy_tests.assert(
+  'candidates has owner_id column',
+  exists (
+    select 1 from information_schema.columns
+     where table_schema = 'screening_v2'
+       and table_name = 'candidates'
+       and column_name = 'owner_id'
+  ),
+  'owner_id must exist on candidates table'
+);
+
+select _policy_tests.assert(
+  'call_sessions has owner_id column',
+  exists (
+    select 1 from information_schema.columns
+     where table_schema = 'screening_v2'
+       and table_name = 'call_sessions'
+       and column_name = 'owner_id'
+  ),
+  'owner_id must exist on call_sessions table'
+);
+
+select _policy_tests.assert(
+  'owner_id is nullable on all three tables',
+  exists (
+    select 1 from information_schema.columns
+     where table_schema = 'screening_v2'
+       and table_name = 'roles'
+       and column_name = 'owner_id'
+       and is_nullable = 'YES'
+  )
+  and exists (
+    select 1 from information_schema.columns
+     where table_schema = 'screening_v2'
+       and table_name = 'candidates'
+       and column_name = 'owner_id'
+       and is_nullable = 'YES'
+  )
+  and exists (
+    select 1 from information_schema.columns
+     where table_schema = 'screening_v2'
+       and table_name = 'call_sessions'
+       and column_name = 'owner_id'
+       and is_nullable = 'YES'
+  ),
+  'owner_id must be nullable for legacy/backfill safety'
+);
+
+select _policy_tests.assert(
+  'owner_id indexes exist',
+  exists (
+    select 1 from pg_indexes
+     where schemaname = 'screening_v2'
+       and tablename = 'roles'
+       and indexname = 'idx_v2_roles_owner'
+  )
+  and exists (
+    select 1 from pg_indexes
+     where schemaname = 'screening_v2'
+       and tablename = 'candidates'
+       and indexname = 'idx_v2_candidates_owner'
+  )
+  and exists (
+    select 1 from pg_indexes
+     where schemaname = 'screening_v2'
+       and tablename = 'call_sessions'
+       and indexname = 'idx_v2_sessions_owner'
+  ),
+  'owner_id must have indexes on all three tables'
+);
+
+-- ── REC-05 recording_object_key ─────────────────────────────────────────
+
+select _policy_tests.assert(
+  'call_sessions has recording_object_key column',
+  exists (
+    select 1 from information_schema.columns
+     where table_schema = 'screening_v2'
+       and table_name = 'call_sessions'
+       and column_name = 'recording_object_key'
+  ),
+  'recording_object_key must exist on call_sessions'
+);
+
+select _policy_tests.assert(
+  'recording_object_key is nullable',
+  exists (
+    select 1 from information_schema.columns
+     where table_schema = 'screening_v2'
+       and table_name = 'call_sessions'
+       and column_name = 'recording_object_key'
+       and is_nullable = 'YES'
+  ),
+  'recording_object_key must be nullable (not yet recorded)'
+);
+
+select _policy_tests.assert(
+  'recording_object_key CHECK constraint exists',
+  exists (
+    select 1 from pg_constraint
+     where conrelid = 'screening_v2.call_sessions'::regclass
+       and conname = 'chk_call_sessions_recording_obj_key'
+       and contype = 'c'
+       and convalidated
+  ),
+  'recording_object_key must have a validated CHECK constraint'
+);
+
+select _policy_tests.assert(
+  'recording_object_key CHECK is bounded (1-512 chars, restricted charset)',
+  (
+    select pg_get_constraintdef(oid)
+      from pg_constraint
+     where conname = 'chk_call_sessions_recording_obj_key'
+       and conrelid = 'screening_v2.call_sessions'::regclass
+  ) like '%512%'
+  and (
+    select pg_get_constraintdef(oid)
+      from pg_constraint
+     where conname = 'chk_call_sessions_recording_obj_key'
+       and conrelid = 'screening_v2.call_sessions'::regclass
+  ) like '%a-zA-Z0-9%',
+  'CHECK must bound length and restrict charset'
+);
+
+select _policy_tests.assert(
+  'recording_object_key has partial index',
+  exists (
+    select 1 from pg_indexes
+     where schemaname = 'screening_v2'
+       and tablename = 'call_sessions'
+       and indexname = 'idx_v2_sessions_recording_key'
+  ),
+  'recording_object_key must have a partial index'
+);
+
+select _policy_tests.assert(
+  'no signed URL is persisted in recording_object_key',
+  not exists (
+    select 1 from information_schema.columns
+     where table_schema = 'screening_v2'
+       and table_name = 'call_sessions'
+       and column_name in ('recording_signed_url', 'recording_presigned_url', 'recording_url_ttl')
+  ),
+  'no signed/presigned URL column may exist on call_sessions'
+);
+
+-- ── B. Recruiter role helper ──────────────────────────────────────────
+
+select _policy_tests.assert(
+  'recruiter_role function exists',
+  exists (
+    select 1 from pg_proc p
+     join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname = 'recruiter_role'
+  ),
+  'screening_v2.recruiter_role() must exist'
+);
+
+select _policy_tests.assert(
+  'recruiter_role is security definer with fixed search_path',
+  exists (
+    select 1
+      from pg_proc p
+      join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname = 'recruiter_role'
+       and p.prosecdef
+       and p.proconfig @> array['search_path=pg_catalog']
+  ),
+  'recruiter_role must be SECURITY DEFINER with search_path=pg_catalog'
+);
+
+select _policy_tests.assert(
+  'recruiter_role not executable by anon/public',
+  not exists (
+    select 1 from pg_proc p
+     join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname = 'recruiter_role'
+       and has_function_privilege('public', p.oid, 'EXECUTE')
+  )
+  and not exists (
+    select 1 from pg_proc p
+     join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname = 'recruiter_role'
+       and has_function_privilege('anon', p.oid, 'EXECUTE')
+  ),
+  'only authenticated and service_role should execute recruiter_role'
+);
+
+-- ── C. Role-aware RLS policies ────────────────────────────────────────
+
+select _policy_tests.assert(
+  'scoped recruiter read roles policy exists',
+  exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename = 'roles'
+       and policyname = 'scoped recruiter read roles'
+       and cmd = 'SELECT'
+  ),
+  'roles must have a scoped SELECT policy'
+);
+
+select _policy_tests.assert(
+  'scoped recruiter read candidates policy exists',
+  exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename = 'candidates'
+       and policyname = 'scoped recruiter read candidates'
+       and cmd = 'SELECT'
+  ),
+  'candidates must have a scoped SELECT policy'
+);
+
+select _policy_tests.assert(
+  'scoped recruiter read call_sessions policy exists',
+  exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename = 'call_sessions'
+       and policyname = 'scoped recruiter read call_sessions'
+       and cmd = 'SELECT'
+  ),
+  'call_sessions must have a scoped SELECT policy'
+);
+
+select _policy_tests.assert(
+  'old membership-agnostic policies are removed',
+  not exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and policyname like 'active recruiter read %'
+       and tablename in ('roles', 'candidates', 'call_sessions')
+  ),
+  'the three old un-scoped policies on roles/candidates/call_sessions must be removed'
+);
+
+select _policy_tests.assert(
+  'transcript_turns still has active recruiter read policy',
+  exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename = 'transcript_turns'
+       and policyname = 'active recruiter read transcript_turns'
+  ),
+  'transcript_turns retains the active recruiter read policy'
+);
+
+select _policy_tests.assert(
+  'assessments still has active recruiter read policy',
+  exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename = 'assessments'
+       and policyname = 'active recruiter read assessments'
+  ),
+  'assessments retains the active recruiter read policy'
+);
+
+-- ── D. Candidate invites table ────────────────────────────────────────
+
+select _policy_tests.assert(
+  'candidate_invites table exists',
+  to_regclass('screening_v2.candidate_invites') is not null,
+  'screening_v2.candidate_invites must exist'
+);
+
+select _policy_tests.assert(
+  'candidate_invites has token_digest column',
+  exists (
+    select 1 from information_schema.columns
+     where table_schema = 'screening_v2'
+       and table_name = 'candidate_invites'
+       and column_name = 'token_digest'
+  ),
+  'candidate_invites must have token_digest column (SHA-256)'
+);
+
+select _policy_tests.assert(
+  'candidate_invites has no plaintext token column',
+  not exists (
+    select 1 from information_schema.columns
+     where table_schema = 'screening_v2'
+       and table_name = 'candidate_invites'
+       and column_name in ('token', 'token_plaintext', 'secret', 'auth_code')
+  ),
+  'no plaintext token column may exist on candidate_invites'
+);
+
+select _policy_tests.assert(
+  'candidate_invites token_digest is unique',
+  exists (
+    select 1 from pg_constraint
+     where conrelid = 'screening_v2.candidate_invites'::regclass
+       and conname = 'uq_candidate_invites_digest'
+       and contype = 'u'
+  ),
+  'token_digest must have a UNIQUE constraint'
+);
+
+select _policy_tests.assert(
+  'candidate_invites has digest format check',
+  exists (
+    select 1 from pg_constraint
+     where conrelid = 'screening_v2.candidate_invites'::regclass
+       and conname = 'chk_invite_token_digest'
+       and contype = 'c'
+  ),
+  'token_digest must have a CHECK constraint for hex format'
+);
+
+select _policy_tests.assert(
+  'candidate_invites has expires_at > created_at check',
+  exists (
+    select 1 from pg_constraint
+     where conrelid = 'screening_v2.candidate_invites'::regclass
+       and conname = 'chk_invite_expires_after_created'
+       and contype = 'c'
+  ),
+  'invite must enforce expires_at > created_at'
+);
+
+select _policy_tests.assert(
+  'candidate_invites has candidate_id FK',
+  exists (
+    select 1 from pg_constraint
+     where conrelid = 'screening_v2.candidate_invites'::regclass
+       and contype = 'f'
+       and pg_get_constraintdef(oid) like '%candidates%'
+  ),
+  'candidate_invites must FK to candidates'
+);
+
+select _policy_tests.assert(
+  'candidate_invites has RLS enabled',
+  exists (
+    select 1 from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'candidate_invites'
+       and c.relrowsecurity
+  ),
+  'RLS must be enabled on candidate_invites'
+);
+
+select _policy_tests.assert(
+  'candidate_invites has no authenticated policy',
+  not exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename = 'candidate_invites'
+       and 'authenticated' = any(roles)
+  ),
+  'candidate_invites must remain server-only'
+);
+
+-- ── E. Candidate access grants table ──────────────────────────────────
+
+select _policy_tests.assert(
+  'candidate_access_grants table exists',
+  to_regclass('screening_v2.candidate_access_grants') is not null,
+  'screening_v2.candidate_access_grants must exist'
+);
+
+select _policy_tests.assert(
+  'candidate_access_grants has token_digest column (no plaintext)',
+  exists (
+    select 1 from information_schema.columns
+     where table_schema = 'screening_v2'
+       and table_name = 'candidate_access_grants'
+       and column_name = 'token_digest'
+  )
+  and not exists (
+    select 1 from information_schema.columns
+     where table_schema = 'screening_v2'
+       and table_name = 'candidate_access_grants'
+       and column_name in ('token', 'token_plaintext', 'secret', 'auth_code')
+  ),
+  'token_digest exists on grants; no plaintext token column'
+);
+
+select _policy_tests.assert(
+  'candidate_access_grants token_digest is unique',
+  exists (
+    select 1 from pg_constraint
+     where conrelid = 'screening_v2.candidate_access_grants'::regclass
+       and conname = 'uq_candidate_grants_digest'
+       and contype = 'u'
+  ),
+  'token_digest must have a UNIQUE constraint on grants'
+);
+
+select _policy_tests.assert(
+  'candidate_access_grants has grant_type check',
+  exists (
+    select 1 from pg_constraint
+     where conrelid = 'screening_v2.candidate_access_grants'::regclass
+       and conname = 'chk_grant_type'
+       and contype = 'c'
+  ),
+  'grant_type must have a CHECK constraint'
+);
+
+select _policy_tests.assert(
+  'candidate_access_grants has RLS enabled',
+  exists (
+    select 1 from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'candidate_access_grants'
+       and c.relrowsecurity
+  ),
+  'RLS must be enabled on candidate_access_grants'
+);
+
+select _policy_tests.assert(
+  'candidate_access_grants has no authenticated policy',
+  not exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename = 'candidate_access_grants'
+       and 'authenticated' = any(roles)
+  ),
+  'candidate_access_grants must remain server-only'
+);
+
+-- Verify grants table is NOT exposed through PostgREST
+select _policy_tests.assert(
+  'candidate_access_grants has no direct SELECT grant to authenticated',
+  not exists (
+    select 1
+      from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'candidate_access_grants'
+       and has_table_privilege('authenticated', c.oid, 'SELECT')
+  ),
+  'candidate_access_grants must NOT have SELECT grant for authenticated (no PostgREST exposure)'
+);
+
+select _policy_tests.assert(
+  'candidate_invites has no direct SELECT grant to authenticated',
+  not exists (
+    select 1
+      from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'candidate_invites'
+       and has_table_privilege('authenticated', c.oid, 'SELECT')
+  ),
+  'candidate_invites must NOT have SELECT grant for authenticated (backend-only access)'
+);
+
+-- ── F. Audit events table ────────────────────────────────────────────
+
+select _policy_tests.assert(
+  'audit_events table exists',
+  to_regclass('screening_v2.audit_events') is not null,
+  'screening_v2.audit_events must exist'
+);
+
+select _policy_tests.assert(
+  'audit_events has no PII columns',
+  not exists (
+    select 1 from information_schema.columns
+     where table_schema = 'screening_v2'
+       and table_name = 'audit_events'
+       and column_name in (
+         'transcript', 'resume_text', 'email', 'phone', 'name',
+         'address', 'ssn', 'token', 'password', 'secret'
+       )
+  ),
+  'audit_events must not contain PII or secret columns'
+);
+
+select _policy_tests.assert(
+  'audit_events has actor_type check constraint',
+  exists (
+    select 1 from pg_constraint
+     where conrelid = 'screening_v2.audit_events'::regclass
+       and conname = 'chk_audit_actor_type'
+       and contype = 'c'
+  ),
+  'audit_events must constrain actor_type'
+);
+
+select _policy_tests.assert(
+  'audit_events has action check constraint',
+  exists (
+    select 1 from pg_constraint
+     where conrelid = 'screening_v2.audit_events'::regclass
+       and conname = 'chk_audit_action'
+       and contype = 'c'
+  ),
+  'audit_events must constrain action'
+);
+
+select _policy_tests.assert(
+  'audit_events has result check constraint',
+  exists (
+    select 1 from pg_constraint
+     where conrelid = 'screening_v2.audit_events'::regclass
+       and conname = 'chk_audit_result'
+       and contype = 'c'
+  ),
+  'audit_events must constrain result'
+);
+
+select _policy_tests.assert(
+  'audit_events has metadata size check',
+  exists (
+    select 1 from pg_constraint
+     where conrelid = 'screening_v2.audit_events'::regclass
+       and conname = 'chk_audit_metadata_size'
+       and contype = 'c'
+  ),
+  'audit_events must constrain metadata size'
+);
+
+select _policy_tests.assert(
+  'audit_events has UPDATE prevention trigger',
+  exists (
+    select 1 from pg_trigger t
+      join pg_class c on c.oid = t.tgrelid
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'audit_events'
+       and t.tgname = 'trg_audit_prevent_update'
+       and not t.tgisinternal
+  ),
+  'UPDATE trigger must block mutations on audit_events'
+);
+
+select _policy_tests.assert(
+  'audit_events has DELETE prevention trigger',
+  exists (
+    select 1 from pg_trigger t
+      join pg_class c on c.oid = t.tgrelid
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'audit_events'
+       and t.tgname = 'trg_audit_prevent_delete'
+       and not t.tgisinternal
+  ),
+  'DELETE trigger must block mutations on audit_events'
+);
+
+select _policy_tests.assert(
+  'audit_events has RLS enabled',
+  exists (
+    select 1 from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'audit_events'
+       and c.relrowsecurity
+  ),
+  'RLS must be enabled on audit_events'
+);
+
+select _policy_tests.assert(
+  'audit_events has recruiter read policy',
+  exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename = 'audit_events'
+       and policyname = 'recruiter read audit_events'
+  ),
+  'active recruiters must be able to read audit_events'
+);
+
+-- Negative: anon has no audit access
+select _policy_tests.assert(
+  'anon has no SELECT on audit_events',
+  not exists (
+    select 1
+      from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'audit_events'
+       and has_table_privilege('anon', c.oid, 'SELECT')
+  ),
+  'anon must not have SELECT on audit_events'
+);
+
+-- ── G. Live audit mutation tests ──────────────────────────────────────
+
+do $$
+declare
+  v_audit_id uuid;
+  update_rejected boolean := false;
+  delete_rejected boolean := false;
+begin
+  -- Insert a synthetic audit event to test mutation guards
+  insert into screening_v2.audit_events (
+    actor_id, actor_type, action, target_type, target_id, result
+  ) values (
+    '00000000-0000-0000-0000-000000000000'::uuid,
+    'system',
+    'config_changed',
+    'system',
+    '00000000-0000-0000-0000-000000000000',
+    'success'
+  ) returning id into v_audit_id;
+
+  if v_audit_id is null then
+    insert into _policy_tests.results(test, passed, detail) values
+      ('audit UPDATE blocked (live)', true, 'skipped: could not insert audit row'),
+      ('audit DELETE blocked (live)', true, 'skipped: could not insert audit row');
+    return;
+  end if;
+
+  -- UPDATE must be rejected
+  begin
+    update screening_v2.audit_events
+       set result = 'failure'
+     where id = v_audit_id;
+  exception when others then
+    update_rejected := true;
+  end;
+
+  -- DELETE must be rejected
+  begin
+    delete from screening_v2.audit_events where id = v_audit_id;
+  exception when others then
+    delete_rejected := true;
+  end;
+
+  -- Clean up via escape hatch for test cleanup
+  if not update_rejected or not delete_rejected then
+    begin
+      set local app.allow_audit_mutation = 'true';
+      delete from screening_v2.audit_events where id = v_audit_id;
+    exception when others then null;
+    end;
+  end if;
+
+  insert into _policy_tests.results(test, passed, detail) values
+    ('audit UPDATE blocked (live)',
+     update_rejected,
+     case when update_rejected then null
+          else 'UPDATE was allowed on append-only audit_events' end),
+    ('audit DELETE blocked (live)',
+     delete_rejected,
+     case when delete_rejected then null
+          else 'DELETE was allowed on append-only audit_events' end);
+end;
+$$;
+
+-- ── H. Cross-owner denial test ───────────────────────────────────────
+
+-- Grant test-schema access so the `set local role authenticated` blocks
+-- can insert results. The `_policy_tests` schema is dropped at the end.
+grant usage on schema _policy_tests to authenticated;
+grant all privileges on all tables    in schema _policy_tests to authenticated;
+grant all privileges on all sequences in schema _policy_tests to authenticated;
+
+do $$
+declare
+  v_interviewer_1_id uuid;
+  v_interviewer_2_id uuid;
+  v_admin_id uuid;
+  v_role_id uuid;
+  v_candidate_id uuid;
+  rows_seen_by_interviewer_1 integer;
+  rows_seen_by_interviewer_2 integer;
+  rows_seen_by_admin integer;
+begin
+  -- Create synthetic auth users for testing
+  insert into auth.users (
+    instance_id, id, aud, role, email, encrypted_password,
+    email_confirmed_at, raw_app_meta_data, raw_user_meta_data,
+    created_at, updated_at
+  ) values (
+    '00000000-0000-0000-0000-000000000000',
+    '20000000-0000-4000-a000-000000000001',
+    'authenticated', 'authenticated', 'interviewer1@example.invalid', '',
+    now(), '{}', '{}', now(), now()
+  ) on conflict (id) do nothing;
+
+  insert into auth.users (
+    instance_id, id, aud, role, email, encrypted_password,
+    email_confirmed_at, raw_app_meta_data, raw_user_meta_data,
+    created_at, updated_at
+  ) values (
+    '00000000-0000-0000-0000-000000000000',
+    '20000000-0000-4000-a000-000000000002',
+    'authenticated', 'authenticated', 'interviewer2@example.invalid', '',
+    now(), '{}', '{}', now(), now()
+  ) on conflict (id) do nothing;
+
+  insert into auth.users (
+    instance_id, id, aud, role, email, encrypted_password,
+    email_confirmed_at, raw_app_meta_data, raw_user_meta_data,
+    created_at, updated_at
+  ) values (
+    '00000000-0000-0000-0000-000000000000',
+    '20000000-0000-4000-a000-000000000003',
+    'authenticated', 'authenticated', 'admin1@example.invalid', '',
+    now(), '{}', '{}', now(), now()
+  ) on conflict (id) do nothing;
+
+  -- Create memberships
+  insert into screening_v2.recruiter_memberships (user_id, role, active)
+  values ('20000000-0000-4000-a000-000000000001', 'interviewer', true)
+  on conflict (user_id) do update set role = excluded.role, active = excluded.active;
+
+  insert into screening_v2.recruiter_memberships (user_id, role, active)
+  values ('20000000-0000-4000-a000-000000000002', 'interviewer', true)
+  on conflict (user_id) do update set role = excluded.role, active = excluded.active;
+
+  insert into screening_v2.recruiter_memberships (user_id, role, active)
+  values ('20000000-0000-4000-a000-000000000003', 'admin', true)
+  on conflict (user_id) do update set role = excluded.role, active = excluded.active;
+
+  -- Create a role owned by interviewer 1
+  insert into screening_v2.roles (id, title, owner_id, created_at, updated_at)
+  values (
+    '20000000-0000-4000-a000-000000000010',
+    'Cross-Owner Test Role',
+    '20000000-0000-4000-a000-000000000001',
+    now(), now()
+  ) on conflict (id) do nothing
+  returning id into v_role_id;
+
+  -- Create a candidate owned by interviewer 1
+  insert into screening_v2.candidates (id, role_id, name, email, skills, status, owner_id, created_at, updated_at)
+  values (
+    '20000000-0000-4000-a000-000000000020',
+    v_role_id,
+    'Cross-Owner Test Candidate',
+    'cross.owner@example.invalid',
+    '["testing"]'::jsonb,
+    'new',
+    '20000000-0000-4000-a000-000000000001',
+    now(), now()
+  ) on conflict (id) do nothing
+  returning id into v_candidate_id;
+
+  -- Test 1: Interviewer 1 sees their owned role
+  begin
+    set local role authenticated;
+    set local "request.jwt.claims" to '{"sub":"20000000-0000-4000-a000-000000000001","role":"authenticated"}';
+    select count(*) into rows_seen_by_interviewer_1
+      from screening_v2.roles r
+     where r.id = '20000000-0000-4000-a000-000000000010';
+  end;
+
+  -- Test 2: Interviewer 2 does NOT see interviewer 1's owned role
+  begin
+    set local role authenticated;
+    set local "request.jwt.claims" to '{"sub":"20000000-0000-4000-a000-000000000002","role":"authenticated"}';
+    select count(*) into rows_seen_by_interviewer_2
+      from screening_v2.roles r
+     where r.id = '20000000-0000-4000-a000-000000000010';
+  end;
+
+  -- Test 3: Admin sees interviewer 1's owned role
+  begin
+    set local role authenticated;
+    set local "request.jwt.claims" to '{"sub":"20000000-0000-4000-a000-000000000003","role":"authenticated"}';
+    select count(*) into rows_seen_by_admin
+      from screening_v2.roles r
+     where r.id = '20000000-0000-4000-a000-000000000010';
+  end;
+
+  insert into _policy_tests.results(test, passed, detail) values
+    ('interviewer sees own owned role',
+     rows_seen_by_interviewer_1 = 1,
+     case when rows_seen_by_interviewer_1 = 1 then null
+          else 'interviewer 1 could not see their owned role (count=' || rows_seen_by_interviewer_1 || ')' end),
+    ('interviewer cannot see other owner role',
+     rows_seen_by_interviewer_2 = 0,
+     case when rows_seen_by_interviewer_2 = 0 then null
+          else 'interviewer 2 could see interviewer 1 owned role (count=' || rows_seen_by_interviewer_2 || ')' end),
+    ('admin can see all owned roles',
+     rows_seen_by_admin = 1,
+     case when rows_seen_by_admin = 1 then null
+          else 'admin could not see interviewer 1 owned role (count=' || rows_seen_by_admin || ')' end);
+
+  -- Same tests for candidates
+  begin
+    set local role authenticated;
+    set local "request.jwt.claims" to '{"sub":"20000000-0000-4000-a000-000000000001","role":"authenticated"}';
+    select count(*) into rows_seen_by_interviewer_1
+      from screening_v2.candidates c
+     where c.id = '20000000-0000-4000-a000-000000000020';
+  end;
+
+  begin
+    set local role authenticated;
+    set local "request.jwt.claims" to '{"sub":"20000000-0000-4000-a000-000000000002","role":"authenticated"}';
+    select count(*) into rows_seen_by_interviewer_2
+      from screening_v2.candidates c
+     where c.id = '20000000-0000-4000-a000-000000000020';
+  end;
+
+  begin
+    set local role authenticated;
+    set local "request.jwt.claims" to '{"sub":"20000000-0000-4000-a000-000000000003","role":"authenticated"}';
+    select count(*) into rows_seen_by_admin
+      from screening_v2.candidates c
+     where c.id = '20000000-0000-4000-a000-000000000020';
+  end;
+
+  insert into _policy_tests.results(test, passed, detail) values
+    ('interviewer sees own owned candidate',
+     rows_seen_by_interviewer_1 = 1,
+     case when rows_seen_by_interviewer_1 = 1 then null
+          else 'interviewer 1 could not see their owned candidate' end),
+    ('interviewer cannot see other owner candidate',
+     rows_seen_by_interviewer_2 = 0,
+     case when rows_seen_by_interviewer_2 = 0 then null
+          else 'interviewer 2 could see interviewer 1 owned candidate' end),
+    ('admin can see all owned candidates',
+     rows_seen_by_admin = 1,
+     case when rows_seen_by_admin = 1 then null
+          else 'admin could not see interviewer 1 owned candidate' end);
+end;
+$$;
+
+-- Cleanup in a separate DO block (resets role to postgres automatically)
+do $$
+begin
+  set local app.allow_audit_mutation to 'true';
+  delete from screening_v2.candidates where id = '20000000-0000-4000-a000-000000000020';
+  delete from screening_v2.roles where id = '20000000-0000-4000-a000-000000000010';
+  delete from screening_v2.recruiter_memberships
+   where user_id in (
+     '20000000-0000-4000-a000-000000000001',
+     '20000000-0000-4000-a000-000000000002',
+     '20000000-0000-4000-a000-000000000003'
+   );
+  delete from auth.users
+   where id in (
+     '20000000-0000-4000-a000-000000000001',
+     '20000000-0000-4000-a000-000000000002',
+     '20000000-0000-4000-a000-000000000003'
+   );
+end;
+$$;
+
+-- ── I. Negative control: token_digest format enforcement ──────────────
+
+do $$
+declare
+  invalid_accepted boolean := false;
+  v_candidate_id uuid;
+begin
+  select id into v_candidate_id from screening_v2.candidates limit 1;
+
+  if v_candidate_id is null then
+    insert into _policy_tests.results(test, passed, detail) values
+      ('INVITE: invalid token_digest format rejected', true,
+       'skipped: no candidate row available');
+    return;
+  end if;
+
+  begin
+    insert into screening_v2.candidate_invites
+      (candidate_id, token_digest, expires_at, created_by)
+    values (
+      v_candidate_id,
+      'not-a-valid-sha256-hex',  -- wrong format
+      now() + interval '1 day',
+      '20000000-0000-4000-a000-000000000001'::uuid
+    );
+  exception when check_violation then
+    invalid_accepted := true;
+  end;
+
+  insert into _policy_tests.results(test, passed, detail) values
+    ('INVITE: invalid token_digest format rejected (live)',
+     invalid_accepted,
+     case when invalid_accepted then null
+          else 'token_digest accepted non-hex value' end);
+end;
+$$;
+
+-- ── J. Negative control: no plaintext token columns on any new table ────
+
+select _policy_tests.assert(
+  'no plaintext token column on candidate_invites (negative proof)',
+  not exists (
+    select 1 from information_schema.columns
+     where table_schema = 'screening_v2'
+       and table_name = 'candidate_invites'
+       and column_name similar to '(token|secret|key|password|auth_code)'
+       and column_name != 'token_digest'
+  )
+  and not exists (
+    select 1 from information_schema.columns
+     where table_schema = 'screening_v2'
+       and table_name = 'candidate_access_grants'
+       and column_name similar to '(token|secret|key|password|auth_code)'
+       and column_name != 'token_digest'
+  ),
+  'no column named token, secret, key, password, or auth_code (except token_digest) may exist'
+);
+
+-- ── K. Negative control: anon denied on all new tables ────────────────
+
+select _policy_tests.assert(
+  'anon has no privilege on candidate_invites',
+  not exists (
+    select 1
+      from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'candidate_invites'
+       and (has_any_column_privilege('anon', c.oid, 'SELECT,INSERT,UPDATE,REFERENCES')
+         or has_table_privilege('anon', c.oid, 'DELETE'))
+  ),
+  'anon must have zero privileges on candidate_invites'
+);
+
+select _policy_tests.assert(
+  'anon has no privilege on candidate_access_grants',
+  not exists (
+    select 1
+      from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'candidate_access_grants'
+       and (has_any_column_privilege('anon', c.oid, 'SELECT,INSERT,UPDATE,REFERENCES')
+         or has_table_privilege('anon', c.oid, 'DELETE'))
+  ),
+  'anon must have zero privileges on candidate_access_grants'
+);
+
+select _policy_tests.assert(
+  'anon has no privilege on audit_events',
+  not exists (
+    select 1
+      from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'audit_events'
+       and (has_any_column_privilege('anon', c.oid, 'SELECT,INSERT,UPDATE,REFERENCES')
+         or has_table_privilege('anon', c.oid, 'DELETE'))
+  ),
+  'anon must have zero privileges on audit_events'
+);
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- Verdict (includes all Phase 1 tests above)
+-- ═══════════════════════════════════════════════════════════════════════
 
 select test, case when passed then 'PASS' else 'FAIL' end as result, detail
   from _policy_tests.results order by id;

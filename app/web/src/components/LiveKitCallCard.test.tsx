@@ -49,16 +49,16 @@ describe('LiveKitCallCard', () => {
     );
     expect(
       screen.getByText(
-        /Starts a LiveKit room for Jane Doe/,
+        /Create a one-time invite for Jane Doe/,
       ),
     ).toBeInTheDocument();
   });
 
-  it('renders "Start Screening" button in idle state', () => {
+  it('renders "Create Invite" button in idle state', () => {
     render(
       <LiveKitCallCard candidateId="candidate-1" candidateName="Jane Doe" />,
     );
-    const btn = screen.getByRole('button', { name: 'Start Screening' });
+    const btn = screen.getByRole('button', { name: 'Create Invite' });
     expect(btn).toBeInTheDocument();
   });
 

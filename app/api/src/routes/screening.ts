@@ -19,8 +19,16 @@ import {
 } from '../schemas/screening.js';
 import { createSession, transitionSession, ERR_INSERT_FAILED, ERR_DB_FAILED } from '../lib/session-lifecycle.js';
 import { screeningProvenance } from '../lib/model-provenance.js';
+import { requireRole } from '../lib/rbac.js';
+import { recordAudit } from '../lib/audit.js';
 
 export const screeningRouter = Router();
+
+// SEC-03: Screening sessions cannot be safely scoped by owner_id because
+// sessions are candidate-centric, not interviewer-owned. Interviewer access
+// is currently denied pending future scoping via candidate owner_id.
+// Only admin may initiate and manage screening sessions.
+screeningRouter.use(requireRole('admin'));
 
 interface BotReply {
   message: string;
@@ -105,6 +113,7 @@ screeningRouter.post('/start', validateBody(startScreeningSchema), async (req, r
 
     // REL-07: create in `created` state. LLM-06 records the configured
     // design-intent model for this API-owned simulation inference path.
+    // SEC-03: screening sessions are admin-only (cannot be safely scoped by owner_id).
     const { data: session, error: insertErr } = await createSession({
       candidate_id: candidateId,
       role_id: roleId,

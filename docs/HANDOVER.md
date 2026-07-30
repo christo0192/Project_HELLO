@@ -1,8 +1,8 @@
 # Project Handover
 
-**Last updated:** 2026-07-29
+**Last updated:** 2026-07-30
 
-**Current baseline:** `main` through PR #19 (`0c06fc0`); the Phase 0 closure wave is under review on isolated feature branches.
+**Current baseline:** `main` through PR #24 (`bf35b58`); the Phase 1 security-core implementation is on `feat/phase1-security-core` pending owner review.
 
 **Repository:** `https://github.com/christo0192/Project_HELLO`
 
@@ -13,11 +13,11 @@
 **Current-state manifest:** [`config/current-state.json`](../config/current-state.json)
 (automated drift checks enforce consistency)
 
-**Implementation status:** Partial — REL-07/REL-08 lifecycle and shutdown code merged in PR #19. REL-09 reconciliation, durable scoring, deployed signal drain, live SDK integration, and external acceptance remain pending; 0/17 launch gates complete and 0/14 roadmap phases are accepted.
+**Implementation status:** Partial — Phase 0 closure PRs #20–#24 are merged, and the Phase 1 branch implements local/synthetic auth, RBAC, ownership, invites, rate limits, audit foundations, metadata minimization and resume defenses. External/production acceptance remains pending; 0/17 launch gates complete and 0/14 roadmap phases are accepted.
 
 ## Baseline
 
-PR #19 was squash-merged to `main` as `0c06fc0` on 2026-07-29. Phase 0 closure PRs are implementation/evidence work only and do not alter production acceptance without authentic external evidence.
+PR #24 was squash-merged to `main` as `bf35b58` on 2026-07-29. PR #19 was previously squash-merged as `0c06fc0`. Phase 0 and Phase 1 implementation/evidence do not alter production acceptance without authentic external evidence.
 
 ## Resume Here
 
@@ -33,10 +33,10 @@ cat docs/HANDOVER.md
 
 | Metric | Value |
 |--------|-------|
-| Completed launch gates | 0/17 — all FND-02, FND-03, and REL acceptance criteria remain unverified at production level |
-| Implementation coverage | REL-07/REL-08 code and aggregate tests exist on branch; strict acceptance is separate from implementation coverage |
-| Integrated baseline | `0c06fc0` (PR #19) |
-| Main state | PRs #1–#19 merged; Phase 0 closure wave pending review |
+| Completed launch gates | 0/17 — Foundation, Security and production acceptance criteria remain externally unverified |
+| Implementation coverage | Phase 1 local/synthetic foundations exist on `feat/phase1-security-core`; strict acceptance is separate |
+| Integrated baseline | `bf35b58` (PR #24) |
+| Main state | PRs #1–#24 merged; Phase 1 implementation PR pending owner review |
 
 > **Note:** The 25% completion figure sometimes seen in earlier summaries is NOT claimed. Zero launch gates are confirmed complete. Implementation coverage and acceptance verification are distinct gates.
 
@@ -132,11 +132,11 @@ git diff --check
 ### Current Test Counts
 | Suite | Count | Notes |
 |---|---|---|
-| API (Node) | **664 tests** | Includes lifecycle/shutdown, provider resilience, validation, observability, provenance, and CORS/CSP suites; deterministic fakes avoid real CLI/provider calls. |
-| LiveKit worker (Python) | **289 tests** | Combined lifecycle, resilience, observability, provenance, correlation, and persistence coverage using `unittest` and fake transports. |
-| Web | **101 tests** | Accessibility scaffold plus typecheck, lint, and production build. |
-| Supabase | **69 policy/provenance/lifecycle + 62 synthetic SQL assertions** | Local ephemeral stack only; includes anonymous denial, legal transition fixtures, and idempotent seed replay. |
-| Phase 0 closure | **82 provenance + 102 governance + 5 history + 75 evidence + 40 demo + 16 current-state tests** | Distributed across PRs #20–#23 and this FND-09 PR; each suite is deterministic and offline except the scanner binary/container itself. |
+| API (Node) | **818 tests** | Includes auth/RBAC/rate/audit, invite/grant, resume abuse, lifecycle, resilience, validation, observability, provenance and CORS/CSP suites with deterministic fakes. |
+| LiveKit worker (Python) | **305 tests + 148 subtests** | Includes authenticated worker-context, lifecycle, resilience, observability, provenance and persistence coverage. |
+| Web | **163 tests** | Recruiter auth/MFA/SSO seams, protected routes, candidate invite UI and accessibility plus typecheck, lint and build. |
+| Supabase | **130 policy/provenance/lifecycle + 62 synthetic SQL assertions** | Ephemeral local stack; includes ownership, invite/grant, append-only audit, anonymous denial and seed replay. |
+| Phase 1 static security | **66 assertions** | Token-column, audit, ownership, RLS, MFA configuration and recording-object-key checks; local/static only. |
 
 ## Remaining Production Work
 
@@ -152,12 +152,13 @@ D-001 and D-011 are approved only for internal synthetic engineering. Production
 authentication, tenancy, and authorization acceptance retains the named security,
 privacy, migration, and deployment gates in `PLAN.md`.
 
-Highest-risk unaddressed gaps:
-- No recruiter authentication, MFA, RBAC, tenant isolation, or candidate invite exchange (SEC-01–SEC-04)
-- No rate limiting or CSRF decision (SEC-06, SEC-08)
-- LiveKit metadata leaks candidate/resume/rubric context (SEC-13)
-- Resume and recording uploads are unauthenticated and memory-buffered (SEC-14, REC-01–REC-05)
-- Production Supabase auth, RLS, storage, backup, and migration: full hosted acceptance pending (Phases 2–12)
+Highest-risk residual gaps:
+- SEC-01–SEC-04 are local/synthetic foundations only: hosted SSO/MFA, account lifecycle, FND-06 identities and live provider proof remain pending.
+- SEC-06 uses in-process state; distributed limits, production thresholds and abuse alerts remain pending.
+- SEC-12 has an append-only schema/sink foundation but not complete event coverage, transactional failure policy or retention evidence.
+- SEC-13 removes sensitive client metadata, but full worker rubric/resume delivery and FND-05/FND-06 worker identity remain pending.
+- SEC-14 fails closed without production malware scanning; operational AV, streaming storage and production sandbox evidence remain pending.
+- Production Supabase auth, RLS, storage, backup and migration acceptance remains pending (Phases 2–12).
 
 ## Working Rules
 
