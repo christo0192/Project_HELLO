@@ -114,6 +114,11 @@ class TestResolveWorkerContext(unittest.TestCase):
         )
         self.env_patcher.start()
         self.addCleanup(self.env_patcher.stop)
+        self.transport_patcher = patch.object(
+            persistence, "_get_worker_context_transport", return_value=MagicMock(),
+        )
+        self.transport_patcher.start()
+        self.addCleanup(self.transport_patcher.stop)
         # Create a magic mock response for 200 OK
         self.mock_response = MagicMock()
         self.mock_response.status_code = 200

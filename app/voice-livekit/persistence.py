@@ -34,6 +34,7 @@ from provider_resilience import (
     CircuitBreakerConfig,
     CircuitState,
     ProviderError,
+    HttpxTransport,
     RealClock,
     call_with_breaker,
     configure_scoring_transport,
@@ -42,8 +43,6 @@ from provider_resilience import (
     parse_env_int,
 )
 
-
-import httpx  # type: ignore[import-untyped]
 
 try:
     from supabase import create_client
@@ -637,14 +636,14 @@ _API_TIMEOUT_SEC = float(os.getenv("WORKER_CONTEXT_TIMEOUT_SEC", "5"))
 
 
 def _get_worker_context_transport():
-    """Create a transport with bounded timeouts for worker context API calls."""
-    return httpx.AsyncClient(
-        timeout=httpx.Timeout(
-            connect=5.0,
-            read=_API_TIMEOUT_SEC,
-            write=5.0,
-            pool=5.0,
-        )
+    """Create the existing lazy HTTP transport with bounded context timeouts."""
+    return HttpxTransport(
+        connect_timeout=5.0,
+        read_timeout=_API_TIMEOUT_SEC,
+        write_timeout=5.0,
+        pool_timeout=5.0,
+        pool_connections=2,
+        pool_maxsize=2,
     )
 
 
@@ -704,14 +703,15 @@ async def resolve_worker_context(
     if not session_id or not _is_valid_uuid(session_id):
         return _ERR_CONTEXT_NOT_FOUND
 
+    # HIGH SEC-13: fail closed before constructing a network transport unless
+    # a worker-only bearer credential exists.
+    worker_secret = os.getenv("WORKER_CONTEXT_SECRET")
+    if not worker_secret or len(worker_secret) < 32:
+        return _ERR_CONTEXT_API_ERROR
+
     try:
         transport = _get_worker_context_transport()
     except Exception:  # noqa: BLE001
-        return _ERR_CONTEXT_API_ERROR
-
-    # HIGH SEC-13: fail closed unless a worker-only bearer credential exists.
-    worker_secret = os.getenv("WORKER_CONTEXT_SECRET")
-    if not worker_secret or len(worker_secret) < 32:
         return _ERR_CONTEXT_API_ERROR
 
     correlation_id = get_correlation_id()
