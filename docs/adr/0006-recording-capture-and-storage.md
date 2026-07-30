@@ -1,13 +1,12 @@
 # ADR-0006: Recording capture and storage
 
-**Status:** Proposed
+**Status:** Accepted
 
-**Decision owner:** Engineering Lead, Product Manager, and Legal Counsel (unassigned)
+**Decision owner:** christo0192 (repository owner / sole Product/Engineering owner)
 
-**Owner-approval update (2026-07-29):** The sole Product/Engineering owner has
-approved browser MediaRecorder capture for internal synthetic browser-only
-evaluation under a no-cost prototype mechanism. Production recording remains
-BLOCKED FOR PRODUCTION. See
+**Owner direction (2026-07-30):** The sole Product/Engineering owner has selected
+Cloudflare R2 as the recording storage target, beginning with Supabase Storage
+free tier for initial evaluation. ADR-0006 is accepted as architecture. See
 [`docs/decisions/fnd-08-owner-approval.md`](../decisions/fnd-08-owner-approval.md).
 
 **Plan references:** D-007, Q-09, REC-01, REC-02, REC-03, MIG-06
@@ -21,27 +20,30 @@ access, integrity, and retention gates.
 
 ## Decision
 
-Treat approved LiveKit server-side Egress as the preferred production capture
-candidate, subject to REC-02 quality, region, format, destination, encryption,
-provenance, failure, and cost evidence. Select Supabase Storage or an approved
-S3-compatible destination only after D-007. Store an object key and integrity
-metadata, never a durable signed URL. Keep browser capture only if Q-09 approves
-it as a hardened secondary path with authenticated streaming upload and clear
-provenance.
+Cloudflare R2 is the selected recording storage target. Begin with Supabase
+Storage free tier for initial evaluation; migrate to R2 when needed. Store an
+object key and integrity metadata, never a durable signed URL. This decision
+accepts the architectural direction but does not authorize production
+implementation. Production go-live additionally requires: authenticated streaming
+upload, server-side Egress evaluation (REC-02), consent linkage, integrity
+provenance, retention compliance, DPA/region evidence, and Legal approval.
 
 ## Consequences
 
-Server-side capture improves authority and resilience but adds Egress cost,
-provider configuration, callbacks, reconciliation, and failure handling. Removing
-browser capture reduces code and privacy surface but may remove a fallback.
+Cloudflare R2 offers S3-compatible API with no egress fees, reducing cost risk.
+Starting with Supabase Storage free tier allows zero-cost initial evaluation.
+Browser capture remains a secondary path for initial evaluation but is not a
+production recording mechanism.
 
 ## Evidence
 
-Required before acceptance: Egress spike across supported browsers/networks,
-audio quality and completeness results, private-object and expiry tests,
-integrity/provenance schema, consent linkage, deletion/restore behavior, DPA and
-region evidence, cost model, and Legal approval.
+Owner direction recorded in `docs/decisions/fnd-08-owner-approval.md`. ADR-0006
+accepted as architecture. Production go-live additionally requires: Egress spike
+across supported browsers/networks, audio quality and completeness results,
+private-object and expiry tests, integrity/provenance schema, consent linkage,
+deletion/restore behavior, DPA and region evidence, cost model, and Legal
+approval.
 
 ## Supersession
 
-None. Update this ADR to Accepted only when D-007 and Q-09 are approved.
+None. Production acceptance is a separate gate.

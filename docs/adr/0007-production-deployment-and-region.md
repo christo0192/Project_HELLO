@@ -1,68 +1,54 @@
 # ADR-0007: Production deployment and region
 
-**Status:** Proposed
+**Status:** Accepted
 
-**Direction confirmed (2026-07-28):** OCI selected as cloud provider. Mumbai
-(`ap-mumbai-1`) and Hyderabad (`ap-hyderabad-1`) require preliminary
-region-discovery evidence (owner-approved synthetic probe with teardown) before
-region selection; formal DEP-01 capacity acceptance depends on
-TST-09/REL-01/OBS-03. Production Supabase is Mumbai `ap-south-1`. Target 5
-concurrent sessions, validate to 10. Formal owner approval and evidence pending.
-This is a selected direction, not stakeholder sign-off, and does not constitute
-FND-08 acceptance.
+**Decision owner:** christo0192 (repository owner / sole Product/Engineering owner)
 
-**Decision owner:** Engineering Lead, Security Lead, and Legal Counsel (unassigned)
-
-**Owner-approval update (2026-07-29):** The sole Product/Engineering owner has
-DEFERRED this decision for internal engineering. Application components run
-locally; an already-provisioned development LiveKit service may be used, but no
-production cloud provisioning, region selection, or compute deployment is approved. See
+**Owner direction (2026-07-30):** The sole Product/Engineering owner has selected
+Oracle Cloud Always-Free Mumbai ($0) as the compute provider and region. LiveKit
+will be self-hosted in Mumbai, beginning with the free cloud tier for initial
+evaluation. ADR-0007 is accepted as architecture. See
 [`docs/decisions/fnd-08-owner-approval.md`](../decisions/fnd-08-owner-approval.md).
 
 **Plan references:** D-003, D-005, FND-08, GOV-07, DEP-01, DEP-02, DEP-03
 
 ## Context
 
-The system runs locally and depends on Supabase, LiveKit, Sarvam, Anthropic, and
-a future queue/observability stack. Production cloud, compute region, LiveKit
-Cloud versus self-hosting, launch concurrency, residency requirements, RPO/RTO,
-and HA posture are all open. An India region is an unverified requirement and
-must not be assumed from marketing labels or endpoint names.
+The system runs locally and depends on Supabase, LiveKit, and a future
+queue/observability stack. Production cloud, compute region, LiveKit hosting,
+launch concurrency, residency requirements, RPO/RTO, and HA posture are now
+defined at the architecture level. India region (Mumbai) is the owner-selected
+target.
 
-**Direction (2026-07-28):** OCI has been selected as the cloud provider.
-Compute-region selection requires preliminary Mumbai (`ap-mumbai-1`) and
-Hyderabad (`ap-hyderabad-1`) measured/legal evidence. Formal DEP-01 acceptance
-depends on TST-09 (load/soak), REL-01 (durable queue), and OBS-03 (metrics).
-Production Supabase already exists unused in Mumbai (`ap-south-1`). Target 5
-concurrent sessions, validate to 10. These are selected directions, not
-stakeholder sign-off. Production provisioning remains blocked. See
-`docs/decisions/fnd-08-inputs.md`.
+**Owner direction (2026-07-30):** OCI Always-Free Mumbai ($0) selected. LiveKit
+self-hosted Mumbai, begin free cloud tier. ADR-0007 accepted as architecture.
 
 ## Decision
 
-Do not provision production compute or choose LiveKit hosting until FND-08 defines
-residency/data-flow constraints, RPO/RTO, concurrency, and owners. The OCI cloud
-direction informs architecture planning, and a preliminary owner-approved
-Mumbai/Hyderabad synthetic probe with teardown may run for region discovery, but
-does not constitute formal DEP-01 acceptance. Production provisioning still
-requires contractual and technical region evidence, measured
-candidate-to-worker/provider latency, Egress support, quota/capacity, workload
-identity and secret-manager integration, backup/restore, failure domains,
-operations burden, support, and cost. Document the explicit HA or accepted
-single-instance posture before launch.
+Oracle Cloud Always-Free tier in Mumbai region is the selected compute
+provider/region. LiveKit self-hosted Mumbai, beginning with free cloud tier for
+initial evaluation. Production Supabase already exists unused in Mumbai
+(`ap-south-1`). Target 5 concurrent sessions, validate to 10. This decision
+accepts the architectural direction but does not authorize production
+implementation. Production go-live additionally requires: DEP-01 region-latency
+benchmark, provider region/DPA evidence, capacity/cost model, network/data-flow
+diagram, backup and failover tests, HA decision, IaC review, and named
+operators.
 
 ## Consequences
 
-Production provisioning is blocked, but the project avoids an expensive move or
-non-compliant data flow. Staging can still use isolated non-production resources
-that contain no production data.
+Production provisioning remains blocked for go-live, but the architecture
+direction is now concrete: OCI Always-Free Mumbai, self-hosted LiveKit Mumbai.
+This enables focused implementation work while production evidence gates remain.
 
 ## Evidence
 
-Required before acceptance: signed FND-08 inputs, provider region/DPA evidence,
-latency and load benchmark, capacity/cost model, network/data-flow diagram,
-backup and failover tests, HA decision, IaC review, and named operators.
+Owner direction recorded in `docs/decisions/fnd-08-owner-approval.md`. ADR-0007
+accepted as architecture. Production go-live additionally requires: signed FND-08
+inputs, provider region/DPA evidence, latency and load benchmark, capacity/cost
+model, network/data-flow diagram, backup and failover tests, HA decision, IaC
+review, and named operators.
 
 ## Supersession
 
-None. Update this ADR to Accepted only when D-003 and D-005 receive approval.
+None. Production acceptance is a separate gate.

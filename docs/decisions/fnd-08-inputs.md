@@ -18,35 +18,40 @@ approvals, deferrals, and production blocks in
 continues to record the original selected technical directions; the owner-approval
 record supersedes it for decision authority.
 
-## Direction Status (Selected Technical Directions — Not Approved)
+## Direction Status (Selected Owner Decisions — Accepted as Architecture, Not Production-Approved)
 
-| ID | Decision | Direction as of 2026-07-28 | Formal Owner Approval |
-|----|----------|---------------------------|----------------------|
-| D-001 | Auth provider | **Supabase Auth.** Auth modes (email/password, SSO), MFA enforcement, account lifecycle, session management, and contractual/DPA evidence pending. ADR-0003 direction confirmed. | formal approval pending; owner unassigned |
-| D-002 | Queue/worker platform | **OCI Queue** (managed, with Logging/Monitoring/APM/Notifications). ADR-0004 direction confirmed. | formal approval pending; owner unassigned |
-| D-003 | Cloud provider + region | **Oracle Cloud Infrastructure (OCI).** Mumbai (`ap-mumbai-1`) and Hyderabad (`ap-hyderabad-1`) must be benchmarked before region selection; measured latency and contractual/legal evidence required. ADR-0007 direction confirmed. | formal approval pending; owner unassigned |
-| D-004 | Scoring provider/hosting | **OPEN.** Current `claude -p` CLI is prototype-only. An evaluated, compliant API/hosted alternative must be selected and approved before production (LLM-03/LLM-04). | formal approval pending; owner unassigned |
-| D-005 | LiveKit hosting | **OPEN.** Stay Cloud vs self-host; region availability TBD after FND-08 residency input. | formal approval pending; owner unassigned |
-| D-006 | Backup strategy | **OPEN.** PITR only vs PITR + daily snapshot export. | formal approval pending; owner unassigned |
-| D-007 | Recording storage | **OPEN.** Supabase Storage vs S3-compatible. | formal approval pending; owner unassigned |
-| D-008 | SIEM/log aggregator | **OCI managed observability** (Logging, Monitoring, APM, Notifications) selected as operational observability stack. Security-log/SIEM acceptance is separate and pending. | formal approval pending; owner unassigned |
-| D-009 | PII retention period | **OPEN.** Must come from Legal. | formal approval pending; owner unassigned |
-| D-010 | DPDP consent mechanism | **OPEN.** Must come from Legal. | formal approval pending; owner unassigned |
-| D-011 | Tenancy model | **Single-organization launch.** No multi-tenant `org_id` isolation required for launch; does not permanently ban future multi-tenancy. Authenticated roles, RLS, and authorization matrix still required. ADR-0005 direction confirmed. | formal approval pending; owner unassigned |
+| ID | Decision | Owner Decision | Owner-Approval Status |
+|----|----------|----------------|----------------------|
+| D-001 | Auth provider | **Supabase Auth: email/password + SSO + MFA.** ADR-0003 accepted as architecture. | Accepted as architecture. Production: blocked. |
+| D-002 | Queue/worker platform | **pg-boss in existing Supabase/Postgres; no new queue infra.** ADR-0004 accepted as architecture. | Accepted as architecture. Production: blocked. |
+| D-003 | Cloud provider + region | **Oracle Cloud Always-Free Mumbai, $0.** ADR-0007 accepted as architecture. | Accepted as architecture. Production: blocked. |
+| D-004 | Scoring provider/hosting | **DeepSeek V4 Pro through Ikey self-hosted OpenRouter alternative on fly.io India-only.** Pre-egress strip name/phone/email; content otherwise not redacted. Replaces `claude -p`. GO-LIVE BLOCKED until independent Security redactor test, Legal memo, DeepSeek DPA. | Accepted as architecture. Go-live: BLOCKED (see conditions). |
+| D-005 | LiveKit hosting | **Self-host LiveKit Mumbai, begin on free cloud tier.** | Accepted as architecture. Production: blocked. |
+| D-006 | Backup strategy | **Supabase Free only/no PITR; daily custom-format pg_dump → encrypted → Cloudflare R2 via Oracle cron; RPO 24h/RTO 8h target.** Acceptance only after restore rehearsal. | Accepted as architecture. RPO/RTO: acceptance after rehearsal only. |
+| D-007 | Recording storage | **Cloudflare R2 recording target; begin with Supabase Storage free.** | Accepted as architecture. Production: blocked. |
+| D-008 | SIEM/log aggregator | **Axiom free tier, PII-redacted at emission; US-hosted Legal nod pending.** | Accepted as architecture. Production: blocked (US-host Legal nod pending). |
+| D-009 | PII retention period | **Owner direction: retain by default indefinitely ('store everything, never delete').** Recordings/logs to R2/Oracle object storage, transcripts/scores/PII in Supabase then object-storage offload near free cap. **NOT Legal-approved retention.** | Owner direction recorded. Production: blocked until Legal DPDP document. |
+| D-010 | DPDP consent mechanism | **Owner direction: combined consent; includes AI interviewer, recording, purpose, processors/cross-border (redacted DeepSeek content), retention summary, rights, decline.** Legal confirmation pending. Grievance mechanism: possible DPDP gap. Job-portal consent: must specifically disclose AI interview, recording, cross-border purposes. | Owner direction recorded. Production: blocked until Legal confirmation. |
+| D-011 | Tenancy model | **Single-org IK India, admin/interviewer/viewer, no org_id.** ADR-0005 accepted as architecture. | Accepted as architecture. Production: blocked. |
 
 ## FND-08 Approval Matrix
 
-### Resolved (Direction Only — Not Approved)
+### Resolved (Accepted as Architecture — Not Production-Approved)
 
-| Item | Selected Direction |
-|------|--------------------|
-| Auth provider | Supabase Auth (modes, MFA, lifecycle evidence pending) |
-| Queue platform | OCI Queue + OCI Observability |
-| Cloud provider | OCI (region TBD after Mumbai/Hyderabad benchmark) |
-| Tenancy model | Single-org launch (no multi-tenant org_id for launch) |
-| Observability stack | OCI Logging, Monitoring, APM, Notifications |
+| Item | Owner Decision |
+|------|----------------|
+| Auth provider | Supabase Auth (email/password + SSO + MFA). ADR-0003 accepted. |
+| Queue platform | pg-boss in existing Supabase/Postgres. ADR-0004 accepted. |
+| Cloud provider | Oracle Cloud Always-Free Mumbai ($0). ADR-0007 accepted. |
+| Tenancy model | Single-org IK India (admin/interviewer/viewer, no org_id). ADR-0005 accepted. |
+| Scoring provider | DeepSeek V4 Pro via Ikey self-hosted OpenRouter on fly.io India-only. Go-live blocked: needs Security redactor test, Legal memo, DPA. |
+| LiveKit hosting | Self-host LiveKit Mumbai, begin free cloud tier. |
+| Backup strategy | pg_dump → encrypted → Cloudflare R2 via Oracle cron. RPO 24h/RTO 8h target. Acceptance: restore rehearsal only. |
+| Recording storage | Cloudflare R2 target; begin Supabase Storage free. |
+| Observability stack | Axiom free tier, PII-redacted at emission. US-host Legal nod pending. |
+| Secret management | Self-hosted Infisical on Oracle Mumbai ($0). Selection complete; deployment pending. |
+| Service identities | Distinct least-privilege per component. Selection complete; execution blocked on FND-05. |
 | Dev environment | Local Supabase Docker for dev/rehearsal |
-| Staging environment | Persistent isolated OCI staging — apply only after protected remote state and owner approval |
 | Production application | Manual reviewed application; no automated production deployment exists |
 
 ### Missing — Blocks FND-08 Acceptance

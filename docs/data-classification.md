@@ -15,6 +15,8 @@
 | 5 | Secret | Credentials, tokens, keys, digests that grant access |
 | PENDING | Legal review required | Retention/erasure/portability obligations not yet determined |
 
+> **Owner direction (D-009, 2026-07-30):** Retain by default indefinitely; offload to object storage near free cap. NOT Legal-approved. Legal DPDP storage-limitation/lawful-basis document is in preparation and gates go-live. Valid erasure requests MUST still delete via GOV-04/GOV-05. All `PENDING` retention classifications below remain pending until Legal document is completed. See `docs/decisions/fnd-08-owner-approval.md`.
+
 ## Column classification
 
 ### `screening_v2.roles`
@@ -44,7 +46,9 @@
 | `created_at` | Public | Timestamp |
 | `updated_at` | Public | Timestamp |
 
-**Retention decision:** PENDING — legal review required for GDPR right-to-erasure and data-minimization obligations.
+**Retention decision:** PENDING — legal review required for GDPR right-to-erasure and data-minimization obligations. Owner direction (D-009): retain indefinitely; NOT Legal-approved.
+
+> **Owner direction (D-009, 2026-07-30):** Retain by default indefinitely; offload to object storage near free cap. NOT Legal-approved. Legal DPDP storage-limitation document gates go-live. Valid erasure requests MUST still delete via GOV-04/GOV-05. See `docs/decisions/fnd-08-owner-approval.md`.
 
 ### `screening_v2.candidates`
 

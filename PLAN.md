@@ -4,7 +4,7 @@
 
 ---
 
-> **Implementation status (2026-07-29):** GOV-06, OBS-01/OBS-02, TST-07 automation, LLM-06 provenance, and REL-05/REL-06 provider resilience are merged in PRs #14–#18. Branch `feat/rel-07-08-session-lifecycle` implements session lifecycle and graceful-shutdown scaffolding. These implementations do **not** close production reliability acceptance: REL-09 reconciliation, durable scoring, deployed signal-drain/provider proof, live SDK/room evidence, owner approvals, and all launch gates remain pending.
+> **Implementation status (2026-07-30):** GOV-06, OBS-01/OBS-02, TST-07 automation, LLM-06 provenance, and REL-05/REL-06 provider resilience are merged in PRs #14–#18. Branch `feat/rel-07-08-session-lifecycle` implements session lifecycle and graceful-shutdown scaffolding. PR #26 (feat/phase2-supabase-migration-local) adds migration foundations. All owner decisions (D-001–D-011, FND-05, FND-06) are now recorded as accepted architecture/owner direction. None are production/go-live accepted. All 0/17 launch gates remain red; all 0/14 roadmap phases remain unaccepted.
 
 ---
 

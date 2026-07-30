@@ -1,15 +1,18 @@
 # ADR-0003: Recruiter authentication provider
 
-**Status:** Proposed
+**Status:** Accepted
 
-**Decision owner:** Engineering Lead and Product Manager (unassigned)
+**Decision owner:** christo0192 (repository owner / sole Product/Engineering owner)
 
 **Plan references:** D-001, SEC-01, SEC-02, SEC-08
 
-**Owner-approval update (2026-07-29):** The sole Product/Engineering owner has
-approved Supabase Auth for internal synthetic browser-only evaluation under a
-no-cost posture. Production auth remains BLOCKED FOR PRODUCTION. See
-[`docs/decisions/fnd-08-owner-approval.md`](../decisions/fnd-08-owner-approval.md).
+**Owner-approval update (2026-07-30):** The sole Product/Engineering owner has
+accepted Supabase Auth (email/password + SSO + MFA) as the architecture for
+recruiter authentication. ADR-0003 is accepted as architecture/owner direction.
+This does NOT constitute production/go-live acceptance. Production additionally
+requires named Security Lead, DPA/subprocessor evidence, MFA/SSO/audit
+enforcement, account lifecycle, session revocation, and operational ownership.
+See [`docs/decisions/fnd-08-owner-approval.md`](../decisions/fnd-08-owner-approval.md).
 
 ## Context
 
@@ -18,34 +21,33 @@ requires MFA, lifecycle management, short-lived sessions, RBAC integration, and
 a documented cookie-versus-bearer transport decision. WorkOS, Supabase Auth, and
 Clerk are listed candidates.
 
-**Direction (2026-07-28):** Supabase Auth has been selected as the technical
-direction. Auth modes, MFA enforcement, account lifecycle, session management,
-and contractual/DPA evidence remain pending formal owner approval. See
-`docs/decisions/fnd-08-inputs.md`.
+**Owner direction (2026-07-30):** Supabase Auth selected: email/password + SSO +
+MFA. ADR-0003 accepted as architecture. See
+`docs/decisions/fnd-08-inputs.md` and `docs/decisions/fnd-08-owner-approval.md`.
 
 ## Decision
 
-Do not implement a provider-specific production login until D-001 receives
-formal owner approval. The Supabase Auth direction informs architecture planning
-but does not authorize production implementation. Evaluate the selected provider
-against MFA enforcement, SSO needs, account lifecycle, session revocation, audit
-events, regional/contractual evidence, integration with API authorization,
-operational ownership, and total cost. The selected provider must be the token
-authority; do not create an unrelated application signing key when
-standards-based verification is sufficient.
+Supabase Auth with email/password, SSO, and MFA enforcement is the selected
+architecture for recruiter authentication. This decision accepts the
+architectural direction but does not authorize production implementation.
+Production go-live additionally requires: scored provider matrix, threat-model
+update, proof that issued sessions validate correctly, MFA and revocation tests,
+DPA/subprocessor review, and a named operational owner.
 
 ## Consequences
 
-SEC-01 through SEC-04 remain blocked, and every current privileged endpoint is a
-production P0. Deferring avoids embedding an auth model that conflicts with the
-tenancy or transport decision.
+SEC-01 through SEC-04 remain blocked for production acceptance, and every
+current privileged endpoint is a production P0. The architectural decision is
+now recorded; production implementation and evidence remain pending.
 
 ## Evidence
 
-Required before acceptance: scored provider matrix, threat-model update, proof
-that issued sessions validate correctly, MFA and revocation tests,
-DPA/subprocessor review, and a named operational owner.
+Owner direction recorded in `docs/decisions/fnd-08-owner-approval.md`. ADR-0003
+accepted as architecture. Production go-live additionally requires: scored
+provider matrix, threat-model update, proof that issued sessions validate
+correctly, MFA and revocation tests, DPA/subprocessor review, and a named
+operational owner.
 
 ## Supersession
 
-None. Update this ADR to Accepted only when D-001 receives approval.
+None. Production acceptance is a separate gate.
