@@ -193,9 +193,9 @@ as $$
   select
     s.id,
     s.status,
-    extract(epoch from (now() - s.waiting_at))::double precision,
+    extract(epoch from (now() - s.waiting_at))::double precision as state_duration_sec,
     s.candidate_id,
-    'stuck_in_waiting'::text
+    'stuck_in_waiting'::text as reason_hint
   from screening_v2.call_sessions s
   where s.status = 'waiting'
     and s.waiting_at is not null
@@ -207,9 +207,9 @@ as $$
   select
     s.id,
     s.status,
-    extract(epoch from (now() - s.started_at))::double precision,
+    extract(epoch from (now() - s.started_at))::double precision as state_duration_sec,
     s.candidate_id,
-    'stuck_in_created'::text
+    'stuck_in_created'::text as reason_hint
   from screening_v2.call_sessions s
   where s.status = 'created'
     and extract(epoch from (now() - s.started_at)) > created_timeout_sec
@@ -220,9 +220,9 @@ as $$
   select
     s.id,
     s.status,
-    extract(epoch from (now() - s.started_at))::double precision,
+    extract(epoch from (now() - s.started_at))::double precision as state_duration_sec,
     s.candidate_id,
-    'stuck_in_progress'::text
+    'stuck_in_progress'::text as reason_hint
   from screening_v2.call_sessions s
   where s.status = 'in_progress'
     and extract(epoch from (now() - s.started_at)) > progress_timeout_sec
