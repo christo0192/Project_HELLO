@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-07-30 (owner decisions reconciled)
 
-**Current baseline:** `main` through PR #25 (`63f8ba1`, Phase 1 security-core); the Phase 2 Supabase migration foundations are on `feat/phase2-supabase-migration-local` pending owner review.
+**Current baseline:** `main` through PR #26 (`1ac8b4d`) — Phase 1 security-core (PR #25, `63f8ba1`) and Phase 2 Supabase migration foundations (PR #26, `1ac8b4d`) are merged.
 
 **Repository:** `https://github.com/christo0192/Project_HELLO`
 
@@ -13,11 +13,11 @@
 **Current-state manifest:** [`config/current-state.json`](../config/current-state.json)
 (automated drift checks enforce consistency)
 
-**Implementation status:** Partial — Phase 0 closure PRs #20–#24 are merged; Phase 1 security-core merged as PR #25 (`63f8ba1`) implementing local/synthetic auth, RBAC, ownership, invites, rate limits, audit foundations, metadata minimization and resume defenses. The Phase 2 branch adds local/synthetic Supabase migration foundations (schema hardening `0008`, RLS matrix, recruiter recording-download route, export/reconcile/storage tooling, and migration runbooks). External/production acceptance remains pending; 0/17 launch gates complete and 0/14 roadmap phases are accepted.
+**Implementation status:** Partial — Phase 0 closure PRs #20–#24 are merged; Phase 1 security-core merged as PR #25 (`63f8ba1`) implementing local/synthetic auth, RBAC, ownership, invites, rate limits, audit foundations, metadata minimization and resume defenses. Phase 2 Supabase migration foundations merged as PR #26 (`1ac8b4d`) adding schema hardening (`0008`), RLS matrix, recruiter recording-download route, export/reconcile/storage tooling, and migration runbooks. External/production acceptance remains pending; 0/17 launch gates complete and 0/14 roadmap phases are accepted.
 
 ## Baseline
 
-PR #25 (Phase 1 security-core) was squash-merged to `main` as `63f8ba1`; PR #24 was squash-merged as `bf35b58` on 2026-07-29; PR #19 was previously squash-merged as `0c06fc0`. Phase 0, Phase 1 and Phase 2 implementation/evidence do not alter production acceptance without authentic external evidence.
+PR #26 (Phase 2 Supabase migration foundations) was squash-merged to `main` as `1ac8b4d`; PR #25 (Phase 1 security-core) was squash-merged as `63f8ba1`; PR #24 was squash-merged as `bf35b58` on 2026-07-29; PR #19 was previously squash-merged as `0c06fc0`. Phase 0, Phase 1 and Phase 2 implementation/evidence do not alter production acceptance without authentic external evidence.
 
 ## Resume Here
 
@@ -34,9 +34,9 @@ cat docs/HANDOVER.md
 | Metric | Value |
 |--------|-------|
 | Completed launch gates | 0/17 — Foundation, Security and production acceptance criteria remain externally unverified |
-| Implementation coverage | Phase 1 merged (PR #25); Phase 2 local/synthetic migration foundations exist on `feat/phase2-supabase-migration-local`; strict acceptance is separate |
-| Integrated baseline | `63f8ba1` (PR #25) |
-| Main state | PRs #1–#25 merged; Phase 2 implementation PR pending owner review |
+| Implementation coverage | Phase 1 merged (PR #25); Phase 2 local/synthetic migration foundations merged (PR #26, `1ac8b4d`); strict acceptance is separate |
+| Integrated baseline | `1ac8b4d` (PR #26) — Phase 1 + Phase 2 merged |
+| Main state | PRs #1–#26 merged |
 
 > **Note:** The 25% completion figure sometimes seen in earlier summaries is NOT claimed. Zero launch gates are confirmed complete. Implementation coverage and acceptance verification are distinct gates.
 
@@ -66,9 +66,8 @@ PRs #14–#19 were merged into `main` on 2026-07-29 with required checks passing
 
 ## Phase-0 Foundation Status (FND-01 through FND-09)
 
-The five-PR closure wave is deliberately path-isolated: #20 FND-02, #21 FND-01,
-#22 FND-08, #23 FND-03, followed by the FND-09 current-state PR. These are open
-implementation PRs until the owner squash-merges them; they do not themselves
+The five-PR Phase-0 closure wave (#20–#24) was merged and reconciled alongside
+PR #26. These PRs introduced local/synthetic foundations only; they do not
 satisfy external or production acceptance.
 
 | Task | Implementation state | Acceptance state |
@@ -77,11 +76,13 @@ satisfy external or production acceptance.
 | FND-02 | Scanner controls merged; PR #20 adds full reachable-history scanning | **Blocked**: owner rotation/revocation evidence pending for eight provider systems |
 | FND-03 | Containment and GOV-06 seed merged; PR #23 adds seven ground-up synthetic demo replacements | **Blocked**: original restricted-storage disposition and owner manual-review evidence pending |
 | FND-04 | Environment contract merged in PR #1 | Implementation complete; production environment evidence remains later-phase work |
-| FND-05 | Partial unapplied OCI Vault/KMS scaffold exists | **Parked/pending** by owner; no approved secret manager/runtime injection |
-| FND-06 | Partial unapplied OCI IAM scaffold exists | **Parked/pending** by owner; no deployed least-privilege service identities |
+| FND-05 | Infisical selected (architecture/owner-direction complete); **BUILD-BLOCKER: none** for local/synthetic development | **Deployment/execution pending** — no secret manager/runtime injection; GO-LIVE gated until deployed |
+| FND-06 | Least-privilege service identities selected (architecture/owner-direction complete); **BUILD-BLOCKER: none** for local/synthetic development | **Deployment/execution pending** — waits FND-05; no deployed service identities; GO-LIVE gated until deployed |
 | FND-07 | Seven ADRs merged in PR #2 | Implementation complete; individual production decisions retain their own gates |
-| FND-08 | PR #22 and this PR #26 record owner decisions for D-001–D-011, FND-05, FND-06. All accepted as architecture/owner direction; none production/go-live accepted. | Internal synthetic engineering only; production Legal/Security/residency/RPO/RTO evidence remains blocked |
-| FND-09 | Current-state manifest and deterministic drift gate implemented in this PR | Complete only after this PR is merged and its CI is green |
+| FND-08 | PR #22 and PR #26 record owner decisions (D-001–D-011, FND-05, FND-06); selected/owner-complete for architecture; **BUILD-BLOCKER: none** for local/synthetic development | **Independent evidence pending** — production Legal/Security/residency/RPO/RTO evidence unresolved; GO-LIVE gated unaddressed |
+| FND-09 | Current-state manifest and deterministic drift gate implemented in PR #24; reconciliation complete for PR #26 merge | Complete — drift gate enforced |
+
+> **BUILD-BLOCKER classification (Phase 0–2):** None for local/synthetic feature development. FND-05 (Infisical), FND-06 (least-privilege identities), and FND-08 (owner decisions D-001–D-011) are selected/owner-complete at the architecture level. Deployment/execution/independent evidence remain pending. All GO-LIVE gates remain evidence-bound and unresolved until the corresponding production platform, deployed provider proof, Legal/Security sign-off, and operational runbooks are demonstrated with authentic external evidence.
 
 ## OBS-01/OBS-02 Status (code merged in PR #15; deployed acceptance pending)
 
@@ -137,6 +138,7 @@ git diff --check
 | Web | **163 tests** | Recruiter auth/MFA/SSO seams, protected routes, candidate invite UI and accessibility plus typecheck, lint and build. |
 | Supabase | **130 policy/provenance/lifecycle + 62 synthetic SQL assertions** | Ephemeral local stack; includes ownership, invite/grant, append-only audit, anonymous denial and seed replay. |
 | Phase 1 static security | **66 assertions** | Token-column, audit, ownership, RLS, MFA configuration and recording-object-key checks; local/static only. |
+| Phase 2 migration tooling | **3 script suites** (export, reconcile, storage manifest) | Standalone Node.js deterministic CLI tests; no Vitest runner dependency. Added in PR #26. |
 
 ## Remaining Production Work
 
@@ -145,8 +147,8 @@ Most remaining P0 tasks in `PLAN.md` Phases 1–12 remain open. The most urgent 
 1. **FND-02 credential rotation**: An authorized account owner must rotate every provider credential listed in `docs/security/credential-inventory.md` and provide non-secret revocation evidence. Deleting local `.env` files does not count.
 2. **FND-01 branch protection**: Requires a GitHub plan upgrade or equivalent control approved by the repository owner. Documented rules are not enforced.
 3. **FND-03 disposition**: Ground-up replacements are in PR #23; originals still require restricted-storage disposition and owner evidence.
-4. **FND-05/FND-06**: Secret management (Infisical selected) and service identities (selected); deployment/execution remains pending. Production engineering depending on them remains blocked until deployment.
-5. **FND-08 production inputs**: Owner decisions (D-001–D-011, FND-05, FND-06) are now recorded as accepted architecture/owner direction. Independent Legal/Security, residency, production RPO/RTO, retention, and vendor evidence remain unresolved and production-blocked.
+4. **FND-05/FND-06**: Secret management (Infisical selected) and service identities (selected); architecture/owner-direction complete (BUILD-BLOCKER: none). Deployment/execution remains pending — production engineering depending on them remains blocked until deployed.
+5. **FND-08 production inputs**: Owner decisions (D-001–D-011, FND-05, FND-06) recorded as accepted architecture/owner direction (BUILD-BLOCKER: none). Independent Legal/Security, residency, production RPO/RTO, retention, and vendor evidence remain unresolved and production-blocked.
 
 D-001 through D-011 and FND-05/FND-06 are accepted as architecture/owner direction only. Production
 authentication, tenancy, authorization, and all production acceptance retains the named security,

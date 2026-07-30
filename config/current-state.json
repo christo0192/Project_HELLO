@@ -10,7 +10,7 @@
     "activeComponents": {
       "api": {
         "path": "app/api",
-        "purpose": "Express/TypeScript API with local recruiter auth/RBAC/rate/audit foundations, bounded resume parsing, one-time candidate invites, LiveKit room creation, session APIs and assessment generation",
+        "purpose": "Express/TypeScript API with local recruiter auth/RBAC/rate/audit foundations, bounded resume parsing, one-time candidate invites, LiveKit room creation, session APIs, assessment generation and authorized recording-download route",
         "language": "TypeScript",
         "productionStatus": "pre-production"
       },
@@ -28,7 +28,7 @@
       },
       "supabase": {
         "path": "app/supabase",
-        "purpose": "Local Supabase prototype with membership/ownership RLS, digest-only invites/grants, append-only audit foundation and ephemeral migrations",
+        "purpose": "Local Supabase prototype with membership/ownership RLS, digest-only invites/grants, append-only audit foundation, ephemeral migrations and Phase 2 migration foundations (0008 schema hardening, RLS matrix, Realtime publication assertions)",
         "language": "PostgreSQL",
         "productionStatus": "pre-production"
       }

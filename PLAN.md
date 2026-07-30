@@ -4,7 +4,23 @@
 
 ---
 
-> **Implementation status (2026-07-30):** GOV-06, OBS-01/OBS-02, TST-07 automation, LLM-06 provenance, and REL-05/REL-06 provider resilience are merged in PRs #14–#18. Branch `feat/rel-07-08-session-lifecycle` implements session lifecycle and graceful-shutdown scaffolding. PR #26 (feat/phase2-supabase-migration-local) adds migration foundations. All owner decisions (D-001–D-011, FND-05, FND-06) are now recorded as accepted architecture/owner direction. None are production/go-live accepted. All 0/17 launch gates remain red; all 0/14 roadmap phases remain unaccepted.
+> **Implementation status (2026-07-30):** GOV-06, OBS-01/OBS-02, TST-07 automation, LLM-06 provenance, and REL-05/REL-06 provider resilience are merged in PRs #14–#18. PR #25 and PR #26 (feat/phase2-supabase-migration-local) are merged to main. All owner decisions (D-001–D-011, FND-05, FND-06) are now recorded as accepted architecture/owner direction. Phase 1 and Phase 2 implementation foundations are complete enough for continued feature development. None are production/go-live accepted. All 0/17 launch gates remain red; all 0/14 roadmap phases remain unaccepted.
+>
+> **BUILD-BLOCKER vs GO-LIVE GATE (2026-07-30):**
+>
+> Development/build for Phase 0–2 is **not blocked**. True build-blockers for local/synthetic development are **none** as of 2026-07-30. The following are **not** build-blockers; they are production/go-live gates requiring external evidence, owner approvals, or hosted dependency availability:
+>
+> | Gate | Type | Reason not a build-blocker |
+> |------|------|---------------------------|
+> | FND-05 (secret manager/KMS provisioning) | GO-LIVE GATE | Infisical self-hosted Oracle Mumbai selected as architecture direction; local/synthetic dev uses env-injected secrets; deployment blocked on hosted OCI provisioning, not development |
+> | FND-06 (service accounts/identities) | GO-LIVE GATE | Least-privilege identities direction selected; execution waits on FND-05 deployment; local/synthetic dev uses service-role credentials |
+> | FND-08 (launch-blocking policy inputs) | GO-LIVE GATE | Owner decisions recorded as architecture/direction; production Legal/Security/residency/RPO/RTO evidence is independent production acceptance, not a development blocker |
+> | D-004 (scoring provider) | GO-LIVE GATE | DeepSeek V4 Pro selected as architecture direction (self-hosted on in-house India infrastructure by Ikey/Oracle Mumbai); not critical-path for build — in-region self-hosted; model-license/IP commercial-use check is a minor follow-up |
+> | D-009 (PII retention period) | GO-LIVE GATE | Legal-owned; does not block local/synthetic implementation of retention mechanics |
+> | D-010 (DPDP consent mechanism) | GO-LIVE GATE | Legal-owned; does not block consent UX scaffolding |
+> | D-008 (SIEM/log aggregator) | GO-LIVE GATE | OCI managed observability direction selected; Axiom US-host legal nod is parallel; does not block structured logging implementation |
+>
+> This classification **does not waive production acceptance**. All 0/17 launch gates remain red; all 0/14 roadmap phases remain unaccepted. The system remains pre-production, synthetic-only, and browser-only.
 
 ---
 
@@ -17,7 +33,7 @@
 | **Reviewers** | [Security Lead — placeholder], [Product Manager — placeholder], [Legal Counsel — placeholder] |
 | **Target** | Browser-first production launch (no PSTN) |
 | **Non-goals** | Telephony/PSTN production (see Phase 13, §6.17); multi-tenant SaaS; mobile app |
-| **Last updated** | 2026-07-29 |
+| **Last updated** | 2026-07-30 |
 | **Next review** | After owners are assigned and D-001 through D-011 receive initial decisions |
 
 ### Assumptions
@@ -38,7 +54,7 @@
 | D-001 | Auth provider: WorkOS vs Supabase Auth vs Clerk | Eng Lead + Product | Direction: Supabase Auth; formal approval pending | 2026-07-28 |
 | D-002 | Queue/worker platform (Cloud Tasks, BullMQ+Redis, SQS, RabbitMQ) | Eng Lead | Direction: OCI Queue; formal approval pending | 2026-07-28 |
 | D-003 | Production cloud provider and region for compute | Eng Lead + Legal + Security | Direction: OCI; Mumbai/Hyderabad region pending measured/legal evidence; formal approval pending | 2026-07-28 |
-| D-004 | Scoring provider/hosting: current `claude -p` is prototype-only; an evaluated, compliant API/hosted alternative must be selected and approved before production (LLM-03/LLM-04) | Eng Lead + Legal | Open | — |
+| D-004 | Scoring provider/hosting: current `claude -p` is prototype-only; DeepSeek V4 Pro selected as architecture direction (self-hosted on in-house India infrastructure by Ikey/Oracle Mumbai; no cross-border; no DPA needed). Not a go-live blocker — in-region self-hosted. Model-license/IP commercial-use check is a minor follow-up. | Eng Lead + Legal | Direction: self-hosted DeepSeek V4 Pro (Ikey/Oracle Mumbai); formal approval pending | 2026-07-30 |
 | D-005 | LiveKit: stay Cloud vs self-host; region availability TBD | Eng Lead | Open | — |
 | D-006 | Backup strategy: PITR only vs PITR + daily snapshot export | Eng Lead | Open | — |
 | D-007 | Recording storage: Supabase Storage vs S3-compatible | Eng Lead | Open | — |
@@ -51,9 +67,11 @@
 
 ## 2. Executive Summary
 
-The current MVP demonstrates a working voice-screening loop: a candidate opens a browser link, LiveKit streams audio, an Anthropic Haiku agent conducts a structured interview, turns are persisted, a recording is uploaded from the browser, and a scorecard is generated via `claude -p`. The system produced a real end-to-end transcript, recording, and assessment.
+The current MVP demonstrated a working voice-screening loop prototype: a candidate opens a browser link, LiveKit streams audio, an Anthropic Haiku agent conducts a structured interview, turns are persisted, a recording is uploaded from the browser, and a scorecard is generated (originally via `claude -p`; now direction toward self-hosted DeepSeek V4 Pro). The original system produced a real end-to-end transcript, recording, and assessment.
 
-**The current artifact is a prototype — not production.** It lacks authentication, authorization, rate limiting, audit trails, durable job processing, structured observability, CI/CD, IaC, credential hygiene, PII governance, reliability engineering, and a tested migration path. The repository has no Git history, `docs/HELLO.html` embeds real candidate PII, and service-role credentials sit in local env files.
+> **Current-state note:** The paragraphs immediately below reflect the original MVP audit baseline. PRs #14–#26 have since added security-core, observability, reliability, accessibility, migration-foundation, and provenance implementations. See `docs/HANDOVER.md` for a complete current-state inventory. The system remains **pre-production, synthetic-only, and browser-only** with 0/17 launch gates complete.
+
+**The current artifact is a prototype — not production.** As of the original MVP audit it lacked authentication, authorization, rate limiting, audit trails, durable job processing, structured observability, CI/CD, IaC, credential hygiene, PII governance, reliability engineering, and a tested migration path. The repository had no Git history, `docs/HELLO.html` embedded real candidate PII, and service-role credentials sat in local env files.
 
 > **Note:** The Current-vs-Target table below represents the original MVP audit
 > baseline. For current implementation status (completed PRs, in-progress
@@ -275,10 +293,10 @@ Workstreams may run in parallel, but **Phase 12 has no shortcut**: every P0 task
 | FND-02 | Scanner controls merged; PR #20 adds full reachable-history scanning | Eight-provider rotation/revocation evidence remains pending |
 | FND-03 | PR #23 adds deterministic replacements for all seven artifact groups | Original restricted-storage disposition and owner review remain pending |
 | FND-04 | Merged in PR #1 | Implementation complete |
-| FND-05 | Partial unapplied OCI Vault/KMS scaffold | Parked/pending by owner |
-| FND-06 | Partial unapplied OCI IAM scaffold | Parked/pending by owner |
+| FND-05 | Infisical self-hosted Oracle Mumbai selected as architecture direction; deployment evidence pending OCI provisioning | GO-LIVE GATE — not a build-blocker. Local/synthetic dev uses env-injected secrets. Deployment blocked on hosted OCI provisioning, not development |
+| FND-06 | Least-privilege identities direction selected; execution waits on FND-05 deployment | GO-LIVE GATE — not a build-blocker. Local/synthetic dev uses service-role credentials. Service-account scaffolding complete pending secret-manager deployment |
 | FND-07 | Seven ADRs merged in PR #2 | Implementation complete; downstream decisions remain gated |
-| FND-08 | PR #22 records sole-owner internal synthetic-engineering decisions | Production Legal/Security/residency/RPO/RTO evidence remains blocked |
+| FND-08 | PR #22 records owner decisions as architecture/direction (tenancy, residency, concurrency, owners) | GO-LIVE GATE — independent production acceptance (Legal/Security/residency/RPO/RTO evidence) remains blocked. Not a build-blocker. |
 | FND-09 | Current-state manifest and drift checker implemented in the FND-09 closure PR | Complete after merge and green CI |
 
 Implementation progress does not change the repository-wide **0/17 launch gates complete** or **0/14 roadmap phases accepted** status.
@@ -306,7 +324,7 @@ Implementation progress does not change the repository-wide **0/17 launch gates 
 
 #### Phase 1 implementation status — 2026-07-30
 
-Phase 1 is **not accepted**. The local/synthetic implementation wave adds the security-core foundations below, while production, provider and independent-review evidence remains pending. See `docs/runbooks/phase1-security-core.md`.
+Phase 1 is **not accepted**. PR #25 and PR #26 are merged to main. The local/synthetic implementation wave adds the security-core foundations below, while production, provider and independent-review evidence remains pending. Implementation foundations are complete enough for continued feature development. See `docs/runbooks/phase1-security-core.md`.
 
 | Task | Implementation status | Residual acceptance gate |
 |---|---|---|
@@ -349,7 +367,7 @@ Phase 1 is **not accepted**. The local/synthetic implementation wave adds the se
 
 #### Phase 2 implementation status — 2026-07-30
 
-Phase 2 is **not accepted**. This local/synthetic wave adds migration-foundation code, tooling and runbooks only. No hosted Supabase project is created, no migration is applied to any hosted project, and no production, backup, residency or independent-Security evidence exists. All MIGRATION/BACKUP/SECURITY launch gates remain **red**. See `docs/runbooks/supabase-migration-strategy.md`, `docs/runbooks/mig-export-reconcile.md`, `docs/runbooks/mig-cutover-rehearsal.md`, `docs/runbooks/mig-rollback-window.md`, `docs/runbooks/mig-decommission.md` and `docs/data-classification.md`.
+Phase 2 is **not accepted**. PR #25 and PR #26 (feat/phase2-supabase-migration-local) are merged to main. This local/synthetic wave adds migration-foundation code, tooling and runbooks only. No hosted Supabase project is created, no migration is applied to any hosted project, and no production, backup, residency or independent-Security evidence exists. Implementation foundations are complete enough for continued feature development. All MIGRATION/BACKUP/SECURITY launch gates remain **red**. See `docs/runbooks/supabase-migration-strategy.md`, `docs/runbooks/mig-export-reconcile.md`, `docs/runbooks/mig-cutover-rehearsal.md`, `docs/runbooks/mig-rollback-window.md`, `docs/runbooks/mig-decommission.md` and `docs/data-classification.md`.
 
 | Task | Implementation status | Residual acceptance gate (external evidence, NOT obtained) |
 |---|---|---|
@@ -550,7 +568,7 @@ This phase is **not** in scope for browser-first production launch. All tasks he
 
 ### 6.1 Repository / Git Governance & Environment Separation
 
-**Current state:** No Git repository exists, so nothing is tracked yet. Secret-bearing local env files and a shareable HTML file containing real candidate PII are present in the working tree; only a local environment is evidenced.
+**Current state (2026-07-30):** Git repository exists with protected `main` branch, PR reviews, CI gates. Secret scans (gitleaks pre-commit + reachable-history scan via PR #20), repository controls/main-provenance monitoring (PR #21), and PII sanitization (PR #23) are merged and enforced. `.gitignore`, `CODEOWNERS`, branch protections and review rules are operational. Local env files with rotated credentials remain in the working tree pending FND-05 deployment — no production secrets are committed. See FND-01/FND-02/FND-03 acceptance table for evidence boundaries.
 
 **Target state:**
 - Monorepo: `web/` (React dashboard), `api/` (Node/Express), `worker/` (Python/LiveKit agent), `infra/` (IaC), `docs/`
@@ -602,7 +620,7 @@ This phase is **not** in scope for browser-first production launch. All tasks he
 
 ### 6.4 Secrets/KMS/Rotation & Least Privilege
 
-**Current state:** Service-role credentials in local `.env` files. No rotation.
+**Current state (2026-07-30):** Service-role credentials remain in local `.env` files for local/synthetic development. Key naming/contract environment config (FND-04) is merged. Existing credentials will be rotated before any hosted production deployment. Infisical self-hosted Oracle Mumbai selected as architecture direction for KMS (FND-05); least-privilege identities direction selected pending deployment (FND-06). Neither FND-05 nor FND-06 blocks local/synthetic development.
 
 **Target state:**
 - Secrets are held in the selected provider's secret manager/KMS (deployment decision D-003), with platform identity or controlled runtime injection
@@ -642,7 +660,7 @@ This phase is **not** in scope for browser-first production launch. All tasks he
 
 ### 6.6 Data Governance, Encryption, Retention, DSAR, PII Minimization
 
-**Current state:** Real PII in `docs/HELLO.html` (candidate name, voice, assessment). No retention policy. No deletion mechanism. No consent records beyond AI disclosure in prompt.
+**Current state (2026-07-30):** FND-03 (PR #23) replaces all seven artifact groups with deterministic synthetic data; original PII evidence retained only in approved restricted storage. No production retention policy, deletion mechanism, or consent records beyond AI disclosure in prompt yet; these are GO-LIVE GATES (D-009/D-010/D-008). Data classification inventory (GOV-01) is not yet started. The `docs/HELLO.html` artifact is sanitized and no longer contains real candidate data.
 
 **Target state:**
 - Data classified and inventoried (GOV-01)
@@ -666,7 +684,7 @@ This phase is **not** in scope for browser-first production launch. All tasks he
 
 ### 6.7 Responsible Hiring
 
-**Current state:** AI disclosure exists in Gopu's prompt and scoring runs automatically via `claude -p`, with no enforced human review or fairness validation. Resume ingestion also writes a `job_application` consent record; that must not be treated as recording, AI-screening or outbound-call permission without Legal approval.
+**Current state (2026-07-30):** AI disclosure exists in the prompt (Gopu system prompt). Scoring direction has moved from `claude -p` to self-hosted DeepSeek V4 Pro (D-004). No enforced human review or fairness validation yet — these are GO-LIVE GATES (AI-GATE, FAIRNESS-GATE). Resume ingestion writes a `job_application` consent record; this must not be treated as recording, AI-screening or outbound-call permission without Legal approval. The current MVP was built with `claude -p` for scoring; this is replaced under the D-004 direction.
 
 **Target state:**
 
@@ -704,7 +722,7 @@ This phase is **not** in scope for browser-first production launch. All tasks he
 
 ### 6.9 Reliability Engineering
 
-**Current state:** Synchronous POST to scoring endpoint from agent close. No queue. No retry. No dead-letter. No circuit breakers. No session state machine enforcement.
+**Current state (2026-07-30):** Session lifecycle state machine (REL-07) and graceful-shutdown scaffolding (REL-08) are implemented in branch `feat/rel-07-08-session-lifecycle`. REL-05/REL-06 provider resilience (timeouts, circuit breakers, fallback decisions) are merged in PRs #14–#18. Remaining: synchronous scoring (no durable queue yet — REL-01 is pending), retry/DLQ (REL-04), transactional outbox (REL-03), and reconciliation (REL-09). Queue provider direction (OCI Queue, D-002) is recorded but not implemented.
 
 **Target state:**
 - Durable job queue for all async work (REL-01)
@@ -733,7 +751,7 @@ Dead Letter Queue: all exhausted retries → alert → manual replay
 
 ### 6.10 Recording Productionization
 
-**Current state:** Browser `AudioContext` + `MediaRecorder` mixes local/remote audio, uploads WebM via unauthenticated POST (100 MB in-memory multer) to Supabase Storage, one-year signed URL.
+**Current state (2026-07-30):** Browser `AudioContext` + `MediaRecorder` was the original MVP path. REC-05 (authorized short-TTL URL minting with object keys) is now implemented locally (MIG-06). The browser upload endpoint still exists but will be hardened (REC-03) or replaced by LiveKit Egress (REC-01/REC-02). One-year signed URLs are removed per REC-05/MIG-06 implementation.
 
 **Problems with current approach:**
 1.  Browser-driven: fails if tab closes, network drops, or JS errors
@@ -754,7 +772,7 @@ Dead Letter Queue: all exhausted retries → alert → manual replay
 
 ### 6.11 Observability
 
-**Current state:** `console.log`. No structured logs. No metrics. No traces. No alerts. No dashboards.
+**Current state (2026-07-30):** Structured JSON logging with correlation IDs and PII redaction (OBS-01) and correlation ID propagation (OBS-02) are merged in PRs #14–#18. No metrics, traces, alerts, SLI/SLO, or dashboards yet — these remain GO-LIVE GATES (OBS-03 through OBS-09).
 
 **Target state:**
 - Structured JSON logs with correlation ID, session ID, component, level, message. PII redacted at emission.
@@ -772,7 +790,7 @@ Dead Letter Queue: all exhausted retries → alert → manual replay
 
 ### 6.12 Testing
 
-**Current state:** Manual voice test only. Web lint fails due to missing oxlint dependency. TypeScript typechecks pass.
+**Current state (2026-07-30):** Accessibility tests (TST-07 — 101 automated axe tests) are completed. PR #26 adds migration-foundation test tooling (export/reconcile, storage verify). PR #25 adds security-core and RLS tests (693+ RLS assertions). TypeScript typechecks pass. Manual voice testing remains the primary E2E method. CI pipeline, E2E voice, load, chaos, and security test suites (TST-01 through TST-16) remain pending GO-LIVE GATES.
 
 **Target state:**
 - Risk-based unit/property/mutation tests on critical paths with an approved, ratcheted coverage baseline (coverage is not the sole quality gate)
@@ -794,7 +812,7 @@ Dead Letter Queue: all exhausted retries → alert → manual replay
 
 ### 6.13 CI/CD & IaC
 
-**Current state:** None.
+**Current state (2026-07-30):** Git repository with protected `main` branch, PR reviews, CI secret scanning (gitleaks), and branch protections are operational (FND-01). Reproducible builds, staging deployments, IaC, canary/blue-green, and artifact provenance (TST-13 through TST-16, DEP-04 through DEP-07) remain GO-LIVE GATES.
 
 **Target state:**
 - CI pipeline: lint → typecheck → unit → contract → integration → security → build → deploy staging → E2E → deploy prod (with approval gate)
@@ -810,7 +828,7 @@ Dead Letter Queue: all exhausted retries → alert → manual replay
 
 ### 6.14 Deployment & Capacity
 
-**Current state:** Not running. Capacity unknown.
+**Current state (2026-07-30):** Local/synthetic development environment running. No benchmark, capacity plan, HA decision, or staging/production deployment (DEP-01 through DEP-07) — all remain GO-LIVE GATES.
 
 **Target state:**
 - Benchmark first: measure actual concurrency limits, not assumptions.
@@ -1092,4 +1110,4 @@ The following are **prohibited** until the listed gate is satisfied:
 
 *End of document.*
 
-**Next step:** Review with Engineering Lead, Security Lead, Product Manager, and Legal Counsel. Collect answers to open questions (Appendix D). Begin Phase 0 execution.
+**Next step:** Phase 0 execution is substantially complete (FND-01/02/03/04/07/09 implemented; FND-05/06/08 as GO-LIVE GATES). Continue Phase 1 and Phase 2 feature development. Production acceptance requires resolving all GO-LIVE GATES (17 non-negotiable P0 gates per §8) before launch.
