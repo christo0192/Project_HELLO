@@ -123,16 +123,20 @@ _orig_prompting = sys.modules.get("prompting")
 _mock_persistence = types.ModuleType("persistence")
 _mock_persistence.LifecycleOutcome = MagicMock()
 _mock_persistence.LifecycleError = type("LifecycleError", (Exception,), {})
+_mock_persistence.WorkerContext = MagicMock()
 _mock_persistence.ClaimResult = types.SimpleNamespace(
     CLAIMED="claimed", ALREADY_MATCHING="already_matching"
 )
 _mock_persistence.set_session_provenance = AsyncMock(return_value="claimed")
+_mock_persistence.resolve_worker_context = AsyncMock(return_value="context_not_found")
 sys.modules["persistence"] = _mock_persistence
 
 # Mock prompting module
 _mock_prompting = types.ModuleType("prompting")
 _mock_prompting.build_prompt_context = MagicMock(return_value=("system text", "opening text"))
 _mock_prompting.collect_prompt_metadata = MagicMock(return_value={})
+_mock_prompting.opening_line = MagicMock(return_value="opening text")
+_mock_prompting.system_prompt = MagicMock(return_value="system text")
 sys.modules["prompting"] = _mock_prompting
 
 import agent as agent_mod  # noqa: E402

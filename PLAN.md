@@ -304,6 +304,27 @@ Implementation progress does not change the repository-wide **0/17 launch gates 
 | **SEC-13** | Remove candidate/resume/question/scoring context from client-visible LiveKit room, participant and token metadata; deliver worker-only context through an authenticated server-to-worker mechanism with minimized identifiers | P0 | Backend + Security | SEC-03, SEC-04 | M | Candidate client inspection cannot read resume facts, interview rubric or internal context; worker still receives authorized context; metadata leak regression test passes | Disable new-room creation and revert only to the last non-leaking context path |
 | **SEC-14** | Harden resume ingestion: authenticated/session-authorized upload, streaming quotas, extension/MIME/magic validation, archive/decompression limits, sandboxed parsers with CPU/memory/time limits, malware scanning, private raw storage and untrusted-text handling | P0 | Backend + Security | SEC-05, SEC-06 | M | Polyglot, zip-bomb, oversized, malformed PDF/DOCX, parser-timeout and cross-role fixtures fail safely with bounded resources; valid supported files parse and retain correct provenance | Disable affected format or all uploads |
 
+#### Phase 1 implementation status — 2026-07-30
+
+Phase 1 is **not accepted**. The local/synthetic implementation wave adds the security-core foundations below, while production, provider and independent-review evidence remains pending. See `docs/runbooks/phase1-security-core.md`.
+
+| Task | Implementation status | Residual acceptance gate |
+|---|---|---|
+| SEC-01 | Partial: email/password UI, configurable OAuth initiation, TOTP/AAL2 flow and API bearer verification | FND-06, hosted SSO/MFA/account lifecycle and live evidence |
+| SEC-02 | Partial: membership-backed admin/interviewer/viewer middleware and local authorization tests | Complete deployed endpoint/ownership matrix and least-privilege identities |
+| SEC-03 | Partial: single-org owner scoping in API/RLS | Production RLS proof, FND-06 and residency/ownership approval |
+| SEC-04 | Partial: digest-only one-time invites, grants and candidate join UI | Live provider replay/revocation/room-bound evidence and operational delivery |
+| SEC-05 | Implemented and reverified | Apply to every future endpoint |
+| SEC-06 | Partial: bounded configurable in-process IP/user/endpoint limiter | Distributed multi-instance state, production limits and abuse alerts |
+| SEC-07 | Partial: exact CORS and CSP scaffold | Enforced deployed CSP after clean reporting window |
+| SEC-08 | Internally decided: bearer transport (`ADR-0008`) | Independent Security review and deployed XSS evidence |
+| SEC-09 | Implemented in code | Deployed Observatory B+ evidence |
+| SEC-10 | Implemented in CI | Ongoing advisory and exception-expiry operations |
+| SEC-11 | Conditional N/A: no maintained application image | Activate scanner when an application image is introduced |
+| SEC-12 | Partial: append-only schema and data-minimized sink foundation | Complete event coverage, transactional failure policy, retention and review |
+| SEC-13 | Partial: metadata minimized and worker channel fails closed | FND-05/FND-06 identity, full authorized worker context and live inspection |
+| SEC-14 | Partial: bounded format/archive/parser defenses and fail-closed scanner seam | Operational malware engine, production sandbox/resource and streaming proof |
+
 ---
 
 ### Phase 2: Supabase Production Migration (P0)
@@ -522,7 +543,7 @@ This phase is **not** in scope for browser-first production launch. All tasks he
 
 ### 6.2 Identity, Authentication, RBAC, Tenant Isolation
 
-**Current state:** No authentication. LiveKit tokens are issued by unauthenticated API. Browser uses Supabase anon key. No RBAC or tenant concept.
+**Current state (2026-07-30):** Local/synthetic Supabase Auth, bearer API verification, TOTP/AAL2 recruiter guards, membership-backed roles, single-org ownership policies and one-time candidate invite/grant foundations are implemented. Production identity, hosted SSO/MFA, complete ownership coverage and FND-05/FND-06 remain pending; Phase 1 is not accepted.
 
 **Target state:**
 - Recruiters authenticate with MFA; SSO and session policy are selected in D-001 from threat model and operational needs
@@ -538,7 +559,7 @@ This phase is **not** in scope for browser-first production launch. All tasks he
 
 ### 6.3 API & Web Security
 
-**Current state:** No rate limiting, request IDs or CSP. CORS allows the configured web origin plus any localhost port. The recording route uses 100 MB in-memory multer; validation is inconsistent and not centralized.
+**Current state (2026-07-30):** Correlation IDs, centralized validation, exact production CORS, CSP scaffolding, security headers, dependency policy, bounded in-process rate limits and resume-ingestion defenses exist. Distributed limiting, deployed CSP/Observatory evidence, complete audit coverage, operational malware scanning, and recording-stream hardening remain pending.
 
 **Target state:**
 - Privileged/data-changing endpoints require authentication and authorization. Health and candidate invite exchange are explicitly public, narrowly scoped, non-enumerable and rate-limited
@@ -576,7 +597,7 @@ This phase is **not** in scope for browser-first production launch. All tasks he
 
 ### 6.5 Supabase Production Migration Runbook
 
-**Current state:** One Supabase project is configured through local anon/service-role env files. Migration `0002_realtime_rls.sql` grants blanket anon read to five `screening_v2` tables and publishes transcript/session/assessment changes; this is acceptable only for the current internal prototype. The API creates one-year recording signed URLs. Bucket privacy and dashboard-level backup/PITR configuration were not observed and must be checked rather than assumed.
+**Current state (2026-07-30):** Local migrations revoke blanket anonymous business-table access, gate authenticated reads through active recruiter membership/ownership, keep storage private, add digest-only candidate invites/grants and store recording object keys for short-TTL URL minting. The server still uses a broad service-role client and no hosted project migration, backup/PITR or production policy evidence exists.
 
 **Detailed migration runbook (see Phase 2):**
 

@@ -105,6 +105,8 @@ jobs:
               sys.exit(1)
           print(f'Validated {len(files)} migrations and local Auth configuration.')
           PY
+      - name: Phase 1 static security contract
+        run: bash scripts/check-phase1-security-sql.sh
       - name: GOV-06 offline synthetic seed validation
         run: node scripts/check-synthetic-seed.mjs
       - name: GOV-06 mutation-based self-tests (zero network)

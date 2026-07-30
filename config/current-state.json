@@ -1,6 +1,6 @@
 {
   "manifestVersion": 1,
-  "evidenceDate": "2026-07-29",
+  "evidenceDate": "2026-07-30",
   "status": {
     "production": "pre-production",
     "dataStage": "synthetic-only",
@@ -10,25 +10,25 @@
     "activeComponents": {
       "api": {
         "path": "app/api",
-        "purpose": "Express/TypeScript API, Supabase access, resume parsing, LiveKit room creation, transcript/session APIs, assessment generation",
+        "purpose": "Express/TypeScript API with local recruiter auth/RBAC/rate/audit foundations, bounded resume parsing, one-time candidate invites, LiveKit room creation, session APIs and assessment generation",
         "language": "TypeScript",
         "productionStatus": "pre-production"
       },
       "web": {
         "path": "app/web",
-        "purpose": "React/Vite recruiter dashboard and browser LiveKit client",
+        "purpose": "React/Vite recruiter dashboard with local Supabase Auth/MFA guards and one-time candidate LiveKit join flow",
         "language": "React/Vite",
         "productionStatus": "pre-production"
       },
       "voice-livekit": {
         "path": "app/voice-livekit",
-        "purpose": "LiveKit Agents Python worker with Sarvam STT/TTS, Anthropic Haiku, Silero VAD, and multilingual turn detection",
+        "purpose": "LiveKit Agents Python worker with authenticated context lookup seam, Sarvam STT/TTS, Anthropic Haiku, Silero VAD and multilingual turn detection",
         "language": "Python",
         "productionStatus": "pre-production"
       },
       "supabase": {
         "path": "app/supabase",
-        "purpose": "Local Supabase prototype schema (screening_v2) and ephemeral migrations",
+        "purpose": "Local Supabase prototype with membership/ownership RLS, digest-only invites/grants, append-only audit foundation and ephemeral migrations",
         "language": "PostgreSQL",
         "productionStatus": "pre-production"
       }

@@ -1,7 +1,21 @@
+/**
+ * API surface for the Maya Screen recruiter dashboard.
+ *
+ * All requests are routed through `apiClient` which attaches the
+ * Supabase bearer access token from the in-memory session.  No token
+ * copy is stored in localStorage/sessionStorage/cookies by this module.
+ *
+ * 401 responses dispatch an `auth:unauthorized` custom event that the
+ * AuthProvider listens for to clear the session and force re-login.
+ */
+
+import { apiClient, ApiError } from './lib/api-client';
 import type {
   Assessment,
   Candidate,
   CandidateDetail,
+  CandidateInviteExchangeResult,
+  CandidateInviteResult,
   HealthResult,
   Role,
   RoleInput,
@@ -10,122 +24,74 @@ import type {
   StartScreeningResult,
   TurnResult,
   UploadResumeResult,
-} from "./types";
+} from './types';
 
-const BASE_URL = import.meta.env.VITE_API_BASE ?? "http://localhost:8787";
+export { ApiError };
 
-export class ApiError extends Error {
-  status: number;
-  constructor(message: string, status: number) {
-    super(message);
-    this.name = "ApiError";
-    this.status = status;
-  }
-}
-
-async function parseError(res: Response): Promise<never> {
-  let message = `${res.status} ${res.statusText}`;
-  try {
-    const data = (await res.json()) as { error?: string; message?: string };
-    if (data?.error) message = data.error;
-    else if (data?.message) message = data.message;
-  } catch {
-    // ignore non-JSON error bodies
-  }
-  throw new ApiError(message, res.status);
-}
-
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  let res: Response;
-  try {
-    res = await fetch(`${BASE_URL}${path}`, {
-      ...init,
-      headers: {
-        ...(init?.body && !(init.body instanceof FormData)
-          ? { "Content-Type": "application/json" }
-          : {}),
-        ...init?.headers,
-      },
-    });
-  } catch {
-    throw new ApiError(
-      "Could not reach the server. Is the API running on " + BASE_URL + "?",
-      0,
-    );
-  }
-  if (!res.ok) return parseError(res);
-  if (res.status === 204) return undefined as T;
-  return (await res.json()) as T;
-}
+const request = apiClient.request;
 
 export const api = {
-  health: () => request<HealthResult>("/api/health"),
+  health: () => request<HealthResult>('/api/health'),
 
   // Roles
-  listRoles: () => request<Role[]>("/api/roles"),
+  listRoles: () => request<Role[]>('/api/roles'),
   getRole: (id: string) => request<Role>(`/api/roles/${id}`),
   createRole: (body: RoleInput) =>
-    request<Role>("/api/roles", {
-      method: "POST",
+    request<Role>('/api/roles', {
+      method: 'POST',
       body: JSON.stringify(body),
     }),
   updateRole: (id: string, body: Partial<RoleInput>) =>
     request<Role>(`/api/roles/${id}`, {
-      method: "PUT",
+      method: 'PUT',
       body: JSON.stringify(body),
     }),
 
   // Resumes / candidates
   uploadResume: (file: File, roleId?: string) => {
     const form = new FormData();
-    form.append("file", file);
-    if (roleId) form.append("role_id", roleId);
-    return request<UploadResumeResult>("/api/resumes", {
-      method: "POST",
+    form.append('file', file);
+    if (roleId) form.append('role_id', roleId);
+    return request<UploadResumeResult>('/api/resumes', {
+      method: 'POST',
       body: form,
     });
   },
   listCandidates: (roleId?: string) =>
     request<Candidate[]>(
-      `/api/candidates${roleId ? `?role_id=${encodeURIComponent(roleId)}` : ""}`,
+      `/api/candidates${roleId ? `?role_id=${encodeURIComponent(roleId)}` : ''}`,
     ),
   getCandidate: (id: string) =>
     request<CandidateDetail>(`/api/candidates/${id}`),
 
   // Screening
   startScreening: (candidateId: string) =>
-    request<StartScreeningResult>("/api/screening/start", {
-      method: "POST",
+    request<StartScreeningResult>('/api/screening/start', {
+      method: 'POST',
       body: JSON.stringify({ candidate_id: candidateId }),
     }),
   startLiveKitScreening: (candidateId: string) =>
-    request<StartLiveKitResult>("/api/livekit/start", {
-      method: "POST",
+    request<StartLiveKitResult>('/api/livekit/start', {
+      method: 'POST',
       body: JSON.stringify({ candidate_id: candidateId }),
     }),
-  uploadLiveKitRecording: (sessionId: string, blob: Blob) => {
-    const form = new FormData();
-    const ext = blob.type.includes("mpeg")
-      ? "mp3"
-      : blob.type.includes("mp4")
-        ? "mp4"
-        : "webm";
-    form.append("file", blob, `${sessionId}.${ext}`);
-    return request<{ recording_url: string }>(
-      `/api/livekit/${sessionId}/recording`,
-      {
-        method: "POST",
-        body: form,
-      },
-    );
-  },
+  issueLiveKitInvite: (candidateId: string, sessionId: string) =>
+    request<CandidateInviteResult>('/api/livekit/invite', {
+      method: 'POST',
+      body: JSON.stringify({ candidate_id: candidateId, session_id: sessionId }),
+    }),
+  exchangeCandidateInvite: (token: string) =>
+    request<CandidateInviteExchangeResult>('/api/livekit/exchange', {
+      method: 'POST',
+      body: JSON.stringify({ token }),
+    }),
   turn: (sessionId: string, text: string) =>
     request<TurnResult>(`/api/screening/${sessionId}/turn`, {
-      method: "POST",
+      method: 'POST',
       body: JSON.stringify({ text }),
     }),
   getSession: (sessionId: string) =>
     request<SessionDetail>(`/api/screening/${sessionId}`),
   assess: (sessionId: string) =>
-    request<Assessment>(`/api/assess/${sessionId}`, { method: "POST" }),
+    request<Assessment>(`/api/assess/${sessionId}`, { method: 'POST' }),
 };

@@ -24,7 +24,17 @@
         "BREAKER_FAILURE_THRESHOLD": { "requiredInProduction": false, "secret": false },
         "BREAKER_COOLDOWN_MS": { "requiredInProduction": false, "secret": false },
         "BREAKER_TIMEOUT_MS": { "requiredInProduction": false, "secret": false },
-        "CLAUDE_MAX_OUTPUT_BYTES": { "requiredInProduction": false, "secret": false }
+        "CLAUDE_MAX_OUTPUT_BYTES": { "requiredInProduction": false, "secret": false },
+        "RATE_LIMIT_DEFAULT": { "requiredInProduction": false, "secret": false },
+        "RATE_LIMIT_STRICT": { "requiredInProduction": false, "secret": false },
+        "RATE_LIMIT_IP": { "requiredInProduction": false, "secret": false },
+        "RATE_LIMIT_WINDOW_SEC": { "requiredInProduction": false, "secret": false },
+        "TRUSTED_PROXY": { "requiredInProduction": false, "secret": false },
+        "WORKER_CONTEXT_SECRET": { "requiredInProduction": true, "secret": true },
+        "RESUME_SCANNER": { "requiredInProduction": false, "secret": false },
+        "RESUME_MAX_COMPRESSED_BYTES": { "requiredInProduction": false, "secret": false },
+        "RESUME_PARSER_TIMEOUT_MS": { "requiredInProduction": false, "secret": false },
+        "RESUME_MAX_TEXT_LENGTH": { "requiredInProduction": false, "secret": false }
       }
     },
     "web": {
@@ -35,6 +45,7 @@
         "VITE_SUPABASE_URL": { "requiredInProduction": true, "secret": false },
         "VITE_SUPABASE_ANON_KEY": { "requiredInProduction": true, "secret": false },
         "VITE_LIVEKIT_URL": { "requiredInProduction": true, "secret": false, "external": true },
+        "VITE_SSO_PROVIDERS": { "requiredInProduction": false, "secret": false, "external": true },
         "VITE_CSP_MODE": { "requiredInProduction": true, "secret": false, "external": true },
         "VITE_CSP_REPORT_ENDPOINT": { "requiredInProduction": true, "secret": false, "external": true }
       }
@@ -73,6 +84,8 @@
         "SUPABASE_SERVICE_ROLE_KEY": { "requiredInProduction": true, "secret": true },
         "SUPABASE_SCHEMA": { "requiredInProduction": true, "secret": false },
         "API_BASE": { "requiredInProduction": true, "secret": false },
+        "WORKER_CONTEXT_SECRET": { "requiredInProduction": true, "secret": true },
+        "WORKER_CONTEXT_TIMEOUT_SEC": { "requiredInProduction": false, "secret": false },
         "SCORING_BREAKER_THRESHOLD": { "requiredInProduction": false, "secret": false },
         "SCORING_BREAKER_COOLDOWN_SEC": { "requiredInProduction": false, "secret": false },
         "SCORING_BREAKER_TIMEOUT_SEC": { "requiredInProduction": false, "secret": false },

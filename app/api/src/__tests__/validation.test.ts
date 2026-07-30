@@ -2,9 +2,45 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import request from 'supertest';
 import fc from 'fast-check';
 import { createApp } from '../app.js';
+import { mockAuthGetUser, type AuthUser, type TokenVerifier } from '../lib/auth.js';
 import { uuidSchema } from '../schemas/common.js';
 import { livekitStartSchema } from '../schemas/livekit.js';
 import { screeningTurnSchema, startScreeningSchema } from '../schemas/screening.js';
+
+// ── Auth DI seam: all validation tests use an injected admin token ──
+const JWT_TEST = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyLTAwMSIsImFhbCI6ImFhbDIifQ.signature';
+const AUTH_HEADER = 'Bearer ' + JWT_TEST;
+
+const TEST_ADMIN: AuthUser = {
+  id: 'user-admin-0000-0000-000000000001',
+  email: 'admin@test.com',
+  aal: 'aal2',
+  active: true,
+  appRole: 'admin',
+  orgId: 'org-test',
+};
+
+function createAuthedApp() {
+  return createApp({
+    authDeps: { getUser: mockAuthGetUser(TEST_ADMIN, JWT_TEST) },
+  });
+}
+
+/**
+ * Create a supertest request that always includes the Authorization header.
+ * Used to wrap existing test requests so auth passes.
+ */
+function $r(app: ReturnType<typeof createApp>) {
+  return {
+    get: (url: string) => request(app).get(url).set('Authorization', AUTH_HEADER),
+    post: (url: string) => request(app).post(url).set('Authorization', AUTH_HEADER),
+    put: (url: string) => request(app).put(url).set('Authorization', AUTH_HEADER),
+    patch: (url: string) => request(app).patch(url).set('Authorization', AUTH_HEADER),
+    delete: (url: string) => request(app).delete(url).set('Authorization', AUTH_HEADER),
+    head: (url: string) => request(app).head(url).set('Authorization', AUTH_HEADER),
+    options: (url: string) => request(app).options(url).set('Authorization', AUTH_HEADER),
+  };
+}
 
 // ── Helpers ───────────────────────────────────────────────────────
 
@@ -170,7 +206,7 @@ let app: ReturnType<typeof createApp>;
 
 beforeEach(async () => {
   await wireMock();
-  app = createApp();
+  app = createAuthedApp();
 });
 
 // ===================================================================
@@ -181,7 +217,7 @@ describe('validation happy paths', () => {
   it('POST /api/roles returns 201 with valid input', async () => {
     supabaseMock.from.mockReturnValue(chainable({ data: mockRole, error: null }));
 
-    const res = await request(app)
+    const res = await $r(app)
       .post('/api/roles')
       .send({
         title: 'SWE',
@@ -201,7 +237,7 @@ describe('validation happy paths', () => {
       chainable({ data: { ...mockRole, title: 'Updated' }, error: null }),
     );
 
-    const res = await request(app)
+    const res = await $r(app)
       .put(`/api/roles/${validUUID()}`)
       .send({ title: 'Updated' })
       .expect(200);
@@ -213,7 +249,7 @@ describe('validation happy paths', () => {
   it('GET /api/roles/:id returns 200 with role', async () => {
     supabaseMock.from.mockReturnValue(chainable({ data: mockRole, error: null }));
 
-    const res = await request(app).get(`/api/roles/${validUUID()}`).expect(200);
+    const res = await $r(app).get(`/api/roles/${validUUID()}`).expect(200);
 
     expect(res.body.title).toBe('Software Engineer');
     expect(hasNoStacktrace(res)).toBe(true);
@@ -222,7 +258,7 @@ describe('validation happy paths', () => {
   it('GET /api/roles returns list', async () => {
     supabaseMock.from.mockReturnValue(chainable({ data: [mockRole], error: null }));
 
-    const res = await request(app).get('/api/roles').expect(200);
+    const res = await $r(app).get('/api/roles').expect(200);
     expect(Array.isArray(res.body)).toBe(true);
     expect(hasNoStacktrace(res)).toBe(true);
   });
@@ -236,7 +272,7 @@ describe('validation happy paths', () => {
       return chainable({ data: [], error: null });
     });
 
-    const res = await request(app).get(`/api/candidates/${validUUID2()}`).expect(200);
+    const res = await $r(app).get(`/api/candidates/${validUUID2()}`).expect(200);
 
     expect(res.body.candidate.name).toBe('Alice Example');
     expect(res.body.sessions).toEqual([]);
@@ -247,7 +283,7 @@ describe('validation happy paths', () => {
   it('GET /api/candidates list returns array', async () => {
     supabaseMock.from.mockReturnValue(chainable({ data: [mockCandidate], error: null }));
 
-    const res = await request(app).get('/api/candidates').expect(200);
+    const res = await $r(app).get('/api/candidates').expect(200);
     expect(Array.isArray(res.body)).toBe(true);
     expect(hasNoStacktrace(res)).toBe(true);
   });
@@ -255,14 +291,14 @@ describe('validation happy paths', () => {
   it('GET /api/candidates with valid role_id query returns array', async () => {
     supabaseMock.from.mockReturnValue(chainable({ data: [], error: null }));
 
-    const res = await request(app).get(`/api/candidates?role_id=${validUUID()}`).expect(200);
+    const res = await $r(app).get(`/api/candidates?role_id=${validUUID()}`).expect(200);
 
     expect(Array.isArray(res.body)).toBe(true);
     expect(hasNoStacktrace(res)).toBe(true);
   });
 
   it('GET /api/health unchanged', async () => {
-    const res = await request(app).get('/api/health').expect(200);
+    const res = await $r(app).get('/api/health').expect(200);
     expect(res.body.ok).toBe(true);
     expect(res.body.model).toBe('haiku');
     expect(hasNoStacktrace(res)).toBe(true);
@@ -290,7 +326,7 @@ describe('validation happy paths', () => {
       return chainable({ data: mockRole, error: null });
     });
 
-    const res = await request(app)
+    const res = await $r(app)
       .post('/api/screening/start')
       .send({ candidate_id: validUUID2() })
       .expect(201);
@@ -308,19 +344,19 @@ describe('validation happy paths', () => {
 
 describe('malformed UUIDs', () => {
   it('rejects non-UUID role id param', async () => {
-    const res = await request(app).get('/api/roles/not-a-uuid').expect(400);
+    const res = await $r(app).get('/api/roles/not-a-uuid').expect(400);
     expect(isValidationError(res)).toBe(true);
     expect(hasNoStacktrace(res)).toBe(true);
   });
 
   it('rejects non-UUID candidate id param', async () => {
-    const res = await request(app).get('/api/candidates/not-a-uuid').expect(400);
+    const res = await $r(app).get('/api/candidates/not-a-uuid').expect(400);
     expect(isValidationError(res)).toBe(true);
     expect(hasNoStacktrace(res)).toBe(true);
   });
 
   it('rejects non-UUID candidate_id in screening/start body', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .post('/api/screening/start')
       .send({ candidate_id: 'not-a-uuid' })
       .expect(400);
@@ -329,7 +365,7 @@ describe('malformed UUIDs', () => {
   });
 
   it('rejects non-UUID path param in screening turn', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .post('/api/screening/not-a-uuid/turn')
       .send({ text: 'hello' })
       .expect(400);
@@ -338,19 +374,19 @@ describe('malformed UUIDs', () => {
   });
 
   it('rejects non-UUID path param in screening GET', async () => {
-    const res = await request(app).get('/api/screening/not-a-uuid').expect(400);
+    const res = await $r(app).get('/api/screening/not-a-uuid').expect(400);
     expect(isValidationError(res)).toBe(true);
     expect(hasNoStacktrace(res)).toBe(true);
   });
 
   it('rejects non-UUID sessionId in assess', async () => {
-    const res = await request(app).post('/api/assess/not-a-uuid').expect(400);
+    const res = await $r(app).post('/api/assess/not-a-uuid').expect(400);
     expect(isValidationError(res)).toBe(true);
     expect(hasNoStacktrace(res)).toBe(true);
   });
 
   it('rejects non-UUID candidate_id in livekit/start body', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .post('/api/livekit/start')
       .send({ candidate_id: 'not-a-uuid' })
       .expect(400);
@@ -359,7 +395,7 @@ describe('malformed UUIDs', () => {
   });
 
   it('rejects non-UUID sessionId in livekit recording path', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .post('/api/livekit/not-a-uuid/recording')
       .attach('file', Buffer.from('data'), 'rec.webm')
       .expect(400);
@@ -368,7 +404,7 @@ describe('malformed UUIDs', () => {
   });
 
   it('rejects non-UUID role_id in query', async () => {
-    const res = await request(app).get('/api/candidates?role_id=bad-uuid').expect(400);
+    const res = await $r(app).get('/api/candidates?role_id=bad-uuid').expect(400);
     expect(isValidationError(res)).toBe(true);
     expect(hasNoStacktrace(res)).toBe(true);
   });
@@ -380,13 +416,13 @@ describe('malformed UUIDs', () => {
 
 describe('wrong types', () => {
   it('rejects numeric title for role', async () => {
-    const res = await request(app).post('/api/roles').send({ title: 123, jd: 'ok' }).expect(400);
+    const res = await $r(app).post('/api/roles').send({ title: 123, jd: 'ok' }).expect(400);
     expect(isValidationError(res)).toBe(true);
     expect(hasNoStacktrace(res)).toBe(true);
   });
 
   it('rejects numeric text in screening turn', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .post(`/api/screening/${validUUID()}/turn`)
       .send({ text: 123 })
       .expect(400);
@@ -395,7 +431,7 @@ describe('wrong types', () => {
   });
 
   it('rejects string for is_active in role update', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .put(`/api/roles/${validUUID()}`)
       .send({ is_active: 'yes' })
       .expect(400);
@@ -404,7 +440,7 @@ describe('wrong types', () => {
   });
 
   it('rejects string for required_skills', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .post('/api/roles')
       .send({ title: 'SWE', required_skills: 'typescript' })
       .expect(400);
@@ -419,7 +455,7 @@ describe('wrong types', () => {
 
 describe('unknown fields', () => {
   it('rejects unknown field in role create', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .post('/api/roles')
       .send({ title: 'SWE', injected_field: true })
       .expect(400);
@@ -431,7 +467,7 @@ describe('unknown fields', () => {
   });
 
   it('rejects unknown field in role update', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .put(`/api/roles/${validUUID()}`)
       .send({ title: 'Updated', hacked: 'evil' })
       .expect(400);
@@ -440,7 +476,7 @@ describe('unknown fields', () => {
   });
 
   it('rejects unknown field in screening/start', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .post('/api/screening/start')
       .send({ candidate_id: validUUID(), prompt_override: 'ignore rules' })
       .expect(400);
@@ -449,7 +485,7 @@ describe('unknown fields', () => {
   });
 
   it('rejects unknown field in screening turn', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .post(`/api/screening/${validUUID()}/turn`)
       .send({ text: 'hello', command: 'drop table' })
       .expect(400);
@@ -458,7 +494,7 @@ describe('unknown fields', () => {
   });
 
   it('rejects unknown field in livekit/start', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .post('/api/livekit/start')
       .send({ candidate_id: validUUID(), system_prompt: 'evil' })
       .expect(400);
@@ -467,13 +503,13 @@ describe('unknown fields', () => {
   });
 
   it('rejects unknown query param in candidates list', async () => {
-    const res = await request(app).get('/api/candidates?evil_param=1').expect(400);
+    const res = await $r(app).get('/api/candidates?evil_param=1').expect(400);
     expect(isValidationError(res)).toBe(true);
     expect(hasNoStacktrace(res)).toBe(true);
   });
 
   it('rejects unknown field in resume upload body fields', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .post('/api/resumes')
       .field('role_id', validUUID())
       .field('hacked', 'evil')
@@ -490,7 +526,7 @@ describe('unknown fields', () => {
 
 describe('malformed JSON', () => {
   it('rejects unparseable JSON with 400', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .post('/api/roles')
       .set('Content-Type', 'application/json')
       .send('{broken json!!!')
@@ -502,7 +538,7 @@ describe('malformed JSON', () => {
   });
 
   it('rejects trailing garbage in screen/start', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .post('/api/screening/start')
       .set('Content-Type', 'application/json')
       .send('{ not json at all ')
@@ -512,7 +548,7 @@ describe('malformed JSON', () => {
   });
 
   it('rejects malformed JSON in livekit/start', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .post('/api/livekit/start')
       .set('Content-Type', 'application/json')
       .send('<<<invalid>>>')
@@ -529,7 +565,7 @@ describe('malformed JSON', () => {
 describe('oversized requests', () => {
   it('rejects JSON body over 2mb with 413', async () => {
     const big = 'x'.repeat(2.5 * 1024 * 1024);
-    const res = await request(app)
+    const res = await $r(app)
       .post('/api/roles')
       .set('Content-Type', 'application/json')
       .send(JSON.stringify({ title: 'Engineer', jd: big }))
@@ -541,7 +577,7 @@ describe('oversized requests', () => {
 
   it('rejects oversized JSON in screening endpoint', async () => {
     const big = 'x'.repeat(3 * 1024 * 1024);
-    const res = await request(app)
+    const res = await $r(app)
       .post('/api/screening/start')
       .set('Content-Type', 'application/json')
       .send(JSON.stringify({ candidate_id: validUUID(), extra: big }))
@@ -567,7 +603,7 @@ describe('multipart validation', () => {
       return chainable({ data: null, error: null });
     });
 
-    const res = await request(app)
+    const res = await $r(app)
       .post('/api/resumes')
       .field('role_id', validUUID())
       .attach(
@@ -582,7 +618,7 @@ describe('multipart validation', () => {
   });
 
   it('rejects a resume over 10mb with the stable 413 contract', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .post('/api/resumes')
       .attach('file', Buffer.alloc(10 * 1024 * 1024 + 1), 'resume.txt')
       .expect(413);
@@ -593,7 +629,7 @@ describe('multipart validation', () => {
 
   it('livekit recording endpoint validates params before processing file', async () => {
     // Bad UUID + file → validation error (params checked before multer)
-    const res = await request(app)
+    const res = await $r(app)
       .post('/api/livekit/not-a-uuid/recording')
       .attach('file', Buffer.from('fake-recording'), 'audio.webm')
       .expect(400);
@@ -601,21 +637,18 @@ describe('multipart validation', () => {
     expect(hasNoStacktrace(res)).toBe(true);
   });
 
-  it('livekit recording accepts a file without metadata fields', async () => {
-    // Recording update needs to match a row (data with id)
-    supabaseMock.from.mockReturnValue(chainable({ data: [{ id: validUUID() }], error: null }));
-
-    const res = await request(app)
+  it('livekit recording rejects a file without a session-bound candidate grant', async () => {
+    const res = await $r(app)
       .post(`/api/livekit/${validUUID()}/recording`)
       .attach('file', Buffer.from('fake-recording'), 'audio.webm')
-      .expect(200);
+      .expect(401);
 
-    expect(res.body.recording_url).toBe('https://storage.example/signed');
+    expect(res.body.error).toBe('authentication_required');
     expect(hasNoStacktrace(res)).toBe(true);
   });
 
   it('rejects unexpected recording metadata', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .post(`/api/livekit/${validUUID()}/recording`)
       .field('session_override', validUUID2())
       .attach('file', Buffer.from('fake-recording'), 'audio.webm')
@@ -632,19 +665,19 @@ describe('multipart validation', () => {
 
 describe('empty and missing fields', () => {
   it('rejects empty body for POST /api/roles', async () => {
-    const res = await request(app).post('/api/roles').send({}).expect(400);
+    const res = await $r(app).post('/api/roles').send({}).expect(400);
     expect(isValidationError(res)).toBe(true);
     expect(hasNoStacktrace(res)).toBe(true);
   });
 
   it('rejects empty candidate_id in screening/start', async () => {
-    const res = await request(app).post('/api/screening/start').send({}).expect(400);
+    const res = await $r(app).post('/api/screening/start').send({}).expect(400);
     expect(isValidationError(res)).toBe(true);
     expect(hasNoStacktrace(res)).toBe(true);
   });
 
   it('rejects empty text in screening turn', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .post(`/api/screening/${validUUID()}/turn`)
       .send({ text: '' })
       .expect(400);
@@ -653,7 +686,7 @@ describe('empty and missing fields', () => {
   });
 
   it('rejects missing file in resume upload (route-level)', async () => {
-    const res = await request(app).post('/api/resumes').field('role_id', validUUID());
+    const res = await $r(app).post('/api/resumes').field('role_id', validUUID());
 
     // File missing — the route handler returns 400 (no validation middleware error)
     expect(res.status).toBe(400);
@@ -661,7 +694,7 @@ describe('empty and missing fields', () => {
   });
 
   it('rejects missing file in livekit recording (route-level)', async () => {
-    const res = await request(app).post(`/api/livekit/${validUUID()}/recording`);
+    const res = await $r(app).post(`/api/livekit/${validUUID()}/recording`);
 
     // multer returns 400 for missing file through the route handler
     expect(res.status).toBe(400);
@@ -676,13 +709,13 @@ describe('empty and missing fields', () => {
 describe('error contract consistency', () => {
   it('all 400 validation errors have type, message, details — no stacktrace', async () => {
     const tests = [
-      request(app).post('/api/roles').send({}),
-      request(app).get('/api/roles/not-a-uuid'),
-      request(app).get('/api/candidates?role_id=bad'),
-      request(app).post('/api/screening/start').send({}),
-      request(app).post(`/api/screening/${validUUID()}/turn`).send({}),
-      request(app).post('/api/assess/bad'),
-      request(app).post('/api/livekit/start').send({}),
+      $r(app).post('/api/roles').send({}),
+      $r(app).get('/api/roles/not-a-uuid'),
+      $r(app).get('/api/candidates?role_id=bad'),
+      $r(app).post('/api/screening/start').send({}),
+      $r(app).post(`/api/screening/${validUUID()}/turn`).send({}),
+      $r(app).post('/api/assess/bad'),
+      $r(app).post('/api/livekit/start').send({}),
     ];
 
     for (const t of tests) {
@@ -754,7 +787,7 @@ describe('error contract consistency', () => {
   it('route-level 500 errors use the sanitized contract', async () => {
     supabaseMock.from.mockReturnValue(chainable({ data: null, error: null }));
 
-    const res = await request(app)
+    const res = await $r(app)
       .post('/api/screening/start')
       .send({ candidate_id: validUUID2() })
       .expect(500);
@@ -813,7 +846,7 @@ describe('security schema properties', () => {
 
 describe('security-sensitive endpoints', () => {
   it('livekit/start rejects unknown metadata fields', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .post('/api/livekit/start')
       .send({
         candidate_id: validUUID(),
@@ -825,7 +858,7 @@ describe('security-sensitive endpoints', () => {
   });
 
   it('screening/start rejects prompt override attempt', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .post('/api/screening/start')
       .send({
         candidate_id: validUUID(),
@@ -837,7 +870,7 @@ describe('security-sensitive endpoints', () => {
   });
 
   it('screening turn rejects extra fields that could be parameter injection', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .post(`/api/screening/${validUUID()}/turn`)
       .send({
         text: 'normal answer',
@@ -850,7 +883,7 @@ describe('security-sensitive endpoints', () => {
   });
 
   it('role create rejects prototype pollution attempt', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .post('/api/roles')
       .send({
         title: 'SWE',
@@ -889,14 +922,14 @@ describe('security headers', () => {
   // ── Happy path: GET + HEAD on health endpoint ──────────────────
 
   it('sets all base headers on GET /api/health', async () => {
-    const res = await request(app).get('/api/health');
+    const res = await $r(app).get('/api/health');
     assertNoPoweredBy(res);
     assertBaseHeaders(res, { 'strict-transport-security': null });
     expect(res.status).toBe(200);
   });
 
   it('sets all base headers on HEAD /api/health', async () => {
-    const res = await request(app).head('/api/health');
+    const res = await $r(app).head('/api/health');
     assertNoPoweredBy(res);
     assertBaseHeaders(res, { 'strict-transport-security': null });
   });
@@ -904,7 +937,7 @@ describe('security headers', () => {
   // ── OPTIONS preflight must carry headers ───────────────────────
 
   it('sets base headers on OPTIONS preflight', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .options('/api/health')
       .set('Origin', 'http://localhost:5173')
       .set('Access-Control-Request-Method', 'GET');
@@ -915,7 +948,7 @@ describe('security headers', () => {
   // ── HSTS: production vs non-production (no global env mutation) ─
 
   it('does NOT set HSTS in non-production (default)', async () => {
-    const res = await request(app).get('/api/health');
+    const res = await $r(app).get('/api/health');
     expect(res.headers['strict-transport-security']).toBeUndefined();
   });
 
@@ -933,7 +966,7 @@ describe('security headers', () => {
   // ── Error paths must still carry security headers ──────────────
 
   it('sets base headers on malformed JSON 400', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .post('/api/roles')
       .set('Content-Type', 'application/json')
       .send('not-json');
@@ -944,7 +977,7 @@ describe('security headers', () => {
   });
 
   it('sets base headers on CORS-blocked response', async () => {
-    const res = await request(app)
+    const res = await $r(app)
       .get('/api/health')
       .set('Origin', 'https://evil.example.com');
     // Disallowed origins get callback(null, false) — no ACAO, 200 OK.
@@ -960,7 +993,7 @@ describe('security headers', () => {
     // (not null) that the list route forwards via next(error). finalErrorHandler
     // sanitizes it to a 500 with internal_error type.
     supabaseMock.from.mockReturnValue(chainable({ data: null, error: { code: 'PGRST999' } }));
-    const res = await request(app).get('/api/roles');
+    const res = await $r(app).get('/api/roles');
     assertNoPoweredBy(res);
     assertBaseHeaders(res);
     expect(res.status).toBe(500);
@@ -975,7 +1008,7 @@ describe('security headers', () => {
     supabaseMock.from.mockReturnValue(chainable({ data: [], error: null }));
 
     for (const path of paths) {
-      const res = await request(app).get(path);
+      const res = await $r(app).get(path);
       expect(res.headers['x-powered-by']).toBeUndefined();
       expect(res.headers['x-content-type-options']).toBe('nosniff');
       expect(res.headers['x-frame-options']).toBe('DENY');
@@ -1034,7 +1067,7 @@ describe('LLM-06 provenance integration', () => {
       return chainable({ data: mockRole, error: null });
     });
 
-    const res = await request(app)
+    const res = await $r(app)
       .post('/api/screening/start')
       .send({ candidate_id: validUUID2() })
       .expect(201);

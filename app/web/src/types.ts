@@ -165,7 +165,20 @@ export interface StartLiveKitResult {
   session_id: string;
   room_name: string;
   url: string;
+}
+
+export interface CandidateInviteResult {
   token: string;
+  expires_at: string;
+}
+
+export interface CandidateInviteExchangeResult {
+  grant_token: string;
+  url: string;
+  room_name: string;
+  session_id: string;
+  expires_at: string;
+  livekit_token: string;
 }
 
 export interface TurnResult {

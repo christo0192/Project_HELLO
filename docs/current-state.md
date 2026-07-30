@@ -1,12 +1,13 @@
 # Current State Manifest
 
-**Evidence date:** 2026-07-29
+**Evidence date:** 2026-07-30
 
 This file documents the purpose, structure, and invariants of the
 machine-readable current-state manifest at `config/current-state.json`.
 
 The manifest is **not** a roadmap. `PLAN.md` remains the sole roadmap and
-launch-gate authority. The manifest records current implementation and
+launch-gate authority. Phase 1 implementation and residual gates are recorded
+in `docs/runbooks/phase1-security-core.md`. The manifest records current implementation and
 deployment status so that automated drift checks can detect semantic
 contradictions (production claims, gate-count changes, stale-provider
 promotion, telephony-as-current) without fragile paragraph matching.

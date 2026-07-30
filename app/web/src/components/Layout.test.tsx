@@ -7,6 +7,7 @@
  *   - API health status display
  *   - axe structural rule compliance (all violations)
  *   - Keyboard tab order through nav links
+ *   - Auth state: user email, sign-out button when authenticated
  */
 
 import { render, screen } from '@testing-library/react';
@@ -26,6 +27,14 @@ vi.mock('../api', () => ({
       this.status = s;
     }
   },
+}));
+
+vi.mock('../lib/auth', () => ({
+  useAuth: () => ({
+    user: { id: 'u1', email: 'recruiter@example.com' },
+    signOut: vi.fn(),
+    isAuthenticated: true,
+  }),
 }));
 
 function renderLayout() {
@@ -53,6 +62,16 @@ describe('Layout', () => {
   it('shows API online', async () => {
     renderLayout();
     expect(await screen.findByText('API online')).toBeInTheDocument();
+  });
+
+  it('shows user email when authenticated', () => {
+    renderLayout();
+    expect(screen.getByText('recruiter@example.com')).toBeInTheDocument();
+  });
+
+  it('shows sign-out button when authenticated', () => {
+    renderLayout();
+    expect(screen.getByText('Sign out')).toBeInTheDocument();
   });
 
   it('navigates links via keyboard Tab', async () => {

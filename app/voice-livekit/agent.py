@@ -18,8 +18,8 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 import persistence
 from observability import reset_correlation_id, set_correlation_id
-from persistence import LifecycleError
-from prompting import build_prompt_context, collect_prompt_metadata
+from persistence import LifecycleError, WorkerContext
+from prompting import build_prompt_context, collect_prompt_metadata, opening_line, system_prompt
 from provenance import screening_provenance
 
 load_dotenv()
@@ -128,14 +128,31 @@ async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect()
     meta = collect_prompt_metadata(ctx)
     session_id = meta.get("session_id") or meta.get("sessionId")
+    room_name = meta.get("room_name") or ""
     cid_token = set_correlation_id(meta.get("correlation_id"))
+
+    # HIGH SEC-13: Resolve worker context from API (server-side lookup).
+    # Never restore sensitive room metadata from client-visible data.
+    worker_ctx: WorkerContext | None = None
+    if session_id:
+        resolved = await persistence.resolve_worker_context(str(session_id), str(room_name))
+        if isinstance(resolved, WorkerContext):
+            worker_ctx = resolved
+        else:
+            # Hosted jobs fail closed when authorized context cannot be resolved.
+            await persistence.fail_session(
+                str(session_id), "worker_crash", expected_status="waiting",
+            )
+            reset_correlation_id(cid_token)
+            return
+
     try:
-        await _run_session(ctx, started_at, session_id)
+        await _run_session(ctx, started_at, session_id, worker_ctx)
     finally:
         reset_correlation_id(cid_token)
 
 
-async def _run_session(ctx: JobContext, started_at: float, session_id: Any) -> None:
+async def _run_session(ctx: JobContext, started_at: float, session_id: Any, worker_ctx: WorkerContext | None) -> None:
     # LLM-06: claim provenance before any provider construction. The same
     # configured model is then supplied to Anthropic below.
     claim = await persistence.set_session_provenance(
@@ -148,7 +165,36 @@ async def _run_session(ctx: JobContext, started_at: float, session_id: Any) -> N
     }:
         return
 
-    system_text, opening_text = build_prompt_context(ctx)
+    # HIGH SEC-13: Build prompt from server-verified worker context,
+    # never from client-visible room/participant metadata.
+    if worker_ctx is not None:
+        sys_text = system_prompt(
+            candidate_name=worker_ctx.candidate_name,
+            role_title=None,
+            role_focus=None,
+            resume_facts=None,
+            questions=None,
+        )
+        open_text = opening_line(
+            candidate_name=worker_ctx.candidate_name,
+            role_title=None,
+        )
+    else:
+        # Fallback (no server context) — use env-only prompt, no room metadata
+        sys_text = system_prompt(
+            candidate_name=None,
+            role_title=None,
+            role_focus=None,
+            resume_facts=None,
+            questions=None,
+        )
+        open_text = opening_line(
+            candidate_name=None,
+            role_title=None,
+        )
+
+    system_text = sys_text
+    opening_text = open_text
 
     # REL-07: separate write-task set from the finalizer.
     # ONLY transcript writes go here; complete_once is never added.
