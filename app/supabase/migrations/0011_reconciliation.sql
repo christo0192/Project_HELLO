@@ -140,9 +140,9 @@ create index if not exists idx_v2_sessions_stuck_progress
   on screening_v2.call_sessions(started_at)
   where status = 'in_progress';
 
--- Stuck sessions: index on status + created_at for stale created sessions.
+-- Stuck sessions: index on status + started_at for stale created sessions.
 create index if not exists idx_v2_sessions_stuck_created
-  on screening_v2.call_sessions(created_at)
+  on screening_v2.call_sessions(started_at)
   where status = 'created';
 
 -- Missing recordings: sessions that completed but have no recording_object_key.
@@ -203,16 +203,16 @@ as $$
 
   union all
 
-  -- Created sessions that never transitioned
+  -- Created sessions that never transitioned (canonical start time is started_at)
   select
     s.id,
     s.status,
-    extract(epoch from (now() - s.created_at))::double precision,
+    extract(epoch from (now() - s.started_at))::double precision,
     s.candidate_id,
     'stuck_in_created'::text
   from screening_v2.call_sessions s
   where s.status = 'created'
-    and extract(epoch from (now() - s.created_at)) > created_timeout_sec
+    and extract(epoch from (now() - s.started_at)) > created_timeout_sec
 
   union all
 

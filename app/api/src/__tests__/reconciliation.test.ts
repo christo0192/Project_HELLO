@@ -180,7 +180,7 @@ describe('reconcile() — full scan', () => {
         id: SESSION_ID_1,
         candidate_id: CANDIDATE_ID_1,
         waiting_at: new Date(Date.now() - 600_000).toISOString(),
-        created_at: new Date(Date.now() - 3600_000).toISOString(),
+        started_at: new Date(Date.now() - 3600_000).toISOString(),
       },
     ];
 

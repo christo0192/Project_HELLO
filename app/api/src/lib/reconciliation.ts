@@ -554,7 +554,7 @@ async function detectOrphanRooms(
 
   const { data, error } = await supabase
     .from('call_sessions')
-    .select('id, candidate_id, waiting_at, created_at')
+    .select('id, candidate_id, waiting_at, started_at')
     .eq('status', 'waiting')
     .lte(
       'waiting_at',
@@ -574,7 +574,7 @@ async function detectOrphanRooms(
     id: string;
     candidate_id: string;
     waiting_at: string | null;
-    created_at: string;
+    started_at: string;
   }> | null;
 
   if (!rows) return issues;
@@ -593,7 +593,7 @@ async function detectOrphanRooms(
       details: {
         currentStatus: 'waiting',
         waitingAt: row.waiting_at,
-        createdAt: row.created_at,
+        createdAt: row.started_at,
       },
     });
   }
