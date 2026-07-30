@@ -37,7 +37,7 @@ create table if not exists screening_v2.retention_policies (
   created_at      timestamptz not null default now(),
   updated_at      timestamptz not null default now(),
   constraint uq_retention_category unique (data_category),
-  constraint chk_retention_days check (retention_days >= 0),
+  constraint chk_retention_days check (retention_days >= -1),
   constraint chk_retention_strategy check (strategy in ('delete', 'anonymize', 'archive')),
   constraint chk_retention_category check (
     data_category in (
@@ -60,7 +60,7 @@ comment on column screening_v2.retention_policies.data_category is
   'active policy (enforced by unique constraint).';
 comment on column screening_v2.retention_policies.retention_days is
   'Retention period in days. 0 = delete immediately. -1 sentinel = '
-  'retain indefinitely (D-009 default). Negative values reserved.';
+  'retain indefinitely (D-009 default). No values below -1.';
 comment on column screening_v2.retention_policies.strategy is
   'Action when retention period expires: delete, anonymize, or archive.';
 
