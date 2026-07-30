@@ -7,7 +7,10 @@ machine-readable current-state manifest at `config/current-state.json`.
 
 The manifest is **not** a roadmap. `PLAN.md` remains the sole roadmap and
 launch-gate authority. Phase 1 implementation and residual gates are recorded
-in `docs/runbooks/phase1-security-core.md`. The manifest records current implementation and
+in `docs/runbooks/phase1-security-core.md`; Phase 2 Supabase migration
+foundations (export/reconcile/storage tooling, 0008 schema, migration runbooks)
+are merged as PR #26 (`1ac8b4d`) and recorded in `docs/runbooks/supabase-migration-strategy.md`.
+The manifest records current implementation and
 deployment status so that automated drift checks can detect semantic
 contradictions (production claims, gate-count changes, stale-provider
 promotion, telephony-as-current) without fragile paragraph matching.
