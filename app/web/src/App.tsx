@@ -11,6 +11,7 @@ import { MfaEnrollPage } from './pages/MfaEnrollPage';
 import { MfaChallengePage } from './pages/MfaChallengePage';
 import { UnauthorizedPage } from './pages/UnauthorizedPage';
 import { CandidateJoinPage } from './pages/CandidateJoinPage';
+import { PrivacyNoticePage } from './pages/PrivacyNoticePage';
 import { RolesPage } from './pages/RolesPage';
 import { CandidatesPage } from './pages/CandidatesPage';
 import { CandidateDetailPage } from './pages/CandidateDetailPage';
@@ -25,6 +26,7 @@ export default function App() {
         <Route path="/mfa/enroll" element={<MfaEnrollPage />} />
         <Route path="/mfa/challenge" element={<MfaChallengePage />} />
         <Route path="/unauthorized" element={<UnauthorizedPage />} />
+        <Route path="/privacy-notice" element={<PrivacyNoticePage />} />
         <Route path="/candidate/join" element={<CandidateJoinPage />} />
 
         {/* Protected recruiter routes — AAL2 required */}

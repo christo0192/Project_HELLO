@@ -184,7 +184,9 @@ _DEFENSE_RE = re.compile(
     r"|AKIA[A-Z0-9]{16}"
     # Generic high-entropy token: 30+ alphanumeric chars in a row with
     # at least one digit and one letter (likely an API key / secret).
-    r"|[A-Za-z0-9]{30,}",
+    r"|[A-Za-z0-9]{30,}"
+    # Path-like patterns that could indicate file system leakage
+    r"|\/[A-Za-z0-9_\-\.]{2,}(?:\/[A-Za-z0-9_\-\.]+)+",
     re.IGNORECASE,
 )
 
@@ -497,3 +499,286 @@ class StructuredLogger:
 
     def error(self, event: str, **meta: Any) -> None:
         self._emit("error", event, meta or None)
+
+
+# =====================================================================
+#  OBS-06: Metrics instrumentation helpers (Python)
+# =====================================================================
+#
+# Thin abstraction over a hypothetical metrics backend.  No real provider
+# is wired — all methods are no-ops by default.
+#
+# PII REDACTION: every metric name and label key/value is run through the
+# same defence-in-depth scanner used by the StructuredLogger.
+#
+# =====================================================================
+
+
+# Reuse the logger's PII detection patterns
+_METRIC_SAFE_IDENT_RE = re.compile(r"^[a-zA-Z0-9_:.\-]{1,64}$")
+
+
+class _MetricSink:
+    """Abstract metric sink base.  Default methods are no-ops."""
+
+    def counter(self, name: str, value: float, labels: Optional[dict[str, Any]] = None) -> None:
+        pass
+
+    def gauge(self, name: str, value: float, labels: Optional[dict[str, Any]] = None) -> None:
+        pass
+
+    def histogram(self, name: str, value: float, labels: Optional[dict[str, Any]] = None) -> None:
+        pass
+
+
+class _NoOpMetricSink(_MetricSink):
+    pass
+
+
+class TestMetricSink(_MetricSink):
+    """In-memory test sink that records every metric emission."""
+
+    def __init__(self) -> None:
+        self.counters: list[dict[str, Any]] = []
+        self.gauges: list[dict[str, Any]] = []
+        self.histograms: list[dict[str, Any]] = []
+
+    def counter(self, name: str, value: float, labels: Optional[dict[str, Any]] = None) -> None:
+        self.counters.append({"name": name, "value": value, "labels": labels})
+
+    def gauge(self, name: str, value: float, labels: Optional[dict[str, Any]] = None) -> None:
+        self.gauges.append({"name": name, "value": value, "labels": labels})
+
+    def histogram(self, name: str, value: float, labels: Optional[dict[str, Any]] = None) -> None:
+        self.histograms.append({"name": name, "value": value, "labels": labels})
+
+    def reset(self) -> None:
+        self.counters.clear()
+        self.gauges.clear()
+        self.histograms.clear()
+
+
+_metric_sink: _MetricSink = _NoOpMetricSink()
+_metrics_log = StructuredLogger("metrics", writer=lambda line: None)
+
+
+def set_metric_sink(sink: Optional[_MetricSink] = None) -> None:
+    """Set the active metric sink.  Pass None to reset to no-op."""
+    global _metric_sink  # noqa: PLW0603
+    _metric_sink = sink or _NoOpMetricSink()
+
+
+def _validate_metric_name(name: str) -> Optional[str]:
+    if not name or not isinstance(name, str):
+        return None
+    if not _METRIC_SAFE_IDENT_RE.match(name):
+        return None
+    if _DEFENSE_RE.search(name):
+        return None
+    return name
+
+
+def _filter_metric_labels(labels: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    if not labels:
+        return None
+    cleaned: dict[str, Any] = {}
+    for k, v in labels.items():
+        safe_key = _validate_metric_name(str(k))
+        if not safe_key:
+            continue
+        if v is None:
+            continue
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, str):
+            if _DEFENSE_RE.search(v):
+                continue
+            if len(v) > 512:
+                v = v[:512]
+            cleaned[safe_key] = v
+        elif isinstance(v, (int, float)):
+            if not math.isfinite(float(v)):
+                continue
+            cleaned[safe_key] = v
+    return cleaned if cleaned else None
+
+
+def counter_metric(name: str, value: float = 1.0, labels: Optional[dict[str, Any]] = None) -> None:
+    """Increment a counter metric."""
+    safe_name = _validate_metric_name(name)
+    if not safe_name:
+        return
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value < 0:
+        return
+    safe_labels = _filter_metric_labels(labels)
+    _metric_sink.counter(safe_name, float(value), safe_labels)
+
+
+def gauge_metric(name: str, value: float, labels: Optional[dict[str, Any]] = None) -> None:
+    """Set a gauge metric."""
+    safe_name = _validate_metric_name(name)
+    if not safe_name:
+        return
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        return
+    safe_labels = _filter_metric_labels(labels)
+    _metric_sink.gauge(safe_name, float(value), safe_labels)
+
+
+def histogram_metric(name: str, value: float, labels: Optional[dict[str, Any]] = None) -> None:
+    """Record a histogram observation."""
+    safe_name = _validate_metric_name(name)
+    if not safe_name:
+        return
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value < 0:
+        return
+    safe_labels = _filter_metric_labels(labels)
+    _metric_sink.histogram(safe_name, float(value), safe_labels)
+
+
+# =====================================================================
+#  OBS-06: Tracing instrumentation helpers (Python)
+# =====================================================================
+#
+# Thin span-based tracing abstraction.  By default spans are no-ops.
+# A real TracerBackend can be configured at startup.
+#
+# PII REDACTION: every span attribute value is scanned and redacted.
+#
+# =====================================================================
+
+import uuid as _uuid_mod
+
+
+class Span:
+    """A single span within a trace."""
+
+    def __init__(self, name: str, parent_span_id: Optional[str] = None) -> None:
+        self.name: str = name
+        self.span_id: str = str(_uuid_mod.uuid4())
+        self.trace_id: str = str(_uuid_mod.uuid4())
+        self.parent_span_id: Optional[str] = parent_span_id
+        self.attributes: dict[str, Any] = {}
+        self.events: list[dict[str, Any]] = []
+        self.error: Optional[Exception] = None
+        self._ended: bool = False
+
+    def end(self) -> None:
+        self._ended = True
+
+    def set_attributes(self, attrs: dict[str, Any]) -> None:
+        cleaned: dict[str, Any] = {}
+        for k, v in attrs.items():
+            if v is None:
+                continue
+            if isinstance(v, str):
+                if _DEFENSE_RE.search(v):
+                    v = "[REDACTED]"
+                if len(v) > 1024:
+                    v = v[:1024]
+                cleaned[k] = v
+            elif isinstance(v, bool):
+                cleaned[k] = v
+            elif isinstance(v, (int, float)):
+                if math.isfinite(float(v)):
+                    cleaned[k] = v
+        self.attributes.update(cleaned)
+
+    def add_event(self, name: str, attrs: Optional[dict[str, Any]] = None) -> None:
+        cleaned: Optional[dict[str, Any]] = None
+        if attrs:
+            cleaned = {}
+            for k, v in attrs.items():
+                if v is None:
+                    continue
+                if isinstance(v, str):
+                    if _DEFENSE_RE.search(v):
+                        v = "[REDACTED]"
+                    if len(v) > 1024:
+                        v = v[:1024]
+                    cleaned[k] = v
+                elif isinstance(v, bool):
+                    cleaned[k] = v
+                elif isinstance(v, (int, float)):
+                    if math.isfinite(float(v)):
+                        cleaned[k] = v
+        self.events.append({"name": name, "attrs": cleaned})
+
+    def set_error(self, error: Exception) -> None:
+        self.error = error
+
+    @property
+    def is_ended(self) -> bool:
+        return self._ended
+
+
+class TracerBackend:
+    """Abstract tracer backend.  Default implementation creates no-op spans."""
+
+    def start_span(self, name: str, parent: Optional[Span] = None) -> Span:
+        parent_id = parent.span_id if parent else None
+        span = Span(name, parent_span_id=parent_id)
+        return span
+
+
+class NoOpTracer(TracerBackend):
+    pass
+
+
+class TestTracer(TracerBackend):
+    """In-memory test tracer that records every span."""
+
+    def __init__(self) -> None:
+        self.spans: list[Span] = []
+
+    def start_span(self, name: str, parent: Optional[Span] = None) -> Span:
+        parent_id = parent.span_id if parent else None
+        span = Span(name, parent_span_id=parent_id)
+        self.spans.append(span)
+        return span
+
+    def reset(self) -> None:
+        self.spans.clear()
+
+
+_tracer: TracerBackend = NoOpTracer()
+_tracing_log = StructuredLogger("tracing", writer=lambda line: None)
+
+
+def set_tracer(tracer: Optional[TracerBackend] = None) -> None:
+    """Set the active tracer backend.  Pass None to reset to no-op."""
+    global _tracer  # noqa: PLW0603
+    _tracer = tracer or NoOpTracer()
+
+
+def start_span(name: str, parent: Optional[Span] = None) -> Span:
+    """Start a new span."""
+    if not name or not isinstance(name, str):
+        return Span("unnamed")
+    if len(name) > 128:
+        return Span("unnamed")
+    return _tracer.start_span(name, parent)
+
+
+def with_span(name: str, fn, parent: Optional[Span] = None):
+    """Run a function inside a span.  The span is automatically ended."""
+    span = start_span(name, parent)
+    try:
+        return fn(span)
+    except Exception as exc:
+        span.set_error(exc)
+        raise
+    finally:
+        span.end()
+
+
+async def with_span_async(name: str, fn, parent: Optional[Span] = None):
+    """Run an async function inside a span.  The span is automatically ended."""
+    span = start_span(name, parent)
+    try:
+        return await fn(span)
+    except Exception as exc:
+        span.set_error(exc)
+        raise
+    finally:
+        span.end()

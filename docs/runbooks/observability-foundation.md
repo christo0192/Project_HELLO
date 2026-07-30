@@ -1,13 +1,15 @@
-# Observability Foundation Runbook (OBS-01 / OBS-02)
+# Observability Foundation Runbook (OBS-01 / OBS-02 / OBS-03 / OBS-04 / OBS-06)
 
 ## Scope
 
 This runbook covers the structured logging schema, stable event catalogue, correlation
-ID format, and query examples for the HR Screening Bot API (Node.js/Express) and
-the LiveKit voice worker (Python).
+ID format, metrics/tracing instrumentation helpers, and query examples for the HR
+Screening Bot API (Node.js/Express) and the LiveKit voice worker (Python).
 
-**Status:** Foundation only.  Managed log export, complete queue tracing, and
-dashboards are **pending** (see Pending Boundaries below).  All items below
+**Status:** Foundation with instrumentation helpers.  Metrics and tracing abstractions
+are in place (OBS-03/04/06) but no real backend (Axiom, Datadog, Prometheus) is wired.
+See `slo-error-budget.md` (OBS-08) and `incident-response.md` (OBS-09) for SLO/alert/incident
+runbooks.  All items below
 reflect unit-test-proven behaviour only — no production deployment verification
 has been performed.
 
@@ -197,9 +199,8 @@ cat /var/log/app/api.log \
 
 ## Pending Boundaries
 
-The following boundaries exist in the system but **do not yet carry structured
-log correlation**.  They are documented here to prevent fabricated propagation
-claims.
+The following boundaries exist in the system but **do not yet carry observability
+coverage**.  They are documented here to prevent fabricated propagation claims.
 
 | Boundary                      | Status   | Notes                                                      |
 |-------------------------------|----------|------------------------------------------------------------|
@@ -209,6 +210,11 @@ claims.
 | Managed log export            | Pending  | Platform not chosen; no dashboard or alert rules           |
 | Sarvam STT/TTS provider       | Pending  | External provider; correlation not propagated              |
 | Anthropic LLM via LiveKit     | Pending  | External provider; correlation not propagated              |
+| Real metrics backend          | Pending  | Metrics helpers exist (OBS-03/06); no Prometheus/Datadog   |
+| Real tracing backend          | Pending  | Tracing helpers exist (OBS-04/06); no OpenTelemetry export |
+| Alert notification            | Pending  | Alert rules defined (OBS-08); no PagerDuty/Slack wired     |
+| Dashboard                     | Pending  | No Grafana or equivalent                                   |
+| Incident response tooling     | Pending  | Runbook defined (OBS-09); no on-call schedule              |
 
 ---
 

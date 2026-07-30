@@ -203,3 +203,81 @@ export interface HealthResult {
   ok: boolean;
   model: string;
 }
+
+// ── Consent types (GOV-03/GOV-08/GOV-09/GOV-10) ─────────────────────
+
+export type ConsentType =
+  | 'ai_interview'
+  | 'recording'
+  | 'purpose'
+  | 'data_processing'
+  | 'retention'
+  | 'rights'
+  | 'job_application';
+
+export type ConsentStatus = 'granted' | 'declined' | 'withdrawn';
+
+export interface ConsentSubmitInput {
+  candidate_id: string;
+  version?: string;
+  consents: ConsentType[];
+  status?: ConsentStatus;
+  proof?: {
+    ip_address?: string;
+    user_agent?: string;
+    captured_at?: string;
+    notice_version?: string;
+    note?: string;
+  };
+  expires_at?: string;
+}
+
+export interface ConsentSubmitResponse {
+  id: string;
+  candidate_id: string;
+  status: ConsentStatus;
+  consents: ConsentType[];
+  version: string;
+  created_at: string;
+}
+
+export interface ConsentStatusResponse {
+  candidate_id: string;
+  has_consent: boolean;
+  has_ai_consent: boolean;
+  has_recording_consent: boolean;
+  latest_consent: {
+    id: string;
+    status: ConsentStatus;
+    consents: ConsentType[];
+    version: string;
+    created_at: string;
+  } | null;
+}
+
+export interface ConsentCheckResponse {
+  ok: boolean;
+  missing: ConsentType[];
+}
+
+export interface ConsentTemplateResponse {
+  id: string;
+  version: string;
+  locale: string;
+  title: string;
+  body_md: string;
+  required_consents: ConsentType[];
+  is_active: boolean;
+}
+
+export interface ConsentWithdrawInput {
+  candidate_id: string;
+  consent_types?: ConsentType[];
+  reason?: string;
+}
+
+export interface ConsentWithdrawResponse {
+  id: string;
+  status: ConsentStatus;
+  updated_at: string;
+}

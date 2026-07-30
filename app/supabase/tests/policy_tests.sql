@@ -112,11 +112,15 @@ select _policy_tests.assert(
 select _policy_tests.assert(
   'dashboard policies invoke membership helper',
   (
-    -- 6 Phase-1 policies (scoped roles/candidates/call_sessions, active
-    -- transcript_turns/assessments, recruiter read audit_events) plus the
-    -- 5 membership-gated reads added by migration 0008 (consent_records,
-    -- call_queue, sms_follow_ups, ats_sync_log, resumes) = 11.
-    select count(*) = 11
+    -- Phase 1 (0007): 3 scoped (roles/candidates/call_sessions),
+    --   2 active (transcript_turns/assessments), 1 recruiter (audit_events) = 6
+    -- Phase 2 (0008): 5 active (consent_records, call_queue, sms_follow_ups,
+    --   ats_sync_log, resumes) = 5
+    -- Phase 3 (0012): 5 recruiter (retention_policies, legal_holds,
+    --   erasure_exceptions, data_subject_requests, governance_audit) = 5
+    -- Phase 3 (0013): 1 active (consent_templates) = 1
+    -- Total: 6 + 5 + 5 + 1 = 17
+    select count(*) = 17
       from pg_policies
      where schemaname = 'screening_v2'
        and cmd = 'SELECT'
@@ -124,10 +128,13 @@ select _policy_tests.assert(
        and (
          policyname like 'active recruiter read %'
          or policyname like 'scoped recruiter read %'
-         or policyname like 'recruiter read audit_events'
+         or policyname in ('recruiter read audit_events',
+            'recruiter read retention_policies', 'recruiter read legal_holds',
+            'recruiter read erasure_exceptions', 'recruiter read data_subject_requests',
+            'recruiter read governance_audit')
        )
   ),
-  'all eleven dashboard SELECT policies must be gated by active recruiter membership'
+  'all 17 dashboard SELECT policies must be gated by active recruiter membership'
 );
 
 -- Seed synthetic identities/data to exercise effective RLS, never candidate data.
@@ -2677,8 +2684,8 @@ select _policy_tests.assert(
   'all five new Phase 2 SELECT policies must exist with exact names'
 );
 
--- Verify the full policy count (baseline + new).
--- Baseline Phase 1 policies (migration 0007):
+-- Verify the full policy count (baseline + Phase 3-5 additions).
+-- Phase 1 (migration 0007):
 --   scoped recruiter read roles (1)
 --   scoped recruiter read candidates (1)
 --   scoped recruiter read call_sessions (1)
@@ -2686,23 +2693,363 @@ select _policy_tests.assert(
 --   active recruiter read assessments (1)
 --   recruiter read audit_events (1)
 --   recruiter read own membership (1) [on recruiter_memberships]
--- Phase 2 additions (migration 0008):
+-- Phase 2 (migration 0008):
 --   active recruiter read consent_records (1)
 --   active recruiter read call_queue (1)
 --   active recruiter read sms_follow_ups (1)
 --   active recruiter read ats_sync_log (1)
 --   active recruiter read resumes (1)
--- Total expected: 12
+-- Phase 3 (migration 0012):
+--   recruiter read retention_policies (1)
+--   recruiter read legal_holds (1)
+--   recruiter read erasure_exceptions (1)
+--   recruiter read data_subject_requests (1)
+--   recruiter read governance_audit (1)
+-- Phase 3 (migration 0013):
+--   active recruiter read consent_templates (1)
+-- Total expected: 7 + 5 + 5 + 1 = 18
 
 select _policy_tests.assert(
-  'expected total screening_v2 SELECT policy count is 12',
+  'expected total screening_v2 SELECT policy count is 18',
   (
-    select count(*) = 12
+    select count(*) = 18
       from pg_policies
      where schemaname = 'screening_v2'
        and cmd = 'SELECT'
   ),
-  'expected exactly 12 SELECT policies as of migration 0008'
+  'expected exactly 18 SELECT policies after all migrations through 0013'
+);
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- Phase 3-5 (0009-0013): queue/outbox/reconciliation/governance/consent
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- ── 0009: job_queue and job_dlq (backend infrastructure) ────────────
+
+select _policy_tests.assert(
+  'job_queue has RLS enabled',
+  exists (
+    select 1 from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'job_queue'
+       and c.relrowsecurity
+  ),
+  'RLS must be enabled on job_queue'
+);
+
+select _policy_tests.assert(
+  'job_dlq has RLS enabled',
+  exists (
+    select 1 from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'job_dlq'
+       and c.relrowsecurity
+  ),
+  'RLS must be enabled on job_dlq'
+);
+
+select _policy_tests.assert(
+  'job_queue has no authenticated policy (service_role only)',
+  not exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename = 'job_queue'
+       and 'authenticated' = any(roles)
+  ),
+  'job_queue must remain service_role-only'
+);
+
+select _policy_tests.assert(
+  'job_dlq has no authenticated policy (service_role only)',
+  not exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename = 'job_dlq'
+       and 'authenticated' = any(roles)
+  ),
+  'job_dlq must remain service_role-only'
+);
+
+-- ── 0010: transcript_events and outbox (backend infrastructure) ──────
+
+select _policy_tests.assert(
+  'transcript_events has RLS enabled',
+  exists (
+    select 1 from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'transcript_events'
+       and c.relrowsecurity
+  ),
+  'RLS must be enabled on transcript_events'
+);
+
+select _policy_tests.assert(
+  'outbox has RLS enabled',
+  exists (
+    select 1 from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'outbox'
+       and c.relrowsecurity
+  ),
+  'RLS must be enabled on outbox'
+);
+
+select _policy_tests.assert(
+  'transcript_events has no authenticated policy (service_role only)',
+  not exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename = 'transcript_events'
+       and 'authenticated' = any(roles)
+  ),
+  'transcript_events must remain service_role-only'
+);
+
+select _policy_tests.assert(
+  'outbox has no authenticated policy (service_role only)',
+  not exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename = 'outbox'
+       and 'authenticated' = any(roles)
+  ),
+  'outbox must remain service_role-only'
+);
+
+select _policy_tests.assert(
+  'authenticated has no SELECT on transcript_events',
+  not exists (
+    select 1
+      from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'transcript_events'
+       and has_table_privilege('authenticated', c.oid, 'SELECT')
+  ),
+  'authenticated must not have SELECT on transcript_events'
+);
+
+select _policy_tests.assert(
+  'authenticated has no SELECT on outbox',
+  not exists (
+    select 1
+      from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'outbox'
+       and has_table_privilege('authenticated', c.oid, 'SELECT')
+  ),
+  'authenticated must not have SELECT on outbox'
+);
+
+-- ── 0011: reconciliation_log and quarantined_sessions ────────────────
+
+select _policy_tests.assert(
+  'reconciliation_log has RLS enabled',
+  exists (
+    select 1 from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'reconciliation_log'
+       and c.relrowsecurity
+  ),
+  'RLS must be enabled on reconciliation_log'
+);
+
+select _policy_tests.assert(
+  'quarantined_sessions has RLS enabled',
+  exists (
+    select 1 from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'quarantined_sessions'
+       and c.relrowsecurity
+  ),
+  'RLS must be enabled on quarantined_sessions'
+);
+
+select _policy_tests.assert(
+  'reconciliation_log has no authenticated policy',
+  not exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename = 'reconciliation_log'
+       and 'authenticated' = any(roles)
+  ),
+  'reconciliation_log must be service_role-only'
+);
+
+select _policy_tests.assert(
+  'quarantined_sessions has no authenticated policy',
+  not exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename = 'quarantined_sessions'
+       and 'authenticated' = any(roles)
+  ),
+  'quarantined_sessions must be service_role-only'
+);
+
+-- ── 0012: governance tables (membership-gated SELECT) ────────────────
+
+select _policy_tests.assert(
+  'retention_policies has RLS enabled',
+  exists (
+    select 1 from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'retention_policies'
+       and c.relrowsecurity
+  ),
+  'RLS must be enabled on retention_policies'
+);
+
+select _policy_tests.assert(
+  'legal_holds has RLS enabled',
+  exists (
+    select 1 from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'legal_holds'
+       and c.relrowsecurity
+  ),
+  'RLS must be enabled on legal_holds'
+);
+
+select _policy_tests.assert(
+  'erasure_exceptions has RLS enabled',
+  exists (
+    select 1 from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'erasure_exceptions'
+       and c.relrowsecurity
+  ),
+  'RLS must be enabled on erasure_exceptions'
+);
+
+select _policy_tests.assert(
+  'data_subject_requests has RLS enabled',
+  exists (
+    select 1 from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'data_subject_requests'
+       and c.relrowsecurity
+  ),
+  'RLS must be enabled on data_subject_requests'
+);
+
+select _policy_tests.assert(
+  'governance_audit has RLS enabled',
+  exists (
+    select 1 from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'governance_audit'
+       and c.relrowsecurity
+  ),
+  'RLS must be enabled on governance_audit'
+);
+
+select _policy_tests.assert(
+  'governance tables have membership-gated SELECT policies',
+  (
+    select count(*) = 5
+      from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename in (
+         'retention_policies', 'legal_holds', 'erasure_exceptions',
+         'data_subject_requests', 'governance_audit'
+       )
+       and cmd = 'SELECT'
+       and roles @> array['authenticated'::name]
+       and qual like '%is_active_recruiter()%'
+  ),
+  'all 5 governance tables must have is_active_recruiter-gated SELECT policies'
+);
+
+select _policy_tests.assert(
+  'authenticated has no INSERT/UPDATE/DELETE on governance tables',
+  not exists (
+    select 1 from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname in (
+         'retention_policies', 'legal_holds', 'erasure_exceptions',
+         'data_subject_requests', 'governance_audit'
+       )
+       and (has_table_privilege('authenticated', c.oid, 'INSERT')
+         or has_table_privilege('authenticated', c.oid, 'UPDATE')
+         or has_table_privilege('authenticated', c.oid, 'DELETE'))
+  ),
+  'authenticated must be read-only on governance tables'
+);
+
+-- ── 0013: consent_templates ─────────────────────────────────────────
+
+select _policy_tests.assert(
+  'consent_templates has RLS enabled',
+  exists (
+    select 1 from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'consent_templates'
+       and c.relrowsecurity
+  ),
+  'RLS must be enabled on consent_templates'
+);
+
+select _policy_tests.assert(
+  'consent_templates has membership-gated SELECT policy',
+  exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename = 'consent_templates'
+       and cmd = 'SELECT'
+       and roles @> array['authenticated'::name]
+       and qual like '%is_active_recruiter()%'
+  ),
+  'consent_templates must have is_active_recruiter-gated SELECT policy'
+);
+
+select _policy_tests.assert(
+  'authenticated has no INSERT/UPDATE/DELETE on consent_templates',
+  not exists (
+    select 1 from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'consent_templates'
+       and (has_table_privilege('authenticated', c.oid, 'INSERT')
+         or has_table_privilege('authenticated', c.oid, 'UPDATE')
+         or has_table_privilege('authenticated', c.oid, 'DELETE'))
+  ),
+  'authenticated must be read-only on consent_templates'
+);
+
+-- ── Phase 3-5 negative: no anon grant on any new table ──────────────
+
+select _policy_tests.assert(
+  'anon has no privilege on any Phase 3-5 table',
+  not exists (
+    select 1
+      from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname in (
+         'job_queue', 'job_dlq', 'transcript_events', 'outbox',
+         'reconciliation_log', 'quarantined_sessions',
+         'retention_policies', 'legal_holds', 'erasure_exceptions',
+         'data_subject_requests', 'governance_audit', 'consent_templates'
+       )
+       and (has_any_column_privilege('anon', c.oid, 'SELECT,INSERT,UPDATE,REFERENCES')
+         or has_table_privilege('anon', c.oid, 'DELETE,TRUNCATE,TRIGGER'))
+  ),
+  'anon must have zero privileges on all Phase 3-5 tables'
 );
 
 -- ═══════════════════════════════════════════════════════════════════════

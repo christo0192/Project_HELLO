@@ -4,7 +4,7 @@
 
 ---
 
-> **Implementation status (2026-07-30):** GOV-06, OBS-01/OBS-02, TST-07 automation, LLM-06 provenance, and REL-05/REL-06 provider resilience are merged in PRs #14–#18. PR #25 and PR #26 (feat/phase2-supabase-migration-local) are merged to main. All owner decisions (D-001–D-011, FND-05, FND-06) are now recorded as accepted architecture/owner direction. Phase 1 and Phase 2 implementation foundations are complete enough for continued feature development. None are production/go-live accepted. All 0/17 launch gates remain red; all 0/14 roadmap phases remain unaccepted.
+> **Implementation status (2026-07-30):** Queue/outbox, ordered ingestion, reconciliation/fallback, consent/privacy scaffold, governance/DSAR foundations, and metrics/tracing are added in the phase3-5-foundations branch (unmerged). GOV-06, OBS-01/OBS-02, TST-07 automation, LLM-06 provenance, and REL-05/REL-06 provider resilience are merged in PRs #14–#18. PR #25 and PR #26 (feat/phase2-supabase-migration-local) are merged to main. All owner decisions (D-001–D-011, FND-05, FND-06) are now recorded as accepted architecture/owner direction. Phase 1–5 local/synthetic implementation foundations are now available. None are production/go-live accepted. All 0/17 launch gates remain red; all 0/14 roadmap phases remain unaccepted.
 >
 > **BUILD-BLOCKER vs GO-LIVE GATE (2026-07-30):**
 >
@@ -406,6 +406,23 @@ Phase 2 is **not accepted**. PR #25 and PR #26 (feat/phase2-supabase-migration-l
 | **GOV-09** | Publish versioned, accessible privacy notice and candidate/recruiter terms; implement cookie consent only where legally applicable | P0 | Legal + Product | GOV-07 | M | Legal-approved pages are linked before data collection; accepted version is evidenced; withdrawal/contact path works | Revert to prior approved version |
 | **GOV-10** | Separate application/resume lawful basis from AI interview, recording and future outbound-call permissions; remove the current assumption that a job application itself proves all downstream consent | P0 | Legal + Backend + Product | GOV-07, GOV-08 | M | Purpose/consent matrix maps each processing activity to approved basis and evidence; `job_application` alone cannot unlock recording or outbound dialing; withdrawal/expiry tests pass | Disable affected processing purpose |
 
+#### Phase 3 implementation status — 2026-07-30
+
+Phase 3 is **not accepted**. The phase3-5-foundations branch adds local/synthetic governance, consent, DSAR, and privacy-scaffold foundations. Legal-approved copy, hosted deployment, owner/legal review, and production evidence remain pending. Implementation foundations are complete enough for continued feature development. See `docs/data-classification.md`, `docs/adr/0009-governance-field-protection.md`.
+
+| Task | Implementation status | Residual acceptance gate |
+|---|---|---|
+| GOV-01 | `docs/data-classification.md` documents per-column classification. No owner/legal review. | Owner and Legal review |
+| GOV-02 | Not implemented (field encryption pending FND-05). | FND-05, GOV-01; field-encryption threat model |
+| GOV-03 | Synthetic consent-before-join UX scaffold in `CandidateJoinPage.tsx` + `PrivacyNoticePage.tsx`. Consent type enum with `hasConsentFor` refusing `job_application` as sufficient for AI/recording. Consent API routes (submit, status, check, withdraw, templates). Migration 0013 extends `consent_records`. Legal copy is placeholder/unapproved. | FND-05, D-010 (legal consent), Legal-approved copy, hosted deployment |
+| GOV-04 | Synthetic legal-hold CRUD, retention policy CRUD, erasure-exception CRUD, `attemptErasure` with legal-hold blocking, append-only `governance_audit` trail. Migration 0012 creates tables/seeds D-009 retain-default policies. | FND-05, D-009 (retention period), D-010, deployed hold/erasure proof |
+| GOV-05 | Synthetic DSAR CRUD (`createDSAR`, `getDSAR`, `listCandidateDSARs`, `updateDSARStatus`, `exportDSAR`, `deleteDSAR`, `correctDSAR`). Legal-hold blocking with audit trail. Export redacts internal IDs/PII paths. Delete cascades with legal-hold checks. Correct enforces uncorrectable-field list. Routes enforce RBAC (interviewer+/admin) and ownership scoping. | FND-05, D-009, D-010, deployed DSAR lifecycle proof, Legal approval |
+| GOV-06 | **Complete** — synthetic seed merged in PR #14 | Owner review pending |
+| GOV-07 | Not implemented (residency evidence pending FND-08) | FND-08 deployment, vendor residency evidence |
+| GOV-08 | Synthetic consent scaffold (GOV-03 above). Legal-required consent UX pending D-010. | D-010 (legal DPDP consent mechanism) — GO-LIVE gate, not build-blocker |
+| GOV-09 | Join fails without consent (`CandidateJoinPage` gates on `consentStatus !== 'granted'`). Decline state renders blocked message, blocks AI/recording (`hasConsentFor`). Privacy notice page with placeholder copy. | D-010, Legal-approved copy |
+| GOV-10 | `hasConsentFor` refuses `job_application` as sufficient for `ai_interview`/`recording`. `canAccessRecordingData` refuses `job_application` source. Consent API routes are recruiter/authenticated-only (fail-closed). `canAccessRecordingData` enforced in DSAR export. | D-010, deployed consent proof, Legal review |
+
 ---
 
 ### Phase 4: Reliability Engineering (P0)
@@ -422,6 +439,22 @@ Phase 2 is **not accepted**. PR #25 and PR #26 (feat/phase2-supabase-migration-l
 | **REL-08** | On SIGTERM stop accepting work, drain within a configured grace period, persist/flush durable state, safely close or mark active sessions, then terminate; never wait indefinitely to finish a conversational turn | P0 | Backend Eng | REL-02, REL-07 | M | Termination tests at each lifecycle state meet the approved shutdown budget and leave no silent stuck session or unacknowledged job | Roll back deployment; reconciliation repairs state |
 | **REL-09** | Reconcile stuck sessions, orphaned rooms, transcript gaps, missing recordings and overdue scorecards on an owner-approved cadence with alert and safe replay tools | P0 | Backend Eng | REL-02, REL-03, REL-07 | M | Seeded inconsistencies are detected within the SLO and repaired or quarantined with complete audit trail | Pause automated repair and run read-only detection |
 
+#### Phase 4 implementation status — 2026-07-30
+
+Phase 4 is **not accepted**. The phase3-5-foundations branch adds local/synthetic queue, outbox, ordered ingestion, and reconciliation/fallback foundations. No production queue provider is provisioned; all tests use in-memory adapters. Implementation foundations are complete enough for continued feature development.
+
+| Task | Implementation status | Residual acceptance gate |
+|---|---|---|
+| REL-01 | Synthetic L1 queue abstraction (`Queue` class with `IQueueAdapter` seam, `MemoryAdapter`/`PgAdapter`). Idempotent enqueue via `dedupKey`. Migration 0009 creates `job_queue`/`job_dlq` tables + `dequeue_job` RPC with SKIP LOCKED. | FND-06, hosted queue provider (OCI Queue or equiv), deployed proof |
+| REL-02 | `upsertTranscriptEvent` in `outbox.ts` with idempotent upsert (ON CONFLICT DO NOTHING on session_id+turn_index). Migration 0010 creates `transcript_events` and `outbox` tables. | Hosted queue provider, deployed idempotency proof |
+| REL-03 | Transactional outbox pattern: `upsertTranscriptEvent` writes event + pending outbox in one call. `pollOutbox`/`markOutboxEntry` for consumer. `createOutboxEntry` for generic events. Outbox insert failure is non-fatal (event already durable). | Hosted queue provider, deployed at-least-once proof |
+| REL-04 | `Queue.fail()` with exponential backoff + full jitter (`computeBackoffMs`). Retries exhausted → DLQ via `moveToDlq`. `replay` moves DLQ back to pending. `computeBackoffMsDeterministic` for testability. | Hosted queue provider, deployed retry/DLQ proof |
+| REL-05 | Already implemented in PR #18 (circuit breakers, explicit timeouts). | Deployed drills pending |
+| REL-06 | Already implemented in PR #18 (fallback decision tree). | Deployed drills pending |
+| REL-07 | Already implemented in PR #19 (CAS transitions, terminal reasons). | Hosted deployment pending |
+| REL-08 | Already implemented in PR #19 (graceful shutdown). | Hosted deployment pending |
+| REL-09 | Synthetic reconciler (`reconcile()` with 5 detectors, `planRepair`, `executeRepair`). Idempotent via `issue_signature` (ON CONFLICT DO NOTHING). Repair uses CAS-based `transitionSession`. Quarantine via `quarantined_sessions` table (idempotent via unique session_id). Migration 0011 creates tables, RPCs, and grants. | Hosted deployment, SLO-based cadence, alert wiring |
+
 ---
 
 ### Phase 5: Observability (P0)
@@ -437,6 +470,22 @@ Phase 2 is **not accepted**. PR #25 and PR #26 (feat/phase2-supabase-migration-l
 | **OBS-07** | Run synthetic browser calls with synthetic data on a cadence selected from cost, quota and detection-time objectives; measure room → transcript → recording → scorecard | P1 | QA/Backend | OBS-06 | M | Approved schedule is documented; success rate and cost are visible; a seeded failure alerts within the detection SLO | Reduce cadence or disable under change control if vendor cost/abuse risk rises |
 | **OBS-08** | Error budget policy: when budget is exhausted, freeze risky feature deploys and prioritize recovery/reliability according to an approved policy | P1 | Eng Lead | OBS-05 | S | Policy, exception authority and CI/release integration are documented and exercised | N/A |
 | **OBS-09** | Create incident response and breach/privacy escalation runbooks with severity, roles, evidence preservation, vendor contacts, candidate/regulator communication decision points and postmortem process; run a tabletop | P0 | Security + SRE + Legal | OBS-01, OBS-06, SEC-12 | M | Tabletop for auth compromise, PII exposure and provider outage meets response/notification decision SLO; actions are tracked to closure | N/A |
+
+#### Phase 5 implementation status — 2026-07-30
+
+Phase 5 is **not accepted**. The phase3-5-foundations branch adds local/synthetic metrics instrumentation (`metrics.ts`), tracing instrumentation (`tracing.ts`), and incident-response/observability runbooks (`docs/runbooks/`). No external metrics/tracing provider is wired (no Axiom, Datadog, Slack, PagerDuty). PII redaction is defense-in-depth on all metric names/labels and span attributes. SLO/error-budget/alerting are documentation only. Implementation foundations are complete enough for continued feature development.
+
+| Task | Implementation status | Residual acceptance gate |
+|---|---|---|
+| OBS-01 | Already merged in PR #15 (structured logging) + Python `observability.py` with PII redaction. | Hosted deployment, managed log export |
+| OBS-02 | Already merged in PR #15 (correlation ID propagation). | Hosted deployment |
+| OBS-03 | `metrics.ts`: Counter/Gauge/Histogram abstraction with PII redaction on names and labels. No-op by default, Sink-configured for tests. No external provider wired. | Hosted metrics backend, dashboards, deployed proof |
+| OBS-04 | `tracing.ts`: Span-based abstraction with PII redaction on attributes. NoOpTracer by default, TestTracer for tests. No external provider wired. | Hosted tracing backend, deployed waterfall proof |
+| OBS-05 | `docs/runbooks/slo-error-budget.md` — documented SLO/SLI skeleton. No SLO enforced. | Approved SLI/SLO document, error budget dashboard |
+| OBS-06 | `docs/runbooks/incident-response.md` — documented alert runbook skeleton. No alerts wired. | Hosted alerting, triggered alert proof |
+| OBS-07 | Not implemented | Hosted synthetic call schedule |
+| OBS-08 | Not implemented | Approved error budget policy |
+| OBS-09 | `docs/runbooks/incident-response.md` — breach/escalation runbook documented. Tabletop not executed. | Tabletop completion, tracked actions
 
 ---
 

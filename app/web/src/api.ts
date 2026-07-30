@@ -16,6 +16,14 @@ import type {
   CandidateDetail,
   CandidateInviteExchangeResult,
   CandidateInviteResult,
+  ConsentCheckResponse,
+  ConsentSubmitInput,
+  ConsentSubmitResponse,
+  ConsentStatusResponse,
+  ConsentTemplateResponse,
+  ConsentType,
+  ConsentWithdrawInput,
+  ConsentWithdrawResponse,
   HealthResult,
   RecordingDownloadResponse,
   Role,
@@ -99,4 +107,35 @@ export const api = {
   // MIG-06: On-demand recruiter recording download URL
   getRecordingDownloadUrl: (sessionId: string) =>
     request<RecordingDownloadResponse>(`/api/recordings/${sessionId}/download`),
+
+  // ── Consent routes (GOV-03/GOV-08/GOV-09/GOV-10) ─────────────────
+
+  /** Submit consent (accept or decline specific consent types). */
+  submitConsent: (body: ConsentSubmitInput) =>
+    request<ConsentSubmitResponse>('/api/consent/submit', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /** Get candidate's current consent status. */
+  getConsentStatus: (candidateId: string) =>
+    request<ConsentStatusResponse>(`/api/consent/${candidateId}/status`),
+
+  /** Check if candidate has granted required consent types (GOV-10). */
+  checkConsent: (candidateId: string, required: ConsentType[]) =>
+    request<ConsentCheckResponse>('/api/consent/check', {
+      method: 'POST',
+      body: JSON.stringify({ candidate_id: candidateId, required }),
+    }),
+
+  /** Withdraw previously granted consent (GOV-09). */
+  withdrawConsent: (body: ConsentWithdrawInput) =>
+    request<ConsentWithdrawResponse>('/api/consent/withdraw', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /** Get active privacy notice templates (GOV-08). */
+  getConsentTemplates: () =>
+    request<ConsentTemplateResponse[]>('/api/consent/templates'),
 };

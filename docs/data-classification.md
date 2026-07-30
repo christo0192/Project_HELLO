@@ -142,8 +142,30 @@
 | `id` | Public | UUID primary key |
 | `candidate_id` | Public | FK to candidates |
 | `source` | Internal | Consent source string |
-| `proof` | **Confidential PII** | May contain evidence of consent with PII |
+| `version` | Public | GOV-03: Semver consent template version |
+| `consents` | Internal | GOV-03: Array of consent_type enums granted/declined |
+| `status` | Internal | GOV-09: granted, declined, or withdrawn |
+| `proof` | **Confidential PII** | GOV-03: May contain evidence of consent with PII |
+| `expires_at` | Public | GOV-03: Optional consent expiry |
+| `classification_level` | Public | GOV-01: Data classification of this record (default 3) |
+| `ip_address` | Internal | IP address of consent submission |
+| `user_agent` | Internal | User agent of consent submission |
 | `created_at` | Public | Timestamp |
+| `updated_at` | Public | Timestamp |
+
+### `screening_v2.consent_templates`
+
+| Column | Classification | Notes |
+|--------|---------------|-------|
+| `id` | Public | UUID primary key |
+| `version` | Public | GOV-03: Template version string |
+| `locale` | Public | Locale string (e.g. en-IN) |
+| `title` | Internal | Privacy notice title |
+| `body_md` | Internal | GOV-08: Markdown body — NOT Legal-approved placeholder |
+| `required_consents` | Internal | Array of consent types required by this template version |
+| `is_active` | Public | Whether this template is currently active |
+| `created_at` | Public | Timestamp |
+| `updated_at` | Public | Timestamp |
 
 ### `screening_v2.call_queue`
 
@@ -238,15 +260,15 @@
 
 | Level | Count | Examples |
 |-------|-------|----------|
-| Public | 51 | UUIDs, timestamps, booleans, integers, FK references |
-| Internal | 40 | Status strings, JSON scorecards, job descriptions, provider names |
+| Public | 61 | UUIDs, timestamps, booleans, integers, FK references |
+| Internal | 46 | Status strings, JSON scorecards, job descriptions, provider names, consent arrays |
 | Confidential PII | 8 | `name`, `email`, `phone_raw`, `phone_e164`, `text_extracted`, `text`, `body`, `summary`, `proof`, `parsed`, `raw` |
 | Secret | 2 | `token_digest` (candidate_invites and candidate_access_grants) |
 | PENDING legal | 5 | Resume content, transcript text, assessment summary, consent proof, SMS body |
 
 ## Machine verification
 
-All columns in `screening_v2` tables (migrations 0001–0007) are classified above. The export tool (`scripts/migrate-export.mjs`) redacts all Confidential PII and Secret columns in its manifest output. The classification matrix can be automatically verified by scanning canonical column lists defined in `scripts/check-synthetic-seed.mjs` and `scripts/migrate-export.mjs`.
+All columns in `screening_v2` tables (migrations 0001–0013) are classified above. The export tool (`scripts/migrate-export.mjs`) redacts all Confidential PII and Secret columns in its manifest output. The classification matrix can be automatically verified by scanning canonical column lists defined in `scripts/check-synthetic-seed.mjs` and `scripts/migrate-export.mjs`.
 
 ## Gaps and exceptions
 
