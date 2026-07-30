@@ -9,6 +9,10 @@ on:
       - 'scripts/supabase-*.sh'
       - 'docs/runbooks/synthetic-*.md'
       - 'docs/runbooks/supabase-*.md'
+      - 'docs/runbooks/mig-*.md'
+      - 'scripts/migrate-export.test.mjs'
+      - 'scripts/migrate-reconcile.test.mjs'
+      - 'scripts/storage-manifest.test.mjs'
       - '.github/workflows/supabase-*.yml'
   push:
     branches: [main]
@@ -19,6 +23,10 @@ on:
       - 'scripts/supabase-*.sh'
       - 'docs/runbooks/synthetic-*.md'
       - 'docs/runbooks/supabase-*.md'
+      - 'docs/runbooks/mig-*.md'
+      - 'scripts/migrate-export.test.mjs'
+      - 'scripts/migrate-reconcile.test.mjs'
+      - 'scripts/storage-manifest.test.mjs'
       - '.github/workflows/supabase-*.yml'
   workflow_dispatch:
 
@@ -111,3 +119,24 @@ jobs:
         run: node scripts/check-synthetic-seed.mjs
       - name: GOV-06 mutation-based self-tests (zero network)
         run: node scripts/check-synthetic-seed.test.mjs
+
+      # ── WS-B Phase 2 migration tooling (integrated single-PR; fail-closed) ──
+
+      - name: WS-B Validate migrate-export syntax
+        run: node -c scripts/migrate-export.test.mjs
+      - name: WS-B Validate migrate-reconcile syntax
+        run: node -c scripts/migrate-reconcile.test.mjs
+      - name: WS-B Validate storage-manifest syntax
+        run: node -c scripts/storage-manifest.test.mjs
+      - name: WS-B Validate trailing whitespace in mig runbooks
+        run: |
+          if git grep -n -I -E '[[:blank:]]+$' -- docs/runbooks/mig-*.md; then
+            echo 'ERROR: trailing whitespace found in MIG runbooks'
+            exit 1
+          fi
+      - name: WS-B Run migrate-export tests (zero network)
+        run: node scripts/migrate-export.test.mjs
+      - name: WS-B Run migrate-reconcile tests (zero network)
+        run: node scripts/migrate-reconcile.test.mjs
+      - name: WS-B Run storage-manifest tests (zero network)
+        run: node scripts/storage-manifest.test.mjs

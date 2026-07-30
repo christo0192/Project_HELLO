@@ -1,5 +1,22 @@
 # Session Lifecycle Runbook (REL-07 / REL-08)
 
+## Phase 2 implementation context
+
+This runbook reflects the **local-only Phase 2 implementation** on commit
+63f8ba1 (PR25). Key distinctions from any future production state:
+
+| Aspect | Current (Phase 2) | Future production |
+|--------|-------------------|-------------------|
+| Voice provider | **LiveKit** — active, implemented in `livekit.ts` | Same LiveKit, with Pipecat explicitly stale |
+| Pipecat | 🗄️ **Stale** — not a production fallback | Not revived |
+| Recording storage | `recording_object_key` stored; short-TTL signed URL minted on download | Same pattern |
+| `recording_url` column | 🟡 **DEPRECATED** — present in schema, nullable, never written by active code | Removed or frozen |
+| `recording_url` in lifecycle | Referenced below as mutable metadata; this applies to `recording_object_key` in practice | Same |
+| Supabase persistence | Local-only; no hosted project connected | Production Supabase MIG-01+ |
+
+> The `recording_url` reference in the mutable-metadata table below reflects
+> the legacy column name; the active implementation uses `recording_object_key`.
+
 ## State table
 
 | State | Owner | Terminal | Description |
@@ -53,7 +70,9 @@ Transitions are enforced at the DB level by `trg_session_lifecycle` (BEFORE UPDA
 The following lifecycle fields remain mutable even after terminal state is reached:
 - `ended_at` (set during terminalization; can be adjusted if needed)
 - `duration_sec` (can be updated post-hoc)
-- `recording_url` (uploaded async)
+- `recording_object_key` (uploaded async by LiveKit; stored as object key, not signed URL)
+- `recording_url` 🟡 **DEPRECATED** — legacy column, present in schema but never written
+  by active code; all recording references use `recording_object_key`.
 
 `status` and `terminal_reason` are immutable once set to a terminal value.
 

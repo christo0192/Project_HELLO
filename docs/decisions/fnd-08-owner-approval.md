@@ -16,12 +16,7 @@
 
 ## Cost posture
 
-This record adopts a strict **no-cost posture** for all approved internal-engineering decisions:
-
-- Prefer existing local Supabase Docker, browser MediaRecorder/Web Audio API, current LiveKit development path (local agents worker, free-tier dev cloud where already provisioned), and offline/open-source tooling.
-- Do not provision paid cloud tiers or commit to free-tier guarantees as permanent contracts.
-- Do not apply unapproved OCI Terraform scaffolds (`infra/oracle/` — FND-05/FND-06 remain parked/pending; scaffold is unapplied).
-- Do not create new paid accounts or upgrade existing ones for internal engineering.
+This record adopts a strict **no-cost posture** for all approved decisions, leveraging Oracle Cloud Always-Free Mumbai ($0). Prefer existing free tiers (Supabase Free, LiveKit free cloud tier initially, Axiom free tier). Do not provision paid cloud tiers or commit to free-tier guarantees as permanent contracts. Do not create new paid accounts without explicit owner approval.
 
 ---
 
@@ -39,121 +34,121 @@ This record adopts a strict **no-cost posture** for all approved internal-engine
 
 | Field | Value |
 |-------|-------|
-| **Decision** | Supabase Auth |
-| **Status** | **APPROVED FOR INTERNAL ENGINEERING** — BLOCKED FOR PRODUCTION |
-| **Rationale** | Supabase Auth with local Docker (email/password, session management, RLS integration) is zero-cost and sufficient for synthetic browser-only evaluation with dummy recruiters. Production requires MFA enforcement, SSO support, account lifecycle policies, session revocation, audit events, DPA/subprocessor review, and a named operational owner — none of which the sole Product/Engineering owner can unilaterally approve. |
-| **Cost posture** | Local Supabase Docker = zero cost. No cloud Supabase project upgrade. |
-| **Verification trigger** | Internal: recruiter can log in, create synthetic sessions, view synthetic scorecards. |
+| **Decision** | Supabase Auth: email/password + SSO + MFA |
+| **Status** | **Accepted as architecture** (owner-complete direction). ADR-0003 accepted. Not production/go-live accepted. |
+| **Rationale** | Supabase Auth (email/password, SSO, MFA) is the owner-selected architecture. ADR-0003 is accepted as the architectural direction. Production go-live additionally requires named Security Lead, DPA/subprocessor evidence, MFA/SSO/audit enforcement, account lifecycle, session revocation, and operational ownership. |
+| **Cost posture** | Supabase Free tier = $0. No cloud project upgrade. |
+| **Verification trigger** | Owner: architecture direction confirmed. Production: Security Lead assigned, DPA evidence, MFA/SSO/audit enforcement. |
 | **Production-revisit trigger** | Named Security Lead assigned; DPA evidence collected; MFA/SSO/audit requirements documented. |
 
 ### D-002 — Queue/worker platform
 
 | Field | Value |
 |-------|-------|
-| **Decision** | Provider-neutral outbox pattern; OCI Queue direction noted |
-| **Status** | **DEFERRED** |
-| **Rationale** | The current synchronous scoring path (LiveKit worker → API → `claude -p`) is adequate for synthetic evaluation with low concurrency. No durable queue is required until scoring must survive worker restart or scale beyond 1–2 concurrent sessions. OCI Queue remains the technical direction for production but is not actionable while OCI is unprovisioned and no-cost requirement holds. |
-| **Cost posture** | Zero cost — maintain synchronous path. No OCI Queue provisioning. |
-| **Verification trigger** | N/A — deferred. |
-| **Production-revisit trigger** | Concurrency target defined; first scoring durability failure observed; OCI tenancy available. |
+| **Decision** | pg-boss in existing Supabase/Postgres; no new queue infra |
+| **Status** | **Accepted as architecture** (owner-complete direction). ADR-0004 accepted. Not production/go-live accepted. |
+| **Rationale** | Owner selected pg-boss (PostgreSQL-based job queue) running in the existing Supabase Postgres instance. No separate queue infrastructure (OCI Queue, BullMQ+Redis, etc.) is introduced. This keeps cost at $0 (Supabase Free) and operational complexity near zero. Production go-live additionally requires durable outbox pattern, idempotent consumers, retry/backoff/DLQ, and concurrency evidence. |
+| **Cost posture** | Zero cost — reuses existing Supabase Postgres. No additional queue infrastructure. |
+| **Verification trigger** | Owner: architecture direction confirmed. Production: outbox + idempotent consumer tested at concurrency target. |
+| **Production-revisit trigger** | Concurrency target sustained; first scoring durability failure observed; Supabase Free DB limits approached. |
 
 ### D-003 — Cloud provider + region
 
 | Field | Value |
 |-------|-------|
-| **Decision** | OCI (Mumbai/Hyderabad benchmark required for production); all internal = local |
-| **Status** | **DEFERRED** |
-| **Rationale** | Internal engineering runs entirely locally (local Supabase Docker, local LiveKit agents worker). No cloud compute or region selection is needed. The OCI Terraform scaffold remains unapplied (FND-05/FND-06 parked). An owner-approved preliminary Mumbai/Hyderabad synthetic probe with teardown may run for region discovery but is not a priority and does not constitute DEP-01 acceptance. |
-| **Cost posture** | Zero cost — local only. No OCI provisioning. If synthetic probe runs, owner must approve a minimal-cost, short-lived instance with teardown guarantee. |
-| **Verification trigger** | N/A — deferred. |
-| **Production-revisit trigger** | FND-08 residency/data-flow constraints defined; RPO/RTO targets set; named owners assigned; OCI tenancy access confirmed. |
+| **Decision** | Oracle Cloud Always-Free Mumbai, $0 |
+| **Status** | **Accepted as architecture** (owner-complete direction). ADR-0007 accepted. Not production/go-live accepted. |
+| **Rationale** | Owner selected Oracle Cloud Infrastructure Always-Free tier in Mumbai region at $0 cost. This replaces the earlier TBD region with a concrete free-tier commitment. Production go-live additionally requires dep-01 region-latency benchmark, residency/DPA evidence, and provider deployment evidence. |
+| **Cost posture** | Zero cost — OCI Always-Free tier, Mumbai. No paid OCI provisioning. |
+| **Verification trigger** | Owner: architecture direction confirmed. Production: DEP-01 region benchmark, residency/DPA evidence, deployed provider proof. |
+| **Production-revisit trigger** | FND-08 production evidence (residency, RPO/RTO, named owners) completed; DEP-01 benchmark executed. |
 
 ### D-004 — Scoring provider/hosting
 
 | Field | Value |
 |-------|-------|
-| **Decision** | Current `claude -p` CLI for synthetic scoring |
-| **Status** | **APPROVED FOR INTERNAL ENGINEERING** — BLOCKED FOR PRODUCTION |
-| **Rationale** | CLI-based scoring via `claude -p` is zero-cost and adequate for synthetic evaluation with small candidate volumes (single-digit sessions). Production requires an evaluated, compliant API/hosted alternative with contractual evidence, latency bounds, cost model, and DPA — gated behind LLM-03/LLM-04. The sole Product/Engineering owner cannot approve production scoring. |
-| **Cost posture** | No incremental infrastructure spend. Existing Anthropic subscription/quota may be consumed and is not represented as permanently free; evaluation stops when existing quota is unavailable. |
-| **Verification trigger** | Internal: scorecards are generated and stored for synthetic sessions. |
-| **Production-revisit trigger** | LLM-03/LLM-04 evaluation required; independent Security review; contractual terms accepted. |
+| **Decision** | DeepSeek V4 Pro through Ikey self-hosted OpenRouter alternative on fly.io India-only |
+| **Status** | **Accepted as architecture** (owner-complete direction). Replaces `claude -p`. Not production/go-live accepted. In-region self-hosted; no China cross-border; no DeepSeek vendor DPA needed. |
+| **Rationale** | Owner selected DeepSeek V4 Pro self-hosted by Ikey on in-house India infrastructure (fly.io India). Ikey does NOT call DeepSeek's China API — the model runs locally on India infrastructure. Therefore no China cross-border transfer occurs, no DeepSeek third-party vendor DPA is needed, and the D-004 Legal memo is a routine in-region processing documentation item folded into the general DPDP package. Pre-egress stripe name/phone/email is optional GOV-02 defense-in-depth, owner-run, not a hard go-live blocker. Model-license/IP commercial-use check is a minor non-data-protection follow-up. |
+| **Cost posture** | Self-hosted on fly.io India region; DeepSeek model inference cost via Ikey infra. |
+| **Verification trigger** | Owner: architecture direction confirmed. Go-live: no D-004-specific blocker (in-region self-hosted); owners optionally run redaction test as GOV-02 defense-in-depth. |
+| **Production-revisit trigger** | Model-license/IP commercial-use check confirms self-hosted DeepSeek weights use is allowed. Gated behind LLM-03/LLM-04 evaluation suite. |
 
 ### D-005 — LiveKit hosting
 
 | Field | Value |
 |-------|-------|
-| **Decision** | Current LiveKit development path (local agents worker, existing dev cloud project if already provisioned) |
-| **Status** | **APPROVED FOR INTERNAL ENGINEERING** — BLOCKED FOR PRODUCTION |
-| **Rationale** | The LiveKit agents worker runs locally for internal evaluation. A free-tier LiveKit Cloud project may be used if already provisioned with zero additional cost; no new paid accounts or upgrades. Production requires region availability, capacity, Egress support, DPA, and a hosting decision (Cloud vs self-host) — all gated behind FND-08. |
-| **Cost posture** | Local = zero cost. Existing free-tier dev cloud project = zero additional cost. No new LiveKit Cloud account creation. |
-| **Verification trigger** | Internal: synthetic recruiter→candidate conversation completes end-to-end. |
-| **Production-revisit trigger** | FND-08 residency/data-flow constraints defined; LiveKit hosting D-005 formally opened; production concurrency target set. |
+| **Decision** | Self-host LiveKit Mumbai, begin on free cloud tier |
+| **Status** | **Accepted as architecture** (owner-complete direction). Not production/go-live accepted. |
+| **Rationale** | Owner selected self-hosted LiveKit in Mumbai region, beginning with the free cloud tier (LiveKit Cloud free) for initial evaluation. Production go-live additionally requires region availability, capacity, Egress support, DPA, and a hosting decision (Cloud vs self-host) with evidence. |
+| **Cost posture** | LiveKit Cloud free tier = $0 initially. Self-hosted LiveKit on OCI Always-Free eligible if applicable. |
+| **Verification trigger** | Owner: architecture direction confirmed. Production: region-capacity-DPA evidence, self-host or Cloud decision with rationale. |
+| **Production-revisit trigger** | FND-08 production evidence completed; concurrency target exceeds free-tier limits. |
 
 ### D-006 — Backup strategy
 
 | Field | Value |
 |-------|-------|
-| **Decision** | No backup strategy required for internal engineering |
-| **Status** | **DEFERRED** |
-| **Rationale** | Internal engineering uses synthetic data with no durability requirement. Loss of local Supabase data is acceptable. Production requires RPO/RTO definition, PITR verification, and a named owner decision on PITR-only vs PITR + snapshot export — none applicable until production launch is gated. |
-| **Cost posture** | Zero cost. No backup provisioning. |
-| **Verification trigger** | N/A — deferred. |
-| **Production-revisit trigger** | RPO/RTO targets defined; MIG-10 migration rehearsal planned; production Supabase project activated. |
+| **Decision** | Supabase Free only/no PITR; daily custom-format pg_dump → encrypted → Cloudflare R2 via Oracle cron; RPO 24h/RTO 8h target |
+| **Status** | **Accepted as architecture** (owner-complete direction). Not production/go-live accepted. RPO/RTO acceptance only after restore rehearsal. |
+| **Rationale** | Owner selected Supabase Free tier (no PITR) with daily custom-format pg_dump, encrypted, pushed to Cloudflare R2 via Oracle Always-Free cron. Target RPO 24h, RTO 8h. These targets are accepted only after a successful restore rehearsal. This replaces the earlier deferred position. |
+| **Cost posture** | Supabase Free = $0. Cloudflare R2 free tier = $0. Oracle Always-Free cron = $0. |
+| **Verification trigger** | Owner: architecture direction confirmed. Production: RPO/RTO acceptance only after restore rehearsal passes. |
+| **Production-revisit trigger** | RPO/RTO targets defined and rehearsed; MIG-10 migration rehearsal planned; production Supabase project activated. |
 
 ### D-007 — Recording storage
 
 | Field | Value |
 |-------|-------|
-| **Decision** | Browser MediaRecorder + local ephemeral storage for prototype; LiveKit server-side Egress as production candidate |
-| **Status** | **APPROVED FOR INTERNAL ENGINEERING** (browser MediaRecorder only, no-cost prototype) — BLOCKED FOR PRODUCTION |
-| **Rationale** | Browser MediaRecorder with Web Audio API provides a zero-cost capture mechanism for synthetic evaluation. Recordings are ephemeral, stored locally or in-memory, and never represent real candidate data. Production recording requires authenticated streaming upload, server-side Egress evaluation (REC-02), consent linkage, integrity provenance, retention compliance, DPA/region evidence, and Legal approval — all blocked. |
-| **Cost posture** | Zero cost. No storage provisioning. No Supabase Storage bucket creation for recordings. |
-| **Verification trigger** | Internal: synthetic session audio is captured and replayable in local development. |
-| **Production-revisit trigger** | Q-09 recording requirements defined; D-007 formally opened with signed owner; consent/auth/storage/retention/residency/reliability gates cleared. |
+| **Decision** | Cloudflare R2 recording target; begin with Supabase Storage free |
+| **Status** | **Accepted as architecture** (owner-complete direction). Not production/go-live accepted. |
+| **Rationale** | Owner selected Cloudflare R2 as the recording storage target. Begin with Supabase Storage free tier for initial evaluation; migrate to R2 when needed. This replaces the earlier browser-MediaRecorder-only approach. Production go-live additionally requires authenticated streaming upload, server-side Egress evaluation (REC-02), consent linkage, integrity provenance, retention compliance, DPA/region evidence, and Legal approval. |
+| **Cost posture** | Supabase Storage free = $0 initially. Cloudflare R2 free tier = $0. |
+| **Verification trigger** | Owner: architecture direction confirmed. Production: Recordings stored in R2 or Supabase Storage with authenticated access, integrity, retention compliance. |
+| **Production-revisit trigger** | Q-09 recording requirements defined; consent/auth/storage/retention/residency/reliability gates cleared. |
 
 ### D-008 — SIEM/log aggregator
 
 | Field | Value |
 |-------|-------|
-| **Decision** | OCI managed observability (Logging, Monitoring, APM, Notifications) selected as production direction |
-| **Status** | **DEFERRED** |
-| **Rationale** | Internal engineering uses local stdout/stderr logging. No SIEM, log aggregation, or observability stack is required for synthetic evaluation. OCI Observability is noted as the production direction but is not actionable while OCI is unprovisioned. Security-log/SIEM acceptance is a separate process that the sole owner cannot complete. |
-| **Cost posture** | Zero cost. No OCI Observability provisioning. |
-| **Verification trigger** | N/A — deferred. |
-| **Production-revisit trigger** | OCI tenancy available; Security Lead assigned; security-log requirements defined. |
+| **Decision** | Axiom free tier, PII-redacted at emission; US-hosted Legal nod pending |
+| **Status** | **Accepted as architecture** (owner-complete direction). Not production/go-live accepted. US-hosted Legal nod is pending. |
+| **Rationale** | Owner selected Axiom free tier for log aggregation. PII is redacted at emission. Replaces the earlier OCI Observability direction. Production go-live additionally requires a US-hosted Legal nod (acknowledgement that Axiom US hosting is acceptable) and Security Lead sign-off on log coverage. |
+| **Cost posture** | Axiom free tier = $0. |
+| **Verification trigger** | Owner: architecture direction confirmed. Production: PII-redacted emission verified; US-host Legal nod documented; Security Lead sign-off. |
+| **Production-revisit trigger** | US-host Legal nod obtained; Security Lead assigned; log coverage requirements defined. |
 
 ### D-009 — PII retention period
 
 | Field | Value |
 |-------|-------|
-| **Decision** | No PII retention policy applicable (synthetic data only) |
-| **Status** | **BLOCKED FOR PRODUCTION** — deferred for internal engineering |
-| **Rationale** | Internal engineering uses only synthetic, non-identifiable data. No real candidate PII is collected, stored, or processed. A PII retention period is a Legal determination that the sole Product/Engineering owner cannot provide. For internal purposes, no retention schedule is needed. Do not fabricate a retention period. |
-| **Cost posture** | Zero cost. |
-| **Verification trigger** | N/A — blocked until Legal input. |
+| **Decision** | Owner direction: retain by default indefinitely ('store everything, never delete') |
+| **Status** | **Owner direction recorded — NOT Legal-approved retention.** Production blocked until Legal DPDP storage-limitation/lawful-basis document is completed. |
+| **Rationale** | Owner direction is to retain by default indefinitely: recordings/logs to R2/Oracle object storage, transcripts/scores/PII in Supabase then offload to object storage near free cap. This is NOT Legal-approved retention. Legal DPDP storage-limitation/lawful-basis document is in preparation and gates go-live. Valid erasure requests MUST still delete via GOV-04/GOV-05; this must never be rewritten as literal no-deletion. |
+| **Cost posture** | Object storage costs for indefinite retention; Supabase Free 500MB/1GB limits constrain primary storage. |
+| **Verification trigger** | Owner direction recorded. Production: Legal DPDP storage-limitation document completed and signed. |
 | **Production-revisit trigger** | Legal Counsel assigned; DPDP applicability assessment complete; retention period documented and signed. |
 
 ### D-010 — DPDP consent mechanism
 
 | Field | Value |
 |-------|-------|
-| **Decision** | No consent mechanism applicable (synthetic data only) |
-| **Status** | **BLOCKED FOR PRODUCTION** — deferred for internal engineering |
-| **Rationale** | Internal engineering uses synthetic, non-identifiable data with no consent requirement. A DPDP consent mechanism is a Legal determination that the sole Product/Engineering owner cannot provide. Do not fabricate a consent flow or DPDP assessment. |
-| **Cost posture** | Zero cost. |
-| **Verification trigger** | N/A — blocked until Legal input. |
+| **Decision** | Owner direction: combined consent; includes AI interviewer, recording, purpose, processors (in-region), retention summary, rights, decline |
+| **Status** | **Owner direction recorded — NOT Legal-approved consent.** Legal confirmation pending. Grievance mechanism marked possible DPDP gap. |
+| **Rationale** | Owner direction specifies combined consent: approved notice content includes AI interviewer, recording, purpose, processors (all in-region India except Axiom US for redacted operational logs), retention summary, candidate rights, and ability to decline. Legal confirmation of this approach is pending. Grievance mechanism is noted as a possible DPDP gap. Job-portal consent only counts if the portal notice specifically discloses AI interview, recording, purposes, India-hosted processors, and any actual non-India processing if applicable (GOV-10 assumption). Axiom US-hosted REDACTED operational logs are a separate D-008 Legal-nod question; generic application consent is NOT sufficient. |
+| **Cost posture** | Implementation cost for consent UI/flows; zero incremental infra cost. |
+| **Verification trigger** | Owner direction recorded. Production: Legal Confirmation; GOV-08/GOV-09/GOV-10 implemented and tested. |
 | **Production-revisit trigger** | Legal Counsel assigned; DPDP applicability assessment complete; consent mechanism defined and signed. |
 
 ### D-011 — Tenancy model
 
 | Field | Value |
 |-------|-------|
-| **Decision** | Single-organization launch model |
-| **Status** | **APPROVED FOR INTERNAL ENGINEERING** — BLOCKED FOR PRODUCTION |
-| **Rationale** | Single-org tenancy is sufficient for synthetic evaluation with dummy recruiters and synthetic candidates. The merged membership-gated RLS baseline (PR #9) provides an adequate local seam. Production requires a signed D-011 decision with complete authorization matrix, representative RLS/Realtime/storage tests, migration impact assessment, and named organization administration — all gated behind formal owner approval from all four roles. |
-| **Cost posture** | Zero cost. Local Supabase Docker with existing RLS policies. |
-| **Verification trigger** | Internal: synthetic recruiter sees only their synthetic sessions; no cross-recruiter data leak in local testing. |
+| **Decision** | Single-org IK India, admin/interviewer/viewer, no org_id |
+| **Status** | **Accepted as architecture** (owner-complete direction). ADR-0005 accepted. Not production/go-live accepted. |
+| **Rationale** | Owner selected single-org tenancy model for Interview Kickstart India, with admin/interviewer/viewer roles and no org_id field. The merged membership-gated RLS baseline (PR #9) provides the local implementation. Production additionally requires a complete authorization matrix, representative RLS/Realtime/storage tests, migration impact assessment, and named organization administration. |
+| **Cost posture** | Zero cost. Supabase Free with existing RLS policies. |
+| **Verification trigger** | Owner: architecture direction confirmed. Production: full authorization matrix documented; cross-recruiter isolation tests pass. |
 | **Production-revisit trigger** | Named Product Manager and Security Lead assigned; full authorization matrix documented; multi-tenancy requirements (if any) defined. |
 
 ---
@@ -182,22 +177,26 @@ All of the above remain **explicitly blocked** and require separate signed recor
 
 ## FND-05 / FND-06 status
 
-FND-05 (approved secret manager/KMS and runtime secret injection) and FND-06 (least-privilege service identities) remain **parked/pending**. The existing `infra/oracle/` Terraform provides only partial Vault/KMS and IAM scaffolding and remains unapplied. No OCI resources have been provisioned, and no OCI tenancy access has been confirmed.
+FND-05 (secret manager): owner selected self-hosted Infisical on Oracle Mumbai ($0), runtime injection/sync to fly.io/Vercel/GitHub Actions, rotation/audit, no persistent production .env. **Selection is complete; deployment/security evidence pending.**
+
+FND-06 (service identities): owner selected distinct least-privilege identities for AI worker/API/web build/CI-CD/scoring worker; remove service_role from all clients. **Selection is complete; execution blocked on deployed FND-05.**
+
+Both are accepted as architecture/owner direction. Neither is production/go-live accepted. The existing `infra/oracle/` Terraform scaffold (Vault/KMS/IAM) is superseded by the Infisical selection; the scaffold may still inform architecture but will not be applied as-is.
 
 ---
 
 ## ADR cross-reference
 
-| ADR | Title | Owner-Approval Status | ADR Status Remains |
-|-----|-------|-----------------------|--------------------|
+| ADR | Title | Owner-Approval Status | ADR Status |
+|-----|-------|-----------------------|------------|
 | ADR-0002 | Current voice and model runtime | Internal engineering runtime confirmed | Accepted (no change) |
-| ADR-0003 | Recruiter authentication provider | Internal engineering: APPROVED. Production: BLOCKED. | Proposed (no change) |
-| ADR-0004 | Durable post-session job queue | DEFERRED — not needed for internal engineering | Proposed (no change) |
-| ADR-0005 | Launch tenancy model | Internal engineering: APPROVED. Production: BLOCKED. | Proposed (no change) |
-| ADR-0006 | Recording capture and storage | Internal engineering: APPROVED (browser MediaRecorder only). Production: BLOCKED. | Proposed (no change) |
-| ADR-0007 | Production deployment and region | DEFERRED — all internal is local | Proposed (no change) |
+| ADR-0003 | Recruiter authentication provider | **Accepted as architecture** (owner-complete). Production not accepted. | **Accepted** (updated) |
+| ADR-0004 | Durable post-session job queue | **Accepted as architecture** (owner-complete: pg-boss). Production not accepted. | **Accepted** (updated) |
+| ADR-0005 | Launch tenancy model | **Accepted as architecture** (owner-complete: single-org IK India). Production not accepted. | **Accepted** (updated) |
+| ADR-0006 | Recording capture and storage | **Accepted as architecture** (owner-complete: Cloudflare R2 target, Supabase Storage free start). Production not accepted. | **Accepted** (updated) |
+| ADR-0007 | Production deployment and region | **Accepted as architecture** (owner-complete: OCI Always-Free Mumbai). Production not accepted. | **Accepted** (updated) |
 
-No new ADR is required for this sole-owner decision. The ADR format remains valid and cross-references are consistent.
+All six ADRs are now accepted as architecture/owner direction. None are production/go-live accepted.
 
 ---
 
@@ -209,17 +208,18 @@ No new ADR is required for this sole-owner decision. The ADR format remains vali
 | Files created | `docs/decisions/fnd-08-owner-approval.md` |
 | Files updated | `docs/decisions/fnd-08-inputs.md`, ADR-0003, ADR-0004, ADR-0005, ADR-0006, ADR-0007 |
 | ADRs created | 0 |
-| ADRs modified | 5 (cross-reference and owner-approval links only) |
-| Decisions approved for internal engineering | D-001, D-004, D-005, D-007 (browser MediaRecorder only), D-011 |
-| Decisions deferred | D-002, D-003, D-006, D-008 |
-| Decisions blocked for production explicitly | D-009, D-010 (+ all D-items for production) |
-| Production blockers unchanged | All items listed in `fnd-08-inputs.md` § "Missing — Blocks FND-08 Acceptance" remain unresolved |
+| ADRs modified | 6 (all updated to Accepted as architecture) |
+| Decisions accepted as architecture | D-001 (Supabase Auth), D-002 (pg-boss), D-003 (OCI Always-Free Mumbai), D-004 (DeepSeek V4 Pro via Ikey), D-005 (self-host LiveKit Mumbai), D-006 (pg_dump→R2, RPO24h/RTO8h), D-007 (R2 target, start Supabase Storage), D-008 (Axiom), D-011 (single-org IK India) |
+| Owner direction recorded (NOT Legal-approved) | D-009 (retain indefinitely), D-010 (combined consent) |
+| FND-05/FND-06 | Selected (Infisical + least-privilege identities); deployment/execution pending |
+| Production blockers unchanged | All D-items and Legal/Security/residency evidence per `fnd-08-inputs.md` § "Missing — Blocks FND-08 Acceptance" remain unresolved |
 
 ## Residual risks
 
-1. **No independent Security review** — every approved internal decision lacks Security Lead sign-off. A Security finding later may invalidate internal engineering assumptions.
-2. **No Legal input on data classification** — synthetic-only posture is self-declared. If real candidate data is introduced accidentally, no retention, consent, or DPDP framework exists.
-3. **LiveKit free-tier instability** — if a LiveKit Cloud dev project is used, the free tier may change terms or availability without notice. No-cost posture means no SLA.
-4. **Browser MediaRecorder quality** — browser capture is adequate for prototype but may miss audio segments or produce inconsistent formats. This is acceptable for synthetic evaluation but does not inform production recording quality.
-5. **OCI scaffold drift** — unapplied `infra/oracle/` Terraform may become stale relative to Supabase schema or application requirements. A refresh review will be needed before any apply.
-6. **Memory is advisory** — the scoped repair recalled five entries, but repository evidence and the owner's explicit confirmation remain authoritative.
+1. **No independent Security review** — every accepted architecture decision lacks Security Lead sign-off. A Security finding later may invalidate architectural assumptions.
+2. **No Legal input on data classification/retention** — D-009 owner direction (indefinite retention) is NOT Legal-approved. If real candidate data is introduced accidentally, no approved retention, consent, or DPDP framework exists.
+3. **Redaction test optional** — Pre-egress name/phone/email stripping is optional GOV-02 defense-in-depth, owner-run, not a hard go-live blocker. Model-license/IP commercial-use check for self-hosted DeepSeek weights is a minor non-data-protection follow-up.
+4. **Supabase Free constraints** — no PITR, 500MB DB/1GB storage, ~7-day inactivity pause, 2 active projects/org (sequential old/new/rehearsal). These bound all architecture decisions.
+5. **Infisical not deployed** — FND-05 selection is complete but deployment/security evidence is pending, blocking FND-06 and all dependent production work.
+6. **Axiom US-host Legal nod pending** — log aggregation direction is accepted but US hosting requires Legal acknowledgement.
+7. **Memory is advisory** — the scoped repair recalled five entries, but repository evidence and the owner's explicit confirmation remain authoritative.

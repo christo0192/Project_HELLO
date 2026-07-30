@@ -34,6 +34,40 @@ supabase_cli db reset
 # above confirms seed auto-apply.  Any "already applied" messages for
 # seed INSERTs confirm the ON CONFLICT DO NOTHING guard.
 
+# ===================================================================
+# MIG-03: Local drift/diff proof — verify schema matches migrations
+# ===================================================================
+log 'MIG-03: Running local schema drift check (supabase db diff)...'
+# Compare the local database schema against the committed migration files.
+# On a clean database the pinned CLI still prints informational output
+# ("No schema changes found" plus a JSON summary whose "diff" field is "").
+# Drift must therefore be detected from the actual diff PAYLOAD, not from the
+# mere presence of output — otherwise a clean run is misread as drift.
+#
+# This is a LOCAL-ONLY check against an ephemeral container.  It does NOT
+# touch any hosted or production database.
+if supabase_cli db diff --use-pg-delta --schema public,screening_v2 > /tmp/supabase-diff-output.txt 2>&1; then
+  # Clean signals emitted by the pinned CLI when the schema matches migrations.
+  if grep -qiE 'no schema changes found|"diff"[[:space:]]*:[[:space:]]*""' /tmp/supabase-diff-output.txt; then
+    log 'MIG-03: PASS — No schema drift. Local database matches migrations.'
+  else
+    log 'MIG-03: FAIL — Schema drift detected. Unexpected diff output follows:'
+    cat /tmp/supabase-diff-output.txt
+    log 'MIG-03: This means the local database schema differs from the committed'
+    log 'MIG-03: migrations. Possible causes: manual DDL, uncommitted migration'
+    log 'MIG-03: changes, or shadow-database corruption. Run supabase db reset'
+    log 'MIG-03: to restore parity, then investigate the root cause.'
+    exit 1
+  fi
+else
+  # CLI does not support --use-pg-delta (e.g., older version, or the pg-delta
+  # engine is not available on this platform).  This is a documented opt-out;
+  # it does NOT indicate a pass or fail for the drift check.
+  log 'MIG-03: SKIPPED — supabase db diff --use-pg-delta unavailable'
+  log "MIG-03: Reason: $(cat /tmp/supabase-diff-output.txt 2>/dev/null || echo 'non-zero exit from CLI')"
+fi
+rm -f /tmp/supabase-diff-output.txt
+
 log 'GOV-06: Verifying seed was auto-applied by db reset (proving config.toml wired seed)...'
 # This is empty-seed-scenario proof: if db reset did NOT auto-apply the seed,
 # the expected GOV-06 rows will be missing.  Check one canonical row per table.

@@ -1,22 +1,13 @@
 # ADR-0005: Launch tenancy model
 
-**Status:** Proposed
+**Status:** Accepted
 
-**Direction confirmed (2026-07-28):** Single-organization launch selected as
-technical direction. No multi-tenant `org_id` isolation required for launch;
-does not permanently ban future multi-tenancy. The merged membership-gated RLS
-baseline (PR #9) provides a production-safe local seam, but full app
-authentication, API authorization, RBAC, storage authorization, and hosted role
-configuration are still pending. Formal
-owner approval and evidence pending. This is a selected direction, not
-stakeholder sign-off, and does not constitute FND-08 acceptance.
+**Decision owner:** christo0192 (repository owner / sole Product/Engineering owner)
 
-**Decision owner:** Engineering Lead and Product Manager (unassigned)
-
-**Owner-approval update (2026-07-29):** The sole Product/Engineering owner has
-approved the single-org tenancy model for internal synthetic browser-only
-evaluation under a no-cost posture. Production tenancy remains BLOCKED FOR
-PRODUCTION. See
+**Owner direction (2026-07-30):** The sole Product/Engineering owner has accepted
+the single-org tenancy model for Interview Kickstart India, with
+admin/interviewer/viewer roles and no org_id field. ADR-0005 is accepted as
+architecture. See
 [`docs/decisions/fnd-08-owner-approval.md`](../decisions/fnd-08-owner-approval.md).
 
 **Plan references:** D-011, FND-08, SEC-03, MIG-03, MIG-04
@@ -33,11 +24,11 @@ remain pending (SEC-01 through SEC-04, MIG-05, MIG-06).
 
 ## Decision
 
-Proceed with the single-organization launch technical direction. No multi-tenant
-`org_id` isolation is required for launch; this does not permanently ban future
-multi-tenancy. Formal acceptance still requires signed owner approval, a
-complete authorization matrix, representative RLS/Realtime/storage tests,
-migration impact assessment, and a named organization administration process.
+Single-org IK India, admin/interviewer/viewer roles, no org_id. This decision
+accepts the architectural direction but does not authorize production
+implementation. Production go-live additionally requires: complete authorization
+matrix, representative RLS/Realtime/storage tests, migration impact assessment,
+and named organization administration process.
 
 ## Consequences
 
@@ -47,10 +38,12 @@ test surface before a product requirement exists.
 
 ## Evidence
 
-Required before acceptance: signed D-011 decision, ownership model, authorization
-matrix, representative RLS/Realtime/storage tests, migration impact, and named
-organization administration process.
+Owner direction recorded in `docs/decisions/fnd-08-owner-approval.md`. ADR-0005
+accepted as architecture. Production go-live additionally requires: signed D-011
+decision, ownership model, authorization matrix, representative
+RLS/Realtime/storage tests, migration impact, and named organization
+administration process.
 
 ## Supersession
 
-None. Update this ADR to Accepted only when D-011 receives approval.
+None. Production acceptance is a separate gate.

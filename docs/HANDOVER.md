@@ -1,8 +1,8 @@
 # Project Handover
 
-**Last updated:** 2026-07-30
+**Last updated:** 2026-07-30 (owner decisions reconciled)
 
-**Current baseline:** `main` through PR #24 (`bf35b58`); the Phase 1 security-core implementation is on `feat/phase1-security-core` pending owner review.
+**Current baseline:** `main` through PR #25 (`63f8ba1`, Phase 1 security-core); the Phase 2 Supabase migration foundations are on `feat/phase2-supabase-migration-local` pending owner review.
 
 **Repository:** `https://github.com/christo0192/Project_HELLO`
 
@@ -13,11 +13,11 @@
 **Current-state manifest:** [`config/current-state.json`](../config/current-state.json)
 (automated drift checks enforce consistency)
 
-**Implementation status:** Partial — Phase 0 closure PRs #20–#24 are merged, and the Phase 1 branch implements local/synthetic auth, RBAC, ownership, invites, rate limits, audit foundations, metadata minimization and resume defenses. External/production acceptance remains pending; 0/17 launch gates complete and 0/14 roadmap phases are accepted.
+**Implementation status:** Partial — Phase 0 closure PRs #20–#24 are merged; Phase 1 security-core merged as PR #25 (`63f8ba1`) implementing local/synthetic auth, RBAC, ownership, invites, rate limits, audit foundations, metadata minimization and resume defenses. The Phase 2 branch adds local/synthetic Supabase migration foundations (schema hardening `0008`, RLS matrix, recruiter recording-download route, export/reconcile/storage tooling, and migration runbooks). External/production acceptance remains pending; 0/17 launch gates complete and 0/14 roadmap phases are accepted.
 
 ## Baseline
 
-PR #24 was squash-merged to `main` as `bf35b58` on 2026-07-29. PR #19 was previously squash-merged as `0c06fc0`. Phase 0 and Phase 1 implementation/evidence do not alter production acceptance without authentic external evidence.
+PR #25 (Phase 1 security-core) was squash-merged to `main` as `63f8ba1`; PR #24 was squash-merged as `bf35b58` on 2026-07-29; PR #19 was previously squash-merged as `0c06fc0`. Phase 0, Phase 1 and Phase 2 implementation/evidence do not alter production acceptance without authentic external evidence.
 
 ## Resume Here
 
@@ -34,9 +34,9 @@ cat docs/HANDOVER.md
 | Metric | Value |
 |--------|-------|
 | Completed launch gates | 0/17 — Foundation, Security and production acceptance criteria remain externally unverified |
-| Implementation coverage | Phase 1 local/synthetic foundations exist on `feat/phase1-security-core`; strict acceptance is separate |
-| Integrated baseline | `bf35b58` (PR #24) |
-| Main state | PRs #1–#24 merged; Phase 1 implementation PR pending owner review |
+| Implementation coverage | Phase 1 merged (PR #25); Phase 2 local/synthetic migration foundations exist on `feat/phase2-supabase-migration-local`; strict acceptance is separate |
+| Integrated baseline | `63f8ba1` (PR #25) |
+| Main state | PRs #1–#25 merged; Phase 2 implementation PR pending owner review |
 
 > **Note:** The 25% completion figure sometimes seen in earlier summaries is NOT claimed. Zero launch gates are confirmed complete. Implementation coverage and acceptance verification are distinct gates.
 
@@ -80,7 +80,7 @@ satisfy external or production acceptance.
 | FND-05 | Partial unapplied OCI Vault/KMS scaffold exists | **Parked/pending** by owner; no approved secret manager/runtime injection |
 | FND-06 | Partial unapplied OCI IAM scaffold exists | **Parked/pending** by owner; no deployed least-privilege service identities |
 | FND-07 | Seven ADRs merged in PR #2 | Implementation complete; individual production decisions retain their own gates |
-| FND-08 | PR #22 records sole-owner internal-engineering decisions for D-001–D-011 | Internal synthetic engineering only; production Legal/Security/residency/RPO/RTO evidence remains blocked |
+| FND-08 | PR #22 and this PR #26 record owner decisions for D-001–D-011, FND-05, FND-06. All accepted as architecture/owner direction; none production/go-live accepted. | Internal synthetic engineering only; production Legal/Security/residency/RPO/RTO evidence remains blocked |
 | FND-09 | Current-state manifest and deterministic drift gate implemented in this PR | Complete only after this PR is merged and its CI is green |
 
 ## OBS-01/OBS-02 Status (code merged in PR #15; deployed acceptance pending)
@@ -145,11 +145,11 @@ Most remaining P0 tasks in `PLAN.md` Phases 1–12 remain open. The most urgent 
 1. **FND-02 credential rotation**: An authorized account owner must rotate every provider credential listed in `docs/security/credential-inventory.md` and provide non-secret revocation evidence. Deleting local `.env` files does not count.
 2. **FND-01 branch protection**: Requires a GitHub plan upgrade or equivalent control approved by the repository owner. Documented rules are not enforced.
 3. **FND-03 disposition**: Ground-up replacements are in PR #23; originals still require restricted-storage disposition and owner evidence.
-4. **FND-05/FND-06**: Secret management and service identities are explicitly parked; production engineering depending on them remains blocked.
-5. **FND-08 production inputs**: Sole-owner internal directions are in PR #22, but independent Legal/Security, residency, production RPO/RTO, retention, and vendor evidence remain unresolved.
+4. **FND-05/FND-06**: Secret management (Infisical selected) and service identities (selected); deployment/execution remains pending. Production engineering depending on them remains blocked until deployment.
+5. **FND-08 production inputs**: Owner decisions (D-001–D-011, FND-05, FND-06) are now recorded as accepted architecture/owner direction. Independent Legal/Security, residency, production RPO/RTO, retention, and vendor evidence remain unresolved and production-blocked.
 
-D-001 and D-011 are approved only for internal synthetic engineering. Production
-authentication, tenancy, and authorization acceptance retains the named security,
+D-001 through D-011 and FND-05/FND-06 are accepted as architecture/owner direction only. Production
+authentication, tenancy, authorization, and all production acceptance retains the named security,
 privacy, migration, and deployment gates in `PLAN.md`.
 
 Highest-risk residual gaps:

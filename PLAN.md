@@ -4,7 +4,7 @@
 
 ---
 
-> **Implementation status (2026-07-29):** GOV-06, OBS-01/OBS-02, TST-07 automation, LLM-06 provenance, and REL-05/REL-06 provider resilience are merged in PRs #14–#18. Branch `feat/rel-07-08-session-lifecycle` implements session lifecycle and graceful-shutdown scaffolding. These implementations do **not** close production reliability acceptance: REL-09 reconciliation, durable scoring, deployed signal-drain/provider proof, live SDK/room evidence, owner approvals, and all launch gates remain pending.
+> **Implementation status (2026-07-30):** GOV-06, OBS-01/OBS-02, TST-07 automation, LLM-06 provenance, and REL-05/REL-06 provider resilience are merged in PRs #14–#18. Branch `feat/rel-07-08-session-lifecycle` implements session lifecycle and graceful-shutdown scaffolding. PR #26 (feat/phase2-supabase-migration-local) adds migration foundations. All owner decisions (D-001–D-011, FND-05, FND-06) are now recorded as accepted architecture/owner direction. None are production/go-live accepted. All 0/17 launch gates remain red; all 0/14 roadmap phases remain unaccepted.
 
 ---
 
@@ -346,6 +346,30 @@ Phase 1 is **not accepted**. The local/synthetic implementation wave adds the se
 | **MIG-13** | Execute cutover under change control: block new calls, finalize data/object sync, reconcile, switch configuration, deploy, run E2E smoke call, then reopen traffic with enhanced monitoring | P0 | Eng Lead + DB Admin | MIG-11, MIG-12 | M | Signed no-data-loss report; reads/writes/realtime/recording/scoring use only new project; P0 monitors remain green through observation window | Stop new traffic, restore old configuration, reconcile any new-project writes back under the tested rollback runbook |
 | **MIG-14** | Maintain a time-bounded rollback window in which the old project and credentials remain intact but tightly access-controlled; define how writes made after cutover are reversed or reconciled | P0 | Eng Lead + DB Admin | MIG-13 | S | Go/no-go owner closes rollback only after the configured stability window and reconciliation pass; rollback drill demonstrates bounded data recovery | Execute MIG-13 rollback procedure |
 | **MIG-15** | After rollback closes, revoke old keys, export/archive or delete data according to Legal retention, remove integrations, and decommission the old project with dual approval | P1 | Security + DB Admin + Legal | MIG-14, GOV-04 | S | Dependency scan shows zero old-project traffic; old credentials fail; archive/deletion evidence and approval are retained | Decommission is irreversible; restore only from approved archive if legally permitted |
+
+#### Phase 2 implementation status — 2026-07-30
+
+Phase 2 is **not accepted**. This local/synthetic wave adds migration-foundation code, tooling and runbooks only. No hosted Supabase project is created, no migration is applied to any hosted project, and no production, backup, residency or independent-Security evidence exists. All MIGRATION/BACKUP/SECURITY launch gates remain **red**. See `docs/runbooks/supabase-migration-strategy.md`, `docs/runbooks/mig-export-reconcile.md`, `docs/runbooks/mig-cutover-rehearsal.md`, `docs/runbooks/mig-rollback-window.md`, `docs/runbooks/mig-decommission.md` and `docs/data-classification.md`.
+
+| Task | Implementation status | Residual acceptance gate (external evidence, NOT obtained) |
+|---|---|---|
+| MIG-01 | Not implemented (hosted) | Company-controlled project, region/backup evidence, 2 MFA admins, break-glass — blocked on FND-08 |
+| MIG-02 | Not implemented (hosted) | Least-privilege org access review; unauthorized-account test — blocked on MIG-01 |
+| MIG-03 | Local: `0008` hardening + ephemeral `db diff` drift proof in `supabase-test.sh` | Hosted fresh-build + schema-diff evidence |
+| MIG-04 | Local: `0008` completes the membership-gated RLS matrix (consent/queue/SMS/ATS/resume reads) with least-privilege policy tests (+693 assertions) | Production RLS proof, FND-06 service identities, D-011 residency/tenancy approval |
+| MIG-05 | Local: publication-membership + RLS-enabled + no-anon assertions for the 3 dashboard tables | Hosted Realtime RLS enforcement and websocket-authz E2E proof |
+| MIG-06 | Local: recruiter authorized-download route (bearer+AAL2+RBAC+ownership, bounded TTL, no durable URL, audited), `recording_url` NULL-guard CHECK, on-demand web fetch | Hosted private-bucket + live signed-URL TTL/revocation proof |
+| MIG-07 | Local: deterministic export-manifest tooling (schema version, counts, canonical digests, allowlists, PII redaction) on fixtures | GOV-01 doc, live `--db` mode, encrypted-artifact implementation, hosted export |
+| MIG-08 | Local: reconcile tooling (counts/digests, FK/orphan, relational smoke) on fixtures | Hosted isolated rehearsal project + signed reconciliation |
+| MIG-09 | Local: storage manifest/verify tooling (key/size/content-type/digest, symlink-safe) on fixtures | Hosted stream-copy + destination verification |
+| MIG-10 | Local: rehearsal runbook only | Signed production-volume rehearsal meeting RTO/RPO |
+| MIG-11 | Local: consistency-strategy design only | Rehearsal proving no omitted writes |
+| MIG-12 | Not implemented (hosted) | Secret-manager credential deploy — blocked on FND-05 (parked) |
+| MIG-13 | Not implemented (hosted) | Signed no-data-loss cutover — blocked on MIG-11/12 |
+| MIG-14 | Not implemented (hosted) | Bounded rollback-window drill — blocked on MIG-13 |
+| MIG-15 | Local: decommission runbook only | Dual-approval decommission + Legal retention evidence |
+
+**Unresolved Phase 2 blockers (owner/external):** FND-08 owner inputs/architecture are complete but independent production evidence (residency, RPO/RTO, named-owner sign-off) remains; FND-05 Infisical selected but undeployed; FND-06 least-privilege identities selected but execution waits on deployed FND-05; SEC-03/D-011 single-org approved but hosted authorization proof remains; GOV-01 data-classification acceptance; D-004 no longer a hard go-live blocker (in-region self-hosted; redaction test optional GOV-02; model-license/IP check minor follow-up); D-009 retention period and D-010 DPDP consent (primary Legal gate); D-008 Axiom US-host Legal nod (parallel). Supabase Free constraints (no PITR/24h backup granularity; 2 active projects/org → old/new/rehearsal must be sequential; 500MB DB / 1GB storage; ~7-day inactivity pause) further bound MIG-06/07/08/10.
 
 ---
 
@@ -1001,7 +1025,7 @@ The names below are inventory only. **Observed** means the current code/example 
 | Sarvam | Production account, DPA/subprocessors/retention review, quotas/support and STT/TTS quality/rate evidence | Backend + Legal |
 | Anthropic | Current provider production account, DPA/retention/region evidence, limits and billing guardrails | Backend + Legal |
 | Google (future) | Only after evaluation: approved Vertex/Gemini account and contractual/technical region evidence; a generic API key is not residency proof | Backend + Legal |
-| DeepSeek/alternative scoring (future) | Only after evaluation and cross-border/DPA/hosting review; API versus approved hosted deployment remains open | Backend + Legal |
+| DeepSeek V4 Pro (current architecture) | Self-hosted by Ikey on in-house India infrastructure; no cross-border; no DPA needed. Model-license/IP commercial-use check minor follow-up. Alternative scoring providers: only after evaluation and DPA/hosting review. | Backend (current); +Legal (future alternatives) |
 | Auth provider | MFA and lifecycle provisioning; SSO if selected; security/DPA review | Infra + Backend |
 | Cloud/queue/observability | Approved compute, secret manager/KMS, durable queue, logs/metrics/traces and support plan | Infra + Security |
 | Telephony provider (future) | Selected only after voice-specific Legal/carrier validation, India route/number, SIP security, DPA, fraud and cost review | Infra + Legal |

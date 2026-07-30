@@ -9,6 +9,7 @@ import { screeningRouter } from './routes/screening.js';
 import { assessRouter } from './routes/assess.js';
 import { livekitRouter } from './routes/livekit.js';
 import { invitesRouter } from './routes/invites.js';
+import { recordingsRouter } from './routes/recordings.js';
 import { cspReportRouter } from './routes/csp.js';
 import {
   malformedJsonHandler,
@@ -233,6 +234,7 @@ export function createApp(opts: CreateAppOptions = {}) {
   app.use('/api/assess', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'assess:', useUserKey: true }));
   app.use('/api/resumes', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'resumes:', useUserKey: true }));
   app.use('/api/livekit', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'livekit:', useUserKey: true }));
+  app.use('/api/recordings', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'recordings:', useUserKey: true }));
 
   // Public: health endpoint (no auth)
   app.get('/api/health', (_req, res) => res.json({ ok: true, model: env.claudeModel }));
@@ -256,6 +258,7 @@ export function createApp(opts: CreateAppOptions = {}) {
   app.use('/api/screening', screeningRouter);
   app.use('/api/livekit', invitesRouter);
   app.use('/api/livekit', livekitRouter);
+  app.use('/api/recordings', recordingsRouter);
   app.use('/api/assess', assessRouter);
 
   // ── 401/403/429 error paths still carry existing headers (CORS/CSP) ─

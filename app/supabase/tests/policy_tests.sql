@@ -112,7 +112,11 @@ select _policy_tests.assert(
 select _policy_tests.assert(
   'dashboard policies invoke membership helper',
   (
-    select count(*) = 6
+    -- 6 Phase-1 policies (scoped roles/candidates/call_sessions, active
+    -- transcript_turns/assessments, recruiter read audit_events) plus the
+    -- 5 membership-gated reads added by migration 0008 (consent_records,
+    -- call_queue, sms_follow_ups, ats_sync_log, resumes) = 11.
+    select count(*) = 11
       from pg_policies
      where schemaname = 'screening_v2'
        and cmd = 'SELECT'
@@ -123,7 +127,7 @@ select _policy_tests.assert(
          or policyname like 'recruiter read audit_events'
        )
   ),
-  'all six dashboard SELECT policies must be gated by active recruiter membership'
+  'all eleven dashboard SELECT policies must be gated by active recruiter membership'
 );
 
 -- Seed synthetic identities/data to exercise effective RLS, never candidate data.
@@ -2011,7 +2015,698 @@ select _policy_tests.assert(
 );
 
 -- ═══════════════════════════════════════════════════════════════════════
--- Verdict (includes all Phase 1 tests above)
+-- Phase 2 WS-A (0008): recording_url deprecation, RLS matrix,
+--                       Realtime publication, local-reset guards
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- ── MIG-03/04/05: recording_url must always be NULL ────────────────────
+
+select _policy_tests.assert(
+  'recording_url column still exists (not dropped)',
+  exists (
+    select 1 from information_schema.columns
+     where table_schema = 'screening_v2'
+       and table_name = 'call_sessions'
+       and column_name = 'recording_url'
+  ),
+  'recording_url must still exist (deprecated, not dropped)'
+);
+
+select _policy_tests.assert(
+  'recording_url CHECK constraint forces IS NULL',
+  exists (
+    select 1 from pg_constraint
+     where conrelid = 'screening_v2.call_sessions'::regclass
+       and conname = 'chk_call_sessions_recording_url_null'
+       and contype = 'c'
+       and convalidated
+  ),
+  'chk_call_sessions_recording_url_null must be a validated CHECK'
+);
+
+select _policy_tests.assert(
+  'recording_url constraint definition requires IS NULL',
+  (
+    select pg_get_constraintdef(oid)
+      from pg_constraint
+     where conname = 'chk_call_sessions_recording_url_null'
+       and conrelid = 'screening_v2.call_sessions'::regclass
+  ) ilike '%recording_url is null%',
+  'constraint definition must contain recording_url IS NULL'
+);
+
+select _policy_tests.assert(
+  'no durable URL column exists on call_sessions',
+  not exists (
+    select 1 from information_schema.columns
+     where table_schema = 'screening_v2'
+       and table_name = 'call_sessions'
+       and column_name in (
+         'recording_signed_url', 'recording_presigned_url',
+         'recording_url_ttl', 'recording_download_url'
+       )
+  ),
+  'no signed/presigned/signed URL column may exist on call_sessions'
+);
+
+select _policy_tests.assert(
+  'recording_object_key preserved (not dropped by 0008)',
+  exists (
+    select 1 from information_schema.columns
+     where table_schema = 'screening_v2'
+       and table_name = 'call_sessions'
+       and column_name = 'recording_object_key'
+  ),
+  'recording_object_key must still exist after 0008'
+);
+
+select _policy_tests.assert(
+  'recordings_v2 bucket is NOT public',
+  not exists (
+    select 1 from storage.buckets
+     where id = 'recordings_v2' and public = true
+  ),
+  'recordings_v2 bucket must remain private'
+);
+
+select _policy_tests.assert(
+  'recordings_v2 has no browser policy',
+  not exists (
+    select 1 from pg_policies
+     where schemaname = 'storage'
+       and tablename = 'objects'
+       and roles && array['anon'::name, 'authenticated'::name, 'public'::name]
+       and (qual ilike '%recordings_v2%' or with_check ilike '%recordings_v2%')
+  ),
+  'no browser-role storage policies may exist for recordings_v2'
+);
+
+-- ── RLS matrix: service-role / backend identity assertions ─────────────
+
+select _policy_tests.assert(
+  'service_role has ALL on all screening_v2 tables',
+  (
+    -- Check a representative sample of tables; the grant is schema-level
+    -- from migration 0001.
+    select count(*) = 6
+      from (
+        select has_table_privilege('service_role',
+          'screening_v2.consent_records'::regclass, 'SELECT,INSERT,UPDATE,DELETE') as ok
+        union all
+        select has_table_privilege('service_role',
+          'screening_v2.call_queue'::regclass, 'SELECT,INSERT,UPDATE,DELETE')
+        union all
+        select has_table_privilege('service_role',
+          'screening_v2.sms_follow_ups'::regclass, 'SELECT,INSERT,UPDATE,DELETE')
+        union all
+        select has_table_privilege('service_role',
+          'screening_v2.ats_sync_log'::regclass, 'SELECT,INSERT,UPDATE,DELETE')
+        union all
+        select has_table_privilege('service_role',
+          'screening_v2.resumes'::regclass, 'SELECT,INSERT,UPDATE,DELETE')
+        union all
+        select has_table_privilege('service_role',
+          'screening_v2.candidate_invites'::regclass, 'SELECT,INSERT,UPDATE,DELETE')
+      ) as checks
+     where checks.ok
+  ),
+  'service_role must have full access to all screening_v2 tables'
+);
+
+select _policy_tests.assert(
+  'authenticated has no INSERT/UPDATE/DELETE on consent_records',
+  not exists (
+    select 1 from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'consent_records'
+       and (has_table_privilege('authenticated', c.oid, 'INSERT')
+         or has_table_privilege('authenticated', c.oid, 'UPDATE')
+         or has_table_privilege('authenticated', c.oid, 'DELETE'))
+  ),
+  'authenticated must be read-only on consent_records'
+);
+
+select _policy_tests.assert(
+  'authenticated has no INSERT/UPDATE/DELETE on call_queue',
+  not exists (
+    select 1 from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'call_queue'
+       and (has_table_privilege('authenticated', c.oid, 'INSERT')
+         or has_table_privilege('authenticated', c.oid, 'UPDATE')
+         or has_table_privilege('authenticated', c.oid, 'DELETE'))
+  ),
+  'authenticated must be read-only on call_queue'
+);
+
+select _policy_tests.assert(
+  'authenticated has no INSERT/UPDATE/DELETE on sms_follow_ups',
+  not exists (
+    select 1 from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'sms_follow_ups'
+       and (has_table_privilege('authenticated', c.oid, 'INSERT')
+         or has_table_privilege('authenticated', c.oid, 'UPDATE')
+         or has_table_privilege('authenticated', c.oid, 'DELETE'))
+  ),
+  'authenticated must be read-only on sms_follow_ups'
+);
+
+select _policy_tests.assert(
+  'authenticated has no INSERT/UPDATE/DELETE on ats_sync_log',
+  not exists (
+    select 1 from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'ats_sync_log'
+       and (has_table_privilege('authenticated', c.oid, 'INSERT')
+         or has_table_privilege('authenticated', c.oid, 'UPDATE')
+         or has_table_privilege('authenticated', c.oid, 'DELETE'))
+  ),
+  'authenticated must be read-only on ats_sync_log'
+);
+
+-- ── RLS matrix: policy coverage for all screening_v2 tables ────────────
+
+-- consent_records, call_queue, sms_follow_ups, ats_sync_log, resumes
+-- each need an active-recruiter-gated SELECT policy.
+
+select _policy_tests.assert(
+  'consent_records has active recruiter read policy',
+  exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename = 'consent_records'
+       and policyname = 'active recruiter read consent_records'
+       and cmd = 'SELECT'
+  ),
+  'consent_records must have membership-gated SELECT policy'
+);
+
+select _policy_tests.assert(
+  'call_queue has active recruiter read policy',
+  exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename = 'call_queue'
+       and policyname = 'active recruiter read call_queue'
+       and cmd = 'SELECT'
+  ),
+  'call_queue must have membership-gated SELECT policy'
+);
+
+select _policy_tests.assert(
+  'sms_follow_ups has active recruiter read policy',
+  exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename = 'sms_follow_ups'
+       and policyname = 'active recruiter read sms_follow_ups'
+       and cmd = 'SELECT'
+  ),
+  'sms_follow_ups must have membership-gated SELECT policy'
+);
+
+select _policy_tests.assert(
+  'ats_sync_log has active recruiter read policy',
+  exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename = 'ats_sync_log'
+       and policyname = 'active recruiter read ats_sync_log'
+       and cmd = 'SELECT'
+  ),
+  'ats_sync_log must have membership-gated SELECT policy'
+);
+
+select _policy_tests.assert(
+  'resumes has active recruiter read policy',
+  exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename = 'resumes'
+       and policyname = 'active recruiter read resumes'
+       and cmd = 'SELECT'
+  ),
+  'resumes must have membership-gated SELECT policy'
+);
+
+-- ── INVARIANT: no USING(true) or WITH CHECK(true) policies exist ───────
+
+select _policy_tests.assert(
+  'no policy uses USING(true)',
+  not exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and (qual = 'true' or qual = 'true::boolean' or qual ilike '%using(true)%')
+  ),
+  'USING(true) would bypass all RLS -- forbidden'
+);
+
+select _policy_tests.assert(
+  'no policy uses WITH CHECK(true)',
+  not exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and (with_check = 'true' or with_check = 'true::boolean' or with_check ilike '%with check(true)%')
+  ),
+  'WITH CHECK(true) would bypass all RLS write checks -- forbidden'
+);
+
+-- ── INVARIANT: SECURITY DEFINER functions have fixed search_path ───────
+
+select _policy_tests.assert(
+  'is_active_recruiter has fixed search_path=pg_catalog',
+  exists (
+    select 1
+      from pg_proc p
+      join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname = 'is_active_recruiter'
+       and p.prosecdef
+       and p.proconfig @> array['search_path=pg_catalog']
+  ),
+  'is_active_recruiter must be SECURITY DEFINER with search_path=pg_catalog'
+);
+
+select _policy_tests.assert(
+  'recruiter_role has fixed search_path=pg_catalog',
+  exists (
+    select 1
+      from pg_proc p
+      join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname = 'recruiter_role'
+       and p.prosecdef
+       and p.proconfig @> array['search_path=pg_catalog']
+  ),
+  'recruiter_role must be SECURITY DEFINER with search_path=pg_catalog'
+);
+
+select _policy_tests.assert(
+  '_is_admin_or_viewer has fixed search_path=pg_catalog',
+  exists (
+    select 1
+      from pg_proc p
+      join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname = '_is_admin_or_viewer'
+       and p.prosecdef
+       and p.proconfig @> array['search_path=pg_catalog']
+  ),
+  '_is_admin_or_viewer must be SECURITY DEFINER with search_path=pg_catalog'
+);
+
+select _policy_tests.assert(
+  '_is_interviewer has fixed search_path=pg_catalog',
+  exists (
+    select 1
+      from pg_proc p
+      join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname = '_is_interviewer'
+       and p.prosecdef
+       and p.proconfig @> array['search_path=pg_catalog']
+  ),
+  '_is_interviewer must be SECURITY DEFINER with search_path=pg_catalog'
+);
+
+-- ── INVARIANT: anon/PUBLIC cannot execute SECURITY DEFINER functions ────
+
+select _policy_tests.assert(
+  'anon cannot execute is_active_recruiter',
+  not exists (
+    select 1 from pg_proc p
+     join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname = 'is_active_recruiter'
+       and has_function_privilege('anon', p.oid, 'EXECUTE')
+  ),
+  'anon must not be able to execute is_active_recruiter'
+);
+
+select _policy_tests.assert(
+  'public cannot execute is_active_recruiter',
+  not exists (
+    select 1 from pg_proc p
+     join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname = 'is_active_recruiter'
+       and has_function_privilege('public', p.oid, 'EXECUTE')
+  ),
+  'public must not be able to execute is_active_recruiter'
+);
+
+select _policy_tests.assert(
+  'anon cannot execute recruiter_role',
+  not exists (
+    select 1 from pg_proc p
+     join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname = 'recruiter_role'
+       and has_function_privilege('anon', p.oid, 'EXECUTE')
+  ),
+  'anon must not be able to execute recruiter_role'
+);
+
+select _policy_tests.assert(
+  'public cannot execute recruiter_role',
+  not exists (
+    select 1 from pg_proc p
+     join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname = 'recruiter_role'
+       and has_function_privilege('public', p.oid, 'EXECUTE')
+  ),
+  'public must not be able to execute recruiter_role'
+);
+
+select _policy_tests.assert(
+  'anon cannot execute valid_model_provenance',
+  not exists (
+    select 1 from pg_proc p
+     join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname = 'valid_model_provenance'
+       and has_function_privilege('anon', p.oid, 'EXECUTE')
+  ),
+  'anon must not be able to execute valid_model_provenance'
+);
+
+select _policy_tests.assert(
+  'authenticated cannot execute valid_model_provenance',
+  not exists (
+    select 1 from pg_proc p
+     join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname = 'valid_model_provenance'
+       and has_function_privilege('authenticated', p.oid, 'EXECUTE')
+  ),
+  'authenticated must not be able to execute valid_model_provenance'
+);
+
+-- ── Membership/consumer assertions ─────────────────────────────────────
+
+select _policy_tests.assert(
+  'recruiter_memberships RLS is enabled',
+  exists (
+    select 1 from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'recruiter_memberships'
+       and c.relrowsecurity
+  ),
+  'RLS must be enabled on recruiter_memberships'
+);
+
+select _policy_tests.assert(
+  'recruiter_memberships has self-scoped SELECT policy',
+  exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename = 'recruiter_memberships'
+       and cmd = 'SELECT'
+  ),
+  'recruiter_memberships must have a SELECT policy (user sees own membership)'
+);
+
+select _policy_tests.assert(
+  'authenticated can SELECT on recruiter_memberships',
+  has_table_privilege('authenticated',
+    'screening_v2.recruiter_memberships'::regclass, 'SELECT'),
+  'authenticated must have SELECT grant on recruiter_memberships'
+);
+
+-- ── Realtime publication assertions ────────────────────────────────────
+
+select _policy_tests.assert(
+  'Realtime publication exists',
+  exists (
+    select 1 from pg_publication where pubname = 'supabase_realtime'
+  ),
+  'supabase_realtime publication must exist'
+);
+
+select _policy_tests.assert(
+  'Realtime publication contains only 3 expected screening_v2 tables',
+  (
+    select count(*) = 3
+      from pg_publication_tables
+     where pubname = 'supabase_realtime'
+       and schemaname = 'screening_v2'
+       and tablename in ('call_sessions', 'transcript_turns', 'assessments')
+  )
+  and not exists (
+    select 1 from pg_publication_tables
+     where pubname = 'supabase_realtime'
+       and schemaname = 'screening_v2'
+       and tablename not in ('call_sessions', 'transcript_turns', 'assessments')
+  ),
+  'only call_sessions, transcript_turns, and assessments may be in supabase_realtime'
+);
+
+select _policy_tests.assert(
+  'Realtime published tables have RLS enabled',
+  not exists (
+    select 1 from pg_publication_tables pt
+     join pg_class c on c.relname = pt.tablename
+     join pg_namespace n on n.oid = c.relnamespace
+                     and n.nspname = pt.schemaname
+     where pt.pubname = 'supabase_realtime'
+       and pt.schemaname = 'screening_v2'
+       and not c.relrowsecurity
+  ),
+  'every Realtime-published table must have RLS enabled'
+);
+
+select _policy_tests.assert(
+  'Realtime published tables have no anon/PUBLIC policies',
+  not exists (
+    select 1 from pg_publication_tables pt
+     join pg_policies p on p.tablename = pt.tablename
+                      and p.schemaname = pt.schemaname
+     where pt.pubname = 'supabase_realtime'
+       and pt.schemaname = 'screening_v2'
+       and p.roles && array['anon'::name, 'public'::name]
+  ),
+  'no Realtime-published table may have an anon/PUBLIC policy'
+);
+
+-- Honest local limitation: we can verify publication membership and RLS
+-- policies locally, but we CANNOT prove that the hosted Supabase Realtime
+-- server correctly enforces RLS or that websocket authorization works.
+-- Those are platform-level guarantees that require end-to-end testing.
+
+-- ── Single-org D-011 posture preservation ─────────────────────────────
+
+select _policy_tests.assert(
+  'no org_id column exists on any screening_v2 table',
+  not exists (
+    select 1 from information_schema.columns
+     where table_schema = 'screening_v2'
+       and column_name = 'org_id'
+  ),
+  'org_id must not exist -- single-org D-011 posture requires no tenant column'
+);
+
+select _policy_tests.assert(
+  'no organization_id column exists on any screening_v2 table',
+  not exists (
+    select 1 from information_schema.columns
+     where table_schema = 'screening_v2'
+       and column_name = 'organization_id'
+  ),
+  'organization_id must not exist -- single-org D-011 posture'
+);
+
+select _policy_tests.assert(
+  'no tenant_id column exists on any screening_v2 table',
+  not exists (
+    select 1 from information_schema.columns
+     where table_schema = 'screening_v2'
+       and column_name = 'tenant_id'
+  ),
+  'tenant_id must not exist -- single-org D-011 posture'
+);
+
+-- ── Adversarial: forbidden recording_url persistence (live) ────────────
+
+do $$
+declare
+  v_candidate_id uuid;
+  v_session_id uuid;
+  insert_rejected boolean := false;
+  update_rejected boolean := false;
+begin
+  select id into v_candidate_id from screening_v2.candidates limit 1;
+
+  if v_candidate_id is null then
+    insert into _policy_tests.results(test, passed, detail) values
+      ('INSERT with non-null recording_url is rejected (live)', true,
+       'skipped: no candidate row available'),
+      ('UPDATE to set recording_url is rejected (live)', true,
+       'skipped: no candidate row available');
+    return;
+  end if;
+
+  -- Create a minimal session with status 'created' (the only INSERT-allowed state).
+  insert into screening_v2.call_sessions
+    (candidate_id, mode, status)
+  values (v_candidate_id, 'simulation', 'created')
+  returning id into v_session_id;
+
+  -- Attempt to INSERT a row with non-null recording_url (must fail).
+  begin
+    insert into screening_v2.call_sessions
+      (candidate_id, mode, status, recording_url)
+    values (v_candidate_id, 'simulation', 'created', 'https://example.invalid/recording.mp3');
+  exception when check_violation or raise_exception then
+    insert_rejected := true;
+  end;
+
+  -- Attempt to UPDATE recording_url to non-null on existing row (must fail).
+  if v_session_id is not null then
+    begin
+      update screening_v2.call_sessions
+         set recording_url = 'https://example.invalid/recording.mp3'
+       where id = v_session_id;
+    exception when check_violation or raise_exception then
+      update_rejected := true;
+    end;
+
+    -- Clean up.
+    delete from screening_v2.call_sessions where id = v_session_id;
+  end if;
+
+  insert into _policy_tests.results(test, passed, detail) values
+    ('INSERT with non-null recording_url is rejected (live)',
+     insert_rejected,
+     case when insert_rejected then null
+          else 'INSERT with recording_url was allowed by constraint' end),
+    ('UPDATE to set recording_url is rejected (live)',
+     update_rejected,
+     case when update_rejected then null
+          else 'UPDATE setting recording_url was allowed by constraint' end);
+end;
+$$;
+
+-- ── Adversarial: no broad browser writes (negative privilege test) ────
+
+select _policy_tests.assert(
+  'authenticated has no INSERT on any screening_v2 user-facing table',
+  not exists (
+    select 1 from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relkind in ('r', 'p')
+       and c.relname not in ('recruiter_memberships')
+       and has_table_privilege('authenticated', c.oid, 'INSERT')
+  ),
+  'authenticated must have zero INSERT grants on user-facing tables'
+);
+
+select _policy_tests.assert(
+  'authenticated has no UPDATE on any screening_v2 user-facing table',
+  not exists (
+    select 1 from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relkind in ('r', 'p')
+       and c.relname not in ('recruiter_memberships')
+       and has_table_privilege('authenticated', c.oid, 'UPDATE')
+  ),
+  'authenticated must have zero UPDATE grants on user-facing tables'
+);
+
+select _policy_tests.assert(
+  'authenticated has no DELETE on any screening_v2 table',
+  not exists (
+    select 1 from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relkind in ('r', 'p')
+       and has_table_privilege('authenticated', c.oid, 'DELETE')
+  ),
+  'authenticated must have zero DELETE grants on all screening_v2 tables'
+);
+
+-- ── Adversarial: candidate_invites/grants remain server-only ───────────
+
+select _policy_tests.assert(
+  'no authenticated policy on candidate_invites',
+  not exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename = 'candidate_invites'
+       and 'authenticated' = any(roles)
+  ),
+  'candidate_invites must have zero authenticated policies (server-only)'
+);
+
+select _policy_tests.assert(
+  'no authenticated policy on candidate_access_grants',
+  not exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename = 'candidate_access_grants'
+       and 'authenticated' = any(roles)
+  ),
+  'candidate_access_grants must have zero authenticated policies (server-only)'
+);
+
+-- ── Local reset / idempotency guard (schema-only, no hosted command) ───
+
+select _policy_tests.assert(
+  'all 0008 policies are properly named with spaces',
+  (
+    select count(*) = 5
+      from pg_policies
+     where schemaname = 'screening_v2'
+       and cmd = 'SELECT'
+       and policyname in (
+         'active recruiter read consent_records',
+         'active recruiter read call_queue',
+         'active recruiter read sms_follow_ups',
+         'active recruiter read ats_sync_log',
+         'active recruiter read resumes'
+       )
+  ),
+  'all five new Phase 2 SELECT policies must exist with exact names'
+);
+
+-- Verify the full policy count (baseline + new).
+-- Baseline Phase 1 policies (migration 0007):
+--   scoped recruiter read roles (1)
+--   scoped recruiter read candidates (1)
+--   scoped recruiter read call_sessions (1)
+--   active recruiter read transcript_turns (1)
+--   active recruiter read assessments (1)
+--   recruiter read audit_events (1)
+--   recruiter read own membership (1) [on recruiter_memberships]
+-- Phase 2 additions (migration 0008):
+--   active recruiter read consent_records (1)
+--   active recruiter read call_queue (1)
+--   active recruiter read sms_follow_ups (1)
+--   active recruiter read ats_sync_log (1)
+--   active recruiter read resumes (1)
+-- Total expected: 12
+
+select _policy_tests.assert(
+  'expected total screening_v2 SELECT policy count is 12',
+  (
+    select count(*) = 12
+      from pg_policies
+     where schemaname = 'screening_v2'
+       and cmd = 'SELECT'
+  ),
+  'expected exactly 12 SELECT policies as of migration 0008'
+);
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)
 -- ═══════════════════════════════════════════════════════════════════════
 
 select test, case when passed then 'PASS' else 'FAIL' end as result, detail

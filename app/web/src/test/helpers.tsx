@@ -62,6 +62,8 @@ export function createMockApi() {
     turn: vi.fn().mockResolvedValue({ message: 'Thanks!', done: false, assessment: null }),
     getSession: vi.fn().mockRejectedValue(new Error('not mocked')),
     assess: vi.fn().mockResolvedValue({}),
+    // MIG-06: On-demand recording download
+    getRecordingDownloadUrl: vi.fn().mockResolvedValue({ url: 'https://example.com/recording' }),
   };
 }
 

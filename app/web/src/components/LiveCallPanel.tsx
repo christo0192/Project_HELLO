@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { supabase } from "../lib/supabase";
+import { api, ApiError } from "../api";
 import { Scorecard } from "./Scorecard";
 import { Card } from "./ui";
 import type { Assessment, Recommendation } from "../types";
@@ -15,6 +16,7 @@ interface CallSession {
   started_at: string | null;
   ended_at: string | null;
   duration_sec: number | null;
+  /** @deprecated MIG-03/04/05 — use on-demand getRecordingDownloadUrl() */
   recording_url?: string | null;
 }
 
@@ -309,24 +311,8 @@ export function LiveCallPanel({
         </div>
       )}
 
-      {/* Call recording, populated after the call ends */}
-      {session?.recording_url && (
-        <div className="border-t border-gray-200 p-4">
-          <h3 className="mb-2 text-sm font-semibold text-gray-900">
-            Call recording
-          </h3>
-          <audio
-            controls
-            preload="none"
-            src={session.recording_url}
-            className="h-9 w-full"
-          >
-            <a href={session.recording_url} target="_blank" rel="noreferrer">
-              Download recording
-            </a>
-          </audio>
-        </div>
-      )}
+      {/* Call recording: on-demand signed URL via MIG-06 (never fetch on list render) */}
+      <RecordingDownloadSection sessionId={session?.id ?? null} status={status} />
 
       {/* Assessment: skeleton while post-call scoring runs, then the scorecard */}
       {assessment ? (
@@ -375,5 +361,109 @@ export function LiveCallPanel({
         </div>
       ) : null}
     </Card>
+  );
+}
+
+/* ---------------- Recording download (MIG-06) ---------------- */
+
+interface RecordingDownloadSectionProps {
+  sessionId: string | null;
+  status: string | null;
+}
+
+/**
+ * On-demand recording access (MIG-06). Fetches a short-TTL signed URL via
+ * GET /api/recordings/:sessionId/download ONLY when the recruiter explicitly
+ * clicks — never on render/mount. This avoids minting a signed URL and an
+ * access audit event for recordings the recruiter never asked to view.
+ *
+ * Handles loading, error, unmount/race (stale responses ignored via a
+ * generation counter), and URL expiry (a "Refresh link" re-mints a fresh URL).
+ */
+function RecordingDownloadSection({ sessionId, status }: RecordingDownloadSectionProps) {
+  const [recordingUrl, setRecordingUrl] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const mountedRef = useRef(true);
+  const reqIdRef = useRef(0);
+
+  const isCompleted = status === "completed";
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  // Discard any loaded URL (and invalidate in-flight fetches) when the
+  // session or its status changes. No fetch is triggered here.
+  useEffect(() => {
+    reqIdRef.current += 1;
+    setRecordingUrl(null);
+    setError(null);
+    setLoading(false);
+  }, [sessionId, isCompleted]);
+
+  const fetchUrl = useCallback(() => {
+    if (!sessionId || !isCompleted) return;
+    const reqId = ++reqIdRef.current;
+    setLoading(true);
+    setError(null);
+    api
+      .getRecordingDownloadUrl(sessionId)
+      .then((res) => {
+        if (!mountedRef.current || reqId !== reqIdRef.current) return;
+        setRecordingUrl(res.url);
+        setLoading(false);
+      })
+      .catch((e: ApiError) => {
+        if (!mountedRef.current || reqId !== reqIdRef.current) return;
+        setError(e.message || "Failed to load recording");
+        setLoading(false);
+      });
+  }, [sessionId, isCompleted]);
+
+  if (!sessionId || !isCompleted) return null;
+
+  return (
+    <div className="border-t border-gray-200 p-4">
+      <h3 className="mb-2 text-sm font-semibold text-gray-900">
+        Call recording
+      </h3>
+      {!recordingUrl && (
+        <button
+          type="button"
+          onClick={fetchUrl}
+          disabled={loading}
+          className="rounded bg-accent-600 px-3 py-1 text-xs font-medium text-white hover:bg-accent-700 disabled:opacity-50"
+        >
+          {loading ? "Loading…" : "Load recording"}
+        </button>
+      )}
+      {error && <p className="mt-2 text-sm text-red-600">{error}</p>}
+      {recordingUrl && !loading && (
+        <div className="space-y-1">
+          <audio
+            controls
+            preload="none"
+            src={recordingUrl}
+            className="h-9 w-full"
+          >
+            <a href={recordingUrl} target="_blank" rel="noreferrer">
+              Download recording
+            </a>
+          </audio>
+          <button
+            type="button"
+            onClick={fetchUrl}
+            className="text-xs font-medium text-accent-600 hover:text-accent-700"
+          >
+            Refresh link
+          </button>
+        </div>
+      )}
+    </div>
   );
 }

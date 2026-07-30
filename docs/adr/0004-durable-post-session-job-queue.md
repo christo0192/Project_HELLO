@@ -1,17 +1,13 @@
 # ADR-0004: Durable post-session job queue
 
-**Status:** Proposed
+**Status:** Accepted
 
-**Direction confirmed (2026-07-28):** OCI Queue selected as technical direction
-with OCI Logging, Monitoring, APM, and Notifications for observability. Formal
-owner approval and evidence pending. This is a selected direction, not
-stakeholder sign-off, and does not constitute FND-08 acceptance.
+**Decision owner:** christo0192 (repository owner / sole Product/Engineering owner)
 
-**Decision owner:** Engineering Lead (unassigned)
-
-**Owner-approval update (2026-07-29):** The sole Product/Engineering owner has
-DEFERRED this decision for internal engineering. The synchronous scoring path is
-adequate for synthetic evaluation. See
+**Owner direction (2026-07-30):** The sole Product/Engineering owner has selected
+pg-boss (PostgreSQL-based job queue) in the existing Supabase/Postgres instance.
+No separate queue infrastructure (OCI Queue, BullMQ+Redis, etc.) is introduced.
+ADR-0004 is accepted as architecture. See
 [`docs/decisions/fnd-08-owner-approval.md`](../decisions/fnd-08-owner-approval.md).
 
 **Plan references:** D-002, REL-01, REL-02, REL-03
@@ -24,34 +20,32 @@ the scorecard, and retries can duplicate side effects. Production requires a
 transactional outbox, idempotent consumers, retry/backoff, dead-letter handling,
 replay, and backlog observability.
 
-**Direction (2026-07-28):** OCI Queue (with OCI Logging, Monitoring, APM, and
-Notifications) has been selected as the technical direction. Formal owner
-approval, failure-injection prototype, and evidence are pending. See
-`docs/decisions/fnd-08-inputs.md`.
+**Owner direction (2026-07-30):** pg-boss in existing Supabase Postgres selected.
+No new queue infrastructure. ADR-0004 accepted as architecture.
 
 ## Decision
 
-Do not commit to a final queue implementation until D-002 receives formal owner
-approval. The OCI Queue direction informs architecture planning and the
-foundation Terraform scaffold, but does not authorize production implementation.
-The application contract remains provider-neutral: a durable session transition
-writes an outbox event, and an idempotent scoring consumer owns the assessment
-side effect. Benchmark OCI Queue against workload identity, ordering needs,
-delayed retries, DLQ and replay support, local testability, regional
-availability, cost, and operator burden before acceptance.
+pg-boss (PostgreSQL job queue) running in the existing Supabase/Postgres instance
+is the selected queue architecture. This decision accepts the architectural
+direction but does not authorize production implementation. Production go-live
+additionally requires: durable outbox pattern, idempotent consumers,
+retry/backoff/DLQ implementation, failure-injection prototype, backlog metrics,
+and recovery runbook.
 
 ## Consequences
 
 Scoring remains prototype-only until the queue and outbox are implemented.
-Keeping the contract provider-neutral reduces lock-in but adds an adapter and
-integration-test boundary.
+No new queue infrastructure (OCI Queue, BullMQ+Redis) is introduced, keeping
+cost and operational complexity near zero.
 
 ## Evidence
 
-Required before acceptance: decision matrix, failure-injection prototype,
-idempotency test, retry/DLQ/replay demonstration, backlog metrics, regional and
-cost evidence, and recovery runbook.
+Owner direction recorded in `docs/decisions/fnd-08-owner-approval.md`. ADR-0004
+accepted as architecture. Production go-live additionally requires: decision
+matrix, failure-injection prototype, idempotency test, retry/DLQ/replay
+demonstration, backlog metrics, regional and cost evidence, and recovery
+runbook.
 
 ## Supersession
 
-None. Update this ADR to Accepted only when D-002 receives approval.
+None. Production acceptance is a separate gate.
