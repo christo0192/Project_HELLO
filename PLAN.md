@@ -369,7 +369,7 @@ Phase 2 is **not accepted**. This local/synthetic wave adds migration-foundation
 | MIG-14 | Not implemented (hosted) | Bounded rollback-window drill — blocked on MIG-13 |
 | MIG-15 | Local: decommission runbook only | Dual-approval decommission + Legal retention evidence |
 
-**Unresolved Phase 2 blockers (owner/external):** FND-08 production inputs (residency, RPO/RTO, named owners); FND-05 secret manager (parked); FND-06 service identities (parked); SEC-03/D-011 production tenancy approval; GOV-01 data-classification acceptance; D-004 redactor test + Legal memo + DeepSeek DPA (conditionally blocked); D-009 retention period and D-010 DPDP consent (open, pending Legal). Supabase Free constraints (no PITR/24h backup granularity; 2 active projects/org → old/new/rehearsal must be sequential; 500MB DB / 1GB storage; ~7-day inactivity pause) further bound MIG-06/07/08/10.
+**Unresolved Phase 2 blockers (owner/external):** FND-08 production inputs (residency, RPO/RTO, named owners); FND-05 secret manager (parked); FND-06 service identities (parked); SEC-03/D-011 production tenancy approval; GOV-01 data-classification acceptance; D-004 no longer a hard go-live blocker (in-region self-hosted; redaction test optional GOV-02; model-license/IP check minor follow-up); D-009 retention period and D-010 DPDP consent (primary Legal gate); D-008 Axiom US-host Legal nod (parallel). Supabase Free constraints (no PITR/24h backup granularity; 2 active projects/org → old/new/rehearsal must be sequential; 500MB DB / 1GB storage; ~7-day inactivity pause) further bound MIG-06/07/08/10.
 
 ---
 
@@ -1025,7 +1025,7 @@ The names below are inventory only. **Observed** means the current code/example 
 | Sarvam | Production account, DPA/subprocessors/retention review, quotas/support and STT/TTS quality/rate evidence | Backend + Legal |
 | Anthropic | Current provider production account, DPA/retention/region evidence, limits and billing guardrails | Backend + Legal |
 | Google (future) | Only after evaluation: approved Vertex/Gemini account and contractual/technical region evidence; a generic API key is not residency proof | Backend + Legal |
-| DeepSeek/alternative scoring (future) | Only after evaluation and cross-border/DPA/hosting review; API versus approved hosted deployment remains open | Backend + Legal |
+| DeepSeek V4 Pro (current architecture) | Self-hosted by Ikey on in-house India infrastructure; no cross-border; no DPA needed. Model-license/IP commercial-use check minor follow-up. Alternative scoring providers: only after evaluation and DPA/hosting review. | Backend (current); +Legal (future alternatives) |
 | Auth provider | MFA and lifecycle provisioning; SSO if selected; security/DPA review | Infra + Backend |
 | Cloud/queue/observability | Approved compute, secret manager/KMS, durable queue, logs/metrics/traces and support plan | Infra + Security |
 | Telephony provider (future) | Selected only after voice-specific Legal/carrier validation, India route/number, SIP security, DPA, fraud and cost review | Infra + Legal |

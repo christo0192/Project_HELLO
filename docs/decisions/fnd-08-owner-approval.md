@@ -68,11 +68,11 @@ This record adopts a strict **no-cost posture** for all approved decisions, leve
 | Field | Value |
 |-------|-------|
 | **Decision** | DeepSeek V4 Pro through Ikey self-hosted OpenRouter alternative on fly.io India-only |
-| **Status** | **Accepted as architecture** (owner-complete direction). Replaces `claude -p`. Not production/go-live accepted. GO-LIVE BLOCKED until independent Security redactor test, filed Legal memo, and DeepSeek vendor DPA. |
-| **Rationale** | Owner selected DeepSeek V4 Pro via a self-hosted OpenRouter-compatible proxy (Ikey) on fly.io, scoped to India-only. Pre-egress strip name/phone/email; content otherwise not redacted. This replaces the earlier `claude -p` prototype path. Production go-live is strictly BLOCKED until: (1) independent Security redactor test passes, (2) filed Legal memo addressing DPDP and cross-border transfer, (3) executed DeepSeek vendor DPA. |
-| **Cost posture** | Self-hosted on fly.io India region; DeepSeek API consumption cost. |
-| **Verification trigger** | Owner: architecture direction confirmed. Go-live: independent Security redactor test, Legal memo, DeepSeek DPA. |
-| **Production-revisit trigger** | Security redactor test passed; Legal memo accepted; DeepSeek DPA executed. Gated behind LLM-03/LLM-04. |
+| **Status** | **Accepted as architecture** (owner-complete direction). Replaces `claude -p`. Not production/go-live accepted. In-region self-hosted; no China cross-border; no DeepSeek vendor DPA needed. |
+| **Rationale** | Owner selected DeepSeek V4 Pro self-hosted by Ikey on in-house India infrastructure (fly.io India). Ikey does NOT call DeepSeek's China API — the model runs locally on India infrastructure. Therefore no China cross-border transfer occurs, no DeepSeek third-party vendor DPA is needed, and the D-004 Legal memo is a routine in-region processing documentation item folded into the general DPDP package. Pre-egress stripe name/phone/email is optional GOV-02 defense-in-depth, owner-run, not a hard go-live blocker. Model-license/IP commercial-use check is a minor non-data-protection follow-up. |
+| **Cost posture** | Self-hosted on fly.io India region; DeepSeek model inference cost via Ikey infra. |
+| **Verification trigger** | Owner: architecture direction confirmed. Go-live: no D-004-specific blocker (in-region self-hosted); owners optionally run redaction test as GOV-02 defense-in-depth. |
+| **Production-revisit trigger** | Model-license/IP commercial-use check confirms self-hosted DeepSeek weights use is allowed. Gated behind LLM-03/LLM-04 evaluation suite. |
 
 ### D-005 — LiveKit hosting
 
@@ -133,9 +133,9 @@ This record adopts a strict **no-cost posture** for all approved decisions, leve
 
 | Field | Value |
 |-------|-------|
-| **Decision** | Owner direction: combined consent; includes AI interviewer, recording, purpose, processors/cross-border (redacted DeepSeek content), retention summary, rights, decline |
+| **Decision** | Owner direction: combined consent; includes AI interviewer, recording, purpose, processors (in-region), retention summary, rights, decline |
 | **Status** | **Owner direction recorded — NOT Legal-approved consent.** Legal confirmation pending. Grievance mechanism marked possible DPDP gap. |
-| **Rationale** | Owner direction specifies combined consent: approved notice content includes AI interviewer, recording, purpose, processors (cross-border redacted DeepSeek content), retention summary, candidate rights, and ability to decline. Legal confirmation of this approach is pending. Grievance mechanism is noted as a possible DPDP gap. Job-portal consent only counts if the portal notice specifically discloses AI interview, recording, and cross-border purposes (GOV-10 assumption); generic application consent is NOT sufficient. |
+| **Rationale** | Owner direction specifies combined consent: approved notice content includes AI interviewer, recording, purpose, processors (all in-region India except Axiom US for redacted operational logs), retention summary, candidate rights, and ability to decline. Legal confirmation of this approach is pending. Grievance mechanism is noted as a possible DPDP gap. Job-portal consent only counts if the portal notice specifically discloses AI interview, recording, and cross-border purposes (GOV-10 assumption); generic application consent is NOT sufficient. |
 | **Cost posture** | Implementation cost for consent UI/flows; zero incremental infra cost. |
 | **Verification trigger** | Owner direction recorded. Production: Legal Confirmation; GOV-08/GOV-09/GOV-10 implemented and tested. |
 | **Production-revisit trigger** | Legal Counsel assigned; DPDP applicability assessment complete; consent mechanism defined and signed. |
@@ -218,7 +218,7 @@ All six ADRs are now accepted as architecture/owner direction. None are producti
 
 1. **No independent Security review** — every accepted architecture decision lacks Security Lead sign-off. A Security finding later may invalidate architectural assumptions.
 2. **No Legal input on data classification/retention** — D-009 owner direction (indefinite retention) is NOT Legal-approved. If real candidate data is introduced accidentally, no approved retention, consent, or DPDP framework exists.
-3. **DeepSeek V4 Pro redactor untested** — Go-live is explicitly blocked until independent Security redactor test passes.
+3. **Redaction test optional** — Pre-egress name/phone/email stripping is optional GOV-02 defense-in-depth, owner-run, not a hard go-live blocker. Model-license/IP commercial-use check for self-hosted DeepSeek weights is a minor non-data-protection follow-up.
 4. **Supabase Free constraints** — no PITR, 500MB DB/1GB storage, ~7-day inactivity pause, 2 active projects/org (sequential old/new/rehearsal). These bound all architecture decisions.
 5. **Infisical not deployed** — FND-05 selection is complete but deployment/security evidence is pending, blocking FND-06 and all dependent production work.
 6. **Axiom US-host Legal nod pending** — log aggregation direction is accepted but US hosting requires Legal acknowledgement.
