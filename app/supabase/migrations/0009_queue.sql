@@ -122,14 +122,23 @@ $$;
 --   to app_service_role;
 
 -- ═══════════════════════════════════════════════════════════════════════
--- 4. Permissions (synthetic-safe defaults)
+-- 4. RLS and permissions (synthetic-safe defaults)
 -- ═══════════════════════════════════════════════════════════════════════
+-- job_queue and job_dlq are service_role-only backend infrastructure.
+-- Enable RLS to block accidental browser-role access. No authenticated
+-- policies — service_role bypasses RLS.
+
+alter table screening_v2.job_queue enable row level security;
+alter table screening_v2.job_dlq enable row level security;
+
+revoke all on screening_v2.job_queue from anon, authenticated;
+revoke all on screening_v2.job_dlq from anon, authenticated;
+
 -- No explicit grants needed for synthetic/local setup where the
 -- connecting user is a superuser (service_role).  In production, grant
 -- INSERT/SELECT/UPDATE/DELETE on job_queue and INSERT/SELECT/DELETE on
 -- job_dlq to the application service role.
 
--- ═══════════════════════════════════════════════════════════════════════
 -- 5. Statement-level invariants
 -- ═══════════════════════════════════════════════════════════════════════
 -- These INSERT-only invariants are enforced at the application layer by

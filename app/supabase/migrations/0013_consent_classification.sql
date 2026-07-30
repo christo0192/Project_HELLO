@@ -195,6 +195,8 @@ create index if not exists idx_v2_consent_active
 -- ═══════════════════════════════════════════════════════════════════════
 
 -- consent_templates: active recruiters can read, insert/update service_role only
+alter table screening_v2.consent_templates enable row level security;
+
 drop policy if exists "active recruiter read consent_templates"
   on screening_v2.consent_templates;
 create policy "active recruiter read consent_templates"

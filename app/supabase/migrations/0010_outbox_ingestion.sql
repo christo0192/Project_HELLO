@@ -83,20 +83,20 @@ create index if not exists idx_v2_outbox_failed
 -- ═══════════════════════════════════════════════════════════════════════
 -- 3. RLS: all access is service_role only (internal tool)
 -- ═══════════════════════════════════════════════════════════════════════
+-- transcript_events and outbox are backend infrastructure.  The
+-- dashboard reads transcripts through transcript_turns (migration 0001).
+-- Enable RLS and grant only service_role access.  No authenticated
+-- policies — service_role bypasses RLS.
 
--- Revoke all on both tables from anon/public
-revoke all on screening_v2.transcript_events from anon, public;
-revoke all on screening_v2.outbox from anon, public;
+alter table screening_v2.transcript_events enable row level security;
+alter table screening_v2.outbox enable row level security;
 
--- Grant service_role full access
+revoke all on screening_v2.transcript_events from anon, authenticated, public;
+revoke all on screening_v2.outbox from anon, authenticated, public;
+
 grant all on screening_v2.transcript_events to service_role;
 grant all on screening_v2.outbox to service_role;
 
--- Grant authenticated SELECT only for dashboard visibility
-grant select on screening_v2.transcript_events to authenticated;
-grant select on screening_v2.outbox to authenticated;
-
--- ═══════════════════════════════════════════════════════════════════════
 -- 4. Notify PostgREST to reload schema cache
 -- ═══════════════════════════════════════════════════════════════════════
 
