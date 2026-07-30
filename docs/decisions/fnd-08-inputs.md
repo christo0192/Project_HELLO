@@ -31,7 +31,7 @@ record supersedes it for decision authority.
 | D-007 | Recording storage | **Cloudflare R2 recording target; begin with Supabase Storage free.** | Accepted as architecture. Production: blocked. |
 | D-008 | SIEM/log aggregator | **Axiom free tier, PII-redacted at emission; US-hosted Legal nod pending.** | Accepted as architecture. Production: blocked (US-host Legal nod pending). |
 | D-009 | PII retention period | **Owner direction: retain by default indefinitely ('store everything, never delete').** Recordings/logs to R2/Oracle object storage, transcripts/scores/PII in Supabase then object-storage offload near free cap. **NOT Legal-approved retention.** | Owner direction recorded. Production: blocked until Legal DPDP document. |
-| D-010 | DPDP consent mechanism | **Owner direction: combined consent; includes AI interviewer, recording, purpose, processors (in-region India except Axiom US for redacted logs), retention summary, rights, decline.** Legal confirmation pending. Grievance mechanism: possible DPDP gap. Job-portal consent: must specifically disclose AI interview, recording, cross-border purposes. | Owner direction recorded. Production: blocked until Legal confirmation. |
+| D-010 | DPDP consent mechanism | **Owner direction: combined consent; includes AI interviewer, recording, purpose, processors (in-region India except Axiom US for redacted logs), retention summary, rights, decline.** Legal confirmation pending. Grievance mechanism: possible DPDP gap. Job-portal consent: must specifically disclose AI interview, recording, purposes, India-hosted processors, and any actual non-India processing if applicable (Axiom US redacted logs — separate D-008 nod). | Owner direction recorded. Production: blocked until Legal confirmation. |
 | D-011 | Tenancy model | **Single-org IK India, admin/interviewer/viewer, no org_id.** ADR-0005 accepted as architecture. | Accepted as architecture. Production: blocked. |
 
 ## FND-08 Approval Matrix
@@ -64,7 +64,7 @@ record supersedes it for decision authority.
 | **HA posture** | Not decided. DEP-03 is PENDING; no explicit single-instance or multi-AD decision |
 | **Backup/PITR plan** | D-006 open. Supabase PITR capability not yet verified against Legal requirements |
 | **LiveKit hosting** | D-005 open. Cloud vs self-host; region availability unverified |
-| **Legal/DPDP review** | D-009, D-010, GOV-07 all open. No DPDP memo, no vendor DPA evidence, no retention schedule |
+| **Legal/DPDP review** | D-009/D-010 owner directions complete; Legal lawful-basis/storage-limitation (D-009) and consent/grievance confirmation (D-010) pending. D-008 Axiom US-host nod pending. DPDP memo and vendor DPA evidence for remaining processors (Supabase, LiveKit, Sarvam, Anthropic) pending. |
 | **Launch concurrency target** | Direction: 5 concurrent sessions, validate to 10. Must be approved by Product+SRE (DEP-01 benchmark required first) |
 | **Budgets** | OCI budget resource scaffolded; amounts not approved by owner |
 | **Formal sign-off** | No signed decision record exists. FND-08 acceptance requires signed record from all four accountable roles |
