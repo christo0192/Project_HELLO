@@ -1,0 +1,162 @@
+{
+  "_comment": "TST-05 offline SAST ruleset (Phase 6 lane L4). Repository-owned, deterministic, zero external service, zero network. Fail-closed: any match => analyzer exit 1. These rules target dangerous-code antipatterns ONLY — secret/env scanning is explicitly OUT OF SCOPE (gitleaks/.gitleaks.toml owns that boundary; see scripts/scan-secrets.sh). Files in scripts/__fixtures__/ are excluded from the default scan and are scanned explicitly by scripts/sast.test.mjs.",
+  "rules": [
+    {
+      "id": "S001-dynamic-eval-js",
+      "name": "Dynamic eval() / new Function() (JS/TS)",
+      "severity": "high",
+      "patterns": [
+        "(?<![.\\w])eval\\s*\\(",
+        "\\bnew\\s+Function\\s*\\("
+      ],
+      "extensions": [
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs"
+      ],
+      "message": "Dynamic code evaluation with attacker-influenceable input enables arbitrary code execution. Reject the input or use a whitelist. NOTE: this rule does not scan secrets/env.",
+      "rationale": "CWE-95. `eval`/`new Function` with non-constant input is RCE."
+    },
+    {
+      "id": "S002-childprocess-exec-js",
+      "name": "child_process exec/execSync with a command string (JS/TS)",
+      "severity": "high",
+      "patterns": [
+        "(?<![.\\w])exec(?:Sync)?\\s*\\(",
+        "\\b(?:cp|childProcess|child_process)\\.exec(?:Sync)?\\s*\\("
+      ],
+      "extensions": [
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs"
+      ],
+      "message": "exec/execSync runs a shell; interpolated input is command injection. Use spawn with an argument array and shell:false.",
+      "rationale": "CWE-78. Shell interpolation of untrusted input => command injection."
+    },
+    {
+      "id": "S003-spawn-shell-js",
+      "name": "spawn/spawnSync with shell enabled (JS/TS)",
+      "severity": "high",
+      "patterns": [
+        "spawn(?:Sync)?\\s*\\([^)\\n]{0,200}shell\\s*:\\s*(?:true|1)\\b"
+      ],
+      "extensions": [
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs"
+      ],
+      "message": "spawn with shell:true reintroduces shell interpretation; pass an argument array with shell:false.",
+      "rationale": "CWE-78. shell:true defeats spawn's argv-array protection."
+    },
+    {
+      "id": "S004-html-injection-web",
+      "name": "DOM HTML sink with dynamic content (React/JSX)",
+      "severity": "high",
+      "patterns": [
+        "(?:innerHTML|outerHTML)\\s*=",
+        "insertAdjacentHTML\\s*\\("
+      ],
+      "extensions": [
+        ".tsx",
+        ".ts",
+        ".jsx",
+        ".js"
+      ],
+      "message": "Assigning non-static content to an HTML sink enables stored/reflected XSS. Render via React text nodes or escape first.",
+      "rationale": "CWE-79. innerHTML/insertAdjacentHTML with untrusted data => XSS."
+    },
+    {
+      "id": "S101-subprocess-shell-py",
+      "name": "subprocess with shell=True (Python)",
+      "severity": "high",
+      "patterns": [
+        "subprocess\\.(?:Popen|call|run|check_call|check_output)\\s*\\([^)\\n]{0,200}shell\\s*=\\s*True\\b"
+      ],
+      "extensions": [
+        ".py"
+      ],
+      "message": "shell=True reintroduces shell interpretation of the command string; pass an argument list with shell=False.",
+      "rationale": "CWE-78. Python subprocess shell=True => command injection."
+    },
+    {
+      "id": "S102-os-system-py",
+      "name": "os.system/os.popen (Python)",
+      "severity": "high",
+      "patterns": [
+        "\\bos\\.(?:system|popen)\\s*\\("
+      ],
+      "extensions": [
+        ".py"
+      ],
+      "message": "os.system/os.popen run a shell; use subprocess with an argument list.",
+      "rationale": "CWE-78. os.system passes the string to /bin/sh."
+    },
+    {
+      "id": "S103-dynamic-eval-py",
+      "name": "Dynamic eval()/exec() (Python)",
+      "severity": "high",
+      "patterns": [
+        "(?<![.\\w])eval\\s*\\(",
+        "(?<![.\\w])exec\\s*\\("
+      ],
+      "extensions": [
+        ".py"
+      ],
+      "message": "Dynamic code execution with non-constant input is RCE; use an AST whitelist or data-driven design.",
+      "rationale": "CWE-95. eval/exec with untrusted input => arbitrary code execution."
+    },
+    {
+      "id": "S104-pickle-load-py",
+      "name": "Unsafe pickle deserialization (Python)",
+      "severity": "medium",
+      "patterns": [
+        "\\bpickle\\.(?:loads|load)\\s*\\("
+      ],
+      "extensions": [
+        ".py"
+      ],
+      "message": "pickle.load/loads executes arbitrary objects during deserialization; use JSON or a safe format for untrusted data.",
+      "rationale": "CWE-502. Unpickling untrusted data => arbitrary code execution."
+    },
+    {
+      "id": "S201-shell-eval-sh",
+      "name": "Shell eval with variable input (sh/bash)",
+      "severity": "high",
+      "patterns": [
+        "(?:^|[;&|])\\s*\\beval\\s+"
+      ],
+      "extensions": [
+        ".sh",
+        ".bash"
+      ],
+      "message": "eval of interpolated shell input is command injection; use direct execution with quoted arguments.",
+      "rationale": "CWE-78. eval re-parses its argument as shell syntax."
+    },
+    {
+      "id": "S202-curl-pipe-installer",
+      "name": "Unpinned curl|bash / wget|sh installer (shell/yaml)",
+      "severity": "high",
+      "patterns": [
+        "curl\\b[^\\n]*\\|\\s*(?:ba)?sh\\b",
+        "wget\\b[^\\n]*\\|\\s*sh\\b"
+      ],
+      "extensions": [
+        ".sh",
+        ".bash",
+        ".yml",
+        ".yaml"
+      ],
+      "message": "Remote pipe-to-shell installers cannot be pinned/reproduced and execute third-party code; vendor the installer or pin a verified release.",
+      "rationale": "Supply-chain / SLSA. Unpinned remote code execution at build time."
+    }
+  ]
+}

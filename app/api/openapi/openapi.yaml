@@ -1,0 +1,2916 @@
+# OpenAPI 3.0.3 specification for the HR screening bot API.
+#
+# Phase 6 (TST-02): documents ONLY routes that already exist in
+# app/api/src/app.ts and the route modules as of origin/main 4f7293d.
+# This file is the single source of truth that contract-openapi.test.ts
+# validates the live Express handlers against.
+#
+# Conventions:
+#   - additionalProperties: false  => the handler CONSTRUCTS this object
+#     (its shape is fixed by code); the contract test asserts exactness.
+#   - additionalProperties omitted => pass-through DB row; the test asserts
+#     the documented required keys and types only.
+#   - Every documented route exists in the live app; the contract test
+#     asserts the reverse direction too (no undocumented mounted routes).
+#
+# NOTE (documented limitation): POST /api/livekit/grant/recording is
+# registered in livekit.ts but is currently SHADOWED by the earlier
+# POST /api/livekit/{sessionId}/recording registration ("grant" fails the
+# UUID path-param validation, so requests reach the recording route and get
+# 400). Its intended 200 shape is documented below for PR2-L5, which fixes
+# the registration order; the contract test asserts the CURRENT shadow
+# behavior (400), not the unreachable success response.
+
+openapi: 3.0.3
+info:
+  title: HR Screening Bot API
+  version: 0.2.0
+  description: Backend API for the AI HR screening bot (Supabase screening_v2 + LiveKit voice).
+servers:
+  - url: /
+security:
+  - bearerAuth: []
+tags:
+  - name: health
+  - name: roles
+  - name: candidates
+  - name: resumes
+  - name: screening
+  - name: assess
+  - name: livekit
+  - name: recordings
+  - name: dsar
+  - name: consent
+  - name: csp
+
+paths:
+  # ── Health ──────────────────────────────────────────────────────────
+  /api/health:
+    get:
+      tags: [health]
+      operationId: getHealth
+      summary: Service health probe
+      security: []
+      responses:
+        '200':
+          description: Service is up and the configured brain model is reported.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  # ── CSP violation report (public, unauthenticated by design) ───────
+  /api/csp-report:
+    post:
+      tags: [csp]
+      operationId: reportCspViolation
+      summary: Bounded CSP violation report endpoint (64 KiB, 204 always)
+      security: []
+      responses:
+        '204':
+          description: Accepted and logged; browsers must not see retry/error signals.
+
+  # ── Roles ──────────────────────────────────────────────────────────
+  /api/roles:
+    get:
+      tags: [roles]
+      operationId: listRoles
+      summary: List roles (viewer+; interviewer scoped to own records)
+      responses:
+        '200':
+          description: Array of role rows.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Role'
+    post:
+      tags: [roles]
+      operationId: createRole
+      summary: Create role with screening template (interviewer+)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRoleRequest'
+      responses:
+        '201':
+          description: Created role row.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Role'
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '500':
+          description: Internal error (including fail-closed audit sink failure).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/roles/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [roles]
+      operationId: getRole
+      summary: Get one role (viewer+; interviewer must own)
+      responses:
+        '200':
+          description: Role row.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Role'
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Role not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+    put:
+      tags: [roles]
+      operationId: updateRole
+      summary: Update role (interviewer+; interviewer must own)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateRoleRequest'
+      responses:
+        '200':
+          description: Updated role row.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Role'
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Role not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '500':
+          description: Internal error (including fail-closed audit sink failure).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  # ── Candidates ─────────────────────────────────────────────────────
+  /api/candidates:
+    get:
+      tags: [candidates]
+      operationId: listCandidates
+      summary: List candidates (viewer+; interviewer scoped to own records)
+      parameters:
+        - name: role_id
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Array of candidate list rows (projected columns).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CandidateListItem'
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/candidates/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [candidates]
+      operationId: getCandidate
+      summary: Candidate detail with latest sessions and assessments (viewer+)
+      responses:
+        '200':
+          description: Candidate, sessions and assessments envelopes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CandidateDetail'
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Candidate not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+
+  # ── Resumes ────────────────────────────────────────────────────────
+  /api/resumes:
+    post:
+      tags: [resumes]
+      operationId: uploadResume
+      summary: Upload and ingest a resume (interviewer+; creates candidate + consent record)
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                role_id:
+                  type: string
+                  format: uuid
+              required: [file]
+      responses:
+        '201':
+          description: Candidate and resume rows plus normalized phone.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResumeUploadResponse'
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '401':
+          description: Recruiter authorization required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '422':
+          description: Upload guard, malware or parse rejection.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '502':
+          description: Storage, brain or persistence failure.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  # ── Screening ──────────────────────────────────────────────────────
+  /api/screening/start:
+    post:
+      tags: [screening]
+      operationId: startScreening
+      summary: Start a simulation screening session (admin only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartScreeningRequest'
+      responses:
+        '201':
+          description: Session id plus the bot opening message.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StartScreeningResponse'
+        '400':
+          description: Request validation failed or candidate_id missing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+
+  /api/screening/{id}/turn:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [screening]
+      operationId: screeningTurn
+      summary: Submit a candidate turn and get the bot reply (admin only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScreeningTurnRequest'
+      responses:
+        '200':
+          description: Bot message, done flag, assessment and scoring status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScreeningTurnResponse'
+        '400':
+          description: Request validation failed or text missing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '404':
+          description: Session not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '409':
+          description: Session already completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+
+  /api/screening/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [screening]
+      operationId: getScreeningSession
+      summary: Session, transcript and latest assessment (admin only)
+      responses:
+        '200':
+          description: Session detail envelope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScreeningSessionDetail'
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Screening session not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+
+  # ── Assess ─────────────────────────────────────────────────────────
+  /api/assess/{sessionId}:
+    parameters:
+      - name: sessionId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [assess]
+      operationId: runAssessment
+      summary: Score a completed screening session (admin only)
+      responses:
+        '200':
+          description: Assessment object (API shape) with id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Assessment'
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '500':
+          description: Internal error (including fail-closed audit sink failure).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  # ── LiveKit ────────────────────────────────────────────────────────
+  /api/livekit/start:
+    post:
+      tags: [livekit]
+      operationId: startLiveKitSession
+      summary: Create a LiveKit room + browser session (interviewer+; no candidate join token returned)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LiveKitStartRequest'
+      responses:
+        '201':
+          description: Session id, room name and LiveKit URL (no join token).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LiveKitStartResponse'
+        '400':
+          description: Request validation failed or candidate_id missing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '403':
+          description: Access denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '409':
+          description: Candidate ownership conflict or session transition conflict.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+
+  /api/livekit/{sessionId}/recording:
+    parameters:
+      - name: sessionId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [livekit]
+      operationId: uploadRecording
+      summary: Upload a recording bound to a session (grant-token or recruiter auth)
+      security:
+        - grantToken: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+              required: [file]
+      responses:
+        '200':
+          description: Stored object key (no signed URL).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordingUploadResponse'
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '401':
+          description: No grant token and no recruiter auth.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '403':
+          description: Grant token not bound to this session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+
+  /api/livekit/worker-context:
+    post:
+      tags: [livekit]
+      operationId: resolveWorkerContext
+      summary: Resolve minimal worker context from opaque session/room identifiers (worker bearer credential)
+      security:
+        - workerBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkerContextRequest'
+      responses:
+        '200':
+          description: Minimal worker context (no resume facts, no PII beyond name).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkerContextResponse'
+        '400':
+          description: Request validation failed or identifiers missing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkerContextError'
+        '401':
+          description: Worker bearer credential required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkerContextError'
+        '403':
+          description: Credential invalid or room binding mismatch.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkerContextError'
+        '404':
+          description: Session not found or not active.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkerContextError'
+        '503':
+          description: Worker credential not configured (deny closed).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkerContextError'
+
+  /api/livekit/invite:
+    post:
+      tags: [livekit]
+      operationId: createInvite
+      summary: Issue a one-time invite token (admin/interviewer; only SHA-256 digest persisted)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InviteCreateRequest'
+      responses:
+        '201':
+          description: Plaintext token (returned once) and expiry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InviteCreateResponse'
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '401':
+          description: Recruiter authentication required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '403':
+          description: Candidate or owner mismatch.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '404':
+          description: Session not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '409':
+          description: Session not in an invitable state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+
+  /api/livekit/exchange:
+    post:
+      tags: [livekit]
+      operationId: exchangeInvite
+      summary: Exchange an invite token for a short-lived candidate access grant + LiveKit JWT
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InviteExchangeRequest'
+      responses:
+        '200':
+          description: Grant token, room binding and short-TTL LiveKit JWT.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InviteExchangeResponse'
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Stable 404 for unknown/expired/revoked/consumed tokens.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+
+  /api/livekit/grant/recording:
+    post:
+      tags: [livekit]
+      operationId: grantRecording
+      summary: Mint a short-TTL signed URL for a recording via a candidate grant
+      description: Registered in livekit.ts but CURRENTLY SHADOWED: POST /api/livekit/{sessionId}/recording is registered first, so grant fails UUID path-param validation and the request is rejected with 400. The intended 200 shape (url) is documented for PR2-L5, which fixes the registration order. The contract test asserts the current shadow behavior (400).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecordingGrantRequest'
+      responses:
+        '200':
+          description: Short-TTL signed recording URL.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordingGrantResponse'
+        '400':
+          description: Current shadow behavior (grant captured as :sessionId, UUID validation fails).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Grant invalid or not bound to the session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '404':
+          description: Recording not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+
+  # ── Recordings ─────────────────────────────────────────────────────
+  /api/recordings/{sessionId}/download:
+    parameters:
+      - name: sessionId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [recordings]
+      operationId: downloadRecording
+      summary: Mint a short-TTL signed recording URL for a recruiter (viewer+; interviewer must own)
+      responses:
+        '200':
+          description: Short-TTL signed URL (never persisted or logged).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordingDownloadResponse'
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Non-privileged role or not the owning interviewer (uniform denial).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '404':
+          description: Recording not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '500':
+          description: Signing failure (redacted stable error).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  # ── DSAR ───────────────────────────────────────────────────────────
+  /api/dsar:
+    post:
+      tags: [dsar]
+      operationId: createDSAR
+      summary: Create a data subject access request (interviewer+; interviewer must own candidate)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDSARRequest'
+      responses:
+        '201':
+          description: Created DSAR request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DSAREnvelope'
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Insufficient permissions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DSARForbidden'
+        '500':
+          description: Failed to create DSAR request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/dsar/{dsarId}:
+    parameters:
+      - name: dsarId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [dsar]
+      operationId: getDSAR
+      summary: Get a DSAR request, optionally with export data (viewer+)
+      parameters:
+        - name: include_export
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: ['true', 'false']
+      responses:
+        '200':
+          description: DSAR request (optionally with export data when fulfilled export).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DSARWithExportEnvelope'
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Insufficient permissions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DSARForbidden'
+        '404':
+          description: DSAR request not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DSARNotFound'
+
+  /api/dsar/candidate/{candidateId}:
+    parameters:
+      - name: candidateId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [dsar]
+      operationId: listCandidateDSARs
+      summary: List DSAR requests for a candidate (viewer+; interviewer must own)
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [pending, in_progress, fulfilled, rejected, cancelled]
+        - name: type
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [export, delete, correct, restrict]
+      responses:
+        '200':
+          description: Array of DSAR requests.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DSARListEnvelope'
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Insufficient permissions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DSARForbidden'
+
+  /api/dsar/{dsarId}/fulfill:
+    parameters:
+      - name: dsarId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [dsar]
+      operationId: fulfillDSAR
+      summary: Fulfill, reject or cancel a DSAR request (interviewer+)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FulfillDSARRequest'
+      responses:
+        '200':
+          description: Updated DSAR request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DSAREnvelope'
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Insufficient permissions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DSARForbidden'
+        '404':
+          description: DSAR request not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DSARNotFound'
+        '500':
+          description: Failed to update DSAR status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/dsar/{dsarId}/export:
+    parameters:
+      - name: dsarId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [dsar]
+      operationId: exportDSAR
+      summary: Execute a DSAR data export (interviewer+)
+      responses:
+        '200':
+          description: Structured export payload respecting consent boundaries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DSARExportEnvelope'
+        '400':
+          description: Request validation failed or DSAR is not an export type.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Insufficient permissions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DSARForbidden'
+        '404':
+          description: DSAR request not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DSARNotFound'
+        '500':
+          description: Failed to export data.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/dsar/{dsarId}/delete:
+    parameters:
+      - name: dsarId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [dsar]
+      operationId: deleteDSAR
+      summary: Execute a DSAR data deletion (interviewer+)
+      responses:
+        '200':
+          description: Deletion result with deleted entity references.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DSARDeleteEnvelope'
+        '400':
+          description: Request validation failed or DSAR is not a delete type.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Insufficient permissions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DSARForbidden'
+        '404':
+          description: DSAR request not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DSARNotFound'
+        '409':
+          description: Deletion blocked by active legal hold(s).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DSARDeleteConflict'
+        '500':
+          description: Failed to execute DSAR deletion.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/dsar/{dsarId}/correct:
+    parameters:
+      - name: dsarId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [dsar]
+      operationId: correctDSAR
+      summary: Apply targeted corrections (interviewer+)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CorrectDSARRequest'
+      responses:
+        '200':
+          description: Correction result with old/new values.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DSARCorrectEnvelope'
+        '400':
+          description: Request validation failed or DSAR is not a correct type.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Insufficient permissions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DSARForbidden'
+        '404':
+          description: DSAR request not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DSARNotFound'
+        '500':
+          description: Failed to apply corrections.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/dsar/legal-holds:
+    post:
+      tags: [dsar]
+      operationId: createLegalHold
+      summary: Place a legal hold (admin only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateLegalHoldRequest'
+      responses:
+        '201':
+          description: Created legal hold.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LegalHoldEnvelope'
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Insufficient permissions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DSARForbidden'
+
+  /api/dsar/legal-holds/{holdId}/release:
+    parameters:
+      - name: holdId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [dsar]
+      operationId: releaseLegalHold
+      summary: Release a legal hold (admin only; idempotent)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReleaseLegalHoldRequest'
+      responses:
+        '200':
+          description: Released legal hold.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LegalHoldEnvelope'
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Insufficient permissions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DSARForbidden'
+        '404':
+          description: Legal hold not found or already released.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DSARNotFound'
+
+  /api/dsar/legal-holds/check:
+    get:
+      tags: [dsar]
+      operationId: checkLegalHold
+      summary: Check legal-hold and erasure-block status for an entity (viewer+)
+      parameters:
+        - name: entity_type
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [candidate, session, transcript, recording, assessment, resume]
+        - name: entity_id
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Hold status and active holds.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LegalHoldCheck'
+        '400':
+          description: Missing or invalid query parameters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/dsar/legal-holds/{holdId}:
+    parameters:
+      - name: holdId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [dsar]
+      operationId: getLegalHold
+      summary: Get legal hold details (viewer+)
+      responses:
+        '200':
+          description: Legal hold row (pass-through DB shape).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LegalHoldRowEnvelope'
+        '404':
+          description: Legal hold not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DSARNotFound'
+
+  # ── Consent ────────────────────────────────────────────────────────
+  /api/consent/submit:
+    post:
+      tags: [consent]
+      operationId: submitConsent
+      summary: Record a candidate consent submission (append-only; authenticated)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsentSubmitRequest'
+      responses:
+        '201':
+          description: Created consent record.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsentSubmitResponse'
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Candidate not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '500':
+          description: Failed to record consent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/consent/{candidateId}/status:
+    parameters:
+      - name: candidateId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [consent]
+      operationId: getConsentStatus
+      summary: Get a candidate's current consent status (authenticated)
+      responses:
+        '200':
+          description: Consent status flags plus latest consent record.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsentStatusResponse'
+        '404':
+          description: Candidate not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/consent/check:
+    post:
+      tags: [consent]
+      operationId: checkConsent
+      summary: Check required consent types for an operation (authenticated)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsentCheckRequest'
+      responses:
+        '200':
+          description: Whether all required consents are granted and the missing set.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsentCheckResponse'
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/consent/withdraw:
+    post:
+      tags: [consent]
+      operationId: withdrawConsent
+      summary: Withdraw previously granted consent types (append-only; authenticated)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsentWithdrawRequest'
+      responses:
+        '200':
+          description: Withdrawal record id, status and timestamp.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsentWithdrawResponse'
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Candidate not found or no active consent to withdraw.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '500':
+          description: Failed to withdraw consent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/consent/templates:
+    get:
+      tags: [consent]
+      operationId: listConsentTemplates
+      summary: List active privacy notice templates (authenticated)
+      responses:
+        '200':
+          description: Array of active templates.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ConsentTemplate'
+        '500':
+          description: Failed to fetch templates.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Supabase Auth bearer JWT (AAL2 for privileged roles).
+    grantToken:
+      type: apiKey
+      in: header
+      name: x-grant-token
+      description: 64-hex candidate access grant token bound to one session.
+    workerBearer:
+      type: http
+      scheme: bearer
+      description: Worker bearer credential (env WORKER_CONTEXT_SECRET, timing-safe compare).
+
+  schemas:
+    # ── Common errors ────────────────────────────────────────────────
+    ErrorBody:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [type, message]
+          properties:
+            type:
+              type: string
+              description: Stable error type code.
+            message:
+              type: string
+            details:
+              type: array
+              items:
+                type: object
+                required: [field, code, message]
+                properties:
+                  field:
+                    type: string
+                  code:
+                    type: string
+                  message:
+                    type: string
+      additionalProperties: false
+
+    SimpleError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+      additionalProperties: false
+
+    AuthErrorBody:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [type, message]
+          properties:
+            type:
+              type: string
+              enum: [authentication_error, authorization_error]
+            message:
+              type: string
+      additionalProperties: false
+
+    DSARForbidden:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [type, message]
+          properties:
+            type:
+              type: string
+            message:
+              type: string
+      additionalProperties: false
+
+    DSARNotFound:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [type, message]
+          properties:
+            type:
+              type: string
+            message:
+              type: string
+      additionalProperties: false
+
+    # ── Health ───────────────────────────────────────────────────────
+    HealthResponse:
+      type: object
+      required: [ok, model]
+      properties:
+        ok:
+          type: boolean
+        model:
+          type: string
+      additionalProperties: false
+
+    # ── Roles / candidates ───────────────────────────────────────────
+    ScreeningQuestion:
+      type: object
+      required: [id, question]
+      properties:
+        id:
+          type: string
+        question:
+          type: string
+        weight:
+          type: number
+        follow_up_hint:
+          type: string
+        mandatory:
+          type: boolean
+      additionalProperties: true
+
+    Role:
+      type: object
+      required: [id, title, required_skills, screening_template, is_active, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        jd:
+          type: string
+          nullable: true
+        required_skills:
+          type: array
+          items:
+            type: string
+        screening_template:
+          type: array
+          items:
+            $ref: '#/components/schemas/ScreeningQuestion'
+        is_active:
+          type: boolean
+        owner_id:
+          type: string
+          format: uuid
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      additionalProperties: true
+
+    CandidateListItem:
+      type: object
+      required: [id, name, email, phone_e164, phone_valid, skills, experience_years, status, role_id, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          nullable: true
+        email:
+          type: string
+          nullable: true
+        phone_e164:
+          type: string
+          nullable: true
+        phone_valid:
+          type: boolean
+        skills:
+          type: array
+          items:
+            type: string
+        experience_years:
+          type: number
+          nullable: true
+        status:
+          type: string
+          enum: [new, queued, screening, screened, advanced, rejected, consent_declined]
+        role_id:
+          type: string
+          format: uuid
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+      additionalProperties: true
+
+    Candidate:
+      type: object
+      required: [id, name, email, phone_e164, phone_valid, skills, experience_years, status, role_id, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        role_id:
+          type: string
+          format: uuid
+          nullable: true
+        resume_id:
+          type: string
+          format: uuid
+          nullable: true
+        name:
+          type: string
+          nullable: true
+        email:
+          type: string
+          nullable: true
+        phone_raw:
+          type: string
+          nullable: true
+        phone_e164:
+          type: string
+          nullable: true
+        phone_valid:
+          type: boolean
+        skills:
+          type: array
+          items:
+            type: string
+        experience_years:
+          type: number
+          nullable: true
+        parsed:
+          type: object
+          nullable: true
+        status:
+          type: string
+          enum: [new, queued, screening, screened, advanced, rejected, consent_declined]
+        consent_source:
+          type: string
+          nullable: true
+        consent_at:
+          type: string
+          format: date-time
+          nullable: true
+        owner_id:
+          type: string
+          format: uuid
+          nullable: true
+        ats_external_id:
+          type: string
+          nullable: true
+        ats_source:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      additionalProperties: true
+
+    CallSession:
+      type: object
+      required: [id, candidate_id, role_id, mode, provider, status, started_at, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        candidate_id:
+          type: string
+          format: uuid
+        role_id:
+          type: string
+          format: uuid
+          nullable: true
+        mode:
+          type: string
+          enum: [browser, live, simulation]
+        provider:
+          type: string
+        external_call_id:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [created, waiting, in_progress, completed, failed, cancelled, expired]
+        recording_url:
+          type: string
+          nullable: true
+        recording_object_key:
+          type: string
+          nullable: true
+        current_question_index:
+          type: integer
+        owner_id:
+          type: string
+          format: uuid
+          nullable: true
+        provenance:
+          type: object
+          nullable: true
+        waiting_at:
+          type: string
+          format: date-time
+          nullable: true
+        terminal_reason:
+          type: string
+          nullable: true
+        started_at:
+          type: string
+          format: date-time
+        ended_at:
+          type: string
+          format: date-time
+          nullable: true
+        duration_sec:
+          type: integer
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      additionalProperties: true
+
+    TranscriptTurn:
+      type: object
+      required: [speaker, text]
+      properties:
+        speaker:
+          type: string
+          enum: [bot, candidate]
+        text:
+          type: string
+      additionalProperties: false
+
+    AssessmentRecord:
+      type: object
+      required: [id, session_id, candidate_id, overall_score, recommendation, summary, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        session_id:
+          type: string
+          format: uuid
+        candidate_id:
+          type: string
+          format: uuid
+        english:
+          type: object
+          nullable: true
+        tone:
+          type: object
+          nullable: true
+        communication:
+          type: object
+          nullable: true
+        motivation:
+          type: object
+          nullable: true
+        role_fit:
+          type: object
+          nullable: true
+        resume_conflicts:
+          type: array
+          items:
+            type: object
+          nullable: true
+        overall_score:
+          type: number
+          nullable: true
+        recommendation:
+          type: string
+          enum: [advance, hold, reject]
+          nullable: true
+        summary:
+          type: string
+          nullable: true
+        raw:
+          type: object
+          nullable: true
+        provenance:
+          type: object
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      additionalProperties: true
+
+    CandidateDetail:
+      type: object
+      required: [candidate, sessions, assessments]
+      properties:
+        candidate:
+          $ref: '#/components/schemas/Candidate'
+        sessions:
+          type: array
+          items:
+            $ref: '#/components/schemas/CallSession'
+        assessments:
+          type: array
+          items:
+            $ref: '#/components/schemas/AssessmentRecord'
+      additionalProperties: false
+
+    # ── Resumes ──────────────────────────────────────────────────────
+    Phone:
+      type: object
+      required: [raw, e164, valid]
+      properties:
+        raw:
+          type: string
+        e164:
+          type: string
+          nullable: true
+        valid:
+          type: boolean
+      additionalProperties: false
+
+    ResumeRecord:
+      type: object
+      required: [id, file_path, file_name, mime_type, text_extracted, parsed, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        file_path:
+          type: string
+          nullable: true
+        file_name:
+          type: string
+          nullable: true
+        mime_type:
+          type: string
+          nullable: true
+        text_extracted:
+          type: string
+          nullable: true
+        parsed:
+          type: object
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      additionalProperties: true
+
+    ResumeUploadResponse:
+      type: object
+      required: [candidate, resume, phone]
+      properties:
+        candidate:
+          $ref: '#/components/schemas/Candidate'
+        resume:
+          $ref: '#/components/schemas/ResumeRecord'
+        phone:
+          $ref: '#/components/schemas/Phone'
+      additionalProperties: false
+
+    # ── Screening ────────────────────────────────────────────────────
+    StartScreeningResponse:
+      type: object
+      required: [session_id, message, done]
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        message:
+          type: string
+        done:
+          type: boolean
+      additionalProperties: false
+
+    ScreeningTurnResponse:
+      type: object
+      required: [message, done, assessment, scoringStatus]
+      properties:
+        message:
+          type: string
+        done:
+          type: boolean
+        assessment:
+          $ref: '#/components/schemas/Assessment'
+          nullable: true
+        scoringStatus:
+          type: string
+          enum: [pending, done, error]
+      additionalProperties: false
+
+    ScreeningSessionDetail:
+      type: object
+      required: [session, transcript, assessment]
+      properties:
+        session:
+          $ref: '#/components/schemas/CallSession'
+        transcript:
+          type: array
+          items:
+            $ref: '#/components/schemas/TranscriptTurn'
+        assessment:
+          $ref: '#/components/schemas/AssessmentRecord'
+          nullable: true
+      additionalProperties: false
+
+    # ── Assessment (API shape from runAssessment) ────────────────────
+    LanguageProficiencyScore:
+      type: object
+      required: [band, grammar, vocabulary, fluency, coherence, notes]
+      properties:
+        band:
+          type: string
+        grammar:
+          type: number
+        vocabulary:
+          type: number
+        fluency:
+          type: number
+        coherence:
+          type: number
+        notes:
+          type: string
+      additionalProperties: false
+
+    SpeechPatternSignal:
+      type: object
+      required: [level, examples, impact_score, notes]
+      properties:
+        level:
+          type: string
+          enum: [none, low, moderate, high]
+        examples:
+          type: array
+          items:
+            type: string
+        impact_score:
+          type: number
+        notes:
+          type: string
+      additionalProperties: false
+
+    FillerUsage:
+      type: object
+      required: [level, examples, impact_score, notes]
+      properties:
+        level:
+          type: string
+          enum: [low, moderate, high]
+        examples:
+          type: array
+          items:
+            type: string
+        impact_score:
+          type: number
+        notes:
+          type: string
+      additionalProperties: false
+
+    Tone:
+      type: object
+      required: [clarity, confidence, professionalism, sentiment, notes]
+      properties:
+        clarity:
+          type: number
+        confidence:
+          type: number
+        professionalism:
+          type: number
+        sentiment:
+          type: string
+          enum: [positive, neutral, negative]
+        notes:
+          type: string
+      additionalProperties: false
+
+    Communication:
+      type: object
+      required: [score, clarity, structure, listening, rapport, english_proficiency, filler_usage, native_language_usage, notes]
+      properties:
+        score:
+          type: number
+        clarity:
+          type: number
+        structure:
+          type: number
+        listening:
+          type: number
+        rapport:
+          type: number
+        english_proficiency:
+          $ref: '#/components/schemas/LanguageProficiencyScore'
+        filler_usage:
+          $ref: '#/components/schemas/FillerUsage'
+        native_language_usage:
+          $ref: '#/components/schemas/SpeechPatternSignal'
+        notes:
+          type: string
+      additionalProperties: false
+
+    Motivation:
+      type: object
+      required: [score, notes]
+      properties:
+        score:
+          type: number
+        notes:
+          type: string
+      additionalProperties: false
+
+    RoleFit:
+      type: object
+      required: [score, matched_skills, gaps, red_flags, notes]
+      properties:
+        score:
+          type: number
+        matched_skills:
+          type: array
+          items:
+            type: string
+        gaps:
+          type: array
+          items:
+            type: string
+        red_flags:
+          type: array
+          items:
+            type: string
+        notes:
+          type: string
+      additionalProperties: false
+
+    ResumeConflict:
+      type: object
+      required: [topic, resume_says, candidate_said, resolved, note]
+      properties:
+        topic:
+          type: string
+        resume_says:
+          type: string
+        candidate_said:
+          type: string
+        resolved:
+          type: boolean
+        note:
+          type: string
+      additionalProperties: false
+
+    Assessment:
+      type: object
+      required: [id, tone, communication, motivation, role_fit, overall_score, recommendation, summary, resume_conflicts]
+      properties:
+        id:
+          type: string
+          format: uuid
+        english:
+          $ref: '#/components/schemas/LanguageProficiencyScore'
+          nullable: true
+        tone:
+          $ref: '#/components/schemas/Tone'
+        communication:
+          $ref: '#/components/schemas/Communication'
+        motivation:
+          $ref: '#/components/schemas/Motivation'
+        role_fit:
+          $ref: '#/components/schemas/RoleFit'
+        overall_score:
+          type: number
+        recommendation:
+          type: string
+          enum: [advance, hold, reject]
+        summary:
+          type: string
+        resume_conflicts:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResumeConflict'
+      additionalProperties: false
+
+    # ── LiveKit ──────────────────────────────────────────────────────
+    LiveKitStartResponse:
+      type: object
+      required: [session_id, room_name, url]
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        room_name:
+          type: string
+        url:
+          type: string
+      additionalProperties: false
+
+    RecordingUploadResponse:
+      type: object
+      required: [object_key]
+      properties:
+        object_key:
+          type: string
+      additionalProperties: false
+
+    WorkerContext:
+      type: object
+      required: [session_id, candidate_id, role_id, candidate_name, room_name, status]
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        candidate_id:
+          type: string
+          format: uuid
+        role_id:
+          type: string
+          format: uuid
+          nullable: true
+        candidate_name:
+          type: string
+          nullable: true
+        room_name:
+          type: string
+        status:
+          type: string
+      additionalProperties: false
+
+    WorkerContextResponse:
+      type: object
+      required: [ok, context]
+      properties:
+        ok:
+          type: boolean
+          const: true
+        context:
+          $ref: '#/components/schemas/WorkerContext'
+      additionalProperties: false
+
+    WorkerContextError:
+      type: object
+      required: [ok, error]
+      properties:
+        ok:
+          type: boolean
+          const: false
+        error:
+          type: string
+      additionalProperties: false
+
+    InviteCreateResponse:
+      type: object
+      required: [token, expires_at]
+      properties:
+        token:
+          type: string
+          description: Plaintext 64-hex invite token (returned exactly once).
+        expires_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    InviteExchangeResponse:
+      type: object
+      required: [grant_token, url, room_name, session_id, expires_at, livekit_token]
+      properties:
+        grant_token:
+          type: string
+        url:
+          type: string
+        room_name:
+          type: string
+        session_id:
+          type: string
+          format: uuid
+        expires_at:
+          type: string
+          format: date-time
+        livekit_token:
+          type: string
+      additionalProperties: false
+
+    RecordingGrantResponse:
+      type: object
+      required: [url]
+      properties:
+        url:
+          type: string
+      additionalProperties: false
+
+    # ── Recordings ───────────────────────────────────────────────────
+    RecordingDownloadResponse:
+      type: object
+      required: [url]
+      properties:
+        url:
+          type: string
+      additionalProperties: false
+
+    # ── DSAR ─────────────────────────────────────────────────────────
+    DSARRequest:
+      type: object
+      required: [id, candidateId, requestType, requestStatus, requestedBy, requestedAt, reviewedBy, reviewedAt, fulfilledAt, rejectionReason, legalHoldBlocked, notes, metadata, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        candidateId:
+          type: string
+          format: uuid
+        requestType:
+          type: string
+          enum: [export, delete, correct, restrict]
+        requestStatus:
+          type: string
+          enum: [pending, in_progress, fulfilled, rejected, cancelled]
+        requestedBy:
+          type: string
+        requestedAt:
+          type: string
+          format: date-time
+        reviewedBy:
+          type: string
+          nullable: true
+        reviewedAt:
+          type: string
+          format: date-time
+          nullable: true
+        fulfilledAt:
+          type: string
+          format: date-time
+          nullable: true
+        rejectionReason:
+          type: string
+          nullable: true
+        legalHoldBlocked:
+          type: boolean
+        notes:
+          type: string
+          nullable: true
+        metadata:
+          type: object
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    DSARSessionItem:
+      type: object
+      required: [id, mode, status, started_at, ended_at, duration_sec]
+      properties:
+        id:
+          type: string
+          format: uuid
+        mode:
+          type: string
+        status:
+          type: string
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        ended_at:
+          type: string
+          format: date-time
+          nullable: true
+        duration_sec:
+          type: integer
+          nullable: true
+      additionalProperties: false
+
+    DSARAssessmentItem:
+      type: object
+      required: [id, overall_score, recommendation, summary, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        overall_score:
+          type: number
+          nullable: true
+        recommendation:
+          type: string
+          nullable: true
+        summary:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    DSARTranscriptItem:
+      type: object
+      required: [speaker, text, turn_index, created_at]
+      properties:
+        speaker:
+          type: string
+        text:
+          type: string
+        turn_index:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    DSARResumeItem:
+      type: object
+      required: [id, file_name, mime_type, text_extracted, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        file_name:
+          type: string
+          nullable: true
+        mime_type:
+          type: string
+          nullable: true
+        text_extracted:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    DSARRecordingItem:
+      type: object
+      required: [sessionId, mode, startedAt, endedAt, durationSec, storageKeyPrefix]
+      properties:
+        sessionId:
+          type: string
+          format: uuid
+        mode:
+          type: string
+        startedAt:
+          type: string
+          format: date-time
+          nullable: true
+        endedAt:
+          type: string
+          format: date-time
+          nullable: true
+        durationSec:
+          type: integer
+          nullable: true
+        storageKeyPrefix:
+          type: string
+          nullable: true
+      additionalProperties: false
+
+    DSARExportResult:
+      type: object
+      required: [requestId, candidate, sessions, assessments, transcripts, resumes, recordings, recordingDataIncluded, exportedAt]
+      properties:
+        requestId:
+          type: string
+          format: uuid
+        candidate:
+          type: object
+          additionalProperties: true
+        sessions:
+          type: array
+          items:
+            $ref: '#/components/schemas/DSARSessionItem'
+        assessments:
+          type: array
+          items:
+            $ref: '#/components/schemas/DSARAssessmentItem'
+        transcripts:
+          type: array
+          items:
+            $ref: '#/components/schemas/DSARTranscriptItem'
+        resumes:
+          type: array
+          items:
+            $ref: '#/components/schemas/DSARResumeItem'
+        recordings:
+          type: array
+          items:
+            $ref: '#/components/schemas/DSARRecordingItem'
+        recordingDataIncluded:
+          type: boolean
+        exportedAt:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    DSAREnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/DSARRequest'
+      additionalProperties: false
+
+    DSARListEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/DSARRequest'
+      additionalProperties: false
+
+    DSARWithExportEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/DSARRequest'
+        export:
+          $ref: '#/components/schemas/DSARExportResult'
+      additionalProperties: false
+
+    DSARExportEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/DSARExportResult'
+      additionalProperties: false
+
+    DSARDeleteEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [success, deleted_entities]
+          properties:
+            success:
+              type: boolean
+            deleted_entities:
+              type: array
+              items:
+                type: string
+          additionalProperties: false
+      additionalProperties: false
+
+    DSARDeleteConflict:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [type, message, holds]
+          properties:
+            type:
+              type: string
+            message:
+              type: string
+            holds:
+              type: array
+              items:
+                $ref: '#/components/schemas/LegalHoldSummary'
+          additionalProperties: false
+      additionalProperties: false
+
+    DSARCorrectEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [success, corrections]
+          properties:
+            success:
+              type: boolean
+            corrections:
+              type: array
+              items:
+                type: object
+                required: [field, oldValue, newValue]
+                properties:
+                  field:
+                    type: string
+                  oldValue: {}
+                  newValue: {}
+                additionalProperties: false
+          additionalProperties: false
+      additionalProperties: false
+
+    LegalHoldSummary:
+      type: object
+      required: [id, hold_reason, hold_source, placed_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        hold_reason:
+          type: string
+        hold_source:
+          type: string
+        placed_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+      additionalProperties: false
+
+    LegalHold:
+      type: object
+      required: [id, entityType, entityId, holdReason, holdSource, placedBy, placedAt, releasedAt, releasedBy, releaseReason, expiresAt, metadata]
+      properties:
+        id:
+          type: string
+          format: uuid
+        entityType:
+          type: string
+          enum: [candidate, session, transcript, recording, assessment, resume]
+        entityId:
+          type: string
+          format: uuid
+        holdReason:
+          type: string
+        holdSource:
+          type: string
+          enum: [court_order, internal_investigation, litigation_hold, regulatory, other]
+        placedBy:
+          type: string
+        placedAt:
+          type: string
+          format: date-time
+        releasedAt:
+          type: string
+          format: date-time
+          nullable: true
+        releasedBy:
+          type: string
+          nullable: true
+        releaseReason:
+          type: string
+          nullable: true
+        expiresAt:
+          type: string
+          format: date-time
+          nullable: true
+        metadata:
+          type: object
+          nullable: true
+      additionalProperties: false
+
+    LegalHoldEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/LegalHold'
+      additionalProperties: false
+
+    LegalHoldRowEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [id, entity_type, entity_id, hold_reason, hold_source, placed_by, placed_at, expires_at, released_at]
+          properties:
+            id:
+              type: string
+              format: uuid
+            entity_type:
+              type: string
+            entity_id:
+              type: string
+            hold_reason:
+              type: string
+            hold_source:
+              type: string
+            placed_by:
+              type: string
+            placed_at:
+              type: string
+              format: date-time
+            released_at:
+              type: string
+              format: date-time
+              nullable: true
+            released_by:
+              type: string
+              nullable: true
+            release_reason:
+              type: string
+              nullable: true
+            expires_at:
+              type: string
+              format: date-time
+              nullable: true
+            metadata:
+              type: object
+              nullable: true
+            created_at:
+              type: string
+              format: date-time
+            updated_at:
+              type: string
+              format: date-time
+          additionalProperties: true
+
+    LegalHoldCheck:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [entity_type, entity_id, under_legal_hold, erasure_blocked, active_holds]
+          properties:
+            entity_type:
+              type: string
+            entity_id:
+              type: string
+              format: uuid
+            under_legal_hold:
+              type: boolean
+            erasure_blocked:
+              type: boolean
+            active_holds:
+              type: array
+              items:
+                $ref: '#/components/schemas/LegalHoldSummary'
+          additionalProperties: false
+      additionalProperties: false
+
+    # ── Consent ──────────────────────────────────────────────────────
+    ConsentSubmitResponse:
+      type: object
+      required: [id, candidate_id, status, consents, version, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        candidate_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [granted, declined, withdrawn]
+        consents:
+          type: array
+          items:
+            type: string
+        version:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    ConsentStatusResponse:
+      type: object
+      required: [candidate_id, has_consent, has_ai_consent, has_recording_consent, latest_consent]
+      properties:
+        candidate_id:
+          type: string
+          format: uuid
+        has_consent:
+          type: boolean
+        has_ai_consent:
+          type: boolean
+        has_recording_consent:
+          type: boolean
+        latest_consent:
+          type: object
+          required: [id, status, consents, version, created_at]
+          properties:
+            id:
+              type: string
+              format: uuid
+            status:
+              type: string
+              enum: [granted, declined, withdrawn]
+            consents:
+              type: array
+              items:
+                type: string
+            version:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+          additionalProperties: false
+          nullable: true
+      additionalProperties: false
+
+    ConsentCheckResponse:
+      type: object
+      required: [ok, missing]
+      properties:
+        ok:
+          type: boolean
+        missing:
+          type: array
+          items:
+            type: string
+      additionalProperties: false
+
+    ConsentWithdrawResponse:
+      type: object
+      required: [id, status, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [granted, declined, withdrawn]
+        updated_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    ConsentTemplate:
+      type: object
+      required: [id, version, locale, title, body_md, required_consents, is_active]
+      properties:
+        id:
+          type: string
+          format: uuid
+        version:
+          type: string
+        locale:
+          type: string
+        title:
+          type: string
+        body_md:
+          type: string
+        required_consents:
+          type: array
+          items:
+            type: string
+        is_active:
+          type: boolean
+      additionalProperties: false
+
+    # ── Request bodies ───────────────────────────────────────────────
+    CreateRoleRequest:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string
+        jd:
+          type: string
+          nullable: true
+        required_skills:
+          type: array
+          items:
+            type: string
+        screening_template:
+          type: array
+          items:
+            $ref: '#/components/schemas/ScreeningQuestion'
+      additionalProperties: false
+
+    UpdateRoleRequest:
+      type: object
+      properties:
+        title:
+          type: string
+        jd:
+          type: string
+          nullable: true
+        required_skills:
+          type: array
+          items:
+            type: string
+        screening_template:
+          type: array
+          items:
+            $ref: '#/components/schemas/ScreeningQuestion'
+        is_active:
+          type: boolean
+      additionalProperties: false
+
+    StartScreeningRequest:
+      type: object
+      required: [candidate_id]
+      properties:
+        candidate_id:
+          type: string
+          format: uuid
+      additionalProperties: false
+
+    ScreeningTurnRequest:
+      type: object
+      required: [text]
+      properties:
+        text:
+          type: string
+      additionalProperties: false
+
+    LiveKitStartRequest:
+      type: object
+      required: [candidate_id]
+      properties:
+        candidate_id:
+          type: string
+          format: uuid
+      additionalProperties: false
+
+    RecordingGrantRequest:
+      type: object
+      required: [grant_token, session_id]
+      properties:
+        grant_token:
+          type: string
+        session_id:
+          type: string
+          format: uuid
+      additionalProperties: false
+
+    WorkerContextRequest:
+      type: object
+      required: [session_id, room_name]
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        room_name:
+          type: string
+      additionalProperties: false
+
+    InviteCreateRequest:
+      type: object
+      required: [candidate_id, session_id]
+      properties:
+        candidate_id:
+          type: string
+          format: uuid
+        session_id:
+          type: string
+          format: uuid
+      additionalProperties: false
+
+    InviteExchangeRequest:
+      type: object
+      required: [token]
+      properties:
+        token:
+          type: string
+      additionalProperties: false
+
+    CreateDSARRequest:
+      type: object
+      required: [candidate_id, request_type]
+      properties:
+        candidate_id:
+          type: string
+          format: uuid
+        request_type:
+          type: string
+          enum: [export, delete, correct, restrict]
+        notes:
+          type: string
+        metadata:
+          type: object
+      additionalProperties: false
+
+    FulfillDSARRequest:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [fulfilled, rejected, cancelled]
+        rejection_reason:
+          type: string
+      additionalProperties: false
+
+    CorrectDSARRequest:
+      type: object
+      required: [corrections]
+      properties:
+        corrections:
+          type: array
+          items:
+            type: object
+            required: [field]
+            properties:
+              field:
+                type: string
+              value: {}
+            additionalProperties: false
+      additionalProperties: false
+
+    CreateLegalHoldRequest:
+      type: object
+      required: [entity_type, entity_id, hold_reason, hold_source]
+      properties:
+        entity_type:
+          type: string
+          enum: [candidate, session, transcript, recording, assessment, resume]
+        entity_id:
+          type: string
+          format: uuid
+        hold_reason:
+          type: string
+        hold_source:
+          type: string
+          enum: [court_order, internal_investigation, litigation_hold, regulatory, other]
+        expires_at:
+          type: string
+          format: date-time
+        metadata:
+          type: object
+      additionalProperties: false
+
+    ReleaseLegalHoldRequest:
+      type: object
+      required: [release_reason]
+      properties:
+        release_reason:
+          type: string
+      additionalProperties: false
+
+    ConsentSubmitRequest:
+      type: object
+      required: [candidate_id, consents]
+      properties:
+        candidate_id:
+          type: string
+          format: uuid
+        version:
+          type: string
+        consents:
+          type: array
+          items:
+            type: string
+        status:
+          type: string
+          enum: [granted, declined, withdrawn]
+        proof:
+          type: object
+        expires_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    ConsentCheckRequest:
+      type: object
+      required: [candidate_id]
+      properties:
+        candidate_id:
+          type: string
+          format: uuid
+        required:
+          type: array
+          items:
+            type: string
+      additionalProperties: false
+
+    ConsentWithdrawRequest:
+      type: object
+      required: [candidate_id]
+      properties:
+        candidate_id:
+          type: string
+          format: uuid
+        consent_types:
+          type: array
+          items:
+            type: string
+        reason:
+          type: string
+      additionalProperties: false

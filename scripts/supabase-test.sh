@@ -3,6 +3,20 @@
 # Starts only ephemeral local containers and uses synthetic identities/data.
 # Also applies the GOV-06 synthetic seed, verifies idempotent rerun, and
 # runs SQL integration tests — all within the same local-stack lifetime.
+#
+# Phase 6 lane L4 (TST-15): adds the migration rollback / compatibility gate.
+# Supabase migrations are FORWARD-ONLY by strategy — no per-migration
+# down-migration files exist for 0001-0013 and none are invented here (see
+# docs/runbooks/supabase-migration-strategy.md "Rollback" and
+# docs/runbooks/phase6-testing-ci.md). Rollback verification therefore =
+#   (a) OFFLINE static half: contract-continuity + destructive-change
+#       detector (scripts/migrate-rollback.test.mjs, run first, no DB);
+#   (b) DYNAMIC half: CLEAN RESET / ROLL-FORWARD rehearsal (db reset applies
+#       0001..0013 from pristine) + RESTORE rehearsal (a SECOND clean reset
+#       reproduces an identical table/column/type inventory plus drift check).
+# This proves the migration set can always be rebuilt from clean state — the
+# sanctioned substitute for reverse SQL. Distinguish this from any claim of
+# reverse-SQL rollback, which remains unsupported.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -19,6 +33,10 @@ cleanup() {
   rm -f "$RESULTS_FILE"
 }
 trap cleanup EXIT INT TERM
+
+# ── TST-15 static half (offline; runs BEFORE any container is started) ──
+log 'TST-15: Running offline migration rollback/compatibility verifier...'
+node scripts/migrate-rollback.test.mjs
 
 command -v docker >/dev/null || { log 'ERROR: Docker is required.'; exit 1; }
 command -v curl >/dev/null || { log 'ERROR: curl is required.'; exit 1; }
@@ -37,36 +55,49 @@ supabase_cli db reset
 # ===================================================================
 # MIG-03: Local drift/diff proof — verify schema matches migrations
 # ===================================================================
-log 'MIG-03: Running local schema drift check (supabase db diff)...'
-# Compare the local database schema against the committed migration files.
-# On a clean database the pinned CLI still prints informational output
-# ("No schema changes found" plus a JSON summary whose "diff" field is "").
-# Drift must therefore be detected from the actual diff PAYLOAD, not from the
-# mere presence of output — otherwise a clean run is misread as drift.
-#
-# This is a LOCAL-ONLY check against an ephemeral container.  It does NOT
-# touch any hosted or production database.
-if supabase_cli db diff --use-pg-delta --schema public,screening_v2 > /tmp/supabase-diff-output.txt 2>&1; then
-  # Clean signals emitted by the pinned CLI when the schema matches migrations.
-  if grep -qiE 'no schema changes found|"diff"[[:space:]]*:[[:space:]]*""' /tmp/supabase-diff-output.txt; then
-    log 'MIG-03: PASS — No schema drift. Local database matches migrations.'
+# Drift check, factored so both MIG-03 (after first reset) and TST-15 (after
+# the restore-rehearsal re-apply) can use it. Compare the local database
+# schema against the committed migration files. On a clean database the
+# pinned CLI still prints informational output ("No schema changes found"
+# plus a JSON summary whose "diff" field is ""). Drift must therefore be
+# detected from the actual diff PAYLOAD, not from the mere presence of
+# output — otherwise a clean run is misread as drift. LOCAL-ONLY against
+# an ephemeral container; never touches hosted/production.
+check_no_drift() {
+  local label="$1"
+  log "${label}: Running local schema drift check (supabase db diff)..."
+  if supabase_cli db diff --use-pg-delta --schema public,screening_v2 > /tmp/supabase-diff-output.txt 2>&1; then
+    # Clean signals emitted by the pinned CLI when the schema matches migrations.
+    if grep -qiE 'no schema changes found|"diff"[[:space:]]*:[[:space:]]*""' /tmp/supabase-diff-output.txt; then
+      log "${label}: PASS — No schema drift. Local database matches migrations."
+    else
+      log "${label}: FAIL — Schema drift detected. Unexpected diff output follows:"
+      cat /tmp/supabase-diff-output.txt
+      log "${label}: This means the local database schema differs from the committed"
+      log "${label}: migrations. Possible causes: manual DDL, uncommitted migration"
+      log "${label}: changes, or shadow-database corruption. Run supabase db reset"
+      log "${label}: to restore parity, then investigate the root cause."
+      exit 1
+    fi
   else
-    log 'MIG-03: FAIL — Schema drift detected. Unexpected diff output follows:'
-    cat /tmp/supabase-diff-output.txt
-    log 'MIG-03: This means the local database schema differs from the committed'
-    log 'MIG-03: migrations. Possible causes: manual DDL, uncommitted migration'
-    log 'MIG-03: changes, or shadow-database corruption. Run supabase db reset'
-    log 'MIG-03: to restore parity, then investigate the root cause.'
-    exit 1
+    # CLI does not support --use-pg-delta (e.g., older version, or the
+    # pg-delta engine is not available on this platform). In CI mode
+    # (GITHUB_ACTIONS=true or CI=true) this is a hard failure because the
+    # drift gate cannot be verified; in local mode the skip is documented
+    # and permitted.
+    if [ "${GITHUB_ACTIONS:-}" = "true" ] || [ "${CI:-}" = "true" ]; then
+      log "${label}: FAIL — supabase db diff --use-pg-delta unavailable in CI; drift gate cannot be verified"
+      log "${label}: Reason: $(cat /tmp/supabase-diff-output.txt 2>/dev/null || echo 'non-zero exit from CLI')"
+      exit 1
+    fi
+    log "${label}: SKIPPED — supabase db diff --use-pg-delta unavailable (local mode, documented)"
+    log "${label}: Reason: $(cat /tmp/supabase-diff-output.txt 2>/dev/null || echo 'non-zero exit from CLI')"
   fi
-else
-  # CLI does not support --use-pg-delta (e.g., older version, or the pg-delta
-  # engine is not available on this platform).  This is a documented opt-out;
-  # it does NOT indicate a pass or fail for the drift check.
-  log 'MIG-03: SKIPPED — supabase db diff --use-pg-delta unavailable'
-  log "MIG-03: Reason: $(cat /tmp/supabase-diff-output.txt 2>/dev/null || echo 'non-zero exit from CLI')"
-fi
-rm -f /tmp/supabase-diff-output.txt
+  rm -f /tmp/supabase-diff-output.txt
+}
+
+check_no_drift 'MIG-03'
+
 
 log 'GOV-06: Verifying seed was auto-applied by db reset (proving config.toml wired seed)...'
 # This is empty-seed-scenario proof: if db reset did NOT auto-apply the seed,
@@ -169,4 +200,54 @@ if grep -Eq '[[:space:]]FAIL([[:space:]]|$)' "$RESULTS_FILE"; then
 fi
 log 'GOV-06: Synthetic seed SQL integration tests passed.'
 
-log 'All local Supabase migration, policy, and synthetic seed checks passed.'
+# =====================================================================
+# TST-15 rollback rehearsal — clean reset / roll-forward / restore
+# (Phase 6 lane L4). No reverse SQL exists or is invented; this proves the
+# sanctioned recovery path: the committed migration set can always be
+# rebuilt from a pristine database with an identical schema and zero drift.
+# =====================================================================
+
+# Snapshot the post-reset schema inventory (tables + columns in the
+# screening_v2 schema). Deterministic ordering via ORDER BY 1.
+snapshot_schema() {
+  docker exec "$SUPABASE_DB_CONTAINER" \
+    psql -U postgres -d postgres -t -A -c \
+    "select n.nspname||'.'||c.relname||':'||a.attname||':'||a.atttypid::regtype::text
+       from pg_class c
+       join pg_namespace n on n.oid = c.relnamespace
+       join pg_attribute a on a.attrelid = c.oid
+      where n.nspname = 'screening_v2'
+        and c.relkind in ('r','p','v','m')
+        and a.attnum > 0
+        and not a.attisdropped
+      order by 1"
+}
+
+log 'TST-15: Snapshotting schema inventory after the first clean reset (roll-forward baseline)...'
+BEFORE_INVENTORY="$(snapshot_schema)"
+log "TST-15: Baseline inventory lines: $(printf '%s\n' "$BEFORE_INVENTORY" | sed '/^$/d' | wc -l)"
+
+log 'TST-15: RESTORE REHEARSAL — running a SECOND clean reset (db reset re-applies 0001..0013 + auto-seed from config.toml)...'
+supabase_cli db reset
+
+log 'TST-15: Verifying seed auto-applied by the second reset (restore parity)...'
+docker exec "$SUPABASE_DB_CONTAINER" \
+  psql -U postgres -d postgres -t -A -c \
+  "select count(*) from screening_v2.roles where id = '60000000-0000-4000-a000-000000000001'" \
+  | grep -q '^1$' || { log 'ERROR: Seed was NOT auto-applied after second reset'; exit 1; }
+log 'TST-15: Seed present after second reset (roll-forward reproducible)'
+
+log 'TST-15: Re-checking schema drift after the re-apply (must be clean)...'
+check_no_drift 'TST-15'
+
+log 'TST-15: Comparing schema inventory before/after the restore rehearsal...'
+AFTER_INVENTORY="$(snapshot_schema)"
+if [ "$BEFORE_INVENTORY" != "$AFTER_INVENTORY" ]; then
+  log 'ERROR: TST-15 restore rehearsal FAILED — schema inventory differs between two clean resets.'
+  diff <(printf '%s\n' "$BEFORE_INVENTORY") <(printf '%s\n' "$AFTER_INVENTORY") | head -40
+  exit 1
+fi
+log "TST-15: PASS — restore rehearsal reproduced identical table/column/type inventory ($(printf '%s\n' "$AFTER_INVENTORY" | sed '/^$/d' | wc -l) inventory lines, zero drift)."
+log 'TST-15: Rollback gate PASSED — forward-only migrations are contract-continuous, free of destructive DDL, and deterministically re-applicable from clean state.'
+
+log 'All local Supabase migration, policy, synthetic seed, and TST-15 rollback rehearsal checks passed.'
