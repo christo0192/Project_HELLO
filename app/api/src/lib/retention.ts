@@ -18,6 +18,7 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { supabase as defaultSupabase } from './supabase.js';
+import { env } from './env.js';
 import { createLogger } from './logger.js';
 import type { EventName } from './logger.js';
 
@@ -683,5 +684,549 @@ function mapRowToGovernanceAudit(row: Record<string, unknown>): GovernanceAuditE
     outcome: row.outcome as AuditOutcome,
     correlationId: row.correlation_id as string | null,
     createdAt: row.created_at as string,
+  };
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// REC-06 (Phase 7 L6): Recording-object erasure — real deletion against
+// SYNTHETIC storage. C-4 fix: attemptErasure() above is audit-only by
+// design (it models DSAR/candidate-level erasure); this section adds the
+// net-new recording-object deletion path with legal-hold / erasure-
+// exception precedence, idempotent tombstoning, and explicit partial-
+// failure semantics. NO cloud/production writes; the default storage
+// binding is a thin Supabase-Storage remove() that tests replace with an
+// in-memory synthetic.
+// ══════════════════════════════════════════════════════════════════════
+
+/**
+ * REC-06: injectable recording-storage delete interface (synthetic-safe).
+ * `remove` MUST be idempotent — removing an absent key resolves as success
+ * (mirrors the in-memory synthetic used by tests; the production binding
+ * keeps the same contract).
+ */
+export interface RecordingStorage {
+  remove(objectKey: string): Promise<void>;
+}
+
+/**
+ * REC-06 default binding: Supabase Storage `.from(bucket).remove([key])`.
+ * Errors are surfaced (fail-closed); a not-found-tolerant wrapper for real
+ * object stores is external-pending (see docs/runbooks/phase7-recording.md).
+ */
+export function supabaseStorageRecordingStorage(
+  bucket: string,
+  clientOverride?: SupabaseClient,
+): RecordingStorage {
+  return {
+    async remove(objectKey: string): Promise<void> {
+      const client = getClient(clientOverride);
+      const { error } = await client.storage.from(bucket).remove([objectKey]);
+      if (error) {
+        throw new Error(`recording storage remove failed: ${error.message}`);
+      }
+    },
+  };
+}
+
+/**
+ * REC-06 erasure state-machine status.
+ *   completed            → object deleted, tombstoned, event appended, audited.
+ *   already_deleted      → idempotent no-op (tombstone present); no error,
+ *                          no second delete, no duplicate completion audit.
+ *   blocked_legal_hold   → fail-closed block; object untouched; audited.
+ *   blocked_exception    → fail-closed block (erasure exception); untouched.
+ *   not_found            → no such session; nothing deleted.
+ *   failed_*             → partial-failure boundary; completion NOT claimed;
+ *                          a failure-outcome audit is recorded. Retrying is
+ *                          safe: storage remove is idempotent and access is
+ *                          never resurrected once the tombstone is set.
+ */
+export type EraseRecordingStatus =
+  | 'completed'
+  | 'already_deleted'
+  | 'blocked_legal_hold'
+  | 'blocked_exception'
+  | 'not_found'
+  | 'failed_storage_delete'
+  | 'failed_tombstone'
+  | 'failed_integrity_event';
+
+export interface EraseRecordingResult {
+  status: EraseRecordingStatus;
+  correlationId: string;
+  blockedBy?: 'legal_hold' | 'erasure_exception';
+  failure?: 'storage_delete' | 'tombstone_write' | 'integrity_event_write';
+  /** Object key that was (or should have been) removed, when known. */
+  objectKey?: string | null;
+  /** True when completion was reached via evidence backfill on a retry (F3). */
+  converged?: boolean;
+}
+
+/**
+ * REC-06 (C-4): erase a recording object idempotently and tombstone the
+ * session so the L5 download/grant gate (recording_deleted_at → 404) can
+ * never re-mint or re-download it.
+ *
+ * ORDERING (documented, contract-mandated):
+ *   1. legal-hold / erasure-exception precedence → block + audit, object
+ *      untouched (reuses existing exported functions — never re-implemented);
+ *   2. idempotency + evidence convergence (recording_deleted_at IS NOT NULL):
+ *      fully-converged → already_deleted no-op (no duplicate evidence); a
+ *      missing 'deleted' event and/or success completion audit is BACKFILLED
+ *      so a retry after failed_integrity_event converges instead of losing
+ *      the append-only evidence (F3 repair);
+ *   3. storage-object delete (synthetic; absent key = success);
+ *   4. tombstone UPDATE (recording_deleted_at=now(), recording_object_key=NULL)
+ *      — access is cut from here (L5 gate returns 404);
+ *   5. append-only recording_integrity_events(event_type='deleted');
+ *   6. synthetic processor-propagation + backup-aging models (labelled
+ *      synthetic — no real DPAs / backup systems exist);
+ *   7. governance audit 'erasure_completed' (success) — ONLY written when
+ *      object deletion + tombstone + event all succeeded.
+ *
+ * PARTIAL FAILURES (explicit, never claimed as completion):
+ *   - storage delete fails      → row untouched; fully retryable; audit failure.
+ *   - tombstone write fails     → object gone, row untouched; retry re-runs
+ *     (storage remove idempotent) and completes with exactly one event + one
+ *     success audit.
+ *   - integrity-event write fails → tombstone IS set (access blocked, no
+ *     resurrection) and completion is NOT claimed; the failure is audited and
+ *     a RETRY converges/backfills the missing 'deleted' event + success
+ *     completion audit (F3 repair) — the append-only log is never left with a
+ *     tombstone and no corresponding event.
+ */
+export async function eraseRecording(
+  sessionId: string,
+  actorId: string,
+  opts: { storage?: RecordingStorage; client?: SupabaseClient; correlationId?: string } = {},
+): Promise<EraseRecordingResult> {
+  const client = getClient(opts.client);
+  const storage = opts.storage ?? supabaseStorageRecordingStorage(env.recordingsBucket, client);
+  const corrId = opts.correlationId ?? governanceCorrelationId();
+
+  // 1. Legal-hold precedence (fail-closed; reuse existing functions).
+  if (await isUnderLegalHold('recording', sessionId, undefined, client)) {
+    const activeHolds = await getActiveLegalHolds('recording', sessionId, client);
+    await recordGovernanceAudit({
+      action: 'erasure_blocked_legal_hold',
+      actorId,
+      entityType: 'recording',
+      entityId: sessionId,
+      details: {
+        block_reason: 'legal_hold',
+        hold_ids: activeHolds.map((h) => h.id),
+      },
+      outcome: 'blocked',
+      correlationId: corrId,
+    }, client);
+    return { status: 'blocked_legal_hold', blockedBy: 'legal_hold', correlationId: corrId };
+  }
+
+  // 2. Erasure-exception precedence. isErasureBlocked already re-checks holds,
+  //    so reaching this point with true implies an active exception.
+  if (await isErasureBlocked('recording', sessionId, client)) {
+    await recordGovernanceAudit({
+      action: 'erasure_blocked_legal_hold',
+      actorId,
+      entityType: 'recording',
+      entityId: sessionId,
+      details: { block_reason: 'erasure_exception' },
+      outcome: 'blocked',
+      correlationId: corrId,
+    }, client);
+    return { status: 'blocked_exception', blockedBy: 'erasure_exception', correlationId: corrId };
+  }
+
+  // 3. Idempotency + convergence (C-4 + F3 repair): an already-erased
+  //    recording is a no-op UNLESS the append-only 'deleted' evidence is
+  //    missing (a retry after failed_integrity_event). In that case the
+  //    retry BACKFILLS the missing event + success completion audit so the
+  //    log converges instead of permanently returning already_deleted.
+  const { data: session, error: sessionErr } = await client
+    .from('call_sessions')
+    .select('recording_deleted_at, recording_object_key')
+    .eq('id', sessionId)
+    .single();
+  if (sessionErr || !session) {
+    return { status: 'not_found', correlationId: corrId };
+  }
+  if (session.recording_deleted_at) {
+    const now = new Date();
+    // Existing 'deleted' event? (unique partial index ⇒ at most one).
+    const { data: existingEvent } = await client
+      .from('recording_integrity_events')
+      .select('id')
+      .eq('session_id', sessionId)
+      .eq('event_type', 'deleted')
+      .limit(1)
+      .maybeSingle();
+    // Existing success completion audit for this session?
+    const { data: existingAudit } = await client
+      .from('governance_audit')
+      .select('id')
+      .eq('action', 'erasure_completed')
+      .eq('outcome', 'success')
+      .eq('entity_id', sessionId)
+      .limit(1)
+      .maybeSingle();
+
+    if (existingEvent && existingAudit) {
+      // Fully converged: idempotent no-op (no duplicate evidence).
+      return { status: 'already_deleted', correlationId: corrId, objectKey: null };
+    }
+
+    // Backfill missing evidence (F3 repair). The unique partial index on
+    // (session_id) where event_type='deleted' makes concurrent backfills
+    // converge: a 23505 unique violation means another retry already
+    // appended it — treat as present.
+    if (!existingEvent) {
+      const { error: evErr } = await client
+        .from('recording_integrity_events')
+        .insert({
+          session_id: sessionId,
+          event_type: 'deleted',
+          detail: `recording erased via synthetic storage (corr ${corrId})`,
+          correlation_id: corrId,
+        });
+      if (evErr && evErr.code !== '23505') {
+        return { status: 'failed_integrity_event', failure: 'integrity_event_write', correlationId: corrId, objectKey: null };
+      }
+    }
+
+    // Exactly-once success completion audit — only when it is missing.
+    if (!existingAudit) {
+      const propagation = propagateErasureToProcessors(sessionId, corrId, { now });
+      const aging = await scheduleBackupAging(sessionId, 'recording', { now, client });
+      await recordGovernanceAudit({
+        action: 'erasure_completed',
+        actorId,
+        entityType: 'recording',
+        entityId: sessionId,
+        details: {
+          strategy: 'delete',
+          converged: true,
+          object_key_removed: true,
+          processors: propagation.processors,
+          backup_aging: {
+            policy_id: aging.policyId,
+            retention_days: aging.retentionDays,
+            horizon_iso: aging.horizonIso,
+            synthetic: true,
+          },
+        },
+        outcome: 'success',
+        correlationId: corrId,
+      }, client);
+    }
+
+    // Converged: completion is now truthfully claimable with exactly one
+    // deleted event + one success audit.
+    return { status: 'completed', correlationId: corrId, objectKey: null, converged: true };
+  }
+
+  const objectKey = session.recording_object_key as string | null;
+
+  // 4. Storage-object deletion (idempotent; absent key = success).
+  if (objectKey) {
+    try {
+      await storage.remove(objectKey);
+    } catch {
+      await recordGovernanceAudit({
+        action: 'erasure_completed',
+        actorId,
+        entityType: 'recording',
+        entityId: sessionId,
+        details: { strategy: 'delete', failure: 'storage_delete', object_key_removed: false },
+        outcome: 'failure',
+        correlationId: corrId,
+      }, client);
+      return { status: 'failed_storage_delete', failure: 'storage_delete', correlationId: corrId, objectKey };
+    }
+  }
+
+  // 5. Tombstone: revoke access from here (L5 gate → 404; key NULLed so no
+  //    re-mint can target the object).
+  const { error: tombErr } = await client
+    .from('call_sessions')
+    .update({
+      recording_deleted_at: new Date().toISOString(),
+      recording_object_key: null,
+    })
+    .eq('id', sessionId);
+  if (tombErr) {
+    await recordGovernanceAudit({
+      action: 'erasure_completed',
+      actorId,
+      entityType: 'recording',
+      entityId: sessionId,
+      details: { strategy: 'delete', failure: 'tombstone_write', object_key_removed: true },
+      outcome: 'failure',
+      correlationId: corrId,
+    }, client);
+    return { status: 'failed_tombstone', failure: 'tombstone_write', correlationId: corrId, objectKey };
+  }
+
+  // 6. Append-only integrity event.
+  const { error: evErr } = await client
+    .from('recording_integrity_events')
+    .insert({
+      session_id: sessionId,
+      event_type: 'deleted',
+      detail: `recording erased via synthetic storage (corr ${corrId})`,
+      correlation_id: corrId,
+    });
+  if (evErr) {
+    await recordGovernanceAudit({
+      action: 'erasure_completed',
+      actorId,
+      entityType: 'recording',
+      entityId: sessionId,
+      details: {
+        strategy: 'delete',
+        failure: 'integrity_event_write',
+        object_key_removed: true,
+        tombstoned: true,
+      },
+      outcome: 'failure',
+      correlationId: corrId,
+    }, client);
+    return { status: 'failed_integrity_event', failure: 'integrity_event_write', correlationId: corrId, objectKey: null };
+  }
+
+  // 7. Synthetic processor-propagation + backup-aging models. Intent is
+  //    recorded in the completion-audit details — modelled, NOT real DPAs
+  //    or backup systems (runbook labels these external-pending).
+  const now = new Date();
+  const propagation = propagateErasureToProcessors(sessionId, corrId, { now });
+  const aging = await scheduleBackupAging(sessionId, 'recording', { now, client });
+
+  // 8. Completion audit — only after object + tombstone + event succeeded.
+  await recordGovernanceAudit({
+    action: 'erasure_completed',
+    actorId,
+    entityType: 'recording',
+    entityId: sessionId,
+    details: {
+      strategy: 'delete',
+      object_key_removed: Boolean(objectKey),
+      processors: propagation.processors,
+      backup_aging: {
+        policy_id: aging.policyId,
+        retention_days: aging.retentionDays,
+        horizon_iso: aging.horizonIso,
+        synthetic: true,
+      },
+    },
+    outcome: 'success',
+    correlationId: corrId,
+  }, client);
+
+  return { status: 'completed', correlationId: corrId, objectKey };
+}
+
+/**
+ * REC-05 (F2 repair): revoke recording access — the write path that makes
+ * `recording_revoked_at` buildable-now (both mint paths already gate on it
+ * with a 403 before createSignedUrl).
+ *
+ * RETRY-CONVERGENT + EXACTLY-ONCE:
+ *   1. CAS update `SET recording_revoked_at = now() WHERE id = ? AND
+ *      recording_revoked_at IS NULL` — only the first caller flips it; a
+ *      concurrent or retry caller observes it already set and skips the
+ *      transition (no duplicate success evidence).
+ *   2. The append-only `revoked` integrity event is appended ONCE per
+ *      session — the unique partial index
+ *      uq_v2_recording_integrity_events_revoked_once enforces it at the DB
+ *      level, so a retry after a partial write BACKFILLS the missing event
+ *      instead of appending a duplicate or permanently no-op'ing.
+ *   3. `revoked` is returned only when a transition OR a backfill happened
+ *      (the caller audits exactly then); `already_revoked` (fully converged)
+ *      produces no duplicate audit/event.
+ */
+export type RevokeRecordingStatus =
+  | 'revoked'
+  | 'already_revoked'
+  | 'not_found'
+  | 'failed_update'
+  | 'failed_event';
+
+export interface RevokeRecordingResult {
+  status: RevokeRecordingStatus;
+  /** ISO-8601 revocation timestamp (null when the session was not found). */
+  revokedAt: string | null;
+  correlationId: string;
+  /** True when the revoked event was backfilled on a retry (convergence). */
+  backfilled?: boolean;
+}
+
+export async function revokeRecording(
+  sessionId: string,
+  actorId: string,
+  opts: { client?: SupabaseClient; reason?: string; correlationId?: string } = {},
+): Promise<RevokeRecordingResult> {
+  const client = getClient(opts.client);
+  const corrId = opts.correlationId ?? governanceCorrelationId();
+  const reason = opts.reason;
+  void actorId; // actor attribution is carried by the route audit, not stored
+
+  const { data: session, error: sessionErr } = await client
+    .from('call_sessions')
+    .select('recording_revoked_at')
+    .eq('id', sessionId)
+    .single();
+  if (sessionErr || !session) {
+    return { status: 'not_found', revokedAt: null, correlationId: corrId };
+  }
+
+  let transitioned = false;
+  let revokedAt: string | null = (session.recording_revoked_at as string | null) ?? null;
+  if (session.recording_revoked_at === null) {
+    const stamped = new Date().toISOString();
+    const { data: updated, error: updErr } = await client
+      .from('call_sessions')
+      .update({ recording_revoked_at: stamped })
+      .eq('id', sessionId)
+      .is('recording_revoked_at', null)
+      .select('recording_revoked_at');
+    if (updErr) {
+      return { status: 'failed_update', revokedAt: null, correlationId: corrId };
+    }
+    const matched = Array.isArray(updated) ? updated.length > 0 : Boolean(updated);
+    if (matched) {
+      transitioned = true;
+      revokedAt = stamped;
+    } else {
+      // Lost the CAS race (concurrent revocation) — read the winner's stamp.
+      const { data: nowRow } = await client
+        .from('call_sessions')
+        .select('recording_revoked_at')
+        .eq('id', sessionId)
+        .single();
+      revokedAt = (nowRow?.recording_revoked_at as string | null) ?? revokedAt;
+    }
+  }
+
+  // Converge the append-only 'revoked' event (backfill on retry).
+  const { data: existingEvent } = await client
+    .from('recording_integrity_events')
+    .select('id')
+    .eq('session_id', sessionId)
+    .eq('event_type', 'revoked')
+    .limit(1)
+    .maybeSingle();
+
+  let backfilled = false;
+  if (!existingEvent) {
+    const { error: evErr } = await client
+      .from('recording_integrity_events')
+      .insert({
+        session_id: sessionId,
+        event_type: 'revoked',
+        detail: `recording access revoked (corr ${corrId})` + (reason ? `: ${reason}` : ''),
+        correlation_id: corrId,
+      });
+    if (evErr && evErr.code !== '23505') {
+      // A 23505 unique violation means a concurrent retry already appended
+      // the event — that is convergence, not failure.
+      return { status: 'failed_event', revokedAt, correlationId: corrId };
+    }
+    // A backfill is only "repairing a partial write" when THIS call did not
+    // perform the transition (the transition itself appends its own event).
+    backfilled = !transitioned && !evErr;
+  }
+
+  const status: RevokeRecordingStatus =
+    transitioned || backfilled ? 'revoked' : 'already_revoked';
+  return { status, revokedAt, correlationId: corrId, backfilled };
+}
+
+/**
+ * REC-06 (SYNTHETIC STUB): models the intent to propagate an erasure to
+ * downstream processors (e.g. a future LiveKit Egress MP3 store or a
+ * transcript/derived-data worker). There are NO real processor DPAs or
+ * worker pipelines — this returns deterministic intent so the completion
+ * audit can prove propagation was modelled, not faked.
+ */
+export interface ProcessorErasureIntent {
+  sessionId: string;
+  correlationId: string | null;
+  recordedAt: string;
+  processors: Array<{
+    id: string;
+    synthetic: true;
+    erasure_forwarded: boolean;
+    note: string;
+  }>;
+}
+
+export function propagateErasureToProcessors(
+  sessionId: string,
+  correlationId?: string | null,
+  opts: { now?: Date } = {},
+): ProcessorErasureIntent {
+  return {
+    sessionId,
+    correlationId: correlationId ?? null,
+    recordedAt: (opts.now ?? new Date()).toISOString(),
+    processors: [
+      {
+        id: 'livekit_egress_mp3',
+        synthetic: true,
+        erasure_forwarded: true,
+        note: 'modelled intent only — no real DPA/worker pipeline (external-pending)',
+      },
+    ],
+  };
+}
+
+/**
+ * REC-06 (SYNTHETIC MODEL): computes the backup-expiry horizon from the
+ * data category's retention policy. No real backup system exists; the
+ * horizon is a deterministic model output (given `now`) so a future real
+ * backup-aging job has a stable contract to implement. retentionDays -1
+ * (D-009 retain-default = indefinite) or a missing policy yields a null
+ * horizon (no expiry computed).
+ */
+export interface BackupAgingPlan {
+  sessionId: string;
+  dataCategory: DataCategory;
+  policyId: string | null;
+  retentionDays: number | null;
+  strategy: RetentionStrategy | null;
+  /** ISO-8601 expiry horizon; null when indefinite (-1) or no policy. */
+  horizonIso: string | null;
+  synthetic: true;
+}
+
+export async function scheduleBackupAging(
+  sessionId: string,
+  dataCategory: DataCategory,
+  opts: { now?: Date; client?: SupabaseClient } = {},
+): Promise<BackupAgingPlan> {
+  const now = opts.now ?? new Date();
+  const policy = await getRetentionPolicy(dataCategory, opts.client);
+  if (!policy) {
+    return {
+      sessionId,
+      dataCategory,
+      policyId: null,
+      retentionDays: null,
+      strategy: null,
+      horizonIso: null,
+      synthetic: true,
+    };
+  }
+  const horizon =
+    policy.retentionDays !== null && policy.retentionDays >= 0
+      ? new Date(now.getTime() + policy.retentionDays * 86_400_000).toISOString()
+      : null;
+  return {
+    sessionId,
+    dataCategory,
+    policyId: policy.id,
+    retentionDays: policy.retentionDays,
+    strategy: policy.strategy,
+    horizonIso: horizon,
+    synthetic: true,
   };
 }

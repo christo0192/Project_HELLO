@@ -1,24 +1,34 @@
 /**
- * MIG-06: Test suite for GET /api/recordings/:sessionId/download.
+ * MIG-06 / REC-03/04/05 (Phase 7 L5): test suite for
+ *   - GET /api/recordings/:sessionId/download
+ *     (recruiter download + revocation/quarantine/deleted gate)
+ *   - POST /api/livekit/:sessionId/recording (hardened upload path)
+ *   - POST /api/livekit/grant/recording (route-shadow fixed)
  *
- * Covers:
- * - route absent from PUBLIC_ROUTES (bearer auth applies)
- * - unauthenticated 401
- * - inactive membership 403 (auth middleware)
- * - admin / viewer read-all (reach handler; 200 on real object, 404 otherwise)
- * - interviewer owns → 200; interviewer non-owner → 403
- * - malformed session id 400
- * - missing object key 404
- * - signing failure → redacted stable 500
- * - rate-limit headers present (per-endpoint strict limiter mounted)
- * - response returns a signed URL that is never persisted (no DB write)
- * - candidate grant POST /api/livekit/grant/recording behavior unchanged
+ * Covers (negative controls are asserted as designed):
+ *   - route absent from PUBLIC_ROUTES; unauthenticated 401; inactive 403
+ *   - admin/viewer read-all 200; interviewer owner 200; non-owner 403
+ *   - malformed session id 400; missing object key 404
+ *   - deleted tombstone → 404; quarantined → 409; revoked → 403 (download + grant mint)
+ *   - signing failure → redacted stable 500
+ *   - upload: 413 oversize (multer LIMIT_FILE_SIZE, not 500)
+ *   - upload: 415 spoofed magic / MIME↔extension mismatch / polyglot
+ *   - upload: 200 valid WebM/OGG/MP3/M4A fixtures
+ *   - upload: 422 EICAR (test scanner) + prod fail-closed scanner
+ *   - upload: 403 cross-session grant; 401 no-grant-no-owner; 200 owner recruiter;
+ *     403 non-owner interviewer; 409 second upload (quota)
+ *   - integrity: sha256/size/content_type/provenance/verified_at persisted +
+ *     'uploaded' event row
+ *   - quarantine: tampered-digest fixture → recording_quarantined=true +
+ *     mismatch_quarantined event; download → 409 (no signed URL)
+ *   - route-shadow: POST /grant/recording reaches the real handler (no 400 shadow)
  *
  * Supabase is mocked (repo convention) so the route never touches a live DB.
  */
 
 import { describe, expect, it, beforeEach } from 'vitest';
 import request from 'supertest';
+import { createHash } from 'node:crypto';
 import { createApp } from '../app.js';
 import { isPublicRoute, PUBLIC_ROUTES } from '../lib/auth.js';
 import { setRateLimitStore, MemoryRateLimitStore } from '../lib/rate-limit.js';
@@ -27,41 +37,107 @@ import { vi } from 'vitest';
 // ── Supabase mock (chainable query builder + storage) ────────────────
 
 const mockFrom = vi.fn();
+const mockUpload = vi.fn();
 const mockCreateSignedUrl = vi.fn();
+const mockDownload = vi.fn();
+const mockRemove = vi.fn();
+const mockRpc = vi.fn();
+const mockAuthGetUser = vi.fn();
 vi.mock('../lib/supabase.js', () => ({
   supabase: {
     from: (...args: unknown[]) => mockFrom(...args),
+    rpc: (...args: unknown[]) => mockRpc(...args),
+    auth: { getUser: (...a: unknown[]) => mockAuthGetUser(...a) },
     storage: {
       from: (..._args: unknown[]) => ({
+        upload: (...a: unknown[]) => mockUpload(...a),
         createSignedUrl: (...a: unknown[]) => mockCreateSignedUrl(...a),
+        download: (...a: unknown[]) => mockDownload(...a),
+        remove: (...a: unknown[]) => mockRemove(...a),
       }),
     },
   },
   RESUME_BUCKET: 'resumes_v2',
 }));
 
-/** Chainable Supabase query-builder mock that resolves to `value`. */
-function chain(value: unknown) {
+/** Chainable Supabase query-builder mock that resolves to `value` and
+ *  records insert/update payloads for later assertions. */
+function chain(value: unknown, insertCalls: unknown[], updateCalls: unknown[]) {
   const c: Record<string, unknown> = {};
-  const methods = ['select', 'insert', 'update', 'delete', 'eq', 'single', 'maybeSingle', 'order', 'limit'];
+  const methods = ['select', 'insert', 'update', 'delete', 'upsert', 'eq', 'is', 'single', 'maybeSingle', 'order', 'limit'];
   for (const m of methods) {
-    c[m] = (..._args: unknown[]) => chain(value);
+    c[m] = (...args: unknown[]) => {
+      if (m === 'insert') insertCalls.push(args[0]);
+      if (m === 'update') updateCalls.push(args[0]);
+      return chain(value, insertCalls, updateCalls);
+    };
   }
   c.then = (resolve: (v: unknown) => unknown) => Promise.resolve(value).then(resolve);
   c.catch = (reject: (e: unknown) => unknown) => Promise.resolve(value).catch(reject);
   return c;
 }
 
+let insertCalls: unknown[] = [];
+let updateCalls: unknown[] = [];
+
+/** Configure per-table resolved values (Supabase response shape). Missing
+ *  tables resolve { data: null, error: null }. Values are the row(s). */
+function configureTables(config: Record<string, unknown>) {
+  mockFrom.mockImplementation((table: string) => {
+    const v = config[table];
+    const resolved = v === undefined ? { data: null, error: null } : { data: v, error: null };
+    return chain(resolved, insertCalls, updateCalls);
+  });
+}
+
 // ── Fixtures ──────────────────────────────────────────────────────────
 
 const VALID_SESSION = '00000000-0000-4000-8000-000000000001';
-const OBJECT_KEY = 'sessions/00000000-0000-4000-8000-000000000001/recording.mp4';
-const SIGNED_URL = 'https://storage.example.invalid/signed/recording.mp4?token=x';
+const OTHER_SESSION = '00000000-0000-4000-8000-000000000002';
+const OBJECT_KEY = 'sessions/00000000-0000-4000-8000-000000000001/recording.webm';
+const SIGNED_URL = 'https://storage.example.invalid/signed/recording.webm?token=x';
+const GRANT_TOKEN = 'a'.repeat(64);
+
+const GRANT_PAYLOAD = {
+  candidate_id: '00000000-0000-4000-8000-000000000021',
+  session_id: VALID_SESSION,
+  room_name: `screening-${VALID_SESSION}`,
+  expires_at: '2099-01-01T00:00:00.000Z',
+  consumed_at: null,
+  revoked_at: null,
+};
+
+const UPLOAD_SESSION = {
+  id: VALID_SESSION,
+  owner_id: 'interviewer-1',
+  recording_object_key: null,
+  recording_sha256: null,
+};
+
+// Synthetic minimal audio fixtures — valid magic bytes only (no real media).
+const WEBM_MAGIC = Buffer.from([0x1a, 0x45, 0xdf, 0xa3]);
+function webmBuf(extra = 'demo-webm-payload'): Buffer {
+  return Buffer.concat([WEBM_MAGIC, Buffer.from(extra)]);
+}
+function oggBuf(): Buffer {
+  return Buffer.concat([Buffer.from('OggS'), Buffer.from('demo-ogg-payload')]);
+}
+function mp3Buf(): Buffer {
+  return Buffer.concat([
+    Buffer.from('ID3'),
+    Buffer.from([0x03, 0x00, 0x00, 0x00, 0x00, 0x00]),
+    Buffer.from('demo-mp3-payload'),
+  ]);
+}
+function mp4Buf(): Buffer {
+  return Buffer.concat([
+    Buffer.from([0x00, 0x00, 0x00, 0x20]),
+    Buffer.from('ftypisom'),
+    Buffer.from('demo-m4a-payload'),
+  ]);
+}
 
 // JWT-shaped token whose payload decodes to {"sub":"user-001","aal":"aal2"}.
-// The auth middleware (extractBearerToken + deriveAalFromJwt) requires a
-// real JWT shape (>= 16 chars, contains dots) and reads AAL from the payload,
-// so a placeholder like "mock-token" is rejected at 401 before the DI seam.
 const JWT_AAL2 =
   'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyLTAwMSIsImFhbCI6ImFhbDIifQ.signature';
 const AUTH_HEADER = `Bearer ${JWT_AAL2}`;
@@ -96,10 +172,26 @@ describe('GET /api/recordings/:sessionId/download', () => {
   beforeEach(() => {
     setRateLimitStore(new MemoryRateLimitStore(100_000));
     mockFrom.mockReset();
+    mockUpload.mockReset();
     mockCreateSignedUrl.mockReset();
-    // Default: no session row found; signing not configured.
-    mockFrom.mockImplementation(() => chain({ data: null, error: null }));
+    mockDownload.mockReset();
+    mockRemove.mockReset();
+    mockRpc.mockReset();
+    insertCalls = [];
+    updateCalls = [];
+    configureTables({});
     mockCreateSignedUrl.mockResolvedValue({ data: null, error: { message: 'no' } });
+    mockRemove.mockResolvedValue({ data: null, error: null });
+    // Default RPC: finalize_recording_upload → ok, quarantine_recording → quarantined
+    mockRpc.mockImplementation((fn: string) => {
+      if (fn === 'finalize_recording_upload') {
+        return Promise.resolve({ data: { status: 'ok' }, error: null });
+      }
+      if (fn === 'quarantine_recording') {
+        return Promise.resolve({ data: { status: 'quarantined' }, error: null });
+      }
+      return Promise.resolve({ data: null, error: { message: 'unknown rpc' } });
+    });
   });
 
   // ── Route not public ──────────────────────────────────────────────
@@ -133,9 +225,9 @@ describe('GET /api/recordings/:sessionId/download', () => {
 
   // ── Interviewer non-owner 403 ─────────────────────────────────────
   it('returns 403 when interviewer does not own the session', async () => {
-    mockFrom.mockImplementation(() =>
-      chain({ data: { owner_id: 'someone-else', recording_object_key: OBJECT_KEY }, error: null }),
-    );
+    configureTables({
+      call_sessions: { owner_id: 'someone-else', recording_object_key: OBJECT_KEY },
+    });
     const app = createTestApp(authAs('interviewer', 'interviewer-1'));
     const res = await request(app)
       .get(`/api/recordings/${VALID_SESSION}/download`)
@@ -145,9 +237,9 @@ describe('GET /api/recordings/:sessionId/download', () => {
 
   // ── Interviewer owner 200 ─────────────────────────────────────────
   it('returns a signed URL when interviewer owns the session', async () => {
-    mockFrom.mockImplementation(() =>
-      chain({ data: { owner_id: 'interviewer-1', recording_object_key: OBJECT_KEY }, error: null }),
-    );
+    configureTables({
+      call_sessions: { owner_id: 'interviewer-1', recording_object_key: OBJECT_KEY },
+    });
     mockCreateSignedUrl.mockResolvedValue({ data: { signedUrl: SIGNED_URL }, error: null });
     const app = createTestApp(authAs('interviewer', 'interviewer-1'));
     const res = await request(app)
@@ -157,13 +249,11 @@ describe('GET /api/recordings/:sessionId/download', () => {
     expect(res.body.url).toBe(SIGNED_URL);
   });
 
-  // ── Viewer read-all 200 (regression: viewer must not be denied) ───
-  // The Phase-1 policy (0007 "scoped recruiter read call_sessions") grants
-  // admin/viewer read-all. A 403 here would mean the viewer was wrongly denied.
+  // ── Viewer read-all 200 ───────────────────────────────────────────
   it('allows an active viewer to read any session (200)', async () => {
-    mockFrom.mockImplementation(() =>
-      chain({ data: { owner_id: 'someone-else', recording_object_key: OBJECT_KEY }, error: null }),
-    );
+    configureTables({
+      call_sessions: { owner_id: 'someone-else', recording_object_key: OBJECT_KEY },
+    });
     mockCreateSignedUrl.mockResolvedValue({ data: { signedUrl: SIGNED_URL }, error: null });
     const app = createTestApp(authAs('viewer', 'viewer-1'));
     const res = await request(app)
@@ -176,9 +266,9 @@ describe('GET /api/recordings/:sessionId/download', () => {
 
   // ── Admin read-all 200; never persists the URL ────────────────────
   it('returns a signed URL for admin and never writes it back to the DB', async () => {
-    mockFrom.mockImplementation(() =>
-      chain({ data: { owner_id: 'someone-else', recording_object_key: OBJECT_KEY }, error: null }),
-    );
+    configureTables({
+      call_sessions: { owner_id: 'someone-else', recording_object_key: OBJECT_KEY },
+    });
     mockCreateSignedUrl.mockResolvedValue({ data: { signedUrl: SIGNED_URL }, error: null });
     const app = createTestApp(authAs('admin', 'admin-1'));
     const res = await request(app)
@@ -206,9 +296,9 @@ describe('GET /api/recordings/:sessionId/download', () => {
 
   // ── Missing object key 404 ────────────────────────────────────────
   it('returns 404 when session has no recording_object_key', async () => {
-    mockFrom.mockImplementation(() =>
-      chain({ data: { owner_id: 'admin-1', recording_object_key: null }, error: null }),
-    );
+    configureTables({
+      call_sessions: { owner_id: 'admin-1', recording_object_key: null },
+    });
     const app = createTestApp(authAs('admin', 'admin-1'));
     const res = await request(app)
       .get(`/api/recordings/${VALID_SESSION}/download`)
@@ -216,11 +306,68 @@ describe('GET /api/recordings/:sessionId/download', () => {
     expect(res.status).toBe(404);
   });
 
+  // ── Deleted tombstone 404 (REC-06 forward-compat) ────────────────
+  it('returns 404 when the recording is tombstoned (recording_deleted_at set)', async () => {
+    configureTables({
+      call_sessions: {
+        owner_id: 'admin-1',
+        recording_object_key: OBJECT_KEY,
+        recording_deleted_at: '2026-01-01T00:00:00.000Z',
+        recording_quarantined: false,
+        recording_revoked_at: null,
+      },
+    });
+    const app = createTestApp(authAs('admin', 'admin-1'));
+    const res = await request(app)
+      .get(`/api/recordings/${VALID_SESSION}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(404);
+    expect(mockCreateSignedUrl).not.toHaveBeenCalled();
+  });
+
+  // ── Quarantined 409 (REC-04: never serve) ────────────────────────
+  it('returns 409 and never mints a signed URL for a quarantined recording', async () => {
+    configureTables({
+      call_sessions: {
+        owner_id: 'admin-1',
+        recording_object_key: OBJECT_KEY,
+        recording_quarantined: true,
+        recording_revoked_at: null,
+        recording_deleted_at: null,
+      },
+    });
+    const app = createTestApp(authAs('admin', 'admin-1'));
+    const res = await request(app)
+      .get(`/api/recordings/${VALID_SESSION}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(409);
+    expect(mockCreateSignedUrl).not.toHaveBeenCalled();
+  });
+
+  // ── Revoked 403 (REC-05: deny new mints within TTL) ──────────────
+  it('returns 403 when the recording is revoked', async () => {
+    configureTables({
+      call_sessions: {
+        owner_id: 'admin-1',
+        recording_object_key: OBJECT_KEY,
+        recording_revoked_at: '2026-01-01T00:00:00.000Z',
+        recording_quarantined: false,
+        recording_deleted_at: null,
+      },
+    });
+    const app = createTestApp(authAs('admin', 'admin-1'));
+    const res = await request(app)
+      .get(`/api/recordings/${VALID_SESSION}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(403);
+    expect(mockCreateSignedUrl).not.toHaveBeenCalled();
+  });
+
   // ── Signing failure → redacted stable 500 ─────────────────────────
   it('returns a redacted 500 when signing fails', async () => {
-    mockFrom.mockImplementation(() =>
-      chain({ data: { owner_id: 'admin-1', recording_object_key: OBJECT_KEY }, error: null }),
-    );
+    configureTables({
+      call_sessions: { owner_id: 'admin-1', recording_object_key: OBJECT_KEY },
+    });
     mockCreateSignedUrl.mockResolvedValue({ data: null, error: { message: 'boom secret detail' } });
     const app = createTestApp(authAs('admin', 'admin-1'));
     const res = await request(app)
@@ -231,7 +378,207 @@ describe('GET /api/recordings/:sessionId/download', () => {
     expect(JSON.stringify(res.body)).not.toContain('boom secret detail');
   });
 
-  // ── Rate-limit headers present (per-endpoint strict limiter) ───────
+  // ── REC-04 download-time re-verification (F1 repair) ─────────────
+  // Untampered object → re-verify passes → mint proceeds (200).
+  it('mints a signed URL when the stored bytes hash to the persisted sha256 (200)', async () => {
+    const buf = webmBuf();
+    const sha = createHash('sha256').update(buf).digest('hex');
+    configureTables({
+      call_sessions: {
+        owner_id: 'admin-1',
+        recording_object_key: OBJECT_KEY,
+        recording_sha256: sha,
+        recording_size_bytes: buf.length,
+        recording_quarantined: false,
+        recording_revoked_at: null,
+        recording_deleted_at: null,
+      },
+    });
+    mockDownload.mockResolvedValue({ data: new Blob([new Uint8Array(buf)]), error: null });
+    mockCreateSignedUrl.mockResolvedValue({ data: { signedUrl: SIGNED_URL }, error: null });
+    const app = createTestApp(authAs('admin', 'admin-1'));
+    const res = await request(app)
+      .get(`/api/recordings/${VALID_SESSION}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(res.body.url).toBe(SIGNED_URL);
+    // The object was fetched and re-hashed before the mint.
+    expect(mockDownload).toHaveBeenCalledWith(OBJECT_KEY);
+    expect(mockCreateSignedUrl).toHaveBeenCalled();
+  });
+
+  // Tampered at-rest bytes → 409 quarantine + mismatch event, no signed URL.
+  it('quarantines a tampered at-rest object (409) via atomic RPC, never mints', async () => {
+    const storedSha = 'f'.repeat(64); // persisted digest ≠ tampered bytes
+    configureTables({
+      call_sessions: {
+        owner_id: 'admin-1',
+        recording_object_key: OBJECT_KEY,
+        recording_sha256: storedSha,
+        recording_size_bytes: 16,
+        recording_quarantined: false,
+        recording_revoked_at: null,
+        recording_deleted_at: null,
+      },
+    });
+    mockDownload.mockResolvedValue({ data: Buffer.from('tampered-at-rest-bytes'), error: null });
+    const app = createTestApp(authAs('admin', 'admin-1'));
+    const res = await request(app)
+      .get(`/api/recordings/${VALID_SESSION}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(409);
+    expect(res.body.error.type).toBe('recording_quarantined');
+    expect(mockCreateSignedUrl).not.toHaveBeenCalled();
+
+    // F-B repair: flag + event are atomic via quarantine_recording RPC.
+    // F-E: actual digest observed at download is forwarded as evidence.
+    expect(mockRpc).toHaveBeenCalledWith(
+      'quarantine_recording',
+      expect.objectContaining({
+        p_session_id: VALID_SESSION,
+        p_expected_sha256: storedSha,
+        p_actual_sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      }),
+    );
+    // No direct update/insert on call_sessions or recording_integrity_events.
+    const quarantineUpdate = updateCalls.find(
+      (u) => (u as Record<string, unknown>).recording_quarantined === true,
+    );
+    expect(quarantineUpdate).toBeUndefined();
+  });
+
+  // F-B: RPC returns already_quarantined → still 409, no duplicate evidence.
+  it('returns 409 when quarantine RPC reports already_quarantined (concurrent loser)', async () => {
+    const storedSha = 'f'.repeat(64);
+    configureTables({
+      call_sessions: {
+        owner_id: 'admin-1',
+        recording_object_key: OBJECT_KEY,
+        recording_sha256: storedSha,
+        recording_size_bytes: 16,
+        recording_quarantined: false,
+        recording_revoked_at: null,
+        recording_deleted_at: null,
+      },
+    });
+    mockDownload.mockResolvedValue({ data: Buffer.from('tampered-at-rest-bytes'), error: null });
+    mockRpc.mockResolvedValueOnce({ data: { status: 'already_quarantined' }, error: null });
+    const app = createTestApp(authAs('admin', 'admin-1'));
+    const res = await request(app)
+      .get(`/api/recordings/${VALID_SESSION}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(409);
+    expect(mockCreateSignedUrl).not.toHaveBeenCalled();
+  });
+
+  // F-B: RPC failure → 500 fail-closed, never a URL.
+  it('returns 500 and never mints a URL when quarantine RPC fails', async () => {
+    const storedSha = 'f'.repeat(64);
+    configureTables({
+      call_sessions: {
+        owner_id: 'admin-1',
+        recording_object_key: OBJECT_KEY,
+        recording_sha256: storedSha,
+        recording_size_bytes: 16,
+        recording_quarantined: false,
+        recording_revoked_at: null,
+        recording_deleted_at: null,
+      },
+    });
+    mockDownload.mockResolvedValue({ data: Buffer.from('tampered-at-rest-bytes'), error: null });
+    mockRpc.mockResolvedValueOnce({ data: null, error: { message: 'db error' } });
+    const app = createTestApp(authAs('admin', 'admin-1'));
+    const res = await request(app)
+      .get(`/api/recordings/${VALID_SESSION}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(500);
+    expect(mockCreateSignedUrl).not.toHaveBeenCalled();
+  });
+
+  // Storage read failure → fail-closed 500, never a URL (redacted stable).
+  it('fails closed (500, no URL) when the stored object cannot be read back', async () => {
+    configureTables({
+      call_sessions: {
+        owner_id: 'admin-1',
+        recording_object_key: OBJECT_KEY,
+        recording_sha256: 'e'.repeat(64),
+        recording_size_bytes: 16,
+        recording_quarantined: false,
+        recording_revoked_at: null,
+        recording_deleted_at: null,
+      },
+    });
+    mockDownload.mockResolvedValue({ data: null, error: { message: 'bucket unreadable secret detail' } });
+    const app = createTestApp(authAs('admin', 'admin-1'));
+    const res = await request(app)
+      .get(`/api/recordings/${VALID_SESSION}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(500);
+    expect(res.body.error.type).toBe('internal_error');
+    expect(mockCreateSignedUrl).not.toHaveBeenCalled();
+    // Redacted: the storage failure detail must never leak.
+    expect(JSON.stringify(res.body)).not.toContain('bucket unreadable secret detail');
+  });
+
+  // No persisted hash → truthful legacy behavior: no download, mint proceeds.
+  it('skips re-verification when no hash is persisted (legacy truthfulness)', async () => {
+    configureTables({
+      call_sessions: {
+        owner_id: 'admin-1',
+        recording_object_key: OBJECT_KEY,
+        recording_sha256: null,
+        recording_size_bytes: null,
+        recording_quarantined: false,
+        recording_revoked_at: null,
+        recording_deleted_at: null,
+      },
+    });
+    mockCreateSignedUrl.mockResolvedValue({ data: { signedUrl: SIGNED_URL }, error: null });
+    const app = createTestApp(authAs('admin', 'admin-1'));
+    const res = await request(app)
+      .get(`/api/recordings/${VALID_SESSION}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(res.body.url).toBe(SIGNED_URL);
+    // No object fetch at all — legacy rows mint exactly as before 0014.
+    expect(mockDownload).not.toHaveBeenCalled();
+  });
+
+  // Recorded size above the upload cap → quarantined before any download.
+  it('quarantines an object whose recorded size exceeds the cap (409, no download)', async () => {
+    configureTables({
+      call_sessions: {
+        owner_id: 'admin-1',
+        recording_object_key: OBJECT_KEY,
+        recording_sha256: 'd'.repeat(64),
+        recording_size_bytes: 999_999_999, // > RECORDING_MAX_BYTES
+        recording_quarantined: false,
+        recording_revoked_at: null,
+        recording_deleted_at: null,
+      },
+    });
+    const app = createTestApp(authAs('admin', 'admin-1'));
+    const res = await request(app)
+      .get(`/api/recordings/${VALID_SESSION}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(409);
+    expect(res.body.error.type).toBe('recording_quarantined');
+    expect(mockDownload).not.toHaveBeenCalled();
+    expect(mockCreateSignedUrl).not.toHaveBeenCalled();
+    // F-B: quarantine is via RPC, not direct update.
+    expect(mockRpc).toHaveBeenCalledWith(
+      'quarantine_recording',
+      expect.objectContaining({
+        p_session_id: VALID_SESSION,
+      }),
+    );
+    const quarantineUpdate = updateCalls.find(
+      (u) => (u as Record<string, unknown>).recording_quarantined === true,
+    );
+    expect(quarantineUpdate).toBeUndefined();
+  });
+
+  // ── Rate-limit headers present ────────────────────────────────────
   it('exposes rate-limit headers on the recordings endpoint', async () => {
     const app = createTestApp(authAs('admin', 'admin-1'));
     const res = await request(app)
@@ -240,22 +587,790 @@ describe('GET /api/recordings/:sessionId/download', () => {
     expect(res.headers['x-ratelimit-limit']).toBeDefined();
     expect(res.headers['x-ratelimit-remaining']).toBeDefined();
   });
+});
 
-  // ── Candidate grant path is separate and NOT intercepted by WS-D ──
-  it('does not let the recruiter recordings route intercept the candidate grant path', async () => {
+describe('POST /api/livekit/:sessionId/recording (hardened upload)', () => {
+  function uploadApp(authDeps?: any) {
+    return createTestApp(authDeps);
+  }
+  /** Attach an audio fixture with a declared MIME + filename. */
+  function attachAudio(req: request.Test, buf: Buffer, filename: string, contentType: string) {
+    return req.attach('file', buf, { filename, contentType });
+  }
+
+  /** Mock the in-route recruiter auth seam (verifyToken → auth.getUser + membership). */
+  function mockRecruiterAuth(role: 'admin' | 'interviewer' | 'viewer', userId: string) {
+    mockAuthGetUser.mockResolvedValue({
+      data: {
+        user: {
+          id: userId,
+          email: `${role}@test.invalid`,
+          app_metadata: { app_role: role, org_id: null, active: true },
+        },
+      },
+      error: null,
+    });
+    configureTables({ recruiter_memberships: { role, active: true } });
+  }
+
+  beforeEach(() => {
+    setRateLimitStore(new MemoryRateLimitStore(100_000));
+    mockFrom.mockReset();
+    mockUpload.mockReset();
+    mockCreateSignedUrl.mockReset();
+    mockDownload.mockReset();
+    mockRpc.mockReset();
+    mockRemove.mockReset();
+    mockAuthGetUser.mockReset();
+    insertCalls = [];
+    updateCalls = [];
+    configureTables({});
+    mockUpload.mockResolvedValue({ data: { path: `${VALID_SESSION}.webm` }, error: null });
+    mockCreateSignedUrl.mockResolvedValue({ data: { signedUrl: SIGNED_URL }, error: null });
+    mockRemove.mockResolvedValue({ data: null, error: null });
+    mockRpc.mockImplementation((fn: string) => {
+      if (fn === 'finalize_recording_upload') {
+        return Promise.resolve({ data: { status: 'ok' }, error: null });
+      }
+      if (fn === 'quarantine_recording') {
+        return Promise.resolve({ data: { status: 'quarantined' }, error: null });
+      }
+      return Promise.resolve({ data: null, error: { message: 'unknown rpc' } });
+    });
+  });
+
+  // ── 413 oversize (multer LIMIT_FILE_SIZE mapped, not 500) ─────────
+  it('returns 413 for an upload above the reduced cap (never 500)', async () => {
+    const app = uploadApp();
+    const bigBuf = Buffer.alloc(26 * 1024 * 1024, 0x41); // > 25 MiB default cap
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .attach('file', bigBuf, { filename: 'big.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(413);
+    expect(res.body.error.type).toBe('payload_too_large');
+    expect(res.status).not.toBe(500);
+  });
+
+  // ── 415 spoofed magic bytes with audio/webm MIME ──────────────────
+  it('returns 415 when magic bytes are spoofed (PDF header claiming webm)', async () => {
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      call_sessions: UPLOAD_SESSION,
+    });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', Buffer.from('%PDF-1.7 fake'), { filename: 'spoof.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(415);
+    expect(res.body.error.details[0].code).toBe('INVALID_AUDIO_MAGIC');
+    expect(mockUpload).not.toHaveBeenCalled();
+  });
+
+  // ── 415 MIME↔extension mismatch ───────────────────────────────────
+  it('returns 415 when declared MIME disagrees with the extension', async () => {
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      call_sessions: UPLOAD_SESSION,
+    });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', webmBuf(), { filename: 'clip.mp3', contentType: 'audio/webm' });
+    expect(res.status).toBe(415);
+    expect(res.body.error.details[0].code).toBe('MIME_MISMATCH');
+    expect(mockUpload).not.toHaveBeenCalled();
+  });
+
+  // ── 415 polyglot (valid audio magic + foreign signature) ──────────
+  it('returns 415 for a polyglot (webm magic + embedded PDF signature)', async () => {
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      call_sessions: UPLOAD_SESSION,
+    });
+    const polyglot = Buffer.concat([WEBM_MAGIC, Buffer.from('abc'), Buffer.from('%PDF-1.7')]);
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', polyglot, { filename: 'poly.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(415);
+    expect(res.body.error.details[0].code).toBe('POLYGLOT_DETECTED');
+    expect(mockUpload).not.toHaveBeenCalled();
+  });
+
+  // ── 200 valid WebM/OGG/MP3/M4A fixtures ───────────────────────────
+  const audioFixtures: Array<[string, Buffer, string, string]> = [
+    ['webm', webmBuf(), 'rec.webm', 'audio/webm'],
+    ['ogg', oggBuf(), 'rec.ogg', 'audio/ogg'],
+    ['mp3', mp3Buf(), 'rec.mp3', 'audio/mpeg'],
+    ['m4a', mp4Buf(), 'rec.m4a', 'audio/mp4'],
+  ];
+  for (const [label, buf, filename, mime] of audioFixtures) {
+    it(`stores a valid ${label} upload (200) and finalizes atomically via RPC`, async () => {
+      configureTables({
+        candidate_access_grants: GRANT_PAYLOAD,
+        call_sessions: UPLOAD_SESSION,
+      });
+      const app = uploadApp();
+      const res = await request(app)
+        .post(`/api/livekit/${VALID_SESSION}/recording`)
+        .set('x-grant-token', GRANT_TOKEN)
+        .attach('file', buf, { filename, contentType: mime });
+      expect(res.status).toBe(200);
+      // Unique-per-attempt key (random suffix, F-A repair).
+      expect(res.body.object_key).toContain(VALID_SESSION);
+      expect(res.body.object_key).toContain(`.${label}`);
+      expect(mockUpload).toHaveBeenCalledWith(
+        expect.stringContaining(`${VALID_SESSION}-`),
+        buf,
+        expect.objectContaining({ upsert: false }),
+      );
+
+      // F-A repair: DB finalization is atomic via RPC — no direct update/insert.
+      const sha256 = createHash('sha256').update(buf).digest('hex');
+      expect(mockRpc).toHaveBeenCalledWith(
+        'finalize_recording_upload',
+        expect.objectContaining({
+          p_session_id: VALID_SESSION,
+          p_sha256: sha256,
+          p_size_bytes: buf.length,
+          p_content_type: mime,
+          p_provenance: 'browser_upload',
+        }),
+      );
+      // No direct call_sessions update or integrity_events insert (RPC owns them).
+      const sessionUpdate = updateCalls.find(
+        (u) => (u as Record<string, unknown>).recording_sha256 === sha256,
+      );
+      expect(sessionUpdate).toBeUndefined();
+      const uploadedEvent = insertCalls.find(
+        (i) => (i as Record<string, unknown>).event_type === 'uploaded',
+      );
+      expect(uploadedEvent).toBeUndefined();
+    });
+  }
+
+  // ── MP3 frame-sync variant (no ID3 tag) is accepted ───────────────
+  it('accepts an MP3 starting with an MPEG frame-sync byte (200)', async () => {
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      call_sessions: UPLOAD_SESSION,
+    });
+    const frameSyncMp3 = Buffer.concat([Buffer.from([0xff, 0xfb, 0x90, 0x64]), Buffer.from('demo')]);
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', frameSyncMp3, { filename: 'rec.mp3', contentType: 'audio/mpeg' });
+    expect(res.status).toBe(200);
+  });
+
+  // ── 415 MP4 declared but missing the ftyp box ─────────────────────
+  it('returns 415 when an MP4-declared file lacks the ftyp box', async () => {
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      call_sessions: UPLOAD_SESSION,
+    });
+    const noFtyp = Buffer.concat([Buffer.from([0x00, 0x00, 0x00, 0x20]), Buffer.from('notftyp')]);
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', noFtyp, { filename: 'rec.m4a', contentType: 'audio/mp4' });
+    expect(res.status).toBe(415);
+    expect(res.body.error.details[0].code).toBe('INVALID_AUDIO_MAGIC');
+  });
+
+  // ── guardAudioUpload unit edges (unsupported ext / too small / quota) ──
+  it('guardAudioUpload rejects unsupported extensions, tiny files, and over-quota buffers', async () => {
+    const { guardAudioUpload, UploadGuardError } = await import('../lib/upload-guard.js');
+    // Unsupported extension.
+    expect(() => guardAudioUpload(webmBuf(), 'audio/webm', 'rec.exe')).toThrowError(UploadGuardError);
+    expect(() => guardAudioUpload(webmBuf(), 'audio/webm', 'rec.webm', 8)).toThrow(
+      /EXCEEDS_QUOTA|exceeds max recording bytes/,
+    );
+    // Too small to carry magic bytes.
+    expect(() => guardAudioUpload(Buffer.from('ab'), 'audio/webm', 'rec.webm')).toThrowError(
+      UploadGuardError,
+    );
+    // MIME mismatch is still rejected.
+    expect(() => guardAudioUpload(webmBuf(), 'audio/mpeg', 'rec.webm')).toThrowError(
+      UploadGuardError,
+    );
+  });
+
+  // ── 422 EICAR (test scanner) ──────────────────────────────────────
+  it('rejects an EICAR-bearing webm with 422 (test scanner)', async () => {
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      call_sessions: UPLOAD_SESSION,
+    });
+    const eicar =
+      'X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*';
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', webmBuf(eicar), { filename: 'evil.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(422);
+    expect(res.body.error.type).toBe('malware_detected');
+    expect(mockUpload).not.toHaveBeenCalled();
+  });
+
+  // ── Production scanner is fail-closed (unit) ──────────────────────
+  it('production scanner rejects ALL files (fail-closed)', async () => {
+    const { resolveScanner } = await import('../lib/malware-scanner.js');
+    const prod = resolveScanner('production');
+    const result = await prod.scan(webmBuf());
+    expect(result.safe).toBe(false);
+    expect(result.status).toBe('scanner_unavailable');
+  });
+
+  // ── 403 cross-session grant ───────────────────────────────────────
+  it('returns 403 when the grant is bound to a different session', async () => {
+    configureTables({
+      candidate_access_grants: { ...GRANT_PAYLOAD, session_id: OTHER_SESSION },
+    });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(403);
+    expect(mockUpload).not.toHaveBeenCalled();
+  });
+
+  // ── 401 no grant AND no recruiter auth ────────────────────────────
+  it('returns 401 when there is no grant token and no recruiter auth', async () => {
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(401);
+    expect(res.body.error).toBe('authentication_required');
+    expect(mockUpload).not.toHaveBeenCalled();
+  });
+
+  // ── 403 non-owner interviewer ─────────────────────────────────────
+  it('returns 403 when an interviewer uploads for a session they do not own', async () => {
+    mockRecruiterAuth('interviewer', 'interviewer-1');
+    configureTables({
+      recruiter_memberships: { role: 'interviewer', active: true },
+      call_sessions: { ...UPLOAD_SESSION, owner_id: 'someone-else' },
+    });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('Authorization', AUTH_HEADER)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(403);
+    expect(mockUpload).not.toHaveBeenCalled();
+  });
+
+  // ── 200 owner recruiter upload (TODO closed) ──────────────────────
+  it('accepts an upload from the owning interviewer (200)', async () => {
+    mockRecruiterAuth('interviewer', 'interviewer-1');
+    configureTables({
+      recruiter_memberships: { role: 'interviewer', active: true },
+      call_sessions: UPLOAD_SESSION, // owner_id: interviewer-1
+    });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('Authorization', AUTH_HEADER)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(200);
+    expect(mockUpload).toHaveBeenCalled();
+  });
+
+  // ── 200 admin recruiter upload ────────────────────────────────────
+  it('accepts an upload from an admin (200)', async () => {
+    mockRecruiterAuth('admin', 'admin-1');
+    configureTables({
+      recruiter_memberships: { role: 'admin', active: true },
+      call_sessions: UPLOAD_SESSION,
+    });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('Authorization', AUTH_HEADER)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(200);
+  });
+
+  // ── 409 second upload (quota / upsert:false) ──────────────────────
+  it('returns 409 when the session already holds a recording', async () => {
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      call_sessions: { ...UPLOAD_SESSION, recording_object_key: OBJECT_KEY },
+    });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(409);
+    expect(mockUpload).not.toHaveBeenCalled();
+  });
+
+  // ── F-D: deleted session rejects upload before storage ───────────
+  it('returns 404 when the session is deleted (F-D preflight)', async () => {
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      call_sessions: { ...UPLOAD_SESSION, recording_deleted_at: '2026-01-01T00:00:00.000Z' },
+    });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(404);
+    expect(mockUpload).not.toHaveBeenCalled();
+  });
+
+  // ── F-D: quarantined session rejects upload before storage ───────
+  it('returns 409 when the session is quarantined (F-D preflight)', async () => {
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      call_sessions: { ...UPLOAD_SESSION, recording_quarantined: true },
+    });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(409);
+    expect(mockUpload).not.toHaveBeenCalled();
+  });
+
+  // ── F-D: revoked session rejects upload before storage ───────────
+  it('returns 403 when the session is revoked (F-D preflight)', async () => {
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      call_sessions: { ...UPLOAD_SESSION, recording_revoked_at: '2026-01-01T00:00:00.000Z' },
+    });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(403);
+    expect(mockUpload).not.toHaveBeenCalled();
+  });
+
+  // ── F-A: quota gate blocks before storage/RPC (code-level check) ─
+  it('returns 409 when the session already holds a recording (code quota gate)', async () => {
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      call_sessions: { ...UPLOAD_SESSION, recording_object_key: OBJECT_KEY },
+    });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe('recording_already_exists');
+    expect(mockUpload).not.toHaveBeenCalled();
+    expect(mockRpc).not.toHaveBeenCalled();
+  });
+
+  // ── Session not found 404 ─────────────────────────────────────────
+  it('returns 404 when the session does not exist', async () => {
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      // call_sessions resolves null → not found
+    });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(404);
+    expect(mockUpload).not.toHaveBeenCalled();
+  });
+
+  // ── Storage upload failure → 500 (stable) ─────────────────────────
+  it('returns 500 when storage upload fails (stable error)', async () => {
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      call_sessions: UPLOAD_SESSION,
+    });
+    mockUpload.mockResolvedValue({ data: null, error: { message: 's3 secret detail' } });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(500);
+    expect(res.body.error.type).toBe('internal_error');
+    expect(JSON.stringify(res.body)).not.toContain('s3 secret detail');
+  });
+
+  // ── F-A: RPC failure → compensation delete, 500, no orphan record ─
+  it('compensates (deletes orphan) when finalize RPC fails, returns 500', async () => {
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      call_sessions: UPLOAD_SESSION,
+    });
+    mockRpc.mockResolvedValueOnce({ data: { status: 'session_not_found' }, error: null });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(500);
+    // Compensation: orphaned object was deleted.
+    expect(mockRemove).toHaveBeenCalled();
+    // No orphan table write (compensation succeeded).
+    const orphanCalls = mockFrom.mock.calls.filter(
+      (c: unknown[]) => c[0] === 'recording_orphaned_objects',
+    );
+    expect(orphanCalls.length).toBe(0);
+  });
+
+  // ── F-A: RPC failure + compensation failure → private orphan row ──
+  it('records orphan in BACKEND-ONLY table when both RPC and compensation fail (F-C)', async () => {
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      call_sessions: UPLOAD_SESSION,
+    });
+    mockRpc.mockResolvedValueOnce({ data: { status: 'session_not_found' }, error: null });
+    mockRemove.mockResolvedValueOnce({ data: null, error: { message: 'storage down' } });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(500);
+    // F-C: orphan goes to BACKEND-ONLY recording_orphaned_objects — NEVER
+    // to recruiter-readable integrity_events, NEVER with event_type='uploaded'.
+    const orphanCalls = mockFrom.mock.calls.filter(
+      (c: unknown[]) => c[0] === 'recording_orphaned_objects',
+    );
+    expect(orphanCalls.length).toBeGreaterThanOrEqual(1);
+    // No uploaded event in integrity_events for this orphan.
+    const uploadedEv = insertCalls.find(
+      (i) => (i as Record<string, unknown>).event_type === 'uploaded',
+    );
+    expect(uploadedEv).toBeUndefined();
+  });
+
+  // ── F-C: retry after orphan converges — exactly one uploaded event ─
+  it('retry succeeds after prior orphan (compensation failure), exactly one uploaded event', async () => {
+    // First attempt: RPC fails, compensation fails → orphan recorded.
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      call_sessions: UPLOAD_SESSION,
+    });
+    mockRpc.mockResolvedValueOnce({ data: { status: 'session_not_found' }, error: null });
+    mockRemove.mockResolvedValueOnce({ data: null, error: { message: 'storage down' } });
+    const app = uploadApp();
+    let res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(500);
+
+    // Reset mocks for retry (second attempt with different object key).
+    mockRpc.mockReset();
+    mockRemove.mockReset();
+    mockRpc.mockImplementation((fn: string) => {
+      if (fn === 'finalize_recording_upload') {
+        return Promise.resolve({ data: { status: 'ok' }, error: null });
+      }
+      return Promise.resolve({ data: null, error: { message: 'unknown' } });
+    });
+    mockRemove.mockResolvedValue({ data: null, error: null });
+    insertCalls = [];
+    updateCalls = [];
+
+    // Retry succeeds — unique key per attempt avoids orphan collision.
+    res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', webmBuf(), { filename: 'retry.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(200);
+    // Exactly one uploaded event via RPC — no duplicate from prior orphan.
+    const uploadedEvs = insertCalls.filter(
+      (i) => (i as Record<string, unknown>).event_type === 'uploaded',
+    );
+    expect(uploadedEvs.length).toBe(0); // RPC owns the event, not direct insert
+    expect(mockRpc).toHaveBeenCalledWith(
+      'finalize_recording_upload',
+      expect.objectContaining({ p_session_id: VALID_SESSION }),
+    );
+  });
+
+  // ── F-A: RPC CAS race (concurrent upload already linked) → 500 ──
+  it('returns 500 when finalize RPC reports recording_already_exists (CAS race)', async () => {
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      call_sessions: UPLOAD_SESSION,
+    });
+    mockRpc.mockResolvedValueOnce({ data: { status: 'recording_already_exists' }, error: null });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(500);
+    // Compensation attempted.
+    expect(mockRemove).toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/livekit/grant/recording (route-shadow fixed)', () => {
+  beforeEach(() => {
+    setRateLimitStore(new MemoryRateLimitStore(100_000));
+    mockFrom.mockReset();
+    mockUpload.mockReset();
+    mockCreateSignedUrl.mockReset();
+    mockDownload.mockReset();
+    insertCalls = [];
+    updateCalls = [];
+    configureTables({});
+    mockCreateSignedUrl.mockResolvedValue({ data: { signedUrl: SIGNED_URL }, error: null });
+  });
+
+  it('is no longer shadowed by /:sessionId/recording — invalid grant reaches the handler (403)', async () => {
+    configureTables({
+      call_sessions: {
+        id: VALID_SESSION,
+        recording_object_key: OBJECT_KEY,
+        recording_deleted_at: null,
+        recording_quarantined: false,
+        recording_revoked_at: null,
+      },
+      // candidate_access_grants resolves null → validateGrant fails closed.
+    });
     const app = createTestApp();
     const res = await request(app)
       .post('/api/livekit/grant/recording')
-      .send({ grant_token: 'a'.repeat(64), session_id: VALID_SESSION });
-    // NOTE (pre-existing, out of Phase-2 scope): in livekit.ts the route
-    // `POST /:sessionId/recording` is registered BEFORE `POST /grant/recording`,
-    // so "grant" is captured as :sessionId and rejected by that route's UUID
-    // param validation with 400. This shadowing exists on main (livekit.ts is
-    // unchanged by Phase 2) and is documented as a follow-up finding — WS-D
-    // did not introduce or alter it. What this test guards is that mounting the
-    // new /api/recordings router did NOT change this behavior: the request is
-    // still handled by the livekit stack, not by the recruiter download route.
-    expect(res.status).toBe(400);
-    expect(res.body.error.type).toBe('validation_error');
+      .send({ grant_token: GRANT_TOKEN, session_id: VALID_SESSION });
+    // Fixed route: no 400 shadow — the real grant handler runs and denies 403.
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe('access_denied');
+  });
+
+  it('denies mint (403) for a revoked recording even with a valid grant', async () => {
+    configureTables({
+      call_sessions: {
+        id: VALID_SESSION,
+        recording_object_key: OBJECT_KEY,
+        recording_deleted_at: null,
+        recording_quarantined: false,
+        recording_revoked_at: '2026-01-01T00:00:00.000Z',
+      },
+      candidate_access_grants: GRANT_PAYLOAD,
+    });
+    const app = createTestApp();
+    const res = await request(app)
+      .post('/api/livekit/grant/recording')
+      .send({ grant_token: GRANT_TOKEN, session_id: VALID_SESSION });
+    expect(res.status).toBe(403);
+    expect(mockCreateSignedUrl).not.toHaveBeenCalled();
+  });
+
+  it('denies mint (409) for a quarantined recording', async () => {
+    configureTables({
+      call_sessions: {
+        id: VALID_SESSION,
+        recording_object_key: OBJECT_KEY,
+        recording_deleted_at: null,
+        recording_quarantined: true,
+        recording_revoked_at: null,
+      },
+    });
+    const app = createTestApp();
+    const res = await request(app)
+      .post('/api/livekit/grant/recording')
+      .send({ grant_token: GRANT_TOKEN, session_id: VALID_SESSION });
+    expect(res.status).toBe(409);
+    expect(mockCreateSignedUrl).not.toHaveBeenCalled();
+  });
+
+  it('denies mint (404) for a deleted recording', async () => {
+    configureTables({
+      call_sessions: {
+        id: VALID_SESSION,
+        recording_object_key: OBJECT_KEY,
+        recording_deleted_at: '2026-01-01T00:00:00.000Z',
+        recording_quarantined: false,
+        recording_revoked_at: null,
+      },
+    });
+    const app = createTestApp();
+    const res = await request(app)
+      .post('/api/livekit/grant/recording')
+      .send({ grant_token: GRANT_TOKEN, session_id: VALID_SESSION });
+    expect(res.status).toBe(404);
+    expect(mockCreateSignedUrl).not.toHaveBeenCalled();
+  });
+
+  it('mints a signed URL (200) for a healthy grant-bound recording', async () => {
+    configureTables({
+      call_sessions: {
+        id: VALID_SESSION,
+        recording_object_key: OBJECT_KEY,
+        recording_deleted_at: null,
+        recording_quarantined: false,
+        recording_revoked_at: null,
+      },
+      candidate_access_grants: GRANT_PAYLOAD,
+    });
+    mockCreateSignedUrl.mockResolvedValue({ data: { signedUrl: SIGNED_URL }, error: null });
+    const app = createTestApp();
+    const res = await request(app)
+      .post('/api/livekit/grant/recording')
+      .send({ grant_token: GRANT_TOKEN, session_id: VALID_SESSION });
+    expect(res.status).toBe(200);
+    expect(res.body.url).toBe(SIGNED_URL);
+  });
+});
+
+describe('POST /api/recordings/:sessionId/revoke (REC-05 F2 repair)', () => {
+  beforeEach(() => {
+    setRateLimitStore(new MemoryRateLimitStore(100_000));
+    mockFrom.mockReset();
+    mockUpload.mockReset();
+    mockCreateSignedUrl.mockReset();
+    mockDownload.mockReset();
+    insertCalls = [];
+    updateCalls = [];
+    configureTables({});
+  });
+
+  function revokeApp(role: 'admin' | 'interviewer' | 'viewer', userId: string) {
+    return createTestApp(authAs(role, userId));
+  }
+
+  // ── Admin revoke: transition + exactly one revoked event ──────────
+  it('revokes as admin (200): sets recording_revoked_at, appends one revoked event', async () => {
+    configureTables({
+      call_sessions: { id: VALID_SESSION, recording_revoked_at: null },
+    });
+    const app = revokeApp('admin', 'admin-1');
+    const res = await request(app)
+      .post(`/api/recordings/${VALID_SESSION}/revoke`)
+      .set('Authorization', AUTH_HEADER)
+      .send({ reason: 'candidate requested' });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ ok: true, status: 'revoked' });
+    expect(res.body.revoked_at).toBeTruthy();
+
+    // CAS transition persisted on call_sessions.
+    const revokeUpdate = updateCalls.find(
+      (u) => (u as Record<string, unknown>).recording_revoked_at,
+    ) as Record<string, unknown>;
+    expect(revokeUpdate).toBeDefined();
+
+    // Exactly one revoked integrity event.
+    const revokedEvents = insertCalls.filter(
+      (i) => (i as Record<string, unknown>).event_type === 'revoked',
+    );
+    expect(revokedEvents).toHaveLength(1);
+    expect((revokedEvents[0] as Record<string, unknown>).detail).toContain('candidate requested');
+  });
+
+  // ── Retry convergence: already_revoked, no duplicate evidence ─────
+  it('is idempotent on retry (200 already_revoked, no duplicate event/update)', async () => {
+    configureTables({
+      call_sessions: { id: VALID_SESSION, recording_revoked_at: '2026-01-01T00:00:00.000Z' },
+      recording_integrity_events: { id: 'evt-1', event_type: 'revoked' },
+    });
+    const app = revokeApp('admin', 'admin-1');
+    const res = await request(app)
+      .post(`/api/recordings/${VALID_SESSION}/revoke`)
+      .set('Authorization', AUTH_HEADER)
+      .send({ reason: 'retry' });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ ok: true, status: 'already_revoked' });
+    expect(res.body.revoked_at).toBe('2026-01-01T00:00:00.000Z');
+    // No new mutation and no duplicate event.
+    expect(updateCalls).toHaveLength(0);
+    expect(insertCalls).toHaveLength(0);
+  });
+
+  // ── Backfill: tombstone set but event missing → converges, no transition
+  it('backfills a missing revoked event when revoked_at is already set (convergence)', async () => {
+    configureTables({
+      call_sessions: { id: VALID_SESSION, recording_revoked_at: '2026-01-01T00:00:00.000Z' },
+      // recording_integrity_events resolves null → event missing
+    });
+    const app = revokeApp('admin', 'admin-1');
+    const res = await request(app)
+      .post(`/api/recordings/${VALID_SESSION}/revoke`)
+      .set('Authorization', AUTH_HEADER)
+      .send({});
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ ok: true, status: 'revoked' });
+    expect(res.body.revoked_at).toBe('2026-01-01T00:00:00.000Z');
+    // No transition update (already set) but exactly one backfilled event.
+    expect(updateCalls).toHaveLength(0);
+    const revokedEvents = insertCalls.filter(
+      (i) => (i as Record<string, unknown>).event_type === 'revoked',
+    );
+    expect(revokedEvents).toHaveLength(1);
+  });
+
+  // ── RBAC: admin-only (uniform 403 for interviewer/viewer) ─────────
+  it('denies non-admin roles with a uniform 403', async () => {
+    configureTables({
+      call_sessions: { id: VALID_SESSION, recording_revoked_at: null },
+    });
+    for (const role of ['interviewer', 'viewer'] as const) {
+      const app = revokeApp(role, `${role}-1`);
+      const res = await request(app)
+        .post(`/api/recordings/${VALID_SESSION}/revoke`)
+        .set('Authorization', AUTH_HEADER)
+        .send({ reason: 'nope' });
+      expect(res.status).toBe(403);
+      expect(res.body.error.type).toBe('authorization_error');
+    }
+    // No mutation attempted by denied roles.
+    expect(updateCalls).toHaveLength(0);
+    expect(insertCalls).toHaveLength(0);
+  });
+
+  // ── Anti-enumeration: unknown session → 404, no mutation ──────────
+  it('returns 404 for an unknown session (no mutation)', async () => {
+    const app = revokeApp('admin', 'admin-1');
+    const res = await request(app)
+      .post(`/api/recordings/${VALID_SESSION}/revoke`)
+      .set('Authorization', AUTH_HEADER)
+      .send({});
+    expect(res.status).toBe(404);
+    expect(updateCalls).toHaveLength(0);
+    expect(insertCalls).toHaveLength(0);
+  });
+
+  // ── Validation bounds: malformed UUID + oversize reason → 400 ─────
+  it('returns 400 for a malformed session id and for an oversize reason', async () => {
+    const app = revokeApp('admin', 'admin-1');
+    const badId = await request(app)
+      .post('/api/recordings/not-a-uuid/revoke')
+      .set('Authorization', AUTH_HEADER)
+      .send({});
+    expect(badId.status).toBe(400);
+    expect(badId.body.error.type).toBe('validation_error');
+
+    const badReason = await request(app)
+      .post(`/api/recordings/${VALID_SESSION}/revoke`)
+      .set('Authorization', AUTH_HEADER)
+      .send({ reason: 'x'.repeat(201) });
+    expect(badReason.status).toBe(400);
+    expect(badReason.body.error.type).toBe('validation_error');
+  });
+
+  // ── Unauthenticated → 401 (route is not public) ───────────────────
+  it('returns 401 without a bearer token', async () => {
+    const app = createTestApp();
+    const res = await request(app)
+      .post(`/api/recordings/${VALID_SESSION}/revoke`)
+      .send({});
+    expect(res.status).toBe(401);
   });
 });

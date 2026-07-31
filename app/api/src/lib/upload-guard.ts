@@ -401,6 +401,169 @@ function findEOCD(buffer: Buffer, sig: Buffer): number {
   return -1;
 }
 
+// ── Audio upload validation (REC-03, L5) ────────────────────────────────────
+
+/**
+ * REC-03 (L5): audio upload validator for the browser recording path.
+ *
+ * Verifies, for the audio set {WebM/Matroska, OGG, MP4/M4A, MP3}:
+ *  1. Filename safety (reuses the resume filename guards).
+ *  2. Declared-MIME ↔ extension agreement.
+ *  3. Magic bytes at the buffer head matching the declared audio type.
+ *  4. No polyglot embedding of foreign container signatures in the head.
+ *  5. Size within the reduced bounded cap (PROPOSED).
+ *
+ * Throws `UploadGuardError` (mapped to 415 by the route) on any failure.
+ * Resume validation (`guardUpload`) is untouched.
+ */
+
+export interface AudioGuardResult {
+  /** Canonical audio MIME after validation. */
+  mime: string;
+  /** Canonical file extension without the leading dot (e.g. "webm"). */
+  ext: string;
+}
+
+const AUDIO_EXT_MAP: Record<string, string> = {
+  '.webm': 'audio/webm',
+  '.ogg': 'audio/ogg',
+  '.opus': 'audio/ogg',
+  '.mp3': 'audio/mpeg',
+  '.mp4': 'audio/mp4',
+  '.m4a': 'audio/mp4',
+};
+
+// WebM/Matroska EBML header: 0x1A 0x45 0xDF 0xA3
+const WEBM_MAGIC = Buffer.from([0x1a, 0x45, 0xdf, 0xa3]);
+// OGG container: "OggS"
+const OGG_MAGIC = Buffer.from([0x4f, 0x67, 0x67, 0x53]);
+// MP3 ID3v2 tag header: "ID3"
+const MP3_ID3_MAGIC = Buffer.from([0x49, 0x44, 0x33]);
+// MP4/M4A "ftyp" box type lives at byte offset 4 (size(4) + "ftyp").
+const MP4_FTYP_TEXT = 'ftyp';
+const MP4_FTYP_OFFSET = 4;
+
+/** Foreign signatures whose presence inside an "audio" file flags a polyglot. */
+const FOREIGN_SIGNATURES: Array<{ name: string; bytes: number[] }> = [
+  { name: 'pdf', bytes: [0x25, 0x50, 0x44, 0x46] },  // %PDF
+  { name: 'zip', bytes: [0x50, 0x4b, 0x03, 0x04] },  // PK\x03\x04
+  { name: 'elf', bytes: [0x7f, 0x45, 0x4c, 0x46] },  // \x7fELF
+  { name: 'mz', bytes: [0x4d, 0x5a] },               // MZ (PE)
+];
+
+function hasMagicAt(buffer: Buffer, bytes: number[], offset = 0): boolean {
+  if (buffer.length < offset + bytes.length) return false;
+  for (let i = 0; i < bytes.length; i++) {
+    if (buffer[offset + i] !== bytes[i]) return false;
+  }
+  return true;
+}
+
+function hasForeignSignature(buffer: Buffer, from: number, to: number): string | null {
+  const end = Math.min(to, buffer.length);
+  for (let i = from; i <= end; i++) {
+    for (const sig of FOREIGN_SIGNATURES) {
+      if (i + sig.bytes.length <= buffer.length && hasMagicAt(buffer, sig.bytes, i)) {
+        return sig.name;
+      }
+    }
+  }
+  return null;
+}
+
+function validateAudioMagic(buffer: Buffer, mime: string): void {
+  if (mime === 'audio/webm') {
+    if (!hasMagicAt(buffer, [...WEBM_MAGIC])) {
+      throw new UploadGuardError('INVALID_AUDIO_MAGIC', 'File does not start with a WebM/Matroska EBML header');
+    }
+    return;
+  }
+  if (mime === 'audio/ogg') {
+    if (!hasMagicAt(buffer, [...OGG_MAGIC])) {
+      throw new UploadGuardError('INVALID_AUDIO_MAGIC', 'File does not start with an Ogg container (OggS)');
+    }
+    return;
+  }
+  if (mime === 'audio/mpeg') {
+    const id3 = hasMagicAt(buffer, [...MP3_ID3_MAGIC]);
+    // MPEG frame-sync: first byte 0xFF, second byte 0xE0-0xFF (111x xxxx).
+    const frameSync =
+      buffer.length >= 2 && buffer[0] === 0xff && (buffer[1] & 0xe0) === 0xe0;
+    if (!id3 && !frameSync) {
+      throw new UploadGuardError('INVALID_AUDIO_MAGIC', 'File does not start with an MP3 ID3 tag or MPEG frame sync');
+    }
+    return;
+  }
+  if (mime === 'audio/mp4') {
+    if (
+      buffer.length < MP4_FTYP_OFFSET + 4 ||
+      buffer.subarray(MP4_FTYP_OFFSET, MP4_FTYP_OFFSET + 4).toString('latin1') !== MP4_FTYP_TEXT
+    ) {
+      throw new UploadGuardError('INVALID_AUDIO_MAGIC', 'File does not contain an MP4/M4A ftyp box');
+    }
+    return;
+  }
+  throw new UploadGuardError('UNSUPPORTED_AUDIO_MIME', `Unsupported audio MIME: ${mime}`);
+}
+
+/**
+ * Validate a browser recording upload. `maxBytes` is the reduced bounded
+ * upload cap (PROPOSED) — matches the multer limit so the in-memory buffer
+ * can never exceed the cap (oversize is rejected pre-buffer by multer → 413).
+ */
+export function guardAudioUpload(
+  buffer: Buffer,
+  mimetype: string,
+  originalname: string,
+  maxBytes: number = RECORDING_AUDIO_MAX_BYTES_DEFAULT,
+): AudioGuardResult {
+  // 1. Filename safety — same guards as resume uploads.
+  validateFilename(originalname);
+
+  // 2. Resolve extension → expected MIME.
+  const ext = resolveExtension(originalname);
+  const expectedMime = AUDIO_EXT_MAP[ext.toLowerCase()];
+  if (!expectedMime) {
+    throw new UploadGuardError('UNSUPPORTED_EXTENSION', `Unsupported audio file extension: ${ext}`);
+  }
+
+  // 3. Declared MIME ↔ extension agreement (case-insensitive).
+  if (mimetype.toLowerCase() !== expectedMime.toLowerCase()) {
+    throw new UploadGuardError(
+      'MIME_MISMATCH',
+      `Declared MIME "${mimetype}" does not match extension "${ext}" (expected "${expectedMime}")`,
+    );
+  }
+
+  // 4. Magic bytes for the declared audio type.
+  if (buffer.length < 4) {
+    throw new UploadGuardError('FILE_TOO_SMALL', 'File is too small to contain valid audio content');
+  }
+  validateAudioMagic(buffer, expectedMime);
+
+  // 5. Polyglot check: a real audio container must not embed foreign
+  //    executable/document signatures in its head region.
+  const headStart = expectedMime === 'audio/mp4' ? MP4_FTYP_OFFSET + 4 : 4;
+  const foreign = hasForeignSignature(buffer, headStart, Math.min(buffer.length, 1024));
+  if (foreign) {
+    throw new UploadGuardError('POLYGLOT_DETECTED', `File contains both audio and ${foreign} signatures (polyglot)`);
+  }
+
+  // 6. Size within the reduced bounded cap.
+  if (buffer.length > maxBytes) {
+    throw new UploadGuardError(
+      'EXCEEDS_QUOTA',
+      `File size ${buffer.length} exceeds max recording bytes ${maxBytes}`,
+    );
+  }
+
+  const cleanExt = ext.startsWith('.') ? ext.slice(1) : ext;
+  return { mime: expectedMime, ext: cleanExt };
+}
+
+/** PROPOSED default cap for guardAudioUpload (25 MiB; mirrors env default). */
+const RECORDING_AUDIO_MAX_BYTES_DEFAULT = 25 * 1024 * 1024;
+
 // ── Text validation ─────────────────────────────────────────────────────────
 
 /** Maximum prefix bytes we inspect for a text file before rejecting. */

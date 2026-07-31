@@ -11,6 +11,7 @@ const _contractVisibleEnvReads = [
   process.env.BREAKER_TIMEOUT_MS,
   process.env.CLAUDE_MAX_OUTPUT_BYTES,
   process.env.RECORDING_DOWNLOAD_TTL_SEC,
+  process.env.RECORDING_MAX_BYTES,
 ];
 void _contractVisibleEnvReads;
 
@@ -60,6 +61,13 @@ export const env = {
   recordingsBucket: process.env.RECORDINGS_BUCKET ?? 'recordings_v2',
   /** MIG-06: TTL (seconds) for recruiter recording download signed URLs. Range 60..900. */
   recordingDownloadTtlSec: positiveInt('RECORDING_DOWNLOAD_TTL_SEC', 300, 60, 900),
+  /**
+   * REC-03 (PROPOSED): reduced bounded browser-upload cap — default 25 MiB,
+   * hard max 50 MiB, strictly below the old 100 MB multer cap (C-3). Oversize
+   * is rejected by multer (LIMIT_FILE_SIZE → 413) BEFORE the body is fully
+   * buffered. This bounds memory — it is NOT constant-memory streaming.
+   */
+  recordingMaxBytes: positiveInt('RECORDING_MAX_BYTES', 25 * 1024 * 1024, 1024, 50 * 1024 * 1024),
   /** REL-08: grace period (ms) before forced connection teardown. */
   shutdownGraceMs: positiveInt('SHUTDOWN_GRACE_MS', 30000, 100, 300000),
   /** REL-05/REL-06 provider resilience controls. */
