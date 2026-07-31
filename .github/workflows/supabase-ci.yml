@@ -10,9 +10,11 @@ on:
       - 'docs/runbooks/synthetic-*.md'
       - 'docs/runbooks/supabase-*.md'
       - 'docs/runbooks/mig-*.md'
+      - 'docs/runbooks/phase6-*.md'
       - 'scripts/migrate-export.test.mjs'
       - 'scripts/migrate-reconcile.test.mjs'
       - 'scripts/storage-manifest.test.mjs'
+      - 'scripts/migrate-rollback.test.mjs'
       - '.github/workflows/supabase-*.yml'
   push:
     branches: [main]
@@ -24,9 +26,11 @@ on:
       - 'docs/runbooks/synthetic-*.md'
       - 'docs/runbooks/supabase-*.md'
       - 'docs/runbooks/mig-*.md'
+      - 'docs/runbooks/phase6-*.md'
       - 'scripts/migrate-export.test.mjs'
       - 'scripts/migrate-reconcile.test.mjs'
       - 'scripts/storage-manifest.test.mjs'
+      - 'scripts/migrate-rollback.test.mjs'
       - '.github/workflows/supabase-*.yml'
   workflow_dispatch:
 
@@ -119,6 +123,15 @@ jobs:
         run: node scripts/check-synthetic-seed.mjs
       - name: GOV-06 mutation-based self-tests (zero network)
         run: node scripts/check-synthetic-seed.test.mjs
+
+      # ── Phase 6 lane L4 — TST-15 offline migration rollback/compatibility
+      #    verifier. Static half of the gate: destructive-change detector +
+      #    contract-continuity across 0001–0013 + seeded negative fixture.
+      #    The dynamic half (clean reset / roll-forward / restore rehearsal)
+      #    runs inside scripts/supabase-test.sh in the supabase-check job.
+      #    Forward-only strategy: no reverse SQL exists and none is invented.
+      - name: TST-15 migration rollback & compatibility verifier (offline)
+        run: node scripts/migrate-rollback.test.mjs
 
       # ── WS-B Phase 2 migration tooling (integrated single-PR; fail-closed) ──
 

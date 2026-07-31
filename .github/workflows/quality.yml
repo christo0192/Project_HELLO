@@ -35,17 +35,46 @@ jobs:
       - name: Install, typecheck, and test API
         working-directory: app/api
         run: npm ci && npm run typecheck && npm test
+      # ── Phase 6 lane L4 — TST-01 coverage ratchet (L1 snippet; floors
+      #    committed in app/api/vitest.config.ts; fail-closed below floor) ──
+      - name: API coverage ratchet (TST-01)
+        working-directory: app/api
+        run: npm run test:coverage
+      # ── Phase 6 lane L4 — TST-02/03/10 gate suites. These five files are
+      #    already exercised by `npm test` above (1120 tests with full output)
+      #    and re-instrumented in `test:coverage`. A third pass via an explicit
+      #    `vitest run` would only duplicate runtime (~12 s) without adding
+      #    distinct evidence. Gate visibility is satisfied by the named suite
+      #    files appearing in the test and coverage output. Rationale documented
+      #    in docs/runbooks/phase6-testing-ci.md §6. ──
       - name: Audit API dependencies
         run: bash scripts/audit-deps.sh --dir app/api
       - name: Install, lint, test, and build web
         working-directory: app/web
         run: npm ci && npm run lint && npm run test:typecheck && npm test && npm run build
+      # ── Phase 6 lane L4 — TST-01 web coverage ratchet (L1 snippet) ──
+      - name: Web coverage ratchet (TST-01)
+        working-directory: app/web
+        run: npm run test:coverage
       - name: Smoke-test CSP header
         run: node scripts/smoke-test-csp.mjs
       - name: Audit web dependencies
         run: bash scripts/audit-deps.sh --dir app/web
       - name: Run seeded dependency-policy test
         run: node scripts/audit-seeded-vuln.test.mjs
+      # ── Phase 6 lane L4 — TST-05 offline deterministic SAST (repo-owned
+      #    analyzer + ruleset; zero external service; fail-closed) and its
+      #    self-tests (seeded unsafe fixtures prove red, safe fixtures prove
+      #    precision; a runtime secret-shaped probe proves the SAST/gitleaks
+      #    boundary — SAST never scans secrets/env) ──
+      - name: Offline SAST + self-tests (TST-05)
+        run: bash scripts/sast.sh && node scripts/sast.test.mjs
+      # ── Phase 6 lane L4 — TST-15 migration rollback/compatibility verifier
+      #    (offline static half: destructive-change detector + contract
+      #    continuity + seeded negative fixture; the dynamic half — clean
+      #    reset/roll-forward/restore rehearsal — runs in supabase-ci.yml) ──
+      - name: Migration rollback & compatibility verifier (TST-15, offline)
+        run: node scripts/migrate-rollback.test.mjs
       - name: Generate SBOMs
         run: bash scripts/sbom.sh
       - name: Upload SBOM artifacts
