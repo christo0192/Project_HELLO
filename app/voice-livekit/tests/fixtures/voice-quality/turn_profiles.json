@@ -1,0 +1,47 @@
+{
+  "schema": "phase8-l4/turn-profiles",
+  "version": 1,
+  "status": "proposed",
+  "description": "PROPOSED-only turn-taking control profiles (VOI-02) for offline voice-quality simulation. No runtime VAD tuning is performed from these values; they are deterministic validation fixtures only.",
+  "profiles": [
+    {
+      "id": "default_turn",
+      "name": "Default turn-taking profile",
+      "version": 1,
+      "status": "proposed",
+      "params": {
+        "barge_in_sensitivity": 0.5,
+        "barge_in_trigger_ms": 400,
+        "candidate_cutoff_ms": 1200,
+        "double_talk_window_ms": 800,
+        "vad_aggression": 1
+      }
+    },
+    {
+      "id": "assertive_candidate",
+      "name": "Assertive candidate turn profile",
+      "version": 1,
+      "status": "proposed",
+      "params": {
+        "barge_in_sensitivity": 0.8,
+        "barge_in_trigger_ms": 200,
+        "candidate_cutoff_ms": 700,
+        "double_talk_window_ms": 500,
+        "vad_aggression": 2
+      }
+    },
+    {
+      "id": "soft_spoken_candidate",
+      "name": "Soft-spoken candidate turn profile",
+      "version": 1,
+      "status": "proposed",
+      "params": {
+        "barge_in_sensitivity": 0.3,
+        "barge_in_trigger_ms": 900,
+        "candidate_cutoff_ms": 2200,
+        "double_talk_window_ms": 1500,
+        "vad_aggression": 0
+      }
+    }
+  ]
+}

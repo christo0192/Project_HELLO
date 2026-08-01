@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { runAssessment } from '../services/assessment.js';
+import { runAssessment, ERR_SESSION_NOT_COMPLETED } from '../services/assessment.js';
 import { validateParams } from '../lib/validation.js';
 import { assessSessionIdParamSchema } from '../schemas/assess.js';
 import { requireRole } from '../lib/rbac.js';
@@ -28,6 +28,13 @@ assessRouter.post(
       }
       res.json(assessment);
     } catch (error) {
+      // VOI-08: ineligible sessions → stable non-retryable 409.
+      // All other errors flow to the global error handler (500).
+      if (error instanceof Error && error.message === ERR_SESSION_NOT_COMPLETED) {
+        return res.status(409).json({
+          error: { type: 'session_not_completed', message: 'Session is not eligible for assessment' },
+        });
+      }
       next(error);
     }
   },

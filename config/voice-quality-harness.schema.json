@@ -1,0 +1,459 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "voice-quality-harness.schema.json",
+  "title": "Voice Quality Harness Fixture Contract",
+  "description": "Machine-checkable mirror of the voice_quality_harness.py validation bounds for the phase-8-l4 offline voice-quality fixtures (VOI-02..06). This is a PROPOSED-only validation contract, NOT production thresholds: every fixture document and every profile is required to carry status \"proposed\" and an integer version >= 1, and none of the bounds below are acceptance/pass-fail decisions. The schema validates the five fixture shapes: turnProfiles, noiseProfiles, networkProfiles, pronunciationProtocol, werPairs. Note: draft-07 evaluates additionalProperties per-subschema, so each concrete definition is self-contained and repeats the shared document/profile envelope exactly.",
+  "type": "object",
+  "definitions": {
+    "profileEnvelope": {
+      "description": "Base profile shape shared by the turn/noise/network profile families (id, name, version, status, params).",
+      "type": "object",
+      "required": ["id", "name", "version", "status", "params"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "const": "proposed"
+        },
+        "params": {
+          "type": "object",
+          "additionalProperties": false
+        }
+      }
+    },
+    "fixtureDocument": {
+      "description": "Base fixture-document shape shared by all five fixture files (schema, version, status).",
+      "type": "object",
+      "required": ["schema", "version", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "const": "proposed"
+        },
+        "description": {
+          "type": "string"
+        }
+      }
+    },
+    "turnProfile": {
+      "type": "object",
+      "required": ["id", "name", "version", "status", "params"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "const": "proposed"
+        },
+        "params": {
+          "type": "object",
+          "required": [
+            "barge_in_sensitivity",
+            "barge_in_trigger_ms",
+            "candidate_cutoff_ms",
+            "double_talk_window_ms",
+            "vad_aggression"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "barge_in_sensitivity": {
+              "type": "number",
+              "minimum": 0.0,
+              "maximum": 1.0
+            },
+            "barge_in_trigger_ms": {
+              "type": "integer",
+              "minimum": 50,
+              "maximum": 2000
+            },
+            "candidate_cutoff_ms": {
+              "type": "integer",
+              "minimum": 50,
+              "maximum": 3000
+            },
+            "double_talk_window_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 5000
+            },
+            "vad_aggression": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 3
+            }
+          }
+        }
+      }
+    },
+    "noiseProfile": {
+      "type": "object",
+      "required": ["id", "name", "version", "status", "params"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "const": "proposed"
+        },
+        "params": {
+          "type": "object",
+          "required": ["scene", "noise_snr_db", "reverb_rt60_ms", "double_talk_overlap_ratio"],
+          "additionalProperties": false,
+          "properties": {
+            "scene": {
+              "type": "string",
+              "enum": [
+                "quiet_office",
+                "coffee_shop",
+                "street",
+                "home",
+                "meeting_room",
+                "crowded"
+              ]
+            },
+            "noise_snr_db": {
+              "type": "number",
+              "minimum": 0.0,
+              "maximum": 40.0
+            },
+            "reverb_rt60_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 2000
+            },
+            "double_talk_overlap_ratio": {
+              "type": "number",
+              "minimum": 0.0,
+              "maximum": 1.0
+            }
+          }
+        }
+      }
+    },
+    "networkProfile": {
+      "type": "object",
+      "required": ["id", "name", "version", "status", "params"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "const": "proposed"
+        },
+        "params": {
+          "type": "object",
+          "required": [
+            "bandwidth_kbps",
+            "latency_ms",
+            "jitter_ms",
+            "packet_loss_pct",
+            "reconnect"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "bandwidth_kbps": {
+              "type": "integer",
+              "minimum": 32,
+              "maximum": 100000
+            },
+            "latency_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 2000
+            },
+            "jitter_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000
+            },
+            "packet_loss_pct": {
+              "type": "number",
+              "minimum": 0.0,
+              "maximum": 100.0
+            },
+            "reconnect": {
+              "type": "object",
+              "required": ["enabled", "max_reconnects", "reconnect_timeout_ms"],
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "max_reconnects": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 10
+                },
+                "reconnect_timeout_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 60000
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "turnProfiles": {
+      "type": "object",
+      "required": ["schema", "version", "status", "profiles"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "const": "proposed"
+        },
+        "description": {
+          "type": "string"
+        },
+        "profiles": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "$ref": "#/definitions/turnProfile"
+          }
+        }
+      }
+    },
+    "noiseProfiles": {
+      "type": "object",
+      "required": ["schema", "version", "status", "profiles"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "const": "proposed"
+        },
+        "description": {
+          "type": "string"
+        },
+        "profiles": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "$ref": "#/definitions/noiseProfile"
+          }
+        }
+      }
+    },
+    "networkProfiles": {
+      "type": "object",
+      "required": ["schema", "version", "status", "profiles"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "const": "proposed"
+        },
+        "description": {
+          "type": "string"
+        },
+        "profiles": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "$ref": "#/definitions/networkProfile"
+          }
+        }
+      }
+    },
+    "pronunciationProtocol": {
+      "type": "object",
+      "required": ["schema", "version", "status", "protocol", "entries"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "const": "proposed"
+        },
+        "description": {
+          "type": "string"
+        },
+        "protocol": {
+          "type": "object",
+          "required": ["rating_scale", "raters_required", "synthetic_only"],
+          "additionalProperties": false,
+          "properties": {
+            "rating_scale": {
+              "type": "string",
+              "minLength": 1
+            },
+            "raters_required": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "synthetic_only": {
+              "type": "boolean",
+              "const": true
+            }
+          }
+        },
+        "entries": {
+          "type": "array",
+          "minItems": 5,
+          "maxItems": 5,
+          "items": {
+            "type": "object",
+            "required": ["name", "role", "synthetic"],
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "role": {
+                "type": "string",
+                "minLength": 1
+              },
+              "synthetic": {
+                "type": "boolean",
+                "const": true
+              }
+            }
+          }
+        }
+      }
+    },
+    "werPairs": {
+      "type": "object",
+      "required": ["schema", "version", "status", "pairs"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "const": "proposed"
+        },
+        "description": {
+          "type": "string"
+        },
+        "pairs": {
+          "type": "array",
+          "minItems": 5,
+          "maxItems": 5,
+          "items": {
+            "type": "object",
+            "required": ["id", "reference", "hypothesis"],
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "reference": {
+                "type": "string"
+              },
+              "hypothesis": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/definitions/turnProfiles"
+    },
+    {
+      "$ref": "#/definitions/noiseProfiles"
+    },
+    {
+      "$ref": "#/definitions/networkProfiles"
+    },
+    {
+      "$ref": "#/definitions/pronunciationProtocol"
+    },
+    {
+      "$ref": "#/definitions/werPairs"
+    }
+  ]
+}

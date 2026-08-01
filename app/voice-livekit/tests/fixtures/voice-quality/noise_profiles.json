@@ -1,0 +1,44 @@
+{
+  "schema": "phase8-l4/noise-profiles",
+  "version": 1,
+  "status": "proposed",
+  "description": "PROPOSED-only ambient noise simulation profiles (VOI-05) for offline voice-quality fixtures. Values are proposed simulation inputs, not measured quality claims.",
+  "profiles": [
+    {
+      "id": "quiet_office_light_noise",
+      "name": "Quiet office with light noise",
+      "version": 1,
+      "status": "proposed",
+      "params": {
+        "scene": "quiet_office",
+        "noise_snr_db": 25.0,
+        "reverb_rt60_ms": 300,
+        "double_talk_overlap_ratio": 0.05
+      }
+    },
+    {
+      "id": "coffee_shop_moderate",
+      "name": "Coffee shop moderate noise",
+      "version": 1,
+      "status": "proposed",
+      "params": {
+        "scene": "coffee_shop",
+        "noise_snr_db": 12.0,
+        "reverb_rt60_ms": 600,
+        "double_talk_overlap_ratio": 0.2
+      }
+    },
+    {
+      "id": "street_heavy_noise",
+      "name": "Street heavy noise",
+      "version": 1,
+      "status": "proposed",
+      "params": {
+        "scene": "street",
+        "noise_snr_db": 4.0,
+        "reverb_rt60_ms": 900,
+        "double_talk_overlap_ratio": 0.35
+      }
+    }
+  ]
+}

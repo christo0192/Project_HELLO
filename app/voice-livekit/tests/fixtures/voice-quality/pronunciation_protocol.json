@@ -1,0 +1,38 @@
+{
+  "schema": "phase8-l4/pronunciation-protocol",
+  "version": 1,
+  "status": "proposed",
+  "description": "PROPOSED pronunciation protocol + explicitly synthetic Indian names/roles. No human MOS rating performed.",
+  "protocol": {
+    "rating_scale": "MOS 1-5",
+    "raters_required": 3,
+    "synthetic_only": true
+  },
+  "entries": [
+    {
+      "name": "Priya Sharma",
+      "role": "Senior Software Engineer",
+      "synthetic": true
+    },
+    {
+      "name": "Rahul Verma",
+      "role": "DevOps Engineer",
+      "synthetic": true
+    },
+    {
+      "name": "Ananya Iyer",
+      "role": "Product Manager",
+      "synthetic": true
+    },
+    {
+      "name": "Vikram Nair",
+      "role": "QA Analyst",
+      "synthetic": true
+    },
+    {
+      "name": "Sneha Kulkarni",
+      "role": "HR Generalist",
+      "synthetic": true
+    }
+  ]
+}

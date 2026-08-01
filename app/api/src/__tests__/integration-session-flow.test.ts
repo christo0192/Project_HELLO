@@ -255,7 +255,9 @@ describe('TST-03 stitched integration flow', () => {
 
     session = db.findOne('call_sessions', (r) => r.id === sessionId)!;
     expect(session.status).toBe('completed');
-    expect(session.terminal_reason).toBe('conversation_complete');
+    // VOI-08: after scoring, terminal_reason transitions to assessment_done
+    // as a non-concurrent repeat guard (Phase 8 audit fix).
+    expect(session.terminal_reason).toBe('assessment_done');
 
     const assessments = db.rows('assessments').filter((a) => a.session_id === sessionId);
     expect(assessments).toHaveLength(1);
