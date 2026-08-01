@@ -4,6 +4,9 @@ import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { CandidateJoinPage } from './CandidateJoinPage';
 
+const { useCapabilitySupport } = vi.hoisted(() => ({ useCapabilitySupport: vi.fn() }));
+vi.mock('../lib/capability-check', () => ({ useCapabilitySupport }));
+
 const { exchangeCandidateInvite, connect, publishTrack, disconnect } = vi.hoisted(() => ({
   exchangeCandidateInvite: vi.fn(),
   connect: vi.fn(),
@@ -40,6 +43,7 @@ function renderPage(initialEntries?: string[]) {
 describe('CandidateJoinPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    useCapabilitySupport.mockReturnValue('supported');
     exchangeCandidateInvite.mockResolvedValue({
       url: 'wss://livekit.example.invalid',
       livekit_token: 'synthetic-livekit-token',
@@ -106,5 +110,30 @@ describe('CandidateJoinPage', () => {
       'wss://livekit.example.invalid',
       'synthetic-livekit-token',
     );
+  });
+
+  it('shows no join button or unsupported message while capabilities are checking', async () => {
+    useCapabilitySupport.mockReturnValue('checking');
+    renderPage(['/candidate/join?consent=true']);
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: 'Join screening' })).not.toBeInTheDocument();
+    });
+    expect(
+      screen.queryByText(/does not support the microphone and WebRTC/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it('blocks joining and shows a generic unsupported message when capabilities are missing', async () => {
+    useCapabilitySupport.mockReturnValue('unsupported');
+    window.history.replaceState(null, '', '/candidate/join#synthetic-invite');
+    renderPage(['/candidate/join?consent=true#synthetic-invite']);
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toBeInTheDocument();
+    });
+    expect(screen.getByText(/does not support the microphone and WebRTC/i)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Join screening' })).not.toBeInTheDocument();
+    expect(exchangeCandidateInvite).not.toHaveBeenCalled();
+    // Mount effect still runs: the invite fragment is removed even when unsupported
+    await waitFor(() => expect(window.location.hash).toBe(''));
   });
 });

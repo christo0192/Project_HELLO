@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import time
 import asyncio
-from typing import Any
+from typing import Any, Callable
 
 from dotenv import load_dotenv
 
@@ -17,7 +17,14 @@ from livekit.plugins import anthropic, sarvam, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 import persistence
-from observability import reset_correlation_id, set_correlation_id
+from observability import (
+    Span,
+    counter_metric,
+    histogram_metric,
+    reset_correlation_id,
+    set_correlation_id,
+    start_span,
+)
 from persistence import LifecycleError, WorkerContext
 from prompting import build_prompt_context, collect_prompt_metadata, opening_line, system_prompt
 from provenance import screening_provenance
@@ -47,6 +54,48 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _monotonic() -> float:
+    """Monotonic clock seam — replaceable in deterministic tests."""
+    return time.monotonic()
+
+
+def _safe_emit(fn: Callable[..., None], *args: Any, **kwargs: Any) -> None:
+    """Emit a metric defensively — an instrumentation failure must never
+    alter the session business flow (OBS-06 invariant)."""
+    try:
+        fn(*args, **kwargs)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _start_span_guarded(name: str, parent: Span | None = None) -> Span | None:
+    """Start a span defensively — a broken tracer must never break the flow."""
+    try:
+        return start_span(name, parent)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _run_span_guarded(
+    name: str, fn: Callable[[Span | None], Any], parent: Span | None = None
+) -> Any:
+    """Run ``fn`` inside a span (mirrors ``with_span_async``) with a guarded start.
+
+    If span plumbing itself fails (broken tracer), ``fn`` still runs directly —
+    instrumentation failure must not alter lifecycle correctness.
+    """
+    span = _start_span_guarded(name, parent)
+    if span is None:
+        return await fn(None)
+    try:
+        return await fn(span)
+    except Exception as exc:
+        span.set_error(exc)
+        raise
+    finally:
+        span.end()
+
+
 class Gopu(Agent):
     def __init__(self, instructions: str) -> None:
         super().__init__(instructions=instructions)
@@ -61,6 +110,27 @@ def _item_text(item: Any) -> str:
         elif hasattr(part, "text"):
             chunks.append(str(part.text))
     return "".join(chunks).strip()
+
+
+# ── Bounded session outcome counter mapping (OBS-06) ────────────────
+# Fixed, explicit allowlist for the session outcome label.  Values outside this
+# fixed set (including any future/unknown terminal reason) map to the bounded
+# ``other_failure`` bucket — never dynamic text.  The raw close reason,
+# session/candidate IDs, transcript and room names are never emitted.
+_SESSION_OUTCOME_ALLOWLIST: dict[str | None, str] = {
+    None: "conversation_complete",
+    "worker_crash": "worker_crash",
+    "shutdown_forced": "shutdown_forced",
+    "provider_error": "provider_error",
+}
+
+
+def _bounded_outcome(reason: str | None) -> str:
+    """Map a terminal reason to a fixed bounded outcome label.
+
+    Unknown or unlisted values map to ``other_failure`` (bounded bucket).
+    """
+    return _SESSION_OUTCOME_ALLOWLIST.get(reason, "other_failure")
 
 
 # ── Explicit close-reason mapping (SDK enum values only) ──────────────
@@ -124,7 +194,7 @@ def _classify_close_event(event: Any) -> str | None:
 
 
 async def entrypoint(ctx: JobContext) -> None:
-    started_at = time.monotonic()
+    started_at = _monotonic()
     await ctx.connect()
     meta = collect_prompt_metadata(ctx)
     session_id = meta.get("session_id") or meta.get("sessionId")
@@ -218,45 +288,74 @@ async def _run_session(ctx: JobContext, started_at: float, session_id: Any, work
     _cleanup_started = False
     _close_event = asyncio.Event()
 
+    # OBS-06: parent span covering the whole voice session lifecycle.
+    # Created only after activation succeeded — sessions that never started
+    # are not instrumented.  Ended in the finally block AFTER the finalizer
+    # completes so child spans always end before the parent.  Guarded start:
+    # a broken tracer must never break the business flow.
+    session_span = _start_span_guarded("voice_session")
+
     async def complete_once(failed_reason: str | None = None) -> None:
         """Terminate the session exactly once.
 
         Drains _write_tasks then marks the session terminal.
         If terminal CAS returns ERROR/DISABLED, raises LifecycleError.
+        Instrumentation (finalize span + bounded outcome counter + duration
+        histograms) is emitted ONLY after a successful terminal CAS.
         """
         nonlocal _cleanup_started
         if _cleanup_started:
             return
         _cleanup_started = True
-        duration = int(time.monotonic() - started_at)
-        activated = _activation_applied
+        finalize_started = _monotonic()
 
-        drained = await persistence.drain_pending_writes(_write_tasks)
-        expected = "in_progress" if activated else "waiting"
+        async def _finalize(span: Span | None) -> None:
+            duration = int(_monotonic() - started_at)
+            activated = _activation_applied
 
-        if not drained:
-            result = await persistence.fail_session(
-                session_id, "shutdown_forced", expected_status=expected,
-            )
-            if not result.ok:
-                raise LifecycleError(f"terminal CAS failed after drain timeout: {result.kind}")
-            return
+            drained = await persistence.drain_pending_writes(_write_tasks)
+            expected = "in_progress" if activated else "waiting"
+            outcome: str | None = None
 
-        if failed_reason:
-            result = await persistence.fail_session(
-                session_id, failed_reason, expected_status=expected,
-            )
-            if not result.ok:
-                raise LifecycleError(f"terminal CAS failed for {failed_reason}: {result.kind}")
-            return
+            if not drained:
+                result = await persistence.fail_session(
+                    session_id, "shutdown_forced", expected_status=expected,
+                )
+                if not result.ok:
+                    raise LifecycleError(f"terminal CAS failed after drain timeout: {result.kind}")
+                outcome = "shutdown_forced"
 
-        if activated:
-            result = await persistence.complete_session(
-                session_id, duration, terminal_reason="conversation_complete"
-            )
-            if not result.ok:
-                raise LifecycleError(f"terminal CAS failed for complete: {result.kind}")
-            await persistence.trigger_scoring(session_id)
+            elif failed_reason:
+                result = await persistence.fail_session(
+                    session_id, failed_reason, expected_status=expected,
+                )
+                if not result.ok:
+                    raise LifecycleError(f"terminal CAS failed for {failed_reason}: {result.kind}")
+                outcome = failed_reason
+
+            elif activated:
+                result = await persistence.complete_session(
+                    session_id, duration, terminal_reason="conversation_complete"
+                )
+                if not result.ok:
+                    raise LifecycleError(f"terminal CAS failed for complete: {result.kind}")
+                await persistence.trigger_scoring(session_id)
+                outcome = None
+
+            else:
+                # Not activated and no failure reason — nothing to persist.
+                return
+
+            # Successful terminal transition — emit bounded metrics only.
+            bounded = _bounded_outcome(outcome)
+            if span is not None:
+                span.set_attributes({"outcome": bounded})
+            _safe_emit(counter_metric, "session_outcome_total", 1.0, {"outcome": bounded})
+            _safe_emit(histogram_metric, "session_finalize_duration_sec",
+                       round(_monotonic() - finalize_started, 3))
+            _safe_emit(histogram_metric, "session_duration_sec", float(duration))
+
+        await _run_span_guarded("session_finalize", _finalize, parent=session_span)
 
     # ── Provider lifecycle — wrapped in try/finally ────────────────
     try:
@@ -271,74 +370,107 @@ async def _run_session(ctx: JobContext, started_at: float, session_id: Any, work
         async def record_turn(speaker: str, text: str) -> None:
             if not text:
                 return
-            await persistence.save_turn(session_id, _next_turn_index(), speaker, text)
+            turn_started = _monotonic()
 
-        session = AgentSession(
-            stt=sarvam.STT(
-                model=os.getenv("SARVAM_STT_MODEL", "saaras:v3"),
-                language=os.getenv("SARVAM_LANGUAGE", "en-IN"),
-            ),
-            tts=sarvam.TTS(
-                model=os.getenv("SARVAM_TTS_MODEL", "bulbul:v3"),
-                speaker=os.getenv("SARVAM_TTS_VOICE", "shubh"),
-            ),
-            llm=anthropic.LLM(model=ANTHROPIC_MODEL),
-            vad=silero.VAD.load(
-                activation_threshold=_float_env("LIVEKIT_VAD_ACTIVATION_THRESHOLD", 0.7),
-                min_speech_duration=_float_env("LIVEKIT_VAD_MIN_SPEECH_DURATION", 0.3),
-                min_silence_duration=_float_env("LIVEKIT_VAD_MIN_SILENCE_DURATION", 0.65),
-                prefix_padding_duration=_float_env("LIVEKIT_VAD_PREFIX_PADDING_DURATION", 0.25),
-            ),
-            turn_detection=MultilingualModel(),
-            min_endpointing_delay=_float_env("LIVEKIT_MIN_ENDPOINTING_DELAY", 0.35),
-            max_endpointing_delay=_float_env("LIVEKIT_MAX_ENDPOINTING_DELAY", 2.0),
-            min_interruption_duration=_float_env("LIVEKIT_MIN_INTERRUPTION_DURATION", 0.75),
-            min_interruption_words=_int_env("LIVEKIT_MIN_INTERRUPTION_WORDS", 2),
-            false_interruption_timeout=_float_env("LIVEKIT_FALSE_INTERRUPTION_TIMEOUT", 1.2),
-            resume_false_interruption=True,
-            allow_interruptions=True,
-        )
+            async def _persist(span: Span | None) -> None:
+                await persistence.save_turn(session_id, _next_turn_index(), speaker, text)
+                if span is not None:
+                    span.set_attributes({"speaker": speaker})
+                _safe_emit(histogram_metric, "session_turn_persistence_duration_sec",
+                           round(_monotonic() - turn_started, 3), {"speaker": speaker})
 
-        @session.on("conversation_item_added")
-        def _on_conversation_item(event):  # noqa: ANN001
-            item = getattr(event, "item", None)
-            role = getattr(item, "role", None)
-            if role not in {"assistant", "user"}:
-                return
-            if role == "assistant" and getattr(item, "interrupted", False):
-                return
-            text = _item_text(item)
-            speaker = "bot" if role == "assistant" else "candidate"
-            tracked_write(record_turn(speaker, text))
+            await _run_span_guarded("turn_persistence", _persist, parent=session_span)
 
-        @session.on("close")
-        def _on_close(event):  # noqa: ANN001
-            nonlocal _finalizer_task  # *** CRITICAL: outer scope assignment ***
-            failed_reason = _classify_close_event(event)
-            _finalizer_task = asyncio.create_task(complete_once(failed_reason))
-            _close_event.set()
+        session: AgentSession | None = None
 
-        await session.start(
-            agent=Gopu(system_text),
-            room=ctx.room,
-            record={"audio": True, "transcript": True, "traces": False, "logs": False},
-        )
-        await session.generate_reply(instructions=opening_text)
+        async def _setup_session(span: Span | None) -> None:
+            nonlocal session
+            session = AgentSession(
+                stt=sarvam.STT(
+                    model=os.getenv("SARVAM_STT_MODEL", "saaras:v3"),
+                    language=os.getenv("SARVAM_LANGUAGE", "en-IN"),
+                ),
+                tts=sarvam.TTS(
+                    model=os.getenv("SARVAM_TTS_MODEL", "bulbul:v3"),
+                    speaker=os.getenv("SARVAM_TTS_VOICE", "shubh"),
+                ),
+                llm=anthropic.LLM(model=ANTHROPIC_MODEL),
+                vad=silero.VAD.load(
+                    activation_threshold=_float_env("LIVEKIT_VAD_ACTIVATION_THRESHOLD", 0.7),
+                    min_speech_duration=_float_env("LIVEKIT_VAD_MIN_SPEECH_DURATION", 0.3),
+                    min_silence_duration=_float_env("LIVEKIT_VAD_MIN_SILENCE_DURATION", 0.65),
+                    prefix_padding_duration=_float_env("LIVEKIT_VAD_PREFIX_PADDING_DURATION", 0.25),
+                ),
+                turn_detection=MultilingualModel(),
+                min_endpointing_delay=_float_env("LIVEKIT_MIN_ENDPOINTING_DELAY", 0.35),
+                max_endpointing_delay=_float_env("LIVEKIT_MAX_ENDPOINTING_DELAY", 2.0),
+                min_interruption_duration=_float_env("LIVEKIT_MIN_INTERRUPTION_DURATION", 0.75),
+                min_interruption_words=_int_env("LIVEKIT_MIN_INTERRUPTION_WORDS", 2),
+                false_interruption_timeout=_float_env("LIVEKIT_FALSE_INTERRUPTION_TIMEOUT", 1.2),
+                resume_false_interruption=True,
+                allow_interruptions=True,
+            )
+
+            @session.on("conversation_item_added")
+            def _on_conversation_item(event):  # noqa: ANN001
+                item = getattr(event, "item", None)
+                role = getattr(item, "role", None)
+                if role not in {"assistant", "user"}:
+                    return
+                if role == "assistant" and getattr(item, "interrupted", False):
+                    return
+                text = _item_text(item)
+                speaker = "bot" if role == "assistant" else "candidate"
+                tracked_write(record_turn(speaker, text))
+
+            @session.on("close")
+            def _on_close(event):  # noqa: ANN001
+                nonlocal _finalizer_task  # *** CRITICAL: outer scope assignment ***
+                failed_reason = _classify_close_event(event)
+                _finalizer_task = asyncio.create_task(complete_once(failed_reason))
+                _close_event.set()
+
+            await session.start(
+                agent=Gopu(system_text),
+                room=ctx.room,
+                record={"audio": True, "transcript": True, "traces": False, "logs": False},
+            )
+
+        setup_started = _monotonic()
+        await _run_span_guarded("session_setup", _setup_session, parent=session_span)
+        _safe_emit(histogram_metric, "session_setup_duration_sec",
+                   round(_monotonic() - setup_started, 3))
+
+        async def _generate_reply(span: Span | None) -> None:
+            await session.generate_reply(instructions=opening_text)
+
+        generate_started = _monotonic()
+        await _run_span_guarded("session_generate_reply", _generate_reply, parent=session_span)
+        _safe_emit(histogram_metric, "session_generate_reply_duration_sec",
+                   round(_monotonic() - generate_started, 3))
 
         # Await session closure — keeps entrypoint alive until close fires
         await _close_event.wait()
 
-    except Exception:
+    except Exception as exc:
+        if session_span is not None:
+            session_span.set_error(exc)
         # Provider construction/start/generate failed before close event
         await complete_once("worker_crash")
     finally:
-        if _finalizer_task is not None and not _finalizer_task.done():
-            try:
-                await _finalizer_task
-            except LifecycleError:
-                raise
-            except Exception:  # noqa: BLE001
-                pass
+        try:
+            if _finalizer_task is not None and not _finalizer_task.done():
+                try:
+                    await _finalizer_task
+                except LifecycleError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    pass
+        finally:
+            # The parent span ends even when a LifecycleError propagates out
+            # of the finalizer — exception paths must end spans.
+            if session_span is not None:
+                session_span.end()
 
 
 if __name__ == "__main__":

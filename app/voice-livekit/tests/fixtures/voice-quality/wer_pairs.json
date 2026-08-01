@@ -1,0 +1,33 @@
+{
+  "schema": "phase8-l4/wer-pairs",
+  "version": 1,
+  "status": "proposed",
+  "description": "PROPOSED-only deterministic WER validation pairs (VOI-03) using synthetic de-identified screening text. No real candidate data is present.",
+  "pairs": [
+    {
+      "id": "identical",
+      "reference": "hello my name is ravi",
+      "hypothesis": "hello my name is ravi"
+    },
+    {
+      "id": "deletion",
+      "reference": "i have five years of experience",
+      "hypothesis": "i have five years experience"
+    },
+    {
+      "id": "insertion",
+      "reference": "please tell me about your role",
+      "hypothesis": "please tell me a little about your role"
+    },
+    {
+      "id": "empty_hypothesis",
+      "reference": "i am interested in this role",
+      "hypothesis": ""
+    },
+    {
+      "id": "normalization",
+      "reference": "I am from Bengaluru, India.",
+      "hypothesis": "i am from bengaluru india"
+    }
+  ]
+}

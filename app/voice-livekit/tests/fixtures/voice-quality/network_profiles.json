@@ -1,0 +1,59 @@
+{
+  "schema": "phase8-l4/network-profiles",
+  "version": 1,
+  "status": "proposed",
+  "description": "PROPOSED-only network condition profiles (VOI-06) for offline voice-quality simulation. No production threshold decisions are derived from these values.",
+  "profiles": [
+    {
+      "id": "good_4g",
+      "name": "Good 4G conditions",
+      "version": 1,
+      "status": "proposed",
+      "params": {
+        "bandwidth_kbps": 15000,
+        "latency_ms": 45,
+        "jitter_ms": 10,
+        "packet_loss_pct": 0.1,
+        "reconnect": {
+          "enabled": true,
+          "max_reconnects": 3,
+          "reconnect_timeout_ms": 5000
+        }
+      }
+    },
+    {
+      "id": "poor_wifi",
+      "name": "Poor WiFi conditions",
+      "version": 1,
+      "status": "proposed",
+      "params": {
+        "bandwidth_kbps": 1500,
+        "latency_ms": 120,
+        "jitter_ms": 60,
+        "packet_loss_pct": 3.5,
+        "reconnect": {
+          "enabled": true,
+          "max_reconnects": 5,
+          "reconnect_timeout_ms": 10000
+        }
+      }
+    },
+    {
+      "id": "stable_lte_with_reconnect",
+      "name": "Stable LTE with reconnect policy",
+      "version": 1,
+      "status": "proposed",
+      "params": {
+        "bandwidth_kbps": 50000,
+        "latency_ms": 30,
+        "jitter_ms": 5,
+        "packet_loss_pct": 0.0,
+        "reconnect": {
+          "enabled": false,
+          "max_reconnects": 0,
+          "reconnect_timeout_ms": 0
+        }
+      }
+    }
+  ]
+}

@@ -5,6 +5,15 @@ import { buildAssessmentPrompt, formatResumeFacts } from '../lib/prompts.js';
 import type { Assessment, TranscriptTurn } from '../lib/types.js';
 import { scoringProvenance } from '../lib/model-provenance.js';
 
+// ── Scoring eligibility ─────────────────────────────────────────────────
+
+/**
+ * VOI-08: stable error code thrown by the technical scoring preflight.
+ * The only session state eligible for initial scoring is `completed` with
+ * the authoritative `conversation_complete` terminal reason.
+ */
+export const ERR_SESSION_NOT_COMPLETED = 'ERR_SESSION_NOT_COMPLETED';
+
 // ── Runner abstraction for testability ──────────────────────────────────
 
 export interface AssessmentRunner {
@@ -38,10 +47,21 @@ export async function runAssessment(sessionId: string): Promise<Assessment & { i
 async function runAssessmentImpl(sessionId: string): Promise<Assessment & { id: string }> {
   const { data: session, error: sErr } = await supabase
     .from('call_sessions')
-    .select('id,candidate_id,role_id')
+    .select('id,candidate_id,role_id,status,terminal_reason')
     .eq('id', sessionId)
     .single();
   if (sErr || !session) throw new Error(`session not found: ${sErr?.message}`);
+
+  // VOI-08: technical scoring eligibility — fail closed unless the session is
+  // completed with the authoritative initial scoring reason. Blocks
+  // failed/cancelled/expired/in_progress/created/waiting, missing/null or
+  // malformed reasons, and the assessment_done repeat path.
+  if (
+    session.status !== 'completed' ||
+    session.terminal_reason !== 'conversation_complete'
+  ) {
+    throw new Error(ERR_SESSION_NOT_COMPLETED);
+  }
 
   const { data: turns } = await supabase
     .from('transcript_turns')
@@ -137,6 +157,18 @@ async function runAssessmentImpl(sessionId: string): Promise<Assessment & { id: 
     .from('candidates')
     .update({ status: assessment.recommendation === 'reject' ? 'rejected' : 'screened' })
     .eq('id', session.candidate_id);
+
+  // VOI-08: best-effort non-concurrent repeat guard — transition the session's
+  // terminal_reason from conversation_complete to assessment_done AFTER a
+  // successful assessment insert.  Concurrent calls still have a TOCTOU race
+  // (no DB-level unique constraint on session_id in the assessments table),
+  // but all non-concurrent repeat calls are now rejected by the preflight.
+  // This is a bounded safe fix — no destructive migration required.
+  await supabase
+    .from('call_sessions')
+    .update({ terminal_reason: 'assessment_done' })
+    .eq('id', sessionId)
+    .eq('terminal_reason', 'conversation_complete');
 
   return { ...assessment, id: row.id };
 }

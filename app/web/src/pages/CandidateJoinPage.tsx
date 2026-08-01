@@ -3,6 +3,7 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { createLocalAudioTrack, LocalAudioTrack, Room, RoomEvent, Track } from 'livekit-client';
 import { api, ApiError } from '../api';
 import { Button, Card } from '../components/ui';
+import { useCapabilitySupport } from '../lib/capability-check';
 
 /** Public candidate flow. The invite fragment is consumed once and removed immediately. */
 export function CandidateJoinPage() {
@@ -13,6 +14,7 @@ export function CandidateJoinPage() {
   const localTrackRef = useRef<LocalAudioTrack | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
   const [searchParams] = useSearchParams();
+  const capabilityStatus = useCapabilitySupport();
   // GOV-03/GOV-09: Consent status derived from URL query param
   const consentParam = searchParams.get('consent');
   const consentStatus: 'unknown' | 'granted' | 'declined' =
@@ -125,6 +127,15 @@ export function CandidateJoinPage() {
           <Button className="mt-5" onClick={leave}>Leave screening</Button>
         ) : status === 'ended' ? (
           <p className="mt-5 text-sm font-medium text-gray-700">The screening has ended.</p>
+        ) : capabilityStatus === 'checking' ? (
+          null
+        ) : capabilityStatus === 'unsupported' ? (
+          <div role="alert" className="mt-5 rounded-md border border-red-200 bg-red-50 p-3">
+            <p className="text-sm text-red-800">
+              Your browser does not support the microphone and WebRTC features this
+              screening requires. Please use a current version of a supported browser.
+            </p>
+          </div>
         ) : consentStatus === 'granted' ? (
           <Button className="mt-5" onClick={join} loading={status === 'joining'}>
             Join screening
