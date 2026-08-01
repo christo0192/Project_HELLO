@@ -13,13 +13,11 @@
 #   - Every documented route exists in the live app; the contract test
 #     asserts the reverse direction too (no undocumented mounted routes).
 #
-# NOTE (documented limitation): POST /api/livekit/grant/recording is
-# registered in livekit.ts but is currently SHADOWED by the earlier
-# POST /api/livekit/{sessionId}/recording registration ("grant" fails the
-# UUID path-param validation, so requests reach the recording route and get
-# 400). Its intended 200 shape is documented below for PR2-L5, which fixes
-# the registration order; the contract test asserts the CURRENT shadow
-# behavior (400), not the unreachable success response.
+# L5 (Phase 7) removed the grant-route shadow: POST /api/livekit/grant/recording
+# is now registered BEFORE POST /api/livekit/{sessionId}/recording, so the
+# literal "grant" segment is no longer captured by the UUID path-param route.
+# The grant endpoint mints a short-TTL signed URL (200 {url}) and is gated
+# fail-closed on revoked (403) / quarantined (409) / deleted (404) recordings.
 
 openapi: 3.0.3
 info:
@@ -513,11 +511,41 @@ paths:
               schema:
                 $ref: '#/components/schemas/SimpleError'
         '403':
-          description: Grant token not bound to this session.
+          description: Grant token not bound to this session, or non-owner recruiter.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/SimpleError'
+        '404':
+          description: Session not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '409':
+          description: Recording already exists for this session (one recording per session; replay rejected).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '413':
+          description: File exceeds the reduced bounded upload cap (PROPOSED default 25 MiB, hard max 50 MiB) — rejected before buffering.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '415':
+          description: Unsupported media type — magic bytes, MIME/extension agreement, or polyglot guard failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '422':
+          description: Malware scan rejected the upload (fail-closed). At-rest tampering is detected on DOWNLOAD (re-verify vs recording_sha256), not on upload — the upload path never compares against a persisted digest (unreachable + uploader-controlled; see runbook).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
 
   /api/livekit/worker-context:
     post:
@@ -656,7 +684,7 @@ paths:
       tags: [livekit]
       operationId: grantRecording
       summary: Mint a short-TTL signed URL for a recording via a candidate grant
-      description: Registered in livekit.ts but CURRENTLY SHADOWED: POST /api/livekit/{sessionId}/recording is registered first, so grant fails UUID path-param validation and the request is rejected with 400. The intended 200 shape (url) is documented for PR2-L5, which fixes the registration order. The contract test asserts the current shadow behavior (400).
+      description: Registered before /api/livekit/{sessionId}/recording (L5 route-shadow fix). Validates the grant binding, then gates fail-closed on deleted (404) / quarantined (409) / revoked (403) recordings before minting.
       security: []
       requestBody:
         required: true
@@ -672,19 +700,25 @@ paths:
               schema:
                 $ref: '#/components/schemas/RecordingGrantResponse'
         '400':
-          description: Current shadow behavior (grant captured as :sessionId, UUID validation fails).
+          description: Request validation failed.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '403':
-          description: Grant invalid or not bound to the session.
+          description: Grant invalid, not bound to the session, or recording revoked.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/SimpleError'
         '404':
-          description: Recording not found.
+          description: Session/recording not found or recording deleted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '409':
+          description: Recording is quarantined and never served.
           content:
             application/json:
               schema:
@@ -703,6 +737,7 @@ paths:
       tags: [recordings]
       operationId: downloadRecording
       summary: Mint a short-TTL signed recording URL for a recruiter (viewer+; interviewer must own)
+      description: Gates fail-closed on deleted (404) / quarantined (409) / revoked (403), then — when recording_sha256 is persisted — re-verifies the stored bytes server-side (SHA-256 fetched through storage vs the persisted digest) BEFORE minting. A mismatch or over-cap object quarantines the session (409); a storage read failure is a redacted fail-closed 500 and never mints a URL. No hash (legacy rows) skips re-verification entirely.
       responses:
         '200':
           description: Short-TTL signed URL (never persisted or logged).
@@ -717,19 +752,70 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '403':
-          description: Non-privileged role or not the owning interviewer (uniform denial).
+          description: Non-privileged role, not the owning interviewer, or recording revoked (uniform denial).
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/AuthErrorBody'
         '404':
-          description: Recording not found.
+          description: Recording not found or deleted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: Recording is quarantined (flag-gated OR caught by download-time re-verification: digest mismatch or over-cap object) and never served.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '500':
-          description: Signing failure (redacted stable error).
+          description: Signing failure or integrity re-verification storage failure (redacted stable error; never mints a URL).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/recordings/{sessionId}/revoke:
+    parameters:
+      - name: sessionId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [recordings]
+      operationId: revokeRecording
+      summary: Revoke recording access (admin only) — REC-05 write path
+      description: Sets recording_revoked_at (CAS-guarded), appends exactly one 'revoked' integrity event (unique partial index; retries backfill a missing event), and audits recording.revoked only on the transition. Both mint paths (recruiter download + candidate grant) then return 403 before createSignedUrl. Retries converge to already_revoked with no duplicate evidence.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecordingRevokeRequest'
+      responses:
+        '200':
+          description: Revocation applied (status revoked) or already converged (status already_revoked).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordingRevokeResponse'
+        '400':
+          description: Request validation failed (malformed session id or oversize reason).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Non-admin caller (uniform denial).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '404':
+          description: Recording/session not found.
           content:
             application/json:
               schema:
@@ -2136,6 +2222,32 @@ components:
       properties:
         url:
           type: string
+      additionalProperties: false
+
+    # REC-05 (F2): recording revocation request/response.
+    RecordingRevokeRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          description: Optional bounded human-readable revocation reason (<= 200 chars).
+      additionalProperties: false
+
+    RecordingRevokeResponse:
+      type: object
+      required: [ok, status, revoked_at]
+      properties:
+        ok:
+          type: boolean
+          const: true
+        status:
+          type: string
+          enum: [revoked, already_revoked]
+          description: revoked = transition (or evidence backfill) happened; already_revoked = idempotent retry, fully converged.
+        revoked_at:
+          type: string
+          format: date-time
+          nullable: true
       additionalProperties: false
 
     # ── DSAR ─────────────────────────────────────────────────────────

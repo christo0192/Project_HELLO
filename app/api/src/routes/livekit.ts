@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import multer from 'multer';
-import { timingSafeEqual as cryptoTimingSafeEqual } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual as cryptoTimingSafeEqual } from 'node:crypto';
 import { RoomServiceClient } from 'livekit-server-sdk';
 import { supabase } from '../lib/supabase.js';
 import { env } from '../lib/env.js';
@@ -12,11 +12,20 @@ import {
 } from '../lib/validation.js';
 import {
   livekitStartSchema,
-  livekitRecordingBodySchema,
-  livekitRecordingParamSchema,
   recordingGrantSchema,
   workerContextSchema,
 } from '../schemas/livekit.js';
+import {
+  recordingUploadParamSchema,
+  recordingUploadBodySchema,
+  RECORDING_MAX_BYTES_DEFAULT,
+  RECORDING_MAX_BYTES_HARD_MAX,
+} from '../schemas/recordings.js';
+import { guardAudioUpload, UploadGuardError } from '../lib/upload-guard.js';
+import { resolveScanner } from '../lib/malware-scanner.js';
+import { recordAudit } from '../lib/audit.js';
+import { extractBearerToken, verifyToken } from '../lib/auth.js';
+import type { AuthUser } from '../lib/auth.js';
 import { createSession, transitionSession } from '../lib/session-lifecycle.js';
 import { getCorrelationId } from '../lib/correlation.js';
 import { handleRecordingGrant } from './invites.js';
@@ -24,10 +33,27 @@ import { resolveWorkerContext } from '../lib/worker-context.js';
 
 export const livekitRouter = Router();
 
+/**
+ * REC-03 (C-3, PROPOSED): reduced bounded browser audio-upload cap.
+ * env.recordingMaxBytes = RECORDING_MAX_BYTES (default 25 MiB, hard max 50 MiB)
+ * — strictly below the old 100 MB multer cap. Multer rejects oversize with
+ * LIMIT_FILE_SIZE → 413 BEFORE the body is fully buffered. This bounds memory;
+ * it is NOT constant-memory streaming (the fail-closed scanner + magic-byte
+ * validator require the in-memory buffer). PROPOSED: no Product/SRE/Legal
+ * sign-off implied.
+ */
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 100 * 1024 * 1024, fields: 0, files: 1, parts: 2 },
+  limits: {
+    fileSize: env.recordingMaxBytes,
+    fields: 0,
+    files: 1,
+    parts: 2,
+  },
 });
+// Keep the PROPOSED constants reachable for documentation/tests.
+void RECORDING_MAX_BYTES_DEFAULT;
+void RECORDING_MAX_BYTES_HARD_MAX;
 
 function requireLiveKit() {
   if (!env.livekitUrl || !env.livekitApiKey || !env.livekitApiSecret) {
@@ -210,48 +236,246 @@ livekitRouter.post('/start', validateBody(livekitStartSchema), async (req, res, 
   }
 });
 
+// ── Recruiter (non-grant) upload auth ────────────────────────────────
+// REC-03 (L5): the recording upload route is PUBLIC because grant-token
+// uploads carry no bearer credential — the global requireAuth middleware
+// therefore never runs for it. For the recruiter path we verify the bearer
+// token in-route with the same verifyToken seam and mirror the membership
+// shape used by recordings.ts (admin/viewer any; interviewer must own).
+
+type RecruiterAuthResult =
+  | { user: AuthUser }
+  | { status: 401 | 403; error: string };
+
+async function resolveRecruiterAuth(req: import('express').Request): Promise<RecruiterAuthResult> {
+  const token = extractBearerToken(req.headers.authorization);
+  if (!token) {
+    return { status: 401, error: 'authentication_required' };
+  }
+  const authResult = await verifyToken(token);
+  if (!authResult.ok) {
+    return {
+      status: authResult.status,
+      error: authResult.status === 401 ? 'authentication_required' : 'access_denied',
+    };
+  }
+  // Membership mirror (same role/active shape as the global middleware and
+  // the recordings.ts owner gate).
+  const { data: membership } = await supabase
+    .from('recruiter_memberships')
+    .select('role,active')
+    .eq('user_id', authResult.user.id)
+    .single();
+  const role = membership?.role as 'admin' | 'interviewer' | 'viewer' | undefined;
+  if (!role || !['admin', 'interviewer', 'viewer'].includes(role)) {
+    return { status: 403, error: 'access_denied' };
+  }
+  if (!membership || membership.active !== true) {
+    return { status: 403, error: 'access_denied' };
+  }
+  if ((role === 'admin' || role === 'interviewer') && authResult.user.aal !== 'aal2') {
+    return { status: 403, error: 'access_denied' };
+  }
+  return { user: { ...authResult.user, active: true, appRole: role } };
+}
+
+// ── POST /api/livekit/grant/recording ────────────────────────────────
+// C-2 route-shadow fix: registered BEFORE POST /:sessionId/recording so the
+// literal "grant" segment is never captured by the UUID path-parameter route.
+// REC-05/04/06 (L5): a new signed URL is never minted for a deleted (404),
+// quarantined (409), or revoked (403) recording — fail-closed, before mint.
+
+livekitRouter.post(
+  '/grant/recording',
+  validateBody(recordingGrantSchema),
+  async (req, res, next) => {
+    try {
+      const { grant_token, session_id } = req.body as { grant_token: string; session_id: string };
+
+      // ── Revocation/quarantine/deleted gate (REC-05, invariant 7) ──
+      // Denies NEW mints within the (short) TTL; existing URLs expire
+      // naturally. Never logs object keys/URLs/tokens.
+      const { data: session } = await supabase
+        .from('call_sessions')
+        .select('recording_deleted_at, recording_quarantined, recording_revoked_at')
+        .eq('id', session_id)
+        .single();
+      if (!session) {
+        return res.status(404).json({ error: 'not_found' });
+      }
+      if (session.recording_deleted_at !== null) {
+        // REC-06 forward-compat tombstone: erased recordings are gone.
+        return res.status(404).json({ error: 'not_found' });
+      }
+      if (session.recording_quarantined === true) {
+        // REC-04: never serve a quarantined object.
+        return res.status(409).json({ error: 'recording_quarantined' });
+      }
+      if (session.recording_revoked_at !== null) {
+        // REC-05: revocation denies new mints.
+        return res.status(403).json({ error: 'access_denied' });
+      }
+
+      const result = await handleRecordingGrant(grant_token, session_id);
+      res.json(result);
+    } catch (error: any) {
+      const statusCode = error.statusCode || 500;
+      if (statusCode === 403) {
+        return res.status(403).json({ error: 'access_denied' });
+      }
+      if (statusCode === 404) {
+        return res.status(404).json({ error: 'not_found' });
+      }
+      next(error);
+    }
+  },
+);
+
 // ── POST /api/livekit/:sessionId/recording ───────────────────────────
-// SEC-04: Requires recruiter owner or candidate grant bound to session.
-//          Uses upsert: false to reject overwrite/replay.
+// REC-03/04/01/05 (L5): hardened secondary browser upload path.
+//   - reduced bounded multer cap (C-3) → 413 pre-buffer
+//   - grant-token OR recruiter-owner auth (closes the owner TODO)
+//   - per-session quota (one recording per session) → 409, upsert:false
+//   - guardAudioUpload magic-byte/MIME/extension/polyglot → 415
+//   - resolveScanner fail-closed → 422; EICAR always rejected
+//   - SHA-256 computed & persisted at upload; at-rest tampering is
+//     detected on DOWNLOAD (re-hash vs recording_sha256) → quarantine
+//   - recording_integrity_events appended; audit recording.upload
 
 livekitRouter.post(
   '/:sessionId/recording',
-  validateParams(livekitRecordingParamSchema),
+  validateParams(recordingUploadParamSchema),
   upload.single('file'),
-  validateBodyFields(livekitRecordingBodySchema),
+  validateBodyFields(recordingUploadBodySchema),
   requireUploadedFile,
   async (req, res, next) => {
     try {
       const sessionId = req.params.sessionId;
       const file = req.file!;
+      let user = req.authUser;
 
-      // TODO: Integrate recruiter-owner check via injected middleware (Codex).
-      // For now, only grant-authenticated uploads are accepted.
-      // Cross-session/replay: the grant token binds to exactly one session.
+      // ── Auth: grant-token XOR recruiter-owner (SEC-04/REC-03) ────
       const grantHeader = req.headers['x-grant-token'];
       const grantToken = typeof grantHeader === 'string' && /^[a-f0-9]{64}$/.test(grantHeader)
         ? grantHeader
         : undefined;
+      let grantOk = false;
       if (grantToken) {
         const { validateGrant } = await import('../lib/candidate-access.js');
         const validation = await validateGrant(grantToken);
+        // Grant binds exactly one session (invariant 4).
         if (!validation.ok || validation.payload.session_id !== sessionId) {
           return res.status(403).json({ error: 'access_denied' });
         }
+        grantOk = true;
       }
-      // When no grant AND no recruiter auth → fail closed.
-      if (!grantToken) {
-        return res.status(401).json({ error: 'authentication_required' });
+      if (!grantOk) {
+        // Recruiter (non-grant) upload — verify the bearer token in-route
+        // (owner check below against the session row, invariant 5).
+        const auth = await resolveRecruiterAuth(req);
+        if ('status' in auth) {
+          return res.status(auth.status).json({ error: auth.error });
+        }
+        user = auth.user;
       }
 
-      const extension = file.mimetype.includes('mpeg')
-        ? 'mp3'
-        : file.mimetype.includes('mp4')
-          ? 'mp4'
-          : 'webm';
-      const objectKey = `${sessionId}.${extension}`;
+      // ── Fetch session for preflight gates in one query (F-D repair) ─
+      const { data: session, error: sessionErr } = await supabase
+        .from('call_sessions')
+        .select('owner_id, recording_object_key, recording_deleted_at, recording_revoked_at, recording_quarantined')
+        .eq('id', sessionId)
+        .single();
+      if (sessionErr || !session) {
+        return res.status(404).json({ error: 'not_found' });
+      }
 
-      // upsert: false — reject overwrite of existing recordings
+      // Recruiter-owner shape (admin/viewer any; interviewer must own).
+      if (!grantOk) {
+        const isAdminOrViewer = user!.appRole === 'admin' || user!.appRole === 'viewer';
+        const isOwningInterviewer =
+          user!.appRole === 'interviewer' &&
+          !!session.owner_id &&
+          session.owner_id === user!.id;
+        if (!isAdminOrViewer && !isOwningInterviewer) {
+          return res.status(403).json({ error: 'access_denied' });
+        }
+      }
+
+      // ── Preflight terminal-state gates (F-D repair) ───────────────
+      // Reject BEFORE storage upload to avoid needless orphan work.
+      // Order: deleted (404), quarantined (409), revoked (403).
+      if (session.recording_deleted_at) {
+        return res.status(404).json({ error: 'not_found' });
+      }
+      if (session.recording_quarantined === true) {
+        return res.status(409).json({ error: 'recording_quarantined' });
+      }
+      if (session.recording_revoked_at) {
+        return res.status(403).json({ error: 'access_denied' });
+      }
+
+      // ── Quota / replay (invariant 4): one recording per session ──
+      if (session.recording_object_key) {
+        return res.status(409).json({ error: 'recording_already_exists' });
+      }
+
+      // ── Audio content validation (REC-03, invariant 2) ───────────
+      let ext: string;
+      try {
+        const audio = guardAudioUpload(
+          file.buffer,
+          file.mimetype || 'audio/webm',
+          file.originalname,
+          env.recordingMaxBytes,
+        );
+        ext = audio.ext;
+      } catch (guardErr) {
+        if (guardErr instanceof UploadGuardError) {
+          return res.status(415).json({
+            error: {
+              type: 'unsupported_media_type',
+              message: guardErr.message,
+              details: [{ field: 'file', code: guardErr.code, message: guardErr.message }],
+            },
+          });
+        }
+        throw guardErr;
+      }
+
+      // Unique-per-attempt object key so a compensation failure does
+      // not block retries (F-A repair). The RPC CAS below ensures at
+      // most one attempt is linked to the session.
+      const objectKey = `${sessionId}-${randomUUID().slice(0, 8)}.${ext}`;
+
+      // ── Malware scan, fail-closed (REC-03, invariant 3) ──────────
+      const scanner = resolveScanner(process.env.NODE_ENV ?? 'development');
+      const scan = await scanner.scan(file.buffer);
+      if (!scan.safe) {
+        await recordAudit(req, 'recording.upload', 422, {
+          metadata: { session_id: sessionId, result: 'malware_rejected', scanner: scanner.name },
+        }).catch(() => {/* fail-open: denial must not 500 */});
+        return res.status(422).json({
+          error: { type: 'malware_detected', message: 'Recording failed malware scan' },
+        });
+      }
+
+      // ── Integrity digest (REC-04, invariant 6) ───────────────────
+      // The digest is computed over the bytes about to be stored and
+      // persisted with the object. NOTE (F1 repair): a persisted-digest
+      // comparison on the UPLOAD path is deliberately NOT attempted — it is
+      // unreachable (the quota gate above rejects any session that already
+      // has a recording_object_key, so recording_sha256 is always NULL
+      // here) and its "expected" value would be uploader-controlled anyway.
+      // At-rest tampering is detected on the DOWNLOAD path instead, where
+      // the stored bytes are fetched, re-hashed server-side and compared to
+      // recording_sha256 before any signed URL is minted (see
+      // lib/recording-integrity.ts + routes/recordings.ts).
+      const sha256 = createHash('sha256').update(file.buffer).digest('hex');
+
+      // ── Store (upsert:false — unique key per attempt, F-A repair) ─
+      // The key includes a random suffix so a compensation failure on
+      // the RPC below does not block retries. The RPC CAS is the real
+      // guard: at most one upload can be linked per session.
       const { error: upErr } = await supabase.storage
         .from(env.recordingsBucket)
         .upload(objectKey, file.buffer, {
@@ -260,17 +484,79 @@ livekitRouter.post(
         });
       if (upErr) return next(upErr);
 
-      // Store object key only — no signed URL persisted
-      const { data: updateData, error: updateErr } = await supabase
-        .from('call_sessions')
-        .update({ recording_object_key: objectKey })
-        .eq('id', sessionId)
-        .select('id');
-      if (updateErr) return next(updateErr);
-      if (!updateData || updateData.length === 0) {
-        return next(new Error('session not found — recording not linked'));
+      // ── Atomic finalization (F-A repair) ──────────────────────────
+      // DB link + exactly-one 'uploaded' integrity event are
+      // transactionally atomic via the service-role-only RPC. CAS
+      // guarantees exactly one caller wins; the FOR UPDATE lock
+      // serialises concurrent uploads.
+      const { data: rpcData, error: rpcErr } = await supabase.rpc(
+        'finalize_recording_upload',
+        {
+          p_session_id: sessionId,
+          p_object_key: objectKey,
+          p_sha256: sha256,
+          p_size_bytes: file.buffer.length,
+          p_content_type: file.mimetype || 'audio/webm',
+          p_provenance: 'browser_upload',
+          p_correlation_id: getCorrelationId() ?? null,
+        },
+      );
+
+      if (rpcErr || !rpcData || (rpcData as any).status !== 'ok') {
+        // ── Compensate: delete orphaned storage object ────────────
+        // The RPC left the session row untouched; the storage object
+        // is orphaned. Delete it so a retry starts clean.
+        const { error: removeErr } = await supabase.storage
+          .from(env.recordingsBucket)
+          .remove([objectKey]);
+        if (removeErr) {
+          // Compensation failed — record orphan in BACKEND-ONLY table (F-C).
+          // NEVER store object_key in recruiter-readable integrity_events;
+          // NEVER use event_type='uploaded' (would block retry via unique
+          // partial index). The orphan table has zero authenticated/anon
+          // policy — service_role only. Unique constraint on object_key
+          // makes this idempotent (upsert-safe).
+          try {
+            await supabase.from('recording_orphaned_objects').upsert(
+              {
+                session_id: sessionId,
+                object_key: objectKey,
+                sha256,
+                size_bytes: file.buffer.length,
+                content_type: file.mimetype || 'audio/webm',
+                status: 'pending_cleanup',
+                error_detail: `RPC ${(rpcData as any)?.status || rpcErr?.message || 'unknown'}`,
+                correlation_id: getCorrelationId() ?? null,
+                updated_at: new Date().toISOString(),
+              },
+              { onConflict: 'object_key' },
+            );
+          } catch {
+            // Orphan-row write also failed — bucket-manifest reconciliation
+            // is the residual gate (documented in runbook). No URL minted.
+          }
+        }
+        return next(
+          new Error(
+            `recording finalization failed: ${(rpcData as any)?.status || rpcErr?.message || 'unknown'}`,
+          ),
+        );
       }
 
+      // ── Audit (read-adjacent to durable RPC evidence → fail-open) ─
+      // The immutable integrity event + RPC link are already durable;
+      // a failed audit row must never turn a successful upload into 500.
+      await recordAudit(req, 'recording.upload', 200, {
+        metadata: {
+          session_id: sessionId,
+          sha256_prefix: sha256.slice(0, 12),
+          size_bytes: file.buffer.length,
+          content_type: file.mimetype || 'audio/webm',
+          provenance: 'browser_upload',
+        },
+      }).catch(() => {/* fail-open: immutable evidence already durable */});
+
+      // Return the object key only — no signed URL is ever persisted/logged.
       res.json({ object_key: objectKey });
     } catch (error) {
       next(error);
@@ -300,29 +586,6 @@ livekitRouter.post(
 
       res.json({ ok: true, context: result.context });
     } catch (error) {
-      next(error);
-    }
-  },
-);
-
-// ── POST /api/livekit/grant/recording ────────────────────────────────
-
-livekitRouter.post(
-  '/grant/recording',
-  validateBody(recordingGrantSchema),
-  async (req, res, next) => {
-    try {
-      const { grant_token, session_id } = req.body as { grant_token: string; session_id: string };
-      const result = await handleRecordingGrant(grant_token, session_id);
-      res.json(result);
-    } catch (error: any) {
-      const statusCode = error.statusCode || 500;
-      if (statusCode === 403) {
-        return res.status(403).json({ error: 'access_denied' });
-      }
-      if (statusCode === 404) {
-        return res.status(404).json({ error: 'not_found' });
-      }
       next(error);
     }
   },

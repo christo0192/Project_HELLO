@@ -38,7 +38,14 @@ export type AuditEvent =
   | 'rate_limit.exceeded'
   | 'audit.sink_failure'
   | 'audit.configuration_error'
-  | 'recording.download';
+  | 'recording.download'
+  // REC-03/04/05 (L5, additive): browser upload + integrity lifecycle.
+  // 'recording.deleted' lands now so the union is stable; L6 uses it.
+  | 'recording.upload'
+  | 'recording.integrity_verified'
+  | 'recording.quarantined'
+  | 'recording.revoked'
+  | 'recording.deleted';
 
 /** Events that, when they fail to record for a privileged mutation,
  *  should block the mutation (fail-closed). */
@@ -46,6 +53,13 @@ export const FAIL_CLOSED_EVENTS: ReadonlySet<string> = new Set([
   'resource.create',
   'resource.update',
   'resource.delete',
+  // REC-03/04/05: security-relevant recording writes are fail-closed — an
+  // audit-sink failure must never silently leave an upload/quarantine/
+  // revocation/erasure unrecorded.
+  'recording.upload',
+  'recording.quarantined',
+  'recording.revoked',
+  'recording.deleted',
 ]);
 
 /** Events that are informational and must never cause a 500. */
@@ -62,6 +76,10 @@ export const FAIL_OPEN_EVENTS: ReadonlySet<string> = new Set([
   'audit.sink_failure',
   'audit.configuration_error',
   'recording.download',
+  // REC-04: verification is a read-adjacent/informational event — the
+  // integrity state itself is already persisted; a failed audit row must not
+  // turn a successful upload into a 500.
+  'recording.integrity_verified',
 ]);
 
 // ── PII redaction patterns ──────────────────────────────────────────

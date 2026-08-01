@@ -523,10 +523,12 @@ function collectExpressRoutes(app: ReturnType<typeof createApp>): Set<string> {
 
 const mockFrom = vi.fn();
 const mockStorageFrom = vi.fn();
+const mockRpc = vi.fn();
 
 vi.mock('../lib/supabase.js', () => ({
   supabase: {
     from: (...args: unknown[]) => mockFrom(...args),
+    rpc: (...args: unknown[]) => mockRpc(...args),
     storage: {
       from: (...args: unknown[]) => mockStorageFrom(...args),
     },
@@ -596,13 +598,16 @@ function configureTables(config: Record<string, unknown | ((callIndex: number) =
   });
 }
 
-function configureStorage(options: { upload?: unknown; createSignedUrl?: unknown } = {}): void {
+function configureStorage(options: { upload?: unknown; createSignedUrl?: unknown; download?: unknown } = {}): void {
   mockStorageFrom.mockReturnValue({
     upload: vi.fn().mockResolvedValue(options.upload ?? { data: { path: '2026/01/fake.txt' }, error: null }),
     createSignedUrl: vi.fn().mockResolvedValue(
       options.createSignedUrl ?? { data: { signedUrl: 'https://storage.example/signed' }, error: null },
     ),
     remove: vi.fn().mockResolvedValue({ data: null, error: null }),
+    download: vi.fn().mockResolvedValue(
+      options.download ?? { data: null, error: { message: 'no object' } },
+    ),
   });
 }
 
@@ -853,6 +858,16 @@ beforeEach(() => {
   // Default: every table resolves { data: null, error: null } unless a test
   // overrides it via configureTables.
   configureTables({});
+  // Default RPC: finalize_recording_upload → ok, quarantine_recording → quarantined
+  mockRpc.mockImplementation((fn: string) => {
+    if (fn === 'finalize_recording_upload') {
+      return Promise.resolve({ data: { status: 'ok' }, error: null });
+    }
+    if (fn === 'quarantine_recording') {
+      return Promise.resolve({ data: { status: 'quarantined' }, error: null });
+    }
+    return Promise.resolve({ data: null, error: { message: 'unknown rpc' } });
+  });
 });
 
 afterEach(() => {
@@ -878,8 +893,8 @@ describe('OpenAPI document integrity', () => {
     const paths = spec.paths as YMap;
     const schemas = ((spec as YMap).components as YMap).schemas as YMap;
     const securitySchemes = ((spec as YMap).components as YMap).securitySchemes as YMap;
-    expect(Object.keys(paths).length).toBe(34);
-    expect(Object.keys(schemas).length).toBe(79);
+    expect(Object.keys(paths).length).toBe(35);
+    expect(Object.keys(schemas).length).toBe(81);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of 79 schemas must carry additionalProperties:false —
     // the ~9 with true are intentionally extensible envelope/record types.
@@ -1177,6 +1192,11 @@ describe('live handler shapes match documented schemas', () => {
   });
 
   it('POST /api/livekit/{sessionId}/recording → RecordingUploadResponse (grant-authenticated)', async () => {
+    // Synthetic minimal WebM fixture: valid EBML magic bytes only (no real media).
+    const webmBytes = Buffer.concat([
+      Buffer.from([0x1a, 0x45, 0xdf, 0xa3]),
+      Buffer.from('webm-bytes'),
+    ]);
     configureTables({
       candidate_access_grants: ok({
         candidate_id: UUID_2,
@@ -1192,10 +1212,10 @@ describe('live handler shapes match documented schemas', () => {
     const res = await request(app)
       .post(`/api/livekit/${UUID_1}/recording`)
       .set('x-grant-token', GRANT_TOKEN)
-      .attach('file', Buffer.from('webm-bytes'), 'session.webm');
+      .attach('file', webmBytes, { filename: 'session.webm', contentType: 'audio/webm' });
     expect(res.status).toBe(200);
     expect(validateResponseBody(res.body, 'RecordingUploadResponse', spec)).toEqual([]);
-    expect(res.body.object_key).toContain(`${UUID_1}.`);
+    expect(res.body.object_key).toContain(UUID_1);
   });
 
   it('POST /api/livekit/worker-context → WorkerContextResponse', async () => {
@@ -1263,16 +1283,34 @@ describe('live handler shapes match documented schemas', () => {
     expect(validateResponseBody(res.body, 'InviteExchangeResponse', spec)).toEqual([]);
   });
 
-  it('POST /api/livekit/grant/recording currently asserts the documented shadow behavior (400)', async () => {
-    // The route is registered but shadowed by /:sessionId/recording ("grant"
-    // fails UUID validation). Assert the CURRENT behavior so the spec's note
-    // stays truthful; PR2-L5 fixes the registration order.
+  it('POST /api/livekit/grant/recording → RecordingGrantResponse (route-shadow fixed, C-2)', async () => {
+    // C-2: grant is registered before /:sessionId/recording, so the literal
+    // "grant" segment is no longer captured by the UUID path-param route.
+    // A valid grant bound to a healthy session yields the real 200 {url}.
+    configureTables({
+      call_sessions: ok({
+        id: UUID_1,
+        recording_object_key: `${UUID_1}.webm`,
+        recording_deleted_at: null,
+        recording_quarantined: false,
+        recording_revoked_at: null,
+      }),
+      candidate_access_grants: ok({
+        candidate_id: UUID_2,
+        session_id: UUID_1,
+        room_name: ROOM_NAME,
+        expires_at: '2099-01-01T00:00:00.000Z',
+        consumed_at: null,
+        revoked_at: null,
+      }),
+    });
     const app = createUnauthedApp();
     const res = await request(app)
       .post('/api/livekit/grant/recording')
       .send({ grant_token: GRANT_TOKEN, session_id: UUID_1 });
-    expect(res.status).toBe(400);
-    expect(res.body.error.type).toBe('validation_error');
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'RecordingGrantResponse', spec)).toEqual([]);
+    expect(res.body.url).toBeTruthy();
   });
 
   it('GET /api/recordings/{sessionId}/download → RecordingDownloadResponse', async () => {
@@ -1285,6 +1323,20 @@ describe('live handler shapes match documented schemas', () => {
       .set('Authorization', AUTH_HEADER);
     expect(res.status).toBe(200);
     expect(validateResponseBody(res.body, 'RecordingDownloadResponse', spec)).toEqual([]);
+  });
+
+  it('POST /api/recordings/{sessionId}/revoke → RecordingRevokeResponse (admin)', async () => {
+    configureTables({
+      call_sessions: ok({ id: UUID_1, recording_revoked_at: null }),
+    });
+    const app = createContractApp();
+    const res = await request(app)
+      .post(`/api/recordings/${UUID_1}/revoke`)
+      .set('Authorization', AUTH_HEADER)
+      .send({ reason: 'contract shape' });
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'RecordingRevokeResponse', spec)).toEqual([]);
+    expect(res.body).toMatchObject({ ok: true, status: 'revoked' });
   });
 
   it('POST /api/dsar → 201 DSAREnvelope', async () => {

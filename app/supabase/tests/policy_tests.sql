@@ -119,8 +119,9 @@ select _policy_tests.assert(
     -- Phase 3 (0012): 5 recruiter (retention_policies, legal_holds,
     --   erasure_exceptions, data_subject_requests, governance_audit) = 5
     -- Phase 3 (0013): 1 active (consent_templates) = 1
-    -- Total: 6 + 5 + 5 + 1 = 17
-    select count(*) = 17
+    -- Phase 7 (0014): 1 active (recording_integrity_events) = 1
+    -- Total: 6 + 5 + 5 + 1 + 1 = 18
+    select count(*) = 18
       from pg_policies
      where schemaname = 'screening_v2'
        and cmd = 'SELECT'
@@ -134,7 +135,7 @@ select _policy_tests.assert(
             'recruiter read governance_audit')
        )
   ),
-  'all 17 dashboard SELECT policies must be gated by active recruiter membership'
+  'all 18 dashboard SELECT policies must be gated by active recruiter membership'
 );
 
 -- Seed synthetic identities/data to exercise effective RLS, never candidate data.
@@ -2707,17 +2708,19 @@ select _policy_tests.assert(
 --   recruiter read governance_audit (1)
 -- Phase 3 (migration 0013):
 --   active recruiter read consent_templates (1)
--- Total expected: 7 + 5 + 5 + 1 = 18
+-- Phase 7 (migration 0014):
+--   active recruiter read recording_integrity_events (1)
+-- Total expected: 7 + 5 + 5 + 1 + 1 = 19
 
 select _policy_tests.assert(
-  'expected total screening_v2 SELECT policy count is 18',
+  'expected total screening_v2 SELECT policy count is 19',
   (
-    select count(*) = 18
+    select count(*) = 19
       from pg_policies
      where schemaname = 'screening_v2'
        and cmd = 'SELECT'
   ),
-  'expected exactly 18 SELECT policies after all migrations through 0013'
+  'expected exactly 19 SELECT policies after all migrations through 0014'
 );
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -3044,13 +3047,232 @@ select _policy_tests.assert(
          'job_queue', 'job_dlq', 'transcript_events', 'outbox',
          'reconciliation_log', 'quarantined_sessions',
          'retention_policies', 'legal_holds', 'erasure_exceptions',
-         'data_subject_requests', 'governance_audit', 'consent_templates'
+         'data_subject_requests', 'governance_audit', 'consent_templates',
+         'recording_integrity_events'
        )
        and (has_any_column_privilege('anon', c.oid, 'SELECT,INSERT,UPDATE,REFERENCES')
          or has_table_privilege('anon', c.oid, 'DELETE,TRUNCATE,TRIGGER'))
   ),
   'anon must have zero privileges on all Phase 3-5 tables'
 );
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- Phase 7 repair (0014): audit-action CHECK evolution + append-only guard
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- The Phase 7 TS AuditEvent union (recording.download/upload/integrity_verified/
+-- quarantined/revoked/deleted) must be accepted by the 0007 chk_audit_action
+-- CHECK after 0014's additive evolution (otherwise the DB-backed audit sink
+-- rejects every Phase 7 recording audit row).
+
+select _policy_tests.assert(
+  'audit_events action CHECK accepts all Phase 7 recording_* actions (0014)',
+  (
+    select count(*) = 1
+      from pg_constraint pc
+      join pg_class rel on rel.oid = pc.conrelid
+      join pg_namespace ns on ns.oid = rel.relnamespace
+     where ns.nspname = 'screening_v2'
+       and rel.relname = 'audit_events'
+       and pc.conname = 'chk_audit_action'
+       and pc.convalidated
+       and pg_get_constraintdef(pc.oid) ilike '%recording_download%'
+       and pg_get_constraintdef(pc.oid) ilike '%recording_upload%'
+       and pg_get_constraintdef(pc.oid) ilike '%recording_integrity_verified%'
+       and pg_get_constraintdef(pc.oid) ilike '%recording_quarantined%'
+       and pg_get_constraintdef(pc.oid) ilike '%recording_revoked%'
+       and pg_get_constraintdef(pc.oid) ilike '%recording_deleted%'
+  ),
+  'chk_audit_action must include the six recording_* actions after 0014'
+);
+
+-- recording_integrity_events is claimed append-only: direct UPDATE/DELETE must
+-- be blocked at the trigger boundary (every role, incl. service_role) while
+-- the ON DELETE CASCADE from call_sessions (FK/retention semantics) must still
+-- remove child rows when the parent session row is deleted.
+
+select _policy_tests.assert(
+  'recording_integrity_events has the append-only mutation guard trigger',
+  (
+    select count(*) = 2
+      from pg_trigger t
+      join pg_class rel on rel.oid = t.tgrelid
+      join pg_namespace ns on ns.oid = rel.relnamespace
+     where ns.nspname = 'screening_v2'
+       and rel.relname = 'recording_integrity_events'
+       and not t.tgisinternal
+       and t.tgname in ('trg_recording_integrity_prevent_update', 'trg_recording_integrity_prevent_delete')
+  ),
+  'UPDATE/DELETE guard triggers must exist on recording_integrity_events'
+);
+
+-- Exactly-once lifecycle events (uploaded/deleted/revoked/mismatch_quarantined)
+-- — the DB-level convergence guard used by RPCs + backfills.
+
+select _policy_tests.assert(
+  'uploaded/deleted/revoked/mismatch_quarantined integrity events are exactly-once per session (unique partial indexes)',
+  (
+    select count(*) = 4
+      from pg_indexes
+     where schemaname = 'screening_v2'
+       and indexname in (
+         'uq_v2_recording_integrity_events_uploaded_once',
+         'uq_v2_recording_integrity_events_deleted_once',
+         'uq_v2_recording_integrity_events_revoked_once',
+         'uq_v2_recording_integrity_events_mismatch_once'
+       )
+       and indexdef ilike '%event_type%'
+       and indexdef ilike '%unique%'
+  ),
+  '0014 must add the unique partial indexes for uploaded/deleted/revoked/mismatch_quarantined events'
+);
+
+-- F-A/F-B RPCs exist and are service-role-only.
+
+select _policy_tests.assert(
+  'finalize_recording_upload RPC exists',
+  exists (
+    select 1 from pg_proc p
+      join pg_namespace ns on ns.oid = p.pronamespace
+     where ns.nspname = 'screening_v2'
+       and p.proname = 'finalize_recording_upload'
+  ),
+  '0014 must create the finalize_recording_upload RPC'
+);
+
+select _policy_tests.assert(
+  'quarantine_recording RPC exists',
+  exists (
+    select 1 from pg_proc p
+      join pg_namespace ns on ns.oid = p.pronamespace
+     where ns.nspname = 'screening_v2'
+       and p.proname = 'quarantine_recording'
+  ),
+  '0014 must create the quarantine_recording RPC'
+);
+
+-- Coherence constraint: browser_upload rows require non-null integrity columns.
+
+select _policy_tests.assert(
+  'browser_upload coherence constraint exists',
+  exists (
+    select 1 from pg_constraint c
+      join pg_namespace ns on ns.oid = c.connamespace
+     where ns.nspname = 'screening_v2'
+       and c.conname = 'chk_call_sessions_browser_upload_coherence'
+       and c.contype = 'c'
+  ),
+  '0014 must add the browser_upload coherence CHECK constraint'
+);
+
+-- F-C: recording_orphaned_objects table exists and is backend-only.
+
+select _policy_tests.assert(
+  'recording_orphaned_objects table exists',
+  exists (
+    select 1 from pg_class c
+      join pg_namespace ns on ns.oid = c.relnamespace
+     where ns.nspname = 'screening_v2'
+       and c.relname = 'recording_orphaned_objects'
+       and c.relkind = 'r'
+  ),
+  '0014 must create the recording_orphaned_objects backend-only table'
+);
+
+select _policy_tests.assert(
+  'recording_orphaned_objects has NO authenticated or anon policies',
+  not exists (
+    select 1 from pg_policy p
+      join pg_class c on c.oid = p.polrelid
+      join pg_namespace ns on ns.oid = c.relnamespace
+     where ns.nspname = 'screening_v2'
+       and c.relname = 'recording_orphaned_objects'
+       and p.polroles::text ilike any(array['%authenticated%','%anon%','%public%'])
+  ),
+  'orphan table must have zero authenticated/anon/PUBLIC policies — service_role only'
+);
+
+select _policy_tests.assert(
+  'recording_orphaned_objects has unique constraint on object_key',
+  exists (
+    select 1 from pg_constraint c
+      join pg_class rel on rel.oid = c.conrelid
+      join pg_namespace ns on ns.oid = rel.relnamespace
+     where ns.nspname = 'screening_v2'
+       and rel.relname = 'recording_orphaned_objects'
+       and c.conname = 'uq_recording_orphaned_objects_object_key'
+       and c.contype = 'u'
+  ),
+  'orphan table must have unique constraint on object_key for idempotent upsert'
+);
+
+-- Live append-only behavior (needs a candidate row to satisfy the FK).
+
+do $$
+declare
+  v_candidate_id uuid;
+  v_session_id uuid;
+  v_event_id uuid;
+  update_blocked boolean := false;
+  delete_blocked boolean := false;
+  cascade_ok boolean := false;
+begin
+  select id into v_candidate_id from screening_v2.candidates limit 1;
+  if v_candidate_id is null then
+    insert into _policy_tests.results(test, passed, detail) values
+      ('recording_integrity_events blocks direct UPDATE (live)', true,
+       'skipped: no candidate row — trigger-presence proof above covers this'),
+      ('recording_integrity_events blocks direct DELETE (live)', true,
+       'skipped: no candidate row — trigger-presence proof above covers this'),
+      ('recording_integrity_events preserves parent cascade delete (live)', true,
+       'skipped: no candidate row');
+    return;
+  end if;
+
+  -- Seed a session + one integrity event (service-role style insert).
+  insert into screening_v2.call_sessions (candidate_id, mode, status)
+    values (v_candidate_id, 'simulation', 'created')
+    returning id into v_session_id;
+  insert into screening_v2.recording_integrity_events (session_id, event_type, detail)
+    values (v_session_id, 'uploaded', 'policy-test synthetic event')
+    returning id into v_event_id;
+
+  -- Direct UPDATE must be blocked by the guard.
+  begin
+    update screening_v2.recording_integrity_events
+       set detail = 'tamper'
+     where id = v_event_id;
+  exception when others then
+    update_blocked := true;
+  end;
+
+  -- Direct DELETE (parent still exists) must be blocked by the guard.
+  begin
+    delete from screening_v2.recording_integrity_events
+     where id = v_event_id;
+  exception when others then
+    delete_blocked := true;
+  end;
+
+  -- Cascade delete from call_sessions must still remove the child event
+  -- (required FK/retention semantics — the guard allows parent-gone deletes).
+  delete from screening_v2.call_sessions where id = v_session_id;
+  cascade_ok := not exists (
+    select 1 from screening_v2.recording_integrity_events where id = v_event_id
+  );
+
+  insert into _policy_tests.results(test, passed, detail) values
+    ('recording_integrity_events blocks direct UPDATE (live)', update_blocked,
+     case when update_blocked then null
+          else 'direct UPDATE on recording_integrity_events was allowed' end),
+    ('recording_integrity_events blocks direct DELETE (live)', delete_blocked,
+     case when delete_blocked then null
+          else 'direct DELETE on recording_integrity_events was allowed' end),
+    ('recording_integrity_events preserves parent cascade delete (live)', cascade_ok,
+     case when cascade_ok then null
+          else 'cascade delete did not remove the child event' end);
+end;
+$$;
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)

@@ -20,6 +20,7 @@
         "LIVEKIT_API_SECRET": { "requiredInProduction": true, "secret": true },
         "RECORDINGS_BUCKET": { "requiredInProduction": true, "secret": false },
         "RECORDING_DOWNLOAD_TTL_SEC": { "requiredInProduction": false, "secret": false },
+        "RECORDING_MAX_BYTES": { "requiredInProduction": false, "secret": false },
         "NODE_ENV": { "requiredInProduction": true, "secret": false },
         "SHUTDOWN_GRACE_MS": { "requiredInProduction": false, "secret": false },
         "BREAKER_FAILURE_THRESHOLD": { "requiredInProduction": false, "secret": false },
