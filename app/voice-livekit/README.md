@@ -27,8 +27,7 @@ python agent.py download-files   # already run — pulls the turn-detector + sil
 ## Step 1 — voice test (PRIMARY spike path, no LiveKit Cloud account needed)
 
 `console` mode talks to the agent through your local mic/speakers directly —
-it does **not** open a LiveKit room, so `LIVEKIT_URL` / `LIVEKIT_API_KEY` /
-`LIVEKIT_API_SECRET` are NOT required for this step.
+it does **not** open a LiveKit room, so LiveKit credentials (URL, API key, API secret) are NOT required for this step.
 
 ```powershell
 cd "D:\Claude projects\Screening bot for HR\app\voice-livekit"
@@ -64,8 +63,8 @@ close, and triggers the existing `/api/assess/:session_id` Claude scorecard.
 
 Required environment variables (see `.env.example` in each directory):
 
-- **`app/api/.env`:** `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`
-- **`app/voice-livekit/.env`:** same LiveKit variables plus `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_SCHEMA`, `RECORDINGS_BUCKET`, `API_BASE`
+- **`app/api/.env`:** LiveKit credentials (URL, API key, API secret)
+- **`app/voice-livekit/.env`:** same LiveKit variables plus Supabase credentials (URL, service-role key, schema, recordings bucket) and API base URL
 
 All values use `replace_me` placeholders in committed example files; real credentials are owner-supplied at deploy time.
 
@@ -101,8 +100,8 @@ Use this only when you want to test through a raw LiveKit room without the
 dashboard.
 
 1. Go to https://cloud.livekit.io (free tier), create a project.
-2. Copy the project's WebSocket URL, API Key, and API Secret into `.env`:
-   `LIVEKIT_URL=`, `LIVEKIT_API_KEY=`, `LIVEKIT_API_SECRET=`.
+2. Copy the project's WebSocket URL, API Key, and API Secret into `.env`
+   (see `.env.example` for the required variable names).
 3. Run the worker:
    ```powershell
    python agent.py dev
