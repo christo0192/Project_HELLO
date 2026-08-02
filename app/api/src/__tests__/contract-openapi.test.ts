@@ -577,7 +577,7 @@ function chain(value: unknown) {
   const methods = [
     'select', 'insert', 'update', 'upsert', 'delete',
     'eq', 'neq', 'gt', 'gte', 'lt', 'lte', 'in', 'is', 'not',
-    'order', 'limit', 'single', 'maybeSingle', 'execute',
+    'order', 'limit', 'range', 'single', 'maybeSingle', 'execute',
   ];
   for (const m of methods) c[m] = (..._args: unknown[]) => chain(value);
   c.then = (resolve: (v: unknown) => unknown) => Promise.resolve(value).then(resolve);
@@ -893,11 +893,11 @@ describe('OpenAPI document integrity', () => {
     const paths = spec.paths as YMap;
     const schemas = ((spec as YMap).components as YMap).schemas as YMap;
     const securitySchemes = ((spec as YMap).components as YMap).securitySchemes as YMap;
-    expect(Object.keys(paths).length).toBe(35);
-    expect(Object.keys(schemas).length).toBe(81);
+    expect(Object.keys(paths).length).toBe(55);
+    expect(Object.keys(schemas).length).toBe(119);
     expect(Object.keys(securitySchemes).length).toBe(3);
-    // At least 70 of 79 schemas must carry additionalProperties:false —
-    // the ~9 with true are intentionally extensible envelope/record types.
+    // At least 70 of the schemas must carry additionalProperties:false —
+    // the few with true are intentionally extensible envelope/record types.
     // A parser mis-parse that silently drops additionalProperties would
     // reduce this count and fail loudly.
     let apFalseCount = 0;
@@ -906,7 +906,7 @@ describe('OpenAPI document integrity', () => {
         apFalseCount += 1;
       }
     }
-    expect(apFalseCount).toBeGreaterThanOrEqual(70);
+    expect(apFalseCount).toBeGreaterThanOrEqual(80);
   });
 
   it('references only component schemas that exist', () => {
@@ -950,6 +950,12 @@ describe('auth boundary vs spec security model', () => {
     'POST /api/livekit/exchange',
     'POST /api/livekit/worker-context',
     'POST /api/livekit/grant/recording',
+    // Phase 9 L4 exact public allowlist (method+path precise).
+    'GET /api/status',
+    'GET /api/candidate-consent/template',
+    'POST /api/candidate-consent/status',
+    'POST /api/candidate-consent/submit',
+    'POST /api/appeals',
   ]);
   const recordingUploadPattern = /^POST \/api\/livekit\/\{sessionId\}\/recording$/;
 
@@ -985,6 +991,25 @@ describe('auth boundary vs spec security model', () => {
       .send({ 'csp-report': { 'document-uri': 'https://app.example/', 'violated-directive': 'script-src' } });
     expect(csp.status).toBe(204);
 
+    // Phase 9 L4 public routes are reachable without bearer auth.
+    const status = await request(app).get('/api/status');
+    expect(status.status).toBe(200);
+    expect(status.body.status).toBe('ok');
+    expect(status.body).not.toHaveProperty('model');
+    expect(status.body).not.toHaveProperty('provider');
+
+    const consentStatus = await request(app)
+      .post('/api/candidate-consent/status')
+      .send({ invite_token: 'a'.repeat(64) });
+    expect(consentStatus.status).toBe(404); // unknown invite → stable fail, route reachable
+    expect(consentStatus.body.error).toBe('invite_token_invalid_or_expired');
+
+    const appealsSubmit = await request(app)
+      .post('/api/appeals')
+      .send({ appeal_grant_token: 'b'.repeat(64), category: 'scoring', description: 'x' });
+    expect(appealsSubmit.status).toBe(404); // unknown grant → stable fail, route reachable
+    expect(appealsSubmit.body.error).toBe('appeal_grant_invalid_or_expired');
+
     const exchange = await request(app)
       .post('/api/livekit/exchange')
       .send({ token: 'not-a-valid-token' });
@@ -1017,6 +1042,40 @@ describe('auth boundary vs spec security model', () => {
       .send({ candidate_id: UUID_2 });
     expect(res.status).toBe(403);
     expect(res.body.error.type).toBe('authorization_error');
+  });
+
+  // Phase 9 L4 negative control: the public allowlist is exact method+path.
+  // Near misses (same path, different method; same method, adjacent path)
+  // must stay behind auth — 401 without a token, never silently public.
+  it('near-miss methods/paths stay protected (exact allowlist, not prefix)', async () => {
+    const app = createUnauthedApp();
+    const nearMisses: Array<[string, string, unknown]> = [
+      ['get', '/api/candidate-consent/status', undefined], // GET vs POST
+      ['get', '/api/candidate-consent/submit', undefined],
+      ['post', '/api/candidate-consent/template', {}], // POST vs GET
+      ['post', '/api/candidate-consent/status/sub', {}], // prefix suffix
+      ['get', '/api/status/sub', undefined],
+      ['get', '/api/appeals', undefined], // GET list is recruiter
+      ['post', '/api/appeals/grants', {}],
+      ['post', '/api/appeals/extra', {}],
+      ['get', '/api/me', undefined], // never public
+      ['get', '/api/me/sub', undefined],
+      ['get', '/api/admin/members', undefined],
+      ['post', '/api/admin/maintenance', {}],
+      ['get', '/api/notes', undefined],
+      ['get', '/api/notifications', undefined],
+      ['get', '/api/export/' + UUID_1 + '/csv', undefined],
+    ];
+    const failures: string[] = [];
+    for (const [method, path, body] of nearMisses) {
+      let res: request.Response;
+      if (method === 'get') res = await (request(app) as any).get(path);
+      else res = await (request(app) as any).post(path).send(body ?? {});
+      if (res.status !== 401 || res.body?.error?.type !== 'authentication_error') {
+        failures.push(`${method.toUpperCase()} ${path} -> ${res.status} ${JSON.stringify(res.body)}`);
+      }
+    }
+    expect(failures).toEqual([]);
   });
 });
 
@@ -1272,6 +1331,11 @@ describe('live handler shapes match documented schemas', () => {
               revoked_at: null,
             })
           : ok([{ id: UUID_3 }]),
+      // Phase 9 L4 consent gate: system_config (maintenance off), latest
+      // consent record (granted, all required types), active template.
+      system_config: ok(null),
+      consent_records: ok({ status: 'granted', consents: ['ai_interview', 'recording', 'purpose', 'data_processing', 'retention', 'rights'], expires_at: null }),
+      consent_templates: ok({ version: '1.0', required_consents: ['ai_interview', 'recording', 'purpose', 'data_processing', 'retention', 'rights'] }),
       call_sessions: ok({ id: UUID_1, external_call_id: ROOM_NAME, status: 'waiting' }),
       candidate_access_grants: ok({ data: null, error: null }),
     });
@@ -1570,6 +1634,299 @@ describe('live handler shapes match documented schemas', () => {
     expect(res.status).toBe(200);
     expect(res.body).toHaveLength(1);
     expect(validateNamed(res.body[0], 'ConsentTemplate', spec)).toEqual([]);
+  });
+
+  // ══════════════════════════════════════════════════════════════════
+  //  Phase 9 L4 — live handler shapes for the newly wired routes
+  // ══════════════════════════════════════════════════════════════════
+
+  it('GET /api/status → StatusResponse (public, no model/provider leakage)', async () => {
+    const app = createUnauthedApp();
+    const res = await request(app).get('/api/status');
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'StatusResponse', spec)).toEqual([]);
+    expect(res.body).not.toHaveProperty('model');
+    expect(res.body).not.toHaveProperty('provider');
+  });
+
+  it('GET /api/me → MeResponse (authenticated authoritative)', async () => {
+    const app = createContractApp();
+    const res = await request(app).get('/api/me').set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'MeResponse', spec)).toEqual([]);
+    expect(res.body.role).toBe('admin');
+  });
+
+  it('GET /api/admin/members → AdminMember[] (opaque, no email)', async () => {
+    configureTables({ recruiter_memberships: ok([{ user_id: 'u-admin-1', role: 'admin', active: true }]) });
+    const app = createContractApp();
+    const res = await request(app).get('/api/admin/members').set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(validateNamed(res.body[0], 'AdminMember', spec)).toEqual([]);
+    expect(res.body[0]).not.toHaveProperty('email');
+  });
+
+  it('PATCH /api/admin/members/{userId} → AdminMemberUpdateResponse', async () => {
+    mockRpc.mockResolvedValue({ data: { status: 'ok' }, error: null });
+    const app = createContractApp();
+    const res = await request(app)
+      .patch(`/api/admin/members/${UUID_1}`)
+      .set('Authorization', AUTH_HEADER)
+      .send({ role: 'viewer' });
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'AdminMemberUpdateResponse', spec)).toEqual([]);
+  });
+
+  it('POST /api/admin/maintenance → AdminMaintenanceToggleResponse', async () => {
+    mockRpc.mockResolvedValue({ data: { status: 'ok', enabled: true }, error: null });
+    const app = createContractApp();
+    const res = await request(app)
+      .post('/api/admin/maintenance')
+      .set('Authorization', AUTH_HEADER)
+      .send({ enabled: true, reason: 'planned window' });
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'AdminMaintenanceToggleResponse', spec)).toEqual([]);
+  });
+
+  it('POST /api/admin/sessions/{sessionId}/override → AdminSessionOverrideResponse', async () => {
+    mockRpc.mockResolvedValue({ data: { status: 'ok', prior_status: 'in_progress' }, error: null });
+    const app = createContractApp();
+    const res = await request(app)
+      .post(`/api/admin/sessions/${UUID_1}/override`)
+      .set('Authorization', AUTH_HEADER)
+      .send({ target_status: 'completed', reason: 'call finished off-hook' });
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'AdminSessionOverrideResponse', spec)).toEqual([]);
+  });
+
+  it('GET /api/notes?candidate_id= → NoteListResponse', async () => {
+    configureTables({
+      candidates: ok({ id: UUID_2, owner_id: null }),
+      recruiter_notes: ok([{ id: UUID_3, candidate_id: UUID_2, author_id: 'u-admin-1', note: 'follow up', created_at: T_2026 }]),
+    });
+    const app = createContractApp();
+    const res = await request(app).get(`/api/notes?candidate_id=${UUID_2}`).set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'NoteListResponse', spec)).toEqual([]);
+  });
+
+  it('POST /api/notes → 201 NoteResponse', async () => {
+    configureTables({
+      candidates: ok({ id: UUID_2, owner_id: null }),
+      recruiter_notes: ok({ id: UUID_3, candidate_id: UUID_2, author_id: 'u-admin-1', note: 'notes', created_at: T_2026 }),
+    });
+    const app = createContractApp();
+    const res = await request(app)
+      .post('/api/notes')
+      .set('Authorization', AUTH_HEADER)
+      .send({ candidate_id: UUID_2, note: 'notes' });
+    expect(res.status).toBe(201);
+    expect(validateResponseBody(res.body, 'NoteResponse', spec)).toEqual([]);
+  });
+
+  it('POST /api/notes/{candidateId}/status → StatusTransitionResponse', async () => {
+    configureTables({
+      candidates: (n: number) =>
+        n === 0 ? ok({ id: UUID_2, owner_id: null, status: 'screening', decision_use_blocked_at: null }) : ok([{ id: UUID_2 }]),
+      audit_events: ok(null),
+    });
+    const app = createContractApp();
+    const res = await request(app)
+      .post(`/api/notes/${UUID_2}/status`)
+      .set('Authorization', AUTH_HEADER)
+      .send({ status: 'screened' });
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'StatusTransitionResponse', spec)).toEqual([]);
+  });
+
+  it('POST /api/candidate-consent/status → CandidateConsentStatusResponse (public)', async () => {
+    configureTables({
+      candidate_invites: ok({ id: UUID_3, candidate_id: UUID_2, session_id: UUID_1, expires_at: '2999-01-01T00:00:00.000Z', consumed_at: null, revoked_at: null }),
+      consent_records: ok({ status: 'granted', consents: ['ai_interview', 'recording'], expires_at: null }),
+      consent_templates: ok({ version: '1.0', locale: 'en-IN', required_consents: ['ai_interview', 'recording'] }),
+    });
+    const app = createUnauthedApp();
+    const res = await request(app)
+      .post('/api/candidate-consent/status')
+      .send({ invite_token: 'a'.repeat(64) });
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'CandidateConsentStatusResponse', spec)).toEqual([]);
+    expect(res.body).not.toHaveProperty('candidate_id');
+    expect(res.body).not.toHaveProperty('token');
+  });
+
+  it('GET /api/candidate-consent/template → CandidateConsentTemplateResponse (public)', async () => {
+    configureTables({
+      consent_templates: ok({ version: '1.0', locale: 'en-IN', title: 'Consent', body_md: 'plain text', required_consents: ['ai_interview'] }),
+    });
+    const app = createUnauthedApp();
+    const res = await request(app).get('/api/candidate-consent/template?locale=en-IN');
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'CandidateConsentTemplateResponse', spec)).toEqual([]);
+  });
+
+  it('POST /api/candidate-consent/submit → 201 CandidateConsentSubmitResponse (public, invite never consumed)', async () => {
+    configureTables({
+      candidate_invites: ok({ id: UUID_3, candidate_id: UUID_2, session_id: UUID_1, expires_at: '2999-01-01T00:00:00.000Z', consumed_at: null, revoked_at: null }),
+      consent_templates: ok({ version: '1.0', required_consents: ['ai_interview', 'recording'] }),
+      consent_records: ok({ id: UUID_3, status: 'granted', consents: ['ai_interview', 'recording'], version: '1.0', created_at: T_2026 }),
+      audit_events: ok(null),
+    });
+    const app = createUnauthedApp();
+    const res = await request(app)
+      .post('/api/candidate-consent/submit')
+      .send({
+        invite_token: 'a'.repeat(64),
+        template_version: '1.0',
+        locale: 'en-IN',
+        consents: ['ai_interview', 'recording'],
+        status: 'granted',
+      });
+    expect(res.status).toBe(201);
+    expect(validateResponseBody(res.body, 'CandidateConsentSubmitResponse', spec)).toEqual([]);
+  });
+
+  it('GET /api/notifications → NotificationIntentListResponse (interviewer+)', async () => {
+    configureTables({
+      notification_intents: ok([{ id: UUID_3, kind: 'assessment_ready', candidate_id: UUID_2, consent_verified: false, created_at: T_2026 }]),
+    });
+    const app = createContractApp();
+    const res = await request(app).get('/api/notifications').set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'NotificationIntentListResponse', spec)).toEqual([]);
+  });
+
+  it('GET /api/export/{candidateId}/csv → text/csv attachment (ownership-scoped)', async () => {
+    configureTables({
+      candidates: ok({ id: UUID_2, owner_id: null, status: 'screened' }),
+      assessments: ok([{ id: UUID_3, english: null, tone: { clarity: 8 }, communication: { score: 8 }, motivation: { score: 8 }, role_fit: { score: 8 }, overall_score: 82, recommendation: 'advance', created_at: T_2026 }]),
+      audit_events: ok(null),
+    });
+    const app = createContractApp();
+    const res = await request(app).get(`/api/export/${UUID_2}/csv`).set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toMatch(/^text\/csv/);
+    expect(res.text.startsWith('\uFEFF')).toBe(true);
+  });
+
+  it('POST /api/appeals/grants → 201 AppealGrantResponse (digest persisted, plaintext once)', async () => {
+    configureTables({
+      candidates: ok({ id: UUID_2, owner_id: null }),
+      call_sessions: ok({ candidate_id: UUID_2 }),
+      appeal_grants: ok(null),
+    });
+    const app = createContractApp();
+    const res = await request(app)
+      .post('/api/appeals/grants')
+      .set('Authorization', AUTH_HEADER)
+      .send({ candidate_id: UUID_2, session_id: UUID_1, expires_in_hours: 24 });
+    expect(res.status).toBe(201);
+    expect(validateResponseBody(res.body, 'AppealGrantResponse', spec)).toEqual([]);
+  });
+
+  it('POST /api/appeals → 201 AppealCreateResponse (public, grant-authenticated, minimized snapshot)', async () => {
+    configureTables({
+      appeal_grants: ok({ id: UUID_3, candidate_id: UUID_2, session_id: UUID_1, expires_at: '2999-01-01T00:00:00.000Z', consumed_at: null, revoked_at: null }),
+      assessments: ok({ id: UUID_3, english: null, tone: { clarity: 8 }, communication: { score: 8 }, motivation: { score: 8 }, role_fit: { score: 8 }, overall_score: 82, recommendation: 'advance' }),
+    });
+    mockRpc.mockImplementation(async (fn: string) => {
+      if (fn === 'create_appeal') return { data: { status: 'ok', appeal_id: UUID_3 }, error: null };
+      return { data: null, error: { message: 'unknown rpc' } };
+    });
+    const app = createUnauthedApp();
+    const res = await request(app)
+      .post('/api/appeals')
+      .send({ appeal_grant_token: 'b'.repeat(64), category: 'scoring', description: 'score seems low' });
+    expect(res.status).toBe(201);
+    expect(validateResponseBody(res.body, 'AppealCreateResponse', spec)).toEqual([]);
+  });
+
+  it('POST /api/appeals/{appealId}/review → AppealReviewResponse (immutable review event via RPC)', async () => {
+    configureTables({ appeal_requests: ok({ id: UUID_3, candidate_id: UUID_2 }) });
+    mockRpc.mockImplementation(async (fn: string) => {
+      if (fn === 'review_appeal') return { data: { status: 'ok' }, error: null };
+      return { data: null, error: { message: 'unknown rpc' } };
+    });
+    const app = createContractApp();
+    const res = await request(app)
+      .post(`/api/appeals/${UUID_3}/review`)
+      .set('Authorization', AUTH_HEADER)
+      .send({ to_status: 'under_review', notes: 'checking' });
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'AppealReviewResponse', spec)).toEqual([]);
+  });
+
+  it('GET /api/appeals?candidate_id= → AppealListResponse (recruiter list)', async () => {
+    configureTables({
+      appeal_requests: ok([{ id: UUID_3, candidate_id: UUID_2, session_id: UUID_1, assessment_id: UUID_3, category: 'scoring', description: 'score seems low', status: 'open', created_at: T_2026, updated_at: T_2026 }]),
+    });
+    const app = createContractApp();
+    const res = await request(app).get(`/api/appeals?candidate_id=${UUID_2}`).set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'AppealListResponse', spec)).toEqual([]);
+  });
+
+  // ══════════════════════════════════════════════════════════════════
+  //  Phase 9 review repair — admin audit / sessions / quota views
+  // ══════════════════════════════════════════════════════════════════
+
+  it('GET /api/admin/audit → AdminAuditListResponse (redacted, admin only)', async () => {
+    configureTables({
+      audit_events: ok([
+        { id: UUID_3, action: 'admin_maintenance_toggle', actor_type: 'recruiter', actor_id: UUID_1, target_type: 'system', target_id: 'maintenance', result: 'success', created_at: T_2026 },
+      ]),
+    });
+    const app = createContractApp();
+    const res = await request(app).get('/api/admin/audit').set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'AdminAuditListResponse', spec)).toEqual([]);
+    expect(JSON.stringify(res.body)).not.toContain('metadata');
+  });
+
+  it('GET /api/admin/sessions → AdminSessionListResponse (opaque, admin only)', async () => {
+    configureTables({
+      call_sessions: ok([
+        { id: UUID_1, candidate_id: UUID_2, role_id: null, status: 'in_progress', created_at: T_2026, started_at: T_2026, ended_at: null },
+      ]),
+    });
+    const app = createContractApp();
+    const res = await request(app).get('/api/admin/sessions').set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'AdminSessionListResponse', spec)).toEqual([]);
+  });
+
+  it('GET /api/admin/quotas → QuotaPolicyListResponse (abstract units, no price)', async () => {
+    configureTables({
+      quota_policies: ok([
+        { id: UUID_3, scope: 'global', scope_id: null, mode: 'simulation', max_sessions: 10, max_cost_units: null, cost_units_per_session: 5, warning_percentage: null, period_days: 1, enabled: false, created_at: T_2026, updated_at: T_2026 },
+      ]),
+    });
+    const app = createContractApp();
+    const res = await request(app).get('/api/admin/quotas').set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'QuotaPolicyListResponse', spec)).toEqual([]);
+  });
+
+  it('POST /api/admin/quotas → 201 QuotaPolicyCreateResponse (atomic RPC + audit)', async () => {
+    mockRpc.mockResolvedValue({ data: { status: 'ok', id: UUID_3, created: true }, error: null });
+    const app = createContractApp();
+    const res = await request(app)
+      .post('/api/admin/quotas')
+      .set('Authorization', AUTH_HEADER)
+      .send({ scope: 'global', max_sessions: 25, enabled: false });
+    expect(res.status).toBe(201);
+    expect(validateResponseBody(res.body, 'QuotaPolicyCreateResponse', spec)).toEqual([]);
+  });
+
+  it('PATCH /api/admin/quotas/{id} → QuotaPolicyUpdateResponse', async () => {
+    mockRpc.mockResolvedValue({ data: { status: 'ok', id: UUID_3, created: false }, error: null });
+    const app = createContractApp();
+    const res = await request(app)
+      .patch(`/api/admin/quotas/${UUID_3}`)
+      .set('Authorization', AUTH_HEADER)
+      .send({ scope: 'global', enabled: true });
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'QuotaPolicyUpdateResponse', spec)).toEqual([]);
   });
 });
 

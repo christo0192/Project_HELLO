@@ -51,7 +51,7 @@ paths:
       security: []
       responses:
         '200':
-          description: Service is up and the configured brain model is reported.
+          description: Service is up. Bounded to ok:true — no model/provider/internal dependency leakage.
           content:
             application/json:
               schema:
@@ -1423,6 +1423,788 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
 
+  # ── Phase 9: status / me / admin ──────────────────────────────────
+  /api/status:
+    get:
+      tags: [health]
+      operationId: getPublicStatus
+      summary: Bounded public operational status (ok/maintenance/degraded). No model/provider/internal dependencies, no PII.
+      security: []
+      responses:
+        '200':
+          description: Bounded status envelope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /api/me:
+    get:
+      tags: [auth]
+      operationId: getMe
+      summary: Authenticated authoritative profile (JWT email + membership role/active). Never public.
+      responses:
+        '200':
+          description: Authoritative role/active from the membership resolver.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MeResponse'
+        '401':
+          description: Authentication required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: AAL/membership insufficient.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/admin/members:
+    get:
+      tags: [admin]
+      operationId: listAdminMembers
+      summary: Opaque membership list (user_id, role, active) — no email, no auth.users join. Admin only.
+      responses:
+        '200':
+          description: Opaque member rows.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AdminMember'
+        '403':
+          description: Non-admin denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/admin/members/{userId}:
+    patch:
+      tags: [admin]
+      operationId: updateAdminMember
+      summary: Atomic last-admin-safe membership mutation via update_membership RPC. Admin only.
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminMemberUpdateRequest'
+      responses:
+        '200':
+          description: Membership updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminMemberUpdateResponse'
+        '400':
+          description: Invalid role or no changes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Member not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: last_active_admin / self_modification_denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/admin/maintenance:
+    post:
+      tags: [admin]
+      operationId: toggleMaintenance
+      summary: Atomic maintenance toggle + audit via toggle_maintenance RPC. Admin only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminMaintenanceRequest'
+      responses:
+        '200':
+          description: Toggle applied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminMaintenanceToggleResponse'
+        '400':
+          description: Invalid reason.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/admin/sessions/{sessionId}/override:
+    post:
+      tags: [admin]
+      operationId: overrideAdminSession
+      summary: Bounded CAS session override with reason via override_admin_session RPC. Admin only.
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminSessionOverrideRequest'
+      responses:
+        '200':
+          description: Override applied (or no-op).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminSessionOverrideResponse'
+        '400':
+          description: Invalid target or reason.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Session not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: resurrection_denied / deleted_denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  # ── Phase 9 review repair: admin audit / sessions / quota policy views ──
+  /api/admin/audit:
+    get:
+      tags: [admin]
+      operationId: listAdminAudit
+      summary: Bounded redacted audit list — allowlisted fields only, no metadata/source_ip/correlation/PII/token.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 10000
+      responses:
+        '200':
+          description: Redacted audit rows (newest first).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminAuditListResponse'
+        '400':
+          description: Bounded pagination rejected.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Non-admin denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/admin/sessions:
+    get:
+      tags: [admin]
+      operationId: listAdminSessions
+      summary: Bounded admin session view with optional status filter. Opaque ids only — no candidate PII/transcript/recording.
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [created, waiting, in_progress, completed, failed, cancelled, expired, abandoned]
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 10000
+      responses:
+        '200':
+          description: Bounded session rows (newest first).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminSessionListResponse'
+        '400':
+          description: Unknown status or unbounded pagination.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Non-admin denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/admin/quotas:
+    get:
+      tags: [admin]
+      operationId: listAdminQuotaPolicies
+      summary: Bounded quota-policy list. Abstract cost units only — never price/currency/usage.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 10000
+      responses:
+        '200':
+          description: Bounded policy rows.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuotaPolicyListResponse'
+        '400':
+          description: Unbounded pagination.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Non-admin denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+    post:
+      tags: [admin]
+      operationId: createAdminQuotaPolicy
+      summary: Create a quota policy via the atomic upsert_quota_policy RPC (quota_override audit in the same transaction). Actor derived from auth.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuotaPolicyUpsertRequest'
+      responses:
+        '201':
+          description: Policy created (disabled by default unless enabled=true).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuotaPolicyCreateResponse'
+        '400':
+          description: Bounded validation or RPC stable status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Non-admin denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/admin/quotas/{id}:
+    patch:
+      tags: [admin]
+      operationId: updateAdminQuotaPolicy
+      summary: Update a quota policy via the atomic upsert RPC (quota_override audit in the same transaction).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuotaPolicyUpsertRequest'
+      responses:
+        '200':
+          description: Policy updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuotaPolicyUpdateResponse'
+        '400':
+          description: Bounded validation or RPC stable status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Non-admin denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: policy_not_found (no row created).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  # ── Phase 9: recruiter notes + candidate status transitions ────────
+  /api/notes:
+    get:
+      tags: [notes]
+      operationId: listNotes
+      summary: Append-only recruiter notes for a candidate (viewer read-only, ownership-scoped).
+      parameters:
+        - name: candidate_id
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+      responses:
+        '200':
+          description: Bounded note list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NoteListResponse'
+        '403':
+          description: Non-owner or viewer mutation denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+    post:
+      tags: [notes]
+      operationId: createNote
+      summary: Append a bounded note (interviewer+/admin, ownership).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NoteCreateRequest'
+      responses:
+        '201':
+          description: Note appended.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NoteResponse'
+        '400':
+          description: Bounded body rejected.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Non-owner denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/notes/{candidateId}/status:
+    post:
+      tags: [notes]
+      operationId: updateCandidateStatus
+      summary: Allowlisted CAS candidate status transition; fails closed while decision_use_blocked_at is set.
+      parameters:
+        - name: candidateId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NoteStatusUpdateRequest'
+      responses:
+        '200':
+          description: Transition applied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusTransitionResponse'
+        '400':
+          description: Illegal transition or unknown status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Non-owner denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Candidate not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: decision_use_blocked or status_conflict.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  # ── Phase 9: candidate pre-join consent (invite-opaque, public) ────
+  /api/candidate-consent/status:
+    post:
+      tags: [consent]
+      operationId: getCandidateConsentStatus
+      summary: Bounded consent/template status for an opaque invite token. Public — token validated inline.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CandidateConsentStatusRequest'
+      responses:
+        '200':
+          description: Bounded status — no candidate_id/PII/token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CandidateConsentStatusResponse'
+        '400':
+          description: Malformed body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: invite_token_invalid_or_expired.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/candidate-consent/template:
+    get:
+      tags: [consent]
+      operationId: getCandidateConsentTemplate
+      summary: Active versioned consent template for a bounded locale. Public. Absence fails closed (404).
+      security: []
+      parameters:
+        - name: locale
+          in: query
+          required: false
+          schema:
+            type: string
+            pattern: '^[a-z]{2}(-[A-Z]{2})?$'
+      responses:
+        '200':
+          description: Active template only.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CandidateConsentTemplateResponse'
+        '404':
+          description: consent_template_unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/candidate-consent/submit:
+    post:
+      tags: [consent]
+      operationId: submitCandidateConsent
+      summary: Append-only consent grant/decline bound to an opaque invite. Public — invite validated inline, never consumed.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CandidateConsentSubmitRequest'
+      responses:
+        '201':
+          description: Consent recorded; proof carries invite/session binding only.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CandidateConsentSubmitResponse'
+        '400':
+          description: required_consents_missing or malformed body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: invite_token_invalid_or_expired.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '503':
+          description: Consent template unavailable (fail closed, stable).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  # ── Phase 9: notification intents (recruiter status query) ────────
+  /api/notifications:
+    get:
+      tags: [notifications]
+      operationId: listNotificationIntents
+      summary: Recruiter (interviewer+) notification intents — own/authorized only, no contact/token material.
+      responses:
+        '200':
+          description: Bounded intent list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationIntentListResponse'
+        '403':
+          description: Viewer denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  # ── Phase 9: CSV scorecard export (ownership-scoped) ──────────────
+  /api/export/{candidateId}/csv:
+    get:
+      tags: [export]
+      operationId: exportCandidateCsv
+      summary: Ownership-scoped, data-minimized scorecard CSV (RFC4180 + BOM, formula-neutralized). No PDF claim.
+      parameters:
+        - name: candidateId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: CSV attachment.
+          content:
+            text/csv:
+              schema:
+                type: string
+        '403':
+          description: Non-owner denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Candidate not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  # ── Phase 9: appeals (separate grants table; immutable review events) ─
+  /api/appeals/grants:
+    post:
+      tags: [appeals]
+      operationId: issueAppealGrant
+      summary: Issue a one-time appeal grant (SHA-256 digest persisted; plaintext returned once). Interviewer+/admin, ownership.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AppealGrantCreateRequest'
+      responses:
+        '201':
+          description: One-time plaintext grant token + expiry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppealGrantResponse'
+        '400':
+          description: candidate_session_mismatch or invalid expiry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Non-owner denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Candidate or session not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/appeals:
+    get:
+      tags: [appeals]
+      operationId: listAppeals
+      summary: Recruiter appeal list scoped to one candidate (viewer read-only).
+      parameters:
+        - name: candidate_id
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Bounded appeal rows.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppealListResponse'
+        '403':
+          description: Non-owner denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+    post:
+      tags: [appeals]
+      operationId: submitAppeal
+      summary: Public candidate appeal submission (grant-authenticated). Server-built minimized snapshot; atomic create_appeal RPC.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AppealCreateRequest'
+      responses:
+        '201':
+          description: Appeal created; decision_use_blocked_at set.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppealCreateResponse'
+        '400':
+          description: Malformed body or invalid grant digest.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: appeal_grant_invalid_or_expired.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: no_assessment_for_appeal or grant consumed/revoked/expired/mismatch.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/appeals/{appealId}/review:
+    post:
+      tags: [appeals]
+      operationId: reviewAppeal
+      summary: Legal CAS review via atomic review_appeal RPC (immutable appeal_review_events). Interviewer+/admin, ownership.
+      parameters:
+        - name: appealId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AppealReviewRequest'
+      responses:
+        '200':
+          description: Review recorded (or no-op).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppealReviewResponse'
+        '400':
+          description: Invalid transition/target/notes/evidence.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Appeal not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: appeal_already_final.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1522,12 +2304,10 @@ components:
     # ── Health ───────────────────────────────────────────────────────
     HealthResponse:
       type: object
-      required: [ok, model]
+      required: [ok]
       properties:
         ok:
           type: boolean
-        model:
-          type: string
       additionalProperties: false
 
     # ── Roles / candidates ───────────────────────────────────────────
@@ -3025,4 +3805,621 @@ components:
             type: string
         reason:
           type: string
+      additionalProperties: false
+
+    # ── Phase 9: status / me / admin ─────────────────────────────────
+    StatusResponse:
+      type: object
+      required: [status, maintenance, updated_at]
+      properties:
+        status:
+          type: string
+          enum: [ok, maintenance, degraded]
+        maintenance:
+          type: object
+          nullable: true
+          required: [enabled, reason, updated_at]
+          properties:
+            enabled:
+              type: boolean
+            reason:
+              type: string
+              nullable: true
+            updated_at:
+              type: string
+              format: date-time
+              nullable: true
+          additionalProperties: false
+        updated_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    MeResponse:
+      type: object
+      required: [userId, email, role, active]
+      properties:
+        userId:
+          type: string
+        email:
+          type: string
+          nullable: true
+        role:
+          type: string
+          enum: [admin, interviewer, viewer]
+        active:
+          type: boolean
+      additionalProperties: false
+
+    AdminMember:
+      type: object
+      required: [user_id, role, active]
+      properties:
+        user_id:
+          type: string
+        role:
+          type: string
+          enum: [admin, interviewer, viewer]
+        active:
+          type: boolean
+      additionalProperties: false
+
+    AdminMemberUpdateRequest:
+      type: object
+      properties:
+        role:
+          type: string
+          enum: [admin, interviewer, viewer]
+        active:
+          type: boolean
+      additionalProperties: false
+
+    AdminMemberUpdateResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+      additionalProperties: false
+
+    AdminMaintenanceToggleResponse:
+      type: object
+      required: [ok, enabled]
+      properties:
+        ok:
+          type: boolean
+        enabled:
+          type: boolean
+      additionalProperties: false
+
+    AdminSessionOverrideResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+        prior_status:
+          type: string
+          nullable: true
+      additionalProperties: false
+
+    AdminAuditRow:
+      type: object
+      required: [id, action, actor_type, actor_id, target_type, target_id, result, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        action:
+          type: string
+        actor_type:
+          type: string
+        actor_id:
+          type: string
+          format: uuid
+        target_type:
+          type: string
+        target_id:
+          type: string
+        result:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    AdminAuditListResponse:
+      type: object
+      required: [audit]
+      properties:
+        audit:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminAuditRow'
+      additionalProperties: false
+
+    AdminSessionRow:
+      type: object
+      required: [id, candidate_id, status, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        candidate_id:
+          type: string
+          format: uuid
+        role_id:
+          type: string
+          format: uuid
+          nullable: true
+        status:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        ended_at:
+          type: string
+          format: date-time
+          nullable: true
+      additionalProperties: false
+
+    AdminSessionListResponse:
+      type: object
+      required: [sessions]
+      properties:
+        sessions:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminSessionRow'
+      additionalProperties: false
+
+    QuotaPolicyRow:
+      type: object
+      required: [id, scope, mode, enabled, period_days, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        scope:
+          type: string
+          enum: [global, candidate]
+        scope_id:
+          type: string
+          format: uuid
+          nullable: true
+        mode:
+          type: string
+          enum: [simulation, live]
+        max_sessions:
+          type: integer
+          nullable: true
+        max_cost_units:
+          type: integer
+          nullable: true
+        cost_units_per_session:
+          type: integer
+          nullable: true
+        warning_percentage:
+          type: integer
+          nullable: true
+        period_days:
+          type: integer
+        enabled:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    QuotaPolicyListResponse:
+      type: object
+      required: [policies]
+      properties:
+        policies:
+          type: array
+          items:
+            $ref: '#/components/schemas/QuotaPolicyRow'
+      additionalProperties: false
+
+    QuotaPolicyUpsertRequest:
+      type: object
+      required: [scope]
+      properties:
+        scope:
+          type: string
+          enum: [global, candidate]
+        scope_id:
+          type: string
+          format: uuid
+          nullable: true
+        mode:
+          type: string
+          enum: [simulation, live]
+        max_sessions:
+          type: integer
+          minimum: 1
+          nullable: true
+        max_cost_units:
+          type: integer
+          minimum: 1
+          nullable: true
+        cost_units_per_session:
+          type: integer
+          minimum: 1
+          nullable: true
+        warning_percentage:
+          type: integer
+          minimum: 1
+          maximum: 100
+          nullable: true
+        period_days:
+          type: integer
+          minimum: 1
+          maximum: 365
+        enabled:
+          type: boolean
+      additionalProperties: false
+
+    QuotaPolicyCreateResponse:
+      type: object
+      required: [ok, id, created]
+      properties:
+        ok:
+          type: boolean
+        id:
+          type: string
+          format: uuid
+        created:
+          type: boolean
+      additionalProperties: false
+
+    QuotaPolicyUpdateResponse:
+      type: object
+      required: [ok, id]
+      properties:
+        ok:
+          type: boolean
+        id:
+          type: string
+          format: uuid
+      additionalProperties: false
+
+    AdminMaintenanceRequest:
+      type: object
+      required: [enabled, reason]
+      properties:
+        enabled:
+          type: boolean
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 200
+      additionalProperties: false
+
+    AdminSessionOverrideRequest:
+      type: object
+      required: [target_status, reason]
+      properties:
+        target_status:
+          type: string
+          enum: [created, waiting, in_progress, failed, cancelled, completed]
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 200
+      additionalProperties: false
+
+    # ── Phase 9: notes / status transitions ──────────────────────────
+    NoteResponse:
+      type: object
+      required: [id, candidate_id, author_id, note, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        candidate_id:
+          type: string
+          format: uuid
+        author_id:
+          type: string
+        note:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    NoteListResponse:
+      type: object
+      required: [notes]
+      properties:
+        notes:
+          type: array
+          items:
+            $ref: '#/components/schemas/NoteResponse'
+      additionalProperties: false
+
+    NoteCreateRequest:
+      type: object
+      required: [candidate_id, note]
+      properties:
+        candidate_id:
+          type: string
+          format: uuid
+        note:
+          type: string
+          minLength: 1
+          maxLength: 2000
+      additionalProperties: false
+
+    NoteStatusUpdateRequest:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [queued, screening, screened, advanced, rejected]
+      additionalProperties: false
+
+    StatusTransitionResponse:
+      type: object
+      required: [ok, from, to]
+      properties:
+        ok:
+          type: boolean
+        from:
+          type: string
+        to:
+          type: string
+      additionalProperties: false
+
+    # ── Phase 9: candidate pre-join consent ──────────────────────────
+    CandidateConsentStatusRequest:
+      type: object
+      required: [invite_token]
+      properties:
+        invite_token:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+      additionalProperties: false
+
+    CandidateConsentStatusResponse:
+      type: object
+      required: [has_consent, template_version, locale, required_consents]
+      properties:
+        has_consent:
+          type: boolean
+        template_version:
+          type: string
+          nullable: true
+        locale:
+          type: string
+          nullable: true
+        required_consents:
+          type: array
+          items:
+            type: string
+      additionalProperties: false
+
+    CandidateConsentTemplateResponse:
+      type: object
+      required: [version, locale, title, body_md, required_consents]
+      properties:
+        version:
+          type: string
+        locale:
+          type: string
+        title:
+          type: string
+        body_md:
+          type: string
+        required_consents:
+          type: array
+          items:
+            type: string
+      additionalProperties: false
+
+    CandidateConsentSubmitRequest:
+      type: object
+      required: [invite_token, template_version, locale, consents, status]
+      properties:
+        invite_token:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        template_version:
+          type: string
+          minLength: 1
+          maxLength: 64
+        locale:
+          type: string
+          pattern: '^[a-z]{2}(-[A-Z]{2})?$'
+        consents:
+          type: array
+          items:
+            type: string
+        status:
+          type: string
+          enum: [granted, declined]
+      additionalProperties: false
+
+    CandidateConsentSubmitResponse:
+      type: object
+      required: [id, status, consents, template_version, locale, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [granted, declined]
+        consents:
+          type: array
+          items:
+            type: string
+        template_version:
+          type: string
+        locale:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    # ── Phase 9: notification intents ────────────────────────────────
+    NotificationIntentResponse:
+      type: object
+      required: [id, kind, candidate_id, consent_verified, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum: [quota_warning, assessment_ready, appeal_resolved]
+        candidate_id:
+          type: string
+          format: uuid
+          nullable: true
+        consent_verified:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    NotificationIntentListResponse:
+      type: object
+      required: [intents]
+      properties:
+        intents:
+          type: array
+          items:
+            $ref: '#/components/schemas/NotificationIntentResponse'
+      additionalProperties: false
+
+    # ── Phase 9: appeals ─────────────────────────────────────────────
+    AppealGrantCreateRequest:
+      type: object
+      required: [candidate_id, session_id, expires_in_hours]
+      properties:
+        candidate_id:
+          type: string
+          format: uuid
+        session_id:
+          type: string
+          format: uuid
+        expires_in_hours:
+          type: integer
+          minimum: 1
+          maximum: 72
+      additionalProperties: false
+
+    AppealGrantResponse:
+      type: object
+      required: [appeal_grant_token, expires_at]
+      properties:
+        appeal_grant_token:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        expires_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    AppealCreateRequest:
+      type: object
+      required: [appeal_grant_token, category, description]
+      properties:
+        appeal_grant_token:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        category:
+          type: string
+          enum: [scoring, recording, accessibility, other]
+        description:
+          type: string
+          minLength: 1
+          maxLength: 2000
+      additionalProperties: false
+
+    AppealCreateResponse:
+      type: object
+      required: [ok, appeal_id]
+      properties:
+        ok:
+          type: boolean
+        appeal_id:
+          type: string
+          format: uuid
+      additionalProperties: false
+
+    AppealRow:
+      type: object
+      required: [id, candidate_id, session_id, assessment_id, category, description, status, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        candidate_id:
+          type: string
+          format: uuid
+        session_id:
+          type: string
+          format: uuid
+        assessment_id:
+          type: string
+          format: uuid
+          nullable: true
+        category:
+          type: string
+        description:
+          type: string
+        status:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    AppealListResponse:
+      type: object
+      required: [appeals]
+      properties:
+        appeals:
+          type: array
+          items:
+            $ref: '#/components/schemas/AppealRow'
+      additionalProperties: false
+
+    AppealReviewRequest:
+      type: object
+      required: [to_status]
+      properties:
+        to_status:
+          type: string
+          enum: [under_review, granted, denied]
+        notes:
+          type: string
+          maxLength: 2000
+        evidence:
+          type: object
+          additionalProperties: true
+      additionalProperties: false
+
+    AppealReviewResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
       additionalProperties: false

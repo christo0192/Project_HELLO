@@ -7,16 +7,36 @@ import { CandidateJoinPage } from './CandidateJoinPage';
 const { useCapabilitySupport } = vi.hoisted(() => ({ useCapabilitySupport: vi.fn() }));
 vi.mock('../lib/capability-check', () => ({ useCapabilitySupport }));
 
-const { exchangeCandidateInvite, connect, publishTrack, disconnect } = vi.hoisted(() => ({
+const {
+  candidateConsentStatus,
+  getCandidateConsentTemplate,
+  submitCandidateConsent,
+  exchangeCandidateInvite,
+  connect,
+  publishTrack,
+} = vi.hoisted(() => ({
+  candidateConsentStatus: vi.fn(),
+  getCandidateConsentTemplate: vi.fn(),
+  submitCandidateConsent: vi.fn(),
   exchangeCandidateInvite: vi.fn(),
   connect: vi.fn(),
   publishTrack: vi.fn(),
-  disconnect: vi.fn(),
 }));
 
 vi.mock('../api', () => ({
-  api: { exchangeCandidateInvite },
-  ApiError: class ApiError extends Error {},
+  api: {
+    candidateConsentStatus,
+    getCandidateConsentTemplate,
+    submitCandidateConsent,
+    exchangeCandidateInvite,
+  },
+  ApiError: class ApiError extends Error {
+    status: number;
+    constructor(m: string, s: number) {
+      super(m);
+      this.status = s;
+    }
+  },
 }));
 
 vi.mock('livekit-client', () => ({
@@ -24,13 +44,23 @@ vi.mock('livekit-client', () => ({
     localParticipant = { publishTrack };
     on = vi.fn();
     connect = connect;
-    disconnect = disconnect;
+    disconnect = vi.fn();
   },
   RoomEvent: { TrackSubscribed: 'trackSubscribed', Disconnected: 'disconnected' },
   Track: { Kind: { Audio: 'audio' } },
   LocalAudioTrack: class {},
   createLocalAudioTrack: vi.fn().mockResolvedValue({ stop: vi.fn() }),
 }));
+
+const SYNTHETIC_INVITE = 'a'.repeat(64);
+
+const TEMPLATE = {
+  version: '1.0',
+  locale: 'en-IN',
+  title: 'Screening consent',
+  body_md: 'We record and use **your** interview for hiring.',
+  required_consents: ['ai_interview', 'recording'],
+};
 
 function renderPage(initialEntries?: string[]) {
   return render(
@@ -44,96 +74,169 @@ describe('CandidateJoinPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     useCapabilitySupport.mockReturnValue('supported');
+    candidateConsentStatus.mockResolvedValue({
+      has_consent: false,
+      template_version: '1.0',
+      locale: 'en-IN',
+      required_consents: ['ai_interview', 'recording'],
+    });
+    getCandidateConsentTemplate.mockResolvedValue(TEMPLATE);
+    submitCandidateConsent.mockResolvedValue({ id: 'c1', status: 'granted' });
     exchangeCandidateInvite.mockResolvedValue({
       url: 'wss://livekit.example.invalid',
       livekit_token: 'synthetic-livekit-token',
     });
   });
 
-  it('shows consent banner when consent status is unknown (GOV-03)', async () => {
+  it('missing fragment → no consent API call, fragment removed, error shown', async () => {
     renderPage();
     await waitFor(() => {
-      expect(screen.getByText(/You must review and accept/i)).toBeInTheDocument();
+      expect(screen.getByRole('alert')).toBeInTheDocument();
     });
-    // No join button when consent is unknown
-    expect(screen.queryByRole('button', { name: 'Join screening' })).not.toBeInTheDocument();
+    expect(candidateConsentStatus).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: /join screening/i })).not.toBeInTheDocument();
   });
 
-  it('shows review privacy notice link when consent is unknown (GOV-03)', async () => {
-    renderPage();
+  it('removes the invite fragment from browser history on mount (even when malformed)', async () => {
+    window.history.replaceState(null, '', '/candidate/join#malformed');
+    renderPage(['/candidate/join#malformed']);
+    await waitFor(() => expect(window.location.hash).toBe(''));
+    // Malformed invite → fail closed, no consent call.
+    expect(candidateConsentStatus).not.toHaveBeenCalled();
+    expect(screen.getByRole('alert')).toBeInTheDocument();
+  });
+
+  it('renders the consent form from the active template when no consent exists', async () => {
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
     await waitFor(() => {
-      expect(screen.getByRole('link', { name: /review privacy notice/i })).toBeInTheDocument();
+      expect(screen.getByText('Screening consent')).toBeInTheDocument();
     });
+    expect(candidateConsentStatus).toHaveBeenCalledWith({ invite_token: SYNTHETIC_INVITE });
+    expect(getCandidateConsentTemplate).toHaveBeenCalledWith('en-IN');
+    // Template body rendered as plain text (markdown stripped, not executed).
+    expect(screen.getByText(/We record and use your interview for hiring/)).toBeInTheDocument();
+    // Exact checkboxes per required type.
+    expect(screen.getByLabelText('ai interview')).toBeInTheDocument();
+    expect(screen.getByLabelText('recording')).toBeInTheDocument();
+    // Join button absent until all required boxes are checked.
+    expect(screen.queryByRole('button', { name: /join screening/i })).not.toBeInTheDocument();
+    // Decline is always available.
+    expect(screen.getByRole('button', { name: 'Decline' })).toBeInTheDocument();
   });
 
-  it('shows join button when consent is granted', async () => {
-    renderPage(['/candidate/join?consent=true']);
+  it('accept button stays disabled until ALL required boxes are checked', async () => {
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
+    const accept = await screen.findByRole('button', { name: 'Accept and continue' });
+    expect(accept).toBeDisabled();
+
+    await userEvent.click(screen.getByLabelText('ai interview'));
+    expect(accept).toBeDisabled();
+
+    await userEvent.click(screen.getByLabelText('recording'));
+    expect(accept).toBeEnabled();
+  });
+
+  it('grant submits granted consent with exactly the checked types, then enables join', async () => {
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
+    await screen.findByText('Screening consent');
+    await userEvent.click(screen.getByLabelText('ai interview'));
+    await userEvent.click(screen.getByLabelText('recording'));
+    await userEvent.click(screen.getByRole('button', { name: 'Accept and continue' }));
+
+    await waitFor(() => {
+      expect(submitCandidateConsent).toHaveBeenCalledWith({
+        invite_token: SYNTHETIC_INVITE,
+        template_version: '1.0',
+        locale: 'en-IN',
+        consents: ['ai_interview', 'recording'],
+        status: 'granted',
+      });
+    });
     await waitFor(() => {
       expect(screen.getByRole('button', { name: 'Join screening' })).toBeInTheDocument();
     });
   });
 
-  it('shows consent declined message when consent is declined (GOV-09)', async () => {
-    renderPage(['/candidate/join?consent=declined']);
+  it('decline persists: no join button, no exchange, no media creation', async () => {
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
+    await screen.findByText('Screening consent');
+    await userEvent.click(screen.getByRole('button', { name: 'Decline' }));
+
     await waitFor(() => {
-      expect(screen.getByText(/Consent declined/i)).toBeInTheDocument();
+      expect(submitCandidateConsent).toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'declined', consents: [] }),
+      );
     });
-    expect(screen.queryByRole('button', { name: 'Join screening' })).not.toBeInTheDocument();
-  });
-
-  it('refuses to join without consent evidence (GOV-09)', async () => {
-    window.history.replaceState(null, '', '/candidate/join#synthetic-invite');
-    renderPage(['/candidate/join#synthetic-invite']);
     await waitFor(() => {
-      expect(screen.getByRole('link', { name: /review privacy notice/i })).toBeInTheDocument();
+      expect(screen.getByText('Consent declined')).toBeInTheDocument();
     });
-    // No join button since consent is unknown
-    expect(screen.queryByRole('button', { name: 'Join screening' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /join screening/i })).not.toBeInTheDocument();
+    expect(exchangeCandidateInvite).not.toHaveBeenCalled();
+    expect(connect).not.toHaveBeenCalled();
   });
 
-  it('removes the invite fragment from browser history on mount', async () => {
-    window.history.replaceState(null, '', '/candidate/join#synthetic-invite');
-    renderPage(['/candidate/join#synthetic-invite']);
-    await waitFor(() => expect(window.location.hash).toBe(''));
-    expect(screen.getByText(/You must review and accept/i)).toBeInTheDocument();
+  it('skips the consent form and enables join when server says has_consent', async () => {
+    candidateConsentStatus.mockResolvedValue({
+      has_consent: true,
+      template_version: '1.0',
+      locale: 'en-IN',
+      required_consents: ['ai_interview', 'recording'],
+    });
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Join screening' })).toBeInTheDocument();
+    });
+    expect(getCandidateConsentTemplate).not.toHaveBeenCalled();
   });
 
-  it('exchanges the captured invite once before joining LiveKit when consent granted', async () => {
-    window.history.replaceState(null, '', '/candidate/join#synthetic-invite');
-    renderPage(['/candidate/join?consent=true']);
+  it('exchanges the captured invite once before joining LiveKit', async () => {
+    candidateConsentStatus.mockResolvedValue({
+      has_consent: true,
+      template_version: '1.0',
+      locale: 'en-IN',
+      required_consents: ['ai_interview', 'recording'],
+    });
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
     await waitFor(() => {
       expect(screen.getByRole('button', { name: 'Join screening' })).toBeInTheDocument();
     });
     await userEvent.click(screen.getByRole('button', { name: 'Join screening' }));
-    await waitFor(() => expect(exchangeCandidateInvite).toHaveBeenCalledWith('synthetic-invite'));
+    await waitFor(() => expect(exchangeCandidateInvite).toHaveBeenCalledWith(SYNTHETIC_INVITE));
     expect(connect).toHaveBeenCalledWith(
       'wss://livekit.example.invalid',
       'synthetic-livekit-token',
     );
   });
 
-  it('shows no join button or unsupported message while capabilities are checking', async () => {
-    useCapabilitySupport.mockReturnValue('checking');
-    renderPage(['/candidate/join?consent=true']);
-    await waitFor(() => {
-      expect(screen.queryByRole('button', { name: 'Join screening' })).not.toBeInTheDocument();
-    });
-    expect(
-      screen.queryByText(/does not support the microphone and WebRTC/i),
-    ).not.toBeInTheDocument();
-  });
-
   it('blocks joining and shows a generic unsupported message when capabilities are missing', async () => {
     useCapabilitySupport.mockReturnValue('unsupported');
-    window.history.replaceState(null, '', '/candidate/join#synthetic-invite');
-    renderPage(['/candidate/join?consent=true#synthetic-invite']);
+    candidateConsentStatus.mockResolvedValue({
+      has_consent: true,
+      template_version: '1.0',
+      locale: 'en-IN',
+      required_consents: ['ai_interview', 'recording'],
+    });
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
     await waitFor(() => {
       expect(screen.getByRole('alert')).toBeInTheDocument();
     });
     expect(screen.getByText(/does not support the microphone and WebRTC/i)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Join screening' })).not.toBeInTheDocument();
     expect(exchangeCandidateInvite).not.toHaveBeenCalled();
-    // Mount effect still runs: the invite fragment is removed even when unsupported
+  });
+
+  it('invite fragment is never persisted in query/path after mount', async () => {
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
     await waitFor(() => expect(window.location.hash).toBe(''));
+    expect(window.location.search).toBe('');
+    expect(window.location.pathname).toBe('/candidate/join');
   });
 });

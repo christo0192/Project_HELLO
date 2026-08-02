@@ -21,6 +21,13 @@ import { createSession, transitionSession, ERR_INSERT_FAILED, ERR_DB_FAILED } fr
 import { screeningProvenance } from '../lib/model-provenance.js';
 import { requireRole } from '../lib/rbac.js';
 import { recordAudit } from '../lib/audit.js';
+import { createMaintenanceMiddleware } from '../lib/maintenance.js';
+import {
+  extractIdempotencyKey,
+  quotaEnforcementEnabled,
+  reserveQuota,
+  runWithQuotaReservation,
+} from '../lib/quota.js';
 
 export const screeningRouter = Router();
 
@@ -104,67 +111,139 @@ async function appendTurn(
 }
 
 // POST /api/screening/start  { candidate_id }
-screeningRouter.post('/start', validateBody(startScreeningSchema), async (req, res, next) => {
-  try {
-    const candidateId = req.body?.candidate_id as string;
-    if (!candidateId) return res.status(400).json({ error: 'candidate_id is required' });
-
-    const { ctxBase, roleId } = await loadContext(candidateId);
-
-    // REL-07: create in `created` state. LLM-06 records the configured
-    // design-intent model for this API-owned simulation inference path.
-    // SEC-03: screening sessions are admin-only (cannot be safely scoped by owner_id).
-    const { data: session, error: insertErr } = await createSession({
-      candidate_id: candidateId,
-      role_id: roleId,
-      mode: 'simulation',
-      provenance: screeningProvenance(env.claudeModel),
-    });
-    if (insertErr || !session) return next(insertErr ?? new Error(ERR_INSERT_FAILED));
-
-    const opening = buildOpeningMessage({
-      candidateName: ctxBase.candidateName,
-      roleTitle: ctxBase.roleTitle,
-      company: env.companyName,
-    });
-
-    // Write opening turn; on failure, attempt to terminate the row.
-    // appendTurn throws on Supabase error now (detected via {error}).
+// Phase 9 L2 (invariant 10/11): gated by the fail-closed maintenance guard
+// for NEW work, and — when quota enforcement is configured (at least one
+// enabled quota_policy) — requires a bounded Idempotency-Key header,
+// reserves a slot BEFORE session creation, commits the reservation after
+// success, and releases it on any failure (compensation). When no quota
+// policy is enabled (the default), legacy start behavior is preserved and
+// no reservation is made. Active-turn/finalization behavior is untouched.
+screeningRouter.post(
+  '/start',
+  validateBody(startScreeningSchema),
+  createMaintenanceMiddleware({ allowAdmin: true }),
+  async (req, res, next) => {
     try {
-      await appendTurn(session.id, 0, 'bot', opening);
-    } catch {
-      const termResult = await transitionSession(
-        session.id, 'created', 'failed', 'worker_crash',
-      );
-      if (!termResult.ok && !termResult.conflict) {
-        return next(new Error('opening turn failed and session could not be terminated — reconciliation required'));
+      const candidateId = req.body?.candidate_id as string;
+      if (!candidateId) return res.status(400).json({ error: 'candidate_id is required' });
+
+      // ── Maintenance guard already ran (fail-closed on DB read). Now check
+      // whether quota enforcement is configured (policies disabled by default).
+      const enforcement = await quotaEnforcementEnabled();
+      if (!enforcement.ok) {
+        // DB read failure → fail closed for new work.
+        return res.status(503).json({ error: 'service_unavailable' });
       }
-      return next(new Error('opening turn insert failed'));
-    }
 
-    // Candidate status is best-effort — use await+check, not .catch().
-    {
-      const { error: candErr } = await supabase
-        .from('candidates')
-        .update({ status: 'screening' })
-        .eq('id', candidateId);
-      if (candErr) {
-        // Candidate status is not critical; proceed with session start.
-        // Documented in runbook as best-effort.
+      // Legacy (quota-unconfigured) path: unchanged start behavior.
+      const run = async (): Promise<void> => {
+        const { ctxBase, roleId } = await loadContext(candidateId);
+
+        // REL-07: create in `created` state. LLM-06 records the configured
+        // design-intent model for this API-owned simulation inference path.
+        // SEC-03: screening sessions are admin-only (cannot be safely scoped by owner_id).
+        const { data: session, error: insertErr } = await createSession({
+          candidate_id: candidateId,
+          role_id: roleId,
+          mode: 'simulation',
+          provenance: screeningProvenance(env.claudeModel),
+        });
+        if (insertErr || !session) throw new Error(ERR_INSERT_FAILED);
+
+        const opening = buildOpeningMessage({
+          candidateName: ctxBase.candidateName,
+          roleTitle: ctxBase.roleTitle,
+          company: env.companyName,
+        });
+
+        // Write opening turn; on failure, attempt to terminate the row.
+        // appendTurn throws on Supabase error now (detected via {error}).
+        try {
+          await appendTurn(session.id, 0, 'bot', opening);
+        } catch {
+          const termResult = await transitionSession(
+            session.id, 'created', 'failed', 'worker_crash',
+          );
+          if (!termResult.ok && !termResult.conflict) {
+            throw new Error('opening turn failed and session could not be terminated — reconciliation required');
+          }
+          throw new Error('opening turn insert failed');
+        }
+
+        // Candidate status is best-effort — use await+check, not .catch().
+        {
+          const { error: candErr } = await supabase
+            .from('candidates')
+            .update({ status: 'screening' })
+            .eq('id', candidateId);
+          void candErr; // Non-critical; documented in runbook as best-effort.
+        }
+
+        // CAS: created → in_progress
+        const tr = await transitionSession(session.id, 'created', 'in_progress');
+        if (!tr.ok) {
+          throw new Error('session transition conflict: could not activate session');
+        }
+
+        res.status(201).json({ session_id: session.id, message: opening, done: false });
+      };
+
+      if (!enforcement.enabled) {
+        await run();
+        return;
       }
-    }
 
-    // CAS: created → in_progress
-    const tr = await transitionSession(session.id, 'created', 'in_progress');
-    if (!tr.ok) {
-      return next(new Error('session transition conflict: could not activate session'));
-    }
+      // ── Quota enforcement: bounded Idempotency-Key required, reserve
+      // before create, commit after success, release on failure. Never
+      // double-reserves: a repeated key returns the SAME stable reservation.
+      const key = extractIdempotencyKey(req);
+      if (!key) {
+        return res.status(400).json({
+          error: { type: 'validation_error', message: 'Idempotency-Key header is required' },
+        });
+      }
 
-    res.status(201).json({ session_id: session.id, message: opening, done: false });
-  } catch (error) {
-    next(error);
-  }
-});
+      const reservation = await reserveQuota({
+        scopeId: candidateId,
+        mode: 'simulation',
+        idempotencyKey: key,
+      });
+
+      if (reservation.status === 'rpc_error') {
+        return res.status(503).json({ error: 'quota_service_error' });
+      }
+      if (reservation.status === 'no_policy') {
+        return res.status(503).json({ error: 'quota_not_configured' });
+      }
+      if (reservation.status === 'quota_exceeded') {
+        return res.status(409).json({
+          error: 'quota_exceeded',
+          remaining_sessions: reservation.remainingSessions,
+          remaining_cost_units: reservation.remainingCostUnits,
+        });
+      }
+      if (reservation.status === 'duplicate') {
+        // Truthful retry semantics: existing-session response is NOT
+        // implemented (residual documented) — a repeated key returns a
+        // stable conflict and never double-reserves.
+        if (reservation.reservationStatus === 'committed') {
+          return res.status(409).json({ error: 'idempotency_replay' });
+        }
+        if (reservation.reservationStatus === 'reserved') {
+          return res.status(409).json({ error: 'request_in_flight' });
+        }
+        return res.status(409).json({ error: 'idempotency_key_exhausted' });
+      }
+
+      // reservation.status === 'ok' — proceed, commit after success, release
+      // on failure (compensates failed session creation).
+      const outcome = await runWithQuotaReservation(reservation, run);
+      if (outcome.handled) return; // response already sent by run()
+    } catch (error) {
+      next(error);
+    }
+  },
+);
 
 // POST /api/screening/:id/turn  { text }
 screeningRouter.post(

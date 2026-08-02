@@ -2,6 +2,7 @@ import { supabase } from '../lib/supabase.js';
 import { runClaudeJSONWithProvenance } from '../lib/claude.js';
 import { env } from '../lib/env.js';
 import { buildAssessmentPrompt, formatResumeFacts } from '../lib/prompts.js';
+import { insertNotificationIntent } from '../lib/notification-intent.js';
 import type { Assessment, TranscriptTurn } from '../lib/types.js';
 import { scoringProvenance } from '../lib/model-provenance.js';
 
@@ -47,7 +48,7 @@ export async function runAssessment(sessionId: string): Promise<Assessment & { i
 async function runAssessmentImpl(sessionId: string): Promise<Assessment & { id: string }> {
   const { data: session, error: sErr } = await supabase
     .from('call_sessions')
-    .select('id,candidate_id,role_id,status,terminal_reason')
+    .select('id,candidate_id,owner_id,role_id,status,terminal_reason')
     .eq('id', sessionId)
     .single();
   if (sErr || !session) throw new Error(`session not found: ${sErr?.message}`);
@@ -152,11 +153,44 @@ async function runAssessmentImpl(sessionId: string): Promise<Assessment & { id: 
   }
   if (aErr) throw new Error(aErr.message);
 
-  // reflect outcome on candidate
-  await supabase
+  // Phase 9 L4 (invariant 9): a recruiter notification intent is logged
+  // IDEMPOTENTLY and only after the assessment row is successfully persisted.
+  // The intent uses bounded IDs only (no contact data) and is a log — no
+  // provider send exists. Assessment insert and intent insert are SEPARATE
+  // Supabase calls; atomicity is NOT claimed (see phase9-operations.md). An
+  // intent-insert failure therefore never fabricates a delivery and never
+  // rolls back the already-persisted assessment — it is a documented
+  // reconciliation residual (idempotent retry fills the gap).
+  try {
+    await insertNotificationIntent({
+      idempotency_key: `assessment_ready:${row.id}`,
+      kind: 'assessment_ready',
+      candidate_id: session.candidate_id,
+      consent_verified: false,
+      payload: { session_id: sessionId, owner_id: session.owner_id ?? null },
+    });
+  } catch {
+    // Best-effort log only — never fabricate delivery, never fail scoring.
+  }
+
+  // Phase 9 L4 (invariant 8): honor candidates.decision_use_blocked_at — the
+  // assessment row (and its intent) stays truthful, but the candidate status
+  // is NOT silently rewritten while an appeal blocks decision use. The status
+  // before the appeal remains for human review (runbook documents this).
+  const { data: candidateRow } = await supabase
     .from('candidates')
-    .update({ status: assessment.recommendation === 'reject' ? 'rejected' : 'screened' })
-    .eq('id', session.candidate_id);
+    .select('decision_use_blocked_at')
+    .eq('id', session.candidate_id)
+    .maybeSingle();
+  const decisionBlocked =
+    candidateRow?.decision_use_blocked_at != null &&
+    candidateRow.decision_use_blocked_at !== '';
+  if (!decisionBlocked) {
+    await supabase
+      .from('candidates')
+      .update({ status: assessment.recommendation === 'reject' ? 'rejected' : 'screened' })
+      .eq('id', session.candidate_id);
+  }
 
   // VOI-08: best-effort non-concurrent repeat guard — transition the session's
   // terminal_reason from conversation_complete to assessment_done AFTER a

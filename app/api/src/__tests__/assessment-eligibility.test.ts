@@ -381,4 +381,78 @@ describe('VOI-08 assessment eligibility preflight', () => {
     expect(assessSource).toContain('session_not_completed');
     expect(assessSource).toContain('Session is not eligible for assessment');
   });
+
+  // ══════════════════════════════════════════════════════════════════
+  //  9. Phase 9 L4 — notification intent + decision-use block
+  // ══════════════════════════════════════════════════════════════════
+
+  it('logs an idempotent recruiter notification intent only after assessment persistence', async () => {
+    configureTable('call_sessions', ok(sessionRow('completed', 'conversation_complete')));
+    configureTable('transcript_turns', ok([]));
+    configureTable('roles', ok({ title: 'FE', required_skills: [] }));
+    configureTable('candidates', ok({ name: 'A', parsed: null, decision_use_blocked_at: null }));
+    configureTable('assessments', ok({ id: ASSESSMENT_ID }));
+    configureTable('notification_intents', ok(null));
+
+    await runAssessment(SESSION_ID);
+
+    // Intent insert: bounded idempotency key, kind assessment_ready, candidate
+    // id only — no contact data, no provider send.
+    const intents = callsFor('notification_intents', 'insert');
+    expect(intents).toHaveLength(1);
+    const payload = intents[0].args[0] as Record<string, unknown>;
+    expect(payload.idempotency_key).toBe(`assessment_ready:${ASSESSMENT_ID}`);
+    expect(payload.kind).toBe('assessment_ready');
+    expect(payload.candidate_id).toBe(CANDIDATE_ID);
+    expect(JSON.stringify(payload)).not.toMatch(/email|phone|transcript|resume|token/i);
+
+    // Intent is inserted AFTER the assessment row persisted (assessment insert
+    // happens first).
+    const assessInsert = callsFor('assessments', 'insert');
+    expect(assessInsert).toHaveLength(1);
+    expect(callsFor('candidates', 'update')).toHaveLength(1);
+  });
+
+  it('skips the candidate status rewrite while decision_use_blocked_at is set (assessment + intent remain truthful)', async () => {
+    configureTable('call_sessions', ok(sessionRow('completed', 'conversation_complete')));
+    configureTable('transcript_turns', ok([]));
+    configureTable('roles', ok({ title: 'FE', required_skills: [] }));
+    configureTable(
+      'candidates',
+      ok({ name: 'A', parsed: null, decision_use_blocked_at: '2026-01-02T00:00:00.000Z' }),
+    );
+    configureTable('assessments', ok({ id: ASSESSMENT_ID }));
+    configureTable('notification_intents', ok(null));
+
+    const result = await runAssessment(SESSION_ID);
+
+    // The assessment resolves normally with its id.
+    expect(result.id).toBe(ASSESSMENT_ID);
+    // Assessment row persisted.
+    expect(callsFor('assessments', 'insert')).toHaveLength(1);
+    // Notification intent still logged (truthful completion signal).
+    expect(callsFor('notification_intents', 'insert')).toHaveLength(1);
+    // NO candidate status rewrite while the appeal blocks decision use.
+    expect(callsFor('candidates', 'update')).toHaveLength(0);
+    // Existing assessment_done behavior preserved.
+    expect(callsFor('call_sessions', 'update')).toHaveLength(1);
+  });
+
+  it('a failed notification-intent insert does not fabricate delivery nor fail scoring', async () => {
+    configureTable('call_sessions', ok(sessionRow('completed', 'conversation_complete')));
+    configureTable('transcript_turns', ok([]));
+    configureTable('roles', ok({ title: 'FE', required_skills: [] }));
+    configureTable('candidates', ok({ name: 'A', parsed: null, decision_use_blocked_at: null }));
+    configureTable('assessments', ok({ id: ASSESSMENT_ID }));
+    configureTable('notification_intents', { data: null, error: { message: 'db down', code: 'PGRST' } });
+
+    const result = await runAssessment(SESSION_ID);
+
+    // Assessment still resolves; the intent failure is a reconciliation residual.
+    expect(result.id).toBe(ASSESSMENT_ID);
+    expect(callsFor('assessments', 'insert')).toHaveLength(1);
+    expect(callsFor('candidates', 'update')).toHaveLength(1);
+    // No fabricated delivery anywhere.
+    expect(callsFor('notification_intents', 'insert')).toHaveLength(1);
+  });
 });

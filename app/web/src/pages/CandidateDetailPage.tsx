@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api, ApiError } from "../api";
-import type { CandidateDetail } from "../types";
+import type { AppealRow, CandidateDetail, Note } from "../types";
 import { Scorecard } from "../components/Scorecard";
 import { LiveCallPanel } from "../components/LiveCallPanel";
 import { LiveKitCallCard } from "../components/LiveKitCallCard";
 import {
+  Button,
   Card,
   Chip,
   ErrorState,
@@ -13,6 +14,16 @@ import {
   PageHeader,
 } from "../components/ui";
 
+/**
+ * Phase 9 L4 — CandidateDetail additions:
+ *   - decision_use_blocked_at banner; while set, the automated
+ *     recommendation/scorecard is suppressed and human review is required.
+ *   - append-only recruiter notes (list + add)
+ *   - ownership-scoped CSV scorecard export (one-click download)
+ *   - appeals list + issue one-time appeal grant (explicit expiry) with a
+ *     fragment link the candidate opens on /appeal
+ * Existing role/session/invite/transcript/scorecard flows are preserved.
+ */
 
 export function CandidateDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -36,6 +47,7 @@ export function CandidateDetailPage() {
 
   const { candidate, sessions, assessments } = detail;
   const latestAssessment = assessments[0] ?? null;
+  const decisionBlocked = candidate.decision_use_blocked_at != null;
 
   return (
     <div>
@@ -50,6 +62,22 @@ export function CandidateDetailPage() {
         title={candidate.name || "Unnamed candidate"}
         description={candidate.email ?? undefined}
       />
+
+      {decisionBlocked && (
+        <div
+          role="alert"
+          className="mb-5 rounded-md border border-amber-300 bg-amber-50 p-4"
+        >
+          <p className="text-sm font-semibold text-amber-900">
+            Decision use is paused — open appeal
+          </p>
+          <p className="mt-1 text-sm text-amber-800">
+            An appeal is under review. Automated recommendations and status
+            automation are hidden until a human reviewer resolves it. The
+            existing status is preserved.
+          </p>
+        </div>
+      )}
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
         {/* Profile */}
@@ -95,6 +123,9 @@ export function CandidateDetailPage() {
             LiveKit mode: start a browser voice screening from this dashboard.
             Transcript, playback, and scorecard sync back to Supabase.
           </p>
+          <div className="mt-4">
+            <CsvExportButton candidateId={candidate.id} />
+          </div>
         </Card>
 
         {/* Sessions + latest assessment */}
@@ -109,7 +140,7 @@ export function CandidateDetailPage() {
             candidateName={candidate.name || undefined}
           />
 
-          {latestAssessment && (
+          {latestAssessment && !decisionBlocked && (
             <div>
               <h2 className="mb-3 text-sm font-semibold text-gray-900">
                 Latest assessment
@@ -117,6 +148,28 @@ export function CandidateDetailPage() {
               <Scorecard assessment={latestAssessment} />
             </div>
           )}
+
+          {latestAssessment && decisionBlocked && (
+            <Card className="p-5">
+              <h2 className="text-sm font-semibold text-gray-900">
+                Latest assessment
+              </h2>
+              <p className="mt-2 text-sm text-gray-600">
+                Hidden while an appeal is under review. A human reviewer will
+                re-assess before any recommendation is used.
+              </p>
+            </Card>
+          )}
+
+          {/* Phase 9: notes */}
+          <NotesSection candidateId={candidate.id} />
+
+          {/* Phase 9: appeals */}
+          <AppealsSection
+            candidateId={candidate.id}
+            sessions={sessions}
+            blocked={decisionBlocked}
+          />
 
           <div>
             <h2 className="mb-3 text-sm font-semibold text-gray-900">
@@ -173,6 +226,270 @@ export function CandidateDetailPage() {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+/* ── Phase 9: append-only notes ─────────────────────────────────────── */
+
+function NotesSection({ candidateId }: { candidateId: string }) {
+  const [notes, setNotes] = useState<Note[] | null>(null);
+  const [noteText, setNoteText] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    setErr(null);
+    api
+      .listNotes(candidateId)
+      .then((r) => setNotes(r.notes))
+      .catch((e: ApiError) => setErr(e.message));
+  }, [candidateId]);
+
+  useEffect(load, [load]);
+
+  async function add() {
+    if (!noteText.trim()) return;
+    setSaving(true);
+    setMsg(null);
+    try {
+      await api.addNote(candidateId, noteText.trim());
+      setNoteText("");
+      await load();
+    } catch (e) {
+      setMsg(e instanceof ApiError ? e.message : "Failed to add note.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Card className="p-5">
+      <h2 className="mb-3 text-sm font-semibold text-gray-900">Notes</h2>
+      {err ? (
+        <p className="text-sm text-red-600">{err}</p>
+      ) : notes === null ? (
+        <p className="text-sm text-gray-400">Loading notes…</p>
+      ) : notes.length === 0 ? (
+        <p className="text-sm text-gray-500">No notes yet.</p>
+      ) : (
+        <ul className="divide-y divide-gray-100">
+          {notes.map((n) => (
+            <li key={n.id} className="py-2 text-sm">
+              <p className="whitespace-pre-wrap text-gray-800">{n.note}</p>
+              <p className="mt-0.5 text-xs text-gray-400">
+                {new Date(n.created_at).toLocaleString()}
+              </p>
+            </li>
+          ))}
+        </ul>
+      )}
+      <div className="mt-3 flex gap-2">
+        <label htmlFor="note-input" className="sr-only">
+          Add a note
+        </label>
+        <input
+          id="note-input"
+          value={noteText}
+          onChange={(e) => setNoteText(e.target.value)}
+          maxLength={2000}
+          placeholder="Add a note…"
+          className="flex-1 rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-accent-500 focus:outline-none focus:ring-accent-500"
+        />
+        <Button variant="secondary" onClick={() => void add()} loading={saving} disabled={!noteText.trim()}>
+          Add
+        </Button>
+      </div>
+      {msg && <p className="mt-2 text-xs text-gray-600">{msg}</p>}
+    </Card>
+  );
+}
+
+/* ── Phase 9: appeals + one-time grant link ─────────────────────────── */
+
+function AppealsSection({
+  candidateId,
+  sessions,
+  blocked,
+}: {
+  candidateId: string;
+  sessions: CandidateDetail["sessions"];
+  blocked: boolean;
+}) {
+  const [appeals, setAppeals] = useState<AppealRow[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [expiryHours, setExpiryHours] = useState(24);
+  const [selectedSession, setSelectedSession] = useState(sessions[0]?.id ?? "");
+  const [issuing, setIssuing] = useState(false);
+  const [grantLink, setGrantLink] = useState<string | null>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    setErr(null);
+    api
+      .listAppeals(candidateId)
+      .then((r) => setAppeals(r.appeals))
+      .catch((e: ApiError) => setErr(e.message));
+  }, [candidateId]);
+
+  useEffect(load, [load]);
+
+  async function issueGrant() {
+    if (!selectedSession) return;
+    setIssuing(true);
+    setMsg(null);
+    setGrantLink(null);
+    try {
+      const res = await api.issueAppealGrant(candidateId, selectedSession, expiryHours);
+      const link = `${window.location.origin}/appeal#${res.appeal_grant_token}`;
+      setGrantLink(link);
+      setMsg(
+        `Grant issued — expires ${new Date(res.expires_at).toLocaleString()}. ` +
+          "Send this one-time link to the candidate.",
+      );
+    } catch (e) {
+      setMsg(e instanceof ApiError ? e.message : "Failed to issue appeal grant.");
+    } finally {
+      setIssuing(false);
+    }
+  }
+
+  return (
+    <Card className="p-5">
+      <h2 className="mb-3 text-sm font-semibold text-gray-900">Appeals</h2>
+      {blocked && (
+        <p className="mb-3 rounded-md bg-amber-50 p-2 text-xs text-amber-800">
+          An appeal is open — automated decision use is paused.
+        </p>
+      )}
+      {err ? (
+        <p className="text-sm text-red-600">{err}</p>
+      ) : appeals === null ? (
+        <p className="text-sm text-gray-400">Loading appeals…</p>
+      ) : appeals.length === 0 ? (
+        <p className="text-sm text-gray-500">No appeals.</p>
+      ) : (
+        <ul className="divide-y divide-gray-100">
+          {appeals.map((a) => (
+            <li key={a.id} className="py-2 text-sm">
+              <div className="flex items-center justify-between gap-2">
+                <p className="font-medium text-gray-800">{a.category}</p>
+                <Chip tone={a.status === "open" || a.status === "under_review" ? "accent" : "green"}>
+                  {a.status}
+                </Chip>
+              </div>
+              <p className="mt-0.5 whitespace-pre-wrap text-gray-600">{a.description}</p>
+              <p className="mt-0.5 text-xs text-gray-400">
+                {new Date(a.created_at).toLocaleString()}
+              </p>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <div className="mt-4 rounded-md border border-gray-200 p-4">
+        <h3 className="text-sm font-semibold text-gray-900">Issue appeal grant</h3>
+        <p className="mt-1 text-xs text-gray-500">
+          A one-time fragment link the candidate opens at /appeal. Explicit
+          expiry is required (1–72 hours); the plaintext is shown only once.
+        </p>
+        <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
+          <div>
+            <label htmlFor="appeal-session" className="block text-xs font-medium text-gray-600">
+              Session
+            </label>
+            <select
+              id="appeal-session"
+              value={selectedSession}
+              onChange={(e) => setSelectedSession(e.target.value)}
+              className="mt-1 block w-full rounded-md border border-gray-300 px-2 py-1.5 text-sm focus:border-accent-500 focus:outline-none focus:ring-accent-500"
+            >
+              {sessions.length === 0 ? (
+                <option value="">No sessions</option>
+              ) : (
+                sessions.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.id.slice(0, 8)} ({s.status})
+                  </option>
+                ))
+              )}
+            </select>
+          </div>
+          <div>
+            <label htmlFor="appeal-expiry" className="block text-xs font-medium text-gray-600">
+              Expires in (hours, 1–72)
+            </label>
+            <input
+              id="appeal-expiry"
+              type="number"
+              min={1}
+              max={72}
+              value={expiryHours}
+              onChange={(e) => setExpiryHours(Number(e.target.value))}
+              className="mt-1 block w-full rounded-md border border-gray-300 px-2 py-1.5 text-sm focus:border-accent-500 focus:outline-none focus:ring-accent-500"
+            />
+          </div>
+        </div>
+        <Button
+          className="mt-3"
+          variant="secondary"
+          onClick={() => void issueGrant()}
+          loading={issuing}
+          disabled={!selectedSession}
+        >
+          Issue one-time appeal grant
+        </Button>
+        {msg && <p className="mt-2 text-xs text-gray-600">{msg}</p>}
+        {grantLink && (
+          <div className="mt-2 rounded-md bg-gray-50 p-3">
+            <p className="text-xs font-semibold text-gray-600">One-time link (shown once)</p>
+            <code className="block break-all text-xs text-gray-700">{grantLink}</code>
+            <p className="mt-1 text-[11px] text-gray-400">
+              Contains a secret token in the fragment — share it only with the
+              candidate. It is never stored by the app.
+            </p>
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+/* ── Phase 9: CSV export ────────────────────────────────────────────── */
+
+function CsvExportButton({ candidateId }: { candidateId: string }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function download() {
+    setBusy(true);
+    setErr(null);
+    try {
+      const csv = await api.exportCsv(candidateId);
+      // Same-tab download via a transient object URL — revoked immediately.
+      const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `screening-export-${candidateId}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : "Failed to export CSV.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div>
+      <Button variant="secondary" onClick={() => void download()} loading={busy}>
+        Export screening data (scorecard + transcript)
+      </Button>
+      {err && <p className="mt-1 text-xs text-red-600">{err}</p>}
     </div>
   );
 }

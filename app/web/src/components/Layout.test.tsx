@@ -18,7 +18,8 @@ import { Layout } from './Layout';
 
 vi.mock('../api', () => ({
   api: {
-    health: () => Promise.resolve({ ok: true, model: 'gpt-4' }),
+    status: () =>
+      Promise.resolve({ status: 'ok', maintenance: null, updated_at: '2026-01-01T00:00:00.000Z' }),
   },
   ApiError: class extends Error {
     status: number;
@@ -34,6 +35,7 @@ vi.mock('../lib/auth', () => ({
     user: { id: 'u1', email: 'recruiter@example.com' },
     signOut: vi.fn(),
     isAuthenticated: true,
+    role: 'admin',
   }),
 }));
 
@@ -59,9 +61,39 @@ describe('Layout', () => {
     expect(screen.getByText('Candidates')).toBeInTheDocument();
   });
 
+  it('renders the Admin nav item only for admins', () => {
+    renderLayout();
+    expect(screen.getByText('Admin')).toBeInTheDocument();
+  });
+
+  it('does not render the model/provider display (no leakage)', () => {
+    renderLayout();
+    expect(screen.queryByText(/gpt-4|haiku|sonnet|claude/i)).not.toBeInTheDocument();
+  });
+
   it('shows API online', async () => {
     renderLayout();
     expect(await screen.findByText('API online')).toBeInTheDocument();
+  });
+
+  it('shows maintenance state from /api/status', async () => {
+    const apiMock = await import('../api');
+    (apiMock.api as any).status = () =>
+      Promise.resolve({
+        status: 'maintenance',
+        maintenance: { enabled: true, reason: 'window', updated_at: null },
+        updated_at: '2026-01-01T00:00:00.000Z',
+      });
+    const { Layout: LayoutAgain } = await import('./Layout');
+    render(
+      <MemoryRouter initialEntries={['/candidates']}>
+        <LayoutAgain />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText('Maintenance')).toBeInTheDocument();
+    // Restore for subsequent tests.
+    (apiMock.api as any).status = () =>
+      Promise.resolve({ status: 'ok', maintenance: null, updated_at: '2026-01-01T00:00:00.000Z' });
   });
 
   it('shows user email when authenticated', () => {

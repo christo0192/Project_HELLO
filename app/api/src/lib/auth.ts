@@ -393,6 +393,14 @@ export const PUBLIC_ROUTES: { method: string; path: string }[] = [
   { method: 'POST', path: '/api/livekit/exchange' },
   { method: 'POST', path: '/api/livekit/worker-context' },
   { method: 'POST', path: '/api/livekit/grant/recording' },
+  // Phase 9 L4: exact public allowlist entries. Each public candidate route
+  // validates its invite/appeal token inline BEFORE any DB write. /api/me and
+  // all recruiter/admin routes remain authenticated (NOT added here).
+  { method: 'GET', path: '/api/status' },
+  { method: 'GET', path: '/api/candidate-consent/template' },
+  { method: 'POST', path: '/api/candidate-consent/status' },
+  { method: 'POST', path: '/api/candidate-consent/submit' },
+  { method: 'POST', path: '/api/appeals' },
 ];
 
 export function isPublicRoute(method: string, path: string): boolean {
