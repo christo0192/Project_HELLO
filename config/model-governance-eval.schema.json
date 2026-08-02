@@ -1,0 +1,548 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "model-governance-eval.schema.json",
+  "title": "Model Governance Evaluation Fixture and Report Contract",
+  "description": "Machine-checkable contract for LLM-02/03/04/05/06 deterministic offline evaluation (PR-A Lane A2): synthetic/de-identified fixture documents with SHA-256 digest manifests and disjoint train/held-out splits, and deterministic evaluation reports that distinguish harness self-test from authentic evaluation, report insufficient_data when no samples exist, keep every threshold PROPOSED, and leave Gemini/DeepSeek compare slots NOT_EVALUATED. This contract validates structure only; it makes no acceptance decision. All policy states in this file are repository-only: proposed, PROPOSED, PENDING, OWNER_VERIFY, NOT_EVALUATED. A positive approval claim (APPROVED/DEPLOYED/ACCEPTED/winner) is rejected unconditionally by the repository status validator and by app/api/src/model-governance/evaluation.ts: repository-only Phase 10 work carries no authentic external evidence, so no EV-xxxx/UUID/identifier reference can authorize a positive claim.",
+  "type": "object",
+  "definitions": {
+    "provenance": {
+      "description": "LLM-06 provenance shape, mirroring app/api/src/lib/model-provenance.ts (schema_version 1, allowlisted provider and workload, UTC RFC 3339 timestamp). The TypeScript evaluator validates this with the real validateProvenance() import; this schema is the structural mirror.",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "provider",
+        "requestedModel",
+        "workload",
+        "prompt_template_version",
+        "timestamp"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "provider": {
+          "enum": [
+            "anthropic"
+          ]
+        },
+        "requestedModel": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "workload": {
+          "enum": [
+            "screening",
+            "scoring"
+          ]
+        },
+        "prompt_template_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "inference_params": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "temperature": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 2
+            },
+            "max_tokens": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100000
+            }
+          }
+        },
+        "timestamp": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,3})?Z$"
+        }
+      }
+    },
+    "fixture": {
+      "description": "One synthetic/de-identified evaluation fixture: a workload, scenario, validated provenance, de-identified input excerpt, expected labels, and a train/held_out split label. selfTestControl is harness-only; it never appears in authentic evaluation input.",
+      "type": "object",
+      "required": [
+        "id",
+        "scenario",
+        "workload",
+        "provenance",
+        "input",
+        "expected",
+        "split"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{0,99}$"
+        },
+        "scenario": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+        },
+        "workload": {
+          "enum": [
+            "screening",
+            "scoring"
+          ]
+        },
+        "provenance": {
+          "$ref": "#/definitions/provenance"
+        },
+        "input": {
+          "type": "object",
+          "required": [
+            "kind",
+            "text"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": [
+                "conversation",
+                "resume_fragment"
+              ]
+            },
+            "text": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "expected": {
+          "type": "object",
+          "required": [
+            "factual",
+            "safe",
+            "disclosureMade",
+            "expectedScore"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "factual": {
+              "type": "boolean"
+            },
+            "safe": {
+              "type": "boolean"
+            },
+            "disclosureMade": {
+              "type": "boolean"
+            },
+            "expectedScore": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 5
+            }
+          }
+        },
+        "split": {
+          "enum": [
+            "train",
+            "held_out"
+          ]
+        },
+        "selfTestControl": {
+          "type": "object",
+          "required": [
+            "simulateError"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "simulateError": {
+              "enum": [
+                "none",
+                "factuality_miss",
+                "safety_miss",
+                "disclosure_miss",
+                "score_shift"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "fixtureDocument": {
+      "description": "Synthetic/de-identified evaluation fixture set with a SHA-256 digest manifest and a disjoint train/held-out split. Every fixture carries a split label and every id in the split map must resolve to a fixture. Held-out fixtures are never used for threshold tuning; thresholds are static PROPOSED constants.",
+      "type": "object",
+      "required": [
+        "schema",
+        "schemaVersion",
+        "status",
+        "manifest",
+        "split",
+        "fixtures"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "model-governance-eval.schema.json"
+        },
+        "schemaVersion": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "const": "proposed"
+        },
+        "description": {
+          "type": "string"
+        },
+        "manifest": {
+          "type": "object",
+          "required": [
+            "algorithm",
+            "digests"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "algorithm": {
+              "const": "sha256"
+            },
+            "digests": {
+              "type": "object",
+              "patternProperties": {
+                "^[a-z0-9][a-z0-9-]{0,99}$": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "split": {
+          "type": "object",
+          "required": [
+            "train",
+            "heldOut"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "train": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "heldOut": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "fixtures": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/definitions/fixture"
+          }
+        }
+      }
+    },
+    "threshold": {
+      "description": "A proposed threshold. status is always PROPOSED in repository-only work; a threshold carrying an APPROVED value is rejected by the evaluator unless authentic human-annotated evaluation exists, which it does not.",
+      "type": "object",
+      "required": [
+        "metricId",
+        "proposedValue",
+        "status"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "metricId": {
+          "enum": [
+            "coverage",
+            "factuality",
+            "safety",
+            "disclosure",
+            "scoring_consistency",
+            "calibration",
+            "variance"
+          ]
+        },
+        "proposedValue": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "status": {
+          "const": "PROPOSED"
+        }
+      }
+    },
+    "metric": {
+      "description": "One evaluation metric. Metrics with no samples report state insufficient_data and omit value; measured metrics carry a 0..1 value where higher is better.",
+      "type": "object",
+      "required": [
+        "id",
+        "sampleCount",
+        "state",
+        "threshold"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "enum": [
+            "coverage",
+            "factuality",
+            "safety",
+            "disclosure",
+            "scoring_consistency",
+            "calibration",
+            "variance"
+          ]
+        },
+        "sampleCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "state": {
+          "enum": [
+            "measured",
+            "insufficient_data"
+          ]
+        },
+        "value": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "threshold": {
+          "$ref": "#/definitions/threshold"
+        },
+        "note": {
+          "type": "string"
+        }
+      }
+    },
+    "compareSlot": {
+      "description": "Optional Gemini/DeepSeek comparison slot (LLM-03/LLM-04). These lanes are NOT implemented: the slot is a NOT_EVALUATED placeholder gated on the LLM-02 framework completing AND authentic human-annotated data existing. No comparison score and no winner is ever recorded here.",
+      "type": "object",
+      "required": [
+        "provider",
+        "status",
+        "role",
+        "requires"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "enum": [
+            "gemini",
+            "deepseek"
+          ]
+        },
+        "status": {
+          "const": "NOT_EVALUATED"
+        },
+        "role": {
+          "const": "optional_compare_slot"
+        },
+        "requires": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "provenanceLinkage": {
+      "description": "LLM-06 linkage: references the real provenance module path and its current allowlist constants by value. Provenance infrastructure lives only in app/api/src/lib/model-provenance.ts; this report does not duplicate it.",
+      "type": "object",
+      "required": [
+        "module",
+        "schemaVersion",
+        "providers",
+        "workloads",
+        "note"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "module": {
+          "const": "app/api/src/lib/model-provenance.ts"
+        },
+        "schemaVersion": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "providers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "workloads": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "note": {
+          "type": "string"
+        }
+      }
+    },
+    "evaluationReport": {
+      "description": "Deterministic offline evaluation report. evaluationKind distinguishes harness self-test (conclusion harness_plumbing_only; no model-quality claim) from authentic evaluation (requires an annotation source; still no acceptance). Metrics report insufficient_data when no samples exist. Every threshold status is PROPOSED. Gemini/DeepSeek compare slots are NOT_EVALUATED placeholders. provenanceLinkage references the real LLM-06 module constants.",
+      "type": "object",
+      "required": [
+        "schema",
+        "schemaVersion",
+        "status",
+        "reportId",
+        "generatedAt",
+        "evaluationKind",
+        "dataSource",
+        "modelUnderTest",
+        "splitUsage",
+        "metrics",
+        "thresholds",
+        "optionalComparisons",
+        "provenanceLinkage",
+        "conclusion"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "model-governance-eval.schema.json"
+        },
+        "schemaVersion": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "const": "proposed"
+        },
+        "reportId": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{0,127}$"
+        },
+        "generatedAt": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,3})?Z$"
+        },
+        "evaluationKind": {
+          "enum": [
+            "harness_self_test",
+            "authentic"
+          ]
+        },
+        "dataSource": {
+          "enum": [
+            "synthetic",
+            "deidentified",
+            "authentic_human_annotated"
+          ]
+        },
+        "modelUnderTest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "annotationSource": {
+          "type": "string"
+        },
+        "splitUsage": {
+          "type": "object",
+          "required": [
+            "splitUsed",
+            "trainFixtureCount",
+            "heldOutFixtureCount",
+            "heldOutUsedForThresholdTuning"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "splitUsed": {
+              "enum": [
+                "train",
+                "held_out"
+              ]
+            },
+            "trainFixtureCount": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "heldOutFixtureCount": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "heldOutUsedForThresholdTuning": {
+              "const": false
+            }
+          }
+        },
+        "metrics": {
+          "type": "array",
+          "minItems": 7,
+          "items": {
+            "$ref": "#/definitions/metric"
+          }
+        },
+        "thresholds": {
+          "type": "array",
+          "minItems": 7,
+          "items": {
+            "$ref": "#/definitions/threshold"
+          }
+        },
+        "optionalComparisons": {
+          "type": "object",
+          "required": [
+            "gemini",
+            "deepseek"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "gemini": {
+              "$ref": "#/definitions/compareSlot"
+            },
+            "deepseek": {
+              "$ref": "#/definitions/compareSlot"
+            }
+          }
+        },
+        "provenanceLinkage": {
+          "$ref": "#/definitions/provenanceLinkage"
+        },
+        "conclusion": {
+          "type": "object",
+          "required": [
+            "kind",
+            "text"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": [
+                "harness_plumbing_only",
+                "no_model_conclusion",
+                "authentic_owner_review_pending"
+              ]
+            },
+            "text": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/definitions/fixtureDocument"
+    },
+    {
+      "$ref": "#/definitions/evaluationReport"
+    }
+  ]
+}

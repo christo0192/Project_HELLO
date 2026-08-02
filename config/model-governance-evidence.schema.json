@@ -1,0 +1,146 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "model-governance-evidence.schema.json",
+  "title": "Model Governance Provider Evidence Register Contract",
+  "description": "Machine-checkable contract for the LLM-05 provider evidence register (PR-A Lane A2). Every entry records repository-only evidence status slots (region, retention, subprocessors, endpoints, DPA, residency, approval) for current providers (anthropic, sarvam, silero, livekit, supabase) and optional-comparison providers (gemini, deepseek). Allowed statuses are PENDING and OWNER_VERIFY only: no endpoint, residency, or DPA approval exists in repository-only work. Endpoint placeholders are closed uppercase tokens; real endpoints are never stored here. Latency is not residency: numeric latency-like status values are rejected. Approval statuses are closed to PENDING and OWNER_VERIFY only: the repository status validator and register validator reject any APPROVED/DEPLOYED/ACCEPTED/winner approval claim unconditionally \u2014 no EV-xxxx/UUID/ownerEvidenceRefs string can authorize it, because repository-only work carries no authentic external evidence.",
+  "type": "object",
+  "definitions": {
+    "entry": {
+      "description": "One provider evidence entry. All seven evidence status slots are closed to repository-only states (PENDING or OWNER_VERIFY); approval claims are rejected unconditionally with no evidence-reference escape. endpointPlaceholder, when present, is a closed uppercase token (never a URL, path, or credential).",
+      "type": "object",
+      "required": [
+        "id",
+        "provider",
+        "category",
+        "regionStatus",
+        "dataRetentionStatus",
+        "subprocessorsStatus",
+        "endpointStatus",
+        "dpaStatus",
+        "residencyStatus",
+        "approvalStatus"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{0,99}$"
+        },
+        "provider": {
+          "enum": [
+            "anthropic",
+            "sarvam",
+            "silero",
+            "livekit",
+            "supabase",
+            "gemini",
+            "deepseek"
+          ]
+        },
+        "category": {
+          "enum": [
+            "current",
+            "optional_comparison"
+          ]
+        },
+        "regionStatus": {
+          "enum": [
+            "PENDING",
+            "OWNER_VERIFY"
+          ]
+        },
+        "dataRetentionStatus": {
+          "enum": [
+            "PENDING",
+            "OWNER_VERIFY"
+          ]
+        },
+        "subprocessorsStatus": {
+          "enum": [
+            "PENDING",
+            "OWNER_VERIFY"
+          ]
+        },
+        "endpointStatus": {
+          "enum": [
+            "PENDING",
+            "OWNER_VERIFY"
+          ]
+        },
+        "dpaStatus": {
+          "enum": [
+            "PENDING",
+            "OWNER_VERIFY"
+          ]
+        },
+        "residencyStatus": {
+          "enum": [
+            "PENDING",
+            "OWNER_VERIFY"
+          ]
+        },
+        "approvalStatus": {
+          "enum": [
+            "PENDING",
+            "OWNER_VERIFY"
+          ]
+        },
+        "endpointPlaceholder": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]{0,63}$"
+        },
+        "ownerEvidenceRefs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$"
+          }
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    },
+    "registerDocument": {
+      "description": "The full register: a versioned document carrying at least the five current providers and the two optional-comparison providers.",
+      "type": "object",
+      "required": [
+        "schema",
+        "schemaVersion",
+        "status",
+        "entries"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "model-governance-evidence.schema.json"
+        },
+        "schemaVersion": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "const": "proposed"
+        },
+        "description": {
+          "type": "string"
+        },
+        "entries": {
+          "type": "array",
+          "minItems": 7,
+          "items": {
+            "$ref": "#/definitions/entry"
+          }
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/definitions/registerDocument"
+    },
+    {
+      "$ref": "#/definitions/entry"
+    }
+  ]
+}

@@ -1,0 +1,83 @@
+name: Model governance
+
+# PR-A Phase 10 model-governance lane — bounded, offline, static validation.
+# No provider commands, no model downloads, no network evaluation, no
+# secrets. All action SHAs are pinned (no @v4-style tags).
+#
+# The broad API/worker test and coverage gates for every PR run in quality.yml
+# (which already exercises app/api/src/__tests__/model-governance*.test.ts and
+# app/voice-livekit/tests/test_model_governance*.py); this workflow adds the
+# model-governance-specific TypeScript vitest suites (A1/A2/A3 negative
+# controls), the status validator with its seeded negative controls, the
+# Python model-governance unit suite, current-state byte-identity, SAST,
+# and whitespace checks on the PR-A allowlist path set.
+
+on:
+  pull_request:
+    paths:
+      - 'app/api/src/model-governance/**'
+      - 'app/api/src/__tests__/model-governance*.test.ts'
+      - 'app/api/src/__tests__/fixtures/model-governance/**'
+      - 'app/voice-livekit/model_governance/**'
+      - 'app/voice-livekit/tests/test_model_governance*.py'
+      - 'config/model-governance*.schema.json'
+      - 'docs/model-governance/**'
+      - 'docs/runbooks/model-governance*.md'
+      - 'scripts/check-model-governance-status.mjs'
+      - 'scripts/check-model-governance-status.test.mjs'
+      - '.github/workflows/model-governance.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'app/api/src/model-governance/**'
+      - 'app/api/src/__tests__/model-governance*.test.ts'
+      - 'app/api/src/__tests__/fixtures/model-governance/**'
+      - 'app/voice-livekit/model_governance/**'
+      - 'app/voice-livekit/tests/test_model_governance*.py'
+      - 'config/model-governance*.schema.json'
+      - 'docs/model-governance/**'
+      - 'docs/runbooks/model-governance*.md'
+      - 'scripts/check-model-governance-status.mjs'
+      - 'scripts/check-model-governance-status.test.mjs'
+      - '.github/workflows/model-governance.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  model-governance:
+    name: model-governance
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository history (full depth for baseline diff)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: Model-governance status validator (baseline pass)
+        run: node scripts/check-model-governance-status.mjs
+      - name: Model-governance status validator negative controls (non-vacuity)
+        run: node scripts/check-model-governance-status.test.mjs
+      - name: TypeScript model-governance vitest suites (offline, lockfile install)
+        run: |
+          cd app/api
+          npm ci
+          npx vitest run src/__tests__/model-governance*.test.ts --reporter=dot
+      - name: Python model-governance unit tests (stdlib only, offline)
+        run: |
+          cd app/voice-livekit
+          python3 -m py_compile model_governance/provider_boundaries.py
+          python3 -m unittest discover -s tests -p 'test_model_governance*.py' -v
+      - name: Current-state byte-identity vs baseline
+        run: |
+          git diff --exit-code b3f1f301ecc2480f04e903e25248aa24c5472833 -- config/current-state.json
+          echo "config/current-state.json unchanged from baseline"
+      - name: Offline deterministic SAST
+        run: bash scripts/sast.sh
+      - name: Whitespace check
+        run: git diff --check
