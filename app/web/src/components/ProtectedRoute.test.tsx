@@ -25,6 +25,7 @@ function createMockAuth(overrides: Record<string, any> = {}) {
     user: null,
     session: null,
     aal: null as ('aal1' | 'aal2' | null),
+    role: null as ('admin' | 'interviewer' | 'viewer' | null),
     signIn: vi.fn(),
     signOut: vi.fn(),
     signInWithSSO: vi.fn(),
@@ -43,14 +44,21 @@ vi.mock('../lib/auth', () => ({
 
 // ── Test harness ───────────────────────────────────────────────────────
 
-function renderProtectedRoute(initialEntry = '/protected') {
+function renderProtectedRoute(initialEntry = '/protected', requireRole?: 'admin') {
+  const guard = requireRole ? (
+    <ProtectedRoute requireRole={requireRole} />
+  ) : (
+    <ProtectedRoute />
+  );
   return render(
     <MemoryRouter initialEntries={[initialEntry]}>
       <Routes>
-        <Route element={<ProtectedRoute />}>
+        <Route element={guard}>
           <Route path="/protected" element={<div data-testid="protected-content">Dashboard</div>} />
+          <Route path="/admin" element={<div data-testid="admin-content">Admin</div>} />
         </Route>
         <Route path="/login" element={<div data-testid="login-page">Login</div>} />
+        <Route path="/unauthorized" element={<div data-testid="unauthorized-page">Unauthorized</div>} />
         <Route path="/mfa/enroll" element={<div data-testid="mfa-enroll">MFA Enroll</div>} />
         <Route path="/mfa/challenge" element={<div data-testid="mfa-challenge">MFA Challenge</div>} />
       </Routes>
@@ -129,5 +137,42 @@ describe('ProtectedRoute', () => {
     const { container } = renderProtectedRoute();
 
     await expect(container).toHaveNoViolations();
+  });
+
+  // ── Phase 9 L4: role gate (UX only; APIs authoritative) ───────────
+  describe('requireRole gate (Phase 9)', () => {
+    function authedAal2() {
+      mockAuth.isLoading = false;
+      mockAuth.isAuthenticated = true;
+      mockAuth.needsMfa = false;
+      mockAuth.aal = 'aal2';
+      mockAuth.session = { access_token: 'tok' } as any;
+    }
+
+    it('fails closed while the authoritative role is unresolved (no content, no redirect)', () => {
+      authedAal2();
+      mockAuth.role = null;
+      renderProtectedRoute('/admin', 'admin');
+      expect(screen.getByText('Checking access…')).toBeInTheDocument();
+      expect(screen.queryByTestId('admin-content')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('unauthorized-page')).not.toBeInTheDocument();
+    });
+
+    it('renders admin content for an admin with resolved role', () => {
+      authedAal2();
+      mockAuth.role = 'admin';
+      renderProtectedRoute('/admin', 'admin');
+      expect(screen.getByTestId('admin-content')).toBeInTheDocument();
+    });
+
+    it('redirects non-admin to /unauthorized', async () => {
+      authedAal2();
+      mockAuth.role = 'interviewer';
+      renderProtectedRoute('/admin', 'admin');
+      await waitFor(() => {
+        expect(screen.getByTestId('unauthorized-page')).toBeInTheDocument();
+      });
+      expect(screen.queryByTestId('admin-content')).not.toBeInTheDocument();
+    });
   });
 });

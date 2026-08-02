@@ -30,6 +30,14 @@ import { createSession, transitionSession } from '../lib/session-lifecycle.js';
 import { getCorrelationId } from '../lib/correlation.js';
 import { handleRecordingGrant } from './invites.js';
 import { resolveWorkerContext } from '../lib/worker-context.js';
+import { createMaintenanceMiddleware } from '../lib/maintenance.js';
+import {
+  extractIdempotencyKey,
+  quotaEnforcementEnabled,
+  reserveQuota,
+  ResponseSentError,
+  runWithQuotaReservation,
+} from '../lib/quota.js';
 
 export const livekitRouter = Router();
 
@@ -116,125 +124,205 @@ function requireWorkerAuth(req: import('express').Request, res: import('express'
 //          Candidate join token is only available through successful
 //          one-time invite exchange → grant flow.
 // The recruiter receives session/room metadata to share the invite.
+//
+// Phase 9 L2 (invariant 10/11): gated by the fail-closed maintenance guard
+// for NEW work, and — when quota enforcement is configured (at least one
+// enabled quota_policy) — requires a bounded Idempotency-Key header,
+// reserves a slot BEFORE session creation, commits after success, and
+// releases on any failure (compensation). When no quota policy is enabled
+// (the default), legacy start behavior is preserved. Active-call turn/
+// finalization behavior is untouched.
 
-livekitRouter.post('/start', validateBody(livekitStartSchema), async (req, res, next) => {
-  try {
-    requireLiveKit();
-    const candidateId = req.body?.candidate_id as string;
-    if (!candidateId) return res.status(400).json({ error: 'candidate_id is required' });
-
-    const { data: candidate, error: candErr } = await supabase
-      .from('candidates')
-      .select('id, name, role_id, owner_id')
-      .eq('id', candidateId)
-      .single();
-    if (candErr || !candidate) return next(new Error('candidate not found'));
-
-    const recruiter = req.authUser;
-    if (!recruiter || (recruiter.appRole !== 'admin' && recruiter.appRole !== 'interviewer')) {
-      return res.status(403).json({ error: 'access_denied' });
-    }
-    if (recruiter.appRole === 'interviewer' && candidate.owner_id && candidate.owner_id !== recruiter.id) {
-      return res.status(403).json({ error: 'access_denied' });
-    }
-    if (recruiter.appRole === 'interviewer' && !candidate.owner_id) {
-      const { data: claimed, error: claimErr } = await supabase
-        .from('candidates')
-        .update({ owner_id: recruiter.id })
-        .eq('id', candidate.id)
-        .is('owner_id', null)
-        .select('id');
-      if (claimErr || !claimed || claimed.length !== 1) {
-        return res.status(409).json({ error: 'candidate_ownership_conflict' });
-      }
-    }
-
-    // REL-07: insert in `created` state.
-    const { data: session, error: insertErr } = await createSession({
-      candidate_id: candidate.id,
-      role_id: candidate.role_id,
-      mode: 'browser',
-      provider: 'livekit',
-    });
-    if (insertErr || !session) return next(insertErr ?? new Error('failed to create session'));
-
-    const { data: ownedSession, error: ownerErr } = await supabase
-      .from('call_sessions')
-      .update({ owner_id: recruiter.id })
-      .eq('id', session.id)
-      .is('owner_id', null)
-      .select('id');
-    if (ownerErr || !ownedSession || ownedSession.length !== 1) {
-      await transitionSession(session.id, 'created', 'failed', 'room_create_error');
-      return next(new Error('failed to assign session ownership'));
-    }
-
-    const roomName = `screening-${session.id}`;
-    const roomMetadata = buildMinimalRoomMetadata(session.id, roomName);
-    const rooms = new RoomServiceClient(env.livekitUrl, env.livekitApiKey, env.livekitApiSecret);
-
+livekitRouter.post(
+  '/start',
+  validateBody(livekitStartSchema),
+  createMaintenanceMiddleware({ allowAdmin: true }),
+  async (req, res, next) => {
     try {
-      try {
-        await rooms.createRoom({
-          name: roomName,
-          emptyTimeout: 10 * 60,
-          maxParticipants: 4,
-          metadata: roomMetadata,
+      requireLiveKit();
+      const candidateId = req.body?.candidate_id as string;
+      if (!candidateId) return res.status(400).json({ error: 'candidate_id is required' });
+
+      // Maintenance guard already ran (fail-closed on DB read). Check whether
+      // quota enforcement is configured (policies disabled by default).
+      const enforcement = await quotaEnforcementEnabled();
+      if (!enforcement.ok) {
+        // DB read failure → fail closed for new work.
+        return res.status(503).json({ error: 'service_unavailable' });
+      }
+
+      // Legacy (quota-unconfigured) path: unchanged start behavior.
+      const run = async (): Promise<void> => {
+        const { data: candidate, error: candErr } = await supabase
+          .from('candidates')
+          .select('id, name, role_id, owner_id')
+          .eq('id', candidateId)
+          .single();
+        if (candErr || !candidate) throw new Error('candidate not found');
+
+        const recruiter = req.authUser;
+        if (!recruiter || (recruiter.appRole !== 'admin' && recruiter.appRole !== 'interviewer')) {
+          res.status(403).json({ error: 'access_denied' });
+          throw new ResponseSentError();
+        }
+        if (recruiter.appRole === 'interviewer' && candidate.owner_id && candidate.owner_id !== recruiter.id) {
+          res.status(403).json({ error: 'access_denied' });
+          throw new ResponseSentError();
+        }
+        if (recruiter.appRole === 'interviewer' && !candidate.owner_id) {
+          const { data: claimed, error: claimErr } = await supabase
+            .from('candidates')
+            .update({ owner_id: recruiter.id })
+            .eq('id', candidate.id)
+            .is('owner_id', null)
+            .select('id');
+          if (claimErr || !claimed || claimed.length !== 1) {
+            res.status(409).json({ error: 'candidate_ownership_conflict' });
+            throw new ResponseSentError();
+          }
+        }
+
+        // REL-07: insert in `created` state.
+        const { data: session, error: insertErr } = await createSession({
+          candidate_id: candidate.id,
+          role_id: candidate.role_id,
+          mode: 'browser',
+          provider: 'livekit',
         });
-      } catch {
-        await rooms.updateRoomMetadata(roomName, roomMetadata);
-      }
-    } catch (roomErr) {
-      // REL-07: room creation failed — terminate the row.
-      const termResult = await transitionSession(
-        session.id, 'created', 'failed', 'room_create_error',
-      );
-      if (!termResult.ok && !termResult.conflict) {
-        return next(new Error('room creation failed and session could not be terminated — reconciliation required'));
-      }
-      return next(roomErr instanceof Error ? roomErr : new Error('LiveKit room creation failed'));
-    }
+        if (insertErr || !session) throw new Error('failed to create session');
 
-    // REL-07: room is ready — CAS created → waiting.
-    const tr = await transitionSession(session.id, 'created', 'waiting', undefined, {
-      external_call_id: roomName,
-    });
-    if (!tr.ok) {
-      let cleanupFailed = false;
-      try {
-        await rooms.deleteRoom(roomName);
-      } catch {
-        cleanupFailed = true;
-      }
-      if (tr.conflict) {
-        const baseMsg = 'session conflict: already transitioned';
-        if (cleanupFailed) return next(new Error(baseMsg + ' and orphan room cleanup failed — reconciliation required'));
-        return res.status(409).json({ error: baseMsg });
-      }
-      if (cleanupFailed) return next(new Error('room created but session could not be transitioned and room cleanup failed — reconciliation required'));
-      return next(new Error('room created but session could not be transitioned — reconciliation required'));
-    }
+        const { data: ownedSession, error: ownerErr } = await supabase
+          .from('call_sessions')
+          .update({ owner_id: recruiter.id })
+          .eq('id', session.id)
+          .is('owner_id', null)
+          .select('id');
+        if (ownerErr || !ownedSession || ownedSession.length !== 1) {
+          await transitionSession(session.id, 'created', 'failed', 'room_create_error');
+          throw new Error('failed to assign session ownership');
+        }
 
-    // Candidate status is best-effort.
-    {
-      const { error: cErr } = await supabase
-        .from('candidates')
-        .update({ status: 'screening' })
-        .eq('id', candidate.id);
-      void cErr; // Non-critical
-    }
+        const roomName = `screening-${session.id}`;
+        const roomMetadata = buildMinimalRoomMetadata(session.id, roomName);
+        const rooms = new RoomServiceClient(env.livekitUrl, env.livekitApiKey, env.livekitApiSecret);
 
-    // SEC-04: NO candidate join token returned here.
-    //          Recruiter gets only session/room identifiers.
-    res.status(201).json({
-      session_id: session.id,
-      room_name: roomName,
-      url: env.livekitUrl,
-    });
-  } catch (error) {
-    next(error);
-  }
-});
+        try {
+          try {
+            await rooms.createRoom({
+              name: roomName,
+              emptyTimeout: 10 * 60,
+              maxParticipants: 4,
+              metadata: roomMetadata,
+            });
+          } catch {
+            await rooms.updateRoomMetadata(roomName, roomMetadata);
+          }
+        } catch (roomErr) {
+          // REL-07: room creation failed — terminate the row.
+          const termResult = await transitionSession(
+            session.id, 'created', 'failed', 'room_create_error',
+          );
+          if (!termResult.ok && !termResult.conflict) {
+            throw new Error('room creation failed and session could not be terminated — reconciliation required');
+          }
+          throw roomErr instanceof Error ? roomErr : new Error('LiveKit room creation failed');
+        }
+
+        // REL-07: room is ready — CAS created → waiting.
+        const tr = await transitionSession(session.id, 'created', 'waiting', undefined, {
+          external_call_id: roomName,
+        });
+        if (!tr.ok) {
+          let cleanupFailed = false;
+          try {
+            await rooms.deleteRoom(roomName);
+          } catch {
+            cleanupFailed = true;
+          }
+          if (tr.conflict) {
+            const baseMsg = 'session conflict: already transitioned';
+            if (cleanupFailed) throw new Error(baseMsg + ' and orphan room cleanup failed — reconciliation required');
+            res.status(409).json({ error: baseMsg });
+            throw new ResponseSentError();
+          }
+          if (cleanupFailed) throw new Error('room created but session could not be transitioned and room cleanup failed — reconciliation required');
+          throw new Error('room created but session could not be transitioned — reconciliation required');
+        }
+
+        // Candidate status is best-effort.
+        {
+          const { error: cErr } = await supabase
+            .from('candidates')
+            .update({ status: 'screening' })
+            .eq('id', candidate.id);
+          void cErr; // Non-critical
+        }
+
+        // SEC-04: NO candidate join token returned here.
+        //          Recruiter gets only session/room identifiers.
+        res.status(201).json({
+          session_id: session.id,
+          room_name: roomName,
+          url: env.livekitUrl,
+        });
+      };
+
+      if (!enforcement.enabled) {
+        await run();
+        return;
+      }
+
+      // ── Quota enforcement: bounded Idempotency-Key required, reserve
+      // before create, commit after success, release on failure. Never
+      // double-reserves: a repeated key returns the SAME stable reservation.
+      const key = extractIdempotencyKey(req);
+      if (!key) {
+        return res.status(400).json({
+          error: { type: 'validation_error', message: 'Idempotency-Key header is required' },
+        });
+      }
+
+      const reservation = await reserveQuota({
+        requesterId: req.authUser!.id,
+        mode: 'live',
+        idempotencyKey: key,
+      });
+
+      if (reservation.status === 'rpc_error') {
+        return res.status(503).json({ error: 'quota_service_error' });
+      }
+      if (reservation.status === 'no_policy') {
+        return res.status(503).json({ error: 'quota_not_configured' });
+      }
+      if (reservation.status === 'quota_exceeded') {
+        return res.status(409).json({
+          error: 'quota_exceeded',
+          remaining_sessions: reservation.remainingSessions,
+          remaining_cost_units: reservation.remainingCostUnits,
+        });
+      }
+      if (reservation.status === 'duplicate') {
+        // Truthful retry semantics: existing-session response is NOT
+        // implemented (residual documented) — a repeated key returns a
+        // stable conflict and never double-reserves.
+        if (reservation.reservationStatus === 'committed') {
+          return res.status(409).json({ error: 'idempotency_replay' });
+        }
+        if (reservation.reservationStatus === 'reserved') {
+          return res.status(409).json({ error: 'request_in_flight' });
+        }
+        return res.status(409).json({ error: 'idempotency_key_exhausted' });
+      }
+
+      // reservation.status === 'ok' — proceed, commit after success, release
+      // on failure (compensates failed session creation).
+      const outcome = await runWithQuotaReservation(reservation, run);
+      if (outcome.handled) return; // response already sent by run()
+    } catch (error) {
+      next(error);
+    }
+  },
+);
 
 // ── Recruiter (non-grant) upload auth ────────────────────────────────
 // REC-03 (L5): the recording upload route is PUBLIC because grant-token

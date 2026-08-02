@@ -45,7 +45,17 @@ export type AuditEvent =
   | 'recording.integrity_verified'
   | 'recording.quarantined'
   | 'recording.revoked'
-  | 'recording.deleted';
+  | 'recording.deleted'
+  // Phase 9 L2 (additive): product-operations events. TS events may be
+  // dotted — createDbAuditSink persists them via replaceAll('.', '_') and
+  // the 0015 audit action CHECK allowlists the underscored forms.
+  | 'admin.session_override'
+  | 'admin.maintenance_toggle'
+  | 'admin.member_update'
+  | 'quota.override'
+  | 'notification.create'
+  | 'appeal.create'
+  | 'appeal.review';
 
 /** Events that, when they fail to record for a privileged mutation,
  *  should block the mutation (fail-closed). */
@@ -60,6 +70,11 @@ export const FAIL_CLOSED_EVENTS: ReadonlySet<string> = new Set([
   'recording.quarantined',
   'recording.revoked',
   'recording.deleted',
+  // Phase 9 L2: membership mutation is admin-mutating; a failed audit row
+  // must not silently leave an admin member change unrecorded. (The L2
+  // admin/appeal mutations are audited atomically inside their RPCs; this
+  // entry covers future TS-driven uses such as L3 notification hooks.)
+  'admin.member_update',
 ]);
 
 /** Events that are informational and must never cause a 500. */
@@ -80,6 +95,9 @@ export const FAIL_OPEN_EVENTS: ReadonlySet<string> = new Set([
   // integrity state itself is already persisted; a failed audit row must not
   // turn a successful upload into a 500.
   'recording.integrity_verified',
+  // Phase 9 L2: notification intents are informational (idempotent DB row;
+  // a failed audit row must never 500 the caller).
+  'notification.create',
 ]);
 
 // ── PII redaction patterns ──────────────────────────────────────────

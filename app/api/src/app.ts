@@ -13,6 +13,14 @@ import { recordingsRouter } from './routes/recordings.js';
 import { dsarRouter } from './routes/dsar.js';
 import { consentRouter } from './routes/consent.js';
 import { cspReportRouter } from './routes/csp.js';
+import { adminRouter } from './routes/admin.js';
+import { statusRouter } from './routes/status.js';
+import { meRouter } from './routes/me.js';
+import { notesRouter } from './routes/notes.js';
+import { candidateConsentRouter } from './routes/candidate-consent.js';
+import { notificationsRouter } from './routes/notifications.js';
+import { exportRouter } from './routes/export.js';
+import { appealsRouter } from './routes/appeals.js';
 import {
   malformedJsonHandler,
   oversizedJsonHandler,
@@ -244,9 +252,21 @@ export function createApp(opts: CreateAppOptions = {}) {
   // deliberately NOT added to the public allowlist. Legal D-010 remains an
   // unwaived go-live gate.
   app.use('/api/consent', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'consent:', useUserKey: true }));
+  // Phase 9 L2/L3/L4: mount rate limits for the new routers. Public
+  // candidate-facing paths (candidate-consent, appeals) get the strict
+  // per-IP/per-user bucket; recruiter/admin paths use the default bucket.
+  app.use('/api/admin', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'admin:', useUserKey: true }));
+  app.use('/api/me', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'me:', useUserKey: true }));
+  app.use('/api/status', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'status:', useUserKey: true }));
+  app.use('/api/notes', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'notes:', useUserKey: true }));
+  app.use('/api/candidate-consent', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'candidate-consent:', useUserKey: true }));
+  app.use('/api/notifications', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'notifications:', useUserKey: true }));
+  app.use('/api/export', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'export:', useUserKey: true }));
+  app.use('/api/appeals', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'appeals:', useUserKey: true }));
 
-  // Public: health endpoint (no auth)
-  app.get('/api/health', (_req, res) => res.json({ ok: true, model: env.claudeModel }));
+  // Public: health endpoint (no auth). Bounded — `{ ok: true }` only, so
+  // no model/provider/internal dependency leaks to unauthenticated callers.
+  app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
   // CSP violation report endpoint: 64 KiB bound, runs before the
   // main JSON parser so oversized CSP reports are rejected at 64 KiB.
@@ -271,6 +291,18 @@ export function createApp(opts: CreateAppOptions = {}) {
   app.use('/api/dsar', dsarRouter);
   app.use('/api', consentRouter);
   app.use('/api/assess', assessRouter);
+
+  // Phase 9 L4 wiring: admin/status/me + L3 domain routers. Mounted after the
+  // global auth + viewer-read-only + rate-limit middleware; each router keeps
+  // its own per-route role guards (admin/me enforce at the router boundary).
+  app.use('/api/admin', adminRouter);
+  app.use('/api/status', statusRouter);
+  app.use('/api/me', meRouter);
+  app.use('/api/notes', notesRouter);
+  app.use('/api/candidate-consent', candidateConsentRouter);
+  app.use('/api/notifications', notificationsRouter);
+  app.use('/api/export', exportRouter);
+  app.use('/api/appeals', appealsRouter);
 
   // ── 401/403/429 error paths still carry existing headers (CORS/CSP) ─
   // Handled inline by the auth/rate-limit middleware, no stack traces.

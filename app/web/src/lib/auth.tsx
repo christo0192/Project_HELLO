@@ -32,11 +32,13 @@ import {
 } from 'react';
 import type { AuthError, Session, User } from '@supabase/supabase-js';
 import { supabase } from './supabase';
+import { api } from '../api';
 import { AUTH_UNAUTHORIZED_EVENT } from './api-client';
 
 /* ── Types ─────────────────────────────────────────────────────────── */
 
 export type AAL = 'aal1' | 'aal2' | null;
+export type MembershipRole = 'admin' | 'interviewer' | 'viewer';
 
 export interface MfaFactor {
   id: string;
@@ -58,6 +60,12 @@ export interface AuthState {
   isAuthenticated: boolean;
   /** Enrolled MFA factors (populated after sign-in). */
   factors: MfaFactor[];
+  /**
+   * Authoritative role from GET /api/me (membership resolver), loaded only
+   * after an AAL2 session. Never derived from editable app_metadata. Null
+   * while unresolved or when /api/me failed (fail closed).
+   */
+  role: MembershipRole | null;
 
   /** Sign in with email and password. */
   signIn: (email: string, password: string) => Promise<{ error: AuthError | null }>;
@@ -77,7 +85,7 @@ export interface AuthState {
     error: AuthError | null;
     verified: boolean;
   }>;
-  /** Refresh the AAL and factors after MFA verification. */
+  /** Refresh the AAL, factors, and authoritative role after MFA verification. */
   refreshSession: () => Promise<void>;
 }
 
@@ -131,12 +139,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [aal, setAal] = useState<AAL>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [factors, setFactors] = useState<MfaFactor[]>([]);
+  const [role, setRole] = useState<MembershipRole | null>(null);
   const subscriptionRef = useRef<{ unsubscribe: () => void } | null>(null);
 
   const needsMfa = aal === 'aal1' && session !== null;
   const isAuthenticated = aal === 'aal2' && session !== null;
 
-  /* ── Refresh session, AAL, and factors ─────────────────────────── */
+  /**
+   * Load the authoritative role/active from GET /api/me after an AAL2
+   * session. Never trusts editable app_metadata for role UX. Failures set
+   * role to null (fail closed — ProtectedRoute shows a safe state).
+   */
+  const refreshRole = useCallback(async (): Promise<void> => {
+    try {
+      const me = await api.getMe();
+      setRole(me.role);
+    } catch {
+      setRole(null);
+    }
+  }, []);
+
+  /* ── Refresh session, AAL, factors, and authoritative role ─────── */
   const refreshSession = useCallback(async () => {
     const {
       data: { session: currentSession },
@@ -150,10 +173,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (currentSession) {
       const verifiedFactors = await getVerifiedTotpFactors();
       setFactors(verifiedFactors);
+      if (level === 'aal2') {
+        await refreshRole();
+      } else {
+        setRole(null);
+      }
     } else {
       setFactors([]);
+      setRole(null);
     }
-  }, []);
+  }, [refreshRole]);
 
   /* ── Sign in ──────────────────────────────────────────────────── */
   const signIn = useCallback(
@@ -198,6 +227,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setUser(null);
     setAal(null);
     setFactors([]);
+    setRole(null);
     setIsLoading(false);
 
     await supabase.auth.signOut();
@@ -300,6 +330,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
         const verifiedFactors = await getVerifiedTotpFactors();
         if (!cancelled) setFactors(verifiedFactors);
+
+        if (level === 'aal2') {
+          try {
+            const me = await api.getMe();
+            if (!cancelled) setRole(me.role);
+          } catch {
+            if (!cancelled) setRole(null);
+          }
+        } else if (!cancelled) {
+          setRole(null);
+        }
       }
 
       if (!cancelled) setIsLoading(false);
@@ -332,17 +373,24 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (currentSession) {
         getAalLevel().then((level) => {
           setAal(level);
+          if (level === 'aal2') {
+            refreshRole();
+          } else {
+            setRole(null);
+          }
         });
         getVerifiedTotpFactors().then((verifiedFactors) => {
           setFactors(verifiedFactors);
         });
+      } else {
+        setRole(null);
       }
     });
 
     return () => {
       subscription.unsubscribe();
     };
-  }, []);
+  }, [refreshRole]);
 
   /* ── Memoised context value ───────────────────────────────────── */
   const value = useMemo<AuthState>(
@@ -354,6 +402,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       needsMfa,
       isAuthenticated,
       factors,
+      role,
       signIn,
       signOut,
       signInWithSSO,
@@ -369,6 +418,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       needsMfa,
       isAuthenticated,
       factors,
+      role,
       signIn,
       signOut,
       signInWithSSO,

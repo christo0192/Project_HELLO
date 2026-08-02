@@ -151,7 +151,7 @@ export interface Assessment {
 }
 
 export interface CandidateDetail {
-  candidate: Candidate;
+  candidate: Candidate & { decision_use_blocked_at?: string | null };
   sessions: Session[];
   assessments: Assessment[];
 }
@@ -201,7 +201,227 @@ export interface RecordingDownloadResponse {
 
 export interface HealthResult {
   ok: boolean;
-  model: string;
+}
+
+// ── Phase 9: status / me / admin / notes / consent / appeals ────────
+
+export interface PublicStatus {
+  status: 'ok' | 'maintenance' | 'degraded';
+  maintenance: {
+    enabled: boolean;
+    reason: string | null;
+    updated_at: string | null;
+  } | null;
+  updated_at: string;
+}
+
+export type MembershipRole = 'admin' | 'interviewer' | 'viewer';
+
+export interface MeResponse {
+  userId: string;
+  email: string | null;
+  role: MembershipRole;
+  active: boolean;
+}
+
+// ── Phase 9: candidate pre-join consent (invite-opaque) ─────────────
+
+export interface CandidateConsentStatusInput {
+  invite_token: string;
+}
+
+export interface CandidateConsentStatus {
+  has_consent: boolean;
+  template_version: string | null;
+  locale: string | null;
+  required_consents: string[];
+}
+
+export interface CandidateConsentTemplate {
+  version: string;
+  locale: string;
+  title: string;
+  body_md: string;
+  required_consents: string[];
+}
+
+export interface CandidateConsentSubmitInput {
+  invite_token: string;
+  template_version: string;
+  locale: string;
+  consents: string[];
+  status: 'granted' | 'declined';
+}
+
+export interface CandidateConsentSubmitResponse {
+  id: string;
+  status: 'granted' | 'declined';
+  consents: string[];
+  template_version: string;
+  locale: string;
+  created_at: string;
+}
+
+// ── Phase 9: recruiter notes + status transitions ───────────────────
+
+export interface Note {
+  id: string;
+  candidate_id: string;
+  author_id: string;
+  note: string;
+  created_at: string;
+}
+
+export interface NoteListResponse {
+  notes: Note[];
+}
+
+export interface StatusTransitionResponse {
+  ok: boolean;
+  from: string;
+  to: string;
+}
+
+// ── Phase 9: notification intents ───────────────────────────────────
+
+export interface NotificationIntent {
+  id: string;
+  kind: 'quota_warning' | 'assessment_ready' | 'appeal_resolved';
+  candidate_id: string | null;
+  consent_verified: boolean;
+  created_at: string;
+}
+
+export interface NotificationIntentListResponse {
+  intents: NotificationIntent[];
+}
+
+// ── Phase 9: appeals ────────────────────────────────────────────────
+
+export interface AppealRow {
+  id: string;
+  candidate_id: string;
+  session_id: string;
+  assessment_id: string | null;
+  category: string;
+  description: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AppealListResponse {
+  appeals: AppealRow[];
+}
+
+export interface AppealGrantResult {
+  appeal_grant_token: string;
+  expires_at: string;
+}
+
+export interface AppealCreateInput {
+  appeal_grant_token: string;
+  category: 'scoring' | 'recording' | 'accessibility' | 'other';
+  description: string;
+}
+
+export interface AppealCreateResponse {
+  ok: boolean;
+  appeal_id: string;
+}
+
+export interface AppealReviewInput {
+  to_status: 'under_review' | 'granted' | 'denied';
+  notes?: string;
+}
+
+// ── Phase 9: admin ──────────────────────────────────────────────────
+
+export interface AdminMember {
+  user_id: string;
+  role: MembershipRole;
+  active: boolean;
+}
+
+export interface AdminMemberUpdateInput {
+  role?: MembershipRole;
+  active?: boolean;
+}
+
+export interface AdminMaintenanceInput {
+  enabled: boolean;
+  reason: string;
+}
+
+export interface AdminSessionOverrideInput {
+  target_status: string;
+  reason: string;
+}
+
+export interface AdminAuditRow {
+  id: string;
+  action: string;
+  actor_type: string;
+  actor_id: string;
+  target_type: string;
+  target_id: string;
+  result: string;
+  created_at: string;
+}
+
+export interface AdminAuditListResponse {
+  audit: AdminAuditRow[];
+}
+
+export interface AdminSessionRow {
+  id: string;
+  candidate_id: string;
+  role_id: string | null;
+  status: string;
+  created_at: string;
+  started_at: string | null;
+  ended_at: string | null;
+}
+
+export interface AdminSessionListResponse {
+  sessions: AdminSessionRow[];
+}
+
+export interface QuotaPolicy {
+  id: string;
+  scope: 'global' | 'candidate';
+  scope_id: string | null;
+  mode: 'simulation' | 'live';
+  max_sessions: number | null;
+  max_cost_units: number | null;
+  cost_units_per_session: number | null;
+  warning_percentage: number | null;
+  period_days: number;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface QuotaPolicyListResponse {
+  policies: QuotaPolicy[];
+}
+
+export interface QuotaPolicyInput {
+  scope: 'global' | 'candidate';
+  scope_id?: string | null;
+  mode?: 'simulation' | 'live';
+  max_sessions?: number | null;
+  max_cost_units?: number | null;
+  cost_units_per_session?: number | null;
+  warning_percentage?: number | null;
+  period_days?: number;
+  enabled?: boolean;
+}
+
+export interface QuotaPolicyMutationResponse {
+  ok: boolean;
+  id: string;
+  created?: boolean;
 }
 
 // ── Consent types (GOV-03/GOV-08/GOV-09/GOV-10) ─────────────────────

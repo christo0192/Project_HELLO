@@ -10,9 +10,26 @@
  */
 
 import { apiClient, ApiError } from './lib/api-client';
+import { supabase } from './lib/supabase';
 import type {
+  AdminMaintenanceInput,
+  AdminAuditListResponse,
+  AdminMember,
+  AdminMemberUpdateInput,
+  AdminSessionListResponse,
+  AdminSessionOverrideInput,
+  AppealCreateInput,
+  AppealCreateResponse,
+  AppealGrantResult,
+  AppealListResponse,
+  AppealReviewInput,
   Assessment,
   Candidate,
+  CandidateConsentStatus,
+  CandidateConsentStatusInput,
+  CandidateConsentSubmitInput,
+  CandidateConsentSubmitResponse,
+  CandidateConsentTemplate,
   CandidateDetail,
   CandidateInviteExchangeResult,
   CandidateInviteResult,
@@ -25,12 +42,21 @@ import type {
   ConsentWithdrawInput,
   ConsentWithdrawResponse,
   HealthResult,
+  MeResponse,
+  Note,
+  NoteListResponse,
+  NotificationIntentListResponse,
+  PublicStatus,
+  QuotaPolicyInput,
+  QuotaPolicyListResponse,
+  QuotaPolicyMutationResponse,
   RecordingDownloadResponse,
   Role,
   RoleInput,
   SessionDetail,
   StartLiveKitResult,
   StartScreeningResult,
+  StatusTransitionResponse,
   TurnResult,
   UploadResumeResult,
 } from './types';
@@ -38,9 +64,52 @@ import type {
 export { ApiError };
 
 const request = apiClient.request;
+const BASE_URL = apiClient.BASE_URL;
+
+/**
+ * Fetch a raw text resource (CSV export) with the same in-memory bearer
+ * token attachment as apiClient. Never stores the token; the CSV text is
+ * returned to the caller which triggers a same-tab download.
+ */
+async function requestText(path: string, init?: RequestInit): Promise<string> {
+  let token: string | null = null;
+  try {
+    const result = await supabase.auth.getSession();
+    token = result?.data?.session?.access_token ?? null;
+  } catch {
+    token = null;
+  }
+  const headers: Record<string, string> = {
+    Accept: 'text/csv',
+    ...(init?.headers as Record<string, string> | undefined),
+  };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  const res = await fetch(`${BASE_URL}${path}`, { ...init, headers });
+  if (res.status === 401) {
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('auth:unauthorized'));
+    }
+  }
+  if (!res.ok) {
+    let message = `${res.status} ${res.statusText}`;
+    try {
+      const data = (await res.json()) as { error?: string; message?: string };
+      if (data?.error) message = data.error;
+      else if (data?.message) message = data.message;
+    } catch {
+      // non-JSON error body
+    }
+    throw new ApiError(message, res.status);
+  }
+  return res.text();
+}
 
 export const api = {
   health: () => request<HealthResult>('/api/health'),
+
+  // Phase 9: bounded public status + authoritative /api/me
+  status: () => request<PublicStatus>('/api/status'),
+  getMe: () => request<MeResponse>('/api/me'),
 
   // Roles
   listRoles: () => request<Role[]>('/api/roles'),
@@ -138,4 +207,120 @@ export const api = {
   /** Get active privacy notice templates (GOV-08). */
   getConsentTemplates: () =>
     request<ConsentTemplateResponse[]>('/api/consent/templates'),
+
+  // ── Phase 9: candidate pre-join consent (invite-opaque, public) ──
+
+  /** Bounded consent/template status for an opaque invite token. */
+  candidateConsentStatus: (body: CandidateConsentStatusInput) =>
+    request<CandidateConsentStatus>('/api/candidate-consent/status', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /** Active Legal-approved consent template for a bounded locale. */
+  getCandidateConsentTemplate: (locale: string) =>
+    request<CandidateConsentTemplate>(
+      `/api/candidate-consent/template?locale=${encodeURIComponent(locale)}`,
+    ),
+
+  /** Append-only consent grant/decline bound to the invite (never consumes it). */
+  submitCandidateConsent: (body: CandidateConsentSubmitInput) =>
+    request<CandidateConsentSubmitResponse>('/api/candidate-consent/submit', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  // ── Phase 9: recruiter notes + status transitions ────────────────
+
+  listNotes: (candidateId: string) =>
+    request<NoteListResponse>(
+      `/api/notes?candidate_id=${encodeURIComponent(candidateId)}`,
+    ),
+  addNote: (candidateId: string, note: string) =>
+    request<Note>('/api/notes', {
+      method: 'POST',
+      body: JSON.stringify({ candidate_id: candidateId, note }),
+    }),
+  updateCandidateStatus: (candidateId: string, status: string) =>
+    request<StatusTransitionResponse>(`/api/notes/${candidateId}/status`, {
+      method: 'POST',
+      body: JSON.stringify({ status }),
+    }),
+
+  // ── Phase 9: notification intents ────────────────────────────────
+
+  listNotificationIntents: () =>
+    request<NotificationIntentListResponse>('/api/notifications'),
+
+  // ── Phase 9: CSV scorecard export (ownership-scoped) ─────────────
+
+  exportCsv: (candidateId: string) => requestText(`/api/export/${candidateId}/csv`),
+
+  // ── Phase 9: appeals ─────────────────────────────────────────────
+
+  listAppeals: (candidateId: string) =>
+    request<AppealListResponse>(
+      `/api/appeals?candidate_id=${encodeURIComponent(candidateId)}`,
+    ),
+  issueAppealGrant: (candidateId: string, sessionId: string, expiresInHours: number) =>
+    request<AppealGrantResult>('/api/appeals/grants', {
+      method: 'POST',
+      body: JSON.stringify({
+        candidate_id: candidateId,
+        session_id: sessionId,
+        expires_in_hours: expiresInHours,
+      }),
+    }),
+  submitAppeal: (body: AppealCreateInput) =>
+    request<AppealCreateResponse>('/api/appeals', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  reviewAppeal: (appealId: string, body: AppealReviewInput) =>
+    request<{ ok: boolean }>(`/api/appeals/${appealId}/review`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  // ── Phase 9: admin operations ────────────────────────────────────
+
+  listAdminMembers: () => request<AdminMember[]>('/api/admin/members'),
+  updateAdminMember: (userId: string, body: AdminMemberUpdateInput) =>
+    request<{ ok: boolean }>(`/api/admin/members/${userId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+  toggleMaintenance: (body: AdminMaintenanceInput) =>
+    request<{ ok: boolean; enabled: boolean }>('/api/admin/maintenance', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  overrideSession: (sessionId: string, body: AdminSessionOverrideInput) =>
+    request<{ ok: boolean; prior_status?: string | null }>(
+      `/api/admin/sessions/${sessionId}/override`,
+      {
+        method: 'POST',
+        body: JSON.stringify(body),
+      },
+    ),
+  // Phase 9 review repair (OPS-01/OPS-05): admin audit / session / quota views
+  listAdminAudit: (limit = 50, offset = 0) =>
+    request<AdminAuditListResponse>(
+      `/api/admin/audit?limit=${limit}&offset=${offset}`,
+    ),
+  listAdminSessions: (status?: string) =>
+    request<AdminSessionListResponse>(
+      `/api/admin/sessions${status ? `?status=${encodeURIComponent(status)}` : ''}`,
+    ),
+  listAdminQuotas: () => request<QuotaPolicyListResponse>('/api/admin/quotas'),
+  createQuotaPolicy: (body: QuotaPolicyInput) =>
+    request<QuotaPolicyMutationResponse>('/api/admin/quotas', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  updateQuotaPolicy: (id: string, body: QuotaPolicyInput) =>
+    request<QuotaPolicyMutationResponse>(`/api/admin/quotas/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
 };

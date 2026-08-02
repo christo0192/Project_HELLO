@@ -73,6 +73,21 @@ vi.mock('../supabase', () => ({
   ),
 }));
 
+// Phase 9 L4: AuthProvider loads the authoritative role from /api/me after
+// an AAL2 session. The api module must be mocked so no real fetch happens.
+// Path is relative to this test file (src/lib/__tests__) → src/api.ts.
+const { getMe } = vi.hoisted(() => ({ getMe: vi.fn() }));
+vi.mock('../../api', () => ({
+  api: { getMe },
+  ApiError: class ApiError extends Error {
+    status: number;
+    constructor(message: string, status: number) {
+      super(message);
+      this.status = status;
+    }
+  },
+}));
+
 function setupMockSupabase() {
   mockSupabase = {
     auth: {
@@ -103,6 +118,7 @@ function TestConsumer() {
     isLoading,
     isAuthenticated,
     needsMfa,
+    role,
     signIn,
     signOut,
     enrollMfa,
@@ -119,6 +135,7 @@ function TestConsumer() {
       <div data-testid="aal">{aal ?? 'null'}</div>
       <div data-testid="authenticated">{isAuthenticated ? 'yes' : 'no'}</div>
       <div data-testid="needs-mfa">{needsMfa ? 'yes' : 'no'}</div>
+      <div data-testid="role">{role ?? 'null'}</div>
 
       <button
         data-testid="sign-in-btn"
@@ -163,6 +180,7 @@ describe('AuthProvider', () => {
   beforeEach(() => {
     setupMockSupabase();
     vi.clearAllMocks();
+    getMe.mockResolvedValue({ userId: 'user-1', email: 'recruiter@example.com', role: 'admin', active: true });
   });
 
   it('shows loading state initially, then transitions to no session', async () => {
@@ -210,6 +228,27 @@ describe('AuthProvider', () => {
       expect(screen.getByTestId('authenticated')).toHaveTextContent('yes');
       expect(screen.getByTestId('needs-mfa')).toHaveTextContent('no');
     });
+    // Authoritative role comes from /api/me, not app_metadata.
+    await waitFor(() => expect(screen.getByTestId('role')).toHaveTextContent('admin'));
+    expect(getMe).toHaveBeenCalled();
+  });
+
+  it('fails closed (role null) when /api/me cannot be loaded', async () => {
+    mockSupabase.auth.getSession = vi
+      .fn()
+      .mockResolvedValue({ data: { session: mockSession }, error: null });
+    mockSupabase.auth.mfa.getAuthenticatorAssuranceLevel = vi
+      .fn()
+      .mockResolvedValue(mockAal2Result);
+    mockSupabase.auth.mfa.listFactors = vi.fn().mockResolvedValue({
+      data: { all: [mockFactorVerified], totp: [mockFactorVerified], phone: [] },
+      error: null,
+    });
+    getMe.mockRejectedValue(new Error('api down'));
+
+    renderWithProvider();
+    await waitFor(() => expect(screen.getByTestId('aal')).toHaveTextContent('aal2'));
+    await waitFor(() => expect(screen.getByTestId('role')).toHaveTextContent('null'));
   });
 
   it('signs in and updates state', async () => {

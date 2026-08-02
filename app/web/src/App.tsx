@@ -16,6 +16,9 @@ import { RolesPage } from './pages/RolesPage';
 import { CandidatesPage } from './pages/CandidatesPage';
 import { CandidateDetailPage } from './pages/CandidateDetailPage';
 import { ScreeningPage } from './pages/ScreeningPage';
+import { StatusPage } from './pages/StatusPage';
+import { AppealPage } from './pages/AppealPage';
+import { AdminDashboardPage } from './pages/AdminDashboardPage';
 
 export default function App() {
   return (
@@ -28,6 +31,8 @@ export default function App() {
         <Route path="/unauthorized" element={<UnauthorizedPage />} />
         <Route path="/privacy-notice" element={<PrivacyNoticePage />} />
         <Route path="/candidate/join" element={<CandidateJoinPage />} />
+        <Route path="/status" element={<StatusPage />} />
+        <Route path="/appeal" element={<AppealPage />} />
 
         {/* Protected recruiter routes — AAL2 required */}
         <Route element={<ProtectedRoute />}>
@@ -38,6 +43,13 @@ export default function App() {
             <Route path="/candidates/:id" element={<CandidateDetailPage />} />
             <Route path="/screening/:sessionId" element={<ScreeningPage />} />
             <Route path="*" element={<Navigate to="/candidates" replace />} />
+          </Route>
+        </Route>
+
+        {/* Phase 9: admin dashboard — role-gated (UX only; APIs authoritative) */}
+        <Route element={<ProtectedRoute requireRole="admin" />}>
+          <Route element={<Layout />}>
+            <Route path="/admin" element={<AdminDashboardPage />} />
           </Route>
         </Route>
 

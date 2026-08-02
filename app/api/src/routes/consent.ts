@@ -47,12 +47,13 @@ export async function hasConsentFor(
   candidateId: string,
   required: ConsentType[],
 ): Promise<{ ok: boolean; missing: ConsentType[] }> {
-  // Fetch the latest active consent record for this candidate
+  // Fetch the LATEST consent record for this candidate REGARDLESS of status.
+  // A later declined/withdrawn/expired record overrides an older grant, so
+  // the status filter is deliberately applied in code, not in the query.
   const { data, error } = await supabase
     .from('consent_records')
     .select('consents, status, expires_at')
     .eq('candidate_id', candidateId)
-    .eq('status', 'granted')
     .order('created_at', { ascending: false })
     .limit(1)
     .single();
@@ -62,9 +63,9 @@ export async function hasConsentFor(
     return { ok: false, missing: required };
   }
 
-  // Defense-in-depth: never rely solely on the query's status filter. A
-  // declined or withdrawn record must never unlock any consent type, even if
-  // one reaches this code path. GOV-09: decline/withdraw fail closed.
+  // Defense-in-depth: the latest record must be an active grant. A declined
+  // or withdrawn record must never unlock any consent type, even if one
+  // reaches this code path. GOV-09: decline/withdraw fail closed.
   if (data.status !== 'granted') {
     return { ok: false, missing: required };
   }

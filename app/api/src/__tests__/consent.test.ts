@@ -194,6 +194,31 @@ describe('Consent API — GOV-03/GOV-08/GOV-09/GOV-10', () => {
       expect(result.ok).toBe(false);
       expect(result.missing).toContain('ai_interview');
     });
+
+    // Phase 9 L4 regression (invariant 4): hasConsentFor must fetch the LATEST
+    // consent record REGARDLESS of status — a later declined/withdrawn/expired
+    // record overrides an older grant. The status filter lives in code, not in
+    // the query, so an old grant can never resurface past a later decline.
+    it('queries the LATEST record regardless of status (later decline overrides older grant)', async () => {
+      mockEq.mockClear();
+      chainResolveValue = {
+        data: {
+          consents: ['ai_interview', 'recording'],
+          status: 'declined',
+          expires_at: null,
+        },
+        error: null,
+      };
+
+      const result = await hasConsentFor(CANDIDATE_ID, ['ai_interview']);
+
+      expect(result.ok).toBe(false);
+      // No status filter on the consent_records query — the latest record is
+      // the only thing that matters.
+      expect(mockEq).not.toHaveBeenCalledWith('status', 'granted');
+      // Ordering by created_at DESC is what makes "latest" authoritative.
+      expect(mockOrder).toHaveBeenCalledWith('created_at', { ascending: false });
+    });
   });
 
   // ── GOV-10: job_application alone cannot unlock AI/recording ────

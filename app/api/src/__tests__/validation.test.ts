@@ -299,8 +299,9 @@ describe('validation happy paths', () => {
 
   it('GET /api/health unchanged', async () => {
     const res = await $r(app).get('/api/health').expect(200);
-    expect(res.body.ok).toBe(true);
-    expect(res.body.model).toBe('haiku');
+    // Phase 9 L4: health is bounded to {ok:true} — no model/provider leakage.
+    expect(res.body).toEqual({ ok: true });
+    expect(res.body.model).toBeUndefined();
     expect(hasNoStacktrace(res)).toBe(true);
   });
 

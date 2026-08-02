@@ -28,6 +28,7 @@ import {
   inviteExchangeSchema,
 } from '../schemas/invites.js';
 import { createGrant } from '../lib/candidate-access.js';
+import { readMaintenanceState, maintenanceBlockedBody } from '../lib/maintenance.js';
 import type { InviteCreateResponse, InviteExchangeResponse } from '../schemas/invites.js';
 import { AccessToken, RoomServiceClient } from 'livekit-server-sdk';
 
@@ -158,6 +159,69 @@ invitesRouter.post(
   },
 );
 
+/**
+ * Phase 9 L4 — server-authoritative consent gate for the exchange route.
+ *
+ * Runs BEFORE the atomic invite-consume CAS so an unconsumed invite can be
+ * retried once consent is granted. Fails closed on:
+ *  - maintenance mode (new joins blocked; consent submission itself remains
+ *    allowed — this gate never touches consent writes),
+ *  - missing/inactive consent template,
+ *  - latest consent record NOT granted, or expired,
+ *  - granted consents missing a template-required type.
+ *
+ * The LATEST consent record is fetched REGARDLESS of status so a later
+ * declined/withdrawn/expired record overrides an older grant.
+ */
+async function checkExchangeConsentGate(invite: {
+  candidate_id: string;
+}): Promise<{ ok: true } | { ok: false; code: 'maintenance' | 'consent_required' }> {
+  const state = await readMaintenanceState();
+  if (!state.ok || state.enabled) {
+    // DB read failure also fails closed for a new-join gate.
+    return { ok: false, code: 'maintenance' };
+  }
+
+  // Latest record regardless of status — a later declined/withdrawn/expired
+  // record overrides an older grant.
+  const { data: latest } = await supabase
+    .from('consent_records')
+    .select('status, consents, expires_at')
+    .eq('candidate_id', invite.candidate_id)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  const hasValidGrant =
+    latest &&
+    latest.status === 'granted' &&
+    (!latest.expires_at || new Date(latest.expires_at) > new Date());
+
+  // Active Legal-approved template is required — absence fails closed.
+  const { data: template } = await supabase
+    .from('consent_templates')
+    .select('required_consents')
+    .eq('is_active', true)
+    .order('version', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (!hasValidGrant || !template) {
+    return { ok: false, code: 'consent_required' };
+  }
+
+  const granted: string[] = Array.isArray(latest.consents) ? latest.consents : [];
+  const required: string[] = Array.isArray(template.required_consents)
+    ? template.required_consents
+    : [];
+  const missing = required.filter((r) => !granted.includes(r));
+  if (missing.length > 0) {
+    return { ok: false, code: 'consent_required' };
+  }
+
+  return { ok: true };
+}
+
 // ── POST /api/livekit/exchange ───────────────────────────────────────
 // Candidate exchanges an invite token for a short-lived access grant.
 
@@ -191,6 +255,19 @@ invitesRouter.post(
       // Check not consumed and not revoked (NULL checks)
       if (invite.consumed_at !== null || invite.revoked_at !== null) {
         return res.status(404).json({ error: STABLE_EXPIRY_MSG });
+      }
+
+      // Phase 9 L4: server-authoritative consent gate BEFORE the atomic CAS
+      // consume. Maintenance blocks new joins (503) and missing/declined/
+      // withdrawn/expired consent or a missing/inactive template fails closed
+      // (409 consent_required). In both cases the invite is left unconsumed so
+      // a later grant/retry can still succeed.
+      const gate = await checkExchangeConsentGate(invite);
+      if (!gate.ok) {
+        if (gate.code === 'maintenance') {
+          return res.status(503).json(maintenanceBlockedBody());
+        }
+        return res.status(409).json({ error: 'consent_required' });
       }
 
       // Step 2: Atomic CAS — update consumed_at where consumed_at IS NULL.

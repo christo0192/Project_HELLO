@@ -1,30 +1,40 @@
 import { useEffect, useState } from 'react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { api } from '../api';
-import { useAuth } from '../lib/auth';
+import { useAuth, type MembershipRole } from '../lib/auth';
 
-const navItems = [
+const baseNavItems = [
   { to: '/roles', label: 'Roles', icon: BriefcaseIcon },
   { to: '/candidates', label: 'Candidates', icon: UsersIcon },
 ];
 
-export function Layout() {
-  const { user, signOut, isAuthenticated } = useAuth();
-  const navigate = useNavigate();
-  const [model, setModel] = useState<string | null>(null);
-  const [online, setOnline] = useState<boolean | null>(null);
+function navItemsForRole(role: MembershipRole | null) {
+  const items = [...baseNavItems];
+  if (role === 'admin') {
+    items.push({ to: '/admin', label: 'Admin', icon: ShieldIcon });
+  }
+  return items;
+}
 
+export function Layout() {
+  const { user, signOut, isAuthenticated, role } = useAuth();
+  const navigate = useNavigate();
+  const [status, setStatus] = useState<'checking' | 'online' | 'maintenance' | 'offline'>('checking');
+
+  // Phase 9 L4: bounded /api/status only — no model/provider display, no fake
+  // alert/provider sync.
   useEffect(() => {
     let cancelled = false;
     api
-      .health()
-      .then((h) => {
+      .status()
+      .then((s) => {
         if (cancelled) return;
-        setOnline(h.ok);
-        setModel(h.model);
+        if (s.status === 'maintenance') setStatus('maintenance');
+        else if (s.status === 'ok') setStatus('online');
+        else setStatus('offline');
       })
       .catch(() => {
-        if (!cancelled) setOnline(false);
+        if (!cancelled) setStatus('offline');
       });
     return () => {
       cancelled = true;
@@ -35,6 +45,8 @@ export function Layout() {
     await signOut();
     navigate('/login', { replace: true });
   }
+
+  const navItems = navItemsForRole(role);
 
   return (
     <div className="flex min-h-screen">
@@ -78,26 +90,25 @@ export function Layout() {
           <div className="flex items-center gap-2">
             <span
               className={`h-2 w-2 rounded-full ${
-                online === null
+                status === 'checking'
                   ? 'bg-gray-300'
-                  : online
+                  : status === 'online'
                     ? 'bg-emerald-500'
-                    : 'bg-red-500'
+                    : status === 'maintenance'
+                      ? 'bg-amber-500'
+                      : 'bg-red-500'
               }`}
             />
             <span className="text-xs text-gray-500">
-              {online === null
+              {status === 'checking'
                 ? 'Checking…'
-                : online
+                : status === 'online'
                   ? 'API online'
-                  : 'API offline'}
+                  : status === 'maintenance'
+                    ? 'Maintenance'
+                    : 'API offline'}
             </span>
           </div>
-          {model && (
-            <p className="mt-1 truncate text-[11px] text-gray-400" title={model}>
-              {model}
-            </p>
-          )}
 
           {isAuthenticated && (
             <button
@@ -116,6 +127,14 @@ export function Layout() {
         </div>
       </main>
     </div>
+  );
+}
+
+function ShieldIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+    </svg>
   );
 }
 
