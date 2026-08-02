@@ -228,6 +228,8 @@ create table if not exists screening_v2.quota_reservations (
                        on delete cascade,
   scope_id             uuid,
   requester_id         uuid not null,
+  mode                 text not null,
+  period_start         date not null,
   idempotency_key      text not null,
   sessions_reserved    integer not null default 1,
   cost_units_reserved  integer not null default 0,
@@ -235,21 +237,23 @@ create table if not exists screening_v2.quota_reservations (
   reserved_at          timestamptz not null default now(),
   committed_at         timestamptz,
   released_at          timestamptz,
-  constraint uq_quota_reservations_idempotency unique (requester_id, idempotency_key),
+  constraint uq_quota_reservations_idempotency unique (requester_id, mode, idempotency_key),
   constraint chk_quota_reservations_idempotency_length check (length(idempotency_key) between 1 and 128),
   constraint chk_quota_reservations_status check (status in ('reserved','committed','released')),
+  constraint chk_quota_reservations_mode check (mode in ('simulation','live')),
   constraint chk_quota_reservations_sessions check (sessions_reserved >= 1),
   constraint chk_quota_reservations_cost check (cost_units_reserved >= 0)
 );
 
 comment on table screening_v2.quota_reservations is
-  'Exactly-one reservation per (requester, bounded Idempotency-Key). '
-  'requester_id is the authenticated recruiter UUID — the same key from '
-  'different recruiters never collides. status flow: '
-  'reserved -> committed (session created, usage incremented) or '
-  'reserved -> released (session creation failed, no usage increment). '
-  'A committed/released reservation is terminal; a repeated key returns the '
-  'same stable reservation (never double-reserves).';
+  'Exactly-one reservation per (requester, mode, bounded Idempotency-Key). '
+  'requester_id is the authenticated recruiter UUID. mode is simulation|live '
+  '(same requester+key with different mode never collides). period_start is '
+  'the authoritative anchored-bucket date persisted at reservation time — '
+  'commit_quota_reservation uses it directly so 7/30-day caps never forget '
+  'committed usage. status flow: reserved -> committed (usage incremented) '
+  'or reserved -> released (compensation, no usage increment). Terminal '
+  'states replay the same stable reservation (never double-counts).';
 
 create index if not exists idx_v2_quota_reservations_policy
   on screening_v2.quota_reservations (policy_id, status);
@@ -561,12 +565,24 @@ declare
   v_period_days integer;
   v_epoch_offset integer;
 begin
-  -- Requester-scoped idempotency: a repeated key from the SAME requester
-  -- returns the stable reservation. Different requesters with the same key
-  -- never collide (unique constraint is on (requester_id, idempotency_key)).
+  -- Defensive validation: never trust the caller for internal state.
+  if p_requester_id is null then
+    return jsonb_build_object('status', 'requester_required', 'allowed', false);
+  end if;
+  if p_mode not in ('simulation', 'live') then
+    return jsonb_build_object('status', 'invalid_mode', 'allowed', false);
+  end if;
+  if p_idempotency_key is null or length(p_idempotency_key) < 1
+     or length(p_idempotency_key) > 128 then
+    return jsonb_build_object('status', 'invalid_idempotency_key', 'allowed', false);
+  end if;
+
+  -- Requester+mode-scoped idempotency: same requester + same mode + same key
+  -- converges. Same requester+same key+different mode is independent.
   select * into v_existing
     from screening_v2.quota_reservations
    where requester_id = p_requester_id
+     and mode = p_mode
      and idempotency_key = p_idempotency_key;
   if found then
     return jsonb_build_object(
@@ -670,13 +686,15 @@ begin
     );
   end if;
 
-  -- Create the reservation (exactly one per (requester, key) pair).
+  -- Create the reservation (exactly one per (requester, mode, key)).
+  -- mode and period_start are persisted authoritatively — commit uses the
+  -- saved period_start directly so 7/30-day caps never forget usage.
   insert into screening_v2.quota_reservations
-    (policy_id, scope_id, requester_id, idempotency_key,
-     sessions_reserved, cost_units_reserved, status)
+    (policy_id, scope_id, requester_id, mode, period_start,
+     idempotency_key, sessions_reserved, cost_units_reserved, status)
   values
-    (v_policy.id, v_usage_scope_id, p_requester_id, p_idempotency_key,
-     1, v_cost_units, 'reserved')
+    (v_policy.id, v_usage_scope_id, p_requester_id, p_mode, v_period_start,
+     p_idempotency_key, 1, v_cost_units, 'reserved')
   returning id into v_reservation_id;
 
   -- Warning percentage (only when the policy configures it; null => no warn).
@@ -714,16 +732,16 @@ grant execute on function screening_v2.check_and_reserve_quota(uuid, text, text)
   to service_role;
 
 comment on function screening_v2.check_and_reserve_quota is
-  'Atomic quota check/reserve keyed by a (requester, bounded Idempotency-Key) '
-  'pair. Requester is the authenticated recruiter UUID — the same key from '
-  'different recruiters never collides. Resolves recruiter-specific policy '
-  'first, global fallback. Global usage aggregates under a NULL scope row. '
-  'Period buckets are anchored to a stable epoch (2000-01-01) so 7/30-day '
-  'windows do NOT reset daily. Locks the matched enabled policy + usage row, '
-  'projects COMMITTED usage PLUS pending reservations so two concurrent '
-  'requests for the final slot cannot both reserve, checks both max_sessions '
-  'and max_cost_units. Cost units from the policy — never from the client. '
-  'warning_reached only when warning_percentage is non-null. Service-role-only.';
+  'Atomic quota check/reserve keyed by a (requester, mode, bounded '
+  'Idempotency-Key) triple. Requester is the authenticated recruiter UUID. '
+  'Same requester+same key+same mode converges; same requester+same key+'
+  'different mode is independent. Resolves recruiter-specific policy first, '
+  'global fallback. Global usage aggregates under a NULL scope row. Period '
+  'buckets are anchored to epoch 2000-01-01. mode and period_start are '
+  'persisted on the reservation row — commit_quota_reservation reads '
+  'period_start directly so 7/30-day caps never forget committed usage. '
+  'Cost units from the policy — never from the client. warning_reached only '
+  'when warning_percentage is non-null. Service-role-only.';
 
 -- ───────────────────────────────────────────────────────────────────────
 -- 10b. commit_quota_reservation — idempotent CAS reserved->committed,
@@ -764,8 +782,10 @@ begin
      set status = 'committed', committed_at = now()
    where id = p_reservation_id;
 
-  -- Increment usage in the reservation's own period (atomic upsert).
-  v_period_start := date_trunc('day', v_res.reserved_at)::date;
+  -- Authoritative anchored period from the reservation row (never recompute
+  -- daily). This is the SAME bucket used by check_and_reserve_quota, so
+  -- committed usage always lands in the correct 7/30-day window.
+  v_period_start := v_res.period_start;
   insert into screening_v2.quota_usage
     (policy_id, scope_id, period_start, sessions_used, cost_units_used)
   values
