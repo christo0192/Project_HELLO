@@ -1,0 +1,144 @@
+{
+  "schema": "model-governance-fairness.schema.json",
+  "schemaVersion": 1,
+  "status": "proposed",
+  "minimumN": 3,
+  "description": "Synthetic, de-identified voluntary cohort fixture for the LLM-07 fairness harness (PR-A Lane A3). All members are fabricated; every cohort label is explicitly voluntary (declared and consented) or synthetic_fixture. cohort-a (2 members) is below the minimum-N suppression threshold; member-011 and member-012 carry no voluntary label and are excluded from cohort metrics, never inferred. No protected trait is derived from voice, name, accent, transcript, language, or metadata anywhere in this file.",
+  "manifest": {
+    "algorithm": "sha256",
+    "digests": {
+      "member-001": "329f35c975bbc8b5784f2fa74e807478f7d27f1b7d14fe52b64462789ee3978a",
+      "member-002": "26e52e3262710630e8bd7f99bf21ac41ae3f9c196790bd8203fb35b25aee110d",
+      "member-003": "40104acc5f60e71c81cd12d04792c5c32cac30fceeb9dd622a60d4da080cd8aa",
+      "member-004": "0b65c89dc6731d03d768fc33e7f5b750a1386b9230914a243c71f95f2f05c4a1",
+      "member-005": "147b9906116fdd86f33fce1ac67346e192af315a05b4072acf1e0b4db8c20166",
+      "member-006": "7a6aae4ae8eefc50224bcab89f0c8395ec0216c08cfeeed5388bfedaac33be3b",
+      "member-007": "b7e6229e8f59e7c7b3c09237da5f9b97b1b1e7d14999af11552b117b0dab0bd5",
+      "member-008": "ce2320f69afa28f47d3284f881c9ad62bc77c4f6d1ec15e88a15e11fed2df881",
+      "member-009": "fa58b65e5984e2462b103ad076d118619d2d39ea872b1deede256472978045f2",
+      "member-010": "d31926e6b90cf70891d48f89fd74979ba9d63a74a8074fa182e7a1bc5f66b0b9",
+      "member-011": "f95f55fe8c8730294df65f6865a3c82edea77cea0923f0b9aedc5b4aa98582a3",
+      "member-012": "0c436644175c446e2a8dc57992939be942583c057fb6d4147bc4513d087b405c"
+    }
+  },
+  "members": [
+    {
+      "memberId": "member-001",
+      "voluntaryLabel": {
+        "declared": true,
+        "cohortId": "cohort-a",
+        "declarationSource": "voluntary_self_declared",
+        "consented": true
+      },
+      "observedScore": 7.5,
+      "confidence": 0.9
+    },
+    {
+      "memberId": "member-002",
+      "voluntaryLabel": {
+        "declared": true,
+        "cohortId": "cohort-a",
+        "declarationSource": "voluntary_self_declared",
+        "consented": true
+      },
+      "observedScore": 6,
+      "confidence": 0.8
+    },
+    {
+      "memberId": "member-003",
+      "voluntaryLabel": {
+        "declared": true,
+        "cohortId": "cohort-b",
+        "declarationSource": "voluntary_self_declared",
+        "consented": true
+      },
+      "observedScore": 8,
+      "confidence": 0.85
+    },
+    {
+      "memberId": "member-004",
+      "voluntaryLabel": {
+        "declared": true,
+        "cohortId": "cohort-b",
+        "declarationSource": "voluntary_self_declared",
+        "consented": true
+      },
+      "observedScore": 7,
+      "confidence": 0.7
+    },
+    {
+      "memberId": "member-005",
+      "voluntaryLabel": {
+        "declared": true,
+        "cohortId": "cohort-b",
+        "declarationSource": "voluntary_self_declared",
+        "consented": true
+      },
+      "observedScore": 6.5,
+      "confidence": 0.75
+    },
+    {
+      "memberId": "member-006",
+      "voluntaryLabel": {
+        "declared": true,
+        "cohortId": "cohort-b",
+        "declarationSource": "voluntary_self_declared",
+        "consented": true
+      },
+      "observedScore": 7.5,
+      "confidence": 0.8
+    },
+    {
+      "memberId": "member-007",
+      "voluntaryLabel": {
+        "declared": true,
+        "cohortId": "cohort-b",
+        "declarationSource": "voluntary_self_declared",
+        "consented": true
+      },
+      "observedScore": 8.5,
+      "confidence": 0.95
+    },
+    {
+      "memberId": "member-008",
+      "voluntaryLabel": {
+        "declared": true,
+        "cohortId": "cohort-c",
+        "declarationSource": "voluntary_self_declared",
+        "consented": true
+      },
+      "observedScore": 5,
+      "confidence": 0.6
+    },
+    {
+      "memberId": "member-009",
+      "voluntaryLabel": {
+        "declared": true,
+        "cohortId": "cohort-c",
+        "declarationSource": "voluntary_self_declared",
+        "consented": true
+      },
+      "observedScore": 5.5,
+      "confidence": 0.65
+    },
+    {
+      "memberId": "member-010",
+      "voluntaryLabel": {
+        "declared": true,
+        "cohortId": "cohort-c",
+        "declarationSource": "voluntary_self_declared",
+        "consented": true
+      },
+      "observedScore": 6,
+      "confidence": 0.7
+    },
+    {
+      "memberId": "member-011",
+      "observedScore": 8
+    },
+    {
+      "memberId": "member-012",
+      "observedScore": 4
+    }
+  ]
+}
