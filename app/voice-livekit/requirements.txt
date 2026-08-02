@@ -1,0 +1,31 @@
+# Direct runtime dependencies for the LiveKit Agents voice worker (agent.py).
+#
+# Pinned EXACTLY to the versions observed in the working-tree environment
+# (2026-08-02, livekit-agents 1.6.4 series). This is a direct-pin file, NOT a
+# full lock: transitive dependencies are resolved by pip at install time, so
+# the transitive closure is not claimed to be reproducible byte-for-byte.
+#
+# Python compatibility (verified 2026-08-02 from public PyPI metadata,
+# no login, no env values read):
+#   livekit-agents            requires-python <3.15,>=3.10  -> 3.12 OK
+#   livekit-plugins-sarvam    requires-python >=3.10.0      -> 3.12 OK
+#   livekit-plugins-anthropic requires-python >=3.10.0      -> 3.12 OK
+#   livekit-plugins-silero    requires-python >=3.10.0      -> 3.12 OK
+#   livekit-plugins-turn-detector requires-python >=3.10.0  -> 3.12 OK
+#   python-dotenv             requires-python >=3.10        -> 3.12 OK
+#   supabase                  requires-python >=3.9         -> 3.12 OK
+#   httpx                     requires-python >=3.8         -> 3.12 OK
+#
+# Closure notes (verified from PyPI requires_dist, 2026-08-02):
+#   supabase==2.31.0 pins httpx<0.29,>=0.26, so httpx==0.28.1 is in range.
+#   livekit-plugins-sarvam depends on livekit-agents[codecs,openai]>=1.6.4.
+#   livekit-plugins-turn-detector and livekit-plugins-silero are required by
+#   agent.py imports (MultilingualModel; silero.VAD) and are pinned directly.
+livekit-agents==1.6.4
+livekit-plugins-anthropic==1.6.4
+livekit-plugins-sarvam==1.6.4
+livekit-plugins-silero==1.6.4
+livekit-plugins-turn-detector==1.6.4
+python-dotenv==1.2.2
+supabase==2.31.0
+httpx==0.28.1
