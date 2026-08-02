@@ -1,0 +1,63 @@
+{
+  "manifestVersion": "1.0.0",
+  "version": "1.0.0",
+  "contractKind": "lch02-launch-execution-contract",
+  "title": "LCH-02 launch execution contract (repository-only template)",
+  "description": "Repository-only LCH-02 launch execution contract (PLAN.md section 8 LCH-02). Fillable foundation only: nothing is deployed, no launch session exists, no on-call is active, no dashboard is monitored, and rollback authority is PENDING. This fixture is a template — it does not claim deployment, a first session, or production readiness. The Phase 11 DEP-06 release record (infra/deployment-contracts/release-record.example.json) is the release state machine instance and stays prepared; this contract references it and does not fork it. It does not modify or duplicate config/current-state.json, which remains the authoritative source of truth (0/17 gates complete, 0/14 phases accepted, production pre-production, dataStage synthetic-only, scope browser-only).",
+  "authority": {
+    "source": "config/current-state.json",
+    "role": "authoritative-source-of-truth",
+    "releaseRecordReference": "infra/deployment-contracts/release-record.example.json",
+    "deploymentManifestReference": "infra/deployment-contracts/manifest.json",
+    "releaseValidatorReference": "scripts/validate-deployment-release",
+    "note": "current-state remains the authoritative manifest; this contract never overrides it. Phase 12 references the Phase 11 DEP-06 release state machine and validator; rollback compatibility is checked against the repository migrations registry only, with no invented live target."
+  },
+  "deployment": {
+    "deployed": false,
+    "stage": "NOT_DEPLOYED",
+    "releaseState": "PENDING",
+    "stateMachine": {
+      "reference": "infra/deployment-contracts/release-record.example.json",
+      "validator": "scripts/validate-deployment-release",
+      "allowedTransitions": "prepared → staging_verified → canary_observing → promote_pending → promoted | rollback_required → rolled_back | aborted",
+      "forked": false
+    },
+    "launchSessionId": null,
+    "launchWindow": "PENDING"
+  },
+  "firstSession": {
+    "firstSessionCompleted": false,
+    "firstRealSessionCompleted": false,
+    "firstSessionEvidence": "PENDING",
+    "sessionId": null,
+    "recordedAt": null
+  },
+  "onCall": {
+    "onCallActive": false,
+    "onCallRoster": "PENDING",
+    "escalationPath": "PENDING",
+    "onCallEvidence": "PENDING"
+  },
+  "rollback": {
+    "rollbackAuthority": "PENDING",
+    "authorizedBy": null,
+    "decisionDate": null,
+    "plan": "PENDING",
+    "targetKind": "repository-marker",
+    "targetReference": "infra/deployment-contracts/manifest.json (migrations registry)",
+    "compatibilityCheck": "scripts/validate-deployment-release (Phase 11 DEP-06 validator)"
+  },
+  "monitoring": {
+    "dashboardMonitored": false,
+    "endpoint": null,
+    "observabilityConnected": false,
+    "alertsActive": false,
+    "status": "NOT_ACTIVE"
+  },
+  "evidence": {
+    "evidenceType": "synthetic_local",
+    "status": "PENDING",
+    "note": "Repository-only fixture; no authentic external evidence exists and none is claimed. No evidence path, session identifier, or monitoring endpoint is recorded.",
+    "paths": []
+  }
+}

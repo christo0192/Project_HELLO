@@ -1,0 +1,34 @@
+{
+  "manifestVersion": "1.0.0",
+  "version": "1.0.0",
+  "drillKind": "lch03-hypercare-synthetic-sessions",
+  "title": "LCH-03 hypercare drill fixture — 200 synthetic sessions (above declared threshold)",
+  "description": "Deterministic above-threshold pass for the LCH-03 synthetic hypercare drill. syntheticSessionCount is 200 against a declaredThreshold of 100, so the harness computes syntheticThresholdMet = true and hypercareWindowAccepted is declared true — a synthetic drill result only. The real hypercare window has not run: hypercareStatus stays PENDING, productionAcceptance is false, incidentCadence and rollbackAuthority stay PENDING, and no SLO, error-budget, or real-traffic claim is made. It does not modify or duplicate config/current-state.json, which remains the authoritative source of truth (0/17 gates complete, 0/14 phases accepted, production pre-production, dataStage synthetic-only, scope browser-only).",
+  "authority": {
+    "source": "config/current-state.json",
+    "role": "authoritative-source-of-truth",
+    "note": "current-state remains the authoritative manifest; this drill fixture never overrides it. Acceptance here is a bounded synthetic computation (session count vs declared threshold) and never a production hypercare acceptance."
+  },
+  "drill": {
+    "declaredThreshold": 100,
+    "syntheticSessionCount": 200,
+    "elapsedHours": 0,
+    "elapsedHoursOnly": false,
+    "trafficSource": "synthetic_local",
+    "hypercareWindowAccepted": true,
+    "hypercareStatus": "PENDING",
+    "productionAcceptance": false,
+    "sloAttainment": null,
+    "errorBudgetRemaining": null,
+    "errorBudgetHealthy": null,
+    "incidentCadence": "PENDING",
+    "rollbackAuthority": "PENDING"
+  },
+  "evidence": {
+    "evidenceType": "synthetic_local",
+    "status": "PENDING",
+    "sessionIds": [],
+    "endpoints": [],
+    "note": "200 synthetic sessions meet and exceed the declared threshold of 100; the window is accepted for the synthetic drill only. No session identifier, endpoint, or external evidence exists or is claimed."
+  }
+}
