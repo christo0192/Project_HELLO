@@ -1,0 +1,214 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/christo0192/Project_HELLO/infra/capacity/benchmark-report.schema.json",
+  "title": "Synthetic Local Capacity Benchmark Report",
+  "description": "Machine report emitted by the DEP-01 synthetic_local capacity benchmark CLI. The only permitted evidence type is synthetic_local, the only permitted policy states are PROPOSED/PENDING, capacity approval is always false, and no pass budget exists. Rejects documents that claim measured capacity, deployment, acceptance, or approval.",
+  "version": "1.0.0",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "reportId",
+    "timestamp",
+    "operator",
+    "evidence",
+    "policy",
+    "inputs",
+    "results",
+    "summary"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "description": "Semantic version of this schema"
+    },
+    "reportId": {
+      "type": "string",
+      "pattern": "^synthetic-capacity-bench-[a-z0-9-]+$",
+      "description": "Unique report identifier, for example synthetic-capacity-bench-fixture-42-20260802"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC timestamp of report generation"
+    },
+    "operator": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Operator identifier (self-test, fixture, or owner-supplied label)"
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["evidenceType", "harness", "realTargets", "liveTargets"],
+      "properties": {
+        "evidenceType": {
+          "type": "string",
+          "const": "synthetic_local",
+          "description": "The only evidence type permitted in repository-only foundations. No real measurements exist."
+        },
+        "harness": {
+          "type": "string",
+          "const": "standard-library-local-simulation",
+          "description": "The harness is a standard-library, deterministic, offline simulation."
+        },
+        "realTargets": {
+          "type": "boolean",
+          "const": false,
+          "description": "No real provider, cloud, or network targets are exercised."
+        },
+        "liveTargets": {
+          "type": "string",
+          "const": "none",
+          "description": "Live targets are owner-operated outside CI and are never listed here."
+        }
+      },
+      "additionalProperties": false
+    },
+    "policy": {
+      "type": "object",
+      "required": [
+        "state",
+        "approvalStatus",
+        "capacityApproved",
+        "capacityConclusion",
+        "passBudget",
+        "headroomAppliedTo"
+      ],
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": ["PROPOSED", "PENDING"],
+          "description": "Policy state is PROPOSED or PENDING only. APPROVED/ACCEPTED/DEPLOYED states are not permitted in repository-only foundations."
+        },
+        "approvalStatus": {
+          "type": "string",
+          "const": "PENDING",
+          "description": "Approval is PENDING owner verification. No approval is claimed."
+        },
+        "capacityApproved": {
+          "type": "boolean",
+          "const": false,
+          "description": "Capacity is never approved by the synthetic harness."
+        },
+        "capacityConclusion": {
+          "type": "string",
+          "const": "none",
+          "description": "No capacity conclusion is drawn from synthetic data."
+        },
+        "passBudget": {
+          "type": "string",
+          "const": "none",
+          "description": "No arbitrary pass budget or threshold exists in the harness."
+        },
+        "headroomAppliedTo": {
+          "type": "string",
+          "const": "none",
+          "description": "Headroom input is stored but never applied to a real deployment."
+        }
+      },
+      "additionalProperties": false
+    },
+    "inputs": {
+      "type": "object",
+      "required": ["scenario", "concurrency", "durationSeconds", "warmupSeconds", "headroomPercent", "seed"],
+      "properties": {
+        "scenario": { "type": "string", "const": "synthetic-local" },
+        "concurrency": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "durationSeconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+        "warmupSeconds": { "type": "integer", "minimum": 0, "maximum": 3600 },
+        "headroomPercent": { "type": "number", "minimum": 0, "maximum": 200 },
+        "saturationThresholdPercent": { "type": "number", "minimum": 1, "maximum": 100 },
+        "seed": { "type": "integer", "description": "Deterministic PRNG seed so the same config reproduces the same report." },
+        "costUnit": {
+          "type": "object",
+          "required": ["label", "currency", "pricingStatus"],
+          "properties": {
+            "label": { "type": "string", "minLength": 3, "maxLength": 120 },
+            "currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+            "pricingStatus": { "type": "string", "const": "PENDING" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "results": {
+      "type": "object",
+      "required": [
+        "timelineSeconds",
+        "warmupSeconds",
+        "sessionsAttempted",
+        "sessionsCompleted",
+        "sessionFailureRate",
+        "apiLatencyMs",
+        "workerUtilizationPercent",
+        "queueDepth",
+        "saturationEvents",
+        "saturationDescription",
+        "headroomPercent"
+      ],
+      "properties": {
+        "timelineSeconds": { "type": "integer", "minimum": 1 },
+        "warmupSeconds": { "type": "integer", "minimum": 0 },
+        "sessionsAttempted": { "type": "integer", "minimum": 0 },
+        "sessionsCompleted": { "type": "integer", "minimum": 0 },
+        "sessionFailureRate": { "type": "number", "minimum": 0, "maximum": 1 },
+        "apiLatencyMs": { "$ref": "#/$defs/syntheticStats" },
+        "workerUtilizationPercent": { "$ref": "#/$defs/syntheticStats" },
+        "queueDepth": { "$ref": "#/$defs/syntheticStats" },
+        "saturationEvents": { "type": "integer", "minimum": 0 },
+        "saturationDescription": { "type": "string", "maxLength": 1000 },
+        "headroomPercent": { "type": "number", "minimum": 0, "maximum": 200 }
+      },
+      "additionalProperties": false
+    },
+    "summary": {
+      "type": "object",
+      "required": ["status", "notYetMeasuredReason", "claims", "notes"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "const": "SYNTHETIC_LOCAL",
+          "description": "The report is explicitly synthetic and local. COMPLETED/ACCEPTED-style real-run statuses are never emitted."
+        },
+        "notYetMeasuredReason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "description": "Required explanation that this is a simulation, not a real measurement."
+        },
+        "claims": {
+          "type": "string",
+          "const": "none",
+          "description": "No real latency, capacity, failover, or cost claim is made."
+        },
+        "notes": {
+          "type": "array",
+          "items": { "type": "string", "maxLength": 1000 },
+          "description": "Truthful observations about the synthetic run only."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "syntheticStats": {
+      "type": "object",
+      "required": ["count", "unit"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 0 },
+        "unit": { "type": "string", "minLength": 1, "maxLength": 16 },
+        "min": { "type": "number" },
+        "max": { "type": "number" },
+        "mean": { "type": "number" },
+        "p50": { "type": "number" },
+        "p95": { "type": "number" },
+        "p99": { "type": "number" },
+        "stddev": { "type": "number" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

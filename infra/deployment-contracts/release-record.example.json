@@ -1,0 +1,27 @@
+{
+  "schemaVersion": "1.0.0",
+  "releaseId": "release-example-0001",
+  "component": "screening-platform",
+  "created": "2026-08-02T00:00:00Z",
+  "state": "prepared",
+  "fromState": null,
+  "stage": "staging",
+  "migrationMarker": { "id": "mig-001", "schemaVersion": 1, "changeType": "additive" },
+  "canary": {
+    "cohort": "PENDING_SRE",
+    "observationWindowMinutes": null,
+    "successCriteria": "PENDING_PRODUCT",
+    "status": "PENDING"
+  },
+  "rollback": null,
+  "evidence": {
+    "evidenceType": "synthetic_local",
+    "status": "PENDING",
+    "paths": []
+  },
+  "approval": {
+    "status": "PENDING",
+    "owner": null,
+    "date": null
+  }
+}

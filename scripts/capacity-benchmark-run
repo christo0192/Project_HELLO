@@ -1,0 +1,818 @@
+#!/usr/bin/env node
+"use strict";
+
+/**
+ * DEP-01 synthetic_local capacity benchmark CLI.
+ *
+ * Deterministic, standard-library-only (no npm packages, no network). The
+ * harness runs a local, seeded simulation of an API / worker-pool / session
+ * lifecycle and emits a machine report whose evidence type is always
+ * `synthetic_local` and whose policy state is always `PROPOSED` or `PENDING`.
+ *
+ * The harness NEVER claims real latency, capacity, failover, or cost, never
+ * applies a pass budget, never touches provider endpoints, and never reads or
+ * writes credentials. Live targets are owner-operated and never run in CI.
+ *
+ * Usage:
+ *   node scripts/capacity-benchmark-run self-test
+ *   node scripts/capacity-benchmark-run fixture --scenario synthetic-local [--output json] [--seed N]
+ *   node scripts/capacity-benchmark-run run --config <config.json> [--output json] [--seed N]
+ *   node scripts/capacity-benchmark-run config-validate <config.json>
+ *   node scripts/capacity-benchmark-run schema-validate <report.json>
+ *   node scripts/capacity-benchmark-run ha-validate <ha-decision.json>
+ *   node scripts/capacity-benchmark-run topology-validate <topology-manifest.json>
+ */
+
+const fs = require("node:fs");
+const path = require("node:path");
+
+const VERSION = "1.0.0";
+const ROOT = path.resolve(__dirname, "..");
+const CONFIG_SCHEMA_PATH = path.join(ROOT, "infra", "capacity", "benchmark.schema.json");
+const REPORT_SCHEMA_PATH = path.join(ROOT, "infra", "capacity", "benchmark-report.schema.json");
+const TOPOLOGY_SCHEMA_PATH = path.join(ROOT, "infra", "capacity", "managed-topology.schema.json");
+const HA_SCHEMA_PATH = path.join(ROOT, "config", "deployment-capacity-ha.schema.json");
+const TOPOLOGY_MANIFEST_PATH = path.join(ROOT, "infra", "capacity", "managed-topology.manifest.json");
+const HA_EXAMPLE_PATH = path.join(ROOT, "infra", "capacity", "ha-decision.example.json");
+
+// ---------------------------------------------------------------------------
+// Secret detection (mirrors the OCI benchmark CLI conventions)
+// ---------------------------------------------------------------------------
+
+// Secret detection — context-aware: flags credential-shaped values, not prose.
+// The word "secret" in phrases such as "runtime secret injection" is legitimate
+// documentation language and must not be flagged; "secret=abc" or "apiKey: xyz"
+// would be.
+const SECRET_PATTERNS = [
+  /\b(?:api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|service[_-]?role[_-]?key|secret|password|passwd|token|credential|authorization|bearer)\b\s*[:=]\s*[^\s,;"']+/i,
+  /[^\s:]+:[^\s@]+@/, // user:password@host
+  /:\/\/[^\s@]+@/, // protocol://user:pass@host
+  /(sk-[a-zA-Z0-9]{20,})/i, // OpenAI-style keys
+  /(eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{5,})/i, // JWT
+];
+
+// Keys that would name a credential, with a non-placeholder string value.
+const SECRET_KEY = /(?:api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|service[_-]?role[_-]?key|secret|password|passwd|token|credential)/i;
+const PLACEHOLDER_VALUE = /^(?:pending|proposed|none|null|n\/a|not[_-]?applicable|not[_-]?started|synthetic|placeholder|todo|example|replace[_-]?me|\s*)$/i;
+
+function checkNoSecrets(data, violations) {
+  if (typeof data === "string") {
+    for (const pattern of SECRET_PATTERNS) {
+      if (pattern.test(data)) {
+        violations.push(`secret-like pattern in string value (${pattern.source.slice(0, 40)}...)`);
+        return;
+      }
+    }
+  } else if (Array.isArray(data)) {
+    for (const item of data) checkNoSecrets(item, violations);
+  } else if (data !== null && typeof data === "object") {
+    for (const [key, value] of Object.entries(data)) {
+      if (typeof key === "string" && SECRET_KEY.test(key) && typeof value === "string" && !PLACEHOLDER_VALUE.test(value.trim())) {
+        violations.push(`secret-like key with non-placeholder value (${key})`);
+        continue;
+      }
+      checkNoSecrets(value, violations);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic PRNG (mulberry32) — stdlib-only, reproducible
+// ---------------------------------------------------------------------------
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function next() {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** Standard normal via Box–Muller using the supplied PRNG. */
+function gaussian(random) {
+  let u = 0;
+  let v = 0;
+  while (u === 0) u = random();
+  while (v === 0) v = random();
+  return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+}
+
+// ---------------------------------------------------------------------------
+// Statistics
+// ---------------------------------------------------------------------------
+
+function percentile(sorted, p) {
+  if (sorted.length === 0) return null;
+  const k = (sorted.length - 1) * (p / 100.0);
+  const f = Math.floor(k);
+  const c = Math.ceil(k);
+  if (f === c) return sorted[k];
+  return sorted[f] * (c - k) + sorted[c] * (k - f);
+}
+
+function computeStats(values, unit) {
+  if (values.length === 0) {
+    return { count: 0, unit, min: null, max: null, mean: null, p50: null, p95: null, p99: null, stddev: null };
+  }
+  const sorted = [...values].sort((a, b) => a - b);
+  const n = sorted.length;
+  const mean = sorted.reduce((sum, v) => sum + v, 0) / n;
+  const variance = sorted.reduce((sum, v) => sum + (v - mean) ** 2, 0) / (n > 1 ? n - 1 : 1);
+  return {
+    count: n,
+    unit,
+    min: round3(sorted[0]),
+    max: round3(sorted[n - 1]),
+    mean: round3(mean),
+    p50: round3(percentile(sorted, 50)),
+    p95: round3(percentile(sorted, 95)),
+    p99: round3(percentile(sorted, 99)),
+    stddev: round3(Math.sqrt(variance)),
+  };
+}
+
+function round3(value) {
+  return Math.round(value * 1000) / 1000;
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic simulation (API / worker-pool / session lifecycle)
+// ---------------------------------------------------------------------------
+
+/**
+ * Deterministic offline simulation of a synthetic session lifecycle.
+ * No network, no providers; every number comes from the seeded PRNG.
+ */
+function simulateTimeline(config, seed) {
+  const concurrency = config.concurrency;
+  const duration = config.durationSeconds;
+  const warmup = config.warmupSeconds;
+  const saturationThreshold = config.saturationThresholdPercent ?? 80;
+  const total = warmup + duration;
+
+  const random = mulberry32(seed);
+  const workerSlots = concurrency;
+  const arrivalRate = Math.max(0.2, concurrency / 40); // synthetic arrivals per second
+
+  const apiLatency = [];
+  const utilization = [];
+  const queueDepth = [];
+  let saturationEvents = 0;
+  let sessionsAttempted = 0;
+  let sessionsCompleted = 0;
+
+  // Active sessions: [remainingSeconds]
+  const active = [];
+
+  for (let t = 1; t <= total; t += 1) {
+    // Synthetic arrivals (deterministic Poisson-lite via seeded PRNG)
+    let arrivals = Math.floor(arrivalRate);
+    if (random() < arrivalRate - Math.floor(arrivalRate)) arrivals += 1;
+    for (let i = 0; i < arrivals; i += 1) {
+      sessionsAttempted += 1;
+      // Synthetic session duration, mean ~45s
+      const durationSec = Math.max(5, Math.round(45 + gaussian(random) * 18));
+      if (active.length < workerSlots) {
+        active.push(durationSec);
+      } else {
+        // Queue the excess session; counts toward queue depth while waiting
+        active.push(durationSec);
+        // A session that never starts is dropped at the next tick boundary:
+        // we model queue pressure, not unbounded backlog.
+      }
+    }
+
+    // Per-second API latency sample per active session
+    const activeCount = active.length;
+    const utilPct = (activeCount / workerSlots) * 100;
+    const saturated = utilPct > saturationThreshold;
+    if (saturated) saturationEvents += 1;
+
+    const baseLatency = 40; // synthetic baseline ms
+    const degradation = saturated ? 1.5 : 1.0;
+    for (let i = 0; i < activeCount; i += 1) {
+      const sample = Math.max(1, baseLatency * degradation + Math.abs(gaussian(random) * 15));
+      apiLatency.push(sample);
+    }
+
+    utilization.push(round3(utilPct));
+    queueDepth.push(Math.max(0, activeCount - workerSlots));
+
+    // Advance sessions; those whose time expires complete (or were queued and
+    // dropped if they could never start — modelled by a completion cap below).
+    let completedThisTick = 0;
+    for (let i = active.length - 1; i >= 0; i -= 1) {
+      active[i] -= 1;
+      if (active[i] <= 0) {
+        active.splice(i, 1);
+        completedThisTick += 1;
+      }
+    }
+    sessionsCompleted += completedThisTick;
+  }
+
+  // Sessions still active at window end are incomplete, not failures.
+  const sessionFailureRate = sessionsAttempted > 0
+    ? round3((sessionsAttempted - sessionsCompleted) / sessionsAttempted)
+    : 0;
+
+  return {
+    timelineSeconds: duration,
+    warmupSeconds: warmup,
+    sessionsAttempted,
+    sessionsCompleted,
+    sessionFailureRate,
+    apiLatencyMs: computeStats(apiLatency, "ms"),
+    workerUtilizationPercent: computeStats(utilization, "percent"),
+    queueDepth: computeStats(queueDepth, "sessions"),
+    saturationEvents,
+    saturationDescription: saturatedDescription(saturationEvents, saturationThreshold),
+    headroomPercent: config.headroomPercent,
+  };
+}
+
+function saturatedDescription(events, threshold) {
+  if (events === 0) {
+    return "No saturation events observed in the synthetic window.";
+  }
+  return `Synthetic utilization exceeded the ${threshold}% threshold on ${events} second(s). This is a simulation observation only; it is not a measured capacity finding.`;
+}
+
+// ---------------------------------------------------------------------------
+// Report building
+// ---------------------------------------------------------------------------
+
+function sanitizeSegment(value) {
+  return String(value).toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+function buildReport(config, results, operator, seed) {
+  const now = new Date().toISOString();
+  const dateSegment = now.slice(0, 10).replace(/-/g, "");
+  return {
+    schemaVersion: VERSION,
+    reportId: `synthetic-capacity-bench-${sanitizeSegment(operator)}-${seed}-${dateSegment}`,
+    timestamp: now,
+    operator,
+    evidence: {
+      evidenceType: "synthetic_local",
+      harness: "standard-library-local-simulation",
+      realTargets: false,
+      liveTargets: "none",
+    },
+    policy: {
+      state: "PROPOSED",
+      approvalStatus: "PENDING",
+      capacityApproved: false,
+      capacityConclusion: "none",
+      passBudget: "none",
+      headroomAppliedTo: "none",
+    },
+    inputs: {
+      scenario: config.scenario,
+      concurrency: config.concurrency,
+      durationSeconds: config.durationSeconds,
+      warmupSeconds: config.warmupSeconds,
+      headroomPercent: config.headroomPercent,
+      saturationThresholdPercent: config.saturationThresholdPercent ?? 80,
+      seed,
+      costUnit: config.costUnit,
+    },
+    results,
+    summary: {
+      status: "SYNTHETIC_LOCAL",
+      notYetMeasuredReason:
+        "The harness ran a deterministic local simulation only. No real provider, cloud, or network target was exercised, so no real latency, capacity, failover, or cost conclusion exists.",
+      claims: "none",
+      notes: [
+        "Evidence type is synthetic_local; policy state is PROPOSED; approval is PENDING owner verification.",
+        "No pass budget or acceptance threshold exists in the harness.",
+        "Live targets are owner-operated outside CI and are not referenced by this report.",
+      ],
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Structural validators (stdlib subset of the JSON Schema files' invariants)
+// ---------------------------------------------------------------------------
+
+const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+
+function validateConfig(doc) {
+  const errors = [];
+  if (!isObject(doc)) return ["config must be a JSON object"];
+  const required = ["schemaVersion", "scenario", "concurrency", "durationSeconds", "warmupSeconds", "headroomPercent", "costUnit"];
+  for (const key of required) if (!(key in doc)) errors.push(`config.${key} is required`);
+  if (doc.scenario !== "synthetic-local") errors.push(`config.scenario must be "synthetic-local"`);
+  if (!Number.isInteger(doc.concurrency) || doc.concurrency < 1 || doc.concurrency > 1000) errors.push("config.concurrency must be an integer in 1..1000");
+  if (!Number.isInteger(doc.durationSeconds) || doc.durationSeconds < 1 || doc.durationSeconds > 86400) errors.push("config.durationSeconds must be an integer in 1..86400");
+  if (!Number.isInteger(doc.warmupSeconds) || doc.warmupSeconds < 0 || doc.warmupSeconds > 3600) errors.push("config.warmupSeconds must be an integer in 0..3600");
+  if (typeof doc.headroomPercent !== "number" || doc.headroomPercent < 0 || doc.headroomPercent > 200) errors.push("config.headroomPercent must be a number in 0..200");
+  if (doc.costUnit !== undefined) {
+    if (!isObject(doc.costUnit)) errors.push("config.costUnit must be an object");
+    else {
+      if (typeof doc.costUnit.label !== "string" || doc.costUnit.label.length < 3) errors.push("config.costUnit.label is required");
+      if (typeof doc.costUnit.currency !== "string" || !/^[A-Z]{3}$/.test(doc.costUnit.currency)) errors.push("config.costUnit.currency must be 3 uppercase letters");
+      if (doc.costUnit.pricingStatus !== "PENDING") errors.push("config.costUnit.pricingStatus must be PENDING");
+    }
+  }
+  const violations = [];
+  checkNoSecrets(doc, violations);
+  for (const v of violations) errors.push(`config contains ${v}`);
+  return errors;
+}
+
+function validateReport(doc) {
+  const errors = [];
+  if (!isObject(doc)) return ["report must be a JSON object"];
+  const required = ["schemaVersion", "reportId", "timestamp", "operator", "evidence", "policy", "inputs", "results", "summary"];
+  for (const key of required) if (!(key in doc)) errors.push(`report.${key} is required`);
+  if (typeof doc.reportId === "string" && !/^synthetic-capacity-bench-[a-z0-9-]+$/.test(doc.reportId)) errors.push("report.reportId must match ^synthetic-capacity-bench-[a-z0-9-]+$");
+
+  const evidence = doc.evidence;
+  if (isObject(evidence)) {
+    if (evidence.evidenceType !== "synthetic_local") errors.push('report.evidence.evidenceType must be "synthetic_local"');
+    if (evidence.harness !== "standard-library-local-simulation") errors.push('report.evidence.harness must be "standard-library-local-simulation"');
+    if (evidence.realTargets !== false) errors.push("report.evidence.realTargets must be false");
+    if (evidence.liveTargets !== "none") errors.push('report.evidence.liveTargets must be "none"');
+  } else errors.push("report.evidence is required");
+
+  const policy = doc.policy;
+  if (isObject(policy)) {
+    if (!["PROPOSED", "PENDING"].includes(policy.state)) errors.push("report.policy.state must be PROPOSED or PENDING");
+    if (policy.approvalStatus !== "PENDING") errors.push("report.policy.approvalStatus must be PENDING");
+    if (policy.capacityApproved !== false) errors.push("report.policy.capacityApproved must be false — no capacity approval exists");
+    if (policy.capacityConclusion !== "none") errors.push("report.policy.capacityConclusion must be \"none\"");
+    if (policy.passBudget !== "none") errors.push("report.policy.passBudget must be \"none\"");
+    if (policy.headroomAppliedTo !== "none") errors.push("report.policy.headroomAppliedTo must be \"none\"");
+  } else errors.push("report.policy is required");
+
+  const summary = doc.summary;
+  if (isObject(summary)) {
+    if (summary.status !== "SYNTHETIC_LOCAL") errors.push("report.summary.status must be SYNTHETIC_LOCAL");
+    if (summary.claims !== "none") errors.push("report.summary.claims must be \"none\"");
+    if (typeof summary.notYetMeasuredReason !== "string" || summary.notYetMeasuredReason.length === 0) errors.push("report.summary.notYetMeasuredReason is required");
+  } else errors.push("report.summary is required");
+
+  const violations = [];
+  checkNoSecrets(doc, violations);
+  for (const v of violations) errors.push(`report contains ${v}`);
+  return errors;
+}
+
+function validateHaDecision(doc) {
+  const errors = [];
+  if (!isObject(doc)) return ["ha decision must be a JSON object"];
+  const required = ["schemaVersion", "decisionId", "component", "created", "decisionState", "haDecision", "singleInstanceRisk", "rtoRpo", "approval"];
+  for (const key of required) if (!(key in doc)) errors.push(`ha.${key} is required`);
+  if (!["PROPOSED", "PENDING"].includes(doc.decisionState)) errors.push("ha.decisionState must be PROPOSED or PENDING");
+
+  if (isObject(doc.haDecision) && typeof doc.haDecision.haRequiredProposal !== "boolean") errors.push("ha.haDecision.haRequiredProposal must be a boolean");
+
+  if (isObject(doc.singleInstanceRisk)) {
+    if (typeof doc.singleInstanceRisk.exists !== "boolean") errors.push("ha.singleInstanceRisk.exists must be a boolean");
+    if (!["PENDING", "PROPOSED"].includes(doc.singleInstanceRisk.status)) errors.push("ha.singleInstanceRisk.status must be PENDING or PROPOSED");
+  } else errors.push("ha.singleInstanceRisk is required");
+
+  if (isObject(doc.rtoRpo)) {
+    for (const key of ["rtoMinutes", "rpoMinutes"]) {
+      const window = doc.rtoRpo[key];
+      if (!isObject(window)) {
+        errors.push(`ha.rtoRpo.${key} is required`);
+        continue;
+      }
+      if (window.unit !== "minutes") errors.push(`ha.rtoRpo.${key}.unit must be "minutes"`);
+      if (window.status !== "PENDING") errors.push(`ha.rtoRpo.${key}.status must be PENDING`);
+      const value = window.value;
+      if (value !== null && (!Number.isInteger(value) || value < 1)) {
+        errors.push(`ha.rtoRpo.${key}.value must be null or an integer >= 1 (0 would claim zero-downtime recovery, which repository-only work cannot evidence)`);
+      }
+    }
+  } else errors.push("ha.rtoRpo is required");
+
+  if (isObject(doc.approval)) {
+    if (doc.approval.status !== "PENDING") errors.push('ha.approval.status must be PENDING — ACCEPTED/APPROVED values are invalid without authentic external evidence');
+  } else errors.push("ha.approval is required");
+
+  const violations = [];
+  checkNoSecrets(doc, violations);
+  for (const v of violations) errors.push(`ha decision contains ${v}`);
+  return errors;
+}
+
+function validateTopology(doc) {
+  const errors = [];
+  if (!isObject(doc)) return ["topology manifest must be a JSON object"];
+  if (doc.provisioned !== false) errors.push("topology.provisioned must be false");
+  if (doc.deployed !== false) errors.push("topology.deployed must be false");
+  if (doc.approvalStatus !== "PENDING") errors.push("topology.approvalStatus must be PENDING");
+  if (!["PROPOSED", "PENDING"].includes(doc.status)) errors.push("topology.status must be PROPOSED or PENDING");
+
+  if (!Array.isArray(doc.components) || doc.components.length < 7) {
+    errors.push("topology.components must contain the 7 ADR-0010 components");
+  } else {
+    const ids = new Set();
+    doc.components.forEach((component, index) => {
+      if (!isObject(component)) return errors.push(`topology.components[${index}] must be an object`);
+      if (!component.componentId) errors.push(`topology.components[${index}].componentId is required`);
+      if (ids.has(component.componentId)) errors.push(`topology.components[${index}].componentId duplicate "${component.componentId}"`);
+      if (component.componentId) ids.add(component.componentId);
+      if (!component.failureDomain) errors.push(`topology.components[${index}].failureDomain is required`);
+      if (!Array.isArray(component.scaleTriggers) || component.scaleTriggers.length < 1) {
+        errors.push(`topology.components[${index}].scaleTriggers must be a non-empty array`);
+      } else {
+        component.scaleTriggers.forEach((trigger, tIndex) => {
+          if (!isObject(trigger)) return errors.push(`topology.components[${index}].scaleTriggers[${tIndex}] must be an object`);
+          if (typeof trigger.metric !== "string" || trigger.metric.trim().length === 0) {
+            errors.push(`topology.components[${index}].scaleTriggers[${tIndex}].metric is required`);
+          }
+          if (typeof trigger.source !== "string" || trigger.source.trim().length === 0) {
+            errors.push(`topology.components[${index}].scaleTriggers[${tIndex}].source is required — every scale trigger needs a metric and a source`);
+          }
+          if (!["PROPOSED", "PENDING"].includes(trigger.status)) errors.push(`topology.components[${index}].scaleTriggers[${tIndex}].status must be PROPOSED or PENDING`);
+        });
+      }
+    });
+  }
+
+  const violations = [];
+  checkNoSecrets(doc, violations);
+  for (const v of violations) errors.push(`topology manifest contains ${v}`);
+  return errors;
+}
+
+// ---------------------------------------------------------------------------
+// IO helpers
+// ---------------------------------------------------------------------------
+
+function readJson(filePath, label) {
+  let text;
+  try {
+    text = fs.readFileSync(filePath, "utf8");
+  } catch {
+    return { error: `Cannot read ${label} at ${filePath}` };
+  }
+  try {
+    return { data: JSON.parse(text) };
+  } catch {
+    return { error: `${label} is not valid JSON` };
+  }
+}
+
+function fileExists(filePath) {
+  try {
+    return fs.statSync(filePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+function cmdFixture(args) {
+  const scenario = args.scenario || "synthetic-local";
+  if (scenario !== "synthetic-local") {
+    fail(`Unknown scenario "${scenario}". The only supported scenario is synthetic-local.`);
+  }
+  const seed = args.seed !== undefined ? Number(args.seed) : 42;
+  if (!Number.isInteger(seed) || seed < 0) fail(`--seed must be a non-negative integer`);
+  const config = {
+    schemaVersion: VERSION,
+    scenario: "synthetic-local",
+    concurrency: 50,
+    durationSeconds: 120,
+    warmupSeconds: 10,
+    headroomPercent: 50,
+    saturationThresholdPercent: 80,
+    costUnit: { label: "per concurrent session-hour", currency: "USD", pricingStatus: "PENDING" },
+  };
+  const results = simulateTimeline(config, seed);
+  const report = buildReport(config, results, "fixture", seed);
+  const errors = validateReport(report);
+  if (errors.length) fail(`fixture report failed self-validation:\n- ${errors.join("\n- ")}`);
+  output(report, args.output);
+}
+
+function cmdRun(args) {
+  const configPath = args.config;
+  if (!configPath) fail("run requires --config <config.json>");
+  const { data, error } = readJson(configPath, "config");
+  if (error) fail(error);
+  const configErrors = validateConfig(data);
+  if (configErrors.length) fail(`config invalid:\n- ${configErrors.join("\n- ")}`);
+  const seed = args.seed !== undefined ? Number(args.seed) : 42;
+  if (!Number.isInteger(seed) || seed < 0) fail(`--seed must be a non-negative integer`);
+  const results = simulateTimeline(data, seed);
+  const report = buildReport(data, results, args.operator || "owner", seed);
+  const errors = validateReport(report);
+  if (errors.length) fail(`report failed self-validation:\n- ${errors.join("\n- ")}`);
+  output(report, args.output);
+}
+
+function cmdConfigValidate(args) {
+  const filePath = args.file;
+  if (!filePath) fail("config-validate requires a file path");
+  const { data, error } = readJson(filePath, "config");
+  if (error) fail(error);
+  const errors = validateConfig(data);
+  if (errors.length) fail(`config invalid:\n- ${errors.join("\n- ")}`);
+  console.log(`PASS: config validates (synthetic-local scenario, no secrets, PROPOSED/PENDING policy inputs only)`);
+}
+
+function cmdSchemaValidate(args) {
+  const filePath = args.file;
+  if (!filePath) fail("schema-validate requires a file path");
+  const { data, error } = readJson(filePath, "report");
+  if (error) fail(error);
+  const errors = validateReport(data);
+  if (errors.length) fail(`report invalid:\n- ${errors.join("\n- ")}`);
+  console.log(`PASS: report validates (synthetic_local evidence, PROPOSED/PENDING policy, capacity approval false)`);
+}
+
+function cmdHaValidate(args) {
+  const filePath = args.file;
+  if (!filePath) fail("ha-validate requires a file path");
+  const { data, error } = readJson(filePath, "HA decision");
+  if (error) fail(error);
+  const errors = validateHaDecision(data);
+  if (errors.length) fail(`HA decision invalid:\n- ${errors.join("\n- ")}`);
+  console.log(`PASS: HA decision validates (approval PENDING, RTO/RPO PENDING, single-instance risk explicit)`);
+}
+
+function cmdTopologyValidate(args) {
+  const filePath = args.file;
+  if (!filePath) fail("topology-validate requires a file path");
+  const { data, error } = readJson(filePath, "topology manifest");
+  if (error) fail(error);
+  const errors = validateTopology(data);
+  if (errors.length) fail(`topology manifest invalid:\n- ${errors.join("\n- ")}`);
+  console.log(`PASS: topology manifest validates (7 ADR-0010 components, failure domains, scale triggers with metric+source, all PENDING)`);
+}
+
+function output(doc, format) {
+  if (format === "markdown") {
+    console.log(markdownReport(doc));
+  } else {
+    console.log(JSON.stringify(doc, null, 2));
+  }
+}
+
+function markdownReport(doc) {
+  const lines = [
+    `# Synthetic Local Capacity Benchmark — ${doc.reportId}`,
+    "",
+    `**Status:** ${doc.summary.status} — synthetic simulation only, no real measurement`,
+    `**Evidence type:** ${doc.evidence.evidenceType}`,
+    `**Policy state:** ${doc.policy.state} — approval ${doc.policy.approvalStatus}`,
+    `**Generated:** ${doc.timestamp}`,
+    "",
+    "| Input | Value |",
+    "|-------|-------|",
+    `| Concurrency | ${doc.inputs.concurrency} |`,
+    `| Duration (s) | ${doc.inputs.durationSeconds} |`,
+    `| Warmup (s) | ${doc.inputs.warmupSeconds} |`,
+    `| Headroom % | ${doc.inputs.headroomPercent} |`,
+    `| Seed | ${doc.inputs.seed} |`,
+    "",
+    "| Synthetic result | Value |",
+    "|------------------|-------|",
+    `| Sessions attempted | ${doc.results.sessionsAttempted} |`,
+    `| Sessions completed | ${doc.results.sessionsCompleted} |`,
+    `| Session failure rate | ${doc.results.sessionFailureRate} |`,
+    `| API latency p95 (ms, synthetic) | ${doc.results.apiLatencyMs.p95} |`,
+    `| Worker utilization mean % | ${doc.results.workerUtilizationPercent.mean} |`,
+    `| Max queue depth (synthetic) | ${doc.results.queueDepth.max} |`,
+    `| Saturation events | ${doc.results.saturationEvents} |`,
+    "",
+    `> ⚠️ This report contains **no real measurements**. ${doc.summary.notYetMeasuredReason}`,
+    "> Do not use this data for any capacity, latency, failover, or cost conclusion.",
+  ];
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Self-test
+// ---------------------------------------------------------------------------
+
+function cmdSelfTest() {
+  const results = [];
+  const check = (name, condition, detail) => {
+    results.push({ name, ok: !!condition, detail: detail || "" });
+  };
+
+  // ── Statistics ──
+  const stats = computeStats([1, 2, 3, 4, 5], "ms");
+  check("mean of [1..5] == 3", stats.mean === 3);
+  check("p50 of [1..5] == 3", stats.p50 === 3);
+  check("min/max of [1..5]", stats.min === 1 && stats.max === 5);
+  const hundred = Array.from({ length: 100 }, (_, i) => i + 1);
+  const h = computeStats(hundred, "ms");
+  check("p95 of 1..100 ~ 95", Math.abs(h.p95 - 95.05) < 0.01, `got ${h.p95}`);
+  check("empty stats count=0", computeStats([], "ms").count === 0);
+  check("single-value stddev=0", computeStats([42], "ms").stddev === 0);
+
+  // ── Secret detection ──
+  const cleanViolations = [];
+  checkNoSecrets({ host: "example.invalid", port: 443 }, cleanViolations);
+  check("no secrets on clean object", cleanViolations.length === 0);
+  const dirtyViolations = [];
+  checkNoSecrets({ url: "https://user:password@host.example/path" }, dirtyViolations);
+  check("rejects URL userinfo", dirtyViolations.length > 0);
+  const tokenViolations = [];
+  // Runtime-constructed synthetic token so no literal key exists in source.
+  const syntheticSkToken = "sk-" + ["syntheticbenchmark", "token", "notarealkey", "0123456789abcdefghij"].join("");
+  checkNoSecrets({ value: syntheticSkToken }, tokenViolations);
+  check("rejects sk- style token", tokenViolations.length > 0);
+  const keyViolations = [];
+  checkNoSecrets({ apiKey: "not-a-placeholder-value" }, keyViolations);
+  check("rejects secret-like key with value", keyViolations.length > 0);
+  const proseViolations = [];
+  checkNoSecrets({ notes: "Runtime secret injection via machine identity is PENDING owner." }, proseViolations);
+  check("does not flag prose about secrets", proseViolations.length === 0);
+
+  // ── Determinism ──
+  const baseConfig = {
+    schemaVersion: VERSION, scenario: "synthetic-local", concurrency: 50,
+    durationSeconds: 120, warmupSeconds: 10, headroomPercent: 50,
+    saturationThresholdPercent: 80,
+    costUnit: { label: "per concurrent session-hour", currency: "USD", pricingStatus: "PENDING" },
+  };
+  const r1 = simulateTimeline(baseConfig, 42);
+  const r2 = simulateTimeline(baseConfig, 42);
+  check("simulation deterministic (same seed -> identical results)", JSON.stringify(r1) === JSON.stringify(r2));
+  const r3 = simulateTimeline(baseConfig, 7);
+  check("different seed -> different results", JSON.stringify(r1) !== JSON.stringify(r3));
+
+  // ── Non-vacuity ──
+  const small = simulateTimeline({ ...baseConfig, concurrency: 5 }, 42);
+  const large = simulateTimeline({ ...baseConfig, concurrency: 200 }, 42);
+  check("synthetic input changes output (queue depth)", small.queueDepth.max !== large.queueDepth.max || small.apiLatencyMs.p95 !== large.apiLatencyMs.p95);
+  check("synthetic input changes saturation events", small.saturationEvents !== large.saturationEvents);
+  check("sessions actually attempted", large.sessionsAttempted > small.sessionsAttempted);
+  check("queue depth max is a number", typeof large.queueDepth.max === "number");
+
+  // ── Config validation ──
+  check("valid config passes", validateConfig(baseConfig).length === 0);
+  const badScenario = validateConfig({ ...baseConfig, scenario: "live-provider" });
+  check("config rejects non-synthetic scenario", badScenario.length > 0, badScenario.join("; "));
+  const missingField = validateConfig({ ...baseConfig, concurrency: undefined });
+  check("config rejects missing concurrency", missingField.length > 0);
+  const secretConfig = validateConfig({ ...baseConfig, costUnit: { label: "per session-hour", currency: "USD", pricingStatus: "PENDING" }, extra: { apiKey: "sk-synthetic-secret-abcdefghijklmnopqrstuvwxyz" } });
+  check("config rejects secret-like strings", secretConfig.length > 0);
+
+  // ── Report validation negative controls ──
+  const goodReport = buildReport(baseConfig, r1, "self-test", 42);
+  check("built report validates", validateReport(goodReport).length === 0);
+  const approvedReport = JSON.parse(JSON.stringify(goodReport));
+  approvedReport.policy.capacityApproved = true;
+  check("report with capacityApproved:true is rejected", validateReport(approvedReport).length > 0);
+  const deployedReport = JSON.parse(JSON.stringify(goodReport));
+  deployedReport.policy.state = "DEPLOYED";
+  check("report with policy.state DEPLOYED is rejected", validateReport(deployedReport).length > 0);
+  const acceptedReport = JSON.parse(JSON.stringify(goodReport));
+  acceptedReport.summary.status = "COMPLETED";
+  check("report with summary.status COMPLETED is rejected", validateReport(acceptedReport).length > 0);
+  const secretReport = JSON.parse(JSON.stringify(goodReport));
+  secretReport.summary.notes.push("target https://user:password@host.example");
+  check("report with secret-like target is rejected", validateReport(secretReport).length > 0);
+
+  // ── HA decision validation ──
+  const goodHa = {
+    schemaVersion: VERSION, decisionId: "ha-decision-selftest-001", component: "synthetic",
+    created: "2026-08-02T00:00:00Z", decisionState: "PROPOSED",
+    haDecision: { haRequiredProposal: false, rationale: "synthetic" },
+    singleInstanceRisk: { exists: true, description: "synthetic", mitigation: "owner recovery", status: "PENDING" },
+    rtoRpo: { rtoMinutes: { value: null, unit: "minutes", status: "PENDING" }, rpoMinutes: { value: null, unit: "minutes", status: "PENDING" } },
+    approval: { status: "PENDING", owner: null, date: null },
+  };
+  check("HA decision example-shaped doc validates", validateHaDecision(goodHa).length === 0);
+  const badHa = JSON.parse(JSON.stringify(goodHa));
+  badHa.rtoRpo.rtoMinutes.value = 0;
+  badHa.approval.status = "ACCEPTED";
+  const badHaErrors = validateHaDecision(badHa);
+  check("HA doc with rto 0 + ACCEPTED is rejected", badHaErrors.length > 0, badHaErrors.join("; "));
+
+  // ── Topology validation ──
+  const topology = readJson(TOPOLOGY_MANIFEST_PATH, "topology manifest");
+  check("real topology manifest parses", !topology.error);
+  if (!topology.error) {
+    const tErrors = validateTopology(topology.data);
+    check("real topology manifest validates", tErrors.length === 0, tErrors.join("; "));
+    const badTopology = JSON.parse(JSON.stringify(topology.data));
+    badTopology.components[0].scaleTriggers[0] = { metric: "api_concurrent_requests", thresholdProposed: "x", status: "PROPOSED" };
+    const badTErrors = validateTopology(badTopology);
+    check("scale trigger without source is rejected", badTErrors.length > 0, badTErrors.join("; "));
+    const deployedTopology = JSON.parse(JSON.stringify(topology.data));
+    deployedTopology.deployed = true;
+    check("topology manifest with deployed:true is rejected", validateTopology(deployedTopology).length > 0);
+  }
+
+  // ── HA example file integration ──
+  const haExample = readJson(HA_EXAMPLE_PATH, "HA decision example");
+  check("real HA example parses", !haExample.error);
+  if (!haExample.error) {
+    const eErrors = validateHaDecision(haExample.data);
+    check("real HA example validates", eErrors.length === 0, eErrors.join("; "));
+  }
+
+  // ── Schema files parse ──
+  for (const [label, filePath] of [
+    ["benchmark config schema", CONFIG_SCHEMA_PATH],
+    ["benchmark report schema", REPORT_SCHEMA_PATH],
+    ["topology schema", TOPOLOGY_SCHEMA_PATH],
+    ["HA schema", HA_SCHEMA_PATH],
+  ]) {
+    const parsed = readJson(filePath, label);
+    check(`${label} is valid JSON`, !parsed.error);
+  }
+
+  // ── Report markdown rendering ──
+  const md = markdownReport(goodReport);
+  check("markdown report marks synthetic", md.includes("no real measurements"));
+
+  const failures = results.filter((r) => !r.ok);
+  for (const r of results) {
+    console.log(`  ${r.ok ? "PASS" : "FAIL"}: ${r.name}${r.detail ? ` (${r.detail})` : ""}`);
+  }
+  if (failures.length) {
+    console.error(`\ncapacity-benchmark-run self-test FAILED (${failures.length}/${results.length})`);
+    process.exit(1);
+  }
+  console.log(`\nAll ${results.length} capacity benchmark self-tests passed.`);
+}
+
+// ---------------------------------------------------------------------------
+// CLI dispatch
+// ---------------------------------------------------------------------------
+
+function parseArgs(argv) {
+  const args = { positional: [] };
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--config" || arg === "-c") {
+      args.config = argv[++i];
+    } else if (arg === "--output" || arg === "-o" || arg === "--out") {
+      args.output = argv[++i];
+    } else if (arg === "--scenario") {
+      args.scenario = argv[++i];
+    } else if (arg === "--seed") {
+      args.seed = argv[++i];
+    } else if (arg === "--operator") {
+      args.operator = argv[++i];
+    } else if (arg.startsWith("--")) {
+      fail(`Unknown option ${arg}`);
+    } else {
+      args.positional.push(arg);
+    }
+  }
+  return args;
+}
+
+function fail(message) {
+  console.error(`ERROR: ${message}`);
+  process.exit(1);
+}
+
+const command = process.argv[2];
+const args = parseArgs(process.argv.slice(3));
+
+switch (command) {
+  case "self-test":
+    cmdSelfTest();
+    break;
+  case "fixture":
+    cmdFixture(args);
+    break;
+  case "run":
+    cmdRun(args);
+    break;
+  case "config-validate":
+    args.file = args.positional[0];
+    cmdConfigValidate(args);
+    break;
+  case "schema-validate":
+    args.file = args.positional[0];
+    cmdSchemaValidate(args);
+    break;
+  case "ha-validate":
+    args.file = args.positional[0];
+    cmdHaValidate(args);
+    break;
+  case "topology-validate":
+    args.file = args.positional[0];
+    cmdTopologyValidate(args);
+    break;
+  case "help":
+  case "--help":
+  case "-h":
+    console.log(fs.readFileSync(__filename, "utf8").match(/^ \* Usage:[\s\S]*?\*\/\n/)?.[0]?.replace(/^ \* ?/gm, "") || "See source header for usage.");
+    break;
+  default:
+    fail(`Unknown command "${command}". Commands: self-test, fixture, run, config-validate, schema-validate, ha-validate, topology-validate`);
+}

@@ -1,0 +1,147 @@
+{
+  "manifestVersion": "1.0.0",
+  "title": "Managed-hosting topology manifest (DEP-02)",
+  "description": "Repository-only topology declaration for the ADR-0010 managed-hosting pilot. No component is provisioned, deployed, or live. Every entitlement, pricing, residency, and owner item remains PENDING owner verification. Failure domains and scale triggers are proposals for DEP-02; they are not measured isolation or capacity claims.",
+  "adrReference": "docs/adr/0010-hosting-topology.md",
+  "status": "PROPOSED",
+  "approvalStatus": "PENDING",
+  "provisioned": false,
+  "deployed": false,
+  "components": [
+    {
+      "componentId": "web-api",
+      "name": "Web / API",
+      "role": "Recruiter browser client and screening API (Next.js web plus Node API). Primary application plane for the pilot.",
+      "failureDomain": "application",
+      "scalesIndependently": true,
+      "scaleTriggers": [
+        {
+          "metric": "api_concurrent_requests",
+          "source": "synthetic_local_benchmark",
+          "thresholdProposed": "owner/SRE-defined after DEP-01 benchmark inputs",
+          "status": "PROPOSED"
+        }
+      ],
+      "ownerStatus": "PENDING",
+      "provisioning": "PENDING",
+      "notes": "Scale trigger thresholds are proposals awaiting owner/SRE input; no measured capacity conclusion exists."
+    },
+    {
+      "componentId": "livekit-cloud",
+      "name": "LiveKit Cloud (SFU Build)",
+      "role": "Managed WebRTC SFU per ADR-0010 decision 1.",
+      "failureDomain": "provider-region",
+      "scalesIndependently": true,
+      "scaleTriggers": [
+        {
+          "metric": "sfu_concurrent_participants",
+          "source": "owner_provided_provider_console",
+          "thresholdProposed": "owner/SRE-defined after provider entitlement verification",
+          "status": "PROPOSED"
+        }
+      ],
+      "ownerStatus": "PENDING",
+      "provisioning": "PENDING",
+      "notes": "Account, entitlement, pricing, and residency verification PENDING owner."
+    },
+    {
+      "componentId": "livekit-agents",
+      "name": "LiveKit Cloud Agents",
+      "role": "Managed Python voice worker runtime per ADR-0010 decision 1.",
+      "failureDomain": "managed-runtime",
+      "scalesIndependently": true,
+      "scaleTriggers": [
+        {
+          "metric": "agents_concurrent_sessions",
+          "source": "owner_provided_provider_console",
+          "thresholdProposed": "owner/SRE-defined once the owner provisions Cloud Agents (PENDING)",
+          "status": "PROPOSED"
+        }
+      ],
+      "ownerStatus": "PENDING",
+      "provisioning": "PENDING",
+      "notes": "Cloud Agents deployment and entitlements PENDING owner."
+    },
+    {
+      "componentId": "supabase",
+      "name": "Supabase",
+      "role": "Postgres, auth, and storage backend for the screening platform.",
+      "failureDomain": "database",
+      "scalesIndependently": false,
+      "scaleTriggers": [
+        {
+          "metric": "db_connection_pool_usage",
+          "source": "owner_provided_provider_console",
+          "thresholdProposed": "owner/SRE-defined after entitlement and residency evidence",
+          "status": "PROPOSED"
+        }
+      ],
+      "ownerStatus": "PENDING",
+      "provisioning": "PENDING",
+      "notes": "Capacity entitlement and region residency evidence PENDING owner."
+    },
+    {
+      "componentId": "infisical-managed",
+      "name": "Managed Infisical",
+      "role": "Runtime secret injection via machine identity per ADR-0010 decision 2.",
+      "failureDomain": "secrets",
+      "scalesIndependently": false,
+      "scaleTriggers": [
+        {
+          "metric": "secret_fetch_latency_p95",
+          "source": "owner_provided_operator_tooling",
+          "thresholdProposed": "owner/SRE-defined after project and machine identity creation",
+          "status": "PROPOSED"
+        }
+      ],
+      "ownerStatus": "PENDING",
+      "provisioning": "PENDING",
+      "notes": "Project creation, machine identity, and scope PENDING owner."
+    },
+    {
+      "componentId": "oci-e2-gateway",
+      "name": "OCI E2 Micro Gateway / Fallback",
+      "role": "Lightweight gateway and fallback only per ADR-0010 decision 3; not the primary worker host.",
+      "failureDomain": "gateway",
+      "scalesIndependently": false,
+      "scaleTriggers": [
+        {
+          "metric": "gateway_egress_bytes",
+          "source": "owner_provided_oci_console",
+          "thresholdProposed": "owner/SRE-defined; existing instance only, no Terraform change accompanies this manifest",
+          "status": "PROPOSED"
+        }
+      ],
+      "ownerStatus": "PENDING",
+      "provisioning": "PENDING",
+      "notes": "Existing instance role confirmation PENDING owner. No Oracle Terraform is modified or extended by Phase 11 repository work."
+    },
+    {
+      "componentId": "vps-fallback",
+      "name": "Bounded near-India VPS Fallback",
+      "role": "Persistent near-India VPS bounded to an internal USD 12 monthly engineering ceiling per ADR-0010 decision 4, if Cloud Agents proves unsuitable.",
+      "failureDomain": "fallback-compute",
+      "scalesIndependently": false,
+      "scaleTriggers": [
+        {
+          "metric": "agents_unsuitability_review",
+          "source": "owner_review_decision",
+          "thresholdProposed": "owner decision only; provider and region PENDING verification",
+          "status": "PROPOSED"
+        }
+      ],
+      "ownerStatus": "PENDING",
+      "provisioning": "PENDING",
+      "notes": "Provider, region, and the USD 12 ceiling are internal engineering bounds PENDING owner verification, not provider quotes."
+    }
+  ],
+  "externalPending": [
+    "LiveKit Cloud project and Cloud Agents deployment",
+    "Managed Infisical project and machine identity",
+    "Supabase capacity entitlement and region residency evidence",
+    "OCI E2 gateway role confirmation",
+    "VPS provider, region, and monthly ceiling verification",
+    "SRE approval for target concurrency and headroom",
+    "Provider pricing, DPA, and residency evidence for every managed component"
+  ]
+}

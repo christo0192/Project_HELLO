@@ -1,0 +1,499 @@
+#!/usr/bin/env node
+"use strict";
+
+/**
+ * validate-deployment-schema-drift — contract-critical schema drift validation
+ * for every published Phase 11 (PR-B) schema.
+ *
+ * HONESTY BOUNDARY: the repository does not vendor a full JSON Schema engine
+ * (no new dependencies are permitted), so this validator does NOT claim full
+ * Draft 2020-12 validation. CI verifies CONTRACT-CRITICAL SCHEMA DRIFT only:
+ * it freezes the machine-critical invariants of each published schema —
+ * required keys, const values, enums, patterns, minima, and
+ * additionalProperties:false — and fails whenever a schema file drifts away
+ * from its frozen contract. Representative positive and negative fixtures are
+ * run through the same frozen contract, and the executable validators
+ * (validate-deployment-contracts, validate-deployment-release,
+ * artifact-provenance-validate, capacity-benchmark-run) are probed to confirm
+ * they AGREE with the schema-critical invariants.
+ *
+ * Schemas covered (all Phase 11 published machine contracts):
+ *   config/deployment-capacity-contracts.schema.json
+ *   config/deployment-capacity-parity.schema.json
+ *   config/deployment-capacity-release.schema.json
+ *   config/deployment-capacity-provenance.schema.json
+ *   config/deployment-capacity-ha.schema.json
+ *   infra/capacity/benchmark.schema.json
+ *   infra/capacity/benchmark-report.schema.json
+ *   infra/capacity/managed-topology.schema.json
+ *
+ * Usage:
+ *   node scripts/validate-deployment-schema-drift
+ * Exit 0 = every frozen invariant holds and executable validators agree.
+ * Exit 1 = schema drift or validator disagreement detected.
+ */
+
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+
+const ROOT = path.resolve(__dirname, "..");
+const failures = [];
+let checksRun = 0;
+
+function check(name, condition, detail) {
+  checksRun += 1;
+  if (!condition) failures.push(`${name}${detail ? ` (${detail})` : ""}`);
+}
+
+function getByPath(obj, dotted) {
+  return dotted.split(".").reduce((acc, key) => (acc === undefined || acc === null ? undefined : acc[key]), obj);
+}
+
+function deepEqual(a, b) {
+  if (a === b) return true;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((item, i) => deepEqual(item, b[i]));
+  }
+  if (a !== null && b !== null && typeof a === "object" && typeof b === "object") {
+    const ka = Object.keys(a);
+    const kb = Object.keys(b);
+    return ka.length === kb.length && ka.every((k) => deepEqual(a[k], b[k]));
+  }
+  return false;
+}
+
+/**
+ * Split a schema path such as "properties.policy.properties.capacityApproved.const"
+ * into { schemaTokens, keyword, dataPath }.
+ */
+function parseSchemaPath(schemaPath) {
+  const tokens = schemaPath.split(".");
+  const keyword = tokens[tokens.length - 1];
+  const schemaTokens = tokens.slice(0, -1);
+  const dataPath = schemaTokens
+    .filter((t) => t !== "properties" && t !== "items" && t !== "$defs")
+    .join(".");
+  return { schemaTokens, keyword, dataPath };
+}
+
+/**
+ * Schema-invariant entry: { path: "<schema dotted path ending in keyword>", value }.
+ * Checks BOTH the schema declaration (schema[path] === value) and the data
+ * contract (doc[dataPath] satisfies the keyword constraint).
+ */
+function checkInvariant(schema, entry) {
+  const { schemaTokens, keyword, dataPath } = parseSchemaPath(entry.path);
+  const parent = getByPath(schema, schemaTokens.join("."));
+  const schemaValue = parent === undefined || parent === null ? undefined : parent[keyword];
+  if (schemaValue === undefined) {
+    check(`schema ${schema.$id ?? entry.path}: missing node ${entry.path}`, false, "schema node missing");
+    return;
+  }
+  check(`schema ${schema.$id ?? entry.path}: ${entry.path} === ${JSON.stringify(entry.value)}`, deepEqual(schemaValue, entry.value),
+    `schema declares ${JSON.stringify(schemaValue)}`);
+  entry.positiveChecks.forEach(({ doc, label }) => {
+    const dataNode = getByPath(doc, dataPath);
+    if (dataNode === undefined) return; // optional field absent — not a violation
+    let ok;
+    switch (keyword) {
+      case "const":
+        ok = dataNode === entry.value;
+        break;
+      case "enum":
+        ok = Array.isArray(entry.value) && entry.value.includes(dataNode);
+        break;
+      case "pattern":
+        ok = typeof dataNode === "string" && new RegExp(entry.value).test(dataNode);
+        break;
+      case "minimum":
+        // Nullable numeric fields (e.g. canary.observationWindowMinutes) allow
+        // null as "not yet set"; minimum applies to numeric values only.
+        ok = dataNode === null || (typeof dataNode === "number" && dataNode >= entry.value);
+        break;
+      case "maxItems":
+        ok = Array.isArray(dataNode) && dataNode.length <= entry.value;
+        break;
+      default:
+        ok = true;
+    }
+    check(`data fixture "${label}" ${dataPath} satisfies ${keyword} ${JSON.stringify(entry.value)}`, ok,
+      `got ${JSON.stringify(dataNode)}`);
+  });
+  entry.negativeChecks.forEach(({ doc, label }) => {
+    const dataNode = getByPath(doc, dataPath);
+    if (dataNode === undefined) return;
+    let ok;
+    switch (keyword) {
+      case "const":
+        ok = dataNode !== entry.value;
+        break;
+      case "enum":
+        ok = !(Array.isArray(entry.value) && entry.value.includes(dataNode));
+        break;
+      case "pattern":
+        ok = typeof dataNode !== "string" || !new RegExp(entry.value).test(dataNode);
+        break;
+      case "minimum":
+        ok = typeof dataNode !== "number" || dataNode < entry.value;
+        break;
+      case "maxItems":
+        ok = !Array.isArray(dataNode) || dataNode.length > entry.value;
+        break;
+      default:
+        ok = true;
+    }
+    check(`data fixture "${label}" ${dataPath} violates ${keyword} ${JSON.stringify(entry.value)}`, ok,
+      `got ${JSON.stringify(dataNode)}`);
+  });
+}
+
+/**
+ * additionalProperties:false check. entries are DATA paths ("$" = root).
+ * For each, the schema object node must declare additionalProperties:false
+ * and the data object must use only declared property names.
+ */
+function checkAdditionalProperties(schema, entry) {
+  const dataPath = entry.path; // data path like "$", "policy", "secretModel"
+  const schemaTokens = dataPath === "$" ? [] : dataPath.split(".").map((seg) => `properties.${seg}`).join(".").split(".");
+  const schemaNode = dataPath === "$" ? schema : getByPath(schema, schemaTokens.join("."));
+  if (schemaNode === undefined || typeof schemaNode !== "object") {
+    check(`schema ${schema.$id ?? entry.path}: additionalProperties node for ${dataPath}`, false, "schema node missing");
+    return;
+  }
+  check(`schema ${schema.$id ?? entry.path}: additionalProperties:false at ${dataPath === "$" ? "$" : dataPath}`,
+    schemaNode.additionalProperties === false,
+    `schema declares ${JSON.stringify(schemaNode.additionalProperties)}`);
+  const declared = new Set(Object.keys(schemaNode.properties ?? {}));
+  entry.dataChecks.forEach(({ doc, label }) => {
+    const dataNode = dataPath === "$" ? doc : getByPath(doc, dataPath);
+    if (dataNode === undefined || typeof dataNode !== "object" || Array.isArray(dataNode)) return;
+    const extra = Object.keys(dataNode).filter((k) => !declared.has(k));
+    check(`data fixture "${label}" ${dataPath}: no undeclared keys`, extra.length === 0,
+      `undeclared: ${extra.join(", ")}`);
+  });
+}
+
+// ── Representative fixtures per schema (positive = must satisfy contract) ──
+
+const contractSchema = {
+  $id: "config/deployment-capacity-contracts.schema.json",
+};
+const paritySchema = {
+  $id: "config/deployment-capacity-parity.schema.json",
+};
+const releaseSchema = {
+  $id: "config/deployment-capacity-release.schema.json",
+};
+const provenanceSchema = {
+  $id: "config/deployment-capacity-provenance.schema.json",
+};
+const haSchema = {
+  $id: "config/deployment-capacity-ha.schema.json",
+};
+const benchmarkSchema = {
+  $id: "infra/capacity/benchmark.schema.json",
+};
+const reportSchema = {
+  $id: "infra/capacity/benchmark-report.schema.json",
+};
+const topologySchema = {
+  $id: "infra/capacity/managed-topology.schema.json",
+};
+
+// Positive fixtures mirror the SHIPPED repository data files.
+const shippedContracts = readJson("infra/deployment-contracts/manifest.json");
+const shippedParity = readJson("infra/deployment-contracts/parity-manifest.json");
+const shippedRelease = readJson("infra/deployment-contracts/release-record.example.json");
+const shippedProvenance = readJson("infra/deployment-contracts/provenance-manifest.json");
+const shippedHa = readJson("infra/capacity/ha-decision.example.json");
+const shippedTopology = readJson("infra/capacity/managed-topology.manifest.json");
+
+// Negative fixtures violate exactly one contract-critical invariant.
+const negContracts = { ...shippedContracts, deployed: true };
+const negParity = { ...shippedParity, parityAchieved: true };
+const negRelease = { ...shippedRelease, approval: { status: "ACCEPTED", owner: null, date: null } };
+const negProvenance = { ...shippedProvenance, signing: { ...shippedProvenance.signing, signed: true } };
+const negHa = { ...shippedHa, approval: { status: "ACCEPTED", owner: null, date: null } };
+const negBenchmark = { ...shippedBenchmark(), scenario: "live-provider" };
+const negReport = { ...shippedReport(), policy: { ...shippedReport().policy, capacityApproved: true } };
+const negTopology = { ...shippedTopology, deployed: true };
+
+function shippedBenchmark() {
+  return {
+    schemaVersion: "1.0.0",
+    scenario: "synthetic-local",
+    concurrency: 50,
+    durationSeconds: 120,
+    warmupSeconds: 10,
+    headroomPercent: 50,
+    saturationThresholdPercent: 80,
+    costUnit: { label: "per concurrent session-hour", currency: "USD", pricingStatus: "PENDING" },
+  };
+}
+function shippedReport() {
+  return {
+    schemaVersion: "1.0.0",
+    reportId: "synthetic-capacity-bench-fixture-42-20260802",
+    timestamp: "2026-08-02T00:00:00Z",
+    operator: "fixture",
+    evidence: {
+      evidenceType: "synthetic_local",
+      harness: "standard-library-local-simulation",
+      realTargets: false,
+      liveTargets: "none",
+    },
+    policy: {
+      state: "PROPOSED",
+      approvalStatus: "PENDING",
+      capacityApproved: false,
+      capacityConclusion: "none",
+      passBudget: "none",
+      headroomAppliedTo: "none",
+    },
+    inputs: { ...shippedBenchmark() },
+    results: {
+      timelineSeconds: 120,
+      warmupSeconds: 10,
+      sessionsAttempted: 100,
+      sessionsCompleted: 95,
+      sessionFailureRate: 0.05,
+      apiLatencyMs: { count: 5000, unit: "ms", min: 1, max: 99, mean: 42, p50: 40, p95: 80, p99: 95, stddev: 12 },
+      workerUtilizationPercent: { count: 120, unit: "percent", min: 5, max: 95, mean: 50, p50: 48, p95: 85, p99: 92, stddev: 20 },
+      queueDepth: { count: 120, unit: "sessions", min: 0, max: 10, mean: 1, p50: 0, p95: 6, p99: 9, stddev: 2 },
+      saturationEvents: 3,
+      saturationDescription: "No real measurement exists.",
+      headroomPercent: 50,
+    },
+    summary: { status: "SYNTHETIC_LOCAL", notYetMeasuredReason: "synthetic only", claims: "none", notes: [] },
+  };
+}
+
+const fixtureSet = (label, doc) => [{ doc, label }];
+
+// ── Frozen schema contracts (the drift guard) ────────────────────────────
+
+const SCHEMAS = [
+  {
+    file: "config/deployment-capacity-contracts.schema.json",
+    requiredTop: ["manifestVersion", "title", "description", "adrReference", "status", "approvalStatus", "deployed", "provisioned", "secretModel", "services", "migrations"],
+    invariants: [
+      { path: "properties.deployed.const", value: false, neg: { doc: negContracts, label: "contracts-negative" } },
+      { path: "properties.provisioned.const", value: false },
+      { path: "properties.approvalStatus.const", value: "PENDING" },
+      { path: "properties.adrReference.const", value: "docs/adr/0010-hosting-topology.md" },
+      { path: "properties.secretModel.properties.runtimeSource.const", value: "managed-infisical-runtime" },
+      { path: "$defs.migration.additionalProperties", value: false },
+      { path: "$defs.migration.properties.applied.const", value: false },
+      { path: "$defs.migration.properties.changeType.enum", value: ["additive", "breaking", "none"] },
+      { path: "$defs.envVar.additionalProperties", value: false },
+      { path: "properties.secretModel.properties.status.enum", value: ["PROPOSED", "PENDING"] },
+      { path: "$defs.envVar.properties.name.pattern", value: "^[A-Z][A-Z0-9_]*$" },
+      { path: "$defs.envVar.properties.secretSource.enum", value: ["managed-infisical-runtime", "build-time-config", "owner-managed-environment"] },
+    ],
+    additionalProps: [
+      { path: "$" },
+      { path: "secretModel" },
+    ],
+    positive: fixtureSet("contracts", shippedContracts),
+    negative: fixtureSet("contracts-negative", negContracts),
+  },
+  {
+    file: "config/deployment-capacity-parity.schema.json",
+    requiredTop: ["manifestVersion", "title", "description", "status", "approvalStatus", "sourceManifest", "rule", "secretNamesOnly", "scaleDifferencesAllowed", "parityStatus", "parityAchieved", "services"],
+    invariants: [
+      { path: "properties.sourceManifest.const", value: "infra/deployment-contracts/manifest.json" },
+      { path: "properties.secretNamesOnly.const", value: true },
+      { path: "properties.scaleDifferencesAllowed.const", value: true },
+      { path: "properties.parityStatus.const", value: "PENDING" },
+      { path: "properties.parityAchieved.const", value: false, neg: { doc: negParity, label: "parity-negative" } },
+      { path: "$defs.stageParity.properties.envVarNames.items.pattern", value: "^[A-Z][A-Z0-9_]*$" },
+    ],
+    additionalProps: [{ path: "$" }],
+    positive: fixtureSet("parity", shippedParity),
+    negative: fixtureSet("parity-negative", negParity),
+  },
+  {
+    file: "config/deployment-capacity-release.schema.json",
+    requiredTop: ["schemaVersion", "releaseId", "component", "created", "state", "fromState", "stage", "migrationMarker", "canary", "rollback", "evidence", "approval"],
+    invariants: [
+      { path: "properties.canary.properties.status.const", value: "PENDING" },
+      { path: "properties.evidence.properties.evidenceType.const", value: "synthetic_local" },
+      { path: "properties.evidence.properties.status.const", value: "PENDING" },
+      { path: "properties.approval.properties.status.const", value: "PENDING", neg: { doc: negRelease, label: "release-negative" } },
+      { path: "properties.canary.properties.observationWindowMinutes.minimum", value: 1 },
+      { path: "properties.state.enum", value: ["prepared", "staging_verified", "canary_observing", "promote_pending", "promoted", "rollback_required", "rolled_back", "aborted"] },
+      { path: "properties.stage.enum", value: ["staging", "prod"] },
+      { path: "properties.rollback.properties.compatibility.enum", value: ["compatible", "incompatible"] },
+      { path: "$defs.migrationMarker.properties.changeType.enum", value: ["additive", "breaking", "none"] },
+    ],
+    additionalProps: [{ path: "$" }, { path: "canary" }, { path: "approval" }, { path: "evidence" }],
+    positive: fixtureSet("release", shippedRelease),
+    negative: fixtureSet("release-negative", negRelease),
+  },
+  {
+    file: "config/deployment-capacity-provenance.schema.json",
+    requiredTop: ["manifestVersion", "provenanceSchema", "name", "description", "status", "approvalStatus", "generatedAt", "builder", "source", "lockfiles", "sboms", "testEvidence", "signing", "slsa"],
+    invariants: [
+      { path: "properties.generatedAt.const", value: "PENDING" },
+      { path: "properties.signing.properties.signed.const", value: false, neg: { doc: negProvenance, label: "provenance-negative" } },
+      { path: "properties.signing.properties.keyId.const", value: null },
+      { path: "properties.slsa.properties.level.const", value: 0 },
+      { path: "properties.slsa.properties.slsaLevelClaimed.const", value: 0 },
+      { path: "properties.signing.properties.attestations.maxItems", value: 0 },
+      { path: "properties.lockfiles.items.properties.sha256.pattern", value: "^(PENDING|[0-9a-f]{64})$" },
+      { path: "properties.testEvidence.items.properties.status.enum", value: ["PENDING_RUN", "PENDING", "NOT_RUN"] },
+      { path: "properties.source.properties.baselineCommitSha.pattern", value: "^[0-9a-f]{40}$" },
+    ],
+    additionalProps: [{ path: "$" }, { path: "signing" }, { path: "slsa" }, { path: "builder" }, { path: "source" }],
+    positive: fixtureSet("provenance", shippedProvenance),
+    negative: fixtureSet("provenance-negative", negProvenance),
+  },
+  {
+    file: "config/deployment-capacity-ha.schema.json",
+    requiredTop: ["schemaVersion", "decisionId", "component", "created", "decisionState", "haDecision", "singleInstanceRisk", "rtoRpo", "approval"],
+    invariants: [
+      { path: "properties.approval.properties.status.const", value: "PENDING", neg: { doc: negHa, label: "ha-negative" } },
+      { path: "properties.decisionState.enum", value: ["PROPOSED", "PENDING"] },
+      { path: "$defs.targetWindow.additionalProperties", value: false },
+    ],
+    additionalProps: [{ path: "$" }, { path: "haDecision" }, { path: "singleInstanceRisk" }, { path: "rtoRpo" }, { path: "approval" }],
+    positive: fixtureSet("ha", shippedHa),
+    negative: fixtureSet("ha-negative", negHa),
+  },
+  {
+    file: "infra/capacity/benchmark.schema.json",
+    requiredTop: ["schemaVersion", "scenario", "concurrency", "durationSeconds", "warmupSeconds", "headroomPercent", "costUnit"],
+    invariants: [
+      { path: "properties.scenario.const", value: "synthetic-local", neg: { doc: negBenchmark, label: "benchmark-negative" } },
+      { path: "properties.costUnit.properties.pricingStatus.const", value: "PENDING" },
+      { path: "properties.concurrency.minimum", value: 1 },
+      { path: "properties.costUnit.properties.currency.pattern", value: "^[A-Z]{3}$" },
+    ],
+    additionalProps: [{ path: "$" }, { path: "costUnit" }],
+    positive: fixtureSet("benchmark", shippedBenchmark()),
+    negative: fixtureSet("benchmark-negative", negBenchmark),
+  },
+  {
+    file: "infra/capacity/benchmark-report.schema.json",
+    requiredTop: ["schemaVersion", "reportId", "timestamp", "operator", "evidence", "policy", "inputs", "results", "summary"],
+    invariants: [
+      { path: "properties.evidence.properties.evidenceType.const", value: "synthetic_local" },
+      { path: "properties.evidence.properties.realTargets.const", value: false },
+      { path: "properties.policy.properties.capacityApproved.const", value: false, neg: { doc: negReport, label: "report-negative" } },
+      { path: "properties.policy.properties.approvalStatus.const", value: "PENDING" },
+      { path: "properties.policy.properties.state.enum", value: ["PROPOSED", "PENDING"] },
+      { path: "properties.summary.properties.status.const", value: "SYNTHETIC_LOCAL" },
+      { path: "properties.summary.properties.claims.const", value: "none" },
+    ],
+    additionalProps: [{ path: "$" }, { path: "evidence" }, { path: "policy" }, { path: "summary" }],
+    positive: fixtureSet("report", shippedReport()),
+    negative: fixtureSet("report-negative", negReport),
+  },
+  {
+    file: "infra/capacity/managed-topology.schema.json",
+    requiredTop: ["manifestVersion", "title", "description", "adrReference", "status", "approvalStatus", "provisioned", "deployed", "components", "externalPending"],
+    invariants: [
+      { path: "properties.provisioned.const", value: false },
+      { path: "properties.deployed.const", value: false, neg: { doc: negTopology, label: "topology-negative" } },
+      { path: "properties.approvalStatus.const", value: "PENDING" },
+      { path: "properties.status.enum", value: ["PROPOSED", "PENDING"] },
+      { path: "properties.components.items.properties.scaleTriggers.items.properties.status.enum", value: ["PROPOSED", "PENDING"] },
+    ],
+    additionalProps: [{ path: "$" }],
+    positive: fixtureSet("topology", shippedTopology),
+    negative: fixtureSet("topology-negative", negTopology),
+  },
+];
+
+function readJson(filePath) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(ROOT, filePath), "utf8"));
+  } catch (e) {
+    throw new Error(`cannot read ${filePath}: ${e.message}`);
+  }
+}
+
+// ── Run schema contract checks ──────────────────────────────────────────
+
+for (const schemaDef of SCHEMAS) {
+  let schema;
+  try {
+    schema = readJson(schemaDef.file);
+  } catch (e) {
+    failures.push(e.message);
+    continue;
+  }
+  const id = schemaDef.file;
+
+  for (const key of schemaDef.requiredTop) {
+    check(`schema ${id}: required contains ${key}`, Array.isArray(schema.required) && schema.required.includes(key),
+      `required=${JSON.stringify(schema.required)}`);
+  }
+  for (const inv of schemaDef.invariants) {
+    checkInvariant(schema, {
+      ...inv,
+      positiveChecks: schemaDef.positive,
+      negativeChecks: inv.neg ? [inv.neg] : [],
+    });
+  }
+  for (const addProp of schemaDef.additionalProps) {
+    checkAdditionalProperties(schema, { ...addProp, dataChecks: schemaDef.positive });
+  }
+}
+
+// ── Executable-validator agreement probes (offline) ─────────────────────
+
+function runNode(script, args, label) {
+  const result = spawnSync(process.execPath, [script, ...args], { cwd: ROOT, encoding: "utf8" });
+  check(`executable agreement: ${label} exit 0`, result.status === 0,
+    `exit=${result.status} ${(result.stderr || "").slice(0, 200)}`);
+  return result;
+}
+
+function runNodeExpectFail(script, args, label) {
+  const result = spawnSync(process.execPath, [script, ...args], { cwd: ROOT, encoding: "utf8" });
+  check(`executable agreement: ${label} rejects (exit non-zero)`, result.status !== 0,
+    `expected rejection but exit=0`);
+  return result;
+}
+
+// Positive agreement: shipped data satisfies both schema contract and the executable validator.
+runNode("scripts/validate-deployment-contracts", [], "validate-deployment-contracts repo mode");
+runNode("scripts/validate-deployment-contracts", ["--fixtures"], "validate-deployment-contracts --fixtures");
+runNode("scripts/validate-deployment-release", ["validate", "infra/deployment-contracts/release-record.example.json"], "validate-deployment-release example record");
+runNode("scripts/validate-deployment-release", ["--fixtures"], "validate-deployment-release --fixtures");
+runNode("scripts/artifact-provenance-validate", ["validate", "infra/deployment-contracts/provenance-manifest.json"], "artifact-provenance-validate repo template");
+runNode("scripts/artifact-provenance-validate", ["--fixtures"], "artifact-provenance-validate --fixtures");
+runNode("scripts/capacity-benchmark-run", ["ha-validate", "infra/capacity/ha-decision.example.json"], "capacity ha-validate example");
+runNode("scripts/capacity-benchmark-run", ["topology-validate", "infra/capacity/managed-topology.manifest.json"], "capacity topology-validate manifest");
+
+// Negative agreement: schema-contract negatives must also be rejected by the
+// executable validators that accept a file argument (temp files, offline).
+const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "dep-schema-drift-"));
+try {
+  const writeNeg = (name, doc) => {
+    const p = path.join(tempDir, name);
+    fs.writeFileSync(p, JSON.stringify(doc));
+    return p;
+  };
+  runNodeExpectFail("scripts/validate-deployment-release", ["validate", writeNeg("release-neg.json", negRelease)], "release validator rejects ACCEPTED approval");
+  runNodeExpectFail("scripts/artifact-provenance-validate", ["validate", writeNeg("prov-neg.json", negProvenance)], "provenance validator rejects signed:true");
+  runNodeExpectFail("scripts/capacity-benchmark-run", ["ha-validate", writeNeg("ha-neg.json", negHa)], "capacity ha-validate rejects ACCEPTED");
+  runNodeExpectFail("scripts/capacity-benchmark-run", ["topology-validate", writeNeg("topo-neg.json", negTopology)], "capacity topology-validate rejects deployed:true");
+  runNodeExpectFail("scripts/capacity-benchmark-run", ["config-validate", writeNeg("bench-neg.json", negBenchmark)], "capacity config-validate rejects non-synthetic scenario");
+  runNodeExpectFail("scripts/capacity-benchmark-run", ["schema-validate", writeNeg("report-neg.json", negReport)], "capacity schema-validate rejects capacityApproved:true");
+} finally {
+  fs.rmSync(tempDir, { recursive: true, force: true });
+}
+
+// ── Report ──────────────────────────────────────────────────────────────
+
+if (failures.length) {
+  console.error(`validate-deployment-schema-drift FAILED (${failures.length}):`);
+  for (const f of failures) console.error(`- ${f}`);
+  process.exit(1);
+}
+console.log(`validate-deployment-schema-drift passed: ${SCHEMAS.length} published Phase 11 schemas, ${checksRun} contract-critical invariant checks, all executable validators agree.`);
+console.log("NOTE: this is contract-critical schema drift validation, not full Draft 2020-12 validation (no JSON Schema engine dependency is permitted).");

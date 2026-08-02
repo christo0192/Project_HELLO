@@ -1,0 +1,506 @@
+#!/usr/bin/env node
+"use strict";
+
+/**
+ * DEP-04/05 deployment contract + staging/prod parity validator.
+ *
+ * Validates the provider-neutral deployment contract manifest
+ * (infra/deployment-contracts/manifest.json) and the staging/prod parity
+ * manifest (infra/deployment-contracts/parity-manifest.json) against the
+ * audited plan's lane-B2 invariants:
+ *
+ *   - env var NAMES only — any value, '='-joined name, or secret-like token
+ *     is rejected (FND-05/ADR-0010 decision 2: runtime injection only);
+ *   - all 7 ADR-0010 components must carry a deployment contract (missing
+ *     service is rejected);
+ *   - staging/prod structural parity with scale-only differences allowed;
+ *     stage mismatches (env name present in one stage only, missing parity
+ *     entry, unlisted service) are rejected;
+ *   - no Terraform files anywhere under infra/deployment-contracts (C3);
+ *   - no provider/cloud URLs, no credentials, no manual-production claims;
+ *   - every env var NAME must be declared in config/environment.schema.json.
+ *
+ * Usage:
+ *   node scripts/validate-deployment-contracts              # validate repo files
+ *   node scripts/validate-deployment-contracts validate     # same
+ *   node scripts/validate-deployment-contracts --fixtures   # seeded negative controls
+ */
+
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+const VERSION = "1.0.0";
+const ROOT = path.resolve(__dirname, "..");
+const CONTRACTS_DIR = path.join(ROOT, "infra", "deployment-contracts");
+const MANIFEST_PATH = path.join(CONTRACTS_DIR, "manifest.json");
+const PARITY_PATH = path.join(CONTRACTS_DIR, "parity-manifest.json");
+const ENV_SCHEMA_PATH = path.join(ROOT, "config", "environment.schema.json");
+
+// Every ADR-0010 component must have a deployment contract (DEP-04 "missing
+// services" negative control).
+const REQUIRED_SERVICE_IDS = [
+  "web-api",
+  "livekit-cloud",
+  "livekit-agents",
+  "supabase",
+  "infisical-managed",
+  "oci-e2-gateway",
+  "vps-fallback",
+];
+
+const SECRET_SOURCES = ["managed-infisical-runtime", "build-time-config", "owner-managed-environment"];
+const ENV_NAME_RE = /^[A-Z][A-Z0-9_]*$/;
+const STAGE_NAMES = ["staging", "prod"];
+
+// Secret-like VALUE patterns. Variable NAMES and source identifiers (e.g.
+// "managed-infisical-runtime") are not values and must never be flagged.
+const SECRET_VALUE_PATTERNS = [
+  /(sk-[a-zA-Z0-9]{20,})/i,
+  /[^\s:]+:[^\s@]+@/, // user:password@host
+  /:\/\/[^\s@]+@/, // protocol://user:pass@host
+  /(eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{5,})/i, // JWT
+  /(BEGIN (?:PGP|RSA|EC|OPENSSH|CERTIFICATE) PRIVATE KEY|BEGIN PGP SIGNATURE|BEGIN CERTIFICATE)/,
+];
+const URL_PATTERN = /\b(?:https?|wss?|ftp):\/\//i;
+
+const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+
+function collectStrings(value, out) {
+  if (typeof value === "string") out.push(value);
+  else if (Array.isArray(value)) for (const item of value) collectStrings(item, out);
+  else if (isObject(value)) for (const item of Object.values(value)) collectStrings(item, out);
+  return out;
+}
+
+function hasSecretValue(doc) {
+  return collectStrings(doc, []).some((s) => SECRET_VALUE_PATTERNS.some((re) => re.test(s)));
+}
+
+function hasUrl(doc) {
+  return collectStrings(doc, []).some((s) => URL_PATTERN.test(s));
+}
+
+// ---------------------------------------------------------------------------
+// Deployment contract manifest validation
+// ---------------------------------------------------------------------------
+
+function validateManifest(doc, envNames) {
+  const errors = [];
+  if (!isObject(doc)) return ["manifest must be a JSON object"];
+  for (const key of ["manifestVersion", "title", "description", "adrReference", "status", "approvalStatus", "secretModel", "services", "migrations"]) {
+    if (!(key in doc)) errors.push(`manifest.${key} is required`);
+  }
+  if (doc.status !== undefined && !["PROPOSED", "PENDING"].includes(doc.status)) errors.push("manifest.status must be PROPOSED or PENDING");
+  if (doc.approvalStatus !== undefined && doc.approvalStatus !== "PENDING") errors.push("manifest.approvalStatus must be PENDING — no acceptance is granted by repository work");
+  if (doc.deployed !== false) errors.push("manifest.deployed must be false — nothing is deployed by repository work");
+  if (doc.provisioned !== false) errors.push("manifest.provisioned must be false — nothing is provisioned by repository work");
+
+  if (isObject(doc.secretModel)) {
+    if (doc.secretModel.runtimeSource !== "managed-infisical-runtime") {
+      errors.push('manifest.secretModel.runtimeSource must be "managed-infisical-runtime" (ADR-0010 decision 2 runtime injection)');
+    }
+    if (!["PROPOSED", "PENDING"].includes(doc.secretModel.status)) errors.push("manifest.secretModel.status must be PROPOSED or PENDING");
+  } else if (doc.secretModel !== undefined) {
+    errors.push("manifest.secretModel must be an object");
+  }
+
+  if (!Array.isArray(doc.services)) return errors.concat(["manifest.services must be an array"]);
+
+  const ids = new Set();
+  doc.services.forEach((service, idx) => {
+    const p = `manifest.services[${idx}]`;
+    if (!isObject(service)) return void errors.push(`${p} must be an object`);
+    if (typeof service.serviceId !== "string" || !service.serviceId) errors.push(`${p}.serviceId is required`);
+    if (service.serviceId) ids.add(service.serviceId);
+    for (const key of ["name", "component", "runtime", "artifactType", "artifactInput", "envVars", "stages"]) {
+      if (!(key in service)) errors.push(`${p}.${key} is required`);
+    }
+    if (service.artifactType !== undefined && !["docker-image", "managed-service", "instance"].includes(service.artifactType)) {
+      errors.push(`${p}.artifactType must be docker-image, managed-service or instance`);
+    }
+
+    if (!Array.isArray(service.envVars)) {
+      errors.push(`${p}.envVars must be an array`);
+    } else {
+      const names = new Set();
+      service.envVars.forEach((ev, evi) => {
+        const ep = `${p}.envVars[${evi}]`;
+        if (!isObject(ev)) return void errors.push(`${ep} must be an object`);
+        if (typeof ev.name !== "string" || !ENV_NAME_RE.test(ev.name)) {
+          errors.push(`${ep}.name must be an env var NAME (^[A-Z][A-Z0-9_]*$); values are never stored in deployment contracts (env value negative control)`);
+          return;
+        }
+        if (names.has(ev.name)) errors.push(`${ep}: duplicate env var name ${ev.name}`);
+        names.add(ev.name);
+        if ("value" in ev) errors.push(`${ep}: env VALUES are never stored in deployment contracts (names only)`);
+        if (typeof ev.secret !== "boolean") errors.push(`${ep}.secret must be a boolean`);
+        if (ev.secretSource !== undefined && !SECRET_SOURCES.includes(ev.secretSource)) {
+          errors.push(`${ep}.secretSource must be one of: ${SECRET_SOURCES.join(", ")}`);
+        }
+        if (envNames && !envNames.has(ev.name)) {
+          errors.push(`${ep}: env var name ${ev.name} is not declared in config/environment.schema.json`);
+        }
+      });
+    }
+
+    if (!isObject(service.stages)) {
+      errors.push(`${p}.stages must be an object with staging and prod`);
+      return;
+    }
+    for (const stage of STAGE_NAMES) {
+      const st = service.stages[stage];
+      const sp = `${p}.stages.${stage}`;
+      if (!isObject(st)) {
+        errors.push(`${sp} is required`);
+        continue;
+      }
+      if (!["PROPOSED", "PENDING", "NOT_DEPLOYED"].includes(st.status)) errors.push(`${sp}.status must be PROPOSED, PENDING or NOT_DEPLOYED`);
+      if (!Number.isInteger(st.replicasProposed) || st.replicasProposed < 0) errors.push(`${sp}.replicasProposed must be a non-negative integer`);
+      if (typeof st.instanceSizeProposed !== "string" || !st.instanceSizeProposed) errors.push(`${sp}.instanceSizeProposed is required`);
+    }
+  });
+
+  for (const required of REQUIRED_SERVICE_IDS) {
+    if (!ids.has(required)) errors.push(`missing required service "${required}" — every ADR-0010 component must have a deployment contract (missing service negative control)`);
+  }
+
+  if (!Array.isArray(doc.migrations)) {
+    errors.push("manifest.migrations must be an array");
+  } else {
+    const migIds = new Set();
+    doc.migrations.forEach((m, i) => {
+      const mp = `manifest.migrations[${i}]`;
+      if (!isObject(m)) return void errors.push(`${mp} must be an object`);
+      for (const key of ["id", "schemaVersion", "changeType", "scope", "status", "applied"]) {
+        if (!(key in m)) errors.push(`${mp}.${key} is required`);
+      }
+      if (typeof m.id === "string" && migIds.has(m.id)) errors.push(`${mp}: duplicate migration id ${m.id}`);
+      if (typeof m.id === "string") migIds.add(m.id);
+      if (!Number.isInteger(m.schemaVersion) || m.schemaVersion < 1) errors.push(`${mp}.schemaVersion must be an integer >= 1`);
+      if (!["additive", "breaking", "none"].includes(m.changeType)) errors.push(`${mp}.changeType must be additive, breaking or none`);
+      if (!["PROPOSED", "PENDING"].includes(m.status)) errors.push(`${mp}.status must be PROPOSED or PENDING`);
+      if (m.applied !== false) errors.push(`${mp}.applied must be false — migrations are not applied by repository work`);
+    });
+  }
+
+  if (hasUrl(doc)) errors.push("manifest contains a URL-like string — provider/cloud endpoints are never referenced");
+  if (hasSecretValue(doc)) errors.push("manifest contains a secret-like value — names and placeholders only");
+  return errors;
+}
+
+// ---------------------------------------------------------------------------
+// Staging/prod parity validation
+// ---------------------------------------------------------------------------
+
+function validateParity(manifestDoc, parityDoc) {
+  const errors = [];
+  if (!isObject(parityDoc)) return ["parity manifest must be a JSON object"];
+  for (const key of ["manifestVersion", "title", "description", "status", "approvalStatus", "sourceManifest", "rule", "secretNamesOnly", "scaleDifferencesAllowed", "parityStatus", "parityAchieved", "services"]) {
+    if (!(key in parityDoc)) errors.push(`parity.${key} is required`);
+  }
+  if (parityDoc.sourceManifest !== undefined && parityDoc.sourceManifest !== "infra/deployment-contracts/manifest.json") {
+    errors.push('parity.sourceManifest must be "infra/deployment-contracts/manifest.json" (repository manifest only)');
+  }
+  if (parityDoc.secretNamesOnly !== true) errors.push("parity.secretNamesOnly must be true — secret names only, never values");
+  if (parityDoc.scaleDifferencesAllowed !== true) errors.push("parity.scaleDifferencesAllowed must be true — scale-only differences are allowed");
+  if (parityDoc.parityStatus !== "PENDING") errors.push("parity.parityStatus must be PENDING — parity is a repository assertion, not a deployment claim");
+  if (parityDoc.parityAchieved !== false) errors.push("parity.parityAchieved must be false — nothing is deployed, so no parity is achieved");
+
+  if (!Array.isArray(parityDoc.services)) return errors.concat(["parity.services must be an array"]);
+
+  const manifestServices = new Map((manifestDoc?.services || []).map((s) => [s.serviceId, s]));
+  const parityIds = new Set();
+
+  parityDoc.services.forEach((svc, idx) => {
+    const p = `parity.services[${idx}]`;
+    if (!isObject(svc)) return void errors.push(`${p} must be an object`);
+    if (typeof svc.serviceId !== "string" || !svc.serviceId) return void errors.push(`${p}.serviceId is required`);
+    parityIds.add(svc.serviceId);
+
+    const manifestSvc = manifestServices.get(svc.serviceId);
+    if (!manifestSvc) {
+      errors.push(`${p}: service ${svc.serviceId} is not present in the deployment contract manifest (unlisted service)`);
+      return;
+    }
+    for (const stage of STAGE_NAMES) {
+      const st = svc[stage];
+      const sp = `${p}.${stage}`;
+      if (!isObject(st)) {
+        errors.push(`${sp} is required for service ${svc.serviceId}`);
+        continue;
+      }
+      if (!Number.isInteger(st.replicasProposed) || st.replicasProposed < 0) errors.push(`${sp}.replicasProposed must be a non-negative integer`);
+      if (typeof st.instanceSizeProposed !== "string" || !st.instanceSizeProposed) errors.push(`${sp}.instanceSizeProposed is required`);
+      if (!Array.isArray(st.envVarNames)) {
+        errors.push(`${sp}.envVarNames must be an array (names only)`);
+        continue;
+      }
+      st.envVarNames.forEach((name, ni) => {
+        if (typeof name !== "string" || !ENV_NAME_RE.test(name)) {
+          errors.push(`${sp}.envVarNames[${ni}] must be an env var NAME; values are never stored (env value negative control)`);
+        }
+      });
+    }
+
+    // Stage mismatch: staging and prod env var NAME sets must be identical.
+    const stagingNames = new Set(Array.isArray(svc.staging?.envVarNames) ? svc.staging.envVarNames : []);
+    const prodNames = new Set(Array.isArray(svc.prod?.envVarNames) ? svc.prod.envVarNames : []);
+    for (const name of stagingNames) {
+      if (!prodNames.has(name)) errors.push(`${p}: stage mismatch — env var name ${name} present in staging but missing in prod`);
+    }
+    for (const name of prodNames) {
+      if (!stagingNames.has(name)) errors.push(`${p}: stage mismatch — env var name ${name} present in prod but missing in staging`);
+    }
+
+    // Consistency with the source manifest's service-level env contract.
+    const manifestEnvNames = new Set((manifestSvc.envVars || []).map((ev) => ev.name));
+    for (const name of stagingNames) {
+      if (!manifestEnvNames.has(name)) errors.push(`${p}: env var name ${name} is not declared in the deployment contract manifest for ${svc.serviceId}`);
+    }
+
+    // Structural-equivalence assertions must all be true (parity is structural).
+    const se = svc.structuralEquivalence || {};
+    for (const field of ["sameService", "sameEnvVarNames", "sameSecretNames", "sameArtifactInput", "sameRuntime"]) {
+      if (se[field] !== true) errors.push(`${p}.structuralEquivalence.${field} must be true — staging/prod structure is identical by contract`);
+    }
+    if (se.status !== undefined && !["PROPOSED", "PENDING"].includes(se.status)) {
+      errors.push(`${p}.structuralEquivalence.status must be PROPOSED or PENDING`);
+    }
+  });
+
+  for (const serviceId of manifestServices.keys()) {
+    if (!parityIds.has(serviceId)) errors.push(`parity: missing parity entry for service ${serviceId} (every contract service needs staging/prod parity)`);
+  }
+
+  if (hasUrl(parityDoc)) errors.push("parity manifest contains a URL-like string — provider/cloud endpoints are never referenced");
+  if (hasSecretValue(parityDoc)) errors.push("parity manifest contains a secret-like value — names only");
+  return errors;
+}
+
+// ---------------------------------------------------------------------------
+// Terraform prohibition (C3): infra/deployment-contracts is JSON/YAML only
+// ---------------------------------------------------------------------------
+
+function scanNoTf(dir) {
+  const errors = [];
+  const walk = (d) => {
+    for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
+      const full = path.join(d, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith(".tf")) {
+        errors.push(`Terraform file forbidden in deployment contracts: ${path.relative(ROOT, full)} — infra/deployment-contracts is provider-neutral JSON/YAML only (no .tf files)`);
+      }
+    }
+  };
+  if (fs.existsSync(dir)) walk(dir);
+  return errors;
+}
+
+// ---------------------------------------------------------------------------
+// IO + repo validation
+// ---------------------------------------------------------------------------
+
+function readJson(filePath, label) {
+  try {
+    return { data: JSON.parse(fs.readFileSync(filePath, "utf8")) };
+  } catch (e) {
+    return { error: `${label} at ${filePath}: ${e.message}` };
+  }
+}
+
+function envNameSet() {
+  try {
+    const schema = JSON.parse(fs.readFileSync(ENV_SCHEMA_PATH, "utf8"));
+    const names = new Set();
+    for (const config of Object.values(schema.components || {})) {
+      for (const name of Object.keys(config.variables || {})) names.add(name);
+    }
+    return names;
+  } catch {
+    return null;
+  }
+}
+
+function validateRealRepo() {
+  const errors = [];
+  errors.push(...scanNoTf(CONTRACTS_DIR));
+  const envNames = envNameSet();
+  if (!envNames) errors.push("cannot read config/environment.schema.json (env NAME cross-check disabled)");
+  const manifest = readJson(MANIFEST_PATH, "deployment contract manifest");
+  if (manifest.error) errors.push(manifest.error);
+  else errors.push(...validateManifest(manifest.data, envNames));
+  const parity = readJson(PARITY_PATH, "parity manifest");
+  if (parity.error) errors.push(parity.error);
+  else errors.push(...validateParity(manifest.error ? null : manifest.data, parity.data));
+  return errors;
+}
+
+// ---------------------------------------------------------------------------
+// Seeded negative-control suite (--fixtures)
+// ---------------------------------------------------------------------------
+
+function runFixtures() {
+  const failures = [];
+  const envNames = envNameSet();
+  if (!envNames) failures.push("cannot load env schema for fixtures");
+
+  const expectReject = (name, errors, fragment) => {
+    if (errors.length === 0) failures.push(`${name}: expected rejection, got PASS`);
+    else if (fragment && !errors.join("\n").includes(fragment)) {
+      failures.push(`${name}: rejection message missing "${fragment}": ${errors.join("; ").slice(0, 400)}`);
+    }
+  };
+  const expectPass = (name, errors) => {
+    if (errors.length) failures.push(`${name}: expected PASS, got: ${errors.join("; ").slice(0, 400)}`);
+  };
+
+  const baseManifest = readJson(MANIFEST_PATH, "manifest").data;
+  expectPass("repo deployment contract manifest validates", validateManifest(baseManifest, envNames));
+
+  // 1. env value in the NAME field (SUPABASE_SERVICE_ROLE_KEY=value form).
+  const envValue = JSON.parse(JSON.stringify(baseManifest));
+  envValue.services[0].envVars[0].name = "SUPABASE_SERVICE_ROLE_KEY=supersecret";
+  expectReject("env value (name contains '=') rejected", validateManifest(envValue, envNames), "env var NAME");
+
+  // 2. env VALUE field on an entry.
+  const envValueField = JSON.parse(JSON.stringify(baseManifest));
+  envValueField.services[0].envVars[0].value = "supersecret";
+  expectReject("env value field rejected", validateManifest(envValueField, envNames), "VALUES");
+
+  // 3. missing service.
+  const missingService = JSON.parse(JSON.stringify(baseManifest));
+  missingService.services = missingService.services.filter((s) => s.serviceId !== "supabase");
+  expectReject("missing service rejected", validateManifest(missingService, envNames), "missing required service");
+
+  // 4. secret-like token (runtime-constructed so no literal key exists).
+  const skToken = "sk-" + ["syntheticbenchmark", "token", "notarealkey", "0123456789abcdefghij"].join("");
+  const secretManifest = JSON.parse(JSON.stringify(baseManifest));
+  secretManifest.description += " fixture value " + skToken;
+  expectReject("secret-like token rejected", validateManifest(secretManifest, envNames), "secret-like value");
+
+  // 5. provider/cloud URL.
+  const urlManifest = JSON.parse(JSON.stringify(baseManifest));
+  urlManifest.services[0].artifactInput = "https://example.invalid/registry/image";
+  expectReject("URL-like string rejected", validateManifest(urlManifest, envNames), "URL-like");
+
+  // 6. env name not declared in config/environment.schema.json.
+  const undeclared = JSON.parse(JSON.stringify(baseManifest));
+  undeclared.services[0].envVars.push({ name: "NOT_IN_ENV_SCHEMA", secret: false, secretSource: "managed-infisical-runtime" });
+  expectReject("undeclared env name rejected", validateManifest(undeclared, envNames), "environment.schema.json");
+
+  // 7. false deployment claim.
+  const deployedManifest = JSON.parse(JSON.stringify(baseManifest));
+  deployedManifest.deployed = true;
+  expectReject("deployed:true rejected", validateManifest(deployedManifest, envNames), "deployed must be false");
+
+  // 8. duplicate migration id.
+  const dupMig = JSON.parse(JSON.stringify(baseManifest));
+  dupMig.migrations[0].id = "mig-002";
+  expectReject("duplicate migration id rejected", validateManifest(dupMig, envNames), "duplicate migration id");
+
+  const baseParity = readJson(PARITY_PATH, "parity").data;
+  expectPass("repo parity manifest validates", validateParity(baseManifest, baseParity));
+
+  // 9. stage mismatch: an env name present in prod but missing in staging.
+  const stageMismatch = JSON.parse(JSON.stringify(baseParity));
+  stageMismatch.services[0].prod.envVarNames.push("PROD_ONLY_SECRET");
+  expectReject("stage mismatch (prod-only env name) rejected", validateParity(baseManifest, stageMismatch), "stage mismatch");
+
+  // 10. stage mismatch: an env name present in staging but missing in prod.
+  const stageMismatch2 = JSON.parse(JSON.stringify(baseParity));
+  stageMismatch2.services[1].staging.envVarNames.push("STAGING_ONLY_VAR");
+  expectReject("stage mismatch (staging-only env name) rejected", validateParity(baseManifest, stageMismatch2), "stage mismatch");
+
+  // 11. missing parity entry for a contract service.
+  const missingParityService = JSON.parse(JSON.stringify(baseParity));
+  missingParityService.services = missingParityService.services.filter((s) => s.serviceId !== "vps-fallback");
+  expectReject("missing parity service rejected", validateParity(baseManifest, missingParityService), "missing parity entry");
+
+  // 12. parity claimed achieved (false deployment claim).
+  const parityAchieved = JSON.parse(JSON.stringify(baseParity));
+  parityAchieved.parityAchieved = true;
+  expectReject("parityAchieved:true rejected", validateParity(baseManifest, parityAchieved), "parityAchieved");
+
+  // 13. structural equivalence asserted false.
+  const seFalse = JSON.parse(JSON.stringify(baseParity));
+  seFalse.services[1].structuralEquivalence.sameEnvVarNames = false;
+  expectReject("structural equivalence false rejected", validateParity(baseManifest, seFalse), "sameEnvVarNames");
+
+  // 14. unlisted service in parity.
+  const unknownSvc = JSON.parse(JSON.stringify(baseParity));
+  unknownSvc.services.push({
+    serviceId: "not-a-service",
+    staging: { replicasProposed: 1, instanceSizeProposed: "x", envVarNames: [] },
+    prod: { replicasProposed: 1, instanceSizeProposed: "x", envVarNames: [] },
+    structuralEquivalence: { sameService: true, sameEnvVarNames: true, sameSecretNames: true, sameArtifactInput: true, sameRuntime: true, status: "PENDING" },
+  });
+  expectReject("unlisted parity service rejected", validateParity(baseManifest, unknownSvc), "not present in the deployment contract manifest");
+
+  // 15. env VALUE inside a parity envVarNames entry.
+  const parityValue = JSON.parse(JSON.stringify(baseParity));
+  parityValue.services[0].staging.envVarNames[0] = "SUPABASE_URL=https://db.example.invalid";
+  expectReject("parity env value rejected", validateParity(baseManifest, parityValue), "env var NAME");
+
+  // 16. scale-only difference is allowed (structural parity holds).
+  const scaleDiff = JSON.parse(JSON.stringify(baseParity));
+  scaleDiff.services[0].prod.replicasProposed = 5;
+  expectPass("scale-only difference allowed", validateParity(baseManifest, scaleDiff));
+
+  // 17. .tf file in the contracts dir must be a build failure.
+  const tfDir = fs.mkdtempSync(path.join(os.tmpdir(), "dep-contracts-tf-"));
+  try {
+    fs.mkdirSync(path.join(tfDir, "infra", "deployment-contracts"), { recursive: true });
+    fs.writeFileSync(path.join(tfDir, "infra", "deployment-contracts", "plan.tf"), 'resource "fake" "x" {}\n');
+    const tfErrors = scanNoTf(path.join(tfDir, "infra", "deployment-contracts"));
+    expectReject(".tf file rejected", tfErrors, "Terraform file forbidden");
+  } finally {
+    fs.rmSync(tfDir, { recursive: true, force: true });
+  }
+
+  // 18. empty dir has no Terraform.
+  const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), "dep-contracts-empty-"));
+  try {
+    const emptyErrors = scanNoTf(emptyDir);
+    expectPass("empty contracts dir has no .tf", emptyErrors);
+  } finally {
+    fs.rmSync(emptyDir, { recursive: true, force: true });
+  }
+
+  return failures;
+}
+
+// ---------------------------------------------------------------------------
+// CLI dispatch
+// ---------------------------------------------------------------------------
+
+const command = process.argv[2];
+let failures = [];
+
+if (command === "--fixtures") {
+  failures = runFixtures();
+  if (failures.length) {
+    console.error(`validate-deployment-contracts --fixtures FAILED (${failures.length}):`);
+    for (const f of failures) console.error(`- ${f}`);
+    process.exit(1);
+  }
+  console.log("validate-deployment-contracts --fixtures passed: all seeded deployment-contract/parity negative controls behave as required (env value, missing service, stage mismatch, .tf, secrets, URLs, false claims).");
+  process.exit(0);
+}
+
+if (command !== undefined && command !== "validate") {
+  console.error(`Unknown command "${command}". Usage: node scripts/validate-deployment-contracts [validate|--fixtures]`);
+  process.exit(2);
+}
+
+const errors = validateRealRepo();
+if (errors.length) {
+  console.error(`deployment contracts validation FAILED (${errors.length}):`);
+  for (const error of errors) console.error(`- ${error}`);
+  process.exit(1);
+}
+console.log("deployment contracts validation passed:");
+console.log("  - infra/deployment-contracts/manifest.json (7 ADR-0010 services, env names only, runtime secret source)");
+console.log("  - infra/deployment-contracts/parity-manifest.json (staging/prod structural parity, scale-only differences)");
+console.log("  - no .tf files under infra/deployment-contracts (C3)");
+console.log("  - every env var NAME declared in config/environment.schema.json");

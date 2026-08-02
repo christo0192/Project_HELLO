@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/christo0192/Project_HELLO/infra/capacity/benchmark.schema.json",
+  "title": "Synthetic Local Capacity Benchmark Configuration",
+  "description": "Input configuration for the deterministic synthetic_local capacity benchmark CLI (DEP-01 foundation). Contains harness inputs only: concurrency, duration, warmup, headroom placeholder, and a cost-unit definition. Contains no real endpoints, no credentials, no provider prices, and no capacity conclusions. Provider pricing and entitlements remain PENDING owner verification.",
+  "version": "1.0.0",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "scenario",
+    "concurrency",
+    "durationSeconds",
+    "warmupSeconds",
+    "headroomPercent",
+    "costUnit"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "description": "Semantic version of this schema"
+    },
+    "scenario": {
+      "type": "string",
+      "const": "synthetic-local",
+      "description": "The only supported scenario. The harness runs a local, deterministic simulation; live targets are owner-operated and never run in CI."
+    },
+    "concurrency": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000,
+      "description": "Target concurrent session count to simulate. An input to the synthetic harness, not a measured capacity claim."
+    },
+    "durationSeconds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 86400,
+      "description": "Measurement window length after warmup, in seconds."
+    },
+    "warmupSeconds": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 3600,
+      "description": "Synthetic warmup window, in seconds. Warmup observations are not included in reported results."
+    },
+    "headroomPercent": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 200,
+      "description": "SRE-input placeholder for the safety headroom percentage to apply. Stored as an input only; the synthetic harness derives no capacity conclusion from it."
+    },
+    "saturationThresholdPercent": {
+      "type": "number",
+      "minimum": 1,
+      "maximum": 100,
+      "description": "Synthetic saturation detection threshold expressed as worker utilization percent. A harness parameter, not a pass/fail budget."
+    },
+    "costUnit": {
+      "type": "object",
+      "required": ["label", "currency", "pricingStatus"],
+      "properties": {
+        "label": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 120,
+          "description": "Unit label, for example 'per concurrent session-hour'. A definition only, never a price."
+        },
+        "currency": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}$",
+          "description": "ISO 4217 currency code for the future cost unit."
+        },
+        "pricingStatus": {
+          "type": "string",
+          "const": "PENDING",
+          "description": "Provider pricing and entitlement verification is PENDING owner verification. No price value is stored here."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/christo0192/Project_HELLO/config/deployment-capacity-release.schema.json",
+  "title": "Deterministic release state machine record schema (DEP-06)",
+  "description": "Release record for the DEP-06 deterministic canary/blue-green state machine: prepared → staging_verified → canary_observing → promote_pending → promoted, with rollback_required → rolled_back | aborted escape paths. Only forward transitions from the documented machine are legal; prepared → promoted and any skip of staging verification are invalid. Rollback compatibility is checked against migration markers declared in the repository manifest only. Nothing here is deployed: the example record stays in prepared, approval stays PENDING, and canary cohort/window stay PENDING SRE/product.",
+  "version": "1.0.0",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "releaseId",
+    "component",
+    "created",
+    "state",
+    "fromState",
+    "stage",
+    "migrationMarker",
+    "canary",
+    "rollback",
+    "evidence",
+    "approval"
+  ],
+  "properties": {
+    "schemaVersion": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "releaseId": { "type": "string", "pattern": "^release-[a-z0-9-]+$" },
+    "component": { "type": "string", "minLength": 1 },
+    "created": { "type": "string", "format": "date-time" },
+    "state": {
+      "type": "string",
+      "enum": ["prepared", "staging_verified", "canary_observing", "promote_pending", "promoted", "rollback_required", "rolled_back", "aborted"],
+      "description": "Current state of the release record. `promoted`, `rolled_back` and `aborted` are terminal."
+    },
+    "fromState": {
+      "type": ["string", "null"],
+      "enum": [null, "prepared", "staging_verified", "canary_observing", "promote_pending", "rollback_required"],
+      "description": "Immediate predecessor state; null only for the prepared (initial) state."
+    },
+    "stage": { "type": "string", "enum": ["staging", "prod"] },
+    "migrationMarker": { "$ref": "#/$defs/migrationMarker" },
+    "canary": {
+      "type": "object",
+      "required": ["cohort", "observationWindowMinutes", "successCriteria", "status"],
+      "properties": {
+        "cohort": { "type": "string", "minLength": 1 },
+        "observationWindowMinutes": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Proposed observation window in minutes; null when unset. 0 is invalid: it would claim an accepted zero-observation canary."
+        },
+        "successCriteria": { "type": "string", "minLength": 1 },
+        "status": {
+          "type": "string",
+          "const": "PENDING",
+          "description": "Canary cohort and observation windows are PENDING SRE/product, never accepted here."
+        }
+      },
+      "additionalProperties": false
+    },
+    "rollback": {
+      "type": ["object", "null"],
+      "properties": {
+        "targetReleaseId": { "type": "string", "minLength": 1 },
+        "targetMigrationMarker": {
+          "type": "object",
+          "required": ["id", "schemaVersion"],
+          "properties": {
+            "id": { "type": "string", "pattern": "^mig-[0-9]+$" },
+            "schemaVersion": { "type": "integer", "minimum": 1 }
+          },
+          "additionalProperties": false
+        },
+        "compatibility": {
+          "type": "string",
+          "enum": ["compatible", "incompatible"],
+          "description": "Rollback across a breaking migration marker is incompatible unless a migration-back plan is declared; incompatible rollbacks terminate in aborted."
+        },
+        "reason": { "type": "string", "minLength": 1 },
+        "migrationBackPlan": {
+          "type": "object",
+          "required": ["migrationId", "status"],
+          "properties": {
+            "migrationId": { "type": "string", "pattern": "^mig-[0-9]+$" },
+            "status": { "type": "string", "enum": ["PROPOSED", "PENDING"] }
+          },
+          "additionalProperties": false
+        }
+      },
+      "required": ["targetReleaseId", "targetMigrationMarker", "compatibility", "reason"],
+      "additionalProperties": false
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["evidenceType", "status", "paths"],
+      "properties": {
+        "evidenceType": { "type": "string", "const": "synthetic_local" },
+        "status": {
+          "type": "string",
+          "const": "PENDING",
+          "description": "Repository-only releases carry no executed evidence; status stays PENDING."
+        },
+        "paths": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "approval": {
+      "type": "object",
+      "required": ["status", "owner", "date"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "const": "PENDING",
+          "description": "Promotion approval is never granted by repository work; ACCEPTED/APPROVED values are invalid."
+        },
+        "owner": { "type": ["string", "null"] },
+        "date": { "type": ["string", "null"], "format": "date-time" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "migrationMarker": {
+      "type": "object",
+      "required": ["id", "schemaVersion", "changeType"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^mig-[0-9]+$" },
+        "schemaVersion": { "type": "integer", "minimum": 1 },
+        "changeType": { "type": "string", "enum": ["additive", "breaking", "none"] }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

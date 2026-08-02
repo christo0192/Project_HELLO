@@ -1,0 +1,99 @@
+name: Deployment capacity validate
+
+# Bounded, offline, deterministic validation for the Phase 11 deployment &
+# capacity foundations (DEP-01..07, PR-B lanes B1+B2). No provider commands, no
+# model downloads, no auth, no cloud applies, no secrets. The synthetic_local
+# benchmark runs only against a seeded local simulation; live targets are
+# owner-operated and never run in CI. All action SHAs are pinned (no @vN).
+
+on:
+  pull_request:
+    paths:
+      - 'infra/capacity/**'
+      - 'infra/deployment-contracts/**'
+      - 'config/deployment-capacity*.schema.json'
+      - 'scripts/capacity-*'
+      - 'scripts/check-deployment-capacity-status.mjs'
+      - 'scripts/check-deployment-capacity-status.test.mjs'
+      - 'scripts/validate-deployment-*'
+      - 'scripts/artifact-provenance-*'
+      - 'docs/deployment-capacity/**'
+      - 'docs/runbooks/deployment-capacity*.md'
+      - 'docs/runbooks/canary-rollback*.md'
+      - 'docs/adr/0010-hosting-topology.md'
+      - '.github/workflows/deployment-capacity.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'infra/capacity/**'
+      - 'infra/deployment-contracts/**'
+      - 'config/deployment-capacity*.schema.json'
+      - 'scripts/capacity-*'
+      - 'scripts/check-deployment-capacity-status.mjs'
+      - 'scripts/check-deployment-capacity-status.test.mjs'
+      - 'scripts/validate-deployment-*'
+      - 'scripts/artifact-provenance-*'
+      - 'docs/deployment-capacity/**'
+      - 'docs/runbooks/deployment-capacity*.md'
+      - 'docs/runbooks/canary-rollback*.md'
+      - 'docs/adr/0010-hosting-topology.md'
+      - '.github/workflows/deployment-capacity.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deployment-capacity-validate:
+    name: deployment-capacity-validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository history (full depth for baseline diff)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: Capacity benchmark self-test (deterministic, offline)
+        run: node scripts/capacity-benchmark-run self-test
+      - name: Synthetic fixture + report schema validation
+        run: |
+          node scripts/capacity-benchmark-run fixture --scenario synthetic-local --output json >/tmp/capacity-fixture.json
+          node scripts/capacity-benchmark-run schema-validate /tmp/capacity-fixture.json
+      - name: Topology manifest + HA decision template validation
+        run: |
+          node scripts/capacity-benchmark-run topology-validate infra/capacity/managed-topology.manifest.json
+          node scripts/capacity-benchmark-run ha-validate infra/capacity/ha-decision.example.json
+      - name: Deployment contract + staging/prod parity validation (DEP-04/05)
+        run: |
+          node scripts/validate-deployment-contracts
+          node scripts/validate-deployment-contracts --fixtures
+      - name: Release state machine + rollback compatibility (DEP-06)
+        run: |
+          node scripts/validate-deployment-release validate infra/deployment-contracts/release-record.example.json
+          node scripts/validate-deployment-release --fixtures
+      - name: Offline artifact provenance (DEP-07)
+        run: |
+          node scripts/artifact-provenance-validate validate infra/deployment-contracts/provenance-manifest.json
+          node scripts/artifact-provenance-validate --fixtures
+      - name: Schema-contract drift validation (all Phase 11 published schemas, stdlib only)
+        run: node scripts/validate-deployment-schema-drift
+      - name: Status-field validator + negative controls
+        run: |
+          node scripts/check-deployment-capacity-status.mjs
+          node scripts/check-deployment-capacity-status.test.mjs
+      - name: Validate architecture decision records
+        run: node scripts/check-adrs.mjs
+      - name: Validate current-state manifest
+        run: node scripts/check-current-state.mjs
+      - name: Current-state byte-identity vs baseline
+        run: |
+          git diff --exit-code origin/main -- config/current-state.json
+          echo "config/current-state.json unchanged from baseline"
+      - name: Offline deterministic SAST
+        run: bash scripts/sast.sh
+      - name: Whitespace check
+        run: git diff --check

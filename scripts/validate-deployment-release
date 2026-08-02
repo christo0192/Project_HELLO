@@ -1,0 +1,483 @@
+#!/usr/bin/env node
+"use strict";
+
+/**
+ * DEP-06 deterministic canary/blue-green release state machine + rollback
+ * compatibility checker.
+ *
+ * The release state machine (documented in docs/runbooks/canary-rollback.md):
+ *
+ *   prepared → staging_verified → canary_observing → promote_pending → promoted
+ *                                                              ↘
+ *   (any non-terminal state) → rollback_required → rolled_back | aborted
+ *
+ * Only transitions from the deterministic machine are legal: prepared → promoted
+ * and any skip of staging verification are rejected. Terminal states (promoted,
+ * rolled_back, aborted) have no outgoing transitions.
+ *
+ * Rollback compatibility is checked against migration markers declared in the
+ * repository deployment contract manifest (infra/deployment-contracts/manifest.json)
+ * only. A rollback across a breaking migration marker is incompatible unless a
+ * migration-back plan is declared; incompatible rollbacks must terminate in
+ * aborted. Rollback targets must be known markers and must never be newer than
+ * the current release marker.
+ *
+ * Nothing is deployed by this validator: the committed example record stays in
+ * prepared, approvals stay PENDING, canary cohort/observation windows stay
+ * PENDING SRE/product, and evidence stays synthetic_local.
+ *
+ * Usage:
+ *   node scripts/validate-deployment-release validate <release-record.json>
+ *   node scripts/validate-deployment-release --fixtures
+ */
+
+const fs = require("node:fs");
+const path = require("node:path");
+
+const VERSION = "1.0.0";
+const ROOT = path.resolve(__dirname, "..");
+const MANIFEST_PATH = path.join(ROOT, "infra", "deployment-contracts", "manifest.json");
+const RELEASE_EXAMPLE_PATH = path.join(ROOT, "infra", "deployment-contracts", "release-record.example.json");
+
+const STATES = [
+  "prepared",
+  "staging_verified",
+  "canary_observing",
+  "promote_pending",
+  "promoted",
+  "rollback_required",
+  "rolled_back",
+  "aborted",
+];
+
+// Deterministic transition table (the only legal edges in the state machine).
+const TRANSITIONS = {
+  prepared: ["staging_verified", "aborted"],
+  staging_verified: ["canary_observing", "aborted"],
+  canary_observing: ["promote_pending", "rollback_required", "aborted"],
+  promote_pending: ["promoted", "rollback_required", "aborted"],
+  rollback_required: ["rolled_back", "aborted"],
+  promoted: [],
+  rolled_back: [],
+  aborted: [],
+};
+
+const TERMINAL_STATES = ["promoted", "rolled_back", "aborted"];
+const CHANGE_TYPES = ["additive", "breaking", "none"];
+
+const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+
+function loadMigrations(registryPath) {
+  try {
+    const doc = JSON.parse(fs.readFileSync(registryPath, "utf8"));
+    if (!Array.isArray(doc.migrations)) return { error: "migrations registry has no migrations array" };
+    const byId = new Map();
+    for (const m of doc.migrations) byId.set(m.id, m);
+    return { byId };
+  } catch (e) {
+    return { error: `cannot read migrations registry ${registryPath}: ${e.message}` };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Release record validation
+// ---------------------------------------------------------------------------
+
+function validateReleaseRecord(doc, migrations) {
+  const errors = [];
+  if (!isObject(doc)) return ["release record must be a JSON object"];
+  for (const key of ["schemaVersion", "releaseId", "component", "created", "state", "fromState", "stage", "migrationMarker", "canary", "rollback", "evidence", "approval"]) {
+    if (!(key in doc)) errors.push(`release.${key} is required`);
+  }
+
+  if (doc.state !== undefined && !STATES.includes(doc.state)) {
+    errors.push(`release.state must be one of: ${STATES.join(", ")} (got "${doc.state}")`);
+  }
+  if (doc.stage !== undefined && !["staging", "prod"].includes(doc.stage)) {
+    errors.push('release.stage must be "staging" or "prod"');
+  }
+  if (doc.fromState !== undefined && doc.fromState !== null && !STATES.includes(doc.fromState)) {
+    errors.push(`release.fromState must be a known state or null (got "${doc.fromState}")`);
+  }
+
+  // ── Transition legality ─────────────────────────────────────────────────
+  if (doc.state === "prepared") {
+    if (doc.fromState !== null && doc.fromState !== undefined) {
+      errors.push("release.fromState must be null in the prepared (initial) state");
+    }
+  } else if (doc.state !== undefined) {
+    if (!doc.fromState) {
+      errors.push("release.fromState is required for any non-initial state");
+    } else if (!TRANSITIONS[doc.fromState]?.includes(doc.state)) {
+      errors.push(`release transition ${doc.fromState} → ${doc.state} is not in the deterministic release state machine (prepared → staging_verified → canary_observing → promote_pending → promoted | rollback_required → rolled_back → aborted)`);
+    }
+  }
+
+  if (doc.fromState && TERMINAL_STATES.includes(doc.fromState)) {
+    errors.push(`release.fromState ${doc.fromState} is terminal — the state machine permits no transitions out of a terminal state`);
+  }
+
+  // ── Stage consistency (stage mismatch negative control) ────────────────
+  if (doc.state === "staging_verified" && doc.stage !== "staging") {
+    errors.push('stage mismatch: staging_verified requires stage "staging"');
+  }
+  if (doc.state === "promoted" && doc.stage !== "prod") {
+    errors.push('stage mismatch: promoted requires stage "prod"');
+  }
+
+  // ── Migration marker (repository registry only) ────────────────────────
+  if (!isObject(doc.migrationMarker)) {
+    errors.push("release.migrationMarker is required");
+  } else {
+    const mm = doc.migrationMarker;
+    for (const key of ["id", "schemaVersion", "changeType"]) {
+      if (!(key in mm)) errors.push(`release.migrationMarker.${key} is required`);
+    }
+    if (!Number.isInteger(mm.schemaVersion) || mm.schemaVersion < 1) {
+      errors.push("release.migrationMarker.schemaVersion must be an integer >= 1");
+    }
+    if (!CHANGE_TYPES.includes(mm.changeType)) {
+      errors.push("release.migrationMarker.changeType must be additive, breaking or none");
+    }
+    const known = migrations?.byId?.get(mm.id);
+    if (!known) {
+      errors.push(`release.migrationMarker.id ${mm.id} is not a known migration marker in the repository manifest (migrations registry)`);
+    } else {
+      if (mm.schemaVersion !== known.schemaVersion) {
+        errors.push(`release.migrationMarker.schemaVersion ${mm.schemaVersion} does not match the registry value ${known.schemaVersion}`);
+      }
+      if (mm.changeType !== known.changeType) {
+        errors.push(`release.migrationMarker.changeType ${mm.changeType} does not match the registry value ${known.changeType}`);
+      }
+    }
+  }
+
+  // ── Canary (cohort/window PENDING SRE/product) ─────────────────────────
+  if (["canary_observing", "promote_pending"].includes(doc.state)) {
+    if (!isObject(doc.canary)) {
+      errors.push("release.canary is required in canary_observing/promote_pending states");
+    } else {
+      if (doc.canary.status !== "PENDING") {
+        errors.push("release.canary.status must be PENDING — canary cohort and observation windows are PENDING SRE/product");
+      }
+      if (doc.canary.observationWindowMinutes !== null &&
+          (!Number.isInteger(doc.canary.observationWindowMinutes) || doc.canary.observationWindowMinutes < 1)) {
+        errors.push("release.canary.observationWindowMinutes must be null or an integer >= 1 (0 would claim an accepted zero-observation canary)");
+      }
+    }
+  }
+
+  // ── Rollback compatibility (repository manifests only) ─────────────────
+  if (["rollback_required", "rolled_back", "aborted"].includes(doc.state)) {
+    if (doc.rollback === null || doc.rollback === undefined) {
+      if (doc.state === "rollback_required") {
+        errors.push("release.rollback is required in rollback_required state");
+      }
+    } else if (!isObject(doc.rollback)) {
+      errors.push("release.rollback must be an object or null");
+    } else {
+      const rb = doc.rollback;
+      for (const key of ["targetReleaseId", "targetMigrationMarker", "compatibility", "reason"]) {
+        if (!(key in rb)) errors.push(`release.rollback.${key} is required`);
+      }
+      if (!["compatible", "incompatible"].includes(rb.compatibility)) {
+        errors.push('release.rollback.compatibility must be "compatible" or "incompatible"');
+      }
+      const target = rb.targetMigrationMarker;
+      if (!isObject(target)) {
+        errors.push("release.rollback.targetMigrationMarker is required");
+      } else {
+        if (!Number.isInteger(target.schemaVersion) || target.schemaVersion < 1) {
+          errors.push("release.rollback.targetMigrationMarker.schemaVersion must be an integer >= 1");
+        }
+        const knownTarget = migrations?.byId?.get(target.id);
+        if (!knownTarget) {
+          errors.push(`release.rollback.targetMigrationMarker.id ${target.id} is not a known migration marker — rollback targets must come from the repository manifest`);
+        } else if (target.schemaVersion !== knownTarget.schemaVersion) {
+          errors.push(`release.rollback target schemaVersion ${target.schemaVersion} does not match the registry value ${knownTarget.schemaVersion}`);
+        }
+        const current = doc.migrationMarker;
+        if (current && Number.isInteger(current.schemaVersion) && Number.isInteger(target.schemaVersion) &&
+            target.schemaVersion > current.schemaVersion) {
+          errors.push("rollback target schemaVersion is newer than the current release marker — rolling forward is not a rollback");
+        }
+        // Rollback across an incompatible (breaking) migration marker.
+        if (current && current.changeType === "breaking" && rb.compatibility === "compatible" && !rb.migrationBackPlan) {
+          errors.push("rollback across incompatible migration marker: the current marker is breaking and no migration-back plan is declared; claiming a compatible rollback is rejected");
+        }
+      }
+      if (rb.compatibility === "incompatible" && doc.state !== "aborted") {
+        errors.push("an incompatible rollback must terminate in aborted, not rolled_back or a continued state");
+      }
+      if (doc.state === "rolled_back" && rb.compatibility !== "compatible") {
+        errors.push("rolled_back requires a compatible rollback declaration");
+      }
+    }
+  } else if (doc.rollback !== undefined && doc.rollback !== null) {
+    errors.push("release.rollback is only meaningful in rollback_required/rolled_back/aborted states");
+  }
+
+  // ── Evidence and approval (never claimed by repository work) ───────────
+  if (isObject(doc.evidence)) {
+    if (doc.evidence.evidenceType !== "synthetic_local") errors.push("release.evidence.evidenceType must be synthetic_local");
+    if (doc.evidence.status !== "PENDING") errors.push("release.evidence.status must be PENDING — repository-only releases carry no executed evidence");
+  }
+  if (isObject(doc.approval)) {
+    if (doc.approval.status !== "PENDING") {
+      errors.push("release.approval.status must be PENDING — no promotion approval is granted by repository work");
+    }
+    if (doc.approval.owner !== null && doc.approval.owner !== undefined) {
+      errors.push("release.approval.owner must be null until the owner acts in writing");
+    }
+    if (doc.approval.date !== null && doc.approval.date !== undefined) {
+      errors.push("release.approval.date must be null until the owner acts");
+    }
+  }
+
+  return errors;
+}
+
+// ---------------------------------------------------------------------------
+// Real-repo validation
+// ---------------------------------------------------------------------------
+
+function validateRealRepo() {
+  const errors = [];
+  const migrations = loadMigrations(MANIFEST_PATH);
+  if (migrations.error) errors.push(migrations.error);
+  else {
+    let doc;
+    try {
+      doc = JSON.parse(fs.readFileSync(RELEASE_EXAMPLE_PATH, "utf8"));
+    } catch (e) {
+      return errors.concat([`cannot read ${RELEASE_EXAMPLE_PATH}: ${e.message}`]);
+    }
+    errors.push(...validateReleaseRecord(doc, migrations));
+  }
+  return errors;
+}
+
+// ---------------------------------------------------------------------------
+// Seeded negative-control suite (--fixtures)
+// ---------------------------------------------------------------------------
+
+function runFixtures() {
+  const failures = [];
+
+  // Hermetic migration registry mirroring the repo manifest shape.
+  const registryDoc = {
+    migrations: [
+      { id: "mig-001", schemaVersion: 1, changeType: "additive", scope: "screening_v2", status: "PROPOSED", applied: false },
+      { id: "mig-002", schemaVersion: 2, changeType: "additive", scope: "screening_v2", status: "PROPOSED", applied: false },
+      { id: "mig-003", schemaVersion: 3, changeType: "additive", scope: "screening_v2", status: "PROPOSED", applied: false },
+      { id: "mig-004", schemaVersion: 4, changeType: "breaking", scope: "screening_v2", status: "PROPOSED", applied: false },
+    ],
+  };
+  const migrations = { byId: new Map(registryDoc.migrations.map((m) => [m.id, m])) };
+
+  const expectReject = (name, errors, fragment) => {
+    if (errors.length === 0) failures.push(`${name}: expected rejection, got PASS`);
+    else if (fragment && !errors.join("\n").includes(fragment)) {
+      failures.push(`${name}: rejection message missing "${fragment}": ${errors.join("; ").slice(0, 400)}`);
+    }
+  };
+  const expectPass = (name, errors) => {
+    if (errors.length) failures.push(`${name}: expected PASS, got: ${errors.join("; ").slice(0, 400)}`);
+  };
+
+  const base = {
+    schemaVersion: VERSION,
+    releaseId: "release-fixture-0001",
+    component: "screening-platform",
+    created: "2026-08-02T00:00:00Z",
+    state: "prepared",
+    fromState: null,
+    stage: "staging",
+    migrationMarker: { id: "mig-001", schemaVersion: 1, changeType: "additive" },
+    canary: { cohort: "PENDING_SRE", observationWindowMinutes: null, successCriteria: "PENDING_PRODUCT", status: "PENDING" },
+    rollback: null,
+    evidence: { evidenceType: "synthetic_local", status: "PENDING", paths: [] },
+    approval: { status: "PENDING", owner: null, date: null },
+  };
+
+  expectPass("prepared (initial state)", validateReleaseRecord(base, migrations));
+
+  // Legal forward chain.
+  const s1 = { ...base, state: "staging_verified", fromState: "prepared" };
+  expectPass("prepared → staging_verified", validateReleaseRecord(s1, migrations));
+  const s2 = { ...s1, state: "canary_observing", fromState: "staging_verified" };
+  expectPass("staging_verified → canary_observing", validateReleaseRecord(s2, migrations));
+  const s3 = { ...s2, state: "promote_pending", fromState: "canary_observing" };
+  expectPass("canary_observing → promote_pending", validateReleaseRecord(s3, migrations));
+  const s4 = { ...s3, state: "promoted", fromState: "promote_pending", stage: "prod" };
+  expectPass("promote_pending → promoted (prod)", validateReleaseRecord(s4, migrations));
+
+  // prepared → promoted is illegal (must pass staging verification + canary).
+  const illegalDirect = { ...base, state: "promoted", fromState: "prepared", stage: "prod" };
+  expectReject("prepared → promoted rejected", validateReleaseRecord(illegalDirect, migrations), "not in the deterministic release state machine");
+
+  // canary_observing → promoted skips promote_pending.
+  const illegalSkip = { ...s2, state: "promoted", fromState: "canary_observing", stage: "prod" };
+  expectReject("canary_observing → promoted rejected", validateReleaseRecord(illegalSkip, migrations), "not in the deterministic release state machine");
+
+  // Unknown state.
+  const unknownState = { ...base, state: "launched" };
+  expectReject("unknown state rejected", validateReleaseRecord(unknownState, migrations), "release.state");
+
+  // Missing migration marker.
+  const noMarker = { ...base, migrationMarker: undefined };
+  expectReject("missing migration marker rejected", validateReleaseRecord(noMarker, migrations), "migrationMarker");
+
+  // Unknown migration marker id.
+  const unknownMig = { ...base, migrationMarker: { id: "mig-999", schemaVersion: 9, changeType: "additive" } };
+  expectReject("unknown migration marker rejected", validateReleaseRecord(unknownMig, migrations), "not a known migration marker");
+
+  // Stage mismatches.
+  const stageMismatchPromoted = { ...s4, stage: "staging" };
+  expectReject("promoted in staging rejected (stage mismatch)", validateReleaseRecord(stageMismatchPromoted, migrations), "stage mismatch");
+  const stageMismatchVerified = { ...s1, stage: "prod" };
+  expectReject("staging_verified in prod rejected (stage mismatch)", validateReleaseRecord(stageMismatchVerified, migrations), "stage mismatch");
+
+  // Compatible rollback (additive marker) → rolled_back is legal.
+  const rbCompat = {
+    ...s2,
+    state: "rolled_back",
+    fromState: "rollback_required",
+    stage: "staging",
+    rollback: {
+      targetReleaseId: "release-fixture-0000",
+      targetMigrationMarker: { id: "mig-001", schemaVersion: 1 },
+      compatibility: "compatible",
+      reason: "additive marker; rollback is schema-safe",
+    },
+  };
+  expectPass("additive compatible rollback → rolled_back", validateReleaseRecord(rbCompat, migrations));
+
+  // Rollback across a breaking marker claiming compatible → rejected.
+  const rbBreaking = {
+    ...base,
+    state: "rollback_required",
+    fromState: "canary_observing",
+    stage: "staging",
+    migrationMarker: { id: "mig-004", schemaVersion: 4, changeType: "breaking" },
+    rollback: {
+      targetReleaseId: "release-fixture-0000",
+      targetMigrationMarker: { id: "mig-003", schemaVersion: 3 },
+      compatibility: "compatible",
+      reason: "rolls back across a breaking marker without a back plan",
+    },
+  };
+  expectReject("breaking-marker compatible rollback rejected", validateReleaseRecord(rbBreaking, migrations), "incompatible migration marker");
+
+  // Breaking + honestly incompatible → aborted is legal.
+  const rbAborted = {
+    ...rbBreaking,
+    state: "aborted",
+    fromState: "rollback_required",
+    rollback: {
+      ...rbBreaking.rollback,
+      compatibility: "incompatible",
+      reason: "mig-004 is breaking and no migration-back plan exists; the release is aborted",
+    },
+  };
+  expectPass("breaking incompatible rollback → aborted", validateReleaseRecord(rbAborted, migrations));
+
+  // Rollback target must be a known marker.
+  const rbUnknown = { ...rbCompat, rollback: { ...rbCompat.rollback, targetMigrationMarker: { id: "mig-999", schemaVersion: 9 } } };
+  expectReject("unknown rollback target rejected", validateReleaseRecord(rbUnknown, migrations), "not a known migration marker");
+
+  // Rollback target newer than the current marker → rejected.
+  const rbNewer = { ...rbCompat, rollback: { ...rbCompat.rollback, targetMigrationMarker: { id: "mig-003", schemaVersion: 3 } } };
+  expectReject("rollback target newer than current rejected", validateReleaseRecord(rbNewer, migrations), "rolling forward");
+
+  // Incompatible rollback in rolled_back state → rejected.
+  const rbIncompatibleRolledBack = { ...rbCompat, rollback: { ...rbCompat.rollback, compatibility: "incompatible" } };
+  expectReject("incompatible rollback cannot be rolled_back", validateReleaseRecord(rbIncompatibleRolledBack, migrations), "aborted");
+
+  // rollback_required without a rollback declaration → rejected.
+  const rbMissing = { ...s2, state: "rollback_required", fromState: "canary_observing", rollback: null };
+  expectReject("rollback_required without rollback rejected", validateReleaseRecord(rbMissing, migrations), "release.rollback is required");
+
+  // Canary observation window of 0 → rejected.
+  const canaryZero = { ...s2, canary: { ...s2.canary, observationWindowMinutes: 0 } };
+  expectReject("canary observation window 0 rejected", validateReleaseRecord(canaryZero, migrations), "observationWindowMinutes");
+
+  // Approval ACCEPTED → rejected.
+  const approvedRec = { ...base, approval: { status: "ACCEPTED", owner: "christo0192", date: "2026-08-02T00:00:00Z" } };
+  expectReject("approval ACCEPTED rejected", validateReleaseRecord(approvedRec, migrations), "PENDING");
+
+  // Legal aborted escapes.
+  const abortedPrepared = { ...base, state: "aborted", fromState: "prepared" };
+  expectPass("prepared → aborted", validateReleaseRecord(abortedPrepared, migrations));
+
+  // No transition out of a terminal state.
+  const outOfTerminal = {
+    ...s4,
+    state: "rolled_back",
+    fromState: "promoted",
+    rollback: { targetReleaseId: "r0", targetMigrationMarker: { id: "mig-001", schemaVersion: 1 }, compatibility: "compatible", reason: "x" },
+  };
+  expectReject("transition out of promoted rejected", validateReleaseRecord(outOfTerminal, migrations), "not in the deterministic release state machine");
+
+  // Real committed example record must validate against the real repo registry.
+  const realMigrations = loadMigrations(MANIFEST_PATH);
+  if (realMigrations.error) failures.push(`cannot load repo migrations: ${realMigrations.error}`);
+  else {
+    try {
+      const example = JSON.parse(fs.readFileSync(RELEASE_EXAMPLE_PATH, "utf8"));
+      expectPass("repo example release record validates", validateReleaseRecord(example, realMigrations));
+    } catch (e) {
+      failures.push(`cannot read release example: ${e.message}`);
+    }
+  }
+
+  return failures;
+}
+
+// ---------------------------------------------------------------------------
+// CLI dispatch
+// ---------------------------------------------------------------------------
+
+const command = process.argv[2];
+
+if (command === "--fixtures") {
+  const failures = runFixtures();
+  if (failures.length) {
+    console.error(`validate-deployment-release --fixtures FAILED (${failures.length}):`);
+    for (const f of failures) console.error(`- ${f}`);
+    process.exit(1);
+  }
+  console.log("validate-deployment-release --fixtures passed: prepared → promoted and all illegal transitions rejected; rollback compatibility against repository migration markers enforced.");
+  process.exit(0);
+}
+
+if (command === "validate") {
+  const filePath = process.argv[3];
+  if (!filePath) {
+    console.error("validate requires a release-record file path");
+    process.exit(2);
+  }
+  const migrations = loadMigrations(MANIFEST_PATH);
+  if (migrations.error) {
+    console.error(migrations.error);
+    process.exit(1);
+  }
+  let doc;
+  try {
+    doc = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch (e) {
+    console.error(`cannot read ${filePath}: ${e.message}`);
+    process.exit(1);
+  }
+  const errors = validateReleaseRecord(doc, migrations);
+  if (errors.length) {
+    console.error(`release record invalid (${errors.length}):`);
+    for (const error of errors) console.error(`- ${error}`);
+    process.exit(1);
+  }
+  console.log(`PASS: release record ${doc.releaseId || filePath} is in state "${doc.state}" and conforms to the deterministic release state machine.`);
+  process.exit(0);
+}
+
+console.error(`Unknown command "${command}". Usage: node scripts/validate-deployment-release validate <record.json> | --fixtures`);
+process.exit(2);
