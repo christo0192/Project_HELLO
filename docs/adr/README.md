@@ -22,6 +22,7 @@ decision. Proposed ADRs are not authority to deploy their option.
 - [ADR-0007: Production deployment and region](0007-production-deployment-and-region.md)
 - [ADR-0008: Recruiter authentication transport](0008-recruiter-auth-transport.md)
 - [ADR-0009: Governance field protection](0009-governance-field-protection.md)
+- [ADR-0010: Managed-hosting topology for the voice-agent pilot](0010-hosting-topology.md)
 
 Create new records from [the template](template.md). Never rewrite an accepted
 decision's outcome; supersede it with a new ADR so the history remains legible.

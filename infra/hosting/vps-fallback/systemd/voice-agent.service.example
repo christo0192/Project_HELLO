@@ -1,0 +1,34 @@
+# systemd unit example for the containerised voice worker (fallback VPS).
+#
+# PLACEHOLDERS ONLY — no provider names, no project IDs, no credentials.
+# Runtime environment must be injected from managed Infisical (machine
+# identity) or a root-only EnvironmentFile that is never committed.
+#
+# Replace: hello-voice:local  ->  the image tag the owner deploys
+#          /srv/hello-voice/env  ->  root-only env file path (if used)
+#          VoiceAgent user/group -> the owner-selected non-root user
+
+[Unit]
+Description=Project_HELLO LiveKit voice agent (managed-hosting fallback)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Restart=always
+RestartSec=5
+# Stop gracefully: systemd sends SIGTERM; the LiveKit Agents SDK drains jobs
+# for LIVEKIT_WORKER_DRAIN_SEC before exiting. Runtime drain proof is
+# OWNER_VERIFY against the live project.
+TimeoutStopSec=60
+User=voiceagent
+Group=voiceagent
+# Root-only env file (values injected at runtime, never committed).
+EnvironmentFile=-/srv/hello-voice/env
+ExecStart=/usr/bin/docker run --rm --name hello-voice-agent \
+  --user 1000:1000 \
+  --env-file /srv/hello-voice/env \
+  hello-voice:local
+ExecStop=/usr/bin/docker stop -t 60 hello-voice-agent
+
+[Install]
+WantedBy=multi-user.target

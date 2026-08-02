@@ -27,8 +27,7 @@ python agent.py download-files   # already run — pulls the turn-detector + sil
 ## Step 1 — voice test (PRIMARY spike path, no LiveKit Cloud account needed)
 
 `console` mode talks to the agent through your local mic/speakers directly —
-it does **not** open a LiveKit room, so `LIVEKIT_URL` / `LIVEKIT_API_KEY` /
-`LIVEKIT_API_SECRET` are NOT required for this step.
+it does **not** open a LiveKit room, so LiveKit credentials (URL, API key, API secret) are NOT required for this step.
 
 ```powershell
 cd "D:\Claude projects\Screening bot for HR\app\voice-livekit"
@@ -62,23 +61,12 @@ join token. The LiveKit worker reads the room metadata, writes committed
 conversation turns into `screening_v2.transcript_turns`, completes the session on
 close, and triggers the existing `/api/assess/:session_id` Claude scorecard.
 
-Fill these values in both `app/api/.env` and `app/voice-livekit/.env`:
+Required environment variables (see `.env.example` in each directory):
 
-```powershell
-LIVEKIT_URL=wss://your-project.livekit.cloud
-LIVEKIT_API_KEY=...
-LIVEKIT_API_SECRET=...
-```
+- **`app/api/.env`:** LiveKit credentials (URL, API key, API secret)
+- **`app/voice-livekit/.env`:** same LiveKit variables plus Supabase credentials (URL, service-role key, schema, recordings bucket) and API base URL
 
-Also make sure `app/voice-livekit/.env` has Supabase persistence values:
-
-```powershell
-SUPABASE_URL=...
-SUPABASE_SERVICE_ROLE_KEY=...
-SUPABASE_SCHEMA=screening_v2
-RECORDINGS_BUCKET=recordings_v2
-API_BASE=http://localhost:8787
-```
+All values use `replace_me` placeholders in committed example files; real credentials are owner-supplied at deploy time.
 
 Run the three processes:
 
@@ -112,8 +100,8 @@ Use this only when you want to test through a raw LiveKit room without the
 dashboard.
 
 1. Go to https://cloud.livekit.io (free tier), create a project.
-2. Copy the project's WebSocket URL, API Key, and API Secret into `.env`:
-   `LIVEKIT_URL=`, `LIVEKIT_API_KEY=`, `LIVEKIT_API_SECRET=`.
+2. Copy the project's WebSocket URL, API Key, and API Secret into `.env`
+   (see `.env.example` for the required variable names).
 3. Run the worker:
    ```powershell
    python agent.py dev

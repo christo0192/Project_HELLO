@@ -1,0 +1,43 @@
+# Local compose for the LiveKit Agents voice worker (managed-hosting topology).
+#
+# Provider-neutral: no project IDs, no secret values, no real endpoints.
+# All provider values are injected at runtime by the orchestrator (managed
+# Infisical machine identity per docs/runbooks/hosting-infisical.md) or, for
+# local dev only, from an operator-supplied .env that is never committed.
+#
+# Truthful boundaries:
+#  - The container runs the production command `python agent.py start`.
+#  - Signal/drain behavior is provided by the LiveKit Agents SDK
+#    (--drain-timeout / LIVEKIT_WORKER_DRAIN_SEC); runtime proof against a
+#    live project is OWNER_VERIFY, not claimed here.
+#  - The image exposes no HTTP readiness endpoint and declares no probe.
+
+services:
+  voice-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hello-voice:local
+    user: "1000:1000"
+    init: true
+    restart: unless-stopped
+    env_file:
+      # Local-dev only. This file must never be committed; managed runtime
+      # deployments inject the same variables from Infisical instead.
+      - path: .env
+        required: false
+    environment:
+      LIVEKIT_URL: ${LIVEKIT_URL:-}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-}
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
+      SUPABASE_SCHEMA: ${SUPABASE_SCHEMA:-screening_v2}
+      API_BASE: ${API_BASE:-}
+      WORKER_CONTEXT_SECRET: ${WORKER_CONTEXT_SECRET:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      SARVAM_API_KEY: ${SARVAM_API_KEY:-}
+      LIVEKIT_WORKER_DRAIN_SEC: ${LIVEKIT_WORKER_DRAIN_SEC:-10}
+    # Worker connects outbound only (LiveKit WebSocket, Supabase, scoring API);
+    # no published ports are required.
+    # No probe is declared: the SDK worker exposes no HTTP readiness endpoint.

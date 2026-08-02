@@ -1,0 +1,43 @@
+# Build context exclusions for app/voice-livekit.
+#
+# The runtime image must never receive: secrets, version control, virtualenvs,
+# caches, bytecode, tests, docs, or the compose file itself. The worker
+# sources listed explicitly in the Dockerfile COPY are the only files that
+# enter the image.
+
+# VCS
+.git
+.gitignore
+.gitattributes
+.githooks
+
+# Secrets and local configuration — never a baked .env
+.env
+.env.*
+!.env.example
+
+# Virtualenvs and interpreter artifacts
+.venv
+venv
+env
+__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Tests, docs, and editor/OS noise — not part of the runtime image
+tests
+docs
+*.md
+*.log
+*.tmp
+.DS_Store
+.idea
+.vscode
+
+# Container files themselves are not runtime content
+Dockerfile
+docker-compose.yml
+.dockerignore

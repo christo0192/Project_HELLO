@@ -1,0 +1,81 @@
+name: Hosting validate
+
+# Bounded, offline, static validation for the managed-hosting foundations lane.
+# No provider commands, no model downloads, no auth, no cloud applies, no
+# secrets. Docker image builds are intentionally NOT run in CI: pip installing
+# the pinned runtime closure (onnxruntime/transformers/av wheels) is
+# heavyweight and network-bound; the container contract is validated statically
+# here and the owner/verifier runs the bounded Docker checks locally
+# (scripts/validate-container.sh --docker).
+
+on:
+  pull_request:
+    paths:
+      - 'app/voice-livekit/**'
+      - 'docs/runbooks/hosting-*.md'
+      - 'docs/adr/0010-hosting-topology.md'
+      - 'docs/adr/0007-production-deployment-and-region.md'
+      - 'docs/adr/README.md'
+      - 'infra/hosting/**'
+      - 'scripts/validate-container.sh'
+      - 'scripts/validate-no-secrets-baked.sh'
+      - 'scripts/validate-hosting-foundation.test.mjs'
+      - 'scripts/__fixtures__/hosting-synthetic-forbidden-secret.txt'
+      - '.github/workflows/hosting-validate.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'app/voice-livekit/**'
+      - 'docs/runbooks/hosting-*.md'
+      - 'docs/adr/0010-hosting-topology.md'
+      - 'docs/adr/0007-production-deployment-and-region.md'
+      - 'docs/adr/README.md'
+      - 'infra/hosting/**'
+      - 'scripts/validate-container.sh'
+      - 'scripts/validate-no-secrets-baked.sh'
+      - 'scripts/validate-hosting-foundation.test.mjs'
+      - 'scripts/__fixtures__/hosting-synthetic-forbidden-secret.txt'
+      - '.github/workflows/hosting-validate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  hosting-validate:
+    name: hosting-validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository history (full depth for baseline diff)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: Hosting foundations static/negative-control tests
+        run: node scripts/validate-hosting-foundation.test.mjs
+      - name: Secret-bake validator (normal pass; synthetic sentinel negative control)
+        run: |
+          bash scripts/validate-no-secrets-baked.sh app/voice-livekit
+          if bash scripts/validate-no-secrets-baked.sh scripts/__fixtures__/hosting-synthetic-forbidden-secret.txt; then
+            echo "negative control must fail" >&2
+            exit 1
+          fi
+          echo "synthetic sentinel correctly rejected"
+      - name: Container contract (static subset; Docker builds are local-only)
+        run: bash scripts/validate-container.sh
+      - name: Validate architecture decision records
+        run: node scripts/check-adrs.mjs
+      - name: Validate current-state manifest
+        run: node scripts/check-current-state.mjs
+      - name: Current-state byte-identity vs baseline
+        run: |
+          git diff --exit-code 2170e6bdad6aa2de63fea346bb40b2ed5cd6a3dc -- config/current-state.json
+          echo "config/current-state.json unchanged from baseline"
+      - name: Offline deterministic SAST
+        run: bash scripts/sast.sh
+      - name: Whitespace check
+        run: git diff --check

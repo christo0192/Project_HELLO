@@ -51,4 +51,8 @@ review, and named operators.
 
 ## Supersession
 
-None. Production acceptance is a separate gate.
+The LiveKit hosting decision (self-hosted Mumbai, beginning with the free cloud
+tier for initial evaluation) is superseded by
+[ADR-0010](0010-hosting-topology.md) for the managed-hosting pilot. The compute
+provider/region decision (OCI Mumbai) and the production-acceptance gate in
+this record remain in force. Production acceptance is a separate gate.
