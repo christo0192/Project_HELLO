@@ -1,0 +1,241 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/christo0192/Project_HELLO/config/phase12-launch-execution.schema.json",
+  "title": "Phase 12 Launch Execution — LCH-02 deployment/rollback/first-session contract schema",
+  "description": "Repository-only LCH-02 launch execution contract (PLAN.md section 8 LCH-02: deploy to production, monitor dashboards, on-call engineer active; success is production live and a first real session completing). This contract is a fillable foundation only: nothing is deployed, no launch session exists, no on-call is active, no dashboard is monitored, and rollback authority is PENDING. All status values use the vocabulary NOT_DEPLOYED | PENDING | NOT_ACTIVE. DEPLOYED, ACTIVE, LIVE, GO, GREEN, APPROVED, AUTHORIZED, EXECUTED, COMPLETED, and any non-null launchSessionId/endpoint/sessionId are forbidden positive claims and are never valid values here. The release state machine is NOT forked: this contract references the Phase 11 DEP-06 machine (infra/deployment-contracts/release-record.example.json, validated by scripts/validate-deployment-release) whose legal chain is prepared → staging_verified → canary_observing → promote_pending → promoted, with rollback_required → rolled_back | aborted escapes. Rollback compatibility refers only to existing repository migration markers in infra/deployment-contracts/manifest.json; no live rollback target is invented. It does not duplicate or override config/current-state.json, which remains the authoritative source of truth (0/17 gates complete, 0/14 phases accepted, production pre-production).",
+  "version": "1.0.0",
+  "type": "object",
+  "required": [
+    "manifestVersion",
+    "version",
+    "contractKind",
+    "title",
+    "description",
+    "authority",
+    "deployment",
+    "firstSession",
+    "onCall",
+    "rollback",
+    "monitoring",
+    "evidence"
+  ],
+  "properties": {
+    "manifestVersion": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "contractKind": { "type": "string", "const": "lch02-launch-execution-contract" },
+    "title": { "type": "string", "minLength": 1 },
+    "description": { "type": "string", "minLength": 1, "maxLength": 4000 },
+    "authority": { "$ref": "#/$defs/authority" },
+    "deployment": { "$ref": "#/$defs/deployment" },
+    "firstSession": { "$ref": "#/$defs/firstSession" },
+    "onCall": { "$ref": "#/$defs/onCall" },
+    "rollback": { "$ref": "#/$defs/rollback" },
+    "monitoring": { "$ref": "#/$defs/monitoring" },
+    "evidence": { "$ref": "#/$defs/evidence" }
+  },
+  "$defs": {
+    "authority": {
+      "type": "object",
+      "required": ["source", "role", "releaseRecordReference", "deploymentManifestReference", "releaseValidatorReference", "note"],
+      "properties": {
+        "source": { "type": "string", "const": "config/current-state.json" },
+        "role": { "type": "string", "const": "authoritative-source-of-truth" },
+        "releaseRecordReference": { "type": "string", "const": "infra/deployment-contracts/release-record.example.json" },
+        "deploymentManifestReference": { "type": "string", "const": "infra/deployment-contracts/manifest.json" },
+        "releaseValidatorReference": { "type": "string", "const": "scripts/validate-deployment-release" },
+        "note": { "type": "string", "minLength": 1, "maxLength": 2000 }
+      },
+      "additionalProperties": false
+    },
+    "deployment": {
+      "type": "object",
+      "required": ["deployed", "stage", "releaseState", "stateMachine", "launchSessionId", "launchWindow"],
+      "properties": {
+        "deployed": {
+          "type": "boolean",
+          "const": false,
+          "description": "Nothing is deployed. true is a forbidden positive claim: repository-only work never deploys, provisions, or starts anything."
+        },
+        "stage": {
+          "type": "string",
+          "const": "NOT_DEPLOYED",
+          "description": "Deployment stage. NOT_DEPLOYED is the only truthful value; DEPLOYED/STAGING_LIVE/PROD_LIVE are forbidden positive claims."
+        },
+        "releaseState": {
+          "type": "string",
+          "const": "PENDING",
+          "description": "Phase 12 does not instantiate or advance a release record. The Phase 11 DEP-06 record (infra/deployment-contracts/release-record.example.json) is the machine instance and remains prepared; this field only records that the referenced machine's outcome is PENDING."
+        },
+        "stateMachine": { "$ref": "#/$defs/stateMachine" },
+        "launchSessionId": {
+          "type": "null",
+          "const": null,
+          "description": "No launch session exists. Any non-null launch session identifier is a forbidden positive claim and is rejected."
+        },
+        "launchWindow": {
+          "type": "string",
+          "const": "PENDING",
+          "description": "Launch window is PENDING owner/SRE; OPEN/ACTIVE/COMPLETE are forbidden positive claims."
+        }
+      },
+      "additionalProperties": false
+    },
+    "stateMachine": {
+      "type": "object",
+      "required": ["reference", "validator", "allowedTransitions", "forked"],
+      "properties": {
+        "reference": { "type": "string", "const": "infra/deployment-contracts/release-record.example.json" },
+        "validator": { "type": "string", "const": "scripts/validate-deployment-release" },
+        "allowedTransitions": {
+          "type": "string",
+          "const": "prepared → staging_verified → canary_observing → promote_pending → promoted | rollback_required → rolled_back | aborted",
+          "description": "The exact Phase 11 DEP-06 legal transition chain. Phase 12 references this machine and defines no alternative transitions."
+        },
+        "forked": {
+          "type": "boolean",
+          "const": false,
+          "description": "Declares that Phase 12 does not fork or redefine the Phase 11 release state machine. true is rejected."
+        }
+      },
+      "additionalProperties": false
+    },
+    "firstSession": {
+      "type": "object",
+      "required": ["firstSessionCompleted", "firstRealSessionCompleted", "firstSessionEvidence", "sessionId", "recordedAt"],
+      "properties": {
+        "firstSessionCompleted": {
+          "type": "boolean",
+          "const": false,
+          "description": "No first session has completed. true is a forbidden positive claim."
+        },
+        "firstRealSessionCompleted": {
+          "type": "boolean",
+          "const": false,
+          "description": "No first REAL session has completed. Synthetic local fixtures never satisfy LCH-02; a real production session is owner-operated and outside this repository."
+        },
+        "firstSessionEvidence": {
+          "type": "string",
+          "const": "PENDING",
+          "description": "First-session evidence is template-only and PENDING; no transcript, recording, or session evidence is claimed."
+        },
+        "sessionId": {
+          "type": "null",
+          "const": null,
+          "description": "No session identifier exists. Any non-null value is a forbidden positive claim."
+        },
+        "recordedAt": {
+          "type": "null",
+          "const": null,
+          "description": "No session timestamp is recorded. Any non-null value is a forbidden positive claim."
+        }
+      },
+      "additionalProperties": false
+    },
+    "onCall": {
+      "type": "object",
+      "required": ["onCallActive", "onCallRoster", "escalationPath", "onCallEvidence"],
+      "properties": {
+        "onCallActive": {
+          "type": "boolean",
+          "const": false,
+          "description": "No on-call engineer is active. true is a forbidden positive claim."
+        },
+        "onCallRoster": {
+          "type": "string",
+          "const": "PENDING",
+          "description": "On-call roster is PENDING; no engineer is named."
+        },
+        "escalationPath": {
+          "type": "string",
+          "const": "PENDING",
+          "description": "Escalation path is PENDING; no contact channel is defined or claimed."
+        },
+        "onCallEvidence": {
+          "type": "string",
+          "const": "PENDING",
+          "description": "No on-call coverage evidence exists."
+        }
+      },
+      "additionalProperties": false
+    },
+    "rollback": {
+      "type": "object",
+      "required": ["rollbackAuthority", "authorizedBy", "decisionDate", "plan", "targetKind", "targetReference", "compatibilityCheck"],
+      "properties": {
+        "rollbackAuthority": {
+          "type": "string",
+          "enum": ["NOT_DEPLOYED", "PENDING", "NOT_ACTIVE"],
+          "description": "Rollback authority state. Only PENDING is truthful in repository-only work; AUTHORIZED, APPROVED, GRANTED, and ACTIVE are forbidden positive claims and are rejected."
+        },
+        "authorizedBy": {
+          "type": "null",
+          "const": null,
+          "description": "No rollback authority is named. Any non-null name is a forbidden sign-off claim."
+        },
+        "decisionDate": {
+          "type": "null",
+          "const": null,
+          "description": "No rollback decision date exists. Any non-null value is a forbidden claim."
+        },
+        "plan": {
+          "type": "string",
+          "enum": ["NOT_DEPLOYED", "PENDING", "NOT_ACTIVE"],
+          "description": "Rollback plan state. A template procedure is documented in docs/runbooks/production-rollback.md; the plan itself stays PENDING and is never EXECUTED or COMPLETE here."
+        },
+        "targetKind": { "type": "string", "const": "repository-marker" },
+        "targetReference": { "type": "string", "const": "infra/deployment-contracts/manifest.json (migrations registry)" },
+        "compatibilityCheck": { "type": "string", "const": "scripts/validate-deployment-release (Phase 11 DEP-06 validator)" }
+      },
+      "additionalProperties": false
+    },
+    "monitoring": {
+      "type": "object",
+      "required": ["dashboardMonitored", "endpoint", "observabilityConnected", "alertsActive", "status"],
+      "properties": {
+        "dashboardMonitored": {
+          "type": "boolean",
+          "const": false,
+          "description": "No dashboard is monitored. true is a forbidden positive claim; Mission Control dashboards are a separate future artifact and not part of this foundation."
+        },
+        "endpoint": {
+          "type": "null",
+          "const": null,
+          "description": "No monitoring endpoint exists. Any URL or host value is a forbidden positive claim and is rejected."
+        },
+        "observabilityConnected": {
+          "type": "boolean",
+          "const": false,
+          "description": "No observability platform connection is established."
+        },
+        "alertsActive": {
+          "type": "boolean",
+          "const": false,
+          "description": "No alert is active. true is a forbidden positive claim."
+        },
+        "status": {
+          "type": "string",
+          "const": "NOT_ACTIVE",
+          "description": "Monitoring status is declared NOT_ACTIVE; ACTIVE/MONITORING/LIVE are forbidden positive claims."
+        }
+      },
+      "additionalProperties": false
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["evidenceType", "status", "note", "paths"],
+      "properties": {
+        "evidenceType": { "type": "string", "const": "synthetic_local" },
+        "status": { "type": "string", "const": "PENDING" },
+        "note": { "type": "string", "minLength": 1, "maxLength": 1000 },
+        "paths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "maxItems": 0,
+          "description": "No evidence paths exist. The array is structurally forced empty so no executed evidence can be claimed."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

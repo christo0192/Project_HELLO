@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/christo0192/Project_HELLO/config/phase12-launch-readiness.schema.json",
+  "title": "Phase 12 Launch Readiness — LCH-01 launch gate registry schema",
+  "description": "Repository-only enumeration of the 17 canonical launch gates from PLAN.md section 8. This registry is a separate Phase 12 foundation artifact: every gate is PENDING or PROPOSED, the go/no-go decision is PENDING, and there is no signatory, date, or evidence approval anywhere. It does not duplicate or override config/current-state.json, which remains the authoritative source of truth (0/17 gates complete, 0/14 phases accepted, production pre-production). COMPLETE, GREEN, SIGNED, APPROVED, and GO are forbidden positive claims and are not valid values anywhere in this schema.",
+  "version": "1.0.0",
+  "type": "object",
+  "required": [
+    "manifestVersion",
+    "version",
+    "registryKind",
+    "title",
+    "description",
+    "authority",
+    "registryStatus",
+    "gates",
+    "goDecision",
+    "approvals",
+    "evidence"
+  ],
+  "properties": {
+    "manifestVersion": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "registryKind": { "type": "string", "const": "lch01-launch-gate-registry" },
+    "title": { "type": "string", "minLength": 1 },
+    "description": { "type": "string", "minLength": 1, "maxLength": 4000 },
+    "authority": { "$ref": "#/$defs/authority" },
+    "registryStatus": {
+      "type": "string",
+      "enum": ["PENDING", "PROPOSED"],
+      "description": "Registry-level state. A repository-only foundation is never COMPLETE, GREEN, SIGNED, APPROVED, or GO."
+    },
+    "gates": {
+      "type": "array",
+      "minItems": 17,
+      "maxItems": 17,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/gate" },
+      "description": "Exactly the 17 canonical launch gate IDs from PLAN.md section 8."
+    },
+    "goDecision": { "$ref": "#/$defs/goDecision" },
+    "approvals": { "$ref": "#/$defs/approvals" },
+    "evidence": { "$ref": "#/$defs/evidence" }
+  },
+  "$defs": {
+    "authority": {
+      "type": "object",
+      "required": ["source", "role", "gateCountSource", "note"],
+      "properties": {
+        "source": { "type": "string", "const": "config/current-state.json" },
+        "role": { "type": "string", "const": "authoritative-source-of-truth" },
+        "gateCountSource": { "type": "string", "const": "PLAN.md section 8 (17 canonical launch gates)" },
+        "note": { "type": "string", "minLength": 1, "maxLength": 2000 }
+      },
+      "additionalProperties": false
+    },
+    "gate": {
+      "type": "object",
+      "required": ["gateId", "title", "definition", "status", "evidenceType", "evidenceStatus"],
+      "properties": {
+        "gateId": {
+          "type": "string",
+          "enum": [
+            "PII-GATE",
+            "AUTH-GATE",
+            "KEY-GATE",
+            "UPLOAD-GATE",
+            "AI-GATE",
+            "CONSENT-GATE",
+            "MIGRATION-GATE",
+            "BACKUP-GATE",
+            "LOAD-GATE",
+            "OBSERVABILITY-GATE",
+            "CI-GATE",
+            "E2E-GATE",
+            "RELIABILITY-GATE",
+            "SECURITY-GATE",
+            "FAIRNESS-GATE",
+            "LEGAL-GATE",
+            "DATA-GATE"
+          ]
+        },
+        "title": { "type": "string", "minLength": 1 },
+        "definition": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "description": "Acceptance definition summarized from PLAN.md section 8. Summary text only; no completion claim."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["PENDING", "PROPOSED"],
+          "description": "Gate state. COMPLETE, GREEN, SIGNED, APPROVED, and GO are forbidden positive claims in repository-only work."
+        },
+        "evidenceType": { "type": "string", "const": "synthetic_local" },
+        "evidenceStatus": { "type": "string", "const": "PENDING" }
+      },
+      "additionalProperties": false
+    },
+    "goDecision": {
+      "type": "object",
+      "required": ["decision", "recordedBy", "date", "evidenceRef"],
+      "properties": {
+        "decision": {
+          "type": "string",
+          "enum": ["PENDING", "PROPOSED"],
+          "description": "Go/no-go decision state. A GO value is a forbidden positive claim: only an authorized named owner with authentic external evidence may record GO, and repository-only foundations never do."
+        },
+        "recordedBy": {
+          "type": "null",
+          "const": null,
+          "description": "No signatory is recorded in repository-only foundations."
+        },
+        "date": {
+          "type": "null",
+          "const": null,
+          "description": "No decision date is recorded in repository-only foundations."
+        },
+        "evidenceRef": {
+          "type": "null",
+          "const": null,
+          "description": "No evidence reference authorizes a decision in repository-only foundations."
+        }
+      },
+      "additionalProperties": false
+    },
+    "approvals": {
+      "type": "object",
+      "required": ["status", "signatory", "date", "evidenceRef"],
+      "properties": {
+        "status": { "type": "string", "const": "PENDING" },
+        "signatory": {
+          "type": "null",
+          "const": null,
+          "description": "No signatory is recorded in repository-only foundations."
+        },
+        "date": {
+          "type": "null",
+          "const": null,
+          "description": "No approval date is recorded in repository-only foundations."
+        },
+        "evidenceRef": {
+          "type": "null",
+          "const": null,
+          "description": "No approval evidence is recorded in repository-only foundations."
+        }
+      },
+      "additionalProperties": false
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["type", "status", "note"],
+      "properties": {
+        "type": { "type": "string", "const": "synthetic_local" },
+        "status": { "type": "string", "const": "PENDING" },
+        "note": { "type": "string", "minLength": 1, "maxLength": 1000 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

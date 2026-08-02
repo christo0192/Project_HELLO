@@ -1,0 +1,34 @@
+{
+  "manifestVersion": "1.0.0",
+  "version": "1.0.0",
+  "drillKind": "lch03-hypercare-synthetic-sessions",
+  "title": "LCH-03 hypercare drill record (repository-only template)",
+  "description": "Repository-only LCH-03 hypercare drill record (PLAN.md section 8 LCH-03). Fillable foundation only: the production hypercare window has not run (hypercareStatus PENDING), no production acceptance exists (productionAcceptance false), incident cadence and rollback authority are PENDING, and no SLO, error-budget, or real-traffic claim is made. This example records the deterministic zero-session drill state: 0 synthetic sessions against a declared threshold of 100, so hypercareWindowAccepted is false — proving the synthetic gate is not vacuous. It is a bounded synthetic computation only (session count vs declared threshold), never production hypercare acceptance, and it does not modify or duplicate config/current-state.json, which remains the authoritative source of truth (0/17 gates complete, 0/14 phases accepted, production pre-production, dataStage synthetic-only, scope browser-only).",
+  "authority": {
+    "source": "config/current-state.json",
+    "role": "authoritative-source-of-truth",
+    "note": "current-state remains the authoritative manifest; this drill record never overrides it. Acceptance here is a bounded synthetic computation (session count vs declared threshold) and never a production hypercare acceptance."
+  },
+  "drill": {
+    "declaredThreshold": 100,
+    "syntheticSessionCount": 0,
+    "elapsedHours": 0,
+    "elapsedHoursOnly": false,
+    "trafficSource": "synthetic_local",
+    "hypercareWindowAccepted": false,
+    "hypercareStatus": "PENDING",
+    "productionAcceptance": false,
+    "sloAttainment": null,
+    "errorBudgetRemaining": null,
+    "errorBudgetHealthy": null,
+    "incidentCadence": "PENDING",
+    "rollbackAuthority": "PENDING"
+  },
+  "evidence": {
+    "evidenceType": "synthetic_local",
+    "status": "PENDING",
+    "sessionIds": [],
+    "endpoints": [],
+    "note": "Repository-only fixture; no authentic external evidence exists and none is claimed. No session identifier or endpoint is recorded, and no identifier can authorize a positive claim."
+  }
+}

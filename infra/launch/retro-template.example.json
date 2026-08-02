@@ -1,0 +1,33 @@
+{
+  "manifestVersion": "1.0.0",
+  "version": "1.0.0",
+  "retroKind": "lch04-post-launch-retro",
+  "title": "LCH-04 post-launch retrospective (repository-only template)",
+  "description": "Repository-only LCH-04 post-launch retrospective template (PLAN.md section 8 LCH-04). Fillable foundation only: the retro session has not run (retroStatus TEMPLATE), nothing is published, completed, filed, or closed, and no action item exists (actionItemsFiled false, count 0, items empty). A real post-launch retro can only be published and action items filed after a completed launch and LCH-03 hypercare closure, which are owner/external operations outside this repository. This fixture is a template — it does not claim a retro session, a published record, or any filed action item. It does not modify or duplicate config/current-state.json, which remains the authoritative source of truth (0/17 gates complete, 0/14 phases accepted, production pre-production, dataStage synthetic-only, scope browser-only).",
+  "authority": {
+    "source": "config/current-state.json",
+    "role": "authoritative-source-of-truth",
+    "note": "current-state remains the authoritative manifest; this retro template never overrides it. Retro publication and action-item filing are external post-launch closures, never claimed here."
+  },
+  "retro": {
+    "retroStatus": "TEMPLATE",
+    "sessionDate": null,
+    "facilitator": null,
+    "participants": [],
+    "findings": [],
+    "published": false,
+    "completed": false,
+    "filed": false,
+    "closed": false
+  },
+  "actionItems": {
+    "actionItemsFiled": false,
+    "count": 0,
+    "items": []
+  },
+  "evidence": {
+    "evidenceType": "synthetic_local",
+    "status": "PENDING",
+    "note": "Repository-only fixture; no authentic external evidence exists and none is claimed. No retro session, participant, finding, or action item is recorded, and no identifier can authorize a claim."
+  }
+}

@@ -1,0 +1,168 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/christo0192/Project_HELLO/config/phase12-retro.schema.json",
+  "title": "Phase 12 Post-Launch Retrospective — LCH-04 retro template schema",
+  "description": "Repository-only LCH-04 post-launch retrospective contract (PLAN.md section 8 LCH-04: the owner team completes a structured retrospective after a successful launch and files action items with owners). This schema governs a fillable TEMPLATE only: retroStatus is restricted to PENDING | TEMPLATE | NOT_STARTED, published/completed/filed/closed are const false, no retro session exists (sessionDate/facilitator null), no participant or finding is recorded, and action items are structurally absent (actionItemsFiled const false, count const 0, items maxItems 0). PUBLISHED, COMPLETED, FILED, and CLOSED retro statuses, a true actionItemsFiled, a non-zero action-item count, and any real action item are forbidden positive claims and are never valid values here: publishing a retro and filing action items requires a completed launch and LCH-03 hypercare closure, which are owner/external operations outside this repository. No EV-* reference, UUID, ticket ID, or URL can authorize a claim. It does not duplicate or override config/current-state.json, which remains the authoritative source of truth (0/17 gates complete, 0/14 phases accepted, production pre-production, dataStage synthetic-only, scope browser-only).",
+  "version": "1.0.0",
+  "type": "object",
+  "required": [
+    "manifestVersion",
+    "version",
+    "retroKind",
+    "title",
+    "description",
+    "authority",
+    "retro",
+    "actionItems",
+    "evidence"
+  ],
+  "properties": {
+    "manifestVersion": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "retroKind": { "type": "string", "const": "lch04-post-launch-retro" },
+    "title": { "type": "string", "minLength": 1 },
+    "description": { "type": "string", "minLength": 1, "maxLength": 4000 },
+    "authority": { "$ref": "#/$defs/authority" },
+    "retro": { "$ref": "#/$defs/retro" },
+    "actionItems": { "$ref": "#/$defs/actionItems" },
+    "evidence": { "$ref": "#/$defs/evidence" }
+  },
+  "$defs": {
+    "authority": {
+      "type": "object",
+      "required": ["source", "role", "note"],
+      "properties": {
+        "source": { "type": "string", "const": "config/current-state.json" },
+        "role": { "type": "string", "const": "authoritative-source-of-truth" },
+        "note": { "type": "string", "minLength": 1, "maxLength": 2000 }
+      },
+      "additionalProperties": false
+    },
+    "retro": {
+      "type": "object",
+      "required": [
+        "retroStatus",
+        "sessionDate",
+        "facilitator",
+        "participants",
+        "findings",
+        "published",
+        "completed",
+        "filed",
+        "closed"
+      ],
+      "properties": {
+        "retroStatus": {
+          "type": "string",
+          "enum": ["PENDING", "TEMPLATE", "NOT_STARTED"],
+          "description": "Retro session state. PUBLISHED, COMPLETED, FILED, and CLOSED are forbidden positive claims: a real post-launch retro can only be published and filed after a completed launch and LCH-03 hypercare closure, which are owner/external operations outside this repository."
+        },
+        "sessionDate": {
+          "type": "null",
+          "const": null,
+          "description": "No retro session has run; no session date exists. Any non-null value is a forbidden claim."
+        },
+        "facilitator": {
+          "type": "null",
+          "const": null,
+          "description": "No facilitator is named. Any non-null name is a forbidden claim."
+        },
+        "participants": {
+          "type": "array",
+          "items": { "type": "string" },
+          "maxItems": 0,
+          "description": "No participant is named. The array is structurally forced empty."
+        },
+        "findings": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": false },
+          "maxItems": 0,
+          "description": "No retro finding is recorded. The array is structurally forced empty."
+        },
+        "published": {
+          "type": "boolean",
+          "const": false,
+          "description": "The retro is not published. true is a forbidden positive claim."
+        },
+        "completed": {
+          "type": "boolean",
+          "const": false,
+          "description": "The retro session is not completed. true is a forbidden positive claim."
+        },
+        "filed": {
+          "type": "boolean",
+          "const": false,
+          "description": "No retro record is filed. true is a forbidden positive claim."
+        },
+        "closed": {
+          "type": "boolean",
+          "const": false,
+          "description": "The retro is not closed. true is a forbidden positive claim."
+        }
+      },
+      "additionalProperties": false
+    },
+    "actionItems": {
+      "type": "object",
+      "required": ["actionItemsFiled", "count", "items"],
+      "properties": {
+        "actionItemsFiled": {
+          "type": "boolean",
+          "const": false,
+          "description": "No action item is filed. true is a forbidden positive claim: filing real action items requires the owner team to hold and close the retro after launch and LCH-03 closure."
+        },
+        "count": {
+          "type": "integer",
+          "const": 0,
+          "description": "Zero action items. Any non-zero count is a forbidden claim."
+        },
+        "items": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/actionItem" },
+          "maxItems": 0,
+          "description": "No action item exists. The array is structurally forced empty so no real action item can be claimed."
+        }
+      },
+      "additionalProperties": false
+    },
+    "actionItem": {
+      "type": "object",
+      "required": ["title", "status", "owner", "dueDate", "evidenceRef"],
+      "properties": {
+        "title": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "status": {
+          "type": "string",
+          "enum": ["PENDING"],
+          "description": "Action-item status. COMPLETE, DONE, IN_PROGRESS, and CLOSED are forbidden positive claims; and because actionItems.items is maxItems 0, no action item may exist at all in repository-only foundations."
+        },
+        "owner": {
+          "type": "null",
+          "const": null,
+          "description": "No action-item owner is named. Any non-null name is a forbidden claim."
+        },
+        "dueDate": {
+          "type": "null",
+          "const": null,
+          "description": "No action-item due date exists. Any non-null value is a forbidden claim."
+        },
+        "evidenceRef": {
+          "type": "null",
+          "const": null,
+          "description": "No evidence reference authorizes an action item. Any non-null value is a forbidden claim."
+        }
+      },
+      "additionalProperties": false
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["evidenceType", "status", "note"],
+      "properties": {
+        "evidenceType": { "type": "string", "const": "synthetic_local" },
+        "status": { "type": "string", "const": "PENDING" },
+        "note": { "type": "string", "minLength": 1, "maxLength": 1000 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,34 @@
+{
+  "manifestVersion": "1.0.0",
+  "version": "1.0.0",
+  "drillKind": "lch03-hypercare-synthetic-sessions",
+  "title": "LCH-03 hypercare drill fixture — 50 synthetic sessions (below declared threshold)",
+  "description": "Deterministic below-threshold control for the LCH-03 synthetic hypercare drill. syntheticSessionCount is 50 against a declaredThreshold of 100, so the harness computes syntheticThresholdMet = false and hypercareWindowAccepted is declared false. Even with elapsedHours recorded, elapsedHoursOnly is false: elapsed time alone never accepts a window. hypercareStatus stays PENDING, productionAcceptance is false, incidentCadence and rollbackAuthority stay PENDING, and no SLO, error-budget, or real-traffic claim is made. It does not modify or duplicate config/current-state.json, which remains the authoritative source of truth (0/17 gates complete, 0/14 phases accepted, production pre-production, dataStage synthetic-only, scope browser-only).",
+  "authority": {
+    "source": "config/current-state.json",
+    "role": "authoritative-source-of-truth",
+    "note": "current-state remains the authoritative manifest; this drill fixture never overrides it. Acceptance here is a bounded synthetic computation (session count vs declared threshold) and never a production hypercare acceptance."
+  },
+  "drill": {
+    "declaredThreshold": 100,
+    "syntheticSessionCount": 50,
+    "elapsedHours": 0,
+    "elapsedHoursOnly": false,
+    "trafficSource": "synthetic_local",
+    "hypercareWindowAccepted": false,
+    "hypercareStatus": "PENDING",
+    "productionAcceptance": false,
+    "sloAttainment": null,
+    "errorBudgetRemaining": null,
+    "errorBudgetHealthy": null,
+    "incidentCadence": "PENDING",
+    "rollbackAuthority": "PENDING"
+  },
+  "evidence": {
+    "evidenceType": "synthetic_local",
+    "status": "PENDING",
+    "sessionIds": [],
+    "endpoints": [],
+    "note": "50 synthetic sessions, below the declared threshold of 100; no session identifier, endpoint, or external evidence exists or is claimed."
+  }
+}

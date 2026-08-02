@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/christo0192/Project_HELLO/config/phase12-hypercare.schema.json",
+  "title": "Phase 12 Hypercare — LCH-03 synthetic drill fixture schema",
+  "description": "Repository-only LCH-03 hypercare drill contract (PLAN.md section 8 LCH-03: heightened post-launch monitoring for an SRE-approved window based on traffic volume, not merely elapsed hours, with active on-call, issue cadence, and explicit rollback authority). This schema governs deterministic, bounded SYNTHETIC drill fixtures only. Every fixture declares a bounded synthetic session count, a declared threshold, and a traffic source that must be synthetic_local. The run-phase12-hypercare-drill harness computes and checks only a syntheticThresholdMet-style result: hypercareWindowAccepted is true if and only if syntheticSessionCount >= declaredThreshold AND trafficSource === \"synthetic_local\". It NEVER accepts production hypercare, real SLO attainment, error-budget health, real traffic, or wall-clock acceptance: hypercareStatus is restricted to NOT_RUN | PENDING, productionAcceptance is const false, sloAttainment/errorBudgetRemaining/errorBudgetHealthy are const null, incidentCadence and rollbackAuthority are const PENDING, and elapsedHoursOnly is const false (elapsed hours are recorded but never used for acceptance). Evidence is type synthetic_local with structurally empty sessionIds and endpoints (no IDs, no endpoints). No EV-* reference, UUID, ticket ID, or URL can authorize a positive claim. It does not duplicate or override config/current-state.json, which remains the authoritative source of truth (0/17 gates complete, 0/14 phases accepted, production pre-production, dataStage synthetic-only, scope browser-only).",
+  "version": "1.0.0",
+  "type": "object",
+  "required": [
+    "manifestVersion",
+    "version",
+    "drillKind",
+    "title",
+    "description",
+    "authority",
+    "drill",
+    "evidence"
+  ],
+  "properties": {
+    "manifestVersion": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "drillKind": { "type": "string", "const": "lch03-hypercare-synthetic-sessions" },
+    "title": { "type": "string", "minLength": 1, "maxLength": 500 },
+    "description": { "type": "string", "minLength": 1, "maxLength": 4000 },
+    "authority": { "$ref": "#/$defs/authority" },
+    "drill": { "$ref": "#/$defs/drill" },
+    "evidence": { "$ref": "#/$defs/evidence" }
+  },
+  "$defs": {
+    "authority": {
+      "type": "object",
+      "required": ["source", "role", "note"],
+      "properties": {
+        "source": { "type": "string", "const": "config/current-state.json" },
+        "role": { "type": "string", "const": "authoritative-source-of-truth" },
+        "note": { "type": "string", "minLength": 1, "maxLength": 2000 }
+      },
+      "additionalProperties": false
+    },
+    "drill": {
+      "type": "object",
+      "required": [
+        "declaredThreshold",
+        "syntheticSessionCount",
+        "elapsedHours",
+        "elapsedHoursOnly",
+        "trafficSource",
+        "hypercareWindowAccepted",
+        "hypercareStatus",
+        "productionAcceptance",
+        "sloAttainment",
+        "errorBudgetRemaining",
+        "errorBudgetHealthy",
+        "incidentCadence",
+        "rollbackAuthority"
+      ],
+      "properties": {
+        "declaredThreshold": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000,
+          "description": "Declared minimum number of synthetic sessions required to accept the synthetic hypercare window. A threshold of 0 is rejected: it would make the gate vacuous. The harness computes acceptance solely as syntheticSessionCount >= declaredThreshold."
+        },
+        "syntheticSessionCount": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000,
+          "description": "Compact aggregate count of synthetic sessions used by the drill. Hard-bounded 0..10000; non-integer and out-of-range values are rejected. Fixtures commit 0, 50, 200, and 1000."
+        },
+        "elapsedHours": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 168,
+          "description": "Recorded elapsed window length in whole hours (informational only, bounded 0..168). NEVER used for acceptance: elapsedHoursOnly is const false, so wall-clock duration alone can never accept a window."
+        },
+        "elapsedHoursOnly": {
+          "type": "boolean",
+          "const": false,
+          "description": "Declares that acceptance is NOT based on elapsed hours alone. true is rejected: a wall-clock-only acceptance is a forbidden claim, and any fixture combining elapsedHoursOnly true with hypercareWindowAccepted true is a cross-field violation."
+        },
+        "trafficSource": {
+          "type": "string",
+          "enum": ["synthetic_local"],
+          "description": "Traffic source. Only synthetic_local is valid; production, prod, live, and real are forbidden positive claims and are rejected."
+        },
+        "hypercareWindowAccepted": {
+          "type": "boolean",
+          "description": "Declared synthetic-drill window acceptance. The harness verifies it equals the computed result syntheticSessionCount >= declaredThreshold AND trafficSource === \"synthetic_local\". true with sessionCount below threshold, or with sessionCount 0, is rejected (non-vacuous gate). This is a synthetic drill result only: the real hypercare window status is hypercareStatus, which stays NOT_RUN | PENDING."
+        },
+        "hypercareStatus": {
+          "type": "string",
+          "enum": ["NOT_RUN", "PENDING"],
+          "description": "Real hypercare window status. The production hypercare window has not run and remains NOT_RUN or PENDING; RUNNING, ACTIVE, OPEN, COMPLETE, and ACCEPTED are forbidden positive claims."
+        },
+        "productionAcceptance": {
+          "type": "boolean",
+          "const": false,
+          "description": "Production acceptance is never claimed by a repository drill. true is rejected unconditionally."
+        },
+        "sloAttainment": {
+          "type": "null",
+          "const": null,
+          "description": "Real SLO attainment is not measured by a synthetic drill. Any non-null value (e.g., 99.95) is a forbidden real-SLO claim and is rejected."
+        },
+        "errorBudgetRemaining": {
+          "type": "null",
+          "const": null,
+          "description": "Real error-budget remaining is not measured by a synthetic drill. Any non-null value is a forbidden error-budget claim and is rejected."
+        },
+        "errorBudgetHealthy": {
+          "type": "null",
+          "const": null,
+          "description": "Error-budget health is not claimed by a synthetic drill. Any non-null value (true/false) is a forbidden claim and is rejected."
+        },
+        "incidentCadence": {
+          "type": "string",
+          "enum": ["PENDING"],
+          "description": "Incident cadence roles and review cadence are PENDING; ACTIVE, SCHEDULED, and ESTABLISHED are forbidden positive claims. See docs/runbooks/launch-incident-cadence.md."
+        },
+        "rollbackAuthority": {
+          "type": "string",
+          "enum": ["PENDING"],
+          "description": "Rollback authority during hypercare is PENDING; AUTHORIZED, APPROVED, GRANTED, and ACTIVE are forbidden positive claims."
+        }
+      },
+      "additionalProperties": false
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["evidenceType", "status", "sessionIds", "endpoints", "note"],
+      "properties": {
+        "evidenceType": { "type": "string", "const": "synthetic_local" },
+        "status": { "type": "string", "const": "PENDING" },
+        "sessionIds": {
+          "type": "array",
+          "items": { "type": "string" },
+          "maxItems": 0,
+          "description": "Structurally forced empty: no session identifier exists in a repository drill. Any identifier value is a forbidden bypass vector and is rejected."
+        },
+        "endpoints": {
+          "type": "array",
+          "items": { "type": "string" },
+          "maxItems": 0,
+          "description": "Structurally forced empty: no endpoint, host, or URL exists in a repository drill. Any endpoint value is a forbidden claim and is rejected."
+        },
+        "note": { "type": "string", "minLength": 1, "maxLength": 1000 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

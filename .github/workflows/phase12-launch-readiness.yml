@@ -1,0 +1,115 @@
+name: Phase 12 launch readiness
+
+# Bounded, offline, deterministic validation for the Phase 12 launch-readiness
+# foundations (LCH-01..04). No provider commands, no cloud applies, no live
+# endpoints, no secrets, no npm install. All Phase 12 validators are Node
+# stdlib-only. Every action SHA is pinned (no @vN tags).
+#
+# Path filters are tight: this workflow only runs when a Phase 12 launch
+# readiness artifact (schema, example, hypercare fixture, runbook, validator,
+# drill harness, this workflow, docs/launch index) changes. It also runs the
+# pre-existing current-state/model-governance/deployment-capacity status
+# validators and the Phase 11 contract/release/provenance/schema validators so
+# Phase 12 can never silently break an upstream contract. current-state files
+# are verified byte-identical to the exact immutable Phase 12 base
+# 9db22b360a5949396d5d541e2b8a417035ff5c41 for pull_request, push, and
+# workflow_dispatch alike — never a moving branch tip baseline (the repository
+# authority remains pre-production, 0/17 launch gates, 0/14 phases).
+
+on:
+  pull_request:
+    paths:
+      - 'config/phase12-launch-readiness.schema.json'
+      - 'config/phase12-launch-execution.schema.json'
+      - 'config/phase12-hypercare.schema.json'
+      - 'config/phase12-retro.schema.json'
+      - 'infra/launch/**'
+      - 'docs/launch/**'
+      - 'docs/runbooks/production-launch.md'
+      - 'docs/runbooks/production-rollback.md'
+      - 'docs/runbooks/launch-hypercare.md'
+      - 'docs/runbooks/launch-incident-cadence.md'
+      - 'docs/runbooks/post-launch-retro.md'
+      - 'scripts/check-phase12-launch-status.mjs'
+      - 'scripts/check-phase12-launch-status.test.mjs'
+      - 'scripts/run-phase12-hypercare-drill.mjs'
+      - 'scripts/run-phase12-hypercare-drill.test.mjs'
+      - '.github/workflows/phase12-launch-readiness.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'config/phase12-launch-readiness.schema.json'
+      - 'config/phase12-launch-execution.schema.json'
+      - 'config/phase12-hypercare.schema.json'
+      - 'config/phase12-retro.schema.json'
+      - 'infra/launch/**'
+      - 'docs/launch/**'
+      - 'docs/runbooks/production-launch.md'
+      - 'docs/runbooks/production-rollback.md'
+      - 'docs/runbooks/launch-hypercare.md'
+      - 'docs/runbooks/launch-incident-cadence.md'
+      - 'docs/runbooks/post-launch-retro.md'
+      - 'scripts/check-phase12-launch-status.mjs'
+      - 'scripts/check-phase12-launch-status.test.mjs'
+      - 'scripts/run-phase12-hypercare-drill.mjs'
+      - 'scripts/run-phase12-hypercare-drill.test.mjs'
+      - '.github/workflows/phase12-launch-readiness.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  phase12-launch-readiness:
+    name: phase12-launch-readiness
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository history (full depth for baseline diff)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: Phase 12 comprehensive contract validator (all committed artifacts, pinned current-state base)
+        run: node scripts/check-phase12-launch-status.mjs --baseline-ref 9db22b360a5949396d5d541e2b8a417035ff5c41
+      - name: Phase 12 validator negative controls (non-vacuity)
+        run: node scripts/check-phase12-launch-status.test.mjs
+      - name: Hypercare synthetic drill matrix (deterministic, traffic-count only)
+        run: node scripts/run-phase12-hypercare-drill.mjs --all
+      - name: Hypercare drill harness self-test
+        run: node scripts/run-phase12-hypercare-drill.test.mjs
+      - name: Current-state validator + negative controls
+        run: |
+          node scripts/check-current-state.mjs
+          node scripts/check-current-state.test.mjs
+      - name: Model-governance status validator + negative controls
+        run: |
+          node scripts/check-model-governance-status.mjs
+          node scripts/check-model-governance-status.test.mjs
+      - name: Deployment-capacity status validator + negative controls
+        run: |
+          node scripts/check-deployment-capacity-status.mjs
+          node scripts/check-deployment-capacity-status.test.mjs
+      - name: Phase 11 deployment contract + fixtures (DEP-04/05, unchanged)
+        run: |
+          node scripts/validate-deployment-contracts
+          node scripts/validate-deployment-contracts --fixtures
+      - name: Phase 11 release state machine + rollback compatibility (DEP-06, unchanged)
+        run: |
+          node scripts/validate-deployment-release validate infra/deployment-contracts/release-record.example.json
+          node scripts/validate-deployment-release --fixtures
+      - name: Phase 11 offline artifact provenance (DEP-07, unchanged)
+        run: |
+          node scripts/artifact-provenance-validate validate infra/deployment-contracts/provenance-manifest.json
+          node scripts/artifact-provenance-validate --fixtures
+      - name: Phase 11 schema-contract drift validation (unchanged)
+        run: node scripts/validate-deployment-schema-drift
+      - name: Current-state byte-identity vs exact Phase 12 base
+        run: |
+          git diff --exit-code 9db22b360a5949396d5d541e2b8a417035ff5c41 -- config/current-state.json docs/current-state.md
+          echo "config/current-state.json and docs/current-state.md unchanged from pinned base 9db22b360a5949396d5d541e2b8a417035ff5c41"
+      - name: Whitespace check
+        run: git diff --check

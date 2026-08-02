@@ -1,0 +1,169 @@
+{
+  "manifestVersion": "1.0.0",
+  "version": "1.0.0",
+  "registryKind": "lch01-launch-gate-registry",
+  "title": "LCH-01 launch gate registry (repository-only template)",
+  "description": "Repository-only enumeration of the 17 canonical launch gates from PLAN.md section 8. Every gate is PENDING, the go/no-go decision is PENDING with no signatory, date, or evidence, and no approval is recorded. This fixture is a fillable template foundation — it does not claim launch completion. It is a separate artifact and does not modify or duplicate config/current-state.json, which remains the authoritative source of truth (0/17 gates complete, 0/14 phases accepted, production pre-production, dataStage synthetic-only, scope browser-only).",
+  "authority": {
+    "source": "config/current-state.json",
+    "role": "authoritative-source-of-truth",
+    "gateCountSource": "PLAN.md section 8 (17 canonical launch gates)",
+    "note": "current-state remains the authoritative manifest; this registry never overrides it. Gate count and phase count in current-state stay 0/17 and 0/14."
+  },
+  "registryStatus": "PENDING",
+  "gates": [
+    {
+      "gateId": "PII-GATE",
+      "title": "PII Cleanliness",
+      "definition": "Zero real PII in docs, demo data, logs, or public storage; secret scan clean; sanitized demo artifacts (PLAN.md section 8).",
+      "status": "PENDING",
+      "evidenceType": "synthetic_local",
+      "evidenceStatus": "PENDING"
+    },
+    {
+      "gateId": "AUTH-GATE",
+      "title": "Authentication and Authorization",
+      "definition": "Every privileged or data-changing endpoint enforces authentication and authorization; intentionally public endpoints are documented, narrowly scoped, abuse-tested, and rate-limited (PLAN.md section 8).",
+      "status": "PENDING",
+      "evidenceType": "synthetic_local",
+      "evidenceStatus": "PENDING"
+    },
+    {
+      "gateId": "KEY-GATE",
+      "title": "Credential Rotation and Secret Management",
+      "definition": "Existing local keys rotated before first commit; no service-role or provider secret in source, image, client bundle, logs, or CI; production secrets use an approved manager or runtime identity (PLAN.md section 8).",
+      "status": "PENDING",
+      "evidenceType": "synthetic_local",
+      "evidenceStatus": "PENDING"
+    },
+    {
+      "gateId": "UPLOAD-GATE",
+      "title": "Upload Security",
+      "definition": "No unauthenticated file upload endpoints; recording upload is authenticated, size-limited, and content-validated (PLAN.md section 8).",
+      "status": "PENDING",
+      "evidenceType": "synthetic_local",
+      "evidenceStatus": "PENDING"
+    },
+    {
+      "gateId": "AI-GATE",
+      "title": "No Sole Automated Rejection",
+      "definition": "No automated rejection without human review and action; candidate status change to rejected requires human action, enforced in code (PLAN.md section 8).",
+      "status": "PENDING",
+      "evidenceType": "synthetic_local",
+      "evidenceStatus": "PENDING"
+    },
+    {
+      "gateId": "CONSENT-GATE",
+      "title": "Recording Consent",
+      "definition": "Recording consent is mandatory before room join; consent record is stored with timestamp (PLAN.md section 8).",
+      "status": "PENDING",
+      "evidenceType": "synthetic_local",
+      "evidenceStatus": "PENDING"
+    },
+    {
+      "gateId": "MIGRATION-GATE",
+      "title": "Production Database Migration",
+      "definition": "Migration to the company-controlled production database project complete under the production email; tenancy-appropriate policy tests pass; storage verified private; final reconciliation signed; rollback available; region and backup evidence satisfy owner decisions (PLAN.md section 8).",
+      "status": "PENDING",
+      "evidenceType": "synthetic_local",
+      "evidenceStatus": "PENDING"
+    },
+    {
+      "gateId": "BACKUP-GATE",
+      "title": "Backup and Restore",
+      "definition": "Database and recording restore drills complete successfully; approved recovery objectives measured, including backup-expiry behavior for deletion requests (PLAN.md section 8).",
+      "status": "PENDING",
+      "evidenceType": "synthetic_local",
+      "evidenceStatus": "PENDING"
+    },
+    {
+      "gateId": "LOAD-GATE",
+      "title": "Load, Spike, and Soak",
+      "definition": "Load, spike, and soak tests pass at approved launch concurrency and safety headroom for the approved duration; latency, error, saturation, backlog, and cost remain within the error budget (PLAN.md section 8).",
+      "status": "PENDING",
+      "evidenceType": "synthetic_local",
+      "evidenceStatus": "PENDING"
+    },
+    {
+      "gateId": "OBSERVABILITY-GATE",
+      "title": "Observability",
+      "definition": "Logs, metrics, and traces flowing to the observability platform; alerts configured and tested; on-call rotation active (PLAN.md section 8).",
+      "status": "PENDING",
+      "evidenceType": "synthetic_local",
+      "evidenceStatus": "PENDING"
+    },
+    {
+      "gateId": "CI-GATE",
+      "title": "CI/CD Integrity",
+      "definition": "CI pipeline green on main; branch protection enforced; deployment approval gate active (PLAN.md section 8).",
+      "status": "PENDING",
+      "evidenceType": "synthetic_local",
+      "evidenceStatus": "PENDING"
+    },
+    {
+      "gateId": "E2E-GATE",
+      "title": "End-to-End Voice",
+      "definition": "Automated and human-reviewed end-to-end voice suites pass across the approved browser, device, network, and accent matrix; transcript ordering, consent, recording, and asynchronous scorecard validated (PLAN.md section 8).",
+      "status": "PENDING",
+      "evidenceType": "synthetic_local",
+      "evidenceStatus": "PENDING"
+    },
+    {
+      "gateId": "RELIABILITY-GATE",
+      "title": "Reliability",
+      "definition": "Lifecycle, stable transcript identifiers and ordering, durable post-session jobs, retries, dead-letter handling, idempotency, graceful shutdown, and reconciliation pass failure-injection tests (PLAN.md section 8).",
+      "status": "PENDING",
+      "evidenceType": "synthetic_local",
+      "evidenceStatus": "PENDING"
+    },
+    {
+      "gateId": "SECURITY-GATE",
+      "title": "Security Posture",
+      "definition": "Threat model and security test suite have no unaccepted critical or high finding; dependency, SAST, DAST, secret, upload, policy, and authorization tests pass; any exception has a named owner, compensating control, and expiry (PLAN.md section 8).",
+      "status": "PENDING",
+      "evidenceType": "synthetic_local",
+      "evidenceStatus": "PENDING"
+    },
+    {
+      "gateId": "FAIRNESS-GATE",
+      "title": "Fairness",
+      "definition": "Human-oversight enforcement, calibration, and legally approved fairness and accommodation tests meet launch thresholds; unresolved material disparity blocks launch (PLAN.md section 8).",
+      "status": "PENDING",
+      "evidenceType": "synthetic_local",
+      "evidenceStatus": "PENDING"
+    },
+    {
+      "gateId": "LEGAL-GATE",
+      "title": "Legal Sign-Off",
+      "definition": "Legal approval of privacy notice and terms, AI and recording consent, data-protection posture, retention and legal holds, data-subject process, vendor agreements and subprocessors, and residency decisions (PLAN.md section 8).",
+      "status": "PENDING",
+      "evidenceType": "synthetic_local",
+      "evidenceStatus": "PENDING"
+    },
+    {
+      "gateId": "DATA-GATE",
+      "title": "Data Lifecycle",
+      "definition": "Retention, legal-hold, deletion and backup aging, and data-subject export, correction, and deletion are implemented and tested (PLAN.md section 8).",
+      "status": "PENDING",
+      "evidenceType": "synthetic_local",
+      "evidenceStatus": "PENDING"
+    }
+  ],
+  "goDecision": {
+    "decision": "PENDING",
+    "recordedBy": null,
+    "date": null,
+    "evidenceRef": null
+  },
+  "approvals": {
+    "status": "PENDING",
+    "signatory": null,
+    "date": null,
+    "evidenceRef": null
+  },
+  "evidence": {
+    "type": "synthetic_local",
+    "status": "PENDING",
+    "note": "Repository-only fixture; no authentic external evidence exists and none is claimed."
+  }
+}
