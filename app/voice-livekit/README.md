@@ -62,23 +62,12 @@ join token. The LiveKit worker reads the room metadata, writes committed
 conversation turns into `screening_v2.transcript_turns`, completes the session on
 close, and triggers the existing `/api/assess/:session_id` Claude scorecard.
 
-Fill these values in both `app/api/.env` and `app/voice-livekit/.env`:
+Required environment variables (see `.env.example` in each directory):
 
-```powershell
-LIVEKIT_URL=wss://your-project.livekit.cloud
-LIVEKIT_API_KEY=...
-LIVEKIT_API_SECRET=...
-```
+- **`app/api/.env`:** `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`
+- **`app/voice-livekit/.env`:** same LiveKit variables plus `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_SCHEMA`, `RECORDINGS_BUCKET`, `API_BASE`
 
-Also make sure `app/voice-livekit/.env` has Supabase persistence values:
-
-```powershell
-SUPABASE_URL=...
-SUPABASE_SERVICE_ROLE_KEY=...
-SUPABASE_SCHEMA=screening_v2
-RECORDINGS_BUCKET=recordings_v2
-API_BASE=http://localhost:8787
-```
+All values use `replace_me` placeholders in committed example files; real credentials are owner-supplied at deploy time.
 
 Run the three processes:
 
