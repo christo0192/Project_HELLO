@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/christo0192/Project_HELLO/config/deployment-capacity-contracts.schema.json",
+  "title": "Provider-neutral deployment contract manifest schema (DEP-04)",
+  "description": "Repository-only deployment contract for the ADR-0010 managed-hosting pilot. Every service is NOT_DEPLOYED, nothing is provisioned or live, and every approval is PENDING owner verification. Contracts store env var NAMES only (never values), image/artifact INPUTS (never registry URLs), and the runtime secret source. No Terraform or provider resource is represented by this file.",
+  "version": "1.0.0",
+  "type": "object",
+  "required": [
+    "manifestVersion",
+    "title",
+    "description",
+    "adrReference",
+    "status",
+    "approvalStatus",
+    "deployed",
+    "provisioned",
+    "secretModel",
+    "services",
+    "migrations"
+  ],
+  "properties": {
+    "manifestVersion": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "title": { "type": "string", "minLength": 1 },
+    "description": { "type": "string", "minLength": 1, "maxLength": 4000 },
+    "adrReference": { "type": "string", "const": "docs/adr/0010-hosting-topology.md" },
+    "status": { "type": "string", "enum": ["PROPOSED", "PENDING"] },
+    "approvalStatus": { "type": "string", "const": "PENDING" },
+    "deployed": {
+      "type": "boolean",
+      "const": false,
+      "description": "Nothing is deployed by repository work; a true value is a false deployment claim."
+    },
+    "provisioned": {
+      "type": "boolean",
+      "const": false,
+      "description": "Nothing is provisioned by repository work; a true value is a false provisioning claim."
+    },
+    "secretModel": {
+      "type": "object",
+      "required": ["runtimeSource", "policy", "status"],
+      "properties": {
+        "runtimeSource": {
+          "type": "string",
+          "const": "managed-infisical-runtime",
+          "description": "ADR-0010 decision 2: values are injected at runtime from a managed Infisical project via machine identity. Names only are stored in this repository."
+        },
+        "policy": { "type": "string", "minLength": 1, "maxLength": 2000 },
+        "status": { "type": "string", "enum": ["PROPOSED", "PENDING"] }
+      },
+      "additionalProperties": false
+    },
+    "services": {
+      "type": "array",
+      "minItems": 7,
+      "items": { "$ref": "#/$defs/service" }
+    },
+    "migrations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/migration" }
+    }
+  },
+  "$defs": {
+    "service": {
+      "type": "object",
+      "required": ["serviceId", "name", "component", "runtime", "artifactType", "artifactInput", "envVars", "stages"],
+      "properties": {
+        "serviceId": { "type": "string", "pattern": "^[a-z0-9-]+$" },
+        "name": { "type": "string", "minLength": 1 },
+        "component": { "type": "string", "minLength": 1 },
+        "runtime": { "type": "string", "minLength": 1 },
+        "artifactType": { "type": "string", "enum": ["docker-image", "managed-service", "instance"] },
+        "artifactInput": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Repository-relative artifact input (build context or managed-service marker). Never a registry URL, provider endpoint, or credential."
+        },
+        "notes": { "type": "string", "maxLength": 2000 },
+        "envVars": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/envVar" }
+        },
+        "stages": {
+          "type": "object",
+          "required": ["staging", "prod"],
+          "properties": {
+            "staging": { "$ref": "#/$defs/stage" },
+            "prod": { "$ref": "#/$defs/stage" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "envVar": {
+      "type": "object",
+      "required": ["name", "secret", "secretSource"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]*$",
+          "description": "Env var NAME only. A name containing '=' or any value-like content is a violation."
+        },
+        "secret": { "type": "boolean" },
+        "secretSource": {
+          "type": "string",
+          "enum": ["managed-infisical-runtime", "build-time-config", "owner-managed-environment"]
+        },
+        "note": { "type": "string", "maxLength": 1000 }
+      },
+      "additionalProperties": false
+    },
+    "stage": {
+      "type": "object",
+      "required": ["status", "replicasProposed", "instanceSizeProposed"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["PROPOSED", "PENDING", "NOT_DEPLOYED"],
+          "description": "Stage deployment status. NOT_DEPLOYED is the only truthful value in repository-only work."
+        },
+        "replicasProposed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Proposed replica count (scale proposal, PENDING owner/SRE). Not a capacity claim."
+        },
+        "instanceSizeProposed": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Proposed instance/tier size (scale proposal, PENDING owner/SRE)."
+        },
+        "regionProposed": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "migration": {
+      "type": "object",
+      "required": ["id", "schemaVersion", "changeType", "scope", "status", "applied"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^mig-[0-9]+$" },
+        "schemaVersion": { "type": "integer", "minimum": 1 },
+        "changeType": {
+          "type": "string",
+          "enum": ["additive", "breaking", "none"],
+          "description": "Proposed migration class used by the rollback compatibility checker."
+        },
+        "scope": { "type": "string", "minLength": 1 },
+        "status": { "type": "string", "enum": ["PROPOSED", "PENDING"] },
+        "applied": {
+          "type": "boolean",
+          "const": false,
+          "description": "Migrations are never applied by repository work."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

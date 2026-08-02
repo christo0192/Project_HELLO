@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/christo0192/Project_HELLO/config/deployment-capacity-parity.schema.json",
+  "title": "Staging/Prod structural parity manifest schema (DEP-05)",
+  "description": "Repository-only parity manifest for the DEP-05 staging/prod structural parity rule: the same service set, the same env var NAMES (secret names only, never values), the same artifact inputs and runtimes in staging and prod, with scale-only differences (replicas, instance size) allowed. parityStatus is PENDING and parityAchieved is false: parity here is a repository contract assertion, not a claim that anything is deployed.",
+  "version": "1.0.0",
+  "type": "object",
+  "required": [
+    "manifestVersion",
+    "title",
+    "description",
+    "status",
+    "approvalStatus",
+    "sourceManifest",
+    "rule",
+    "secretNamesOnly",
+    "scaleDifferencesAllowed",
+    "parityStatus",
+    "parityAchieved",
+    "services"
+  ],
+  "properties": {
+    "manifestVersion": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "title": { "type": "string", "minLength": 1 },
+    "description": { "type": "string", "minLength": 1, "maxLength": 4000 },
+    "status": { "type": "string", "enum": ["PROPOSED", "PENDING"] },
+    "approvalStatus": { "type": "string", "const": "PENDING" },
+    "sourceManifest": {
+      "type": "string",
+      "const": "infra/deployment-contracts/manifest.json",
+      "description": "Parity is computed against the repository deployment contract manifest only."
+    },
+    "rule": { "type": "string", "minLength": 1, "maxLength": 2000 },
+    "secretNamesOnly": {
+      "type": "boolean",
+      "const": true,
+      "description": "Parity compares secret NAMES only; values never appear in this repository."
+    },
+    "scaleDifferencesAllowed": {
+      "type": "boolean",
+      "const": true,
+      "description": "Replica counts and instance sizes may differ between staging and prod; structure may not."
+    },
+    "parityStatus": {
+      "type": "string",
+      "const": "PENDING",
+      "description": "Parity is a PENDING repository assertion; no deployment parity is claimed."
+    },
+    "parityAchieved": {
+      "type": "boolean",
+      "const": false,
+      "description": "No parity is achieved because nothing is deployed."
+    },
+    "services": {
+      "type": "array",
+      "minItems": 7,
+      "items": { "$ref": "#/$defs/serviceParity" }
+    }
+  },
+  "$defs": {
+    "serviceParity": {
+      "type": "object",
+      "required": ["serviceId", "staging", "prod", "structuralEquivalence"],
+      "properties": {
+        "serviceId": { "type": "string", "pattern": "^[a-z0-9-]+$" },
+        "staging": { "$ref": "#/$defs/stageParity" },
+        "prod": { "$ref": "#/$defs/stageParity" },
+        "structuralEquivalence": {
+          "type": "object",
+          "required": ["sameService", "sameEnvVarNames", "sameSecretNames", "sameArtifactInput", "sameRuntime", "status"],
+          "properties": {
+            "sameService": { "type": "boolean", "const": true },
+            "sameEnvVarNames": { "type": "boolean", "const": true },
+            "sameSecretNames": { "type": "boolean", "const": true },
+            "sameArtifactInput": { "type": "boolean", "const": true },
+            "sameRuntime": { "type": "boolean", "const": true },
+            "status": { "type": "string", "enum": ["PROPOSED", "PENDING"] }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "stageParity": {
+      "type": "object",
+      "required": ["replicasProposed", "instanceSizeProposed", "envVarNames"],
+      "properties": {
+        "replicasProposed": { "type": "integer", "minimum": 0 },
+        "instanceSizeProposed": { "type": "string", "minLength": 1 },
+        "envVarNames": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_]*$",
+            "description": "Env var NAME only. A value, '='-joined name, or any credential-like content is a violation."
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

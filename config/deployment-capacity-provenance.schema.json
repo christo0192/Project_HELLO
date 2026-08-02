@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/christo0192/Project_HELLO/config/deployment-capacity-provenance.schema.json",
+  "title": "Offline artifact provenance manifest schema (DEP-07)",
+  "description": "Repository-only provenance template. SLSA level is 0, signing is false, and every digest, commit, builder, and test-evidence field is a PENDING placeholder until the owner records a real build. No signature, attestation, or build provenance is claimed by this file.",
+  "version": "1.0.0",
+  "type": "object",
+  "required": [
+    "manifestVersion",
+    "provenanceSchema",
+    "name",
+    "description",
+    "status",
+    "approvalStatus",
+    "generatedAt",
+    "builder",
+    "source",
+    "lockfiles",
+    "sboms",
+    "testEvidence",
+    "signing",
+    "slsa"
+  ],
+  "properties": {
+    "manifestVersion": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "provenanceSchema": { "type": "string", "const": "config/deployment-capacity-provenance.schema.json" },
+    "name": { "type": "string", "minLength": 1 },
+    "description": { "type": "string", "minLength": 1, "maxLength": 4000 },
+    "status": { "type": "string", "enum": ["PROPOSED", "PENDING"] },
+    "approvalStatus": { "type": "string", "const": "PENDING" },
+    "generatedAt": {
+      "type": "string",
+      "const": "PENDING",
+      "description": "No build is recorded by repository-only work; a timestamp would be a false build claim."
+    },
+    "builder": {
+      "type": "object",
+      "required": ["identity", "ciWorkflow", "host"],
+      "properties": {
+        "identity": { "type": "string", "pattern": "^PENDING(_[A-Z]+)*$" },
+        "ciWorkflow": { "type": "string", "pattern": "^PENDING(_[A-Z]+)*$" },
+        "host": { "type": "string", "pattern": "^PENDING(_[A-Z]+)*$" }
+      },
+      "additionalProperties": false
+    },
+    "source": {
+      "type": "object",
+      "required": ["repositorySlug", "baselineCommitSha", "commitSha"],
+      "properties": {
+        "repositorySlug": { "type": "string", "minLength": 1 },
+        "baselineCommitSha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$",
+          "description": "The clean baseline commit (origin/main) the Phase 11 repository work sits on."
+        },
+        "commitSha": {
+          "type": "string",
+          "pattern": "^(PENDING|[0-9a-f]{40})$",
+          "description": "PENDING until the owner records a build; a 40-hex SHA only with a real build."
+        }
+      },
+      "additionalProperties": false
+    },
+    "lockfiles": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "sha256"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "sha256": {
+            "type": "string",
+            "pattern": "^(PENDING|[0-9a-f]{64})$",
+            "description": "PENDING placeholder, or the computed sha256 of the repository lockfile. A missing digest is invalid."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "sboms": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "sha256", "generatedBy"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "sha256": {
+            "type": "string",
+            "pattern": "^(PENDING|[0-9a-f]{64})$"
+          },
+          "generatedBy": { "type": "string", "const": "scripts/sbom.sh" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "testEvidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "role", "status"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "role": { "type": "string", "minLength": 1 },
+          "status": {
+            "type": "string",
+            "enum": ["PENDING_RUN", "PENDING", "NOT_RUN"],
+            "description": "Test evidence placeholders only; a completed claim (e.g. PASSED) is not permitted in repository-only templates."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "signing": {
+      "type": "object",
+      "required": ["signed", "signingService", "keyId", "attestations", "note"],
+      "properties": {
+        "signed": {
+          "type": "boolean",
+          "const": false,
+          "description": "No artifact is signed; signed:true is a false signing claim."
+        },
+        "signingService": { "type": "string", "pattern": "^PENDING(_[A-Z]+)*$" },
+        "keyId": { "type": ["null"], "const": null },
+        "attestations": {
+          "type": "array",
+          "maxItems": 0,
+          "description": "No external attestation exists; any entry is a false attestation claim."
+        },
+        "note": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "slsa": {
+      "type": "object",
+      "required": ["level", "slsaLevelClaimed", "note"],
+      "properties": {
+        "level": {
+          "type": "integer",
+          "const": 0,
+          "description": "SLSA level 0 only. Any value above 0 claims build provenance that repository-only work cannot evidence."
+        },
+        "slsaLevelClaimed": { "type": "integer", "const": 0 },
+        "note": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

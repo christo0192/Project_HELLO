@@ -1,0 +1,26 @@
+{
+  "schemaVersion": "1.0.0",
+  "decisionId": "ha-decision-synthetic-example-001",
+  "component": "screening-api (synthetic example — not a real component)",
+  "created": "2026-08-02T00:00:00Z",
+  "decisionState": "PROPOSED",
+  "haDecision": {
+    "haRequiredProposal": false,
+    "rationale": "Synthetic placeholder rationale for the DEP-03 template. A single-instance pilot is proposed first; HA would be revisited only after real benchmark evidence exists. This is a proposal, not a commitment."
+  },
+  "singleInstanceRisk": {
+    "exists": true,
+    "description": "Synthetic example: if the pilot ran on a single instance, an instance outage would interrupt service until owner recovery. Explicitly recorded so the risk is visible.",
+    "mitigation": "Owner-operated restart path and documented recovery runbook; no failover capability is claimed.",
+    "status": "PENDING"
+  },
+  "rtoRpo": {
+    "rtoMinutes": { "value": null, "unit": "minutes", "status": "PENDING" },
+    "rpoMinutes": { "value": null, "unit": "minutes", "status": "PENDING" }
+  },
+  "approval": {
+    "status": "PENDING",
+    "owner": null,
+    "date": null
+  }
+}

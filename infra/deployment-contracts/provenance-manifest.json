@@ -1,0 +1,46 @@
+{
+  "manifestVersion": "1.0.0",
+  "provenanceSchema": "config/deployment-capacity-provenance.schema.json",
+  "name": "Offline artifact provenance template (DEP-07)",
+  "description": "Repository-only provenance template for the Phase 11 deployment foundations. SLSA level is 0, signing is false, and every commit, builder, lockfile digest, SBOM digest and test-evidence field is a PENDING placeholder until the owner records a real build. No build was recorded, no artifact is signed, and no external attestation exists.",
+  "status": "PROPOSED",
+  "approvalStatus": "PENDING",
+  "generatedAt": "PENDING",
+  "builder": {
+    "identity": "PENDING_OWNER",
+    "ciWorkflow": "PENDING",
+    "host": "PENDING"
+  },
+  "source": {
+    "repositorySlug": "christo0192/Project_HELLO",
+    "baselineCommitSha": "b3f1f301ecc2480f04e903e25248aa24c5472833",
+    "commitSha": "PENDING"
+  },
+  "lockfiles": [
+    { "path": "app/api/package-lock.json", "sha256": "PENDING" },
+    { "path": "app/web/package-lock.json", "sha256": "PENDING" },
+    { "path": "app/voice-livekit/requirements.txt", "sha256": "PENDING" }
+  ],
+  "sboms": [
+    { "path": "sbom-artifacts/api-sbom.cdx.json", "sha256": "PENDING", "generatedBy": "scripts/sbom.sh" },
+    { "path": "sbom-artifacts/web-sbom.cdx.json", "sha256": "PENDING", "generatedBy": "scripts/sbom.sh" }
+  ],
+  "testEvidence": [
+    { "path": "scripts/check-deployment-capacity-status.test.mjs", "role": "PR-B status-field validator negative controls", "status": "PENDING_RUN" },
+    { "path": "scripts/validate-deployment-contracts", "role": "deployment contract + parity negative controls", "status": "PENDING_RUN" },
+    { "path": "scripts/validate-deployment-release", "role": "release state machine + rollback negative controls", "status": "PENDING_RUN" },
+    { "path": "scripts/artifact-provenance-validate", "role": "provenance negative controls", "status": "PENDING_RUN" }
+  ],
+  "signing": {
+    "signed": false,
+    "signingService": "PENDING_OWNER",
+    "keyId": null,
+    "attestations": [],
+    "note": "No artifact is signed. The signing service and any external attestation are PENDING owner verification; the repository claims SLSA level 0 only."
+  },
+  "slsa": {
+    "level": 0,
+    "slsaLevelClaimed": 0,
+    "note": "SLSA level 0. No build provenance, no SLSA attestation and no signature is claimed by this repository-only template."
+  }
+}

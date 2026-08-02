@@ -1,0 +1,477 @@
+#!/usr/bin/env node
+"use strict";
+
+/**
+ * DEP-07 offline artifact provenance manifest validator.
+ *
+ * Validates infra/deployment-contracts/provenance-manifest.json against the
+ * audited plan's lane-B2 invariants:
+ *
+ *   - SLSA level 0 only; slsa.level/slsaLevelClaimed > 0 are rejected;
+ *   - signing is false; signed:true, registered key IDs, and any non-empty
+ *     attestation list are rejected; signature-like strings are rejected;
+ *   - commit SHA is PENDING or a 40-hex SHA (baseline must be the clean
+ *     origin/main commit);
+ *   - lockfile digests: every lockfile must carry sha256 — a missing digest
+ *     is rejected; a real 64-hex digest must match the repository file;
+ *   - SBOM entries reference the existing scripts/sbom.sh generator; digest
+ *     placeholders are PENDING until the owner records a build;
+ *   - test-evidence entries are placeholders (PENDING_RUN/PENDING/NOT_RUN)
+ *     only — a completed claim (e.g. PASSED) is rejected in repository-only
+ *     templates;
+ *   - provenance paths are hardened (MEDIUM-review regression): every
+ *     lockfile/SBOM/testEvidence path is checked for absolute paths, `..`
+ *     traversal, outside-root escapes, symlinks / non-regular files, NUL
+ *     bytes, and oversized files (bounded max) BEFORE any digest state is
+ *     consulted — even when the digest placeholder is PENDING;
+ *   - no URL-like or secret-like content anywhere in the manifest.
+ *
+ * Bounded file-size max: files larger than 8 MiB (MAX_PROVENANCE_FILE_BYTES)
+ * are rejected before hashing; provenance validation never reads files
+ * outside the repository root.
+ *
+ * Usage:
+ *   node scripts/artifact-provenance-validate validate <manifest.json>
+ *   node scripts/artifact-provenance-validate --fixtures
+ */
+
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const crypto = require("node:crypto");
+
+const VERSION = "1.0.0";
+const ROOT = path.resolve(__dirname, "..");
+const PROVENANCE_MANIFEST_PATH = path.join(ROOT, "infra", "deployment-contracts", "provenance-manifest.json");
+
+const SHA256_RE = /^[0-9a-f]{64}$/i;
+const SHA40_RE = /^[0-9a-f]{40}$/i;
+const PENDING_TOKENS = ["PENDING", "PENDING_OWNER", "PENDING_RUN", "PENDING_BUILD", "NOT_RUN"];
+const EVIDENCE_STATUSES = ["PENDING_RUN", "PENDING", "NOT_RUN"];
+
+/** Bounded max size for files hashed/checked by the provenance validator. */
+const MAX_PROVENANCE_FILE_BYTES = 8 * 1024 * 1024; // 8 MiB (documented bound)
+
+const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+
+function isPending(value) {
+  return typeof value === "string" && PENDING_TOKENS.includes(value);
+}
+
+function collectStrings(value, out) {
+  if (typeof value === "string") out.push(value);
+  else if (Array.isArray(value)) for (const item of value) collectStrings(item, out);
+  else if (isObject(value)) for (const item of Object.values(value)) collectStrings(item, out);
+  return out;
+}
+
+// Signature/attestation-like strings. Constructed carefully so documentation
+// words such as "signing service" and "no signature is claimed" never match.
+const SIGNATURE_PATTERNS = [
+  /-----BEGIN [A-Z ]+-----/,
+  /BEGIN (?:PGP|RSA|EC|OPENSSH|CERTIFICATE) PRIVATE KEY/,
+  /BEGIN PGP SIGNATURE/,
+  /BEGIN CERTIFICATE/,
+  /(MEUCIQD|MEYCIQD|MEUCIE)[A-Za-z0-9+/=]+/, // DER-encoded signature prefixes
+  /\bsignature\s*[:=]\s*[^\s,;"']+/i,
+  /\bsig\s*[:=]\s*[A-Za-z0-9+/=]{20,}/i,
+];
+
+const SECRET_VALUE_PATTERNS = [
+  /(sk-[a-zA-Z0-9]{20,})/i,
+  /[^\s:]+:[^\s@]+@/,
+  /:\/\/[^\s@]+@/,
+  /(eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{5,})/i,
+];
+const URL_PATTERN = /\b(?:https?|wss?|ftp):\/\//i;
+
+function sha256File(filePath) {
+  return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
+}
+
+/**
+ * Path-safety check for provenance references (applies EVEN when the digest is
+ * PENDING). Rejects NUL bytes, absolute paths, `..` traversal, outside-root
+ * escapes, symlinks / non-regular files, and oversized files. When
+ * requireExists is true, a missing file is also rejected. Returns an error
+ * string or null (safe).
+ */
+function assertSafeRepoPath(pathStr, requireExists) {
+  if (typeof pathStr !== "string" || pathStr.length === 0) return "path must be a non-empty string";
+  if (pathStr.includes("\0")) return "path contains a NUL byte";
+  if (path.isAbsolute(pathStr)) return "absolute paths are not permitted (repository-relative paths only)";
+  const segments = pathStr.split(/[\\/]+/);
+  for (const segment of segments) {
+    if (segment === "..") return "path traversal ('..') is not permitted — provenance references stay inside the repository";
+  }
+  const full = path.resolve(ROOT, pathStr);
+  const rootPrefix = ROOT.endsWith(path.sep) ? ROOT : ROOT + path.sep;
+  if (full !== ROOT && !full.startsWith(rootPrefix)) return "path escapes the repository root";
+
+  let stat;
+  try {
+    stat = fs.lstatSync(full);
+  } catch {
+    if (requireExists) return `referenced file ${pathStr} does not exist in the repository`;
+    return null; // generated artifacts (SBOMs) may legitimately be absent until generated
+  }
+  if (stat.isSymbolicLink()) return `path ${pathStr} is a symlink — provenance references must be regular files`;
+  if (!stat.isFile()) return `path ${pathStr} is not a regular file`;
+  if (stat.size > MAX_PROVENANCE_FILE_BYTES) {
+    return `file ${pathStr} is ${stat.size} bytes, exceeding the bounded max of ${MAX_PROVENANCE_FILE_BYTES} bytes (8 MiB)`;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Provenance manifest validation
+// ---------------------------------------------------------------------------
+
+function validateProvenance(doc) {
+  const errors = [];
+  if (!isObject(doc)) return ["provenance manifest must be a JSON object"];
+  for (const key of ["manifestVersion", "provenanceSchema", "name", "description", "status", "approvalStatus", "generatedAt", "builder", "source", "lockfiles", "sboms", "testEvidence", "signing", "slsa"]) {
+    if (!(key in doc)) errors.push(`provenance.${key} is required`);
+  }
+  if (doc.status !== undefined && !["PROPOSED", "PENDING"].includes(doc.status)) errors.push("provenance.status must be PROPOSED or PENDING");
+  if (doc.approvalStatus !== undefined && doc.approvalStatus !== "PENDING") errors.push("provenance.approvalStatus must be PENDING");
+  if (doc.generatedAt !== "PENDING") errors.push('provenance.generatedAt must be "PENDING" — no build is recorded by repository-only work');
+
+  if (isObject(doc.builder)) {
+    for (const key of ["identity", "ciWorkflow", "host"]) {
+      if (!isPending(doc.builder[key])) errors.push(`provenance.builder.${key} must be a PENDING placeholder — the build is owner-operated and not recorded here`);
+    }
+  }
+
+  if (isObject(doc.source)) {
+    if (typeof doc.source.repositorySlug !== "string" || !doc.source.repositorySlug) errors.push("provenance.source.repositorySlug is required");
+    if (typeof doc.source.baselineCommitSha !== "string" || !SHA40_RE.test(doc.source.baselineCommitSha)) {
+      errors.push("provenance.source.baselineCommitSha must be a 40-hex commit SHA");
+    }
+    if (doc.source.commitSha !== "PENDING" && !SHA40_RE.test(String(doc.source.commitSha ?? ""))) {
+      errors.push("provenance.source.commitSha must be PENDING or a 40-hex commit SHA");
+    }
+  }
+
+  if (!Array.isArray(doc.lockfiles)) {
+    errors.push("provenance.lockfiles must be an array");
+  } else {
+    doc.lockfiles.forEach((lf, i) => {
+      const p = `provenance.lockfiles[${i}]`;
+      if (!isObject(lf)) return void errors.push(`${p} must be an object`);
+      if (typeof lf.path !== "string" || !lf.path) errors.push(`${p}.path is required`);
+      if (!("sha256" in lf)) {
+        errors.push(`${p}.sha256 is missing — every lockfile must carry a digest (PENDING placeholder or computed sha256); a missing lock digest is rejected`);
+      } else if (lf.sha256 !== "PENDING" && !SHA256_RE.test(lf.sha256)) {
+        errors.push(`${p}.sha256 must be "PENDING" or a 64-hex sha256`);
+      }
+      // Path-safety applies even when the digest placeholder is PENDING.
+      const pathError = assertSafeRepoPath(lf.path, true);
+      if (pathError) errors.push(`${p}: ${pathError}`);
+      else if (lf.sha256 && lf.sha256 !== "PENDING") {
+        const full = path.join(ROOT, lf.path);
+        if (sha256File(full) !== String(lf.sha256).toLowerCase()) {
+          errors.push(`${p}: sha256 ${lf.sha256} does not match the repository file (computed ${sha256File(full)})`);
+        }
+      }
+    });
+  }
+
+  if (!Array.isArray(doc.sboms)) {
+    errors.push("provenance.sboms must be an array");
+  } else {
+    doc.sboms.forEach((sb, i) => {
+      const p = `provenance.sboms[${i}]`;
+      if (!isObject(sb)) return void errors.push(`${p} must be an object`);
+      if (typeof sb.path !== "string" || !sb.path) errors.push(`${p}.path is required`);
+      if (sb.generatedBy !== "scripts/sbom.sh") errors.push(`${p}.generatedBy must be scripts/sbom.sh (the existing SBOM generator)`);
+      if (!("sha256" in sb)) errors.push(`${p}.sha256 is missing`);
+      else if (sb.sha256 !== "PENDING" && !SHA256_RE.test(sb.sha256)) errors.push(`${p}.sha256 must be "PENDING" or a 64-hex sha256`);
+      // Path-safety applies even when the digest placeholder is PENDING.
+      // SBOM artifacts are generated (gitignored), so existence is only
+      // required when a real digest claims to reference them.
+      const pathError = assertSafeRepoPath(sb.path, sb.sha256 !== "PENDING");
+      if (pathError) errors.push(`${p}: ${pathError}`);
+      else if (sb.sha256 && sb.sha256 !== "PENDING") {
+        const full = path.join(ROOT, sb.path);
+        if (sha256File(full) !== String(sb.sha256).toLowerCase()) errors.push(`${p}: sha256 mismatch for ${sb.path}`);
+      }
+    });
+  }
+
+  if (!Array.isArray(doc.testEvidence)) {
+    errors.push("provenance.testEvidence must be an array");
+  } else {
+    doc.testEvidence.forEach((te, i) => {
+      const p = `provenance.testEvidence[${i}]`;
+      if (!isObject(te)) return void errors.push(`${p} must be an object`);
+      for (const key of ["path", "role", "status"]) if (!(key in te)) errors.push(`${p}.${key} is required`);
+      if (te.status !== undefined && !EVIDENCE_STATUSES.includes(te.status)) {
+        errors.push(`${p}.status must be one of ${EVIDENCE_STATUSES.join(", ")} — repository-only test evidence is placeholder PENDING_RUN, never a completed claim`);
+      }
+      // Path-safety applies even when the digest placeholder is PENDING.
+      if (typeof te.path === "string" && te.path) {
+        const pathError = assertSafeRepoPath(te.path, true);
+        if (pathError) errors.push(`${p}: ${pathError}`);
+      }
+    });
+  }
+
+  if (isObject(doc.signing)) {
+    if (doc.signing.signed !== false) errors.push("provenance.signing.signed must be false — no artifact is signed and no signing claim is permitted (signed:true rejected)");
+    if (!isPending(doc.signing.signingService)) errors.push('provenance.signing.signingService must be "PENDING_OWNER" — the signing service is PENDING owner verification');
+    if (doc.signing.keyId !== null && doc.signing.keyId !== undefined) errors.push("provenance.signing.keyId must be null — no signing key is registered");
+    if (!Array.isArray(doc.signing.attestations) || doc.signing.attestations.length !== 0) {
+      errors.push("provenance.signing.attestations must be an empty array — no external attestation exists");
+    }
+  }
+
+  if (isObject(doc.slsa)) {
+    if (doc.slsa.level !== 0) errors.push("provenance.slsa.level must be 0 — SLSA level 0 only; no build provenance claim is permitted (slsa>0 rejected)");
+    if (doc.slsa.slsaLevelClaimed !== 0) errors.push("provenance.slsa.slsaLevelClaimed must be 0 — no SLSA level is claimed");
+  }
+
+  const strings = collectStrings(doc, []);
+  for (const s of strings) {
+    if (SIGNATURE_PATTERNS.some((re) => re.test(s))) {
+      errors.push("provenance manifest contains a signature-like string — signatures are never claimed (fake signature negative control)");
+      break;
+    }
+  }
+  for (const s of strings) {
+    if (URL_PATTERN.test(s)) {
+      errors.push("provenance manifest contains a URL-like string — no provider/cloud endpoint is referenced");
+      break;
+    }
+  }
+  for (const s of strings) {
+    if (SECRET_VALUE_PATTERNS.some((re) => re.test(s))) {
+      errors.push("provenance manifest contains a secret-like value");
+      break;
+    }
+  }
+
+  return errors;
+}
+
+// ---------------------------------------------------------------------------
+// Real-repo validation
+// ---------------------------------------------------------------------------
+
+function validateRealRepo() {
+  let doc;
+  try {
+    doc = JSON.parse(fs.readFileSync(PROVENANCE_MANIFEST_PATH, "utf8"));
+  } catch (e) {
+    return [`cannot read ${PROVENANCE_MANIFEST_PATH}: ${e.message}`];
+  }
+  return validateProvenance(doc);
+}
+
+// ---------------------------------------------------------------------------
+// Seeded negative-control suite (--fixtures)
+// ---------------------------------------------------------------------------
+
+function runFixtures() {
+  const failures = [];
+  const expectReject = (name, errors, fragment) => {
+    if (errors.length === 0) failures.push(`${name}: expected rejection, got PASS`);
+    else if (fragment && !errors.join("\n").includes(fragment)) {
+      failures.push(`${name}: rejection message missing "${fragment}": ${errors.join("; ").slice(0, 400)}`);
+    }
+  };
+  const expectPass = (name, errors) => {
+    if (errors.length) failures.push(`${name}: expected PASS, got: ${errors.join("; ").slice(0, 400)}`);
+  };
+
+  const base = readJson(PROVENANCE_MANIFEST_PATH, "provenance template");
+  if (base.error) {
+    failures.push(base.error);
+    return failures;
+  }
+  expectPass("repo provenance template validates", validateProvenance(base.data));
+
+  // 1. fake signature string.
+  const fakeSig = JSON.parse(JSON.stringify(base.data));
+  fakeSig.signing.note = "signature: " + "MEUCIQD" + "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdef";
+  expectReject("fake signature string rejected", validateProvenance(fakeSig), "signature-like");
+
+  // 2. signed:true.
+  const signedTrue = JSON.parse(JSON.stringify(base.data));
+  signedTrue.signing.signed = true;
+  expectReject("signed:true rejected", validateProvenance(signedTrue), "signed must be false");
+
+  // 3. slsa level 2.
+  const slsa2 = JSON.parse(JSON.stringify(base.data));
+  slsa2.slsa.level = 2;
+  expectReject("slsa.level 2 rejected", validateProvenance(slsa2), "SLSA level 0");
+
+  // 4. slsaLevelClaimed 2.
+  const slsaClaimed = JSON.parse(JSON.stringify(base.data));
+  slsaClaimed.slsa.slsaLevelClaimed = 2;
+  expectReject("slsaLevelClaimed 2 rejected", validateProvenance(slsaClaimed), "slsaLevelClaimed");
+
+  // 5. missing lock digest.
+  const missingDigest = JSON.parse(JSON.stringify(base.data));
+  delete missingDigest.lockfiles[0].sha256;
+  expectReject("missing lock digest rejected", validateProvenance(missingDigest), "missing lock digest");
+
+  // 6. lock digest mismatch (runtime-constructed 64-hex, not a real digest).
+  const badDigest = JSON.parse(JSON.stringify(base.data));
+  badDigest.lockfiles[0].sha256 = "0".repeat(63) + "f";
+  expectReject("lock digest mismatch rejected", validateProvenance(badDigest), "does not match");
+
+  // 7. non-empty attestations.
+  const attestations = JSON.parse(JSON.stringify(base.data));
+  attestations.signing.attestations = [{ type: "slsa-provenance", statement: "example.invalid" }];
+  expectReject("non-empty attestations rejected", validateProvenance(attestations), "empty array");
+
+  // 8. test-evidence completed claim.
+  const evidencePassed = JSON.parse(JSON.stringify(base.data));
+  evidencePassed.testEvidence[0].status = "PASSED";
+  expectReject("testEvidence PASSED rejected", validateProvenance(evidencePassed), "PENDING_RUN");
+
+  // 9. invalid commitSha.
+  const badCommit = JSON.parse(JSON.stringify(base.data));
+  badCommit.source.commitSha = "abc123";
+  expectReject("invalid commitSha rejected", validateProvenance(badCommit), "commit SHA");
+
+  // 10. generatedAt timestamp claim.
+  const generated = JSON.parse(JSON.stringify(base.data));
+  generated.generatedAt = "2026-08-02T00:00:00Z";
+  expectReject("generatedAt timestamp rejected", validateProvenance(generated), "PENDING");
+
+  // 11. missing referenced lockfile with a real digest.
+  const missingFile = JSON.parse(JSON.stringify(base.data));
+  missingFile.lockfiles[0].path = "app/api/does-not-exist.json";
+  missingFile.lockfiles[0].sha256 = "0".repeat(64);
+  expectReject("missing referenced lockfile rejected", validateProvenance(missingFile), "does not exist in the repository");
+
+  // 12. builder identity claim.
+  const builderClaim = JSON.parse(JSON.stringify(base.data));
+  builderClaim.builder.identity = "some-ci-runner";
+  expectReject("builder identity claim rejected", validateProvenance(builderClaim), "PENDING");
+
+  // ── Path-safety controls (MEDIUM-review regression) ───────────────────
+  // These apply EVEN when the digest placeholder is PENDING: an unsafe path
+  // must never be normalized as future deployment evidence.
+
+  // 13. traversal path (../) with PENDING digest.
+  const traversal = JSON.parse(JSON.stringify(base.data));
+  traversal.lockfiles[0].path = "../outside/package-lock.json";
+  expectReject("traversal lockfile path rejected (PENDING digest)", validateProvenance(traversal), "path traversal");
+
+  // 14. absolute path with PENDING digest.
+  const absolute = JSON.parse(JSON.stringify(base.data));
+  absolute.lockfiles[0].path = "/etc/passwd";
+  expectReject("absolute lockfile path rejected (PENDING digest)", validateProvenance(absolute), "absolute paths");
+
+  // 15. NUL byte in path.
+  const nulPath = JSON.parse(JSON.stringify(base.data));
+  nulPath.lockfiles[0].path = "app/api/package-lock.json\0evil";
+  expectReject("NUL-byte path rejected", validateProvenance(nulPath), "NUL byte");
+
+  // 16. symlink path (repo-internal link to a temp target) rejected even with PENDING digest.
+  const symlinkTarget = fs.mkdtempSync(path.join(os.tmpdir(), "dep-prov-target-"));
+  const repoLink = path.join(ROOT, "tmp", ".prov-symlink-fixture.json");
+  let symlinkCreated = false;
+  try {
+    fs.mkdirSync(path.join(ROOT, "tmp"), { recursive: true });
+    fs.writeFileSync(path.join(symlinkTarget, "target.json"), "{}");
+    fs.symlinkSync(path.join(symlinkTarget, "target.json"), repoLink);
+    symlinkCreated = true;
+    const symlinkManifest = JSON.parse(JSON.stringify(base.data));
+    symlinkManifest.lockfiles[0].path = "tmp/.prov-symlink-fixture.json";
+    expectReject("symlink lockfile path rejected (PENDING digest)", validateProvenance(symlinkManifest), "symlink");
+  } catch (e) {
+    failures.push(`symlink fixture setup failed: ${e.message}`);
+  } finally {
+    if (symlinkCreated) {
+      try {
+        fs.unlinkSync(repoLink);
+      } catch {
+        /* best-effort cleanup */
+      }
+    }
+    fs.rmSync(symlinkTarget, { recursive: true, force: true });
+  }
+
+  // 17. oversized file (bounded max) rejected before hashing, even with PENDING digest.
+  const bigFile = path.join(ROOT, "tmp", ".prov-oversized-fixture.bin");
+  try {
+    fs.mkdirSync(path.join(ROOT, "tmp"), { recursive: true });
+    fs.writeFileSync(bigFile, Buffer.alloc(MAX_PROVENANCE_FILE_BYTES + 1, 1));
+    const oversized = JSON.parse(JSON.stringify(base.data));
+    oversized.lockfiles[0].path = "tmp/.prov-oversized-fixture.bin";
+    expectReject("oversized file rejected (PENDING digest)", validateProvenance(oversized), "bounded max");
+  } finally {
+    try {
+      fs.unlinkSync(bigFile);
+    } catch {
+      /* best-effort cleanup */
+    }
+  }
+
+  // 18. traversal SBOM path with PENDING digest.
+  const traversalSbom = JSON.parse(JSON.stringify(base.data));
+  traversalSbom.sboms[0].path = "../../outside/sbom.cdx.json";
+  expectReject("traversal sbom path rejected (PENDING digest)", validateProvenance(traversalSbom), "path traversal");
+
+  // 19. traversal testEvidence path with PENDING digest.
+  const traversalTe = JSON.parse(JSON.stringify(base.data));
+  traversalTe.testEvidence[0].path = "../outside/scripts/test.mjs";
+  expectReject("traversal testEvidence path rejected (PENDING digest)", validateProvenance(traversalTe), "path traversal");
+
+  return failures;
+}
+
+function readJson(filePath, label) {
+  try {
+    return { data: JSON.parse(fs.readFileSync(filePath, "utf8")) };
+  } catch (e) {
+    return { error: `${label} at ${filePath}: ${e.message}` };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CLI dispatch
+// ---------------------------------------------------------------------------
+
+const command = process.argv[2];
+
+if (command === "--fixtures") {
+  const failures = runFixtures();
+  if (failures.length) {
+    console.error(`artifact-provenance-validate --fixtures FAILED (${failures.length}):`);
+    for (const f of failures) console.error(`- ${f}`);
+    process.exit(1);
+  }
+  console.log("artifact-provenance-validate --fixtures passed: fake signature, signed:true, slsa>0, missing lock digest, digest mismatch and false claims all rejected; PENDING/SLSA-0 template accepted.");
+  process.exit(0);
+}
+
+if (command === "validate") {
+  const filePath = process.argv[3];
+  if (!filePath) {
+    console.error("validate requires a provenance manifest file path");
+    process.exit(2);
+  }
+  let doc;
+  try {
+    doc = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch (e) {
+    console.error(`cannot read ${filePath}: ${e.message}`);
+    process.exit(1);
+  }
+  const errors = validateProvenance(doc);
+  if (errors.length) {
+    console.error(`provenance manifest invalid (${errors.length}):`);
+    for (const error of errors) console.error(`- ${error}`);
+    process.exit(1);
+  }
+  console.log(`PASS: provenance manifest ${filePath} is valid (SLSA 0, unsigned, PENDING placeholders only).`);
+  process.exit(0);
+}
+
+console.error(`Unknown command "${command}". Usage: node scripts/artifact-provenance-validate validate <manifest.json> | --fixtures`);
+process.exit(2);

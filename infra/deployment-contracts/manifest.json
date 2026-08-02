@@ -1,0 +1,817 @@
+{
+  "manifestVersion": "1.0.0",
+  "title": "Provider-neutral deployment contract manifest (DEP-04)",
+  "description": "Repository-only deployment contract for the ADR-0010 managed-hosting pilot. Every service is NOT_DEPLOYED; nothing is provisioned or live. Env var NAMES only - no values, no endpoints, no credentials, no Terraform. Artifact inputs are repository-relative paths or managed-service markers, never registry URLs. Scale and region fields are proposals PENDING owner/SRE verification.",
+  "adrReference": "docs/adr/0010-hosting-topology.md",
+  "status": "PROPOSED",
+  "approvalStatus": "PENDING",
+  "deployed": false,
+  "provisioned": false,
+  "secretModel": {
+    "runtimeSource": "managed-infisical-runtime",
+    "policy": "FND-05: variable names only in this repository; values are injected at runtime by the owner from a managed Infisical project via machine identity (ADR-0010 decision 2).",
+    "status": "PENDING"
+  },
+  "services": [
+    {
+      "serviceId": "web-api",
+      "name": "Web / API",
+      "component": "web-api",
+      "runtime": "node:22-alpine",
+      "artifactType": "docker-image",
+      "artifactInput": "app/api (Dockerfile build context)",
+      "envVars": [
+        {
+          "name": "SUPABASE_URL",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SUPABASE_SERVICE_ROLE_KEY",
+          "secret": true,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SUPABASE_SCHEMA",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "CLAUDE_MODEL",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "CLAUDE_SCORING_MODEL",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "COMPANY_NAME",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "CLAUDE_BIN",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "CLAUDE_TIMEOUT_MS",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "PORT",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "WEB_ORIGIN",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_URL",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_API_KEY",
+          "secret": true,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_API_SECRET",
+          "secret": true,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "RECORDINGS_BUCKET",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "RECORDING_DOWNLOAD_TTL_SEC",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "RECORDING_MAX_BYTES",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "NODE_ENV",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SHUTDOWN_GRACE_MS",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "BREAKER_FAILURE_THRESHOLD",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "BREAKER_COOLDOWN_MS",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "BREAKER_TIMEOUT_MS",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "CLAUDE_MAX_OUTPUT_BYTES",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "RATE_LIMIT_DEFAULT",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "RATE_LIMIT_STRICT",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "RATE_LIMIT_IP",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "RATE_LIMIT_WINDOW_SEC",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "TRUSTED_PROXY",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "WORKER_CONTEXT_SECRET",
+          "secret": true,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "RESUME_SCANNER",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "RESUME_MAX_COMPRESSED_BYTES",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "RESUME_PARSER_TIMEOUT_MS",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "RESUME_MAX_TEXT_LENGTH",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "VITE_API_BASE",
+          "secret": false,
+          "secretSource": "build-time-config"
+        },
+        {
+          "name": "VITE_SUPABASE_URL",
+          "secret": false,
+          "secretSource": "build-time-config"
+        },
+        {
+          "name": "VITE_SUPABASE_ANON_KEY",
+          "secret": false,
+          "secretSource": "build-time-config"
+        },
+        {
+          "name": "VITE_LIVEKIT_URL",
+          "secret": false,
+          "secretSource": "build-time-config"
+        },
+        {
+          "name": "VITE_SSO_PROVIDERS",
+          "secret": false,
+          "secretSource": "build-time-config"
+        },
+        {
+          "name": "VITE_CSP_MODE",
+          "secret": false,
+          "secretSource": "build-time-config"
+        },
+        {
+          "name": "VITE_CSP_REPORT_ENDPOINT",
+          "secret": false,
+          "secretSource": "build-time-config"
+        }
+      ],
+      "stages": {
+        "staging": {
+          "status": "NOT_DEPLOYED",
+          "replicasProposed": 1,
+          "instanceSizeProposed": "small",
+          "regionProposed": "PENDING_OWNER"
+        },
+        "prod": {
+          "status": "NOT_DEPLOYED",
+          "replicasProposed": 2,
+          "instanceSizeProposed": "medium",
+          "regionProposed": "PENDING_OWNER"
+        }
+      },
+      "notes": "Recruiter browser client and screening API. Client build vars (VITE_*) are public build-time config, not runtime secrets."
+    },
+    {
+      "serviceId": "livekit-cloud",
+      "name": "LiveKit Cloud (SFU Build)",
+      "component": "livekit-cloud",
+      "runtime": "managed-livekit-cloud",
+      "artifactType": "managed-service",
+      "artifactInput": "managed-service (provider console; owner-operated)",
+      "envVars": [],
+      "stages": {
+        "staging": {
+          "status": "NOT_DEPLOYED",
+          "replicasProposed": 1,
+          "instanceSizeProposed": "provider-managed",
+          "regionProposed": "PENDING_OWNER"
+        },
+        "prod": {
+          "status": "NOT_DEPLOYED",
+          "replicasProposed": 1,
+          "instanceSizeProposed": "provider-managed",
+          "regionProposed": "PENDING_OWNER"
+        }
+      },
+      "notes": "Managed WebRTC SFU per ADR-0010 decision 1. Configuration lives in the provider console; this repository holds no env contract for it."
+    },
+    {
+      "serviceId": "livekit-agents",
+      "name": "LiveKit Cloud Agents",
+      "component": "livekit-agents",
+      "runtime": "livekit-agents-managed-python",
+      "artifactType": "managed-service",
+      "artifactInput": "app/voice-livekit (agent worker artifact)",
+      "envVars": [
+        {
+          "name": "ANTHROPIC_API_KEY",
+          "secret": true,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SARVAM_API_KEY",
+          "secret": true,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "COMPANY_NAME",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "ANTHROPIC_MODEL",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SARVAM_STT_MODEL",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SARVAM_LANGUAGE",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SARVAM_TTS_MODEL",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SARVAM_TTS_VOICE",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_VAD_ACTIVATION_THRESHOLD",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_VAD_MIN_SPEECH_DURATION",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_VAD_MIN_SILENCE_DURATION",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_VAD_PREFIX_PADDING_DURATION",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_MIN_ENDPOINTING_DELAY",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_MAX_ENDPOINTING_DELAY",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_MIN_INTERRUPTION_DURATION",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_MIN_INTERRUPTION_WORDS",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_FALSE_INTERRUPTION_TIMEOUT",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_WORKER_DRAIN_SEC",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "GOPU_CANDIDATE_NAME",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime",
+          "note": "synthetic local-console demo context; not required for production"
+        },
+        {
+          "name": "GOPU_ROLE_TITLE",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime",
+          "note": "synthetic local-console demo context; not required for production"
+        },
+        {
+          "name": "GOPU_ROLE_FOCUS",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime",
+          "note": "synthetic local-console demo context; not required for production"
+        },
+        {
+          "name": "GOPU_RESUME_FACTS",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime",
+          "note": "synthetic local-console demo context; not required for production"
+        },
+        {
+          "name": "GOPU_CONTEXT_JSON",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime",
+          "note": "synthetic local-console demo context; not required for production"
+        },
+        {
+          "name": "LIVEKIT_URL",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_API_KEY",
+          "secret": true,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_API_SECRET",
+          "secret": true,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SUPABASE_URL",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SUPABASE_SERVICE_ROLE_KEY",
+          "secret": true,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SUPABASE_SCHEMA",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "API_BASE",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "WORKER_CONTEXT_SECRET",
+          "secret": true,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "WORKER_CONTEXT_TIMEOUT_SEC",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SCORING_BREAKER_THRESHOLD",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SCORING_BREAKER_COOLDOWN_SEC",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SCORING_BREAKER_TIMEOUT_SEC",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SCORING_HTTP_CONNECT_TIMEOUT",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SCORING_HTTP_READ_TIMEOUT",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SCORING_HTTP_WRITE_TIMEOUT",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SCORING_HTTP_POOL_TIMEOUT",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        }
+      ],
+      "stages": {
+        "staging": {
+          "status": "NOT_DEPLOYED",
+          "replicasProposed": 1,
+          "instanceSizeProposed": "managed-default",
+          "regionProposed": "PENDING_OWNER"
+        },
+        "prod": {
+          "status": "NOT_DEPLOYED",
+          "replicasProposed": 2,
+          "instanceSizeProposed": "managed-default",
+          "regionProposed": "PENDING_OWNER"
+        }
+      },
+      "notes": "Managed Python voice worker runtime per ADR-0010 decision 1. Env var NAMES injected at runtime from managed Infisical (decision 2); entitlements PENDING owner."
+    },
+    {
+      "serviceId": "supabase",
+      "name": "Supabase",
+      "component": "supabase",
+      "runtime": "managed-supabase",
+      "artifactType": "managed-service",
+      "artifactInput": "managed-service (provider console; owner-operated)",
+      "envVars": [],
+      "stages": {
+        "staging": {
+          "status": "NOT_DEPLOYED",
+          "replicasProposed": 1,
+          "instanceSizeProposed": "provider-managed",
+          "regionProposed": "PENDING_OWNER"
+        },
+        "prod": {
+          "status": "NOT_DEPLOYED",
+          "replicasProposed": 1,
+          "instanceSizeProposed": "provider-managed",
+          "regionProposed": "PENDING_OWNER"
+        }
+      },
+      "notes": "Postgres, auth and storage backend. Capacity entitlement and region residency evidence PENDING owner."
+    },
+    {
+      "serviceId": "infisical-managed",
+      "name": "Managed Infisical",
+      "component": "infisical-managed",
+      "runtime": "managed-infisical",
+      "artifactType": "managed-service",
+      "artifactInput": "managed-service (provider console; owner-operated)",
+      "envVars": [],
+      "stages": {
+        "staging": {
+          "status": "NOT_DEPLOYED",
+          "replicasProposed": 1,
+          "instanceSizeProposed": "provider-managed",
+          "regionProposed": "PENDING_OWNER"
+        },
+        "prod": {
+          "status": "NOT_DEPLOYED",
+          "replicasProposed": 1,
+          "instanceSizeProposed": "provider-managed",
+          "regionProposed": "PENDING_OWNER"
+        }
+      },
+      "notes": "Runtime secret source per ADR-0010 decision 2: the web-api and voice-worker env contracts resolve their secret values from a managed Infisical project via machine identity. Project creation, machine identity and scope PENDING owner."
+    },
+    {
+      "serviceId": "oci-e2-gateway",
+      "name": "OCI E2 Micro Gateway / Fallback",
+      "component": "oci-e2-gateway",
+      "runtime": "oci-e2-micro-instance",
+      "artifactType": "instance",
+      "artifactInput": "existing OCI E2 Micro instance (gateway/fallback only)",
+      "envVars": [],
+      "stages": {
+        "staging": {
+          "status": "NOT_DEPLOYED",
+          "replicasProposed": 1,
+          "instanceSizeProposed": "e2-micro",
+          "regionProposed": "PENDING_OWNER"
+        },
+        "prod": {
+          "status": "NOT_DEPLOYED",
+          "replicasProposed": 1,
+          "instanceSizeProposed": "e2-micro",
+          "regionProposed": "PENDING_OWNER"
+        }
+      },
+      "notes": "Lightweight gateway and fallback only per ADR-0010 decision 3; not the primary worker host. No Oracle Terraform change accompanies this contract."
+    },
+    {
+      "serviceId": "vps-fallback",
+      "name": "Bounded near-India VPS Fallback",
+      "component": "vps-fallback",
+      "runtime": "container-vps-fallback",
+      "artifactType": "instance",
+      "artifactInput": "app/voice-livekit (containerised worker, internal USD 12 monthly ceiling)",
+      "envVars": [
+        {
+          "name": "ANTHROPIC_API_KEY",
+          "secret": true,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SARVAM_API_KEY",
+          "secret": true,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "COMPANY_NAME",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "ANTHROPIC_MODEL",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SARVAM_STT_MODEL",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SARVAM_LANGUAGE",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SARVAM_TTS_MODEL",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SARVAM_TTS_VOICE",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_VAD_ACTIVATION_THRESHOLD",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_VAD_MIN_SPEECH_DURATION",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_VAD_MIN_SILENCE_DURATION",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_VAD_PREFIX_PADDING_DURATION",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_MIN_ENDPOINTING_DELAY",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_MAX_ENDPOINTING_DELAY",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_MIN_INTERRUPTION_DURATION",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_MIN_INTERRUPTION_WORDS",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_FALSE_INTERRUPTION_TIMEOUT",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_WORKER_DRAIN_SEC",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "GOPU_CANDIDATE_NAME",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime",
+          "note": "synthetic local-console demo context; not required for production"
+        },
+        {
+          "name": "GOPU_ROLE_TITLE",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime",
+          "note": "synthetic local-console demo context; not required for production"
+        },
+        {
+          "name": "GOPU_ROLE_FOCUS",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime",
+          "note": "synthetic local-console demo context; not required for production"
+        },
+        {
+          "name": "GOPU_RESUME_FACTS",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime",
+          "note": "synthetic local-console demo context; not required for production"
+        },
+        {
+          "name": "GOPU_CONTEXT_JSON",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime",
+          "note": "synthetic local-console demo context; not required for production"
+        },
+        {
+          "name": "LIVEKIT_URL",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_API_KEY",
+          "secret": true,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "LIVEKIT_API_SECRET",
+          "secret": true,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SUPABASE_URL",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SUPABASE_SERVICE_ROLE_KEY",
+          "secret": true,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SUPABASE_SCHEMA",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "API_BASE",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "WORKER_CONTEXT_SECRET",
+          "secret": true,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "WORKER_CONTEXT_TIMEOUT_SEC",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SCORING_BREAKER_THRESHOLD",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SCORING_BREAKER_COOLDOWN_SEC",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SCORING_BREAKER_TIMEOUT_SEC",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SCORING_HTTP_CONNECT_TIMEOUT",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SCORING_HTTP_READ_TIMEOUT",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SCORING_HTTP_WRITE_TIMEOUT",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "SCORING_HTTP_POOL_TIMEOUT",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        }
+      ],
+      "stages": {
+        "staging": {
+          "status": "NOT_DEPLOYED",
+          "replicasProposed": 0,
+          "instanceSizeProposed": "vps-small",
+          "regionProposed": "PENDING_OWNER"
+        },
+        "prod": {
+          "status": "NOT_DEPLOYED",
+          "replicasProposed": 1,
+          "instanceSizeProposed": "vps-small",
+          "regionProposed": "PENDING_OWNER"
+        }
+      },
+      "notes": "Persistent near-India VPS bounded to an internal USD 12 monthly engineering ceiling per ADR-0010 decision 4, only if Cloud Agents proves unsuitable. Provider and region PENDING owner verification."
+    }
+  ],
+  "migrations": [
+    {
+      "id": "mig-001",
+      "schemaVersion": 1,
+      "changeType": "additive",
+      "scope": "screening_v2",
+      "status": "PROPOSED",
+      "applied": false
+    },
+    {
+      "id": "mig-002",
+      "schemaVersion": 2,
+      "changeType": "additive",
+      "scope": "screening_v2",
+      "status": "PROPOSED",
+      "applied": false
+    },
+    {
+      "id": "mig-003",
+      "schemaVersion": 3,
+      "changeType": "additive",
+      "scope": "screening_v2",
+      "status": "PROPOSED",
+      "applied": false
+    },
+    {
+      "id": "mig-004",
+      "schemaVersion": 4,
+      "changeType": "breaking",
+      "scope": "screening_v2",
+      "status": "PROPOSED",
+      "applied": false
+    }
+  ]
+}

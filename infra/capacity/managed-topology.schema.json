@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/christo0192/Project_HELLO/infra/capacity/managed-topology.schema.json",
+  "title": "Managed Topology Manifest (DEP-02)",
+  "description": "Repository-only topology declaration for the ADR-0010 managed-hosting pilot. Every component carries a failure domain and scale triggers; every scale trigger requires both a metric and a source. Provisioning and owner statuses are PENDING; nothing is provisioned or deployed by this manifest.",
+  "version": "1.0.0",
+  "type": "object",
+  "required": [
+    "manifestVersion",
+    "title",
+    "description",
+    "adrReference",
+    "status",
+    "approvalStatus",
+    "provisioned",
+    "deployed",
+    "components",
+    "externalPending"
+  ],
+  "properties": {
+    "manifestVersion": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "description": { "type": "string", "minLength": 1, "maxLength": 2000 },
+    "adrReference": { "type": "string", "maxLength": 300 },
+    "status": {
+      "type": "string",
+      "enum": ["PROPOSED", "PENDING"],
+      "description": "Policy state is PROPOSED or PENDING only."
+    },
+    "approvalStatus": {
+      "type": "string",
+      "const": "PENDING",
+      "description": "Approval remains PENDING owner verification."
+    },
+    "provisioned": {
+      "type": "boolean",
+      "const": false,
+      "description": "No component is provisioned by repository-only work."
+    },
+    "deployed": {
+      "type": "boolean",
+      "const": false,
+      "description": "No component is deployed by repository-only work."
+    },
+    "components": {
+      "type": "array",
+      "minItems": 7,
+      "items": {
+        "type": "object",
+        "required": [
+          "componentId",
+          "name",
+          "role",
+          "failureDomain",
+          "scalesIndependently",
+          "scaleTriggers",
+          "ownerStatus",
+          "provisioning",
+          "notes"
+        ],
+        "properties": {
+          "componentId": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]+$",
+            "description": "Stable component identifier"
+          },
+          "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+          "role": { "type": "string", "minLength": 1, "maxLength": 500 },
+          "failureDomain": {
+            "type": "string",
+            "enum": [
+              "application",
+              "provider-region",
+              "managed-runtime",
+              "database",
+              "secrets",
+              "gateway",
+              "fallback-compute"
+            ],
+            "description": "Isolated failure domain the component belongs to. A proposal for DEP-02, not a measured isolation claim."
+          },
+          "scalesIndependently": { "type": "boolean" },
+          "scaleTriggers": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["metric", "source", "thresholdProposed", "status"],
+              "properties": {
+                "metric": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200,
+                  "description": "The observable that would trigger a scale decision."
+                },
+                "source": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 300,
+                  "description": "Where the metric would be observed (owner-provided console, synthetic_local benchmark, operator tooling). A source is required for every trigger."
+                },
+                "thresholdProposed": {
+                  "type": "string",
+                  "maxLength": 300,
+                  "description": "Proposed threshold text awaiting owner/SRE input. Not a pass/fail budget."
+                },
+                "status": {
+                  "type": "string",
+                  "enum": ["PROPOSED", "PENDING"],
+                  "description": "Each trigger is PROPOSED or PENDING only."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "ownerStatus": {
+            "type": "string",
+            "enum": ["PENDING", "OWNER_VERIFY", "PROPOSED"],
+            "description": "Owner verification state. Never APPROVED in repository-only foundations."
+          },
+          "provisioning": {
+            "type": "string",
+            "enum": ["PENDING", "NOT_STARTED"],
+            "description": "Provisioning state. Nothing is provisioned by this manifest."
+          },
+          "notes": { "type": "string", "maxLength": 1000 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "externalPending": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 500 },
+      "description": "Every external item (entitlements, pricing, residency, DPA, accounts) remains PENDING owner verification."
+    }
+  },
+  "additionalProperties": false
+}

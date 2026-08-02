@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/christo0192/Project_HELLO/config/deployment-capacity-ha.schema.json",
+  "title": "HA Decision Evidence Template (DEP-03)",
+  "description": "Repository-only evidence template for the DEP-03 high-availability decision. The single-instance risk is explicit when applicable, RTO/RPO values remain PENDING (values may be present only as proposals, never as accepted commitments), and the approval slot is always PENDING. No HA, failover, or multi-zone capability is claimed by this template.",
+  "version": "1.0.0",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "decisionId",
+    "component",
+    "created",
+    "decisionState",
+    "haDecision",
+    "singleInstanceRisk",
+    "rtoRpo",
+    "approval"
+  ],
+  "properties": {
+    "schemaVersion": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "decisionId": { "type": "string", "pattern": "^ha-decision-[a-z0-9-]+$" },
+    "component": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "created": { "type": "string", "format": "date-time" },
+    "decisionState": {
+      "type": "string",
+      "enum": ["PROPOSED", "PENDING"],
+      "description": "The HA decision itself is PROPOSED or PENDING only."
+    },
+    "haDecision": {
+      "type": "object",
+      "required": ["haRequiredProposal", "rationale"],
+      "properties": {
+        "haRequiredProposal": {
+          "type": "boolean",
+          "description": "Proposed answer to whether HA (multi-zone / multi-instance) is needed for launch. A proposal only; nothing is implemented."
+        },
+        "rationale": { "type": "string", "minLength": 1, "maxLength": 2000 }
+      },
+      "additionalProperties": false
+    },
+    "singleInstanceRisk": {
+      "type": "object",
+      "required": ["exists", "description", "mitigation", "status"],
+      "properties": {
+        "exists": {
+          "type": "boolean",
+          "description": "Whether a single-instance risk applies to this component. Must be explicit when applicable."
+        },
+        "description": { "type": "string", "maxLength": 2000 },
+        "mitigation": { "type": "string", "maxLength": 2000 },
+        "status": {
+          "type": "string",
+          "enum": ["PENDING", "PROPOSED"],
+          "description": "Risk disposition is PENDING or PROPOSED only."
+        }
+      },
+      "additionalProperties": false
+    },
+    "rtoRpo": {
+      "type": "object",
+      "required": ["rtoMinutes", "rpoMinutes"],
+      "properties": {
+        "rtoMinutes": { "$ref": "#/$defs/targetWindow" },
+        "rpoMinutes": { "$ref": "#/$defs/targetWindow" }
+      },
+      "additionalProperties": false
+    },
+    "approval": {
+      "type": "object",
+      "required": ["status", "owner", "date"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "const": "PENDING",
+          "description": "Approval status is always PENDING in repository-only foundations. A value of ACCEPTED or APPROVED is invalid."
+        },
+        "owner": {
+          "type": ["string", "null"],
+          "maxLength": 200,
+          "description": "Owner identifier slot; remains null until the owner acts in writing."
+        },
+        "date": {
+          "type": ["string", "null"],
+          "format": "date-time",
+          "description": "Owner acceptance date slot; remains null until the owner acts."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "targetWindow": {
+      "type": "object",
+      "required": ["value", "unit", "status"],
+      "properties": {
+        "value": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Proposed target window in minutes. Null when no proposal exists yet. A value of 0 is invalid: RTO/RPO of zero cannot be evidenced by repository-only work and would imply accepted zero-downtime recovery."
+        },
+        "unit": { "type": "string", "const": "minutes" },
+        "status": {
+          "type": "string",
+          "const": "PENDING",
+          "description": "Target window values are PENDING owner/SRE acceptance, never accepted commitments."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
