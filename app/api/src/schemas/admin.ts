@@ -63,7 +63,7 @@ export type AdminQuotaListQueryInput = z.infer<typeof adminQuotaListQuerySchema>
  */
 export const adminQuotaUpsertSchema = z
   .object({
-    scope: z.enum(['global', 'candidate']),
+    scope: z.enum(['global', 'recruiter']),
     scope_id: uuidSchema.nullable().optional(),
     mode: z.enum(['simulation', 'live']).optional().default('simulation'),
     max_sessions: z.number().int().positive().max(1_000_000).nullable().optional(),
@@ -75,7 +75,7 @@ export const adminQuotaUpsertSchema = z
   })
   .strict()
   .refine((v) => (v.scope === 'global' ? v.scope_id == null : v.scope_id != null), {
-    message: 'global policies must have no scope_id; candidate policies require one',
+    message: 'global policies must have no scope_id; recruiter policies require one',
     path: ['scope_id'],
   });
 

@@ -204,7 +204,7 @@ screeningRouter.post(
       }
 
       const reservation = await reserveQuota({
-        scopeId: candidateId,
+        requesterId: req.authUser!.id,
         mode: 'simulation',
         idempotencyKey: key,
       });

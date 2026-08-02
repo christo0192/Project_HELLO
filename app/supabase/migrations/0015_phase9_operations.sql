@@ -162,7 +162,7 @@ create table if not exists screening_v2.quota_policies (
   enabled                 boolean not null default false,
   created_at              timestamptz not null default now(),
   updated_at              timestamptz not null default now(),
-  constraint chk_quota_policies_scope check (scope in ('global','candidate')),
+  constraint chk_quota_policies_scope check (scope in ('global','recruiter')),
   constraint chk_quota_policies_mode check (mode in ('simulation','live')),
   constraint chk_quota_policies_max_sessions check (max_sessions is null or max_sessions > 0),
   constraint chk_quota_policies_max_cost_units check (max_cost_units is null or max_cost_units > 0),
@@ -171,13 +171,15 @@ create table if not exists screening_v2.quota_policies (
   constraint chk_quota_policies_period_days check (period_days between 1 and 365),
   constraint chk_quota_policies_scope_coherence check (
     (scope = 'global' and scope_id is null)
-    or (scope = 'candidate' and scope_id is not null)
+    or (scope = 'recruiter' and scope_id is not null)
   )
 );
 
 comment on table screening_v2.quota_policies is
   'Admin-configured quota policies. DISABLED by default (enabled=false): '
   'quota enforcement only engages once a policy is enabled. '
+  'Scope: global (scope_id null, all recruiters aggregate) or recruiter '
+  '(scope_id = recruiter membership user UUID, one recruiter isolated). '
   'cost_units_per_session is an admin-configured integer/fixed-unit value — '
   'never currency, provider price, or client-supplied. warning_percentage is '
   'nullable with NO default; when null no warning intent is produced.';
@@ -225,6 +227,7 @@ create table if not exists screening_v2.quota_reservations (
   policy_id            uuid not null references screening_v2.quota_policies(id)
                        on delete cascade,
   scope_id             uuid,
+  requester_id         uuid not null,
   idempotency_key      text not null,
   sessions_reserved    integer not null default 1,
   cost_units_reserved  integer not null default 0,
@@ -232,7 +235,7 @@ create table if not exists screening_v2.quota_reservations (
   reserved_at          timestamptz not null default now(),
   committed_at         timestamptz,
   released_at          timestamptz,
-  constraint uq_quota_reservations_idempotency unique (idempotency_key),
+  constraint uq_quota_reservations_idempotency unique (requester_id, idempotency_key),
   constraint chk_quota_reservations_idempotency_length check (length(idempotency_key) between 1 and 128),
   constraint chk_quota_reservations_status check (status in ('reserved','committed','released')),
   constraint chk_quota_reservations_sessions check (sessions_reserved >= 1),
@@ -240,7 +243,9 @@ create table if not exists screening_v2.quota_reservations (
 );
 
 comment on table screening_v2.quota_reservations is
-  'Exactly-one reservation per bounded Idempotency-Key. status flow: '
+  'Exactly-one reservation per (requester, bounded Idempotency-Key). '
+  'requester_id is the authenticated recruiter UUID — the same key from '
+  'different recruiters never collides. status flow: '
   'reserved -> committed (session created, usage incremented) or '
   'reserved -> released (session creation failed, no usage increment). '
   'A committed/released reservation is terminal; a repeated key returns the '
@@ -515,16 +520,19 @@ comment on constraint chk_audit_action on screening_v2.audit_events is
 
 -- ───────────────────────────────────────────────────────────────────────
 -- 10a. check_and_reserve_quota — atomic quota check/reserve keyed by a
---      bounded Idempotency-Key. Locks the matched policy and the usage row,
---      checks BOTH max_sessions and max_cost_units against current usage,
---      creates/returns the stable reservation. Configured cost units are
---      read from the policy — NEVER from the client. A repeated key returns
---      the same stable reservation (no extra units). Warning flag is only
---      computed when the policy's warning_percentage is non-null.
+--      (requester, bounded Idempotency-Key) pair. Locks the matched policy
+--      and the usage row, checks BOTH max_sessions and max_cost_units
+--      against projected usage, creates/returns the stable reservation.
+--      Configured cost units are read from the policy — NEVER from the
+--      client. A repeated key FROM THE SAME REQUESTER returns the same
+--      stable reservation (no extra units). Warning flag is only computed
+--      when the policy's warning_percentage is non-null.
+--      Period buckets are anchored to a stable epoch so 7/30-day caps do
+--      not reset daily.
 -- ───────────────────────────────────────────────────────────────────────
 
 create or replace function screening_v2.check_and_reserve_quota(
-  p_scope_id uuid,
+  p_requester_id uuid,
   p_mode text,
   p_idempotency_key text
 )
@@ -537,6 +545,7 @@ declare
   v_existing screening_v2.quota_reservations%rowtype;
   v_policy screening_v2.quota_policies%rowtype;
   v_usage screening_v2.quota_usage%rowtype;
+  v_usage_scope_id uuid;
   v_period_start date;
   v_cost_units integer;
   v_pending_sessions bigint := 0;
@@ -549,11 +558,16 @@ declare
   v_reservation_id uuid;
   v_percent bigint;
   v_denominator integer;
+  v_period_days integer;
+  v_epoch_offset integer;
 begin
-  -- Idempotent replay: a repeated key returns the SAME stable reservation.
+  -- Requester-scoped idempotency: a repeated key from the SAME requester
+  -- returns the stable reservation. Different requesters with the same key
+  -- never collide (unique constraint is on (requester_id, idempotency_key)).
   select * into v_existing
     from screening_v2.quota_reservations
-   where idempotency_key = p_idempotency_key;
+   where requester_id = p_requester_id
+     and idempotency_key = p_idempotency_key;
   if found then
     return jsonb_build_object(
       'status', 'duplicate',
@@ -563,18 +577,18 @@ begin
     );
   end if;
 
-  -- Resolve the enabled policy for this mode + scope (candidate-scoped
-  -- preferred, global fallback; deterministic id tiebreak). Locked FOR
-  -- UPDATE to serialise races.
+  -- Resolve the enabled policy: recruiter-specific first, then global
+  -- fallback. Recruiter policy binds to the authenticated recruiter UUID;
+  -- global aggregates all recruiters. Deterministic id tiebreak.
   select * into v_policy
     from screening_v2.quota_policies
    where enabled = true
      and mode = p_mode
      and (
-       (scope = 'candidate' and scope_id = p_scope_id)
+       (scope = 'recruiter' and scope_id = p_requester_id)
        or (scope = 'global' and scope_id is null)
      )
-   order by case when scope = 'candidate' then 0 else 1 end, id
+   order by case when scope = 'recruiter' then 0 else 1 end, id
    limit 1
    for update;
 
@@ -582,19 +596,31 @@ begin
     return jsonb_build_object('status', 'no_policy', 'allowed', false);
   end if;
 
-  -- Lock/create the usage row for the current period.
-  v_period_start := date_trunc('day', now())::date;
+  -- Usage scope: recruiter UUID for recruiter policy, NULL for global.
+  -- Global usage aggregates ALL recruiters under a single NULL-scoped row.
+  v_usage_scope_id := case when v_policy.scope = 'recruiter'
+                       then p_requester_id else null end;
+
+  -- Lock/create the usage row for the current PERIOD bucket.
+  -- Period buckets are anchored to a stable epoch (2000-01-01) so 7/30-day
+  -- windows do NOT reset daily. bucket = (now - epoch) / period_days.
+  v_period_days := coalesce(v_policy.period_days, 1);
+  v_epoch_offset := (date_trunc('day', now())::date
+                     - '2000-01-01'::date)::integer;
+  v_period_start := '2000-01-01'::date
+                    + ((v_epoch_offset / v_period_days) * v_period_days);
+
   select * into v_usage
     from screening_v2.quota_usage
    where policy_id = v_policy.id
-     and scope_id is not distinct from p_scope_id
+     and scope_id is not distinct from v_usage_scope_id
      and period_start = v_period_start
    for update;
   if not found then
     insert into screening_v2.quota_usage
       (policy_id, scope_id, period_start, sessions_used, cost_units_used)
     values
-      (v_policy.id, p_scope_id, v_period_start, 0, 0)
+      (v_policy.id, v_usage_scope_id, v_period_start, 0, 0)
     returning * into v_usage;
   end if;
 
@@ -606,16 +632,17 @@ begin
   -- concurrent requests for the final slot cannot both reserve: the FOR
   -- UPDATE lock on the usage row serialises the check, and the pending
   -- count makes the second caller see the first caller's reservation.
-  -- Stale reserved rows (crash leftovers) therefore hold their slot until
+  -- Pending cutoff aligns with the current period bucket, not a rolling
+  -- now()-period_days. Stale reserved rows hold their slot until
   -- stale-reservation reconciliation expires them (documented residual).
   select coalesce(sum(r.sessions_reserved), 0),
          coalesce(sum(r.cost_units_reserved), 0)
     into v_pending_sessions, v_pending_cost
     from screening_v2.quota_reservations r
    where r.policy_id = v_policy.id
-     and r.scope_id is not distinct from p_scope_id
+     and r.scope_id is not distinct from v_usage_scope_id
      and r.status = 'reserved'
-     and r.reserved_at >= now() - make_interval(days => v_policy.period_days);
+     and r.reserved_at >= v_period_start::timestamptz;
 
   v_projected_sessions := v_usage.sessions_used + v_pending_sessions;
   v_projected_cost := v_usage.cost_units_used + v_pending_cost;
@@ -643,11 +670,13 @@ begin
     );
   end if;
 
-  -- Create the reservation (exactly one per key).
+  -- Create the reservation (exactly one per (requester, key) pair).
   insert into screening_v2.quota_reservations
-    (policy_id, scope_id, idempotency_key, sessions_reserved, cost_units_reserved, status)
+    (policy_id, scope_id, requester_id, idempotency_key,
+     sessions_reserved, cost_units_reserved, status)
   values
-    (v_policy.id, p_scope_id, p_idempotency_key, 1, v_cost_units, 'reserved')
+    (v_policy.id, v_usage_scope_id, p_requester_id, p_idempotency_key,
+     1, v_cost_units, 'reserved')
   returning id into v_reservation_id;
 
   -- Warning percentage (only when the policy configures it; null => no warn).
@@ -685,15 +714,16 @@ grant execute on function screening_v2.check_and_reserve_quota(uuid, text, text)
   to service_role;
 
 comment on function screening_v2.check_and_reserve_quota is
-  'Atomic quota check/reserve keyed by a bounded Idempotency-Key (1..128 '
-  'chars, enforced by chk_quota_reservations_idempotency_length). Locks the '
-  'matched enabled policy + usage row, projects COMMITTED usage PLUS pending '
-  '(uncommitted) reservations so two concurrent requests for the final slot '
-  'cannot both reserve, checks both max_sessions and max_cost_units, and '
-  'returns the stable reservation. Configured cost units are read from the '
-  'policy — never from the client. A repeated key returns the same '
-  'reservation (status ''duplicate''), never double-reserving. warning_reached '
-  'is only computed when warning_percentage is non-null. Service-role-only.';
+  'Atomic quota check/reserve keyed by a (requester, bounded Idempotency-Key) '
+  'pair. Requester is the authenticated recruiter UUID — the same key from '
+  'different recruiters never collides. Resolves recruiter-specific policy '
+  'first, global fallback. Global usage aggregates under a NULL scope row. '
+  'Period buckets are anchored to a stable epoch (2000-01-01) so 7/30-day '
+  'windows do NOT reset daily. Locks the matched enabled policy + usage row, '
+  'projects COMMITTED usage PLUS pending reservations so two concurrent '
+  'requests for the final slot cannot both reserve, checks both max_sessions '
+  'and max_cost_units. Cost units from the policy — never from the client. '
+  'warning_reached only when warning_percentage is non-null. Service-role-only.';
 
 -- ───────────────────────────────────────────────────────────────────────
 -- 10b. commit_quota_reservation — idempotent CAS reserved->committed,
@@ -1293,11 +1323,11 @@ declare
   v_period_days integer := coalesce(p_period_days, 1);
 begin
   -- Defensive bounds — never trust the client past the API schema.
-  if v_scope not in ('global', 'candidate') then
+  if v_scope not in ('global', 'recruiter') then
     return jsonb_build_object('status', 'invalid_scope');
   end if;
   if (v_scope = 'global' and p_scope_id is not null)
-     or (v_scope = 'candidate' and p_scope_id is null) then
+     or (v_scope = 'recruiter' and p_scope_id is null) then
     return jsonb_build_object('status', 'invalid_scope_coherence');
   end if;
   if v_mode not in ('simulation', 'live') then

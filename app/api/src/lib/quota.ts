@@ -100,12 +100,12 @@ function numOrNull(value: unknown): number | null {
 
 /** Atomically check both caps and reserve one session slot. */
 export async function reserveQuota(opts: {
-  scopeId: string;
+  requesterId: string;
   mode: QuotaMode;
   idempotencyKey: string;
 }): Promise<ReserveQuotaResult> {
   const { data, error } = await supabase.rpc('check_and_reserve_quota', {
-    p_scope_id: opts.scopeId,
+    p_requester_id: opts.requesterId,
     p_mode: opts.mode,
     p_idempotency_key: opts.idempotencyKey,
   });

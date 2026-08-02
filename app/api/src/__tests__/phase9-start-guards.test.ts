@@ -272,7 +272,7 @@ describe('start paths — quota enforcement (enabled policy)', () => {
       .send({ candidate_id: UUID_2 });
     expect(res.status).toBe(201);
     expect(mockRpc).toHaveBeenCalledWith('check_and_reserve_quota', {
-      p_scope_id: UUID_2,
+      p_requester_id: 'user-admin-0000-0000-000000000001',
       p_mode: 'simulation',
       p_idempotency_key: IDEM,
     });
@@ -426,7 +426,7 @@ describe('start paths — quota enforcement (enabled policy)', () => {
       .send({ candidate_id: UUID_2 });
     expect(res.status).toBe(201);
     expect(mockRpc).toHaveBeenCalledWith('check_and_reserve_quota', {
-      p_scope_id: UUID_2,
+      p_requester_id: 'user-admin-0000-0000-000000000001',
       p_mode: 'live',
       p_idempotency_key: IDEM,
     });

@@ -546,7 +546,7 @@ describe('POST /api/admin/quotas (OPS-05)', () => {
       { ...base, period_days: 0 },
       { ...base, period_days: 366 },
       { ...base, max_sessions: 9999999999999 },
-      { scope: 'candidate' }, // missing scope_id → coherence failure
+      { scope: 'recruiter' }, // missing scope_id → coherence failure
       { scope: 'global', scope_id: UUID_1 }, // global must not carry scope_id
     ];
     for (const body of bad) {
@@ -612,7 +612,7 @@ describe('PATCH /api/admin/quotas/:id (OPS-05)', () => {
     const res = await request(makeApp(makeUser('admin')))
       .patch(`/api/admin/quotas/${UUID_1}`)
       .set(AUTH)
-      .send({ scope: 'candidate', scope_id: '00000000-0000-4000-8000-0000000000bb', warning_percentage: null, enabled: false });
+      .send({ scope: 'recruiter', scope_id: '00000000-0000-4000-8000-0000000000bb', warning_percentage: null, enabled: false });
     expect(res.status).toBe(200);
     expect(mockRpc).toHaveBeenCalledWith('upsert_quota_policy', expect.objectContaining({ p_warning_percentage: null }));
   });

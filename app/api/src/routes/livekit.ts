@@ -283,7 +283,7 @@ livekitRouter.post(
       }
 
       const reservation = await reserveQuota({
-        scopeId: candidateId,
+        requesterId: req.authUser!.id,
         mode: 'live',
         idempotencyKey: key,
       });

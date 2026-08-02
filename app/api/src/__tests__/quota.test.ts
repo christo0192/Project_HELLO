@@ -101,7 +101,7 @@ describe('reserveQuota (check_and_reserve_quota mapping)', () => {
       },
       error: null,
     });
-    const result = await reserveQuota({ scopeId: 'cand-1', mode: 'simulation', idempotencyKey: 'k' });
+    const result = await reserveQuota({ requesterId: 'recruiter-1', mode: 'simulation', idempotencyKey: 'k' });
     expect(result.status).toBe('ok');
     if (result.status === 'ok') {
       expect(result.allowed).toBe(true);
@@ -111,7 +111,7 @@ describe('reserveQuota (check_and_reserve_quota mapping)', () => {
       expect(result.warningReached).toBe(true);
     }
     expect(mockRpc).toHaveBeenCalledWith('check_and_reserve_quota', {
-      p_scope_id: 'cand-1',
+      p_requester_id: 'recruiter-1',
       p_mode: 'simulation',
       p_idempotency_key: 'k',
     });
@@ -122,7 +122,7 @@ describe('reserveQuota (check_and_reserve_quota mapping)', () => {
       data: { status: 'duplicate', allowed: true, reservation_id: RESERVATION_ID, reservation_status: 'committed' },
       error: null,
     });
-    const result = await reserveQuota({ scopeId: 'cand-1', mode: 'live', idempotencyKey: 'k' });
+    const result = await reserveQuota({ requesterId: 'recruiter-1', mode: 'live', idempotencyKey: 'k' });
     expect(result.status).toBe('duplicate');
     if (result.status === 'duplicate') {
       expect(result.reservationId).toBe(RESERVATION_ID);
@@ -135,7 +135,7 @@ describe('reserveQuota (check_and_reserve_quota mapping)', () => {
       data: { status: 'quota_exceeded', allowed: false, remaining_sessions: 0, remaining_cost_units: 2 },
       error: null,
     });
-    const result = await reserveQuota({ scopeId: 'cand-1', mode: 'simulation', idempotencyKey: 'k' });
+    const result = await reserveQuota({ requesterId: 'recruiter-1', mode: 'simulation', idempotencyKey: 'k' });
     expect(result.status).toBe('quota_exceeded');
     if (result.status === 'quota_exceeded') {
       expect(result.allowed).toBe(false);
@@ -145,17 +145,17 @@ describe('reserveQuota (check_and_reserve_quota mapping)', () => {
 
   it('maps no_policy → not allowed', async () => {
     mockRpc.mockResolvedValue({ data: { status: 'no_policy', allowed: false }, error: null });
-    const result = await reserveQuota({ scopeId: 'cand-1', mode: 'simulation', idempotencyKey: 'k' });
+    const result = await reserveQuota({ requesterId: 'recruiter-1', mode: 'simulation', idempotencyKey: 'k' });
     expect(result).toEqual({ status: 'no_policy', allowed: false });
   });
 
   it('maps RPC error / malformed payload → rpc_error (never trusts client cost)', async () => {
     mockRpc.mockResolvedValue({ data: null, error: { message: 'boom' } });
-    expect((await reserveQuota({ scopeId: 'x', mode: 'simulation', idempotencyKey: 'k' })).status).toBe('rpc_error');
+    expect((await reserveQuota({ requesterId: 'x', mode: 'simulation', idempotencyKey: 'k' })).status).toBe('rpc_error');
     mockRpc.mockResolvedValue({ data: { status: 'weird' }, error: null });
-    expect((await reserveQuota({ scopeId: 'x', mode: 'simulation', idempotencyKey: 'k' })).status).toBe('rpc_error');
+    expect((await reserveQuota({ requesterId: 'x', mode: 'simulation', idempotencyKey: 'k' })).status).toBe('rpc_error');
     mockRpc.mockResolvedValue({ data: [1, 2], error: null });
-    expect((await reserveQuota({ scopeId: 'x', mode: 'simulation', idempotencyKey: 'k' })).status).toBe('rpc_error');
+    expect((await reserveQuota({ requesterId: 'x', mode: 'simulation', idempotencyKey: 'k' })).status).toBe('rpc_error');
   });
 });
 
