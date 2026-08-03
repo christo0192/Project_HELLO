@@ -34,6 +34,8 @@
         "TRUSTED_PROXY": { "requiredInProduction": false, "secret": false },
         "WORKER_CONTEXT_SECRET": { "requiredInProduction": true, "secret": true },
         "RESUME_SCANNER": { "requiredInProduction": false, "secret": false },
+        "RESUME_SCANNER_BIN": { "requiredInProduction": false, "secret": false },
+        "RESUME_SCANNER_TIMEOUT_MS": { "requiredInProduction": false, "secret": false },
         "RESUME_MAX_COMPRESSED_BYTES": { "requiredInProduction": false, "secret": false },
         "RESUME_PARSER_TIMEOUT_MS": { "requiredInProduction": false, "secret": false },
         "RESUME_MAX_TEXT_LENGTH": { "requiredInProduction": false, "secret": false }
