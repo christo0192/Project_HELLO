@@ -12,6 +12,11 @@
 import { apiClient, ApiError } from './lib/api-client';
 import { supabase } from './lib/supabase';
 import type {
+  AdminAllowlistAddInput,
+  AdminAllowlistAddResponse,
+  AdminAllowlistListResponse,
+  AdminAllowlistUpdateInput,
+  AdminAllowlistUpdateResponse,
   AdminMaintenanceInput,
   AdminAuditListResponse,
   AdminMember,
@@ -320,6 +325,19 @@ export const api = {
     }),
   updateQuotaPolicy: (id: string, body: QuotaPolicyInput) =>
     request<QuotaPolicyMutationResponse>(`/api/admin/quotas/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+
+  // ── HELLO access allowlist (0016): normalized-email access gate ────
+  listAdminAllowlist: () => request<AdminAllowlistListResponse>('/api/admin/allowlist'),
+  addAdminAllowlistEntry: (body: AdminAllowlistAddInput) =>
+    request<AdminAllowlistAddResponse>('/api/admin/allowlist', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  updateAdminAllowlistEntry: (id: string, body: AdminAllowlistUpdateInput) =>
+    request<AdminAllowlistUpdateResponse>(`/api/admin/allowlist/${id}`, {
       method: 'PATCH',
       body: JSON.stringify(body),
     }),

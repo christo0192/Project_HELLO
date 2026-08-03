@@ -1,3 +1,19 @@
+/**
+ * HELLO application routes (integration lane).
+ *
+ * - Lazy route chunks: Dashboard, Candidate detail, Session detail and
+ *   Mission Control are `React.lazy` so ECharts/motion-heavy code is split
+ *   out of the main bundle; `<Suspense>` lives inside Layout (per-route
+ *   loading fallback).
+ * - `/dashboard` is the primary TA/HR landing; `/admin` is a safe alias
+ *   that redirects to `/mission-control`.
+ * - Mission Control is admin-gated by `ProtectedRoute requireRole="admin"`
+ *   (UX gate only — the server enforces authorization).
+ * - All existing candidate / call / consent / appeal / login routes are
+ *   preserved unchanged.
+ */
+
+import { lazy } from 'react';
 import {
   Navigate,
   Route,
@@ -6,6 +22,7 @@ import {
 } from 'react-router-dom';
 import { Layout } from './components/Layout';
 import { ProtectedRoute } from './components/ProtectedRoute';
+import { useAuth } from './lib/auth';
 import { LoginPage } from './pages/LoginPage';
 import { MfaEnrollPage } from './pages/MfaEnrollPage';
 import { MfaChallengePage } from './pages/MfaChallengePage';
@@ -14,11 +31,47 @@ import { CandidateJoinPage } from './pages/CandidateJoinPage';
 import { PrivacyNoticePage } from './pages/PrivacyNoticePage';
 import { RolesPage } from './pages/RolesPage';
 import { CandidatesPage } from './pages/CandidatesPage';
-import { CandidateDetailPage } from './pages/CandidateDetailPage';
 import { ScreeningPage } from './pages/ScreeningPage';
 import { StatusPage } from './pages/StatusPage';
 import { AppealPage } from './pages/AppealPage';
-import { AdminDashboardPage } from './pages/AdminDashboardPage';
+import { NotFoundPage } from './pages/NotFoundPage';
+
+/** Named-export wrapper for React.lazy (pages use named exports). */
+function lazyPage<T extends { [K in string]: unknown }>(
+  loader: () => Promise<T>,
+  name: keyof T & string,
+) {
+  return lazy(async () => {
+    const mod = await loader();
+    return { default: mod[name] as () => React.ReactElement };
+  });
+}
+
+const DashboardPage = lazyPage(() => import('./pages/DashboardPage'), 'DashboardPage');
+const CandidateDetailPage = lazyPage(
+  () => import('./pages/CandidateDetailPage'),
+  'CandidateDetailPage',
+);
+const SessionDetailPage = lazyPage(
+  () => import('./pages/SessionDetailPage'),
+  'SessionDetailPage',
+);
+const MissionControlPage = lazyPage(
+  () => import('./pages/MissionControlPage'),
+  'MissionControlPage',
+);
+
+/**
+ * Single catch-all: authenticated users return to the dashboard (the old
+ * protected `*` → /candidates behavior, retargeted to the new landing);
+ * unauthenticated users get a truthful branded 404 with sign-in escape.
+ */
+function CatchAll() {
+  const { isLoading, isAuthenticated } = useAuth();
+  if (isLoading) return null;
+  if (isAuthenticated) return <Navigate to="/dashboard" replace />;
+  return <NotFoundPage />;
+}
 
 export default function App() {
   return (
@@ -37,24 +90,26 @@ export default function App() {
         {/* Protected recruiter routes — AAL2 required */}
         <Route element={<ProtectedRoute />}>
           <Route element={<Layout />}>
-            <Route index element={<Navigate to="/candidates" replace />} />
+            <Route index element={<Navigate to="/dashboard" replace />} />
+            <Route path="/dashboard" element={<DashboardPage />} />
             <Route path="/roles" element={<RolesPage />} />
             <Route path="/candidates" element={<CandidatesPage />} />
             <Route path="/candidates/:id" element={<CandidateDetailPage />} />
+            <Route path="/sessions/:sessionId" element={<SessionDetailPage />} />
             <Route path="/screening/:sessionId" element={<ScreeningPage />} />
-            <Route path="*" element={<Navigate to="/candidates" replace />} />
           </Route>
         </Route>
 
-        {/* Phase 9: admin dashboard — role-gated (UX only; APIs authoritative) */}
+        {/* Mission Control — admin-gated (UX only; APIs authoritative) */}
         <Route element={<ProtectedRoute requireRole="admin" />}>
           <Route element={<Layout />}>
-            <Route path="/admin" element={<AdminDashboardPage />} />
+            <Route path="/admin" element={<Navigate to="/mission-control" replace />} />
+            <Route path="/mission-control" element={<MissionControlPage />} />
           </Route>
         </Route>
 
-        {/* Catch-all — unknown routes redirect to login */}
-        <Route path="*" element={<Navigate to="/login" replace />} />
+        {/* Catch-all — unknown routes */}
+        <Route path="*" element={<CatchAll />} />
       </Routes>
     </Router>
   );

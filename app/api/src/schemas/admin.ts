@@ -126,3 +126,40 @@ export const adminMaintenanceSchema = z
   .strict();
 
 export type AdminMaintenanceInput = z.infer<typeof adminMaintenanceSchema>;
+
+// ── HELLO access-allowlist (0016) ────────────────────────────────────
+
+/** Path param schema for PATCH /api/admin/allowlist/:id */
+export const adminAllowlistIdParamSchema = z.object({ id: uuidSchema }).strict();
+
+/**
+ * POST /api/admin/allowlist body — the email is NOT format-validated here:
+ * normalization/validation is authoritative in the add_allowlist_entry RPC
+ * (identical rules to the per-request resolver). This schema only bounds
+ * transport and constrains the role enum. Duplicate case/whitespace
+ * variants are rejected by the RPC/unique normalized index (409 duplicate).
+ */
+export const adminAllowlistAddSchema = z
+  .object({
+    email: z.string().trim().min(1, 'email is required').max(320, 'email must be at most 320 characters'),
+    role: z.enum(['admin', 'interviewer', 'viewer']).optional().default('viewer'),
+  })
+  .strict();
+
+export type AdminAllowlistAddInput = z.infer<typeof adminAllowlistAddSchema>;
+
+/**
+ * PATCH /api/admin/allowlist/:id body.
+ * At least one of role/active is required; both are bounded.
+ */
+export const adminAllowlistUpdateSchema = z
+  .object({
+    role: z.enum(['admin', 'interviewer', 'viewer']).optional(),
+    active: z.boolean().optional(),
+  })
+  .strict()
+  .refine((v) => v.role !== undefined || v.active !== undefined, {
+    message: 'at least one of role or active is required',
+  });
+
+export type AdminAllowlistUpdateInput = z.infer<typeof adminAllowlistUpdateSchema>;

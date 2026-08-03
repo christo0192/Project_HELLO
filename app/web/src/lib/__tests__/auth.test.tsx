@@ -8,7 +8,7 @@
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { AuthProvider, useAuth, getSsoProviders } from '../auth';
+import { AuthProvider, useAuth, getSsoProviders, isCompanyEmail, ALLOWED_EMAIL_DOMAIN } from '../auth';
 
 // ── Fixtures ──────────────────────────────────────────────────────────
 
@@ -410,5 +410,38 @@ describe('useAuth throws outside provider', () => {
     expect(() => render(<BadComponent />)).toThrow(
       'useAuth must be used within an AuthProvider',
     );
+  });
+});
+
+// ── HELLO company-email UX helper (real module, real behavior) ────────
+
+describe('isCompanyEmail / ALLOWED_EMAIL_DOMAIN (UX-only helpers)', () => {
+  it('exports the exact company domain', () => {
+    expect(ALLOWED_EMAIL_DOMAIN).toBe('interviewkickstart.com');
+  });
+
+  it('accepts exact company-domain emails (case/whitespace tolerant)', () => {
+    expect(isCompanyEmail('gopu.nair@interviewkickstart.com')).toBe(true);
+    expect(isCompanyEmail('  GOPU.NAIR@InterviewKickStart.COM  ')).toBe(true);
+  });
+
+  it('rejects non-company domains and domain tricks', () => {
+    expect(isCompanyEmail('gopu@gmail.com')).toBe(false);
+    expect(isCompanyEmail('gopu@outlook.com')).toBe(false);
+    expect(isCompanyEmail('gopu@interviewkickstart.com.evil.test')).toBe(false);
+    expect(isCompanyEmail('gopu@sub.interviewkickstart.com')).toBe(false);
+    expect(isCompanyEmail('gopu@notinterviewkickstart.com')).toBe(false);
+  });
+
+  it('rejects multi-@, unicode lookalikes, and empty input', () => {
+    expect(isCompanyEmail('a@b@interviewkickstart.com')).toBe(false);
+    expect(isCompanyEmail('gopu＠interviewkickstart.com')).toBe(false);
+    expect(isCompanyEmail('gopu@interviewkіckstart.com')).toBe(false); // Cyrillic і
+    expect(isCompanyEmail('')).toBe(false);
+    expect(isCompanyEmail(null as unknown as string)).toBe(false);
+  });
+
+  it('strips a display-name wrapper like the server-side normalizer', () => {
+    expect(isCompanyEmail('Gopu Nair <gopu.nair@interviewkickstart.com>')).toBe(true);
   });
 });

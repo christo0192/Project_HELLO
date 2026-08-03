@@ -501,3 +501,41 @@ export interface ConsentWithdrawResponse {
   status: ConsentStatus;
   updated_at: string;
 }
+
+// ── HELLO access allowlist (0016): normalized-email access gate ────────
+// Lane 2 backend contract (GET/POST /api/admin/allowlist,
+// PATCH /api/admin/allowlist/:id). Emails are the admin management
+// surface only — they never appear in audit metadata or non-admin
+// responses; normalization/validation is authoritative server-side.
+
+export interface AdminAllowlistEntry {
+  id: string;
+  email: string;
+  role: MembershipRole;
+  active: boolean;
+  linked_user_id: string | null;
+  linked_at: string | null;
+}
+
+export interface AdminAllowlistListResponse {
+  entries: AdminAllowlistEntry[];
+}
+
+export interface AdminAllowlistAddInput {
+  email: string;
+  role?: MembershipRole;
+}
+
+export interface AdminAllowlistAddResponse {
+  ok: boolean;
+  id: string | null;
+}
+
+export interface AdminAllowlistUpdateInput {
+  role?: MembershipRole;
+  active?: boolean;
+}
+
+export interface AdminAllowlistUpdateResponse {
+  ok: boolean;
+}

@@ -22,7 +22,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
 import { createApp } from '../app.js';
-import { mockAuthGetUser, type AuthUser, type TokenVerifier } from '../lib/auth.js';
+import { mockAuthGetUser, normalizeEmailForAccess, type AuthUser, type TokenVerifier } from '../lib/auth.js';
 import { MemoryRateLimitStore, setRateLimitStore } from '../lib/rate-limit.js';
 import { setAuditSink, minimizeIp } from '../lib/audit.js';
 
@@ -120,6 +120,7 @@ function chainable(value: any): any {
 vi.mock('../lib/supabase.js', () => ({
   supabase: {
     from: vi.fn(),
+    rpc: vi.fn(),
     auth: { getUser: vi.fn() },
     storage: { from: vi.fn() },
   },
@@ -152,7 +153,7 @@ function hasSecurityHeaders(res: request.Response) {
 // ── App & mock per test ─────────────────────────────────────────────
 
 let app: ReturnType<typeof createApp>;
-let mockSupabase: { from: any };
+let mockSupabase: { from: any; rpc: any };
 
 beforeEach(async () => {
   setRateLimitStore(new MemoryRateLimitStore(1000));
@@ -161,6 +162,8 @@ beforeEach(async () => {
   const supabaseMod = await import('../lib/supabase.js');
   mockSupabase = supabaseMod.supabase as any;
   mockSupabase.from.mockReturnValue(chainable({ data: [], error: null }));
+  mockSupabase.rpc.mockReset();
+  mockSupabase.rpc.mockResolvedValue({ data: null, error: { message: 'unknown rpc' } });
 });
 
 afterEach(() => {
@@ -892,4 +895,212 @@ describe('role-based access matrix', () => {
       });
     }
   }
+});
+
+// ===================================================================
+//  HELLO ACCESS GATE (0016) — normalized company email allowlist
+// ===================================================================
+
+describe('normalizeEmailForAccess — strict ASCII company-email gate', () => {
+  it('accepts a plain company email', () => {
+    expect(normalizeEmailForAccess('gopu.nair@interviewkickstart.com')).toBe(
+      'gopu.nair@interviewkickstart.com',
+    );
+  });
+
+  it('trims and lowercases (case/whitespace variants collide)', () => {
+    expect(normalizeEmailForAccess('  GOPU.NAIR@InterviewKickstart.COM  ')).toBe(
+      'gopu.nair@interviewkickstart.com',
+    );
+  });
+
+  it('strips a Display Name <email> wrapper', () => {
+    expect(normalizeEmailForAccess('Gopu Nair <gopu.nair@interviewkickstart.com>')).toBe(
+      'gopu.nair@interviewkickstart.com',
+    );
+  });
+
+  it('rejects a gmail / non-company domain (uniform deny)', () => {
+    expect(normalizeEmailForAccess('gopu@gmail.com')).toBeNull();
+    expect(normalizeEmailForAccess('gopu@outlook.com')).toBeNull();
+    expect(normalizeEmailForAccess('gopu@yahoo.in')).toBeNull();
+  });
+
+  it('rejects subdomain and suffix tricks on the company domain', () => {
+    expect(normalizeEmailForAccess('gopu@sub.interviewkickstart.com')).toBeNull();
+    expect(normalizeEmailForAccess('gopu@interviewkickstart.com.evil.test')).toBeNull();
+    expect(normalizeEmailForAccess('gopu@notinterviewkickstart.com')).toBeNull();
+    expect(normalizeEmailForAccess('gopu@interviewkickstart.com.evil')).toBeNull();
+  });
+
+  it('rejects unicode lookalikes and non-ASCII input', () => {
+    // Fullwidth @ (U+FF20) and Cyrillic а lookalike must be rejected.
+    expect(normalizeEmailForAccess('gopu＠interviewkickstart.com')).toBeNull();
+    expect(normalizeEmailForAccess('gopu@interviewkіckstart.com')).toBeNull(); // Cyrillic і
+    expect(normalizeEmailForAccess('josé@interviewkickstart.com')).toBeNull();
+    expect(normalizeEmailForAccess('gopu@interviewkickstart。com')).toBeNull(); // fullwidth dot
+  });
+
+  it('rejects more than one @ (including display-name wrappers with @ inside the name)', () => {
+    expect(normalizeEmailForAccess('a@b@interviewkickstart.com')).toBeNull();
+    expect(normalizeEmailForAccess('gopu@interviewkickstart.com@extra')).toBeNull();
+  });
+
+  it('rejects missing/empty/invalid local parts and domains', () => {
+    expect(normalizeEmailForAccess('')).toBeNull();
+    expect(normalizeEmailForAccess('   ')).toBeNull();
+    expect(normalizeEmailForAccess('@interviewkickstart.com')).toBeNull();
+    expect(normalizeEmailForAccess('gopu@')).toBeNull();
+    expect(normalizeEmailForAccess('gopu@interviewkickstart')).toBeNull(); // no TLD
+    expect(normalizeEmailForAccess('gopu nair@interviewkickstart.com')).toBeNull(); // space in local
+    expect(normalizeEmailForAccess('gopu@interviewkickstart.c')).toBeNull(); // 1-char TLD
+  });
+
+  it('rejects non-string input', () => {
+    expect(normalizeEmailForAccess(null as unknown as string)).toBeNull();
+    expect(normalizeEmailForAccess(undefined as unknown as string)).toBeNull();
+  });
+});
+
+describe('defaultAccessResolver — live per-request allowlist RPC gate', () => {
+  it('denies unverified (no email_confirmed_at) with uniform 403', async () => {
+    const { defaultAccessResolver } = await import('../lib/auth.js');
+    const res = await defaultAccessResolver('user-1', 'gopu.nair@interviewkickstart.com', false);
+    expect(res).toEqual({ ok: false, status: 403 });
+    expect(mockSupabase.rpc).not.toHaveBeenCalled();
+  });
+
+  it('denies wrong-domain emails BEFORE the RPC (uniform 403)', async () => {
+    const { defaultAccessResolver } = await import('../lib/auth.js');
+    const res = await defaultAccessResolver('user-1', 'gopu@gmail.com', true);
+    expect(res).toEqual({ ok: false, status: 403 });
+    expect(mockSupabase.rpc).not.toHaveBeenCalled();
+  });
+
+  it('denies when the resolver RPC reports non-ok (missing/inactive/relink)', async () => {
+    const { defaultAccessResolver, setAuthSupabaseClient } = await import('../lib/auth.js');
+    setAuthSupabaseClient(mockSupabase as any);
+    for (const status of ['denied', 'not_allowlisted', 'email_already_linked']) {
+      mockSupabase.rpc.mockResolvedValueOnce({ data: { status }, error: null });
+      const res = await defaultAccessResolver('user-1', 'gopu.nair@interviewkickstart.com', true);
+      expect(res, `status=${status}`).toEqual({ ok: false, status: 403 });
+    }
+  });
+
+  it('denies on RPC transport error (fail closed, uniform 403)', async () => {
+    const { defaultAccessResolver, setAuthSupabaseClient } = await import('../lib/auth.js');
+    setAuthSupabaseClient(mockSupabase as any);
+    mockSupabase.rpc.mockResolvedValueOnce({ data: null, error: { message: 'boom' } });
+    const res = await defaultAccessResolver('user-1', 'gopu.nair@interviewkickstart.com', true);
+    expect(res).toEqual({ ok: false, status: 403 });
+  });
+
+  it('returns the server-held role/active on ok and calls the RPC with the raw verified email', async () => {
+    const { defaultAccessResolver, setAuthSupabaseClient } = await import('../lib/auth.js');
+    setAuthSupabaseClient(mockSupabase as any);
+    mockSupabase.rpc.mockResolvedValueOnce({
+      data: { status: 'ok', role: 'interviewer', active: true },
+      error: null,
+    });
+    const res = await defaultAccessResolver('user-1', 'GOPU.NAIR@InterviewKickstart.COM', true);
+    expect(res).toEqual({ ok: true, role: 'interviewer', active: true });
+    expect(mockSupabase.rpc).toHaveBeenCalledWith('resolve_allowlist_access', {
+      p_user_id: 'user-1',
+      p_email: 'GOPU.NAIR@InterviewKickstart.COM',
+    });
+  });
+
+  it('treats an invalid RPC role as a deny (never trusts the resolver blindly)', async () => {
+    const { defaultAccessResolver, setAuthSupabaseClient } = await import('../lib/auth.js');
+    setAuthSupabaseClient(mockSupabase as any);
+    mockSupabase.rpc.mockResolvedValueOnce({ data: { status: 'ok', role: 'superuser', active: true }, error: null });
+    const res = await defaultAccessResolver('user-1', 'gopu.nair@interviewkickstart.com', true);
+    expect(res).toEqual({ ok: false, status: 403 });
+  });
+});
+
+describe('HELLO access gate — middleware enforces allowlist on every request', () => {
+  async function createGateApp(resolveAccess: import('../lib/auth.js').AccessResolver) {
+    const authMod = await import('../lib/auth.js');
+    const rbacMod = await import('../lib/rbac.js');
+    const validationMod = await import('../lib/validation.js');
+    const { default: express } = await import('express');
+    const admin: import('../lib/auth.js').AuthUser = {
+      id: 'user-admin-0000-0000-000000000001',
+      email: 'admin@example.com',
+      aal: 'aal2',
+      active: true,
+      appRole: 'admin',
+      orgId: null,
+    };
+    const app = express();
+    app.use(express.json());
+    app.use(authMod.createRequireAuth({ getUser: authMod.mockAuthGetUser(admin, JWT_AAL2), resolveAccess }));
+    app.use(rbacMod.viewerReadOnly);
+    app.get('/api/roles', (_req: any, res: any) => res.json([{ ok: true }]));
+    app.use(validationMod.finalErrorHandler);
+    return app;
+  }
+
+  it('denies a wrong-domain verified email with the uniform generic 403 (not 401)', async () => {
+    const gate = await createGateApp(async () => ({ ok: false, status: 403 }));
+    const res = await request(gate).get('/api/roles').set('Authorization', VALID_TOKEN);
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({
+      error: { type: 'authorization_error', message: 'Insufficient permissions' },
+    });
+    expect(JSON.stringify(res.body)).not.toContain('gmail');
+    expect(JSON.stringify(res.body)).not.toContain('interviewkickstart');
+  });
+
+  it('denies when the allowlist has no matching entry (missing/inactive → same 403)', async () => {
+    const gate = await createGateApp(async () => ({ ok: false, status: 403 }));
+    const res = await request(gate).get('/api/roles').set('Authorization', VALID_TOKEN);
+    expect(res.status).toBe(403);
+    expect(res.body.error.type).toBe('authorization_error');
+  });
+
+  it('denies even when the stale membership says active (disabled allowlist beats old JWT/membership)', async () => {
+    // resolveAccess denies (entry disabled) while the user object carries
+    // active app_metadata + aal2 — the gate must still reject.
+    const gate = await createGateApp(async () => ({ ok: false, status: 403 }));
+    const res = await request(gate).get('/api/roles').set('Authorization', VALID_TOKEN);
+    expect(res.status).toBe(403);
+  });
+
+  it('passes the verified email and confirmation flag to the resolver on every request', async () => {
+    const seen: Array<[string, string, boolean]> = [];
+    const gate = await createGateApp(async (userId, email, emailVerified) => {
+      seen.push([userId, email, emailVerified]);
+      return { ok: true, role: 'viewer', active: true };
+    });
+    await request(gate).get('/api/roles').set('Authorization', VALID_TOKEN);
+    expect(seen).toHaveLength(1);
+    expect(seen[0][0]).toBe('user-admin-0000-0000-000000000001');
+    expect(seen[0][1]).toBe('admin@example.com');
+    expect(seen[0][2]).toBe(false); // mock users carry no email_confirmed_at
+  });
+
+  it('grants access and uses the SERVER-HELD role (never app_metadata)', async () => {
+    const gate = await createGateApp(async () => ({ ok: true, role: 'interviewer', active: true }));
+    const res = await request(gate).get('/api/roles').set('Authorization', VALID_TOKEN);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([{ ok: true }]);
+  });
+
+  it('rejects a resolver failure (fail closed → 403, not 500)', async () => {
+    const gate = await createGateApp(async () => {
+      throw new Error('resolver exploded');
+    });
+    const res = await request(gate).get('/api/roles').set('Authorization', VALID_TOKEN);
+    expect(res.status).toBe(403);
+    expect(JSON.stringify(res.body)).not.toContain('stack');
+  });
+
+  it('inactive server-held membership denies even when the role passes', async () => {
+    const gate = await createGateApp(async () => ({ ok: true, role: 'admin', active: false }));
+    const res = await request(gate).get('/api/roles').set('Authorization', VALID_TOKEN);
+    expect(res.status).toBe(403);
+    expect(res.body.error.type).toBe('authorization_error');
+  });
 });
