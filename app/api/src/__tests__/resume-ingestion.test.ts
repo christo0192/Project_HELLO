@@ -38,7 +38,7 @@ function readFixture(name: string): Buffer {
 // ─── Import modules under test ─────────────────────────────────────
 
 import { guardUpload, UploadGuardError } from '../lib/upload-guard.js';
-import { TestScanner, ProductionFailClosedScanner } from '../lib/malware-scanner.js';
+import { TestScanner, ProductionFailClosedScanner, ClamAvScanner } from '../lib/malware-scanner.js';
 import { createResumesRouter } from '../routes/resumes.js';
 import type { RecruiterAuthGuard } from '../schemas/candidates.js';
 
@@ -564,6 +564,26 @@ describe('malware-scanner', () => {
     });
   });
 
+  describe('ClamAvScanner', () => {
+    it('rejects EICAR without invoking external scanner', async () => {
+      const scanner = new ClamAvScanner('scanner-binary-that-should-not-run');
+      const eicar = Buffer.from(
+        'X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*',
+        'utf-8',
+      );
+      const result = await scanner.scan(eicar);
+      expect(result.safe).toBe(false);
+      expect(result.status).toBe('infected');
+    });
+
+    it('fails closed when clamscan is unavailable', async () => {
+      const scanner = new ClamAvScanner('scanner-binary-that-does-not-exist');
+      const result = await scanner.scan(Buffer.from('clean data'));
+      expect(result.safe).toBe(false);
+      expect(result.status).toBe('scanner_error');
+    });
+  });
+
   describe('ProductionFailClosedScanner', () => {
     const scanner = new ProductionFailClosedScanner();
 
@@ -597,6 +617,22 @@ describe('malware-scanner', () => {
       const { resolveScanner } = await import('../lib/malware-scanner.js');
       const scanner = resolveScanner('development');
       expect(scanner.name).toBe('test-scanner');
+    });
+
+    it('returns ClamAvScanner when RESUME_SCANNER=clamav', async () => {
+      const previous = process.env.RESUME_SCANNER;
+      process.env.RESUME_SCANNER = 'clamav';
+      try {
+        const { resolveScanner } = await import('../lib/malware-scanner.js');
+        const scanner = resolveScanner('production');
+        expect(scanner.name).toBe('clamav');
+      } finally {
+        if (previous === undefined) {
+          delete process.env.RESUME_SCANNER;
+        } else {
+          process.env.RESUME_SCANNER = previous;
+        }
+      }
     });
   });
 });
