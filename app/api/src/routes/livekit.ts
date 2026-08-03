@@ -24,7 +24,7 @@ import {
 import { guardAudioUpload, UploadGuardError } from '../lib/upload-guard.js';
 import { resolveScanner } from '../lib/malware-scanner.js';
 import { recordAudit } from '../lib/audit.js';
-import { extractBearerToken, verifyToken } from '../lib/auth.js';
+import { extractBearerToken, resolveFullAuth } from '../lib/auth.js';
 import type { AuthUser } from '../lib/auth.js';
 import { createSession, transitionSession } from '../lib/session-lifecycle.js';
 import { getCorrelationId } from '../lib/correlation.js';
@@ -327,9 +327,14 @@ livekitRouter.post(
 // ── Recruiter (non-grant) upload auth ────────────────────────────────
 // REC-03 (L5): the recording upload route is PUBLIC because grant-token
 // uploads carry no bearer credential — the global requireAuth middleware
-// therefore never runs for it. For the recruiter path we verify the bearer
-// token in-route with the same verifyToken seam and mirror the membership
-// shape used by recordings.ts (admin/viewer any; interviewer must own).
+// therefore never runs for it. For the recruiter path we use the SAME
+// shared full-authorization seam as the global middleware
+// (resolveFullAuth: bearer token → verified Supabase email → allowlist/
+// domain access resolver → server-held role → AAL gate). There is NO
+// weaker duplicate implementation — a disabled/missing allowlist entry or
+// a non-company email denies here exactly as on every other route.
+// The owner check below (admin/viewer any; interviewer must own) is then
+// applied against the session row, invariant 5.
 
 type RecruiterAuthResult =
   | { user: AuthUser }
@@ -340,31 +345,14 @@ async function resolveRecruiterAuth(req: import('express').Request): Promise<Rec
   if (!token) {
     return { status: 401, error: 'authentication_required' };
   }
-  const authResult = await verifyToken(token);
+  const authResult = await resolveFullAuth(token);
   if (!authResult.ok) {
     return {
       status: authResult.status,
       error: authResult.status === 401 ? 'authentication_required' : 'access_denied',
     };
   }
-  // Membership mirror (same role/active shape as the global middleware and
-  // the recordings.ts owner gate).
-  const { data: membership } = await supabase
-    .from('recruiter_memberships')
-    .select('role,active')
-    .eq('user_id', authResult.user.id)
-    .single();
-  const role = membership?.role as 'admin' | 'interviewer' | 'viewer' | undefined;
-  if (!role || !['admin', 'interviewer', 'viewer'].includes(role)) {
-    return { status: 403, error: 'access_denied' };
-  }
-  if (!membership || membership.active !== true) {
-    return { status: 403, error: 'access_denied' };
-  }
-  if ((role === 'admin' || role === 'interviewer') && authResult.user.aal !== 'aal2') {
-    return { status: 403, error: 'access_denied' };
-  }
-  return { user: { ...authResult.user, active: true, appRole: role } };
+  return { user: authResult.user };
 }
 
 // ── POST /api/livekit/grant/recording ────────────────────────────────

@@ -3275,6 +3275,220 @@ end;
 $$;
 
 -- ═══════════════════════════════════════════════════════════════════════
+-- HELLO dashboard access allowlist (0016) — normalized-email access gate
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- Direct anon/authenticated DB access must be impossible: no privileges,
+-- no policies, RLS enabled.
+select _policy_tests.assert(
+  'email_allowlist has RLS enabled',
+  exists (
+    select 1
+      from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'email_allowlist'
+       and c.relrowsecurity
+  ),
+  'email_allowlist must have row level security enabled'
+);
+
+select _policy_tests.assert(
+  'anon has ZERO privileges on email_allowlist',
+  not exists (
+    select 1
+      from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'email_allowlist'
+       and (has_any_column_privilege('anon', c.oid, 'SELECT,INSERT,UPDATE,REFERENCES')
+         or has_table_privilege('anon', c.oid, 'DELETE,TRUNCATE,TRIGGER'))
+  ),
+  'anon must have zero effective privileges on email_allowlist'
+);
+
+select _policy_tests.assert(
+  'authenticated has ZERO privileges on email_allowlist (no direct DB access)',
+  not exists (
+    select 1
+      from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'email_allowlist'
+       and (has_any_column_privilege('authenticated', c.oid, 'SELECT,INSERT,UPDATE,REFERENCES')
+         or has_table_privilege('authenticated', c.oid, 'DELETE,TRUNCATE,TRIGGER'))
+  ),
+  'authenticated browser sessions must never touch email_allowlist directly'
+);
+
+select _policy_tests.assert(
+  'email_allowlist has NO authenticated/anon RLS policies',
+  not exists (
+    select 1
+      from pg_policies p
+      join pg_class c on c.relname = p.tablename
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'email_allowlist'
+       and p.roles && array['authenticated'::name, 'anon'::name]
+  ),
+  'no browser-role RLS policy may exist on email_allowlist'
+);
+
+select _policy_tests.assert(
+  'email_allowlist grants service_role full access',
+  exists (
+    select 1
+      from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'email_allowlist'
+       and has_table_privilege('service_role', c.oid, 'SELECT,INSERT,UPDATE,DELETE')
+  ),
+  'service_role must own email_allowlist access'
+);
+
+-- Bootstrap: exactly the three confirmed launch admins, all active, admin role.
+select _policy_tests.assert(
+  'bootstrap: exactly three allowlist entries',
+  (select count(*) from screening_v2.email_allowlist) = 3,
+  'expected exactly 3 bootstrap entries'
+);
+
+select _policy_tests.assert(
+  'bootstrap: all three confirmed emails present, active admins',
+  (select count(*) from screening_v2.email_allowlist
+    where role = 'admin' and active
+      and email_normalized in (
+        'gopu.nair@interviewkickstart.com',
+        'christo.b@interviewkickstart.com',
+        'jerin@interviewkickstart.com'
+      )) = 3,
+  'all three bootstrap emails must be active admins'
+);
+
+select _policy_tests.assert(
+  'bootstrap: no entry is linked before first login (independent of auth.users)',
+  (select count(*) from screening_v2.email_allowlist
+    where linked_user_id is not null or linked_at is not null) = 0,
+  'bootstrap entries must not require auth.users rows'
+);
+
+-- Canonical shape: unique normalized email + exact-domain CHECK.
+select _policy_tests.assert(
+  'email_allowlist has UNIQUE email_normalized (duplicate case variants conflict)',
+  exists (
+    select 1
+      from pg_constraint con
+      join pg_class c on c.oid = con.conrelid
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'email_allowlist'
+       and con.contype = 'u'
+       and con.conname = 'uq_email_allowlist_normalized'
+  ),
+  'a unique constraint on email_normalized must exist'
+);
+
+select _policy_tests.assert(
+  'email_allowlist CHECK restricts to the exact company domain',
+  exists (
+    select 1
+      from pg_constraint con
+      join pg_class c on c.oid = con.conrelid
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'email_allowlist'
+       and con.contype = 'c'
+       and con.conname = 'chk_email_allowlist_normalized'
+  ),
+  'the normalized-email CHECK constraint must exist'
+);
+
+select _policy_tests.assert(
+  'email_allowlist role CHECK exists',
+  exists (
+    select 1
+      from pg_constraint con
+      join pg_class c on c.oid = con.conrelid
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'email_allowlist'
+       and con.contype = 'c'
+       and con.conname = 'chk_email_allowlist_role'
+  ),
+  'the role CHECK constraint must exist'
+);
+
+-- RPCs: service-role only; never executable by browser roles.
+select _policy_tests.assert(
+  'resolve_allowlist_access is revoked from public/anon/authenticated',
+  not exists (
+    select 1
+      from pg_proc p
+      join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname = 'resolve_allowlist_access'
+       and (has_function_privilege('anon', p.oid, 'EXECUTE')
+         or has_function_privilege('authenticated', p.oid, 'EXECUTE'))
+  ),
+  'anon/authenticated must not execute resolve_allowlist_access'
+);
+
+select _policy_tests.assert(
+  'resolve_allowlist_access is executable by service_role',
+  exists (
+    select 1
+      from pg_proc p
+      join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname = 'resolve_allowlist_access'
+       and has_function_privilege('service_role', p.oid, 'EXECUTE')
+  ),
+  'service_role must execute resolve_allowlist_access'
+);
+
+select _policy_tests.assert(
+  'add_allowlist_entry / update_allowlist_entry are service-role only',
+  not exists (
+    select 1
+      from pg_proc p
+      join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname in ('add_allowlist_entry', 'update_allowlist_entry')
+       and (has_function_privilege('anon', p.oid, 'EXECUTE')
+         or has_function_privilege('authenticated', p.oid, 'EXECUTE'))
+  )
+  and exists (
+    select 1
+      from pg_proc p
+      join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname in ('add_allowlist_entry', 'update_allowlist_entry')
+       and has_function_privilege('service_role', p.oid, 'EXECUTE')
+  ),
+  'admin allowlist RPCs must be service-role only'
+);
+
+select _policy_tests.assert(
+  'audit action CHECK includes the 0016 allowlist actions',
+  exists (
+    select 1
+      from pg_constraint con
+      join pg_class c on c.oid = con.conrelid
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'audit_events'
+       and con.contype = 'c'
+       and con.conname = 'chk_audit_action'
+       and pg_get_constraintdef(con.oid) ~ 'allowlist_linked'
+       and pg_get_constraintdef(con.oid) ~ 'admin_allowlist_add'
+       and pg_get_constraintdef(con.oid) ~ 'admin_allowlist_update'
+  ),
+  'chk_audit_action must allow the 0016 allowlist actions'
+);
+
+-- ═══════════════════════════════════════════════════════════════════════
 -- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)
 -- ═══════════════════════════════════════════════════════════════════════
 

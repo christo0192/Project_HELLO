@@ -598,19 +598,53 @@ describe('POST /api/livekit/:sessionId/recording (hardened upload)', () => {
     return req.attach('file', buf, { filename, contentType });
   }
 
-  /** Mock the in-route recruiter auth seam (verifyToken → auth.getUser + membership). */
+  /**
+   * Mock the in-route recruiter auth seam (resolveFullAuth → supabase.auth
+   * getUser + allowlist resolver RPC). Models a fully ALLOWLISTED,
+   * email-confirmed company recruiter so the owner tests exercise the
+   * happy path. Callers that want denial set mockRpc's
+   * resolve_allowlist_access branch (or a wrong-domain email) themselves.
+   */
   function mockRecruiterAuth(role: 'admin' | 'interviewer' | 'viewer', userId: string) {
     mockAuthGetUser.mockResolvedValue({
       data: {
         user: {
           id: userId,
-          email: `${role}@test.invalid`,
+          email: `${role}@interviewkickstart.com`,
+          email_confirmed_at: '2026-01-01T00:00:00.000Z',
           app_metadata: { app_role: role, org_id: null, active: true },
         },
       },
       error: null,
     });
+    mockRpc.mockImplementation((fn: string) => {
+      if (fn === 'resolve_allowlist_access') {
+        return Promise.resolve({ data: { status: 'ok', role, active: true }, error: null });
+      }
+      if (fn === 'finalize_recording_upload') {
+        return Promise.resolve({ data: { status: 'ok' }, error: null });
+      }
+      if (fn === 'quarantine_recording') {
+        return Promise.resolve({ data: { status: 'quarantined' }, error: null });
+      }
+      return Promise.resolve({ data: null, error: { message: 'unknown rpc' } });
+    });
     configureTables({ recruiter_memberships: { role, active: true } });
+  }
+
+  /** Mock a verified token whose email is NOT a company address. */
+  function mockNonCompanyEmail() {
+    mockAuthGetUser.mockResolvedValue({
+      data: {
+        user: {
+          id: 'outsider-1',
+          email: 'outsider@gmail.com',
+          email_confirmed_at: '2026-01-01T00:00:00.000Z',
+          app_metadata: { app_role: 'viewer', org_id: null, active: true },
+        },
+      },
+      error: null,
+    });
   }
 
   beforeEach(() => {
@@ -629,6 +663,11 @@ describe('POST /api/livekit/:sessionId/recording (hardened upload)', () => {
     mockCreateSignedUrl.mockResolvedValue({ data: { signedUrl: SIGNED_URL }, error: null });
     mockRemove.mockResolvedValue({ data: null, error: null });
     mockRpc.mockImplementation((fn: string) => {
+      if (fn === 'resolve_allowlist_access') {
+        // Fail-closed default: unless a test explicitly allowlists the
+        // recruiter (mockRecruiterAuth), the access resolver denies.
+        return Promise.resolve({ data: { status: 'denied' }, error: null });
+      }
       if (fn === 'finalize_recording_upload') {
         return Promise.resolve({ data: { status: 'ok' }, error: null });
       }
@@ -898,6 +937,130 @@ describe('POST /api/livekit/:sessionId/recording (hardened upload)', () => {
       .set('Authorization', AUTH_HEADER)
       .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
     expect(res.status).toBe(200);
+  });
+
+  // ── HELLO allowlist gate on the recruiter upload path (0016) ─────
+  // Regression: the in-route recruiter auth now uses the SAME shared
+  // resolveFullAuth seam as the global middleware — a valid old JWT and an
+  // active membership row are NOT enough; the allowlist resolver must pass.
+
+  it('rejects a valid JWT + active membership when the allowlist entry is MISSING (403)', async () => {
+    // Verified company email but NO allowlist entry (default RPC → denied).
+    mockAuthGetUser.mockResolvedValue({
+      data: {
+        user: {
+          id: 'outsider-1',
+          email: 'outsider@interviewkickstart.com',
+          email_confirmed_at: '2026-01-01T00:00:00.000Z',
+          app_metadata: { app_role: 'admin', org_id: null, active: true },
+        },
+      },
+      error: null,
+    });
+    configureTables({
+      recruiter_memberships: { role: 'admin', active: true }, // stale active membership
+      call_sessions: UPLOAD_SESSION,
+    });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('Authorization', AUTH_HEADER)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe('access_denied');
+    expect(mockUpload).not.toHaveBeenCalled();
+    expect(mockRpc).toHaveBeenCalledWith(
+      'resolve_allowlist_access',
+      expect.objectContaining({ p_email: 'outsider@interviewkickstart.com' }),
+    );
+  });
+
+  it('rejects a valid JWT + active membership when the allowlist entry is INACTIVE/disabled (403)', async () => {
+    mockAuthGetUser.mockResolvedValue({
+      data: {
+        user: {
+          id: 'disabled-1',
+          email: 'disabled@interviewkickstart.com',
+          email_confirmed_at: '2026-01-01T00:00:00.000Z',
+          app_metadata: { app_role: 'viewer', org_id: null, active: true },
+        },
+      },
+      error: null,
+    });
+    // Resolver denies because the entry is inactive (uniform 'denied' —
+    // indistinguishable from missing at the API boundary, by design).
+    mockRpc.mockImplementation((fn: string) => {
+      if (fn === 'resolve_allowlist_access') {
+        return Promise.resolve({ data: { status: 'denied' }, error: null });
+      }
+      return Promise.resolve({ data: null, error: { message: 'unknown rpc' } });
+    });
+    configureTables({
+      recruiter_memberships: { role: 'viewer', active: true }, // stale active membership
+      call_sessions: UPLOAD_SESSION,
+    });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('Authorization', AUTH_HEADER)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe('access_denied');
+    expect(mockUpload).not.toHaveBeenCalled();
+  });
+
+  it('rejects a verified NON-COMPANY email (wrong domain) even with a valid JWT (403)', async () => {
+    mockNonCompanyEmail();
+    configureTables({
+      recruiter_memberships: { role: 'viewer', active: true },
+      call_sessions: UPLOAD_SESSION,
+    });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('Authorization', AUTH_HEADER)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe('access_denied');
+    // Denied BEFORE the RPC — the domain gate runs in the shared seam.
+    expect(mockRpc).not.toHaveBeenCalledWith('resolve_allowlist_access', expect.anything());
+    expect(mockUpload).not.toHaveBeenCalled();
+  });
+
+  it('accepts a valid ALLOWLISTED recruiter via the shared seam (200)', async () => {
+    mockRecruiterAuth('viewer', 'viewer-1');
+    configureTables({
+      recruiter_memberships: { role: 'viewer', active: true },
+      call_sessions: UPLOAD_SESSION,
+    });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('Authorization', AUTH_HEADER)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(200);
+    expect(mockRpc).toHaveBeenCalledWith(
+      'resolve_allowlist_access',
+      expect.objectContaining({ p_email: 'viewer@interviewkickstart.com' }),
+    );
+    expect(mockUpload).toHaveBeenCalled();
+  });
+
+  it('grant-token path is UNCHANGED — succeeds without bearer and without an allowlist entry (200)', async () => {
+    // Default allowlist resolver DENIES (fail-closed) — grant uploads must
+    // not depend on it at all.
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      call_sessions: UPLOAD_SESSION,
+    });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(200);
+    expect(mockRpc).not.toHaveBeenCalledWith('resolve_allowlist_access', expect.anything());
+    expect(mockUpload).toHaveBeenCalled();
   });
 
   // ── 409 second upload (quota / upsert:false) ──────────────────────

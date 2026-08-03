@@ -1214,3 +1214,72 @@ describe('LLM-06 provenance integration', () => {
     }
   });
 });
+
+// ════════════════════════════════════════════════════════════════════
+//  HELLO access allowlist (0016) — schema boundary validation
+//  (Server-side normalization + duplicate detection live in the RPC; the
+//  API schema only bounds transport, the role enum, and the uuid param.)
+// ════════════════════════════════════════════════════════════════════
+
+describe('admin allowlist schema boundary (0016)', () => {
+  function app() {
+    return createAuthedApp();
+  }
+
+  it('POST /api/admin/allowlist rejects empty/whitespace email and oversized email', async () => {
+    const a = app();
+    expect((await $r(a).post('/api/admin/allowlist').send({ email: '' })).status).toBe(400);
+    expect((await $r(a).post('/api/admin/allowlist').send({ email: '   ' })).status).toBe(400);
+    expect(
+      (await $r(a).post('/api/admin/allowlist').send({ email: 'a'.repeat(321) + '@interviewkickstart.com' })).status,
+    ).toBe(400);
+  });
+
+  it('POST /api/admin/allowlist rejects unknown keys (strict) and invalid roles', async () => {
+    const a = app();
+    const unknown = await $r(a)
+      .post('/api/admin/allowlist')
+      .send({ email: 'gopu@interviewkickstart.com', actor_id: validUUID(), role: 'admin' });
+    expect(unknown.status).toBe(400);
+    expect(isValidationError(unknown)).toBe(true);
+
+    const badRole = await $r(a)
+      .post('/api/admin/allowlist')
+      .send({ email: 'gopu@interviewkickstart.com', role: 'superuser' });
+    expect(badRole.status).toBe(400);
+    expect(isValidationError(badRole)).toBe(true);
+  });
+
+  it('POST schema accepts a role-optional add (viewer default) and bounded email', async () => {
+    const { adminAllowlistAddSchema } = await import('../schemas/admin.js');
+    const parsed = adminAllowlistAddSchema.safeParse({ email: 'gopu@interviewkickstart.com' });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) expect(parsed.data.role).toBe('viewer');
+    // Rejects oversized / empty / unknown keys at the schema itself.
+    expect(adminAllowlistAddSchema.safeParse({ email: 'a'.repeat(321) + '@interviewkickstart.com' }).success).toBe(false);
+    expect(adminAllowlistAddSchema.safeParse({ email: '' }).success).toBe(false);
+    expect(adminAllowlistAddSchema.safeParse({ email: 'x@interviewkickstart.com', actor_id: 'u' }).success).toBe(false);
+  });
+
+  it('PATCH /api/admin/allowlist/:id rejects non-UUID id, empty body, unknown keys, invalid role', async () => {
+    const a = app();
+    expect((await $r(a).patch('/api/admin/allowlist/not-a-uuid').send({ active: true })).status).toBe(400);
+    expect((await $r(a).patch(`/api/admin/allowlist/${validUUID()}`).send({})).status).toBe(400);
+    expect(
+      (await $r(a).patch(`/api/admin/allowlist/${validUUID()}`).send({ role: 'admin', forged: 1 })).status,
+    ).toBe(400);
+    expect(
+      (await $r(a).patch(`/api/admin/allowlist/${validUUID()}`).send({ role: 'superuser' })).status,
+    ).toBe(400);
+  });
+
+  it('PATCH schema accepts role and/or active, rejects neither and invalid role', async () => {
+    const { adminAllowlistUpdateSchema } = await import('../schemas/admin.js');
+    for (const body of [{ active: false }, { role: 'viewer' }, { role: 'admin', active: true }]) {
+      expect(adminAllowlistUpdateSchema.safeParse(body).success, JSON.stringify(body)).toBe(true);
+    }
+    expect(adminAllowlistUpdateSchema.safeParse({}).success).toBe(false);
+    expect(adminAllowlistUpdateSchema.safeParse({ role: 'superuser' }).success).toBe(false);
+    expect(adminAllowlistUpdateSchema.safeParse({ active: false, forged: 1 }).success).toBe(false);
+  });
+});

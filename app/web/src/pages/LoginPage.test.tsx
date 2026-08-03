@@ -2,11 +2,14 @@
  * LoginPage tests.
  *
  * Verifies:
- *   - Renders email/password form with labels
+ *   - Renders email/password form with labels and HELLO branding
  *   - Redirects to /candidates if already authenticated
- *   - Shows error on invalid credentials
- *   - SSO buttons hidden when VITE_SSO_PROVIDERS is unset
- *   - SSO buttons visible when configured
+ *   - Shows generic error on invalid credentials (never leaks allowlist state)
+ *   - Company-only access messaging (exact @interviewkickstart.com domain)
+ *   - Soft inline hint for non-company emails (UX only — server enforces)
+ *   - Google Workspace button hidden when VITE_SSO_PROVIDERS is unset
+ *   - Google Workspace button visible when configured
+ *   - Generic SSO error (never leaks OAuth configuration)
  *   - Form validation (empty fields)
  *   - Accessibility: axe violations
  */
@@ -16,6 +19,7 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Routes, Route } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { LoginPage } from './LoginPage';
+import { ALLOWED_EMAIL_DOMAIN, isCompanyEmail } from '../lib/auth';
 
 // ── Mock useAuth ───────────────────────────────────────────────────────
 
@@ -30,6 +34,12 @@ vi.mock('../lib/auth', () => ({
     isAuthenticated: mockIsAuthenticated,
     isLoading: false,
   }),
+  ALLOWED_EMAIL_DOMAIN: 'interviewkickstart.com',
+  isCompanyEmail: (raw: string) => {
+    const t = raw.trim().toLowerCase();
+    const at = t.indexOf('@');
+    return at !== -1 && t.indexOf('@', at + 1) === -1 && t.slice(at + 1) === 'interviewkickstart.com';
+  },
 }));
 
 function renderLoginPage() {
@@ -57,13 +67,26 @@ describe('LoginPage', () => {
     delete import.meta.env.VITE_SSO_PROVIDERS;
   });
 
-  it('renders the sign-in form', () => {
+  it('renders the sign-in form with HELLO branding and company-only messaging', () => {
     renderLoginPage();
-    expect(screen.getByText('Maya Screen')).toBeInTheDocument();
+    expect(screen.getByText('HELLO')).toBeInTheDocument();
+    expect(screen.getByText(/Talent Workspace & Mission Control/)).toBeInTheDocument();
     expect(screen.getByText('Recruiter sign-in')).toBeInTheDocument();
     expect(screen.getByLabelText('Email')).toBeInTheDocument();
     expect(screen.getByLabelText('Password')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Sign in' })).toBeInTheDocument();
+    expect(
+      screen.getByText(`@${ALLOWED_EMAIL_DOMAIN}`, { exact: false }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Access is limited to authorised team members/),
+    ).toBeInTheDocument();
+  });
+
+  it('renders the brand logo on a neutral plate with a proper alt', () => {
+    renderLoginPage();
+    const img = screen.getByAltText('InterviewKickstart logo');
+    expect(img).toHaveAttribute('src', '/ik-logo.png');
   });
 
   it('redirects to /candidates if already authenticated', async () => {
@@ -80,28 +103,26 @@ describe('LoginPage', () => {
     renderLoginPage();
 
     const user = userEvent.setup();
-    await user.type(screen.getByLabelText('Email'), 'test@example.com');
+    await user.type(screen.getByLabelText('Email'), 'gopu.nair@interviewkickstart.com');
     await user.type(screen.getByLabelText('Password'), 'password123');
     await user.click(screen.getByRole('button', { name: 'Sign in' }));
 
     await waitFor(() => {
-      expect(mockSignIn).toHaveBeenCalledWith('test@example.com', 'password123');
+      expect(mockSignIn).toHaveBeenCalledWith('gopu.nair@interviewkickstart.com', 'password123');
     });
   });
 
-  it('shows generic error on failed sign-in', async () => {
+  it('shows a generic error on failed sign-in (never leaks allowlist state)', async () => {
     mockSignIn.mockResolvedValue({ error: new Error('Invalid login credentials') });
     renderLoginPage();
 
     const user = userEvent.setup();
-    await user.type(screen.getByLabelText('Email'), 'test@example.com');
+    await user.type(screen.getByLabelText('Email'), 'gopu.nair@interviewkickstart.com');
     await user.type(screen.getByLabelText('Password'), 'wrongpassword');
     await user.click(screen.getByRole('button', { name: 'Sign in' }));
 
     expect(
-      await screen.findByText(
-        'Invalid credentials. Please check your email and password.',
-      ),
+      await screen.findByText('Unable to sign in. Please check your details and try again.'),
     ).toBeInTheDocument();
   });
 
@@ -116,44 +137,94 @@ describe('LoginPage', () => {
     ).toBeInTheDocument();
   });
 
-  it('does not show SSO buttons when VITE_SSO_PROVIDERS is not set', () => {
+  it('shows a soft company-email hint for a non-company address (UX only)', async () => {
     renderLoginPage();
-    expect(screen.queryByText('Google')).not.toBeInTheDocument();
-    expect(screen.queryByText('GitHub')).not.toBeInTheDocument();
+
+    const user = userEvent.setup();
+    await user.type(screen.getByLabelText('Email'), 'gopu@gmail.com');
+
+    expect(
+      await screen.findByText(`Company accounts only — use your @${ALLOWED_EMAIL_DOMAIN} email.`),
+    ).toBeInTheDocument();
+  });
+
+  it('does not show the company-email hint for a valid company address', async () => {
+    renderLoginPage();
+
+    const user = userEvent.setup();
+    await user.type(screen.getByLabelText('Email'), 'gopu.nair@interviewkickstart.com');
+
+    expect(
+      screen.queryByText(/Company accounts only/),
+    ).not.toBeInTheDocument();
+  });
+
+  it('does not show Google Workspace button when VITE_SSO_PROVIDERS is not set', () => {
+    renderLoginPage();
+    expect(screen.queryByText(/Continue with Google Workspace/)).not.toBeInTheDocument();
     expect(screen.queryByText('or continue with')).not.toBeInTheDocument();
   });
 
-  it('shows SSO buttons when VITE_SSO_PROVIDERS is set', () => {
-    import.meta.env.VITE_SSO_PROVIDERS = 'google,github';
+  it('shows the Google Workspace button when VITE_SSO_PROVIDERS includes google', () => {
+    import.meta.env.VITE_SSO_PROVIDERS = 'google';
     renderLoginPage();
 
-    expect(screen.getByText('Google')).toBeInTheDocument();
-    expect(screen.getByText('GitHub')).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /Continue with Google Workspace/ }),
+    ).toBeInTheDocument();
     expect(screen.getByText('or continue with')).toBeInTheDocument();
   });
 
-  it('calls signInWithSSO when SSO button clicked', async () => {
+  it('calls signInWithSSO when the Google Workspace button is clicked', async () => {
     import.meta.env.VITE_SSO_PROVIDERS = 'google';
     mockSignInWithSSO.mockResolvedValue(undefined);
     renderLoginPage();
 
     const user = userEvent.setup();
-    await user.click(screen.getByText('Google'));
+    await user.click(screen.getByRole('button', { name: /Continue with Google Workspace/ }));
 
     await waitFor(() => {
       expect(mockSignInWithSSO).toHaveBeenCalledWith('google');
     });
   });
 
-  it('shows message noting sign-up is not available', () => {
+  it('shows a generic SSO error (never leaks OAuth/allowlist configuration)', async () => {
+    import.meta.env.VITE_SSO_PROVIDERS = 'google';
+    mockSignInWithSSO.mockRejectedValue(new Error('provider not configured'));
     renderLoginPage();
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: /Continue with Google Workspace/ }));
+
     expect(
-      screen.getByText('Authorised recruiters only. Sign-up is not available.'),
+      await screen.findByText(
+        'Sign-in with Google is unavailable right now. Please try again later.',
+      ),
     ).toBeInTheDocument();
   });
 
   it('has no axe violations', async () => {
     const { container } = renderLoginPage();
     await expect(container).toHaveNoViolations();
+  });
+});
+
+// ── isCompanyEmail (UX helper) unit tests ─────────────────────────────
+
+describe('isCompanyEmail (UX-only helper)', () => {
+  it('accepts exact company-domain emails (case/whitespace tolerant)', () => {
+    expect(isCompanyEmail('gopu.nair@interviewkickstart.com')).toBe(true);
+    expect(isCompanyEmail('  GOPU.NAIR@InterviewKickStart.COM  ')).toBe(true);
+  });
+
+  it('rejects non-company domains', () => {
+    expect(isCompanyEmail('gopu@gmail.com')).toBe(false);
+    expect(isCompanyEmail('gopu@interviewkickstart.com.evil.test')).toBe(false);
+    expect(isCompanyEmail('gopu@sub.interviewkickstart.com')).toBe(false);
+  });
+
+  it('rejects multi-@ and unicode lookalikes', () => {
+    expect(isCompanyEmail('a@b@interviewkickstart.com')).toBe(false);
+    expect(isCompanyEmail('gopu＠interviewkickstart.com')).toBe(false);
   });
 });

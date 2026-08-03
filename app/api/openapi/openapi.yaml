@@ -1797,6 +1797,111 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
 
+  # ── HELLO access allowlist (0016): normalized-email access gate ─────
+  /api/admin/allowlist:
+    get:
+      tags: [admin]
+      operationId: listAdminAllowlist
+      summary: Admin-only list of normalized-email allowlist entries (id, email, role, active, linked_user_id, linked_at).
+      responses:
+        '200':
+          description: Allowlist entries (oldest first).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminAllowlistListResponse'
+        '403':
+          description: Non-admin denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+    post:
+      tags: [admin]
+      operationId: addAdminAllowlistEntry
+      summary: Add an allowlist email via the atomic add_allowlist_entry RPC (audit in the same transaction; metadata never contains the full email). Actor derived from auth.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminAllowlistAddRequest'
+      responses:
+        '201':
+          description: Entry created (active by default).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminAllowlistAddResponse'
+        '400':
+          description: invalid_email / invalid_role (server-side normalization identical to the resolver).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Non-admin denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: duplicate normalized email (case/whitespace variants conflict).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/admin/allowlist/{id}:
+    patch:
+      tags: [admin]
+      operationId: updateAdminAllowlistEntry
+      summary: Update/disable/demote an allowlist entry via the atomic update_allowlist_entry RPC (audit in the same transaction). Self-disable/demote and last-linked-active-admin removal are rejected.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminAllowlistUpdateRequest'
+      responses:
+        '200':
+          description: Entry updated (propagated to the linked membership row).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminAllowlistUpdateResponse'
+        '400':
+          description: invalid_role / no_changes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Non-admin denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Entry not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: self_modification_denied / last_linked_active_admin.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
   # ── Phase 9: recruiter notes + candidate status transitions ────────
   /api/notes:
     get:
@@ -4114,6 +4219,87 @@ components:
           type: string
           minLength: 1
           maxLength: 200
+      additionalProperties: false
+
+    # ── HELLO access allowlist (0016) ────────────────────────────────
+    AdminAllowlistRow:
+      type: object
+      required: [id, email, role, active, linked_user_id, linked_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          description: Canonical company email (admin management surface only — never in audit metadata).
+        role:
+          type: string
+          enum: [admin, interviewer, viewer]
+        active:
+          type: boolean
+        linked_user_id:
+          type: string
+          format: uuid
+          nullable: true
+        linked_at:
+          type: string
+          format: date-time
+          nullable: true
+      additionalProperties: false
+
+    AdminAllowlistListResponse:
+      type: object
+      required: [entries]
+      properties:
+        entries:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminAllowlistRow'
+      additionalProperties: false
+
+    AdminAllowlistAddRequest:
+      type: object
+      required: [email]
+      properties:
+        email:
+          type: string
+          description: Company email; normalized/validated server-side (exact domain interviewkickstart.com).
+          minLength: 1
+          maxLength: 320
+        role:
+          type: string
+          enum: [admin, interviewer, viewer]
+          default: viewer
+      additionalProperties: false
+
+    AdminAllowlistAddResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+        id:
+          type: string
+          format: uuid
+          nullable: true
+      additionalProperties: false
+
+    AdminAllowlistUpdateRequest:
+      type: object
+      properties:
+        role:
+          type: string
+          enum: [admin, interviewer, viewer]
+        active:
+          type: boolean
+      additionalProperties: false
+
+    AdminAllowlistUpdateResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
       additionalProperties: false
 
     # ── Phase 9: notes / status transitions ──────────────────────────

@@ -4,7 +4,31 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Maya Screen — AI HR Screening</title>
+    <meta
+      name="description"
+      content="HELLO — InterviewKickstart talent workspace and mission control."
+    />
+    <title>HELLO — Talent Workspace &amp; Mission Control</title>
+    <script>
+      // Theme bootstrap — prevents a white flash when the persisted/system
+      // theme is dark. Must stay in sync with src/lib/theme.tsx (storage key
+      // `hello.theme`). Safe: pure DOM + matchMedia, no eval, no external
+      // resources, wrapped in try/catch.
+      (function () {
+        try {
+          var mode = localStorage.getItem('hello.theme');
+          var dark =
+            mode === 'dark' ||
+            ((mode === 'system' || mode === null) &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches);
+          var root = document.documentElement;
+          root.classList.toggle('dark', dark);
+          root.style.colorScheme = dark ? 'dark' : 'light';
+        } catch (err) {
+          /* storage unavailable — default light */
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

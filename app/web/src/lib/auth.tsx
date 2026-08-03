@@ -104,6 +104,34 @@ function getSsoProviders(): string[] {
     .filter(Boolean);
 }
 
+/* ── Company-email access gate (UX helpers — NEVER authorization) ─── */
+
+/**
+ * The ONLY accepted email domain for dashboard access (Google Workspace
+ * company account). Enforced server-side by the allowlist resolver;
+ * these helpers only drive login-page messaging.
+ */
+export const ALLOWED_EMAIL_DOMAIN = 'interviewkickstart.com';
+
+/**
+ * UX-only company-email check (never authorization — the API enforces the
+ * allowlist with the verified Supabase email). Mirrors the server's strict
+ * ASCII trim+lower normalization for inline hints: exactly one '@' and the
+ * exact domain interviewkickstart.com.
+ */
+export function isCompanyEmail(raw: string): boolean {
+  if (typeof raw !== 'string') return false;
+  const trimmed = raw.trim();
+  // Strict ASCII — unicode lookalikes are never a company account.
+  if (/[^\x20-\x7E]/.test(trimmed)) return false;
+  const lower = trimmed.toLowerCase();
+  const angle = /^.*<([^<>]+)>$/.exec(lower);
+  const email = (angle ? angle[1] : lower).trim();
+  const at = email.indexOf('@');
+  if (at === -1 || email.indexOf('@', at + 1) !== -1) return false;
+  return email.slice(at + 1) === ALLOWED_EMAIL_DOMAIN;
+}
+
 /* ── Helper: get AAL from getAuthenticatorAssuranceLevel ──────────── */
 
 async function getAalLevel(): Promise<AAL> {

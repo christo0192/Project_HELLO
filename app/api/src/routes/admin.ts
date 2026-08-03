@@ -16,6 +16,9 @@ import { supabase } from '../lib/supabase.js';
 import { requireAdmin } from '../lib/rbac.js';
 import { validateBody, validateParams, validateQuery } from '../lib/validation.js';
 import {
+  adminAllowlistAddSchema,
+  adminAllowlistIdParamSchema,
+  adminAllowlistUpdateSchema,
   adminAuditListQuerySchema,
   adminMaintenanceSchema,
   adminMemberUpdateSchema,
@@ -355,6 +358,126 @@ adminRouter.post(
           return res.status(400).json({ error: 'invalid_reason' });
         default:
           return next(new Error('session override failed'));
+      }
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+// ════════════════════════════════════════════════════════════════════
+//  HELLO access allowlist (0016) — admin management of the normalized-
+//  email access gate. Every mutation is audited atomically inside its RPC;
+//  audit metadata never contains the full email (SHA-256 digest only).
+// ════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /api/admin/allowlist
+ * Admin-only list of allowlist entries: id, email, role, active,
+ * linked_user_id, linked_at. Emails are shown to admins (management
+ * surface); they never reach audit metadata or non-admin responses.
+ */
+adminRouter.get('/allowlist', async (_req, res, next) => {
+  try {
+    const { data, error } = await supabase
+      .from('email_allowlist')
+      .select('id, email, role, active, linked_user_id, linked_at, created_at')
+      .order('created_at', { ascending: true });
+    if (error) return next(new Error('failed to list allowlist'));
+
+    const entries = (data ?? []).map((r) => ({
+      id: r.id,
+      email: r.email,
+      role: r.role,
+      active: r.active === true,
+      linked_user_id: r.linked_user_id ?? null,
+      linked_at: r.linked_at ?? null,
+    }));
+    res.json({ entries });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /api/admin/allowlist
+ * Add an allowlist entry via the atomic add_allowlist_entry RPC (audit row
+ * in the same transaction). Normalization happens server-side identically
+ * to the resolver; duplicate case/whitespace variants are rejected.
+ * Stable statuses: 201 ok, 400 invalid_email / invalid_role, 409 duplicate.
+ * Actor id is derived from auth — never accepted from the client.
+ */
+adminRouter.post(
+  '/allowlist',
+  validateBody(adminAllowlistAddSchema),
+  async (req, res, next) => {
+    try {
+      const { data, error } = await supabase.rpc('add_allowlist_entry', {
+        p_email: req.body.email,
+        p_role: req.body.role ?? 'viewer',
+        p_actor_id: req.authUser?.id ?? null,
+      });
+      if (error) return next(new Error('failed to add allowlist entry'));
+
+      const record = data as { status?: string; id?: string } | null;
+      const status = record?.status;
+      switch (status) {
+        case 'ok':
+          return res.status(201).json({ ok: true, id: record?.id ?? null });
+        case 'invalid_email':
+          return res.status(400).json({ error: 'invalid_email' });
+        case 'invalid_role':
+          return res.status(400).json({ error: 'invalid_role' });
+        case 'duplicate':
+          return res.status(409).json({ error: 'duplicate' });
+        default:
+          return next(new Error('allowlist add failed'));
+      }
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+/**
+ * PATCH /api/admin/allowlist/:id
+ * Update/disable/demote an allowlist entry via the atomic
+ * update_allowlist_entry RPC (audit row in the same transaction).
+ * Stable errors: 404 not_found, 409 self_modification_denied /
+ * last_linked_active_admin, 400 invalid_role / no_changes.
+ * Role/active changes propagate to the linked membership row atomically.
+ */
+adminRouter.patch(
+  '/allowlist/:id',
+  validateParams(adminAllowlistIdParamSchema),
+  validateBody(adminAllowlistUpdateSchema),
+  async (req, res, next) => {
+    try {
+      const entryId = req.params.id as string;
+      const { data, error } = await supabase.rpc('update_allowlist_entry', {
+        p_entry_id: entryId,
+        p_role: req.body.role ?? null,
+        p_active: req.body.active ?? null,
+        p_actor_id: req.authUser?.id ?? null,
+      });
+      if (error) return next(new Error('failed to update allowlist entry'));
+
+      const status = (data as { status?: string } | null)?.status;
+      switch (status) {
+        case 'ok':
+          return res.json({ ok: true });
+        case 'not_found':
+          return res.status(404).json({ error: 'not_found' });
+        case 'self_modification_denied':
+          return res.status(409).json({ error: 'self_modification_denied' });
+        case 'last_linked_active_admin':
+          return res.status(409).json({ error: 'last_linked_active_admin' });
+        case 'invalid_role':
+          return res.status(400).json({ error: 'invalid_role' });
+        case 'no_changes':
+          return res.status(400).json({ error: 'no_changes' });
+        default:
+          return next(new Error('allowlist update failed'));
       }
     } catch (error) {
       next(error);

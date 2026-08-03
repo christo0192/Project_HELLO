@@ -893,8 +893,8 @@ describe('OpenAPI document integrity', () => {
     const paths = spec.paths as YMap;
     const schemas = ((spec as YMap).components as YMap).schemas as YMap;
     const securitySchemes = ((spec as YMap).components as YMap).securitySchemes as YMap;
-    expect(Object.keys(paths).length).toBe(55);
-    expect(Object.keys(schemas).length).toBe(119);
+    expect(Object.keys(paths).length).toBe(57);
+    expect(Object.keys(schemas).length).toBe(125);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.
@@ -1927,6 +1927,79 @@ describe('live handler shapes match documented schemas', () => {
       .send({ scope: 'global', enabled: true });
     expect(res.status).toBe(200);
     expect(validateResponseBody(res.body, 'QuotaPolicyUpdateResponse', spec)).toEqual([]);
+  });
+
+  // ── HELLO access allowlist (0016): normalized-email access gate ──
+  it('GET /api/admin/allowlist → AdminAllowlistListResponse (admin-only, no internal fields)', async () => {
+    configureTables({
+      email_allowlist: ok([
+        {
+          id: UUID_3,
+          email: 'gopu.nair@interviewkickstart.com',
+          role: 'admin',
+          active: true,
+          linked_user_id: null,
+          linked_at: null,
+          created_at: T_2026,
+          updated_at: T_2026,
+          email_normalized: 'should-never-leak',
+        },
+      ]),
+    });
+    const app = createContractApp();
+    const res = await request(app).get('/api/admin/allowlist').set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'AdminAllowlistListResponse', spec)).toEqual([]);
+    expect(res.body.entries).toHaveLength(1);
+    expect(res.body.entries[0].email).toBe('gopu.nair@interviewkickstart.com');
+    expect(JSON.stringify(res.body)).not.toContain('email_normalized');
+    expect(JSON.stringify(res.body)).not.toContain('updated_at');
+  });
+
+  it('POST /api/admin/allowlist → 201 AdminAllowlistAddResponse (atomic RPC + audit)', async () => {
+    mockRpc.mockResolvedValue({ data: { status: 'ok', id: UUID_3 }, error: null });
+    const app = createContractApp();
+    const res = await request(app)
+      .post('/api/admin/allowlist')
+      .set('Authorization', AUTH_HEADER)
+      .send({ email: 'alice@interviewkickstart.com', role: 'interviewer' });
+    expect(res.status).toBe(201);
+    expect(validateResponseBody(res.body, 'AdminAllowlistAddResponse', spec)).toEqual([]);
+    expect(res.body.ok).toBe(true);
+  });
+
+  it('PATCH /api/admin/allowlist/{id} → AdminAllowlistUpdateResponse', async () => {
+    mockRpc.mockResolvedValue({ data: { status: 'ok' }, error: null });
+    const app = createContractApp();
+    const res = await request(app)
+      .patch(`/api/admin/allowlist/${UUID_3}`)
+      .set('Authorization', AUTH_HEADER)
+      .send({ active: false });
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'AdminAllowlistUpdateResponse', spec)).toEqual([]);
+  });
+
+  it('allowlist routes are protected: unauthenticated → 401, non-admin → 403', async () => {
+    const unauth = createUnauthedApp();
+    const noAuth = await request(unauth).get('/api/admin/allowlist');
+    expect(noAuth.status).toBe(401);
+    expect(noAuth.body.error.type).toBe('authentication_error');
+
+    const viewer: AuthUser = {
+      id: 'user-view-0000-0000-000000000003',
+      email: 'viewer@example.com',
+      aal: 'aal1',
+      active: true,
+      appRole: 'viewer',
+      orgId: null,
+    };
+    const viewerApp = createApp({ authDeps: { getUser: mockAuthGetUser(viewer, JWT_ADMIN) } });
+    const forbidden = await request(viewerApp)
+      .post('/api/admin/allowlist')
+      .set('Authorization', AUTH_HEADER)
+      .send({ email: 'alice@interviewkickstart.com' });
+    expect(forbidden.status).toBe(403);
+    expect(forbidden.body.error.type).toBe('authorization_error');
   });
 });
 

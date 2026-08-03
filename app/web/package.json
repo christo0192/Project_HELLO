@@ -15,7 +15,10 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.108.2",
+    "echarts": "^6.1.0",
+    "echarts-for-react": "^3.0.6",
     "livekit-client": "^2.20.0",
+    "motion": "^12.43.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "react-router-dom": "^7.18.0"

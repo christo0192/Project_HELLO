@@ -60,6 +60,14 @@ export interface AuthUser {
   appRole: 'admin' | 'interviewer' | 'viewer';
   /** Organization scope (admin within one org). Null for viewers. */
   orgId: string | null;
+  /**
+   * Whether the email is CONFIRMED/verified by Supabase Auth
+   * (email_confirmed_at is set). Access gate input — never trust OAuth hd.
+   * Optional so injected test users that predate the gate keep compiling;
+   * the live access resolver treats missing/undefined as UNVERIFIED
+   * (fail closed).
+   */
+  emailVerified?: boolean;
 }
 
 /**
@@ -69,6 +77,25 @@ export type AuthResult =
   | { ok: true; user: AuthUser }
   | { ok: false; status: 401; message: string }
   | { ok: false; status: 403; message: string };
+
+/**
+ * Result of the per-request access resolution (allowlist + domain gate).
+ * A non-ok result maps to a uniform generic 403 — identical for wrong
+ * domain, not-allowlisted, inactive, disabled, and relink denials.
+ */
+export type AccessResolution =
+  | { ok: true; role: 'admin' | 'interviewer' | 'viewer'; active: boolean }
+  | { ok: false; status: 403 };
+
+/**
+ * Access resolver signature — injectable test seam. Called by the auth
+ * middleware on EVERY request (live default: resolve_allowlist_access RPC).
+ */
+export type AccessResolver = (
+  userId: string,
+  email: string,
+  emailVerified: boolean,
+) => Promise<AccessResolution>;
 
 /**
  * Verifier function signature — injectable test seam.
@@ -83,17 +110,86 @@ export type MembershipResolver = (userId: string) => Promise<{
   active: boolean;
 } | null>;
 
-async function defaultMembershipResolver(userId: string): Promise<{
-  role: 'admin' | 'interviewer' | 'viewer';
-  active: boolean;
-} | null> {
-  const { data, error } = await getClient()
-    .from('recruiter_memberships')
-    .select('role,active')
-    .eq('user_id', userId)
-    .single();
-  if (error || !data || !['admin', 'interviewer', 'viewer'].includes(data.role)) return null;
-  return { role: data.role as 'admin' | 'interviewer' | 'viewer', active: data.active === true };
+// ── Access gate: normalized company email allowlist ─────────────────────
+
+/** The ONLY accepted email domain (Google Workspace company account). */
+export const ALLOWED_ACCESS_DOMAIN = 'interviewkickstart.com';
+
+/**
+ * Normalize a Supabase-verified email for the access gate.
+ *
+ * Strict ASCII trim + lower normalization:
+ *   - rejects any non-ASCII (printable-range) character (unicode tricks);
+ *   - trims whitespace and lowercases;
+ *   - strips a "Display Name <email>" wrapper;
+ *   - requires EXACTLY ONE '@';
+ *   - requires a valid local part and dotted domain;
+ *   - requires the EXACT domain interviewkickstart.com (no subdomains,
+ *     no suffix tricks — e.g. a@interviewkickstart.com.evil.test fails).
+ *
+ * Returns null when the email cannot be safely normalized — the caller
+ * must treat that as a 403 (uniform generic denial). OAuth `hd` is NEVER
+ * consulted: only the Supabase-verified user email is authoritative.
+ */
+export function normalizeEmailForAccess(raw: string): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  // Strict ASCII: reject any character outside printable ASCII.
+  if (/[^\x20-\x7E]/.test(trimmed)) return null;
+  const lower = trimmed.toLowerCase();
+  // Strip a "Display Name <email>" wrapper, if any (strict: must end in '>').
+  const angle = /^.*<([^<>]+)>$/.exec(lower);
+  const email = (angle ? angle[1] : lower).trim();
+  // Exactly one '@'.
+  const atIndex = email.indexOf('@');
+  if (atIndex === -1 || email.indexOf('@', atIndex + 1) !== -1) return null;
+  const local = email.slice(0, atIndex);
+  const domain = email.slice(atIndex + 1);
+  if (!/^[a-z0-9._%+\-]+$/.test(local)) return null;
+  if (!/^[a-z0-9.\-]+\.[a-z]{2,}$/.test(domain)) return null;
+  if (domain !== ALLOWED_ACCESS_DOMAIN) return null;
+  return `${local}@${domain}`;
+}
+
+/**
+ * Default live access resolver: normalizes the verified Supabase email,
+ * enforces the exact company domain, then calls the atomic
+ * resolve_allowlist_access SECURITY DEFINER RPC (fixed search_path,
+ * service-role-only). The RPC locks the allowlist entry, rejects
+ * missing/inactive/domain-mismatch/relink, links on first login, and
+ * creates/updates recruiter_memberships from the SERVER-HELD allowlist
+ * role. A disabled entry denies even with a valid old JWT / stale
+ * membership. Every failure path returns the same generic 403.
+ */
+export async function defaultAccessResolver(
+  userId: string,
+  email: string,
+  emailVerified: boolean,
+): Promise<AccessResolution> {
+  // Verified Supabase email required (email_confirmed_at set).
+  if (!emailVerified) return { ok: false, status: 403 };
+  const normalized = normalizeEmailForAccess(email);
+  if (!normalized) return { ok: false, status: 403 };
+  try {
+    const { data, error } = await getClient().rpc('resolve_allowlist_access', {
+      p_user_id: userId,
+      p_email: email,
+    });
+    if (error || !data) return { ok: false, status: 403 };
+    const record = data as { status?: string; role?: string; active?: boolean };
+    if (record.status !== 'ok') return { ok: false, status: 403 };
+    const role = record.role;
+    if (!role || !['admin', 'interviewer', 'viewer'].includes(role)) {
+      return { ok: false, status: 403 };
+    }
+    return {
+      ok: true,
+      role: role as 'admin' | 'interviewer' | 'viewer',
+      active: record.active === true,
+    };
+  } catch {
+    return { ok: false, status: 403 };
+  }
 }
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -229,6 +325,11 @@ function extractAuthUser(
   const isActive: boolean =
     (appMetadata.active as boolean) ?? true;
 
+  // Access gate input: only Supabase-confirmed emails pass the allowlist
+  // gate. OAuth `hd` is a hint only — never authorization.
+  const emailVerified: boolean =
+    (authUser.email_confirmed_at as string | null) != null;
+
   return {
     id: String(authUser.id ?? ''),
     email: (authUser.email as string) ?? null,
@@ -236,6 +337,7 @@ function extractAuthUser(
     active: isActive,
     appRole,
     orgId,
+    emailVerified,
   };
 }
 
@@ -323,15 +425,110 @@ declare global {
 }
 
 /**
+ * Full authorization result: verified token + allowlist access + membership.
+ */
+export type FullAuthResult =
+  | { ok: true; user: AuthUser }
+  | { ok: false; status: 401 | 403; message: string };
+
+/**
+ * SINGLE shared full-authorization seam: bearer token → verified Supabase
+ * email → allowlist/domain access resolver → server-held role → AAL gate.
+ *
+ * Used by BOTH the global requireAuth middleware and the livekit in-route
+ * recruiter auth — there is deliberately NO weaker duplicate implementation.
+ *
+ *   - injected resolveAccess: the caller fully controls the access decision;
+ *   - injected getUser only (legacy seam): the injected verifier encodes the
+ *     server state (app_metadata) — unchanged pre-allowlist behavior;
+ *   - live (no deps): defaultAccessResolver → resolve_allowlist_access RPC,
+ *     which runs on EVERY request and denies inactive/missing/domain-
+ *     mismatched/relinked entries even with a valid old JWT or a stale
+ *     active membership row.
+ *
+ * Every failure path is a uniform generic 401/403 (never 500); resolver
+ * errors fail closed (403).
+ */
+export async function resolveFullAuth(
+  token: string,
+  deps: {
+    getUser?: TokenVerifier;
+    resolveMembership?: MembershipResolver;
+    resolveAccess?: AccessResolver;
+  } = {},
+): Promise<FullAuthResult> {
+  const result = await verifyToken(token, deps);
+  if (!result.ok) return result;
+
+  let access: AccessResolution;
+  try {
+    access = deps.resolveAccess
+      ? await deps.resolveAccess(result.user.id, result.user.email ?? '', result.user.emailVerified ?? false)
+      : deps.getUser
+        ? {
+            // Legacy injected seam: role/active come from the injected
+            // verifier (app_metadata) exactly as before the allowlist.
+            ok: true,
+            role: result.user.appRole,
+            active: result.user.active,
+          }
+        : await defaultAccessResolver(
+            result.user.id,
+            result.user.email ?? '',
+            result.user.emailVerified ?? false,
+          );
+  } catch {
+    // Resolver failure fails closed — never 500, never silently grants.
+    return { ok: false, status: 403, message: 'Insufficient permissions' };
+  }
+  if (!access.ok) {
+    // Uniform generic 403 — never distinguishes wrong-domain from
+    // not-allowlisted/disabled/missing.
+    return { ok: false, status: 403, message: 'Insufficient permissions' };
+  }
+
+  // Membership mirrors the SERVER-HELD role (the resolver RPC just
+  // upserted recruiter_memberships), or the injected resolver when one is
+  // provided. Never the client.
+  let membership: { role: 'admin' | 'interviewer' | 'viewer'; active: boolean } | null;
+  try {
+    membership = deps.resolveMembership
+      ? await deps.resolveMembership(result.user.id)
+      : { role: access.role, active: access.active };
+  } catch {
+    return { ok: false, status: 403, message: 'Insufficient permissions' };
+  }
+  if (!membership || !membership.active) {
+    return { ok: false, status: 403, message: 'Insufficient permissions' };
+  }
+  if ((membership.role === 'admin' || membership.role === 'interviewer') && result.user.aal !== 'aal2') {
+    return { ok: false, status: 403, message: 'Multi-factor authentication required' };
+  }
+
+  return {
+    ok: true,
+    user: {
+      ...result.user,
+      active: true,
+      appRole: membership.role,
+    },
+  };
+}
+
+/**
  * Factory: creates a requireAuth middleware with optional injected deps.
  * When authDeps is provided, its getUser is used instead of the live
  * Supabase Auth client — enabling DI test seams without live provider.
+ *
+ * The middleware is a thin adapter over resolveFullAuth (the single shared
+ * full-authorization seam) — same token → verified email → allowlist
+ * resolver → role/AAL path as every other authenticated surface.
  */
 export function createRequireAuth(authDeps?: {
   getUser?: TokenVerifier;
   resolveMembership?: MembershipResolver;
+  resolveAccess?: AccessResolver;
 }) {
-  const injectedVerifier = Boolean(authDeps?.getUser);
   return (req: Request, res: Response, next: NextFunction): void => {
     const raw = req.headers.authorization;
     const token = extractBearerToken(raw);
@@ -341,37 +538,17 @@ export function createRequireAuth(authDeps?: {
       return;
     }
 
-    verifyToken(token, authDeps ?? {})
+    resolveFullAuth(token, authDeps ?? {})
       .then((result) => {
         if (!result.ok) {
-          res.status(result.status as 401 | 403).json(authErrorBody(result.status as 401 | 403));
+          res.status(result.status).json(authErrorBody(result.status));
           return;
         }
-        const membershipPromise = authDeps?.resolveMembership
-          ? authDeps.resolveMembership(result.user.id)
-          : injectedVerifier
-            ? Promise.resolve({ role: result.user.appRole, active: result.user.active })
-            : defaultMembershipResolver(result.user.id);
-        membershipPromise
-          .then((membership) => {
-            if (!membership || !membership.active) {
-              res.status(403).json(authErrorBody(403));
-              return;
-            }
-            if ((membership.role === 'admin' || membership.role === 'interviewer') && result.user.aal !== 'aal2') {
-              res.status(403).json(authErrorBody(403));
-              return;
-            }
-            req.authUser = {
-              ...result.user,
-              active: true,
-              appRole: membership.role,
-            };
-            next();
-          })
-          .catch(() => res.status(403).json(authErrorBody(403)));
+        req.authUser = result.user;
+        next();
       })
       .catch(() => {
+        // Safety net only — resolveFullAuth never rejects for auth paths.
         res.status(401).json(authErrorBody(401));
       });
   };

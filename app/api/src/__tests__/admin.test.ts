@@ -625,3 +625,221 @@ describe('PATCH /api/admin/quotas/:id (OPS-05)', () => {
     expect(res.status).toBe(403);
   });
 });
+
+// ════════════════════════════════════════════════════════════════════
+//  HELLO access allowlist (0016) — admin management endpoints
+// ════════════════════════════════════════════════════════════════════
+
+describe('GET /api/admin/allowlist (0016)', () => {
+  it('returns entries with id/email/role/active/linked_user_id/linked_at only', async () => {
+    mockFrom.mockReturnValue(
+      chainable({
+        data: [
+          {
+            id: UUID_1,
+            email: 'gopu.nair@interviewkickstart.com',
+            role: 'admin',
+            active: true,
+            linked_user_id: '00000000-0000-4000-8000-0000000000ff',
+            linked_at: '2026-01-01T00:00:00.000Z',
+            created_at: '2026-01-01T00:00:00.000Z',
+            updated_at: '2026-01-01T00:00:00.000Z',
+            email_normalized: 'secret-normalized-field',
+          },
+          {
+            id: '00000000-0000-4000-8000-000000000002',
+            email: 'jerin@interviewkickstart.com',
+            role: 'viewer',
+            active: false,
+            linked_user_id: null,
+            linked_at: null,
+            created_at: '2026-01-01T00:00:00.000Z',
+          },
+        ],
+        error: null,
+      }),
+    );
+    const res = await request(makeApp(makeUser('admin'))).get('/api/admin/allowlist').set(AUTH);
+    expect(res.status).toBe(200);
+    expect(res.body.entries).toHaveLength(2);
+    expect(res.body.entries[0]).toEqual({
+      id: UUID_1,
+      email: 'gopu.nair@interviewkickstart.com',
+      role: 'admin',
+      active: true,
+      linked_user_id: '00000000-0000-4000-8000-0000000000ff',
+      linked_at: '2026-01-01T00:00:00.000Z',
+    });
+    expect(res.body.entries[1]).toEqual({
+      id: '00000000-0000-4000-8000-000000000002',
+      email: 'jerin@interviewkickstart.com',
+      role: 'viewer',
+      active: false,
+      linked_user_id: null,
+      linked_at: null,
+    });
+    // Minimization by construction — never pass through normalized/internal fields.
+    expect(JSON.stringify(res.body)).not.toContain('email_normalized');
+    expect(mockFrom).toHaveBeenCalledWith('email_allowlist');
+  });
+
+  it('non-admin → 403', async () => {
+    const res = await request(makeApp(makeUser('interviewer')))
+      .get('/api/admin/allowlist')
+      .set(AUTH);
+    expect(res.status).toBe(403);
+  });
+});
+
+describe('POST /api/admin/allowlist (0016)', () => {
+  it('adds via add_allowlist_entry RPC with actor derived from auth', async () => {
+    mockRpc.mockResolvedValue({ data: { status: 'ok', id: UUID_1 }, error: null });
+    const res = await request(makeApp(makeUser('admin')))
+      .post('/api/admin/allowlist')
+      .set(AUTH)
+      .send({ email: '  New.Hire@InterviewKickStart.COM  ', role: 'interviewer' });
+    expect(res.status).toBe(201);
+    expect(res.body).toEqual({ ok: true, id: UUID_1 });
+    // The schema trims; case/display-name normalization is authoritative
+    // server-side (identical to the per-request resolver).
+    expect(mockRpc).toHaveBeenCalledWith('add_allowlist_entry', {
+      p_email: 'New.Hire@InterviewKickStart.COM',
+      p_role: 'interviewer',
+      p_actor_id: '00000000-0000-4000-8000-0000000000ff',
+    });
+  });
+
+  it('defaults role to viewer', async () => {
+    mockRpc.mockResolvedValue({ data: { status: 'ok', id: UUID_1 }, error: null });
+    const res = await request(makeApp(makeUser('admin')))
+      .post('/api/admin/allowlist')
+      .set(AUTH)
+      .send({ email: 'new.hire@interviewkickstart.com' });
+    expect(res.status).toBe(201);
+    expect(mockRpc).toHaveBeenCalledWith('add_allowlist_entry', {
+      p_email: 'new.hire@interviewkickstart.com',
+      p_role: 'viewer',
+      p_actor_id: '00000000-0000-4000-8000-0000000000ff',
+    });
+  });
+
+  it('maps invalid_email / invalid_role from the RPC to stable 400', async () => {
+    const app = makeApp(makeUser('admin'));
+    for (const status of ['invalid_email', 'invalid_role']) {
+      mockRpc.mockResolvedValue({ data: { status }, error: null });
+      const res = await request(app)
+        .post('/api/admin/allowlist')
+        .set(AUTH)
+        .send({ email: 'someone@gmail.com', role: 'viewer' });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe(status);
+    }
+  });
+
+  it('maps duplicate (case/whitespace variant) from the RPC to 409', async () => {
+    mockRpc.mockResolvedValue({ data: { status: 'duplicate' }, error: null });
+    const res = await request(makeApp(makeUser('admin')))
+      .post('/api/admin/allowlist')
+      .set(AUTH)
+      .send({ email: 'gopu.nair@interviewkickstart.com' });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe('duplicate');
+  });
+
+  it('rejects empty/missing email and unknown keys at the schema boundary (RPC never called)', async () => {
+    const app = makeApp(makeUser('admin'));
+    expect((await request(app).post('/api/admin/allowlist').set(AUTH).send({ email: '' })).status).toBe(400);
+    expect((await request(app).post('/api/admin/allowlist').set(AUTH).send({})).status).toBe(400);
+    expect((await request(app).post('/api/admin/allowlist').set(AUTH).send({ email: 'x@interviewkickstart.com', actor_id: 'forged' })).status).toBe(400);
+    expect(mockRpc).not.toHaveBeenCalled();
+  });
+
+  it('rejects an invalid role enum', async () => {
+    const res = await request(makeApp(makeUser('admin')))
+      .post('/api/admin/allowlist')
+      .set(AUTH)
+      .send({ email: 'x@interviewkickstart.com', role: 'superuser' });
+    expect(res.status).toBe(400);
+    expect(mockRpc).not.toHaveBeenCalled();
+  });
+
+  it('non-admin → 403', async () => {
+    const res = await request(makeApp(makeUser('viewer', { aal: 'aal1' })))
+      .post('/api/admin/allowlist')
+      .set(AUTH)
+      .send({ email: 'x@interviewkickstart.com' });
+    expect(res.status).toBe(403);
+    expect(mockRpc).not.toHaveBeenCalled();
+  });
+});
+
+describe('PATCH /api/admin/allowlist/:id (0016)', () => {
+  it('updates via update_allowlist_entry RPC and returns ok', async () => {
+    mockRpc.mockResolvedValue({ data: { status: 'ok' }, error: null });
+    const res = await request(makeApp(makeUser('admin')))
+      .patch(`/api/admin/allowlist/${UUID_1}`)
+      .set(AUTH)
+      .send({ active: false });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true });
+    expect(mockRpc).toHaveBeenCalledWith('update_allowlist_entry', {
+      p_entry_id: UUID_1,
+      p_role: null,
+      p_active: false,
+      p_actor_id: '00000000-0000-4000-8000-0000000000ff',
+    });
+  });
+
+  it('rejects self-modification with stable 409 (self-disable/demote guard)', async () => {
+    mockRpc.mockResolvedValue({ data: { status: 'self_modification_denied' }, error: null });
+    const res = await request(makeApp(makeUser('admin')))
+      .patch(`/api/admin/allowlist/${UUID_1}`)
+      .set(AUTH)
+      .send({ active: false });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe('self_modification_denied');
+  });
+
+  it('rejects removing the last linked active admin with stable 409', async () => {
+    mockRpc.mockResolvedValue({ data: { status: 'last_linked_active_admin' }, error: null });
+    const res = await request(makeApp(makeUser('admin')))
+      .patch(`/api/admin/allowlist/${UUID_1}`)
+      .set(AUTH)
+      .send({ role: 'viewer' });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe('last_linked_active_admin');
+  });
+
+  it('404 not_found and 400 invalid_role / no_changes map to stable statuses', async () => {
+    const app = makeApp(makeUser('admin'));
+    mockRpc.mockResolvedValue({ data: { status: 'not_found' }, error: null });
+    expect((await request(app).patch(`/api/admin/allowlist/${UUID_1}`).set(AUTH).send({ active: true })).status).toBe(404);
+    for (const status of ['invalid_role', 'no_changes']) {
+      mockRpc.mockResolvedValue({ data: { status }, error: null });
+      const res = await request(app).patch(`/api/admin/allowlist/${UUID_1}`).set(AUTH).send({ active: true });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe(status);
+    }
+  });
+
+  it('400 when the body has neither role nor active, or the param is not a UUID', async () => {
+    const app = makeApp(makeUser('admin'));
+    const empty = await request(app).patch(`/api/admin/allowlist/${UUID_1}`).set(AUTH).send({});
+    expect(empty.status).toBe(400);
+    expect(mockRpc).not.toHaveBeenCalled();
+    const badId = await request(app)
+      .patch('/api/admin/allowlist/not-a-uuid')
+      .set(AUTH)
+      .send({ active: true });
+    expect(badId.status).toBe(400);
+  });
+
+  it('non-admin → 403', async () => {
+    const res = await request(makeApp(makeUser('interviewer')))
+      .patch(`/api/admin/allowlist/${UUID_1}`)
+      .set(AUTH)
+      .send({ active: false });
+    expect(res.status).toBe(403);
+    expect(mockRpc).not.toHaveBeenCalled();
+  });
+});
