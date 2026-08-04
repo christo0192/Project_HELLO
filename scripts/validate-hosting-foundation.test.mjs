@@ -65,7 +65,6 @@ const expectedPins = [
   "livekit-plugins-openai==1.6.4",
   "livekit-plugins-sarvam==1.6.4",
   "livekit-plugins-silero==1.6.4",
-  "livekit-plugins-turn-detector==1.6.4",
   "python-dotenv==1.2.2",
   "supabase==2.31.0",
   "httpx==0.28.1",

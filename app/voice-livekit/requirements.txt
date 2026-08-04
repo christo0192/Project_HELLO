@@ -11,7 +11,6 @@
 #   livekit-plugins-sarvam    requires-python >=3.10.0      -> 3.12 OK
 #   livekit-plugins-openai    requires-python >=3.10.0      -> 3.12 OK
 #   livekit-plugins-silero    requires-python >=3.10.0      -> 3.12 OK
-#   livekit-plugins-turn-detector requires-python >=3.10.0  -> 3.12 OK
 #   python-dotenv             requires-python >=3.10        -> 3.12 OK
 #   supabase                  requires-python >=3.9         -> 3.12 OK
 #   httpx                     requires-python >=3.8         -> 3.12 OK
@@ -19,13 +18,11 @@
 # Closure notes (verified from PyPI requires_dist, 2026-08-02):
 #   supabase==2.31.0 pins httpx<0.29,>=0.26, so httpx==0.28.1 is in range.
 #   livekit-plugins-sarvam depends on livekit-agents[codecs,openai]>=1.6.4.
-#   livekit-plugins-turn-detector and livekit-plugins-silero are required by
-#   agent.py imports (MultilingualModel; silero.VAD) and are pinned directly.
+#   livekit-plugins-silero is required by agent.py imports and is pinned directly.
 livekit-agents==1.6.4
 livekit-plugins-openai==1.6.4
 livekit-plugins-sarvam==1.6.4
 livekit-plugins-silero==1.6.4
-livekit-plugins-turn-detector==1.6.4
 python-dotenv==1.2.2
 supabase==2.31.0
 httpx==0.28.1

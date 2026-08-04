@@ -362,20 +362,6 @@ PROVIDER_BOUNDARIES: list[dict[str, Any]] = [
         "notes": "silero.VAD.load with bounded tuning values. Local ONNX model; not a network provider.",
     },
     {
-        "id": "livekit-turn-detector",
-        "workloads": ["screening"],
-        "provider": "livekit",
-        "runtime": "voice-livekit",
-        "boundaryKind": "sdk_constructor",
-        "constructorPath": "app/voice-livekit/agent.py",
-        "envVars": [],
-        "allowlists": [],
-        "policyStatus": "PENDING",
-        "notes": (
-            "livekit.plugins.turn_detector.multilingual.MultilingualModel. Local model; not a network provider."
-        ),
-    },
-    {
         "id": "livekit-prompt-construction",
         "workloads": ["screening"],
         "provider": "deepseek",
