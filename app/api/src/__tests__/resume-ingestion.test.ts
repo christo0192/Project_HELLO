@@ -638,7 +638,32 @@ describe('malware-scanner', () => {
 });
 
 // ===================================================================
-//  3. ROUTE INTEGRATION TESTS
+//  3. DETERMINISTIC FALLBACK PARSER TESTS
+// ===================================================================
+
+describe('resume deterministic fallback parser', () => {
+  it('extracts useful facts from readable resume text when the LLM parser fails', async () => {
+    const { fallbackParseResumeText, hasUsefulFallbackResume } = await import('../lib/resume-fallback.js');
+    const text = `RIJO J JOHN
+Program Advisor
+rijo@example.com Hangah Handwara J&K 193302 9741076931
+SUMMARY
+Results-driven Senior Sales Consultant with experience in consultative sales, CRM, communication, negotiation, and program advising.`;
+
+    const parsed = fallbackParseResumeText(text);
+
+    expect(hasUsefulFallbackResume(parsed)).toBe(true);
+    expect(parsed.name).toBe('RIJO J JOHN');
+    expect(parsed.email).toBe('rijo@example.com');
+    expect(parsed.phone).toContain('9741076931');
+    expect(parsed.current_role).toBe('Program Advisor');
+    expect(parsed.skills).toEqual(expect.arrayContaining(['Sales', 'Crm', 'Communication', 'Negotiation', 'Program Advisor']));
+    expect(parsed.summary).toContain('Results-driven Senior Sales Consultant');
+  });
+});
+
+// ===================================================================
+//  4. ROUTE INTEGRATION TESTS
 // ===================================================================
 
 describe('resumes route', () => {

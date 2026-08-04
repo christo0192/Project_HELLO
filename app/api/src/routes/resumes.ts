@@ -22,6 +22,7 @@ import { normalizePhone } from '../lib/phone.js';
 import { requireUploadedFile, validateBodyFields } from '../lib/validation.js';
 import { guardUpload, UploadGuardError } from '../lib/upload-guard.js';
 import { parseResume } from '../lib/resume-parser.js';
+import { fallbackParseResumeText, hasUsefulFallbackResume } from '../lib/resume-fallback.js';
 import { resolveScanner } from '../lib/malware-scanner.js';
 import { uploadResumeBodySchema, type RecruiterAuthGuard } from '../schemas/candidates.js';
 import { createLogger } from '../lib/logger.js';
@@ -211,11 +212,21 @@ export function createResumesRouter(deps: ResumesRouterDeps = {}): Router {
         try {
           parsed = await runClaudeJSON<ParsedResume>(buildExtractionPrompt(text));
         } catch (err) {
-          // Cleanup orphan; LLM parse failure is not a file problem
-          await supabase.storage.from(RESUME_BUCKET).remove([storageKey]).then(() => {}, () => {});
-          return res.status(502).json({
-            error: { type: 'brain_error', message: 'Failed to parse resume content.' },
+          // LLM structuring failure should not block an otherwise safe/readable
+          // resume. Fall back to deterministic extraction from the already
+          // parsed text and keep the raw text_extracted for recruiter review.
+          const fallback = fallbackParseResumeText(text);
+          if (!hasUsefulFallbackResume(fallback)) {
+            await supabase.storage.from(RESUME_BUCKET).remove([storageKey]).then(() => {}, () => {});
+            return res.status(502).json({
+              error: { type: 'brain_error', message: 'Failed to parse resume content.' },
+            });
+          }
+          resumesLogger.warn('unknown_event', {
+            error_category: 'resume_llm_parse_failed',
+            error_type: 'deterministic_fallback_used',
           });
+          parsed = fallback;
         }
 
         // ── 4f. Normalize phone ─────────────────────────────────────
