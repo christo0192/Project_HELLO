@@ -13,7 +13,7 @@ const shutdown = createShutdownController({ graceMs: env.shutdownGraceMs });
 server.listen(env.port, () => {
   startupLogger.info('startup_listen', {
     port: env.port,
-    model: env.claudeModel,
+    model: env.deepseekModel,
     schema: env.supabaseSchema,
   });
 });

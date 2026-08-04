@@ -146,7 +146,7 @@ screeningRouter.post(
           candidate_id: candidateId,
           role_id: roleId,
           mode: 'simulation',
-          provenance: screeningProvenance(env.claudeModel),
+          provenance: screeningProvenance(env.deepseekModel),
         });
         if (insertErr || !session) throw new Error(ERR_INSERT_FAILED);
 

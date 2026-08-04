@@ -26,6 +26,10 @@ describe('candidateStatusLabel', () => {
     expect(candidateStatusLabel(undefined)).toBe('New');
     expect(candidateStatusLabel('  ')).toBe('New');
   });
+
+  it('guards malformed runtime payloads without rendering objects', () => {
+    expect(candidateStatusLabel({ value: 'new' } as unknown as string)).toBe('New');
+  });
 });
 
 describe('candidateStatusTone', () => {
@@ -51,6 +55,10 @@ describe('sessionStatusLabel / tone', () => {
     expect(sessionStatusLabel('expired')).toBe('Expired');
     expect(sessionStatusLabel('weird')).toBe('weird');
     expect(sessionStatusLabel(null)).toBe('—');
+  });
+
+  it('guards malformed runtime payloads without rendering objects', () => {
+    expect(sessionStatusLabel({ value: 'completed' } as unknown as string)).toBe('—');
   });
 
   it('tones terminal failure states as danger', () => {
@@ -103,6 +111,14 @@ describe('sessionStatusCounts', () => {
       { label: 'Completed', value: 2 },
       { label: 'In progress', value: 1 },
     ]);
+  });
+
+  it('keeps chart labels as strings for malformed runtime statuses', () => {
+    const counts = sessionStatusCounts([
+      { status: { value: 'completed' } as unknown as string },
+    ]);
+    expect(counts).toEqual([{ label: '—', value: 1 }]);
+    expect(counts.every((row) => typeof row.label === 'string')).toBe(true);
   });
 });
 

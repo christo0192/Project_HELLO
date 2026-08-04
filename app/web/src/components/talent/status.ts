@@ -14,6 +14,7 @@ import type { StatusTone } from '../design/StatusBadge';
 
 /** Human label for a candidate status (fallback: the raw value). */
 export function candidateStatusLabel(status: string | null | undefined): string {
+  if (typeof status !== 'string' && status != null) return 'New';
   switch (status ?? 'new') {
     case 'new':
       return 'New';
@@ -51,6 +52,7 @@ export function candidateStatusTone(status: string | null | undefined): StatusTo
 
 /** Human label for a session status (fallback: the raw value). */
 export function sessionStatusLabel(status: string | null | undefined): string {
+  if (typeof status !== 'string' && status != null) return '—';
   switch (status) {
     case 'created':
       return 'Created';

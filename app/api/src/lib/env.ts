@@ -4,12 +4,14 @@ import 'dotenv/config';
 // parsed through helper functions below.
 const _contractVisibleEnvReads = [
   process.env.CLAUDE_TIMEOUT_MS,
+  process.env.DEEPSEEK_TIMEOUT_MS,
   process.env.PORT,
   process.env.SHUTDOWN_GRACE_MS,
   process.env.BREAKER_FAILURE_THRESHOLD,
   process.env.BREAKER_COOLDOWN_MS,
   process.env.BREAKER_TIMEOUT_MS,
   process.env.CLAUDE_MAX_OUTPUT_BYTES,
+  process.env.DEEPSEEK_MAX_OUTPUT_BYTES,
   process.env.RECORDING_DOWNLOAD_TTL_SEC,
   process.env.RECORDING_MAX_BYTES,
 ];
@@ -49,6 +51,13 @@ export const env = {
   supabaseSchema: process.env.SUPABASE_SCHEMA ?? 'screening_v2',
   claudeModel: process.env.CLAUDE_MODEL ?? 'haiku',
   claudeScoringModel: process.env.CLAUDE_SCORING_MODEL ?? 'sonnet',
+  deepseekApiKey: process.env.DEEPSEEK_API_KEY ?? '',
+  deepseekModel: process.env.DEEPSEEK_MODEL ?? 'deepseek-chat',
+  deepseekScoringModel: process.env.DEEPSEEK_SCORING_MODEL ?? 'deepseek-chat',
+  deepseekTimeoutMs: positiveInt('DEEPSEEK_TIMEOUT_MS', 120000, 1, 300000),
+  deepseekMaxOutputBytes: positiveInt(
+    'DEEPSEEK_MAX_OUTPUT_BYTES', 5 * 1024 * 1024, 1024, 100 * 1024 * 1024,
+  ),
   companyName: process.env.COMPANY_NAME ?? 'the hiring team',
   claudeBin: process.env.CLAUDE_BIN ?? 'claude',
   claudeTimeoutMs: positiveInt('CLAUDE_TIMEOUT_MS', 120000, 1, 300000),

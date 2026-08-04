@@ -22,7 +22,7 @@ import {
 
 // ── Allowlists ──────────────────────────────────────────────────────────
 
-export const ALLOWLISTED_PROVIDERS = ['anthropic'] as const;
+export const ALLOWLISTED_PROVIDERS = ['anthropic', 'deepseek'] as const;
 export type Provider = (typeof ALLOWLISTED_PROVIDERS)[number];
 
 export const ALLOWLISTED_WORKLOADS = ['screening', 'scoring'] as const;
@@ -501,10 +501,11 @@ export const LEGACY_PROVENANCE: LegacyProvenance = Object.freeze({
 export function screeningProvenance(
   requestedModel: string,
   clock?: ProvenanceClock,
+  provider: Provider = 'deepseek',
 ): ModelProvenance {
   return createProvenance(
     {
-      provider: 'anthropic',
+      provider,
       requestedModel,
       workload: 'screening',
       prompt_template_version: SCREENING_PROMPT_TEMPLATE_VERSION,
@@ -518,10 +519,11 @@ export function screeningProvenance(
 export function scoringProvenance(
   requestedModel: string,
   clock?: ProvenanceClock,
+  provider: Provider = 'deepseek',
 ): ModelProvenance {
   return createProvenance(
     {
-      provider: 'anthropic',
+      provider,
       requestedModel,
       workload: 'scoring',
       prompt_template_version: SCORING_PROMPT_TEMPLATE_VERSION,

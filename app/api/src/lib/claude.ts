@@ -33,6 +33,11 @@ import { spawn } from 'node:child_process';
 import { Readable } from 'node:stream';
 import { env } from './env.js';
 import {
+  runDeepseek,
+  runDeepseekJSON,
+  runDeepseekJSONWithProvenance,
+} from './deepseek.js';
+import {
   CircuitBreaker,
   collectBounded,
   ProviderError,
@@ -386,9 +391,14 @@ export function createClaudeRunner(deps?: Partial<ClaudeRunnerDeps>): ClaudeRunn
   return { runClaude, runClaudeJSON, runClaudeJSONWithProvenance };
 }
 
-// ── Default singleton (production use, configured from env) ──────
+// ── Compatibility singleton exports ─────────────────────────────
+//
+// Active API routes historically import `runClaude*` from this module. To
+// avoid broad route/test churn while removing the production Claude CLI
+// dependency, these compatibility exports now use the DeepSeek HTTP runner.
+// `createClaudeRunner()` above remains available only for legacy/fallback
+// tests that explicitly exercise the old CLI runner behavior.
 
-const defaultRunner = createClaudeRunner();
-export const runClaude = defaultRunner.runClaude;
-export const runClaudeJSON = defaultRunner.runClaudeJSON;
-export const runClaudeJSONWithProvenance = defaultRunner.runClaudeJSONWithProvenance;
+export const runClaude = runDeepseek;
+export const runClaudeJSON = runDeepseekJSON;
+export const runClaudeJSONWithProvenance = runDeepseekJSONWithProvenance;

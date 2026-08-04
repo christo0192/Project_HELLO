@@ -98,9 +98,19 @@ async function requestText(path: string, init?: RequestInit): Promise<string> {
   if (!res.ok) {
     let message = `${res.status} ${res.statusText}`;
     try {
-      const data = (await res.json()) as { error?: string; message?: string };
-      if (data?.error) message = data.error;
-      else if (data?.message) message = data.message;
+      const data = (await res.json()) as { error?: unknown; message?: unknown };
+      if (typeof data?.error === 'string' && data.error.trim()) {
+        message = data.error;
+      } else if (data?.error && typeof data.error === 'object') {
+        const nested = data.error as { message?: unknown; type?: unknown };
+        if (typeof nested.message === 'string' && nested.message.trim()) {
+          message = nested.message;
+        } else if (typeof nested.type === 'string' && nested.type.trim()) {
+          message = nested.type;
+        }
+      } else if (typeof data?.message === 'string' && data.message.trim()) {
+        message = data.message;
+      }
     } catch {
       // non-JSON error body
     }

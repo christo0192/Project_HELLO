@@ -22,7 +22,7 @@ export interface AssessmentRunner {
 }
 
 /**
- * Default runner: connects to real Supabase and Claude CLI.
+ * Default runner: connects to real Supabase and the configured HTTP LLM provider.
  * Override in tests via injectAssessmentRunner() to avoid network/CLI calls.
  */
 let _runAssessment: AssessmentRunner = runAssessmentImpl;
@@ -35,9 +35,9 @@ export function injectAssessmentRunner(fn: AssessmentRunner | null): void {
  * Score a completed screening session and persist the assessment.
  * Idempotent-ish: inserts a new assessment row each call.
  * Delegates to the injected runner (default: real implementation).
- * The default provenance-aware inference call uses claude.ts's single circuit
- * breaker; no nested breaker is added here. Provider failures affect that
- * breaker, while invalid JSON is a BusinessError and does not.
+ * The default provenance-aware inference call uses the configured provider's
+ * single circuit breaker; no nested breaker is added here. Provider failures
+ * affect that breaker, while invalid JSON is a BusinessError and does not.
  */
 export async function runAssessment(sessionId: string): Promise<Assessment & { id: string }> {
   return _runAssessment(sessionId);
@@ -95,8 +95,9 @@ async function runAssessmentImpl(sessionId: string): Promise<Assessment & { id: 
     .eq('id', session.candidate_id)
     .single();
 
-  // The provenance-aware call uses claude.ts's single breaker-managed runner
-  // and returns the configured design-intent model for immutable provenance.
+  // The provenance-aware call uses the configured provider's single
+  // breaker-managed runner and returns the configured design-intent model for
+  // immutable provenance.
   const { data: assessment, requestedModel: scoringModel } = await runClaudeJSONWithProvenance<Assessment>(
     buildAssessmentPrompt({
       roleTitle,
@@ -105,7 +106,7 @@ async function runAssessmentImpl(sessionId: string): Promise<Assessment & { id: 
       transcript,
       resumeFacts: formatResumeFacts((candidate?.parsed as any) ?? null),
     }),
-    { model: env.claudeScoringModel },
+    { model: env.deepseekScoringModel },
   );
 
   // Recompute overall_score + recommendation in code (transparent, tunable).
