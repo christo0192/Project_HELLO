@@ -206,17 +206,18 @@ export function CandidateJoinPage() {
 
     setStatus('joining');
     setError(null);
-    let exchanged = false;
+    let joinStep: 'microphone' | 'exchange' | 'connect' = 'microphone';
     try {
       // Acquire microphone access before consuming the one-time invite. If the
       // browser permission/device step fails, the invite remains reusable.
       const localTrack = await acquireLocalAudioTrack();
       localTrackRef.current = localTrack;
 
+      joinStep = 'exchange';
       const access = await api.exchangeCandidateInvite(invite);
-      exchanged = true;
       inviteRef.current = null;
 
+      joinStep = 'connect';
       const room = new Room({ adaptiveStream: true, dynacast: true });
       roomRef.current = room;
       room.on(RoomEvent.TrackSubscribed, (track) => {
@@ -234,7 +235,7 @@ export function CandidateJoinPage() {
       roomRef.current?.disconnect();
       roomRef.current = null;
       setStatus('ready');
-      if (!exchanged) {
+      if (joinStep === 'microphone') {
         setError(microphoneErrorMessage(err));
         return;
       }

@@ -230,6 +230,27 @@ describe('CandidateJoinPage', () => {
     );
   });
 
+  it('does not report microphone failure when invite exchange fails after mic access succeeds', async () => {
+    candidateConsentStatus.mockResolvedValue({
+      has_consent: true,
+      template_version: '1.0',
+      locale: 'en-IN',
+      required_consents: ['ai_interview', 'recording'],
+    });
+    exchangeCandidateInvite.mockRejectedValueOnce(new Error('exchange failed'));
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Join screening' })).toBeInTheDocument();
+    });
+
+    await userEvent.click(screen.getByRole('button', { name: 'Join screening' }));
+
+    await waitFor(() => expect(exchangeCandidateInvite).toHaveBeenCalledWith(SYNTHETIC_INVITE));
+    expect(screen.queryByText(/Microphone access is required before this invite can be used/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/Unable to join this screening/i)).toBeInTheDocument();
+  });
+
   it('falls back to browser getUserMedia before exchanging when LiveKit audio creation fails', async () => {
     candidateConsentStatus.mockResolvedValue({
       has_consent: true,
