@@ -37,7 +37,7 @@ MODEL_PROVENANCE_SCHEMA_VERSION = 1
 # This is a documented value, not a live import.  A parity test verifies
 # alignment with the TypeScript source of truth.
 
-SCREENING_PROVENANCE_VERSION = "2026-07-28.1"
+SCREENING_PROVENANCE_VERSION = "2026-08-04.1"
 
 # ── Validation constants ────────────────────────────────────────────────
 

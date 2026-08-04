@@ -13,6 +13,10 @@ RUN npm prune --omit=dev
 FROM node:22-slim AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends clamav clamav-freshclam ca-certificates \
+  && (freshclam --quiet || true) \
+  && rm -rf /var/lib/apt/lists/*
 RUN useradd --create-home --shell /usr/sbin/nologin appuser
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/node_modules ./node_modules

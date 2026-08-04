@@ -606,7 +606,7 @@ describe('screeningProvenance', () => {
     const p = screeningProvenance('claude-haiku-4-5-20251001', fixedClock);
     expect(p.workload).toBe('screening');
     expect(p.requestedModel).toBe('claude-haiku-4-5-20251001');
-    expect(p.prompt_template_version).toBe('2026-07-28.1');
+    expect(p.prompt_template_version).toBe('2026-08-04.1');
   });
 });
 
@@ -615,7 +615,7 @@ describe('scoringProvenance', () => {
     const p = scoringProvenance('claude-sonnet-4-20250514', fixedClock);
     expect(p.workload).toBe('scoring');
     expect(p.requestedModel).toBe('claude-sonnet-4-20250514');
-    expect(p.prompt_template_version).toBe('2026-07-28.1');
+    expect(p.prompt_template_version).toBe('2026-08-04.1');
   });
 });
 
