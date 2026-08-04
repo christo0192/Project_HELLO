@@ -325,6 +325,25 @@ describe('exchange consent gate (invariant 4)', () => {
     expect(res.body.session_id).toBe(UUID_1);
   });
 
+  it('grants when the LiveKit room has already moved the session to in_progress', async () => {
+    configureTables({
+      system_config: ok(null),
+      candidate_invites: (n: number) =>
+        n === 0 ? ok(ACTIVE_INVITE_ROW) : ok([{ id: UUID_3 }]),
+      consent_records: ok({ status: 'granted', consents: REQUIRED, expires_at: null }),
+      consent_templates: ok({ version: '1.0', required_consents: REQUIRED }),
+      call_sessions: ok({ id: UUID_1, external_call_id: `screening-${UUID_1}`, status: 'in_progress' }),
+      candidate_access_grants: ok({ data: null, error: null }),
+    });
+    const app = createUnauthedApp();
+
+    const res = await request(app).post('/api/livekit/exchange').send(EXCHANGE_BODY);
+
+    expect(res.status).toBe(200);
+    expect(res.body.session_id).toBe(UUID_1);
+    expect(callsFor('candidate_invites', 'update')).toHaveLength(1);
+  });
+
   it('session unavailable after consent gate → stable 404 and invite unconsumed', async () => {
     configureTables({
       system_config: ok(null),

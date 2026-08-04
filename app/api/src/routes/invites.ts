@@ -279,7 +279,11 @@ invitesRouter.post(
         .eq('id', invite.session_id)
         .single();
 
-      if (!session || session.status !== 'waiting' || !session.external_call_id) {
+      if (
+        !session ||
+        !['waiting', 'in_progress'].includes(session.status as string) ||
+        !session.external_call_id
+      ) {
         return res.status(404).json({ error: STABLE_EXPIRY_MSG });
       }
 
