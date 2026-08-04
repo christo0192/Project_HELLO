@@ -325,6 +325,23 @@ describe('exchange consent gate (invariant 4)', () => {
     expect(res.body.session_id).toBe(UUID_1);
   });
 
+  it('session unavailable after consent gate → stable 404 and invite unconsumed', async () => {
+    configureTables({
+      system_config: ok(null),
+      candidate_invites: ok(ACTIVE_INVITE_ROW),
+      consent_records: ok({ status: 'granted', consents: REQUIRED, expires_at: null }),
+      consent_templates: ok({ version: '1.0', required_consents: REQUIRED }),
+      call_sessions: ok({ id: UUID_1, external_call_id: `screening-${UUID_1}`, status: 'failed' }),
+    });
+    const app = createUnauthedApp();
+
+    const res = await request(app).post('/api/livekit/exchange').send(EXCHANGE_BODY);
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe('invite_token_invalid_or_expired');
+    expect(callsFor('candidate_invites', 'update')).toHaveLength(0);
+  });
+
   it('missing consent record → 409 consent_required and invite update count is zero', async () => {
     const app = consentGateApp({ data: null, error: null });
     const res = await request(app).post('/api/livekit/exchange').send(EXCHANGE_BODY);

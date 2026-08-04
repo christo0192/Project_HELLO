@@ -270,7 +270,22 @@ invitesRouter.post(
         return res.status(409).json({ error: 'consent_required' });
       }
 
-      // Step 2: Atomic CAS — update consumed_at where consumed_at IS NULL.
+      // Step 2: Look up session for room name BEFORE consuming the one-time
+      // invite. If the session is no longer joinable, the candidate may retry
+      // after ops/admin fixes session state without the token being burned.
+      const { data: session } = await supabase
+        .from('call_sessions')
+        .select('id, external_call_id, status')
+        .eq('id', invite.session_id)
+        .single();
+
+      if (!session || session.status !== 'waiting' || !session.external_call_id) {
+        return res.status(404).json({ error: STABLE_EXPIRY_MSG });
+      }
+
+      const roomName = session.external_call_id;
+
+      // Step 3: Atomic CAS — update consumed_at where consumed_at IS NULL.
       const nowIso = new Date().toISOString();
       const { data: consumed, error: consumeErr } = await supabase
         .from('candidate_invites')
@@ -285,19 +300,6 @@ invitesRouter.post(
         // CAS failed — another request consumed this token first
         return res.status(404).json({ error: STABLE_EXPIRY_MSG });
       }
-
-      // Step 3: Look up session for room name
-      const { data: session } = await supabase
-        .from('call_sessions')
-        .select('id, external_call_id, status')
-        .eq('id', invite.session_id)
-        .single();
-
-      if (!session || session.status !== 'waiting' || !session.external_call_id) {
-        return res.status(404).json({ error: STABLE_EXPIRY_MSG });
-      }
-
-      const roomName = session.external_call_id;
 
       // Step 4: Create short-lived opaque candidate access grant (candidate_access_grants)
       const grant = await createGrant({
