@@ -238,7 +238,7 @@ async def set_session_provenance(
         return (
             table.update({"provenance": provenance})
             .eq("id", session_id)
-            .is_("provenance", "null")
+            .is_("provenance", None)
             .select("id")
             .execute()
         )
