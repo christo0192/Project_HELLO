@@ -218,7 +218,8 @@ def _classify_close_event(event: Any) -> str | None:
 
     reason = getattr(event, "reason", None)
     if reason is not None:
-        reason_str = str(getattr(reason, "name", reason)).lower()
+        raw_reason = getattr(reason, "name", None) or getattr(reason, "value", None) or reason
+        reason_str = str(raw_reason).lower().rsplit(".", 1)[-1]
         if reason_str in _CLOSE_REASON_TO_TERMINAL:
             return _CLOSE_REASON_TO_TERMINAL[reason_str]
         return "worker_crash"
