@@ -280,6 +280,39 @@ describe('CandidateJoinPage', () => {
     expect(connect).toHaveBeenCalledWith('wss://livekit.example.invalid', 'synthetic-livekit-token');
   });
 
+  it('falls back to plain audio capture when preferred browser constraints fail', async () => {
+    candidateConsentStatus.mockResolvedValue({
+      has_consent: true,
+      template_version: '1.0',
+      locale: 'en-IN',
+      required_consents: ['ai_interview', 'recording'],
+    });
+    createLocalAudioTrack.mockRejectedValueOnce(new DOMException('primary failed', 'AbortError'));
+    const browserTrack = { kind: 'audio' };
+    const getUserMedia = vi
+      .fn()
+      .mockRejectedValueOnce(new DOMException('constraints failed', 'AbortError'))
+      .mockResolvedValueOnce({ getAudioTracks: () => [browserTrack] });
+    Object.defineProperty(window.navigator, 'mediaDevices', {
+      configurable: true,
+      value: { getUserMedia },
+    });
+
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Join screening' })).toBeInTheDocument();
+    });
+    await userEvent.click(screen.getByRole('button', { name: 'Join screening' }));
+
+    await waitFor(() => expect(exchangeCandidateInvite).toHaveBeenCalledWith(SYNTHETIC_INVITE));
+    expect(getUserMedia).toHaveBeenNthCalledWith(1, {
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    expect(getUserMedia).toHaveBeenNthCalledWith(2, { audio: true });
+    expect(connect).toHaveBeenCalledWith('wss://livekit.example.invalid', 'synthetic-livekit-token');
+  });
+
   it('blocks joining and shows a generic unsupported message when capabilities are missing', async () => {
     useCapabilitySupport.mockReturnValue('unsupported');
     candidateConsentStatus.mockResolvedValue({

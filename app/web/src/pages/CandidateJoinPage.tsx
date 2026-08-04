@@ -43,41 +43,54 @@ const LOCALE = 'en-IN';
 const INVITE_TOKEN_RE = /^[a-f0-9]{64}$/;
 
 async function acquireLocalAudioTrack(): Promise<LocalAudioTrack> {
+  const preferredAudioConstraints = {
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+  };
+
   try {
-    return await createLocalAudioTrack({
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-    });
+    return await createLocalAudioTrack(preferredAudioConstraints);
   } catch (primaryError) {
     const mediaDevices = window.navigator?.mediaDevices;
     if (!mediaDevices || typeof mediaDevices.getUserMedia !== 'function') {
       throw primaryError;
     }
-    try {
-      const stream = await mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-      const [track] = stream.getAudioTracks();
-      if (!track) throw primaryError;
-      return new LocalAudioTrack(track);
-    } catch {
-      throw primaryError;
+
+    let lastError = primaryError;
+    for (const constraints of [
+      { audio: preferredAudioConstraints },
+      { audio: true },
+    ] satisfies MediaStreamConstraints[]) {
+      try {
+        const stream = await mediaDevices.getUserMedia(constraints);
+        const [track] = stream.getAudioTracks();
+        if (!track) {
+          stream.getTracks().forEach((t) => t.stop());
+          throw new DOMException('No audio track returned by browser', 'NotFoundError');
+        }
+        return new LocalAudioTrack(track);
+      } catch (fallbackError) {
+        lastError = fallbackError;
+      }
     }
+    throw lastError;
   }
 }
 
 function microphoneErrorMessage(error: unknown): string {
-  const name = error instanceof DOMException ? error.name : '';
+  const name = error instanceof Error ? error.name : '';
   if (name === 'NotAllowedError' || name === 'SecurityError') {
     return 'Microphone permission is blocked. Please allow microphone access in your browser site settings and try again.';
   }
   if (name === 'NotFoundError' || name === 'OverconstrainedError') {
     return 'No usable microphone was found. Please connect or enable a microphone and try again.';
+  }
+  if (name === 'NotReadableError' || name === 'AbortError') {
+    return 'The browser could not start the microphone. Close other apps using the mic, check OS microphone privacy settings, then try again.';
+  }
+  if (name === 'TypeError') {
+    return 'This browser could not start microphone capture. Please try Chrome or Edge over HTTPS.';
   }
   return 'Microphone access is required before this invite can be used. Please allow microphone access and try again.';
 }
