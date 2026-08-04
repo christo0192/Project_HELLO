@@ -429,6 +429,7 @@ async def _run_session(ctx: JobContext, started_at: float, session_id: Any, work
             await _run_span_guarded("turn_persistence", _persist, parent=session_span)
 
         session: AgentSession | None = None
+        opening_recorded = False
 
         async def _setup_session(span: Span | None) -> None:
             nonlocal session
@@ -454,6 +455,7 @@ async def _run_session(ctx: JobContext, started_at: float, session_id: Any, work
 
             @session.on("conversation_item_added")
             def _on_conversation_item(event):  # noqa: ANN001
+                nonlocal opening_recorded
                 item = getattr(event, "item", None)
                 role = getattr(item, "role", None)
                 if role not in {"assistant", "user"}:
@@ -461,6 +463,8 @@ async def _run_session(ctx: JobContext, started_at: float, session_id: Any, work
                 if role == "assistant" and getattr(item, "interrupted", False):
                     return
                 text = _item_text(item)
+                if role == "assistant" and opening_recorded and text == opening_text:
+                    return
                 speaker = "bot" if role == "assistant" else "candidate"
                 tracked_write(record_turn(speaker, text))
 
@@ -483,11 +487,14 @@ async def _run_session(ctx: JobContext, started_at: float, session_id: Any, work
                    round(_monotonic() - setup_started, 3))
 
         async def _generate_reply(span: Span | None) -> None:
+            nonlocal opening_recorded
+            opening_recorded = True
             say = getattr(session, "say", None)
             if callable(say):
                 await say(opening_text)
             else:
                 await session.generate_reply(instructions=opening_text)
+            tracked_write(record_turn("bot", opening_text))
 
         generate_started = _monotonic()
         await _run_span_guarded("session_generate_reply", _generate_reply, parent=session_span)

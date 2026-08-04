@@ -461,11 +461,13 @@ livekitRouter.post(
         return next(new Error('session completion failed'));
       }
 
-      // Best-effort synchronous scoring trigger so the dashboard can show a
-      // scorecard shortly after the candidate leaves. If scoring fails, the
-      // completed session remains durable and admin/reconciler can retry.
+      // Best-effort delayed scoring trigger so final worker transcript writes
+      // have time to land before assessment. If scoring fails, the completed
+      // session remains durable and admin/reconciler can retry.
       if (completed.ok) {
-        runAssessment(sessionId).catch(() => undefined);
+        setTimeout(() => {
+          runAssessment(sessionId).catch(() => undefined);
+        }, 8_000).unref?.();
       }
       return res.status(202).json({ status: completed.ok ? 'completed' : 'already_completed' });
     } catch (error) {
