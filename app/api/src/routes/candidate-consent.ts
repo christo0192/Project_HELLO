@@ -53,22 +53,9 @@ candidateConsentRouter.post(
       if (!result.ok) return res.status(404).json({ error: STABLE_INVITE_ERROR });
       const { invite } = result;
 
-      // Latest granted consent record (not expired) for the invite-bound
-      // candidate. The candidate id stays server-side only.
-      const { data: latest } = await supabase
-        .from('consent_records')
-        .select('status, consents, version, expires_at')
-        .eq('candidate_id', invite.candidate_id)
-        .eq('status', 'granted')
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      const hasConsent = Boolean(
-        latest && (!latest.expires_at || new Date(latest.expires_at) > new Date()),
-      );
-
       // Bounded server template status — active template only; null when no
-      // active Legal template exists (never pretend Legal copy exists).
+      // active template exists. Consent cannot be considered complete without
+      // an active template and every template-required consent type.
       const { data: template } = await supabase
         .from('consent_templates')
         .select('version, locale, required_consents')
@@ -77,11 +64,32 @@ candidateConsentRouter.post(
         .limit(1)
         .maybeSingle();
 
+      // Latest granted consent record (not expired) for the invite-bound
+      // candidate. The candidate id stays server-side only. Job-application
+      // consent alone must never unlock the AI/recording join gate.
+      const { data: latest } = await supabase
+        .from('consent_records')
+        .select('status, consents, version, expires_at')
+        .eq('candidate_id', invite.candidate_id)
+        .eq('status', 'granted')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      const requiredConsents = (template?.required_consents ?? []) as string[];
+      const grantedConsents = Array.isArray(latest?.consents) ? latest.consents as string[] : [];
+      const hasConsent = Boolean(
+        template &&
+        latest &&
+        (!latest.expires_at || new Date(latest.expires_at) > new Date()) &&
+        requiredConsents.length > 0 &&
+        requiredConsents.every((required) => grantedConsents.includes(required)),
+      );
+
       const body: ConsentStatusResponse = {
         has_consent: hasConsent,
         template_version: template?.version ?? null,
         locale: template?.locale ?? null,
-        required_consents: (template?.required_consents ?? []) as string[],
+        required_consents: requiredConsents,
       };
       res.json(body);
     } catch (error) {

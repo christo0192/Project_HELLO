@@ -108,8 +108,8 @@ describe('POST /api/candidate-consent/status', () => {
   it('bounded status for a valid invite — no candidate_id, no token', async () => {
     mockFrom
       .mockReturnValueOnce(chainable(ACTIVE_INVITE))
-      .mockReturnValueOnce(grantedRecord())
-      .mockReturnValueOnce(chainable(ACTIVE_TEMPLATE));
+      .mockReturnValueOnce(chainable(ACTIVE_TEMPLATE))
+      .mockReturnValueOnce(grantedRecord());
     const res = await request(makeApp()).post('/api/candidate-consent/status').send({ invite_token: TOKEN });
     expect(res.status).toBe(200);
     expect(res.body).toEqual({
@@ -127,11 +127,37 @@ describe('POST /api/candidate-consent/status', () => {
   it('has_consent false when no granted record exists', async () => {
     mockFrom
       .mockReturnValueOnce(chainable(ACTIVE_INVITE))
-      .mockReturnValueOnce(chainable({ data: null, error: null }))
-      .mockReturnValueOnce(chainable(ACTIVE_TEMPLATE));
+      .mockReturnValueOnce(chainable(ACTIVE_TEMPLATE))
+      .mockReturnValueOnce(chainable({ data: null, error: null }));
     const res = await request(makeApp()).post('/api/candidate-consent/status').send({ invite_token: TOKEN });
     expect(res.status).toBe(200);
     expect(res.body.has_consent).toBe(false);
+  });
+
+  it('has_consent false when latest grant is only job_application', async () => {
+    mockFrom
+      .mockReturnValueOnce(chainable(ACTIVE_INVITE))
+      .mockReturnValueOnce(chainable(ACTIVE_TEMPLATE))
+      .mockReturnValueOnce(grantedRecord({ consents: ['job_application'] }));
+    const res = await request(makeApp()).post('/api/candidate-consent/status').send({ invite_token: TOKEN });
+    expect(res.status).toBe(200);
+    expect(res.body.has_consent).toBe(false);
+    expect(res.body.required_consents).toEqual(REQUIRED);
+  });
+
+  it('has_consent false when no active template exists', async () => {
+    mockFrom
+      .mockReturnValueOnce(chainable(ACTIVE_INVITE))
+      .mockReturnValueOnce(chainable({ data: null, error: null }))
+      .mockReturnValueOnce(grantedRecord());
+    const res = await request(makeApp()).post('/api/candidate-consent/status').send({ invite_token: TOKEN });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      has_consent: false,
+      template_version: null,
+      locale: null,
+      required_consents: [],
+    });
   });
 
   it('unknown invite → stable 404', async () => {
