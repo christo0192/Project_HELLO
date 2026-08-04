@@ -14,6 +14,7 @@ const {
   exchangeCandidateInvite,
   connect,
   publishTrack,
+  createLocalAudioTrack,
 } = vi.hoisted(() => ({
   candidateConsentStatus: vi.fn(),
   getCandidateConsentTemplate: vi.fn(),
@@ -21,6 +22,7 @@ const {
   exchangeCandidateInvite: vi.fn(),
   connect: vi.fn(),
   publishTrack: vi.fn(),
+  createLocalAudioTrack: vi.fn().mockResolvedValue({ stop: vi.fn() }),
 }));
 
 vi.mock('../api', () => ({
@@ -49,7 +51,7 @@ vi.mock('livekit-client', () => ({
   RoomEvent: { TrackSubscribed: 'trackSubscribed', Disconnected: 'disconnected' },
   Track: { Kind: { Audio: 'audio' } },
   LocalAudioTrack: class {},
-  createLocalAudioTrack: vi.fn().mockResolvedValue({ stop: vi.fn() }),
+  createLocalAudioTrack,
 }));
 
 const SYNTHETIC_INVITE = 'a'.repeat(64);
@@ -194,7 +196,7 @@ describe('CandidateJoinPage', () => {
     expect(getCandidateConsentTemplate).not.toHaveBeenCalled();
   });
 
-  it('exchanges the captured invite once before joining LiveKit', async () => {
+  it('creates the local audio track before exchanging the one-time invite', async () => {
     candidateConsentStatus.mockResolvedValue({
       has_consent: true,
       template_version: '1.0',
@@ -208,6 +210,9 @@ describe('CandidateJoinPage', () => {
     });
     await userEvent.click(screen.getByRole('button', { name: 'Join screening' }));
     await waitFor(() => expect(exchangeCandidateInvite).toHaveBeenCalledWith(SYNTHETIC_INVITE));
+    expect(createLocalAudioTrack.mock.invocationCallOrder[0]).toBeLessThan(
+      exchangeCandidateInvite.mock.invocationCallOrder[0],
+    );
     expect(connect).toHaveBeenCalledWith(
       'wss://livekit.example.invalid',
       'synthetic-livekit-token',

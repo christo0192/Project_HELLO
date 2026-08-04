@@ -159,7 +159,6 @@ export function CandidateJoinPage() {
 
   async function join() {
     const invite = inviteRef.current;
-    inviteRef.current = null;
     if (!invite || phase !== 'granted') {
       setError('This invite is missing, expired, revoked, or already used.');
       return;
@@ -167,8 +166,21 @@ export function CandidateJoinPage() {
 
     setStatus('joining');
     setError(null);
+    let exchanged = false;
     try {
+      // Acquire microphone access before consuming the one-time invite. If the
+      // browser permission/device step fails, the invite remains reusable.
+      const localTrack = await createLocalAudioTrack({
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      });
+      localTrackRef.current = localTrack;
+
       const access = await api.exchangeCandidateInvite(invite);
+      exchanged = true;
+      inviteRef.current = null;
+
       const room = new Room({ adaptiveStream: true, dynacast: true });
       roomRef.current = room;
       room.on(RoomEvent.TrackSubscribed, (track) => {
@@ -178,16 +190,18 @@ export function CandidateJoinPage() {
       });
       room.on(RoomEvent.Disconnected, () => setStatus('ended'));
       await room.connect(access.url, access.livekit_token);
-      const localTrack = await createLocalAudioTrack({
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      });
-      localTrackRef.current = localTrack;
       await room.localParticipant.publishTrack(localTrack);
       setStatus('live');
     } catch (err) {
+      localTrackRef.current?.stop();
+      localTrackRef.current = null;
+      roomRef.current?.disconnect();
+      roomRef.current = null;
       setStatus('ready');
+      if (!exchanged) {
+        setError('Microphone access is required before this invite can be used. Please allow microphone access and try again.');
+        return;
+      }
       setError(err instanceof ApiError ? err.message : 'Unable to join this screening.');
     }
   }
