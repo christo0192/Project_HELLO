@@ -184,6 +184,18 @@ class TestRoomSessionFallback(unittest.TestCase):
     def test_ignores_non_canonical_room_name(self):
         self.assertIsNone(agent_mod._session_id_from_room_name("synthetic-worker-smoke-123"))
 
+    def test_reads_room_name_from_job_room_object(self):
+        ctx = types.SimpleNamespace(
+            room=types.SimpleNamespace(name=""),
+            job=types.SimpleNamespace(
+                room=types.SimpleNamespace(name="screening-5b2a34cb-a912-4c68-a2c2-79ccdc1dcdd1")
+            ),
+        )
+        self.assertEqual(
+            agent_mod._room_name_from_context(ctx),
+            "screening-5b2a34cb-a912-4c68-a2c2-79ccdc1dcdd1",
+        )
+
 
 class TestClassifyCloseEvent(unittest.TestCase):
     """Explicit mapping — no substring matching, unknown/empty fails closed."""

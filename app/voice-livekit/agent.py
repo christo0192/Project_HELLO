@@ -42,7 +42,20 @@ ROOM_SESSION_RE = re.compile(
 def _room_name_from_context(ctx: JobContext) -> str:
     room = getattr(ctx, "room", None)
     name = getattr(room, "name", None)
-    return str(name) if name else ""
+    if name:
+        return str(name)
+
+    job = getattr(ctx, "job", None)
+    for attr in ("room_name", "roomName"):
+        value = getattr(job, attr, None)
+        if value:
+            return str(value)
+
+    job_room = getattr(job, "room", None)
+    if isinstance(job_room, str) and job_room:
+        return job_room
+    job_room_name = getattr(job_room, "name", None)
+    return str(job_room_name) if job_room_name else ""
 
 
 def _session_id_from_room_name(room_name: str) -> str | None:
