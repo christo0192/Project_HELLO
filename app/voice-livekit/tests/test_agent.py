@@ -217,6 +217,11 @@ class TestClassifyCloseEvent(unittest.TestCase):
         result = agent_mod._classify_close_event(event)
         self.assertIsNone(result)
 
+    def test_client_initiated_close_reason(self):
+        event = FakeCloseEvent(error=None, reason=FakeAgentSessionCloseReason("CLIENT_INITIATED"))
+        result = agent_mod._classify_close_event(event)
+        self.assertIsNone(result)
+
     def test_shutdown_reason(self):
         event = FakeCloseEvent(error=None, reason=FakeAgentSessionCloseReason("shutdown"))
         result = agent_mod._classify_close_event(event)

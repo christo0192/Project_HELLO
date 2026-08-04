@@ -171,6 +171,7 @@ _CLOSE_REASON_TO_TERMINAL: dict[str | None, str | None] = {
     None: None,
     "completed": None,
     "normal": None,
+    "client_initiated": None,
     "shutdown": "shutdown_forced",
     "cancelled": "shutdown_forced",
     "timeout": "shutdown_forced",
