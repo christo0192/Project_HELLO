@@ -633,6 +633,12 @@ async def drain_pending_writes(
 # using strict session/room UUID binding — never from client-visible metadata.
 
 _API_TIMEOUT_SEC = float(os.getenv("WORKER_CONTEXT_TIMEOUT_SEC", "5"))
+_WORKER_CONTEXT_BREAKER = CircuitBreaker(CircuitBreakerConfig(
+    failure_threshold=3,
+    cooldown_sec=10.0,
+    timeout_sec=max(_API_TIMEOUT_SEC, 1.0),
+    clock=RealClock(),
+))
 
 
 def _get_worker_context_transport():
@@ -729,6 +735,7 @@ async def resolve_worker_context(
         response = await call_with_breaker(
             "POST",
             f"{API_BASE}/api/livekit/worker-context",
+            breaker=_WORKER_CONTEXT_BREAKER,
             transport=transport,
             headers=headers,
             json_body={
