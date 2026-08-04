@@ -43,7 +43,7 @@ def valid_payload(**overrides: Any) -> dict[str, Any]:
         "provider": "deepseek",
         "requestedModel": "deepseek-chat",
         "workload": "screening",
-        "prompt_template_version": "2026-07-28.1",
+        "prompt_template_version": "2026-08-04.1",
         "timestamp": "2026-07-28T12:00:00.000Z",
     }
     payload.update(overrides)
@@ -395,7 +395,7 @@ class TestProvenanceValidation(unittest.TestCase):
             provider="deepseek",
             requested_model=original_model,
             workload="screening",
-            prompt_template_version="2026-07-28.1",
+            prompt_template_version="2026-08-04.1",
             inference_params={"temperature": 0.3},
             clock=fixed_clock,
         )
@@ -412,7 +412,7 @@ class TestProvenanceValidation(unittest.TestCase):
             provider="deepseek",
             requested_model="deepseek-chat",
             workload="screening",
-            prompt_template_version="2026-07-28.1",
+            prompt_template_version="2026-08-04.1",
             clock=fixed_clock,
         )
         self.assertEqual(p["provider"], "deepseek")

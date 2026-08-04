@@ -46,7 +46,7 @@ as `requestedModel`.  Immutable from insert (trigger raises on change).
   "provider": "anthropic",
   "requestedModel": "claude-haiku-4-5-20251001",
   "workload": "screening|scoring",
-  "prompt_template_version": "2026-07-28.1",
+  "prompt_template_version": "2026-08-04.1",
   "inference_params": {
     "temperature": 0.7,
     "max_tokens": 4096
@@ -143,8 +143,8 @@ Defined in `app/api/src/lib/prompts.ts` and used by
 
 | Constant | Template | Current Version |
 |---|---|---|
-| `SCREENING_PROMPT_TEMPLATE_VERSION` | `buildConversationPrompt()` + `SCREENING_SYSTEM` | `2026-07-28.1` |
-| `SCORING_PROMPT_TEMPLATE_VERSION` | `buildAssessmentPrompt()` | `2026-07-28.1` |
+| `SCREENING_PROMPT_TEMPLATE_VERSION` | `buildConversationPrompt()` + `SCREENING_SYSTEM` | `2026-08-04.1` |
+| `SCORING_PROMPT_TEMPLATE_VERSION` | `buildAssessmentPrompt()` | `2026-08-04.1` |
 
 **Bump these** whenever the corresponding template function changes in a
 semantically meaningful way (structure, scoring rubric, behavior).
