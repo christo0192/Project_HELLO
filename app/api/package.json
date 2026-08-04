@@ -3,10 +3,12 @@
   "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Backend API for the AI HR screening bot (claude -p brain + Supabase screening_v2). Voice handled by a separate Python service.",
+  "description": "Backend API for the AI HR screening bot (DeepSeek HTTP brain + Supabase screening_v2). Voice handled by a separate Python service.",
   "scripts": {
     "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.build.json",
     "start": "tsx src/index.ts",
+    "start:prod": "node dist/src/index.js",
     "seed": "tsx scripts/seed.ts",
     "seed:advisor": "tsx scripts/seed-program-advisor.ts",
     "smoke:brain": "tsx scripts/smoke-brain.ts",

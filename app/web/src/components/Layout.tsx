@@ -26,6 +26,7 @@ import { useAuth, type MembershipRole } from '../lib/auth';
 import { usePageVariants } from '../lib/motion';
 import { Spinner } from './ui';
 import { ThemeToggle } from './design';
+import { ErrorBoundary } from './ErrorBoundary';
 import {
   Brand,
   BriefcaseIcon,
@@ -294,29 +295,31 @@ export function Layout() {
           className="flex-1 outline-none"
         >
           <div className="mx-auto max-w-page px-4 py-6 sm:px-6 sm:py-8">
-            <Suspense
-              fallback={
-                <div
-                  role="status"
-                  className="flex min-h-64 items-center justify-center"
-                >
-                  <div className="flex flex-col items-center gap-3">
-                    <Spinner className="h-6 w-6 text-brand-500" />
-                    <p className="text-sm text-ink-tertiary">Loading…</p>
+            <ErrorBoundary resetKey={location.pathname}>
+              <Suspense
+                fallback={
+                  <div
+                    role="status"
+                    className="flex min-h-64 items-center justify-center"
+                  >
+                    <div className="flex flex-col items-center gap-3">
+                      <Spinner className="h-6 w-6 text-brand-500" />
+                      <p className="text-sm text-ink-tertiary">Loading…</p>
+                    </div>
                   </div>
-                </div>
-              }
-            >
-              {/* Restrained route fade; static under reduced motion. */}
-              <motion.div
-                key={location.pathname}
-                variants={pageVariants}
-                initial="initial"
-                animate="enter"
+                }
               >
-                <Outlet />
-              </motion.div>
-            </Suspense>
+                {/* Restrained route fade; static under reduced motion. */}
+                <motion.div
+                  key={location.pathname}
+                  variants={pageVariants}
+                  initial="initial"
+                  animate="enter"
+                >
+                  <Outlet />
+                </motion.div>
+              </Suspense>
+            </ErrorBoundary>
           </div>
         </main>
       </div>

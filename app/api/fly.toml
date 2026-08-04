@@ -1,0 +1,53 @@
+app = "project-hello-api"
+primary_region = "bom"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NODE_ENV = "production"
+  PORT = "8787"
+  SUPABASE_SCHEMA = "screening_v2"
+  COMPANY_NAME = "Interview Kickstart"
+  WEB_ORIGIN = "https://ib-ik-project-hello.vercel.app"
+  DEEPSEEK_MODEL = "deepseek-chat"
+  DEEPSEEK_SCORING_MODEL = "deepseek-chat"
+  DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1/chat/completions"
+  DEEPSEEK_TIMEOUT_MS = "120000"
+  DEEPSEEK_MAX_OUTPUT_BYTES = "5242880"
+  RECORDINGS_BUCKET = "recordings_v2"
+  RECORDING_DOWNLOAD_TTL_SEC = "300"
+  RECORDING_MAX_BYTES = "26214400"
+  WORKER_CONTEXT_TIMEOUT_SEC = "5"
+  RESUME_SCANNER = "production"
+  RESUME_SCANNER_TIMEOUT_MS = "30000"
+  RESUME_MAX_COMPRESSED_BYTES = "10485760"
+  RESUME_PARSER_TIMEOUT_MS = "30000"
+  RESUME_MAX_TEXT_LENGTH = "50000"
+  SHUTDOWN_GRACE_MS = "30000"
+  BREAKER_FAILURE_THRESHOLD = "5"
+  BREAKER_COOLDOWN_MS = "30000"
+  BREAKER_TIMEOUT_MS = "60000"
+  RATE_LIMIT_DEFAULT = "100"
+  RATE_LIMIT_STRICT = "20"
+  RATE_LIMIT_IP = "300"
+  RATE_LIMIT_WINDOW_SEC = "60"
+  TRUSTED_PROXY = "loopback"
+
+[http_service]
+  internal_port = 8787
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 20
+    hard_limit = 40
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512

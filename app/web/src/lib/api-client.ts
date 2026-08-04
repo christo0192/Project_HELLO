@@ -47,12 +47,23 @@ function dispatchUnauthorized(): void {
   }
 }
 
+function errorMessageFromBody(data: unknown, fallback: string): string {
+  if (!data || typeof data !== 'object') return fallback;
+  const body = data as { error?: unknown; message?: unknown };
+  if (typeof body.error === 'string' && body.error.trim()) return body.error;
+  if (body.error && typeof body.error === 'object') {
+    const nested = body.error as { message?: unknown; type?: unknown };
+    if (typeof nested.message === 'string' && nested.message.trim()) return nested.message;
+    if (typeof nested.type === 'string' && nested.type.trim()) return nested.type;
+  }
+  if (typeof body.message === 'string' && body.message.trim()) return body.message;
+  return fallback;
+}
+
 async function parseError(res: Response): Promise<never> {
   let message = `${res.status} ${res.statusText}`;
   try {
-    const data = (await res.json()) as { error?: string; message?: string };
-    if (data?.error) message = data.error;
-    else if (data?.message) message = data.message;
+    message = errorMessageFromBody(await res.json(), message);
   } catch {
     // ignore non-JSON error bodies
   }
