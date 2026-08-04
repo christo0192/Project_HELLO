@@ -19,6 +19,7 @@ from livekit.plugins import openai, sarvam, silero
 import persistence
 from observability import (
     Span,
+    StructuredLogger,
     counter_metric,
     histogram_metric,
     reset_correlation_id,
@@ -33,6 +34,7 @@ load_dotenv()
 
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+_log = StructuredLogger("agent")
 ROOM_SESSION_RE = re.compile(
     r"^screening-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
     re.IGNORECASE,
@@ -228,6 +230,12 @@ async def entrypoint(ctx: JobContext) -> None:
     meta = collect_prompt_metadata(ctx)
     room_name = str(meta.get("room_name") or _room_name_from_context(ctx) or "")
     session_id = meta.get("session_id") or meta.get("sessionId") or _session_id_from_room_name(room_name)
+    _log.info(
+        "worker_context_resolution_start",
+        has_room_name=bool(room_name),
+        has_session_id=bool(session_id),
+        room_name_source="metadata_or_context" if room_name else "missing",
+    )
     cid_token = set_correlation_id(meta.get("correlation_id"))
 
     # HIGH SEC-13: Resolve worker context from API (server-side lookup).
@@ -239,6 +247,12 @@ async def entrypoint(ctx: JobContext) -> None:
             worker_ctx = resolved
         else:
             # Hosted jobs fail closed when authorized context cannot be resolved.
+            _log.warn(
+                "worker_context_resolution_failed",
+                error_category=str(resolved),
+                has_room_name=bool(room_name),
+                has_session_id=bool(session_id),
+            )
             await persistence.fail_session(
                 str(session_id), "worker_crash", expected_status="waiting",
             )
