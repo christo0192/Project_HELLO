@@ -3,7 +3,7 @@
   "rewrites": [
     {
       "source": "/api/(.*)",
-      "destination": "http://161.118.177.99/api/$1"
+      "destination": "https://project-hello-api.fly.dev/api/$1"
     },
     {
       "source": "/(.*)",
