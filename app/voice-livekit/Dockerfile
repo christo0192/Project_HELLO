@@ -9,8 +9,8 @@
 #  - No HEALTHCHECK and no fake readiness server: the SDK worker does not
 #    expose an HTTP readiness endpoint, and provider-connected behavior (job
 #    drain on SIGTERM) is owner-verified at runtime, not claimed here.
-#  - Model weights are NOT downloaded at build time (see the LiveKit Cloud
-#    runbook: `download-files` build/runtime strategy is OWNER_VERIFY).
+#  - Model weights are downloaded at build time via the LiveKit Agents SDK so
+#    the runtime worker does not fail lazy turn-detector initialization.
 #  - Direct pins only (requirements.txt); this is not a full lock.
 
 # Stage 1: resolve and install pinned direct dependencies in an isolated venv.
@@ -49,6 +49,12 @@ COPY --from=builder /opt/venv /opt/venv
 # Worker sources only — the build context excludes everything else
 # (see .dockerignore). No .env is ever copied into the image.
 COPY agent.py observability.py persistence.py prompting.py provenance.py provider_resilience.py ./
+
+# Download local VAD/turn-detector model assets into the runtime cache before
+# dropping privileges. The worker has no HTTP probe, so missing model files must
+# fail during image build rather than first production job startup.
+RUN python agent.py download-files \
+    && chown -R 1000:1000 /home/agent
 
 USER 1000:1000
 
