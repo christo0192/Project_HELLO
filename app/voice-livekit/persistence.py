@@ -632,7 +632,7 @@ async def drain_pending_writes(
 # Worker context comes from authenticated server-side Supabase/persistence lookup
 # using strict session/room UUID binding — never from client-visible metadata.
 
-_API_TIMEOUT_SEC = float(os.getenv("WORKER_CONTEXT_TIMEOUT_SEC", "5"))
+_API_TIMEOUT_SEC = float(os.getenv("WORKER_CONTEXT_TIMEOUT_SEC", "20"))
 _WORKER_CONTEXT_BREAKER = CircuitBreaker(CircuitBreakerConfig(
     failure_threshold=3,
     cooldown_sec=10.0,
@@ -644,10 +644,10 @@ _WORKER_CONTEXT_BREAKER = CircuitBreaker(CircuitBreakerConfig(
 def _get_worker_context_transport():
     """Create the existing lazy HTTP transport with bounded context timeouts."""
     return HttpxTransport(
-        connect_timeout=5.0,
+        connect_timeout=10.0,
         read_timeout=_API_TIMEOUT_SEC,
-        write_timeout=5.0,
-        pool_timeout=5.0,
+        write_timeout=10.0,
+        pool_timeout=10.0,
         pool_connections=2,
         pool_maxsize=2,
     )
