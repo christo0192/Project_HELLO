@@ -207,6 +207,13 @@ def _classify_close_event(event: Any) -> str | None:
     so recordings and scorecards are produced instead of leaving a false
     worker_crash terminal state.
     """
+    reason = getattr(event, "reason", None)
+    if reason is not None:
+        raw_reason = getattr(reason, "name", None) or getattr(reason, "value", None) or reason
+        reason_str = str(raw_reason).lower().rsplit(".", 1)[-1]
+        if reason_str in _CLOSE_REASON_TO_TERMINAL:
+            return _CLOSE_REASON_TO_TERMINAL[reason_str]
+
     error = getattr(event, "error", None)
     if error is not None:
         error_name = type(error).__name__.lower()
@@ -216,12 +223,7 @@ def _classify_close_event(event: Any) -> str | None:
             return _CLOSE_ERROR_NAME_TO_TERMINAL[error_name]
         return "worker_crash"
 
-    reason = getattr(event, "reason", None)
     if reason is not None:
-        raw_reason = getattr(reason, "name", None) or getattr(reason, "value", None) or reason
-        reason_str = str(raw_reason).lower().rsplit(".", 1)[-1]
-        if reason_str in _CLOSE_REASON_TO_TERMINAL:
-            return _CLOSE_REASON_TO_TERMINAL[reason_str]
         return "worker_crash"
 
     # Clean SDK close with no error/reason → normal candidate leave.

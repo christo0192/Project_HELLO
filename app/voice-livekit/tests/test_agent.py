@@ -227,6 +227,11 @@ class TestClassifyCloseEvent(unittest.TestCase):
         result = agent_mod._classify_close_event(event)
         self.assertIsNone(result)
 
+    def test_client_initiated_reason_takes_precedence_over_error_object(self):
+        event = FakeCloseEvent(error=RuntimeError("disconnect"), reason="CloseReason.CLIENT_INITIATED")
+        result = agent_mod._classify_close_event(event)
+        self.assertIsNone(result)
+
     def test_shutdown_reason(self):
         event = FakeCloseEvent(error=None, reason=FakeAgentSessionCloseReason("shutdown"))
         result = agent_mod._classify_close_event(event)
