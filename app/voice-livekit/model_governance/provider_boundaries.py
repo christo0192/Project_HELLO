@@ -35,7 +35,7 @@ MODEL_GOVERNANCE_SCHEMA_VERSION = 1
 # ── Closed enumerations ─────────────────────────────────────────────────
 
 ALLOWED_POLICY_STATUSES = frozenset({"PROPOSED", "PENDING", "NOT_EVALUATED"})
-ALLOWED_PROVIDERS = frozenset({"anthropic", "sarvam", "silero", "livekit", "supabase"})
+ALLOWED_PROVIDERS = frozenset({"deepseek", "sarvam", "silero", "livekit", "supabase"})
 ALLOWED_WORKLOADS = frozenset({"screening", "scoring", "resume_extraction"})
 ALLOWED_RUNTIMES = frozenset({"api", "voice-livekit"})
 ALLOWED_BOUNDARY_KINDS = frozenset(
@@ -329,19 +329,19 @@ PROVIDER_BOUNDARIES: list[dict[str, Any]] = [
         ),
     },
     {
-        "id": "livekit-llm-anthropic",
+        "id": "livekit-llm-deepseek",
         "workloads": ["screening"],
-        "provider": "anthropic",
+        "provider": "deepseek",
         "runtime": "voice-livekit",
         "boundaryKind": "sdk_constructor",
         "constructorPath": "app/voice-livekit/agent.py",
-        "envVars": ["ANTHROPIC_MODEL"],
-        "allowlists": ["anthropic"],
+        "envVars": ["DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL"],
+        "allowlists": ["deepseek"],
         "policyStatus": "PENDING",
         "notes": (
-            "livekit.plugins.anthropic.LLM(model=ANTHROPIC_MODEL). Provenance is claimed via "
-            "set_session_provenance before any provider construction; the same configured model feeds "
-            "screening_provenance."
+            "livekit.plugins.openai.LLM(model=DEEPSEEK_MODEL, base_url=DEEPSEEK_BASE_URL). "
+            "Provenance is claimed via set_session_provenance before any provider construction; "
+            "the same configured model feeds screening_provenance."
         ),
     },
     {
@@ -378,7 +378,7 @@ PROVIDER_BOUNDARIES: list[dict[str, Any]] = [
     {
         "id": "livekit-prompt-construction",
         "workloads": ["screening"],
-        "provider": "anthropic",
+        "provider": "deepseek",
         "runtime": "voice-livekit",
         "boundaryKind": "prompt_construction",
         "constructorPath": "app/voice-livekit/prompting.py",
@@ -393,12 +393,12 @@ PROVIDER_BOUNDARIES: list[dict[str, Any]] = [
     {
         "id": "livekit-provenance",
         "workloads": ["screening"],
-        "provider": "anthropic",
+        "provider": "deepseek",
         "runtime": "voice-livekit",
         "boundaryKind": "provenance",
         "constructorPath": "app/voice-livekit/provenance.py",
         "envVars": [],
-        "allowlists": ["anthropic", "screening", "scoring"],
+        "allowlists": ["deepseek", "screening", "scoring"],
         "policyStatus": "PROPOSED",
         "notes": (
             "screening_provenance mirrors model-provenance.ts shape without cross-imports. Documented "

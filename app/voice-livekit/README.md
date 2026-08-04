@@ -6,8 +6,7 @@ that remains the rollback path.
 
 Stack: Sarvam STT (`saaras:v3`, en-IN) + Sarvam TTS (`bulbul:v3`, speaker `shubh`)
 + local multilingual turn-detector model (`livekit.plugins.turn_detector.multilingual.MultilingualModel`,
-runs on-device, not the cloud `inference.TurnDetector`) + silero VAD + Anthropic
-Haiku (`claude-haiku-4-5-20251001`) LLM.
+runs on-device, not the cloud `inference.TurnDetector`) + silero VAD + DeepSeek (`deepseek-chat`) LLM.
 
 The mature Gopu screening prompt from the Pipecat implementation has been ported
 into this worker: AI disclosure, five-minute screening discipline, role-specific
@@ -20,7 +19,7 @@ candidate Q&A wind-down, and final goodbye behavior.
 python -m venv "D:\Claude projects\Screening bot for HR\app\voice-livekit\.venv"
 & "D:\Claude projects\Screening bot for HR\app\voice-livekit\.venv\Scripts\Activate.ps1"
 python -m pip install --upgrade pip
-pip install "livekit-agents[silero,turn-detector]" livekit-plugins-sarvam livekit-plugins-anthropic python-dotenv supabase httpx
+pip install "livekit-agents[silero,turn-detector]" livekit-plugins-sarvam livekit-plugins-openai python-dotenv supabase httpx
 python agent.py download-files   # already run — pulls the turn-detector + silero model weights locally
 ```
 
@@ -59,7 +58,7 @@ This is now the dashboard path. The React dashboard asks the Node API to create 
 `screening_v2.call_sessions` row, create a LiveKit room, and return a browser
 join token. The LiveKit worker reads the room metadata, writes committed
 conversation turns into `screening_v2.transcript_turns`, completes the session on
-close, and triggers the existing `/api/assess/:session_id` Claude scorecard.
+close, and triggers the existing `/api/assess/:session_id` DeepSeek scorecard.
 
 Required environment variables (see `.env.example` in each directory):
 
@@ -91,7 +90,7 @@ What should happen:
 
 - Live transcript appears in the dashboard from Supabase Realtime.
 - Browser-side playback audio is uploaded to `recordings_v2` when the call ends.
-- The worker marks the session completed and triggers the same Claude scorecard
+- The worker marks the session completed and triggers the same DeepSeek scorecard
   route used by the old flow.
 
 ## Manual LiveKit Cloud Test

@@ -32,7 +32,7 @@ if _LIVEKIT_DIR not in sys.path:
 _STUBBED_MODULES: list[str] = []
 for _mod_name in (
     "livekit", "livekit.agents", "livekit.plugins",
-    "livekit.plugins.anthropic", "livekit.plugins.sarvam", "livekit.plugins.silero",
+    "livekit.plugins.openai", "livekit.plugins.sarvam", "livekit.plugins.silero",
     "livekit.plugins.turn_detector", "livekit.plugins.turn_detector.multilingual",
     "dotenv",
 ):
