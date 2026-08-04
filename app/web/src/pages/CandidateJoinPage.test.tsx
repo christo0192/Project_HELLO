@@ -50,7 +50,13 @@ vi.mock('livekit-client', () => ({
   },
   RoomEvent: { TrackSubscribed: 'trackSubscribed', Disconnected: 'disconnected' },
   Track: { Kind: { Audio: 'audio' } },
-  LocalAudioTrack: class {},
+  LocalAudioTrack: class {
+    mediaStreamTrack: unknown;
+    stop = vi.fn();
+    constructor(mediaStreamTrack?: unknown) {
+      this.mediaStreamTrack = mediaStreamTrack;
+    }
+  },
   createLocalAudioTrack,
 }));
 
@@ -87,6 +93,11 @@ describe('CandidateJoinPage', () => {
     exchangeCandidateInvite.mockResolvedValue({
       url: 'wss://livekit.example.invalid',
       livekit_token: 'synthetic-livekit-token',
+    });
+    createLocalAudioTrack.mockResolvedValue({ stop: vi.fn() });
+    Object.defineProperty(window.navigator, 'mediaDevices', {
+      configurable: true,
+      value: undefined,
     });
   });
 
@@ -217,6 +228,35 @@ describe('CandidateJoinPage', () => {
       'wss://livekit.example.invalid',
       'synthetic-livekit-token',
     );
+  });
+
+  it('falls back to browser getUserMedia before exchanging when LiveKit audio creation fails', async () => {
+    candidateConsentStatus.mockResolvedValue({
+      has_consent: true,
+      template_version: '1.0',
+      locale: 'en-IN',
+      required_consents: ['ai_interview', 'recording'],
+    });
+    createLocalAudioTrack.mockRejectedValueOnce(new DOMException('primary failed', 'AbortError'));
+    const browserTrack = { kind: 'audio' };
+    const getUserMedia = vi.fn().mockResolvedValue({ getAudioTracks: () => [browserTrack] });
+    Object.defineProperty(window.navigator, 'mediaDevices', {
+      configurable: true,
+      value: { getUserMedia },
+    });
+
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Join screening' })).toBeInTheDocument();
+    });
+    await userEvent.click(screen.getByRole('button', { name: 'Join screening' }));
+
+    await waitFor(() => expect(exchangeCandidateInvite).toHaveBeenCalledWith(SYNTHETIC_INVITE));
+    expect(getUserMedia).toHaveBeenCalledWith({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    expect(connect).toHaveBeenCalledWith('wss://livekit.example.invalid', 'synthetic-livekit-token');
   });
 
   it('blocks joining and shows a generic unsupported message when capabilities are missing', async () => {

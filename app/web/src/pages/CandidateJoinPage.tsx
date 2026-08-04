@@ -42,6 +42,46 @@ const LOCALE = 'en-IN';
 /** Invites issued by the API are 256-bit tokens serialized as 64 hex chars. */
 const INVITE_TOKEN_RE = /^[a-f0-9]{64}$/;
 
+async function acquireLocalAudioTrack(): Promise<LocalAudioTrack> {
+  try {
+    return await createLocalAudioTrack({
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    });
+  } catch (primaryError) {
+    const mediaDevices = window.navigator?.mediaDevices;
+    if (!mediaDevices || typeof mediaDevices.getUserMedia !== 'function') {
+      throw primaryError;
+    }
+    try {
+      const stream = await mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      const [track] = stream.getAudioTracks();
+      if (!track) throw primaryError;
+      return new LocalAudioTrack(track);
+    } catch {
+      throw primaryError;
+    }
+  }
+}
+
+function microphoneErrorMessage(error: unknown): string {
+  const name = error instanceof DOMException ? error.name : '';
+  if (name === 'NotAllowedError' || name === 'SecurityError') {
+    return 'Microphone permission is blocked. Please allow microphone access in your browser site settings and try again.';
+  }
+  if (name === 'NotFoundError' || name === 'OverconstrainedError') {
+    return 'No usable microphone was found. Please connect or enable a microphone and try again.';
+  }
+  return 'Microphone access is required before this invite can be used. Please allow microphone access and try again.';
+}
+
 function plainText(markdown: string): string {
   // Render template body as SAFE PLAIN TEXT — no markdown/HTML execution.
   return markdown.replace(/[`*_~#>]/g, '').trim();
@@ -170,11 +210,7 @@ export function CandidateJoinPage() {
     try {
       // Acquire microphone access before consuming the one-time invite. If the
       // browser permission/device step fails, the invite remains reusable.
-      const localTrack = await createLocalAudioTrack({
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      });
+      const localTrack = await acquireLocalAudioTrack();
       localTrackRef.current = localTrack;
 
       const access = await api.exchangeCandidateInvite(invite);
@@ -199,7 +235,7 @@ export function CandidateJoinPage() {
       roomRef.current = null;
       setStatus('ready');
       if (!exchanged) {
-        setError('Microphone access is required before this invite can be used. Please allow microphone access and try again.');
+        setError(microphoneErrorMessage(err));
         return;
       }
       setError(err instanceof ApiError ? err.message : 'Unable to join this screening.');
