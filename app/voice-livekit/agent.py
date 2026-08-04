@@ -1,6 +1,6 @@
 """
     SPIKE: LiveKit Agents voice worker (Gopu screening interviewer).
-Sarvam STT/TTS + silero VAD endpointing + DeepSeek LLM.
+Sarvam STT/TTS + LiveKit Agents turn handling + DeepSeek LLM.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from typing import Any, Callable
 from dotenv import load_dotenv
 
 from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli
-from livekit.plugins import openai, sarvam, silero
+from livekit.plugins import openai, sarvam
 
 import persistence
 from observability import (
@@ -442,20 +442,10 @@ async def _run_session(ctx: JobContext, started_at: float, session_id: Any, work
                     api_key=os.getenv("DEEPSEEK_API_KEY"),
                     base_url=DEEPSEEK_BASE_URL,
                 ),
-                vad=silero.VAD.load(
-                    activation_threshold=_float_env("LIVEKIT_VAD_ACTIVATION_THRESHOLD", 0.7),
-                    min_speech_duration=_float_env("LIVEKIT_VAD_MIN_SPEECH_DURATION", 0.3),
-                    min_silence_duration=_float_env("LIVEKIT_VAD_MIN_SILENCE_DURATION", 0.65),
-                    prefix_padding_duration=_float_env("LIVEKIT_VAD_PREFIX_PADDING_DURATION", 0.25),
-                ),
-                turn_detection=None,
-                min_endpointing_delay=_float_env("LIVEKIT_MIN_ENDPOINTING_DELAY", 0.35),
-                max_endpointing_delay=_float_env("LIVEKIT_MAX_ENDPOINTING_DELAY", 2.0),
-                min_interruption_duration=_float_env("LIVEKIT_MIN_INTERRUPTION_DURATION", 0.75),
-                min_interruption_words=_int_env("LIVEKIT_MIN_INTERRUPTION_WORDS", 2),
-                false_interruption_timeout=_float_env("LIVEKIT_FALSE_INTERRUPTION_TIMEOUT", 1.2),
-                resume_false_interruption=True,
-                allow_interruptions=True,
+                # Do not provide custom VAD or turn-detection components here.
+                # LiveKit Agents owns turn handling via its AgentSession defaults.
+                # This avoids deprecated endpointing knobs and keeps behavior on
+                # the SDK-supported path.
             )
 
             @session.on("conversation_item_added")
@@ -489,7 +479,11 @@ async def _run_session(ctx: JobContext, started_at: float, session_id: Any, work
                    round(_monotonic() - setup_started, 3))
 
         async def _generate_reply(span: Span | None) -> None:
-            await session.generate_reply(instructions=opening_text)
+            say = getattr(session, "say", None)
+            if callable(say):
+                await say(opening_text)
+            else:
+                await session.generate_reply(instructions=opening_text)
 
         generate_started = _monotonic()
         await _run_span_guarded("session_generate_reply", _generate_reply, parent=session_span)

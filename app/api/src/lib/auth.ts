@@ -582,8 +582,8 @@ export const PUBLIC_ROUTES: { method: string; path: string }[] = [
 
 export function isPublicRoute(method: string, path: string): boolean {
   if (PUBLIC_ROUTES.some((r) => r.method === method && r.path === path)) return true;
-  // Candidate recording upload is grant-authenticated inside the route.
-  return method === 'POST' && /^\/api\/livekit\/[0-9a-f-]{36}\/recording$/i.test(path);
+  // Candidate recording upload and completion are grant-authenticated inside the route.
+  return method === 'POST' && /^\/api\/livekit\/[0-9a-f-]{36}\/(recording|complete)$/i.test(path);
 }
 
 // ── Test helper: create a token verifier that always returns a given user ──

@@ -29,6 +29,7 @@ import type { AuthUser } from '../lib/auth.js';
 import { createSession, transitionSession } from '../lib/session-lifecycle.js';
 import { getCorrelationId } from '../lib/correlation.js';
 import { handleRecordingGrant } from './invites.js';
+import { runAssessment } from '../services/assessment.js';
 import { resolveWorkerContext } from '../lib/worker-context.js';
 import { createMaintenanceMiddleware } from '../lib/maintenance.js';
 import {
@@ -402,6 +403,72 @@ livekitRouter.post(
       if (statusCode === 404) {
         return res.status(404).json({ error: 'not_found' });
       }
+      next(error);
+    }
+  },
+);
+
+// ── POST /api/livekit/:sessionId/complete ────────────────────────────
+// Candidate grant-authenticated completion path. The browser calls this when
+// the candidate leaves the LiveKit room so the session does not remain stuck
+// in_progress and the scorecard can be produced.
+livekitRouter.post(
+  '/:sessionId/complete',
+  validateParams(recordingUploadParamSchema),
+  async (req, res, next) => {
+    try {
+      const sessionId = req.params.sessionId;
+      const grantHeader = req.headers['x-grant-token'];
+      const grantToken = typeof grantHeader === 'string' && /^[a-f0-9]{64}$/.test(grantHeader)
+        ? grantHeader
+        : undefined;
+      if (!grantToken) {
+        return res.status(403).json({ error: 'access_denied' });
+      }
+
+      const { validateGrant } = await import('../lib/candidate-access.js');
+      const validation = await validateGrant(grantToken);
+      if (!validation.ok || validation.payload.session_id !== sessionId) {
+        return res.status(403).json({ error: 'access_denied' });
+      }
+
+      const { data: session, error: sessionErr } = await supabase
+        .from('call_sessions')
+        .select('status, started_at')
+        .eq('id', sessionId)
+        .single();
+      if (sessionErr || !session) {
+        return res.status(404).json({ error: 'not_found' });
+      }
+
+      if (session.status === 'completed') {
+        return res.status(202).json({ status: 'already_completed' });
+      }
+      if (session.status !== 'in_progress') {
+        return res.status(409).json({ error: 'session_not_completable' });
+      }
+
+      const startedAt = session.started_at ? new Date(session.started_at).getTime() : Date.now();
+      const durationSec = Math.max(0, Math.min(86_400, Math.floor((Date.now() - startedAt) / 1000)));
+      const completed = await transitionSession(
+        sessionId,
+        'in_progress',
+        'completed',
+        'conversation_complete',
+        { duration_sec: durationSec },
+      );
+      if (!completed.ok && !completed.conflict) {
+        return next(new Error('session completion failed'));
+      }
+
+      // Best-effort synchronous scoring trigger so the dashboard can show a
+      // scorecard shortly after the candidate leaves. If scoring fails, the
+      // completed session remains durable and admin/reconciler can retry.
+      if (completed.ok) {
+        runAssessment(sessionId).catch(() => undefined);
+      }
+      return res.status(202).json({ status: completed.ok ? 'completed' : 'already_completed' });
+    } catch (error) {
       next(error);
     }
   },

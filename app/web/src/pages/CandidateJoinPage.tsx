@@ -110,6 +110,10 @@ export function CandidateJoinPage() {
   const roomRef = useRef<Room | null>(null);
   const localTrackRef = useRef<LocalAudioTrack | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
+  const grantTokenRef = useRef<string | null>(null);
+  const sessionIdRef = useRef<string | null>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const recordingChunksRef = useRef<BlobPart[]>([]);
   const capabilityStatus = useCapabilitySupport();
 
   // ── Invite capture: fragment → memory only, fragment removed immediately ─
@@ -123,6 +127,7 @@ export function CandidateJoinPage() {
     window.history.replaceState(null, '', '/candidate/join');
 
     return () => {
+      recorderRef.current?.state === 'recording' && recorderRef.current.stop();
       localTrackRef.current?.stop();
       roomRef.current?.disconnect();
     };
@@ -210,6 +215,67 @@ export function CandidateJoinPage() {
     }
   }
 
+  function startBrowserRecording(localTrack: LocalAudioTrack) {
+    const MediaRecorderCtor = window.MediaRecorder;
+    const mediaStreamTrack = localTrack.mediaStreamTrack;
+    if (!MediaRecorderCtor || !mediaStreamTrack) return;
+    try {
+      const stream = new MediaStream([mediaStreamTrack]);
+      const options = MediaRecorderCtor.isTypeSupported?.('audio/webm;codecs=opus')
+        ? { mimeType: 'audio/webm;codecs=opus' }
+        : undefined;
+      const recorder = new MediaRecorderCtor(stream, options);
+      recordingChunksRef.current = [];
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) recordingChunksRef.current.push(event.data);
+      };
+      recorder.start(1000);
+      recorderRef.current = recorder;
+    } catch {
+      recorderRef.current = null;
+      recordingChunksRef.current = [];
+    }
+  }
+
+  async function stopAndUploadRecording() {
+    const recorder = recorderRef.current;
+    recorderRef.current = null;
+    if (!recorder) return;
+    if (recorder.state === 'recording') {
+      await new Promise<void>((resolve) => {
+        const previous = recorder.onstop;
+        recorder.onstop = (event) => {
+          previous?.call(recorder, event);
+          resolve();
+        };
+        recorder.stop();
+      });
+    }
+    const sessionId = sessionIdRef.current;
+    const grantToken = grantTokenRef.current;
+    const chunks = recordingChunksRef.current;
+    recordingChunksRef.current = [];
+    if (!sessionId || !grantToken || chunks.length === 0) return;
+    const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+    if (blob.size === 0) return;
+    try {
+      await api.uploadCandidateRecording(sessionId, grantToken, blob);
+    } catch {
+      // Recording upload failure must not trap the candidate in the room.
+    }
+  }
+
+  async function completeCandidateSession() {
+    const sessionId = sessionIdRef.current;
+    const grantToken = grantTokenRef.current;
+    if (!sessionId || !grantToken) return;
+    try {
+      await api.completeCandidateScreening(sessionId, grantToken);
+    } catch {
+      // Completion/scoring can be retried by ops/reconciler; keep candidate UX terminal.
+    }
+  }
+
   async function join() {
     const invite = inviteRef.current;
     if (!invite || phase !== 'granted') {
@@ -229,6 +295,8 @@ export function CandidateJoinPage() {
       joinStep = 'exchange';
       const access = await api.exchangeCandidateInvite(invite);
       inviteRef.current = null;
+      grantTokenRef.current = access.grant_token;
+      sessionIdRef.current = access.session_id;
 
       joinStep = 'connect';
       const room = new Room({ adaptiveStream: true, dynacast: true });
@@ -241,6 +309,7 @@ export function CandidateJoinPage() {
       room.on(RoomEvent.Disconnected, () => setStatus('ended'));
       await room.connect(access.url, access.livekit_token);
       await room.localParticipant.publishTrack(localTrack);
+      startBrowserRecording(localTrack);
       setStatus('live');
     } catch (err) {
       localTrackRef.current?.stop();
@@ -256,11 +325,13 @@ export function CandidateJoinPage() {
     }
   }
 
-  function leave() {
+  async function leave() {
+    await stopAndUploadRecording();
     localTrackRef.current?.stop();
     localTrackRef.current = null;
     roomRef.current?.disconnect();
     roomRef.current = null;
+    await completeCandidateSession();
     setStatus('ended');
   }
 

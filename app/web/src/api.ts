@@ -178,6 +178,23 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ token }),
     }),
+  completeCandidateScreening: (sessionId: string, grantToken: string) =>
+    request<{ status: string }>(`/api/livekit/${sessionId}/complete`, {
+      method: 'POST',
+      headers: { 'x-grant-token': grantToken },
+    }),
+  uploadCandidateRecording: (sessionId: string, grantToken: string, blob: Blob) => {
+    const form = new FormData();
+    form.append('file', blob, 'screening.webm');
+    return request<{ ok: true; object_key: string; sha256: string }>(
+      `/api/livekit/${sessionId}/recording`,
+      {
+        method: 'POST',
+        headers: { 'x-grant-token': grantToken },
+        body: form,
+      },
+    );
+  },
   turn: (sessionId: string, text: string) =>
     request<TurnResult>(`/api/screening/${sessionId}/turn`, {
       method: 'POST',
