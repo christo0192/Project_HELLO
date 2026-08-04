@@ -5,8 +5,7 @@ Isolated, throwaway LiveKit Agents worker to test whether migrating off Pipecat
 that remains the rollback path.
 
 Stack: Sarvam STT (`saaras:v3`, en-IN) + Sarvam TTS (`bulbul:v3`, speaker `shubh`)
-+ local multilingual turn-detector model (`livekit.plugins.turn_detector.multilingual.MultilingualModel`,
-runs on-device, not the cloud `inference.TurnDetector`) + silero VAD + DeepSeek (`deepseek-chat`) LLM.
++ silero VAD endpointing + DeepSeek (`deepseek-chat`) LLM.
 
 The mature Gopu screening prompt from the Pipecat implementation has been ported
 into this worker: AI disclosure, five-minute screening discipline, role-specific
@@ -19,8 +18,7 @@ candidate Q&A wind-down, and final goodbye behavior.
 python -m venv "D:\Claude projects\Screening bot for HR\app\voice-livekit\.venv"
 & "D:\Claude projects\Screening bot for HR\app\voice-livekit\.venv\Scripts\Activate.ps1"
 python -m pip install --upgrade pip
-pip install "livekit-agents[silero,turn-detector]" livekit-plugins-sarvam livekit-plugins-openai python-dotenv supabase httpx
-python agent.py download-files   # already run — pulls the turn-detector + silero model weights locally
+pip install "livekit-agents[silero]" livekit-plugins-sarvam livekit-plugins-openai python-dotenv supabase httpx
 ```
 
 ## Step 1 — voice test (PRIMARY spike path, no LiveKit Cloud account needed)
@@ -144,8 +142,6 @@ soft-spoken candidates get missed, lower those two values slightly.
 
 - `agent.py` is still a LiveKit migration spike, but it now uses the full Gopu
   behavior prompt from the Pipecat prototype.
-- Deprecation warnings on import (`livekit-plugins-silero` bundling, and
-  `turn_detector` -> `inference.TurnDetector`) are expected and harmless for
-  this spike; we deliberately kept the local `MultilingualModel` so the
-  turn-detector model runs on-device rather than calling out to LiveKit's
-  cloud inference endpoint.
+- Deprecation warnings on import (`livekit-plugins-silero` bundling) are expected
+  and harmless for this spike. Production uses VAD-only endpointing to avoid
+  local turn-detector model memory pressure on low-cost Fly machines.

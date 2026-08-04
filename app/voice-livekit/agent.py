@@ -1,6 +1,6 @@
 """
     SPIKE: LiveKit Agents voice worker (Gopu screening interviewer).
-Sarvam STT/TTS + local multilingual turn-detector model + DeepSeek LLM.
+Sarvam STT/TTS + silero VAD endpointing + DeepSeek LLM.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ from dotenv import load_dotenv
 
 from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli
 from livekit.plugins import openai, sarvam, silero
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 import persistence
 from observability import (
@@ -406,7 +405,7 @@ async def _run_session(ctx: JobContext, started_at: float, session_id: Any, work
                     min_silence_duration=_float_env("LIVEKIT_VAD_MIN_SILENCE_DURATION", 0.65),
                     prefix_padding_duration=_float_env("LIVEKIT_VAD_PREFIX_PADDING_DURATION", 0.25),
                 ),
-                turn_detection=MultilingualModel(),
+                turn_detection=None,
                 min_endpointing_delay=_float_env("LIVEKIT_MIN_ENDPOINTING_DELAY", 0.35),
                 max_endpointing_delay=_float_env("LIVEKIT_MAX_ENDPOINTING_DELAY", 2.0),
                 min_interruption_duration=_float_env("LIVEKIT_MIN_INTERRUPTION_DURATION", 0.75),
