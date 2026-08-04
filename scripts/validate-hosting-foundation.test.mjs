@@ -62,7 +62,7 @@ const exists = async (p) => {
 const isExactPin = (line) => /^[A-Za-z0-9_.-]+==[^=]+$/.test(line);
 const expectedPins = [
   "livekit-agents==1.6.4",
-  "livekit-plugins-anthropic==1.6.4",
+  "livekit-plugins-openai==1.6.4",
   "livekit-plugins-sarvam==1.6.4",
   "livekit-plugins-silero==1.6.4",
   "livekit-plugins-turn-detector==1.6.4",

@@ -27,7 +27,7 @@ def _stub_sdk():
         "livekit": types.ModuleType("livekit"),
         "livekit.agents": types.ModuleType("livekit.agents"),
         "livekit.plugins": types.ModuleType("livekit.plugins"),
-        "livekit.plugins.anthropic": types.ModuleType("livekit.plugins.anthropic"),
+        "livekit.plugins.openai": types.ModuleType("livekit.plugins.openai"),
         "livekit.plugins.sarvam": types.ModuleType("livekit.plugins.sarvam"),
         "livekit.plugins.silero": types.ModuleType("livekit.plugins.silero"),
         "livekit.plugins.turn_detector": types.ModuleType("livekit.plugins.turn_detector"),
@@ -95,8 +95,8 @@ def _stub_sdk():
         def load(**kwargs):
             return MagicMock()
 
-    modules["livekit.plugins"].anthropic = types.ModuleType("livekit.plugins.anthropic")
-    modules["livekit.plugins.anthropic"].LLM = FakeLLM
+    modules["livekit.plugins"].openai = types.ModuleType("livekit.plugins.openai")
+    modules["livekit.plugins.openai"].LLM = FakeLLM
     modules["livekit.plugins.sarvam"] = types.ModuleType("livekit.plugins.sarvam")
     modules["livekit.plugins.sarvam"].STT = FakeSTT
     modules["livekit.plugins.sarvam"].TTS = FakeTTS

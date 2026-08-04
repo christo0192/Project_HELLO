@@ -1,6 +1,6 @@
 """
     SPIKE: LiveKit Agents voice worker (Gopu screening interviewer).
-Sarvam STT/TTS + local multilingual turn-detector model + Anthropic Haiku LLM.
+Sarvam STT/TTS + local multilingual turn-detector model + DeepSeek LLM.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from typing import Any, Callable
 from dotenv import load_dotenv
 
 from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli
-from livekit.plugins import anthropic, sarvam, silero
+from livekit.plugins import openai, sarvam, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 import persistence
@@ -31,7 +31,8 @@ from provenance import screening_provenance
 
 load_dotenv()
 
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 
 
 def _float_env(name: str, default: float) -> float:
@@ -224,10 +225,10 @@ async def entrypoint(ctx: JobContext) -> None:
 
 async def _run_session(ctx: JobContext, started_at: float, session_id: Any, worker_ctx: WorkerContext | None) -> None:
     # LLM-06: claim provenance before any provider construction. The same
-    # configured model is then supplied to Anthropic below.
+    # configured model is then supplied to DeepSeek below.
     claim = await persistence.set_session_provenance(
         session_id,
-        screening_provenance(ANTHROPIC_MODEL),
+        screening_provenance(DEEPSEEK_MODEL),
     )
     if claim not in {
         persistence.ClaimResult.CLAIMED,
@@ -394,7 +395,11 @@ async def _run_session(ctx: JobContext, started_at: float, session_id: Any, work
                     model=os.getenv("SARVAM_TTS_MODEL", "bulbul:v3"),
                     speaker=os.getenv("SARVAM_TTS_VOICE", "shubh"),
                 ),
-                llm=anthropic.LLM(model=ANTHROPIC_MODEL),
+                llm=openai.LLM(
+                    model=DEEPSEEK_MODEL,
+                    api_key=os.getenv("DEEPSEEK_API_KEY"),
+                    base_url=DEEPSEEK_BASE_URL,
+                ),
                 vad=silero.VAD.load(
                     activation_threshold=_float_env("LIVEKIT_VAD_ACTIVATION_THRESHOLD", 0.7),
                     min_speech_duration=_float_env("LIVEKIT_VAD_MIN_SPEECH_DURATION", 0.3),

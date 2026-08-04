@@ -36,7 +36,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 # ---------------------------------------------------------------------------
 # Path bootstrap & SDK stubs (corrected aliasing so `from livekit.plugins
-# import anthropic` binds the module that actually carries `.LLM`).
+# import openai` binds the module that actually carries `.LLM`).
 # ---------------------------------------------------------------------------
 _HERE = os.path.dirname(__file__)
 _LIVEKIT_DIR = os.path.abspath(os.path.join(_HERE, ".."))
@@ -47,7 +47,7 @@ _SDK_MODULES = [
     "livekit",
     "livekit.agents",
     "livekit.plugins",
-    "livekit.plugins.anthropic",
+    "livekit.plugins.openai",
     "livekit.plugins.sarvam",
     "livekit.plugins.silero",
     "livekit.plugins.turn_detector",
@@ -153,15 +153,15 @@ def _install_sdk_stubs() -> None:
             return MagicMock()
 
     # Populate the leaf modules that agent.py imports from.
-    modules["livekit.plugins.anthropic"].LLM = FakeLLM
+    modules["livekit.plugins.openai"].LLM = FakeLLM
     modules["livekit.plugins.sarvam"].STT = FakeSTT
     modules["livekit.plugins.sarvam"].TTS = FakeTTS
     modules["livekit.plugins.silero"].VAD = FakeVAD
     modules["livekit.plugins.turn_detector.multilingual"].MultilingualModel = MagicMock
 
     # Alias parent attributes to the SAME module objects held in sys.modules so
-    # `from livekit.plugins import anthropic` and deep from-imports agree.
-    modules["livekit.plugins"].anthropic = modules["livekit.plugins.anthropic"]
+    # `from livekit.plugins import openai` and deep from-imports agree.
+    modules["livekit.plugins"].openai = modules["livekit.plugins.openai"]
     modules["livekit.plugins"].sarvam = modules["livekit.plugins.sarvam"]
     modules["livekit.plugins"].silero = modules["livekit.plugins.silero"]
     modules["livekit.plugins"].turn_detector = modules["livekit.plugins.turn_detector"]

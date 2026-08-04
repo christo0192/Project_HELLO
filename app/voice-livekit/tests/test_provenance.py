@@ -40,8 +40,8 @@ def valid_payload(**overrides: Any) -> dict[str, Any]:
     """Return a valid base provenance payload."""
     payload = {
         "schema_version": MODEL_PROVENANCE_SCHEMA_VERSION,
-        "provider": "anthropic",
-        "requestedModel": "claude-haiku-4-5-20251001",
+        "provider": "deepseek",
+        "requestedModel": "deepseek-chat",
         "workload": "screening",
         "prompt_template_version": "2026-07-28.1",
         "timestamp": "2026-07-28T12:00:00.000Z",
@@ -60,8 +60,8 @@ class TestProvenanceValidation(unittest.TestCase):
     def test_valid_provenance(self):
         result = validate_provenance(valid_payload(), fixed_clock)
         self.assertTrue(result["valid"])
-        self.assertEqual(result["data"]["provider"], "anthropic")
-        self.assertEqual(result["data"]["requestedModel"], "claude-haiku-4-5-20251001")
+        self.assertEqual(result["data"]["provider"], "deepseek")
+        self.assertEqual(result["data"]["requestedModel"], "deepseek-chat")
         self.assertEqual(result["data"]["workload"], "screening")
 
     def test_valid_with_inference_params(self):
@@ -385,14 +385,14 @@ class TestProvenanceValidation(unittest.TestCase):
         self.assertEqual(data["requestedModel"], "original-model")
         self.assertEqual(data["inference_params"]["temperature"], 0.5)
         self.assertEqual(data["inference_params"]["max_tokens"], 100)
-        self.assertEqual(data["provider"], "anthropic")
+        self.assertEqual(data["provider"], "deepseek")
         self.assertIn("timestamp", data)
 
     def test_deep_copy_create_provenance_mutation_isolation(self):
         """Prove that mutating create_provenance arguments does not affect the result."""
-        original_model = "claude-haiku-4-5-20251001"
+        original_model = "deepseek-chat"
         p = create_provenance(
-            provider="anthropic",
+            provider="deepseek",
             requested_model=original_model,
             workload="screening",
             prompt_template_version="2026-07-28.1",
@@ -409,21 +409,21 @@ class TestProvenanceValidation(unittest.TestCase):
 
     def test_create_provenance(self):
         p = create_provenance(
-            provider="anthropic",
-            requested_model="claude-haiku-4-5-20251001",
+            provider="deepseek",
+            requested_model="deepseek-chat",
             workload="screening",
             prompt_template_version="2026-07-28.1",
             clock=fixed_clock,
         )
-        self.assertEqual(p["provider"], "anthropic")
-        self.assertEqual(p["requestedModel"], "claude-haiku-4-5-20251001")
+        self.assertEqual(p["provider"], "deepseek")
+        self.assertEqual(p["requestedModel"], "deepseek-chat")
         self.assertEqual(p["workload"], "screening")
         self.assertEqual(p["schema_version"], 1)
         self.assertEqual(p["timestamp"], "2026-07-28T12:00:00.000Z")
 
     def test_create_provenance_strips_empty_inference_params(self):
         p = create_provenance(
-            provider="anthropic",
+            provider="deepseek",
             requested_model="claude",
             workload="screening",
             prompt_template_version="v1",
@@ -445,9 +445,9 @@ class TestProvenanceValidation(unittest.TestCase):
     # ── screening_provenance ─────────────────────────────────────────
 
     def test_screening_provenance(self):
-        p = screening_provenance("claude-haiku-4-5-20251001", fixed_clock)
+        p = screening_provenance("deepseek-chat", fixed_clock)
         self.assertEqual(p["workload"], "screening")
-        self.assertEqual(p["requestedModel"], "claude-haiku-4-5-20251001")
+        self.assertEqual(p["requestedModel"], "deepseek-chat")
         self.assertEqual(p["prompt_template_version"], SCREENING_PROVENANCE_VERSION)
 
     # ── legacy provenance ────────────────────────────────────────────
@@ -495,7 +495,7 @@ class TestProvenanceValidation(unittest.TestCase):
             ).replace(tzinfo=timezone.utc),
         }
         p = create_provenance(
-            provider="anthropic",
+            provider="deepseek",
             requested_model="claude",
             workload="screening",
             prompt_template_version="v1",
@@ -507,7 +507,7 @@ class TestProvenanceValidation(unittest.TestCase):
         """Default clock should produce timestamps close to real time."""
         before = datetime.now(timezone.utc).timestamp()
         p = create_provenance(
-            provider="anthropic",
+            provider="deepseek",
             requested_model="claude",
             workload="screening",
             prompt_template_version="v1",

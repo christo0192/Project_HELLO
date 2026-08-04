@@ -35,7 +35,9 @@ services:
       SUPABASE_SCHEMA: ${SUPABASE_SCHEMA:-screening_v2}
       API_BASE: ${API_BASE:-}
       WORKER_CONTEXT_SECRET: ${WORKER_CONTEXT_SECRET:-}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}
       SARVAM_API_KEY: ${SARVAM_API_KEY:-}
       LIVEKIT_WORKER_DRAIN_SEC: ${LIVEKIT_WORKER_DRAIN_SEC:-10}
     # Worker connects outbound only (LiveKit WebSocket, Supabase, scoring API);

@@ -64,10 +64,11 @@
       "example": "app/voice-livekit/.env.example",
       "sourceRoots": ["app/voice-livekit"],
       "variables": {
-        "ANTHROPIC_API_KEY": { "requiredInProduction": true, "secret": true, "external": true },
+        "DEEPSEEK_API_KEY": { "requiredInProduction": true, "secret": true, "external": true },
         "SARVAM_API_KEY": { "requiredInProduction": true, "secret": true, "external": true },
         "COMPANY_NAME": { "requiredInProduction": true, "secret": false },
-        "ANTHROPIC_MODEL": { "requiredInProduction": true, "secret": false },
+        "DEEPSEEK_MODEL": { "requiredInProduction": true, "secret": false },
+        "DEEPSEEK_BASE_URL": { "requiredInProduction": true, "secret": false },
         "SARVAM_STT_MODEL": { "requiredInProduction": true, "secret": false },
         "SARVAM_LANGUAGE": { "requiredInProduction": true, "secret": false },
         "SARVAM_TTS_MODEL": { "requiredInProduction": true, "secret": false },

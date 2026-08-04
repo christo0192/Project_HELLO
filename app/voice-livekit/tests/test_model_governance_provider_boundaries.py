@@ -26,7 +26,7 @@ def valid_entry(**overrides: Any) -> dict[str, Any]:
     entry: dict[str, Any] = {
         "id": "example-boundary",
         "workloads": ["screening"],
-        "provider": "anthropic",
+        "provider": "deepseek",
         "runtime": "api",
         "boundaryKind": "cli_spawn",
         "constructorPath": "app/api/src/lib/example.ts",
@@ -62,7 +62,7 @@ class TestShippedInventory(unittest.TestCase):
             self.assertNotIn("optionalEvidenceRefs", entry)
 
     def test_closed_enumerations_exported(self) -> None:
-        self.assertIn("anthropic", ALLOWED_PROVIDERS)
+        self.assertIn("deepseek", ALLOWED_PROVIDERS)
         self.assertIn("screening", ALLOWED_WORKLOADS)
         self.assertIn("voice-livekit", ALLOWED_RUNTIMES)
         self.assertIn("sdk_constructor", ALLOWED_BOUNDARY_KINDS)
