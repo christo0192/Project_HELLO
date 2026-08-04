@@ -173,6 +173,18 @@ class FakeAgentSessionCloseReason:
 
 # ── Tests ─────────────────────────────────────────────────────────────
 
+class TestRoomSessionFallback(unittest.TestCase):
+    def test_extracts_session_id_from_canonical_room_name(self):
+        session_id = "5b2a34cb-a912-4c68-a2c2-79ccdc1dcdd1"
+        self.assertEqual(
+            agent_mod._session_id_from_room_name(f"screening-{session_id}"),
+            session_id,
+        )
+
+    def test_ignores_non_canonical_room_name(self):
+        self.assertIsNone(agent_mod._session_id_from_room_name("synthetic-worker-smoke-123"))
+
+
 class TestClassifyCloseEvent(unittest.TestCase):
     """Explicit mapping — no substring matching, unknown/empty fails closed."""
 

@@ -6,6 +6,7 @@ Sarvam STT/TTS + silero VAD endpointing + DeepSeek LLM.
 from __future__ import annotations
 
 import os
+import re
 import time
 import asyncio
 from typing import Any, Callable
@@ -32,6 +33,21 @@ load_dotenv()
 
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+ROOM_SESSION_RE = re.compile(
+    r"^screening-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
+    re.IGNORECASE,
+)
+
+
+def _room_name_from_context(ctx: JobContext) -> str:
+    room = getattr(ctx, "room", None)
+    name = getattr(room, "name", None)
+    return str(name) if name else ""
+
+
+def _session_id_from_room_name(room_name: str) -> str | None:
+    match = ROOM_SESSION_RE.match(room_name)
+    return match.group(1) if match else None
 
 
 def _float_env(name: str, default: float) -> float:
@@ -197,8 +213,8 @@ async def entrypoint(ctx: JobContext) -> None:
     started_at = _monotonic()
     await ctx.connect()
     meta = collect_prompt_metadata(ctx)
-    session_id = meta.get("session_id") or meta.get("sessionId")
-    room_name = meta.get("room_name") or ""
+    room_name = str(meta.get("room_name") or _room_name_from_context(ctx) or "")
+    session_id = meta.get("session_id") or meta.get("sessionId") or _session_id_from_room_name(room_name)
     cid_token = set_correlation_id(meta.get("correlation_id"))
 
     # HIGH SEC-13: Resolve worker context from API (server-side lookup).
