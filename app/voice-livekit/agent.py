@@ -478,4 +478,16 @@ async def _run_session(ctx: JobContext, started_at: float, session_id: Any, work
 
 
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+    cli.run_app(
+        WorkerOptions(
+            entrypoint_fnc=entrypoint,
+            # Production default prewarms multiple idle job processes. That is
+            # too memory-heavy for the single shared Fly worker used here and
+            # can leave browser joins stuck with no assistant audio. Start job
+            # processes only on demand.
+            num_idle_processes=0,
+            initialize_process_timeout=60.0,
+            job_memory_warn_mb=1400,
+            job_memory_limit_mb=0,
+        )
+    )
