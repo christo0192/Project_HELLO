@@ -198,13 +198,13 @@ class TestRoomSessionFallback(unittest.TestCase):
 
 
 class TestClassifyCloseEvent(unittest.TestCase):
-    """Explicit mapping — no substring matching, unknown/empty fails closed."""
+    """Explicit mapping — no substring matching; unknown explicit values fail closed."""
 
-    def test_no_error_no_reason_fails_closed(self):
-        """No error and no reason → worker_crash (not completion)."""
+    def test_no_error_no_reason_is_clean_completion(self):
+        """No error and no reason → LiveKit clean close / candidate leave."""
         event = FakeCloseEvent(error=None, reason=None)
         result = agent_mod._classify_close_event(event)
-        self.assertEqual(result, "worker_crash")
+        self.assertIsNone(result)
 
     def test_explicit_completion_signal(self):
         """Explicit 'completed' reason → None (conversation_complete)."""

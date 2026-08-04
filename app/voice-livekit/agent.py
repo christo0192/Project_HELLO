@@ -200,9 +200,11 @@ def _classify_close_event(event: Any) -> str | None:
       None → conversation_complete (requires explicit completion signal).
       str  → terminal_reason code (fail/shutdown).
 
-    Unknown or missing close reason → worker_crash (fail closed).
-    A completed interview requires an explicit completion signal;
-    arbitrary participant disconnect without evidence is NOT completion.
+    Unknown explicit close reasons still fail closed. However, LiveKit can emit
+    a clean close event with neither error nor reason when the candidate leaves
+    the room normally. Treat that SDK clean-close shape as conversation_complete
+    so recordings and scorecards are produced instead of leaving a false
+    worker_crash terminal state.
     """
     error = getattr(event, "error", None)
     if error is not None:
@@ -220,8 +222,8 @@ def _classify_close_event(event: Any) -> str | None:
             return _CLOSE_REASON_TO_TERMINAL[reason_str]
         return "worker_crash"
 
-    # No error and no explicit close reason → not a confirmed completion
-    return "worker_crash"
+    # Clean SDK close with no error/reason → normal candidate leave.
+    return None
 
 
 async def entrypoint(ctx: JobContext) -> None:
