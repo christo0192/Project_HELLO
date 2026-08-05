@@ -320,6 +320,12 @@ _CLOSE_REASON_TO_TERMINAL: dict[str | None, str | None] = {
     "completed": None,
     "normal": None,
     "client_initiated": None,
+    # LiveKit Agents 1.6 CloseReason values. A participant leaving the room,
+    # an explicit session close, or a completed task are normal terminal paths.
+    "participant_disconnected": None,
+    "user_initiated": None,
+    "task_completed": None,
+    "job_shutdown": "shutdown_forced",
     "shutdown": "shutdown_forced",
     "cancelled": "shutdown_forced",
     "timeout": "shutdown_forced",

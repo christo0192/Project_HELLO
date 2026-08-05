@@ -319,6 +319,22 @@ class TestClassifyCloseEvent(unittest.TestCase):
         result = agent_mod._classify_close_event(event)
         self.assertIsNone(result)
 
+    def test_livekit_participant_disconnected_is_completion(self):
+        event = FakeCloseEvent(error=None, reason="CloseReason.PARTICIPANT_DISCONNECTED")
+        self.assertIsNone(agent_mod._classify_close_event(event))
+
+    def test_livekit_user_initiated_is_completion(self):
+        event = FakeCloseEvent(error=None, reason="CloseReason.USER_INITIATED")
+        self.assertIsNone(agent_mod._classify_close_event(event))
+
+    def test_livekit_task_completed_is_completion(self):
+        event = FakeCloseEvent(error=None, reason="CloseReason.TASK_COMPLETED")
+        self.assertIsNone(agent_mod._classify_close_event(event))
+
+    def test_livekit_job_shutdown_is_forced_shutdown(self):
+        event = FakeCloseEvent(error=None, reason="CloseReason.JOB_SHUTDOWN")
+        self.assertEqual(agent_mod._classify_close_event(event), "shutdown_forced")
+
     def test_shutdown_reason(self):
         event = FakeCloseEvent(error=None, reason=FakeAgentSessionCloseReason("shutdown"))
         result = agent_mod._classify_close_event(event)
