@@ -3830,34 +3830,43 @@ begin
 end;
 $$;
 
--- ── T19e: non-null provenance other than browser_upload/livekit_egress → provenance_conflict
+-- ── T19e: recording_provenance CHECK constraint rejects invalid values ─
+-- The provenance_conflict status in the RPC is defence-in-depth that can
+-- never fire while chk_call_sessions_recording_provenance (0014:128-135)
+-- limits provenance to {null, browser_upload, livekit_egress}. Test that
+-- the production constraint itself blocks an invalid provenance.
 do $$
 declare
   v_candidate_id uuid;
   v_session_id uuid;
-  v_result jsonb;
 begin
   select id into v_candidate_id from screening_v2.candidates limit 1;
   if v_candidate_id is null then
     insert into _policy_tests.results(test, passed, detail) values
-      ('T19e: provenance conflict rejected', true, 'skipped: no candidate row');
+      ('T19e: CHECK constraint rejects invalid provenance', true, 'skipped: no candidate row');
     return;
   end if;
 
   v_session_id := _policy_tests.seed_repoint_session(
     v_candidate_id, 'EG_polT19e', 'policy-test-browser.webm', false, false, false);
-  -- Set provenance to something other than null / browser_upload / livekit_egress.
-  update screening_v2.call_sessions
-     set recording_provenance = 'other_source'
-   where id = v_session_id;
 
-  v_result := screening_v2.finalize_authoritative_recording(
-    v_session_id, v_session_id::text || '-egress.ogg', repeat('b', 64), 4096, 'audio/ogg', null);
-
-  insert into _policy_tests.results(test, passed, detail) values
-    ('T19e: provenance conflict rejected',
-     v_result ->> 'status' = 'provenance_conflict',
-     'status=' || coalesce(v_result ->> 'status', 'null'));
+  -- The CHECK constraint must reject provenance values outside
+  -- {null, browser_upload, livekit_egress}. This proves the constraint is
+  -- active and the RPC's provenance_conflict branch is unreachable
+  -- defence-in-depth, not a live code path.
+  begin
+    update screening_v2.call_sessions
+       set recording_provenance = 'other_source'
+     where id = v_session_id;
+    insert into _policy_tests.results(test, passed, detail) values
+      ('T19e: CHECK constraint rejects invalid provenance', false,
+       'expected constraint violation but UPDATE succeeded');
+  exception
+    when check_violation then
+      insert into _policy_tests.results(test, passed, detail) values
+        ('T19e: CHECK constraint rejects invalid provenance', true,
+         'check_violation raised as expected');
+  end;
 
   delete from screening_v2.call_sessions where id = v_session_id;
 end;
