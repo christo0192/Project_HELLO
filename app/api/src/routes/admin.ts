@@ -84,23 +84,26 @@ adminRouter.get('/sessions', validateQuery(adminSessionListQuerySchema), async (
     const offset = req.query.offset as unknown as number;
     let q = supabase
       .from('call_sessions')
-      .select('id, candidate_id, role_id, status, created_at, started_at, ended_at')
-      .order('created_at', { ascending: false });
+      .select('id, candidate_id, role_id, status, updated_at, started_at, ended_at')
+      .order('updated_at', { ascending: false });
     if (req.query.status) {
       q = q.eq('status', req.query.status as string);
     }
     const { data, error } = await q.range(offset, offset + limit - 1);
     if (error) return next(new Error('failed to list sessions'));
 
-    const sessions = (data ?? []).map((r) => ({
-      id: r.id,
-      candidate_id: r.candidate_id,
-      role_id: r.role_id,
-      status: r.status,
-      created_at: r.created_at,
-      started_at: r.started_at,
-      ended_at: r.ended_at,
-    }));
+    const sessions = (data ?? []).map((r) => {
+      const row = r as typeof r & { created_at?: string | null };
+      return {
+        id: row.id,
+        candidate_id: row.candidate_id,
+        role_id: row.role_id,
+        status: row.status,
+        created_at: row.updated_at ?? row.created_at,
+        started_at: row.started_at,
+        ended_at: row.ended_at,
+      };
+    });
     res.json({ sessions });
   } catch (error) {
     next(error);

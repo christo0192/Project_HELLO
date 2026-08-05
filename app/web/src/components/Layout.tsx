@@ -12,18 +12,14 @@
  *   returned to the toggle on close.
  * - Topbar: mobile menu toggle, theme toggle (design barrel), status.
  * - Skip link + `#main-content` target (WCAG 2.4.1).
- * - Restrained route fade via lib/motion `usePageVariants()`; collapses to
- *   static values under `prefers-reduced-motion`.
  * - Lazy route chunks suspend inside `<Suspense>` with a small loading
  *   fallback (route components are React.lazy in App.tsx).
  */
 
 import { Suspense, useEffect, useRef, useState } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
-import { motion } from 'motion/react';
 import { api } from '../api';
 import { useAuth, type MembershipRole } from '../lib/auth';
-import { usePageVariants } from '../lib/motion';
 import { Spinner } from './ui';
 import { ThemeToggle } from './design';
 import { ErrorBoundary } from './ErrorBoundary';
@@ -90,7 +86,6 @@ export function Layout() {
   const { user, signOut, isAuthenticated, role } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
-  const pageVariants = usePageVariants();
 
   const [status, setStatus] = useState<Status>('checking');
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -309,15 +304,9 @@ export function Layout() {
                   </div>
                 }
               >
-                {/* Restrained route fade; static under reduced motion. */}
-                <motion.div
-                  key={location.pathname}
-                  variants={pageVariants}
-                  initial="initial"
-                  animate="enter"
-                >
+                <div key={location.pathname}>
                   <Outlet />
-                </motion.div>
+                </div>
               </Suspense>
             </ErrorBoundary>
           </div>
