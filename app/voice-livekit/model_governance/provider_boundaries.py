@@ -35,7 +35,7 @@ MODEL_GOVERNANCE_SCHEMA_VERSION = 1
 # ── Closed enumerations ─────────────────────────────────────────────────
 
 ALLOWED_POLICY_STATUSES = frozenset({"PROPOSED", "PENDING", "NOT_EVALUATED"})
-ALLOWED_PROVIDERS = frozenset({"deepseek", "sarvam", "silero", "livekit", "supabase"})
+ALLOWED_PROVIDERS = frozenset({"deepseek", "gemini", "sarvam", "silero", "livekit", "supabase"})
 ALLOWED_WORKLOADS = frozenset({"screening", "scoring", "resume_extraction"})
 ALLOWED_RUNTIMES = frozenset({"api", "voice-livekit"})
 ALLOWED_BOUNDARY_KINDS = frozenset(
@@ -329,25 +329,25 @@ PROVIDER_BOUNDARIES: list[dict[str, Any]] = [
         ),
     },
     {
-        "id": "livekit-llm-deepseek",
+        "id": "livekit-llm-gemini",
         "workloads": ["screening"],
-        "provider": "deepseek",
+        "provider": "gemini",
         "runtime": "voice-livekit",
         "boundaryKind": "sdk_constructor",
         "constructorPath": "app/voice-livekit/agent.py",
-        "envVars": ["DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL"],
-        "allowlists": ["deepseek"],
+        "envVars": ["GEMINI_MODEL", "GEMINI_BASE_URL"],
+        "allowlists": ["gemini"],
         "policyStatus": "PENDING",
         "notes": (
-            "livekit.plugins.openai.LLM(model=DEEPSEEK_MODEL, base_url=DEEPSEEK_BASE_URL). "
-            "Provenance is claimed via set_session_provenance before any provider construction; "
-            "the same configured model feeds screening_provenance."
+            "livekit.plugins.openai.LLM(model=GEMINI_MODEL, base_url=GEMINI_BASE_URL) "
+            "streams directly from Google's OpenAI-compatible endpoint. Provenance is claimed "
+            "before provider construction using the same configured model."
         ),
     },
     {
         "id": "livekit-prompt-construction",
         "workloads": ["screening"],
-        "provider": "deepseek",
+        "provider": "gemini",
         "runtime": "voice-livekit",
         "boundaryKind": "prompt_construction",
         "constructorPath": "app/voice-livekit/prompting.py",
@@ -362,12 +362,12 @@ PROVIDER_BOUNDARIES: list[dict[str, Any]] = [
     {
         "id": "livekit-provenance",
         "workloads": ["screening"],
-        "provider": "deepseek",
+        "provider": "gemini",
         "runtime": "voice-livekit",
         "boundaryKind": "provenance",
         "constructorPath": "app/voice-livekit/provenance.py",
         "envVars": [],
-        "allowlists": ["deepseek", "screening", "scoring"],
+        "allowlists": ["deepseek", "gemini", "screening", "scoring"],
         "policyStatus": "PROPOSED",
         "notes": (
             "screening_provenance mirrors model-provenance.ts shape without cross-imports. Documented "

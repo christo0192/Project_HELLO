@@ -120,6 +120,7 @@ export function CandidateJoinPage() {
   const sessionIdRef = useRef<string | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const recordingChunksRef = useRef<BlobPart[]>([]);
+  const finalizationPromiseRef = useRef<Promise<void> | null>(null);
   const capabilityStatus = useCapabilitySupport();
 
   // ── Invite capture: fragment → memory only, fragment removed immediately ─
@@ -245,10 +246,10 @@ export function CandidateJoinPage() {
     }
   }
 
-  async function stopAndUploadRecording() {
+  async function stopBrowserRecording(): Promise<Blob | null> {
     const recorder = recorderRef.current;
     recorderRef.current = null;
-    if (!recorder) return;
+    if (!recorder) return null;
     if (recorder.state === 'recording') {
       await new Promise<void>((resolve) => {
         const previous = recorder.onstop;
@@ -259,13 +260,17 @@ export function CandidateJoinPage() {
         recorder.stop();
       });
     }
-    const sessionId = sessionIdRef.current;
-    const grantToken = grantTokenRef.current;
     const chunks = recordingChunksRef.current;
     recordingChunksRef.current = [];
-    if (!sessionId || !grantToken || chunks.length === 0) return;
+    if (chunks.length === 0) return null;
     const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
-    if (blob.size === 0) return;
+    return blob.size > 0 ? blob : null;
+  }
+
+  async function uploadBrowserFallback(blob: Blob | null) {
+    const sessionId = sessionIdRef.current;
+    const grantToken = grantTokenRef.current;
+    if (!blob || !sessionId || !grantToken) return;
     for (let attempt = 1; attempt <= CANDIDATE_FINALIZE_ATTEMPTS; attempt += 1) {
       try {
         await api.uploadCandidateRecording(sessionId, grantToken, blob);
@@ -276,24 +281,47 @@ export function CandidateJoinPage() {
         }
       }
     }
-    // Recording upload failure must not trap the candidate in the room.
   }
 
-  async function completeCandidateSession() {
-    const sessionId = sessionIdRef.current;
-    const grantToken = grantTokenRef.current;
-    if (!sessionId || !grantToken) return;
-    for (let attempt = 1; attempt <= CANDIDATE_FINALIZE_ATTEMPTS; attempt += 1) {
-      try {
-        await api.completeCandidateScreening(sessionId, grantToken);
-        return;
-      } catch {
+  function finalizeCandidateCall(disconnectRoom: boolean): Promise<void> {
+    if (finalizationPromiseRef.current) return finalizationPromiseRef.current;
+    const finalization = (async () => {
+      const fallbackBlob = await stopBrowserRecording();
+      localTrackRef.current?.stop();
+      localTrackRef.current = null;
+      if (disconnectRoom) roomRef.current?.disconnect();
+      roomRef.current = null;
+
+      const sessionId = sessionIdRef.current;
+      const grantToken = grantTokenRef.current;
+      if (!sessionId || !grantToken) return;
+
+      let fallbackRequired = false;
+      for (let attempt = 1; attempt <= CANDIDATE_FINALIZE_ATTEMPTS; attempt += 1) {
+        try {
+          const result = await api.completeCandidateScreening(sessionId, grantToken);
+          const recordingStatus = result.recording_status ?? 'fallback_required';
+          if (recordingStatus === 'ready') return;
+          if (recordingStatus === 'fallback_required') {
+            fallbackRequired = true;
+            break;
+          }
+        } catch {
+          // Retain the in-memory blob while the API cold-starts or Egress settles.
+        }
         if (attempt < CANDIDATE_FINALIZE_ATTEMPTS) {
           await sleep(CANDIDATE_FINALIZE_RETRY_MS * attempt);
         }
       }
-    }
-    // Completion/scoring can be retried by ops/reconciler; keep candidate UX terminal.
+
+      // After an explicit Egress failure—or after all completion attempts are
+      // exhausted—the browser copy is the last-resort redundant recording.
+      if (fallbackRequired || fallbackBlob) {
+        await uploadBrowserFallback(fallbackBlob);
+      }
+    })().finally(() => setStatus('ended'));
+    finalizationPromiseRef.current = finalization;
+    return finalization;
   }
 
   async function join() {
@@ -326,7 +354,10 @@ export function CandidateJoinPage() {
           track.attach(remoteAudioRef.current);
         }
       });
-      room.on(RoomEvent.Disconnected, () => setStatus('ended'));
+      room.on(RoomEvent.Disconnected, () => {
+        setStatus('ended');
+        void finalizeCandidateCall(false);
+      });
       await room.connect(access.url, access.livekit_token);
       await room.localParticipant.publishTrack(localTrack);
       startBrowserRecording(localTrack);
@@ -346,13 +377,7 @@ export function CandidateJoinPage() {
   }
 
   async function leave() {
-    await stopAndUploadRecording();
-    localTrackRef.current?.stop();
-    localTrackRef.current = null;
-    roomRef.current?.disconnect();
-    roomRef.current = null;
-    await completeCandidateSession();
-    setStatus('ended');
+    await finalizeCandidateCall(true);
   }
 
   // ── Decline is terminal: no join button, no exchange, no media access ──

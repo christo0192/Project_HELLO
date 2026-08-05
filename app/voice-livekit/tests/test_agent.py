@@ -25,6 +25,7 @@ def _stub_sdk():
     """Install stub livekit SDK modules so agent.py can import without network."""
     modules = {
         "livekit": types.ModuleType("livekit"),
+        "livekit.api": types.ModuleType("livekit.api"),
         "livekit.agents": types.ModuleType("livekit.agents"),
         "livekit.plugins": types.ModuleType("livekit.plugins"),
         "livekit.plugins.openai": types.ModuleType("livekit.plugins.openai"),
@@ -33,6 +34,10 @@ def _stub_sdk():
         "livekit.plugins.turn_detector": types.ModuleType("livekit.plugins.turn_detector"),
         "livekit.plugins.turn_detector.multilingual": types.ModuleType("livekit.plugins.turn_detector.multilingual"),
     }
+
+    modules["livekit"].api = modules["livekit.api"]
+    modules["livekit.api"].LiveKitAPI = MagicMock
+    modules["livekit.api"].DeleteRoomRequest = MagicMock
 
     # Agent class
     class FakeAgent:
@@ -56,7 +61,9 @@ def _stub_sdk():
             self.started = True
 
         async def generate_reply(self, **kwargs):
-            pass
+            handler = self._handlers.get("close")
+            if handler is not None:
+                handler(types.SimpleNamespace(error=None, reason=None))
 
     modules["livekit.agents"].AgentSession = FakeAgentSession
 
@@ -172,6 +179,86 @@ class FakeAgentSessionCloseReason:
 
 
 # ── Tests ─────────────────────────────────────────────────────────────
+
+class _FakeSpeechHandle:
+    def __init__(self, log):
+        self.log = log
+
+    async def wait_for_playout(self):
+        self.log.append("playout")
+
+
+class _FakeTerminationSession:
+    def __init__(self, log):
+        self.log = log
+
+    def say(self, text, **kwargs):
+        self.log.append("goodbye" if agent_mod._is_final_goodbye(text) else "prompt")
+        return _FakeSpeechHandle(self.log)
+
+
+class TestTerminationHelpers(unittest.IsolatedAsyncioTestCase):
+    async def test_close_occurs_after_playout_and_grace(self):
+        log = []
+
+        async def close():
+            log.append("close")
+
+        await agent_mod._close_after_playout(_FakeSpeechHandle(log), close, 0)
+        self.assertEqual(log, ["playout", "close"])
+
+    async def test_silence_prompts_then_says_goodbye_then_closes(self):
+        log = []
+
+        async def close():
+            log.append("close")
+
+        await agent_mod._silence_termination_loop(
+            _FakeTerminationSession(log),
+            asyncio.Event(),
+            close,
+            prompt_after_sec=0.001,
+            end_after_sec=0.001,
+            grace_sec=0,
+        )
+        self.assertEqual(log, ["prompt", "playout", "goodbye", "playout", "close"])
+
+    async def test_candidate_activity_restarts_initial_silence_window(self):
+        log = []
+        activity = asyncio.Event()
+
+        async def close():
+            log.append("close")
+
+        task = asyncio.create_task(
+            agent_mod._silence_termination_loop(
+                _FakeTerminationSession(log), activity, close,
+                prompt_after_sec=0.05, end_after_sec=0.05, grace_sec=0,
+            )
+        )
+        await asyncio.sleep(0.005)
+        activity.set()
+        await asyncio.sleep(0.01)
+        self.assertEqual(log, [])
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+    def test_final_goodbye_marker_is_bounded(self):
+        self.assertTrue(agent_mod._is_final_goodbye("Thanks, and goodbye."))
+        self.assertTrue(agent_mod._is_final_goodbye("Take care!"))
+        self.assertFalse(agent_mod._is_final_goodbye("What would you like to ask?"))
+
+
+class TestGeminiProviderConfiguration(unittest.TestCase):
+    def test_direct_google_endpoint_and_lite_model(self):
+        self.assertEqual(agent_mod.GEMINI_MODEL, "gemini-2.5-flash-lite")
+        self.assertEqual(
+            agent_mod.GEMINI_BASE_URL,
+            "https://generativelanguage.googleapis.com/v1beta/openai/",
+        )
+        self.assertNotIn("ikey", agent_mod.GEMINI_BASE_URL)
+
 
 class TestRoomSessionFallback(unittest.TestCase):
     def test_extracts_session_id_from_canonical_room_name(self):

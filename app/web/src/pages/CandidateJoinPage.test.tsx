@@ -15,6 +15,10 @@ const {
   connect,
   publishTrack,
   createLocalAudioTrack,
+  completeCandidateScreening,
+  uploadCandidateRecording,
+  roomHandlers,
+  disconnect,
 } = vi.hoisted(() => ({
   candidateConsentStatus: vi.fn(),
   getCandidateConsentTemplate: vi.fn(),
@@ -23,6 +27,10 @@ const {
   connect: vi.fn(),
   publishTrack: vi.fn(),
   createLocalAudioTrack: vi.fn().mockResolvedValue({ stop: vi.fn() }),
+  completeCandidateScreening: vi.fn(),
+  uploadCandidateRecording: vi.fn(),
+  roomHandlers: new Map<string, () => void>(),
+  disconnect: vi.fn(() => roomHandlers.get('disconnected')?.()),
 }));
 
 vi.mock('../api', () => ({
@@ -31,6 +39,8 @@ vi.mock('../api', () => ({
     getCandidateConsentTemplate,
     submitCandidateConsent,
     exchangeCandidateInvite,
+    completeCandidateScreening,
+    uploadCandidateRecording,
   },
   ApiError: class ApiError extends Error {
     status: number;
@@ -44,9 +54,11 @@ vi.mock('../api', () => ({
 vi.mock('livekit-client', () => ({
   Room: class {
     localParticipant = { publishTrack };
-    on = vi.fn();
+    on = vi.fn((event: string, handler: () => void) => {
+      roomHandlers.set(event, handler);
+    });
     connect = connect;
-    disconnect = vi.fn();
+    disconnect = disconnect;
   },
   RoomEvent: { TrackSubscribed: 'trackSubscribed', Disconnected: 'disconnected' },
   Track: { Kind: { Audio: 'audio' } },
@@ -93,7 +105,15 @@ describe('CandidateJoinPage', () => {
     exchangeCandidateInvite.mockResolvedValue({
       url: 'wss://livekit.example.invalid',
       livekit_token: 'synthetic-livekit-token',
+      session_id: '00000000-0000-4000-8000-000000000001',
+      grant_token: 'b'.repeat(64),
     });
+    completeCandidateScreening.mockResolvedValue({
+      status: 'completed',
+      recording_status: 'ready',
+    });
+    uploadCandidateRecording.mockResolvedValue({ ok: true });
+    roomHandlers.clear();
     createLocalAudioTrack.mockResolvedValue({ stop: vi.fn() });
     Object.defineProperty(window.navigator, 'mediaDevices', {
       configurable: true,
@@ -228,6 +248,70 @@ describe('CandidateJoinPage', () => {
       'wss://livekit.example.invalid',
       'synthetic-livekit-token',
     );
+  });
+
+  it('manual Leave finalizes exactly once and prefers authoritative Egress', async () => {
+    candidateConsentStatus.mockResolvedValue({
+      has_consent: true,
+      template_version: '1.0',
+      locale: 'en-IN',
+      required_consents: ['ai_interview', 'recording'],
+    });
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
+    await userEvent.click(await screen.findByRole('button', { name: 'Join screening' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Leave screening' }));
+
+    await waitFor(() => expect(completeCandidateScreening).toHaveBeenCalledTimes(1));
+    expect(uploadCandidateRecording).not.toHaveBeenCalled();
+    expect(await screen.findByText('The screening has ended.')).toBeInTheDocument();
+  });
+
+  it('server-forced disconnect finalizes once and uploads captured bytes only on Egress failure', async () => {
+    candidateConsentStatus.mockResolvedValue({
+      has_consent: true,
+      template_version: '1.0',
+      locale: 'en-IN',
+      required_consents: ['ai_interview', 'recording'],
+    });
+    completeCandidateScreening.mockResolvedValue({
+      status: 'completed',
+      recording_status: 'fallback_required',
+    });
+
+    class FakeMediaRecorder {
+      static isTypeSupported = vi.fn(() => true);
+      state: RecordingState = 'inactive';
+      mimeType = 'audio/webm;codecs=opus';
+      ondataavailable: ((event: BlobEvent) => void) | null = null;
+      onstop: ((event: Event) => void) | null = null;
+      start() {
+        this.state = 'recording';
+        this.ondataavailable?.({ data: new Blob(['synthetic audio']) } as BlobEvent);
+      }
+      stop() {
+        this.state = 'inactive';
+        this.onstop?.(new Event('stop'));
+      }
+    }
+    vi.stubGlobal('MediaStream', class MediaStream {
+      constructor(_tracks: unknown[]) {}
+    });
+    vi.stubGlobal('MediaRecorder', FakeMediaRecorder);
+    createLocalAudioTrack.mockResolvedValue({
+      stop: vi.fn(),
+      mediaStreamTrack: { kind: 'audio' },
+    });
+
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
+    await userEvent.click(await screen.findByRole('button', { name: 'Join screening' }));
+    await waitFor(() => expect(roomHandlers.has('disconnected')).toBe(true));
+    roomHandlers.get('disconnected')?.();
+
+    await waitFor(() => expect(uploadCandidateRecording).toHaveBeenCalledTimes(1));
+    expect(completeCandidateScreening).toHaveBeenCalledTimes(1);
+    expect(uploadCandidateRecording.mock.calls[0]?.[2]).toBeInstanceOf(Blob);
   });
 
   it('does not report microphone failure when invite exchange fails after mic access succeeds', async () => {

@@ -35,11 +35,14 @@ services:
       SUPABASE_SCHEMA: ${SUPABASE_SCHEMA:-screening_v2}
       API_BASE: ${API_BASE:-}
       WORKER_CONTEXT_SECRET: ${WORKER_CONTEXT_SECRET:-}
-      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
-      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
-      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash-lite}
+      GEMINI_BASE_URL: ${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai/}
       SARVAM_API_KEY: ${SARVAM_API_KEY:-}
       LIVEKIT_WORKER_DRAIN_SEC: ${LIVEKIT_WORKER_DRAIN_SEC:-10}
+      CANDIDATE_SILENCE_PROMPT_SEC: ${CANDIDATE_SILENCE_PROMPT_SEC:-30}
+      CANDIDATE_SILENCE_END_SEC: ${CANDIDATE_SILENCE_END_SEC:-20}
+      FINAL_GOODBYE_GRACE_SEC: ${FINAL_GOODBYE_GRACE_SEC:-5}
     # Worker connects outbound only (LiveKit WebSocket, Supabase, scoring API);
     # no published ports are required.
     # No probe is declared: the SDK worker exposes no HTTP readiness endpoint.

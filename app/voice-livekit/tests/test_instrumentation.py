@@ -45,6 +45,7 @@ if _LIVEKIT_DIR not in sys.path:
 
 _SDK_MODULES = [
     "livekit",
+    "livekit.api",
     "livekit.agents",
     "livekit.plugins",
     "livekit.plugins.openai",
@@ -109,6 +110,10 @@ class FakeAgentSession:
 
 def _install_sdk_stubs() -> None:
     modules = {n: types.ModuleType(n) for n in _SDK_MODULES}
+
+    modules["livekit"].api = modules["livekit.api"]
+    modules["livekit.api"].LiveKitAPI = MagicMock
+    modules["livekit.api"].DeleteRoomRequest = MagicMock
 
     class FakeAgent:
         def __init__(self, instructions: str = ""):

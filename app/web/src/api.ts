@@ -179,7 +179,10 @@ export const api = {
       body: JSON.stringify({ token }),
     }),
   completeCandidateScreening: (sessionId: string, grantToken: string) =>
-    request<{ status: string }>(`/api/livekit/${sessionId}/complete`, {
+    request<{
+      status: string;
+      recording_status?: 'ready' | 'fallback_required' | 'pending';
+    }>(`/api/livekit/${sessionId}/complete`, {
       method: 'POST',
       headers: { 'x-grant-token': grantToken },
     }),

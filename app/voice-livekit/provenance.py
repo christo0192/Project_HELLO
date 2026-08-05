@@ -2,7 +2,7 @@
 LLM-06: Provenance builder for the LiveKit screening worker.
 
 This module constructs a validated ModelProvenance dict reflecting what the
-LiveKit worker *actually* knows: the provider ("deepseek"), the DeepSeek
+LiveKit worker *actually* knows: the provider ("gemini"), the Gemini
 LLM model it was configured with (as *requestedModel*), the workload
 ("screening"), and the prompt template version.  It does NOT blindly trust
 client-supplied room metadata for model/provider identifiers.
@@ -25,7 +25,8 @@ from typing import Any, Optional
 
 # ── Allowlists ──────────────────────────────────────────────────────────
 
-ALLOWLISTED_PROVIDERS = frozenset({"deepseek"})
+# Keep historical DeepSeek rows valid while new screening claims use Gemini.
+ALLOWLISTED_PROVIDERS = frozenset({"deepseek", "gemini"})
 ALLOWLISTED_WORKLOADS = frozenset({"screening", "scoring"})
 SAFE_INFERENCE_KEYS = frozenset({"temperature", "max_tokens"})
 
@@ -410,7 +411,7 @@ def screening_provenance(
     affecting provenance tracking.
     """
     return create_provenance(
-        provider="deepseek",
+        provider="gemini",
         requested_model=requested_model,
         workload="screening",
         prompt_template_version=SCREENING_PROVENANCE_VERSION,

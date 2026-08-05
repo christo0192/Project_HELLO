@@ -31,6 +31,11 @@ import { getCorrelationId } from '../lib/correlation.js';
 import { handleRecordingGrant } from './invites.js';
 import { runAssessment } from '../services/assessment.js';
 import { resolveWorkerContext } from '../lib/worker-context.js';
+import {
+  finalizeAuthoritativeRecording,
+  startAuthoritativeRecording,
+  type RecordingFinalizeStatus,
+} from '../lib/recording-egress.js';
 import { createMaintenanceMiddleware } from '../lib/maintenance.js';
 import {
   extractIdempotencyKey,
@@ -218,8 +223,13 @@ livekitRouter.post(
           } catch {
             await rooms.updateRoomMetadata(roomName, roomMetadata);
           }
+          // Start server-authoritative audio capture before anyone joins. In
+          // required mode, a storage/egress failure aborts the screening rather
+          // than silently creating an unrecorded room.
+          await startAuthoritativeRecording(roomName, session.id);
         } catch (roomErr) {
-          // REL-07: room creation failed — terminate the row.
+          await rooms.deleteRoom(roomName).catch(() => undefined);
+          // REL-07: room/recording creation failed — terminate the row.
           const termResult = await transitionSession(
             session.id, 'created', 'failed', 'room_create_error',
           );
@@ -408,6 +418,16 @@ livekitRouter.post(
   },
 );
 
+async function finalizeRecordingForCompletion(sessionId: string): Promise<RecordingFinalizeStatus> {
+  try {
+    return await finalizeAuthoritativeRecording(sessionId);
+  } catch {
+    // A transient provider/storage error is retryable. Do not tell the browser
+    // to overwrite an authoritative object that may still be finalizing.
+    return 'pending';
+  }
+}
+
 // ── POST /api/livekit/:sessionId/complete ────────────────────────────
 // Candidate grant-authenticated completion path. The browser calls this when
 // the candidate leaves the LiveKit room so the session does not remain stuck
@@ -442,7 +462,11 @@ livekitRouter.post(
       }
 
       if (session.status === 'completed') {
-        return res.status(202).json({ status: 'already_completed' });
+        const recordingStatus = await finalizeRecordingForCompletion(sessionId);
+        return res.status(202).json({
+          status: 'already_completed',
+          recording_status: recordingStatus,
+        });
       }
       if (session.status !== 'in_progress') {
         return res.status(409).json({ error: 'session_not_completable' });
@@ -469,7 +493,11 @@ livekitRouter.post(
           runAssessment(sessionId).catch(() => undefined);
         }, 8_000).unref?.();
       }
-      return res.status(202).json({ status: completed.ok ? 'completed' : 'already_completed' });
+      const recordingStatus = await finalizeRecordingForCompletion(sessionId);
+      return res.status(202).json({
+        status: completed.ok ? 'completed' : 'already_completed',
+        recording_status: recordingStatus,
+      });
     } catch (error) {
       next(error);
     }

@@ -14,6 +14,9 @@ const _contractVisibleEnvReads = [
   process.env.DEEPSEEK_MAX_OUTPUT_BYTES,
   process.env.RECORDING_DOWNLOAD_TTL_SEC,
   process.env.RECORDING_MAX_BYTES,
+  process.env.RECORDING_EGRESS_ENABLED,
+  process.env.RECORDING_EGRESS_REQUIRED,
+  process.env.RECORDING_EGRESS_FINALIZE_TIMEOUT_MS,
 ];
 void _contractVisibleEnvReads;
 
@@ -29,6 +32,14 @@ function required(name: string): string {
  * Parse a positive integer environment variable.
  * Throws at import time (before server.listen) for NaN, Infinity, negative, zero, fraction, or out-of-range.
  */
+function booleanEnv(name: string, defaultVal: boolean): boolean {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return defaultVal;
+  if (raw === 'true') return true;
+  if (raw === 'false') return false;
+  throw new Error(`${name} must be either "true" or "false"`);
+}
+
 function positiveInt(name: string, defaultVal: number, min: number, max: number): number {
   const raw = process.env[name];
   if (raw === undefined || raw === '') return defaultVal;
@@ -68,6 +79,15 @@ export const env = {
   livekitApiKey: process.env.LIVEKIT_API_KEY ?? '',
   livekitApiSecret: process.env.LIVEKIT_API_SECRET ?? '',
   recordingsBucket: process.env.RECORDINGS_BUCKET ?? 'recordings_v2',
+  recordingEgressEnabled: booleanEnv('RECORDING_EGRESS_ENABLED', false),
+  recordingEgressRequired: booleanEnv('RECORDING_EGRESS_REQUIRED', false),
+  recordingEgressS3Endpoint: process.env.RECORDING_EGRESS_S3_ENDPOINT ?? '',
+  recordingEgressS3Region: process.env.RECORDING_EGRESS_S3_REGION ?? 'ap-south-1',
+  recordingEgressS3AccessKeyId: process.env.RECORDING_EGRESS_S3_ACCESS_KEY_ID ?? '',
+  recordingEgressS3SecretAccessKey: process.env.RECORDING_EGRESS_S3_SECRET_ACCESS_KEY ?? '',
+  recordingEgressFinalizeTimeoutMs: positiveInt(
+    'RECORDING_EGRESS_FINALIZE_TIMEOUT_MS', 20_000, 1_000, 120_000,
+  ),
   /** MIG-06: TTL (seconds) for recruiter recording download signed URLs. Range 60..900. */
   recordingDownloadTtlSec: positiveInt('RECORDING_DOWNLOAD_TTL_SEC', 300, 60, 900),
   /**

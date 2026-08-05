@@ -1,6 +1,6 @@
 """
     SPIKE: LiveKit Agents voice worker (Gopu screening interviewer).
-Sarvam STT/TTS + LiveKit Agents turn handling + DeepSeek LLM.
+Sarvam STT/TTS + LiveKit Agents turn handling + direct streaming Gemini LLM.
 """
 
 from __future__ import annotations
@@ -9,10 +9,12 @@ import os
 import re
 import time
 import asyncio
+import inspect
 from typing import Any, Callable
 
 from dotenv import load_dotenv
 
+from livekit import api as livekit_api
 from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli
 from livekit.plugins import openai, sarvam
 
@@ -32,8 +34,12 @@ from provenance import screening_provenance
 
 load_dotenv()
 
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+# Google AI Studio's direct OpenAI-compatible endpoint. AgentSession consumes
+# the plugin's async token stream; no iKey/model gateway is present in this path.
+GEMINI_BASE_URL = os.getenv(
+    "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"
+)
 _log = StructuredLogger("agent")
 ROOM_SESSION_RE = re.compile(
     r"^screening-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
@@ -73,6 +79,11 @@ def _float_env(name: str, default: float) -> float:
         return float(raw)
     except ValueError:
         return default
+
+
+CANDIDATE_SILENCE_PROMPT_SEC = _float_env("CANDIDATE_SILENCE_PROMPT_SEC", 30.0)
+CANDIDATE_SILENCE_END_SEC = _float_env("CANDIDATE_SILENCE_END_SEC", 20.0)
+FINAL_GOODBYE_GRACE_SEC = _float_env("FINAL_GOODBYE_GRACE_SEC", 5.0)
 
 
 def _int_env(name: str, default: int) -> int:
@@ -192,6 +203,81 @@ async def _run_span_guarded(
 class Gopu(Agent):
     def __init__(self, instructions: str) -> None:
         super().__init__(instructions=instructions)
+
+
+_FINAL_GOODBYE_RE = re.compile(r"\b(?:goodbye|take care)\b", re.IGNORECASE)
+
+
+def _is_final_goodbye(text: str) -> bool:
+    """The prompt reserves these phrases exclusively for the final closing."""
+    return bool(_FINAL_GOODBYE_RE.search(text))
+
+
+async def _close_after_playout(
+    speech_handle: Any,
+    close_room_once: Callable[[], Any],
+    grace_sec: float,
+) -> None:
+    """Wait for final speech playout, then apply the configured grace period."""
+    if speech_handle is not None:
+        wait_for_playout = getattr(speech_handle, "wait_for_playout", None)
+        if callable(wait_for_playout):
+            await wait_for_playout()
+    if grace_sec > 0:
+        await asyncio.sleep(grace_sec)
+    await close_room_once()
+
+
+async def _silence_termination_loop(
+    session: Any,
+    candidate_activity: asyncio.Event,
+    close_room_once: Callable[[], Any],
+    *,
+    prompt_after_sec: float,
+    end_after_sec: float,
+    grace_sec: float,
+) -> None:
+    """Prompt once per silent period, then speak a final goodbye and close.
+
+    Candidate activity restarts the full silence window. The final room close
+    occurs only after the goodbye's SpeechHandle confirms playout.
+    """
+    while True:
+        candidate_activity.clear()
+        try:
+            await asyncio.wait_for(candidate_activity.wait(), timeout=prompt_after_sec)
+            continue
+        except asyncio.TimeoutError:
+            pass
+
+        prompt_handle = session.say(
+            "Are you still there? No worries if you need a moment.",
+            allow_interruptions=True,
+        )
+        await prompt_handle.wait_for_playout()
+
+        candidate_activity.clear()
+        try:
+            await asyncio.wait_for(candidate_activity.wait(), timeout=end_after_sec)
+            continue
+        except asyncio.TimeoutError:
+            pass
+
+        goodbye_handle = session.say(
+            "Looks like you're unavailable, so I'll end the screening here. Thanks for your time, and goodbye.",
+            allow_interruptions=False,
+        )
+        await _close_after_playout(goodbye_handle, close_room_once, grace_sec)
+        return
+
+
+async def _delete_livekit_room(room_name: str) -> None:
+    """Delete the room so every participant receives a terminal disconnect."""
+    client = livekit_api.LiveKitAPI()
+    try:
+        await client.room.delete_room(livekit_api.DeleteRoomRequest(room=room_name))
+    finally:
+        await client.aclose()
 
 
 def _item_text(item: Any) -> str:
@@ -351,10 +437,10 @@ async def entrypoint(ctx: JobContext) -> None:
 
 async def _run_session(ctx: JobContext, started_at: float, session_id: Any, worker_ctx: WorkerContext | None) -> None:
     # LLM-06: claim provenance before any provider construction. The same
-    # configured model is then supplied to DeepSeek below.
+    # configured model is then supplied directly to Gemini below.
     claim = await persistence.set_session_provenance(
         session_id,
-        screening_provenance(DEEPSEEK_MODEL),
+        screening_provenance(GEMINI_MODEL),
     )
     if claim not in {
         persistence.ClaimResult.CLAIMED,
@@ -396,13 +482,41 @@ async def _run_session(ctx: JobContext, started_at: float, session_id: Any, work
     # REL-07: separate write-task set from the finalizer.
     # ONLY transcript writes go here; complete_once is never added.
     _write_tasks: set[asyncio.Task] = set()
+    _background_tasks: set[asyncio.Task] = set()
     _finalizer_task: asyncio.Task | None = None
+    _silence_task: asyncio.Task | None = None
+    candidate_activity = asyncio.Event()
+    room_close_started = False
 
     def tracked_write(coro) -> asyncio.Task:
         task = asyncio.create_task(coro)
         _write_tasks.add(task)
         task.add_done_callback(_write_tasks.discard)
         return task
+
+    def tracked_background(coro) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+        return task
+
+    async def close_room_once() -> None:
+        nonlocal room_close_started
+        if room_close_started:
+            return
+        room_close_started = True
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                await _delete_livekit_room(room_name)
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if attempt < 2:
+                    await asyncio.sleep(float(attempt + 1))
+        room_close_started = False
+        if last_error is not None:
+            raise last_error
 
     # REL-07: activate session — fail closed on ANY non-SUCCESS outcome.
     activate_result = await persistence.activate_session(session_id)
@@ -539,6 +653,8 @@ async def _run_session(ctx: JobContext, started_at: float, session_id: Any, work
 
         session: AgentSession | None = None
         opening_recorded = False
+        latest_speech_handle: Any = None
+        natural_close_scheduled = False
 
         async def _setup_session(span: Span | None) -> None:
             nonlocal session
@@ -551,10 +667,13 @@ async def _run_session(ctx: JobContext, started_at: float, session_id: Any, work
                     model=os.getenv("SARVAM_TTS_MODEL", "bulbul:v3"),
                     speaker=os.getenv("SARVAM_TTS_VOICE", "shubh"),
                 ),
+                # LiveKit's OpenAI-compatible adapter always consumes a token
+                # stream. Point it directly at Google so first tokens are not
+                # delayed by the previous iKey gateway hop.
                 llm=openai.LLM(
-                    model=DEEPSEEK_MODEL,
-                    api_key=os.getenv("DEEPSEEK_API_KEY"),
-                    base_url=DEEPSEEK_BASE_URL,
+                    model=GEMINI_MODEL,
+                    api_key=os.getenv("GEMINI_API_KEY"),
+                    base_url=GEMINI_BASE_URL,
                 ),
                 # Do not provide custom VAD or turn-detection components here.
                 # LiveKit Agents owns turn handling via its AgentSession defaults.
@@ -566,9 +685,19 @@ async def _run_session(ctx: JobContext, started_at: float, session_id: Any, work
             def _on_metrics_collected(event):  # noqa: ANN001
                 _record_provider_metrics(event)
 
+            @session.on("speech_created")
+            def _on_speech_created(event):  # noqa: ANN001
+                nonlocal latest_speech_handle
+                latest_speech_handle = getattr(event, "speech_handle", None)
+
+            @session.on("user_state_changed")
+            def _on_user_state_changed(event):  # noqa: ANN001
+                if getattr(event, "new_state", None) in {"speaking", "listening"}:
+                    candidate_activity.set()
+
             @session.on("conversation_item_added")
             def _on_conversation_item(event):  # noqa: ANN001
-                nonlocal opening_recorded
+                nonlocal opening_recorded, natural_close_scheduled, _silence_task
                 item = getattr(event, "item", None)
                 role = getattr(item, "role", None)
                 if role not in {"assistant", "user"}:
@@ -576,10 +705,29 @@ async def _run_session(ctx: JobContext, started_at: float, session_id: Any, work
                 if role == "assistant" and getattr(item, "interrupted", False):
                     return
                 text = _item_text(item)
+                if role == "user":
+                    candidate_activity.set()
                 if role == "assistant" and opening_recorded and text == opening_text:
                     return
                 speaker = "bot" if role == "assistant" else "candidate"
                 tracked_write(record_turn(speaker, text))
+                if (
+                    role == "assistant"
+                    and _is_final_goodbye(text)
+                    and not natural_close_scheduled
+                ):
+                    natural_close_scheduled = True
+                    candidate_activity.set()
+                    if _silence_task is not None:
+                        _silence_task.cancel()
+                    speech_handle = getattr(session, "current_speech", None) or latest_speech_handle
+                    tracked_background(
+                        _close_after_playout(
+                            speech_handle,
+                            close_room_once,
+                            FINAL_GOODBYE_GRACE_SEC,
+                        )
+                    )
 
             @session.on("close")
             def _on_close(event):  # noqa: ANN001
@@ -604,15 +752,34 @@ async def _run_session(ctx: JobContext, started_at: float, session_id: Any, work
             opening_recorded = True
             say = getattr(session, "say", None)
             if callable(say):
-                await say(opening_text)
+                speech = say(opening_text)
+                wait_for_playout = getattr(speech, "wait_for_playout", None)
+                if callable(wait_for_playout):
+                    await wait_for_playout()
             else:
-                await session.generate_reply(instructions=opening_text)
+                speech = session.generate_reply(instructions=opening_text)
+                if inspect.isawaitable(speech):
+                    speech = await speech
+                wait_for_playout = getattr(speech, "wait_for_playout", None)
+                if callable(wait_for_playout):
+                    await wait_for_playout()
             tracked_write(record_turn("bot", opening_text))
 
         generate_started = _monotonic()
         await _run_span_guarded("session_generate_reply", _generate_reply, parent=session_span)
         _safe_emit(histogram_metric, "session_generate_reply_duration_sec",
                    round(_monotonic() - generate_started, 3))
+
+        _silence_task = tracked_background(
+            _silence_termination_loop(
+                session,
+                candidate_activity,
+                close_room_once,
+                prompt_after_sec=CANDIDATE_SILENCE_PROMPT_SEC,
+                end_after_sec=CANDIDATE_SILENCE_END_SEC,
+                grace_sec=FINAL_GOODBYE_GRACE_SEC,
+            )
+        )
 
         # Await session closure — keeps entrypoint alive until close fires
         await _close_event.wait()
@@ -625,8 +792,16 @@ async def _run_session(ctx: JobContext, started_at: float, session_id: Any, work
         # normal completion over a false worker_crash.
         await complete_once(None if candidate_left_normally else "worker_crash")
     finally:
+        # If our own goodbye initiated room deletion, let that request finish;
+        # otherwise cancel idle timers immediately on an external disconnect.
+        if not room_close_started:
+            for task in tuple(_background_tasks):
+                if not task.done():
+                    task.cancel()
+        if _background_tasks:
+            await asyncio.gather(*tuple(_background_tasks), return_exceptions=True)
         try:
-            if _finalizer_task is not None and not _finalizer_task.done():
+            if _finalizer_task is not None:
                 try:
                     await _finalizer_task
                 except LifecycleError:

@@ -63,6 +63,7 @@ class TestShippedInventory(unittest.TestCase):
 
     def test_closed_enumerations_exported(self) -> None:
         self.assertIn("deepseek", ALLOWED_PROVIDERS)
+        self.assertIn("gemini", ALLOWED_PROVIDERS)
         self.assertIn("screening", ALLOWED_WORKLOADS)
         self.assertIn("voice-livekit", ALLOWED_RUNTIMES)
         self.assertIn("sdk_constructor", ALLOWED_BOUNDARY_KINDS)
