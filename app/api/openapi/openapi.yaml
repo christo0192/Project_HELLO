@@ -466,6 +466,53 @@ paths:
               schema:
                 $ref: '#/components/schemas/SimpleError'
 
+  /api/livekit/{sessionId}/complete:
+    parameters:
+      - name: sessionId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [livekit]
+      operationId: completeCandidateScreening
+      summary: Complete a candidate LiveKit screening and trigger scorecard generation
+      description: Candidate grant-authenticated endpoint called when the browser leaves the LiveKit room. It marks an in-progress session completed and starts best-effort scoring without requiring recruiter auth.
+      security:
+        - grantToken: []
+      responses:
+        '202':
+          description: Session completed, or it was already completed by the worker.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CandidateCompleteResponse'
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Grant token missing, malformed, expired, or not bound to this session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '404':
+          description: Session not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '409':
+          description: Session exists but is not currently completable by the candidate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+
   /api/livekit/{sessionId}/recording:
     parameters:
       - name: sessionId
@@ -3013,6 +3060,15 @@ components:
       properties:
         object_key:
           type: string
+      additionalProperties: false
+
+    CandidateCompleteResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [completed, already_completed]
       additionalProperties: false
 
     WorkerContext:

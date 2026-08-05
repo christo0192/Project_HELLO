@@ -893,8 +893,8 @@ describe('OpenAPI document integrity', () => {
     const paths = spec.paths as YMap;
     const schemas = ((spec as YMap).components as YMap).schemas as YMap;
     const securitySchemes = ((spec as YMap).components as YMap).securitySchemes as YMap;
-    expect(Object.keys(paths).length).toBe(57);
-    expect(Object.keys(schemas).length).toBe(125);
+    expect(Object.keys(paths).length).toBe(58);
+    expect(Object.keys(schemas).length).toBe(126);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.
@@ -957,7 +957,7 @@ describe('auth boundary vs spec security model', () => {
     'POST /api/candidate-consent/submit',
     'POST /api/appeals',
   ]);
-  const recordingUploadPattern = /^POST \/api\/livekit\/\{sessionId\}\/recording$/;
+  const grantAuthenticatedPattern = /^POST \/api\/livekit\/\{sessionId\}\/(recording|complete)$/;
 
   it('rejects unauthenticated requests on every non-public route with the middleware 401 contract', async () => {
     const app = createUnauthedApp();
@@ -965,7 +965,7 @@ describe('auth boundary vs spec security model', () => {
     const failures: string[] = [];
     for (const route of routes) {
       if (publicRoutes.has(route)) continue;
-      if (recordingUploadPattern.test(route)) continue; // grant-authenticated inside route
+      if (grantAuthenticatedPattern.test(route)) continue; // grant-authenticated inside route
       const [method, rawPath] = route.split(' ');
       const path = rawPath.replace(/\{[^}]+\}/g, UUID_1);
       let res: request.Response;
