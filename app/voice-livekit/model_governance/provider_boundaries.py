@@ -345,23 +345,6 @@ PROVIDER_BOUNDARIES: list[dict[str, Any]] = [
         ),
     },
     {
-        "id": "livekit-vad-silero",
-        "workloads": ["screening"],
-        "provider": "silero",
-        "runtime": "voice-livekit",
-        "boundaryKind": "sdk_constructor",
-        "constructorPath": "app/voice-livekit/agent.py",
-        "envVars": [
-            "LIVEKIT_VAD_ACTIVATION_THRESHOLD",
-            "LIVEKIT_VAD_MIN_SPEECH_DURATION",
-            "LIVEKIT_VAD_MIN_SILENCE_DURATION",
-            "LIVEKIT_VAD_PREFIX_PADDING_DURATION",
-        ],
-        "allowlists": [],
-        "policyStatus": "PENDING",
-        "notes": "silero.VAD.load with bounded tuning values. Local ONNX model; not a network provider.",
-    },
-    {
         "id": "livekit-prompt-construction",
         "workloads": ["screening"],
         "provider": "deepseek",

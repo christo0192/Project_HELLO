@@ -22,8 +22,8 @@ Verified from the public `livekit/agents` repository at tag
 | `python agent.py start` | Production worker: connects to the LiveKit server/Cloud project using `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`; supports `--drain-timeout` for job drain on shutdown. | Syntax verified from 1.6.4 source; container ENTRYPOINT. Provider-connected drain behavior = OWNER_VERIFY. |
 | `python agent.py dev` | Development worker mode (watch/reload). | Syntax verified from 1.6.4 source. Not the container default. |
 | `python agent.py console` | Local mic/speaker console; no LiveKit room needed. | Syntax verified from 1.6.4 source. Development only. |
-| `python agent.py download-files` | Legacy per-script command that invokes each plugin's `download_files()`. The 1.6.4 source prints a deprecation note pointing to the module command. | Existence verified from 1.6.4 source. Strategy = OWNER_VERIFY (see §4). |
-| `python -m livekit.agents download-files` | Official module command: discovers `livekit.plugins.*` packages and runs each registered plugin's `download_files()` (silero VAD ONNX weights, turn-detector multilingual model). | Source verified from 1.6.4. Not executed in CI (heavyweight model download). |
+| `python agent.py download-files` | Legacy per-script command that invokes each plugin's `download_files()`. The 1.6.4 source prints a deprecation note pointing to the module command. | Existence verified from 1.6.4 source. Not needed by the current worker because no custom VAD/turn-detector weights are configured. |
+| `python -m livekit.agents download-files` | Official module command: discovers `livekit.plugins.*` packages and runs each registered plugin's `download_files()`. | Source verified from 1.6.4. Not needed by the current worker because no custom VAD/turn-detector weights are configured. |
 
 The `lk` CLI (LiveKit CLI, Go binary) and Cloud Agents deployment commands
 (e.g. agent deployment via the Cloud dashboard/CLI) are **OWNER_VERIFY**:
@@ -53,20 +53,11 @@ bash scripts/validate-no-secrets-baked.sh
 CI runs the bounded static subset only
 (`.github/workflows/hosting-validate.yml`); Docker builds are not run in CI.
 
-## 4. Model weights strategy — OWNER_VERIFY
+## 4. Model weights strategy
 
-The worker imports `silero.VAD` (ONNX weights) and
-`livekit.plugins.turn_detector.multilingual.MultilingualModel` (transformers
-multilingual turn-detector). These weights are pulled by
-`python -m livekit.agents download-files` (or the legacy
-`python agent.py download-files`) and are NOT bundled in the image build.
-
-The decision of where/how to materialise the weights for Cloud Agents
-(build-time download, startup download with retry, or an agents-deployment
-artifact/volume) depends on the current official LiveKit Cloud Agents guidance
-and the deployed project's storage rules — **OWNER_VERIFY**. We do not execute
-heavyweight provider/model downloads in CI and we make no claim that any
-download or model command has run successfully.
+The worker does not import a custom Silero VAD or local LiveKit turn-detector
+model. Turn handling uses LiveKit Agents defaults, so no worker-owned model
+weights need to be materialised for VAD/turn detection.
 
 ## 5. Environment variables (names only — no values)
 

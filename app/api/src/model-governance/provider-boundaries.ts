@@ -462,23 +462,6 @@ export const PROVIDER_BOUNDARIES: readonly ProviderBoundaryEntry[] = [
       'before any provider construction; the same configured model feeds screening_provenance.',
   },
   {
-    id: 'livekit-vad-silero',
-    workloads: ['screening'],
-    provider: 'silero',
-    runtime: 'voice-livekit',
-    boundaryKind: 'sdk_constructor',
-    constructorPath: 'app/voice-livekit/agent.py',
-    envVars: [
-      'LIVEKIT_VAD_ACTIVATION_THRESHOLD',
-      'LIVEKIT_VAD_MIN_SPEECH_DURATION',
-      'LIVEKIT_VAD_MIN_SILENCE_DURATION',
-      'LIVEKIT_VAD_PREFIX_PADDING_DURATION',
-    ],
-    allowlists: [],
-    policyStatus: 'PENDING',
-    notes: 'silero.VAD.load with bounded tuning values. Local ONNX model; not a network provider.',
-  },
-  {
     id: 'livekit-turn-detector',
     workloads: ['screening'],
     provider: 'livekit',

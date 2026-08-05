@@ -104,24 +104,25 @@ inventory claims one.
 | Worker connection | livekit | screening | `sdk_constructor` (worker bootstrap) | `app/voice-livekit/agent.py` | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` |
 | STT | sarvam | screening | `sdk_constructor` (`sarvam.STT`) | `app/voice-livekit/agent.py` | `SARVAM_STT_MODEL`, `SARVAM_LANGUAGE` |
 | TTS | sarvam | screening | `sdk_constructor` (`sarvam.TTS`) | `app/voice-livekit/agent.py` | `SARVAM_TTS_MODEL`, `SARVAM_TTS_VOICE` |
-| Conversation LLM | anthropic | screening | `sdk_constructor` (`anthropic.LLM`) | `app/voice-livekit/agent.py` | `ANTHROPIC_MODEL` |
-| VAD | silero | screening | `sdk_constructor` (`silero.VAD.load`) | `app/voice-livekit/agent.py` | `LIVEKIT_VAD_ACTIVATION_THRESHOLD`, `LIVEKIT_VAD_MIN_SPEECH_DURATION`, `LIVEKIT_VAD_MIN_SILENCE_DURATION`, `LIVEKIT_VAD_PREFIX_PADDING_DURATION` |
-| Turn detection | livekit (local) | screening | `sdk_constructor` (`MultilingualModel`) | `app/voice-livekit/agent.py` | *(none)* |
-| Prompt assembly | anthropic | screening | `prompt_construction` | `app/voice-livekit/prompting.py` | `COMPANY_NAME` |
-| Provenance | anthropic | screening | `provenance` | `app/voice-livekit/provenance.py` | *(none)* |
+| Conversation LLM | deepseek | screening | `sdk_constructor` (`openai.LLM`) | `app/voice-livekit/agent.py` | `DEEPSEEK_MODEL`, `DEEPSEEK_BASE_URL` |
+| Turn handling | livekit | screening | `AgentSession` defaults | `app/voice-livekit/agent.py` | *(none)* |
+| Prompt assembly | deepseek | screening | `prompt_construction` | `app/voice-livekit/prompting.py` | `COMPANY_NAME` |
+| Provenance | deepseek | screening | `provenance` | `app/voice-livekit/provenance.py` | *(none)* |
 | Persistence | supabase | screening | `persistence` | `app/voice-livekit/persistence.py` | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_SCHEMA`, `WORKER_CONTEXT_SECRET`, `WORKER_CONTEXT_TIMEOUT_SEC`, `API_BASE`, `SCORING_BREAKER_THRESHOLD`, `SCORING_BREAKER_COOLDOWN_SEC`, `SCORING_BREAKER_TIMEOUT_SEC`, `SCORING_HTTP_CONNECT_TIMEOUT`, `SCORING_HTTP_READ_TIMEOUT`, `SCORING_HTTP_WRITE_TIMEOUT`, `SCORING_HTTP_POOL_TIMEOUT`, `LIVEKIT_WORKER_DRAIN_SEC` |
 
 ### 5. `agent.py` — LiveKit plugin constructors
 
 - **Boundary kind:** LiveKit Agents SDK constructors inside `AgentSession`:
-  `sarvam.STT`, `sarvam.TTS`, `anthropic.LLM`, `silero.VAD.load`, and the
-  local `MultilingualModel` turn detector.
+  `sarvam.STT`, `sarvam.TTS`, and OpenAI-compatible `openai.LLM`. No custom VAD
+  or local turn-detector constructor is provided; turn handling uses LiveKit
+  Agents defaults.
 - **Notes:**
   - STT/TTS/LLM network calls are **SDK-internal**; no constructor parameter
     exposes timeout, retry, or circuit-breaker configuration
     (see `docs/runbooks/provider-resilience.md`).
-  - The Anthropic LLM model id is read from `ANTHROPIC_MODEL`; provenance is
-    claimed via `set_session_provenance()` before any provider construction.
+  - The DeepSeek/OpenAI-compatible model id is read from `DEEPSEEK_MODEL`;
+    provenance is claimed via `set_session_provenance()` before any provider
+    construction.
   - VAD and turn detection are local models, not network providers.
   - Silero VAD is NOT a provider API; it is a local ONNX model.
 - **Status:** PENDING for SDK-internal and connection behavior (owner

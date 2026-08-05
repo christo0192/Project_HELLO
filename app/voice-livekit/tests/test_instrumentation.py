@@ -408,6 +408,7 @@ class TestHappyPathInstrumentation(unittest.TestCase):
                 "session_generate_reply_duration_sec",
                 "session_finalize_duration_sec",
                 "session_duration_sec",
+                "session_turn_persistence_duration_sec",
             },
         )
         # Naming is truthful: nothing implies "first audio" or component
@@ -424,10 +425,11 @@ class TestHappyPathInstrumentation(unittest.TestCase):
         generate = next(h for h in self.sink.histograms if h["name"] == "session_generate_reply_duration_sec")
         finalize = next(h for h in self.sink.histograms if h["name"] == "session_finalize_duration_sec")
         # With a 1s-step fake clock each section is exactly its call-distance
-        # apart: setup/generate = 2 calls, finalize = 3 calls.
+        # apart: setup/generate are direct boundaries; finalize also drains the
+        # explicit opener transcript write before terminal CAS/scoring.
         self.assertEqual(setup["value"], 1.0)
         self.assertEqual(generate["value"], 1.0)
-        self.assertEqual(finalize["value"], 2.0)
+        self.assertEqual(finalize["value"], 4.0)
         for h in self.sink.histograms:
             self.assertIsInstance(h["value"], float)
             self.assertGreaterEqual(h["value"], 0.0)
@@ -488,7 +490,7 @@ class TestTurnPersistenceInstrumented(unittest.TestCase):
             items=items,
         )
         turn_spans = [s for s in self.tracer.spans if s.name == "turn_persistence"]
-        self.assertEqual(len(turn_spans), 2)
+        self.assertEqual(len(turn_spans), 3)
         session_span = next(s for s in self.tracer.spans if s.name == "voice_session")
         for span in turn_spans:
             self.assertTrue(span.is_ended)
@@ -496,14 +498,14 @@ class TestTurnPersistenceInstrumented(unittest.TestCase):
             self.assertIn(span.attributes.get("speaker"), {"bot", "candidate"})
 
         histograms = [h for h in self.sink.histograms if h["name"] == "session_turn_persistence_duration_sec"]
-        self.assertEqual(len(histograms), 2)
+        self.assertEqual(len(histograms), 3)
         speakers = {h["labels"]["speaker"] for h in histograms}
         self.assertEqual(speakers, {"bot", "candidate"})
         for h in histograms:
             self.assertGreaterEqual(h["value"], 0.0)
 
-        # Both turns persisted.
-        self.assertEqual(persistence_mock.save_turn.await_count, 2)
+        # Explicit opener plus both conversation items persisted.
+        self.assertEqual(persistence_mock.save_turn.await_count, 3)
 
     def test_empty_text_turn_is_not_instrumented(self) -> None:
         items = (_item("assistant", "   "), _item("user", ""))
@@ -512,10 +514,12 @@ class TestTurnPersistenceInstrumented(unittest.TestCase):
             items=items,
         )
         turn_spans = [s for s in self.tracer.spans if s.name == "turn_persistence"]
-        self.assertEqual(turn_spans, [])
+        self.assertEqual(len(turn_spans), 1)
+        self.assertEqual(turn_spans[0].attributes.get("speaker"), "bot")
         turn_hists = [h for h in self.sink.histograms if h["name"] == "session_turn_persistence_duration_sec"]
-        self.assertEqual(turn_hists, [])
-        persistence_mock.save_turn.assert_not_awaited()
+        self.assertEqual(len(turn_hists), 1)
+        self.assertEqual(turn_hists[0]["labels"], {"speaker": "bot"})
+        persistence_mock.save_turn.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

@@ -5,7 +5,7 @@ Isolated, throwaway LiveKit Agents worker to test whether migrating off Pipecat
 that remains the rollback path.
 
 Stack: Sarvam STT (`saaras:v3`, en-IN) + Sarvam TTS (`bulbul:v3`, speaker `shubh`)
-+ silero VAD endpointing + DeepSeek (`deepseek-chat`) LLM.
++ DeepSeek/OpenAI-compatible LLM. Turn handling uses LiveKit Agents defaults.
 
 The mature Gopu screening prompt from the Pipecat implementation has been ported
 into this worker: AI disclosure, five-minute screening discipline, role-specific
@@ -18,7 +18,7 @@ candidate Q&A wind-down, and final goodbye behavior.
 python -m venv "D:\Claude projects\Screening bot for HR\app\voice-livekit\.venv"
 & "D:\Claude projects\Screening bot for HR\app\voice-livekit\.venv\Scripts\Activate.ps1"
 python -m pip install --upgrade pip
-pip install "livekit-agents[silero]" livekit-plugins-sarvam livekit-plugins-openai python-dotenv supabase httpx
+pip install livekit-agents livekit-plugins-sarvam livekit-plugins-openai python-dotenv supabase httpx
 ```
 
 ## Step 1 — voice test (PRIMARY spike path, no LiveKit Cloud account needed)
@@ -123,25 +123,12 @@ metadata. Supported keys:
 }
 ```
 
-## Noise / interruption tuning
+## Turn handling
 
-The worker uses stricter VAD and interruption defaults than LiveKit's baseline:
-
-```powershell
-LIVEKIT_VAD_ACTIVATION_THRESHOLD=0.7
-LIVEKIT_VAD_MIN_SPEECH_DURATION=0.3
-LIVEKIT_MIN_INTERRUPTION_DURATION=0.75
-LIVEKIT_MIN_INTERRUPTION_WORDS=2
-```
-
-If background voices still trigger Gopu, raise `LIVEKIT_VAD_ACTIVATION_THRESHOLD`
-to `0.75` or `0.8`, and raise `LIVEKIT_VAD_MIN_SPEECH_DURATION` to `0.4`. If
-soft-spoken candidates get missed, lower those two values slightly.
+The worker does not configure a custom VAD, Silero model, or explicit endpointing
+thresholds. Turn handling uses the LiveKit Agents `AgentSession` defaults.
 
 ## Notes
 
 - `agent.py` is still a LiveKit migration spike, but it now uses the full Gopu
   behavior prompt from the Pipecat prototype.
-- Deprecation warnings on import (`livekit-plugins-silero` bundling) are expected
-  and harmless for this spike. Production uses VAD-only endpointing to avoid
-  local turn-detector model memory pressure on low-cost Fly machines.

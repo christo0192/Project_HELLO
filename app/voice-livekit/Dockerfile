@@ -9,8 +9,8 @@
 #  - No HEALTHCHECK and no fake readiness server: the SDK worker does not
 #    expose an HTTP readiness endpoint, and provider-connected behavior (job
 #    drain on SIGTERM) is owner-verified at runtime, not claimed here.
-#  - No local turn-detector model is bundled in the image; production uses
-#    VAD-only endpointing to stay within the low-memory worker budget.
+#  - No custom VAD or local turn-detector model is bundled; turn handling uses
+#    LiveKit Agents defaults to stay within the low-memory worker budget.
 #  - Direct pins only (requirements.txt); this is not a full lock.
 
 # Stage 1: resolve and install pinned direct dependencies in an isolated venv.

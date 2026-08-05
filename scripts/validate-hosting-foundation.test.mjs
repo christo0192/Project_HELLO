@@ -64,7 +64,6 @@ const expectedPins = [
   "livekit-agents==1.6.4",
   "livekit-plugins-openai==1.6.4",
   "livekit-plugins-sarvam==1.6.4",
-  "livekit-plugins-silero==1.6.4",
   "python-dotenv==1.2.2",
   "supabase==2.31.0",
   "httpx==0.28.1",
@@ -78,7 +77,7 @@ await checkAsync("requirements.txt exists", async () => {
 await checkAsync("requirements.txt is exactly == pinned and non-vacuous", async () => {
   const content = await read("app/voice-livekit/requirements.txt");
   const depLines = content.split(/\r?\n/).filter((l) => l.trim() && !l.trim().startsWith("#"));
-  assert.ok(depLines.length >= 7, "at least 7 pinned dependencies");
+  assert.ok(depLines.length >= 6, "at least 6 pinned dependencies");
   for (const line of depLines) {
     assert.ok(isExactPin(line.trim()), `line is not an exact == pin: ${line}`);
     assert.ok(!/[<>=~*]/.test(line.replace(/==[^=]+$/, "")), `name constraint present: ${line}`);
