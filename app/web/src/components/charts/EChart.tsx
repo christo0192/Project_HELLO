@@ -13,7 +13,7 @@ export interface EChartProps {
   ariaLabel: string;
   className?: string;
   height?: number | string;
-  /** Overridden to 'svg' in tests (jsdom has no canvas). */
+  /** Canvas in browsers; test mode auto-falls back to SVG because jsdom has no canvas. */
   renderer?: 'canvas' | 'svg';
   onChartReady?: (instance: EChartsInstance) => void;
 }
@@ -67,7 +67,8 @@ export function EChart({
   useEffect(() => {
     const node = containerRef.current;
     if (!node) return;
-    const instance = echarts.init(node, undefined, { renderer });
+    const activeRenderer = import.meta.env['MODE'] === 'test' && renderer === 'canvas' ? 'svg' : renderer;
+    const instance = echarts.init(node, undefined, { renderer: activeRenderer });
     instanceRef.current = instance;
     instance.setOption(themed, true);
     readyRef.current?.(instance);
