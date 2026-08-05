@@ -615,7 +615,7 @@ describe('scoringProvenance', () => {
     const p = scoringProvenance('claude-sonnet-4-20250514', fixedClock);
     expect(p.workload).toBe('scoring');
     expect(p.requestedModel).toBe('claude-sonnet-4-20250514');
-    expect(p.prompt_template_version).toBe('2026-08-04.1');
+    expect(p.prompt_template_version).toBe('2026-08-05.1');
   });
 });
 
