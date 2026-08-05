@@ -6,7 +6,7 @@ import type { ParsedResume, ScreeningQuestion, TranscriptTurn } from './types.js
 // changes in a semantically meaningful way (structure, scoring, behavior).
 
 export const SCREENING_PROMPT_TEMPLATE_VERSION = '2026-08-04.1';
-export const SCORING_PROMPT_TEMPLATE_VERSION = '2026-08-04.1';
+export const SCORING_PROMPT_TEMPLATE_VERSION = '2026-08-05.1';
 
 // Resume extraction
 export function buildExtractionPrompt(resumeText: string): string {
@@ -161,6 +161,7 @@ Dimension guidance:
 - "communication.score": combined communication and English score. Judge how clearly and effectively they articulate ideas, structure answers, listen, build rapport, persuade/explain, and use English in a customer-facing call.
 - "communication.english_proficiency": language proficiency. Grade LENIENTLY - only give low scores if the English is genuinely poor / hard to follow. Minor grammar slips or an accent should NOT pull scores down.
 - "communication.filler_usage": detect distracting filler words such as "um", "uh", "like", "you know", repeated "actually", repeated "basically", long verbal stalls, or similar. Use examples from the transcript where possible. impact_score 10 = no meaningful issue, 0 = very distracting.
+- REGISTER FAIRNESS: The interviewer speaks casually on purpose (contractions, relaxed tone). Do NOT penalize the candidate for being casual, using contractions, or matching that friendly register. Judge clarity and substance, not formality. Casual-but-clear is fine for a screen.
 - "communication.native_language_usage": detect whether the candidate uses too much non-English/native-language speech for a role that requires clear English customer conversations. Do NOT penalize a light accent or one-off native word. impact_score 10 = no issue, 0 = mostly not understandable in English.
 - "motivation.score": genuine interest in the role and the company, energy, and intent to join.
 - "english": deprecated mirror of communication.english_proficiency for compatibility only. Do not treat it as a separate dimension.

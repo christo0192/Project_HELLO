@@ -38,6 +38,12 @@ type JoinPhase =
   | 'error';         // invite missing/malformed or server error
 
 const LOCALE = 'en-IN';
+const RECORDING_UPLOAD_ATTEMPTS = 3;
+const RECORDING_UPLOAD_RETRY_MS = 1500;
+
+function sleep(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
 
 /** Invites issued by the API are 256-bit tokens serialized as 64 hex chars. */
 const INVITE_TOKEN_RE = /^[a-f0-9]{64}$/;
@@ -127,7 +133,9 @@ export function CandidateJoinPage() {
     window.history.replaceState(null, '', '/candidate/join');
 
     return () => {
-      recorderRef.current?.state === 'recording' && recorderRef.current.stop();
+      if (recorderRef.current?.state === 'recording') {
+        recorderRef.current.stop();
+      }
       localTrackRef.current?.stop();
       roomRef.current?.disconnect();
     };
@@ -258,11 +266,17 @@ export function CandidateJoinPage() {
     if (!sessionId || !grantToken || chunks.length === 0) return;
     const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
     if (blob.size === 0) return;
-    try {
-      await api.uploadCandidateRecording(sessionId, grantToken, blob);
-    } catch {
-      // Recording upload failure must not trap the candidate in the room.
+    for (let attempt = 1; attempt <= RECORDING_UPLOAD_ATTEMPTS; attempt += 1) {
+      try {
+        await api.uploadCandidateRecording(sessionId, grantToken, blob);
+        return;
+      } catch {
+        if (attempt < RECORDING_UPLOAD_ATTEMPTS) {
+          await sleep(RECORDING_UPLOAD_RETRY_MS * attempt);
+        }
+      }
     }
+    // Recording upload failure must not trap the candidate in the room.
   }
 
   async function completeCandidateSession() {

@@ -191,6 +191,18 @@ _CLOSE_ERROR_NAME_TO_TERMINAL: dict[str, str | None] = {
 }
 
 
+def _close_reason_name(reason: Any) -> str | None:
+    if reason is None:
+        return None
+    raw_reason = getattr(reason, "name", None) or getattr(reason, "value", None) or reason
+    return str(raw_reason).lower().rsplit(".", 1)[-1]
+
+
+def _is_normal_disconnect_reason(reason: Any) -> bool:
+    reason_str = _close_reason_name(reason)
+    return reason_str in {"completed", "normal", "client_initiated"}
+
+
 def _classify_close_event(event: Any) -> str | None:
     """Classify a close event into terminal_reason or None (normal complete).
 
@@ -209,8 +221,7 @@ def _classify_close_event(event: Any) -> str | None:
     """
     reason = getattr(event, "reason", None)
     if reason is not None:
-        raw_reason = getattr(reason, "name", None) or getattr(reason, "value", None) or reason
-        reason_str = str(raw_reason).lower().rsplit(".", 1)[-1]
+        reason_str = _close_reason_name(reason)
         if reason_str in _CLOSE_REASON_TO_TERMINAL:
             return _CLOSE_REASON_TO_TERMINAL[reason_str]
 
@@ -336,6 +347,35 @@ async def _run_session(ctx: JobContext, started_at: float, session_id: Any, work
 
     _cleanup_started = False
     _close_event = asyncio.Event()
+    candidate_left_normally = False
+
+    def _mark_candidate_left_normally(event: Any = None) -> None:
+        """Remember a LiveKit participant-initiated leave across SDK close shapes.
+
+        Some SDK versions log the room participant disconnect reason separately
+        from the later AgentSession close event. Preserve that authoritative
+        client-initiated signal so a candidate pressing Leave while TTS is still
+        flushing is treated as a completed screening, not as worker_crash.
+        """
+        nonlocal candidate_left_normally
+        reason = getattr(event, "reason", None) or getattr(event, "disconnect_reason", None)
+        if reason is None or _is_normal_disconnect_reason(reason):
+            candidate_left_normally = True
+
+    room_on = getattr(getattr(ctx, "room", None), "on", None)
+    if callable(room_on):
+        def _participant_disconnected(event: Any = None) -> None:
+            _mark_candidate_left_normally(event)
+
+        try:
+            registered = room_on("participant_disconnected")
+            if callable(registered):
+                registered(_participant_disconnected)
+        except Exception:  # noqa: BLE001
+            try:
+                room_on("participant_disconnected", _participant_disconnected)
+            except Exception:  # noqa: BLE001
+                pass
 
     # OBS-06: parent span covering the whole voice session lifecycle.
     # Created only after activation succeeded — sessions that never started
@@ -473,7 +513,7 @@ async def _run_session(ctx: JobContext, started_at: float, session_id: Any, work
             @session.on("close")
             def _on_close(event):  # noqa: ANN001
                 nonlocal _finalizer_task  # *** CRITICAL: outer scope assignment ***
-                failed_reason = _classify_close_event(event)
+                failed_reason = None if candidate_left_normally else _classify_close_event(event)
                 _finalizer_task = asyncio.create_task(complete_once(failed_reason))
                 _close_event.set()
 
@@ -509,8 +549,10 @@ async def _run_session(ctx: JobContext, started_at: float, session_id: Any, work
     except Exception as exc:
         if session_span is not None:
             session_span.set_error(exc)
-        # Provider construction/start/generate failed before close event
-        await complete_once("worker_crash")
+        # Provider construction/start/generate failed before close event. If the
+        # room already told us the candidate intentionally disconnected, prefer
+        # normal completion over a false worker_crash.
+        await complete_once(None if candidate_left_normally else "worker_crash")
     finally:
         try:
             if _finalizer_task is not None and not _finalizer_task.done():
