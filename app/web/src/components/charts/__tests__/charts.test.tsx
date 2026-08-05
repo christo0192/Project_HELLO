@@ -318,9 +318,9 @@ describe('ChartReveal', () => {
     expect(container.querySelector('[style*="clip-path"]')).toBeNull();
   });
 
-  it('renders children with a clip-path animation by default', () => {
+  it('renders children without a production-only motion component dependency', () => {
     const { container } = render(<ChartReveal>content</ChartReveal>);
     expect(container.textContent).toBe('content');
-    expect(container.querySelector('[style*="clip-path"]')).not.toBeNull();
+    expect(container.querySelector('[style*="clip-path"]')).toBeNull();
   });
 });
