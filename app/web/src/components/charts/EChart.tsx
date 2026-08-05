@@ -1,7 +1,6 @@
-import ReactEChartsCore from 'echarts-for-react/lib/core';
-import type { EChartsInstance } from 'echarts-for-react/lib/types';
-import { useMemo } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import type { EChartsOption } from 'echarts';
+import type { ECharts as EChartsInstance } from 'echarts/core';
 import { useReducedMotion } from '../../lib/motion';
 import { useTheme } from '../../lib/theme';
 import { cx } from '../design/cx';
@@ -38,9 +37,12 @@ function mergeThemedOption(base: EChartsOption, option: EChartsOption): EChartsO
 }
 
 /**
- * Shared ECharts binding. Canvas rendering is intentionally NOT
- * keyboard-accessible; do not attach tabIndex or interactive roles to it.
- * The adjacent sr-only data table is the authoritative AT source.
+ * Shared ECharts binding.
+ *
+ * Do not use the `echarts-for-react` wrapper here: production bundling can
+ * resolve its CommonJS default export to an object, which React treats as an
+ * invalid element type. Initialising ECharts directly keeps the dashboard
+ * render path free of third-party React component interop.
  */
 export function EChart({
   option,
@@ -52,22 +54,40 @@ export function EChart({
 }: EChartProps) {
   const reducedMotion = useReducedMotion();
   const { theme } = useTheme();
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const instanceRef = useRef<EChartsInstance | null>(null);
+  const readyRef = useRef(onChartReady);
+  readyRef.current = onChartReady;
+
   const themed = useMemo(() => {
     const { base } = chartTheme(theme, reducedMotion);
     return mergeThemedOption(base, option);
   }, [option, theme, reducedMotion]);
 
+  useEffect(() => {
+    const node = containerRef.current;
+    if (!node) return;
+    const instance = echarts.init(node, undefined, { renderer });
+    instanceRef.current = instance;
+    instance.setOption(themed, true);
+    readyRef.current?.(instance);
+
+    const resize = () => instance.resize();
+    window.addEventListener('resize', resize);
+    return () => {
+      window.removeEventListener('resize', resize);
+      instance.dispose();
+      instanceRef.current = null;
+    };
+  }, [renderer, themed]);
+
+  useEffect(() => {
+    instanceRef.current?.setOption(themed, true);
+  }, [themed]);
+
   return (
     <div role="img" aria-label={ariaLabel} className={cx('w-full', className)} style={{ height }}>
-      <div aria-hidden="true" className="h-full w-full">
-        <ReactEChartsCore
-          echarts={echarts}
-          option={themed}
-          opts={{ renderer, width: 'auto', height: 'auto' }}
-          style={{ height: '100%', width: '100%' }}
-          onChartReady={onChartReady}
-        />
-      </div>
+      <div ref={containerRef} aria-hidden="true" className="h-full w-full" />
     </div>
   );
 }
