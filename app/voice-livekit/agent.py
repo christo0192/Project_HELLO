@@ -294,7 +294,12 @@ def _classify_close_event(event: Any) -> str | None:
         # (meaning conversation_complete), distinct from "key not found".
         if error_name in _CLOSE_ERROR_NAME_TO_TERMINAL:
             return _CLOSE_ERROR_NAME_TO_TERMINAL[error_name]
-        return "worker_crash"
+        # Unknown AgentSession close errors commonly arrive after a normal
+        # participant-initiated disconnect (the SDK logs CLIENT_INITIATED on a
+        # separate internal event). Treat the close as conversation_complete;
+        # provider/start exceptions are caught by the outer exception path and
+        # still fail as worker_crash/provider_error.
+        return None
 
     if reason is not None:
         return "worker_crash"

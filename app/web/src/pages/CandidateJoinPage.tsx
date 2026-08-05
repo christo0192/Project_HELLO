@@ -38,8 +38,8 @@ type JoinPhase =
   | 'error';         // invite missing/malformed or server error
 
 const LOCALE = 'en-IN';
-const RECORDING_UPLOAD_ATTEMPTS = 3;
-const RECORDING_UPLOAD_RETRY_MS = 1500;
+const CANDIDATE_FINALIZE_ATTEMPTS = 6;
+const CANDIDATE_FINALIZE_RETRY_MS = 2000;
 
 function sleep(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -266,13 +266,13 @@ export function CandidateJoinPage() {
     if (!sessionId || !grantToken || chunks.length === 0) return;
     const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
     if (blob.size === 0) return;
-    for (let attempt = 1; attempt <= RECORDING_UPLOAD_ATTEMPTS; attempt += 1) {
+    for (let attempt = 1; attempt <= CANDIDATE_FINALIZE_ATTEMPTS; attempt += 1) {
       try {
         await api.uploadCandidateRecording(sessionId, grantToken, blob);
         return;
       } catch {
-        if (attempt < RECORDING_UPLOAD_ATTEMPTS) {
-          await sleep(RECORDING_UPLOAD_RETRY_MS * attempt);
+        if (attempt < CANDIDATE_FINALIZE_ATTEMPTS) {
+          await sleep(CANDIDATE_FINALIZE_RETRY_MS * attempt);
         }
       }
     }
@@ -283,11 +283,17 @@ export function CandidateJoinPage() {
     const sessionId = sessionIdRef.current;
     const grantToken = grantTokenRef.current;
     if (!sessionId || !grantToken) return;
-    try {
-      await api.completeCandidateScreening(sessionId, grantToken);
-    } catch {
-      // Completion/scoring can be retried by ops/reconciler; keep candidate UX terminal.
+    for (let attempt = 1; attempt <= CANDIDATE_FINALIZE_ATTEMPTS; attempt += 1) {
+      try {
+        await api.completeCandidateScreening(sessionId, grantToken);
+        return;
+      } catch {
+        if (attempt < CANDIDATE_FINALIZE_ATTEMPTS) {
+          await sleep(CANDIDATE_FINALIZE_RETRY_MS * attempt);
+        }
+      }
     }
+    // Completion/scoring can be retried by ops/reconciler; keep candidate UX terminal.
   }
 
   async function join() {

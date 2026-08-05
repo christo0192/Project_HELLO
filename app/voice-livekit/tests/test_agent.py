@@ -275,11 +275,11 @@ class TestClassifyCloseEvent(unittest.TestCase):
         result = agent_mod._classify_close_event(event)
         self.assertEqual(result, "shutdown_forced")
 
-    def test_unknown_error_fails_closed(self):
-        """Unknown error type → worker_crash."""
-        event = FakeCloseEvent(error=ValueError("weird error"))
+    def test_unknown_close_error_completes_normally(self):
+        """Unknown AgentSession close error → None (normal close fallback)."""
+        event = FakeCloseEvent(error=ValueError("weird close cleanup error"))
         result = agent_mod._classify_close_event(event)
-        self.assertEqual(result, "worker_crash")
+        self.assertIsNone(result)
 
 
 class TestEntrypointActivationFailClosed(unittest.TestCase):

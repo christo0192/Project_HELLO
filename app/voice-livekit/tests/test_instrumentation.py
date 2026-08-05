@@ -562,6 +562,14 @@ class TestOutcomeCounterPaths(unittest.TestCase):
         # Negative control: the raw reason never appears anywhere.
         self._assert_no_leak(raw)
 
+    def test_unknown_close_error_completes_normally(self) -> None:
+        _configure_persistence()
+        _run_entrypoint(close_event=FakeCloseEvent(error=ValueError("sdk cleanup error")))
+        self.assertEqual(self._captured_outcome(), "conversation_complete")
+        persistence_mock.complete_session.assert_awaited_once()
+        persistence_mock.trigger_scoring.assert_awaited_once()
+        persistence_mock.fail_session.assert_not_awaited()
+
     def test_drain_timeout_maps_to_shutdown_forced(self) -> None:
         _configure_persistence(drain_pending_writes=_drain_false)
         _run_entrypoint(close_event=FakeCloseEvent(reason=FakeCloseReason("completed")))
