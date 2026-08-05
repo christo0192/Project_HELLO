@@ -628,7 +628,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/SimpleError'
         '409':
-          description: Recording already exists for this session (one recording per session; replay rejected).
+          description: Recording rejected — either recording_already_exists (one recording per session; replay) or authoritative_recording_pending (a LiveKit room-composite egress is active or completing and must be authoritative; browser upload is not accepted while a non-failed egress exists).
           content:
             application/json:
               schema:

@@ -1283,6 +1283,160 @@ describe('POST /api/livekit/:sessionId/recording (hardened upload)', () => {
     // Compensation attempted.
     expect(mockRemove).toHaveBeenCalled();
   });
+
+  // ── T7-T11: Egress-precedence gate (I‑2) ─────────────────────────
+
+  it('T7: rejects browser upload (409) when egress is active (authoritative_recording_pending)', async () => {
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      call_sessions: {
+        ...UPLOAD_SESSION,
+        recording_egress_id: 'EG_active123',
+        recording_egress_status: 'active',
+      },
+    });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe('authoritative_recording_pending');
+    expect(mockUpload).not.toHaveBeenCalled();
+    expect(mockRpc).not.toHaveBeenCalled();
+  });
+
+  it('T7b: rejects also when egress status is complete (still authoritative, not failed)', async () => {
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      call_sessions: {
+        ...UPLOAD_SESSION,
+        recording_egress_id: 'EG_complete123',
+        recording_egress_status: 'complete',
+      },
+    });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe('authoritative_recording_pending');
+    expect(mockUpload).not.toHaveBeenCalled();
+  });
+
+  it('T8: allows upload when egress status is failed (fallback declared)', async () => {
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      call_sessions: {
+        ...UPLOAD_SESSION,
+        recording_egress_id: 'EG_failed123',
+        recording_egress_status: 'failed',
+      },
+    });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    // Upload proceeds past the egress gate — should return 200 (not 409).
+    expect(res.status).toBe(200);
+    expect(res.body.object_key).toBeDefined();
+  });
+
+  it('T9: legacy path unchanged when no recording_egress_id is set', async () => {
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      call_sessions: {
+        ...UPLOAD_SESSION,
+        recording_egress_id: null,
+        recording_egress_status: null,
+      },
+    });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(200);
+    expect(res.body.object_key).toBeDefined();
+  });
+
+  it('T10: gate ordering preserved — deleted (404) before egress gate', async () => {
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      call_sessions: {
+        ...UPLOAD_SESSION,
+        recording_egress_id: 'EG_active123',
+        recording_egress_status: 'active',
+        recording_deleted_at: '2026-01-01T00:00:00.000Z',
+      },
+    });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe('not_found');
+  });
+
+  it('T10b: gate ordering preserved — quarantined (409) before egress gate', async () => {
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      call_sessions: {
+        ...UPLOAD_SESSION,
+        recording_egress_id: 'EG_active123',
+        recording_egress_status: 'active',
+        recording_quarantined: true,
+      },
+    });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe('recording_quarantined');
+  });
+
+  it('T10c: gate ordering preserved — revoked (403) before egress gate', async () => {
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      call_sessions: {
+        ...UPLOAD_SESSION,
+        recording_egress_id: 'EG_active123',
+        recording_egress_status: 'active',
+        recording_revoked_at: '2026-01-01T00:00:00.000Z',
+      },
+    });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('x-grant-token', GRANT_TOKEN)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe('access_denied');
+  });
+
+  // T11: grant-token and recruiter-owner auth outcomes unchanged
+  it('T11: recruiter-owner upload returns 200 (unchanged, egress is null)', async () => {
+    mockRecruiterAuth('interviewer', 'interviewer-1');
+    configureTables({
+      call_sessions: {
+        ...UPLOAD_SESSION,
+        owner_id: 'interviewer-1',
+        recording_egress_id: null,
+        recording_egress_status: null,
+      },
+    });
+    const app = uploadApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/recording`)
+      .set('Authorization', AUTH_HEADER)
+      .attach('file', webmBuf(), { filename: 'rec.webm', contentType: 'audio/webm' });
+    expect(res.status).toBe(200);
+  });
 });
 
 describe('POST /api/livekit/grant/recording (route-shadow fixed)', () => {

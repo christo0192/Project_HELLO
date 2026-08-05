@@ -275,7 +275,10 @@ export function CandidateJoinPage() {
       try {
         await api.uploadCandidateRecording(sessionId, grantToken, blob);
         return;
-      } catch {
+      } catch (err) {
+        // HTTP 409 authoritative_recording_pending → egress is authoritative;
+        // browser upload is NOT needed. Terminate without consuming retries.
+        if (err instanceof ApiError && err.status === 409) return;
         if (attempt < CANDIDATE_FINALIZE_ATTEMPTS) {
           await sleep(CANDIDATE_FINALIZE_RETRY_MS * attempt);
         }
@@ -314,9 +317,10 @@ export function CandidateJoinPage() {
         }
       }
 
-      // After an explicit Egress failure—or after all completion attempts are
-      // exhausted—the browser copy is the last-resort redundant recording.
-      if (fallbackRequired || fallbackBlob) {
+      // I‑2: browser upload is accepted only when the server explicitly
+      // declares fallback. pending / ready mean the egress is authoritative
+      // (or will be) — NEVER upload the browser-only blob in those cases.
+      if (fallbackRequired) {
         await uploadBrowserFallback(fallbackBlob);
       }
     })().finally(() => setStatus('ended'));

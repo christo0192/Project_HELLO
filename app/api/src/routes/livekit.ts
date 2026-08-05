@@ -555,7 +555,7 @@ livekitRouter.post(
       // ── Fetch session for preflight gates in one query (F-D repair) ─
       const { data: session, error: sessionErr } = await supabase
         .from('call_sessions')
-        .select('owner_id, recording_object_key, recording_deleted_at, recording_revoked_at, recording_quarantined')
+        .select('owner_id, recording_object_key, recording_egress_id, recording_egress_status, recording_deleted_at, recording_revoked_at, recording_quarantined')
         .eq('id', sessionId)
         .single();
       if (sessionErr || !session) {
@@ -585,6 +585,17 @@ livekitRouter.post(
       }
       if (session.recording_revoked_at) {
         return res.status(403).json({ error: 'access_denied' });
+      }
+
+      // ── Egress-precedence gate (I‑2): browser upload is accepted only
+      // when the server has declared fallback: egress disabled, no
+      // recording_egress_id, or recording_egress_status='failed'.
+      // pending is never a licence to upload.
+      if (session.recording_egress_id && session.recording_egress_status !== 'failed') {
+        await recordAudit(req, 'recording.upload', 409, {
+          metadata: { session_id: sessionId, result: 'egress_authoritative' },
+        }).catch(() => {/* fail-open */});
+        return res.status(409).json({ error: 'authoritative_recording_pending' });
       }
 
       // ── Quota / replay (invariant 4): one recording per session ──

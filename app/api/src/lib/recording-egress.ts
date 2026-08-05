@@ -149,12 +149,19 @@ export async function finalizeAuthoritativeRecording(
   const db = deps.db ?? supabase;
   const { data: session, error } = await db
     .from('call_sessions')
-    .select('recording_object_key, recording_egress_id, recording_egress_status')
+    .select('recording_object_key, recording_provenance, recording_egress_id, recording_egress_status')
     .eq('id', sessionId)
     .single();
   if (error || !session) throw new Error('recording session not found');
-  if (session.recording_object_key) return 'ready';
-  if (!session.recording_egress_id) return 'fallback_required';
+  // I‑1: a linked key is only authoritative when it came from the egress.
+  // A browser_upload key with a live egress must fall through and be repointed.
+  if (session.recording_object_key && session.recording_provenance === 'livekit_egress') return 'ready';
+  if (!session.recording_egress_id) {
+    // No egress to defer to. An already-linked key (legacy row, or a fallback
+    // the server previously licensed) is final — asking for another upload
+    // would only earn a 409. Otherwise the browser copy is the last resort.
+    return session.recording_object_key ? 'ready' : 'fallback_required';
+  }
 
   const client = deps.client ?? egressClient();
   const egressId = String(session.recording_egress_id);
@@ -178,23 +185,40 @@ export async function finalizeAuthoritativeRecording(
   }
 
   const sha256 = createHash('sha256').update(bytes).digest('hex');
-  const { data: rpcData, error: rpcError } = await db.rpc('finalize_recording_upload', {
+  const { data: rpcData, error: rpcError } = await db.rpc('finalize_authoritative_recording', {
     p_session_id: sessionId,
     p_object_key: objectKey,
     p_sha256: sha256,
     p_size_bytes: bytes.length,
     p_content_type: 'audio/ogg',
-    p_provenance: 'livekit_egress',
     p_correlation_id: null,
   });
   if (rpcError) throw new Error('recording egress finalization failed');
-  if ((rpcData as { status?: string } | null)?.status !== 'ok') {
+  const rpcStatus = (rpcData as { status?: string } | null)?.status;
+  if (rpcStatus === 'already_authoritative') return 'ready';
+  if (rpcStatus === 'provenance_conflict') {
+    // Row has provenance that cannot be upgraded to livekit_egress.
+    // If a key exists, it stays as-is (ready); otherwise pending.
     const { data: current } = await db
       .from('call_sessions')
       .select('recording_object_key')
       .eq('id', sessionId)
       .single();
     return current?.recording_object_key ? 'ready' : 'pending';
+  }
+  if (rpcStatus !== 'ok') {
+    if (rpcStatus === 'terminal_state') {
+      // Session is in a terminal recording state — cannot be repointed.
+      // If a key exists, it stays as-is (ready); otherwise pending.
+      const { data: current } = await db
+        .from('call_sessions')
+        .select('recording_object_key')
+        .eq('id', sessionId)
+        .single();
+      return current?.recording_object_key ? 'ready' : 'pending';
+    }
+    if (rpcStatus === 'no_egress') return 'fallback_required';
+    return 'pending';
   }
 
   await db.from('call_sessions').update({ recording_egress_status: 'complete' }).eq('id', sessionId);

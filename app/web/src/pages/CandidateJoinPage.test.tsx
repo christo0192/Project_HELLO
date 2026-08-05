@@ -422,4 +422,203 @@ describe('CandidateJoinPage', () => {
     expect(window.location.search).toBe('');
     expect(window.location.pathname).toBe('/candidate/join');
   });
+
+  // ── T12: all attempts pending → uploadCandidateRecording never called ─
+  it('T12: never uploads when /complete returns pending on every attempt', async () => {
+    candidateConsentStatus.mockResolvedValue({
+      has_consent: true,
+      template_version: '1.0',
+      locale: 'en-IN',
+      required_consents: ['ai_interview', 'recording'],
+    });
+    // Always returns pending — never ready, never fallback_required
+    completeCandidateScreening.mockResolvedValue({
+      status: 'completed',
+      recording_status: 'pending',
+    });
+
+    class FakeMediaRecorder {
+      static isTypeSupported = vi.fn(() => true);
+      state: RecordingState = 'inactive';
+      mimeType = 'audio/webm;codecs=opus';
+      ondataavailable: ((event: BlobEvent) => void) | null = null;
+      onstop: ((event: Event) => void) | null = null;
+      start() {
+        this.state = 'recording';
+        this.ondataavailable?.({ data: new Blob(['synthetic audio']) } as BlobEvent);
+      }
+      stop() {
+        this.state = 'inactive';
+        this.onstop?.(new Event('stop'));
+      }
+    }
+    vi.stubGlobal('MediaStream', class MediaStream {
+      constructor(_tracks: unknown[]) {}
+    });
+    vi.stubGlobal('MediaRecorder', FakeMediaRecorder);
+    createLocalAudioTrack.mockResolvedValue({
+      stop: vi.fn(),
+      mediaStreamTrack: { kind: 'audio' },
+    });
+
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
+    await userEvent.click(await screen.findByRole('button', { name: 'Join screening' }));
+
+    // Force disconnect → triggers finalizeCandidateCall
+    await waitFor(() => expect(roomHandlers.has('disconnected')).toBe(true));
+    roomHandlers.get('disconnected')?.();
+
+    await waitFor(() => expect(completeCandidateScreening).toHaveBeenCalled());
+    // T12 passes: uploadCandidateRecording was never called
+    expect(uploadCandidateRecording).not.toHaveBeenCalled();
+  });
+
+  // ── T13: fallback_required → uploaded exactly once ─
+  it('T13: uploads exactly once when /complete returns fallback_required', async () => {
+    candidateConsentStatus.mockResolvedValue({
+      has_consent: true,
+      template_version: '1.0',
+      locale: 'en-IN',
+      required_consents: ['ai_interview', 'recording'],
+    });
+    completeCandidateScreening.mockResolvedValue({
+      status: 'completed',
+      recording_status: 'fallback_required',
+    });
+
+    class FakeMediaRecorder {
+      static isTypeSupported = vi.fn(() => true);
+      state: RecordingState = 'inactive';
+      mimeType = 'audio/webm;codecs=opus';
+      ondataavailable: ((event: BlobEvent) => void) | null = null;
+      onstop: ((event: Event) => void) | null = null;
+      start() {
+        this.state = 'recording';
+        this.ondataavailable?.({ data: new Blob(['synthetic audio']) } as BlobEvent);
+      }
+      stop() {
+        this.state = 'inactive';
+        this.onstop?.(new Event('stop'));
+      }
+    }
+    vi.stubGlobal('MediaStream', class MediaStream {
+      constructor(_tracks: unknown[]) {}
+    });
+    vi.stubGlobal('MediaRecorder', FakeMediaRecorder);
+    createLocalAudioTrack.mockResolvedValue({
+      stop: vi.fn(),
+      mediaStreamTrack: { kind: 'audio' },
+    });
+
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
+    await userEvent.click(await screen.findByRole('button', { name: 'Join screening' }));
+
+    await waitFor(() => expect(roomHandlers.has('disconnected')).toBe(true));
+    roomHandlers.get('disconnected')?.();
+
+    await waitFor(() => expect(uploadCandidateRecording).toHaveBeenCalledTimes(1));
+    expect(uploadCandidateRecording.mock.calls[0]?.[2]).toBeInstanceOf(Blob);
+  });
+
+  // ── T14: ready → not called ─
+  it('T14: never uploads when /complete returns ready', async () => {
+    candidateConsentStatus.mockResolvedValue({
+      has_consent: true,
+      template_version: '1.0',
+      locale: 'en-IN',
+      required_consents: ['ai_interview', 'recording'],
+    });
+    completeCandidateScreening.mockResolvedValue({
+      status: 'completed',
+      recording_status: 'ready',
+    });
+    uploadCandidateRecording.mockClear();
+
+    class FakeMediaRecorder {
+      static isTypeSupported = vi.fn(() => true);
+      state: RecordingState = 'inactive';
+      mimeType = 'audio/webm;codecs=opus';
+      ondataavailable: ((event: BlobEvent) => void) | null = null;
+      onstop: ((event: Event) => void) | null = null;
+      start() {
+        this.state = 'recording';
+        this.ondataavailable?.({ data: new Blob(['synthetic audio']) } as BlobEvent);
+      }
+      stop() {
+        this.state = 'inactive';
+        this.onstop?.(new Event('stop'));
+      }
+    }
+    vi.stubGlobal('MediaStream', class MediaStream {
+      constructor(_tracks: unknown[]) {}
+    });
+    vi.stubGlobal('MediaRecorder', FakeMediaRecorder);
+    createLocalAudioTrack.mockResolvedValue({
+      stop: vi.fn(),
+      mediaStreamTrack: { kind: 'audio' },
+    });
+
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
+    await userEvent.click(await screen.findByRole('button', { name: 'Join screening' }));
+
+    await waitFor(() => expect(roomHandlers.has('disconnected')).toBe(true));
+    roomHandlers.get('disconnected')?.();
+
+    await waitFor(() => expect(completeCandidateScreening).toHaveBeenCalled());
+    expect(uploadCandidateRecording).not.toHaveBeenCalled();
+  });
+
+  // ── T15: upload 409 → no retry loop, terminal ─
+  it('T15: treats 409 as terminal in uploadBrowserFallback (no retry loop)', async () => {
+    candidateConsentStatus.mockResolvedValue({
+      has_consent: true,
+      template_version: '1.0',
+      locale: 'en-IN',
+      required_consents: ['ai_interview', 'recording'],
+    });
+    completeCandidateScreening.mockResolvedValue({
+      status: 'completed',
+      recording_status: 'fallback_required',
+    });
+    // Upload returns 409 — egress is authoritative
+    const ApiError = (await import('../api')).ApiError;
+    uploadCandidateRecording.mockRejectedValue(new ApiError('authoritative_recording_pending', 409));
+
+    class FakeMediaRecorder {
+      static isTypeSupported = vi.fn(() => true);
+      state: RecordingState = 'inactive';
+      mimeType = 'audio/webm;codecs=opus';
+      ondataavailable: ((event: BlobEvent) => void) | null = null;
+      onstop: ((event: Event) => void) | null = null;
+      start() {
+        this.state = 'recording';
+        this.ondataavailable?.({ data: new Blob(['synthetic audio']) } as BlobEvent);
+      }
+      stop() {
+        this.state = 'inactive';
+        this.onstop?.(new Event('stop'));
+      }
+    }
+    vi.stubGlobal('MediaStream', class MediaStream {
+      constructor(_tracks: unknown[]) {}
+    });
+    vi.stubGlobal('MediaRecorder', FakeMediaRecorder);
+    createLocalAudioTrack.mockResolvedValue({
+      stop: vi.fn(),
+      mediaStreamTrack: { kind: 'audio' },
+    });
+
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
+    await userEvent.click(await screen.findByRole('button', { name: 'Join screening' }));
+
+    await waitFor(() => expect(roomHandlers.has('disconnected')).toBe(true));
+    roomHandlers.get('disconnected')?.();
+
+    // T15 passes: upload was attempted exactly once and did NOT retry
+    await waitFor(() => expect(uploadCandidateRecording).toHaveBeenCalledTimes(1));
+  });
 });

@@ -3489,6 +3489,381 @@ select _policy_tests.assert(
 );
 
 -- ═══════════════════════════════════════════════════════════════════════
+-- 0025 — finalize_authoritative_recording: grants + behaviour (T16-T19)
+--
+-- Sessions are created through the sanctioned lifecycle (created →
+-- in_progress → completed); direct INSERTs at a terminal status are
+-- rejected by trg_insert_created. Cleanup deletes the parent session only —
+-- recording_integrity_events is append-only and refuses direct DELETE, but
+-- the guard permits the parent cascade.
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- Helper: create a completed session carrying a browser_upload recording and
+-- a non-terminal egress, walking the allowed lifecycle transitions.
+create or replace function _policy_tests.seed_repoint_session(
+  p_candidate_id uuid,
+  p_egress_id text,
+  p_object_key text,
+  p_deleted boolean,
+  p_revoked boolean,
+  p_quarantined boolean
+)
+returns uuid language plpgsql as $$
+declare
+  v_session_id uuid;
+begin
+  insert into screening_v2.call_sessions (candidate_id, mode, status)
+    values (p_candidate_id, 'simulation', 'created')
+    returning id into v_session_id;
+
+  update screening_v2.call_sessions set status = 'in_progress' where id = v_session_id;
+  update screening_v2.call_sessions
+     set status = 'completed', terminal_reason = 'assessment_done'
+   where id = v_session_id;
+
+  update screening_v2.call_sessions
+     set recording_egress_id = p_egress_id,
+         recording_egress_status = 'complete',
+         recording_object_key = p_object_key,
+         recording_sha256 = repeat('a', 64),
+         recording_size_bytes = 1024,
+         recording_content_type = 'audio/webm',
+         recording_provenance = 'browser_upload',
+         recording_deleted_at = case when p_deleted then now() else null end,
+         recording_revoked_at = case when p_revoked then now() else null end,
+         recording_quarantined = p_quarantined
+   where id = v_session_id;
+
+  -- The 'uploaded' event the original browser upload would have written.
+  insert into screening_v2.recording_integrity_events
+    (session_id, event_type, sha256_expected, size_bytes, detail)
+  values (v_session_id, 'uploaded', repeat('a', 64), 1024, 'policy-test synthetic upload');
+
+  return v_session_id;
+end;
+$$;
+
+-- ── T16: execute privilege is service-role-only ──────────────────────
+select _policy_tests.assert(
+  'T16: anon cannot execute finalize_authoritative_recording',
+  not has_function_privilege(
+    'anon',
+    'screening_v2.finalize_authoritative_recording(uuid,text,text,bigint,text,text)'::regprocedure,
+    'EXECUTE'),
+  'anon must not be able to execute the authoritative recording RPC'
+);
+
+select _policy_tests.assert(
+  'T16: authenticated cannot execute finalize_authoritative_recording',
+  not has_function_privilege(
+    'authenticated',
+    'screening_v2.finalize_authoritative_recording(uuid,text,text,bigint,text,text)'::regprocedure,
+    'EXECUTE'),
+  'authenticated must not be able to execute the authoritative recording RPC'
+);
+
+select _policy_tests.assert(
+  'T16: service_role can execute finalize_authoritative_recording',
+  has_function_privilege(
+    'service_role',
+    'screening_v2.finalize_authoritative_recording(uuid,text,text,bigint,text,text)'::regprocedure,
+    'EXECUTE'),
+  'service_role must be able to execute the authoritative recording RPC'
+);
+
+-- ── T17: terminal rows are refused and left byte-identical ───────────
+do $$
+declare
+  v_candidate_id uuid;
+  v_session_id uuid;
+  v_before record;
+  v_after record;
+  v_result jsonb;
+  v_case record;
+begin
+  select id into v_candidate_id from screening_v2.candidates limit 1;
+  if v_candidate_id is null then
+    insert into _policy_tests.results(test, passed, detail) values
+      ('T17: deleted row is refused with terminal_state', true, 'skipped: no candidate row'),
+      ('T17: revoked row is refused with terminal_state', true, 'skipped: no candidate row'),
+      ('T17: quarantined row is refused with terminal_state', true, 'skipped: no candidate row');
+    return;
+  end if;
+
+  for v_case in
+    select * from (values
+      ('deleted',     true,  false, false, 'EG_polT17del'),
+      ('revoked',     false, true,  false, 'EG_polT17rev'),
+      ('quarantined', false, false, true,  'EG_polT17qua')
+    ) as t(label, is_deleted, is_revoked, is_quarantined, egress_id)
+  loop
+    v_session_id := _policy_tests.seed_repoint_session(
+      v_candidate_id, v_case.egress_id, 'policy-test-browser.webm',
+      v_case.is_deleted, v_case.is_revoked, v_case.is_quarantined);
+
+    select recording_object_key, recording_sha256, recording_size_bytes,
+           recording_content_type, recording_provenance,
+           recording_superseded_object_key, recording_deleted_at,
+           recording_revoked_at, recording_quarantined
+      into v_before
+      from screening_v2.call_sessions where id = v_session_id;
+
+    v_result := screening_v2.finalize_authoritative_recording(
+      v_session_id, v_session_id::text || '-egress.ogg', repeat('b', 64), 4096, 'audio/ogg', null);
+
+    select recording_object_key, recording_sha256, recording_size_bytes,
+           recording_content_type, recording_provenance,
+           recording_superseded_object_key, recording_deleted_at,
+           recording_revoked_at, recording_quarantined
+      into v_after
+      from screening_v2.call_sessions where id = v_session_id;
+
+    insert into _policy_tests.results(test, passed, detail) values
+      ('T17: ' || v_case.label || ' row is refused with terminal_state',
+       (v_result ->> 'status' = 'terminal_state')
+       and (v_before is not distinct from v_after)
+       and not exists (
+         select 1 from screening_v2.recording_integrity_events
+          where session_id = v_session_id and event_type = 'repointed'),
+       'status=' || coalesce(v_result ->> 'status', 'null')
+       || ' mutated=' || (v_before is distinct from v_after)::text);
+
+    -- Parent delete cascades the integrity events (direct delete is blocked).
+    delete from screening_v2.call_sessions where id = v_session_id;
+  end loop;
+end;
+$$;
+
+-- ── T18: browser → egress repoint writes exactly one 'repointed' event ─
+do $$
+declare
+  v_candidate_id uuid;
+  v_session_id uuid;
+  v_result jsonb;
+  v_total integer;
+  v_repointed integer;
+  v_provenance text;
+  v_superseded text;
+  v_key text;
+begin
+  select id into v_candidate_id from screening_v2.candidates limit 1;
+  if v_candidate_id is null then
+    insert into _policy_tests.results(test, passed, detail) values
+      ('T18: browser upload is repointed to livekit_egress', true, 'skipped: no candidate row');
+    return;
+  end if;
+
+  v_session_id := _policy_tests.seed_repoint_session(
+    v_candidate_id, 'EG_polT18', 'policy-test-browser.webm', false, false, false);
+
+  v_result := screening_v2.finalize_authoritative_recording(
+    v_session_id, v_session_id::text || '-egress.ogg', repeat('b', 64), 4096, 'audio/ogg', null);
+
+  select count(*) into v_total
+    from screening_v2.recording_integrity_events where session_id = v_session_id;
+  select count(*) into v_repointed
+    from screening_v2.recording_integrity_events
+   where session_id = v_session_id and event_type = 'repointed';
+  select recording_provenance, recording_superseded_object_key, recording_object_key
+    into v_provenance, v_superseded, v_key
+    from screening_v2.call_sessions where id = v_session_id;
+
+  insert into _policy_tests.results(test, passed, detail) values
+    ('T18: browser upload is repointed to livekit_egress',
+     (v_result ->> 'status' = 'ok')
+     and v_provenance = 'livekit_egress'
+     and v_key = v_session_id::text || '-egress.ogg'
+     and v_superseded = 'policy-test-browser.webm'
+     and v_total = 2          -- the original 'uploaded' plus one 'repointed'
+     and v_repointed = 1,
+     'status=' || coalesce(v_result ->> 'status', 'null')
+     || ' provenance=' || coalesce(v_provenance, 'null')
+     || ' superseded=' || coalesce(v_superseded, 'null')
+     || ' events=' || v_total || ' repointed=' || v_repointed);
+
+  delete from screening_v2.call_sessions where id = v_session_id;
+end;
+$$;
+
+-- ── T19: a second repoint is idempotent (already_authoritative) ──────
+do $$
+declare
+  v_candidate_id uuid;
+  v_session_id uuid;
+  v_result jsonb;
+  v_total integer;
+  v_repointed integer;
+  v_key text;
+begin
+  select id into v_candidate_id from screening_v2.candidates limit 1;
+  if v_candidate_id is null then
+    insert into _policy_tests.results(test, passed, detail) values
+      ('T19: repeat repoint returns already_authoritative', true, 'skipped: no candidate row');
+    return;
+  end if;
+
+  v_session_id := _policy_tests.seed_repoint_session(
+    v_candidate_id, 'EG_polT19', 'policy-test-browser.webm', false, false, false);
+
+  perform screening_v2.finalize_authoritative_recording(
+    v_session_id, v_session_id::text || '-egress.ogg', repeat('b', 64), 4096, 'audio/ogg', null);
+
+  -- Second call with the same key still passes validation, but provenance is now livekit_egress.
+  v_result := screening_v2.finalize_authoritative_recording(
+    v_session_id, v_session_id::text || '-egress.ogg', repeat('b', 64), 4096, 'audio/ogg', null);
+
+  select count(*) into v_total
+    from screening_v2.recording_integrity_events where session_id = v_session_id;
+  select count(*) into v_repointed
+    from screening_v2.recording_integrity_events
+   where session_id = v_session_id and event_type = 'repointed';
+  select recording_object_key into v_key
+    from screening_v2.call_sessions where id = v_session_id;
+
+  insert into _policy_tests.results(test, passed, detail) values
+    ('T19: repeat repoint returns already_authoritative',
+     (v_result ->> 'status' = 'already_authoritative')
+     and v_key = v_session_id::text || '-egress.ogg'   -- unchanged by the second call
+     and v_total = 2
+     and v_repointed = 1,
+     'status=' || coalesce(v_result ->> 'status', 'null')
+     || ' key=' || coalesce(v_key, 'null')
+     || ' events=' || v_total || ' repointed=' || v_repointed);
+
+  delete from screening_v2.call_sessions where id = v_session_id;
+end;
+$$;
+
+-- ── T19b: a session without an egress is refused with no_egress ──────
+do $$
+declare
+  v_candidate_id uuid;
+  v_session_id uuid;
+  v_result jsonb;
+  v_provenance text;
+begin
+  select id into v_candidate_id from screening_v2.candidates limit 1;
+  if v_candidate_id is null then
+    insert into _policy_tests.results(test, passed, detail) values
+      ('T19b: session without egress is refused with no_egress', true, 'skipped: no candidate row');
+    return;
+  end if;
+
+  v_session_id := _policy_tests.seed_repoint_session(
+    v_candidate_id, 'EG_polT19b', 'policy-test-browser.webm', false, false, false);
+  update screening_v2.call_sessions
+     set recording_egress_id = null, recording_egress_status = null
+   where id = v_session_id;
+
+  v_result := screening_v2.finalize_authoritative_recording(
+    v_session_id, v_session_id::text || '-egress.ogg', repeat('b', 64), 4096, 'audio/ogg', null);
+
+  select recording_provenance into v_provenance
+    from screening_v2.call_sessions where id = v_session_id;
+
+  insert into _policy_tests.results(test, passed, detail) values
+    ('T19b: session without egress is refused with no_egress',
+     (v_result ->> 'status' = 'no_egress') and v_provenance = 'browser_upload',
+     'status=' || coalesce(v_result ->> 'status', 'null')
+     || ' provenance=' || coalesce(v_provenance, 'null'));
+
+  delete from screening_v2.call_sessions where id = v_session_id;
+end;
+$$;
+
+-- ── T19c: invalid object key is rejected ─────────────────────────────
+do $$
+declare
+  v_candidate_id uuid;
+  v_session_id uuid;
+  v_result jsonb;
+begin
+  select id into v_candidate_id from screening_v2.candidates limit 1;
+  if v_candidate_id is null then
+    insert into _policy_tests.results(test, passed, detail) values
+      ('T19c: invalid object key rejected', true, 'skipped: no candidate row');
+    return;
+  end if;
+
+  v_session_id := _policy_tests.seed_repoint_session(
+    v_candidate_id, 'EG_polT19c', 'policy-test-browser.webm', false, false, false);
+
+  -- Key does not match {session_id}-egress.ogg pattern.
+  v_result := screening_v2.finalize_authoritative_recording(
+    v_session_id, 'wrong-key.ogg', repeat('b', 64), 4096, 'audio/ogg', null);
+
+  insert into _policy_tests.results(test, passed, detail) values
+    ('T19c: invalid object key rejected',
+     v_result ->> 'status' = 'invalid_object_key',
+     'status=' || coalesce(v_result ->> 'status', 'null'));
+
+  delete from screening_v2.call_sessions where id = v_session_id;
+end;
+$$;
+
+-- ── T19d: size exceeds 52428800 is rejected ──────────────────────────
+do $$
+declare
+  v_candidate_id uuid;
+  v_session_id uuid;
+  v_result jsonb;
+begin
+  select id into v_candidate_id from screening_v2.candidates limit 1;
+  if v_candidate_id is null then
+    insert into _policy_tests.results(test, passed, detail) values
+      ('T19d: oversized bytes rejected', true, 'skipped: no candidate row');
+    return;
+  end if;
+
+  v_session_id := _policy_tests.seed_repoint_session(
+    v_candidate_id, 'EG_polT19d', 'policy-test-browser.webm', false, false, false);
+
+  v_result := screening_v2.finalize_authoritative_recording(
+    v_session_id, v_session_id::text || '-egress.ogg', repeat('b', 64), 52428801, 'audio/ogg', null);
+
+  insert into _policy_tests.results(test, passed, detail) values
+    ('T19d: oversized bytes rejected',
+     v_result ->> 'status' = 'invalid_size_bytes',
+     'status=' || coalesce(v_result ->> 'status', 'null'));
+
+  delete from screening_v2.call_sessions where id = v_session_id;
+end;
+$$;
+
+-- ── T19e: non-null provenance other than browser_upload/livekit_egress → provenance_conflict
+do $$
+declare
+  v_candidate_id uuid;
+  v_session_id uuid;
+  v_result jsonb;
+begin
+  select id into v_candidate_id from screening_v2.candidates limit 1;
+  if v_candidate_id is null then
+    insert into _policy_tests.results(test, passed, detail) values
+      ('T19e: provenance conflict rejected', true, 'skipped: no candidate row');
+    return;
+  end if;
+
+  v_session_id := _policy_tests.seed_repoint_session(
+    v_candidate_id, 'EG_polT19e', 'policy-test-browser.webm', false, false, false);
+  -- Set provenance to something other than null / browser_upload / livekit_egress.
+  update screening_v2.call_sessions
+     set recording_provenance = 'other_source'
+   where id = v_session_id;
+
+  v_result := screening_v2.finalize_authoritative_recording(
+    v_session_id, v_session_id::text || '-egress.ogg', repeat('b', 64), 4096, 'audio/ogg', null);
+
+  insert into _policy_tests.results(test, passed, detail) values
+    ('T19e: provenance conflict rejected',
+     v_result ->> 'status' = 'provenance_conflict',
+     'status=' || coalesce(v_result ->> 'status', 'null'));
+
+  delete from screening_v2.call_sessions where id = v_session_id;
+end;
+$$;
+
+-- ═══════════════════════════════════════════════════════════════════════
 -- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)
 -- ═══════════════════════════════════════════════════════════════════════
 
