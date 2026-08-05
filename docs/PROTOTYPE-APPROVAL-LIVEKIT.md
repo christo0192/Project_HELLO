@@ -32,7 +32,7 @@ Everything runs on **free tiers + one tiny India server**, so we can screen real
 | **Turn detection** | v1-mini (local, on-device) | Free, India-fast, transcript-independent |
 | **Speech-to-text** | Sarvam saaras:v3 (India) | Fast, India-hosted |
 | **Text-to-speech** | Sarvam bulbul:v3 (shubh) | Matches current production voice |
-| **LLM (the brain)** | **Gemini 3.5 Flash-Lite — Google Developer API** | **~10× cheaper than Haiku**, strong instruction-following, **hosted in India** (keeps the latency win) |
+| **LLM (the brain)** | **Gemini 3.1 Flash-Lite — Google Developer API** | Low-cost, strong instruction-following via Google's global endpoint; strict regional processing would require Vertex AI |
 | **Agent worker host** | **Oracle Cloud free (Mumbai)** or DigitalOcean Bangalore (~$6) | Tiny India box runs Gopu's brain |
 | **Recording** | Open-source MP3 (LiveKit egress / ffmpeg) → storage | The MP3 the previous build didn't save |
 | **Recording storage** | Supabase Storage free (1GB) → Cloudflare R2 later | Free for prototype |

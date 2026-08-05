@@ -252,7 +252,7 @@ class TestTerminationHelpers(unittest.IsolatedAsyncioTestCase):
 
 class TestGeminiProviderConfiguration(unittest.TestCase):
     def test_direct_google_endpoint_and_lite_model(self):
-        self.assertEqual(agent_mod.GEMINI_MODEL, "gemini-3.5-flash-lite")
+        self.assertEqual(agent_mod.GEMINI_MODEL, "gemini-3.1-flash-lite")
         self.assertEqual(
             agent_mod.GEMINI_BASE_URL,
             "https://generativelanguage.googleapis.com/v1beta/openai/",
