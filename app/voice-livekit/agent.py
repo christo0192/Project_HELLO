@@ -99,6 +99,68 @@ def _safe_emit(fn: Callable[..., None], *args: Any, **kwargs: Any) -> None:
         pass
 
 
+def _provider_metric_component(metric: Any) -> str | None:
+    name = type(metric).__name__.lower()
+    if "llm" in name:
+        return "llm"
+    if "tts" in name:
+        return "tts"
+    return None
+
+
+def _provider_metric_number(metric: Any, *names: str) -> float | None:
+    for name in names:
+        value = getattr(metric, name, None)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            return float(value)
+    return None
+
+
+def _record_provider_metrics(event: Any) -> None:
+    """Log bounded LLM/TTS timings emitted by LiveKit Agents, when available.
+
+    We intentionally skip STT/EOU here for now per the latency work order.
+    Field names differ slightly across SDK versions, so this function probes a
+    small allowlist and never logs transcript, room, candidate, request IDs, or
+    raw provider payloads.
+    """
+    metric = getattr(event, "metrics", event)
+    component = _provider_metric_component(metric)
+    if component is None:
+        return
+
+    duration = _provider_metric_number(metric, "duration", "duration_sec", "elapsed")
+    ttf = _provider_metric_number(metric, "ttft", "ttfb", "time_to_first_token", "time_to_first_byte")
+    if duration is not None:
+        _safe_emit(
+            histogram_metric,
+            "voice_provider_duration_sec",
+            duration,
+            {"schema": component},
+        )
+        _log.info(
+            "unknown_event",
+            error_type="voice_provider_duration",
+            schema=component,
+            duration_sec=round(duration, 3),
+        )
+    if ttf is not None:
+        _safe_emit(
+            histogram_metric,
+            "voice_provider_first_signal_sec",
+            ttf,
+            {"schema": component},
+        )
+        _log.info(
+            "unknown_event",
+            error_type="voice_provider_first_signal",
+            schema=component,
+            duration_sec=round(ttf, 3),
+        )
+
+
 def _start_span_guarded(name: str, parent: Span | None = None) -> Span | None:
     """Start a span defensively — a broken tracer must never break the flow."""
     try:
@@ -494,6 +556,10 @@ async def _run_session(ctx: JobContext, started_at: float, session_id: Any, work
                 # This avoids deprecated endpointing knobs and keeps behavior on
                 # the SDK-supported path.
             )
+
+            @session.on("metrics_collected")
+            def _on_metrics_collected(event):  # noqa: ANN001
+                _record_provider_metrics(event)
 
             @session.on("conversation_item_added")
             def _on_conversation_item(event):  # noqa: ANN001
