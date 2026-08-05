@@ -66,7 +66,7 @@ class TestProvenanceValidation(unittest.TestCase):
 
     def test_valid_gemini_screening_provenance(self):
         result = validate_provenance(
-            valid_payload(provider="gemini", requestedModel="gemini-2.5-flash-lite"),
+            valid_payload(provider="gemini", requestedModel="gemini-3.5-flash-lite"),
             fixed_clock,
         )
         self.assertTrue(result["valid"])
@@ -453,10 +453,10 @@ class TestProvenanceValidation(unittest.TestCase):
     # ── screening_provenance ─────────────────────────────────────────
 
     def test_screening_provenance(self):
-        p = screening_provenance("gemini-2.5-flash-lite", fixed_clock)
+        p = screening_provenance("gemini-3.5-flash-lite", fixed_clock)
         self.assertEqual(p["provider"], "gemini")
         self.assertEqual(p["workload"], "screening")
-        self.assertEqual(p["requestedModel"], "gemini-2.5-flash-lite")
+        self.assertEqual(p["requestedModel"], "gemini-3.5-flash-lite")
         self.assertEqual(p["prompt_template_version"], SCREENING_PROVENANCE_VERSION)
 
     # ── legacy provenance ────────────────────────────────────────────

@@ -34,7 +34,7 @@ from provenance import screening_provenance
 
 load_dotenv()
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 # Google AI Studio's direct OpenAI-compatible endpoint. AgentSession consumes
 # the plugin's async token stream; no iKey/model gateway is present in this path.
 GEMINI_BASE_URL = os.getenv(
