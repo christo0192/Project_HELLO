@@ -428,6 +428,64 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
 
+  /api/internal/assess/{sessionId}:
+    parameters:
+      - name: sessionId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [assess]
+      operationId: runWorkerAssessment
+      summary: Score a completed screening session from the voice worker
+      security:
+        - workerBearer: []
+      responses:
+        '200':
+          description: Assessment object created by the configured scoring provider.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Assessment'
+        '400':
+          description: Session identifier validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '401':
+          description: Worker bearer credential required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkerContextError'
+        '403':
+          description: Worker bearer credential invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkerContextError'
+        '409':
+          description: Session is not eligible for assessment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '500':
+          description: Scoring or persistence failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '503':
+          description: Worker credential is not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkerContextError'
+
   # ── LiveKit ────────────────────────────────────────────────────────
   /api/livekit/start:
     post:

@@ -893,7 +893,7 @@ describe('OpenAPI document integrity', () => {
     const paths = spec.paths as YMap;
     const schemas = ((spec as YMap).components as YMap).schemas as YMap;
     const securitySchemes = ((spec as YMap).components as YMap).securitySchemes as YMap;
-    expect(Object.keys(paths).length).toBe(58);
+    expect(Object.keys(paths).length).toBe(59);
     expect(Object.keys(schemas).length).toBe(126);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
@@ -949,6 +949,7 @@ describe('auth boundary vs spec security model', () => {
     'POST /api/csp-report',
     'POST /api/livekit/exchange',
     'POST /api/livekit/worker-context',
+    'POST /api/internal/assess/{sessionId}',
     'POST /api/livekit/grant/recording',
     // Phase 9 L4 exact public allowlist (method+path precise).
     'GET /api/status',
@@ -1231,6 +1232,26 @@ describe('live handler shapes match documented schemas', () => {
     injectAssessmentRunner(async () => mockAssessmentCamel);
     const app = createContractApp();
     const res = await request(app).post(`/api/assess/${UUID_1}`).set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'Assessment', spec)).toEqual([]);
+  });
+
+  it('POST /api/internal/assess/{sessionId} requires the worker credential', async () => {
+    injectAssessmentRunner(async () => mockAssessmentCamel);
+    const app = createContractApp();
+    await request(app).post(`/api/internal/assess/${UUID_1}`).expect(401);
+    await request(app)
+      .post(`/api/internal/assess/${UUID_1}`)
+      .set('Authorization', 'Bearer wrong-worker-secret-0123456789abcdef')
+      .expect(403);
+  });
+
+  it('POST /api/internal/assess/{sessionId} scores with the worker credential', async () => {
+    injectAssessmentRunner(async () => mockAssessmentCamel);
+    const app = createContractApp();
+    const res = await request(app)
+      .post(`/api/internal/assess/${UUID_1}`)
+      .set('Authorization', `Bearer ${process.env.WORKER_CONTEXT_SECRET}`);
     expect(res.status).toBe(200);
     expect(validateResponseBody(res.body, 'Assessment', spec)).toEqual([]);
   });

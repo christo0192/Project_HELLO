@@ -551,11 +551,16 @@ async def trigger_scoring(session_id: Optional[str]) -> TriggerOutcome:
     correlation_id = get_correlation_id()
     if correlation_id:
         headers["X-Correlation-ID"] = correlation_id
+    worker_secret = os.getenv("WORKER_CONTEXT_SECRET", "")
+    if len(worker_secret) < 32:
+        _log.warn("scoring_failed", error_category="configuration")
+        return TriggerOutcome.BUSINESS_ERROR
+    headers["Authorization"] = f"Bearer {worker_secret}"
 
     try:
         response = await call_with_breaker(
             "POST",
-            f"{API_BASE}/api/assess/{session_id}",
+            f"{API_BASE}/api/internal/assess/{session_id}",
             breaker=_SCORING_BREAKER,
             transport=transport,
             headers=headers,

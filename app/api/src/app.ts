@@ -6,7 +6,7 @@ import { rolesRouter } from './routes/roles.js';
 import { resumesRouter } from './routes/resumes.js';
 import { candidatesRouter } from './routes/candidates.js';
 import { screeningRouter } from './routes/screening.js';
-import { assessRouter } from './routes/assess.js';
+import { assessRouter, workerAssessRouter } from './routes/assess.js';
 import { livekitRouter } from './routes/livekit.js';
 import { invitesRouter } from './routes/invites.js';
 import { recordingsRouter } from './routes/recordings.js';
@@ -203,6 +203,11 @@ export function createApp(opts: CreateAppOptions = {}) {
     prefix: 'global:ip:',
     useUserKey: false,
   }));
+
+  // Internal scoring callback for the Fly voice worker. It is mounted before
+  // recruiter auth because it uses a separate constant-time shared-secret
+  // boundary and is still covered by the global per-IP limiter.
+  app.use('/api/internal/assess', workerAssessRouter);
 
   // ── Auth middleware: runs after CORS so preflight succeeds ─────
   // Uses DI seam when authDeps is provided (tests).

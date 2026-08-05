@@ -748,6 +748,14 @@ class TestTriggerScoringHeaderPropagation(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         reset_correlation()
         persistence._SCORING_BREAKER.reset()
+        self._worker_secret = "w" * 32
+        self._worker_secret_patcher = patch.dict(
+            os.environ, {"WORKER_CONTEXT_SECRET": self._worker_secret}
+        )
+        self._worker_secret_patcher.start()
+
+    async def asyncTearDown(self) -> None:
+        self._worker_secret_patcher.stop()
 
     @staticmethod
     def _transport(status: int, captured: Optional[dict] = None):
@@ -781,6 +789,10 @@ class TestTriggerScoringHeaderPropagation(unittest.IsolatedAsyncioTestCase):
             result = await persistence.trigger_scoring("session-id-irrelevant")
         self.assertEqual(result, persistence.TriggerOutcome.SUCCESS)
         self.assertEqual(captured["headers"]["X-Correlation-ID"], expected_cid)
+        self.assertEqual(
+            captured["headers"]["Authorization"], f"Bearer {self._worker_secret}"
+        )
+        self.assertIn("/api/internal/assess/", captured["url"])
 
     async def test_no_url_or_session_id_in_log_output(self) -> None:
         result, lines = await self._invoke(200, session_id="secret-session-id-123")
