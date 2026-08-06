@@ -59,9 +59,18 @@ export async function resolveWorkerContext(
     .from('call_sessions')
     .select('id, candidate_id, role_id, status, external_call_id')
     .eq('id', sessionId)
-    .single();
+    .maybeSingle();
 
-  if (error || !data) {
+  // Distinguish a transient DB failure from a genuinely-absent session.
+  // `.maybeSingle()` returns data:null WITHOUT an error when there is no row,
+  // and populates `error` only on an actual query/connection failure. Conflating
+  // the two (the previous `error || !data → NOT_FOUND`) made a cold-start DB blip
+  // look like "session not found" — a 404 the worker treats as a permanent
+  // failure, so the bot never activated. A transient error must be retryable.
+  if (error) {
+    return { ok: false, code: ERR_DB_FAILED };
+  }
+  if (!data) {
     return { ok: false, code: ERR_SESSION_NOT_FOUND };
   }
 

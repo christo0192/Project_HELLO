@@ -30,7 +30,7 @@ import { createSession, transitionSession } from '../lib/session-lifecycle.js';
 import { getCorrelationId } from '../lib/correlation.js';
 import { handleRecordingGrant } from './invites.js';
 import { runAssessment } from '../services/assessment.js';
-import { resolveWorkerContext } from '../lib/worker-context.js';
+import { resolveWorkerContext, ERR_DB_FAILED } from '../lib/worker-context.js';
 import {
   finalizeAuthoritativeRecording,
   startAuthoritativeRecording,
@@ -764,7 +764,16 @@ livekitRouter.post(
 
       const result = await resolveWorkerContext(session_id, room_name);
       if (!result.ok) {
-        const statusCode = result.code === 'ERR_BINDING_MISMATCH' ? 403 : 404;
+        // ERR_BINDING_MISMATCH → 403 (authorization). ERR_DB_FAILED → 503 so a
+        // transient DB/cold-start failure is a RETRYABLE server error, not a
+        // permanent 404 that makes the worker abandon the session (no bot).
+        // Genuine ERR_SESSION_NOT_FOUND / ERR_SESSION_NOT_ACTIVE stay 404.
+        const statusCode =
+          result.code === 'ERR_BINDING_MISMATCH'
+            ? 403
+            : result.code === ERR_DB_FAILED
+              ? 503
+              : 404;
         return res.status(statusCode).json({ ok: false, error: result.code });
       }
 

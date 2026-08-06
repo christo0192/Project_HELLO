@@ -416,6 +416,39 @@ def _classify_close_event(event: Any) -> str | None:
     return None
 
 
+async def _resolve_worker_context_with_retry(
+    session_id: str,
+    room_name: str,
+    *,
+    attempts: int,
+    backoff_sec: float,
+) -> "WorkerContext | str":
+    """Resolve worker context, retrying transient failures before giving up.
+
+    ``persistence.resolve_worker_context`` returns a WorkerContext on success or
+    a stable error-category string on failure. A single failure used to abandon
+    the whole call (candidate joined, no bot). Because the API is scale-to-zero,
+    the first lookup after a cold start can transiently fail; retry a bounded
+    number of times with a fixed backoff, then return the last error so the
+    caller can fail closed. Retrying a genuinely-absent/unauthorized session is
+    harmless — it stays unresolved and still fails closed.
+    """
+    attempts = max(1, attempts)
+    resolved: "WorkerContext | str" = "context_api_error"
+    for attempt in range(attempts):
+        resolved = await persistence.resolve_worker_context(session_id, room_name)
+        if isinstance(resolved, WorkerContext):
+            return resolved
+        if attempt + 1 < attempts:
+            _log.warn(
+                "worker_context_resolution_retry",
+                error_category=str(resolved),
+                attempt=attempt + 1,
+            )
+            await asyncio.sleep(max(0.0, backoff_sec))
+    return resolved
+
+
 async def entrypoint(ctx: JobContext) -> None:
     started_at = _monotonic()
     await ctx.connect()
@@ -434,7 +467,18 @@ async def entrypoint(ctx: JobContext) -> None:
     # Never restore sensitive room metadata from client-visible data.
     worker_ctx: WorkerContext | None = None
     if session_id:
-        resolved = await persistence.resolve_worker_context(str(session_id), str(room_name))
+        # Resolve authorized context with a bounded retry. The worker still fails
+        # the session CLOSED when context cannot be resolved — but a single
+        # transient failure (API cold start / DB blip) must not permanently
+        # abandon a valid call, which left candidates with a joined room and no
+        # bot. A genuinely-absent or unauthorized session still fails closed
+        # after the attempts are exhausted.
+        resolved = await _resolve_worker_context_with_retry(
+            str(session_id),
+            str(room_name),
+            attempts=max(1, _int_env("WORKER_CONTEXT_RESOLVE_ATTEMPTS", 3)),
+            backoff_sec=_float_env("WORKER_CONTEXT_RESOLVE_BACKOFF_SEC", 1.5),
+        )
         if isinstance(resolved, WorkerContext):
             worker_ctx = resolved
         else:
