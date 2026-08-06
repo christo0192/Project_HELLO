@@ -1,12 +1,15 @@
 /**
- * ProtectedRoute tests.
+ * ProtectedRoute tests — ADR-0011 (single factor, allowlist authorization).
  *
  * Verifies:
- *   - Loading state while auth check is in progress
- *   - Redirects to /login when no session
- *   - Redirects to /mfa/enroll when AAL1 with no factors
- *   - Redirects to /mfa/challenge when AAL1 with verified factors
- *   - Renders children when AAL2 (full auth)
+ *   - Loading state while the session check is in progress
+ *   - Redirects to /login when there is no session
+ *   - NO MFA redirects: /mfa/enroll and /mfa/challenge are never targeted
+ *   - Renders protected content for a valid session with a resolved role
+ *   - No recruiter/candidate data flashes before the role resolves
+ *   - A resolved null role (revoked entry / stale session / API failure)
+ *     fails closed to /unauthorized
+ *   - requireRole gate still enforced
  */
 
 import { render, screen, waitFor } from '@testing-library/react';
@@ -20,12 +23,13 @@ function createMockAuth(overrides: Record<string, any> = {}) {
   return {
     isLoading: false,
     isAuthenticated: false,
-    needsMfa: false,
+    needsMfa: false, // ADR-0011: always false
     factors: [] as Array<{ id: string; type: 'totp' }>,
     user: null,
     session: null,
     aal: null as ('aal1' | 'aal2' | null),
     role: null as ('admin' | 'interviewer' | 'viewer' | null),
+    isRoleLoading: false,
     signIn: vi.fn(),
     signOut: vi.fn(),
     signInWithSSO: vi.fn(),
@@ -66,6 +70,16 @@ function renderProtectedRoute(initialEntry = '/protected', requireRole?: 'admin'
   );
 }
 
+/** A valid single-factor session with a resolved role. */
+function authedWithRole(role: 'admin' | 'interviewer' | 'viewer') {
+  mockAuth.isLoading = false;
+  mockAuth.isAuthenticated = true;
+  mockAuth.aal = 'aal1'; // single factor — must be sufficient
+  mockAuth.session = { access_token: 'tok' } as any;
+  mockAuth.isRoleLoading = false;
+  mockAuth.role = role;
+}
+
 describe('ProtectedRoute', () => {
   beforeEach(() => {
     mockAuth = createMockAuth();
@@ -82,7 +96,6 @@ describe('ProtectedRoute', () => {
   it('redirects to /login when no session', async () => {
     mockAuth.isLoading = false;
     mockAuth.isAuthenticated = false;
-    mockAuth.needsMfa = false;
 
     renderProtectedRoute();
 
@@ -91,45 +104,106 @@ describe('ProtectedRoute', () => {
     });
   });
 
-  it('redirects to /mfa/enroll when AAL1 with no factors', async () => {
-    mockAuth.isLoading = false;
-    mockAuth.isAuthenticated = false;
-    mockAuth.needsMfa = true;
-    mockAuth.factors = [];
-
-    renderProtectedRoute();
-
-    await waitFor(() => {
-      expect(screen.getByTestId('mfa-enroll')).toBeInTheDocument();
-    });
-  });
-
-  it('redirects to /mfa/challenge when AAL1 with verified factors', async () => {
-    mockAuth.isLoading = false;
-    mockAuth.isAuthenticated = false;
-    mockAuth.needsMfa = true;
-    mockAuth.factors = [{ id: 'f1', type: 'totp' }];
-
-    renderProtectedRoute();
-
-    await waitFor(() => {
-      expect(screen.getByTestId('mfa-challenge')).toBeInTheDocument();
-    });
-  });
-
-  it('renders protected content when AAL2', () => {
-    mockAuth.isLoading = false;
-    mockAuth.isAuthenticated = true;
-    mockAuth.needsMfa = false;
-    mockAuth.aal = 'aal2';
-    mockAuth.session = { access_token: 'tok' } as any;
+  it('renders protected content for a single-factor (aal1) session with a resolved role', () => {
+    authedWithRole('viewer');
 
     renderProtectedRoute();
 
     expect(screen.getByTestId('protected-content')).toBeInTheDocument();
     expect(screen.queryByTestId('login-page')).not.toBeInTheDocument();
-    expect(screen.queryByTestId('mfa-enroll')).not.toBeInTheDocument();
-    expect(screen.queryByTestId('mfa-challenge')).not.toBeInTheDocument();
+  });
+
+  // ── ADR-0011: MFA routes are never targeted ──────────────────────
+  describe('ADR-0011: no MFA redirects', () => {
+    it('never redirects to /mfa/enroll for an aal1 session with no factors', async () => {
+      authedWithRole('admin');
+      mockAuth.factors = [];
+
+      renderProtectedRoute();
+
+      await waitFor(() => {
+        expect(screen.getByTestId('protected-content')).toBeInTheDocument();
+      });
+      expect(screen.queryByTestId('mfa-enroll')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('mfa-challenge')).not.toBeInTheDocument();
+    });
+
+    it('never redirects to /mfa/challenge even when verified factors exist', async () => {
+      authedWithRole('admin');
+      mockAuth.factors = [{ id: 'f1', type: 'totp' }];
+
+      renderProtectedRoute();
+
+      await waitFor(() => {
+        expect(screen.getByTestId('protected-content')).toBeInTheDocument();
+      });
+      expect(screen.queryByTestId('mfa-challenge')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('mfa-enroll')).not.toBeInTheDocument();
+    });
+  });
+
+  // ── No data flash before role resolution ─────────────────────────
+  describe('no data flashes before role resolution', () => {
+    it('renders no content while the role is still resolving (ungated route)', () => {
+      mockAuth.isLoading = false;
+      mockAuth.isAuthenticated = true;
+      mockAuth.session = { access_token: 'tok' } as any;
+      mockAuth.isRoleLoading = true;
+      mockAuth.role = null;
+
+      renderProtectedRoute();
+
+      expect(screen.getByText('Checking access…')).toBeInTheDocument();
+      expect(screen.queryByTestId('protected-content')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('unauthorized-page')).not.toBeInTheDocument();
+    });
+
+    it('renders no content while the role is still resolving (role-gated route)', () => {
+      mockAuth.isLoading = false;
+      mockAuth.isAuthenticated = true;
+      mockAuth.session = { access_token: 'tok' } as any;
+      mockAuth.isRoleLoading = true;
+      mockAuth.role = null;
+
+      renderProtectedRoute('/admin', 'admin');
+
+      expect(screen.getByText('Checking access…')).toBeInTheDocument();
+      expect(screen.queryByTestId('admin-content')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('unauthorized-page')).not.toBeInTheDocument();
+    });
+  });
+
+  // ── Stale session / revoked allowlist entry fails closed ─────────
+  describe('stale session fails closed', () => {
+    it('redirects to /unauthorized when the role resolved to null (revoked/denied)', async () => {
+      mockAuth.isLoading = false;
+      mockAuth.isAuthenticated = true;
+      mockAuth.session = { access_token: 'tok' } as any;
+      mockAuth.isRoleLoading = false;
+      mockAuth.role = null; // /api/me denied — allowlist entry revoked
+
+      renderProtectedRoute();
+
+      await waitFor(() => {
+        expect(screen.getByTestId('unauthorized-page')).toBeInTheDocument();
+      });
+      expect(screen.queryByTestId('protected-content')).not.toBeInTheDocument();
+    });
+
+    it('never renders admin content for a stale session on a gated route', async () => {
+      mockAuth.isLoading = false;
+      mockAuth.isAuthenticated = true;
+      mockAuth.session = { access_token: 'tok' } as any;
+      mockAuth.isRoleLoading = false;
+      mockAuth.role = null;
+
+      renderProtectedRoute('/admin', 'admin');
+
+      await waitFor(() => {
+        expect(screen.getByTestId('unauthorized-page')).toBeInTheDocument();
+      });
+      expect(screen.queryByTestId('admin-content')).not.toBeInTheDocument();
+    });
   });
 
   it('has loading axe accessibility', async () => {
@@ -141,38 +215,27 @@ describe('ProtectedRoute', () => {
 
   // ── Phase 9 L4: role gate (UX only; APIs authoritative) ───────────
   describe('requireRole gate (Phase 9)', () => {
-    function authedAal2() {
-      mockAuth.isLoading = false;
-      mockAuth.isAuthenticated = true;
-      mockAuth.needsMfa = false;
-      mockAuth.aal = 'aal2';
-      mockAuth.session = { access_token: 'tok' } as any;
-    }
-
-    it('fails closed while the authoritative role is unresolved (no content, no redirect)', () => {
-      authedAal2();
-      mockAuth.role = null;
-      renderProtectedRoute('/admin', 'admin');
-      expect(screen.getByText('Checking access…')).toBeInTheDocument();
-      expect(screen.queryByTestId('admin-content')).not.toBeInTheDocument();
-      expect(screen.queryByTestId('unauthorized-page')).not.toBeInTheDocument();
-    });
-
     it('renders admin content for an admin with resolved role', () => {
-      authedAal2();
-      mockAuth.role = 'admin';
+      authedWithRole('admin');
       renderProtectedRoute('/admin', 'admin');
       expect(screen.getByTestId('admin-content')).toBeInTheDocument();
     });
 
     it('redirects non-admin to /unauthorized', async () => {
-      authedAal2();
-      mockAuth.role = 'interviewer';
+      authedWithRole('interviewer');
       renderProtectedRoute('/admin', 'admin');
       await waitFor(() => {
         expect(screen.getByTestId('unauthorized-page')).toBeInTheDocument();
       });
       expect(screen.queryByTestId('admin-content')).not.toBeInTheDocument();
+    });
+
+    it('redirects a viewer to /unauthorized on an admin route', async () => {
+      authedWithRole('viewer');
+      renderProtectedRoute('/admin', 'admin');
+      await waitFor(() => {
+        expect(screen.getByTestId('unauthorized-page')).toBeInTheDocument();
+      });
     });
   });
 });

@@ -300,9 +300,15 @@ auth_token = "env(SUPABASE_AUTH_SMS_TWILIO_AUTH_TOKEN)"
 max_enrolled_factors = 10
 
 # Control MFA via App Authenticator (TOTP)
+# ADR-0011: MFA removed entirely — single-factor auth with server-side
+# allowlist authorization. Enrollment AND verification are disabled for every
+# factor type so enrollment state can never diverge from enforcement.
+# Reinstating MFA requires re-enabling enrollment here AND restoring both API
+# gates (verifyToken + resolveFullAuth) together — never one without the
+# other, or new users are stranded at a challenge they cannot satisfy.
 [auth.mfa.totp]
-enroll_enabled = true
-verify_enabled = true
+enroll_enabled = false
+verify_enabled = false
 
 # Configure MFA via Phone Messaging
 [auth.mfa.phone]

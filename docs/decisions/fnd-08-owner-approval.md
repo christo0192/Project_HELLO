@@ -34,12 +34,13 @@ This record adopts a strict **no-cost posture** for all approved decisions, leve
 
 | Field | Value |
 |-------|-------|
-| **Decision** | Supabase Auth: email/password + SSO + MFA |
-| **Status** | **Accepted as architecture** (owner-complete direction). ADR-0003 accepted. Not production/go-live accepted. |
-| **Rationale** | Supabase Auth (email/password, SSO, MFA) is the owner-selected architecture. ADR-0003 is accepted as the architectural direction. Production go-live additionally requires named Security Lead, DPA/subprocessor evidence, MFA/SSO/audit enforcement, account lifecycle, session revocation, and operational ownership. |
-| **Cost posture** | Supabase Free tier = $0. No cloud project upgrade. |
-| **Verification trigger** | Owner: architecture direction confirmed. Production: Security Lead assigned, DPA evidence, MFA/SSO/audit enforcement. |
-| **Production-revisit trigger** | Named Security Lead assigned; DPA evidence collected; MFA/SSO/audit requirements documented. |
+| **Decision** | Supabase Auth: email/password + Google OAuth, **single factor — no MFA**. Authorization by server-held active allowlist entry + role. |
+| **Status** | **Revised 2026-08-06 (ADR-0011).** Accepted as architecture (owner-complete direction). ADR-0003 accepted; MFA element withdrawn by the owner. Not production/go-live accepted. |
+| **Revision note (2026-08-06)** | The MFA element of this decision is **withdrawn at explicit owner direction**. No second factor of any kind (TOTP, phone/SMS, or other) is required. Access is governed solely by an active entry in `screening_v2.email_allowlist` plus the role held there, resolved server-side on every request. An intermediate proposal to delegate the second factor to Google Workspace 2SV was investigated and rejected: Supabase's `aal` claim reflects only Supabase-managed factors, so identity-provider MFA is not verifiable by the application. See ADR-0011. |
+| **Rationale** | Supabase Auth (email/password + Google OAuth) is the owner-selected architecture. The owner has **explicitly accepted the risk of single-factor authentication** for dashboard access to candidate personal data, recordings and transcripts: a compromised password or Google account grants full access at that account's role with no second factor to interrupt it. Accepted deliberately for usability. Production go-live still requires named Security Lead, DPA/subprocessor evidence, SSO/audit enforcement, account lifecycle, session revocation, and operational ownership. |
+| **Cost posture** | Supabase Free tier = $0. No cloud project upgrade. Removing MFA avoids any Pro-plan/SMS cost that a phone factor would have required. |
+| **Verification trigger** | Owner: architecture direction confirmed; single-factor risk accepted 2026-08-06. Production: Security Lead assigned, DPA evidence, SSO/audit enforcement, independent review of the single-factor posture. |
+| **Production-revisit trigger** | Named Security Lead assigned; DPA evidence collected; SSO/audit requirements documented. **A named Security Lead must re-examine the single-factor acceptance before go-live.** |
 
 ### D-002 — Queue/worker platform
 

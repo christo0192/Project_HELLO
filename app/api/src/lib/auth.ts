@@ -3,16 +3,31 @@
  *
  * Extracts a Bearer token from the Authorization header, verifies it
  * through Supabase Auth's getUser() API (never merely decodes), and
- * enforces AAL2 and active membership for privileged endpoints.
+ * enforces a verified email, an ACTIVE server-held allowlist entry and
+ * the role held there.
  *
- * AAL is derived ONLY from the validated JWT's top-level `aal` claim
- * via a strict bounded payload parse — never from app_metadata or
- * user_metadata, which are user-influenceable.
+ * ── Authorization model (ADR-0011) ───────────────────────────────────
+ * Single factor: NO MFA/AAL2 requirement. Access requires all of:
+ *   1. a valid Supabase session (verified via getUser, never decoded);
+ *   2. a Supabase-verified email (email_confirmed_at set);
+ *   3. an ACTIVE entry in screening_v2.email_allowlist, resolved on
+ *      EVERY request (so disabling an entry revokes access immediately,
+ *      even with a valid unexpired JWT and a stale membership row);
+ *   4. the role from that server-held entry.
+ * Never from client claims, app_metadata/user_metadata, the OAuth `hd`
+ * hint, or email domain alone — an exact-domain match with no active
+ * allowlist entry is DENIED.
+ *
+ * AAL is still derived ONLY from the validated JWT's top-level `aal`
+ * claim via a strict bounded payload parse — never from app_metadata or
+ * user_metadata — but it is carried for observability only and is NOT an
+ * authorization input.
  *
  * Distinguishes:
  *   401 — malformed/missing/duplicated/oversized Authorization header,
  *         invalid or expired token, token revoked, user not found.
- *   403 — authenticated but AAL < 2, or membership inactive.
+ *   403 — no active allowlist entry, membership inactive, or role
+ *         insufficient. Uniform generic message; never enumerates.
  *
  * No cookie/CSRF; Bearer transport only.
  *
@@ -391,16 +406,19 @@ export async function verifyToken(
     return { ok: false, status: 401, message: 'Invalid or expired token' };
   }
 
-  // CRITICAL: Derive AAL from the JWT payload's top-level `aal` claim,
-  // NOT from app_metadata or user_metadata which are user-influenceable.
+  // AAL is still derived from the JWT payload's top-level `aal` claim (never
+  // from app_metadata/user_metadata, which are user-influenceable) and carried
+  // on AuthUser for observability only.
+  //
+  // ADR-0011: `aal` is NOT an authorization input. No second factor is
+  // required. Authorization is an ACTIVE entry in the server-held
+  // screening_v2.email_allowlist plus the role held there, resolved on every
+  // request by resolveFullAuth(). Reinstating MFA means restoring the gate
+  // HERE and in resolveFullAuth() together — never one without the other —
+  // alongside re-enabling enrollment in Supabase config.
   const aal = deriveAalFromJwt(token);
 
   const user = extractAuthUser(result.data.user, aal);
-
-  // AAL2 enforcement for privileged roles
-  if ((user.appRole === 'admin' || user.appRole === 'interviewer') && user.aal !== 'aal2') {
-    return { ok: false, status: 403, message: 'Multi-factor authentication required' };
-  }
 
   // Active membership check
   if (!user.active) {
@@ -501,9 +519,10 @@ export async function resolveFullAuth(
   if (!membership || !membership.active) {
     return { ok: false, status: 403, message: 'Insufficient permissions' };
   }
-  if ((membership.role === 'admin' || membership.role === 'interviewer') && result.user.aal !== 'aal2') {
-    return { ok: false, status: 403, message: 'Multi-factor authentication required' };
-  }
+
+  // ADR-0011: no AAL2 gate here. Authorization is the ACTIVE allowlist entry
+  // resolved above plus the server-held role; per-route role gates apply on
+  // top. See the matching note in verifyToken().
 
   return {
     ok: true,

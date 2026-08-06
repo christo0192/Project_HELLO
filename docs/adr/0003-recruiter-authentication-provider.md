@@ -2,6 +2,10 @@
 
 **Status:** Accepted
 
+**Partial supersession:** the MFA element of this decision is superseded by ADR-0011.
+
+**Revision (2026-08-06):** The MFA element of this decision is withdrawn at explicit owner direction. Recruiter authentication is **single factor** (email/password or Google OAuth); authorization is an active entry in the server-held `screening_v2.email_allowlist` plus the role held there. The owner has explicitly accepted the single-factor risk. See ADR-0011. The choice of Supabase Auth as the provider is unchanged.
+
 **Decision owner:** christo0192 (repository owner / sole Product/Engineering owner)
 
 **Plan references:** D-001, SEC-01, SEC-02, SEC-08

@@ -24,8 +24,6 @@ import { Layout } from './components/Layout';
 import { ProtectedRoute } from './components/ProtectedRoute';
 import { useAuth } from './lib/auth';
 import { LoginPage } from './pages/LoginPage';
-import { MfaEnrollPage } from './pages/MfaEnrollPage';
-import { MfaChallengePage } from './pages/MfaChallengePage';
 import { UnauthorizedPage } from './pages/UnauthorizedPage';
 import { CandidateJoinPage } from './pages/CandidateJoinPage';
 import { PrivacyNoticePage } from './pages/PrivacyNoticePage';
@@ -79,15 +77,23 @@ export default function App() {
       <Routes>
         {/* Public auth routes */}
         <Route path="/login" element={<LoginPage />} />
-        <Route path="/mfa/enroll" element={<MfaEnrollPage />} />
-        <Route path="/mfa/challenge" element={<MfaChallengePage />} />
+        {/*
+          MFA retired (ADR-0011). Legacy /mfa/* links redirect to the root,
+          which sends authenticated users to /dashboard and unauthenticated
+          users to /login via ProtectedRoute. No redirect loop is possible:
+          ProtectedRoute no longer navigates to /mfa/* under any state.
+          MfaEnrollPage/MfaChallengePage are retained in the tree but
+          unrouted, so reinstating a Supabase-managed factor is a localized
+          change here plus the API gates.
+        */}
+        <Route path="/mfa/*" element={<Navigate to="/" replace />} />
         <Route path="/unauthorized" element={<UnauthorizedPage />} />
         <Route path="/privacy-notice" element={<PrivacyNoticePage />} />
         <Route path="/candidate/join" element={<CandidateJoinPage />} />
         <Route path="/status" element={<StatusPage />} />
         <Route path="/appeal" element={<AppealPage />} />
 
-        {/* Protected recruiter routes — AAL2 required */}
+        {/* Protected recruiter routes — valid session + resolved allowlist role */}
         <Route element={<ProtectedRoute />}>
           <Route element={<Layout />}>
             <Route index element={<Navigate to="/dashboard" replace />} />

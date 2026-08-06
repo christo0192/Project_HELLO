@@ -183,14 +183,35 @@ describe('SEC-01: AAL derived from JWT payload not metadata', () => {
     expect(res.status).toBe(200);
   });
 
-  it('AAL1 in JWT payload denies admin despite user_metadata.aal2', async () => {
-    // Create admin user but inject token that verifies as AAL2
+  // ADR-0011: `aal` is no longer an authorization input. These tests pin the
+  // DERIVATION contract (still metadata-proof and fail-safe) without asserting
+  // that a low AAL denies access — it no longer does, by design.
+
+  it('deriveAalFromJwt reads the JWT payload, never metadata (aal1 stays aal1)', async () => {
+    const { deriveAalFromJwt } = await import('../lib/auth.js');
+    // The user object may claim aal2 in app_metadata/user_metadata; derivation
+    // must only ever read the signed payload.
+    expect(deriveAalFromJwt(JWT_AAL1)).toBe('aal1');
+    expect(deriveAalFromJwt(JWT_AAL2)).toBe('aal2');
+  });
+
+  it('deriveAalFromJwt defaults to aal1 when the claim is missing (no escalation)', async () => {
+    const { deriveAalFromJwt } = await import('../lib/auth.js');
+    expect(deriveAalFromJwt(JWT_NO_AAL)).toBe('aal1');
+  });
+
+  it('deriveAalFromJwt returns aal1 for a malformed payload (fail safe)', async () => {
+    const { deriveAalFromJwt } = await import('../lib/auth.js');
+    expect(
+      deriveAalFromJwt('header.garbage_payload_that_is_not_base64url!.sig'),
+    ).toBe('aal1');
+  });
+
+  it('ADR-0011: an aal1 admin is ADMITTED — user_metadata still cannot grant a role', async () => {
     const admin = makeAdmin();
-    // Admin user has aal='aal2' in app_metadata, but JWT payload says aal='aal1'
-    // The AAL is derived from JWT payload, so this should be 403
     app = createApp({
       authDeps: {
-        getUser: async (token: string) => ({
+        getUser: async () => ({
           data: {
             user: {
               id: admin.id,
@@ -199,10 +220,10 @@ describe('SEC-01: AAL derived from JWT payload not metadata', () => {
                 app_role: 'admin',
                 org_id: admin.orgId,
                 active: true,
-                aal: 'aal2',  // user-influenceable field, should be IGNORED
+                aal: 'aal2', // user-influenceable field, still IGNORED
               },
               user_metadata: {
-                aal: 'aal2',  // user-influenceable field, should be IGNORED
+                aal: 'aal2', // user-influenceable field, still IGNORED
               },
             },
           },
@@ -211,65 +232,12 @@ describe('SEC-01: AAL derived from JWT payload not metadata', () => {
       },
     });
 
-    // Use a JWT that has aal=aal1 in payload
     const res = await request(app)
       .get('/api/roles')
       .set('Authorization', `Bearer ${JWT_AAL1}`);
-    expect(res.status).toBe(403);
-    expect(res.body.error.type).toBe('authorization_error');
-  });
-
-  it('missing aal in JWT defaults to aal1 (no escalation)', async () => {
-    const admin = makeAdmin();
-    // Even though admin user has aal='aal2' in app_metadata, the JWT has no aal => defaults to aal1
-    app = createApp({
-      authDeps: {
-        getUser: async (token: string) => ({
-          data: {
-            user: {
-              id: admin.id,
-              email: admin.email,
-              app_metadata: {
-                app_role: 'admin',
-                org_id: admin.orgId,
-                active: true,
-              },
-            },
-          },
-          error: null,
-        }),
-      },
-    });
-
-    const res = await request(app)
-      .get('/api/roles')
-      .set('Authorization', `Bearer ${JWT_NO_AAL}`);
-    expect(res.status).toBe(403);
-  });
-
-  it('malformed JWT payload returns aal1 (fail safe)', async () => {
-    const admin = makeAdmin();
-    app = createApp({
-      authDeps: {
-        getUser: async (token: string) => ({
-          data: {
-            user: {
-              id: admin.id,
-              email: admin.email,
-              app_metadata: { app_role: 'admin', active: true },
-            },
-          },
-          error: null,
-        }),
-      },
-    });
-
-    // Token with garbage middle segment
-    const res = await request(app)
-      .get('/api/roles')
-      .set('Authorization', 'Bearer header.garbage_payload_that_is_not_base64url!.sig');
-    // Malformed JWT payload => aal1 => admin needs aal2 => 403
-    expect(res.status).toBe(403);
+    // No MFA requirement (ADR-0011): a valid session + active allowlist role
+    // is sufficient. AAL does not gate.
+    expect(res.status).toBe(200);
   });
 
   it('parseJwtPayload rejects oversized payloads', async () => {
@@ -451,12 +419,12 @@ describe('forged JWT rejection', () => {
 //  AAL1 REJECTION FOR PRIVILEGED ROLES
 // ===================================================================
 
-describe('AAL1 rejection for privileged roles', () => {
-  it('returns 403 when admin has only AAL1 (JWT aal=aal1)', async () => {
+describe('ADR-0011: no MFA/AAL gate for privileged roles', () => {
+  it('admits an admin at AAL1 (no second factor required)', async () => {
     const admin = makeAdmin();
     app = createApp({
       authDeps: {
-        getUser: async (token: string) => ({
+        getUser: async () => ({
           data: {
             user: {
               id: admin.id,
@@ -471,16 +439,15 @@ describe('AAL1 rejection for privileged roles', () => {
     const res = await request(app)
       .get('/api/roles')
       .set('Authorization', `Bearer ${JWT_AAL1}`);
-    expect(res.status).toBe(403);
-    expect(res.body.error.type).toBe('authorization_error');
+    expect(res.status).toBe(200);
     expect(hasSecurityHeaders(res)).toBe(true);
   });
 
-  it('returns 403 when interviewer has only AAL1', async () => {
+  it('admits an interviewer at AAL1', async () => {
     const int = makeInterviewer();
     app = createApp({
       authDeps: {
-        getUser: async (token: string) => ({
+        getUser: async () => ({
           data: {
             user: {
               id: int.id,
@@ -495,13 +462,82 @@ describe('AAL1 rejection for privileged roles', () => {
     const res = await request(app)
       .get('/api/roles')
       .set('Authorization', `Bearer ${JWT_AAL1}`);
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(200);
+  });
+
+  it('admits an admin with no aal claim at all', async () => {
+    const admin = makeAdmin();
+    app = createApp({
+      authDeps: {
+        getUser: async () => ({
+          data: {
+            user: {
+              id: admin.id,
+              email: admin.email,
+              app_metadata: { app_role: 'admin', org_id: admin.orgId, active: true },
+            },
+          },
+          error: null,
+        }),
+      },
+    });
+    const res = await request(app)
+      .get('/api/roles')
+      .set('Authorization', `Bearer ${JWT_NO_AAL}`);
+    expect(res.status).toBe(200);
   });
 
   it('allows viewer with AAL1 to access read-only endpoints', async () => {
     app = createAuthedApp(makeViewer());
     const res = await request(app).get('/api/roles').set('Authorization', VALID_TOKEN);
     expect(res.status).toBe(200);
+  });
+
+  it('still denies a viewer mutation regardless of AAL (role gate intact)', async () => {
+    const viewer = makeViewer();
+    app = createApp({
+      authDeps: {
+        getUser: async () => ({
+          data: {
+            user: {
+              id: viewer.id,
+              email: viewer.email,
+              app_metadata: { app_role: 'viewer', active: true },
+            },
+          },
+          error: null,
+        }),
+      },
+    });
+    const res = await request(app)
+      .post('/api/roles')
+      .set('Authorization', `Bearer ${JWT_AAL1}`)
+      .send({ title: 'SWE' });
+    expect(res.status).toBe(403);
+    expect(res.body.error.type).toBe('authorization_error');
+  });
+
+  it('still denies an inactive admin regardless of AAL (fail closed)', async () => {
+    const admin = makeAdmin();
+    app = createApp({
+      authDeps: {
+        getUser: async () => ({
+          data: {
+            user: {
+              id: admin.id,
+              email: admin.email,
+              app_metadata: { app_role: 'admin', active: false },
+            },
+          },
+          error: null,
+        }),
+      },
+    });
+    const res = await request(app)
+      .get('/api/roles')
+      .set('Authorization', `Bearer ${JWT_AAL2}`);
+    expect(res.status).toBe(403);
+    expect(res.body.error.type).toBe('authorization_error');
   });
 });
 
