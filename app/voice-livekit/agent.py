@@ -1,5 +1,5 @@
 """
-    SPIKE: LiveKit Agents voice worker (Gopu screening interviewer).
+    SPIKE: LiveKit Agents voice worker (Diana screening interviewer).
 Sarvam STT/TTS + LiveKit Agents turn handling + direct streaming Gemini LLM.
 """
 
@@ -199,7 +199,7 @@ async def _run_span_guarded(
         span.end()
 
 
-class Gopu(Agent):
+class Diana(Agent):
     def __init__(self, instructions: str) -> None:
         super().__init__(instructions=instructions)
 
@@ -672,7 +672,7 @@ async def _run_session(
                 ),
                 tts=sarvam.TTS(
                     model=os.getenv("SARVAM_TTS_MODEL", "bulbul:v3"),
-                    speaker=os.getenv("SARVAM_TTS_VOICE", "shubh"),
+                    speaker=os.getenv("SARVAM_TTS_VOICE", "simran"),
                 ),
                 # LiveKit's OpenAI-compatible adapter always consumes a token
                 # stream. Point it directly at Google so first tokens are not
@@ -743,7 +743,7 @@ async def _run_session(
                 _close_event.set()
 
             await session.start(
-                agent=Gopu(system_text),
+                agent=Diana(system_text),
                 room=ctx.room,
                 record={"audio": True, "transcript": True, "traces": False, "logs": False},
             )

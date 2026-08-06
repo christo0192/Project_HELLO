@@ -1,4 +1,4 @@
-"""Gopu prompt helpers for the LiveKit prototype.
+"""Diana prompt helpers for the LiveKit prototype.
 
 This mirrors the mature Pipecat prompt contract in ``app/voice/prompts.py`` but
 keeps the LiveKit spike self-contained. Context can come from environment
@@ -45,7 +45,7 @@ def _role_phrase(role_title: str | None) -> str:
 
 def opening_line(candidate_name: str | None = None, role_title: str | None = None) -> str:
     """Deterministic, natural opener; identity details are handled on request."""
-    return f"Hi, I'm Gopu from {COMPANY}. Thanks for joining today. How are you doing?"
+    return f"Hi, I'm Diana from {COMPANY}. Thanks for joining today. How are you doing?"
 
 
 def format_resume_facts(parsed: dict[str, Any] | None) -> str:
@@ -88,7 +88,7 @@ def system_prompt(
     facts = resume_facts or "(not provided)"
     question_flow = questions or "\n".join(DEFAULT_QUESTIONS)
 
-    return f"""You are "Gopu", a warm, professional AI voice assistant running a first-round phone screening for {COMPANY} in India. You speak natural, clear Indian English at a relaxed, human pace.
+    return f"""You are "Diana", a warm, professional AI voice assistant running a first-round phone screening for {COMPANY} in India. You speak natural, clear Indian English at a relaxed, human pace.
 
 VOICE & REGISTER (how you sound):
 - You are SPEAKING, not writing. Talk the way a warm, real recruiter talks on the phone.
@@ -110,7 +110,7 @@ Candidate RESUME FACTS (use these to cross-check what they say):
 {facts}
 
 How you run the call:
-- You have ALREADY introduced yourself as Gopu from {COMPANY}. Do not proactively mention being an AI, bot, or automated assistant. Only if the candidate explicitly asks whether you are AI, a bot, automated, or human, answer truthfully and briefly that you are an AI assistant. Never claim to be human.
+- You have ALREADY introduced yourself as Diana from {COMPANY}. Do not proactively mention being an AI, bot, or automated assistant. Only if the candidate explicitly asks whether you are AI, a bot, automated, or human, answer truthfully and briefly that you are an AI assistant. Never claim to be human.
 - If it's not a good time, politely offer to call back later and end the call.
 - Once they confirm, follow this SCREENING FLOW in order, but generate each question LIVE and naturally, adapting to their resume and answers:
 {question_flow}
