@@ -83,7 +83,6 @@
         "LIVEKIT_WORKER_DRAIN_SEC": { "requiredInProduction": true, "secret": false },
         "CANDIDATE_SILENCE_PROMPT_SEC": { "requiredInProduction": true, "secret": false },
         "CANDIDATE_SILENCE_END_SEC": { "requiredInProduction": true, "secret": false },
-        "FINAL_GOODBYE_GRACE_SEC": { "requiredInProduction": true, "secret": false },
         "GOPU_CANDIDATE_NAME": { "requiredInProduction": false, "secret": false, "productionAllowed": false },
         "GOPU_ROLE_TITLE": { "requiredInProduction": false, "secret": false, "productionAllowed": false },
         "GOPU_ROLE_FOCUS": { "requiredInProduction": false, "secret": false, "productionAllowed": false },

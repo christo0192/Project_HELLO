@@ -418,6 +418,17 @@ class TestEntrypointActivationFailClosed(unittest.TestCase):
         await agent_mod.entrypoint(ctx)
         return ctx
 
+    def test_entrypoint_passes_resolved_room_name_to_session(self):
+        async def _test():
+            ctx = agent_mod.JobContext()
+            ctx.room.name = "synthetic-worker-room"
+            with patch.object(agent_mod, "_run_session", new_callable=AsyncMock) as run_session:
+                await agent_mod.entrypoint(ctx)
+            run_session.assert_awaited_once()
+            self.assertEqual(run_session.await_args.args[4], "synthetic-worker-room")
+
+        asyncio.run(_test())
+
     def test_provenance_conflict_aborts_before_activation(self):
         """A mismatched immutable model claim must fail closed before activation."""
         async def _test():

@@ -431,12 +431,18 @@ async def entrypoint(ctx: JobContext) -> None:
             return
 
     try:
-        await _run_session(ctx, started_at, session_id, worker_ctx)
+        await _run_session(ctx, started_at, session_id, worker_ctx, room_name)
     finally:
         reset_correlation_id(cid_token)
 
 
-async def _run_session(ctx: JobContext, started_at: float, session_id: Any, worker_ctx: WorkerContext | None) -> None:
+async def _run_session(
+    ctx: JobContext,
+    started_at: float,
+    session_id: Any,
+    worker_ctx: WorkerContext | None,
+    room_name: str,
+) -> None:
     # LLM-06: claim provenance before any provider construction. The same
     # configured model is then supplied directly to Gemini below.
     claim = await persistence.set_session_provenance(
