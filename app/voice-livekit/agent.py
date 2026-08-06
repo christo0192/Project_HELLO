@@ -1,5 +1,5 @@
 """
-    SPIKE: LiveKit Agents voice worker (Diana screening interviewer).
+    SPIKE: LiveKit Agents voice worker (Christy screening interviewer).
 Sarvam STT/TTS + LiveKit Agents turn handling + direct streaming Gemini LLM.
 """
 
@@ -199,7 +199,7 @@ async def _run_span_guarded(
         span.end()
 
 
-class Diana(Agent):
+class Christy(Agent):
     def __init__(self, instructions: str) -> None:
         super().__init__(instructions=instructions)
 
@@ -743,7 +743,7 @@ async def _run_session(
                 _close_event.set()
 
             await session.start(
-                agent=Diana(system_text),
+                agent=Christy(system_text),
                 room=ctx.room,
                 record={"audio": True, "transcript": True, "traces": False, "logs": False},
             )

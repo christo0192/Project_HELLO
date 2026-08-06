@@ -7,7 +7,7 @@ that remains the rollback path.
 Stack: Sarvam STT (`saaras:v3`, en-IN) + Sarvam TTS (`bulbul:v3`, speaker `simran`)
 + DeepSeek/OpenAI-compatible LLM. Turn handling uses LiveKit Agents defaults.
 
-The mature Diana screening prompt from the Pipecat implementation has been ported
+The mature Christy screening prompt from the Pipecat implementation has been ported
 into this worker: on-request AI disclosure, five-minute screening discipline, role-specific
 question flow, mandatory-item coverage, resume cross-checks, indirect gap probes,
 candidate Q&A wind-down, and final goodbye behavior.
@@ -44,7 +44,7 @@ GOPU_RESUME_FACTS=- Name: Taylor Example\n- Current role: Support Associate\n- T
 
 **Acceptance test:** Say out loud: *"So my name is Taylor ... [pause ~2.5s] ... and I
 have been working in data."*
-- Does Diana WAIT through the pause instead of cutting you off?
+- Does Christy WAIT through the pause instead of cutting you off?
 - Is end-of-turn -> response latency ≤ what you measured for Deepgram Flux on
   the current Pipecat stack?
 
@@ -130,5 +130,5 @@ thresholds. Turn handling uses the LiveKit Agents `AgentSession` defaults.
 
 ## Notes
 
-- `agent.py` is still a LiveKit migration spike, but it now uses the full Diana
+- `agent.py` is still a LiveKit migration spike, but it now uses the full Christy
   behavior prompt from the Pipecat prototype.

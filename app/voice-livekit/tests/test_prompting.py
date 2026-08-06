@@ -1,4 +1,4 @@
-"""Focused tests for Diana's introduction, identity, and production voice."""
+"""Focused tests for Christy's introduction, identity, and production voice."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ class TestOpeningAndIdentityDisclosure(unittest.TestCase):
 
         self.assertEqual(
             opener,
-            "Hi, I'm Diana from Interview Kickstart. Thanks for joining today. How are you doing?",
+            "Hi, I'm Christy from Interview Kickstart. Thanks for joining today. How are you doing?",
         )
         self.assertNotIn("AI", opener)
         self.assertNotIn("automated", opener.lower())
@@ -24,8 +24,9 @@ class TestOpeningAndIdentityDisclosure(unittest.TestCase):
     def test_system_prompt_discloses_ai_only_after_explicit_question(self):
         prompt = system_prompt(candidate_name="Asha")
 
-        self.assertIn('You are "Diana"', prompt)
-        self.assertIn("introduced yourself as Diana", prompt)
+        self.assertIn('You are "Christy"', prompt)
+        self.assertIn("introduced yourself as Christy", prompt)
+        self.assertNotIn("Diana", prompt)
         self.assertNotIn("Gopu", prompt)
         self.assertIn("Do not proactively mention being an AI", prompt)
         self.assertIn("Only if the candidate explicitly asks", prompt)
