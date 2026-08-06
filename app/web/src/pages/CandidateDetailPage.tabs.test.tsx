@@ -127,20 +127,19 @@ describe('CandidateDetailPage tabs (Lane 3)', () => {
     expect(screen.getByText('completed')).toBeInTheDocument();
   });
 
-  it('loads a session transcript only on demand from the Transcript & Scorecards tab', async () => {
+  it('auto-loads transcript for the first completed session', async () => {
     renderDetailPage();
     await screen.findByText('Jane Doe');
-    fireEvent.click(screen.getByRole('tab', { name: 'Transcript & Scorecards' }));
 
-    // No prefetch — the transcript is fetched only after the click.
-    expect(mockApi.getSession).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: /load transcript/i }));
+    // The workspace auto-fetches transcript for the first completed session.
     await waitFor(() => expect(mockApi.getSession).toHaveBeenCalledWith('session-1'));
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Transcript & Scorecards' }));
     expect(await screen.findByText('Welcome to the screening.')).toBeInTheDocument();
     expect(screen.getByText('Thank you!')).toBeInTheDocument();
   });
 
-  it('shows a truthful empty transcript state', async () => {
+  it('shows a truthful empty transcript state when the session has no transcript lines', async () => {
     mockApi.getSession.mockResolvedValue({
       ...mockSessionDetail,
       transcript: [],
@@ -148,19 +147,21 @@ describe('CandidateDetailPage tabs (Lane 3)', () => {
     renderDetailPage();
     await screen.findByText('Jane Doe');
     fireEvent.click(screen.getByRole('tab', { name: 'Transcript & Scorecards' }));
-    fireEvent.click(screen.getByRole('button', { name: /load transcript/i }));
+
     expect(
       await screen.findByText(/No transcript lines recorded for this session yet/i),
     ).toBeInTheDocument();
   });
 
-  it('shows an inline transcript error with a retry path', async () => {
+  it('shows an inline transcript error with a retry path when the auto-load fails', async () => {
     mockApi.getSession.mockRejectedValue({ message: 'transcript unavailable' });
     renderDetailPage();
     await screen.findByText('Jane Doe');
     fireEvent.click(screen.getByRole('tab', { name: 'Transcript & Scorecards' }));
-    fireEvent.click(screen.getByRole('button', { name: /load transcript/i }));
+
     expect(await screen.findByText('transcript unavailable')).toBeInTheDocument();
+    // The ErrorState component provides a retry button
+    expect(screen.getByRole('button', { name: /try again/i })).toBeInTheDocument();
   });
 
   it('does not auto-fetch recordings and gates access behind an explicit click', async () => {

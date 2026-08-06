@@ -11,6 +11,7 @@ import {
 } from '../lib/prompts.js';
 import type { ScreeningQuestion, TranscriptTurn } from '../lib/types.js';
 import { runAssessment } from '../services/assessment.js';
+import { validateEpochMsAnchor } from '../lib/recording-egress.js';
 import { validateBody, validateParams } from '../lib/validation.js';
 import {
   startScreeningSchema,
@@ -88,13 +89,73 @@ async function loadContext(candidateId: string): Promise<{
   };
 }
 
+/**
+ * Pure derivation of a recording-relative offset in seconds.
+ *
+ * start_offset_sec = max(0, turnMs − egressMs) / 1000
+ *
+ * Both inputs are validated through validateEpochMsAnchor first (accepts
+ * number | string | null, rejects NaN/Infinity/boolean/float/out-of-range).
+ * Returns null when either anchor is missing or invalid.
+ *
+ * The max(0, …) clamp guards against clock skew where the agent clock
+ * momentarily precedes the LiveKit server clock (NTP correction).
+ * Math.round() produces clean millisecond-precision values.
+ */
+export function deriveStartOffsetSec(
+  turnMs: unknown,
+  egressMs: unknown,
+): number | null {
+  const turn = validateEpochMsAnchor(turnMs);
+  const egress = validateEpochMsAnchor(egressMs);
+  if (turn === null || egress === null) return null;
+  return Math.round(Math.max(0, turn - egress)) / 1000;
+}
+
+/**
+ * Fetch transcript turns with start_offset_sec derived from the two
+ * absolute epoch-ms anchors when both are present.
+ *
+ * start_offset_sec = max(0, turn_started_at_ms − recording_egress_started_at_ms) / 1000
+ *
+ * Returns the existing {speaker, text} shape plus the new nullable
+ * start_offset_sec field. Legacy rows (NULL turn_started_at_ms), simulation
+ * sessions (NULL recording_egress_started_at_ms), and non-egress fallback
+ * recordings all produce start_offset_sec = null.
+ *
+ * The max(0, …) clamp guards against clock skew where the agent clock
+ * momentarily precedes the LiveKit server clock (NTP correction).
+ */
 async function getTranscript(sessionId: string): Promise<TranscriptTurn[]> {
-  const { data } = await supabase
-    .from('transcript_turns')
-    .select('speaker,text')
-    .eq('session_id', sessionId)
-    .order('turn_index', { ascending: true });
-  return (data ?? []).map((t) => ({ speaker: t.speaker as 'bot' | 'candidate', text: t.text }));
+  const [turnsResult, sessionResult] = await Promise.all([
+    supabase
+      .from('transcript_turns')
+      .select('speaker,text,turn_started_at_ms')
+      .eq('session_id', sessionId)
+      .order('turn_index', { ascending: true }),
+    supabase
+      .from('call_sessions')
+      .select('recording_egress_started_at_ms')
+      .eq('id', sessionId)
+      .maybeSingle(),
+  ]);
+
+  const turns = turnsResult.data ?? [];
+  const egressStartMs = validateEpochMsAnchor(
+    sessionResult.data?.recording_egress_started_at_ms ?? null,
+  );
+
+  return turns.map((t: Record<string, unknown>) => {
+    const start_offset_sec = deriveStartOffsetSec(
+      t.turn_started_at_ms,
+      egressStartMs,
+    );
+    return {
+      speaker: t.speaker as 'bot' | 'candidate',
+      text: t.text as string,
+      start_offset_sec,
+    };
+  });
 }
 
 /** Insert a transcript turn. Throws on Supabase error. */

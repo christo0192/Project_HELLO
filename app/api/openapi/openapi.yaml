@@ -2749,6 +2749,10 @@ components:
           enum: [bot, candidate]
         text:
           type: string
+        start_offset_sec:
+          type: number
+          nullable: true
+          description: Seconds from the authoritative recording start to this turn start. NULL when either anchor is missing (legacy rows, simulation sessions, non-egress recordings).
       additionalProperties: false
 
     AssessmentRecord:

@@ -26,6 +26,9 @@ import {
   egressObjectKey,
   finalizeAuthoritativeRecording,
   startAuthoritativeRecording,
+  safeEgressStartedAtMs,
+  validateEpochMsAnchor,
+  MAX_EPOCH_MS_ANCHOR,
 } from '../lib/recording-egress.js';
 
 function fakeDb(singleRows: unknown[], bytes = Buffer.from('synthetic audio')) {
@@ -67,11 +70,11 @@ function fakeDb(singleRows: unknown[], bytes = Buffer.from('synthetic audio')) {
   };
 }
 
-function fakeClient(status = EgressStatus.EGRESS_COMPLETE) {
+function fakeClient(status = EgressStatus.EGRESS_COMPLETE, startedAt = 1700000000000000000n) {
   return {
     startRoomCompositeEgress: vi.fn().mockResolvedValue({ egressId: 'EG_synthetic123' }),
     stopEgress: vi.fn().mockResolvedValue({ egressId: 'EG_synthetic123' }),
-    listEgress: vi.fn().mockResolvedValue([{ egressId: 'EG_synthetic123', status }]),
+    listEgress: vi.fn().mockResolvedValue([{ egressId: 'EG_synthetic123', status, startedAt }]),
   } as any;
 }
 
@@ -128,6 +131,7 @@ describe('authoritative recording egress', () => {
       p_object_key: egressObjectKey('00000000-0000-4000-8000-000000000001'),
       p_content_type: 'audio/ogg',
       p_sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      p_recording_egress_started_at_ms: 1700000000000,
     }));
   });
 
@@ -169,6 +173,7 @@ describe('authoritative recording egress', () => {
     expect(result).toBe('ready');
     expect(rpc).toHaveBeenCalledWith('finalize_authoritative_recording', expect.objectContaining({
       p_session_id: 'session',
+      p_recording_egress_started_at_ms: 1700000000000,
     }));
     // Must NOT short-circuit early — stopEgress must have been called
     expect(client.stopEgress).toHaveBeenCalled();
@@ -275,5 +280,165 @@ describe('authoritative recording egress', () => {
     ]);
     const result = await finalizeAuthoritativeRecording('session', { db, client: fakeClient() });
     expect(result).toBe('fallback_required');
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 0026: pure timing-anchor helpers — deterministic, zero I/O
+// ═══════════════════════════════════════════════════════════════════
+
+describe('safeEgressStartedAtMs', () => {
+  it('converts valid nanos to ms', () => {
+    // 1700000000123456789n ns → 1700000000123 ms (integer division truncates)
+    expect(safeEgressStartedAtMs(1700000000123456789n)).toBe(1700000000123);
+  });
+
+  it('returns epoch-ms for a current-era timestamp', () => {
+    // ~2026-01-01 in nanos
+    const ms = safeEgressStartedAtMs(1_767_000_000_000_000_000n);
+    expect(ms).toBe(1_767_000_000_000);
+  });
+
+  it('returns null for null', () => {
+    expect(safeEgressStartedAtMs(null)).toBeNull();
+  });
+
+  it('returns null for undefined', () => {
+    expect(safeEgressStartedAtMs(undefined)).toBeNull();
+  });
+
+  it('returns null for 0n (EGRESS_STARTING, not authoritative)', () => {
+    expect(safeEgressStartedAtMs(0n)).toBeNull();
+  });
+
+  it('returns null for negative nanos', () => {
+    expect(safeEgressStartedAtMs(-1n)).toBeNull();
+  });
+
+  it('returns null when ms result exceeds MAX_EPOCH_MS_ANCHOR (year 2100)', () => {
+    // nanos = MAX_EPOCH_MS_ANCHOR * 1e6 + 1 → ms would be beyond the bound
+    const farFutureNanos = BigInt(MAX_EPOCH_MS_ANCHOR) * 1_000_000n + 1n;
+    expect(safeEgressStartedAtMs(farFutureNanos)).toBeNull();
+  });
+
+  it('accepts exactly MAX_EPOCH_MS_ANCHOR - 1 in ms', () => {
+    const nanos = BigInt(MAX_EPOCH_MS_ANCHOR - 1) * 1_000_000n;
+    expect(safeEgressStartedAtMs(nanos)).toBe(MAX_EPOCH_MS_ANCHOR - 1);
+  });
+});
+
+describe('validateEpochMsAnchor', () => {
+  // ── Happy path: valid number ────────────────────────────────────
+  it('accepts a positive integer number within range', () => {
+    expect(validateEpochMsAnchor(1700000000123)).toBe(1700000000123);
+  });
+
+  it('accepts a numeric string that unambiguously represents the value', () => {
+    expect(validateEpochMsAnchor('1700000000123')).toBe(1700000000123);
+  });
+
+  it('accepts bigint within range as a number', () => {
+    expect(validateEpochMsAnchor(BigInt(1700000000123))).toBe(1700000000123);
+  });
+
+  // ── null / undefined ───────────────────────────────────────────
+  it('returns null for null', () => {
+    expect(validateEpochMsAnchor(null)).toBeNull();
+  });
+
+  it('returns null for undefined', () => {
+    expect(validateEpochMsAnchor(undefined)).toBeNull();
+  });
+
+  // ── Invalid types ──────────────────────────────────────────────
+  it('returns null for true (boolean)', () => {
+    expect(validateEpochMsAnchor(true)).toBeNull();
+  });
+
+  it('returns null for false (boolean)', () => {
+    expect(validateEpochMsAnchor(false)).toBeNull();
+  });
+
+  it('returns null for an object', () => {
+    expect(validateEpochMsAnchor({})).toBeNull();
+  });
+
+  it('returns null for an array', () => {
+    expect(validateEpochMsAnchor([1, 2, 3])).toBeNull();
+  });
+
+  it('returns null for a function', () => {
+    expect(validateEpochMsAnchor(() => 1)).toBeNull();
+  });
+
+  it('returns null for a symbol', () => {
+    expect(validateEpochMsAnchor(Symbol('test'))).toBeNull();
+  });
+
+  // ── Invalid number values ──────────────────────────────────────
+  it('returns null for NaN', () => {
+    expect(validateEpochMsAnchor(NaN)).toBeNull();
+  });
+
+  it('returns null for Infinity', () => {
+    expect(validateEpochMsAnchor(Infinity)).toBeNull();
+  });
+
+  it('returns null for -Infinity', () => {
+    expect(validateEpochMsAnchor(-Infinity)).toBeNull();
+  });
+
+  it('returns null for 0', () => {
+    expect(validateEpochMsAnchor(0)).toBeNull();
+  });
+
+  it('returns null for a negative number', () => {
+    expect(validateEpochMsAnchor(-1)).toBeNull();
+  });
+
+  it('returns null for a float', () => {
+    expect(validateEpochMsAnchor(1700000000123.5)).toBeNull();
+  });
+
+  it('returns null for a value equal to MAX_EPOCH_MS_ANCHOR', () => {
+    expect(validateEpochMsAnchor(MAX_EPOCH_MS_ANCHOR)).toBeNull();
+  });
+
+  it('returns null for a value exceeding MAX_EPOCH_MS_ANCHOR', () => {
+    expect(validateEpochMsAnchor(MAX_EPOCH_MS_ANCHOR + 1)).toBeNull();
+  });
+
+  // ── Invalid string values ──────────────────────────────────────
+  it('returns null for an empty string', () => {
+    expect(validateEpochMsAnchor('')).toBeNull();
+  });
+
+  it('returns null for a string with leading zeros', () => {
+    expect(validateEpochMsAnchor('01700000000123')).toBeNull();
+  });
+
+  it('returns null for a string with decimal point', () => {
+    expect(validateEpochMsAnchor('1700000000123.0')).toBeNull();
+  });
+
+  it('returns null for a string with whitespace', () => {
+    expect(validateEpochMsAnchor(' 1700000000123 ')).toBeNull();
+  });
+
+  it('returns null for a hex string', () => {
+    expect(validateEpochMsAnchor('0x18b')).toBeNull();
+  });
+
+  it('returns null for a negative numeric string', () => {
+    expect(validateEpochMsAnchor('-1')).toBeNull();
+  });
+
+  it('returns null for a non-numeric string', () => {
+    expect(validateEpochMsAnchor('abcd')).toBeNull();
+  });
+
+  it('returns null for a string that rounds differently (loss of precision)', () => {
+    // "9007199254740993" > Number.MAX_SAFE_INTEGER — Number() rounds it
+    expect(validateEpochMsAnchor('9007199254740993')).toBeNull();
   });
 });

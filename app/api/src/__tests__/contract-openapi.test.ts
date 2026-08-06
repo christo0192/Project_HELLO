@@ -696,8 +696,9 @@ const mockSessionRow = {
 };
 
 const mockTranscriptTurns: TranscriptTurn[] = [
-  { speaker: 'bot', text: 'Hello, thanks for joining.' },
-  { speaker: 'candidate', text: 'Hi, happy to be here.' },
+  { speaker: 'bot', text: 'Hello, thanks for joining.', start_offset_sec: 0.0 },
+  { speaker: 'candidate', text: 'Hi, happy to be here.', start_offset_sec: 2.5 },
+  { speaker: 'bot', text: 'Tell me about your experience.', start_offset_sec: null },
 ];
 
 const mockAssessmentRecord = {
@@ -2129,5 +2130,89 @@ describe('documented routes respond to invalid params with the documented 400 co
       }
     }
     expect(failures).toEqual([]);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 0026: deriveStartOffsetSec — deterministic, zero I/O
+// ═══════════════════════════════════════════════════════════════════
+
+import { deriveStartOffsetSec } from '../routes/screening.js';
+
+describe('deriveStartOffsetSec', () => {
+  it('derives a positive offset in seconds', () => {
+    expect(deriveStartOffsetSec(1700000005000, 1700000000000)).toBe(5.0);
+  });
+
+  it('derives offset with sub-second precision (rounded to ms)', () => {
+    expect(deriveStartOffsetSec(1700000000123, 1700000000000)).toBe(0.123);
+  });
+
+  it('rounds to nearest ms', () => {
+    expect(deriveStartOffsetSec(1700000000001, 1700000000000)).toBe(0.001);
+  });
+
+  it('returns null when turnMs is null', () => {
+    expect(deriveStartOffsetSec(null, 1700000000000)).toBeNull();
+  });
+
+  it('returns null when egressMs is null', () => {
+    expect(deriveStartOffsetSec(1700000005000, null)).toBeNull();
+  });
+
+  it('returns null when both anchors are null', () => {
+    expect(deriveStartOffsetSec(null, null)).toBeNull();
+  });
+
+  it('clamps negative offset to 0 (turn < egress — NTP skew)', () => {
+    expect(deriveStartOffsetSec(1700000000000, 1700000005000)).toBe(0.0);
+  });
+
+  it('returns 0 when turn equals egress', () => {
+    expect(deriveStartOffsetSec(1700000000000, 1700000000000)).toBe(0.0);
+  });
+
+  it('returns null when turnMs is NaN', () => {
+    expect(deriveStartOffsetSec(NaN, 1700000000000)).toBeNull();
+  });
+
+  it('returns null when egressMs is NaN', () => {
+    expect(deriveStartOffsetSec(1700000005000, NaN)).toBeNull();
+  });
+
+  it('returns null when turnMs is a boolean', () => {
+    expect(deriveStartOffsetSec(true, 1700000000000)).toBeNull();
+  });
+
+  it('returns null when turnMs is a float', () => {
+    expect(deriveStartOffsetSec(1700000005000.5, 1700000000000)).toBeNull();
+  });
+
+  it('returns null when turnMs is an invalid string', () => {
+    expect(deriveStartOffsetSec('abc', 1700000000000)).toBeNull();
+  });
+
+  it('returns null when turnMs is a negative number', () => {
+    expect(deriveStartOffsetSec(-1, 1700000000000)).toBeNull();
+  });
+
+  it('returns null when turnMs is 0', () => {
+    expect(deriveStartOffsetSec(0, 1700000000000)).toBeNull();
+  });
+
+  it('returns null when egressMs is a non-numeric string', () => {
+    expect(deriveStartOffsetSec(1700000005000, 'not-a-number')).toBeNull();
+  });
+
+  it('accepts numeric strings for both anchors', () => {
+    expect(deriveStartOffsetSec('1700000005000', '1700000000000')).toBe(5.0);
+  });
+
+  it('returns null when turnMs exceeds MAX_EPOCH_MS_ANCHOR', () => {
+    expect(deriveStartOffsetSec(4102444800000, 1700000000000)).toBeNull();
+  });
+
+  it('returns null when egressMs is out of range (negative)', () => {
+    expect(deriveStartOffsetSec(1700000005000, -5)).toBeNull();
   });
 });
