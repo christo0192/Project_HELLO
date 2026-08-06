@@ -123,6 +123,10 @@ _mock_dotenv.load_dotenv = MagicMock()
 sys.modules["dotenv"] = _mock_dotenv
 
 # Save original persistence/prompting modules before overriding
+# The real persistence module is imported first so the anchor normaliser
+# (which agent._turn_anchor_ms calls through ``persistence.``) is bound to
+# the mock with its real implementation.
+import persistence as _real_persistence_module  # noqa: E402
 _orig_persistence = sys.modules.get("persistence")
 _orig_prompting = sys.modules.get("prompting")
 
@@ -134,6 +138,7 @@ _mock_persistence.WorkerContext = MagicMock()
 _mock_persistence.ClaimResult = types.SimpleNamespace(
     CLAIMED="claimed", ALREADY_MATCHING="already_matching"
 )
+_mock_persistence.normalize_turn_anchor_ms = _real_persistence_module.normalize_turn_anchor_ms
 _mock_persistence.set_session_provenance = AsyncMock(return_value="claimed")
 _mock_persistence.resolve_worker_context = AsyncMock(return_value="context_not_found")
 sys.modules["persistence"] = _mock_persistence
@@ -179,6 +184,60 @@ class FakeAgentSessionCloseReason:
 
 
 # ── Tests ─────────────────────────────────────────────────────────────
+
+class TestTurnAnchorExtraction(unittest.TestCase):
+    """_turn_anchor_ms: metrics.started_speaking_at primary, created_at fallback."""
+
+    def _item(self, **attrs):
+        return types.SimpleNamespace(**attrs)
+
+    def test_primary_metrics_started_speaking_at_wins(self):
+        item = self._item(
+            role="user",
+            content=[types.SimpleNamespace(text="hello")],
+            metrics={"started_speaking_at": 1723000000.25, "stopped_speaking_at": 1723000008.5},
+            created_at=1723000009.0,
+        )
+        self.assertEqual(agent_mod._turn_anchor_ms(item), 1723000000250)
+
+    def test_fallback_created_at_when_metrics_missing(self):
+        item = self._item(role="assistant", created_at=1723000005.75)
+        self.assertEqual(agent_mod._turn_anchor_ms(item), 1723000005750)
+
+    def test_fallback_created_at_when_metrics_not_a_mapping(self):
+        for bad_metrics in (None, [1, 2], "nope", 42):
+            with self.subTest(bad_metrics=bad_metrics):
+                item = self._item(role="assistant", metrics=bad_metrics, created_at=1723000001.0)
+                self.assertEqual(agent_mod._turn_anchor_ms(item), 1723000001000)
+
+    def test_fallback_when_primary_present_but_invalid(self):
+        # Primary exists but is bool / NaN / out-of-range → fall back to created_at.
+        for bad_primary in (True, float("nan"), 0, -1, 4102444800.0):
+            with self.subTest(bad_primary=bad_primary):
+                item = self._item(
+                    role="user",
+                    metrics={"started_speaking_at": bad_primary},
+                    created_at=1723000007.25,
+                )
+                self.assertEqual(agent_mod._turn_anchor_ms(item), 1723000007250)
+
+    def test_metrics_mapping_missing_key_falls_back(self):
+        item = self._item(role="assistant", metrics={}, created_at=1723000003.5)
+        self.assertEqual(agent_mod._turn_anchor_ms(item), 1723000003500)
+
+    def test_null_when_no_valid_anchor(self):
+        for item in (self._item(role="assistant"), self._item(role="assistant", metrics={})):
+            with self.subTest(item=item):
+                self.assertIsNone(agent_mod._turn_anchor_ms(item))
+
+    def test_null_when_both_anchors_invalid(self):
+        item = self._item(
+            role="user",
+            metrics={"started_speaking_at": float("inf")},
+            created_at=float("nan"),
+        )
+        self.assertIsNone(agent_mod._turn_anchor_ms(item))
+
 
 class _FakeSpeechHandle:
     def __init__(self, log):

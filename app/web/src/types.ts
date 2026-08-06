@@ -75,6 +75,8 @@ export type Speaker = "bot" | "candidate";
 export interface TranscriptLine {
   speaker: Speaker;
   text: string;
+  /** Seconds from the authoritative recording start. null when timing data is unavailable (legacy, simulation). */
+  start_offset_sec?: number | null;
 }
 
 export interface EnglishScore {

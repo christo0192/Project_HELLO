@@ -194,6 +194,90 @@ class TestSaveTurn(unittest.TestCase):
                 run(persistence.save_turn(SESSION_ID, 0, "bot", "hello"))
 
 
+# ── normalize_turn_anchor_ms (0026 timing anchor validation) ──────────
+
+class TestNormalizeTurnAnchorMs(unittest.TestCase):
+    def test_seconds_epoch_converted_to_ms(self):
+        self.assertEqual(persistence.normalize_turn_anchor_ms(1723000000.5), 1723000000500)
+        self.assertEqual(persistence.normalize_turn_anchor_ms(1723000000), 1723000000000)
+
+    def test_none_and_missing_are_null(self):
+        self.assertIsNone(persistence.normalize_turn_anchor_ms(None))
+
+    def test_rejects_bool(self):
+        self.assertIsNone(persistence.normalize_turn_anchor_ms(True))
+        self.assertIsNone(persistence.normalize_turn_anchor_ms(False))
+
+    def test_rejects_nan_and_inf(self):
+        self.assertIsNone(persistence.normalize_turn_anchor_ms(float("nan")))
+        self.assertIsNone(persistence.normalize_turn_anchor_ms(float("inf")))
+        self.assertIsNone(persistence.normalize_turn_anchor_ms(float("-inf")))
+
+    def test_rejects_nonpositive(self):
+        self.assertIsNone(persistence.normalize_turn_anchor_ms(0))
+        self.assertIsNone(persistence.normalize_turn_anchor_ms(-1))
+        self.assertIsNone(persistence.normalize_turn_anchor_ms(0.0004))  # rounds to 0 ms
+
+    def test_rejects_out_of_range_at_year_2100_boundary(self):
+        # 4102444800 seconds == 4102444800000 ms == the 0026 CHECK boundary.
+        self.assertIsNone(persistence.normalize_turn_anchor_ms(4102444800))
+        self.assertIsNone(persistence.normalize_turn_anchor_ms(4102444800.0))
+        self.assertIsNone(persistence.normalize_turn_anchor_ms(1e20))
+
+    def test_rejects_non_numeric_types(self):
+        self.assertIsNone(persistence.normalize_turn_anchor_ms("1723000000"))
+        self.assertIsNone(persistence.normalize_turn_anchor_ms(object()))
+
+
+# ── save_turn with turn_started_at_ms (0026 timing column) ────────────
+
+class TestSaveTurnTiming(unittest.TestCase):
+    def test_row_shape_includes_turn_started_at_ms_anchor(self):
+        client, chain = _make_mock_client()
+        with patch.object(persistence, "_get_client", return_value=client):
+            run(persistence.save_turn(
+                SESSION_ID, 0, "bot", "hello", turn_started_at_ms=1723000000123))
+        inserted = chain.insert.call_args[0][0]
+        self.assertEqual(
+            inserted,
+            {
+                "session_id": SESSION_ID,
+                "turn_index": 0,
+                "speaker": "bot",
+                "text": "hello",
+                "turn_started_at_ms": 1723000000123,
+            },
+        )
+
+    def test_row_shape_null_anchor_when_omitted(self):
+        """Legacy four-argument callers stay compatible; anchor is NULL."""
+        client, chain = _make_mock_client()
+        with patch.object(persistence, "_get_client", return_value=client):
+            run(persistence.save_turn(SESSION_ID, 1, "candidate", "answer"))
+        inserted = chain.insert.call_args[0][0]
+        self.assertIn("turn_started_at_ms", inserted)
+        self.assertIsNone(inserted["turn_started_at_ms"])
+
+    def test_invalid_anchors_degrade_to_null_not_crash(self):
+        """Bool/float/NaN/out-of-range ms values must never reach the DB CHECK."""
+        for bad in (True, False, 0, -5, 4102444800000, 99999999999999999999, float("nan"), "123"):
+            with self.subTest(bad=bad):
+                client, chain = _make_mock_client()
+                with patch.object(persistence, "_get_client", return_value=client):
+                    run(persistence.save_turn(
+                        SESSION_ID, 0, "bot", "hello", turn_started_at_ms=bad))
+                inserted = chain.insert.call_args[0][0]
+                self.assertIsNone(inserted["turn_started_at_ms"])
+
+    def test_boundary_anchor_passes(self):
+        client, chain = _make_mock_client()
+        with patch.object(persistence, "_get_client", return_value=client):
+            run(persistence.save_turn(
+                SESSION_ID, 0, "bot", "hello", turn_started_at_ms=4102444799999))
+        inserted = chain.insert.call_args[0][0]
+        self.assertEqual(inserted["turn_started_at_ms"], 4102444799999)
+
+
 # ── activate_session ─────────────────────────────────────────────────
 
 class TestActivateSession(unittest.TestCase):

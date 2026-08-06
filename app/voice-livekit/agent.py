@@ -10,6 +10,7 @@ import re
 import time
 import asyncio
 import inspect
+from collections.abc import Mapping
 from typing import Any, Callable
 
 from dotenv import load_dotenv
@@ -284,6 +285,26 @@ def _item_text(item: Any) -> str:
         elif hasattr(part, "text"):
             chunks.append(str(part.text))
     return "".join(chunks).strip()
+
+
+def _turn_anchor_ms(item: Any) -> int | None:
+    """Validated millisecond speech-start anchor for a conversation item.
+
+    Primary: ``ChatMessage.metrics['started_speaking_at']`` — the SDK's
+    speech-start timestamp (VAD speech start for user turns, TTS start for
+    assistant turns; a ``time.time()`` seconds float). Fallback:
+    ``ChatMessage.created_at`` — the message-finalization time. Metrics is a
+    TypedDict, i.e. a dict at runtime, so only Mapping values are inspected.
+    Invalid anchors (bool, NaN/inf, nonpositive, out-of-range) are rejected
+    by the persistence normaliser; the next candidate, or NULL, is used so
+    the 0026 DB CHECK can never fire on a turn write.
+    """
+    metrics = getattr(item, "metrics", None)
+    if isinstance(metrics, Mapping):
+        anchor = persistence.normalize_turn_anchor_ms(metrics.get("started_speaking_at"))
+        if anchor is not None:
+            return anchor
+    return persistence.normalize_turn_anchor_ms(getattr(item, "created_at", None))
 
 
 # ── Bounded session outcome counter mapping (OBS-06) ────────────────
@@ -644,13 +665,16 @@ async def _run_session(
             turn_index += 1
             return idx
 
-        async def record_turn(speaker: str, text: str) -> None:
+        async def record_turn(speaker: str, text: str, turn_started_at_ms: int | None = None) -> None:
             if not text:
                 return
             turn_started = _monotonic()
 
             async def _persist(span: Span | None) -> None:
-                await persistence.save_turn(session_id, _next_turn_index(), speaker, text)
+                await persistence.save_turn(
+                    session_id, _next_turn_index(), speaker, text,
+                    turn_started_at_ms=turn_started_at_ms,
+                )
                 if span is not None:
                     span.set_attributes({"speaker": speaker})
                 _safe_emit(histogram_metric, "session_turn_persistence_duration_sec",
@@ -717,7 +741,7 @@ async def _run_session(
                 if role == "assistant" and opening_recorded and text == opening_text:
                     return
                 speaker = "bot" if role == "assistant" else "candidate"
-                tracked_write(record_turn(speaker, text))
+                tracked_write(record_turn(speaker, text, _turn_anchor_ms(item)))
                 if (
                     role == "assistant"
                     and _is_final_goodbye(text)

@@ -57,6 +57,75 @@ export function egressObjectKey(sessionId: string): string {
   return `${sessionId}-egress.ogg`;
 }
 
+// ── 0026: pure timing-anchor helpers ────────────────────────────────
+
+/** Maximum valid epoch-ms value (year 2100, matches DB CHECK constraint). */
+export const MAX_EPOCH_MS_ANCHOR = 4_102_444_800_000;
+
+/**
+ * Safely convert an EgressInfo.startedAt bigint (nanoseconds since epoch
+ * on the LiveKit server clock) to epoch milliseconds.
+ *
+ * BigInt division happens BEFORE Number conversion: the nanosecond value
+ * does NOT need to fit in Number.MAX_SAFE_INTEGER because integer division
+ * by 1_000_000n yields a millisecond value (~1.7e12 for the current epoch)
+ * which fits comfortably in Number safely. The result is validated against
+ * MAX_EPOCH_MS_ANCHOR (year 2100 boundary).
+ *
+ * Returns null when startedAt is null, undefined, 0n, or produces an
+ * out-of-range ms value. Never throws.
+ */
+export function safeEgressStartedAtMs(
+  startedAt: bigint | null | undefined,
+): number | null {
+  if (startedAt == null) return null;
+  if (typeof startedAt !== 'bigint') return null;
+  if (startedAt <= 0n) return null;
+  // Integer division: nanos → ms. For current epoch values (~1.7e18 ns),
+  // this yields ~1.7e12 ms which is safely below MAX_SAFE_INTEGER (~9e15).
+  const ms = Number(startedAt / 1_000_000n);
+  if (!Number.isFinite(ms) || ms <= 0 || ms >= MAX_EPOCH_MS_ANCHOR) return null;
+  return ms;
+}
+
+/**
+ * Validate a possibly-unsafe epoch-ms value arriving from the database
+ * (Supabase returns int8/bigint as `number` for safe values, but a
+ * misconfigured parser or a manual insert could produce a `string`).
+ *
+ * Accepts: positive finite integer numbers (or numeric strings that parse
+ * to the same) within (0, MAX_EPOCH_MS_ANCHOR). Rejects: NaN, Infinity,
+ * negative, zero, boolean, non-numeric strings, floats, out-of-range.
+ *
+ * Returns a clean integer `number` or null. Never throws.
+ */
+export function validateEpochMsAnchor(
+  v: unknown,
+): number | null {
+  if (v == null) return null;
+  if (typeof v === 'boolean') return null;
+  if (typeof v === 'bigint') {
+    if (v <= 0n || v >= BigInt(MAX_EPOCH_MS_ANCHOR)) return null;
+    return Number(v);
+  }
+  let n: number;
+  if (typeof v === 'string') {
+    // Accept only strings that unambiguously represent a positive integer
+    // (no leading sign, no decimals, no whitespace, no hex).
+    if (!/^[1-9]\d{0,15}$/.test(v)) return null;
+    n = Number(v);
+    if (!Number.isFinite(n) || n <= 0 || n >= MAX_EPOCH_MS_ANCHOR) return null;
+    // Round-trip check: Number→string must match the original
+    if (String(n) !== v) return null;
+    return n;
+  }
+  if (typeof v !== 'number') return null;
+  if (!Number.isFinite(v)) return null;
+  if (v <= 0 || v >= MAX_EPOCH_MS_ANCHOR) return null;
+  if (!Number.isInteger(v)) return null;
+  return v;
+}
+
 export async function startAuthoritativeRecording(
   roomName: string,
   sessionId: string,
@@ -185,6 +254,16 @@ export async function finalizeAuthoritativeRecording(
   }
 
   const sha256 = createHash('sha256').update(bytes).digest('hex');
+
+  // ── 0026: authoritative recording-timeline origin ──────────────────
+  // EgressInfo.startedAt is bigint nanoseconds on the LiveKit server
+  // clock. safeEgressStartedAtMs performs integer division by 1_000_000n
+  // BEFORE Number conversion, so the nanosecond magnitude (~1.7e18) never
+  // needs to fit in Number; only the resulting ms value (~1.7e12) does.
+  // Invalid, zero, or out-of-range values degrade to null rather than
+  // throwing or causing finalization fallback.
+  const egressStartedAtMs = safeEgressStartedAtMs(info.startedAt);
+
   const { data: rpcData, error: rpcError } = await db.rpc('finalize_authoritative_recording', {
     p_session_id: sessionId,
     p_object_key: objectKey,
@@ -192,6 +271,7 @@ export async function finalizeAuthoritativeRecording(
     p_size_bytes: bytes.length,
     p_content_type: 'audio/ogg',
     p_correlation_id: null,
+    p_recording_egress_started_at_ms: egressStartedAtMs,
   });
   if (rpcError) throw new Error('recording egress finalization failed');
   const rpcStatus = (rpcData as { status?: string } | null)?.status;

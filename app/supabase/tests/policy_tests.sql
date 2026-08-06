@@ -3489,7 +3489,11 @@ select _policy_tests.assert(
 );
 
 -- ═══════════════════════════════════════════════════════════════════════
--- 0025 — finalize_authoritative_recording: grants + behaviour (T16-T19)
+-- 0025/0026 — finalize_authoritative_recording: grants + behaviour
+-- (T16-T25). 0026 replaces the six-arg finalizer with a seven-arg version
+-- whose final argument (p_recording_egress_started_at_ms) DEFAULTS to NULL,
+-- so every T16-T19 call below (six arguments) exercises the legacy-caller
+-- compatibility path while regprocedure checks pin the 7-arg signature.
 --
 -- Sessions are created through the sanctioned lifecycle (created →
 -- in_progress → completed); direct INSERTs at a terminal status are
@@ -3545,28 +3549,28 @@ $$;
 
 -- ── T16: execute privilege is service-role-only ──────────────────────
 select _policy_tests.assert(
-  'T16: anon cannot execute finalize_authoritative_recording',
+  'T16: anon cannot execute finalize_authoritative_recording (7-arg)',
   not has_function_privilege(
     'anon',
-    'screening_v2.finalize_authoritative_recording(uuid,text,text,bigint,text,text)'::regprocedure,
+    'screening_v2.finalize_authoritative_recording(uuid,text,text,bigint,text,text,bigint)'::regprocedure,
     'EXECUTE'),
   'anon must not be able to execute the authoritative recording RPC'
 );
 
 select _policy_tests.assert(
-  'T16: authenticated cannot execute finalize_authoritative_recording',
+  'T16: authenticated cannot execute finalize_authoritative_recording (7-arg)',
   not has_function_privilege(
     'authenticated',
-    'screening_v2.finalize_authoritative_recording(uuid,text,text,bigint,text,text)'::regprocedure,
+    'screening_v2.finalize_authoritative_recording(uuid,text,text,bigint,text,text,bigint)'::regprocedure,
     'EXECUTE'),
   'authenticated must not be able to execute the authoritative recording RPC'
 );
 
 select _policy_tests.assert(
-  'T16: service_role can execute finalize_authoritative_recording',
+  'T16: service_role can execute finalize_authoritative_recording (7-arg)',
   has_function_privilege(
     'service_role',
-    'screening_v2.finalize_authoritative_recording(uuid,text,text,bigint,text,text)'::regprocedure,
+    'screening_v2.finalize_authoritative_recording(uuid,text,text,bigint,text,text,bigint)'::regprocedure,
     'EXECUTE'),
   'service_role must be able to execute the authoritative recording RPC'
 );
@@ -3867,6 +3871,267 @@ begin
         ('T19e: CHECK constraint rejects invalid provenance', true,
          'check_violation raised as expected');
   end;
+
+  delete from screening_v2.call_sessions where id = v_session_id;
+end;
+$$;
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- 0026 — timing anchors + extended finalizer compatibility (T20-T25)
+--
+-- Covers: nullable bigint columns + CHECK guards (T20), removal of the
+-- lingering six-arg overload + 7-arg grants (T21), legacy six-argument call
+-- compatibility through the DEFAULT (T22), egress-start persistence and
+-- fill-once immutability (T23), invalid egress-start validation (T24), and
+-- idempotent re-call immutability (T25). Terminal-state protections,
+-- repoint evidence, and validation ordering are already covered by
+-- T17/T18/T19c/T19d against the same (now 7-arg) function via defaults.
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- ── T20: nullable timing anchor columns exist with CHECK guards ────────
+select _policy_tests.assert(
+  'T20: call_sessions.recording_egress_started_at_ms is nullable bigint',
+  exists (
+    select 1 from information_schema.columns
+     where table_schema = 'screening_v2'
+       and table_name = 'call_sessions'
+       and column_name = 'recording_egress_started_at_ms'
+       and data_type = 'bigint'
+       and is_nullable = 'YES'
+  ),
+  'recording_egress_started_at_ms must be a nullable bigint on call_sessions'
+);
+
+select _policy_tests.assert(
+  'T20: transcript_turns.turn_started_at_ms is nullable bigint',
+  exists (
+    select 1 from information_schema.columns
+     where table_schema = 'screening_v2'
+       and table_name = 'transcript_turns'
+       and column_name = 'turn_started_at_ms'
+       and data_type = 'bigint'
+       and is_nullable = 'YES'
+  ),
+  'turn_started_at_ms must be a nullable bigint on transcript_turns'
+);
+
+select _policy_tests.assert(
+  'T20: timing anchor CHECK constraints guard the epoch window',
+  exists (
+    select 1 from pg_constraint
+     where conrelid = 'screening_v2.call_sessions'::regclass
+       and conname = 'chk_call_sessions_recording_egress_started_at_ms'
+       and contype = 'c'
+  )
+  and exists (
+    select 1 from pg_constraint
+     where conrelid = 'screening_v2.transcript_turns'::regclass
+       and conname = 'chk_transcript_turns_turn_started_at_ms'
+       and contype = 'c'
+  ),
+  'both timing anchor columns must be guarded by CHECK constraints'
+);
+
+-- ── T21: no lingering 6-arg overload; grants pin the 7-arg signature ────
+select _policy_tests.assert(
+  'T21: the old 6-arg overload is removed',
+  to_regprocedure('screening_v2.finalize_authoritative_recording(uuid,text,text,bigint,text,text)') is null,
+  'the 6-arg overload must not linger (the DEFAULT arg preserves old callers)'
+);
+
+-- ── T22: legacy six-argument call resolves through the DEFAULT ──────────
+do $$
+declare
+  v_candidate_id uuid;
+  v_session_id uuid;
+  v_result jsonb;
+  v_started_at_ms bigint;
+begin
+  select id into v_candidate_id from screening_v2.candidates limit 1;
+  if v_candidate_id is null then
+    insert into _policy_tests.results(test, passed, detail) values
+      ('T22: legacy 6-arg call resolves via default', true, 'skipped: no candidate row');
+    return;
+  end if;
+
+  v_session_id := _policy_tests.seed_repoint_session(
+    v_candidate_id, 'EG_polT22', 'policy-test-browser.webm', false, false, false);
+
+  -- Exactly the six-argument shape the current API rpc uses; must resolve
+  -- to the extended 7-arg function via DEFAULT NULL and leave timing NULL.
+  v_result := screening_v2.finalize_authoritative_recording(
+    v_session_id, v_session_id::text || '-egress.ogg', repeat('b', 64), 4096, 'audio/ogg', null);
+
+  select recording_egress_started_at_ms into v_started_at_ms
+    from screening_v2.call_sessions where id = v_session_id;
+
+  insert into _policy_tests.results(test, passed, detail) values
+    ('T22: legacy 6-arg call resolves via default',
+     (v_result ->> 'status' = 'ok') and v_started_at_ms is null,
+     'status=' || coalesce(v_result ->> 'status', 'null')
+     || ' started_at_ms=' || coalesce(v_started_at_ms::text, 'null'));
+
+  delete from screening_v2.call_sessions where id = v_session_id;
+end;
+$$;
+
+-- ── T23: egress start persisted on first-writer link; never clobbered ───
+do $$
+declare
+  v_candidate_id uuid;
+  v_session_id uuid;
+  v_result jsonb;
+  v_started_at_ms bigint;
+begin
+  select id into v_candidate_id from screening_v2.candidates limit 1;
+  if v_candidate_id is null then
+    insert into _policy_tests.results(test, passed, detail) values
+      ('T23: first-writer link persists egress start', true, 'skipped: no candidate row'),
+      ('T23: existing egress start is never clobbered', true, 'skipped: no candidate row');
+    return;
+  end if;
+
+  -- (a) Fresh row with no prior capture → finalize-time value is persisted.
+  insert into screening_v2.call_sessions (candidate_id, mode, status)
+    values (v_candidate_id, 'simulation', 'created')
+    returning id into v_session_id;
+  update screening_v2.call_sessions set status = 'in_progress' where id = v_session_id;
+  update screening_v2.call_sessions
+     set status = 'completed', terminal_reason = 'assessment_done',
+         recording_egress_id = 'EG_polT23a', recording_egress_status = 'complete'
+   where id = v_session_id;
+
+  v_result := screening_v2.finalize_authoritative_recording(
+    v_session_id, v_session_id::text || '-egress.ogg', repeat('c', 64), 8192, 'audio/ogg', null,
+    1723000500000);
+
+  select recording_egress_started_at_ms into v_started_at_ms
+    from screening_v2.call_sessions where id = v_session_id;
+
+  insert into _policy_tests.results(test, passed, detail) values
+    ('T23: first-writer link persists egress start',
+     (v_result ->> 'status' = 'ok') and v_started_at_ms = 1723000500000,
+     'status=' || coalesce(v_result ->> 'status', 'null')
+     || ' started_at_ms=' || coalesce(v_started_at_ms::text, 'null'));
+
+  delete from screening_v2.call_sessions where id = v_session_id;
+
+  -- (b) Start-time capture (Step 2) already wrote a value; the finalizer
+  -- passes a later, different value → the existing value must win.
+  insert into screening_v2.call_sessions (candidate_id, mode, status)
+    values (v_candidate_id, 'simulation', 'created')
+    returning id into v_session_id;
+  update screening_v2.call_sessions set status = 'in_progress' where id = v_session_id;
+  update screening_v2.call_sessions
+     set status = 'completed', terminal_reason = 'assessment_done',
+         recording_egress_id = 'EG_polT23b', recording_egress_status = 'complete',
+         recording_egress_started_at_ms = 1723000000000
+   where id = v_session_id;
+
+  v_result := screening_v2.finalize_authoritative_recording(
+    v_session_id, v_session_id::text || '-egress.ogg', repeat('d', 64), 8192, 'audio/ogg', null,
+    1723000500000);
+
+  select recording_egress_started_at_ms into v_started_at_ms
+    from screening_v2.call_sessions where id = v_session_id;
+
+  insert into _policy_tests.results(test, passed, detail) values
+    ('T23: existing egress start is never clobbered',
+     (v_result ->> 'status' = 'ok') and v_started_at_ms = 1723000000000,
+     'status=' || coalesce(v_result ->> 'status', 'null')
+     || ' started_at_ms=' || coalesce(v_started_at_ms::text, 'null'));
+
+  delete from screening_v2.call_sessions where id = v_session_id;
+end;
+$$;
+
+-- ── T24: invalid egress-start values are rejected before any mutation ───
+do $$
+declare
+  v_candidate_id uuid;
+  v_session_id uuid;
+  v_result jsonb;
+  v_started_at_ms bigint;
+  v_case record;
+begin
+  select id into v_candidate_id from screening_v2.candidates limit 1;
+  if v_candidate_id is null then
+    insert into _policy_tests.results(test, passed, detail) values
+      ('T24: non-positive egress start rejected', true, 'skipped: no candidate row'),
+      ('T24: year-2100 boundary egress start rejected', true, 'skipped: no candidate row');
+    return;
+  end if;
+
+  for v_case in
+    select * from (values
+      ('non-positive', 0::bigint),
+      ('year-2100-boundary', 4102444800000::bigint)
+    ) as t(label, value_ms)
+  loop
+    v_session_id := _policy_tests.seed_repoint_session(
+      v_candidate_id, 'EG_polT24' || replace(v_case.label, '-', ''), 'policy-test-browser.webm',
+      false, false, false);
+
+    v_result := screening_v2.finalize_authoritative_recording(
+      v_session_id, v_session_id::text || '-egress.ogg', repeat('b', 64), 4096, 'audio/ogg', null,
+      v_case.value_ms);
+
+    select recording_egress_started_at_ms into v_started_at_ms
+      from screening_v2.call_sessions where id = v_session_id;
+
+    insert into _policy_tests.results(test, passed, detail) values
+      ('T24: ' || v_case.label || ' egress start rejected',
+       (v_result ->> 'status' = 'invalid_egress_start') and v_started_at_ms is null,
+       'status=' || coalesce(v_result ->> 'status', 'null')
+       || ' started_at_ms=' || coalesce(v_started_at_ms::text, 'null'));
+
+    delete from screening_v2.call_sessions where id = v_session_id;
+  end loop;
+end;
+$$;
+
+-- ── T25: idempotent re-call never mutates the timing anchor ─────────────
+do $$
+declare
+  v_candidate_id uuid;
+  v_session_id uuid;
+  v_result jsonb;
+  v_started_at_ms bigint;
+  v_events integer;
+begin
+  select id into v_candidate_id from screening_v2.candidates limit 1;
+  if v_candidate_id is null then
+    insert into _policy_tests.results(test, passed, detail) values
+      ('T25: idempotent re-call leaves timing anchor untouched', true, 'skipped: no candidate row');
+    return;
+  end if;
+
+  v_session_id := _policy_tests.seed_repoint_session(
+    v_candidate_id, 'EG_polT25', 'policy-test-browser.webm', false, false, false);
+
+  -- First call captures the anchor.
+  v_result := screening_v2.finalize_authoritative_recording(
+    v_session_id, v_session_id::text || '-egress.ogg', repeat('b', 64), 4096, 'audio/ogg', null,
+    1723000000000);
+
+  -- Second call with a DIFFERENT anchor must be idempotent (no mutation).
+  v_result := screening_v2.finalize_authoritative_recording(
+    v_session_id, v_session_id::text || '-egress.ogg', repeat('b', 64), 4096, 'audio/ogg', null,
+    1723000500000);
+
+  select recording_egress_started_at_ms into v_started_at_ms
+    from screening_v2.call_sessions where id = v_session_id;
+  select count(*) into v_events
+    from screening_v2.recording_integrity_events where session_id = v_session_id;
+
+  insert into _policy_tests.results(test, passed, detail) values
+    ('T25: idempotent re-call leaves timing anchor untouched',
+     (v_result ->> 'status' = 'already_authoritative')
+     and v_started_at_ms = 1723000000000
+     and v_events = 2,          -- original 'uploaded' + single 'repointed'
+     'status=' || coalesce(v_result ->> 'status', 'null')
+     || ' started_at_ms=' || coalesce(v_started_at_ms::text, 'null')
+     || ' events=' || v_events);
 
   delete from screening_v2.call_sessions where id = v_session_id;
 end;

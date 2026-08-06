@@ -660,6 +660,18 @@ function runSelfTests() {
     ]);
     check("P5 guarded trigger drop+recreate → not RED", reds.length === 0, `unexpected reds: ${JSON.stringify(reds.map((r) => r.rule))}`);
   }
+  {
+    // 0026 pattern: additive nullable column, guarded CHECK drop+recreate,
+    // guarded DROP FUNCTION of an old overload, CREATE OR REPLACE with a
+    // new DEFAULT final argument, then grants. All must stay non-RED.
+    const { reds, findings } = runScannerOn([
+      { name: "0001_base.sql", sql: "create table screening_v2.call_sessions (id uuid primary key); create table screening_v2.transcript_turns (id uuid primary key);" },
+      { name: "0025_finalizer.sql", sql: "create or replace function screening_v2.finalize_authoritative_recording(uuid,text,text,bigint,text,text) returns jsonb language plpgsql security definer set search_path = pg_catalog, screening_v2 as $$ begin return jsonb_build_object('status','ok'); end; $$; grant execute on function screening_v2.finalize_authoritative_recording(uuid,text,text,bigint,text,text) to service_role;" },
+      { name: "0026_timing.sql", sql: "alter table screening_v2.call_sessions add column if not exists recording_egress_started_at_ms bigint; alter table screening_v2.call_sessions drop constraint if exists chk_call_sessions_recording_egress_started_at_ms; alter table screening_v2.call_sessions add constraint chk_call_sessions_recording_egress_started_at_ms check (recording_egress_started_at_ms is null or (recording_egress_started_at_ms > 0 and recording_egress_started_at_ms < 4102444800000)) not valid; alter table screening_v2.call_sessions validate constraint chk_call_sessions_recording_egress_started_at_ms; alter table screening_v2.transcript_turns add column if not exists turn_started_at_ms bigint; drop function if exists screening_v2.finalize_authoritative_recording(uuid,text,text,bigint,text,text); create or replace function screening_v2.finalize_authoritative_recording(uuid,text,text,bigint,text,text,bigint default null) returns jsonb language plpgsql security definer set search_path = pg_catalog, screening_v2 as $$ begin return jsonb_build_object('status','ok'); end; $$; revoke all on function screening_v2.finalize_authoritative_recording(uuid,text,text,bigint,text,text,bigint) from public, anon, authenticated; grant execute on function screening_v2.finalize_authoritative_recording(uuid,text,text,bigint,text,text,bigint) to service_role;" },
+    ]);
+    check("P6 0026 pattern (timing columns + guarded overload replacement) → not RED", reds.length === 0, `unexpected reds: ${JSON.stringify(reds.map((r) => r.rule))}`);
+    check("P6 function replacement tracked as sanctioned", findings.some((f) => f.rule === "REPLACEABLE_DROP_FUNCTION") && findings.some((f) => f.rule === "CREATE_FUNCTION"), "expected REPLACEABLE_DROP_FUNCTION + CREATE_FUNCTION");
+  }
 
   return results;
 }

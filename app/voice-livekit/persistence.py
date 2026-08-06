@@ -22,6 +22,7 @@ Logging policy:
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import re
 from datetime import datetime, timezone
@@ -72,6 +73,11 @@ _client = None
 
 _DRAIN_TIMEOUT_SEC = int(os.getenv("LIVEKIT_WORKER_DRAIN_SEC", "10"))
 _MAX_DURATION_SEC = 86400
+# Timing-anchor epoch window — mirrors the 0026 CHECK constraints on
+# transcript_turns.turn_started_at_ms and
+# call_sessions.recording_egress_started_at_ms: NULL, or
+# 0 < v < 4102444800000 (year-2100 boundary, bigint milliseconds).
+_TURN_ANCHOR_MAX_MS = 4102444800000
 _UUID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
 )
@@ -360,16 +366,75 @@ def _cas_update(
 
 # ── Public lifecycle helpers ─────────────────────────────────────────
 
+def normalize_turn_anchor_ms(value: Any) -> Optional[int]:
+    """Normalise a wall-clock speech-start anchor (seconds) to validated ms.
+
+    Both ChatMessage.metrics.started_speaking_at and ChatMessage.created_at
+    are ``time.time()`` seconds-epoch floats. Returns bounded integer
+    milliseconds for ``transcript_turns.turn_started_at_ms``, or None when
+    the value is missing/invalid. Rejects bool (an int subclass), NaN/inf,
+    nonpositive values, and values at/over the year-2100 boundary — the same
+    window as the 0026 CHECK constraints — so a bad anchor can never violate
+    the DB constraint and crash a session. The value is never logged.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    try:
+        if not math.isfinite(float(value)):
+            return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if value <= 0:
+        return None
+    ms = int(round(value * 1000))
+    if ms <= 0 or ms >= _TURN_ANCHOR_MAX_MS:
+        return None
+    return ms
+
+
+def _sanitize_turn_started_at_ms(value: Any) -> Optional[int]:
+    """Defensive DB-boundary check: accept None or a plausible int-ms anchor.
+
+    The agent already normalises seconds-epoch anchors via
+    ``normalize_turn_anchor_ms``; this second guard ensures a future caller
+    can never pass a value that would violate the 0026 CHECK (bool, float,
+    NaN/inf, nonpositive, or at/over the year-2100 boundary) and crash a
+    session. Invalid values degrade to NULL — timing is best-effort, the
+    transcript write must not fail.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if not isinstance(value, int):
+        return None
+    if value <= 0 or value >= _TURN_ANCHOR_MAX_MS:
+        return None
+    return value
+
+
 async def save_turn(
-    session_id: Optional[str], turn_index: int, speaker: str, text: str
+    session_id: Optional[str],
+    turn_index: int,
+    speaker: str,
+    text: str,
+    turn_started_at_ms: Optional[int] = None,
 ) -> None:
     """Insert one transcript turn.
 
     Raises LifecycleError on persistence errors so tracked_write/drain
     can detect failures.  No-ops on missing session_id or empty text.
+
+    ``turn_started_at_ms`` is OPTIONAL (legacy callers omit it): the
+    validated millisecond speech-start anchor for the 0026 timing column.
+    Invalid values (bool, NaN/inf, nonpositive, out-of-range, non-int) are
+    defensively dropped to NULL before the write so the 0026 CHECK
+    constraint can never fire on a turn write and crash a session.
     """
     if not (session_id and text.strip()):
         return
+
+    anchor_ms = _sanitize_turn_started_at_ms(turn_started_at_ms)
 
     def run() -> None:
         try:
@@ -385,6 +450,7 @@ async def save_turn(
                     "turn_index": turn_index,
                     "speaker": speaker,
                     "text": text.strip(),
+                    "turn_started_at_ms": anchor_ms,
                 }
             ).execute()
         except Exception:  # noqa: BLE001

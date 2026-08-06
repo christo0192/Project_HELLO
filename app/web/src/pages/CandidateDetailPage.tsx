@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api, ApiError } from "../api";
-import type { AppealRow, CandidateDetail, Note, Session, TranscriptLine } from "../types";
+import type { AppealRow, CandidateDetail, Note } from "../types";
 import { Scorecard } from "../components/Scorecard";
 import { LiveCallPanel } from "../components/LiveCallPanel";
 import { LiveKitCallCard } from "../components/LiveKitCallCard";
 import { Button, Card, Chip, ErrorState, LoadingState } from "../components/ui";
 import { PageHeader, StatusBadge } from "../components/design";
-import { RecordingCard, Tabs, TranscriptList } from "../components/talent";
+import { RecordingCard, Tabs, TranscriptionSyncWorkspace } from "../components/talent";
 import {
   candidateStatusLabel,
   candidateStatusTone,
@@ -117,7 +117,7 @@ export function CandidateDetailPage() {
             id: "transcripts",
             label: "Transcript & Scorecards",
             panel: (
-              <TranscriptsTab
+              <TranscriptionSyncWorkspace
                 sessions={sessions}
                 assessments={assessments}
                 blocked={decisionBlocked}
@@ -294,125 +294,6 @@ function SessionsTab({ sessions }: { sessions: CandidateDetail["sessions"] }) {
         </Card>
       )}
     </div>
-  );
-}
-
-function TranscriptsTab({
-  sessions,
-  assessments,
-  blocked,
-}: {
-  sessions: CandidateDetail["sessions"];
-  assessments: CandidateDetail["assessments"];
-  blocked: boolean;
-}) {
-  const olderAssessments = assessments.slice(1);
-  return (
-    <div className="space-y-6">
-      <Card className="p-5">
-        <h2 className="mb-1 text-sm font-semibold text-ink">
-          Session transcripts
-        </h2>
-        <p className="mb-4 text-xs text-ink-tertiary">
-          Transcripts are loaded on demand per session. The API returns speaker
-          turns; timestamps are not part of the transcript contract.
-        </p>
-        {sessions.length === 0 ? (
-          <p className="text-sm text-ink-secondary">No screening sessions yet.</p>
-        ) : (
-          <ul className="divide-y divide-line">
-            {sessions.map((s) => (
-              <TranscriptCard key={s.id} session={s} />
-            ))}
-          </ul>
-        )}
-      </Card>
-
-      <Card className="p-5">
-        <h2 className="mb-3 text-sm font-semibold text-ink">Scorecards</h2>
-        {blocked ? (
-          <p className="text-sm text-ink-secondary">
-            Scorecards are suppressed while an appeal is under review. A human
-            reviewer will re-assess before any recommendation is used.
-          </p>
-        ) : olderAssessments.length === 0 ? (
-          <p className="text-sm text-ink-secondary">
-            {assessments.length > 0
-              ? "The latest scorecard is shown on the Overview tab. No older scorecards exist yet."
-              : "No scorecards yet — complete a screening to generate one."}
-          </p>
-        ) : (
-          <div className="space-y-6">
-            {olderAssessments.map((a) => (
-              <Scorecard key={a.id ?? a.overall_score} assessment={a} />
-            ))}
-          </div>
-        )}
-      </Card>
-    </div>
-  );
-}
-
-function TranscriptCard({ session }: { session: Session }) {
-  const [transcript, setTranscript] = useState<TranscriptLine[] | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  async function load() {
-    setLoading(true);
-    setError(null);
-    try {
-      const detail = await api.getSession(session.id);
-      setTranscript(detail.transcript);
-    } catch (e) {
-      setError(
-        (e as { message?: string }).message || "Failed to load transcript.",
-      );
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  return (
-    <li className="py-4">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <p className="text-sm font-medium text-ink">
-            Session {session.id.slice(0, 8)}
-          </p>
-          <p className="text-xs text-ink-tertiary">
-            {new Date(session.created_at).toLocaleString()}
-            {session.duration_sec
-              ? ` · ${formatDurationSec(session.duration_sec)}`
-              : ""}
-          </p>
-        </div>
-        {transcript === null && (
-          <Button
-            variant="secondary"
-            onClick={() => void load()}
-            loading={loading}
-          >
-            Load transcript
-          </Button>
-        )}
-      </div>
-      {error && (
-        <p role="alert" className="mt-2 text-sm text-error">
-          {error}
-        </p>
-      )}
-      {transcript !== null && (
-        <div className="mt-4">
-          <TranscriptList
-            transcript={transcript}
-            onRetry={() => {
-              setTranscript(null);
-            }}
-          />
-        </div>
-      )}
-    </li>
   );
 }
 

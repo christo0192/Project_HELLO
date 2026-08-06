@@ -184,6 +184,10 @@ sys.modules["dotenv"] = _mock_dotenv
 
 # Stub persistence + prompting for THIS module load only; restore afterwards so
 # the real modules stay available to the other test files.
+# The real persistence module is imported first so the anchor normaliser
+# (which agent._turn_anchor_ms calls through ``persistence.``) is bound to
+# the mock with its real implementation.
+import persistence as _real_persistence_module  # noqa: E402
 _orig_persistence = sys.modules.get("persistence")
 _orig_prompting = sys.modules.get("prompting")
 
@@ -194,6 +198,7 @@ persistence_mock.ClaimResult = SimpleNamespace(
     CLAIMED="claimed", ALREADY_MATCHING="already_matching",
     CONFLICT="conflict", MISSING="missing", ERROR="error",
 )
+persistence_mock.normalize_turn_anchor_ms = _real_persistence_module.normalize_turn_anchor_ms
 persistence_mock.set_session_provenance = AsyncMock(return_value="claimed")
 persistence_mock.resolve_worker_context = AsyncMock(return_value="context_not_found")
 sys.modules["persistence"] = persistence_mock
@@ -323,9 +328,13 @@ class FakeCloseEvent:
         self.reason = reason
 
 
-def _item(role: str, text: str, interrupted: bool = False) -> SimpleNamespace:
+def _item(role: str, text: str, interrupted: bool = False, created_at: Any = None, metrics: Any = None) -> SimpleNamespace:
     item = SimpleNamespace(
-        role=role, interrupted=interrupted, content=[SimpleNamespace(text=text)]
+        role=role,
+        interrupted=interrupted,
+        content=[SimpleNamespace(text=text)],
+        created_at=created_at,
+        metrics=metrics,
     )
     # SDK conversation_item_added events carry the item under ``.item``.
     return SimpleNamespace(item=item)
@@ -525,6 +534,36 @@ class TestTurnPersistenceInstrumented(unittest.TestCase):
         self.assertEqual(len(turn_hists), 1)
         self.assertEqual(turn_hists[0]["labels"], {"speaker": "bot"})
         persistence_mock.save_turn.assert_awaited_once()
+
+    def test_turn_anchor_primary_metrics_flows_to_save_turn(self) -> None:
+        items = (
+            _item("user", "hello", metrics={"started_speaking_at": 1723000000.25}, created_at=1723000009.0),
+            _item("assistant", "hi", created_at=1723000015.5),
+            _item("user", "last", metrics={"started_speaking_at": float("nan")}, created_at=1723000020.0),
+        )
+        _run_entrypoint(
+            close_event=FakeCloseEvent(reason=FakeCloseReason("completed")),
+            items=items,
+        )
+        calls = [c.kwargs for c in persistence_mock.save_turn.await_args_list]
+        # The three conversation items fire during start() and persist before
+        # the explicit opener (generated after start), all drained pre-CAS:
+        # primary metrics anchor, created_at fallback, invalid-primary fallback,
+        # then the no-item opener → NULL.
+        self.assertEqual(calls[0]["turn_started_at_ms"], 1723000000250)
+        self.assertEqual(calls[1]["turn_started_at_ms"], 1723000015500)
+        self.assertEqual(calls[2]["turn_started_at_ms"], 1723000020000)
+        self.assertIsNone(calls[3].get("turn_started_at_ms"))
+
+    def test_turn_anchor_missing_yields_null_kwarg(self) -> None:
+        items = (_item("user", "hello"),)
+        _run_entrypoint(
+            close_event=FakeCloseEvent(reason=FakeCloseReason("completed")),
+            items=items,
+        )
+        calls = [c.kwargs for c in persistence_mock.save_turn.await_args_list]
+        self.assertEqual(len(calls), 2)  # opener + item
+        self.assertTrue(all("turn_started_at_ms" in c and c["turn_started_at_ms"] is None for c in calls))
 
 
 # ---------------------------------------------------------------------------

@@ -19,6 +19,11 @@ export interface ParsedResume {
 export interface TranscriptTurn {
   speaker: 'bot' | 'candidate';
   text: string;
+  /** Seconds from the authoritative recording start to this turn's start.
+   *  Derived as max(0, turn_started_at_ms − recording_egress_started_at_ms) / 1000.
+   *  NULL when either anchor is missing (legacy rows, simulation sessions,
+   *  non-egress recordings). */
+  start_offset_sec?: number | null;
 }
 
 export interface LanguageProficiencyScore {
