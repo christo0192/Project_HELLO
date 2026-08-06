@@ -83,7 +83,6 @@ def _float_env(name: str, default: float) -> float:
 
 CANDIDATE_SILENCE_PROMPT_SEC = _float_env("CANDIDATE_SILENCE_PROMPT_SEC", 30.0)
 CANDIDATE_SILENCE_END_SEC = _float_env("CANDIDATE_SILENCE_END_SEC", 20.0)
-FINAL_GOODBYE_GRACE_SEC = _float_env("FINAL_GOODBYE_GRACE_SEC", 5.0)
 
 
 def _int_env(name: str, default: int) -> int:
@@ -205,7 +204,7 @@ class Gopu(Agent):
         super().__init__(instructions=instructions)
 
 
-_FINAL_GOODBYE_RE = re.compile(r"\b(?:goodbye|take care)\b", re.IGNORECASE)
+_FINAL_GOODBYE_RE = re.compile(r"\b(?:good\s*bye|bye|take care)\b", re.IGNORECASE)
 
 
 def _is_final_goodbye(text: str) -> bool:
@@ -216,15 +215,12 @@ def _is_final_goodbye(text: str) -> bool:
 async def _close_after_playout(
     speech_handle: Any,
     close_room_once: Callable[[], Any],
-    grace_sec: float,
 ) -> None:
-    """Wait for final speech playout, then apply the configured grace period."""
+    """Wait for final speech playout, then close the room immediately."""
     if speech_handle is not None:
         wait_for_playout = getattr(speech_handle, "wait_for_playout", None)
         if callable(wait_for_playout):
             await wait_for_playout()
-    if grace_sec > 0:
-        await asyncio.sleep(grace_sec)
     await close_room_once()
 
 
@@ -235,7 +231,6 @@ async def _silence_termination_loop(
     *,
     prompt_after_sec: float,
     end_after_sec: float,
-    grace_sec: float,
 ) -> None:
     """Prompt once per silent period, then speak a final goodbye and close.
 
@@ -267,7 +262,7 @@ async def _silence_termination_loop(
             "Looks like you're unavailable, so I'll end the screening here. Thanks for your time, and goodbye.",
             allow_interruptions=False,
         )
-        await _close_after_playout(goodbye_handle, close_room_once, grace_sec)
+        await _close_after_playout(goodbye_handle, close_room_once)
         return
 
 
@@ -731,7 +726,6 @@ async def _run_session(ctx: JobContext, started_at: float, session_id: Any, work
                         _close_after_playout(
                             speech_handle,
                             close_room_once,
-                            FINAL_GOODBYE_GRACE_SEC,
                         )
                     )
 
@@ -783,7 +777,6 @@ async def _run_session(ctx: JobContext, started_at: float, session_id: Any, work
                 close_room_once,
                 prompt_after_sec=CANDIDATE_SILENCE_PROMPT_SEC,
                 end_after_sec=CANDIDATE_SILENCE_END_SEC,
-                grace_sec=FINAL_GOODBYE_GRACE_SEC,
             )
         )
 

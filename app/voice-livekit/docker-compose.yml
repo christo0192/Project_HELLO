@@ -42,7 +42,6 @@ services:
       LIVEKIT_WORKER_DRAIN_SEC: ${LIVEKIT_WORKER_DRAIN_SEC:-10}
       CANDIDATE_SILENCE_PROMPT_SEC: ${CANDIDATE_SILENCE_PROMPT_SEC:-30}
       CANDIDATE_SILENCE_END_SEC: ${CANDIDATE_SILENCE_END_SEC:-20}
-      FINAL_GOODBYE_GRACE_SEC: ${FINAL_GOODBYE_GRACE_SEC:-5}
     # Worker connects outbound only (LiveKit WebSocket, Supabase, scoring API);
     # no published ports are required.
     # No probe is declared: the SDK worker exposes no HTTP readiness endpoint.

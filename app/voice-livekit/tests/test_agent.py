@@ -198,14 +198,17 @@ class _FakeTerminationSession:
 
 
 class TestTerminationHelpers(unittest.IsolatedAsyncioTestCase):
-    async def test_close_occurs_after_playout_and_grace(self):
+    async def test_close_occurs_immediately_after_playout_without_grace_sleep(self):
         log = []
 
         async def close():
             log.append("close")
 
-        await agent_mod._close_after_playout(_FakeSpeechHandle(log), close, 0)
+        with patch.object(agent_mod.asyncio, "sleep", new_callable=AsyncMock) as sleep:
+            await agent_mod._close_after_playout(_FakeSpeechHandle(log), close)
+
         self.assertEqual(log, ["playout", "close"])
+        sleep.assert_not_awaited()
 
     async def test_silence_prompts_then_says_goodbye_then_closes(self):
         log = []
@@ -219,7 +222,6 @@ class TestTerminationHelpers(unittest.IsolatedAsyncioTestCase):
             close,
             prompt_after_sec=0.001,
             end_after_sec=0.001,
-            grace_sec=0,
         )
         self.assertEqual(log, ["prompt", "playout", "goodbye", "playout", "close"])
 
@@ -233,7 +235,7 @@ class TestTerminationHelpers(unittest.IsolatedAsyncioTestCase):
         task = asyncio.create_task(
             agent_mod._silence_termination_loop(
                 _FakeTerminationSession(log), activity, close,
-                prompt_after_sec=0.05, end_after_sec=0.05, grace_sec=0,
+                prompt_after_sec=0.05, end_after_sec=0.05,
             )
         )
         await asyncio.sleep(0.005)
@@ -245,8 +247,14 @@ class TestTerminationHelpers(unittest.IsolatedAsyncioTestCase):
             await task
 
     def test_final_goodbye_marker_is_bounded(self):
-        self.assertTrue(agent_mod._is_final_goodbye("Thanks, and goodbye."))
-        self.assertTrue(agent_mod._is_final_goodbye("Take care!"))
+        for closing in (
+            "Thanks, and goodbye.",
+            "Thanks, and good bye.",
+            "Thanks, bye!",
+            "Take care!",
+        ):
+            with self.subTest(closing=closing):
+                self.assertTrue(agent_mod._is_final_goodbye(closing))
         self.assertFalse(agent_mod._is_final_goodbye("What would you like to ask?"))
 
 
