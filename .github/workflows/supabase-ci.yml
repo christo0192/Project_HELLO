@@ -119,6 +119,8 @@ jobs:
           PY
       - name: Phase 1 static security contract
         run: bash scripts/check-phase1-security-sql.sh
+      - name: Phase 1 static security contract — mutation self-tests
+        run: bash scripts/check-phase1-security-sql.test.sh
       - name: GOV-06 offline synthetic seed validation
         run: node scripts/check-synthetic-seed.mjs
       - name: GOV-06 mutation-based self-tests (zero network)

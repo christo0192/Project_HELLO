@@ -21,6 +21,22 @@
 
 import { describe, it, expect } from 'vitest';
 import request from 'supertest';
+import express from 'express';
+// Static imports: the helper below is called once per test, and re-importing
+// these dynamically each time made the first test in the file pay the whole
+// module-graph cost and time out under full-suite load.
+import {
+  createRequireAuth,
+  mockAuthGetUser,
+  normalizeEmailForAccess,
+  defaultAccessResolver,
+  deriveAalFromJwt,
+  type AccessResolver,
+  type AuthUser,
+  type TokenVerifier,
+} from '../lib/auth.js';
+import { requireRole } from '../lib/rbac.js';
+import { finalErrorHandler } from '../lib/validation.js';
 
 // ── Synthetic JWTs (unsigned; the verifier is always injected) ────────
 
@@ -42,7 +58,7 @@ const SYNTHETIC_EMAIL = 'synthetic.user@interviewkickstart.com';
 
 type Role = 'admin' | 'interviewer' | 'viewer';
 
-function syntheticAuthUser(appRole: Role, aal = 'aal1') {
+function syntheticAuthUser(appRole: Role, aal = 'aal1'): AuthUser {
   return {
     id: SYNTHETIC_USER_ID,
     email: SYNTHETIC_EMAIL,
@@ -51,7 +67,7 @@ function syntheticAuthUser(appRole: Role, aal = 'aal1') {
     appRole,
     orgId: null,
     emailVerified: true,
-  } as import('../lib/auth.js').AuthUser;
+  };
 }
 
 /**
@@ -59,44 +75,39 @@ function syntheticAuthUser(appRole: Role, aal = 'aal1') {
  * verifier and allowlist resolver. `GET /api/whoami` echoes the SERVER-HELD
  * role so tests can prove the role came from the resolver, not the client.
  */
-async function createGateApp(opts: {
-  resolveAccess?: import('../lib/auth.js').AccessResolver;
-  getUser?: import('../lib/auth.js').TokenVerifier;
-  user?: import('../lib/auth.js').AuthUser;
+function createGateApp(opts: {
+  resolveAccess?: AccessResolver;
+  getUser?: TokenVerifier;
+  user?: AuthUser;
   token?: string;
 }) {
-  const authMod = await import('../lib/auth.js');
-  const rbacMod = await import('../lib/rbac.js');
-  const validationMod = await import('../lib/validation.js');
-  const { default: express } = await import('express');
-
   const user = opts.user ?? syntheticAuthUser('admin');
   const token = opts.token ?? JWT_AAL1;
 
   const app = express();
   app.use(express.json());
   app.use(
-    authMod.createRequireAuth({
-      getUser: opts.getUser ?? authMod.mockAuthGetUser(user, token),
+    createRequireAuth({
+      getUser: opts.getUser ?? mockAuthGetUser(user, token),
       resolveAccess: opts.resolveAccess,
     }),
   );
   app.get('/api/whoami', (req: any, res: any) =>
     res.json({ role: req.authUser?.appRole, aal: req.authUser?.aal }),
   );
-  app.post('/api/admin-only', rbacMod.requireRole('admin'), (_req: any, res: any) =>
+  app.post('/api/admin-only', requireRole('admin'), (_req: any, res: any) =>
     res.json({ ok: true }),
   );
-  app.post('/api/interviewer-only', rbacMod.requireRole('interviewer'), (_req: any, res: any) =>
+  app.post('/api/interviewer-only', requireRole('interviewer'), (_req: any, res: any) =>
     res.json({ ok: true }),
   );
-  app.use(validationMod.finalErrorHandler);
+  app.use(finalErrorHandler);
   return app;
 }
 
-const ALLOW = (role: Role): import('../lib/auth.js').AccessResolver =>
+const ALLOW = (role: Role): AccessResolver =>
   async () => ({ ok: true, role, active: true });
-const DENY: import('../lib/auth.js').AccessResolver = async () => ({
+const DENY: AccessResolver = async () => ({
   ok: false,
   status: 403,
 });
@@ -314,7 +325,6 @@ describe('ADR-0011: domain match alone never authorizes', () => {
   });
 
   it('normalizeEmailForAccess still rejects near-miss domains', async () => {
-    const { normalizeEmailForAccess } = await import('../lib/auth.js');
     expect(normalizeEmailForAccess('a@interviewkickstart.com.evil.test')).toBeNull();
     expect(normalizeEmailForAccess('a@sub.interviewkickstart.com')).toBeNull();
     expect(normalizeEmailForAccess('a@gmail.com')).toBeNull();
@@ -341,7 +351,6 @@ describe('ADR-0011: domain match alone never authorizes', () => {
   });
 
   it('defaultAccessResolver denies an UNVERIFIED email before any DB call', async () => {
-    const { defaultAccessResolver } = await import('../lib/auth.js');
     // emailVerified=false must short-circuit to 403 without touching the
     // Supabase client (which is unset in this test process).
     await expect(
@@ -350,7 +359,6 @@ describe('ADR-0011: domain match alone never authorizes', () => {
   });
 
   it('defaultAccessResolver denies a non-company domain before any DB call', async () => {
-    const { defaultAccessResolver } = await import('../lib/auth.js');
     await expect(
       defaultAccessResolver(SYNTHETIC_USER_ID, 'someone@gmail.com', true),
     ).resolves.toEqual({ ok: false, status: 403 });
