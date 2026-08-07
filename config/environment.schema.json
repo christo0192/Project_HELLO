@@ -97,6 +97,8 @@
         "API_BASE": { "requiredInProduction": true, "secret": false },
         "WORKER_CONTEXT_SECRET": { "requiredInProduction": true, "secret": true },
         "WORKER_CONTEXT_TIMEOUT_SEC": { "requiredInProduction": false, "secret": false },
+        "WORKER_CONTEXT_RESOLVE_ATTEMPTS": { "requiredInProduction": false, "secret": false },
+        "WORKER_CONTEXT_RESOLVE_BACKOFF_SEC": { "requiredInProduction": false, "secret": false },
         "SCORING_BREAKER_THRESHOLD": { "requiredInProduction": false, "secret": false },
         "SCORING_BREAKER_COOLDOWN_SEC": { "requiredInProduction": false, "secret": false },
         "SCORING_BREAKER_TIMEOUT_SEC": { "requiredInProduction": false, "secret": false },

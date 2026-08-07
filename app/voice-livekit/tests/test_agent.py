@@ -561,5 +561,72 @@ class TestFinalizerTracking(unittest.TestCase):
         asyncio.run(_test())
 
 
+class TestWorkerContextResolveRetry(unittest.IsolatedAsyncioTestCase):
+    """_resolve_worker_context_with_retry: bounded retry, then fail closed.
+
+    A transient worker-context failure (API cold start / DB blip) must not
+    permanently abandon a valid call — it is retried before giving up — while a
+    genuinely-unresolvable session still fails closed after the attempts.
+    """
+
+    class _WC:  # real stand-in type so isinstance(...) works under the mock
+        pass
+
+    def setUp(self):
+        self._wc_patch = patch.object(agent_mod, "WorkerContext", self._WC)
+        self._wc_patch.start()
+
+    def tearDown(self):
+        self._wc_patch.stop()
+
+    async def test_retries_transient_failures_then_succeeds(self):
+        wc = self._WC()
+        agent_mod.persistence.resolve_worker_context = AsyncMock(
+            side_effect=["context_api_error", "context_not_found", wc]
+        )
+        result = await agent_mod._resolve_worker_context_with_retry(
+            "sid", "screening-room", attempts=3, backoff_sec=0.0
+        )
+        self.assertIs(result, wc)
+        self.assertEqual(
+            agent_mod.persistence.resolve_worker_context.await_count, 3
+        )
+
+    async def test_fails_closed_after_exhausting_attempts(self):
+        agent_mod.persistence.resolve_worker_context = AsyncMock(
+            return_value="context_not_found"
+        )
+        result = await agent_mod._resolve_worker_context_with_retry(
+            "sid", "screening-room", attempts=3, backoff_sec=0.0
+        )
+        self.assertEqual(result, "context_not_found")
+        self.assertEqual(
+            agent_mod.persistence.resolve_worker_context.await_count, 3
+        )
+
+    async def test_single_attempt_does_not_retry(self):
+        agent_mod.persistence.resolve_worker_context = AsyncMock(
+            return_value="context_api_error"
+        )
+        result = await agent_mod._resolve_worker_context_with_retry(
+            "sid", "screening-room", attempts=1, backoff_sec=0.0
+        )
+        self.assertEqual(result, "context_api_error")
+        self.assertEqual(
+            agent_mod.persistence.resolve_worker_context.await_count, 1
+        )
+
+    async def test_succeeds_on_first_attempt_without_retry(self):
+        wc = self._WC()
+        agent_mod.persistence.resolve_worker_context = AsyncMock(return_value=wc)
+        result = await agent_mod._resolve_worker_context_with_retry(
+            "sid", "screening-room", attempts=3, backoff_sec=0.0
+        )
+        self.assertIs(result, wc)
+        self.assertEqual(
+            agent_mod.persistence.resolve_worker_context.await_count, 1
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
