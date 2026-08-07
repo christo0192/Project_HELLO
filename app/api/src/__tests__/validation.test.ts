@@ -120,6 +120,7 @@ function chainable(value: any): any {
   fn.catch = (reject: (e: any) => any) => Promise.resolve(value).catch(reject);
   // Passthrough methods that routes call: .eq(), .order(), .limit(), .single(), .maybeSingle()
   fn.eq = () => chainable(value);
+  fn.in = () => chainable(value);
   fn.order = () => chainable(value);
   fn.limit = () => chainable(value);
   fn.select = () => chainable(value);

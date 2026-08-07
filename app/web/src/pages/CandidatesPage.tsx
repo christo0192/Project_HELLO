@@ -1,32 +1,79 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+/**
+ * Candidates — recruiter pipeline list with URL-addressable drill-down filters.
+ *
+ * The dashboard links here with `?status=…&role=…`; those filters are parsed
+ * from the URL (via `useSearchParams`) so deep links and browser back/forward
+ * work, and are shown as removable chips. Status is filtered client-side (the
+ * list API only filters by role); role is passed to the API. Every row's name
+ * is a real keyboard-reachable link to the candidate workspace, and a
+ * "Next action" column makes the obvious next step explicit.
+ */
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api";
 import type { Candidate, Role } from "../types";
+import type { CandidateFilters } from "../components/talent";
 import {
   Button,
-  Card,
-  Chip,
   EmptyState,
   ErrorState,
   Label,
   LoadingState,
-  PageHeader,
   Select,
   Spinner,
 } from "../components/ui";
+import { PageHeader } from "../components/design";
+import {
+  Table,
+  THead,
+  TBody,
+  Tr,
+  Th,
+  Td,
+  StatusBadge,
+} from "../components/design";
+import {
+  buildCandidateSearch,
+  candidateNextAction,
+  candidateStatusLabel,
+  candidateStatusTone,
+  CANDIDATE_STATUS_ORDER,
+  hasActiveFilters,
+  matchesCandidateFilters,
+  normalizeStatus,
+  parseCandidateFilters,
+  recommendationLabel,
+  RECOMMENDATION_ORDER,
+} from "../components/talent";
+import type { StatusTone } from "../components/design/StatusBadge";
+
+const RECOMMENDATION_TONE: Record<string, StatusTone> = {
+  advance: "success",
+  hold: "warning",
+  reject: "danger",
+};
+
+// Statuses offered as quick toggles (consent_declined stays URL-only/terminal).
+const FILTERABLE_STATUSES = CANDIDATE_STATUS_ORDER.filter(
+  (s) => s !== "consent_declined",
+);
 
 export function CandidatesPage() {
-  const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const filters = parseCandidateFilters(searchParams);
+  const filterKey = buildCandidateSearch(filters).toString();
+  const { roleId } = filters;
+
   const [roles, setRoles] = useState<Role[]>([]);
   const [candidates, setCandidates] = useState<Candidate[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [filterRole, setFilterRole] = useState<string>("");
 
-  const loadCandidates = useCallback((roleId: string) => {
+  const loadCandidates = useCallback((role: string | null) => {
     setError(null);
     setCandidates(null);
     api
-      .listCandidates(roleId || undefined)
+      .listCandidates(role || undefined)
       .then(setCandidates)
       .catch((e: ApiError) => setError(e.message));
   }, []);
@@ -36,119 +83,375 @@ export function CandidatesPage() {
   }, []);
 
   useEffect(() => {
-    loadCandidates(filterRole);
-  }, [filterRole, loadCandidates]);
+    loadCandidates(roleId);
+  }, [roleId, loadCandidates]);
+
+  // Every mutation rebuilds the full filter set from the current URL so no
+  // dimension (status / recommendation / assessed / role) is dropped.
+  const applyFilters = useCallback(
+    (next: Partial<CandidateFilters>) => {
+      setSearchParams(buildCandidateSearch({ ...filters, ...next }));
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [filterKey, setSearchParams],
+  );
+
+  const toggleFromList = (list: string[], value: string) =>
+    list.includes(value) ? list.filter((v) => v !== value) : [...list, value];
+
+  const toggleStatus = useCallback(
+    (status: string) => applyFilters({ statuses: toggleFromList(filters.statuses, status) }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [filterKey, applyFilters],
+  );
+
+  const toggleRecommendation = useCallback(
+    (rec: string) =>
+      applyFilters({ recommendations: toggleFromList(filters.recommendations, rec) }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [filterKey, applyFilters],
+  );
+
+  const setRole = useCallback(
+    (nextRole: string) => applyFilters({ roleId: nextRole || null }),
+    [applyFilters],
+  );
+
+  const clearFilters = useCallback(() => {
+    setSearchParams(new URLSearchParams());
+  }, [setSearchParams]);
+
+  const visible = useMemo(
+    () => (candidates ?? []).filter((c) => matchesCandidateFilters(c, filters)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [candidates, filterKey],
+  );
+
+  const active = hasActiveFilters(filters);
+  const roleTitle = roles.find((r) => r.id === roleId)?.title;
+
+  // Live count per status from the currently loaded (role-scoped) set.
+  const statusCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const c of candidates ?? []) {
+      const key = normalizeStatus(c.status);
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    return counts;
+  }, [candidates]);
+
+  // Live count per recommendation from the currently loaded set.
+  const recommendationCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const c of candidates ?? []) {
+      if (c.latest_recommendation) {
+        counts.set(
+          c.latest_recommendation,
+          (counts.get(c.latest_recommendation) ?? 0) + 1,
+        );
+      }
+    }
+    return counts;
+  }, [candidates]);
 
   return (
     <div>
       <PageHeader
+        eyebrow="Talent workspace"
         title="Candidates"
-        description="Upload resumes, review parsed profiles, and launch screenings."
+        description="Upload resumes, review parsed profiles, and move candidates through screening."
       />
 
-      <UploadCard
-        roles={roles}
-        onUploaded={() => loadCandidates(filterRole)}
-      />
-
-      <div className="mb-4 mt-8 flex items-center justify-between gap-4">
-        <h2 className="text-sm font-semibold text-gray-900">All candidates</h2>
-        {roles.length > 0 && (
-          <div className="w-56">
-            <Select
-              value={filterRole}
-              onChange={(e) => setFilterRole(e.target.value)}
-              aria-label="Filter by role"
-            >
-              <option value="">All roles</option>
-              {roles.map((r) => (
-                <option key={r.id} value={r.id}>
-                  {r.title}
-                </option>
-              ))}
-            </Select>
-          </div>
-        )}
+      <div className="mt-6">
+        <UploadCard roles={roles} onUploaded={() => loadCandidates(roleId)} />
       </div>
 
-      {error && (
-        <ErrorState message={error} onRetry={() => loadCandidates(filterRole)} />
-      )}
-      {!error && candidates === null && (
-        <LoadingState label="Loading candidates…" />
-      )}
-      {!error && candidates !== null && candidates.length === 0 && (
-        <EmptyState
-          title="No candidates yet"
-          hint="Upload a resume above to parse a candidate and add them here."
-        />
-      )}
+      {/* Filter bar */}
+      <section aria-label="Filters" className="mt-8">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h2 className="text-sm font-semibold text-ink">
+            All candidates
+            {candidates && (
+              <span className="ml-2 font-normal text-ink-tertiary">
+                {active
+                  ? `${visible.length} of ${candidates.length}`
+                  : candidates.length}
+              </span>
+            )}
+          </h2>
+          {roles.length > 0 && (
+            <div className="w-56">
+              <label htmlFor="role-filter" className="sr-only">
+                Filter by role
+              </label>
+              <Select
+                id="role-filter"
+                value={roleId ?? ""}
+                onChange={(e) => setRole(e.target.value)}
+                aria-label="Filter by role"
+              >
+                <option value="">All roles</option>
+                {roles.map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {r.title}
+                  </option>
+                ))}
+              </Select>
+            </div>
+          )}
+        </div>
 
-      {candidates && candidates.length > 0 && (
-        <Card className="overflow-hidden">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-gray-200 bg-gray-50/60 text-left text-xs uppercase tracking-wide text-gray-500">
-                <th className="px-4 py-3 font-medium">Name</th>
-                <th className="px-4 py-3 font-medium">Phone</th>
-                <th className="px-4 py-3 font-medium">Skills</th>
-                <th className="px-4 py-3 font-medium">Exp.</th>
-                <th className="px-4 py-3 font-medium">Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              {candidates.map((c) => (
-                <tr
-                  key={c.id}
-                  onClick={() => navigate(`/candidates/${c.id}`)}
-                  className="cursor-pointer border-b border-gray-100 last:border-0 hover:bg-accent-50/40"
-                >
-                  <td className="px-4 py-3">
-                    <p className="font-medium text-gray-900">
-                      {c.name || "Unnamed"}
-                    </p>
-                    {c.email && (
-                      <p className="text-xs text-gray-400">{c.email}</p>
-                    )}
-                  </td>
-                  <td className="px-4 py-3">
-                    {c.phone_e164 ? (
-                      <span className="flex items-center gap-1.5">
-                        <span className="text-gray-700">{c.phone_e164}</span>
-                        {!c.phone_valid && <Chip tone="red">invalid</Chip>}
-                      </span>
-                    ) : (
-                      <span className="text-gray-400">—</span>
-                    )}
-                  </td>
-                  <td className="px-4 py-3">
-                    <div className="flex max-w-xs flex-wrap gap-1">
-                      {c.skills.slice(0, 4).map((s) => (
-                        <Chip key={s}>{s}</Chip>
-                      ))}
-                      {c.skills.length > 4 && (
-                        <Chip>+{c.skills.length - 4}</Chip>
-                      )}
-                      {c.skills.length === 0 && (
-                        <span className="text-gray-400">—</span>
-                      )}
-                    </div>
-                  </td>
-                  <td className="px-4 py-3 text-gray-700">
-                    {c.experience_years != null
-                      ? `${c.experience_years} yr`
-                      : "—"}
-                  </td>
-                  <td className="px-4 py-3">
-                    <Chip>{c.status || "new"}</Chip>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </Card>
-      )}
+        {/* Status toggles */}
+        <div className="mt-3 flex flex-wrap gap-2" role="group" aria-label="Filter by status">
+          {FILTERABLE_STATUSES.map((status) => {
+            const selected = filters.statuses.includes(status);
+            const count = statusCounts.get(status) ?? 0;
+            return (
+              <button
+                key={status}
+                type="button"
+                onClick={() => toggleStatus(status)}
+                aria-pressed={selected}
+                className={[
+                  "inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors",
+                  "focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500",
+                  selected
+                    ? "border-brand-500 bg-brand-50 text-brand-700 dark:bg-brand-950 dark:text-brand-300"
+                    : "border-line bg-surface text-ink-secondary hover:bg-surface-tertiary hover:text-ink",
+                ].join(" ")}
+              >
+                {candidateStatusLabel(status)}
+                {candidates && (
+                  <span className="tabular-nums text-ink-tertiary">{count}</span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Recommendation toggles */}
+        <div
+          className="mt-2 flex flex-wrap items-center gap-2"
+          role="group"
+          aria-label="Filter by recommendation"
+        >
+          <span className="text-xs font-medium text-ink-tertiary">Recommendation:</span>
+          {RECOMMENDATION_ORDER.map((rec) => {
+            const selected = filters.recommendations.includes(rec);
+            const count = recommendationCounts.get(rec) ?? 0;
+            return (
+              <button
+                key={rec}
+                type="button"
+                onClick={() => toggleRecommendation(rec)}
+                aria-pressed={selected}
+                className={[
+                  "inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors",
+                  "focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500",
+                  selected
+                    ? "border-brand-500 bg-brand-50 text-brand-700 dark:bg-brand-950 dark:text-brand-300"
+                    : "border-line bg-surface text-ink-secondary hover:bg-surface-tertiary hover:text-ink",
+                ].join(" ")}
+              >
+                {recommendationLabel(rec)}
+                {candidates && (
+                  <span className="tabular-nums text-ink-tertiary">{count}</span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Active-filter summary */}
+        {active && (
+          <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-ink-secondary">
+            <span className="font-medium">Active filters:</span>
+            {roleTitle && (
+              <FilterChip
+                label={`Role: ${roleTitle}`}
+                onRemove={() => setRole("")}
+              />
+            )}
+            {filters.statuses.map((s) => (
+              <FilterChip
+                key={s}
+                label={candidateStatusLabel(s)}
+                onRemove={() => toggleStatus(s)}
+              />
+            ))}
+            {filters.recommendations.map((r) => (
+              <FilterChip
+                key={r}
+                label={`Rec: ${recommendationLabel(r)}`}
+                onRemove={() => toggleRecommendation(r)}
+              />
+            ))}
+            {filters.assessed && (
+              <FilterChip
+                label="Assessed"
+                onRemove={() => applyFilters({ assessed: false })}
+              />
+            )}
+            <button
+              type="button"
+              onClick={clearFilters}
+              className="rounded px-1.5 py-0.5 font-medium text-brand-700 underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:text-brand-300"
+            >
+              Clear all
+            </button>
+          </div>
+        )}
+      </section>
+
+      {/* Body states */}
+      <div className="mt-4">
+        {error && (
+          <ErrorState message={error} onRetry={() => loadCandidates(roleId)} />
+        )}
+        {!error && candidates === null && (
+          <LoadingState label="Loading candidates…" />
+        )}
+        {!error && candidates !== null && candidates.length === 0 && (
+          <EmptyState
+            title="No candidates yet"
+            hint="Upload a resume above to parse a candidate and add them here."
+          />
+        )}
+        {!error &&
+          candidates !== null &&
+          candidates.length > 0 &&
+          visible.length === 0 && (
+            <div className="rounded-xl border border-dashed border-line-strong bg-surface-secondary p-8 text-center">
+              <p className="text-sm font-medium text-ink-secondary">
+                No candidates match these filters
+              </p>
+              <button
+                type="button"
+                onClick={clearFilters}
+                className="mt-2 text-xs font-medium text-brand-700 hover:text-brand-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:text-brand-300"
+              >
+                Clear filters
+              </button>
+            </div>
+          )}
+
+        {!error && visible.length > 0 && (
+          <Table caption="Candidates in your pipeline">
+              <THead>
+                <Tr>
+                  <Th>Name</Th>
+                  <Th>Skills</Th>
+                  <Th>Exp.</Th>
+                  <Th>Status</Th>
+                  <Th>Recommendation</Th>
+                  <Th>Next action</Th>
+                </Tr>
+              </THead>
+              <TBody>
+                {visible.map((c) => {
+                  const next = candidateNextAction(c.status);
+                  return (
+                    <Tr key={c.id}>
+                      <Td>
+                        <Link
+                          to={`/candidates/${c.id}`}
+                          className="font-medium text-brand-700 hover:text-brand-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:text-brand-300"
+                        >
+                          {c.name || "Unnamed"}
+                        </Link>
+                        {c.email && (
+                          <p className="text-xs text-ink-tertiary">{c.email}</p>
+                        )}
+                      </Td>
+                      <Td>
+                        <div className="flex max-w-xs flex-wrap gap-1">
+                          {c.skills.slice(0, 4).map((s) => (
+                            <span
+                              key={s}
+                              className="inline-flex items-center rounded-md bg-surface-tertiary px-2 py-0.5 text-xs font-medium text-ink-secondary"
+                            >
+                              {s}
+                            </span>
+                          ))}
+                          {c.skills.length > 4 && (
+                            <span className="text-xs text-ink-tertiary">
+                              +{c.skills.length - 4}
+                            </span>
+                          )}
+                          {c.skills.length === 0 && (
+                            <span className="text-ink-tertiary">—</span>
+                          )}
+                        </div>
+                      </Td>
+                      <Td className="tabular-nums text-ink-secondary">
+                        {c.experience_years != null
+                          ? `${c.experience_years} yr`
+                          : "—"}
+                      </Td>
+                      <Td>
+                        <StatusBadge tone={candidateStatusTone(c.status)}>
+                          {candidateStatusLabel(c.status)}
+                        </StatusBadge>
+                      </Td>
+                      <Td>
+                        {c.latest_recommendation ? (
+                          <span className="inline-flex items-center gap-1.5">
+                            <StatusBadge
+                              tone={RECOMMENDATION_TONE[c.latest_recommendation] ?? "neutral"}
+                            >
+                              {recommendationLabel(c.latest_recommendation)}
+                            </StatusBadge>
+                            {c.latest_score != null && (
+                              <span className="text-xs tabular-nums text-ink-tertiary">
+                                {c.latest_score}
+                              </span>
+                            )}
+                          </span>
+                        ) : (
+                          <span className="text-ink-tertiary">—</span>
+                        )}
+                      </Td>
+                      <Td>
+                        <span
+                          className={
+                            next.emphasis
+                              ? "text-sm font-medium text-brand-700 dark:text-brand-300"
+                              : "text-sm text-ink-secondary"
+                          }
+                        >
+                          {next.label}
+                        </span>
+                      </Td>
+                    </Tr>
+                  );
+                })}
+              </TBody>
+            </Table>
+        )}
+      </div>
     </div>
+  );
+}
+
+function FilterChip({
+  label,
+  onRemove,
+}: {
+  label: string;
+  onRemove: () => void;
+}) {
+  return (
+    <span className="inline-flex items-center gap-1 rounded-full bg-surface-tertiary px-2 py-0.5 text-xs text-ink">
+      {label}
+      <button
+        type="button"
+        onClick={onRemove}
+        aria-label={`Remove filter ${label}`}
+        className="rounded-full px-0.5 text-ink-tertiary hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
+      >
+        ×
+      </button>
+    </span>
   );
 }
 
@@ -185,11 +488,9 @@ function UploadCard({
   }
 
   return (
-    <Card className="p-5">
-      <h2 className="mb-1 text-sm font-semibold text-gray-900">
-        Upload a resume
-      </h2>
-      <p className="mb-4 text-sm text-gray-500">
+    <div className="rounded-xl border border-line bg-surface p-5 shadow-card">
+      <h2 className="mb-1 text-sm font-semibold text-ink">Upload a resume</h2>
+      <p className="mb-4 text-sm text-ink-secondary">
         PDF or DOCX. Parsing runs an LLM and can take 10–20 seconds.
       </p>
 
@@ -207,7 +508,7 @@ function UploadCard({
               setError(null);
             }}
             disabled={uploading}
-            className="block w-full text-sm text-gray-600 file:mr-3 file:rounded-lg file:border-0 file:bg-accent-50 file:px-3 file:py-2 file:text-sm file:font-medium file:text-accent-700 hover:file:bg-accent-100 disabled:opacity-60"
+            className="block w-full text-sm text-ink-secondary file:mr-3 file:rounded-lg file:border-0 file:bg-brand-50 file:px-3 file:py-2 file:text-sm file:font-medium file:text-brand-700 hover:file:bg-brand-100 disabled:opacity-60 dark:file:bg-brand-950 dark:file:text-brand-300"
           />
         </div>
         <div>
@@ -233,18 +534,18 @@ function UploadCard({
           {uploading ? "Parsing…" : "Upload & Parse"}
         </Button>
         {uploading && (
-          <span className="flex items-center gap-2 text-sm text-gray-500">
-            <Spinner className="h-4 w-4 text-accent-500" />
+          <span className="flex items-center gap-2 text-sm text-ink-secondary">
+            <Spinner className="h-4 w-4 text-brand-500" />
             Extracting and parsing with the LLM…
           </span>
         )}
         {success && !uploading && (
-          <span className="text-sm text-emerald-600">{success}</span>
+          <span className="text-sm text-success">{success}</span>
         )}
         {error && !uploading && (
-          <span className="text-sm text-red-600">{error}</span>
+          <span className="text-sm text-error">{error}</span>
         )}
       </div>
-    </Card>
+    </div>
   );
 }

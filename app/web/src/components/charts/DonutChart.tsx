@@ -1,5 +1,6 @@
 import type { EChartsInstance } from 'echarts-for-react/lib/types';
 import { useEffect, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import type { EChartsOption } from 'echarts';
 import { useReducedMotion } from '../../lib/motion';
 import { useTheme } from '../../lib/theme';
@@ -15,6 +16,12 @@ import { chartTheme } from './theme';
 export interface DonutChartDatum {
   label: string;
   value: number;
+  /**
+   * Optional drill-down target. When present the legend entry becomes a real
+   * router link and the matching slice becomes clickable, so the segment
+   * navigates to a filtered destination (accessible via the legend link).
+   */
+  href?: string;
 }
 
 export interface DonutChartProps {
@@ -28,6 +35,11 @@ export interface DonutChartProps {
   height?: number;
   /** Overridden to 'svg' in tests (jsdom has no canvas). */
   renderer?: 'canvas' | 'svg';
+  /**
+   * Called with the datum index when a slice is clicked (mouse convenience;
+   * keyboard/AT users use the accessible legend links instead).
+   */
+  onSegmentSelect?: (index: number) => void;
 }
 
 /**
@@ -46,12 +58,15 @@ export function DonutChart({
   className,
   height = 260,
   renderer = 'canvas',
+  onSegmentSelect,
 }: DonutChartProps) {
   const { theme } = useTheme();
   const reduced = useReducedMotion();
   const { palette, base } = chartTheme(theme, reduced);
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const instanceRef = useRef<EChartsInstance | null>(null);
+  const onSegmentSelectRef = useRef(onSegmentSelect);
+  onSegmentSelectRef.current = onSegmentSelect;
 
   // Legend hover-dim: dim all slices, then highlight the hovered one.
   useEffect(() => {
@@ -127,32 +142,61 @@ export function DonutChart({
             renderer={renderer}
             onChartReady={(instance) => {
               instanceRef.current = instance;
+              instance.off('click');
+              instance.on('click', (params: { dataIndex?: number }) => {
+                if (typeof params.dataIndex === 'number') {
+                  onSegmentSelectRef.current?.(params.dataIndex);
+                }
+              });
             }}
           />
         </ChartReveal>
         <LegendHoverProvider hoveredIndex={hoveredIndex} onHoverChange={setHoveredIndex}>
           <ul className="mt-3 flex flex-wrap gap-x-4 gap-y-1.5">
-            {data.map((d, index) => (
-              <li key={d.label}>
-                <button
-                  type="button"
-                  onMouseEnter={() => setHoveredIndex(index)}
-                  onMouseLeave={() => setHoveredIndex(null)}
-                  onFocus={() => setHoveredIndex(index)}
-                  onBlur={() => setHoveredIndex(null)}
-                  aria-pressed={hoveredIndex === index}
-                  className="flex items-center gap-1.5 rounded px-1 py-0.5 text-xs text-ink-secondary transition-colors hover:text-ink"
-                >
-                  <span
-                    aria-hidden="true"
-                    className="h-2 w-2 shrink-0 rounded-sm"
-                    style={{ backgroundColor: palette.colors[index % palette.colors.length] }}
-                  />
-                  <span>{d.label}</span>
-                  <span className="tabular-nums text-ink-tertiary">{d.value}</span>
-                </button>
-              </li>
-            ))}
+            {data.map((d, index) => {
+              const swatch = (
+                <span
+                  aria-hidden="true"
+                  className="h-2 w-2 shrink-0 rounded-sm"
+                  style={{ backgroundColor: palette.colors[index % palette.colors.length] }}
+                />
+              );
+              const hoverProps = {
+                onMouseEnter: () => setHoveredIndex(index),
+                onMouseLeave: () => setHoveredIndex(null),
+                onFocus: () => setHoveredIndex(index),
+                onBlur: () => setHoveredIndex(null),
+              };
+              const itemClass =
+                'flex items-center gap-1.5 rounded px-1 py-0.5 text-xs text-ink-secondary transition-colors hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500';
+              return (
+                <li key={d.label}>
+                  {d.href ? (
+                    <Link
+                      to={d.href}
+                      {...hoverProps}
+                      className={itemClass}
+                      aria-label={`${d.label}: ${d.value}. View these candidates.`}
+                    >
+                      {swatch}
+                      <span>{d.label}</span>
+                      <span className="tabular-nums text-ink-tertiary">{d.value}</span>
+                    </Link>
+                  ) : (
+                    <button
+                      type="button"
+                      {...hoverProps}
+                      aria-pressed={hoveredIndex === index}
+                      className={itemClass}
+                    >
+                      {swatch}
+                      <span>{d.label}</span>
+                      <span className="tabular-nums text-ink-tertiary">{d.value}</span>
+                    </button>
+                  )}
+                </li>
+              );
+            })}
           </ul>
         </LegendHoverProvider>
       </div>

@@ -1,32 +1,36 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api, ApiError } from "../api";
-import type { AppealRow, CandidateDetail, Note } from "../types";
-import { Scorecard } from "../components/Scorecard";
+import type { AppealRow, CandidateDetail, Note, Session } from "../types";
 import { LiveCallPanel } from "../components/LiveCallPanel";
 import { LiveKitCallCard } from "../components/LiveKitCallCard";
 import { Button, Card, Chip, ErrorState, LoadingState } from "../components/ui";
 import { PageHeader, StatusBadge } from "../components/design";
-import { RecordingCard, Tabs, TranscriptionSyncWorkspace } from "../components/talent";
+import { Tabs, TranscriptionSyncWorkspace } from "../components/talent";
 import {
   candidateStatusLabel,
   candidateStatusTone,
   formatDurationSec,
+  sessionStatusLabel,
+  sessionStatusTone,
 } from "../components/talent";
+import { formatDateTime } from "../lib/datetime";
 
 /**
- * HELLO Lane 3 — CandidateDetail reorganized for daily work.
+ * HELLO Lane 3 — CandidateDetail as one recruiter review workspace.
  *
- * Layout: a compact identity/status/action header (always visible) plus
- * responsive keyboard tabs (ARIA tabs pattern) that split the profile into
- * Overview / Sessions / Transcript & Scorecards / Recordings / Notes & Appeals.
+ * Two tabs:
+ *   - Overview: identity/profile, live screening actions, session summary,
+ *     append-only notes, and appeals + one-time grant links.
+ *   - Review: the single authoritative review workspace — session context,
+ *     one recording player, synchronized transcript, and the session's
+ *     scorecard (TranscriptionSyncWorkspace). This replaces the previously
+ *     duplicated Sessions-tab audio, Recordings tab, and Overview scorecard.
  *
- * EVERY existing behavior is preserved exactly:
- *   - decision-use block banner + automated-scorecard suppression
- *   - LiveKit voice-screening invite + live call panel (realtime transcript)
- *   - append-only notes, appeals + one-time grant links (fragment-only)
- *   - ownership-scoped CSV scorecard export
- *   - on-demand short-lived recording playback (never auto-fetched)
+ * Preserved behavior: decision-use block banner + scorecard suppression,
+ * LiveKit invite + live call panel, ownership-scoped CSV export, append-only
+ * notes, appeals + fragment-only grant links, on-demand (never auto-fetched)
+ * short-lived recording playback.
  */
 
 export function CandidateDetailPage() {
@@ -50,19 +54,17 @@ export function CandidateDetailPage() {
   if (!detail) return <LoadingState label="Loading candidate…" />;
 
   const { candidate, sessions, assessments } = detail;
-  const latestAssessment = assessments[0] ?? null;
   const decisionBlocked = candidate.decision_use_blocked_at != null;
 
   return (
     <div>
       <Link
         to="/candidates"
-        className="mb-4 inline-flex items-center gap-1 text-sm text-ink-secondary hover:text-ink"
+        className="mb-4 inline-flex items-center gap-1 text-sm text-ink-secondary hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
       >
         ← Back to candidates
       </Link>
 
-      {/* Compact identity / status / action header */}
       <PageHeader
         eyebrow="Candidate"
         title={candidate.name || "Unnamed candidate"}
@@ -80,7 +82,7 @@ export function CandidateDetailPage() {
       {decisionBlocked && (
         <div
           role="alert"
-          className="mb-5 rounded-md border border-warning/40 bg-warning-soft p-4"
+          className="mb-5 mt-4 rounded-md border border-warning/40 bg-warning-soft p-4"
         >
           <p className="text-sm font-semibold text-warning">
             Decision use is paused — open appeal
@@ -93,60 +95,43 @@ export function CandidateDetailPage() {
         </div>
       )}
 
-      <Tabs
-        ariaLabel="Candidate sections"
-        items={[
-          {
-            id: "overview",
-            label: "Overview",
-            panel: (
-              <OverviewTab
-                candidate={candidate}
-                sessions={sessions}
-                latestAssessment={latestAssessment}
-                decisionBlocked={decisionBlocked}
-              />
-            ),
-          },
-          {
-            id: "sessions",
-            label: "Sessions",
-            panel: <SessionsTab sessions={sessions} />,
-          },
-          {
-            id: "transcripts",
-            label: "Transcript & Scorecards",
-            panel: (
-              <TranscriptionSyncWorkspace
-                sessions={sessions}
-                assessments={assessments}
-                blocked={decisionBlocked}
-              />
-            ),
-          },
-          {
-            id: "recordings",
-            label: "Recordings",
-            panel: <RecordingsTab sessions={sessions} />,
-          },
-        ]}
-      />
+      <div className="mt-4">
+        <Tabs
+          ariaLabel="Candidate sections"
+          items={[
+            {
+              id: "overview",
+              label: "Overview",
+              panel: (
+                <OverviewTab candidate={candidate} sessions={sessions} />
+              ),
+            },
+            {
+              id: "review",
+              label: "Review",
+              panel: (
+                <TranscriptionSyncWorkspace
+                  sessions={sessions}
+                  assessments={assessments}
+                  blocked={decisionBlocked}
+                />
+              ),
+            },
+          ]}
+        />
+      </div>
     </div>
   );
 }
 
-/* ── Tab panels ─────────────────────────────────────────────────────── */
+/* ── Overview tab ───────────────────────────────────────────────────── */
 
 function OverviewTab({
   candidate,
   sessions,
-  latestAssessment,
-  decisionBlocked,
 }: {
   candidate: CandidateDetail["candidate"];
   sessions: CandidateDetail["sessions"];
-  latestAssessment: CandidateDetail["assessments"][number] | null;
-  decisionBlocked: boolean;
 }) {
   return (
     <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
@@ -170,7 +155,9 @@ function OverviewTab({
               : "—"}
           </Field>
           <Field label="Status">
-            <Chip>{candidate.status || "new"}</Chip>
+            <StatusBadge tone={candidateStatusTone(candidate.status)}>
+              {candidateStatusLabel(candidate.status)}
+            </StatusBadge>
           </Field>
           <div>
             <dt className="mb-1.5 text-xs font-medium text-ink-secondary">
@@ -190,12 +177,12 @@ function OverviewTab({
           </div>
         </dl>
         <p className="mt-5 rounded-lg bg-surface-tertiary p-3 text-xs leading-relaxed text-ink-secondary">
-          LiveKit mode: start a browser voice screening from this dashboard.
-          Transcript, playback, and scorecard sync back to Supabase.
+          Start a browser voice screening below. Transcript, playback, and
+          scorecard sync back and are reviewed in the Review tab.
         </p>
       </Card>
 
-      {/* Live actions + latest assessment */}
+      {/* Live actions + sessions + notes + appeals */}
       <div className="space-y-6 lg:col-span-2">
         <LiveKitCallCard
           candidateId={candidate.id}
@@ -207,123 +194,57 @@ function OverviewTab({
           candidateName={candidate.name || undefined}
         />
 
-        {latestAssessment && !decisionBlocked && (
-          <div>
-            <h2 className="mb-3 text-sm font-semibold text-ink">
-              Latest assessment
-            </h2>
-            <Scorecard assessment={latestAssessment} />
-          </div>
-        )}
-
-        {latestAssessment && decisionBlocked && (
-          <Card className="p-5">
-            <h2 className="text-sm font-semibold text-ink">
-              Latest assessment
-            </h2>
-            <p className="mt-2 text-sm text-ink-secondary">
-              Hidden while an appeal is under review. A human reviewer will
-              re-assess before any recommendation is used.
-            </p>
-          </Card>
-        )}
+        <SessionsSummary sessions={sessions} />
 
         <NotesSection candidateId={candidate.id} />
-        <AppealsSection
-          candidateId={candidate.id}
-          sessions={sessions}
-          blocked={decisionBlocked}
-        />
+        <AppealsSection candidateId={candidate.id} sessions={sessions} />
       </div>
     </div>
   );
 }
 
-function SessionsTab({ sessions }: { sessions: CandidateDetail["sessions"] }) {
-  return (
-    <div>
-      <h2 className="mb-3 text-sm font-semibold text-ink">
-        Screening sessions
-      </h2>
-      {sessions.length === 0 ? (
-        <Card className="p-5 text-sm text-ink-secondary">
-          No screening sessions yet. Start one from the Overview tab.
-        </Card>
-      ) : (
-        <Card className="divide-y divide-line">
-          {sessions.map((s) => (
-            <div key={s.id} className="px-4 py-3 text-sm">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <p className="font-medium text-ink">
-                    Session {s.id.slice(0, 8)}
-                    {s.mode && (
-                      <span className="ml-2 text-xs font-normal text-ink-tertiary">
-                        {s.mode === "live" ? "📞 live call" : "💬 simulation"}
-                      </span>
-                    )}
-                  </p>
-                  <p className="text-xs text-ink-tertiary">
-                    {new Date(s.created_at).toLocaleString()}
-                    {s.duration_sec
-                      ? ` · ${formatDurationSec(s.duration_sec)}`
-                      : ""}
-                  </p>
-                </div>
-                <div className="flex items-center gap-3">
-                  <Chip
-                    tone={
-                      s.status === "completed" || s.done ? "green" : "neutral"
-                    }
-                  >
-                    {s.status || (s.done ? "completed" : "in progress")}
-                  </Chip>
-                  <Link
-                    to={`/screening/${s.id}`}
-                    className="text-xs font-medium text-brand-700 hover:text-brand-800 dark:text-brand-300"
-                  >
-                    View
-                  </Link>
-                </div>
-              </div>
-              {s.status === "completed" && (
-                <RecordingDownloadButton sessionId={s.id} />
-              )}
-            </div>
-          ))}
-        </Card>
-      )}
-    </div>
-  );
-}
-
-function RecordingsTab({
-  sessions,
-}: {
-  sessions: CandidateDetail["sessions"];
-}) {
-  const completed = sessions.filter((s) => s.status === "completed");
+function SessionsSummary({ sessions }: { sessions: Session[] }) {
   return (
     <Card className="p-5">
-      <h2 className="mb-1 text-sm font-semibold text-ink">Recordings</h2>
-      <p className="mb-4 text-xs text-ink-tertiary">
-        Short-lived playback links are created only when you request them —
-        never on page load — and expire automatically. Signed URLs and object
-        keys are never logged or stored.
-      </p>
-      {completed.length === 0 ? (
+      <h2 className="mb-3 text-sm font-semibold text-ink">Screening sessions</h2>
+      {sessions.length === 0 ? (
         <p className="text-sm text-ink-secondary">
-          No completed sessions with recordings yet.
+          No screening sessions yet. Start one above.
         </p>
       ) : (
-        <ul className="space-y-4">
-          {completed.map((s) => (
-            <li key={s.id}>
-              <p className="mb-2 text-sm font-medium text-ink">
-                Session {s.id.slice(0, 8)} ·{" "}
-                {new Date(s.created_at).toLocaleString()}
-              </p>
-              <RecordingCard sessionId={s.id} title="Session recording" />
+        <ul className="divide-y divide-line">
+          {sessions.map((s) => (
+            <li
+              key={s.id}
+              className="flex flex-wrap items-center justify-between gap-3 py-3 text-sm"
+            >
+              <div className="min-w-0">
+                <p className="font-medium text-ink">
+                  Session {s.id.slice(0, 8)}
+                  {s.mode && (
+                    <span className="ml-2 text-xs font-normal text-ink-tertiary">
+                      {s.mode === "live" ? "live call" : "simulation"}
+                    </span>
+                  )}
+                </p>
+                <p className="text-xs text-ink-tertiary">
+                  {formatDateTime(s.created_at)}
+                  {s.duration_sec
+                    ? ` · ${formatDurationSec(s.duration_sec)}`
+                    : ""}
+                </p>
+              </div>
+              <div className="flex items-center gap-3">
+                <StatusBadge tone={sessionStatusTone(s.status)}>
+                  {sessionStatusLabel(s.status)}
+                </StatusBadge>
+                <Link
+                  to={`/sessions/${s.id}`}
+                  className="text-xs font-medium text-brand-700 hover:text-brand-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:text-brand-300"
+                >
+                  View details
+                </Link>
+              </div>
             </li>
           ))}
         </ul>
@@ -332,7 +253,7 @@ function RecordingsTab({
   );
 }
 
-/* ── Phase 9: append-only notes ─────────────────────────────────────── */
+/* ── Append-only notes ──────────────────────────────────────────────── */
 
 function NotesSection({ candidateId }: { candidateId: string }) {
   const [notes, setNotes] = useState<Note[] | null>(null);
@@ -381,7 +302,7 @@ function NotesSection({ candidateId }: { candidateId: string }) {
             <li key={n.id} className="py-2 text-sm">
               <p className="whitespace-pre-wrap text-ink">{n.note}</p>
               <p className="mt-0.5 text-xs text-ink-tertiary">
-                {new Date(n.created_at).toLocaleString()}
+                {formatDateTime(n.created_at)}
               </p>
             </li>
           ))}
@@ -399,7 +320,12 @@ function NotesSection({ candidateId }: { candidateId: string }) {
           placeholder="Add a note…"
           className="flex-1 rounded-md border border-line bg-surface px-3 py-2 text-sm text-ink placeholder:text-ink-tertiary focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
         />
-        <Button variant="secondary" onClick={() => void add()} loading={saving} disabled={!noteText.trim()}>
+        <Button
+          variant="secondary"
+          onClick={() => void add()}
+          loading={saving}
+          disabled={!noteText.trim()}
+        >
           Add
         </Button>
       </div>
@@ -408,16 +334,14 @@ function NotesSection({ candidateId }: { candidateId: string }) {
   );
 }
 
-/* ── Phase 9: appeals + one-time grant link ─────────────────────────── */
+/* ── Appeals + one-time grant link ──────────────────────────────────── */
 
 function AppealsSection({
   candidateId,
   sessions,
-  blocked,
 }: {
   candidateId: string;
   sessions: CandidateDetail["sessions"];
-  blocked: boolean;
 }) {
   const [appeals, setAppeals] = useState<AppealRow[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -447,7 +371,7 @@ function AppealsSection({
       const link = `${window.location.origin}/appeal#${res.appeal_grant_token}`;
       setGrantLink(link);
       setMsg(
-        `Grant issued — expires ${new Date(res.expires_at).toLocaleString()}. ` +
+        `Grant issued — expires ${formatDateTime(res.expires_at)}. ` +
           "Send this one-time link to the candidate.",
       );
     } catch (e) {
@@ -460,11 +384,6 @@ function AppealsSection({
   return (
     <Card className="p-5">
       <h2 className="mb-3 text-sm font-semibold text-ink">Appeals</h2>
-      {blocked && (
-        <p className="mb-3 rounded-md bg-warning-soft p-2 text-xs text-warning">
-          An appeal is open — automated decision use is paused.
-        </p>
-      )}
       {err ? (
         <p className="text-sm text-error">{err}</p>
       ) : appeals === null ? (
@@ -483,7 +402,7 @@ function AppealsSection({
               </div>
               <p className="mt-0.5 whitespace-pre-wrap text-ink-secondary">{a.description}</p>
               <p className="mt-0.5 text-xs text-ink-tertiary">
-                {new Date(a.created_at).toLocaleString()}
+                {formatDateTime(a.created_at)}
               </p>
             </li>
           ))}
@@ -512,7 +431,7 @@ function AppealsSection({
               ) : (
                 sessions.map((s) => (
                   <option key={s.id} value={s.id}>
-                    {s.id.slice(0, 8)} ({s.status})
+                    {s.id.slice(0, 8)} ({sessionStatusLabel(s.status)})
                   </option>
                 ))
               )}
@@ -558,7 +477,7 @@ function AppealsSection({
   );
 }
 
-/* ── Phase 9: CSV export ────────────────────────────────────────────── */
+/* ── CSV export ─────────────────────────────────────────────────────── */
 
 function CsvExportButton({ candidateId }: { candidateId: string }) {
   const [busy, setBusy] = useState(false);
@@ -569,7 +488,6 @@ function CsvExportButton({ candidateId }: { candidateId: string }) {
     setErr(null);
     try {
       const csv = await api.exportCsv(candidateId);
-      // Same-tab download via a transient object URL — revoked immediately.
       const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -592,81 +510,6 @@ function CsvExportButton({ candidateId }: { candidateId: string }) {
         Export screening data (scorecard + transcript)
       </Button>
       {err && <p className="mt-1 text-xs text-error">{err}</p>}
-    </div>
-  );
-}
-
-/**
- * MIG-06: On-demand recording download button.
- * Fetches a short-lived signed URL only when clicked.
- * Never auto-fetches on list render.
- */
-function RecordingDownloadButton({ sessionId }: { sessionId: string }) {
-  const [url, setUrl] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const mountedRef = useRef(true);
-  const reqIdRef = useRef(0);
-
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-    };
-  }, []);
-
-  // On-demand fetch — only ever runs from an explicit click. Repeated
-  // clicks re-mint a fresh short-TTL URL (handles expiry); stale responses
-  // are ignored via a generation counter.
-  const handleClick = useCallback(() => {
-    const reqId = ++reqIdRef.current;
-    setLoading(true);
-    setError(null);
-    api
-      .getRecordingDownloadUrl(sessionId)
-      .then((res) => {
-        if (!mountedRef.current || reqId !== reqIdRef.current) return;
-        setUrl(res.url);
-        setLoading(false);
-      })
-      .catch((e: ApiError) => {
-        if (!mountedRef.current || reqId !== reqIdRef.current) return;
-        setError(e.message || "Failed to load recording");
-        setLoading(false);
-      });
-  }, [sessionId]);
-
-  if (url && !loading) {
-    return (
-      <div className="mt-2 space-y-1">
-        <audio controls preload="none" src={url} className="h-9 w-full">
-          <a href={url} target="_blank" rel="noreferrer">
-            Download recording
-          </a>
-        </audio>
-        <button
-          type="button"
-          onClick={handleClick}
-          className="text-xs font-medium text-brand-700 hover:text-brand-800 dark:text-brand-300"
-        >
-          Refresh link
-        </button>
-      </div>
-    );
-  }
-
-  return (
-    <div className="mt-2">
-      <button
-        type="button"
-        onClick={handleClick}
-        disabled={loading}
-        className="rounded bg-brand-600 px-3 py-1 text-xs font-medium text-white hover:bg-brand-700 disabled:opacity-50"
-      >
-        {loading ? "Loading…" : "Play recording"}
-      </button>
-      {error && <p className="mt-1 text-xs text-error">{error}</p>}
     </div>
   );
 }

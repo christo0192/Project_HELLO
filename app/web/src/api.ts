@@ -36,6 +36,7 @@ import type {
   CandidateConsentSubmitResponse,
   CandidateConsentTemplate,
   CandidateDetail,
+  CandidatesSummary,
   CandidateInviteExchangeResult,
   CandidateInviteResult,
   ConsentCheckResponse,
@@ -156,6 +157,8 @@ export const api = {
     ),
   getCandidate: (id: string) =>
     request<CandidateDetail>(`/api/candidates/${id}`),
+  getCandidatesSummary: () =>
+    request<CandidatesSummary>('/api/candidates/summary'),
 
   // Screening
   startScreening: (candidateId: string) =>

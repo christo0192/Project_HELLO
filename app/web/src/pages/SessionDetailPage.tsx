@@ -29,6 +29,7 @@ import {
   sessionStatusTone,
 } from '../components/talent';
 import { Scorecard } from '../components/Scorecard';
+import { formatDateTime } from '../lib/datetime';
 
 export function SessionDetailPage() {
   const { sessionId } = useParams<{ sessionId: string }>();
@@ -65,7 +66,7 @@ export function SessionDetailPage() {
       <PageHeader
         eyebrow="Session"
         title={`Session ${session.id.slice(0, 8)}`}
-        description={`${session.mode === 'live' ? 'Live voice screening' : 'Simulation screening'} · created ${new Date(session.created_at).toLocaleString()}`}
+        description={`${session.mode === 'live' ? 'Live voice screening' : 'Simulation screening'} · created ${formatDateTime(session.created_at)}`}
         actions={<StatusBadge tone={sessionStatusTone(session.status)}>{sessionStatusLabel(session.status)}</StatusBadge>}
       />
 
@@ -101,7 +102,7 @@ export function SessionDetailPage() {
               {formatDurationSec(session.duration_sec)}
             </MetaField>
             <MetaField label="Started">
-              {new Date(session.created_at).toLocaleString()}
+              {formatDateTime(session.started_at ?? session.created_at)}
             </MetaField>
             <div className="pt-1">
               <dt className="mb-1 text-xs font-medium text-ink-secondary">Session ID</dt>
