@@ -12,7 +12,6 @@ import {
 import type { ScreeningQuestion, TranscriptTurn } from '../lib/types.js';
 import { runAssessment } from '../services/assessment.js';
 import { validateEpochMsAnchor } from '../lib/recording-egress.js';
-import { withSessionCreatedAt } from '../lib/session-serialization.js';
 import { validateBody, validateParams } from '../lib/validation.js';
 import {
   startScreeningSchema,
@@ -409,5 +408,5 @@ screeningRouter.get('/:id', validateParams(screeningSessionIdParamSchema), async
     .order('created_at', { ascending: false })
     .limit(1)
     .maybeSingle();
-  res.json({ session: withSessionCreatedAt(session), transcript, assessment });
+  res.json({ session, transcript, assessment });
 });

@@ -23,10 +23,11 @@ import {
   allowEchartsInitWarnings,
 } from '../components/design/__tests__/helpers';
 
-const { getMe, listCandidates, listNotificationIntents } = vi.hoisted(() => ({
+const { getMe, listCandidates, listNotificationIntents, getCandidatesSummary } = vi.hoisted(() => ({
   getMe: vi.fn(),
   listCandidates: vi.fn(),
   listNotificationIntents: vi.fn(),
+  getCandidatesSummary: vi.fn(),
 }));
 
 vi.mock('../api', () => ({
@@ -34,6 +35,7 @@ vi.mock('../api', () => ({
     getMe: (...args: any[]) => getMe(...args),
     listCandidates: (...args: any[]) => listCandidates(...args),
     listNotificationIntents: (...args: any[]) => listNotificationIntents(...args),
+    getCandidatesSummary: (...args: any[]) => getCandidatesSummary(...args),
   },
   ApiError: class extends Error {
     status: number;
@@ -61,9 +63,20 @@ const INTENTS = [
   { id: 'i3', kind: 'quota_warning', candidate_id: null, consent_verified: false, created_at: '2026-06-04T02:00:00Z' },
 ];
 
+const SUMMARY = {
+  assessed_count: 3,
+  average_score: 64,
+  recommendation_distribution: { advance: 2, hold: 0, reject: 1 },
+};
+
 function CandidatesProbe() {
   const [params] = useSearchParams();
-  return <div data-testid="probe">status={params.get('status') ?? ''}</div>;
+  return (
+    <div data-testid="probe">
+      status={params.get('status') ?? ''};recommendation={params.get('recommendation') ?? ''};
+      assessed={params.get('assessed') ?? ''}
+    </div>
+  );
 }
 
 function wrap(ui: ReactNode) {
@@ -93,6 +106,7 @@ describe('DashboardPage', () => {
     getMe.mockResolvedValue(ADMIN_ME);
     listCandidates.mockResolvedValue(CANDIDATES);
     listNotificationIntents.mockResolvedValue({ intents: [] });
+    getCandidatesSummary.mockResolvedValue(SUMMARY);
   });
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -169,6 +183,39 @@ describe('DashboardPage', () => {
     expect(
       screen.getByRole('link', { name: /rejected candidates/i }),
     ).toHaveAttribute('href', candidatesHref({ statuses: ['rejected'] }));
+  });
+
+  it('renders the average score linking to the assessed cohort', async () => {
+    getMe.mockResolvedValue(VIEWER_ME);
+    renderDashboard();
+    const link = await screen.findByRole('link', { name: /average assessment score 64/i });
+    expect(link).toHaveAttribute('href', candidatesHref({ assessed: true }));
+    fireEvent.click(link);
+    expect(await screen.findByTestId('probe')).toHaveTextContent('assessed=1');
+  });
+
+  it('shows a truthful empty state when there is no average score', async () => {
+    getMe.mockResolvedValue(VIEWER_ME);
+    getCandidatesSummary.mockResolvedValue({
+      assessed_count: 0,
+      average_score: null,
+      recommendation_distribution: { advance: 0, hold: 0, reject: 0 },
+    });
+    renderDashboard();
+    // Shown by both the average-score card and the distribution empty state.
+    expect((await screen.findAllByText('No assessments yet')).length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('renders the recommendation distribution with navigable segments', async () => {
+    getMe.mockResolvedValue(VIEWER_ME);
+    renderDashboard();
+    const table = await screen.findByRole('table', { name: 'Recommendation distribution data' });
+    expect(within(table).getByRole('cell', { name: 'Advance' })).toBeInTheDocument();
+    expect(within(table).getByRole('cell', { name: 'Reject' })).toBeInTheDocument();
+    const advanceLink = screen.getByRole('link', { name: /Advance:.*View these candidates/i });
+    expect(advanceLink).toHaveAttribute('href', candidatesHref({ recommendations: ['advance'] }));
+    fireEvent.click(advanceLink);
+    expect(await screen.findByTestId('probe')).toHaveTextContent('recommendation=advance');
   });
 
   it('renders a candidate intake trend from created_at', async () => {

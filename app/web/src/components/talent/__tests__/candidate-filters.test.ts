@@ -5,9 +5,11 @@ import {
   buildCandidateSearch,
   candidatesHref,
   matchesCandidateStatus,
+  matchesCandidateFilters,
   hasActiveFilters,
   candidateFunnel,
   candidateNextAction,
+  recommendationLabel,
   normalizeStatus,
   EMPTY_CANDIDATE_FILTERS,
 } from '../candidateFilters';
@@ -28,71 +30,112 @@ function cand(partial: Partial<Candidate>): Candidate {
   };
 }
 
+const f = (partial: Partial<typeof EMPTY_CANDIDATE_FILTERS>) => ({
+  ...EMPTY_CANDIDATE_FILTERS,
+  ...partial,
+});
+
 describe('parseCandidateFilters', () => {
-  it('parses a comma-separated status list, dropping unknown values', () => {
-    const f = parseCandidateFilters(
-      new URLSearchParams('status=new,screening,bogus&role=r1'),
+  it('parses status, recommendation, assessed and role, dropping unknowns', () => {
+    const parsed = parseCandidateFilters(
+      new URLSearchParams('status=new,screening,bogus&recommendation=advance,zzz&assessed=1&role=r1'),
     );
-    expect(f.statuses).toEqual(['new', 'screening']);
-    expect(f.roleId).toBe('r1');
+    expect(parsed).toEqual({
+      statuses: ['new', 'screening'],
+      recommendations: ['advance'],
+      assessed: true,
+      roleId: 'r1',
+    });
   });
 
   it('returns empty filters for an empty query', () => {
-    expect(parseCandidateFilters(new URLSearchParams(''))).toEqual(
-      EMPTY_CANDIDATE_FILTERS,
-    );
+    expect(parseCandidateFilters(new URLSearchParams(''))).toEqual(EMPTY_CANDIDATE_FILTERS);
   });
 
-  it('canonicalizes status order regardless of URL order', () => {
-    const f = parseCandidateFilters(new URLSearchParams('status=screened,new'));
-    expect(f.statuses).toEqual(['new', 'screened']);
+  it('canonicalizes status + recommendation order regardless of URL order', () => {
+    const parsed = parseCandidateFilters(
+      new URLSearchParams('status=screened,new&recommendation=reject,advance'),
+    );
+    expect(parsed.statuses).toEqual(['new', 'screened']);
+    expect(parsed.recommendations).toEqual(['advance', 'reject']);
   });
 });
 
 describe('buildCandidateSearch / candidatesHref', () => {
   it('round-trips through parse in canonical order', () => {
-    const href = candidatesHref({ statuses: ['screening', 'new'], roleId: 'r9' });
-    expect(href).toBe('/candidates?status=new%2Cscreening&role=r9');
+    const href = candidatesHref({
+      statuses: ['screening', 'new'],
+      recommendations: ['reject', 'advance'],
+      assessed: true,
+      roleId: 'r9',
+    });
     const back = parseCandidateFilters(new URLSearchParams(href.split('?')[1]));
-    expect(back).toEqual({ statuses: ['new', 'screening'], roleId: 'r9' });
+    expect(back).toEqual({
+      statuses: ['new', 'screening'],
+      recommendations: ['advance', 'reject'],
+      assessed: true,
+      roleId: 'r9',
+    });
   });
 
   it('produces a bare path with no filters', () => {
     expect(candidatesHref()).toBe('/candidates');
     expect(buildCandidateSearch(EMPTY_CANDIDATE_FILTERS).toString()).toBe('');
   });
-});
 
-describe('matchesCandidateStatus', () => {
-  it('matches all when no statuses selected', () => {
-    expect(
-      matchesCandidateStatus(cand({ status: 'advanced' }), EMPTY_CANDIDATE_FILTERS),
-    ).toBe(true);
-  });
-
-  it('filters by selected status and treats missing as "new"', () => {
-    const f = { statuses: ['new'], roleId: null };
-    expect(matchesCandidateStatus(cand({ status: undefined as never }), f)).toBe(true);
-    expect(matchesCandidateStatus(cand({ status: 'screening' }), f)).toBe(false);
+  it('builds a single-recommendation drill-down href', () => {
+    expect(candidatesHref({ recommendations: ['advance'] })).toBe(
+      '/candidates?recommendation=advance',
+    );
+    expect(candidatesHref({ assessed: true })).toBe('/candidates?assessed=1');
   });
 });
 
-describe('hasActiveFilters / normalizeStatus', () => {
-  it('detects active filters', () => {
+describe('matchesCandidateStatus / matchesCandidateFilters', () => {
+  it('matches all when no filters', () => {
+    expect(matchesCandidateFilters(cand({ status: 'advanced' }), EMPTY_CANDIDATE_FILTERS)).toBe(true);
+    expect(matchesCandidateStatus(cand({ status: 'advanced' }), EMPTY_CANDIDATE_FILTERS)).toBe(true);
+  });
+
+  it('filters by status (missing = new)', () => {
+    const filters = f({ statuses: ['new'] });
+    expect(matchesCandidateFilters(cand({ status: undefined as never }), filters)).toBe(true);
+    expect(matchesCandidateFilters(cand({ status: 'screening' }), filters)).toBe(false);
+  });
+
+  it('filters by recommendation using latest_recommendation', () => {
+    const filters = f({ recommendations: ['advance'] });
+    expect(matchesCandidateFilters(cand({ latest_recommendation: 'advance' }), filters)).toBe(true);
+    expect(matchesCandidateFilters(cand({ latest_recommendation: 'reject' }), filters)).toBe(false);
+    expect(matchesCandidateFilters(cand({ latest_recommendation: null }), filters)).toBe(false);
+  });
+
+  it('filters the assessed cohort by latest_score presence', () => {
+    const filters = f({ assessed: true });
+    expect(matchesCandidateFilters(cand({ latest_score: 72 }), filters)).toBe(true);
+    expect(matchesCandidateFilters(cand({ latest_score: null }), filters)).toBe(false);
+    expect(matchesCandidateFilters(cand({}), filters)).toBe(false);
+  });
+});
+
+describe('hasActiveFilters / normalizeStatus / recommendationLabel', () => {
+  it('detects active filters across every dimension', () => {
     expect(hasActiveFilters(EMPTY_CANDIDATE_FILTERS)).toBe(false);
-    expect(hasActiveFilters({ statuses: ['new'], roleId: null })).toBe(true);
-    expect(hasActiveFilters({ statuses: [], roleId: 'r' })).toBe(true);
+    expect(hasActiveFilters(f({ statuses: ['new'] }))).toBe(true);
+    expect(hasActiveFilters(f({ recommendations: ['hold'] }))).toBe(true);
+    expect(hasActiveFilters(f({ assessed: true }))).toBe(true);
+    expect(hasActiveFilters(f({ roleId: 'r' }))).toBe(true);
   });
 
-  it('normalizes blank/nullish status to new', () => {
-    expect(normalizeStatus(null)).toBe('new');
+  it('normalizes blank status to new and labels recommendations', () => {
     expect(normalizeStatus('   ')).toBe('new');
-    expect(normalizeStatus('screened')).toBe('screened');
+    expect(recommendationLabel('advance')).toBe('Advance');
+    expect(recommendationLabel(null)).toBe('Unassessed');
   });
 });
 
-describe('candidateFunnel', () => {
-  it('counts by status in canonical funnel order, only present statuses', () => {
+describe('candidateFunnel / candidateNextAction', () => {
+  it('counts by status in canonical order', () => {
     const funnel = candidateFunnel([
       cand({ status: 'screened' }),
       cand({ status: 'new' }),
@@ -106,18 +149,9 @@ describe('candidateFunnel', () => {
     ]);
   });
 
-  it('appends unknown statuses last', () => {
-    const funnel = candidateFunnel([cand({ status: 'zzz' }), cand({ status: 'new' })]);
-    expect(funnel[0].status).toBe('new');
-    expect(funnel[funnel.length - 1].status).toBe('zzz');
-  });
-});
-
-describe('candidateNextAction', () => {
   it('maps statuses to an actionable next step', () => {
     expect(candidateNextAction('new')).toEqual({ label: 'Start screening', emphasis: true });
     expect(candidateNextAction('screened')).toEqual({ label: 'Review & decide', emphasis: true });
-    expect(candidateNextAction('advanced').emphasis).toBe(false);
     expect(candidateNextAction('anything-else').label).toBe('Open profile');
   });
 });

@@ -13,6 +13,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api";
 import type { Candidate, Role } from "../types";
+import type { CandidateFilters } from "../components/talent";
 import {
   Button,
   EmptyState,
@@ -39,10 +40,19 @@ import {
   candidateStatusTone,
   CANDIDATE_STATUS_ORDER,
   hasActiveFilters,
-  matchesCandidateStatus,
+  matchesCandidateFilters,
   normalizeStatus,
   parseCandidateFilters,
+  recommendationLabel,
+  RECOMMENDATION_ORDER,
 } from "../components/talent";
+import type { StatusTone } from "../components/design/StatusBadge";
+
+const RECOMMENDATION_TONE: Record<string, StatusTone> = {
+  advance: "success",
+  hold: "warning",
+  reject: "danger",
+};
 
 // Statuses offered as quick toggles (consent_declined stays URL-only/terminal).
 const FILTERABLE_STATUSES = CANDIDATE_STATUS_ORDER.filter(
@@ -52,7 +62,7 @@ const FILTERABLE_STATUSES = CANDIDATE_STATUS_ORDER.filter(
 export function CandidatesPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const filters = parseCandidateFilters(searchParams);
-  const statusKey = filters.statuses.join(",");
+  const filterKey = buildCandidateSearch(filters).toString();
   const { roleId } = filters;
 
   const [roles, setRoles] = useState<Role[]>([]);
@@ -76,35 +86,35 @@ export function CandidatesPage() {
     loadCandidates(roleId);
   }, [roleId, loadCandidates]);
 
-  const setStatuses = useCallback(
-    (statuses: string[]) => {
-      setSearchParams(buildCandidateSearch({ statuses, roleId }));
+  // Every mutation rebuilds the full filter set from the current URL so no
+  // dimension (status / recommendation / assessed / role) is dropped.
+  const applyFilters = useCallback(
+    (next: Partial<CandidateFilters>) => {
+      setSearchParams(buildCandidateSearch({ ...filters, ...next }));
     },
-    [roleId, setSearchParams],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [filterKey, setSearchParams],
   );
 
+  const toggleFromList = (list: string[], value: string) =>
+    list.includes(value) ? list.filter((v) => v !== value) : [...list, value];
+
   const toggleStatus = useCallback(
-    (status: string) => {
-      const has = filters.statuses.includes(status);
-      setStatuses(
-        has
-          ? filters.statuses.filter((s) => s !== status)
-          : [...filters.statuses, status],
-      );
-    },
-    [filters.statuses, setStatuses],
+    (status: string) => applyFilters({ statuses: toggleFromList(filters.statuses, status) }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [filterKey, applyFilters],
+  );
+
+  const toggleRecommendation = useCallback(
+    (rec: string) =>
+      applyFilters({ recommendations: toggleFromList(filters.recommendations, rec) }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [filterKey, applyFilters],
   );
 
   const setRole = useCallback(
-    (nextRole: string) => {
-      setSearchParams(
-        buildCandidateSearch({
-          statuses: filters.statuses,
-          roleId: nextRole || null,
-        }),
-      );
-    },
-    [filters.statuses, setSearchParams],
+    (nextRole: string) => applyFilters({ roleId: nextRole || null }),
+    [applyFilters],
   );
 
   const clearFilters = useCallback(() => {
@@ -112,9 +122,9 @@ export function CandidatesPage() {
   }, [setSearchParams]);
 
   const visible = useMemo(
-    () => (candidates ?? []).filter((c) => matchesCandidateStatus(c, filters)),
+    () => (candidates ?? []).filter((c) => matchesCandidateFilters(c, filters)),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [candidates, statusKey],
+    [candidates, filterKey],
   );
 
   const active = hasActiveFilters(filters);
@@ -126,6 +136,20 @@ export function CandidatesPage() {
     for (const c of candidates ?? []) {
       const key = normalizeStatus(c.status);
       counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    return counts;
+  }, [candidates]);
+
+  // Live count per recommendation from the currently loaded set.
+  const recommendationCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const c of candidates ?? []) {
+      if (c.latest_recommendation) {
+        counts.set(
+          c.latest_recommendation,
+          (counts.get(c.latest_recommendation) ?? 0) + 1,
+        );
+      }
     }
     return counts;
   }, [candidates]);
@@ -205,6 +229,39 @@ export function CandidatesPage() {
           })}
         </div>
 
+        {/* Recommendation toggles */}
+        <div
+          className="mt-2 flex flex-wrap items-center gap-2"
+          role="group"
+          aria-label="Filter by recommendation"
+        >
+          <span className="text-xs font-medium text-ink-tertiary">Recommendation:</span>
+          {RECOMMENDATION_ORDER.map((rec) => {
+            const selected = filters.recommendations.includes(rec);
+            const count = recommendationCounts.get(rec) ?? 0;
+            return (
+              <button
+                key={rec}
+                type="button"
+                onClick={() => toggleRecommendation(rec)}
+                aria-pressed={selected}
+                className={[
+                  "inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors",
+                  "focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500",
+                  selected
+                    ? "border-brand-500 bg-brand-50 text-brand-700 dark:bg-brand-950 dark:text-brand-300"
+                    : "border-line bg-surface text-ink-secondary hover:bg-surface-tertiary hover:text-ink",
+                ].join(" ")}
+              >
+                {recommendationLabel(rec)}
+                {candidates && (
+                  <span className="tabular-nums text-ink-tertiary">{count}</span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+
         {/* Active-filter summary */}
         {active && (
           <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-ink-secondary">
@@ -222,6 +279,19 @@ export function CandidatesPage() {
                 onRemove={() => toggleStatus(s)}
               />
             ))}
+            {filters.recommendations.map((r) => (
+              <FilterChip
+                key={r}
+                label={`Rec: ${recommendationLabel(r)}`}
+                onRemove={() => toggleRecommendation(r)}
+              />
+            ))}
+            {filters.assessed && (
+              <FilterChip
+                label="Assessed"
+                onRemove={() => applyFilters({ assessed: false })}
+              />
+            )}
             <button
               type="button"
               onClick={clearFilters}
@@ -273,6 +343,7 @@ export function CandidatesPage() {
                   <Th>Skills</Th>
                   <Th>Exp.</Th>
                   <Th>Status</Th>
+                  <Th>Recommendation</Th>
                   <Th>Next action</Th>
                 </Tr>
               </THead>
@@ -321,6 +392,24 @@ export function CandidatesPage() {
                         <StatusBadge tone={candidateStatusTone(c.status)}>
                           {candidateStatusLabel(c.status)}
                         </StatusBadge>
+                      </Td>
+                      <Td>
+                        {c.latest_recommendation ? (
+                          <span className="inline-flex items-center gap-1.5">
+                            <StatusBadge
+                              tone={RECOMMENDATION_TONE[c.latest_recommendation] ?? "neutral"}
+                            >
+                              {recommendationLabel(c.latest_recommendation)}
+                            </StatusBadge>
+                            {c.latest_score != null && (
+                              <span className="text-xs tabular-nums text-ink-tertiary">
+                                {c.latest_score}
+                              </span>
+                            )}
+                          </span>
+                        ) : (
+                          <span className="text-ink-tertiary">—</span>
+                        )}
                       </Td>
                       <Td>
                         <span

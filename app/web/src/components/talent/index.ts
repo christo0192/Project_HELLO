@@ -23,14 +23,21 @@ export {
 } from './status';
 export {
   CANDIDATE_STATUS_ORDER,
+  RECOMMENDATION_ORDER,
   EMPTY_CANDIDATE_FILTERS,
   normalizeStatus,
+  recommendationLabel,
   parseCandidateFilters,
   buildCandidateSearch,
   candidatesHref,
   matchesCandidateStatus,
+  matchesCandidateFilters,
   hasActiveFilters,
   candidateFunnel,
   candidateNextAction,
 } from './candidateFilters';
-export type { CandidateFilters, CandidateStatusKey } from './candidateFilters';
+export type {
+  CandidateFilters,
+  CandidateStatusKey,
+  RecommendationKey,
+} from './candidateFilters';

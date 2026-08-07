@@ -37,6 +37,24 @@ export interface Candidate {
   status: CandidateStatus;
   role_id: string | null;
   created_at: string;
+  /** Latest assessment recommendation, null when unassessed or decision-use blocked. */
+  latest_recommendation?: Recommendation | null;
+  /** Latest assessment overall score (0–100), null when unassessed or blocked. */
+  latest_score?: number | null;
+}
+
+/** Aggregate pipeline assessment metrics (GET /api/candidates/summary). */
+export interface CandidatesSummary {
+  /** Candidates with a non-suppressed latest assessment score. */
+  assessed_count: number;
+  /** Mean latest score across the assessed cohort; null when none. */
+  average_score: number | null;
+  /** Deterministic per-recommendation counts (decision-use blocked excluded). */
+  recommendation_distribution: {
+    advance: number;
+    hold: number;
+    reject: number;
+  };
 }
 
 export interface Resume {
@@ -67,8 +85,8 @@ export interface Session {
   /** @deprecated MIG-03/04/05 — use getRecordingDownloadUrl() for on-demand signed URL. */
   recording_url?: string | null;
   duration_sec?: number | null;
-  /** Session creation instant (ISO). Server aliases started_at when no explicit column. */
-  created_at: string;
+  /** Session creation instant (ISO). Persisted column; null only for unrecoverable legacy rows. */
+  created_at: string | null;
   /** Call start instant (ISO). NOT NULL in storage; may be absent on older payloads. */
   started_at?: string | null;
   /** Call end instant (ISO), null while in progress. */

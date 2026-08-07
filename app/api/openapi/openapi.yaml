@@ -209,6 +209,19 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
 
+  /api/candidates/summary:
+    get:
+      tags: [candidates]
+      operationId: getCandidatesSummary
+      summary: Aggregate assessment metrics (viewer+; interviewer scoped to own records)
+      responses:
+        '200':
+          description: Aggregate assessment metrics.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CandidatesSummary'
+
   /api/candidates/{id}:
     parameters:
       - name: id
@@ -2606,6 +2619,34 @@ components:
         created_at:
           type: string
           format: date-time
+        latest_recommendation:
+          type: string
+          enum: [advance, hold, reject]
+          nullable: true
+        latest_score:
+          type: number
+          nullable: true
+      additionalProperties: true
+
+    CandidatesSummary:
+      type: object
+      required: [assessed_count, average_score, recommendation_distribution]
+      properties:
+        assessed_count:
+          type: integer
+        average_score:
+          type: number
+          nullable: true
+        recommendation_distribution:
+          type: object
+          required: [advance, hold, reject]
+          properties:
+            advance:
+              type: integer
+            hold:
+              type: integer
+            reject:
+              type: integer
       additionalProperties: true
 
     Candidate:
@@ -2677,7 +2718,7 @@ components:
 
     CallSession:
       type: object
-      required: [id, candidate_id, role_id, mode, provider, status, started_at, created_at]
+      required: [id, candidate_id, role_id, mode, provider, status, started_at]
       properties:
         id:
           type: string
@@ -2735,6 +2776,7 @@ components:
         created_at:
           type: string
           format: date-time
+          nullable: true
         updated_at:
           type: string
           format: date-time

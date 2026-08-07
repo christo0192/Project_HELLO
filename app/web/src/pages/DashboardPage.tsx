@@ -25,7 +25,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { api, ApiError } from '../api';
-import type { Candidate, MeResponse, NotificationIntent } from '../types';
+import type { Candidate, CandidatesSummary, MeResponse, NotificationIntent } from '../types';
 import { ErrorState, LoadingState } from '../components/ui';
 import { PageHeader } from '../components/design';
 import { KpiCard } from '../components/design';
@@ -46,6 +46,8 @@ import {
   candidateFunnel,
   candidatesHref,
   normalizeStatus,
+  recommendationLabel,
+  RECOMMENDATION_ORDER,
   sessionsPerDay,
 } from '../components/talent';
 import { formatDateTime } from '../lib/datetime';
@@ -62,6 +64,8 @@ export function DashboardPage() {
   const [candidates, setCandidates] = useState<Candidate[] | null>(null);
   const [me, setMe] = useState<MeResponse | null>(null);
   const [intents, setIntents] = useState<NotificationIntent[] | null>(null);
+  const [summary, setSummary] = useState<CandidatesSummary | null>(null);
+  const [summaryError, setSummaryError] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [intentsError, setIntentsError] = useState<string | null>(null);
 
@@ -70,7 +74,15 @@ export function DashboardPage() {
     setCandidates(null);
     setMe(null);
     setIntents(null);
+    setSummary(null);
+    setSummaryError(null);
     setIntentsError(null);
+
+    // Aggregate assessment metrics (viewer+, owner-scoped server-side).
+    api
+      .getCandidatesSummary()
+      .then(setSummary)
+      .catch((e: ApiError) => setSummaryError(e.message));
 
     api
       .getMe()
@@ -210,6 +222,18 @@ export function DashboardPage() {
         </div>
       </div>
 
+      {/* Assessment outcomes — average score + recommendation distribution */}
+      <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-3">
+        <AverageScoreCard summary={summary} error={summaryError} />
+        <div className="lg:col-span-2">
+          <RecommendationDistribution
+            summary={summary}
+            error={summaryError}
+            onRetry={load}
+          />
+        </div>
+      </div>
+
       {/* Intake trend — all roles, from candidate.created_at */}
       <div className="mt-6">
         <ChartCard
@@ -341,6 +365,115 @@ function OutcomeLinks({ advanced, rejected }: { advanced: number; rejected: numb
         <p className="mt-1 text-xl font-semibold tabular-nums text-error">{rejected}</p>
       </Link>
     </div>
+  );
+}
+
+/* ── Assessment outcomes (server-side aggregate; truthful) ──────────── */
+
+function AverageScoreCard({
+  summary,
+  error,
+}: {
+  summary: CandidatesSummary | null;
+  error: string | null;
+}) {
+  const hasAvg = summary != null && summary.average_score != null;
+  return (
+    <Link
+      to={candidatesHref({ assessed: true })}
+      aria-label={
+        hasAvg
+          ? `Average assessment score ${summary!.average_score} across ${summary!.assessed_count} assessed candidates. View them.`
+          : 'View assessed candidates.'
+      }
+      className="group block rounded-xl border border-line bg-surface p-5 shadow-card transition-shadow hover:shadow-md focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
+    >
+      <p className="text-xs font-medium uppercase tracking-wide text-ink-secondary">
+        Average score
+      </p>
+      {error ? (
+        <p className="mt-2 text-sm text-error">{error}</p>
+      ) : summary == null ? (
+        <p className="mt-2 text-sm text-ink-tertiary">Loading…</p>
+      ) : summary.average_score == null ? (
+        <>
+          <p className="mt-2 text-2xl font-semibold text-ink-tertiary">—</p>
+          <p className="mt-1 text-xs text-ink-tertiary">No assessments yet</p>
+        </>
+      ) : (
+        <>
+          <p className="mt-2 text-2xl font-semibold tabular-nums tracking-tight text-ink">
+            {summary.average_score}
+            <span className="ml-0.5 text-base font-normal text-ink-tertiary">/ 100</span>
+          </p>
+          <p className="mt-1 text-xs text-ink-tertiary">
+            across {summary.assessed_count} assessed candidate
+            {summary.assessed_count === 1 ? '' : 's'}
+          </p>
+        </>
+      )}
+    </Link>
+  );
+}
+
+function RecommendationDistribution({
+  summary,
+  error,
+  onRetry,
+}: {
+  summary: CandidatesSummary | null;
+  error: string | null;
+  onRetry: () => void;
+}) {
+  const navigate = useNavigate();
+  const dist = summary?.recommendation_distribution;
+  const data = dist
+    ? RECOMMENDATION_ORDER.filter((r) => dist[r] > 0).map((r) => ({
+        label: recommendationLabel(r),
+        value: dist[r],
+        href: candidatesHref({ recommendations: [r] }),
+      }))
+    : [];
+  const total = data.reduce((s, d) => s + d.value, 0);
+
+  return (
+    <ChartCard
+      title="Recommendation distribution"
+      description="Latest assessment recommendation per candidate. Select a category to view those candidates."
+    >
+      {error ? (
+        <div role="alert" className="flex h-full min-h-40 flex-col items-center justify-center gap-3 rounded-xl border border-error/30 bg-error-soft px-4 text-center">
+          <p className="max-w-md text-sm text-error">{error}</p>
+          <button
+            type="button"
+            onClick={onRetry}
+            className="inline-flex items-center rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-medium text-ink transition-colors hover:bg-surface-tertiary"
+          >
+            Try again
+          </button>
+        </div>
+      ) : summary == null ? (
+        <DonutChart title="Recommendation distribution" data={[]} isLoading height={240} />
+      ) : total === 0 ? (
+        <div className="flex h-full min-h-40 flex-col items-center justify-center gap-1.5 rounded-xl border border-dashed border-line-strong bg-surface-secondary px-4 text-center">
+          <p className="text-sm font-medium text-ink-secondary">No assessments yet</p>
+          <p className="max-w-sm text-xs text-ink-tertiary">
+            Recommendation counts appear once candidates are assessed.
+          </p>
+        </div>
+      ) : (
+        <DonutChart
+          title="Recommendation distribution"
+          data={data}
+          isLoading={false}
+          height={240}
+          onSegmentSelect={(i) => {
+            const target = data[i];
+            if (target?.href) navigate(target.href);
+          }}
+        />
+      )}
+    </ChartCard>
   );
 }
 

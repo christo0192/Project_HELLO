@@ -34,14 +34,40 @@ export type CandidateStatusKey = (typeof CANDIDATE_STATUS_ORDER)[number];
 
 const STATUS_SET = new Set<string>(CANDIDATE_STATUS_ORDER);
 
+/** Assessment recommendation vocabulary (assessment.recommendation). */
+export const RECOMMENDATION_ORDER = ['advance', 'hold', 'reject'] as const;
+export type RecommendationKey = (typeof RECOMMENDATION_ORDER)[number];
+const RECOMMENDATION_SET = new Set<string>(RECOMMENDATION_ORDER);
+
+const RECOMMENDATION_LABELS: Record<string, string> = {
+  advance: 'Advance',
+  hold: 'Hold',
+  reject: 'Reject',
+};
+
+/** Human label for a recommendation (fallback: the raw value). */
+export function recommendationLabel(rec: string | null | undefined): string {
+  if (!rec) return 'Unassessed';
+  return RECOMMENDATION_LABELS[rec] ?? rec;
+}
+
 export interface CandidateFilters {
   /** Selected statuses (empty = all). */
   statuses: string[];
+  /** Selected assessment recommendations (empty = all). */
+  recommendations: string[];
+  /** When true, restrict to candidates with a latest assessment score. */
+  assessed: boolean;
   /** Selected role id, or null for all roles. */
   roleId: string | null;
 }
 
-export const EMPTY_CANDIDATE_FILTERS: CandidateFilters = { statuses: [], roleId: null };
+export const EMPTY_CANDIDATE_FILTERS: CandidateFilters = {
+  statuses: [],
+  recommendations: [],
+  assessed: false,
+  roleId: null,
+};
 
 /** Normalize a candidate's status to a known key ('new' when missing). */
 export function normalizeStatus(status: string | null | undefined): string {
@@ -49,20 +75,25 @@ export function normalizeStatus(status: string | null | undefined): string {
   return s || 'new';
 }
 
-/** Parse filters from URL search params. Unknown statuses are dropped (truthful). */
+/** Parse filters from URL search params. Unknown values are dropped (truthful). */
 export function parseCandidateFilters(params: URLSearchParams): CandidateFilters {
   const rawStatus = params.get('status');
   const statuses = rawStatus
-    ? rawStatus
-        .split(',')
-        .map((s) => s.trim())
-        .filter((s) => STATUS_SET.has(s))
+    ? CANDIDATE_STATUS_ORDER.filter((s) =>
+        rawStatus.split(',').map((x) => x.trim()).filter((x) => STATUS_SET.has(x)).includes(s),
+      )
     : [];
-  // De-dupe while preserving canonical order.
-  const ordered = CANDIDATE_STATUS_ORDER.filter((s) => statuses.includes(s));
+  const rawRec = params.get('recommendation');
+  const recommendations = rawRec
+    ? RECOMMENDATION_ORDER.filter((r) =>
+        rawRec.split(',').map((x) => x.trim()).filter((x) => RECOMMENDATION_SET.has(x)).includes(r),
+      )
+    : [];
   const roleId = params.get('role');
   return {
-    statuses: ordered,
+    statuses: [...statuses],
+    recommendations: [...recommendations],
+    assessed: params.get('assessed') === '1',
     roleId: roleId && roleId.trim() ? roleId.trim() : null,
   };
 }
@@ -71,9 +102,15 @@ export function parseCandidateFilters(params: URLSearchParams): CandidateFilters
 export function buildCandidateSearch(filters: CandidateFilters): URLSearchParams {
   const params = new URLSearchParams();
   if (filters.statuses.length > 0) {
-    const ordered = CANDIDATE_STATUS_ORDER.filter((s) => filters.statuses.includes(s));
-    params.set('status', ordered.join(','));
+    params.set('status', CANDIDATE_STATUS_ORDER.filter((s) => filters.statuses.includes(s)).join(','));
   }
+  if (filters.recommendations.length > 0) {
+    params.set(
+      'recommendation',
+      RECOMMENDATION_ORDER.filter((r) => filters.recommendations.includes(r)).join(','),
+    );
+  }
+  if (filters.assessed) params.set('assessed', '1');
   if (filters.roleId) params.set('role', filters.roleId);
   return params;
 }
@@ -81,8 +118,8 @@ export function buildCandidateSearch(filters: CandidateFilters): URLSearchParams
 /** Build an href to the Candidates page with the given filters applied. */
 export function candidatesHref(filters: Partial<CandidateFilters> = {}): string {
   const params = buildCandidateSearch({
-    statuses: filters.statuses ?? [],
-    roleId: filters.roleId ?? null,
+    ...EMPTY_CANDIDATE_FILTERS,
+    ...filters,
   });
   const qs = params.toString();
   return qs ? `/candidates?${qs}` : '/candidates';
@@ -94,9 +131,31 @@ export function matchesCandidateStatus(candidate: Candidate, filters: CandidateF
   return filters.statuses.includes(normalizeStatus(candidate.status));
 }
 
+/**
+ * Full client-side predicate: status + recommendation + assessed. Role is
+ * filtered server-side. Recommendation/assessed use the list-enriched
+ * latest_recommendation / latest_score fields.
+ */
+export function matchesCandidateFilters(candidate: Candidate, filters: CandidateFilters): boolean {
+  if (!matchesCandidateStatus(candidate, filters)) return false;
+  if (
+    filters.recommendations.length > 0 &&
+    !(candidate.latest_recommendation && filters.recommendations.includes(candidate.latest_recommendation))
+  ) {
+    return false;
+  }
+  if (filters.assessed && candidate.latest_score == null) return false;
+  return true;
+}
+
 /** True when any filter is active. */
 export function hasActiveFilters(filters: CandidateFilters): boolean {
-  return filters.statuses.length > 0 || filters.roleId !== null;
+  return (
+    filters.statuses.length > 0 ||
+    filters.recommendations.length > 0 ||
+    filters.assessed ||
+    filters.roleId !== null
+  );
 }
 
 /**

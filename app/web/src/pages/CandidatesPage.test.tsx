@@ -36,9 +36,25 @@ vi.mock('../api', () => ({
 }));
 
 const CANDIDATES = [
-  mockCandidate, // status: new, email jane@example.com
-  { ...mockCandidate, id: 'c-screened', name: 'Screened Sam', email: 'sam@example.com', status: 'screened' },
-  { ...mockCandidate, id: 'c-screening', name: 'Screening Sara', email: 'sara@example.com', status: 'screening' },
+  mockCandidate, // status: new, email jane@example.com, unassessed
+  {
+    ...mockCandidate,
+    id: 'c-screened',
+    name: 'Screened Sam',
+    email: 'sam@example.com',
+    status: 'screened',
+    latest_recommendation: 'advance',
+    latest_score: 82,
+  },
+  {
+    ...mockCandidate,
+    id: 'c-screening',
+    name: 'Screening Sara',
+    email: 'sara@example.com',
+    status: 'screening',
+    latest_recommendation: 'reject',
+    latest_score: 41,
+  },
 ];
 
 function renderPage(entry = '/candidates', ui: ReactNode = <CandidatesPage />) {
@@ -129,6 +145,38 @@ describe('CandidatesPage', () => {
   it('shows a truthful empty state when filters match nothing', async () => {
     renderPage('/candidates?status=rejected');
     expect(await screen.findByText('No candidates match these filters')).toBeInTheDocument();
+  });
+
+  it('shows the recommendation column and applies a recommendation deep link', async () => {
+    renderPage('/candidates?recommendation=advance');
+    // Only the advance-recommended candidate is visible.
+    expect(await screen.findByText('Screened Sam')).toBeInTheDocument();
+    expect(screen.queryByText('Screening Sara')).not.toBeInTheDocument();
+    expect(screen.queryByText('Jane Doe')).not.toBeInTheDocument();
+    // The recommendation is visibly shown (badge + score) in the table.
+    const table = screen.getByRole('table', { name: /candidates in your pipeline/i });
+    expect(within(table).getByText('Advance')).toBeInTheDocument();
+    expect(within(table).getByText('82')).toBeInTheDocument();
+    expect(screen.getByText('Rec: Advance')).toBeInTheDocument();
+  });
+
+  it('applies the assessed deep link (average-score cohort)', async () => {
+    renderPage('/candidates?assessed=1');
+    // Only candidates with a latest score remain (Sam + Sara), not the unassessed Jane.
+    expect(await screen.findByText('Screened Sam')).toBeInTheDocument();
+    expect(screen.getByText('Screening Sara')).toBeInTheDocument();
+    expect(screen.queryByText('Jane Doe')).not.toBeInTheDocument();
+    expect(screen.getByText('Assessed')).toBeInTheDocument();
+  });
+
+  it('toggles a recommendation filter into the URL', async () => {
+    renderPage();
+    await screen.findByText('Jane Doe');
+    const group = screen.getByRole('group', { name: 'Filter by recommendation' });
+    fireEvent.click(within(group).getByRole('button', { name: /Reject/i }));
+    expect(await screen.findByText('Screening Sara')).toBeInTheDocument();
+    expect(screen.queryByText('Screened Sam')).not.toBeInTheDocument();
+    expect(screen.queryByText('Jane Doe')).not.toBeInTheDocument();
   });
 
   it('upload button is disabled without a file', async () => {
