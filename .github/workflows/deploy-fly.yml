@@ -1,0 +1,165 @@
+name: Deploy (Fly)
+
+# Deploys the changed Fly service(s) after the required "Quality" checks pass on
+# main. This closes the deployment-skew gap that let a merged fix (PR #48) sit
+# undeployed on the voice worker while the API advanced — a merge to main now
+# deploys exactly the service(s) whose sources changed.
+#
+# Security properties (this file is production security code):
+#  - Least privilege: only `contents: read`. No write scopes.
+#  - Runs ONLY after the Quality workflow concludes success on a push to main
+#    (never on PRs, never on a failed/cancelled Quality run).
+#  - Per-service concurrency groups serialize deploys and never cancel an
+#    in-flight release (cancel-in-progress: false).
+#  - Deploys only the service(s) with changed sources (path diff of the merge).
+#  - Third-party and first-party actions are pinned to immutable full commit
+#    SHAs (no floating tags, no @master), consistent with repo hardening policy.
+#  - Per-service Fly tokens: the API job can ONLY use FLY_API_TOKEN_API and the
+#    voice job ONLY FLY_API_TOKEN_VOICE, so a compromise of one job cannot deploy
+#    the other app. Tokens are consumed only as step env for flyctl, never
+#    echoed. Fly APP secrets (provider keys, Supabase, LiveKit) are untouched.
+#  - Post-deploy verification is CURRENT, not historical: API /api/health must
+#    return 200, and the voice worker must log "registered worker" with a
+#    timestamp at/after a watermark captured immediately before the release —
+#    a stale old registration line cannot satisfy the check.
+#
+# Prerequisite (one-time, owner action — NOT stored in VCS; no secret values):
+#   Two app-scoped repository secrets must exist, each a `fly tokens create
+#   deploy -a <app>` token:
+#     FLY_API_TOKEN_API    → deploy access to project-hello-api ONLY
+#     FLY_API_TOKEN_VOICE  → deploy access to project-hello-voice ONLY
+#   Until they exist the corresponding deploy job fails closed at the flyctl step.
+
+on:
+  workflow_run:
+    workflows: ["Quality"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      service:
+        description: Service to redeploy manually (recovery valve)
+        required: true
+        type: choice
+        options: [api, voice, both]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fly-deploy-${{ github.event.workflow_run.head_sha || github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    # Gate: manual dispatch, OR a SUCCESSFUL Quality run triggered by a push to main.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    outputs:
+      api: ${{ steps.decide.outputs.api }}
+      voice: ${{ steps.decide.outputs.voice }}
+      sha: ${{ steps.decide.outputs.sha }}
+    steps:
+      - name: Resolve target SHA
+        id: sha
+        run: echo "sha=${{ github.event.workflow_run.head_sha || github.sha }}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.x
+        with:
+          ref: ${{ steps.sha.outputs.sha }}
+          fetch-depth: 2
+      - name: Decide which services changed
+        id: decide
+        env:
+          SVC: ${{ github.event.inputs.service }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          sha='${{ steps.sha.outputs.sha }}'
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            case "$SVC" in
+              api)   echo "api=true"  >> "$GITHUB_OUTPUT"; echo "voice=false" >> "$GITHUB_OUTPUT" ;;
+              voice) echo "api=false" >> "$GITHUB_OUTPUT"; echo "voice=true"  >> "$GITHUB_OUTPUT" ;;
+              both)  echo "api=true"  >> "$GITHUB_OUTPUT"; echo "voice=true"  >> "$GITHUB_OUTPUT" ;;
+            esac
+            exit 0
+          fi
+          # Path diff of the merge commit (fallback to single-commit file list).
+          changed="$(git diff --name-only "${sha}^" "${sha}" 2>/dev/null || git show --name-only --format= "${sha}")"
+          echo "$changed" | grep -qE '^app/api/'          && echo "api=true"   >> "$GITHUB_OUTPUT" || echo "api=false"   >> "$GITHUB_OUTPUT"
+          echo "$changed" | grep -qE '^app/voice-livekit/' && echo "voice=true" >> "$GITHUB_OUTPUT" || echo "voice=false" >> "$GITHUB_OUTPUT"
+
+  deploy-api:
+    needs: detect
+    if: needs.detect.outputs.api == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: fly-deploy-api
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.x
+        with:
+          ref: ${{ needs.detect.outputs.sha }}
+      - uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be # v1.5
+      - name: Deploy API
+        working-directory: app/api
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_API }}
+        run: flyctl deploy --remote-only --config fly.toml
+      - name: Verify /api/health (current)
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' https://project-hello-api.fly.dev/api/health || true)"
+            if [ "$code" = "200" ]; then echo "API healthy (200)"; exit 0; fi
+            sleep 5
+          done
+          echo "::error::API health check did not return 200"; exit 1
+
+  deploy-voice:
+    needs: detect
+    if: needs.detect.outputs.voice == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: fly-deploy-voice
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.x
+        with:
+          ref: ${{ needs.detect.outputs.sha }}
+      - uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be # v1.5
+      - name: Deploy voice worker
+        id: deploy
+        working-directory: app/voice-livekit
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_VOICE }}
+        run: |
+          set -euo pipefail
+          # Watermark captured BEFORE the release so the registration check below
+          # cannot be satisfied by a stale historical "registered worker" line.
+          echo "watermark=$(date -u +%Y-%m-%dT%H:%M:%S)" >> "$GITHUB_OUTPUT"
+          flyctl deploy --remote-only --config fly.toml
+      - name: Verify CURRENT worker registration
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_VOICE }}
+          WATERMARK: ${{ steps.deploy.outputs.watermark }}
+        run: |
+          set -euo pipefail
+          flyctl status -a project-hello-voice
+          # Accept ONLY a "registered worker" line whose ISO-8601 log timestamp is
+          # at/after the pre-deploy watermark (ISO-8601 sorts lexically), tying the
+          # evidence to the release this job just created — not an old log line.
+          for i in $(seq 1 24); do
+            ts="$(flyctl logs -a project-hello-voice --no-tail 2>/dev/null \
+                  | grep 'registered worker' \
+                  | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}' \
+                  | sort | tail -1 || true)"
+            if [ -n "$ts" ] && [ "$(printf '%s\n%s\n' "$WATERMARK" "$ts" | sort | tail -1)" = "$ts" ]; then
+              echo "voice worker re-registered at $ts (>= watermark $WATERMARK)"; exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::no current 'registered worker' log at/after watermark $WATERMARK"; exit 1
