@@ -30,6 +30,8 @@ jobs:
         run: node scripts/check-phase0-2-build-status.test.mjs && node scripts/check-phase0-2-build-status.mjs
       - name: Validate environment contract
         run: node scripts/check-env-contract.mjs && node scripts/check-env-contract.test.mjs
+      - name: Validate Fly deploy workflow contract
+        run: node scripts/deploy-fly-workflow.test.mjs
       - name: Validate architecture decision records
         run: node scripts/check-adrs.mjs
       - name: Install, typecheck, and test API
