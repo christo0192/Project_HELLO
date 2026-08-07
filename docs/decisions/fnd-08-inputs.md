@@ -22,7 +22,7 @@ record supersedes it for decision authority.
 
 | ID | Decision | Owner Decision | Owner-Approval Status |
 |----|----------|----------------|----------------------|
-| D-001 | Auth provider | **Supabase Auth: email/password + SSO + MFA.** ADR-0003 accepted as architecture. | Accepted as architecture. Production: blocked. |
+| D-001 | Auth provider | **Supabase Auth: email/password + Google OAuth, single factor (no MFA).** Authorization by server-held active allowlist + role. ADR-0003 accepted as architecture; MFA element withdrawn 2026-08-06 by owner (ADR-0011). | Accepted as architecture, single-factor risk explicitly accepted by owner. Production: blocked. |
 | D-002 | Queue/worker platform | **pg-boss in existing Supabase/Postgres; no new queue infra.** ADR-0004 accepted as architecture. | Accepted as architecture. Production: blocked. |
 | D-003 | Cloud provider + region | **Oracle Cloud Always-Free Mumbai, $0.** ADR-0007 accepted as architecture. | Accepted as architecture. Production: blocked. |
 | D-004 | Scoring provider/hosting | **DeepSeek V4 Pro self-hosted by Ikey on in-house India infrastructure (fly.io India).** No China cross-border transfer; no DeepSeek vendor DPA needed. Pre-egress strip name/phone/email is optional GOV-02 defense-in-depth, owner-run, not a hard go-live blocker. Model-license/IP commercial-use check is a minor non-data-protection follow-up. Legal memo folded into general DPDP package. | Accepted as architecture. No D-004-specific go-live blocker. |
@@ -40,7 +40,7 @@ record supersedes it for decision authority.
 
 | Item | Owner Decision |
 |------|----------------|
-| Auth provider | Supabase Auth (email/password + SSO + MFA). ADR-0003 accepted. |
+| Auth provider | Supabase Auth (email/password + Google OAuth), single factor — no MFA. Authorization by server-held active allowlist + role. ADR-0003 accepted; MFA withdrawn 2026-08-06 (ADR-0011). |
 | Queue platform | pg-boss in existing Supabase/Postgres. ADR-0004 accepted. |
 | Cloud provider | Oracle Cloud Always-Free Mumbai ($0). ADR-0007 accepted. |
 | Tenancy model | Single-org IK India (admin/interviewer/viewer, no org_id). ADR-0005 accepted. |

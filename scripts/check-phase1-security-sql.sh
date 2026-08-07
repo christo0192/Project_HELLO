@@ -181,25 +181,137 @@ has_ge "$C" "^enable_signup = false" 1 \
   && pass "Public signup disabled" \
   || fail "Public signup not disabled"
 
-# MFA TOTP
-TOTP_SECTION=$(grep -A3 '^\[auth.mfa.totp\]' "$C" || true)
-echo "$TOTP_SECTION" | grep -q 'enroll_enabled = true' \
-  && pass "TOTP enroll enabled" \
-  || fail "TOTP enroll not enabled"
-echo "$TOTP_SECTION" | grep -q 'verify_enabled = true' \
-  && pass "TOTP verify enabled" \
-  || fail "TOTP verify not enabled"
+# ── ADR-0011 invariant: no second factor of any kind ────────────────
+#
+# Extract a TOML section by header, from the header line up to (but not
+# including) the next top-level/sub-table header. Unlike `grep -A<n>` this
+# cannot silently truncate when a section grows, and it returns EMPTY when
+# the section is absent — so a missing section can never satisfy a check.
+section() {
+  awk -v want="$1" '
+    /^[[:space:]]*\[/ { inside = ($0 ~ "^[[:space:]]*\\[" want "\\][[:space:]]*$") ? 1 : 0; next }
+    inside { print }
+  ' "$2"
+}
 
-# Session timeouts
-has_ge "$C" '\[auth.sessions\]' 1 && pass "[auth.sessions] section exists" \
-  || fail "[auth.sessions] section missing"
-SESS_SECTION=$(grep -A5 '^\[auth.sessions\]' "$C" || true)
-echo "$SESS_SECTION" | grep -q 'timebox' \
-  && pass "Session timebox set" \
-  || fail "Session timebox not set"
-echo "$SESS_SECTION" | grep -q 'inactivity_timeout' \
-  && pass "Session inactivity_timeout set" \
-  || fail "Session inactivity_timeout not set"
+# Assert `key = false` inside a section that MUST exist. Fails closed on a
+# missing section, a missing key, a malformed value, or `true`.
+assert_key_false() {
+  local sec="$1" key="$2" label="$3" body
+  body=$(section "$sec" "$C")
+  if [ -z "$(printf '%s' "$body" | tr -d '[:space:]')" ]; then
+    fail "$label — [$sec] section missing or empty in $C"
+    return
+  fi
+  local line
+  line=$(printf '%s\n' "$body" | grep -E "^[[:space:]]*${key}[[:space:]]*=" | head -1 || true)
+  if [ -z "$line" ]; then
+    fail "$label — '$key' not declared in [$sec]"
+  elif printf '%s' "$line" | grep -qE "^[[:space:]]*${key}[[:space:]]*=[[:space:]]*false[[:space:]]*$"; then
+    pass "$label"
+  else
+    fail "$label — '$key' is not exactly false in [$sec] (got: $(printf '%s' "$line" | tr -s '[:space:]' ' '))"
+  fi
+}
+
+# TOTP: enrollment AND verification disabled. Both must be off together —
+# leaving verification on while enrollment is off (or vice versa) lets
+# enrollment state diverge from enforcement.
+assert_key_false "auth.mfa.totp" "enroll_enabled" "TOTP enroll disabled (ADR-0011)"
+assert_key_false "auth.mfa.totp" "verify_enabled" "TOTP verify disabled (ADR-0011)"
+
+# Phone/SMS: enrollment AND verification disabled.
+assert_key_false "auth.mfa.phone" "enroll_enabled" "Phone MFA enroll disabled (ADR-0011)"
+assert_key_false "auth.mfa.phone" "verify_enabled" "Phone MFA verify disabled (ADR-0011)"
+
+# Guard against a factor type being re-enabled anywhere under [auth.mfa.*]
+# (e.g. an uncommented [auth.mfa.web_authn] block).
+ENABLED_FACTOR=$(awk '
+  /^[[:space:]]*\[/ { inside = ($0 ~ /^[[:space:]]*\[auth\.mfa\./) ? 1 : 0; next }
+  inside && /^[[:space:]]*(enroll_enabled|verify_enabled)[[:space:]]*=[[:space:]]*true[[:space:]]*$/ { print }
+' "$C" || true)
+[ -z "$ENABLED_FACTOR" ] \
+  && pass "No MFA factor type enables enroll/verify (ADR-0011)" \
+  || fail "An [auth.mfa.*] factor still enables enroll/verify: $(printf '%s' "$ENABLED_FACTOR" | tr -s '[:space:]' ' ')"
+
+# Session timeouts — RETAINED. Shorter-lived sessions are load-bearing now
+# that a single factor guards access (ADR-0011 § Controls retained).
+SESS_SECTION=$(section "auth.sessions" "$C")
+if [ -z "$(printf '%s' "$SESS_SECTION" | tr -d '[:space:]')" ]; then
+  fail "[auth.sessions] section missing or empty in $C"
+  fail "Session timebox not set"
+  fail "Session inactivity_timeout not set"
+else
+  pass "[auth.sessions] section exists"
+  printf '%s\n' "$SESS_SECTION" | grep -qE '^[[:space:]]*timebox[[:space:]]*=[[:space:]]*".+"' \
+    && pass "Session timebox set" \
+    || fail "Session timebox not set (or malformed)"
+  printf '%s\n' "$SESS_SECTION" | grep -qE '^[[:space:]]*inactivity_timeout[[:space:]]*=[[:space:]]*".+"' \
+    && pass "Session inactivity_timeout set" \
+    || fail "Session inactivity_timeout not set (or malformed)"
+fi
+
+# ============ 5b. ADR-0011 server-side allowlist + RBAC ============
+echo "=== 5b. Server-side allowlist / RBAC controls (ADR-0011) ==="
+
+AL="app/supabase/migrations/0016_dashboard_access_allowlist.sql"
+API_AUTH="app/api/src/lib/auth.ts"
+API_RBAC="app/api/src/lib/rbac.ts"
+
+for f in "$AL" "$API_AUTH" "$API_RBAC"; do
+  [ -f "$f" ] || { fail "Required ADR-0011 file missing: $f"; }
+done
+
+if [ -f "$AL" ]; then
+  has_ge "$AL" "create table if not exists screening_v2\.email_allowlist" 1 \
+    && pass "email_allowlist table defined" \
+    || fail "email_allowlist table missing"
+  has_ge "$AL" "alter table screening_v2\.email_allowlist enable row level security" 1 \
+    && pass "email_allowlist RLS enabled" \
+    || fail "email_allowlist RLS not enabled"
+  has_ge "$AL" "revoke all on screening_v2\.email_allowlist from anon, authenticated, public" 1 \
+    && pass "email_allowlist revoked from anon/authenticated/public" \
+    || fail "email_allowlist not revoked from anon/authenticated/public"
+  has_ge "$AL" "create or replace function screening_v2\.resolve_allowlist_access" 1 \
+    && pass "resolve_allowlist_access resolver defined" \
+    || fail "resolve_allowlist_access resolver missing"
+fi
+
+if [ -f "$API_AUTH" ]; then
+  # The API must resolve the allowlist on every request…
+  has_ge "$API_AUTH" "resolve_allowlist_access" 1 \
+    && pass "API calls resolve_allowlist_access" \
+    || fail "API does not call resolve_allowlist_access"
+  # …and must require a Supabase-verified email before doing so.
+  has_ge "$API_AUTH" "emailVerified" 1 \
+    && pass "API gates on verified email" \
+    || fail "API does not gate on verified email"
+  # Exact company domain, never the OAuth hd hint.
+  has_ge "$API_AUTH" "ALLOWED_ACCESS_DOMAIN" 1 \
+    && pass "API enforces an exact access domain" \
+    || fail "API exact access domain constant missing"
+fi
+
+if [ -f "$API_RBAC" ]; then
+  has_ge "$API_RBAC" "export function requireRole" 1 \
+    && pass "RBAC requireRole present" \
+    || fail "RBAC requireRole missing"
+  # requireRole must fail closed when no server-set authUser exists.
+  has_ge "$API_RBAC" "req\.authUser" 1 \
+    && pass "RBAC reads server-set authUser" \
+    || fail "RBAC does not read server-set authUser"
+fi
+
+# No AAL2 gate may be reintroduced without also restoring enrollment
+# (see ADR-0011 § Consequences) — flag the inconsistent half-state.
+if [ -f "$API_AUTH" ]; then
+  AAL_GATE=$(grep -nE "aal[[:space:]]*!==[[:space:]]*'aal2'" "$API_AUTH" || true)
+  if [ -z "$AAL_GATE" ]; then
+    pass "No AAL2 authorization gate (consistent with disabled enrollment)"
+  else
+    fail "AAL2 gate present while MFA enrollment is disabled — new users would be stranded: $(printf '%s' "$AAL_GATE" | tr -s '[:space:]' ' ')"
+  fi
+fi
 
 # ============ 6. Membership preservation ============
 echo "=== 6. Membership table preservation ==="

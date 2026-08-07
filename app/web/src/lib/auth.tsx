@@ -4,21 +4,30 @@
  * Provides:
  *   - Email/password sign-in via Supabase
  *   - Session restoration on page load via `getSession()`
- *   - AAL tracking via `supabase.auth.mfa.getAuthenticatorAssuranceLevel()`
- *   - TOTP MFA enrollment and challenge (AAL1 → AAL2)
- *   - SSO OAuth initiation from an allowlisted provider env value
+ *   - Google OAuth initiation from an allowlisted provider env value
+ *   - Authoritative role resolution via GET /api/me
  *   - Session cleanup on 401 (via auth:unauthorized event)
  *   - Logout clears subscriptions and app state
  *
  * Public signup is NOT supported — only existing recruiter accounts.
  *
- * ── AAL (Authenticator Assurance Level) ───────────────────────────────
- *   - `aal1`: basic auth (email/password or OAuth)
- *   - `aal2`: MFA verified (TOTP factor verified)
+ * ── Authentication model (ADR-0011) ───────────────────────────────────
+ * Single factor: NO MFA. A valid Supabase session authenticates the user;
+ * authorization is an ACTIVE entry in the server-held email allowlist plus
+ * the role held there, enforced by the API on every request. Nothing here
+ * is authorization — the API is always authoritative.
  *
- * The `getAuthenticatorAssuranceLevel()` API checks the JWT's `aal` claim
- * AND the user's verified MFA factors.  After TOTP verification via
- * `mfa.verify()`, the session token is rotated with `aal2` in the JWT.
+ * `aal` is still tracked for observability but is NOT an access input, and
+ * `needsMfa` is retained as a constant `false` so consumers keep compiling.
+ * Reinstating MFA means restoring the gate here AND in the API's
+ * verifyToken()/resolveFullAuth() together, plus re-enabling enrollment in
+ * Supabase config.
+ *
+ * ── Role resolution ──────────────────────────────────────────────────
+ * `isRoleLoading` is true while GET /api/me is in flight. ProtectedRoute
+ * must render a loading state (never children) while it is true, so no
+ * recruiter/candidate data is shown before the role resolves. A resolved
+ * `role === null` means /api/me failed or denied — fail closed.
  */
 
 import {
@@ -54,18 +63,27 @@ export interface AuthState {
   aal: AAL;
   /** True while initial session check or sign-in is in progress. */
   isLoading: boolean;
-  /** True if the user has a session but needs MFA (AAL1). */
+  /**
+   * Always false — MFA was removed in ADR-0011. Retained so existing
+   * consumers keep compiling; do not reintroduce a gate on this without
+   * also restoring the API-side gates.
+   */
   needsMfa: boolean;
-  /** True if the user has a session at AAL2 (fully authenticated). */
+  /** True if the user has a valid session (single factor — ADR-0011). */
   isAuthenticated: boolean;
-  /** Enrolled MFA factors (populated after sign-in). */
+  /** Enrolled MFA factors. Always empty in practice — enrollment disabled. */
   factors: MfaFactor[];
   /**
-   * Authoritative role from GET /api/me (membership resolver), loaded only
-   * after an AAL2 session. Never derived from editable app_metadata. Null
-   * while unresolved or when /api/me failed (fail closed).
+   * Authoritative role from GET /api/me (server-held allowlist role).
+   * Never derived from editable app_metadata. Null while unresolved or when
+   * /api/me failed/denied (fail closed).
    */
   role: MembershipRole | null;
+  /**
+   * True while GET /api/me is in flight. Guards against rendering any
+   * recruiter/candidate data before the role resolves.
+   */
+  isRoleLoading: boolean;
 
   /** Sign in with email and password. */
   signIn: (email: string, password: string) => Promise<{ error: AuthError | null }>;
@@ -168,22 +186,29 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [isLoading, setIsLoading] = useState(true);
   const [factors, setFactors] = useState<MfaFactor[]>([]);
   const [role, setRole] = useState<MembershipRole | null>(null);
+  const [isRoleLoading, setIsRoleLoading] = useState(false);
   const subscriptionRef = useRef<{ unsubscribe: () => void } | null>(null);
 
-  const needsMfa = aal === 'aal1' && session !== null;
-  const isAuthenticated = aal === 'aal2' && session !== null;
+  // ADR-0011: single factor. A valid session authenticates; the API enforces
+  // the active allowlist entry and role on every request.
+  const needsMfa = false;
+  const isAuthenticated = session !== null;
 
   /**
-   * Load the authoritative role/active from GET /api/me after an AAL2
-   * session. Never trusts editable app_metadata for role UX. Failures set
-   * role to null (fail closed — ProtectedRoute shows a safe state).
+   * Load the authoritative role from GET /api/me (server-held allowlist
+   * role). Never trusts editable app_metadata for role UX. Failures and
+   * denials set role to null (fail closed — ProtectedRoute shows a safe
+   * state). `isRoleLoading` brackets the request so no data renders first.
    */
   const refreshRole = useCallback(async (): Promise<void> => {
+    setIsRoleLoading(true);
     try {
       const me = await api.getMe();
       setRole(me.role);
     } catch {
       setRole(null);
+    } finally {
+      setIsRoleLoading(false);
     }
   }, []);
 
@@ -201,11 +226,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (currentSession) {
       const verifiedFactors = await getVerifiedTotpFactors();
       setFactors(verifiedFactors);
-      if (level === 'aal2') {
-        await refreshRole();
-      } else {
-        setRole(null);
-      }
+      // ADR-0011: role resolves for any valid session, not only aal2.
+      await refreshRole();
     } else {
       setFactors([]);
       setRole(null);
@@ -359,15 +381,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         const verifiedFactors = await getVerifiedTotpFactors();
         if (!cancelled) setFactors(verifiedFactors);
 
-        if (level === 'aal2') {
-          try {
-            const me = await api.getMe();
-            if (!cancelled) setRole(me.role);
-          } catch {
-            if (!cancelled) setRole(null);
-          }
-        } else if (!cancelled) {
-          setRole(null);
+        // ADR-0011: role resolves for any valid session, not only aal2.
+        if (!cancelled) setIsRoleLoading(true);
+        try {
+          const me = await api.getMe();
+          if (!cancelled) setRole(me.role);
+        } catch {
+          if (!cancelled) setRole(null);
+        } finally {
+          if (!cancelled) setIsRoleLoading(false);
         }
       }
 
@@ -390,6 +412,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (_event === 'SIGNED_OUT') {
         setAal(null);
         setFactors([]);
+        setRole(null);
+        setIsRoleLoading(false);
         if (subscriptionRef.current) {
           subscriptionRef.current.unsubscribe();
           subscriptionRef.current = null;
@@ -399,19 +423,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       // For SIGNED_IN, TOKEN_REFRESHED, USER_UPDATED — refresh AAL
       if (currentSession) {
+        // AAL tracked for observability only (ADR-0011).
         getAalLevel().then((level) => {
           setAal(level);
-          if (level === 'aal2') {
-            refreshRole();
-          } else {
-            setRole(null);
-          }
         });
+        refreshRole();
         getVerifiedTotpFactors().then((verifiedFactors) => {
           setFactors(verifiedFactors);
         });
       } else {
         setRole(null);
+        setIsRoleLoading(false);
       }
     });
 
@@ -431,6 +453,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       isAuthenticated,
       factors,
       role,
+      isRoleLoading,
       signIn,
       signOut,
       signInWithSSO,
@@ -447,6 +470,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       isAuthenticated,
       factors,
       role,
+      isRoleLoading,
       signIn,
       signOut,
       signInWithSSO,

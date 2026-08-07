@@ -2,6 +2,8 @@
 
 **Status:** Accepted
 
+**Partial supersession:** § Decision bullet 3 (the `aal=aal2` requirement) is superseded by ADR-0011. All other decisions in this record remain binding.
+
 **Decision owner:** Sole Product/Engineering owner
 
 **Plan references:** D-001, D-011, SEC-01, SEC-02, SEC-03, SEC-08, FND-05, FND-06
@@ -18,7 +20,7 @@ Use the Supabase access token as an `Authorization: Bearer` token for recruiter 
 
 - The API validates the token through Supabase Auth before reading its bounded JWT claims.
 - Recruiter role and active state come from `screening_v2.recruiter_memberships` in the production/default path, not browser-controlled metadata.
-- Admin and interviewer requests require a verified top-level `aal=aal2` claim.
+- ~~Admin and interviewer requests require a verified top-level `aal=aal2` claim.~~ **Superseded by ADR-0011:** no second factor is required. Authorization is an active entry in the server-held `screening_v2.email_allowlist` plus the role held there, resolved on every request. `aal` is no longer an authorization input.
 - Public endpoints are narrowly enumerated and authenticate with their own one-time candidate grant or worker credential.
 - The application does not add a second token copy. Supabase JS still persists its session as plaintext JSON in browser local storage by default.
 - Cookies and a custom CSRF token are not introduced. Cross-site forms cannot attach the bearer header, while CORS restricts browser response access. XSS remains the principal browser token-theft risk.
@@ -51,4 +53,6 @@ Production acceptance requires FND-05/FND-06, authentic hosted MFA and SSO confi
 
 ## Supersession
 
-None. Supersede this ADR if the application adopts server-managed HttpOnly sessions or another identity provider.
+Partially superseded by **ADR-0011** (recruiter single-factor authentication with server-side allowlist authorization), which removes the `aal=aal2` requirement in § Decision bullet 3 and records explicit owner risk acceptance of single-factor authentication. All other decisions in this ADR remain in force.
+
+Supersede the remainder of this ADR if the application adopts server-managed HttpOnly sessions or another identity provider.

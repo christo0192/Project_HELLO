@@ -191,7 +191,7 @@ describe('AuthProvider', () => {
     });
   });
 
-  it('restores session on mount', async () => {
+  it('restores session on mount and authenticates a single-factor (aal1) session', async () => {
     mockSupabase.auth.getSession = vi
       .fn()
       .mockResolvedValue({ data: { session: mockSession }, error: null });
@@ -204,9 +204,12 @@ describe('AuthProvider', () => {
       expect(screen.getByTestId('user-email')).toHaveTextContent(
         'recruiter@example.com',
       );
+      // AAL is still tracked for observability…
       expect(screen.getByTestId('aal')).toHaveTextContent('aal1');
-      expect(screen.getByTestId('needs-mfa')).toHaveTextContent('yes');
-      expect(screen.getByTestId('authenticated')).toHaveTextContent('no');
+      // …but ADR-0011 removed MFA entirely: needsMfa is always false and a
+      // valid single-factor session is authenticated.
+      expect(screen.getByTestId('needs-mfa')).toHaveTextContent('no');
+      expect(screen.getByTestId('authenticated')).toHaveTextContent('yes');
     });
   });
 

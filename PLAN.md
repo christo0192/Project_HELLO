@@ -40,7 +40,7 @@
 
 1.  The user/org controls a billing account with Supabase, LiveKit Cloud, and Oracle Cloud Infrastructure (region TBD after Mumbai/Hyderabad benchmark).
 2.  A Supabase production project already exists unused in Mumbai (`ap-south-1`). Company-controlled organization ownership evidence and access configuration pending; second MFA admin, plan, PITR, billing-alert, and break-glass acceptance are pending.
-3.  Recruiter users will authenticate via Supabase Auth (direction selected; auth modes, MFA enforcement, lifecycle, and DPA evidence pending formal owner approval) — not phone-only.
+3.  Recruiter users will authenticate via Supabase Auth (direction selected; **MFA enforcement withdrawn 2026-08-06 per ADR-0011 — single factor, owner risk accepted**; lifecycle and DPA evidence pending formal owner approval) — not phone-only.
 4.  Candidate join flow remains browser-based; candidates do not authenticate (token-gated join).
 5.  Browser-first production launch occurs before any telephony integration.
 6.  DLT registration, consent automation, and legal review for outbound calling will gate the telephony phase (§6.17).
@@ -83,7 +83,7 @@ The current MVP demonstrated a working voice-screening loop prototype: a candida
 |-----------|---------------|-----------------------------------|
 | **Git** | None | Monorepo with protected branches, signed commits, pre-commit hooks |
 | **Environments** | Local only | dev / staging / prod, fully separated |
-| **AuthN** | None (open API, anon Supabase) | Recruiter SSO + MFA, candidate join tokens (JWT, short-lived) |
+| **AuthN** | None (open API, anon Supabase) | Recruiter email/password + Google OAuth (single factor, no MFA — ADR-0011) with per-request allowlist+role authorization; candidate join tokens (JWT, short-lived) |
 | **AuthZ / RBAC** | None | Recruiter roles (admin, interviewer, viewer); single-org isolation for launch or `org_id` isolation only if D-011 approves multi-tenancy |
 | **LiveKit context privacy** | Candidate/resume/role/rubric context is serialized into room metadata | Worker-only context fetch; client-visible token/room metadata contains only minimal opaque identifiers |
 | **API security** | No rate limits, limited validation, 100 MB in-memory multer | Input validation, rate limits, quotas, streaming uploads, security headers/CSP, strict CORS, and CSRF protection if cookie-based auth is chosen |
@@ -177,7 +177,7 @@ For Phases 0–12, P0 blocks the browser-first launch. In Phase 13, P0 blocks **
 │               Supabase (Production Project)               │
 │  ┌───────────┐ ┌──────────┐ ┌──────────┐ ┌────────────┐ │
 │  │ Auth/RBAC │ │ Database │ │ Storage  │ │ Realtime   │ │
-│  │ (MFA)     │ │ (RLS)    │ │ (private)│ │ (scoped)   │ │
+│  │(allowlist)│ │ (RLS)    │ │ (private)│ │ (scoped)   │ │
 │  └───────────┘ └──────────┘ └──────────┘ └────────────┘ │
 │  Backups/PITR per approved plan | private storage | region evidenced │
 └─────────────────────────────────────────────────────────┘
@@ -187,7 +187,7 @@ For Phases 0–12, P0 blocks the browser-first launch. In Phase 13, P0 blocks **
 │                    Recruiter Dashboard                    │
 │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────────┐  │
 │  │ Approved │ │ Sessions │ │ Scorecard│ │ Admin      │  │
-│  │ auth+MFA │ │ List     │ │ Review   │ │ Panel      │  │
+│  │ allowlist│ │ List     │ │ Review   │ │ Panel      │  │
 │  └──────────┘ └──────────┘ └──────────┘ └────────────┘  │
 │  HTTPS | CSP | authorized API calls | CSRF if cookies    │
 └──────────────────────────────────────────────────────────┘
@@ -307,7 +307,7 @@ Implementation progress does not change the repository-wide **0/17 launch gates 
 
 | ID | Task | S | Owner | Dep | Effort | Acceptance / Verification | Rollback |
 |----|------|---|-------|-----|--------|--------------------------|----------|
-| **SEC-01** | Implement recruiter authentication (Supabase Auth or provider per D-001): email/password + SSO, MFA enforcement | P0 | Backend Eng | FND-06 | M | Login flow works; MFA required; session tokens short-lived. Test: unauthenticated API calls rejected 401 | Disable MFA (not recommended) |
+| **SEC-01** | Implement recruiter authentication (Supabase Auth per D-001): email/password + Google OAuth, **single factor — no MFA** (revised 2026-08-06, ADR-0011). Authorization by active server-held allowlist entry + role, resolved per request | P0 | Backend Eng | FND-06 | M | Login flow works; session tokens short-lived; unlisted/inactive users denied 403; unauthenticated API calls rejected 401. **No MFA requirement** — owner explicitly accepted single-factor risk | Reinstate a Supabase-managed factor (TOTP or phone): re-enable enrollment in Supabase config AND restore both AAL2 gates together — never one without the other |
 | **SEC-02** | Implement RBAC middleware on API: roles (admin, interviewer, viewer) with least-privilege access to sessions, candidates, assessments | P0 | Backend Eng | SEC-01 | M | Viewer can read but not create/delete; interviewer can manage own sessions; admin can manage org. Test: authorization matrix pass | Revert to open (not allowed) |
 | **SEC-03** | Decide tenancy model (D-011), then enforce it in API queries and RLS: single-org launch with authenticated roles, or `org_id` scoping if multi-tenancy is approved | P0 | Backend Eng + Product | SEC-01 | M | Automated authorization matrix proves users cannot access data outside their approved scope; if multi-tenant, org A cannot access org B at API or DB layers | N/A |
 | **SEC-04** | Implement revocable, one-time candidate invite exchange and short-lived LiveKit join grants scoped to one candidate/session/room | P0 | Backend Eng | SEC-03 | M | Invite cannot enumerate a session, expires, is single-use or safely replay-protected, can be revoked, and cannot join another room; recruiter issuance is authorized | Revoke and reissue invite |
@@ -328,7 +328,7 @@ Phase 1 is **not accepted**. PR #25 and PR #26 are merged to main. The local/syn
 
 | Task | Implementation status | Residual acceptance gate |
 |---|---|---|
-| SEC-01 | Partial: email/password UI, configurable OAuth initiation, TOTP/AAL2 flow and API bearer verification | FND-06, hosted SSO/MFA/account lifecycle and live evidence |
+| SEC-01 | Partial: email/password UI, configurable OAuth initiation, API bearer verification, per-request allowlist+role authorization. **MFA removed 2026-08-06 (ADR-0011)** — single factor, owner risk accepted | FND-06, hosted SSO/account lifecycle and live evidence; independent Security review of the single-factor posture |
 | SEC-02 | Partial: membership-backed admin/interviewer/viewer middleware and local authorization tests | Complete deployed endpoint/ownership matrix and least-privilege identities |
 | SEC-03 | Partial: single-org owner scoping in API/RLS | Production RLS proof, FND-06 and residency/ownership approval |
 | SEC-04 | Partial: digest-only one-time invites, grants and candidate join UI | Live provider replay/revocation/room-bound evidence and operational delivery |
@@ -634,10 +634,10 @@ This phase is **not** in scope for browser-first production launch. All tasks he
 
 ### 6.2 Identity, Authentication, RBAC, Tenant Isolation
 
-**Current state (2026-07-30):** Local/synthetic Supabase Auth, bearer API verification, TOTP/AAL2 recruiter guards, membership-backed roles, single-org ownership policies and one-time candidate invite/grant foundations are implemented. Production identity, hosted SSO/MFA, complete ownership coverage and FND-05/FND-06 remain pending; Phase 1 is not accepted.
+**Current state (2026-08-06):** Local/synthetic Supabase Auth, bearer API verification, per-request server-held allowlist + role authorization, membership-backed roles, single-org ownership policies and one-time candidate invite/grant foundations are implemented. **TOTP/AAL2 recruiter guards were removed on 2026-08-06 (ADR-0011) at explicit owner direction; recruiter authentication is single factor and the owner has accepted that risk.** Production identity, hosted SSO, complete ownership coverage and FND-05/FND-06 remain pending; Phase 1 is not accepted.
 
 **Target state:**
-- Recruiters authenticate with MFA; SSO and session policy are selected in D-001 from threat model and operational needs
+- Recruiters authenticate with a single factor (email/password or Google OAuth); authorization is an active server-held allowlist entry plus role, resolved on every request. No MFA — see ADR-0011 for the owner risk acceptance and the rejected identity-provider-assurance alternative
 - Roles: admin, interviewer and viewer, enforced consistently at API and database boundaries
 - D-011 decides single-org versus multi-tenant launch. Add `org_id` only if multi-tenancy is approved; otherwise enforce the single organization explicitly and avoid pretending blanket anon reads are isolation
 - Candidate receives a revocable, non-enumerable, one-time invite that exchanges for a short-lived session/room-scoped LiveKit grant; no recruiter credential is exposed to the candidate

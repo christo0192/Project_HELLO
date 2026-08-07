@@ -168,9 +168,9 @@ git diff --check
 |---|---|---|
 | API (Node) | **818 tests** | Includes auth/RBAC/rate/audit, invite/grant, resume abuse, lifecycle, resilience, validation, observability, provenance and CORS/CSP suites with deterministic fakes. |
 | LiveKit worker (Python) | **305 tests + 148 subtests** | Includes authenticated worker-context, lifecycle, resilience, observability, provenance and persistence coverage. |
-| Web | **163 tests** | Recruiter auth/MFA/SSO seams, protected routes, candidate invite UI and accessibility plus typecheck, lint and build. |
+| Web | **163 tests** | Recruiter auth/SSO seams, protected routes (session + resolved allowlist role; no MFA — ADR-0011), candidate invite UI and accessibility plus typecheck, lint and build. |
 | Supabase | **130 policy/provenance/lifecycle + 62 synthetic SQL assertions** | Ephemeral local stack; includes ownership, invite/grant, append-only audit, anonymous denial and seed replay. |
-| Phase 1 static security | **66 assertions** | Token-column, audit, ownership, RLS, MFA configuration and recording-object-key checks; local/static only. |
+| Phase 1 static security | **79 assertions** | Token-column, audit, ownership, RLS, recording-object-key, Auth configuration (signup disabled; TOTP and phone enroll/verify disabled per ADR-0011; session timebox retained) and server-side allowlist/RBAC checks; local/static only. Backed by 25 mutation self-tests proving the contract fails closed on missing/malformed config. |
 | Phase 2 migration tooling | **3 script suites** (export, reconcile, storage manifest) | Standalone Node.js deterministic CLI tests; no Vitest runner dependency. Added in PR #26. |
 
 ## Remaining Production Work
@@ -188,7 +188,7 @@ authentication, tenancy, authorization, and all production acceptance retains th
 privacy, migration, and deployment gates in `PLAN.md`.
 
 Highest-risk residual gaps:
-- SEC-01–SEC-04 are local/synthetic foundations only: hosted SSO/MFA, account lifecycle, FND-06 identities and live provider proof remain pending.
+- SEC-01–SEC-04 are local/synthetic foundations only: hosted SSO, account lifecycle, FND-06 identities and live provider proof remain pending. MFA was removed on 2026-08-06 (ADR-0011) at explicit owner direction — recruiter auth is single factor with server-side allowlist authorization, and a named Security Lead must re-examine that acceptance before go-live.
 - SEC-06 uses in-process state; distributed limits, production thresholds and abuse alerts remain pending.
 - SEC-12 has an append-only schema/sink foundation but not complete event coverage, transactional failure policy or retention evidence.
 - SEC-13 removes sensitive client metadata, but full worker rubric/resume delivery and FND-05/FND-06 worker identity remain pending.

@@ -1562,7 +1562,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '403':
-          description: AAL/membership insufficient.
+          description: Not authorized — no active allowlist entry, or insufficient role. Uniform generic denial; never distinguishes wrong domain, not-allowlisted, inactive or disabled.
           content:
             application/json:
               schema:
@@ -2420,7 +2420,7 @@ components:
     bearerAuth:
       type: http
       scheme: bearer
-      description: Supabase Auth bearer JWT (AAL2 for privileged roles).
+      description: Supabase Auth bearer JWT, validated server-side via getUser(). Single factor — no MFA/AAL2 requirement (ADR-0011). Authorization is an active entry in the server-held email allowlist plus the role held there, resolved on every request.
     grantToken:
       type: apiKey
       in: header
