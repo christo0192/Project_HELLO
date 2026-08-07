@@ -1,32 +1,31 @@
 /**
- * HELLO Talent Workspace — recruiter dashboard (Lane 3).
+ * HELLO Talent Workspace — recruiter business dashboard (Lane 3).
  *
- * Every number, chart and queue item here is derived from existing,
- * real API responses — nothing is fabricated:
+ * Every number, chart segment, queue row and CTA here is (a) derived from
+ * existing, real API responses — nothing is fabricated — and (b) a real
+ * accessible link/control that navigates to the matching, URL-addressable,
+ * visibly-represented filter on the Candidates page. Deep links and browser
+ * back/forward therefore work end-to-end.
  *
- *   - KPIs + status donut  ← GET /api/candidates (viewer+)
- *   - Action queue         ← GET /api/notifications (interviewer+), joined
- *                            to candidate names from the same load (no N+1)
- *   - Session charts       ← GET /api/admin/sessions (admin only) — rendered
- *                            ONLY for admins; others see a truthful note
- *   - Recent candidates    ← GET /api/candidates (already newest-first)
+ *   - KPIs + screening funnel  ← GET /api/candidates (viewer+), by status.
+ *       Each → /candidates?status=… (drill-down).
+ *   - Completion              ← decided ÷ considered, from the same statuses.
+ *   - Candidate intake trend  ← candidates.created_at per day (all roles).
+ *   - Prioritized work queue  ← GET /api/notifications (interviewer+), joined
+ *                               to candidate names from the same load (no N+1).
+ *   - Recent candidates       ← GET /api/candidates (already newest-first).
  *
- * No trend/delta chips: prior-period deltas are NOT derivable from these
- * endpoints, so KpiCard deltas are never used. No direct Supabase access.
- *
- * Charts pair with sr-only data tables and require <ThemeProvider> (Lane 5
- * mounts it in main.tsx before pages render).
+ * Deliberately omitted (cannot be shown truthfully from list payloads without
+ * per-candidate N+1 fetches, and there is no aggregate endpoint): pipeline
+ * "average score" and LLM "recommendation distribution" — those live only on
+ * per-candidate assessments. Admin session-ops analytics live in Mission
+ * Control (linked), not duplicated here.
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { api, ApiError } from '../api';
-import type {
-  AdminSessionRow,
-  Candidate,
-  MeResponse,
-  NotificationIntent,
-} from '../types';
+import type { Candidate, MeResponse, NotificationIntent } from '../types';
 import { ErrorState, LoadingState } from '../components/ui';
 import { PageHeader } from '../components/design';
 import { KpiCard } from '../components/design';
@@ -42,12 +41,14 @@ import {
 } from '../components/design';
 import { DonutChart, LineChart } from '../components/charts';
 import {
-  candidateStatusCounts,
   candidateStatusLabel,
   candidateStatusTone,
-  sessionStatusCounts,
+  candidateFunnel,
+  candidatesHref,
+  normalizeStatus,
   sessionsPerDay,
 } from '../components/talent';
+import { formatDateTime } from '../lib/datetime';
 import type { StatusTone } from '../components/design/StatusBadge';
 
 const INTENT_KIND_META: Record<string, { title: string; tone: StatusTone }> = {
@@ -57,12 +58,11 @@ const INTENT_KIND_META: Record<string, { title: string; tone: StatusTone }> = {
 };
 
 export function DashboardPage() {
+  const navigate = useNavigate();
   const [candidates, setCandidates] = useState<Candidate[] | null>(null);
   const [me, setMe] = useState<MeResponse | null>(null);
   const [intents, setIntents] = useState<NotificationIntent[] | null>(null);
-  const [sessions, setSessions] = useState<AdminSessionRow[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [sessionError, setSessionError] = useState<string | null>(null);
   const [intentsError, setIntentsError] = useState<string | null>(null);
 
   const load = useCallback(() => {
@@ -70,22 +70,14 @@ export function DashboardPage() {
     setCandidates(null);
     setMe(null);
     setIntents(null);
-    setSessions(null);
-    setSessionError(null);
     setIntentsError(null);
 
     api
       .getMe()
       .then((nextMe) => {
         setMe(nextMe);
-        // Session + intent data are role-gated; only fetch what the caller
-        // can actually read so the page never makes a doomed 403 call.
-        if (nextMe.role === 'admin') {
-          api
-            .listAdminSessions()
-            .then((r) => setSessions(r.sessions))
-            .catch((e: ApiError) => setSessionError(e.message));
-        }
+        // Intent data is role-gated; only fetch what the caller can read so
+        // the page never makes a doomed 403 call.
         if (nextMe.role !== 'viewer') {
           api
             .listNotificationIntents()
@@ -103,6 +95,18 @@ export function DashboardPage() {
 
   useEffect(load, [load]);
 
+  const funnel = useMemo(
+    () =>
+      candidates
+        ? candidateFunnel(candidates).map((f) => ({
+            label: f.label,
+            value: f.value,
+            href: candidatesHref({ statuses: [f.status] }),
+          }))
+        : [],
+    [candidates],
+  );
+
   if (loadError) {
     return <ErrorState message={loadError} onRetry={load} />;
   }
@@ -110,145 +114,119 @@ export function DashboardPage() {
     return <LoadingState label="Loading dashboard…" />;
   }
 
-  const totalCandidates = candidates.length;
-  const awaiting = candidates.filter((c) => (c.status ?? 'new') === 'new').length;
-  const inScreening = candidates.filter(
-    (c) => c.status === 'screening' || c.status === 'queued',
+  const byStatus = (statuses: string[]) =>
+    candidates.filter((c) => statuses.includes(normalizeStatus(c.status))).length;
+
+  const total = candidates.length;
+  const awaiting = byStatus(['new']);
+  const inScreening = byStatus(['queued', 'screening']);
+  const awaitingDecision = byStatus(['screened']);
+  const decided = byStatus(['advanced', 'rejected']);
+  const considered = candidates.filter(
+    (c) => normalizeStatus(c.status) !== 'consent_declined',
   ).length;
-  const reviewsPending =
-    intents?.filter((i) => i.kind === 'assessment_ready').length ?? 0;
-  const statusCounts = candidateStatusCounts(candidates);
+  const completionPct = considered > 0 ? Math.round((decided / considered) * 100) : 0;
+
+  const intakeTrend = sessionsPerDay(candidates);
 
   return (
     <div>
       <PageHeader
         eyebrow="Talent workspace"
         title="Dashboard"
-        description="Today's screening activity across your pipeline — every number is derived from live API data."
+        description="Your screening pipeline at a glance — every figure is derived from live API data, and every card drills into the matching candidates."
         actions={
           <button
             type="button"
             onClick={load}
-            className="inline-flex items-center rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-medium text-ink-secondary transition-colors hover:bg-surface-tertiary hover:text-ink"
+            className="inline-flex items-center rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-medium text-ink-secondary transition-colors hover:bg-surface-tertiary hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
           >
             Refresh
           </button>
         }
       />
 
-      {/* KPI row — no fabricated deltas */}
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <KpiCard
+      {/* KPI row — every card is a drill-down link */}
+      <div className="mt-6 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <KpiLink
+          href={candidatesHref()}
           label="Candidates"
-          value={totalCandidates}
+          value={total}
           hint="in pipeline"
+          ariaLabel={`${total} candidates in pipeline. View all candidates.`}
         />
-        <KpiCard
+        <KpiLink
+          href={candidatesHref({ statuses: ['new'] })}
           label="Awaiting screening"
           value={awaiting}
           tone={awaiting > 0 ? 'warning' : 'default'}
-          hint="new, not yet screened"
+          hint="new · not yet screened"
+          ariaLabel={`${awaiting} candidates awaiting screening. View them.`}
         />
-        <KpiCard
+        <KpiLink
+          href={candidatesHref({ statuses: ['queued', 'screening'] })}
           label="In screening"
           value={inScreening}
           tone={inScreening > 0 ? 'warning' : 'default'}
-          hint="active or queued"
+          hint="queued or active"
+          ariaLabel={`${inScreening} candidates in screening. View them.`}
         />
-        {intents !== null ? (
-          <KpiCard
-            label="Ready for review"
-            value={reviewsPending}
-            hint="assessments awaiting review"
-          />
-        ) : (
-          <div className="rounded-xl border border-line bg-surface p-5 shadow-card">
-            <p className="text-xs font-medium uppercase tracking-wide text-ink-secondary">
-              Ready for review
-            </p>
-            <p className="mt-2 text-sm text-ink-tertiary">
-              Requires interviewer or admin access.
-            </p>
-          </div>
-        )}
+        <KpiLink
+          href={candidatesHref({ statuses: ['screened'] })}
+          label="Awaiting decision"
+          value={awaitingDecision}
+          tone={awaitingDecision > 0 ? 'info' : 'default'}
+          hint="screened · ready to review"
+          ariaLabel={`${awaitingDecision} candidates awaiting a decision. Review them.`}
+        />
       </div>
 
-      {/* Charts — only what the source data supports */}
-      <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-2">
+      {/* Funnel + completion + trend */}
+      <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-3">
         <ChartCard
-          title="Candidate status"
-          description="Distribution of candidates across the pipeline."
+          title="Screening funnel"
+          description="Candidates by pipeline stage. Select a stage to view those candidates."
+          className="lg:col-span-2"
         >
           <DonutChart
-            title="Candidate status"
-            data={statusCounts}
+            title="Screening funnel"
+            data={funnel}
             isLoading={false}
             height={240}
+            onSegmentSelect={(i) => {
+              const target = funnel[i];
+              if (target) navigate(target.href);
+            }}
           />
         </ChartCard>
 
-        {me.role === 'admin' && sessions !== null ? (
-          <>
-            <ChartCard
-              title="Sessions by status"
-              description={`${sessions.length} sessions total across the workspace.`}
-            >
-              <DonutChart
-                title="Sessions by status"
-                data={sessionStatusCounts(sessions)}
-                isLoading={false}
-                height={240}
-              />
-            </ChartCard>
-            <ChartCard
-              title="Sessions started"
-              description="Sessions created per day over the last 14 days (real counts)."
-              className="lg:col-span-2"
-            >
-              <LineChart
-                title="Sessions started per day"
-                data={sessionsPerDay(sessions)}
-                unit="sessions"
-                isLoading={false}
-                height={220}
-              />
-            </ChartCard>
-          </>
-        ) : me.role === 'admin' && sessionError ? (
-          <ChartCard
-            title="Session metrics"
-            description="Session charts are unavailable right now."
-          >
-            <div role="alert" className="flex h-full min-h-40 flex-col items-center justify-center gap-3 rounded-xl border border-error/30 bg-error-soft px-4 text-center">
-              <p className="max-w-md text-sm text-error">{sessionError}</p>
-              <button
-                type="button"
-                onClick={load}
-                className="inline-flex items-center rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-medium text-ink transition-colors hover:bg-surface-tertiary"
-              >
-                Try again
-              </button>
-            </div>
-          </ChartCard>
-        ) : (
-          <ChartCard
-            title="Session metrics"
-            description="Session volume and status trends."
-          >
-            <div className="flex h-full min-h-40 flex-col items-center justify-center gap-1.5 rounded-xl border border-dashed border-line-strong bg-surface-secondary px-4 text-center">
-              <p className="text-sm font-medium text-ink-secondary">
-                Session metrics require admin access
-              </p>
-              <p className="max-w-sm text-xs text-ink-tertiary">
-                Ask an admin to review session volume, or view sessions from a
-                candidate's profile.
-              </p>
-            </div>
-          </ChartCard>
-        )}
+        <div className="flex flex-col gap-6">
+          <CompletionCard
+            completionPct={completionPct}
+            decided={decided}
+            considered={considered}
+          />
+          <OutcomeLinks advanced={byStatus(['advanced'])} rejected={byStatus(['rejected'])} />
+        </div>
       </div>
 
-      {/* Recent candidates + action queue */}
+      {/* Intake trend — all roles, from candidate.created_at */}
+      <div className="mt-6">
+        <ChartCard
+          title="Candidates added"
+          description="New candidates entering the pipeline per day over the last 14 days (real counts)."
+        >
+          <LineChart
+            title="Candidates added per day"
+            data={intakeTrend}
+            unit="candidates"
+            isLoading={false}
+            height={220}
+          />
+        </ChartCard>
+      </div>
+
+      {/* Recent candidates + prioritized work */}
       <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-2">
         <RecentCandidates candidates={candidates} />
         <ActionQueue
@@ -258,6 +236,110 @@ export function DashboardPage() {
           viewer={me.role === 'viewer'}
         />
       </div>
+
+      {me.role === 'admin' && (
+        <p className="mt-6 text-sm text-ink-secondary">
+          Looking for session operations, recordings integrity and quotas?{' '}
+          <Link
+            to="/mission-control"
+            className="font-medium text-brand-700 hover:text-brand-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:text-brand-300"
+          >
+            Open Mission Control →
+          </Link>
+        </p>
+      )}
+    </div>
+  );
+}
+
+/* ── KPI drill-down link ────────────────────────────────────────────── */
+
+function KpiLink({
+  href,
+  label,
+  value,
+  hint,
+  tone,
+  ariaLabel,
+}: {
+  href: string;
+  label: string;
+  value: number;
+  hint?: string;
+  tone?: 'default' | 'success' | 'warning' | 'danger' | 'info';
+  ariaLabel: string;
+}) {
+  // KpiCard only knows default/success/warning/danger; map 'info' → default.
+  const cardTone = tone === 'info' ? 'default' : tone;
+  return (
+    <Link
+      to={href}
+      aria-label={ariaLabel}
+      className="group block rounded-xl transition-shadow hover:shadow-md focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
+    >
+      <KpiCard label={label} value={value} hint={hint} tone={cardTone} />
+    </Link>
+  );
+}
+
+function CompletionCard({
+  completionPct,
+  decided,
+  considered,
+}: {
+  completionPct: number;
+  decided: number;
+  considered: number;
+}) {
+  return (
+    <div className="rounded-xl border border-line bg-surface p-5 shadow-card">
+      <p className="text-xs font-medium uppercase tracking-wide text-ink-secondary">
+        Completion
+      </p>
+      <p className="mt-2 text-2xl font-semibold tabular-nums tracking-tight text-ink">
+        {completionPct}
+        <span className="ml-0.5 text-base font-normal text-ink-tertiary">%</span>
+      </p>
+      <p className="mt-1 text-xs text-ink-tertiary">
+        {decided} of {considered} decided (advanced or rejected)
+      </p>
+      <div
+        className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-surface-tertiary"
+        role="img"
+        aria-label={`Completion ${completionPct} percent`}
+      >
+        <div
+          className="h-full rounded-full bg-brand-500"
+          style={{ width: `${completionPct}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function OutcomeLinks({ advanced, rejected }: { advanced: number; rejected: number }) {
+  return (
+    <div className="grid grid-cols-2 gap-3">
+      <Link
+        to={candidatesHref({ statuses: ['advanced'] })}
+        className="rounded-xl border border-line bg-surface p-4 shadow-card transition-shadow hover:shadow-md focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
+        aria-label={`${advanced} advanced candidates. View them.`}
+      >
+        <p className="text-xs font-medium uppercase tracking-wide text-ink-secondary">
+          Advanced
+        </p>
+        <p className="mt-1 text-xl font-semibold tabular-nums text-success">{advanced}</p>
+      </Link>
+      <Link
+        to={candidatesHref({ statuses: ['rejected'] })}
+        className="rounded-xl border border-line bg-surface p-4 shadow-card transition-shadow hover:shadow-md focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
+        aria-label={`${rejected} rejected candidates. View them.`}
+      >
+        <p className="text-xs font-medium uppercase tracking-wide text-ink-secondary">
+          Rejected
+        </p>
+        <p className="mt-1 text-xl font-semibold tabular-nums text-error">{rejected}</p>
+      </Link>
     </div>
   );
 }
@@ -269,11 +351,20 @@ function RecentCandidates({ candidates }: { candidates: Candidate[] }) {
 
   if (candidates.length === 0) {
     return (
-      <section aria-label="Recent candidates" className="rounded-xl border border-dashed border-line-strong bg-surface-secondary p-8 text-center">
+      <section
+        aria-label="Recent candidates"
+        className="rounded-xl border border-dashed border-line-strong bg-surface-secondary p-8 text-center"
+      >
         <p className="text-sm font-medium text-ink-secondary">No candidates yet</p>
         <p className="mx-auto mt-1 max-w-sm text-xs text-ink-tertiary">
           Upload a resume from the Candidates page to start your pipeline.
         </p>
+        <Link
+          to="/candidates"
+          className="mt-3 inline-block text-xs font-medium text-brand-700 hover:text-brand-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:text-brand-300"
+        >
+          Go to Candidates →
+        </Link>
       </section>
     );
   }
@@ -296,7 +387,7 @@ function RecentCandidates({ candidates }: { candidates: Candidate[] }) {
               <Td>
                 <Link
                   to={`/candidates/${candidate.id}`}
-                  className="font-medium text-brand-700 hover:text-brand-800 dark:text-brand-300"
+                  className="font-medium text-brand-700 hover:text-brand-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:text-brand-300"
                 >
                   {candidate.name || 'Unnamed'}
                 </Link>
@@ -315,7 +406,11 @@ function RecentCandidates({ candidates }: { candidates: Candidate[] }) {
                   : '—'}
               </Td>
               <Td className="tabular-nums text-ink-secondary">
-                {new Date(candidate.created_at).toLocaleDateString()}
+                {formatDateTime(candidate.created_at, {
+                  year: 'numeric',
+                  month: 'short',
+                  day: 'numeric',
+                })}
               </Td>
             </Tr>
           ))}
@@ -324,7 +419,7 @@ function RecentCandidates({ candidates }: { candidates: Candidate[] }) {
       {candidates.length > recent.length && (
         <Link
           to="/candidates"
-          className="mt-3 inline-block text-xs font-medium text-brand-700 hover:text-brand-800 dark:text-brand-300"
+          className="mt-3 inline-block text-xs font-medium text-brand-700 hover:text-brand-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:text-brand-300"
         >
           View all {candidates.length} candidates →
         </Link>
@@ -333,7 +428,7 @@ function RecentCandidates({ candidates }: { candidates: Candidate[] }) {
   );
 }
 
-/* ── Action queue (real notification intents, no fabrication) ───────── */
+/* ── Prioritized work queue (real notification intents, no fabrication) ─ */
 
 function ActionQueue({
   intents,
@@ -353,7 +448,7 @@ function ActionQueue({
 
   return (
     <section aria-label="Action queue">
-      <h2 className="mb-3 text-sm font-semibold text-ink">Action queue</h2>
+      <h2 className="mb-3 text-sm font-semibold text-ink">Prioritized work</h2>
       <div className="rounded-xl border border-line bg-surface shadow-card">
         {viewer ? (
           <p className="px-4 py-6 text-center text-sm text-ink-tertiary">
@@ -389,7 +484,7 @@ function ActionQueue({
                       {candidate ? (
                         <Link
                           to={`/candidates/${candidate.id}`}
-                          className="font-medium text-brand-700 hover:text-brand-800 dark:text-brand-300"
+                          className="font-medium text-brand-700 hover:text-brand-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:text-brand-300"
                         >
                           {candidate.name || 'Unnamed candidate'}
                         </Link>
@@ -402,7 +497,7 @@ function ActionQueue({
                       )}
                     </p>
                     <p className="mt-0.5 text-xs text-ink-tertiary">
-                      {new Date(intent.created_at).toLocaleString()}
+                      {formatDateTime(intent.created_at)}
                       {intent.consent_verified && (
                         <span className="ml-2 rounded bg-success-soft px-1.5 py-0.5 text-[11px] font-medium text-success">
                           consent verified

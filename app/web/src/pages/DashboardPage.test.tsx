@@ -1,22 +1,21 @@
 /**
- * DashboardPage — truthful KPIs/charts/action queue:
- *   - KPIs + status donut from candidates
- *   - admin-only session charts (403-free role gating)
- *   - interviewer/admin action queue from notification intents
- *   - viewer truthful empty/notes states
- *   - loading/error/retry, empty data, axe, reduced-motion + dark render
+ * DashboardPage — truthful, fully-navigable recruiter business dashboard:
+ *   - KPIs derived from candidate statuses, each a drill-down link
+ *   - screening funnel donut with per-status legend links + click-to-navigate
+ *   - completion + outcome links, all → /candidates?status=…
+ *   - candidate intake trend (all roles) from created_at
+ *   - prioritized work queue from notification intents (interviewer/admin)
+ *   - viewer/empty/error/retry, axe, reduced-motion + dark render
  *
- * Charts run under jsdom with the same stubs as the chart-lib suite
- * (ResizeObserver, canvas context, matchMedia) and reduced-motion so KPI
- * count-up renders targets instantly. Every api method gets a default
- * resolution in beforeEach — the page loads them all in one effect.
+ * Charts run under jsdom with the same stubs as the chart-lib suite.
  */
 import { render, screen, fireEvent, within } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, Routes, Route, useSearchParams } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { ReactNode } from 'react';
 import { ThemeProvider } from '../lib/theme';
 import { DashboardPage } from './DashboardPage';
+import { candidatesHref } from '../components/talent';
 import {
   stubMatchMedia,
   stubResizeObserver,
@@ -24,10 +23,9 @@ import {
   allowEchartsInitWarnings,
 } from '../components/design/__tests__/helpers';
 
-const { getMe, listCandidates, listAdminSessions, listNotificationIntents } = vi.hoisted(() => ({
+const { getMe, listCandidates, listNotificationIntents } = vi.hoisted(() => ({
   getMe: vi.fn(),
   listCandidates: vi.fn(),
-  listAdminSessions: vi.fn(),
   listNotificationIntents: vi.fn(),
 }));
 
@@ -35,7 +33,6 @@ vi.mock('../api', () => ({
   api: {
     getMe: (...args: any[]) => getMe(...args),
     listCandidates: (...args: any[]) => listCandidates(...args),
-    listAdminSessions: (...args: any[]) => listAdminSessions(...args),
     listNotificationIntents: (...args: any[]) => listNotificationIntents(...args),
   },
   ApiError: class extends Error {
@@ -55,12 +52,7 @@ const CANDIDATES = [
   { id: 'c1', name: 'Jane Doe', email: 'jane@example.com', phone_e164: '+1', phone_valid: true, skills: ['React'], experience_years: 5, status: 'new', role_id: null, created_at: '2026-06-01T00:00:00Z' },
   { id: 'c2', name: 'Bob Smith', email: 'bob@example.com', phone_e164: null, phone_valid: false, skills: [], experience_years: null, status: 'screened', role_id: null, created_at: '2026-06-02T00:00:00Z' },
   { id: 'c3', name: 'Alice Wu', email: 'alice@example.com', phone_e164: '+2', phone_valid: true, skills: ['Python'], experience_years: 3, status: 'screening', role_id: null, created_at: '2026-06-03T00:00:00Z' },
-];
-
-const SESSIONS = [
-  { id: 's1', candidate_id: 'c1', role_id: null, status: 'completed', created_at: '2026-06-01T00:00:00Z', started_at: null, ended_at: null },
-  { id: 's2', candidate_id: 'c2', role_id: null, status: 'completed', created_at: '2026-06-02T00:00:00Z', started_at: null, ended_at: null },
-  { id: 's3', candidate_id: 'c3', role_id: null, status: 'in_progress', created_at: '2026-06-03T00:00:00Z', started_at: null, ended_at: null },
+  { id: 'c4', name: 'Ken Ito', email: 'ken@example.com', phone_e164: '+3', phone_valid: true, skills: [], experience_years: 2, status: 'advanced', role_id: null, created_at: '2026-06-04T00:00:00Z' },
 ];
 
 const INTENTS = [
@@ -69,10 +61,20 @@ const INTENTS = [
   { id: 'i3', kind: 'quota_warning', candidate_id: null, consent_verified: false, created_at: '2026-06-04T02:00:00Z' },
 ];
 
+function CandidatesProbe() {
+  const [params] = useSearchParams();
+  return <div data-testid="probe">status={params.get('status') ?? ''}</div>;
+}
+
 function wrap(ui: ReactNode) {
   return (
     <MemoryRouter initialEntries={['/dashboard']}>
-      <ThemeProvider>{ui}</ThemeProvider>
+      <ThemeProvider>
+        <Routes>
+          <Route path="/dashboard" element={ui} />
+          <Route path="/candidates" element={<CandidatesProbe />} />
+        </Routes>
+      </ThemeProvider>
     </MemoryRouter>
   );
 }
@@ -90,7 +92,6 @@ describe('DashboardPage', () => {
     vi.clearAllMocks();
     getMe.mockResolvedValue(ADMIN_ME);
     listCandidates.mockResolvedValue(CANDIDATES);
-    listAdminSessions.mockResolvedValue({ sessions: [] });
     listNotificationIntents.mockResolvedValue({ intents: [] });
   });
   afterEach(() => {
@@ -103,7 +104,7 @@ describe('DashboardPage', () => {
     expect(screen.getByText('Loading dashboard…')).toBeInTheDocument();
   });
 
-  it('shows an error state with a retry action on candidate failure', async () => {
+  it('shows an error state with retry on candidate failure', async () => {
     listCandidates.mockRejectedValueOnce({ message: 'API unavailable' });
     renderDashboard();
     expect(await screen.findByText('API unavailable')).toBeInTheDocument();
@@ -112,64 +113,78 @@ describe('DashboardPage', () => {
     expect(await screen.findByText('Recent candidates')).toBeInTheDocument();
   });
 
-  it('renders truthful KPIs and the candidate-status donut for any role', async () => {
+  it('renders KPI drill-down links for every stage (any role)', async () => {
     getMe.mockResolvedValue(VIEWER_ME);
-    listNotificationIntents.mockResolvedValue({ intents: [] });
     renderDashboard();
 
-    expect(await screen.findByText('Candidates')).toBeInTheDocument();
-    const candidatesCard = screen
-      .getByText('Candidates')
-      .closest('.shadow-card') as HTMLElement;
-    expect(within(candidatesCard).getByText('3')).toBeInTheDocument();
-    expect(screen.getByText('Awaiting screening')).toBeInTheDocument();
-    expect(screen.getByText('In screening')).toBeInTheDocument();
+    const total = await screen.findByRole('link', { name: /candidates in pipeline/i });
+    expect(total).toHaveAttribute('href', candidatesHref());
 
-    // Status donut pairs with an sr-only data table — the authoritative data.
-    const statusTable = screen.getByRole('table', { name: 'Candidate status data' });
-    expect(within(statusTable).getByRole('cell', { name: 'New' })).toBeInTheDocument();
-    expect(within(statusTable).getByRole('cell', { name: 'Screened' })).toBeInTheDocument();
-    expect(within(statusTable).getByRole('cell', { name: 'Screening' })).toBeInTheDocument();
-  });
-
-  it('does NOT fetch admin session data for viewers and shows a truthful note', async () => {
-    getMe.mockResolvedValue(VIEWER_ME);
-    listNotificationIntents.mockResolvedValue({ intents: [] });
-    renderDashboard();
-    await screen.findByText('Recent candidates');
-    expect(listAdminSessions).not.toHaveBeenCalled();
-    expect(listNotificationIntents).not.toHaveBeenCalled();
-    expect(screen.getByText('Session metrics require admin access')).toBeInTheDocument();
     expect(
-      screen.getByText(/Action items require interviewer or admin access/i),
-    ).toBeInTheDocument();
+      screen.getByRole('link', { name: /awaiting screening/i }),
+    ).toHaveAttribute('href', candidatesHref({ statuses: ['new'] }));
+    expect(screen.getByRole('link', { name: /in screening/i })).toHaveAttribute(
+      'href',
+      candidatesHref({ statuses: ['queued', 'screening'] }),
+    );
+    expect(
+      screen.getByRole('link', { name: /awaiting a decision/i }),
+    ).toHaveAttribute('href', candidatesHref({ statuses: ['screened'] }));
   });
 
-  it('renders admin session charts from real session data only', async () => {
-    listAdminSessions.mockResolvedValue({ sessions: SESSIONS });
+  it('derives the funnel donut + data table from candidate statuses', async () => {
+    getMe.mockResolvedValue(VIEWER_ME);
     renderDashboard();
+    const table = await screen.findByRole('table', { name: 'Screening funnel data' });
+    expect(within(table).getByRole('cell', { name: 'New' })).toBeInTheDocument();
+    expect(within(table).getByRole('cell', { name: 'Screened' })).toBeInTheDocument();
+    expect(within(table).getByRole('cell', { name: 'Advanced' })).toBeInTheDocument();
+  });
 
-    const sessionsTable = await screen.findByRole('table', {
-      name: 'Sessions by status data',
+  it('drills down when a KPI link is clicked (URL filter applied)', async () => {
+    getMe.mockResolvedValue(VIEWER_ME);
+    renderDashboard();
+    const link = await screen.findByRole('link', { name: /awaiting a decision/i });
+    fireEvent.click(link);
+    expect(await screen.findByTestId('probe')).toHaveTextContent('status=screened');
+  });
+
+  it('exposes the funnel legend stages as navigable links', async () => {
+    getMe.mockResolvedValue(VIEWER_ME);
+    renderDashboard();
+    const legendLink = await screen.findByRole('link', {
+      name: /New:.*View these candidates/i,
     });
-    expect(listAdminSessions).toHaveBeenCalledTimes(1);
-    expect(within(sessionsTable).getByRole('cell', { name: 'Completed' })).toBeInTheDocument();
-    expect(within(sessionsTable).getByRole('cell', { name: 'In progress' })).toBeInTheDocument();
-    // The sessions-over-time line chart also pairs with a data table.
+    expect(legendLink).toHaveAttribute('href', candidatesHref({ statuses: ['new'] }));
+  });
+
+  it('shows completion and outcome links', async () => {
+    getMe.mockResolvedValue(VIEWER_ME);
+    renderDashboard();
+    // 1 decided (advanced) of 4 considered = 25%
+    expect(await screen.findByText(/1 of 4 decided/i)).toBeInTheDocument();
     expect(
-      screen.getByRole('table', { name: 'Sessions started per day data' }),
+      screen.getByRole('link', { name: /advanced candidates/i }),
+    ).toHaveAttribute('href', candidatesHref({ statuses: ['advanced'] }));
+    expect(
+      screen.getByRole('link', { name: /rejected candidates/i }),
+    ).toHaveAttribute('href', candidatesHref({ statuses: ['rejected'] }));
+  });
+
+  it('renders a candidate intake trend from created_at', async () => {
+    getMe.mockResolvedValue(VIEWER_ME);
+    renderDashboard();
+    expect(
+      await screen.findByRole('table', { name: 'Candidates added per day data' }),
     ).toBeInTheDocument();
   });
 
-  it('renders the action queue from notification intents joined to candidates', async () => {
+  it('renders the prioritized work queue from intents joined to candidates', async () => {
     getMe.mockResolvedValue(INTERVIEWER_ME);
     listNotificationIntents.mockResolvedValue({ intents: INTENTS });
     renderDashboard();
 
     expect(await screen.findByText('Screening ready for review')).toBeInTheDocument();
-    expect(screen.getByText('Appeal resolved — review outcome')).toBeInTheDocument();
-    expect(screen.getByText('Session quota nearing its limit')).toBeInTheDocument();
-    // Intent → candidate join is a local name lookup, never an extra request.
     const queue = screen.getByRole('region', { name: 'Action queue' });
     const reviewLink = within(queue).getByRole('link', { name: 'Jane Doe' });
     expect(reviewLink).toHaveAttribute('href', '/candidates/c1');
@@ -177,46 +192,31 @@ describe('DashboardPage', () => {
     expect(within(queue).getByText('Workspace-wide')).toBeInTheDocument();
   });
 
-  it('shows a caught-up empty state for the action queue', async () => {
-    getMe.mockResolvedValue(INTERVIEWER_ME);
-    listNotificationIntents.mockResolvedValue({ intents: [] });
+  it('gates the work queue for viewers and never fetches intents', async () => {
+    getMe.mockResolvedValue(VIEWER_ME);
     renderDashboard();
+    await screen.findByText('Recent candidates');
+    expect(listNotificationIntents).not.toHaveBeenCalled();
     expect(
-      await screen.findByText(/You're all caught up — no pending items/i),
+      screen.getByText(/Action items require interviewer or admin access/i),
     ).toBeInTheDocument();
   });
 
-  it('shows an inline error when intents cannot be loaded', async () => {
-    getMe.mockResolvedValue(INTERVIEWER_ME);
-    listNotificationIntents.mockRejectedValue({ message: 'intents unavailable' });
+  it('shows the admin Mission Control link only for admins', async () => {
     renderDashboard();
-    expect(await screen.findByText('intents unavailable')).toBeInTheDocument();
+    expect(await screen.findByRole('link', { name: /Open Mission Control/i })).toBeInTheDocument();
   });
 
   it('handles a completely empty pipeline truthfully', async () => {
-    listCandidates.mockResolvedValue([]);
-    listAdminSessions.mockResolvedValue({ sessions: [] });
-    listNotificationIntents.mockResolvedValue({ intents: [] });
-    renderDashboard();
-
-    expect(await screen.findByText('No candidates yet')).toBeInTheDocument();
-    // Both donuts show their truthful empty state (no fabricated statuses);
-    // the hardcoded hint text is shared by DonutChart, so expect ≥ 1.
-    expect(screen.getAllByText(/will appear here/).length).toBeGreaterThan(0);
-    expect(screen.getByText(/all caught up/i)).toBeInTheDocument();
-  });
-
-  it('renders recent candidates with links to their detail pages', async () => {
     getMe.mockResolvedValue(VIEWER_ME);
+    listCandidates.mockResolvedValue([]);
     renderDashboard();
-    const table = await screen.findByRole('table', { name: 'Recent candidates, newest first' });
-    const janeLink = within(table).getByRole('link', { name: 'Jane Doe' });
-    expect(janeLink).toHaveAttribute('href', '/candidates/c1');
-    expect(within(table).getByText('5 yr')).toBeInTheDocument();
+    expect(await screen.findByText('No candidates yet')).toBeInTheDocument();
+    expect(screen.getAllByText(/will appear here/).length).toBeGreaterThan(0);
   });
 
-  it('has no axe violations on a populated admin view', async () => {
-    listAdminSessions.mockResolvedValue({ sessions: SESSIONS });
+  it('has no axe violations on a populated interviewer view', async () => {
+    getMe.mockResolvedValue(INTERVIEWER_ME);
     listNotificationIntents.mockResolvedValue({ intents: INTENTS });
     const { container } = renderDashboard();
     await screen.findByText('Recent candidates');
@@ -224,14 +224,13 @@ describe('DashboardPage', () => {
   });
 
   it('renders under dark + reduced motion without crashing', async () => {
-    stubMatchMedia(true); // dark (prefers-color-scheme) + reduced motion
-    listAdminSessions.mockResolvedValue({ sessions: SESSIONS });
+    stubMatchMedia(true);
     listNotificationIntents.mockResolvedValue({ intents: INTENTS });
     renderDashboard();
     expect(await screen.findByText('Recent candidates')).toBeInTheDocument();
     expect(document.documentElement.classList.contains('dark')).toBe(true);
     expect(
-      screen.getByRole('table', { name: 'Candidate status data' }),
+      screen.getByRole('table', { name: 'Screening funnel data' }),
     ).toBeInTheDocument();
   });
 });

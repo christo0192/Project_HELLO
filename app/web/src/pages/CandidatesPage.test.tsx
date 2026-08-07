@@ -1,19 +1,15 @@
 /**
- * CandidatesPage accessibility tests.
+ * CandidatesPage — pipeline list with URL-addressable drill-down filters.
  *
- * Covers:
- *   - Loading state
- *   - Empty state (no candidates)
- *   - Candidates table with data
- *   - Upload card (file input, role select)
- *   - Role filter
- *   - axe structural rule compliance
- *   - Keyboard / focus management
+ * Covers: loading/empty states, table + next-action, upload card, role filter,
+ * URL status deep-link + toggle + clear (deep link / back-forward friendly),
+ * keyboard/axe.
  */
 
-import { render, screen } from '@testing-library/react';
+import { render, screen, fireEvent, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { ReactNode } from 'react';
 import { CandidatesPage } from './CandidatesPage';
 import { mockCandidate, mockRole } from '../test/helpers';
 
@@ -39,105 +35,119 @@ vi.mock('../api', () => ({
   },
 }));
 
-function renderCandidatesPage() {
-  return render(
-    <MemoryRouter initialEntries={['/candidates']}>
-      <CandidatesPage />
-    </MemoryRouter>,
-  );
+const CANDIDATES = [
+  mockCandidate, // status: new, email jane@example.com
+  { ...mockCandidate, id: 'c-screened', name: 'Screened Sam', email: 'sam@example.com', status: 'screened' },
+  { ...mockCandidate, id: 'c-screening', name: 'Screening Sara', email: 'sara@example.com', status: 'screening' },
+];
+
+function renderPage(entry = '/candidates', ui: ReactNode = <CandidatesPage />) {
+  return render(<MemoryRouter initialEntries={[entry]}>{ui}</MemoryRouter>);
 }
 
 describe('CandidatesPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockApi.listRoles.mockResolvedValue([mockRole]);
+    mockApi.listCandidates.mockResolvedValue(CANDIDATES);
   });
 
   it('shows loading state initially', () => {
     mockApi.listCandidates.mockReturnValue(new Promise(() => {}));
-    renderCandidatesPage();
+    renderPage();
     expect(screen.getByText('Loading candidates…')).toBeInTheDocument();
   });
 
   it('shows empty state when no candidates', async () => {
     mockApi.listCandidates.mockResolvedValue([]);
-    renderCandidatesPage();
+    renderPage();
     expect(await screen.findByText('No candidates yet')).toBeInTheDocument();
     expect(
-      screen.getByText(
-        'Upload a resume above to parse a candidate and add them here.',
-      ),
+      screen.getByText('Upload a resume above to parse a candidate and add them here.'),
     ).toBeInTheDocument();
   });
 
-  it('renders candidates table', async () => {
-    mockApi.listCandidates.mockResolvedValue([mockCandidate]);
-    renderCandidatesPage();
-
+  it('renders the candidates table with status badge + next action', async () => {
+    renderPage();
     expect(await screen.findByText('Jane Doe')).toBeInTheDocument();
     expect(screen.getByText('jane@example.com')).toBeInTheDocument();
-    expect(screen.getByText('+1234567890')).toBeInTheDocument();
-    expect(screen.getByText('5 yr')).toBeInTheDocument();
-    expect(screen.getByText('new')).toBeInTheDocument();
+    expect(screen.getAllByText('5 yr').length).toBeGreaterThanOrEqual(1);
+    // Status vocabulary label + actionable next step for a "new" candidate.
+    expect(screen.getAllByText('New').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText('Start screening')).toBeInTheDocument();
   });
 
-  it('renders upload card with file input and role select', async () => {
-    mockApi.listCandidates.mockResolvedValue([]);
-    renderCandidatesPage();
+  it('links each candidate name to its workspace', async () => {
+    renderPage();
+    const link = await screen.findByRole('link', { name: 'Jane Doe' });
+    expect(link).toHaveAttribute('href', '/candidates/candidate-1');
+  });
 
+  it('renders the upload card with file input and role select', async () => {
+    renderPage();
     expect(await screen.findByText('Upload a resume')).toBeInTheDocument();
-    expect(screen.getByText('PDF or DOCX. Parsing runs an LLM and can take 10–20 seconds.')).toBeInTheDocument();
-
-    // File input should exist
+    expect(
+      screen.getByText('PDF or DOCX. Parsing runs an LLM and can take 10–20 seconds.'),
+    ).toBeInTheDocument();
     const fileInput = screen.getByLabelText('Resume file');
-    expect(fileInput).toBeInTheDocument();
     expect(fileInput).toHaveAttribute('type', 'file');
-
-    // Role select should be populated (Senior Frontend Engineer appears in both
-    // the upload role select and the filter role select - use getAllByText)
-    const roleOptions = screen.getAllByText('Senior Frontend Engineer');
-    expect(roleOptions.length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText('Senior Frontend Engineer').length).toBeGreaterThanOrEqual(1);
   });
 
-  it('renders role filter select', async () => {
-    mockApi.listCandidates.mockResolvedValue([mockCandidate]);
-    renderCandidatesPage();
-
+  it('renders the role filter select', async () => {
+    renderPage();
     expect(await screen.findByLabelText('Filter by role')).toBeInTheDocument();
-    const filterSelect = screen.getByLabelText('Filter by role');
-    expect(filterSelect).toBeInTheDocument();
     expect(screen.getByText('All roles')).toBeInTheDocument();
   });
 
-  it('handles upload error', async () => {
-    mockApi.listCandidates.mockResolvedValue([]);
-    mockApi.uploadResume.mockRejectedValue({ message: 'Upload failed.' });
-    renderCandidatesPage();
-
-    await screen.findByText('Upload a resume');
-
-    // Click upload without a file - button should be disabled
-    const uploadBtn = screen.getByRole('button', { name: 'Upload & Parse' });
-    expect(uploadBtn).toBeDisabled();
+  it('applies a status filter from the URL (deep link)', async () => {
+    renderPage('/candidates?status=screened');
+    // Only the screened candidate is visible.
+    expect(await screen.findByText('Screened Sam')).toBeInTheDocument();
+    expect(screen.queryByText('Jane Doe')).not.toBeInTheDocument();
+    expect(screen.queryByText('Screening Sara')).not.toBeInTheDocument();
+    // Count summary reflects the filtered subset.
+    expect(screen.getByText('1 of 3')).toBeInTheDocument();
+    // Active filter chip is shown.
+    expect(screen.getByText('Active filters:')).toBeInTheDocument();
   });
 
-  it('has no axe violations in loading state', async () => {
-    mockApi.listCandidates.mockReturnValue(new Promise(() => {}));
-    const { container } = renderCandidatesPage();
+  it('toggles a status filter into the URL and clears it', async () => {
+    renderPage();
+    await screen.findByText('Jane Doe');
+    const group = screen.getByRole('group', { name: 'Filter by status' });
+    const screenedToggle = within(group).getByRole('button', { name: /Screened/i });
+    fireEvent.click(screenedToggle);
+    // After toggling, only the screened candidate remains.
+    expect(await screen.findByText('Screened Sam')).toBeInTheDocument();
+    expect(screen.queryByText('Jane Doe')).not.toBeInTheDocument();
+    // Clear all restores the full list.
+    fireEvent.click(screen.getByRole('button', { name: /clear all/i }));
+    expect(await screen.findByText('Jane Doe')).toBeInTheDocument();
+  });
+
+  it('shows a truthful empty state when filters match nothing', async () => {
+    renderPage('/candidates?status=rejected');
+    expect(await screen.findByText('No candidates match these filters')).toBeInTheDocument();
+  });
+
+  it('upload button is disabled without a file', async () => {
+    mockApi.listCandidates.mockResolvedValue([]);
+    renderPage();
+    await screen.findByText('Upload a resume');
+    expect(screen.getByRole('button', { name: 'Upload & Parse' })).toBeDisabled();
+  });
+
+  it('has no axe violations with candidates', async () => {
+    const { container } = renderPage();
+    await screen.findByText('Jane Doe');
     await expect(container).toHaveNoViolations();
   });
 
   it('has no axe violations in empty state', async () => {
     mockApi.listCandidates.mockResolvedValue([]);
-    const { container } = renderCandidatesPage();
+    const { container } = renderPage();
     await screen.findByText('No candidates yet');
-    await expect(container).toHaveNoViolations();
-  });
-
-  it('has no axe violations with candidates', async () => {
-    mockApi.listCandidates.mockResolvedValue([mockCandidate]);
-    const { container } = renderCandidatesPage();
-    await screen.findByText('Jane Doe');
     await expect(container).toHaveNoViolations();
   });
 });

@@ -1,20 +1,28 @@
 /**
- * TranscriptionSyncWorkspace — recording player + transcript sync workspace.
+ * TranscriptionSyncWorkspace — the ONE unified candidate review workspace.
  *
- * Renders a split-pane layout within the "Transcript & Scorecards" tab:
- *   - Left: sticky RecordingPlayer (on-demand signed URL, single <audio>)
- *   - Right: scrollable SeekableTranscript with session selector
- *   - Below: Scorecards (collapsible)
+ * A single authoritative place to review a completed screening session:
+ *   - session context header (date, mode, duration, status)
+ *   - one on-demand RecordingPlayer (single <audio>, signed URL minted only
+ *     on explicit action)
+ *   - a synchronized SeekableTranscript (click a timed turn to seek+play;
+ *     the active turn tracks playback)
+ *   - the scorecard for THAT session
  *
- * Desktop (>=1024px): side-by-side (320px sticky player, flex-1 transcript)
- * Mobile (<1024px): compact sticky player bar at top, transcript below
+ * This replaces the previously duplicated recording/transcript/scorecard
+ * presentations on the candidate page. All three artifacts come from a single
+ * `GET /api/screening/:id` load, so they always correspond to the selected
+ * session.
+ *
+ * Access: `GET /api/screening/:id` is admin-only. For non-admin reviewers the
+ * transcript/recording load returns 403; we degrade gracefully — showing a
+ * truthful note plus the candidate's latest scorecard (from the viewer-visible
+ * candidate detail) instead of an error.
  *
  * Sync logic:
- *   1. User clicks a timed transcript turn → if URL not loaded, mint it,
- *      queue the offset, wait for canplay, then seek+play.
- *      If already loaded, seek+play immediately.
- *      Last queued offset wins on rapid clicks.
- *   2. audio timeupdate → find nearest turn by start_offset_sec → highlight
+ *   1. Click a timed turn → if URL not loaded, mint it, queue the offset, wait
+ *      for readiness, then seek + play (latest offset wins on rapid clicks).
+ *   2. audio timeupdate → nearest turn by start_offset_sec → highlight.
  *   3. Selecting a new session resets everything; stale loads are discarded.
  */
 
@@ -22,10 +30,17 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../../api';
 import type { Assessment, Session, TranscriptLine } from '../../types';
 import { Card, ErrorState } from '../ui';
+import { StatusBadge } from '../design';
 import { Scorecard } from '../Scorecard';
 import { RecordingPlayer } from './RecordingPlayer';
 import type { RecordingPlayerHandle } from './RecordingPlayer';
 import { SeekableTranscript } from './SeekableTranscript';
+import {
+  formatDurationSec,
+  sessionStatusLabel,
+  sessionStatusTone,
+} from './status';
+import { formatDateTime } from '../../lib/datetime';
 
 export interface TranscriptionSyncWorkspaceProps {
   sessions: Session[];
@@ -62,21 +77,32 @@ export function TranscriptionSyncWorkspace({
     () => selectableSessions[0]?.id ?? null,
   );
   const [transcript, setTranscript] = useState<TranscriptLine[]>([]);
+  const [sessionAssessment, setSessionAssessment] = useState<Assessment | null>(null);
+  const [loadedSession, setLoadedSession] = useState<Session | null>(null);
   const [transcriptLoading, setTranscriptLoading] = useState(false);
   const [transcriptError, setTranscriptError] = useState<string | null>(null);
+  const [permissionDenied, setPermissionDenied] = useState(false);
   const [activeTurnIndex, setActiveTurnIndex] = useState<number | null>(null);
 
-  // P1-1: refreshKey counter for retry — changing it re-triggers the effect
+  // refreshKey counter for retry — changing it re-triggers the effect
   const [refreshKey, setRefreshKey] = useState(0);
 
   const playerRef = useRef<RecordingPlayerHandle>(null);
 
-  // Load transcript when session or refreshKey changes
+  const selectedSession = useMemo(
+    () => selectableSessions.find((s) => s.id === selectedSessionId) ?? null,
+    [selectableSessions, selectedSessionId],
+  );
+
+  // Load transcript + assessment + session meta when session/refreshKey changes
   const loadTranscript = useCallback((sessionId: string) => {
     let cancelled = false;
     setTranscriptLoading(true);
     setTranscriptError(null);
+    setPermissionDenied(false);
     setTranscript([]);
+    setSessionAssessment(null);
+    setLoadedSession(null);
     setActiveTurnIndex(null);
 
     api
@@ -84,188 +110,237 @@ export function TranscriptionSyncWorkspace({
       .then((detail) => {
         if (cancelled) return;
         setTranscript(detail.transcript);
+        setSessionAssessment(detail.assessment ?? null);
+        setLoadedSession(detail.session ?? null);
         setTranscriptLoading(false);
       })
       .catch((e: ApiError) => {
         if (cancelled) return;
+        // Non-admin reviewers cannot read the per-session transcript; degrade
+        // gracefully rather than surfacing a raw error.
+        if (e.status === 403) {
+          setPermissionDenied(true);
+          setTranscriptLoading(false);
+          return;
+        }
         setTranscriptError(e.message || 'Failed to load transcript');
         setTranscriptLoading(false);
       });
 
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, []);
+
+  // If the sessions prop changes (candidate reload) and the selected session
+  // is no longer completable, fall back to the first available one so the
+  // <select> never shows a blank value and the effect never fetches a session
+  // that has vanished from the list.
+  useEffect(() => {
+    if (
+      selectedSessionId &&
+      !selectableSessions.some((s) => s.id === selectedSessionId)
+    ) {
+      setSelectedSessionId(selectableSessions[0]?.id ?? null);
+    }
+  }, [selectableSessions, selectedSessionId]);
 
   useEffect(() => {
     if (!selectedSessionId) {
       setTranscript([]);
       setTranscriptError(null);
+      setPermissionDenied(false);
       setActiveTurnIndex(null);
       return;
     }
     return loadTranscript(selectedSessionId);
   }, [selectedSessionId, refreshKey, loadTranscript]);
 
-  // timeupdate → active turn
   const handleTimeUpdate = useCallback(
     (currentTime: number) => {
-      const idx = findActiveTurnIndex(transcript, currentTime);
-      setActiveTurnIndex(idx);
+      setActiveTurnIndex(findActiveTurnIndex(transcript, currentTime));
     },
     [transcript],
   );
 
-  // P0-1: click-to-play contract. The RecordingPlayer owns the full
-  // lifecycle — mint the short-lived URL on demand, wait for the <audio> to
-  // mount and reach readiness, then seek + play — so a transcript click made
-  // BEFORE the recording is loaded works, and the latest offset wins on rapid
-  // clicks. Session-change resets inside RecordingPlayer discard stale seeks.
+  // click-to-play contract — RecordingPlayer owns mint/wait/seek/play.
   const handleSeek = useCallback((offsetSec: number) => {
     playerRef.current?.playFrom(offsetSec);
   }, []);
 
-  // P1-1: working retry — increments refreshKey to re-trigger the effect
   const handleTranscriptRetry = useCallback(() => {
     setRefreshKey((k) => k + 1);
   }, []);
 
-  // Older assessments (latest is on Overview tab)
-  const olderAssessments = assessments.slice(1);
-
   const handleSessionChange = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
     setSelectedSessionId(e.target.value || null);
-    // RecordingPlayer resets its own URL + queued seek when sessionId changes.
   }, []);
+
+  // The scorecard shown is the selected session's own assessment when
+  // available; for non-admins it falls back to the candidate's latest.
+  const scorecardAssessment = sessionAssessment ?? (permissionDenied ? assessments[0] ?? null : null);
 
   if (selectableSessions.length === 0) {
     return (
       <div className="space-y-6">
         <Card className="p-5">
-          <h2 className="mb-1 text-sm font-semibold text-ink">
-            Transcript &amp; Recording
-          </h2>
+          <h2 className="mb-1 text-sm font-semibold text-ink">Review workspace</h2>
           <p className="text-sm text-ink-secondary">
             No completed sessions with recordings yet. Complete a live voice
-            screening to review transcripts with synchronized playback.
+            screening to review the transcript with synchronized playback and
+            the session scorecard here.
           </p>
         </Card>
-        <ScorecardsBlock assessments={olderAssessments} blocked={blocked} fallback={assessments.length > 0 ? 'latest-on-overview' : 'none'} />
+        <ScorecardBlock
+          blocked={blocked}
+          assessment={assessments[0] ?? null}
+          heading={assessments.length > 0 ? 'Latest scorecard' : undefined}
+        />
       </div>
     );
   }
 
+  const contextSession = loadedSession ?? selectedSession;
+
   return (
     <div className="space-y-6">
-      {/* Session selector */}
-      <div className="flex flex-wrap items-center gap-3">
-        <label htmlFor="sync-session-select" className="text-sm font-medium text-ink">
-          Session
-        </label>
-        <select
-          id="sync-session-select"
-          value={selectedSessionId ?? ''}
-          onChange={handleSessionChange}
-          className="rounded-md border border-line bg-surface px-3 py-1.5 text-sm text-ink focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
-        >
-          {selectableSessions.map((s) => (
-            <option key={s.id} value={s.id}>
-              {new Date(s.created_at).toLocaleDateString()} — {s.id.slice(0, 8)}
-              {s.mode === 'live' ? ' (live)' : ''}
-              {s.duration_sec ? ` · ${Math.round(s.duration_sec / 60)}m` : ''}
-            </option>
-          ))}
-        </select>
-      </div>
-
-      {/* Split pane */}
-      <div className="flex flex-col gap-6 lg:flex-row lg:items-start">
-        {/* LEFT — sticky player (compact on mobile, full on desktop) */}
-        {/* P1-3: mobile bar is sticky; desktop full panel */}
-        <div className="lg:sticky lg:top-4 lg:w-80 lg:shrink-0 [&_audio]:w-full">
-          {selectedSessionId && (
-            <RecordingPlayer
-              ref={playerRef}
-              sessionId={selectedSessionId}
-              onTimeUpdate={handleTimeUpdate}
-              compact={false}
-            />
-          )}
-          {/* P2-2: hidden skip-link anchor to return to transcript */}
-          <a
-            href="#sync-transcript-region"
-            className="sr-only focus:not-sr-only focus:inline-block focus:mt-2 focus:text-xs focus:text-brand-600"
+      {/* Session selector + context */}
+      <div className="flex flex-col gap-3 rounded-xl border border-line bg-surface p-4 shadow-card sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex flex-wrap items-center gap-3">
+          <label htmlFor="sync-session-select" className="text-sm font-medium text-ink">
+            Session
+          </label>
+          <select
+            id="sync-session-select"
+            value={selectedSessionId ?? ''}
+            onChange={handleSessionChange}
+            className="rounded-md border border-line bg-surface px-3 py-1.5 text-sm text-ink focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
           >
-            Skip to transcript
-          </a>
-          <p className="mt-2 hidden text-xs text-ink-tertiary lg:block">
-            Click any timed transcript turn to jump to that moment. Active
-            turns are highlighted automatically during playback.
-          </p>
+            {selectableSessions.map((s) => (
+              <option key={s.id} value={s.id}>
+                {formatDateTime(s.created_at, { month: 'short', day: 'numeric', year: 'numeric' })}
+                {' — '}
+                {s.id.slice(0, 8)}
+                {s.mode === 'live' ? ' (live)' : ''}
+              </option>
+            ))}
+          </select>
         </div>
-
-        {/* RIGHT — scrollable transcript */}
-        <div id="sync-transcript-region" className="min-h-0 flex-1">
-          {transcriptError ? (
-            <ErrorState
-              message={transcriptError}
-              onRetry={handleTranscriptRetry}
-            />
-          ) : (
-            <SeekableTranscript
-              transcript={transcript}
-              activeTurnIndex={activeTurnIndex}
-              onSeek={handleSeek}
-              recordingReady={true}
-              isLoading={transcriptLoading}
-              onRetry={handleTranscriptRetry}
-            />
-          )}
-        </div>
+        {contextSession && (
+          <div className="flex flex-wrap items-center gap-2 text-xs text-ink-tertiary">
+            <StatusBadge tone={sessionStatusTone(contextSession.status)}>
+              {sessionStatusLabel(contextSession.status)}
+            </StatusBadge>
+            <span>{contextSession.mode === 'live' ? 'Live voice' : 'Simulation'}</span>
+            <span aria-hidden>·</span>
+            <span>{formatDurationSec(contextSession.duration_sec)}</span>
+            <span aria-hidden>·</span>
+            <span>{formatDateTime(contextSession.created_at)}</span>
+          </div>
+        )}
       </div>
 
-      {/* P2-2: skip link back to player */}
-      <a
-        href="#sync-workspace-audio"
-        className="sr-only focus:not-sr-only focus:inline-block focus:text-xs focus:text-brand-600"
-      >
-        Return to recording player
-      </a>
+      {permissionDenied ? (
+        <Card className="p-5">
+          <h2 className="mb-1 text-sm font-semibold text-ink">Transcript &amp; recording</h2>
+          <p className="text-sm text-ink-secondary">
+            Detailed transcript playback and recording review require admin
+            access. The session scorecard is shown below.
+          </p>
+        </Card>
+      ) : (
+        /* Split pane: sticky player + scrollable transcript */
+        <div className="flex flex-col gap-6 lg:flex-row lg:items-start">
+          <div id="sync-workspace-player" className="lg:sticky lg:top-4 lg:w-80 lg:shrink-0 [&_audio]:w-full">
+            {selectedSessionId && (
+              <RecordingPlayer
+                ref={playerRef}
+                sessionId={selectedSessionId}
+                onTimeUpdate={handleTimeUpdate}
+                compact={false}
+              />
+            )}
+            <a
+              href="#sync-transcript-region"
+              className="sr-only focus:not-sr-only focus:mt-2 focus:inline-block focus:text-xs focus:text-brand-600"
+            >
+              Skip to transcript
+            </a>
+            <p className="mt-2 hidden text-xs text-ink-tertiary lg:block">
+              Click any timed transcript turn to jump to that moment. Active
+              turns are highlighted automatically during playback.
+            </p>
+          </div>
 
-      {/* Scorecards */}
-      <ScorecardsBlock assessments={olderAssessments} blocked={blocked} fallback={assessments.length > 0 ? 'latest-on-overview' : 'none'} />
+          <div id="sync-transcript-region" className="min-h-0 flex-1">
+            {transcriptError ? (
+              <ErrorState message={transcriptError} onRetry={handleTranscriptRetry} />
+            ) : (
+              <SeekableTranscript
+                transcript={transcript}
+                activeTurnIndex={activeTurnIndex}
+                onSeek={handleSeek}
+                recordingReady={true}
+                isLoading={transcriptLoading}
+                onRetry={handleTranscriptRetry}
+              />
+            )}
+          </div>
+        </div>
+      )}
+
+      {!permissionDenied && (
+        <a
+          href="#sync-workspace-player"
+          className="sr-only focus:not-sr-only focus:inline-block focus:text-xs focus:text-brand-600"
+        >
+          Return to recording player
+        </a>
+      )}
+
+      {/* Scorecard for the selected session */}
+      <ScorecardBlock
+        blocked={blocked}
+        assessment={scorecardAssessment}
+        heading={
+          sessionAssessment
+            ? 'Scorecard for this session'
+            : permissionDenied && scorecardAssessment
+              ? 'Latest scorecard'
+              : undefined
+        }
+      />
     </div>
   );
 }
 
-/* ── Scorecards block ──────────────────────────────────────────── */
+/* ── Scorecard block ──────────────────────────────────────────────── */
 
-function ScorecardsBlock({
-  assessments,
+function ScorecardBlock({
   blocked,
-  fallback,
+  assessment,
+  heading,
 }: {
-  assessments: Assessment[];
   blocked: boolean;
-  fallback: 'latest-on-overview' | 'none';
+  assessment: Assessment | null;
+  heading?: string;
 }) {
   return (
     <Card className="p-5">
-      <h2 className="mb-3 text-sm font-semibold text-ink">Scorecards</h2>
+      <h2 className="mb-3 text-sm font-semibold text-ink">
+        {heading ?? 'Scorecard'}
+      </h2>
       {blocked ? (
         <p className="text-sm text-ink-secondary">
           Scorecards are suppressed while an appeal is under review.
         </p>
-      ) : assessments.length === 0 ? (
-        <p className="text-sm text-ink-secondary">
-          {fallback === 'latest-on-overview'
-            ? 'The latest scorecard is shown on the Overview tab. No older scorecards exist yet.'
-            : 'No scorecards yet — complete a screening to generate one.'}
-        </p>
+      ) : assessment ? (
+        <Scorecard assessment={assessment} />
       ) : (
-        <div className="space-y-6">
-          {assessments.map((a) => (
-            <Scorecard key={a.id ?? a.overall_score} assessment={a} />
-          ))}
-        </div>
+        <p className="text-sm text-ink-secondary">
+          No scorecard for this session yet — complete a screening to generate
+          one.
+        </p>
       )}
     </Card>
   );

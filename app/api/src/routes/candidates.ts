@@ -4,6 +4,7 @@ import { validateQuery, validateParams } from '../lib/validation.js';
 import { listCandidatesQuerySchema, candidateIdParamSchema } from '../schemas/candidates.js';
 import { requireRole } from '../lib/rbac.js';
 import { recordAudit } from '../lib/audit.js';
+import { withSessionCreatedAtList } from '../lib/session-serialization.js';
 
 export const candidatesRouter = Router();
 
@@ -57,5 +58,9 @@ candidatesRouter.get('/:id', requireRole('viewer'), validateParams(candidateIdPa
     .eq('candidate_id', req.params.id)
     .order('created_at', { ascending: false });
 
-  res.json({ candidate, sessions: sessions ?? [], assessments: assessments ?? [] });
+  res.json({
+    candidate,
+    sessions: withSessionCreatedAtList(sessions),
+    assessments: assessments ?? [],
+  });
 });

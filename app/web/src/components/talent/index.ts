@@ -21,3 +21,16 @@ export {
   sessionStatusCounts,
   sessionsPerDay,
 } from './status';
+export {
+  CANDIDATE_STATUS_ORDER,
+  EMPTY_CANDIDATE_FILTERS,
+  normalizeStatus,
+  parseCandidateFilters,
+  buildCandidateSearch,
+  candidatesHref,
+  matchesCandidateStatus,
+  hasActiveFilters,
+  candidateFunnel,
+  candidateNextAction,
+} from './candidateFilters';
+export type { CandidateFilters, CandidateStatusKey } from './candidateFilters';

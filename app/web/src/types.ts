@@ -67,7 +67,12 @@ export interface Session {
   /** @deprecated MIG-03/04/05 — use getRecordingDownloadUrl() for on-demand signed URL. */
   recording_url?: string | null;
   duration_sec?: number | null;
+  /** Session creation instant (ISO). Server aliases started_at when no explicit column. */
   created_at: string;
+  /** Call start instant (ISO). NOT NULL in storage; may be absent on older payloads. */
+  started_at?: string | null;
+  /** Call end instant (ISO), null while in progress. */
+  ended_at?: string | null;
 }
 
 export type Speaker = "bot" | "candidate";

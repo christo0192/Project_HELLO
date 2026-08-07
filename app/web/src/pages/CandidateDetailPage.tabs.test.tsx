@@ -1,11 +1,8 @@
 /**
- * CandidateDetailPage (Lane 3) — tab reorganization tests (adjacent to the
- * preserved existing suite, which remains untouched):
- *   - ARIA tablist semantics + keyboard activation
- *   - on-demand transcript loading per session (no prefetch), empty/error states
- *   - on-demand recording access (no auto-fetch), signed URL lifecycle
- *   - appeal-block suppression holds across tabs (no scorecard anywhere)
- *   - axe compliance with hidden tab panels
+ * CandidateDetailPage — tab semantics for the redesigned 2-tab workspace
+ * (Overview + Review). Covers ARIA tablist + keyboard activation, the Review
+ * workspace transcript load (empty/error), on-demand recording gating, and
+ * axe with hidden panels.
  */
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -24,7 +21,7 @@ const mockApi = {
   exportCsv: vi.fn(),
   startLiveKitScreening: vi.fn().mockRejectedValue(new Error('mock')),
   issueLiveKitInvite: vi.fn(),
-  getSession: vi.fn().mockResolvedValue(mockSessionDetail),
+  getSession: vi.fn(),
 };
 
 vi.mock('../api', () => ({
@@ -49,7 +46,6 @@ vi.mock('../api', () => ({
   },
 }));
 
-// Mock supabase to prevent channel subscriptions (same shape as the existing suite).
 vi.mock('../lib/supabase', () => {
   const makeChannel = () => {
     const channel: any = {};
@@ -84,107 +80,78 @@ function renderDetailPage() {
   );
 }
 
-describe('CandidateDetailPage tabs (Lane 3)', () => {
+describe('CandidateDetailPage tabs', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockApi.getCandidate.mockResolvedValue(mockCandidateDetail);
+    mockApi.getSession.mockResolvedValue(mockSessionDetail);
   });
 
-  it('renders a keyboard tablist with the expected tab names', async () => {
+  it('renders a keyboard tablist with Overview + Review', async () => {
     renderDetailPage();
     await screen.findByText('Jane Doe');
     const tablist = screen.getByRole('tablist', { name: 'Candidate sections' });
     expect(tablist).toBeInTheDocument();
-    const labels = screen.getAllByRole('tab').map((t) => t.textContent);
-    expect(labels).toEqual([
-      'Overview',
-      'Sessions',
-      'Transcript & Scorecards',
-      'Recordings',
-    ]);
-    expect(screen.getByRole('tab', { name: 'Overview' })).toHaveAttribute(
-      'aria-selected',
-      'true',
-    );
+    expect(screen.getAllByRole('tab').map((t) => t.textContent)).toEqual(['Overview', 'Review']);
+    expect(screen.getByRole('tab', { name: 'Overview' })).toHaveAttribute('aria-selected', 'true');
   });
 
-  it('activates the Sessions tab on ArrowRight and keeps panel state', async () => {
+  it('activates the Review tab on ArrowRight', async () => {
     const user = userEvent.setup();
     renderDetailPage();
     await screen.findByText('Jane Doe');
-    const overview = screen.getByRole('tab', { name: 'Overview' });
-    overview.focus();
+    screen.getByRole('tab', { name: 'Overview' }).focus();
     await user.keyboard('{ArrowRight}');
-    const sessions = screen.getByRole('tab', { name: 'Sessions' });
-    expect(sessions).toHaveFocus();
-    expect(sessions).toHaveAttribute('aria-selected', 'true');
-    // The sessions panel becomes the visible one.
-    expect(screen.getByRole('tabpanel', { name: 'Sessions' })).not.toHaveAttribute(
-      'hidden',
-    );
-    // Sessions content (status chips, recording button) is present.
-    expect(screen.getByText('Screening sessions')).toBeInTheDocument();
-    expect(screen.getByText('completed')).toBeInTheDocument();
+    const review = screen.getByRole('tab', { name: 'Review' });
+    expect(review).toHaveFocus();
+    expect(review).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByRole('tabpanel', { name: 'Review' })).not.toHaveAttribute('hidden');
   });
 
-  it('auto-loads transcript for the first completed session', async () => {
+  it('auto-loads the transcript for the first completed session', async () => {
     renderDetailPage();
     await screen.findByText('Jane Doe');
-
-    // The workspace auto-fetches transcript for the first completed session.
     await waitFor(() => expect(mockApi.getSession).toHaveBeenCalledWith('session-1'));
-
-    fireEvent.click(screen.getByRole('tab', { name: 'Transcript & Scorecards' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Review' }));
     expect(await screen.findByText('Welcome to the screening.')).toBeInTheDocument();
     expect(screen.getByText('Thank you!')).toBeInTheDocument();
   });
 
-  it('shows a truthful empty transcript state when the session has no transcript lines', async () => {
-    mockApi.getSession.mockResolvedValue({
-      ...mockSessionDetail,
-      transcript: [],
-    });
+  it('shows a truthful empty transcript state', async () => {
+    mockApi.getSession.mockResolvedValue({ ...mockSessionDetail, transcript: [] });
     renderDetailPage();
     await screen.findByText('Jane Doe');
-    fireEvent.click(screen.getByRole('tab', { name: 'Transcript & Scorecards' }));
-
+    fireEvent.click(screen.getByRole('tab', { name: 'Review' }));
     expect(
       await screen.findByText(/No transcript lines recorded for this session yet/i),
     ).toBeInTheDocument();
   });
 
-  it('shows an inline transcript error with a retry path when the auto-load fails', async () => {
+  it('shows an inline transcript error with retry', async () => {
     mockApi.getSession.mockRejectedValue({ message: 'transcript unavailable' });
     renderDetailPage();
     await screen.findByText('Jane Doe');
-    fireEvent.click(screen.getByRole('tab', { name: 'Transcript & Scorecards' }));
-
+    fireEvent.click(screen.getByRole('tab', { name: 'Review' }));
     expect(await screen.findByText('transcript unavailable')).toBeInTheDocument();
-    // The ErrorState component provides a retry button
     expect(screen.getByRole('button', { name: /try again/i })).toBeInTheDocument();
   });
 
-  it('does not auto-fetch recordings and gates access behind an explicit click', async () => {
+  it('gates recording access behind an explicit click', async () => {
     mockApi.getRecordingDownloadUrl.mockResolvedValue({ url: 'https://x.invalid/rec' });
     renderDetailPage();
     await screen.findByText('Jane Doe');
-    fireEvent.click(screen.getByRole('tab', { name: 'Recordings' }));
-
+    fireEvent.click(screen.getByRole('tab', { name: 'Review' }));
+    const loadBtn = await screen.findByRole('button', { name: /load recording/i });
     expect(mockApi.getRecordingDownloadUrl).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: /load recording/i }));
+    fireEvent.click(loadBtn);
     await waitFor(() =>
       expect(mockApi.getRecordingDownloadUrl).toHaveBeenCalledWith('session-1'),
     );
-    await waitFor(() =>
-      expect(document.querySelector('audio')).not.toBeNull(),
-    );
-    expect(document.querySelector('audio')).toHaveAttribute(
-      'src',
-      'https://x.invalid/rec',
-    );
+    await waitFor(() => expect(document.querySelector('audio')).not.toBeNull());
+    expect(document.querySelector('audio')).toHaveAttribute('src', 'https://x.invalid/rec');
   });
 
-  it('keeps the appeal block suppressing every scorecard across tabs', async () => {
+  it('suppresses the scorecard across the appeal block', async () => {
     mockApi.getCandidate.mockResolvedValue({
       ...mockCandidateDetail,
       candidate: {
@@ -193,16 +160,11 @@ describe('CandidateDetailPage tabs (Lane 3)', () => {
       },
     });
     renderDetailPage();
+    expect(await screen.findByText(/Decision use is paused — open appeal/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: 'Review' }));
     expect(
-      await screen.findByText(/Decision use is paused — open appeal/i),
+      await screen.findByText(/Scorecards are suppressed while an appeal is under review/i),
     ).toBeInTheDocument();
-    expect(screen.getByText(/Hidden while an appeal is under review/i)).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('tab', { name: 'Transcript & Scorecards' }));
-    expect(
-      screen.getByText(/Scorecards are suppressed while an appeal is under review/i),
-    ).toBeInTheDocument();
-    // No scorecard number anywhere in the page (Overview or other tabs).
     expect(screen.queryByText('78')).not.toBeInTheDocument();
   });
 
