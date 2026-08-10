@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { createLocalAudioTrack, LocalAudioTrack, Room, RoomEvent, Track } from 'livekit-client';
+import {
+  createLocalAudioTrack,
+  LocalAudioTrack,
+  Room,
+  RoomEvent,
+  Track,
+  type TranscriptionSegment,
+} from 'livekit-client';
 import { api, ApiError } from '../api';
 import type { CandidateConsentTemplate } from '../types';
 import { Button, Card } from '../components/ui';
@@ -40,6 +47,14 @@ type JoinPhase =
 const LOCALE = 'en-IN';
 const CANDIDATE_FINALIZE_ATTEMPTS = 6;
 const CANDIDATE_FINALIZE_RETRY_MS = 2000;
+const MAX_LIVE_TRANSCRIPT_SEGMENTS = 100;
+
+interface LiveTranscriptSegment {
+  id: string;
+  text: string;
+  speaker: 'christy' | 'candidate';
+  final: boolean;
+}
 
 function sleep(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -112,6 +127,7 @@ export function CandidateJoinPage() {
   const [error, setError] = useState<string | null>(null);
   const [template, setTemplate] = useState<CandidateConsentTemplate | null>(null);
   const [checked, setChecked] = useState<Record<string, boolean>>({});
+  const [liveTranscript, setLiveTranscript] = useState<LiveTranscriptSegment[]>([]);
   const inviteRef = useRef<string | null>(null);
   const roomRef = useRef<Room | null>(null);
   const localTrackRef = useRef<LocalAudioTrack | null>(null);
@@ -353,10 +369,32 @@ export function CandidateJoinPage() {
       joinStep = 'connect';
       const room = new Room({ adaptiveStream: true, dynacast: true });
       roomRef.current = room;
+      setLiveTranscript([]);
       room.on(RoomEvent.TrackSubscribed, (track) => {
         if (track.kind === Track.Kind.Audio && remoteAudioRef.current) {
           track.attach(remoteAudioRef.current);
         }
+      });
+      room.on(RoomEvent.TranscriptionReceived, (segments, participant) => {
+        const speaker: LiveTranscriptSegment['speaker'] =
+          participant?.identity === room.localParticipant.identity ? 'candidate' : 'christy';
+        setLiveTranscript((previous) => {
+          const next = [...previous];
+          for (const segment of segments as TranscriptionSegment[]) {
+            const text = segment.text.trim();
+            if (!text) continue;
+            const value: LiveTranscriptSegment = {
+              id: segment.id,
+              text,
+              speaker,
+              final: segment.final,
+            };
+            const existing = next.findIndex((item) => item.id === segment.id);
+            if (existing >= 0) next[existing] = value;
+            else next.push(value);
+          }
+          return next.slice(-MAX_LIVE_TRANSCRIPT_SEGMENTS);
+        });
       });
       room.on(RoomEvent.Disconnected, () => {
         setStatus('ended');
@@ -479,7 +517,44 @@ export function CandidateJoinPage() {
         {phase === 'granted' && (
           <>
             {status === 'live' ? (
-              <Button className="mt-5" onClick={leave}>Leave screening</Button>
+              <>
+                <section
+                  aria-label="Live transcript"
+                  aria-live="polite"
+                  className="mt-5 max-h-72 overflow-y-auto rounded-lg border border-gray-200 bg-gray-50 p-4"
+                >
+                  <div className="mb-3 flex items-center justify-between gap-3">
+                    <h2 className="text-sm font-semibold text-gray-900">Live transcript</h2>
+                    <span className="text-xs text-gray-500">Final text is saved after each turn</span>
+                  </div>
+                  {liveTranscript.length === 0 ? (
+                    <p className="text-sm text-gray-500">Waiting for the conversation to start…</p>
+                  ) : (
+                    <ol className="space-y-3">
+                      {liveTranscript.map((segment) => (
+                        <li
+                          key={segment.id}
+                          className={segment.speaker === 'candidate' ? 'text-right' : 'text-left'}
+                        >
+                          <span className="block text-xs font-medium text-gray-500">
+                            {segment.speaker === 'candidate' ? 'You' : 'Christy'}
+                          </span>
+                          <span
+                            className={`mt-1 inline-block max-w-[90%] rounded-xl px-3 py-2 text-sm ${
+                              segment.speaker === 'candidate'
+                                ? 'bg-accent-600 text-white'
+                                : 'bg-white text-gray-800 ring-1 ring-gray-200'
+                            } ${segment.final ? '' : 'italic opacity-70'}`}
+                          >
+                            {segment.text}
+                          </span>
+                        </li>
+                      ))}
+                    </ol>
+                  )}
+                </section>
+                <Button className="mt-5" onClick={leave}>Leave screening</Button>
+              </>
             ) : status === 'ended' ? (
               <p className="mt-5 text-sm font-medium text-gray-700">The screening has ended.</p>
             ) : capabilityStatus === 'checking' ? (

@@ -68,6 +68,21 @@ supabase db push --dry-run
 supabase db push
 ```
 
+### Automated Fly release gate
+
+For the active hosted environment, `.github/workflows/deploy-fly.yml` runs the
+same pending migration set **before** either API or voice deployment. It uses a
+single repository secret named `SUPABASE_DB_URL`; the value is injected only
+into the serialized migration job and is never passed to either Fly job. The
+job runs the pinned Supabase CLI and `db push --include-all`. A missing
+credential or failed migration blocks both application deployments, preventing
+a worker/API image from running against an older schema.
+
+Configure the secret through the repository secret UI or a no-echo approved
+shell. Never put the URL in workflow YAML, logs, chat, or command history.
+Manual recovery dispatches also pass through the migration gate. Confirm the
+migration job is green before trusting API/voice deploy checks.
+
 Hosted project settings must also be checked explicitly because local `config.toml` is not a production control:
 
 - Exposed schemas include `screening_v2` only as required by the dashboard.

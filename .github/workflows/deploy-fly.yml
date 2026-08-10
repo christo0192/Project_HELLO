@@ -14,6 +14,9 @@ name: Deploy (Fly)
 #  - Deploys only the service(s) with changed sources (path diff of the merge).
 #  - Third-party and first-party actions are pinned to immutable full commit
 #    SHAs (no floating tags, no @master), consistent with repo hardening policy.
+#  - Database migrations are applied before either application deploy. A failed
+#    or unavailable migration credential blocks both deploys, preventing schema /
+#    runtime skew (for example a worker writing a column that production lacks).
 #  - Per-service Fly tokens: the API job can ONLY use FLY_API_TOKEN_API and the
 #    voice job ONLY FLY_API_TOKEN_VOICE, so a compromise of one job cannot deploy
 #    the other app. Tokens are consumed only as step env for flyctl, never
@@ -28,7 +31,9 @@ name: Deploy (Fly)
 #   deploy -a <app>` token:
 #     FLY_API_TOKEN_API    → deploy access to project-hello-api ONLY
 #     FLY_API_TOKEN_VOICE  → deploy access to project-hello-voice ONLY
-#   Until they exist the corresponding deploy job fails closed at the flyctl step.
+#     SUPABASE_DB_URL       → production Postgres connection URL used only by
+#                             the serialized migration job
+#   Until they exist the corresponding job fails closed before deployment.
 
 on:
   workflow_run:
@@ -61,6 +66,7 @@ jobs:
     outputs:
       api: ${{ steps.decide.outputs.api }}
       voice: ${{ steps.decide.outputs.voice }}
+      database: ${{ steps.decide.outputs.database }}
       sha: ${{ steps.decide.outputs.sha }}
     steps:
       - name: Resolve target SHA
@@ -85,15 +91,46 @@ jobs:
               voice) echo "api=false" >> "$GITHUB_OUTPUT"; echo "voice=true"  >> "$GITHUB_OUTPUT" ;;
               both)  echo "api=true"  >> "$GITHUB_OUTPUT"; echo "voice=true"  >> "$GITHUB_OUTPUT" ;;
             esac
+            # Manual application deploys still apply every pending migration first.
+            echo "database=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # Path diff of the merge commit (fallback to single-commit file list).
           changed="$(git diff --name-only "${sha}^" "${sha}" 2>/dev/null || git show --name-only --format= "${sha}")"
           echo "$changed" | grep -qE '^app/api/'          && echo "api=true"   >> "$GITHUB_OUTPUT" || echo "api=false"   >> "$GITHUB_OUTPUT"
           echo "$changed" | grep -qE '^app/voice-livekit/' && echo "voice=true" >> "$GITHUB_OUTPUT" || echo "voice=false" >> "$GITHUB_OUTPUT"
+          echo "$changed" | grep -qE '^app/supabase/migrations/' && echo "database=true" >> "$GITHUB_OUTPUT" || {
+            # Any application release first converges pending migrations. This
+            # also recovers safely if an earlier migration job was interrupted.
+            if echo "$changed" | grep -qE '^app/(api|voice-livekit)/'; then
+              echo "database=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "database=false" >> "$GITHUB_OUTPUT"
+            fi
+          }
+
+  migrate-production:
+    needs: detect
+    if: needs.detect.outputs.database == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: supabase-production-migrations
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.x
+        with:
+          ref: ${{ needs.detect.outputs.sha }}
+      - name: Apply pending production migrations
+        working-directory: app/supabase
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -euo pipefail
+          test -n "$SUPABASE_DB_URL" || { echo "::error::SUPABASE_DB_URL is not configured"; exit 1; }
+          npx --yes supabase@2.110.0 db push --db-url "$SUPABASE_DB_URL" --include-all
 
   deploy-api:
-    needs: detect
+    needs: [detect, migrate-production]
     if: needs.detect.outputs.api == 'true'
     runs-on: ubuntu-latest
     concurrency:
@@ -120,7 +157,7 @@ jobs:
           echo "::error::API health check did not return 200"; exit 1
 
   deploy-voice:
-    needs: detect
+    needs: [detect, migrate-production]
     if: needs.detect.outputs.voice == 'true'
     runs-on: ubuntu-latest
     concurrency:

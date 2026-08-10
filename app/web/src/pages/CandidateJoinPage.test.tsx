@@ -29,7 +29,7 @@ const {
   createLocalAudioTrack: vi.fn().mockResolvedValue({ stop: vi.fn() }),
   completeCandidateScreening: vi.fn(),
   uploadCandidateRecording: vi.fn(),
-  roomHandlers: new Map<string, () => void>(),
+  roomHandlers: new Map<string, (...args: any[]) => void>(),
   disconnect: vi.fn(() => roomHandlers.get('disconnected')?.()),
 }));
 
@@ -53,14 +53,18 @@ vi.mock('../api', () => ({
 
 vi.mock('livekit-client', () => ({
   Room: class {
-    localParticipant = { publishTrack };
-    on = vi.fn((event: string, handler: () => void) => {
+    localParticipant = { publishTrack, identity: 'candidate-local' };
+    on = vi.fn((event: string, handler: (...args: any[]) => void) => {
       roomHandlers.set(event, handler);
     });
     connect = connect;
     disconnect = disconnect;
   },
-  RoomEvent: { TrackSubscribed: 'trackSubscribed', Disconnected: 'disconnected' },
+  RoomEvent: {
+    TrackSubscribed: 'trackSubscribed',
+    TranscriptionReceived: 'transcriptionReceived',
+    Disconnected: 'disconnected',
+  },
   Track: { Kind: { Audio: 'audio' } },
   LocalAudioTrack: class {
     mediaStreamTrack: unknown;
@@ -248,6 +252,43 @@ describe('CandidateJoinPage', () => {
       'wss://livekit.example.invalid',
       'synthetic-livekit-token',
     );
+  });
+
+  it('streams and updates LiveKit transcript segments during the call', async () => {
+    candidateConsentStatus.mockResolvedValue({
+      has_consent: true,
+      template_version: '1.0',
+      locale: 'en-IN',
+      required_consents: ['ai_interview', 'recording'],
+    });
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
+    await userEvent.click(await screen.findByRole('button', { name: 'Join screening' }));
+    await screen.findByRole('region', { name: 'Live transcript' });
+
+    const receive = roomHandlers.get('transcriptionReceived');
+    expect(receive).toBeDefined();
+    receive?.(
+      [{ id: 'seg-1', text: 'Hel', final: false }],
+      { identity: 'agent-worker' },
+    );
+    expect(await screen.findByText('Hel')).toHaveClass('italic');
+    expect(screen.getByText('Christy')).toBeInTheDocument();
+
+    receive?.(
+      [{ id: 'seg-1', text: 'Hello there', final: true }],
+      { identity: 'agent-worker' },
+    );
+    await waitFor(() => expect(screen.queryByText('Hel')).not.toBeInTheDocument());
+    expect(screen.getByText('Hello there')).not.toHaveClass('italic');
+
+    receive?.(
+      [{ id: 'seg-2', text: 'Thank you', final: true }],
+      { identity: 'candidate-local' },
+    );
+    expect(await screen.findByText('Thank you')).toBeInTheDocument();
+    expect(screen.getByText('You')).toBeInTheDocument();
+    expect(screen.getAllByText('Hello there')).toHaveLength(1);
   });
 
   it('manual Leave finalizes exactly once and prefers authoritative Egress', async () => {

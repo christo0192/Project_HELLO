@@ -661,8 +661,9 @@ class TestDeadlockRegression(unittest.TestCase):
                 return drained
 
             t = asyncio.create_task(write_op())
+            # Agent retains completed writes through finalization so a failure
+            # that completed before the drain cannot disappear.
             write_tasks.add(t)
-            t.add_done_callback(write_tasks.discard)
 
             finalizer = asyncio.create_task(complete_once())
             # finalizer is NOT added to write_tasks
@@ -672,7 +673,24 @@ class TestDeadlockRegression(unittest.TestCase):
 
         drained, remaining_writes = asyncio.run(_simulate())
         self.assertTrue(drained)
-        self.assertEqual(remaining_writes, 0)
+        self.assertEqual(remaining_writes, 1)
+
+    def test_completed_failed_write_is_retained_and_fails_terminal_drain(self):
+        """Regression: done-callback removal used to hide transcript failures."""
+        async def _simulate():
+            write_tasks: set[asyncio.Task] = set()
+
+            async def failed_write():
+                raise LifecycleError("synthetic write failure")
+
+            task = asyncio.create_task(failed_write())
+            write_tasks.add(task)
+            await asyncio.sleep(0)  # failure completes before finalization
+            self.assertTrue(task.done())
+            self.assertIn(task, write_tasks)
+            return await persistence.drain_pending_writes(write_tasks, timeout_sec=1)
+
+        self.assertFalse(asyncio.run(_simulate()))
 
 
 # ── Transition matrix ────────────────────────────────────────────────

@@ -41,6 +41,7 @@ import {
   sessionStatusTone,
 } from './status';
 import { formatDateTime } from '../../lib/datetime';
+import { isLiveVoiceMode, sessionModeLabel } from '../../lib/session-mode';
 
 export interface TranscriptionSyncWorkspaceProps {
   sessions: Session[];
@@ -221,7 +222,7 @@ export function TranscriptionSyncWorkspace({
                 {formatDateTime(s.created_at, { month: 'short', day: 'numeric', year: 'numeric' })}
                 {' — '}
                 {s.id.slice(0, 8)}
-                {s.mode === 'live' ? ' (live)' : ''}
+                {isLiveVoiceMode(s.mode) ? ' (live)' : ''}
               </option>
             ))}
           </select>
@@ -231,7 +232,7 @@ export function TranscriptionSyncWorkspace({
             <StatusBadge tone={sessionStatusTone(contextSession.status)}>
               {sessionStatusLabel(contextSession.status)}
             </StatusBadge>
-            <span>{contextSession.mode === 'live' ? 'Live voice' : 'Simulation'}</span>
+            <span>{sessionModeLabel(contextSession.mode)}</span>
             <span aria-hidden>·</span>
             <span>{formatDurationSec(contextSession.duration_sec)}</span>
             <span aria-hidden>·</span>

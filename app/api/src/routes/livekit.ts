@@ -472,6 +472,23 @@ livekitRouter.post(
         return res.status(409).json({ error: 'session_not_completable' });
       }
 
+      // Do not let the browser race the worker into a false completed session
+      // with an empty transcript. CandidateJoin retries this bounded 409 while
+      // the opening/turn writes drain. A durable write failure leaves the row
+      // non-completed so the worker can fail it truthfully instead of triggering
+      // a scorecard with no evidence.
+      const { data: persistedTurns, error: turnsErr } = await supabase
+        .from('transcript_turns')
+        .select('id')
+        .eq('session_id', sessionId)
+        .limit(1);
+      if (turnsErr) {
+        return res.status(503).json({ error: 'transcript_status_unavailable' });
+      }
+      if (!persistedTurns || persistedTurns.length === 0) {
+        return res.status(409).json({ error: 'transcript_pending' });
+      }
+
       const startedAt = session.started_at ? new Date(session.started_at).getTime() : Date.now();
       const durationSec = Math.max(0, Math.min(86_400, Math.floor((Date.now() - startedAt) / 1000)));
       const completed = await transitionSession(
