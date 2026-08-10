@@ -34,6 +34,14 @@ import { isPublicRoute, PUBLIC_ROUTES } from '../lib/auth.js';
 import { setRateLimitStore, MemoryRateLimitStore } from '../lib/rate-limit.js';
 import { vi } from 'vitest';
 
+const { mockFinalizeAuthoritativeRecording } = vi.hoisted(() => ({
+  mockFinalizeAuthoritativeRecording: vi.fn(),
+}));
+vi.mock('../lib/recording-egress.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../lib/recording-egress.js')>();
+  return { ...actual, finalizeAuthoritativeRecording: mockFinalizeAuthoritativeRecording };
+});
+
 // ── Supabase mock (chainable query builder + storage) ────────────────
 
 const mockFrom = vi.fn();
@@ -177,6 +185,8 @@ describe('GET /api/recordings/:sessionId/download', () => {
     mockDownload.mockReset();
     mockRemove.mockReset();
     mockRpc.mockReset();
+    mockFinalizeAuthoritativeRecording.mockReset();
+    mockFinalizeAuthoritativeRecording.mockResolvedValue('pending');
     insertCalls = [];
     updateCalls = [];
     configureTables({});
@@ -295,7 +305,7 @@ describe('GET /api/recordings/:sessionId/download', () => {
   });
 
   // ── Missing object key 404 ────────────────────────────────────────
-  it('returns 404 when session has no recording_object_key', async () => {
+  it('returns 404 when session has no recording_object_key or linked Egress', async () => {
     configureTables({
       call_sessions: { owner_id: 'admin-1', recording_object_key: null },
     });
@@ -304,6 +314,77 @@ describe('GET /api/recordings/:sessionId/download', () => {
       .get(`/api/recordings/${VALID_SESSION}/download`)
       .set('Authorization', AUTH_HEADER);
     expect(res.status).toBe(404);
+    expect(mockFinalizeAuthoritativeRecording).not.toHaveBeenCalled();
+  });
+
+  it('returns recording_processing while a completed linked Egress is settling', async () => {
+    configureTables({
+      call_sessions: {
+        owner_id: 'admin-1', status: 'completed', mode: 'browser',
+        recording_object_key: null, recording_egress_id: 'egress-1',
+        recording_egress_status: 'active',
+      },
+    });
+    mockFinalizeAuthoritativeRecording.mockResolvedValue('pending');
+    const app = createTestApp(authAs('admin', 'admin-1'));
+    const res = await request(app)
+      .get(`/api/recordings/${VALID_SESSION}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(409);
+    expect(res.body.error.type).toBe('recording_processing');
+    expect(mockFinalizeAuthoritativeRecording).toHaveBeenCalledWith(VALID_SESSION);
+    expect(mockCreateSignedUrl).not.toHaveBeenCalled();
+  });
+
+  it('recovers a completed Egress on explicit download and then mints the URL', async () => {
+    const missing = {
+      owner_id: 'admin-1', status: 'completed', mode: 'browser',
+      recording_object_key: null, recording_egress_id: 'egress-1',
+      recording_egress_status: 'active', recording_deleted_at: null,
+      recording_revoked_at: null, recording_quarantined: false,
+    };
+    const ready = {
+      ...missing,
+      recording_object_key: OBJECT_KEY,
+      recording_sha256: null,
+      recording_size_bytes: 128,
+      recording_egress_status: 'complete',
+    };
+    let sessionReads = 0;
+    mockFrom.mockImplementation((table: string) => {
+      const data = table === 'call_sessions' && sessionReads++ === 0 ? missing : ready;
+      return chain({ data, error: null }, insertCalls, updateCalls);
+    });
+    mockFinalizeAuthoritativeRecording.mockResolvedValue('ready');
+    mockCreateSignedUrl.mockResolvedValue({ data: { signedUrl: SIGNED_URL }, error: null });
+
+    const app = createTestApp(authAs('admin', 'admin-1'));
+    const res = await request(app)
+      .get(`/api/recordings/${VALID_SESSION}/download`)
+      .set('Authorization', AUTH_HEADER);
+
+    expect(res.status).toBe(200);
+    expect(res.body.url).toBe(SIGNED_URL);
+    expect(mockFinalizeAuthoritativeRecording).toHaveBeenCalledTimes(1);
+    expect(mockCreateSignedUrl).toHaveBeenCalledWith(OBJECT_KEY, expect.any(Number));
+  });
+
+  it('fails closed without minting when Egress recovery errors', async () => {
+    configureTables({
+      call_sessions: {
+        owner_id: 'admin-1', status: 'completed', mode: 'browser',
+        recording_object_key: null, recording_egress_id: 'egress-1',
+        recording_egress_status: 'active',
+      },
+    });
+    mockFinalizeAuthoritativeRecording.mockRejectedValue(new Error('synthetic failure'));
+    const app = createTestApp(authAs('admin', 'admin-1'));
+    const res = await request(app)
+      .get(`/api/recordings/${VALID_SESSION}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(503);
+    expect(res.body.error.type).toBe('recording_processing');
+    expect(mockCreateSignedUrl).not.toHaveBeenCalled();
   });
 
   // ── Deleted tombstone 404 (REC-06 forward-compat) ────────────────
@@ -576,6 +657,22 @@ describe('GET /api/recordings/:sessionId/download', () => {
       (u) => (u as Record<string, unknown>).recording_quarantined === true,
     );
     expect(quarantineUpdate).toBeUndefined();
+  });
+
+  it('does not complete or score an in-progress call before a transcript turn persists', async () => {
+    configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
+      call_sessions: { status: 'in_progress', started_at: '2026-01-01T00:00:00.000Z' },
+      transcript_turns: [],
+    });
+    const app = createTestApp();
+    const res = await request(app)
+      .post(`/api/livekit/${VALID_SESSION}/complete`)
+      .set('x-grant-token', GRANT_TOKEN);
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe('transcript_pending');
+    expect(updateCalls).toHaveLength(0);
+    expect(mockFinalizeAuthoritativeRecording).not.toHaveBeenCalled();
   });
 
   // ── Rate-limit headers present ────────────────────────────────────

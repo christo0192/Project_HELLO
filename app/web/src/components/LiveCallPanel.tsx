@@ -269,7 +269,7 @@ export function LiveCallPanel({
                   className={`flex flex-col ${isBot ? "items-start" : "items-end"}`}
                 >
                   <span className="mb-0.5 px-1 text-[11px] font-medium text-gray-400">
-                    {isBot ? "Gopu" : candidateName || "Candidate"}
+                    {isBot ? "Christy" : candidateName || "Candidate"}
                   </span>
                   <div
                     className={`max-w-[85%] whitespace-pre-wrap rounded-2xl px-3.5 py-2 text-sm leading-relaxed ${

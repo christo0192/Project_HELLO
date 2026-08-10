@@ -40,6 +40,7 @@ import {
   RECORDING_INTEGRITY_SHA256_HEX_LENGTH,
 } from '../lib/recording-integrity.js';
 import { getCorrelationId } from '../lib/correlation.js';
+import { finalizeAuthoritativeRecording } from '../lib/recording-egress.js';
 
 // ── LANE L6 (REC-01 buildable half) — pinned constants ──────────────
 // LiveKit Egress MP3 primary path is external-pending (runbook); this is
@@ -127,9 +128,9 @@ recordingsRouter.get(
       // REC-04/05/06 (L5): the integrity/revocation/tombstone columns feed
       // the fail-closed gate before createSignedUrl. recording_sha256 +
       // recording_size_bytes feed the F1 download-time re-verification.
-      const { data: session, error: sessionErr } = await supabase
+      let { data: session, error: sessionErr } = await supabase
         .from('call_sessions')
-        .select('owner_id, recording_object_key, recording_sha256, recording_size_bytes, recording_quarantined, recording_revoked_at, recording_deleted_at')
+        .select('owner_id, status, mode, recording_object_key, recording_sha256, recording_size_bytes, recording_quarantined, recording_revoked_at, recording_deleted_at, recording_egress_id, recording_egress_status')
         .eq('id', sessionId)
         .single();
 
@@ -148,8 +149,7 @@ recordingsRouter.get(
         return res.status(403).json(authErrorBody(403));
       }
 
-      // ── Recording presence check (privileged roles only reach here) ─
-      if (sessionErr || !session || !session.recording_object_key) {
+      if (sessionErr || !session) {
         return res
           .status(404)
           .json({ error: { type: 'not_found', message: 'Recording not found' } });
@@ -174,6 +174,46 @@ recordingsRouter.get(
       // 3. Revoked (REC-05): revocation denies new mints within the TTL.
       if (session.recording_revoked_at) {
         return res.status(403).json(authErrorBody(403));
+      }
+
+      // A candidate browser can disappear while LiveKit Egress is still
+      // settling. Recover on the recruiter's explicit playback request instead
+      // of returning a permanent false 404. This keeps Egress authoritative:
+      // no browser upload is accepted and no URL is minted until the normal
+      // finalizer has linked and integrity-stamped the object.
+      if (
+        !session.recording_object_key
+        && session.status === 'completed'
+        && session.recording_egress_id
+        && session.recording_egress_status !== 'failed'
+      ) {
+        let finalization: Awaited<ReturnType<typeof finalizeAuthoritativeRecording>>;
+        try {
+          finalization = await finalizeAuthoritativeRecording(sessionId);
+        } catch {
+          return res.status(503).json({
+            error: { type: 'recording_processing', message: 'Recording is still processing. Try again shortly.' },
+          });
+        }
+        if (finalization === 'pending') {
+          return res.status(409).json({
+            error: { type: 'recording_processing', message: 'Recording is still processing. Try again shortly.' },
+          });
+        }
+        if (finalization === 'ready') {
+          const refreshed = await supabase
+            .from('call_sessions')
+            .select('owner_id, status, mode, recording_object_key, recording_sha256, recording_size_bytes, recording_quarantined, recording_revoked_at, recording_deleted_at, recording_egress_id, recording_egress_status')
+            .eq('id', sessionId)
+            .single();
+          if (!refreshed.error && refreshed.data) session = refreshed.data;
+        }
+      }
+
+      if (!session.recording_object_key) {
+        return res
+          .status(404)
+          .json({ error: { type: 'not_found', message: 'Recording not found' } });
       }
 
       // ── REC-04 download-time re-verification (F1 repair) ──────────

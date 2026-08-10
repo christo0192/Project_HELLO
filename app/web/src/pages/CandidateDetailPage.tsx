@@ -15,6 +15,7 @@ import {
   sessionStatusTone,
 } from "../components/talent";
 import { formatDateTime } from "../lib/datetime";
+import { sessionModeLabel } from "../lib/session-mode";
 
 /**
  * HELLO Lane 3 — CandidateDetail as one recruiter review workspace.
@@ -223,7 +224,7 @@ function SessionsSummary({ sessions }: { sessions: Session[] }) {
                   Session {s.id.slice(0, 8)}
                   {s.mode && (
                     <span className="ml-2 text-xs font-normal text-ink-tertiary">
-                      {s.mode === "live" ? "live call" : "simulation"}
+                      {sessionModeLabel(s.mode).toLowerCase()}
                     </span>
                   )}
                 </p>

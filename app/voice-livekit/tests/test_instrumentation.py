@@ -620,6 +620,20 @@ class TestOutcomeCounterPaths(unittest.TestCase):
         self.assertEqual(self._captured_outcome(), "shutdown_forced")
         self.assertEqual(persistence_mock.fail_session.await_args.args, (None, "shutdown_forced"))
 
+    def test_completed_transcript_write_failure_cannot_score_empty_session(self) -> None:
+        """A write that fails before close remains visible to the final drain."""
+        _configure_persistence(
+            save_turn=AsyncMock(side_effect=RuntimeError("synthetic persistence failure")),
+            drain_pending_writes=AsyncMock(side_effect=_drain_all),
+        )
+        _run_entrypoint(close_event=FakeCloseEvent(reason=FakeCloseReason("completed")))
+        self.assertEqual(self._captured_outcome(), "shutdown_forced")
+        persistence_mock.fail_session.assert_awaited_once_with(
+            None, "shutdown_forced", expected_status="in_progress",
+        )
+        persistence_mock.complete_session.assert_not_awaited()
+        persistence_mock.trigger_scoring.assert_not_awaited()
+
     def test_start_exception_maps_to_worker_crash(self) -> None:
         _configure_persistence()
         FakeAgentSession.reset()

@@ -81,7 +81,7 @@ export interface Session {
   role_id: string | null;
   status: string;
   done?: boolean;
-  mode?: string;                 // "simulation" | "live"
+  mode?: string;                 // "browser" (web voice) | "live" (telephony) | "simulation"
   /** @deprecated MIG-03/04/05 — use getRecordingDownloadUrl() for on-demand signed URL. */
   recording_url?: string | null;
   duration_sec?: number | null;

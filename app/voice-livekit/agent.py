@@ -562,8 +562,13 @@ async def _run_session(
 
     def tracked_write(coro) -> asyncio.Task:
         task = asyncio.create_task(coro)
+        # Keep completed tasks until finalization. Removing a completed failed
+        # task here makes drain_pending_writes() see an empty set and can mark a
+        # session completed/scored even though every transcript insert failed.
+        # A session has a bounded number of turns, so retaining these tasks for
+        # the session lifetime is small and lets the terminal drain observe
+        # both pending work and already-completed exceptions.
         _write_tasks.add(task)
-        task.add_done_callback(_write_tasks.discard)
         return task
 
     def tracked_background(coro) -> asyncio.Task:
