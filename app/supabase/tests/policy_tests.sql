@@ -2775,6 +2775,51 @@ select _policy_tests.assert(
   'job_dlq must remain service_role-only'
 );
 
+-- ── 0028: lease-safe queue columns + RPCs (backend infrastructure) ───
+
+select _policy_tests.assert(
+  'job_queue has the 0028 lease columns',
+  (select count(*) from information_schema.columns
+     where table_schema = 'screening_v2'
+       and table_name = 'job_queue'
+       and column_name in ('lease_token', 'lease_owner', 'lease_expires_at', 'lease_deadline_at')
+  ) = 4,
+  'lease_token/lease_owner/lease_expires_at/lease_deadline_at must exist on job_queue'
+);
+
+-- Every queue RPC (0009 dequeue + 0028 lease RPCs) is service-role only:
+-- browser roles cannot execute them.
+select _policy_tests.assert(
+  'queue RPCs are revoked from anon/authenticated/public (service-role only)',
+  not exists (
+    select 1
+      from pg_proc p
+      join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname in (
+         'dequeue_job', 'claim_job', 'heartbeat_job', 'complete_job',
+         'fail_job', 'reclaim_expired_jobs', 'dlq_job', 'replay_dlq_job')
+       and (has_function_privilege('anon', p.oid, 'EXECUTE')
+         or has_function_privilege('authenticated', p.oid, 'EXECUTE')
+         or has_function_privilege('public', p.oid, 'EXECUTE'))
+  ),
+  'anon/authenticated/public must not execute any queue RPC'
+);
+
+select _policy_tests.assert(
+  'queue lease RPCs are executable by service_role',
+  (select count(distinct p.proname)
+     from pg_proc p
+     join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname in (
+        'claim_job', 'heartbeat_job', 'complete_job', 'fail_job',
+        'reclaim_expired_jobs', 'dlq_job', 'replay_dlq_job')
+      and has_function_privilege('service_role', p.oid, 'EXECUTE')
+  ) = 7,
+  'service_role must execute all seven 0028 queue RPCs'
+);
+
 -- ── 0010: transcript_events and outbox (backend infrastructure) ──────
 
 select _policy_tests.assert(

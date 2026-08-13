@@ -22,8 +22,20 @@
  *   pending status for re-processing.
  */
 
-import type { IQueueAdapter, QueueJob, EnqueueOptions, DequeueOptions } from './types.js';
-import { computeBackoffMs } from './types.js';
+import type {
+  IQueueAdapter,
+  ILeasedQueueAdapter,
+  QueueJob,
+  EnqueueOptions,
+  DequeueOptions,
+  ClaimOptions,
+  FailOutcome,
+  ReclaimResult,
+} from './types.js';
+import { computeBackoffMs, clampLeaseSeconds } from './types.js';
+
+/** Stable sanitized error code — adapter does not support the lease API. */
+export const ERR_LEASE_UNSUPPORTED = 'ERR_LEASE_UNSUPPORTED';
 
 export interface QueueOptions {
   /** Base backoff delay in ms (default: 1000). */
@@ -180,5 +192,90 @@ export class Queue {
    */
   async getById(jobId: string): Promise<QueueJob | null> {
     return this.adapter.getById(jobId);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Lease-safe claim API (0028 — Ashby queue hardening, plan Step 2)
+  // ═══════════════════════════════════════════════════════════════════
+  //
+  // Ashby workers use this path exclusively. Each claim grants an
+  // unguessable lease token bound to a bounded visibility window; every
+  // mutation is a compare-and-set on the live lease, so a stale worker
+  // whose lease expired or was reclaimed fails closed.
+
+  /** Narrow the adapter to the leased seam or throw a stable sanitized error. */
+  private leased(): ILeasedQueueAdapter {
+    const a = this.adapter as Partial<ILeasedQueueAdapter>;
+    if (typeof a.claim !== 'function' || typeof a.completeLeased !== 'function') {
+      throw new Error(ERR_LEASE_UNSUPPORTED);
+    }
+    return this.adapter as ILeasedQueueAdapter;
+  }
+
+  /**
+   * Atomically claim the next eligible job, granting a bounded lease.
+   * Returns the claimed job (with `leaseToken` populated) or null.
+   */
+  async claim<T = unknown>(name: string, options: ClaimOptions = {}): Promise<QueueJob<T> | null> {
+    const leaseSeconds = clampLeaseSeconds(options.leaseSeconds);
+    const now = this.clock();
+    const job = await this.leased().claim(name, now, leaseSeconds, options.owner);
+    return (job as QueueJob<T> | null) ?? null;
+  }
+
+  /**
+   * Extend a live matching lease. Bounded by the job's absolute visibility
+   * deadline. Returns true when extended, false when the lease is lost
+   * (expired, reclaimed, or token mismatch) — the worker must stop.
+   */
+  async heartbeat(jobId: string, leaseToken: string, options: { leaseSeconds?: number } = {}): Promise<boolean> {
+    const leaseSeconds = clampLeaseSeconds(options.leaseSeconds);
+    const outcome = await this.leased().heartbeat(jobId, leaseToken, this.clock(), leaseSeconds);
+    return outcome === 'ok';
+  }
+
+  /**
+   * Complete a job under the live matching lease. Returns true on success,
+   * false when the caller no longer owns the lease. Clears lease fields.
+   */
+  async completeClaim(jobId: string, leaseToken: string): Promise<boolean> {
+    const outcome = await this.leased().completeLeased(jobId, leaseToken, this.clock());
+    return outcome === 'ok';
+  }
+
+  /**
+   * Fail a job under the live matching lease. Retries with backoff+jitter
+   * while attempts remain (clearing the lease and scheduling a delayed
+   * re-delivery), else moves it to the DLQ in one server-side transaction.
+   * Returns 'not_owned' for a stale/mismatched lease (fails closed).
+   */
+  async failClaim(jobId: string, leaseToken: string, error: Error | string): Promise<FailOutcome> {
+    const errorMessage = typeof error === 'string' ? error : error.message;
+    const now = this.clock();
+    // Compute a retry instant from the current attempt count. The adapter
+    // decides retry-vs-DLQ from attempts vs maxAttempts under the lease guard;
+    // retryAt is ignored on the DLQ branch.
+    const fresh = await this.adapter.getById(jobId);
+    const attemptIndex = fresh ? Math.max(0, fresh.attempts - 1) : 0;
+    const delayMs = computeBackoffMs(attemptIndex, this.backoffBaseMs, this.backoffMaxMs);
+    const retryAt = new Date(Date.parse(now) + delayMs).toISOString();
+    return this.leased().failLeased(jobId, leaseToken, now, errorMessage, retryAt);
+  }
+
+  /**
+   * Reclaim expired active jobs: requeue while attempts remain, else
+   * dead-letter deterministically (never bypassing maxAttempts).
+   */
+  async reclaimExpired(options: { limit?: number } = {}): Promise<ReclaimResult> {
+    return this.leased().reclaimExpired(this.clock(), options.limit);
+  }
+
+  /**
+   * Transactionally replay a DLQ job as exactly one new pending job.
+   * Returns the new job, or null when the DLQ entry was already consumed
+   * (concurrent replay cannot duplicate).
+   */
+  async replayDlq(dlqId: string): Promise<QueueJob | null> {
+    return this.leased().replayDlq(dlqId, this.clock());
   }
 }

@@ -15,8 +15,17 @@
  *  - replay: moves DLQ job back as new pending job.
  */
 
-import type { IQueueAdapter, QueueJob, QueueStatus, EnqueueInput } from './types.js';
-import { ACTIVE_STATUSES } from './types.js';
+import type {
+  IQueueAdapter,
+  ILeasedQueueAdapter,
+  QueueJob,
+  QueueStatus,
+  EnqueueInput,
+  FailOutcome,
+  LeaseMutationOutcome,
+  ReclaimResult,
+} from './types.js';
+import { ACTIVE_STATUSES, MAX_VISIBILITY_SECONDS } from './types.js';
 
 /** A concrete job row for the in-memory store. */
 interface JobRow {
@@ -34,19 +43,52 @@ interface JobRow {
   failedAt: string | undefined;
   errorMessage: string | undefined;
   createdAt: string;
+  leaseToken: string | undefined;
+  leaseOwner: string | undefined;
+  leaseExpiresAt: string | undefined;
+  leaseDeadlineAt: string | undefined;
 }
 
 let NEXT_ID = 1;
+let NEXT_LEASE = 1;
 
 function nextId(): string {
   return `mem-job-${String(NEXT_ID++).padStart(8, '0')}`;
+}
+
+/**
+ * Deterministic lease-token generator for tests. Production leases use
+ * gen_random_uuid() in Postgres (genuinely unguessable); the in-memory
+ * adapter uses a monotonic opaque counter so unit tests stay deterministic
+ * while still proving compare-and-set against a distinct token value.
+ */
+function nextLeaseToken(): string {
+  return `mem-lease-${String(NEXT_LEASE++).padStart(8, '0')}`;
+}
+
+/** Add `seconds` to an ISO instant, returning a new ISO string. */
+function addSeconds(iso: string, seconds: number): string {
+  return new Date(Date.parse(iso) + seconds * 1000).toISOString();
+}
+
+/** Earlier of two ISO instants. */
+function minIso(a: string, b: string): string {
+  return Date.parse(a) <= Date.parse(b) ? a : b;
+}
+
+/** Clear all lease/visibility fields on a row in place. */
+function clearLease(row: JobRow): void {
+  row.leaseToken = undefined;
+  row.leaseOwner = undefined;
+  row.leaseExpiresAt = undefined;
+  row.leaseDeadlineAt = undefined;
 }
 
 export interface MemoryAdapterDeps {
   clock?: () => string;
 }
 
-export class MemoryAdapter implements IQueueAdapter {
+export class MemoryAdapter implements ILeasedQueueAdapter {
   private jobs: Map<string, JobRow> = new Map();
   private dlq: Map<string, JobRow> = new Map();
   private dedupIndex: Map<string, string> = new Map(); // dedupKey → jobId
@@ -100,6 +142,10 @@ export class MemoryAdapter implements IQueueAdapter {
       failedAt: undefined,
       errorMessage: undefined,
       createdAt: now,
+      leaseToken: undefined,
+      leaseOwner: undefined,
+      leaseExpiresAt: undefined,
+      leaseDeadlineAt: undefined,
     };
 
     this.jobs.set(id, row);
@@ -209,6 +255,10 @@ export class MemoryAdapter implements IQueueAdapter {
       failedAt: undefined,
       errorMessage: undefined,
       createdAt: now,
+      leaseToken: undefined,
+      leaseOwner: undefined,
+      leaseExpiresAt: undefined,
+      leaseDeadlineAt: undefined,
     };
 
     this.jobs.set(newRow.id, newRow);
@@ -222,6 +272,183 @@ export class MemoryAdapter implements IQueueAdapter {
 
   async getDlqJobs(): Promise<QueueJob[]> {
     return [...this.dlq.values()].map(r => this.rowToJob(r));
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Lease-safe claim path (0028) — parity with the Postgres RPCs.
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Atomically claim the next eligible job (pending/delayed, scheduledAt<=now)
+   * ordered by priority DESC, scheduledAt ASC. Grants a fresh unguessable
+   * lease token, an owner, a bounded lease window, and an absolute visibility
+   * deadline. Increments attempts (a claim is a delivery). Returns null when
+   * nothing is eligible. Single-threaded execution models FOR UPDATE SKIP
+   * LOCKED: a second concurrent claim sees the job already active and skips it.
+   */
+  async claim(
+    queueName: string,
+    nowIso: string,
+    leaseSeconds: number,
+    owner?: string,
+  ): Promise<QueueJob | null> {
+    const eligible: JobRow[] = [];
+    for (const row of this.jobs.values()) {
+      if (row.name !== queueName) continue;
+      if (row.status !== 'pending' && row.status !== 'delayed') continue;
+      if (row.scheduledAt > nowIso) continue;
+      eligible.push(row);
+    }
+    if (eligible.length === 0) return null;
+
+    eligible.sort((a, b) => {
+      if (b.priority !== a.priority) return b.priority - a.priority;
+      return a.scheduledAt.localeCompare(b.scheduledAt);
+    });
+
+    const row = eligible[0];
+    row.status = 'active';
+    row.startedAt = nowIso;
+    row.attempts += 1;
+    row.leaseToken = nextLeaseToken();
+    row.leaseOwner = owner;
+    row.leaseExpiresAt = addSeconds(nowIso, leaseSeconds);
+    row.leaseDeadlineAt = addSeconds(nowIso, MAX_VISIBILITY_SECONDS);
+    return this.rowToJob(row);
+  }
+
+  /** True iff `row` is currently held by a live (unexpired) matching lease. */
+  private holdsLiveLease(row: JobRow, leaseToken: string, nowIso: string): boolean {
+    return (
+      row.status === 'active' &&
+      row.leaseToken !== undefined &&
+      row.leaseToken === leaseToken &&
+      row.leaseExpiresAt !== undefined &&
+      row.leaseExpiresAt > nowIso
+    );
+  }
+
+  async heartbeat(
+    jobId: string,
+    leaseToken: string,
+    nowIso: string,
+    leaseSeconds: number,
+  ): Promise<LeaseMutationOutcome> {
+    const row = this.jobs.get(jobId);
+    if (!row || !this.holdsLiveLease(row, leaseToken, nowIso)) return 'not_owned';
+    // Extend, but never beyond the absolute visibility deadline.
+    const requested = addSeconds(nowIso, leaseSeconds);
+    row.leaseExpiresAt = row.leaseDeadlineAt
+      ? minIso(requested, row.leaseDeadlineAt)
+      : requested;
+    return 'ok';
+  }
+
+  async completeLeased(
+    jobId: string,
+    leaseToken: string,
+    nowIso: string,
+  ): Promise<LeaseMutationOutcome> {
+    const row = this.jobs.get(jobId);
+    if (!row || !this.holdsLiveLease(row, leaseToken, nowIso)) return 'not_owned';
+    row.status = 'completed';
+    row.completedAt = nowIso;
+    clearLease(row);
+    if (row.dedupKey) this.dedupIndex.delete(row.dedupKey);
+    return 'ok';
+  }
+
+  async failLeased(
+    jobId: string,
+    leaseToken: string,
+    nowIso: string,
+    errorMessage: string,
+    retryAtIso: string,
+  ): Promise<FailOutcome> {
+    const row = this.jobs.get(jobId);
+    if (!row || !this.holdsLiveLease(row, leaseToken, nowIso)) return 'not_owned';
+
+    if (row.attempts < row.maxAttempts) {
+      // Retry: clear lease ownership and schedule a future delivery.
+      row.status = 'delayed';
+      row.scheduledAt = retryAtIso;
+      row.errorMessage = errorMessage;
+      clearLease(row);
+      return 'retry_scheduled';
+    }
+    // Exhausted: move to the DLQ in one step (no insert-then-delete gap).
+    this.dlqMove(row, nowIso, errorMessage);
+    return 'dead_lettered';
+  }
+
+  async reclaimExpired(nowIso: string, limit: number = 100): Promise<ReclaimResult> {
+    const result: ReclaimResult = { requeued: [], deadLettered: [] };
+    const expired: JobRow[] = [];
+    for (const row of this.jobs.values()) {
+      if (row.status !== 'active') continue;
+      if (row.leaseExpiresAt === undefined || row.leaseExpiresAt > nowIso) continue;
+      expired.push(row);
+    }
+    // Deterministic order: oldest expiry first.
+    expired.sort((a, b) => (a.leaseExpiresAt as string).localeCompare(b.leaseExpiresAt as string));
+
+    for (const row of expired.slice(0, limit)) {
+      if (row.attempts < row.maxAttempts) {
+        // Return to the pool; a fresh claim will grant a new lease + attempt.
+        row.status = 'pending';
+        row.scheduledAt = nowIso;
+        clearLease(row);
+        result.requeued.push(row.id);
+      } else {
+        // Attempts exhausted — dead-letter deterministically (never bypass max).
+        const id = row.id;
+        this.dlqMove(row, nowIso, 'lease_expired_attempts_exhausted');
+        result.deadLettered.push(id);
+      }
+    }
+    return result;
+  }
+
+  async replayDlq(dlqId: string, nowIso: string): Promise<QueueJob | null> {
+    const dlqRow = this.dlq.get(dlqId);
+    // Concurrent replay: the first caller removes the row; the second sees
+    // nothing and returns null, so exactly one pending replacement is created.
+    if (!dlqRow) return null;
+    this.dlq.delete(dlqId);
+
+    const newRow: JobRow = {
+      id: nextId(),
+      name: dlqRow.name,
+      payload: dlqRow.payload,
+      status: 'pending',
+      dedupKey: undefined, // new dedup cycle
+      attempts: 0,
+      maxAttempts: dlqRow.maxAttempts,
+      priority: dlqRow.priority,
+      scheduledAt: nowIso,
+      startedAt: undefined,
+      completedAt: undefined,
+      failedAt: undefined,
+      errorMessage: undefined,
+      createdAt: nowIso,
+      leaseToken: undefined,
+      leaseOwner: undefined,
+      leaseExpiresAt: undefined,
+      leaseDeadlineAt: undefined,
+    };
+    this.jobs.set(newRow.id, newRow);
+    return this.rowToJob(newRow);
+  }
+
+  /** Shared DLQ move: remove from the live store, copy to the DLQ store. */
+  private dlqMove(row: JobRow, nowIso: string, errorMessage: string): void {
+    row.status = 'failed';
+    row.failedAt = nowIso;
+    row.errorMessage = errorMessage;
+    clearLease(row);
+    this.jobs.delete(row.id);
+    if (row.dedupKey) this.dedupIndex.delete(row.dedupKey);
+    this.dlq.set(row.id, { ...row });
   }
 
   private rowToJob(row: JobRow): QueueJob {
@@ -240,6 +467,10 @@ export class MemoryAdapter implements IQueueAdapter {
       failedAt: row.failedAt,
       errorMessage: row.errorMessage,
       createdAt: row.createdAt,
+      leaseToken: row.leaseToken,
+      leaseOwner: row.leaseOwner,
+      leaseExpiresAt: row.leaseExpiresAt,
+      leaseDeadlineAt: row.leaseDeadlineAt,
     };
   }
 }

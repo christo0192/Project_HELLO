@@ -46,6 +46,19 @@ matrix, failure-injection prototype, idempotency test, retry/DLQ/replay
 demonstration, backlog metrics, regional and cost evidence, and recovery
 runbook.
 
+Build-foundation progress (Ashby Phase 1, plan Step 2): migration
+`0028_queue_leases.sql` adds a lease-safe claim model to the L1 queue —
+`FOR UPDATE SKIP LOCKED` atomic claim, unguessable lease tokens with a bounded
+visibility window and absolute deadline, heartbeat extension, expired-lease
+reclaim that never bypasses `max_attempts`, compare-and-set completion/failure,
+single-transaction DLQ movement, and concurrent-safe replay. Queue and DLQ
+remain service-role-only. Deterministic unit and negative-control tests cover
+the worker-race, stale-worker-lockout, atomic-DLQ, concurrent-replay,
+max-attempts-exhaustion, and fail-closed-token cases
+(`app/api/src/__tests__/queue-leases.test.ts`); operations are described in
+`docs/runbooks/queue-leases.md`. This is build-foundation only; production
+go-live acceptance remains the separate gate described above.
+
 ## Supersession
 
 None. Production acceptance is a separate gate.

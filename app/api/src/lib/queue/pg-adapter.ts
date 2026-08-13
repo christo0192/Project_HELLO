@@ -22,13 +22,27 @@
  * This avoids row-level lock contention without a separate SELECT transaction.
  */
 
-import type { IQueueAdapter, QueueJob, EnqueueInput } from './types.js';
+import type {
+  IQueueAdapter,
+  ILeasedQueueAdapter,
+  QueueJob,
+  EnqueueInput,
+  FailOutcome,
+  LeaseMutationOutcome,
+  ReclaimResult,
+} from './types.js';
+import { clampLeaseSeconds } from './types.js';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 export const ERR_ENQUEUE_FAILED = 'ERR_ENQUEUE_FAILED';
 export const ERR_JOB_NOT_FOUND = 'ERR_JOB_NOT_FOUND';
 export const ERR_DLQ_FAILED = 'ERR_DLQ_FAILED';
 export const ERR_REPLAY_FAILED = 'ERR_REPLAY_FAILED';
+export const ERR_CLAIM_FAILED = 'ERR_CLAIM_FAILED';
+export const ERR_HEARTBEAT_FAILED = 'ERR_HEARTBEAT_FAILED';
+export const ERR_COMPLETE_FAILED = 'ERR_COMPLETE_FAILED';
+export const ERR_FAIL_FAILED = 'ERR_FAIL_FAILED';
+export const ERR_RECLAIM_FAILED = 'ERR_RECLAIM_FAILED';
 
 /** Minimum viable row shape from Supabase JSON responses. */
 interface JobRow {
@@ -46,6 +60,10 @@ interface JobRow {
   failed_at: string | null;
   error_message: string | null;
   created_at: string;
+  lease_token: string | null;
+  lease_owner: string | null;
+  lease_expires_at: string | null;
+  lease_deadline_at: string | null;
 }
 
 interface DlqRow {
@@ -77,7 +95,18 @@ function rowToJob(row: JobRow): QueueJob {
     failedAt: row.failed_at ?? undefined,
     errorMessage: row.error_message ?? undefined,
     createdAt: row.created_at,
+    leaseToken: row.lease_token ?? undefined,
+    leaseOwner: row.lease_owner ?? undefined,
+    leaseExpiresAt: row.lease_expires_at ?? undefined,
+    leaseDeadlineAt: row.lease_deadline_at ?? undefined,
   };
+}
+
+/** PostgREST returns set-returning RPCs as an array; take the first row. */
+function firstRow<R>(data: unknown): R | null {
+  if (Array.isArray(data)) return (data[0] as R) ?? null;
+  if (data && typeof data === 'object') return data as R;
+  return null;
 }
 
 function dlqRowToJob(row: DlqRow): QueueJob {
@@ -97,7 +126,7 @@ function dlqRowToJob(row: DlqRow): QueueJob {
   };
 }
 
-export class PgAdapter implements IQueueAdapter {
+export class PgAdapter implements ILeasedQueueAdapter {
   private supabase: SupabaseClient;
   private schema: string;
 
@@ -210,113 +239,132 @@ export class PgAdapter implements IQueueAdapter {
   }
 
   async moveToDlq(jobId: string, errorMessage: string): Promise<QueueJob> {
+    // Single server-side transaction (lock queue row, insert DLQ, delete queue
+    // row) — no insert-then-delete client gap that could leave both/neither
+    // record on a crash.
     const now = new Date().toISOString();
-
-    // Fetch the job first.
-    const { data: job, error: fetchError } = await this.supabase
-      .from('job_queue')
-      .select('*')
-      .eq('id', jobId)
-      .single();
-
-    if (fetchError || !job) {
-      throw Object.assign(new Error(ERR_JOB_NOT_FOUND), { cause: fetchError });
-    }
-
-    const row = job as unknown as JobRow;
-
-    // Insert into DLQ.
-    const dlqPayload = {
-      id: row.id,
-      name: row.name,
-      payload: row.payload,
-      dedup_key: row.dedup_key,
-      attempts: row.attempts,
-      max_attempts: row.max_attempts,
-      error_message: errorMessage,
-      failed_at: now,
-      moved_at: now,
-      replay_count: 0,
-    };
-
-    const { error: dlqError } = await this.supabase
-      .from('job_dlq')
-      .insert(dlqPayload);
-
-    if (dlqError) {
-      throw Object.assign(new Error(ERR_DLQ_FAILED), { cause: dlqError });
-    }
-
-    // Delete from main queue.
-    const { error: delError } = await this.supabase
-      .from('job_queue')
-      .delete()
-      .eq('id', jobId);
-
-    if (delError) throw delError;
-
-    return {
-      id: row.id,
-      name: row.name,
-      payload: row.payload,
-      status: 'failed',
-      dedupKey: row.dedup_key ?? undefined,
-      attempts: row.attempts,
-      maxAttempts: row.max_attempts,
-      priority: row.priority,
-      scheduledAt: row.scheduled_at,
-      failedAt: now,
-      errorMessage: errorMessage,
-      createdAt: now,
-    };
+    const { data, error } = await this.supabase.rpc('dlq_job', {
+      p_job_id: jobId,
+      p_now: now,
+      p_error: errorMessage,
+    });
+    if (error) throw Object.assign(new Error(ERR_DLQ_FAILED), { cause: error });
+    const row = firstRow<DlqRow>(data);
+    if (!row) throw new Error(ERR_JOB_NOT_FOUND);
+    return dlqRowToJob(row);
   }
 
   async replay(jobId: string): Promise<QueueJob> {
+    // Transactional replay: lock the DLQ row, insert one pending job, delete
+    // the DLQ row — all in one RPC so concurrent replay cannot duplicate.
     const now = new Date().toISOString();
+    const { data, error } = await this.supabase.rpc('replay_dlq_job', {
+      p_dlq_id: jobId,
+      p_now: now,
+    });
+    if (error) throw Object.assign(new Error(ERR_REPLAY_FAILED), { cause: error });
+    const row = firstRow<JobRow>(data);
+    if (!row) throw new Error(ERR_JOB_NOT_FOUND);
+    return rowToJob(row);
+  }
 
-    // Fetch from DLQ.
-    const { data: dlqRow, error: fetchError } = await this.supabase
-      .from('job_dlq')
-      .select('*')
-      .eq('id', jobId)
-      .single();
+  // ═══════════════════════════════════════════════════════════════════
+  // Lease-safe claim path (0028) — every mutation is a server-side
+  // compare-and-set on the live lease token via a SECURITY-guarded RPC.
+  // Errors are sanitized stable codes; payloads and lease tokens are never
+  // logged.
+  // ═══════════════════════════════════════════════════════════════════
 
-    if (fetchError || !dlqRow) {
-      throw Object.assign(new Error(ERR_JOB_NOT_FOUND), { cause: fetchError });
+  async claim(
+    queueName: string,
+    nowIso: string,
+    leaseSeconds: number,
+    owner?: string,
+  ): Promise<QueueJob | null> {
+    const { data, error } = await this.supabase.rpc('claim_job', {
+      p_queue_name: queueName,
+      p_now: nowIso,
+      p_lease_seconds: clampLeaseSeconds(leaseSeconds),
+      p_owner: owner ?? null,
+    });
+    if (error) throw Object.assign(new Error(ERR_CLAIM_FAILED), { cause: error });
+    const row = firstRow<JobRow>(data);
+    return row ? rowToJob(row) : null;
+  }
+
+  async heartbeat(
+    jobId: string,
+    leaseToken: string,
+    nowIso: string,
+    leaseSeconds: number,
+  ): Promise<LeaseMutationOutcome> {
+    const { data, error } = await this.supabase.rpc('heartbeat_job', {
+      p_job_id: jobId,
+      p_lease_token: leaseToken,
+      p_now: nowIso,
+      p_lease_seconds: clampLeaseSeconds(leaseSeconds),
+    });
+    if (error) throw Object.assign(new Error(ERR_HEARTBEAT_FAILED), { cause: error });
+    return firstRow<JobRow>(data) ? 'ok' : 'not_owned';
+  }
+
+  async completeLeased(
+    jobId: string,
+    leaseToken: string,
+    nowIso: string,
+  ): Promise<LeaseMutationOutcome> {
+    const { data, error } = await this.supabase.rpc('complete_job', {
+      p_job_id: jobId,
+      p_lease_token: leaseToken,
+      p_now: nowIso,
+    });
+    if (error) throw Object.assign(new Error(ERR_COMPLETE_FAILED), { cause: error });
+    return data === true ? 'ok' : 'not_owned';
+  }
+
+  async failLeased(
+    jobId: string,
+    leaseToken: string,
+    nowIso: string,
+    errorMessage: string,
+    retryAtIso: string,
+  ): Promise<FailOutcome> {
+    const { data, error } = await this.supabase.rpc('fail_job', {
+      p_job_id: jobId,
+      p_lease_token: leaseToken,
+      p_now: nowIso,
+      p_error: errorMessage,
+      p_retry_at: retryAtIso,
+    });
+    if (error) throw Object.assign(new Error(ERR_FAIL_FAILED), { cause: error });
+    const outcome = String(data);
+    if (outcome === 'retry_scheduled' || outcome === 'dead_lettered') return outcome;
+    return 'not_owned';
+  }
+
+  async reclaimExpired(nowIso: string, limit: number = 100): Promise<ReclaimResult> {
+    const { data, error } = await this.supabase.rpc('reclaim_expired_jobs', {
+      p_now: nowIso,
+      p_limit: limit,
+    });
+    if (error) throw Object.assign(new Error(ERR_RECLAIM_FAILED), { cause: error });
+    const rows = (Array.isArray(data) ? data : []) as Array<{ job_id: string; outcome: string }>;
+    const result: ReclaimResult = { requeued: [], deadLettered: [] };
+    for (const r of rows) {
+      if (r.outcome === 'dead_lettered') result.deadLettered.push(r.job_id);
+      else if (r.outcome === 'requeued') result.requeued.push(r.job_id);
     }
+    return result;
+  }
 
-    const row = dlqRow as unknown as DlqRow;
-
-    // Re-insert into job_queue as a new pending job.
-    const newJob = {
-      name: row.name,
-      payload: row.payload,
-      dedup_key: null, // dedup counter reset on replay
-      attempts: 0,
-      max_attempts: row.max_attempts,
-      priority: 0,
-      scheduled_at: now,
-      status: 'pending',
-      created_at: now,
-    };
-
-    const { data: inserted, error: insertError } = await this.supabase
-      .from('job_queue')
-      .insert(newJob)
-      .select()
-      .single();
-
-    if (insertError || !inserted) {
-      throw Object.assign(new Error(ERR_REPLAY_FAILED), { cause: insertError });
-    }
-
-    // Delete from DLQ.
-    await this.supabase
-      .from('job_dlq')
-      .delete()
-      .eq('id', jobId);
-
-    return rowToJob(inserted as unknown as JobRow);
+  async replayDlq(dlqId: string, nowIso: string): Promise<QueueJob | null> {
+    const { data, error } = await this.supabase.rpc('replay_dlq_job', {
+      p_dlq_id: dlqId,
+      p_now: nowIso,
+    });
+    if (error) throw Object.assign(new Error(ERR_REPLAY_FAILED), { cause: error });
+    const row = firstRow<JobRow>(data);
+    return row ? rowToJob(row) : null;
   }
 
   async getById(jobId: string): Promise<QueueJob | null> {
