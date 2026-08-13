@@ -4,7 +4,7 @@
  * presence/absence (truthful), on-demand signed-URL recording lifecycle,
  * and axe compliance.
  */
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, act } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { SessionDetailPage } from './SessionDetailPage';
@@ -137,33 +137,65 @@ describe('SessionDetailPage', () => {
 
   it('gates recording access behind an explicit click', async () => {
     getSession.mockResolvedValue(completedSessionDetail);
-    getRecordingDownloadUrl.mockResolvedValue({ url: 'https://x.invalid/rec' });
+    // Control the mocked request so the test drives (and awaits) the exact
+    // request→render transition deterministically. The prior version raced two
+    // wall-clock waitFor(<audio>) polls; combined with the mount-effect flush
+    // below, this removes the flake seen on the post-merge coverage run.
+    let resolveRec!: (v: { url: string }) => void;
+    getRecordingDownloadUrl.mockImplementationOnce(
+      () => new Promise<{ url: string }>((res) => { resolveRec = res; }),
+    );
     renderPage();
     await screen.findByText('Recording');
+    // Flush RecordingCard's mount effects (its on-mount in-flight-invalidation
+    // effect) BEFORE interacting, so a synthetic click cannot race that effect
+    // and get its request generation clobbered. A real user only ever clicks
+    // after mount has settled; the test must mirror that.
+    await act(async () => {});
+
+    // Fetch is issued ONLY on the explicit click — never before.
     expect(getRecordingDownloadUrl).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('button', { name: /load recording/i }));
-    await waitFor(() =>
-      expect(getRecordingDownloadUrl).toHaveBeenCalledWith(
-        '550e8400-e29b-41d4-a716-446655440000',
-      ),
+    expect(getRecordingDownloadUrl).toHaveBeenCalledWith(
+      '550e8400-e29b-41d4-a716-446655440000',
     );
-    await waitFor(() =>
-      expect(document.querySelector('audio')).not.toBeNull(),
-    );
+
+    // Settle the request; the player controls (incl. "Refresh link") render in
+    // the same commit as <audio>. Await that control via a mutation-observing
+    // query so the assertion never races React's flush scheduling.
+    resolveRec({ url: 'https://x.invalid/rec' });
+    await screen.findByRole('button', { name: /refresh link/i });
+
     const audio = document.querySelector('audio') as HTMLAudioElement;
+    expect(audio).not.toBeNull();
     expect(audio.src).toContain('x.invalid/rec');
   });
 
   it('refreshes an expired link on demand and reports errors inline', async () => {
     getSession.mockResolvedValue(completedSessionDetail);
+    // Controlled deferreds: the first load resolves a fresh URL; the on-demand
+    // refresh rejects (expired link). Each transition is settled explicitly and
+    // awaited via a semantic query, so the test never races async latency.
+    let resolveFirst!: (v: { url: string }) => void;
+    let rejectSecond!: (e: { message: string }) => void;
     getRecordingDownloadUrl
-      .mockResolvedValueOnce({ url: 'https://x.invalid/rec1' })
-      .mockRejectedValueOnce({ message: 'link expired' });
+      .mockImplementationOnce(() => new Promise<{ url: string }>((res) => { resolveFirst = res; }))
+      .mockImplementationOnce(() => new Promise<{ url: string }>((_res, rej) => { rejectSecond = rej; }));
     renderPage();
     await screen.findByText('Recording');
+    // Flush mount effects before interacting (see the gating test above).
+    await act(async () => {});
+
     fireEvent.click(screen.getByRole('button', { name: /load recording/i }));
-    await waitFor(() => expect(document.querySelector('audio')).not.toBeNull());
+    resolveFirst({ url: 'https://x.invalid/rec1' });
+    // The "Refresh link" control renders alongside <audio> once the URL loads.
+    await screen.findByRole('button', { name: /refresh link/i });
+    expect(document.querySelector('audio')).not.toBeNull();
+
+    // Explicit user-gated refresh mints a new URL; the expired response surfaces
+    // inline without fabricating a URL.
     fireEvent.click(screen.getByRole('button', { name: /refresh link/i }));
+    rejectSecond({ message: 'link expired' });
     expect(await screen.findByText('link expired')).toBeInTheDocument();
   });
 
