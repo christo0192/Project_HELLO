@@ -4183,6 +4183,184 @@ end;
 $$;
 
 -- ═══════════════════════════════════════════════════════════════════════
+-- 0029: Ashby integration schema — RLS/privilege + functional negative
+-- controls (service-role-only backend, state machine, dependency ordering,
+-- terminal block, and mapping-administration RPC gates).
+-- ═══════════════════════════════════════════════════════════════════════
+
+select _policy_tests.assert(
+  'ashby integration tables have RLS enabled',
+  (select count(*) from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+    where n.nspname = 'screening_v2'
+      and c.relname in ('ashby_job_mappings','ashby_application_links',
+                        'ashby_event_receipts','ashby_resume_ingestions','ashby_operations')
+      and c.relrowsecurity) = 5,
+  'all five ashby_* integration tables must have RLS enabled'
+);
+
+select _policy_tests.assert(
+  'ashby integration tables have no anon/authenticated/public policy',
+  not exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2'
+       and tablename in ('ashby_job_mappings','ashby_application_links',
+                         'ashby_event_receipts','ashby_resume_ingestions','ashby_operations')
+       and roles && array['anon'::name, 'authenticated'::name, 'public'::name]
+  ),
+  'ashby_* integration tables must remain service_role-only'
+);
+
+select _policy_tests.assert(
+  'ashby integration tables: browser roles have no read/write privilege',
+  not exists (
+    select 1 from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname in ('ashby_job_mappings','ashby_application_links',
+                         'ashby_event_receipts','ashby_resume_ingestions','ashby_operations')
+       and (has_table_privilege('anon', c.oid, 'SELECT,INSERT,UPDATE,DELETE')
+         or has_table_privilege('authenticated', c.oid, 'INSERT,UPDATE,DELETE'))
+  ),
+  'anon/authenticated must not read/write ashby_* backend tables'
+);
+
+select _policy_tests.assert(
+  'ashby integration tables: service_role has full access',
+  (select count(*) from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+    where n.nspname = 'screening_v2'
+      and c.relname in ('ashby_job_mappings','ashby_application_links',
+                        'ashby_event_receipts','ashby_resume_ingestions','ashby_operations')
+      and has_table_privilege('service_role', c.oid, 'SELECT,INSERT,UPDATE,DELETE')) = 5,
+  'service_role must own all ashby_* integration tables'
+);
+
+select _policy_tests.assert(
+  'ashby mapping RPCs are service-role only',
+  not exists (
+    select 1 from pg_proc p
+      join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname in ('upsert_ashby_job_mapping','mark_ashby_mapping_drift')
+       and (has_function_privilege('anon', p.oid, 'EXECUTE')
+         or has_function_privilege('authenticated', p.oid, 'EXECUTE')
+         or has_function_privilege('public', p.oid, 'EXECUTE'))
+  )
+  and (
+    select count(distinct p.proname) from pg_proc p
+      join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname in ('upsert_ashby_job_mapping','mark_ashby_mapping_drift')
+       and has_function_privilege('service_role', p.oid, 'EXECUTE')
+  ) = 2,
+  'ashby mapping-administration RPCs must be service-role only'
+);
+
+-- Functional negative controls against the live schema.
+do $$
+declare
+  v_role   uuid;
+  v_link   uuid;
+  v_ing    uuid;
+  v_score  uuid;
+  v_stage  uuid;
+  v_mapping uuid;
+  v_res    jsonb;
+begin
+  select id into v_role from screening_v2.roles limit 1;
+  if v_role is null then
+    perform _policy_tests.assert('ashby functional: seed role present', false, 'no seed role available');
+    return;
+  end if;
+
+  -- A. Duplicate application identity converges to one row.
+  insert into screening_v2.ashby_application_links (external_application_id)
+    values ('pol-app-dup') returning id into v_link;
+  begin
+    insert into screening_v2.ashby_application_links (external_application_id)
+      values ('pol-app-dup');
+    perform _policy_tests.assert('ashby: duplicate application rejected (one identity)', false, 'expected unique_violation');
+  exception when unique_violation then
+    perform _policy_tests.assert('ashby: duplicate application rejected (one identity)', true, 'unique_violation as expected');
+  end;
+
+  -- B. Incomplete mapping cannot be enabled (CHECK).
+  begin
+    insert into screening_v2.ashby_job_mappings (external_job_id, role_id, owner_id, status)
+      values ('pol-job-incomplete', v_role, gen_random_uuid(), 'enabled');
+    perform _policy_tests.assert('ashby: incomplete mapping cannot enable', false, 'expected check_violation');
+  exception when check_violation then
+    perform _policy_tests.assert('ashby: incomplete mapping cannot enable', true, 'check_violation as expected');
+  end;
+
+  -- C. Illegal ingestion state transition is rejected; legal one succeeds.
+  insert into screening_v2.ashby_resume_ingestions (application_link_id)
+    values (v_link) returning id into v_ing;
+  begin
+    update screening_v2.ashby_resume_ingestions set state = 'ready' where id = v_ing;
+    perform _policy_tests.assert('ashby: invalid ingestion transition rejected', false, 'expected trigger raise');
+  exception when others then
+    perform _policy_tests.assert('ashby: invalid ingestion transition rejected', true, sqlerrm);
+  end;
+  update screening_v2.ashby_resume_ingestions set state = 'fetching' where id = v_ing;
+
+  -- D. Scorecard-before-stage: stage_move cannot run before its dependency succeeds.
+  insert into screening_v2.ashby_operations (application_link_id, operation_type, operation_key)
+    values (v_link, 'scorecard_write', 'pol-op-score') returning id into v_score;
+  insert into screening_v2.ashby_operations (application_link_id, operation_type, operation_key, depends_on_operation_id)
+    values (v_link, 'stage_move', 'pol-op-stage', v_score) returning id into v_stage;
+  begin
+    update screening_v2.ashby_operations set state = 'running' where id = v_stage;
+    perform _policy_tests.assert('ashby: stage cannot run before scorecard succeeds', false, 'expected trigger raise');
+  exception when others then
+    perform _policy_tests.assert('ashby: stage cannot run before scorecard succeeds', true, sqlerrm);
+  end;
+  update screening_v2.ashby_operations set state = 'running'   where id = v_score;
+  update screening_v2.ashby_operations set state = 'succeeded' where id = v_score;
+  update screening_v2.ashby_operations set state = 'running'   where id = v_stage;
+  perform _policy_tests.assert('ashby: stage runs after scorecard success',
+    (select state from screening_v2.ashby_operations where id = v_stage) = 'running',
+    'stage_move should run once scorecard_write succeeded');
+
+  -- E. Terminal application link blocks new operations.
+  update screening_v2.ashby_application_links set terminal_state = 'withdrawn' where id = v_link;
+  begin
+    insert into screening_v2.ashby_operations (application_link_id, operation_type, operation_key)
+      values (v_link, 'invite_delivery', 'pol-op-terminal');
+    perform _policy_tests.assert('ashby: terminal link blocks new operation', false, 'expected trigger raise');
+  exception when others then
+    perform _policy_tests.assert('ashby: terminal link blocks new operation', true, sqlerrm);
+  end;
+
+  -- F. Mapping-administration RPC gates (incomplete/complete/drift).
+  v_res := screening_v2.upsert_ashby_job_mapping(
+    null::uuid, 'pol-job-rpc', v_role, null::text, null::text, null::text, null::text, null::text,
+    gen_random_uuid(), 'manual', 24, 'enabled', null::text, gen_random_uuid());
+  perform _policy_tests.assert('ashby RPC: enable incomplete rejected',
+    v_res->>'status' = 'incomplete_cannot_enable', 'got ' || coalesce(v_res->>'status','null'));
+
+  v_res := screening_v2.upsert_ashby_job_mapping(
+    null::uuid, 'pol-job-rpc', v_role, 'ai_x', 'ta_x', null::text, null::text, null::text,
+    gen_random_uuid(), 'both', 24, 'enabled', null::text, gen_random_uuid());
+  perform _policy_tests.assert('ashby RPC: enable complete ok',
+    v_res->>'status' = 'ok', 'got ' || coalesce(v_res->>'status','null'));
+  v_mapping := (v_res->>'id')::uuid;
+
+  perform screening_v2.mark_ashby_mapping_drift(v_mapping, 'stage_id_invalid', gen_random_uuid());
+  v_res := screening_v2.upsert_ashby_job_mapping(
+    v_mapping, 'pol-job-rpc', v_role, 'ai_x', 'ta_x', null::text, null::text, null::text,
+    gen_random_uuid(), 'both', 24, 'enabled', null::text, gen_random_uuid());
+  perform _policy_tests.assert('ashby RPC: drifted mapping cannot enable',
+    v_res->>'status' = 'drifted_cannot_enable', 'got ' || coalesce(v_res->>'status','null'));
+
+  -- Cleanup: deleting the link cascades its operations/ingestions.
+  delete from screening_v2.ashby_application_links where external_application_id = 'pol-app-dup';
+  delete from screening_v2.ashby_job_mappings where external_job_id in ('pol-job-incomplete','pol-job-rpc');
+end;
+$$;
+
+-- ═══════════════════════════════════════════════════════════════════════
 -- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)
 -- ═══════════════════════════════════════════════════════════════════════
 
