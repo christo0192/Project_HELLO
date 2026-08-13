@@ -4,6 +4,22 @@ Status: **complete integrated implementation — disabled by default; no real
 tenant/provider/email activity.** Stacked on PR B (`feat/ashby-webhook-reconciliation`).
 Owner squash-merges; no agent merge. Merge order **A → B → C**.
 
+## Restack (post PR B review-repair)
+
+PR B was repaired for the integrated-review findings F1/F2/F3 and rebased onto
+`main` (PR A merged as `c2bfb9c`). PR C was rebased onto the repaired B head
+`0679170` (GitHub base stays `feat/ashby-webhook-reconciliation` while B is
+open); the PR C diff contains only C changes. The F2 repair **folded the
+standalone `SignalEnqueuer` port into the transactional-outbox `ReceiptStore`**
+(`record({enqueue})` now inserts receipt + signal job in one transaction and
+reports `workPending`; reconciliation enqueues import work per observed
+application). PR C consumes none of the removed symbols, so the rebase is a
+clean interface no-op for C. A new regression — `ashby-full-chain-recovery.test.ts`
+— composes the repaired webhook/reconciliation outbox with C's `runImport` to
+prove that a dropped-then-recovered signal AND an enqueue-failed/redelivered
+(and a lost-job re-driven) signal each reach **exactly one** import / workflow
+link / seeded ingestion / invite set — not merely a receipt.
+
 This PR (#58) implements Ashby Wave 2 work items 3–7 as an integrated screening
 workflow: application import + cancellation, ephemeral SSRF-hardened resume
 ingestion, invitation lifecycle, Mission Control (API + web), and the
