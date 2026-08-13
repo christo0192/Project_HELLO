@@ -4361,6 +4361,108 @@ end;
 $$;
 
 -- ═══════════════════════════════════════════════════════════════════════
+-- 0030: Ashby webhook + reconciliation — RLS/privilege + functional controls
+-- (dedup-safe receipt ingress, checkpoint advance, forced full resync).
+-- ═══════════════════════════════════════════════════════════════════════
+
+select _policy_tests.assert(
+  'ashby_sync_checkpoints has RLS enabled',
+  (select count(*) from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+    where n.nspname = 'screening_v2'
+      and c.relname = 'ashby_sync_checkpoints'
+      and c.relrowsecurity) = 1,
+  'ashby_sync_checkpoints must have RLS enabled'
+);
+
+select _policy_tests.assert(
+  'ashby_sync_checkpoints has no anon/authenticated/public policy or privilege',
+  not exists (
+    select 1 from pg_policies
+     where schemaname = 'screening_v2' and tablename = 'ashby_sync_checkpoints'
+       and roles && array['anon'::name, 'authenticated'::name, 'public'::name]
+  )
+  and not exists (
+    select 1 from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2' and c.relname = 'ashby_sync_checkpoints'
+       and (has_table_privilege('anon', c.oid, 'SELECT,INSERT,UPDATE,DELETE')
+         or has_table_privilege('authenticated', c.oid, 'SELECT,INSERT,UPDATE,DELETE'))
+  ),
+  'ashby_sync_checkpoints must remain service_role-only'
+);
+
+select _policy_tests.assert(
+  'ashby webhook/reconciliation RPCs are service-role only',
+  not exists (
+    select 1 from pg_proc p
+      join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname in ('record_ashby_event_receipt','advance_ashby_sync_checkpoint','mark_ashby_sync_full_resync')
+       and (has_function_privilege('anon', p.oid, 'EXECUTE')
+         or has_function_privilege('authenticated', p.oid, 'EXECUTE')
+         or has_function_privilege('public', p.oid, 'EXECUTE'))
+  )
+  and (
+    select count(distinct p.proname) from pg_proc p
+      join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname in ('record_ashby_event_receipt','advance_ashby_sync_checkpoint','mark_ashby_sync_full_resync')
+       and has_function_privilege('service_role', p.oid, 'EXECUTE')
+  ) = 3,
+  'record/advance/resync RPCs must be service-role only'
+);
+
+-- Functional negative controls against the live 0030 primitives.
+do $$
+declare
+  v_res  jsonb;
+  v_tok  text;
+  v_status text;
+begin
+  -- A. Dedup-safe receipt ingress: first inserts, second is a duplicate.
+  v_res := screening_v2.record_ashby_event_receipt('pol-wh-1', 'candidateStageChange', null);
+  perform _policy_tests.assert('ashby receipt: first delivery inserted',
+    v_res->>'status' = 'inserted', 'got ' || coalesce(v_res->>'status','null'));
+  v_res := screening_v2.record_ashby_event_receipt('pol-wh-1', 'candidateStageChange', null);
+  perform _policy_tests.assert('ashby receipt: duplicate delivery deduped',
+    v_res->>'status' = 'duplicate', 'got ' || coalesce(v_res->>'status','null'));
+  perform _policy_tests.assert('ashby receipt: exactly one row for the key',
+    (select count(*) from screening_v2.ashby_event_receipts
+      where webhook_action_id = 'pol-wh-1' and action = 'candidateStageChange') = 1,
+    'expected a single deduped receipt row');
+
+  -- B. Oversized metadata is rejected (defensive bound).
+  v_res := screening_v2.record_ashby_event_receipt('pol-wh-2', 'candidateStageChange',
+    jsonb_build_object('blob', repeat('x', 4000)));
+  perform _policy_tests.assert('ashby receipt: oversized metadata rejected',
+    v_res->>'status' = 'metadata_too_large', 'got ' || coalesce(v_res->>'status','null'));
+
+  -- C. Checkpoint advance persists an opaque token + stamps the expiry anchor.
+  v_res := screening_v2.advance_ashby_sync_checkpoint('pol-stream', 'opaque-token-1', 3, 12, true);
+  perform _policy_tests.assert('ashby checkpoint: advance ok',
+    v_res->>'status' = 'ok', 'got ' || coalesce(v_res->>'status','null'));
+  select sync_token, status into v_tok, v_status
+    from screening_v2.ashby_sync_checkpoints where checkpoint_key = 'pol-stream';
+  perform _policy_tests.assert('ashby checkpoint: token persisted, status idle',
+    v_tok = 'opaque-token-1' and v_status = 'idle', 'token=' || coalesce(v_tok,'null') || ' status=' || coalesce(v_status,'null'));
+
+  -- D. Forced full resync nulls the token and flags the stream.
+  v_res := screening_v2.mark_ashby_sync_full_resync('pol-stream', 'token_expired');
+  perform _policy_tests.assert('ashby checkpoint: forced resync ok',
+    v_res->>'status' = 'ok', 'got ' || coalesce(v_res->>'status','null'));
+  select sync_token, status into v_tok, v_status
+    from screening_v2.ashby_sync_checkpoints where checkpoint_key = 'pol-stream';
+  perform _policy_tests.assert('ashby checkpoint: resync nulls token + flags stream',
+    v_tok is null and v_status = 'full_resync_required', 'token=' || coalesce(v_tok,'null') || ' status=' || coalesce(v_status,'null'));
+
+  -- Cleanup.
+  delete from screening_v2.ashby_event_receipts where webhook_action_id in ('pol-wh-1','pol-wh-2');
+  delete from screening_v2.ashby_sync_checkpoints where checkpoint_key = 'pol-stream';
+end;
+$$;
+
+-- ═══════════════════════════════════════════════════════════════════════
 -- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)
 -- ═══════════════════════════════════════════════════════════════════════
 
