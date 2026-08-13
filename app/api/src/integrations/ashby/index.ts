@@ -58,6 +58,8 @@ export {
 export {
   processAshbySignal,
   runClaimedAshbySignal,
+  buildSignalEnqueueSpec,
+  signalDedupKey,
   ASHBY_SIGNAL_QUEUE,
   CANDIDATE_DELETE_ACTION,
   type SignalDecision,
@@ -70,15 +72,14 @@ export {
   createReceiptStore,
   createCheckpointStore,
   createMappingResolver,
-  createSignalEnqueuer,
   createAshbySignalQueue,
 } from './stores.js';
 export type {
   ReceiptStore,
   ReceiptOutcome,
+  EnqueueSpec,
   CheckpointStore,
   SyncCheckpoint,
-  SignalEnqueuer,
   AshbySignalPayload,
 } from './ports.js';
 export {

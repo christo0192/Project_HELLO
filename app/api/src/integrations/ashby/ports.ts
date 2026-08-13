@@ -7,25 +7,55 @@
  * PII, raw bodies, signatures, secrets, or logs an opaque sync token.
  */
 
-/** Outcome of a dedup-safe receipt insert (mirrors record_ashby_event_receipt). */
+/** Opaque-ID-only signal payload placed on the leased queue. NEVER carries PII. */
+export interface AshbySignalPayload {
+  provider: 'ashby';
+  webhookActionId: string;
+  action: string;
+  /** Opaque external application id (never contact/resume data). May be absent. */
+  externalApplicationId?: string;
+}
+
+/**
+ * A deterministic enqueue request handed to the transactional-outbox receipt
+ * write. The receipt insert and this job insert commit in ONE transaction, and
+ * the dedup key makes re-drive idempotent (exactly one live job per signal).
+ */
+export interface EnqueueSpec {
+  queueName: string;
+  /** Deterministic dedup key — identical across webhook retries + reconciliation. */
+  dedupKey: string;
+  /** Opaque-ids-only payload. */
+  payload: AshbySignalPayload;
+  maxAttempts?: number;
+}
+
+/** Outcome of the transactional-outbox receipt write (mirrors the 0030 RPC). */
 export interface ReceiptOutcome {
-  /** 'inserted' = newly durable (schedule signal work once); 'duplicate' = already stored. */
+  /** 'inserted' = receipt newly stored; 'duplicate' = already stored. */
   status: 'inserted' | 'duplicate';
   /** Opaque receipt row id. */
   id: string;
+  /** A queue job was inserted on THIS call (false when re-drive found work). */
+  enqueued: boolean;
+  /** Durable processing work exists after this call (live job or terminal receipt). */
+  workPending: boolean;
 }
 
-/** Durable, dedup-safe webhook receipt sink. */
+/** Durable, dedup-safe webhook receipt sink with an atomic signal outbox. */
 export interface ReceiptStore {
   /**
-   * Insert-or-noop a sanitized receipt keyed by (webhookActionId, action).
-   * Metadata is bounded non-PII only. Throws on a durability failure so the
-   * caller can return a retryable 5xx.
+   * Atomically insert-or-noop a sanitized receipt keyed by
+   * (webhookActionId, action) AND, when `enqueue` is supplied, ensure exactly
+   * one live signal job exists for the deterministic dedup key (re-driving a
+   * missing enqueue on a duplicate). Metadata/payload are bounded non-PII only.
+   * Throws on a durability failure so the caller returns a retryable 5xx.
    */
   record(input: {
     webhookActionId: string;
     action: string;
     metadata?: Record<string, unknown> | null;
+    enqueue?: EnqueueSpec;
   }): Promise<ReceiptOutcome>;
 
   /** Update a receipt's processing status (post-processing bookkeeping). */
@@ -60,22 +90,4 @@ export interface CheckpointStore {
   }): Promise<void>;
   /** Force a safe full resync (null the token, flag the stream). */
   requireFullResync(checkpointKey: string, reason: string): Promise<void>;
-}
-
-/** Opaque-ID-only signal payload placed on the leased queue. NEVER carries PII. */
-export interface AshbySignalPayload {
-  provider: 'ashby';
-  webhookActionId: string;
-  action: string;
-  /** Opaque external application id (never contact/resume data). May be absent. */
-  externalApplicationId?: string;
-}
-
-/**
- * Enqueues a signal for the reconciliation worker. Implementations MUST dedup
- * on (webhookActionId, action) so duplicate deliveries never create duplicate
- * queue work, and MUST carry only the opaque ids above.
- */
-export interface SignalEnqueuer {
-  enqueue(payload: AshbySignalPayload): Promise<void>;
 }

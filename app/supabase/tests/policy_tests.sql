@@ -4438,6 +4438,64 @@ begin
   perform _policy_tests.assert('ashby receipt: oversized metadata rejected',
     v_res->>'status' = 'metadata_too_large', 'got ' || coalesce(v_res->>'status','null'));
 
+  -- B2. Transactional outbox: atomic receipt+job, idempotent re-drive, terminal guard.
+  v_res := screening_v2.record_ashby_event_receipt(
+    'pol-wh-ob', 'candidateStageChange', null,
+    true, 'ashby.signal', 'ashby:signal:candidateStageChange:pol-wh-ob',
+    jsonb_build_object('provider','ashby','webhookActionId','pol-wh-ob','action','candidateStageChange'), 5);
+  perform _policy_tests.assert('ashby outbox: fresh delivery inserted + enqueued',
+    v_res->>'status' = 'inserted' and (v_res->>'enqueued')::boolean and (v_res->>'work_pending')::boolean,
+    'got ' || v_res::text);
+  perform _policy_tests.assert('ashby outbox: exactly one live signal job',
+    (select count(*) from screening_v2.job_queue
+      where dedup_key = 'ashby:signal:candidateStageChange:pol-wh-ob'
+        and status in ('pending','active','delayed')) = 1,
+    'expected a single live signal job');
+
+  -- Duplicate delivery: no second live job (idempotent).
+  v_res := screening_v2.record_ashby_event_receipt(
+    'pol-wh-ob', 'candidateStageChange', null,
+    true, 'ashby.signal', 'ashby:signal:candidateStageChange:pol-wh-ob',
+    jsonb_build_object('provider','ashby'), 5);
+  perform _policy_tests.assert('ashby outbox: duplicate creates no second job',
+    v_res->>'status' = 'duplicate' and not (v_res->>'enqueued')::boolean and (v_res->>'work_pending')::boolean
+    and (select count(*) from screening_v2.job_queue
+          where dedup_key = 'ashby:signal:candidateStageChange:pol-wh-ob'
+            and status in ('pending','active','delayed')) = 1,
+    'got ' || v_res::text);
+
+  -- Re-drive: with the live job gone (completed) and receipt NOT terminal, a
+  -- redelivery re-enqueues exactly one job (closes the F2 strand gap).
+  update screening_v2.job_queue set status = 'completed'
+    where dedup_key = 'ashby:signal:candidateStageChange:pol-wh-ob';
+  v_res := screening_v2.record_ashby_event_receipt(
+    'pol-wh-ob', 'candidateStageChange', null,
+    true, 'ashby.signal', 'ashby:signal:candidateStageChange:pol-wh-ob',
+    jsonb_build_object('provider','ashby'), 5);
+  perform _policy_tests.assert('ashby outbox: re-drives a missing enqueue',
+    (v_res->>'enqueued')::boolean and (v_res->>'work_pending')::boolean
+    and (select count(*) from screening_v2.job_queue
+          where dedup_key = 'ashby:signal:candidateStageChange:pol-wh-ob'
+            and status in ('pending','active','delayed')) = 1,
+    'got ' || v_res::text);
+
+  -- Terminal-receipt guard: once the worker marks the receipt processed, a
+  -- redelivery with no live job does NOT re-enqueue (no re-run of done work).
+  update screening_v2.job_queue set status = 'completed'
+    where dedup_key = 'ashby:signal:candidateStageChange:pol-wh-ob';
+  update screening_v2.ashby_event_receipts set status = 'processed'
+    where webhook_action_id = 'pol-wh-ob' and action = 'candidateStageChange';
+  v_res := screening_v2.record_ashby_event_receipt(
+    'pol-wh-ob', 'candidateStageChange', null,
+    true, 'ashby.signal', 'ashby:signal:candidateStageChange:pol-wh-ob',
+    jsonb_build_object('provider','ashby'), 5);
+  perform _policy_tests.assert('ashby outbox: terminal receipt suppresses re-enqueue',
+    not (v_res->>'enqueued')::boolean and (v_res->>'work_pending')::boolean
+    and (select count(*) from screening_v2.job_queue
+          where dedup_key = 'ashby:signal:candidateStageChange:pol-wh-ob'
+            and status in ('pending','active','delayed')) = 0,
+    'got ' || v_res::text);
+
   -- C. Checkpoint advance persists an opaque token + stamps the expiry anchor.
   v_res := screening_v2.advance_ashby_sync_checkpoint('pol-stream', 'opaque-token-1', 3, 12, true);
   perform _policy_tests.assert('ashby checkpoint: advance ok',
@@ -4457,7 +4515,8 @@ begin
     v_tok is null and v_status = 'full_resync_required', 'token=' || coalesce(v_tok,'null') || ' status=' || coalesce(v_status,'null'));
 
   -- Cleanup.
-  delete from screening_v2.ashby_event_receipts where webhook_action_id in ('pol-wh-1','pol-wh-2');
+  delete from screening_v2.job_queue where dedup_key = 'ashby:signal:candidateStageChange:pol-wh-ob';
+  delete from screening_v2.ashby_event_receipts where webhook_action_id in ('pol-wh-1','pol-wh-2','pol-wh-ob');
   delete from screening_v2.ashby_sync_checkpoints where checkpoint_key = 'pol-stream';
 end;
 $$;

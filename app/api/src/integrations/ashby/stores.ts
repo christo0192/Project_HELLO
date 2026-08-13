@@ -18,26 +18,41 @@ import type {
   ReceiptOutcome,
   CheckpointStore,
   SyncCheckpoint,
-  SignalEnqueuer,
-  AshbySignalPayload,
 } from './ports.js';
 import type { MappingResolver, MappingActivity } from './signal-worker.js';
-import { ASHBY_SIGNAL_QUEUE } from './signal-worker.js';
 
-/** Dedup-safe receipt store backed by record_ashby_event_receipt. */
+/**
+ * Transactional-outbox receipt store backed by record_ashby_event_receipt.
+ * When an enqueue spec is supplied, the receipt and the signal job are written
+ * in one server-side transaction (atomic outbox); duplicates re-drive.
+ */
 export function createReceiptStore(client: SupabaseClient): ReceiptStore {
   return {
     async record(input): Promise<ReceiptOutcome> {
+      const enqueue = input.enqueue;
       const { data, error } = await client.rpc('record_ashby_event_receipt', {
         p_webhook_action_id: input.webhookActionId,
         p_action: input.action,
         p_metadata: input.metadata ?? null,
+        p_enqueue: enqueue !== undefined,
+        p_queue_name: enqueue?.queueName ?? null,
+        p_dedup_key: enqueue?.dedupKey ?? null,
+        p_payload: enqueue?.payload ?? null,
+        p_max_attempts: enqueue?.maxAttempts ?? 5,
       });
       if (error) throw new Error('ashby_receipt_rpc_error');
-      const status = (data as { status?: string; id?: string } | null)?.status;
-      const id = (data as { id?: string } | null)?.id;
+      const row = data as
+        | { status?: string; id?: string; enqueued?: boolean; work_pending?: boolean }
+        | null;
+      const status = row?.status;
+      const id = row?.id;
       if ((status === 'inserted' || status === 'duplicate') && typeof id === 'string') {
-        return { status, id };
+        return {
+          status,
+          id,
+          enqueued: row?.enqueued === true,
+          workPending: row?.work_pending === true,
+        };
       }
       throw new Error('ashby_receipt_unexpected_status');
     },
@@ -124,23 +139,7 @@ export function createMappingResolver(client: SupabaseClient): MappingResolver {
   };
 }
 
-/**
- * Leased-queue signal enqueuer. Dedups on (webhookActionId, action) so a
- * duplicate delivery never creates duplicate queue work, and carries only
- * opaque ids. Enqueue errors propagate so the route returns a retryable 5xx.
- */
-export function createSignalEnqueuer(queue: Queue): SignalEnqueuer {
-  return {
-    async enqueue(payload: AshbySignalPayload): Promise<void> {
-      await queue.enqueue(ASHBY_SIGNAL_QUEUE, payload, {
-        dedupKey: `ashby:signal:${payload.action}:${payload.webhookActionId}`,
-        maxAttempts: 5,
-      });
-    },
-  };
-}
-
-/** Build the leased signal Queue bound to the service-role client. */
+/** Build the leased signal Queue bound to the service-role client (worker side). */
 export function createAshbySignalQueue(client: SupabaseClient): Queue {
   return new Queue(new PgAdapter(client));
 }

@@ -32,12 +32,8 @@ import {
   type WebhookVerifyReason,
 } from '../integrations/ashby/webhook-verify.js';
 import { ingestWebhook } from '../integrations/ashby/ingress.js';
-import {
-  createReceiptStore,
-  createSignalEnqueuer,
-  createAshbySignalQueue,
-} from '../integrations/ashby/stores.js';
-import type { ReceiptStore, SignalEnqueuer } from '../integrations/ashby/ports.js';
+import { createReceiptStore } from '../integrations/ashby/stores.js';
+import type { ReceiptStore } from '../integrations/ashby/ports.js';
 
 /** Canonical Ashby signature header (case-insensitive on read). */
 const SIGNATURE_HEADER = 'ashby-signature';
@@ -57,10 +53,11 @@ function verifyStatus(reason: WebhookVerifyReason): 400 | 401 | 403 | 413 | 503 
 export interface AshbyWebhookRouterDeps {
   /** Integration config (defaults to loadAshbyConfig()). */
   config?: AshbyIntegrationConfig;
-  /** Durable receipt store (defaults to the service-role Supabase store). */
+  /**
+   * Transactional-outbox receipt store (defaults to the service-role Supabase
+   * store). Its `record` writes the receipt AND the signal job in one tx.
+   */
   receipts?: ReceiptStore;
-  /** Signal enqueuer (defaults to the leased Supabase queue). Omit to disable. */
-  enqueuer?: SignalEnqueuer;
   /** Raw-body byte bound for signature verification. */
   maxBytes?: number;
   /** Metadata-only logger component name. */
@@ -79,8 +76,6 @@ export function createAshbyWebhookRouter(deps: AshbyWebhookRouterDeps = {}): Rou
   // Lazily-resolved config/deps so a disabled integration does no work and unit
   // tests can inject everything. Defaults are built once at first use.
   let cachedReceipts: ReceiptStore | undefined = deps.receipts;
-  let cachedEnqueuer: SignalEnqueuer | undefined = deps.enqueuer;
-  let enqueuerResolved = deps.enqueuer !== undefined;
 
   function resolveConfig(): AshbyIntegrationConfig {
     return deps.config ?? loadAshbyConfig();
@@ -88,14 +83,6 @@ export function createAshbyWebhookRouter(deps: AshbyWebhookRouterDeps = {}): Rou
   function resolveReceipts(): ReceiptStore {
     if (!cachedReceipts) cachedReceipts = createReceiptStore(supabase as never);
     return cachedReceipts;
-  }
-  function resolveEnqueuer(): SignalEnqueuer {
-    if (!enqueuerResolved) {
-      cachedEnqueuer = createSignalEnqueuer(createAshbySignalQueue(supabase as never));
-      enqueuerResolved = true;
-    }
-    // cachedEnqueuer may be intentionally undefined when injected as such.
-    return cachedEnqueuer as SignalEnqueuer;
   }
 
   router.post(
@@ -132,7 +119,6 @@ export function createAshbyWebhookRouter(deps: AshbyWebhookRouterDeps = {}): Rou
       try {
         const outcome = await ingestWebhook(parsed, {
           receipts: resolveReceipts(),
-          enqueuer: resolveEnqueuer(),
         });
         if (outcome.httpStatus === 200) {
           return res.status(200).json({ ok: true, status: outcome.code });

@@ -49,22 +49,31 @@ non-retryable (Ashby will not retry-storm); durable-ingress failure is **500**
 > `sha256=` envelope, and the raw-bytes MAC domain must be re-confirmed against
 > the tenant's Ashby webhook configuration before enabling with production data.
 
-## Durable ingress + dedup
+## Durable ingress + transactional outbox
 
 1. Verify signature → parse JSON.
 2. Extract a sanitized signal (action + dedup identity + opaque ids). A
    `candidateStageChange` uses a **stage-centric dedup identity**
    `stage:<applicationId>:<stageId>` so retries and reconciliation converge.
-3. `record_ashby_event_receipt` inserts-or-noops on
-   `(provider, webhook_action_id, action)` and reports `inserted` vs `duplicate`.
-   A duplicate is acked **200** with no new queue work.
-4. Only a **fresh** `candidateStageChange` enqueues exactly one leased signal
-   job carrying opaque ids only. `applicationUpdate` is redundant (recorded, not
-   enqueued); `candidateDelete` is **capability-gated off** (recorded, not
-   enqueued — reconciliation is the safety net).
+3. `record_ashby_event_receipt` is a **transactional outbox**: in ONE
+   transaction it inserts-or-noops the receipt on
+   `(provider, webhook_action_id, action)` AND — for a stage-change trigger —
+   ensures exactly one live signal job exists for the deterministic dedup key
+   `ashby:signal:candidateStageChange:<stageId identity>`. Receipt and queue job
+   commit or roll back together, so a durably-recorded trigger is always durably
+   queued (**no receipt-then-enqueue strand — review F2**).
+4. **Re-drive:** a duplicate delivery (or reconciliation) whose signal was never
+   queued — or whose job was lost (DLQ'd) — re-inserts one job, unless durable
+   work already exists (a live pending/active/delayed job, or a receipt the
+   worker already drove to `processed`/`ignored`/`failed`). The route acks **200
+   only when `work_pending`** is true; otherwise it returns a retryable **500**.
+5. `applicationUpdate` is redundant (recorded, not enqueued); `candidateDelete`
+   is **capability-gated off** (recorded, not enqueued — reconciliation is the
+   safety net). Duplicate deliveries never create a second job.
 
 Only a sanitized `{ source }` marker is stored as receipt metadata — never the
-body, signature, secret, or contact data.
+body, signature, secret, or contact data. The queue payload carries opaque ids
+only.
 
 ## Signal worker (signal, not truth)
 
@@ -85,9 +94,14 @@ cannot commit (0028 compare-and-set).
 ## Reconciliation (dropped-signal safety net)
 
 `runReconciliation` pages `application.list` with the opaque incremental sync
-token and records the **same** stage receipts the webhook would — a dropped
-webhook is recovered on the next pass; already-covered applications converge
-(duplicate, no work).
+token and, for each observed application, drives the **same transactional
+outbox** the webhook uses — recording the stage receipt AND ensuring a live
+signal job (**review F1: recovery restores processing, not just a receipt**). A
+dropped webhook is recovered into processing on the next pass; already-covered
+applications converge (the outbox creates no duplicate job), so a later webhook
+still results in exactly one scheduled import. The worker re-reads authoritative
+state and gates on mapping/stage, so enqueuing every observed application is
+safe (non-AI-stage / paused / unknown → no-op).
 
 - **Sync mode:** incremental with the stored token, unless the token is absent,
   the stream is `full_resync_required`, or the token is older than the **14-day**

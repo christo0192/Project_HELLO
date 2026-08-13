@@ -16,17 +16,33 @@ import {
   SYNC_TOKEN_MAX_AGE_MS,
   type ApplicationLister,
 } from '../integrations/ashby/reconciliation.js';
+import { ingestWebhook } from '../integrations/ashby/ingress.js';
 import type { CheckpointStore, ReceiptStore, ReceiptOutcome, SyncCheckpoint } from '../integrations/ashby/ports.js';
 import type { AshbyResult, OpaqueRecord } from '../integrations/ashby/types.js';
 
-/** Receipt store that dedups on (action, id) and reports inserted vs duplicate. */
+/**
+ * Transactional-outbox fake: dedups receipts on (action, id) and ensures one
+ * live signal job per enqueue dedupKey (so reconciliation and the webhook
+ * converge to exactly one scheduled import).
+ */
 class FakeReceipts implements ReceiptStore {
   seen = new Set<string>();
-  async record(input: { webhookActionId: string; action: string }): Promise<ReceiptOutcome> {
+  liveJobs = new Set<string>();
+  async record(input: {
+    webhookActionId: string;
+    action: string;
+    enqueue?: { dedupKey: string };
+  }): Promise<ReceiptOutcome> {
     const key = `${input.action}:${input.webhookActionId}`;
-    if (this.seen.has(key)) return { status: 'duplicate', id: key };
-    this.seen.add(key);
-    return { status: 'inserted', id: key };
+    const fresh = !this.seen.has(key);
+    if (fresh) this.seen.add(key);
+    let enqueued = false;
+    let workPending = false;
+    if (input.enqueue) {
+      if (this.liveJobs.has(input.enqueue.dedupKey)) workPending = true;
+      else { this.liveJobs.add(input.enqueue.dedupKey); enqueued = true; workPending = true; }
+    }
+    return { status: fresh ? 'inserted' : 'duplicate', id: key, enqueued, workPending };
   }
 }
 
@@ -97,9 +113,33 @@ describe('runReconciliation — recovery + checkpoint safety', () => {
     expect(res.items).toBe(2);
     expect(res.recovered).toBe(1);  // app_2 recovered
     expect(res.duplicates).toBe(1); // app_1 already had a receipt
+    // F1: recovery enqueues import work — app_2 (new) AND app_1 (receipt-only
+    // strand re-driven), so both now have a live signal job.
+    expect(res.enqueued).toBe(2);
+    expect(receipts.liveJobs.size).toBe(2);
     expect(res.advanced).toBe(true);
     expect(checkpoints.advances).toHaveLength(1);
     expect(checkpoints.advances[0]).toMatchObject({ syncToken: 'sync_final', full: true });
+  });
+
+  it('F1: recovery enqueues import work; a later webhook converges to exactly one job', async () => {
+    const receipts = new FakeReceipts();
+    const checkpoints = new FakeCheckpoints(null);
+    const lister = scriptedLister([
+      { results: [app('app_x', 'stage_ai')], moreDataAvailable: false, syncToken: 't' },
+    ]);
+    const res = await runReconciliation({ client: lister, checkpoints, receipts });
+    expect(res.recovered).toBe(1);
+    expect(res.enqueued).toBe(1);
+    expect(receipts.liveJobs.size).toBe(1);
+    // A subsequent real webhook for the same application-at-stage converges: no
+    // second import is scheduled (deterministic dedup key).
+    const out = await ingestWebhook(
+      { action: 'candidateStageChange', data: { application: { id: 'app_x', currentInterviewStage: { id: 'stage_ai' } } } },
+      { receipts },
+    );
+    expect(out).toMatchObject({ kind: 'duplicate', enqueued: false });
+    expect(receipts.liveJobs.size).toBe(1);
   });
 
   it('pages through multiple pages and advances only once, when drained', async () => {

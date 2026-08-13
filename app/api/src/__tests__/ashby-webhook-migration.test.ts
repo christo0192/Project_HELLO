@@ -54,10 +54,22 @@ describe('0030 RPC hardening', () => {
     }
   });
 
-  it('receipt ingress is dedup-safe (insert-or-noop on the unique key)', () => {
+  it('receipt ingress is dedup-safe (insert-or-noop) and reports inserted/duplicate', () => {
     expect(sql).toContain('on conflict (provider, webhook_action_id, action) do nothing');
-    expect(sql).toContain("jsonb_build_object('status', 'inserted'");
-    expect(sql).toContain("jsonb_build_object('status', 'duplicate'");
+    expect(sql).toContain("case when v_created then 'inserted' else 'duplicate' end");
+  });
+
+  it('is a transactional outbox: atomic signal-job insert with deterministic dedup + re-drive', () => {
+    // Receipt + queue job in the SAME function/transaction.
+    expect(sql).toContain('insert into screening_v2.job_queue');
+    // Re-drive only when no live job carries the dedup key and the receipt is
+    // not already in a terminal processing state.
+    expect(sql).toContain("v_status in ('processed', 'ignored', 'failed')");
+    expect(sql).toContain("status in ('pending', 'active', 'delayed')");
+    // Race-safe enqueue under the partial unique index.
+    expect(sql).toContain('exception when unique_violation');
+    // work_pending gates the caller's 2xx ack.
+    expect(sql).toContain("'work_pending', v_work_pending");
   });
 
   it('is forward-only and additive (no destructive DDL)', () => {

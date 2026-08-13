@@ -28,12 +28,45 @@ import {
   extractApplicationInfo,
   CANDIDATE_STAGE_CHANGE_ACTION,
 } from './extractors.js';
-import type { AshbySignalPayload, ReceiptStore } from './ports.js';
+import type { AshbySignalPayload, EnqueueSpec, ReceiptStore } from './ports.js';
 import type { AshbyResult, OpaqueRecord } from './types.js';
 import type { QueueJob, FailOutcome } from '../../lib/queue/types.js';
 
 /** Queue name for inbound Ashby webhook signals. */
 export const ASHBY_SIGNAL_QUEUE = 'ashby.signal';
+
+/**
+ * Deterministic queue dedup key for a signal. Identical across webhook retries
+ * AND reconciliation, so the transactional outbox converges to one live job.
+ */
+export function signalDedupKey(action: string, webhookActionId: string): string {
+  return `ashby:signal:${action}:${webhookActionId}`;
+}
+
+/**
+ * Build the enqueue spec handed to the transactional-outbox receipt write.
+ * The payload carries opaque ids only (never PII/body/tokens). Used identically
+ * by the webhook ingress and the reconciliation recovery path so a dropped and
+ * a later-delivered signal for the same application converge to one import.
+ */
+export function buildSignalEnqueueSpec(signal: {
+  webhookActionId: string;
+  action: string;
+  externalApplicationId?: string;
+}): EnqueueSpec {
+  const payload: AshbySignalPayload = {
+    provider: 'ashby',
+    webhookActionId: signal.webhookActionId,
+    action: signal.action,
+    externalApplicationId: signal.externalApplicationId,
+  };
+  return {
+    queueName: ASHBY_SIGNAL_QUEUE,
+    dedupKey: signalDedupKey(signal.action, signal.webhookActionId),
+    payload,
+    maxAttempts: 5,
+  };
+}
 
 /** The capability-gated delete action (disabled until a tenant probe verifies). */
 export const CANDIDATE_DELETE_ACTION = 'candidateDelete';

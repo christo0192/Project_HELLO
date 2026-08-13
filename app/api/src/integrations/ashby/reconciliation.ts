@@ -26,6 +26,7 @@
  */
 
 import { extractApplicationInfo, stageDedupId, CANDIDATE_STAGE_CHANGE_ACTION } from './extractors.js';
+import { buildSignalEnqueueSpec } from './signal-worker.js';
 import type { CheckpointStore, ReceiptStore } from './ports.js';
 import type { AshbyResult, ApplicationListParams, OpaqueRecord } from './types.js';
 
@@ -65,6 +66,8 @@ export interface ReconcileResult {
   recovered: number;
   /** Applications whose receipt already existed. */
   duplicates: number;
+  /** Signal jobs enqueued this run (recovered work re-driven into processing). */
+  enqueued: number;
   stop: ReconcileStop;
   /** Whether the checkpoint token was advanced (only on a fully drained run). */
   advanced: boolean;
@@ -124,6 +127,7 @@ export async function runReconciliation(deps: ReconcileDeps): Promise<ReconcileR
   let items = 0;
   let recovered = 0;
   let duplicates = 0;
+  let enqueued = 0;
   let stop: ReconcileStop = 'drained';
 
   for (;;) {
@@ -146,12 +150,25 @@ export async function runReconciliation(deps: ReconcileDeps): Promise<ReconcileR
       const view = extractApplicationInfo(raw);
       if (!view.applicationId) continue; // unusable item — skip safely
       const dedupId = stageDedupId(view.applicationId, view.currentStageId);
+      // Recover the signal INTO PROCESSING via the transactional outbox: record
+      // the receipt AND ensure a live signal job exists (re-drive). A dropped
+      // webhook is thus imported; an already-covered application converges (the
+      // outbox creates no duplicate job) so a later webhook still results in
+      // exactly one scheduled import. The worker re-reads authoritative state
+      // and gates on mapping/stage, so enqueuing every observed application is
+      // safe (non-AI-stage / paused / unknown → no-op).
       const outcome = await deps.receipts.record({
         webhookActionId: dedupId,
         action: CANDIDATE_STAGE_CHANGE_ACTION,
         metadata: { source: 'reconcile' },
+        enqueue: buildSignalEnqueueSpec({
+          webhookActionId: dedupId,
+          action: CANDIDATE_STAGE_CHANGE_ACTION,
+          externalApplicationId: view.applicationId,
+        }),
       });
       if (outcome.status === 'inserted') recovered += 1; else duplicates += 1;
+      if (outcome.enqueued) enqueued += 1;
     }
 
     // The final page's opaque token supersedes the working token.
@@ -182,5 +199,5 @@ export async function runReconciliation(deps: ReconcileDeps): Promise<ReconcileR
     advanced = true;
   }
 
-  return { mode: decided.mode, pages, items, recovered, duplicates, stop, advanced };
+  return { mode: decided.mode, pages, items, recovered, duplicates, enqueued, stop, advanced };
 }

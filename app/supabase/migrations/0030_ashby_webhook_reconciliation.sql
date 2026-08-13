@@ -30,19 +30,38 @@
 -- =====================================================================
 
 -- ═══════════════════════════════════════════════════════════════════════
--- 1. record_ashby_event_receipt — dedup-safe durable webhook ingress
+-- 1. record_ashby_event_receipt — dedup-safe durable ingress + atomic outbox
 -- ═══════════════════════════════════════════════════════════════════════
--- Inserts one sanitized receipt keyed by the 0029 unique constraint
--- (provider, webhook_action_id, action). On a duplicate delivery the insert
--- is a no-op and the function reports status='duplicate' with the existing
--- row id, so the caller acknowledges 2xx WITHOUT scheduling duplicate queue
--- work. A newly inserted row reports status='inserted'. Metadata is bounded
--- defensively (the table CHECK also bounds it) and defaults to null.
+-- Transactional outbox: in ONE transaction this inserts the sanitized receipt
+-- (keyed by the 0029 unique (provider, webhook_action_id, action)) AND, when
+-- p_enqueue is set, ensures exactly one live signal job exists for the
+-- deterministic p_dedup_key. Because both writes commit or roll back together,
+-- there is no "receipt without queued work" gap: a stage-change trigger that is
+-- durably recorded is durably queued.
+--
+-- Re-drive semantics (idempotent, at-least-once): a duplicate delivery (or a
+-- reconciliation pass over the same application) RE-DRIVES a missing enqueue —
+-- if the receipt is not yet in a terminal processing state (processed/ignored/
+-- failed) and no live (pending/active/delayed) job carries the dedup key, one
+-- job is inserted. If durable work already exists (a live job, or the worker
+-- already reached a terminal decision) no duplicate job is created. So the
+-- webhook and reconciliation converge to EXACTLY ONE scheduled import.
+--
+-- The queue job payload carries opaque ids only (never PII/body/tokens). Only
+-- CALLERS that pass p_enqueue schedule work; non-trigger actions omit it and
+-- are recorded-only (still acked). The result reports work_pending so the route
+-- acks 2xx only when durable processing work exists.
 
 create or replace function screening_v2.record_ashby_event_receipt(
   p_webhook_action_id text,
   p_action            text,
-  p_metadata          jsonb default null
+  p_metadata          jsonb   default null,
+  p_enqueue           boolean default false,
+  p_queue_name        text    default null,
+  p_dedup_key         text    default null,
+  p_payload           jsonb   default null,
+  p_max_attempts      integer default 5,
+  p_now               timestamptz default now()
 )
 returns jsonb
 language plpgsql
@@ -50,7 +69,11 @@ security definer
 set search_path = pg_catalog, screening_v2
 as $$
 declare
-  v_id uuid;
+  v_id             uuid;
+  v_status         text;
+  v_created        boolean := false;
+  v_enqueued       boolean := false;
+  v_work_pending   boolean := false;
 begin
   if p_webhook_action_id is null
      or length(p_webhook_action_id) < 1 or length(p_webhook_action_id) > 256 then
@@ -62,6 +85,16 @@ begin
   if p_metadata is not null and octet_length(p_metadata::text) > 2048 then
     return jsonb_build_object('status', 'metadata_too_large');
   end if;
+  if p_enqueue then
+    if p_queue_name is null or length(p_queue_name) < 1 or length(p_queue_name) > 128
+       or p_dedup_key is null or length(p_dedup_key) < 1 or length(p_dedup_key) > 256
+       or p_payload is null then
+      return jsonb_build_object('status', 'invalid_enqueue_params');
+    end if;
+    if octet_length(p_payload::text) > 8192 then
+      return jsonb_build_object('status', 'payload_too_large');
+    end if;
+  end if;
 
   -- Race-safe insert-or-noop on the (provider, webhook_action_id, action)
   -- unique key. Concurrent duplicate deliveries converge to a single row.
@@ -70,35 +103,71 @@ begin
   values
     ('ashby', p_webhook_action_id, p_action, p_metadata)
   on conflict (provider, webhook_action_id, action) do nothing
-  returning id into v_id;
+  returning id, status into v_id, v_status;
 
   if v_id is not null then
-    return jsonb_build_object('status', 'inserted', 'id', v_id);
+    v_created := true;
+  else
+    -- Lost the race (or a prior delivery already stored it): read the winner.
+    select id, status into v_id, v_status
+      from screening_v2.ashby_event_receipts
+     where provider = 'ashby'
+       and webhook_action_id = p_webhook_action_id
+       and action = p_action;
   end if;
 
-  -- Lost the race (or a prior delivery already stored it): fetch the winner.
-  select id into v_id
-    from screening_v2.ashby_event_receipts
-   where provider = 'ashby'
-     and webhook_action_id = p_webhook_action_id
-     and action = p_action;
+  -- Atomic outbox / re-drive: ensure exactly one live signal job exists.
+  if p_enqueue then
+    if v_status in ('processed', 'ignored', 'failed') then
+      -- Worker already reached a terminal decision — durable work is done.
+      v_work_pending := true;
+    elsif exists (
+      select 1 from screening_v2.job_queue
+       where dedup_key = p_dedup_key
+         and status in ('pending', 'active', 'delayed')
+    ) then
+      -- A live job already carries this signal — no duplicate work.
+      v_work_pending := true;
+    else
+      -- No durable work yet: enqueue one job in THIS transaction (re-drive).
+      begin
+        insert into screening_v2.job_queue
+          (name, payload, status, dedup_key, attempts, max_attempts, priority, scheduled_at, created_at)
+        values
+          (p_queue_name, p_payload, 'pending', p_dedup_key, 0,
+           greatest(1, least(coalesce(p_max_attempts, 5), 20)), 0, p_now, p_now);
+        v_enqueued := true;
+        v_work_pending := true;
+      exception when unique_violation then
+        -- A concurrent caller won the enqueue race — a live job exists.
+        v_work_pending := true;
+      end;
+    end if;
+  end if;
 
-  return jsonb_build_object('status', 'duplicate', 'id', v_id);
+  return jsonb_build_object(
+    'status',       case when v_created then 'inserted' else 'duplicate' end,
+    'id',           v_id,
+    'enqueued',     v_enqueued,
+    'work_pending', v_work_pending
+  );
 end;
 $$;
 
-revoke all on function screening_v2.record_ashby_event_receipt(text, text, jsonb)
+revoke all on function screening_v2.record_ashby_event_receipt(text, text, jsonb, boolean, text, text, jsonb, integer, timestamptz)
   from public, anon, authenticated;
-grant execute on function screening_v2.record_ashby_event_receipt(text, text, jsonb)
+grant execute on function screening_v2.record_ashby_event_receipt(text, text, jsonb, boolean, text, text, jsonb, integer, timestamptz)
   to service_role;
 
 comment on function screening_v2.record_ashby_event_receipt is
-  'Dedup-safe durable ingress for a sanitized Ashby webhook receipt. '
-  'Insert-or-noop on the (provider, webhook_action_id, action) unique key; '
-  'returns status=inserted (new) or status=duplicate (already present) with '
-  'the row id, so the caller schedules signal work at most once. Stores only '
-  'the sanitized identity + bounded non-PII metadata — never the raw body, '
-  'signature, secret, or contact data. Service-role-only.';
+  'Transactional outbox for Ashby signals: atomically inserts the sanitized '
+  'receipt (dedup on provider+webhook_action_id+action) AND, when p_enqueue is '
+  'set, ensures exactly one live signal job for the deterministic dedup key — '
+  'so there is no receipt-without-queued-work gap. Duplicate deliveries and '
+  'reconciliation RE-DRIVE a missing enqueue idempotently (never duplicating a '
+  'live job or re-running terminal work), converging to exactly one scheduled '
+  'import. Job payload is opaque ids only. Returns status (inserted/duplicate), '
+  'id, enqueued, and work_pending. Service-role-only.';
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- 2. ashby_sync_checkpoints — one durable reconciliation cursor per stream
