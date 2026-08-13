@@ -13,6 +13,7 @@
     "seed:advisor": "tsx scripts/seed-program-advisor.ts",
     "smoke:brain": "tsx scripts/smoke-brain.ts",
     "smoke:http": "tsx scripts/smoke-http.ts",
+    "bench:parser": "tsx scripts/bench-resume-parser.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage"
