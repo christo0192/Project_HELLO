@@ -4,90 +4,104 @@
  *
  * Production entry-point. Run with `process.execPath` (vanilla Node.js, no tsx).
  * This file:
- *  - Reads a base64-encoded buffer from stdin.
+ *  - Reads the RAW file bytes from stdin as binary (no base64 expansion),
+ *    bounded by a maximum input-byte cap (argv[3]); overflow fails closed.
  *  - Extracts text using the appropriate parser (pdf-parse, mammoth, utf-8).
- *  - Writes a single JSON line to stdout: { ok: true, text: "..." } or { ok: false, error: "..." }.
+ *  - Truncates extracted text to a bounded character cap (argv[4]) while still
+ *    reporting the pre-truncation length, then writes ONE JSON line to stdout:
+ *      { ok: true, text: "...", totalLength: N }  or  { ok: false, error: CODE }
  *
- * No shell interpolation — the parent passes data via stdin, not argv.
- * The validated MIME type is passed as argv[2] (guaranteed by upload-guard).
- *
- * This file has NO relative imports to TypeScript source files so it runs
- * in compiled / production layouts without tsx.
+ * Security:
+ *  - No shell interpolation — the parent passes data via binary stdin, not argv.
+ *  - The validated MIME type is passed as argv[2] (fixed enum from upload-guard).
+ *  - Error output is a STABLE code only — never the file bytes/path, extracted
+ *    text, contact fields, or a library's dynamic message. Nothing sensitive is
+ *    written to stderr.
+ *  - No relative imports to TypeScript source, so it runs in compiled/production
+ *    layouts without tsx.
  */
 
 // @ts-check
 
-function handleError(code, message) {
-  const result = JSON.stringify({ ok: false, error: code, message });
-  process.stdout.write(result + '\n');
-  console.error('[resume-parser-child]', code, message);
-  process.exit(0); // exit cleanly so parent can read the error
+const DEFAULT_MAX_INPUT_BYTES = 25 * 1024 * 1024; // 25 MiB
+const DEFAULT_MAX_OUTPUT_CHARS = 50_000;
+
+/** Write a stable error result and exit cleanly so the parent can read it. */
+function emitError(code) {
+  process.stdout.write(JSON.stringify({ ok: false, error: code }) + '\n');
+  process.exit(0);
 }
 
-function parseBase64Stdin() {
+/** Read raw binary stdin bounded to maxBytes; overflow → null (fail closed). */
+function readBinaryStdin(maxBytes) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    process.stdin.setEncoding('utf-8');
-
+    let total = 0;
+    let overflowed = false;
     process.stdin.on('data', (chunk) => {
-      chunks.push(chunk);
-    });
-
-    process.stdin.on('end', () => {
-      const raw = chunks.join('').trim();
-      if (!raw) {
-        reject(new Error('No input data received'));
+      if (overflowed) return;
+      total += chunk.length; // Buffer byte length, not character count
+      if (total > maxBytes) {
+        overflowed = true;
+        resolve(null);
         return;
       }
-      try {
-        const buf = Buffer.from(raw, 'base64');
-        resolve(buf);
-      } catch (err) {
-        reject(new Error(`Base64 decode failed: ${err.message}`));
-      }
+      chunks.push(chunk);
     });
-
+    process.stdin.on('end', () => {
+      if (overflowed) return;
+      resolve(Buffer.concat(chunks, total));
+    });
     process.stdin.on('error', (err) => reject(err));
   });
 }
 
 async function extractText(buf, mime) {
   if (mime === 'application/pdf') {
-    // Dynamic import to avoid pdf-parse's debug self-test at module level
+    // Dynamic import avoids pdf-parse's debug self-test at module load.
     const pdfParse = (await import('pdf-parse/lib/pdf-parse.js')).default;
     const out = await pdfParse(buf);
     return out.text;
   }
-
   if (mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
     const mammoth = await import('mammoth');
     const out = await mammoth.extractRawText({ buffer: buf });
     return out.value;
   }
-
   if (mime === 'text/plain') {
     return buf.toString('utf-8');
   }
+  return null; // unsupported — mapped to a stable code by the caller
+}
 
-  throw new Error(`Unsupported MIME type: ${mime}`);
+function parsePositiveInt(raw, fallback) {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) return fallback;
+  return n;
 }
 
 async function main() {
   try {
     const mime = process.argv[2] ?? '';
-    if (!mime) {
-      handleError('NO_MIME', 'No MIME type provided');
-      return;
-    }
+    const maxInputBytes = parsePositiveInt(process.argv[3], DEFAULT_MAX_INPUT_BYTES);
+    const maxOutputChars = parsePositiveInt(process.argv[4], DEFAULT_MAX_OUTPUT_CHARS);
+    if (!mime) return emitError('NO_MIME');
 
-    const buf = await parseBase64Stdin();
+    const buf = await readBinaryStdin(maxInputBytes);
+    if (buf === null) return emitError('INPUT_OVERFLOW');
+    if (buf.length === 0) return emitError('EMPTY_INPUT');
+
     const text = await extractText(buf, mime);
+    if (text === null) return emitError('UNSUPPORTED_MIME');
+    if (typeof text !== 'string') return emitError('EXTRACT_FAILED');
 
-    const result = JSON.stringify({ ok: true, text });
-    process.stdout.write(result + '\n');
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    handleError('PARSE_FAILED', msg);
+    // Unicode-safe truncation by code unit, reporting the pre-truncation length.
+    const totalLength = text.length;
+    const bounded = totalLength > maxOutputChars ? text.slice(0, maxOutputChars) : text;
+    process.stdout.write(JSON.stringify({ ok: true, text: bounded, totalLength }) + '\n');
+  } catch {
+    // Never surface a library's dynamic message (could echo file content).
+    emitError('EXTRACT_FAILED');
   }
 }
 
