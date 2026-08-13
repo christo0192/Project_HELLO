@@ -564,3 +564,52 @@ export interface AdminAllowlistUpdateInput {
 export interface AdminAllowlistUpdateResponse {
   ok: boolean;
 }
+
+// ── Ashby Mission Control (sanitized; no PII/tokens) ─────────────────
+export interface AshbyMcMapping {
+  id: string;
+  externalJobId: string;
+  status: 'paused' | 'enabled' | 'drift';
+  statusReason: string | null;
+  deliveryMode: string;
+  hasAiStage: boolean;
+  hasTaStage: boolean;
+  label: string | null;
+  updatedAt: string;
+}
+
+export interface AshbyMcWorkflowOperation {
+  id: string;
+  type: string;
+  state: string;
+  errorCode: string | null;
+}
+
+export interface AshbyMcWorkflow {
+  applicationLinkId: string;
+  externalApplicationId: string;
+  externalJobId: string | null;
+  lifecycle: string;
+  terminalState: string | null;
+  ingestionState: string | null;
+  operations: AshbyMcWorkflowOperation[];
+  updatedAt: string;
+}
+
+export interface AshbyMcMappingsResponse {
+  ok: boolean;
+  mappings: AshbyMcMapping[];
+}
+
+export interface AshbyMcWorkflowsResponse {
+  ok: boolean;
+  workflows: AshbyMcWorkflow[];
+}
+
+export interface AshbyMcActionResponse {
+  ok: boolean;
+  status?: string;
+  error?: string;
+  cancelled_operations?: number;
+  cancelled_ingestion?: number;
+}

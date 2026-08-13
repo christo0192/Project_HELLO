@@ -4522,6 +4522,166 @@ end;
 $$;
 
 -- ═══════════════════════════════════════════════════════════════════════
+-- 0031: Ashby screening-workflow execution primitives — RLS/privilege +
+--       functional controls (leased outbox, atomic terminal cancel,
+--       ingestion advance, scorecard idempotency, mapping pause/resume).
+-- ═══════════════════════════════════════════════════════════════════════
+
+select _policy_tests.assert(
+  'ashby workflow RPCs are service-role only',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname in ('enqueue_ashby_operation','claim_ashby_operation',
+                        'complete_ashby_operation','fail_ashby_operation',
+                        'cancel_ashby_application','advance_ashby_ingestion',
+                        'set_ashby_mapping_status')
+      and not has_function_privilege('anon', p.oid, 'EXECUTE')
+      and not has_function_privilege('authenticated', p.oid, 'EXECUTE')
+      and has_function_privilege('service_role', p.oid, 'EXECUTE')
+  ) = 7,
+  'ashby workflow-execution RPCs must be service-role only'
+);
+
+select _policy_tests.assert(
+  'ashby_operations has additive lease/anchor/marker columns',
+  (select count(*)
+     from information_schema.columns
+    where table_schema = 'screening_v2' and table_name = 'ashby_operations'
+      and column_name in ('lease_token','lease_owner','lease_expires_at','external_anchor','marker')
+  ) = 5,
+  'ashby_operations must carry the 0031 lease/anchor/marker columns'
+);
+
+-- Functional negative controls against the live 0031 primitives.
+do $$
+declare
+  v_role    uuid;
+  v_res     jsonb;
+  v_link    uuid;
+  v_link2   uuid;
+  v_score   uuid;
+  v_stage   uuid;
+  v_lease   uuid;
+  v_map     jsonb;
+  v_mapid   uuid;
+  v_marker  text := repeat('a', 16);
+begin
+  select id into v_role from screening_v2.roles limit 1;
+  if v_role is null then
+    perform _policy_tests.assert('ashby 0031 functional: seed role present', false, 'no seed role available');
+    return;
+  end if;
+
+  insert into screening_v2.ashby_application_links (external_application_id)
+    values ('pol31-app') returning id into v_link;
+
+  -- A. Idempotent outbox: insert, duplicate key, duplicate marker.
+  v_res := screening_v2.enqueue_ashby_operation(v_link, 'scorecard_write', 'pol31-score', null, v_marker, gen_random_uuid());
+  perform _policy_tests.assert('ashby 0031: enqueue scorecard inserted',
+    v_res->>'status' = 'inserted', 'got ' || coalesce(v_res->>'status','null'));
+  v_score := (v_res->>'id')::uuid;
+
+  v_res := screening_v2.enqueue_ashby_operation(v_link, 'scorecard_write', 'pol31-score', null, null, gen_random_uuid());
+  perform _policy_tests.assert('ashby 0031: duplicate operation_key deduped',
+    v_res->>'status' = 'duplicate', 'got ' || coalesce(v_res->>'status','null'));
+
+  v_res := screening_v2.enqueue_ashby_operation(v_link, 'scorecard_write', 'pol31-score-2', null, v_marker, gen_random_uuid());
+  perform _policy_tests.assert('ashby 0031: duplicate marker rejected (scorecard idempotency)',
+    v_res->>'status' = 'duplicate_marker', 'got ' || coalesce(v_res->>'status','null'));
+
+  v_res := screening_v2.enqueue_ashby_operation(v_link, 'stage_move', 'pol31-stage', v_score, null, gen_random_uuid());
+  perform _policy_tests.assert('ashby 0031: enqueue stage_move inserted',
+    v_res->>'status' = 'inserted', 'got ' || coalesce(v_res->>'status','null'));
+  v_stage := (v_res->>'id')::uuid;
+
+  -- B. Scorecard-before-stage AT CLAIM: stage not claimable before scorecard succeeds.
+  v_res := screening_v2.claim_ashby_operation('stage_move', 'w1', 30);
+  perform _policy_tests.assert('ashby 0031: stage_move not claimable before scorecard succeeds',
+    v_res->>'status' = 'empty', 'got ' || coalesce(v_res->>'status','null'));
+
+  -- C. Lease claim + CAS complete (stale lease rejected).
+  v_res := screening_v2.claim_ashby_operation('scorecard_write', 'w1', 30);
+  perform _policy_tests.assert('ashby 0031: scorecard claimed under lease',
+    v_res->>'status' = 'claimed' and (v_res->>'id')::uuid = v_score,
+    'got ' || coalesce(v_res->>'status','null'));
+  v_lease := (v_res->>'lease_token')::uuid;
+
+  perform _policy_tests.assert('ashby 0031: complete with wrong lease is not_owned',
+    (screening_v2.complete_ashby_operation(v_score, gen_random_uuid(), 'anchor_x', null, gen_random_uuid()))->>'status' = 'not_owned',
+    'stale lease must not commit');
+
+  v_res := screening_v2.complete_ashby_operation(v_score, v_lease, 'anchor_x', null, gen_random_uuid());
+  perform _policy_tests.assert('ashby 0031: complete with live lease ok + anchor persisted',
+    v_res->>'status' = 'ok'
+    and (select external_anchor from screening_v2.ashby_operations where id = v_score) = 'anchor_x',
+    'got ' || coalesce(v_res->>'status','null'));
+
+  -- D. Now the stage_move is claimable (dependency succeeded); retryable fail reschedules.
+  v_res := screening_v2.claim_ashby_operation('stage_move', 'w1', 30);
+  perform _policy_tests.assert('ashby 0031: stage_move claimable after scorecard success',
+    v_res->>'status' = 'claimed', 'got ' || coalesce(v_res->>'status','null'));
+  v_lease := (v_res->>'lease_token')::uuid;
+  v_res := screening_v2.fail_ashby_operation(v_stage, v_lease, 'transient_x', true);
+  perform _policy_tests.assert('ashby 0031: retryable fail reschedules to pending',
+    v_res->>'outcome' = 'retry'
+    and (select state from screening_v2.ashby_operations where id = v_stage) = 'pending',
+    'got ' || coalesce(v_res->>'outcome','null'));
+
+  -- E. Restart-safe ingestion advance: legal move ok, illegal move rejected.
+  insert into screening_v2.ashby_resume_ingestions (application_link_id) values (v_link)
+    on conflict (application_link_id) do nothing;
+  v_res := screening_v2.advance_ashby_ingestion(v_link, 'fetching', null, null, null, null);
+  perform _policy_tests.assert('ashby 0031: ingestion queued->fetching ok',
+    v_res->>'status' = 'ok', 'got ' || coalesce(v_res->>'status','null'));
+  v_res := screening_v2.advance_ashby_ingestion(v_link, 'ready', null, null, null, null);
+  perform _policy_tests.assert('ashby 0031: illegal ingestion transition rejected',
+    v_res->>'status' = 'invalid_transition', 'got ' || coalesce(v_res->>'status','null'));
+
+  -- F. Atomic terminal cancellation on a fresh link with in-flight work.
+  insert into screening_v2.ashby_application_links (external_application_id)
+    values ('pol31-app2') returning id into v_link2;
+  perform screening_v2.enqueue_ashby_operation(v_link2, 'invite_delivery', 'pol31-inv2', null, null, gen_random_uuid());
+  insert into screening_v2.ashby_resume_ingestions (application_link_id) values (v_link2)
+    on conflict (application_link_id) do nothing;
+  v_res := screening_v2.cancel_ashby_application(v_link2, 'withdrawn', 'candidate_withdrew', gen_random_uuid(), 'recruiter');
+  perform _policy_tests.assert('ashby 0031: terminal cancel cancels in-flight op + ingestion',
+    v_res->>'status' = 'ok'
+    and (v_res->>'cancelled_operations')::int >= 1
+    and (v_res->>'cancelled_ingestion')::int >= 1,
+    'got ' || coalesce(v_res::text,'null'));
+  v_res := screening_v2.cancel_ashby_application(v_link2, 'withdrawn', null, gen_random_uuid(), 'recruiter');
+  perform _policy_tests.assert('ashby 0031: terminal cancel is idempotent',
+    v_res->>'status' = 'already_terminal', 'got ' || coalesce(v_res->>'status','null'));
+  v_res := screening_v2.enqueue_ashby_operation(v_link2, 'stage_move', 'pol31-after-terminal', null, null, gen_random_uuid());
+  perform _policy_tests.assert('ashby 0031: enqueue on terminal link blocked',
+    v_res->>'status' = 'blocked_terminal', 'got ' || coalesce(v_res->>'status','null'));
+
+  -- G. Mission Control pause/resume gate.
+  v_map := screening_v2.upsert_ashby_job_mapping(
+    null::uuid, 'pol31-job', v_role, 'ai_x', 'ta_x', null::text, null::text, null::text,
+    gen_random_uuid(), 'both', 24, 'enabled', null::text, gen_random_uuid());
+  v_mapid := (v_map->>'id')::uuid;
+  v_res := screening_v2.set_ashby_mapping_status(v_mapid, 'paused', 'mc_pause', gen_random_uuid());
+  perform _policy_tests.assert('ashby 0031: mapping pause ok',
+    v_res->>'status' = 'ok'
+    and (select status from screening_v2.ashby_job_mappings where id = v_mapid) = 'paused',
+    'got ' || coalesce(v_res->>'status','null'));
+
+  v_map := screening_v2.upsert_ashby_job_mapping(
+    null::uuid, 'pol31-job-incomplete', v_role, 'ai_only', null::text, null::text, null::text, null::text,
+    gen_random_uuid(), 'manual', 24, 'paused', null::text, gen_random_uuid());
+  v_res := screening_v2.set_ashby_mapping_status((v_map->>'id')::uuid, 'enabled', null, gen_random_uuid());
+  perform _policy_tests.assert('ashby 0031: incomplete mapping cannot be resumed to enabled',
+    v_res->>'status' = 'incomplete_cannot_enable', 'got ' || coalesce(v_res->>'status','null'));
+
+  -- Cleanup (link deletes cascade operations + ingestions).
+  delete from screening_v2.ashby_application_links where external_application_id in ('pol31-app','pol31-app2');
+  delete from screening_v2.ashby_job_mappings where external_job_id in ('pol31-job','pol31-job-incomplete');
+end;
+$$;
+
+-- ═══════════════════════════════════════════════════════════════════════
 -- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)
 -- ═══════════════════════════════════════════════════════════════════════
 

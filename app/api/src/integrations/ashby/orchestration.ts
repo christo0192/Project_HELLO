@@ -1,0 +1,332 @@
+/**
+ * ashby/orchestration.ts — disabled-by-default workflow orchestrators that
+ * COMPOSE the pure domain modules (workflow / resume-fetch / resume-ingestion /
+ * invite-delivery / scorecard) with injected persistence + client seams into
+ * the four executable stages of the Ashby screening workflow:
+ *
+ *   1. runImport            — re-read application.info → decideImport → resolve
+ *                             identity → create/reuse link → seed ingestion +
+ *                             per-mode invite delivery ops.
+ *   2. runIngestionJob      — file.info → SSRF-hardened ephemeral fetch → scan →
+ *                             parse → structure, advancing the ingestion state
+ *                             machine through the durable store.
+ *   3. runInviteDelivery    — issue/reuse one active invite; manual channel is a
+ *                             token-free recruiter reissue link; email is
+ *                             provider-gated; delivery is an idempotent op.
+ *   4. runScorecardStageSaga— scorecard_write (idempotent by marker) → persist
+ *                             external anchor → stage_move ONLY if still at the
+ *                             mapped AI stage; human move cancels; scorecard
+ *                             success + stage failure retries the stage only; no
+ *                             auto-reject.
+ *
+ * Every side effect goes through an injected seam (`WorkflowStores`,
+ * `ApplicationReader`, gates), so the whole matrix — including every failure
+ * branch — is driven by synthetic adapters with zero real network/DB/provider.
+ * Real Ashby mutations + email remain gated OFF; the code paths are complete.
+ */
+
+import { decideImport, type MappingActivity, type ApplicationView, type ImportDecision } from './workflow.js';
+import { extractApplicationInfo } from './extractors.js';
+import { runResumeIngestion, type IngestionPorts, type IngestionOutcome } from './resume-ingestion.js';
+import {
+  channelsForMode,
+  decideInviteIssue,
+  buildManualDelivery,
+  decideEmailSend,
+  inviteDeliveryOperationKey,
+  type DeliveryMode,
+  type ActiveInviteView,
+  type EmailProviderState,
+} from './invite-delivery.js';
+import { buildScorecard, type ScorecardSource, type ScorecardScale } from './scorecard.js';
+import type { AshbyResult, OpaqueRecord } from './types.js';
+
+// ── Injected seams ───────────────────────────────────────────────────────────
+
+/** Narrow reader over the authoritative Ashby client (application.info). */
+export interface ApplicationReader {
+  applicationInfo<T = OpaqueRecord>(applicationId: string): Promise<AshbyResult<T>>;
+}
+
+export interface ExistingLinkRow {
+  id: string;
+  externalApplicationId: string;
+  terminalState?: 'withdrawn' | 'deleted' | 'manual_stage_cancel' | null;
+}
+
+export interface EnqueueResult {
+  status: 'inserted' | 'duplicate' | 'duplicate_marker' | 'blocked_terminal' | string;
+  id?: string;
+}
+
+export interface OperationClaimRow {
+  id: string;
+  operationType: 'invite_delivery' | 'scorecard_write' | 'stage_move';
+  applicationLinkId: string;
+  leaseToken: string;
+  attempts: number;
+  maxAttempts: number;
+  marker: string | null;
+}
+
+/** Durable persistence for the workflow (0029/0031 tables + RPCs). */
+export interface WorkflowStores {
+  findLinkByApplicationId(externalApplicationId: string): Promise<ExistingLinkRow | null>;
+  createLink(input: {
+    externalApplicationId: string;
+    externalJobId: string;
+    externalStageId: string;
+    jobMappingId: string | null;
+    externalResumeFileHandle: string | null;
+  }): Promise<{ id: string }>;
+  advanceIngestion(
+    applicationLinkId: string,
+    nextState: string,
+    provenance?: { contentSha256?: string; extractorVersion?: string; structurerVersion?: string; failedReason?: string },
+  ): Promise<{ status: string; state?: string }>;
+  enqueueOperation(input: {
+    applicationLinkId: string;
+    operationType: 'invite_delivery' | 'scorecard_write' | 'stage_move';
+    operationKey: string;
+    dependsOn?: string | null;
+    marker?: string | null;
+  }): Promise<EnqueueResult>;
+  completeOperation(id: string, leaseToken: string, externalAnchor?: string | null, marker?: string | null): Promise<'ok' | 'not_owned'>;
+  failOperation(id: string, leaseToken: string, errorCode: string, retryable: boolean): Promise<{ outcome: 'retry' | 'failed' } | 'not_owned'>;
+}
+
+/** Mapping activity + tenant config resolved for a job. */
+export interface ResolvedMapping extends MappingActivity {
+  id: string | null;
+  deliveryMode: DeliveryMode;
+  externalResumeFileHandleFromApp?: string | null;
+}
+
+export interface OrchestrationGates {
+  /** Master integration switch. When false, orchestrators no-op with 'disabled'. */
+  enabled: boolean;
+  /** Email provider gate. */
+  email: EmailProviderState;
+}
+
+// ── 1. Import orchestrator ───────────────────────────────────────────────────
+
+export type ImportResult =
+  | { status: 'imported'; applicationLinkId: string; reused: boolean; decision: ImportDecision }
+  | { status: 'skipped'; reason: string }
+  | { status: 'disabled' };
+
+export interface ImportDeps {
+  gates: OrchestrationGates;
+  client: ApplicationReader;
+  stores: WorkflowStores;
+  /** Resolve mapping activity + config for the re-read job id. */
+  resolveMapping(jobId: string): Promise<ResolvedMapping>;
+  /** Read the app's resume file handle from the authoritative info (opaque). */
+  readResumeFileHandle?(info: unknown): string | null;
+}
+
+/**
+ * Import one application by its opaque id. Re-reads the authoritative
+ * application.info, applies {@link decideImport}, then (on eligibility) resolves
+ * the application-id-only identity, creates/reuses exactly one link, seeds the
+ * ingestion row, and enqueues the per-delivery-mode invite operation(s).
+ */
+export async function runImport(externalApplicationId: string, deps: ImportDeps): Promise<ImportResult> {
+  if (!deps.gates.enabled) return { status: 'disabled' };
+
+  const info = await deps.client.applicationInfo(externalApplicationId);
+  const view: ApplicationView = extractApplicationInfo(info.results);
+  const appId = view.applicationId ?? externalApplicationId;
+
+  const existing = await deps.stores.findLinkByApplicationId(appId);
+  if (existing?.terminalState) return { status: 'skipped', reason: 'terminal' };
+
+  const jobId = view.jobId;
+  if (!jobId) return { status: 'skipped', reason: 'no_job' };
+  const mapping = await deps.resolveMapping(jobId);
+
+  const decision = decideImport(view, mapping, existing?.terminalState ?? null);
+  if (decision.action !== 'import') return { status: 'skipped', reason: decision.reason };
+
+  // Application-id-only identity: reuse the existing non-terminal link or create one.
+  let linkId: string;
+  let reused: boolean;
+  if (existing && existing.externalApplicationId === appId) {
+    linkId = existing.id;
+    reused = true;
+  } else {
+    const created = await deps.stores.createLink({
+      externalApplicationId: appId,
+      externalJobId: jobId,
+      externalStageId: decision.stageId,
+      jobMappingId: mapping.id,
+      externalResumeFileHandle: deps.readResumeFileHandle?.(info.results) ?? null,
+    });
+    linkId = created.id;
+    reused = false;
+  }
+
+  // Seed the ingestion row (idempotent) and enqueue invite delivery per mode.
+  await deps.stores.advanceIngestion(linkId, 'queued');
+  const channels = channelsForMode(mapping.deliveryMode);
+  if (channels.email) {
+    await deps.stores.enqueueOperation({
+      applicationLinkId: linkId,
+      operationType: 'invite_delivery',
+      operationKey: inviteDeliveryOperationKey({ externalApplicationId: appId, channel: 'email', inviteId: 'pending' }),
+    });
+  }
+  if (channels.manual) {
+    await deps.stores.enqueueOperation({
+      applicationLinkId: linkId,
+      operationType: 'invite_delivery',
+      operationKey: inviteDeliveryOperationKey({ externalApplicationId: appId, channel: 'manual', inviteId: 'pending' }),
+    });
+  }
+
+  return { status: 'imported', applicationLinkId: linkId, reused, decision };
+}
+
+// ── 2. Ingestion job orchestrator ────────────────────────────────────────────
+
+export type IngestionJobResult =
+  | { status: 'done'; outcome: IngestionOutcome }
+  | { status: 'disabled' }
+  | { status: 'no_resume' };
+
+export interface IngestionJobDeps {
+  gates: OrchestrationGates;
+  stores: WorkflowStores;
+  /** Build the ephemeral ingestion ports (fetch/scan/guard/parse/fallback). */
+  buildIngestionPorts(input: {
+    applicationLinkId: string;
+    onState: IngestionPorts['onState'];
+  }): IngestionPorts | null;
+  /** Poll: has the application become terminal since the job started? */
+  isCancelled(applicationLinkId: string): Promise<boolean>;
+}
+
+/**
+ * Run the ephemeral ingestion for one link, wiring each state emission through
+ * the durable `advanceIngestion` store so restarts resume from the last state.
+ */
+export async function runIngestionJob(applicationLinkId: string, deps: IngestionJobDeps): Promise<IngestionJobResult> {
+  if (!deps.gates.enabled) return { status: 'disabled' };
+  const ports = deps.buildIngestionPorts({
+    applicationLinkId,
+    onState: async (state, provenance) => {
+      await deps.stores.advanceIngestion(applicationLinkId, state, provenance);
+    },
+  });
+  if (!ports) return { status: 'no_resume' };
+  const outcome = await runResumeIngestion(ports, () => deps.isCancelled(applicationLinkId));
+  return { status: 'done', outcome };
+}
+
+// ── 3. Invite delivery orchestrator ──────────────────────────────────────────
+
+export type InviteDeliveryResult =
+  | { status: 'issued' | 'reused'; channel: 'email' | 'manual'; delivery: 'sent' | 'blocked_provider' | 'manual_reissue' }
+  | { status: 'blocked_terminal' }
+  | { status: 'disabled' };
+
+export interface InviteDeliveryDeps {
+  gates: OrchestrationGates;
+  /** Existing active invite for the application (if any). */
+  existingActiveInvite: ActiveInviteView | null;
+  applicationTerminal: boolean;
+  externalApplicationId: string;
+  /** Site-relative recruiter reissue path for the manual channel. */
+  recruiterReissuePath: string;
+}
+
+/** Decide+shape one channel's invite delivery (no real send; gated). */
+export function runInviteDelivery(channel: 'email' | 'manual', deps: InviteDeliveryDeps): InviteDeliveryResult {
+  if (!deps.gates.enabled) return { status: 'disabled' };
+  const decision = decideInviteIssue(deps.existingActiveInvite, deps.applicationTerminal);
+  if (decision.action === 'blocked_terminal') return { status: 'blocked_terminal' };
+  const status = decision.action === 'reuse_active' ? 'reused' : 'issued';
+
+  if (channel === 'email') {
+    const send = decideEmailSend(deps.gates.email);
+    return { status, channel, delivery: send.action === 'send' ? 'sent' : 'blocked_provider' };
+  }
+  // Manual channel: token-free recruiter reissue indirection only.
+  const manual = buildManualDelivery({
+    externalApplicationId: deps.externalApplicationId,
+    recruiterReissuePath: deps.recruiterReissuePath,
+  });
+  // A malformed path is surfaced as blocked; never a fabricated send.
+  return { status, channel, delivery: manual.ok ? 'manual_reissue' : 'blocked_provider' };
+}
+
+// ── 4. Scorecard → stage saga ────────────────────────────────────────────────
+
+export type SagaResult =
+  | { status: 'scorecard_enqueued' | 'scorecard_duplicate'; marker: string }
+  | { status: 'stage_enqueued' }
+  | { status: 'stage_skipped'; reason: 'not_ai_stage' | 'human_moved' | 'scorecard_unconfirmed' }
+  | { status: 'blocked_scorecard'; reason: string }
+  | { status: 'disabled' };
+
+export interface SagaDeps {
+  gates: OrchestrationGates;
+  stores: WorkflowStores;
+  client: ApplicationReader;
+  scale: ScorecardScale;
+  applicationLinkId: string;
+  externalApplicationId: string;
+  /** The mapping's current AI screening stage id (for the re-read guard). */
+  aiScreeningStageId: string;
+  /** The scorecard_write operation id (if already enqueued) for the dependency. */
+}
+
+/**
+ * Phase 1 of the saga: build the redaction-safe scorecard and enqueue the
+ * idempotent scorecard_write op (keyed by content marker). A matching marker
+ * short-circuits (already written).
+ */
+export async function enqueueScorecard(source: ScorecardSource, deps: SagaDeps): Promise<SagaResult> {
+  if (!deps.gates.enabled) return { status: 'disabled' };
+  const built = buildScorecard(source, deps.scale);
+  if (!built.ok) return { status: 'blocked_scorecard', reason: built.reason };
+  const res = await deps.stores.enqueueOperation({
+    applicationLinkId: deps.applicationLinkId,
+    operationType: 'scorecard_write',
+    operationKey: `ashby:scorecard:${deps.externalApplicationId}:${built.marker}`,
+    marker: built.marker,
+  });
+  if (res.status === 'inserted') return { status: 'scorecard_enqueued', marker: built.marker };
+  if (res.status === 'duplicate' || res.status === 'duplicate_marker') {
+    return { status: 'scorecard_duplicate', marker: built.marker };
+  }
+  return { status: 'blocked_scorecard', reason: res.status };
+}
+
+/**
+ * Phase 2 of the saga: enqueue the stage_move ONLY after re-reading the
+ * authoritative application and confirming it is STILL at the mapped AI stage
+ * (a human move away → skip, never undo). The stage op depends on the scorecard
+ * op so it cannot run before the scorecard succeeds.
+ */
+export async function enqueueStageMove(
+  scorecardOperationId: string,
+  deps: SagaDeps,
+): Promise<SagaResult> {
+  if (!deps.gates.enabled) return { status: 'disabled' };
+  const info = await deps.client.applicationInfo(deps.externalApplicationId);
+  const view = extractApplicationInfo(info.results);
+  if (!view.currentStageId || view.currentStageId !== deps.aiScreeningStageId) {
+    // A human/TA moved the application away from the AI stage — never undo it.
+    return { status: 'stage_skipped', reason: 'human_moved' };
+  }
+  const res = await deps.stores.enqueueOperation({
+    applicationLinkId: deps.applicationLinkId,
+    operationType: 'stage_move',
+    operationKey: `ashby:stage:${deps.externalApplicationId}:${deps.aiScreeningStageId}`,
+    dependsOn: scorecardOperationId,
+  });
+  if (res.status === 'inserted' || res.status === 'duplicate') return { status: 'stage_enqueued' };
+  return { status: 'stage_skipped', reason: 'scorecard_unconfirmed' };
+}

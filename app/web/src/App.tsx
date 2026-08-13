@@ -58,6 +58,10 @@ const MissionControlPage = lazyPage(
   () => import('./pages/MissionControlPage'),
   'MissionControlPage',
 );
+const AshbyMissionControlPage = lazyPage(
+  () => import('./pages/AshbyMissionControlPage'),
+  'AshbyMissionControlPage',
+);
 
 /**
  * Single catch-all: authenticated users return to the dashboard (the old
@@ -111,6 +115,7 @@ export default function App() {
           <Route element={<Layout />}>
             <Route path="/admin" element={<Navigate to="/mission-control" replace />} />
             <Route path="/mission-control" element={<MissionControlPage />} />
+            <Route path="/ashby-mission-control" element={<AshbyMissionControlPage />} />
           </Route>
         </Route>
 

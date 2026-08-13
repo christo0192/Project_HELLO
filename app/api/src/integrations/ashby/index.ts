@@ -130,6 +130,41 @@ export {
   type CancelCheck,
 } from './resume-ingestion.js';
 export {
+  runImport,
+  runIngestionJob,
+  runInviteDelivery,
+  enqueueScorecard,
+  enqueueStageMove,
+  type ApplicationReader,
+  type WorkflowStores,
+  type ResolvedMapping,
+  type OrchestrationGates,
+  type ExistingLinkRow,
+  type EnqueueResult,
+  type OperationClaimRow,
+  type ImportDeps,
+  type ImportResult,
+  type IngestionJobDeps,
+  type IngestionJobResult,
+  type InviteDeliveryDeps,
+  type InviteDeliveryResult,
+  type SagaDeps,
+  type SagaResult,
+} from './orchestration.js';
+export {
+  createWorkflowStores,
+  createMissionControlStore,
+  type MissionControlStore,
+  type MissionControlMapping,
+  type MissionControlWorkflow,
+} from './workflow-stores.js';
+export {
+  createPinnedHttpsTransport,
+  classifyStatus,
+  pinnedLookup,
+  type PinnedTransportOptions,
+} from './resume-transport.js';
+export {
   buildScorecard,
   bindFeedbackForm,
   mapOverallToScale,
