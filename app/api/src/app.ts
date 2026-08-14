@@ -21,6 +21,7 @@ import { candidateConsentRouter } from './routes/candidate-consent.js';
 import { notificationsRouter } from './routes/notifications.js';
 import { exportRouter } from './routes/export.js';
 import { appealsRouter } from './routes/appeals.js';
+import { ashbyWebhookRouter } from './routes/ashby-webhook.js';
 import {
   malformedJsonHandler,
   oversizedJsonHandler,
@@ -208,6 +209,13 @@ export function createApp(opts: CreateAppOptions = {}) {
   // recruiter auth because it uses a separate constant-time shared-secret
   // boundary and is still covered by the global per-IP limiter.
   app.use('/api/internal/assess', workerAssessRouter);
+
+  // Inbound Ashby webhook receiver. Mounted before recruiter auth because its
+  // trust boundary is the HMAC-SHA256 Ashby-Signature verified over the raw
+  // request bytes (not a recruiter session). It reads the raw body itself and
+  // is still covered by the global per-IP limiter. Disabled by default: it
+  // fails closed (503) unless ASHBY_INTEGRATION_ENABLED + a secret are set.
+  app.use('/api/integrations/ashby', ashbyWebhookRouter);
 
   // ── Auth middleware: runs after CORS so preflight succeeds ─────
   // Uses DI seam when authDeps is provided (tests).

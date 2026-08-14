@@ -499,6 +499,64 @@ paths:
               schema:
                 $ref: '#/components/schemas/WorkerContextError'
 
+  # ── Ashby integration ──────────────────────────────────────────────
+  /api/integrations/ashby/webhook:
+    post:
+      tags: [ashby]
+      operationId: receiveAshbyWebhook
+      summary: Receive an Ashby webhook verified by HMAC-SHA256 over the raw body
+      description: Inbound Ashby webhook receiver. The only trust boundary is the Ashby-Signature header verified as an HMAC-SHA256 of the exact raw request bytes before JSON parsing. Not recruiter authenticated. Disabled by default and fails closed until the integration flag and secret are configured.
+      parameters:
+        - name: Ashby-Signature
+          in: header
+          required: true
+          description: HMAC-SHA256 of the raw request body as sha256 equals hex.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Signal durably received, or a duplicate delivery acknowledged.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyWebhookAck'
+        '400':
+          description: Malformed signature or body, or an unusable payload (non-retryable).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyWebhookError'
+        '401':
+          description: Signature header missing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyWebhookError'
+        '403':
+          description: Signature did not verify.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyWebhookError'
+        '413':
+          description: Raw body exceeded the byte bound.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyWebhookError'
+        '500':
+          description: Durable ingress failed and is retryable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyWebhookError'
+        '503':
+          description: Integration disabled or secret not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyWebhookError'
+
   # ── LiveKit ────────────────────────────────────────────────────────
   /api/livekit/start:
     post:
@@ -2543,6 +2601,26 @@ components:
       properties:
         ok:
           type: boolean
+      additionalProperties: false
+
+    AshbyWebhookAck:
+      type: object
+      required: [ok, status]
+      properties:
+        ok:
+          type: boolean
+        status:
+          type: string
+      additionalProperties: false
+
+    AshbyWebhookError:
+      type: object
+      required: [ok, error]
+      properties:
+        ok:
+          type: boolean
+        error:
+          type: string
       additionalProperties: false
 
     # ── Roles / candidates ───────────────────────────────────────────

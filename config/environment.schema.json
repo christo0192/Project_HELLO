@@ -51,7 +51,9 @@
         "RESUME_SCANNER_TIMEOUT_MS": { "requiredInProduction": false, "secret": false },
         "RESUME_MAX_COMPRESSED_BYTES": { "requiredInProduction": false, "secret": false },
         "RESUME_PARSER_TIMEOUT_MS": { "requiredInProduction": false, "secret": false },
-        "RESUME_MAX_TEXT_LENGTH": { "requiredInProduction": false, "secret": false }
+        "RESUME_MAX_TEXT_LENGTH": { "requiredInProduction": false, "secret": false },
+        "ASHBY_INTEGRATION_ENABLED": { "requiredInProduction": false, "secret": false },
+        "ASHBY_WEBHOOK_SECRET": { "requiredInProduction": false, "secret": true, "external": true }
       }
     },
     "web": {
