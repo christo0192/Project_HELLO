@@ -17,6 +17,9 @@ import type {
   AdminAllowlistListResponse,
   AdminAllowlistUpdateInput,
   AdminAllowlistUpdateResponse,
+  AshbyMcMappingsResponse,
+  AshbyMcWorkflowsResponse,
+  AshbyMcActionResponse,
   AdminMaintenanceInput,
   AdminAuditListResponse,
   AdminMember,
@@ -373,5 +376,31 @@ export const api = {
     request<AdminAllowlistUpdateResponse>(`/api/admin/allowlist/${id}`, {
       method: 'PATCH',
       body: JSON.stringify(body),
+    }),
+
+  // ── Ashby Mission Control ────────────────────────────────────────
+  listAshbyMappings: () =>
+    request<AshbyMcMappingsResponse>('/api/integrations/ashby/mission-control/mappings'),
+  listAshbyWorkflows: () =>
+    request<AshbyMcWorkflowsResponse>('/api/integrations/ashby/mission-control/workflows'),
+  pauseAshbyMapping: (id: string, reason?: string) =>
+    request<AshbyMcActionResponse>(`/api/integrations/ashby/mission-control/mappings/${id}/pause`, {
+      method: 'POST',
+      body: JSON.stringify({ reason }),
+    }),
+  resumeAshbyMapping: (id: string) =>
+    request<AshbyMcActionResponse>(`/api/integrations/ashby/mission-control/mappings/${id}/resume`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    }),
+  cancelAshbyWorkflow: (id: string, terminalState: string, reason?: string) =>
+    request<AshbyMcActionResponse>(`/api/integrations/ashby/mission-control/workflows/${id}/cancel`, {
+      method: 'POST',
+      body: JSON.stringify({ terminal_state: terminalState, reason }),
+    }),
+  retryAshbyOperation: (id: string) =>
+    request<AshbyMcActionResponse>(`/api/integrations/ashby/mission-control/operations/${id}/retry`, {
+      method: 'POST',
+      body: JSON.stringify({}),
     }),
 };

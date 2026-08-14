@@ -1,0 +1,89 @@
+import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { AshbyMissionControlPage } from './AshbyMissionControlPage';
+
+const { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation } = vi.hoisted(() => ({
+  listAshbyMappings: vi.fn(),
+  listAshbyWorkflows: vi.fn(),
+  pauseAshbyMapping: vi.fn(),
+  resumeAshbyMapping: vi.fn(),
+  cancelAshbyWorkflow: vi.fn(),
+  retryAshbyOperation: vi.fn(),
+}));
+
+vi.mock('../api', () => ({
+  api: { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation },
+  ApiError: class ApiError extends Error {
+    status: number;
+    constructor(m: string, s: number) { super(m); this.status = s; }
+  },
+}));
+
+const MAPPINGS = {
+  ok: true,
+  mappings: [
+    { id: 'm1', externalJobId: 'job_1', status: 'enabled', statusReason: null, deliveryMode: 'both', hasAiStage: true, hasTaStage: true, label: null, updatedAt: '2026-08-13T00:00:00Z' },
+    { id: 'm2', externalJobId: 'job_2', status: 'drift', statusReason: 'stage_id_invalid', deliveryMode: 'manual', hasAiStage: true, hasTaStage: false, label: null, updatedAt: '2026-08-13T00:00:00Z' },
+  ],
+};
+const WORKFLOWS = {
+  ok: true,
+  workflows: [
+    { applicationLinkId: 'l1', externalApplicationId: 'app_1', externalJobId: 'job_1', lifecycle: 'processing', terminalState: null, ingestionState: 'failed_review', operations: [{ id: 'op1', type: 'stage_move', state: 'failed', errorCode: 'transient_x' }], updatedAt: '2026-08-13T00:00:00Z' },
+  ],
+};
+
+describe('AshbyMissionControlPage', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    listAshbyMappings.mockResolvedValue(MAPPINGS);
+    listAshbyWorkflows.mockResolvedValue(WORKFLOWS);
+    pauseAshbyMapping.mockResolvedValue({ ok: true, status: 'paused' });
+    resumeAshbyMapping.mockResolvedValue({ ok: true, status: 'enabled' });
+    cancelAshbyWorkflow.mockResolvedValue({ ok: true, cancelled_operations: 1, cancelled_ingestion: 1 });
+    retryAshbyOperation.mockResolvedValue({ ok: true });
+  });
+
+  it('renders sanitized mappings + workflows (no PII/tokens)', async () => {
+    render(<AshbyMissionControlPage />);
+    expect(await screen.findByText('job_1')).toBeInTheDocument();
+    expect(screen.getByText('drift')).toBeInTheDocument();
+    expect(screen.getByText('app_1')).toBeInTheDocument();
+    expect(screen.getByText(/ingest: failed_review/)).toBeInTheDocument();
+    // No candidate PII / token / URL leaks in the rendered surface.
+    const text = document.body.textContent ?? '';
+    expect(text).not.toMatch(/\S+@\S+\.\S+/); // no email
+    expect(text).not.toMatch(/bearer|presigned|invite_token|resume_url|https?:\/\//i);
+  });
+
+  it('pauses an enabled mapping and reloads', async () => {
+    render(<AshbyMissionControlPage />);
+    await screen.findByText('job_1');
+    const pauseButtons = screen.getAllByRole('button', { name: 'Pause' });
+    await userEvent.click(pauseButtons[0]); // job_1 is enabled → pausable
+    await waitFor(() => expect(pauseAshbyMapping).toHaveBeenCalledWith('m1'));
+    expect(listAshbyMappings).toHaveBeenCalledTimes(2); // initial + reload
+  });
+
+  it('cancels a non-terminal workflow and retries a failed operation', async () => {
+    render(<AshbyMissionControlPage />);
+    await screen.findByText('app_1');
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    await waitFor(() => expect(cancelAshbyWorkflow).toHaveBeenCalledWith('l1', 'manual_stage_cancel'));
+    await userEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(retryAshbyOperation).toHaveBeenCalledWith('op1'));
+  });
+
+  it('surfaces a load error', async () => {
+    listAshbyMappings.mockRejectedValue({ message: 'boom' });
+    render(<AshbyMissionControlPage />);
+    expect(await screen.findByRole('alert')).toBeInTheDocument();
+  });
+
+  it('has no axe violations', async () => {
+    const { container } = render(<AshbyMissionControlPage />);
+    await screen.findByText('job_1');
+    await expect(container).toHaveNoViolations();
+  });
+});

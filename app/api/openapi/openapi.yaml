@@ -557,6 +557,219 @@ paths:
               schema:
                 $ref: '#/components/schemas/AshbyWebhookError'
 
+  # ── Ashby Mission Control (recruiter/admin authenticated) ───────────
+  /api/integrations/ashby/mission-control/mappings:
+    get:
+      tags: [ashby]
+      operationId: listAshbyMappings
+      summary: List Ashby job mappings for Mission Control
+      description: Sanitized job-mapping projections (status incl. paused/drift, delivery mode, completeness) for HR/admin review. Interviewer role or above. No PII or tokens.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Maximum rows to return (bounded).
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Sanitized mapping list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcMappingsResponse'
+  /api/integrations/ashby/mission-control/workflows:
+    get:
+      tags: [ashby]
+      operationId: listAshbyWorkflows
+      summary: List Ashby application workflows for Mission Control
+      description: Sanitized application-workflow projections (lifecycle, terminal, ingestion state, operation states and sanitized error codes) for HR/admin review. Interviewer role or above. No candidate PII, tokens, or presigned URLs.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Maximum rows to return (bounded).
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Sanitized workflow list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcWorkflowsResponse'
+  /api/integrations/ashby/mission-control/mappings/{id}/pause:
+    post:
+      tags: [ashby]
+      operationId: pauseAshbyMapping
+      summary: Pause an Ashby job mapping
+      description: Admin-only. Pauses a mapping so no further applications are processed. Audited and race-safe inside the RPC.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Mapping paused.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcActionResponse'
+        '400':
+          description: Invalid mapping id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+        '404':
+          description: Mapping not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+        '409':
+          description: Action rejected by the mapping gate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+  /api/integrations/ashby/mission-control/mappings/{id}/resume:
+    post:
+      tags: [ashby]
+      operationId: resumeAshbyMapping
+      summary: Resume (enable) an Ashby job mapping
+      description: Admin-only. Enables a mapping only when it is complete (both stage ids) and not drifted; otherwise 409. Audited and race-safe inside the RPC.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Mapping resumed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcActionResponse'
+        '400':
+          description: Invalid mapping id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+        '404':
+          description: Mapping not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+        '409':
+          description: Cannot enable an incomplete or drifted mapping.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+  /api/integrations/ashby/mission-control/workflows/{id}/cancel:
+    post:
+      tags: [ashby]
+      operationId: cancelAshbyWorkflow
+      summary: Terminal-cancel an Ashby application workflow
+      description: Admin-only atomic terminal cancellation — marks the application link terminal and cancels every in-flight operation and the in-flight ingestion in one transaction. Idempotent. Never reverses succeeded work or auto-rejects.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                terminal_state:
+                  type: string
+                  enum: [withdrawn, deleted, manual_stage_cancel]
+                reason:
+                  type: string
+              additionalProperties: false
+      responses:
+        '200':
+          description: Application terminal-cancelled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcCancelResponse'
+        '400':
+          description: Invalid workflow id or terminal state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+        '404':
+          description: Workflow not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+        '409':
+          description: Workflow already terminal.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+  /api/integrations/ashby/mission-control/operations/{id}/retry:
+    post:
+      tags: [ashby]
+      operationId: retryAshbyOperation
+      summary: Retry a failed Ashby operation
+      description: Admin-only. Resets a failed safe operation back to pending for a bounded retry. No-op (409) if the operation is not in a retryable state.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Operation re-queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcRetryResponse'
+        '400':
+          description: Invalid operation id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+        '409':
+          description: Operation not in a retryable state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+
   # ── LiveKit ────────────────────────────────────────────────────────
   /api/livekit/start:
     post:
@@ -2614,6 +2827,143 @@ components:
       additionalProperties: false
 
     AshbyWebhookError:
+      type: object
+      required: [ok, error]
+      properties:
+        ok:
+          type: boolean
+        error:
+          type: string
+      additionalProperties: false
+
+    AshbyMcMapping:
+      type: object
+      required: [id, externalJobId, status, deliveryMode, hasAiStage, hasTaStage, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        externalJobId:
+          type: string
+        status:
+          type: string
+          enum: [paused, enabled, drift]
+        statusReason:
+          type: string
+          nullable: true
+        deliveryMode:
+          type: string
+        hasAiStage:
+          type: boolean
+        hasTaStage:
+          type: boolean
+        label:
+          type: string
+          nullable: true
+        updatedAt:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    AshbyMcMappingsResponse:
+      type: object
+      required: [ok, mappings]
+      properties:
+        ok:
+          type: boolean
+        mappings:
+          type: array
+          items:
+            $ref: '#/components/schemas/AshbyMcMapping'
+      additionalProperties: false
+
+    AshbyMcWorkflowOperation:
+      type: object
+      required: [id, type, state]
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+        state:
+          type: string
+        errorCode:
+          type: string
+          nullable: true
+      additionalProperties: false
+
+    AshbyMcWorkflow:
+      type: object
+      required: [applicationLinkId, externalApplicationId, lifecycle, operations, updatedAt]
+      properties:
+        applicationLinkId:
+          type: string
+          format: uuid
+        externalApplicationId:
+          type: string
+        externalJobId:
+          type: string
+          nullable: true
+        lifecycle:
+          type: string
+        terminalState:
+          type: string
+          nullable: true
+        ingestionState:
+          type: string
+          nullable: true
+        operations:
+          type: array
+          items:
+            $ref: '#/components/schemas/AshbyMcWorkflowOperation'
+        updatedAt:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    AshbyMcWorkflowsResponse:
+      type: object
+      required: [ok, workflows]
+      properties:
+        ok:
+          type: boolean
+        workflows:
+          type: array
+          items:
+            $ref: '#/components/schemas/AshbyMcWorkflow'
+      additionalProperties: false
+
+    AshbyMcActionResponse:
+      type: object
+      required: [ok, status]
+      properties:
+        ok:
+          type: boolean
+        status:
+          type: string
+      additionalProperties: false
+
+    AshbyMcCancelResponse:
+      type: object
+      required: [ok, cancelled_operations, cancelled_ingestion]
+      properties:
+        ok:
+          type: boolean
+        cancelled_operations:
+          type: integer
+        cancelled_ingestion:
+          type: integer
+      additionalProperties: false
+
+    AshbyMcRetryResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+      additionalProperties: false
+
+    AshbyMcError:
       type: object
       required: [ok, error]
       properties:
