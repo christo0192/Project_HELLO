@@ -5,7 +5,7 @@
  * the six sections, lazy section mounting (unvisited sections never fetch),
  * keyboard subnav, dark + reduced-motion render, axe.
  */
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { ReactNode } from 'react';
 import { MemoryRouter } from 'react-router-dom';
@@ -113,24 +113,36 @@ describe('MissionControlPage', () => {
   it('mounts only Overview initially and lazily mounts sections on activation', async () => {
     renderPage();
     await screen.findByRole('tablist', { name: 'Mission Control sections' });
-    // Overview (default) loads its five sources exactly once.
-    expect(apiFns.status).toHaveBeenCalledTimes(1);
-    expect(apiFns.listAdminSessions).toHaveBeenCalledTimes(1);
-    expect(apiFns.listAdminAllowlist).toHaveBeenCalledTimes(1);
-    expect(apiFns.listAdminQuotas).toHaveBeenCalledTimes(1);
-    expect(apiFns.listAdminAudit).toHaveBeenCalledTimes(1);
+    // Overview (default) loads its five sources exactly once. The section's
+    // fetch effect runs AFTER mount (a passive effect), so settle on the mocks
+    // semantically before asserting exact counts — a bare synchronous assertion
+    // races that effect. waitFor still fails a double-fetch regression, because
+    // a second call would push the count to 2 and toHaveBeenCalledTimes(1)
+    // would never pass (waiting until timeout).
+    await waitFor(() => {
+      expect(apiFns.status).toHaveBeenCalledTimes(1);
+      expect(apiFns.listAdminSessions).toHaveBeenCalledTimes(1);
+      expect(apiFns.listAdminAllowlist).toHaveBeenCalledTimes(1);
+      expect(apiFns.listAdminQuotas).toHaveBeenCalledTimes(1);
+      expect(apiFns.listAdminAudit).toHaveBeenCalledTimes(1);
+    });
     // Unvisited sections do not mount, so their own loads never run.
     expect(apiFns.getMe).toHaveBeenCalledTimes(1); // page gate only
 
     fireEvent.click(screen.getByRole('tab', { name: 'Access' }));
     expect(await screen.findByText('Access entries')).toBeInTheDocument();
-    // AccessSection mounts and performs its own read.
-    expect(apiFns.getMe).toHaveBeenCalledTimes(2);
-    expect(apiFns.listAdminAllowlist).toHaveBeenCalledTimes(2);
+    // AccessSection mounts and performs its own read (settle its mount effect
+    // before asserting the exact counts, same passive-effect reason as above).
+    await waitFor(() => {
+      expect(apiFns.getMe).toHaveBeenCalledTimes(2);
+      expect(apiFns.listAdminAllowlist).toHaveBeenCalledTimes(2);
+    });
 
     fireEvent.click(screen.getByRole('tab', { name: 'Quotas' }));
     expect(await screen.findByText('Quota policies')).toBeInTheDocument();
-    expect(apiFns.listAdminQuotas).toHaveBeenCalledTimes(2);
+    await waitFor(() => {
+      expect(apiFns.listAdminQuotas).toHaveBeenCalledTimes(2);
+    });
 
     // Maintenance is still unmounted — its status() read never ran twice.
     expect(apiFns.status).toHaveBeenCalledTimes(1);
