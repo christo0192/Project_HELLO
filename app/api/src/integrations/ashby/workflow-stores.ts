@@ -11,7 +11,13 @@
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
-import type { WorkflowStores, ExistingLinkRow, EnqueueResult } from './orchestration.js';
+import type {
+  RuntimeWorkflowStores,
+  ExistingLinkRow,
+  EnqueueResult,
+  OperationClaimRow,
+  WorkflowLinkRow,
+} from './orchestration.js';
 
 const SYSTEM_ACTOR = '00000000-0000-4000-8000-000000000001';
 
@@ -20,7 +26,7 @@ function statusOf(data: unknown): string {
 }
 
 /** Production WorkflowStores backed by the 0029/0031 tables + RPCs. */
-export function createWorkflowStores(client: SupabaseClient, actorId: string = SYSTEM_ACTOR): WorkflowStores {
+export function createWorkflowStores(client: SupabaseClient, actorId: string = SYSTEM_ACTOR): RuntimeWorkflowStores {
   return {
     async findLinkByApplicationId(externalApplicationId): Promise<ExistingLinkRow | null> {
       const { data, error } = await client
@@ -102,6 +108,77 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
       const outcome = (data as { outcome?: string } | null)?.outcome;
       return { outcome: outcome === 'failed' ? 'failed' : 'retry' };
     },
+    async claimOperation(operationType, owner, leaseSeconds): Promise<OperationClaimRow | null> {
+      const { data, error } = await client.rpc('claim_ashby_operation', {
+        p_operation_type: operationType,
+        p_owner: owner,
+        p_lease_seconds: leaseSeconds,
+      });
+      if (error) throw new Error('ashby_operation_claim_error');
+      const row = data as Record<string, unknown> | null;
+      if (statusOf(data) !== 'claimed') return null;
+      const id = row?.id;
+      const leaseToken = row?.lease_token;
+      const linkId = row?.application_link_id;
+      if (typeof id !== 'string' || typeof leaseToken !== 'string' || typeof linkId !== 'string') {
+        throw new Error('ashby_operation_claim_malformed');
+      }
+      return {
+        id,
+        operationType: row?.operation_type as OperationClaimRow['operationType'],
+        applicationLinkId: linkId,
+        leaseToken,
+        attempts: typeof row?.attempts === 'number' ? row.attempts : 0,
+        maxAttempts: typeof row?.max_attempts === 'number' ? row.max_attempts : 5,
+        marker: typeof row?.marker === 'string' ? row.marker : null,
+      };
+    },
+    async readIngestion(applicationLinkId): Promise<{ state: string; attempts: number } | null> {
+      const { data, error } = await client
+        .from('ashby_resume_ingestions')
+        .select('state, attempts')
+        .eq('provider', 'ashby')
+        .eq('application_link_id', applicationLinkId)
+        .maybeSingle();
+      if (error) throw new Error('ashby_ingestion_read_error');
+      if (!data) return null;
+      const row = data as { state: string; attempts: number };
+      return { state: String(row.state), attempts: Number(row.attempts) || 0 };
+    },
+    async readLink(applicationLinkId): Promise<WorkflowLinkRow | null> {
+      const { data, error } = await client
+        .from('ashby_application_links')
+        .select(
+          'id, external_application_id, external_job_id, job_mapping_id, ' +
+            'candidate_id, session_id, invite_id, lifecycle, terminal_state',
+        )
+        .eq('provider', 'ashby')
+        .eq('id', applicationLinkId)
+        .maybeSingle();
+      if (error) throw new Error('ashby_link_read_error');
+      if (!data) return null;
+      const r = data as unknown as Record<string, unknown>;
+      return {
+        id: String(r.id),
+        externalApplicationId: String(r.external_application_id),
+        externalJobId: (r.external_job_id as string | null) ?? null,
+        jobMappingId: (r.job_mapping_id as string | null) ?? null,
+        candidateId: (r.candidate_id as string | null) ?? null,
+        sessionId: (r.session_id as string | null) ?? null,
+        inviteId: (r.invite_id as string | null) ?? null,
+        lifecycle: String(r.lifecycle),
+        terminalState: (r.terminal_state as WorkflowLinkRow['terminalState']) ?? null,
+      };
+    },
+    async markWritebackPending(applicationLinkId, reason): Promise<{ status: string }> {
+      const { data, error } = await client.rpc('mark_ashby_writeback_pending', {
+        p_application_link_id: applicationLinkId,
+        p_reason: reason,
+        p_actor_id: actorId,
+      });
+      if (error) throw new Error('ashby_writeback_pending_error');
+      return { status: statusOf(data) };
+    },
   };
 }
 
@@ -132,9 +209,29 @@ export interface MissionControlWorkflow {
   updatedAt: string;
 }
 
+/** Admin-supplied mapping provisioning input. Opaque tenant ids only. */
+export interface MissionControlMappingUpsert {
+  /** Existing mapping id for an update; omit to create. */
+  id?: string | null;
+  externalJobId: string;
+  roleId: string;
+  ownerId: string;
+  deliveryMode: 'email' | 'manual' | 'both';
+  aiScreeningStageId?: string | null;
+  taScreeningStageId?: string | null;
+  feedbackFormId?: string | null;
+  interviewId?: string | null;
+  attributionUserId?: string | null;
+  /** Non-sensitive display label only — never PII or a secret. */
+  label?: string | null;
+  actorId: string;
+}
+
 export interface MissionControlStore {
   listMappings(limit: number): Promise<MissionControlMapping[]>;
   listWorkflows(limit: number): Promise<MissionControlWorkflow[]>;
+  /** Create/update a mapping. Always lands `paused`; never enables. */
+  upsertMapping(input: MissionControlMappingUpsert): Promise<{ status: string; id?: string }>;
   setMappingStatus(mappingId: string, status: 'paused' | 'enabled', reason: string | null, actorId: string): Promise<{ status: string; mappingStatus?: string }>;
   cancelApplication(linkId: string, terminalState: string, reason: string | null, actorId: string): Promise<{ status: string; cancelledOperations?: number; cancelledIngestion?: number }>;
   retryOperation(operationId: string, actorId: string): Promise<{ status: string }>;
@@ -213,18 +310,42 @@ export function createMissionControlStore(client: SupabaseClient): MissionContro
       return { status: d?.status ?? 'error', cancelledOperations: d?.cancelled_operations, cancelledIngestion: d?.cancelled_ingestion };
     },
     async retryOperation(operationId, actorId) {
-      // Retry = reset a failed operation to pending (bounded) via a targeted update.
-      const { data, error } = await client
-        .from('ashby_operations')
-        .update({ state: 'pending', scheduled_at: new Date().toISOString(), error_code: null })
-        .eq('id', operationId)
-        .eq('provider', 'ashby')
-        .in('state', ['failed'])
-        .select('id')
-        .maybeSingle();
+      // 0032: an AUDITED, attempt-bounded, terminal-safe RPC. The prior direct
+      // table UPDATE discarded the actor (an unattributable admin action) and
+      // ignored max_attempts, and — because the 0029 terminal trigger guards
+      // INSERT only — could return a failed operation to `pending` on a
+      // withdrawn application, which a runtime would then execute.
+      const { data, error } = await client.rpc('retry_ashby_operation', {
+        p_operation_id: operationId,
+        p_actor_id: actorId,
+      });
       if (error) throw new Error('ashby_mc_retry_error');
-      void actorId;
-      return { status: data ? 'ok' : 'not_retryable' };
+      return { status: statusOf(data) };
+    },
+    async upsertMapping(input) {
+      // Mapping creation ALWAYS lands paused. Enabling stays a separate,
+      // explicit admin action gated by the DB completeness + drift checks.
+      const { data, error } = await client.rpc('upsert_ashby_job_mapping', {
+        p_mapping_id: input.id ?? null,
+        p_external_job_id: input.externalJobId,
+        p_role_id: input.roleId,
+        p_ai_screening_stage_id: input.aiScreeningStageId ?? null,
+        p_ta_screening_stage_id: input.taScreeningStageId ?? null,
+        p_feedback_form_id: input.feedbackFormId ?? null,
+        p_interview_id: input.interviewId ?? null,
+        p_attribution_user_id: input.attributionUserId ?? null,
+        p_owner_id: input.ownerId,
+        p_delivery_mode: input.deliveryMode,
+        p_invite_ttl_hours: 24,
+        // ALWAYS paused on create/update through this surface. Enabling is a
+        // separate, explicit admin action (POST /mappings/:id/resume) that the
+        // DB still gates on stage completeness and absence of drift.
+        p_status: 'paused',
+        p_label: input.label ?? null,
+        p_actor_id: input.actorId,
+      });
+      if (error) throw new Error('ashby_mc_upsert_mapping_error');
+      return { status: statusOf(data), id: (data as { id?: string } | null)?.id };
     },
   };
 }

@@ -33,6 +33,17 @@ primary_region = "bom"
   RATE_LIMIT_IP = "300"
   RATE_LIMIT_WINDOW_SEC = "60"
   TRUSTED_PROXY = "loopback"
+  # Ashby runtime: OFF. Flipping this to "true" additionally requires the
+  # ASHBY_API_KEY and ASHBY_WEBHOOK_SECRET Fly SECRETS (never [env], never the
+  # repo) and ASHBY_INTEGRATION_ENABLED. See docs/runbooks/ashby-runtime-activation.md.
+  ASHBY_RUNTIME_ENABLED = "false"
+  # Empty ⇒ the resume-download SSRF allowlist stays DISABLED (fail-closed).
+  ASHBY_RESUME_HOSTS = ""
+  ASHBY_SIGNAL_POLL_MS = "5000"
+  ASHBY_OPERATION_POLL_MS = "5000"
+  ASHBY_RECONCILE_INTERVAL_MS = "900000"
+  ASHBY_RECLAIM_INTERVAL_MS = "60000"
+  ASHBY_LEASE_SECONDS = "60"
 
 [http_service]
   internal_port = 8787

@@ -580,6 +580,63 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AshbyMcMappingsResponse'
+    post:
+      tags: [ashby]
+      operationId: upsertAshbyMapping
+      summary: Create or update an Ashby job mapping (always paused)
+      description: Admin-only. ALWAYS writes the mapping in the `paused` state — this endpoint can never enable one. Enabling remains the separate POST /mappings/{id}/resume action, which the database still gates on stage completeness and absence of drift. invite_ttl_hours is fixed at 24 by a DB CHECK; supplying any other value is rejected.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AshbyMappingUpsertRequest'
+      responses:
+        '201':
+          description: Mapping created or updated; always paused.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMappingUpsertResponse'
+  /api/integrations/ashby/mission-control/health:
+    get:
+      tags: [ashby]
+      operationId: getAshbyRuntimeHealth
+      summary: Ashby integration and runtime health
+      description: Booleans, bounded integers and counts ONLY — never the API key, the webhook secret, an allowlisted resume host, an invite token, a presigned URL, or any candidate field. Makes no live-connectivity claim: `provider` is always `unknown` because this handler contacts no provider. Interviewer role or above; deliberately separate from the unauthenticated liveness-only /api/health.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Sanitized integration + runtime configuration state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyRuntimeHealthResponse'
+  /api/integrations/ashby/mission-control/jobs/{externalJobId}/stages:
+    get:
+      tags: [ashby]
+      operationId: probeAshbyJobStages
+      summary: Read-only tenant probe for a job's interview stages
+      description: Admin-only discovery. Performs exactly one allowlisted READ operation (jobInterviewPlan.info) and returns sanitized stage ids plus bounded display titles. Writes nothing — it proposes stage ids that an admin applies via POST /mappings. Returns 503 when the runtime gates are closed (no client is constructed and no network call is made).
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: externalJobId
+          in: path
+          required: true
+          description: Opaque Ashby job id.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Sanitized stage descriptors.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyProbeStagesResponse'
   /api/integrations/ashby/mission-control/workflows:
     get:
       tags: [ashby]
@@ -2875,6 +2932,151 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/AshbyMcMapping'
+      additionalProperties: false
+
+    AshbyIntegrationState:
+      type: object
+      required: [enabled, webhookSecretConfigured, active]
+      properties:
+        enabled:
+          type: boolean
+        webhookSecretConfigured:
+          type: boolean
+        active:
+          type: boolean
+      additionalProperties: false
+
+    AshbyRuntimeState:
+      type: object
+      required:
+        - runtimeEnabled
+        - apiKeyConfigured
+        - resumeAllowlistEnabled
+        - resumeAllowlistCount
+        - active
+        - signalPollMs
+        - operationPollMs
+        - reconcileIntervalMs
+        - reclaimIntervalMs
+        - leaseSeconds
+      properties:
+        runtimeEnabled:
+          type: boolean
+        apiKeyConfigured:
+          type: boolean
+        resumeAllowlistEnabled:
+          type: boolean
+        resumeAllowlistCount:
+          description: Count only — the hostnames themselves are tenant-identifying and are never disclosed.
+          type: integer
+        active:
+          type: boolean
+        signalPollMs:
+          type: integer
+        operationPollMs:
+          type: integer
+        reconcileIntervalMs:
+          type: integer
+        reclaimIntervalMs:
+          type: integer
+        leaseSeconds:
+          type: integer
+      additionalProperties: false
+
+    AshbyRuntimeHealthResponse:
+      type: object
+      required: [ok, integration, runtime, provider]
+      properties:
+        ok:
+          type: boolean
+        integration:
+          $ref: '#/components/schemas/AshbyIntegrationState'
+        runtime:
+          $ref: '#/components/schemas/AshbyRuntimeState'
+        provider:
+          description: Always "unknown" — this handler contacts no provider, so it makes no live-connectivity claim.
+          type: string
+      additionalProperties: false
+
+    AshbyProbeStage:
+      type: object
+      required: [id, title]
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+          nullable: true
+      additionalProperties: false
+
+    AshbyProbeStagesResponse:
+      type: object
+      required: [ok, stages, empty]
+      properties:
+        ok:
+          type: boolean
+        stages:
+          type: array
+          items:
+            $ref: '#/components/schemas/AshbyProbeStage'
+        empty:
+          type: boolean
+      additionalProperties: false
+
+    AshbyMappingUpsertRequest:
+      type: object
+      required: [external_job_id, role_id]
+      properties:
+        id:
+          type: string
+          format: uuid
+        external_job_id:
+          type: string
+        role_id:
+          type: string
+          format: uuid
+        owner_id:
+          type: string
+          format: uuid
+        delivery_mode:
+          type: string
+          enum: [email, manual, both]
+        ai_screening_stage_id:
+          type: string
+          nullable: true
+        ta_screening_stage_id:
+          type: string
+          nullable: true
+        feedback_form_id:
+          type: string
+          nullable: true
+        interview_id:
+          type: string
+          nullable: true
+        attribution_user_id:
+          type: string
+          nullable: true
+        label:
+          description: Non-sensitive display label only — never PII or a secret.
+          type: string
+          nullable: true
+        invite_ttl_hours:
+          description: Fixed at 24 by a DB CHECK; any other value is rejected.
+          type: integer
+      additionalProperties: false
+
+    AshbyMappingUpsertResponse:
+      type: object
+      required: [ok, status]
+      properties:
+        ok:
+          type: boolean
+        id:
+          type: string
+          format: uuid
+        status:
+          description: Always "paused" — this endpoint can never enable a mapping.
+          type: string
       additionalProperties: false
 
     AshbyMcWorkflowOperation:

@@ -4682,6 +4682,229 @@ end;
 $$;
 
 -- ═══════════════════════════════════════════════════════════════════════
+-- 0032: Ashby runtime activation — writeback_pending terminus, audited and
+--       attempt-bounded retry, terminal-resurrection backstop, bounded
+--       ingestion requeue, reconciliation single-flight.
+-- ═══════════════════════════════════════════════════════════════════════
+
+select _policy_tests.assert(
+  'ashby 0032 RPCs are service-role only',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname in ('mark_ashby_writeback_pending','retry_ashby_operation',
+                        'begin_ashby_sync_run','end_ashby_sync_run')
+      and not has_function_privilege('anon', p.oid, 'EXECUTE')
+      and not has_function_privilege('authenticated', p.oid, 'EXECUTE')
+      and has_function_privilege('service_role', p.oid, 'EXECUTE')
+  ) = 4,
+  'ashby 0032 runtime RPCs must be service-role only'
+);
+
+select _policy_tests.assert(
+  'ashby 0032 RPCs pin search_path',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname in ('mark_ashby_writeback_pending','retry_ashby_operation',
+                        'begin_ashby_sync_run','end_ashby_sync_run')
+      and p.prosecdef
+      and array_to_string(coalesce(p.proconfig, '{}'), ',') like '%search_path%'
+  ) = 4,
+  'every 0032 SECURITY DEFINER RPC must pin search_path'
+);
+
+select _policy_tests.assert(
+  'ashby 0032: writeback_pending is an accepted lifecycle value',
+  pg_get_constraintdef(oid) like '%writeback_pending%',
+  'lifecycle CHECK must admit writeback_pending'
+) from pg_constraint
+ where conname = 'chk_ashby_application_links_lifecycle'
+   and conrelid = 'screening_v2.ashby_application_links'::regclass;
+
+select _policy_tests.assert(
+  'ashby 0032: terminal-resurrection UPDATE trigger exists',
+  (select count(*) from pg_trigger
+    where tgname = 'trg_ashby_operation_not_terminal_update'
+      and tgrelid = 'screening_v2.ashby_operations'::regclass
+      and not tgisinternal) = 1,
+  'the BEFORE UPDATE terminal guard must exist'
+);
+
+do $$
+declare
+  v_role  uuid;
+  v_map   jsonb;
+  v_mapid uuid;
+  v_link  uuid;
+  v_op    jsonb;
+  v_opid  uuid;
+  v_res   jsonb;
+  v_state text;
+  v_begin jsonb;
+  v_actor uuid := gen_random_uuid();
+begin
+  select id into v_role from screening_v2.roles order by created_at limit 1;
+  if v_role is null then
+    perform _policy_tests.assert('ashby 0032 functional: seed role present', false, 'no seed role available');
+    return;
+  end if;
+
+  v_map := screening_v2.upsert_ashby_job_mapping(
+    null::uuid, 'pol32-job', v_role, 'pol32_ai', 'pol32_ta', null::text, null::text, null::text,
+    gen_random_uuid(), 'manual', 24, 'paused', null::text, v_actor);
+  v_mapid := (v_map->>'id')::uuid;
+
+  insert into screening_v2.ashby_application_links
+    (provider, external_application_id, external_job_id, external_stage_id, job_mapping_id, lifecycle)
+  values ('ashby', 'pol32-app', 'pol32-job', 'pol32_ai', v_mapid, 'imported')
+  returning id into v_link;
+
+  -- ── writeback_pending terminus ────────────────────────────────────────
+  v_res := screening_v2.mark_ashby_writeback_pending(v_link, 'no_verified_result_sink', v_actor);
+  perform _policy_tests.assert('ashby 0032: writeback_pending parks the application',
+    v_res->>'status' = 'ok'
+    and (select lifecycle from screening_v2.ashby_application_links where id = v_link) = 'writeback_pending',
+    'got ' || coalesce(v_res->>'status','null'));
+
+  perform _policy_tests.assert('ashby 0032: writeback_pending is audited',
+    exists (select 1 from screening_v2.audit_events
+             where action = 'ashby_writeback_pending' and target_id = v_link::text),
+    'expected an ashby_writeback_pending audit row');
+
+  v_res := screening_v2.mark_ashby_writeback_pending(v_link, 'again', v_actor);
+  perform _policy_tests.assert('ashby 0032: writeback_pending is idempotent',
+    v_res->>'status' = 'already_pending', 'got ' || coalesce(v_res->>'status','null'));
+
+  perform _policy_tests.assert('ashby 0032: parking enqueues no operation',
+    (select count(*) from screening_v2.ashby_operations where application_link_id = v_link) = 0,
+    'writeback_pending must not schedule follow-on work');
+
+  -- ── audited, bounded, terminal-safe retry ─────────────────────────────
+  v_op := screening_v2.enqueue_ashby_operation(v_link, 'invite_delivery', 'pol32:invite', null, null, v_actor);
+  v_opid := (v_op->>'id')::uuid;
+
+  v_res := screening_v2.retry_ashby_operation(v_opid, v_actor);
+  perform _policy_tests.assert('ashby 0032: retry refuses a non-failed operation',
+    v_res->>'status' = 'not_retryable', 'got ' || coalesce(v_res->>'status','null'));
+
+  update screening_v2.ashby_operations set state = 'failed', attempts = 1 where id = v_opid;
+  v_res := screening_v2.retry_ashby_operation(v_opid, v_actor);
+  perform _policy_tests.assert('ashby 0032: retry re-queues a failed operation',
+    v_res->>'status' = 'ok'
+    and (select state from screening_v2.ashby_operations where id = v_opid) = 'pending',
+    'got ' || coalesce(v_res->>'status','null'));
+
+  perform _policy_tests.assert('ashby 0032: retry is audited with the acting admin',
+    exists (select 1 from screening_v2.audit_events
+             where action = 'ashby_operation_retry' and target_id = v_opid::text and actor_id = v_actor),
+    'expected an attributed ashby_operation_retry audit row');
+
+  update screening_v2.ashby_operations
+     set state = 'failed', attempts = max_attempts where id = v_opid;
+  v_res := screening_v2.retry_ashby_operation(v_opid, v_actor);
+  perform _policy_tests.assert('ashby 0032: retry is bounded by max_attempts',
+    v_res->>'status' = 'retry_exhausted', 'got ' || coalesce(v_res->>'status','null'));
+
+  -- ── terminal resurrection is impossible ───────────────────────────────
+  update screening_v2.ashby_operations set state = 'failed', attempts = 1 where id = v_opid;
+  v_res := screening_v2.cancel_ashby_application(v_link, 'withdrawn', 'pol32_withdraw', v_actor, 'recruiter');
+  perform _policy_tests.assert('ashby 0032: cancel marks the link terminal',
+    v_res->>'status' = 'ok', 'got ' || coalesce(v_res->>'status','null'));
+
+  v_res := screening_v2.retry_ashby_operation(v_opid, v_actor);
+  perform _policy_tests.assert('ashby 0032: retry cannot resurrect a terminal application',
+    v_res->>'status' = 'blocked_terminal', 'got ' || coalesce(v_res->>'status','null'));
+
+  -- The DB backstop: even a direct UPDATE cannot re-run terminal work.
+  begin
+    update screening_v2.ashby_operations set state = 'pending' where id = v_opid;
+    perform _policy_tests.assert('ashby 0032: direct UPDATE to pending is blocked on a terminal link',
+      false, 'expected P0001 from trg_ashby_operation_not_terminal_update');
+  exception when others then
+    perform _policy_tests.assert('ashby 0032: direct UPDATE to pending is blocked on a terminal link',
+      true, null);
+  end;
+
+  -- Belt and braces: after cancellation no operation for that link is left in
+  -- a claimable state, and the leased claim never returns one for it.
+  perform _policy_tests.assert('ashby 0032: no claimable operation survives cancellation',
+    not exists (select 1 from screening_v2.ashby_operations
+                 where application_link_id = v_link and state = 'pending'),
+    'a terminal link must retain no pending operation');
+
+  v_res := screening_v2.claim_ashby_operation('invite_delivery', 'pol32-worker', 30);
+  perform _policy_tests.assert('ashby 0032: claim never returns an operation on a terminal link',
+    v_res->>'status' = 'empty'
+      or (v_res->>'application_link_id') is distinct from v_link::text,
+    'got ' || coalesce(v_res->>'status','null'));
+
+  -- ── bounded ingestion requeue ─────────────────────────────────────────
+  insert into screening_v2.ashby_application_links
+    (provider, external_application_id, external_job_id, external_stage_id, job_mapping_id, lifecycle)
+  values ('ashby', 'pol32-app2', 'pol32-job', 'pol32_ai', v_mapid, 'imported')
+  returning id into v_link;
+
+  v_res := screening_v2.advance_ashby_ingestion(v_link, 'fetching', null, null, null, null);
+  perform _policy_tests.assert('ashby 0032: legal ingestion transition still succeeds',
+    v_res->>'status' = 'ok', 'got ' || coalesce(v_res->>'status','null'));
+
+  v_res := screening_v2.advance_ashby_ingestion(v_link, 'failed_review', null, null, null, 'synthetic');
+  perform _policy_tests.assert('ashby 0032: failed_review transition succeeds',
+    v_res->>'status' = 'ok', 'got ' || coalesce(v_res->>'status','null'));
+
+  -- Requeue up to the ceiling, then refuse.
+  for i in 1..10 loop
+    v_res := screening_v2.advance_ashby_ingestion(v_link, 'queued', null, null, null, null);
+    exit when v_res->>'status' = 'retry_exhausted';
+    v_res := screening_v2.advance_ashby_ingestion(v_link, 'fetching', null, null, null, null);
+    v_res := screening_v2.advance_ashby_ingestion(v_link, 'failed_review', null, null, null, 'synthetic');
+  end loop;
+  select state into v_state from screening_v2.ashby_resume_ingestions where application_link_id = v_link;
+  perform _policy_tests.assert('ashby 0032: ingestion requeue is bounded and rests in failed_review',
+    v_res->>'status' = 'retry_exhausted' and v_state = 'failed_review',
+    'got status=' || coalesce(v_res->>'status','null') || ' state=' || coalesce(v_state,'null'));
+
+  -- ── reconciliation single-flight ──────────────────────────────────────
+  v_begin := screening_v2.begin_ashby_sync_run('pol32-stream', 'runner-a', 300);
+  perform _policy_tests.assert('ashby 0032: first runner acquires the sync lease',
+    v_begin->>'status' = 'ok', 'got ' || coalesce(v_begin->>'status','null'));
+
+  v_res := screening_v2.begin_ashby_sync_run('pol32-stream', 'runner-b', 300);
+  perform _policy_tests.assert('ashby 0032: a second concurrent runner is locked out',
+    v_res->>'status' = 'locked', 'got ' || coalesce(v_res->>'status','null'));
+
+  v_res := screening_v2.end_ashby_sync_run('pol32-stream', 'runner-b', true);
+  perform _policy_tests.assert('ashby 0032: a non-owner cannot release the sync lease',
+    v_res->>'status' = 'not_owned', 'got ' || coalesce(v_res->>'status','null'));
+
+  v_res := screening_v2.end_ashby_sync_run('pol32-stream', 'runner-a', false);
+  perform _policy_tests.assert('ashby 0032: a non-advancing run increments no_progress_runs',
+    v_res->>'status' = 'ok' and (v_res->>'no_progress_runs')::int = 1,
+    'got ' || coalesce(v_res->>'no_progress_runs','null'));
+
+  v_begin := screening_v2.begin_ashby_sync_run('pol32-stream', 'runner-a', 300);
+  v_res := screening_v2.end_ashby_sync_run('pol32-stream', 'runner-a', false);
+  perform _policy_tests.assert('ashby 0032: consecutive non-advancing runs accumulate',
+    (v_res->>'no_progress_runs')::int = 2,
+    'got ' || coalesce(v_res->>'no_progress_runs','null'));
+
+  perform screening_v2.advance_ashby_sync_checkpoint('pol32-stream', 'tok', 1, 1, false);
+  perform _policy_tests.assert('ashby 0032: advancing resets no_progress_runs and clears the lease',
+    (select no_progress_runs from screening_v2.ashby_sync_checkpoints
+      where provider = 'ashby' and checkpoint_key = 'pol32-stream') = 0
+    and (select lease_owner from screening_v2.ashby_sync_checkpoints
+          where provider = 'ashby' and checkpoint_key = 'pol32-stream') is null,
+    'advance must reset progress bookkeeping');
+
+  -- Cleanup (link deletes cascade operations + ingestions).
+  delete from screening_v2.ashby_application_links where external_application_id in ('pol32-app','pol32-app2');
+  delete from screening_v2.ashby_job_mappings where external_job_id = 'pol32-job';
+  delete from screening_v2.ashby_sync_checkpoints where checkpoint_key = 'pol32-stream';
+end;
+$$;
+
+-- ═══════════════════════════════════════════════════════════════════════
 -- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)
 -- ═══════════════════════════════════════════════════════════════════════
 

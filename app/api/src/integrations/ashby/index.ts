@@ -221,3 +221,66 @@ export {
   type EmailSendDecision,
   type ReissuePlan,
 } from './invite-delivery.js';
+
+// ── Wave 2 Step 6: runtime activation (workers, scheduler, probe) ───────────
+// Disabled by default: `createAshbyRuntime` returns null unless the integration
+// switch, a usable webhook secret, the independent runtime flag, AND an API key
+// are all present.
+export {
+  loadAshbyRuntimeConfig,
+  isAshbyRuntimeActive,
+  describeAshbyRuntime,
+  parseResumeHosts,
+  RUNTIME_BOUNDS,
+  MIN_API_KEY_LENGTH,
+  type AshbyRuntimeConfig,
+} from './config.js';
+export {
+  createAshbyRuntime,
+  createMaterializationStore,
+  extractFileUrl,
+  ASHBY_EXTRACTOR_VERSION,
+  ASHBY_STRUCTURER_VERSION,
+  type AshbyRuntime,
+  type CreateAshbyRuntimeOptions,
+} from './runtime.js';
+export {
+  createAshbyWorkers,
+  buildAshbyHandlers,
+  extractResumeHandle,
+  ingestionDedupKey,
+  reissuePathFor,
+  ASHBY_INGESTION_QUEUE,
+  type AshbyWorkers,
+} from './runtime-workers.js';
+export {
+  createAshbyScheduler,
+  queueRunnerTick,
+  type AshbySchedulerHandle,
+  type SchedulerLoopHealth,
+} from './scheduler.js';
+export {
+  runClaimedAshbyOperation,
+  SUPPORTED_OPERATION_TYPES,
+  REFUSED_OPERATION_TYPES,
+  type OperationWorkerDeps,
+  type OperationRunOutcome,
+} from './operation-worker.js';
+export {
+  materializeCandidate,
+  materializeInvite,
+  type MaterializationStore,
+  type MaterializationMapping,
+  type MaterializeInviteResult,
+} from './materialize.js';
+export {
+  probeJobStages,
+  extractStages,
+  assertReadOnly,
+  PROBE_READ_OPERATIONS,
+  type ProbeStage,
+  type ProbeResult,
+} from './probe.js';
+export { ASHBY_IMPORT_QUEUE, importDedupKey } from './signal-worker.js';
+export type { RuntimeWorkflowStores, WorkflowLinkRow } from './orchestration.js';
+export type { MissionControlMappingUpsert } from './workflow-stores.js';

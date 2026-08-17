@@ -894,8 +894,8 @@ describe('OpenAPI document integrity', () => {
     const paths = spec.paths as YMap;
     const schemas = ((spec as YMap).components as YMap).schemas as YMap;
     const securitySchemes = ((spec as YMap).components as YMap).securitySchemes as YMap;
-    expect(Object.keys(paths).length).toBe(67);
-    expect(Object.keys(schemas).length).toBe(138);
+    expect(Object.keys(paths).length).toBe(69);
+    expect(Object.keys(schemas).length).toBe(145);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.

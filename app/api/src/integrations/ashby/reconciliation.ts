@@ -56,7 +56,7 @@ const DEFAULT_DEADLINE_MS = 60_000;
 const HARD_MAX_PAGES = 1_000;
 const HARD_MAX_ITEMS = 100_000;
 
-export type ReconcileStop = 'drained' | 'page_cap' | 'item_cap' | 'deadline';
+export type ReconcileStop = 'drained' | 'page_cap' | 'item_cap' | 'deadline' | 'locked';
 
 export interface ReconcileResult {
   mode: 'full' | 'incremental';
@@ -81,6 +81,8 @@ export interface ReconcileDeps {
   caps?: ReconcileCaps;
   /** Monotonic clock in ms; inject for deterministic tests. */
   nowMs?: () => number;
+  /** Opaque single-flight lease owner. Never a secret. Default 'reconciler'. */
+  owner?: string;
 }
 
 function bounded(v: number | undefined, def: number, min: number, max: number): number {
@@ -117,6 +119,42 @@ export async function runReconciliation(deps: ReconcileDeps): Promise<ReconcileR
   const pageLimit = bounded(deps.caps?.pageLimit, 100, 1, 500);
 
   const startedAt = nowMs();
+
+  // ── Single-flight (0032) ────────────────────────────────────────────────
+  // Acquire the stream lease before ANY provider call. Two schedulers (or a
+  // slow run overlapping the next tick) must never both page and both advance.
+  // The lease is released in `finally` so a throw cannot strand the stream.
+  const owner = deps.owner ?? 'reconciler';
+  let leaseHeld = false;
+  if (deps.checkpoints.beginRun) {
+    const begun = await deps.checkpoints.beginRun({
+      checkpointKey,
+      owner,
+      leaseSeconds: Math.max(1, Math.ceil(deadlineMs / 1000) + 60),
+    });
+    if (begun.status === 'locked') {
+      return {
+        mode: 'incremental', pages: 0, items: 0, recovered: 0, duplicates: 0,
+        enqueued: 0, stop: 'locked', advanced: false,
+      };
+    }
+    leaseHeld = true;
+  }
+
+  let advanced = false;
+  try {
+    return await drain();
+  } finally {
+    if (leaseHeld && deps.checkpoints.endRun) {
+      // Best-effort release: a failure here must not mask the run's own error,
+      // and the lease expires on its own deadline regardless.
+      try {
+        await deps.checkpoints.endRun({ checkpointKey, owner, advanced });
+      } catch { /* lease self-expires; never mask the primary outcome */ }
+    }
+  }
+
+  async function drain(): Promise<ReconcileResult> {
   const checkpoint = await deps.checkpoints.get(checkpointKey);
   const decided = resolveSyncMode(checkpoint, startedAt);
 
@@ -187,7 +225,6 @@ export async function runReconciliation(deps: ReconcileDeps): Promise<ReconcileR
   // Advance the checkpoint ONLY on a fully drained, successful run. A run that
   // stopped on a page/item cap or the deadline is partial and must NOT advance
   // the cursor past unprocessed work (dedup makes the next full run idempotent).
-  let advanced = false;
   if (stop === 'drained') {
     await deps.checkpoints.advance({
       checkpointKey,
@@ -200,4 +237,5 @@ export async function runReconciliation(deps: ReconcileDeps): Promise<ReconcileR
   }
 
   return { mode: decided.mode, pages, items, recovered, duplicates, enqueued, stop, advanced };
+  }
 }

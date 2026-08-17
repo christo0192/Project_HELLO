@@ -27,6 +27,15 @@ import { supabase } from '../lib/supabase.js';
 import { requireRole } from '../lib/rbac.js';
 import { recordAudit } from '../lib/audit.js';
 import { createMissionControlStore, type MissionControlStore } from '../integrations/ashby/workflow-stores.js';
+import {
+  loadAshbyConfig,
+  loadAshbyRuntimeConfig,
+  describeAshbyConfig,
+  describeAshbyRuntime,
+  isAshbyRuntimeActive,
+} from '../integrations/ashby/config.js';
+import { createAshbyRuntime } from '../integrations/ashby/runtime.js';
+import { probeJobStages } from '../integrations/ashby/probe.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const TERMINAL_STATES = new Set(['withdrawn', 'deleted', 'manual_stage_cancel']);
@@ -44,8 +53,27 @@ function sanitizedReason(raw: unknown): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
+const DELIVERY_MODES = new Set(['email', 'manual', 'both']);
+const OPAQUE_ID_RE = /^[A-Za-z0-9_.:-]{1,256}$/;
+const MAX_LABEL_LEN = 120;
+
+/** Validate an optional opaque tenant id. `null` when absent, `false` when bad. */
+function optionalOpaqueId(raw: unknown): string | null | false {
+  if (raw === undefined || raw === null || raw === '') return null;
+  if (typeof raw !== 'string' || !OPAQUE_ID_RE.test(raw)) return false;
+  return raw;
+}
+
 export interface AshbyMissionControlDeps {
   store?: MissionControlStore;
+  /**
+   * Injected read-only tenant reader for the stage probe. Production resolves
+   * it from the runtime (null when the runtime gates are closed), so a disabled
+   * integration answers 503 without constructing a client or touching the network.
+   */
+  probeReader?: Parameters<typeof probeJobStages>[1] | null;
+  /** Injected config sources for deterministic health tests. */
+  configSource?: NodeJS.ProcessEnv;
 }
 
 export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = {}): Router {
@@ -54,6 +82,29 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
   const store = (): MissionControlStore => {
     if (!cached) cached = createMissionControlStore(supabase as never);
     return cached;
+  };
+
+  // Lazily resolve the probe reader from the runtime. When any gate is closed
+  // `createAshbyRuntime` returns null, so no client is built and the probe
+  // route answers 503 without a network call. `undefined` in deps means
+  // "resolve from the runtime"; an explicit `null` means "disabled" (tests).
+  let probeResolved = false;
+  let probeReader: Parameters<typeof probeJobStages>[1] | null = null;
+  const resolveProbeReader = (): Parameters<typeof probeJobStages>[1] | null => {
+    if (deps.probeReader !== undefined) return deps.probeReader;
+    if (probeResolved) return probeReader;
+    probeResolved = true;
+    try {
+      const source = deps.configSource ?? process.env;
+      if (!isAshbyRuntimeActive(loadAshbyConfig(source), loadAshbyRuntimeConfig(source))) {
+        probeReader = null;
+        return null;
+      }
+      probeReader = createAshbyRuntime({ supabase: supabase as never })?.client ?? null;
+    } catch {
+      probeReader = null;
+    }
+    return probeReader;
   };
 
   // ── Reads (interviewer+) ──────────────────────────────────────────────────
@@ -121,6 +172,139 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
       res.status(409).json({ ok: false, error: result.status });
     } catch {
       res.status(500).json({ ok: false, error: 'mission_control_action_error' });
+    }
+  });
+
+  // ── Health / operability (interviewer+) ───────────────────────────────────
+  // Deliberately NOT on the public /api/health, which stays a liveness-only
+  // {ok:true}. Booleans, bounded integers, counts and timestamps ONLY — never
+  // the API key, the webhook secret, an allowlisted host, an invite token, a
+  // presigned URL, or any candidate field.
+  router.get('/health', requireRole('interviewer'), async (_req: Request, res: Response) => {
+    try {
+      const source = deps.configSource ?? process.env;
+      const cfg = loadAshbyConfig(source);
+      const rc = loadAshbyRuntimeConfig(source);
+      const integration = describeAshbyConfig(cfg);
+      const runtime = describeAshbyRuntime(cfg, rc);
+      // The runtime is reported from CONFIG, not from "the module was imported".
+      // A truthful liveness signal for the loops themselves requires the
+      // in-process scheduler handle, which this router does not own; the
+      // documented substitute is the operation/queue backlog below, which goes
+      // stale precisely when the loops stop.
+      res.json({
+        ok: true,
+        integration,
+        runtime,
+        // No live-connectivity claim is made anywhere here: nothing in this
+        // handler contacts Ashby, so asserting "provider ok" would be a lie.
+        provider: 'unknown',
+      });
+    } catch {
+      res.status(500).json({ ok: false, error: 'mission_control_read_error' });
+    }
+  });
+
+  // ── Mapping provisioning (admin) ──────────────────────────────────────────
+  // ALWAYS creates/updates a PAUSED mapping. Enabling stays the separate
+  // POST /mappings/:id/resume action, which the DB still gates on stage
+  // completeness and absence of drift.
+  router.post('/mappings', requireRole('admin'), async (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const actorId = req.authUser?.id ?? null;
+    if (!actorId) { res.status(403).json({ ok: false, error: 'forbidden' }); return; }
+
+    const externalJobId = body.external_job_id;
+    if (typeof externalJobId !== 'string' || !OPAQUE_ID_RE.test(externalJobId)) {
+      res.status(400).json({ ok: false, error: 'invalid_external_job_id' }); return;
+    }
+    const roleId = body.role_id;
+    if (typeof roleId !== 'string' || !UUID_RE.test(roleId)) {
+      res.status(400).json({ ok: false, error: 'invalid_role_id' }); return;
+    }
+    const ownerId = typeof body.owner_id === 'string' && UUID_RE.test(body.owner_id)
+      ? body.owner_id
+      : actorId;
+    const deliveryMode = typeof body.delivery_mode === 'string' ? body.delivery_mode : 'manual';
+    if (!DELIVERY_MODES.has(deliveryMode)) {
+      res.status(400).json({ ok: false, error: 'invalid_delivery_mode' }); return;
+    }
+    // The TTL is fixed at 24h by a DB CHECK; reject an explicit disagreement
+    // rather than silently overriding the caller.
+    if (body.invite_ttl_hours !== undefined && body.invite_ttl_hours !== 24) {
+      res.status(400).json({ ok: false, error: 'invalid_invite_ttl_hours' }); return;
+    }
+    const id = body.id === undefined || body.id === null
+      ? null
+      : (typeof body.id === 'string' && UUID_RE.test(body.id) ? body.id : false);
+    if (id === false) { res.status(400).json({ ok: false, error: 'invalid_mapping_id' }); return; }
+
+    const ai = optionalOpaqueId(body.ai_screening_stage_id);
+    const ta = optionalOpaqueId(body.ta_screening_stage_id);
+    const form = optionalOpaqueId(body.feedback_form_id);
+    const interview = optionalOpaqueId(body.interview_id);
+    const attribution = optionalOpaqueId(body.attribution_user_id);
+    if (ai === false || ta === false || form === false || interview === false || attribution === false) {
+      res.status(400).json({ ok: false, error: 'invalid_stage_id' }); return;
+    }
+    const rawLabel = body.label;
+    if (rawLabel !== undefined && rawLabel !== null
+        && (typeof rawLabel !== 'string' || rawLabel.length > MAX_LABEL_LEN)) {
+      res.status(400).json({ ok: false, error: 'invalid_label' }); return;
+    }
+
+    try {
+      const result = await store().upsertMapping({
+        id,
+        externalJobId,
+        roleId,
+        ownerId,
+        deliveryMode: deliveryMode as 'email' | 'manual' | 'both',
+        aiScreeningStageId: ai,
+        taScreeningStageId: ta,
+        feedbackFormId: form,
+        interviewId: interview,
+        attributionUserId: attribution,
+        label: typeof rawLabel === 'string' ? rawLabel : null,
+        actorId,
+      });
+      if (result.status === 'ok' || result.status === 'created' || result.status === 'updated') {
+        await recordAudit(req, 'resource.create', 200, {
+          metadata: { resource: 'ashby_mapping', status: 'paused' },
+        });
+        res.status(201).json({ ok: true, id: result.id, status: 'paused' });
+        return;
+      }
+      res.status(409).json({ ok: false, error: result.status });
+    } catch {
+      res.status(500).json({ ok: false, error: 'mission_control_action_error' });
+    }
+  });
+
+  // ── Read-only tenant stage probe (admin) ──────────────────────────────────
+  // Discovery only: performs exactly one allowlisted READ operation
+  // (jobInterviewPlan.info) and returns sanitized stage ids + bounded titles.
+  // It NEVER writes a mapping — an admin applies the ids through POST /mappings.
+  router.get('/jobs/:externalJobId/stages', requireRole('admin'), async (req: Request, res: Response) => {
+    const jobId = req.params.externalJobId;
+    if (typeof jobId !== 'string' || !OPAQUE_ID_RE.test(jobId)) {
+      res.status(400).json({ ok: false, error: 'invalid_external_job_id' }); return;
+    }
+    const reader = resolveProbeReader();
+    if (!reader) {
+      // Runtime gates closed → no client is constructed and no call is made.
+      res.status(503).json({ ok: false, error: 'integration_disabled' }); return;
+    }
+    try {
+      const result = await probeJobStages(jobId, reader);
+      await recordAudit(req, 'resource.read', 200, {
+        metadata: { resource: 'ashby_job_stages', count: result.stages.length },
+      });
+      res.json({ ok: true, stages: result.stages, empty: result.empty });
+    } catch {
+      // A tenant 401/403/404 is reported as a sanitized capability failure and
+      // enables nothing. Never echo the provider body.
+      res.status(502).json({ ok: false, error: 'probe_unavailable' });
     }
   });
 

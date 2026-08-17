@@ -112,6 +112,37 @@ export interface SignalWorkerDeps {
   candidateDeleteEnabled?: boolean;
   /** Detect a self-generated stage echo (our own write-back). Default: never. */
   isSelfEcho?: (input: { applicationId: string; stageId: string }) => Promise<boolean> | boolean;
+  /**
+   * Scheduling seam invoked ONLY on the `import_eligible` verdict, before the
+   * receipt is marked processed. Production binds it to a deterministic,
+   * dedup-keyed import enqueue (see {@link importDedupKey}); tests assert it is
+   * never called for any other decision.
+   *
+   * Default `undefined` — omitting it preserves the decision-only behaviour
+   * exactly, so this seam adds no risk to the disabled configuration.
+   *
+   * It must be idempotent: a redelivered webhook and a reconciliation recovery
+   * both reach this point for the same application and must converge to ONE
+   * import. A throw propagates so the leased runner fails (and retries) the
+   * signal job rather than acking work that was never scheduled.
+   */
+  onImportEligible?: (input: {
+    applicationId: string;
+    jobId: string;
+    stageId: string;
+  }) => Promise<void> | void;
+}
+
+/** Queue name for application imports scheduled from an eligible signal. */
+export const ASHBY_IMPORT_QUEUE = 'ashby.import';
+
+/**
+ * Deterministic dedup key for an import. Keyed by the APPLICATION, not by the
+ * webhook delivery, so a duplicate webhook, a redelivery, and a reconciliation
+ * recovery for the same application all collapse onto one live job.
+ */
+export function importDedupKey(applicationId: string): string {
+  return `ashby:import:${applicationId}`;
 }
 
 async function mark(
@@ -194,7 +225,15 @@ export async function processAshbySignal(
     }
   }
 
-  // Genuinely eligible — record the safe signal state. NO import is performed.
+  // Genuinely eligible. Schedule the import BEFORE marking the receipt
+  // processed: `mark` is deliberately best-effort (it swallows failures), so if
+  // the order were reversed a scheduling failure could leave a receipt in a
+  // terminal status with no durable work — and the reconciliation re-drive
+  // would then decline to re-enqueue. Scheduling first means a throw here
+  // fails the leased job and the whole signal is retried.
+  if (deps.onImportEligible) {
+    await deps.onImportEligible({ applicationId, jobId, stageId });
+  }
   await mark(deps, payload, 'processed');
   return { decision: 'import_eligible', applicationId, jobId, stageId };
 }

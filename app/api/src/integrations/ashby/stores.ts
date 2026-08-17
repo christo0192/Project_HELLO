@@ -114,6 +114,45 @@ export function createCheckpointStore(client: SupabaseClient): CheckpointStore {
       });
       if (error) throw new Error('ashby_checkpoint_resync_error');
     },
+    async beginRun(input) {
+      const { data, error } = await client.rpc('begin_ashby_sync_run', {
+        p_checkpoint_key: input.checkpointKey,
+        p_owner: input.owner,
+        p_lease_seconds: input.leaseSeconds,
+      });
+      if (error) throw new Error('ashby_sync_begin_error');
+      const row = data as Record<string, unknown> | null;
+      const status = typeof row?.status === 'string' ? row.status : 'error';
+      if (status !== 'ok') return { status, noProgressRuns: 0 };
+      const cpStatus = row?.checkpoint_status;
+      const checkpoint: SyncCheckpoint = {
+        syncToken: (row?.sync_token as string | null) ?? null,
+        status:
+          cpStatus === 'running' || cpStatus === 'full_resync_required'
+            ? (cpStatus as SyncCheckpoint['status'])
+            : 'idle',
+        tokenIssuedAt: (row?.token_issued_at as string | null) ?? null,
+        lastSuccessAt: (row?.last_success_at as string | null) ?? null,
+      };
+      return {
+        status: 'ok',
+        checkpoint,
+        noProgressRuns: typeof row?.no_progress_runs === 'number' ? row.no_progress_runs : 0,
+      };
+    },
+    async endRun(input) {
+      const { data, error } = await client.rpc('end_ashby_sync_run', {
+        p_checkpoint_key: input.checkpointKey,
+        p_owner: input.owner,
+        p_advanced: input.advanced,
+      });
+      if (error) throw new Error('ashby_sync_end_error');
+      const row = data as Record<string, unknown> | null;
+      return {
+        status: typeof row?.status === 'string' ? row.status : 'error',
+        noProgressRuns: typeof row?.no_progress_runs === 'number' ? row.no_progress_runs : 0,
+      };
+    },
   };
 }
 
