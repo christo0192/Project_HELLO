@@ -66,7 +66,27 @@ function world() {
       return { id };
     },
     async advanceIngestion(linkId, next) {
-      const cur = ingestions.get(linkId) ?? { state: 'queued', attempts: 0 };
+      // Mirrors the 0029 `enforce_ashby_ingestion_transition` trigger: `ready`
+      // and `cancelled` are TERMINAL and reject every further transition. A
+      // permissive fake here would hide exactly the defect M2 describes.
+      // The real RPC inserts the row on first use (`on conflict do nothing`)
+      // before transitioning, so the fake must too.
+      if (!ingestions.has(linkId)) ingestions.set(linkId, { state: 'queued', attempts: 0 });
+      const cur = ingestions.get(linkId)!;
+      const legal: Record<string, string[]> = {
+        queued: ['fetching', 'cancelled'],
+        fetching: ['scanning', 'failed_review', 'cancelled'],
+        scanning: ['extracting', 'failed_review', 'cancelled'],
+        extracting: ['structuring', 'failed_review', 'cancelled'],
+        structuring: ['ready', 'failed_review', 'cancelled'],
+        failed_review: ['queued', 'cancelled'],
+        ready: [],
+        cancelled: [],
+      };
+      if (cur.state === next) return { status: 'ok', state: next };
+      if (!(legal[cur.state] ?? []).includes(next)) {
+        return { status: 'invalid_transition', state: cur.state };
+      }
       ingestions.set(linkId, { state: next, attempts: cur.attempts + (next === 'queued' ? 1 : 0) });
       return { status: 'ok', state: next };
     },
@@ -80,6 +100,7 @@ function world() {
     async completeOperation() { return 'ok'; },
     async failOperation() { return { outcome: 'retry' }; },
     async claimOperation() { return null; },
+    async parkOperationAwaitingDelivery() { return 'ok'; },
     async readIngestion(linkId) { return ingestions.get(linkId) ?? null; },
     async readLink(linkId) {
       for (const l of links.values()) if (l.id === linkId) return l;
@@ -387,5 +408,114 @@ describe('helpers', () => {
     expect(extractResumeHandle({ resume: { fileHandle: { handle: 'h2' } } })).toBe('h2');
     expect(extractResumeHandle({ resumeFileHandle: 'x'.repeat(600) })).toBeNull();
     for (const bad of [null, undefined, 42, 'str', {}]) expect(extractResumeHandle(bad)).toBeNull();
+  });
+});
+
+describe('M2 — a redelivered signal never re-downloads the resume', () => {
+  /** A world whose ingestion for the link is already terminal. */
+  function readyWorld() {
+    const w = world();
+    w.links.set(APP, {
+      id: 'link_ready', externalApplicationId: APP, externalJobId: JOB, jobMappingId: 'map_1',
+      candidateId: 'cand_1', sessionId: 'sess_1', inviteId: null,
+      lifecycle: 'ready', terminalState: null,
+    });
+    w.ingestions.set('link_ready', { state: 'ready', attempts: 1 });
+    return w;
+  }
+
+  it('does not enqueue an ingestion job for an already-ready link', async () => {
+    const w = readyWorld();
+    const runtime = makeRuntime(w);
+    const enqueued: string[] = [];
+    const spyQueue = {
+      ...runtime.queue,
+      enqueue: async (name: string, payload: unknown, opts: unknown) => {
+        enqueued.push(name);
+        return runtime.queue.enqueue(name, payload as never, opts as never);
+      },
+    } as never;
+
+    const handlers = buildAshbyHandlers({ ...runtime, queue: spyQueue });
+    await handlers[ASHBY_IMPORT_QUEUE]({ name: ASHBY_IMPORT_QUEUE, payload: { externalApplicationId: APP } } as never);
+
+    // The import still reuses the link, but ingestion is terminal so no
+    // ingestion work may be scheduled.
+    expect(enqueued).not.toContain(ASHBY_INGESTION_QUEUE);
+  });
+
+  it('does the same for a cancelled ingestion', async () => {
+    const w = readyWorld();
+    w.ingestions.set('link_ready', { state: 'cancelled', attempts: 1 });
+    const runtime = makeRuntime(w);
+    const enqueued: string[] = [];
+    const spyQueue = {
+      ...runtime.queue,
+      enqueue: async (name: string, payload: unknown, opts: unknown) => {
+        enqueued.push(name);
+        return runtime.queue.enqueue(name, payload as never, opts as never);
+      },
+    } as never;
+    const handlers = buildAshbyHandlers({ ...runtime, queue: spyQueue });
+    await handlers[ASHBY_IMPORT_QUEUE]({ name: ASHBY_IMPORT_QUEUE, payload: { externalApplicationId: APP } } as never);
+    expect(enqueued).not.toContain(ASHBY_INGESTION_QUEUE);
+  });
+
+  it('performs ZERO file.info / fetch / scan / parse for a ready link', async () => {
+    const w = readyWorld();
+    // Every port that would touch the candidate's resume is a spy that fails
+    // the test if it is ever reached.
+    const buildIngestionPorts = vi.fn(async () => {
+      throw new Error('buildIngestionPorts must not be called for a ready link');
+    });
+    const runtime = makeRuntime(w, { buildIngestionPorts: buildIngestionPorts as never });
+    const handlers = buildAshbyHandlers(runtime);
+
+    // Even if a stale ingestion job somehow exists, executing it must be inert.
+    await handlers[ASHBY_INGESTION_QUEUE]({
+      name: ASHBY_INGESTION_QUEUE, payload: { applicationLinkId: 'link_ready' },
+    } as never);
+
+    // `buildIngestionPorts` is what resolves the presigned URL via file.info,
+    // so not calling it is exactly "zero file.info, zero fetch, zero scan,
+    // zero parse".
+    expect(buildIngestionPorts).not.toHaveBeenCalled();
+  });
+
+  it('NEGATIVE CONTROL: a still-queued ingestion DOES build ports', async () => {
+    // Proves the assertions above are about the terminal state, not about the
+    // handler being inert in general.
+    const w = readyWorld();
+    w.ingestions.set('link_ready', { state: 'queued', attempts: 1 });
+    const buildIngestionPorts = vi.fn(async () => null);
+    const runtime = makeRuntime(w, { buildIngestionPorts: buildIngestionPorts as never });
+    const handlers = buildAshbyHandlers(runtime);
+    await handlers[ASHBY_INGESTION_QUEUE]({
+      name: ASHBY_INGESTION_QUEUE, payload: { applicationLinkId: 'link_ready' },
+    } as never);
+    expect(buildIngestionPorts).toHaveBeenCalledTimes(1);
+  });
+
+  it('aborts the ingestion when a state transition is rejected as illegal', async () => {
+    const w = readyWorld();
+    w.ingestions.set('link_ready', { state: 'queued', attempts: 1 });
+    // The 0029 trigger rejects an illegal move; the RPC reports it as a status
+    // rather than throwing. Ignoring that status let the in-memory pipeline
+    // keep running against a durable row that no longer described reality.
+    w.stores.advanceIngestion = async () => ({ status: 'invalid_transition' });
+
+    let capturedOnState: ((s: string) => Promise<void>) | null = null;
+    const buildIngestionPorts = vi.fn(async (input: { onState: (s: string) => Promise<void> }) => {
+      capturedOnState = input.onState;
+      return null;
+    });
+    const runtime = makeRuntime(w, { buildIngestionPorts: buildIngestionPorts as never });
+    const handlers = buildAshbyHandlers(runtime);
+    await handlers[ASHBY_INGESTION_QUEUE]({
+      name: ASHBY_INGESTION_QUEUE, payload: { applicationLinkId: 'link_ready' },
+    } as never);
+
+    expect(capturedOnState).not.toBeNull();
+    await expect(capturedOnState!('fetching')).rejects.toThrow('ashby_ingestion_invalid_transition');
   });
 });

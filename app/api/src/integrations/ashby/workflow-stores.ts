@@ -18,6 +18,7 @@ import type {
   OperationClaimRow,
   WorkflowLinkRow,
 } from './orchestration.js';
+import type { AshbyLinkLookup } from './completion-observer.js';
 
 const SYSTEM_ACTOR = '00000000-0000-4000-8000-000000000001';
 
@@ -126,6 +127,7 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
       return {
         id,
         operationType: row?.operation_type as OperationClaimRow['operationType'],
+        operationKey: typeof row?.operation_key === 'string' ? row.operation_key : null,
         applicationLinkId: linkId,
         leaseToken,
         attempts: typeof row?.attempts === 'number' ? row.attempts : 0,
@@ -170,6 +172,15 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
         terminalState: (r.terminal_state as WorkflowLinkRow['terminalState']) ?? null,
       };
     },
+    async parkOperationAwaitingDelivery(id, leaseToken, externalAnchor): Promise<'ok' | 'not_owned'> {
+      const { data, error } = await client.rpc('park_ashby_operation_awaiting_delivery', {
+        p_operation_id: id,
+        p_lease_token: leaseToken,
+        p_external_anchor: externalAnchor,
+      });
+      if (error) throw new Error('ashby_operation_park_error');
+      return statusOf(data) === 'ok' ? 'ok' : 'not_owned';
+    },
     async markWritebackPending(applicationLinkId, reason): Promise<{ status: string }> {
       const { data, error } = await client.rpc('mark_ashby_writeback_pending', {
         p_application_link_id: applicationLinkId,
@@ -178,6 +189,28 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
       });
       if (error) throw new Error('ashby_writeback_pending_error');
       return { status: statusOf(data) };
+    },
+  };
+}
+
+/**
+ * Session -> Ashby application link lookup for the completion observer.
+ * Returns null for the overwhelmingly common case of a non-Ashby session, so
+ * the observer costs one indexed lookup on the ordinary recruiter path.
+ */
+export function createAshbyLinkLookup(client: SupabaseClient): AshbyLinkLookup {
+  return {
+    async findLinkBySessionId(sessionId) {
+      const { data, error } = await client
+        .from('ashby_application_links')
+        .select('id, terminal_state')
+        .eq('provider', 'ashby')
+        .eq('session_id', sessionId)
+        .maybeSingle();
+      if (error) throw new Error('ashby_link_by_session_error');
+      if (!data) return null;
+      const row = data as { id: string; terminal_state: string | null };
+      return { id: String(row.id), terminalState: row.terminal_state ?? null };
     },
   };
 }
@@ -227,11 +260,29 @@ export interface MissionControlMappingUpsert {
   actorId: string;
 }
 
+/** Outcome of an atomic manual-invite hand-off. Never carries the token. */
+export interface MissionControlInviteIssue {
+  status: string;
+  inviteId?: string;
+  revokedInvites?: number;
+}
+
 export interface MissionControlStore {
   listMappings(limit: number): Promise<MissionControlMapping[]>;
   listWorkflows(limit: number): Promise<MissionControlWorkflow[]>;
   /** Create/update a mapping. Always lands `paused`; never enables. */
   upsertMapping(input: MissionControlMappingUpsert): Promise<{ status: string; id?: string }>;
+  /**
+   * Atomically revoke every prior active invite for the application's session
+   * and issue exactly one new one, storing ONLY the supplied digest. The
+   * caller mints the plaintext and is the only holder of it.
+   */
+  reissueManualInvite(input: {
+    applicationLinkId: string;
+    tokenDigest: string;
+    expiresAt: string;
+    actorId: string;
+  }): Promise<MissionControlInviteIssue>;
   setMappingStatus(mappingId: string, status: 'paused' | 'enabled', reason: string | null, actorId: string): Promise<{ status: string; mappingStatus?: string }>;
   cancelApplication(linkId: string, terminalState: string, reason: string | null, actorId: string): Promise<{ status: string; cancelledOperations?: number; cancelledIngestion?: number }>;
   retryOperation(operationId: string, actorId: string): Promise<{ status: string }>;
@@ -321,6 +372,22 @@ export function createMissionControlStore(client: SupabaseClient): MissionContro
       });
       if (error) throw new Error('ashby_mc_retry_error');
       return { status: statusOf(data) };
+    },
+    async reissueManualInvite(input): Promise<MissionControlInviteIssue> {
+      const { data, error } = await client.rpc('reissue_ashby_manual_invite', {
+        p_application_link_id: input.applicationLinkId,
+        // DIGEST ONLY — the plaintext token never crosses this boundary.
+        p_token_digest: input.tokenDigest,
+        p_expires_at: input.expiresAt,
+        p_actor_id: input.actorId,
+      });
+      if (error) throw new Error('ashby_mc_reissue_error');
+      const row = data as { status?: string; invite_id?: string; revoked_invites?: number } | null;
+      return {
+        status: statusOf(data),
+        inviteId: row?.invite_id,
+        revokedInvites: typeof row?.revoked_invites === 'number' ? row.revoked_invites : undefined,
+      };
     },
     async upsertMapping(input) {
       // Mapping creation ALWAYS lands paused. Enabling stays a separate,

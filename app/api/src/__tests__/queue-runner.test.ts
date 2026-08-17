@@ -10,7 +10,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { Queue } from '../lib/queue/index.js';
 import { MemoryAdapter } from '../lib/queue/memory-adapter.js';
-import { createQueueRunner, nextPollDelayMs } from '../lib/queue/runner.js';
+import { createQueueRunner, nextPollDelayMs, sanitizeErrorCode, UNKNOWN_ERROR_CODE } from '../lib/queue/runner.js';
 
 
 /**
@@ -307,5 +307,74 @@ describe('heartbeat', () => {
     for (const call of heartbeat.mock.calls) {
       expect(typeof (call as unknown as unknown[])[0]).toBe('string');
     }
+  });
+});
+
+describe('sanitizeErrorCode — nothing raw reaches the queue error column or the DLQ', () => {
+  it('passes through the sanitized codes the handlers actually throw', () => {
+    for (const code of [
+      'ashby_link_read_error', 'malformed_import_payload', 'no_registered_handler',
+      'ashby_ingestion_invalid_transition', 'operation_error', 'ashby.op:retry-1',
+    ]) {
+      expect(sanitizeErrorCode(new Error(code))).toBe(code);
+    }
+  });
+
+  it('replaces anything that could carry data with a bounded fallback', () => {
+    const hostile = [
+      new TypeError("Cannot read properties of undefined (reading 'email')"),
+      new Error('pg: connection to 10.0.0.5:5432 failed for user "svc" password "hunter2"'),
+      new Error('duplicate key value violates unique constraint — candidate a@b.example'),
+      new Error('Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature'),
+      new Error('x'.repeat(5000)),
+      new Error(''),
+      new Error('Has Spaces And Capitals'),
+      'a raw string error',
+      { message: 'not an error object' },
+      null,
+      undefined,
+      42,
+    ];
+    for (const err of hostile) {
+      const code = sanitizeErrorCode(err);
+      expect(code, String(err)).toBe(UNKNOWN_ERROR_CODE);
+      expect(code.length).toBeLessThanOrEqual(64);
+    }
+  });
+
+  it('NEGATIVE CONTROL: the raw message would otherwise have been persisted', () => {
+    // Before the repair the runner passed `err.message` straight to failClaim,
+    // which writes it to job_queue.error_message and the DLQ row.
+    const raw = 'pg: connection to 10.0.0.5 failed for user svc';
+    expect(raw).not.toBe(sanitizeErrorCode(new Error(raw)));
+    expect(sanitizeErrorCode(new Error(raw))).toBe(UNKNOWN_ERROR_CODE);
+  });
+
+  it('persists only the sanitized code when a handler throws hostile text', async () => {
+    const { queue } = makeQueue();
+    await queue.enqueue('q.a', {}, { maxAttempts: 1 });
+    const failed: string[] = [];
+    const facade = {
+      claim: queue.claim.bind(queue),
+      heartbeat: queue.heartbeat.bind(queue),
+      completeClaim: queue.completeClaim.bind(queue),
+      failClaim: async (_id: string, _t: string, message: string) => {
+        failed.push(message);
+        return 'dead_lettered' as const;
+      },
+    };
+    const runner = createQueueRunner({
+      queue: facade as never,
+      handlers: {
+        'q.a': async () => { throw new Error('pg: row (a@b.example, +15551234567) violated constraint'); },
+      },
+      owner: 'w1', leaseSeconds: 30, pollMs: 1000,
+    });
+    await runner.tick();
+    await runner.stop();
+
+    expect(failed).toEqual([UNKNOWN_ERROR_CODE]);
+    expect(failed.join()).not.toContain('a@b.example');
+    expect(failed.join()).not.toContain('15551234567');
   });
 });

@@ -32,6 +32,33 @@ import type { QueueJob } from './types.js';
 /** A handler processes exactly one job. Throwing fails the job under lease. */
 export type QueueHandler = (job: QueueJob<unknown>) => Promise<void>;
 
+/** Fallback code for anything that is not already a sanitized token. */
+export const UNKNOWN_ERROR_CODE = 'unknown_error';
+
+/** Maximum length of a persisted error code. */
+const MAX_ERROR_CODE_LEN = 64;
+
+/**
+ * Reduce a thrown value to a bounded, sanitized code before it is persisted to
+ * `job_queue.error_message` and the DLQ.
+ *
+ * Every current throw site already uses a stable snake_case token
+ * (`ashby_link_read_error`, `malformed_import_payload`, …), but nothing
+ * enforced it: a future `TypeError`, or a driver error carrying row content or
+ * a connection string, would have been written verbatim to a durable column
+ * (review finding L2). This is the enforcement — shape-checked allowlisting,
+ * not a denylist, so an unanticipated message can never pass.
+ */
+export function sanitizeErrorCode(error: unknown): string {
+  const raw = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
+  // A sanitized code is lowercase snake/dotted/dashed ASCII of bounded length.
+  // Anything with whitespace, punctuation, digits-as-data, or non-ASCII fails.
+  if (/^[a-z][a-z0-9_.:-]{2,63}$/.test(raw) && raw.length <= MAX_ERROR_CODE_LEN) {
+    return raw;
+  }
+  return UNKNOWN_ERROR_CODE;
+}
+
 export interface QueueRunnerOptions {
   queue: Pick<Queue, 'claim' | 'completeClaim' | 'failClaim' | 'heartbeat'>;
   /** Queue name → handler. A job whose name has no handler is failed closed. */
@@ -137,7 +164,8 @@ export function createQueueRunner(options: QueueRunnerOptions): QueueRunnerHandl
         emit({ kind: 'stale_lease', queueName: job.name });
       }
     } catch (err) {
-      const code = err instanceof Error ? err.message : 'handler_error';
+      // Sanitized BEFORE it can reach a durable column (see sanitizeErrorCode).
+      const code = sanitizeErrorCode(err);
       try {
         const outcome = await options.queue.failClaim(job.id, leaseToken, code);
         emit({

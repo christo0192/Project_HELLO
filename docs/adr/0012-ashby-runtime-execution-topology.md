@@ -110,7 +110,13 @@ move as a superseding ADR:
   `ashby-reconcile-single-flight.test.ts` (only one of two overlapping runs
   advances the checkpoint).
 - Real Docker `scripts/supabase-test.sh`: migrations 0001–0032 apply clean with
-  zero drift; 330 policy tests pass.
+  zero drift; 349 policy tests pass (330 before the independent-review repair).
+- Post-review repair: `runtime-health.ts` registers the live scheduler so the
+  health surface reports real tick bookkeeping plus a fleet-wide durable
+  backlog, rather than configuration. The heartbeat is deliberately
+  process-local — `registeredInThisProcess: false` is never treated as evidence
+  that the fleet has no scheduler, which is exactly the multi-machine
+  assumption this ADR refuses to make.
 
 ## Supersession
 

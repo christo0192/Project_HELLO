@@ -126,5 +126,13 @@ transcript/recording copy, or deployment is performed by this work.
 
 **Still not implemented, by design.** There is no approved Ashby result sink, so
 `scorecard_write` and `stage_move` are never claimed or executed and a completed
-screening parks at the `writeback_pending` lifecycle state (migration 0032). See
-the runtime-activation runbook for the four locks that enforce this.
+screening parks at the `writeback_pending` lifecycle state (migration 0032),
+written by the completion observer on the authoritative assessment path. See the
+runtime-activation runbook for the four locks that enforce this.
+
+**Manual invite delivery.** The invite row stores only a SHA-256 digest, so the
+usable link exists for exactly one moment: the response to an authorized admin
+calling `POST …/mission-control/workflows/{id}/invite` (or clicking *Get invite
+link* in Mission Control). Until that happens the delivery operation rests at
+`awaiting_manual_delivery` — it is deliberately NOT `succeeded`, because no
+candidate can be contacted yet.

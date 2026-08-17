@@ -743,3 +743,498 @@ comment on function screening_v2.advance_ashby_sync_checkpoint is
   '0032: also resets no_progress_runs to 0 (progress observed). The '
   'single-flight lease is released separately by end_ashby_sync_run. '
   'Service-role-only.';
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- 10. Manual-delivery truthfulness (independent review B1 / M1)
+-- ═══════════════════════════════════════════════════════════════════════
+-- Review finding B1: the manual invite was minted, its digest persisted, and
+-- the operation completed `succeeded` — but the plaintext token was discarded
+-- by design and NO surface existed to give a recruiter a usable link. The
+-- operation therefore reported success for work that had not happened.
+--
+-- The fix has two halves. Here (SQL) we make the state machine able to tell
+-- the truth: a manual invite that has been minted but NOT yet handed to a
+-- recruiter rests in `awaiting_manual_delivery`, and only an authenticated
+-- admin actually obtaining the link moves it to `succeeded`.
+--
+-- Review finding M1: `claim_ashby_operation` returned the marker but not the
+-- operation key, so the worker could not tell an `email` operation from a
+-- `manual` one and `delivery_mode='both'` collapsed to manual. The claim now
+-- returns `operation_key`, which already encodes the channel.
+
+-- ── 10a. Additive operation-state evolution ─────────────────────────────
+-- `awaiting_manual_delivery` is NOT a runnable state: `claim_ashby_operation`
+-- only ever selects `state = 'pending'`, so a parked operation is never
+-- re-claimed. It IS cancellable (see 10d) so terminal cancellation still
+-- sweeps it.
+
+alter table screening_v2.ashby_operations
+  drop constraint if exists chk_ashby_operations_state;
+alter table screening_v2.ashby_operations
+  add constraint chk_ashby_operations_state check (
+    state in ('pending','running','succeeded','failed','blocked','cancelled',
+              'awaiting_manual_delivery')
+  )
+  not valid;
+alter table screening_v2.ashby_operations
+  validate constraint chk_ashby_operations_state;
+
+comment on constraint chk_ashby_operations_state on screening_v2.ashby_operations is
+  'Operation state allowlist, extended additively by 0032 with '
+  '"awaiting_manual_delivery": a manual invite has been minted (digest only) '
+  'but no recruiter has obtained the link yet. It is NOT runnable — the claim '
+  'RPC selects only `pending` — and it is NOT success. Only an authenticated '
+  'admin retrieving the link moves it to succeeded.';
+
+-- ── 10b. Additive audit action for the delivery hand-off ────────────────
+
+alter table screening_v2.audit_events
+  drop constraint if exists chk_audit_action;
+alter table screening_v2.audit_events
+  add constraint chk_audit_action check (
+    action in (
+      'invite_sent', 'invite_revoked', 'invite_consumed',
+      'grant_issued', 'grant_revoked', 'grant_consumed',
+      'screening_started', 'screening_completed', 'screening_failed',
+      'assessment_recorded',
+      'candidate_status_changed', 'candidate_consent_updated',
+      'session_created', 'session_updated', 'session_terminated',
+      'membership_created', 'membership_updated', 'membership_deactivated',
+      'role_created', 'role_updated', 'role_deactivated',
+      'export_requested', 'export_completed',
+      'login_success', 'login_failure', 'logout',
+      'config_changed',
+      'auth_login_success', 'auth_login_failure', 'auth_token_refresh', 'auth_logout',
+      'rbac_access_denied', 'rbac_ownership_denied',
+      'resource_create', 'resource_read', 'resource_update',
+      'resource_delete', 'resource_list', 'rate_limit_exceeded',
+      'audit_sink_failure', 'audit_configuration_error',
+      'recording_download', 'recording_upload', 'recording_integrity_verified',
+      'recording_quarantined', 'recording_revoked', 'recording_deleted',
+      'admin_session_override', 'admin_maintenance_toggle', 'admin_member_update',
+      'quota_override', 'notification_create', 'appeal_create', 'appeal_review',
+      'allowlist_linked', 'admin_allowlist_add', 'admin_allowlist_update',
+      -- Ashby Wave 2 (0029): mapping-administration audits.
+      'ashby_mapping_update', 'ashby_mapping_drift',
+      -- Ashby Wave 2 (0031, additive): workflow-execution audits.
+      'ashby_application_cancel', 'ashby_operation_enqueue', 'ashby_operation_update',
+      -- Ashby Wave 2 (0032, additive): runtime-activation audits.
+      'ashby_operation_retry', 'ashby_writeback_pending',
+      -- Ashby Wave 2 (0032, review repair): manual invite hand-off.
+      'ashby_invite_delivered'
+    )
+  )
+  not valid;
+alter table screening_v2.audit_events
+  validate constraint chk_audit_action;
+
+-- ── 10c. claim_ashby_operation — return the operation key (channel) ─────
+-- Same signature as before. The ONLY change is the added `operation_key` in
+-- the result so the worker can resolve the delivery channel per-operation
+-- instead of guessing from the mapping's delivery mode.
+
+create or replace function screening_v2.claim_ashby_operation(
+  p_operation_type text,
+  p_owner          text,
+  p_lease_seconds  integer,
+  p_now            timestamptz default now()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  v_op    screening_v2.ashby_operations%rowtype;
+  v_lease integer := least(greatest(coalesce(p_lease_seconds, 30), 1), 900);
+  v_token uuid := gen_random_uuid();
+begin
+  if p_operation_type is not null
+     and p_operation_type not in ('invite_delivery','scorecard_write','stage_move') then
+    return jsonb_build_object('status', 'invalid_operation_type');
+  end if;
+
+  select o.* into v_op
+    from screening_v2.ashby_operations o
+    join screening_v2.ashby_application_links l on l.id = o.application_link_id
+   where o.provider = 'ashby'
+     and o.state = 'pending'
+     and o.scheduled_at <= p_now
+     and l.terminal_state is null
+     and (p_operation_type is null or o.operation_type = p_operation_type)
+     and (o.lease_expires_at is null or o.lease_expires_at <= p_now)
+     and (
+       o.depends_on_operation_id is null
+       or exists (
+         select 1 from screening_v2.ashby_operations d
+          where d.id = o.depends_on_operation_id and d.state = 'succeeded'
+       )
+     )
+   order by o.scheduled_at, o.id
+   for update of o skip locked
+   limit 1;
+
+  if not found then
+    return jsonb_build_object('status', 'empty');
+  end if;
+
+  update screening_v2.ashby_operations
+     set state = 'running',
+         attempts = attempts + 1,
+         lease_token = v_token,
+         lease_owner = left(coalesce(p_owner, 'worker'), 128),
+         lease_expires_at = p_now + make_interval(secs => v_lease),
+         updated_at = p_now
+   where id = v_op.id;
+
+  return jsonb_build_object(
+    'status', 'claimed',
+    'id', v_op.id,
+    'operation_type', v_op.operation_type,
+    'operation_key', v_op.operation_key,
+    'application_link_id', v_op.application_link_id,
+    'lease_token', v_token,
+    'attempts', v_op.attempts + 1,
+    'max_attempts', v_op.max_attempts,
+    'marker', v_op.marker
+  );
+end;
+$$;
+
+revoke all on function screening_v2.claim_ashby_operation(text, text, integer, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.claim_ashby_operation(text, text, integer, timestamptz)
+  to service_role;
+
+comment on function screening_v2.claim_ashby_operation is
+  'Leased claim (FOR UPDATE SKIP LOCKED) of the next runnable pending Ashby '
+  'operation. 0032: operations on a TERMINAL link are never claimed, and the '
+  'result carries operation_key so the worker resolves the delivery channel '
+  'per-operation (delivery_mode=both no longer collapses to manual). '
+  'Service-role-only.';
+
+-- ── 10d. park_ashby_operation — CAS running -> awaiting_manual_delivery ──
+
+create or replace function screening_v2.park_ashby_operation_awaiting_delivery(
+  p_operation_id    uuid,
+  p_lease_token     uuid,
+  p_external_anchor text,
+  p_now             timestamptz default now()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  v_updated integer;
+begin
+  -- CAS on the live lease, exactly like complete_ashby_operation: a stale
+  -- worker cannot park (or otherwise mutate) an operation it no longer owns.
+  update screening_v2.ashby_operations
+     set state = 'awaiting_manual_delivery',
+         external_anchor = coalesce(left(p_external_anchor, 256), external_anchor),
+         lease_token = null,
+         lease_owner = null,
+         lease_expires_at = null,
+         updated_at = p_now
+   where id = p_operation_id
+     and provider = 'ashby'
+     and state = 'running'
+     and lease_token = p_lease_token
+     and (lease_expires_at is null or lease_expires_at > p_now);
+  get diagnostics v_updated = row_count;
+
+  if v_updated = 0 then
+    return jsonb_build_object('status', 'not_owned');
+  end if;
+  return jsonb_build_object('status', 'ok', 'state', 'awaiting_manual_delivery');
+end;
+$$;
+
+revoke all on function screening_v2.park_ashby_operation_awaiting_delivery(uuid, uuid, text, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.park_ashby_operation_awaiting_delivery(uuid, uuid, text, timestamptz)
+  to service_role;
+
+comment on function screening_v2.park_ashby_operation_awaiting_delivery is
+  'CAS (under the live lease) of a manual invite_delivery operation from '
+  'running to awaiting_manual_delivery. The invite digest exists but no '
+  'recruiter has obtained the link, so this is deliberately NOT success. '
+  'Service-role-only.';
+
+-- ── 10e. mark_ashby_invite_delivered — the recruiter obtained the link ──
+
+create or replace function screening_v2.mark_ashby_invite_delivered(
+  p_application_link_id uuid,
+  p_invite_id           uuid,
+  p_actor_id            uuid,
+  p_now                 timestamptz default now()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  v_delivered integer := 0;
+begin
+  -- Only manual delivery operations that are genuinely awaiting hand-off move
+  -- to succeeded. `succeeded` here means "an authorized human actually took
+  -- possession of a usable link", which is the only honest definition.
+  update screening_v2.ashby_operations
+     set state = 'succeeded',
+         external_anchor = coalesce(left(p_invite_id::text, 256), external_anchor),
+         error_code = null,
+         updated_at = p_now
+   where application_link_id = p_application_link_id
+     and provider = 'ashby'
+     and operation_type = 'invite_delivery'
+     and state = 'awaiting_manual_delivery'
+     and operation_key like '%:manual:%';
+  get diagnostics v_delivered = row_count;
+
+  insert into screening_v2.audit_events
+    (actor_id, actor_type, action, target_type, target_id, result, metadata)
+  values
+    (coalesce(p_actor_id, '00000000-0000-4000-8000-000000000001'),
+     'recruiter',
+     'ashby_invite_delivered', 'ashby_application_link', p_application_link_id::text, 'success',
+     -- Opaque ids and a count ONLY. The plaintext invite token is never
+     -- logged, audited, or persisted anywhere — only its SHA-256 digest is
+     -- stored, in candidate_invites.
+     jsonb_build_object('application_link_id', p_application_link_id,
+                        'invite_id', p_invite_id,
+                        'operations_delivered', v_delivered));
+
+  return jsonb_build_object('status', 'ok', 'operations_delivered', v_delivered);
+end;
+$$;
+
+revoke all on function screening_v2.mark_ashby_invite_delivered(uuid, uuid, uuid, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.mark_ashby_invite_delivered(uuid, uuid, uuid, timestamptz)
+  to service_role;
+
+comment on function screening_v2.mark_ashby_invite_delivered is
+  'Records that an authorized admin obtained a usable manual invite link, '
+  'moving the awaiting_manual_delivery operation(s) to succeeded and writing '
+  'one audit row. Metadata carries opaque ids only — never the token. '
+  'Service-role-only.';
+
+-- ── 10f. cancel_ashby_application — sweep the parked state too ──────────
+-- Identical to the 0031 body except `awaiting_manual_delivery` is added to
+-- the in-flight set, so terminal cancellation still cancels a parked manual
+-- delivery instead of leaving it dangling forever.
+
+create or replace function screening_v2.cancel_ashby_application(
+  p_application_link_id uuid,
+  p_terminal_state      text,
+  p_reason              text,
+  p_actor_id            uuid,
+  p_actor_type          text default 'system'
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  v_link          screening_v2.ashby_application_links%rowtype;
+  v_cancelled_ops integer := 0;
+  v_cancelled_ing integer := 0;
+begin
+  if p_terminal_state not in ('withdrawn','deleted','manual_stage_cancel') then
+    return jsonb_build_object('status', 'invalid_terminal_state');
+  end if;
+  if p_reason is not null and length(p_reason) > 200 then
+    return jsonb_build_object('status', 'invalid_reason');
+  end if;
+
+  select * into v_link
+    from screening_v2.ashby_application_links
+   where id = p_application_link_id
+   for update;
+  if not found then
+    return jsonb_build_object('status', 'not_found');
+  end if;
+
+  if v_link.terminal_state is not null then
+    return jsonb_build_object('status', 'already_terminal',
+                              'terminal_state', v_link.terminal_state);
+  end if;
+
+  update screening_v2.ashby_application_links
+     set terminal_state = p_terminal_state,
+         terminal_reason = coalesce(p_reason, 'terminal_cancel'),
+         lifecycle = 'cancelled',
+         updated_at = now()
+   where id = p_application_link_id;
+
+  -- Cancel every still-in-flight operation (never touch succeeded/failed/cancelled).
+  with cancelled as (
+    update screening_v2.ashby_operations
+       set state = 'cancelled',
+           error_code = 'terminal_cancel',
+           lease_token = null, lease_owner = null, lease_expires_at = null,
+           updated_at = now()
+     where application_link_id = p_application_link_id
+       and state in ('pending','running','blocked','awaiting_manual_delivery')
+    returning 1
+  )
+  select count(*) into v_cancelled_ops from cancelled;
+
+  with cancelled_ing as (
+    update screening_v2.ashby_resume_ingestions
+       set state = 'cancelled',
+           failed_reason = 'terminal_cancel',
+           updated_at = now()
+     where application_link_id = p_application_link_id
+       and state in ('queued','fetching','scanning','extracting','structuring','failed_review')
+    returning 1
+  )
+  select count(*) into v_cancelled_ing from cancelled_ing;
+
+  insert into screening_v2.audit_events
+    (actor_id, actor_type, action, target_type, target_id, result, metadata)
+  values
+    (coalesce(p_actor_id, '00000000-0000-4000-8000-000000000001'),
+     case when p_actor_type in ('recruiter','system','admin') then p_actor_type else 'system' end,
+     'ashby_application_cancel', 'ashby_application_link', p_application_link_id::text, 'success',
+     jsonb_build_object('application_link_id', p_application_link_id,
+                        'terminal_state', p_terminal_state,
+                        'cancelled_operations', v_cancelled_ops,
+                        'cancelled_ingestion', v_cancelled_ing));
+
+  return jsonb_build_object('status', 'ok',
+                            'terminal_state', p_terminal_state,
+                            'cancelled_operations', v_cancelled_ops,
+                            'cancelled_ingestion', v_cancelled_ing);
+end;
+$$;
+
+revoke all on function screening_v2.cancel_ashby_application(uuid, text, text, uuid, text)
+  from public, anon, authenticated;
+grant execute on function screening_v2.cancel_ashby_application(uuid, text, text, uuid, text)
+  to service_role;
+
+comment on function screening_v2.cancel_ashby_application is
+  'ONE-transaction terminal cancellation: marks the link terminal, cancels '
+  'every in-flight operation (0032: including awaiting_manual_delivery) and '
+  'the in-flight ingestion. Idempotent; never reverses a succeeded operation; '
+  'never auto-rejects. Service-role-only; audited.';
+
+-- ── 10g. reissue_ashby_manual_invite — atomic revoke-then-issue ─────────
+-- The delivery half of review finding B1. ONE transaction:
+--   terminal/readiness guards -> revoke every prior ACTIVE invite for the
+--   session -> insert exactly one new 24h invite (DIGEST only) -> move the
+--   parked manual delivery operation(s) to succeeded + audit.
+--
+-- The plaintext token is minted by the API process and NEVER passed here:
+-- this function receives only its SHA-256 digest, so the token cannot reach
+-- the database, a log, an audit row, or a query plan. The API returns the
+-- plaintext exactly once, in the HTTPS response body, to an authenticated
+-- admin, under Cache-Control: no-store.
+
+create or replace function screening_v2.reissue_ashby_manual_invite(
+  p_application_link_id uuid,
+  p_token_digest        text,
+  p_expires_at          timestamptz,
+  p_actor_id            uuid,
+  p_now                 timestamptz default now()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  v_link      screening_v2.ashby_application_links%rowtype;
+  v_invite_id uuid;
+  v_revoked   integer := 0;
+begin
+  if p_token_digest is null or p_token_digest !~ '^[a-f0-9]{64}$' then
+    return jsonb_build_object('status', 'invalid_digest');
+  end if;
+  if p_expires_at is null or p_expires_at <= p_now then
+    return jsonb_build_object('status', 'invalid_expiry');
+  end if;
+
+  select * into v_link
+    from screening_v2.ashby_application_links
+   where id = p_application_link_id
+   for update;
+  if not found then
+    return jsonb_build_object('status', 'not_found');
+  end if;
+
+  -- A withdrawn/deleted/manually-cancelled application never gets a fresh
+  -- candidate link. This is the same guard the operation worker applies.
+  if v_link.terminal_state is not null then
+    return jsonb_build_object('status', 'blocked_terminal',
+                              'terminal_state', v_link.terminal_state);
+  end if;
+
+  if v_link.session_id is null or v_link.candidate_id is null then
+    -- The screening session has not been materialized yet (ingestion still
+    -- running, or no mapping). There is nothing to invite anyone to.
+    return jsonb_build_object('status', 'not_ready');
+  end if;
+
+  -- Revoke-then-issue, in this order, inside one transaction: there is never
+  -- a window in which two live invites exist for the session.
+  with revoked as (
+    update screening_v2.candidate_invites
+       set revoked_at = p_now, updated_at = p_now
+     where session_id = v_link.session_id
+       and consumed_at is null
+       and revoked_at is null
+       and expires_at > p_now
+    returning 1
+  )
+  select count(*) into v_revoked from revoked;
+
+  insert into screening_v2.candidate_invites
+    (candidate_id, session_id, token_digest, expires_at, created_by)
+  values
+    (v_link.candidate_id, v_link.session_id, p_token_digest, p_expires_at,
+     coalesce(p_actor_id, '00000000-0000-4000-8000-000000000001'))
+  returning id into v_invite_id;
+
+  update screening_v2.ashby_application_links
+     set invite_id = v_invite_id, updated_at = p_now
+   where id = p_application_link_id;
+
+  -- The recruiter is taking possession of a usable link right now, so the
+  -- parked manual delivery operation(s) become genuinely succeeded (audited).
+  perform screening_v2.mark_ashby_invite_delivered(
+    p_application_link_id, v_invite_id, p_actor_id, p_now);
+
+  return jsonb_build_object('status', 'ok',
+                            'invite_id', v_invite_id,
+                            'revoked_invites', v_revoked,
+                            'session_id', v_link.session_id);
+end;
+$$;
+
+revoke all on function screening_v2.reissue_ashby_manual_invite(uuid, text, timestamptz, uuid, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.reissue_ashby_manual_invite(uuid, text, timestamptz, uuid, timestamptz)
+  to service_role;
+
+comment on function screening_v2.reissue_ashby_manual_invite is
+  'Atomic manual-invite hand-off for an Ashby application: guards terminal '
+  'and not-ready states, revokes every prior ACTIVE invite for the session, '
+  'issues exactly one new invite storing ONLY the caller-supplied SHA-256 '
+  'digest, back-fills the link, and marks the parked delivery operation '
+  'succeeded with one audit row. The plaintext token never reaches this '
+  'function. Service-role-only.';
+
+-- ── 10h. Completion-observer lookup index ───────────────────────────────
+-- The completion observer resolves session -> Ashby link on EVERY assessment
+-- completion, including the overwhelmingly common non-Ashby case. Without an
+-- index that is a sequential scan on the ordinary recruiter path.
+
+create index if not exists idx_ashby_application_links_session
+  on screening_v2.ashby_application_links (session_id)
+  where session_id is not null;

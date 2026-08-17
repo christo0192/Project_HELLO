@@ -792,6 +792,29 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AshbyMcError'
+  /api/integrations/ashby/mission-control/workflows/{id}/invite:
+    post:
+      tags: [ashby]
+      operationId: deliverAshbyManualInvite
+      summary: Issue a usable manual invite link for an Ashby application
+      description: Admin-only. Atomically revokes every prior ACTIVE invite for the application's session and issues exactly one new 24-hour invite, persisting ONLY its SHA-256 digest. Returns the candidate join URL exactly once in this response; the token is carried in the URL fragment and is never logged, audited, persisted, placed in a query string, or sent to Ashby. The response is uncacheable (Cache-Control no-store). Refuses a terminal application and one whose screening session has not been materialized.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Ashby application-link id.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: A usable candidate join link, returned exactly once.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyManualInviteResponse'
   /api/integrations/ashby/mission-control/operations/{id}/retry:
     post:
       tags: [ashby]
@@ -3077,6 +3100,29 @@ components:
         status:
           description: Always "paused" — this endpoint can never enable a mapping.
           type: string
+      additionalProperties: false
+
+    AshbyManualInviteResponse:
+      type: object
+      required: [ok, invite_id, join_url, expires_at, ttl_hours]
+      properties:
+        ok:
+          type: boolean
+        invite_id:
+          type: string
+          format: uuid
+        join_url:
+          description: Candidate join URL. The one-time token is in the fragment, never the query string.
+          type: string
+        expires_at:
+          type: string
+          format: date-time
+        ttl_hours:
+          description: Fixed at 24 by a database CHECK.
+          type: integer
+        revoked_invites:
+          description: How many prior active invites were revoked by this issue.
+          type: integer
       additionalProperties: false
 
     AshbyMcWorkflowOperation:

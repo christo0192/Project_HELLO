@@ -606,6 +606,21 @@ export interface AshbyMcWorkflowsResponse {
   workflows: AshbyMcWorkflow[];
 }
 
+/**
+ * One-time manual invite hand-off. `joinUrl` carries the candidate token in the
+ * URL FRAGMENT and is returned exactly once — it is never persisted by the API
+ * and must never be written to storage, a query string, or telemetry here.
+ */
+export interface AshbyManualInviteResponse {
+  ok: boolean;
+  invite_id?: string;
+  join_url?: string;
+  expires_at?: string;
+  ttl_hours?: number;
+  revoked_invites?: number;
+  error?: string;
+}
+
 export interface AshbyMcActionResponse {
   ok: boolean;
   status?: string;

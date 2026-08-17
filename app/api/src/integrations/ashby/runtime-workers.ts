@@ -48,6 +48,13 @@ import type { AshbySignalPayload } from './ports.js';
 /** Queue name for the ephemeral resume ingestion of one application link. */
 export const ASHBY_INGESTION_QUEUE = 'ashby.ingestion';
 
+/**
+ * Ingestion states from which no further work is possible (0029 state machine).
+ * A link in one of these must never re-enter fetch/scan/parse — re-downloading
+ * a candidate's resume is both a PII cost and a provider cost.
+ */
+export const TERMINAL_INGESTION_STATES: ReadonlySet<string> = new Set(['ready', 'cancelled']);
+
 /** Deterministic dedup key for one link's ingestion. */
 export function ingestionDedupKey(applicationLinkId: string): string {
   return `ashby:ingestion:${applicationLinkId}`;
@@ -70,6 +77,11 @@ export interface AshbyWorkersOptions {
 
 export interface AshbyWorkers {
   scheduler: AshbySchedulerHandle;
+  /**
+   * Per-loop base interval (ms), keyed by loop name. The health surface needs
+   * these to decide whether a loop's last tick is stale for ITS own cadence.
+   */
+  loopIntervalsMs: Record<string, number>;
   /** Drive one pass of every loop directly (tests; no timers involved). */
   tickAll(): Promise<void>;
   stop(): Promise<void>;
@@ -125,8 +137,16 @@ export function buildAshbyHandlers(runtime: AshbyRuntime): Record<string, QueueH
       });
       if (result.status !== 'imported') return;
 
-      // Seed the ephemeral ingestion as durable work. `runImport` only moved
-      // the ingestion row to 'queued'; without this the row was never picked up.
+      // Seed the ephemeral ingestion as durable work — but ONLY when there is
+      // ingestion work left to do. `ready` and `cancelled` are terminal states
+      // in the 0029 state machine, so a redelivered signal against an
+      // already-ingested link must not re-enqueue: doing so re-resolved a
+      // presigned URL and re-downloaded, re-scanned and re-parsed the
+      // candidate's resume while the durable row still read `ready`
+      // (review finding M2).
+      const existingIngestion = await runtime.stores.readIngestion(result.applicationLinkId);
+      if (existingIngestion && TERMINAL_INGESTION_STATES.has(existingIngestion.state)) return;
+
       await runtime.queue.enqueue(
         ASHBY_INGESTION_QUEUE,
         { provider: 'ashby', applicationLinkId: result.applicationLinkId },
@@ -149,10 +169,26 @@ export function buildAshbyHandlers(runtime: AshbyRuntime): Record<string, QueueH
       // A terminal application is not an error — there is simply no work.
       if (!link || link.terminalState) return;
 
+      // Second guard, at execution time: the ingestion may have reached a
+      // terminal state between enqueue and claim. Checked BEFORE
+      // `buildIngestionPorts`, which is what resolves the short-lived
+      // presigned URL — so a redundant job costs zero provider calls and
+      // zero resume bytes.
+      const current = await runtime.stores.readIngestion(linkId);
+      if (current && TERMINAL_INGESTION_STATES.has(current.state)) return;
+
       const ports = await runtime.buildIngestionPorts({
         applicationLinkId: linkId,
         onState: async (state, provenance) => {
-          await runtime.stores.advanceIngestion(linkId, state, provenance);
+          // The 0029 trigger rejects an illegal transition and the RPC returns
+          // `invalid_transition` rather than throwing. Ignoring that status
+          // let the in-memory pipeline keep running against a durable row that
+          // no longer described reality; abort instead so the bytes are wiped
+          // on the ingestion's own terminal path.
+          const outcome = await runtime.stores.advanceIngestion(linkId, state, provenance);
+          if (outcome.status !== 'ok') {
+            throw new Error(`ashby_ingestion_${outcome.status}`);
+          }
         },
       });
       // No resume handle / no resolvable presigned URL → nothing to ingest.
@@ -286,6 +322,12 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
 
   return {
     scheduler,
+    loopIntervalsMs: {
+      signal: rc.signalPollMs,
+      operation: rc.operationPollMs,
+      reconcile: rc.reconcileIntervalMs,
+      reclaim: rc.reclaimIntervalMs,
+    },
     async tickAll() {
       await runner.tick();
     },

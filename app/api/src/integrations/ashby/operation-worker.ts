@@ -71,13 +71,33 @@ export type OperationRunOutcome =
       code: string;
     };
 
-/** Which delivery channel an invite_delivery operation targets. */
-function channelForOperation(marker: string | null, fallback: 'email' | 'manual'): 'email' | 'manual' {
-  // The channel is encoded in the operation key by `inviteDeliveryOperationKey`;
-  // the claim RPC returns the marker, not the key, so the mapping's delivery
-  // mode is the authority and a single-channel mode is unambiguous.
-  void marker;
-  return fallback;
+/**
+ * Resolve the delivery channel for a claimed invite_delivery operation.
+ *
+ * The channel is encoded in the operation key by `inviteDeliveryOperationKey`
+ * as `ashby:invite:<application>:<channel>:<invite>`. Reading it from the KEY
+ * (rather than from the mapping's delivery mode) is what makes
+ * `delivery_mode='both'` correct: it enqueues two operations, and each must
+ * resolve to its own channel. Deriving the channel from the mapping instead
+ * collapsed both to `manual` and completed the email operation as a manual
+ * success — review finding M1.
+ *
+ * A key we cannot parse falls back to the mapping mode, and an ambiguous
+ * `both` with no usable key falls back to `manual` (the only channel that can
+ * actually deliver) rather than silently claiming the email channel worked.
+ */
+export function channelForOperationKey(
+  operationKey: string | null,
+  deliveryMode: 'email' | 'manual' | 'both',
+): 'email' | 'manual' {
+  if (typeof operationKey === 'string') {
+    const parts = operationKey.split(':');
+    for (const part of parts) {
+      if (part === 'email') return 'email';
+      if (part === 'manual') return 'manual';
+    }
+  }
+  return deliveryMode === 'email' ? 'email' : 'manual';
 }
 
 /**
@@ -134,7 +154,7 @@ export async function runClaimedAshbyOperation(
     const result = await materializeInvite({
       store: deps.materialization,
       mapping,
-      channel: channelForOperation(claim.marker, mapping.deliveryMode === 'email' ? 'email' : 'manual'),
+      channel: channelForOperationKey(claim.operationKey, mapping.deliveryMode),
       link: {
         id: link.id,
         externalApplicationId: link.externalApplicationId,
@@ -167,6 +187,27 @@ export async function runClaimedAshbyOperation(
     // The external anchor is an OPAQUE invite row id — never the token, never a
     // URL, never contact data.
     const anchor = result.inviteId ?? null;
+
+    // ── The manual channel does NOT complete here (review finding B1) ──────
+    // Minting the invite only produces a SHA-256 digest; the plaintext is
+    // deliberately never returned, logged, or persisted. Until an authorized
+    // admin actually obtains a usable link through the Mission Control
+    // delivery endpoint, no recruiter can contact the candidate — so
+    // completing the operation as `succeeded` here would report success for
+    // work that has not happened. It parks instead, and the delivery endpoint
+    // moves it to `succeeded` when the link is genuinely handed over.
+    if (result.channel === 'manual' && result.delivery === 'manual_reissue') {
+      const parked = await deps.stores.parkOperationAwaitingDelivery(claim.id, claim.leaseToken, anchor);
+      emit(parked === 'ok' ? 'awaiting_manual_delivery' : 'stale_lease', 'awaiting_manual_delivery');
+      return {
+        claimed: true, operationType: claim.operationType,
+        // `committed` means the operation reached its intended durable state,
+        // which for the manual channel is `awaiting_manual_delivery`.
+        committed: parked === 'ok', staleLease: parked !== 'ok',
+        code: 'awaiting_manual_delivery',
+      };
+    }
+
     const outcome = await deps.stores.completeOperation(claim.id, claim.leaseToken, anchor, claim.marker);
     emit(outcome === 'ok' ? 'completed' : 'stale_lease', result.delivery);
     return {

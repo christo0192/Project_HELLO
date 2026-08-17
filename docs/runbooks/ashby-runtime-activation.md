@@ -72,7 +72,7 @@ Four independent, jittered, single-flight loops (see `scheduler.ts`):
 | Loop | Work |
 |---|---|
 | `signal` | Claims `ashby.signal`, `ashby.import`, `ashby.ingestion` jobs through the leased queue runner. |
-| `operation` | Claims **`invite_delivery` operations and nothing else** (see §6). |
+| `operation` | Claims **`invite_delivery` operations and nothing else** (see §7). |
 | `reconcile` | The dropped-webhook safety net, under a DB single-flight lease. |
 | `reclaim` | `reclaimExpired` — requeues or dead-letters jobs whose lease expired. |
 
@@ -81,7 +81,8 @@ The chain: signed webhook → receipt + outbox (one transaction) → `ashby.sign
 (dedup-keyed by **application**, so duplicate webhooks and reconciliation
 recoveries converge to one import) → link + `invite_delivery` operation +
 `ashby.ingestion` job → ephemeral fetch/scan/parse → candidate → one manual
-24-hour invite.
+24-hour invite, whose delivery operation rests at `awaiting_manual_delivery`
+until an admin obtains the link (§5).
 
 **Multi-machine safety** comes from the database leases (`FOR UPDATE SKIP
 LOCKED` + compare-and-set on the live lease token), never from an assumption
@@ -102,14 +103,53 @@ Do not proceed on a red gate. Each stage is independently reversible.
 | 3 | Create mappings: `POST …/mission-control/mappings` (admin). | Every mapping lands `paused`. Enabling an incomplete/drifted mapping is refused by the DB. |
 | 4 | `ASHBY_INTEGRATION_ENABLED=true`, register the webhook. **All mappings still paused.** | Receipts accumulate; reconciliation drains and advances; **zero imports**. |
 | 5 | `ASHBY_RESUME_HOSTS=<exact presigned host>`; confirm `RESUME_SCANNER=clamav`. | Health shows `resumeAllowlistEnabled: true`. One synthetic resume ingests end-to-end; the bucket holds no Ashby original. |
-| 6 | Enable **one** mapping via `POST …/mappings/{id}/resume`. | One application flows to exactly one manual 24-hour invite. Email stays `blocked_provider`. |
+| 6 | Enable **one** mapping via `POST …/mappings/{id}/resume`. | One application flows to a minted invite whose delivery operation rests at `awaiting_manual_delivery`. An admin then clicks **Get invite link** in Mission Control (or calls `POST …/workflows/{id}/invite`), receives the candidate URL once, and the operation becomes `succeeded`. Email stays `blocked_provider`. |
 | 7 | Remaining mappings. | DLQ empty; reconciliation advancing; `no_progress_runs` at 0. |
 
-There is deliberately **no write-back stage**: see §6.
+There is deliberately **no write-back stage**: see §7.
 
 ---
 
-## 5. Rollback
+## 5. Handing the candidate their link (manual delivery)
+
+Minting an invite produces only a SHA-256 digest — by design, so a leaked
+database or log cannot be replayed. That means the plaintext link exists for
+exactly one moment: the HTTPS response to an authenticated admin.
+
+**Operator flow.** Mission Control → *Application workflows* → **Get invite
+link** (or **Reissue invite link**). The link is shown once with its true
+expiry and a Copy button; send it to the candidate yourself. Equivalent API:
+
+```
+POST /api/integrations/ashby/mission-control/workflows/{applicationLinkId}/invite
+```
+
+**Guarantees.**
+
+- Admin-only. Interviewer, viewer, candidate and unauthenticated callers get
+  403 and no token is minted.
+- Atomic revoke-then-issue in one transaction: reissuing kills the previous
+  link before the new one exists, so there is never more than one live invite
+  for the session.
+- Exactly 24 hours, pinned by a database CHECK.
+- The response is `Cache-Control: no-store, private`. The token rides in the
+  URL **fragment**, which browsers never send to a server, and the candidate
+  page moves it straight into memory and strips it from the address bar.
+- The token is never logged, audited, persisted, placed in a query string, or
+  sent to Ashby. Only its digest reaches the database.
+- Refused for a terminal application (`blocked_terminal`) and for one whose
+  screening session has not been materialized yet (`not_ready`).
+
+**Why the operation says `awaiting_manual_delivery`.** Until a human has taken
+possession of a usable link, no candidate can be contacted. Reporting that
+operation as `succeeded` — which an earlier revision did — told the operator
+delivery had happened when it had not. `succeeded` now means exactly one thing:
+an authorized admin obtained the link.
+
+**The link is genuinely unrecoverable.** If it is lost, reissue. There is no
+"show it again", because the server does not have it.
+
+## 6. Rollback
 
 Rollback is a flag flip at any stage, in this order:
 
@@ -132,7 +172,7 @@ unused.
 
 ---
 
-## 6. Why nothing is written back to Ashby (read this before "fixing" it)
+## 7. Why nothing is written back to Ashby (read this before "fixing" it)
 
 **No approved Ashby result sink exists.** A completed screening therefore parks
 at the `writeback_pending` lifecycle state (0032) and NOTHING is published: no
@@ -163,7 +203,7 @@ ids AND a durable verified binding — it is not a flag flip, and widening
 
 ---
 
-## 7. Health and operability
+## 8. Health and operability
 
 `GET /api/integrations/ashby/mission-control/health` (interviewer+). Returns
 **booleans, bounded integers and counts only** — never the API key, the webhook
@@ -173,12 +213,27 @@ claiming `ok` would be a lie.
 
 The public `GET /api/health` deliberately remains a liveness-only `{ok:true}`.
 
-**What health does NOT tell you.** The handler reports runtime *configuration*,
-not live loop liveness — it does not own the in-process scheduler handle. Use the
-backlog as the liveness signal instead: if `ashby.signal`/`ashby.import` jobs or
-`pending` operations stop draining while the flags are on, the loops are not
-running. Metrics `ashby_scheduler_tick` / `ashby_scheduler_tick_error` are emitted
-per loop and are the intended alerting surface.
+**Two independent liveness signals, because neither alone is truthful.**
+
+1. **In-process scheduler heartbeat** (`scheduler`): real tick bookkeeping from
+   the live scheduler handle — `lastTickAt`, `ticks`, `errors`,
+   `consecutiveErrors`, and a `stale` flag when a loop has not ticked within
+   three of its own intervals (floor 30 s). `registeredInThisProcess: false`
+   means *this machine* has no scheduler; it is **not** a claim about the fleet,
+   because `auto_start_machines` can run several machines.
+2. **Durable backlog** (`backlog`): correct on any machine — `queuePending`,
+   `dlqDepth`, `oldestPendingAgeSec`, `operationsPending`, `operationsFailed`,
+   `operationsAwaitingDelivery`, `writebackPending`, `reconcileNoProgressRuns`,
+   `reconcileLastSuccessAt`.
+
+`status` is `healthy` / `degraded` / `idle` (idle = the integration is switched
+off, which is neither healthy nor broken), with stable `reasons` codes:
+`dlq_non_empty`, `queue_not_draining`, `reconciliation_not_advancing`,
+`scheduler_loop_stale`, `scheduler_stopped`, `backlog_unavailable`. Thresholds
+are returned in the payload so an alert can be written against them.
+
+**Config-active is never reported as worker-live**: an integration with every
+flag on but a dead scheduler reports `degraded`, not `healthy`.
 
 ### Triage
 
@@ -192,10 +247,13 @@ per loop and are the intended alerting surface.
 | DLQ growing | Repeated handler failures | Inspect `job_dlq`; replay with `replayDlq` after fixing the cause. |
 | Retry refused with `blocked_terminal` | The application is withdrawn/deleted/cancelled | Correct — terminal work is never resurrected. |
 | Retry refused with `retry_exhausted` | `attempts` reached `max_attempts` | Deliberate bound. Investigate rather than forcing. |
+| `operationsAwaitingDelivery` climbing | Invites minted but no admin has taken the links | Expected until an operator runs the §5 hand-off. Not an error. |
+| `writebackPending` climbing | Screenings completing with no approved result sink | Expected (§7). These are results awaiting manual publication. |
+| Health `degraded` with `scheduler_loop_stale` | A loop stopped ticking on THIS machine | Check the process; the backlog fields tell you whether another machine is still draining. |
 
 ---
 
-## 8. Known limitations recorded honestly
+## 9. Known limitations recorded honestly
 
 - **`maxPinnedIps` is computed but only the first resolved IP is used**
   (`resume-transport.ts`). Not a vulnerability — every resolved address is
@@ -206,6 +264,21 @@ per loop and are the intended alerting surface.
   keep the bounded caps and make a non-advancing run *observable* via
   `no_progress_runs`, rather than advancing a partial cursor. Chosen because
   advancing past unprocessed work would silently skip applications.
-- **Health is configuration-derived, not heartbeat-derived** (§7).
-- **No web UI** for the new mapping-provisioning or probe endpoints in this PR —
-  they are API-only. Mission Control's existing pages are unchanged.
+- **Health is now heartbeat + backlog derived** (§8). The heartbeat is
+  process-local by necessity; the backlog is the fleet-wide signal.
+- **No web UI** for the mapping-provisioning or stage-probe endpoints — they
+  remain API-only. Mission Control *does* now carry the manual invite hand-off
+  (§5).
+- **`consent_at` is NULL for Ashby-originated candidates.** The recruiter upload
+  path stamps it because a human watched the submission happen; an Ashby import
+  has no such moment — the applicant consented in the tenant's system at a time
+  only the tenant knows. Writing `now()` would fabricate a consent timestamp, so
+  it is deliberately left null. This is also the safe choice: the column default
+  keeps `consent_source='job_application'`, so the DSAR/recording/outbound gates
+  stay exactly as restrictive as for every other candidate — nothing is
+  over-permitted. Setting a real value needs the tenant/legal evidence that is
+  out of scope here (Legal D-010 remains an unwaived go-live gate).
+- **Queue error text is allowlisted, not denylisted.** A handler error that is
+  not already a stable snake_case code is persisted as `unknown_error`; the
+  detail is lost on purpose so a driver message carrying row content can never
+  reach `job_queue.error_message` or the DLQ.

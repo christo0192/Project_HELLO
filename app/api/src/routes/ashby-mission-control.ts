@@ -34,8 +34,22 @@ import {
   describeAshbyRuntime,
   isAshbyRuntimeActive,
 } from '../integrations/ashby/config.js';
-import { createAshbyRuntime } from '../integrations/ashby/runtime.js';
 import { probeJobStages } from '../integrations/ashby/probe.js';
+import { createAshbyProbeClient } from '../integrations/ashby/runtime.js';
+import {
+  snapshotScheduler,
+  readBacklog,
+  evaluateDegradation,
+  DEGRADE_THRESHOLDS,
+  type BacklogView,
+} from '../integrations/ashby/runtime-health.js';
+import {
+  generateInviteToken,
+  hashInviteToken,
+  inviteExpiresAt,
+  INVITE_TTL_HOURS,
+} from '../lib/invite-token.js';
+import { env } from '../lib/env.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const TERMINAL_STATES = new Set(['withdrawn', 'deleted', 'manual_stage_cancel']);
@@ -45,6 +59,15 @@ const DEFAULT_LIMIT = 50;
 function boundedLimit(raw: unknown): number {
   const n = typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : DEFAULT_LIMIT;
   return Math.min(MAX_LIMIT, Math.max(1, n));
+}
+
+/**
+ * First configured web origin, used to build the candidate join link. WEB_ORIGIN
+ * is a validated canonical allowlist (see app.ts), so this is not user input.
+ */
+function primaryWebOrigin(): string {
+  const first = env.webOrigin.split(',')[0]?.trim() ?? '';
+  return first.replace(/\/+$/, '');
 }
 
 function sanitizedReason(raw: unknown): string | null {
@@ -74,6 +97,10 @@ export interface AshbyMissionControlDeps {
   probeReader?: Parameters<typeof probeJobStages>[1] | null;
   /** Injected config sources for deterministic health tests. */
   configSource?: NodeJS.ProcessEnv;
+  /** Injected scheduler snapshot (tests). Production reads the live registry. */
+  schedulerSnapshot?: () => ReturnType<typeof snapshotScheduler>;
+  /** Injected backlog reader (tests). Production queries the database. */
+  backlog?: () => Promise<BacklogView>;
 }
 
 export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = {}): Router {
@@ -84,10 +111,13 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
     return cached;
   };
 
-  // Lazily resolve the probe reader from the runtime. When any gate is closed
-  // `createAshbyRuntime` returns null, so no client is built and the probe
-  // route answers 503 without a network call. `undefined` in deps means
-  // "resolve from the runtime"; an explicit `null` means "disabled" (tests).
+  // Lazily resolve the probe reader. When any gate is closed the factory
+  // returns null, so no client is built and the probe route answers 503
+  // without a network call. `undefined` in deps means "resolve from config";
+  // an explicit `null` means "disabled" (tests).
+  //
+  // This builds ONLY a client — not a whole runtime — so the route owns no
+  // parser pool or other resource it would need to shut down (finding L3).
   let probeResolved = false;
   let probeReader: Parameters<typeof probeJobStages>[1] | null = null;
   const resolveProbeReader = (): Parameters<typeof probeJobStages>[1] | null => {
@@ -96,11 +126,10 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
     probeResolved = true;
     try {
       const source = deps.configSource ?? process.env;
-      if (!isAshbyRuntimeActive(loadAshbyConfig(source), loadAshbyRuntimeConfig(source))) {
-        probeReader = null;
-        return null;
-      }
-      probeReader = createAshbyRuntime({ supabase: supabase as never })?.client ?? null;
+      probeReader = createAshbyProbeClient({
+        config: loadAshbyConfig(source),
+        runtimeConfig: loadAshbyRuntimeConfig(source),
+      });
     } catch {
       probeReader = null;
     }
@@ -187,15 +216,39 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
       const rc = loadAshbyRuntimeConfig(source);
       const integration = describeAshbyConfig(cfg);
       const runtime = describeAshbyRuntime(cfg, rc);
-      // The runtime is reported from CONFIG, not from "the module was imported".
-      // A truthful liveness signal for the loops themselves requires the
-      // in-process scheduler handle, which this router does not own; the
-      // documented substitute is the operation/queue backlog below, which goes
-      // stale precisely when the loops stop.
+
+      // Two INDEPENDENT liveness signals, because neither alone is truthful:
+      //  - the in-process scheduler heartbeat (real tick bookkeeping, but only
+      //    describes THIS machine);
+      //  - the durable backlog (correct fleet-wide, on any machine).
+      // Config-active is never reported as worker-live.
+      const scheduler = deps.schedulerSnapshot
+        ? deps.schedulerSnapshot()
+        : snapshotScheduler();
+      let backlog: BacklogView | null = null;
+      let backlogError = false;
+      try {
+        backlog = deps.backlog ? await deps.backlog() : await readBacklog(supabase as never);
+      } catch {
+        // A backlog read failure must not take the whole health surface down,
+        // but it must not be silently reported as a healthy zero either.
+        backlogError = true;
+      }
+
+      const verdict = backlog
+        ? evaluateDegradation({ active: runtime.active, scheduler, backlog })
+        : { status: 'degraded' as const, reasons: ['backlog_unavailable'] };
+
       res.json({
         ok: true,
+        status: verdict.status,
+        reasons: verdict.reasons,
         integration,
         runtime,
+        scheduler,
+        backlog,
+        backlogError,
+        thresholds: DEGRADE_THRESHOLDS,
         // No live-connectivity claim is made anywhere here: nothing in this
         // handler contacts Ashby, so asserting "provider ok" would be a lie.
         provider: 'unknown',
@@ -305,6 +358,71 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
       // A tenant 401/403/404 is reported as a sanitized capability failure and
       // enables nothing. Never echo the provider body.
       res.status(502).json({ ok: false, error: 'probe_unavailable' });
+    }
+  });
+
+  // ── Manual invite delivery / reissue (admin) ──────────────────────────────
+  // The delivery half of the manual channel. Minting an invite only produces a
+  // SHA-256 digest, so without this endpoint the candidate could never be
+  // contacted and the delivery operation would report success for work that
+  // never happened. The operation worker therefore parks manual deliveries as
+  // `awaiting_manual_delivery`; this route is what genuinely completes them.
+  //
+  // TOKEN HANDLING: the plaintext is minted here, hashed, and the DIGEST alone
+  // is sent to the RPC. The plaintext is returned exactly once in this HTTPS
+  // response and is never logged, audited, persisted, put in a URL query, or
+  // sent to Ashby. The candidate link carries it in the URL FRAGMENT, which
+  // browsers do not send to servers and which CandidateJoinPage strips
+  // immediately into memory.
+  router.post('/workflows/:id/invite', requireRole('admin'), async (req: Request, res: Response) => {
+    const id = req.params.id;
+    if (!UUID_RE.test(id)) { res.status(400).json({ ok: false, error: 'invalid_workflow_id' }); return; }
+    const actorId = req.authUser?.id ?? null;
+    if (!actorId) { res.status(403).json({ ok: false, error: 'forbidden' }); return; }
+
+    // A one-time secret must never be cached by a proxy, the browser, or a
+    // back/forward restore.
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    res.setHeader('Pragma', 'no-cache');
+
+    try {
+      const token = generateInviteToken();
+      const expiresAt = inviteExpiresAt().toISOString();
+      const result = await store().reissueManualInvite({
+        applicationLinkId: id,
+        tokenDigest: hashInviteToken(token),
+        expiresAt,
+        actorId,
+      });
+
+      if (result.status !== 'ok') {
+        if (result.status === 'not_found') { res.status(404).json({ ok: false, error: 'not_found' }); return; }
+        // blocked_terminal / not_ready / invalid_* are all 409 conflicts.
+        res.status(409).json({ ok: false, error: result.status });
+        return;
+      }
+
+      // Audited WITHOUT the token — opaque ids and a count only.
+      await recordAudit(req, 'resource.create', 200, {
+        metadata: {
+          resource: 'ashby_manual_invite',
+          application_link_id: id,
+          invite_id: result.inviteId ?? null,
+          revoked_invites: result.revokedInvites ?? 0,
+        },
+      });
+
+      res.json({
+        ok: true,
+        invite_id: result.inviteId,
+        // Fragment, never a query parameter.
+        join_url: `${primaryWebOrigin()}/candidate/join#${token}`,
+        expires_at: expiresAt,
+        ttl_hours: INVITE_TTL_HOURS,
+        revoked_invites: result.revokedInvites ?? 0,
+      });
+    } catch {
+      res.status(500).json({ ok: false, error: 'mission_control_action_error' });
     }
   });
 

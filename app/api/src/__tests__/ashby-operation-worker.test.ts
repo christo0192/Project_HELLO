@@ -15,7 +15,7 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { runClaimedAshbyOperation } from '../integrations/ashby/operation-worker.js';
+import { runClaimedAshbyOperation, channelForOperationKey } from '../integrations/ashby/operation-worker.js';
 import type { RuntimeWorkflowStores, OperationClaimRow, WorkflowLinkRow } from '../integrations/ashby/orchestration.js';
 import type { MaterializationStore, MaterializationMapping } from '../integrations/ashby/materialize.js';
 
@@ -27,6 +27,7 @@ const OWNER = '33333333-3333-4333-8333-333333333333';
 const claim: OperationClaimRow = {
   id: 'op_1',
   operationType: 'invite_delivery',
+  operationKey: `ashby:invite:${APP}:manual:pending`,
   applicationLinkId: LINK,
   leaseToken: 'lease-abc',
   attempts: 1,
@@ -64,6 +65,7 @@ function stores(over: Partial<RuntimeWorkflowStores> = {}): RuntimeWorkflowStore
     completeOperation: async () => 'ok',
     failOperation: async () => ({ outcome: 'retry' }),
     claimOperation: async () => claim,
+    parkOperationAwaitingDelivery: async () => 'ok',
     readIngestion: async () => ({ state: 'ready', attempts: 0 }),
     readLink: async () => link,
     markWritebackPending: async () => ({ status: 'ok' }),
@@ -85,18 +87,44 @@ function deps(over: Partial<Parameters<typeof runClaimedAshbyOperation>[0]> = {}
   };
 }
 
-describe('runClaimedAshbyOperation — happy path', () => {
-  it('claims, materializes an invite, and completes under the lease', async () => {
+describe('runClaimedAshbyOperation — manual channel parks, never "succeeds"', () => {
+  it('parks the manual delivery as awaiting_manual_delivery and does NOT complete it', async () => {
     const complete = vi.fn(async () => 'ok' as const);
-    const r = await runClaimedAshbyOperation(deps({ stores: stores({ completeOperation: complete }) }));
+    const park = vi.fn(async () => 'ok' as const);
+    const r = await runClaimedAshbyOperation(deps({
+      stores: stores({ completeOperation: complete, parkOperationAwaitingDelivery: park }),
+    }));
 
-    expect(r).toMatchObject({ claimed: true, committed: true, staleLease: false, code: 'manual_reissue' });
-    expect(complete).toHaveBeenCalledTimes(1);
+    expect(r).toMatchObject({
+      claimed: true, committed: true, staleLease: false, code: 'awaiting_manual_delivery',
+    });
+    // Minting an invite only produces a digest. Until an admin obtains a usable
+    // link, `succeeded` would report work that has not happened.
+    expect(complete).not.toHaveBeenCalled();
+    expect(park).toHaveBeenCalledTimes(1);
+
     // The external anchor is an OPAQUE invite row id — never a token or URL.
-    const [, leaseToken, anchor] = complete.mock.calls[0] as unknown as [string, string, string | null];
+    const [, leaseToken, anchor] = park.mock.calls[0] as unknown as [string, string, string | null];
     expect(leaseToken).toBe('lease-abc');
-    expect(typeof anchor === 'string' || anchor === null).toBe(true);
     expect(String(anchor)).not.toMatch(/^[a-f0-9]{64}$/); // not a token/digest
+  });
+
+  it('NEGATIVE CONTROL: completing instead of parking would report undelivered work as success', async () => {
+    // If a future change reverts to completeOperation for the manual channel,
+    // this assertion is what goes red.
+    const park = vi.fn(async () => 'ok' as const);
+    const r = await runClaimedAshbyOperation(deps({
+      stores: stores({ parkOperationAwaitingDelivery: park }),
+    }));
+    expect(r.claimed && r.code).not.toBe('manual_reissue');
+    expect(r.claimed && r.code).toBe('awaiting_manual_delivery');
+  });
+
+  it('commits nothing when the lease was lost before parking', async () => {
+    const r = await runClaimedAshbyOperation(deps({
+      stores: stores({ parkOperationAwaitingDelivery: async () => 'not_owned' }),
+    }));
+    expect(r).toMatchObject({ claimed: true, committed: false, staleLease: true });
   });
 
   it('reports not-claimed on an empty queue and touches nothing else', async () => {
@@ -110,13 +138,6 @@ describe('runClaimedAshbyOperation — happy path', () => {
 });
 
 describe('runClaimedAshbyOperation — fail-closed branches', () => {
-  it('commits nothing when the lease was lost before completion', async () => {
-    const r = await runClaimedAshbyOperation(deps({
-      stores: stores({ completeOperation: async () => 'not_owned' }),
-    }));
-    expect(r).toMatchObject({ claimed: true, committed: false, staleLease: true });
-  });
-
   it('blocks a terminal application even after the row was claimed', async () => {
     const complete = vi.fn(async () => 'ok' as const);
     const fail = vi.fn(async () => ({ outcome: 'failed' as const }));
@@ -194,12 +215,62 @@ describe('runClaimedAshbyOperation — fail-closed branches', () => {
 describe('runClaimedAshbyOperation — email channel', () => {
   it('completes the operation as blocked_provider with zero sends', async () => {
     const complete = vi.fn(async () => 'ok' as const);
+    const emailClaim = { ...claim, operationKey: `ashby:invite:${APP}:email:pending` };
     const r = await runClaimedAshbyOperation(deps({
       resolveMappingForLink: async () => ({ ...mapping, deliveryMode: 'email' }),
-      stores: stores({ completeOperation: complete }),
+      stores: stores({ completeOperation: complete, claimOperation: async () => emailClaim }),
     }));
     expect(r).toMatchObject({ claimed: true, code: 'blocked_provider' });
-    // The operation is durably resolved (not retried forever) but nothing was sent.
+    // The operation is durably resolved (not retried forever) but nothing was sent,
+    // and it is NOT parked as awaiting manual delivery.
     expect(complete).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('channelForOperationKey — delivery_mode "both" resolves per operation', () => {
+  it('reads the channel from the operation key, not the mapping mode', () => {
+    expect(channelForOperationKey('ashby:invite:app_1:manual:pending', 'both')).toBe('manual');
+    expect(channelForOperationKey('ashby:invite:app_1:email:pending', 'both')).toBe('email');
+    expect(channelForOperationKey('ashby:invite:app_1:email:pending', 'manual')).toBe('email');
+  });
+
+  it('falls back to the mapping mode when the key is unusable', () => {
+    expect(channelForOperationKey(null, 'email')).toBe('email');
+    expect(channelForOperationKey(null, 'manual')).toBe('manual');
+    // An ambiguous `both` with no key resolves to the only channel that can
+    // actually deliver, rather than claiming the email channel worked.
+    expect(channelForOperationKey(null, 'both')).toBe('manual');
+    expect(channelForOperationKey('garbage-key', 'both')).toBe('manual');
+  });
+});
+
+describe('delivery_mode "both" — one manual op parks, one email op blocks', () => {
+  it('resolves each of the two operations to its own channel', async () => {
+    const bothMapping = { ...mapping, deliveryMode: 'both' as const };
+    const park = vi.fn(async () => 'ok' as const);
+    const complete = vi.fn(async () => 'ok' as const);
+
+    const manual = await runClaimedAshbyOperation(deps({
+      resolveMappingForLink: async () => bothMapping,
+      stores: stores({
+        claimOperation: async () => ({ ...claim, operationKey: `ashby:invite:${APP}:manual:pending` }),
+        parkOperationAwaitingDelivery: park, completeOperation: complete,
+      }),
+    }));
+    const email = await runClaimedAshbyOperation(deps({
+      resolveMappingForLink: async () => bothMapping,
+      stores: stores({
+        claimOperation: async () => ({ ...claim, id: 'op_2', operationKey: `ashby:invite:${APP}:email:pending` }),
+        parkOperationAwaitingDelivery: park, completeOperation: complete,
+      }),
+    }));
+
+    expect(manual).toMatchObject({ code: 'awaiting_manual_delivery' });
+    expect(email).toMatchObject({ code: 'blocked_provider' });
+    // The email operation must never be parked as a manual hand-off, and the
+    // manual one must never be completed as a provider send.
+    expect(park).toHaveBeenCalledTimes(1);
+    expect(complete).toHaveBeenCalledTimes(1);
+    expect((complete.mock.calls[0] as unknown as string[])[0]).toBe('op_2');
   });
 });

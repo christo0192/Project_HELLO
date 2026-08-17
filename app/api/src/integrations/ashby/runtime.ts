@@ -134,6 +134,24 @@ export function createMaterializationStore(client: SupabaseClient): Materializat
       return { id: (data as { id: string }).id };
     },
     async insertCandidate(input) {
+      // ── consent_at is deliberately NOT set (review finding L1) ──────────
+      // The recruiter upload path sets `consent_source='job_application'` and
+      // `consent_at=now()` because a human just watched a candidate submit an
+      // application. An Ashby import has no such moment: the applicant
+      // consented in the TENANT's system, at a time only the tenant knows.
+      //
+      // Writing `now()` here would fabricate a consent timestamp — recording
+      // when WE imported the row as if it were when the candidate agreed.
+      // Leaving it null is the honest state and is also the SAFE one: the
+      // column default keeps `consent_source='job_application'`, so the
+      // recording/outbound gates in lib/dsar.ts stay exactly as restrictive as
+      // they are for every other candidate. Nothing is over-permitted; what is
+      // lost is only the ability to report a capture time, and DSAR export
+      // correctly shows `consent_at: null` rather than a fiction.
+      //
+      // Setting a real value requires the tenant/legal evidence that the
+      // implementation contract explicitly placed out of scope (Legal D-010).
+      // See docs/runbooks/ashby-runtime-activation.md §8.
       const p = input.parsed;
       const { data, error } = await client
         .from('candidates')
@@ -231,6 +249,30 @@ export function createMaterializationStore(client: SupabaseClient): Materializat
       return { id: (data as { id: string }).id };
     },
   };
+}
+
+/**
+ * Build ONLY the outbound Ashby client, or null when any gate is closed.
+ *
+ * The read-only probe route needs a client and nothing else. Building a whole
+ * runtime for it allocated a resume parser pool whose `shutdown()` the route
+ * never called (review finding L3) — harmless today because the pool spawns
+ * children lazily and the probe never parses, but it is a resource the caller
+ * had no way to release. This factory owns no resources at all.
+ */
+export function createAshbyProbeClient(options: {
+  config?: AshbyIntegrationConfig;
+  runtimeConfig?: AshbyRuntimeConfig;
+  transport?: Parameters<typeof createAshbyClient>[0]['transport'];
+}): AshbyClient | null {
+  const config = options.config ?? loadAshbyConfig();
+  const runtimeConfig = options.runtimeConfig ?? loadAshbyRuntimeConfig();
+  if (!isAshbyRuntimeActive(config, runtimeConfig)) return null;
+  return createAshbyClient({
+    apiKey: runtimeConfig.apiKey,
+    transport: options.transport,
+    logger: createMetadataLogger('ashby-probe'),
+  });
 }
 
 /**

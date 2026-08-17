@@ -3,17 +3,18 @@ import userEvent from '@testing-library/user-event';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { AshbyMissionControlPage } from './AshbyMissionControlPage';
 
-const { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation } = vi.hoisted(() => ({
+const { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation, deliverAshbyManualInvite } = vi.hoisted(() => ({
   listAshbyMappings: vi.fn(),
   listAshbyWorkflows: vi.fn(),
   pauseAshbyMapping: vi.fn(),
   resumeAshbyMapping: vi.fn(),
   cancelAshbyWorkflow: vi.fn(),
   retryAshbyOperation: vi.fn(),
+  deliverAshbyManualInvite: vi.fn(),
 }));
 
 vi.mock('../api', () => ({
-  api: { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation },
+  api: { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation, deliverAshbyManualInvite },
   ApiError: class ApiError extends Error {
     status: number;
     constructor(m: string, s: number) { super(m); this.status = s; }
@@ -43,6 +44,14 @@ describe('AshbyMissionControlPage', () => {
     resumeAshbyMapping.mockResolvedValue({ ok: true, status: 'enabled' });
     cancelAshbyWorkflow.mockResolvedValue({ ok: true, cancelled_operations: 1, cancelled_ingestion: 1 });
     retryAshbyOperation.mockResolvedValue({ ok: true });
+    deliverAshbyManualInvite.mockResolvedValue({
+      ok: true,
+      invite_id: 'inv_1',
+      join_url: 'https://app.example/candidate/join#' + 'a'.repeat(64),
+      expires_at: '2026-08-18T00:00:00.000Z',
+      ttl_hours: 24,
+      revoked_invites: 1,
+    });
   });
 
   it('renders sanitized mappings + workflows (no PII/tokens)', async () => {
@@ -85,5 +94,103 @@ describe('AshbyMissionControlPage', () => {
     const { container } = render(<AshbyMissionControlPage />);
     await screen.findByText('job_1');
     await expect(container).toHaveNoViolations();
+  });
+});
+
+describe('AshbyMissionControlPage — manual invite delivery (B1)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    listAshbyMappings.mockResolvedValue(MAPPINGS);
+    listAshbyWorkflows.mockResolvedValue(WORKFLOWS);
+    deliverAshbyManualInvite.mockResolvedValue({
+      ok: true,
+      invite_id: 'inv_1',
+      join_url: 'https://app.example/candidate/join#' + 'a'.repeat(64),
+      expires_at: '2026-08-18T00:00:00.000Z',
+      ttl_hours: 24,
+      revoked_invites: 1,
+    });
+  });
+
+  it('lets an admin obtain a usable candidate link and shows its expiry', async () => {
+    render(<AshbyMissionControlPage />);
+    const button = await screen.findByRole('button', { name: /get invite link/i });
+    await userEvent.click(button);
+
+    await waitFor(() => expect(deliverAshbyManualInvite).toHaveBeenCalledWith('l1'));
+    const field = await screen.findByLabelText(/candidate link/i);
+    expect((field as HTMLInputElement).value).toContain('/candidate/join#');
+    // Truthful expiry, not a hardcoded string.
+    expect(screen.getByText(/expires/i)).toBeInTheDocument();
+    expect((field as HTMLInputElement).readOnly).toBe(true);
+  });
+
+  it('keeps the token out of the URL, storage and telemetry', async () => {
+    const setItem = vi.spyOn(Storage.prototype, 'setItem');
+    render(<AshbyMissionControlPage />);
+    await userEvent.click(await screen.findByRole('button', { name: /get invite link/i }));
+    const field = (await screen.findByLabelText(/candidate link/i)) as HTMLInputElement;
+    const token = field.value.split('#')[1];
+    expect(token).toMatch(/^[a-f0-9]{64}$/);
+
+    // Never written to local/session storage …
+    for (const call of setItem.mock.calls) {
+      expect(String(call[1])).not.toContain(token);
+    }
+    // … and never placed in the page URL.
+    expect(window.location.href).not.toContain(token);
+    expect(window.location.search).toBe('');
+    setItem.mockRestore();
+  });
+
+  it('copies the link on demand', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    render(<AshbyMissionControlPage />);
+    await userEvent.click(await screen.findByRole('button', { name: /get invite link/i }));
+    await screen.findByLabelText(/candidate link/i);
+    await userEvent.click(screen.getByRole('button', { name: /^copy$/i }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledTimes(1));
+    expect(String(writeText.mock.calls[0][0])).toContain('/candidate/join#');
+    expect(await screen.findByRole('button', { name: /copied/i })).toBeInTheDocument();
+  });
+
+  it('shows a truthful error and NO link when the server refuses', async () => {
+    deliverAshbyManualInvite.mockResolvedValue({ ok: false, error: 'blocked_terminal' });
+    render(<AshbyMissionControlPage />);
+    await userEvent.click(await screen.findByRole('button', { name: /get invite link/i }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(/blocked_terminal/i);
+    expect(screen.queryByLabelText(/candidate link/i)).toBeNull();
+  });
+
+  it('shows a truthful error when the request throws', async () => {
+    deliverAshbyManualInvite.mockRejectedValue(new Error('network down'));
+    render(<AshbyMissionControlPage />);
+    await userEvent.click(await screen.findByRole('button', { name: /get invite link/i }));
+    expect(await screen.findByRole('alert')).toBeInTheDocument();
+    expect(screen.queryByLabelText(/candidate link/i)).toBeNull();
+  });
+
+  it('offers reissue once a delivery has succeeded', async () => {
+    listAshbyWorkflows.mockResolvedValue({
+      ok: true,
+      workflows: [{
+        ...WORKFLOWS.workflows[0],
+        operations: [{ id: 'op2', type: 'invite_delivery', state: 'succeeded', errorCode: null }],
+      }],
+    });
+    render(<AshbyMissionControlPage />);
+    expect(await screen.findByRole('button', { name: /reissue invite link/i })).toBeInTheDocument();
+  });
+
+  it('disables delivery for a terminal application', async () => {
+    listAshbyWorkflows.mockResolvedValue({
+      ok: true,
+      workflows: [{ ...WORKFLOWS.workflows[0], terminalState: 'withdrawn' }],
+    });
+    render(<AshbyMissionControlPage />);
+    const button = await screen.findByRole('button', { name: /get invite link/i });
+    expect(button).toBeDisabled();
+    expect(deliverAshbyManualInvite).not.toHaveBeenCalled();
   });
 });

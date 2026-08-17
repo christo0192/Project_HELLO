@@ -62,6 +62,14 @@ export interface EnqueueResult {
 export interface OperationClaimRow {
   id: string;
   operationType: 'invite_delivery' | 'scorecard_write' | 'stage_move';
+  /**
+   * The deterministic operation key. It encodes the delivery CHANNEL
+   * (`ashby:invite:<app>:<channel>:<invite>`), which is why the claim RPC
+   * returns it: without the key a `delivery_mode='both'` mapping enqueues two
+   * operations that are indistinguishable at execution time, and both collapse
+   * to the manual channel.
+   */
+  operationKey: string | null;
   applicationLinkId: string;
   leaseToken: string;
   attempts: number;
@@ -124,6 +132,16 @@ export interface RuntimeWorkflowStores extends WorkflowStores {
   readLink(applicationLinkId: string): Promise<WorkflowLinkRow | null>;
   /** Park a completed application as `writeback_pending` (audited, idempotent). */
   markWritebackPending(applicationLinkId: string, reason: string): Promise<{ status: string }>;
+  /**
+   * CAS a manual invite_delivery operation from `running` to
+   * `awaiting_manual_delivery`. The invite digest exists but no recruiter has
+   * obtained a usable link, so this is deliberately NOT success.
+   */
+  parkOperationAwaitingDelivery(
+    id: string,
+    leaseToken: string,
+    externalAnchor: string | null,
+  ): Promise<'ok' | 'not_owned'>;
 }
 
 /** The link fields the runtime needs; deliberately no PII and no tokens. */

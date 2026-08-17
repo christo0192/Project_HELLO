@@ -64,6 +64,7 @@ function runtimeStores(over: Partial<RuntimeWorkflowStores> = {}): RuntimeWorkfl
     completeOperation: async () => 'ok',
     failOperation: async () => ({ outcome: 'retry' }),
     claimOperation: async () => null,
+    parkOperationAwaitingDelivery: async () => 'ok',
     readIngestion: async () => ({ state: 'ready', attempts: 0 }),
     readLink: async () => null,
     markWritebackPending: async () => ({ status: 'ok' }),
