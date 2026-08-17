@@ -31,7 +31,7 @@ const MAPPINGS = {
 const WORKFLOWS = {
   ok: true,
   workflows: [
-    { applicationLinkId: 'l1', externalApplicationId: 'app_1', externalJobId: 'job_1', lifecycle: 'processing', terminalState: null, ingestionState: 'failed_review', operations: [{ id: 'op1', type: 'stage_move', state: 'failed', errorCode: 'transient_x' }], updatedAt: '2026-08-13T00:00:00Z' },
+    { applicationLinkId: 'l1', externalApplicationId: 'app_1', externalJobId: 'job_1', lifecycle: 'processing', terminalState: null, ingestionState: 'failed_review', operations: [{ id: 'op1', type: 'stage_move', state: 'failed', errorCode: 'transient_x' }], sessionStatus: 'in_progress', updatedAt: '2026-08-13T00:00:00Z' },
   ],
 };
 
@@ -181,6 +181,37 @@ describe('AshbyMissionControlPage — manual invite delivery (B1)', () => {
     });
     render(<AshbyMissionControlPage />);
     expect(await screen.findByRole('button', { name: /reissue invite link/i })).toBeInTheDocument();
+  });
+
+  it('flags a completed screening whose writeback park did not land', async () => {
+    listAshbyWorkflows.mockResolvedValue({
+      ok: true,
+      workflows: [{ ...WORKFLOWS.workflows[0], lifecycle: 'ready', sessionStatus: 'completed' }],
+    });
+    render(<AshbyMissionControlPage />);
+    // The completion observer is best-effort by design; this badge is what
+    // makes a park that never landed visible instead of log-only.
+    expect(await screen.findByText(/screened: not parked/i)).toBeInTheDocument();
+  });
+
+  it('does not flag a screening that parked correctly', async () => {
+    listAshbyWorkflows.mockResolvedValue({
+      ok: true,
+      workflows: [{ ...WORKFLOWS.workflows[0], lifecycle: 'writeback_pending', sessionStatus: 'completed' }],
+    });
+    render(<AshbyMissionControlPage />);
+    expect(await screen.findByText('app_1')).toBeInTheDocument();
+    expect(screen.queryByText(/screened: not parked/i)).toBeNull();
+  });
+
+  it('does not flag a terminal application', async () => {
+    listAshbyWorkflows.mockResolvedValue({
+      ok: true,
+      workflows: [{ ...WORKFLOWS.workflows[0], lifecycle: 'ready', sessionStatus: 'completed', terminalState: 'withdrawn' }],
+    });
+    render(<AshbyMissionControlPage />);
+    expect(await screen.findByText('app_1')).toBeInTheDocument();
+    expect(screen.queryByText(/screened: not parked/i)).toBeNull();
   });
 
   it('disables delivery for a terminal application', async () => {

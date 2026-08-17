@@ -192,6 +192,16 @@ export function AshbyMissionControlPage() {
                   {w.ingestionState && (
                     <span className="ml-2 text-xs text-gray-500">ingest: {w.ingestionState}</span>
                   )}
+                  {/* A completed screening whose link never reached
+                      `writeback_pending` is a completion park that did not
+                      land. The observer is best-effort by design (it must
+                      never discard a scored assessment), so this is where that
+                      case becomes visible instead of living only in a log. */}
+                  {w.sessionStatus === 'completed'
+                    && w.terminalState == null
+                    && w.lifecycle !== 'writeback_pending' && (
+                    <span className="ml-2 text-xs text-amber-700">screened: not parked</span>
+                  )}
                 </div>
                 <div className="flex items-center gap-2">
                   <button

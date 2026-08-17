@@ -149,6 +149,17 @@ an authorized admin obtained the link.
 **The link is genuinely unrecoverable.** If it is lost, reissue. There is no
 "show it again", because the server does not have it.
 
+**Why the email operation ends `failed / blocked_provider`.** The email channel
+is provider-gated and has no transport wired at all, so it sends nothing. The
+worker therefore records it as a durable, NON-retryable failure carrying the
+sanitized reason `blocked_provider` rather than completing it. Marking it
+`succeeded` would be the same untruth the manual channel was repaired for: an
+operator reading Mission Control would see a delivered email that no candidate
+ever received. A mapping in `email` or `both` mode will accumulate these; that
+is the honest signal that the mapping needs a decision — switch it to the manual
+channel, or wait for an approved provider and verified domain. The manual half
+of a `both` mapping is unaffected and still delivers.
+
 ## 6. Rollback
 
 Rollback is a flag flip at any stage, in this order:
@@ -249,6 +260,8 @@ flag on but a dead scheduler reports `degraded`, not `healthy`.
 | Retry refused with `retry_exhausted` | `attempts` reached `max_attempts` | Deliberate bound. Investigate rather than forcing. |
 | `operationsAwaitingDelivery` climbing | Invites minted but no admin has taken the links | Expected until an operator runs the §5 hand-off. Not an error. |
 | `writebackPending` climbing | Screenings completing with no approved result sink | Expected (§7). These are results awaiting manual publication. |
+| A workflow shows `screened: not parked` (session `completed`, lifecycle not `writeback_pending`, not terminal) | The completion observer's park did not land — it is best-effort so that a transient failure can never discard a scored assessment | The assessment itself is safe and visible on the ordinary session surfaces. Nothing downstream waits on `writeback_pending` (there is no result sink), so this is a bookkeeping gap. Re-parking is idempotent: it self-corrects on any later completion for that session, and the state is legible here rather than log-only. |
+| An `invite_delivery` operation shows `failed / blocked_provider` | The email channel is gated off (§5) | Expected for `email`/`both` mappings. Switch the mapping to `manual`, or wait for an approved provider. |
 | Health `degraded` with `scheduler_loop_stale` | A loop stopped ticking on THIS machine | Check the process; the backlog fields tell you whether another machine is still draining. |
 
 ---

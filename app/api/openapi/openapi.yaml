@@ -3164,6 +3164,10 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/AshbyMcWorkflowOperation'
+        sessionStatus:
+          type: string
+          nullable: true
+          description: Status of the screening session this application was materialized into, or null when none exists yet. A completed session on a non-terminal workflow whose lifecycle is not writeback_pending is a screening whose completion park did not land — the diagnostic the best-effort completion observer requires.
         updatedAt:
           type: string
           format: date-time

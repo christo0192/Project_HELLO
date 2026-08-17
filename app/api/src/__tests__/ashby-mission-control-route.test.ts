@@ -20,7 +20,7 @@ function fakeStore(over: Partial<MissionControlStore> = {}): MissionControlStore
       { id: UUID, externalJobId: 'job_1', status: 'drift', statusReason: 'stage_id_invalid', deliveryMode: 'both', hasAiStage: true, hasTaStage: false, label: null, updatedAt: '2026-08-13T00:00:00Z' },
     ],
     listWorkflows: async () => [
-      { applicationLinkId: UUID, externalApplicationId: 'app_1', externalJobId: 'job_1', lifecycle: 'processing', terminalState: null, ingestionState: 'failed_review', operations: [{ id: 'op_1', type: 'stage_move', state: 'failed', errorCode: 'transient_x' }], updatedAt: '2026-08-13T00:00:00Z' },
+      { applicationLinkId: UUID, externalApplicationId: 'app_1', externalJobId: 'job_1', lifecycle: 'processing', terminalState: null, ingestionState: 'failed_review', operations: [{ id: 'op_1', type: 'stage_move', state: 'failed', errorCode: 'transient_x' }], sessionStatus: 'in_progress', updatedAt: '2026-08-13T00:00:00Z' },
     ],
     setMappingStatus: async () => ({ status: 'ok', mappingStatus: 'paused' }),
     cancelApplication: async () => ({ status: 'ok', cancelledOperations: 2, cancelledIngestion: 1 }),
@@ -53,6 +53,24 @@ describe('reads — interviewer+ only', () => {
     expect(w.status).toBe(200);
     expect(w.body.workflows[0].ingestionState).toBe('failed_review');
     // No token/PII fields leak.
+    expect(JSON.stringify(w.body)).not.toMatch(/token|email|phone|bearer/i);
+  });
+
+  it('carries the screening session status so a park that did not land is visible', async () => {
+    const stranded = fakeStore({
+      listWorkflows: async () => [{
+        applicationLinkId: UUID, externalApplicationId: 'app_1', externalJobId: 'job_1',
+        lifecycle: 'ready', terminalState: null, ingestionState: 'ready', operations: [],
+        sessionStatus: 'completed', updatedAt: '2026-08-17T00:00:00Z',
+      }],
+    });
+    const w = await request(appWith('interviewer', stranded)).get('/mc/workflows');
+    expect(w.status).toBe(200);
+    // Completed screening + non-parked, non-terminal lifecycle = the stranded
+    // completion-park case the best-effort observer can produce.
+    expect(w.body.workflows[0].sessionStatus).toBe('completed');
+    expect(w.body.workflows[0].lifecycle).not.toBe('writeback_pending');
+    // Still no PII: a status enum only.
     expect(JSON.stringify(w.body)).not.toMatch(/token|email|phone|bearer/i);
   });
 

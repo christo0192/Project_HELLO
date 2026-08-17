@@ -213,17 +213,38 @@ describe('runClaimedAshbyOperation — fail-closed branches', () => {
 });
 
 describe('runClaimedAshbyOperation — email channel', () => {
-  it('completes the operation as blocked_provider with zero sends', async () => {
+  it('records blocked_provider as a durable non-retryable failure, never succeeded', async () => {
     const complete = vi.fn(async () => 'ok' as const);
+    const park = vi.fn(async () => 'ok' as const);
+    const fail = vi.fn(async () => ({ outcome: 'failed' as const }));
     const emailClaim = { ...claim, operationKey: `ashby:invite:${APP}:email:pending` };
     const r = await runClaimedAshbyOperation(deps({
       resolveMappingForLink: async () => ({ ...mapping, deliveryMode: 'email' }),
-      stores: stores({ completeOperation: complete, claimOperation: async () => emailClaim }),
+      stores: stores({
+        completeOperation: complete, parkOperationAwaitingDelivery: park,
+        failOperation: fail, claimOperation: async () => emailClaim,
+      }),
     }));
     expect(r).toMatchObject({ claimed: true, code: 'blocked_provider' });
-    // The operation is durably resolved (not retried forever) but nothing was sent,
-    // and it is NOT parked as awaiting manual delivery.
-    expect(complete).toHaveBeenCalledTimes(1);
+    // Zero mail was sent, so the operation must NOT be recorded as success —
+    // and it is not parked as a manual hand-off either.
+    expect(complete).not.toHaveBeenCalled();
+    expect(park).not.toHaveBeenCalled();
+    // Durably failed with the sanitized reason, non-retryable (no spin).
+    expect(fail).toHaveBeenCalledTimes(1);
+    expect(fail.mock.calls[0]).toEqual(['op_1', 'lease-abc', 'blocked_provider', false]);
+  });
+
+  it('does not report the blocked operation as committed', async () => {
+    const emailClaim = { ...claim, operationKey: `ashby:invite:${APP}:email:pending` };
+    const r = await runClaimedAshbyOperation(deps({
+      resolveMappingForLink: async () => ({ ...mapping, deliveryMode: 'email' }),
+      stores: stores({
+        failOperation: async () => ({ outcome: 'failed' as const }),
+        claimOperation: async () => emailClaim,
+      }),
+    }));
+    expect(r).toMatchObject({ claimed: true, committed: false, staleLease: false });
   });
 });
 
@@ -249,28 +270,32 @@ describe('delivery_mode "both" — one manual op parks, one email op blocks', ()
     const bothMapping = { ...mapping, deliveryMode: 'both' as const };
     const park = vi.fn(async () => 'ok' as const);
     const complete = vi.fn(async () => 'ok' as const);
+    const fail = vi.fn(async () => ({ outcome: 'failed' as const }));
 
     const manual = await runClaimedAshbyOperation(deps({
       resolveMappingForLink: async () => bothMapping,
       stores: stores({
         claimOperation: async () => ({ ...claim, operationKey: `ashby:invite:${APP}:manual:pending` }),
-        parkOperationAwaitingDelivery: park, completeOperation: complete,
+        parkOperationAwaitingDelivery: park, completeOperation: complete, failOperation: fail,
       }),
     }));
     const email = await runClaimedAshbyOperation(deps({
       resolveMappingForLink: async () => bothMapping,
       stores: stores({
         claimOperation: async () => ({ ...claim, id: 'op_2', operationKey: `ashby:invite:${APP}:email:pending` }),
-        parkOperationAwaitingDelivery: park, completeOperation: complete,
+        parkOperationAwaitingDelivery: park, completeOperation: complete, failOperation: fail,
       }),
     }));
 
     expect(manual).toMatchObject({ code: 'awaiting_manual_delivery' });
     expect(email).toMatchObject({ code: 'blocked_provider' });
-    // The email operation must never be parked as a manual hand-off, and the
-    // manual one must never be completed as a provider send.
+    // The email operation must never be parked as a manual hand-off, and
+    // NEITHER operation may be recorded as `succeeded`: the manual one parks
+    // until a human takes the link, the email one durably fails as blocked.
     expect(park).toHaveBeenCalledTimes(1);
-    expect(complete).toHaveBeenCalledTimes(1);
-    expect((complete.mock.calls[0] as unknown as string[])[0]).toBe('op_2');
+    expect((park.mock.calls[0] as unknown as string[])[0]).toBe('op_1');
+    expect(complete).not.toHaveBeenCalled();
+    expect(fail).toHaveBeenCalledTimes(1);
+    expect(fail.mock.calls[0]).toEqual(['op_2', 'lease-abc', 'blocked_provider', false]);
   });
 });

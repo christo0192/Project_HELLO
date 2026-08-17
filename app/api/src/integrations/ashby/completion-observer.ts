@@ -24,8 +24,16 @@
  * FAILURE POSTURE. The observer is best-effort with respect to scoring: a
  * failure here must never lose a completed assessment, which is the primary
  * product artifact. It is idempotent (the RPC returns `already_pending` on a
- * second call), and an un-parked application remains visible in Mission
- * Control as a completed session whose link is not `writeback_pending`.
+ * second call).
+ *
+ * Because it is best-effort, a park CAN fail to land, and that must not be
+ * knowable only from a log line. `MissionControlWorkflow.sessionStatus` carries
+ * the screening session's status, so a workflow whose session is `completed`
+ * while its lifecycle is not `writeback_pending` (and which is not terminal) is
+ * visible as exactly that case in the Mission Control list and is flagged in
+ * the web UI. Re-parking is idempotent, so the state is recoverable. Nothing
+ * downstream waits on `writeback_pending` — there is no result sink at all —
+ * so a missed park is a bookkeeping inaccuracy, not a halted workflow.
  */
 
 import { createLogger } from '../../lib/logger.js';

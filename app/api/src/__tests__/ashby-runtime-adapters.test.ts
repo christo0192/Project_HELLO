@@ -18,6 +18,7 @@ import {
   ASHBY_EXTRACTOR_VERSION,
 } from '../integrations/ashby/runtime.js';
 import { loadAshbyConfig, loadAshbyRuntimeConfig } from '../integrations/ashby/config.js';
+import { createMissionControlStore } from '../integrations/ashby/workflow-stores.js';
 
 const APIKEY = 'SENTINEL_APIKEY_aaaaaaaaaaaaaaaaaaaa';
 const SECRET = 'SENTINEL_SECRET_bbbbbbbbbbbbbbbbbbbb';
@@ -383,5 +384,67 @@ describe('runtime shutdown', () => {
     })!;
     await runtime.shutdown();
     await expect(runtime.shutdown()).resolves.toBeUndefined();
+  });
+});
+
+describe('createMissionControlStore — stranded-completion visibility', () => {
+  const LINK = '11111111-1111-4111-8111-111111111111';
+  const SESSION = '22222222-2222-4222-8222-222222222222';
+
+  function linkRow(over: Record<string, unknown> = {}) {
+    return {
+      id: LINK,
+      external_application_id: 'app_1',
+      external_job_id: 'job_1',
+      lifecycle: 'ready',
+      terminal_state: null,
+      session_id: SESSION,
+      updated_at: '2026-08-17T00:00:00Z',
+      ashby_resume_ingestions: [{ state: 'ready' }],
+      ashby_operations: [],
+      ...over,
+    };
+  }
+
+  it('surfaces the screening session status alongside the lifecycle', async () => {
+    const { client, calls } = fakeSupabase({
+      ashby_application_links: { data: [linkRow()], error: null },
+      call_sessions: { data: [{ id: SESSION, status: 'completed' }], error: null },
+    });
+    const [row] = await createMissionControlStore(client).listWorkflows(50);
+
+    // `completed` session + lifecycle that is not `writeback_pending` + no
+    // terminal state is exactly the stranded completion-park case. The
+    // observer is best-effort with respect to scoring, so this projection is
+    // what makes a park that did not land legible to an operator.
+    expect(row.sessionStatus).toBe('completed');
+    expect(row.lifecycle).not.toBe('writeback_pending');
+    expect(row.terminalState).toBeNull();
+
+    // Fetched as its own bounded query, not an embedded join.
+    const sessions = calls.find((c) => c.table === 'call_sessions')!;
+    expect(sessions.columns).toBe('id, status');
+    expect(sessions.filters).toContainEqual(['in', 'id', [SESSION]]);
+  });
+
+  it('degrades sessionStatus to null instead of breaking the list', async () => {
+    const { client } = fakeSupabase({
+      ashby_application_links: { data: [linkRow()], error: null },
+      call_sessions: { data: null, error: { message: 'boom' } },
+    });
+    const rows = await createMissionControlStore(client).listWorkflows(50);
+    // The workflow list is what operators rely on; a diagnostic read failure
+    // must never take it down.
+    expect(rows).toHaveLength(1);
+    expect(rows[0].sessionStatus).toBeNull();
+  });
+
+  it('issues no session query at all when no workflow has a session', async () => {
+    const { client, calls } = fakeSupabase({
+      ashby_application_links: { data: [linkRow({ session_id: null })], error: null },
+    });
+    const rows = await createMissionControlStore(client).listWorkflows(50);
+    expect(rows[0].sessionStatus).toBeNull();
+    expect(calls.some((c) => c.table === 'call_sessions')).toBe(false);
   });
 });

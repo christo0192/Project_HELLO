@@ -27,6 +27,17 @@
  *
  * Every mutation is CAS'd on the live lease, so a worker whose lease expired or
  * was reclaimed commits nothing.
+ *
+ * ══ WHAT `succeeded` MEANS ══
+ *
+ * This worker never marks an `invite_delivery` operation `succeeded`. Minting
+ * an invite only produces a SHA-256 digest, and the provider-gated email
+ * channel sends nothing at all, so the only honest success is an authorized
+ * human taking possession of a usable link — which happens in
+ * `mark_ashby_invite_delivered` (0032), driven by the Mission Control delivery
+ * endpoint. The worker either PARKS the manual channel as
+ * `awaiting_manual_delivery` or records a durable, non-retryable failure with
+ * a sanitized reason.
  */
 
 import type { RuntimeWorkflowStores, OperationClaimRow } from './orchestration.js';
@@ -208,11 +219,27 @@ export async function runClaimedAshbyOperation(
       };
     }
 
-    const outcome = await deps.stores.completeOperation(claim.id, claim.leaseToken, anchor, claim.marker);
-    emit(outcome === 'ok' ? 'completed' : 'stale_lease', result.delivery);
+    // ── Nothing else delivered anything, so nothing else may say `succeeded` ─
+    // Every remaining outcome is a delivery that provably did NOT happen:
+    //   blocked_provider — the email channel is provider-gated and there is no
+    //                      transport wired at all, so zero mail was sent;
+    //   blocked_terminal — the application went terminal under the lease;
+    //   invalid_reissue_path — the manual artifact could not even be shaped.
+    // Completing these as `succeeded` would report success for work that did
+    // not occur — the exact untruthfulness the manual channel was repaired for
+    // (review finding B1), and it would make Mission Control show a delivered
+    // email that no candidate ever received. They are instead recorded as a
+    // durable, NON-retryable failure carrying the sanitized reason, which is
+    // an admin-visible signal that the mapping needs a decision (switch to the
+    // manual channel, or wait for an approved provider). `succeeded` on an
+    // invite_delivery operation now means exactly one thing: an authorized
+    // human took possession of a usable link.
+    const blockedCode = result.reason ?? result.delivery;
+    const blocked = await deps.stores.failOperation(claim.id, claim.leaseToken, blockedCode, false);
+    emit('blocked', result.delivery);
     return {
       claimed: true, operationType: claim.operationType,
-      committed: outcome === 'ok', staleLease: outcome !== 'ok',
+      committed: false, staleLease: blocked === 'not_owned',
       code: result.delivery,
     };
   } catch {

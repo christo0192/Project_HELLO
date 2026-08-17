@@ -4995,10 +4995,21 @@ begin
       and (v_opm->>'id') is distinct from (v_ope->>'id'),
     'got ' || coalesce(v_opm->>'status','null') || '/' || coalesce(v_ope->>'status','null'));
 
+  -- Both operations were enqueued in THIS transaction, so they share one
+  -- `scheduled_at`. `claim_ashby_operation` orders by `(scheduled_at, id)` and
+  -- `id` is a RANDOM uuid, so without this the claim below would return the
+  -- manual or the email operation with ~50/50 probability and the two
+  -- assertions that follow would be a coin flip. Age the manual operation so
+  -- the claim order is deterministic and the test asserts one fixed scenario.
+  update screening_v2.ashby_operations
+     set scheduled_at = scheduled_at - interval '1 minute'
+   where operation_key = 'ashby:invite:pol32b-app:manual:pending';
+
   -- ── M1: the claim now returns operation_key so the channel is knowable ──
   v_claim := screening_v2.claim_ashby_operation('invite_delivery', 'pol32b-worker', 30);
   perform _policy_tests.assert('ashby 0032/M1: claim returns the operation key (channel)',
-    v_claim->>'status' = 'claimed' and (v_claim->>'operation_key') like 'ashby:invite:pol32b-app:%',
+    v_claim->>'status' = 'claimed'
+      and (v_claim->>'operation_key') = 'ashby:invite:pol32b-app:manual:pending',
     'got ' || coalesce(v_claim->>'operation_key','null'));
 
   -- ── B1: park under the live lease; NOT success ──────────────────────────
@@ -5015,11 +5026,18 @@ begin
   perform _policy_tests.assert('ashby 0032/B1: a stale lease cannot park an operation',
     v_res->>'status' = 'not_owned', 'got ' || coalesce(v_res->>'status','null'));
 
-  -- A parked operation is NOT runnable: the claim never returns it again.
+  -- A parked operation is NOT runnable: the claim skips it and returns the
+  -- OTHER (email) operation instead.
   v_claim := screening_v2.claim_ashby_operation('invite_delivery', 'pol32b-worker', 30);
   perform _policy_tests.assert('ashby 0032/B1: a parked operation is never re-claimed',
-    v_claim->>'status' = 'empty' or (v_claim->>'operation_key') like '%:email:%',
+    (v_claim->>'operation_key') = 'ashby:invite:pol32b-app:email:pending',
     'got ' || coalesce(v_claim->>'operation_key', v_claim->>'status'));
+
+  -- ...and with the manual operation parked and the email one running, there
+  -- is nothing left to claim at all.
+  v_claim := screening_v2.claim_ashby_operation('invite_delivery', 'pol32b-worker', 30);
+  perform _policy_tests.assert('ashby 0032/B1: a parked operation is not claimable when alone',
+    v_claim->>'status' = 'empty', 'got ' || coalesce(v_claim->>'status','null'));
 
   -- ── B1: the hand-off is what makes it succeed ───────────────────────────
   v_res := screening_v2.reissue_ashby_manual_invite(v_link, v_digest, now() + interval '24 hours', v_actor);

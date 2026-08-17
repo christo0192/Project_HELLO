@@ -593,6 +593,12 @@ export interface AshbyMcWorkflow {
   terminalState: string | null;
   ingestionState: string | null;
   operations: AshbyMcWorkflowOperation[];
+  /**
+   * Screening-session status, or null when no session exists yet. A `completed`
+   * session on a non-terminal workflow whose lifecycle is not
+   * `writeback_pending` is a screening whose completion park did not land.
+   */
+  sessionStatus: string | null;
   updatedAt: string;
 }
 

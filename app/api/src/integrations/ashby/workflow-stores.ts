@@ -239,6 +239,20 @@ export interface MissionControlWorkflow {
   terminalState: string | null;
   ingestionState: string | null;
   operations: Array<{ id: string; type: string; state: string; errorCode: string | null }>;
+  /**
+   * Status of the screening session this application was materialized into,
+   * or null when no session exists yet (or it could not be read).
+   *
+   * This is what makes a failed completion-park LEGIBLE. `observeAshbyCompletion`
+   * is deliberately best-effort with respect to scoring — it must never discard
+   * a scored assessment — so a transient RPC failure can leave a screened
+   * application without its `writeback_pending` lifecycle. That combination
+   * (`sessionStatus === 'completed'` while `lifecycle !== 'writeback_pending'`
+   * and no terminal state) is exactly the stranded case, and it is visible here
+   * rather than only in a log line. Re-parking is idempotent, so an operator
+   * who sees it can act on it. A session status enum is not PII.
+   */
+  sessionStatus: string | null;
   updatedAt: string;
 }
 
@@ -315,7 +329,7 @@ export function createMissionControlStore(client: SupabaseClient): MissionContro
       const { data, error } = await client
         .from('ashby_application_links')
         .select(
-          'id, external_application_id, external_job_id, lifecycle, terminal_state, updated_at, ' +
+          'id, external_application_id, external_job_id, lifecycle, terminal_state, session_id, updated_at, ' +
             'ashby_resume_ingestions ( state ), ' +
             'ashby_operations ( id, operation_type, state, error_code )',
         )
@@ -323,7 +337,36 @@ export function createMissionControlStore(client: SupabaseClient): MissionContro
         .order('updated_at', { ascending: false })
         .limit(limit);
       if (error) throw new Error('ashby_mc_workflows_error');
-      return ((data ?? []) as unknown as Array<Record<string, unknown>>).map((r) => {
+
+      const rows = (data ?? []) as unknown as Array<Record<string, unknown>>;
+
+      // Session status is fetched as a SEPARATE bounded query rather than an
+      // embedded join: it is a strictly additive diagnostic, so a failure to
+      // read it must degrade to `null` and never take down the workflow list
+      // that operators rely on.
+      const sessionIds = [...new Set(
+        rows.map((r) => r.session_id).filter((v): v is string => typeof v === 'string' && v.length > 0),
+      )];
+      const sessionStatus = new Map<string, string>();
+      if (sessionIds.length > 0) {
+        try {
+          const { data: sessions, error: sessErr } = await client
+            .from('call_sessions')
+            .select('id, status')
+            .in('id', sessionIds);
+          if (!sessErr) {
+            for (const s of ((sessions ?? []) as Array<{ id?: unknown; status?: unknown }>)) {
+              if (typeof s.id === 'string' && typeof s.status === 'string') {
+                sessionStatus.set(s.id, s.status);
+              }
+            }
+          }
+        } catch {
+          // Diagnostic only — leave every sessionStatus null.
+        }
+      }
+
+      return rows.map((r) => {
         const ings = (r.ashby_resume_ingestions as Array<{ state: string }> | null) ?? [];
         const ops = (r.ashby_operations as Array<{ id: string; operation_type: string; state: string; error_code: string | null }> | null) ?? [];
         return {
@@ -334,6 +377,7 @@ export function createMissionControlStore(client: SupabaseClient): MissionContro
           terminalState: (r.terminal_state as string | null) ?? null,
           ingestionState: ings[0]?.state ?? null,
           operations: ops.map((o) => ({ id: o.id, type: o.operation_type, state: o.state, errorCode: o.error_code ?? null })),
+          sessionStatus: typeof r.session_id === 'string' ? sessionStatus.get(r.session_id) ?? null : null,
           updatedAt: String(r.updated_at),
         };
       });
