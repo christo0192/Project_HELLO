@@ -109,6 +109,22 @@ describe('signature enforcement (active)', () => {
 });
 
 describe('durable ingress (active, verified)', () => {
+  it('accepts Ashby’s official signed idless ping so create/edit can enable the webhook', async () => {
+    const body = JSON.stringify({ action: 'ping', data: { webhookActionType: 'ping' } });
+    const res = await post(makeApp(ACTIVE, receipts), body, sign(body));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, status: 'ping' });
+    expect(receipts.receipts.size).toBe(0);
+    expect(receipts.liveJobs.size).toBe(0);
+  });
+
+  it('still requires a valid signature for ping', async () => {
+    const body = JSON.stringify({ action: 'ping', data: { webhookActionType: 'ping' } });
+    expect((await post(makeApp(ACTIVE, receipts), body)).status).toBe(401);
+    expect((await post(makeApp(ACTIVE, receipts), body, 'sha256=' + 'a'.repeat(64))).status).toBe(403);
+    expect(receipts.receipts.size).toBe(0);
+  });
+
   it('atomically records + enqueues exactly one signal for a fresh stage change', async () => {
     const res = await post(makeApp(ACTIVE, receipts), STAGE_BODY, sign(STAGE_BODY));
     expect(res.status).toBe(200);
