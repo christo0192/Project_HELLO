@@ -20,7 +20,20 @@ primary_region = "bom"
   RECORDING_MAX_BYTES = "26214400"
   WORKER_CONTEXT_TIMEOUT_SEC = "5"
   RESUME_SCANNER = "clamav"
-  RESUME_SCANNER_TIMEOUT_MS = "30000"
+  # Real clamscan loads ~1 GiB of signatures on one shared CPU; 30s was below
+  # measured cold-start cost. Scans are process-wide serialized in code.
+  RESUME_SCANNER_TIMEOUT_MS = "120000"
+  # Signature freshness. The scanner refuses every file whose screening would
+  # rest on a database older than this, rather than trusting a stale
+  # `clamscan` exit 0. Far stricter than ClamAV's own 7-day warning; the
+  # updater below refreshes hourly, so 24h leaves ~23 consecutive failures of
+  # headroom before ingestion is blocked.
+  RESUME_SCANNER_DB_DIR = "/var/lib/clamav"
+  RESUME_SCANNER_MAX_DB_AGE_HOURS = "24"
+  # Signature updater (container supervisor). No database is baked into the
+  # image, so these own the whole lifecycle: one attempt at boot, then hourly.
+  AV_UPDATER_INTERVAL_MS = "3600000"
+  AV_UPDATER_TIMEOUT_MS = "600000"
   RESUME_MAX_COMPRESSED_BYTES = "10485760"
   RESUME_PARSER_TIMEOUT_MS = "30000"
   RESUME_MAX_TEXT_LENGTH = "50000"

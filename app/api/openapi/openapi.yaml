@@ -3006,9 +3006,38 @@ components:
           type: integer
       additionalProperties: false
 
+    AshbyScannerState:
+      description: Resume malware-scanner readiness. `clamscan` exits 0 on a clean file whatever its signature database age, so an installed binary is not evidence that anything was screened; `ready` is true only for ClamAV with a database that is present, parseable and within the configured maximum age. Sanitized — no path, ClamAV or signature version, mirror, hostname, filename, or candidate field.
+      type: object
+      required:
+        - mode
+        - ready
+        - signatureAgeSec
+        - maxAgeSec
+        - reason
+      properties:
+        mode:
+          description: Which scanner the configuration selects.
+          type: string
+          enum: [clamav, test, fail-closed]
+        ready:
+          description: True only when this scanner can currently accept a file on production evidence. The development test scanner is never ready.
+          type: boolean
+        signatureAgeSec:
+          description: Age of the signature database in seconds; null when it could not be read.
+          type: integer
+          nullable: true
+        maxAgeSec:
+          description: Age ceiling this verdict was measured against; null when not applicable.
+          type: integer
+          nullable: true
+        reason:
+          description: Stable reason code when not ready (signature-state, capability-failure, scanner_busy, test_scanner, or scanner_not_configured); null when ready.
+          type: string
+          nullable: true
     AshbyRuntimeHealthResponse:
       type: object
-      required: [ok, integration, runtime, provider]
+      required: [ok, integration, runtime, scanner, provider]
       properties:
         ok:
           type: boolean
@@ -3016,6 +3045,8 @@ components:
           $ref: '#/components/schemas/AshbyIntegrationState'
         runtime:
           $ref: '#/components/schemas/AshbyRuntimeState'
+        scanner:
+          $ref: '#/components/schemas/AshbyScannerState'
         provider:
           description: Always "unknown" — this handler contacts no provider, so it makes no live-connectivity claim.
           type: string

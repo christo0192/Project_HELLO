@@ -33,6 +33,14 @@ import type { AshbySchedulerHandle, SchedulerLoopHealth } from './scheduler.js';
 import { ASHBY_SIGNAL_QUEUE, ASHBY_IMPORT_QUEUE } from './signal-worker.js';
 import { ASHBY_INGESTION_QUEUE } from './runtime-workers.js';
 import { DEFAULT_CHECKPOINT_KEY } from './reconciliation.js';
+import {
+  defaultSignatureFreshnessReader,
+  type SignatureFreshnessReader,
+} from '../../lib/clamav-signatures.js';
+import {
+  defaultScannerCapabilityReader,
+  type ScannerCapabilityReader,
+} from '../../lib/malware-scanner.js';
 
 /**
  * How many missed intervals before a loop is called `stale`. Three gives a
@@ -224,6 +232,98 @@ export async function readBacklog(
   };
 }
 
+// ── Malware scanner readiness ────────────────────────────────────────────────
+
+/**
+ * Sanitized view of the resume malware scanner.
+ *
+ * Stage 5 of the activation runbook turns on resume ingestion, and that stage
+ * is only safe if the scanner is genuinely able to screen — which, for ClamAV,
+ * means a signature database that exists and is current. `clamscan` exits 0 on
+ * a clean file regardless of database age, so "the binary is installed" was
+ * never evidence of readiness; this reports the thing that actually is.
+ *
+ * DISCLOSURE BOUNDARY: an enum, two booleans, two bounded integers and a stable
+ * reason code. No path, no ClamAV or signature version, no mirror, no hostname,
+ * no filename, nothing candidate-derived.
+ */
+export interface ScannerHealthView {
+  /** Which scanner the configuration selects. */
+  mode: 'clamav' | 'test' | 'fail-closed';
+  /** True only when this scanner can currently accept a file on production evidence. */
+  ready: boolean;
+  /** Age of the signature database in seconds; null when it could not be read. */
+  signatureAgeSec: number | null;
+  /** Age ceiling this verdict was measured against, in seconds. */
+  maxAgeSec: number | null;
+  /** Stable reason code when not ready; null when ready. */
+  reason: string | null;
+}
+
+/** Resolve the configured scanner mode without constructing a scanner. */
+export function scannerMode(source: NodeJS.ProcessEnv): ScannerHealthView['mode'] {
+  const setting = source.RESUME_SCANNER ?? '';
+  if (setting === 'clamav') return 'clamav';
+  // Mirrors `resolveScanner`: outside production an unset/`test` setting means
+  // the built-in test scanner; everything else is the fail-closed stub.
+  const isProduction = (source.NODE_ENV ?? 'development') === 'production';
+  if (!isProduction && (setting === 'test' || setting === '')) return 'test';
+  return 'fail-closed';
+}
+
+/**
+ * Read scanner readiness. Never throws.
+ *
+ * Only ClamAV can ever be `ready: true`. The built-in test scanner accepts
+ * everything that is not EICAR and is explicitly not production anti-malware
+ * evidence, so reporting it as ready would be exactly the untruth this surface
+ * exists to prevent.
+ */
+export async function readScannerHealth(
+  source: NodeJS.ProcessEnv = process.env,
+  freshness: SignatureFreshnessReader = defaultSignatureFreshnessReader(),
+  capability: ScannerCapabilityReader = defaultScannerCapabilityReader,
+): Promise<ScannerHealthView> {
+  const mode = scannerMode(source);
+  if (mode !== 'clamav') {
+    return {
+      mode,
+      ready: false,
+      signatureAgeSec: null,
+      maxAgeSec: null,
+      reason: mode === 'test' ? 'test_scanner' : 'scanner_not_configured',
+    };
+  }
+  try {
+    const state = await freshness();
+    if (!state.fresh) {
+      return {
+        mode,
+        ready: false,
+        signatureAgeSec: state.ageSec,
+        maxAgeSec: state.maxAgeSec,
+        reason: state.reason,
+      };
+    }
+    const proof = await capability();
+    return {
+      mode,
+      ready: proof.ready,
+      signatureAgeSec: state.ageSec,
+      maxAgeSec: state.maxAgeSec,
+      reason: proof.ready ? null : proof.reason ?? 'capability_unverified',
+    };
+  } catch {
+    return {
+      mode,
+      ready: false,
+      signatureAgeSec: null,
+      maxAgeSec: null,
+      reason: 'signatures_unreadable',
+    };
+  }
+}
+
 // ── Degradation verdict ──────────────────────────────────────────────────────
 
 /** Thresholds beyond which the integration is reported degraded. */
@@ -254,6 +354,8 @@ export function evaluateDegradation(input: {
   active: boolean;
   scheduler: SchedulerHealthView;
   backlog: BacklogView;
+  /** Optional: omitted only by callers that do not own the resume path. */
+  scanner?: ScannerHealthView;
 }): DegradeVerdict {
   // Nothing is enabled: not healthy, not broken — idle by configuration.
   if (!input.active) return { status: 'idle', reasons: [] };
@@ -271,6 +373,12 @@ export function evaluateDegradation(input: {
   }
   if (input.scheduler.registeredInThisProcess && !input.scheduler.running) {
     reasons.push('scheduler_stopped');
+  }
+  // A live runtime whose scanner cannot screen means resume ingestion is
+  // fail-closed. That is the correct behaviour, but it is NOT healthy, and an
+  // operator who cannot see it here would read stalled ingestions as a bug.
+  if (input.scanner && !input.scanner.ready) {
+    reasons.push(`scanner_${input.scanner.reason ?? 'not_ready'}`);
   }
   return { status: reasons.length > 0 ? 'degraded' : 'healthy', reasons };
 }

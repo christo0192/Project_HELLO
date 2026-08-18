@@ -704,8 +704,18 @@ describe('rate limiting details', () => {
     const admin = makeAdmin();
     app = createAuthedApp(admin);
 
-    // Exhaust per-user rate limit
-    const requests = Array.from({ length: 101 }, () =>
+    // Exhaust the per-user rate limit.
+    //
+    // The limiter is a TOKEN BUCKET with continuous refill, not a fixed
+    // window: it grants `limit / windowSec` tokens per second (100/60 ≈ 1.67).
+    // Sending exactly `limit + 1` requests therefore leaves a margin of ONE
+    // token, and any wall-clock spread beyond ~600 ms refills that token and
+    // produces zero 429s — which made this assertion fail intermittently
+    // whenever the suite ran slowly (coverage instrumentation, a loaded CI
+    // runner). Overshoot by enough that the bucket cannot refill fast enough
+    // even if these requests take half a minute to drain.
+    const OVERSHOOT = 160; // tolerates ~36 s of spread at 1.67 tokens/sec
+    const requests = Array.from({ length: OVERSHOOT }, () =>
       request(app).get('/api/roles').set('Authorization', VALID_TOKEN),
     );
     const results = await Promise.all(requests);

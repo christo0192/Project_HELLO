@@ -565,8 +565,17 @@ describe('malware-scanner', () => {
   });
 
   describe('ClamAvScanner', () => {
+    // These two cases are about the BINARY, so they inject a fresh signature
+    // state; the signature-freshness matrix itself lives in
+    // resume-scanner-freshness.test.ts.
+    const freshSignatures = async () => ({
+      fresh: true, ageSec: 60, maxAgeSec: 86_400, reason: null,
+    });
+
     it('rejects EICAR without invoking external scanner', async () => {
-      const scanner = new ClamAvScanner('scanner-binary-that-should-not-run');
+      const scanner = new ClamAvScanner(
+        'scanner-binary-that-should-not-run', 30_000, freshSignatures,
+      );
       const eicar = Buffer.from(
         'X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*',
         'utf-8',
@@ -577,7 +586,9 @@ describe('malware-scanner', () => {
     });
 
     it('fails closed when clamscan is unavailable', async () => {
-      const scanner = new ClamAvScanner('scanner-binary-that-does-not-exist');
+      const scanner = new ClamAvScanner(
+        'scanner-binary-that-does-not-exist', 30_000, freshSignatures,
+      );
       const result = await scanner.scan(Buffer.from('clean data'));
       expect(result.safe).toBe(false);
       expect(result.status).toBe('scanner_error');
