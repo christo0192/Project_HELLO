@@ -215,7 +215,13 @@ describe('GET /health — truthful and sanitized', () => {
 });
 
 describe('GET /health — real liveness, not configuration', () => {
-  const base = { store: fakeStore(), probeReader: null, configSource: activeEnv() };
+  /** A ClamAV scanner with current signatures — the only ready state. */
+  const readyScanner = async () => ({
+    mode: 'clamav' as const, ready: true, signatureAgeSec: 600, maxAgeSec: 86_400, reason: null,
+  });
+  const base = {
+    store: fakeStore(), probeReader: null, configSource: activeEnv(), scanner: readyScanner,
+  };
 
   it('reports healthy when the scheduler is ticking and the backlog is clear', async () => {
     const res = await request(appWithDeps('interviewer', {
@@ -274,6 +280,44 @@ describe('GET /health — real liveness, not configuration', () => {
       backlog: async () => emptyBacklog(),
     })).get('/mc/health');
     expect(res.body.status).toBe('idle');
+  });
+
+  it('surfaces truthful malware-scanner readiness', async () => {
+    const res = await request(appWithDeps('interviewer', {
+      ...base, schedulerSnapshot: healthySchedulerSnapshot, backlog: async () => emptyBacklog(),
+    })).get('/mc/health');
+    expect(res.body.scanner).toEqual({
+      mode: 'clamav', ready: true, signatureAgeSec: 600, maxAgeSec: 86400, reason: null,
+    });
+  });
+
+  it('degrades when the resume scanner cannot screen, and says why', async () => {
+    // The production blocker: clamscan installed and exiting 0, on signatures
+    // that stopped updating. Health must not report that as healthy.
+    const res = await request(appWithDeps('interviewer', {
+      ...base, schedulerSnapshot: healthySchedulerSnapshot, backlog: async () => emptyBacklog(),
+      scanner: async () => ({
+        mode: 'clamav' as const, ready: false, signatureAgeSec: 700_000,
+        maxAgeSec: 86_400, reason: 'signatures_stale',
+      }),
+    })).get('/mc/health');
+    expect(res.body.runtime.active).toBe(true);
+    expect(res.body.status).toBe('degraded');
+    expect(res.body.reasons).toContain('scanner_signatures_stale');
+  });
+
+  it('discloses no path, mirror or signature version in the scanner block', async () => {
+    const res = await request(appWithDeps('interviewer', {
+      ...base, schedulerSnapshot: healthySchedulerSnapshot, backlog: async () => emptyBacklog(),
+      scanner: async () => ({
+        mode: 'clamav' as const, ready: false, signatureAgeSec: null,
+        maxAgeSec: 86_400, reason: 'signatures_missing',
+      }),
+    })).get('/mc/health');
+    const body = JSON.stringify(res.body.scanner);
+    for (const forbidden of ['/var', '/etc', 'clamav.net', '.cvd', '.cld', 'clamscan']) {
+      expect(body).not.toContain(forbidden);
+    }
   });
 
   it('degrades rather than reporting a healthy zero when the backlog read fails', async () => {

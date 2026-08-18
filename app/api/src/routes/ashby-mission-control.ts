@@ -42,6 +42,8 @@ import {
   evaluateDegradation,
   DEGRADE_THRESHOLDS,
   type BacklogView,
+  readScannerHealth,
+  type ScannerHealthView,
 } from '../integrations/ashby/runtime-health.js';
 import {
   generateInviteToken,
@@ -101,6 +103,8 @@ export interface AshbyMissionControlDeps {
   schedulerSnapshot?: () => ReturnType<typeof snapshotScheduler>;
   /** Injected backlog reader (tests). Production queries the database. */
   backlog?: () => Promise<BacklogView>;
+  /** Injected scanner-readiness reader (tests). Production reads the signature DB. */
+  scanner?: () => Promise<ScannerHealthView>;
 }
 
 export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = {}): Router {
@@ -235,9 +239,19 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
         backlogError = true;
       }
 
+      // Resume malware-scanner readiness. Read on every call (behind a short
+      // TTL in the reader) so a database that goes stale becomes visible
+      // without a redeploy. Never throws.
+      const scanner = deps.scanner ? await deps.scanner() : await readScannerHealth(source);
+
       const verdict = backlog
-        ? evaluateDegradation({ active: runtime.active, scheduler, backlog })
-        : { status: 'degraded' as const, reasons: ['backlog_unavailable'] };
+        ? evaluateDegradation({ active: runtime.active, scheduler, backlog, scanner })
+        : {
+            status: 'degraded' as const,
+            reasons: runtime.active && !scanner.ready
+              ? ['backlog_unavailable', `scanner_${scanner.reason ?? 'not_ready'}`]
+              : ['backlog_unavailable'],
+          };
 
       res.json({
         ok: true,
@@ -248,6 +262,7 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
         scheduler,
         backlog,
         backlogError,
+        scanner,
         thresholds: DEGRADE_THRESHOLDS,
         // No live-connectivity claim is made anywhere here: nothing in this
         // handler contacts Ashby, so asserting "provider ok" would be a lie.
