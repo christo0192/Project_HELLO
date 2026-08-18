@@ -37,6 +37,10 @@ import {
   defaultSignatureFreshnessReader,
   type SignatureFreshnessReader,
 } from '../../lib/clamav-signatures.js';
+import {
+  defaultScannerCapabilityReader,
+  type ScannerCapabilityReader,
+} from '../../lib/malware-scanner.js';
 
 /**
  * How many missed intervals before a loop is called `stale`. Three gives a
@@ -278,6 +282,7 @@ export function scannerMode(source: NodeJS.ProcessEnv): ScannerHealthView['mode'
 export async function readScannerHealth(
   source: NodeJS.ProcessEnv = process.env,
   freshness: SignatureFreshnessReader = defaultSignatureFreshnessReader(),
+  capability: ScannerCapabilityReader = defaultScannerCapabilityReader,
 ): Promise<ScannerHealthView> {
   const mode = scannerMode(source);
   if (mode !== 'clamav') {
@@ -291,12 +296,22 @@ export async function readScannerHealth(
   }
   try {
     const state = await freshness();
+    if (!state.fresh) {
+      return {
+        mode,
+        ready: false,
+        signatureAgeSec: state.ageSec,
+        maxAgeSec: state.maxAgeSec,
+        reason: state.reason,
+      };
+    }
+    const proof = await capability();
     return {
       mode,
-      ready: state.fresh,
+      ready: proof.ready,
       signatureAgeSec: state.ageSec,
       maxAgeSec: state.maxAgeSec,
-      reason: state.reason,
+      reason: proof.ready ? null : proof.reason ?? 'capability_unverified',
     };
   } catch {
     return {

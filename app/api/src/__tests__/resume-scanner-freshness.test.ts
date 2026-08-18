@@ -41,7 +41,7 @@ import {
   readSignatureState,
   resolveMaxDbAgeHours,
 } from '../lib/clamav-signatures.js';
-import { ClamAvScanner } from '../lib/malware-scanner.js';
+import { ClamAvScanner, ClamScanGate, probeClamAvCapability } from '../lib/malware-scanner.js';
 import {
   AV_UPDATER_BOUNDS,
   loadAvUpdaterConfig,
@@ -107,8 +107,8 @@ async function makeDbDir(opts: {
 
 /**
  * Write an executable stand-in for `clamscan`. The scanner invokes it as
- * `<bin> --no-summary --infected <file>`, so the script sees the scratch file
- * as `$3`. Using a real process (rather than a mocked `execFile`) keeps the
+ * `<bin> --database=… --no-summary --infected <file>`, so the script sees the
+ * scratch file as `$4`. Using a real process (rather than a mocked `execFile`) keeps the
  * exit-code mapping, the timeout and the temp-file lifecycle under test.
  */
 async function stubScanner(body: string): Promise<{ bin: string; cleanup: () => Promise<void> }> {
@@ -256,17 +256,13 @@ describe('signature freshness state', () => {
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
 
-  it('fails closed when the database file cannot be read', async () => {
+  it.skipIf(process.getuid?.() === 0)('fails closed when the database file cannot be read', async () => {
     const dir = await makeDbDir();
     const daily = join(dir, `${AGE_DATABASE}.cvd`);
     try {
       await chmod(daily, 0o000);
       const state = await readSignatureState({ dbDir: dir });
-      // Root can read a 0000 file, so accept either verdict — both fail closed.
-      expect(state.fresh).toBe(false);
-      if (state.reason !== null) {
-        expect(['signatures_unreadable', 'signatures_missing', 'signatures_stale']).toContain(state.reason);
-      }
+      expect(state).toMatchObject({ fresh: false, reason: 'signatures_unreadable' });
     } finally {
       await chmod(daily, 0o600).catch(() => undefined);
       await rm(dir, { recursive: true, force: true });
@@ -417,6 +413,42 @@ describe('ClamAvScanner signature gating', () => {
     } finally { await cleanup(); }
   });
 
+  it('serializes scans process-wide and rejects work beyond the bounded queue', async () => {
+    const marker = join(await mkdtemp(join(tmpdir(), 'scan-gate-')), 'events');
+    const { bin, cleanup } = await stubScanner(`echo start >> "${marker}"\nsleep 0.15\necho end >> "${marker}"\nexit 0`);
+    const gate = new ClamScanGate(2);
+    try {
+      const scanner = new ClamAvScanner(bin, 2_000, fresh, gate, '/tmp/db');
+      const results = await Promise.all([
+        scanner.scan(Buffer.from('one')),
+        scanner.scan(Buffer.from('two')),
+        scanner.scan(Buffer.from('three')),
+        scanner.scan(Buffer.from('four')),
+      ]);
+      expect(results.filter((r) => r.status === 'clean')).toHaveLength(3);
+      expect(results.filter((r) => r.status === 'scanner_busy')).toHaveLength(1);
+      const events = readFileSync(marker, 'utf8').trim().split(/\s+/);
+      expect(events).toEqual(['start', 'end', 'start', 'end', 'start', 'end']);
+    } finally {
+      await cleanup();
+      await rm(join(marker, '..'), { recursive: true, force: true });
+    }
+  });
+
+  it('uses the exact vouched database directory and proves EICAR via the real binary path', async () => {
+    const spool = await mkdtemp(join(tmpdir(), 'capability-proof-'));
+    const args = join(spool, 'args');
+    const { bin, cleanup } = await stubScanner(`printf '%s\\n' "$@" > "${args}"\nexit 1`);
+    try {
+      const result = await probeClamAvCapability({ command: bin, timeoutMs: 2_000, dbDir: '/approved/db', gate: new ClamScanGate(0) });
+      expect(result).toEqual({ ready: true, reason: null });
+      expect(readFileSync(args, 'utf8')).toContain('--database=/approved/db');
+    } finally {
+      await cleanup();
+      await rm(spool, { recursive: true, force: true });
+    }
+  });
+
   it('fails closed on a clamscan internal error (exit 2)', async () => {
     const { bin, cleanup } = await stubScanner('exit 2');
     try {
@@ -443,7 +475,7 @@ describe('ClamAvScanner signature gating', () => {
     const link = join(spool, 'linked.bin');
     const secret = 'SENSITIVE-RESUME-BYTES';
     const { bin, cleanup } = await stubScanner(
-      `cp "$3" "${join(spool, 'copy.bin')}"\nln "$3" "${link}"\nexit 0`,
+      `cp "$4" "${join(spool, 'copy.bin')}"\nln "$4" "${link}"\nexit 0`,
     );
     try {
       const result = await new ClamAvScanner(bin, 30_000, fresh).scan(Buffer.from(secret, 'utf-8'));
@@ -692,8 +724,18 @@ describe('scanner readiness on the activation health surface', () => {
     const view = await readScannerHealth(
       { RESUME_SCANNER: 'clamav' } as NodeJS.ProcessEnv,
       async () => ({ fresh: true, ageSec: 900, maxAgeSec: 86_400, reason: null }),
+      async () => ({ ready: true, reason: null }),
     );
     expect(view).toEqual({ mode: 'clamav', ready: true, signatureAgeSec: 900, maxAgeSec: 86_400, reason: null });
+  });
+
+  it('does not claim readiness when the real binary capability proof fails', async () => {
+    const view = await readScannerHealth(
+      { RESUME_SCANNER: 'clamav' } as NodeJS.ProcessEnv,
+      async () => ({ fresh: true, ageSec: 900, maxAgeSec: 86_400, reason: null }),
+      async () => ({ ready: false, reason: 'capability_timeout' }),
+    );
+    expect(view).toMatchObject({ ready: false, reason: 'capability_timeout' });
   });
 
   it('reports stale signatures truthfully instead of claiming readiness', async () => {

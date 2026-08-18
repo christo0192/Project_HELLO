@@ -129,7 +129,8 @@ export interface CvdHeader {
 export function parseCvdHeader(head: Buffer, nowMs: number = Date.now()): CvdHeader | null {
   if (!Buffer.isBuffer(head) || head.length < CVD_MAGIC.length) return null;
 
-  // The header is NUL-padded to 512 bytes; stop at the first NUL or newline.
+  // Headers are normally space-padded to 512 bytes. Tolerate NUL/newline
+  // terminators used by some database variants while rejecting binary bytes.
   let end = head.length;
   for (let i = 0; i < head.length; i += 1) {
     const b = head[i]!;
@@ -175,7 +176,7 @@ export interface SignatureReaderOptions {
   source?: NodeJS.ProcessEnv;
 }
 
-function resolveDbDir(opts: SignatureReaderOptions): string {
+export function resolveDbDir(opts: SignatureReaderOptions = {}): string {
   if (typeof opts.dbDir === 'string' && opts.dbDir !== '') return opts.dbDir;
   const source = opts.source ?? process.env;
   const fromEnv = source.RESUME_SCANNER_DB_DIR;

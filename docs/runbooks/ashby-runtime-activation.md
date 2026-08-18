@@ -153,6 +153,12 @@ file whatever its database age.
   stale database `clamscan` is **not invoked at all**, so a stale `exit 0` can
   never be mistaken for a clean verdict. Age is judged on `daily` because `main`
   is republished roughly yearly; `main` must still be present and parseable.
+- **Scanning is process-wide serialized with bounded backpressure.** Loading a
+  real database costs roughly 1 GiB per `clamscan`; concurrent processes can OOM
+  the 2 GiB Fly machine. One scan runs, at most two wait, and excess work fails
+  closed as `scanner_busy`. The 120 s binary timeout covers measured shared-CPU
+  cold loads. Health additionally runs a cached real-binary EICAR capability
+  proof, so fresh headers alone can never produce `scanner.ready: true`.
 
 ### Configuration
 
@@ -161,6 +167,7 @@ file whatever its database age.
 | `RESUME_SCANNER` | `test` (prod: `clamav`) | — | `clamav` selects the production scanner **and** enables the updater. |
 | `RESUME_SCANNER_DB_DIR` | `/var/lib/clamav` | — | Database directory; owned by the runtime user, mode 0700. |
 | `RESUME_SCANNER_MAX_DB_AGE_HOURS` | `24` | 1–168 | Maximum `daily` age. Deliberately far stricter than ClamAV's own 7-day warning. Malformed ⇒ default. |
+| `RESUME_SCANNER_TIMEOUT_MS` | `120000` | 30–300 s | Per-binary bound; queue wait is separately bounded by the same value. |
 | `AV_UPDATER_INTERVAL_MS` | `3600000` | 15 min–12 h | Refresh cadence. 24 opportunities inside the 24 h ceiling. |
 | `AV_UPDATER_TIMEOUT_MS` | `600000` | 60 s–30 min | Hard wall-clock bound per attempt; covers a cold ~113 MB download. |
 
@@ -194,8 +201,11 @@ Expected once a machine has completed its first update:
 ```
 
 `signatureAgeSec` should normally sit well under `AV_UPDATER_INTERVAL_MS / 1000`.
-`ready: false` with `reason: "signatures_missing"` in the first minute after a
-deploy is expected; the same reason ten minutes later is not.
+The first authenticated health read also performs a cached real EICAR binary
+proof and can take one scan budget. `ready: false` with `signatures_missing` in
+the first minute after a deploy is expected; `capability_timeout`,
+`capability_failed`, or `scanner_busy` means the binary/resource proof did not
+pass and activation must stop.
 
 To verify the container itself (image build + rehearsal, before deploying):
 
@@ -228,7 +238,17 @@ Rollback is configuration-only; nothing here has a migration or a data footprint
 | Ingestion must stop entirely | Pause the mappings (§6), or `ASHBY_RUNTIME_ENABLED=false`. |
 
 There is deliberately no switch that accepts a stale database. The only way to
-scan is to have current signatures.
+scan is to have current signatures and a passing real-binary capability proof.
+
+Accepted availability/defence-in-depth residuals for this phase:
+
+- A new machine depends on ClamAV's CDN for its initial database. Rate limiting
+  leaves resume ingestion visibly fail-closed; it never weakens scanning or
+  takes down unrelated API surfaces.
+- The non-root API/updater user owns the signature directory. A future hardening
+  phase may split updater and parser UIDs; current protection assumes no API
+  remote-code execution and never treats header freshness as the sole readiness
+  proof.
 
 ---
 

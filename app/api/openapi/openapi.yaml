@@ -3032,12 +3032,12 @@ components:
           type: integer
           nullable: true
         reason:
-          description: Stable reason code when not ready (signatures_stale, signatures_missing, signatures_unreadable, signatures_corrupt, test_scanner, scanner_not_configured); null when ready.
+          description: Stable reason code when not ready (signature-state, capability-failure, scanner_busy, test_scanner, or scanner_not_configured); null when ready.
           type: string
           nullable: true
     AshbyRuntimeHealthResponse:
       type: object
-      required: [ok, integration, runtime, provider]
+      required: [ok, integration, runtime, scanner, provider]
       properties:
         ok:
           type: boolean
