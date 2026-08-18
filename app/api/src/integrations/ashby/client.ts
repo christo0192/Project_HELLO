@@ -398,9 +398,16 @@ export class AshbyClient {
     return this.request<T>('application.list', body);
   }
 
+  /**
+   * `candidate.info` names the candidate identifier `id` on the wire (the API
+   * rejects `candidateId` with `invalid_input`). The caller-facing argument
+   * keeps the unambiguous `candidateId` name; `extra` is spread first so it can
+   * carry optional documented fields (e.g. `externalMappingId`) but can never
+   * override the validated `id`.
+   */
   async candidateInfo<T = OpaqueRecord>(candidateId: string, extra?: OpaqueRecord): Promise<AshbyResult<T>> {
-    validateId('candidate.info', 'candidateId', candidateId);
-    return this.request<T>('candidate.info', { candidateId, ...(extra ?? {}) });
+    const id = validateId('candidate.info', 'candidateId', candidateId);
+    return this.request<T>('candidate.info', { ...(extra ?? {}), id });
   }
 
   /**

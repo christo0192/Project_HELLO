@@ -352,6 +352,34 @@ describe('endpoint helpers', () => {
       .rejects.toMatchObject({ code: 'invalid_feedback_form' });
   });
 
+  it('candidate.info sends the candidate identifier as `id`, never `candidateId`', async () => {
+    const { client, calls } = makeClient([ok({ id: 'cand_1' })]);
+    await client.candidateInfo('cand_1');
+    expect(calls[0].url).toBe('https://api.ashbyhq.com/candidate.info');
+    const body = JSON.parse(calls[0].body) as Record<string, unknown>;
+    expect(body.id).toBe('cand_1');
+    expect(Object.keys(body)).not.toContain('candidateId');
+    expect(calls[0].body).not.toContain('candidateId');
+    // No credential or contact data may ride along in the request.
+    expect(calls[0].body).not.toContain('synthetic-key');
+    expect(calls[0].url).not.toContain('cand_1');
+  });
+
+  it('candidate.info lets `extra` add documented fields but never override `id`', async () => {
+    const { client, calls } = makeClient([ok({ id: 'cand_2' })]);
+    await client.candidateInfo('cand_2', { externalMappingId: 'ext_9', id: 'attacker_override' });
+    const body = JSON.parse(calls[0].body) as Record<string, unknown>;
+    expect(body).toEqual({ externalMappingId: 'ext_9', id: 'cand_2' });
+  });
+
+  it('candidate.info rejects an invalid identifier before any transport call', async () => {
+    const { client, calls } = makeClient([ok({ id: 'never' })]);
+    await expect(client.candidateInfo('')).rejects.toMatchObject({ code: 'invalid_id', operation: 'candidate.info' });
+    await expect(client.candidateInfo('cand\u0000_1')).rejects.toMatchObject({ code: 'id_control_char', operation: 'candidate.info' });
+    await expect(client.candidateInfo(undefined as unknown as string)).rejects.toMatchObject({ code: 'invalid_id' });
+    expect(calls).toHaveLength(0);
+  });
+
   it('changeStage validates both ids and posts to the fixed path', async () => {
     const { client, calls } = makeClient([ok({ moved: true })]);
     await client.applicationChangeStage('app_1', 'stage_2');

@@ -42,6 +42,12 @@ makes **no** claim of tenant validation or live Ashby connectivity.
 `applicationFeedbackRequest.create`, `applicationFeedback.submit`, and
 `application.changeStage`.
 
+`candidate.info` takes the candidate identifier as `id` on the wire (with an
+optional `externalMappingId`); the helper argument is still named `candidateId`
+for clarity and is mapped to `id` before the request is built. Sending
+`candidateId` instead returns HTTP 200 with `success:false` and
+`errorInfo.code=invalid_input`.
+
 Only officially verified generic envelope/pagination primitives are locked.
 Tenant-uncertain payload details (feedback form field paths, score scales, exact
 per-endpoint request field names, `file.info` URL host/TTL) are **not** locked:
