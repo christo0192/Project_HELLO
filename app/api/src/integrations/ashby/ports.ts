@@ -74,6 +74,14 @@ export interface SyncCheckpoint {
   /** ISO time the current token was issued (14-day expiry anchor), or null. */
   tokenIssuedAt: string | null;
   lastSuccessAt: string | null;
+  /**
+   * Monotonic counter bumped every time a forced full resync is requested
+   * (0033). A run reads it before paging and hands it back to `advance`, which
+   * refuses to clear `full_resync_required` when the value moved meanwhile —
+   * so enabling a mapping DURING a run cannot have its forced resync silently
+   * cleared by that run's own completion.
+   */
+  resyncEpoch?: number;
 }
 
 /** Durable checkpoint store for incremental reconciliation. */
@@ -87,6 +95,12 @@ export interface CheckpointStore {
     pages: number;
     items: number;
     full: boolean;
+    /**
+     * The `resyncEpoch` observed when this run started. When supplied and the
+     * stored epoch has moved on, the cursor still advances but the forced
+     * `full_resync_required` flag is PRESERVED (see 0033).
+     */
+    resyncEpoch?: number | null;
   }): Promise<void>;
   /** Force a safe full resync (null the token, flag the stream). */
   requireFullResync(checkpointKey: string, reason: string): Promise<void>;
@@ -118,4 +132,34 @@ export interface CheckpointStore {
     status: string;
     noProgressRuns: number;
   }>;
+}
+
+// ── Reconciliation admission: enabled-mapping index ─────────────────────────
+
+/**
+ * One ENABLED mapping's admission facts. Opaque provider ids only — never a
+ * role, owner, label, or any tenant-identifying text.
+ */
+export interface EnabledMappingRow {
+  externalJobId: string;
+  aiScreeningStageId: string;
+}
+
+/**
+ * Loads the CURRENT set of enabled mappings in ONE bounded query, so
+ * reconciliation can admit applications without issuing a per-application
+ * mapping lookup (which is what turned a single reconciliation pass into a
+ * tenant-wide `application.info` + queue storm).
+ *
+ * The index is rebuilt from this port on EVERY run and never cached across
+ * runs: a pause, a drift auto-pause, or a stage-id edit must take effect on
+ * the very next pass.
+ */
+export interface EnabledMappingLoader {
+  /**
+   * Return at most `limit` enabled mappings that carry an AI screening stage
+   * id. `truncated` is true when more enabled mappings exist than the bound —
+   * a fail-closed condition the caller reports rather than silently ignores.
+   */
+  listEnabled(limit: number): Promise<{ rows: EnabledMappingRow[]; truncated: boolean }>;
 }

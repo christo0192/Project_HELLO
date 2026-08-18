@@ -78,6 +78,7 @@ function lister(pages: number, perPage: number) {
         return {
           results: Array.from({ length: perPage }, (_, i) => ({
             id: `app_${page}_${i}`,
+            job: { id: 'job_1' },
             currentInterviewStage: { id: 'stage_ai' },
           })),
           moreDataAvailable: page < pages - 1,
@@ -89,12 +90,19 @@ function lister(pages: number, perPage: number) {
   };
 }
 
+/** Admits the single (job, AI stage) pair every fixture page uses. */
+const enabledMappings = {
+  async listEnabled() {
+    return { rows: [{ externalJobId: 'job_1', aiScreeningStageId: 'stage_ai' }], truncated: false };
+  },
+};
+
 describe('single-flight lease', () => {
   it('acquires and releases the lease around a run', async () => {
     const cp = checkpointStore();
     const l = lister(1, 2);
     const r = await runReconciliation({
-      client: l.client, checkpoints: cp.store, receipts: receipts(), owner: 'sched-1',
+      client: l.client, checkpoints: cp.store, receipts: receipts(), mappings: enabledMappings, owner: 'sched-1',
     });
     expect(r.stop).toBe('drained');
     expect(r.advanced).toBe(true);
@@ -116,14 +124,14 @@ describe('single-flight lease', () => {
     };
 
     const first = runReconciliation({
-      client: slowClient, checkpoints: cp.store, receipts: receipts(), owner: 'sched-1',
+      client: slowClient, checkpoints: cp.store, receipts: receipts(), mappings: enabledMappings, owner: 'sched-1',
     });
     // Let the lease be taken.
     for (let i = 0; i < 20; i++) await Promise.resolve();
     expect(cp.heldBy()).toBe('sched-1');
 
     const second = await runReconciliation({
-      client: l.client, checkpoints: cp.store, receipts: receipts(), owner: 'sched-2',
+      client: l.client, checkpoints: cp.store, receipts: receipts(), mappings: enabledMappings, owner: 'sched-2',
     });
 
     expect(second.stop).toBe('locked');
@@ -142,8 +150,8 @@ describe('single-flight lease', () => {
     const a = lister(1, 1);
     const b = lister(1, 1);
     const [ra, rb] = await Promise.all([
-      runReconciliation({ client: a.client, checkpoints: cp.store, receipts: receipts(), owner: 'A' }),
-      runReconciliation({ client: b.client, checkpoints: cp.store, receipts: receipts(), owner: 'B' }),
+      runReconciliation({ client: a.client, checkpoints: cp.store, receipts: receipts(), mappings: enabledMappings, owner: 'A' }),
+      runReconciliation({ client: b.client, checkpoints: cp.store, receipts: receipts(), mappings: enabledMappings, owner: 'B' }),
     ]);
     const advanced = [ra, rb].filter((r) => r.advanced);
     const locked = [ra, rb].filter((r) => r.stop === 'locked');
@@ -156,7 +164,7 @@ describe('single-flight lease', () => {
     const cp = checkpointStore();
     const boom = { applicationList: async () => { throw new Error('provider_down'); } };
     await expect(runReconciliation({
-      client: boom, checkpoints: cp.store, receipts: receipts(), owner: 'sched-1',
+      client: boom, checkpoints: cp.store, receipts: receipts(), mappings: enabledMappings, owner: 'sched-1',
     })).rejects.toThrow('provider_down');
     // A stranded lease would wedge the stream until its deadline.
     expect(cp.heldBy()).toBeNull();
@@ -171,7 +179,7 @@ describe('single-flight lease', () => {
       async requireFullResync() {},
     };
     const l = lister(1, 1);
-    const r = await runReconciliation({ client: l.client, checkpoints: minimal, receipts: receipts() });
+    const r = await runReconciliation({ client: l.client, checkpoints: minimal, receipts: receipts(), mappings: enabledMappings });
     expect(r.stop).toBe('drained');
     expect(r.advanced).toBe(true);
   });
@@ -184,7 +192,7 @@ describe('no-progress visibility', () => {
     for (let i = 1; i <= 3; i++) {
       const l = lister(3, 10);
       const r = await runReconciliation({
-        client: l.client, checkpoints: cp.store, receipts: receipts(), owner: 'sched-1',
+        client: l.client, checkpoints: cp.store, receipts: receipts(), mappings: enabledMappings, owner: 'sched-1',
         caps: { maxItems: 5 },
       });
       expect(r.stop).toBe('item_cap');
@@ -200,14 +208,14 @@ describe('no-progress visibility', () => {
     const cp = checkpointStore();
     const capped = lister(3, 10);
     await runReconciliation({
-      client: capped.client, checkpoints: cp.store, receipts: receipts(), owner: 's',
+      client: capped.client, checkpoints: cp.store, receipts: receipts(), mappings: enabledMappings, owner: 's',
       caps: { maxItems: 5 },
     });
     expect(cp.noProgress()).toBe(1);
 
     const drained = lister(1, 2);
     const r = await runReconciliation({
-      client: drained.client, checkpoints: cp.store, receipts: receipts(), owner: 's',
+      client: drained.client, checkpoints: cp.store, receipts: receipts(), mappings: enabledMappings, owner: 's',
     });
     expect(r.advanced).toBe(true);
     expect(cp.noProgress()).toBe(0);
@@ -217,7 +225,7 @@ describe('no-progress visibility', () => {
     const cp = checkpointStore();
     const l = lister(5, 10);
     const r = await runReconciliation({
-      client: l.client, checkpoints: cp.store, receipts: receipts(), owner: 's',
+      client: l.client, checkpoints: cp.store, receipts: receipts(), mappings: enabledMappings, owner: 's',
       caps: { maxPages: 2 },
     });
     expect(r.stop).toBe('page_cap');

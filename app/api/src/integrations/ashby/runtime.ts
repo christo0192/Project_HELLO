@@ -31,7 +31,7 @@ import {
   type AshbyIntegrationConfig,
   type AshbyRuntimeConfig,
 } from './config.js';
-import { createReceiptStore, createCheckpointStore, createMappingResolver, createAshbySignalQueue } from './stores.js';
+import { createReceiptStore, createCheckpointStore, createMappingResolver, createEnabledMappingLoader, createAshbySignalQueue } from './stores.js';
 import { createWorkflowStores, createMissionControlStore, type MissionControlStore } from './workflow-stores.js';
 import { createPinnedHttpsTransport } from './resume-transport.js';
 import { fetchEphemeralResume } from './resume-fetch.js';
@@ -40,7 +40,7 @@ import type { IngestionPorts, ParseOutput, StructuredResume } from './resume-ing
 import type { RuntimeWorkflowStores, ResolvedMapping } from './orchestration.js';
 import type { MappingResolver } from './signal-worker.js';
 import type { MaterializationStore, MaterializationMapping } from './materialize.js';
-import type { ReceiptStore, CheckpointStore } from './ports.js';
+import type { ReceiptStore, CheckpointStore, EnabledMappingLoader } from './ports.js';
 import type { Queue } from '../../lib/queue/index.js';
 import { resolveScanner } from '../../lib/malware-scanner.js';
 import { guardUpload, UploadGuardError } from '../../lib/upload-guard.js';
@@ -66,6 +66,12 @@ export interface AshbyRuntime {
   materialization: MaterializationStore;
   /** Current per-job mapping activity (status + AI stage) for the signal gate. */
   mappings: MappingResolver;
+  /**
+   * One bounded load of the ENABLED mappings, used by reconciliation to admit
+   * application.list rows BEFORE any receipt/enqueue — the tenant-wide storm
+   * guard. Rebuilt every run; never cached across runs.
+   */
+  enabledMappings: EnabledMappingLoader;
   /** SSRF policy derived from config. `allowlistEnabled` false when empty. */
   urlPolicy: UrlPolicy;
   /** Full mapping config for the import decision (status + stage + mode). */
@@ -423,6 +429,7 @@ export function createAshbyRuntime(options: CreateAshbyRuntimeOptions): AshbyRun
     stores,
     receipts: createReceiptStore(supabase),
     checkpoints: createCheckpointStore(supabase),
+    enabledMappings: createEnabledMappingLoader(supabase),
     missionControl: createMissionControlStore(supabase),
     materialization,
     urlPolicy,

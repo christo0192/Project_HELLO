@@ -3047,9 +3047,77 @@ components:
           $ref: '#/components/schemas/AshbyRuntimeState'
         scanner:
           $ref: '#/components/schemas/AshbyScannerState'
+        reconcile:
+          description: Last reconciliation pass observed by THIS process, or null when this process has run none (never a fleet-wide claim, and never a claim that no reconciliation happened). Counts and sanitized codes only.
+          nullable: true
+          $ref: '#/components/schemas/AshbyReconcilePassState'
         provider:
           description: Always "unknown" — this handler contacts no provider, so it makes no live-connectivity claim.
           type: string
+      additionalProperties: false
+
+    AshbyReconcileSkipState:
+      type: object
+      required: [noApplicationId, noEnabledMapping, stageNotAi, ambiguousMapping]
+      properties:
+        noApplicationId:
+          description: Rows with no usable application id.
+          type: integer
+        noEnabledMapping:
+          description: Rows whose job has no ENABLED mapping (unmapped, paused, or drifted).
+          type: integer
+        stageNotAi:
+          description: Rows on a mapped, enabled job but at some stage other than its AI screening stage.
+          type: integer
+        ambiguousMapping:
+          description: Rows whose job had conflicting AI stages in the index — never guessed.
+          type: integer
+      additionalProperties: false
+
+    AshbyReconcilePassState:
+      description: Sanitized counts from the last reconciliation pass. No application, job, stage, candidate, mapping, or tenant identifier appears here. On a pass that reached a normal stop, observed = admitted + sum(skipped); on an aborted pass (enqueue_cap / unclassified_cap) the row that tripped the bound is observed but neither admitted nor skipped.
+      type: object
+      required: [stop, mode, observed, admitted, skipped, unclassified, enabledMappings, mappingIndexTruncated, recovered, duplicates, enqueued, advanced, observedAt]
+      properties:
+        stop:
+          description: Sanitized stop code — drained, page_cap, item_cap, deadline, enqueue_cap, or unclassified_cap.
+          type: string
+        mode:
+          description: full or incremental.
+          type: string
+        observed:
+          description: Applications seen on the pages read.
+          type: integer
+        admitted:
+          description: Applications that passed admission, including fail-open unclassified rows. Must be 0 while every mapping is paused.
+          type: integer
+        skipped:
+          $ref: '#/components/schemas/AshbyReconcileSkipState'
+        unclassified:
+          description: Rows admitted fail-open because their job or stage id was unreadable. A sustained non-zero value indicates provider list-schema drift.
+          type: integer
+        enabledMappings:
+          description: Enabled mappings in this pass's admission index. 0 means nothing could be admitted.
+          type: integer
+        mappingIndexTruncated:
+          description: True when more enabled mappings exist than the per-run bound.
+          type: boolean
+        recovered:
+          description: Newly recorded stage receipts (dropped-webhook recovery).
+          type: integer
+        duplicates:
+          description: Admitted applications whose receipt already existed.
+          type: integer
+        enqueued:
+          description: Signal jobs enqueued by this pass. Non-zero alongside a climbing no_progress_runs means real backlog progress, not a stuck stream.
+          type: integer
+        advanced:
+          description: Whether the opaque cursor advanced (only on a fully drained pass).
+          type: boolean
+        observedAt:
+          description: When this pass was published. Never a provider timestamp.
+          type: string
+          format: date-time
       additionalProperties: false
 
     AshbyProbeStage:

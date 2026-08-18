@@ -214,6 +214,106 @@ describe('GET /health — truthful and sanitized', () => {
   });
 });
 
+// ── Reconciliation admission counts (review M-1) ────────────────────────────
+//
+// The admission counters emitted by runReconciliation go to lib/metrics.ts,
+// whose sink is a NO-OP in this deployment. Without a real consumer the
+// runbook's re-activation gate — "admitted = 0 and enqueued = 0 while every
+// mapping is paused" — could not actually be checked. These tests hold that
+// consumer in place.
+
+describe('GET /health — last reconciliation pass', () => {
+  const pausedTenantPass = {
+    stop: 'drained', mode: 'full',
+    observed: 2000, admitted: 0,
+    skipped: { noApplicationId: 0, noEnabledMapping: 2000, stageNotAi: 0, ambiguousMapping: 0 },
+    unclassified: 0, enabledMappings: 0, mappingIndexTruncated: false,
+    recovered: 0, duplicates: 0, enqueued: 0, advanced: true,
+    observedAt: '2026-08-18T00:00:00.000Z',
+  };
+
+  it('surfaces the admission gate an operator must check before enabling a mapping', async () => {
+    const app = appWithDeps('interviewer', {
+      store: fakeStore(), probeReader: null, configSource: activeEnv(),
+      schedulerSnapshot: healthySchedulerSnapshot,
+      backlog: async () => emptyBacklog(),
+      reconcilePass: () => pausedTenantPass,
+    });
+    const res = await request(app).get('/mc/health');
+    expect(res.status).toBe(200);
+    // The exact gate from the runbook's re-activation step 6.
+    expect(res.body.reconcile.admitted).toBe(0);
+    expect(res.body.reconcile.enqueued).toBe(0);
+    expect(res.body.reconcile.observed).toBe(2000);
+    expect(res.body.reconcile.enabledMappings).toBe(0);
+    expect(res.body.reconcile.advanced).toBe(true);
+    // observed === admitted + sum(skipped) on a normally-stopped pass.
+    const skips = Object.values(res.body.reconcile.skipped as Record<string, number>)
+      .reduce((a, b) => a + b, 0);
+    expect(res.body.reconcile.admitted + skips).toBe(res.body.reconcile.observed);
+  });
+
+  it('reports null when THIS process has run no pass, without claiming none happened', async () => {
+    const common = {
+      store: fakeStore(), probeReader: null, configSource: activeEnv(),
+      schedulerSnapshot: healthySchedulerSnapshot,
+      backlog: async () => emptyBacklog(),
+    };
+    const res = await request(appWithDeps('interviewer', { ...common, reconcilePass: () => null }))
+      .get('/mc/health');
+    expect(res.status).toBe(200);
+    expect(res.body.reconcile).toBeNull();
+
+    // A null pass means "this process has run none" — it is NOT a fleet-wide
+    // claim and must not itself move the verdict. The durable backlog and the
+    // scheduler heartbeat remain the liveness signals, so the status is
+    // identical with and without a published pass.
+    const withPass = await request(
+      appWithDeps('interviewer', { ...common, reconcilePass: () => pausedTenantPass }),
+    ).get('/mc/health');
+    expect(res.body.status).toBe(withPass.body.status);
+    expect(res.body.reasons).toEqual(withPass.body.reasons);
+  });
+
+  it('distinguishes an enqueue_cap pass (real progress) from a stuck stream', async () => {
+    const app = appWithDeps('interviewer', {
+      store: fakeStore(), probeReader: null, configSource: activeEnv(),
+      schedulerSnapshot: healthySchedulerSnapshot,
+      backlog: async () => emptyBacklog(),
+      reconcilePass: () => ({
+        ...pausedTenantPass,
+        stop: 'enqueue_cap', admitted: 200, enqueued: 200, advanced: false,
+        enabledMappings: 1,
+        skipped: { noApplicationId: 0, noEnabledMapping: 1800, stageNotAi: 0, ambiguousMapping: 0 },
+      }),
+    });
+    const res = await request(app).get('/mc/health');
+    // The discriminator the runbook documents: enqueued > 0 with advanced
+    // false is a draining backlog, NOT the re-storming stuck case.
+    expect(res.body.reconcile.stop).toBe('enqueue_cap');
+    expect(res.body.reconcile.enqueued).toBeGreaterThan(0);
+    expect(res.body.reconcile.advanced).toBe(false);
+  });
+
+  it('leaks no identifier through the reconciliation surface', async () => {
+    const app = appWithDeps('interviewer', {
+      store: fakeStore(), probeReader: null, configSource: activeEnv(),
+      schedulerSnapshot: healthySchedulerSnapshot,
+      backlog: async () => emptyBacklog(),
+      reconcilePass: () => pausedTenantPass,
+    });
+    const res = await request(app).get('/mc/health');
+    const serialized = JSON.stringify(res.body.reconcile);
+    // Counts and sanitized codes only — no opaque provider id shape at all.
+    expect(serialized).not.toMatch(/app_|job_|stage_|cand_/);
+    expect(Object.keys(res.body.reconcile).sort()).toEqual([
+      'admitted', 'advanced', 'duplicates', 'enabledMappings', 'enqueued',
+      'mappingIndexTruncated', 'mode', 'observed', 'observedAt', 'recovered',
+      'skipped', 'stop', 'unclassified',
+    ]);
+  });
+});
+
 describe('GET /health — real liveness, not configuration', () => {
   /** A ClamAV scanner with current signatures — the only ready state. */
   const readyScanner = async () => ({

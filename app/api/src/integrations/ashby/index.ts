@@ -48,11 +48,16 @@ export { ingestWebhook, isTriggerAction, type IngressOutcome, type IngressDeps }
 export {
   runReconciliation,
   resolveSyncMode,
+  admitApplication,
+  buildEnabledStageIndex,
   SYNC_TOKEN_MAX_AGE_MS,
   DEFAULT_CHECKPOINT_KEY,
+  DEFAULT_MAX_ENABLED_MAPPINGS,
   type ReconcileResult,
+  type ReconcileSkipCounts,
   type ReconcileDeps,
   type ReconcileCaps,
+  type AdmissionVerdict,
   type ApplicationLister,
 } from './reconciliation.js';
 export {
@@ -72,6 +77,7 @@ export {
   createReceiptStore,
   createCheckpointStore,
   createMappingResolver,
+  createEnabledMappingLoader,
   createAshbySignalQueue,
 } from './stores.js';
 export type {
@@ -81,6 +87,8 @@ export type {
   CheckpointStore,
   SyncCheckpoint,
   AshbySignalPayload,
+  EnabledMappingLoader,
+  EnabledMappingRow,
 } from './ports.js';
 export {
   ASHBY_OPERATIONS,

@@ -19,6 +19,25 @@
  *                           (human/TA/other stage → NO import)
  *   self_echo            → the stage change was our own write-back (dedup no-op)
  *
+ * TERMINAL vs CONDITIONAL verdicts (review finding B2). `mark(...)` writes a
+ * receipt status, and `record_ashby_event_receipt` treats
+ * `processed|ignored|failed` as "durable work is done" and refuses to re-drive.
+ * Because the receipt identity is stage-centric (`stage:<app>:<stage>`), a
+ * terminal status permanently poisons that exact application-at-stage: no
+ * future signal for it can ever be enqueued again.
+ *
+ * That is correct only for verdicts whose "no" is PERMANENT:
+ *   ignored_action, capability_disabled, self_echo → terminal `ignored`
+ *   import_eligible                                → terminal `processed`
+ *
+ * It is WRONG for CONDITIONAL verdicts, whose "no" a human can reverse:
+ *   mapping_inactive  → someone can enable the mapping tomorrow
+ *   stage_not_ai      → someone can move the candidate into the AI stage
+ * These leave the receipt at its non-terminal `received` state — recorded, not
+ * concluded — so a later forced full resync (which enabling a mapping now
+ * triggers) can still recover the application. Terminalising them is what made
+ * "enable a mapping after the runtime ran" silently, permanently blind.
+ *
  * The leased runner (`runClaimedAshbySignal`) claims one job under an
  * unguessable lease and commits ONLY under the live matching lease: a stale
  * worker whose lease expired or was reclaimed cannot commit (invariant 8).
@@ -199,20 +218,23 @@ export async function processAshbySignal(
   const stageId = view.currentStageId;
 
   if (!jobId) {
-    await mark(deps, payload, 'ignored');
+    // CONDITIONAL — leave the receipt non-terminal (B2). Deliberately no mark.
     return { decision: 'mapping_inactive', applicationId, stageId };
   }
 
   const mapping = await deps.mappings.resolveByJobId(jobId);
   if (mapping.status !== 'enabled' || !mapping.aiScreeningStageId) {
-    await mark(deps, payload, 'ignored');
+    // CONDITIONAL — the mapping can be enabled later, and enabling forces a
+    // full resync that must be able to re-drive this application (B2).
     return { decision: 'mapping_inactive', applicationId, jobId, stageId };
   }
 
   // The current stage must be the mapping's AI screening stage. A human/TA/other
   // stage → no import.
   if (!stageId || stageId !== mapping.aiScreeningStageId) {
-    await mark(deps, payload, 'ignored');
+    // CONDITIONAL — a human can move the candidate INTO the AI stage, and the
+    // stage-centric dedup identity would suppress that re-entry forever if we
+    // terminalised here (B2).
     return { decision: 'stage_not_ai', applicationId, jobId, stageId };
   }
 

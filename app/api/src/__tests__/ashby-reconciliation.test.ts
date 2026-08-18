@@ -17,7 +17,10 @@ import {
   type ApplicationLister,
 } from '../integrations/ashby/reconciliation.js';
 import { ingestWebhook } from '../integrations/ashby/ingress.js';
-import type { CheckpointStore, ReceiptStore, ReceiptOutcome, SyncCheckpoint } from '../integrations/ashby/ports.js';
+import type {
+  CheckpointStore, ReceiptStore, ReceiptOutcome, SyncCheckpoint,
+  EnabledMappingLoader, EnabledMappingRow,
+} from '../integrations/ashby/ports.js';
 import type { AshbyResult, OpaqueRecord } from '../integrations/ashby/types.js';
 
 /**
@@ -75,8 +78,30 @@ function scriptedLister(pages: Array<Partial<AshbyResult<OpaqueRecord[]>>>): App
   };
 }
 
-function app(id: string, stageId: string): OpaqueRecord {
-  return { application: { id, currentInterviewStage: { id: stageId } } };
+/**
+ * An application.list row. Every row now carries a job id as well, because
+ * admission requires the row to POSITIVELY expose both a job and a stage.
+ */
+function app(id: string, stageId: string, jobId = 'job_1'): OpaqueRecord {
+  return { application: { id, job: { id: jobId }, currentInterviewStage: { id: stageId } } };
+}
+
+/** An enabled-mapping loader admitting exactly the given (job, AI stage) pairs. */
+function enabledMappings(
+  pairs: Array<[string, string]>,
+  truncated = false,
+): EnabledMappingLoader & { calls: number } {
+  const rows: EnabledMappingRow[] = pairs.map(([externalJobId, aiScreeningStageId]) => ({
+    externalJobId, aiScreeningStageId,
+  }));
+  const loader = {
+    calls: 0,
+    async listEnabled(): Promise<{ rows: EnabledMappingRow[]; truncated: boolean }> {
+      loader.calls += 1;
+      return { rows, truncated };
+    },
+  };
+  return loader;
 }
 
 describe('resolveSyncMode (14-day expiry + forced resync)', () => {
@@ -98,6 +123,14 @@ describe('resolveSyncMode (14-day expiry + forced resync)', () => {
   });
 });
 
+/**
+ * These recovery/checkpoint tests predate admission and exercise cursor
+ * mechanics, not the gate — so they run with a mapping index that admits the
+ * stages their fixtures use. Admission itself is proven in
+ * `ashby-reconcile-admission.test.ts`.
+ */
+const ADMIT_ALL_TEST_STAGES = enabledMappings([['job_1', 'stage_ai']]);
+
 describe('runReconciliation — recovery + checkpoint safety', () => {
   it('recovers dropped signals and advances the checkpoint after a drained run', async () => {
     const receipts = new FakeReceipts();
@@ -107,7 +140,7 @@ describe('runReconciliation — recovery + checkpoint safety', () => {
     const lister = scriptedLister([
       { results: [app('app_1', 'stage_ai'), app('app_2', 'stage_ai')], moreDataAvailable: false, syncToken: 'sync_final' },
     ]);
-    const res = await runReconciliation({ client: lister, checkpoints, receipts });
+    const res = await runReconciliation({ client: lister, checkpoints, receipts, mappings: ADMIT_ALL_TEST_STAGES });
     expect(res.mode).toBe('full');
     expect(res.stop).toBe('drained');
     expect(res.items).toBe(2);
@@ -128,7 +161,7 @@ describe('runReconciliation — recovery + checkpoint safety', () => {
     const lister = scriptedLister([
       { results: [app('app_x', 'stage_ai')], moreDataAvailable: false, syncToken: 't' },
     ]);
-    const res = await runReconciliation({ client: lister, checkpoints, receipts });
+    const res = await runReconciliation({ client: lister, checkpoints, receipts, mappings: ADMIT_ALL_TEST_STAGES });
     expect(res.recovered).toBe(1);
     expect(res.enqueued).toBe(1);
     expect(receipts.liveJobs.size).toBe(1);
@@ -146,11 +179,11 @@ describe('runReconciliation — recovery + checkpoint safety', () => {
     const receipts = new FakeReceipts();
     const checkpoints = new FakeCheckpoints(null);
     const lister = scriptedLister([
-      { results: [app('a', 's1')], moreDataAvailable: true, nextCursor: 'c1' },
-      { results: [app('b', 's1')], moreDataAvailable: true, nextCursor: 'c2' },
-      { results: [app('c', 's1')], moreDataAvailable: false, syncToken: 'final' },
+      { results: [app('a', 'stage_ai')], moreDataAvailable: true, nextCursor: 'c1' },
+      { results: [app('b', 'stage_ai')], moreDataAvailable: true, nextCursor: 'c2' },
+      { results: [app('c', 'stage_ai')], moreDataAvailable: false, syncToken: 'final' },
     ]);
-    const res = await runReconciliation({ client: lister, checkpoints, receipts });
+    const res = await runReconciliation({ client: lister, checkpoints, receipts, mappings: ADMIT_ALL_TEST_STAGES });
     expect(res.pages).toBe(3);
     expect(res.recovered).toBe(3);
     expect(res.advanced).toBe(true);
@@ -161,10 +194,10 @@ describe('runReconciliation — recovery + checkpoint safety', () => {
     const receipts = new FakeReceipts();
     const checkpoints = new FakeCheckpoints(null);
     const lister = scriptedLister([
-      { results: [app('a', 's1')], moreDataAvailable: true, nextCursor: 'c1' },
-      { results: [app('b', 's1')], moreDataAvailable: true, nextCursor: 'c2' },
+      { results: [app('a', 'stage_ai')], moreDataAvailable: true, nextCursor: 'c1' },
+      { results: [app('b', 'stage_ai')], moreDataAvailable: true, nextCursor: 'c2' },
     ]);
-    const res = await runReconciliation({ client: lister, checkpoints, receipts, caps: { maxPages: 1 } });
+    const res = await runReconciliation({ client: lister, checkpoints, receipts, mappings: ADMIT_ALL_TEST_STAGES, caps: { maxPages: 1 } });
     expect(res.stop).toBe('page_cap');
     expect(res.advanced).toBe(false);
     expect(checkpoints.advances).toHaveLength(0);
@@ -174,9 +207,9 @@ describe('runReconciliation — recovery + checkpoint safety', () => {
     const receipts = new FakeReceipts();
     const checkpoints = new FakeCheckpoints(null);
     const lister = scriptedLister([
-      { results: [app('a', 's1'), app('b', 's1'), app('c', 's1')], moreDataAvailable: false },
+      { results: [app('a', 'stage_ai'), app('b', 'stage_ai'), app('c', 'stage_ai')], moreDataAvailable: false },
     ]);
-    const res = await runReconciliation({ client: lister, checkpoints, receipts, caps: { maxItems: 2 } });
+    const res = await runReconciliation({ client: lister, checkpoints, receipts, mappings: ADMIT_ALL_TEST_STAGES, caps: { maxItems: 2 } });
     expect(res.stop).toBe('item_cap');
     expect(res.advanced).toBe(false);
   });
@@ -186,10 +219,10 @@ describe('runReconciliation — recovery + checkpoint safety', () => {
     const checkpoints = new FakeCheckpoints(null);
     // Both pages return the SAME nextCursor → loop.
     const lister = scriptedLister([
-      { results: [app('a', 's1')], moreDataAvailable: true, nextCursor: 'loop' },
-      { results: [app('b', 's1')], moreDataAvailable: true, nextCursor: 'loop' },
+      { results: [app('a', 'stage_ai')], moreDataAvailable: true, nextCursor: 'loop' },
+      { results: [app('b', 'stage_ai')], moreDataAvailable: true, nextCursor: 'loop' },
     ]);
-    await expect(runReconciliation({ client: lister, checkpoints, receipts })).rejects.toThrow(/cursor_loop/);
+    await expect(runReconciliation({ client: lister, checkpoints, receipts, mappings: ADMIT_ALL_TEST_STAGES })).rejects.toThrow(/cursor_loop/);
     expect(checkpoints.advances).toHaveLength(0);
   });
 
@@ -201,12 +234,12 @@ describe('runReconciliation — recovery + checkpoint safety', () => {
       async applicationList<T = OpaqueRecord[]>(): Promise<AshbyResult<T>> {
         calls += 1;
         if (calls === 1) {
-          return { results: [app('a', 's1')] as unknown as T, moreDataAvailable: true, nextCursor: 'c1' };
+          return { results: [app('a', 'stage_ai')] as unknown as T, moreDataAvailable: true, nextCursor: 'c1' };
         }
         throw new Error('provider 500');
       },
     };
-    await expect(runReconciliation({ client: lister, checkpoints, receipts })).rejects.toThrow('provider 500');
+    await expect(runReconciliation({ client: lister, checkpoints, receipts, mappings: ADMIT_ALL_TEST_STAGES })).rejects.toThrow('provider 500');
     expect(checkpoints.advances).toHaveLength(0);
   });
 
@@ -216,10 +249,10 @@ describe('runReconciliation — recovery + checkpoint safety', () => {
     let t = 0;
     const nowMs = () => { t += 2000; return t; }; // each read advances 2s
     const lister = scriptedLister([
-      { results: [app('a', 's1')], moreDataAvailable: true, nextCursor: 'c1' },
-      { results: [app('b', 's1')], moreDataAvailable: true, nextCursor: 'c2' },
+      { results: [app('a', 'stage_ai')], moreDataAvailable: true, nextCursor: 'c1' },
+      { results: [app('b', 'stage_ai')], moreDataAvailable: true, nextCursor: 'c2' },
     ]);
-    const res = await runReconciliation({ client: lister, checkpoints, receipts, caps: { deadlineMs: 1000 }, nowMs });
+    const res = await runReconciliation({ client: lister, checkpoints, receipts, mappings: ADMIT_ALL_TEST_STAGES, caps: { deadlineMs: 1000 }, nowMs });
     expect(res.stop).toBe('deadline');
     expect(res.advanced).toBe(false);
   });
