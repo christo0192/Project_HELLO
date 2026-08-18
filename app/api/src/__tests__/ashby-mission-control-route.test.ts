@@ -229,6 +229,10 @@ describe('GET /health — last reconciliation pass', () => {
     skipped: { noApplicationId: 0, noEnabledMapping: 2000, stageNotAi: 0, ambiguousMapping: 0 },
     unclassified: 0, enabledMappings: 0, mappingIndexTruncated: false,
     recovered: 0, duplicates: 0, enqueued: 0, advanced: true,
+    // 0034 continuation surface: booleans and bounded counts only.
+    resumed: false, continuationPending: false, pageAnchors: 0,
+    resyncPagesDone: 0, resyncItemsDone: 0, restartReason: 'none',
+    sweepRestarts: 0, tokenInstalled: true,
     observedAt: '2026-08-18T00:00:00.000Z',
   };
 
@@ -295,6 +299,41 @@ describe('GET /health — last reconciliation pass', () => {
     expect(res.body.reconcile.advanced).toBe(false);
   });
 
+  it('reports a multi-run full resync as progressing, not stuck', async () => {
+    // The exact production shape Lane A exists for: a >5,000 corpus whose
+    // full resync stops on `page_cap` every run. Pre-0034 that was
+    // indistinguishable from a permanently stuck stream; the continuation
+    // fields are what make it readable as forward progress.
+    const app = appWithDeps('interviewer', {
+      store: fakeStore(), probeReader: null, configSource: activeEnv(),
+      schedulerSnapshot: healthySchedulerSnapshot,
+      backlog: async () => emptyBacklog(),
+      reconcilePass: () => ({
+        ...pausedTenantPass,
+        stop: 'page_cap', advanced: false,
+        resumed: true, continuationPending: true, pageAnchors: 50,
+        resyncPagesDone: 100, resyncItemsDone: 10_000,
+      }),
+    });
+    const res = await request(app).get('/mc/health');
+    expect(res.body.reconcile.advanced).toBe(false);
+    expect(res.body.reconcile.resumed).toBe(true);
+    expect(res.body.reconcile.continuationPending).toBe(true);
+    expect(res.body.reconcile.resyncItemsDone).toBe(10_000);
+    // Still no opaque VALUE anywhere on the surface. The continuation is
+    // reported as booleans, bounded counts, and short sanitized codes only —
+    // the page cursor and the sync token never leave the service-role
+    // boundary, so every string here must be a short lowercase code.
+    for (const [key, value] of Object.entries(res.body.reconcile)) {
+      if (key === 'observedAt') continue;                 // ISO timestamp
+      if (typeof value === 'string') {
+        expect(value).toMatch(/^[a-z_]{1,32}$/);
+      } else {
+        expect(['boolean', 'number', 'object']).toContain(typeof value);
+      }
+    }
+  });
+
   it('leaks no identifier through the reconciliation surface', async () => {
     const app = appWithDeps('interviewer', {
       store: fakeStore(), probeReader: null, configSource: activeEnv(),
@@ -307,9 +346,11 @@ describe('GET /health — last reconciliation pass', () => {
     // Counts and sanitized codes only — no opaque provider id shape at all.
     expect(serialized).not.toMatch(/app_|job_|stage_|cand_/);
     expect(Object.keys(res.body.reconcile).sort()).toEqual([
-      'admitted', 'advanced', 'duplicates', 'enabledMappings', 'enqueued',
-      'mappingIndexTruncated', 'mode', 'observed', 'observedAt', 'recovered',
-      'skipped', 'stop', 'unclassified',
+      'admitted', 'advanced', 'continuationPending', 'duplicates',
+      'enabledMappings', 'enqueued', 'mappingIndexTruncated', 'mode',
+      'observed', 'observedAt', 'pageAnchors', 'recovered', 'restartReason',
+      'resumed', 'resyncItemsDone', 'resyncPagesDone', 'skipped', 'stop',
+      'sweepRestarts', 'tokenInstalled', 'unclassified',
     ]);
   });
 });

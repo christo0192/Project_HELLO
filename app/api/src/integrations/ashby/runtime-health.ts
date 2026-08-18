@@ -165,6 +165,26 @@ export interface ReconcilePassView {
   duplicates: number;
   enqueued: number;
   advanced: boolean;
+  /**
+   * Page-anchored full-resync continuation (0034). Booleans and bounded
+   * counts ONLY — the opaque page cursor never reaches this surface, exactly
+   * like the sync token it sits beside.
+   */
+  resumed: boolean;
+  continuationPending: boolean;
+  pageAnchors: number;
+  resyncPagesDone: number;
+  resyncItemsDone: number;
+  /** Why the run started at page 1 instead of resuming. Sanitized code. */
+  restartReason: string;
+  /** Times a sweep was abandoned and restarted. Climbing ⇒ resume not holding. */
+  sweepRestarts: number;
+  /**
+   * Whether a drained run actually installed a sync token. A sweep can drain
+   * with none (the provider returned no token in 1,200 probed pages), which
+   * means the next pass is another full sweep — invisible from `advanced`.
+   */
+  tokenInstalled: boolean;
   /** ISO time this pass was published. Never a provider timestamp. */
   observedAt: string;
 }
@@ -202,6 +222,16 @@ export function publishReconcilePass(
     duplicates: number;
     enqueued: number;
     advanced: boolean;
+    partialProgress?: {
+      resumed: boolean;
+      checkpoints: number;
+      pagesDone: number;
+      itemsDone: number;
+      continuationPending: boolean;
+      restartReason?: string;
+      sweepRestarts?: number;
+      tokenInstalled?: boolean;
+    };
   },
   nowIso: string = new Date().toISOString(),
 ): void {
@@ -223,6 +253,14 @@ export function publishReconcilePass(
     duplicates: safeCount(pass.duplicates),
     enqueued: safeCount(pass.enqueued),
     advanced: pass.advanced === true,
+    resumed: pass.partialProgress?.resumed === true,
+    continuationPending: pass.partialProgress?.continuationPending === true,
+    pageAnchors: safeCount(pass.partialProgress?.checkpoints),
+    resyncPagesDone: safeCount(pass.partialProgress?.pagesDone),
+    resyncItemsDone: safeCount(pass.partialProgress?.itemsDone),
+    restartReason: safeCode(pass.partialProgress?.restartReason ?? 'none'),
+    sweepRestarts: safeCount(pass.partialProgress?.sweepRestarts),
+    tokenInstalled: pass.partialProgress?.tokenInstalled === true,
     observedAt: nowIso,
   };
 }

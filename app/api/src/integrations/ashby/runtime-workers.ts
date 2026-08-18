@@ -102,6 +102,12 @@ export interface ReconcilePassSummary {
   duplicates: number;
   enqueued: number;
   advanced: boolean;
+  /**
+   * Durable page-anchored continuation progress (0034). `advanced` alone
+   * cannot distinguish "stuck, re-paging the same prefix forever" from
+   * "eating through a >5,000 corpus one bounded run at a time" — this can.
+   */
+  partialProgress: ReconcileResult['partialProgress'];
 }
 
 export interface AshbyWorkers {
@@ -336,6 +342,16 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
       {
         name: 'reconcile',
         intervalMs: rc.reconcileIntervalMs,
+        // While a page-anchored sweep is in flight, tick on the SHORT sweep
+        // cadence instead. Production measured ~119,000 applications paging
+        // ~100 at a time: at the 15-minute rest cadence that backfill would
+        // take a day, and the anchor would be 15 minutes stale on every
+        // resume. The single-flight lease makes the short interval safe — an
+        // overlapping tick returns `locked` before any provider call.
+        intervalMsFor: () =>
+          (lastReconcilePass?.partialProgress.continuationPending
+            ? rc.reconcileSweepIntervalMs
+            : rc.reconcileIntervalMs),
         tick: async () => {
           const r = await runReconciliation({
             client: runtime.client,
@@ -347,6 +363,12 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
             mappings: runtime.enabledMappings,
             checkpointKey: DEFAULT_CHECKPOINT_KEY,
             owner,
+            // Tunable without a deploy: a backfill against a large corpus
+            // needs different bounds than steady-state reconciliation.
+            caps: {
+              ...rc.reconcileCaps,
+              anchorDisabled: rc.reconcileAnchorDisabled,
+            },
           });
           if (r.stop !== 'locked') {
             // Numeric admission counters go to the metrics sink (emitted
@@ -367,6 +389,7 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
               duplicates: r.duplicates,
               enqueued: r.enqueued,
               advanced: r.advanced,
+              partialProgress: r.partialProgress,
             };
             // Publish to the health registry so the counts have a REAL consumer
             // (Mission Control /health). Without this the re-activation gate
@@ -392,6 +415,26 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
             if (r.stop === 'enqueue_cap' || r.stop === 'unclassified_cap') {
               logger.warn('unknown_event', {
                 error_category: 'ashby_reconcile_aborted',
+                error_type: r.stop,
+              });
+            }
+            // A refused page anchor means this run lost the continuation to a
+            // newer generation or to another lease holder. It is not an error
+            // (the sweep restarts safely) but it must not be silent, because a
+            // stream that hits it every pass never finishes a full resync.
+            if (r.stop === 'continuation_conflict') {
+              logger.warn('unknown_event', {
+                error_category: 'ashby_reconcile_continuation_conflict',
+                error_type: r.stop,
+              });
+            }
+            // An abandoned sweep is the loudest signal here: the corpus could
+            // not be swept within its budget, or the resumed cursor was not
+            // usable. Reconciliation is not covering this tenant until it is
+            // understood.
+            if (r.stop === 'sweep_budget' || r.stop === 'cursor_invalid') {
+              logger.error('unknown_event', {
+                error_category: 'ashby_reconcile_sweep_abandoned',
                 error_type: r.stop,
               });
             }

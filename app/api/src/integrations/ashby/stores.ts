@@ -78,7 +78,7 @@ export function createCheckpointStore(client: SupabaseClient): CheckpointStore {
     async get(checkpointKey): Promise<SyncCheckpoint | null> {
       const { data, error } = await client
         .from('ashby_sync_checkpoints')
-        .select('sync_token, status, token_issued_at, last_success_at, resync_epoch')
+        .select('sync_token, status, token_issued_at, last_success_at, resync_epoch, resync_cursor, resync_cursor_epoch, resync_cursor_at, sweep_mode, sweep_restarts, resync_pages_done, resync_items_done')
         .eq('provider', 'ashby')
         .eq('checkpoint_key', checkpointKey)
         .maybeSingle();
@@ -90,6 +90,13 @@ export function createCheckpointStore(client: SupabaseClient): CheckpointStore {
         token_issued_at: string | null;
         last_success_at: string | null;
         resync_epoch: number | null;
+        resync_cursor: string | null;
+        resync_cursor_epoch: number | null;
+        resync_cursor_at: string | null;
+        sweep_mode: string | null;
+        resync_pages_done: number | null;
+        resync_items_done: number | null;
+        sweep_restarts: number | null;
       };
       const status: SyncCheckpoint['status'] =
         row.status === 'running' || row.status === 'full_resync_required' ? row.status : 'idle';
@@ -99,10 +106,24 @@ export function createCheckpointStore(client: SupabaseClient): CheckpointStore {
         tokenIssuedAt: row.token_issued_at,
         lastSuccessAt: row.last_success_at,
         resyncEpoch: typeof row.resync_epoch === 'number' ? row.resync_epoch : 0,
+        // Opaque page anchor (0034) — stays inside the service-role boundary.
+        resyncCursor: typeof row.resync_cursor === 'string' && row.resync_cursor
+          ? row.resync_cursor
+          : null,
+        resyncCursorEpoch: typeof row.resync_cursor_epoch === 'number'
+          ? row.resync_cursor_epoch
+          : null,
+        resyncCursorAt: row.resync_cursor_at ?? null,
+        sweepMode: row.sweep_mode === 'full' || row.sweep_mode === 'incremental'
+          ? row.sweep_mode
+          : null,
+        resyncPagesDone: typeof row.resync_pages_done === 'number' ? row.resync_pages_done : 0,
+        resyncItemsDone: typeof row.resync_items_done === 'number' ? row.resync_items_done : 0,
+        sweepRestarts: typeof row.sweep_restarts === 'number' ? row.sweep_restarts : 0,
       };
     },
     async advance(input): Promise<void> {
-      const { error } = await client.rpc('advance_ashby_sync_checkpoint', {
+      const { data, error } = await client.rpc('advance_ashby_sync_checkpoint', {
         p_checkpoint_key: input.checkpointKey,
         p_sync_token: input.syncToken,
         p_pages: input.pages,
@@ -112,8 +133,15 @@ export function createCheckpointStore(client: SupabaseClient): CheckpointStore {
         // stored epoch has moved on, and the RPC keeps `full_resync_required`
         // set instead of letting this run's completion clear it.
         p_resync_epoch: typeof input.resyncEpoch === 'number' ? input.resyncEpoch : null,
+        // 0034 lease guard: refuse to install a token over another runner's
+        // in-flight sweep.
+        p_owner: typeof input.owner === 'string' && input.owner ? input.owner : null,
       });
       if (error) throw new Error('ashby_checkpoint_advance_error');
+      // A REFUSED advance (not_owned, invalid_*) must be loud. Swallowing the
+      // status would report a cursor as installed when nothing was written.
+      const status = (data as Record<string, unknown> | null)?.status;
+      if (status !== 'ok') throw new Error('ashby_checkpoint_advance_refused');
     },
     async requireFullResync(checkpointKey, reason): Promise<void> {
       const { error } = await client.rpc('mark_ashby_sync_full_resync', {
@@ -121,6 +149,30 @@ export function createCheckpointStore(client: SupabaseClient): CheckpointStore {
         p_reason: reason,
       });
       if (error) throw new Error('ashby_checkpoint_resync_error');
+    },
+    async saveResyncCursor(input) {
+      // 0034 page anchor. The RPC compare-and-sets BOTH the observed epoch and
+      // the live lease owner and writes nothing on a mismatch, returning a
+      // sanitized status the caller fails closed on. A transport error is
+      // surfaced as its own non-`ok` status rather than thrown, so a failed
+      // anchor stops the sweep cleanly instead of unwinding it as a crash.
+      const { data, error } = await client.rpc('save_ashby_resync_cursor', {
+        p_checkpoint_key: input.checkpointKey,
+        p_cursor: input.cursor,
+        p_owner: input.owner,
+        p_pages_done: input.pagesDone,
+        p_items_done: input.itemsDone,
+        p_resync_epoch: typeof input.resyncEpoch === 'number' ? input.resyncEpoch : null,
+        p_mode: input.mode,
+        // Banked first-write-wins by the RPC; passing it every time is safe.
+        p_sweep_token: typeof input.sweepToken === 'string' && input.sweepToken
+          ? input.sweepToken
+          : null,
+        p_first: input.first === true,
+      });
+      if (error) return { status: 'save_error' };
+      const row = data as Record<string, unknown> | null;
+      return { status: typeof row?.status === 'string' ? row.status : 'error' };
     },
     async beginRun(input) {
       const { data, error } = await client.rpc('begin_ashby_sync_run', {
@@ -142,6 +194,19 @@ export function createCheckpointStore(client: SupabaseClient): CheckpointStore {
         tokenIssuedAt: (row?.token_issued_at as string | null) ?? null,
         lastSuccessAt: (row?.last_success_at as string | null) ?? null,
         resyncEpoch: typeof row?.resync_epoch === 'number' ? row.resync_epoch : 0,
+        resyncCursor: typeof row?.resync_cursor === 'string' && row.resync_cursor
+          ? (row.resync_cursor as string)
+          : null,
+        resyncCursorEpoch: typeof row?.resync_cursor_epoch === 'number'
+          ? row.resync_cursor_epoch
+          : null,
+        resyncCursorAt: (row?.resync_cursor_at as string | null) ?? null,
+        sweepMode: row?.sweep_mode === 'full' || row?.sweep_mode === 'incremental'
+          ? row.sweep_mode
+          : null,
+        resyncPagesDone: typeof row?.resync_pages_done === 'number' ? row.resync_pages_done : 0,
+        resyncItemsDone: typeof row?.resync_items_done === 'number' ? row.resync_items_done : 0,
+        sweepRestarts: typeof row?.sweep_restarts === 'number' ? row.sweep_restarts : 0,
       };
       return {
         status: 'ok',

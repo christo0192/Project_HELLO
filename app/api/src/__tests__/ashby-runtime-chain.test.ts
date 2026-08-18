@@ -122,6 +122,11 @@ function makeRuntime(w: ReturnType<typeof world>, over: Partial<AshbyRuntime> = 
       runtimeEnabled: true, apiKeyConfigured: true, apiKey: 'SENTINEL_APIKEY_aaaaaaaaaaaa',
       resumeHosts: [], signalPollMs: 5000, operationPollMs: 5000,
       reconcileIntervalMs: 900000, reclaimIntervalMs: 60000, leaseSeconds: 60,
+      reconcileSweepIntervalMs: 10000, reconcileAnchorDisabled: false,
+      reconcileCaps: {
+        maxPages: 50, maxItems: 5000, pageLimit: 100,
+        deadlineMs: 60000, maxEnqueuePerRun: 200,
+      },
     },
     client: {
       applicationInfo: async () => ({
