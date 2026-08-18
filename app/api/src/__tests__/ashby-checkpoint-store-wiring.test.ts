@@ -15,7 +15,7 @@ import { createCheckpointStore } from '../integrations/ashby/stores.js';
 /** The parameter names declared by 0034's save_ashby_resync_cursor. */
 const SAVE_RPC_PARAMS = [
   'p_checkpoint_key', 'p_cursor', 'p_owner', 'p_pages_done', 'p_items_done',
-  'p_resync_epoch', 'p_mode', 'p_sweep_token', 'p_first',
+  'p_resync_epoch', 'p_mode', 'p_sweep_token', 'p_first', 'p_enqueued',
 ] as const;
 
 type RpcCall = { fn: string; args: Record<string, unknown> };
@@ -61,6 +61,7 @@ describe('createCheckpointStore — 0034 continuation wiring', () => {
       mode: 'full',
       sweepToken: 'opaque-token',
       first: false,
+      enqueued: 42,
     });
     expect(res.status).toBe('ok');
     expect(calls).toHaveLength(1);
@@ -76,6 +77,7 @@ describe('createCheckpointStore — 0034 continuation wiring', () => {
       p_mode: 'full',
       p_sweep_token: 'opaque-token',
       p_first: false,
+      p_enqueued: 42,
     });
   });
 
@@ -158,6 +160,57 @@ describe('createCheckpointStore — 0034 continuation wiring', () => {
     expect(begun.status).toBe('ok');
     expect(begun.checkpoint).toMatchObject({
       resyncCursor: 'opaque-cursor', resyncPagesDone: 3, resyncItemsDone: 300, resyncEpoch: 5,
+    });
+  });
+
+  it('calls halt_ashby_sync_sweep with the migration parameter names', async () => {
+    // The halt is the compensating control for the page-aligned breaker. A
+    // parameter rename here would leave every domain test green and silently
+    // remove the only sweep-level ceiling on durable work.
+    const { client, calls } = fakeClient({ rpcResult: { status: 'ok' } });
+    const res = await createCheckpointStore(client).haltSweep!({
+      checkpointKey: 'application.list', owner: 'runner-a', reason: 'sweep_enqueue_budget',
+    });
+    expect(res.status).toBe('ok');
+    expect(calls[0].fn).toBe('halt_ashby_sync_sweep');
+    expect(Object.keys(calls[0].args).sort())
+      .toEqual(['p_checkpoint_key', 'p_owner', 'p_reason']);
+    expect(calls[0].args.p_reason).toBe('sweep_enqueue_budget');
+  });
+
+  it('surfaces a refused or failed halt as a status, never a silent ok', async () => {
+    const { client } = fakeClient({ rpcResult: { status: 'not_owned' } });
+    await expect(createCheckpointStore(client).haltSweep!({
+      checkpointKey: 'application.list', owner: 'runner-a', reason: 'sweep_enqueue_budget',
+    })).resolves.toEqual({ status: 'not_owned' });
+
+    const { client: broken } = fakeClient({ rpcError: { message: 'boom' } });
+    const res = await createCheckpointStore(broken).haltSweep!({
+      checkpointKey: 'application.list', owner: 'runner-a', reason: 'sweep_enqueue_budget',
+    });
+    expect(res.status).not.toBe('ok');
+  });
+
+  it('reads the sweep budget and halt state back', async () => {
+    const { client, columns } = fakeClient({
+      row: {
+        sync_token: null, status: 'full_resync_required', token_issued_at: null,
+        last_success_at: null, resync_epoch: 4, resync_cursor: 'opaque-cursor',
+        resync_cursor_epoch: 4, resync_cursor_at: '2026-08-18T00:00:00.000Z',
+        sweep_mode: 'full', sweep_restarts: 2, sweep_enqueued: 1_234,
+        sweep_halted_at: '2026-08-18T01:00:00.000Z',
+        sweep_halt_reason: 'sweep_enqueue_budget',
+        resync_pages_done: 12, resync_items_done: 1_200,
+      },
+    });
+    const cp = await createCheckpointStore(client).get('application.list');
+    for (const col of ['sweep_enqueued', 'sweep_halted_at', 'sweep_halt_reason']) {
+      expect(columns()).toContain(col);
+    }
+    expect(cp).toMatchObject({
+      sweepEnqueued: 1_234,
+      sweepHaltedAt: '2026-08-18T01:00:00.000Z',
+      sweepHaltReason: 'sweep_enqueue_budget',
     });
   });
 

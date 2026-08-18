@@ -59,6 +59,17 @@
 --        re-delivers changes (idempotent), never skips them. Latent today at
 --        50 pages; under multi-run sweeps the window is hours.
 --
+--   H-8  The storm breaker's compensating control. Page-aligning the enqueue
+--        breaker (so pages stay atomic and anchorable) converts it from a WEDGE
+--        into a RATE LIMIT: it bounds one run, and a sweep runs every few
+--        seconds. Combined, the guarded rate moves from <=200 jobs / 15 min to
+--        <=300 jobs / 5-10 s. `sweep_enqueued` therefore accumulates durable
+--        work across the WHOLE sweep, and exceeding the absolute per-sweep
+--        budget HALTS the sweep outright — reconciliation stops until an
+--        operator clears it. Reconciliation stopping is the conservative
+--        failure: webhook delivery is unaffected and nothing is lost, whereas
+--        an unbounded rate is how the 2,000-job incident happened.
+--
 --   H-7  Anchor binding and freshness. An anchor is usable only when it was
 --        written under the CURRENT resync_epoch and for the SAME sweep mode,
 --        and only while it is fresh. Provider cursor lifetime is not a
@@ -96,6 +107,9 @@ alter table screening_v2.ashby_sync_checkpoints
   add column if not exists sweep_mode          text,
   add column if not exists sweep_token         text,
   add column if not exists sweep_restarts      integer not null default 0,
+  add column if not exists sweep_enqueued      integer not null default 0,
+  add column if not exists sweep_halted_at     timestamptz,
+  add column if not exists sweep_halt_reason   text,
   add column if not exists resync_pages_done   integer not null default 0,
   add column if not exists resync_items_done   integer not null default 0,
   add column if not exists resync_started_at   timestamptz;
@@ -118,7 +132,17 @@ begin
   ) then
     alter table screening_v2.ashby_sync_checkpoints
       add constraint chk_ashby_sync_checkpoints_resync_progress
-        check (resync_pages_done >= 0 and resync_items_done >= 0 and sweep_restarts >= 0);
+        check (resync_pages_done >= 0 and resync_items_done >= 0
+               and sweep_restarts >= 0 and sweep_enqueued >= 0);
+  end if;
+  if not exists (
+    select 1 from pg_constraint
+     where conname = 'chk_ashby_sync_checkpoints_halt_reason'
+       and conrelid = 'screening_v2.ashby_sync_checkpoints'::regclass
+  ) then
+    alter table screening_v2.ashby_sync_checkpoints
+      add constraint chk_ashby_sync_checkpoints_halt_reason
+        check (sweep_halt_reason is null or length(sweep_halt_reason) <= 64);
   end if;
   if not exists (
     select 1 from pg_constraint
@@ -174,6 +198,20 @@ comment on column screening_v2.ashby_sync_checkpoints.sweep_token is
   'sweep can only re-deliver (idempotent), while the end of a sweep would '
   'permanently hide changes that landed on already-scanned pages. Opaque — '
   'never logged, never exposed to a browser role.';
+comment on column screening_v2.ashby_sync_checkpoints.sweep_enqueued is
+  'Signal jobs this SWEEP has created, across all of its runs. The per-run '
+  'breaker bounds one pass; page-aligning it and sweeping every few seconds '
+  'turned that bound into a rate, so this is the figure that actually bounds '
+  'blast radius. Exceeding the absolute per-sweep budget halts the sweep. A '
+  'bounded count — never an id.';
+comment on column screening_v2.ashby_sync_checkpoints.sweep_halted_at is
+  'When reconciliation HALTED itself on this stream (per-sweep enqueue budget '
+  'or restart budget exhausted). While set, every run returns immediately '
+  'without a single provider call. Cleared by mark_ashby_sync_full_resync — '
+  'i.e. by a deliberate operator action. Reconciliation stopping is the '
+  'conservative failure: webhook delivery is unaffected.';
+comment on column screening_v2.ashby_sync_checkpoints.sweep_halt_reason is
+  'Sanitized code for why the sweep halted. Never an id, token, or message.';
 comment on column screening_v2.ashby_sync_checkpoints.sweep_restarts is
   'How many times a sweep was abandoned and restarted from page 1 (stale or '
   'invalidated anchor). A climbing value means resume is not holding — the '
@@ -212,7 +250,8 @@ create or replace function screening_v2.save_ashby_resync_cursor(
   p_now            timestamptz default now(),
   p_mode           text    default null,
   p_sweep_token    text    default null,
-  p_first          boolean default false
+  p_first          boolean default false,
+  p_enqueued       integer default 0
 )
 returns jsonb
 language plpgsql
@@ -227,6 +266,7 @@ declare
   v_token    text;
   v_restarts integer;
   v_started  timestamptz;
+  v_enq      integer;
 begin
   if p_checkpoint_key is null or length(p_checkpoint_key) < 1 or length(p_checkpoint_key) > 128 then
     return jsonb_build_object('status', 'invalid_checkpoint_key');
@@ -275,6 +315,8 @@ begin
     v_started  := p_now;
     v_restarts := coalesce(v_row.sweep_restarts, 0)
                   + case when v_row.resync_cursor is not null then 1 else 0 end;
+    -- A new sweep starts its durable-work budget over.
+    v_enq      := greatest(0, coalesce(p_enqueued, 0));
   else
     -- Continuing the same sweep: counters only move forward, and the sweep
     -- token is FIRST-write-wins (H-6).
@@ -283,6 +325,8 @@ begin
     v_token    := coalesce(v_row.sweep_token, p_sweep_token);
     v_started  := coalesce(v_row.resync_started_at, p_now);
     v_restarts := coalesce(v_row.sweep_restarts, 0);
+    -- H-8: durable work accumulates across the WHOLE sweep, monotonically.
+    v_enq      := greatest(coalesce(v_row.sweep_enqueued, 0), greatest(0, coalesce(p_enqueued, 0)));
   end if;
 
   -- I7: this statement deliberately touches NO stream-level field — not
@@ -299,19 +343,21 @@ begin
          resync_pages_done   = v_pages,
          resync_items_done   = v_items,
          resync_started_at   = v_started,
+         sweep_enqueued      = v_enq,
          updated_at          = p_now
    where provider = 'ashby' and checkpoint_key = p_checkpoint_key;
 
   return jsonb_build_object('status', 'ok',
                             'resync_pages_done', v_pages,
                             'resync_items_done', v_items,
-                            'sweep_restarts', v_restarts);
+                            'sweep_restarts', v_restarts,
+                            'sweep_enqueued', v_enq);
 end;
 $$;
 
-revoke all on function screening_v2.save_ashby_resync_cursor(text, text, text, integer, integer, bigint, timestamptz, text, text, boolean)
+revoke all on function screening_v2.save_ashby_resync_cursor(text, text, text, integer, integer, bigint, timestamptz, text, text, boolean, integer)
   from public, anon, authenticated;
-grant execute on function screening_v2.save_ashby_resync_cursor(text, text, text, integer, integer, bigint, timestamptz, text, text, boolean)
+grant execute on function screening_v2.save_ashby_resync_cursor(text, text, text, integer, integer, bigint, timestamptz, text, text, boolean, integer)
   to service_role;
 
 comment on function screening_v2.save_ashby_resync_cursor is
@@ -321,6 +367,84 @@ comment on function screening_v2.save_ashby_resync_cursor is
   'when the resync_epoch moved or the caller no longer holds the '
   'single-flight lease. The cursor is an opaque provider black box — never '
   'logged or exposed to a browser role. Service-role-only.';
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- 2b. halt_ashby_sync_sweep — the circuit breaker with teeth (H-8)
+-- ═══════════════════════════════════════════════════════════════════════
+-- Page-aligning the enqueue breaker made it a RATE limit rather than a wedge,
+-- and the sweep cadence multiplied that rate. The compensating control is an
+-- ABSOLUTE per-sweep budget that, when exhausted, stops reconciliation on this
+-- stream entirely until an operator intervenes — restoring the "wedge"
+-- property the per-run breaker used to provide, at sweep granularity.
+--
+-- Also used when a sweep restarts from page 1 too many times: a resume that
+-- never holds would otherwise re-page the whole corpus forever.
+--
+-- Deliberately does NOT touch `status` (D-3: `status` is a single encoding
+-- slot and holds the forced-resync demand). The halt is its own field, so a
+-- pending resync survives it and is honoured once the halt is cleared.
+-- Clearing is `mark_ashby_sync_full_resync` — a deliberate operator action,
+-- which is also what enabling or repointing a mapping performs.
+
+create or replace function screening_v2.halt_ashby_sync_sweep(
+  p_checkpoint_key text,
+  p_owner          text,
+  p_reason         text,
+  p_now            timestamptz default now()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  v_row   screening_v2.ashby_sync_checkpoints%rowtype;
+  v_owner text := left(coalesce(p_owner, 'reconciler'), 128);
+begin
+  if p_checkpoint_key is null or length(p_checkpoint_key) < 1 or length(p_checkpoint_key) > 128 then
+    return jsonb_build_object('status', 'invalid_checkpoint_key');
+  end if;
+  if p_reason is null or length(p_reason) < 1 or length(p_reason) > 64 then
+    return jsonb_build_object('status', 'invalid_reason');
+  end if;
+
+  select * into v_row
+    from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = p_checkpoint_key
+   for update;
+  if not found then
+    return jsonb_build_object('status', 'not_found');
+  end if;
+  if v_row.lease_owner is distinct from v_owner then
+    return jsonb_build_object('status', 'not_owned');
+  end if;
+
+  update screening_v2.ashby_sync_checkpoints
+     set sweep_halted_at   = coalesce(sweep_halted_at, p_now),
+         sweep_halt_reason = coalesce(sweep_halt_reason, p_reason),
+         -- Drop the anchor: whatever this sweep was doing must not resume.
+         resync_cursor       = null,
+         resync_cursor_epoch = null,
+         resync_cursor_at    = null,
+         updated_at          = p_now
+   where provider = 'ashby' and checkpoint_key = p_checkpoint_key;
+
+  return jsonb_build_object('status', 'ok', 'halted_at', p_now);
+end;
+$$;
+
+revoke all on function screening_v2.halt_ashby_sync_sweep(text, text, text, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.halt_ashby_sync_sweep(text, text, text, timestamptz)
+  to service_role;
+
+comment on function screening_v2.halt_ashby_sync_sweep is
+  'HALTS reconciliation on one stream after a sweep exhausted its absolute '
+  'per-sweep enqueue budget or restart budget. While halted every run returns '
+  'before any provider call, so a page-aligned breaker cannot become an '
+  'unbounded rate. Does not touch status, so a pending forced resync '
+  'survives. Cleared by mark_ashby_sync_full_resync (a deliberate operator '
+  'action). Service-role-only.';
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- 3. mark_ashby_sync_full_resync — invalidate the continuation
@@ -355,11 +479,12 @@ begin
   insert into screening_v2.ashby_sync_checkpoints
     (provider, checkpoint_key, sync_token, status, token_issued_at,
      full_resync_reason, resync_epoch, resync_cursor, resync_cursor_epoch,
-     resync_cursor_at, sweep_mode, sweep_token, sweep_restarts,
+     resync_cursor_at, sweep_mode, sweep_token, sweep_restarts, sweep_enqueued,
+     sweep_halted_at, sweep_halt_reason,
      resync_pages_done, resync_items_done, resync_started_at, updated_at)
   values
     ('ashby', p_checkpoint_key, null, 'full_resync_required', null, p_reason, 1,
-     null, null, null, null, null, 0, 0, 0, null, p_now)
+     null, null, null, null, null, 0, 0, null, null, 0, 0, null, p_now)
   on conflict (provider, checkpoint_key) do update set
      sync_token         = null,
      status             = 'full_resync_required',
@@ -377,6 +502,10 @@ begin
      sweep_restarts      = screening_v2.ashby_sync_checkpoints.sweep_restarts
                            + case when screening_v2.ashby_sync_checkpoints.resync_cursor
                                        is not null then 1 else 0 end,
+     sweep_enqueued      = 0,
+     -- A forced resync IS the operator action that clears a halt.
+     sweep_halted_at     = null,
+     sweep_halt_reason   = null,
      resync_pages_done   = 0,
      resync_items_done   = 0,
      resync_started_at   = null,
@@ -463,10 +592,17 @@ begin
    where provider = 'ashby' and checkpoint_key = p_checkpoint_key
    for update;
 
-  -- H-5: a caller that names itself must still hold the live lease.
-  if found and p_owner is not null
-     and v_row.lease_owner is distinct from left(p_owner, 128) then
-    return jsonb_build_object('status', 'not_owned');
+  -- H-5: a caller that names itself must still hold the LIVE lease — both the
+  -- owner and the expiry. Checking only the owner would let a runner whose
+  -- lease lapsed unclaimed still install a token, which is the same hazard one
+  -- step removed.
+  if found and p_owner is not null then
+    if v_row.lease_owner is distinct from left(p_owner, 128) then
+      return jsonb_build_object('status', 'not_owned');
+    end if;
+    if v_row.lease_expires_at is null or v_row.lease_expires_at <= p_now then
+      return jsonb_build_object('status', 'lease_expired');
+    end if;
   end if;
 
   if found and p_resync_epoch is not null
@@ -495,14 +631,14 @@ begin
      last_success_at, last_full_sync_at, pages_last_run, items_last_run,
      full_resync_reason, no_progress_runs, resync_cursor, resync_cursor_epoch,
      resync_cursor_at, sweep_mode, sweep_token, resync_pages_done,
-     resync_items_done, resync_started_at, updated_at)
+     resync_items_done, resync_started_at, sweep_enqueued, updated_at)
   values
     ('ashby', p_checkpoint_key, v_token, 'idle',
      case when v_token is null then null else p_now end,
      p_now,
      case when p_full then p_now else null end,
      greatest(0, coalesce(p_pages, 0)), greatest(0, coalesce(p_items, 0)),
-     null, 0, null, null, null, null, null, 0, 0, null, p_now)
+     null, 0, null, null, null, null, null, 0, 0, null, 0, p_now)
   on conflict (provider, checkpoint_key) do update set
      sync_token         = v_token,
      status             = v_status,
@@ -543,6 +679,10 @@ begin
      resync_started_at   = case when v_keep
                                 then screening_v2.ashby_sync_checkpoints.resync_started_at
                                 else null end,
+     -- A completed sweep releases its durable-work budget for the next one.
+     sweep_enqueued      = case when v_keep
+                                then screening_v2.ashby_sync_checkpoints.sweep_enqueued
+                                else 0 end,
      updated_at          = p_now
   returning id into v_id;
 
@@ -639,6 +779,9 @@ begin
     'resync_cursor_at', v_row.resync_cursor_at,
     'sweep_mode', v_row.sweep_mode,
     'sweep_restarts', v_row.sweep_restarts,
+    'sweep_enqueued', v_row.sweep_enqueued,
+    'sweep_halted_at', v_row.sweep_halted_at,
+    'sweep_halt_reason', v_row.sweep_halt_reason,
     'resync_pages_done', v_row.resync_pages_done,
     'resync_items_done', v_row.resync_items_done
   );

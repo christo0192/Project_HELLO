@@ -126,6 +126,8 @@ function makeRuntime(w: ReturnType<typeof world>, over: Partial<AshbyRuntime> = 
       reconcileCaps: {
         maxPages: 50, maxItems: 5000, pageLimit: 100,
         deadlineMs: 60000, maxEnqueuePerRun: 200,
+        sweepMaxEnqueue: 2000, sweepMaxPages: 5000,
+        sweepMaxRestarts: 5, anchorMaxAgeMs: 21_600_000,
       },
     },
     client: {

@@ -40,6 +40,10 @@ const _contractVisibleEnvReads = [
   process.env.ASHBY_RECONCILE_DEADLINE_MS,
   process.env.ASHBY_RECONCILE_MAX_ENQUEUE,
   process.env.ASHBY_RECONCILE_ANCHOR_DISABLED,
+  process.env.ASHBY_RECONCILE_SWEEP_MAX_ENQUEUE,
+  process.env.ASHBY_RECONCILE_SWEEP_MAX_PAGES,
+  process.env.ASHBY_RECONCILE_SWEEP_MAX_RESTARTS,
+  process.env.ASHBY_RECONCILE_ANCHOR_MAX_AGE_MS,
 ];
 void _contractVisibleEnvReads;
 
@@ -142,6 +146,20 @@ export const RUNTIME_BOUNDS = {
   reconcileDeadlineMs: { def: 60_000, min: 1_000, max: 1_800_000 },
   /** Circuit breaker: signal jobs one run may create. */
   reconcileMaxEnqueue: { def: 200, min: 1, max: 2_000 },
+  /**
+   * ABSOLUTE ceiling on the jobs one SWEEP may create across all its runs, and
+   * the compensating control for page-aligning the per-run breaker (which
+   * turned it from a wedge into a rate). Exhausting it HALTS the stream.
+   * Conservative by design: the incident this subsystem exists to prevent
+   * created 2,000 jobs, so the default would have caught it.
+   */
+  reconcileSweepMaxEnqueue: { def: 2_000, min: 1, max: 100_000 },
+  /** Pages one SWEEP may consume across its runs (~500k applications). */
+  reconcileSweepMaxPages: { def: 5_000, min: 1, max: 100_000 },
+  /** Sweep restarts allowed before halting — a resume that never holds. */
+  reconcileSweepMaxRestarts: { def: 5, min: 1, max: 1_000 },
+  /** Age at which a persisted page anchor is discarded (6 h). */
+  reconcileAnchorMaxAgeMs: { def: 21_600_000, min: 60_000, max: 604_800_000 },
 } as const;
 
 /** Maximum number of allowlisted resume hosts accepted from configuration. */
@@ -173,6 +191,11 @@ export interface AshbyRuntimeConfig {
     pageLimit: number;
     deadlineMs: number;
     maxEnqueuePerRun: number;
+    /** Sweep-level bounds: the two that decide whether a large tenant finishes. */
+    sweepMaxEnqueue: number;
+    sweepMaxPages: number;
+    sweepMaxRestarts: number;
+    anchorMaxAgeMs: number;
   };
   /**
    * KILL SWITCH (`ASHBY_RECONCILE_ANCHOR_DISABLED=true`): skip every anchor
@@ -245,6 +268,18 @@ export function loadAshbyRuntimeConfig(
       deadlineMs: boundedMs(source.ASHBY_RECONCILE_DEADLINE_MS, RUNTIME_BOUNDS.reconcileDeadlineMs),
       maxEnqueuePerRun: boundedMs(
         source.ASHBY_RECONCILE_MAX_ENQUEUE, RUNTIME_BOUNDS.reconcileMaxEnqueue,
+      ),
+      sweepMaxEnqueue: boundedMs(
+        source.ASHBY_RECONCILE_SWEEP_MAX_ENQUEUE, RUNTIME_BOUNDS.reconcileSweepMaxEnqueue,
+      ),
+      sweepMaxPages: boundedMs(
+        source.ASHBY_RECONCILE_SWEEP_MAX_PAGES, RUNTIME_BOUNDS.reconcileSweepMaxPages,
+      ),
+      sweepMaxRestarts: boundedMs(
+        source.ASHBY_RECONCILE_SWEEP_MAX_RESTARTS, RUNTIME_BOUNDS.reconcileSweepMaxRestarts,
+      ),
+      anchorMaxAgeMs: boundedMs(
+        source.ASHBY_RECONCILE_ANCHOR_MAX_AGE_MS, RUNTIME_BOUNDS.reconcileAnchorMaxAgeMs,
       ),
     },
     reconcileAnchorDisabled: source.ASHBY_RECONCILE_ANCHOR_DISABLED === 'true',

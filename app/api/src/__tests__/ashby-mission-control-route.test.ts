@@ -232,7 +232,7 @@ describe('GET /health — last reconciliation pass', () => {
     // 0034 continuation surface: booleans and bounded counts only.
     resumed: false, continuationPending: false, pageAnchors: 0,
     resyncPagesDone: 0, resyncItemsDone: 0, restartReason: 'none',
-    sweepRestarts: 0, tokenInstalled: true,
+    sweepRestarts: 0, sweepEnqueued: 0, halted: false, tokenInstalled: true,
     observedAt: '2026-08-18T00:00:00.000Z',
   };
 
@@ -347,10 +347,10 @@ describe('GET /health — last reconciliation pass', () => {
     expect(serialized).not.toMatch(/app_|job_|stage_|cand_/);
     expect(Object.keys(res.body.reconcile).sort()).toEqual([
       'admitted', 'advanced', 'continuationPending', 'duplicates',
-      'enabledMappings', 'enqueued', 'mappingIndexTruncated', 'mode',
+      'enabledMappings', 'enqueued', 'halted', 'mappingIndexTruncated', 'mode',
       'observed', 'observedAt', 'pageAnchors', 'recovered', 'restartReason',
       'resumed', 'resyncItemsDone', 'resyncPagesDone', 'skipped', 'stop',
-      'sweepRestarts', 'tokenInstalled', 'unclassified',
+      'sweepEnqueued', 'sweepRestarts', 'tokenInstalled', 'unclassified',
     ]);
   });
 });

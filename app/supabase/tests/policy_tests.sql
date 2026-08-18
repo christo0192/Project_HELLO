@@ -5443,11 +5443,12 @@ select _policy_tests.assert(
      from pg_proc p join pg_namespace n on n.oid = p.pronamespace
     where n.nspname = 'screening_v2'
       and p.proname in ('save_ashby_resync_cursor','advance_ashby_sync_checkpoint',
-                        'mark_ashby_sync_full_resync','begin_ashby_sync_run')
+                        'mark_ashby_sync_full_resync','begin_ashby_sync_run',
+                        'halt_ashby_sync_sweep')
       and not has_function_privilege('anon', p.oid, 'EXECUTE')
       and not has_function_privilege('authenticated', p.oid, 'EXECUTE')
       and has_function_privilege('service_role', p.oid, 'EXECUTE')
-  ) = 4,
+  ) = 5,
   'ashby 0034 RPCs must be service-role only'
 );
 
@@ -5457,10 +5458,11 @@ select _policy_tests.assert(
      from pg_proc p join pg_namespace n on n.oid = p.pronamespace
     where n.nspname = 'screening_v2'
       and p.proname in ('save_ashby_resync_cursor','advance_ashby_sync_checkpoint',
-                        'mark_ashby_sync_full_resync','begin_ashby_sync_run')
+                        'mark_ashby_sync_full_resync','begin_ashby_sync_run',
+                        'halt_ashby_sync_sweep')
       and p.prosecdef
       and array_to_string(coalesce(p.proconfig, '{}'), ',') like '%search_path%'
-  ) = 4,
+  ) = 5,
   'every 0034 SECURITY DEFINER RPC must pin search_path'
 );
 
@@ -5691,7 +5693,83 @@ begin
       and v_cp.resync_cursor is null,
     'got ' || coalesce(v_res->>'status', '<null>'));
 
-  -- (k) The anchor cannot outlive its own lease: end the run, then try again.
+  -- (k) H-8: the per-sweep enqueue accumulator and the HALT that bounds it.
+  --     Page-aligning the per-run breaker made it a rate limit; this is the
+  --     sweep-level ceiling that restores the wedge.
+  v_res := screening_v2.save_ashby_resync_cursor(
+    'application.list', 'cur-800', 'runner-a', 8, 800, null, now(), 'full', null, false, 120);
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0034: sweep_enqueued accumulates with the anchor',
+    v_res->>'status' = 'ok' and v_cp.sweep_enqueued = 120,
+    'got sweep_enqueued ' || coalesce(v_cp.sweep_enqueued::text, '<null>'));
+
+  -- Monotonic: a lower report never walks the budget backwards.
+  v_res := screening_v2.save_ashby_resync_cursor(
+    'application.list', 'cur-810', 'runner-a', 8, 810, null, now(), 'full', null, false, 5);
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0034: sweep_enqueued only moves forward',
+    v_cp.sweep_enqueued = 120,
+    'budget regressed to ' || v_cp.sweep_enqueued);
+
+  -- A non-owner cannot halt the stream.
+  v_res := screening_v2.halt_ashby_sync_sweep(
+    'application.list', 'runner-b', 'sweep_enqueue_budget');
+  perform _policy_tests.assert('ashby 0034: a non-owner cannot halt the sweep',
+    v_res->>'status' = 'not_owned',
+    'got ' || coalesce(v_res->>'status', '<null>'));
+
+  -- The owner halts: the anchor is dropped, `status` is NOT touched (D-3), so
+  -- a pending forced-resync demand survives the halt.
+  v_res := screening_v2.halt_ashby_sync_sweep(
+    'application.list', 'runner-a', 'sweep_enqueue_budget');
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0034: halting drops the anchor and preserves status',
+    v_res->>'status' = 'ok'
+      and v_cp.sweep_halted_at is not null
+      and v_cp.sweep_halt_reason = 'sweep_enqueue_budget'
+      and v_cp.resync_cursor is null and v_cp.resync_cursor_epoch is null
+      and v_cp.status = 'idle',
+    'got halt_reason ' || coalesce(v_cp.sweep_halt_reason, '<null>')
+      || ' status ' || v_cp.status);
+
+  -- A forced resync is the operator action that clears the halt.
+  v_res := screening_v2.mark_ashby_sync_full_resync('application.list', 'pol34_clear');
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0034: a forced resync clears the halt and the budget',
+    v_cp.sweep_halted_at is null and v_cp.sweep_halt_reason is null
+      and v_cp.sweep_enqueued = 0,
+    'halt survived a forced resync');
+
+  -- An unsanitized halt reason is refused rather than stored.
+  v_res := screening_v2.begin_ashby_sync_run('application.list', 'runner-a', 300);
+  v_res := screening_v2.halt_ashby_sync_sweep('application.list', 'runner-a', repeat('x', 65));
+  perform _policy_tests.assert('ashby 0034: an over-long halt reason is refused',
+    v_res->>'status' = 'invalid_reason',
+    'got ' || coalesce(v_res->>'status', '<null>'));
+  v_res := screening_v2.end_ashby_sync_run('application.list', 'runner-a', false);
+  v_res := screening_v2.mark_ashby_sync_full_resync('application.list', 'pol34_reset2');
+  v_begin := screening_v2.begin_ashby_sync_run('application.list', 'runner-a', 300);
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+
+  -- (l) L2: advance requires a LIVE lease, not merely a matching owner name.
+  update screening_v2.ashby_sync_checkpoints
+     set lease_expires_at = now() - interval '1 second'
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  v_res := screening_v2.advance_ashby_sync_checkpoint(
+    'application.list', 'tok-expired', 1, 1, true, now(), null, 'runner-a');
+  perform _policy_tests.assert('ashby 0034: an EXPIRED lease cannot advance',
+    v_res->>'status' = 'lease_expired',
+    'got ' || coalesce(v_res->>'status', '<null>'));
+  update screening_v2.ashby_sync_checkpoints
+     set lease_expires_at = now() + interval '300 seconds'
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+
+  -- (m) The anchor cannot outlive its own lease: end the run, then try again.
   v_res := screening_v2.end_ashby_sync_run('application.list', 'runner-a', true);
   v_res := screening_v2.save_ashby_resync_cursor(
     'application.list', 'cur-500', 'runner-a', 5, 500, v_cp.resync_epoch, now(), 'full');

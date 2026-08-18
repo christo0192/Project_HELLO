@@ -348,8 +348,11 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
         // take a day, and the anchor would be 15 minutes stale on every
         // resume. The single-flight lease makes the short interval safe — an
         // overlapping tick returns `locked` before any provider call.
+        // Halted streams fall back to the REST cadence: there is nothing to
+        // sweep, and polling a halted stream every few seconds is pure waste.
         intervalMsFor: () =>
           (lastReconcilePass?.partialProgress.continuationPending
+            && !lastReconcilePass.partialProgress.halted
             ? rc.reconcileSweepIntervalMs
             : rc.reconcileIntervalMs),
         tick: async () => {
@@ -435,6 +438,16 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
             if (r.stop === 'sweep_budget' || r.stop === 'cursor_invalid') {
               logger.error('unknown_event', {
                 error_category: 'ashby_reconcile_sweep_abandoned',
+                error_type: r.stop,
+              });
+            }
+            // HALTED is the loudest state this subsystem has: reconciliation
+            // has stopped itself on this stream and will make no provider call
+            // until an operator forces a resync. It is what keeps the
+            // page-aligned breaker from becoming an unbounded rate.
+            if (r.stop === 'halted') {
+              logger.error('unknown_event', {
+                error_category: 'ashby_reconcile_halted',
                 error_type: r.stop,
               });
             }

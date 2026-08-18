@@ -284,6 +284,14 @@ number during re-activation. Discriminate before concluding anything:
 | `unclassified_cap` | any | climbing | **Provider schema drift.** Investigate the list shape; it will not self-heal. |
 | `drained` | any | resets to 0 | Normal. |
 
+> **`no_progress_runs` changed meaning in 0034.** Any durable page anchor now
+> counts as progress and resets the counter, so a sweep that anchors forever
+> without ever draining keeps `no_progress_runs: 0`. It is no longer the
+> backstop for "this stream can never finish" — `sweep_budget` (5,000 pages),
+> the per-sweep enqueue budget, and the restart budget are. Read
+> `resyncItemsDone` and `restartReason`, not this counter, when judging whether
+> a sweep is healthy.
+
 The fast confirmation is that work is actually moving: `enqueued > 0` on the
 health `reconcile` object, or a shrinking `pending` count for `ashby.signal` in
 diagnostic 1b across two passes. `no_progress_runs` climbing **with
@@ -450,8 +458,13 @@ Two operational consequences follow directly:
 
 - **Budget the backfill.** ~119,000 applications at the default bounds is ~24
   runs. On the rest cadence (15 min) that is a day; on the sweep cadence
-  (`ASHBY_RECONCILE_SWEEP_INTERVAL_MS`, default 10 s) it is minutes. The loop
-  switches to the sweep cadence automatically while an anchor is pending.
+  (`ASHBY_RECONCILE_SWEEP_INTERVAL_MS`, default 10 s) it is **minutes to about
+  half an hour**. The loop switches to the sweep cadence automatically while an
+  anchor is pending. The spread is real and worth expecting: a pass that
+  admitted work returns "did work" and keeps the 5–10 s cadence, but a pass
+  over a corpus where nothing is admitted (the paused-mapping state the tenant
+  was left in) counts as idle, and the scheduler's idle backoff walks the
+  interval up toward its 60 s ceiling — roughly 6× the optimistic figure.
 - **Expect no incremental token.** If the provider issues one only at true
   end-of-stream, `reconcile.tokenInstalled` will be `false` after a sweep that
   drained, and the next pass is another full sweep. That is a provider fact,
@@ -520,11 +533,50 @@ a multi-run sweep would permanently hide every change that landed on an
 already-scanned page while the sweep ran; the earliest token can only
 re-deliver, which is idempotent.
 
-**Breaker weakening (accept this consciously).** The enqueue circuit breaker is
-now evaluated at the page boundary rather than per item, so a page is always
-fully decided and therefore anchorable. It overshoots its cap by at most one
-page — at the default bounds, 200 becomes at most 300 jobs in one pass. That is
-a deliberate, bounded trade for atomic pages.
+**Breaker weakening, stated precisely — read this before sizing blast radius.**
+The enqueue circuit breaker is now evaluated at the page boundary rather than
+per item, so a page is always fully decided and therefore anchorable. Two
+things change together, and the second is the one that matters:
+
+1. `ASHBY_RECONCILE_MAX_ENQUEUE` overshoots by at most one page — at the
+   default bounds, 200 becomes **at most 300 jobs per pass**.
+2. **A pass now fires every 5–10 s while a sweep is in flight** (the sweep
+   cadence, with the scheduler's jitter), not once per 15 minutes.
+
+So the per-run breaker is **no longer a wedge — it is a rate limit**, and the
+guarded rate moves from ~200 jobs / 15 min to ≤300 jobs / 5–10 s. **Do not size
+blast radius from `ASHBY_RECONCILE_MAX_ENQUEUE`.** The bound that actually
+limits damage is the per-sweep budget below, and the lever for *slowing* a
+backfill is `ASHBY_RECONCILE_SWEEP_INTERVAL_MS`, not the per-run breaker.
+
+**The per-sweep ceiling (this is the real guard).** `sweep_enqueued`
+accumulates every job a sweep creates across **all** of its runs and is
+persisted with the anchor. Exceeding `ASHBY_RECONCILE_SWEEP_MAX_ENQUEUE`
+(default **2,000**) **HALTS** reconciliation on that stream: every subsequent
+run returns before making a single provider call, `stop: 'halted'`, until an
+operator clears it. That restores the wedge at sweep granularity.
+
+The default is deliberately conservative — the PR64 incident created exactly
+2,000 jobs, so this budget would have caught it. With admission in place a
+legitimate sweep enqueues a small fraction of the corpus, so it should never be
+reached; a genuinely large first enable that trips it is raised deliberately,
+by an operator, with the corpus in front of them.
+
+**Clearing a halt** is `mark_ashby_sync_full_resync` — which is also what
+enabling, resuming, or repointing a mapping performs. Investigate *before*
+clearing: a halt means durable work was created faster than expected, which is
+exactly the shape of the incident this subsystem exists to prevent.
+
+```sql
+-- Why is it halted, and how much work did the sweep create?
+select sweep_halt_reason, sweep_halted_at, sweep_enqueued,
+       resync_pages_done, resync_items_done, sweep_restarts
+  from screening_v2.ashby_sync_checkpoints where provider = 'ashby';
+```
+
+**Restart budget.** A sweep that restarts from page 1 more than
+`ASHBY_RECONCILE_SWEEP_MAX_RESTARTS` times (default 5) also halts: a resume
+that never holds would otherwise re-page the whole corpus forever.
 
 **Kill switch.** `ASHBY_RECONCILE_ANCHOR_DISABLED=true` skips every anchor read
 and write, reverting exactly to the pre-0034 all-or-nothing sweep. Safe by
@@ -540,7 +592,11 @@ construction: not advancing is the conservative failure.
 | `ASHBY_RECONCILE_MAX_ITEMS` | 5000 | Applications per run. |
 | `ASHBY_RECONCILE_PAGE_LIMIT` | 100 | Page-size **hint** — the provider ignored 500. |
 | `ASHBY_RECONCILE_DEADLINE_MS` | 60000 | Wall clock per run. |
-| `ASHBY_RECONCILE_MAX_ENQUEUE` | 200 | Storm breaker (page-aligned; see above). |
+| `ASHBY_RECONCILE_MAX_ENQUEUE` | 200 | Per-**run** breaker. Page-aligned, so it is a **rate**, not a ceiling — see above. Not the blast-radius bound. |
+| `ASHBY_RECONCILE_SWEEP_MAX_ENQUEUE` | 2000 | **The blast-radius bound.** Absolute jobs one sweep may create across all runs; exceeding it HALTS the stream. |
+| `ASHBY_RECONCILE_SWEEP_MAX_PAGES` | 5000 | Pages one sweep may consume (~500k applications). |
+| `ASHBY_RECONCILE_SWEEP_MAX_RESTARTS` | 5 | Restarts before halting. |
+| `ASHBY_RECONCILE_ANCHOR_MAX_AGE_MS` | 21600000 | Anchor freshness (6 h). |
 | `ASHBY_RECONCILE_ANCHOR_DISABLED` | false | Kill switch. |
 
 #### The operational gate
@@ -556,6 +612,8 @@ curl -sS -H "Authorization: Bearer $TOKEN"   "$API/api/integrations/ashby/missio
        itemsDone: .reconcile.resyncItemsDone,
        restartReason: .reconcile.restartReason,
        restarts: .reconcile.sweepRestarts,
+       sweepEnqueued: .reconcile.sweepEnqueued,
+       halted: .reconcile.halted,
        tokenInstalled: .reconcile.tokenInstalled,
        noProgress: .backlog.reconcileNoProgressRuns}'
 ```
@@ -567,6 +625,8 @@ Read it as:
 | `resyncItemsDone` climbing pass over pass, `noProgress: 0` | **Progressing.** Wait for it; nothing to do. |
 | `restartReason` != `none` on every pass, `sweepRestarts` climbing | **Resume is not holding.** The sweep restarts from page 1 forever. Investigate before anything else. |
 | `stop: "sweep_budget"` or `"cursor_invalid"` | **Sweep abandoned.** The cursor chain did not terminate or was unusable. Reconciliation is not covering this tenant. |
+| `stop: "halted"`, `halted: true` | **Reconciliation has stopped itself** on the per-sweep enqueue or restart budget. No provider calls at all until an operator forces a resync. Investigate `sweep_enqueued` before clearing. |
+| `sweepEnqueued` climbing while `resyncPagesDone` is flat | **Admission bug signature** — durable work being created without the sweep advancing. This is what the per-sweep budget is watching for. |
 | `stop: "drained"`, `tokenInstalled: false` | Drained with no provider token — the next pass is another full sweep. Expected at this tenant; tune the rest interval if costly. |
 | `pending: true`, `itemsDone` **flat** across two passes | **Stuck.** The run is not anchoring. Check `stop`. |
 | `stop: "continuation_conflict"` once | A mapping was enabled/repointed mid-run. Self-heals on the next pass. |

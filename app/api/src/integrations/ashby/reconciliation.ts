@@ -138,6 +138,10 @@ export interface ReconcileCaps {
   anchorMaxAgeMs?: number;
   /** Kill switch: skip every anchor read/write (pre-0034 behaviour). */
   anchorDisabled?: boolean;
+  /** Absolute jobs ONE SWEEP may create across its runs before halting. */
+  sweepMaxEnqueue?: number;
+  /** Sweep restarts allowed before halting (M2). */
+  sweepMaxRestarts?: number;
 }
 
 /**
@@ -203,7 +207,13 @@ export type ReconcileStop =
    * The sweep exceeded its cross-run page budget without draining. Abandon it
    * loudly rather than page a non-terminating cursor chain forever.
    */
-  | 'sweep_budget';
+  | 'sweep_budget'
+  /**
+   * Reconciliation is HALTED on this stream: a sweep exhausted its absolute
+   * per-sweep enqueue budget or its restart budget. No provider call is made
+   * until an operator clears it with a forced resync.
+   */
+  | 'halted';
 
 /**
  * Why an observed application.list row was NOT admitted. Counters only — no
@@ -252,6 +262,14 @@ export interface PartialProgress {
   restartReason: SweepRestartReason;
   /** Times a sweep has been abandoned and restarted, across runs. */
   sweepRestarts: number;
+  /**
+   * Signal jobs the CURRENT sweep has created across all of its runs. `enqueued`
+   * is per-run; page-aligning the breaker and sweeping every few seconds made
+   * the per-run figure a rate, so THIS is the number that bounds blast radius.
+   */
+  sweepEnqueued: number;
+  /** Reconciliation is halted on this stream until an operator clears it. */
+  halted: boolean;
   /**
    * True when the run drained AND an opaque sync token was actually installed.
    * A sweep can legitimately drain with NO token (production observed none in
@@ -336,8 +354,31 @@ function noProgress(): PartialProgress {
   return {
     resumed: false, checkpoints: 0, pagesDone: 0, itemsDone: 0,
     continuationPending: false, restartReason: 'none', sweepRestarts: 0,
-    tokenInstalled: false,
+    sweepEnqueued: 0, halted: false, tokenInstalled: false,
   };
+}
+
+/**
+ * Whether a page-fetch failure means the CURSOR was rejected rather than the
+ * request being transiently unlucky (M1).
+ *
+ * Only a NON-retriable provider failure implicates the cursor: a logical
+ * envelope failure, a permanent 4xx, a rejected request, or an unparseable
+ * response. Rate limits, 5xx, timeouts, and socket errors say nothing about
+ * the cursor and must never cost a good anchor.
+ *
+ * Structural rather than `instanceof`, so the injectable lister seam stays
+ * testable, and deliberately conservative: anything unrecognised is treated as
+ * transient, because throwing away a valid anchor restarts a ~119k-page sweep.
+ */
+export function isCursorRejection(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) return false;
+  const e = err as { retriable?: unknown; category?: unknown };
+  if (e.retriable !== false) return false;
+  return e.category === 'logical_failure'
+    || e.category === 'http_client_error'
+    || e.category === 'invalid_request'
+    || e.category === 'malformed_response';
 }
 
 /** Coerce a stored continuation counter into a safe non-negative integer. */
@@ -389,6 +430,41 @@ const HARD_SWEEP_MAX_PAGES = 100_000;
 
 /** Sanitized stream flag written when a sweep exceeds its page budget. */
 export const SWEEP_BUDGET_RESYNC_REASON = 'sweep_page_budget';
+
+/**
+ * ABSOLUTE ceiling on the durable work ONE SWEEP may create, across all of its
+ * runs — the compensating control for page-aligning the enqueue breaker.
+ *
+ * Page alignment makes the per-run breaker a RATE limit rather than a wedge
+ * (it bounds a pass, and a pass now fires every few seconds while a sweep is
+ * in flight). Without a sweep-level ceiling, a runaway admission bug would
+ * create `maxEnqueuePerRun` jobs indefinitely instead of wedging after one
+ * run. Exceeding this HALTS the stream until an operator clears it.
+ *
+ * Deliberately conservative: the production incident this subsystem exists to
+ * prevent created 2,000 jobs, so the default budget would have caught it. With
+ * PR64 admission in place a legitimate sweep enqueues a tiny fraction of the
+ * corpus, so this should never be reached in normal operation — and when it is
+ * reached, stopping is the right answer. A genuinely large first enable can
+ * raise it via `ASHBY_RECONCILE_SWEEP_MAX_ENQUEUE`.
+ */
+export const DEFAULT_SWEEP_MAX_ENQUEUE = 2_000;
+const HARD_SWEEP_MAX_ENQUEUE = 100_000;
+
+/**
+ * How many times one stream may restart a sweep from page 1 before halting. A
+ * resume that never holds would otherwise re-page the entire corpus forever,
+ * burning provider quota with nothing to show for it (M2).
+ */
+export const DEFAULT_SWEEP_MAX_RESTARTS = 5;
+const HARD_SWEEP_MAX_RESTARTS = 1_000;
+
+/** Sanitized halt codes. Never an id, token, or message. */
+export const HALT_ENQUEUE_BUDGET = 'sweep_enqueue_budget';
+export const HALT_RESTART_BUDGET = 'sweep_restart_budget';
+
+/** Sanitized flag written when the provider REJECTED a resumed cursor (M1). */
+export const CURSOR_REJECTED_RESYNC_REASON = 'resume_cursor_rejected';
 
 /** Sanitized flag written when a resumed anchor proves to be a cursor loop. */
 export const CURSOR_INVALID_RESYNC_REASON = 'resume_cursor_invalid';
@@ -559,6 +635,12 @@ export async function runReconciliation(deps: ReconcileDeps): Promise<ReconcileR
     deps.caps?.sweepMaxPages, DEFAULT_SWEEP_MAX_PAGES, 1, HARD_SWEEP_MAX_PAGES,
   );
   const anchorEnabled = deps.caps?.anchorDisabled !== true;
+  const sweepMaxEnqueue = bounded(
+    deps.caps?.sweepMaxEnqueue, DEFAULT_SWEEP_MAX_ENQUEUE, 1, HARD_SWEEP_MAX_ENQUEUE,
+  );
+  const sweepMaxRestarts = bounded(
+    deps.caps?.sweepMaxRestarts, DEFAULT_SWEEP_MAX_RESTARTS, 1, HARD_SWEEP_MAX_RESTARTS,
+  );
 
   const startedAt = nowMs();
 
@@ -572,7 +654,11 @@ export async function runReconciliation(deps: ReconcileDeps): Promise<ReconcileR
     const begun = await deps.checkpoints.beginRun({
       checkpointKey,
       owner,
-      leaseSeconds: Math.max(1, Math.ceil(deadlineMs / 1000) + 60),
+      // Margin over the run's own deadline. 120 s (not 60) so a run that
+      // overruns slightly still holds a LIVE lease when it anchors or
+      // advances — both of which now refuse on an expired lease, and a refused
+      // advance discards a completed sweep's token.
+      leaseSeconds: Math.max(1, Math.ceil(deadlineMs / 1000) + 120),
     });
     if (begun.status === 'locked') {
       return {
@@ -635,6 +721,60 @@ export async function runReconciliation(deps: ReconcileDeps): Promise<ReconcileR
   const basePagesDone = resumeFrom ? safeProgress(checkpoint?.resyncPagesDone) : 0;
   const baseItemsDone = resumeFrom ? safeProgress(checkpoint?.resyncItemsDone) : 0;
   const sweepRestarts = safeProgress(checkpoint?.sweepRestarts);
+  const baseSweepEnqueued = safeProgress(checkpoint?.sweepEnqueued);
+  /** Jobs this SWEEP has created, this run included. */
+  let sweepEnqueued = baseSweepEnqueued;
+  let halted = false;
+
+  /** Stop the run, durably halting the stream until an operator clears it. */
+  async function haltStream(reason: string): Promise<void> {
+    halted = true;
+    if (!deps.checkpoints.haltSweep) return;   // fake store: the run still stops
+    try {
+      await deps.checkpoints.haltSweep({ checkpointKey, owner, reason });
+    } catch { /* the run stops regardless; never mask the primary outcome */ }
+  }
+
+  // ── HALTED (H-8) ───────────────────────────────────────────────────────
+  // Checked before ANY provider call: while halted, reconciliation on this
+  // stream does nothing at all. This is what stops a page-aligned breaker from
+  // becoming an unbounded rate — it restores the wedge at sweep granularity.
+  if (checkpoint?.sweepHaltedAt) {
+    counter('ashby_reconcile_halted', 1);
+    return {
+      mode: decided.mode, pages: 0, items: 0, observed: 0, admitted: 0,
+      skipped: emptySkips(), unclassified: 0, mappingsLoaded,
+      mappingIndexTruncated, recovered: 0, duplicates: 0, enqueued: 0,
+      stop: 'halted', advanced: false,
+      partialProgress: {
+        ...noProgress(),
+        sweepRestarts,
+        sweepEnqueued: baseSweepEnqueued,
+        halted: true,
+      },
+    };
+  }
+
+  // ── Restart budget (M2) ────────────────────────────────────────────────
+  // A resume that never holds re-pages the whole corpus every run forever.
+  // `sweep_restarts` was previously reported and gated nothing.
+  if (canAnchor && decided.restartReason !== 'none' && sweepRestarts >= sweepMaxRestarts) {
+    await haltStream(HALT_RESTART_BUDGET);
+    counter('ashby_reconcile_halted', 1, { reason: HALT_RESTART_BUDGET });
+    return {
+      mode: decided.mode, pages: 0, items: 0, observed: 0, admitted: 0,
+      skipped: emptySkips(), unclassified: 0, mappingsLoaded,
+      mappingIndexTruncated, recovered: 0, duplicates: 0, enqueued: 0,
+      stop: 'halted', advanced: false,
+      partialProgress: {
+        ...noProgress(),
+        restartReason: decided.restartReason,
+        sweepRestarts,
+        sweepEnqueued: baseSweepEnqueued,
+        halted: true,
+      },
+    };
+  }
   /**
    * The EARLIEST opaque token seen in this sweep. Banked on the anchor so it
    * survives across runs, and installed — not the last one — on completion.
@@ -691,13 +831,40 @@ export async function runReconciliation(deps: ReconcileDeps): Promise<ReconcileR
       sweepAbandoned = true;
       break;
     }
+    // H-8: the ABSOLUTE ceiling on durable work for this sweep. The per-run
+    // breaker only bounds a pass, and a pass fires every few seconds while a
+    // sweep is in flight — so without this the guard is a rate, not a limit.
+    // Exhausting it HALTS the stream rather than merely ending the run.
+    if (canAnchor && sweepEnqueued >= sweepMaxEnqueue) {
+      stop = 'halted';
+      await haltStream(HALT_ENQUEUE_BUDGET);
+      break;
+    }
 
     // A page fetch or receipt failure throws — the cursor is NOT advanced.
-    const page = await deps.client.applicationList<OpaqueRecord[]>({
-      cursor,
-      syncToken,
-      limit: pageLimit,
-    });
+    let page;
+    try {
+      page = await deps.client.applicationList<OpaqueRecord[]>({
+        cursor,
+        syncToken,
+        limit: pageLimit,
+      });
+    } catch (err) {
+      // M1: the provider REJECTED the cursor we resumed from. Left standing,
+      // every subsequent run would resume the same dead cursor and throw
+      // again until the freshness bound eventually expired it — hours of the
+      // dropped-webhook safety net being down. Invalidate it now so the very
+      // next run sweeps from page 1. Only ever on the FIRST page of a resumed
+      // run, and only for a non-retriable failure: a transient error must not
+      // cost a valid anchor.
+      if (resumeFrom !== null && pages === 0 && isCursorRejection(err)) {
+        counter('ashby_reconcile_cursor_rejected', 1);
+        try {
+          await deps.checkpoints.requireFullResync(checkpointKey, CURSOR_REJECTED_RESYNC_REASON);
+        } catch { /* the throw already prevents advancing; never mask it */ }
+      }
+      throw err;
+    }
     pages += 1;
 
     const pageItems = Array.isArray(page.results) ? page.results : [];
@@ -751,7 +918,7 @@ export async function runReconciliation(deps: ReconcileDeps): Promise<ReconcileR
         }),
       });
       if (outcome.status === 'inserted') recovered += 1; else duplicates += 1;
-      if (outcome.enqueued) enqueued += 1;
+      if (outcome.enqueued) { enqueued += 1; sweepEnqueued += 1; }
       // Durably handled: the receipt (and any re-driven job) is committed.
       // Only now may this row count towards anchoring the page.
       pageHandled += 1;
@@ -809,6 +976,9 @@ export async function runReconciliation(deps: ReconcileDeps): Promise<ReconcileR
         resyncEpoch,
         mode: decided.mode,
         sweepToken,
+        // H-8: the sweep's durable-work total travels with the anchor, so the
+        // budget survives across runs instead of resetting every pass.
+        enqueued: sweepEnqueued,
         // The first anchor of a run that did NOT resume starts a new sweep:
         // it resets the sweep counters and banked token, and counts a restart
         // if an abandoned anchor was still standing.
@@ -883,6 +1053,8 @@ export async function runReconciliation(deps: ReconcileDeps): Promise<ReconcileR
     counter('ashby_reconcile_page_anchors', anchors, { stop });
     if (anchorConflict) counter('ashby_reconcile_continuation_conflict', 1);
     if (sweepAbandoned) counter('ashby_reconcile_sweep_abandoned', 1, { stop });
+    counter('ashby_reconcile_sweep_enqueued', sweepEnqueued, { stop });
+    if (halted) counter('ashby_reconcile_halted', 1, { reason: HALT_ENQUEUE_BUDGET });
     if (restartReason !== 'none') {
       counter('ashby_reconcile_sweep_restart', 1, { reason: restartReason });
     }
@@ -909,6 +1081,8 @@ export async function runReconciliation(deps: ReconcileDeps): Promise<ReconcileR
       && !anchorConflict && !unclassifiedAbort && !sweepAbandoned,
     restartReason,
     sweepRestarts,
+    sweepEnqueued,
+    halted,
     tokenInstalled,
   };
 

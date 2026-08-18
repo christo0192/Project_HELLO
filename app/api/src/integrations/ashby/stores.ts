@@ -78,7 +78,7 @@ export function createCheckpointStore(client: SupabaseClient): CheckpointStore {
     async get(checkpointKey): Promise<SyncCheckpoint | null> {
       const { data, error } = await client
         .from('ashby_sync_checkpoints')
-        .select('sync_token, status, token_issued_at, last_success_at, resync_epoch, resync_cursor, resync_cursor_epoch, resync_cursor_at, sweep_mode, sweep_restarts, resync_pages_done, resync_items_done')
+        .select('sync_token, status, token_issued_at, last_success_at, resync_epoch, resync_cursor, resync_cursor_epoch, resync_cursor_at, sweep_mode, sweep_restarts, sweep_enqueued, sweep_halted_at, sweep_halt_reason, resync_pages_done, resync_items_done')
         .eq('provider', 'ashby')
         .eq('checkpoint_key', checkpointKey)
         .maybeSingle();
@@ -97,6 +97,9 @@ export function createCheckpointStore(client: SupabaseClient): CheckpointStore {
         resync_pages_done: number | null;
         resync_items_done: number | null;
         sweep_restarts: number | null;
+        sweep_enqueued: number | null;
+        sweep_halted_at: string | null;
+        sweep_halt_reason: string | null;
       };
       const status: SyncCheckpoint['status'] =
         row.status === 'running' || row.status === 'full_resync_required' ? row.status : 'idle';
@@ -120,6 +123,9 @@ export function createCheckpointStore(client: SupabaseClient): CheckpointStore {
         resyncPagesDone: typeof row.resync_pages_done === 'number' ? row.resync_pages_done : 0,
         resyncItemsDone: typeof row.resync_items_done === 'number' ? row.resync_items_done : 0,
         sweepRestarts: typeof row.sweep_restarts === 'number' ? row.sweep_restarts : 0,
+        sweepEnqueued: typeof row.sweep_enqueued === 'number' ? row.sweep_enqueued : 0,
+        sweepHaltedAt: row.sweep_halted_at ?? null,
+        sweepHaltReason: row.sweep_halt_reason ?? null,
       };
     },
     async advance(input): Promise<void> {
@@ -169,8 +175,22 @@ export function createCheckpointStore(client: SupabaseClient): CheckpointStore {
           ? input.sweepToken
           : null,
         p_first: input.first === true,
+        p_enqueued: typeof input.enqueued === 'number' ? input.enqueued : 0,
       });
       if (error) return { status: 'save_error' };
+      const row = data as Record<string, unknown> | null;
+      return { status: typeof row?.status === 'string' ? row.status : 'error' };
+    },
+    async haltSweep(input) {
+      // Halting is the compensating control for the page-aligned breaker, so a
+      // failure here must be visible rather than swallowed into a silent
+      // "budget ignored". The caller stops the run either way.
+      const { data, error } = await client.rpc('halt_ashby_sync_sweep', {
+        p_checkpoint_key: input.checkpointKey,
+        p_owner: input.owner,
+        p_reason: input.reason,
+      });
+      if (error) return { status: 'halt_error' };
       const row = data as Record<string, unknown> | null;
       return { status: typeof row?.status === 'string' ? row.status : 'error' };
     },
@@ -207,6 +227,9 @@ export function createCheckpointStore(client: SupabaseClient): CheckpointStore {
         resyncPagesDone: typeof row?.resync_pages_done === 'number' ? row.resync_pages_done : 0,
         resyncItemsDone: typeof row?.resync_items_done === 'number' ? row.resync_items_done : 0,
         sweepRestarts: typeof row?.sweep_restarts === 'number' ? row.sweep_restarts : 0,
+        sweepEnqueued: typeof row?.sweep_enqueued === 'number' ? row.sweep_enqueued : 0,
+        sweepHaltedAt: (row?.sweep_halted_at as string | null) ?? null,
+        sweepHaltReason: (row?.sweep_halt_reason as string | null) ?? null,
       };
       return {
         status: 'ok',

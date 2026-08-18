@@ -110,6 +110,21 @@ export interface SyncCheckpoint {
   resyncItemsDone?: number;
   /** How many times a sweep was abandoned and restarted from page 1. */
   sweepRestarts?: number;
+  /**
+   * Signal jobs the CURRENT sweep has created, across all of its runs. The
+   * per-run breaker bounds one pass; page-aligning it and sweeping every few
+   * seconds turned that into a rate, so this is the figure that actually
+   * bounds blast radius.
+   */
+  sweepEnqueued?: number;
+  /**
+   * Set when reconciliation HALTED itself on this stream (per-sweep enqueue or
+   * restart budget exhausted). While set, a run must return before any
+   * provider call. Cleared only by a forced resync — an operator action.
+   */
+  sweepHaltedAt?: string | null;
+  /** Sanitized code for why the sweep halted. Never an id or a message. */
+  sweepHaltReason?: string | null;
 }
 
 /** Durable checkpoint store for incremental reconciliation. */
@@ -188,6 +203,32 @@ export interface CheckpointStore {
      * banked token, and counts a restart if an anchor was still standing.
      */
     first?: boolean;
+    /** Jobs this sweep has created so far, across runs (monotonic). */
+    enqueued?: number;
+  }): Promise<{ status: 'ok' | string }>;
+
+  /**
+   * HALT reconciliation on this stream until an operator clears it. Called
+   * when a sweep exhausts its ABSOLUTE per-sweep enqueue budget or its restart
+   * budget.
+   *
+   * This is the compensating control for page-aligning the enqueue breaker.
+   * Page alignment converts the breaker from a wedge into a rate limit, and
+   * the sweep cadence multiplies that rate; without a sweep-level stop, a
+   * runaway admission bug would create `maxEnqueuePerRun` jobs every few
+   * seconds indefinitely instead of wedging after one run. Halting restores
+   * the wedge at sweep granularity — and reconciliation stopping is the
+   * conservative failure, since webhook delivery is unaffected.
+   *
+   * Optional for the same reason as `beginRun`: the pure-domain fakes may omit
+   * it. When absent the caller still stops the run and refuses to anchor, so
+   * the budget is never silently ignored — it just is not durable.
+   */
+  haltSweep?(input: {
+    checkpointKey: string;
+    owner: string;
+    /** Sanitized code. Never an id, token, or message. */
+    reason: string;
   }): Promise<{ status: 'ok' | string }>;
 
   /**

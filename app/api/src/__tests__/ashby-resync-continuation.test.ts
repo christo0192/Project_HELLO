@@ -70,6 +70,9 @@ interface CheckpointRow {
   sweepMode: 'full' | 'incremental' | null;
   sweepToken: string | null;
   sweepRestarts: number;
+  sweepEnqueued: number;
+  sweepHaltedAt: string | null;
+  sweepHaltReason: string | null;
   resyncPagesDone: number;
   resyncItemsDone: number;
   resyncStartedAt: string | null;
@@ -84,6 +87,7 @@ class FakeCheckpointStore implements CheckpointStore {
   saves: Array<{ cursor: string; owner: string; status: string }> = [];
   advances: Array<{ syncToken: string | null; resyncEpoch: number | null }> = [];
   resyncReasons: string[] = [];
+  halts: string[] = [];
   nowMs: () => number;
 
   constructor(nowMs: () => number, initial?: Partial<CheckpointRow>) {
@@ -92,7 +96,8 @@ class FakeCheckpointStore implements CheckpointStore {
       syncToken: null, status: 'full_resync_required', tokenIssuedAt: null,
       lastSuccessAt: null, resyncEpoch: 1, resyncCursor: null,
       resyncCursorEpoch: null, resyncCursorAt: null, sweepMode: null,
-      sweepToken: null, sweepRestarts: 0, resyncPagesDone: 0,
+      sweepToken: null, sweepRestarts: 0, sweepEnqueued: 0,
+      sweepHaltedAt: null, sweepHaltReason: null, resyncPagesDone: 0,
       resyncItemsDone: 0, resyncStartedAt: null, leaseOwner: null,
       leaseExpiresAtMs: null, noProgressRuns: 0, ...initial,
     };
@@ -112,7 +117,22 @@ class FakeCheckpointStore implements CheckpointStore {
       resyncPagesDone: this.row.resyncPagesDone,
       resyncItemsDone: this.row.resyncItemsDone,
       sweepRestarts: this.row.sweepRestarts,
+      sweepEnqueued: this.row.sweepEnqueued,
+      sweepHaltedAt: this.row.sweepHaltedAt,
+      sweepHaltReason: this.row.sweepHaltReason,
     };
+  }
+
+  async haltSweep(input: { owner: string; reason: string }): Promise<{ status: string }> {
+    if (this.row.leaseOwner !== input.owner) return { status: 'not_owned' };
+    this.row.sweepHaltedAt ??= new Date(this.nowMs()).toISOString();
+    this.row.sweepHaltReason ??= input.reason;
+    // A halt drops the anchor: whatever this sweep was doing must not resume.
+    this.row.resyncCursor = null;
+    this.row.resyncCursorEpoch = null;
+    this.row.resyncCursorAt = null;
+    this.halts.push(input.reason);
+    return { status: 'ok' };
   }
 
   /** Clear every field a completed or invalidated sweep must not leave behind. */
@@ -125,6 +145,7 @@ class FakeCheckpointStore implements CheckpointStore {
     this.row.resyncPagesDone = 0;
     this.row.resyncItemsDone = 0;
     this.row.resyncStartedAt = null;
+    this.row.sweepEnqueued = 0;
   }
 
   async advance(input: {
@@ -164,13 +185,16 @@ class FakeCheckpointStore implements CheckpointStore {
     // means a sweep was abandoned mid-way.
     if (this.row.resyncCursor !== null) this.row.sweepRestarts += 1;
     this.clearSweep();
+    // A forced resync IS the operator action that clears a halt.
+    this.row.sweepHaltedAt = null;
+    this.row.sweepHaltReason = null;
     this.resyncReasons.push(reason);
   }
 
   async saveResyncCursor(input: {
     cursor: string; owner: string; pagesDone: number; itemsDone: number;
     resyncEpoch: number | null; mode: 'full' | 'incremental';
-    sweepToken?: string | null; first?: boolean;
+    sweepToken?: string | null; first?: boolean; enqueued?: number;
   }): Promise<{ status: string }> {
     const record = (status: string) => {
       this.saves.push({ cursor: input.cursor, owner: input.owner, status });
@@ -191,12 +215,15 @@ class FakeCheckpointStore implements CheckpointStore {
       this.row.resyncItemsDone = input.itemsDone;
       this.row.sweepToken = input.sweepToken ?? null;
       this.row.resyncStartedAt = new Date(this.nowMs()).toISOString();
+      this.row.sweepEnqueued = input.enqueued ?? 0;
     } else {
       this.row.resyncPagesDone = Math.max(this.row.resyncPagesDone, input.pagesDone);
       this.row.resyncItemsDone = Math.max(this.row.resyncItemsDone, input.itemsDone);
       // First-write-wins across the sweep.
       this.row.sweepToken = this.row.sweepToken ?? input.sweepToken ?? null;
       this.row.resyncStartedAt ??= new Date(this.nowMs()).toISOString();
+      // H-8: durable work accumulates across the sweep, monotonically.
+      this.row.sweepEnqueued = Math.max(this.row.sweepEnqueued, input.enqueued ?? 0);
     }
     this.row.resyncCursor = input.cursor;
     this.row.resyncCursorEpoch = this.row.resyncEpoch;
@@ -366,8 +393,12 @@ describe('full-resync page-anchored continuation (0034)', () => {
     const runs: Awaited<ReturnType<typeof runReconciliation>>[] = [];
     // Bounded runs, exactly as the scheduler drives them. Guard the loop so a
     // liveness regression fails as a bounded test rather than hanging CI.
+    // A genuine first-enable backfill of this size creates more durable work
+    // than the conservative default per-sweep budget allows, so it is raised
+    // here exactly as the runbook tells an operator to raise it.
+    const caps = { sweepMaxEnqueue: 20_000 };
     for (let i = 0; i < 20; i += 1) {
-      const r = await runReconciliation(deps(provider, checkpoints, receipts));
+      const r = await runReconciliation(deps(provider, checkpoints, receipts, ENABLED, { caps }));
       runs.push(r);
       if (r.stop === 'drained') break;
       // A bounded stop MUST leave durable progress behind, or the sweep is
@@ -465,7 +496,7 @@ describe('full-resync page-anchored continuation (0034)', () => {
     expect(r.partialProgress).toEqual({
       resumed: false, checkpoints: 0, pagesDone: 0, itemsDone: 0,
       continuationPending: false, restartReason: 'anchor_disabled',
-      sweepRestarts: 0, tokenInstalled: false,
+      sweepRestarts: 0, sweepEnqueued: 0, halted: false, tokenInstalled: false,
     });
   });
 });
@@ -682,7 +713,7 @@ describe('continuation invalidation and ownership', () => {
     expect(r.partialProgress).toEqual({
       resumed: false, checkpoints: 0, pagesDone: 0, itemsDone: 0,
       continuationPending: false, restartReason: 'none',
-      sweepRestarts: 0, tokenInstalled: false,
+      sweepRestarts: 0, sweepEnqueued: 0, halted: false, tokenInstalled: false,
     });
     expect(checkpoints.saves).toHaveLength(0);
     expect(receipts.totalWrites).toBe(0);
@@ -758,6 +789,218 @@ describe('continuation invalidation and ownership', () => {
     expect(r.partialProgress.resumed).toBe(false);
     expect(cursors[0]).toBeUndefined();
     expect(receipts.seen.size).toBe(150);
+  });
+});
+
+describe('the storm breaker at SWEEP scale (H-8)', () => {
+  // Page-aligning the per-run breaker converted it from a wedge into a RATE
+  // limit, and the sweep cadence multiplied that rate (~200 jobs / 15 min ->
+  // <=300 jobs / 5-10 s). These are the compensating controls that make that
+  // trade safe; without them the guard would be ~90x weaker than the docs say.
+
+  it('accumulates enqueued work across the whole sweep, not just one run', async () => {
+    const clock = { ms: 1_000 };
+    const checkpoints = new FakeCheckpointStore(() => clock.ms);
+    const receipts = new FakeReceipts();
+    const provider = new FakeProvider(500);
+    // Small per-run breaker, generous sweep budget: several runs, one sweep.
+    const caps = { maxEnqueuePerRun: 100, sweepMaxEnqueue: 10_000 };
+
+    const first = await runReconciliation(deps(provider, checkpoints, receipts, ENABLED, { caps }));
+    expect(first.partialProgress.sweepEnqueued).toBe(first.enqueued);
+    expect(checkpoints.row.sweepEnqueued).toBe(first.enqueued);
+
+    clock.ms += 60_000;
+    const second = await runReconciliation(deps(provider, checkpoints, receipts, ENABLED, { caps }));
+    // The per-run figure resets; the SWEEP figure does not — which is the
+    // whole point, since the per-run figure is now a rate.
+    expect(second.partialProgress.sweepEnqueued).toBeGreaterThan(second.enqueued);
+    expect(second.partialProgress.sweepEnqueued)
+      .toBe(first.partialProgress.sweepEnqueued + second.enqueued);
+  });
+
+  it('HALTS the stream when a sweep exhausts its absolute enqueue budget', async () => {
+    const clock = { ms: 1_000 };
+    const checkpoints = new FakeCheckpointStore(() => clock.ms);
+    const receipts = new FakeReceipts();
+    const provider = new FakeProvider(5_000);
+    const caps = { maxEnqueuePerRun: 2_000, sweepMaxEnqueue: 250 };
+
+    const r = await runReconciliation(deps(provider, checkpoints, receipts, ENABLED, { caps }));
+    expect(r.stop).toBe('halted');
+    expect(r.partialProgress.halted).toBe(true);
+    expect(r.advanced).toBe(false);
+    expect(checkpoints.halts).toContain('sweep_enqueue_budget');
+    expect(checkpoints.row.sweepHaltedAt).not.toBeNull();
+    // The anchor is dropped so the halted sweep cannot silently resume.
+    expect(checkpoints.row.resyncCursor).toBeNull();
+    // Bounded blast radius: at most the budget plus one page's overshoot.
+    expect(r.partialProgress.sweepEnqueued).toBeLessThanOrEqual(250 + 100);
+  });
+
+  it('makes a halted stream a genuine wedge — no provider call at all', async () => {
+    const clock = { ms: 1_000 };
+    const checkpoints = new FakeCheckpointStore(() => clock.ms, {
+      sweepHaltedAt: new Date(1_000).toISOString(),
+      sweepHaltReason: 'sweep_enqueue_budget',
+    });
+    const receipts = new FakeReceipts();
+    const provider = new FakeProvider(5_000);
+
+    const r = await runReconciliation(deps(provider, checkpoints, receipts));
+    expect(r.stop).toBe('halted');
+    expect(r.partialProgress.halted).toBe(true);
+    // This is the assertion that matters: the halt restores the "wedge"
+    // property the per-run breaker used to have.
+    expect(provider.calls).toBe(0);
+    expect(receipts.totalWrites).toBe(0);
+    expect(checkpoints.saves).toHaveLength(0);
+    expect(checkpoints.advances).toHaveLength(0);
+  });
+
+  it('clears the halt on a forced resync — the operator action', async () => {
+    const clock = { ms: 1_000 };
+    const checkpoints = new FakeCheckpointStore(() => clock.ms, {
+      sweepHaltedAt: new Date(1_000).toISOString(),
+      sweepHaltReason: 'sweep_enqueue_budget',
+    });
+    const receipts = new FakeReceipts();
+    // Enabling or repointing a mapping performs exactly this call.
+    await checkpoints.requireFullResync(KEY, 'mapping_enabled');
+    expect(checkpoints.row.sweepHaltedAt).toBeNull();
+
+    const r = await runReconciliation(deps(new FakeProvider(150), checkpoints, receipts, PAUSED));
+    expect(r.stop).toBe('drained');
+    expect(r.partialProgress.halted).toBe(false);
+  });
+
+  it('HALTS a sweep that keeps restarting from page 1 (M2)', async () => {
+    // A resume that never holds would otherwise re-page the whole corpus
+    // forever, burning provider quota with nothing to show for it.
+    const clock = { ms: 10_000_000 };
+    const checkpoints = new FakeCheckpointStore(() => clock.ms, {
+      resyncCursor: 'cur-300', resyncCursorEpoch: 1, sweepMode: 'full',
+      resyncCursorAt: new Date(0).toISOString(),     // stale -> restart
+      sweepRestarts: 5,
+    });
+    const receipts = new FakeReceipts();
+    const provider = new FakeProvider(5_000);
+
+    const r = await runReconciliation(
+      deps(provider, checkpoints, receipts, PAUSED, {
+        caps: { anchorMaxAgeMs: 60_000, sweepMaxRestarts: 5 },
+      }),
+    );
+    expect(r.stop).toBe('halted');
+    expect(r.partialProgress.restartReason).toBe('anchor_stale');
+    expect(checkpoints.halts).toContain('sweep_restart_budget');
+    expect(provider.calls).toBe(0);
+  });
+
+  it('does not halt a healthy sweep that resumes cleanly', async () => {
+    const clock = { ms: 1_000 };
+    const checkpoints = new FakeCheckpointStore(() => clock.ms, { sweepRestarts: 4 });
+    const receipts = new FakeReceipts();
+    const r = await runReconciliation(
+      deps(new FakeProvider(150), checkpoints, receipts, PAUSED, {
+        caps: { sweepMaxRestarts: 5 },
+      }),
+    );
+    // restartReason 'none' -> the restart budget is not even consulted.
+    expect(r.stop).toBe('drained');
+    expect(checkpoints.halts).toHaveLength(0);
+  });
+});
+
+describe('a provider-rejected resumed cursor (M1)', () => {
+  /** A non-retriable provider failure, shaped like AshbyError. */
+  function rejection(category: string) {
+    return Object.assign(new Error(`ashby_${category}`), { category, retriable: false });
+  }
+
+  function resumable(clock: { ms: number }) {
+    return new FakeCheckpointStore(() => clock.ms, {
+      resyncCursor: 'cur-300', resyncCursorEpoch: 1, sweepMode: 'full',
+      resyncCursorAt: new Date(clock.ms).toISOString(),
+      resyncPagesDone: 3, resyncItemsDone: 300,
+    });
+  }
+
+  it('invalidates the anchor at once instead of wedging until it goes stale', async () => {
+    // Left standing, every later run resumes the same dead cursor and throws
+    // again until the 6h freshness bound expires it — hours with the
+    // dropped-webhook safety net down.
+    const clock = { ms: 1_000 };
+    const checkpoints = resumable(clock);
+    const receipts = new FakeReceipts();
+    const rejecting: ApplicationLister = {
+      async applicationList() { throw rejection('logical_failure'); },
+    };
+    await expect(runReconciliation(deps(rejecting, checkpoints, receipts)))
+      .rejects.toThrow(/logical_failure/);
+    expect(checkpoints.row.resyncCursor).toBeNull();
+    expect(checkpoints.resyncReasons).toContain('resume_cursor_rejected');
+
+    // The very next run sweeps from page 1 and completes.
+    clock.ms += 60_000;
+    const { provider, cursors } = trackingProvider(150);
+    const next = await runReconciliation(deps(provider, checkpoints, receipts));
+    expect(next.partialProgress.resumed).toBe(false);
+    expect(cursors[0]).toBeUndefined();
+    expect(next.stop).toBe('drained');
+  });
+
+  it('KEEPS the anchor when the failure is transient', async () => {
+    // Throwing away a valid anchor restarts a ~119k-page sweep, so a rate
+    // limit, a 5xx, a timeout, or a socket error must never cost one.
+    for (const category of ['rate_limited', 'http_server_error', 'timeout', 'network']) {
+      const clock = { ms: 1_000 };
+      const checkpoints = resumable(clock);
+      const receipts = new FakeReceipts();
+      const flaky: ApplicationLister = {
+        async applicationList() {
+          throw Object.assign(new Error(`ashby_${category}`), { category, retriable: true });
+        },
+      };
+      await expect(runReconciliation(deps(flaky, checkpoints, receipts))).rejects.toThrow();
+      expect(checkpoints.row.resyncCursor).toBe('cur-300');
+      expect(checkpoints.resyncReasons).toHaveLength(0);
+    }
+  });
+
+  it('keeps the anchor when an unrecognised error shape fails', async () => {
+    // Conservative by default: only a recognised NON-retriable provider
+    // failure implicates the cursor.
+    const clock = { ms: 1_000 };
+    const checkpoints = resumable(clock);
+    const receipts = new FakeReceipts();
+    const odd: ApplicationLister = {
+      async applicationList() { throw new Error('boom'); },
+    };
+    await expect(runReconciliation(deps(odd, checkpoints, receipts))).rejects.toThrow(/boom/);
+    expect(checkpoints.row.resyncCursor).toBe('cur-300');
+  });
+
+  it('does not blame the cursor for a failure on a LATER page', async () => {
+    // Page 2 failing says nothing about the cursor we resumed from.
+    const clock = { ms: 1_000 };
+    const checkpoints = resumable(clock);
+    const receipts = new FakeReceipts();
+    let calls = 0;
+    const lateFail: ApplicationLister = {
+      async applicationList<T = OpaqueRecord[]>() {
+        calls += 1;
+        if (calls > 1) throw rejection('logical_failure');
+        return {
+          results: [] as unknown as T, moreDataAvailable: true, nextCursor: 'cur-400',
+        };
+      },
+    };
+    await expect(runReconciliation(deps(lateFail, checkpoints, receipts)))
+      .rejects.toThrow(/logical_failure/);
+    // Page 1 anchored normally; the anchor moved forward, it was not dropped.
+    expect(checkpoints.row.resyncCursor).toBe('cur-400');
+    expect(checkpoints.resyncReasons).toHaveLength(0);
   });
 });
 

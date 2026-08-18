@@ -180,6 +180,20 @@ export interface ReconcilePassView {
   /** Times a sweep was abandoned and restarted. Climbing ⇒ resume not holding. */
   sweepRestarts: number;
   /**
+   * Signal jobs the CURRENT sweep has created across ALL of its runs. This —
+   * not `enqueued`, which is per-run — is the figure that bounds blast radius,
+   * because the per-run breaker is page-aligned and a pass fires every few
+   * seconds while a sweep is in flight. Climbing while `resyncPagesDone` is
+   * flat is the signature of an admission bug.
+   */
+  sweepEnqueued: number;
+  /**
+   * Reconciliation has HALTED itself on this stream (per-sweep enqueue or
+   * restart budget exhausted) and makes no provider call until an operator
+   * clears it with a forced resync. Webhook delivery is unaffected.
+   */
+  halted: boolean;
+  /**
    * Whether a drained run actually installed a sync token. A sweep can drain
    * with none (the provider returned no token in 1,200 probed pages), which
    * means the next pass is another full sweep — invisible from `advanced`.
@@ -230,6 +244,8 @@ export function publishReconcilePass(
       continuationPending: boolean;
       restartReason?: string;
       sweepRestarts?: number;
+      sweepEnqueued?: number;
+      halted?: boolean;
       tokenInstalled?: boolean;
     };
   },
@@ -260,6 +276,8 @@ export function publishReconcilePass(
     resyncItemsDone: safeCount(pass.partialProgress?.itemsDone),
     restartReason: safeCode(pass.partialProgress?.restartReason ?? 'none'),
     sweepRestarts: safeCount(pass.partialProgress?.sweepRestarts),
+    sweepEnqueued: safeCount(pass.partialProgress?.sweepEnqueued),
+    halted: pass.partialProgress?.halted === true,
     tokenInstalled: pass.partialProgress?.tokenInstalled === true,
     observedAt: nowIso,
   };
