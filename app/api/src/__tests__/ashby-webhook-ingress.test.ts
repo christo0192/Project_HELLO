@@ -98,6 +98,28 @@ describe('ingestWebhook outcomes (transactional outbox)', () => {
     expect(out).toMatchObject({ kind: 'unrecognized', httpStatus: 400 });
   });
 
+  it('acks the official idless Ashby ping without persistence or queue work', async () => {
+    const receipts = new FakeOutbox();
+    const out = await ingestWebhook(
+      { action: 'ping', data: { webhookActionType: 'ping' } },
+      { receipts },
+    );
+    expect(out).toEqual({ kind: 'ignored_action', httpStatus: 200, code: 'ping', enqueued: false });
+    expect(receipts.receipts.size).toBe(0);
+    expect(receipts.liveJobs.size).toBe(0);
+  });
+
+  it.each([
+    { action: 'ping' },
+    { action: 'ping', data: {} },
+    { action: 'ping', data: { webhookActionType: 'not-ping' } },
+  ])('rejects malformed ping lookalikes: %j', async (body) => {
+    const receipts = new FakeOutbox();
+    const out = await ingestWebhook(body, { receipts });
+    expect(out).toMatchObject({ kind: 'unrecognized', httpStatus: 400 });
+    expect(receipts.receipts.size).toBe(0);
+  });
+
   it('records + acks a non-trigger action WITHOUT enqueuing', async () => {
     const receipts = new FakeOutbox();
     const out = await ingestWebhook({ action: 'applicationUpdate', id: 'e1', data: { application: { id: 'a' } } }, { receipts });

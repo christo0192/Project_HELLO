@@ -505,7 +505,7 @@ paths:
       tags: [ashby]
       operationId: receiveAshbyWebhook
       summary: Receive an Ashby webhook verified by HMAC-SHA256 over the raw body
-      description: Inbound Ashby webhook receiver. The only trust boundary is the Ashby-Signature header verified as an HMAC-SHA256 of the exact raw request bytes before JSON parsing. Not recruiter authenticated. Disabled by default and fails closed until the integration flag and secret are configured.
+      description: Inbound Ashby webhook receiver. The only trust boundary is the Ashby-Signature header verified as an HMAC-SHA256 of the exact raw request bytes before JSON parsing. Not recruiter authenticated. Disabled by default and fails closed until the integration flag and secret are configured. Ashby's signed idless configuration ping is acknowledged without persistence or queue work so webhook create/edit can enable delivery.
       parameters:
         - name: Ashby-Signature
           in: header
@@ -515,7 +515,7 @@ paths:
             type: string
       responses:
         '200':
-          description: Signal durably received, or a duplicate delivery acknowledged.
+          description: Signal durably received, duplicate acknowledged, or signed configuration ping accepted.
           content:
             application/json:
               schema:

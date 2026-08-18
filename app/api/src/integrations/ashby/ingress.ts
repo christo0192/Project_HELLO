@@ -3,6 +3,7 @@
  *
  * Runs AFTER the route has verified the HMAC signature over the raw bytes and
  * parsed the JSON. Given the parsed body it:
+ *   0. acknowledges Ashby's signed, idless configuration `ping` without DB work;
  *   1. extracts a sanitized signal (action + dedup identity + opaque ids);
  *   2. for the stage-change trigger, atomically records the receipt AND ensures
  *      exactly one live signal job (transactional outbox — a single RPC), so a
@@ -17,13 +18,13 @@
  *
  * Outcome → HTTP mapping (applied by the route):
  *   accepted / duplicate → 200 (durable; work pending)
- *   ignored_action       → 200 (durable receipt; not a processing trigger)
+ *   ignored_action       → 200 (durable non-trigger receipt, or storage-free signed ping)
  *   unrecognized         → 400 (signed but unparseable/idless — Ashby won't storm)
  *   durability_error     → 500 (retryable; receipt/enqueue not durable)
  *
  * SECURITY: only a sanitized `{ source }` marker is stored as receipt metadata —
- * never the body, contact data, or ids-as-content. The raw body/signature/secret
- * never reach this layer.
+ * never the body, contact data, or ids-as-content. Ping stores nothing. The raw
+ * body/signature/secret never reach this layer.
  */
 
 import {
@@ -61,10 +62,33 @@ export function isTriggerAction(action: string): boolean {
 }
 
 /**
+ * Ashby's create/edit liveness probe has no `webhookActionId` by contract:
+ * `{ action: "ping", data: { webhookActionType: "ping" } }`. It must receive
+ * 200 or Ashby leaves the webhook disabled. Signature verification has already
+ * happened in the route; this exact shape performs no persistence or queueing.
+ */
+export function isAshbyPing(parsed: unknown): boolean {
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+  const root = parsed as Record<string, unknown>;
+  if (root.action !== 'ping') return false;
+  const data = root.data;
+  return data !== null
+    && typeof data === 'object'
+    && !Array.isArray(data)
+    && (data as Record<string, unknown>).webhookActionType === 'ping';
+}
+
+/**
  * Durably ingest one verified, parsed webhook. Throws are converted to a
  * retryable `durability_error` so the route returns a 5xx and Ashby retries.
  */
 export async function ingestWebhook(parsed: unknown, deps: IngressDeps): Promise<IngressOutcome> {
+  // Provider liveness handshake: signed by the route, exact official shape,
+  // deliberately storage-free because Ashby supplies no stable event id.
+  if (isAshbyPing(parsed)) {
+    return { kind: 'ignored_action', httpStatus: 200, code: 'ping', enqueued: false };
+  }
+
   const extracted = extractWebhookSignal(parsed);
   if (!extracted.ok) {
     // Signed but structurally unusable: acknowledge as a non-retryable 400 so
