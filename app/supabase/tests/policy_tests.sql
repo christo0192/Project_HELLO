@@ -5475,6 +5475,18 @@ select _policy_tests.assert(
   'a second overload could bypass the epoch/lease guards'
 );
 
+-- N1: the superseded save signatures are explicitly dropped, so an environment
+-- that ever saw an in-progress form cannot end up with ambiguous dispatch.
+select _policy_tests.assert(
+  'ashby 0034/N1: no superseded save_ashby_resync_cursor overload survives',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname = 'save_ashby_resync_cursor'
+      and p.pronargs <> 11) = 0,
+  'only the 11-argument save_ashby_resync_cursor may exist'
+);
+
 -- The superseded 7-argument advance overload must be gone: leaving it callable
 -- would let a stale runner advance while bypassing the lease guard entirely.
 select _policy_tests.assert(
@@ -5611,7 +5623,7 @@ begin
   perform _policy_tests.assert('ashby 0034: enabling a mapping invalidates the continuation',
     v_cp.status = 'full_resync_required' and v_cp.resync_cursor is null
       and v_cp.resync_cursor_epoch is null and v_cp.sweep_mode is null
-      and v_cp.sweep_token is null and v_cp.sweep_restarts = 1
+      and v_cp.sweep_token is null and v_cp.sweep_restarts = 0
       and v_cp.resync_pages_done = 0 and v_cp.resync_epoch = v_epoch + 1,
     'expected a cleared continuation at epoch ' || (v_epoch + 1)
       || ', got cursor ' || coalesce(v_cp.resync_cursor, '<null>')
@@ -5743,6 +5755,42 @@ begin
     v_cp.sweep_halted_at is null and v_cp.sweep_halt_reason is null
       and v_cp.sweep_enqueued = 0,
     'halt survived a forced resync');
+
+  -- B2: the restart budget must be a per-EPISODE counter, not a lifetime
+  -- latch. A lifetime counter made the documented halt-clear cosmetic: the
+  -- stream re-halted on the first failed binding after it, forever.
+  update screening_v2.ashby_sync_checkpoints
+     set sweep_restarts = 5
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  v_res := screening_v2.mark_ashby_sync_full_resync('application.list', 'pol34_b2');
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0034/B2: a forced resync clears the restart budget',
+    v_cp.sweep_restarts = 0,
+    'restart budget survived the documented clear: ' || v_cp.sweep_restarts);
+
+  -- A drained sweep proves resume works, so it clears the tally too.
+  update screening_v2.ashby_sync_checkpoints
+     set sweep_restarts = 4
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  v_begin := screening_v2.begin_ashby_sync_run('application.list', 'runner-a', 300);
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  v_res := screening_v2.advance_ashby_sync_checkpoint(
+    'application.list', 'tok-b2-drain', 1, 1, true, now(), v_cp.resync_epoch, 'runner-a');
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0034/B2: a drained sweep clears the restart budget',
+    v_res->>'status' = 'ok' and v_cp.sweep_restarts = 0 and v_cp.sweep_enqueued = 0,
+    'got restarts ' || v_cp.sweep_restarts);
+  v_res := screening_v2.end_ashby_sync_run('application.list', 'runner-a', true);
+
+  -- N2: halting requires a LIVE lease, matching save and advance.
+  v_res := screening_v2.halt_ashby_sync_sweep(
+    'application.list', 'runner-a', 'sweep_enqueue_budget');
+  perform _policy_tests.assert('ashby 0034/N2: an unleased halt is refused',
+    v_res->>'status' = 'lease_expired',
+    'got ' || coalesce(v_res->>'status', '<null>'));
 
   -- An unsanitized halt reason is refused rather than stored.
   v_res := screening_v2.begin_ashby_sync_run('application.list', 'runner-a', 300);

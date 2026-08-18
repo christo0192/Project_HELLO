@@ -213,9 +213,14 @@ comment on column screening_v2.ashby_sync_checkpoints.sweep_halted_at is
 comment on column screening_v2.ashby_sync_checkpoints.sweep_halt_reason is
   'Sanitized code for why the sweep halted. Never an id, token, or message.';
 comment on column screening_v2.ashby_sync_checkpoints.sweep_restarts is
-  'How many times a sweep was abandoned and restarted from page 1 (stale or '
-  'invalidated anchor). A climbing value means resume is not holding — the '
-  'operator signal that the continuation is not working. A bounded count.';
+  'CONSECUTIVE restarts from page 1 (stale or invalidated anchor) since the '
+  'last successful drain or operator reset — deliberately NOT a lifetime '
+  'total. It gates the restart budget, so a lifetime counter would make the '
+  'budget a one-way latch: it would reach the threshold once and halt on the '
+  'first failed binding forever, and the documented remedy (a forced resync) '
+  'would not clear it. Reset to 0 by mark_ashby_sync_full_resync and by a '
+  'drained advance; incremented only when a new sweep discards a standing '
+  'anchor. A climbing value means resume is not holding.';
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- 2. save_ashby_resync_cursor — the page anchor, epoch- and lease-guarded
@@ -355,6 +360,17 @@ begin
 end;
 $$;
 
+-- N1: 0034 is additive and has never been applied anywhere, so no earlier
+-- signature of this function can exist — but `create or replace` with a new
+-- parameter list creates a SIBLING rather than replacing, so an environment
+-- that ever saw an in-progress form would end up with two callable overloads
+-- and ambiguous dispatch. Drop the earlier shapes explicitly, exactly as
+-- `advance_ashby_sync_checkpoint` does, so that cannot happen.
+drop function if exists screening_v2.save_ashby_resync_cursor(
+  text, text, text, integer, integer, bigint, timestamptz);
+drop function if exists screening_v2.save_ashby_resync_cursor(
+  text, text, text, integer, integer, bigint, timestamptz, text, text, boolean);
+
 revoke all on function screening_v2.save_ashby_resync_cursor(text, text, text, integer, integer, bigint, timestamptz, text, text, boolean, integer)
   from public, anon, authenticated;
 grant execute on function screening_v2.save_ashby_resync_cursor(text, text, text, integer, integer, bigint, timestamptz, text, text, boolean, integer)
@@ -414,6 +430,9 @@ begin
    for update;
   if not found then
     return jsonb_build_object('status', 'not_found');
+  end if;
+  if v_row.lease_expires_at is null or v_row.lease_expires_at <= p_now then
+    return jsonb_build_object('status', 'lease_expired');
   end if;
   if v_row.lease_owner is distinct from v_owner then
     return jsonb_build_object('status', 'not_owned');
@@ -499,9 +518,11 @@ begin
      sweep_mode          = null,
      sweep_token         = null,
      -- An anchor standing at this moment means a sweep was abandoned mid-way.
-     sweep_restarts      = screening_v2.ashby_sync_checkpoints.sweep_restarts
-                           + case when screening_v2.ashby_sync_checkpoints.resync_cursor
-                                       is not null then 1 else 0 end,
+     -- B2: a forced resync starts a NEW generation — new epoch, no anchor, no
+     -- budget. The previous generation's restart tally is not this one's, and
+     -- carrying it over would make the documented halt-clear a no-op: the
+     -- stream would re-halt on the very next failed binding, forever.
+     sweep_restarts      = 0,
      sweep_enqueued      = 0,
      -- A forced resync IS the operator action that clears a halt.
      sweep_halted_at     = null,
@@ -679,9 +700,13 @@ begin
      resync_started_at   = case when v_keep
                                 then screening_v2.ashby_sync_checkpoints.resync_started_at
                                 else null end,
-     -- A completed sweep releases its durable-work budget for the next one.
+     -- A completed sweep releases its durable-work budget for the next one,
+     -- and proves resume is working, so it clears the restart tally too (B2).
      sweep_enqueued      = case when v_keep
                                 then screening_v2.ashby_sync_checkpoints.sweep_enqueued
+                                else 0 end,
+     sweep_restarts      = case when v_keep
+                                then screening_v2.ashby_sync_checkpoints.sweep_restarts
                                 else 0 end,
      updated_at          = p_now
   returning id into v_id;

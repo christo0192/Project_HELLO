@@ -578,6 +578,26 @@ select sweep_halt_reason, sweep_halted_at, sweep_enqueued,
 `ASHBY_RECONCILE_SWEEP_MAX_RESTARTS` times (default 5) also halts: a resume
 that never holds would otherwise re-page the whole corpus forever.
 
+`sweep_restarts` counts **consecutive** restarts — since the last successful
+drain or the last forced resync — **not** a lifetime total. Both a drained
+sweep and `mark_ashby_sync_full_resync` reset it to 0. That matters: gating a
+budget on a lifetime counter would make it a one-way latch, so the stream would
+reach the threshold once and then halt on the first failed binding forever,
+and the documented clear above would be cosmetic.
+
+**If a restart-budget halt recurs, do not just keep clearing it.** Repeated
+`anchor_stale` restarts mean anchors are expiring between runs, which is the
+normal outcome of enabling the runtime only for bounded windows shorter than
+the sweep. The fix is one of:
+
+- raise `ASHBY_RECONCILE_ANCHOR_MAX_AGE_MS` so an anchor survives the gap
+  between sessions (the cursor itself was observed still valid across
+  processes), or
+- run a long enough window for the sweep to drain, or
+- lower `ASHBY_RECONCILE_SWEEP_INTERVAL_MS` so the sweep completes sooner.
+
+Clearing without changing one of those returns you to the same halt.
+
 **Kill switch.** `ASHBY_RECONCILE_ANCHOR_DISABLED=true` skips every anchor read
 and write, reverting exactly to the pre-0034 all-or-nothing sweep. Safe by
 construction: not advancing is the conservative failure.
@@ -623,7 +643,7 @@ Read it as:
 | Reading | Meaning |
 | --- | --- |
 | `resyncItemsDone` climbing pass over pass, `noProgress: 0` | **Progressing.** Wait for it; nothing to do. |
-| `restartReason` != `none` on every pass, `sweepRestarts` climbing | **Resume is not holding.** The sweep restarts from page 1 forever. Investigate before anything else. |
+| `restartReason` != `none` on every pass, `sweepRestarts` climbing | **Resume is not holding.** The sweep restarts from page 1 forever. Investigate before anything else — and note `sweepRestarts` is consecutive-since-progress, so a climbing value means it is failing *now*, not historically. |
 | `stop: "sweep_budget"` or `"cursor_invalid"` | **Sweep abandoned.** The cursor chain did not terminate or was unusable. Reconciliation is not covering this tenant. |
 | `stop: "halted"`, `halted: true` | **Reconciliation has stopped itself** on the per-sweep enqueue or restart budget. No provider calls at all until an operator forces a resync. Investigate `sweep_enqueued` before clearing. |
 | `sweepEnqueued` climbing while `resyncPagesDone` is flat | **Admission bug signature** — durable work being created without the sweep advancing. This is what the per-sweep budget is watching for. |

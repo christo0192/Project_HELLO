@@ -721,7 +721,10 @@ export async function runReconciliation(deps: ReconcileDeps): Promise<ReconcileR
   const basePagesDone = resumeFrom ? safeProgress(checkpoint?.resyncPagesDone) : 0;
   const baseItemsDone = resumeFrom ? safeProgress(checkpoint?.resyncItemsDone) : 0;
   const sweepRestarts = safeProgress(checkpoint?.sweepRestarts);
-  const baseSweepEnqueued = safeProgress(checkpoint?.sweepEnqueued);
+  // N3: gated on `resumeFrom` exactly like the page/item totals. A run that
+  // starts a NEW sweep must not inherit the previous sweep's durable-work
+  // total — it would burn the budget it never spent and halt early.
+  const baseSweepEnqueued = resumeFrom ? safeProgress(checkpoint?.sweepEnqueued) : 0;
   /** Jobs this SWEEP has created, this run included. */
   let sweepEnqueued = baseSweepEnqueued;
   let halted = false;

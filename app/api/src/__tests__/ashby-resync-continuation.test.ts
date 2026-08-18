@@ -124,6 +124,9 @@ class FakeCheckpointStore implements CheckpointStore {
   }
 
   async haltSweep(input: { owner: string; reason: string }): Promise<{ status: string }> {
+    if (this.row.leaseExpiresAtMs === null || this.row.leaseExpiresAtMs <= this.nowMs()) {
+      return { status: 'lease_expired' };
+    }
     if (this.row.leaseOwner !== input.owner) return { status: 'not_owned' };
     this.row.sweepHaltedAt ??= new Date(this.nowMs()).toISOString();
     this.row.sweepHaltReason ??= input.reason;
@@ -171,8 +174,10 @@ class FakeCheckpointStore implements CheckpointStore {
       this.row.tokenIssuedAt = this.row.syncToken === null
         ? null
         : new Date(this.nowMs()).toISOString();
-      // H-4: the continuation ends atomically with the token install.
+      // H-4: the continuation ends atomically with the token install. A
+      // drained sweep proves resume works, so it clears the restart tally.
       this.clearSweep();
+      this.row.sweepRestarts = 0;
     }
   }
 
@@ -183,8 +188,11 @@ class FakeCheckpointStore implements CheckpointStore {
     this.row.resyncEpoch += 1;
     // H-2: a new generation must sweep from page 1. An anchor standing here
     // means a sweep was abandoned mid-way.
-    if (this.row.resyncCursor !== null) this.row.sweepRestarts += 1;
     this.clearSweep();
+    // B2: a forced resync starts a NEW generation, so the previous one's
+    // restart tally is not this one's budget. Carrying it over would make the
+    // documented halt-clear a no-op.
+    this.row.sweepRestarts = 0;
     // A forced resync IS the operator action that clears a halt.
     this.row.sweepHaltedAt = null;
     this.row.sweepHaltReason = null;
@@ -897,6 +905,119 @@ describe('the storm breaker at SWEEP scale (H-8)', () => {
     expect(provider.calls).toBe(0);
   });
 
+  it('CLEARS the restart budget, so the documented remedy actually works (B2)', async () => {
+    // The regression: `sweep_restarts` used to be lifetime-monotonic while the
+    // budget gated on it, which made the budget a one-way latch. The operator
+    // ran the documented clear, the stream worked until the next anchor failed
+    // a binding, then halted again — forever, with no documented way back.
+    //
+    // This walks the exact sequence: halt -> documented clear -> a NEW sweep
+    // that anchors -> that anchor goes stale -> must NOT re-halt.
+    const clock = { ms: 10_000_000 };
+    const checkpoints = new FakeCheckpointStore(() => clock.ms, {
+      resyncCursor: 'cur-300', resyncCursorEpoch: 1, sweepMode: 'full',
+      resyncCursorAt: new Date(0).toISOString(),      // stale -> restart
+      sweepRestarts: 5,
+    });
+    const receipts = new FakeReceipts();
+    const caps = { anchorMaxAgeMs: 60_000, sweepMaxRestarts: 5 };
+
+    // 1. It halts, as designed.
+    const halted = await runReconciliation(
+      deps(new FakeProvider(5_000), checkpoints, receipts, PAUSED, { caps }),
+    );
+    expect(halted.stop).toBe('halted');
+
+    // 2. The operator runs the documented clear.
+    await checkpoints.requireFullResync(KEY, 'operator_clear');
+    expect(checkpoints.row.sweepHaltedAt).toBeNull();
+    // The budget must be cleared WITH the halt, or the clear is cosmetic.
+    expect(checkpoints.row.sweepRestarts).toBe(0);
+
+    // 3. A new sweep starts and anchors (bounded, so it does not drain).
+    clock.ms += 60_000;
+    const swept = await runReconciliation(
+      deps(new FakeProvider(5_001), checkpoints, receipts, PAUSED, { caps }),
+    );
+    expect(swept.stop).toBe('page_cap');
+    expect(checkpoints.row.resyncCursor).not.toBeNull();
+
+    // 4. That anchor goes stale — the ordinary outcome of a bounded canary
+    //    window resumed the next day. It must restart, NOT re-halt.
+    clock.ms += 10_000_000;
+    const later = await runReconciliation(
+      deps(new FakeProvider(150), checkpoints, receipts, PAUSED, { caps }),
+    );
+    expect(later.partialProgress.restartReason).toBe('anchor_stale');
+    expect(later.stop).not.toBe('halted');
+    expect(later.stop).toBe('drained');
+    expect(checkpoints.row.sweepHaltedAt).toBeNull();
+  });
+
+  it('a drained sweep clears the restart tally — resume demonstrably works', async () => {
+    const clock = { ms: 10_000_000 };
+    const checkpoints = new FakeCheckpointStore(() => clock.ms, {
+      resyncCursor: 'cur-300', resyncCursorEpoch: 1, sweepMode: 'full',
+      resyncCursorAt: new Date(0).toISOString(),      // stale -> one restart
+      sweepRestarts: 3,
+    });
+    const receipts = new FakeReceipts();
+    const r = await runReconciliation(
+      deps(new FakeProvider(150), checkpoints, receipts, PAUSED, {
+        caps: { anchorMaxAgeMs: 60_000, sweepMaxRestarts: 5 },
+      }),
+    );
+    expect(r.stop).toBe('drained');
+    expect(r.partialProgress.restartReason).toBe('anchor_stale');
+    expect(checkpoints.row.sweepRestarts).toBe(0);
+  });
+
+  it('still halts on CONSECUTIVE restarts with no drain in between', async () => {
+    // The budget must keep its teeth: what it targets is a resume that never
+    // holds, and nothing in the B2 fix should let that loop run forever.
+    const clock = { ms: 10_000_000 };
+    const checkpoints = new FakeCheckpointStore(() => clock.ms);
+    const receipts = new FakeReceipts();
+    const caps = { anchorMaxAgeMs: 1, sweepMaxRestarts: 3 };
+
+    // Each run anchors, and every anchor is stale by the next run. The first
+    // run has no anchor to discard, so it costs nothing; the next three each
+    // discard one and increment the tally to the threshold.
+    for (let i = 0; i < 4; i += 1) {
+      clock.ms += 60_000;
+      const r = await runReconciliation(
+        deps(new FakeProvider(5_001), checkpoints, receipts, PAUSED, { caps }),
+      );
+      expect(r.stop).toBe('page_cap');
+    }
+    clock.ms += 60_000;
+    const halted = await runReconciliation(
+      deps(new FakeProvider(5_001), checkpoints, receipts, PAUSED, { caps }),
+    );
+    expect(halted.stop).toBe('halted');
+    expect(checkpoints.halts).toContain('sweep_restart_budget');
+  });
+
+  it('a new sweep does not inherit the previous sweep-enqueue total (N3)', async () => {
+    // Carrying it over would burn a budget this sweep never spent.
+    const clock = { ms: 10_000_000 };
+    const checkpoints = new FakeCheckpointStore(() => clock.ms, {
+      resyncCursor: 'cur-300', resyncCursorEpoch: 1, sweepMode: 'full',
+      resyncCursorAt: new Date(0).toISOString(),      // stale -> new sweep
+      sweepEnqueued: 1_900,
+    });
+    const receipts = new FakeReceipts();
+    const r = await runReconciliation(
+      deps(new FakeProvider(300), checkpoints, receipts, ENABLED, {
+        caps: { anchorMaxAgeMs: 60_000, sweepMaxEnqueue: 2_000 },
+      }),
+    );
+    // With the stale total inherited this would have halted almost at once.
+    expect(r.stop).toBe('drained');
+    expect(r.partialProgress.sweepEnqueued).toBe(r.enqueued);
+    expect(r.partialProgress.halted).toBe(false);
+  });
+
   it('does not halt a healthy sweep that resumes cleanly', async () => {
     const clock = { ms: 1_000 };
     const checkpoints = new FakeCheckpointStore(() => clock.ms, { sweepRestarts: 4 });
@@ -1079,8 +1200,10 @@ describe('admission and bounds are preserved end to end', () => {
     expect(r.partialProgress.resumed).toBe(false);
     expect(r.partialProgress.restartReason).toBe('anchor_stale');
     expect(cursors[0]).toBeUndefined();
-    // The abandoned sweep is counted, so a resume that never holds is visible.
-    expect(checkpoints.row.sweepRestarts).toBe(1);
+    // The restart WAS counted (the halt-budget test covers accumulation), but
+    // this run then drained, and a drained sweep proves resume works — so the
+    // tally is cleared rather than carried forward (B2).
+    expect(checkpoints.row.sweepRestarts).toBe(0);
   });
 
   it('abandons a sweep that exceeds its cross-run page budget', async () => {
