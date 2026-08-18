@@ -593,6 +593,12 @@ export interface AshbyMcWorkflow {
   terminalState: string | null;
   ingestionState: string | null;
   operations: AshbyMcWorkflowOperation[];
+  /**
+   * Screening-session status, or null when no session exists yet. A `completed`
+   * session on a non-terminal workflow whose lifecycle is not
+   * `writeback_pending` is a screening whose completion park did not land.
+   */
+  sessionStatus: string | null;
   updatedAt: string;
 }
 
@@ -604,6 +610,21 @@ export interface AshbyMcMappingsResponse {
 export interface AshbyMcWorkflowsResponse {
   ok: boolean;
   workflows: AshbyMcWorkflow[];
+}
+
+/**
+ * One-time manual invite hand-off. `joinUrl` carries the candidate token in the
+ * URL FRAGMENT and is returned exactly once — it is never persisted by the API
+ * and must never be written to storage, a query string, or telemetry here.
+ */
+export interface AshbyManualInviteResponse {
+  ok: boolean;
+  invite_id?: string;
+  join_url?: string;
+  expires_at?: string;
+  ttl_hours?: number;
+  revoked_invites?: number;
+  error?: string;
 }
 
 export interface AshbyMcActionResponse {

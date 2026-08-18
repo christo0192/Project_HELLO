@@ -20,6 +20,7 @@ import type {
   AshbyMcMappingsResponse,
   AshbyMcWorkflowsResponse,
   AshbyMcActionResponse,
+  AshbyManualInviteResponse,
   AdminMaintenanceInput,
   AdminAuditListResponse,
   AdminMember,
@@ -397,6 +398,15 @@ export const api = {
     request<AshbyMcActionResponse>(`/api/integrations/ashby/mission-control/workflows/${id}/cancel`, {
       method: 'POST',
       body: JSON.stringify({ terminal_state: terminalState, reason }),
+    }),
+  /**
+   * Issue a usable manual invite link. The response body carries a one-time
+   * token in `join_url`'s fragment; the caller must keep it in memory only.
+   */
+  deliverAshbyManualInvite: (id: string) =>
+    request<AshbyManualInviteResponse>(`/api/integrations/ashby/mission-control/workflows/${id}/invite`, {
+      method: 'POST',
+      body: JSON.stringify({}),
     }),
   retryAshbyOperation: (id: string) =>
     request<AshbyMcActionResponse>(`/api/integrations/ashby/mission-control/operations/${id}/retry`, {

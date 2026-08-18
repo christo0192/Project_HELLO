@@ -62,6 +62,14 @@ export interface EnqueueResult {
 export interface OperationClaimRow {
   id: string;
   operationType: 'invite_delivery' | 'scorecard_write' | 'stage_move';
+  /**
+   * The deterministic operation key. It encodes the delivery CHANNEL
+   * (`ashby:invite:<app>:<channel>:<invite>`), which is why the claim RPC
+   * returns it: without the key a `delivery_mode='both'` mapping enqueues two
+   * operations that are indistinguishable at execution time, and both collapse
+   * to the manual channel.
+   */
+  operationKey: string | null;
   applicationLinkId: string;
   leaseToken: string;
   attempts: number;
@@ -93,6 +101,60 @@ export interface WorkflowStores {
   }): Promise<EnqueueResult>;
   completeOperation(id: string, leaseToken: string, externalAnchor?: string | null, marker?: string | null): Promise<'ok' | 'not_owned'>;
   failOperation(id: string, leaseToken: string, errorCode: string, retryable: boolean): Promise<{ outcome: 'retry' | 'failed' } | 'not_owned'>;
+}
+
+/**
+ * The runtime's persistence surface: {@link WorkflowStores} plus the seams a
+ * live worker needs. Kept as a SEPARATE interface so the pure orchestrators —
+ * and every existing fake that implements `WorkflowStores` — are unchanged; a
+ * decision function has no business claiming a lease or parking a lifecycle.
+ */
+export interface RuntimeWorkflowStores extends WorkflowStores {
+  /**
+   * Leased claim of the next runnable operation of `operationType`. Returns
+   * null when the queue is empty. The 0032 RPC never returns an operation
+   * whose application link is terminal, and honours the scorecard-before-stage
+   * dependency gate.
+   *
+   * This closes the single most load-bearing dead seam in the merged code:
+   * `claim_ashby_operation` shipped in 0031 with no TypeScript caller, so
+   * `OperationClaimRow` had no producer and `completeOperation`'s required
+   * `leaseToken` was unobtainable.
+   */
+  claimOperation(
+    operationType: 'invite_delivery' | 'scorecard_write' | 'stage_move',
+    owner: string,
+    leaseSeconds: number,
+  ): Promise<OperationClaimRow | null>;
+  /** Read the durable ingestion state for a link (null when absent). */
+  readIngestion(applicationLinkId: string): Promise<{ state: string; attempts: number } | null>;
+  /** Read the link row needed to materialize an invite (opaque ids only). */
+  readLink(applicationLinkId: string): Promise<WorkflowLinkRow | null>;
+  /** Park a completed application as `writeback_pending` (audited, idempotent). */
+  markWritebackPending(applicationLinkId: string, reason: string): Promise<{ status: string }>;
+  /**
+   * CAS a manual invite_delivery operation from `running` to
+   * `awaiting_manual_delivery`. The invite digest exists but no recruiter has
+   * obtained a usable link, so this is deliberately NOT success.
+   */
+  parkOperationAwaitingDelivery(
+    id: string,
+    leaseToken: string,
+    externalAnchor: string | null,
+  ): Promise<'ok' | 'not_owned'>;
+}
+
+/** The link fields the runtime needs; deliberately no PII and no tokens. */
+export interface WorkflowLinkRow {
+  id: string;
+  externalApplicationId: string;
+  externalJobId: string | null;
+  jobMappingId: string | null;
+  candidateId: string | null;
+  sessionId: string | null;
+  inviteId: string | null;
+  lifecycle: string;
+  terminalState: 'withdrawn' | 'deleted' | 'manual_stage_cancel' | null;
 }
 
 /** Mapping activity + tenant config resolved for a job. */

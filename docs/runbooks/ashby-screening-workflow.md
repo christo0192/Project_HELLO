@@ -102,11 +102,37 @@ raw model/CoT/transcript/recording/bearer) + idempotency marker + fail-closed
 tenant form binding; stale-lease CAS rejection; Mission Control candidate/
 unauthorized fail closed with no PII/tokens.
 
-## Residual EXTERNAL gates (runtime activation only — not code)
+## Residual gates
 
-Real Ashby credentials + tenant probe to pin per-job stage/form/interview ids
-and approve the presigned-URL host; an approved email provider + verified domain;
+> **CORRECTION (Wave 2 Step 6).** An earlier version of this section claimed the
+> residual was "runtime activation only — not code". **That was inaccurate.** The
+> domain and persistence layers were complete, but the production composition
+> root did not exist: nothing in a running process ever claimed an Ashby job.
+> Specifically, at `1f813ac` there was no queue consumer, no scheduler, no
+> reclaim sweeper, no `ASHBY_API_KEY`, no `claimOperation` adapter (so the 0031
+> `claim_ashby_operation` RPC had zero TypeScript callers), no ingestion work
+> item, and no candidate/session/invite persistence. A signed webhook durably
+> enqueued a job that would never be claimed. That code is delivered in the
+> runtime-activation PR — see
+> [`ashby-runtime-activation.md`](ashby-runtime-activation.md) and ADR-0012.
+
+**Remaining EXTERNAL gates (genuinely not code).** Real Ashby credentials and a
+tenant probe to pin per-job stage/form/interview ids and approve the
+presigned-URL host; an approved email provider + verified sending domain; the
 privacy/legal erasure decision for withdrawn/deleted applications; production
-malware scanner (ClamAV) configuration. All are runtime activation switches — the
-implementation is complete and disabled by default. No real provider call, email
-send, transcript/recording copy, or deployment is performed.
+malware-scanner (ClamAV) configuration. The runtime remains disabled by default
+behind two independent flags; no real provider call, email send,
+transcript/recording copy, or deployment is performed by this work.
+
+**Still not implemented, by design.** There is no approved Ashby result sink, so
+`scorecard_write` and `stage_move` are never claimed or executed and a completed
+screening parks at the `writeback_pending` lifecycle state (migration 0032),
+written by the completion observer on the authoritative assessment path. See the
+runtime-activation runbook for the four locks that enforce this.
+
+**Manual invite delivery.** The invite row stores only a SHA-256 digest, so the
+usable link exists for exactly one moment: the response to an authorized admin
+calling `POST …/mission-control/workflows/{id}/invite` (or clicking *Get invite
+link* in Mission Control). Until that happens the delivery operation rests at
+`awaiting_manual_delivery` — it is deliberately NOT `succeeded`, because no
+candidate can be contacted yet.

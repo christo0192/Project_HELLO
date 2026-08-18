@@ -53,7 +53,15 @@
         "RESUME_PARSER_TIMEOUT_MS": { "requiredInProduction": false, "secret": false },
         "RESUME_MAX_TEXT_LENGTH": { "requiredInProduction": false, "secret": false },
         "ASHBY_INTEGRATION_ENABLED": { "requiredInProduction": false, "secret": false },
-        "ASHBY_WEBHOOK_SECRET": { "requiredInProduction": false, "secret": true, "external": true }
+        "ASHBY_WEBHOOK_SECRET": { "requiredInProduction": false, "secret": true, "external": true },
+        "ASHBY_RUNTIME_ENABLED": { "requiredInProduction": false, "secret": false },
+        "ASHBY_API_KEY": { "requiredInProduction": false, "secret": true, "external": true },
+        "ASHBY_RESUME_HOSTS": { "requiredInProduction": false, "secret": false, "external": true },
+        "ASHBY_SIGNAL_POLL_MS": { "requiredInProduction": false, "secret": false },
+        "ASHBY_OPERATION_POLL_MS": { "requiredInProduction": false, "secret": false },
+        "ASHBY_RECONCILE_INTERVAL_MS": { "requiredInProduction": false, "secret": false },
+        "ASHBY_RECLAIM_INTERVAL_MS": { "requiredInProduction": false, "secret": false },
+        "ASHBY_LEASE_SECONDS": { "requiredInProduction": false, "secret": false }
       }
     },
     "web": {

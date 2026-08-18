@@ -90,4 +90,32 @@ export interface CheckpointStore {
   }): Promise<void>;
   /** Force a safe full resync (null the token, flag the stream). */
   requireFullResync(checkpointKey: string, reason: string): Promise<void>;
+
+  /**
+   * Acquire the SINGLE-FLIGHT lease for a stream (0032). Returns `locked` when
+   * another runner holds a live lease, so two schedulers — or a slow run
+   * overlapping the next tick — can never both page the provider and both
+   * advance the cursor.
+   *
+   * Optional so the pure-domain tests can drive `runReconciliation` with a
+   * minimal fake; production ALWAYS supplies it. When absent, reconciliation
+   * runs unguarded exactly as it did before, which is only safe because
+   * nothing scheduled it.
+   */
+  beginRun?(input: { checkpointKey: string; owner: string; leaseSeconds: number }): Promise<{
+    status: 'ok' | 'locked' | string;
+    checkpoint?: SyncCheckpoint | null;
+    noProgressRuns?: number;
+  }>;
+
+  /**
+   * Release the single-flight lease. `advanced=false` increments the durable
+   * consecutive-no-progress counter so a stream that can never drain (e.g. a
+   * full resync permanently larger than `item_cap`) becomes observable instead
+   * of silently replaying the same prefix forever.
+   */
+  endRun?(input: { checkpointKey: string; owner: string; advanced: boolean }): Promise<{
+    status: string;
+    noProgressRuns: number;
+  }>;
 }

@@ -1,6 +1,8 @@
 import { supabase } from '../lib/supabase.js';
 import { runClaudeJSONWithProvenance } from '../lib/claude.js';
 import { env } from '../lib/env.js';
+import { observeAshbyCompletion } from '../integrations/ashby/completion-observer.js';
+import { createAshbyLinkLookup, createWorkflowStores } from '../integrations/ashby/workflow-stores.js';
 import { buildAssessmentPrompt, formatResumeFacts } from '../lib/prompts.js';
 import { insertNotificationIntent } from '../lib/notification-intent.js';
 import type { Assessment, TranscriptTurn } from '../lib/types.js';
@@ -204,6 +206,23 @@ async function runAssessmentImpl(sessionId: string): Promise<Assessment & { id: 
     .update({ terminal_reason: 'assessment_done' })
     .eq('id', sessionId)
     .eq('terminal_reason', 'conversation_complete');
+
+  // ── Ashby completion observer ─────────────────────────────────────────
+  // This is the authoritative terminal path: we only reach here after the
+  // eligibility guard above (status='completed' AND terminal_reason=
+  // 'conversation_complete') and after the assessment row is durably
+  // inserted, so a failed/cancelled/expired/in-flight session can never be
+  // parked. For an Ashby-originated session the application link becomes
+  // `writeback_pending` — screened, awaiting manual publication, because no
+  // tenant-verified Ashby result sink exists. It publishes NOTHING: no
+  // scorecard write, no stage move, no auto-reject.
+  //
+  // Deliberately best-effort with respect to scoring: `observeAshbyCompletion`
+  // never throws, so a bookkeeping failure cannot discard a scored assessment.
+  await observeAshbyCompletion(sessionId, {
+    lookup: createAshbyLinkLookup(supabase as never),
+    stores: createWorkflowStores(supabase as never),
+  });
 
   return { ...assessment, id: row.id };
 }

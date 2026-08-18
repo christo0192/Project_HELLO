@@ -73,27 +73,37 @@ describe('OverviewSection', () => {
     renderOverview();
     await screen.findByText('Service state');
 
+    // Every KPI card resolves from its OWN fetch, so they settle independently.
+    // Asserting the remaining cards synchronously after only the first has
+    // settled is a mount-effect race — the same class as the SessionDetailPage
+    // (#55) and MissionControlPage (#59) repairs. Under a loaded parallel run
+    // the default 1s waitFor budget also expires before the first card paints,
+    // so the whole group is settled together with an explicit budget.
+    const KPI_TIMEOUT = { timeout: 10_000 };
+
     const sessionsCard = screen
       .getAllByText('Sessions')
       .find((el) => el.tagName === 'P')!
       .closest('.shadow-card') as HTMLElement;
     await waitFor(() => {
       expect(within(sessionsCard).getByText('3')).toBeInTheDocument();
-    });
+    }, KPI_TIMEOUT);
 
-    const activeCard = screen.getByText('Active sessions').closest('.shadow-card') as HTMLElement;
-    expect(within(activeCard).getByText('1')).toBeInTheDocument();
+    await waitFor(() => {
+      const activeCard = screen.getByText('Active sessions').closest('.shadow-card') as HTMLElement;
+      expect(within(activeCard).getByText('1')).toBeInTheDocument();
 
-    const linkedCard = screen.getByText('Linked access').closest('.shadow-card') as HTMLElement;
-    expect(within(linkedCard).getByText('1')).toBeInTheDocument();
+      const linkedCard = screen.getByText('Linked access').closest('.shadow-card') as HTMLElement;
+      expect(within(linkedCard).getByText('1')).toBeInTheDocument();
 
-    const quotaCard = screen.getByText('Quota policies enabled').closest('.shadow-card') as HTMLElement;
-    expect(within(quotaCard).getByText('1')).toBeInTheDocument();
+      const quotaCard = screen.getByText('Quota policies enabled').closest('.shadow-card') as HTMLElement;
+      expect(within(quotaCard).getByText('1')).toBeInTheDocument();
 
-    // Audit: 2 events in the last 24h within the 50-row page (a3 is old).
-    const auditCard = screen.getByText('Audit events · 24h').closest('.shadow-card') as HTMLElement;
-    expect(within(auditCard).getByText('2')).toBeInTheDocument();
-    expect(within(auditCard).getByText('within the 50 most recent events')).toBeInTheDocument();
+      // Audit: 2 events in the last 24h within the 50-row page (a3 is old).
+      const auditCard = screen.getByText('Audit events · 24h').closest('.shadow-card') as HTMLElement;
+      expect(within(auditCard).getByText('2')).toBeInTheDocument();
+      expect(within(auditCard).getByText('within the 50 most recent events')).toBeInTheDocument();
+    }, KPI_TIMEOUT);
   });
 
   it('renders the maintenance state from /api/status', async () => {

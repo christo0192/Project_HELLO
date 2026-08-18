@@ -272,7 +272,7 @@ describe('input validation', () => {
   it('rejects empty / control-char / oversized ids without hitting the network', async () => {
     const { client, count } = makeClient([ok({})]);
     await expect(client.applicationInfo('')).rejects.toMatchObject({ category: 'invalid_request' });
-    await expect(client.applicationInfo('ab')).rejects.toMatchObject({ code: 'id_control_char' });
+    await expect(client.applicationInfo('a\u0001b')).rejects.toMatchObject({ code: 'id_control_char' });
     await expect(client.applicationInfo('a'.repeat(300))).rejects.toMatchObject({ code: 'id_too_long' });
     expect(count()).toBe(0);
   });

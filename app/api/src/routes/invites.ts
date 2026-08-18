@@ -19,8 +19,11 @@
  */
 
 import { Router, Request, Response, NextFunction } from 'express';
-import { randomBytes, createHash, timingSafeEqual } from 'node:crypto';
 import { supabase } from '../lib/supabase.js';
+import {
+  generateInviteToken as mintInviteToken,
+  hashInviteToken,
+} from '../lib/invite-token.js';
 import { env } from '../lib/env.js';
 import { validateBody } from '../lib/validation.js';
 import {
@@ -45,14 +48,11 @@ function requireLiveKit() {
 }
 
 // ── Token helpers ────────────────────────────────────────────────────
+// Single implementation, shared with the Ashby runtime materializer — see
+// lib/invite-token.ts. Do not re-implement invite crypto here.
 
-function generateInviteToken(): string {
-  return randomBytes(32).toString('hex');
-}
-
-function hashToken(token: string): string {
-  return createHash('sha256').update(token, 'utf-8').digest('hex');
-}
+const generateInviteToken = mintInviteToken;
+const hashToken = hashInviteToken;
 
 const STABLE_EXPIRY_MSG = 'invite_token_invalid_or_expired';
 
