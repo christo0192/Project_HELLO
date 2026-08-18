@@ -82,6 +82,49 @@ export interface SyncCheckpoint {
    * cleared by that run's own completion.
    */
   resyncEpoch?: number;
+  /**
+   * PAGE ANCHOR for an in-flight FULL resync (0034): the opaque provider page
+   * cursor the next run resumes from, or null when no continuation is in
+   * flight (start at page 1). Written only after every item on the preceding
+   * page was durably handled, so resuming can never skip an application.
+   * Opaque like `syncToken` — never log it, never return it to a browser.
+   */
+  resyncCursor?: string | null;
+  /**
+   * The `resyncEpoch` the anchor was written under. An anchor from an older
+   * epoch was scanned against a STALE admission index — the mapping enabled
+   * since then admits rows that prefix skipped — so it must not be resumed.
+   */
+  resyncCursorEpoch?: number | null;
+  /**
+   * When the anchor was last written (ISO). Provider cursor lifetime is not a
+   * documented guarantee, so an anchor older than the caller's freshness bound
+   * is discarded and the sweep restarts rather than replaying a dead cursor.
+   */
+  resyncCursorAt?: string | null;
+  /** Which sweep the anchor belongs to. A full anchor is invalid incrementally. */
+  sweepMode?: 'full' | 'incremental' | null;
+  /** Pages fully handled so far in the current continuation, across its runs. */
+  resyncPagesDone?: number;
+  /** Applications fully handled so far in the current continuation. */
+  resyncItemsDone?: number;
+  /** How many times a sweep was abandoned and restarted from page 1. */
+  sweepRestarts?: number;
+  /**
+   * Signal jobs the CURRENT sweep has created, across all of its runs. The
+   * per-run breaker bounds one pass; page-aligning it and sweeping every few
+   * seconds turned that into a rate, so this is the figure that actually
+   * bounds blast radius.
+   */
+  sweepEnqueued?: number;
+  /**
+   * Set when reconciliation HALTED itself on this stream (per-sweep enqueue or
+   * restart budget exhausted). While set, a run must return before any
+   * provider call. Cleared only by a forced resync — an operator action.
+   */
+  sweepHaltedAt?: string | null;
+  /** Sanitized code for why the sweep halted. Never an id or a message. */
+  sweepHaltReason?: string | null;
 }
 
 /** Durable checkpoint store for incremental reconciliation. */
@@ -101,9 +144,92 @@ export interface CheckpointStore {
      * `full_resync_required` flag is PRESERVED (see 0033).
      */
     resyncEpoch?: number | null;
+    /**
+     * The lease owner asserted by the store's compare-and-set (0034). A run
+     * whose lease expired must not install a token over the sweep another
+     * runner is now performing — doing so would strand that runner's
+     * continuation behind a fresh incremental token and silently skip its
+     * unread pages. Omitted ⇒ no lease assertion (pre-0034 behaviour).
+     */
+    owner?: string;
   }): Promise<void>;
-  /** Force a safe full resync (null the token, flag the stream). */
+  /**
+   * Force a safe full resync (null the token, flag the stream). Also bumps
+   * `resyncEpoch` and INVALIDATES any in-flight page-anchored continuation,
+   * so the new generation sweeps from page 1 (0034).
+   */
   requireFullResync(checkpointKey: string, reason: string): Promise<void>;
+
+  /**
+   * Persist the durable PAGE ANCHOR of an in-flight full resync (0034), so
+   * the next run resumes there instead of page 1 — the only thing that lets a
+   * corpus larger than one run's page/item bound ever finish sweeping.
+   *
+   * The caller invokes this ONLY after every item on the page preceding
+   * `cursor` has been durably handled. The store compare-and-sets BOTH the
+   * observed `resyncEpoch` and the live single-flight lease owner and writes
+   * nothing on a mismatch, returning a sanitized status — so a stale run can
+   * neither resurrect an anchor a forced resync just invalidated nor move an
+   * anchor a different runner now owns. Any non-`ok` status makes the caller
+   * fail closed (stop the run, advance nothing).
+   *
+   * Optional so the pure-domain tests can drive `runReconciliation` with a
+   * minimal fake; production ALWAYS supplies it. When absent, a full resync
+   * behaves exactly as it did pre-0034 (no continuation, one-run-or-nothing).
+   */
+  saveResyncCursor?(input: {
+    checkpointKey: string;
+    /** Opaque provider page cursor. Never logged. */
+    cursor: string;
+    /** Lease owner asserted by the compare-and-set. Never a secret. */
+    owner: string;
+    /** Pages fully handled across the whole continuation so far. */
+    pagesDone: number;
+    /** Applications fully handled across the whole continuation so far. */
+    itemsDone: number;
+    /** The epoch observed before paging; a mismatch refuses the write. */
+    resyncEpoch: number | null;
+    /** Which sweep this anchor belongs to, so a resume can mode-check it. */
+    mode: 'full' | 'incremental';
+    /**
+     * The opaque sync token observed so far in THIS sweep, if any. Banked
+     * first-write-wins: installing the EARLIEST token anchors "changes since"
+     * at the sweep's start, which can only re-deliver (idempotent), where the
+     * latest would permanently hide changes that landed on scanned pages.
+     */
+    sweepToken?: string | null;
+    /**
+     * True for the first anchor of a NEW sweep: resets the sweep's counters and
+     * banked token, and counts a restart if an anchor was still standing.
+     */
+    first?: boolean;
+    /** Jobs this sweep has created so far, across runs (monotonic). */
+    enqueued?: number;
+  }): Promise<{ status: 'ok' | string }>;
+
+  /**
+   * HALT reconciliation on this stream until an operator clears it. Called
+   * when a sweep exhausts its ABSOLUTE per-sweep enqueue budget or its restart
+   * budget.
+   *
+   * This is the compensating control for page-aligning the enqueue breaker.
+   * Page alignment converts the breaker from a wedge into a rate limit, and
+   * the sweep cadence multiplies that rate; without a sweep-level stop, a
+   * runaway admission bug would create `maxEnqueuePerRun` jobs every few
+   * seconds indefinitely instead of wedging after one run. Halting restores
+   * the wedge at sweep granularity — and reconciliation stopping is the
+   * conservative failure, since webhook delivery is unaffected.
+   *
+   * Optional for the same reason as `beginRun`: the pure-domain fakes may omit
+   * it. When absent the caller still stops the run and refuses to anchor, so
+   * the budget is never silently ignored — it just is not durable.
+   */
+  haltSweep?(input: {
+    checkpointKey: string;
+    owner: string;
+    /** Sanitized code. Never an id, token, or message. */
+    reason: string;
+  }): Promise<{ status: 'ok' | string }>;
 
   /**
    * Acquire the SINGLE-FLIGHT lease for a stream (0032). Returns `locked` when

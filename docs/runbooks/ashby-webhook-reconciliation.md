@@ -278,9 +278,19 @@ number during re-activation. Discriminate before concluding anything:
 | `stop` | `enqueued` | `no_progress_runs` | Reading |
 | --- | --- | --- | --- |
 | `enqueue_cap` | **> 0** | climbing | **Healthy backlog draining.** Each pass converts 200 more parked applications into work. Expect it to end. |
-| `item_cap` / `page_cap` / `deadline` | 0 | climbing | **Stuck** — the corpus cannot drain in one run. See the corpus precondition below. |
+| `item_cap` / `page_cap` / `deadline` | 0 | **resets to 0** | **Full resync progressing across runs.** Since 0034 a bounded stop still anchors the pages it fully handled, and an anchor counts as progress. Check `reconcile.resyncItemsDone` is climbing pass over pass. |
+| `item_cap` / `page_cap` / `deadline` | 0 | climbing | **Stuck** — the run is ending without anchoring anything. See "durable page continuation" below. |
+| `continuation_conflict` | any | resets or climbs | The run lost the continuation: a mapping was enabled/repointed mid-run (expected, self-heals next pass), or another runner holds the lease. Persistent = investigate lease churn. |
 | `unclassified_cap` | any | climbing | **Provider schema drift.** Investigate the list shape; it will not self-heal. |
 | `drained` | any | resets to 0 | Normal. |
+
+> **`no_progress_runs` changed meaning in 0034.** Any durable page anchor now
+> counts as progress and resets the counter, so a sweep that anchors forever
+> without ever draining keeps `no_progress_runs: 0`. It is no longer the
+> backstop for "this stream can never finish" — `sweep_budget` (5,000 pages),
+> the per-sweep enqueue budget, and the restart budget are. Read
+> `resyncItemsDone` and `restartReason`, not this counter, when judging whether
+> a sweep is healthy.
 
 The fast confirmation is that work is actually moving: `enqueued > 0` on the
 health `reconcile` object, or a shrinking `pending` count for `ashby.signal` in
@@ -297,7 +307,11 @@ receipts, making every affected candidate permanently unrecoverable (B2).
 
 **This procedure is documented, not executed, and contains no tenant ids.** Run
 it manually as `service_role`. **Precondition:** `ASHBY_RUNTIME_ENABLED` is
-false fleet-wide, with no live scheduler and no lease holder.
+false fleet-wide, with no live scheduler, no lease holder, **and no in-flight
+sweep** (`resync_cursor IS NULL`). The cleanup ends in
+`mark_ashby_sync_full_resync`, which invalidates any page anchor — running it
+against a live sweep would silently discard that sweep's durable progress and
+restart a ~119,000-application backfill from page 1.
 
 #### 1. Diagnose first (read-only)
 
@@ -307,7 +321,11 @@ false fleet-wide, with no live scheduler and no lease holder.
 select checkpoint_key, status, (sync_token is not null) as has_token,
        token_issued_at, last_success_at, last_full_sync_at,
        pages_last_run, items_last_run, no_progress_runs,
-       (lease_owner is not null) as lease_held, lease_expires_at
+       (lease_owner is not null) as lease_held, lease_expires_at,
+       -- 0034: a non-null anchor means a sweep is MID-FLIGHT. Both the
+       -- cleanup and any manual mark_ashby_sync_full_resync must wait.
+       (resync_cursor is not null) as sweep_in_flight,
+       sweep_mode, resync_pages_done, resync_items_done, sweep_restarts
   from screening_v2.ashby_sync_checkpoints
  where provider = 'ashby';
 
@@ -420,34 +438,233 @@ Do **not** delete the checkpoint row to "start fresh" — that discards the
 `full_resync_required` and epoch state the repair depends on. Use
 `mark_ashby_sync_full_resync`.
 
-### Corpus-size precondition (a hard gate, check this first)
+### Corpus size: durable page continuation (0034)
 
-A forced full resync must drain in **one run** or the cursor never advances. The
-per-run bounds are `maxItems 5000`, `maxPages 50 × pageLimit 100 = 5000`, and
-`deadlineMs 60000`, and the checkpoint advances only on `stop: 'drained'`.
+**A corpus larger than one run is now supported.** This section replaces the
+former hard gate; read it before enabling a mapping on a large tenant.
 
-A tenant whose **total application corpus exceeds ~5,000** therefore ends every
-full sweep on `item_cap`/`page_cap`, never advances, never establishes an
-incremental token, and re-pages the same prefix on every tick. This is
-pre-existing, but this PR makes it *reachable by ordinary operator actions*:
-before, a full sweep happened only on 14-day token expiry; now **every mapping
-enable, resume, or AI-stage repoint forces one**.
+#### What production actually looks like (read-only probe)
 
-It fails quiet and cheap rather than loud — admission means the stuck stream
-creates no work — so reconciliation simply stops being a dropped-webhook safety
-net for that tenant. Webhook delivery is unaffected.
+Measured against the live tenant before any of this shipped:
 
-> **Gate:** before enabling any mapping on a tenant, confirm the corpus is
-> comfortably below the item/page bound. If it is not, do **not** enable —
-> land page-anchored partial checkpointing first.
+| Fact | Value | Consequence |
+| --- | --- | --- |
+| Page size | ~100 per page, **even when 500 was requested** | `pageLimit` is a hint. Do not size a sweep assuming 500. |
+| Corpus | **had not drained after 1,200 pages / 118,909 items** | Raising the one-run cap is **not** sufficient. Multi-run sweeps are the only viable shape. |
+| `syncToken` | **absent on every one of the first 1,200 pages** | Final-page-only issuance is likely; a sweep can legitimately drain with no token to install. |
+| Cursor lifetime | a `nextCursor` **resumed successfully from a different process after 120 s** (HTTP 200, 100 items, a further cursor) | Page-anchored resume is viable — this is the fact the whole design depends on. |
 
-Measure it from the provider side (the count of applications `application.list`
-would page, not the count of rows we hold — we hold none before activation).
-After a first pass, the same fact is readable from the health surface:
-`reconcile.observed` at or above 5000 with `advanced: false` and a `stop` of
-`item_cap`/`page_cap` **is** the stuck state.
+Two operational consequences follow directly:
 
-The observed canary corpus was ~2,000, comfortably under the bound.
+- **Budget the backfill.** ~119,000 applications at the default bounds is ~24
+  runs. On the rest cadence (15 min) that is a day; on the sweep cadence
+  (`ASHBY_RECONCILE_SWEEP_INTERVAL_MS`, default 10 s) it is **minutes to about
+  half an hour**. The loop switches to the sweep cadence automatically while an
+  anchor is pending. The spread is real and worth expecting: a pass that
+  admitted work returns "did work" and keeps the 5–10 s cadence, but a pass
+  over a corpus where nothing is admitted (the paused-mapping state the tenant
+  was left in) counts as idle, and the scheduler's idle backoff walks the
+  interval up toward its 60 s ceiling — roughly 6× the optimistic figure.
+- **Expect no incremental token.** If the provider issues one only at true
+  end-of-stream, `reconcile.tokenInstalled` will be `false` after a sweep that
+  drained, and the next pass is another full sweep. That is a provider fact,
+  not a bug — raise `ASHBY_RECONCILE_INTERVAL_MS` for that tenant if the
+  repeated full sweep costs too much.
+
+#### What used to happen (the production stall)
+
+A forced full resync had to drain in **one run** or the cursor never advanced.
+The per-run bounds are `maxItems 5000`, `maxPages 50 × pageLimit 100 = 5000`,
+and `deadlineMs 60000`, and the checkpoint advanced only on `stop: 'drained'`.
+
+A tenant whose corpus exceeded ~5,000 therefore ended every full sweep on
+`item_cap`/`page_cap`, advanced nothing, and re-paged the same 5,000-row prefix
+on every tick. It failed quiet and cheap — admission meant the stuck stream
+created no work — so reconciliation simply stopped being a dropped-webhook
+safety net for that tenant, permanently. This was observed in production: with
+the mapping paused and the backlog cleaned, repeated full resyncs stopped on
+`page_cap` at 50×100 and the checkpoint stayed `full_resync_required`.
+
+#### What happens now
+
+A full resync persists the opaque provider **page cursor** after every page
+whose every item was durably handled, and the next run resumes from it:
+
+```
+handle every item on page N  ->  commit  ->  anchor page N+1's cursor
+```
+
+That ordering is the whole safety argument. A crash **before** the anchor
+replays page N, which is dedup-safe (the receipt/outbox converges and creates
+no duplicate work); a crash **after** it resumes at page N+1, whose predecessor
+is fully handled. A page cut short mid-way (item bound, enqueue breaker, drift
+abort) is never anchored, so it replays whole. There is no ordering in which an
+application is skipped.
+
+A 12,000-application corpus therefore completes in three or four bounded runs
+instead of never. The final drained page installs the sync token and clears the
+continuation in one atomic statement, so the stream lands on a real incremental
+baseline.
+
+**Invalidation.** Enabling, resuming, or repointing a mapping — and any other
+`mark_ashby_sync_full_resync` — nulls the anchor and bumps `resync_epoch` in
+the same transaction. Every anchor write compare-and-sets that epoch *and* the
+live single-flight lease owner, so a run already paging under the old epoch, or
+one whose lease expired, fails closed with `stop: 'continuation_conflict'` and
+advances nothing. The new generation sweeps from page 1.
+
+An anchor is resumed only when **all four** bindings hold — current epoch, same
+sweep mode, and younger than the freshness bound (6 h). Any failure restarts at
+page 1 with a sanitized `reconcile.restartReason` (`epoch_moved`,
+`mode_changed`, `anchor_stale`, `anchor_disabled`) and increments
+`sweep_restarts`. **A `restartReason` other than `none` on every pass means
+resume is not holding and the sweep will never finish** — that is the single
+most important thing to watch during a backfill.
+
+**Bounds on the sweep itself.** `maxPages` bounds one run; `sweepMaxPages`
+(5,000) bounds the whole sweep across runs, so a cursor chain that never
+terminates is abandoned with `stop: 'sweep_budget'` rather than paged forever.
+A resumed cursor that hands itself straight back is caught as
+`stop: 'cursor_invalid'`. Both drop the anchor and force a clean resync.
+
+**Token semantics.** The sync token is installed **earliest-wins**: the first
+token seen in a sweep, not the last. Anchoring "changes since" at the *end* of
+a multi-run sweep would permanently hide every change that landed on an
+already-scanned page while the sweep ran; the earliest token can only
+re-deliver, which is idempotent.
+
+**Breaker weakening, stated precisely — read this before sizing blast radius.**
+The enqueue circuit breaker is now evaluated at the page boundary rather than
+per item, so a page is always fully decided and therefore anchorable. Two
+things change together, and the second is the one that matters:
+
+1. `ASHBY_RECONCILE_MAX_ENQUEUE` overshoots by at most one page — at the
+   default bounds, 200 becomes **at most 300 jobs per pass**.
+2. **A pass now fires every 5–10 s while a sweep is in flight** (the sweep
+   cadence, with the scheduler's jitter), not once per 15 minutes.
+
+So the per-run breaker is **no longer a wedge — it is a rate limit**, and the
+guarded rate moves from ~200 jobs / 15 min to ≤300 jobs / 5–10 s. **Do not size
+blast radius from `ASHBY_RECONCILE_MAX_ENQUEUE`.** The bound that actually
+limits damage is the per-sweep budget below, and the lever for *slowing* a
+backfill is `ASHBY_RECONCILE_SWEEP_INTERVAL_MS`, not the per-run breaker.
+
+**The per-sweep ceiling (this is the real guard).** `sweep_enqueued`
+accumulates every job a sweep creates across **all** of its runs and is
+persisted with the anchor. Exceeding `ASHBY_RECONCILE_SWEEP_MAX_ENQUEUE`
+(default **2,000**) **HALTS** reconciliation on that stream: every subsequent
+run returns before making a single provider call, `stop: 'halted'`, until an
+operator clears it. That restores the wedge at sweep granularity.
+
+The default is deliberately conservative — the PR64 incident created exactly
+2,000 jobs, so this budget would have caught it. With admission in place a
+legitimate sweep enqueues a small fraction of the corpus, so it should never be
+reached; a genuinely large first enable that trips it is raised deliberately,
+by an operator, with the corpus in front of them.
+
+**Clearing a halt** is `mark_ashby_sync_full_resync` — which is also what
+enabling, resuming, or repointing a mapping performs. Investigate *before*
+clearing: a halt means durable work was created faster than expected, which is
+exactly the shape of the incident this subsystem exists to prevent.
+
+```sql
+-- Why is it halted, and how much work did the sweep create?
+select sweep_halt_reason, sweep_halted_at, sweep_enqueued,
+       resync_pages_done, resync_items_done, sweep_restarts
+  from screening_v2.ashby_sync_checkpoints where provider = 'ashby';
+```
+
+**Restart budget.** A sweep that restarts from page 1 more than
+`ASHBY_RECONCILE_SWEEP_MAX_RESTARTS` times (default 5) also halts: a resume
+that never holds would otherwise re-page the whole corpus forever.
+
+`sweep_restarts` counts **consecutive** restarts — since the last successful
+drain or the last forced resync — **not** a lifetime total. Both a drained
+sweep and `mark_ashby_sync_full_resync` reset it to 0. That matters: gating a
+budget on a lifetime counter would make it a one-way latch, so the stream would
+reach the threshold once and then halt on the first failed binding forever,
+and the documented clear above would be cosmetic.
+
+**If a restart-budget halt recurs, do not just keep clearing it.** Repeated
+`anchor_stale` restarts mean anchors are expiring between runs, which is the
+normal outcome of enabling the runtime only for bounded windows shorter than
+the sweep. The fix is one of:
+
+- raise `ASHBY_RECONCILE_ANCHOR_MAX_AGE_MS` so an anchor survives the gap
+  between sessions (the cursor itself was observed still valid across
+  processes), or
+- run a long enough window for the sweep to drain, or
+- lower `ASHBY_RECONCILE_SWEEP_INTERVAL_MS` so the sweep completes sooner.
+
+Clearing without changing one of those returns you to the same halt.
+
+**Kill switch.** `ASHBY_RECONCILE_ANCHOR_DISABLED=true` skips every anchor read
+and write, reverting exactly to the pre-0034 all-or-nothing sweep. Safe by
+construction: not advancing is the conservative failure.
+
+#### Tuning knobs (no deploy required)
+
+| Env var | Default | Use |
+| --- | --- | --- |
+| `ASHBY_RECONCILE_INTERVAL_MS` | 900000 | Cadence at rest. |
+| `ASHBY_RECONCILE_SWEEP_INTERVAL_MS` | 10000 | Cadence **while a sweep is in flight**. Lower = faster backfill and fresher anchors. |
+| `ASHBY_RECONCILE_MAX_PAGES` | 50 | Pages per run. |
+| `ASHBY_RECONCILE_MAX_ITEMS` | 5000 | Applications per run. |
+| `ASHBY_RECONCILE_PAGE_LIMIT` | 100 | Page-size **hint** — the provider ignored 500. |
+| `ASHBY_RECONCILE_DEADLINE_MS` | 60000 | Wall clock per run. |
+| `ASHBY_RECONCILE_MAX_ENQUEUE` | 200 | Per-**run** breaker. Page-aligned, so it is a **rate**, not a ceiling — see above. Not the blast-radius bound. |
+| `ASHBY_RECONCILE_SWEEP_MAX_ENQUEUE` | 2000 | **The blast-radius bound.** Absolute jobs one sweep may create across all runs; exceeding it HALTS the stream. |
+| `ASHBY_RECONCILE_SWEEP_MAX_PAGES` | 5000 | Pages one sweep may consume (~500k applications). |
+| `ASHBY_RECONCILE_SWEEP_MAX_RESTARTS` | 5 | Restarts before halting. |
+| `ASHBY_RECONCILE_ANCHOR_MAX_AGE_MS` | 21600000 | Anchor freshness (6 h). |
+| `ASHBY_RECONCILE_ANCHOR_DISABLED` | false | Kill switch. |
+
+#### The operational gate
+
+Enabling a mapping on a large tenant is now safe, but the sweep is not
+instantaneous — it takes roughly `corpus / 5000` reconcile intervals to reach a
+steady incremental state. Confirm it is *progressing*, not stuck:
+
+```bash
+curl -sS -H "Authorization: Bearer $TOKEN"   "$API/api/integrations/ashby/mission-control/health" | jq '{stop: .reconcile.stop, resumed: .reconcile.resumed,
+       pending: .reconcile.continuationPending,
+       anchors: .reconcile.pageAnchors,
+       itemsDone: .reconcile.resyncItemsDone,
+       restartReason: .reconcile.restartReason,
+       restarts: .reconcile.sweepRestarts,
+       sweepEnqueued: .reconcile.sweepEnqueued,
+       halted: .reconcile.halted,
+       tokenInstalled: .reconcile.tokenInstalled,
+       noProgress: .backlog.reconcileNoProgressRuns}'
+```
+
+Read it as:
+
+| Reading | Meaning |
+| --- | --- |
+| `resyncItemsDone` climbing pass over pass, `noProgress: 0` | **Progressing.** Wait for it; nothing to do. |
+| `restartReason` != `none` on every pass, `sweepRestarts` climbing | **Resume is not holding.** The sweep restarts from page 1 forever. Investigate before anything else — and note `sweepRestarts` is consecutive-since-progress, so a climbing value means it is failing *now*, not historically. |
+| `stop: "sweep_budget"` or `"cursor_invalid"` | **Sweep abandoned.** The cursor chain did not terminate or was unusable. Reconciliation is not covering this tenant. |
+| `stop: "halted"`, `halted: true` | **Reconciliation has stopped itself** on the per-sweep enqueue or restart budget. No provider calls at all until an operator forces a resync. Investigate `sweep_enqueued` before clearing. |
+| `sweepEnqueued` climbing while `resyncPagesDone` is flat | **Admission bug signature** — durable work being created without the sweep advancing. This is what the per-sweep budget is watching for. |
+| `stop: "drained"`, `tokenInstalled: false` | Drained with no provider token — the next pass is another full sweep. Expected at this tenant; tune the rest interval if costly. |
+| `pending: true`, `itemsDone` **flat** across two passes | **Stuck.** The run is not anchoring. Check `stop`. |
+| `stop: "continuation_conflict"` once | A mapping was enabled/repointed mid-run. Self-heals on the next pass. |
+| `stop: "continuation_conflict"` every pass | Lease churn or repeated forced resyncs — investigate before enabling more mappings. |
+| `stop: "drained"`, `pending: false` | Done. The stream is on an incremental token. |
+
+The health surface exposes **booleans and bounded counts only** — the page
+cursor, like the sync token, never leaves the service-role boundary.
+
+> **Gate:** enabling is permitted at any corpus size. Confirm one full
+> reconcile cycle shows `resyncItemsDone` climbing before enabling a second
+> mapping, so a stalled sweep is caught with one mapping in play rather than
+> several.
+
+Measure expected duration from the provider side (the count of applications
+`application.list` would page, not the count of rows we hold — we hold none
+before activation). The observed canary corpus was ~2,000, which completes in a
+single run.
 
 ### Re-activation sequence
 
@@ -457,9 +674,10 @@ executable as written — each names the exact surface it is read from.
 1. Confirm `ASHBY_RUNTIME_ENABLED=false` fleet-wide and no lease holder (§1a).
 2. Deploy this code with the flag still false — `createAshbyRuntime` returns
    null, so it is a genuine no-op deploy.
-3. Apply migration 0033 (verified against a real Docker `0001→0033` run).
+3. Apply migrations 0033 and 0034 (verified against a real Docker `0001→0034` run).
 4. Execute the cleanup and verify it.
-5. Confirm the **corpus precondition** above.
+5. Read the **corpus / durable page continuation** section above and note the
+   expected number of reconcile cycles for this tenant's corpus.
 6. Keep **every mapping paused**. Enable the runtime on **one** machine with a
    conservative `ASHBY_RECONCILE_INTERVAL_MS`.
 7. Observe one full reconcile cycle, then read the gate from Mission Control:

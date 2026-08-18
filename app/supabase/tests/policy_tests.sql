@@ -5429,6 +5429,408 @@ end;
 $$;
 
 -- ═══════════════════════════════════════════════════════════════════════
+-- 0034 — page-anchored full-resync continuation
+-- ═══════════════════════════════════════════════════════════════════════
+-- The production stall this closes: a forced full resync had to drain in ONE
+-- run or the cursor never moved, so a corpus above the per-run page/item bound
+-- re-paged the same prefix forever and reconciliation never came up. These
+-- tests pin the two compare-and-sets that make partial checkpointing safe
+-- (resync_epoch, live lease owner) and the atomic finish.
+
+select _policy_tests.assert(
+  'ashby 0034 RPCs are service-role only',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname in ('save_ashby_resync_cursor','advance_ashby_sync_checkpoint',
+                        'mark_ashby_sync_full_resync','begin_ashby_sync_run',
+                        'halt_ashby_sync_sweep')
+      and not has_function_privilege('anon', p.oid, 'EXECUTE')
+      and not has_function_privilege('authenticated', p.oid, 'EXECUTE')
+      and has_function_privilege('service_role', p.oid, 'EXECUTE')
+  ) = 5,
+  'ashby 0034 RPCs must be service-role only'
+);
+
+select _policy_tests.assert(
+  'ashby 0034 RPCs pin search_path',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname in ('save_ashby_resync_cursor','advance_ashby_sync_checkpoint',
+                        'mark_ashby_sync_full_resync','begin_ashby_sync_run',
+                        'halt_ashby_sync_sweep')
+      and p.prosecdef
+      and array_to_string(coalesce(p.proconfig, '{}'), ',') like '%search_path%'
+  ) = 5,
+  'every 0034 SECURITY DEFINER RPC must pin search_path'
+);
+
+select _policy_tests.assert(
+  'ashby 0034: exactly one save_ashby_resync_cursor overload exists',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname = 'save_ashby_resync_cursor') = 1,
+  'a second overload could bypass the epoch/lease guards'
+);
+
+-- N1: the superseded save signatures are explicitly dropped, so an environment
+-- that ever saw an in-progress form cannot end up with ambiguous dispatch.
+select _policy_tests.assert(
+  'ashby 0034/N1: no superseded save_ashby_resync_cursor overload survives',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname = 'save_ashby_resync_cursor'
+      and p.pronargs <> 11) = 0,
+  'only the 11-argument save_ashby_resync_cursor may exist'
+);
+
+-- The superseded 7-argument advance overload must be gone: leaving it callable
+-- would let a stale runner advance while bypassing the lease guard entirely.
+select _policy_tests.assert(
+  'ashby 0034: exactly one advance_ashby_sync_checkpoint overload remains',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname = 'advance_ashby_sync_checkpoint') = 1,
+  'the pre-0034 seven-argument overload must be dropped'
+);
+
+-- The continuation cursor is an opaque black box on a table that must stay
+-- entirely out of reach of the browser roles — same posture as sync_token.
+select _policy_tests.assert(
+  'ashby 0034: browser roles cannot read the continuation cursor',
+  not has_table_privilege('anon', 'screening_v2.ashby_sync_checkpoints', 'SELECT')
+  and not has_table_privilege('authenticated', 'screening_v2.ashby_sync_checkpoints', 'SELECT'),
+  'ashby_sync_checkpoints must remain service-role only'
+);
+
+do $$
+declare
+  v_role   uuid;
+  v_actor  uuid := gen_random_uuid();
+  v_cp     screening_v2.ashby_sync_checkpoints%rowtype;
+  v_epoch  bigint;
+  v_res    jsonb;
+  v_begin  jsonb;
+  v_map    jsonb;
+begin
+  select id into v_role from screening_v2.roles order by created_at limit 1;
+  if v_role is null then
+    perform _policy_tests.assert('ashby 0034 functional: seed role present', false, 'no seed role available');
+    return;
+  end if;
+
+  delete from screening_v2.ashby_sync_checkpoints where checkpoint_key = 'application.list';
+
+  -- (a) A forced resync starts a generation with NO continuation.
+  v_res := screening_v2.mark_ashby_sync_full_resync('application.list', 'pol34_start');
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0034: a forced resync leaves no page anchor',
+    v_cp.status = 'full_resync_required' and v_cp.resync_cursor is null
+      and v_cp.resync_pages_done = 0 and v_cp.resync_items_done = 0,
+    'expected a clean continuation, got cursor ' || coalesce(v_cp.resync_cursor, '<null>'));
+  v_epoch := v_cp.resync_epoch;
+
+  -- (b) An anchor written WITHOUT the lease is refused. This is the guard that
+  --     stops a runner whose lease expired from moving another runner's cursor.
+  v_res := screening_v2.save_ashby_resync_cursor(
+    'application.list', 'cur-100', 'runner-a', 1, 100, v_epoch, now(), 'full');
+  perform _policy_tests.assert('ashby 0034: an unleased anchor write is refused',
+    v_res->>'status' = 'lease_expired',
+    'got ' || coalesce(v_res->>'status', '<null>'));
+
+  -- (c) With the lease held, the anchor lands and the counters move forward.
+  v_begin := screening_v2.begin_ashby_sync_run('application.list', 'runner-a', 300);
+  perform _policy_tests.assert('ashby 0034: begin_ashby_sync_run exposes the continuation',
+    v_begin->>'status' = 'ok' and v_begin->>'resync_cursor' is null
+      and (v_begin->>'resync_pages_done')::integer = 0,
+    'got ' || coalesce(v_begin::text, '<null>'));
+
+  v_res := screening_v2.save_ashby_resync_cursor(
+    'application.list', 'cur-100', 'runner-a', 1, 100, v_epoch, now(), 'full', 'tok-sweep-1', true);
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0034: the leased anchor is persisted',
+    v_res->>'status' = 'ok' and v_cp.resync_cursor = 'cur-100'
+      and v_cp.resync_pages_done = 1 and v_cp.resync_items_done = 100
+      and v_cp.resync_started_at is not null
+      and v_cp.resync_cursor_epoch = v_epoch
+      and v_cp.resync_cursor_at is not null
+      and v_cp.sweep_mode = 'full'
+      and v_cp.sweep_token = 'tok-sweep-1',
+    'got cursor ' || coalesce(v_cp.resync_cursor, '<null>'));
+
+  -- I7: an anchor write touches NO stream-level field. A pending forced
+  -- resync must survive every anchor write untouched.
+  perform _policy_tests.assert('ashby 0034: anchoring never rewrites stream state',
+    v_cp.status = 'full_resync_required' and v_cp.sync_token is null
+      and v_cp.full_resync_reason = 'pol34_start' and v_cp.no_progress_runs = 0,
+    'anchoring altered stream state: status ' || v_cp.status);
+
+  -- H-6: the sweep token is FIRST-write-wins across the sweep.
+  v_res := screening_v2.save_ashby_resync_cursor(
+    'application.list', 'cur-150', 'runner-a', 2, 150, v_epoch, now(), 'full', 'tok-sweep-2');
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0034: the sweep token is earliest-wins',
+    v_cp.sweep_token = 'tok-sweep-1',
+    'expected the earliest token, got ' || coalesce(v_cp.sweep_token, '<null>'));
+
+  -- An invalid sweep mode is refused rather than silently stored.
+  v_res := screening_v2.save_ashby_resync_cursor(
+    'application.list', 'cur-160', 'runner-a', 2, 160, v_epoch, now(), 'sideways');
+  perform _policy_tests.assert('ashby 0034: an invalid sweep mode is refused',
+    v_res->>'status' = 'invalid_mode',
+    'got ' || coalesce(v_res->>'status', '<null>'));
+
+  -- (d) A DIFFERENT runner cannot move it, even holding the right epoch.
+  v_res := screening_v2.save_ashby_resync_cursor(
+    'application.list', 'cur-999', 'runner-b', 9, 900, v_epoch, now(), 'full');
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0034: a non-owner cannot move the anchor',
+    v_res->>'status' = 'not_owned' and v_cp.resync_cursor = 'cur-150',
+    'got ' || coalesce(v_res->>'status', '<null>'));
+
+  -- (e) Counters never move backwards.
+  v_res := screening_v2.save_ashby_resync_cursor(
+    'application.list', 'cur-200', 'runner-a', 0, 0, v_epoch, now(), 'full');
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0034: continuation counters only move forward',
+    v_res->>'status' = 'ok' and v_cp.resync_cursor = 'cur-200'
+      and v_cp.resync_pages_done = 2 and v_cp.resync_items_done = 150,
+    'counters regressed to ' || v_cp.resync_pages_done || '/' || v_cp.resync_items_done);
+
+  -- (f) An empty/null cursor is refused: it would silently mean "page 1".
+  v_res := screening_v2.save_ashby_resync_cursor(
+    'application.list', null, 'runner-a', 5, 500, v_epoch, now(), 'full');
+  perform _policy_tests.assert('ashby 0034: a null anchor is refused',
+    v_res->>'status' = 'invalid_cursor',
+    'got ' || coalesce(v_res->>'status', '<null>'));
+
+  -- (g) ENABLING A MAPPING MID-RUN invalidates the continuation, and the
+  --     in-flight run can no longer anchor into the new generation.
+  v_map := screening_v2.upsert_ashby_job_mapping(
+    null::uuid, 'pol34-job', v_role, 'pol34_ai', 'pol34_ta', null::text, null::text, null::text,
+    gen_random_uuid(), 'manual', 24, 'enabled', null::text, v_actor);
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0034: enabling a mapping invalidates the continuation',
+    v_cp.status = 'full_resync_required' and v_cp.resync_cursor is null
+      and v_cp.resync_cursor_epoch is null and v_cp.sweep_mode is null
+      and v_cp.sweep_token is null and v_cp.sweep_restarts = 0
+      and v_cp.resync_pages_done = 0 and v_cp.resync_epoch = v_epoch + 1,
+    'expected a cleared continuation at epoch ' || (v_epoch + 1)
+      || ', got cursor ' || coalesce(v_cp.resync_cursor, '<null>')
+      || ' at epoch ' || v_cp.resync_epoch);
+
+  v_res := screening_v2.save_ashby_resync_cursor(
+    'application.list', 'cur-300', 'runner-a', 3, 300, v_epoch, now(), 'full');
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0034: a stale-epoch run cannot resurrect its anchor',
+    v_res->>'status' = 'epoch_changed' and v_cp.resync_cursor is null,
+    'got ' || coalesce(v_res->>'status', '<null>'));
+
+  -- (h) That same stale run advancing must not clear the forced resync NOR
+  --     touch the newer generation's continuation.
+  v_epoch := v_cp.resync_epoch;
+  v_res := screening_v2.save_ashby_resync_cursor(
+    'application.list', 'cur-400', 'runner-a', 4, 400, v_epoch, now(), 'full', 'tok-gen2', true);
+  perform _policy_tests.assert('ashby 0034: the new generation can anchor normally',
+    v_res->>'status' = 'ok', 'got ' || coalesce(v_res->>'status', '<null>'));
+
+  v_res := screening_v2.advance_ashby_sync_checkpoint(
+    'application.list', 'tok-0034-stale', 2, 5, true, now(), v_epoch - 1);
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert(
+    'ashby 0034: a stale advance preserves the forced resync AND the newer anchor',
+    (v_res->>'resync_pending')::boolean
+      and v_cp.status = 'full_resync_required'
+      and v_cp.resync_cursor = 'cur-400'
+      and v_cp.resync_pages_done = 4,
+    'got status ' || v_cp.status || ' cursor ' || coalesce(v_cp.resync_cursor, '<null>'));
+
+  -- (i) A CURRENT-epoch drained run installs the token AND ends the
+  --     continuation atomically — no window where a stale anchor coexists
+  --     with a fresh incremental token.
+  v_res := screening_v2.advance_ashby_sync_checkpoint(
+    'application.list', 'tok-0034-final', 12, 1200, true, now(), v_cp.resync_epoch);
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert(
+    'ashby 0034: a drained run installs the EARLIEST token and ends the continuation',
+    v_cp.status = 'idle'
+      -- H-6: the token banked at the START of the sweep wins over the one the
+      -- final run observed at the END.
+      and v_cp.sync_token = 'tok-gen2'
+      and v_cp.token_issued_at is not null
+      and v_cp.resync_cursor is null and v_cp.resync_cursor_epoch is null
+      and v_cp.resync_cursor_at is null and v_cp.sweep_mode is null
+      and v_cp.sweep_token is null and v_cp.resync_pages_done = 0
+      and v_cp.resync_items_done = 0 and v_cp.resync_started_at is null,
+    'got status ' || v_cp.status || ' token ' || coalesce(v_cp.sync_token, '<null>'));
+
+  -- (j) H-5: a runner that no longer holds the lease cannot install a token
+  --     over the sweep whoever holds it is performing. Before this guard, a
+  --     stale advance left the stream idle with a valid token and the live
+  --     runner's unread pages were never swept again.
+  v_res := screening_v2.begin_ashby_sync_run('application.list', 'runner-a', 300);
+  v_res := screening_v2.save_ashby_resync_cursor(
+    'application.list', 'cur-700', 'runner-a', 7, 700, null, now(), 'full');
+  v_res := screening_v2.advance_ashby_sync_checkpoint(
+    'application.list', 'tok-0034-stale-owner', 1, 1, true, now(), null, 'runner-b');
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0034: a non-owner cannot install a sync token',
+    v_res->>'status' = 'not_owned'
+      and v_cp.sync_token is distinct from 'tok-0034-stale-owner'
+      and v_cp.resync_cursor = 'cur-700',
+    'got ' || coalesce(v_res->>'status', '<null>')
+      || ' cursor ' || coalesce(v_cp.resync_cursor, '<null>'));
+
+  -- The genuine owner still advances, and the continuation ends with it.
+  v_res := screening_v2.advance_ashby_sync_checkpoint(
+    'application.list', 'tok-0034-owned', 1, 1, true, now(), null, 'runner-a');
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0034: the lease owner advances normally',
+    v_res->>'status' = 'ok' and v_cp.sync_token = 'tok-0034-owned'
+      and v_cp.resync_cursor is null,
+    'got ' || coalesce(v_res->>'status', '<null>'));
+
+  -- (k) H-8: the per-sweep enqueue accumulator and the HALT that bounds it.
+  --     Page-aligning the per-run breaker made it a rate limit; this is the
+  --     sweep-level ceiling that restores the wedge.
+  v_res := screening_v2.save_ashby_resync_cursor(
+    'application.list', 'cur-800', 'runner-a', 8, 800, null, now(), 'full', null, false, 120);
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0034: sweep_enqueued accumulates with the anchor',
+    v_res->>'status' = 'ok' and v_cp.sweep_enqueued = 120,
+    'got sweep_enqueued ' || coalesce(v_cp.sweep_enqueued::text, '<null>'));
+
+  -- Monotonic: a lower report never walks the budget backwards.
+  v_res := screening_v2.save_ashby_resync_cursor(
+    'application.list', 'cur-810', 'runner-a', 8, 810, null, now(), 'full', null, false, 5);
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0034: sweep_enqueued only moves forward',
+    v_cp.sweep_enqueued = 120,
+    'budget regressed to ' || v_cp.sweep_enqueued);
+
+  -- A non-owner cannot halt the stream.
+  v_res := screening_v2.halt_ashby_sync_sweep(
+    'application.list', 'runner-b', 'sweep_enqueue_budget');
+  perform _policy_tests.assert('ashby 0034: a non-owner cannot halt the sweep',
+    v_res->>'status' = 'not_owned',
+    'got ' || coalesce(v_res->>'status', '<null>'));
+
+  -- The owner halts: the anchor is dropped, `status` is NOT touched (D-3), so
+  -- a pending forced-resync demand survives the halt.
+  v_res := screening_v2.halt_ashby_sync_sweep(
+    'application.list', 'runner-a', 'sweep_enqueue_budget');
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0034: halting drops the anchor and preserves status',
+    v_res->>'status' = 'ok'
+      and v_cp.sweep_halted_at is not null
+      and v_cp.sweep_halt_reason = 'sweep_enqueue_budget'
+      and v_cp.resync_cursor is null and v_cp.resync_cursor_epoch is null
+      and v_cp.status = 'idle',
+    'got halt_reason ' || coalesce(v_cp.sweep_halt_reason, '<null>')
+      || ' status ' || v_cp.status);
+
+  -- A forced resync is the operator action that clears the halt.
+  v_res := screening_v2.mark_ashby_sync_full_resync('application.list', 'pol34_clear');
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0034: a forced resync clears the halt and the budget',
+    v_cp.sweep_halted_at is null and v_cp.sweep_halt_reason is null
+      and v_cp.sweep_enqueued = 0,
+    'halt survived a forced resync');
+
+  -- B2: the restart budget must be a per-EPISODE counter, not a lifetime
+  -- latch. A lifetime counter made the documented halt-clear cosmetic: the
+  -- stream re-halted on the first failed binding after it, forever.
+  update screening_v2.ashby_sync_checkpoints
+     set sweep_restarts = 5
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  v_res := screening_v2.mark_ashby_sync_full_resync('application.list', 'pol34_b2');
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0034/B2: a forced resync clears the restart budget',
+    v_cp.sweep_restarts = 0,
+    'restart budget survived the documented clear: ' || v_cp.sweep_restarts);
+
+  -- A drained sweep proves resume works, so it clears the tally too.
+  update screening_v2.ashby_sync_checkpoints
+     set sweep_restarts = 4
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  v_begin := screening_v2.begin_ashby_sync_run('application.list', 'runner-a', 300);
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  v_res := screening_v2.advance_ashby_sync_checkpoint(
+    'application.list', 'tok-b2-drain', 1, 1, true, now(), v_cp.resync_epoch, 'runner-a');
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0034/B2: a drained sweep clears the restart budget',
+    v_res->>'status' = 'ok' and v_cp.sweep_restarts = 0 and v_cp.sweep_enqueued = 0,
+    'got restarts ' || v_cp.sweep_restarts);
+  v_res := screening_v2.end_ashby_sync_run('application.list', 'runner-a', true);
+
+  -- N2: halting requires a LIVE lease, matching save and advance.
+  v_res := screening_v2.halt_ashby_sync_sweep(
+    'application.list', 'runner-a', 'sweep_enqueue_budget');
+  perform _policy_tests.assert('ashby 0034/N2: an unleased halt is refused',
+    v_res->>'status' = 'lease_expired',
+    'got ' || coalesce(v_res->>'status', '<null>'));
+
+  -- An unsanitized halt reason is refused rather than stored.
+  v_res := screening_v2.begin_ashby_sync_run('application.list', 'runner-a', 300);
+  v_res := screening_v2.halt_ashby_sync_sweep('application.list', 'runner-a', repeat('x', 65));
+  perform _policy_tests.assert('ashby 0034: an over-long halt reason is refused',
+    v_res->>'status' = 'invalid_reason',
+    'got ' || coalesce(v_res->>'status', '<null>'));
+  v_res := screening_v2.end_ashby_sync_run('application.list', 'runner-a', false);
+  v_res := screening_v2.mark_ashby_sync_full_resync('application.list', 'pol34_reset2');
+  v_begin := screening_v2.begin_ashby_sync_run('application.list', 'runner-a', 300);
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+
+  -- (l) L2: advance requires a LIVE lease, not merely a matching owner name.
+  update screening_v2.ashby_sync_checkpoints
+     set lease_expires_at = now() - interval '1 second'
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  v_res := screening_v2.advance_ashby_sync_checkpoint(
+    'application.list', 'tok-expired', 1, 1, true, now(), null, 'runner-a');
+  perform _policy_tests.assert('ashby 0034: an EXPIRED lease cannot advance',
+    v_res->>'status' = 'lease_expired',
+    'got ' || coalesce(v_res->>'status', '<null>'));
+  update screening_v2.ashby_sync_checkpoints
+     set lease_expires_at = now() + interval '300 seconds'
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+
+  -- (m) The anchor cannot outlive its own lease: end the run, then try again.
+  v_res := screening_v2.end_ashby_sync_run('application.list', 'runner-a', true);
+  v_res := screening_v2.save_ashby_resync_cursor(
+    'application.list', 'cur-500', 'runner-a', 5, 500, v_cp.resync_epoch, now(), 'full');
+  perform _policy_tests.assert('ashby 0034: a released lease cannot anchor',
+    v_res->>'status' = 'lease_expired',
+    'got ' || coalesce(v_res->>'status', '<null>'));
+
+  delete from screening_v2.ashby_job_mappings where external_job_id = 'pol34-job';
+  delete from screening_v2.ashby_sync_checkpoints where checkpoint_key = 'application.list';
+end;
+$$;
+
+-- ═══════════════════════════════════════════════════════════════════════
 -- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)
 -- ═══════════════════════════════════════════════════════════════════════
 

@@ -32,6 +32,14 @@ import { counter, gauge } from '../../lib/metrics.js';
 export interface SchedulerLoopConfig {
   /** Base delay between ticks (ms). Already clamped by the runtime config. */
   intervalMs: number;
+  /**
+   * Optional per-tick override of the base delay. A loop whose work has two
+   * cadences — reconciliation ticks every 15 minutes at rest, but every few
+   * seconds while a multi-run page-anchored sweep is in flight — returns the
+   * one that applies right now. Values are clamped by the caller's own config
+   * bounds; a non-finite or non-positive return falls back to `intervalMs`.
+   */
+  intervalMsFor?: () => number;
   /** Run one tick. Resolves true when it did useful work (shortens backoff). */
   tick: () => Promise<boolean>;
   /** Stable loop name for metrics/health. Never a secret. */
@@ -135,7 +143,11 @@ export function createAshbyScheduler(options: AshbySchedulerOptions): AshbySched
       ? 0
       : Math.min((idle.get(loop.name) ?? 0) + 1, 10);
     idle.set(loop.name, idleCount);
-    const delay = nextPollDelayMs(loop.intervalMs, idleCount, random);
+    const dynamic = loop.intervalMsFor?.();
+    const base = typeof dynamic === 'number' && Number.isFinite(dynamic) && dynamic > 0
+      ? dynamic
+      : loop.intervalMs;
+    const delay = nextPollDelayMs(base, idleCount, random);
     schedule(loop, delay);
   }
 

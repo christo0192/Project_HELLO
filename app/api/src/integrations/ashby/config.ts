@@ -29,6 +29,21 @@ const _contractVisibleEnvReads = [
   process.env.ASHBY_RECONCILE_INTERVAL_MS,
   process.env.ASHBY_RECLAIM_INTERVAL_MS,
   process.env.ASHBY_LEASE_SECONDS,
+  // Reconciliation sweep tuning (0034). A backfill against a large corpus has
+  // to be tunable WITHOUT a deploy: production measured ~119k applications
+  // paging ~100/request regardless of the requested limit, which is 24 runs at
+  // the default bounds.
+  process.env.ASHBY_RECONCILE_SWEEP_INTERVAL_MS,
+  process.env.ASHBY_RECONCILE_MAX_PAGES,
+  process.env.ASHBY_RECONCILE_MAX_ITEMS,
+  process.env.ASHBY_RECONCILE_PAGE_LIMIT,
+  process.env.ASHBY_RECONCILE_DEADLINE_MS,
+  process.env.ASHBY_RECONCILE_MAX_ENQUEUE,
+  process.env.ASHBY_RECONCILE_ANCHOR_DISABLED,
+  process.env.ASHBY_RECONCILE_SWEEP_MAX_ENQUEUE,
+  process.env.ASHBY_RECONCILE_SWEEP_MAX_PAGES,
+  process.env.ASHBY_RECONCILE_SWEEP_MAX_RESTARTS,
+  process.env.ASHBY_RECONCILE_ANCHOR_MAX_AGE_MS,
 ];
 void _contractVisibleEnvReads;
 
@@ -109,6 +124,42 @@ export const RUNTIME_BOUNDS = {
   reconcileIntervalMs: { def: 900_000, min: 60_000, max: 86_400_000 },
   reclaimIntervalMs: { def: 60_000, min: 5_000, max: 3_600_000 },
   leaseSeconds: { def: 60, min: 5, max: 900 },
+  /**
+   * Cadence used INSTEAD of `reconcileIntervalMs` while a page-anchored sweep
+   * is in flight (0034). Two payoffs: the anchor stays seconds old rather than
+   * minutes, which is what makes resume viable if provider cursors are
+   * short-lived; and a multi-run backfill drains in minutes instead of hours.
+   * Safe at a short interval because the single-flight lease makes an
+   * overlapping tick return `locked` before any provider call.
+   */
+  reconcileSweepIntervalMs: { def: 10_000, min: 1_000, max: 60_000 },
+  /** Pages one reconciliation RUN may fetch. */
+  reconcileMaxPages: { def: 50, min: 1, max: 1_000 },
+  /** Applications one reconciliation RUN may observe. */
+  reconcileMaxItems: { def: 5_000, min: 1, max: 100_000 },
+  /**
+   * Page-size hint. Production evidence: the provider returned ~100 per page
+   * regardless of a requested 500, so treat this as a hint, never a guarantee.
+   */
+  reconcilePageLimit: { def: 100, min: 1, max: 500 },
+  /** Wall-clock budget for one reconciliation run. */
+  reconcileDeadlineMs: { def: 60_000, min: 1_000, max: 1_800_000 },
+  /** Circuit breaker: signal jobs one run may create. */
+  reconcileMaxEnqueue: { def: 200, min: 1, max: 2_000 },
+  /**
+   * ABSOLUTE ceiling on the jobs one SWEEP may create across all its runs, and
+   * the compensating control for page-aligning the per-run breaker (which
+   * turned it from a wedge into a rate). Exhausting it HALTS the stream.
+   * Conservative by design: the incident this subsystem exists to prevent
+   * created 2,000 jobs, so the default would have caught it.
+   */
+  reconcileSweepMaxEnqueue: { def: 2_000, min: 1, max: 100_000 },
+  /** Pages one SWEEP may consume across its runs (~500k applications). */
+  reconcileSweepMaxPages: { def: 5_000, min: 1, max: 100_000 },
+  /** Sweep restarts allowed before halting — a resume that never holds. */
+  reconcileSweepMaxRestarts: { def: 5, min: 1, max: 1_000 },
+  /** Age at which a persisted page anchor is discarded (6 h). */
+  reconcileAnchorMaxAgeMs: { def: 21_600_000, min: 60_000, max: 604_800_000 },
 } as const;
 
 /** Maximum number of allowlisted resume hosts accepted from configuration. */
@@ -131,6 +182,27 @@ export interface AshbyRuntimeConfig {
   reconcileIntervalMs: number;
   reclaimIntervalMs: number;
   leaseSeconds: number;
+  /** Short cadence used while a page-anchored sweep is in flight (0034). */
+  reconcileSweepIntervalMs: number;
+  /** Per-run reconciliation bounds, tunable without a deploy (0034). */
+  reconcileCaps: {
+    maxPages: number;
+    maxItems: number;
+    pageLimit: number;
+    deadlineMs: number;
+    maxEnqueuePerRun: number;
+    /** Sweep-level bounds: the two that decide whether a large tenant finishes. */
+    sweepMaxEnqueue: number;
+    sweepMaxPages: number;
+    sweepMaxRestarts: number;
+    anchorMaxAgeMs: number;
+  };
+  /**
+   * KILL SWITCH (`ASHBY_RECONCILE_ANCHOR_DISABLED=true`): skip every anchor
+   * read and write, reverting exactly to the pre-0034 all-or-nothing sweep.
+   * Safe by construction — not advancing is the conservative failure.
+   */
+  reconcileAnchorDisabled: boolean;
 }
 
 /** Clamp a raw env integer into [min,max]; any malformed value yields `def`. */
@@ -186,6 +258,31 @@ export function loadAshbyRuntimeConfig(
     reconcileIntervalMs: boundedMs(source.ASHBY_RECONCILE_INTERVAL_MS, RUNTIME_BOUNDS.reconcileIntervalMs),
     reclaimIntervalMs: boundedMs(source.ASHBY_RECLAIM_INTERVAL_MS, RUNTIME_BOUNDS.reclaimIntervalMs),
     leaseSeconds: boundedMs(source.ASHBY_LEASE_SECONDS, RUNTIME_BOUNDS.leaseSeconds),
+    reconcileSweepIntervalMs: boundedMs(
+      source.ASHBY_RECONCILE_SWEEP_INTERVAL_MS, RUNTIME_BOUNDS.reconcileSweepIntervalMs,
+    ),
+    reconcileCaps: {
+      maxPages: boundedMs(source.ASHBY_RECONCILE_MAX_PAGES, RUNTIME_BOUNDS.reconcileMaxPages),
+      maxItems: boundedMs(source.ASHBY_RECONCILE_MAX_ITEMS, RUNTIME_BOUNDS.reconcileMaxItems),
+      pageLimit: boundedMs(source.ASHBY_RECONCILE_PAGE_LIMIT, RUNTIME_BOUNDS.reconcilePageLimit),
+      deadlineMs: boundedMs(source.ASHBY_RECONCILE_DEADLINE_MS, RUNTIME_BOUNDS.reconcileDeadlineMs),
+      maxEnqueuePerRun: boundedMs(
+        source.ASHBY_RECONCILE_MAX_ENQUEUE, RUNTIME_BOUNDS.reconcileMaxEnqueue,
+      ),
+      sweepMaxEnqueue: boundedMs(
+        source.ASHBY_RECONCILE_SWEEP_MAX_ENQUEUE, RUNTIME_BOUNDS.reconcileSweepMaxEnqueue,
+      ),
+      sweepMaxPages: boundedMs(
+        source.ASHBY_RECONCILE_SWEEP_MAX_PAGES, RUNTIME_BOUNDS.reconcileSweepMaxPages,
+      ),
+      sweepMaxRestarts: boundedMs(
+        source.ASHBY_RECONCILE_SWEEP_MAX_RESTARTS, RUNTIME_BOUNDS.reconcileSweepMaxRestarts,
+      ),
+      anchorMaxAgeMs: boundedMs(
+        source.ASHBY_RECONCILE_ANCHOR_MAX_AGE_MS, RUNTIME_BOUNDS.reconcileAnchorMaxAgeMs,
+      ),
+    },
+    reconcileAnchorDisabled: source.ASHBY_RECONCILE_ANCHOR_DISABLED === 'true',
   };
 }
 
@@ -222,6 +319,8 @@ export function describeAshbyRuntime(
   reconcileIntervalMs: number;
   reclaimIntervalMs: number;
   leaseSeconds: number;
+  reconcileSweepIntervalMs: number;
+  reconcileAnchorDisabled: boolean;
 } {
   return {
     runtimeEnabled: runtime.runtimeEnabled,
@@ -234,5 +333,7 @@ export function describeAshbyRuntime(
     reconcileIntervalMs: runtime.reconcileIntervalMs,
     reclaimIntervalMs: runtime.reclaimIntervalMs,
     leaseSeconds: runtime.leaseSeconds,
+    reconcileSweepIntervalMs: runtime.reconcileSweepIntervalMs,
+    reconcileAnchorDisabled: runtime.reconcileAnchorDisabled,
   };
 }
