@@ -5310,6 +5310,124 @@ begin
 end;
 $$;
 
+
+-- ── 0033 (B3): set_ashby_mapping_status is the REAL Mission Control resume
+--    path (POST /mappings/:id/resume). Hooking only upsert_ashby_job_mapping
+--    would have left the operator's actual resume with no backfill at all.
+
+select _policy_tests.assert(
+  'ashby 0033: set_ashby_mapping_status is service-role only with a pinned search_path',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname = 'set_ashby_mapping_status'
+      and p.prosecdef
+      and array_to_string(coalesce(p.proconfig, '{}'), ',') like '%search_path%'
+      and not has_function_privilege('anon', p.oid, 'EXECUTE')
+      and not has_function_privilege('authenticated', p.oid, 'EXECUTE')
+      and has_function_privilege('service_role', p.oid, 'EXECUTE')) = 1,
+  'set_ashby_mapping_status must stay service-role-only and pin search_path'
+);
+
+do $$
+declare
+  v_role  uuid;
+  v_actor uuid := gen_random_uuid();
+  v_map   jsonb;
+  v_mapid uuid;
+  v_res   jsonb;
+  v_cp    screening_v2.ashby_sync_checkpoints%rowtype;
+  v_epoch bigint;
+begin
+  select id into v_role from screening_v2.roles order by created_at limit 1;
+  if v_role is null then
+    perform _policy_tests.assert('ashby 0033/B3 functional: seed role present', false, 'no seed role available');
+    return;
+  end if;
+
+  delete from screening_v2.ashby_sync_checkpoints where checkpoint_key = 'application.list';
+  v_res := screening_v2.advance_ashby_sync_checkpoint('application.list', 'tok-b3', 1, 1, true);
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  v_epoch := v_cp.resync_epoch;
+
+  v_map := screening_v2.upsert_ashby_job_mapping(
+    null::uuid, 'pol33b-job', v_role, 'b3_ai', 'b3_ta', null::text, null::text, null::text,
+    gen_random_uuid(), 'manual', 24, 'paused', null::text, v_actor);
+  v_mapid := (v_map->>'id')::uuid;
+
+  -- Resume (paused → enabled) MUST force the backfill in the same transaction.
+  v_res := screening_v2.set_ashby_mapping_status(v_mapid, 'enabled', null::text, v_actor);
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0033/B3: resume forces a full resync',
+    v_res->>'status' = 'ok'
+      and (v_res->>'forced_full_resync')::boolean
+      and v_cp.status = 'full_resync_required'
+      and v_cp.full_resync_reason = 'mapping_enabled'
+      and v_cp.sync_token is null
+      and v_cp.resync_epoch = v_epoch + 1,
+    'POST /mappings/:id/resume must force the application.list backfill');
+
+  perform _policy_tests.assert('ashby 0033/B3: the resume audit row records the forced resync',
+    exists (select 1 from screening_v2.audit_events
+             where action = 'ashby_mapping_update'
+               and target_id = v_mapid::text
+               and metadata->>'action' = 'set_status'
+               and (metadata->>'forced_full_resync')::boolean),
+    'the resume audit row must record forced_full_resync');
+
+  -- Re-enabling an already-enabled mapping forces nothing (same rows admitted).
+  v_epoch := v_cp.resync_epoch;
+  v_res := screening_v2.advance_ashby_sync_checkpoint('application.list', 'tok-b3b', 1, 1, true,
+                                                      now(), v_epoch);
+  v_res := screening_v2.set_ashby_mapping_status(v_mapid, 'enabled', null::text, v_actor);
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0033/B3: re-enabling an enabled mapping forces no resync',
+    coalesce((v_res->>'forced_full_resync')::boolean, true) = false and v_cp.status = 'idle',
+    'no transition means no backfill');
+
+  -- PAUSING forces nothing: admission only narrows.
+  v_res := screening_v2.set_ashby_mapping_status(v_mapid, 'paused', 'operator', v_actor);
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0033/B3: pausing forces no resync',
+    coalesce((v_res->>'forced_full_resync')::boolean, true) = false
+      and v_cp.status = 'idle' and v_cp.resync_epoch = v_epoch,
+    'pausing must not trigger a full provider sweep');
+
+  -- An incomplete mapping still cannot be enabled, and forces nothing.
+  v_map := screening_v2.upsert_ashby_job_mapping(
+    null::uuid, 'pol33b-job2', v_role, null::text, null::text, null::text, null::text, null::text,
+    gen_random_uuid(), 'manual', 24, 'paused', null::text, v_actor);
+  v_res := screening_v2.set_ashby_mapping_status((v_map->>'id')::uuid, 'enabled', null::text, v_actor);
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0033/B3: a refused enable forces no resync',
+    v_res->>'status' = 'incomplete_cannot_enable' and v_cp.status = 'idle',
+    'a rejected enable must leave the checkpoint untouched');
+
+  -- Atomicity: rolling back the resume leaves BOTH the status and the
+  -- checkpoint unchanged — they are one transaction, never half-applied.
+  begin
+    v_res := screening_v2.set_ashby_mapping_status(v_mapid, 'enabled', null::text, v_actor);
+    raise exception 'rollback_probe';
+  exception when others then
+    if sqlerrm <> 'rollback_probe' then raise; end if;
+  end;
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0033/B3: a rolled-back resume leaves status AND checkpoint unchanged',
+    v_cp.status = 'idle'
+      and (select status from screening_v2.ashby_job_mappings where id = v_mapid) = 'paused',
+    'the status flip and the forced resync must roll back together');
+
+  delete from screening_v2.ashby_job_mappings where external_job_id in ('pol33b-job','pol33b-job2');
+  delete from screening_v2.ashby_sync_checkpoints where checkpoint_key = 'application.list';
+end;
+$$;
+
 -- ═══════════════════════════════════════════════════════════════════════
 -- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)
 -- ═══════════════════════════════════════════════════════════════════════

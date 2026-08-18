@@ -91,6 +91,8 @@ export interface ReconcilePassSummary {
   admitted: number;
   /** Why the rest were declined, by reason. */
   skipped: ReconcileSkipCounts;
+  /** Admitted fail-open because the row's job/stage id was unreadable. */
+  unclassified: number;
   /** Enabled mappings in this pass's index; 0 ⇒ nothing can be admitted. */
   enabledMappings: number;
   /** True when more enabled mappings exist than the per-run bound (fail-loud). */
@@ -346,17 +348,18 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
             owner,
           });
           if (r.stop !== 'locked') {
-            // The repo logger enforces a strict metadata allowlist mirrored in
-            // the Python side, so the pass emits only allowlisted fields here
-            // and publishes the full observed/admitted/skipped triple through
-            // `lastReconcilePass()` (see the runbook) rather than widening
-            // shared logging infrastructure for one integration's counters.
+            // Numeric admission counters go to the metrics sink (emitted
+            // inside `runReconciliation`); this snapshot is the operator-facing
+            // read of the last pass. The repo LOGGER enforces a strict metadata
+            // allowlist mirrored in the Python voice service, so the log line
+            // below carries only allowlisted fields.
             lastReconcilePass = {
               stop: r.stop,
               mode: r.mode,
               observed: r.observed,
               admitted: r.admitted,
               skipped: r.skipped,
+              unclassified: r.unclassified,
               enabledMappings: r.mappingsLoaded,
               mappingIndexTruncated: r.mappingIndexTruncated,
               recovered: r.recovered,
@@ -375,6 +378,14 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
               logger.warn('unknown_event', {
                 error_category: 'ashby_reconcile_mapping_index_truncated',
                 error_type: 'bound_exceeded',
+              });
+            }
+            // The circuit breaker and the schema-drift abort are the two stops
+            // an operator must never have to discover from a queue graph.
+            if (r.stop === 'enqueue_cap' || r.stop === 'unclassified_cap') {
+              logger.warn('unknown_event', {
+                error_category: 'ashby_reconcile_aborted',
+                error_type: r.stop,
               });
             }
           }

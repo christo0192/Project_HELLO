@@ -26,6 +26,8 @@ import {
   admitApplication,
   buildEnabledStageIndex,
   DEFAULT_MAX_ENABLED_MAPPINGS,
+  DEFAULT_MAX_ENQUEUE_PER_RUN,
+  UNCLASSIFIED_RESYNC_REASON,
   type ApplicationLister,
 } from '../integrations/ashby/reconciliation.js';
 import { processAshbySignal } from '../integrations/ashby/signal-worker.js';
@@ -209,10 +211,11 @@ describe('admission — one enabled mapping admits only the exact job + stage', 
     });
 
     expect(res.observed).toBe(7);
-    expect(res.admitted).toBe(2);
+    // 2 exact matches + 2 fail-open unclassified rows (no_job, no_stage).
+    expect(res.admitted).toBe(4);
+    expect(res.unclassified).toBe(2);
     expect(res.skipped).toEqual({
       noApplicationId: 1,
-      missingFields: 2,       // no_job + no_stage
       noEnabledMapping: 1,    // job_paused
       stageNotAi: 1,          // stage_ta on the mapped job
       ambiguousMapping: 0,
@@ -221,14 +224,14 @@ describe('admission — one enabled mapping admits only the exact job + stage', 
     const skips = Object.values(res.skipped).reduce((a, b) => a + b, 0);
     expect(res.admitted + skips).toBe(res.observed);
 
-    // Only the two admitted applications produced durable work, under the SAME
-    // stage-centric identity the webhook uses.
-    expect(receipts.writes).toBe(2);
-    expect([...receipts.seen]).toEqual([
-      `${CANDIDATE_STAGE_CHANGE_ACTION}:${stageDedupId('app_hit_1', AI)}`,
-      `${CANDIDATE_STAGE_CHANGE_ACTION}:${stageDedupId('app_hit_2', AI)}`,
-    ]);
-    expect(receipts.liveJobs.size).toBe(2);
+    // The two exact matches carry the SAME stage-centric identity the webhook
+    // uses; the unclassified pair is admitted for the worker to adjudicate.
+    expect(receipts.writes).toBe(4);
+    expect(receipts.seen).toContain(
+      `${CANDIDATE_STAGE_CHANGE_ACTION}:${stageDedupId('app_hit_1', AI)}`);
+    expect(receipts.seen).toContain(
+      `${CANDIDATE_STAGE_CHANGE_ACTION}:${stageDedupId('app_hit_2', AI)}`);
+    expect(receipts.liveJobs.size).toBe(4);
   });
 
   it('refuses to guess when the index holds conflicting stages for one job', async () => {
@@ -271,7 +274,10 @@ describe('admission ordering', () => {
     const record = vi.fn();
     const res = await runReconciliation({
       client: scriptedLister([{
-        results: [row('a', { jobId: 'job_paused', stageId: AI }), row('b', { jobId: JOB })],
+        results: [
+          row('a', { jobId: 'job_paused', stageId: AI }),
+          row('b', { jobId: JOB, stageId: 'stage_other' }),
+        ],
         moreDataAvailable: false,
       }]),
       checkpoints: new FakeCheckpoints(null),
@@ -458,7 +464,7 @@ describe('admission does not weaken the run bounds', () => {
       checkpoints: new FakeCheckpoints(null),
       receipts: new FakeReceipts(),
       mappings: new FakeMappings([{ externalJobId: JOB, aiScreeningStageId: AI }]),
-      caps: { maxPages: 1, maxItems: 5_000 },
+      caps: { maxPages: 1, maxItems: 5_000, maxEnqueuePerRun: 2_000 },
     });
     expect(res.pages).toBe(1);
     expect(res.stop).toBe('page_cap');
@@ -475,7 +481,7 @@ describe('admission does not weaken the run bounds', () => {
       checkpoints: new FakeCheckpoints(null),
       receipts: new FakeReceipts(),
       mappings: new FakeMappings([{ externalJobId: JOB, aiScreeningStageId: AI }]),
-      caps: { deadlineMs: 1_000, maxItems: 5_000 },
+      caps: { deadlineMs: 1_000, maxItems: 5_000, maxEnqueuePerRun: 2_000 },
       nowMs: () => { t += 2_000; return t; },
     });
     expect(res.stop).toBe('deadline');
@@ -510,9 +516,11 @@ describe('buildEnabledStageIndex / admitApplication', () => {
       { externalJobId: 'jx', aiScreeningStageId: 'b' },
     ]);
     expect(admitApplication({}, index)).toEqual({ admit: false, reason: 'noApplicationId' });
-    expect(admitApplication({ applicationId: 'a' }, index)).toEqual({ admit: false, reason: 'missingFields' });
+    // Unreadable job/stage fails OPEN — the worker adjudicates authoritatively.
+    expect(admitApplication({ applicationId: 'a' }, index))
+      .toEqual({ admit: true, classified: false, applicationId: 'a', stageId: undefined });
     expect(admitApplication({ applicationId: 'a', jobId: 'j1' }, index))
-      .toEqual({ admit: false, reason: 'missingFields' });
+      .toEqual({ admit: true, classified: false, applicationId: 'a', stageId: undefined });
     expect(admitApplication({ applicationId: 'a', jobId: 'nope', currentStageId: 's1' }, index))
       .toEqual({ admit: false, reason: 'noEnabledMapping' });
     expect(admitApplication({ applicationId: 'a', jobId: 'j1', currentStageId: 'other' }, index))
@@ -520,6 +528,138 @@ describe('buildEnabledStageIndex / admitApplication', () => {
     expect(admitApplication({ applicationId: 'a', jobId: 'jx', currentStageId: 'a' }, index))
       .toEqual({ admit: false, reason: 'ambiguousMapping' });
     expect(admitApplication({ applicationId: 'a', jobId: 'j1', currentStageId: 's1' }, index))
-      .toEqual({ admit: true, applicationId: 'a', jobId: 'j1', stageId: 's1' });
+      .toEqual({ admit: true, classified: true, applicationId: 'a', jobId: 'j1', stageId: 's1' });
+  });
+});
+
+// ── 8. Circuit breaker + schema-drift abort (review §3.4, §3.1) ─────────────
+
+describe('per-run enqueue circuit breaker', () => {
+  it('stops at maxEnqueuePerRun without advancing the checkpoint', async () => {
+    const receipts = new FakeReceipts();
+    const checkpoints = new FakeCheckpoints(null);
+    const many = Array.from({ length: 500 }, (_, i) => row(`app_${i}`, { jobId: JOB, stageId: AI }));
+    const res = await runReconciliation({
+      client: scriptedLister([{ results: many, moreDataAvailable: false, syncToken: 'tok' }]),
+      checkpoints, receipts,
+      mappings: new FakeMappings([{ externalJobId: JOB, aiScreeningStageId: AI }]),
+      caps: { maxItems: 5_000, maxEnqueuePerRun: 25 },
+    });
+    expect(res.stop).toBe('enqueue_cap');
+    expect(res.enqueued).toBe(25);
+    // The cap is a true ceiling on durable work, not an after-the-fact report.
+    expect(receipts.liveJobs.size).toBe(25);
+    expect(res.advanced).toBe(false);
+    expect(checkpoints.advances).toHaveLength(0);
+  });
+
+  it('defaults to a small breaker so an admission bug cannot flood the queue', async () => {
+    const receipts = new FakeReceipts();
+    const many = Array.from({ length: 2_000 }, (_, i) => row(`app_${i}`, { jobId: JOB, stageId: AI }));
+    const res = await runReconciliation({
+      client: scriptedLister([{ results: many, moreDataAvailable: false }]),
+      checkpoints: new FakeCheckpoints(null),
+      receipts,
+      mappings: new FakeMappings([{ externalJobId: JOB, aiScreeningStageId: AI }]),
+      caps: { maxItems: 5_000 },
+    });
+    expect(res.stop).toBe('enqueue_cap');
+    expect(res.enqueued).toBe(DEFAULT_MAX_ENQUEUE_PER_RUN);
+    expect(res.advanced).toBe(false);
+  });
+});
+
+describe('unclassifiable rows fail OPEN but bounded', () => {
+  /** Rows carrying an application id only — the provider list shape drifted. */
+  const drifted = Array.from({ length: 200 }, (_, i) => row(`app_${i}`));
+
+  it('admits a small number of unclassified rows rather than dropping real work', async () => {
+    const receipts = new FakeReceipts();
+    const res = await runReconciliation({
+      client: scriptedLister([{ results: drifted.slice(0, 5), moreDataAvailable: false, syncToken: 'tok' }]),
+      checkpoints: new FakeCheckpoints(null),
+      receipts,
+      mappings: new FakeMappings([{ externalJobId: JOB, aiScreeningStageId: AI }]),
+    });
+    expect(res.unclassified).toBe(5);
+    expect(res.admitted).toBe(5);
+    expect(receipts.liveJobs.size).toBe(5);
+    expect(res.stop).toBe('drained');
+  });
+
+  it('aborts without advancing and flags the stream when drift exceeds the bound', async () => {
+    const checkpoints = new FakeCheckpoints(null);
+    const res = await runReconciliation({
+      client: scriptedLister([{ results: drifted, moreDataAvailable: false, syncToken: 'tok' }]),
+      checkpoints,
+      receipts: new FakeReceipts(),
+      mappings: new FakeMappings([{ externalJobId: JOB, aiScreeningStageId: AI }]),
+      caps: { maxItems: 5_000, maxUnclassified: 10, maxEnqueuePerRun: 2_000 },
+    });
+    expect(res.stop).toBe('unclassified_cap');
+    expect(res.advanced).toBe(false);
+    expect(checkpoints.advances).toHaveLength(0);
+    // Loud: the stream is flagged with a sanitized reason for the operator.
+    expect(checkpoints.resyncs).toEqual([UNCLASSIFIED_RESYNC_REASON]);
+  });
+
+  it('a well-formed corpus never trips the drift abort', async () => {
+    const res = await runReconciliation({
+      client: scriptedLister([{
+        results: Array.from({ length: 300 }, (_, i) => row(`app_${i}`, { jobId: 'job_paused', stageId: AI })),
+        moreDataAvailable: false, syncToken: 'tok',
+      }]),
+      checkpoints: new FakeCheckpoints(null),
+      receipts: new FakeReceipts(),
+      mappings: new FakeMappings([]),
+      caps: { maxItems: 5_000 },
+    });
+    expect(res.unclassified).toBe(0);
+    expect(res.stop).toBe('drained');
+    expect(res.advanced).toBe(true);
+  });
+});
+
+// ── 9. Counter accounting is exact and stated ───────────────────────────────
+
+describe('counter accounting', () => {
+  it('observed === admitted + sum(skipped) on every non-aborted run', async () => {
+    const mixed = [
+      row('a', { jobId: JOB, stageId: AI }),                 // admit
+      row('b', { jobId: JOB, stageId: 'other' }),            // stageNotAi
+      row('c', { jobId: 'nope', stageId: AI }),              // noEnabledMapping
+      row('d'),                                              // unclassified (admit)
+      { application: {} } as OpaqueRecord,                    // noApplicationId
+    ];
+    const res = await runReconciliation({
+      client: scriptedLister([{ results: mixed, moreDataAvailable: false, syncToken: 't' }]),
+      checkpoints: new FakeCheckpoints(null),
+      receipts: new FakeReceipts(),
+      mappings: new FakeMappings([{ externalJobId: JOB, aiScreeningStageId: AI }]),
+    });
+    const skips = Object.values(res.skipped).reduce((a, b) => a + b, 0);
+    expect(res.stop).toBe('drained');
+    expect(res.admitted + skips).toBe(res.observed);
+    expect(res.admitted).toBe(2);       // exact match + unclassified
+    expect(res.unclassified).toBe(1);
+  });
+
+  it('on an aborted run the tripping row is observed but neither admitted nor skipped', async () => {
+    const drifted = Array.from({ length: 20 }, (_, i) => row(`app_${i}`));
+    const res = await runReconciliation({
+      client: scriptedLister([{ results: drifted, moreDataAvailable: false }]),
+      checkpoints: new FakeCheckpoints(null),
+      receipts: new FakeReceipts(),
+      mappings: new FakeMappings([]),
+      caps: { maxUnclassified: 5 },
+    });
+    const skips = Object.values(res.skipped).reduce((a, b) => a + b, 0);
+    expect(res.stop).toBe('unclassified_cap');
+    // 5 admitted fail-open, the 6th tripped the bound and stopped the run.
+    expect(res.admitted).toBe(5);
+    expect(res.unclassified).toBe(6);
+    expect(res.observed).toBe(6);
+    expect(res.admitted + skips).toBe(res.observed - 1);
+    expect(res.advanced).toBe(false);   // the tripping row is reconsidered next pass
   });
 });

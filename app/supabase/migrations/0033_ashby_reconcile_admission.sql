@@ -491,3 +491,105 @@ comment on function screening_v2.upsert_ashby_job_mapping is
   'full_resync_required in the same transaction, so applications already at '
   'the trigger stage are reconsidered under the new mapping. '
   'Service-role-only.';
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- 6. set_ashby_mapping_status — the Mission Control resume path (B3)
+-- ═══════════════════════════════════════════════════════════════════════
+-- This — not `upsert_ashby_job_mapping` — is what `POST /mappings/:id/resume`
+-- actually calls, so hooking only the upsert would have left the operator's
+-- real resume path with no backfill at all: the status flips, the recruiter is
+-- told "enabled", and every candidate already parked at the AI stage stays
+-- invisible behind an incremental cursor until an unrelated 14-day token
+-- expiry happens to force a full resync.
+--
+-- Identical to 0031 in validation and audit behaviour, plus: a transition
+-- INTO 'enabled' forces the application.list checkpoint to
+-- full_resync_required in the SAME transaction as the status flip, so a resume
+-- can never be acknowledged without the backfill being requested. Pausing
+-- forces nothing (admission only narrows), and re-enabling an already-enabled
+-- mapping forces nothing (the same rows are already admitted).
+
+create or replace function screening_v2.set_ashby_mapping_status(
+  p_mapping_id uuid,
+  p_status     text,
+  p_reason     text,
+  p_actor_id   uuid
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  v_current       screening_v2.ashby_job_mappings%rowtype;
+  v_resync        boolean := false;
+  v_resync_result jsonb;
+begin
+  if p_actor_id is null then
+    return jsonb_build_object('status', 'actor_required');
+  end if;
+  if p_status not in ('paused','enabled') then
+    return jsonb_build_object('status', 'invalid_status');
+  end if;
+
+  select * into v_current from screening_v2.ashby_job_mappings
+   where id = p_mapping_id for update;
+  if not found then
+    return jsonb_build_object('status', 'not_found');
+  end if;
+
+  if p_status = 'enabled' then
+    if v_current.ai_screening_stage_id is null or v_current.ta_screening_stage_id is null then
+      return jsonb_build_object('status', 'incomplete_cannot_enable');
+    end if;
+    if v_current.status = 'drift' then
+      return jsonb_build_object('status', 'drifted_cannot_enable');
+    end if;
+    -- Only a real transition INTO enabled opens admission.
+    v_resync := v_current.status is distinct from 'enabled';
+  end if;
+
+  update screening_v2.ashby_job_mappings
+     set status = p_status,
+         status_reason = case when p_status = 'enabled' then null else left(coalesce(p_reason, 'paused'), 200) end,
+         config_version = config_version + 1,
+         updated_at = now()
+   where id = p_mapping_id;
+
+  -- Same transaction as the status flip. A failure here rolls the resume back
+  -- too: an "enabled" mapping whose backlog can never be reconsidered would
+  -- screen only future stage changes and silently strand everyone waiting.
+  if v_resync then
+    v_resync_result := screening_v2.mark_ashby_sync_full_resync(
+      'application.list', 'mapping_enabled');
+    if coalesce(v_resync_result ->> 'status', '') <> 'ok' then
+      raise exception 'ashby_resync_force_failed';
+    end if;
+  end if;
+
+  insert into screening_v2.audit_events
+    (actor_id, actor_type, action, target_type, target_id, result, metadata)
+  values
+    (p_actor_id, 'recruiter', 'ashby_mapping_update', 'ashby_job_mapping', p_mapping_id::text, 'success',
+     jsonb_build_object('mapping_id', p_mapping_id, 'status', p_status, 'action', 'set_status',
+                        'forced_full_resync', v_resync));
+
+  return jsonb_build_object('status', 'ok', 'mapping_status', p_status,
+                            'forced_full_resync', v_resync);
+end;
+$$;
+
+revoke all on function screening_v2.set_ashby_mapping_status(uuid, text, text, uuid)
+  from public, anon, authenticated;
+grant execute on function screening_v2.set_ashby_mapping_status(uuid, text, text, uuid)
+  to service_role;
+
+comment on function screening_v2.set_ashby_mapping_status is
+  'Mission Control pause/resume of a mapping. Enabling still requires both '
+  'stage IDs (completeness) and a non-drifted status. A transition INTO '
+  'enabled also forces the application.list checkpoint to '
+  'full_resync_required in the same transaction, so a resume can never be '
+  'acknowledged without its backfill being requested. Audited. '
+  'Service-role-only.';
+
+notify pgrst, 'reload schema';
