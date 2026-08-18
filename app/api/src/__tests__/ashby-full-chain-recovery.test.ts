@@ -30,6 +30,17 @@ const JOB = 'job_1';
 const appObj = { id: APP, job: { id: JOB }, currentInterviewStage: { id: AI } };
 const appInfo = { application: appObj };
 
+/**
+ * Admission source for reconciliation: exactly the one enabled mapping this
+ * chain models. Recovery must still reach exactly one import THROUGH the
+ * admission gate, not around it.
+ */
+const enabledMappings = {
+  async listEnabled() {
+    return { rows: [{ externalJobId: JOB, aiScreeningStageId: AI }], truncated: false };
+  },
+};
+
 /** In-memory model of the 0030 transactional outbox (receipt + signal job). */
 class Outbox implements ReceiptStore {
   receipts = new Map<string, { id: string; status: string }>();
@@ -145,6 +156,7 @@ describe('reconciliation dropped-webhook recovery → exactly one import', () =>
       client: { applicationList: (async () => ({ results: [appObj], moreDataAvailable: false })) as never },
       checkpoints: { get: async () => null, advance: async () => {}, requireFullResync: async () => {} },
       receipts: outbox,
+      mappings: enabledMappings,
     });
     expect(recon.recovered).toBe(1);
     expect(recon.enqueued).toBe(1); // recovery reached PROCESSING, not receipt-only

@@ -40,6 +40,7 @@ import {
 } from './signal-worker.js';
 import { runImport, runIngestionJob } from './orchestration.js';
 import { runReconciliation, DEFAULT_CHECKPOINT_KEY } from './reconciliation.js';
+import type { ReconcileResult, ReconcileSkipCounts, ReconcileStop } from './reconciliation.js';
 import { runClaimedAshbyOperation } from './operation-worker.js';
 import { materializeCandidate } from './materialize.js';
 import { extractFileUrl, type AshbyRuntime } from './runtime.js';
@@ -75,8 +76,38 @@ export interface AshbyWorkersOptions {
     : never;
 }
 
+/**
+ * Operator-facing summary of the last completed reconciliation pass. Counters
+ * and sanitized codes ONLY — no application, job, stage, candidate, or tenant
+ * identifier ever appears here, so it is safe to log or surface in an admin
+ * diagnostic. `observed === admitted + sum(skipped)` always holds.
+ */
+export interface ReconcilePassSummary {
+  stop: ReconcileStop;
+  mode: ReconcileResult['mode'];
+  /** Applications seen on the pages read. */
+  observed: number;
+  /** Applications that passed admission and could create durable work. */
+  admitted: number;
+  /** Why the rest were declined, by reason. */
+  skipped: ReconcileSkipCounts;
+  /** Enabled mappings in this pass's index; 0 ⇒ nothing can be admitted. */
+  enabledMappings: number;
+  /** True when more enabled mappings exist than the per-run bound (fail-loud). */
+  mappingIndexTruncated: boolean;
+  recovered: number;
+  duplicates: number;
+  enqueued: number;
+  advanced: boolean;
+}
+
 export interface AshbyWorkers {
   scheduler: AshbySchedulerHandle;
+  /**
+   * Last completed reconciliation pass, or null before the first one. The
+   * truthful observed/admitted/skipped triple for operators; in-process only.
+   */
+  lastReconcilePass(): ReconcilePassSummary | null;
   /**
    * Per-loop base interval (ms), keyed by loop name. The health surface needs
    * these to decide whether a loop's last tick is stale for ITS own cadence.
@@ -255,6 +286,13 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
   // cannot await for us — so build the ports first and pass a sync thunk.
   const handlers = buildAshbyHandlers(runtime);
 
+  /**
+   * Last completed (non-`locked`) reconciliation pass. In-process and
+   * best-effort: it is an operator/diagnostic surface for the truthful
+   * observed → admitted → skipped triple, never a durability mechanism.
+   */
+  let lastReconcilePass: ReconcilePassSummary | null = null;
+
   const runner = createQueueRunner({
     queue: runtime.queue,
     handlers,
@@ -300,10 +338,50 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
             client: runtime.client,
             checkpoints: runtime.checkpoints,
             receipts: runtime.receipts,
+            // Admission source. Without it reconciliation would record and
+            // enqueue EVERY application it observed — the tenant-wide signal
+            // storm this loop exists to avoid.
+            mappings: runtime.enabledMappings,
             checkpointKey: DEFAULT_CHECKPOINT_KEY,
             owner,
           });
-          return r.stop !== 'locked' && r.items > 0;
+          if (r.stop !== 'locked') {
+            // The repo logger enforces a strict metadata allowlist mirrored in
+            // the Python side, so the pass emits only allowlisted fields here
+            // and publishes the full observed/admitted/skipped triple through
+            // `lastReconcilePass()` (see the runbook) rather than widening
+            // shared logging infrastructure for one integration's counters.
+            lastReconcilePass = {
+              stop: r.stop,
+              mode: r.mode,
+              observed: r.observed,
+              admitted: r.admitted,
+              skipped: r.skipped,
+              enabledMappings: r.mappingsLoaded,
+              mappingIndexTruncated: r.mappingIndexTruncated,
+              recovered: r.recovered,
+              duplicates: r.duplicates,
+              enqueued: r.enqueued,
+              advanced: r.advanced,
+            };
+            logger.info('unknown_event', {
+              error_category: 'ashby_reconcile_pass',
+              error_type: r.stop,
+            });
+            // A truncated index means enabled mappings exist that this pass
+            // could not admit against — fail-loud, since the symptom (missing
+            // imports) is otherwise silent.
+            if (r.mappingIndexTruncated) {
+              logger.warn('unknown_event', {
+                error_category: 'ashby_reconcile_mapping_index_truncated',
+                error_type: 'bound_exceeded',
+              });
+            }
+          }
+          // "Did work" means work was ADMITTED — a pass that observed thousands
+          // of applications and admitted none is idle, not busy, and must not
+          // make the scheduler poll faster.
+          return r.stop !== 'locked' && r.admitted > 0;
         },
       },
       {
@@ -322,6 +400,7 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
 
   return {
     scheduler,
+    lastReconcilePass: () => lastReconcilePass,
     loopIntervalsMs: {
       signal: rc.signalPollMs,
       operation: rc.operationPollMs,

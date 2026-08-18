@@ -5131,6 +5131,185 @@ begin
 end;
 $$;
 
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- 0033: Ashby reconciliation admission — forced full resync when enabling
+--       a mapping opens admission, with an epoch guard so an in-flight run
+--       cannot clear it.
+-- ═══════════════════════════════════════════════════════════════════════
+
+select _policy_tests.assert(
+  'ashby 0033: resync_epoch column exists and is NOT NULL',
+  (select count(*) from information_schema.columns
+    where table_schema = 'screening_v2'
+      and table_name = 'ashby_sync_checkpoints'
+      and column_name = 'resync_epoch'
+      and is_nullable = 'NO') = 1,
+  'ashby_sync_checkpoints.resync_epoch must exist and be NOT NULL'
+);
+
+select _policy_tests.assert(
+  'ashby 0033 RPCs are service-role only',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname in ('advance_ashby_sync_checkpoint','mark_ashby_sync_full_resync',
+                        'begin_ashby_sync_run','upsert_ashby_job_mapping')
+      and not has_function_privilege('anon', p.oid, 'EXECUTE')
+      and not has_function_privilege('authenticated', p.oid, 'EXECUTE')
+      and has_function_privilege('service_role', p.oid, 'EXECUTE')
+  ) = 4,
+  'ashby 0033 RPCs must be service-role only'
+);
+
+select _policy_tests.assert(
+  'ashby 0033 RPCs pin search_path',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname in ('advance_ashby_sync_checkpoint','mark_ashby_sync_full_resync',
+                        'begin_ashby_sync_run','upsert_ashby_job_mapping')
+      and p.prosecdef
+      and array_to_string(coalesce(p.proconfig, '{}'), ',') like '%search_path%'
+  ) = 4,
+  'every 0033 SECURITY DEFINER RPC must pin search_path'
+);
+
+-- The superseded 6-argument overload must be gone: leaving it callable would
+-- let a caller advance the cursor while bypassing the epoch guard entirely.
+select _policy_tests.assert(
+  'ashby 0033: exactly one advance_ashby_sync_checkpoint overload remains',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname = 'advance_ashby_sync_checkpoint') = 1,
+  'the pre-0033 six-argument overload must be dropped'
+);
+
+do $$
+declare
+  v_role   uuid;
+  v_actor  uuid := gen_random_uuid();
+  v_map    jsonb;
+  v_mapid  uuid;
+  v_cp     screening_v2.ashby_sync_checkpoints%rowtype;
+  v_epoch  bigint;
+  v_res    jsonb;
+  v_begin  jsonb;
+begin
+  select id into v_role from screening_v2.roles order by created_at limit 1;
+  if v_role is null then
+    perform _policy_tests.assert('ashby 0033 functional: seed role present', false, 'no seed role available');
+    return;
+  end if;
+
+  -- Start from a clean, advanced (idle) application.list checkpoint.
+  delete from screening_v2.ashby_sync_checkpoints where checkpoint_key = 'application.list';
+  v_res := screening_v2.advance_ashby_sync_checkpoint('application.list', 'tok-0033-a', 1, 1, true);
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0033: baseline checkpoint is idle with a token',
+    v_cp.status = 'idle' and v_cp.sync_token = 'tok-0033-a',
+    'got status ' || v_cp.status);
+  v_epoch := v_cp.resync_epoch;
+
+  -- (a) Creating a PAUSED mapping must NOT force a resync — admission does
+  --     not widen, so a routine save never triggers a full provider sweep.
+  v_map := screening_v2.upsert_ashby_job_mapping(
+    null::uuid, 'pol33-job', v_role, 'pol33_ai', 'pol33_ta', null::text, null::text, null::text,
+    gen_random_uuid(), 'manual', 24, 'paused', null::text, v_actor);
+  v_mapid := (v_map->>'id')::uuid;
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0033: creating a paused mapping forces no resync',
+    coalesce((v_map->>'forced_full_resync')::boolean, true) = false
+      and v_cp.status = 'idle' and v_cp.resync_epoch = v_epoch,
+    'paused create must not force a resync');
+
+  -- (b) ENABLING the mapping must force full_resync_required in the SAME
+  --     transaction, so applications already parked at the trigger stage are
+  --     reconsidered under the new mapping.
+  v_map := screening_v2.upsert_ashby_job_mapping(
+    v_mapid, 'pol33-job', v_role, 'pol33_ai', 'pol33_ta', null::text, null::text, null::text,
+    gen_random_uuid(), 'manual', 24, 'enabled', null::text, v_actor);
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0033: enabling a mapping forces a full resync',
+    (v_map->>'forced_full_resync')::boolean
+      and v_cp.status = 'full_resync_required'
+      and v_cp.sync_token is null
+      and v_cp.resync_epoch = v_epoch + 1,
+    'enable must force full_resync_required and bump the epoch');
+
+  perform _policy_tests.assert('ashby 0033: the forced resync is audited on the mapping event',
+    exists (select 1 from screening_v2.audit_events
+             where action = 'ashby_mapping_update'
+               and target_id = v_mapid::text
+               and (metadata->>'forced_full_resync')::boolean),
+    'the mapping audit row must record the forced resync');
+
+  -- (c) Re-saving the SAME enabled mapping with an unchanged AI stage must
+  --     not force another resync (the same rows are already admitted).
+  v_epoch := v_cp.resync_epoch;
+  v_res := screening_v2.advance_ashby_sync_checkpoint('application.list', 'tok-0033-b', 1, 1, true,
+                                                      now(), v_epoch);
+  v_map := screening_v2.upsert_ashby_job_mapping(
+    v_mapid, 'pol33-job', v_role, 'pol33_ai', 'pol33_ta', null::text, null::text, null::text,
+    gen_random_uuid(), 'both', 24, 'enabled', 'relabel', v_actor);
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0033: re-saving an enabled mapping forces no resync',
+    coalesce((v_map->>'forced_full_resync')::boolean, true) = false
+      and v_cp.status = 'idle' and v_cp.resync_epoch = v_epoch,
+    'an unchanged AI stage must not force a resync');
+
+  -- (d) Repointing the AI stage of an ENABLED mapping opens new admission and
+  --     must force a resync.
+  v_map := screening_v2.upsert_ashby_job_mapping(
+    v_mapid, 'pol33-job', v_role, 'pol33_ai_v2', 'pol33_ta', null::text, null::text, null::text,
+    gen_random_uuid(), 'manual', 24, 'enabled', null::text, v_actor);
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0033: repointing the AI stage forces a resync',
+    (v_map->>'forced_full_resync')::boolean and v_cp.status = 'full_resync_required',
+    'a new AI stage must force a resync');
+
+  -- (e) EPOCH GUARD: a run that read the checkpoint BEFORE the enable must not
+  --     clear the forced resync when it finishes.
+  v_epoch := v_cp.resync_epoch;                    -- what an in-flight run read
+  v_res := screening_v2.mark_ashby_sync_full_resync('application.list', 'mapping_enabled');
+  v_res := screening_v2.advance_ashby_sync_checkpoint('application.list', 'tok-0033-c', 2, 5, true,
+                                                      now(), v_epoch);
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0033: a stale run cannot clear a mid-run forced resync',
+    (v_res->>'resync_pending')::boolean
+      and v_cp.status = 'full_resync_required'
+      and v_cp.sync_token = 'tok-0033-c',
+    'the cursor advances but the forced resync must stand');
+
+  -- (f) A run holding the CURRENT epoch does clear the flag normally.
+  v_res := screening_v2.advance_ashby_sync_checkpoint('application.list', 'tok-0033-d', 2, 5, true,
+                                                      now(), v_cp.resync_epoch);
+  select * into v_cp from screening_v2.ashby_sync_checkpoints
+   where provider = 'ashby' and checkpoint_key = 'application.list';
+  perform _policy_tests.assert('ashby 0033: a current-epoch run clears the forced resync',
+    coalesce((v_res->>'resync_pending')::boolean, true) = false and v_cp.status = 'idle',
+    'a run that observed the latest epoch must clear the flag');
+
+  -- (g) begin_ashby_sync_run exposes the epoch the run must compare against.
+  v_begin := screening_v2.begin_ashby_sync_run('application.list', 'pol33-owner', 60);
+  perform _policy_tests.assert('ashby 0033: begin_ashby_sync_run returns resync_epoch',
+    v_begin->>'status' = 'ok' and (v_begin->>'resync_epoch')::bigint = v_cp.resync_epoch,
+    'the lease acquisition must expose the current epoch');
+  v_res := screening_v2.end_ashby_sync_run('application.list', 'pol33-owner', true);
+
+  -- Cleanup (audit_events is append-only by design and is left intact).
+  delete from screening_v2.ashby_job_mappings where external_job_id = 'pol33-job';
+  delete from screening_v2.ashby_sync_checkpoints where checkpoint_key = 'application.list';
+end;
+$$;
+
 -- ═══════════════════════════════════════════════════════════════════════
 -- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)
 -- ═══════════════════════════════════════════════════════════════════════

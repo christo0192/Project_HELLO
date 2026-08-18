@@ -18,6 +18,8 @@ import type {
   ReceiptOutcome,
   CheckpointStore,
   SyncCheckpoint,
+  EnabledMappingLoader,
+  EnabledMappingRow,
 } from './ports.js';
 import type { MappingResolver, MappingActivity } from './signal-worker.js';
 
@@ -76,7 +78,7 @@ export function createCheckpointStore(client: SupabaseClient): CheckpointStore {
     async get(checkpointKey): Promise<SyncCheckpoint | null> {
       const { data, error } = await client
         .from('ashby_sync_checkpoints')
-        .select('sync_token, status, token_issued_at, last_success_at')
+        .select('sync_token, status, token_issued_at, last_success_at, resync_epoch')
         .eq('provider', 'ashby')
         .eq('checkpoint_key', checkpointKey)
         .maybeSingle();
@@ -87,6 +89,7 @@ export function createCheckpointStore(client: SupabaseClient): CheckpointStore {
         status: string;
         token_issued_at: string | null;
         last_success_at: string | null;
+        resync_epoch: number | null;
       };
       const status: SyncCheckpoint['status'] =
         row.status === 'running' || row.status === 'full_resync_required' ? row.status : 'idle';
@@ -95,6 +98,7 @@ export function createCheckpointStore(client: SupabaseClient): CheckpointStore {
         status,
         tokenIssuedAt: row.token_issued_at,
         lastSuccessAt: row.last_success_at,
+        resyncEpoch: typeof row.resync_epoch === 'number' ? row.resync_epoch : 0,
       };
     },
     async advance(input): Promise<void> {
@@ -104,6 +108,10 @@ export function createCheckpointStore(client: SupabaseClient): CheckpointStore {
         p_pages: input.pages,
         p_items: input.items,
         p_full: input.full,
+        // 0033 compare-and-set: when a mapping was enabled DURING this run the
+        // stored epoch has moved on, and the RPC keeps `full_resync_required`
+        // set instead of letting this run's completion clear it.
+        p_resync_epoch: typeof input.resyncEpoch === 'number' ? input.resyncEpoch : null,
       });
       if (error) throw new Error('ashby_checkpoint_advance_error');
     },
@@ -133,6 +141,7 @@ export function createCheckpointStore(client: SupabaseClient): CheckpointStore {
             : 'idle',
         tokenIssuedAt: (row?.token_issued_at as string | null) ?? null,
         lastSuccessAt: (row?.last_success_at as string | null) ?? null,
+        resyncEpoch: typeof row?.resync_epoch === 'number' ? row.resync_epoch : 0,
       };
       return {
         status: 'ok',
@@ -174,6 +183,46 @@ export function createMappingResolver(client: SupabaseClient): MappingResolver {
           ? row.status
           : 'unknown';
       return { status, aiScreeningStageId: row.ai_screening_stage_id };
+    },
+  };
+}
+
+/**
+ * One bounded read of the ENABLED mappings that carry an AI screening stage
+ * (0029 partial index `idx_ashby_job_mappings_enabled`). Reconciliation calls
+ * this exactly once per run to build its admission index — replacing what
+ * would otherwise be one mapping lookup per observed application.
+ *
+ * Only the two opaque provider ids are selected: no role, owner, label, or any
+ * other tenant-identifying column ever leaves the DB on this path. Rows are
+ * ordered by `external_job_id` so a truncated read is deterministic rather
+ * than an arbitrary slice that changes between runs.
+ */
+export function createEnabledMappingLoader(client: SupabaseClient): EnabledMappingLoader {
+  return {
+    async listEnabled(limit): Promise<{ rows: EnabledMappingRow[]; truncated: boolean }> {
+      const bound = Math.max(1, Math.min(Math.trunc(limit), 10_000));
+      const { data, error } = await client
+        .from('ashby_job_mappings')
+        .select('external_job_id, ai_screening_stage_id')
+        .eq('provider', 'ashby')
+        .eq('status', 'enabled')
+        .not('ai_screening_stage_id', 'is', null)
+        .order('external_job_id', { ascending: true })
+        // Read ONE extra row purely to detect truncation without a count query.
+        .limit(bound + 1);
+      if (error) throw new Error('ashby_enabled_mappings_read_error');
+      const all = Array.isArray(data) ? (data as Array<Record<string, unknown>>) : [];
+      const truncated = all.length > bound;
+      const rows: EnabledMappingRow[] = [];
+      for (const r of all.slice(0, bound)) {
+        const externalJobId = typeof r.external_job_id === 'string' ? r.external_job_id : '';
+        const aiScreeningStageId =
+          typeof r.ai_screening_stage_id === 'string' ? r.ai_screening_stage_id : '';
+        if (!externalJobId || !aiScreeningStageId) continue;
+        rows.push({ externalJobId, aiScreeningStageId });
+      }
+      return { rows, truncated };
     },
   };
 }

@@ -154,6 +154,11 @@ function makeRuntime(w: ReturnType<typeof world>, over: Partial<AshbyRuntime> = 
       insertInvite: async (i) => { const id = `inv_${w.next()}`; w.invites.push({ id, digest: i.tokenDigest }); return { id }; },
     },
     mappings: { resolveByJobId: async () => ({ status: 'enabled', aiScreeningStageId: AI }) },
+    enabledMappings: {
+      async listEnabled() {
+        return { rows: [{ externalJobId: JOB, aiScreeningStageId: AI }], truncated: false };
+      },
+    },
     urlPolicy: { allowlistEnabled: false, allowedHosts: [], allowedPorts: [443] },
     resolveMappingByJobId: async () => ({ status: 'enabled', aiScreeningStageId: AI, id: 'map_1', deliveryMode: 'manual' }),
     resolveMappingForLink: async () => ({ id: 'map_1', roleId: ROLE, ownerId: OWNER, deliveryMode: 'manual' }),
