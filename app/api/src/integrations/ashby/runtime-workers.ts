@@ -39,6 +39,7 @@ import {
   importDedupKey,
 } from './signal-worker.js';
 import { runImport, runIngestionJob } from './orchestration.js';
+import { publishReconcilePass } from './runtime-health.js';
 import { runReconciliation, DEFAULT_CHECKPOINT_KEY } from './reconciliation.js';
 import type { ReconcileResult, ReconcileSkipCounts, ReconcileStop } from './reconciliation.js';
 import { runClaimedAshbyOperation } from './operation-worker.js';
@@ -367,6 +368,12 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
               enqueued: r.enqueued,
               advanced: r.advanced,
             };
+            // Publish to the health registry so the counts have a REAL consumer
+            // (Mission Control /health). Without this the re-activation gate
+            // "admitted = 0 and enqueued = 0 while every mapping is paused" is
+            // not executable: the metrics sink is a no-op in this deployment,
+            // so the numbers would never leave the worker process.
+            publishReconcilePass(lastReconcilePass);
             logger.info('unknown_event', {
               error_category: 'ashby_reconcile_pass',
               error_type: r.stop,

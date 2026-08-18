@@ -124,6 +124,123 @@ export function snapshotScheduler(nowMs: number = Date.now()): SchedulerHealthVi
   };
 }
 
+// ── Process-local reconciliation-pass registry ───────────────────────────────
+//
+// Review finding M-1: the admission counters emitted by `runReconciliation` go
+// to `lib/metrics.ts`, whose sink is a NO-OP in this deployment (there is no
+// production `setMetricSink` caller). That made the runbook's re-activation
+// gate — "confirm admitted = 0 and enqueued = 0 while every mapping is paused"
+// — impossible to actually execute: the numbers existed only inside the worker
+// process. Publishing the last pass here gives the Mission Control health route
+// a real, sanitized consumer, so the gate can be checked over HTTP.
+//
+// Counts and a sanitized stop/mode code ONLY. No application, job, stage,
+// candidate, mapping, or tenant identifier ever enters this structure — it is
+// the same discipline as the rest of the health surface.
+
+/** Per-reason skip counts for the last reconciliation pass. */
+export interface ReconcileSkipView {
+  noApplicationId: number;
+  noEnabledMapping: number;
+  stageNotAi: number;
+  ambiguousMapping: number;
+}
+
+/**
+ * The last completed reconciliation pass, as exposed on the health surface.
+ * `observed === admitted + sum(skipped)` on any pass that reached a normal
+ * stop; on an aborted pass (`enqueue_cap` / `unclassified_cap`) the row that
+ * tripped the bound is observed but neither admitted nor skipped.
+ */
+export interface ReconcilePassView {
+  stop: string;
+  mode: string;
+  observed: number;
+  admitted: number;
+  skipped: ReconcileSkipView;
+  unclassified: number;
+  enabledMappings: number;
+  mappingIndexTruncated: boolean;
+  recovered: number;
+  duplicates: number;
+  enqueued: number;
+  advanced: boolean;
+  /** ISO time this pass was published. Never a provider timestamp. */
+  observedAt: string;
+}
+
+let lastPass: ReconcilePassView | null = null;
+
+/** Bound an untrusted number into a safe non-negative integer for the surface. */
+function safeCount(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return 0;
+  return Math.min(Math.floor(value), Number.MAX_SAFE_INTEGER);
+}
+
+/** Bound a sanitized code to a short identifier; anything else becomes 'unknown'. */
+function safeCode(value: unknown): string {
+  return typeof value === 'string' && /^[a-z_]{1,32}$/.test(value) ? value : 'unknown';
+}
+
+/**
+ * Publish the last completed reconciliation pass. Called by the reconcile loop
+ * on every non-`locked` pass. Defensive by construction: every field is
+ * re-derived through the bounded helpers above, so nothing unexpected can reach
+ * the health surface even if the caller changes.
+ */
+export function publishReconcilePass(
+  pass: {
+    stop: string;
+    mode: string;
+    observed: number;
+    admitted: number;
+    skipped: ReconcileSkipView;
+    unclassified: number;
+    enabledMappings: number;
+    mappingIndexTruncated: boolean;
+    recovered: number;
+    duplicates: number;
+    enqueued: number;
+    advanced: boolean;
+  },
+  nowIso: string = new Date().toISOString(),
+): void {
+  lastPass = {
+    stop: safeCode(pass.stop),
+    mode: safeCode(pass.mode),
+    observed: safeCount(pass.observed),
+    admitted: safeCount(pass.admitted),
+    skipped: {
+      noApplicationId: safeCount(pass.skipped?.noApplicationId),
+      noEnabledMapping: safeCount(pass.skipped?.noEnabledMapping),
+      stageNotAi: safeCount(pass.skipped?.stageNotAi),
+      ambiguousMapping: safeCount(pass.skipped?.ambiguousMapping),
+    },
+    unclassified: safeCount(pass.unclassified),
+    enabledMappings: safeCount(pass.enabledMappings),
+    mappingIndexTruncated: pass.mappingIndexTruncated === true,
+    recovered: safeCount(pass.recovered),
+    duplicates: safeCount(pass.duplicates),
+    enqueued: safeCount(pass.enqueued),
+    advanced: pass.advanced === true,
+    observedAt: nowIso,
+  };
+}
+
+/**
+ * The last pass observed BY THIS PROCESS, or null when this process has not run
+ * one. Like `snapshotScheduler`, null is a statement about this process only —
+ * never a fleet-wide claim, and never a claim that no reconciliation happened.
+ */
+export function snapshotReconcilePass(): ReconcilePassView | null {
+  return lastPass;
+}
+
+/** Clear the registry (process shutdown, and test isolation). */
+export function clearReconcilePassRegistration(): void {
+  lastPass = null;
+}
+
 // ── Durable backlog (multi-machine safe) ─────────────────────────────────────
 
 export interface BacklogView {

@@ -44,6 +44,7 @@ import {
   type BacklogView,
   readScannerHealth,
   type ScannerHealthView,
+  snapshotReconcilePass,
 } from '../integrations/ashby/runtime-health.js';
 import {
   generateInviteToken,
@@ -97,6 +98,8 @@ export interface AshbyMissionControlDeps {
    * integration answers 503 without constructing a client or touching the network.
    */
   probeReader?: Parameters<typeof probeJobStages>[1] | null;
+  /** Injected last-reconciliation-pass snapshot for deterministic health tests. */
+  reconcilePass?: () => ReturnType<typeof snapshotReconcilePass>;
   /** Injected config sources for deterministic health tests. */
   configSource?: NodeJS.ProcessEnv;
   /** Injected scheduler snapshot (tests). Production reads the live registry. */
@@ -253,6 +256,12 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
               : ['backlog_unavailable'],
           };
 
+      // Last reconciliation pass observed BY THIS PROCESS (null when this
+      // process has run none — never a fleet-wide claim). Counts and sanitized
+      // codes only; this is what makes the runbook's admission gates
+      // executable over HTTP instead of only inside the worker.
+      const reconcile = deps.reconcilePass ? deps.reconcilePass() : snapshotReconcilePass();
+
       res.json({
         ok: true,
         status: verdict.status,
@@ -260,6 +269,7 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
         integration,
         runtime,
         scheduler,
+        reconcile,
         backlog,
         backlogError,
         scanner,

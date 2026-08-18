@@ -20,7 +20,7 @@
  *      admission narrows what gets queued, it never becomes the authority.
  */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   runReconciliation,
   admitApplication,
@@ -31,6 +31,11 @@ import {
   type ApplicationLister,
 } from '../integrations/ashby/reconciliation.js';
 import { processAshbySignal } from '../integrations/ashby/signal-worker.js';
+import {
+  publishReconcilePass,
+  snapshotReconcilePass,
+  clearReconcilePassRegistration,
+} from '../integrations/ashby/runtime-health.js';
 import { ingestWebhook } from '../integrations/ashby/ingress.js';
 import { stageDedupId, CANDIDATE_STAGE_CHANGE_ACTION } from '../integrations/ashby/extractors.js';
 import type {
@@ -661,5 +666,55 @@ describe('counter accounting', () => {
     expect(res.observed).toBe(6);
     expect(res.admitted + skips).toBe(res.observed - 1);
     expect(res.advanced).toBe(false);   // the tripping row is reconsidered next pass
+  });
+});
+
+// ── 10. The counts reach a real consumer (review M-1) ───────────────────────
+
+describe('reconcile-pass publication to the health registry', () => {
+  beforeEach(() => { clearReconcilePassRegistration(); });
+  afterEach(() => { clearReconcilePassRegistration(); });
+
+  it('publishes a sanitized, self-consistent pass that the health route can read', () => {
+    expect(snapshotReconcilePass()).toBeNull();
+    publishReconcilePass({
+      stop: 'drained', mode: 'full',
+      observed: 2_000, admitted: 0,
+      skipped: { noApplicationId: 0, noEnabledMapping: 2_000, stageNotAi: 0, ambiguousMapping: 0 },
+      unclassified: 0, enabledMappings: 0, mappingIndexTruncated: false,
+      recovered: 0, duplicates: 0, enqueued: 0, advanced: true,
+    }, '2026-08-18T00:00:00.000Z');
+
+    const view = snapshotReconcilePass();
+    expect(view).not.toBeNull();
+    // The exact re-activation gate: paused tenant ⇒ nothing admitted or queued.
+    expect(view?.admitted).toBe(0);
+    expect(view?.enqueued).toBe(0);
+    expect(view?.observed).toBe(2_000);
+    expect(view?.observedAt).toBe('2026-08-18T00:00:00.000Z');
+  });
+
+  it('bounds every published field defensively — no unexpected value can reach the surface', () => {
+    publishReconcilePass({
+      // Hostile input the caller should never produce, but must not propagate.
+      stop: 'drained; DROP TABLE', mode: 'FULL-mode',
+      observed: -5, admitted: Number.NaN,
+      skipped: { noApplicationId: -1, noEnabledMapping: 1.9, stageNotAi: Infinity, ambiguousMapping: 3 },
+      unclassified: -0.5, enabledMappings: Number.NaN, mappingIndexTruncated: 'yes' as unknown as boolean,
+      recovered: -2, duplicates: 4, enqueued: -9, advanced: 1 as unknown as boolean,
+    }, '2026-08-18T00:00:00.000Z');
+
+    const view = snapshotReconcilePass();
+    expect(view?.stop).toBe('unknown');            // not a safe code ⇒ 'unknown'
+    expect(view?.mode).toBe('unknown');
+    expect(view?.observed).toBe(0);                // negatives floor to 0
+    expect(view?.admitted).toBe(0);                // NaN floors to 0
+    expect(view?.skipped.noEnabledMapping).toBe(1); // truncated, not rounded
+    expect(view?.skipped.stageNotAi).toBe(0);      // Infinity floors to 0
+    expect(view?.skipped.ambiguousMapping).toBe(3);
+    expect(view?.enqueued).toBe(0);
+    // Non-boolean truthiness is never accepted as true.
+    expect(view?.mappingIndexTruncated).toBe(false);
+    expect(view?.advanced).toBe(false);
   });
 });

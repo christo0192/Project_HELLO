@@ -178,20 +178,40 @@ cursor advances while `full_resync_required` **stands** for the next pass.
 
 ### Counters
 
-Every pass emits metrics via `lib/metrics.ts`: `ashby_reconcile_observed`,
-`_admitted`, `_enqueued`, `_unclassified`, `_skipped_mapping`, `_skipped_stage`,
-`_skipped_ambiguous`, `_skipped_no_application`, and
-`_mapping_index_truncated`. **This is the alarm that did not exist** — nothing
-would have fired on "one run enqueued 2,000 jobs". Alert on
-`ashby_reconcile_enqueued` and on any non-zero `ashby_reconcile_admitted` while
-every mapping is paused.
+**What is observable today, and where.** Be precise about this — the difference
+decides whether a gate below is executable.
 
-`AshbyWorkers.lastReconcilePass()` additionally exposes the last pass as a
-structured snapshot for operators. The invariant `observed === admitted +
-sum(skipped)` always holds and is asserted in tests. Log lines carry only
-allowlisted fields — the repo logger's metadata allowlist is mirrored in the
-Python voice service and is deliberately not widened for these counters, which
-have a proper home in the metrics sink.
+| Signal | Where it actually lands | Usable now? |
+| --- | --- | --- |
+| `reconcile` object on Mission Control `GET /health` | HTTP, interviewer+ | **yes** — the primary gate |
+| `warn` logs: `ashby_reconcile_aborted` (`enqueue_cap` / `unclassified_cap`), `ashby_reconcile_mapping_index_truncated` | app logs | **yes** |
+| `reconcileNoProgressRuns`, `reconcileLastSuccessAt` on `GET /health` | HTTP, from the DB | **yes** — fleet-wide |
+| DB verify queries (below) | psql | **yes** — fleet-wide |
+| `ashby_reconcile_*` counters via `lib/metrics.ts` | **a no-op sink** | **no** — see below |
+
+`runReconciliation` emits `ashby_reconcile_observed`, `_admitted`, `_enqueued`,
+`_unclassified`, `_skipped_mapping`, `_skipped_stage`, `_skipped_ambiguous`,
+`_skipped_no_application`, and `_mapping_index_truncated`. **These are wired but
+not yet collected:** there is no production `setMetricSink` caller in this
+deployment, so `counter()` reaches `NOOP_SINK` and a debug log line carrying
+only the metric name. They become the alerting path the moment a sink is
+installed — **do not write an alert against them today and assume it fires.**
+
+Because of that, the counts are also published to the health surface, which is
+a real consumer: every non-`locked` pass calls `publishReconcilePass(...)`, and
+Mission Control `GET /health` returns them as `reconcile` (null when *this
+process* has run no pass — never a fleet-wide claim, and never a claim that no
+reconciliation happened). Counts and sanitized codes only; no application, job,
+stage, candidate, mapping, or tenant identifier appears there. In-process,
+`AshbyWorkers.lastReconcilePass()` exposes the same snapshot.
+
+The invariant `observed === admitted + sum(skipped)` holds on any pass that
+reached a normal stop and is asserted in tests; on an **aborted** pass
+(`enqueue_cap` / `unclassified_cap`) the row that tripped the bound is observed
+but neither admitted nor skipped, and is reconsidered next pass.
+
+Log lines carry only allowlisted fields — the repo logger's metadata allowlist
+is mirrored in the Python voice service and is deliberately not widened.
 
 - **Sync mode:** incremental with the stored token, unless the token is absent,
   the stream is `full_resync_required`, or the token is older than the **14-day**
@@ -246,6 +266,26 @@ every pass.
   Exceeding the bound stops the run with `stop: 'unclassified_cap'`, does not
   advance, and flags the stream `list_schema_unclassified` — loud and bounded in
   both directions.
+
+#### Reading `no_progress_runs` correctly
+
+Neither cap advances the cursor, so **both make `no_progress_runs` climb** — the
+same counter diagnostic 1a reads as "every run is re-storming". A newly enabled
+mapping with more than 200 parked candidates legitimately trips the breaker for
+several consecutive passes, which is exactly when an operator is watching that
+number during re-activation. Discriminate before concluding anything:
+
+| `stop` | `enqueued` | `no_progress_runs` | Reading |
+| --- | --- | --- | --- |
+| `enqueue_cap` | **> 0** | climbing | **Healthy backlog draining.** Each pass converts 200 more parked applications into work. Expect it to end. |
+| `item_cap` / `page_cap` / `deadline` | 0 | climbing | **Stuck** — the corpus cannot drain in one run. See the corpus precondition below. |
+| `unclassified_cap` | any | climbing | **Provider schema drift.** Investigate the list shape; it will not self-heal. |
+| `drained` | any | resets to 0 | Normal. |
+
+The fast confirmation is that work is actually moving: `enqueued > 0` on the
+health `reconcile` object, or a shrinking `pending` count for `ashby.signal` in
+diagnostic 1b across two passes. `no_progress_runs` climbing **with
+`enqueued = 0`** is the genuine stuck case.
 
 ### One-time cleanup of the pre-fix storm backlog
 
@@ -380,27 +420,99 @@ Do **not** delete the checkpoint row to "start fresh" — that discards the
 `full_resync_required` and epoch state the repair depends on. Use
 `mark_ashby_sync_full_resync`.
 
+### Corpus-size precondition (a hard gate, check this first)
+
+A forced full resync must drain in **one run** or the cursor never advances. The
+per-run bounds are `maxItems 5000`, `maxPages 50 × pageLimit 100 = 5000`, and
+`deadlineMs 60000`, and the checkpoint advances only on `stop: 'drained'`.
+
+A tenant whose **total application corpus exceeds ~5,000** therefore ends every
+full sweep on `item_cap`/`page_cap`, never advances, never establishes an
+incremental token, and re-pages the same prefix on every tick. This is
+pre-existing, but this PR makes it *reachable by ordinary operator actions*:
+before, a full sweep happened only on 14-day token expiry; now **every mapping
+enable, resume, or AI-stage repoint forces one**.
+
+It fails quiet and cheap rather than loud — admission means the stuck stream
+creates no work — so reconciliation simply stops being a dropped-webhook safety
+net for that tenant. Webhook delivery is unaffected.
+
+> **Gate:** before enabling any mapping on a tenant, confirm the corpus is
+> comfortably below the item/page bound. If it is not, do **not** enable —
+> land page-anchored partial checkpointing first.
+
+Measure it from the provider side (the count of applications `application.list`
+would page, not the count of rows we hold — we hold none before activation).
+After a first pass, the same fact is readable from the health surface:
+`reconcile.observed` at or above 5000 with `advanced: false` and a `stop` of
+`item_cap`/`page_cap` **is** the stuck state.
+
+The observed canary corpus was ~2,000, comfortably under the bound.
+
 ### Re-activation sequence
 
-Only after the above is deployed, applied, and cleaned up:
+Only after the above is deployed, applied, and cleaned up. Every gate below is
+executable as written — each names the exact surface it is read from.
 
 1. Confirm `ASHBY_RUNTIME_ENABLED=false` fleet-wide and no lease holder (§1a).
 2. Deploy this code with the flag still false — `createAshbyRuntime` returns
    null, so it is a genuine no-op deploy.
 3. Apply migration 0033 (verified against a real Docker `0001→0033` run).
 4. Execute the cleanup and verify it.
-5. Keep **every mapping paused**. Enable the runtime on **one** machine with a
+5. Confirm the **corpus precondition** above.
+6. Keep **every mapping paused**. Enable the runtime on **one** machine with a
    conservative `ASHBY_RECONCILE_INTERVAL_MS`.
-6. Observe one full reconcile cycle. **Required:** `ashby_reconcile_admitted =
-   0`, `ashby_reconcile_enqueued = 0`, `job_queue` unchanged, checkpoint
-   advances. Any non-zero admission with all mappings paused is a
-   stop-and-revert signal.
-7. Enable **exactly one** mapping for a low-volume job via Mission Control.
-   Confirm the resume forced the resync (`status = full_resync_required`,
-   reason `mapping_enabled`).
-8. Observe the next run: admissions should equal the applications genuinely at
-   that mapping's AI stage, each producing exactly one link and one import.
-9. Only then widen, one mapping at a time, watching the counters at each step.
+7. Observe one full reconcile cycle, then read the gate from Mission Control:
+
+   ```bash
+   curl -sS -H "Authorization: Bearer $TOKEN" \
+     "$API/api/integrations/ashby/mission-control/health" \
+   | jq '{status, reconcile, noProgress: .backlog.reconcileNoProgressRuns}'
+   ```
+
+   **Required, with every mapping paused:**
+
+   ```jsonc
+   "reconcile": {
+     "admitted": 0,        // ← any non-zero here is STOP-AND-REVERT
+     "enqueued": 0,        // ← ditto
+     "enabledMappings": 0, // nothing could be admitted
+     "advanced": true,     // the pass drained and the cursor moved
+     "stop": "drained"
+   }
+   ```
+
+   `reconcile: null` means *this* machine has not run a pass yet — wait for one
+   interval, or query the machine running the scheduler. It is **not** evidence
+   that nothing ran.
+
+   Cross-check the durable, fleet-wide side (no reconcile-generated work at all):
+
+   ```sql
+   select name, status, count(*) from screening_v2.job_queue
+    where name like 'ashby.%' group by 1,2 order by 1,2;   -- expect: no new rows
+
+   select status, last_success_at, no_progress_runs
+     from screening_v2.ashby_sync_checkpoints where provider = 'ashby';
+                                                            -- expect: idle, fresh, 0
+   ```
+
+8. Enable **exactly one** mapping for a low-volume job via Mission Control.
+   Confirm the resume forced the resync in the same transaction:
+
+   ```sql
+   select status, (sync_token is null) as token_cleared, full_resync_reason, resync_epoch
+     from screening_v2.ashby_sync_checkpoints
+    where provider = 'ashby' and checkpoint_key = 'application.list';
+   -- expect: full_resync_required, true, 'mapping_enabled', epoch incremented
+   ```
+
+9. Observe the next run. `reconcile.admitted` should equal the applications
+   genuinely sitting at that mapping's AI stage, each producing exactly one link
+   and one import — verify against Mission Control `/workflows`. If `stop` is
+   `enqueue_cap` with `enqueued > 0`, that is the backlog draining normally
+   (see "Reading `no_progress_runs` correctly"); let it run further passes.
+10. Only then widen, one mapping at a time, re-reading `reconcile` at each step.
 
 **Rollback at any step:** set `ASHBY_RUNTIME_ENABLED=false`. No timer is armed,
 no client exists, and durable state stays consistent.
@@ -425,6 +537,15 @@ no client exists, and durable state stays consistent.
 `describeAshbyConfig` returns `{ enabled, webhookSecretConfigured, active }`
 booleans (never the secret) for health/metadata without any live-connectivity
 claim. When `active` is false, the webhook is intentionally 503.
+
+Mission Control `GET /health` (interviewer+) additionally returns `reconcile` —
+the last reconciliation pass observed by that process, as sanitized counts
+(`observed`, `admitted`, `skipped.*`, `unclassified`, `enabledMappings`,
+`mappingIndexTruncated`, `recovered`, `duplicates`, `enqueued`, `advanced`,
+`stop`, `mode`, `observedAt`), or `null` when that process has run none. It is a
+per-process observation, not a fleet-wide claim, and it deliberately does **not**
+feed the degradation verdict — the durable backlog and the scheduler heartbeat
+remain the liveness signals. See the re-activation gates for how it is read.
 
 ## Not in this PR (later work / go-live gates)
 
