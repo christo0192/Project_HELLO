@@ -52,6 +52,12 @@ export interface ExistingLinkRow {
   id: string;
   externalApplicationId: string;
   terminalState?: 'withdrawn' | 'deleted' | 'manual_stage_cancel' | null;
+  /**
+   * The link's currently-stored opaque resume handle, if the store surfaces
+   * it. Needed to decide whether a REUSED link still needs the handle
+   * backfilled — see the backfill in `runImport`.
+   */
+  externalResumeFileHandle?: string | null;
 }
 
 export interface EnqueueResult {
@@ -99,6 +105,12 @@ export interface WorkflowStores {
     dependsOn?: string | null;
     marker?: string | null;
   }): Promise<EnqueueResult>;
+  /**
+   * Backfill the opaque resume handle onto an EXISTING link that has none.
+   * Optional so every existing fake keeps compiling; when absent the backfill
+   * is simply skipped. Implementations must never overwrite a non-null handle.
+   */
+  bindLinkResumeHandle?(applicationLinkId: string, handle: string): Promise<void>;
   completeOperation(id: string, leaseToken: string, externalAnchor?: string | null, marker?: string | null): Promise<'ok' | 'not_owned'>;
   failOperation(id: string, leaseToken: string, errorCode: string, retryable: boolean): Promise<{ outcome: 'retry' | 'failed' } | 'not_owned'>;
 }
@@ -130,6 +142,22 @@ export interface RuntimeWorkflowStores extends WorkflowStores {
   readIngestion(applicationLinkId: string): Promise<{ state: string; attempts: number } | null>;
   /** Read the link row needed to materialize an invite (opaque ids only). */
   readLink(applicationLinkId: string): Promise<WorkflowLinkRow | null>;
+  /**
+   * DEFER a running operation back to pending because a prerequisite stopped
+   * holding after the claim. Refunds the attempt the claim charged and
+   * reschedules behind a bounded delay.
+   *
+   * This is NOT `failOperation(..., retryable)`: that leaves the attempt spent
+   * and reschedules with no backoff, which is how a five-attempt budget was
+   * consumed in ~20 seconds by an invite waiting on an ingestion that was
+   * working correctly. A wait is not a failure.
+   */
+  deferOperation(
+    id: string,
+    leaseToken: string,
+    reasonCode: string,
+    delaySeconds: number,
+  ): Promise<'ok' | 'not_owned'>;
   /** Park a completed application as `writeback_pending` (audited, idempotent). */
   markWritebackPending(applicationLinkId: string, reason: string): Promise<{ status: string }>;
   /**
@@ -149,6 +177,15 @@ export interface WorkflowLinkRow {
   id: string;
   externalApplicationId: string;
   externalJobId: string | null;
+  /**
+   * Opaque resume file handle, or null when the application carried none.
+   *
+   * This — not "does an ingestion row exist" — is the authoritative answer to
+   * "is this application resume-backed?". `runImport` seeds an ingestion row
+   * for EVERY link, so the row-existence test was always true and a no-resume
+   * application would have waited forever for an ingestion with nothing to do.
+   */
+  externalResumeFileHandle: string | null;
   jobMappingId: string | null;
   candidateId: string | null;
   sessionId: string | null;
@@ -212,18 +249,28 @@ export async function runImport(externalApplicationId: string, deps: ImportDeps)
   if (decision.action !== 'import') return { status: 'skipped', reason: decision.reason };
 
   // Application-id-only identity: reuse the existing non-terminal link or create one.
+  const resumeHandle = deps.readResumeFileHandle?.(info.results) ?? null;
   let linkId: string;
   let reused: boolean;
   if (existing && existing.externalApplicationId === appId) {
     linkId = existing.id;
     reused = true;
+    // Backfill-on-reuse. The handle used to be captured ONLY in the create
+    // branch, so a link first imported before the application carried a resume
+    // (or before the handle was readable) never acquired one on any later
+    // re-import: `external_resume_file_handle` stayed null forever, ingestion
+    // had nothing to resolve, and the invite went out down the no-resume path
+    // with no resume ever ingested. Never overwrites an existing handle.
+    if (resumeHandle && !existing.externalResumeFileHandle && deps.stores.bindLinkResumeHandle) {
+      await deps.stores.bindLinkResumeHandle(linkId, resumeHandle);
+    }
   } else {
     const created = await deps.stores.createLink({
       externalApplicationId: appId,
       externalJobId: jobId,
       externalStageId: decision.stageId,
       jobMappingId: mapping.id,
-      externalResumeFileHandle: deps.readResumeFileHandle?.(info.results) ?? null,
+      externalResumeFileHandle: resumeHandle,
     });
     linkId = created.id;
     reused = false;

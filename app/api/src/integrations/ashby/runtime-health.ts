@@ -314,6 +314,44 @@ export interface BacklogView {
   operationsAwaitingDelivery: number;
   /** Applications parked awaiting manual result publication. */
   writebackPending: number;
+  /**
+   * Invite deliveries currently held back by an unmet prerequisite (mapping
+   * paused, or a resume-backed link whose ingestion is not `ready`). This is
+   * CORRECT behaviour — waiting, not broken — but it was previously
+   * indistinguishable from `operationsPending`, so an operator had no way to
+   * tell "the pipeline is idle" from "every invite is blocked".
+   */
+  operationsBlockedPrerequisite: number;
+  /**
+   * The SUBSET of `operationsBlockedPrerequisite` that cannot clear without a
+   * human: a resume-backed link whose ingestion ended `failed_review`. The 0029
+   * trigger lets that state go only to `queued` or `cancelled` and nothing in
+   * the runtime does either, so the invite waits forever.
+   *
+   * This exists because the ordering repair traded a wrong-but-loud signal for
+   * a right-but-quiet one: before it, such a link surfaced (incorrectly) as
+   * `operationsFailed` within ~25 seconds. Being recoverable instead of
+   * budget-burnt is the improvement; being SILENT would not be. Not subtracted
+   * from the total above — a consumer wanting "transiently waiting" takes the
+   * difference.
+   */
+  operationsBlockedFailedIngestion: number;
+  /**
+   * Invite deliveries already driven to `failed` on a prerequisite-deferral
+   * code. Non-zero means `reopen_ashby_invite_delivery` is needed; after the
+   * 0035 fix nothing new can enter this count.
+   */
+  operationsFailedPrerequisite: number;
+  /**
+   * Resume ingestions stranded in `queued` past the stuck window on a
+   * resume-backed, non-terminal link — i.e. work that was enqueued and never
+   * started. This signal did not exist before: a stranded ingestion was
+   * invisible to /health by construction and discoverable only by direct
+   * database inspection.
+   */
+  ingestionStuckQueued: number;
+  /** Resume ingestions stranded in `fetching` past the stuck window. */
+  ingestionStuckFetching: number;
   /** Consecutive reconciliation runs that did not advance the cursor. */
   reconcileNoProgressRuns: number;
   /** Last fully-drained reconciliation, or null. */
@@ -323,6 +361,9 @@ export interface BacklogView {
 const EMPTY_BACKLOG: BacklogView = {
   queuePending: 0, dlqDepth: 0, oldestPendingAgeSec: null,
   operationsPending: 0, operationsFailed: 0, operationsAwaitingDelivery: 0,
+  operationsBlockedPrerequisite: 0, operationsBlockedFailedIngestion: 0,
+  operationsFailedPrerequisite: 0,
+  ingestionStuckQueued: 0, ingestionStuckFetching: 0,
   writebackPending: 0, reconcileNoProgressRuns: 0, reconcileLastSuccessAt: null,
 };
 
@@ -397,9 +438,28 @@ export async function readBacklog(
   if (cpErr) throw new Error('ashby_health_count_error');
   const cp = checkpoint as { no_progress_runs?: number; last_success_at?: string | null } | null;
 
+  // Prerequisite/stuck counters come from ONE service-role RPC: the predicates
+  // need joins across operations, links, mappings and ingestions, which a
+  // PostgREST count cannot express. Counters only — the RPC returns no
+  // application, job, candidate or tenant identifier.
+  const { data: prereq, error: prereqErr } = await client.rpc('ashby_prerequisite_backlog', {
+    p_stuck_after_seconds: DEGRADE_THRESHOLDS.ingestionStuckAgeSec,
+  });
+  if (prereqErr) throw new Error('ashby_health_count_error');
+  const pq = (prereq ?? {}) as Record<string, unknown>;
+  const counter = (key: string): number => {
+    const v = pq[key];
+    return typeof v === 'number' && Number.isFinite(v) ? v : 0;
+  };
+
   return {
     queuePending, dlqDepth, oldestPendingAgeSec,
     operationsPending, operationsFailed, operationsAwaitingDelivery, writebackPending,
+    operationsBlockedPrerequisite: counter('pending_blocked'),
+    operationsBlockedFailedIngestion: counter('pending_blocked_failed_ingestion'),
+    operationsFailedPrerequisite: counter('failed_prerequisite'),
+    ingestionStuckQueued: counter('ingestion_stuck_queued'),
+    ingestionStuckFetching: counter('ingestion_stuck_fetching'),
     reconcileNoProgressRuns: typeof cp?.no_progress_runs === 'number' ? cp.no_progress_runs : 0,
     reconcileLastSuccessAt: cp?.last_success_at ?? null,
   };
@@ -507,6 +567,21 @@ export const DEGRADE_THRESHOLDS = {
   dlqDepth: 1,
   /** Consecutive non-advancing reconciliation runs. */
   reconcileNoProgressRuns: 3,
+  /**
+   * A resume ingestion sitting in `queued` or `fetching` longer than this is
+   * stranded, not slow. Download + scan + parse of a real resume is a
+   * seconds-to-low-minutes operation.
+   */
+  ingestionStuckAgeSec: 900,
+  /** Any stranded ingestion needs a human — one is already a fault. */
+  ingestionStuck: 1,
+  /** Any invite killed by the prerequisite-ordering defect needs a reopen. */
+  operationsFailedPrerequisite: 1,
+  /**
+   * Any invite blocked behind a failed_review ingestion needs a human — the
+   * ingestion cannot requeue itself, so this never clears on its own.
+   */
+  operationsBlockedFailedIngestion: 1,
 } as const;
 
 export type HealthStatus = 'healthy' | 'degraded' | 'idle';
@@ -540,6 +615,28 @@ export function evaluateDegradation(input: {
   }
   if (input.backlog.reconcileNoProgressRuns >= DEGRADE_THRESHOLDS.reconcileNoProgressRuns) {
     reasons.push('reconciliation_not_advancing');
+  }
+  // A stranded ingestion is the failure shape the live canary produced, and it
+  // had no health signal at all: the durable row sat in `queued` forever while
+  // /health reported a perfectly ordinary backlog.
+  if (input.backlog.ingestionStuckQueued + input.backlog.ingestionStuckFetching
+      >= DEGRADE_THRESHOLDS.ingestionStuck) {
+    reasons.push('ingestion_stuck');
+  }
+  // An invite blocked behind a failed_review ingestion is NOT transient: the
+  // ingestion can only leave failed_review via an explicit requeue or a cancel,
+  // neither of which the runtime performs. Degrading here is what keeps the
+  // ordering repair from converting a loud wrong signal into a silent right
+  // one — the invite is correctly not failed, but it is also going nowhere.
+  if (input.backlog.operationsBlockedFailedIngestion
+      >= DEGRADE_THRESHOLDS.operationsBlockedFailedIngestion) {
+    reasons.push('invite_blocked_failed_ingestion');
+  }
+  // Invites killed by the ordering defect. Nothing new can enter this count
+  // after 0035, so a non-zero value is a recovery backlog, not a live fault.
+  if (input.backlog.operationsFailedPrerequisite
+      >= DEGRADE_THRESHOLDS.operationsFailedPrerequisite) {
+    reasons.push('invite_prerequisite_failed');
   }
   if (input.scheduler.registeredInThisProcess && input.scheduler.loops.some((l) => l.stale)) {
     reasons.push('scheduler_loop_stale');

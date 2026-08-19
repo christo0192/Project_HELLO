@@ -4973,6 +4973,13 @@ begin
     null::uuid, 'pol32b-job', v_role, 'b_ai', 'b_ta', null::text, null::text, null::text,
     v_actor, 'both', 24, 'paused', null::text, v_actor);
   v_mapid := (v_map->>'id')::uuid;
+  -- 0035: an ENABLED mapping is now a CLAIM PREREQUISITE for invite_delivery.
+  -- This block exercises operation-key/park/hand-off mechanics, not mapping
+  -- status, so the mapping is enabled here — otherwise every claim below
+  -- correctly returns `empty` and the assertions test nothing. The link
+  -- deliberately carries no resume handle, so the ingestion prerequisite is
+  -- satisfied by the application having no resume at all.
+  perform screening_v2.set_ashby_mapping_status(v_mapid, 'enabled', null, v_actor);
 
   insert into screening_v2.candidates (role_id, owner_id, status)
   values (v_role, v_actor, 'new') returning id into v_cand;
@@ -5827,6 +5834,368 @@ begin
 
   delete from screening_v2.ashby_job_mappings where external_job_id = 'pol34-job';
   delete from screening_v2.ashby_sync_checkpoints where checkpoint_key = 'application.list';
+end;
+$$;
+
+
+-- =====================================================================
+-- 0035: Ashby invite prerequisites — claim gate, attempt-safe deferral,
+--       guarded reopen, and the blocked/stuck counters.
+-- =====================================================================
+
+select _policy_tests.assert(
+  'ashby 0035 RPCs are service-role only',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname in ('defer_ashby_operation','reopen_ashby_invite_delivery',
+                        'ashby_prerequisite_backlog')
+      and not has_function_privilege('anon', p.oid, 'EXECUTE')
+      and not has_function_privilege('authenticated', p.oid, 'EXECUTE')
+      and has_function_privilege('service_role', p.oid, 'EXECUTE')
+  ) = 3,
+  'ashby 0035 RPCs must be service-role only'
+);
+
+select _policy_tests.assert(
+  'ashby 0035 RPCs pin search_path',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname in ('defer_ashby_operation','reopen_ashby_invite_delivery',
+                        'ashby_prerequisite_backlog')
+      and p.prosecdef
+      and array_to_string(coalesce(p.proconfig, '{}'), ',') like '%search_path%'
+  ) = 3,
+  'every 0035 SECURITY DEFINER RPC must pin search_path'
+);
+
+-- The file-handle bound is a CROSS-LAYER contract (client + extractor + this
+-- CHECK). 0035 deliberately does NOT widen it; this asserts it is still 512,
+-- because raising it here alone would let an over-long handle reach createLink.
+select _policy_tests.assert(
+  'ashby 0035: the resume file handle CHECK is still bounded at 512',
+  (select pg_get_constraintdef(oid)
+     from pg_constraint
+    where conname = 'chk_ashby_application_links_resume_handle'
+      and conrelid = 'screening_v2.ashby_application_links'::regclass)
+    like '%512%',
+  'the 0029 resume-handle bound must stay 512 and move only together with the client + extractor'
+);
+
+do $$
+declare
+  v_role     uuid;
+  v_map      uuid;
+  v_link     uuid;   -- resume-backed
+  v_link_nr  uuid;   -- no resume handle
+  v_link_fr  uuid;   -- resume-backed, ingestion ends failed_review
+  v_op       uuid;
+  v_op_nr    uuid;
+  v_res      jsonb;
+  v_lease    uuid;
+  v_att      integer;
+  v_state    text;
+  v_sched    timestamptz;
+  v_owner    uuid := '00000000-0000-4000-8000-0000000000aa';
+begin
+  select id into v_role from screening_v2.roles limit 1;
+  if v_role is null then
+    perform _policy_tests.assert('ashby 0035 functional: seed role present', false, 'no seed role available');
+    return;
+  end if;
+
+  insert into screening_v2.ashby_job_mappings
+    (external_job_id, role_id, owner_id, ai_screening_stage_id, ta_screening_stage_id, status, delivery_mode)
+  values ('pol35-job', v_role, v_owner, 'pol35-ai', 'pol35-ta', 'enabled', 'manual')
+  returning id into v_map;
+
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol35-app', 'pol35-job', v_map, repeat('h', 270))
+  returning id into v_link;
+
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol35-app-noresume', 'pol35-job', v_map, null)
+  returning id into v_link_nr;
+
+  -- `runImport` seeds an ingestion row for EVERY link, including one with no
+  -- resume handle. Reproduce that faithfully — it is the F-2 trap.
+  perform screening_v2.advance_ashby_ingestion(v_link, 'queued', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_nr, 'queued', null, null, null, null);
+
+  v_res := screening_v2.enqueue_ashby_operation(
+    v_link, 'invite_delivery', 'ashby:invite:manual:pol35-app:pending', null, null, gen_random_uuid());
+  v_op := (v_res->>'id')::uuid;
+  v_res := screening_v2.enqueue_ashby_operation(
+    v_link_nr, 'invite_delivery', 'ashby:invite:manual:pol35-app-noresume:pending', null, null, gen_random_uuid());
+  v_op_nr := (v_res->>'id')::uuid;
+
+  -- ── B-2/B-1: a resume-backed link whose ingestion is not ready is NOT
+  -- claimable, and crucially is charged NO attempt for waiting. ────────────
+  -- Claim by type would otherwise pick up the no-resume operation, so assert
+  -- on the ROW rather than on the claim being empty.
+  for v_state in select unnest(array['queued','fetching','scanning','extracting','structuring']) loop
+    perform screening_v2.claim_ashby_operation('invite_delivery', 'w35', 30);
+    perform screening_v2.claim_ashby_operation('invite_delivery', 'w35', 30);
+  end loop;
+  select attempts, state into v_att, v_state from screening_v2.ashby_operations where id = v_op;
+  perform _policy_tests.assert(
+    'ashby 0035: a queued ingestion leaves the invite pending with ZERO attempts',
+    v_att = 0 and v_state = 'pending',
+    'attempts=' || v_att || ' state=' || v_state);
+
+  -- ── F-2: a NO-RESUME link is claimable immediately even though its
+  -- ingestion row exists and reads `queued`. ───────────────────────────────
+  select attempts into v_att from screening_v2.ashby_operations where id = v_op_nr;
+  perform _policy_tests.assert(
+    'ashby 0035: a no-resume link is claimable despite a queued ingestion row',
+    v_att > 0,
+    'the no-resume invite must not wait on an ingestion that has nothing to ingest');
+
+  -- Put the no-resume operation out of the way for the rest of the block.
+  update screening_v2.ashby_operations set state = 'cancelled' where id = v_op_nr;
+
+  -- ── A paused mapping is a claim prerequisite too. ────────────────────────
+  perform screening_v2.set_ashby_mapping_status(v_map, 'paused', 'pol35 pause', v_owner);
+  perform screening_v2.advance_ashby_ingestion(v_link, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link, 'scanning', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link, 'extracting', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link, 'structuring', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link, 'ready', null, null, null, null);
+  v_res := screening_v2.claim_ashby_operation('invite_delivery', 'w35', 30);
+  perform _policy_tests.assert(
+    'ashby 0035: a PAUSED mapping makes the invite unclaimable even when ingestion is ready',
+    v_res->>'status' = 'empty',
+    'got ' || coalesce(v_res->>'status', '<null>'));
+  select attempts into v_att from screening_v2.ashby_operations where id = v_op;
+  perform _policy_tests.assert(
+    'ashby 0035: a paused mapping charges the invite no attempt',
+    v_att = 0, 'attempts=' || v_att);
+
+  -- ── Everything satisfied: exactly one claim. ─────────────────────────────
+  perform screening_v2.set_ashby_mapping_status(v_map, 'enabled', null, v_owner);
+  v_res := screening_v2.claim_ashby_operation('invite_delivery', 'w35', 30);
+  perform _policy_tests.assert(
+    'ashby 0035: ready ingestion + enabled mapping makes the invite claimable',
+    v_res->>'status' = 'claimed' and (v_res->>'id')::uuid = v_op,
+    'got ' || coalesce(v_res->>'status', '<null>'));
+  v_lease := (v_res->>'lease_token')::uuid;
+  perform _policy_tests.assert(
+    'ashby 0035: the claim charges exactly one attempt',
+    (v_res->>'attempts')::int = 1, 'got ' || coalesce(v_res->>'attempts','<null>'));
+
+  -- ── defer: refunds the attempt, reschedules, never fails. ────────────────
+  v_res := screening_v2.defer_ashby_operation(v_op, gen_random_uuid(), 'ingestion_not_ready', 60);
+  perform _policy_tests.assert(
+    'ashby 0035: defer with a WRONG lease is not_owned',
+    v_res->>'status' = 'not_owned', 'got ' || coalesce(v_res->>'status','<null>'));
+
+  v_res := screening_v2.defer_ashby_operation(v_op, v_lease, 'not a valid code', 60);
+  perform _policy_tests.assert(
+    'ashby 0035: defer refuses an unsanitized reason code',
+    v_res->>'status' = 'invalid_error_code', 'got ' || coalesce(v_res->>'status','<null>'));
+
+  v_res := screening_v2.defer_ashby_operation(v_op, v_lease, 'ingestion_not_ready', 60);
+  perform _policy_tests.assert(
+    'ashby 0035: defer under the live lease refunds the attempt',
+    v_res->>'status' = 'ok' and (v_res->>'attempts')::int = 0,
+    'got ' || coalesce(v_res::text, '<null>'));
+
+  select state, attempts, scheduled_at into v_state, v_att, v_sched
+    from screening_v2.ashby_operations where id = v_op;
+  perform _policy_tests.assert(
+    'ashby 0035: a deferred operation is pending, un-charged and rescheduled forward',
+    v_state = 'pending' and v_att = 0 and v_sched > now(),
+    'state=' || v_state || ' attempts=' || v_att);
+
+  -- The delay is server-clamped in BOTH directions: a deferral loop can never
+  -- become a hot loop, and can never park a row for a week either.
+  v_res := screening_v2.claim_ashby_operation('invite_delivery', 'w35', 30);
+  update screening_v2.ashby_operations set scheduled_at = now() where id = v_op;
+  v_res := screening_v2.claim_ashby_operation('invite_delivery', 'w35', 30);
+  v_lease := (v_res->>'lease_token')::uuid;
+  v_res := screening_v2.defer_ashby_operation(v_op, v_lease, 'ingestion_not_ready', 999999);
+  perform _policy_tests.assert(
+    'ashby 0035: an absurd defer delay is clamped to 3600s',
+    (v_res->>'delay_seconds')::int = 3600, 'got ' || coalesce(v_res->>'delay_seconds','<null>'));
+
+  -- ── reopen: six independent refusals, then the one success. ──────────────
+  update screening_v2.ashby_operations
+     set state = 'failed', attempts = 5, error_code = 'ingestion_not_ready',
+         scheduled_at = now(), lease_token = null, lease_owner = null, lease_expires_at = null
+   where id = v_op;
+
+  v_res := screening_v2.reopen_ashby_invite_delivery(gen_random_uuid(), v_owner);
+  perform _policy_tests.assert('ashby 0035 reopen: unknown operation is not_found',
+    v_res->>'status' = 'not_found', 'got ' || coalesce(v_res->>'status','<null>'));
+
+  -- Guard 1: never a scorecard_write / stage_move (the result-sink refusal).
+  v_res := screening_v2.enqueue_ashby_operation(
+    v_link, 'scorecard_write', 'pol35-score', null, null, gen_random_uuid());
+  update screening_v2.ashby_operations
+     set state = 'failed', error_code = 'ingestion_not_ready'
+   where id = (v_res->>'id')::uuid;
+  v_res := screening_v2.reopen_ashby_invite_delivery((v_res->>'id')::uuid, v_owner);
+  perform _policy_tests.assert('ashby 0035 reopen: a scorecard_write is refused',
+    v_res->>'status' = 'unsupported_operation_type', 'got ' || coalesce(v_res->>'status','<null>'));
+
+  -- Guard 2: only a FAILED operation.
+  update screening_v2.ashby_operations set state = 'pending' where id = v_op;
+  v_res := screening_v2.reopen_ashby_invite_delivery(v_op, v_owner);
+  perform _policy_tests.assert('ashby 0035 reopen: a non-failed operation is not_retryable',
+    v_res->>'status' = 'not_retryable', 'got ' || coalesce(v_res->>'status','<null>'));
+  update screening_v2.ashby_operations
+     set state = 'failed', attempts = 5, error_code = 'ingestion_not_ready' where id = v_op;
+
+  -- Guard 4: the mapping must still be ENABLED.
+  perform screening_v2.set_ashby_mapping_status(v_map, 'paused', 'pol35 pause 2', v_owner);
+  v_res := screening_v2.reopen_ashby_invite_delivery(v_op, v_owner);
+  perform _policy_tests.assert('ashby 0035 reopen: a paused mapping is refused',
+    v_res->>'status' = 'blocked_mapping', 'got ' || coalesce(v_res->>'status','<null>'));
+  perform screening_v2.set_ashby_mapping_status(v_map, 'enabled', null, v_owner);
+
+  -- Guard 5: the ingestion prerequisite must genuinely hold. `ready` is
+  -- TERMINAL in the 0029 state machine, so an unfinished ingestion is
+  -- reproduced by removing the row (the `missing` branch) and walking a fresh
+  -- one forward, never by an illegal backwards transition.
+  delete from screening_v2.ashby_resume_ingestions where application_link_id = v_link;
+  v_res := screening_v2.reopen_ashby_invite_delivery(v_op, v_owner);
+  perform _policy_tests.assert('ashby 0035 reopen: a MISSING ingestion is refused',
+    v_res->>'status' = 'ingestion_not_ready', 'got ' || coalesce(v_res->>'status','<null>'));
+
+  perform screening_v2.advance_ashby_ingestion(v_link, 'queued', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link, 'fetching', null, null, null, null);
+  v_res := screening_v2.reopen_ashby_invite_delivery(v_op, v_owner);
+  perform _policy_tests.assert('ashby 0035 reopen: an IN-FLIGHT ingestion is refused',
+    v_res->>'status' = 'ingestion_not_ready', 'got ' || coalesce(v_res->>'status','<null>'));
+
+  perform screening_v2.advance_ashby_ingestion(v_link, 'scanning', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link, 'extracting', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link, 'structuring', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link, 'ready', null, null, null, null);
+
+  -- Guard 6: THE DEFERRAL-CODE ALLOWLIST. This is what stops the RPC being a
+  -- general-purpose budget reset around max_attempts.
+  update screening_v2.ashby_operations set error_code = 'blocked_provider' where id = v_op;
+  v_res := screening_v2.reopen_ashby_invite_delivery(v_op, v_owner);
+  perform _policy_tests.assert(
+    'ashby 0035 reopen: a REAL delivery failure (blocked_provider) is refused',
+    v_res->>'status' = 'not_a_deferral', 'got ' || coalesce(v_res->>'status','<null>'));
+  update screening_v2.ashby_operations set error_code = 'invalid_reissue_path' where id = v_op;
+  v_res := screening_v2.reopen_ashby_invite_delivery(v_op, v_owner);
+  perform _policy_tests.assert(
+    'ashby 0035 reopen: invalid_reissue_path is refused',
+    v_res->>'status' = 'not_a_deferral', 'got ' || coalesce(v_res->>'status','<null>'));
+  update screening_v2.ashby_operations set error_code = 'ingestion_not_ready' where id = v_op;
+
+  -- The success path, with the audit row carrying the PRE-RESET attempts.
+  v_res := screening_v2.reopen_ashby_invite_delivery(v_op, v_owner);
+  perform _policy_tests.assert(
+    'ashby 0035 reopen: every guard satisfied reopens the operation',
+    v_res->>'status' = 'ok' and (v_res->>'attempts_before')::int = 5,
+    'got ' || coalesce(v_res::text,'<null>'));
+
+  select state, attempts into v_state, v_att from screening_v2.ashby_operations where id = v_op;
+  perform _policy_tests.assert(
+    'ashby 0035 reopen: the row is pending with a corrected attempt count',
+    v_state = 'pending' and v_att = 0, 'state=' || v_state || ' attempts=' || v_att);
+
+  perform _policy_tests.assert(
+    'ashby 0035 reopen: max_attempts is NOT raised',
+    (select max_attempts from screening_v2.ashby_operations where id = v_op) = 5,
+    'the reopen must correct the accounting, never enlarge the budget');
+
+  perform _policy_tests.assert(
+    'ashby 0035 reopen: an audit row records the acting admin and the pre-reset attempts',
+    exists (
+      select 1 from screening_v2.audit_events
+       where action = 'ashby_operation_retry'
+         and target_id = v_op::text
+         and actor_id = v_owner
+         and (metadata->>'attempts_before')::int = 5
+         and metadata->>'reopened_error_code' = 'ingestion_not_ready'),
+    'the reopen must be attributable');
+
+  -- Guard 3: the resurrection guard. Terminal beats everything above.
+  update screening_v2.ashby_operations
+     set state = 'failed', attempts = 5, error_code = 'ingestion_not_ready' where id = v_op;
+  perform screening_v2.cancel_ashby_application(v_link, 'withdrawn', 'pol35 terminal', v_owner);
+  v_res := screening_v2.reopen_ashby_invite_delivery(v_op, v_owner);
+  perform _policy_tests.assert('ashby 0035 reopen: a terminal link is refused',
+    v_res->>'status' = 'blocked_terminal', 'got ' || coalesce(v_res->>'status','<null>'));
+
+  -- ── The blocked/stuck counters: no identifiers, correct arithmetic. ──────
+  v_res := screening_v2.ashby_prerequisite_backlog(900);
+  perform _policy_tests.assert(
+    'ashby 0035: the prerequisite backlog reports all five counters',
+    v_res ? 'pending_blocked' and v_res ? 'pending_blocked_failed_ingestion'
+      and v_res ? 'failed_prerequisite'
+      and v_res ? 'ingestion_stuck_queued' and v_res ? 'ingestion_stuck_fetching',
+    'got ' || coalesce(v_res::text,'<null>'));
+  perform _policy_tests.assert(
+    'ashby 0035: the prerequisite backlog leaks no identifier of any kind',
+    v_res::text not like '%pol35%' and v_res::text not like '%' || v_link::text || '%',
+    'counters only — never an application, job, candidate or tenant identifier');
+
+  -- ── O-1: a failed_review ingestion blocks its invite FOREVER, and that is
+  -- a different fact from "waiting 30 seconds". The 0029 trigger lets
+  -- failed_review go only to queued or cancelled and nothing in the runtime
+  -- does either, so this invite never clears on its own. Build the case on a
+  -- fresh link so the terminal link above cannot contribute.
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol35-app-failed', 'pol35-job', v_map, repeat('h', 64))
+  returning id into v_link_fr;
+  perform screening_v2.advance_ashby_ingestion(v_link_fr, 'queued', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_fr, 'fetching', null, null, null, null);
+
+  v_res := screening_v2.enqueue_ashby_operation(
+    v_link_fr, 'invite_delivery', 'ashby:invite:manual:pol35-app-failed:pending',
+    null, null, gen_random_uuid());
+
+  -- While the ingestion is merely IN FLIGHT it is transient: blocked, but not
+  -- permanently so.
+  v_res := screening_v2.ashby_prerequisite_backlog(900);
+  perform _policy_tests.assert(
+    'ashby 0035/O1: an in-flight ingestion counts as blocked but NOT as permanently blocked',
+    (v_res->>'pending_blocked')::int >= 1
+      and (v_res->>'pending_blocked_failed_ingestion')::int = 0,
+    'got ' || coalesce(v_res::text,'<null>'));
+
+  perform screening_v2.advance_ashby_ingestion(
+    v_link_fr, 'failed_review', null, null, null, 'scan_unavailable');
+
+  v_res := screening_v2.ashby_prerequisite_backlog(900);
+  perform _policy_tests.assert(
+    'ashby 0035/O1: a failed_review ingestion counts as PERMANENTLY blocked',
+    (v_res->>'pending_blocked_failed_ingestion')::int = 1,
+    'got ' || coalesce(v_res::text,'<null>'));
+  perform _policy_tests.assert(
+    'ashby 0035/O1: the permanent count is a SUBSET of the total, not a replacement',
+    (v_res->>'pending_blocked')::int >= (v_res->>'pending_blocked_failed_ingestion')::int,
+    'got ' || coalesce(v_res::text,'<null>'));
+  perform _policy_tests.assert(
+    'ashby 0035/O1: the invite is still pending — blocked is never failed',
+    (select state from screening_v2.ashby_operations
+      where application_link_id = v_link_fr and operation_type = 'invite_delivery') = 'pending',
+    'a blocked invite must not be converted back into a failure');
+
+  -- An explicit requeue (the one exit the 0029 trigger allows) clears it.
+  perform screening_v2.advance_ashby_ingestion(v_link_fr, 'queued', null, null, null, null);
+  v_res := screening_v2.ashby_prerequisite_backlog(900);
+  perform _policy_tests.assert(
+    'ashby 0035/O1: requeueing the ingestion clears the permanent-block count',
+    (v_res->>'pending_blocked_failed_ingestion')::int = 0,
+    'got ' || coalesce(v_res::text,'<null>'));
+
+  delete from screening_v2.ashby_operations
+   where application_link_id in (v_link, v_link_nr, v_link_fr);
+  delete from screening_v2.ashby_resume_ingestions
+   where application_link_id in (v_link, v_link_nr, v_link_fr);
+  delete from screening_v2.ashby_application_links where id in (v_link, v_link_nr, v_link_fr);
+  delete from screening_v2.ashby_job_mappings where id = v_map;
 end;
 $$;
 

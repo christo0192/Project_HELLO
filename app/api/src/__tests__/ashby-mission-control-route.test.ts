@@ -134,6 +134,9 @@ function emptyBacklog() {
   return {
     queuePending: 0, dlqDepth: 0, oldestPendingAgeSec: null as number | null,
     operationsPending: 0, operationsFailed: 0, operationsAwaitingDelivery: 0,
+    operationsBlockedPrerequisite: 0, operationsBlockedFailedIngestion: 0,
+    operationsFailedPrerequisite: 0,
+    ingestionStuckQueued: 0, ingestionStuckFetching: 0,
     writebackPending: 0, reconcileNoProgressRuns: 0, reconcileLastSuccessAt: null,
   };
 }

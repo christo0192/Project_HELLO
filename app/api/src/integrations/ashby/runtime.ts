@@ -80,10 +80,32 @@ export interface AshbyRuntime {
   buildIngestionPorts(input: {
     applicationLinkId: string;
     onState: IngestionPorts['onState'];
-  }): Promise<IngestionPorts | null>;
+  }): Promise<IngestionPortsResult>;
   /** Release pooled resources (parser child processes). Idempotent. */
   shutdown(): Promise<void>;
 }
+
+/**
+ * Why this is a discriminated result and not `IngestionPorts | null`.
+ *
+ * The old signature collapsed three genuinely different outcomes into one
+ * `null`: the link row is missing, the application carried NO resume handle,
+ * and the provider gave us a `file.info` payload with no resolvable URL. The
+ * ingestion handler treated all three as "nothing to do" and completed the
+ * job SUCCESSFULLY, so a real provider failure was reported as success and
+ * the durable ingestion row was left in `queued` forever with no signal
+ * anywhere. Naming the three cases is what makes a durable `failed_review`
+ * reachable for the two that are failures, while keeping the genuine
+ * no-resume case a non-failure.
+ */
+export type IngestionPortsResult =
+  | { status: 'ok'; ports: IngestionPorts }
+  /** The application carried no resume file handle — nothing to ingest. */
+  | { status: 'no_resume' }
+  /** The application link row could not be read. */
+  | { status: 'link_missing' }
+  /** `file.info` returned no resolvable presigned URL — a provider failure. */
+  | { status: 'url_unresolved' };
 
 export interface CreateAshbyRuntimeOptions {
   supabase: SupabaseClient;
@@ -361,26 +383,30 @@ export function createAshbyRuntime(options: CreateAshbyRuntimeOptions): AshbyRun
   async function buildIngestionPorts(input: {
     applicationLinkId: string;
     onState: IngestionPorts['onState'];
-  }): Promise<IngestionPorts | null> {
+  }): Promise<IngestionPortsResult> {
     const { data, error } = await supabase
       .from('ashby_application_links')
       .select('external_resume_file_handle')
       .eq('id', input.applicationLinkId)
       .maybeSingle();
-    if (error || !data) return null;
+    if (error || !data) return { status: 'link_missing' };
     const handle = (data as { external_resume_file_handle: string | null }).external_resume_file_handle;
-    // No resume handle ⇒ nothing to ingest. The caller treats this as
-    // `no_resume`, not as a failure.
-    if (!handle) return null;
+    // No resume handle ⇒ nothing to ingest. This is the ONLY one of the three
+    // early exits that is not a failure.
+    if (!handle) return { status: 'no_resume' };
 
     // Resolve the presigned URL at the LAST possible moment: these URLs are
     // short-lived, and holding one longer than necessary widens the window in
     // which a leaked log line would matter. It is never persisted.
+    //
+    // A throw from `fileInfo` propagates deliberately: it carries the client's
+    // sanitized category/code and its `retriable` flag, and the caller is what
+    // classifies it into "fail this job once, permanently" versus "retry".
     const info = await client.fileInfo(handle);
     const presignedUrl = extractFileUrl(info.results);
-    if (!presignedUrl) return null;
+    if (!presignedUrl) return { status: 'url_unresolved' };
 
-    return {
+    const ports: IngestionPorts = {
       presignedUrl,
       policy: urlPolicy,
       fetch: (url, policy) =>
@@ -418,6 +444,7 @@ export function createAshbyRuntime(options: CreateAshbyRuntimeOptions): AshbyRun
       onState: input.onState,
       extractorVersion: ASHBY_EXTRACTOR_VERSION,
     };
+    return { status: 'ok', ports };
   }
 
   let shut = false;

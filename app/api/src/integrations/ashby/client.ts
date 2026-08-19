@@ -45,7 +45,25 @@ const DEFAULT_BACKOFF_MAX_MS = 10_000;
 const DEFAULT_MAX_RETRY_AFTER_MS = 30_000;
 const DEFAULT_MAX_RESPONSE_BYTES = 5 * 1024 * 1024; // 5 MiB
 const MAX_REQUEST_BODY_BYTES = 256 * 1024;          // 256 KiB
-const MAX_ID_LEN = 256;
+export const MAX_ID_LEN = 256;
+/**
+ * Max accepted length of an opaque provider FILE HANDLE.
+ *
+ * A `fileHandle` is not an identifier: it is a provider-minted opaque token
+ * whose length Ashby does not contract. Validating it with the generic id
+ * bound (256) was a category error, and it is the exact reason the live
+ * canary's 270-character resume handle was rejected pre-transport as
+ * `invalid_request/id_too_long` — ingestion never reached the network.
+ *
+ * 512 is ONE cross-layer contract, shared by:
+ *   - this constant,
+ *   - `extractResumeHandle` (integrations/ashby/runtime-workers.ts),
+ *   - `chk_ashby_application_links_resume_handle` (migration 0029).
+ * Raising it here alone would let an over-long handle reach `createLink` and
+ * turn a clean pre-transport refusal into a mid-import constraint violation,
+ * so if a tenant ever produces a longer handle, all three move together.
+ */
+export const MAX_FILE_HANDLE_LEN = 512;
 const DEFAULT_PAGE_CAP = 100;                        // Ashby forces full-sync ~100 pages
 const DEFAULT_ITEM_CAP = 10_000;
 
@@ -147,6 +165,34 @@ function validateId(operation: string, field: string, value: unknown): string {
     const c = value.charCodeAt(i);
     if (c <= 0x1f || c === 0x7f) {
       throw new AshbyError('invalid_request', { code: 'id_control_char', operation });
+    }
+  }
+  void field;
+  return value;
+}
+
+/**
+ * Validate an opaque provider file handle. Same fail-closed shape as
+ * {@link validateId} — non-string, empty, C0 control characters and DEL (NUL
+ * included) are all rejected — but bounded by {@link MAX_FILE_HANDLE_LEN}
+ * rather than the id bound. Deliberately separate so widening the handle
+ * bound can never widen the bound on a real id.
+ *
+ * The handle itself never reaches a URL, query string, log line, error
+ * message, or any `AshbyError` field: the errors below carry a stable code
+ * and the operation name only.
+ */
+function validateFileHandle(operation: string, field: string, value: unknown): string {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new AshbyError('invalid_request', { code: 'invalid_file_handle', operation });
+  }
+  if (value.length > MAX_FILE_HANDLE_LEN) {
+    throw new AshbyError('invalid_request', { code: 'file_handle_too_long', operation });
+  }
+  for (let i = 0; i < value.length; i++) {
+    const c = value.charCodeAt(i);
+    if (c <= 0x1f || c === 0x7f) {
+      throw new AshbyError('invalid_request', { code: 'file_handle_control_char', operation });
     }
   }
   void field;
@@ -413,9 +459,13 @@ export class AshbyClient {
   /**
    * Return file metadata/URL only. This client NEVER fetches the presigned URL;
    * SSRF-controlled downloads are a separate, later concern.
+   *
+   * The handle is validated with {@link validateFileHandle}, NOT the id
+   * validator: an opaque provider token is not an id and must not carry the
+   * id length bound.
    */
   async fileInfo<T = OpaqueRecord>(fileHandle: string, extra?: OpaqueRecord): Promise<AshbyResult<T>> {
-    validateId('file.info', 'fileHandle', fileHandle);
+    validateFileHandle('file.info', 'fileHandle', fileHandle);
     return this.request<T>('file.info', { fileHandle, ...(extra ?? {}) });
   }
 

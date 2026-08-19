@@ -377,7 +377,13 @@ The public `GET /api/health` deliberately remains a liveness-only `{ok:true}`.
 2. **Durable backlog** (`backlog`): correct on any machine — `queuePending`,
    `dlqDepth`, `oldestPendingAgeSec`, `operationsPending`, `operationsFailed`,
    `operationsAwaitingDelivery`, `writebackPending`, `reconcileNoProgressRuns`,
-   `reconcileLastSuccessAt`.
+   `reconcileLastSuccessAt`, and (0035) `operationsBlockedPrerequisite`,
+   `operationsFailedPrerequisite`, `ingestionStuckQueued`,
+   `ingestionStuckFetching`, and `operationsBlockedFailedIngestion`. The last four separate "waiting on a prerequisite"
+   from "broken": a prerequisite-gated invite counts as `operationsPending`
+   forever and a stranded ingestion had no signal at all, so a failure of that
+   shape was previously discoverable only by direct database inspection. See
+   [ashby-canary-ingestion-delivery-recovery.md](ashby-canary-ingestion-delivery-recovery.md).
 
 3. **Malware scanner readiness** (`scanner`, §5a): the resume path is
    fail-closed without current ClamAV signatures, so an activation health
@@ -414,6 +420,10 @@ flag on but a dead scheduler reports `degraded`, not `healthy`.
 | Retry refused with `blocked_terminal` | The application is withdrawn/deleted/cancelled | Correct — terminal work is never resurrected. |
 | Retry refused with `retry_exhausted` | `attempts` reached `max_attempts` | Deliberate bound. Investigate rather than forcing. |
 | `operationsAwaitingDelivery` climbing | Invites minted but no admin has taken the links | Expected until an operator runs the §5 hand-off. Not an error. |
+| `operationsBlockedPrerequisite` non-zero | Invites correctly WAITING on a paused mapping or an unfinished resume ingestion | Not an error, and it consumes no attempt. Resume the mapping, or let ingestion finish. Subtract `operationsBlockedFailedIngestion` for the genuinely transient count. |
+| `invite_blocked_failed_ingestion` in `reasons` | An invite is blocked behind a `failed_review` ingestion, which only a human can requeue | Real, non-transient. Fix the `failed_reason` cause, then requeue the ingestion per §2a of the recovery runbook. It will never clear on its own. |
+| `ingestion_stuck` in `reasons` | A resume ingestion has sat in `queued`/`fetching` past the stuck window | Real fault. Diagnose via the recovery runbook — check the scanner first, it is the usual cause. |
+| `invite_prerequisite_failed` in `reasons` | Invites killed by the pre-0035 ordering defect | Recovery backlog, not a live fault. Run `reopen_ashby_invite_delivery` per the recovery runbook. |
 | `writebackPending` climbing | Screenings completing with no approved result sink | Expected (§7). These are results awaiting manual publication. |
 | A workflow shows `screened: not parked` (session `completed`, lifecycle not `writeback_pending`, not terminal) | The completion observer's park did not land — it is best-effort so that a transient failure can never discard a scored assessment | The assessment itself is safe and visible on the ordinary session surfaces. Nothing downstream waits on `writeback_pending` (there is no result sink), so this is a bookkeeping gap. Re-parking is idempotent: it self-corrects on any later completion for that session, and the state is legible here rather than log-only. |
 | An `invite_delivery` operation shows `failed / blocked_provider` | The email channel is gated off (§5) | Expected for `email`/`both` mappings. Switch the mapping to `manual`, or wait for an approved provider. |

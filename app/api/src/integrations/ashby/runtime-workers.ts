@@ -45,6 +45,8 @@ import type { ReconcileResult, ReconcileSkipCounts, ReconcileStop } from './reco
 import { runClaimedAshbyOperation } from './operation-worker.js';
 import { materializeCandidate } from './materialize.js';
 import { extractFileUrl, type AshbyRuntime } from './runtime.js';
+import { MAX_FILE_HANDLE_LEN } from './client.js';
+import { isAshbyError, type AshbyErrorCategory } from './errors.js';
 import type { AshbySignalPayload } from './ports.js';
 
 /** Queue name for the ephemeral resume ingestion of one application link. */
@@ -108,6 +110,42 @@ export interface ReconcilePassSummary {
    * "eating through a >5,000 corpus one bounded run at a time" — this can.
    */
   partialProgress: ReconcileResult['partialProgress'];
+}
+
+/**
+ * Ashby error categories that are DETERMINISTICALLY permanent for a queue job.
+ *
+ * `buildIngestionPorts` calls `client.fileInfo`, and a throw from there used to
+ * propagate untouched into the queue's generic failure path, which treats any
+ * thrown handler error as retryable. The canary therefore burned all five
+ * ingestion attempts on `invalid_request/id_too_long` — an error whose outcome
+ * was identical every single time — and dead-lettered. An `AshbyError` already
+ * carries a sanitized category and a `retriable` flag; the handler just has to
+ * read them.
+ *
+ * `retry_exhausted` is deliberately NOT here: the client already spent its own
+ * bounded attempts on a transient class, and a fresh queue attempt (minutes
+ * later, not milliseconds) is a genuinely different try.
+ */
+export const PERMANENT_ASHBY_CATEGORIES: ReadonlySet<AshbyErrorCategory> = new Set([
+  'invalid_request',
+  'http_client_error',
+  'logical_failure',
+  'malformed_response',
+  'output_limit',
+]);
+
+/** True when this error can only ever fail the same way again. */
+export function isPermanentAshbyFailure(err: unknown): boolean {
+  if (!isAshbyError(err)) return false;
+  if (err.retriable) return false;
+  return PERMANENT_ASHBY_CATEGORIES.has(err.category);
+}
+
+/** Sanitized, bounded durable reason for a failed ingestion. Never PII. */
+export function ingestionFailureReason(err: unknown): string {
+  if (!isAshbyError(err)) return 'fetch_provider_error';
+  return `fetch_${err.category}_${err.code}`.slice(0, 200);
 }
 
 export interface AshbyWorkers {
@@ -210,29 +248,83 @@ export function buildAshbyHandlers(runtime: AshbyRuntime): Record<string, QueueH
       if (!link || link.terminalState) return;
 
       // Second guard, at execution time: the ingestion may have reached a
-      // terminal state between enqueue and claim. Checked BEFORE
-      // `buildIngestionPorts`, which is what resolves the short-lived
-      // presigned URL — so a redundant job costs zero provider calls and
-      // zero resume bytes.
+      // terminal state between enqueue and claim. Checked BEFORE anything
+      // resolves the short-lived presigned URL — so a redundant job costs zero
+      // provider calls and zero resume bytes.
       const current = await runtime.stores.readIngestion(linkId);
       if (current && TERMINAL_INGESTION_STATES.has(current.state)) return;
 
-      const ports = await runtime.buildIngestionPorts({
-        applicationLinkId: linkId,
-        onState: async (state, provenance) => {
-          // The 0029 trigger rejects an illegal transition and the RPC returns
-          // `invalid_transition` rather than throwing. Ignoring that status
-          // let the in-memory pipeline keep running against a durable row that
-          // no longer described reality; abort instead so the bytes are wiped
-          // on the ingestion's own terminal path.
-          const outcome = await runtime.stores.advanceIngestion(linkId, state, provenance);
-          if (outcome.status !== 'ok') {
-            throw new Error(`ashby_ingestion_${outcome.status}`);
-          }
-        },
-      });
-      // No resume handle / no resolvable presigned URL → nothing to ingest.
-      if (!ports) return;
+      // An application that carried no resume handle has nothing to ingest.
+      // This is decided from the LINK — the fact itself — and never from
+      // "does an ingestion row exist", because `runImport` seeds an ingestion
+      // row for every link including this one.
+      if (!link.externalResumeFileHandle) return;
+
+      // ── Leave `queued` BEFORE talking to the provider ──────────────────
+      // The 0029 trigger allows `queued -> {fetching, cancelled}` only, so
+      // `failed_review` is not reachable from `queued` at all. Every provider
+      // failure below therefore used to leave the row stranded in `queued`
+      // forever with no signal anywhere — the canary's durable symptom. One
+      // transition first makes the existing failure path reachable, needs no
+      // migration, and preserves the state machine's meaning (`fetching` =
+      // "we have started talking to the provider"). The presigned URL is
+      // still resolved at the last possible moment relative to the DOWNLOAD,
+      // so the security rationale for late resolution is untouched.
+      const started = await runtime.stores.advanceIngestion(linkId, 'fetching');
+      if (started.status !== 'ok') {
+        // A concurrent cancel or an illegal transition: not our work to do.
+        return;
+      }
+
+      /** Record a durable, sanitized ingestion failure. Best effort. */
+      const failIngestion = async (reason: string): Promise<void> => {
+        try {
+          await runtime.stores.advanceIngestion(linkId, 'failed_review', { failedReason: reason });
+        } catch { /* the queue outcome below is the authoritative signal */ }
+      };
+
+      let built;
+      try {
+        built = await runtime.buildIngestionPorts({
+          applicationLinkId: linkId,
+          onState: async (state, provenance) => {
+            // The 0029 trigger rejects an illegal transition and the RPC
+            // returns `invalid_transition` rather than throwing. Ignoring that
+            // status let the in-memory pipeline keep running against a durable
+            // row that no longer described reality; abort instead so the bytes
+            // are wiped on the ingestion's own terminal path.
+            const outcome = await runtime.stores.advanceIngestion(linkId, state, provenance);
+            if (outcome.status !== 'ok') {
+              throw new Error(`ashby_ingestion_${outcome.status}`);
+            }
+          },
+        });
+      } catch (err) {
+        if (isPermanentAshbyFailure(err)) {
+          // Deterministically permanent: fail the job ONCE with the durable
+          // reason recorded, instead of five identical attempts into the DLQ.
+          await failIngestion(ingestionFailureReason(err));
+          return;
+        }
+        // Transient. Retry — but on the LAST attempt record the durable
+        // failure too, so a dead-lettered job can never leave the ingestion
+        // row stranded mid-flight.
+        if (job.attempts >= job.maxAttempts) await failIngestion(ingestionFailureReason(err));
+        throw err;
+      }
+
+      if (built.status === 'link_missing') return;
+      if (built.status === 'no_resume') {
+        // The link claimed a handle a moment ago and now reports none. Not a
+        // provider failure; nothing to ingest.
+        return;
+      }
+      if (built.status === 'url_unresolved') {
+        // A real provider failure that used to be reported as job SUCCESS.
+        await failIngestion('fetch_url_unresolved');
+        return;
+      }
+      const ports = built.ports;
 
       const result = await runIngestionJob(linkId, {
         gates,
@@ -263,16 +355,35 @@ export function buildAshbyHandlers(runtime: AshbyRuntime): Record<string, QueueH
   };
 }
 
-/** Defensive read of the opaque resume file handle from `application.info`. */
+/**
+ * Defensive read of the opaque resume file handle from `application.info`.
+ *
+ * Bounded by the SHARED {@link MAX_FILE_HANDLE_LEN} (512) rather than a local
+ * literal, so this, `AshbyClient.fileInfo` and the 0029
+ * `chk_ashby_application_links_resume_handle` CHECK cannot drift apart — the
+ * drift between them (256 / 512 / 512) is what rejected the canary's
+ * 270-character handle pre-transport. Control characters and NUL are rejected
+ * here as well as in the client: a handle that reaches `createLink` must
+ * already be safe, since nothing downstream re-validates it.
+ */
 export function extractResumeHandle(info: unknown): string | null {
   if (info === null || typeof info !== 'object') return null;
+  const safe = (v: unknown): string | null => {
+    if (typeof v !== 'string' || v.length === 0 || v.length > MAX_FILE_HANDLE_LEN) return null;
+    for (let i = 0; i < v.length; i++) {
+      const c = v.charCodeAt(i);
+      if (c <= 0x1f || c === 0x7f) return null;
+    }
+    return v;
+  };
   const rec = info as Record<string, unknown>;
   for (const key of ['resumeFileHandle', 'fileHandle', 'resumeHandle']) {
     const v = rec[key];
-    if (typeof v === 'string' && v.length > 0 && v.length <= 512) return v;
+    const direct = safe(v);
+    if (direct) return direct;
     if (v !== null && typeof v === 'object') {
-      const h = (v as Record<string, unknown>).handle;
-      if (typeof h === 'string' && h.length > 0 && h.length <= 512) return h;
+      const nested = safe((v as Record<string, unknown>).handle);
+      if (nested) return nested;
     }
   }
   const resume = rec.resume;

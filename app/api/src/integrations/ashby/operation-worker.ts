@@ -30,7 +30,26 @@
  *
  * ══ WHAT `succeeded` MEANS ══
  *
- * This worker never marks an `invite_delivery` operation `succeeded`. Minting
+ * ══ A WAIT IS NOT A FAILURE ══
+ *
+ * `claim_ashby_operation` increments `attempts` at claim time, and
+ * `fail_ashby_operation` reschedules a retry with NO backoff. So recording
+ * "the resume ingestion has not finished yet" as a retryable FAILURE — which
+ * this worker used to do — spent the operation's entire five-attempt budget in
+ * roughly five poll intervals (~20-25s) and permanently failed the invite
+ * before a real resume could plausibly have been downloaded, scanned and
+ * parsed. The attempt bound was designed as a safety property; it functioned
+ * as a deadline, and it fired on the HEALTHY path, not only on the canary's.
+ *
+ * Prerequisite outcomes are therefore DEFERRED, never failed: `deferOperation`
+ * refunds the attempt the claim charged and reschedules behind a bounded
+ * delay. The claim RPC (0035) additionally refuses to hand out an operation
+ * whose prerequisites are unmet, so this path is the post-claim race backstop
+ * rather than the common case. Genuine faults — `candidate_missing`,
+ * `persist_failed`, an adapter throw — are still ordinary attempt-bounded
+ * failures, because those are real failures.
+ *
+ * Minting
  * an invite only produces a SHA-256 digest, and the provider-gated email
  * channel sends nothing at all, so the only honest success is an authorized
  * human taking possession of a usable link — which happens in
@@ -54,6 +73,22 @@ export type SupportedOperationType = (typeof SUPPORTED_OPERATION_TYPES)[number];
 /** Operation types the runtime must never claim while no result sink exists. */
 export const REFUSED_OPERATION_TYPES = ['scorecard_write', 'stage_move'] as const;
 
+/**
+ * Sanitized reasons that mean "a prerequisite is not satisfied yet", NOT "this
+ * delivery failed". Each is deferred without consuming an attempt.
+ *
+ * `candidate_missing` and `persist_failed` are deliberately absent: those are
+ * genuine faults in work this operation owns, and they must stay bounded by
+ * `max_attempts` rather than parking indefinitely.
+ */
+export const PREREQUISITE_DEFER_REASONS: ReadonlySet<string> = new Set([
+  'ingestion_not_ready',
+  'mapping_inactive',
+]);
+
+/** Default backoff applied to a prerequisite deferral. */
+export const DEFAULT_DEFER_SECONDS = 60;
+
 export interface OperationWorkerDeps {
   stores: RuntimeWorkflowStores;
   materialization: MaterializationStore;
@@ -66,6 +101,12 @@ export interface OperationWorkerDeps {
   /** Opaque worker identity recorded as the operation lease owner. */
   owner: string;
   leaseSeconds: number;
+  /**
+   * How long a prerequisite-deferred operation waits before becoming
+   * claimable again. Server-clamped to 1..3600s by the RPC. Defaults to
+   * {@link DEFAULT_DEFER_SECONDS}.
+   */
+  deferSeconds?: number;
   /** Metadata-only observer. Never receives tokens, PII, or provider text. */
   onEvent?: (event: { kind: string; operationType: string; code?: string }) => void;
   nowMs?: () => number;
@@ -126,6 +167,8 @@ export async function runClaimedAshbyOperation(
   }
   if (!claim) return { claimed: false };
 
+  const deferSeconds = deps.deferSeconds ?? DEFAULT_DEFER_SECONDS;
+
   const emit = (kind: string, code?: string): void => {
     if (!deps.onEvent) return;
     try { deps.onEvent({ kind, operationType: claim!.operationType, code }); } catch { /* never break */ }
@@ -154,7 +197,14 @@ export async function runClaimedAshbyOperation(
 
     const mapping = await deps.resolveMappingForLink(claim.applicationLinkId);
     if (!mapping) {
-      const r = await deps.stores.failOperation(claim.id, claim.leaseToken, 'mapping_inactive', true);
+      // A mapping paused between claim and execution. Waiting for a recruiter
+      // to resume it is not a delivery failure, and charging it as one meant a
+      // pause lasting longer than ~25 seconds permanently failed every
+      // in-flight invite.
+      const r = await deps.stores.deferOperation(
+        claim.id, claim.leaseToken, 'mapping_inactive', deferSeconds,
+      );
+      emit('deferred', 'mapping_inactive');
       return {
         claimed: true, operationType: claim.operationType, committed: false,
         staleLease: r === 'not_owned', code: 'mapping_inactive',
@@ -175,23 +225,37 @@ export async function runClaimedAshbyOperation(
         terminalState: link.terminalState,
       },
       ingestionState: ingestion?.state ?? null,
-      // No ingestion row at all means the application carried no resume handle.
-      noResume: ingestion === null,
+      // "Is this application resume-backed?" is answered by the LINK's handle,
+      // not by the existence of an ingestion row: `runImport` seeds an
+      // ingestion row for EVERY link, so the row-existence test was always
+      // true and a no-resume application would have waited forever for an
+      // ingestion that had nothing to ingest.
+      noResume: link.externalResumeFileHandle == null,
       email: deps.email,
       recruiterReissuePath: deps.reissuePathFor(link.externalApplicationId),
       nowMs: deps.nowMs,
     });
 
     if (result.delivery === 'not_ready') {
-      // Retryable: the ephemeral ingestion has not reached `ready` yet. The
-      // operation's own max_attempts bounds this — it cannot spin forever.
-      const r = await deps.stores.failOperation(
-        claim.id, claim.leaseToken, result.reason ?? 'not_ready', true,
-      );
-      emit('deferred', result.reason);
+      const reason = result.reason ?? 'not_ready';
+      if (PREREQUISITE_DEFER_REASONS.has(reason)) {
+        // A WAIT, not a failure: refund the attempt the claim charged and
+        // come back after a bounded delay. With the 0035 claim gate in place
+        // this is the post-claim race only.
+        const r = await deps.stores.deferOperation(claim.id, claim.leaseToken, reason, deferSeconds);
+        emit('deferred', reason);
+        return {
+          claimed: true, operationType: claim.operationType, committed: false,
+          staleLease: r === 'not_owned', code: reason,
+        };
+      }
+      // A genuine fault in work this operation owns (`candidate_missing`,
+      // `persist_failed`). Retryable and attempt-bounded, as before.
+      const r = await deps.stores.failOperation(claim.id, claim.leaseToken, reason, true);
+      emit('retry', reason);
       return {
         claimed: true, operationType: claim.operationType, committed: false,
-        staleLease: r === 'not_owned', code: result.reason ?? 'not_ready',
+        staleLease: r === 'not_owned', code: reason,
       };
     }
 
