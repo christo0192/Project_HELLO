@@ -1,7 +1,6 @@
 import { Router } from 'express';
 import multer from 'multer';
 import { createHash, randomUUID, timingSafeEqual as cryptoTimingSafeEqual } from 'node:crypto';
-import { RoomServiceClient } from 'livekit-server-sdk';
 import { supabase } from '../lib/supabase.js';
 import { env } from '../lib/env.js';
 import {
@@ -33,9 +32,12 @@ import { runAssessment } from '../services/assessment.js';
 import { resolveWorkerContext, ERR_DB_FAILED } from '../lib/worker-context.js';
 import {
   finalizeAuthoritativeRecording,
-  startAuthoritativeRecording,
   type RecordingFinalizeStatus,
 } from '../lib/recording-egress.js';
+import {
+  provisionRoomForCreatedSession,
+  requireLiveKitConfigured,
+} from '../lib/room-provisioning.js';
 import { createMaintenanceMiddleware } from '../lib/maintenance.js';
 import {
   extractIdempotencyKey,
@@ -69,23 +71,10 @@ const upload = multer({
 void RECORDING_MAX_BYTES_DEFAULT;
 void RECORDING_MAX_BYTES_HARD_MAX;
 
-function requireLiveKit() {
-  if (!env.livekitUrl || !env.livekitApiKey || !env.livekitApiSecret) {
-    throw new Error(
-      'LIVEKIT_URL, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET must be set in app/api/.env',
-    );
-  }
-}
-
-// ── Minimal metadata (no PII) ────────────────────────────────────────
-
-function buildMinimalRoomMetadata(sessionId: string, roomName: string): string {
-  return JSON.stringify({
-    session_id: sessionId,
-    room_name: roomName,
-    correlation_id: getCorrelationId() ?? undefined,
-  });
-}
+// Room naming, PII-free metadata, room creation, authoritative egress and the
+// created → waiting CAS all live in lib/room-provisioning.ts — the SINGLE
+// implementation shared with the candidate exchange JIT path. Do not
+// re-implement room provisioning here.
 
 // ── Worker-context bearer credential from env ────────────────────────
 // Pending FND-05/FND-06 for operational worker identity.
@@ -145,7 +134,7 @@ livekitRouter.post(
   createMaintenanceMiddleware({ allowAdmin: true }),
   async (req, res, next) => {
     try {
-      requireLiveKit();
+      requireLiveKitConfigured();
       const candidateId = req.body?.candidate_id as string;
       if (!candidateId) return res.status(400).json({ error: 'candidate_id is required' });
 
@@ -208,57 +197,36 @@ livekitRouter.post(
           throw new Error('failed to assign session ownership');
         }
 
-        const roomName = `screening-${session.id}`;
-        const roomMetadata = buildMinimalRoomMetadata(session.id, roomName);
-        const rooms = new RoomServiceClient(env.livekitUrl, env.livekitApiKey, env.livekitApiSecret);
-
-        try {
-          try {
-            await rooms.createRoom({
-              name: roomName,
-              emptyTimeout: 10 * 60,
-              maxParticipants: 4,
-              metadata: roomMetadata,
-            });
-          } catch {
-            await rooms.updateRoomMetadata(roomName, roomMetadata);
+        // REL-07: shared fail-closed provisioner — room + authoritative egress
+        // + created → waiting CAS. `new_session` mode terminates the row it
+        // just created on a provider failure and reaps an orphan room on a
+        // lost CAS (this request owns the row end-to-end).
+        const provisioned = await provisionRoomForCreatedSession(session.id, 'new_session');
+        if (!provisioned.ok) {
+          if (provisioned.code === 'provider_failed') {
+            if (provisioned.terminateFailed) {
+              throw new Error('room creation failed and session could not be terminated — reconciliation required');
+            }
+            throw provisioned.error;
           }
-          // Start server-authoritative audio capture before anyone joins. In
-          // required mode, a storage/egress failure aborts the screening rather
-          // than silently creating an unrecorded room.
-          await startAuthoritativeRecording(roomName, session.id);
-        } catch (roomErr) {
-          await rooms.deleteRoom(roomName).catch(() => undefined);
-          // REL-07: room/recording creation failed — terminate the row.
-          const termResult = await transitionSession(
-            session.id, 'created', 'failed', 'room_create_error',
-          );
-          if (!termResult.ok && !termResult.conflict) {
-            throw new Error('room creation failed and session could not be terminated — reconciliation required');
-          }
-          throw roomErr instanceof Error ? roomErr : new Error('LiveKit room creation failed');
-        }
-
-        // REL-07: room is ready — CAS created → waiting.
-        const tr = await transitionSession(session.id, 'created', 'waiting', undefined, {
-          external_call_id: roomName,
-        });
-        if (!tr.ok) {
-          let cleanupFailed = false;
-          try {
-            await rooms.deleteRoom(roomName);
-          } catch {
-            cleanupFailed = true;
-          }
-          if (tr.conflict) {
+          if (provisioned.code === 'transition_conflict') {
             const baseMsg = 'session conflict: already transitioned';
-            if (cleanupFailed) throw new Error(baseMsg + ' and orphan room cleanup failed — reconciliation required');
+            if (provisioned.cleanupFailed) {
+              throw new Error(baseMsg + ' and orphan room cleanup failed — reconciliation required');
+            }
             res.status(409).json({ error: baseMsg });
             throw new ResponseSentError();
           }
-          if (cleanupFailed) throw new Error('room created but session could not be transitioned and room cleanup failed — reconciliation required');
-          throw new Error('room created but session could not be transitioned — reconciliation required');
+          if (provisioned.code === 'transition_failed') {
+            if (provisioned.cleanupFailed) {
+              throw new Error('room created but session could not be transitioned and room cleanup failed — reconciliation required');
+            }
+            throw new Error('room created but session could not be transitioned — reconciliation required');
+          }
+          // `not_joinable` is an existing_session-only outcome.
+          throw new Error('room provisioning returned an unexpected outcome — reconciliation required');
         }
+        const roomName = provisioned.roomName;
 
         // Candidate status is best-effort.
         {

@@ -226,6 +226,15 @@ select l.candidate_id, l.session_id, l.invite_id, l.lifecycle,
  where l.id = :application_link_id and o.operation_type = 'invite_delivery';
 ```
 
+> **The invite is now joinable.** A delivered Ashby invite used to dead-end at
+> `POST /api/livekit/exchange`, because materialization leaves the session in
+> `created` with a NULL `external_call_id` and nothing provisioned a LiveKit
+> room for an *existing* session. That room and its authoritative egress are now
+> provisioned just-in-time on exchange — see
+> [`ashby-room-provisioning.md`](./ashby-room-provisioning.md). If a candidate
+> reports "We could not open your screening room just now", that is a 503 on
+> the provisioning step and the invite is **still valid**; do not reissue it.
+
 Expect **exactly one** candidate, one session, one invite, and the manual
 operation resting at **`awaiting_manual_delivery`** — *not* `succeeded`.
 `succeeded` on an `invite_delivery` means one thing only: an authorized human

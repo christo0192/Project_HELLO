@@ -376,6 +376,58 @@ describe('CandidateJoinPage', () => {
     expect(screen.getByText(/Unable to join this screening/i)).toBeInTheDocument();
   });
 
+  it('surfaces retryable copy when just-in-time room provisioning is unavailable', async () => {
+    // The server leaves the one-time invite UNCONSUMED on a 503
+    // screening_room_unavailable, so the candidate must be told to retry and
+    // the Join button must remain usable.
+    candidateConsentStatus.mockResolvedValue({
+      has_consent: true,
+      template_version: '1.0',
+      locale: 'en-IN',
+      required_consents: ['ai_interview', 'recording'],
+    });
+    const ApiError = (await import('../api')).ApiError;
+    exchangeCandidateInvite.mockRejectedValueOnce(
+      new ApiError('screening_room_unavailable', 503),
+    );
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Join screening' })).toBeInTheDocument();
+    });
+
+    await userEvent.click(screen.getByRole('button', { name: 'Join screening' }));
+
+    await waitFor(() => expect(exchangeCandidateInvite).toHaveBeenCalledWith(SYNTHETIC_INVITE));
+    expect(screen.getByText(/your invite is still valid/i)).toBeInTheDocument();
+    // Raw server codes are never shown to the candidate.
+    expect(screen.queryByText(/screening_room_unavailable/)).not.toBeInTheDocument();
+    // Retry is possible.
+    expect(screen.getByRole('button', { name: 'Join screening' })).toBeEnabled();
+  });
+
+  it('surfaces consent copy (not a raw code) when the exchange consent gate fails', async () => {
+    candidateConsentStatus.mockResolvedValue({
+      has_consent: true,
+      template_version: '1.0',
+      locale: 'en-IN',
+      required_consents: ['ai_interview', 'recording'],
+    });
+    const ApiError = (await import('../api')).ApiError;
+    exchangeCandidateInvite.mockRejectedValueOnce(new ApiError('consent_required', 409));
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Join screening' })).toBeInTheDocument();
+    });
+
+    await userEvent.click(screen.getByRole('button', { name: 'Join screening' }));
+
+    await waitFor(() => expect(exchangeCandidateInvite).toHaveBeenCalledWith(SYNTHETIC_INVITE));
+    expect(screen.getByText(/consent is missing or no longer valid/i)).toBeInTheDocument();
+    expect(screen.queryByText(/consent_required/)).not.toBeInTheDocument();
+  });
+
   it('falls back to browser getUserMedia before exchanging when LiveKit audio creation fails', async () => {
     candidateConsentStatus.mockResolvedValue({
       has_consent: true,
