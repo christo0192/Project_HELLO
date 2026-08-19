@@ -6666,6 +6666,310 @@ end;
 $$;
 
 -- ═══════════════════════════════════════════════════════════════════════
+-- 0038 — durable authoritative-recording finalization convergence
+-- ═══════════════════════════════════════════════════════════════════════
+
+select _policy_tests.assert(
+  '0038: finalize observability columns exist on call_sessions',
+  (select count(*) from information_schema.columns
+    where table_schema = 'screening_v2' and table_name = 'call_sessions'
+      and column_name in ('recording_finalize_attempts',
+                          'recording_finalize_last_attempt_at',
+                          'recording_finalize_defer_reason',
+                          'recording_finalize_exhausted_at')) = 4,
+  'a pending finalize must be able to say WHY, how often, and whether it gave up'
+);
+
+select _policy_tests.assert(
+  '0038: defer reason is a bounded ALLOWLIST, never free text',
+  exists (
+    select 1 from pg_constraint
+     where conname = 'chk_call_sessions_recording_finalize_defer_reason'
+       and conrelid = 'screening_v2.call_sessions'::regclass
+       and convalidated
+  ),
+  'provider text must never be persistable in a durable reason column'
+);
+
+select _policy_tests.assert(
+  '0038: the egress-status domain is UNCHANGED (no read gate changes meaning)',
+  (select pg_get_constraintdef(oid) from pg_constraint
+    where conname = 'chk_call_sessions_recording_egress_status'
+      and conrelid = 'screening_v2.call_sessions'::regclass)
+    like '%''active''%complete''%failed''%',
+  '0038 must not widen the three-value egress status domain'
+);
+
+select _policy_tests.assert(
+  '0038: the sweeper index covers the FULL terminal set',
+  (select indexdef from pg_indexes
+    where schemaname = 'screening_v2'
+      and indexname = 'idx_call_sessions_recording_finalize_pending')
+    like '%cancelled%expired%',
+  'a partial index narrower than the sweeper predicate silently changes eligibility'
+);
+
+select _policy_tests.assert(
+  '0038: terminal-transition trigger is installed on call_sessions',
+  exists (
+    select 1 from pg_trigger t
+      join pg_class c on c.oid = t.tgrelid
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'call_sessions'
+       and t.tgname = 'trg_enqueue_recording_finalize'
+       and not t.tgisinternal
+  ),
+  'the trigger is the only seam covering the Python worker''s direct UPDATE'
+);
+
+select _policy_tests.assert(
+  '0038: residency_timeout is a legal failed terminal_reason',
+  (select pg_get_constraintdef(oid) from pg_constraint
+    where conname = 'chk_call_sessions_terminal_reason'
+      and conrelid = 'screening_v2.call_sessions'::regclass)
+    like '%residency_timeout%',
+  'the worker residency cap must be persistable truthfully, never as worker_crash'
+);
+
+select _policy_tests.assert(
+  '0038: new functions are service-role-only',
+  not exists (
+    select 1 from pg_proc p
+      join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname in ('reopen_recording_finalize',
+                         'record_recording_finalize_deferral',
+                         'set_recording_finalize_halt',
+                         'clear_recording_finalize_halt',
+                         'reap_completed_jobs')
+       and (has_function_privilege('anon', p.oid, 'EXECUTE')
+         or has_function_privilege('authenticated', p.oid, 'EXECUTE'))
+  ),
+  'browser roles must never execute the finalization control surface'
+);
+
+select _policy_tests.assert(
+  '0038: the halt control table is RLS-enabled and browser-revoked',
+  exists (
+    select 1 from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'recording_finalize_control'
+       and c.relrowsecurity
+  )
+  and not exists (
+    select 1 from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname = 'recording_finalize_control'
+       and (has_table_privilege('anon', c.oid, 'SELECT')
+         or has_table_privilege('authenticated', c.oid, 'SELECT'))
+  ),
+  'the kill switch is service-role-only backend infrastructure'
+);
+
+-- ── Live behaviour: the trigger, the dedup, the reopen RPC, the reaper ──
+do $$
+declare
+  v_sid  uuid;
+  v_cand uuid;
+  v_jobs integer;
+  v_res  jsonb;
+  v_reaped jsonb;
+  v_status text;
+begin
+  select id into v_cand from screening_v2.candidates limit 1;
+  if v_cand is null then
+    perform _policy_tests.assert('0038: trigger enqueues exactly one finalize job',
+      true, 'skipped: no candidate row available for synthetic session');
+    return;
+  end if;
+
+  insert into screening_v2.call_sessions (candidate_id, mode, status)
+  values (v_cand, 'simulation', 'created')
+  returning id into v_sid;
+
+  update screening_v2.call_sessions
+     set status = 'in_progress' where id = v_sid;
+  -- Link an egress with no object key: the exact pre-terminal shape.
+  update screening_v2.call_sessions
+     set recording_egress_id = 'EG_policytest0001',
+         recording_egress_status = 'active'
+   where id = v_sid;
+
+  -- THE PYTHON WORKER'S SHAPE: a direct SQL terminal UPDATE that bypasses
+  -- every TypeScript seam. This is the whole reason the enqueue is a trigger.
+  update screening_v2.call_sessions
+     set status = 'completed', terminal_reason = 'conversation_complete',
+         ended_at = now()
+   where id = v_sid;
+
+  select count(*) into v_jobs
+    from screening_v2.job_queue
+   where dedup_key = 'recording.finalize:' || v_sid::text;
+  perform _policy_tests.assert(
+    '0038: a direct SQL terminal UPDATE enqueues exactly one finalize job',
+    v_jobs = 1,
+    'expected 1 job, got ' || v_jobs::text);
+
+  -- A second QUALIFYING update while that job is live must add nothing.
+  -- Re-linking the egress on an already-terminal row is the trigger's second
+  -- guard (old.recording_egress_id null -> new not null), so this genuinely
+  -- fires the trigger again; uq_job_queue_dedup_active (which covers
+  -- pending/active/delayed) is what makes the insert a no-op.
+  update screening_v2.call_sessions
+     set recording_egress_id = null where id = v_sid;
+  update screening_v2.call_sessions
+     set recording_egress_id = 'EG_policytest0001' where id = v_sid;
+  select count(*) into v_jobs
+    from screening_v2.job_queue
+   where dedup_key = 'recording.finalize:' || v_sid::text;
+  perform _policy_tests.assert(
+    '0038: a repeat update while the job is live enqueues nothing further',
+    v_jobs = 1,
+    'expected 1 job after repeat update, got ' || v_jobs::text);
+
+  -- ── record_recording_finalize_deferral: bookkeeping and its terminus ──
+  v_res := screening_v2.record_recording_finalize_deferral(v_sid, 'not_a_real_reason', 5);
+  perform _policy_tests.assert(
+    '0038: an unlisted defer reason is refused',
+    v_res->>'status' = 'invalid_reason',
+    'got ' || coalesce(v_res->>'status', 'null'));
+
+  v_res := screening_v2.record_recording_finalize_deferral(v_sid, 'poll_timeout', 2);
+  perform _policy_tests.assert(
+    '0038: the first deferral increments and does not exhaust',
+    v_res->>'status' = 'ok' and (v_res->>'attempts')::int = 1
+      and (v_res->>'exhausted')::boolean = false,
+    'got ' || v_res::text);
+
+  v_res := screening_v2.record_recording_finalize_deferral(v_sid, 'object_unreadable', 2);
+  perform _policy_tests.assert(
+    '0038: reaching the budget stamps the exhaustion TERMINUS',
+    v_res->>'status' = 'ok' and (v_res->>'exhausted')::boolean = true,
+    'got ' || v_res::text);
+
+  perform _policy_tests.assert(
+    '0038: an exhausted row is no longer selected by the sweeper predicate',
+    not exists (
+      select 1 from screening_v2.call_sessions
+       where id = v_sid
+         and status in ('completed','failed','cancelled','expired')
+         and recording_egress_id is not null
+         and recording_object_key is null
+         and recording_egress_status = 'active'
+         and recording_finalize_exhausted_at is null),
+    'the exhaustion terminus must remove the row from the sweep');
+
+  -- ── reopen_recording_finalize: the audited way back ──
+  update screening_v2.call_sessions
+     set recording_egress_status = 'failed' where id = v_sid;
+
+  v_res := screening_v2.reopen_recording_finalize(v_sid, 'because_i_said_so');
+  perform _policy_tests.assert(
+    '0038: reopen refuses a reason outside the allowlist',
+    v_res->>'status' = 'invalid_reason',
+    'got ' || coalesce(v_res->>'status', 'null'));
+
+  v_res := screening_v2.reopen_recording_finalize(v_sid, 'operator_review');
+  select recording_egress_status into v_status
+    from screening_v2.call_sessions where id = v_sid;
+  perform _policy_tests.assert(
+    '0038: reopen is the ONLY writer that moves failed back to active',
+    v_res->>'status' = 'ok' and v_status = 'active',
+    'status=' || coalesce(v_status, 'null') || ' res=' || v_res::text);
+
+  perform _policy_tests.assert(
+    '0038: reopen resets the attempt counter and clears the terminus',
+    exists (select 1 from screening_v2.call_sessions
+             where id = v_sid
+               and recording_finalize_attempts = 0
+               and recording_finalize_exhausted_at is null
+               and recording_finalize_defer_reason is null),
+    'a gate with no reset lifecycle is a one-way latch, not a control');
+
+  perform _policy_tests.assert(
+    '0038: reopen writes an attributable audit row',
+    exists (select 1 from screening_v2.audit_events
+             where action = 'admin_session_override'
+               and target_type = 'call_session'
+               and target_id = v_sid::text
+               and metadata->>'override' = 'recording_finalize_reopen'),
+    'an operator override must never be silent');
+
+  -- Terminal recording states are refused, exactly as 0025 refuses them.
+  update screening_v2.call_sessions
+     set recording_deleted_at = now() where id = v_sid;
+  v_res := screening_v2.reopen_recording_finalize(v_sid, 'operator_review');
+  perform _policy_tests.assert(
+    '0038: reopen refuses a deleted recording',
+    v_res->>'status' = 'terminal_state',
+    'got ' || coalesce(v_res->>'status', 'null'));
+
+  update screening_v2.call_sessions
+     set recording_deleted_at = null,
+         recording_object_key = v_sid::text || '-egress.ogg'
+   where id = v_sid;
+  v_res := screening_v2.reopen_recording_finalize(v_sid, 'operator_review');
+  perform _policy_tests.assert(
+    '0038: reopen refuses an already-linked recording',
+    v_res->>'status' = 'already_linked',
+    'got ' || coalesce(v_res->>'status', 'null'));
+
+  -- ── the halt control: set, idempotent re-set, and CLEAR ──
+  v_res := screening_v2.set_recording_finalize_halt('not_a_reason');
+  perform _policy_tests.assert(
+    '0038: halt refuses a reason outside the allowlist',
+    v_res->>'status' = 'invalid_reason',
+    'got ' || coalesce(v_res->>'status', 'null'));
+
+  v_res := screening_v2.set_recording_finalize_halt('operator_pause');
+  perform _policy_tests.assert(
+    '0038: the halt can be SET',
+    v_res->>'status' = 'ok'
+      and exists (select 1 from screening_v2.recording_finalize_control
+                   where control_key = 'default' and sweep_halted_at is not null),
+    'got ' || v_res::text);
+
+  v_res := screening_v2.clear_recording_finalize_halt();
+  perform _policy_tests.assert(
+    '0038: the halt can be CLEARED — a gate with no reset is a latch',
+    v_res->>'status' = 'ok' and (v_res->>'was_halted')::boolean = true
+      and exists (select 1 from screening_v2.recording_finalize_control
+                   where control_key = 'default'
+                     and sweep_halted_at is null and sweep_halt_reason is null),
+    'got ' || v_res::text);
+
+  -- ── the bounded reaper ──
+  update screening_v2.job_queue
+     set status = 'completed', completed_at = now() - interval '30 days'
+   where dedup_key = 'recording.finalize:' || v_sid::text;
+
+  v_reaped := screening_v2.reap_completed_jobs(604800, 500);
+  perform _policy_tests.assert(
+    '0038: the reaper removes aged COMPLETED job rows',
+    (v_reaped->>'deleted')::int >= 1
+      and not exists (select 1 from screening_v2.job_queue
+                       where dedup_key = 'recording.finalize:' || v_sid::text),
+    'got ' || v_reaped::text);
+
+  v_reaped := screening_v2.reap_completed_jobs(1, 1);
+  perform _policy_tests.assert(
+    '0038: the reaper CLAMPS its retention window rather than trusting input',
+    (v_reaped->>'older_than_seconds')::int = 3600 and (v_reaped->>'limit')::int = 1,
+    'got ' || v_reaped::text);
+
+  delete from screening_v2.job_queue
+   where dedup_key = 'recording.finalize:' || v_sid::text;
+  -- audit_events is APPEND-ONLY (prevent_audit_mutation blocks DELETE), which
+  -- is exactly the property the reopen audit relies on. The synthetic rows are
+  -- left in place deliberately; they carry no candidate data.
+  delete from screening_v2.call_sessions where id = v_sid;
+end;
+$$;
+
+-- ═══════════════════════════════════════════════════════════════════════
 -- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)
 -- ═══════════════════════════════════════════════════════════════════════
 

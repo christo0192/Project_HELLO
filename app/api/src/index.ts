@@ -10,6 +10,14 @@ import {
   registerAshbyScheduler,
   clearAshbySchedulerRegistration,
 } from './integrations/ashby/runtime-health.js';
+import {
+  createRecordingRuntime,
+  type RecordingRuntimeHandle,
+} from './lib/recording/runtime.js';
+import {
+  registerRecordingRuntime,
+  clearRecordingRuntimeRegistration,
+} from './lib/recording/health.js';
 
 const startupLogger = createLogger('startup');
 const app = createApp();
@@ -40,7 +48,30 @@ try {
   ashbyWorkers = null;
 }
 
+// ── Recording finalization runtime (disabled by default) ─────────────────────
+// Built in its OWN try/catch, from its OWN gate, with no reference to the
+// Ashby branch above. That independence is the point: the deployment this
+// repair exists for has the Ashby runtime paused, and a session whose
+// recording never finalized must still converge there. A failure of either
+// runtime must not prevent the other from starting, and neither may prevent
+// the API from serving HTTP.
+let recordingRuntime: RecordingRuntimeHandle | null = null;
+try {
+  recordingRuntime = createRecordingRuntime();
+} catch {
+  // Sanitized: the error is not logged verbatim because it can carry config text.
+  startupLogger.warn('unknown_event', { error_category: 'recording_runtime_start_failed' });
+  recordingRuntime = null;
+}
+
 server.listen(env.port, () => {
+  if (recordingRuntime) {
+    recordingRuntime.scheduler.start();
+    // Register the LIVE scheduler so /api/recordings/health reports real tick
+    // bookkeeping rather than configuration. Process-local by design; the
+    // fleet-wide signal is the durable backlog the same route reads from the DB.
+    registerRecordingRuntime(recordingRuntime);
+  }
   if (ashbyWorkers) {
     ashbyWorkers.scheduler.start();
     // Register the LIVE scheduler so the Mission Control health surface reports
@@ -65,6 +96,17 @@ shutdown.boot(server).then(async (code) => {
     try {
       clearAshbySchedulerRegistration();
       await ashbyWorkers.stop();
+    } catch {
+      // Never let a worker-stop failure change the process exit code.
+    }
+  }
+  if (recordingRuntime) {
+    try {
+      clearRecordingRuntimeRegistration();
+      // Stopped independently of the Ashby workers, and in its own try: a
+      // finalize job in flight either completes or fails UNDER ITS LEASE, and
+      // an abandoned lease is recovered by the reclaim loop on any machine.
+      await recordingRuntime.stop();
     } catch {
       // Never let a worker-stop failure change the process exit code.
     }

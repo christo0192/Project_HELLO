@@ -372,9 +372,27 @@ class TestBoundedOutcomeMapping(unittest.TestCase):
             with self.subTest(raw=raw):
                 self.assertEqual(agent_mod._bounded_outcome(raw), "other_failure")
 
-    def test_allowlist_is_exactly_four_plus_bucket(self) -> None:
+    def test_residency_timeout_has_its_own_bucket(self) -> None:
+        # 0038: a bounded room-residency timeout is NOT a crash — the worker was
+        # alive and the close event simply never fired. Folding it into
+        # `worker_crash` would misattribute the session AND inflate the real
+        # crash count; folding it into `other_failure` would hide a signal an
+        # operator needs to see distinctly.
+        self.assertEqual(agent_mod._bounded_outcome("residency_timeout"), "residency_timeout")
+
+    def test_allowlist_is_exactly_the_named_codes_plus_bucket(self) -> None:
         values = set(agent_mod._SESSION_OUTCOME_ALLOWLIST.values())
-        self.assertEqual(values, {"conversation_complete", "worker_crash", "shutdown_forced", "provider_error"})
+        self.assertEqual(
+            values,
+            {
+                "conversation_complete",
+                "worker_crash",
+                "shutdown_forced",
+                "provider_error",
+                # 0038 — see test_residency_timeout_has_its_own_bucket.
+                "residency_timeout",
+            },
+        )
 
 
 # ---------------------------------------------------------------------------

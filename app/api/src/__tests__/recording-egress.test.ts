@@ -15,6 +15,7 @@ const { testEnv } = vi.hoisted(() => ({
     recordingEgressS3SecretAccessKey: 'synthetic-secret',
     recordingEgressFinalizeTimeoutMs: 2_000,
     recordingMaxBytes: 25 * 1024 * 1024,
+    recordingFinalizeMaxAttempts: 5,
   },
 }));
 
@@ -28,6 +29,10 @@ import {
   startAuthoritativeRecording,
   safeEgressStartedAtMs,
   validateEpochMsAnchor,
+  probeEgressIdentity,
+  egressManifestObjectKey,
+  egressFinalizeConfigured,
+  RECORDING_FINALIZE_DEFER_REASONS,
   MAX_EPOCH_MS_ANCHOR,
 } from '../lib/recording-egress.js';
 
@@ -202,6 +207,13 @@ describe('authoritative recording egress', () => {
       sleep: async () => undefined,
     });
     expect(result).toBe('pending');
+    // 0038: a poll that timed out with a correctly-filtered, non-terminal
+    // answer is `poll_timeout` — DISTINCT from the storage-side and
+    // identity-mismatch causes it used to be indistinguishable from.
+    expect(db.rpc).toHaveBeenCalledWith('record_recording_finalize_deferral', expect.objectContaining({
+      p_reason: 'poll_timeout',
+      p_session_id: 'session',
+    }));
   });
 
   // ── T4: EGRESS_FAILED / _ABORTED / _LIMIT_REACHED → fallback_required ─
@@ -229,9 +241,39 @@ describe('authoritative recording egress', () => {
     expect(result).toBe('fallback_required');
   });
 
-  // ── T5: zero-byte egress object → fallback_required ─
-  it('T5: returns fallback_required when the egress object has zero bytes', async () => {
-    const { db } = fakeDb(
+  // ── N-1: a successful finalize clears the TERMINUS, not just the reason ─
+  it('N-1: success clears recording_finalize_exhausted_at as well as the defer reason', async () => {
+    // A session that exhausted its deferral budget and later converged — most
+    // often through the recruiter play path — would otherwise keep counting
+    // toward the health surface's `exhausted_count` forever, and there would
+    // be NO way to clear it: `reopen_recording_finalize` refuses an
+    // already-linked key by design. A converged recording is not waiting on a
+    // human.
+    const { db, updates } = fakeDb([
+      { recording_object_key: null, recording_provenance: null, recording_egress_id: 'EG_synthetic123', recording_egress_status: 'active' },
+    ]);
+    const result = await finalizeAuthoritativeRecording('session', {
+      db, client: fakeClient(), sleep: async () => undefined,
+    });
+    expect(result).toBe('ready');
+    expect(updates).toContainEqual({
+      recording_egress_status: 'complete',
+      recording_finalize_defer_reason: null,
+      recording_finalize_exhausted_at: null,
+    });
+  });
+
+  // ── T5 (0038, CHANGED BEHAVIOUR): zero bytes DEFERS, it does not latch ─
+  // A zero-byte download is evidence about STORAGE, not about the egress. The
+  // old behaviour latched `recording_egress_status = 'failed'` — a one-way
+  // door — on a transient S3 5xx, an eventually-consistent read, or a finalize
+  // racing the object's own write, permanently losing a recording that exists.
+  // The weakening ships with its mitigation: the deferral is bounded by
+  // RECORDING_FINALIZE_MAX_ATTEMPTS and terminated by
+  // recording_finalize_exhausted_at (asserted in
+  // recording-finalize-convergence.test.ts).
+  it('T5: zero bytes defers (object_unreadable) and does NOT latch failed', async () => {
+    const { db, rpc, updates } = fakeDb(
       [{ recording_object_key: null, recording_provenance: null, recording_egress_id: 'EG_synthetic123', recording_egress_status: 'active' }],
       Buffer.alloc(0),
     );
@@ -240,7 +282,31 @@ describe('authoritative recording egress', () => {
       client: fakeClient(),
       sleep: async () => undefined,
     });
+    expect(result).toBe('pending');
+    // The row was NOT written to 'failed'.
+    expect(updates).not.toContainEqual({ recording_egress_status: 'failed' });
+    // The cause was persisted, distinctly.
+    expect(rpc).toHaveBeenCalledWith('record_recording_finalize_deferral', expect.objectContaining({
+      p_reason: 'object_unreadable',
+    }));
+  });
+
+  // ── T5b (0038): OVERSIZE still latches — deliberately asymmetric ─
+  // An object larger than recordingMaxBytes is a DETERMINISTIC property of the
+  // bytes. Retrying cannot change it, so deferring would burn the whole
+  // attempt budget for nothing.
+  it('T5b: an oversize object still latches failed rather than deferring', async () => {
+    const { db, updates } = fakeDb(
+      [{ recording_object_key: null, recording_provenance: null, recording_egress_id: 'EG_synthetic123', recording_egress_status: 'active' }],
+      Buffer.alloc(testEnv.recordingMaxBytes + 1),
+    );
+    const result = await finalizeAuthoritativeRecording('session', {
+      db,
+      client: fakeClient(),
+      sleep: async () => undefined,
+    });
     expect(result).toBe('fallback_required');
+    expect(updates).toContainEqual({ recording_egress_status: 'failed' });
   });
 
   // ── T6: storage download error → pending, no RPC ─
@@ -270,7 +336,14 @@ describe('authoritative recording egress', () => {
       sleep: async () => undefined,
     });
     expect(result).toBe('pending');
-    expect(rpc).not.toHaveBeenCalled();
+    // 0038: the FINALIZE rpc must still never run on an unreadable object...
+    expect(rpc).not.toHaveBeenCalledWith('finalize_authoritative_recording', expect.anything());
+    // ...but the CAUSE is no longer silent. Before this, a misconfigured
+    // storage gateway and an egress still flushing produced byte-identical
+    // rows and byte-identical logs (none).
+    expect(rpc).toHaveBeenCalledWith('record_recording_finalize_deferral', expect.objectContaining({
+      p_reason: 'object_unreadable',
+    }));
   });
 
   // ── no egress id → fallback_required ─
@@ -440,5 +513,138 @@ describe('validateEpochMsAnchor', () => {
   it('returns null for a string that rounds differently (loss of precision)', () => {
     // "9007199254740993" > Number.MAX_SAFE_INTEGER — Number() rounds it
     expect(validateEpochMsAnchor('9007199254740993')).toBeNull();
+  });
+});
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// 0038 — egress IDENTITY, and the three answers a listEgress response gives
+// ═══════════════════════════════════════════════════════════════════════
+//
+// The old `terminalEgressInfo(items)` never checked WHOSE egress it found. It
+// took the first terminal item in the response, so if the provider ignored the
+// `egressId` filter — a shape already observed on this provider with `limit` —
+// ANOTHER session's EGRESS_FAILED would latch OUR row to 'failed', permanently
+// and invisibly.
+
+describe('0038: egress identity probe', () => {
+  const MINE = 'EG_synthetic123';
+
+  it('an empty response is NOT a mismatch — it is an ordinary wait', () => {
+    // Collapsing this into `identity_mismatch` would burn the attempt budget
+    // of every healthy in-flight session.
+    expect(probeEgressIdentity([], MINE)).toEqual({ outcome: 'not_terminal' });
+    expect(probeEgressIdentity(null, MINE)).toEqual({ outcome: 'not_terminal' });
+    expect(probeEgressIdentity(undefined, MINE)).toEqual({ outcome: 'not_terminal' });
+  });
+
+  it('our egress in a live state is not terminal', () => {
+    const probe = probeEgressIdentity(
+      [{ egressId: MINE, status: EgressStatus.EGRESS_ACTIVE }] as never,
+      MINE,
+    );
+    expect(probe).toEqual({ outcome: 'not_terminal' });
+  });
+
+  it('our egress in a terminal state is terminal', () => {
+    const probe = probeEgressIdentity(
+      [{ egressId: MINE, status: EgressStatus.EGRESS_COMPLETE }] as never,
+      MINE,
+    );
+    expect(probe.outcome).toBe('terminal');
+  });
+
+  it('a NON-EMPTY response with no item of ours is an identity mismatch', () => {
+    const probe = probeEgressIdentity(
+      [{ egressId: 'EG_somebodyelse999', status: EgressStatus.EGRESS_FAILED }] as never,
+      MINE,
+    );
+    expect(probe).toEqual({ outcome: 'identity_mismatch' });
+  });
+
+  it('picks OUR item out of a response containing several', () => {
+    const probe = probeEgressIdentity(
+      [
+        { egressId: 'EG_somebodyelse999', status: EgressStatus.EGRESS_FAILED },
+        { egressId: MINE, status: EgressStatus.EGRESS_COMPLETE },
+      ] as never,
+      MINE,
+    );
+    expect(probe.outcome).toBe('terminal');
+    expect(probe.outcome === 'terminal' && probe.info.egressId).toBe(MINE);
+  });
+});
+
+describe('0038: identity mismatch never latches our row failed', () => {
+  it("another session's EGRESS_FAILED defers as egress_identity_mismatch", async () => {
+    const { db, rpc, updates } = fakeDb([
+      { recording_object_key: null, recording_provenance: null, recording_egress_id: 'EG_synthetic123', recording_egress_status: 'active' },
+    ]);
+    // The provider ignores the filter and answers about somebody else.
+    const client = {
+      startRoomCompositeEgress: vi.fn(),
+      stopEgress: vi.fn().mockResolvedValue({}),
+      listEgress: vi.fn().mockResolvedValue([
+        { egressId: 'EG_somebodyelse999', status: EgressStatus.EGRESS_FAILED },
+      ]),
+    } as never;
+
+    const result = await finalizeAuthoritativeRecording('session', {
+      db, client, sleep: async () => undefined,
+    });
+
+    expect(result).toBe('pending');
+    // THE regression this exists for: our row is untouched.
+    expect(updates).not.toContainEqual({ recording_egress_status: 'failed' });
+    expect(rpc).toHaveBeenCalledWith('record_recording_finalize_deferral', expect.objectContaining({
+      p_reason: 'egress_identity_mismatch',
+    }));
+    expect(rpc).not.toHaveBeenCalledWith('finalize_authoritative_recording', expect.anything());
+  });
+});
+
+describe('0038: manifest key and configuration probe', () => {
+  it('the manifest is <key>.json, not <session>-egress.json', () => {
+    // Pinned against livekit-server-sdk@2.16.0: LiveKit appends `.json` to the
+    // FILEPATH. Deleting a guessed `<session>-egress.json` would silently
+    // succeed against an idempotent remove() and write a false compliance
+    // record — the exact failure class the erasure repair ends.
+    const id = '00000000-0000-4000-8000-000000000001';
+    expect(egressObjectKey(id)).toBe(`${id}-egress.ogg`);
+    expect(egressManifestObjectKey(id)).toBe(`${id}-egress.ogg.json`);
+    expect(egressManifestObjectKey(id)).not.toBe(`${id}-egress.json`);
+  });
+
+  it('reports NOT configured when egress is disabled, so the handler defers', () => {
+    // Without this pre-check, a build with egress off but legacy rows still
+    // carrying an egress id would construct an EgressClient against an empty
+    // URL, THROW, and dead-letter the job after five attempts — for a session
+    // whose only problem is that the feature is switched off.
+    testEnv.recordingEgressEnabled = false;
+    expect(egressFinalizeConfigured()).toBe(false);
+    testEnv.recordingEgressEnabled = true;
+  });
+
+  it('every worker-emitted defer reason is in the bounded allowlist', () => {
+    // B-10: the 0038 CHECK is the AUTHORITATIVE gate and is NARROWER than the
+    // queue's shape regex, so a code the worker can emit but the migration
+    // does not admit would defer the JOB normally while failing the SESSION
+    // write — silently, because that write is best-effort — and the health
+    // surface would under-report. Keep this list and the CHECK in lockstep.
+    expect([...RECORDING_FINALIZE_DEFER_REASONS].sort()).toEqual([
+      'egress_disabled',
+      'egress_identity_mismatch',
+      'object_absent',
+      'object_unreadable',
+      'poll_timeout',
+      'provenance_conflict',
+      'provider_error',
+      'rpc_unknown',
+      'terminal_state',
+    ]);
+    for (const reason of RECORDING_FINALIZE_DEFER_REASONS) {
+      // Must also satisfy the queue's own (looser) reason shape.
+      expect(reason).toMatch(/^[a-z0-9_.:-]{1,64}$/);
+    }
   });
 });

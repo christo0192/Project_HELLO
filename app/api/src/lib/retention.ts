@@ -19,6 +19,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { supabase as defaultSupabase } from './supabase.js';
 import { env } from './env.js';
+import { egressObjectKey, egressManifestObjectKey } from './recording-egress.js';
 import { createLogger } from './logger.js';
 import type { EventName } from './logger.js';
 
@@ -706,6 +707,22 @@ function mapRowToGovernanceAudit(row: Record<string, unknown>): GovernanceAuditE
  */
 export interface RecordingStorage {
   remove(objectKey: string): Promise<void>;
+  /**
+   * OPTIONAL existence probe, added by 0038 for the orphan branch below.
+   *
+   * A session with a NULL `recording_object_key` and a live
+   * `recording_egress_id` may still have objects in the bucket: the egress
+   * wrote them, and the finalize that would have linked them never ran. The
+   * DB row alone cannot answer whether anything is there, and an idempotent
+   * `remove()` cannot either — it succeeds on an absent key, which is exactly
+   * how a false "removed" record gets written.
+   *
+   * Optional so every existing injected synthetic stays valid. When it is
+   * absent the erasure reports `orphan_probe: 'unavailable'` and does NOT
+   * claim removal — an honest "we could not look" rather than a confident
+   * "there was nothing there".
+   */
+  exists?(objectKey: string): Promise<boolean>;
 }
 
 /**
@@ -724,6 +741,19 @@ export function supabaseStorageRecordingStorage(
       if (error) {
         throw new Error(`recording storage remove failed: ${error.message}`);
       }
+    },
+    async exists(objectKey: string): Promise<boolean> {
+      const client = getClient(clientOverride);
+      // `list` with an exact `search` is the cheapest true existence probe:
+      // it transfers a name, never bytes, and never mints a URL.
+      const slash = objectKey.lastIndexOf('/');
+      const prefix = slash >= 0 ? objectKey.slice(0, slash) : '';
+      const name = slash >= 0 ? objectKey.slice(slash + 1) : objectKey;
+      const { data, error } = await client.storage
+        .from(bucket)
+        .list(prefix, { search: name, limit: 100 });
+      if (error) throw new Error(`recording storage probe failed: ${error.message}`);
+      return Array.isArray(data) && data.some((entry) => (entry as { name?: string }).name === name);
     },
   };
 }
@@ -842,9 +872,15 @@ export async function eraseRecording(
   //    missing (a retry after failed_integrity_event). In that case the
   //    retry BACKFILLS the missing event + success completion audit so the
   //    log converges instead of permanently returning already_deleted.
+  // 0038: `recording_egress_id` is read as well. A NULL key is NOT proof that
+  // nothing is in the bucket — an egress that completed without a finalize
+  // wrote its object (and its manifest) and left the row unlinked, which is
+  // the exact shape the whole convergence repair exists for. Erasing such a
+  // session by tombstoning the row alone would leave candidate audio in
+  // storage while recording a completed erasure.
   const { data: session, error: sessionErr } = await client
     .from('call_sessions')
-    .select('recording_deleted_at, recording_object_key')
+    .select('recording_deleted_at, recording_object_key, recording_egress_id')
     .eq('id', sessionId)
     .single();
   if (sessionErr || !session) {
@@ -905,7 +941,14 @@ export async function eraseRecording(
         details: {
           strategy: 'delete',
           converged: true,
-          object_key_removed: true,
+          // 0038 (compliance): this was hardcoded `true`. It is a BACKFILL of
+          // missing evidence for a row that was already tombstoned — this
+          // pass removed nothing at all, and saying otherwise made the
+          // completion record a false success. The truthful value is false;
+          // whether an object was removed is recorded by the pass that
+          // actually removed it.
+          object_key_removed: false,
+          backfilled_evidence: true,
           processors: propagation.processors,
           backup_aging: {
             policy_id: aging.policyId,
@@ -925,22 +968,103 @@ export async function eraseRecording(
   }
 
   const objectKey = session.recording_object_key as string | null;
+  const egressId = (session as { recording_egress_id?: string | null }).recording_egress_id ?? null;
+
+  // What this pass actually removed, as opposed to what it intended to.
+  let objectRemoved = false;
+  let manifestRemoved = false;
+  /** 'not_applicable' | 'absent' | 'removed' | 'unavailable' */
+  let orphanProbe: 'not_applicable' | 'absent' | 'removed' | 'unavailable' = 'not_applicable';
+
+  const failStorage = async (): Promise<EraseRecordingResult> => {
+    await recordGovernanceAudit({
+      action: 'erasure_completed',
+      actorId,
+      entityType: 'recording',
+      entityId: sessionId,
+      details: { strategy: 'delete', failure: 'storage_delete', object_key_removed: false },
+      outcome: 'failure',
+      correlationId: corrId,
+    }, client);
+    return { status: 'failed_storage_delete', failure: 'storage_delete', correlationId: corrId, objectKey };
+  };
 
   // 4. Storage-object deletion (idempotent; absent key = success).
   if (objectKey) {
     try {
       await storage.remove(objectKey);
+      objectRemoved = true;
     } catch {
-      await recordGovernanceAudit({
-        action: 'erasure_completed',
-        actorId,
-        entityType: 'recording',
-        entityId: sessionId,
-        details: { strategy: 'delete', failure: 'storage_delete', object_key_removed: false },
-        outcome: 'failure',
-        correlationId: corrId,
-      }, client);
-      return { status: 'failed_storage_delete', failure: 'storage_delete', correlationId: corrId, objectKey };
+      return failStorage();
+    }
+
+    // 0038: the MANIFEST. `startAuthoritativeRecording` sets
+    // `disableManifest: false`, so a `<key>.json` manifest exists for every
+    // egress-recorded session — and nothing ever removed it, on this normal
+    // fully-linked path either, not only in the orphan case. It is only
+    // derived when the linked key IS the egress key: a browser_upload object
+    // has no manifest, and deleting a guessed sibling would be a second,
+    // quieter false success.
+    //
+    // N-3: PROBE BEFORE CLAIMING. `storage.remove()` is contractually
+    // idempotent — it succeeds on an absent key — so "the call did not throw"
+    // is not evidence that anything was removed. That is precisely the
+    // pattern this change eliminates for `object_key_removed`; applying it to
+    // `manifest_removed` would just move the overstatement to a quieter
+    // field. When the interface offers no probe the answer is UNKNOWN, and an
+    // unknown must not be reported as a removal.
+    if (objectKey === egressObjectKey(sessionId)) {
+      const manifestKey = egressManifestObjectKey(sessionId);
+      try {
+        const present = typeof storage.exists === 'function'
+          ? await storage.exists(manifestKey)
+          : null;
+        // `null` = could not look. Still attempt the delete (it is idempotent
+        // and the manifest almost certainly exists), but do not claim it.
+        if (present !== false) await storage.remove(manifestKey);
+        manifestRemoved = present === true;
+      } catch {
+        return failStorage();
+      }
+    }
+  } else if (egressId) {
+    // ── 0038: the ORPHAN branch ────────────────────────────────────────
+    // NULL key + live egress id. The row says nothing was ever linked; the
+    // BUCKET may disagree. Probe, and report only what was observed.
+    const orphanKey = egressObjectKey(sessionId);
+    const orphanManifest = egressManifestObjectKey(sessionId);
+    if (typeof storage.exists !== 'function') {
+      // We cannot look. That is a real, reportable limitation — not evidence
+      // of absence, and not grounds to claim a removal.
+      orphanProbe = 'unavailable';
+    } else {
+      let present: boolean;
+      let manifestPresent: boolean;
+      try {
+        present = await storage.exists(orphanKey);
+        manifestPresent = await storage.exists(orphanManifest);
+      } catch {
+        return failStorage();
+      }
+      if (!present && !manifestPresent) {
+        // Idempotent success — but audited as `absent`, NOT as a removal.
+        orphanProbe = 'absent';
+      } else {
+        try {
+          if (present) {
+            await storage.remove(orphanKey);
+            objectRemoved = true;
+          }
+          if (manifestPresent) {
+            await storage.remove(orphanManifest);
+            manifestRemoved = true;
+          }
+        } catch {
+          // Present and NOT deletable is a failure, never a success.
+          return failStorage();
+        }
+        orphanProbe = 'removed';
+      }
     }
   }
 
@@ -959,7 +1083,16 @@ export async function eraseRecording(
       actorId,
       entityType: 'recording',
       entityId: sessionId,
-      details: { strategy: 'delete', failure: 'tombstone_write', object_key_removed: true },
+      // 0038 (compliance): was hardcoded `true`. On a NULL-key session
+      // nothing was removed, and a failure record that overstates what it
+      // deleted is still a false record.
+      details: {
+        strategy: 'delete',
+        failure: 'tombstone_write',
+        object_key_removed: objectRemoved,
+        manifest_removed: manifestRemoved,
+        orphan_probe: orphanProbe,
+      },
       outcome: 'failure',
       correlationId: corrId,
     }, client);
@@ -984,7 +1117,10 @@ export async function eraseRecording(
       details: {
         strategy: 'delete',
         failure: 'integrity_event_write',
-        object_key_removed: true,
+        // 0038 (compliance): was hardcoded `true`.
+        object_key_removed: objectRemoved,
+        manifest_removed: manifestRemoved,
+        orphan_probe: orphanProbe,
         tombstoned: true,
       },
       outcome: 'failure',
@@ -1008,7 +1144,13 @@ export async function eraseRecording(
     entityId: sessionId,
     details: {
       strategy: 'delete',
-      object_key_removed: Boolean(objectKey),
+      // What was ACTUALLY removed by this pass, not what the row implied.
+      // `Boolean(objectKey)` was already truthful for the linked path; it is
+      // not sufficient for the orphan path, where a removal can happen with
+      // no linked key at all.
+      object_key_removed: objectRemoved,
+      manifest_removed: manifestRemoved,
+      orphan_probe: orphanProbe,
       processors: propagation.processors,
       backup_aging: {
         policy_id: aging.policyId,

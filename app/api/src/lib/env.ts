@@ -17,6 +17,21 @@ const _contractVisibleEnvReads = [
   process.env.RECORDING_EGRESS_ENABLED,
   process.env.RECORDING_EGRESS_REQUIRED,
   process.env.RECORDING_EGRESS_FINALIZE_TIMEOUT_MS,
+  process.env.RECORDING_FINALIZE_WORKER_ENABLED,
+  process.env.RECORDING_FINALIZE_GRACE_SEC,
+  process.env.RECORDING_FINALIZE_MAX_ATTEMPTS,
+  process.env.RECORDING_FINALIZE_CONCURRENCY,
+  process.env.RECORDING_FINALIZE_SWEEP_ADMISSION,
+  process.env.RECORDING_FINALIZE_SWEEP_MAX_AGE_SEC,
+  process.env.RECORDING_FINALIZE_POLL_MS,
+  process.env.RECORDING_FINALIZE_SWEEP_MS,
+  process.env.RECORDING_FINALIZE_RECLAIM_MS,
+  process.env.RECORDING_FINALIZE_RECLAIM_LIMIT,
+  process.env.RECORDING_FINALIZE_LEASE_SEC,
+  process.env.RECORDING_FINALIZE_HALT_TTL_MS,
+  process.env.RECORDING_JOB_REAP_MS,
+  process.env.RECORDING_JOB_REAP_AGE_SEC,
+  process.env.RECORDING_JOB_REAP_LIMIT,
 ];
 void _contractVisibleEnvReads;
 
@@ -88,6 +103,90 @@ export const env = {
   recordingEgressFinalizeTimeoutMs: positiveInt(
     'RECORDING_EGRESS_FINALIZE_TIMEOUT_MS', 20_000, 1_000, 120_000,
   ),
+  // ── 0038: durable recording-finalization convergence ──────────────────
+  // Every knob here defaults to the DISABLED or conservative value, so a
+  // deploy of this build changes nothing about a running API. The trigger
+  // still records finalization intent durably in `job_queue` while the
+  // worker is off; enabling it later drains that intent.
+  /**
+   * Master gate. False (default) ⇒ `createRecordingRuntime()` returns null:
+   * no queue runner, no scheduler, no timer, no DB poll.
+   */
+  recordingFinalizeWorkerEnabled: booleanEnv('RECORDING_FINALIZE_WORKER_ENABLED', false),
+  /**
+   * Delay between a session becoming terminal and its finalize job becoming
+   * claimable. Exists so the job does not race the egress's own flush. The
+   * trigger's own grace is a migration-level literal; this one bounds the
+   * SWEEPER, which must not re-enqueue a row the trigger just queued.
+   */
+  recordingFinalizeGraceSec: positiveInt('RECORDING_FINALIZE_GRACE_SEC', 60, 10, 900),
+  /**
+   * Deferral budget per SESSION before `recording_finalize_exhausted_at` is
+   * stamped. Distinct from the queue job's `max_attempts`, which counts only
+   * genuine handler throws — a deferral refunds that one and charges this one.
+   */
+  recordingFinalizeMaxAttempts: positiveInt('RECORDING_FINALIZE_MAX_ATTEMPTS', 5, 1, 20),
+  /**
+   * In-flight finalize jobs per machine. Pinned rather than left to the
+   * runner's default of 2, because the producer/consumer balance below is an
+   * INVARIANT, not an accident:
+   *
+   *   admission ≤ concurrency × (sweepMs / pollMs)
+   *   20        ≤ 4           × (300000 / 60000) = 20   ✓
+   *
+   * At the runner's default of 2 the sweeper would enqueue 4 rows/min against
+   * a 2 rows/min drain and the backlog would grow while the sweep ran.
+   * `effectiveSweepAdmission` in lib/recording/config.ts enforces this at
+   * construction — it CLAMPS admission to the drain capacity and logs the
+   * clamp rather than refusing to start, because degrading a rate is right
+   * where refusing to start a convergence subsystem is not. A test asserts
+   * both the invariant at the defaults and the clamp above them.
+   */
+  recordingFinalizeConcurrency: positiveInt('RECORDING_FINALIZE_CONCURRENCY', 4, 1, 32),
+  /** Rows the sweeper may enqueue per tick. The first bound on a cold backlog. */
+  recordingFinalizeSweepAdmission: positiveInt('RECORDING_FINALIZE_SWEEP_ADMISSION', 20, 1, 200),
+  /**
+   * How far back the sweeper may reach at all. The second bound: the first
+   * enable runs against accumulated history, and "everything ever recorded"
+   * is not a work list anyone chose.
+   */
+  recordingFinalizeSweepMaxAgeSec: positiveInt(
+    'RECORDING_FINALIZE_SWEEP_MAX_AGE_SEC', 604_800, 3_600, 2_592_000,
+  ),
+  /** Queue-runner tick cadence. */
+  recordingFinalizePollMs: positiveInt('RECORDING_FINALIZE_POLL_MS', 60_000, 1_000, 600_000),
+  /** Sweeper tick cadence. */
+  recordingFinalizeSweepMs: positiveInt('RECORDING_FINALIZE_SWEEP_MS', 300_000, 10_000, 3_600_000),
+  /**
+   * Reclaim cadence. Without a reclaim loop a machine that dies mid-finalize
+   * leaves the job `active` with an expired lease, and `uq_job_queue_dedup_active`
+   * covers `active` — so the trigger's `on conflict do nothing` and the
+   * sweeper's dedup-keyed enqueue both become silent no-ops and the session is
+   * stuck forever, one level up from the defect this whole change repairs.
+   */
+  recordingFinalizeReclaimMs: positiveInt('RECORDING_FINALIZE_RECLAIM_MS', 60_000, 5_000, 3_600_000),
+  /**
+   * Per-pass reclaim limit. `reclaim_expired_jobs` is queue-name-AGNOSTIC
+   * (its signature has no queue name), so with both runtimes enabled this
+   * loop and the Ashby reclaim loop share ONE global budget. Kept well below
+   * the Ashby loop's 50 so neither starves the other.
+   */
+  recordingFinalizeReclaimLimit: positiveInt('RECORDING_FINALIZE_RECLAIM_LIMIT', 25, 1, 500),
+  /** Lease granted per finalize claim. Must exceed the finalize timeout. */
+  recordingFinalizeLeaseSec: positiveInt('RECORDING_FINALIZE_LEASE_SEC', 180, 30, 900),
+  /**
+   * TTL of the in-process halt-flag cache. The runner's admission gate runs on
+   * EVERY poll of EVERY queue and its contract says whatever it consults must
+   * be CHEAP; an uncached DB read there would turn a transient blip into a
+   * fleet-wide claim freeze.
+   */
+  recordingFinalizeHaltTtlMs: positiveInt('RECORDING_FINALIZE_HALT_TTL_MS', 5_000, 500, 60_000),
+  /** Cadence of the bounded terminal-job reaper. */
+  recordingJobReapMs: positiveInt('RECORDING_JOB_REAP_MS', 900_000, 60_000, 86_400_000),
+  /** Retention window for COMPLETED job_queue rows before they are reaped. */
+  recordingJobReapAgeSec: positiveInt('RECORDING_JOB_REAP_AGE_SEC', 604_800, 3_600, 7_776_000),
+  /** Rows the reaper may delete per pass. */
+  recordingJobReapLimit: positiveInt('RECORDING_JOB_REAP_LIMIT', 500, 1, 5_000),
   /** MIG-06: TTL (seconds) for recruiter recording download signed URLs. Range 60..900. */
   recordingDownloadTtlSec: positiveInt('RECORDING_DOWNLOAD_TTL_SEC', 300, 60, 900),
   /**

@@ -185,6 +185,21 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ token }),
     }),
+  /**
+   * Signal that the candidate's screening is over.
+   *
+   * `keepalive: true` is a MITIGATION, not the mechanism. A browser that is
+   * being torn down (tab close, navigation, backgrounded mobile app) will
+   * cancel an ordinary in-flight fetch, and this call was the only thing that
+   * completed the session and finalized the recording from the client side.
+   * `keepalive` lets the request survive the unload.
+   *
+   * It is explicitly not load-bearing: the server-side convergence path (the
+   * 0038 terminal-transition trigger + finalize worker + sweeper) must remain
+   * correct with this call deleted entirely, and the API suite asserts exactly
+   * that. Treat this as shortening the common-case latency, never as the
+   * reason the recording converges.
+   */
   completeCandidateScreening: (sessionId: string, grantToken: string) =>
     request<{
       status: string;
@@ -192,6 +207,7 @@ export const api = {
     }>(`/api/livekit/${sessionId}/complete`, {
       method: 'POST',
       headers: { 'x-grant-token': grantToken },
+      keepalive: true,
     }),
   uploadCandidateRecording: (sessionId: string, grantToken: string, blob: Blob) => {
     const form = new FormData();
