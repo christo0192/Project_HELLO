@@ -17,10 +17,27 @@ committed file.
 
 ## 0. Preconditions — all three, in order
 
-1. **The code fix is deployed.** Replaying the ingestion job before the
-   file-handle fix reproduces the identical failure and consumes the replay.
-   Confirm the running image contains migration `0035` and the 512-bound
-   `MAX_FILE_HANDLE_LEN`.
+1. **Both code fixes are deployed.** Replaying the ingestion job before them
+   reproduces the identical failure and consumes the replay. Confirm the running
+   image contains:
+   - migration `0035` and the 512-bound `MAX_FILE_HANDLE_LEN` (the ordering /
+     file-handle fix), **and**
+   - the Node 22 pinned-lookup fix in `resume-transport.ts` (the transport fix,
+     below). Without it *every* resume fetch fails, so the recovery in this
+     document will run to completion and still leave the ingestion in
+     `failed_review`.
+
+   **The transport fix, in one paragraph.** The pinned-IP transport injects its
+   own DNS `lookup` so the socket connects to an address that was already
+   asserted public. Node 22 calls that lookup with `{ all: true }` (the
+   `autoSelectFamily` default) and expects an **address array** back; the old
+   implementation always answered with the legacy `(address, family)` tuple, so
+   Node read an array out of a bare string and rejected the connect with
+   `ERR_INVALID_IP_ADDRESS` before a single packet left the machine. The failure
+   surfaced as ingestion `failed_review / fetch_http_error` while the very same
+   presigned URL fetched fine by hand (`200`, a real PDF) — which is the
+   signature to look for. The lookup now answers both shapes and still never
+   falls back to system DNS.
 2. **The runtime is still off** (or the mapping still paused) while you inspect.
    Turn it on only at step 3.
 3. **You have read the current state** rather than assuming it. Step 1 below is
@@ -106,8 +123,13 @@ select state, attempts from screening_v2.ashby_resume_ingestions
  where application_link_id = :application_link_id;
 ```
 
-- **`queued`** — replay directly (this is the canary's own case).
-- **`failed_review`** — requeue it first. `failed_review -> queued` is the one
+- **`queued`** — replay directly (this was the canary's state at `b92e590`).
+- **`failed_review`** — requeue it first. **This is the canary's state after the
+  transport failure**, and it is now the ordinary case: the handler records
+  `failed_review` before dead-lettering, so `failed_reason = fetch_http_error`
+  is exactly what the pinned-lookup defect leaves behind. **The requeue must
+  happen BEFORE the DLQ replay in §2b** — replaying onto a `failed_review` row
+  reports success having done nothing, and burns the replay. `failed_review -> queued` is the one
   exit the trigger allows, and `advance_ashby_ingestion` is the audited way to
   take it:
 
@@ -126,6 +148,10 @@ select state, attempts from screening_v2.ashby_resume_ingestions
 ### 2b. Replay the job
 
 Replay **exactly one** job — the `ashby.ingestion` entry for this link:
+
+> **Order matters.** §2a first, §2b second. If §2a returned `retry_exhausted`,
+> do not replay at all — the ingestion has genuinely failed five times and the
+> cause in `failed_reason` is what needs fixing.
 
 ```sql
 select id, name, payload->>'applicationLinkId' as link
@@ -155,7 +181,10 @@ select state, attempts, failed_reason
 - **`ready`** — proceed to step 4.
 - **`failed_review`** — **STOP; do not reopen the invite.** `failed_reason`
   carries the sanitized cause (`fetch_invalid_request_*`, `fetch_url_unresolved`,
-  `scan_*`, `guard_*`, `parse_error`, …); diagnose that first. Before `0035` this
+  `fetch_http_error`, `scan_*`, `guard_*`, `parse_error`, …); diagnose that
+  first. A `fetch_http_error` on a URL that fetches fine by hand is the
+  pinned-transport signature from precondition 1 — check the deployed image
+  before requeuing, or the requeue just spends another attempt. Before `0035` this
   state was unreachable from `queued`, which is why the canary's row read
   `queued` rather than failed.
 
@@ -271,3 +300,8 @@ doing anything else.
    refunds the attempt the claim charged and reschedules behind a clamped delay.
 6. **Blocked and stuck work is visible** in `/health` rather than only by direct
    database inspection.
+7. **The pinned transport speaks Node 22's lookup contract**, so the resume
+   fetch can actually connect. It also fails over across the resolved addresses
+   — bounded, ordered, within the same wall-clock budget, and only while nothing
+   has been served yet — so one black-holed A-record no longer fails the whole
+   ingestion.

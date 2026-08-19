@@ -433,11 +433,18 @@ flag on but a dead scheduler reports `degraded`, not `healthy`.
 
 ## 9. Known limitations recorded honestly
 
-- **`maxPinnedIps` is computed but only the first resolved IP is used**
-  (`resume-transport.ts`). Not a vulnerability — every resolved address is
-  asserted public before connect — but it means no failover across A-records.
-  Left as-is in this PR; it is a one-line behavioural change that deserves its
-  own review.
+- **Pinned-IP failover is live** (`resume-transport.ts`). `maxPinnedIps` is no
+  longer computed-and-ignored: the transport now walks a bounded, ordered set
+  of the already-validated addresses (IPv4 first, then IPv6, resolver order
+  preserved within each family, de-duplicated, capped at 4) and moves to the
+  next one **only** on a connect/TLS/socket failure raised *before* a response
+  begins. Once the server has answered — any status, any byte of body — the
+  attempt is final, because replaying a one-shot presigned GET is neither safe
+  nor useful. The whole sequence shares the caller's single wall-clock budget,
+  so failover cannot extend the fetch deadline. Ordering does not filter:
+  every address the orchestrator asserted public stays eligible, so the
+  upstream all-address check is not quietly narrowed to "the v4 records were
+  fine".
 - **Reconciliation progress strategy** is option (c) from the acceptance matrix:
   keep the bounded caps and make a non-advancing run *observable* via
   `no_progress_runs`, rather than advancing a partial cursor. Chosen because
