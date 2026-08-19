@@ -21,11 +21,17 @@ import type {
   QueueJob,
   QueueStatus,
   EnqueueInput,
+  DeferOutcome,
   FailOutcome,
   LeaseMutationOutcome,
   ReclaimResult,
 } from './types.js';
-import { ACTIVE_STATUSES, MAX_VISIBILITY_SECONDS } from './types.js';
+import {
+  ACTIVE_STATUSES,
+  MAX_VISIBILITY_SECONDS,
+  clampDeferSeconds,
+  isValidDeferReason,
+} from './types.js';
 
 /** A concrete job row for the in-memory store. */
 interface JobRow {
@@ -47,6 +53,9 @@ interface JobRow {
   leaseOwner: string | undefined;
   leaseExpiresAt: string | undefined;
   leaseDeadlineAt: string | undefined;
+  deferReason: string | undefined;
+  deferredAt: string | undefined;
+  deferCount: number;
 }
 
 let NEXT_ID = 1;
@@ -82,6 +91,12 @@ function clearLease(row: JobRow): void {
   row.leaseOwner = undefined;
   row.leaseExpiresAt = undefined;
   row.leaseDeadlineAt = undefined;
+}
+
+/** Clear the deferral marker on a row in place (any non-deferral outcome). */
+function clearDefer(row: JobRow): void {
+  row.deferReason = undefined;
+  row.deferredAt = undefined;
 }
 
 export interface MemoryAdapterDeps {
@@ -146,6 +161,9 @@ export class MemoryAdapter implements ILeasedQueueAdapter {
       leaseOwner: undefined,
       leaseExpiresAt: undefined,
       leaseDeadlineAt: undefined,
+      deferReason: undefined,
+      deferredAt: undefined,
+      deferCount: 0,
     };
 
     this.jobs.set(id, row);
@@ -259,6 +277,9 @@ export class MemoryAdapter implements ILeasedQueueAdapter {
       leaseOwner: undefined,
       leaseExpiresAt: undefined,
       leaseDeadlineAt: undefined,
+      deferReason: undefined,
+      deferredAt: undefined,
+      deferCount: 0,
     };
 
     this.jobs.set(newRow.id, newRow);
@@ -354,6 +375,7 @@ export class MemoryAdapter implements ILeasedQueueAdapter {
     row.status = 'completed';
     row.completedAt = nowIso;
     clearLease(row);
+    clearDefer(row);
     if (row.dedupKey) this.dedupIndex.delete(row.dedupKey);
     return 'ok';
   }
@@ -374,11 +396,48 @@ export class MemoryAdapter implements ILeasedQueueAdapter {
       row.scheduledAt = retryAtIso;
       row.errorMessage = errorMessage;
       clearLease(row);
+      // A retry is not a wait: drop the deferral marker so a failing job is
+      // never counted as one blocked on a prerequisite.
+      clearDefer(row);
       return 'retry_scheduled';
     }
     // Exhausted: move to the DLQ in one step (no insert-then-delete gap).
     this.dlqMove(row, nowIso, errorMessage);
     return 'dead_lettered';
+  }
+
+  /**
+   * Parity with the 0037 `defer_job` RPC: CAS on the live lease, return to
+   * `delayed` behind a clamped delay, and REFUND the attempt the claim
+   * charged. Never fails, never dead-letters, never writes error text — a job
+   * that could not start has no error to report.
+   */
+  async deferLeased(
+    jobId: string,
+    leaseToken: string,
+    nowIso: string,
+    reasonCode: string,
+    delaySeconds: number,
+  ): Promise<DeferOutcome> {
+    if (!isValidDeferReason(reasonCode)) return 'invalid_reason';
+    const row = this.jobs.get(jobId);
+    if (!row || !this.holdsLiveLease(row, leaseToken, nowIso)) return 'not_owned';
+
+    const delay = clampDeferSeconds(delaySeconds);
+    row.status = 'delayed';
+    row.scheduledAt = addSeconds(nowIso, delay);
+    row.attempts = Math.max(0, row.attempts - 1);
+    row.errorMessage = undefined;
+    row.startedAt = undefined;
+    // Keep the ORIGINAL wait start while the same reason repeats, so a job
+    // deferred 120 times over an hour reports an hour of waiting.
+    row.deferredAt = row.deferReason === reasonCode && row.deferredAt !== undefined
+      ? row.deferredAt
+      : nowIso;
+    row.deferReason = reasonCode;
+    row.deferCount += 1;
+    clearLease(row);
+    return 'deferred';
   }
 
   async reclaimExpired(nowIso: string, limit: number = 100): Promise<ReclaimResult> {
@@ -435,6 +494,9 @@ export class MemoryAdapter implements ILeasedQueueAdapter {
       leaseOwner: undefined,
       leaseExpiresAt: undefined,
       leaseDeadlineAt: undefined,
+      deferReason: undefined,
+      deferredAt: undefined,
+      deferCount: 0,
     };
     this.jobs.set(newRow.id, newRow);
     return this.rowToJob(newRow);
@@ -471,6 +533,9 @@ export class MemoryAdapter implements ILeasedQueueAdapter {
       leaseOwner: row.leaseOwner,
       leaseExpiresAt: row.leaseExpiresAt,
       leaseDeadlineAt: row.leaseDeadlineAt,
+      deferReason: row.deferReason,
+      deferredAt: row.deferredAt,
+      deferCount: row.deferCount,
     };
   }
 }

@@ -42,7 +42,7 @@ import type { MappingResolver } from './signal-worker.js';
 import type { MaterializationStore, MaterializationMapping } from './materialize.js';
 import type { ReceiptStore, CheckpointStore, EnabledMappingLoader } from './ports.js';
 import type { Queue } from '../../lib/queue/index.js';
-import { resolveScanner } from '../../lib/malware-scanner.js';
+import { classifyScanStatus, resolveScanner } from '../../lib/malware-scanner.js';
 import { guardUpload, UploadGuardError } from '../../lib/upload-guard.js';
 import { createResumeParserPool, type ResumeParserPool } from '../../lib/resume-parser-pool.js';
 import { fallbackParseResumeText } from '../../lib/resume-fallback.js';
@@ -441,6 +441,12 @@ export function createAshbyRuntime(options: CreateAshbyRuntimeOptions): AshbyRun
         return { text: parsed.text, structured, structurerVersion: ASHBY_STRUCTURER_VERSION };
       },
       fallbackFromText: (text) => fallbackParseResumeText(text),
+      // Tells the ingestion orchestrator which not-safe statuses are ANSWERS
+      // about the file (terminal) and which are an absence of screening
+      // (deferrable). Without it the orchestrator defaults to treating every
+      // not-safe status as a verdict — the pre-repair behaviour.
+      classifyScan: (status) =>
+        classifyScanStatus(status as Parameters<typeof classifyScanStatus>[0]),
       onState: input.onState,
       extractorVersion: ASHBY_EXTRACTOR_VERSION,
     };

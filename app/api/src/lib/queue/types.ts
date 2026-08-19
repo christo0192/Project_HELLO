@@ -48,6 +48,13 @@ export interface QueueJob<T = unknown> {
   leaseExpiresAt?: string;
   /** Absolute maximum visibility deadline; heartbeats cannot extend past it. */
   leaseDeadlineAt?: string;
+  // ── Deferral bookkeeping (0037) — a job WAITING on a prerequisite. ──
+  /** Sanitized reason code for the current deferral wait; absent when running. */
+  deferReason?: string;
+  /** Start of the current uninterrupted deferral streak (not the last defer). */
+  deferredAt?: string;
+  /** Monotonic count of deferrals taken. Diagnostic only; never a budget. */
+  deferCount?: number;
 }
 
 export interface EnqueueOptions {
@@ -180,6 +187,41 @@ export interface ClaimOptions {
 /** Outcome of a lease-guarded fail. */
 export type FailOutcome = 'retry_scheduled' | 'dead_lettered' | 'not_owned';
 
+/**
+ * Outcome of a lease-guarded DEFER.
+ *
+ * `deferred` is a first-class third outcome alongside complete and fail — it
+ * means the work never started because a prerequisite was not met, so no
+ * attempt was consumed and nothing failed. `invalid_reason` is returned rather
+ * than thrown so a bad reason code can never be mistaken for a successful wait.
+ */
+export type DeferOutcome = 'deferred' | 'not_owned' | 'invalid_reason';
+
+/** Minimum delay a deferral may schedule (seconds). Mirrors the 0037 clamp. */
+export const MIN_DEFER_SECONDS = 1;
+/** Maximum delay a deferral may schedule (seconds). Mirrors the 0037 clamp. */
+export const MAX_DEFER_SECONDS = 3600;
+/** Delay used when a caller supplies nothing usable. */
+export const DEFAULT_DEFER_SECONDS = 60;
+
+/** Clamp a requested deferral delay into [1, 3600] seconds. */
+export function clampDeferSeconds(seconds: number | undefined): number {
+  const s = typeof seconds === 'number' && Number.isFinite(seconds)
+    ? Math.floor(seconds)
+    : DEFAULT_DEFER_SECONDS;
+  if (s < MIN_DEFER_SECONDS) return MIN_DEFER_SECONDS;
+  if (s > MAX_DEFER_SECONDS) return MAX_DEFER_SECONDS;
+  return s;
+}
+
+/**
+ * Shape-check a deferral reason code against the SAME allowlist the 0037 RPC
+ * enforces, so a rejection is detected before a round trip rather than after.
+ */
+export function isValidDeferReason(reason: string): boolean {
+  return /^[a-z0-9_.:-]{1,64}$/.test(reason);
+}
+
 /** Outcome of a lease-guarded complete/heartbeat. */
 export type LeaseMutationOutcome = 'ok' | 'not_owned';
 
@@ -222,6 +264,13 @@ export interface ILeasedQueueAdapter extends IQueueAdapter {
    * single transaction.
    */
   failLeased(jobId: string, leaseToken: string, nowIso: string, errorMessage: string, retryAtIso: string): Promise<FailOutcome>;
+
+  /**
+   * Defer a job under the live matching lease: return it to `delayed` behind a
+   * clamped delay, REFUNDING the attempt the claim charged. Never fails the
+   * job, never dead-letters, never writes error text.
+   */
+  deferLeased(jobId: string, leaseToken: string, nowIso: string, reasonCode: string, delaySeconds: number): Promise<DeferOutcome>;
 
   /** Reclaim expired active jobs: requeue while attempts remain, else DLQ. */
   reclaimExpired(nowIso: string, limit?: number): Promise<ReclaimResult>;

@@ -137,6 +137,7 @@ function emptyBacklog() {
     operationsBlockedPrerequisite: 0, operationsBlockedFailedIngestion: 0,
     operationsFailedPrerequisite: 0,
     ingestionStuckQueued: 0, ingestionStuckFetching: 0,
+    scannerDeferredJobs: 0, scannerDeferredOldestAgeSec: null,
     writebackPending: 0, reconcileNoProgressRuns: 0, reconcileLastSuccessAt: null,
   };
 }

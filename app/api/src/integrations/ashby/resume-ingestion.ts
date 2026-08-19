@@ -46,6 +46,27 @@ export interface IngestionScanResult {
   status: string;
 }
 
+/**
+ * How a not-safe scan status should be treated (see `classifyScanStatus` in
+ * lib/malware-scanner). Injected rather than imported so this module stays a
+ * pure domain orchestrator with no scanner dependency.
+ *
+ * `verdict`      → the file was screened; a not-safe verdict is TERMINAL.
+ * anything else  → the file was NOT screened; the ingestion DEFERS.
+ */
+export type ScanClassifier = (status: string) => 'verdict' | 'availability' | 'transient';
+
+/**
+ * Default classifier used when a caller injects none: treat every not-safe
+ * status as a verdict, i.e. the pre-repair behaviour.
+ *
+ * Fail-safe in the direction that matters. An unclassified status closes the
+ * ingestion out loudly instead of deferring it invisibly, so forgetting to
+ * wire the classifier can never create a silent unbounded wait — the failure
+ * mode the deferral itself has to be careful about.
+ */
+export const DEFAULT_SCAN_CLASSIFIER: ScanClassifier = () => 'verdict';
+
 /** A parsed document: extracted text + structured fields + a structurer tag. */
 export interface ParseOutput {
   text: string;
@@ -72,6 +93,11 @@ export interface IngestionPorts {
   onState: (state: IngestionState, provenance?: IngestionProvenance) => void | Promise<void>;
   /** Extractor version tag for provenance. */
   extractorVersion: string;
+  /**
+   * Classifies a not-safe scan status into verdict / availability / transient.
+   * Defaults to "everything is a verdict" (see DEFAULT_SCAN_CLASSIFIER).
+   */
+  classifyScan?: ScanClassifier;
 }
 
 /** Opaque provenance recorded alongside a state transition. */
@@ -85,6 +111,17 @@ export interface IngestionProvenance {
 export type IngestionOutcome =
   | { state: 'ready'; structured: StructuredResume; provenance: IngestionProvenance }
   | { state: 'failed_review'; reason: string }
+  /**
+   * NOT a state in the 0029 state machine, and deliberately so: the durable
+   * row is left exactly where it was and carries no failure reason. This says
+   * "the file was never screened — ask again later", and the CALLER decides
+   * how to wait (the queue defers the job, refunding its attempt).
+   *
+   * Adding a ninth ingestion state would mean editing the 0029 transition
+   * trigger and every legality proof built on eight, for a property that is
+   * orthogonal to the state machine.
+   */
+  | { state: 'deferred'; reason: string; scanStatus: string }
   | { state: 'cancelled'; reason: string };
 
 /** Whether the ingestion should abort as cancelled before a step (terminal link). */
@@ -134,10 +171,28 @@ export async function runResumeIngestion(
     }
 
     // ── scanning (FAIL CLOSED before any parse) ──────────────────────────
+    // The fail-closed posture is unchanged and must not be softened: nothing
+    // unscanned is ever parsed. What changed is the DISPOSITION of a not-safe
+    // result. An `infected` verdict is terminal, as it always was. A scanner
+    // that could not screen at all (no signatures, busy, timed out) is not a
+    // statement about this file, and writing it down as one permanently
+    // condemned a resume for a machine that was not warmed up yet.
     await ports.onState('scanning', { contentSha256 });
     const scan = await ports.scan(bytes);
     if (!scan.safe) {
+      const classify = ports.classifyScan ?? DEFAULT_SCAN_CLASSIFIER;
+      const klass = classify(scan.status);
+      // The bytes are wiped on the deferral path too. This is a NEW exit from
+      // the pipeline, and the wipe-on-every-exit guarantee has to extend to it
+      // or the deferral leaks the very thing the ephemeral design protects.
       wipe();
+      if (klass !== 'verdict') {
+        // No `onState` call at all: the row keeps its current state and gains
+        // no failure reason, so nothing downstream (invite prerequisites, the
+        // `operationsBlockedFailedIngestion` health counter) reads a wait as
+        // work that needs a human.
+        return { state: 'deferred', reason: `scan_${scan.status}`, scanStatus: scan.status };
+      }
       await ports.onState('failed_review', { contentSha256, failedReason: `scan_${scan.status}` });
       return { state: 'failed_review', reason: `scan_${scan.status}` };
     }

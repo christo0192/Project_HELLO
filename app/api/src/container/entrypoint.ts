@@ -34,6 +34,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { join } from 'node:path';
 
 import { loadAvUpdaterConfig, startAvUpdater, type AvUpdaterHandle } from '../lib/av-updater.js';
+import { readSignatureState } from '../lib/clamav-signatures.js';
 import { createLogger } from '../lib/logger.js';
 
 const supervisorLogger = createLogger('container-entrypoint');
@@ -95,7 +96,22 @@ export function startSupervisor(opts: SupervisorOptions = {}): SupervisorHandle 
   const startUpdater = opts.startUpdater
     ?? ((cfg): AvUpdaterHandle | null => (
       cfg.enabled
-        ? startAvUpdater({ intervalMs: cfg.intervalMs, timeoutMs: cfg.timeoutMs, immediate: true })
+        ? startAvUpdater({
+            intervalMs: cfg.intervalMs,
+            timeoutMs: cfg.timeoutMs,
+            immediate: true,
+            // A machine with NO usable database cannot scan at all, and a lost
+            // cold-start download used to cost a full steady-state hour of
+            // that. `fresh` is false for a stale database too, but that
+            // machine CAN still be topped up politely — only a genuinely
+            // absent/unreadable/corrupt database takes the urgent ladder.
+            isCold: async (): Promise<boolean> => {
+              const state = await readSignatureState({ source });
+              return state.reason === 'signatures_missing'
+                || state.reason === 'signatures_unreadable'
+                || state.reason === 'signatures_corrupt';
+            },
+          })
         : null
     ));
   const updater = startUpdater(updaterConfig);

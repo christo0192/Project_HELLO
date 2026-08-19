@@ -28,9 +28,38 @@
 
 import type { Queue } from './index.js';
 import type { QueueJob } from './types.js';
+import { clampDeferSeconds, isValidDeferReason, DEFAULT_DEFER_SECONDS } from './types.js';
+
+/**
+ * An explicit, typed request to DEFER this job instead of completing or
+ * failing it: the work never started because a prerequisite was not met.
+ *
+ * This is deliberately a RETURN VALUE and not a thrown sentinel. A throw is
+ * how a handler reports failure, and the entire point of a deferral is that it
+ * is not one — routing it through the same channel is exactly how "waiting"
+ * gets charged against a failure budget.
+ */
+export interface QueueDeferDirective {
+  outcome: 'defer';
+  /** Sanitized snake_case reason code (allowlist-checked before use). */
+  reasonCode: string;
+  /** Delay before the job becomes claimable again; clamped to [1, 3600]s. */
+  delaySeconds?: number;
+}
+
+/** What a handler may return. `void` keeps every existing handler valid. */
+export type QueueHandlerResult = void | QueueDeferDirective;
 
 /** A handler processes exactly one job. Throwing fails the job under lease. */
-export type QueueHandler = (job: QueueJob<unknown>) => Promise<void>;
+export type QueueHandler = (job: QueueJob<unknown>) => Promise<QueueHandlerResult>;
+
+/** Reason recorded when a handler asks to defer with an unusable code. */
+export const FALLBACK_DEFER_REASON = 'prerequisite_not_ready';
+
+/** Narrow a handler return value to a defer directive. */
+export function isDeferDirective(value: QueueHandlerResult): value is QueueDeferDirective {
+  return Boolean(value) && (value as QueueDeferDirective).outcome === 'defer';
+}
 
 /** Fallback code for anything that is not already a sanitized token. */
 export const UNKNOWN_ERROR_CODE = 'unknown_error';
@@ -60,7 +89,7 @@ export function sanitizeErrorCode(error: unknown): string {
 }
 
 export interface QueueRunnerOptions {
-  queue: Pick<Queue, 'claim' | 'completeClaim' | 'failClaim' | 'heartbeat'>;
+  queue: Pick<Queue, 'claim' | 'completeClaim' | 'failClaim' | 'heartbeat' | 'deferClaim'>;
   /** Queue name → handler. A job whose name has no handler is failed closed. */
   handlers: Readonly<Record<string, QueueHandler>>;
   /** Opaque worker identity recorded as the lease owner. Never a secret. */
@@ -71,6 +100,21 @@ export interface QueueRunnerOptions {
   concurrency?: number;
   /** Base delay between polls when work was found (ms). */
   pollMs: number;
+  /**
+   * ADMISSION GATE, consulted before each claim on a queue (R-2).
+   *
+   * Returning false means this machine does not claim from that queue right
+   * now. The job stays `pending`: no attempt is spent, no lease churns, no
+   * provider call is made, no bytes are downloaded — and a DIFFERENT machine
+   * whose prerequisite IS satisfied can take it, which no post-claim outcome
+   * can express.
+   *
+   * It is deliberately advisory, not authoritative: a prerequisite can lapse
+   * between the check and the work, which is what the lease-safe deferral is
+   * for. Anything it consults must be CHEAP — it runs on every poll of every
+   * queue. A throw is treated as "do not claim", never as permission.
+   */
+  shouldClaim?: (queueName: string) => boolean | Promise<boolean>;
   /** Injectable clock for deterministic tests. */
   now?: () => number;
   /** Injectable jitter source in [0,1). Inject for determinism. */
@@ -80,7 +124,7 @@ export interface QueueRunnerOptions {
 }
 
 export interface QueueRunnerEvent {
-  kind: 'claimed' | 'completed' | 'failed' | 'stale_lease' | 'no_handler' | 'poll_error';
+  kind: 'claimed' | 'completed' | 'deferred' | 'not_admitted' | 'failed' | 'stale_lease' | 'no_handler' | 'poll_error';
   queueName: string;
   /** Sanitized stable code only — never a provider message or payload. */
   code?: string;
@@ -154,7 +198,34 @@ export function createQueueRunner(options: QueueRunnerOptions): QueueRunnerHandl
     if (typeof beat.unref === 'function') beat.unref();
 
     try {
-      await handler(job);
+      const result = await handler(job);
+
+      // ── Deferral: a THIRD outcome, not a flavour of failure ────────────
+      // The handler proved a prerequisite was not met before doing any work.
+      // Returning the job to `delayed` refunds the attempt the claim charged,
+      // so an outage that lasts hours costs cheap polls instead of the job's
+      // whole failure budget followed by a dead letter.
+      if (isDeferDirective(result)) {
+        const reason = isValidDeferReason(result.reasonCode)
+          ? result.reasonCode
+          : FALLBACK_DEFER_REASON;
+        const delay = clampDeferSeconds(result.delaySeconds ?? DEFAULT_DEFER_SECONDS);
+        try {
+          const outcome = await options.queue.deferClaim(job.id, leaseToken, reason, delay);
+          emit({
+            kind: outcome === 'deferred' ? 'deferred' : 'stale_lease',
+            queueName: job.name,
+            code: outcome === 'deferred' ? reason : outcome,
+          });
+        } catch {
+          // Even the deferral path must not throw out of the runner. Nothing
+          // was committed, so the lease simply expires and the reclaim sweep
+          // requeues the job — no work is lost and nothing is failed.
+          emit({ kind: 'poll_error', queueName: job.name, code: 'defer_error' });
+        }
+        return;
+      }
+
       const committed = await options.queue.completeClaim(job.id, leaseToken);
       if (committed) {
         emit({ kind: 'completed', queueName: job.name });
@@ -189,6 +260,25 @@ export function createQueueRunner(options: QueueRunnerOptions): QueueRunnerHandl
     let processed = 0;
 
     for (const queueName of queueNames) {
+      // ── Admission gate (R-2) ────────────────────────────────────────────
+      // Asked ONCE per queue per tick, before any claim. A queue whose
+      // machine-local prerequisite is unmet is skipped entirely: its jobs are
+      // never claimed here, so waiting costs nothing and blocks no other
+      // queue in this runner.
+      if (options.shouldClaim) {
+        let admitted: boolean;
+        try {
+          admitted = await options.shouldClaim(queueName);
+        } catch {
+          // A gate that cannot answer has not granted permission.
+          admitted = false;
+        }
+        if (!admitted) {
+          emit({ kind: 'not_admitted', queueName });
+          continue;
+        }
+      }
+
       // Fill up to the concurrency budget, one claim at a time. A claim that
       // returns null means the queue is empty — move to the next queue.
       while (!isStopped && active < concurrency) {
