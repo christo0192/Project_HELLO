@@ -26,10 +26,13 @@
  *  3. Egress is never started twice for one session:
  *     `startAuthoritativeRecording` short-circuits on a linked
  *     recording_egress_id and links its own id with an `is null` CAS.
- *  4. `existing_session` mode NEVER deletes a room it cannot prove is
- *     unowned, and NEVER terminates the session on a provider error — the
- *     candidate's invite is still unconsumed and the join must stay
- *     retryable. Stopping a loud failure must not make it a silent one.
+ *  4. `existing_session` mode NEVER deletes a room and NEVER terminates the
+ *     session on a provider error — the candidate's invite is still unconsumed
+ *     and the join must stay retryable. Stopping a loud failure must not make
+ *     it a silent one. "Nobody owns this room" is not a decidable property
+ *     from outside a transaction (see reapUnownedRoom's removal below), so
+ *     the mode simply never deletes; an orphan room self-reaps at
+ *     ROOM_EMPTY_TIMEOUT_SEC and no token was ever minted for it.
  */
 
 import { RoomServiceClient } from 'livekit-server-sdk';
@@ -83,6 +86,12 @@ export interface RoomServiceClientLike {
 
 export interface ProvisionRoomDeps {
   rooms?: RoomServiceClientLike;
+  /**
+   * Used ONLY by the `existing_session` adopt re-read. Room creation and the
+   * `created` → `waiting` CAS go through `transitionSession`, which holds its
+   * own module-level Supabase client, so `new_session` mode never reads this.
+   * Injecting it does not redirect every database access.
+   */
   db?: typeof supabase;
   startRecording?: typeof startAuthoritativeRecording;
 }
@@ -121,32 +130,19 @@ function roomClient(): RoomServiceClientLike {
 }
 
 /**
- * Best-effort reap of a room we can PROVE nobody owns: the session is still
- * `created` (so no CAS winner published it) and no egress is linked (so no
- * concurrent provisioner is recording into it). Anything else is left alone
- * and self-reaps via emptyTimeout — deleting it could kill a winner's room.
- * Nobody can join a room we never minted a token for.
+ * REMOVED — `reapUnownedRoom`. It read (status, recording_egress_id) and then
+ * deleted the room in a SECOND await. Between those two awaits a concurrent
+ * request could start its egress, win the `recording_egress_id is null` link
+ * CAS, win the `created → waiting` CAS and return a grant + LiveKit JWT — and
+ * the reap would then delete the winner's room. With LiveKit's default
+ * `room.auto_create`, that candidate would join a fresh, EGRESS-FREE room:
+ * an unrecorded screening that the "joinable with no egress linked" detection
+ * query cannot see, because the row still carries the (now-orphaned) egress
+ * id. A read-then-delete pair cannot prove ownership, so `existing_session`
+ * mode does not delete at all. The cost is at most one empty room living out
+ * its ROOM_EMPTY_TIMEOUT_SEC; the benefit is that "never deletes a live
+ * room" is true by construction rather than by timing.
  */
-async function reapUnownedRoom(
-  db: typeof supabase,
-  rooms: RoomServiceClientLike,
-  sessionId: string,
-  roomName: string,
-): Promise<void> {
-  try {
-    const { data, error } = await db
-      .from('call_sessions')
-      .select('status, recording_egress_id')
-      .eq('id', sessionId)
-      .single();
-    if (error || !data) return;
-    if (data.status !== 'created') return;
-    if (data.recording_egress_id) return;
-    await rooms.deleteRoom(roomName);
-  } catch {
-    // Best effort only — an orphan empty room expires on its own.
-  }
-}
 
 /**
  * Provision the LiveKit room and authoritative egress for a session that is
@@ -206,8 +202,9 @@ export async function provisionRoomForCreatedSession(
       };
     }
     // existing_session: leave the row in `created` so the unconsumed invite
-    // stays retryable, and only reap a room provably nobody owns.
-    await reapUnownedRoom(db, rooms, sessionId, roomName);
+    // stays retryable, and leave any room we may have created alone — see the
+    // reapUnownedRoom removal note above. It is empty (no token was minted)
+    // and expires on its own; a retry converges on the same room.
     return {
       ok: false,
       code: 'provider_failed',

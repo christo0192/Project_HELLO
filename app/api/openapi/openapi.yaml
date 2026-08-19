@@ -1161,13 +1161,13 @@ paths:
               schema:
                 $ref: '#/components/schemas/SimpleError'
         '503':
-          description: Maintenance mode (ErrorBody maintenance_mode), or just-in-time room/egress provisioning failed (SimpleError screening_room_unavailable). In both cases the invite is left unconsumed and the join is retryable.
+          description: Maintenance mode (MaintenanceBlockedBody), or just-in-time room/egress provisioning failed (RoomUnavailableError). In both cases the invite is left unconsumed and the join is retryable. Discriminate on the shape of `error`, object vs string.
           content:
             application/json:
               schema:
                 oneOf:
-                  - $ref: '#/components/schemas/ErrorBody'
-                  - $ref: '#/components/schemas/SimpleError'
+                  - $ref: '#/components/schemas/MaintenanceBlockedBody'
+                  - $ref: '#/components/schemas/RoomUnavailableError'
 
   /api/livekit/grant/recording:
     post:
@@ -2857,6 +2857,32 @@ components:
       properties:
         error:
           type: string
+      additionalProperties: false
+
+    RoomUnavailableError:
+      description: Just-in-time LiveKit room/egress provisioning failed. The one-time invite is left unconsumed and the join is retryable.
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          enum: ['screening_room_unavailable']
+      additionalProperties: false
+
+    MaintenanceBlockedBody:
+      description: New joins are blocked by maintenance mode. The one-time invite is left unconsumed.
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [type]
+          properties:
+            type:
+              type: string
+              enum: ['maintenance_mode']
+            message:
+              type: string
       additionalProperties: false
 
     AuthErrorBody:

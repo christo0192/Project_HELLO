@@ -19,7 +19,8 @@
  *      second egress. Exactly one request consumes the invite.
  *   3. Room create error → updateRoomMetadata fallback; both failing → 503,
  *      invite unconsumed, no grant/JWT.
- *   4. Egress failure → 503, invite unconsumed, and the unowned room is reaped.
+ *   4. Egress failure → 503, invite unconsumed, and NO room deletion — an
+ *      `existing_session` provider failure never deletes a room (B-1).
  *   5. created → waiting CAS lost to a terminal/foreign transition → stable 404,
  *      invite unconsumed, winner's room NOT deleted.
  *   6. Retry after a provider failure succeeds and still consumes exactly once.
@@ -30,6 +31,12 @@
  *      provider call.
  *  10. Recording integrity: a session whose egress did not start never yields a
  *      grant token or a LiveKit JWT.
+ *  11. B-1 regression (review blocker): a failing exchange interleaved with a
+ *      SUCCEEDING concurrent exchange never deletes the winner's room and never
+ *      detaches the winner's egress. The stateful harness deliberately serves a
+ *      stale pre-winner snapshot to any ownership-probe read, so the old
+ *      read-then-delete `reapUnownedRoom` would delete the winner's room here
+ *      and fail the test.
  *
  * Offline, deterministic, synthetic fixtures only.
  */
@@ -384,12 +391,9 @@ describe('provider failures during JIT provisioning', () => {
   function failingApp(extra: Record<string, unknown | ((n: number) => unknown)> = {}) {
     return exchangeApp({
       candidate_invites: invites(true),
-      // Provisioning aborts before the CAS, so the second call_sessions read
-      // is the reap probe.
-      call_sessions: sessionsSequence([
-        ok({ id: SESSION_ID, external_call_id: null, status: 'created' }),
-        ok({ status: 'created', recording_egress_id: null }), // reap probe
-      ]),
+      // Provisioning aborts before the CAS, and `existing_session` mode makes
+      // no further call_sessions read on the failure path.
+      call_sessions: ok({ id: SESSION_ID, external_call_id: null, status: 'created' }),
       ...extra,
     });
   }
@@ -407,7 +411,7 @@ describe('provider failures during JIT provisioning', () => {
     expect(toJwt).not.toHaveBeenCalled();
   });
 
-  it('authoritative egress failure → 503, invite unconsumed, unowned room reaped', async () => {
+  it('authoritative egress failure → 503, invite unconsumed, and NO room deletion', async () => {
     startAuthoritativeRecording.mockRejectedValueOnce(new Error('egress storage unreachable'));
 
     const res = await exchange(failingApp());
@@ -416,8 +420,10 @@ describe('provider failures during JIT provisioning', () => {
     expect(res.body.error).toBe('screening_room_unavailable');
     expect(callsFor('candidate_invites', 'update')).toHaveLength(0);
     expect(toJwt).not.toHaveBeenCalled();
-    // Provably unowned (still `created`, no linked egress) → safe to reap.
-    expect(deleteRoom).toHaveBeenCalledWith(ROOM);
+    // B-1: "nobody owns this room" is not decidable from outside a
+    // transaction, so this mode never deletes. The empty room expires on its
+    // own and a retry converges on it.
+    expect(deleteRoom).not.toHaveBeenCalled();
   });
 
   it('an egress that reports started WITHOUT an id is treated as a failure', async () => {
@@ -430,18 +436,21 @@ describe('provider failures during JIT provisioning', () => {
     expect(toJwt).not.toHaveBeenCalled();
   });
 
-  it('a room with a CONCURRENT egress linked is NOT reaped on our failure', async () => {
-    startAuthoritativeRecording.mockRejectedValueOnce(new Error('transient'));
+  it.each([
+    ['room create + metadata update both fail', () => {
+      createRoom.mockRejectedValueOnce(new Error('down'));
+      updateRoomMetadata.mockRejectedValueOnce(new Error('down'));
+    }],
+    ['egress start throws', () => {
+      startAuthoritativeRecording.mockRejectedValueOnce(new Error('transient'));
+    }],
+    ['egress reports started without an id', () => {
+      startAuthoritativeRecording.mockResolvedValueOnce({ status: 'started' });
+    }],
+  ])('existing_session never deletes a room — %s', async (_label, arrange) => {
+    arrange();
 
-    const app = exchangeApp({
-      candidate_invites: invites(true),
-      call_sessions: sessionsSequence([
-        ok({ id: SESSION_ID, external_call_id: null, status: 'created' }),
-        ok({ status: 'created', recording_egress_id: EGRESS_ID }), // someone owns it
-      ]),
-    });
-
-    const res = await exchange(app);
+    const res = await exchange(failingApp());
 
     expect(res.status).toBe(503);
     expect(deleteRoom).not.toHaveBeenCalled();
@@ -558,6 +567,242 @@ describe('paths that must never provision', () => {
 
     expect(res.status).toBe(404);
     expect(createRoom).not.toHaveBeenCalled();
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════
+//  4b. B-1 regression — a failing exchange must not damage a winner
+// ════════════════════════════════════════════════════════════════════
+
+function deferred<T = void>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+/**
+ * Stateful `call_sessions` + `candidate_invites` doubles.
+ *
+ * Unlike the scripted per-call sequences above, BOTH concurrent requests read
+ * and write the SAME mutable rows, so an interleaving that happens between two
+ * awaits is expressible — which is exactly what the scripted model could not
+ * do, and exactly where B-1 lived.
+ *
+ * `onOwnershipProbe` fires when something issues the read-then-delete
+ * ownership probe that `reapUnownedRoom` used to perform (a `call_sessions`
+ * select whose column list includes `recording_egress_id`). The harness serves
+ * that probe a STALE pre-winner snapshot and only then lets the winner publish
+ * — reproducing the exact straddle in which the old code deleted a live room.
+ */
+function statefulTables(
+  sessionRow: Record<string, unknown>,
+  inviteRow: Record<string, unknown>,
+  hooks: { onOwnershipProbe?: () => Record<string, unknown> } = {},
+) {
+  mockFrom.mockImplementation((table: string) => {
+    callLog.push({ table, method: 'from', args: [table] });
+
+    if (table === 'call_sessions') {
+      return {
+        select: (cols: string) => {
+          callLog.push({ table, method: 'select', args: [cols] });
+          const isOwnershipProbe = typeof cols === 'string' && cols.includes('recording_egress_id');
+          const snapshot = isOwnershipProbe && hooks.onOwnershipProbe
+            ? hooks.onOwnershipProbe()
+            : { ...sessionRow };
+          const q: Record<string, unknown> = {
+            eq: () => q,
+            single: async () => ({ data: snapshot, error: null }),
+          };
+          return q;
+        },
+        update: (updates: Record<string, unknown>) => {
+          const conds: Record<string, unknown> = {};
+          const q: Record<string, unknown> = {
+            eq: (col: string, val: unknown) => {
+              conds[col] = val;
+              return q;
+            },
+            select: async () => {
+              callLog.push({ table, method: 'update', args: [updates] });
+              // Compare-and-set on `status` when the caller supplied one.
+              if (conds.status !== undefined && sessionRow.status !== conds.status) {
+                return { data: [], error: null };
+              }
+              Object.assign(sessionRow, updates);
+              return { data: [{ id: sessionRow.id }], error: null };
+            },
+          };
+          return q;
+        },
+      };
+    }
+
+    if (table === 'candidate_invites') {
+      return {
+        select: () => {
+          const q: Record<string, unknown> = {
+            eq: () => q,
+            single: async () => ({ data: { ...inviteRow }, error: null }),
+          };
+          return q;
+        },
+        update: (updates: Record<string, unknown>) => {
+          const q: Record<string, unknown> = {
+            eq: () => q,
+            is: () => q,
+            gt: () => q,
+            select: async () => {
+              callLog.push({ table, method: 'update', args: [updates] });
+              // One-time consume: only the first caller sees a row back.
+              if (inviteRow.consumed_at !== null) return { data: [], error: null };
+              Object.assign(inviteRow, updates);
+              return { data: [{ id: inviteRow.id }], error: null };
+            },
+          };
+          return q;
+        },
+      };
+    }
+
+    const fixed: Record<string, unknown> = {
+      system_config: ok(null),
+      consent_records: GRANTED_CONSENT,
+      consent_templates: ACTIVE_TEMPLATE,
+      candidate_access_grants: ok(null),
+    };
+    return chain(fixed[table] ?? { data: null, error: null }, table);
+  });
+}
+
+describe('B-1 regression: a failing exchange interleaved with a winning one', () => {
+  it('never deletes the winner\'s room and never detaches the winner\'s egress', async () => {
+    const sessionRow: Record<string, unknown> = {
+      id: SESSION_ID,
+      status: 'created',
+      external_call_id: null,
+      recording_egress_id: null,
+    };
+    const inviteRow: Record<string, unknown> = { ...ACTIVE_INVITE };
+
+    // The pre-winner snapshot every ownership probe is served. If the
+    // implementation still probes-then-deletes, it sees "created, no egress",
+    // concludes the room is unowned, and deletes it AFTER B published.
+    const staleSnapshot = { status: 'created', recording_egress_id: null };
+    const bPublished = deferred();
+
+    statefulTables(sessionRow, inviteRow, {
+      onOwnershipProbe: () => {
+        // Let the winner publish in the gap between the probe and the delete.
+        bPublished.resolve();
+        return staleSnapshot;
+      },
+    });
+    const app = createApp({ nodeEnv: 'test', webOrigin: 'http://localhost:5173' });
+
+    const liveRooms = new Set<string>();
+    createRoom.mockImplementation(async (opts: { name: string }) => {
+      if (liveRooms.has(opts.name)) throw new Error('room already exists');
+      liveRooms.add(opts.name);
+      return { name: opts.name };
+    });
+    updateRoomMetadata.mockResolvedValue({});
+    deleteRoom.mockImplementation(async (name: string) => {
+      liveRooms.delete(name);
+      return {};
+    });
+
+    const aInsideProvisioning = deferred();
+    const aMayFail = deferred();
+    let egressCall = 0;
+
+    startAuthoritativeRecording.mockImplementation(async () => {
+      const n = egressCall++;
+      if (n === 0) {
+        // Request A: hold inside provisioning until B has fully published,
+        // then fail. This puts A's failure handling strictly AFTER B's win.
+        aInsideProvisioning.resolve();
+        await aMayFail.promise;
+        throw new Error('egress storage unreachable');
+      }
+      // Request B: links its egress and wins.
+      sessionRow.recording_egress_id = EGRESS_ID;
+      return { status: 'started', egressId: EGRESS_ID };
+    });
+
+    // `.then()` is what actually dispatches a supertest request — calling
+    // `exchange(app)` alone builds it without sending.
+    const aPromise = exchange(app).then((r) => r);
+    await aInsideProvisioning.promise;
+
+    // B runs to completion while A is still mid-provisioning.
+    const bRes = await exchange(app);
+    aMayFail.resolve();
+    const aRes = await aPromise;
+    // If an ownership probe ever ran, this is already resolved; otherwise the
+    // race never existed. Either way the test does not hang.
+    bPublished.resolve();
+
+    // The winner joined.
+    expect(bRes.status).toBe(200);
+    expect(bRes.body.room_name).toBe(ROOM);
+    expect(bRes.body.grant_token).toBeTruthy();
+    expect(bRes.body.livekit_token).toBe('synthetic-livekit-jwt');
+
+    // The loser failed closed, retryably.
+    expect(aRes.status).toBe(503);
+    expect(aRes.body.error).toBe('screening_room_unavailable');
+    expect(aRes.body.grant_token).toBeUndefined();
+    expect(aRes.body.livekit_token).toBeUndefined();
+
+    // ── The blocker itself ──────────────────────────────────────────────
+    // No room deletion at all, so the winner's room still exists...
+    expect(deleteRoom).not.toHaveBeenCalled();
+    expect(liveRooms.has(ROOM)).toBe(true);
+    // ...its authoritative egress is still attached...
+    expect(sessionRow.recording_egress_id).toBe(EGRESS_ID);
+    // ...and the row the winner published is intact.
+    expect(sessionRow.status).toBe('waiting');
+    expect(sessionRow.external_call_id).toBe(ROOM);
+
+    // Exactly one egress and exactly one consume across both requests.
+    expect(egressCall).toBe(2); // both attempted; only B's succeeded
+    expect(callsFor('candidate_invites', 'update')).toHaveLength(1);
+    expect(inviteRow.consumed_at).not.toBeNull();
+  });
+
+  it('the harness is non-vacuous: an ownership probe would straddle the winner', async () => {
+    // Guards the guard. If a future change reintroduces a read-then-delete
+    // ownership probe on this path, `onOwnershipProbe` fires and this asserts
+    // the straddle is real — i.e. the probe would have seen a stale snapshot
+    // while the winner was already published.
+    const sessionRow: Record<string, unknown> = {
+      id: SESSION_ID,
+      status: 'created',
+      external_call_id: null,
+      recording_egress_id: null,
+    };
+    const inviteRow: Record<string, unknown> = { ...ACTIVE_INVITE };
+    let probes = 0;
+
+    statefulTables(sessionRow, inviteRow, {
+      onOwnershipProbe: () => {
+        probes += 1;
+        return { status: 'created', recording_egress_id: null };
+      },
+    });
+    const app = createApp({ nodeEnv: 'test', webOrigin: 'http://localhost:5173' });
+    startAuthoritativeRecording.mockRejectedValueOnce(new Error('transient'));
+
+    const res = await exchange(app);
+
+    expect(res.status).toBe(503);
+    // The current implementation performs NO ownership probe — that is the
+    // fix. Deleting this assertion is how you would notice the regression.
+    expect(probes).toBe(0);
+    expect(deleteRoom).not.toHaveBeenCalled();
   });
 });
 

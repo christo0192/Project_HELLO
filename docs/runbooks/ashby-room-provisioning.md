@@ -26,7 +26,7 @@ already-existing `created` session a room". Both routes call it:
 | Caller | Mode | On provider failure | On lost `created → waiting` CAS |
 | --- | --- | --- | --- |
 | `POST /api/livekit/start` | `new_session` | delete room, transition row to `failed` / `room_create_error` | delete the orphan room, 409 / reconciliation error |
-| `POST /api/livekit/exchange` | `existing_session` | leave the row in `created`, reap the room **only** if provably unowned, 503 | **adopt** the winner's identical room; never delete it |
+| `POST /api/livekit/exchange` | `existing_session` | leave the row in `created`, **never delete the room**, 503 | **adopt** the winner's identical room; never delete it |
 
 Exchange gate order (unchanged gates, one new step):
 
@@ -73,20 +73,37 @@ exchanges converge on the same room.
   `recording_egress_id`, and links its own with an `is null` CAS — never two
   egresses for one session.
 * The loser of the `created → waiting` CAS re-reads the row; if it is now
-  `waiting`/`in_progress` **on the same room**, the loser adopts it. It never
-  deletes the winner's room.
+  `waiting`/`in_progress` **on the same room**, the loser adopts it.
 * Exactly one request wins the invite-consume CAS; the other gets the stable
   404 with no grant and no JWT.
+* **`existing_session` mode issues no `deleteRoom` call on any path.** This is
+  the property that makes "a failing request never damages a succeeding one"
+  true by construction — see below.
 
-### Why a provider failure does NOT terminate the session
+### Why a provider failure neither terminates the session nor deletes the room
 
 Moving the row to `failed` would convert a transient LiveKit/storage blip into a
 permanently dead screening — the invite would stay unconsumed but could never
 succeed again, and the loud failure would become a silent one. `existing_session`
-mode therefore leaves the row in `created` and reaps the room **only** when it
-can prove nobody owns it (status still `created` **and** no `recording_egress_id`
-linked). Anything else is left to expire via `emptyTimeout`; nobody can join a
-room for which no token was ever minted.
+mode therefore leaves the row in `created`.
+
+It also never deletes the room. An earlier revision tried to reap a room it
+believed nobody owned, by reading `(status, recording_egress_id)` and then
+deleting. **That proof is not atomic**: between the read and the delete, a
+concurrent request can start its egress, win the `recording_egress_id is null`
+link CAS, win the `created → waiting` CAS and return a grant + LiveKit JWT. The
+reap would then delete a live room. With LiveKit's default `room.auto_create`
+that candidate joins a fresh, **egress-free** room — an unrecorded screening
+that the detection query below cannot see, because the row still carries the
+now-orphaned egress id. (With `auto_create` disabled it is instead an
+unexplained hard join failure.)
+
+Ownership is not decidable from outside a transaction, so the mode simply does
+not delete. The cost is at most one empty room living out its 10-minute
+`emptyTimeout`; nobody can join a room for which no token was ever minted, and a
+retry converges on the same room. Regression-pinned by the interleaving test in
+`ashby-room-provisioning.test.ts` (`B-1 regression`), which fails if a
+read-then-delete probe is ever reintroduced.
 
 ## Security
 
@@ -135,7 +152,7 @@ lane's volume as un-metered when sizing launch capacity.
 | --- | --- | --- |
 | Candidate sees "We could not open your screening room just now…" | 503 `screening_room_unavailable` — LiveKit or egress S3 unreachable | Check LiveKit reachability and `RECORDING_EGRESS_S3_*`. The invite is still valid; the candidate can retry. |
 | Candidate sees the stable "invite is missing, expired, revoked, or already used" on a fresh Ashby invite | Session is terminal, or a concurrent actor moved it | Inspect `call_sessions.status` / `terminal_reason` for the invite's `session_id`. A terminal row needs a new session + invite, not a retry. |
-| Room exists in LiveKit but session is still `created` | Provisioning aborted after room create, before/at egress | Harmless: the room self-reaps at `emptyTimeout` (10 min) and no token was minted. A retry converges on the same room. |
+| Room exists in LiveKit but session is still `created` | Provisioning aborted after room create, before/at egress | Expected and harmless: the room self-reaps at `emptyTimeout` (10 min) and no token was minted. A retry converges on the same room. This is the deliberate cost of never deleting — do not add a cleanup that deletes rooms on this path. |
 | Two rooms for one session | Should be impossible — the room name is derived from the session id | Escalate; indicates the deterministic naming was bypassed. |
 
 ### Verification queries
