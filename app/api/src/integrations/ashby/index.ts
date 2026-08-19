@@ -172,7 +172,9 @@ export {
   createPinnedHttpsTransport,
   classifyStatus,
   pinnedLookup,
+  orderPinnedIps,
   type PinnedTransportOptions,
+  type PinnedLookup,
 } from './resume-transport.js';
 export {
   buildScorecard,

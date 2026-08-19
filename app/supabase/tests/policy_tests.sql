@@ -6199,6 +6199,226 @@ begin
 end;
 $$;
 
+-- =====================================================================
+-- 0036: Ashby ingestion attempt-counter reset — grants, pinned search_path,
+--       the full refusal matrix, and the two things the RPC must NOT touch
+--       (the row's state, and the requeue ceiling).
+-- =====================================================================
+
+select _policy_tests.assert(
+  'ashby 0036 RPC is service-role only',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname = 'reset_ashby_ingestion_attempts'
+      and not has_function_privilege('anon', p.oid, 'EXECUTE')
+      and not has_function_privilege('authenticated', p.oid, 'EXECUTE')
+      and has_function_privilege('service_role', p.oid, 'EXECUTE')
+  ) = 1,
+  'reset_ashby_ingestion_attempts must be service-role only — it corrects an audited counter'
+);
+
+select _policy_tests.assert(
+  'ashby 0036 RPC pins search_path',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname = 'reset_ashby_ingestion_attempts'
+      and p.prosecdef
+      and array_to_string(coalesce(p.proconfig, '{}'), ',') like '%search_path%'
+  ) = 1,
+  'every SECURITY DEFINER RPC must pin search_path'
+);
+
+-- The audit action allowlist was re-declared wholesale by 0036. Assert both
+-- that the new action landed AND that a representative sample of the older
+-- ones survived, because a re-declaration that silently dropped an action
+-- would break unrelated audit writes at runtime, not at migration time.
+select _policy_tests.assert(
+  'ashby 0036: the new audit action is permitted',
+  (select pg_get_constraintdef(oid) from pg_constraint
+    where conname = 'chk_audit_action'
+      and conrelid = 'screening_v2.audit_events'::regclass)
+    like '%ashby_ingestion_attempts_reset%',
+  'the 0036 audit action must be in chk_audit_action'
+);
+
+select _policy_tests.assert(
+  'ashby 0036: re-declaring chk_audit_action dropped none of the earlier actions',
+  (select bool_and(pg_get_constraintdef(c.oid) like ('%' || a || '%'))
+     from pg_constraint c,
+          unnest(array['invite_sent','grant_issued','recording_quarantined',
+                       'ashby_mapping_update','ashby_operation_retry',
+                       'ashby_invite_delivered']) as a
+    where c.conname = 'chk_audit_action'
+      and c.conrelid = 'screening_v2.audit_events'::regclass),
+  'widening chk_audit_action must be purely additive'
+);
+
+do $$
+declare
+  v_role      uuid;
+  v_map       uuid;
+  v_link      uuid;   -- burned ceiling, transport reason  → the ok path
+  v_link_scan uuid;   -- failed_review, NON-transport reason → refused
+  v_link_q    uuid;   -- still queued                        → refused
+  v_link_term uuid;   -- terminal application                → refused
+  v_link_zero uuid;   -- failed_review, transport reason, attempts 0 → noop
+  v_res       jsonb;
+  v_att       integer;
+  v_state     text;
+  v_audit     jsonb;
+  v_owner     uuid := '00000000-0000-4000-8000-0000000000ab';
+  i           integer;
+begin
+  select id into v_role from screening_v2.roles limit 1;
+  if v_role is null then
+    perform _policy_tests.assert('ashby 0036 functional: seed role present', false, 'no seed role available');
+    return;
+  end if;
+
+  insert into screening_v2.ashby_job_mappings
+    (external_job_id, role_id, owner_id, ai_screening_stage_id, ta_screening_stage_id, status, delivery_mode)
+  values ('pol36-job', v_role, v_owner, 'pol36-ai', 'pol36-ta', 'enabled', 'manual')
+  returning id into v_map;
+
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol36-app',      'pol36-job', v_map, repeat('h', 64)) returning id into v_link;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol36-app-scan', 'pol36-job', v_map, repeat('h', 64)) returning id into v_link_scan;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol36-app-q',    'pol36-job', v_map, repeat('h', 64)) returning id into v_link_q;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol36-app-term', 'pol36-job', v_map, repeat('h', 64)) returning id into v_link_term;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol36-app-zero', 'pol36-job', v_map, repeat('h', 64)) returning id into v_link_zero;
+
+  -- ── Burn the ceiling exactly the way the transport defect did: five
+  --    identical fetch failures, each one costing a requeue. ──────────────
+  perform screening_v2.advance_ashby_ingestion(v_link, 'queued', null, null, null, null);
+  for i in 1..5 loop
+    perform screening_v2.advance_ashby_ingestion(v_link, 'fetching', null, null, null, null);
+    perform screening_v2.advance_ashby_ingestion(v_link, 'failed_review', null, null, null, 'fetch_http_error');
+    perform screening_v2.advance_ashby_ingestion(v_link, 'queued', null, null, null, null);
+  end loop;
+  perform screening_v2.advance_ashby_ingestion(v_link, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link, 'failed_review', null, null, null, 'fetch_http_error');
+
+  select attempts, state into v_att, v_state
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link;
+  perform _policy_tests.assert(
+    'ashby 0036: the setup reproduced a burned ceiling in failed_review',
+    v_att = 5 and v_state = 'failed_review',
+    'got attempts=' || coalesce(v_att::text,'<null>') || ' state=' || coalesce(v_state,'<null>'));
+
+  -- The dead-end this RPC exists to resolve: the documented recovery refuses.
+  v_res := screening_v2.advance_ashby_ingestion(v_link, 'queued', null, null, null, null);
+  perform _policy_tests.assert(
+    'ashby 0036: without a reset the documented requeue dead-ends at retry_exhausted',
+    v_res->>'status' = 'retry_exhausted',
+    'got ' || coalesce(v_res::text,'<null>'));
+
+  -- ── Refusal matrix. Each branch refuses independently. ─────────────────
+  v_res := screening_v2.reset_ashby_ingestion_attempts(gen_random_uuid(), v_owner);
+  perform _policy_tests.assert(
+    'ashby 0036 refusal: an unknown link is not_found',
+    v_res->>'status' = 'not_found', 'got ' || coalesce(v_res::text,'<null>'));
+
+  perform screening_v2.advance_ashby_ingestion(v_link_q, 'queued', null, null, null, null);
+  v_res := screening_v2.reset_ashby_ingestion_attempts(v_link_q, v_owner);
+  perform _policy_tests.assert(
+    'ashby 0036 refusal: a live (non failed_review) ingestion is not_resettable',
+    v_res->>'status' = 'not_resettable' and v_res->>'state' = 'queued',
+    'a running ingestion''s counter belongs to the scheduler; got ' || coalesce(v_res::text,'<null>'));
+
+  perform screening_v2.advance_ashby_ingestion(v_link_term, 'queued', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_term, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_term, 'failed_review', null, null, null, 'fetch_http_error');
+  update screening_v2.ashby_application_links set terminal_state = 'withdrawn' where id = v_link_term;
+  v_res := screening_v2.reset_ashby_ingestion_attempts(v_link_term, v_owner);
+  perform _policy_tests.assert(
+    'ashby 0036 refusal: a withdrawn application is blocked_terminal',
+    v_res->>'status' = 'blocked_terminal' and v_res->>'terminal_state' = 'withdrawn',
+    'the resurrection guard must fire even on a transport reason; got ' || coalesce(v_res::text,'<null>'));
+
+  perform screening_v2.advance_ashby_ingestion(v_link_scan, 'queued', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_scan, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_scan, 'scanning', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_scan, 'failed_review', null, null, null, 'scan_infected');
+  v_res := screening_v2.reset_ashby_ingestion_attempts(v_link_scan, v_owner);
+  perform _policy_tests.assert(
+    'ashby 0036 refusal: a NON-transport failure is not_a_transport_failure',
+    v_res->>'status' = 'not_a_transport_failure' and v_res->>'failed_reason' = 'scan_infected',
+    'a scan/parse/guard failure measured a real fault and its attempts are not returned; got '
+      || coalesce(v_res::text,'<null>'));
+
+  perform screening_v2.advance_ashby_ingestion(v_link_zero, 'queued', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_zero, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_zero, 'failed_review', null, null, null, 'fetch_timeout');
+  v_res := screening_v2.reset_ashby_ingestion_attempts(v_link_zero, v_owner);
+  perform _policy_tests.assert(
+    'ashby 0036 refusal: an already-zero counter is a distinct noop, not ok',
+    v_res->>'status' = 'noop' and (v_res->>'attempts')::int = 0,
+    'an operator must be able to tell "already clear" from "just corrected"; got '
+      || coalesce(v_res::text,'<null>'));
+
+  -- ── The ok path, and the two things it must NOT change. ────────────────
+  v_res := screening_v2.reset_ashby_ingestion_attempts(v_link, v_owner);
+  perform _policy_tests.assert(
+    'ashby 0036: the reset succeeds and reports the pre-reset count',
+    v_res->>'status' = 'ok' and (v_res->>'attempts_before')::int = 5,
+    'got ' || coalesce(v_res::text,'<null>'));
+
+  select attempts, state into v_att, v_state
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link;
+  perform _policy_tests.assert(
+    'ashby 0036: the reset zeroes the counter but does NOT transition state',
+    v_att = 0 and v_state = 'failed_review',
+    'there must remain exactly ONE counted way out of failed_review; got attempts='
+      || coalesce(v_att::text,'<null>') || ' state=' || coalesce(v_state,'<null>'));
+
+  -- The ceiling itself is untouched: the ordinary exit still charges 1 of 5.
+  v_res := screening_v2.advance_ashby_ingestion(v_link, 'queued', null, null, null, null);
+  perform _policy_tests.assert(
+    'ashby 0036: the ceiling is unchanged — the ordinary requeue still charges 1 of 5',
+    v_res->>'status' = 'ok'
+      and (v_res->>'attempts')::int = 1
+      and (v_res->>'max_attempts')::int = 5,
+    'the reset must correct the counter, never enlarge the budget; got '
+      || coalesce(v_res::text,'<null>'));
+
+  -- Attribution: the correction is auditable, with the pre-reset value.
+  select metadata into v_audit
+    from screening_v2.audit_events
+   where action = 'ashby_ingestion_attempts_reset'
+     and metadata->>'application_link_id' = v_link::text
+   order by created_at desc limit 1;
+  perform _policy_tests.assert(
+    'ashby 0036: the reset writes an audit row carrying the pre-reset count and reason',
+    v_audit is not null
+      and (v_audit->>'attempts_before')::int = 5
+      and v_audit->>'failed_reason' = 'fetch_http_error',
+    'an unattributable counter correction is indistinguishable from a raw UPDATE; got '
+      || coalesce(v_audit::text,'<null>'));
+
+  -- The audit row is deliberately NOT cleaned up: `audit_events` is
+  -- append-only by the 0007 trigger, and reaching for its
+  -- `app.allow_audit_mutation` escape hatch inside a test would be a far worse
+  -- precedent than leaving one row behind. Every id it references is a local
+  -- fixture, and the same is true of the sibling blocks above.
+  delete from screening_v2.ashby_resume_ingestions
+   where application_link_id in (v_link, v_link_scan, v_link_q, v_link_term, v_link_zero);
+  delete from screening_v2.ashby_application_links
+   where id in (v_link, v_link_scan, v_link_q, v_link_term, v_link_zero);
+  delete from screening_v2.ashby_job_mappings where id = v_map;
+end;
+$$;
+
 -- ═══════════════════════════════════════════════════════════════════════
 -- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)
 -- ═══════════════════════════════════════════════════════════════════════

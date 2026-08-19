@@ -24,6 +24,29 @@ async function filesUnder(target) {
   return files;
 }
 
+/**
+ * Is this file a TEST rather than runtime code?
+ *
+ * This distinction matters in ONE direction only. A test that reads a variable
+ * still proves that variable is exercised, so tests keep counting toward "is
+ * this declared variable actually read". But a variable read ONLY by a test is
+ * not part of the component's environment CONTRACT — `CI`, set by the runner
+ * so a test can fail loudly instead of skipping, is not application
+ * configuration and declaring it in the schema (and therefore in
+ * `.env.example`) would tell developers to set something the app never reads.
+ *
+ * So tests are excluded from the "must be declared" direction and kept in the
+ * "must be read" direction. Neither check is weakened: a genuinely new runtime
+ * variable still has to be declared, and a declared variable that nothing reads
+ * at all is still reported.
+ */
+function isTestFile(file) {
+  const normalized = file.split(path.sep).join("/");
+  return /(?:^|\/)(?:__tests__|tests)\//.test(normalized)
+    || /\.(?:test|spec)\.[^/]+$/.test(normalized)
+    || /(?:^|\/)test_[^/]*\.py$/.test(normalized);
+}
+
 function readExample(content, component) {
   const values = new Map();
   for (const [index, line] of content.split(/\r?\n/).entries()) {
@@ -58,16 +81,22 @@ for (const [component, config] of Object.entries(schema.components ?? {})) {
   const declared = new Map(Object.entries(config.variables ?? {}));
   const exampleContent = await readFile(path.join(root, config.example), "utf8");
   const example = readExample(exampleContent, component);
-  const discovered = new Set();
+  const discovered = new Set();      // read anywhere, including tests
+  const discoveredRuntime = new Set(); // read by NON-test code only
 
   for (const sourceRoot of config.sourceRoots ?? []) {
     for (const file of await filesUnder(path.join(root, sourceRoot))) {
       const content = await readFile(file, "utf8");
-      for (const name of runtimeVariables(content)) discovered.add(name);
+      const isTest = isTestFile(file);
+      for (const name of runtimeVariables(content)) {
+        discovered.add(name);
+        if (!isTest) discoveredRuntime.add(name);
+      }
     }
   }
 
-  for (const name of discovered) {
+  // Only RUNTIME reads create a contract obligation — see isTestFile.
+  for (const name of discoveredRuntime) {
     if (!declared.has(name)) fail(`${component}: runtime variable ${name} is missing from schema`);
   }
   for (const [name, metadata] of declared) {

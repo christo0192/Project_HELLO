@@ -433,11 +433,31 @@ flag on but a dead scheduler reports `degraded`, not `healthy`.
 
 ## 9. Known limitations recorded honestly
 
-- **`maxPinnedIps` is computed but only the first resolved IP is used**
-  (`resume-transport.ts`). Not a vulnerability — every resolved address is
-  asserted public before connect — but it means no failover across A-records.
-  Left as-is in this PR; it is a one-line behavioural change that deserves its
-  own review.
+- **Pinned-IP failover is live** (`resume-transport.ts`). `maxPinnedIps` is no
+  longer computed-and-ignored: the transport now walks a bounded, ordered set
+  of the already-validated addresses (IPv4 first, then IPv6, resolver order
+  preserved within each family, de-duplicated, capped at 4) and moves to the
+  next one **only** on a connect/TLS/socket failure raised *before* a response
+  begins. Once the server has answered — any status, any byte of body — the
+  attempt is final, because replaying a one-shot presigned GET is neither safe
+  nor useful. The whole sequence shares the caller's single wall-clock budget,
+  so failover cannot extend the fetch deadline. Ordering does not filter:
+  every address the orchestrator asserted public stays eligible, so the
+  upstream all-address check is not quietly narrowed to "the v4 records were
+  fine". Each attempt also carries a **5s connect sub-budget**: an address that
+  raises no error but silently drops packets is the textbook black hole, and an
+  error-only failover trigger would miss exactly the case failover exists for.
+  Sub-budget expiry counts as a bad address (retryable); the caller's overall
+  deadline still outranks it, so this can only make a fetch finish sooner.
+- **A resume ingestion whose attempt ceiling was burned by one defect can be
+  corrected once, with attribution.** `reset_ashby_ingestion_attempts` (0036)
+  is allowlisted by `failed_reason` to transport-shaped failures, refuses a
+  terminal application or a non-`failed_review` row, audits the pre-reset count,
+  and changes neither the state nor the ceiling of 5. The honest limitation is
+  recorded in the migration header and the recovery runbook: `fetch_http_error`
+  covers both a provider error status and a status-0 connect failure, so
+  allowlist membership is necessary but never sufficient — the operator confirms
+  the URL fetches by hand before calling it.
 - **Reconciliation progress strategy** is option (c) from the acceptance matrix:
   keep the bounded caps and make a non-advancing run *observable* via
   `no_progress_runs`, rather than advancing a partial cursor. Chosen because
