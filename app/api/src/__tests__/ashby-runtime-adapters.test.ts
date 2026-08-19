@@ -273,18 +273,35 @@ describe('buildIngestionPorts', () => {
     })!;
   }
 
-  it('returns null when the application carries no resume handle', async () => {
+  // The three "nothing to ingest" outcomes are now NAMED rather than all
+  // collapsing to null — that collapse is what let a real provider failure be
+  // reported as job success while the durable row stayed `queued` forever.
+  it('reports no_resume when the application carries no resume handle', async () => {
     const { client } = fakeSupabase({
       'ashby_application_links:select': { data: { external_resume_file_handle: null }, error: null },
     });
-    const ports = await runtimeWith(client).buildIngestionPorts({ applicationLinkId: 'link_1', onState: async () => {} });
-    expect(ports).toBeNull();
+    const built = await runtimeWith(client).buildIngestionPorts({ applicationLinkId: 'link_1', onState: async () => {} });
+    expect(built.status).toBe('no_resume');
   });
 
-  it('returns null when the link row is missing', async () => {
+  it('reports link_missing when the link row is missing', async () => {
     const { client } = fakeSupabase({ 'ashby_application_links:select': { data: null, error: null } });
-    const ports = await runtimeWith(client).buildIngestionPorts({ applicationLinkId: 'nope', onState: async () => {} });
-    expect(ports).toBeNull();
+    const built = await runtimeWith(client).buildIngestionPorts({ applicationLinkId: 'nope', onState: async () => {} });
+    expect(built.status).toBe('link_missing');
+  });
+
+  it('reports url_unresolved when file.info exposes no usable https URL', async () => {
+    const { client } = fakeSupabase({
+      'ashby_application_links:select': { data: { external_resume_file_handle: 'handle_1' }, error: null },
+    });
+    const transport = vi.fn(async () => ({
+      status: 200, ok: true,
+      headers: { get: () => null },
+      text: async () => JSON.stringify({ success: true, results: { url: 'http://insecure.example/r.pdf' } }),
+    }));
+    const built = await runtimeWith(client, { transport })
+      .buildIngestionPorts({ applicationLinkId: 'link_1', onState: async () => {} });
+    expect(built.status).toBe('url_unresolved');
   });
 
   it('builds ports carrying the configured SSRF policy and version tags', async () => {
@@ -298,8 +315,10 @@ describe('buildIngestionPorts', () => {
       text: async () => JSON.stringify({ success: true, results: { url: 'https://files.ashby.example/r.pdf' } }),
     }));
     const runtime = runtimeWith(client, { transport });
-    const ports = await runtime.buildIngestionPorts({ applicationLinkId: 'link_1', onState: async () => {} });
+    const built = await runtime.buildIngestionPorts({ applicationLinkId: 'link_1', onState: async () => {} });
 
+    expect(built.status).toBe('ok');
+    const ports = built.status === 'ok' ? built.ports : null;
     expect(ports).not.toBeNull();
     expect(ports!.presignedUrl).toBe('https://files.ashby.example/r.pdf');
     expect(ports!.policy.allowlistEnabled).toBe(true);
@@ -308,7 +327,7 @@ describe('buildIngestionPorts', () => {
     expect(ports!.extractorVersion).toBe(ASHBY_EXTRACTOR_VERSION);
   });
 
-  it('returns null when file.info exposes no usable https URL', async () => {
+  it('a non-https file.info URL yields url_unresolved, never usable ports', async () => {
     const { client } = fakeSupabase({
       'ashby_application_links:select': { data: { external_resume_file_handle: 'handle_1' }, error: null },
     });
@@ -317,9 +336,9 @@ describe('buildIngestionPorts', () => {
       headers: { get: () => null },
       text: async () => JSON.stringify({ success: true, results: { url: 'http://insecure.example/r.pdf' } }),
     }));
-    const ports = await runtimeWith(client, { transport })
+    const built = await runtimeWith(client, { transport })
       .buildIngestionPorts({ applicationLinkId: 'link_1', onState: async () => {} });
-    expect(ports).toBeNull();
+    expect(built.status).toBe('url_unresolved');
   });
 
   it('scan port is fail-closed even if the scanner throws', async () => {
@@ -331,8 +350,10 @@ describe('buildIngestionPorts', () => {
       headers: { get: () => null },
       text: async () => JSON.stringify({ success: true, results: { url: 'https://files.ashby.example/r.pdf' } }),
     }));
-    const ports = (await runtimeWith(client, { transport })
-      .buildIngestionPorts({ applicationLinkId: 'link_1', onState: async () => {} }))!;
+    const built = await runtimeWith(client, { transport })
+      .buildIngestionPorts({ applicationLinkId: 'link_1', onState: async () => {} });
+    if (built.status !== 'ok') throw new Error(`expected ok ports, got ${built.status}`);
+    const ports = built.ports;
     // The bundled test scanner treats arbitrary bytes as clean; the contract we
     // assert is that the port never throws and always yields a verdict object.
     const verdict = await ports.scan(Buffer.from('synthetic'));
@@ -349,8 +370,10 @@ describe('buildIngestionPorts', () => {
       headers: { get: () => null },
       text: async () => JSON.stringify({ success: true, results: { url: 'https://files.ashby.example/r.pdf' } }),
     }));
-    const ports = (await runtimeWith(client, { transport })
-      .buildIngestionPorts({ applicationLinkId: 'link_1', onState: async () => {} }))!;
+    const built = await runtimeWith(client, { transport })
+      .buildIngestionPorts({ applicationLinkId: 'link_1', onState: async () => {} });
+    if (built.status !== 'ok') throw new Error(`expected ok ports, got ${built.status}`);
+    const ports = built.ports;
     const result = ports.guard(Buffer.from('not a pdf at all'), 'application/pdf');
     expect(result.ok).toBe(false);
     if (!result.ok) expect(typeof result.reason).toBe('string');

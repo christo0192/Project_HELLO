@@ -15,7 +15,12 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { runClaimedAshbyOperation, channelForOperationKey } from '../integrations/ashby/operation-worker.js';
+import {
+  runClaimedAshbyOperation,
+  channelForOperationKey,
+  DEFAULT_DEFER_SECONDS,
+  PREREQUISITE_DEFER_REASONS,
+} from '../integrations/ashby/operation-worker.js';
 import type { RuntimeWorkflowStores, OperationClaimRow, WorkflowLinkRow } from '../integrations/ashby/orchestration.js';
 import type { MaterializationStore, MaterializationMapping } from '../integrations/ashby/materialize.js';
 
@@ -37,6 +42,7 @@ const claim: OperationClaimRow = {
 
 const link: WorkflowLinkRow = {
   id: LINK, externalApplicationId: APP, externalJobId: 'job_1', jobMappingId: 'map_1',
+  externalResumeFileHandle: 'handle_1',
   candidateId: 'cand_1', sessionId: null, inviteId: null,
   lifecycle: 'processing', terminalState: null,
 };
@@ -64,6 +70,7 @@ function stores(over: Partial<RuntimeWorkflowStores> = {}): RuntimeWorkflowStore
     enqueueOperation: async () => ({ status: 'inserted', id: 'op' }),
     completeOperation: async () => 'ok',
     failOperation: async () => ({ outcome: 'retry' }),
+    deferOperation: async () => 'ok',
     claimOperation: async () => claim,
     parkOperationAwaitingDelivery: async () => 'ok',
     readIngestion: async () => ({ state: 'ready', attempts: 0 }),
@@ -154,23 +161,73 @@ describe('runClaimedAshbyOperation — fail-closed branches', () => {
     expect(fail).toHaveBeenCalledWith('op_1', 'lease-abc', 'terminal_cancel', false);
   });
 
-  it('defers (retryable) while the ingestion has not reached ready', async () => {
+  // A WAIT IS NOT A FAILURE. These two used to call failOperation(retryable),
+  // which leaves the claim's attempt spent and reschedules with no backoff —
+  // five polls (~25s) and the invite was permanently failed while ingestion was
+  // still legitimately working. They must DEFER instead: attempt refunded,
+  // bounded delay, never routed through the failure path.
+  it('DEFERS (never fails) while the ingestion has not reached ready', async () => {
     const fail = vi.fn(async () => ({ outcome: 'retry' as const }));
+    const defer = vi.fn(async () => 'ok' as const);
     const r = await runClaimedAshbyOperation(deps({
-      stores: stores({ readIngestion: async () => ({ state: 'scanning', attempts: 1 }), failOperation: fail }),
+      stores: stores({
+        readIngestion: async () => ({ state: 'scanning', attempts: 1 }),
+        failOperation: fail,
+        deferOperation: defer,
+      }),
     }));
     expect(r).toMatchObject({ claimed: true, committed: false, code: 'ingestion_not_ready' });
-    expect(fail).toHaveBeenCalledWith('op_1', 'lease-abc', 'ingestion_not_ready', true);
+    expect(defer).toHaveBeenCalledWith('op_1', 'lease-abc', 'ingestion_not_ready', DEFAULT_DEFER_SECONDS);
+    expect(fail).not.toHaveBeenCalled();
   });
 
-  it('defers when the mapping is no longer enabled (a pause landing mid-flight)', async () => {
+  it('DEFERS (never fails) when the mapping is no longer enabled (a pause landing mid-flight)', async () => {
     const fail = vi.fn(async () => ({ outcome: 'retry' as const }));
+    const defer = vi.fn(async () => 'ok' as const);
     const r = await runClaimedAshbyOperation(deps({
       resolveMappingForLink: async () => null,
-      stores: stores({ failOperation: fail }),
+      stores: stores({ failOperation: fail, deferOperation: defer }),
     }));
     expect(r).toMatchObject({ claimed: true, code: 'mapping_inactive' });
-    expect(fail).toHaveBeenCalledWith('op_1', 'lease-abc', 'mapping_inactive', true);
+    expect(defer).toHaveBeenCalledWith('op_1', 'lease-abc', 'mapping_inactive', DEFAULT_DEFER_SECONDS);
+    expect(fail).not.toHaveBeenCalled();
+  });
+
+  // The other side of the line: a genuine fault in work this operation OWNS
+  // stays an ordinary attempt-bounded failure. Deferral must not swallow it.
+  it('still FAILS (retryable, attempt-bounded) when the candidate is missing', async () => {
+    const fail = vi.fn(async () => ({ outcome: 'retry' as const }));
+    const defer = vi.fn(async () => 'ok' as const);
+    const r = await runClaimedAshbyOperation(deps({
+      stores: stores({
+        readLink: async () => ({ ...link, candidateId: null }),
+        failOperation: fail,
+        deferOperation: defer,
+      }),
+    }));
+    expect(r).toMatchObject({ claimed: true, committed: false, code: 'candidate_missing' });
+    expect(fail).toHaveBeenCalledWith('op_1', 'lease-abc', 'candidate_missing', true);
+    expect(defer).not.toHaveBeenCalled();
+  });
+
+  // F-2: "is this application resume-backed?" is the LINK's handle, not the
+  // existence of an ingestion row — `runImport` seeds a row for every link, so
+  // the row-existence test was always true and a no-resume application would
+  // have waited forever for an ingestion with nothing to ingest.
+  it('delivers a no-resume application even though a queued ingestion row exists', async () => {
+    const defer = vi.fn(async () => 'ok' as const);
+    const park = vi.fn(async () => 'ok' as const);
+    const r = await runClaimedAshbyOperation(deps({
+      stores: stores({
+        readLink: async () => ({ ...link, externalResumeFileHandle: null }),
+        readIngestion: async () => ({ state: 'queued', attempts: 0 }),
+        deferOperation: defer,
+        parkOperationAwaitingDelivery: park,
+      }),
+    }));
+    expect(r).toMatchObject({ claimed: true, code: 'awaiting_manual_delivery' });
+    expect(defer).not.toHaveBeenCalled();
+    expect(park).toHaveBeenCalled();
   });
 
   it('fails non-retryably when the link row has vanished', async () => {

@@ -53,13 +53,21 @@ function world() {
   const stores: RuntimeWorkflowStores = {
     async findLinkByApplicationId(appId) {
       const l = links.get(appId);
-      return l ? { id: l.id, externalApplicationId: l.externalApplicationId, terminalState: l.terminalState } : null;
+      return l
+        ? {
+            id: l.id,
+            externalApplicationId: l.externalApplicationId,
+            terminalState: l.terminalState,
+            externalResumeFileHandle: l.externalResumeFileHandle,
+          }
+        : null;
     },
     async createLink(input) {
       const id = `link_${++n}`;
       links.set(input.externalApplicationId, {
         id, externalApplicationId: input.externalApplicationId,
         externalJobId: input.externalJobId, jobMappingId: input.jobMappingId,
+        externalResumeFileHandle: input.externalResumeFileHandle,
         candidateId: null, sessionId: null, inviteId: null,
         lifecycle: 'imported', terminalState: null,
       });
@@ -105,6 +113,9 @@ function world() {
     async readLink(linkId) {
       for (const l of links.values()) if (l.id === linkId) return l;
       return null;
+    },
+    async deferOperation() {
+      return 'ok' as const;
     },
     async markWritebackPending() { return { status: 'ok' }; },
   };
@@ -170,7 +181,7 @@ function makeRuntime(w: ReturnType<typeof world>, over: Partial<AshbyRuntime> = 
     resolveMappingByJobId: async () => ({ status: 'enabled', aiScreeningStageId: AI, id: 'map_1', deliveryMode: 'manual' }),
     resolveMappingForLink: async () => ({ id: 'map_1', roleId: ROLE, ownerId: OWNER, deliveryMode: 'manual' }),
     // No resume handle in this fixture ⇒ the ingestion job is a clean no-op.
-    buildIngestionPorts: async () => null,
+    buildIngestionPorts: async () => ({ status: 'no_resume' as const }),
     shutdown: async () => {},
     ...over,
   };
@@ -356,6 +367,7 @@ describe('terminal safety through the chain', () => {
     // Pre-existing TERMINAL link for this application.
     w.links.set(APP, {
       id: 'link_terminal', externalApplicationId: APP, externalJobId: JOB, jobMappingId: 'map_1',
+      externalResumeFileHandle: null,
       candidateId: null, sessionId: null, inviteId: null,
       lifecycle: 'cancelled', terminalState: 'withdrawn',
     });
@@ -374,10 +386,11 @@ describe('terminal safety through the chain', () => {
     const runtime = makeRuntime(w);
     w.links.set(APP, {
       id: 'link_1', externalApplicationId: APP, externalJobId: JOB, jobMappingId: 'map_1',
+      externalResumeFileHandle: null,
       candidateId: null, sessionId: null, inviteId: null,
       lifecycle: 'cancelled', terminalState: 'deleted',
     });
-    const buildIngestionPorts = vi.fn(async () => null);
+    const buildIngestionPorts = vi.fn(async () => ({ status: 'no_resume' as const }));
     const handlers = buildAshbyHandlers(makeRuntime(w, { buildIngestionPorts }));
     await handlers[ASHBY_INGESTION_QUEUE]({ name: ASHBY_INGESTION_QUEUE, payload: { applicationLinkId: 'link_1' } } as never);
     // It must not even resolve a presigned URL for a terminal application.
@@ -429,6 +442,7 @@ describe('M2 — a redelivered signal never re-downloads the resume', () => {
     const w = world();
     w.links.set(APP, {
       id: 'link_ready', externalApplicationId: APP, externalJobId: JOB, jobMappingId: 'map_1',
+      externalResumeFileHandle: 'handle_ready',
       candidateId: 'cand_1', sessionId: 'sess_1', inviteId: null,
       lifecycle: 'ready', terminalState: null,
     });
@@ -499,7 +513,7 @@ describe('M2 — a redelivered signal never re-downloads the resume', () => {
     // handler being inert in general.
     const w = readyWorld();
     w.ingestions.set('link_ready', { state: 'queued', attempts: 1 });
-    const buildIngestionPorts = vi.fn(async () => null);
+    const buildIngestionPorts = vi.fn(async () => ({ status: 'no_resume' as const }));
     const runtime = makeRuntime(w, { buildIngestionPorts: buildIngestionPorts as never });
     const handlers = buildAshbyHandlers(runtime);
     await handlers[ASHBY_INGESTION_QUEUE]({
@@ -514,12 +528,21 @@ describe('M2 — a redelivered signal never re-downloads the resume', () => {
     // The 0029 trigger rejects an illegal move; the RPC reports it as a status
     // rather than throwing. Ignoring that status let the in-memory pipeline
     // keep running against a durable row that no longer described reality.
-    w.stores.advanceIngestion = async () => ({ status: 'invalid_transition' });
+    // The FIRST advanceIngestion call is now the handler's own
+    // `queued -> fetching` (0035): the row must leave `queued` before any
+    // provider call, or a failure can never reach `failed_review` at all. Let
+    // that one succeed and reject every later transition, so the onState seam
+    // under test is still the one the pipeline uses.
+    let firstAdvance = true;
+    w.stores.advanceIngestion = async () => {
+      if (firstAdvance) { firstAdvance = false; return { status: 'ok' }; }
+      return { status: 'invalid_transition' };
+    };
 
     let capturedOnState: ((s: string) => Promise<void>) | null = null;
     const buildIngestionPorts = vi.fn(async (input: { onState: (s: string) => Promise<void> }) => {
       capturedOnState = input.onState;
-      return null;
+      return { status: 'no_resume' as const };
     });
     const runtime = makeRuntime(w, { buildIngestionPorts: buildIngestionPorts as never });
     const handlers = buildAshbyHandlers(runtime);

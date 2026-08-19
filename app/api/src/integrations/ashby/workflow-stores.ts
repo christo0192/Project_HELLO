@@ -32,18 +32,38 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
     async findLinkByApplicationId(externalApplicationId): Promise<ExistingLinkRow | null> {
       const { data, error } = await client
         .from('ashby_application_links')
-        .select('id, external_application_id, terminal_state')
+        .select('id, external_application_id, terminal_state, external_resume_file_handle')
         .eq('provider', 'ashby')
         .eq('external_application_id', externalApplicationId)
         .maybeSingle();
       if (error) throw new Error('ashby_link_read_error');
       if (!data) return null;
-      const row = data as { id: string; external_application_id: string; terminal_state: string | null };
+      const row = data as {
+        id: string;
+        external_application_id: string;
+        terminal_state: string | null;
+        external_resume_file_handle: string | null;
+      };
       return {
         id: row.id,
         externalApplicationId: row.external_application_id,
         terminalState: (row.terminal_state as ExistingLinkRow['terminalState']) ?? null,
+        externalResumeFileHandle: row.external_resume_file_handle ?? null,
       };
+    },
+    /**
+     * Backfill-on-reuse. Guarded in SQL as well as by the caller: the `is`
+     * filter means a concurrent writer that already set a handle wins and this
+     * update matches no row, so a stored handle is never overwritten.
+     */
+    async bindLinkResumeHandle(applicationLinkId, handle): Promise<void> {
+      const { error } = await client
+        .from('ashby_application_links')
+        .update({ external_resume_file_handle: handle })
+        .eq('provider', 'ashby')
+        .eq('id', applicationLinkId)
+        .is('external_resume_file_handle', null);
+      if (error) throw new Error('ashby_link_handle_backfill_error');
     },
     async createLink(input): Promise<{ id: string }> {
       const { data, error } = await client
@@ -109,6 +129,16 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
       const outcome = (data as { outcome?: string } | null)?.outcome;
       return { outcome: outcome === 'failed' ? 'failed' : 'retry' };
     },
+    async deferOperation(id, leaseToken, reasonCode, delaySeconds): Promise<'ok' | 'not_owned'> {
+      const { data, error } = await client.rpc('defer_ashby_operation', {
+        p_operation_id: id,
+        p_lease_token: leaseToken,
+        p_reason_code: reasonCode,
+        p_delay_seconds: delaySeconds,
+      });
+      if (error) throw new Error('ashby_operation_defer_error');
+      return statusOf(data) === 'ok' ? 'ok' : 'not_owned';
+    },
     async claimOperation(operationType, owner, leaseSeconds): Promise<OperationClaimRow | null> {
       const { data, error } = await client.rpc('claim_ashby_operation', {
         p_operation_type: operationType,
@@ -152,7 +182,8 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
         .from('ashby_application_links')
         .select(
           'id, external_application_id, external_job_id, job_mapping_id, ' +
-            'candidate_id, session_id, invite_id, lifecycle, terminal_state',
+            'candidate_id, session_id, invite_id, lifecycle, terminal_state, ' +
+            'external_resume_file_handle',
         )
         .eq('provider', 'ashby')
         .eq('id', applicationLinkId)
@@ -164,6 +195,7 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
         id: String(r.id),
         externalApplicationId: String(r.external_application_id),
         externalJobId: (r.external_job_id as string | null) ?? null,
+        externalResumeFileHandle: (r.external_resume_file_handle as string | null) ?? null,
         jobMappingId: (r.job_mapping_id as string | null) ?? null,
         candidateId: (r.candidate_id as string | null) ?? null,
         sessionId: (r.session_id as string | null) ?? null,
