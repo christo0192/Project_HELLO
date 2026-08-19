@@ -258,7 +258,25 @@ export function createApp(opts: CreateAppOptions = {}) {
   app.use('/api/assess', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'assess:', useUserKey: true }));
   app.use('/api/resumes', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'resumes:', useUserKey: true }));
   app.use('/api/livekit', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'livekit:', useUserKey: true }));
-  app.use('/api/recordings', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'recordings:', useUserKey: true }));
+  // Recordings: the download/revoke paths keep the STRICT bucket, but the
+  // 0038 operator health surface must not sit behind it. An ops poller on a
+  // tight interval would exhaust 20 requests/window, and a throttled read is
+  // indistinguishable from `backlog_unavailable` → `degraded` — i.e. the
+  // limiter would manufacture the exact false alarm the surface exists to
+  // avoid. `/health` gets the default bucket with its own prefix (so it also
+  // cannot consume the download bucket); an over-limit caller gets a plain
+  // 429, which the client contract must NOT read as degraded.
+  const recordingsStrictLimiter = createRateLimitMiddleware({
+    config: strictRateLimit, prefix: 'recordings:', useUserKey: true,
+  });
+  const recordingsHealthLimiter = createRateLimitMiddleware({
+    config: defaultRateLimit, prefix: 'recordings-health:', useUserKey: true,
+  });
+  app.use('/api/recordings', (req, res, next) => (
+    req.path === '/health'
+      ? recordingsHealthLimiter(req, res, next)
+      : recordingsStrictLimiter(req, res, next)
+  ));
   app.use('/api/dsar', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'dsar:', useUserKey: true }));
   // GOV-08/09/10: consent routes are recruiter/authenticated-only (fail-closed).
   // Candidate consent-before-join is a synthetic client-side mechanism (see

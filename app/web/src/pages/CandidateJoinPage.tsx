@@ -178,6 +178,45 @@ export function CandidateJoinPage() {
     };
   }, []);
 
+  // ── Completion-signal survivability (MITIGATION ONLY) ──────────────────
+  // The normal completion signal is an ordinary fetch, and a browser tearing
+  // the page down cancels those. Since that call was the only client-side
+  // thing that completed the session and finalized the recording, a candidate
+  // who closed the tab left the row for the reconciler to expire much later.
+  // `pagehide` plus the `keepalive` flag on the request itself closes that.
+  //
+  // This is a LATENCY mitigation and nothing more: the server-side convergence
+  // path (0038 terminal-transition trigger → finalize worker → sweeper) is
+  // required to be correct with this call deleted entirely, and the API suite
+  // asserts precisely that.
+  //
+  // DELIBERATELY NOT `visibilitychange → hidden`. That event also fires when a
+  // candidate switches tabs or backgrounds a mobile browser MID-INTERVIEW, and
+  // this handler ends the session — so wiring it there would trade a bounded
+  // convergence delay for terminating live screenings. `pagehide` is the event
+  // that actually means "this page is going away". The residual cost is a
+  // mobile browser that kills the tab without firing `pagehide`; that case
+  // converges server-side like every other, which is the whole point.
+  const unloadSignalSentRef = useRef(false);
+  useEffect(() => {
+    function sendCompletionSignal(): void {
+      if (unloadSignalSentRef.current) return;
+      // If the ordinary finalization already started, it owns the outcome.
+      if (finalizationPromiseRef.current) return;
+      const sessionId = sessionIdRef.current;
+      const grantToken = grantTokenRef.current;
+      if (!sessionId || !grantToken) return;
+      unloadSignalSentRef.current = true;
+      // Errors are irrelevant on this path: nothing here is load-bearing, and
+      // there is no UI left to show a failure to.
+      void api.completeCandidateScreening(sessionId, grantToken).catch(() => undefined);
+    }
+    window.addEventListener('pagehide', sendCompletionSignal);
+    return () => {
+      window.removeEventListener('pagehide', sendCompletionSignal);
+    };
+  }, []);
+
   const allRequiredChecked = useCallback(
     (t: CandidateConsentTemplate | null): boolean => {
       if (!t) return false;

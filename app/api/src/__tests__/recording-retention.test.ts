@@ -779,3 +779,200 @@ describe('REC-06 default Supabase-Storage binding', () => {
     await expect(storage.remove(OBJECT_KEY)).rejects.toThrow(/recording storage remove failed/);
   });
 });
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// 0038 — erasure truthfulness: the orphan branch and the MANIFEST
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Two independent compliance defects are covered here.
+//
+// (1) THE ORPHAN. A session whose finalize never ran has a NULL
+//     `recording_object_key` and a live `recording_egress_id` — and the egress
+//     wrote its object anyway. Erasing such a session by tombstoning the row
+//     alone leaves candidate audio in the bucket while recording a completed
+//     erasure. That is the exact population the convergence repair exists for,
+//     so it is also exactly the population most likely to be erased.
+//
+// (2) THE MANIFEST. Egress starts with `disableManifest: false`, so a
+//     `<key>.json` manifest exists for every egress-recorded session, and
+//     NOTHING ever removed it — not in the orphan case, and not on the normal
+//     fully-linked path either.
+//
+// A false `erasure_completed` is materially worse than a failure record: this
+// is the one part of the change with regulatory rather than operational weight.
+
+const EGRESS_SESSION_ID = '00000000-0000-4000-8000-0000000000e9';
+const EGRESS_KEY = `${EGRESS_SESSION_ID}-egress.ogg`;
+const EGRESS_MANIFEST = `${EGRESS_SESSION_ID}-egress.ogg.json`;
+
+/** A storage double that can also be ASKED whether a key exists. */
+function probingStorage(): RecordingStorage & { removed: string[] } {
+  const removed: string[] = [];
+  return {
+    removed,
+    async remove(objectKey: string): Promise<void> {
+      removed.push(objectKey);
+      storageObjects.delete(objectKey);
+    },
+    async exists(objectKey: string): Promise<boolean> {
+      return storageObjects.has(objectKey);
+    },
+  };
+}
+
+function seedOrphanEgressSession(): void {
+  mem.call_sessions.push({
+    id: EGRESS_SESSION_ID,
+    owner_id: 'admin-1',
+    // The stuck shape: finalize never linked a key...
+    recording_object_key: null,
+    recording_egress_id: 'EG_synthetic123',
+    recording_egress_status: 'active',
+    recording_sha256: null,
+    recording_size_bytes: null,
+    recording_content_type: null,
+    recording_provenance: null,
+    recording_quarantined: false,
+    recording_quarantine_reason: null,
+    recording_revoked_at: null,
+    recording_deleted_at: null,
+  });
+}
+
+function completionFor(sessionId: string): Row[] {
+  return mem.governance_audit.filter(
+    (a) => a.action === 'erasure_completed' && a.entity_id === sessionId,
+  );
+}
+
+describe('0038 erasure: NULL key + live egress (the orphan branch)', () => {
+  it('object PRESENT → object AND manifest removed, audit truthful', async () => {
+    seedOrphanEgressSession();
+    // ...but the egress wrote both objects anyway.
+    storageObjects.set(EGRESS_KEY, Buffer.from('orphaned-audio'));
+    storageObjects.set(EGRESS_MANIFEST, Buffer.from('{}'));
+    const storage = probingStorage();
+
+    const result = await eraseRecording(EGRESS_SESSION_ID, ACTOR_ID, { storage });
+
+    expect(result.status).toBe('completed');
+    expect(storageObjects.has(EGRESS_KEY)).toBe(false);
+    expect(storageObjects.has(EGRESS_MANIFEST)).toBe(false);
+
+    const details = completionFor(EGRESS_SESSION_ID)[0].details as Record<string, unknown>;
+    expect(details.object_key_removed).toBe(true);
+    expect(details.manifest_removed).toBe(true);
+    expect(details.orphan_probe).toBe('removed');
+  });
+
+  it('object ABSENT → idempotent success that does NOT claim a removal', async () => {
+    seedOrphanEgressSession();
+    const storage = probingStorage();
+
+    const result = await eraseRecording(EGRESS_SESSION_ID, ACTOR_ID, { storage });
+
+    expect(result.status).toBe('completed');
+    const details = completionFor(EGRESS_SESSION_ID)[0].details as Record<string, unknown>;
+    // The whole point: idempotent success, truthfully labelled.
+    expect(details.object_key_removed).toBe(false);
+    expect(details.orphan_probe).toBe('absent');
+    expect(storage.removed).toEqual([]);
+  });
+
+  it('object PRESENT but UNDELETABLE → failed_storage_delete, never a success', async () => {
+    seedOrphanEgressSession();
+    storageObjects.set(EGRESS_KEY, Buffer.from('orphaned-audio'));
+    const storage: RecordingStorage = {
+      async remove(): Promise<void> { throw new Error('storage backend boom'); },
+      async exists(key: string): Promise<boolean> { return storageObjects.has(key); },
+    };
+
+    const result = await eraseRecording(EGRESS_SESSION_ID, ACTOR_ID, { storage });
+
+    expect(result.status).toBe('failed_storage_delete');
+    // Nothing was tombstoned and no success was claimed — fully retryable.
+    expect(sessionRow(EGRESS_SESSION_ID)!.recording_deleted_at).toBeNull();
+    expect(storageObjects.has(EGRESS_KEY)).toBe(true);
+    const success = completionFor(EGRESS_SESSION_ID).filter((a) => a.outcome === 'success');
+    expect(success).toHaveLength(0);
+  });
+
+  it('a storage double with NO probe reports orphan_probe: unavailable, never "absent"', async () => {
+    // "We could not look" is a real, reportable limitation. Reporting it as
+    // absence would be a confident claim about a bucket nobody inspected.
+    seedOrphanEgressSession();
+    storageObjects.set(EGRESS_KEY, Buffer.from('orphaned-audio'));
+    const blind: RecordingStorage = { async remove(): Promise<void> {} };
+
+    const result = await eraseRecording(EGRESS_SESSION_ID, ACTOR_ID, { storage: blind });
+
+    expect(result.status).toBe('completed');
+    const details = completionFor(EGRESS_SESSION_ID)[0].details as Record<string, unknown>;
+    expect(details.orphan_probe).toBe('unavailable');
+    expect(details.object_key_removed).toBe(false);
+  });
+});
+
+describe('0038 erasure: the manifest on the NORMAL, fully-linked path', () => {
+  it('a linked EGRESS key also removes its manifest sibling', async () => {
+    // The gap was wider than the orphan case: the manifest was never removed
+    // on the ordinary path either.
+    mem.call_sessions.push({
+      id: EGRESS_SESSION_ID,
+      owner_id: 'admin-1',
+      recording_object_key: EGRESS_KEY,
+      recording_egress_id: 'EG_synthetic123',
+      recording_provenance: 'livekit_egress',
+      recording_sha256: 'b'.repeat(64),
+      recording_size_bytes: 2048,
+      recording_content_type: 'audio/ogg',
+      recording_quarantined: false,
+      recording_quarantine_reason: null,
+      recording_revoked_at: null,
+      recording_deleted_at: null,
+    });
+    storageObjects.set(EGRESS_KEY, Buffer.from('audio'));
+    storageObjects.set(EGRESS_MANIFEST, Buffer.from('{}'));
+    const storage = probingStorage();
+
+    const result = await eraseRecording(EGRESS_SESSION_ID, ACTOR_ID, { storage });
+
+    expect(result.status).toBe('completed');
+    expect(storage.removed).toEqual([EGRESS_KEY, EGRESS_MANIFEST]);
+    const details = completionFor(EGRESS_SESSION_ID)[0].details as Record<string, unknown>;
+    expect(details.object_key_removed).toBe(true);
+    expect(details.manifest_removed).toBe(true);
+  });
+
+  it('a BROWSER-upload key gets no manifest guess — a wrong key would be a quiet false success', async () => {
+    seedSessionWithRecording();
+    const storage = probingStorage();
+    const result = await eraseRecording(SESSION_ID, ACTOR_ID, { storage });
+    expect(result.status).toBe('completed');
+    // Exactly the linked key, and nothing invented alongside it.
+    expect(storage.removed).toEqual([OBJECT_KEY]);
+    const details = completionFor(SESSION_ID)[0].details as Record<string, unknown>;
+    expect(details.manifest_removed).toBe(false);
+    expect(details.orphan_probe).toBe('not_applicable');
+  });
+});
+
+describe('0038 erasure: the already-tombstoned BACKFILL no longer claims a removal', () => {
+  it('convergence backfill reports object_key_removed:false, not a hardcoded true', async () => {
+    // This branch REMOVES NOTHING — it backfills missing evidence for a row
+    // that was already tombstoned — and it hardcoded `object_key_removed: true`.
+    // That was the genuine false-success compliance record.
+    seedSessionWithRecording({ recording_deleted_at: '2026-08-19T00:00:00.000Z', recording_object_key: null });
+
+    const result = await eraseRecording(SESSION_ID, ACTOR_ID, { storage: syntheticStorage });
+
+    expect(result.status).toBe('completed');
+    const success = completionFor(SESSION_ID).filter((a) => a.outcome === 'success');
+    expect(success).toHaveLength(1);
+    const details = success[0].details as Record<string, unknown>;
+    expect(details.object_key_removed).toBe(false);
+    expect(details.converged).toBe(true);
+    expect(details.backfilled_evidence).toBe(true);
+  });
+});

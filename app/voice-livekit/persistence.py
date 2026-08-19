@@ -86,6 +86,13 @@ _UUID_PATTERN = re.compile(
 _FAILED_REASONS: frozenset[str] = frozenset([
     "room_create_error", "worker_crash", "provider_error",
     "assessment_error", "shutdown_forced", "drain_timeout",
+    # 0038: the bounded room-residency cap in agent.py. Its own code, because
+    # a residency timeout is NOT a crash — the worker was alive and the close
+    # event simply never fired — and reporting it as `worker_crash` would both
+    # misattribute the session and pollute the real crash signal. Mirrors the
+    # widened chk_call_sessions_terminal_reason CHECK; the two must move
+    # together or fail_session rejects the write.
+    "residency_timeout",
 ])
 _CANCELLED_REASONS: frozenset[str] = frozenset([
     "recruiter_cancelled", "migrated_abandoned", "duplicate_session", "shutdown_drain",

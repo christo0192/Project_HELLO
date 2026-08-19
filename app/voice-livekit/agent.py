@@ -86,6 +86,38 @@ CANDIDATE_SILENCE_PROMPT_SEC = _float_env("CANDIDATE_SILENCE_PROMPT_SEC", 30.0)
 CANDIDATE_SILENCE_END_SEC = _float_env("CANDIDATE_SILENCE_END_SEC", 20.0)
 
 
+def _bounded_float_env(name: str, default: float, lo: float, hi: float) -> float:
+    """Read a float env var and CLAMP it — a residency bound that an operator
+    can set to zero (or to a week) is not a bound."""
+    value = _float_env(name, default)
+    if value != value:  # NaN
+        return default
+    return lo if value < lo else hi if value > hi else value
+
+
+# ── Bounded room residency (0038 / D-7) ───────────────────────────────
+# The entrypoint used to `await _close_event.wait()` with NO wall-clock cap,
+# and `participant_disconnected` never initiates a close — so a candidate who
+# simply closed the tab left the worker resident in the room until something
+# else happened to it. This is that cap.
+#
+# It is a WALL CLOCK, deliberately, not an attempt counter: a counter that
+# gates a control needs its own reset lifecycle or it becomes a one-way latch,
+# while a deadline derived from the session's own start resets naturally with
+# every new session.
+#
+# NOT DONE HERE, and refused rather than postponed: driving `close_room_once()`
+# from `participant_disconnected`. That would race the worker's `delete_room`
+# against the API's `stopEgress`, which is the mechanism most likely to produce
+# EGRESS_ABORTED — the exact latch the finalize path was just taught not to
+# mis-fire. It is also unnecessary: with the finalize runtime enabled the
+# sweeper drives `stopEgress` at `ended_at + grace`, well before the room's own
+# 600s empty timeout.
+SESSION_MAX_RESIDENCY_SEC = _bounded_float_env(
+    "SESSION_MAX_RESIDENCY_SEC", 3600.0, 60.0, 21600.0
+)
+
+
 def _int_env(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw in (None, ""):
@@ -317,6 +349,9 @@ _SESSION_OUTCOME_ALLOWLIST: dict[str | None, str] = {
     "worker_crash": "worker_crash",
     "shutdown_forced": "shutdown_forced",
     "provider_error": "provider_error",
+    # 0038: its own bucket, so a residency timeout never inflates the
+    # `other_failure` catch-all or the crash count.
+    "residency_timeout": "residency_timeout",
 }
 
 
@@ -859,8 +894,24 @@ async def _run_session(
             )
         )
 
-        # Await session closure — keeps entrypoint alive until close fires
-        await _close_event.wait()
+        # Await session closure — keeps entrypoint alive until close fires,
+        # but no longer forever. See SESSION_MAX_RESIDENCY_SEC.
+        try:
+            await asyncio.wait_for(
+                _close_event.wait(), timeout=SESSION_MAX_RESIDENCY_SEC
+            )
+        except asyncio.TimeoutError:
+            # Caught EXPLICITLY here rather than falling through to the generic
+            # handler below. asyncio.TimeoutError IS an Exception, so without
+            # this the residency cap would persist `worker_crash` — a false
+            # attribution that also pollutes the real crash signal. The
+            # truthful code is `residency_timeout`, which required widening
+            # BOTH persistence._FAILED_REASONS and the 0006
+            # chk_call_sessions_terminal_reason CHECK (0038 §8); neither alone
+            # is sufficient, and fail_session rejects anything outside the set.
+            await complete_once(
+                None if candidate_left_normally else "residency_timeout"
+            )
 
     except Exception as exc:
         if session_span is not None:

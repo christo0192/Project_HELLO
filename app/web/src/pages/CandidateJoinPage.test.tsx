@@ -714,4 +714,72 @@ describe('CandidateJoinPage', () => {
     // T15 passes: upload was attempted exactly once and did NOT retry
     await waitFor(() => expect(uploadCandidateRecording).toHaveBeenCalledTimes(1));
   });
+
+  // ── 0038: completion-signal survivability (MITIGATION ONLY) ───────────
+  // The completion call is an ordinary fetch, and a browser tearing the page
+  // down cancels those — so a candidate who closed the tab left the session
+  // for the reconciler to expire much later. `pagehide` plus `keepalive`
+  // closes that window.
+  //
+  // These assert the mitigation exists. They are deliberately NOT the proof
+  // that recordings converge: the API suite proves convergence with this call
+  // deleted entirely (recording-finalize-convergence.test.ts drives the
+  // sweeper and worker with no browser involved at all).
+
+  it('fires the completion signal on pagehide after a session is joined', async () => {
+    candidateConsentStatus.mockResolvedValue({
+      has_consent: true,
+      template_version: '1.0',
+      locale: 'en-IN',
+      required_consents: ['ai_interview', 'recording'],
+    });
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
+    await userEvent.click(await screen.findByRole('button', { name: 'Join screening' }));
+    await waitFor(() => expect(roomHandlers.has('disconnected')).toBe(true));
+
+    expect(completeCandidateScreening).not.toHaveBeenCalled();
+    window.dispatchEvent(new Event('pagehide'));
+    await waitFor(() => expect(completeCandidateScreening).toHaveBeenCalledTimes(1));
+
+    // Exactly once, even if the browser fires the event repeatedly.
+    window.dispatchEvent(new Event('pagehide'));
+    window.dispatchEvent(new Event('pagehide'));
+    expect(completeCandidateScreening).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT fire the completion signal before a session exists', async () => {
+    candidateConsentStatus.mockResolvedValue({
+      has_consent: true,
+      template_version: '1.0',
+      locale: 'en-IN',
+      required_consents: ['ai_interview', 'recording'],
+    });
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
+    await screen.findByRole('button', { name: 'Join screening' });
+
+    window.dispatchEvent(new Event('pagehide'));
+    expect(completeCandidateScreening).not.toHaveBeenCalled();
+  });
+
+  it('does NOT end the session when the tab is merely backgrounded', async () => {
+    // `visibilitychange -> hidden` also fires when a candidate switches tabs
+    // or backgrounds a mobile browser MID-INTERVIEW, and this handler ENDS the
+    // session. Wiring it there would trade a bounded convergence delay for
+    // terminating live screenings, so it is deliberately not wired.
+    candidateConsentStatus.mockResolvedValue({
+      has_consent: true,
+      template_version: '1.0',
+      locale: 'en-IN',
+      required_consents: ['ai_interview', 'recording'],
+    });
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
+    await userEvent.click(await screen.findByRole('button', { name: 'Join screening' }));
+    await waitFor(() => expect(roomHandlers.has('disconnected')).toBe(true));
+
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(completeCandidateScreening).not.toHaveBeenCalled();
+  });
 });

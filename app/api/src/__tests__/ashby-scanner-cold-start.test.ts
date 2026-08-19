@@ -127,9 +127,25 @@ function runtimeFor(world: World, scanStatus = 'clean') {
   };
 }
 
+/**
+ * A wall-clock anchor for this suite, expressed RELATIVE to the run.
+ *
+ * `createdAt` used to be the fixed literal '2026-08-19T00:00:00.000Z'. The
+ * post-claim deferral is bounded by a WALL-CLOCK deadline measured from the
+ * job's creation (default 8 h), so from eight hours after that instant onward
+ * every deferral test permanently reported `scan_unavailable_deadline` instead
+ * of deferring — a time bomb that made three tests fail on `main` on a date
+ * with nothing to do with the code. A fixed past timestamp cannot be a fixture
+ * for a deadline test; the anchor is now derived from `Date.now()`, and the
+ * one test that DOES exercise the deadline pins its own `nowMs` relative to
+ * the same anchor.
+ */
+const JOB_CREATED_AT_MS = Date.now();
+const JOB_CREATED_AT = new Date(JOB_CREATED_AT_MS).toISOString();
+
 const job = (over: Record<string, unknown> = {}) => ({
   id: 'job_1', name: ASHBY_INGESTION_QUEUE, payload: { applicationLinkId: 'link_1' },
-  attempts: 1, maxAttempts: 5, createdAt: '2026-08-19T00:00:00.000Z', ...over,
+  attempts: 1, maxAttempts: 5, createdAt: JOB_CREATED_AT, ...over,
 }) as never;
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -277,8 +293,9 @@ describe('post-claim scanner race', () => {
       scannerGate: async () => ({ action: 'proceed', mode: 'clamav' }),
       scannerDeferDeadlineMs: 8 * 3600_000,
       // Nine hours after the job was created: waiting has stopped being
-      // correct and has become an invisible backlog.
-      nowMs: () => Date.parse('2026-08-19T09:00:00.000Z'),
+      // correct and has become an invisible backlog. Relative to the job's
+      // own creation anchor, so this stays true on every future run date.
+      nowMs: () => JOB_CREATED_AT_MS + 9 * 3600_000,
     });
     const result = await handlers[ASHBY_INGESTION_QUEUE](job());
     expect(result).toBeUndefined();

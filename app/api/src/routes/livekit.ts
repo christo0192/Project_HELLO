@@ -32,8 +32,10 @@ import { runAssessment } from '../services/assessment.js';
 import { resolveWorkerContext, ERR_DB_FAILED } from '../lib/worker-context.js';
 import {
   finalizeAuthoritativeRecording,
+  recordRecordingFinalizeDeferral,
   type RecordingFinalizeStatus,
 } from '../lib/recording-egress.js';
+import { createLogger } from '../lib/logger.js';
 import {
   provisionRoomForCreatedSession,
   requireLiveKitConfigured,
@@ -46,6 +48,9 @@ import {
   ResponseSentError,
   runWithQuotaReservation,
 } from '../lib/quota.js';
+
+/** Sanitized, PII-free logger for the recording-finalization seam. */
+const recordingLogger = createLogger('recording-finalize');
 
 export const livekitRouter = Router();
 
@@ -391,7 +396,21 @@ async function finalizeRecordingForCompletion(sessionId: string): Promise<Record
     return await finalizeAuthoritativeRecording(sessionId);
   } catch {
     // A transient provider/storage error is retryable. Do not tell the browser
-    // to overwrite an authoritative object that may still be finalizing.
+    // to overwrite an authoritative object that may still be finalizing — the
+    // `'pending'` contract here is load-bearing for the I-2 precedence rule
+    // and is deliberately unchanged.
+    //
+    // What DID change: this catch used to be the end of the story. The error
+    // was swallowed, nothing was written, nothing was logged, and the row was
+    // indistinguishable from one that had simply not been tried. Both are now
+    // recorded before `'pending'` is returned, best-effort so the observability
+    // write can never change the outcome it observes.
+    void recordRecordingFinalizeDeferral(sessionId, 'provider_error')
+      .catch(() => undefined);
+    recordingLogger.warn('unknown_event', {
+      error_category: 'recording_finalize_provider_error',
+      error_type: 'complete_route',
+    });
     return 'pending';
   }
 }

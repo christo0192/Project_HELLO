@@ -57,6 +57,139 @@ export function egressObjectKey(sessionId: string): string {
   return `${sessionId}-egress.ogg`;
 }
 
+/**
+ * The manifest object LiveKit writes alongside every egress file.
+ *
+ * `startAuthoritativeRecording` sets `disableManifest: false`, so a manifest
+ * exists for EVERY egress-recorded session — and nothing in this repository
+ * ever deleted it, on the erasure path or anywhere else.
+ *
+ * The name is `<filepath>.json`, i.e. `<session-id>-egress.ogg.json` — NOT
+ * `<session-id>-egress.json`. That distinction matters: deleting the wrong key
+ * against an idempotent `remove()` succeeds silently and would produce a
+ * second, quieter false-success compliance record, which is precisely the
+ * failure class the erasure repair exists to end.
+ *
+ * Pinned against `livekit-server-sdk@2.16.0` / `@livekit/protocol`: the SDK
+ * does not construct the name (the egress service does), and the AUTHORITATIVE
+ * value is reported back by the provider as `EgressInfo.manifestLocation`
+ * (`@generated from field: string manifest_location = 23`), sitting beside
+ * `FileInfo.filename` (field 1). This helper is therefore the derivation used
+ * when no live `EgressInfo` is in hand (erasure runs long after the egress is
+ * gone); `scripts/repair/inspect-egress.ts` prints the provider's own
+ * `manifestLocation` so the derivation is OBSERVABLE rather than assumed.
+ */
+export function egressManifestObjectKey(sessionId: string): string {
+  return `${egressObjectKey(sessionId)}.json`;
+}
+
+/**
+ * Bounded reason codes for a finalization DEFERRAL.
+ *
+ * This list is the code-side mirror of the 0038 CHECK
+ * `chk_call_sessions_recording_finalize_defer_reason`, which is the
+ * AUTHORITATIVE gate. The queue's own `defer_job` reason gate is a looser
+ * shape regex, so a code added here but not to the migration would defer the
+ * JOB normally while failing the SESSION write — and because that write is
+ * best-effort, it would fail silently and the health surface would
+ * under-report. The two must always move together.
+ */
+export const RECORDING_FINALIZE_DEFER_REASONS = [
+  'poll_timeout',
+  'object_unreadable',
+  'object_absent',
+  'provider_error',
+  'egress_identity_mismatch',
+  'provenance_conflict',
+  'terminal_state',
+  'rpc_unknown',
+  'egress_disabled',
+] as const;
+
+export type RecordingFinalizeDeferReason = typeof RECORDING_FINALIZE_DEFER_REASONS[number];
+
+/** Outcome of the best-effort deferral bookkeeping write. */
+export interface RecordingFinalizeDeferralRecord {
+  /** Post-increment deferral count for this session, or null when unknown. */
+  attempts: number | null;
+  /** True once the session has stamped `recording_finalize_exhausted_at`. */
+  exhausted: boolean;
+}
+
+/**
+ * Persist ONE finalization deferral: why, when, how many times, and whether
+ * the row has now given up.
+ *
+ * BEST-EFFORT BY CONTRACT. Before this existed, every `'pending'` return wrote
+ * nothing and logged nothing while collapsing five distinct causes into one
+ * silence. Recording the cause must not be able to CHANGE the cause: a failure
+ * to write the marker never alters the returned `RecordingFinalizeStatus`, so
+ * an observability write can never turn a converging session into a stuck one.
+ *
+ * The increment happens inside the RPC in a single statement, so two machines
+ * racing the same session cannot lose one to a read-modify-write.
+ */
+async function recordFinalizeDeferral(
+  db: typeof supabase,
+  sessionId: string,
+  reason: RecordingFinalizeDeferReason,
+  maxAttempts: number,
+): Promise<RecordingFinalizeDeferralRecord> {
+  try {
+    const { data, error } = await db.rpc('record_recording_finalize_deferral', {
+      p_session_id: sessionId,
+      p_reason: reason,
+      p_max_attempts: maxAttempts,
+    });
+    if (error) return { attempts: null, exhausted: false };
+    const row = (data ?? {}) as { attempts?: unknown; exhausted?: unknown };
+    return {
+      attempts: typeof row.attempts === 'number' && Number.isFinite(row.attempts)
+        ? row.attempts
+        : null,
+      exhausted: row.exhausted === true,
+    };
+  } catch {
+    return { attempts: null, exhausted: false };
+  }
+}
+
+/**
+ * Public seam so the queue handler can record a deferral for a cause it
+ * observed OUTSIDE this module — a `listEgress` throw that the route swallows,
+ * or an egress build that is not configured at all. Same best-effort contract.
+ */
+export async function recordRecordingFinalizeDeferral(
+  sessionId: string,
+  reason: RecordingFinalizeDeferReason,
+  maxAttempts: number = env.recordingFinalizeMaxAttempts,
+  deps: { db?: typeof supabase } = {},
+): Promise<RecordingFinalizeDeferralRecord> {
+  return recordFinalizeDeferral(deps.db ?? supabase, sessionId, reason, maxAttempts);
+}
+
+/**
+ * Whether an egress finalize can even be ATTEMPTED on this build.
+ *
+ * `finalizeAuthoritativeRecording` never consulted the enable flag: with
+ * `RECORDING_EGRESS_ENABLED=false` but legacy rows still carrying an egress
+ * id, `egressClient()` constructs against a possibly-empty `LIVEKIT_URL` and
+ * throws — which, from a queue handler, is a FAILURE, and five of those
+ * dead-letter a job whose only problem is that the feature is off. The handler
+ * checks this first and DEFERS instead.
+ */
+export function egressFinalizeConfigured(): boolean {
+  if (!env.recordingEgressEnabled) return false;
+  return Boolean(
+    env.livekitUrl
+    && env.livekitApiKey
+    && env.livekitApiSecret
+    && env.recordingEgressS3Endpoint
+    && env.recordingEgressS3AccessKeyId
+    && env.recordingEgressS3SecretAccessKey,
+  );
+}
+
 // ── 0026: pure timing-anchor helpers ────────────────────────────────
 
 /** Maximum valid epoch-ms value (year 2100, matches DB CHECK constraint). */
@@ -187,28 +320,89 @@ export async function startAuthoritativeRecording(
   return { status: 'started', egressId: info.egressId };
 }
 
-function terminalEgressInfo(items: EgressInfo[]): EgressInfo | undefined {
-  return items.find((item) => [
+/**
+ * The terminal egress statuses, read LAZILY.
+ *
+ * Deliberately a function rather than a module-level constant: several suites
+ * `vi.mock('livekit-server-sdk')` with a partial module, and a top-level
+ * `EgressStatus.EGRESS_COMPLETE` would evaluate at import time and throw
+ * before a single test ran. The original code happened to be lazy because the
+ * array sat inside a function body; keeping it lazy is a requirement, not a
+ * style preference.
+ */
+function terminalEgressStatuses(): readonly EgressStatus[] {
+  return [
     EgressStatus.EGRESS_COMPLETE,
     EgressStatus.EGRESS_FAILED,
     EgressStatus.EGRESS_ABORTED,
     EgressStatus.EGRESS_LIMIT_REACHED,
-  ].includes(item.status));
+  ];
 }
+
+/**
+ * What ONE `listEgress` response says about OUR egress.
+ *
+ * There are THREE answers here, not two, and collapsing any pair of them is a
+ * defect:
+ *
+ *  1. `terminal`          — an item matching our `egressId` reached a terminal
+ *                           status. The only case that may act.
+ *  2. `identity_mismatch` — the response carried items but NONE of them is
+ *                           ours. That is the provider ignoring the
+ *                           `egressId` filter, a shape already observed on
+ *                           this provider with `limit`. Before this check,
+ *                           ANOTHER session's `EGRESS_FAILED` would satisfy
+ *                           the old unfiltered `find` and latch OUR row to
+ *                           `'failed'` permanently.
+ *  3. `not_terminal`      — either an empty response (filter honoured, not
+ *                           terminal yet) or our item in a live state. This
+ *                           is the ordinary healthy path and must stay
+ *                           `poll_timeout`; recording it as a mismatch would
+ *                           burn the attempt budget of every in-flight
+ *                           session.
+ */
+export type EgressIdentityProbe =
+  | { outcome: 'terminal'; info: EgressInfo }
+  | { outcome: 'identity_mismatch' }
+  | { outcome: 'not_terminal' };
+
+export function probeEgressIdentity(
+  items: readonly EgressInfo[] | null | undefined,
+  egressId: string,
+): EgressIdentityProbe {
+  if (!items || items.length === 0) return { outcome: 'not_terminal' };
+  const mine = items.find((item) => item.egressId === egressId);
+  // Case 2: a non-empty answer that is not about us.
+  if (!mine) return { outcome: 'identity_mismatch' };
+  return terminalEgressStatuses().includes(mine.status)
+    ? { outcome: 'terminal', info: mine }
+    : { outcome: 'not_terminal' };
+}
+
+/** Result of polling for OUR egress to reach a terminal state. */
+type TerminalEgressWait =
+  | { kind: 'terminal'; info: EgressInfo }
+  | { kind: 'timeout'; sawIdentityMismatch: boolean };
 
 async function waitForTerminalEgress(
   client: EgressClientLike,
   egressId: string,
   wait: (ms: number) => Promise<void>,
-): Promise<EgressInfo | undefined> {
+): Promise<TerminalEgressWait> {
   const deadline = Date.now() + env.recordingEgressFinalizeTimeoutMs;
+  let sawIdentityMismatch = false;
   while (Date.now() < deadline) {
     const items = await client.listEgress({ egressId });
-    const terminal = terminalEgressInfo(items);
-    if (terminal) return terminal;
+    const probe = probeEgressIdentity(items, egressId);
+    if (probe.outcome === 'terminal') return { kind: 'terminal', info: probe.info };
+    // A mismatch is NOT a reason to stop polling — the next response may be
+    // correctly filtered — but it must not be forgotten either, because it is
+    // the difference between "still flushing" and "the filter is being
+    // ignored and we are reading someone else's egress".
+    if (probe.outcome === 'identity_mismatch') sawIdentityMismatch = true;
     await wait(500);
   }
-  return undefined;
+  return { kind: 'timeout', sawIdentityMismatch };
 }
 
 export async function finalizeAuthoritativeRecording(
@@ -232,12 +426,26 @@ export async function finalizeAuthoritativeRecording(
     return session.recording_object_key ? 'ready' : 'fallback_required';
   }
 
+  const maxAttempts = env.recordingFinalizeMaxAttempts;
+  const defer = async (reason: RecordingFinalizeDeferReason): Promise<'pending'> => {
+    await recordFinalizeDeferral(db, sessionId, reason, maxAttempts);
+    return 'pending';
+  };
+
   const client = deps.client ?? egressClient();
   const egressId = String(session.recording_egress_id);
   await client.stopEgress(egressId).catch(() => undefined);
-  const info = await waitForTerminalEgress(client, egressId, deps.sleep ?? sleep);
-  if (!info) return 'pending';
+  const waited = await waitForTerminalEgress(client, egressId, deps.sleep ?? sleep);
+  if (waited.kind === 'timeout') {
+    // Three-way, per `probeEgressIdentity`: a response that carried items but
+    // none of ours is a DIFFERENT fact from a quiet, correctly-filtered wait.
+    return defer(waited.sawIdentityMismatch ? 'egress_identity_mismatch' : 'poll_timeout');
+  }
+  const info = waited.info;
   if (info.status !== EgressStatus.EGRESS_COMPLETE) {
+    // Genuine PROVIDER evidence about OUR egress (FAILED / ABORTED /
+    // LIMIT_REACHED). This may latch: the provider has spoken about this
+    // egress and retrying cannot change its answer.
     await db.from('call_sessions').update({ recording_egress_status: 'failed' }).eq('id', sessionId);
     return 'fallback_required';
   }
@@ -246,9 +454,27 @@ export async function finalizeAuthoritativeRecording(
   const { data: object, error: downloadError } = await db.storage
     .from(env.recordingsBucket)
     .download(objectKey);
-  if (downloadError || !object) return 'pending';
+  if (downloadError) return defer('object_unreadable');
+  if (!object) return defer('object_absent');
   const bytes = Buffer.from(await object.arrayBuffer());
-  if (bytes.length === 0 || bytes.length > env.recordingMaxBytes) {
+  // ── The latch split ──────────────────────────────────────────────────
+  // A ZERO-BYTE download is evidence about STORAGE, not about the egress: a
+  // transient S3 5xx, an eventually-consistent read, or a finalize racing the
+  // object's own write all produce it, and latching `'failed'` on it turned a
+  // recoverable moment into permanent loss of a recording that exists.
+  // It becomes a deferral.
+  //
+  // OVERSIZE keeps latching. An object larger than `recordingMaxBytes` is a
+  // DETERMINISTIC property of the bytes that will not improve with retries,
+  // and deferring it would burn the whole attempt budget for nothing.
+  //
+  // This is a deliberate weakening of a one-way door, and it ships in the same
+  // change as its mitigation: the deferral is bounded by
+  // `RECORDING_FINALIZE_MAX_ATTEMPTS` and terminated by
+  // `recording_finalize_exhausted_at`, and `reopen_recording_finalize` is the
+  // audited way back for anything that did latch.
+  if (bytes.length === 0) return defer('object_unreadable');
+  if (bytes.length > env.recordingMaxBytes) {
     await db.from('call_sessions').update({ recording_egress_status: 'failed' }).eq('id', sessionId);
     return 'fallback_required';
   }
@@ -284,7 +510,8 @@ export async function finalizeAuthoritativeRecording(
       .select('recording_object_key')
       .eq('id', sessionId)
       .single();
-    return current?.recording_object_key ? 'ready' : 'pending';
+    if (current?.recording_object_key) return 'ready';
+    return defer('provenance_conflict');
   }
   if (rpcStatus !== 'ok') {
     if (rpcStatus === 'terminal_state') {
@@ -295,12 +522,20 @@ export async function finalizeAuthoritativeRecording(
         .select('recording_object_key')
         .eq('id', sessionId)
         .single();
-      return current?.recording_object_key ? 'ready' : 'pending';
+      if (current?.recording_object_key) return 'ready';
+      return defer('terminal_state');
     }
     if (rpcStatus === 'no_egress') return 'fallback_required';
-    return 'pending';
+    return defer('rpc_unknown');
   }
 
-  await db.from('call_sessions').update({ recording_egress_status: 'complete' }).eq('id', sessionId);
+  // Clear the deferral marker on the way out: a converged session that still
+  // carried a stale `poll_timeout` would be counted by the health surface as a
+  // session still waiting, which is the same class of untruth this change
+  // exists to remove.
+  await db.from('call_sessions').update({
+    recording_egress_status: 'complete',
+    recording_finalize_defer_reason: null,
+  }).eq('id', sessionId);
   return 'ready';
 }

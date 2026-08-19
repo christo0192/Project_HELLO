@@ -72,6 +72,13 @@ export type TerminalReason =
   | 'assessment_error'
   | 'shutdown_forced'
   | 'drain_timeout'
+  // 0038: the voice worker's bounded room-residency cap. Its own code
+  // because a residency timeout is NOT a crash — the worker was alive and
+  // the close event never fired. This member, persistence.py's
+  // _FAILED_REASONS, and the 0006/0038 chk_call_sessions_terminal_reason
+  // CHECK are ONE cross-layer contract: move all three or none, and
+  // parity-terminal-reasons.test.ts enforces exactly that.
+  | 'residency_timeout'
   // cancelled
   | 'recruiter_cancelled'
   | 'migrated_abandoned'
@@ -109,7 +116,8 @@ export const VALID_REASONS_FOR_STATUS: Readonly<
 > = {
   completed: new Set(['conversation_complete', 'assessment_done']),
   failed: new Set(['room_create_error', 'worker_crash', 'provider_error',
-    'assessment_error', 'shutdown_forced', 'drain_timeout']),
+    'assessment_error', 'shutdown_forced', 'drain_timeout',
+    'residency_timeout']),
   cancelled: new Set(['recruiter_cancelled', 'migrated_abandoned',
     'duplicate_session', 'shutdown_drain']),
   expired: new Set(['idle_timeout', 'grace_timeout']),

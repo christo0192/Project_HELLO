@@ -1215,6 +1215,32 @@ paths:
                 $ref: '#/components/schemas/SimpleError'
 
   # ── Recordings ─────────────────────────────────────────────────────
+  /api/recordings/health:
+    get:
+      tags: [recordings]
+      operationId: recordingFinalizeHealth
+      summary: Recording-finalization convergence health (admin only)
+      description: Operator surface for authoritative-recording convergence (migration 0038). Reports the IN-PROCESS scheduler heartbeat and the DURABLE, multi-machine-safe backlog read live from the database — never derived from metric counters, whose sink is a no-op by default and would report a confident zero. queueDepth and oldestQueuedAgeSec are included because stuckCount alone cannot separate "converging slowly" from "not converging" - the sweeper's three bounds all bound the producer. A backlog read failure surfaces as degraded with reason backlog_unavailable, never as a healthy zero. Registered BEFORE any parameterised GET so it can never be shadowed, and routed to the DEFAULT rate-limit bucket rather than the strict one, so a throttled poll returns HTTP 429 which clients MUST NOT interpret as degraded. The response carries booleans, bounded integers, timestamps and sanitized codes only - no session id, object key, URL, or token.
+      responses:
+        '200':
+          description: Convergence health snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordingFinalizeHealth'
+        '403':
+          description: Caller is not an admin.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '429':
+          description: Poll rate exceeded. NOT a health signal — retry, do not report degraded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
   /api/recordings/{sessionId}/download:
     parameters:
       - name: sessionId
@@ -4093,6 +4119,115 @@ components:
       additionalProperties: false
 
     # ── Recordings ───────────────────────────────────────────────────
+    # 0038: recording-finalization convergence health (admin-only surface).
+    RecordingFinalizeHealth:
+      type: object
+      required: [worker, halt, backlog, degraded, reasons]
+      properties:
+        worker:
+          type: object
+          description: IN-PROCESS scheduler heartbeat. `enabled=false` means THIS process has no runtime — never a fleet-wide claim.
+          required: [enabled, running, loops]
+          properties:
+            enabled:
+              type: boolean
+            running:
+              type: boolean
+            loops:
+              type: array
+              items:
+                type: object
+                required: [name, running, lastTickAt, ticks, errors, consecutiveErrors, stale]
+                properties:
+                  name:
+                    type: string
+                    enum: [recording-finalize, recording-sweep, recording-reclaim, recording-reap]
+                  running:
+                    type: boolean
+                  lastTickAt:
+                    type: string
+                    format: date-time
+                    nullable: true
+                  ticks:
+                    type: integer
+                  errors:
+                    type: integer
+                  consecutiveErrors:
+                    type: integer
+                  stale:
+                    type: boolean
+              additionalProperties: false
+          additionalProperties: false
+        halt:
+          type: object
+          nullable: true
+          description: Operator kill switch. Null when this process has no runtime to read it through.
+          required: [halted, reason, since, degraded]
+          properties:
+            halted:
+              type: boolean
+            reason:
+              type: string
+              nullable: true
+              enum: [operator_pause, storage_incident, provider_incident, backlog_control]
+            since:
+              type: string
+              format: date-time
+              nullable: true
+            degraded:
+              type: boolean
+              description: True when the flag could not be read and a cached or fail-open answer was served.
+          additionalProperties: false
+        backlog:
+          type: object
+          nullable: true
+          description: DURABLE, multi-machine-safe counts read live from the database. Null means the read FAILED — never that the backlog is empty.
+          required: [stuckCount, oldestStuckAgeSec, exhaustedCount, deferredByReason, queueDepth, oldestScheduledAt, oldestQueuedAgeSec, dlqDepth]
+          properties:
+            stuckCount:
+              type: integer
+            oldestStuckAgeSec:
+              type: integer
+              nullable: true
+            exhaustedCount:
+              type: integer
+              description: Sessions that spent their deferral budget and stopped being swept. Any non-zero value needs a human decision.
+            deferredByReason:
+              type: object
+              description: Per-reason counts, keyed by the bounded 0038 defer-reason allowlist.
+              additionalProperties:
+                type: integer
+            queueDepth:
+              type: integer
+              description: Live recording.finalize jobs. Without this, "converging slowly" and "not converging" look identical.
+            oldestScheduledAt:
+              type: string
+              format: date-time
+              nullable: true
+            oldestQueuedAgeSec:
+              type: integer
+              nullable: true
+            dlqDepth:
+              type: integer
+          additionalProperties: false
+        degraded:
+          type: boolean
+        reasons:
+          type: array
+          description: Sanitized codes only.
+          items:
+            type: string
+            enum:
+              - sweep_halted
+              - halt_flag_unavailable
+              - backlog_unavailable
+              - finalize_exhausted
+              - stuck_backlog_aging
+              - queue_not_draining
+              - finalize_dead_lettered
+              - loop_stale
+      additionalProperties: false
+
     RecordingDownloadResponse:
       type: object
       required: [url]

@@ -41,6 +41,7 @@ import {
 } from '../lib/recording-integrity.js';
 import { getCorrelationId } from '../lib/correlation.js';
 import { finalizeAuthoritativeRecording } from '../lib/recording-egress.js';
+import { readRecordingHealth } from '../lib/recording/health.js';
 
 // ── LANE L6 (REC-01 buildable half) — pinned constants ──────────────
 // LiveKit Egress MP3 primary path is external-pending (runbook); this is
@@ -102,6 +103,32 @@ async function reverifyRecordingIntegrity(
 }
 
 export const recordingsRouter = Router();
+
+// ── GET /api/recordings/health ───────────────────────────────────────
+// 0038: the operator surface for authoritative-recording convergence.
+//
+// Registered FIRST, before any parameterised GET, so a future `GET /:id`
+// cannot shadow it. (`/:sessionId/download` is two segments and could not
+// shadow it today, and `validateParams` would 400 a non-UUID anyway — the
+// order is nonetheless made explicit rather than left to luck.)
+//
+// Admin-only. Everything it returns is a boolean, a bounded integer, a
+// timestamp, or a sanitized code: no session id, object key, URL, or token.
+//
+// RATE LIMITING (app.ts): `/api/recordings` sits behind the STRICT, user-keyed
+// bucket (20 requests/window), which an ops poller on a tight interval would
+// exhaust — and a throttled read would then be indistinguishable from
+// `backlog_unavailable`. This path is therefore routed to the DEFAULT bucket
+// instead, and an over-limit caller receives a plain HTTP 429, which the
+// client contract treats as "ask again", never as `degraded`.
+recordingsRouter.get('/health', requireRole('admin'), async (_req, res, next) => {
+  try {
+    const health = await readRecordingHealth(supabase as never);
+    return res.json(health);
+  } catch (error) {
+    next(error);
+  }
+});
 
 // ── GET /api/recordings/:sessionId/download ──────────────────────────
 // MIG-06: Recruiter on-demand recording download.
