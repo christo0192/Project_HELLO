@@ -417,7 +417,11 @@ describe('B1 - an unfinished ingestion never consumes the delivery budget', () =
    */
   it('120 consecutive polls against a queued ingestion produce ZERO failures', async () => {
     const fail = vi.fn(async () => ({ outcome: 'retry' as const }));
-    const defer = vi.fn(async () => 'ok' as const);
+    // Parameters are declared so the recorded calls are a typed 4-tuple: the
+    // delay argument is asserted below, and a zero-arg mock records `[]`.
+    const defer = vi.fn(
+      async (_id: string, _lease: string, _reason: string, _delaySeconds: number) => 'ok' as const,
+    );
     for (let i = 0; i < 120; i++) {
       const r = await runClaimedAshbyOperation(
         operationDeps({
