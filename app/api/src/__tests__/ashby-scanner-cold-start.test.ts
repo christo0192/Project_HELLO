@@ -237,8 +237,11 @@ describe('post-claim scanner race', () => {
 
     const result = await handlers[ASHBY_INGESTION_QUEUE](job());
 
+    // Normalised to the `scanner_` vocabulary the health filter counts — NOT
+    // the `scan_`-prefixed form the ingestion orchestrator produces, which is
+    // invisible to `readBacklog`'s `defer_reason LIKE 'scanner%'`.
     expect(result).toMatchObject({
-      outcome: 'defer', reasonCode: 'scan_scanner_signatures_unavailable', delaySeconds: 300,
+      outcome: 'defer', reasonCode: 'scanner_signatures_unavailable', delaySeconds: 300,
     });
     // The row went back to `queued` (0037 retry edge) and carries NO failure.
     // `fetching` appears twice: the handler leaves `queued` before touching the

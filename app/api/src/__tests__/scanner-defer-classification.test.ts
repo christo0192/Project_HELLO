@@ -265,6 +265,31 @@ describe('checkScannerReadiness', () => {
     expect(scannerDeferReason(null)).toBe(READINESS_NOT_READY_REASON);
     expect(scannerDeferReason('Provider said: /var/lib/clamav missing')).toBe(READINESS_NOT_READY_REASON);
   });
+
+  it('normalises BOTH deferral vocabularies onto one durable prefix', () => {
+    // The gate starts from a SignatureReason, the post-scan path from a
+    // ScanResult.status that the ingestion orchestrator has already wrapped as
+    // `scan_…`. Two mints meant half of them never matched the `scanner%`
+    // health filter; one mint means the same condition is the same string
+    // whichever site observed it.
+    expect(scannerDeferReason('scan_scanner_busy')).toBe('scanner_busy');
+    expect(scannerDeferReason('scan_scanner_signatures_unavailable'))
+      .toBe('scanner_signatures_unavailable');
+    expect(scannerDeferReason('scanner_busy')).toBe(scannerDeferReason('scan_scanner_busy'));
+    // Only the scanner family is unwrapped — an unrelated `scan_` reason is
+    // not silently re-labelled as a scanner problem.
+    expect(scannerDeferReason('scan_infected')).toBe('scanner_scan_infected');
+  });
+
+  it('REJECTS an over-long reason instead of truncating it into a valid-looking code', () => {
+    // Truncate-then-validate would mint a plausible prefix of something we
+    // cannot vouch for — the opposite of the fail-closed intent.
+    expect(scannerDeferReason('signatures_'.padEnd(200, 'x'))).toBe(READINESS_NOT_READY_REASON);
+    // A code exactly at the bound is still accepted.
+    const atBound = `scanner_${'a'.repeat(64 - 'scanner_'.length)}`;
+    expect(atBound.length).toBe(64);
+    expect(scannerDeferReason(atBound)).toBe(atBound);
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════

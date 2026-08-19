@@ -6464,6 +6464,7 @@ declare
   v_res    text;
   v_row    screening_v2.job_queue%rowtype;
   v_at     timestamptz;
+  v_first_wait timestamptz;
   v_now    timestamptz := now();
 begin
   -- ── deferral refunds exactly the claim's attempt ─────────────────────
@@ -6494,6 +6495,7 @@ begin
     'a deferred job must not look failed');
 
   -- ── a deferral can never dead-letter, even at max_attempts ───────────
+  v_first_wait := v_row.deferred_at;
   for i in 1..5 loop
     select lease_token into v_tok
       from screening_v2.claim_job('pol37.queue', v_row.scheduled_at + interval '1 second', 30, 'pol37-worker');
@@ -6505,8 +6507,24 @@ begin
     v_row.status = 'delayed' and v_row.attempts = 0
       and not exists (select 1 from screening_v2.job_dlq where id = v_job),
     'got status=' || v_row.status || ' attempts=' || v_row.attempts);
+  -- The COUNT alone does not test this claim: a job deferred every 45 seconds
+  -- for an hour must report an hour of waiting, not 45 seconds of it, or
+  -- "oldest scanner deferral" measures the last poll instead of the outage.
   perform _policy_tests.assert('ashby 0037: the wait start survives a repeating reason',
-    v_row.defer_count = 6, 'got defer_count=' || v_row.defer_count);
+    v_row.defer_count = 6 and v_row.deferred_at = v_first_wait,
+    'got defer_count=' || v_row.defer_count
+      || ' deferred_at=' || coalesce(v_row.deferred_at::text,'null')
+      || ' expected deferred_at=' || coalesce(v_first_wait::text,'null'));
+
+  -- ...and a CHANGED reason restarts the clock, because it is a different wait.
+  select lease_token into v_tok
+    from screening_v2.claim_job('pol37.queue', v_row.scheduled_at + interval '1 second', 30, 'pol37-worker');
+  v_at := v_row.scheduled_at + interval '1 second';
+  v_res := screening_v2.defer_job(v_job, v_tok, 'scanner_busy', 1, v_at);
+  select * into v_row from screening_v2.job_queue where id = v_job;
+  perform _policy_tests.assert('ashby 0037: a changed reason restarts the wait clock',
+    v_row.deferred_at = v_at and v_row.deferred_at <> v_first_wait,
+    'got ' || coalesce(v_row.deferred_at::text,'null'));
 
   -- ── CAS: a wrong token mutates nothing ───────────────────────────────
   select lease_token into v_tok

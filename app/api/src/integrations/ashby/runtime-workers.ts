@@ -44,7 +44,11 @@ import {
 } from './signal-worker.js';
 import { runImport, runIngestionJob } from './orchestration.js';
 import { publishReconcilePass } from './runtime-health.js';
-import { checkScannerReadiness, type ScannerGateVerdict } from './scanner-readiness.js';
+import {
+  checkScannerReadiness,
+  scannerDeferReason,
+  type ScannerGateVerdict,
+} from './scanner-readiness.js';
 import { runReconciliation, DEFAULT_CHECKPOINT_KEY } from './reconciliation.js';
 import type { ReconcileResult, ReconcileSkipCounts, ReconcileStop } from './reconciliation.js';
 import { runClaimedAshbyOperation } from './operation-worker.js';
@@ -200,15 +204,6 @@ export function deferSecondsFor(scanStatus: string): number {
   return KNOWN_TRANSIENT.has(scanStatus)
     ? DEFER_SECONDS_BY_CLASS.transient
     : DEFER_SECONDS_BY_CLASS.availability;
-}
-
-/**
- * Bound and shape-check an ingestion deferral reason for the queue's durable
- * `defer_reason` column, on the SAME allowlist the 0037 RPC enforces.
- */
-export function scannerDeferReasonCode(reason: string): string {
-  const code = reason.slice(0, 64);
-  return /^[a-z0-9_.:-]{1,64}$/.test(code) ? code : 'scanner_not_ready';
 }
 
 /** Sanitized, bounded durable reason for a failed ingestion. Never PII. */
@@ -474,7 +469,12 @@ export function buildAshbyHandlers(
       // the resume, so the row must not be written off. It returns to `queued`
       // (0037 retry edge) and the queue job defers with its attempt refunded.
       if (result.status === 'done' && result.outcome.state === 'deferred') {
-        const reason = scannerDeferReasonCode(result.outcome.reason);
+        // Normalised through the SAME minting function the readiness gate
+        // uses, so both deferral classes land in one durable vocabulary and
+        // the `scanner%` health filter sees all of them. Minting a reason
+        // locally here is exactly how the post-scan class became invisible to
+        // the counter added for it.
+        const reason = scannerDeferReason(result.outcome.scanStatus);
 
         // BOUND. Derived from the job's own creation, so it resets with every
         // new enqueue and needs no counter with a reset lifecycle. Past it,

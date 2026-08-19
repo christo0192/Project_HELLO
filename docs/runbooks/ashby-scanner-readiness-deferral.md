@@ -166,18 +166,37 @@ exists to prevent.
 | `ASHBY_SCANNER_READINESS_TIMEOUT_MS` | `2000` | Bound on the freshness read on the poll path |
 | `ASHBY_SCANNER_DEFER_DEADLINE_MS` | `28800000` | Wall-clock bound before a deferral becomes a loud failure |
 
-All are clamped; malformed input takes the default.
+All are clamped; malformed input takes the default. All three are echoed back
+on `/health` under `runtime`, so the values actually in force can be read
+without inspecting the deployment.
+
+Note the deadline applies to the **post-scan** deferral. The handler-entry gate
+and the pre-claim hold are bounded by the gate itself — it stops admitting, and
+the three loud signals below are what surface a scanner that never returns.
 
 ---
 
 ## 4. Reading `/api/ashby/mission-control/health`
 
 * `scanner.mode` / `.ready` / `.signatureAgeSec` / `.reason` — unchanged.
-* `backlog.scannerDeferredJobs` — jobs currently deferred on the scanner
-  (post-claim races only; the common cold-boot case never claims).
-* `backlog.scannerDeferredOldestAgeSec` — longest uninterrupted wait. Minutes
-  is a cold boot; an hour is an updater that never came back.
+* `backlog.scannerDeferredJobs` — jobs currently deferred on the scanner. This
+  covers **both** deferral sites: the handler-entry gate and the post-scan
+  race. It does **not** cover the common cold-boot case, which never claims at
+  all — that one shows up as `pending` depth, not as a deferral.
+* `backlog.scannerDeferredOldestAgeSec` — longest **uninterrupted** wait,
+  measured from the start of the streak rather than the last poll (a job
+  deferred every 45 s for an hour reports an hour). Minutes is a cold boot; an
+  hour is an updater that never came back.
 * `reasons` gains `scanner_deferral_stalled` past 900 s.
+
+Both sites mint their reason through one function (`scannerDeferReason`), so
+every scanner deferral is a `scanner_…` code and the health filter
+(`defer_reason LIKE 'scanner%'`) sees all of them. That is load-bearing, not
+cosmetic: when the post-scan path minted its own `scan_scanner_…` string, the
+counter and the degrade reason added for exactly that class could never fire
+for it, and every unit test on both sides still passed. `ashby-backlog-defer-seam.test.ts`
+now crosses that seam — it feeds whatever the real handler returns into the
+real `readBacklog`, and asserts a mismatched prefix would be counted as 0.
 
 **A permanent scanner outage is deliberately still loud.** With the admission
 gate holding jobs `pending`, three independent signals fire and none is
@@ -253,9 +272,12 @@ backlog.operationsBlockedFailedIngestion → 0
 backlog.ingestionStuckQueued            → 0
 ```
 
-If it defers instead, `backlog.scannerDeferredJobs` becomes 1 and
-`scannerDeferredOldestAgeSec` starts climbing — that is the scanner, not the
-row.
+If it defers instead — the scanner went unready between the claim and the scan
+— `backlog.scannerDeferredJobs` becomes 1 and `scannerDeferredOldestAgeSec`
+starts climbing. That is the scanner, not the row. If instead the job is never
+claimed (the scanner was already unready at poll time), nothing appears in the
+deferral counters at all: look at `queuePending` / `oldestPendingAgeSec` and at
+`scanner.reason`.
 
 ---
 

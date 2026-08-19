@@ -136,9 +136,14 @@ export const RUNTIME_BOUNDS = {
    */
   scannerDeferSeconds: { def: 45, min: 5, max: 600 },
   /**
-   * Bound on the worker-side scanner readiness read. Must stay well inside
-   * the smallest lease (5s) so a slow capability probe can never cost a job
-   * its claim: an unanswered read defers rather than blocking.
+   * Bound on the worker-side scanner readiness read.
+   *
+   * The DEFAULT (2s) sits well inside even the smallest lease (5s), so the
+   * gate cannot cost a job its claim. The MAXIMUM deliberately exceeds that
+   * lease: the gate's dominant caller is the PRE-claim admission check, which
+   * holds no lease at all, and on the post-claim path an unanswered read
+   * DEFERS rather than blocking — so raising this trades pickup latency, not
+   * lease safety. Read as: the bound is generous, the default is safe.
    */
   scannerReadinessTimeoutMs: { def: 2_000, min: 250, max: 15_000 },
   /**
@@ -361,6 +366,8 @@ export function describeAshbyRuntime(
   reclaimIntervalMs: number;
   leaseSeconds: number;
   scannerDeferSeconds: number;
+  scannerReadinessTimeoutMs: number;
+  scannerDeferDeadlineMs: number;
   reconcileSweepIntervalMs: number;
   reconcileAnchorDisabled: boolean;
 } {
@@ -375,7 +382,12 @@ export function describeAshbyRuntime(
     reconcileIntervalMs: runtime.reconcileIntervalMs,
     reclaimIntervalMs: runtime.reclaimIntervalMs,
     leaseSeconds: runtime.leaseSeconds,
+    // All three scanner knobs, not one of three: a tunable an operator cannot
+    // read back from /health is a tunable they have to guess at while
+    // diagnosing the exact outage it governs.
     scannerDeferSeconds: runtime.scannerDeferSeconds,
+    scannerReadinessTimeoutMs: runtime.scannerReadinessTimeoutMs,
+    scannerDeferDeadlineMs: runtime.scannerDeferDeadlineMs,
     reconcileSweepIntervalMs: runtime.reconcileSweepIntervalMs,
     reconcileAnchorDisabled: runtime.reconcileAnchorDisabled,
   };

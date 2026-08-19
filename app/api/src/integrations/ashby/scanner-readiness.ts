@@ -77,18 +77,36 @@ export interface ScannerGateOptions {
 }
 
 /**
- * Turn a freshness reason into a bounded, sanitized deferral code.
+ * Normalise ANY scanner-shaped reason into the single durable vocabulary the
+ * health surface filters on: `scanner_…`.
  *
- * The signature reasons are already stable snake_case tokens
- * (`signatures_missing`, `signatures_stale`, …). They are namespaced so a
- * queue-level reason always names WHICH prerequisite is missing, and
- * shape-checked against the same allowlist the queue and the 0037 RPC
- * enforce — an unrecognised token degrades to a fixed code rather than
- * reaching a durable column.
+ * THIS IS THE ONLY PLACE A SCANNER DEFERRAL REASON IS MINTED, and that is the
+ * point. There are two deferral sites — the readiness gate (which starts from
+ * a `SignatureReason` like `signatures_missing`) and the post-scan race (which
+ * starts from a `ScanResult.status` like `scanner_busy`, wrapped by the
+ * ingestion orchestrator as `scan_scanner_busy`). When each site minted its own
+ * string, half of them never matched the `scanner%` filter in `readBacklog`,
+ * so the counter and the degrade reason this repair added for the post-scan
+ * class could never fire for it. Both inputs now converge here:
+ *
+ *     signatures_missing            → scanner_signatures_missing
+ *     scanner_busy                  → scanner_busy
+ *     scan_scanner_busy             → scanner_busy
+ *     scan_scanner_signatures_stale → scanner_signatures_stale
+ *
+ * A reason that does not shape-check degrades to a fixed code. Note the order:
+ * the length is REJECTED, not truncated. Truncating first would turn an
+ * over-long or malformed reason into a valid-LOOKING code, which is the
+ * opposite of the fail-closed intent — a code we cannot vouch for must become
+ * `scanner_not_ready`, not a plausible prefix of itself.
  */
 export function scannerDeferReason(reason: string | null | undefined): string {
   if (typeof reason !== 'string' || reason.length === 0) return READINESS_NOT_READY_REASON;
-  const code = (reason.startsWith('scanner_') ? reason : `scanner_${reason}`).slice(0, 64);
+  // The ingestion orchestrator prefixes every scan outcome with `scan_`; strip
+  // it so a scan-time reason and a gate-time reason for the SAME condition are
+  // the same durable string.
+  const bare = reason.startsWith('scan_scanner') ? reason.slice('scan_'.length) : reason;
+  const code = bare.startsWith('scanner_') ? bare : `scanner_${bare}`;
   return /^[a-z0-9_.:-]{1,64}$/.test(code) ? code : READINESS_NOT_READY_REASON;
 }
 
