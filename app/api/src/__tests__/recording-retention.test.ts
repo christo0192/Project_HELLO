@@ -945,6 +945,73 @@ describe('0038 erasure: the manifest on the NORMAL, fully-linked path', () => {
     expect(details.manifest_removed).toBe(true);
   });
 
+  it('N-3: manifest_removed is FALSE when the manifest was not actually there', async () => {
+    // `storage.remove()` is contractually idempotent — it succeeds on an
+    // absent key — so "the call did not throw" is not evidence of a removal.
+    // That is exactly the pattern this change eliminates for
+    // `object_key_removed`; claiming it for `manifest_removed` would just move
+    // the overstatement to a quieter field.
+    mem.call_sessions.push({
+      id: EGRESS_SESSION_ID,
+      owner_id: 'admin-1',
+      recording_object_key: EGRESS_KEY,
+      recording_egress_id: 'EG_synthetic123',
+      recording_provenance: 'livekit_egress',
+      recording_sha256: 'b'.repeat(64),
+      recording_size_bytes: 2048,
+      recording_content_type: 'audio/ogg',
+      recording_quarantined: false,
+      recording_quarantine_reason: null,
+      recording_revoked_at: null,
+      recording_deleted_at: null,
+    });
+    // The recording is present; its manifest is NOT.
+    storageObjects.set(EGRESS_KEY, Buffer.from('audio'));
+    const storage = probingStorage();
+
+    const result = await eraseRecording(EGRESS_SESSION_ID, ACTOR_ID, { storage });
+
+    expect(result.status).toBe('completed');
+    const details = completionFor(EGRESS_SESSION_ID)[0].details as Record<string, unknown>;
+    expect(details.object_key_removed).toBe(true);
+    expect(details.manifest_removed).toBe(false);
+  });
+
+  it('N-3: an unprobeable manifest is reported as NOT removed, never as removed', async () => {
+    // "We could not look" is not "we removed it". The delete is still
+    // attempted (idempotent, and the manifest almost certainly exists), but
+    // the audit does not claim what was not observed.
+    mem.call_sessions.push({
+      id: EGRESS_SESSION_ID,
+      owner_id: 'admin-1',
+      recording_object_key: EGRESS_KEY,
+      recording_egress_id: 'EG_synthetic123',
+      recording_provenance: 'livekit_egress',
+      recording_sha256: 'b'.repeat(64),
+      recording_size_bytes: 2048,
+      recording_content_type: 'audio/ogg',
+      recording_quarantined: false,
+      recording_quarantine_reason: null,
+      recording_revoked_at: null,
+      recording_deleted_at: null,
+    });
+    storageObjects.set(EGRESS_KEY, Buffer.from('audio'));
+    storageObjects.set(EGRESS_MANIFEST, Buffer.from('{}'));
+    const removed: string[] = [];
+    const blind: RecordingStorage = {
+      async remove(key: string): Promise<void> { removed.push(key); storageObjects.delete(key); },
+    };
+
+    const result = await eraseRecording(EGRESS_SESSION_ID, ACTOR_ID, { storage: blind });
+
+    expect(result.status).toBe('completed');
+    // The delete WAS attempted...
+    expect(removed).toEqual([EGRESS_KEY, EGRESS_MANIFEST]);
+    // ...but not claimed.
+    const details = completionFor(EGRESS_SESSION_ID)[0].details as Record<string, unknown>;
+    expect(details.manifest_removed).toBe(false);
+  });
+
   it('a BROWSER-upload key gets no manifest guess — a wrong key would be a quiet false success', async () => {
     seedSessionWithRecording();
     const storage = probingStorage();

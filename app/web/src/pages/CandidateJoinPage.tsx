@@ -197,9 +197,22 @@ export function CandidateJoinPage() {
   // that actually means "this page is going away". The residual cost is a
   // mobile browser that kills the tab without firing `pagehide`; that case
   // converges server-side like every other, which is the whole point.
+  //
+  // `pagehide` carries a NARROWER version of the same hazard, which is what
+  // `event.persisted` guards. When a page enters the back/forward cache — a
+  // mobile Safari app-switch, a back-navigation — `pagehide` fires with
+  // `persisted === true` and the page can be RESTORED later via `pageshow`.
+  // Ending the candidate's session on that would be the same defect as wiring
+  // `visibilitychange`, just rarer. A page holding a live WebRTC peer
+  // connection is normally ineligible for bfcache, so the realistic exposure is
+  // the window between the grant landing and the room connecting — small, but
+  // `unloadSignalSentRef` makes it unrecoverable, so it is guarded rather than
+  // reasoned away.
   const unloadSignalSentRef = useRef(false);
   useEffect(() => {
-    function sendCompletionSignal(): void {
+    function sendCompletionSignal(event: PageTransitionEvent): void {
+      // A bfcache freeze is not a page going away — it can come back.
+      if (event.persisted) return;
       if (unloadSignalSentRef.current) return;
       // If the ordinary finalization already started, it owns the outcome.
       if (finalizationPromiseRef.current) return;
@@ -211,9 +224,10 @@ export function CandidateJoinPage() {
       // there is no UI left to show a failure to.
       void api.completeCandidateScreening(sessionId, grantToken).catch(() => undefined);
     }
-    window.addEventListener('pagehide', sendCompletionSignal);
+    const listener = sendCompletionSignal as EventListener;
+    window.addEventListener('pagehide', listener);
     return () => {
-      window.removeEventListener('pagehide', sendCompletionSignal);
+      window.removeEventListener('pagehide', listener);
     };
   }, []);
 

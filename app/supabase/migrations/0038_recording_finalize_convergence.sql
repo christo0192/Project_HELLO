@@ -157,9 +157,14 @@ create index if not exists idx_call_sessions_recording_finalize_pending
     and recording_finalize_exhausted_at is null;
 
 comment on index screening_v2.idx_call_sessions_recording_finalize_pending is
-  'Serves the recording finalization sweeper. Predicate is the exact stuck '
-  'shape over the FULL 0006 terminal set; it must stay identical to the '
-  'sweeper query predicate in lib/recording/sweeper.ts.';
+  'Serves the recording finalization sweeper. Predicate is the stuck shape '
+  'over the FULL 0006 terminal set. The sweeper query in '
+  'lib/recording/sweeper.ts must remain a SUPERSET of this predicate — it '
+  'additionally excludes deleted/revoked/quarantined rows, which is why a '
+  'partial index narrower than the query would be unusable while a query '
+  'narrower than the index is served fine. Widening this index predicate, or '
+  'narrowing the query below it, would silently change which rows are '
+  'eligible.';
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- 3. enqueue_recording_finalize — the terminal-transition trigger

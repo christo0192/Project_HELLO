@@ -533,9 +533,16 @@ export async function finalizeAuthoritativeRecording(
   // carried a stale `poll_timeout` would be counted by the health surface as a
   // session still waiting, which is the same class of untruth this change
   // exists to remove.
+  // N-1: the TERMINUS is cleared here too, not only the defer reason. A session
+  // that exhausted its budget and later converged — most often through the
+  // recruiter play path — would otherwise keep counting toward
+  // `exhausted_count` forever, and `reopen_recording_finalize` cannot clear it
+  // for such a row because it refuses an already-linked key (`already_linked`).
+  // A converged recording is not waiting on a human.
   await db.from('call_sessions').update({
     recording_egress_status: 'complete',
     recording_finalize_defer_reason: null,
+    recording_finalize_exhausted_at: null,
   }).eq('id', sessionId);
   return 'ready';
 }

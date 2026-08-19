@@ -1005,10 +1005,24 @@ export async function eraseRecording(
     // derived when the linked key IS the egress key: a browser_upload object
     // has no manifest, and deleting a guessed sibling would be a second,
     // quieter false success.
+    //
+    // N-3: PROBE BEFORE CLAIMING. `storage.remove()` is contractually
+    // idempotent — it succeeds on an absent key — so "the call did not throw"
+    // is not evidence that anything was removed. That is precisely the
+    // pattern this change eliminates for `object_key_removed`; applying it to
+    // `manifest_removed` would just move the overstatement to a quieter
+    // field. When the interface offers no probe the answer is UNKNOWN, and an
+    // unknown must not be reported as a removal.
     if (objectKey === egressObjectKey(sessionId)) {
+      const manifestKey = egressManifestObjectKey(sessionId);
       try {
-        await storage.remove(egressManifestObjectKey(sessionId));
-        manifestRemoved = true;
+        const present = typeof storage.exists === 'function'
+          ? await storage.exists(manifestKey)
+          : null;
+        // `null` = could not look. Still attempt the delete (it is idempotent
+        // and the manifest almost certainly exists), but do not claim it.
+        if (present !== false) await storage.remove(manifestKey);
+        manifestRemoved = present === true;
       } catch {
         return failStorage();
       }

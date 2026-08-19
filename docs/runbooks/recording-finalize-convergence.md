@@ -168,6 +168,10 @@ cd app/api
 npx tsx scripts/repair/inspect-egress.ts --session-id=<uuid>
 ```
 
+It lives under `scripts/repair/` — beside `repoint-recording-to-egress.ts`,
+the other one-shot operator tool for this same subsystem — rather than in a new
+`scripts/ops/` directory, which nothing else in this repository uses.
+
 Read-only: `listEgress` plus one DB read. No `stopEgress`, no download, no URL,
 no token, no write. It prints the `EgressStatus` **enum name**, whether the
 returned item's `egressId` actually matches ours (the identity check, made

@@ -802,6 +802,40 @@ describe('health surface', () => {
     expect(backlog.deferredByReason.poll_timeout).toBe(0);
   });
 
+  it('N-1: exhausted_count means "still needs a human", not "ever exhausted"', async () => {
+    // This count drives `degraded` at a threshold of 1, so without a
+    // qualifying predicate it is a RATCHET: one historically exhausted row
+    // pins the surface to degraded forever. Worse, a row that converged
+    // through the recruiter play path could never clear it —
+    // `reopen_recording_finalize` refuses an already-linked key. An alarm that
+    // cannot be acknowledged trains operators to ignore it.
+    const { client } = makeDb({
+      call_sessions: [
+        // Still genuinely stuck and exhausted — this is the only one that counts.
+        stuckSession('needs-a-human', { recording_finalize_exhausted_at: ago(60) }),
+        // Exhausted, then CONVERGED (recruiter pressed play). Not a problem.
+        stuckSession('converged', {
+          recording_finalize_exhausted_at: ago(600),
+          recording_object_key: 'x-egress.ogg',
+          recording_egress_status: 'complete',
+        }),
+        // Exhausted, then ERASED. Not a problem.
+        stuckSession('erased', {
+          recording_finalize_exhausted_at: ago(600),
+          recording_deleted_at: ago(300),
+        }),
+        // Exhausted, then REVOKED. Not a problem.
+        stuckSession('revoked', {
+          recording_finalize_exhausted_at: ago(600),
+          recording_revoked_at: ago(300),
+        }),
+      ],
+    });
+
+    const backlog = await readRecordingBacklog(client, nowMs);
+    expect(backlog.exhaustedCount).toBe(1);
+  });
+
   it('a failed backlog read THROWS rather than reporting a confident zero', async () => {
     // `lib/metrics.ts` is a no-op sink by default, so a counter-derived gauge
     // would report zero — the most dangerous possible answer for a subsystem

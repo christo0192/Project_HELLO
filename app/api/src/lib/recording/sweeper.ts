@@ -85,7 +85,13 @@ export async function runRecordingSweep(options: SweeperOptions): Promise<SweepR
   const notBefore = new Date(nowMs - options.maxAgeSec * 1000).toISOString();
   const notAfter = new Date(nowMs - options.graceSec * 1000).toISOString();
 
-  // The predicate here and the 0038 partial index predicate are ONE contract.
+  // This predicate must remain a SUPERSET of the 0038 partial index predicate
+  // — not identical to it. It adds the deleted/revoked/quarantined exclusions
+  // that the index omits, which is fine (a query narrower than a partial index
+  // is still served by it) and deliberate (never re-drive a finished
+  // recording). Widening the index, or narrowing this query below the index,
+  // is what would break.
+  //
   // Note the full terminal set: `expired` is the reconciler's own repair for a
   // candidate who closed the tab, which is exactly the stuck population.
   //

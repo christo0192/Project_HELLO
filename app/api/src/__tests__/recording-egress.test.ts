@@ -241,6 +241,28 @@ describe('authoritative recording egress', () => {
     expect(result).toBe('fallback_required');
   });
 
+  // ── N-1: a successful finalize clears the TERMINUS, not just the reason ─
+  it('N-1: success clears recording_finalize_exhausted_at as well as the defer reason', async () => {
+    // A session that exhausted its deferral budget and later converged — most
+    // often through the recruiter play path — would otherwise keep counting
+    // toward the health surface's `exhausted_count` forever, and there would
+    // be NO way to clear it: `reopen_recording_finalize` refuses an
+    // already-linked key by design. A converged recording is not waiting on a
+    // human.
+    const { db, updates } = fakeDb([
+      { recording_object_key: null, recording_provenance: null, recording_egress_id: 'EG_synthetic123', recording_egress_status: 'active' },
+    ]);
+    const result = await finalizeAuthoritativeRecording('session', {
+      db, client: fakeClient(), sleep: async () => undefined,
+    });
+    expect(result).toBe('ready');
+    expect(updates).toContainEqual({
+      recording_egress_status: 'complete',
+      recording_finalize_defer_reason: null,
+      recording_finalize_exhausted_at: null,
+    });
+  });
+
   // ── T5 (0038, CHANGED BEHAVIOUR): zero bytes DEFERS, it does not latch ─
   // A zero-byte download is evidence about STORAGE, not about the egress. The
   // old behaviour latched `recording_egress_status = 'failed'` — a one-way

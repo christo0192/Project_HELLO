@@ -171,8 +171,19 @@ export async function readRecordingBacklog(
 ): Promise<RecordingBacklogView> {
   const [stuckCount, exhaustedCount, queueDepth, dlqDepth] = await Promise.all([
     countRows(client, 'call_sessions', stuckShape),
+    // N-1: this count is an OPS ALARM, so it must mean "still needs a human",
+    // not "ever exhausted". Without the qualifying predicate it is a RATCHET:
+    // `DEGRADE_THRESHOLDS.exhaustedCount` is 1, so a single historically
+    // exhausted row pins the surface to `degraded` forever — including rows
+    // that have since converged through the recruiter play path, or been
+    // erased or revoked. An alarm that cannot be acknowledged trains operators
+    // to ignore `degraded`, which is the opposite of this surface's purpose.
+    // `deferredByReason` already scopes itself the same way.
     countRows(client, 'call_sessions', (q) =>
-      q.not('recording_finalize_exhausted_at', 'is', null)),
+      q.not('recording_finalize_exhausted_at', 'is', null)
+       .is('recording_object_key', null)
+       .is('recording_deleted_at', null)
+       .is('recording_revoked_at', null)),
     countRows(client, 'job_queue', (q) =>
       q.eq('name', RECORDING_FINALIZE_QUEUE).in('status', ['pending', 'active', 'delayed'])),
     countRows(client, 'job_dlq', (q) => q.eq('name', RECORDING_FINALIZE_QUEUE)),

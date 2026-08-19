@@ -136,8 +136,11 @@ export const env = {
    *
    * At the runner's default of 2 the sweeper would enqueue 4 rows/min against
    * a 2 rows/min drain and the backlog would grow while the sweep ran.
-   * `assertDrainInvariant` in lib/recording/config.ts enforces this at
-   * construction, and a test asserts it at the defaults.
+   * `effectiveSweepAdmission` in lib/recording/config.ts enforces this at
+   * construction — it CLAMPS admission to the drain capacity and logs the
+   * clamp rather than refusing to start, because degrading a rate is right
+   * where refusing to start a convergence subsystem is not. A test asserts
+   * both the invariant at the defaults and the clamp above them.
    */
   recordingFinalizeConcurrency: positiveInt('RECORDING_FINALIZE_CONCURRENCY', 4, 1, 32),
   /** Rows the sweeper may enqueue per tick. The first bound on a cold backlog. */
