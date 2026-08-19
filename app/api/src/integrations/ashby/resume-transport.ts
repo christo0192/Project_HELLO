@@ -25,10 +25,15 @@
  * FAILOVER. A hostname behind a CDN resolves to many A/AAAA records and any one
  * of them can be black-holed. The transport walks a bounded, ordered set of the
  * already-validated pinned addresses, but ONLY while the failure is a
- * connect/TLS/socket error raised before a response begins. Once the server has
- * answered — any status, any byte of body — the attempt is final: replaying a
- * one-shot presigned GET after it has been served is neither safe nor useful.
- * The whole sequence shares the caller's single wall-clock budget.
+ * connect/TLS/socket error, or a connect that never answers within the
+ * per-attempt sub-budget (see {@link DEFAULT_CONNECT_TIMEOUT_MS} — an address
+ * that silently drops packets raises no error at all, so an error-only trigger
+ * would miss the very failure failover exists for), and ONLY before a response
+ * begins. Once the server has answered — any status, any byte of body — the
+ * attempt is final: replaying a one-shot presigned GET after it has been served
+ * is neither safe nor useful. The whole sequence shares the caller's single
+ * wall-clock budget, which always outranks the sub-budget, so failover can make
+ * a fetch finish sooner but never later.
  */
 
 import https from 'node:https';
@@ -162,6 +167,12 @@ export interface PinnedTransportOptions {
   /** Cap on the number of pinned IPs to actually attempt (defense-in-depth). */
   maxPinnedIps?: number;
   /**
+   * Per-attempt budget for REACHING an address, in ms. See
+   * {@link DEFAULT_CONNECT_TIMEOUT_MS}. Clamped to the caller's remaining
+   * wall clock, which always wins.
+   */
+  connectTimeoutMs?: number;
+  /**
    * Override the `https.request` implementation. Test/rehearsal seam only —
    * production leaves it unset and gets `node:https`.
    */
@@ -177,6 +188,29 @@ interface AttemptOutcome {
 const DEFAULT_MAX_PINNED_IPS = 4;
 
 /**
+ * Per-attempt budget for REACHING an address (TCP + TLS), in ms.
+ *
+ * Without this, failover only ever helps an address that actively refuses,
+ * resets, or fails TLS — because those raise a socket `error`. The textbook
+ * CDN failure is the opposite: a black-holed A-record that silently DROPS
+ * packets, which produces no error at all, just silence. Under a single
+ * whole-fetch timeout that address eats the entire budget and the second
+ * pinned IP is never tried, so failover would be useless in exactly the case
+ * it exists for.
+ *
+ * A connect that neither completes nor fails within this sub-budget is
+ * therefore treated as a bad ADDRESS (retryable) rather than as the caller's
+ * clock running out. The caller's overall deadline still wins: each attempt
+ * gets `min(remaining, this)`, so the sub-budget can only ever make the walk
+ * finish sooner, never later.
+ *
+ * 5s is comfortably above a normal TLS handshake to a healthy CDN edge and
+ * well under the 15s default whole-fetch budget, leaving room for two further
+ * addresses plus the actual download.
+ */
+const DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
+
+/**
  * Run exactly one request against one pinned IP under its own wall-clock bound.
  * Resolves (never rejects) with a sanitized result — no URL, IP, header, or
  * error detail escapes. All listeners, timers, sockets and buffered bytes are
@@ -186,12 +220,14 @@ function attemptOnce(
   url: URL,
   pinnedIp: string,
   timeoutMs: number,
+  connectTimeoutMs: number,
   maxBytes: number,
   requestImpl: HttpsRequestFn,
 ): Promise<AttemptOutcome> {
   return new Promise<AttemptOutcome>((resolve) => {
     let settled = false;
     let responseStarted = false;
+    let established = false;
     let request: ClientRequest | null = null;
     let response: IncomingMessage | null = null;
     let chunks: Buffer[] = [];
@@ -202,19 +238,39 @@ function attemptOnce(
       chunks = [];
     };
 
-    // Not unref'd: this timer is the only guarantee that a stalled socket still
-    // settles the promise, and `finish` clears it on every path.
+    // Not unref'd: these timers are the only guarantee that a stalled socket
+    // still settles the promise, and `finish` clears both on every path.
+
+    // (a) The caller's wall clock. Expiry here is NOT retryable — the budget is
+    //     gone, so trying another address would spend time that no longer
+    //     exists.
     const timer = setTimeout(() => {
       discard();
-      // A timeout is the caller's wall clock running out, not a bad address:
-      // trying the next pinned IP would spend budget that no longer exists.
       finish({ kind: 'timeout' }, false);
     }, timeoutMs);
+
+    // (b) The connect sub-budget. Expiry here IS retryable: an address that
+    //     neither completes a handshake nor raises an error is black-holing,
+    //     and that is a property of the ADDRESS, not of the clock. Never longer
+    //     than (a), so the caller's deadline still bounds everything.
+    const connectTimer = setTimeout(() => {
+      if (established) return;
+      discard();
+      finish({ kind: 'timeout' }, true);
+    }, Math.min(timeoutMs, connectTimeoutMs));
+
+    /** The address answered — stop holding it to the connect sub-budget. */
+    const markEstablished = (): void => {
+      if (established) return;
+      established = true;
+      clearTimeout(connectTimer);
+    };
 
     function finish(result: TransportResult, retryable: boolean): void {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearTimeout(connectTimer);
       // Drop every listener, then re-arm a no-op `error` handler BEFORE
       // destroying: an aborted socket can still emit ECONNRESET, and an
       // 'error' with no listener is an uncaught exception, not a log line.
@@ -236,6 +292,7 @@ function attemptOnce(
     const onResponse = (res: IncomingMessage): void => {
       response = res;
       responseStarted = true;
+      markEstablished(); // bytes are flowing; the address is plainly reachable
       const status = res.statusCode ?? 0;
       const kind = classifyStatus(status);
 
@@ -304,9 +361,28 @@ function attemptOnce(
       return;
     }
 
+    // A socket that connects tells us the address is good even if the response
+    // is slow, so the connect sub-budget stops applying from here.
+    request.on('socket', (socket) => {
+      // A POOLED socket (https.globalAgent keeps connections alive) is handed
+      // over already established and will never re-emit 'connect'. Waiting for
+      // an event that cannot arrive would abandon a perfectly healthy
+      // connection the moment the origin took longer than the sub-budget to
+      // respond. `connecting === false` is the reliable "already up" signal;
+      // anything else falls through to listening, which fails safe.
+      if ((socket as unknown as { connecting?: boolean }).connecting === false) {
+        markEstablished();
+        return;
+      }
+      socket.on('connect', markEstablished);
+      socket.on('secureConnect', markEstablished);
+    });
     request.on('timeout', () => {
       discard();
-      finish({ kind: 'timeout' }, false);
+      // Node's `timeout` option is an IDLE timeout. If it fires before the
+      // address ever answered, that is the same black-hole signature the
+      // connect sub-budget catches, and it is retryable for the same reason.
+      finish({ kind: 'timeout' }, !established);
     });
     request.on('error', () => {
       discard();
@@ -325,6 +401,7 @@ function attemptOnce(
  */
 export function createPinnedHttpsTransport(options: PinnedTransportOptions = {}): ResumeTransport {
   const maxPinnedIps = Math.max(1, options.maxPinnedIps ?? DEFAULT_MAX_PINNED_IPS);
+  const connectTimeoutMs = Math.max(1, options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS);
   const requestImpl: HttpsRequestFn = options.request ?? (https.request as HttpsRequestFn);
 
   return async function pinnedHttpsTransport(req: TransportRequest): Promise<TransportResult> {
@@ -349,7 +426,14 @@ export function createPinnedHttpsTransport(options: PinnedTransportOptions = {})
       // an expiry normally surfaces as that attempt's own timeout. This guard
       // catches the boundary case where the clock ran out between attempts.
       if (remaining <= 0) return { kind: 'timeout' };
-      const attempt = await attemptOnce(url, ip, remaining, req.maxBytes, requestImpl);
+      const attempt = await attemptOnce(
+        url,
+        ip,
+        remaining,
+        Math.min(remaining, connectTimeoutMs),
+        req.maxBytes,
+        requestImpl,
+      );
       if (!attempt.retryable) return attempt.result;
       last = attempt.result;
     }

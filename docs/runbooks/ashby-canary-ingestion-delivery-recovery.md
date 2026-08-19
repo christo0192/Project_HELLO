@@ -22,8 +22,8 @@ committed file.
    image contains:
    - migration `0035` and the 512-bound `MAX_FILE_HANDLE_LEN` (the ordering /
      file-handle fix), **and**
-   - the Node 22 pinned-lookup fix in `resume-transport.ts` (the transport fix,
-     below). Without it *every* resume fetch fails, so the recovery in this
+   - migration `0036` and the Node 22 pinned-lookup fix in
+     `resume-transport.ts` (the transport fix, below). Without it *every* resume fetch fails, so the recovery in this
      document will run to completion and still leave the ingestion in
      `failed_review`.
 
@@ -72,6 +72,14 @@ select id, operation_type, state, attempts, max_attempts, error_code, operation_
  order by created_at;
 ```
 
+**Read `ingestion_attempts` now, before you deploy anything.** It decides
+whether the recovery below is executable at all. The requeue in §2a is bounded
+at **5** attempts by `advance_ashby_ingestion` (0032), and the pinned-transport
+defect failed *every* fetch identically — so the counter may already be at the
+ceiling, burned entirely by one now-fixed fault. If `ingestion_attempts >= 5`,
+go to **§2a-0** first; starting §2a without it dead-ends at `retry_exhausted`
+halfway through the recovery.
+
 `handle_len` on the canary reads **270**. That value was rejected pre-transport
 by the old 256 id bound; under the fix it is comfortably inside the 512
 file-handle bound.
@@ -108,6 +116,65 @@ two racing replays cannot both fire, re-inserts and consumes the row in one
 transaction, and resets `dedup_key` to null so the replay cannot collide with a
 live dedup key.
 
+### 2a-0. If the attempt ceiling was burned by the transport defect
+
+Skip this whole section if `attempts < 5`. It exists for exactly one situation:
+**all five attempts recorded the same now-fixed fault**, so the counter is
+measuring one defect five times rather than five independent chances.
+
+```sql
+select state, attempts, failed_reason
+  from screening_v2.ashby_resume_ingestions
+ where application_link_id = :application_link_id;
+```
+
+Proceed only when **all** of these hold:
+
+1. `state = 'failed_review'` and `attempts >= 5`;
+2. `failed_reason` is one of `fetch_http_error`, `fetch_transport_error`,
+   `fetch_timeout`; **and**
+3. you have confirmed **by hand** that a freshly minted `file.info` URL for this
+   link fetches successfully (`200`, a real PDF).
+
+Step 3 is not ceremony. `resume-fetch.ts` maps *both* a genuine provider error
+status *and* a status-0 connect failure to `http_error`, so `fetch_http_error`
+on its own **cannot** tell you the cause was the transport. The RPC's allowlist
+narrows the field; it cannot make the judgement. That is yours, and it is why
+this is an attributable audited call rather than an automatic behaviour.
+
+```sql
+select screening_v2.reset_ashby_ingestion_attempts(
+  :application_link_id, :acting_admin_user_id);
+```
+
+`:acting_admin_user_id` is the real admin's auth UUID — it is what makes the
+correction attributable. The call writes an `ashby_ingestion_attempts_reset`
+audit event carrying the pre-reset `attempts`, the `failed_reason` that
+justified it, and the acting admin.
+
+**What it does and does not do.** It sets `attempts = 0` for that one row and
+**nothing else** — the state stays `failed_review`, the ceiling of 5 is
+untouched, and no global bound moves. You still take the ordinary §2a exit
+afterwards, which charges attempt 1 of 5 exactly as it would have. There remains
+exactly **one** way a row leaves `failed_review`, and it is still counted. This
+is the same mis-accounting correction that `reopen_ashby_invite_delivery` makes
+for invite deliveries (step 4), built to the same shape deliberately.
+
+**Its four refusals**, each independent:
+
+| Refusal | Meaning |
+|---|---|
+| `not_found` | no ingestion row, or no link |
+| `not_resettable` | the row is not in `failed_review` — a live ingestion's counter belongs to the scheduler |
+| `blocked_terminal` | the application was withdrawn/deleted/cancelled — the resurrection guard |
+| `not_a_transport_failure` | `failed_reason` is outside the transport allowlist. A scan, parse, or guard failure measured a **real** fault; those attempts are not returned. |
+
+`noop` (rather than `ok`) means `attempts` was already 0 and nothing changed.
+
+If you get `not_a_transport_failure`, **stop and read `failed_reason`** — the
+ingestion is failing for a different reason and this recovery is the wrong
+instrument.
+
 ### 2a. First check the ingestion state — a replay onto `failed_review` does nothing
 
 **Read the ingestion row before replaying.** The handler now records
@@ -140,18 +207,24 @@ select state, attempts from screening_v2.ashby_resume_ingestions
 
   This **increments `attempts`** against the ceiling of 5, and returns
   `retry_exhausted` (leaving the row in `failed_review`) once that ceiling is
-  reached. If you get `retry_exhausted`, stop: the ingestion has genuinely failed
-  five times and the cause in `failed_reason` is what needs fixing, not the
-  attempt count.
+  reached.
+
+  If you get `retry_exhausted`, the question is *what those five attempts
+  measured*:
+  - **Five independent faults** — stop. The cause in `failed_reason` is what
+    needs fixing, not the attempt count. Do not reset.
+  - **One now-fixed defect, recorded five times** — that is the transport case,
+    and §2a-0 is the audited way to correct it. Go there, then come back here.
 - **`ready`** or **`cancelled`** — terminal. Do not replay; skip to step 3.
 
 ### 2b. Replay the job
 
 Replay **exactly one** job — the `ashby.ingestion` entry for this link:
 
-> **Order matters.** §2a first, §2b second. If §2a returned `retry_exhausted`,
-> do not replay at all — the ingestion has genuinely failed five times and the
-> cause in `failed_reason` is what needs fixing.
+> **Order matters.** §2a-0 (only if the ceiling was burned) → §2a requeue →
+> §2b replay. If §2a returned `retry_exhausted` and §2a-0 does not apply, do not
+> replay at all — the ingestion has genuinely failed five times and the cause in
+> `failed_reason` is what needs fixing.
 
 ```sql
 select id, name, payload->>'applicationLinkId' as link
@@ -303,5 +376,13 @@ doing anything else.
 7. **The pinned transport speaks Node 22's lookup contract**, so the resume
    fetch can actually connect. It also fails over across the resolved addresses
    — bounded, ordered, within the same wall-clock budget, and only while nothing
-   has been served yet — so one black-holed A-record no longer fails the whole
-   ingestion.
+   has been served yet. Failover covers an address that refuses, resets, or
+   fails TLS **and** one that silently drops packets: the latter raises no error
+   at all, so each attempt carries its own 5s connect sub-budget whose expiry
+   counts as a bad address rather than as the clock running out. The overall
+   deadline still wins, so this can only make a fetch finish sooner.
+8. **A ceiling burned by one defect can be corrected, once, with attribution.**
+   `reset_ashby_ingestion_attempts` (0036) returns the attempts a single
+   transport fault consumed — allowlisted by `failed_reason`, refused on a
+   terminal application or a non-`failed_review` row, audited with the pre-reset
+   count, and leaving both the state and the ceiling untouched (§2a-0).

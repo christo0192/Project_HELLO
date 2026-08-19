@@ -129,6 +129,8 @@ type Behaviour =
   | { type: 'connect-error' }
   | { type: 'throw' }
   | { type: 'socket-timeout' }
+  | { type: 'connected-then-timeout' }
+  | { type: 'pooled-socket-then-slow' }
   | { type: 'hang' }
   | { type: 'response'; status: number; headers?: Record<string, string>; chunks?: Buffer[]; truncate?: boolean };
 
@@ -156,6 +158,25 @@ function harness(script: Behaviour[]): { request: HttpsRequestFn; calls: https.R
     setImmediate(() => {
       if (behaviour.type === 'connect-error') { req.emit('error', new Error('ECONNREFUSED')); return; }
       if (behaviour.type === 'socket-timeout') { req.emit('timeout'); return; }
+      if (behaviour.type === 'connected-then-timeout') {
+        const socket = Object.assign(new EventEmitter(), { connecting: true });
+        req.emit('socket', socket);
+        socket.emit('secureConnect');
+        req.emit('timeout');
+        return;
+      }
+      if (behaviour.type === 'pooled-socket-then-slow') {
+        // A reused keep-alive socket: handed over already connected, so it
+        // never re-emits 'connect'. The connect sub-budget must NOT abandon it.
+        const socket = Object.assign(new EventEmitter(), { connecting: false });
+        req.emit('socket', socket);
+        setTimeout(() => {
+          const res = new FakeResponse(200, {});
+          callback(res as unknown as import('node:http').IncomingMessage);
+          setImmediate(() => { res.emit('data', Buffer.from('slow')); res.emit('end'); });
+        }, 60);
+        return;
+      }
       if (behaviour.type === 'hang') return;
       const res = new FakeResponse(behaviour.status, behaviour.headers ?? {});
       callback(res as unknown as import('node:http').IncomingMessage);
@@ -317,18 +338,72 @@ describe('createPinnedHttpsTransport — body bounds', () => {
 });
 
 describe('createPinnedHttpsTransport — wall-clock budget', () => {
-  it('stops on its own timer when a connection hangs, and does NOT spend the next IP', async () => {
-    const { request, calls } = harness([{ type: 'hang' }, { type: 'response', status: 200, chunks: [Buffer.from('x')] }]);
-    const transport = createPinnedHttpsTransport({ request });
+  it('BLACK HOLE: an address that silently drops packets fails over on the connect sub-budget', async () => {
+    // The regression this guards: a packet-dropping A-record raises no socket
+    // error at all. With only a whole-fetch timeout it would eat the entire
+    // budget and the second address would never be tried.
+    const { request, calls } = harness([
+      { type: 'hang' },
+      { type: 'response', status: 200, headers: { 'content-type': 'application/pdf' }, chunks: [Buffer.from('%PDF')] },
+    ]);
+    const transport = createPinnedHttpsTransport({ request, connectTimeoutMs: 40 });
     const started = Date.now();
-    const out = await transport({ ...REQ, pinnedIps: ['1.1.1.1', '2.2.2.2'], timeoutMs: 60 });
+    const out = await transport({ ...REQ, pinnedIps: ['1.1.1.1', '2.2.2.2'], timeoutMs: 5_000 });
+    expect(out).toMatchObject({ kind: 'body', status: 200 });
+    expect(calls).toHaveLength(2);
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it('BLACK HOLE: every address dropping packets ends as a timeout, bounded, without hanging', async () => {
+    const { request, calls } = harness([{ type: 'hang' }, { type: 'hang' }]);
+    const transport = createPinnedHttpsTransport({ request, connectTimeoutMs: 30 });
+    const started = Date.now();
+    const out = await transport({ ...REQ, pinnedIps: ['1.1.1.1', '2.2.2.2'], timeoutMs: 5_000 });
     expect(out).toEqual({ kind: 'timeout' });
-    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(calls).toHaveLength(2);
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it('does NOT abandon a POOLED keep-alive socket that is slow to respond', async () => {
+    // Regression guard: a reused socket never re-emits 'connect', so a
+    // sub-budget that waited for that event would kill a healthy connection.
+    const { request, calls } = harness([
+      { type: 'pooled-socket-then-slow' },
+      { type: 'response', status: 200, chunks: [Buffer.from('wrong')] },
+    ]);
+    const transport = createPinnedHttpsTransport({ request, connectTimeoutMs: 25 });
+    const out = await transport({ ...REQ, pinnedIps: ['1.1.1.1', '2.2.2.2'], timeoutMs: 5_000 });
+    expect((out as { bytes: Buffer }).bytes.toString()).toBe('slow');
     expect(calls).toHaveLength(1);
   });
 
-  it('maps a socket timeout to timeout without failover', async () => {
-    const { request, calls } = harness([{ type: 'socket-timeout' }, { type: 'response', status: 200 }]);
+  it('the OVERALL budget still outranks the connect sub-budget — it never extends the fetch', async () => {
+    const { request, calls } = harness([{ type: 'hang' }, { type: 'hang' }, { type: 'hang' }]);
+    const transport = createPinnedHttpsTransport({ request, connectTimeoutMs: 10_000 });
+    const started = Date.now();
+    const out = await transport({ ...REQ, pinnedIps: ['1.1.1.1', '2.2.2.2', '3.3.3.3'], timeoutMs: 80 });
+    expect(out).toEqual({ kind: 'timeout' });
+    // The whole-fetch timer fired first, so the walk stopped at the first IP.
+    expect(calls).toHaveLength(1);
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it('treats an idle timeout on an address that never answered as a bad address, and fails over', async () => {
+    const { request, calls } = harness([
+      { type: 'socket-timeout' },
+      { type: 'response', status: 200, chunks: [Buffer.from('ok')] },
+    ]);
+    const transport = createPinnedHttpsTransport({ request });
+    const out = await transport({ ...REQ, pinnedIps: ['1.1.1.1', '2.2.2.2'] });
+    expect(out.kind).toBe('body');
+    expect(calls).toHaveLength(2);
+  });
+
+  it('does NOT fail over on an idle timeout once the address has answered', async () => {
+    const { request, calls } = harness([
+      { type: 'connected-then-timeout' },
+      { type: 'response', status: 200, chunks: [Buffer.from('ok')] },
+    ]);
     const transport = createPinnedHttpsTransport({ request });
     expect(await transport({ ...REQ, pinnedIps: ['1.1.1.1', '2.2.2.2'] })).toEqual({ kind: 'timeout' });
     expect(calls).toHaveLength(1);
@@ -363,6 +438,9 @@ describe('createPinnedHttpsTransport — wall-clock budget', () => {
 
 const PINNED_HOSTNAME = 'pinned.ashby.test';
 
+/** Why the certificate could not be minted, for the CI availability gate. */
+let certFailure: string | null = null;
+
 function makeSelfSignedCert(): { key: Buffer; cert: Buffer } | null {
   let dir: string | null = null;
   try {
@@ -377,7 +455,8 @@ function makeSelfSignedCert(): { key: Buffer; cert: Buffer } | null {
       { stdio: 'ignore' },
     );
     return { key: readFileSync(keyPath), cert: readFileSync(certPath) };
-  } catch {
+  } catch (err) {
+    certFailure = err instanceof Error ? err.message : String(err);
     return null;
   } finally {
     if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } }
@@ -385,6 +464,28 @@ function makeSelfSignedCert(): { key: Buffer; cert: Buffer } | null {
 }
 
 const tls = makeSelfSignedCert();
+
+/**
+ * The rehearsal below is the ONLY non-vacuous proof that the Node 22
+ * `{ all: true }` lookup contract is honoured — every other test in this file
+ * runs against an injected `request` and would pass just as happily with the
+ * broken legacy-only lookup restored. `skipIf` is therefore a load-bearing
+ * hazard: the day a runner image drops `openssl`, the suite would go green with
+ * the regression proof silently absent.
+ *
+ * So skipping is tolerated on a developer machine and is a HARD FAILURE under
+ * CI. If this ever fires, do not delete it — mint the certificate another way.
+ */
+describe('real-TLS rehearsal availability', () => {
+  it('must be runnable under CI — this rehearsal is the only regression proof', () => {
+    if (!process.env.CI) return;
+    expect(
+      tls,
+      `openssl unavailable under CI (${certFailure ?? 'unknown'}) — the Node 22 ` +
+        'lookup regression proof cannot run and MUST NOT be silently skipped',
+    ).not.toBeNull();
+  });
+});
 
 describe.skipIf(tls === null)('createPinnedHttpsTransport — real Node 22 pinned-certificate rehearsal', () => {
   const previousCa = https.globalAgent.options.ca;
