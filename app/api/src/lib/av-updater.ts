@@ -73,6 +73,25 @@ export const AV_UPDATER_BOUNDS = {
   timeoutMs: { def: 600_000, min: 60_000, max: 1_800_000 },
 } as const;
 
+/**
+ * COLD-START retry ladder, used only while the machine holds NO usable
+ * signature database at all.
+ *
+ * The steady-state interval and its 15-minute floor are ClamAV's politeness
+ * request about TOPPING UP a database you already have. They are the wrong
+ * cadence for a machine that cannot scan anything: with a single hourly
+ * schedule, one lost cold-start attempt — a timeout, a 429 — meant a full hour
+ * during which every resume ingestion arrived at a scanner with nothing to
+ * screen with. That hour is the difference between a deferral nobody notices
+ * and a backlog somebody has to explain.
+ *
+ * Each individual attempt is still bounded by freshclam's own `MaxAttempts 3`
+ * and by `timeoutMs`, and the updater remains single-flight, so a short ladder
+ * cannot become a request storm. The ladder is escalating and capped, and the
+ * moment a database exists the steady-state interval takes over.
+ */
+export const AV_COLD_RETRY_MS: readonly number[] = [60_000, 120_000, 300_000];
+
 export interface AvUpdaterConfig {
   /** True iff ClamAV is the configured production scanner. */
   enabled: boolean;
@@ -191,6 +210,43 @@ export interface StartUpdaterOptions extends RunUpdateOptions {
   intervalMs: number;
   /** Run an attempt immediately on start (default true). */
   immediate?: boolean;
+  /**
+   * True when this machine currently has NO usable signature database — it
+   * cannot scan at all, as opposed to holding one that wants topping up.
+   * Defaults to "not cold", which preserves the pure steady-state cadence for
+   * any caller that does not supply it.
+   */
+  isCold?: () => boolean | Promise<boolean>;
+  /** Timer seams so the ladder is deterministic in tests. */
+  setTimer?: (fn: () => void, ms: number) => unknown;
+  clearTimer?: (handle: unknown) => void;
+  /** Jitter source in [0,1). Injected for determinism. */
+  random?: () => number;
+  /**
+   * Injectable single attempt (tests). Defaults to the real bounded
+   * `runAvUpdateOnce`, so production behaviour is unchanged; the seam exists
+   * so the CADENCE can be tested without spawning freshclam.
+   */
+  runOnce?: () => Promise<AvUpdateOutcome>;
+}
+
+/**
+ * Delay before the next attempt.
+ *
+ * Cold: climb the ladder, capped at its last rung, with full jitter in
+ * [0.5, 1.0) so a fleet restarting together does not hit the mirror in
+ * lockstep. Warm: the configured steady-state interval, unchanged.
+ */
+export function nextUpdateDelayMs(
+  cold: boolean,
+  consecutiveColdAttempts: number,
+  intervalMs: number,
+  random: () => number = Math.random,
+): number {
+  if (!cold) return intervalMs;
+  const idx = Math.min(Math.max(0, consecutiveColdAttempts), AV_COLD_RETRY_MS.length - 1);
+  const base = AV_COLD_RETRY_MS[idx]!;
+  return Math.max(1, Math.round(base * (0.5 + random() * 0.5)));
 }
 
 /**
@@ -213,7 +269,7 @@ export function startAvUpdater(opts: StartUpdaterOptions): AvUpdaterHandle {
   const runNow = async (): Promise<AvUpdateOutcome> => {
     if (inFlight) return inFlight;
     runs += 1;
-    inFlight = runAvUpdateOnce(opts)
+    inFlight = (opts.runOnce ? opts.runOnce() : runAvUpdateOnce(opts))
       .then((outcome) => {
         if (outcome.ok) { successes += 1; lastReason = null; }
         else { failures += 1; lastReason = outcome.reason; }
@@ -223,21 +279,57 @@ export function startAvUpdater(opts: StartUpdaterOptions): AvUpdaterHandle {
     return inFlight;
   };
 
-  const timer = setInterval(() => {
-    if (stopped) return;
-    // An update failure must never reach the process as an unhandled rejection.
-    void runNow().catch(() => undefined);
-  }, opts.intervalMs);
-  if (typeof timer.unref === 'function') timer.unref();
+  // Self-scheduling rather than a fixed interval: the delay to the NEXT
+  // attempt depends on the state the LAST one left behind. Single-flight is
+  // preserved by construction — the next timer is armed only after the
+  // previous attempt settles, so two freshclam processes can never write the
+  // same database directory concurrently.
+  const setTimer = opts.setTimer
+    ?? ((fn: () => void, ms: number) => {
+      const t = setTimeout(fn, ms);
+      // Never hold the process open on account of the updater.
+      if (typeof (t as NodeJS.Timeout).unref === 'function') (t as NodeJS.Timeout).unref();
+      return t;
+    });
+  const clearTimer = opts.clearTimer ?? ((h: unknown) => clearTimeout(h as NodeJS.Timeout));
+  const random = opts.random ?? Math.random;
 
-  if (opts.immediate !== false) void runNow().catch(() => undefined);
+  let timer: unknown = null;
+  let coldAttempts = 0;
+
+  const arm = async (): Promise<void> => {
+    if (stopped) return;
+    let cold = false;
+    try {
+      cold = opts.isCold ? await opts.isCold() : false;
+    } catch {
+      // An unreadable database directory is indistinguishable from an absent
+      // one, and both mean this machine cannot scan — retry on the urgent
+      // ladder rather than an hour later.
+      cold = true;
+    }
+    if (stopped) return;
+    const delay = nextUpdateDelayMs(cold, coldAttempts, opts.intervalMs, random);
+    coldAttempts = cold ? coldAttempts + 1 : 0;
+    timer = setTimer(() => {
+      if (stopped) return;
+      // An update failure must never reach the process as an unhandled rejection.
+      void runNow().catch(() => undefined).then(() => arm());
+    }, delay);
+  };
+
+  if (opts.immediate !== false) {
+    void runNow().catch(() => undefined).then(() => arm());
+  } else {
+    void arm();
+  }
 
   return {
     runNow,
     stop(): void {
       if (stopped) return;
       stopped = true;
-      clearInterval(timer);
+      if (timer !== null) clearTimer(timer);
     },
     stats: () => ({ runs, successes, failures, lastReason }),
   };

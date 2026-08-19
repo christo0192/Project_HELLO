@@ -29,6 +29,9 @@ const _contractVisibleEnvReads = [
   process.env.ASHBY_RECONCILE_INTERVAL_MS,
   process.env.ASHBY_RECLAIM_INTERVAL_MS,
   process.env.ASHBY_LEASE_SECONDS,
+  process.env.ASHBY_SCANNER_DEFER_SECONDS,
+  process.env.ASHBY_SCANNER_READINESS_TIMEOUT_MS,
+  process.env.ASHBY_SCANNER_DEFER_DEADLINE_MS,
   // Reconciliation sweep tuning (0034). A backfill against a large corpus has
   // to be tunable WITHOUT a deploy: production measured ~119k applications
   // paging ~100/request regardless of the requested limit, which is 24 runs at
@@ -125,6 +128,34 @@ export const RUNTIME_BOUNDS = {
   reclaimIntervalMs: { def: 60_000, min: 5_000, max: 3_600_000 },
   leaseSeconds: { def: 60, min: 5, max: 900 },
   /**
+   * How long an ingestion job waits after finding the malware scanner not
+   * ready (0037 deferral). The queue clamps to [1, 3600] independently; these
+   * bounds keep the tunable inside the range where a cold boot is picked up
+   * promptly without hot-looping. A deferral refunds its attempt, so this
+   * knob trades poll frequency against pickup latency and nothing else.
+   */
+  scannerDeferSeconds: { def: 45, min: 5, max: 600 },
+  /**
+   * Bound on the worker-side scanner readiness read.
+   *
+   * The DEFAULT (2s) sits well inside even the smallest lease (5s), so the
+   * gate cannot cost a job its claim. The MAXIMUM deliberately exceeds that
+   * lease: the gate's dominant caller is the PRE-claim admission check, which
+   * holds no lease at all, and on the post-claim path an unanswered read
+   * DEFERS rather than blocking — so raising this trades pickup latency, not
+   * lease safety. Read as: the bound is generous, the default is safe.
+   */
+  scannerReadinessTimeoutMs: { def: 2_000, min: 250, max: 15_000 },
+  /**
+   * Wall-clock bound on how long ONE ingestion job may keep deferring on the
+   * scanner before the outcome becomes a real, loud `failed_review`. Eight
+   * hours is far outside any cold start and far inside the 24-hour signature
+   * freshness ceiling, so it can only fire on a genuinely broken updater.
+   * It is measured from the job's own creation, so it resets per enqueue and
+   * needs no counter with a reset lifecycle.
+   */
+  scannerDeferDeadlineMs: { def: 28_800_000, min: 300_000, max: 86_400_000 },
+  /**
    * Cadence used INSTEAD of `reconcileIntervalMs` while a page-anchored sweep
    * is in flight (0034). Two payoffs: the anchor stays seconds old rather than
    * minutes, which is what makes resume viable if provider cursors are
@@ -182,6 +213,12 @@ export interface AshbyRuntimeConfig {
   reconcileIntervalMs: number;
   reclaimIntervalMs: number;
   leaseSeconds: number;
+  /** Delay applied when an ingestion defers on scanner readiness (0037). */
+  scannerDeferSeconds: number;
+  /** Bound on the worker-side scanner readiness read (ms). */
+  scannerReadinessTimeoutMs: number;
+  /** Wall-clock bound on one job's total scanner deferral (ms). */
+  scannerDeferDeadlineMs: number;
   /** Short cadence used while a page-anchored sweep is in flight (0034). */
   reconcileSweepIntervalMs: number;
   /** Per-run reconciliation bounds, tunable without a deploy (0034). */
@@ -258,6 +295,15 @@ export function loadAshbyRuntimeConfig(
     reconcileIntervalMs: boundedMs(source.ASHBY_RECONCILE_INTERVAL_MS, RUNTIME_BOUNDS.reconcileIntervalMs),
     reclaimIntervalMs: boundedMs(source.ASHBY_RECLAIM_INTERVAL_MS, RUNTIME_BOUNDS.reclaimIntervalMs),
     leaseSeconds: boundedMs(source.ASHBY_LEASE_SECONDS, RUNTIME_BOUNDS.leaseSeconds),
+    scannerDeferSeconds: boundedMs(
+      source.ASHBY_SCANNER_DEFER_SECONDS, RUNTIME_BOUNDS.scannerDeferSeconds,
+    ),
+    scannerReadinessTimeoutMs: boundedMs(
+      source.ASHBY_SCANNER_READINESS_TIMEOUT_MS, RUNTIME_BOUNDS.scannerReadinessTimeoutMs,
+    ),
+    scannerDeferDeadlineMs: boundedMs(
+      source.ASHBY_SCANNER_DEFER_DEADLINE_MS, RUNTIME_BOUNDS.scannerDeferDeadlineMs,
+    ),
     reconcileSweepIntervalMs: boundedMs(
       source.ASHBY_RECONCILE_SWEEP_INTERVAL_MS, RUNTIME_BOUNDS.reconcileSweepIntervalMs,
     ),
@@ -319,6 +365,9 @@ export function describeAshbyRuntime(
   reconcileIntervalMs: number;
   reclaimIntervalMs: number;
   leaseSeconds: number;
+  scannerDeferSeconds: number;
+  scannerReadinessTimeoutMs: number;
+  scannerDeferDeadlineMs: number;
   reconcileSweepIntervalMs: number;
   reconcileAnchorDisabled: boolean;
 } {
@@ -333,6 +382,12 @@ export function describeAshbyRuntime(
     reconcileIntervalMs: runtime.reconcileIntervalMs,
     reclaimIntervalMs: runtime.reclaimIntervalMs,
     leaseSeconds: runtime.leaseSeconds,
+    // All three scanner knobs, not one of three: a tunable an operator cannot
+    // read back from /health is a tunable they have to guess at while
+    // diagnosing the exact outage it governs.
+    scannerDeferSeconds: runtime.scannerDeferSeconds,
+    scannerReadinessTimeoutMs: runtime.scannerReadinessTimeoutMs,
+    scannerDeferDeadlineMs: runtime.scannerDeferDeadlineMs,
     reconcileSweepIntervalMs: runtime.reconcileSweepIntervalMs,
     reconcileAnchorDisabled: runtime.reconcileAnchorDisabled,
   };

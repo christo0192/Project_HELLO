@@ -30,7 +30,11 @@
  */
 
 import { createLogger } from '../../lib/logger.js';
-import { createQueueRunner, type QueueHandler } from '../../lib/queue/runner.js';
+import {
+  createQueueRunner,
+  type QueueDeferDirective,
+  type QueueHandler,
+} from '../../lib/queue/runner.js';
 import { createAshbyScheduler, queueRunnerTick, type AshbySchedulerHandle } from './scheduler.js';
 import {
   processAshbySignal,
@@ -40,6 +44,11 @@ import {
 } from './signal-worker.js';
 import { runImport, runIngestionJob } from './orchestration.js';
 import { publishReconcilePass } from './runtime-health.js';
+import {
+  checkScannerReadiness,
+  scannerDeferReason,
+  type ScannerGateVerdict,
+} from './scanner-readiness.js';
 import { runReconciliation, DEFAULT_CHECKPOINT_KEY } from './reconciliation.js';
 import type { ReconcileResult, ReconcileSkipCounts, ReconcileStop } from './reconciliation.js';
 import { runClaimedAshbyOperation } from './operation-worker.js';
@@ -58,6 +67,43 @@ export const ASHBY_INGESTION_QUEUE = 'ashby.ingestion';
  * a candidate's resume is both a PII cost and a provider cost.
  */
 export const TERMINAL_INGESTION_STATES: ReadonlySet<string> = new Set(['ready', 'cancelled']);
+
+/**
+ * Default wait between scanner-readiness deferrals.
+ *
+ * freshclam's first successful update after a cold boot is a matter of tens of
+ * seconds, so this is short enough that a ready scanner is picked up promptly
+ * and long enough that an hour-long outage costs ~80 cheap DB polls rather
+ * than a hot loop. Every deferral refunds its claim's attempt, so the count of
+ * polls has no bearing on the job's failure budget.
+ */
+export const DEFAULT_SCANNER_DEFER_SECONDS = 45;
+
+/**
+ * Delay applied to a POST-SCAN deferral, by class.
+ *
+ * `transient` (busy / timeout / a mid-run error) clears in seconds — another
+ * scan finishing, a retry of a wedged run — so a short delay is right.
+ * `availability` (no database, a stale one, no scanner configured) is measured
+ * in minutes at best: a cold freshclam download is minutes, so polling it
+ * every minute is pure noise.
+ */
+export const DEFER_SECONDS_BY_CLASS = { transient: 60, availability: 300 } as const;
+
+/**
+ * Sanitized reason recorded when a deferral outlives its wall-clock deadline.
+ * This is the deferral's BOUND, and it is deliberately wall-clock rather than
+ * a defer counter: a counter that gates a control needs a reset lifecycle or
+ * it becomes a one-way latch (the PR #65 lesson), while a deadline derived
+ * from the job's own creation resets naturally with every new enqueue.
+ */
+export const DEFER_DEADLINE_REASON = 'scan_unavailable_deadline';
+
+/** Fallback deadline when no tuning block is supplied (8 hours). */
+export const DEFAULT_SCANNER_DEFER_DEADLINE_MS = 28_800_000;
+
+/** Sanitized reason recorded when the bounded ingestion requeue ceiling is hit. */
+export const DEFER_EXHAUSTED_REASON = 'scan_deferral_exhausted';
 
 /** Deterministic dedup key for one link's ingestion. */
 export function ingestionDedupKey(applicationLinkId: string): string {
@@ -142,6 +188,24 @@ export function isPermanentAshbyFailure(err: unknown): boolean {
   return PERMANENT_ASHBY_CATEGORIES.has(err.category);
 }
 
+/**
+ * Delay for a post-scan deferral, chosen from the scan status' class.
+ * An unclassifiable status takes the longer (availability) delay: guessing
+ * "this will clear in a second" about something we do not understand is the
+ * guess that hot-loops.
+ */
+export function deferSecondsFor(scanStatus: string): number {
+  // Matched against KNOWN transient statuses rather than against the
+  // classifier's verdict alone: `classifyScanStatus` deliberately falls back
+  // to 'transient' for an unrecognised status (defer, never condemn), and
+  // inheriting that fallback here would give an unknown condition the SHORT
+  // delay — the fastest possible poll for the thing we understand least.
+  const KNOWN_TRANSIENT = new Set(['scanner_busy', 'scanner_timeout', 'scanner_error']);
+  return KNOWN_TRANSIENT.has(scanStatus)
+    ? DEFER_SECONDS_BY_CLASS.transient
+    : DEFER_SECONDS_BY_CLASS.availability;
+}
+
 /** Sanitized, bounded durable reason for a failed ingestion. Never PII. */
 export function ingestionFailureReason(err: unknown): string {
   if (!isAshbyError(err)) return 'fetch_provider_error';
@@ -165,11 +229,42 @@ export interface AshbyWorkers {
   stop(): Promise<void>;
 }
 
+/** Injectable seams for the handler map (tests drive these directly). */
+export interface AshbyHandlerDeps {
+  /**
+   * Proof that the resume malware scanner can screen right now. Shares the
+   * Mission Control health evidence; see `scanner-readiness.ts`.
+   */
+  scannerGate?: () => Promise<ScannerGateVerdict>;
+  /** Delay applied to a scanner-readiness deferral (clamped by the queue). */
+  scannerDeferSeconds?: number;
+  /** Wall-clock bound on how long one job may keep deferring on the scanner. */
+  scannerDeferDeadlineMs?: number;
+  /** Injectable clock for the deadline (tests). */
+  nowMs?: () => number;
+}
+
 /**
  * Build the queue handler map. Exported so tests can drive each handler in
  * isolation with an in-memory queue and fake stores.
  */
-export function buildAshbyHandlers(runtime: AshbyRuntime): Record<string, QueueHandler> {
+export function buildAshbyHandlers(
+  runtime: AshbyRuntime,
+  deps: AshbyHandlerDeps = {},
+): Record<string, QueueHandler> {
+  // Optional-chained throughout: `buildAshbyHandlers` is exported so tests can
+  // drive one handler against a minimal runtime stub, and a handler map must
+  // not require a fully-populated tuning block to be constructed.
+  const rc = runtime.runtimeConfig as Partial<AshbyRuntime['runtimeConfig']> | undefined;
+  const scannerGate = deps.scannerGate
+    ?? (() => checkScannerReadiness({ timeoutMs: rc?.scannerReadinessTimeoutMs }));
+  const scannerDeferSeconds = deps.scannerDeferSeconds
+    ?? rc?.scannerDeferSeconds
+    ?? DEFAULT_SCANNER_DEFER_SECONDS;
+  const scannerDeferDeadlineMs = deps.scannerDeferDeadlineMs
+    ?? rc?.scannerDeferDeadlineMs
+    ?? DEFAULT_SCANNER_DEFER_DEADLINE_MS;
+  const nowMs = deps.nowMs ?? (() => Date.now());
   const gates = {
     enabled: true,
     // The email channel stays provider-gated until an approved provider AND a
@@ -260,6 +355,37 @@ export function buildAshbyHandlers(runtime: AshbyRuntime): Record<string, QueueH
       // row for every link including this one.
       if (!link.externalResumeFileHandle) return;
 
+      // ── Scanner readiness: the LAST free moment to decide not to start ──
+      // Checked here, while the durable row is still `queued` and before ANY
+      // provider call, because this is the only point at which "not yet" is
+      // free: one transition later the row is `fetching` and the only ways
+      // out of it are forward or `failed_review`.
+      //
+      // A negative verdict is a DEFERRAL, not a failure — the queue refunds
+      // the attempt the claim charged, the ingestion row stays `queued`, and
+      // nothing is downloaded, scanned, or dead-lettered. The canary's cold
+      // boot burned an attempt and stranded a resume in `failed_review`
+      // precisely because this question was asked after the download instead
+      // of before it.
+      //
+      // BOUNDED RACE, stated rather than pretended away: the scanner is
+      // proven ready HERE, and the bytes are scanned a bounded moment later
+      // (one `file.info` call plus one download, each transport-bounded).
+      // freshclam can only make the database newer and installs by atomic
+      // rename, so the realistic direction of change inside that window is
+      // safe. If the scanner genuinely degrades mid-flight the scan still
+      // fails closed exactly as before, landing `failed_review` with a
+      // transient `scan_scanner_*` reason — recoverable by the documented
+      // requeue, not by silently trusting a stale verdict.
+      const gate = await scannerGate();
+      if (gate.action === 'defer') {
+        return {
+          outcome: 'defer',
+          reasonCode: gate.reasonCode,
+          delaySeconds: scannerDeferSeconds,
+        } satisfies QueueDeferDirective;
+      }
+
       // ── Leave `queued` BEFORE talking to the provider ──────────────────
       // The 0029 trigger allows `queued -> {fetching, cancelled}` only, so
       // `failed_review` is not reachable from `queued` at all. Every provider
@@ -335,6 +461,45 @@ export function buildAshbyHandlers(runtime: AshbyRuntime): Record<string, QueueH
           return l?.terminalState != null;
         },
       });
+
+      // ── Post-scan deferral: the scanner never produced a verdict ────────
+      // The file WAS downloaded (the readiness gate was satisfied when this
+      // job started) but the scanner could not screen it — it went busy, timed
+      // out, or lost its database mid-flight. That is not a statement about
+      // the resume, so the row must not be written off. It returns to `queued`
+      // (0037 retry edge) and the queue job defers with its attempt refunded.
+      if (result.status === 'done' && result.outcome.state === 'deferred') {
+        // Normalised through the SAME minting function the readiness gate
+        // uses, so both deferral classes land in one durable vocabulary and
+        // the `scanner%` health filter sees all of them. Minting a reason
+        // locally here is exactly how the post-scan class became invisible to
+        // the counter added for it.
+        const reason = scannerDeferReason(result.outcome.scanStatus);
+
+        // BOUND. Derived from the job's own creation, so it resets with every
+        // new enqueue and needs no counter with a reset lifecycle. Past it,
+        // waiting stops being correct and becomes a hidden backlog, so the
+        // outcome becomes a real, loud, human-visible failure.
+        const waitedMs = Math.max(0, nowMs() - Date.parse(job.createdAt));
+        if (Number.isFinite(waitedMs) && waitedMs > scannerDeferDeadlineMs) {
+          await failIngestion(DEFER_DEADLINE_REASON);
+          return;
+        }
+
+        const requeued = await runtime.stores.advanceIngestion(linkId, 'queued');
+        if (requeued.status !== 'ok') {
+          // `retry_exhausted` (the 0032 ceiling) or a concurrent cancel. The
+          // row cannot go back, so resting it loudly beats deferring a job
+          // whose durable state can never advance again.
+          if (requeued.status === 'retry_exhausted') await failIngestion(DEFER_EXHAUSTED_REASON);
+          return;
+        }
+        return {
+          outcome: 'defer',
+          reasonCode: reason,
+          delaySeconds: deferSecondsFor(result.outcome.scanStatus),
+        } satisfies QueueDeferDirective;
+      }
 
       // Persist the candidate the instant the ephemeral parse succeeds: the
       // structured fields exist only in memory here and the original bytes have
@@ -413,6 +578,31 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
    */
   let lastReconcilePass: ReconcilePassSummary | null = null;
 
+  // ── Ingestion admission gate (R-2) ──────────────────────────────────────
+  // Asked before every ingestion claim, and CHEAP by construction: a 512-byte
+  // signature-header read behind a short TTL. Never the capability probe,
+  // which runs the real binary behind the same gate production scans take.
+  //
+  // Holding the claim rather than deferring after it is what makes a cold boot
+  // free: the job stays `pending`, so no attempt is spent, no lease churns, no
+  // provider call is made, no resume bytes move — and a machine whose updater
+  // HAS succeeded can take the job instead, which no post-claim outcome could
+  // express. Only `ashby.ingestion` is gated; every other Ashby queue keeps
+  // draining, because none of them touch the scanner.
+  const ingestionAdmitted = async (queueName: string): Promise<boolean> => {
+    if (queueName !== ASHBY_INGESTION_QUEUE) return true;
+    const verdict = await checkScannerReadiness({
+      timeoutMs: rc.scannerReadinessTimeoutMs,
+    });
+    if (verdict.action === 'proceed') return true;
+    // Metadata only — a sanitized prerequisite code, never an identifier.
+    logger.info('unknown_event', {
+      error_category: 'ashby_ingestion_not_admitted',
+      error_type: verdict.reasonCode,
+    });
+    return false;
+  };
+
   const runner = createQueueRunner({
     queue: runtime.queue,
     handlers,
@@ -420,6 +610,7 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
     leaseSeconds: rc.leaseSeconds,
     concurrency: 2,
     pollMs: rc.signalPollMs,
+    shouldClaim: ingestionAdmitted,
     onEvent: (e) => {
       // Metadata only: queue name + sanitized code. Never a payload or token.
       logger.info('unknown_event', { error_category: `queue_${e.kind}`, error_type: e.queueName });

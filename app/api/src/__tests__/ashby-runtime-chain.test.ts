@@ -134,6 +134,8 @@ function makeRuntime(w: ReturnType<typeof world>, over: Partial<AshbyRuntime> = 
       resumeHosts: [], signalPollMs: 5000, operationPollMs: 5000,
       reconcileIntervalMs: 900000, reclaimIntervalMs: 60000, leaseSeconds: 60,
       reconcileSweepIntervalMs: 10000, reconcileAnchorDisabled: false,
+      scannerDeferSeconds: 45, scannerReadinessTimeoutMs: 2000,
+      scannerDeferDeadlineMs: 28_800_000,
       reconcileCaps: {
         maxPages: 50, maxItems: 5000, pageLimit: 100,
         deadlineMs: 60000, maxEnqueuePerRun: 200,

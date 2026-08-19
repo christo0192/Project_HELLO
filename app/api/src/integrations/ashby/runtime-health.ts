@@ -352,6 +352,21 @@ export interface BacklogView {
   ingestionStuckQueued: number;
   /** Resume ingestions stranded in `fetching` past the stuck window. */
   ingestionStuckFetching: number;
+  /**
+   * Ashby jobs currently DEFERRED on scanner readiness (0037): claimed, found
+   * the malware scanner unable to screen, and returned to the queue with their
+   * attempt refunded. This is correct behaviour and costs no failure budget —
+   * but without a count it is indistinguishable from an idle queue, which is
+   * exactly the reading an operator would take during a signature outage.
+   */
+  scannerDeferredJobs: number;
+  /**
+   * Age in seconds of the LONGEST-waiting scanner deferral, measured from the
+   * start of its uninterrupted wait (not its most recent poll), or null when
+   * nothing is waiting. Minutes are a cold boot; an hour is an updater that
+   * never came back.
+   */
+  scannerDeferredOldestAgeSec: number | null;
   /** Consecutive reconciliation runs that did not advance the cursor. */
   reconcileNoProgressRuns: number;
   /** Last fully-drained reconciliation, or null. */
@@ -364,6 +379,7 @@ const EMPTY_BACKLOG: BacklogView = {
   operationsBlockedPrerequisite: 0, operationsBlockedFailedIngestion: 0,
   operationsFailedPrerequisite: 0,
   ingestionStuckQueued: 0, ingestionStuckFetching: 0,
+  scannerDeferredJobs: 0, scannerDeferredOldestAgeSec: null,
   writebackPending: 0, reconcileNoProgressRuns: 0, reconcileLastSuccessAt: null,
 };
 
@@ -374,6 +390,7 @@ const EMPTY_BACKLOG: BacklogView = {
 interface CountQuery {
   eq(column: string, value: string): CountQuery;
   in(column: string, values: readonly string[]): CountQuery;
+  like(column: string, pattern: string): CountQuery;
   then<T>(onOk: (r: { count: number | null; error: unknown }) => T): Promise<T>;
 }
 
@@ -402,12 +419,18 @@ export async function readBacklog(
     countRows(client, 'ashby_operations', (q) => q.eq('state', state));
 
   const [
-    queuePending, dlqDepth,
+    queuePending, dlqDepth, scannerDeferredJobs,
     operationsPending, operationsFailed, operationsAwaitingDelivery,
     writebackPending,
   ] = await Promise.all([
     countRows(client, 'job_queue', (q) => q.in('name', names)),
     countRows(client, 'job_dlq', (q) => q.in('name', names)),
+    // Deferred-on-scanner jobs. `defer_reason` is a sanitized code written
+    // only by `defer_job`, and every non-deferral outcome clears it, so a
+    // delayed row carrying a `scanner*` reason is waiting on the scanner and
+    // nothing else.
+    countRows(client, 'job_queue', (q) =>
+      q.in('name', names).eq('status', 'delayed').like('defer_reason', 'scanner%')),
     operationsInState('pending'),
     operationsInState('failed'),
     operationsInState('awaiting_manual_delivery'),
@@ -427,6 +450,23 @@ export async function readBacklog(
   const oldestAt = (oldest as { scheduled_at?: string } | null)?.scheduled_at;
   const oldestPendingAgeSec = oldestAt
     ? Math.max(0, Math.round((nowMs - Date.parse(oldestAt)) / 1000))
+    : null;
+
+  // Longest-waiting scanner deferral — one row, `deferred_at` only, and no
+  // identifier of any kind leaves the database.
+  const { data: oldestDeferred, error: deferErr } = await client
+    .from('job_queue')
+    .select('deferred_at')
+    .in('name', names)
+    .eq('status', 'delayed')
+    .like('defer_reason', 'scanner%')
+    .order('deferred_at', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (deferErr) throw new Error('ashby_health_count_error');
+  const deferredAt = (oldestDeferred as { deferred_at?: string | null } | null)?.deferred_at;
+  const scannerDeferredOldestAgeSec = deferredAt
+    ? Math.max(0, Math.round((nowMs - Date.parse(deferredAt)) / 1000))
     : null;
 
   const { data: checkpoint, error: cpErr } = await client
@@ -460,6 +500,7 @@ export async function readBacklog(
     operationsFailedPrerequisite: counter('failed_prerequisite'),
     ingestionStuckQueued: counter('ingestion_stuck_queued'),
     ingestionStuckFetching: counter('ingestion_stuck_fetching'),
+    scannerDeferredJobs, scannerDeferredOldestAgeSec,
     reconcileNoProgressRuns: typeof cp?.no_progress_runs === 'number' ? cp.no_progress_runs : 0,
     reconcileLastSuccessAt: cp?.last_success_at ?? null,
   };
@@ -578,6 +619,12 @@ export const DEGRADE_THRESHOLDS = {
   /** Any invite killed by the prerequisite-ordering defect needs a reopen. */
   operationsFailedPrerequisite: 1,
   /**
+   * A scanner deferral lasting longer than this is no longer a cold boot.
+   * freshclam establishes a database in tens of seconds; fifteen minutes of
+   * waiting means the updater is not winning and a human should look.
+   */
+  scannerDeferredAgeSec: 900,
+  /**
    * Any invite blocked behind a failed_review ingestion needs a human — the
    * ingestion cannot requeue itself, so this never clears on its own.
    */
@@ -637,6 +684,15 @@ export function evaluateDegradation(input: {
   if (input.backlog.operationsFailedPrerequisite
       >= DEGRADE_THRESHOLDS.operationsFailedPrerequisite) {
     reasons.push('invite_prerequisite_failed');
+  }
+  // A scanner deferral is CORRECT — no attempt burned, nothing failed — but a
+  // long one is still work that is not happening, and it is fleet-wide
+  // durable evidence where `input.scanner` only describes THIS machine. A
+  // process with a healthy scanner must still report jobs stuck waiting on
+  // another one, or the deferral becomes the silent failure the whole repair
+  // exists to avoid.
+  if ((input.backlog.scannerDeferredOldestAgeSec ?? 0) > DEGRADE_THRESHOLDS.scannerDeferredAgeSec) {
+    reasons.push('scanner_deferral_stalled');
   }
   if (input.scheduler.registeredInThisProcess && input.scheduler.loops.some((l) => l.stale)) {
     reasons.push('scheduler_loop_stale');

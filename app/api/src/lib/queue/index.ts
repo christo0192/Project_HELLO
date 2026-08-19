@@ -29,10 +29,16 @@ import type {
   EnqueueOptions,
   DequeueOptions,
   ClaimOptions,
+  DeferOutcome,
   FailOutcome,
   ReclaimResult,
 } from './types.js';
-import { computeBackoffMs, clampLeaseSeconds } from './types.js';
+import {
+  computeBackoffMs,
+  clampLeaseSeconds,
+  clampDeferSeconds,
+  DEFAULT_DEFER_SECONDS,
+} from './types.js';
 
 /** Stable sanitized error code — adapter does not support the lease API. */
 export const ERR_LEASE_UNSUPPORTED = 'ERR_LEASE_UNSUPPORTED';
@@ -260,6 +266,32 @@ export class Queue {
     const delayMs = computeBackoffMs(attemptIndex, this.backoffBaseMs, this.backoffMaxMs);
     const retryAt = new Date(Date.parse(now) + delayMs).toISOString();
     return this.leased().failLeased(jobId, leaseToken, now, errorMessage, retryAt);
+  }
+
+  /**
+   * DEFER a job under the live matching lease: the work never started because
+   * a prerequisite was not met, so the attempt the claim charged is refunded
+   * and the job returns to `delayed` behind a clamped delay (1..3600s).
+   *
+   * This is a third outcome alongside complete and fail, not a flavour of
+   * fail: it never dead-letters, never writes error text, and never raises
+   * maxAttempts, so an unbounded wait costs an unbounded number of cheap polls
+   * and exactly zero of the job's failure budget.
+   *
+   * Returns 'not_owned' for a stale/mismatched lease (fails closed) and
+   * 'invalid_reason' for a reason code outside the sanitized allowlist.
+   */
+  async deferClaim(
+    jobId: string,
+    leaseToken: string,
+    reasonCode: string,
+    delaySeconds: number = DEFAULT_DEFER_SECONDS,
+  ): Promise<DeferOutcome> {
+    const leased = this.leased();
+    if (typeof leased.deferLeased !== 'function') throw new Error(ERR_LEASE_UNSUPPORTED);
+    return leased.deferLeased(
+      jobId, leaseToken, this.clock(), reasonCode, clampDeferSeconds(delaySeconds),
+    );
   }
 
   /**

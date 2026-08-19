@@ -76,7 +76,10 @@
         "ASHBY_RECONCILE_SWEEP_MAX_RESTARTS": { "requiredInProduction": false, "secret": false },
         "ASHBY_RECONCILE_ANCHOR_MAX_AGE_MS": { "requiredInProduction": false, "secret": false },
         "ASHBY_RECLAIM_INTERVAL_MS": { "requiredInProduction": false, "secret": false },
-        "ASHBY_LEASE_SECONDS": { "requiredInProduction": false, "secret": false }
+        "ASHBY_LEASE_SECONDS": { "requiredInProduction": false, "secret": false },
+        "ASHBY_SCANNER_DEFER_SECONDS": { "requiredInProduction": false, "secret": false },
+        "ASHBY_SCANNER_READINESS_TIMEOUT_MS": { "requiredInProduction": false, "secret": false },
+        "ASHBY_SCANNER_DEFER_DEADLINE_MS": { "requiredInProduction": false, "secret": false }
       }
     },
     "web": {

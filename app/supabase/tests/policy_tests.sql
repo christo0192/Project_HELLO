@@ -6419,6 +6419,252 @@ begin
 end;
 $$;
 
+-- =====================================================================
+-- 0037: lease-safe queue DEFERRAL, the abandon-before-verdict retry edges,
+--       and the verdict-class requeue refusal.
+--
+--   The queue had two post-claim outcomes, complete and fail, so "the
+--   prerequisite is not met yet" could only be said by FAILING — which spends
+--   an attempt and dead-letters minutes-long waits in about thirty seconds.
+--   These assert the third outcome exists, refunds exactly what the claim
+--   charged, and cannot fail or dead-letter anything; and that making the
+--   pipeline more willing to retry did NOT make known malware re-downloadable.
+-- =====================================================================
+
+select _policy_tests.assert(
+  'ashby 0037: defer_job is service-role only',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname = 'defer_job'
+      and not has_function_privilege('anon', p.oid, 'EXECUTE')
+      and not has_function_privilege('authenticated', p.oid, 'EXECUTE')
+      and has_function_privilege('service_role', p.oid, 'EXECUTE')
+  ) = 1,
+  'defer_job mutates the backend queue — anon/authenticated must never execute it'
+);
+
+select _policy_tests.assert(
+  'ashby 0037: the re-declared complete_job/fail_job keep their grants',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname in ('complete_job', 'fail_job')
+      and not has_function_privilege('anon', p.oid, 'EXECUTE')
+      and not has_function_privilege('authenticated', p.oid, 'EXECUTE')
+      and has_function_privilege('service_role', p.oid, 'EXECUTE')
+  ) = 2,
+  'a create-or-replace that dropped a revoke would silently open the queue'
+);
+
+do $$
+declare
+  v_job    uuid;
+  v_tok    uuid;
+  v_res    text;
+  v_row    screening_v2.job_queue%rowtype;
+  v_at     timestamptz;
+  v_first_wait timestamptz;
+  v_now    timestamptz := now();
+begin
+  -- ── deferral refunds exactly the claim's attempt ─────────────────────
+  insert into screening_v2.job_queue
+    (name, payload, status, attempts, max_attempts, priority, scheduled_at)
+  values ('pol37.queue', '{}'::jsonb, 'pending', 0, 1, 0, v_now)
+  returning id into v_job;
+
+  select lease_token into v_tok
+    from screening_v2.claim_job('pol37.queue', v_now, 30, 'pol37-worker');
+  select * into v_row from screening_v2.job_queue where id = v_job;
+  perform _policy_tests.assert('ashby 0037: a claim charges one attempt',
+    v_row.attempts = 1, 'got ' || v_row.attempts);
+
+  v_res := screening_v2.defer_job(v_job, v_tok, 'scanner_signatures_missing', 45, v_now);
+  select * into v_row from screening_v2.job_queue where id = v_job;
+  perform _policy_tests.assert('ashby 0037: defer refunds exactly the claim attempt',
+    v_res = 'deferred' and v_row.attempts = 0,
+    'got ' || v_res || ' attempts=' || v_row.attempts);
+  perform _policy_tests.assert('ashby 0037: a deferral leaves NO failure evidence',
+    v_row.status = 'delayed'
+      and v_row.error_message is null
+      and v_row.failed_at is null
+      and v_row.lease_token is null
+      and v_row.defer_reason = 'scanner_signatures_missing'
+      and v_row.defer_count = 1
+      and v_row.scheduled_at > v_now,
+    'a deferred job must not look failed');
+
+  -- ── a deferral can never dead-letter, even at max_attempts ───────────
+  v_first_wait := v_row.deferred_at;
+  for i in 1..5 loop
+    select lease_token into v_tok
+      from screening_v2.claim_job('pol37.queue', v_row.scheduled_at + interval '1 second', 30, 'pol37-worker');
+    v_res := screening_v2.defer_job(v_job, v_tok, 'scanner_signatures_missing', 1,
+                                    v_row.scheduled_at + interval '1 second');
+    select * into v_row from screening_v2.job_queue where id = v_job;
+  end loop;
+  perform _policy_tests.assert('ashby 0037: repeated deferral never dead-letters (max_attempts=1)',
+    v_row.status = 'delayed' and v_row.attempts = 0
+      and not exists (select 1 from screening_v2.job_dlq where id = v_job),
+    'got status=' || v_row.status || ' attempts=' || v_row.attempts);
+  -- The COUNT alone does not test this claim: a job deferred every 45 seconds
+  -- for an hour must report an hour of waiting, not 45 seconds of it, or
+  -- "oldest scanner deferral" measures the last poll instead of the outage.
+  perform _policy_tests.assert('ashby 0037: the wait start survives a repeating reason',
+    v_row.defer_count = 6 and v_row.deferred_at = v_first_wait,
+    'got defer_count=' || v_row.defer_count
+      || ' deferred_at=' || coalesce(v_row.deferred_at::text,'null')
+      || ' expected deferred_at=' || coalesce(v_first_wait::text,'null'));
+
+  -- ...and a CHANGED reason restarts the clock, because it is a different wait.
+  select lease_token into v_tok
+    from screening_v2.claim_job('pol37.queue', v_row.scheduled_at + interval '1 second', 30, 'pol37-worker');
+  v_at := v_row.scheduled_at + interval '1 second';
+  v_res := screening_v2.defer_job(v_job, v_tok, 'scanner_busy', 1, v_at);
+  select * into v_row from screening_v2.job_queue where id = v_job;
+  perform _policy_tests.assert('ashby 0037: a changed reason restarts the wait clock',
+    v_row.deferred_at = v_at and v_row.deferred_at <> v_first_wait,
+    'got ' || coalesce(v_row.deferred_at::text,'null'));
+
+  -- ── CAS: a wrong token mutates nothing ───────────────────────────────
+  select lease_token into v_tok
+    from screening_v2.claim_job('pol37.queue', v_row.scheduled_at + interval '1 second', 30, 'pol37-worker');
+  v_res := screening_v2.defer_job(v_job, gen_random_uuid(), 'scanner_busy', 10,
+                                  v_row.scheduled_at + interval '1 second');
+  perform _policy_tests.assert('ashby 0037: a mismatched lease is refused',
+    v_res = 'not_owned', 'got ' || v_res);
+
+  -- ── the reason code is allowlisted, not merely trusted ───────────────
+  v_res := screening_v2.defer_job(v_job, v_tok, 'Provider said: /var/lib/clamav missing', 10,
+                                  v_row.scheduled_at + interval '1 second');
+  perform _policy_tests.assert('ashby 0037: an unsanitized reason is refused before it is stored',
+    v_res = 'invalid_reason_code', 'got ' || v_res);
+
+  -- ── the delay is clamped server-side ─────────────────────────────────
+  v_at := v_row.scheduled_at + interval '1 second';
+  v_res := screening_v2.defer_job(v_job, v_tok, 'scanner_busy', 999999, v_at);
+  select * into v_row from screening_v2.job_queue where id = v_job;
+  perform _policy_tests.assert('ashby 0037: the deferral delay is clamped to one hour',
+    v_res = 'deferred'
+      and v_row.scheduled_at = v_at + interval '3600 seconds',
+    'an unclamped delay could park a job for a year; got '
+      || (v_row.scheduled_at - v_at)::text);
+
+  -- ── a genuine failure still clears the deferral marker ───────────────
+  -- Raise the ceiling first: with max_attempts = 1 the very next fail_job
+  -- takes the DLQ branch, which is correct behaviour but a different path
+  -- from the retry branch under test here.
+  update screening_v2.job_queue set max_attempts = 5 where id = v_job;
+
+  v_at := v_row.scheduled_at + interval '1 second';
+  select lease_token into v_tok
+    from screening_v2.claim_job('pol37.queue', v_at, 30, 'pol37-worker');
+  v_res := screening_v2.fail_job(v_job, v_tok, v_at, 'genuine_fault', v_at + interval '1 minute');
+  select * into v_row from screening_v2.job_queue where id = v_job;
+  perform _policy_tests.assert('ashby 0037: a retry is not counted as a wait',
+    v_row.defer_reason is null and v_row.deferred_at is null
+      and v_row.error_message = 'genuine_fault',
+    'a failing job must never be read as blocked on a prerequisite');
+
+  delete from screening_v2.job_queue where id = v_job;
+  delete from screening_v2.job_dlq where id = v_job;
+end;
+$$;
+
+-- ── ingestion state machine: the two new edges, and the R-8 refusal ────
+do $$
+declare
+  v_map   uuid;
+  v_link  uuid;
+  v_inf   uuid;
+  v_res   jsonb;
+  v_state text;
+  v_role  uuid;
+  v_owner uuid := '00000000-0000-4000-8000-0000000000bb';
+begin
+  select id into v_role from screening_v2.roles limit 1;
+  if v_role is null then
+    perform _policy_tests.assert('ashby 0037 functional: seed role present', false, 'no seed role available');
+    return;
+  end if;
+
+  insert into screening_v2.ashby_job_mappings
+    (external_job_id, role_id, owner_id, ai_screening_stage_id, status)
+  values ('pol37-job', v_role, v_owner, 'pol37-ai', 'paused')
+  returning id into v_map;
+
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id)
+  values ('pol37-app', 'pol37-job', v_map)
+  returning id into v_link;
+
+  -- fetching -> queued: abandoned before any statement about the file.
+  v_res := screening_v2.advance_ashby_ingestion(v_link, 'fetching', null, null, null, null);
+  v_res := screening_v2.advance_ashby_ingestion(v_link, 'queued', null, null, null, null);
+  perform _policy_tests.assert('ashby 0037: fetching -> queued is a legal retry edge',
+    v_res->>'status' = 'ok', 'got ' || coalesce(v_res->>'status','null'));
+
+  -- scanning -> queued: the post-claim scanner race.
+  v_res := screening_v2.advance_ashby_ingestion(v_link, 'fetching', null, null, null, null);
+  v_res := screening_v2.advance_ashby_ingestion(v_link, 'scanning', null, null, null, null);
+  v_res := screening_v2.advance_ashby_ingestion(v_link, 'queued', null, null, null, null);
+  perform _policy_tests.assert('ashby 0037: scanning -> queued is a legal retry edge',
+    v_res->>'status' = 'ok', 'got ' || coalesce(v_res->>'status','null'));
+
+  -- extracting keeps NO such edge: by then the bytes were parsed.
+  v_res := screening_v2.advance_ashby_ingestion(v_link, 'fetching', null, null, null, null);
+  v_res := screening_v2.advance_ashby_ingestion(v_link, 'scanning', null, null, null, null);
+  v_res := screening_v2.advance_ashby_ingestion(v_link, 'extracting', null, null, null, null);
+  v_res := screening_v2.advance_ashby_ingestion(v_link, 'queued', null, null, null, null);
+  perform _policy_tests.assert('ashby 0037: extracting -> queued stays illegal',
+    v_res->>'status' = 'invalid_transition', 'got ' || coalesce(v_res->>'status','null'));
+
+  -- An AVAILABILITY failure stays recoverable: it never had a verdict.
+  v_res := screening_v2.advance_ashby_ingestion(v_link, 'failed_review', null, null, null,
+                                                'scan_scanner_signatures_unavailable');
+  v_res := screening_v2.advance_ashby_ingestion(v_link, 'queued', null, null, null, null);
+  perform _policy_tests.assert('ashby 0037: an availability failure is still requeueable',
+    v_res->>'status' = 'ok', 'got ' || coalesce(v_res->>'status','null'));
+  select failed_reason into v_state from screening_v2.ashby_resume_ingestions
+   where application_link_id = v_link;
+  perform _policy_tests.assert('ashby 0037: a requeue clears the stale failure reason',
+    v_state is null, 'got ' || coalesce(v_state,'null'));
+
+  -- A VERDICT is permanent. Re-running it re-downloads known malware.
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id)
+  values ('pol37-app-inf', 'pol37-job', v_map)
+  returning id into v_inf;
+
+  v_res := screening_v2.advance_ashby_ingestion(v_inf, 'fetching', null, null, null, null);
+  v_res := screening_v2.advance_ashby_ingestion(v_inf, 'scanning', null, null, null, null);
+  v_res := screening_v2.advance_ashby_ingestion(v_inf, 'failed_review', null, null, null, 'scan_infected');
+  v_res := screening_v2.advance_ashby_ingestion(v_inf, 'queued', null, null, null, null);
+  perform _policy_tests.assert('ashby 0037: an INFECTED verdict is never requeueable',
+    v_res->>'status' = 'not_requeueable', 'got ' || coalesce(v_res->>'status','null'));
+  select state into v_state from screening_v2.ashby_resume_ingestions where application_link_id = v_inf;
+  perform _policy_tests.assert('ashby 0037: the infected row is left where it rests',
+    v_state = 'failed_review', 'got ' || coalesce(v_state,'null'));
+
+  -- Deterministic content faults are verdicts about the file too.
+  update screening_v2.ashby_resume_ingestions
+     set failed_reason = 'guard_unsupported_type' where application_link_id = v_inf;
+  v_res := screening_v2.advance_ashby_ingestion(v_inf, 'queued', null, null, null, null);
+  perform _policy_tests.assert('ashby 0037: a guard rejection is never requeueable',
+    v_res->>'status' = 'not_requeueable', 'got ' || coalesce(v_res->>'status','null'));
+
+  update screening_v2.ashby_resume_ingestions
+     set failed_reason = 'parse_error' where application_link_id = v_inf;
+  v_res := screening_v2.advance_ashby_ingestion(v_inf, 'queued', null, null, null, null);
+  perform _policy_tests.assert('ashby 0037: an unparseable document is never requeueable',
+    v_res->>'status' = 'not_requeueable', 'got ' || coalesce(v_res->>'status','null'));
+
+  delete from screening_v2.ashby_resume_ingestions where application_link_id in (v_link, v_inf);
+  delete from screening_v2.ashby_application_links where id in (v_link, v_inf);
+  delete from screening_v2.ashby_job_mappings where id = v_map;
+end;
+$$;
+
 -- ═══════════════════════════════════════════════════════════════════════
 -- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)
 -- ═══════════════════════════════════════════════════════════════════════

@@ -27,11 +27,12 @@ import type {
   ILeasedQueueAdapter,
   QueueJob,
   EnqueueInput,
+  DeferOutcome,
   FailOutcome,
   LeaseMutationOutcome,
   ReclaimResult,
 } from './types.js';
-import { clampLeaseSeconds } from './types.js';
+import { clampLeaseSeconds, clampDeferSeconds, isValidDeferReason } from './types.js';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 export const ERR_ENQUEUE_FAILED = 'ERR_ENQUEUE_FAILED';
@@ -43,6 +44,7 @@ export const ERR_HEARTBEAT_FAILED = 'ERR_HEARTBEAT_FAILED';
 export const ERR_COMPLETE_FAILED = 'ERR_COMPLETE_FAILED';
 export const ERR_FAIL_FAILED = 'ERR_FAIL_FAILED';
 export const ERR_RECLAIM_FAILED = 'ERR_RECLAIM_FAILED';
+export const ERR_DEFER_FAILED = 'ERR_DEFER_FAILED';
 
 /** Minimum viable row shape from Supabase JSON responses. */
 interface JobRow {
@@ -64,6 +66,9 @@ interface JobRow {
   lease_owner: string | null;
   lease_expires_at: string | null;
   lease_deadline_at: string | null;
+  defer_reason?: string | null;
+  deferred_at?: string | null;
+  defer_count?: number | null;
 }
 
 interface DlqRow {
@@ -99,6 +104,9 @@ function rowToJob(row: JobRow): QueueJob {
     leaseOwner: row.lease_owner ?? undefined,
     leaseExpiresAt: row.lease_expires_at ?? undefined,
     leaseDeadlineAt: row.lease_deadline_at ?? undefined,
+    deferReason: row.defer_reason ?? undefined,
+    deferredAt: row.deferred_at ?? undefined,
+    deferCount: typeof row.defer_count === 'number' ? row.defer_count : undefined,
   };
 }
 
@@ -339,6 +347,35 @@ export class PgAdapter implements ILeasedQueueAdapter {
     if (error) throw Object.assign(new Error(ERR_FAIL_FAILED), { cause: error });
     const outcome = String(data);
     if (outcome === 'retry_scheduled' || outcome === 'dead_lettered') return outcome;
+    return 'not_owned';
+  }
+
+  /**
+   * Defer under the live lease (0037). The RPC returns a stable sanitized
+   * token; anything unexpected is read as `not_owned` so an unrecognised
+   * response can never be mistaken for a successful wait.
+   */
+  async deferLeased(
+    jobId: string,
+    leaseToken: string,
+    nowIso: string,
+    reasonCode: string,
+    delaySeconds: number,
+  ): Promise<DeferOutcome> {
+    // Rejected locally on the SAME allowlist the RPC enforces, so a bad code
+    // costs no round trip and can never reach a durable column.
+    if (!isValidDeferReason(reasonCode)) return 'invalid_reason';
+    const { data, error } = await this.supabase.rpc('defer_job', {
+      p_job_id: jobId,
+      p_lease_token: leaseToken,
+      p_reason_code: reasonCode,
+      p_delay_seconds: clampDeferSeconds(delaySeconds),
+      p_now: nowIso,
+    });
+    if (error) throw Object.assign(new Error(ERR_DEFER_FAILED), { cause: error });
+    const outcome = String(data);
+    if (outcome === 'deferred') return 'deferred';
+    if (outcome === 'invalid_reason_code') return 'invalid_reason';
     return 'not_owned';
   }
 
