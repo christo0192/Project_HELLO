@@ -40,6 +40,12 @@ import {
 } from '../integrations/ashby/index.js';
 import { AshbyError } from '../integrations/ashby/errors.js';
 import {
+  evaluateDegradation,
+  DEGRADE_THRESHOLDS,
+  type BacklogView,
+  type SchedulerHealthView,
+} from '../integrations/ashby/runtime-health.js';
+import {
   runClaimedAshbyOperation,
   PREREQUISITE_DEFER_REASONS,
   DEFAULT_DEFER_SECONDS,
@@ -611,5 +617,88 @@ describe('C1 - handle backfill on link reuse', () => {
   it('is a no-op when the store does not implement the backfill seam', async () => {
     const r = await runImport('app_1', importDeps(importStores(null, undefined)) as never);
     expect(r.status).toBe('imported');
+  });
+});
+
+// ===========================================================================
+// O-1 - a permanently blocked invite must be a VERDICT, not just a counter
+// ===========================================================================
+
+// The ordering repair traded a wrong-but-loud signal for a right-but-quiet one:
+// before it, a resume-backed link whose ingestion ended `failed_review` surfaced
+// (incorrectly) as `operationsFailed` within ~25 seconds. Being recoverable
+// instead of budget-burnt is the improvement. Being SILENT would not be — the
+// 0029 trigger lets `failed_review` go only to `queued` or `cancelled`, and
+// nothing in the runtime does either, so that invite waits until a human acts.
+
+function backlog(over: Partial<BacklogView> = {}): BacklogView {
+  return {
+    queuePending: 0, dlqDepth: 0, oldestPendingAgeSec: null,
+    operationsPending: 0, operationsFailed: 0, operationsAwaitingDelivery: 0,
+    operationsBlockedPrerequisite: 0, operationsBlockedFailedIngestion: 0,
+    operationsFailedPrerequisite: 0,
+    ingestionStuckQueued: 0, ingestionStuckFetching: 0,
+    writebackPending: 0, reconcileNoProgressRuns: 0, reconcileLastSuccessAt: null,
+    ...over,
+  };
+}
+
+const LIVE_SCHEDULER: SchedulerHealthView = {
+  registeredInThisProcess: false, running: false, loops: [],
+};
+
+describe('O-1 - blocked-forever is degraded, blocked-for-now is not', () => {
+  it('a TRANSIENTLY blocked invite is healthy — waiting is correct behaviour', () => {
+    const v = evaluateDegradation({
+      active: true, scheduler: LIVE_SCHEDULER,
+      backlog: backlog({ operationsPending: 3, operationsBlockedPrerequisite: 3 }),
+    });
+    expect(v.status).toBe('healthy');
+    expect(v.reasons).toEqual([]);
+  });
+
+  it('an invite blocked behind a failed_review ingestion DEGRADES', () => {
+    const v = evaluateDegradation({
+      active: true, scheduler: LIVE_SCHEDULER,
+      backlog: backlog({
+        operationsPending: 3,
+        operationsBlockedPrerequisite: 3,
+        operationsBlockedFailedIngestion: 1,
+      }),
+    });
+    expect(v.status).toBe('degraded');
+    expect(v.reasons).toContain('invite_blocked_failed_ingestion');
+  });
+
+  it('one blocked invite is already enough — this never needs to pile up', () => {
+    expect(DEGRADE_THRESHOLDS.operationsBlockedFailedIngestion).toBe(1);
+  });
+
+  it('the permanent count is a SUBSET, so it never contradicts the total', () => {
+    const b = backlog({ operationsBlockedPrerequisite: 5, operationsBlockedFailedIngestion: 2 });
+    expect(b.operationsBlockedFailedIngestion).toBeLessThanOrEqual(b.operationsBlockedPrerequisite);
+    // "Transiently waiting" is the difference, computed by the consumer rather
+    // than handed over pre-baked.
+    expect(b.operationsBlockedPrerequisite - b.operationsBlockedFailedIngestion).toBe(3);
+  });
+
+  it('stuck ingestion and blocked invite are INDEPENDENT signals', () => {
+    // A failed_review ingestion is not "stuck" — it reached a durable verdict.
+    // Reporting only `ingestion_stuck` would miss it entirely.
+    const v = evaluateDegradation({
+      active: true, scheduler: LIVE_SCHEDULER,
+      backlog: backlog({ operationsBlockedFailedIngestion: 1 }),
+    });
+    expect(v.reasons).toContain('invite_blocked_failed_ingestion');
+    expect(v.reasons).not.toContain('ingestion_stuck');
+  });
+
+  it('a disabled integration is idle, not degraded, however blocked it looks', () => {
+    const v = evaluateDegradation({
+      active: false, scheduler: LIVE_SCHEDULER,
+      backlog: backlog({ operationsBlockedFailedIngestion: 9 }),
+    });
+    expect(v.status).toBe('idle');
+    expect(v.reasons).toEqual([]);
   });
 });

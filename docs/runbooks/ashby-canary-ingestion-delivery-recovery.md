@@ -67,9 +67,14 @@ select screening_v2.ashby_prerequisite_backlog(900);
 ```
 
 - `ingestion_stuck_queued` / `ingestion_stuck_fetching` — stranded ingestions.
-- `pending_blocked` — invites correctly WAITING on a prerequisite.
+- `pending_blocked` — invites WAITING on a prerequisite (the total).
+- `pending_blocked_failed_ingestion` — the **subset** of those that will never
+  clear on their own, because the link's ingestion ended `failed_review` and only
+  a human can requeue it (see §2a). This one degrades `/health` with
+  `invite_blocked_failed_ingestion`; subtract it from `pending_blocked` to get
+  the genuinely transient count.
 - `failed_prerequisite` — invites already killed by the ordering defect; this is
-  the count step 3 reduces. Nothing new can enter it after `0035`.
+  the count step 4 reduces. Nothing new can enter it after `0035`.
 
 The same four counters surface on `GET /api/integrations/ashby/mission-control/health`
 under `backlog`, and a non-zero stuck count degrades the verdict with
@@ -85,6 +90,40 @@ correct instrument and needs nothing new: it locks the DLQ row `SKIP LOCKED` so
 two racing replays cannot both fire, re-inserts and consumes the row in one
 transaction, and resets `dedup_key` to null so the replay cannot collide with a
 live dedup key.
+
+### 2a. First check the ingestion state — a replay onto `failed_review` does nothing
+
+**Read the ingestion row before replaying.** The handler now records
+`failed_review` on the last attempt before dead-lettering, so from this point on
+a dead-lettered ingestion will usually leave the row in `failed_review` rather
+than `queued`. That matters, because the `0029` trigger allows
+`queued -> {fetching, cancelled}` **only**: a replayed job against a
+`failed_review` row cannot make the `fetching` transition, so the handler returns
+early and **the job reports success having done nothing at all.**
+
+```sql
+select state, attempts from screening_v2.ashby_resume_ingestions
+ where application_link_id = :application_link_id;
+```
+
+- **`queued`** — replay directly (this is the canary's own case).
+- **`failed_review`** — requeue it first. `failed_review -> queued` is the one
+  exit the trigger allows, and `advance_ashby_ingestion` is the audited way to
+  take it:
+
+  ```sql
+  select screening_v2.advance_ashby_ingestion(
+    :application_link_id, 'queued', null, null, null, null);
+  ```
+
+  This **increments `attempts`** against the ceiling of 5, and returns
+  `retry_exhausted` (leaving the row in `failed_review`) once that ceiling is
+  reached. If you get `retry_exhausted`, stop: the ingestion has genuinely failed
+  five times and the cause in `failed_reason` is what needs fixing, not the
+  attempt count.
+- **`ready`** or **`cancelled`** — terminal. Do not replay; skip to step 3.
+
+### 2b. Replay the job
 
 Replay **exactly one** job — the `ashby.ingestion` entry for this link:
 
@@ -114,11 +153,17 @@ select state, attempts, failed_reason
 ```
 
 - **`ready`** — proceed to step 4.
-- **`failed_review`** — **STOP.** Do not reopen the invite. `failed_reason`
+- **`failed_review`** — **STOP; do not reopen the invite.** `failed_reason`
   carries the sanitized cause (`fetch_invalid_request_*`, `fetch_url_unresolved`,
   `scan_*`, `guard_*`, `parse_error`, …); diagnose that first. Before `0035` this
   state was unreachable from `queued`, which is why the canary's row read
   `queued` rather than failed.
+
+  Note this is a *hard stop for the invite*, not for the ingestion: once the
+  underlying cause is fixed you can requeue via §2a and come back here. But the
+  invite stays blocked — and visibly so, via `pending_blocked_failed_ingestion`
+  and the `invite_blocked_failed_ingestion` health reason — until the ingestion
+  genuinely reaches `ready`.
 - **`fetching` for more than ~15 minutes** — the ingestion is stranded, not slow.
   `ashby_prerequisite_backlog` counts it under `ingestion_stuck_fetching`.
 
@@ -213,8 +258,15 @@ doing anything else.
 4. **Prerequisites are part of what RUNNABLE means.** `claim_ashby_operation`
    will not hand out an `invite_delivery` whose mapping is paused, or whose
    resume-backed link is not ingestion-ready. Waiting therefore costs no attempt,
-   and the operation becomes claimable the moment the prerequisite is satisfied —
-   no wake-up plumbing, no polling storm.
+   and the operation becomes claimable again on the next poll after the
+   prerequisite is satisfied — no wake-up plumbing, no polling storm.
+
+   **Promptly, not instantly.** An idle scheduler loop backs off geometrically to
+   a 60-second ceiling, and a prior deferral adds its own clamped delay on top,
+   so expect roughly **one to two minutes** between an ingestion reaching `ready`
+   and the invite being claimed. That is fine for invite delivery — but do not
+   build a tighter timing expectation on it, and do not read a 90-second gap as a
+   stall.
 5. **The post-claim race defers instead of failing.** `defer_ashby_operation`
    refunds the attempt the claim charged and reschedules behind a clamped delay.
 6. **Blocked and stuck work is visible** in `/health` rather than only by direct

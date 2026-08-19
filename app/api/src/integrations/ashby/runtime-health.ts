@@ -323,6 +323,20 @@ export interface BacklogView {
    */
   operationsBlockedPrerequisite: number;
   /**
+   * The SUBSET of `operationsBlockedPrerequisite` that cannot clear without a
+   * human: a resume-backed link whose ingestion ended `failed_review`. The 0029
+   * trigger lets that state go only to `queued` or `cancelled` and nothing in
+   * the runtime does either, so the invite waits forever.
+   *
+   * This exists because the ordering repair traded a wrong-but-loud signal for
+   * a right-but-quiet one: before it, such a link surfaced (incorrectly) as
+   * `operationsFailed` within ~25 seconds. Being recoverable instead of
+   * budget-burnt is the improvement; being SILENT would not be. Not subtracted
+   * from the total above — a consumer wanting "transiently waiting" takes the
+   * difference.
+   */
+  operationsBlockedFailedIngestion: number;
+  /**
    * Invite deliveries already driven to `failed` on a prerequisite-deferral
    * code. Non-zero means `reopen_ashby_invite_delivery` is needed; after the
    * 0035 fix nothing new can enter this count.
@@ -347,7 +361,8 @@ export interface BacklogView {
 const EMPTY_BACKLOG: BacklogView = {
   queuePending: 0, dlqDepth: 0, oldestPendingAgeSec: null,
   operationsPending: 0, operationsFailed: 0, operationsAwaitingDelivery: 0,
-  operationsBlockedPrerequisite: 0, operationsFailedPrerequisite: 0,
+  operationsBlockedPrerequisite: 0, operationsBlockedFailedIngestion: 0,
+  operationsFailedPrerequisite: 0,
   ingestionStuckQueued: 0, ingestionStuckFetching: 0,
   writebackPending: 0, reconcileNoProgressRuns: 0, reconcileLastSuccessAt: null,
 };
@@ -441,6 +456,7 @@ export async function readBacklog(
     queuePending, dlqDepth, oldestPendingAgeSec,
     operationsPending, operationsFailed, operationsAwaitingDelivery, writebackPending,
     operationsBlockedPrerequisite: counter('pending_blocked'),
+    operationsBlockedFailedIngestion: counter('pending_blocked_failed_ingestion'),
     operationsFailedPrerequisite: counter('failed_prerequisite'),
     ingestionStuckQueued: counter('ingestion_stuck_queued'),
     ingestionStuckFetching: counter('ingestion_stuck_fetching'),
@@ -561,6 +577,11 @@ export const DEGRADE_THRESHOLDS = {
   ingestionStuck: 1,
   /** Any invite killed by the prerequisite-ordering defect needs a reopen. */
   operationsFailedPrerequisite: 1,
+  /**
+   * Any invite blocked behind a failed_review ingestion needs a human — the
+   * ingestion cannot requeue itself, so this never clears on its own.
+   */
+  operationsBlockedFailedIngestion: 1,
 } as const;
 
 export type HealthStatus = 'healthy' | 'degraded' | 'idle';
@@ -601,6 +622,15 @@ export function evaluateDegradation(input: {
   if (input.backlog.ingestionStuckQueued + input.backlog.ingestionStuckFetching
       >= DEGRADE_THRESHOLDS.ingestionStuck) {
     reasons.push('ingestion_stuck');
+  }
+  // An invite blocked behind a failed_review ingestion is NOT transient: the
+  // ingestion can only leave failed_review via an explicit requeue or a cancel,
+  // neither of which the runtime performs. Degrading here is what keeps the
+  // ordering repair from converting a loud wrong signal into a silent right
+  // one — the invite is correctly not failed, but it is also going nowhere.
+  if (input.backlog.operationsBlockedFailedIngestion
+      >= DEGRADE_THRESHOLDS.operationsBlockedFailedIngestion) {
+    reasons.push('invite_blocked_failed_ingestion');
   }
   // Invites killed by the ordering defect. Nothing new can enter this count
   // after 0035, so a non-zero value is a recovery backlog, not a live fault.

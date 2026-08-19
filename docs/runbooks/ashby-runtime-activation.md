@@ -379,7 +379,7 @@ The public `GET /api/health` deliberately remains a liveness-only `{ok:true}`.
    `operationsAwaitingDelivery`, `writebackPending`, `reconcileNoProgressRuns`,
    `reconcileLastSuccessAt`, and (0035) `operationsBlockedPrerequisite`,
    `operationsFailedPrerequisite`, `ingestionStuckQueued`,
-   `ingestionStuckFetching`. The last four separate "waiting on a prerequisite"
+   `ingestionStuckFetching`, and `operationsBlockedFailedIngestion`. The last four separate "waiting on a prerequisite"
    from "broken": a prerequisite-gated invite counts as `operationsPending`
    forever and a stranded ingestion had no signal at all, so a failure of that
    shape was previously discoverable only by direct database inspection. See
@@ -420,7 +420,8 @@ flag on but a dead scheduler reports `degraded`, not `healthy`.
 | Retry refused with `blocked_terminal` | The application is withdrawn/deleted/cancelled | Correct — terminal work is never resurrected. |
 | Retry refused with `retry_exhausted` | `attempts` reached `max_attempts` | Deliberate bound. Investigate rather than forcing. |
 | `operationsAwaitingDelivery` climbing | Invites minted but no admin has taken the links | Expected until an operator runs the §5 hand-off. Not an error. |
-| `operationsBlockedPrerequisite` non-zero | Invites correctly WAITING on a paused mapping or an unfinished resume ingestion | Not an error, and it consumes no attempt. Resume the mapping, or let ingestion finish. |
+| `operationsBlockedPrerequisite` non-zero | Invites correctly WAITING on a paused mapping or an unfinished resume ingestion | Not an error, and it consumes no attempt. Resume the mapping, or let ingestion finish. Subtract `operationsBlockedFailedIngestion` for the genuinely transient count. |
+| `invite_blocked_failed_ingestion` in `reasons` | An invite is blocked behind a `failed_review` ingestion, which only a human can requeue | Real, non-transient. Fix the `failed_reason` cause, then requeue the ingestion per §2a of the recovery runbook. It will never clear on its own. |
 | `ingestion_stuck` in `reasons` | A resume ingestion has sat in `queued`/`fetching` past the stuck window | Real fault. Diagnose via the recovery runbook — check the scanner first, it is the usual cause. |
 | `invite_prerequisite_failed` in `reasons` | Invites killed by the pre-0035 ordering defect | Recovery backlog, not a live fault. Run `reopen_ashby_invite_delivery` per the recovery runbook. |
 | `writebackPending` climbing | Screenings completing with no approved result sink | Expected (§7). These are results awaiting manual publication. |

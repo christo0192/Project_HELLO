@@ -36,10 +36,18 @@
 --
 --        (a) Prerequisites become part of what RUNNABLE means, in the claim
 --            RPC itself, so a blocked operation is never selected: it stays
---            `pending`, is charged no attempt, and becomes claimable the
---            moment its prerequisite is satisfied. No wake-up plumbing and
---            no polling storm — the operation loop already polls, and the
---            predicate flips on its own.
+--            `pending`, is charged no attempt, and becomes claimable again on
+--            the next poll after its prerequisite is satisfied. No wake-up
+--            plumbing and no polling storm — the operation loop already polls,
+--            and the predicate flips on its own.
+--
+--            That is "promptly", not "instantly", and the distinction is worth
+--            stating: an idle scheduler loop backs off geometrically to a 60s
+--            ceiling (`nextPollDelayMs`), and a prior deferral adds its own
+--            clamped delay on top. Real wake latency after `ready` is therefore
+--            bounded by roughly one to two minutes. That is entirely adequate
+--            for invite delivery — but anyone reading "the moment" and building
+--            a tighter timing assumption on it would be wrong.
 --
 --        (b) `defer_ashby_operation` handles the POST-CLAIM race (a mapping
 --            paused, or an ingestion that changed state, between claim and
@@ -101,6 +109,18 @@
 --        stranded `queued` ingestion had no health signal of any kind — so a
 --        failure of this shape was discoverable only by direct DB inspection.
 --        `ashby_prerequisite_backlog` reports both, as counters only.
+--
+--        Waiting and PERMANENTLY blocked are not the same thing, and one
+--        counter cannot say both. A resume-backed link whose ingestion ended
+--        `failed_review` can NEVER satisfy the claim gate on its own: the 0029
+--        trigger lets `failed_review` go only to `queued` (an explicit requeue)
+--        or `cancelled`, so nothing in the runtime will ever move it. Its
+--        invite parks in `pending` forever. Before this migration that case
+--        surfaced — wrongly, but visibly — as `operationsFailed` within ~25
+--        seconds; the repair makes it recoverable instead of budget-burnt, and
+--        it must not become silent in exchange. It is therefore counted
+--        SEPARATELY and degrades the health verdict, while `pending_blocked`
+--        keeps its meaning as the total (a superset) of everything waiting.
 --
 -- NOTE ON THE FILE-HANDLE BOUND: the durable contract is
 -- `chk_ashby_application_links_resume_handle` = 1..512 from 0029, and it is
@@ -486,19 +506,30 @@ comment on function screening_v2.reopen_ashby_invite_delivery is
 -- ═══════════════════════════════════════════════════════════════════════
 -- 4. ashby_prerequisite_backlog — "waiting, not broken" + "stuck"
 -- ═══════════════════════════════════════════════════════════════════════
--- Four counters, no identifiers of any kind:
+-- Five counters, no identifiers of any kind:
 --
---   pending_blocked      invite deliveries held back by an unmet prerequisite
---                        (correct behaviour — waiting, not broken)
+--   pending_blocked      invite deliveries held back by an unmet prerequisite.
+--                        The TOTAL, and mostly correct behaviour — waiting,
+--                        not broken.
+--   pending_blocked_failed_ingestion
+--                        the SUBSET of the above that can never clear on its
+--                        own: a resume-backed link whose ingestion ended
+--                        `failed_review`. The 0029 trigger lets that state go
+--                        only to `queued` or `cancelled`, and nothing in the
+--                        runtime does either — so this invite waits forever
+--                        until a human acts. Counted apart from
+--                        `pending_blocked` precisely because "waiting 30
+--                        seconds" and "blocked until someone intervenes" are
+--                        different facts, and one number cannot carry both.
 --   failed_prerequisite  invite deliveries already killed by the ordering
 --                        defect and needing reopen_ashby_invite_delivery
 --   ingestion_stuck_queued    ingestions that never started
 --   ingestion_stuck_fetching  ingestions that started and never progressed
 --
--- The two stuck counters are the signal that did not exist anywhere before:
--- a stranded ingestion was invisible to /health and to Mission Control by
--- construction, so a failure of this shape was discoverable only by direct
--- database inspection.
+-- The stuck and permanently-blocked counters are the signal that did not exist
+-- anywhere before: a stranded or unrecoverable row was invisible to /health and
+-- to Mission Control by construction, so a failure of this shape was
+-- discoverable only by direct database inspection.
 
 create or replace function screening_v2.ashby_prerequisite_backlog(
   p_stuck_after_seconds integer default 900,
@@ -531,6 +562,25 @@ as $$
                 where i.application_link_id = l.id and i.state = 'ready'
              )
            )
+         )
+    ),
+    -- The subset of `pending_blocked` that cannot clear without a human.
+    -- Deliberately NOT subtracted from `pending_blocked`: that stays the
+    -- honest total, and a consumer that wants "transiently waiting" computes
+    -- the difference rather than being handed a pre-baked number whose
+    -- derivation it cannot see.
+    'pending_blocked_failed_ingestion', (
+      select count(*)
+        from screening_v2.ashby_operations o
+        join screening_v2.ashby_application_links l on l.id = o.application_link_id
+       where o.provider = 'ashby'
+         and o.operation_type = 'invite_delivery'
+         and o.state = 'pending'
+         and l.terminal_state is null
+         and l.external_resume_file_handle is not null
+         and exists (
+           select 1 from screening_v2.ashby_resume_ingestions i
+            where i.application_link_id = l.id and i.state = 'failed_review'
          )
     ),
     'failed_prerequisite', (
@@ -573,8 +623,10 @@ grant execute on function screening_v2.ashby_prerequisite_backlog(integer, times
   to service_role;
 
 comment on function screening_v2.ashby_prerequisite_backlog is
-  'Four counters for the invite-ordering surface: invite deliveries waiting on '
-  'an unmet prerequisite, invite deliveries already failed on a '
-  'prerequisite-deferral code, and resume ingestions stranded in queued or '
-  'fetching beyond a clamped age. Counters ONLY — no application, job, '
-  'candidate or tenant identifier. Service-role-only.';
+  'Five counters for the invite-ordering surface: invite deliveries waiting on '
+  'an unmet prerequisite (total), the SUBSET of those blocked behind a '
+  'failed_review ingestion and therefore unable to clear without a human, '
+  'invite deliveries already failed on a prerequisite-deferral code, and resume '
+  'ingestions stranded in queued or fetching beyond a clamped age. Counters '
+  'ONLY — no application, job, candidate or tenant identifier. '
+  'Service-role-only.';

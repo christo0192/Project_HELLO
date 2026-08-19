@@ -5889,6 +5889,7 @@ declare
   v_map      uuid;
   v_link     uuid;   -- resume-backed
   v_link_nr  uuid;   -- no resume handle
+  v_link_fr  uuid;   -- resume-backed, ingestion ends failed_review
   v_op       uuid;
   v_op_nr    uuid;
   v_res      jsonb;
@@ -6128,8 +6129,9 @@ begin
   -- ── The blocked/stuck counters: no identifiers, correct arithmetic. ──────
   v_res := screening_v2.ashby_prerequisite_backlog(900);
   perform _policy_tests.assert(
-    'ashby 0035: the prerequisite backlog reports all four counters',
-    v_res ? 'pending_blocked' and v_res ? 'failed_prerequisite'
+    'ashby 0035: the prerequisite backlog reports all five counters',
+    v_res ? 'pending_blocked' and v_res ? 'pending_blocked_failed_ingestion'
+      and v_res ? 'failed_prerequisite'
       and v_res ? 'ingestion_stuck_queued' and v_res ? 'ingestion_stuck_fetching',
     'got ' || coalesce(v_res::text,'<null>'));
   perform _policy_tests.assert(
@@ -6137,9 +6139,62 @@ begin
     v_res::text not like '%pol35%' and v_res::text not like '%' || v_link::text || '%',
     'counters only — never an application, job, candidate or tenant identifier');
 
-  delete from screening_v2.ashby_operations where application_link_id in (v_link, v_link_nr);
-  delete from screening_v2.ashby_resume_ingestions where application_link_id in (v_link, v_link_nr);
-  delete from screening_v2.ashby_application_links where id in (v_link, v_link_nr);
+  -- ── O-1: a failed_review ingestion blocks its invite FOREVER, and that is
+  -- a different fact from "waiting 30 seconds". The 0029 trigger lets
+  -- failed_review go only to queued or cancelled and nothing in the runtime
+  -- does either, so this invite never clears on its own. Build the case on a
+  -- fresh link so the terminal link above cannot contribute.
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol35-app-failed', 'pol35-job', v_map, repeat('h', 64))
+  returning id into v_link_fr;
+  perform screening_v2.advance_ashby_ingestion(v_link_fr, 'queued', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_fr, 'fetching', null, null, null, null);
+
+  v_res := screening_v2.enqueue_ashby_operation(
+    v_link_fr, 'invite_delivery', 'ashby:invite:manual:pol35-app-failed:pending',
+    null, null, gen_random_uuid());
+
+  -- While the ingestion is merely IN FLIGHT it is transient: blocked, but not
+  -- permanently so.
+  v_res := screening_v2.ashby_prerequisite_backlog(900);
+  perform _policy_tests.assert(
+    'ashby 0035/O1: an in-flight ingestion counts as blocked but NOT as permanently blocked',
+    (v_res->>'pending_blocked')::int >= 1
+      and (v_res->>'pending_blocked_failed_ingestion')::int = 0,
+    'got ' || coalesce(v_res::text,'<null>'));
+
+  perform screening_v2.advance_ashby_ingestion(
+    v_link_fr, 'failed_review', null, null, null, 'scan_unavailable');
+
+  v_res := screening_v2.ashby_prerequisite_backlog(900);
+  perform _policy_tests.assert(
+    'ashby 0035/O1: a failed_review ingestion counts as PERMANENTLY blocked',
+    (v_res->>'pending_blocked_failed_ingestion')::int = 1,
+    'got ' || coalesce(v_res::text,'<null>'));
+  perform _policy_tests.assert(
+    'ashby 0035/O1: the permanent count is a SUBSET of the total, not a replacement',
+    (v_res->>'pending_blocked')::int >= (v_res->>'pending_blocked_failed_ingestion')::int,
+    'got ' || coalesce(v_res::text,'<null>'));
+  perform _policy_tests.assert(
+    'ashby 0035/O1: the invite is still pending — blocked is never failed',
+    (select state from screening_v2.ashby_operations
+      where application_link_id = v_link_fr and operation_type = 'invite_delivery') = 'pending',
+    'a blocked invite must not be converted back into a failure');
+
+  -- An explicit requeue (the one exit the 0029 trigger allows) clears it.
+  perform screening_v2.advance_ashby_ingestion(v_link_fr, 'queued', null, null, null, null);
+  v_res := screening_v2.ashby_prerequisite_backlog(900);
+  perform _policy_tests.assert(
+    'ashby 0035/O1: requeueing the ingestion clears the permanent-block count',
+    (v_res->>'pending_blocked_failed_ingestion')::int = 0,
+    'got ' || coalesce(v_res::text,'<null>'));
+
+  delete from screening_v2.ashby_operations
+   where application_link_id in (v_link, v_link_nr, v_link_fr);
+  delete from screening_v2.ashby_resume_ingestions
+   where application_link_id in (v_link, v_link_nr, v_link_fr);
+  delete from screening_v2.ashby_application_links where id in (v_link, v_link_nr, v_link_fr);
   delete from screening_v2.ashby_job_mappings where id = v_map;
 end;
 $$;
