@@ -99,6 +99,26 @@ async function acquireLocalAudioTrack(): Promise<LocalAudioTrack> {
   }
 }
 
+/**
+ * Stable server codes surfaced by POST /api/livekit/exchange, mapped to
+ * candidate-facing copy. Each of these leaves the one-time invite UNCONSUMED
+ * server-side, so the join button stays usable and a retry is meaningful.
+ */
+function exchangeErrorMessage(error: unknown): string {
+  const code = error instanceof ApiError ? error.message : '';
+  if (code === 'screening_room_unavailable') {
+    return 'We could not open your screening room just now. Please try again in a moment — your invite is still valid.';
+  }
+  if (code === 'consent_required') {
+    return 'Your consent is missing or no longer valid. Please review and accept the consent form, then try again.';
+  }
+  if (code === 'invite_token_invalid_or_expired') {
+    return 'This invite is missing, expired, revoked, or already used.';
+  }
+  if (error instanceof ApiError && error.message.trim()) return error.message;
+  return 'Unable to join this screening.';
+}
+
 function microphoneErrorMessage(error: unknown): string {
   const name = error instanceof Error ? error.name : '';
   if (name === 'NotAllowedError' || name === 'SecurityError') {
@@ -414,7 +434,7 @@ export function CandidateJoinPage() {
         setError(microphoneErrorMessage(err));
         return;
       }
-      setError(err instanceof ApiError ? err.message : 'Unable to join this screening.');
+      setError(exchangeErrorMessage(err));
     }
   }
 

@@ -12,6 +12,15 @@
  * 4. Room metadata, participant metadata and token metadata contain no
  *    candidate name/email/phone, resume facts, JD/role focus, screening
  *    template, transcript/scoring context, provider secrets, or access tokens.
+ * 5. Exchange provisions a LiveKit room + authoritative egress just-in-time for
+ *    a session still in `created` (the shape Ashby materialization produces).
+ *    Provisioning runs AFTER the maintenance/consent/invite-validity gates and
+ *    BEFORE the one-time invite is consumed, so every provisioning failure
+ *    leaves the invite reusable and mints no grant and no LiveKit JWT.
+ *    Sessions already `waiting`/`in_progress` are untouched and make no
+ *    provider call. The candidate's valid invite plus a valid consent record
+ *    IS the authorization for provisioning — there is no recruiter auth on
+ *    this route.
  *
  * DB migration 0007 tables: candidate_invites, candidate_access_grants.
  * Invite active = consumed_at IS NULL AND revoked_at IS NULL.
@@ -33,19 +42,17 @@ import {
 import { createGrant } from '../lib/candidate-access.js';
 import { readMaintenanceState, maintenanceBlockedBody } from '../lib/maintenance.js';
 import type { InviteCreateResponse, InviteExchangeResponse } from '../schemas/invites.js';
-import { AccessToken, RoomServiceClient } from 'livekit-server-sdk';
+import { AccessToken } from 'livekit-server-sdk';
+import {
+  provisionRoomForCreatedSession,
+  requireLiveKitConfigured,
+} from '../lib/room-provisioning.js';
 
 export const invitesRouter = Router();
 
-// ── Env guard ────────────────────────────────────────────────────────
-
-function requireLiveKit() {
-  if (!env.livekitUrl || !env.livekitApiKey || !env.livekitApiSecret) {
-    throw new Error(
-      'LIVEKIT_URL, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET must be set in app/api/.env',
-    );
-  }
-}
+// LiveKit configuration guard, deterministic room naming, PII-free room
+// metadata and room/egress provisioning all live in lib/room-provisioning.ts,
+// shared with POST /api/livekit/start. Do not re-implement them here.
 
 // ── Token helpers ────────────────────────────────────────────────────
 // Single implementation, shared with the Ashby runtime materializer — see
@@ -95,7 +102,7 @@ invitesRouter.post(
   validateBody(inviteCreateSchema),
   async (req, res, next) => {
     try {
-      requireLiveKit();
+      requireLiveKitConfigured();
       const inviteCtx: InviteRequestContext | undefined = (req as any)._inviteContext;
       if (!inviteCtx) {
         return res.status(401).json({ error: 'authentication_required' });
@@ -230,7 +237,7 @@ invitesRouter.post(
   validateBody(inviteExchangeSchema),
   async (req, res, next) => {
     try {
-      requireLiveKit();
+      requireLiveKitConfigured();
       const { token } = req.body as { token: string };
       const digest = hashToken(token);
 
@@ -279,15 +286,58 @@ invitesRouter.post(
         .eq('id', invite.session_id)
         .single();
 
-      if (
-        !session ||
-        !['waiting', 'in_progress'].includes(session.status as string) ||
-        !session.external_call_id
-      ) {
+      if (!session) {
         return res.status(404).json({ error: STABLE_EXPIRY_MSG });
       }
 
-      const roomName = session.external_call_id;
+      const sessionStatus = session.status as string;
+      let roomName: string;
+
+      if (
+        (sessionStatus === 'waiting' || sessionStatus === 'in_progress')
+        && session.external_call_id
+      ) {
+        // Already provisioned (the recruiter `/start` path, or a concurrent
+        // exchange that got here first). Untouched — no provider call.
+        roomName = session.external_call_id as string;
+      } else if (sessionStatus === 'created') {
+        // ── Step 2b: JIT room provisioning ────────────────────────────────
+        // Ashby materialization creates exactly one `created` session with a
+        // NULL external_call_id and no room. Provision it now — AFTER the
+        // maintenance + consent + invite-validity gates above and BEFORE the
+        // one-time invite is consumed, so any failure leaves the invite
+        // reusable. The room/egress therefore start at join time, not when the
+        // 24h link was minted, which is also what keeps the empty-room timeout
+        // meaningful.
+        //
+        // Quota: this path deliberately does NOT reserve a launch-capacity
+        // slot. Quota is reserved at session-creation time on `/start`;
+        // charging it here would fail a candidate's click with a 409 after HR
+        // already promised the interview, and would double-count once
+        // materialization reserves. Residual (documented, not bypassed):
+        // Ashby-materialized sessions are currently created outside quota
+        // accounting — see docs/runbooks/ashby-room-provisioning.md.
+        const provisioned = await provisionRoomForCreatedSession(
+          session.id as string,
+          'existing_session',
+        );
+        if (!provisioned.ok) {
+          if (provisioned.code === 'provider_failed') {
+            // Transient provider/storage failure. The session stays `created`
+            // and the invite stays unconsumed — the candidate can retry. No
+            // grant and no LiveKit JWT are minted, so nobody can join a room
+            // whose authoritative recording did not start.
+            return res.status(503).json({ error: 'screening_room_unavailable' });
+          }
+          // `not_joinable`: a concurrent actor moved the row somewhere we
+          // cannot join. Stable 4xx, invite unconsumed.
+          return res.status(404).json({ error: STABLE_EXPIRY_MSG });
+        }
+        roomName = provisioned.roomName;
+      } else {
+        // Terminal/failed/expired/cancelled — never provisionable.
+        return res.status(404).json({ error: STABLE_EXPIRY_MSG });
+      }
 
       // Step 3: Atomic CAS — update consumed_at where consumed_at IS NULL.
       const nowIso = new Date().toISOString();

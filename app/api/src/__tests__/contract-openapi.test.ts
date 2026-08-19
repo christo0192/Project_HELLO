@@ -895,7 +895,9 @@ describe('OpenAPI document integrity', () => {
     const schemas = ((spec as YMap).components as YMap).schemas as YMap;
     const securitySchemes = ((spec as YMap).components as YMap).securitySchemes as YMap;
     expect(Object.keys(paths).length).toBe(70);
-    expect(Object.keys(schemas).length).toBe(149);
+    // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
+    // 503 bodies on exchangeInvite).
+    expect(Object.keys(schemas).length).toBe(151);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.
