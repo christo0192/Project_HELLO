@@ -120,6 +120,14 @@ export function createAshbyWebhookRouter(deps: AshbyWebhookRouterDeps = {}): Rou
         const outcome = await ingestWebhook(parsed, {
           receipts: resolveReceipts(),
         });
+        // `code` is a closed, sanitized ingress result (never provider body,
+        // ids, signature, or candidate data). This makes Ashby's one-shot
+        // enablement handshake diagnosable without exposing webhook content.
+        logger.info('unknown_event', {
+          error_category: 'ashby_webhook_ingress',
+          error_type: outcome.code,
+          http_status: outcome.httpStatus,
+        });
         if (outcome.httpStatus === 200) {
           return res.status(200).json({ ok: true, status: outcome.code });
         }
