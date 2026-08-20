@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { AshbyMissionControlPage } from './AshbyMissionControlPage';
 
-const { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation, deliverAshbyManualInvite } = vi.hoisted(() => ({
+const { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation, deliverAshbyManualInvite, discoverAshbyFeedbackForm } = vi.hoisted(() => ({
   listAshbyMappings: vi.fn(),
   listAshbyWorkflows: vi.fn(),
   pauseAshbyMapping: vi.fn(),
@@ -11,10 +11,11 @@ const { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMap
   cancelAshbyWorkflow: vi.fn(),
   retryAshbyOperation: vi.fn(),
   deliverAshbyManualInvite: vi.fn(),
+  discoverAshbyFeedbackForm: vi.fn(),
 }));
 
 vi.mock('../api', () => ({
-  api: { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation, deliverAshbyManualInvite },
+  api: { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation, deliverAshbyManualInvite, discoverAshbyFeedbackForm },
   ApiError: class ApiError extends Error {
     status: number;
     constructor(m: string, s: number) { super(m); this.status = s; }
@@ -223,5 +224,184 @@ describe('AshbyMissionControlPage — manual invite delivery (B1)', () => {
     const button = await screen.findByRole('button', { name: /get invite link/i });
     expect(button).toBeDisabled();
     expect(deliverAshbyManualInvite).not.toHaveBeenCalled();
+  });
+});
+
+// ── Read-only feedback-form schema discovery ───────────────────────────────
+
+const FORM_SCHEMA = {
+  ok: true,
+  empty: false,
+  truncated: false,
+  forms: [
+    {
+      formDefinitionId: 'form_1',
+      title: 'Hello Christy Feedback',
+      interviewId: 'iv_1',
+      interviewTitle: 'Hello Christy Screen',
+      stageId: 'stage_ai',
+      stageTitle: 'AI Screening',
+      fieldCount: 2,
+      schemaAvailable: true,
+      sections: [
+        {
+          id: null,
+          title: 'Overall',
+          fields: [
+            {
+              id: 'field_overall',
+              title: 'Overall Recommendation',
+              path: 'overall_recommendation',
+              type: 'ValueSelect',
+              required: true,
+              options: [
+                { value: '4', label: '4 - Strong Yes' },
+                { value: '3', label: '3 - Yes' },
+              ],
+              optionsTruncated: false,
+            },
+            {
+              id: 'field_summary',
+              title: 'Summary',
+              path: 'summary',
+              type: 'String',
+              required: false,
+              options: [],
+              optionsTruncated: false,
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
+describe('AshbyMissionControlPage — feedback-form schema discovery (read-only)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    listAshbyMappings.mockResolvedValue(MAPPINGS);
+    listAshbyWorkflows.mockResolvedValue(WORKFLOWS);
+    discoverAshbyFeedbackForm.mockResolvedValue(FORM_SCHEMA);
+  });
+
+  it('renders ids, labels, types, required flags and the scale for the chosen job', async () => {
+    render(<AshbyMissionControlPage />);
+    const buttons = await screen.findAllByRole('button', { name: /discover feedback form/i });
+    await userEvent.click(buttons[0]);
+
+    await waitFor(() => expect(discoverAshbyFeedbackForm).toHaveBeenCalledWith('job_1'));
+    expect(discoverAshbyFeedbackForm).toHaveBeenCalledTimes(1);
+
+    expect(await screen.findByText(/form id: form_1/)).toBeInTheDocument();
+    expect(screen.getByText('Hello Christy Feedback')).toBeInTheDocument();
+    expect(screen.getByText(/stage: AI Screening \(stage_ai\)/)).toBeInTheDocument();
+    expect(screen.getByText(/interview: Hello Christy Screen \(iv_1\)/)).toBeInTheDocument();
+
+    const text = document.body.textContent ?? '';
+    expect(text).toContain('field_overall');
+    expect(text).toContain('Overall Recommendation');
+    expect(text).toContain('[overall_recommendation]');
+    expect(text).toContain('ValueSelect');
+    expect(text).toContain('required');
+    expect(text).toContain('4 - Strong Yes | 3 - Yes');
+    expect(text).toContain('field_summary');
+  });
+
+  it('labels the surface read-only and unverified and never claims a binding', async () => {
+    render(<AshbyMissionControlPage />);
+    await userEvent.click((await screen.findAllByRole('button', { name: /discover feedback form/i }))[0]);
+    await screen.findByText(/form id: form_1/);
+
+    const text = document.body.textContent ?? '';
+    expect(text).toMatch(/read-only, unverified/i);
+    expect(text).toMatch(/no feedback content/i);
+    expect(text).toMatch(/nothing is saved or bound/i);
+    // A read must never read as a write. The disclaimer legitimately contains
+    // "saved"/"bound" in the NEGATIVE, so assert against affirmative claims of
+    // a write having happened rather than against the bare words.
+    expect(text).not.toMatch(/binding (created|saved|applied)/i);
+    expect(text).not.toMatch(/(configuration|mapping|form) (updated|saved|applied)/i);
+    expect(text).not.toMatch(/write-?back (enabled|configured|ready)/i);
+  });
+
+  it('renders no candidate PII, token, or URL — structure only', async () => {
+    render(<AshbyMissionControlPage />);
+    await userEvent.click((await screen.findAllByRole('button', { name: /discover feedback form/i }))[0]);
+    await screen.findByText(/form id: form_1/);
+
+    const text = document.body.textContent ?? '';
+    expect(text).not.toMatch(/\S+@\S+\.\S+/);
+    expect(text).not.toMatch(/bearer|presigned|invite_token|resume_url|https?:\/\//i);
+  });
+
+  it('says plainly when the plan names no form at all', async () => {
+    discoverAshbyFeedbackForm.mockResolvedValue({ ok: true, forms: [], empty: true, truncated: false });
+    render(<AshbyMissionControlPage />);
+    await userEvent.click((await screen.findAllByRole('button', { name: /discover feedback form/i }))[0]);
+    expect(await screen.findByText(/no feedback form is named/i)).toBeInTheDocument();
+  });
+
+  it('distinguishes "fields not readable here" from "the form has no fields"', async () => {
+    discoverAshbyFeedbackForm.mockResolvedValue({
+      ok: true,
+      empty: false,
+      truncated: false,
+      forms: [{
+        formDefinitionId: 'form_ref_only',
+        title: null,
+        interviewId: null,
+        interviewTitle: null,
+        stageId: null,
+        stageTitle: null,
+        sections: [],
+        fieldCount: 0,
+        schemaAvailable: false,
+      }],
+    });
+    render(<AshbyMissionControlPage />);
+    await userEvent.click((await screen.findAllByRole('button', { name: /discover feedback form/i }))[0]);
+    expect(await screen.findByText(/only\s+its id could be read/i)).toBeInTheDocument();
+    expect(document.body.textContent ?? '').toMatch(/not a claim that the form has no fields/i);
+  });
+
+  it('warns when a safety bound clipped the result', async () => {
+    discoverAshbyFeedbackForm.mockResolvedValue({ ...FORM_SCHEMA, truncated: true });
+    render(<AshbyMissionControlPage />);
+    await userEvent.click((await screen.findAllByRole('button', { name: /discover feedback form/i }))[0]);
+    expect(await screen.findByText(/truncated by a safety bound/i)).toBeInTheDocument();
+  });
+
+  it('surfaces a sanitized API error without rendering a schema', async () => {
+    discoverAshbyFeedbackForm.mockResolvedValue({ ok: false, error: 'probe_unavailable' });
+    render(<AshbyMissionControlPage />);
+    await userEvent.click((await screen.findAllByRole('button', { name: /discover feedback form/i }))[0]);
+    expect(await screen.findByText('probe_unavailable')).toBeInTheDocument();
+    expect(screen.queryByText(/form id:/)).not.toBeInTheDocument();
+  });
+
+  it('surfaces a thrown API error as an alert', async () => {
+    discoverAshbyFeedbackForm.mockRejectedValue({ message: 'network down' });
+    render(<AshbyMissionControlPage />);
+    await userEvent.click((await screen.findAllByRole('button', { name: /discover feedback form/i }))[0]);
+    expect(await screen.findByRole('alert')).toBeInTheDocument();
+    expect(screen.queryByText(/form id:/)).not.toBeInTheDocument();
+  });
+
+  it('shows the schema for one mapping at a time', async () => {
+    render(<AshbyMissionControlPage />);
+    const buttons = await screen.findAllByRole('button', { name: /discover feedback form/i });
+    await userEvent.click(buttons[0]);
+    await screen.findByText(/form id: form_1/);
+    discoverAshbyFeedbackForm.mockResolvedValue({ ok: true, forms: [], empty: true, truncated: false });
+    await userEvent.click(buttons[1]);
+    await waitFor(() => expect(discoverAshbyFeedbackForm).toHaveBeenLastCalledWith('job_2'));
+    expect(screen.queryByText(/form id: form_1/)).not.toBeInTheDocument();
+  });
+
+  it('has no axe violations with a schema rendered', async () => {
+    const { container } = render(<AshbyMissionControlPage />);
+    await userEvent.click((await screen.findAllByRole('button', { name: /discover feedback form/i }))[0]);
+    await screen.findByText(/form id: form_1/);
+    await expect(container).toHaveNoViolations();
   });
 });

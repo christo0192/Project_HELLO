@@ -28,6 +28,7 @@ import {
   loadAshbyConfig,
   loadAshbyRuntimeConfig,
   isAshbyRuntimeActive,
+  isAshbyReadOnlyProbeActive,
   type AshbyIntegrationConfig,
   type AshbyRuntimeConfig,
 } from './config.js';
@@ -295,7 +296,7 @@ export function createAshbyProbeClient(options: {
 }): AshbyClient | null {
   const config = options.config ?? loadAshbyConfig();
   const runtimeConfig = options.runtimeConfig ?? loadAshbyRuntimeConfig();
-  if (!isAshbyRuntimeActive(config, runtimeConfig)) return null;
+  if (!isAshbyReadOnlyProbeActive(config, runtimeConfig)) return null;
   return createAshbyClient({
     apiKey: runtimeConfig.apiKey,
     transport: options.transport,

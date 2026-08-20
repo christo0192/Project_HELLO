@@ -628,6 +628,59 @@ export interface AshbyManualInviteResponse {
   error?: string;
 }
 
+/**
+ * Read-only Ashby feedback-form SCHEMA discovery (admin). Structure only —
+ * opaque ids, bounded labels, input types, and scale options. It never carries
+ * a submitted answer, score, comment, or any candidate field, and nothing here
+ * is persisted or bound to write-back by viewing it.
+ */
+export interface AshbyFormOption {
+  value: string | null;
+  label: string | null;
+}
+
+export interface AshbyFormField {
+  id: string;
+  title: string | null;
+  path: string | null;
+  type: string | null;
+  /** `null` = the payload did not say. Never inferred. */
+  required: boolean | null;
+  options: AshbyFormOption[];
+  optionsTruncated: boolean;
+}
+
+export interface AshbyFormSection {
+  id: string | null;
+  title: string | null;
+  fields: AshbyFormField[];
+}
+
+export interface AshbyFeedbackForm {
+  formDefinitionId: string;
+  title: string | null;
+  interviewId: string | null;
+  interviewTitle: string | null;
+  stageId: string | null;
+  stageTitle: string | null;
+  sections: AshbyFormSection[];
+  fieldCount: number;
+  /**
+   * FALSE = the interview plan named this form but carried no field schema.
+   * An empty `sections` is then "not readable here", NOT "the form is empty".
+   */
+  schemaAvailable: boolean;
+}
+
+export interface AshbyFeedbackFormResponse {
+  ok: boolean;
+  forms?: AshbyFeedbackForm[];
+  empty?: boolean;
+  /** True when a bound clipped the result — the view is partial. */
+  truncated?: boolean;
+  error?: string;
+}
+
 export interface AshbyMcActionResponse {
   ok: boolean;
   status?: string;

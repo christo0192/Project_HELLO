@@ -10,6 +10,7 @@ import { describe, it, expect, vi } from 'vitest';
 import express, { type Request, type Response, type NextFunction } from 'express';
 import request from 'supertest';
 import { createAshbyMissionControlRouter } from '../routes/ashby-mission-control.js';
+import { setAuditSink, getAuditSink, type AuditEntry } from '../lib/audit.js';
 import type { MissionControlStore } from '../integrations/ashby/workflow-stores.js';
 
 const UUID = '11111111-1111-4111-8111-111111111111';
@@ -616,6 +617,200 @@ describe('GET /jobs/:externalJobId/stages — read-only probe', () => {
     expect(res.status).toBe(502);
     expect(res.body.error).toBe('probe_unavailable');
     expect(JSON.stringify(res.body)).not.toContain('tenant xyz');
+  });
+});
+
+describe('GET /jobs/:externalJobId/feedback-form — read-only schema discovery', () => {
+  const PLAN_WITH_FORM = {
+    stages: [{
+      id: 'stage_ai',
+      title: 'AI Screening',
+      candidateEmail: 'leak@example.invalid',
+      activities: [{
+        interviews: [{
+          interviewId: 'iv_1',
+          title: 'Hello Christy Screen',
+          feedbackFormDefinition: {
+            id: 'form_1',
+            title: 'Hello Christy Feedback',
+            formDefinition: {
+              sections: [{
+                title: 'Overall',
+                descriptionHtml: '<p>tenant-html-must-not-surface</p>',
+                fields: [{
+                  isRequired: true,
+                  field: {
+                    id: 'field_overall',
+                    type: 'ValueSelect',
+                    path: 'overall_recommendation',
+                    title: 'Overall Recommendation',
+                    submittedValue: 'ANSWER-MUST-NOT-SURFACE',
+                    selectableValues: [{ label: '4 - Strong Yes', value: '4' }],
+                  },
+                }],
+              }],
+            },
+          },
+        }],
+      }],
+    }],
+  };
+
+  it('returns sanitized form schema for an admin and no feedback content', async () => {
+    const probeReader = { jobInterviewPlanInfo: async () => ({ results: PLAN_WITH_FORM }) };
+    const res = await request(appWithDeps('admin', { store: fakeStore(), probeReader: probeReader as never }))
+      .get('/mc/jobs/job_1/feedback-form');
+
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.empty).toBe(false);
+    expect(res.body.truncated).toBe(false);
+    expect(res.body.forms).toHaveLength(1);
+    expect(res.body.forms[0]).toMatchObject({
+      formDefinitionId: 'form_1',
+      title: 'Hello Christy Feedback',
+      stageId: 'stage_ai',
+      interviewId: 'iv_1',
+      schemaAvailable: true,
+      fieldCount: 1,
+    });
+    expect(res.body.forms[0].sections[0].fields[0]).toEqual({
+      id: 'field_overall',
+      title: 'Overall Recommendation',
+      path: 'overall_recommendation',
+      type: 'ValueSelect',
+      required: true,
+      options: [{ value: '4', label: '4 - Strong Yes' }],
+      optionsTruncated: false,
+    });
+
+    const body = JSON.stringify(res.body);
+    for (const forbidden of ['leak@example.invalid', 'ANSWER-MUST-NOT-SURFACE', 'tenant-html-must-not-surface']) {
+      expect(body, `must not leak ${forbidden}`).not.toContain(forbidden);
+    }
+  });
+
+  it('makes exactly ONE provider read and calls no other member of the client', async () => {
+    const calls: string[] = [];
+    // Any member the handler touches beyond the single read throws, so
+    // applicationFeedback.list or a mutation would fail the test loudly.
+    const probeReader = new Proxy(
+      {
+        jobInterviewPlanInfo: async (jobId: string) => {
+          calls.push(`jobInterviewPlanInfo:${jobId}`);
+          return { results: PLAN_WITH_FORM };
+        },
+      } as Record<string, unknown>,
+      {
+        get(target, prop: string) {
+          if (prop in target) return target[prop];
+          throw new Error(`route reached a forbidden client member: ${String(prop)}`);
+        },
+      },
+    );
+    const res = await request(appWithDeps('admin', { store: fakeStore(), probeReader: probeReader as never }))
+      .get('/mc/jobs/job_1/feedback-form');
+    expect(res.status).toBe(200);
+    expect(calls).toEqual(['jobInterviewPlanInfo:job_1']);
+  });
+
+  it('is a GET-only surface — no mutating verb is mounted on the path', async () => {
+    const deps = { store: fakeStore(), probeReader: null };
+    const app = appWithDeps('admin', deps);
+    for (const verb of ['post', 'put', 'patch', 'delete'] as const) {
+      const res = await request(app)[verb]('/mc/jobs/job_1/feedback-form').send({});
+      expect(res.status, `${verb} must not be routable`).toBe(404);
+    }
+  });
+
+  it('answers 503 when the integration is disabled — no client, no call', async () => {
+    const res = await request(appWithDeps('admin', { store: fakeStore(), probeReader: null }))
+      .get('/mc/jobs/job_1/feedback-form');
+    expect(res.status).toBe(503);
+    expect(res.body.error).toBe('integration_disabled');
+  });
+
+  it('is admin-only', async () => {
+    const deps = { store: fakeStore(), probeReader: null };
+    expect((await request(appWithDeps('interviewer', deps)).get('/mc/jobs/job_1/feedback-form')).status).toBe(403);
+    expect((await request(appWithDeps('viewer', deps)).get('/mc/jobs/job_1/feedback-form')).status).toBe(403);
+    expect((await request(appWithDeps(null, deps)).get('/mc/jobs/job_1/feedback-form')).status).toBe(403);
+  });
+
+  it('rejects a malformed job id before any provider call', async () => {
+    const jobInterviewPlanInfo = vi.fn();
+    const res = await request(appWithDeps('admin', { store: fakeStore(), probeReader: { jobInterviewPlanInfo } as never }))
+      .get('/mc/jobs/has%20space/feedback-form');
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('invalid_external_job_id');
+    expect(jobInterviewPlanInfo).not.toHaveBeenCalled();
+  });
+
+  it('reports a provider failure as a sanitized 502 that echoes no provider body', async () => {
+    const probeReader = {
+      jobInterviewPlanInfo: async () => { throw new Error('403 Forbidden: tenant xyz lacks hiringProcessMetadataRead'); },
+    };
+    const res = await request(appWithDeps('admin', { store: fakeStore(), probeReader: probeReader as never }))
+      .get('/mc/jobs/job_1/feedback-form');
+    expect(res.status).toBe(502);
+    expect(res.body).toEqual({ ok: false, error: 'probe_unavailable' });
+    expect(JSON.stringify(res.body)).not.toContain('tenant xyz');
+  });
+
+  it('reports an unusable provider body as a sanitized 502, not a half-built schema', async () => {
+    const probeReader = { jobInterviewPlanInfo: async () => { throw new TypeError('unexpected token'); } };
+    const res = await request(appWithDeps('admin', { store: fakeStore(), probeReader: probeReader as never }))
+      .get('/mc/jobs/job_1/feedback-form');
+    expect(res.status).toBe(502);
+    expect(res.body.error).toBe('probe_unavailable');
+  });
+
+  it('reports a plan with no attached form as empty rather than as an error', async () => {
+    const probeReader = { jobInterviewPlanInfo: async () => ({ results: { stages: [{ id: 's1', activities: [] }] } }) };
+    const res = await request(appWithDeps('admin', { store: fakeStore(), probeReader: probeReader as never }))
+      .get('/mc/jobs/job_1/feedback-form');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, forms: [], empty: true, truncated: false });
+  });
+
+  it('audits bounded COUNTS only — never a form, section, field or job id', async () => {
+    const entries: AuditEntry[] = [];
+    const previous = getAuditSink();
+    setAuditSink(async (entry) => { entries.push(entry); });
+    try {
+      const probeReader = { jobInterviewPlanInfo: async () => ({ results: PLAN_WITH_FORM }) };
+      const res = await request(appWithDeps('admin', { store: fakeStore(), probeReader: probeReader as never }))
+        .get('/mc/jobs/job_1/feedback-form');
+      expect(res.status).toBe(200);
+    } finally {
+      setAuditSink(previous);
+    }
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0].metadata).toEqual({
+      resource: 'ashby_job_feedback_forms',
+      count: 1,
+      field_count: 1,
+      truncated: false,
+    });
+    // Tenant configuration ids must not spread beyond the one authenticated
+    // response that asked for them.
+    const audited = JSON.stringify(entries[0].metadata);
+    for (const id of ['form_1', 'field_overall', 'stage_ai', 'iv_1']) {
+      expect(audited, `audit must not carry ${id}`).not.toContain(id);
+    }
+  });
+
+  it('surfaces a form the plan only NAMES as schema-unavailable, not as an empty form', async () => {
+    const probeReader = {
+      jobInterviewPlanInfo: async () => ({
+        results: { stages: [{ id: 's1', interviews: [{ feedbackFormDefinitionId: 'form_ref_only' }] }] },
+      }),
+    };
+    const res = await request(appWithDeps('admin', { store: fakeStore(), probeReader: probeReader as never }))
+      .get('/mc/jobs/job_1/feedback-form');
+    expect(res.status).toBe(200);
+    expect(res.body.forms[0]).toMatchObject({ formDefinitionId: 'form_ref_only', schemaAvailable: false, sections: [], fieldCount: 0 });
   });
 });
 

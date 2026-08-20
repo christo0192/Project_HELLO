@@ -346,6 +346,19 @@ export function isAshbyRuntimeActive(
 }
 
 /**
+ * Read-only provider discovery may run independently of the workflow runtime.
+ * It requires the integration/webhook gate and API-key presence, but not the
+ * scheduler/runtime flag. This permits an admin to inspect a form schema while
+ * imports, reconciliation, invitations, and write-back remain disabled.
+ */
+export function isAshbyReadOnlyProbeActive(
+  config: AshbyIntegrationConfig,
+  runtime: AshbyRuntimeConfig,
+): boolean {
+  return isAshbyWebhookActive(config) && runtime.apiKeyConfigured;
+}
+
+/**
  * Non-sensitive health/metadata view of the runtime state. Booleans and
  * bounded integers ONLY — never the API key, the webhook secret, or a host.
  * `resumeAllowlistEnabled` reports whether any host is configured WITHOUT
