@@ -26,6 +26,8 @@ export interface ApplicationView {
   applicationId?: string;
   jobId?: string;
   currentStageId?: string;
+  /** Candidate identity used only for the candidate.info resume fallback. */
+  candidateId?: string;
 }
 
 /** Terminal triggers (parity with ashby_application_links.terminal_state). */

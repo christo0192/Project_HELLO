@@ -38,6 +38,7 @@ class FakeStores implements WorkflowStores {
   ingestionStates: Array<{ linkId: string; state: string }> = [];
   operations: Array<{ linkId: string; type: string; key: string; dependsOn?: string | null; marker?: string | null }> = [];
   seededLink?: ExistingLinkRow;
+  createdResumeHandle: string | null | undefined;
   advanceResult: { status: string; state?: string } = { status: 'ok' };
   enqueueResult: EnqueueResult = { status: 'inserted', id: 'op_1' };
   private n = 0;
@@ -45,8 +46,9 @@ class FakeStores implements WorkflowStores {
   async findLinkByApplicationId(appId: string): Promise<ExistingLinkRow | null> {
     return this.seededLink ?? this.links.get(appId) ?? null;
   }
-  async createLink(input: { externalApplicationId: string }): Promise<{ id: string }> {
+  async createLink(input: { externalApplicationId: string; externalResumeFileHandle: string | null }): Promise<{ id: string }> {
     const id = `link_${++this.n}`;
+    this.createdResumeHandle = input.externalResumeFileHandle;
     this.links.set(input.externalApplicationId, { id, externalApplicationId: input.externalApplicationId, terminalState: null });
     return { id };
   }
@@ -89,6 +91,36 @@ describe('runImport', () => {
     const r = await runImport('app_1', { gates: enabledGates, client: reader(appAtAi), stores, resolveMapping: async () => mapping() });
     expect(r.status).toBe('imported');
     if (r.status === 'imported') { expect(r.reused).toBe(true); expect(r.applicationLinkId).toBe('link_x'); }
+  });
+
+  it('falls back to candidate.info when application.info omits the attached resume', async () => {
+    const stores = new FakeStores();
+    const candidateInfo = vi.fn(async () => ({
+      results: { resumeFileHandle: { handle: 'candidate_resume_handle' } },
+      moreDataAvailable: false,
+    }));
+    const app = {
+      application: {
+        id: 'app_1', job: { id: 'job_1' }, candidate: { id: 'candidate_1' },
+        currentInterviewStage: { id: AI },
+      },
+    };
+
+    const r = await runImport('app_1', {
+      gates: enabledGates,
+      client: { ...reader(app), candidateInfo },
+      stores,
+      resolveMapping: async () => mapping({ deliveryMode: 'manual' }),
+      readResumeFileHandle: (value) => {
+        const rec = value as { resumeFileHandle?: { handle?: unknown } };
+        return typeof rec.resumeFileHandle?.handle === 'string' ? rec.resumeFileHandle.handle : null;
+      },
+    });
+
+    expect(r.status).toBe('imported');
+    expect(candidateInfo).toHaveBeenCalledOnce();
+    expect(candidateInfo).toHaveBeenCalledWith('candidate_1');
+    expect(stores.createdResumeHandle).toBe('candidate_resume_handle');
   });
 
   it('skips a terminal link, a non-AI stage, and an inactive mapping', async () => {

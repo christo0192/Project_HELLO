@@ -43,9 +43,15 @@ import type { AshbyResult, OpaqueRecord } from './types.js';
 
 // ── Injected seams ───────────────────────────────────────────────────────────
 
-/** Narrow reader over the authoritative Ashby client (application.info). */
+/** Narrow reader over the authoritative Ashby application/candidate APIs. */
 export interface ApplicationReader {
   applicationInfo<T = OpaqueRecord>(applicationId: string): Promise<AshbyResult<T>>;
+  /**
+   * Optional for synthetic adapters; the production client implements it.
+   * Ashby may expose an attached resume only on candidate.info, not
+   * application.info, so imports use this as an authoritative fallback.
+   */
+  candidateInfo?<T = OpaqueRecord>(candidateId: string): Promise<AshbyResult<T>>;
 }
 
 export interface ExistingLinkRow {
@@ -253,7 +259,15 @@ export async function runImport(externalApplicationId: string, deps: ImportDeps)
   if (decision.action !== 'import') return { status: 'skipped', reason: decision.reason };
 
   // Application-id-only identity: reuse the existing non-terminal link or create one.
-  const resumeHandle = deps.readResumeFileHandle?.(info.results) ?? null;
+  // Ashby does not consistently include candidate-level attachments in
+  // application.info. Fall back to candidate.info only when the application
+  // payload has no usable handle; immediately discard everything except the
+  // bounded opaque handle extracted by the injected reader.
+  let resumeHandle = deps.readResumeFileHandle?.(info.results) ?? null;
+  if (!resumeHandle && view.candidateId && deps.client.candidateInfo && deps.readResumeFileHandle) {
+    const candidate = await deps.client.candidateInfo(view.candidateId);
+    resumeHandle = deps.readResumeFileHandle(candidate.results);
+  }
   let linkId: string;
   let reused: boolean;
   if (existing && existing.externalApplicationId === appId) {

@@ -77,8 +77,8 @@ describe('extractWebhookSignal', () => {
 
 describe('extractApplicationInfo', () => {
   it('reads id/job/stage from a nested application', () => {
-    expect(extractApplicationInfo({ application: { id: 'a', job: { id: 'j' }, currentInterviewStage: { id: 's' } } }))
-      .toEqual({ applicationId: 'a', jobId: 'j', currentStageId: 's' });
+    expect(extractApplicationInfo({ application: { id: 'a', job: { id: 'j' }, candidate: { id: 'c' }, currentInterviewStage: { id: 's' } } }))
+      .toEqual({ applicationId: 'a', jobId: 'j', currentStageId: 's', candidateId: 'c' });
   });
   it('returns {} for a non-object', () => {
     expect(extractApplicationInfo(null)).toEqual({});
