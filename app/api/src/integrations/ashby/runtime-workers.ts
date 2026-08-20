@@ -51,7 +51,7 @@ import {
 } from './scanner-readiness.js';
 import { runReconciliation, DEFAULT_CHECKPOINT_KEY } from './reconciliation.js';
 import type { ReconcileResult, ReconcileSkipCounts, ReconcileStop } from './reconciliation.js';
-import { runClaimedAshbyOperation } from './operation-worker.js';
+import { runAshbyOperationPass } from './operation-worker.js';
 import { materializeCandidate } from './materialize.js';
 import { extractFileUrl, type AshbyRuntime } from './runtime.js';
 import { MAX_FILE_HANDLE_LEN } from './client.js';
@@ -629,7 +629,7 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
         name: 'operation',
         intervalMs: rc.operationPollMs,
         tick: async () => {
-          const r = await runClaimedAshbyOperation({
+          const r = await runAshbyOperationPass({
             stores: runtime.stores,
             materialization: runtime.materialization,
             scorecard: {
@@ -642,7 +642,7 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
             owner,
             leaseSeconds: rc.leaseSeconds,
           });
-          return r.claimed;
+          return r.invite.claimed || r.scorecard.claimed;
         },
       },
       {

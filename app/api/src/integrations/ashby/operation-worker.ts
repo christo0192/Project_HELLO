@@ -362,3 +362,23 @@ export async function runClaimedAshbyOperation(
     }
   }
 }
+
+/**
+ * Poll both supported operation lanes once.
+ *
+ * Supplying the scorecard adapter to `runClaimedAshbyOperation` selects the
+ * scorecard lane. The runtime previously supplied it unconditionally, which
+ * meant the invite lane was never polled and every candidate invite remained
+ * pending forever. Keep the lanes explicit and run both on every scheduler
+ * pass so neither can starve the other.
+ */
+export async function runAshbyOperationPass(
+  deps: OperationWorkerDeps,
+): Promise<{ invite: OperationRunOutcome; scorecard: OperationRunOutcome }> {
+  const { scorecard, ...inviteDeps } = deps;
+  const invite = await runClaimedAshbyOperation(inviteDeps);
+  const scorecardOutcome = scorecard
+    ? await runClaimedAshbyOperation({ ...inviteDeps, scorecard })
+    : { claimed: false as const };
+  return { invite, scorecard: scorecardOutcome };
+}
