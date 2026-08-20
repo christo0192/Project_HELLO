@@ -204,6 +204,14 @@ export function AshbyMissionControlPage() {
                   )}
                 </div>
                 <div className="flex items-center gap-2">
+                  {w.sessionId && w.sessionStatus === 'completed' && (
+                    <a
+                      href={`/sessions/${encodeURIComponent(w.sessionId)}`}
+                      className="rounded border border-blue-300 px-2 py-1 text-xs text-blue-800"
+                    >
+                      Review screening
+                    </a>
+                  )}
                   <button
                     type="button"
                     disabled={busy || w.terminalState != null}
