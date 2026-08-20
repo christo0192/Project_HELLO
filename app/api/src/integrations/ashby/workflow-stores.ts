@@ -285,6 +285,8 @@ export interface MissionControlWorkflow {
    * who sees it can act on it. A session status enum is not PII.
    */
   sessionStatus: string | null;
+  /** Opaque internal session id for authorized recruiter review navigation. */
+  sessionId?: string | null;
   updatedAt: string;
 }
 
@@ -410,6 +412,10 @@ export function createMissionControlStore(client: SupabaseClient): MissionContro
           ingestionState: ings[0]?.state ?? null,
           operations: ops.map((o) => ({ id: o.id, type: o.operation_type, state: o.state, errorCode: o.error_code ?? null })),
           sessionStatus: typeof r.session_id === 'string' ? sessionStatus.get(r.session_id) ?? null : null,
+          // The id is an opaque internal reference, not candidate data. It is
+          // returned only to the already-authenticated Mission Control surface
+          // so an authorized reviewer can open the existing session view.
+          sessionId: typeof r.session_id === 'string' ? r.session_id : null,
           updatedAt: String(r.updated_at),
         };
       });

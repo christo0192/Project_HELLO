@@ -599,6 +599,7 @@ export interface AshbyMcWorkflow {
    * `writeback_pending` is a screening whose completion park did not land.
    */
   sessionStatus: string | null;
+  sessionId?: string | null;
   updatedAt: string;
 }
 
