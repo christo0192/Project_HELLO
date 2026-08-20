@@ -12,6 +12,7 @@ import { describe, it, expect } from 'vitest';
 import {
   buildScorecard,
   bindFeedbackForm,
+  HELLO_CHRISTY_SCORECARD_BINDING,
   mapOverallToScale,
   isScorecardSafe,
   isRelativeReviewPath,
@@ -124,6 +125,29 @@ describe('bindFeedbackForm — fails closed until tenant-verified', () => {
     expect(bindFeedbackForm(scorecard, binding)).toEqual({ ok: false, reason: 'binding_incomplete' });
   });
 
+  it('binds the approved Hello Christy form with all fields and an authenticated URL', () => {
+    const fullScorecard = buildScorecard(source({
+      dimensions: [
+        { key: 'english', score: 8 },
+        { key: 'tone', score: 7 },
+        { key: 'communication', score: 8 },
+        { key: 'motivation', score: 6 },
+        { key: 'role_fit', score: 5 },
+      ],
+    }), scale);
+    const r = bindFeedbackForm(fullScorecard.ok ? fullScorecard.scorecard : scorecard, HELLO_CHRISTY_SCORECARD_BINDING, 'https://hello.example.com');
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.formDefinitionId).toBe(HELLO_CHRISTY_SCORECARD_BINDING.formDefinitionId);
+      expect(r.feedbackForm['666cedf5-cbd2-4d51-8e53-213e73fd536f']).toBe('3');
+      expect(r.feedbackForm['8a057bef-b7c6-4193-9e47-611c01d5d910']).toEqual({ score: 4 });
+      expect(r.feedbackForm['1a943e2f-c1ec-4960-9179-b97ce376392a']).toEqual({
+        type: 'PlainText',
+        value: expect.stringContaining('https://hello.example.com/review/sessions/sess_123'),
+      });
+    }
+  });
+
   it('binds only mapped dimensions when fully verified', () => {
     const binding: ScorecardFormBinding = {
       verified: true,
@@ -136,9 +160,12 @@ describe('bindFeedbackForm — fails closed until tenant-verified', () => {
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.formDefinitionId).toBe('form_1');
-      expect(r.feedbackForm.f_overall).toBe(scorecard.scaleValue);
-      expect(r.feedbackForm.f_summary).toBe(scorecard.summary);
-      expect(r.feedbackForm.f_comm).toBeDefined();
+      expect(r.feedbackForm.f_overall).toBe(String(scorecard.scaleValue));
+      expect(r.feedbackForm.f_summary).toEqual({
+        type: 'PlainText',
+        value: `${scorecard.summary}\n\nDetailed Project_HELLO scorecard: ${scorecard.reviewPath}`,
+      });
+      expect(r.feedbackForm.f_comm).toEqual({ score: 4 });
       expect(Object.keys(r.feedbackForm)).not.toContain('motivation');
     }
   });

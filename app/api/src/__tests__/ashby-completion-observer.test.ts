@@ -52,7 +52,7 @@ describe('observeAshbyCompletion — branches', () => {
     const marks: Array<[string, string]> = [];
     const r = await observeAshbyCompletion(SESSION, deps({ onMark: (id, reason) => marks.push([id, reason]) }));
     expect(r).toEqual({ status: 'parked', applicationLinkId: LINK });
-    expect(marks).toEqual([[LINK, NO_RESULT_SINK_REASON]]);
+    expect(marks).toEqual([[LINK, 'scorecard_write_pending']]);
     expect(NO_RESULT_SINK_REASON).toBe('no_verified_result_sink');
   });
 
@@ -194,7 +194,7 @@ describe('INTEGRATION — runAssessment parks an Ashby-linked session through th
     const park = SUPABASE_STATE.rpcs.filter((r) => r.fn === 'mark_ashby_writeback_pending');
     expect(park).toHaveLength(1);
     expect(park[0].args.p_application_link_id).toBe(LINK);
-    expect(park[0].args.p_reason).toBe(NO_RESULT_SINK_REASON);
+    expect(park[0].args.p_reason).toBe('scorecard_write_pending');
     // And the assessment itself was still persisted — parking is additive.
     expect(SUPABASE_STATE.inserts.some((i) => i.table === 'assessments')).toBe(true);
   });
