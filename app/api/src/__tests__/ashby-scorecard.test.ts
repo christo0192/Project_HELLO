@@ -139,9 +139,10 @@ describe('bindFeedbackForm — fails closed until tenant-verified', () => {
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.formDefinitionId).toBe(HELLO_CHRISTY_SCORECARD_BINDING.formDefinitionId);
-      expect(r.feedbackForm.overall_recommendation).toBe('3');
-      expect(r.feedbackForm['ee3ca034-ea9c-451a-85de-1e22b1bce180']).toEqual({ score: 4 });
-      expect(r.feedbackForm['b5778d87-0be5-4ca3-8727-88dc8dd6eba0']).toEqual({
+      const fields = r.feedbackForm.fieldSubmissions as Array<{ path: string; value: unknown }>;
+      expect(fields.find((f) => f.path === 'overall_recommendation')?.value).toBe('3');
+      expect(fields.find((f) => f.path === 'ee3ca034-ea9c-451a-85de-1e22b1bce180')?.value).toEqual({ score: 4 });
+      expect(fields.find((f) => f.path === 'b5778d87-0be5-4ca3-8727-88dc8dd6eba0')?.value).toEqual({
         type: 'PlainText',
         value: expect.stringContaining('https://hello.example.com/review/sessions/sess_123'),
       });
@@ -160,13 +161,14 @@ describe('bindFeedbackForm — fails closed until tenant-verified', () => {
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.formDefinitionId).toBe('form_1');
-      expect(r.feedbackForm.f_overall).toBe(String(scorecard.scaleValue));
-      expect(r.feedbackForm.f_summary).toEqual({
+      const fields = r.feedbackForm.fieldSubmissions as Array<{ path: string; value: unknown }>;
+      expect(fields.find((f) => f.path === 'f_overall')?.value).toBe(String(scorecard.scaleValue));
+      expect(fields.find((f) => f.path === 'f_summary')?.value).toEqual({
         type: 'PlainText',
         value: `${scorecard.summary}\n\nDetailed Project_HELLO scorecard: ${scorecard.reviewPath}`,
       });
-      expect(r.feedbackForm.f_comm).toEqual({ score: 4 });
-      expect(Object.keys(r.feedbackForm)).not.toContain('motivation');
+      expect(fields.find((f) => f.path === 'f_comm')?.value).toEqual({ score: 4 });
+      expect(fields.map((f) => f.path)).not.toContain('motivation');
     }
   });
 });

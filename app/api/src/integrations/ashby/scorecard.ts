@@ -300,19 +300,20 @@ export function bindFeedbackForm(
   const overallKey = paths?.overall ?? binding.overallFieldId;
   const summaryKey = paths?.summary ?? binding.summaryFieldId;
   if (!overallKey || !summaryKey) return { ok: false, reason: 'binding_incomplete' };
-  const feedbackForm: Record<string, unknown> = {
+  const fieldSubmissions: Array<{ path: string; value: unknown }> = [
     // Ashby ValueSelect fields accept the stored option value as a string.
-    [overallKey]: String(scorecard.scaleValue),
+    { path: overallKey, value: String(scorecard.scaleValue) },
     // Ashby accepts PlainText objects for RichText fields via the public API.
-    [summaryKey]: { type: 'PlainText', value: dashboardSummary(scorecard, dashboardOrigin) },
-  };
+    { path: summaryKey, value: { type: 'PlainText', value: dashboardSummary(scorecard, dashboardOrigin) } },
+  ];
   const dimKeys = paths?.dimensions ?? binding.dimensionFieldIds ?? {};
   const dimensionScale = binding.dimensionScale ?? { min: 1, max: 4 };
   for (const d of scorecard.dimensions) {
     const fieldKey = dimKeys[d.key];
     if (typeof fieldKey === 'string' && fieldKey.length > 0) {
-      feedbackForm[fieldKey] = { score: mapDimensionToScale(d.score, dimensionScale) };
+      fieldSubmissions.push({ path: fieldKey, value: { score: mapDimensionToScale(d.score, dimensionScale) } });
     }
   }
+  const feedbackForm: Record<string, unknown> = { fieldSubmissions };
   return { ok: true, formDefinitionId: binding.formDefinitionId, feedbackForm };
 }
