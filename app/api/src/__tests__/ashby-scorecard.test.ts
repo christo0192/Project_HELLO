@@ -139,9 +139,9 @@ describe('bindFeedbackForm — fails closed until tenant-verified', () => {
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.formDefinitionId).toBe(HELLO_CHRISTY_SCORECARD_BINDING.formDefinitionId);
-      expect(r.feedbackForm['666cedf5-cbd2-4d51-8e53-213e73fd536f']).toBe('3');
-      expect(r.feedbackForm['8a057bef-b7c6-4193-9e47-611c01d5d910']).toEqual({ score: 4 });
-      expect(r.feedbackForm['1a943e2f-c1ec-4960-9179-b97ce376392a']).toEqual({
+      expect(r.feedbackForm.overall_recommendation).toBe('3');
+      expect(r.feedbackForm['ee3ca034-ea9c-451a-85de-1e22b1bce180']).toEqual({ score: 4 });
+      expect(r.feedbackForm['b5778d87-0be5-4ca3-8727-88dc8dd6eba0']).toEqual({
         type: 'PlainText',
         value: expect.stringContaining('https://hello.example.com/review/sessions/sess_123'),
       });
