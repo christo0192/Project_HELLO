@@ -154,6 +154,8 @@ export interface ApplicationInfoView {
   applicationId?: string;
   jobId?: string;
   currentStageId?: string;
+  /** Opaque candidate id for an authoritative candidate.info resume fallback. */
+  candidateId?: string;
 }
 
 /** Defensively read the authoritative application.info result. */
@@ -162,10 +164,12 @@ export function extractApplicationInfo(results: unknown): ApplicationInfoView {
   if (!root) return {};
   // application.info may nest under `application` or return the app directly.
   const app = asObject(root.application) ?? root;
+  const candidateId = firstSafeId(app, [['candidate', 'id'], ['candidateId']]);
   return {
     applicationId: firstSafeId(app, [['id']]) ?? firstSafeId(root, [['applicationId']]),
     jobId: firstSafeId(app, [['job', 'id'], ['jobId']]),
     currentStageId:
       firstSafeId(app, [['currentInterviewStage', 'id'], ['currentStageId'], ['stageId']]),
+    ...(candidateId ? { candidateId } : {}),
   };
 }
