@@ -17,6 +17,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   runClaimedAshbyOperation,
+  runAshbyOperationPass,
   channelForOperationKey,
   DEFAULT_DEFER_SECONDS,
   PREREQUISITE_DEFER_REASONS,
@@ -93,6 +94,27 @@ function deps(over: Partial<Parameters<typeof runClaimedAshbyOperation>[0]> = {}
     ...over,
   };
 }
+
+describe('runAshbyOperationPass — polls every supported lane', () => {
+  it('polls invite_delivery and scorecard_write when scorecard execution is configured', async () => {
+    const claimedTypes: Array<string | null> = [];
+    const claimOperation = vi.fn(async (operationType: string | null) => {
+      claimedTypes.push(operationType);
+      return null;
+    });
+
+    const result = await runAshbyOperationPass(deps({
+      stores: stores({ claimOperation: claimOperation as RuntimeWorkflowStores['claimOperation'] }),
+      scorecard: {
+        submit: async () => ({ results: {}, moreDataAvailable: false }),
+        dashboardOrigin: 'https://dashboard.example.test',
+      },
+    }));
+
+    expect(result).toEqual({ invite: { claimed: false }, scorecard: { claimed: false } });
+    expect(claimedTypes).toEqual(['invite_delivery', 'scorecard_write']);
+  });
+});
 
 describe('runClaimedAshbyOperation — manual channel parks, never "succeeds"', () => {
   it('parks the manual delivery as awaiting_manual_delivery and does NOT complete it', async () => {
