@@ -220,8 +220,10 @@ export interface ScorecardFormBinding {
   overallFieldId?: string;
   /** Field id for the RichText summary field. */
   summaryFieldId?: string;
-  /** Map of internal dimension key → Ashby Score field id. */
+  /** Map of internal dimension key → Ashby field id (display/audit metadata). */
   dimensionFieldIds?: Record<string, string>;
+  /** Ashby submit payload keys; the API uses field paths, not definition ids. */
+  fieldPaths?: { overall: string; summary: string; dimensions: Record<string, string> };
   /** Verified Ashby Score scale for dimension fields. */
   dimensionScale?: ScorecardScale;
 }
@@ -238,6 +240,17 @@ export const HELLO_CHRISTY_SCORECARD_BINDING: ScorecardFormBinding = {
     communication: '2dd40f54-2e2a-4879-ad4e-e43c2a24902f',
     motivation: 'f25d443d-0c0e-49ab-9d82-e472e0f1c28b',
     role_fit: '8604e59e-5147-4c39-b33f-4dffc8e10c1d',
+  },
+  fieldPaths: {
+    overall: 'overall_recommendation',
+    summary: 'b5778d87-0be5-4ca3-8727-88dc8dd6eba0',
+    dimensions: {
+      english: '46ee47b9-71a7-42bd-844c-c279c0e8bebf',
+      tone: 'bba47eac-b0f4-43c2-a931-d1fe00a24d03',
+      communication: 'ee3ca034-ea9c-451a-85de-1e22b1bce180',
+      motivation: '6d8d9ff3-43c9-44e5-bba3-d3ae4dce0eef',
+      role_fit: 'd1220462-1d8a-43b9-a56f-c5635cdd5e2f',
+    },
   },
   dimensionScale: { min: 1, max: 4 },
 };
@@ -283,18 +296,22 @@ export function bindFeedbackForm(
   if (!binding.formDefinitionId || !binding.overallFieldId || !binding.summaryFieldId) {
     return { ok: false, reason: 'binding_incomplete' };
   }
+  const paths = binding.fieldPaths;
+  const overallKey = paths?.overall ?? binding.overallFieldId;
+  const summaryKey = paths?.summary ?? binding.summaryFieldId;
+  if (!overallKey || !summaryKey) return { ok: false, reason: 'binding_incomplete' };
   const feedbackForm: Record<string, unknown> = {
     // Ashby ValueSelect fields accept the stored option value as a string.
-    [binding.overallFieldId]: String(scorecard.scaleValue),
+    [overallKey]: String(scorecard.scaleValue),
     // Ashby accepts PlainText objects for RichText fields via the public API.
-    [binding.summaryFieldId]: { type: 'PlainText', value: dashboardSummary(scorecard, dashboardOrigin) },
+    [summaryKey]: { type: 'PlainText', value: dashboardSummary(scorecard, dashboardOrigin) },
   };
-  const dimIds = binding.dimensionFieldIds ?? {};
+  const dimKeys = paths?.dimensions ?? binding.dimensionFieldIds ?? {};
   const dimensionScale = binding.dimensionScale ?? { min: 1, max: 4 };
   for (const d of scorecard.dimensions) {
-    const fieldId = dimIds[d.key];
-    if (typeof fieldId === 'string' && fieldId.length > 0) {
-      feedbackForm[fieldId] = { score: mapDimensionToScale(d.score, dimensionScale) };
+    const fieldKey = dimKeys[d.key];
+    if (typeof fieldKey === 'string' && fieldKey.length > 0) {
+      feedbackForm[fieldKey] = { score: mapDimensionToScale(d.score, dimensionScale) };
     }
   }
   return { ok: true, formDefinitionId: binding.formDefinitionId, feedbackForm };
