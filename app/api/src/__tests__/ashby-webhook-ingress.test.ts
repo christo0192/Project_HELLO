@@ -113,10 +113,10 @@ describe('ingestWebhook outcomes (transactional outbox)', () => {
     { action: 'ping' },
     { action: 'ping', data: {} },
     { action: 'ping', data: { webhookActionType: 'not-ping' } },
-  ])('rejects malformed ping lookalikes: %j', async (body) => {
+  ])('acks signed ping handshake variants without persistence: %j', async (body) => {
     const receipts = new FakeOutbox();
     const out = await ingestWebhook(body, { receipts });
-    expect(out).toMatchObject({ kind: 'unrecognized', httpStatus: 400 });
+    expect(out).toMatchObject({ kind: 'ignored_action', httpStatus: 200, code: 'ping', enqueued: false });
     expect(receipts.receipts.size).toBe(0);
   });
 

@@ -71,11 +71,10 @@ export function isAshbyPing(parsed: unknown): boolean {
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
   const root = parsed as Record<string, unknown>;
   if (root.action !== 'ping') return false;
-  const data = root.data;
-  return data !== null
-    && typeof data === 'object'
-    && !Array.isArray(data)
-    && (data as Record<string, unknown>).webhookActionType === 'ping';
+  // Ashby has emitted both a bare ping and a ping carrying
+  // data.webhookActionType. The request has already passed HMAC verification;
+  // acknowledging either signed liveness form performs no persistence or work.
+  return root.action === 'ping';
 }
 
 /**
