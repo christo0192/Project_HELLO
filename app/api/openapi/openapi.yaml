@@ -637,6 +637,28 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AshbyProbeStagesResponse'
+  /api/integrations/ashby/mission-control/jobs/{externalJobId}/feedback-form:
+    get:
+      tags: [ashby]
+      operationId: discoverAshbyFeedbackForm
+      summary: Read-only feedback-form SCHEMA discovery for a job
+      description: Read-only admin discovery of sanitized feedback-form structure using jobInterviewPlan.info. It does not read feedback content, write data, or create a binding. A false schemaAvailable value means the provider named a form without returning its field schema.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: externalJobId
+          in: path
+          required: true
+          description: Opaque Ashby job id.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Sanitized feedback-form schema.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyFeedbackFormResponse'
   /api/integrations/ashby/mission-control/workflows:
     get:
       tags: [ashby]
@@ -3210,6 +3232,112 @@ components:
             $ref: '#/components/schemas/AshbyProbeStage'
         empty:
           type: boolean
+      additionalProperties: false
+
+    AshbyFormOption:
+      type: object
+      description: One selectable value of a rating/select field — the scale, never an answer.
+      required: [value, label]
+      properties:
+        value:
+          type: string
+          nullable: true
+        label:
+          type: string
+          nullable: true
+      additionalProperties: false
+
+    AshbyFormField:
+      type: object
+      description: One sanitized form field. Structure only; never a submitted value.
+      required: [id, title, path, type, required, options, optionsTruncated]
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+          nullable: true
+        path:
+          type: string
+          nullable: true
+        type:
+          type: string
+          nullable: true
+        required:
+          type: boolean
+          nullable: true
+          description: From the payload's isRequired only. null means the payload did not say — never inferred.
+        options:
+          type: array
+          items:
+            $ref: '#/components/schemas/AshbyFormOption'
+        optionsTruncated:
+          type: boolean
+      additionalProperties: false
+
+    AshbyFormSection:
+      type: object
+      required: [id, title, fields]
+      properties:
+        id:
+          type: string
+          nullable: true
+        title:
+          type: string
+          nullable: true
+        fields:
+          type: array
+          items:
+            $ref: '#/components/schemas/AshbyFormField'
+      additionalProperties: false
+
+    AshbyFeedbackForm:
+      type: object
+      required: [formDefinitionId, title, interviewId, interviewTitle, stageId, stageTitle, sections, fieldCount, schemaAvailable]
+      properties:
+        formDefinitionId:
+          type: string
+        title:
+          type: string
+          nullable: true
+        interviewId:
+          type: string
+          nullable: true
+        interviewTitle:
+          type: string
+          nullable: true
+        stageId:
+          type: string
+          nullable: true
+        stageTitle:
+          type: string
+          nullable: true
+        sections:
+          type: array
+          items:
+            $ref: '#/components/schemas/AshbyFormSection'
+        fieldCount:
+          type: integer
+        schemaAvailable:
+          type: boolean
+          description: Empty sections means the provider named a form without returning its field schema.
+      additionalProperties: false
+
+    AshbyFeedbackFormResponse:
+      type: object
+      required: [ok, forms, empty, truncated]
+      properties:
+        ok:
+          type: boolean
+        forms:
+          type: array
+          items:
+            $ref: '#/components/schemas/AshbyFeedbackForm'
+        empty:
+          type: boolean
+        truncated:
+          type: boolean
+          description: True when a safety bound clipped the result — the view is partial.
       additionalProperties: false
 
     AshbyMappingUpsertRequest:

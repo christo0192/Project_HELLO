@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError } from '../api';
-import type { AshbyMcMapping, AshbyMcWorkflow } from '../types';
+import type { AshbyMcMapping, AshbyMcWorkflow, AshbyFeedbackForm } from '../types';
 import { Card } from '../components/ui';
 
 /**
@@ -19,6 +19,14 @@ import { Card } from '../components/ui';
  * server or written to an access log. The server keeps only its SHA-256
  * digest, so the link genuinely cannot be shown again; reissuing revokes the
  * previous one.
+ *
+ * FEEDBACK-FORM DISCOVERY: `Discover feedback form` calls an admin-only
+ * READ-ONLY endpoint that performs one provider read of the job's interview
+ * plan and returns form SCHEMA — opaque ids, labels, input types, and scale
+ * options. It never returns a submitted answer, score, or comment, and it
+ * changes nothing: the result is unverified reference material an admin copies
+ * by hand into the approved configuration process. The ids are held in
+ * component state only and are never logged or sent to analytics.
  */
 export function AshbyMissionControlPage() {
   const [mappings, setMappings] = useState<AshbyMcMapping[]>([]);
@@ -37,6 +45,15 @@ export function AshbyMissionControlPage() {
   >(null);
   const [inviteError, setInviteError] = useState<{ linkId: string; message: string } | null>(null);
   const [copied, setCopied] = useState(false);
+  /**
+   * Discovered feedback-form schema for ONE mapping, held in component state
+   * only. Never persisted, never logged, never sent to analytics — these are
+   * tenant configuration ids, and this view is read-only reference material.
+   */
+  const [formSchema, setFormSchema] = useState<
+    { jobId: string; forms: AshbyFeedbackForm[]; truncated: boolean } | null
+  >(null);
+  const [formError, setFormError] = useState<{ jobId: string; message: string } | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -112,6 +129,32 @@ export function AshbyMissionControlPage() {
     }
   }, [invite]);
 
+  /**
+   * Read the feedback-form schema for one job. Read-only end to end: the API
+   * performs a single provider READ and writes nothing, and this handler binds
+   * nothing — it only renders what came back.
+   */
+  const discoverForm = useCallback(async (externalJobId: string) => {
+    setBusy(true);
+    setFormError(null);
+    setFormSchema(null);
+    try {
+      const res = await api.discoverAshbyFeedbackForm(externalJobId);
+      if (res.ok) {
+        setFormSchema({ jobId: externalJobId, forms: res.forms ?? [], truncated: res.truncated === true });
+      } else {
+        setFormError({ jobId: externalJobId, message: res.error ?? 'Could not read the feedback form' });
+      }
+    } catch (e) {
+      setFormError({
+        jobId: externalJobId,
+        message: e instanceof ApiError ? e.message : 'Could not read the feedback form',
+      });
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
   const mappingTone = (status: string): string =>
     status === 'enabled'
       ? 'text-emerald-700'
@@ -144,33 +187,53 @@ export function AshbyMissionControlPage() {
         )}
         <ul className="mt-3 divide-y divide-gray-100">
           {mappings.map((m) => (
-            <li key={m.id} className="flex items-center justify-between py-2">
-              <div>
-                <span className="font-mono text-sm text-gray-800">{m.externalJobId}</span>
-                <span className={`ml-3 text-sm font-semibold ${mappingTone(m.status)}`}>{m.status}</span>
-                {!(m.hasAiStage && m.hasTaStage) && (
-                  <span className="ml-2 text-xs text-amber-600">incomplete</span>
-                )}
-                {m.statusReason && <span className="ml-2 text-xs text-gray-400">{m.statusReason}</span>}
+            <li key={m.id} className="py-2">
+              <div className="flex items-center justify-between">
+                <div>
+                  <span className="font-mono text-sm text-gray-800">{m.externalJobId}</span>
+                  <span className={`ml-3 text-sm font-semibold ${mappingTone(m.status)}`}>{m.status}</span>
+                  {!(m.hasAiStage && m.hasTaStage) && (
+                    <span className="ml-2 text-xs text-amber-600">incomplete</span>
+                  )}
+                  {m.statusReason && <span className="ml-2 text-xs text-gray-400">{m.statusReason}</span>}
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    disabled={busy || m.status === 'paused'}
+                    onClick={() => run(() => api.pauseAshbyMapping(m.id))}
+                    className="rounded border border-gray-300 px-2 py-1 text-xs disabled:opacity-40"
+                  >
+                    Pause
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busy || m.status === 'enabled' || !(m.hasAiStage && m.hasTaStage)}
+                    onClick={() => run(() => api.resumeAshbyMapping(m.id))}
+                    className="rounded border border-gray-300 px-2 py-1 text-xs disabled:opacity-40"
+                  >
+                    Resume
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void discoverForm(m.externalJobId)}
+                    className="rounded border border-gray-300 px-2 py-1 text-xs disabled:opacity-40"
+                  >
+                    Discover feedback form
+                  </button>
+                </div>
               </div>
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  disabled={busy || m.status === 'paused'}
-                  onClick={() => run(() => api.pauseAshbyMapping(m.id))}
-                  className="rounded border border-gray-300 px-2 py-1 text-xs disabled:opacity-40"
-                >
-                  Pause
-                </button>
-                <button
-                  type="button"
-                  disabled={busy || m.status === 'enabled' || !(m.hasAiStage && m.hasTaStage)}
-                  onClick={() => run(() => api.resumeAshbyMapping(m.id))}
-                  className="rounded border border-gray-300 px-2 py-1 text-xs disabled:opacity-40"
-                >
-                  Resume
-                </button>
-              </div>
+
+              {formError?.jobId === m.externalJobId && (
+                <p role="alert" className="mt-2 text-xs text-red-700">
+                  {formError.message}
+                </p>
+              )}
+
+              {formSchema?.jobId === m.externalJobId && (
+                <FeedbackFormSchema forms={formSchema.forms} truncated={formSchema.truncated} />
+              )}
             </li>
           ))}
         </ul>
@@ -299,6 +362,104 @@ export function AshbyMissionControlPage() {
         </ul>
       </Card>
     </main>
+  );
+}
+
+/**
+ * Read-only rendering of discovered feedback-form SCHEMA.
+ *
+ * Every value here is form STRUCTURE that the API already sanitized — opaque
+ * ids, bounded labels, input types, and scale options. There is no submitted
+ * answer, score, comment, or candidate field in this data, and nothing is
+ * persisted: an admin copies the ids by hand into the approved configuration
+ * process. It is labelled unverified because a form the plan merely NAMES may
+ * carry fields this read cannot see.
+ */
+function FeedbackFormSchema({ forms, truncated }: { forms: AshbyFeedbackForm[]; truncated: boolean }) {
+  return (
+    <div className="mt-2 rounded border border-blue-200 bg-blue-50 p-2">
+      <h3 className="text-xs font-semibold text-blue-900">
+        Feedback form schema — read-only, unverified
+      </h3>
+      <p className="mt-1 text-xs text-blue-800">
+        Structure only — no feedback content, scores, or comments are read. Nothing is saved or
+        bound to write-back; copy the ids by hand into the approved configuration process.
+      </p>
+      {truncated && (
+        <p className="mt-1 text-xs text-amber-800">
+          Result was truncated by a safety bound — this view is partial.
+        </p>
+      )}
+      {forms.length === 0 ? (
+        <p className="mt-2 text-xs text-blue-900">
+          No feedback form is named in this job&apos;s interview plan.
+        </p>
+      ) : (
+        <ul className="mt-2 space-y-2">
+          {forms.map((f) => (
+            <li key={f.formDefinitionId} className="rounded border border-blue-200 bg-white p-2">
+              <p className="text-xs font-semibold text-gray-900">{f.title ?? 'Untitled form'}</p>
+              <p className="font-mono text-xs text-gray-700">form id: {f.formDefinitionId}</p>
+              {(f.stageTitle || f.stageId) && (
+                <p className="text-xs text-gray-500">
+                  stage: {f.stageTitle ?? 'untitled'}
+                  {f.stageId ? ` (${f.stageId})` : ''}
+                </p>
+              )}
+              {(f.interviewTitle || f.interviewId) && (
+                <p className="text-xs text-gray-500">
+                  interview: {f.interviewTitle ?? 'untitled'}
+                  {f.interviewId ? ` (${f.interviewId})` : ''}
+                </p>
+              )}
+              {!f.schemaAvailable ? (
+                <p className="mt-1 text-xs text-amber-800">
+                  Field-level schema is not available from the interview plan for this form — only
+                  its id could be read. This is not a claim that the form has no fields.
+                </p>
+              ) : (
+                <>
+                  <p className="mt-1 text-xs text-gray-500">{f.fieldCount} field(s)</p>
+                  {f.sections.map((sec, si) => (
+                    <div key={sec.id ?? `section-${si}`} className="mt-1">
+                      <p className="text-xs font-medium text-gray-700">
+                        {sec.title ?? 'Untitled section'}
+                      </p>
+                      <ul className="mt-1 space-y-1">
+                        {sec.fields.map((field) => (
+                          <li key={field.id} className="text-xs text-gray-700">
+                            <span className="font-mono">{field.id}</span>
+                            {' — '}
+                            {field.title ?? 'untitled'}
+                            {field.path ? ` [${field.path}]` : ''}
+                            {field.type ? ` · ${field.type}` : ''}
+                            {field.required === null
+                              ? ' · required: unknown'
+                              : field.required
+                                ? ' · required'
+                                : ' · optional'}
+                            {field.options.length > 0 && (
+                              <span className="text-gray-500">
+                                {' · scale: '}
+                                {field.options
+                                  .map((o) => (o.label ?? o.value ?? '').trim())
+                                  .filter((t) => t.length > 0)
+                                  .join(' | ')}
+                                {field.optionsTruncated ? ' …' : ''}
+                              </span>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  ))}
+                </>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 

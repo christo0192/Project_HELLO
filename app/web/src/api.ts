@@ -21,6 +21,7 @@ import type {
   AshbyMcWorkflowsResponse,
   AshbyMcActionResponse,
   AshbyManualInviteResponse,
+  AshbyFeedbackFormResponse,
   AdminMaintenanceInput,
   AdminAuditListResponse,
   AdminMember,
@@ -424,6 +425,15 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({}),
     }),
+  /**
+   * Read-only feedback-form SCHEMA discovery for one job (admin-gated server
+   * side). Structure only — this never returns feedback content, and viewing
+   * it binds nothing.
+   */
+  discoverAshbyFeedbackForm: (externalJobId: string) =>
+    request<AshbyFeedbackFormResponse>(
+      `/api/integrations/ashby/mission-control/jobs/${encodeURIComponent(externalJobId)}/feedback-form`,
+    ),
   retryAshbyOperation: (id: string) =>
     request<AshbyMcActionResponse>(`/api/integrations/ashby/mission-control/operations/${id}/retry`, {
       method: 'POST',

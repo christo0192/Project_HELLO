@@ -895,10 +895,11 @@ describe('OpenAPI document integrity', () => {
     const schemas = ((spec as YMap).components as YMap).schemas as YMap;
     const securitySchemes = ((spec as YMap).components as YMap).securitySchemes as YMap;
     // 70 + GET /api/recordings/health (0038 convergence surface).
-    expect(Object.keys(paths).length).toBe(71);
+    expect(Object.keys(paths).length).toBe(72);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
-    // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038).
-    expect(Object.keys(schemas).length).toBe(152);
+    // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
+    // + the five read-only feedback-form discovery schemas.
+    expect(Object.keys(schemas).length).toBe(157);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.

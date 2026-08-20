@@ -17,6 +17,10 @@
  *   POST /mappings/:id/resume      — admin: resume (enable) a complete, non-drift mapping
  *   POST /workflows/:id/cancel     — admin: atomic terminal cancellation
  *   POST /operations/:id/retry     — admin: retry a failed safe operation
+ *   GET  /jobs/:externalJobId/stages         — admin: read-only stage discovery
+ *   GET  /jobs/:externalJobId/feedback-form  — admin: read-only feedback-form
+ *                                    SCHEMA discovery (ids/labels/types/scales;
+ *                                    never feedback content)
  *
  * Every mutation is race-safe + audited inside its RPC (0031). Candidate results
  * are never exposed here.
@@ -34,7 +38,7 @@ import {
   describeAshbyRuntime,
   isAshbyRuntimeActive,
 } from '../integrations/ashby/config.js';
-import { probeJobStages } from '../integrations/ashby/probe.js';
+import { probeJobStages, probeJobFeedbackForms } from '../integrations/ashby/probe.js';
 import { createAshbyProbeClient } from '../integrations/ashby/runtime.js';
 import {
   snapshotScheduler,
@@ -382,6 +386,47 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
     } catch {
       // A tenant 401/403/404 is reported as a sanitized capability failure and
       // enables nothing. Never echo the provider body.
+      res.status(502).json({ ok: false, error: 'probe_unavailable' });
+    }
+  });
+
+  // ── Read-only feedback-form schema discovery (admin) ──────────────────────
+  // The Ashby UI hides the internal form/section/field ids that a scorecard
+  // binding would need, so HR cannot even review what a form is made of. This
+  // performs the SAME single allowlisted READ as the stage probe
+  // (jobInterviewPlan.info) and returns sanitized SCHEMA only.
+  //
+  // `applicationFeedback.list` is NOT called here and no feedback CONTENT is
+  // read: no answer, score, comment, or interviewer note. Nothing is persisted
+  // and no binding is created — an admin copies the ids by hand into the
+  // approved configuration process. Write-back stays fail-closed either way.
+  router.get('/jobs/:externalJobId/feedback-form', requireRole('admin'), async (req: Request, res: Response) => {
+    const jobId = req.params.externalJobId;
+    if (typeof jobId !== 'string' || !OPAQUE_ID_RE.test(jobId)) {
+      res.status(400).json({ ok: false, error: 'invalid_external_job_id' }); return;
+    }
+    const reader = resolveProbeReader();
+    if (!reader) {
+      // Runtime gates closed → no client is constructed and no call is made.
+      res.status(503).json({ ok: false, error: 'integration_disabled' }); return;
+    }
+    try {
+      const result = await probeJobFeedbackForms(jobId, reader);
+      // Audit carries bounded COUNTS only. A form/field id is tenant
+      // configuration; putting one in an audit row or a log would spread it
+      // beyond the one authenticated response that asked for it.
+      await recordAudit(req, 'resource.read', 200, {
+        metadata: {
+          resource: 'ashby_job_feedback_forms',
+          count: result.forms.length,
+          field_count: result.forms.reduce((n, f) => n + f.fieldCount, 0),
+          truncated: result.truncated,
+        },
+      });
+      res.json({ ok: true, forms: result.forms, empty: result.empty, truncated: result.truncated });
+    } catch {
+      // A tenant 401/403/404 or an unparseable body is a sanitized capability
+      // failure. Never echo the provider body.
       res.status(502).json({ ok: false, error: 'probe_unavailable' });
     }
   });

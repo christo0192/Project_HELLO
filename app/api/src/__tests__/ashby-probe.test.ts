@@ -139,7 +139,16 @@ describe('probe module has no write capability', () => {
     for (const name of names) {
       expect(name.toLowerCase()).not.toMatch(/upsert|write|create|update|delete|mutate|enable/);
     }
-    // It proposes stage ids; applying them is a separate admin action.
-    expect(names.sort()).toEqual(['PROBE_READ_OPERATIONS', 'assertReadOnly', 'extractStages', 'probeJobStages']);
+    // It proposes stage ids and reports feedback-form SCHEMA; applying either
+    // is a separate admin action. The exact list is asserted so a new export
+    // has to be justified here rather than appearing quietly.
+    expect(names.sort()).toEqual([
+      'PROBE_READ_OPERATIONS',
+      'assertReadOnly',
+      'extractFeedbackForms',
+      'extractStages',
+      'probeJobFeedbackForms',
+      'probeJobStages',
+    ]);
   });
 });
