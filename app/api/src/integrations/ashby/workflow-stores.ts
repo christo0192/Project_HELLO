@@ -19,6 +19,7 @@ import type {
   WorkflowLinkRow,
 } from './orchestration.js';
 import type { AshbyLinkLookup } from './completion-observer.js';
+import { buildScorecard, type ScorecardSource } from './scorecard.js';
 
 const SYSTEM_ACTOR = '00000000-0000-4000-8000-000000000001';
 
@@ -177,6 +178,46 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
       const row = data as { state: string; attempts: number };
       return { state: String(row.state), attempts: Number(row.attempts) || 0 };
     },
+    async readScorecardSource(applicationLinkId): Promise<ScorecardSource | null> {
+      const { data: link, error: linkError } = await client
+        .from('ashby_application_links')
+        .select('external_application_id, session_id')
+        .eq('provider', 'ashby')
+        .eq('id', applicationLinkId)
+        .maybeSingle();
+      if (linkError || !link || typeof link.session_id !== 'string') return null;
+      const { data: assessment, error: assessmentError } = await client
+        .from('assessments')
+        .select('english, tone, communication, motivation, role_fit, overall_score, recommendation, summary, provenance, created_at')
+        .eq('session_id', link.session_id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (assessmentError || !assessment) return null;
+      const a = assessment as Record<string, unknown>;
+      const obj = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+      const num = (value: unknown): number => typeof value === 'number' ? value : Number(value) || 0;
+      const english = obj(a.english), tone = obj(a.tone), communication = obj(a.communication), motivation = obj(a.motivation), roleFit = obj(a.role_fit), provenance = obj(a.provenance);
+      return {
+        externalApplicationId: String(link.external_application_id),
+        overallScore: num(a.overall_score),
+        recommendation: a.recommendation === 'advance' || a.recommendation === 'reject' ? a.recommendation : 'hold',
+        dimensions: [
+          { key: 'english', score: (num(english.grammar) + num(english.vocabulary) + num(english.fluency) + num(english.coherence)) / 4 },
+          { key: 'tone', score: (num(tone.clarity) + num(tone.confidence) + num(tone.professionalism)) / 3 },
+          { key: 'communication', score: num(communication.score) },
+          { key: 'motivation', score: num(motivation.score) },
+          { key: 'role_fit', score: num(roleFit.score) },
+        ],
+        summary: typeof a.summary === 'string' ? a.summary : '',
+        provenance: {
+          model: typeof provenance.requestedModel === 'string' ? provenance.requestedModel : undefined,
+          scoredAt: typeof a.created_at === 'string' ? a.created_at : undefined,
+          version: typeof provenance.prompt_template_version === 'string' ? provenance.prompt_template_version : undefined,
+        },
+        reviewPath: `/sessions/${encodeURIComponent(link.session_id)}`,
+      };
+    },
     async readLink(applicationLinkId): Promise<WorkflowLinkRow | null> {
       const { data, error } = await client
         .from('ashby_application_links')
@@ -221,6 +262,68 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
       });
       if (error) throw new Error('ashby_writeback_pending_error');
       return { status: statusOf(data) };
+    },
+    async enqueueScorecardWrite(applicationLinkId, sessionId): Promise<{ status: string }> {
+      const { data: link, error: linkError } = await client
+        .from('ashby_application_links')
+        .select('external_application_id, external_job_id, job_mapping_id, ashby_job_mappings ( status, feedback_form_id )')
+        .eq('id', applicationLinkId)
+        .maybeSingle();
+      if (linkError || !link) return { status: 'link_missing' };
+      const rawMapping = (link as Record<string, unknown>).ashby_job_mappings;
+      const mapping = (Array.isArray(rawMapping) ? rawMapping[0] : rawMapping) as Record<string, unknown> | null;
+      // Only the approved, enabled mapping can publish. Paused/drifted mappings
+      // remain parked and never create an outbound operation.
+      if (mapping?.status !== 'enabled' || mapping.feedback_form_id !== '1c9a92c0-c18f-4bf1-898f-c29e71d7d303') {
+        return { status: 'mapping_inactive' };
+      }
+      const { data: assessment, error: assessmentError } = await client
+        .from('assessments')
+        .select('id, english, tone, communication, motivation, role_fit, overall_score, recommendation, summary, provenance, created_at')
+        .eq('session_id', sessionId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (assessmentError || !assessment) return { status: 'assessment_missing' };
+      const a = assessment as Record<string, unknown>;
+      const number = (value: unknown): number => typeof value === 'number' ? value : Number(value) || 0;
+      const object = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+      const english = object(a.english);
+      const tone = object(a.tone);
+      const communication = object(a.communication);
+      const motivation = object(a.motivation);
+      const roleFit = object(a.role_fit);
+      const provenance = object(a.provenance);
+      const source: ScorecardSource = {
+        overallScore: number(a.overall_score),
+        recommendation: a.recommendation === 'advance' || a.recommendation === 'reject' ? a.recommendation : 'hold',
+        dimensions: [
+          { key: 'english', score: (number(english.grammar) + number(english.vocabulary) + number(english.fluency) + number(english.coherence)) / 4 },
+          { key: 'tone', score: (number(tone.clarity) + number(tone.confidence) + number(tone.professionalism)) / 3 },
+          { key: 'communication', score: number(communication.score) },
+          { key: 'motivation', score: number(motivation.score) },
+          { key: 'role_fit', score: number(roleFit.score) },
+        ],
+        summary: typeof a.summary === 'string' ? a.summary : '',
+        provenance: {
+          model: typeof provenance.requestedModel === 'string' ? provenance.requestedModel : undefined,
+          scoredAt: typeof a.created_at === 'string' ? a.created_at : undefined,
+          version: typeof provenance.prompt_template_version === 'string' ? provenance.prompt_template_version : undefined,
+        },
+        reviewPath: `/sessions/${encodeURIComponent(sessionId)}`,
+      };
+      const built = buildScorecard(source, { min: 1, max: 4 });
+      if (!built.ok) return { status: `scorecard_${built.reason}` };
+      const result = await client.rpc('enqueue_ashby_operation', {
+        p_application_link_id: applicationLinkId,
+        p_operation_type: 'scorecard_write',
+        p_operation_key: `ashby:scorecard:${String(link.external_application_id)}:${built.marker}`,
+        p_depends_on: null,
+        p_marker: built.marker,
+        p_actor_id: actorId,
+      });
+      if (result.error) throw new Error('ashby_scorecard_enqueue_error');
+      return { status: statusOf(result.data) };
     },
   };
 }

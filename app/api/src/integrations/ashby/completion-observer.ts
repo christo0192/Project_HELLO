@@ -15,11 +15,10 @@
  * means a failed, cancelled, expired, abandoned, or still-running session can
  * never be marked complete — the guard is upstream of us and we inherit it.
  *
- * WHAT IT DOES, AND DELIBERATELY DOES NOT DO. It parks the Ashby application
- * link as `writeback_pending` and stops. It publishes nothing: no scorecard
- * write, no stage move, no feedback submission, no auto-reject. That is the
- * whole point — there is no tenant-verified Ashby result sink, so the honest
- * terminal state is "screened, awaiting manual publication".
+ * WHAT IT DOES. It parks the Ashby application link as `writeback_pending`
+ * and, when the approved sink is configured, asks the durable store to enqueue
+ * exactly one scorecard-write operation. The operation worker owns the only
+ * provider mutation. No stage move, auto-reject, or email is ever enqueued.
  *
  * FAILURE POSTURE. The observer is best-effort with respect to scoring: a
  * failure here must never lose a completed assessment, which is the primary
@@ -46,6 +45,7 @@ export const NO_RESULT_SINK_REASON = 'no_verified_result_sink';
 /** Narrow store seam — satisfied by `RuntimeWorkflowStores`. */
 export interface CompletionStore {
   markWritebackPending(applicationLinkId: string, reason: string): Promise<{ status: string }>;
+  enqueueScorecardWrite?(applicationLinkId: string, sessionId: string): Promise<{ status: string }>;
 }
 
 /** Resolve the Ashby application link bound to a screening session, if any. */
@@ -89,7 +89,12 @@ export async function observeAshbyCompletion(
     // that is not true, so we refuse — as does the RPC itself.
     if (link.terminalState) return { status: 'blocked_terminal' };
 
-    const result = await deps.stores.markWritebackPending(link.id, NO_RESULT_SINK_REASON);
+    const result = await deps.stores.markWritebackPending(link.id, 'scorecard_write_pending');
+    if (result.status === 'ok' || result.status === 'already_pending') {
+      // Optional keeps legacy/test stores compatible. Production enqueues only
+      // after the assessment row exists and dedupes by deterministic marker.
+      await deps.stores.enqueueScorecardWrite?.(link.id, sessionId);
+    }
     if (result.status === 'ok') return { status: 'parked', applicationLinkId: link.id };
     if (result.status === 'already_pending') {
       return { status: 'already_pending', applicationLinkId: link.id };

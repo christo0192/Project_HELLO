@@ -32,6 +32,8 @@ export interface ScorecardDimension {
 
 /** Bounded, PII-light view the saga extracts from a persisted assessment. */
 export interface ScorecardSource {
+  /** Opaque Ashby application id used only as the provider request identity. */
+  externalApplicationId?: string;
   /** Overall 0–100 score. */
   overallScore: number;
   /** Informational recommendation. */
@@ -210,17 +212,35 @@ export function buildScorecard(source: ScorecardSource, scale: ScorecardScale): 
  * models the write as blocked and surfaces it in Mission Control instead.
  */
 export interface ScorecardFormBinding {
-  /** Whether this binding has been verified by a tenant probe. */
+  /** Whether this binding has been verified by an approved tenant probe. */
   verified: boolean;
   /** Ashby feedback form definition id. */
   formDefinitionId?: string;
-  /** Field id for the overall scale value. */
+  /** Field id for the overall ValueSelect field. */
   overallFieldId?: string;
-  /** Field id for the summary. */
+  /** Field id for the RichText summary field. */
   summaryFieldId?: string;
-  /** Map of internal dimension key → Ashby field id. */
+  /** Map of internal dimension key → Ashby Score field id. */
   dimensionFieldIds?: Record<string, string>;
+  /** Verified Ashby Score scale for dimension fields. */
+  dimensionScale?: ScorecardScale;
 }
+
+/** The approved synthetic Hello Christy tenant binding. */
+export const HELLO_CHRISTY_SCORECARD_BINDING: ScorecardFormBinding = {
+  verified: true,
+  formDefinitionId: '1c9a92c0-c18f-4bf1-898f-c29e71d7d303',
+  overallFieldId: '666cedf5-cbd2-4d51-8e53-213e73fd536f',
+  summaryFieldId: '1a943e2f-c1ec-4960-9179-b97ce376392a',
+  dimensionFieldIds: {
+    english: '8a057bef-b7c6-4193-9e47-611c01d5d910',
+    tone: 'cfd97e91-928d-49b1-8924-f928dc2bdada',
+    communication: '2dd40f54-2e2a-4879-ad4e-e43c2a24902f',
+    motivation: 'f25d443d-0c0e-49ab-9d82-e472e0f1c28b',
+    role_fit: '8604e59e-5147-4c39-b33f-4dffc8e10c1d',
+  },
+  dimensionScale: { min: 1, max: 4 },
+};
 
 export type BoundFeedbackForm =
   | { ok: true; formDefinitionId: string; feedbackForm: Record<string, unknown> }
@@ -232,19 +252,50 @@ export type BoundFeedbackForm =
  * missing the form/overall/summary ids — never fabricating an Ashby endpoint
  * shape. Unmapped dimensions are omitted (not guessed).
  */
-export function bindFeedbackForm(scorecard: NormalizedScorecard, binding: ScorecardFormBinding): BoundFeedbackForm {
+function mapDimensionToScale(score: number, scale: ScorecardScale): number {
+  const min = Math.round(scale.min);
+  const max = Math.round(scale.max);
+  if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) return min;
+  const pct = clampNum(score, 0, 10) / 10;
+  return min + Math.min(max - min, Math.floor(pct * (max - min + 1)));
+}
+
+function dashboardSummary(scorecard: NormalizedScorecard, dashboardOrigin: string): string {
+  // The review path was validated as site-relative before reaching this point.
+  // The origin is supplied from the server's validated WEB_ORIGIN allowlist;
+  // reject anything else rather than placing an attacker-controlled URL in ATS.
+  let origin = '';
+  try {
+    const parsed = new URL(dashboardOrigin);
+    if ((parsed.protocol === 'https:' || parsed.protocol === 'http:') && !parsed.username && !parsed.password && parsed.pathname === '/') {
+      origin = parsed.origin;
+    }
+  } catch { /* fail closed to the relative path */ }
+  return `${scorecard.summary}\n\nDetailed Project_HELLO scorecard: ${origin}${scorecard.reviewPath}`.slice(0, MAX_SUMMARY_LEN);
+}
+
+export function bindFeedbackForm(
+  scorecard: NormalizedScorecard,
+  binding: ScorecardFormBinding,
+  dashboardOrigin = '',
+): BoundFeedbackForm {
   if (!binding.verified) return { ok: false, reason: 'binding_unverified' };
   if (!binding.formDefinitionId || !binding.overallFieldId || !binding.summaryFieldId) {
     return { ok: false, reason: 'binding_incomplete' };
   }
   const feedbackForm: Record<string, unknown> = {
-    [binding.overallFieldId]: scorecard.scaleValue,
-    [binding.summaryFieldId]: scorecard.summary,
+    // Ashby ValueSelect fields accept the stored option value as a string.
+    [binding.overallFieldId]: String(scorecard.scaleValue),
+    // Ashby accepts PlainText objects for RichText fields via the public API.
+    [binding.summaryFieldId]: { type: 'PlainText', value: dashboardSummary(scorecard, dashboardOrigin) },
   };
   const dimIds = binding.dimensionFieldIds ?? {};
+  const dimensionScale = binding.dimensionScale ?? { min: 1, max: 4 };
   for (const d of scorecard.dimensions) {
     const fieldId = dimIds[d.key];
-    if (typeof fieldId === 'string' && fieldId.length > 0) feedbackForm[fieldId] = d.score;
+    if (typeof fieldId === 'string' && fieldId.length > 0) {
+      feedbackForm[fieldId] = { score: mapDimensionToScale(d.score, dimensionScale) };
+    }
   }
   return { ok: true, formDefinitionId: binding.formDefinitionId, feedbackForm };
 }

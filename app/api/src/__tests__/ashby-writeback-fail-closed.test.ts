@@ -73,15 +73,15 @@ function runtimeStores(over: Partial<RuntimeWorkflowStores> = {}): RuntimeWorkfl
   };
 }
 
-// ── L1: the worker refuses the two write-back operation types ────────────────
+// ── L1: the worker claims the approved scorecard sink but never stage moves ──
 
-describe('L1 — the runtime claims invite_delivery and NOTHING else', () => {
-  it('declares invite_delivery as the only supported type', () => {
-    expect([...SUPPORTED_OPERATION_TYPES]).toEqual(['invite_delivery']);
-    expect([...REFUSED_OPERATION_TYPES].sort()).toEqual(['scorecard_write', 'stage_move']);
+describe('L1 — the runtime claims approved operations only', () => {
+  it('declares invite_delivery and scorecard_write as supported', () => {
+    expect([...SUPPORTED_OPERATION_TYPES]).toEqual(['invite_delivery', 'scorecard_write']);
+    expect([...REFUSED_OPERATION_TYPES].sort()).toEqual(['stage_move']);
   });
 
-  it('never passes scorecard_write or stage_move to claim_ashby_operation', async () => {
+  it('never passes stage_move to claim_ashby_operation', async () => {
     const claimed: string[] = [];
     const stores = runtimeStores({
       claimOperation: async (type) => { claimed.push(type); return null; },
@@ -101,7 +101,6 @@ describe('L1 — the runtime claims invite_delivery and NOTHING else', () => {
 
     expect(claimed).toHaveLength(25);
     expect(new Set(claimed)).toEqual(new Set(['invite_delivery']));
-    expect(claimed).not.toContain('scorecard_write');
     expect(claimed).not.toContain('stage_move');
   });
 

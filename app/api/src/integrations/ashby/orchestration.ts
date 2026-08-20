@@ -142,6 +142,8 @@ export interface RuntimeWorkflowStores extends WorkflowStores {
   readIngestion(applicationLinkId: string): Promise<{ state: string; attempts: number } | null>;
   /** Read the link row needed to materialize an invite (opaque ids only). */
   readLink(applicationLinkId: string): Promise<WorkflowLinkRow | null>;
+  /** Read only bounded assessment fields needed for the approved scorecard sink. */
+  readScorecardSource?(applicationLinkId: string): Promise<import('./scorecard.js').ScorecardSource | null>;
   /**
    * DEFER a running operation back to pending because a prerequisite stopped
    * holding after the claim. Refunds the attempt the claim charged and
@@ -160,6 +162,8 @@ export interface RuntimeWorkflowStores extends WorkflowStores {
   ): Promise<'ok' | 'not_owned'>;
   /** Park a completed application as `writeback_pending` (audited, idempotent). */
   markWritebackPending(applicationLinkId: string, reason: string): Promise<{ status: string }>;
+  /** Enqueue the verified scorecard sink after a durable assessment insert. */
+  enqueueScorecardWrite?(applicationLinkId: string, sessionId: string): Promise<{ status: string }>;
   /**
    * CAS a manual invite_delivery operation from `running` to
    * `awaiting_manual_delivery`. The invite digest exists but no recruiter has

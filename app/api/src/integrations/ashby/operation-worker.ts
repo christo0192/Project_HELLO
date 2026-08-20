@@ -60,6 +60,7 @@
  */
 
 import type { RuntimeWorkflowStores, OperationClaimRow } from './orchestration.js';
+import { bindFeedbackForm, buildScorecard, HELLO_CHRISTY_SCORECARD_BINDING } from './scorecard.js';
 import { materializeInvite, type MaterializationStore, type MaterializationMapping } from './materialize.js';
 import type { EmailProviderState } from './invite-delivery.js';
 
@@ -67,11 +68,11 @@ import type { EmailProviderState } from './invite-delivery.js';
  * The ONLY operation types this runtime executes. Deliberately excludes
  * `scorecard_write` and `stage_move` — see the module header.
  */
-export const SUPPORTED_OPERATION_TYPES = ['invite_delivery'] as const;
+export const SUPPORTED_OPERATION_TYPES = ['invite_delivery', 'scorecard_write'] as const;
 export type SupportedOperationType = (typeof SUPPORTED_OPERATION_TYPES)[number];
 
 /** Operation types the runtime must never claim while no result sink exists. */
-export const REFUSED_OPERATION_TYPES = ['scorecard_write', 'stage_move'] as const;
+export const REFUSED_OPERATION_TYPES = ['stage_move'] as const;
 
 /**
  * Sanitized reasons that mean "a prerequisite is not satisfied yet", NOT "this
@@ -92,6 +93,10 @@ export const DEFAULT_DEFER_SECONDS = 60;
 export interface OperationWorkerDeps {
   stores: RuntimeWorkflowStores;
   materialization: MaterializationStore;
+  scorecard?: {
+    submit(req: { applicationId: string; formDefinitionId: string; feedbackForm: Record<string, unknown> }): Promise<unknown>;
+    dashboardOrigin: string;
+  };
   /** Resolve mapping config for a link's job. Null when no usable mapping. */
   resolveMappingForLink(applicationLinkId: string): Promise<MaterializationMapping | null>;
   /** Build the site-relative recruiter reissue path for an application. */
@@ -161,7 +166,11 @@ export async function runClaimedAshbyOperation(
 ): Promise<OperationRunOutcome> {
   let claim: OperationClaimRow | null;
   try {
-    claim = await deps.stores.claimOperation('invite_delivery', deps.owner, deps.leaseSeconds);
+    claim = await deps.stores.claimOperation(
+      deps.scorecard ? 'scorecard_write' : 'invite_delivery',
+      deps.owner,
+      deps.leaseSeconds,
+    );
   } catch {
     return { claimed: false };
   }
@@ -193,6 +202,37 @@ export async function runClaimedAshbyOperation(
         claimed: true, operationType: claim.operationType, committed: false,
         staleLease: r === 'not_owned', code: 'blocked_terminal',
       };
+    }
+
+    if (claim.operationType === 'scorecard_write') {
+      if (!deps.scorecard || !deps.stores.readScorecardSource) {
+        const r = await deps.stores.failOperation(claim.id, claim.leaseToken, 'scorecard_sink_unavailable', false);
+        return { claimed: true, operationType: claim.operationType, committed: false, staleLease: r === 'not_owned', code: 'scorecard_sink_unavailable' };
+      }
+      const source = await deps.stores.readScorecardSource(claim.applicationLinkId);
+      if (!source) {
+        const r = await deps.stores.failOperation(claim.id, claim.leaseToken, 'assessment_missing', true);
+        return { claimed: true, operationType: claim.operationType, committed: false, staleLease: r === 'not_owned', code: 'assessment_missing' };
+      }
+      const built = buildScorecard(source, { min: 1, max: 4 });
+      if (!built.ok) {
+        const r = await deps.stores.failOperation(claim.id, claim.leaseToken, `scorecard_${built.reason}`, false);
+        return { claimed: true, operationType: claim.operationType, committed: false, staleLease: r === 'not_owned', code: `scorecard_${built.reason}` };
+      }
+      const bound = bindFeedbackForm(built.scorecard, HELLO_CHRISTY_SCORECARD_BINDING, deps.scorecard.dashboardOrigin);
+      if (!bound.ok || !source.externalApplicationId) {
+        const reason = bound.ok ? 'application_id_missing' : bound.reason;
+        const r = await deps.stores.failOperation(claim.id, claim.leaseToken, reason, false);
+        return { claimed: true, operationType: claim.operationType, committed: false, staleLease: r === 'not_owned', code: reason };
+      }
+      await deps.scorecard.submit({
+        applicationId: source.externalApplicationId,
+        formDefinitionId: bound.formDefinitionId,
+        feedbackForm: bound.feedbackForm,
+      });
+      const r = await deps.stores.completeOperation(claim.id, claim.leaseToken, 'scorecard_submitted', claim.marker);
+      emit('scorecard_submitted', r === 'ok' ? 'scorecard_submitted' : 'stale_lease');
+      return { claimed: true, operationType: claim.operationType, committed: r === 'ok', staleLease: r !== 'ok', code: 'scorecard_submitted' };
     }
 
     const mapping = await deps.resolveMappingForLink(claim.applicationLinkId);

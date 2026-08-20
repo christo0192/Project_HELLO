@@ -632,6 +632,10 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
           const r = await runClaimedAshbyOperation({
             stores: runtime.stores,
             materialization: runtime.materialization,
+            scorecard: {
+              submit: (request) => runtime.client.applicationFeedbackSubmit(request),
+              dashboardOrigin: (process.env.WEB_ORIGIN ?? '').split(',')[0]?.trim() ?? '',
+            },
             resolveMappingForLink: runtime.resolveMappingForLink,
             reissuePathFor,
             email: { providerApproved: false, domainVerified: false },
