@@ -108,7 +108,7 @@ describe('runImport', () => {
 
     const r = await runImport('app_1', {
       gates: enabledGates,
-      client: { ...reader(app), candidateInfo },
+      client: { ...reader(app), candidateInfo: candidateInfo as ApplicationReader['candidateInfo'] },
       stores,
       resolveMapping: async () => mapping({ deliveryMode: 'manual' }),
       readResumeFileHandle: (value) => {
