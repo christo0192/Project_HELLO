@@ -895,12 +895,15 @@ describe('OpenAPI document integrity', () => {
     const schemas = ((spec as YMap).components as YMap).schemas as YMap;
     const securitySchemes = ((spec as YMap).components as YMap).securitySchemes as YMap;
     // 70 + GET /api/recordings/health (0038 convergence surface)
-    // + the two candidate-scoped Ashby review read routes.
-    expect(Object.keys(paths).length).toBe(74);
+    // + the two candidate-scoped Ashby review read routes
+    // + the two read-only Ashby workflow-status reads (candidate-addressed
+    //   and application-link-addressed).
+    expect(Object.keys(paths).length).toBe(76);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
-    // + the five read-only feedback-form discovery schemas.
-    expect(Object.keys(schemas).length).toBe(157);
+    // + the five read-only feedback-form discovery schemas
+    // + the three candidate-scoped Ashby workflow-card schemas.
+    expect(Object.keys(schemas).length).toBe(160);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.
@@ -1154,6 +1157,77 @@ describe('live handler shapes match documented schemas', () => {
     const res = await request(app).get(`/api/candidates/${UUID_2}`).set('Authorization', AUTH_HEADER);
     expect(res.status).toBe(200);
     expect(validateResponseBody(res.body, 'CandidateDetail', spec)).toEqual([]);
+  });
+
+  it('GET /api/candidates/{id}/ashby-workflow → AshbyCandidateWorkflowResponse', async () => {
+    configureTables({
+      candidates: ok({ id: UUID_2 }),
+      ashby_application_links: ok([
+        {
+          lifecycle: 'writeback_pending',
+          terminal_state: null,
+          session_id: UUID_1,
+          updated_at: T_2026,
+          ashby_resume_ingestions: [{ state: 'ready' }],
+          ashby_operations: [
+            { operation_type: 'invite_delivery', state: 'succeeded', error_code: null, updated_at: T_2026 },
+            { operation_type: 'scorecard_write', state: 'failed', error_code: 'provider_5xx', updated_at: T_2026 },
+            // stage_move is filtered out by the projection, never documented.
+            { operation_type: 'stage_move', state: 'pending', error_code: null, updated_at: T_2026 },
+          ],
+        },
+      ]),
+      call_sessions: ok({ status: 'completed' }),
+    });
+    const app = createContractApp();
+    const res = await request(app)
+      .get(`/api/candidates/${UUID_2}/ashby-workflow`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'AshbyCandidateWorkflowResponse', spec)).toEqual([]);
+    expect(res.body.workflow.operations.map((o: { type: string }) => o.type)).toEqual([
+      'invite_delivery',
+      'scorecard_write',
+    ]);
+  });
+
+  it('GET /api/candidates/{id}/ashby-workflow → workflow:null for a non-Ashby candidate', async () => {
+    configureTables({ candidates: ok({ id: UUID_2 }), ashby_application_links: ok([]) });
+    const app = createContractApp();
+    const res = await request(app)
+      .get(`/api/candidates/${UUID_2}/ashby-workflow`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(res.body.workflow).toBeNull();
+    expect(validateResponseBody(res.body, 'AshbyCandidateWorkflowResponse', spec)).toEqual([]);
+  });
+
+  it('GET /api/integrations/ashby/review/{applicationLinkId}/workflow → AshbyCandidateWorkflowResponse', async () => {
+    // The link lookup (maybeSingle) and the workflow read (list) hit the same
+    // table in that order, so the fixture is call-index driven.
+    configureTables({
+      ashby_application_links: (call: number) =>
+        call === 0
+          ? ok({ candidate_id: UUID_2 })
+          : ok([
+              {
+                lifecycle: 'ready',
+                terminal_state: null,
+                session_id: null,
+                updated_at: T_2026,
+                ashby_resume_ingestions: [{ state: 'scanning' }],
+                ashby_operations: [],
+              },
+            ]),
+      candidates: ok({ id: UUID_2 }),
+    });
+    const app = createContractApp();
+    const res = await request(app)
+      .get(`/api/integrations/ashby/review/${UUID_1}/workflow`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'AshbyCandidateWorkflowResponse', spec)).toEqual([]);
+    expect(res.body.workflow.sessionStatus).toBeNull();
   });
 
   it('POST /api/resumes → 201 ResumeUploadResponse', async () => {

@@ -22,6 +22,7 @@ import type {
   AshbyMcActionResponse,
   AshbyManualInviteResponse,
   AshbyFeedbackFormResponse,
+  AshbyCandidateWorkflowResponse,
   AdminMaintenanceInput,
   AdminAuditListResponse,
   AdminMember,
@@ -445,6 +446,20 @@ export const api = {
   listAshbyScopedReviewNotes: (applicationLinkId: string) =>
     request<NoteListResponse>(
       `/api/integrations/ashby/review/${encodeURIComponent(applicationLinkId)}/notes`,
+    ),
+
+  // ── Ashby candidate-scoped workflow card (read-only) ─────────────
+  // Two addresses, ONE projection and one access rule. The normal candidate
+  // page knows the candidate id; the scoped review shell only ever knows the
+  // opaque application link, and the API resolves the candidate from it
+  // server-side under the identical role + interviewer-ownership check.
+  getCandidateAshbyWorkflow: (candidateId: string) =>
+    request<AshbyCandidateWorkflowResponse>(
+      `/api/candidates/${encodeURIComponent(candidateId)}/ashby-workflow`,
+    ),
+  getAshbyScopedReviewWorkflow: (applicationLinkId: string) =>
+    request<AshbyCandidateWorkflowResponse>(
+      `/api/integrations/ashby/review/${encodeURIComponent(applicationLinkId)}/workflow`,
     ),
 
   retryAshbyOperation: (id: string) =>

@@ -33,6 +33,7 @@ import { Card, ErrorState, LoadingState } from '../components/ui';
 import { clearReturnTo } from '../lib/return-to';
 import { StatusBadge } from '../components/design';
 import {
+  AshbyWorkflowCard,
   CandidateProfileCard,
   DecisionBlockedBanner,
   NotesList,
@@ -167,6 +168,11 @@ function ScopedOverviewTab({
     <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
       <CandidateProfileCard candidate={candidate} />
       <div className="space-y-6 lg:col-span-2">
+        {/* The SAME read-only card as the normal Overview, read through the
+            SAME link scope this shell already uses. No new access, no new
+            navigation — the API resolves the candidate server-side. */}
+        <AshbyWorkflowCard source={{ kind: 'applicationLink', applicationLinkId }} />
+
         <SessionsSummary
           sessions={sessions}
           linkToSession={false}

@@ -254,6 +254,39 @@ paths:
               schema:
                 $ref: '#/components/schemas/SimpleError'
 
+  /api/candidates/{id}/ashby-workflow:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [candidates, ashby]
+      operationId: getCandidateAshbyWorkflow
+      summary: Read-only Ashby screening workflow status for a candidate (viewer+)
+      description: Sanitized, read-only projection of the candidate's Ashby screening workflow, rendered as a status card in the candidate Overview. Same state vocabulary as the Mission Control workflow list, but deliberately narrower - it never returns external Ashby identifiers, internal row ids (application link, operation, ingestion, session), operation keys, markers, leases, invite tokens, provider payloads, or candidate PII. Viewer role or above; the existing interviewer ownership rule is re-applied verbatim, so this grants no new access. A malformed id, an unknown candidate and a candidate the caller does not own all return the identical 404 used by GET /api/candidates/{id}. A candidate with no Ashby application link is not an error - the response is 200 with `workflow: null` and no card is rendered. There is no action on this surface; retry, cancel and stage controls remain in Mission Control.
+      responses:
+        '200':
+          description: The candidate's current Ashby workflow, or null when not Ashby-linked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyCandidateWorkflowResponse'
+        '404':
+          description: Candidate unknown, not owned by the caller, or malformed id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '500':
+          description: Sanitized internal error - a database lookup failed. Deliberately distinct from the 404 so an outage is retryable and is not shown as "not found"; returned identically whether or not the candidate exists.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
   # ── Resumes ────────────────────────────────────────────────────────
   /api/resumes:
     post:
@@ -939,6 +972,42 @@ paths:
                 $ref: '#/components/schemas/SimpleError'
         '500':
           description: Sanitized internal error — a database lookup failed. Deliberately distinct from the 404 so an outage is retryable and is not shown as "removed or no access"; returned identically whether or not the link exists.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/integrations/ashby/review/{applicationLinkId}/workflow:
+    parameters:
+      - name: applicationLinkId
+        in: path
+        required: true
+        description: Opaque Ashby application link id (UUID).
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [ashby]
+      operationId: getAshbyScopedReviewWorkflow
+      summary: Read-only Ashby workflow status for the linked candidate
+      description: The SAME sanitized projection as GET /api/candidates/{id}/ashby-workflow, addressed through the opaque application link instead of a candidate id because the scoped review shell never learns one. Same server-side link resolution, same viewer role rule and same interviewer ownership rule as the rest of this router - it broadens no access and adds no navigation. A linked candidate with no Ashby workflow returns 200 with `workflow: null`.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The linked candidate's current Ashby workflow, or null.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyCandidateWorkflowResponse'
+        '404':
+          description: Link unknown, unresolved, not owned by the caller, or malformed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '500':
+          description: Sanitized internal error - a database lookup failed. Deliberately distinct from the 404 so an outage is retryable and is not shown as "removed or no access"; returned identically whether or not the link exists.
           content:
             application/json:
               schema:
@@ -3549,6 +3618,66 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/AshbyMcWorkflow'
+      additionalProperties: false
+
+    AshbyCandidateWorkflowOperation:
+      type: object
+      required: [type, state, errorCode]
+      properties:
+        type:
+          type: string
+          enum: [invite_delivery, scorecard_write]
+          description: The reported operation leg. stage_move is never included on this surface.
+        state:
+          type: string
+          enum: [pending, running, succeeded, failed, blocked, cancelled]
+        errorCode:
+          type: string
+          nullable: true
+          description: Sanitized stable code only (`^[a-z0-9_.:-]{1,64}$` per the 0029 CHECK). Free-text error_detail is never exposed here.
+      additionalProperties: false
+
+    AshbyCandidateWorkflow:
+      type: object
+      required: [lifecycle, terminalState, ingestionState, operations, sessionStatus, updatedAt]
+      properties:
+        lifecycle:
+          type: string
+          enum: [imported, processing, ready, completed, writeback_pending, cancelled]
+        terminalState:
+          type: string
+          nullable: true
+          enum: [withdrawn, deleted, manual_stage_cancel]
+        ingestionState:
+          type: string
+          nullable: true
+          enum: [queued, fetching, scanning, extracting, structuring, ready, failed_review, cancelled]
+        operations:
+          type: array
+          description: At most one entry per reported type, most recently updated wins, in a stable declaration order.
+          items:
+            $ref: '#/components/schemas/AshbyCandidateWorkflowOperation'
+        sessionStatus:
+          type: string
+          nullable: true
+          description: Screening session status, or null when no session exists yet or the additive diagnostic read failed. Not PII, and carries no session id.
+        updatedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Null when the workflow row carries no usable timestamp. The card omits the timestamp line rather than rendering an empty one.
+      additionalProperties: false
+
+    AshbyCandidateWorkflowResponse:
+      type: object
+      required: [ok, workflow]
+      properties:
+        ok:
+          type: boolean
+        workflow:
+          $ref: '#/components/schemas/AshbyCandidateWorkflow'
+          nullable: true
+          description: Null when the candidate has no Ashby application link. An ordinary absence, never an error - the web card renders nothing.
       additionalProperties: false
 
     AshbyMcActionResponse:

@@ -25,6 +25,11 @@ import { Router, type Request } from 'express';
 import { supabase } from '../lib/supabase.js';
 import { requireRole } from '../lib/rbac.js';
 import { uuidSchema } from '../schemas/common.js';
+import {
+  createCandidateWorkflowStore,
+  type CandidateAshbyWorkflowStore,
+} from '../integrations/ashby/candidate-workflow.js';
+import { respondCandidateWorkflow } from './ashby-candidate-workflow.js';
 
 export const ashbyReviewRouter = Router();
 
@@ -142,3 +147,65 @@ ashbyReviewRouter.get('/:applicationLinkId/notes', requireRole('viewer'), async 
     next(error);
   }
 });
+
+/**
+ * GET /api/integrations/ashby/review/:applicationLinkId/workflow
+ *
+ * The SAME read-only workflow projection the normal CandidateDetail Overview
+ * card renders, resolved through the SAME link scope as the rest of this
+ * router — no new access, no new navigation, no extra field. The scoped shell
+ * calls this instead of the candidate-addressed route purely because it never
+ * learns a candidate id.
+ *
+ * It reports the workflow of the link it was ADDRESSED with, not the linked
+ * candidate's most recent one. A candidate may hold several Ashby
+ * applications; reporting the newest here would silently describe a different
+ * application than the page around it, and the card may not show job ids, so
+ * the mismatch would be invisible.
+ *
+ * Access is unchanged: the link is resolved to a candidate server-side and
+ * that candidate is checked under the same role + interviewer-ownership rules
+ * as every other route in this file. The link itself grants nothing.
+ *
+ * Consistent with the card everywhere: a linked candidate with no Ashby
+ * workflow answers 200 `{ workflow: null }` and the card renders nothing.
+ */
+export interface AshbyScopedWorkflowDeps {
+  /** Injected projection store (tests). Production builds it from the service client. */
+  store?: CandidateAshbyWorkflowStore;
+}
+
+/**
+ * Built as a factory — like its candidate-addressed sibling — so the test seam
+ * is a constructor argument rather than an exported mutable module global that
+ * any importer could permanently swap under production traffic.
+ */
+export function createAshbyScopedWorkflowRoute(deps: AshbyScopedWorkflowDeps = {}): Router {
+  const router = Router();
+  let cached: CandidateAshbyWorkflowStore | undefined = deps.store;
+  const store = (): CandidateAshbyWorkflowStore => {
+    if (!cached) cached = createCandidateWorkflowStore(supabase as never);
+    return cached;
+  };
+
+  router.get('/:applicationLinkId/workflow', requireRole('viewer'), async (req, res, next) => {
+    try {
+      // Authorization first, always: the link is only usable as an address
+      // once its candidate has passed the ownership check.
+      const candidateId = await resolveScopedCandidateId(req);
+      if (candidateId === 'error') return next(new Error('failed to resolve review link'));
+      if (!candidateId) return res.status(404).json(NOT_FOUND);
+
+      // Safe by construction: resolveScopedCandidateId returns null for any id
+      // that does not parse, so reaching here means the parse succeeded.
+      const linkId = uuidSchema.parse(req.params.applicationLinkId);
+      await respondCandidateWorkflow(() => store().getForApplicationLink(linkId), res, next);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  return router;
+}
+
+ashbyReviewRouter.use(createAshbyScopedWorkflowRoute());

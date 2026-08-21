@@ -24,6 +24,7 @@ import { appealsRouter } from './routes/appeals.js';
 import { ashbyWebhookRouter } from './routes/ashby-webhook.js';
 import { ashbyMissionControlRouter } from './routes/ashby-mission-control.js';
 import { ashbyReviewRouter } from './routes/ashby-review.js';
+import { ashbyCandidateWorkflowRouter } from './routes/ashby-candidate-workflow.js';
 import {
   malformedJsonHandler,
   oversizedJsonHandler,
@@ -321,6 +322,10 @@ export function createApp(opts: CreateAppOptions = {}) {
   app.use('/api/roles', rolesRouter);
   app.use('/api/resumes', resumesRouter);
   app.use('/api/candidates', candidatesRouter);
+  // Read-only Ashby workflow card for a candidate. A separate router so the
+  // Ashby integration stays out of the core candidates route; `/:id` above
+  // never matches `/:id/ashby-workflow`, so ordering is not load-bearing.
+  app.use('/api/candidates', ashbyCandidateWorkflowRouter);
   app.use('/api/screening', screeningRouter);
   app.use('/api/livekit', invitesRouter);
   app.use('/api/livekit', livekitRouter);
