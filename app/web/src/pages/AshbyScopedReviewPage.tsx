@@ -48,6 +48,7 @@ import {
   TranscriptionSyncWorkspace,
   candidateStatusLabel,
   candidateStatusTone,
+  candidateDisplayName,
 } from '../components/talent';
 
 /** Shown for every unresolvable link — never distinguishes why. */
@@ -112,7 +113,7 @@ export function AshbyScopedReviewPage() {
       <CandidateHeader
         divided
         eyebrow="Candidate review"
-        title={candidate.name || 'Unnamed candidate'}
+        title={candidateDisplayName(candidate.name)}
         description={candidate.email ?? undefined}
         actions={
           <StatusBadge tone={candidateStatusTone(candidate.status)}>

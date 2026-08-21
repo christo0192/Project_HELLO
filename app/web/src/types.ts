@@ -26,9 +26,26 @@ export interface RoleInput {
 
 export type CandidateStatus = string;
 
+/**
+ * The ONE sanitized resume-review signal a candidate row may carry
+ * (`GET /api/candidates`). Mirrors the API's `ResumeReview` union exactly.
+ *
+ * `null` for every non-Ashby candidate, and for an Ashby candidate whose
+ * ingestion row cannot be read. Nothing else about the integration crosses
+ * this boundary — no link id, no external id, no file handle, no failure
+ * reason, no attempt counter.
+ */
+export type ResumeReview = 'ready' | 'processing' | 'needs_review' | 'cancelled';
+
 export interface Candidate {
   id: string;
-  name: string;
+  /**
+   * Nullable, and truthfully so: `screening_v2.candidates.name` has no NOT
+   * NULL constraint (0001) and a PII-minimal shell created at Ashby import
+   * carries `null` here until its resume parses. Render it through
+   * `candidateDisplayName` rather than inventing an identity.
+   */
+  name: string | null;
   email: string | null;
   phone_e164: string | null;
   phone_valid: boolean;
@@ -41,6 +58,11 @@ export interface Candidate {
   latest_recommendation?: Recommendation | null;
   /** Latest assessment overall score (0–100), null when unassessed or blocked. */
   latest_score?: number | null;
+  /**
+   * Sanitized resume-review state from the list endpoint. Absent on payloads
+   * that predate the field; null when the candidate has no Ashby ingestion.
+   */
+  resume_review?: ResumeReview | null;
 }
 
 /** Aggregate pipeline assessment metrics (GET /api/candidates/summary). */

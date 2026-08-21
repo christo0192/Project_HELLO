@@ -118,6 +118,40 @@ describe('CandidateDetailPage', () => {
     expect(screen.getByText('Profile')).toBeInTheDocument();
   });
 
+  /**
+   * An Ashby import creates the candidate before its resume is parsed, so
+   * Detail must open on a row whose name/email/phone are all null. The header
+   * uses the SAME shared neutral copy as the list, and the profile keeps its
+   * existing "not provided" fallbacks rather than inventing values.
+   */
+  it('falls back to the shared neutral title for a nullable shell', async () => {
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      candidate: {
+        ...mockCandidateDetail.candidate,
+        name: null,
+        email: null,
+        phone_e164: null,
+        phone_valid: false,
+        skills: [],
+        experience_years: null,
+        status: 'queued',
+      },
+    });
+    renderDetailPage();
+    expect(
+      await screen.findByRole('heading', { name: 'Awaiting resume details' }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/unnamed/i)).toBeNull();
+    // Profile fallbacks, not fabricated values.
+    expect(screen.getByText('Not provided')).toBeInTheDocument();
+    expect(screen.getByText('None parsed')).toBeInTheDocument();
+    // Status vocabulary is unchanged: a queued shell is still queued.
+    expect(screen.getAllByText('Queued').length).toBeGreaterThanOrEqual(1);
+    // No recovery affordance on a candidate page — recovery is admin-only.
+    expect(screen.queryByRole('button', { name: /retry|reprocess|re-?parse/i })).toBeNull();
+  });
+
   it('renders Back to candidates link', async () => {
     renderDetailPage();
     expect(await screen.findByText('← Back to candidates')).toBeInTheDocument();

@@ -7,6 +7,12 @@
  * list API only filters by role); role is passed to the API. Every row's name
  * is a real keyboard-reachable link to the candidate workspace, and a
  * "Next action" column makes the obvious next step explicit.
+ *
+ * A candidate imported from Ashby exists before its resume is parsed: its
+ * `name`/`email`/`phone` are null and its status is `queued`. Such a row is
+ * titled with the shared neutral `CANDIDATE_SHELL_TITLE` rather than a
+ * fabricated identity, and carries the sanitized `resume_review` badge that
+ * says how far its resume got — and nothing more.
  */
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
@@ -46,6 +52,10 @@ import {
   parseCandidateFilters,
   recommendationLabel,
   RECOMMENDATION_ORDER,
+  candidateDisplayName,
+  ResumeReviewBadge,
+  resumeReviewLabel,
+  RESUME_REVIEW_ORDER,
 } from "../components/talent";
 import type { StatusTone } from "../components/design/StatusBadge";
 
@@ -102,7 +112,8 @@ export function CandidatesPage() {
   }, [roleId, loadCandidates]);
 
   // Every mutation rebuilds the full filter set from the current URL so no
-  // dimension (status / recommendation / assessed / role) is dropped.
+  // dimension (status / recommendation / resume review / assessed / role) is
+  // dropped.
   const applyFilters = useCallback(
     (next: Partial<CandidateFilters>) => {
       setSearchParams(buildCandidateSearch({ ...filters, ...next }));
@@ -123,6 +134,13 @@ export function CandidatesPage() {
   const toggleRecommendation = useCallback(
     (rec: string) =>
       applyFilters({ recommendations: toggleFromList(filters.recommendations, rec) }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [filterKey, applyFilters],
+  );
+
+  const toggleResumeReview = useCallback(
+    (value: string) =>
+      applyFilters({ resumeReview: toggleFromList(filters.resumeReview, value) }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [filterKey, applyFilters],
   );
@@ -168,6 +186,23 @@ export function CandidatesPage() {
     }
     return counts;
   }, [candidates]);
+
+  // Live count per resume-review state from the currently loaded set. Derived
+  // from the same one response the list already has — no extra request.
+  const resumeReviewCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const c of candidates ?? []) {
+      if (c.resume_review) {
+        counts.set(c.resume_review, (counts.get(c.resume_review) ?? 0) + 1);
+      }
+    }
+    return counts;
+  }, [candidates]);
+
+  // The facet is only meaningful where the signal exists. A deep link keeps
+  // it visible so its own toggles stay reachable and removable.
+  const showResumeFacet =
+    resumeReviewCounts.size > 0 || filters.resumeReview.length > 0;
 
   return (
     <CandidateShell variant="inset">
@@ -266,6 +301,42 @@ export function CandidatesPage() {
           })}
         </div>
 
+        {/* Resume-review toggles — additive facet over the sanitized enum the
+            list already returns. Never mutates candidate status.
+
+            Shown only when the loaded set actually carries the signal (or a
+            deep link selected it), so a workspace with no ATS-imported
+            candidates keeps the filter bar it had. Three permanently-zero
+            toggles would be noise, and would imply a dimension that does not
+            exist for that recruiter. */}
+        {showResumeFacet && (
+        <div
+          className="mt-2 flex flex-wrap items-center gap-2"
+          role="group"
+          aria-label="Filter by resume review"
+        >
+          <span className="text-xs font-medium text-ink-tertiary">Resume:</span>
+          {RESUME_REVIEW_ORDER.map((value) => {
+            const selected = filters.resumeReview.includes(value);
+            const count = resumeReviewCounts.get(value) ?? 0;
+            return (
+              <button
+                key={value}
+                type="button"
+                onClick={() => toggleResumeReview(value)}
+                aria-pressed={selected}
+                className={FILTER_TOGGLE_CLASS(selected)}
+              >
+                {resumeReviewLabel(value)}
+                {candidates && (
+                  <span className="tabular-nums text-ink-tertiary">{count}</span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+        )}
+
         {/* Active-filter summary */}
         {active && (
           <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-ink-secondary">
@@ -288,6 +359,13 @@ export function CandidatesPage() {
                 key={r}
                 label={`Rec: ${recommendationLabel(r)}`}
                 onRemove={() => toggleRecommendation(r)}
+              />
+            ))}
+            {filters.resumeReview.map((r) => (
+              <FilterChip
+                key={r}
+                label={resumeReviewLabel(r) ?? r}
+                onRemove={() => toggleResumeReview(r)}
               />
             ))}
             {filters.assessed && (
@@ -364,7 +442,7 @@ export function CandidatesPage() {
                           to={`/candidates/${c.id}`}
                           className="font-medium text-[var(--c-accent)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
                         >
-                          {c.name || "Unnamed"}
+                          {candidateDisplayName(c.name)}
                         </Link>
                         {c.email && (
                           <p className="text-xs text-ink-tertiary">{c.email}</p>
@@ -396,9 +474,14 @@ export function CandidatesPage() {
                           : "—"}
                       </Td>
                       <Td>
-                        <StatusBadge tone={candidateStatusTone(c.status)}>
-                          {candidateStatusLabel(c.status)}
-                        </StatusBadge>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <StatusBadge tone={candidateStatusTone(c.status)}>
+                            {candidateStatusLabel(c.status)}
+                          </StatusBadge>
+                          {/* Additive only: the candidate's own status is
+                              unchanged and still first. */}
+                          <ResumeReviewBadge value={c.resume_review} />
+                        </div>
                       </Td>
                       <Td>
                         {c.latest_recommendation ? (
@@ -484,7 +567,7 @@ function UploadCard({
     setUploading(true);
     try {
       const result = await api.uploadResume(file, roleId || undefined);
-      setSuccess(`Parsed ${result.candidate.name || "candidate"}.`);
+      setSuccess(`Parsed ${result.candidate.name?.trim() || "candidate"}.`);
       setFile(null);
       if (inputRef.current) inputRef.current.value = "";
       onUploaded();

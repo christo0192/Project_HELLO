@@ -33,6 +33,7 @@ const CANDIDATE_SCOPE_SOURCES = [
   'src/pages/CandidateDetailPage.tsx',
   'src/pages/AshbyScopedReviewPage.tsx',
   'src/components/talent/CandidateShell.tsx',
+  'src/components/talent/ResumeReviewBadge.tsx',
   'src/components/talent/CandidateScorecard.tsx',
   'src/components/talent/CandidateOverviewSections.tsx',
   'src/components/talent/AshbyWorkflowCard.tsx',

@@ -76,6 +76,32 @@ describe('scoped review shell', () => {
     expect(mockApi.getAshbyScopedReview).toHaveBeenCalledTimes(1);
   });
 
+  /** The same shared fallback copy as the list and Candidate Detail. */
+  it('falls back to the shared neutral title for a nullable shell', async () => {
+    mockApi.getAshbyScopedReview.mockResolvedValue({
+      ...mockCandidateDetail,
+      candidate: {
+        ...mockCandidateDetail.candidate,
+        name: null,
+        email: null,
+        phone_e164: null,
+        phone_valid: false,
+        skills: [],
+        experience_years: null,
+        status: 'queued',
+      },
+    });
+    renderPage();
+    expect(
+      await screen.findByRole('heading', { name: 'Awaiting resume details' }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/unnamed/i)).toBeNull();
+    expect(screen.getByText('Not provided')).toBeInTheDocument();
+    expect(screen.getByText('None parsed')).toBeInTheDocument();
+    // Still action-free: the shell state adds no affordance here either.
+    expect(screen.queryByRole('button', { name: /retry|reprocess|re-?parse|start|export|note|appeal/i })).toBeNull();
+  });
+
   it('renders no global navigation, no backlinks and no cross-candidate links', async () => {
     const { container } = renderPage();
     await screen.findByText('Jane Doe');
