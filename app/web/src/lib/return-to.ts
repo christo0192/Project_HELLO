@@ -35,3 +35,80 @@ export function sanitizeReturnTo(value: unknown): string | null {
   if (typeof value !== 'string') return null;
   return ALLOWED_RETURN_TO.some((re) => re.test(value)) ? value : null;
 }
+
+/*
+ * ── Surviving a full-page SSO redirect ──────────────────────────────────────
+ * React Router location state does not survive the navigation to the identity
+ * provider and back, so the (already sanitized) destination is parked in
+ * sessionStorage for the duration of that round trip.
+ *
+ * Trust posture is unchanged: `sanitizeReturnTo` is applied on BOTH the write
+ * and the read, so storage is not a trust boundary — a tampered value simply
+ * fails the exact-path allowlist and the caller lands on its normal route. The
+ * entry is single-use (deleted on read), same-tab only (sessionStorage), and
+ * expires, so it can never silently re-route a later visit.
+ */
+
+const RETURN_TO_KEY = 'ashby.returnTo';
+
+/** How long a parked return-to stays valid — one sign-in round trip. */
+const RETURN_TO_TTL_MS = 10 * 60 * 1000;
+
+/** How long a successful consume is replayed (StrictMode double-mount only). */
+const CONSUME_REPLAY_MS = 5000;
+
+let lastConsumed: { value: string; at: number } | null = null;
+
+/** Park an allowlisted return-to across a full-page redirect. No-op otherwise. */
+export function rememberReturnTo(value: unknown, now: number = Date.now()): void {
+  const safe = sanitizeReturnTo(value);
+  try {
+    if (!safe) {
+      window.sessionStorage.removeItem(RETURN_TO_KEY);
+      return;
+    }
+    window.sessionStorage.setItem(RETURN_TO_KEY, JSON.stringify({ p: safe, t: now }));
+  } catch {
+    /* storage unavailable (private mode, disabled) — deep link degrades to the
+       normal landing route, never to an error. */
+  }
+}
+
+/**
+ * Read, delete and re-validate a parked return-to. Returns null unless the
+ * stored value is a fresh, allowlisted in-app path.
+ */
+export function consumeReturnTo(now: number = Date.now()): string | null {
+  // React StrictMode mounts the landing route twice in development, and the
+  // read deletes the entry — so a successful consume is replayed for a few
+  // seconds instead of collapsing to null on the second mount. The window is
+  // deliberately tiny so a later navigation in the same page load is never
+  // re-routed by an old link.
+  if (lastConsumed && now - lastConsumed.at <= CONSUME_REPLAY_MS && now >= lastConsumed.at) {
+    return lastConsumed.value;
+  }
+  lastConsumed = null;
+  let raw: string | null = null;
+  try {
+    raw = window.sessionStorage.getItem(RETURN_TO_KEY);
+    window.sessionStorage.removeItem(RETURN_TO_KEY);
+  } catch {
+    return null;
+  }
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as { p?: unknown; t?: unknown };
+    const stamped = typeof parsed?.t === 'number' ? parsed.t : 0;
+    if (!Number.isFinite(stamped) || now - stamped > RETURN_TO_TTL_MS || now < stamped) return null;
+    const value = sanitizeReturnTo(parsed?.p);
+    if (value) lastConsumed = { value, at: now };
+    return value;
+  } catch {
+    return null;
+  }
+}
+
+/** Test-only: drop the short replay memo so each case starts clean. */
+export function resetReturnToReplay(): void {
+  lastConsumed = null;
+}

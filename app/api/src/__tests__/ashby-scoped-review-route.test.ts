@@ -232,3 +232,60 @@ describe('GET …/:applicationLinkId/notes', () => {
     }
   });
 });
+
+describe('database failures are distinguishable from denial', () => {
+  /** Fail one table's read with a PostgREST/transport error, keep the rest. */
+  function failTable(table: string) {
+    const base = mockFrom.getMockImplementation();
+    mockFrom.mockImplementation((t: string) => {
+      if (t === table) return chainable({ data: null, error: { message: 'connection reset', code: '57P01' } });
+      return base(t);
+    });
+  }
+
+  it('answers a sanitized 500 — not the 404 — when the link lookup fails', async () => {
+    failTable('ashby_application_links');
+    const res = await request(makeApp(makeUser('interviewer'))).get(`/api/integrations/ashby/review/${LINK_ID}`).set(AUTH);
+    expect(res.status).toBe(500);
+    // Sanitized: the generic internal_error envelope, nothing about the link,
+    // the candidate, the driver error or the SQL state.
+    expect(res.body).toEqual({ error: { type: 'internal_error', message: 'Internal server error' } });
+    const body = JSON.stringify(res.body);
+    expect(body).not.toContain(CANDIDATE_ID);
+    expect(body).not.toContain(LINK_ID);
+    expect(body).not.toMatch(/connection reset|57P01|ashby_application_links/);
+  });
+
+  it('answers a sanitized 500 when the ownership lookup fails', async () => {
+    failTable('candidates');
+    const res = await request(makeApp(makeUser('interviewer'))).get(`/api/integrations/ashby/review/${LINK_ID}`).set(AUTH);
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ error: { type: 'internal_error', message: 'Internal server error' } });
+  });
+
+  it('applies the same distinction on the notes route', async () => {
+    failTable('ashby_application_links');
+    const res = await request(makeApp(makeUser('interviewer'))).get(`/api/integrations/ashby/review/${LINK_ID}/notes`).set(AUTH);
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ error: { type: 'internal_error', message: 'Internal server error' } });
+  });
+
+  it('a 500 is uncorrelated with existence: unknown and unowned links fail identically', async () => {
+    failTable('ashby_application_links');
+    const unknown = await request(makeApp(makeUser('interviewer'))).get(`/api/integrations/ashby/review/${UNKNOWN_LINK_ID}`).set(AUTH);
+    expect(unknown.status).toBe(500);
+
+    wireSupabase({ ownerId: OTHER_RECRUITER_ID });
+    failTable('ashby_application_links');
+    const unowned = await request(makeApp(makeUser('interviewer'))).get(`/api/integrations/ashby/review/${LINK_ID}`).set(AUTH);
+    expect(unowned.status).toBe(500);
+    expect(unowned.body).toEqual(unknown.body);
+  });
+
+  it('still returns the uniform 404 when the link simply does not exist', async () => {
+    wireSupabase({ link: null });
+    const res = await request(makeApp(makeUser('interviewer'))).get(`/api/integrations/ashby/review/${UNKNOWN_LINK_ID}`).set(AUTH);
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ error: 'application_link_not_found' });
+  });
+});

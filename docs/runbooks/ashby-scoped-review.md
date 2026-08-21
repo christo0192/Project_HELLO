@@ -52,24 +52,64 @@ Only the deep link changed. The Ashby feedback **value type**, field set, scale
 mapping, provenance and summary bounds are untouched; no field was added; Red
 Flags are not written; no email is sent and no stage is moved.
 
-### Idempotency — read before changing the path again
+### Idempotency — one scorecard per application link, ever
 
-The idempotency marker hashes the review path (`p:` in the marker input). That
-derivation is **unchanged**, which has two consequences:
+An Ashby scorecard **cannot be retracted**, so the invariant is hard: at most
+one `scorecard_write` operation per `application_link_id`, across every
+historical marker version. Two guards enforce it, and neither depends on how the
+deep link is rendered:
 
-1. **Both builders must derive the path identically.** `enqueueScorecardWrite`
-   (enqueue time, sets `operation_key = ashby:scorecard:<appId>:<marker>`) and
-   `readScorecardSource` (execute time, builds the payload) both call
-   `ashbyReviewPath(applicationLinkId)`. If one drifts, the executed payload's
-   marker disagrees with the enqueued key. `ashby-scoped-review-path.test.ts`
-   pins this agreement.
-2. **An application whose scorecard was already written under the old
-   `/sessions/<id>` path hashes to a different marker.** A *re-drive* of that
-   link would therefore not dedupe against the old operation key. This is the
-   pre-existing content-change semantics of this marker — a summary or score
-   change behaves the same way — and it is asserted in the same test file so the
-   consequence is recorded, not discovered. Steady-state writes are unaffected:
-   each link is enqueued once on completion.
+1. **Link-scoped admission.** `enqueueScorecardWrite` first looks for ANY
+   existing `scorecard_write` row on the link (any state, any marker — including
+   rows written when the marker still hashed `/sessions/<id>`) and returns
+   `duplicate` without touching the mapping, the assessment or the RPC. A lookup
+   error throws rather than falling through, so a database blip can never be
+   read as "no scorecard yet".
+2. **A link-derived `operation_key`.** The enqueued key is
+   `ashby:scorecard:link:<applicationLinkId>` — marker-independent — so the
+   pre-existing `uq_ashby_operations_key` unique constraint is itself the
+   durable, concurrency-safe guard: two racing enqueues collapse to `duplicate`
+   in Postgres even if their content markers differ.
+
+The marker now hashes the **assessment content only** (score, recommendation,
+dimensions, summary, model) and NOT the review path: presentation changes must
+never look like new content. Changing the path shape again is therefore safe by
+construction — but both builders must still derive it identically
+(`enqueueScorecardWrite` at enqueue time, `readScorecardSource` at execute time,
+both via `ashbyReviewPath(applicationLinkId)`), and
+`ashby-scoped-review-path.test.ts` pins that agreement.
+
+Consequence to know: a link whose scorecard genuinely needs re-writing (e.g. a
+re-score after a corrected assessment) is **not** re-enqueued automatically.
+That is deliberate — the second write would be unretractable. Recovery is a
+deliberate operator action against the existing operation row, not a re-drive.
+
+### The deep link in the summary
+
+The summary field reserves the full `\n\nDetailed Project_HELLO scorecard: <url>`
+suffix before truncating to the 2000-character cap, so a maximum-length summary
+loses its own tail rather than a character of the URL.
+
+### Signing in through SSO
+
+The Google Workspace path is a full-page redirect to the identity provider, so
+React Router state does not survive it. The validated destination therefore
+travels two ways: as the provider `redirectTo` (`origin + <allowlisted path>`,
+which must be registered in Supabase's allowed redirect URLs for the direct
+landing to work) and parked in `sessionStorage` under `ashby.returnTo`, consumed
+once by the `/` landing route when Supabase falls back to the site URL.
+`sanitizeReturnTo` runs on the write and on the read, so storage is not a trust
+boundary and no open redirect is possible; the entry is single-use and expires
+after 10 minutes.
+
+### Outage vs denial
+
+A failed database lookup on the review routes returns the sanitized
+`500 {"error":{"type":"internal_error",…}}` — never the 404 — so an outage does
+not present to every recruiter as "this link was removed or you don't have
+access", and the page keeps its retry affordance. The 500 is returned
+identically for links that exist, do not exist, and are owned by someone else,
+so it leaks nothing.
 
 ## Verifying in an incident
 
@@ -92,9 +132,10 @@ workflow that has not materialized a candidate yet legitimately 404s.
 
 | File | Covers |
 | --- | --- |
-| `app/api/src/__tests__/ashby-scoped-review-route.test.ts` | ownership denial, indistinguishable 404s, malformed id rejected before any DB read, 401/403 boundary, no write surface |
-| `app/api/src/__tests__/ashby-scoped-review-path.test.ts` | path shape, marker determinism, builder agreement, unchanged bound payload |
+| `app/api/src/__tests__/ashby-scoped-review-route.test.ts` | ownership denial, indistinguishable 404s, malformed id rejected before any DB read, 401/403 boundary, no write surface, sanitized 500 on DB failure |
+| `app/api/src/__tests__/ashby-scoped-review-path.test.ts` | path shape, marker is content-only, builder agreement, unchanged bound payload, link never truncated out of a max-length summary |
+| `app/api/src/__tests__/ashby-scorecard-link-idempotency.test.ts` | one scorecard per link across legacy markers, fail-closed lookup, link-derived `operation_key` |
 | `app/api/src/__tests__/contract-openapi.test.ts` | both routes documented **and** mounted; route/spec bijection |
 | `app/web/src/pages/AshbyScopedReviewPage.test.tsx` | no nav/backlinks/actions, tab restriction, generic unavailable state |
-| `app/web/src/pages/AshbyScopedReviewReturnTo.test.tsx` | logged-out redirect, return-to in state (never a query), hostile-value fallback |
-| `app/web/src/lib/return-to.test.ts` | exact allowlist / open-redirect posture |
+| `app/web/src/pages/AshbyScopedReviewReturnTo.test.tsx` | logged-out redirect, return-to in state (never a query), hostile-value fallback, SSO redirect round trip + post-SSO landing |
+| `app/web/src/lib/return-to.test.ts` | exact allowlist / open-redirect posture, single-use expiring SSO parking, re-validation on read |

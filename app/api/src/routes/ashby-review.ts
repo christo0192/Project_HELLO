@@ -36,19 +36,29 @@ const NOTE_LIMIT = 100;
 
 /**
  * Resolve `:applicationLinkId` to the linked candidate id, re-applying the
- * caller's role/ownership scope. Returns null for EVERY failure mode
- * (malformed, unknown, unlinked, unowned) so callers cannot tell them apart.
+ * caller's role/ownership scope.
+ *
+ * Returns `null` for EVERY *authorization* failure mode (malformed, unknown,
+ * unlinked, unowned) so callers cannot tell them apart, and `'error'` for a
+ * *lookup* failure (connection blip, PostgREST error). The two are distinct on
+ * purpose: a database outage must surface as a retryable sanitized 500, not as
+ * a permanent "this link was removed or you don't have access". A 500 leaks
+ * nothing about existence — it is returned identically for a well-formed link
+ * that exists, one that does not, and one owned by someone else.
  */
-async function resolveScopedCandidateId(req: Request): Promise<string | null> {
+type ResolvedCandidate = string | null | 'error';
+
+async function resolveScopedCandidateId(req: Request): Promise<ResolvedCandidate> {
   const parsed = uuidSchema.safeParse(req.params.applicationLinkId);
   if (!parsed.success) return null;
 
-  const { data: link } = await supabase
+  const { data: link, error: linkError } = await supabase
     .from('ashby_application_links')
     .select('candidate_id')
     .eq('provider', 'ashby')
     .eq('id', parsed.data)
     .maybeSingle();
+  if (linkError) return 'error';
   const candidateId = (link as { candidate_id: string | null } | null)?.candidate_id ?? null;
   if (!candidateId) return null;
 
@@ -57,7 +67,8 @@ async function resolveScopedCandidateId(req: Request): Promise<string | null> {
   if (req.authUser?.appRole === 'interviewer') {
     q = q.eq('owner_id', req.authUser.id);
   }
-  const { data: candidate } = await q.maybeSingle();
+  const { data: candidate, error: candidateError } = await q.maybeSingle();
+  if (candidateError) return 'error';
   return (candidate as { id: string } | null)?.id ?? null;
 }
 
@@ -71,6 +82,7 @@ async function resolveScopedCandidateId(req: Request): Promise<string | null> {
 ashbyReviewRouter.get('/:applicationLinkId', requireRole('viewer'), async (req, res, next) => {
   try {
     const candidateId = await resolveScopedCandidateId(req);
+    if (candidateId === 'error') return next(new Error('failed to resolve review link'));
     if (!candidateId) return res.status(404).json(NOT_FOUND);
 
     const { data: candidate, error } = await supabase
@@ -78,7 +90,13 @@ ashbyReviewRouter.get('/:applicationLinkId', requireRole('viewer'), async (req, 
       .select('*')
       .eq('id', candidateId)
       .single();
-    if (error || !candidate) return res.status(404).json(NOT_FOUND);
+    // Existence + ownership were already established above, so anything other
+    // than PostgREST's "no rows" (PGRST116 — the row vanished between the two
+    // reads) is a lookup failure and must not masquerade as "no access".
+    if (error && (error as { code?: string }).code !== 'PGRST116') {
+      return next(new Error('failed to load review candidate'));
+    }
+    if (!candidate) return res.status(404).json(NOT_FOUND);
 
     const { data: sessions } = await supabase
       .from('call_sessions')
@@ -108,6 +126,7 @@ ashbyReviewRouter.get('/:applicationLinkId', requireRole('viewer'), async (req, 
 ashbyReviewRouter.get('/:applicationLinkId/notes', requireRole('viewer'), async (req, res, next) => {
   try {
     const candidateId = await resolveScopedCandidateId(req);
+    if (candidateId === 'error') return next(new Error('failed to resolve review link'));
     if (!candidateId) return res.status(404).json(NOT_FOUND);
 
     const { data, error } = await supabase

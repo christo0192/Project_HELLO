@@ -16,7 +16,7 @@
  *   preserved unchanged.
  */
 
-import { lazy, Suspense } from 'react';
+import { lazy, Suspense, useMemo } from 'react';
 import {
   Navigate,
   Route,
@@ -26,6 +26,7 @@ import {
 import { Layout } from './components/Layout';
 import { ProtectedRoute } from './components/ProtectedRoute';
 import { useAuth } from './lib/auth';
+import { consumeReturnTo } from './lib/return-to';
 import { LoginPage } from './pages/LoginPage';
 import { UnauthorizedPage } from './pages/UnauthorizedPage';
 import { CandidateJoinPage } from './pages/CandidateJoinPage';
@@ -71,6 +72,17 @@ const AshbyScopedReviewPage = lazyPage(
 );
 
 /**
+ * Post-SSO landing. A full-page identity-provider round trip destroys router
+ * state, so a deep-linked scoped review parks its (already allowlisted) path
+ * before leaving and it is re-validated and consumed here. Anything absent,
+ * stale or non-allowlisted falls back to the normal landing route.
+ */
+export function PostAuthLanding() {
+  const target = useMemo(() => consumeReturnTo(), []);
+  return <Navigate to={target ?? '/dashboard'} replace />;
+}
+
+/**
  * Single catch-all: authenticated users return to the dashboard (the old
  * protected `*` → /candidates behavior, retargeted to the new landing);
  * unauthenticated users get a truthful branded 404 with sign-in escape.
@@ -107,7 +119,7 @@ export default function App() {
         {/* Protected recruiter routes — valid session + resolved allowlist role */}
         <Route element={<ProtectedRoute />}>
           <Route element={<Layout />}>
-            <Route index element={<Navigate to="/dashboard" replace />} />
+            <Route index element={<PostAuthLanding />} />
             <Route path="/dashboard" element={<DashboardPage />} />
             <Route path="/roles" element={<RolesPage />} />
             <Route path="/candidates" element={<CandidatesPage />} />

@@ -411,8 +411,11 @@ export interface SagaDeps {
 
 /**
  * Phase 1 of the saga: build the redaction-safe scorecard and enqueue the
- * idempotent scorecard_write op (keyed by content marker). A matching marker
- * short-circuits (already written).
+ * scorecard_write op. The key is derived from the APPLICATION LINK alone, so
+ * `uq_ashby_operations_key` enforces at most one scorecard per link no matter
+ * how the content marker (or the review path inside it) changes — an Ashby
+ * scorecard cannot be retracted. A duplicate key or marker short-circuits
+ * (already written).
  */
 export async function enqueueScorecard(source: ScorecardSource, deps: SagaDeps): Promise<SagaResult> {
   if (!deps.gates.enabled) return { status: 'disabled' };
@@ -421,7 +424,7 @@ export async function enqueueScorecard(source: ScorecardSource, deps: SagaDeps):
   const res = await deps.stores.enqueueOperation({
     applicationLinkId: deps.applicationLinkId,
     operationType: 'scorecard_write',
-    operationKey: `ashby:scorecard:${deps.externalApplicationId}:${built.marker}`,
+    operationKey: `ashby:scorecard:link:${deps.applicationLinkId}`,
     marker: built.marker,
   });
   if (res.status === 'inserted') return { status: 'scorecard_enqueued', marker: built.marker };

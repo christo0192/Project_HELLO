@@ -902,6 +902,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SimpleError'
+        '500':
+          description: Sanitized internal error — a database lookup failed. Deliberately distinct from the 404 so an outage is retryable and is not shown as "removed or no access"; returned identically whether or not the link exists.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
   /api/integrations/ashby/review/{applicationLinkId}/notes:
     parameters:
       - name: applicationLinkId
@@ -931,6 +937,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SimpleError'
+        '500':
+          description: Sanitized internal error — a database lookup failed. Deliberately distinct from the 404 so an outage is retryable and is not shown as "removed or no access"; returned identically whether or not the link exists.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
 
   # ── LiveKit ────────────────────────────────────────────────────────
   /api/livekit/start:

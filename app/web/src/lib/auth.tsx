@@ -43,6 +43,7 @@ import type { AuthError, Session, User } from '@supabase/supabase-js';
 import { supabase } from './supabase';
 import { api } from '../api';
 import { AUTH_UNAUTHORIZED_EVENT } from './api-client';
+import { sanitizeReturnTo } from './return-to';
 
 /* ── Types ─────────────────────────────────────────────────────────── */
 
@@ -90,7 +91,7 @@ export interface AuthState {
   /** Sign out — clears subscriptions and app state. */
   signOut: () => Promise<void>;
   /** Initiate SSO OAuth with a configured provider. */
-  signInWithSSO: (provider: string) => Promise<void>;
+  signInWithSSO: (provider: string, returnTo?: string) => Promise<void>;
   /** Enroll a TOTP MFA factor. */
   enrollMfa: () => Promise<{
     error: AuthError | null;
@@ -252,14 +253,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   );
 
   /* ── SSO sign-in ──────────────────────────────────────────────── */
-  const signInWithSSO = useCallback(async (provider: string) => {
+  const signInWithSSO = useCallback(async (provider: string, returnTo?: string) => {
     const allowed = getSsoProviders();
     if (!allowed.includes(provider.toLowerCase())) {
       throw new Error('SSO provider is not configured or not allowed.');
     }
+    // The IdP round trip is a FULL-PAGE navigation, so router state is lost.
+    // Ask the provider to come back on the deep link itself, re-validating the
+    // path here against the same exact allowlist that guards every other
+    // return-to — `sanitizeReturnTo` stays the single trust boundary, so no
+    // caller can widen this into an open redirect. If the deployment has not
+    // registered the path in Supabase's allowed redirect URLs, Supabase falls
+    // back to the site URL and the parked sessionStorage copy takes over.
+    const safeReturnTo = sanitizeReturnTo(returnTo);
     const { error } = await supabase.auth.signInWithOAuth({
       provider: provider as any,
-      options: { redirectTo: window.location.origin },
+      options: { redirectTo: `${window.location.origin}${safeReturnTo ?? ''}` },
     });
     if (error) throw error;
   }, []);

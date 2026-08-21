@@ -264,6 +264,26 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
       return { status: statusOf(data) };
     },
     async enqueueScorecardWrite(applicationLinkId, sessionId): Promise<{ status: string }> {
+      // LINK-SCOPED idempotency, ahead of everything else. An Ashby scorecard
+      // cannot be retracted, so at most ONE scorecard_write operation may ever
+      // exist per application link — regardless of which historical marker
+      // version (or review-path shape) produced the first one. This covers
+      // legacy rows written before the marker stopped hashing the review path;
+      // the stable, link-derived operation_key below covers the concurrent
+      // case via the existing uq_ashby_operations_key constraint.
+      const { data: existing, error: existingError } = await client
+        .from('ashby_operations')
+        .select('id')
+        .eq('provider', 'ashby')
+        .eq('application_link_id', applicationLinkId)
+        .eq('operation_type', 'scorecard_write')
+        .limit(1)
+        .maybeSingle();
+      // Fail closed: a lookup we could not complete must never be read as
+      // "no scorecard yet" and produce a second provider write.
+      if (existingError) throw new Error('ashby_scorecard_enqueue_error');
+      if (existing) return { status: 'duplicate' };
+
       const { data: link, error: linkError } = await client
         .from('ashby_application_links')
         .select('external_application_id, external_job_id, job_mapping_id, ashby_job_mappings ( status, feedback_form_id )')
@@ -317,7 +337,11 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
       const result = await client.rpc('enqueue_ashby_operation', {
         p_application_link_id: applicationLinkId,
         p_operation_type: 'scorecard_write',
-        p_operation_key: `ashby:scorecard:${String(link.external_application_id)}:${built.marker}`,
+        // Link-derived and marker-INDEPENDENT: the (provider, operation_key)
+        // unique constraint is then itself the durable one-scorecard-per-link
+        // guard, so two racing enqueues collapse to `duplicate` in the database
+        // even if their content markers differ.
+        p_operation_key: `ashby:scorecard:link:${applicationLinkId}`,
         p_depends_on: null,
         p_marker: built.marker,
         p_actor_id: actorId,

@@ -6,17 +6,16 @@
  * feedback value type, the field set, Red Flags, email and stage moves are all
  * untouched by this lane.
  *
- * Idempotency is deliberately PRESERVED, not re-designed:
- *   - the marker still hashes the review path (unchanged derivation), so the
- *     same source still produces a byte-identical marker;
- *   - the enqueue-time and execute-time builders must therefore derive the path
- *     the same way — both go through `ashbyReviewPath`, and this file pins that
+ * Idempotency is content-only and link-scoped:
+ *   - the marker hashes the ASSESSMENT content and NOT the review path, so
+ *     re-shaping the deep link can never look like new content and re-trigger
+ *     a provider write on a link scored under the old `/sessions/<id>` path;
+ *   - the enqueue-time and execute-time builders still derive the path the same
+ *     way — both go through `ashbyReviewPath` — and this file pins that
  *     agreement so a future edit to one site fails loudly here;
- *   - because the path is part of the hashed content, a link whose scorecard
- *     was written under the OLD path hashes to a different marker. That is the
- *     pre-existing content-change semantics of this marker (any summary/score
- *     change behaves identically) and is asserted below so the consequence is
- *     recorded rather than discovered in production.
+ *   - the durable "one scorecard per application link, across every historical
+ *     marker version" guard lives at the enqueue site and is pinned by
+ *     ashby-scorecard-link-idempotency.test.ts.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -66,7 +65,7 @@ describe('ashbyReviewPath', () => {
   });
 });
 
-describe('scorecard idempotency is preserved', () => {
+describe('scorecard idempotency is content-only', () => {
   it('produces a byte-identical marker for an identical source', () => {
     const a = buildScorecard(source(), SCALE);
     const b = buildScorecard(source(), SCALE);
@@ -83,11 +82,21 @@ describe('scorecard idempotency is preserved', () => {
     if (enqueued.ok && executed.ok) expect(enqueued.marker).toBe(executed.marker);
   });
 
-  it('records that the path is hashed: the old session path yields a different marker', () => {
+  it('is independent of the review path: the old session path yields the SAME marker', () => {
+    // The whole point of the repair — a link whose scorecard was submitted
+    // under /sessions/<id> hashes identically under /ashby/review/<linkId>, so
+    // a re-drive cannot present as new content.
     const scoped = buildScorecard(source(), SCALE);
     const legacy = buildScorecard(source({ reviewPath: `/sessions/${SESSION_ID}` }), SCALE);
     expect(scoped.ok && legacy.ok).toBe(true);
-    if (scoped.ok && legacy.ok) expect(scoped.marker).not.toBe(legacy.marker);
+    if (scoped.ok && legacy.ok) expect(scoped.marker).toBe(legacy.marker);
+  });
+
+  it('still changes when the assessment content changes', () => {
+    const base = buildScorecard(source(), SCALE);
+    const rescored = buildScorecard(source({ overallScore: 41, summary: 'Weaker on role fit.' }), SCALE);
+    expect(base.ok && rescored.ok).toBe(true);
+    if (base.ok && rescored.ok) expect(base.marker).not.toBe(rescored.marker);
   });
 });
 
@@ -111,5 +120,49 @@ describe('the bound Ashby payload changes only the deep link', () => {
     expect(typeof overall.value).toBe('string');
     expect(fields).toHaveLength(3); // overall + summary + the one dimension
     expect(JSON.stringify(bound.feedbackForm)).not.toMatch(/red[_ ]?flag/i);
+  });
+
+  it('never truncates the deep link, even for a summary at the maximum length', () => {
+    const origin = 'https://app.example';
+    const link = `${origin}/ashby/review/${LINK_ID}`;
+    // A summary long enough that buildScorecard itself caps it at MAX_SUMMARY_LEN.
+    const built = buildScorecard(source({ summary: 'x'.repeat(5000) }), SCALE);
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    expect(built.scorecard.summary).toHaveLength(2000);
+
+    const bound = bindFeedbackForm(built.scorecard, HELLO_CHRISTY_SCORECARD_BINDING, `${origin}/`);
+    expect(bound.ok).toBe(true);
+    if (!bound.ok) return;
+    const fields = (bound.feedbackForm as { fieldSubmissions: Array<{ path: string; value: any }> }).fieldSubmissions;
+    const summary = fields.find((f) => f.path === HELLO_CHRISTY_SCORECARD_BINDING.fieldPaths!.summary)!;
+
+    // The complete suffix survives: value type unchanged, whole URL present,
+    // and the payload still respects the 2000-char cap (the summary body, not
+    // the link, is what gives way).
+    expect(summary.value.type).toBe('PlainText');
+    expect(summary.value.value.endsWith(link)).toBe(true);
+    expect(summary.value.value).toHaveLength(2000);
+    expect(summary.value.value).toContain('Detailed Project_HELLO scorecard: ');
+  });
+
+  it('keeps the whole link for a maximum-length summary on the longest allowed path', () => {
+    // Same boundary with the longer scoped path vs the old session path: the
+    // reserved suffix grows, the summary body shrinks, the URL stays intact.
+    const built = buildScorecard(source({ summary: 'y'.repeat(3000), reviewPath: `/sessions/${SESSION_ID}` }), SCALE);
+    const scoped = buildScorecard(source({ summary: 'y'.repeat(3000) }), SCALE);
+    expect(built.ok && scoped.ok).toBe(true);
+    if (!built.ok || !scoped.ok) return;
+    const value = (b: typeof built) => {
+      const bound = bindFeedbackForm((b as { scorecard: any }).scorecard, HELLO_CHRISTY_SCORECARD_BINDING, 'https://app.example/');
+      const fields = (bound as any).feedbackForm.fieldSubmissions as Array<{ path: string; value: any }>;
+      return fields.find((f) => f.path === HELLO_CHRISTY_SCORECARD_BINDING.fieldPaths!.summary)!.value.value as string;
+    };
+    const legacyValue = value(built);
+    const scopedValue = value(scoped);
+    expect(legacyValue.endsWith(`https://app.example/sessions/${SESSION_ID}`)).toBe(true);
+    expect(scopedValue.endsWith(`https://app.example/ashby/review/${LINK_ID}`)).toBe(true);
+    expect(legacyValue).toHaveLength(2000);
+    expect(scopedValue).toHaveLength(2000);
   });
 });

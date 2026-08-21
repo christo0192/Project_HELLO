@@ -164,6 +164,18 @@ function TestConsumer() {
       >
         SSO
       </button>
+      <button
+        data-testid="sso-return-btn"
+        onClick={() => signInWithSSO('google', '/ashby/review/11111111-1111-4111-8111-111111111111')}
+      >
+        SSO with return-to
+      </button>
+      <button
+        data-testid="sso-hostile-btn"
+        onClick={() => signInWithSSO('google', 'https://evil.example/ashby/review/11111111-1111-4111-8111-111111111111')}
+      >
+        SSO with hostile return-to
+      </button>
     </div>
   );
 }
@@ -370,6 +382,48 @@ describe('AuthProvider', () => {
     });
 
     // Cleanup
+    delete import.meta.env.VITE_SSO_PROVIDERS;
+  });
+
+  it('asks the identity provider to return to an allowlisted deep link', async () => {
+    // The IdP round trip is a full-page navigation, so the destination has to
+    // ride on the redirect URL — re-validated here, never taken on trust.
+    import.meta.env.VITE_SSO_PROVIDERS = 'google';
+    mockSupabase.auth.signInWithOAuth = vi.fn().mockResolvedValue({ data: {}, error: null });
+
+    renderWithProvider();
+    await waitFor(() => expect(screen.getByTestId('session')).toBeInTheDocument());
+
+    await userEvent.click(screen.getByTestId('sso-return-btn'));
+    await waitFor(() => {
+      expect(mockSupabase.auth.signInWithOAuth).toHaveBeenCalledWith({
+        provider: 'google',
+        options: {
+          redirectTo: `${window.location.origin}/ashby/review/11111111-1111-4111-8111-111111111111`,
+        },
+      });
+    });
+
+    delete import.meta.env.VITE_SSO_PROVIDERS;
+  });
+
+  it('never lets a caller-supplied return-to become an off-origin redirect', async () => {
+    import.meta.env.VITE_SSO_PROVIDERS = 'google';
+    mockSupabase.auth.signInWithOAuth = vi.fn().mockResolvedValue({ data: {}, error: null });
+
+    renderWithProvider();
+    await waitFor(() => expect(screen.getByTestId('session')).toBeInTheDocument());
+
+    await userEvent.click(screen.getByTestId('sso-hostile-btn'));
+    await waitFor(() => {
+      expect(mockSupabase.auth.signInWithOAuth).toHaveBeenCalledWith({
+        provider: 'google',
+        options: { redirectTo: window.location.origin },
+      });
+    });
+    const call = mockSupabase.auth.signInWithOAuth.mock.calls[0][0];
+    expect(call.options.redirectTo).not.toContain('evil.example');
+
     delete import.meta.env.VITE_SSO_PROVIDERS;
   });
 });

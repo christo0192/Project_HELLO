@@ -202,7 +202,13 @@ export function buildScorecard(source: ScorecardSource, scale: ScorecardScale): 
     provenance,
   };
 
-  // Deterministic idempotency marker over the stable content (no wall-clock).
+  // Deterministic idempotency marker over the ASSESSMENT CONTENT only (no
+  // wall-clock, and deliberately NOT the review path): the deep link is
+  // presentation, so re-shaping it must never look like new content and
+  // re-trigger a provider write. Link-scoped idempotency (at most one
+  // scorecard_write per application link, across every historical marker
+  // version) is enforced at the enqueue site + the operation_key unique
+  // constraint — see `enqueueScorecardWrite` in workflow-stores.ts.
   const marker = createHash('sha256')
     .update(
       JSON.stringify({
@@ -210,7 +216,6 @@ export function buildScorecard(source: ScorecardSource, scale: ScorecardScale): 
         r: scorecard.recommendation,
         d: scorecard.dimensions,
         s: scorecard.summary,
-        p: scorecard.reviewPath,
         m: provenance.model ?? '',
       }),
     )
@@ -300,7 +305,15 @@ function dashboardSummary(scorecard: NormalizedScorecard, dashboardOrigin: strin
       origin = parsed.origin;
     }
   } catch { /* fail closed to the relative path */ }
-  return `${scorecard.summary}\n\nDetailed Project_HELLO scorecard: ${origin}${scorecard.reviewPath}`.slice(0, MAX_SUMMARY_LEN);
+  // Reserve the WHOLE link suffix before truncating: the deep link is the
+  // artifact this summary exists to deliver, so a summary at the cap must lose
+  // its own tail, never a character of the URL.
+  const suffix = `\n\nDetailed Project_HELLO scorecard: ${origin}${scorecard.reviewPath}`;
+  const room = MAX_SUMMARY_LEN - suffix.length;
+  // Degenerate only if the suffix alone exceeded the cap (bounded origin +
+  // bounded review path make this unreachable in practice); keep the link whole.
+  if (room <= 0) return suffix.trimStart();
+  return `${scorecard.summary.slice(0, room)}${suffix}`;
 }
 
 export function bindFeedbackForm(

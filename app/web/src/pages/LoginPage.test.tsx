@@ -184,7 +184,8 @@ describe('LoginPage', () => {
     await user.click(screen.getByRole('button', { name: /Continue with Google Workspace/ }));
 
     await waitFor(() => {
-      expect(mockSignInWithSSO).toHaveBeenCalledWith('google');
+      // No deep link in play here, so no return-to travels with the request.
+      expect(mockSignInWithSSO).toHaveBeenCalledWith('google', undefined);
     });
   });
 

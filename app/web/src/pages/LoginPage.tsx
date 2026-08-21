@@ -21,7 +21,7 @@
 import { useState } from 'react';
 import { Navigate, useLocation } from 'react-router-dom';
 import { useAuth, ALLOWED_EMAIL_DOMAIN, isCompanyEmail } from '../lib/auth';
-import { sanitizeReturnTo } from '../lib/return-to';
+import { rememberReturnTo, sanitizeReturnTo } from '../lib/return-to';
 import { Button, Card, Input, Label } from '../components/ui';
 
 function getSsoProviders(): string[] {
@@ -106,7 +106,12 @@ export function LoginPage() {
   async function handleSSO(provider: string) {
     setError(null);
     try {
-      await signInWithSSO(provider);
+      // SSO leaves the SPA entirely, so the validated deep link is parked for
+      // the round trip AND handed to the provider as the return URL. Both
+      // paths re-run `sanitizeReturnTo`; an absent/rejected value simply
+      // lands on the normal route.
+      rememberReturnTo(returnTo);
+      await signInWithSSO(provider, returnTo ?? undefined);
     } catch {
       // Generic message — never leaks OAuth/allowlist configuration details.
       setError('Sign-in with Google is unavailable right now. Please try again later.');

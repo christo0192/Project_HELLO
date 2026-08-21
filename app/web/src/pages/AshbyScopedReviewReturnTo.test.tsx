@@ -11,10 +11,13 @@
  *     injected directly, since state is not a trust boundary.
  */
 import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { ProtectedRoute } from '../components/ProtectedRoute';
 import { LoginPage } from './LoginPage';
+import { PostAuthLanding } from '../App';
+import { rememberReturnTo, resetReturnToReplay } from '../lib/return-to';
 
 const UUID = '11111111-1111-4111-8111-111111111111';
 const REVIEW_PATH = `/ashby/review/${UUID}`;
@@ -68,6 +71,8 @@ function renderLoginWithState(state: unknown) {
 }
 
 beforeEach(() => {
+  resetReturnToReplay();
+  window.sessionStorage.clear();
   mockAuth = {
     isLoading: false,
     isAuthenticated: false,
@@ -127,5 +132,90 @@ describe('login return-to handling', () => {
     mockAuth.isAuthenticated = true;
     renderLoginWithState(undefined);
     await waitFor(() => expect(screen.getByTestId('candidates-page')).toBeInTheDocument());
+  });
+});
+
+/**
+ * The SSO path — a FULL-PAGE redirect to the identity provider and back.
+ *
+ * Router state does not survive that navigation, so without this the deep link
+ * was silently dropped for every deployment with VITE_SSO_PROVIDERS configured
+ * and the recruiter landed on the dashboard. The destination now travels two
+ * ways, both re-validated by `sanitizeReturnTo`: on the provider redirect URL,
+ * and parked in sessionStorage for the deployment where Supabase falls back to
+ * the site URL.
+ */
+describe('SSO deep-link return-to', () => {
+  const NOW_PATH = REVIEW_PATH;
+
+  afterEach(() => {
+    delete import.meta.env.VITE_SSO_PROVIDERS;
+  });
+
+  function renderLoginForSSO(state: unknown) {
+    import.meta.env.VITE_SSO_PROVIDERS = 'google';
+    return renderLoginWithState(state);
+  }
+
+  it('hands the validated destination to the provider AND parks it', async () => {
+    renderLoginForSSO({ returnTo: NOW_PATH });
+    await userEvent.click(screen.getByRole('button', { name: /continue with google/i }));
+
+    expect(mockAuth.signInWithSSO).toHaveBeenCalledWith('google', NOW_PATH);
+    const parked = window.sessionStorage.getItem('ashby.returnTo');
+    expect(parked).not.toBeNull();
+    expect(JSON.parse(parked!).p).toBe(NOW_PATH);
+  });
+
+  it('parks nothing and passes nothing for a hostile state value', async () => {
+    renderLoginForSSO({ returnTo: 'https://evil.example/ashby/review/' + UUID });
+    await userEvent.click(screen.getByRole('button', { name: /continue with google/i }));
+
+    expect(mockAuth.signInWithSSO).toHaveBeenCalledWith('google', undefined);
+    expect(window.sessionStorage.getItem('ashby.returnTo')).toBeNull();
+  });
+
+  it('parks nothing when there is no deep link at all', async () => {
+    renderLoginForSSO(undefined);
+    await userEvent.click(screen.getByRole('button', { name: /continue with google/i }));
+
+    expect(mockAuth.signInWithSSO).toHaveBeenCalledWith('google', undefined);
+    expect(window.sessionStorage.getItem('ashby.returnTo')).toBeNull();
+  });
+});
+
+/** The post-SSO landing route consumes the parked destination once. */
+describe('post-SSO landing', () => {
+  function renderLanding() {
+    return render(
+      <MemoryRouter initialEntries={['/']}>
+        <Routes>
+          <Route path="/" element={<PostAuthLanding />} />
+          <Route path="/dashboard" element={<div data-testid="dashboard-page">Dashboard</div>} />
+          <Route path="/ashby/review/:applicationLinkId" element={<div data-testid="scoped-review">Jane Doe</div>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  it('returns the recruiter to the exact scoped review they clicked', async () => {
+    rememberReturnTo(REVIEW_PATH);
+    renderLanding();
+    await waitFor(() => expect(screen.getByTestId('scoped-review')).toBeInTheDocument());
+  });
+
+  it('lands on the dashboard when nothing was parked (unchanged default)', async () => {
+    renderLanding();
+    await waitFor(() => expect(screen.getByTestId('dashboard-page')).toBeInTheDocument());
+  });
+
+  it('lands on the dashboard for a tampered storage entry', async () => {
+    window.sessionStorage.setItem(
+      'ashby.returnTo',
+      JSON.stringify({ p: 'https://evil.example/', t: Date.now() }),
+    );
+    renderLanding();
+    await waitFor(() => expect(screen.getByTestId('dashboard-page')).toBeInTheDocument());
+    expect(screen.queryByTestId('scoped-review')).toBeNull();
   });
 });
