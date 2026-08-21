@@ -7,9 +7,13 @@
  * payload to the Ashby client. This module NEVER emits a raw model response,
  * chain-of-thought, full transcript, recording bytes/URL, or a bearer/presigned
  * URL — only the existing numeric dimensions, the current scale, an
- * informational recommendation, a bounded summary, provenance, and a relative
- * internal review deep-link path. It also fails CLOSED when the tenant form
- * binding is unverified, rather than inventing Ashby field ids.
+ * informational recommendation, a bounded summary, provenance, bounded red
+ * flags taken only from the persisted `role_fit.red_flags` array, and an
+ * internal review deep link composed solely from the server's validated
+ * dashboard origin plus the canonical scoped review path. It also fails CLOSED
+ * when the tenant form binding is unverified, when that origin cannot be
+ * trusted, or when the review path is not the canonical scoped one — rather
+ * than inventing an Ashby field id or degrading the deep link.
  *
  * Determinism: given the same source + config the payload and its idempotency
  * marker are byte-identical, so "write the scorecard only if no matching marker
@@ -51,6 +55,14 @@ export interface ScorecardSource {
    * ride along in the scorecard.
    */
   reviewPath: string;
+  /**
+   * Raw `role_fit.red_flags` entries from the PERSISTED assessment, in the
+   * order they were scored. This is the ONLY accepted red-flag source: the
+   * saga reads exactly `role_fit.red_flags` and never an arbitrary provider or
+   * user payload key. Entries are normalized and bounded by
+   * {@link normalizeRedFlags} before they reach the provider.
+   */
+  redFlags?: readonly unknown[];
 }
 
 /** The configured target scale for the overall score on the Ashby scorecard. */
@@ -65,6 +77,16 @@ export interface ScorecardScale {
 const MAX_SUMMARY_LEN = 2000;
 const MAX_DIMENSIONS = 32;
 const MAX_REVIEW_PATH_LEN = 512;
+/** Red flags bounds — per item, per count, and over the rendered total. */
+export const MAX_RED_FLAG_ITEMS = 12;
+export const MAX_RED_FLAG_ITEM_LEN = 200;
+export const MAX_RED_FLAGS_TOTAL_LEN = 1500;
+/** Bound on an accepted dashboard origin string (defence in depth). */
+const MAX_DASHBOARD_ORIGIN_LEN = 255;
+/** The exact value submitted when no red flag survives normalization. */
+export const NO_RED_FLAGS_TEXT = 'None identified';
+/** How each normalized red flag is rendered into the Ashby `String` field. */
+const RED_FLAG_BULLET = '- ';
 
 /**
  * Field name fragments that must NEVER appear in scorecard source/config —
@@ -132,6 +154,134 @@ export interface NormalizedScorecard {
   summary: string;
   reviewPath: string;
   provenance: { model?: string; scoredAt?: string; version?: string };
+  /**
+   * Normalized, ordered, bounded red flags. Derived ONLY from the persisted
+   * `role_fit.red_flags` array; an empty list renders as
+   * {@link NO_RED_FLAGS_TEXT}.
+   */
+  redFlags: string[];
+}
+
+/** Remove UTF-16 surrogate halves that have no partner. */
+function stripLoneSurrogates(value: string): string {
+  return value
+    .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, '')
+    .replace(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '');
+}
+
+/**
+ * Normalize the persisted `role_fit.red_flags` array into ordered, bounded,
+ * control-character-free text items.
+ *
+ * Deliberately total and defensive: a non-array, a non-string entry, an entry
+ * that is only whitespace/control bytes, or an over-long list can never widen
+ * what reaches the ATS. Order is preserved because a recruiter reads the list
+ * as the assessment scored it. The cumulative bound is applied against the
+ * RENDERED length, so {@link renderRedFlags} can never exceed
+ * {@link MAX_RED_FLAGS_TOTAL_LEN} and no item is ever cut mid-way.
+ */
+export function normalizeRedFlags(input: unknown): string[] {
+  if (!Array.isArray(input)) return [];
+  const out: string[] = [];
+  let rendered = 0;
+  for (const entry of input) {
+    if (out.length >= MAX_RED_FLAG_ITEMS) break;
+    if (typeof entry !== 'string') continue;
+    // Strip C0/C1 controls and DEL (newlines included: one flag is one line),
+    // then collapse the resulting whitespace runs.
+    let cleaned = '';
+    for (let i = 0; i < entry.length; i++) {
+      const c = entry.charCodeAt(i);
+      cleaned += c <= 0x1f || c === 0x7f || (c >= 0x80 && c <= 0x9f) ? ' ' : entry[i];
+    }
+    // Lone surrogates are not text. Drop them before collapsing whitespace so
+    // removing one cannot leave a double space behind.
+    cleaned = stripLoneSurrogates(cleaned).replace(/\s+/g, ' ').trim();
+    if (cleaned.length === 0) continue;
+    if (cleaned.length > MAX_RED_FLAG_ITEM_LEN) {
+      // Truncation counts UTF-16 code units, so a cut can land inside a
+      // surrogate pair; strip the orphaned half the cut just created.
+      cleaned = stripLoneSurrogates(cleaned.slice(0, MAX_RED_FLAG_ITEM_LEN)).trim();
+    }
+    if (cleaned.length === 0) continue;
+    // '- ' prefix, plus a '\n' separator for every item after the first.
+    const cost = RED_FLAG_BULLET.length + cleaned.length + (out.length === 0 ? 0 : 1);
+    if (rendered + cost > MAX_RED_FLAGS_TOTAL_LEN) break;
+    rendered += cost;
+    out.push(cleaned);
+  }
+  return out;
+}
+
+/**
+ * Render normalized red flags into the exact value submitted to the Ashby
+ * `String` field. An empty list is submitted as exactly
+ * {@link NO_RED_FLAGS_TEXT} — never an empty string, so a recruiter can tell
+ * "screened, nothing found" from "never screened".
+ */
+export function renderRedFlags(redFlags: readonly string[]): string {
+  if (!Array.isArray(redFlags) || redFlags.length === 0) return NO_RED_FLAGS_TEXT;
+  const text = redFlags.map((f) => `${RED_FLAG_BULLET}${f}`).join('\n');
+  return text.length === 0 ? NO_RED_FLAGS_TEXT : text.slice(0, MAX_RED_FLAGS_TOTAL_LEN);
+}
+
+/**
+ * Canonicalize a configured dashboard origin into a bare `https://host[:port]`
+ * origin, or `null` when it cannot be trusted.
+ *
+ * Fails closed on anything that is not a plain HTTPS origin: `http:` (the ATS
+ * link must not be downgradeable), userinfo (`https://user:pw@host`, a classic
+ * spoofed-host vector), a path/query/fragment (an open-redirect input), and any
+ * unparseable or over-long value. The caller MUST refuse to submit any Ashby
+ * feedback when this returns `null` — a relative path may never enter a `Url`
+ * field.
+ */
+export function dashboardOriginOf(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const value = raw.trim();
+  if (value.length === 0 || value.length > MAX_DASHBOARD_ORIGIN_LEN) return null;
+  let parsed: URL;
+  try { parsed = new URL(value); } catch { return null; }
+  if (parsed.protocol !== 'https:') return null;
+  if (parsed.username.length > 0 || parsed.password.length > 0) return null;
+  if (parsed.pathname !== '/') return null;
+  if (parsed.search.length > 0 || parsed.hash.length > 0) return null;
+  if (parsed.hostname.length === 0) return null;
+  return parsed.origin;
+}
+
+/**
+ * True iff `p` is EXACTLY the canonical scoped review path
+ * `/ashby/review/<uuid>`. Nothing else may be composed into the `Detailed
+ * report` `Url` field: not a legacy `/sessions/<id>` path, not an absolute URL,
+ * not a path carrying a query/fragment/traversal, and not a non-UUID id (which
+ * is what an external Ashby id or an email would look like).
+ */
+export function isScopedReviewPath(p: unknown): boolean {
+  if (typeof p !== 'string' || !isRelativeReviewPath(p)) return false;
+  return /^\/ashby\/review\/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(p);
+}
+
+/**
+ * Compose the bare absolute HTTPS deep link submitted to `Detailed report`.
+ * Built ONLY from a validated server origin plus the canonical scoped review
+ * path, so it carries no PII, token, query, fragment, userinfo, external Ashby
+ * id, or open-redirect input. Returns `null` (fail closed) otherwise.
+ */
+export function detailedReportUrl(dashboardOrigin: unknown, reviewPath: unknown): string | null {
+  const origin = dashboardOriginOf(dashboardOrigin);
+  if (origin === null) return null;
+  if (!isScopedReviewPath(reviewPath)) return null;
+  const composed = `${origin}${reviewPath as string}`;
+  // Re-parse the composed value: it must round-trip byte-identically as a bare
+  // HTTPS URL with no credentials, query, or fragment.
+  let url: URL;
+  try { url = new URL(composed); } catch { return null; }
+  if (url.href !== composed) return null;
+  if (url.protocol !== 'https:') return null;
+  if (url.username.length > 0 || url.password.length > 0) return null;
+  if (url.search.length > 0 || url.hash.length > 0) return null;
+  return composed;
 }
 
 /**
@@ -200,15 +350,22 @@ export function buildScorecard(source: ScorecardSource, scale: ScorecardScale): 
     summary,
     reviewPath: source.reviewPath,
     provenance,
+    redFlags: normalizeRedFlags(source.redFlags),
   };
 
   // Deterministic idempotency marker over the ASSESSMENT CONTENT only (no
   // wall-clock, and deliberately NOT the review path): the deep link is
   // presentation, so re-shaping it must never look like new content and
-  // re-trigger a provider write. Link-scoped idempotency (at most one
-  // scorecard_write per application link, across every historical marker
-  // version) is enforced at the enqueue site + the operation_key unique
-  // constraint — see `enqueueScorecardWrite` in workflow-stores.ts.
+  // re-trigger a provider write. Normalized red flags ARE assessment content
+  // and are hashed under a NEW key `f` — deliberately, so the marker keeps
+  // describing what was scored rather than a subset of it. This is safe
+  // because it cannot widen what gets written: link-scoped idempotency (at
+  // most one scorecard_write per application link, across every historical
+  // marker version) is enforced by a marker-INDEPENDENT admission read plus a
+  // link-derived `operation_key` unique constraint — see
+  // `enqueueScorecardWrite` in workflow-stores.ts and `enqueueScorecard` in
+  // orchestration.ts. A changed red-flag list therefore changes the marker and
+  // still enqueues nothing.
   const marker = createHash('sha256')
     .update(
       JSON.stringify({
@@ -217,6 +374,7 @@ export function buildScorecard(source: ScorecardSource, scale: ScorecardScale): 
         d: scorecard.dimensions,
         s: scorecard.summary,
         m: provenance.model ?? '',
+        f: scorecard.redFlags,
       }),
     )
     .digest('hex')
@@ -244,7 +402,23 @@ export interface ScorecardFormBinding {
   /** Map of internal dimension key → Ashby field id (display/audit metadata). */
   dimensionFieldIds?: Record<string, string>;
   /** Ashby submit payload keys; the API uses field paths, not definition ids. */
-  fieldPaths?: { overall: string; summary: string; dimensions: Record<string, string> };
+  fieldPaths?: {
+    overall: string;
+    summary: string;
+    dimensions: Record<string, string>;
+    /** Verified submission path of the optional `Red flags` String field. */
+    redFlags?: string;
+    /** Verified submission path of the optional `Detailed report` Url field. */
+    detailedReport?: string;
+  };
+  /**
+   * Explicit expected Ashby field types, as read from the tenant's official
+   * `feedbackFormDefinition.info`. Declared so a future form edit that changes
+   * a field's type is a fail-closed binding error rather than a silently
+   * mis-typed submission: a `Url` field takes a bare URL string, a `String`
+   * field takes a bare string, and only `RichText` takes a PlainText envelope.
+   */
+  fieldTypes?: { redFlags?: string; detailedReport?: string };
   /** Verified Ashby Score scale for dimension fields. */
   dimensionScale?: ScorecardScale;
 }
@@ -272,20 +446,28 @@ export const HELLO_CHRISTY_SCORECARD_BINDING: ScorecardFormBinding = {
       motivation: '6d8d9ff3-43c9-44e5-bba3-d3ae4dce0eef',
       role_fit: 'd1220462-1d8a-43b9-a56f-c5635cdd5e2f',
     },
+    // Verified 2026-08-21 from the tenant's official feedbackFormDefinition.info
+    // for form 1c9a92c0-c18f-4bf1-898f-c29e71d7d303. Both fields are optional
+    // on the form; no submitted values were read.
+    redFlags: 'a9127af9-fc4d-474d-b3ce-95c57052e840',
+    detailedReport: '81b04084-d7a0-40f1-9d30-7eccaa62798d',
   },
+  fieldTypes: { redFlags: 'String', detailedReport: 'Url' },
   dimensionScale: { min: 1, max: 4 },
 };
 
 export type BoundFeedbackForm =
   | { ok: true; formDefinitionId: string; feedbackForm: Record<string, unknown> }
-  | { ok: false; reason: 'binding_unverified' | 'binding_incomplete' };
+  | {
+      ok: false;
+      reason:
+        | 'binding_unverified'
+        | 'binding_incomplete'
+        | 'binding_field_type_mismatch'
+        | 'dashboard_origin_invalid'
+        | 'invalid_review_path';
+    };
 
-/**
- * Bind a normalized scorecard to concrete Ashby feedback-form field ids using a
- * VERIFIED tenant binding. Fails closed when the binding is unverified or is
- * missing the form/overall/summary ids — never fabricating an Ashby endpoint
- * shape. Unmapped dimensions are omitted (not guessed).
- */
 function mapDimensionToScale(score: number, scale: ScorecardScale): number {
   const min = Math.round(scale.min);
   const max = Math.round(scale.max);
@@ -294,28 +476,22 @@ function mapDimensionToScale(score: number, scale: ScorecardScale): number {
   return min + Math.min(max - min, Math.floor(pct * (max - min + 1)));
 }
 
-function dashboardSummary(scorecard: NormalizedScorecard, dashboardOrigin: string): string {
-  // The review path was validated as site-relative before reaching this point.
-  // The origin is supplied from the server's validated WEB_ORIGIN allowlist;
-  // reject anything else rather than placing an attacker-controlled URL in ATS.
-  let origin = '';
-  try {
-    const parsed = new URL(dashboardOrigin);
-    if ((parsed.protocol === 'https:' || parsed.protocol === 'http:') && !parsed.username && !parsed.password && parsed.pathname === '/') {
-      origin = parsed.origin;
-    }
-  } catch { /* fail closed to the relative path */ }
-  // Reserve the WHOLE link suffix before truncating: the deep link is the
-  // artifact this summary exists to deliver, so a summary at the cap must lose
-  // its own tail, never a character of the URL.
-  const suffix = `\n\nDetailed Project_HELLO scorecard: ${origin}${scorecard.reviewPath}`;
-  const room = MAX_SUMMARY_LEN - suffix.length;
-  // Degenerate only if the suffix alone exceeded the cap (bounded origin +
-  // bounded review path make this unreachable in practice); keep the link whole.
-  if (room <= 0) return suffix.trimStart();
-  return `${scorecard.summary.slice(0, room)}${suffix}`;
-}
-
+/**
+ * Bind a normalized scorecard to concrete Ashby feedback-form field paths.
+ *
+ * Fail-closed order matters and is deliberate:
+ *   1. an unverified / incomplete / mis-typed binding never invents a shape;
+ *   2. the dashboard deep link is composed BEFORE any field is emitted, so a
+ *      dashboard origin we cannot trust (missing, `http:`, userinfo-bearing,
+ *      pathful, unparseable) or a review path that is not the canonical
+ *      `/ashby/review/<uuid>` refuses the WHOLE binding. The caller then
+ *      submits no Ashby feedback at all, rather than a scorecard whose only
+ *      clickable destination is missing or, worse, a relative path smuggled
+ *      into a `Url` field.
+ *
+ * The Summary field deliberately no longer carries the dashboard URL: the
+ * clickable destination lives ONLY in `Detailed report`.
+ */
 export function bindFeedbackForm(
   scorecard: NormalizedScorecard,
   binding: ScorecardFormBinding,
@@ -329,12 +505,34 @@ export function bindFeedbackForm(
   const overallKey = paths?.overall ?? binding.overallFieldId;
   const summaryKey = paths?.summary ?? binding.summaryFieldId;
   if (!overallKey || !summaryKey) return { ok: false, reason: 'binding_incomplete' };
+  // Explicit verified types only. A form edit that retyped either extended
+  // field must break loudly here, never submit a wrongly-shaped value.
+  if (paths?.redFlags && (binding.fieldTypes?.redFlags ?? 'String') !== 'String') {
+    return { ok: false, reason: 'binding_field_type_mismatch' };
+  }
+  if (paths?.detailedReport && (binding.fieldTypes?.detailedReport ?? 'Url') !== 'Url') {
+    return { ok: false, reason: 'binding_field_type_mismatch' };
+  }
+  // Compose the deep link first: it gates the entire submission.
+  if (!isScopedReviewPath(scorecard.reviewPath)) return { ok: false, reason: 'invalid_review_path' };
+  const reportUrl = detailedReportUrl(dashboardOrigin, scorecard.reviewPath);
+  if (reportUrl === null) return { ok: false, reason: 'dashboard_origin_invalid' };
+
   const fieldSubmissions: Array<{ path: string; value: unknown }> = [
     // Ashby ValueSelect fields accept the stored option value as a string.
     { path: overallKey, value: String(scorecard.scaleValue) },
     // Ashby accepts PlainText objects for RichText fields via the public API.
-    { path: summaryKey, value: { type: 'PlainText', value: dashboardSummary(scorecard, dashboardOrigin) } },
+    // The approved summary text only — no raw dashboard URL, no link label.
+    { path: summaryKey, value: { type: 'PlainText', value: scorecard.summary } },
   ];
+  // Ashby `String` fields take a bare string; `Url` fields take a bare, valid
+  // absolute URL string. Neither takes a PlainText envelope.
+  if (paths?.redFlags) {
+    fieldSubmissions.push({ path: paths.redFlags, value: renderRedFlags(scorecard.redFlags) });
+  }
+  if (paths?.detailedReport) {
+    fieldSubmissions.push({ path: paths.detailedReport, value: reportUrl });
+  }
   const dimKeys = paths?.dimensions ?? binding.dimensionFieldIds ?? {};
   const dimensionScale = binding.dimensionScale ?? { min: 1, max: 4 };
   for (const d of scorecard.dimensions) {

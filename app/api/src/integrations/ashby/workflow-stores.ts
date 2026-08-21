@@ -240,6 +240,10 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
           version: typeof provenance.prompt_template_version === 'string' ? provenance.prompt_template_version : undefined,
         },
         reviewPath: ashbyReviewPath(applicationLinkId),
+        // ONLY the persisted `role_fit.red_flags` array. Never any other
+        // provider/user payload key; normalization + bounds live in
+        // `normalizeRedFlags` so both build sites agree byte-for-byte.
+        redFlags: Array.isArray(roleFit.red_flags) ? roleFit.red_flags : [],
       };
     },
     async readLink(applicationLinkId): Promise<WorkflowLinkRow | null> {
@@ -354,6 +358,10 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
           version: typeof provenance.prompt_template_version === 'string' ? provenance.prompt_template_version : undefined,
         },
         reviewPath: ashbyReviewPath(applicationLinkId),
+        // ONLY the persisted `role_fit.red_flags` array. Never any other
+        // provider/user payload key; normalization + bounds live in
+        // `normalizeRedFlags` so both build sites agree byte-for-byte.
+        redFlags: Array.isArray(roleFit.red_flags) ? roleFit.red_flags : [],
       };
       const built = buildScorecard(source, { min: 1, max: 4 });
       if (!built.ok) return { status: `scorecard_${built.reason}` };

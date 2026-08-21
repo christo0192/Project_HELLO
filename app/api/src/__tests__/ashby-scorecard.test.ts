@@ -10,6 +10,7 @@
 
 import { describe, it, expect } from 'vitest';
 import {
+  ashbyReviewPath,
   buildScorecard,
   bindFeedbackForm,
   HELLO_CHRISTY_SCORECARD_BINDING,
@@ -22,6 +23,8 @@ import {
 } from '../integrations/ashby/scorecard.js';
 
 const scale: ScorecardScale = { min: 1, max: 4 };
+const LINK_ID = '33333333-3333-4333-8333-333333333333';
+const ORIGIN = 'https://hello.example.com';
 
 function source(overrides: Partial<ScorecardSource> = {}): ScorecardSource {
   return {
@@ -33,7 +36,7 @@ function source(overrides: Partial<ScorecardSource> = {}): ScorecardSource {
     ],
     summary: 'Strong communicator; relevant background.',
     provenance: { model: 'deepseek-scoring', scoredAt: '2026-08-13T00:00:00Z', version: '1' },
-    reviewPath: '/review/sessions/sess_123',
+    reviewPath: ashbyReviewPath(LINK_ID),
     ...overrides,
   };
 }
@@ -135,17 +138,23 @@ describe('bindFeedbackForm — fails closed until tenant-verified', () => {
         { key: 'role_fit', score: 5 },
       ],
     }), scale);
-    const r = bindFeedbackForm(fullScorecard.ok ? fullScorecard.scorecard : scorecard, HELLO_CHRISTY_SCORECARD_BINDING, 'https://hello.example.com');
+    const r = bindFeedbackForm(fullScorecard.ok ? fullScorecard.scorecard : scorecard, HELLO_CHRISTY_SCORECARD_BINDING, ORIGIN);
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.formDefinitionId).toBe(HELLO_CHRISTY_SCORECARD_BINDING.formDefinitionId);
       const fields = r.feedbackForm.fieldSubmissions as Array<{ path: string; value: unknown }>;
       expect(fields.find((f) => f.path === 'overall_recommendation')?.value).toBe('3');
       expect(fields.find((f) => f.path === 'ee3ca034-ea9c-451a-85de-1e22b1bce180')?.value).toEqual({ score: 4 });
+      // Summary is the approved PlainText summary and NOTHING else: the
+      // clickable destination now lives only in `Detailed report`.
       expect(fields.find((f) => f.path === 'b5778d87-0be5-4ca3-8727-88dc8dd6eba0')?.value).toEqual({
         type: 'PlainText',
-        value: expect.stringContaining('https://hello.example.com/review/sessions/sess_123'),
+        value: 'Strong communicator; relevant background.',
       });
+      expect(fields.find((f) => f.path === '81b04084-d7a0-40f1-9d30-7eccaa62798d')?.value)
+        .toBe(`${ORIGIN}/ashby/review/${LINK_ID}`);
+      expect(fields.find((f) => f.path === 'a9127af9-fc4d-474d-b3ce-95c57052e840')?.value)
+        .toBe('None identified');
     }
   });
 
@@ -157,7 +166,7 @@ describe('bindFeedbackForm — fails closed until tenant-verified', () => {
       summaryFieldId: 'f_summary',
       dimensionFieldIds: { communication: 'f_comm' }, // motivation intentionally unmapped
     };
-    const r = bindFeedbackForm(scorecard, binding);
+    const r = bindFeedbackForm(scorecard, binding, ORIGIN);
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.formDefinitionId).toBe('form_1');
@@ -165,7 +174,7 @@ describe('bindFeedbackForm — fails closed until tenant-verified', () => {
       expect(fields.find((f) => f.path === 'f_overall')?.value).toBe(String(scorecard.scaleValue));
       expect(fields.find((f) => f.path === 'f_summary')?.value).toEqual({
         type: 'PlainText',
-        value: `${scorecard.summary}\n\nDetailed Project_HELLO scorecard: ${scorecard.reviewPath}`,
+        value: scorecard.summary,
       });
       expect(fields.find((f) => f.path === 'f_comm')?.value).toEqual({ score: 4 });
       expect(fields.map((f) => f.path)).not.toContain('motivation');
