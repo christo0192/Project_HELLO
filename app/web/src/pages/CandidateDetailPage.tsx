@@ -1,21 +1,25 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api, ApiError } from "../api";
-import type { AppealRow, CandidateDetail, Note, Session } from "../types";
+import type { AppealRow, CandidateDetail, Note } from "../types";
 import { LiveCallPanel } from "../components/LiveCallPanel";
 import { LiveKitCallCard } from "../components/LiveKitCallCard";
 import { Button, Card, Chip, ErrorState, LoadingState } from "../components/ui";
 import { PageHeader, StatusBadge } from "../components/design";
-import { Tabs, TranscriptionSyncWorkspace } from "../components/talent";
+import {
+  CandidateProfileCard,
+  DecisionBlockedBanner,
+  NotesList,
+  SessionsSummary,
+  Tabs,
+  TranscriptionSyncWorkspace,
+} from "../components/talent";
 import {
   candidateStatusLabel,
   candidateStatusTone,
-  formatDurationSec,
   sessionStatusLabel,
-  sessionStatusTone,
 } from "../components/talent";
 import { formatDateTime } from "../lib/datetime";
-import { sessionModeLabel } from "../lib/session-mode";
 
 /**
  * HELLO Lane 3 — CandidateDetail as one recruiter review workspace.
@@ -80,21 +84,7 @@ export function CandidateDetailPage() {
         }
       />
 
-      {decisionBlocked && (
-        <div
-          role="alert"
-          className="mb-5 mt-4 rounded-md border border-warning/40 bg-warning-soft p-4"
-        >
-          <p className="text-sm font-semibold text-warning">
-            Decision use is paused — open appeal
-          </p>
-          <p className="mt-1 text-sm text-ink-secondary">
-            An appeal is under review. Automated recommendations and status
-            automation are hidden until a human reviewer resolves it. The
-            existing status is preserved.
-          </p>
-        </div>
-      )}
+      {decisionBlocked && <DecisionBlockedBanner />}
 
       <div className="mt-4">
         <Tabs
@@ -137,51 +127,10 @@ function OverviewTab({
   return (
     <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
       {/* Profile */}
-      <Card className="p-5 lg:col-span-1">
-        <h2 className="mb-4 text-sm font-semibold text-ink">Profile</h2>
-        <dl className="space-y-3 text-sm">
-          <Field label="Phone">
-            {candidate.phone_e164 ? (
-              <span className="flex items-center gap-1.5">
-                {candidate.phone_e164}
-                {!candidate.phone_valid && <Chip tone="red">invalid</Chip>}
-              </span>
-            ) : (
-              <span className="text-ink-tertiary">Not provided</span>
-            )}
-          </Field>
-          <Field label="Experience">
-            {candidate.experience_years != null
-              ? `${candidate.experience_years} years`
-              : "—"}
-          </Field>
-          <Field label="Status">
-            <StatusBadge tone={candidateStatusTone(candidate.status)}>
-              {candidateStatusLabel(candidate.status)}
-            </StatusBadge>
-          </Field>
-          <div>
-            <dt className="mb-1.5 text-xs font-medium text-ink-secondary">
-              Skills
-            </dt>
-            <dd className="flex flex-wrap gap-1.5">
-              {candidate.skills.length === 0 ? (
-                <span className="text-ink-tertiary">None parsed</span>
-              ) : (
-                candidate.skills.map((s) => (
-                  <Chip key={s} tone="accent">
-                    {s}
-                  </Chip>
-                ))
-              )}
-            </dd>
-          </div>
-        </dl>
-        <p className="mt-5 rounded-lg bg-surface-tertiary p-3 text-xs leading-relaxed text-ink-secondary">
-          Start a browser voice screening below. Transcript, playback, and
-          scorecard sync back and are reviewed in the Review tab.
-        </p>
-      </Card>
+      <CandidateProfileCard
+        candidate={candidate}
+        footnote="Start a browser voice screening below. Transcript, playback, and scorecard sync back and are reviewed in the Review tab."
+      />
 
       {/* Live actions + sessions + notes + appeals */}
       <div className="space-y-6 lg:col-span-2">
@@ -201,56 +150,6 @@ function OverviewTab({
         <AppealsSection candidateId={candidate.id} sessions={sessions} />
       </div>
     </div>
-  );
-}
-
-function SessionsSummary({ sessions }: { sessions: Session[] }) {
-  return (
-    <Card className="p-5">
-      <h2 className="mb-3 text-sm font-semibold text-ink">Screening sessions</h2>
-      {sessions.length === 0 ? (
-        <p className="text-sm text-ink-secondary">
-          No screening sessions yet. Start one above.
-        </p>
-      ) : (
-        <ul className="divide-y divide-line">
-          {sessions.map((s) => (
-            <li
-              key={s.id}
-              className="flex flex-wrap items-center justify-between gap-3 py-3 text-sm"
-            >
-              <div className="min-w-0">
-                <p className="font-medium text-ink">
-                  Session {s.id.slice(0, 8)}
-                  {s.mode && (
-                    <span className="ml-2 text-xs font-normal text-ink-tertiary">
-                      {sessionModeLabel(s.mode).toLowerCase()}
-                    </span>
-                  )}
-                </p>
-                <p className="text-xs text-ink-tertiary">
-                  {formatDateTime(s.created_at)}
-                  {s.duration_sec
-                    ? ` · ${formatDurationSec(s.duration_sec)}`
-                    : ""}
-                </p>
-              </div>
-              <div className="flex items-center gap-3">
-                <StatusBadge tone={sessionStatusTone(s.status)}>
-                  {sessionStatusLabel(s.status)}
-                </StatusBadge>
-                <Link
-                  to={`/sessions/${s.id}`}
-                  className="text-xs font-medium text-brand-700 hover:text-brand-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:text-brand-300"
-                >
-                  View details
-                </Link>
-              </div>
-            </li>
-          ))}
-        </ul>
-      )}
-    </Card>
   );
 }
 
@@ -291,24 +190,7 @@ function NotesSection({ candidateId }: { candidateId: string }) {
   return (
     <Card className="p-5">
       <h2 className="mb-3 text-sm font-semibold text-ink">Notes</h2>
-      {err ? (
-        <p className="text-sm text-error">{err}</p>
-      ) : notes === null ? (
-        <p className="text-sm text-ink-tertiary">Loading notes…</p>
-      ) : notes.length === 0 ? (
-        <p className="text-sm text-ink-secondary">No notes yet.</p>
-      ) : (
-        <ul className="divide-y divide-line">
-          {notes.map((n) => (
-            <li key={n.id} className="py-2 text-sm">
-              <p className="whitespace-pre-wrap text-ink">{n.note}</p>
-              <p className="mt-0.5 text-xs text-ink-tertiary">
-                {formatDateTime(n.created_at)}
-              </p>
-            </li>
-          ))}
-        </ul>
-      )}
+      <NotesList notes={notes} error={err} />
       <div className="mt-3 flex gap-2">
         <label htmlFor="note-input" className="sr-only">
           Add a note
@@ -511,21 +393,6 @@ function CsvExportButton({ candidateId }: { candidateId: string }) {
         Export screening data (scorecard + transcript)
       </Button>
       {err && <p className="mt-1 text-xs text-error">{err}</p>}
-    </div>
-  );
-}
-
-function Field({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex items-center justify-between gap-4">
-      <dt className="text-xs font-medium text-ink-secondary">{label}</dt>
-      <dd className="text-ink">{children}</dd>
     </div>
   );
 }

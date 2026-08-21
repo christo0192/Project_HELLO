@@ -19,7 +19,7 @@ import type {
   WorkflowLinkRow,
 } from './orchestration.js';
 import type { AshbyLinkLookup } from './completion-observer.js';
-import { buildScorecard, type ScorecardSource } from './scorecard.js';
+import { ashbyReviewPath, buildScorecard, type ScorecardSource } from './scorecard.js';
 
 const SYSTEM_ACTOR = '00000000-0000-4000-8000-000000000001';
 
@@ -29,6 +29,29 @@ function statusOf(data: unknown): string {
 
 /** Production WorkflowStores backed by the 0029/0031 tables + RPCs. */
 export function createWorkflowStores(client: SupabaseClient, actorId: string = SYSTEM_ACTOR): RuntimeWorkflowStores {
+  /**
+   * Link-scoped scorecard admission read. Any `scorecard_write` row on the link
+   * — any state, any historical operation key, any marker — counts, because an
+   * Ashby scorecard cannot be retracted. Throws rather than returning null when
+   * the read itself fails, so every caller fails closed.
+   *
+   * Declared once here and shared by `enqueueScorecardWrite` and (through the
+   * store seam) the saga's `enqueueScorecard`, so there is exactly one copy of
+   * this query.
+   */
+  async function findScorecardWriteOperation(applicationLinkId: string): Promise<{ id: string } | null> {
+    const { data, error } = await client
+      .from('ashby_operations')
+      .select('id')
+      .eq('provider', 'ashby')
+      .eq('application_link_id', applicationLinkId)
+      .eq('operation_type', 'scorecard_write')
+      .limit(1)
+      .maybeSingle();
+    if (error) throw new Error('ashby_scorecard_admission_error');
+    return data ? { id: String((data as { id: unknown }).id) } : null;
+  }
+
   return {
     async findLinkByApplicationId(externalApplicationId): Promise<ExistingLinkRow | null> {
       const { data, error } = await client
@@ -95,6 +118,7 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
       if (error) throw new Error('ashby_ingestion_advance_error');
       return { status: statusOf(data), state: (data as { state?: string } | null)?.state };
     },
+    findScorecardWriteOperation,
     async enqueueOperation(input): Promise<EnqueueResult> {
       const { data, error } = await client.rpc('enqueue_ashby_operation', {
         p_application_link_id: input.applicationLinkId,
@@ -215,7 +239,7 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
           scoredAt: typeof a.created_at === 'string' ? a.created_at : undefined,
           version: typeof provenance.prompt_template_version === 'string' ? provenance.prompt_template_version : undefined,
         },
-        reviewPath: `/sessions/${encodeURIComponent(link.session_id)}`,
+        reviewPath: ashbyReviewPath(applicationLinkId),
       };
     },
     async readLink(applicationLinkId): Promise<WorkflowLinkRow | null> {
@@ -264,6 +288,25 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
       return { status: statusOf(data) };
     },
     async enqueueScorecardWrite(applicationLinkId, sessionId): Promise<{ status: string }> {
+      // LINK-SCOPED idempotency, ahead of everything else. An Ashby scorecard
+      // cannot be retracted, so at most ONE scorecard_write operation may ever
+      // exist per application link — regardless of which historical marker
+      // version (or review-path shape) produced the first one. This covers
+      // legacy rows written before the marker stopped hashing the review path;
+      // the stable, link-derived operation_key below covers the concurrent
+      // case via the existing uq_ashby_operations_key constraint.
+      // Fail closed: a lookup we could not complete must never be read as
+      // "no scorecard yet" and produce a second provider write. The read lives
+      // in `findScorecardWriteOperation` so the saga's `enqueueScorecard` uses
+      // the SAME guard through the store seam instead of a second copy of it.
+      let existing: { id: string } | null;
+      try {
+        existing = await findScorecardWriteOperation(applicationLinkId);
+      } catch {
+        throw new Error('ashby_scorecard_enqueue_error');
+      }
+      if (existing) return { status: 'duplicate' };
+
       const { data: link, error: linkError } = await client
         .from('ashby_application_links')
         .select('external_application_id, external_job_id, job_mapping_id, ashby_job_mappings ( status, feedback_form_id )')
@@ -310,14 +353,18 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
           scoredAt: typeof a.created_at === 'string' ? a.created_at : undefined,
           version: typeof provenance.prompt_template_version === 'string' ? provenance.prompt_template_version : undefined,
         },
-        reviewPath: `/sessions/${encodeURIComponent(sessionId)}`,
+        reviewPath: ashbyReviewPath(applicationLinkId),
       };
       const built = buildScorecard(source, { min: 1, max: 4 });
       if (!built.ok) return { status: `scorecard_${built.reason}` };
       const result = await client.rpc('enqueue_ashby_operation', {
         p_application_link_id: applicationLinkId,
         p_operation_type: 'scorecard_write',
-        p_operation_key: `ashby:scorecard:${String(link.external_application_id)}:${built.marker}`,
+        // Link-derived and marker-INDEPENDENT: the (provider, operation_key)
+        // unique constraint is then itself the durable one-scorecard-per-link
+        // guard, so two racing enqueues collapse to `duplicate` in the database
+        // even if their content markers differ.
+        p_operation_key: `ashby:scorecard:link:${applicationLinkId}`,
         p_depends_on: null,
         p_marker: built.marker,
         p_actor_id: actorId,

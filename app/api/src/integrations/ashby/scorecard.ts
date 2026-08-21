@@ -45,7 +45,8 @@ export interface ScorecardSource {
   /** Immutable scoring provenance (model id / scored-at / version) — no secrets. */
   provenance: { model?: string; scoredAt?: string; version?: string };
   /**
-   * Relative internal review path (e.g. '/review/sessions/<id>'). MUST be a
+   * Relative internal review path (e.g. '/ashby/review/<applicationLinkId>',
+   * built by {@link ashbyReviewPath}). MUST be a
    * site-relative path — never an absolute URL, so no bearer/presigned link can
    * ride along in the scorecard.
    */
@@ -133,6 +134,21 @@ export interface NormalizedScorecard {
   provenance: { model?: string; scoredAt?: string; version?: string };
 }
 
+/**
+ * The canonical relative deep link for a scorecard's review experience: the
+ * candidate-scoped Ashby review page, addressed ONLY by the opaque application
+ * link id. It never carries a candidate id, a session id, an email, or a token,
+ * and it is always site-relative so no bearer/presigned URL can ride along.
+ *
+ * Both scorecard builders (enqueue-time and execute-time) MUST derive the path
+ * through this helper: the idempotency marker hashes the review path, so the
+ * two sites drifting apart would make the executed payload's marker disagree
+ * with the enqueued operation_key.
+ */
+export function ashbyReviewPath(applicationLinkId: string): string {
+  return `/ashby/review/${encodeURIComponent(applicationLinkId)}`;
+}
+
 /** True iff `p` is a safe site-relative path (leading '/', no scheme/host/userinfo). */
 export function isRelativeReviewPath(p: string): boolean {
   if (typeof p !== 'string' || p.length === 0 || p.length > MAX_REVIEW_PATH_LEN) return false;
@@ -186,7 +202,13 @@ export function buildScorecard(source: ScorecardSource, scale: ScorecardScale): 
     provenance,
   };
 
-  // Deterministic idempotency marker over the stable content (no wall-clock).
+  // Deterministic idempotency marker over the ASSESSMENT CONTENT only (no
+  // wall-clock, and deliberately NOT the review path): the deep link is
+  // presentation, so re-shaping it must never look like new content and
+  // re-trigger a provider write. Link-scoped idempotency (at most one
+  // scorecard_write per application link, across every historical marker
+  // version) is enforced at the enqueue site + the operation_key unique
+  // constraint — see `enqueueScorecardWrite` in workflow-stores.ts.
   const marker = createHash('sha256')
     .update(
       JSON.stringify({
@@ -194,7 +216,6 @@ export function buildScorecard(source: ScorecardSource, scale: ScorecardScale): 
         r: scorecard.recommendation,
         d: scorecard.dimensions,
         s: scorecard.summary,
-        p: scorecard.reviewPath,
         m: provenance.model ?? '',
       }),
     )
@@ -284,7 +305,15 @@ function dashboardSummary(scorecard: NormalizedScorecard, dashboardOrigin: strin
       origin = parsed.origin;
     }
   } catch { /* fail closed to the relative path */ }
-  return `${scorecard.summary}\n\nDetailed Project_HELLO scorecard: ${origin}${scorecard.reviewPath}`.slice(0, MAX_SUMMARY_LEN);
+  // Reserve the WHOLE link suffix before truncating: the deep link is the
+  // artifact this summary exists to deliver, so a summary at the cap must lose
+  // its own tail, never a character of the URL.
+  const suffix = `\n\nDetailed Project_HELLO scorecard: ${origin}${scorecard.reviewPath}`;
+  const room = MAX_SUMMARY_LEN - suffix.length;
+  // Degenerate only if the suffix alone exceeded the cap (bounded origin +
+  // bounded review path make this unreachable in practice); keep the link whole.
+  if (room <= 0) return suffix.trimStart();
+  return `${scorecard.summary.slice(0, room)}${suffix}`;
 }
 
 export function bindFeedbackForm(

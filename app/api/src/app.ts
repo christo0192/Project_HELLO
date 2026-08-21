@@ -23,6 +23,7 @@ import { exportRouter } from './routes/export.js';
 import { appealsRouter } from './routes/appeals.js';
 import { ashbyWebhookRouter } from './routes/ashby-webhook.js';
 import { ashbyMissionControlRouter } from './routes/ashby-mission-control.js';
+import { ashbyReviewRouter } from './routes/ashby-review.js';
 import {
   malformedJsonHandler,
   oversizedJsonHandler,
@@ -298,6 +299,7 @@ export function createApp(opts: CreateAppOptions = {}) {
   // Ashby Mission Control (recruiter/admin-authenticated; distinct from the
   // pre-auth webhook path). Reads are interviewer+, actions admin-only.
   app.use('/api/integrations/ashby/mission-control', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'ashby-mc:', useUserKey: true }));
+  app.use('/api/integrations/ashby/review', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'ashby-review:', useUserKey: true }));
 
   // Public: health endpoint (no auth). Bounded — `{ ok: true }` only, so
   // no model/provider/internal dependency leaks to unauthenticated callers.
@@ -339,6 +341,7 @@ export function createApp(opts: CreateAppOptions = {}) {
   app.use('/api/export', exportRouter);
   app.use('/api/appeals', appealsRouter);
   app.use('/api/integrations/ashby/mission-control', ashbyMissionControlRouter);
+  app.use('/api/integrations/ashby/review', ashbyReviewRouter);
 
   // ── 401/403/429 error paths still carry existing headers (CORS/CSP) ─
   // Handled inline by the auth/rate-limit middleware, no stack traces.

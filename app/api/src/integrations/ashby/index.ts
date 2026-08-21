@@ -177,6 +177,7 @@ export {
   type PinnedLookup,
 } from './resume-transport.js';
 export {
+  ashbyReviewPath,
   buildScorecard,
   bindFeedbackForm,
   mapOverallToScale,

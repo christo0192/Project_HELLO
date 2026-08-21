@@ -9,6 +9,18 @@ export { RecordingPlayer } from './RecordingPlayer';
 export type { RecordingPlayerHandle, RecordingPlayerProps } from './RecordingPlayer';
 export { SeekableTranscript } from './SeekableTranscript';
 export type { SeekableTranscriptProps } from './SeekableTranscript';
+export {
+  CandidateProfileCard,
+  SessionsSummary,
+  NotesList,
+  DecisionBlockedBanner,
+  Field,
+} from './CandidateOverviewSections';
+export type {
+  CandidateProfileCardProps,
+  SessionsSummaryProps,
+  NotesListProps,
+} from './CandidateOverviewSections';
 export { TranscriptionSyncWorkspace } from './TranscriptionSyncWorkspace';
 export type { TranscriptionSyncWorkspaceProps } from './TranscriptionSyncWorkspace';
 export {

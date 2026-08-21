@@ -894,8 +894,9 @@ describe('OpenAPI document integrity', () => {
     const paths = spec.paths as YMap;
     const schemas = ((spec as YMap).components as YMap).schemas as YMap;
     const securitySchemes = ((spec as YMap).components as YMap).securitySchemes as YMap;
-    // 70 + GET /api/recordings/health (0038 convergence surface).
-    expect(Object.keys(paths).length).toBe(72);
+    // 70 + GET /api/recordings/health (0038 convergence surface)
+    // + the two candidate-scoped Ashby review read routes.
+    expect(Object.keys(paths).length).toBe(74);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas.

@@ -9,11 +9,14 @@
  *   that redirects to `/mission-control`.
  * - Mission Control is admin-gated by `ProtectedRoute requireRole="admin"`
  *   (UX gate only — the server enforces authorization).
+ * - `/ashby/review/:applicationLinkId` is the candidate-scoped Ashby review
+ *   experience: authenticated, but rendered outside Layout in its own shell
+ *   (no global nav/backlinks). It grants no privilege of its own.
  * - All existing candidate / call / consent / appeal / login routes are
  *   preserved unchanged.
  */
 
-import { lazy } from 'react';
+import { lazy, Suspense, useMemo } from 'react';
 import {
   Navigate,
   Route,
@@ -23,6 +26,7 @@ import {
 import { Layout } from './components/Layout';
 import { ProtectedRoute } from './components/ProtectedRoute';
 import { useAuth } from './lib/auth';
+import { consumeReturnTo } from './lib/return-to';
 import { LoginPage } from './pages/LoginPage';
 import { UnauthorizedPage } from './pages/UnauthorizedPage';
 import { CandidateJoinPage } from './pages/CandidateJoinPage';
@@ -62,6 +66,21 @@ const AshbyMissionControlPage = lazyPage(
   () => import('./pages/AshbyMissionControlPage'),
   'AshbyMissionControlPage',
 );
+const AshbyScopedReviewPage = lazyPage(
+  () => import('./pages/AshbyScopedReviewPage'),
+  'AshbyScopedReviewPage',
+);
+
+/**
+ * Post-SSO landing. A full-page identity-provider round trip destroys router
+ * state, so a deep-linked scoped review parks its (already allowlisted) path
+ * before leaving and it is re-validated and consumed here. Anything absent,
+ * stale or non-allowlisted falls back to the normal landing route.
+ */
+export function PostAuthLanding() {
+  const target = useMemo(() => consumeReturnTo(), []);
+  return <Navigate to={target ?? '/dashboard'} replace />;
+}
 
 /**
  * Single catch-all: authenticated users return to the dashboard (the old
@@ -100,7 +119,7 @@ export default function App() {
         {/* Protected recruiter routes — valid session + resolved allowlist role */}
         <Route element={<ProtectedRoute />}>
           <Route element={<Layout />}>
-            <Route index element={<Navigate to="/dashboard" replace />} />
+            <Route index element={<PostAuthLanding />} />
             <Route path="/dashboard" element={<DashboardPage />} />
             <Route path="/roles" element={<RolesPage />} />
             <Route path="/candidates" element={<CandidatesPage />} />
@@ -108,6 +127,23 @@ export default function App() {
             <Route path="/sessions/:sessionId" element={<SessionDetailPage />} />
             <Route path="/screening/:sessionId" element={<ScreeningPage />} />
           </Route>
+        </Route>
+
+        {/*
+          Candidate-scoped Ashby review — authenticated like every recruiter
+          route, but deliberately OUTSIDE <Layout>: no global nav, no sidebar,
+          no cross-candidate links. The opaque link is not a capability; the
+          API re-resolves the candidate and re-applies ownership/RBAC.
+        */}
+        <Route element={<ProtectedRoute />}>
+          <Route
+            path="/ashby/review/:applicationLinkId"
+            element={
+              <Suspense fallback={null}>
+                <AshbyScopedReviewPage />
+              </Suspense>
+            }
+          />
         </Route>
 
         {/* Mission Control — admin-gated (UX only; APIs authoritative) */}

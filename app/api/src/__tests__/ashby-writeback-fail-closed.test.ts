@@ -61,6 +61,7 @@ function runtimeStores(over: Partial<RuntimeWorkflowStores> = {}): RuntimeWorkfl
     createLink: async () => ({ id: 'link_1' }),
     advanceIngestion: async () => ({ status: 'ok' }),
     enqueueOperation: async () => ({ status: 'inserted', id: 'op_1' }),
+    findScorecardWriteOperation: async () => null,
     completeOperation: async () => 'ok',
     failOperation: async () => ({ outcome: 'retry' }),
     deferOperation: async () => 'ok' as const,

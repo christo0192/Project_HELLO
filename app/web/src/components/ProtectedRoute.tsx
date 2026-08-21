@@ -1,7 +1,9 @@
 /**
  * Route guard that requires an authenticated session and a resolved role.
  *
- * - No session → redirect to /login
+ * - No session → redirect to /login, carrying an allowlisted return-to in
+ *   router state (never a query parameter) so a deep-linked scoped review
+ *   survives the sign-in round trip. Any non-allowlisted path is dropped.
  * - Session, role still resolving → loading state (never children)
  * - Session, role resolved null (denied / stale session / API failure)
  *   → redirect to /unauthorized (fail closed)
@@ -16,8 +18,9 @@
  * whose allowlist entry was revoked never sees data flash before denial.
  */
 
-import { Navigate, Outlet } from 'react-router-dom';
+import { Navigate, Outlet, useLocation } from 'react-router-dom';
 import { useAuth, type MembershipRole } from '../lib/auth';
+import { sanitizeReturnTo } from '../lib/return-to';
 import { Spinner } from './ui';
 
 interface ProtectedRouteProps {
@@ -31,6 +34,7 @@ interface ProtectedRouteProps {
 
 export function ProtectedRoute({ requireRole }: ProtectedRouteProps = {}) {
   const { isLoading, isAuthenticated, role, isRoleLoading } = useAuth();
+  const location = useLocation();
 
   // Still checking session — no data rendered
   if (isLoading) {
@@ -44,9 +48,18 @@ export function ProtectedRoute({ requireRole }: ProtectedRouteProps = {}) {
     );
   }
 
-  // No session at all — redirect to login
+  // No session at all — redirect to login. The return-to is validated against
+  // an exact path allowlist BEFORE it is handed to the login page, and travels
+  // in router state only, so no attacker-supplied destination can ride along.
   if (!isAuthenticated) {
-    return <Navigate to="/login" replace />;
+    const returnTo = sanitizeReturnTo(location.pathname);
+    return (
+      <Navigate
+        to="/login"
+        replace
+        state={returnTo ? { returnTo } : undefined}
+      />
+    );
   }
 
   // Role still resolving — never render children speculatively. This applies
