@@ -209,7 +209,57 @@ export interface IngestionPorts {
    * Defaults to "everything is a verdict" (see DEFAULT_PARSE_CLASSIFIER).
    */
   classifyParse?: ParseClassifier;
+  /**
+   * Persist the parsed result into the approved candidate/resume rows.
+   *
+   * WHY THIS IS A PORT, AND WHY IT RUNS *BEFORE* `ready`
+   * ---------------------------------------------------
+   * `ready` is TERMINAL in the 0029 machine. Materializing after it was
+   * committed meant a transient database fault could leave a candidate with
+   * `name: null, email: null` for ever while the durable row — and therefore
+   * the candidates list — reported the ingestion as finished. Nothing could
+   * repair it: no automatic path re-runs a terminal ingestion, and
+   * `recover_ashby_ingestion_parse` requires `failed_review`. A row that
+   * claims to be done and contains nothing is the worst of both worlds.
+   *
+   * So the durable `ready` transition is now the LAST thing that happens, and
+   * only after this port reports success. A persistence failure leaves the row
+   * OFF `ready` with a sanitized machine-class code, where the ordinary
+   * bounded requeue and the audited admin retry can both reach it.
+   *
+   * The port receives ONLY the approved structured fields — never the original
+   * bytes, which are wiped before it is called — and it must write nowhere but
+   * the approved candidate/resume rows.
+   *
+   * Optional so every existing fake keeps compiling; when it is absent the
+   * ingestion behaves exactly as it did before (the caller materializes
+   * afterwards), which is what the pure-domain unit tests exercise.
+   */
+  persist?: (structured: StructuredResume) => Promise<PersistOutcome>;
 }
+
+/**
+ * Outcome of the pre-`ready` persistence step.
+ *
+ * `reason` is a stable, bounded, sanitized code (0029
+ * `^[a-z0-9_.:-]{1,64}$`) describing OUR machine failing — never a database
+ * message, never provider text, and never anything derived from the document.
+ */
+export type PersistOutcome =
+  | { ok: true }
+  | { ok: false; reason: string };
+
+/**
+ * Sanitized durable reason recorded when the parse succeeded but the approved
+ * candidate/resume rows could not be written.
+ *
+ * Machine-class, not document-class: the document is fine and re-running the
+ * ingestion is the correct recovery, so this reason is deliberately NOT in
+ * `advance_ashby_ingestion`'s verdict-refusal list (a redelivered webhook or a
+ * reconciliation re-observation repairs it automatically, bounded by the
+ * unchanged five-attempt ceiling) and IS in the audited admin retry allowlist.
+ */
+export const MATERIALIZE_FAILED_REASON = 'materialize_failed';
 
 /** Opaque provenance recorded alongside a state transition. */
 export interface IngestionProvenance {
@@ -383,8 +433,30 @@ export async function runResumeIngestion(
       extractorVersion: ports.extractorVersion,
       structurerVersion,
     };
-    // Original bytes are dropped BEFORE marking ready — never uploaded anywhere.
+    // Original bytes are dropped BEFORE anything is persisted and before the
+    // row is marked ready — never uploaded anywhere.
     wipe();
+
+    // ── persist, THEN ready ──────────────────────────────────────────────
+    // Ordered this way on purpose: `ready` is terminal, so it must be the
+    // last word, not the first. See `IngestionPorts.persist`.
+    if (ports.persist) {
+      const persisted = await ports.persist(structured);
+      if (!persisted.ok) {
+        // Truthful and recoverable: the row does NOT say ready, it says why
+        // it is not. `structuring -> failed_review` is a legal 0029 edge and
+        // charges no attempt. The structured fields are NOT written anywhere
+        // here — only the sanitized code and the existing provenance.
+        await ports.onState('failed_review', {
+          contentSha256,
+          extractorVersion: ports.extractorVersion,
+          structurerVersion,
+          failedReason: persisted.reason,
+        });
+        return { state: 'failed_review', reason: persisted.reason };
+      }
+    }
+
     await ports.onState('ready', provenance);
     return { state: 'ready', structured, provenance };
   } catch (err) {

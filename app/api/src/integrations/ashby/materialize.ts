@@ -258,6 +258,21 @@ export interface MaterializeCandidateDeps {
 }
 
 /**
+ * What populating an already-bound candidate needs.
+ *
+ * Deliberately NARROWER than {@link MaterializeCandidateDeps}: populating a
+ * shell needs no mapping, because ownership and role were decided at import
+ * and this step may not revise them. That is not a technicality — it is what
+ * lets a shell still be populated when its mapping was paused between the
+ * import and the parse, instead of being stranded blank.
+ */
+export interface PopulateCandidateDeps {
+  store: MaterializationStore;
+  /** Bounded extracted text for the resume row, or null to store none. */
+  textExtracted?: string | null;
+}
+
+/**
  * Populate an already-bound candidate (normally the import-time shell) from a
  * successful parse.
  *
@@ -270,10 +285,10 @@ export interface MaterializeCandidateDeps {
  * bound before the shell existed — takes `reused`, i.e. exactly the behaviour
  * that shipped before this change. Nothing regresses to "no candidate".
  */
-async function populateExistingCandidate(
+export async function populateExistingCandidate(
   candidateId: string,
   structured: StructuredResume,
-  deps: MaterializeCandidateDeps,
+  deps: PopulateCandidateDeps,
 ): Promise<MaterializeCandidateResult> {
   const update = deps.store.updateCandidateFromParse;
   if (!update) return { status: 'reused', candidateId };
@@ -361,11 +376,24 @@ export async function materializeCandidate(
       const winner = bound.bound;
       const update = deps.store.updateCandidateFromParse;
       if (update) {
+        let res: { updated: boolean };
         try {
-          const res = await update.call(deps.store, { candidateId: winner, resumeId, parsed: structured });
-          if (res.updated) return { status: 'updated', candidateId: winner };
-        } catch { /* fall through to the orphan cleanup below */ }
+          res = await update.call(deps.store, { candidateId: winner, resumeId, parsed: structured });
+        } catch {
+          // The population THREW. Distinguished from "already populated"
+          // deliberately: reporting `reused` here would tell the caller the
+          // parse was persisted when it was not, and the caller would then
+          // write the terminal `ready` over a blank winner — the exact defect
+          // the pre-`ready` ordering exists to prevent. Report the failure so
+          // the row rests recoverably instead.
+          await deps.store.deleteOrphan('resumes', resumeId).catch(() => {});
+          return { status: 'skipped', reason: 'persist_failed' };
+        }
+        if (res.updated) return { status: 'updated', candidateId: winner };
       }
+      // Either the winner was ALREADY populated (a repeat run — the CAS
+      // matched zero rows), or the store predates the populate seam. Both mean
+      // the winner is authoritative and our resume row is surplus.
       await deps.store.deleteOrphan('resumes', resumeId).catch(() => {});
       return { status: 'reused', candidateId: winner };
     }

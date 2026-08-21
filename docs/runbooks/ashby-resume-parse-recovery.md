@@ -104,8 +104,29 @@ The bound ships in the same change as the deferral, on purpose.
 redelivered webhook (which calls it unconditionally) can never re-download a
 resume that is mid-parse.
 
-### At `ready`
-The ready path now **updates the shell in place** under a CAS on
+### At `ready` — persistence happens BEFORE the terminal transition
+
+`ready` is **terminal** in the 0029 machine. Materializing the candidate after
+it was already durable meant a single transient database fault left a candidate
+with `name: null, email: null` for ever while the durable row — and the
+candidates list — reported the ingestion finished. Nothing could repair it: no
+automatic path re-runs a terminal ingestion, and the audited recovery requires
+`failed_review`, so it answered `not_recoverable`.
+
+So the durable `ready` transition is now the **last** thing that happens, and
+only after the approved candidate/resume rows are written. A persistence
+failure writes `failed_review` / **`materialize_failed`** instead — truthful,
+visible, and recoverable through **both** doors:
+
+- the **generic** requeue, so a redelivered webhook or a reconciliation
+  re-observation repairs it automatically, bounded by the unchanged
+  five-attempt ceiling; and
+- the **audited admin retry** below.
+
+Reaching `ready` at all therefore means the candidate is already populated.
+**A blank `ready` row can no longer be written.**
+
+The ready path **updates the shell in place** under a CAS on
 `resume_id is null`, so running it twice writes once and never leaves a
 duplicate resume row. The update is an allowlist of parse-derived fields:
 `role_id`, `owner_id`, `status` and `ats_source` are deliberately absent — a
@@ -119,7 +140,14 @@ A link bound before the shell existed still takes the original create path.
 ### Step 1 — see the queue
 `GET /api/integrations/ashby/mission-control/health` reports
 `backlog.ingestionFailedParse`: resume ingestions rested on a `parse_*` reason
-on a live application. It counts the legacy generic `parse_error` and every
+on a live application.
+
+> `materialize_failed` does **not** match that `parse_*` counter — it is a
+> different class and the counter's name would become untruthful. It is still
+> visible: `backlog.operationsBlockedFailedIngestion` counts invites blocked
+> behind **any** `failed_review` ingestion and **does** degrade the health
+> verdict, so a materialization failure that does not self-heal is surfaced
+> there. It counts the legacy generic `parse_error` and every
 sub-classified code alike.
 
 It is **reported and not wired into the degradation verdict**: a genuinely
@@ -157,6 +185,8 @@ transport defect proven to have recorded one fault five times.
 | `parse_timeout`, `parse_overload` | yes |
 | `parse_spawn_error`, `parse_child_exit`, `parse_asset_missing` | yes — fix the deployment first |
 | `parse_defer_deadline`, `parse_defer_exhausted`, `parse_defer_unavailable` | yes |
+| `parse_defer_clock_invalid` (the job timestamp was unparseable, so the wall-clock bound could not be computed and the wait was stopped rather than left unbounded) | yes |
+| `materialize_failed` (the parse succeeded; writing the approved candidate/resume rows did not) | **yes — and it also self-heals on the next redelivery** |
 | `parse_error` (legacy) | **yes — one bounded retry, so the new classifier can NAME it** |
 | `parse_extract_failed`, `parse_bad_output`, `parse_no_output`, `parse_output_exceeded` | **no** — document verdict |
 | `no_extractable_fields`, `guard_*`, `scan_infected` | **no** |
@@ -229,7 +259,24 @@ Until step 3 produces a code, no cause is asserted anywhere in this change.
 
 ---
 
-## 6. Residual gates (not closable by code)
+## 6. Known residual — a doubly-failed write can rest at `structuring`
+
+Stated plainly rather than left to be discovered. If the persistence fails
+**and** the subsequent `failed_review` write also fails, the row rests at
+`structuring`. `structuring` has no edge back to `queued`, so that row needs
+operator attention.
+
+Two things bound it. First, it is **truthful**: the row never claims `ready`,
+so the blank-`ready` defect this repair closes cannot recur through it. Second,
+it is the **pre-existing** shape shared by every `failIngestion` call site in
+this worker — the scanner-deferral paths have behaved this way since before
+this change, and it is not made worse here. Repairing it properly means giving
+`structuring` a guarded recovery edge, which is a separate, deliberately-scoped
+migration rather than something to bolt onto this one.
+
+Reaching it requires two independent database failures in the same job.
+
+## 7. Residual gates (not closable by code)
 
 | gate | owner | status |
 |---|---|---|

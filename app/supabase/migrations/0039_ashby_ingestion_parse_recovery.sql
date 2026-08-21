@@ -479,11 +479,17 @@ declare
   v_link screening_v2.ashby_application_links%rowtype;
   v_attempts integer;
   v_max_attempts constant integer := 5;
-  -- STABLE reasons that describe our machine rather than the document, plus
+  -- STABLE reasons that describe OUR MACHINE rather than the document, plus
   -- the legacy generic code that describes nothing at all and exists only to
   -- be reclassified. Membership is a NECESSARY condition for the retry, never
   -- a sufficient one — the operator supplies the judgement, which is why this
   -- is an attributable audited RPC and not an automatic behaviour.
+  --
+  -- The set is MACHINE-CLASS, not merely parse-class: parse availability was
+  -- simply the first member. A failure to write the approved candidate/resume
+  -- rows belongs to the same category — our fault, the document unchanged,
+  -- re-running is correct — and is admitted on exactly the same terms and the
+  -- same unchanged ceiling. Document verdicts remain excluded from both doors.
   v_recoverable_reasons constant text[] := array[
     'parse_timeout',
     'parse_overload',
@@ -493,6 +499,16 @@ declare
     'parse_defer_deadline',
     'parse_defer_exhausted',
     'parse_defer_unavailable',
+    -- The wall-clock bound became uncomputable (an unparseable job timestamp).
+    -- The wait was stopped rather than left unbounded; nothing was learned
+    -- about the document, so the row is recoverable.
+    'parse_defer_clock_invalid',
+    -- The parse SUCCEEDED and the approved candidate/resume rows could not be
+    -- written. Machine-class by construction: the document is fine, so
+    -- re-running the ingestion is the correct recovery. This is why `ready` is
+    -- now written only AFTER persistence succeeds — the row rests here instead
+    -- of claiming to be finished while its candidate is blank.
+    'materialize_failed',
     -- Legacy: written before failures were sub-classified. One bounded retry
     -- is what turns an unfalsifiable row into a named one.
     'parse_error'
@@ -585,12 +601,14 @@ grant execute on function screening_v2.recover_ashby_ingestion_parse(uuid, uuid,
   to service_role;
 
 comment on function screening_v2.recover_ashby_ingestion_parse is
-  'Audited, attempt-BOUNDED operator retry of ONE parse-class failed_review '
+  'Audited, attempt-BOUNDED operator retry of ONE MACHINE-class failed_review '
   'resume ingestion. Performs the ordinary failed_review -> queued transition '
   'and CHARGES an attempt against the unchanged 5-requeue ceiling — it is NOT '
   'a counter reset and an exhausted row is refused with retry_exhausted. '
   'Refuses a non-failed_review row, a terminal application, and every reason '
-  'outside the parse-availability allowlist; document verdicts '
+  'outside the machine-class allowlist (parse availability, an uncomputable '
+  'defer clock, and a failure to write the approved candidate/resume rows); '
+  'document verdicts '
   '(parse_extract_failed / parse_bad_output / parse_no_output / '
   'parse_output_exceeded / no_extractable_fields / guard_* / scan_infected) '
   'are never recoverable. Legacy generic parse_error IS allowed, once per '

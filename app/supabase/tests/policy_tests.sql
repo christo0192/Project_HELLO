@@ -7052,6 +7052,8 @@ declare
   v_link_leg  uuid;   -- legacy generic parse_error  → recoverable ONCE per attempt
   v_link_term uuid;   -- terminal application        → refused
   v_link_gen  uuid;   -- the generic advance() refusal of extracting -> queued
+  v_link_mat  uuid;   -- parse succeeded, persisting the candidate failed
+  v_link_clk  uuid;   -- the defer wall-clock became uncomputable
   v_res       jsonb;
   v_att       integer;
   v_state     text;
@@ -7087,6 +7089,12 @@ begin
   insert into screening_v2.ashby_application_links
     (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
   values ('pol39-app-gen',  'pol39-job', v_map, repeat('h', 64)) returning id into v_link_gen;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol39-app-mat',  'pol39-job', v_map, repeat('h', 64)) returning id into v_link_mat;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol39-app-clk',  'pol39-job', v_map, repeat('h', 64)) returning id into v_link_clk;
 
   -- ── The GENERIC path must still refuse extracting -> queued ────────────
   -- This is the guard that keeps the new edge from becoming a general
@@ -7269,6 +7277,63 @@ begin
     'ashby 0039: an exhausted row keeps its counter',
     v_att = 5, 'got attempts=' || coalesce(v_att::text,'<null>'));
 
+  -- ── MACHINE-class recovery: materialize_failed and an unusable clock ───
+  -- `materialize_failed` is the row written when the parse SUCCEEDED but the
+  -- approved candidate/resume rows could not be written. It must be
+  -- recoverable through BOTH doors — the generic requeue (so a redelivered
+  -- webhook repairs it automatically) and the audited admin retry — because
+  -- the document is fine and only our write failed.
+  perform screening_v2.advance_ashby_ingestion(v_link_mat, 'queued', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_mat, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_mat, 'scanning', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_mat, 'extracting', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_mat, 'structuring', null, null, null, null);
+  v_res := screening_v2.advance_ashby_ingestion(v_link_mat, 'failed_review', null, null, null, 'materialize_failed');
+  perform _policy_tests.assert(
+    'ashby 0039: structuring -> failed_review(materialize_failed) is legal',
+    v_res->>'status' = 'ok',
+    'the persist failure must be recordable from structuring; got ' || coalesce(v_res::text,'<null>'));
+
+  v_res := screening_v2.recover_ashby_ingestion_parse(v_link_mat, v_owner);
+  perform _policy_tests.assert(
+    'ashby 0039: the audited retry ACCEPTS materialize_failed and charges an attempt',
+    v_res->>'status' = 'ok' and (v_res->>'attempts')::int = 1,
+    'a failed write of our own rows is machine-class, not a document verdict; got '
+      || coalesce(v_res::text,'<null>'));
+
+  -- ...and the GENERIC path accepts it too, so a redelivered webhook repairs
+  -- it without an operator. This is what makes the blank-ready defect
+  -- self-healing rather than merely reportable.
+  perform screening_v2.advance_ashby_ingestion(v_link_mat, 'fetching', null, null, null, null);
+  v_res := screening_v2.advance_ashby_ingestion(v_link_mat, 'failed_review', null, null, null, 'materialize_failed');
+  v_res := screening_v2.advance_ashby_ingestion(v_link_mat, 'queued', null, null, null, null);
+  perform _policy_tests.assert(
+    'ashby 0039: the GENERIC requeue also accepts materialize_failed',
+    v_res->>'status' = 'ok',
+    'machine-class failures must stay auto-recoverable; got ' || coalesce(v_res::text,'<null>'));
+
+  -- An uncomputable defer clock is recoverable on the same terms.
+  perform screening_v2.advance_ashby_ingestion(v_link_clk, 'queued', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_clk, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_clk, 'failed_review', null, null, null, 'parse_defer_clock_invalid');
+  v_res := screening_v2.recover_ashby_ingestion_parse(v_link_clk, v_owner);
+  perform _policy_tests.assert(
+    'ashby 0039: the audited retry accepts parse_defer_clock_invalid',
+    v_res->>'status' = 'ok',
+    'a wait we could not bound is not a statement about the document; got '
+      || coalesce(v_res::text,'<null>'));
+
+  -- The widening did NOT admit a document verdict by accident.
+  perform screening_v2.advance_ashby_ingestion(v_link_clk, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_clk, 'scanning', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_clk, 'extracting', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_clk, 'failed_review', null, null, null, 'parse_no_output');
+  v_res := screening_v2.recover_ashby_ingestion_parse(v_link_clk, v_owner);
+  perform _policy_tests.assert(
+    'ashby 0039: widening the allowlist admitted NO document verdict',
+    v_res->>'status' = 'not_a_parse_availability_failure',
+    'parse_no_output must still be refused; got ' || coalesce(v_res::text,'<null>'));
+
   -- ── The additive backlog counter sees BOTH legacy and sub-classified ───
   v_backlog := screening_v2.ashby_prerequisite_backlog(900);
   perform _policy_tests.assert(
@@ -7290,9 +7355,9 @@ begin
   -- Audit rows are append-only (0007) and deliberately left behind, exactly as
   -- the 0036 block does; every id they reference is a local fixture.
   delete from screening_v2.ashby_resume_ingestions
-   where application_link_id in (v_link, v_link_doc, v_link_leg, v_link_term, v_link_gen);
+   where application_link_id in (v_link, v_link_doc, v_link_leg, v_link_term, v_link_gen, v_link_mat, v_link_clk);
   delete from screening_v2.ashby_application_links
-   where id in (v_link, v_link_doc, v_link_leg, v_link_term, v_link_gen);
+   where id in (v_link, v_link_doc, v_link_leg, v_link_term, v_link_gen, v_link_mat, v_link_clk);
   delete from screening_v2.ashby_job_mappings where id = v_map;
 end;
 $$;
