@@ -10,6 +10,10 @@
  *   (DB CHECK 0001/0006/notes): new | queued | screening | screened |
  *   advanced | rejected | consent_declined. Applied client-side (the list
  *   API only filters by role).
+ * - `resume` is a comma-separated subset of the sanitized resume-review enum
+ *   the list API returns (processing | needs_review | cancelled). Applied
+ *   client-side over the already-loaded page: additive, adds no request, and
+ *   changes nothing about the status vocabulary.
  * - `role` is a role id, applied server-side via `listCandidates(roleId)`.
  *
  * Everything here is derived from data the candidate list already returns —
@@ -18,6 +22,7 @@
 
 import type { Candidate } from '../../types';
 import { candidateStatusLabel } from './status';
+import { RESUME_REVIEW_ORDER } from './ResumeReviewBadge';
 
 /** Canonical funnel order for the candidate status vocabulary. */
 export const CANDIDATE_STATUS_ORDER = [
@@ -51,11 +56,19 @@ export function recommendationLabel(rec: string | null | undefined): string {
   return RECOMMENDATION_LABELS[rec] ?? rec;
 }
 
+const RESUME_REVIEW_SET = new Set<string>(RESUME_REVIEW_ORDER);
+
 export interface CandidateFilters {
   /** Selected statuses (empty = all). */
   statuses: string[];
   /** Selected assessment recommendations (empty = all). */
   recommendations: string[];
+  /**
+   * Selected resume-review states (empty = all). Purely additive: it narrows
+   * which rows are shown and never touches the status vocabulary, its order,
+   * or its counts.
+   */
+  resumeReview: string[];
   /** When true, restrict to candidates with a latest assessment score. */
   assessed: boolean;
   /** Selected role id, or null for all roles. */
@@ -65,6 +78,7 @@ export interface CandidateFilters {
 export const EMPTY_CANDIDATE_FILTERS: CandidateFilters = {
   statuses: [],
   recommendations: [],
+  resumeReview: [],
   assessed: false,
   roleId: null,
 };
@@ -89,10 +103,17 @@ export function parseCandidateFilters(params: URLSearchParams): CandidateFilters
         rawRec.split(',').map((x) => x.trim()).filter((x) => RECOMMENDATION_SET.has(x)).includes(r),
       )
     : [];
+  const rawResume = params.get('resume');
+  const resumeReview = rawResume
+    ? RESUME_REVIEW_ORDER.filter((r) =>
+        rawResume.split(',').map((x) => x.trim()).filter((x) => RESUME_REVIEW_SET.has(x)).includes(r),
+      )
+    : [];
   const roleId = params.get('role');
   return {
     statuses: [...statuses],
     recommendations: [...recommendations],
+    resumeReview: [...resumeReview],
     assessed: params.get('assessed') === '1',
     roleId: roleId && roleId.trim() ? roleId.trim() : null,
   };
@@ -108,6 +129,12 @@ export function buildCandidateSearch(filters: CandidateFilters): URLSearchParams
     params.set(
       'recommendation',
       RECOMMENDATION_ORDER.filter((r) => filters.recommendations.includes(r)).join(','),
+    );
+  }
+  if (filters.resumeReview.length > 0) {
+    params.set(
+      'resume',
+      RESUME_REVIEW_ORDER.filter((r) => filters.resumeReview.includes(r)).join(','),
     );
   }
   if (filters.assessed) params.set('assessed', '1');
@@ -144,6 +171,12 @@ export function matchesCandidateFilters(candidate: Candidate, filters: Candidate
   ) {
     return false;
   }
+  if (
+    filters.resumeReview.length > 0 &&
+    !(candidate.resume_review && filters.resumeReview.includes(candidate.resume_review))
+  ) {
+    return false;
+  }
   if (filters.assessed && candidate.latest_score == null) return false;
   return true;
 }
@@ -153,6 +186,7 @@ export function hasActiveFilters(filters: CandidateFilters): boolean {
   return (
     filters.statuses.length > 0 ||
     filters.recommendations.length > 0 ||
+    filters.resumeReview.length > 0 ||
     filters.assessed ||
     filters.roleId !== null
   );

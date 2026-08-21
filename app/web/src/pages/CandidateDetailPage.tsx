@@ -24,6 +24,7 @@ import {
   SessionsSummary,
   Tabs,
   TranscriptionSyncWorkspace,
+  candidateDisplayName,
 } from "../components/talent";
 import {
   candidateStatusLabel,
@@ -93,7 +94,7 @@ export function CandidateDetailPage() {
 
       <CandidateHeader
         eyebrow="Candidate"
-        title={candidate.name || "Unnamed candidate"}
+        title={candidateDisplayName(candidate.name)}
         description={candidate.email ?? undefined}
         actions={
           <>

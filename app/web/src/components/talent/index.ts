@@ -27,6 +27,15 @@ export type {
   AshbyWorkflowCardViewProps,
   AshbyWorkflowSource,
 } from './AshbyWorkflowCard';
+export {
+  ResumeReviewBadge,
+  RESUME_REVIEW_ORDER,
+  CANDIDATE_SHELL_TITLE,
+  candidateDisplayName,
+  isBadgedResumeReview,
+  resumeReviewLabel,
+} from './ResumeReviewBadge';
+export type { ResumeReviewBadgeProps, ResumeReviewKey } from './ResumeReviewBadge';
 export { CandidateShell, CandidateHeader, CANDIDATE_SCOPE_CLASS } from './CandidateShell';
 export type { CandidateShellProps, CandidateHeaderProps } from './CandidateShell';
 export { CandidateScorecard, SECTION_WEIGHTS } from './CandidateScorecard';

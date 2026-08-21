@@ -43,6 +43,7 @@ describe('parseCandidateFilters', () => {
     expect(parsed).toEqual({
       statuses: ['new', 'screening'],
       recommendations: ['advance'],
+      resumeReview: [],
       assessed: true,
       roleId: 'r1',
     });
@@ -73,6 +74,7 @@ describe('buildCandidateSearch / candidatesHref', () => {
     expect(back).toEqual({
       statuses: ['new', 'screening'],
       recommendations: ['advance', 'reject'],
+      resumeReview: [],
       assessed: true,
       roleId: 'r9',
     });
@@ -153,5 +155,113 @@ describe('candidateFunnel / candidateNextAction', () => {
     expect(candidateNextAction('new')).toEqual({ label: 'Start screening', emphasis: true });
     expect(candidateNextAction('screened')).toEqual({ label: 'Review & decide', emphasis: true });
     expect(candidateNextAction('anything-else').label).toBe('Open profile');
+  });
+});
+
+/**
+ * The resume-review facet is ADDITIVE. These tests are the guard on that
+ * claim: it round-trips through the URL, narrows the visible rows, combines
+ * with every other dimension, and does not touch the status vocabulary, its
+ * canonical order or its counts.
+ */
+describe('resume-review facet', () => {
+  it('parses the resume param, dropping unknown and quiet values', () => {
+    const parsed = parseCandidateFilters(
+      new URLSearchParams('resume=needs_review,ready,bogus,processing'),
+    );
+    // `ready` is deliberately not a facet — it is the quiet majority.
+    expect(parsed.resumeReview).toEqual(['processing', 'needs_review']);
+  });
+
+  it('round-trips in canonical order alongside every other dimension', () => {
+    const href = candidatesHref({
+      statuses: ['queued'],
+      recommendations: ['advance'],
+      resumeReview: ['cancelled', 'processing'],
+      assessed: true,
+      roleId: 'r9',
+    });
+    expect(href).toContain('resume=processing%2Ccancelled');
+    const back = parseCandidateFilters(new URLSearchParams(href.split('?')[1]));
+    expect(back).toEqual({
+      statuses: ['queued'],
+      recommendations: ['advance'],
+      resumeReview: ['processing', 'cancelled'],
+      assessed: true,
+      roleId: 'r9',
+    });
+  });
+
+  it('emits no resume param when unselected', () => {
+    expect(buildCandidateSearch(f({ statuses: ['queued'] })).has('resume')).toBe(false);
+  });
+
+  it('narrows to the selected states and treats null as excluded', () => {
+    const filters = f({ resumeReview: ['needs_review'] });
+    expect(matchesCandidateFilters(cand({ resume_review: 'needs_review' }), filters)).toBe(true);
+    expect(matchesCandidateFilters(cand({ resume_review: 'processing' }), filters)).toBe(false);
+    expect(matchesCandidateFilters(cand({ resume_review: null }), filters)).toBe(false);
+    expect(matchesCandidateFilters(cand({}), filters)).toBe(false);
+  });
+
+  it('combines with status and recommendation rather than replacing them', () => {
+    const filters = f({
+      statuses: ['queued'],
+      recommendations: ['advance'],
+      resumeReview: ['needs_review'],
+    });
+    const match = cand({
+      status: 'queued',
+      latest_recommendation: 'advance',
+      resume_review: 'needs_review',
+    });
+    expect(matchesCandidateFilters(match, filters)).toBe(true);
+    // Each dimension can independently veto.
+    expect(matchesCandidateFilters({ ...match, status: 'new' }, filters)).toBe(false);
+    expect(matchesCandidateFilters({ ...match, latest_recommendation: 'hold' }, filters)).toBe(false);
+    expect(matchesCandidateFilters({ ...match, resume_review: 'processing' }, filters)).toBe(false);
+  });
+
+  /**
+   * Type-level contract check: `Candidate` must accept the row the API
+   * actually returns for a PII-minimal shell. If `name` were typed
+   * non-nullable again, this literal would stop compiling.
+   */
+  it('accepts a truthfully nullable shell row', () => {
+    const shell: Candidate = cand({
+      name: null,
+      email: null,
+      phone_e164: null,
+      status: 'queued',
+      resume_review: 'needs_review',
+    });
+    expect(shell.name).toBeNull();
+    expect(shell.email).toBeNull();
+    expect(matchesCandidateFilters(shell, f({ statuses: ['queued'] }))).toBe(true);
+  });
+
+  it('counts as an active filter and clears with the rest', () => {
+    expect(hasActiveFilters(f({ resumeReview: ['cancelled'] }))).toBe(true);
+    expect(hasActiveFilters(EMPTY_CANDIDATE_FILTERS)).toBe(false);
+  });
+
+  it('leaves the status vocabulary, order and counts untouched', () => {
+    const rows = [
+      cand({ id: 'a', status: 'queued', resume_review: 'needs_review' }),
+      cand({ id: 'b', status: 'queued', resume_review: 'ready' }),
+      cand({ id: 'c', status: 'new', resume_review: null }),
+    ];
+    // The status funnel is derived from status alone — resume review is
+    // nowhere in its vocabulary or its counts.
+    expect(candidateFunnel(rows)).toEqual([
+      { status: 'new', label: 'New', value: 1 },
+      { status: 'queued', label: 'Queued', value: 2 },
+    ]);
+    // A queued shell stays queued, and its next action is unchanged.
+    expect(normalizeStatus(rows[0].status)).toBe('queued');
+    expect(candidateNextAction(rows[0].status)).toEqual({
+      label: 'Queued for screening',
+      emphasis: false,
+    });
   });
 });
