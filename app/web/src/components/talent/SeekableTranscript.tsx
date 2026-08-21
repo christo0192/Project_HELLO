@@ -141,9 +141,9 @@ export function SeekableTranscript({
                     aria-label={`Turn ${index + 1}: ${speaker}. At ${formatOffset(turn.start_offset_sec!)}. Click to play from here.`}
                     className={cx(
                       'w-full text-left px-3 py-3 rounded-md transition-colors min-h-[44px]',
-                      'focus:outline-none focus:ring-2 focus:ring-brand-500 focus:ring-inset',
+                      'focus:outline-none focus:ring-2 focus:ring-[var(--c-accent)] focus:ring-inset',
                       active
-                        ? 'bg-brand-50 border-l-2 border-brand-500 dark:bg-brand-950'
+                        ? 'bg-[var(--c-accent-light)] border-l-2 border-[var(--c-accent)]'
                         : 'bg-transparent border-l-2 border-transparent hover:bg-surface-secondary',
                     )}
                   >

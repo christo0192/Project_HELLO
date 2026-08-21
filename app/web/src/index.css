@@ -1,3 +1,4 @@
+@import './styles/candidate-palette.css';
 @tailwind base;
 @tailwind components;
 @tailwind utilities;

@@ -99,10 +99,12 @@ export function Tabs({
               onClick={() => setActiveIndex(index)}
               onKeyDown={(event) => onKeyDown(event, index)}
               className={cx(
+                // 44px minimum touch target (WCAG 2.5.8).
                 'shrink-0 rounded-t-lg border-b-2 px-3 py-2 text-sm font-medium transition-colors sm:px-4',
+                'min-h-11',
                 'focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-2 focus-visible:ring-offset-surface',
                 selected
-                  ? 'border-brand-600 text-brand-700 dark:border-brand-400 dark:text-brand-300'
+                  ? 'border-[var(--c-accent)] text-[var(--c-accent)]'
                   : 'border-transparent text-ink-secondary hover:bg-surface-tertiary hover:text-ink',
               )}
             >

@@ -15,11 +15,11 @@
  * unscoped app, which the scoped route must not offer.
  */
 
+import { useId } from 'react';
 import type { ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import type { CandidateDetail, Note, Session } from '../../types';
-import { Card, Chip } from '../ui';
-import { StatusBadge } from '../design';
+import { StatusBadge, SurfaceCard, Tag } from '../design';
 import {
   candidateStatusLabel,
   candidateStatusTone,
@@ -51,17 +51,24 @@ export interface CandidateProfileCardProps {
 export function CandidateProfileCard({
   candidate,
   footnote,
-  className = 'p-5 lg:col-span-1',
+  className = 'p-4 sm:p-5 lg:col-span-1',
 }: CandidateProfileCardProps) {
+  const headingId = useId();
   return (
-    <Card className={className}>
-      <h2 className="mb-4 text-sm font-semibold text-ink">Profile</h2>
+    <SurfaceCard as="section" labelledBy={headingId} className={className}>
+      <h2 id={headingId} className="mb-4 text-sm font-semibold text-ink">
+        Profile
+      </h2>
       <dl className="space-y-3 text-sm">
         <Field label="Phone">
           {candidate.phone_e164 ? (
             <span className="flex items-center gap-1.5">
               {candidate.phone_e164}
-              {!candidate.phone_valid && <Chip tone="red">invalid</Chip>}
+              {!candidate.phone_valid && (
+                <Tag tone="negative" srPrefix="Phone number:">
+                  invalid
+                </Tag>
+              )}
             </span>
           ) : (
             <span className="text-ink-tertiary">Not provided</span>
@@ -84,20 +91,22 @@ export function CandidateProfileCard({
               <span className="text-ink-tertiary">None parsed</span>
             ) : (
               candidate.skills.map((s) => (
-                <Chip key={s} tone="accent">
+                <Tag key={s} tone="accent" srPrefix="Skill:">
                   {s}
-                </Chip>
+                </Tag>
               ))
             )}
           </dd>
         </div>
       </dl>
       {footnote && (
-        <p className="mt-5 rounded-lg bg-surface-tertiary p-3 text-xs leading-relaxed text-ink-secondary">
-          {footnote}
-        </p>
+        <SurfaceCard level="sunken" className="mt-5 p-3">
+          <p className="max-w-prose text-xs leading-relaxed text-ink-secondary">
+            {footnote}
+          </p>
+        </SurfaceCard>
       )}
-    </Card>
+    </SurfaceCard>
   );
 }
 
@@ -118,9 +127,12 @@ export function SessionsSummary({
   linkToSession = true,
   emptyLabel = 'No screening sessions yet. Start one above.',
 }: SessionsSummaryProps) {
+  const headingId = useId();
   return (
-    <Card className="p-5">
-      <h2 className="mb-3 text-sm font-semibold text-ink">Screening sessions</h2>
+    <SurfaceCard as="section" labelledBy={headingId} className="p-4 sm:p-5">
+      <h2 id={headingId} className="mb-3 text-sm font-semibold text-ink">
+        Screening sessions
+      </h2>
       {sessions.length === 0 ? (
         <p className="text-sm text-ink-secondary">{emptyLabel}</p>
       ) : (
@@ -151,7 +163,7 @@ export function SessionsSummary({
                 {linkToSession && (
                   <Link
                     to={`/sessions/${s.id}`}
-                    className="text-xs font-medium text-brand-700 hover:text-brand-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:text-brand-300"
+                    className="text-xs font-medium text-[var(--c-accent)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
                   >
                     View details
                   </Link>
@@ -161,7 +173,7 @@ export function SessionsSummary({
           ))}
         </ul>
       )}
-    </Card>
+    </SurfaceCard>
   );
 }
 

@@ -25,16 +25,22 @@
  * "not available" state.
  */
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useId, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { api, ApiError } from '../api';
 import type { CandidateDetail, Note } from '../types';
-import { Card, ErrorState, LoadingState } from '../components/ui';
 import { clearReturnTo } from '../lib/return-to';
-import { StatusBadge } from '../components/design';
+import {
+  CandidateErrorState,
+  CandidateLoadingState,
+  StatusBadge,
+  SurfaceCard,
+} from '../components/design';
 import {
   AshbyWorkflowCard,
+  CandidateHeader,
   CandidateProfileCard,
+  CandidateShell,
   DecisionBlockedBanner,
   NotesList,
   SessionsSummary,
@@ -78,19 +84,19 @@ export function AshbyScopedReviewPage() {
 
   if (error) {
     return (
-      <main className="mx-auto max-w-3xl px-4 py-10">
-        <ErrorState
+      <CandidateShell as="main" width="narrow">
+        <CandidateErrorState
           message={error}
           onRetry={error === UNAVAILABLE ? undefined : load}
         />
-      </main>
+      </CandidateShell>
     );
   }
   if (!detail) {
     return (
-      <main className="mx-auto max-w-3xl px-4 py-10">
-        <LoadingState label="Loading review…" />
-      </main>
+      <CandidateShell as="main" width="narrow">
+        <CandidateLoadingState label="Loading review…" />
+      </CandidateShell>
     );
   }
 
@@ -98,26 +104,22 @@ export function AshbyScopedReviewPage() {
   const decisionBlocked = candidate.decision_use_blocked_at != null;
 
   return (
-    // No <Layout>: this shell intentionally has no global navigation.
-    <main className="mx-auto max-w-6xl px-4 py-8">
-      <header className="border-b border-line pb-5">
-        <p className="text-xs font-medium uppercase tracking-wide text-ink-tertiary">
-          Candidate review
-        </p>
-        <div className="mt-1 flex flex-wrap items-center justify-between gap-3">
-          <div className="min-w-0">
-            <h1 className="truncate text-xl font-semibold text-ink">
-              {candidate.name || 'Unnamed candidate'}
-            </h1>
-            {candidate.email && (
-              <p className="truncate text-sm text-ink-secondary">{candidate.email}</p>
-            )}
-          </div>
+    // No <Layout>: this shell intentionally has no global navigation. The
+    // candidate palette is applied by CandidateShell, exactly as on the
+    // normal candidate pages — styling grants no privilege and adds no
+    // affordance; this route stays navigation-free and action-free.
+    <CandidateShell as="main" width="wide">
+      <CandidateHeader
+        divided
+        eyebrow="Candidate review"
+        title={candidate.name || 'Unnamed candidate'}
+        description={candidate.email ?? undefined}
+        actions={
           <StatusBadge tone={candidateStatusTone(candidate.status)}>
             {candidateStatusLabel(candidate.status)}
           </StatusBadge>
-        </div>
-      </header>
+        }
+      />
 
       {decisionBlocked && <DecisionBlockedBanner />}
 
@@ -150,7 +152,7 @@ export function AshbyScopedReviewPage() {
           ]}
         />
       </div>
-    </main>
+    </CandidateShell>
   );
 }
 
@@ -165,9 +167,9 @@ function ScopedOverviewTab({
   applicationLinkId: string;
 }) {
   return (
-    <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+    <div className="grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-3">
       <CandidateProfileCard candidate={candidate} />
-      <div className="space-y-6 lg:col-span-2">
+      <div className="space-y-4 sm:space-y-6 lg:col-span-2">
         {/* The SAME read-only card as the normal Overview, read through the
             SAME link scope this shell already uses. No new access, no new
             navigation — the API resolves the candidate server-side. */}
@@ -185,6 +187,7 @@ function ScopedOverviewTab({
 }
 
 function ScopedNotesCard({ applicationLinkId }: { applicationLinkId: string }) {
+  const headingId = useId();
   const [notes, setNotes] = useState<Note[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
@@ -204,9 +207,11 @@ function ScopedNotesCard({ applicationLinkId }: { applicationLinkId: string }) {
   }, [applicationLinkId]);
 
   return (
-    <Card className="p-5">
-      <h2 className="mb-3 text-sm font-semibold text-ink">Notes</h2>
+    <SurfaceCard as="section" labelledBy={headingId} className="p-4 sm:p-5">
+      <h2 id={headingId} className="mb-3 text-sm font-semibold text-ink">
+        Notes
+      </h2>
       <NotesList notes={notes} error={err} />
-    </Card>
+    </SurfaceCard>
   );
 }

@@ -12,7 +12,7 @@
 
 import { useCallback, useEffect, useImperativeHandle, useRef, useState, forwardRef } from 'react';
 import { api, ApiError } from '../../api';
-import { Button } from '../ui';
+import { CandidateButton } from '../design';
 import { cx } from '../design/cx';
 
 export interface RecordingPlayerHandle {
@@ -261,13 +261,13 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
                 A short-lived link is created on request and expires automatically.
               </p>
             )}
-            <Button
+            <CandidateButton
               variant="secondary"
               className={cx('shrink-0', compact ? 'px-3 py-2 text-xs' : 'mt-0')}
               onClick={fetchUrl}
             >
               Load recording
-            </Button>
+            </CandidateButton>
           </div>
         </div>
       );
@@ -278,7 +278,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
       return (
         <div className={cx('rounded-lg border border-line bg-surface p-3', compact && 'p-2', className)}>
           <div className="flex items-center gap-3">
-            <div className="h-4 w-4 animate-spin rounded-full border-2 border-brand-500 border-t-transparent" />
+            <div className="h-4 w-4 animate-spin rounded-full border-2 border-[var(--c-accent)] border-t-transparent" />
             <p className="text-xs text-ink-tertiary">Loading recording…</p>
           </div>
         </div>
@@ -291,13 +291,13 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
         <div className={cx('rounded-lg border border-line bg-surface p-3', compact && 'p-2', className)} role="alert">
           <div className={cx('flex items-center gap-3', compact && 'gap-2')}>
             <p className="text-sm text-error">{error}</p>
-            <Button
+            <CandidateButton
               variant="secondary"
               className={cx('shrink-0', compact ? 'px-3 py-2 text-xs' : 'mt-0')}
               onClick={fetchUrl}
             >
               Try again
-            </Button>
+            </CandidateButton>
           </div>
         </div>
       );
@@ -333,7 +333,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
           <a
             href={url!}
             download
-            className="text-xs font-medium text-brand-700 hover:text-brand-800 dark:text-brand-300"
+            className="text-xs font-medium text-[var(--c-accent)] underline-offset-2 hover:underline"
           >
             Download file
           </a>

@@ -9,21 +9,21 @@
  * "Next action" column makes the obvious next step explicit.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api";
 import type { Candidate, Role } from "../types";
 import type { CandidateFilters } from "../components/talent";
 import {
-  Button,
-  EmptyState,
-  ErrorState,
-  Label,
-  LoadingState,
-  Select,
-  Spinner,
-} from "../components/ui";
-import { PageHeader } from "../components/design";
+  CandidateButton,
+  CandidateEmptyState,
+  CandidateErrorState,
+  CandidateLabel,
+  CandidateLoadingState,
+  CandidateSelect,
+  CandidateSpinner,
+  SurfaceCard,
+} from "../components/design";
 import {
   Table,
   THead,
@@ -33,6 +33,7 @@ import {
   Td,
   StatusBadge,
 } from "../components/design";
+import { CandidateHeader, CandidateShell } from "../components/talent";
 import {
   buildCandidateSearch,
   candidateNextAction,
@@ -47,6 +48,20 @@ import {
   RECOMMENDATION_ORDER,
 } from "../components/talent";
 import type { StatusTone } from "../components/design/StatusBadge";
+
+/**
+ * Filter toggle. 44px minimum target, palette tokens only, and the selected
+ * state carries `aria-pressed` (set by the caller) as well as colour, so the
+ * distinction is never hue-only.
+ */
+const FILTER_TOGGLE_CLASS = (selected: boolean) =>
+  [
+    "inline-flex min-h-11 items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors",
+    "focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]",
+    selected
+      ? "border-[var(--c-accent)] bg-[var(--c-accent-light)] text-[var(--c-accent)]"
+      : "border-[var(--c-control-border)] bg-[var(--c-surface)] text-[var(--c-ink-secondary)] hover:bg-[var(--c-border-light)] hover:text-[var(--c-ink)]",
+  ].join(" ");
 
 const RECOMMENDATION_TONE: Record<string, StatusTone> = {
   advance: "success",
@@ -155,8 +170,8 @@ export function CandidatesPage() {
   }, [candidates]);
 
   return (
-    <div>
-      <PageHeader
+    <CandidateShell variant="inset">
+      <CandidateHeader
         eyebrow="Talent workspace"
         title="Candidates"
         description="Upload resumes, review parsed profiles, and move candidates through screening."
@@ -180,15 +195,16 @@ export function CandidatesPage() {
             )}
           </h2>
           {roles.length > 0 && (
-            <div className="w-56">
+            <div className="w-full sm:w-56">
               <label htmlFor="role-filter" className="sr-only">
                 Filter by role
               </label>
-              <Select
+              <CandidateSelect
                 id="role-filter"
                 value={roleId ?? ""}
                 onChange={(e) => setRole(e.target.value)}
                 aria-label="Filter by role"
+                className="w-full"
               >
                 <option value="">All roles</option>
                 {roles.map((r) => (
@@ -196,7 +212,7 @@ export function CandidatesPage() {
                     {r.title}
                   </option>
                 ))}
-              </Select>
+              </CandidateSelect>
             </div>
           )}
         </div>
@@ -212,13 +228,7 @@ export function CandidatesPage() {
                 type="button"
                 onClick={() => toggleStatus(status)}
                 aria-pressed={selected}
-                className={[
-                  "inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors",
-                  "focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500",
-                  selected
-                    ? "border-brand-500 bg-brand-50 text-brand-700 dark:bg-brand-950 dark:text-brand-300"
-                    : "border-line bg-surface text-ink-secondary hover:bg-surface-tertiary hover:text-ink",
-                ].join(" ")}
+                className={FILTER_TOGGLE_CLASS(selected)}
               >
                 {candidateStatusLabel(status)}
                 {candidates && (
@@ -245,13 +255,7 @@ export function CandidatesPage() {
                 type="button"
                 onClick={() => toggleRecommendation(rec)}
                 aria-pressed={selected}
-                className={[
-                  "inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors",
-                  "focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500",
-                  selected
-                    ? "border-brand-500 bg-brand-50 text-brand-700 dark:bg-brand-950 dark:text-brand-300"
-                    : "border-line bg-surface text-ink-secondary hover:bg-surface-tertiary hover:text-ink",
-                ].join(" ")}
+                className={FILTER_TOGGLE_CLASS(selected)}
               >
                 {recommendationLabel(rec)}
                 {candidates && (
@@ -295,7 +299,7 @@ export function CandidatesPage() {
             <button
               type="button"
               onClick={clearFilters}
-              className="rounded px-1.5 py-0.5 font-medium text-brand-700 underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:text-brand-300"
+              className="rounded px-1.5 py-0.5 font-medium text-[var(--c-accent)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
             >
               Clear all
             </button>
@@ -306,13 +310,16 @@ export function CandidatesPage() {
       {/* Body states */}
       <div className="mt-4">
         {error && (
-          <ErrorState message={error} onRetry={() => loadCandidates(roleId)} />
+          <CandidateErrorState
+            message={error}
+            onRetry={() => loadCandidates(roleId)}
+          />
         )}
         {!error && candidates === null && (
-          <LoadingState label="Loading candidates…" />
+          <CandidateLoadingState label="Loading candidates…" />
         )}
         {!error && candidates !== null && candidates.length === 0 && (
-          <EmptyState
+          <CandidateEmptyState
             title="No candidates yet"
             hint="Upload a resume above to parse a candidate and add them here."
           />
@@ -321,14 +328,14 @@ export function CandidatesPage() {
           candidates !== null &&
           candidates.length > 0 &&
           visible.length === 0 && (
-            <div className="rounded-xl border border-dashed border-line-strong bg-surface-secondary p-8 text-center">
-              <p className="text-sm font-medium text-ink-secondary">
+            <div className="rounded-xl border border-dashed border-[var(--c-control-border)] bg-[var(--c-surface)] p-8 text-center">
+              <p className="text-sm font-medium text-[var(--c-ink-secondary)]">
                 No candidates match these filters
               </p>
               <button
                 type="button"
                 onClick={clearFilters}
-                className="mt-2 text-xs font-medium text-brand-700 hover:text-brand-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:text-brand-300"
+                className="mt-2 inline-flex min-h-11 items-center text-xs font-medium text-[var(--c-accent)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
               >
                 Clear filters
               </button>
@@ -355,7 +362,7 @@ export function CandidatesPage() {
                       <Td>
                         <Link
                           to={`/candidates/${c.id}`}
-                          className="font-medium text-brand-700 hover:text-brand-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:text-brand-300"
+                          className="font-medium text-[var(--c-accent)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
                         >
                           {c.name || "Unnamed"}
                         </Link>
@@ -415,7 +422,7 @@ export function CandidatesPage() {
                         <span
                           className={
                             next.emphasis
-                              ? "text-sm font-medium text-brand-700 dark:text-brand-300"
+                              ? "text-sm font-medium text-[var(--c-accent)]"
                               : "text-sm text-ink-secondary"
                           }
                         >
@@ -429,7 +436,7 @@ export function CandidatesPage() {
             </Table>
         )}
       </div>
-    </div>
+    </CandidateShell>
   );
 }
 
@@ -447,7 +454,7 @@ function FilterChip({
         type="button"
         onClick={onRemove}
         aria-label={`Remove filter ${label}`}
-        className="rounded-full px-0.5 text-ink-tertiary hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
+        className="rounded-full px-1 text-ink-tertiary hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
       >
         ×
       </button>
@@ -462,6 +469,7 @@ function UploadCard({
   roles: Role[];
   onUploaded: () => void;
 }) {
+  const headingId = useId();
   const [file, setFile] = useState<File | null>(null);
   const [roleId, setRoleId] = useState("");
   const [uploading, setUploading] = useState(false);
@@ -488,15 +496,17 @@ function UploadCard({
   }
 
   return (
-    <div className="rounded-xl border border-line bg-surface p-5 shadow-card">
-      <h2 className="mb-1 text-sm font-semibold text-ink">Upload a resume</h2>
-      <p className="mb-4 text-sm text-ink-secondary">
+    <SurfaceCard as="section" labelledBy={headingId} className="p-4 sm:p-5">
+      <h2 id={headingId} className="mb-1 text-sm font-semibold text-ink">
+        Upload a resume
+      </h2>
+      <p className="mb-4 max-w-prose text-sm text-ink-secondary">
         PDF or DOCX. Parsing runs an LLM and can take 10–20 seconds.
       </p>
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
         <div className="sm:col-span-2">
-          <Label htmlFor="resume-file">Resume file</Label>
+          <CandidateLabel htmlFor="resume-file">Resume file</CandidateLabel>
           <input
             id="resume-file"
             ref={inputRef}
@@ -508,16 +518,17 @@ function UploadCard({
               setError(null);
             }}
             disabled={uploading}
-            className="block w-full text-sm text-ink-secondary file:mr-3 file:rounded-lg file:border-0 file:bg-brand-50 file:px-3 file:py-2 file:text-sm file:font-medium file:text-brand-700 hover:file:bg-brand-100 disabled:opacity-60 dark:file:bg-brand-950 dark:file:text-brand-300"
+            className="block w-full text-sm text-ink-secondary file:mr-3 file:rounded-lg file:border-0 file:bg-[var(--c-accent-light)] file:px-3 file:py-2 file:text-sm file:font-medium file:text-[var(--c-accent)] disabled:opacity-60"
           />
         </div>
         <div>
-          <Label htmlFor="resume-role">Role (optional)</Label>
-          <Select
+          <CandidateLabel htmlFor="resume-role">Role (optional)</CandidateLabel>
+          <CandidateSelect
             id="resume-role"
             value={roleId}
             onChange={(e) => setRoleId(e.target.value)}
             disabled={uploading}
+            className="w-full"
           >
             <option value="">No role</option>
             {roles.map((r) => (
@@ -525,17 +536,17 @@ function UploadCard({
                 {r.title}
               </option>
             ))}
-          </Select>
+          </CandidateSelect>
         </div>
       </div>
 
-      <div className="mt-4 flex items-center gap-3">
-        <Button onClick={handleUpload} disabled={!file} loading={uploading}>
+      <div className="mt-4 flex flex-wrap items-center gap-3">
+        <CandidateButton onClick={handleUpload} disabled={!file} loading={uploading}>
           {uploading ? "Parsing…" : "Upload & Parse"}
-        </Button>
+        </CandidateButton>
         {uploading && (
           <span className="flex items-center gap-2 text-sm text-ink-secondary">
-            <Spinner className="h-4 w-4 text-brand-500" />
+            <CandidateSpinner className="h-4 w-4 text-[var(--c-accent)]" />
             Extracting and parsing with the LLM…
           </span>
         )}
@@ -546,6 +557,6 @@ function UploadCard({
           <span className="text-sm text-error">{error}</span>
         )}
       </div>
-    </div>
+    </SurfaceCard>
   );
 }

@@ -32,8 +32,7 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError } from '../../api';
 import type { AshbyCandidateWorkflow, AshbyCandidateWorkflowOperation } from '../../types';
-import { Card } from '../ui';
-import { StatusBadge, type StatusTone } from '../design';
+import { StatusBadge, SurfaceCard, type StatusTone } from '../design';
 import { formatDateTime } from '../../lib/datetime';
 import { sessionStatusLabel, sessionStatusTone } from './status';
 
@@ -341,7 +340,7 @@ export function AshbyWorkflowCard({ source }: AshbyWorkflowCardProps) {
   if (state.phase === 'absent') return null;
 
   return (
-    <Card className="p-5">
+    <SurfaceCard className="p-4 sm:p-5">
       <section aria-labelledby={HEADING_ID} aria-busy={state.phase === 'loading'}>
         {/* ONE live region, mounted for every phase and never replaced. A
             region inserted at the moment its content arrives is announced
@@ -362,6 +361,6 @@ export function AshbyWorkflowCard({ source }: AshbyWorkflowCardProps) {
           )}
         </div>
       </section>
-    </Card>
+    </SurfaceCard>
   );
 }
