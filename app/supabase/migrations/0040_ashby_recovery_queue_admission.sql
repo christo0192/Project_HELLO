@@ -220,7 +220,8 @@ begin
   -- and passes through the route as a 409 like every other refusal.
   select id into v_job_id
     from screening_v2.job_queue
-   where dedup_key = v_dedup_key
+   where name = v_queue_name
+     and dedup_key = v_dedup_key
      and status = 'active'
    limit 1;
   if v_job_id is not null then
@@ -281,7 +282,8 @@ begin
     -- satisfied.
     select id into v_job_id
       from screening_v2.job_queue
-     where dedup_key = v_dedup_key
+     where name = v_queue_name
+       and dedup_key = v_dedup_key
        and status in ('pending', 'delayed')
      limit 1;
 
