@@ -35,7 +35,25 @@ primary_region = "bom"
   AV_UPDATER_INTERVAL_MS = "3600000"
   AV_UPDATER_TIMEOUT_MS = "600000"
   RESUME_MAX_COMPRESSED_BYTES = "10485760"
-  RESUME_PARSER_TIMEOUT_MS = "30000"
+  # Resume parser child bounds. Both are read by resume-parser.ts itself and
+  # CLAMPED there, so a typo degrades to the built-in default rather than
+  # taking ingestion down. Neither is a secret.
+  #
+  # Timeout: raised from the 30s built-in to match the scanner's already-
+  # corrected shared-CPU value above. The same single shared vCPU may be
+  # mid-clamscan (which loads ~1 GiB of signatures) when a parse starts, and
+  # 30s was chosen before that was true. This is a CONFIGURATION change made
+  # on the scanner's measured precedent; it is NOT a claim that the live
+  # canary's failure was a timeout. Until the new sub-classifier writes a
+  # specific parse_* code, that cause is unnamed. Clamped to [1000, 300000].
+  RESUME_PARSER_TIMEOUT_MS = "120000"
+  # Child old-space cap (MiB), previously the hard literal 256. pdf.js
+  # materialises font/glyph tables that make 256 MiB tight for a real-world
+  # PDF, and this machine is shared/1cpu/2048MB. 512 leaves the scanner's
+  # signature set room while removing the tightest suspected bound.
+  # Clamped to [128, 1024]; same caveat as above — evidence-led headroom, not
+  # a diagnosis. See docs/runbooks/ashby-resume-parse-recovery.md.
+  RESUME_PARSER_CHILD_HEAP_MB = "512"
   RESUME_MAX_TEXT_LENGTH = "50000"
   SHUTDOWN_GRACE_MS = "30000"
   BREAKER_FAILURE_THRESHOLD = "5"

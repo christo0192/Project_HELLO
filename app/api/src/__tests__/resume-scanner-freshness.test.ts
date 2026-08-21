@@ -771,7 +771,7 @@ describe('scanner readiness on the activation health surface', () => {
         operationsPending: 0, operationsFailed: 0, operationsAwaitingDelivery: 0,
         operationsBlockedPrerequisite: 0, operationsBlockedFailedIngestion: 0,
     operationsFailedPrerequisite: 0,
-        ingestionStuckQueued: 0, ingestionStuckFetching: 0,
+        ingestionStuckQueued: 0, ingestionStuckFetching: 0, ingestionFailedParse: 0,
     scannerDeferredJobs: 0, scannerDeferredOldestAgeSec: null,
         writebackPending: 0, reconcileNoProgressRuns: 0, reconcileLastSuccessAt: null,
       },

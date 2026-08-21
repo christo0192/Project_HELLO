@@ -46,6 +46,9 @@ function world() {
   const ingestions = new Map<string, { state: string; attempts: number }>();
   const operations: Array<{ id: string; key: string; linkId: string; type: string }> = [];
   const candidates: string[] = [];
+  /** PII-minimal shells bound at import. Tracked apart from `candidates` so
+   *  "exactly one candidate per application" is assertable across both. */
+  const shells: string[] = [];
   const sessions: string[] = [];
   const invites: Array<{ id: string; digest: string }> = [];
   let n = 0;
@@ -120,7 +123,7 @@ function world() {
     async markWritebackPending() { return { status: 'ok' }; },
   };
 
-  return { links, ingestions, operations, candidates, sessions, invites, stores, next: () => ++n };
+  return { links, ingestions, operations, candidates, shells, sessions, invites, stores, next: () => ++n };
 }
 
 function makeRuntime(w: ReturnType<typeof world>, over: Partial<AshbyRuntime> = {}): AshbyRuntime {
@@ -157,6 +160,11 @@ function makeRuntime(w: ReturnType<typeof world>, over: Partial<AshbyRuntime> = 
     materialization: {
       insertResume: async () => ({ id: `res_${w.next()}` }),
       insertCandidate: async () => { const id = `cand_${w.next()}`; w.candidates.push(id); return { id }; },
+      // The import-time shell. A runtime WITHOUT this seam can no longer
+      // complete an import at all — the handler throws `ashby_import_shell_unbound`
+      // rather than finishing an import that leaves the application invisible.
+      insertCandidateShell: async () => { const id = `shell_${w.next()}`; w.shells.push(id); return { id }; },
+      updateCandidateFromParse: async () => ({ updated: true }),
       bindLinkColumn: async ({ applicationLinkId, column, value }) => {
         for (const l of w.links.values()) {
           if (l.id !== applicationLinkId) continue;
@@ -240,6 +248,10 @@ describe('chain convergence — exactly one of everything', () => {
     await runner.stop();
 
     expect(w.links.size).toBe(1);
+    // Exactly ONE candidate identity per application, shell included: the
+    // import-time shell converges through the same link CAS, so a
+    // duplicate/concurrent/re-driven import cannot mint a second.
+    expect([...w.links.values()].filter((l) => l.candidateId != null)).toHaveLength(1);
     expect(w.ingestions.size).toBe(1);
     expect(w.operations.filter((o) => o.type === 'invite_delivery')).toHaveLength(1);
   });
@@ -256,6 +268,10 @@ describe('chain convergence — exactly one of everything', () => {
     await runner.stop();
 
     expect(w.links.size).toBe(1);
+    // Exactly ONE candidate identity per application, shell included: the
+    // import-time shell converges through the same link CAS, so a
+    // duplicate/concurrent/re-driven import cannot mint a second.
+    expect([...w.links.values()].filter((l) => l.candidateId != null)).toHaveLength(1);
     expect(w.operations.filter((o) => o.type === 'invite_delivery')).toHaveLength(1);
   });
 
@@ -273,6 +289,10 @@ describe('chain convergence — exactly one of everything', () => {
     await runner.stop();
 
     expect(w.links.size).toBe(1);
+    // Exactly ONE candidate identity per application, shell included: the
+    // import-time shell converges through the same link CAS, so a
+    // duplicate/concurrent/re-driven import cannot mint a second.
+    expect([...w.links.values()].filter((l) => l.candidateId != null)).toHaveLength(1);
     expect(w.ingestions.size).toBe(1);
     expect(w.operations.filter((o) => o.type === 'invite_delivery')).toHaveLength(1);
   });
@@ -287,6 +307,10 @@ describe('chain convergence — exactly one of everything', () => {
     for (let i = 0; i < 5; i++) await handlers[ASHBY_IMPORT_QUEUE](job);
 
     expect(w.links.size).toBe(1);
+    // Exactly ONE candidate identity per application, shell included: the
+    // import-time shell converges through the same link CAS, so a
+    // duplicate/concurrent/re-driven import cannot mint a second.
+    expect([...w.links.values()].filter((l) => l.candidateId != null)).toHaveLength(1);
     expect(w.operations.filter((o) => o.type === 'invite_delivery')).toHaveLength(1);
   });
 
@@ -311,6 +335,10 @@ describe('chain convergence — exactly one of everything', () => {
     await runner.stop();
 
     expect(w.links.size).toBe(1);
+    // Exactly ONE candidate identity per application, shell included: the
+    // import-time shell converges through the same link CAS, so a
+    // duplicate/concurrent/re-driven import cannot mint a second.
+    expect([...w.links.values()].filter((l) => l.candidateId != null)).toHaveLength(1);
     expect(w.operations.filter((o) => o.type === 'invite_delivery')).toHaveLength(1);
   });
 
@@ -330,6 +358,10 @@ describe('chain convergence — exactly one of everything', () => {
     await Promise.all([a.stop(), b.stop()]);
 
     expect(w.links.size).toBe(1);
+    // Exactly ONE candidate identity per application, shell included: the
+    // import-time shell converges through the same link CAS, so a
+    // duplicate/concurrent/re-driven import cannot mint a second.
+    expect([...w.links.values()].filter((l) => l.candidateId != null)).toHaveLength(1);
     expect(w.ingestions.size).toBe(1);
     expect(w.operations.filter((o) => o.type === 'invite_delivery')).toHaveLength(1);
   });
@@ -358,6 +390,10 @@ describe('chain convergence — exactly one of everything', () => {
 
     // The work ran twice, but the durable effects are still singular.
     expect(w.links.size).toBe(1);
+    // Exactly ONE candidate identity per application, shell included: the
+    // import-time shell converges through the same link CAS, so a
+    // duplicate/concurrent/re-driven import cannot mint a second.
+    expect([...w.links.values()].filter((l) => l.candidateId != null)).toHaveLength(1);
     expect(w.operations.filter((o) => o.type === 'invite_delivery')).toHaveLength(1);
   });
 });

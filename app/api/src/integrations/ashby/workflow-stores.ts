@@ -164,6 +164,22 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
       if (error) throw new Error('ashby_operation_defer_error');
       return statusOf(data) === 'ok' ? 'ok' : 'not_owned';
     },
+    async deferIngestionParse(applicationLinkId, reasonCode): Promise<{ status: string; attempts?: number }> {
+      // The ONLY door through which `extracting -> queued` is reachable. The
+      // RPC re-checks the state and the reason allowlist server-side and
+      // charges the same 5-attempt requeue budget every other requeue does —
+      // this seam does not get to decide any of that.
+      const { data, error } = await client.rpc('defer_ashby_ingestion_parse', {
+        p_application_link_id: applicationLinkId,
+        p_reason: reasonCode,
+      });
+      if (error) throw new Error('ashby_ingestion_parse_defer_error');
+      const row = data as { attempts?: unknown } | null;
+      return {
+        status: statusOf(data),
+        attempts: typeof row?.attempts === 'number' ? row.attempts : undefined,
+      };
+    },
     async claimOperation(operationType, owner, leaseSeconds): Promise<OperationClaimRow | null> {
       const { data, error } = await client.rpc('claim_ashby_operation', {
         p_operation_type: operationType,
@@ -492,6 +508,21 @@ export interface MissionControlStore {
   setMappingStatus(mappingId: string, status: 'paused' | 'enabled', reason: string | null, actorId: string): Promise<{ status: string; mappingStatus?: string }>;
   cancelApplication(linkId: string, terminalState: string, reason: string | null, actorId: string): Promise<{ status: string; cancelledOperations?: number; cancelledIngestion?: number }>;
   retryOperation(operationId: string, actorId: string): Promise<{ status: string }>;
+  /**
+   * Audited admin retry of ONE parse-class `failed_review` resume ingestion.
+   *
+   * Bounded by construction and NOT a counter reset: the RPC charges an
+   * attempt against the unchanged 0032 ceiling, so an exhausted row is refused
+   * rather than resurrected. It refuses a terminal application, a row that is
+   * not `failed_review`, and every reason outside the parse-availability
+   * allowlist — a document verdict stays a document verdict.
+   *
+   * Legacy generic `parse_error` IS accepted, for one reason: rows written
+   * before failures were sub-classified cannot say which of nine causes they
+   * were, and one bounded retry is what turns an unfalsifiable row into a
+   * named one. It is still counted, so it cannot be repeated indefinitely.
+   */
+  retryIngestionParse(applicationLinkId: string, actorId: string): Promise<{ status: string }>;
 }
 
 /** Mission Control read/action store (service-role; sanitized projections). */
@@ -611,6 +642,14 @@ export function createMissionControlStore(client: SupabaseClient): MissionContro
         p_actor_id: actorId,
       });
       if (error) throw new Error('ashby_mc_retry_error');
+      return { status: statusOf(data) };
+    },
+    async retryIngestionParse(applicationLinkId, actorId) {
+      const { data, error } = await client.rpc('recover_ashby_ingestion_parse', {
+        p_application_link_id: applicationLinkId,
+        p_actor_id: actorId,
+      });
+      if (error) throw new Error('ashby_mc_ingestion_retry_error');
       return { status: statusOf(data) };
     },
     async reissueManualInvite(input): Promise<MissionControlInviteIssue> {

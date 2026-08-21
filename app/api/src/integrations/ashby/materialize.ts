@@ -61,7 +61,9 @@ export type MaterializeReason =
   | 'candidate_missing'
   | 'persist_failed'
   | 'unsafe_manual_artifact'
-  | 'invalid_reissue_path';
+  | 'invalid_reissue_path'
+  /** The store predates the shell seam — fail-closed, never a silent skip. */
+  | 'shell_unsupported';
 
 /** The mapping fields materialization needs. Opaque ids only. */
 export interface MaterializationMapping {
@@ -88,6 +90,40 @@ export interface MaterializationStore {
     resumeId: string | null;
     parsed: StructuredResume;
   }): Promise<{ id: string }>;
+
+  /**
+   * Insert a PII-MINIMAL candidate shell: ownership and provenance only.
+   *
+   * `name`, `email`, `phone_raw`, `parsed` and `resume_id` stay NULL. A
+   * candidate that exists because an application was imported holds no
+   * candidate contact data until a resume has actually been parsed, so a
+   * `failed_review` application is visible without ever having disclosed
+   * anything about the person. No external/provider identifier is written as
+   * identity: the link owns that relationship.
+   *
+   * Optional ONLY so a store written before this seam existed still type-checks;
+   * {@link materializeCandidateShell} FAILS CLOSED when it is absent rather
+   * than pretending the shell was not needed.
+   */
+  insertCandidateShell?(input: { roleId: string; ownerId: string }): Promise<{ id: string }>;
+
+  /**
+   * Populate an existing shell from a successful parse, under a CAS on
+   * `resume_id is null`.
+   *
+   * Returns false when another runner already populated it — the caller then
+   * removes the resume row it created and reports `reused`, so a second run of
+   * the ready path can never leave a duplicate resume behind.
+   *
+   * Implementations MUST NOT write `role_id`, `owner_id`, `status`, or
+   * `ats_source`: the shell's ownership and funnel position were decided at
+   * import and a parse is not an event that may change either.
+   */
+  updateCandidateFromParse?(input: {
+    candidateId: string;
+    resumeId: string;
+    parsed: StructuredResume;
+  }): Promise<{ updated: boolean }>;
 
   /**
    * CAS back-fill of a link column. Returns the winning value: either the one
@@ -121,8 +157,94 @@ export interface MaterializationStore {
 // ── 1. Candidate materialization (called on ingestion `ready`) ───────────────
 
 export type MaterializeCandidateResult =
-  | { status: 'created' | 'reused'; candidateId: string }
+  /** `updated` = an existing PII-minimal shell was populated by this parse. */
+  | { status: 'created' | 'reused' | 'updated'; candidateId: string }
   | { status: 'skipped'; reason: MaterializeReason };
+
+/** Outcome of binding the PII-minimal shell at import time. */
+export type MaterializeShellResult =
+  | { status: 'created' | 'reused'; candidateId: string }
+  /** Nothing to do, and nothing wrong (terminal application). */
+  | { status: 'skipped'; reason: MaterializeReason }
+  /**
+   * The shell could NOT be bound. Distinct from `skipped` on purpose: the
+   * caller must treat this as retryable work that has not happened, never as
+   * an import that is finished.
+   */
+  | { status: 'failed'; reason: MaterializeReason };
+
+export interface MaterializeShellDeps {
+  store: MaterializationStore;
+  mapping: MaterializationMapping;
+  /** Terminal check re-read at the moment of the write. */
+  isTerminal: boolean;
+  /** Already-bound candidate for this link, if any. */
+  existingCandidateId: string | null;
+}
+
+/**
+ * Bind exactly one PII-minimal `queued` candidate shell to an application link.
+ *
+ * WHY AT IMPORT, AND WHY IT MAY NOT BE SWALLOWED
+ * ----------------------------------------------
+ * Before this, the ONLY thing that created an Ashby candidate was the ingestion
+ * job reaching `ready`. An application whose resume failed to parse therefore
+ * produced a link, an ingestion row and a queued invite operation — and no row
+ * anywhere a recruiter looks. The application was invisible, and invisible is
+ * indistinguishable from "never arrived".
+ *
+ * Binding it here fixes that only if a failure to bind is LOUD. A swallowed
+ * failure recreates the invisible-candidate defect precisely, in the one code
+ * path added to prevent it, so this reports `failed` and the import job it runs
+ * under must not complete on it. Every step of the import is idempotent, so the
+ * retry is safe.
+ *
+ * IDENTITY is unchanged: the shell is bound through the SAME
+ * `bindLinkColumn('candidate_id', …)` CAS `materializeCandidate` uses, and is
+ * never looked up or merged by email or phone — the shell has no email to
+ * merge on, which is a property of the design rather than a coincidence.
+ */
+export async function materializeCandidateShell(
+  applicationLinkId: string,
+  deps: MaterializeShellDeps,
+): Promise<MaterializeShellResult> {
+  // A withdrawn/deleted application must not gain a candidate. This is not a
+  // failure: there is genuinely no work.
+  if (deps.isTerminal) return { status: 'skipped', reason: 'blocked_terminal' };
+  if (deps.existingCandidateId) {
+    return { status: 'reused', candidateId: deps.existingCandidateId };
+  }
+  const insertShell = deps.store.insertCandidateShell;
+  if (!insertShell) {
+    // Fail CLOSED. A store without the seam cannot bind a shell, and reporting
+    // that as "skipped" would be the swallow this function exists to refuse.
+    return { status: 'failed', reason: 'shell_unsupported' };
+  }
+
+  let candidateId: string | null = null;
+  try {
+    const created = await insertShell.call(deps.store, {
+      roleId: deps.mapping.roleId,
+      ownerId: deps.mapping.ownerId,
+    });
+    candidateId = created.id;
+    const bound = await deps.store.bindLinkColumn({
+      applicationLinkId,
+      column: 'candidate_id',
+      value: candidateId,
+    });
+    if (!bound.wonRace) {
+      // A concurrent import bound first. Adopt the winner and delete our own
+      // row so a lost race can never leave an orphan candidate behind.
+      await deps.store.deleteOrphan('candidates', candidateId).catch(() => {});
+      return { status: 'reused', candidateId: bound.bound };
+    }
+    return { status: 'created', candidateId };
+  } catch {
+    if (candidateId) await deps.store.deleteOrphan('candidates', candidateId).catch(() => {});
+    return { status: 'failed', reason: 'persist_failed' };
+  }
+}
 
 export interface MaterializeCandidateDeps {
   store: MaterializationStore;
@@ -133,6 +255,65 @@ export interface MaterializeCandidateDeps {
   existingCandidateId: string | null;
   /** Bounded extracted text for the resume row, or null to store none. */
   textExtracted?: string | null;
+}
+
+/**
+ * What populating an already-bound candidate needs.
+ *
+ * Deliberately NARROWER than {@link MaterializeCandidateDeps}: populating a
+ * shell needs no mapping, because ownership and role were decided at import
+ * and this step may not revise them. That is not a technicality — it is what
+ * lets a shell still be populated when its mapping was paused between the
+ * import and the parse, instead of being stranded blank.
+ */
+export interface PopulateCandidateDeps {
+  store: MaterializationStore;
+  /** Bounded extracted text for the resume row, or null to store none. */
+  textExtracted?: string | null;
+}
+
+/**
+ * Populate an already-bound candidate (normally the import-time shell) from a
+ * successful parse.
+ *
+ * IDEMPOTENT BY CAS, not by hope. The update only applies while the candidate
+ * still has no resume, so running the ready path twice writes once: the second
+ * run's resume row is deleted and the call reports `reused`. Without that a
+ * repeat would accumulate a resume row per run.
+ *
+ * BACKWARD COMPATIBLE. A store with no `updateCandidateFromParse` — or a link
+ * bound before the shell existed — takes `reused`, i.e. exactly the behaviour
+ * that shipped before this change. Nothing regresses to "no candidate".
+ */
+export async function populateExistingCandidate(
+  candidateId: string,
+  structured: StructuredResume,
+  deps: PopulateCandidateDeps,
+): Promise<MaterializeCandidateResult> {
+  const update = deps.store.updateCandidateFromParse;
+  if (!update) return { status: 'reused', candidateId };
+
+  let resumeId: string | null = null;
+  try {
+    const resume = await deps.store.insertResume({
+      textExtracted: deps.textExtracted ?? null,
+      parsed: structured,
+    });
+    resumeId = resume.id;
+    const res = await update.call(deps.store, { candidateId, resumeId, parsed: structured });
+    if (!res.updated) {
+      // Already populated (a repeat run, or a concurrent winner). Drop the
+      // resume row we just created; the candidate is authoritative.
+      await deps.store.deleteOrphan('resumes', resumeId).catch(() => {});
+      return { status: 'reused', candidateId };
+    }
+    return { status: 'updated', candidateId };
+  } catch {
+    if (resumeId) await deps.store.deleteOrphan('resumes', resumeId).catch(() => {});
+    // The candidate itself is NOT deleted: it is the durable shell created at
+    // import and it must survive a failed population.
+    return { status: 'skipped', reason: 'persist_failed' };
+  }
 }
 
 /**
@@ -147,7 +328,10 @@ export async function materializeCandidate(
 ): Promise<MaterializeCandidateResult> {
   if (deps.isTerminal) return { status: 'skipped', reason: 'blocked_terminal' };
   if (deps.existingCandidateId) {
-    return { status: 'reused', candidateId: deps.existingCandidateId };
+    // The link already carries a candidate — since the import step, that is
+    // normally the PII-MINIMAL SHELL, and this is the moment its fields become
+    // knowable. Populate it in place rather than creating a second identity.
+    return populateExistingCandidate(deps.existingCandidateId, structured, deps);
   }
 
   let resumeId: string | null = null;
@@ -175,11 +359,43 @@ export async function materializeCandidate(
     });
 
     if (!bound.wonRace) {
-      // A concurrent runner bound a candidate first. Adopt theirs and remove
-      // ours so the application never ends up with two candidate identities.
+      // A concurrent runner bound a candidate first — in practice, the import
+      // binding its PII-MINIMAL SHELL while this ingestion was downloading,
+      // scanning and parsing. Adopt theirs and remove our own candidate so the
+      // application never ends up with two identities.
       await deps.store.deleteOrphan('candidates', candidateId).catch(() => {});
+
+      // ...and then POPULATE the winner with what we just parsed.
+      //
+      // Simply returning `reused` here would be the quiet failure: the parse
+      // succeeded, the fields exist in memory, and the surviving candidate
+      // would nevertheless stay empty forever — a candidate with no name that
+      // no later run can fill, because `ready` is terminal in the 0029 machine
+      // and this path never runs again. The same CAS on `resume_id is null`
+      // keeps it idempotent.
+      const winner = bound.bound;
+      const update = deps.store.updateCandidateFromParse;
+      if (update) {
+        let res: { updated: boolean };
+        try {
+          res = await update.call(deps.store, { candidateId: winner, resumeId, parsed: structured });
+        } catch {
+          // The population THREW. Distinguished from "already populated"
+          // deliberately: reporting `reused` here would tell the caller the
+          // parse was persisted when it was not, and the caller would then
+          // write the terminal `ready` over a blank winner — the exact defect
+          // the pre-`ready` ordering exists to prevent. Report the failure so
+          // the row rests recoverably instead.
+          await deps.store.deleteOrphan('resumes', resumeId).catch(() => {});
+          return { status: 'skipped', reason: 'persist_failed' };
+        }
+        if (res.updated) return { status: 'updated', candidateId: winner };
+      }
+      // Either the winner was ALREADY populated (a repeat run — the CAS
+      // matched zero rows), or the store predates the populate seam. Both mean
+      // the winner is authoritative and our resume row is surplus.
       await deps.store.deleteOrphan('resumes', resumeId).catch(() => {});
-      return { status: 'reused', candidateId: bound.bound };
+      return { status: 'reused', candidateId: winner };
     }
     return { status: 'created', candidateId };
   } catch {

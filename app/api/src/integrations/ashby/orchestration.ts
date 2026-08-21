@@ -182,6 +182,30 @@ export interface RuntimeWorkflowStores extends WorkflowStores {
     reasonCode: string,
     delaySeconds: number,
   ): Promise<'ok' | 'not_owned'>;
+  /**
+   * Return an ingestion from `extracting` to `queued` because the PARSER was
+   * unavailable (timed out on a contended CPU, or the bounded pool refused the
+   * submission) — never because of anything learned about the document.
+   *
+   * A SEPARATE seam from `advanceIngestion` on purpose. `extracting -> queued`
+   * is deliberately not a legal transition for the generic path: by the time a
+   * row is `extracting` the bytes have been downloaded, so a requeue is a
+   * re-download, and the ONLY justification for paying that again is that no
+   * statement about the file was ever produced. Migration 0039 makes the edge
+   * legal solely through this guarded, reason-allowlisted, attempt-charging
+   * RPC, and keeps `advance_ashby_ingestion` refusing it.
+   *
+   * The 0032 five-attempt ceiling is NOT relaxed: this charges an attempt like
+   * every other requeue and answers `retry_exhausted` at the bound.
+   *
+   * Optional so existing fakes compile; the worker fails LOUDLY (a durable
+   * `failed_review`) when it is absent rather than waiting on a seam that
+   * cannot record the wait.
+   */
+  deferIngestionParse?(
+    applicationLinkId: string,
+    reasonCode: string,
+  ): Promise<{ status: string; attempts?: number }>;
   /** Park a completed application as `writeback_pending` (audited, idempotent). */
   markWritebackPending(applicationLinkId: string, reason: string): Promise<{ status: string }>;
   /** Enqueue the verified scorecard sink after a durable assessment insert. */
@@ -236,8 +260,35 @@ export interface OrchestrationGates {
 
 // ── 1. Import orchestrator ───────────────────────────────────────────────────
 
+/** How the PII-minimal candidate shell was disposed of by one import. */
+export type ImportShellStatus =
+  | 'created'
+  | 'reused'
+  /** Deliberately not attempted (terminal application, or no mapping to own it). */
+  | 'skipped'
+  /** No shell seam was injected at all — a decision-only caller. */
+  | 'unavailable';
+
 export type ImportResult =
-  | { status: 'imported'; applicationLinkId: string; reused: boolean; decision: ImportDecision }
+  | {
+      status: 'imported';
+      applicationLinkId: string;
+      reused: boolean;
+      decision: ImportDecision;
+      /** The bound candidate shell, or null when none was created. */
+      candidateId?: string | null;
+      shell?: ImportShellStatus;
+    }
+  /**
+   * The link and ingestion row are durable but the candidate shell could NOT
+   * be bound.
+   *
+   * This is a distinct outcome and not a variant of `imported` because the
+   * caller must be able to tell "finished" from "finished except for the one
+   * row that makes this application visible". Every step of `runImport` is
+   * idempotent, so the correct response is to RETRY the whole import.
+   */
+  | { status: 'shell_unbound'; applicationLinkId: string; reason: string }
   | { status: 'skipped'; reason: string }
   | { status: 'disabled' };
 
@@ -249,6 +300,24 @@ export interface ImportDeps {
   resolveMapping(jobId: string): Promise<ResolvedMapping>;
   /** Read the app's resume file handle from the authoritative info (opaque). */
   readResumeFileHandle?(info: unknown): string | null;
+  /**
+   * Bind the PII-minimal `queued` candidate shell for a freshly imported link.
+   *
+   * Injected rather than called directly so this orchestrator keeps no
+   * knowledge of ownership resolution — the composition root already resolves
+   * the mapping for a link, and duplicating that here would fork it.
+   *
+   * Optional so decision-only callers (and every pre-existing test fake) still
+   * compile. When it is absent the import reports `shell: 'unavailable'` and
+   * `candidateId: null` — an explicit, assertable fact, NOT a silent success.
+   * The queue handler that owns the durable import job is what refuses to
+   * complete on it.
+   */
+  materializeShell?(applicationLinkId: string): Promise<
+    { status: 'created' | 'reused'; candidateId: string }
+    | { status: 'skipped'; reason: string }
+    | { status: 'failed'; reason: string }
+  >;
 }
 
 /**
@@ -312,6 +381,28 @@ export async function runImport(externalApplicationId: string, deps: ImportDeps)
 
   // Seed the ingestion row (idempotent) and enqueue invite delivery per mode.
   await deps.stores.advanceIngestion(linkId, 'queued');
+
+  // ── Candidate shell, BEFORE the invite operations ────────────────────────
+  // Ordered here for one reason: a failure below must leave the least work
+  // done. The link and the ingestion row are the higher-value records and are
+  // already durable; the invite operations are cheap to enqueue and the shell
+  // is the row that makes this application visible at all. A shell failure
+  // therefore returns before the operations exist, and the retry re-runs a
+  // fully idempotent sequence.
+  //
+  // NOTE the failure is NOT swallowed. A logged-and-ignored shell failure is
+  // exactly the invisible-candidate defect this seam exists to close.
+  let candidateId: string | null = null;
+  let shell: ImportShellStatus = 'unavailable';
+  if (deps.materializeShell) {
+    const bound = await deps.materializeShell(linkId);
+    if (bound.status === 'failed') {
+      return { status: 'shell_unbound', applicationLinkId: linkId, reason: bound.reason };
+    }
+    shell = bound.status;
+    candidateId = bound.status === 'skipped' ? null : bound.candidateId;
+  }
+
   const channels = channelsForMode(mapping.deliveryMode);
   if (channels.email) {
     await deps.stores.enqueueOperation({
@@ -328,7 +419,7 @@ export async function runImport(externalApplicationId: string, deps: ImportDeps)
     });
   }
 
-  return { status: 'imported', applicationLinkId: linkId, reused, decision };
+  return { status: 'imported', applicationLinkId: linkId, reused, decision, candidateId, shell };
 }
 
 // ── 2. Ingestion job orchestrator ────────────────────────────────────────────

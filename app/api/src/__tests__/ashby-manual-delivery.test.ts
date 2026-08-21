@@ -51,6 +51,7 @@ function recorder(status = 'ok'): Recorder {
     setMappingStatus: async () => ({ status: 'ok' }),
     cancelApplication: async () => ({ status: 'ok' }),
     retryOperation: async () => ({ status: 'ok' }),
+    retryIngestionParse: async () => ({ status: 'ok' }),
     upsertMapping: async () => ({ status: 'ok', id: UUID }),
     reissueManualInvite: async (input) => {
       rec.reissues.push(input);

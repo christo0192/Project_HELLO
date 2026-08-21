@@ -17,6 +17,8 @@
  *   POST /mappings/:id/resume      — admin: resume (enable) a complete, non-drift mapping
  *   POST /workflows/:id/cancel     — admin: atomic terminal cancellation
  *   POST /operations/:id/retry     — admin: retry a failed safe operation
+ *   POST /ingestions/:linkId/retry — admin: bounded, audited retry of ONE
+ *                                    parse-class failed_review ingestion
  *   GET  /jobs/:externalJobId/stages         — admin: read-only stage discovery
  *   GET  /jobs/:externalJobId/feedback-form  — admin: read-only feedback-form
  *                                    SCHEMA discovery (ids/labels/types/scales;
@@ -502,6 +504,46 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
     try {
       const actorId = req.authUser?.id ?? '';
       const result = await store().retryOperation(id, actorId);
+      if (result.status === 'ok') { res.json({ ok: true }); return; }
+      res.status(409).json({ ok: false, error: result.status });
+    } catch {
+      res.status(500).json({ ok: false, error: 'mission_control_action_error' });
+    }
+  });
+
+  /**
+   * Bounded, audited admin retry of a parse-class `failed_review` ingestion.
+   *
+   * Deliberately NOT a counter reset. The RPC charges an attempt against the
+   * unchanged 0032 ceiling, so this can be used a bounded number of times and
+   * an exhausted row answers 409 rather than being resurrected. Everything
+   * that decides whether the retry is allowed — state, terminal application,
+   * the parse-availability reason allowlist — is enforced SERVER-SIDE in the
+   * RPC, not here; this route contributes authentication, an admin gate, id
+   * validation and the audit record.
+   *
+   * It issues no invite and moves no stage. Clearing the ingestion is what
+   * eventually lets the ordinary 0035 invite prerequisite hold; nothing here
+   * short-circuits that.
+   */
+  router.post('/ingestions/:applicationLinkId/retry', requireRole('admin'), async (req: Request, res: Response) => {
+    const linkId = req.params.applicationLinkId;
+    if (!UUID_RE.test(linkId)) {
+      res.status(400).json({ ok: false, error: 'invalid_application_link_id' });
+      return;
+    }
+    try {
+      const actorId = req.authUser?.id ?? '';
+      const result = await store().retryIngestionParse(linkId, actorId);
+      // Opaque link id and a stable status only — never the failure reason
+      // text, an external Ashby id, a file handle, or a candidate field.
+      await recordAudit(req, 'resource.update', result.status === 'ok' ? 200 : 409, {
+        metadata: {
+          resource: 'ashby_resume_ingestion',
+          application_link_id: linkId,
+          outcome: result.status,
+        },
+      });
       if (result.status === 'ok') { res.json({ ok: true }); return; }
       res.status(409).json({ ok: false, error: result.status });
     } catch {

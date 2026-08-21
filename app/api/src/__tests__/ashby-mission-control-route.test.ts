@@ -26,6 +26,7 @@ function fakeStore(over: Partial<MissionControlStore> = {}): MissionControlStore
     setMappingStatus: async () => ({ status: 'ok', mappingStatus: 'paused' }),
     cancelApplication: async () => ({ status: 'ok', cancelledOperations: 2, cancelledIngestion: 1 }),
     retryOperation: async () => ({ status: 'ok' }),
+    retryIngestionParse: async () => ({ status: 'ok' }),
     upsertMapping: async () => ({ status: 'ok', id: UUID }),
     reissueManualInvite: async () => ({ status: 'ok', inviteId: UUID, revokedInvites: 0 }),
     ...over,
@@ -137,7 +138,7 @@ function emptyBacklog() {
     operationsPending: 0, operationsFailed: 0, operationsAwaitingDelivery: 0,
     operationsBlockedPrerequisite: 0, operationsBlockedFailedIngestion: 0,
     operationsFailedPrerequisite: 0,
-    ingestionStuckQueued: 0, ingestionStuckFetching: 0,
+    ingestionStuckQueued: 0, ingestionStuckFetching: 0, ingestionFailedParse: 0,
     scannerDeferredJobs: 0, scannerDeferredOldestAgeSec: null,
     writebackPending: 0, reconcileNoProgressRuns: 0, reconcileLastSuccessAt: null,
   };

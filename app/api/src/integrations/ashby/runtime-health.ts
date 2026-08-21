@@ -353,6 +353,22 @@ export interface BacklogView {
   /** Resume ingestions stranded in `fetching` past the stuck window. */
   ingestionStuckFetching: number;
   /**
+   * Resume ingestions rested in `failed_review` on a PARSE-class reason, on a
+   * non-terminal link.
+   *
+   * Counted apart from every other failure class because it is the one with an
+   * audited operator recovery (`recover_ashby_ingestion_parse`) and because
+   * making a document visible as a candidate shell without making its blockage
+   * visible to operations would trade one silence for another: the recruiter
+   * would see a candidate that never progresses and nobody would be paged.
+   *
+   * A parse-class rest is not automatically wrong — a genuinely unparseable
+   * document belongs here — so this counter is reported and NOT wired into the
+   * degradation verdict. It answers "how many applications are waiting on a
+   * human?", which is a queue an operator works, not an alarm.
+   */
+  ingestionFailedParse: number;
+  /**
    * Ashby jobs currently DEFERRED on scanner readiness (0037): claimed, found
    * the malware scanner unable to screen, and returned to the queue with their
    * attempt refunded. This is correct behaviour and costs no failure budget —
@@ -378,7 +394,7 @@ const EMPTY_BACKLOG: BacklogView = {
   operationsPending: 0, operationsFailed: 0, operationsAwaitingDelivery: 0,
   operationsBlockedPrerequisite: 0, operationsBlockedFailedIngestion: 0,
   operationsFailedPrerequisite: 0,
-  ingestionStuckQueued: 0, ingestionStuckFetching: 0,
+  ingestionStuckQueued: 0, ingestionStuckFetching: 0, ingestionFailedParse: 0,
   scannerDeferredJobs: 0, scannerDeferredOldestAgeSec: null,
   writebackPending: 0, reconcileNoProgressRuns: 0, reconcileLastSuccessAt: null,
 };
@@ -500,6 +516,7 @@ export async function readBacklog(
     operationsFailedPrerequisite: counter('failed_prerequisite'),
     ingestionStuckQueued: counter('ingestion_stuck_queued'),
     ingestionStuckFetching: counter('ingestion_stuck_fetching'),
+    ingestionFailedParse: counter('ingestion_failed_parse'),
     scannerDeferredJobs, scannerDeferredOldestAgeSec,
     reconcileNoProgressRuns: typeof cp?.no_progress_runs === 'number' ? cp.no_progress_runs : 0,
     reconcileLastSuccessAt: cp?.last_success_at ?? null,
