@@ -6,7 +6,7 @@
  * block suppression, notes, appeals, CSV export, axe.
  */
 
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -25,6 +25,9 @@ const mockApi = {
     expires_at: '2999-01-01T00:00:00.000Z',
   }),
   exportCsv: vi.fn().mockResolvedValue('﻿candidate_id,status\n'),
+  // Default: this candidate is not Ashby-linked, so the read-only Ashby
+  // pipeline card contributes nothing to the Overview.
+  getCandidateAshbyWorkflow: vi.fn().mockResolvedValue({ ok: true, workflow: null }),
 };
 
 vi.mock('../api', () => ({
@@ -39,6 +42,7 @@ vi.mock('../api', () => ({
     exportCsv: (...args: any[]) => mockApi.exportCsv(...args),
     startLiveKitScreening: vi.fn().mockRejectedValue(new Error('mock')),
     listCandidates: vi.fn().mockResolvedValue([]),
+    getCandidateAshbyWorkflow: (...args: any[]) => mockApi.getCandidateAshbyWorkflow(...args),
   },
   ApiError: class extends Error {
     status: number;
@@ -227,5 +231,43 @@ describe('CandidateDetailPage', () => {
       expect(await screen.findByText(/\/appeal#/)).toBeInTheDocument();
       expect(screen.queryByText(/\/appeal\?/)).not.toBeInTheDocument();
     });
+  });
+});
+
+describe('Ashby pipeline card on the Overview', () => {
+  beforeEach(() => {
+    mockApi.getCandidate.mockResolvedValue(mockCandidateDetail);
+  });
+
+  it('renders no card at all for a candidate with no Ashby workflow', async () => {
+    mockApi.getCandidateAshbyWorkflow.mockResolvedValue({ ok: true, workflow: null });
+    renderDetailPage();
+    await screen.findByText('Jane Doe');
+    await waitFor(() => expect(mockApi.getCandidateAshbyWorkflow).toHaveBeenCalledWith('candidate-1'));
+    expect(screen.queryByText('Ashby screening pipeline')).not.toBeInTheDocument();
+  });
+
+  it('renders the read-only card for an Ashby-linked candidate, with no new controls', async () => {
+    mockApi.getCandidateAshbyWorkflow.mockResolvedValue({
+      ok: true,
+      workflow: {
+        lifecycle: 'ready',
+        terminalState: null,
+        ingestionState: 'ready',
+        operations: [{ type: 'invite_delivery', state: 'pending', errorCode: null }],
+        sessionStatus: null,
+        updatedAt: '2026-08-20T10:00:00.000Z',
+      },
+    });
+    renderDetailPage();
+    // Wait for the resolved card, not the identically-headed loading state.
+    expect(await screen.findByText('Ready to screen')).toBeInTheDocument();
+    expect(screen.getByText('Ashby screening pipeline')).toBeInTheDocument();
+    expect(screen.getByText('Screening invite')).toBeInTheDocument();
+    // The card region itself contributes no control of any kind.
+    const region = screen.getByRole('region', { name: 'Ashby screening pipeline' });
+    expect(within(region).queryAllByRole('button')).toHaveLength(0);
+    expect(within(region).queryAllByRole('link')).toHaveLength(0);
+    expect(region.querySelectorAll('button, a, input, select, textarea')).toHaveLength(0);
   });
 });

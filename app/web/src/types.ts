@@ -603,6 +603,40 @@ export interface AshbyMcWorkflow {
   updatedAt: string;
 }
 
+/**
+ * Candidate-scoped, read-only Ashby workflow projection.
+ *
+ * Same state vocabulary as the Mission Control workflow list — this is not a
+ * second state model — but a deliberately narrower payload. It carries NO
+ * external Ashby identifiers, no internal row ids (link/operation/ingestion/
+ * session), no operation keys, markers or leases, no tokens, no provider
+ * payloads, and no candidate PII. `errorCode` is the sanitized stable code the
+ * database CHECK constrains to `^[a-z0-9_.:-]{1,64}$`.
+ */
+export type AshbyCandidateWorkflowOperationType = 'invite_delivery' | 'scorecard_write';
+
+export interface AshbyCandidateWorkflowOperation {
+  type: AshbyCandidateWorkflowOperationType;
+  state: string;
+  errorCode: string | null;
+}
+
+export interface AshbyCandidateWorkflow {
+  lifecycle: string;
+  terminalState: string | null;
+  ingestionState: string | null;
+  operations: AshbyCandidateWorkflowOperation[];
+  sessionStatus: string | null;
+  /** Null when the workflow row carries no usable timestamp. */
+  updatedAt: string | null;
+}
+
+/** `workflow: null` = the candidate is not Ashby-linked. Never an error. */
+export interface AshbyCandidateWorkflowResponse {
+  ok: boolean;
+  workflow: AshbyCandidateWorkflow | null;
+}
+
 export interface AshbyMcMappingsResponse {
   ok: boolean;
   mappings: AshbyMcMapping[];

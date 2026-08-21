@@ -21,6 +21,7 @@ const mockApi = {
   listAshbyScopedReviewNotes: vi.fn(),
   getSession: vi.fn(),
   getRecordingDownloadUrl: vi.fn(),
+  getAshbyScopedReviewWorkflow: vi.fn().mockResolvedValue({ ok: true, workflow: null }),
 };
 
 class MockApiError extends Error {
@@ -37,6 +38,7 @@ vi.mock('../api', () => ({
     listAshbyScopedReviewNotes: (...a: any[]) => mockApi.listAshbyScopedReviewNotes(...a),
     getSession: (...a: any[]) => mockApi.getSession(...a),
     getRecordingDownloadUrl: (...a: any[]) => mockApi.getRecordingDownloadUrl(...a),
+    getAshbyScopedReviewWorkflow: (...a: any[]) => mockApi.getAshbyScopedReviewWorkflow(...a),
   },
   ApiError: class extends Error {
     status: number;
@@ -205,5 +207,38 @@ describe('parked SSO return-to', () => {
     await screen.findByText('Jane Doe');
 
     expect(window.sessionStorage.getItem('unrelated.key')).toBe('keep-me');
+  });
+});
+
+describe('Ashby pipeline card in the scoped review Overview', () => {
+  it('reads the workflow through the link scope only — never a candidate id', async () => {
+    mockApi.getAshbyScopedReviewWorkflow.mockResolvedValue({
+      ok: true,
+      workflow: {
+        lifecycle: 'writeback_pending',
+        terminalState: null,
+        ingestionState: 'ready',
+        operations: [{ type: 'scorecard_write', state: 'failed', errorCode: 'provider_5xx' }],
+        sessionStatus: 'completed',
+        updatedAt: '2026-08-20T10:00:00.000Z',
+      },
+    });
+    renderPage();
+    // Wait for the resolved card, not the identically-headed loading state.
+    expect(await screen.findByText('Writing results back to Ashby')).toBeInTheDocument();
+    expect(mockApi.getAshbyScopedReviewWorkflow).toHaveBeenCalledWith(LINK_ID);
+    expect(screen.getByText('provider_5xx')).toBeInTheDocument();
+
+    // No new access and no new navigation: the card adds no control or link.
+    const region = screen.getByRole('region', { name: 'Ashby screening pipeline' });
+    expect(region.querySelectorAll('button, a, input, select, textarea')).toHaveLength(0);
+  });
+
+  it('renders no card when the linked candidate has no Ashby workflow', async () => {
+    mockApi.getAshbyScopedReviewWorkflow.mockResolvedValue({ ok: true, workflow: null });
+    renderPage();
+    await screen.findByText('Jane Doe');
+    await waitFor(() => expect(mockApi.getAshbyScopedReviewWorkflow).toHaveBeenCalledWith(LINK_ID));
+    expect(screen.queryByText('Ashby screening pipeline')).not.toBeInTheDocument();
   });
 });

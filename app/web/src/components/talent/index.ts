@@ -21,6 +21,12 @@ export type {
   SessionsSummaryProps,
   NotesListProps,
 } from './CandidateOverviewSections';
+export { AshbyWorkflowCard, AshbyWorkflowCardView } from './AshbyWorkflowCard';
+export type {
+  AshbyWorkflowCardProps,
+  AshbyWorkflowCardViewProps,
+  AshbyWorkflowSource,
+} from './AshbyWorkflowCard';
 export { TranscriptionSyncWorkspace } from './TranscriptionSyncWorkspace';
 export type { TranscriptionSyncWorkspaceProps } from './TranscriptionSyncWorkspace';
 export {

@@ -22,6 +22,7 @@ const mockApi = {
   startLiveKitScreening: vi.fn().mockRejectedValue(new Error('mock')),
   issueLiveKitInvite: vi.fn(),
   getSession: vi.fn(),
+  getCandidateAshbyWorkflow: vi.fn().mockResolvedValue({ ok: true, workflow: null }),
 };
 
 vi.mock('../api', () => ({
@@ -36,6 +37,7 @@ vi.mock('../api', () => ({
     startLiveKitScreening: (...args: any[]) => mockApi.startLiveKitScreening(...args),
     issueLiveKitInvite: (...args: any[]) => mockApi.issueLiveKitInvite(...args),
     getSession: (...args: any[]) => mockApi.getSession(...args),
+    getCandidateAshbyWorkflow: (...args: any[]) => mockApi.getCandidateAshbyWorkflow(...args),
   },
   ApiError: class extends Error {
     status: number;

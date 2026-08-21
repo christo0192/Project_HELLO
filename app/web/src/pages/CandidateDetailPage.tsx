@@ -7,6 +7,7 @@ import { LiveKitCallCard } from "../components/LiveKitCallCard";
 import { Button, Card, Chip, ErrorState, LoadingState } from "../components/ui";
 import { PageHeader, StatusBadge } from "../components/design";
 import {
+  AshbyWorkflowCard,
   CandidateProfileCard,
   DecisionBlockedBanner,
   NotesList,
@@ -143,6 +144,10 @@ function OverviewTab({
           candidateId={candidate.id}
           candidateName={candidate.name || undefined}
         />
+
+        {/* Read-only Ashby pipeline status. Renders nothing for a candidate
+            with no Ashby application link. */}
+        <AshbyWorkflowCard source={{ kind: "candidate", candidateId: candidate.id }} />
 
         <SessionsSummary sessions={sessions} />
 
