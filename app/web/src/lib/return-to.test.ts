@@ -11,6 +11,7 @@ import {
   ashbyReviewPath,
   rememberReturnTo,
   consumeReturnTo,
+  clearReturnTo,
   resetReturnToReplay,
 } from './return-to';
 
@@ -129,6 +130,58 @@ describe('rememberReturnTo / consumeReturnTo', () => {
     try {
       expect(() => rememberReturnTo(`/ashby/review/${UUID}`, NOW)).not.toThrow();
       expect(consumeReturnTo(NOW)).toBeNull();
+    } finally {
+      if (original) Object.defineProperty(window, 'sessionStorage', original);
+    }
+  });
+});
+
+/**
+ * The destination page is the OTHER consume point.
+ *
+ * On the provider-honoured redirect path the browser lands directly on the deep
+ * link and `PostAuthLanding` never runs, so without an explicit clear the parked
+ * entry survived its full TTL and re-routed the next visit to `/`.
+ */
+describe('clearReturnTo — arrival kills the parked entry', () => {
+  const UUID_ = '11111111-1111-4111-8111-111111111111';
+  const NOW_ = 1_700_000_000_000;
+
+  beforeEach(() => {
+    resetReturnToReplay();
+    window.sessionStorage.clear();
+  });
+
+  it('makes a later landing-route visit fall back instead of replaying', () => {
+    rememberReturnTo(`/ashby/review/${UUID_}`, NOW_);
+    clearReturnTo();
+    expect(window.sessionStorage.getItem('ashby.returnTo')).toBeNull();
+    // Well inside both the 10-minute TTL and the 5-second replay window.
+    expect(consumeReturnTo(NOW_ + 1000)).toBeNull();
+  });
+
+  it('drops the StrictMode replay memo too, so a consumed value cannot replay', () => {
+    rememberReturnTo(`/ashby/review/${UUID_}`, NOW_);
+    expect(consumeReturnTo(NOW_)).toBe(`/ashby/review/${UUID_}`);
+    // Without a clear this would replay for CONSUME_REPLAY_MS.
+    expect(consumeReturnTo(NOW_ + 100)).toBe(`/ashby/review/${UUID_}`);
+    clearReturnTo();
+    expect(consumeReturnTo(NOW_ + 200)).toBeNull();
+  });
+
+  it('is idempotent and a no-op when nothing is parked', () => {
+    expect(() => { clearReturnTo(); clearReturnTo(); }).not.toThrow();
+    expect(consumeReturnTo(NOW_)).toBeNull();
+  });
+
+  it('degrades quietly when storage is unavailable', () => {
+    const original = Object.getOwnPropertyDescriptor(window, 'sessionStorage');
+    Object.defineProperty(window, 'sessionStorage', {
+      configurable: true,
+      get() { throw new Error('storage disabled'); },
+    });
+    try {
+      expect(() => clearReturnTo()).not.toThrow();
     } finally {
       if (original) Object.defineProperty(window, 'sessionStorage', original);
     }

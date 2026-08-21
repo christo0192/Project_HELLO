@@ -64,6 +64,10 @@ class SyntheticStore implements WorkflowStores {
     this.ops.push({ id, linkId: input.applicationLinkId, type: input.operationType, key: input.operationKey, dependsOn: input.dependsOn, marker: input.marker, state: 'pending' });
     return { status: 'inserted', id };
   }
+  async findScorecardWriteOperation(applicationLinkId: string): Promise<{ id: string } | null> {
+    const hit = this.ops.find((o) => o.linkId === applicationLinkId && o.type === 'scorecard_write');
+    return hit ? { id: hit.id } : null;
+  }
   async completeOperation(id: string): Promise<'ok' | 'not_owned'> {
     const op = this.ops.find((o) => o.id === id);
     if (op) op.state = 'succeeded';

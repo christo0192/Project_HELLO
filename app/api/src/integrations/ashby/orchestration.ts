@@ -112,6 +112,22 @@ export interface WorkflowStores {
     marker?: string | null;
   }): Promise<EnqueueResult>;
   /**
+   * Does this application link ALREADY have a `scorecard_write` operation — in
+   * ANY state, under ANY historical operation key or marker?
+   *
+   * An Ashby scorecard cannot be retracted, so at most one may ever exist per
+   * link. The `(provider, operation_key)` unique constraint enforces that only
+   * for rows written under the current link-derived key; a legacy row keyed on
+   * the pre-repair `ashby:scorecard:<extAppId>:<marker>` shape (whose marker
+   * also changed when it stopped hashing the review path) misses BOTH unique
+   * constraints, so the admission read is the only guard that catches it.
+   *
+   * Optional purely so existing fakes keep compiling — {@link enqueueScorecard}
+   * FAILS CLOSED when it is absent rather than falling through to the generic
+   * `enqueueOperation` passthrough.
+   */
+  findScorecardWriteOperation?(applicationLinkId: string): Promise<{ id: string } | null>;
+  /**
    * Backfill the opaque resume handle onto an EXISTING link that has none.
    * Optional so every existing fake keeps compiling; when absent the backfill
    * is simply skipped. Implementations must never overwrite a non-null handle.
@@ -416,11 +432,33 @@ export interface SagaDeps {
  * how the content marker (or the review path inside it) changes — an Ashby
  * scorecard cannot be retracted. A duplicate key or marker short-circuits
  * (already written).
+ *
+ * The unique key only covers rows written under the CURRENT key shape, so a
+ * link-scoped admission read through {@link WorkflowStores.findScorecardWriteOperation}
+ * runs first and also catches legacy rows (old `ashby:scorecard:<extAppId>:<marker>`
+ * key, pre-repair review-path marker). Missing or failing seam ⇒ blocked, never
+ * a fall-through to the generic enqueue.
  */
 export async function enqueueScorecard(source: ScorecardSource, deps: SagaDeps): Promise<SagaResult> {
   if (!deps.gates.enabled) return { status: 'disabled' };
   const built = buildScorecard(source, deps.scale);
   if (!built.ok) return { status: 'blocked_scorecard', reason: built.reason };
+  // LINK-SCOPED admission, ahead of the enqueue and independent of any key or
+  // marker shape — the same guard the authoritative `enqueueScorecardWrite`
+  // seam applies, reached through the store rather than re-implemented here.
+  if (!deps.stores.findScorecardWriteOperation) {
+    // No admission seam ⇒ no way to see a legacy row ⇒ refuse to enqueue.
+    return { status: 'blocked_scorecard', reason: 'scorecard_admission_unavailable' };
+  }
+  let existing: { id: string } | null;
+  try {
+    existing = await deps.stores.findScorecardWriteOperation(deps.applicationLinkId);
+  } catch {
+    // Fail closed: a lookup we could not complete must never be read as
+    // "no scorecard yet" and produce a second, unretractable provider write.
+    return { status: 'blocked_scorecard', reason: 'scorecard_admission_error' };
+  }
+  if (existing) return { status: 'scorecard_duplicate', marker: built.marker };
   const res = await deps.stores.enqueueOperation({
     applicationLinkId: deps.applicationLinkId,
     operationType: 'scorecard_write',

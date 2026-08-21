@@ -19,6 +19,9 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import { createWorkflowStores } from '../integrations/ashby/workflow-stores.js';
+import { enqueueScorecard } from '../integrations/ashby/orchestration.js';
+import type { WorkflowStores } from '../integrations/ashby/orchestration.js';
+import type { ScorecardSource } from '../integrations/ashby/scorecard.js';
 
 const LINK_ID = '11111111-1111-4111-8111-111111111111';
 const SESSION_ID = '22222222-2222-4222-8222-222222222222';
@@ -151,5 +154,107 @@ describe('enqueueScorecardWrite — one scorecard per application link, ever', (
     const noAssessmentStores = createWorkflowStores(noAssessment.client as never);
     expect(await noAssessmentStores.enqueueScorecardWrite!(LINK_ID, SESSION_ID)).toEqual({ status: 'assessment_missing' });
     expect(noAssessment.rpc).not.toHaveBeenCalled();
+  });
+});
+
+// ── The saga entry point uses the SAME guard ────────────────────────────────
+//
+// `orchestration.enqueueScorecard` is exported (and re-exported from
+// integrations/ashby/index.ts), so it is a second door onto the same
+// unretractable provider write. It must not be able to reach `enqueueOperation`
+// on a link that already carries a scorecard_write row — including a legacy row
+// whose operation_key and marker both predate the link-scoped repair and
+// therefore miss `uq_ashby_operations_key` AND `uq_ashby_operations_marker`.
+
+const AI_STAGE = 'stage_ai';
+
+function sagaSource(): ScorecardSource {
+  return {
+    overallScore: 72,
+    recommendation: 'advance',
+    dimensions: [{ key: 'communication', score: 3 }],
+    summary: 'Synthetic summary.',
+    provenance: { model: 'm', scoredAt: '2026-08-20T00:00:00Z', version: 'v1' },
+    reviewPath: `/ashby/review/${LINK_ID}`,
+  };
+}
+
+function sagaDeps(stores: WorkflowStores) {
+  return {
+    gates: { enabled: true, email: { providerApproved: false, domainVerified: false } },
+    stores,
+    client: {
+      applicationInfo: (async () => ({
+        results: { id: 'app_1', currentInterviewStage: { id: AI_STAGE } },
+        moreDataAvailable: false,
+      })) as never,
+    },
+    scale: { min: 1, max: 4 },
+    applicationLinkId: LINK_ID,
+    externalApplicationId: 'app_1',
+    aiScreeningStageId: AI_STAGE,
+  };
+}
+
+describe('enqueueScorecard (saga) — cannot bypass the link-scoped admission', () => {
+  it('refuses a link that already has a LEGACY-keyed scorecard row', async () => {
+    // Legacy shape: key `ashby:scorecard:<extAppId>:<oldMarker>` and a marker
+    // computed while the review path was still hashed. Both unique constraints
+    // miss it; only the admission read sees it.
+    const { client, rpc } = fakeClient({
+      ashby_operations: { data: { id: 'op_legacy' }, error: null },
+    });
+    const stores = createWorkflowStores(client as never);
+
+    const result = await enqueueScorecard(sagaSource(), sagaDeps(stores));
+
+    expect(result.status).toBe('scorecard_duplicate');
+    // Nothing was enqueued: the RPC that mints the operation never ran.
+    expect(rpc).not.toHaveBeenCalled();
+  });
+
+  it('performs the initial write when the link has no scorecard row', async () => {
+    const { client, rpc } = fakeClient({ ashby_operations: { data: null, error: null } });
+    const stores = createWorkflowStores(client as never);
+
+    const result = await enqueueScorecard(sagaSource(), sagaDeps(stores));
+
+    expect(result.status).toBe('scorecard_enqueued');
+    expect(rpc).toHaveBeenCalledTimes(1);
+    const [fn, args] = rpc.mock.calls[0] as unknown as [string, Record<string, unknown>];
+    expect(fn).toBe('enqueue_ashby_operation');
+    expect(args.p_operation_key).toBe(`ashby:scorecard:link:${LINK_ID}`);
+  });
+
+  it('fails closed when the admission read errors', async () => {
+    const { client, rpc } = fakeClient({
+      ashby_operations: { data: null, error: { message: 'connection reset' } },
+    });
+    const stores = createWorkflowStores(client as never);
+
+    const result = await enqueueScorecard(sagaSource(), sagaDeps(stores));
+
+    expect(result).toEqual({ status: 'blocked_scorecard', reason: 'scorecard_admission_error' });
+    expect(rpc).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when a store offers no admission seam at all', async () => {
+    const enqueued: unknown[] = [];
+    const seamless = {
+      findLinkByApplicationId: async () => null,
+      createLink: async () => ({ id: LINK_ID }),
+      advanceIngestion: async () => ({ status: 'ok' }),
+      enqueueOperation: async (input: unknown) => {
+        enqueued.push(input);
+        return { status: 'inserted', id: 'op_1' };
+      },
+      completeOperation: async () => 'ok' as const,
+      failOperation: async () => ({ outcome: 'retry' as const }),
+    } as unknown as WorkflowStores;
+
+    const result = await enqueueScorecard(sagaSource(), sagaDeps(seamless));
+
+    expect(result).toEqual({ status: 'blocked_scorecard', reason: 'scorecard_admission_unavailable' });
+    expect(enqueued).toEqual([]);
   });
 });

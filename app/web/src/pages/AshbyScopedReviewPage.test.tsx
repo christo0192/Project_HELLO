@@ -6,11 +6,13 @@
  * no global navigation, no backlinks, no actions, and one indistinguishable
  * "not available" state for unknown / malformed / unowned links.
  */
+import { StrictMode } from 'react';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { AshbyScopedReviewPage } from './AshbyScopedReviewPage';
 import { mockCandidateDetail, mockSessionDetail } from '../test/helpers';
+import { rememberReturnTo, consumeReturnTo, resetReturnToReplay } from '../lib/return-to';
 
 const LINK_ID = '11111111-1111-4111-8111-111111111111';
 
@@ -60,6 +62,8 @@ beforeEach(() => {
   mockApi.getAshbyScopedReview.mockResolvedValue(mockCandidateDetail);
   mockApi.listAshbyScopedReviewNotes.mockResolvedValue({ notes: [] });
   mockApi.getSession.mockResolvedValue(mockSessionDetail);
+  resetReturnToReplay();
+  window.sessionStorage.clear();
 });
 
 describe('scoped review shell', () => {
@@ -142,5 +146,64 @@ describe('unresolvable links', () => {
     renderPage();
     expect(await screen.findByText('Internal server error')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /try again/i })).toBeInTheDocument();
+  });
+});
+
+/**
+ * Arrival consumes the parked SSO return-to.
+ *
+ * On the provider-honoured deep-link path Supabase returns the browser straight
+ * to /ashby/review/<id>, so `PostAuthLanding` — the fallback path's consumer —
+ * never runs. Without this the parked entry lived out its 10-minute TTL and
+ * silently re-routed the next visit to `/` in the same tab.
+ */
+describe('parked SSO return-to', () => {
+  const PARKED = `/ashby/review/${LINK_ID}`;
+
+  it('is cleared once the page mounts, so a later landing visit cannot replay it', async () => {
+    rememberReturnTo(PARKED);
+    expect(window.sessionStorage.getItem('ashby.returnTo')).not.toBeNull();
+
+    renderPage();
+    await screen.findByText('Jane Doe');
+
+    expect(window.sessionStorage.getItem('ashby.returnTo')).toBeNull();
+    // What `PostAuthLanding` would read on a later visit to `/`: nothing.
+    expect(consumeReturnTo()).toBeNull();
+  });
+
+  it('is cleared even when the link resolves to the unavailable state', async () => {
+    rememberReturnTo(PARKED);
+    mockApi.getAshbyScopedReview.mockRejectedValue(new MockApiError('not found', 404));
+
+    renderPage();
+    await screen.findByText(/not available/i);
+
+    expect(consumeReturnTo()).toBeNull();
+  });
+
+  it('survives a StrictMode double mount without throwing or resurrecting', async () => {
+    rememberReturnTo(PARKED);
+    render(
+      <StrictMode>
+        <MemoryRouter initialEntries={[`/ashby/review/${LINK_ID}`]}>
+          <Routes>
+            <Route path="/ashby/review/:applicationLinkId" element={<AshbyScopedReviewPage />} />
+          </Routes>
+        </MemoryRouter>
+      </StrictMode>,
+    );
+    await screen.findByText('Jane Doe');
+    expect(consumeReturnTo()).toBeNull();
+  });
+
+  it('clears only its own key, never the rest of sessionStorage', async () => {
+    window.sessionStorage.setItem('unrelated.key', 'keep-me');
+    rememberReturnTo(PARKED);
+
+    renderPage();
+    await screen.findByText('Jane Doe');
+
+    expect(window.sessionStorage.getItem('unrelated.key')).toBe('keep-me');
   });
 });

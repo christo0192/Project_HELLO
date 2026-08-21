@@ -14,6 +14,11 @@
  *     actions (start a call, add a note, issue an appeal grant, export CSV).
  *     Those stay on the unchanged full workspace page.
  *   - No PII in the URL: the address is the opaque application link id only.
+ *   - Terminal for the SSO deep link: reaching this page means the parked
+ *     return-to has served its purpose, so it is cleared on mount. On the
+ *     provider-honoured redirect path the browser lands here directly and
+ *     `PostAuthLanding` never runs, so this is the only consumer — without it
+ *     the parked entry lived out its TTL and re-routed a later visit to `/`.
  *
  * Unknown, malformed, unauthorized and unowned links are indistinguishable —
  * the API answers all four with the same 404 and this page shows one generic
@@ -25,6 +30,7 @@ import { useParams } from 'react-router-dom';
 import { api, ApiError } from '../api';
 import type { CandidateDetail, Note } from '../types';
 import { Card, ErrorState, LoadingState } from '../components/ui';
+import { clearReturnTo } from '../lib/return-to';
 import { StatusBadge } from '../components/design';
 import {
   CandidateProfileCard,
@@ -62,6 +68,10 @@ export function AshbyScopedReviewPage() {
         setError(e.status === 404 || e.status === 403 ? UNAVAILABLE : e.message),
       );
   }, [applicationLinkId]);
+
+  // Arrival is the consume point for the parked SSO return-to, whichever
+  // landing path got us here and regardless of what the API then answers.
+  useEffect(clearReturnTo, []);
 
   useEffect(load, [load]);
 

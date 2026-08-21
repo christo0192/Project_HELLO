@@ -46,7 +46,15 @@ export function sanitizeReturnTo(value: unknown): string | null {
  * and the read, so storage is not a trust boundary — a tampered value simply
  * fails the exact-path allowlist and the caller lands on its normal route. The
  * entry is single-use (deleted on read), same-tab only (sessionStorage), and
- * expires, so it can never silently re-route a later visit.
+ * expires.
+ *
+ * There are TWO landing paths, and the entry must die on either:
+ *   - the FALLBACK path (Supabase returns to the site URL) runs through
+ *     `PostAuthLanding`, which consumes and deletes it;
+ *   - the PROVIDER-HONOURED path (the deep link is a registered redirect URL)
+ *     lands straight on the review page, so `PostAuthLanding` never runs — the
+ *     page itself calls `clearReturnTo` on mount. Without that the entry
+ *     survived its full TTL and re-routed a later visit to `/` in the same tab.
  */
 
 const RETURN_TO_KEY = 'ashby.returnTo';
@@ -71,6 +79,24 @@ export function rememberReturnTo(value: unknown, now: number = Date.now()): void
   } catch {
     /* storage unavailable (private mode, disabled) — deep link degrades to the
        normal landing route, never to an error. */
+  }
+}
+
+/**
+ * Drop a parked return-to because the destination has been REACHED — the scoped
+ * review page mounted, so no landing route should ever replay this value again.
+ *
+ * Also drops the StrictMode replay memo: the memo exists only to survive the
+ * double-mount of the landing route, and by the time the destination page is
+ * mounted the landing route is gone. Idempotent, and safe when storage is
+ * unavailable.
+ */
+export function clearReturnTo(): void {
+  lastConsumed = null;
+  try {
+    window.sessionStorage.removeItem(RETURN_TO_KEY);
+  } catch {
+    /* storage unavailable — nothing was parked, so nothing to clear. */
   }
 }
 

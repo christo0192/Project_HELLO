@@ -41,6 +41,7 @@ class FakeStores implements WorkflowStores {
   createdResumeHandle: string | null | undefined;
   advanceResult: { status: string; state?: string } = { status: 'ok' };
   enqueueResult: EnqueueResult = { status: 'inserted', id: 'op_1' };
+  admissionError = false;
   private n = 0;
 
   async findLinkByApplicationId(appId: string): Promise<ExistingLinkRow | null> {
@@ -59,6 +60,12 @@ class FakeStores implements WorkflowStores {
   async enqueueOperation(input: { applicationLinkId: string; operationType: string; operationKey: string; dependsOn?: string | null; marker?: string | null }): Promise<EnqueueResult> {
     this.operations.push({ linkId: input.applicationLinkId, type: input.operationType, key: input.operationKey, dependsOn: input.dependsOn, marker: input.marker });
     return this.enqueueResult;
+  }
+  /** Link-scoped admission read over whatever scorecard rows exist (any key/marker). */
+  async findScorecardWriteOperation(applicationLinkId: string): Promise<{ id: string } | null> {
+    if (this.admissionError) throw new Error('ashby_scorecard_admission_error');
+    const hit = this.operations.find((o) => o.linkId === applicationLinkId && o.type === 'scorecard_write');
+    return hit ? { id: 'op_existing' } : null;
   }
   async completeOperation(): Promise<'ok' | 'not_owned'> { return 'ok'; }
   async failOperation(): Promise<{ outcome: 'retry' | 'failed' } | 'not_owned'> { return { outcome: 'retry' }; }
