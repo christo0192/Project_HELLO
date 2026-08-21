@@ -1,11 +1,15 @@
 -- =====================================================================
--- 0040 concurrency assertions — run AFTER three concurrent
--- `recover_ashby_ingestion_parse` calls have raced the fixture created by
--- `recovery_concurrency_setup.sql`.
+-- 0040 concurrency assertions — run AFTER three `recover_ashby_ingestion_parse`
+-- sessions, proven blocked on the same row lock, have been released to
+-- contend for the fixture created by `recovery_concurrency_setup.sql`.
 --
--- The shell harness asserts the three RETURNED statuses (exactly one `ok`,
--- two `not_recoverable`). This script asserts the DURABLE consequences,
--- which is where a serialisation defect would actually show up:
+-- The shell harness asserts two things this script cannot see: that all
+-- three sessions were genuinely PARKED on a lock before the blocker was
+-- released (the proof that the lock exists and is the serialiser), and
+-- the three RETURNED statuses (exactly one `ok`, two `not_recoverable`).
+--
+-- This script asserts the DURABLE consequences, which is where a
+-- serialisation defect would actually show up:
 --
 --   * ONE attempt charged — not three; the bounded budget is the whole
 --     point of the audited door;
@@ -14,12 +18,20 @@
 --     re-scan and re-parse the same resume;
 --   * the row genuinely `queued`, i.e. the winner really did the work.
 --
+-- Parameterised to match the setup, one link id per phase:
+--   psql -v link_id=<uuid> -v tag=<slug> -f recovery_concurrency_assert.sql
+--
 -- Raises (and therefore fails the suite) on any violation.
 -- =====================================================================
 
+-- `\g /dev/null` keeps the parameter plumbing out of the suite's output.
+select set_config('pol40c.link', :'link_id', false),
+       set_config('pol40c.tag',  :'tag',     false) \g /dev/null
+
 do $$
 declare
-  v_link  constant uuid := '40000000-0000-4000-8000-0000000000c1';
+  v_link  constant uuid := current_setting('pol40c.link')::uuid;
+  v_tag   constant text := current_setting('pol40c.tag');
   v_att   integer;
   v_state text;
   v_jobs  integer;
@@ -64,14 +76,15 @@ begin
     raise exception 'pol40c FAIL: the raced job carries an unexpected payload: %', v_payload;
   end if;
 
-  raise notice 'pol40c PASS: three concurrent recoveries charged 1 attempt, wrote 1 audit row and admitted exactly 1 live ashby.ingestion job';
+  raise notice 'pol40c PASS (%): three CONTENDING recoveries charged 1 attempt, wrote 1 audit row and admitted exactly 1 live ashby.ingestion job', v_tag;
 
-  -- Teardown. Audit rows are append-only (0007) and deliberately left behind.
+  -- Teardown. Audit rows are append-only (0007) and deliberately left
+  -- behind — which is exactly why each phase uses its own link id.
   delete from screening_v2.job_queue
    where dedup_key = 'ashby:ingestion:' || v_link::text;
   delete from screening_v2.ashby_operations where application_link_id = v_link;
   delete from screening_v2.ashby_resume_ingestions where application_link_id = v_link;
   delete from screening_v2.ashby_application_links where id = v_link;
-  delete from screening_v2.ashby_job_mappings where external_job_id = 'pol40c-job';
+  delete from screening_v2.ashby_job_mappings where external_job_id = v_tag || '-job';
 end;
 $$;

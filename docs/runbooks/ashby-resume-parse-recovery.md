@@ -193,18 +193,55 @@ status.
 **It is not a counter reset.** It performs the ordinary
 `failed_review -> queued` transition and charges an attempt against the same
 five-requeue ceiling, so an exhausted row answers `retry_exhausted` and stays
-rested. **It is atomic** (0040): the transition, the attempt charge, the audit
-row and the `ashby.ingestion` queue job are one transaction, and a concurrent
-second click is refused with `not_recoverable` rather than charging a second
-attempt or admitting a second job.
+rested. This is deliberately different from 0036, which zeroes the counter for a
+transport defect proven to have recorded one fault five times.
+
+**It is atomic** (0040): the transition, the attempt charge, the audit row and
+the `ashby.ingestion` queue job are one transaction, and a concurrent second
+click is refused with `not_recoverable` rather than charging a second attempt or
+admitting a second job.
 
 Two refusals are specific to the queue admission, and neither spends anything:
 
 | 409 `error` | meaning | what to do |
 |---|---|---|
-| `ingestion_job_in_flight` | a worker has already claimed an `ashby.ingestion` job for this link — the row is `failed_review` only because the handler has not returned yet | wait a few seconds and retry; no attempt was charged |
-| a 500 `mission_control_action_error` on this route | the queue job could not be made durable, so the whole recovery rolled back | retry; the row is still `failed_review` with its full budget | This is deliberately different from 0036, which zeroes the counter for a
-transport defect proven to have recorded one fault five times.
+| `ingestion_job_in_flight` | a worker has already claimed an `ashby.ingestion` job for this link — the row is `failed_review` only because the handler has not returned yet | normally clears within one lease; see below if it persists |
+| a 500 `mission_control_action_error` on this route | the queue job could not be made durable, so the whole recovery rolled back | retry; the row is still `failed_review` with its full budget |
+
+#### When `ingestion_job_in_flight` does not clear
+
+The refusal is honest — the dedup index forbids a second live job while one is
+`active`, so the recovery cannot admit work and will not pretend it did. But the
+only thing that returns an `active` job to `pending` is
+`reclaim_expired_jobs` (0028), and **that runs only from the `reclaim` scheduler
+loop inside `createAshbyWorkers`**. With `ASHBY_RUNTIME_ENABLED` false — the
+shipped default — nothing sweeps expired leases, so a job left `active` by a
+machine that stopped mid-claim (the Fly `auto_stop_machines` case that loop
+exists for) pins the row at `ingestion_job_in_flight` indefinitely.
+
+Diagnose before waiting any longer:
+
+```sql
+select status, lease_owner, lease_expires_at, attempts, max_attempts
+  from screening_v2.job_queue
+ where dedup_key = 'ashby:ingestion:<applicationLinkId>'
+   and status in ('pending','active','delayed');
+```
+
+- `status = 'active'` with `lease_expires_at` **in the future** — a worker
+  genuinely holds it. Wait out the lease and retry; nothing is wrong.
+- `status = 'active'` with `lease_expires_at` **in the past** — the claim is
+  wedged. It is *eligible* for reclaim (every Ashby claim goes through
+  `claim_job`, which always stamps a lease), but reclaim only runs while the
+  runtime does. **Re-enable the Ashby runtime** and let the `reclaim` loop
+  requeue it — one pass returns it to `pending`, or dead-letters it if its job
+  attempts are exhausted, and the retry then succeeds normally.
+- **no row at all** — nothing is in flight; the refusal came from a job that
+  completed between your two clicks. Retry immediately.
+
+Do not clear the row by hand. A manual `update … set status='completed'` leaves
+the ingestion `queued` with nothing runnable, which is the exact defect 0040
+exists to remove.
 
 | `failed_reason` | retryable here? |
 |---|---|
