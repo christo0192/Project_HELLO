@@ -37,7 +37,7 @@
 import { useId } from 'react';
 import type { ReactNode } from 'react';
 import type { Assessment, Recommendation } from '../../types';
-import { Meter, SurfaceCard, Tag } from '../design';
+import { Meter, SurfaceCard, Tag } from '../design/candidate';
 import { cx } from '../design/cx';
 
 /** Fixed rubric weights — the same values the legacy card printed. */

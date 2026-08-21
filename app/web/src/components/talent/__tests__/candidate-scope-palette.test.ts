@@ -44,6 +44,7 @@ const CANDIDATE_SCOPE_SOURCES = [
   'src/components/design/Meter.tsx',
   'src/components/design/Tag.tsx',
   'src/components/design/CandidateControls.tsx',
+  'src/components/design/candidate.ts',
 ];
 
 /**

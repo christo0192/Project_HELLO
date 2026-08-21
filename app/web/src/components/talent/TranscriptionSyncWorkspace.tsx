@@ -29,12 +29,12 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../../api';
 import type { Assessment, Session, TranscriptLine } from '../../types';
+import { StatusBadge } from '../design';
 import {
   CandidateErrorState,
   CandidateSelect,
-  StatusBadge,
   SurfaceCard,
-} from '../design';
+} from '../design/candidate';
 import { CandidateScorecard } from './CandidateScorecard';
 import { RecordingPlayer } from './RecordingPlayer';
 import type { RecordingPlayerHandle } from './RecordingPlayer';

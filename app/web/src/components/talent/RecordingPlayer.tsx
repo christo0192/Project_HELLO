@@ -12,7 +12,7 @@
 
 import { useCallback, useEffect, useImperativeHandle, useRef, useState, forwardRef } from 'react';
 import { api, ApiError } from '../../api';
-import { CandidateButton } from '../design';
+import { CandidateButton } from '../design/candidate';
 import { cx } from '../design/cx';
 
 export interface RecordingPlayerHandle {

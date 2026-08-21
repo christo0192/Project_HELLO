@@ -91,7 +91,7 @@ three source files and fails if the block falls behind.
 
 | Primitive | Contract |
 |---|---|
-| `SurfaceCard` | Two levels — `base` (bordered white card) and `sunken` (tinted well inside a card). A third nesting level **throws**; `MAX_SURFACE_DEPTH` is 2. |
+| `SurfaceCard` | Two levels — `base` (bordered white card) and `sunken` (tinted well inside a card). A third nesting level is reported and clamped; `MAX_SURFACE_DEPTH` is 2. |
 | `Meter` | `role="meter"` with `aria-valuenow/min/max`, `aria-valuetext`, and an accessible name from its visible label. Always renders the number in monospace tabular figures **and** the band word (`Low` / `Fair` / `Strong`). Colour is the third signal. 8px track (12px for the overall score). |
 | `Tag` | Tone as tint + ring, label as high-contrast ink, plus an optional screen-reader classification prefix. |
 | `CandidateButton` / `CandidateInput` / `CandidateSelect` / `CandidateLabel` / states | Token-only stand-ins for the frozen `components/ui` primitives, same props and copy, 44px minimum targets. |
@@ -103,6 +103,24 @@ Depth is enforced by React context, not by review. The scorecard's own
 sections are level 1 and their sunken blocks level 2, so the Review tab
 wraps the card in a plain `<section>` with a heading rather than a third
 card.
+
+An overflowing level is **reported and clamped, never fatal**. The test
+harness fails on an unexpected `console.error`, so a composition mistake
+stops CI exactly as a thrown error would, while a production page keeps
+rendering — blanking a recruiter's candidate view over a visual-hierarchy
+rule would be a far worse outcome than one card too many. Gating a throw on
+`import.meta.env.DEV` was tried and rejected: `scripts/check-env-contract.mjs`
+treats every `import.meta.env.X` read as a schema obligation, so the guard
+would have added a fake runtime variable to the environment contract.
+
+### Where the primitives live
+
+They are exported from `components/design/candidate.ts`, **not** from the
+shared `components/design` barrel. That barrel is imported by Mission
+Control, Session Detail, the Dashboard and the auth pages, none of which
+render inside `.candidate-scope`; re-exporting from there would make all of
+them load modules they can never use, and would stop `design/index.ts` being
+identical to `main` for no benefit.
 
 ---
 
@@ -169,6 +187,8 @@ declare no transition at all.
 Verified mechanically, on every run:
 
 - exact palette literals, and `.dark` equality
+- the environment contract (`scripts/check-env-contract.mjs`), which the
+  candidate code adds no runtime variable to
 - zero stock-Tailwind / brand / raw-literal / `dark:` colour sources in candidate-scoped code
 - compatibility coverage for every utility the frozen embedded components use
 - WCAG 2.1 contrast arithmetic over the pairs the design actually uses, with a failing weak-pair control and the published 21:1 / 1:1 reference values

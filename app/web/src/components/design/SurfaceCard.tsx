@@ -55,20 +55,22 @@ export function SurfaceCard({
   const depth = useContext(SurfaceDepthContext);
   const nextDepth = depth + 1;
 
-  if (nextDepth > MAX_SURFACE_DEPTH && import.meta.env.DEV) {
-    // Loud in development and in tests, where a composition mistake should
-    // stop the build. NEVER in production: this invariant is about visual
-    // hierarchy, and blanking a recruiter's candidate page over it would be
-    // a far worse outcome than one card too many. There the depth is simply
-    // clamped, so the extra level renders as the sunken level it already is.
-    throw new Error(
+  const overflowed = nextDepth > MAX_SURFACE_DEPTH;
+  if (overflowed) {
+    // Loud, but never fatal. The test harness fails on an unexpected
+    // console.error, so a composition mistake stops CI exactly as a throw
+    // would; in production the page keeps rendering, because blanking a
+    // recruiter's candidate view over a visual-hierarchy rule would be a
+    // far worse outcome than one card too many. The extra level is clamped
+    // to the sunken level it already is.
+    console.error(
       `SurfaceCard nested ${nextDepth} levels deep; the candidate experience allows at most ${MAX_SURFACE_DEPTH}.`,
     );
   }
 
   const Component = (as ?? 'div') as ElementType;
   const clampedDepth = Math.min(nextDepth, MAX_SURFACE_DEPTH);
-  const effectiveLevel: SurfaceLevel = nextDepth > MAX_SURFACE_DEPTH ? 'sunken' : level;
+  const effectiveLevel: SurfaceLevel = overflowed ? 'sunken' : level;
 
   return (
     <SurfaceDepthContext.Provider value={clampedDepth}>
@@ -79,6 +81,7 @@ export function SurfaceCard({
         aria-labelledby={labelledBy}
         data-surface-level={effectiveLevel}
         data-surface-depth={clampedDepth}
+        data-surface-overflow={overflowed ? 'true' : undefined}
       >
         {children}
       </Component>

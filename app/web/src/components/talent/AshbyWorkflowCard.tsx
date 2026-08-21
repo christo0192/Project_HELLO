@@ -32,7 +32,8 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError } from '../../api';
 import type { AshbyCandidateWorkflow, AshbyCandidateWorkflowOperation } from '../../types';
-import { StatusBadge, SurfaceCard, type StatusTone } from '../design';
+import { StatusBadge, type StatusTone } from '../design';
+import { SurfaceCard } from '../design/candidate';
 import { formatDateTime } from '../../lib/datetime';
 import { sessionStatusLabel, sessionStatusTone } from './status';
 

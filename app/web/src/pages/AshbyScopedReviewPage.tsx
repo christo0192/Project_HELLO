@@ -30,12 +30,12 @@ import { useParams } from 'react-router-dom';
 import { api, ApiError } from '../api';
 import type { CandidateDetail, Note } from '../types';
 import { clearReturnTo } from '../lib/return-to';
+import { StatusBadge } from '../components/design';
 import {
   CandidateErrorState,
   CandidateLoadingState,
-  StatusBadge,
   SurfaceCard,
-} from '../components/design';
+} from '../components/design/candidate';
 import {
   AshbyWorkflowCard,
   CandidateHeader,

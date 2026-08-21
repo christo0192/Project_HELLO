@@ -19,7 +19,7 @@ import {
   Tag,
   clampScore,
   meterBand,
-} from '../index';
+} from '../candidate';
 
 describe('meterBand', () => {
   it.each([
@@ -168,28 +168,39 @@ describe('SurfaceCard', () => {
     expect(screen.getByRole('region', { name: 'Second' })).toBeInTheDocument();
   });
 
-  it('clamps rather than throwing when the guard is not dev-gated on', () => {
-    // The guard is deliberately dev/test-only: in production a composition
-    // mistake must not blank the page. This asserts the gate exists and is
-    // currently ON, which is what makes the negative control below valid.
-    expect(import.meta.env.DEV).toBe(true);
+  it('NEGATIVE CONTROL: a third nesting level is reported and clamped', () => {
+    expect(MAX_SURFACE_DEPTH).toBe(2);
+    // The harness fails a test on any unexpected console.error, so this
+    // allowance IS the proof the guard fires: remove the third level and
+    // the allowance goes unused; remove the guard and the test below fails.
+    (globalThis as { __allowConsole?: (p: RegExp) => void }).__allowConsole?.(
+      /SurfaceCard nested 3 levels deep/,
+    );
+    const { container } = render(
+      <SurfaceCard>
+        <SurfaceCard level="sunken">
+          <SurfaceCard level="sunken">too deep</SurfaceCard>
+        </SurfaceCard>
+      </SurfaceCard>,
+    );
+    // Reported…
+    const overflowed = container.querySelectorAll('[data-surface-overflow]');
+    expect(overflowed).toHaveLength(1);
+    // …and clamped rather than fatal: the page still renders.
+    expect(screen.getByText('too deep')).toBeInTheDocument();
+    const depths = [...container.querySelectorAll('[data-surface-depth]')].map((el) =>
+      Number(el.getAttribute('data-surface-depth')),
+    );
+    expect(Math.max(...depths)).toBe(MAX_SURFACE_DEPTH);
   });
 
-  it('NEGATIVE CONTROL: a third nesting level throws', () => {
-    expect(MAX_SURFACE_DEPTH).toBe(2);
-    // React logs the thrown render error; the assertion is the guard firing.
-    (globalThis as { __allowConsole?: (p: RegExp) => void }).__allowConsole?.(
-      /SurfaceCard nested/,
+  it('reports nothing and marks nothing at a legal depth', () => {
+    const { container } = render(
+      <SurfaceCard>
+        <SurfaceCard level="sunken">fine</SurfaceCard>
+      </SurfaceCard>,
     );
-    expect(() =>
-      render(
-        <SurfaceCard>
-          <SurfaceCard level="sunken">
-            <SurfaceCard level="sunken">too deep</SurfaceCard>
-          </SurfaceCard>
-        </SurfaceCard>,
-      ),
-    ).toThrow(/SurfaceCard nested 3 levels deep/);
+    expect(container.querySelectorAll('[data-surface-overflow]')).toHaveLength(0);
   });
 });
 

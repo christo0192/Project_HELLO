@@ -4,16 +4,16 @@ import { api, ApiError } from "../api";
 import type { AppealRow, CandidateDetail, Note } from "../types";
 import { LiveCallPanel } from "../components/LiveCallPanel";
 import { LiveKitCallCard } from "../components/LiveKitCallCard";
+import { StatusBadge } from "../components/design";
 import {
   CandidateButton,
   CandidateErrorState,
   CandidateInput,
   CandidateLoadingState,
   CandidateSelect,
-  StatusBadge,
   SurfaceCard,
   Tag,
-} from "../components/design";
+} from "../components/design/candidate";
 import {
   AshbyWorkflowCard,
   CandidateHeader,

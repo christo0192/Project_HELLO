@@ -19,7 +19,8 @@ import { useId } from 'react';
 import type { ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import type { CandidateDetail, Note, Session } from '../../types';
-import { StatusBadge, SurfaceCard, Tag } from '../design';
+import { StatusBadge } from '../design';
+import { SurfaceCard, Tag } from '../design/candidate';
 import {
   candidateStatusLabel,
   candidateStatusTone,

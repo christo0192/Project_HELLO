@@ -23,7 +23,7 @@ import {
   CandidateSelect,
   CandidateSpinner,
   SurfaceCard,
-} from "../components/design";
+} from "../components/design/candidate";
 import {
   Table,
   THead,
