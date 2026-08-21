@@ -45,7 +45,8 @@ export interface ScorecardSource {
   /** Immutable scoring provenance (model id / scored-at / version) — no secrets. */
   provenance: { model?: string; scoredAt?: string; version?: string };
   /**
-   * Relative internal review path (e.g. '/review/sessions/<id>'). MUST be a
+   * Relative internal review path (e.g. '/ashby/review/<applicationLinkId>',
+   * built by {@link ashbyReviewPath}). MUST be a
    * site-relative path — never an absolute URL, so no bearer/presigned link can
    * ride along in the scorecard.
    */
@@ -131,6 +132,21 @@ export interface NormalizedScorecard {
   summary: string;
   reviewPath: string;
   provenance: { model?: string; scoredAt?: string; version?: string };
+}
+
+/**
+ * The canonical relative deep link for a scorecard's review experience: the
+ * candidate-scoped Ashby review page, addressed ONLY by the opaque application
+ * link id. It never carries a candidate id, a session id, an email, or a token,
+ * and it is always site-relative so no bearer/presigned URL can ride along.
+ *
+ * Both scorecard builders (enqueue-time and execute-time) MUST derive the path
+ * through this helper: the idempotency marker hashes the review path, so the
+ * two sites drifting apart would make the executed payload's marker disagree
+ * with the enqueued operation_key.
+ */
+export function ashbyReviewPath(applicationLinkId: string): string {
+  return `/ashby/review/${encodeURIComponent(applicationLinkId)}`;
 }
 
 /** True iff `p` is a safe site-relative path (leading '/', no scheme/host/userinfo). */

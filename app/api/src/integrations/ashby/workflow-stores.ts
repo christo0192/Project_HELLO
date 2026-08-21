@@ -19,7 +19,7 @@ import type {
   WorkflowLinkRow,
 } from './orchestration.js';
 import type { AshbyLinkLookup } from './completion-observer.js';
-import { buildScorecard, type ScorecardSource } from './scorecard.js';
+import { ashbyReviewPath, buildScorecard, type ScorecardSource } from './scorecard.js';
 
 const SYSTEM_ACTOR = '00000000-0000-4000-8000-000000000001';
 
@@ -215,7 +215,7 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
           scoredAt: typeof a.created_at === 'string' ? a.created_at : undefined,
           version: typeof provenance.prompt_template_version === 'string' ? provenance.prompt_template_version : undefined,
         },
-        reviewPath: `/sessions/${encodeURIComponent(link.session_id)}`,
+        reviewPath: ashbyReviewPath(applicationLinkId),
       };
     },
     async readLink(applicationLinkId): Promise<WorkflowLinkRow | null> {
@@ -310,7 +310,7 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
           scoredAt: typeof a.created_at === 'string' ? a.created_at : undefined,
           version: typeof provenance.prompt_template_version === 'string' ? provenance.prompt_template_version : undefined,
         },
-        reviewPath: `/sessions/${encodeURIComponent(sessionId)}`,
+        reviewPath: ashbyReviewPath(applicationLinkId),
       };
       const built = buildScorecard(source, { min: 1, max: 4 });
       if (!built.ok) return { status: `scorecard_${built.reason}` };

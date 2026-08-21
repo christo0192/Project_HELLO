@@ -9,11 +9,14 @@
  *   that redirects to `/mission-control`.
  * - Mission Control is admin-gated by `ProtectedRoute requireRole="admin"`
  *   (UX gate only — the server enforces authorization).
+ * - `/ashby/review/:applicationLinkId` is the candidate-scoped Ashby review
+ *   experience: authenticated, but rendered outside Layout in its own shell
+ *   (no global nav/backlinks). It grants no privilege of its own.
  * - All existing candidate / call / consent / appeal / login routes are
  *   preserved unchanged.
  */
 
-import { lazy } from 'react';
+import { lazy, Suspense } from 'react';
 import {
   Navigate,
   Route,
@@ -62,6 +65,10 @@ const AshbyMissionControlPage = lazyPage(
   () => import('./pages/AshbyMissionControlPage'),
   'AshbyMissionControlPage',
 );
+const AshbyScopedReviewPage = lazyPage(
+  () => import('./pages/AshbyScopedReviewPage'),
+  'AshbyScopedReviewPage',
+);
 
 /**
  * Single catch-all: authenticated users return to the dashboard (the old
@@ -108,6 +115,23 @@ export default function App() {
             <Route path="/sessions/:sessionId" element={<SessionDetailPage />} />
             <Route path="/screening/:sessionId" element={<ScreeningPage />} />
           </Route>
+        </Route>
+
+        {/*
+          Candidate-scoped Ashby review — authenticated like every recruiter
+          route, but deliberately OUTSIDE <Layout>: no global nav, no sidebar,
+          no cross-candidate links. The opaque link is not a capability; the
+          API re-resolves the candidate and re-applies ownership/RBAC.
+        */}
+        <Route element={<ProtectedRoute />}>
+          <Route
+            path="/ashby/review/:applicationLinkId"
+            element={
+              <Suspense fallback={null}>
+                <AshbyScopedReviewPage />
+              </Suspense>
+            }
+          />
         </Route>
 
         {/* Mission Control — admin-gated (UX only; APIs authoritative) */}

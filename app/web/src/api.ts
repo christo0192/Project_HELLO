@@ -434,6 +434,19 @@ export const api = {
     request<AshbyFeedbackFormResponse>(
       `/api/integrations/ashby/mission-control/jobs/${encodeURIComponent(externalJobId)}/feedback-form`,
     ),
+  // ── Ashby candidate-scoped review ────────────────────────────────
+  // Purpose-built READ endpoints. The candidate/session are resolved
+  // server-side from the opaque application link id; no candidate id, email,
+  // or token ever appears in these URLs.
+  getAshbyScopedReview: (applicationLinkId: string) =>
+    request<CandidateDetail>(
+      `/api/integrations/ashby/review/${encodeURIComponent(applicationLinkId)}`,
+    ),
+  listAshbyScopedReviewNotes: (applicationLinkId: string) =>
+    request<NoteListResponse>(
+      `/api/integrations/ashby/review/${encodeURIComponent(applicationLinkId)}/notes`,
+    ),
+
   retryAshbyOperation: (id: string) =>
     request<AshbyMcActionResponse>(`/api/integrations/ashby/mission-control/operations/${id}/retry`, {
       method: 'POST',

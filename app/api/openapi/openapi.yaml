@@ -872,6 +872,66 @@ paths:
               schema:
                 $ref: '#/components/schemas/AshbyMcError'
 
+  # ── Ashby candidate-scoped review (authenticated recruiter) ────────
+  /api/integrations/ashby/review/{applicationLinkId}:
+    parameters:
+      - name: applicationLinkId
+        in: path
+        required: true
+        description: Opaque Ashby application link id (UUID). Carries no candidate identifier or PII.
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [ashby]
+      operationId: getAshbyScopedReview
+      summary: Candidate Overview + Review payload resolved from an application link
+      description: Read-only. Resolves the candidate/session SERVER-SIDE from the opaque application link and returns the same envelope as GET /api/candidates/{id}. Viewer role or above; the existing interviewer ownership rule is re-applied, so the link grants no new privilege. A malformed, unknown, unlinked or unowned id all return the identical 404, so the surface cannot be used to enumerate links.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Candidate, sessions and assessments envelopes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CandidateDetail'
+        '404':
+          description: Link unknown, unresolved, not owned by the caller, or malformed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+  /api/integrations/ashby/review/{applicationLinkId}/notes:
+    parameters:
+      - name: applicationLinkId
+        in: path
+        required: true
+        description: Opaque Ashby application link id (UUID).
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [ashby]
+      operationId: listAshbyScopedReviewNotes
+      summary: Read-only recruiter notes for the linked candidate
+      description: Read-only, bounded list of the linked candidate's append-only recruiter notes. Same server-side link resolution, role and ownership rules as the review payload; the scoped experience never adds a note.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Bounded note list, oldest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NoteListResponse'
+        '404':
+          description: Link unknown, unresolved, not owned by the caller, or malformed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+
   # ── LiveKit ────────────────────────────────────────────────────────
   /api/livekit/start:
     post:

@@ -19,8 +19,9 @@
  */
 
 import { useState } from 'react';
-import { Navigate } from 'react-router-dom';
+import { Navigate, useLocation } from 'react-router-dom';
 import { useAuth, ALLOWED_EMAIL_DOMAIN, isCompanyEmail } from '../lib/auth';
+import { sanitizeReturnTo } from '../lib/return-to';
 import { Button, Card, Input, Label } from '../components/ui';
 
 function getSsoProviders(): string[] {
@@ -58,6 +59,7 @@ function GoogleMark() {
 
 export function LoginPage() {
   const { signIn, signInWithSSO, isAuthenticated, isLoading } = useAuth();
+  const location = useLocation();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -65,9 +67,18 @@ export function LoginPage() {
 
   const ssoProviders = getSsoProviders();
 
-  // If already authenticated at AAL2, redirect to candidates
+  // A deep link that bounced through the guard carries its destination in
+  // router state. Re-validated here against the same exact path allowlist —
+  // state is not a trust boundary, and there is no `?next=` to honour — so an
+  // unrecognized value simply falls back to the normal landing route.
+  const returnTo = sanitizeReturnTo(
+    (location.state as { returnTo?: unknown } | null)?.returnTo,
+  );
+
+  // If already authenticated, redirect to the validated return-to (or the
+  // normal landing route).
   if (isAuthenticated) {
-    return <Navigate to="/candidates" replace />;
+    return <Navigate to={returnTo ?? '/candidates'} replace />;
   }
 
   // Soft UX hint only — the server is the sole enforcer.
