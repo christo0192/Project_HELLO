@@ -116,12 +116,28 @@ automatic path re-runs a terminal ingestion, and the audited recovery requires
 So the durable `ready` transition is now the **last** thing that happens, and
 only after the approved candidate/resume rows are written. A persistence
 failure writes `failed_review` / **`materialize_failed`** instead — truthful,
-visible, and recoverable through **both** doors:
+visible, and recoverable through two doors that are **not** equally reliable:
 
-- the **generic** requeue, so a redelivered webhook or a reconciliation
-  re-observation repairs it automatically, bounded by the unchanged
-  five-attempt ceiling; and
-- the **audited admin retry** below.
+- the **audited admin retry** below. This is the reliable door: it moves the
+  row *and* admits the `ashby.ingestion` job in the **same database
+  transaction** (0040), so a successful retry always leaves live, claimable
+  work;
+- the **generic** requeue (`advance_ashby_ingestion … 'queued'`), which the
+  import path calls when a signal arrives. It repairs the row automatically
+  **only when a genuinely new provider event produces a new signal** — a
+  stage change that mints a receipt the 0030 outbox has not already seen.
+
+> **Do not rely on redelivery or reconciliation for an unchanged
+> application.** Once an application has been imported, its event receipt is
+> `processed`; the 0030 outbox suppresses re-drive on a terminal receipt, and
+> reconciliation keys on (application, stage) while a webhook redelivery keys
+> on the same provider action id. An unchanged, already-linked application
+> therefore mints no new receipt, produces no `ashby.signal` job, and so no
+> `ashby.import` and no `ashby.ingestion` job — every pass, forever. Before
+> 0040 that made the operator retry a bookkeeping-only action: the row went to
+> `queued`, left the `ingestionFailedParse` queue that was watching it, and
+> nothing was ever scheduled. **The audited retry is the door; the automatic
+> self-heal is a bonus that only a new event can deliver.**
 
 Reaching `ready` at all therefore means the candidate is already populated.
 **A blank `ready` row can no longer be written.**
@@ -180,13 +196,60 @@ five-requeue ceiling, so an exhausted row answers `retry_exhausted` and stays
 rested. This is deliberately different from 0036, which zeroes the counter for a
 transport defect proven to have recorded one fault five times.
 
+**It is atomic** (0040): the transition, the attempt charge, the audit row and
+the `ashby.ingestion` queue job are one transaction, and a concurrent second
+click is refused with `not_recoverable` rather than charging a second attempt or
+admitting a second job.
+
+Two refusals are specific to the queue admission, and neither spends anything:
+
+| 409 `error` | meaning | what to do |
+|---|---|---|
+| `ingestion_job_in_flight` | a worker has already claimed an `ashby.ingestion` job for this link — the row is `failed_review` only because the handler has not returned yet | normally clears within one lease; see below if it persists |
+| a 500 `mission_control_action_error` on this route | the queue job could not be made durable, so the whole recovery rolled back | retry; the row is still `failed_review` with its full budget |
+
+#### When `ingestion_job_in_flight` does not clear
+
+The refusal is honest — the dedup index forbids a second live job while one is
+`active`, so the recovery cannot admit work and will not pretend it did. But the
+only thing that returns an `active` job to `pending` is
+`reclaim_expired_jobs` (0028), and **that runs only from the `reclaim` scheduler
+loop inside `createAshbyWorkers`**. With `ASHBY_RUNTIME_ENABLED` false — the
+shipped default — nothing sweeps expired leases, so a job left `active` by a
+machine that stopped mid-claim (the Fly `auto_stop_machines` case that loop
+exists for) pins the row at `ingestion_job_in_flight` indefinitely.
+
+Diagnose before waiting any longer:
+
+```sql
+select status, lease_owner, lease_expires_at, attempts, max_attempts
+  from screening_v2.job_queue
+ where dedup_key = 'ashby:ingestion:<applicationLinkId>'
+   and status in ('pending','active','delayed');
+```
+
+- `status = 'active'` with `lease_expires_at` **in the future** — a worker
+  genuinely holds it. Wait out the lease and retry; nothing is wrong.
+- `status = 'active'` with `lease_expires_at` **in the past** — the claim is
+  wedged. It is *eligible* for reclaim (every Ashby claim goes through
+  `claim_job`, which always stamps a lease), but reclaim only runs while the
+  runtime does. **Re-enable the Ashby runtime** and let the `reclaim` loop
+  requeue it — one pass returns it to `pending`, or dead-letters it if its job
+  attempts are exhausted, and the retry then succeeds normally.
+- **no row at all** — nothing is in flight; the refusal came from a job that
+  completed between your two clicks. Retry immediately.
+
+Do not clear the row by hand. A manual `update … set status='completed'` leaves
+the ingestion `queued` with nothing runnable, which is the exact defect 0040
+exists to remove.
+
 | `failed_reason` | retryable here? |
 |---|---|
 | `parse_timeout`, `parse_overload` | yes |
 | `parse_spawn_error`, `parse_child_exit`, `parse_asset_missing` | yes — fix the deployment first |
 | `parse_defer_deadline`, `parse_defer_exhausted`, `parse_defer_unavailable` | yes |
 | `parse_defer_clock_invalid` (the job timestamp was unparseable, so the wall-clock bound could not be computed and the wait was stopped rather than left unbounded) | yes |
-| `materialize_failed` (the parse succeeded; writing the approved candidate/resume rows did not) | **yes — and it also self-heals on the next redelivery** |
+| `materialize_failed` (the parse succeeded; writing the approved candidate/resume rows did not) | **yes** — and it additionally self-heals if a genuinely NEW stage-change event arrives; a redelivery or re-observation of the same event does **not** repair it |
 | `parse_error` (legacy) | **yes — one bounded retry, so the new classifier can NAME it** |
 | `parse_extract_failed`, `parse_bad_output`, `parse_no_output`, `parse_output_exceeded` | **no** — document verdict |
 | `no_extractable_fields`, `guard_*`, `scan_infected` | **no** |
@@ -199,7 +262,24 @@ encrypted and unsupported documents remain `needs_review`. No heap or timeout
 value makes them acceptable, and none should.**
 
 ### Step 4 — observe
-The retried ingestion re-enters `queued`. If it reaches `ready`:
+The retried ingestion re-enters `queued` **and a live `ashby.ingestion` job is
+admitted in the same transaction** (0040), so an ordinary ingestion worker
+claims it on its next poll. If the RPC answers `ok`, that job exists; if the
+enqueue could not be made durable, the whole recovery rolls back and the row
+stays in `failed_review` with its attempt budget intact — the retry never
+reports work it did not schedule. Confirm with:
+
+```sql
+select status, attempts, max_attempts, scheduled_at
+  from screening_v2.job_queue
+ where dedup_key = 'ashby:ingestion:<applicationLinkId>'
+   and status in ('pending','active','delayed');
+```
+
+A cold scanner does **not** consume the job: the readiness gate holds the claim
+before anything is downloaded, so the row waits in `queued` at no cost.
+
+If it reaches `ready`:
 
 - the **existing shell candidate is populated in place** — no second row;
 - the 0035 invite prerequisite then holds and exactly one manual invite becomes
