@@ -26,12 +26,16 @@
  *   3. Selecting a new session resets everything; stale loads are discarded.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../../api';
 import type { Assessment, Session, TranscriptLine } from '../../types';
-import { Card, ErrorState } from '../ui';
 import { StatusBadge } from '../design';
-import { Scorecard } from '../Scorecard';
+import {
+  CandidateErrorState,
+  CandidateSelect,
+  SurfaceCard,
+} from '../design/candidate';
+import { CandidateScorecard } from './CandidateScorecard';
 import { RecordingPlayer } from './RecordingPlayer';
 import type { RecordingPlayerHandle } from './RecordingPlayer';
 import { SeekableTranscript } from './SeekableTranscript';
@@ -184,14 +188,16 @@ export function TranscriptionSyncWorkspace({
   if (selectableSessions.length === 0) {
     return (
       <div className="space-y-6">
-        <Card className="p-5">
-          <h2 className="mb-1 text-sm font-semibold text-ink">Review workspace</h2>
-          <p className="text-sm text-ink-secondary">
+        <SurfaceCard className="p-4 sm:p-5">
+          <h2 className="mb-1 text-sm font-semibold text-[var(--c-ink)]">
+            Review workspace
+          </h2>
+          <p className="max-w-prose text-sm leading-relaxed text-[var(--c-ink-secondary)]">
             No completed sessions with recordings yet. Complete a live voice
             screening to review the transcript with synchronized playback and
             the session scorecard here.
           </p>
-        </Card>
+        </SurfaceCard>
         <ScorecardBlock
           blocked={blocked}
           assessment={assessments[0] ?? null}
@@ -206,16 +212,18 @@ export function TranscriptionSyncWorkspace({
   return (
     <div className="space-y-6">
       {/* Session selector + context */}
-      <div className="flex flex-col gap-3 rounded-xl border border-line bg-surface p-4 shadow-card sm:flex-row sm:items-center sm:justify-between">
+      <SurfaceCard className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex flex-wrap items-center gap-3">
-          <label htmlFor="sync-session-select" className="text-sm font-medium text-ink">
+          <label
+            htmlFor="sync-session-select"
+            className="text-sm font-medium text-[var(--c-ink)]"
+          >
             Session
           </label>
-          <select
+          <CandidateSelect
             id="sync-session-select"
             value={selectedSessionId ?? ''}
             onChange={handleSessionChange}
-            className="rounded-md border border-line bg-surface px-3 py-1.5 text-sm text-ink focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
           >
             {selectableSessions.map((s) => (
               <option key={s.id} value={s.id}>
@@ -225,10 +233,10 @@ export function TranscriptionSyncWorkspace({
                 {isLiveVoiceMode(s.mode) ? ' (live)' : ''}
               </option>
             ))}
-          </select>
+          </CandidateSelect>
         </div>
         {contextSession && (
-          <div className="flex flex-wrap items-center gap-2 text-xs text-ink-tertiary">
+          <div className="flex flex-wrap items-center gap-2 text-xs text-[var(--c-ink-muted)]">
             <StatusBadge tone={sessionStatusTone(contextSession.status)}>
               {sessionStatusLabel(contextSession.status)}
             </StatusBadge>
@@ -239,16 +247,18 @@ export function TranscriptionSyncWorkspace({
             <span>{formatDateTime(contextSession.created_at)}</span>
           </div>
         )}
-      </div>
+      </SurfaceCard>
 
       {permissionDenied ? (
-        <Card className="p-5">
-          <h2 className="mb-1 text-sm font-semibold text-ink">Transcript &amp; recording</h2>
-          <p className="text-sm text-ink-secondary">
+        <SurfaceCard className="p-4 sm:p-5">
+          <h2 className="mb-1 text-sm font-semibold text-[var(--c-ink)]">
+            Transcript &amp; recording
+          </h2>
+          <p className="max-w-prose text-sm leading-relaxed text-[var(--c-ink-secondary)]">
             Detailed transcript playback and recording review require admin
             access. The session scorecard is shown below.
           </p>
-        </Card>
+        </SurfaceCard>
       ) : (
         /* Split pane: sticky player + scrollable transcript */
         <div className="flex flex-col gap-6 lg:flex-row lg:items-start">
@@ -263,11 +273,11 @@ export function TranscriptionSyncWorkspace({
             )}
             <a
               href="#sync-transcript-region"
-              className="sr-only focus:not-sr-only focus:mt-2 focus:inline-block focus:text-xs focus:text-brand-600"
+              className="sr-only focus:not-sr-only focus:mt-2 focus:inline-block focus:text-xs focus:text-[var(--c-accent)]"
             >
               Skip to transcript
             </a>
-            <p className="mt-2 hidden text-xs text-ink-tertiary lg:block">
+            <p className="mt-2 hidden max-w-prose text-xs text-[var(--c-ink-secondary)] lg:block">
               Click any timed transcript turn to jump to that moment. Active
               turns are highlighted automatically during playback.
             </p>
@@ -275,7 +285,10 @@ export function TranscriptionSyncWorkspace({
 
           <div id="sync-transcript-region" className="min-h-0 flex-1">
             {transcriptError ? (
-              <ErrorState message={transcriptError} onRetry={handleTranscriptRetry} />
+              <CandidateErrorState
+                message={transcriptError}
+                onRetry={handleTranscriptRetry}
+              />
             ) : (
               <SeekableTranscript
                 transcript={transcript}
@@ -293,7 +306,7 @@ export function TranscriptionSyncWorkspace({
       {!permissionDenied && (
         <a
           href="#sync-workspace-player"
-          className="sr-only focus:not-sr-only focus:inline-block focus:text-xs focus:text-brand-600"
+          className="sr-only focus:not-sr-only focus:inline-block focus:text-xs focus:text-[var(--c-accent)]"
         >
           Return to recording player
         </a>
@@ -326,23 +339,27 @@ function ScorecardBlock({
   assessment: Assessment | null;
   heading?: string;
 }) {
+  const headingId = useId();
+  // A plain section, not a card: the scorecard's own sections are the first
+  // card level and their sunken blocks the second, so wrapping the whole
+  // thing in another card would make three — the nesting the owner flagged.
   return (
-    <Card className="p-5">
-      <h2 className="mb-3 text-sm font-semibold text-ink">
+    <section aria-labelledby={headingId}>
+      <h2 id={headingId} className="mb-3 text-sm font-semibold text-[var(--c-ink)]">
         {heading ?? 'Scorecard'}
       </h2>
       {blocked ? (
-        <p className="text-sm text-ink-secondary">
+        <p className="max-w-prose text-sm leading-relaxed text-[var(--c-ink-secondary)]">
           Scorecards are suppressed while an appeal is under review.
         </p>
       ) : assessment ? (
-        <Scorecard assessment={assessment} />
+        <CandidateScorecard assessment={assessment} />
       ) : (
-        <p className="text-sm text-ink-secondary">
+        <p className="max-w-prose text-sm leading-relaxed text-[var(--c-ink-secondary)]">
           No scorecard for this session yet — complete a screening to generate
           one.
         </p>
       )}
-    </Card>
+    </section>
   );
 }

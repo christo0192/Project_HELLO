@@ -1,14 +1,24 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useId, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api, ApiError } from "../api";
 import type { AppealRow, CandidateDetail, Note } from "../types";
 import { LiveCallPanel } from "../components/LiveCallPanel";
 import { LiveKitCallCard } from "../components/LiveKitCallCard";
-import { Button, Card, Chip, ErrorState, LoadingState } from "../components/ui";
-import { PageHeader, StatusBadge } from "../components/design";
+import { StatusBadge } from "../components/design";
+import {
+  CandidateButton,
+  CandidateErrorState,
+  CandidateInput,
+  CandidateLoadingState,
+  CandidateSelect,
+  SurfaceCard,
+  Tag,
+} from "../components/design/candidate";
 import {
   AshbyWorkflowCard,
+  CandidateHeader,
   CandidateProfileCard,
+  CandidateShell,
   DecisionBlockedBanner,
   NotesList,
   SessionsSummary,
@@ -56,22 +66,32 @@ export function CandidateDetailPage() {
 
   useEffect(load, [load]);
 
-  if (error) return <ErrorState message={error} onRetry={load} />;
-  if (!detail) return <LoadingState label="Loading candidate…" />;
+  if (error)
+    return (
+      <CandidateShell variant="inset">
+        <CandidateErrorState message={error} onRetry={load} />
+      </CandidateShell>
+    );
+  if (!detail)
+    return (
+      <CandidateShell variant="inset">
+        <CandidateLoadingState label="Loading candidate…" />
+      </CandidateShell>
+    );
 
   const { candidate, sessions, assessments } = detail;
   const decisionBlocked = candidate.decision_use_blocked_at != null;
 
   return (
-    <div>
+    <CandidateShell variant="inset">
       <Link
         to="/candidates"
-        className="mb-4 inline-flex items-center gap-1 text-sm text-ink-secondary hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
+        className="mb-4 inline-flex min-h-11 items-center gap-1 text-sm text-[var(--c-ink-secondary)] hover:text-[var(--c-ink)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
       >
         ← Back to candidates
       </Link>
 
-      <PageHeader
+      <CandidateHeader
         eyebrow="Candidate"
         title={candidate.name || "Unnamed candidate"}
         description={candidate.email ?? undefined}
@@ -112,7 +132,7 @@ export function CandidateDetailPage() {
           ]}
         />
       </div>
-    </div>
+    </CandidateShell>
   );
 }
 
@@ -126,7 +146,7 @@ function OverviewTab({
   sessions: CandidateDetail["sessions"];
 }) {
   return (
-    <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+    <div className="grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-3">
       {/* Profile */}
       <CandidateProfileCard
         candidate={candidate}
@@ -134,7 +154,7 @@ function OverviewTab({
       />
 
       {/* Live actions + sessions + notes + appeals */}
-      <div className="space-y-6 lg:col-span-2">
+      <div className="space-y-4 sm:space-y-6 lg:col-span-2">
         <LiveKitCallCard
           candidateId={candidate.id}
           candidateName={candidate.name}
@@ -161,6 +181,7 @@ function OverviewTab({
 /* ── Append-only notes ──────────────────────────────────────────────── */
 
 function NotesSection({ candidateId }: { candidateId: string }) {
+  const headingId = useId();
   const [notes, setNotes] = useState<Note[] | null>(null);
   const [noteText, setNoteText] = useState("");
   const [saving, setSaving] = useState(false);
@@ -193,32 +214,34 @@ function NotesSection({ candidateId }: { candidateId: string }) {
   }
 
   return (
-    <Card className="p-5">
-      <h2 className="mb-3 text-sm font-semibold text-ink">Notes</h2>
+    <SurfaceCard as="section" labelledBy={headingId} className="p-4 sm:p-5">
+      <h2 id={headingId} className="mb-3 text-sm font-semibold text-ink">
+        Notes
+      </h2>
       <NotesList notes={notes} error={err} />
-      <div className="mt-3 flex gap-2">
+      <div className="mt-3 flex flex-wrap gap-2">
         <label htmlFor="note-input" className="sr-only">
           Add a note
         </label>
-        <input
+        <CandidateInput
           id="note-input"
           value={noteText}
           onChange={(e) => setNoteText(e.target.value)}
           maxLength={2000}
           placeholder="Add a note…"
-          className="flex-1 rounded-md border border-line bg-surface px-3 py-2 text-sm text-ink placeholder:text-ink-tertiary focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
+          className="min-w-0 flex-1"
         />
-        <Button
+        <CandidateButton
           variant="secondary"
           onClick={() => void add()}
           loading={saving}
           disabled={!noteText.trim()}
         >
           Add
-        </Button>
+        </CandidateButton>
       </div>
-      {msg && <p className="mt-2 text-xs text-ink-secondary">{msg}</p>}
-    </Card>
+      {msg && <p className="mt-2 max-w-prose text-xs text-ink-secondary">{msg}</p>}
+    </SurfaceCard>
   );
 }
 
@@ -231,6 +254,7 @@ function AppealsSection({
   candidateId: string;
   sessions: CandidateDetail["sessions"];
 }) {
+  const headingId = useId();
   const [appeals, setAppeals] = useState<AppealRow[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [expiryHours, setExpiryHours] = useState(24);
@@ -270,8 +294,10 @@ function AppealsSection({
   }
 
   return (
-    <Card className="p-5">
-      <h2 className="mb-3 text-sm font-semibold text-ink">Appeals</h2>
+    <SurfaceCard as="section" labelledBy={headingId} className="p-4 sm:p-5">
+      <h2 id={headingId} className="mb-3 text-sm font-semibold text-ink">
+        Appeals
+      </h2>
       {err ? (
         <p className="text-sm text-error">{err}</p>
       ) : appeals === null ? (
@@ -284,11 +310,20 @@ function AppealsSection({
             <li key={a.id} className="py-2 text-sm">
               <div className="flex items-center justify-between gap-2">
                 <p className="font-medium text-ink">{a.category}</p>
-                <Chip tone={a.status === "open" || a.status === "under_review" ? "accent" : "green"}>
+                <Tag
+                  tone={
+                    a.status === "open" || a.status === "under_review"
+                      ? "accent"
+                      : "positive"
+                  }
+                  srPrefix="Appeal status:"
+                >
                   {a.status}
-                </Chip>
+                </Tag>
               </div>
-              <p className="mt-0.5 whitespace-pre-wrap text-ink-secondary">{a.description}</p>
+              <p className="mt-0.5 max-w-prose whitespace-pre-wrap leading-relaxed text-ink-secondary">
+                {a.description}
+              </p>
               <p className="mt-0.5 text-xs text-ink-tertiary">
                 {formatDateTime(a.created_at)}
               </p>
@@ -297,9 +332,9 @@ function AppealsSection({
         </ul>
       )}
 
-      <div className="mt-4 rounded-md border border-line p-4">
+      <div className="mt-4 rounded-lg border border-[var(--c-border)] p-4">
         <h3 className="text-sm font-semibold text-ink">Issue appeal grant</h3>
-        <p className="mt-1 text-xs text-ink-tertiary">
+        <p className="mt-1 max-w-prose text-xs leading-relaxed text-ink-tertiary">
           A one-time fragment link the candidate opens at /appeal. Explicit
           expiry is required (1–72 hours); the plaintext is shown only once.
         </p>
@@ -308,11 +343,11 @@ function AppealsSection({
             <label htmlFor="appeal-session" className="block text-xs font-medium text-ink-secondary">
               Session
             </label>
-            <select
+            <CandidateSelect
               id="appeal-session"
               value={selectedSession}
               onChange={(e) => setSelectedSession(e.target.value)}
-              className="mt-1 block w-full rounded-md border border-line bg-surface px-2 py-1.5 text-sm text-ink focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
+              className="mt-1 block w-full"
             >
               {sessions.length === 0 ? (
                 <option value="">No sessions</option>
@@ -323,24 +358,24 @@ function AppealsSection({
                   </option>
                 ))
               )}
-            </select>
+            </CandidateSelect>
           </div>
           <div>
             <label htmlFor="appeal-expiry" className="block text-xs font-medium text-ink-secondary">
               Expires in (hours, 1–72)
             </label>
-            <input
+            <CandidateInput
               id="appeal-expiry"
               type="number"
               min={1}
               max={72}
               value={expiryHours}
               onChange={(e) => setExpiryHours(Number(e.target.value))}
-              className="mt-1 block w-full rounded-md border border-line bg-surface px-2 py-1.5 text-sm text-ink focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
+              className="mt-1 block w-full"
             />
           </div>
         </div>
-        <Button
+        <CandidateButton
           className="mt-3"
           variant="secondary"
           onClick={() => void issueGrant()}
@@ -348,20 +383,20 @@ function AppealsSection({
           disabled={!selectedSession}
         >
           Issue one-time appeal grant
-        </Button>
-        {msg && <p className="mt-2 text-xs text-ink-secondary">{msg}</p>}
+        </CandidateButton>
+        {msg && <p className="mt-2 max-w-prose text-xs text-ink-secondary">{msg}</p>}
         {grantLink && (
-          <div className="mt-2 rounded-md bg-surface-tertiary p-3">
+          <div className="mt-2 rounded-lg bg-[var(--c-border-light)] p-3">
             <p className="text-xs font-semibold text-ink-secondary">One-time link (shown once)</p>
             <code className="block break-all text-xs text-ink-secondary">{grantLink}</code>
-            <p className="mt-1 text-[11px] text-ink-tertiary">
+            <p className="mt-1 max-w-prose text-[11px] leading-relaxed text-ink-tertiary">
               Contains a secret token in the fragment — share it only with the
               candidate. It is never stored by the app.
             </p>
           </div>
         )}
       </div>
-    </Card>
+    </SurfaceCard>
   );
 }
 
@@ -394,10 +429,18 @@ function CsvExportButton({ candidateId }: { candidateId: string }) {
 
   return (
     <div>
-      <Button variant="secondary" onClick={() => void download()} loading={busy}>
+      <CandidateButton
+        variant="secondary"
+        onClick={() => void download()}
+        loading={busy}
+      >
         Export screening data (scorecard + transcript)
-      </Button>
-      {err && <p className="mt-1 text-xs text-error">{err}</p>}
+      </CandidateButton>
+      {err && (
+        <p className="mt-1 rounded bg-[var(--c-surface)] px-2 py-1 text-xs text-error">
+          {err}
+        </p>
+      )}
     </div>
   );
 }

@@ -27,6 +27,10 @@ export type {
   AshbyWorkflowCardViewProps,
   AshbyWorkflowSource,
 } from './AshbyWorkflowCard';
+export { CandidateShell, CandidateHeader, CANDIDATE_SCOPE_CLASS } from './CandidateShell';
+export type { CandidateShellProps, CandidateHeaderProps } from './CandidateShell';
+export { CandidateScorecard, SECTION_WEIGHTS } from './CandidateScorecard';
+export type { CandidateScorecardProps, HeadingLevel } from './CandidateScorecard';
 export { TranscriptionSyncWorkspace } from './TranscriptionSyncWorkspace';
 export type { TranscriptionSyncWorkspaceProps } from './TranscriptionSyncWorkspace';
 export {
