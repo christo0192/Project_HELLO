@@ -24,7 +24,12 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import { runClaimedAshbyOperation, SUPPORTED_OPERATION_TYPES, REFUSED_OPERATION_TYPES } from '../integrations/ashby/operation-worker.js';
-import { bindFeedbackForm, buildScorecard, type ScorecardSource } from '../integrations/ashby/scorecard.js';
+import {
+  bindFeedbackForm,
+  buildScorecard,
+  HELLO_CHRISTY_SCORECARD_BINDING,
+  type ScorecardSource,
+} from '../integrations/ashby/scorecard.js';
 import { enqueueStageMove, enqueueScorecard, type RuntimeWorkflowStores, type SagaDeps } from '../integrations/ashby/orchestration.js';
 import { createAshbyClient, ASHBY_API_BASE_URL } from '../integrations/ashby/client.js';
 import { ASHBY_OPERATIONS } from '../integrations/ashby/types.js';
@@ -131,8 +136,9 @@ describe('L2 — the scorecard payload cannot be built without a verified bindin
     summary: 'synthetic summary',
     dimensions: [{ key: 'communication', score: 3 }],
     provenance: { model: 'synthetic-model', scoredAt: '2026-08-17T00:00:00.000Z', version: '1' },
-    reviewPath: '/candidates/abc',
+    reviewPath: '/ashby/review/66666666-6666-4666-8666-666666666666',
   };
+  const ORIGIN = 'https://hello.example.com';
 
   it('fails closed on an unverified binding', () => {
     const built = buildScorecard(source, { min: 1, max: 4 });
@@ -147,6 +153,36 @@ describe('L2 — the scorecard payload cannot be built without a verified bindin
     if (!built.ok) throw new Error('fixture');
     expect(bindFeedbackForm(built.scorecard, { verified: true, formDefinitionId: 'f1' }))
       .toEqual({ ok: false, reason: 'binding_incomplete' });
+  });
+
+  it('fails closed when no trustworthy HTTPS dashboard origin can be composed', () => {
+    const built = buildScorecard(source, { min: 1, max: 4 });
+    if (!built.ok) throw new Error('fixture');
+    // A verified binding is NOT enough: without a dashboard origin we can
+    // trust, the `Detailed report` Url field has no legal value and the whole
+    // submission is refused rather than degraded to a relative path.
+    for (const origin of ['', 'http://localhost:5173', 'https://u:p@app.example/', 'https://app.example/x']) {
+      expect(bindFeedbackForm(built.scorecard, HELLO_CHRISTY_SCORECARD_BINDING, origin))
+        .toEqual({ ok: false, reason: 'dashboard_origin_invalid' });
+    }
+  });
+
+  it('fails closed when the review path is not the canonical scoped one', () => {
+    const built = buildScorecard({ ...source, reviewPath: '/candidates/abc' }, { min: 1, max: 4 });
+    if (!built.ok) throw new Error('fixture');
+    expect(bindFeedbackForm(built.scorecard, HELLO_CHRISTY_SCORECARD_BINDING, ORIGIN))
+      .toEqual({ ok: false, reason: 'invalid_review_path' });
+  });
+
+  it('publishes exactly the nine approved fields once everything IS trustworthy', () => {
+    const built = buildScorecard(source, { min: 1, max: 4 });
+    if (!built.ok) throw new Error('fixture');
+    const bound = bindFeedbackForm(built.scorecard, HELLO_CHRISTY_SCORECARD_BINDING, ORIGIN);
+    expect(bound.ok).toBe(true);
+    if (!bound.ok) return;
+    const fields = (bound.feedbackForm as { fieldSubmissions: unknown[] }).fieldSubmissions;
+    // overall + summary + red flags + detailed report + the one mapped dimension
+    expect(fields).toHaveLength(5);
   });
 });
 

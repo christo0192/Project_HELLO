@@ -429,9 +429,10 @@ export interface SagaDeps {
  * Phase 1 of the saga: build the redaction-safe scorecard and enqueue the
  * scorecard_write op. The key is derived from the APPLICATION LINK alone, so
  * `uq_ashby_operations_key` enforces at most one scorecard per link no matter
- * how the content marker (or the review path inside it) changes — an Ashby
- * scorecard cannot be retracted. A duplicate key or marker short-circuits
- * (already written).
+ * how the content marker changes — including when the marker moves because the
+ * assessment's normalized red flags changed. An Ashby scorecard cannot be
+ * retracted, so a changed marker must never read as "new work". A duplicate key
+ * or marker short-circuits (already written).
  *
  * The unique key only covers rows written under the CURRENT key shape, so a
  * link-scoped admission read through {@link WorkflowStores.findScorecardWriteOperation}

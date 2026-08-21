@@ -29,6 +29,12 @@ import { fetchEphemeralResume } from '../integrations/ashby/resume-fetch.js';
 import { planTerminalCancellation } from '../integrations/ashby/workflow.js';
 import type { AshbyResult } from '../integrations/ashby/types.js';
 import type { UrlPolicy } from '../integrations/ashby/ssrf.js';
+import {
+  ashbyReviewPath,
+  buildScorecard,
+  bindFeedbackForm,
+  HELLO_CHRISTY_SCORECARD_BINDING,
+} from '../integrations/ashby/scorecard.js';
 
 const AI = 'stage_ai';
 const TA = 'stage_ta';
@@ -47,7 +53,9 @@ class SyntheticStore implements WorkflowStores {
     return this.links.get(appId) ?? null;
   }
   async createLink(input: { externalApplicationId: string }) {
-    const id = `link_${++this.n}`;
+    // A synthetic UUID, like the real column: the scorecard deep link is only
+    // composable from a canonical `/ashby/review/<uuid>` path.
+    const id = `1a2b3c4d-0000-4000-8000-${String(++this.n).padStart(12, '0')}`;
     this.links.set(input.externalApplicationId, { id, externalApplicationId: input.externalApplicationId, terminalState: null });
     return { id };
   }
@@ -139,13 +147,43 @@ describe('synthetic end-to-end: stage signal → TA transition', () => {
 
     // 4. Synthetic assessment → scorecard (idempotent marker).
     const saga = { gates, stores: store, client: reader(appAtAi), scale: { min: 1, max: 4 }, applicationLinkId: linkId, externalApplicationId: 'app_1', aiScreeningStageId: AI };
-    const sc = await enqueueScorecard(
-      { overallScore: 78, recommendation: 'advance', dimensions: [{ key: 'communication', score: 8 }], summary: 'Strong', provenance: { model: 'm' }, reviewPath: '/review/s' },
-      saga,
-    );
+    const scorecardSource = {
+      overallScore: 78,
+      recommendation: 'advance' as const,
+      dimensions: [{ key: 'communication', score: 8 }],
+      summary: 'Strong',
+      provenance: { model: 'm' },
+      reviewPath: ashbyReviewPath(linkId),
+      redFlags: ['Notice period is three months'],
+    };
+    const sc = await enqueueScorecard(scorecardSource, saga);
     expect(sc.status).toBe('scorecard_enqueued');
     const scoreOp = store.ops.find((o) => o.type === 'scorecard_write');
     expect(scoreOp).toBeDefined();
+
+    // 4b. The payload the worker would hand the provider: the approved fields
+    // plus the two verified extras, with the deep link in `Detailed report`
+    // (a bare HTTPS URL) and the Summary carrying no link at all.
+    const built = buildScorecard(scorecardSource, { min: 1, max: 4 });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    const bound = bindFeedbackForm(built.scorecard, HELLO_CHRISTY_SCORECARD_BINDING, 'https://hello.example.com');
+    expect(bound.ok).toBe(true);
+    if (!bound.ok) return;
+    const fields = (bound.feedbackForm as { fieldSubmissions: Array<{ path: string; value: unknown }> }).fieldSubmissions;
+    // overall + summary + red flags + detailed report + the one mapped dimension
+    expect(fields).toHaveLength(5);
+    const paths = HELLO_CHRISTY_SCORECARD_BINDING.fieldPaths!;
+    expect(fields.find((f) => f.path === paths.detailedReport)!.value)
+      .toBe(`https://hello.example.com/ashby/review/${linkId}`);
+    expect(fields.find((f) => f.path === paths.redFlags)!.value)
+      .toBe('- Notice period is three months');
+    expect(fields.find((f) => f.path === paths.summary)!.value)
+      .toEqual({ type: 'PlainText', value: 'Strong' });
+    // ...and with no trustworthy dashboard origin, nothing is published at all.
+    expect(bindFeedbackForm(built.scorecard, HELLO_CHRISTY_SCORECARD_BINDING, 'http://localhost:5173'))
+      .toEqual({ ok: false, reason: 'dashboard_origin_invalid' });
+
     await store.completeOperation(scoreOp!.id); // synthetic scorecard write succeeds
 
     // 5. Stage move enqueued only because still at AI stage; depends on scorecard.

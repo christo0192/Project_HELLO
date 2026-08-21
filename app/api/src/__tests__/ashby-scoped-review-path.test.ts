@@ -2,8 +2,9 @@
  * Scorecard reviewPath → the candidate-scoped review route.
  *
  * NEW scorecard writes deep-link to `/ashby/review/<applicationLinkId>` instead
- * of `/sessions/<sessionId>`. Nothing else about the write changes: the Ashby
- * feedback value type, the field set, Red Flags, email and stage moves are all
+ * of `/sessions/<sessionId>`. The deep link is now delivered by the verified
+ * `Detailed report` Url field rather than appended to the Summary — see
+ * ashby-scorecard-fields.test.ts for that field set. Email and stage moves stay
  * untouched by this lane.
  *
  * Idempotency is content-only and link-scoped:
@@ -100,8 +101,8 @@ describe('scorecard idempotency is content-only', () => {
   });
 });
 
-describe('the bound Ashby payload changes only the deep link', () => {
-  it('embeds the scoped review path in the summary and nothing else moves', () => {
+describe('the bound Ashby payload carries the deep link in Detailed report', () => {
+  it('delivers the scoped review link as a bare Url value, never in the summary', () => {
     const built = buildScorecard(source(), SCALE);
     expect(built.ok).toBe(true);
     if (!built.ok) return;
@@ -111,18 +112,23 @@ describe('the bound Ashby payload changes only the deep link', () => {
     const fields = (bound.feedbackForm as { fieldSubmissions: Array<{ path: string; value: any }> }).fieldSubmissions;
     const summary = fields.find((f) => f.path === HELLO_CHRISTY_SCORECARD_BINDING.fieldPaths!.summary)!;
     expect(summary.value.type).toBe('PlainText');
-    expect(summary.value.value).toContain(`https://app.example/ashby/review/${LINK_ID}`);
+    expect(summary.value.value).toBe('Strong communicator.');
+    expect(summary.value.value).not.toContain('http');
     expect(summary.value.value).not.toContain('/sessions/');
 
+    const report = fields.find((f) => f.path === HELLO_CHRISTY_SCORECARD_BINDING.fieldPaths!.detailedReport)!;
+    expect(report.value).toBe(`https://app.example/ashby/review/${LINK_ID}`);
+    expect(report.value).not.toContain(SESSION_ID);
+
     // Unchanged contract: the overall field is still the stringified scale
-    // value (never a new type), and no field was added or removed.
+    // value (never a new type).
     const overall = fields.find((f) => f.path === HELLO_CHRISTY_SCORECARD_BINDING.fieldPaths!.overall)!;
     expect(typeof overall.value).toBe('string');
-    expect(fields).toHaveLength(3); // overall + summary + the one dimension
-    expect(JSON.stringify(bound.feedbackForm)).not.toMatch(/red[_ ]?flag/i);
+    // overall + summary + red flags + detailed report + the one mapped dimension
+    expect(fields).toHaveLength(5);
   });
 
-  it('never truncates the deep link, even for a summary at the maximum length', () => {
+  it('keeps the deep link whole and un-truncated for a maximum-length summary', () => {
     const origin = 'https://app.example';
     const link = `${origin}/ashby/review/${LINK_ID}`;
     // A summary long enough that buildScorecard itself caps it at MAX_SUMMARY_LEN.
@@ -135,34 +141,22 @@ describe('the bound Ashby payload changes only the deep link', () => {
     expect(bound.ok).toBe(true);
     if (!bound.ok) return;
     const fields = (bound.feedbackForm as { fieldSubmissions: Array<{ path: string; value: any }> }).fieldSubmissions;
-    const summary = fields.find((f) => f.path === HELLO_CHRISTY_SCORECARD_BINDING.fieldPaths!.summary)!;
 
-    // The complete suffix survives: value type unchanged, whole URL present,
-    // and the payload still respects the 2000-char cap (the summary body, not
-    // the link, is what gives way).
-    expect(summary.value.type).toBe('PlainText');
-    expect(summary.value.value.endsWith(link)).toBe(true);
+    // The summary now owns its whole budget, and the link is a separate field
+    // that a long summary can no longer crowd out or truncate.
+    const summary = fields.find((f) => f.path === HELLO_CHRISTY_SCORECARD_BINDING.fieldPaths!.summary)!;
     expect(summary.value.value).toHaveLength(2000);
-    expect(summary.value.value).toContain('Detailed Project_HELLO scorecard: ');
+    expect(fields.find((f) => f.path === HELLO_CHRISTY_SCORECARD_BINDING.fieldPaths!.detailedReport)!.value)
+      .toBe(link);
   });
 
-  it('keeps the whole link for a maximum-length summary on the longest allowed path', () => {
-    // Same boundary with the longer scoped path vs the old session path: the
-    // reserved suffix grows, the summary body shrinks, the URL stays intact.
-    const built = buildScorecard(source({ summary: 'y'.repeat(3000), reviewPath: `/sessions/${SESSION_ID}` }), SCALE);
-    const scoped = buildScorecard(source({ summary: 'y'.repeat(3000) }), SCALE);
-    expect(built.ok && scoped.ok).toBe(true);
-    if (!built.ok || !scoped.ok) return;
-    const value = (b: typeof built) => {
-      const bound = bindFeedbackForm((b as { scorecard: any }).scorecard, HELLO_CHRISTY_SCORECARD_BINDING, 'https://app.example/');
-      const fields = (bound as any).feedbackForm.fieldSubmissions as Array<{ path: string; value: any }>;
-      return fields.find((f) => f.path === HELLO_CHRISTY_SCORECARD_BINDING.fieldPaths!.summary)!.value.value as string;
-    };
-    const legacyValue = value(built);
-    const scopedValue = value(scoped);
-    expect(legacyValue.endsWith(`https://app.example/sessions/${SESSION_ID}`)).toBe(true);
-    expect(scopedValue.endsWith(`https://app.example/ashby/review/${LINK_ID}`)).toBe(true);
-    expect(legacyValue).toHaveLength(2000);
-    expect(scopedValue).toHaveLength(2000);
+  it('refuses the whole binding for a legacy non-scoped review path', () => {
+    // A `/sessions/<id>` path is no longer a legal Url value, and the binding
+    // fails closed rather than shipping a scorecard with no destination.
+    const built = buildScorecard(source({ reviewPath: `/sessions/${SESSION_ID}` }), SCALE);
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    expect(bindFeedbackForm(built.scorecard, HELLO_CHRISTY_SCORECARD_BINDING, 'https://app.example/'))
+      .toEqual({ ok: false, reason: 'invalid_review_path' });
   });
 });
