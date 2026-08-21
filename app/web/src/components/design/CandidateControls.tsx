@@ -158,6 +158,20 @@ export function CandidateLoadingState({ label = 'Loading…' }: { label?: string
   );
 }
 
+/**
+ * Error state.
+ *
+ * Tone lives in the BORDER and the FILL; the message is ink. The approved
+ * rose reaches only 3.94:1 on its own tint, and this is normal-weight
+ * `text-sm` prose, so WCAG 1.4.3 wants 4.5:1 — the secondary ink gives
+ * 9.04:1 on the same ground. This is the identical rule `Tag` applies to its
+ * tone labels, and the identical re-pairing move the muted ink, the success
+ * ink and the control border each took: the palette is fixed, so the PAIRING
+ * changes and the value never does.
+ *
+ * The state is still unmistakably an error — rose border, rose tint, and on
+ * the scoped review route the message itself is the generic unavailable text.
+ */
 export function CandidateErrorState({
   message,
   onRetry,
@@ -167,7 +181,7 @@ export function CandidateErrorState({
 }) {
   return (
     <div className="flex flex-col items-center justify-center gap-3 rounded-xl border border-[var(--c-negative)] bg-[var(--c-negative-light)] py-12 text-center">
-      <p className="max-w-prose px-4 text-sm text-[var(--c-negative)]">{message}</p>
+      <p className="max-w-prose px-4 text-sm text-[var(--c-ink-secondary)]">{message}</p>
       {onRetry && (
         <CandidateButton variant="secondary" onClick={onRetry}>
           Try again

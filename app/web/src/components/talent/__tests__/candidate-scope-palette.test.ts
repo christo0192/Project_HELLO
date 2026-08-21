@@ -239,6 +239,58 @@ describe('candidate-scope source guard', () => {
     );
   });
 
+  /**
+   * The semantic tone colours may fill, ring and border. They may NOT be text.
+   *
+   * `--c-negative` and `--c-positive` have no ground in this palette that
+   * clears 4.5:1 for normal text: rose reaches only 3.94:1 on its own tint and
+   * 4.52:1 on the card, teal only 3.47:1 and 3.94:1. Rather than allow one and
+   * ban the other — a distinction no author will remember at the point of
+   * writing a className — neither is a text colour anywhere in candidate
+   * scope. Tone is carried by tint, ring and border; the label is always ink.
+   *
+   * SCOPE: this reads `text-[var(--c-…)]` utilities only. A colour applied
+   * through an inline `style` — the 36px overall score is the one such site —
+   * is invisible here and is covered by the pair list above instead. Both
+   * halves are needed; neither is sufficient alone.
+   *
+   * This is the guard that would have caught `CandidateErrorState`, which
+   * painted its message in the negative tone on the negative tint
+   * while `Tag` — one file away, under the same written rule — did not. The
+   * arithmetic list above cannot catch it on its own, because the tokens it
+   * pins are the ones the design INTENDS to pair; a component is free to pair
+   * two others. Only reading the source closes that gap.
+   */
+  const TONE_TOKENS_BANNED_AS_TEXT = ['--c-negative', '--c-positive'] as const;
+
+  /**
+   * Assembled by concatenation, never written out as one literal.
+   *
+   * `tailwind.config.js` scans every `.ts`/`.tsx` under `src` — test files and
+   * COMMENTS included — and generates a rule for any complete arbitrary-value
+   * class candidate it finds. Interpolating the token name into that form
+   * produced a class whose declaration contained the un-substituted
+   * placeholder, which is not valid CSS, and lightningcss failed the
+   * production build on it. Building the needle from parts means the scanner
+   * never sees a candidate. For the same reason this comment describes the
+   * shape in prose rather than spelling it out.
+   */
+  const textUtilityFor = (tokenName: string) => 'text-[var(' + tokenName + ')]';
+
+  it.each(TONE_TOKENS_BANNED_AS_TEXT)('%s is never used as a text colour', (tokenName) => {
+    const needle = textUtilityFor(tokenName);
+    const offenders = CANDIDATE_SCOPE_SOURCES.filter((rel) => read(rel).includes(needle));
+    expect(offenders).toEqual([]);
+  });
+
+  it('NEGATIVE CONTROL: that ban matches the exact string it forbids', () => {
+    const needle = textUtilityFor('--c-negative');
+    const bad = '<p className="text-sm ' + needle + '">boom</p>';
+    expect(bad.includes(needle)).toBe(true);
+    // …and the needle really is the utility form, not a near-miss.
+    expect(needle).toBe(['text-[var(', '--c-negative', ')]'].join(''));
+  });
+
   it('candidate-scoped source consumes the palette through --c-* tokens', () => {
     const consumers = CANDIDATE_SCOPE_SOURCES.filter((f) => f.endsWith('.tsx'));
     const using = consumers.filter((rel) => /var\(--c-[\w-]+\)/.test(read(rel)));
@@ -311,13 +363,29 @@ const CONTRAST_PAIRS: Array<[string, string, number, string]> = [
   ['--c-data-label-inside', '--c-accent', 4.5, 'label on a primary button'],
   ['--c-caution', '--c-caution-light', 4.5, 'caution badge text'],
   ['--c-data-label-outside', '--c-surface', 4.5, 'outside chart data label'],
+  // Every tinted ground a candidate component actually paints text on. The
+  // label ink is the secondary ink on ALL of them (see Tag, and the error
+  // state) — enumerated rather than sampled, because axe cannot check
+  // contrast under jsdom and this list is therefore the only guard there is.
+  ['--c-ink-secondary', '--c-accent-light', 4.5, 'tag label on the accent tint'],
+  ['--c-ink-secondary', '--c-positive-light', 4.5, 'tag label on the positive tint'],
+  ['--c-ink-secondary', '--c-caution-light', 4.5, 'tag label on the caution tint'],
+  ['--c-ink-secondary', '--c-negative-light', 4.5, 'error-state message on the rose tint'],
+  ['--c-accent', '--c-accent-light', 4.5, 'selected filter toggle on its own tint'],
   // Aliases the inherited utilities resolve through.
   ['--success', '--success-soft', 4.5, 'success badge text'],
   ['--error', '--error-soft', 4.5, 'error badge text'],
   ['--warning', '--warning-soft', 4.5, 'warning badge text'],
   ['--info', '--info-soft', 4.5, 'info badge text'],
   ['--ink-tertiary', '--c-bg', 4.5, 'inherited tertiary ink on the page ground'],
+  // LARGE text, 3:1 (WCAG 1.4.3 — the overall score is 36px bold, painted
+  // through an inline `style` rather than a utility, so the source ban below
+  // cannot see it and this list is what covers it).
+  ['--c-positive', '--c-surface', 3, 'overall score, strong band (36px bold)'],
+  ['--c-caution', '--c-surface', 3, 'overall score, fair band (36px bold)'],
+  ['--c-negative', '--c-surface', 3, 'overall score, low band (36px bold)'],
   // Non-text UI, 3:1 (WCAG 1.4.11).
+  ['--c-negative', '--c-bg', 3, 'error-state border vs the page ground'],
   ['--c-positive', '--c-border-light', 3, 'strong meter fill vs its track'],
   ['--c-caution', '--c-border-light', 3, 'fair meter fill vs its track'],
   ['--c-negative', '--c-border-light', 3, 'low meter fill vs its track'],
@@ -327,12 +395,39 @@ const CONTRAST_PAIRS: Array<[string, string, number, string]> = [
   ['--c-accent', '--c-surface', 3, 'focus ring vs the card'],
 ];
 
+/**
+ * Pairings this design DELIBERATELY does not use, with the sub-threshold
+ * number that is the reason.
+ *
+ * A rule kept only in a comment is a rule that gets broken: painting the
+ * error message in `--c-negative` on `--c-negative-light` is exactly what
+ * `CandidateErrorState` did until this was pinned, while `Tag` — carrying the
+ * same rule as prose — obeyed it. Asserting the REJECTED number keeps the ban
+ * checkable, and the tone-as-text source guard in §2 keeps it enforced.
+ */
+const REJECTED_TEXT_PAIRS: Array<[string, string, string]> = [
+  ['--c-negative', '--c-negative-light', 'rose on its own tint'],
+  ['--c-positive', '--c-positive-light', 'teal on its own tint'],
+  ['--c-ink-muted', '--c-bg', 'muted ink on the page ground'],
+  ['--c-border', '--c-surface', 'the hairline as a control boundary'],
+];
+
 describe('candidate palette contrast (WCAG 2.1)', () => {
   it.each(CONTRAST_PAIRS)(
     '%s on %s clears %s:1 (%s)',
     (fg, bg, minimum) => {
       const ratio = contrastRatio(token(fg), token(bg));
       expect(Number(ratio.toFixed(2))).toBeGreaterThanOrEqual(minimum);
+    },
+  );
+
+  it.each(REJECTED_TEXT_PAIRS)(
+    'REJECTED: %s on %s is below AA for normal text (%s)',
+    (fg, bg) => {
+      // Each of these is why the corresponding pairing moved. If one ever
+      // clears 4.5 the palette changed underneath us and the re-pairing
+      // decisions in docs/design/candidate-experience.md must be revisited.
+      expect(contrastRatio(token(fg), token(bg))).toBeLessThan(4.5);
     },
   );
 
@@ -413,5 +508,43 @@ describe('motion budget', () => {
 
   it('adds no keyframes or transition of its own to the palette file', () => {
     expect(paletteCss).not.toMatch(/@keyframes|animation:|transition:/);
+  });
+});
+
+/* ── 7. Why this arithmetic is the ONLY contrast guard ────────────── */
+
+describe('axe cannot check contrast under jsdom', () => {
+  /**
+   * This is not a disclaimer, it is a pinned fact.
+   *
+   * axe-core's `color-contrast` rule needs a canvas to resolve computed
+   * colours, so under jsdom it aborts and reports the node as INCOMPLETE
+   * rather than as a violation. `toHaveNoViolations` asserts only on
+   * `violations`, which means every axe suite in this repo is structurally
+   * incapable of failing on contrast — a genuinely failing pair sails
+   * through all four of them. That is exactly how `CandidateErrorState`
+   * shipped a 3.94:1 pairing past four green axe suites.
+   *
+   * So the pair list above is not a convenience, it is the whole guard, and
+   * it must enumerate every pair the components actually render.
+   *
+   * Asserting the limitation keeps it honest in both directions: if axe ever
+   * gains this capability under jsdom, THIS test fails and tells us the
+   * arithmetic list is no longer the only line of defence.
+   */
+  it('reports a genuinely failing pair as incomplete, never as a violation', async () => {
+    const { default: axe } = await import('axe-core');
+    document.body.innerHTML =
+      '<div style="background-color:#f7edf0">' +
+      '<p style="color:#b45a72;font-size:14px">rose on its own tint</p>' +
+      '</div>';
+    const result = await axe.run(document.body, { runOnly: ['color-contrast'] });
+    document.body.innerHTML = '';
+
+    // The pair really is below AA — the same number REJECTED_TEXT_PAIRS pins.
+    expect(contrastRatio('#b45a72', '#f7edf0')).toBeLessThan(4.5);
+    // …and axe still finds nothing to fail on.
+    expect(result.violations).toHaveLength(0);
+    expect(result.incomplete.length).toBeGreaterThan(0);
   });
 });

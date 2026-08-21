@@ -13,6 +13,8 @@ import { render, screen } from '@testing-library/react';
 import { describe, it, expect } from 'vitest';
 import {
   BAND_LABEL,
+  CandidateEmptyState,
+  CandidateErrorState,
   MAX_SURFACE_DEPTH,
   Meter,
   SurfaceCard,
@@ -232,6 +234,59 @@ describe('Tag', () => {
     expect(spans).toHaveLength(tones.length);
     for (const span of spans) {
       expect(span.className).toContain('text-[var(--c-ink-secondary)]');
+    }
+  });
+});
+
+/**
+ * Built from parts so Tailwind's content scanner — which reads test files as
+ * well as source — never sees a complete arbitrary-value class candidate and
+ * emits a dead rule for it into the production bundle.
+ */
+const TONE_TEXT_UTILITY = 'text-[var(' + '--c-negative' + ')]';
+const INK_TEXT_UTILITY = 'text-[var(' + '--c-ink-secondary' + ')]';
+
+describe('CandidateErrorState', () => {
+  /**
+   * The message is prose on a tinted ground, so it is governed by WCAG 1.4.3's
+   * 4.5:1 — and the approved rose reaches only 3.94:1 on its own tint. Tone
+   * therefore lives in the border and the fill; the words are ink.
+   *
+   * A DOM assertion rather than a snapshot: the failure mode is one className
+   * on one element, and a snapshot would have been updated alongside it.
+   */
+  it('paints the message in ink, never in the tone colour', () => {
+    render(<CandidateErrorState message="Something went wrong." />);
+    const message = screen.getByText('Something went wrong.');
+    expect(message.className).toContain(INK_TEXT_UTILITY);
+    expect(message.className).not.toContain(TONE_TEXT_UTILITY);
+  });
+
+  it('keeps the rose border and tint, so the state is still legible as an error', () => {
+    const { container } = render(<CandidateErrorState message="Nope." />);
+    const box = container.firstElementChild as HTMLElement;
+    expect(box.className).toContain('border-[var(' + '--c-negative' + ')]');
+    expect(box.className).toContain('bg-[var(' + '--c-negative-light' + ')]');
+  });
+
+  it('still offers a retry only when one is given', () => {
+    const { rerender } = render(<CandidateErrorState message="No retry." />);
+    expect(screen.queryByRole('button', { name: /try again/i })).toBeNull();
+    rerender(<CandidateErrorState message="Retry." onRetry={() => {}} />);
+    expect(screen.getByRole('button', { name: /try again/i })).toBeInTheDocument();
+  });
+
+  it('has no axe violations', async () => {
+    const { container } = render(
+      <CandidateErrorState message="Something went wrong." onRetry={() => {}} />,
+    );
+    await expect(container).toHaveNoViolations();
+  });
+
+  it('the empty state carries no tone colour on its text either', () => {
+    render(<CandidateEmptyState title="No candidates yet" hint="Upload a resume." />);
+    for (const text of ['No candidates yet', 'Upload a resume.']) {
+      expect(screen.getByText(text).className).not.toContain(TONE_TEXT_UTILITY);
     }
   });
 });

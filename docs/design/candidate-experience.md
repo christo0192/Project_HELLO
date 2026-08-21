@@ -47,10 +47,16 @@ changed, never the value. Four such decisions, each with a test:
 | Teal on its own tint (success badge) | 3.47:1 | The success **ink** is the deeper approved cyan `--c-cat-3` (4.62:1). The teal itself still fills meters, where 3.39:1 clears the 3:1 non-text bar. |
 | Rose on its own tint (error badge) | 3.94:1 | The approved rose has no darker sibling, so the error **ground** is the card surface (4.52:1). Hue survives in the badge dot and ring. |
 | Approved hairline as a control boundary | 1.31:1 | Inputs, selects, secondary buttons and filter toggles use `--c-control-border` (4.68:1). Decorative card hairlines keep `--c-border`. |
+| Rose message on the rose tint (`CandidateErrorState`) | 3.94:1 | Tone stays in the border and the fill; the message takes the secondary ink (9.04:1). Same rule `Tag` already applied — it was written down before it was enforced, and one component broke it. |
 
 `Tag` labels are always `--c-ink-secondary` (≥8.9:1 on every tint); tone is
 carried by the tint, the ring, a visible group label and an `srPrefix`.
 Nothing in the candidate experience is distinguishable by hue alone.
+
+The rule is now **enforced, not just written**: `--c-negative` and
+`--c-positive` are banned outright as text colours anywhere in candidate
+scope by a source guard, because neither has any ground in this fixed palette
+that clears 4.5:1 for normal text. Tone fills, rings and borders; ink writes.
 
 ---
 
@@ -184,9 +190,37 @@ declare no transition at all.
 
 ## 7. What is verified, and what is not
 
+### axe cannot check contrast here — so the arithmetic list is the whole guard
+
+axe-core's `color-contrast` rule needs a canvas to resolve computed colours.
+Under jsdom it aborts and reports the node as **incomplete**, and
+`toHaveNoViolations` asserts only on `violations`. Probed directly against
+this repo's own axe-core with a deliberately failing pair: `violations: 0,
+incomplete: 1, passes: 0`.
+
+Every axe suite in this repo is therefore **structurally incapable of failing
+on contrast**. That is not a theoretical gap: a 3.94:1 error-state pairing
+shipped past four green axe suites, and only an independent arithmetic
+re-derivation caught it.
+
+Two consequences, both now enforced:
+
+1. The pinned pair list is not a sample — it must enumerate **every**
+   foreground/background pair the components actually render, including the
+   tinted grounds.
+2. A source guard bans the two tone colours as text outright, because the
+   arithmetic list can only check pairs the design *intends*; a component is
+   free to pair two others, which is exactly what happened.
+
+The limitation itself is pinned by a test, so if axe ever gains this
+capability under jsdom, that test fails and tells us.
+
 Verified mechanically, on every run:
 
 - exact palette literals, and `.dark` equality
+- WCAG 2.1 arithmetic over every rendered pair, **plus** the rejected pairings
+  asserted to be below AA, so each re-pairing decision stays falsifiable
+- the two tone colours never appearing as a text utility in candidate source
 - the environment contract (`scripts/check-env-contract.mjs`), which the
   candidate code adds no runtime variable to
 - zero stock-Tailwind / brand / raw-literal / `dark:` colour sources in candidate-scoped code

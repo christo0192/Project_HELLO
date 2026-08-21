@@ -5,7 +5,10 @@
  * blocks three deep inside a bordered card, every level painted the same
  * fill, so "inside" and "beside" were indistinguishable. Depth here
  * is therefore both *visual* (a bordered surface vs. a sunken well) and
- * *enforced*: a third nesting level throws instead of quietly rendering.
+ * *enforced*: a third nesting level is REPORTED and CLAMPED — never thrown.
+ * The test harness fails on an unexpected `console.error`, so a composition
+ * mistake still stops CI, while a production page keeps rendering rather
+ * than blanking over a visual-hierarchy rule. See the guard below.
  *
  *   level="base"    bordered white surface — a real card
  *   level="sunken"  tinted well with no border — a block INSIDE a card
