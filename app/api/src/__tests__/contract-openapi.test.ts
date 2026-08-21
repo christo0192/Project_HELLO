@@ -898,7 +898,9 @@ describe('OpenAPI document integrity', () => {
     // + the two candidate-scoped Ashby review read routes
     // + the two read-only Ashby workflow-status reads (candidate-addressed
     //   and application-link-addressed).
-    expect(Object.keys(paths).length).toBe(76);
+    // + POST .../mission-control/ingestions/{applicationLinkId}/retry — the
+    //   bounded, audited parse-class ingestion recovery (0039).
+    expect(Object.keys(paths).length).toBe(77);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas

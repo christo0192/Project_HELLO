@@ -67,6 +67,112 @@ export type ScanClassifier = (status: string) => 'verdict' | 'availability' | 't
  */
 export const DEFAULT_SCAN_CLASSIFIER: ScanClassifier = () => 'verdict';
 
+/**
+ * How a PARSE failure should be treated.
+ *
+ * `verdict`    → the parser reached a conclusion ABOUT THIS DOCUMENT (it could
+ *                not be extracted, produced no/garbled output, or exceeded a
+ *                bound). Retrying re-burns attempts on a file that will fail
+ *                identically, so it is TERMINAL.
+ * `transient`  → the parser was UNAVAILABLE, not unwilling: it was killed by
+ *                the wall-clock timeout on a contended CPU, or the bounded
+ *                pool refused the submission. Nothing was learned about the
+ *                file, so writing `failed_review` records a wait as a verdict.
+ */
+export type ParseClassifier = (code: string) => 'verdict' | 'transient';
+
+/**
+ * The ONLY parse codes that may defer automatically.
+ *
+ * Deliberately two, and deliberately not "everything that is not a document
+ * verdict": `parse_spawn_error`, `parse_child_exit` and `parse_asset_missing`
+ * describe a broken deployment, and a broken deployment that quietly waits is
+ * a broken deployment nobody is paged for. Those rest loudly in
+ * `failed_review` and are recoverable through the audited admin path.
+ */
+export const PARSE_TRANSIENT_CODES: ReadonlySet<string> = new Set(['parse_timeout', 'parse_overload']);
+
+/**
+ * Default classifier used when a caller injects none: every parse failure is a
+ * verdict, i.e. the pre-repair behaviour, byte for byte.
+ *
+ * Fail-safe in the direction that matters, exactly as {@link DEFAULT_SCAN_CLASSIFIER}
+ * is: forgetting to wire the classifier closes an ingestion out loudly instead
+ * of parking it in an invisible wait.
+ */
+export const DEFAULT_PARSE_CLASSIFIER: ParseClassifier = () => 'verdict';
+
+/** The classifier production wires: availability defers, everything else rests. */
+export const PARSE_CLASSIFIER: ParseClassifier = (code) =>
+  PARSE_TRANSIENT_CODES.has(code) ? 'transient' : 'verdict';
+
+/**
+ * Stable codes the parser boundary may emit. `parse_error` is retained as the
+ * honest UNKNOWN: an error this module cannot recognise must not be dressed up
+ * as a diagnosis it did not make.
+ *
+ * Every member satisfies the 0029 `failed_reason` shape (`^[a-z0-9_.:-]{1,64}$`).
+ */
+export const PARSE_FAILURE_CODES = [
+  'parse_timeout',
+  'parse_overload',
+  'parse_output_exceeded',
+  'parse_asset_missing',
+  'parse_spawn_error',
+  'parse_child_exit',
+  'parse_no_output',
+  'parse_bad_output',
+  'parse_extract_failed',
+  'parse_error',
+] as const;
+
+export type ParseFailureCode = (typeof PARSE_FAILURE_CODES)[number];
+
+/** Stable `code` literals carried by the parser's error classes. */
+const PARSER_CODE_MAP: Readonly<Record<string, ParseFailureCode>> = {
+  PARSER_TIMEOUT: 'parse_timeout',
+  PARSER_OVERLOAD: 'parse_overload',
+  PARSER_OUTPUT_EXCEEDED: 'parse_output_exceeded',
+  PARSER_ASSET_MISSING: 'parse_asset_missing',
+};
+
+/** Stable `detail` literals carried by the generic `ParserError`. */
+const PARSER_DETAIL_MAP: Readonly<Record<string, ParseFailureCode>> = {
+  spawn_error: 'parse_spawn_error',
+  child_exit: 'parse_child_exit',
+  no_output: 'parse_no_output',
+  bad_output: 'parse_bad_output',
+  extract_failed: 'parse_extract_failed',
+};
+
+/**
+ * Map a thrown parser failure onto ONE stable code.
+ *
+ * Reads only the parser's fixed `code`/`detail` literals through two closed
+ * allowlists — never `err.message`, never `err.stack`, never child `stderr`,
+ * never any provider or document text. A value that is not in an allowlist is
+ * not "nearly" classified: it collapses to `parse_error`, which is what the
+ * durable row said before this function existed.
+ *
+ * Read STRUCTURALLY rather than with `instanceof` on purpose: this module is a
+ * pure domain orchestrator with no dependency on `lib/resume-parser.ts` (which
+ * pulls in `node:child_process`), and the classification must not become a
+ * reason to import a process spawner into it.
+ */
+export function classifyParserFailure(err: unknown): ParseFailureCode {
+  if (!(err instanceof Error)) return 'parse_error';
+  const rec = err as unknown as { code?: unknown; detail?: unknown };
+  if (typeof rec.code === 'string') {
+    const byCode = PARSER_CODE_MAP[rec.code];
+    if (byCode) return byCode;
+    if (rec.code === 'PARSER_ERROR' && typeof rec.detail === 'string') {
+      const byDetail = PARSER_DETAIL_MAP[rec.detail];
+      if (byDetail) return byDetail;
+    }
+  }
+  return 'parse_error';
+}
+
 /** A parsed document: extracted text + structured fields + a structurer tag. */
 export interface ParseOutput {
   text: string;
@@ -98,6 +204,11 @@ export interface IngestionPorts {
    * Defaults to "everything is a verdict" (see DEFAULT_SCAN_CLASSIFIER).
    */
   classifyScan?: ScanClassifier;
+  /**
+   * Classifies a stable parse failure code into verdict / transient.
+   * Defaults to "everything is a verdict" (see DEFAULT_PARSE_CLASSIFIER).
+   */
+  classifyParse?: ParseClassifier;
 }
 
 /** Opaque provenance recorded alongside a state transition. */
@@ -121,7 +232,23 @@ export type IngestionOutcome =
    * trigger and every legality proof built on eight, for a property that is
    * orthogonal to the state machine.
    */
-  | { state: 'deferred'; reason: string; scanStatus: string }
+  | {
+      state: 'deferred';
+      reason: string;
+      /**
+       * The status/code that caused the deferral. Named for the scan class it
+       * was introduced for; for a parse deferral it carries the stable parse
+       * code, and {@link IngestionOutcome.deferSource} is what distinguishes
+       * them.
+       */
+      scanStatus: string;
+      /**
+       * Which step deferred. Absent means `scan` — the only deferral that
+       * existed before parse deferral was added — so an older consumer keeps
+       * its exact prior meaning.
+       */
+      deferSource?: 'scan' | 'parse';
+    }
   | { state: 'cancelled'; reason: string };
 
 /** Whether the ingestion should abort as cancelled before a step (terminal link). */
@@ -209,10 +336,25 @@ export async function runResumeIngestion(
     let parsed: ParseOutput;
     try {
       parsed = await ports.parse(bytes, guard.mime);
-    } catch {
+    } catch (parseErr) {
+      // The durable row is `extracting` at this point (the transition above is
+      // what makes the guard/parse step observable), so this is the state the
+      // deferral has to be legal FROM — not `queued`. See migration 0039.
+      const code = classifyParserFailure(parseErr);
+      // Wiped before either exit. The deferral is a NEW way out of the
+      // pipeline and the wipe-on-every-exit guarantee extends to it, or the
+      // wait leaks the very bytes the ephemeral design protects.
       wipe();
-      await ports.onState('failed_review', { contentSha256, extractorVersion: ports.extractorVersion, failedReason: 'parse_error' });
-      return { state: 'failed_review', reason: 'parse_error' };
+      const classifyParse = ports.classifyParse ?? DEFAULT_PARSE_CLASSIFIER;
+      if (classifyParse(code) === 'transient') {
+        // No `onState` at all: the row keeps `extracting` and gains no failure
+        // reason, so nothing downstream (the invite prerequisite, the
+        // failed-parse health counter) reads an unavailable parser as a
+        // document that needs a human. The CALLER decides how to wait.
+        return { state: 'deferred', reason: code, scanStatus: code, deferSource: 'parse' };
+      }
+      await ports.onState('failed_review', { contentSha256, extractorVersion: ports.extractorVersion, failedReason: code });
+      return { state: 'failed_review', reason: code };
     }
 
     // ── structuring (deterministic; fallback preserved) ──────────────────

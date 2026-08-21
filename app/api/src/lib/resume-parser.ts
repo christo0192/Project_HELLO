@@ -39,6 +39,70 @@ const DEFAULT_MAX_OUTPUT_BYTES = 512_000; // 500 KiB
 /** Maximum bytes of input the child will read before failing closed. */
 const DEFAULT_MAX_INPUT_BYTES = 25 * 1024 * 1024; // 25 MiB, matches upload cap
 
+/** Clamp applied to a configured child timeout. */
+export const PARSER_TIMEOUT_BOUNDS = { def: DEFAULT_TIMEOUT_MS, min: 1_000, max: 300_000 } as const;
+/**
+ * Default old-space cap (MiB) for the child parser process.
+ *
+ * Unchanged from the value this module has always spawned with. It is now a
+ * BOUND rather than a literal so a deployment whose documents are heavier than
+ * the default assumes can raise it without a code change — and so that a test
+ * can pin it. The value that is right for a shared-CPU, 2 GiB machine that also
+ * hosts a ~1 GiB ClamAV signature set is deployment configuration, and lives in
+ * `fly.toml`, not here.
+ */
+const DEFAULT_CHILD_HEAP_MB = 256;
+/**
+ * Clamp applied to a configured child heap cap.
+ *
+ * The floor is the smallest cap under which the child has ever been observed
+ * to complete; the ceiling keeps a mis-set variable from letting one document
+ * evict the scanner's signature set on a 2 GiB machine. A value outside the
+ * range is CLAMPED, never honoured and never fatal — a typo in an env var must
+ * not take resume ingestion down.
+ */
+export const PARSER_CHILD_HEAP_MB_BOUNDS = { def: DEFAULT_CHILD_HEAP_MB, min: 128, max: 1_024 } as const;
+
+/** Parse + clamp an integer env value; a missing/garbled value takes the default. */
+function boundedInt(raw: string | undefined, bounds: { def: number; min: number; max: number }): number {
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw.trim())) return bounds.def;
+  const n = Number(raw.trim());
+  if (!Number.isFinite(n)) return bounds.def;
+  return Math.min(bounds.max, Math.max(bounds.min, Math.trunc(n)));
+}
+
+/**
+ * Default configuration source for this module.
+ *
+ * Each variable is named through `process.env.<VAR>` explicitly rather than by
+ * passing `process.env` wholesale, so the repository's environment contract
+ * (`scripts/check-env-contract.mjs`) can see exactly which variables this
+ * module reads — and so an injected `envSource` in a test is a CLOSED world
+ * that cannot silently inherit an ambient value.
+ */
+function defaultParserEnv(): NodeJS.ProcessEnv {
+  return {
+    RESUME_PARSER_TIMEOUT_MS: process.env.RESUME_PARSER_TIMEOUT_MS,
+    RESUME_PARSER_CHILD_HEAP_MB: process.env.RESUME_PARSER_CHILD_HEAP_MB,
+  };
+}
+
+/**
+ * Configured child timeout (ms), clamped.
+ *
+ * Read HERE rather than only at the HTTP route, because the Ashby ingestion
+ * path reaches the parser through the bounded pool and never passed a
+ * `timeoutMs` at all — so `RESUME_PARSER_TIMEOUT_MS` was configuration that
+ * applied to one of the two callers. Both honour it now.
+ */
+export function resumeParserTimeoutMs(source: NodeJS.ProcessEnv = defaultParserEnv()): number {
+  return boundedInt(source.RESUME_PARSER_TIMEOUT_MS, PARSER_TIMEOUT_BOUNDS);
+}
+
+/** Configured child old-space cap (MiB), clamped. */
+export function resumeParserChildHeapMb(source: NodeJS.ProcessEnv = defaultParserEnv()): number {
+  return boundedInt(source.RESUME_PARSER_CHILD_HEAP_MB, PARSER_CHILD_HEAP_MB_BOUNDS);
+}
 // ── Types ───────────────────────────────────────────────────────────────────
 
 /** Stage timing hook payload — metadata only (never candidate data). */
@@ -66,6 +130,13 @@ export interface ParserConfig {
   childScript?: string;
   /** Explicit Node executable path (default: process.execPath). */
   nodeBin?: string;
+  /**
+   * Child old-space cap in MiB. Clamped to {@link PARSER_CHILD_HEAP_MB_BOUNDS};
+   * omitted takes the `RESUME_PARSER_CHILD_HEAP_MB` value, itself clamped.
+   */
+  childHeapMb?: number;
+  /** Env source for the configured defaults (test seam). */
+  envSource?: NodeJS.ProcessEnv;
   /**
    * Development/test ONLY: permit a `.ts` child via tsx when the `.mjs` asset
    * is absent. Defaults to false so production fails closed.
@@ -101,10 +172,17 @@ export async function parseResume(
   mime: string,
   config: ParserConfig = {},
 ): Promise<ParserResult> {
-  const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const envSource = config.envSource ?? defaultParserEnv();
+  const timeoutMs = config.timeoutMs ?? resumeParserTimeoutMs(envSource);
   const maxTextLength = config.maxTextLength ?? DEFAULT_MAX_TEXT_LENGTH;
   const maxOutputBytes = config.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
   const maxInputBytes = config.maxInputBytes ?? DEFAULT_MAX_INPUT_BYTES;
+  const childHeapMb = config.childHeapMb === undefined
+    ? resumeParserChildHeapMb(envSource)
+    : Math.min(
+        PARSER_CHILD_HEAP_MB_BOUNDS.max,
+        Math.max(PARSER_CHILD_HEAP_MB_BOUNDS.min, Math.trunc(config.childHeapMb)),
+      );
 
   // Resolve the child script FAIL-CLOSED before spawning or touching input.
   const libDir = dirname(fileURLToPath(import.meta.url));
@@ -118,7 +196,10 @@ export async function parseResume(
     const child = spawn(command, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       shell: false, // No shell — prevents shell injection entirely.
-      env: { ...process.env, NODE_OPTIONS: '--max-old-space-size=256' },
+      // The cap is CLAMPED before it reaches here, so this interpolation can
+      // only ever be an integer in [128, 1024] — never attacker- or
+      // operator-supplied text in a spawn argument.
+      env: { ...process.env, NODE_OPTIONS: `--max-old-space-size=${childHeapMb}` },
     });
 
     const startedAt = Date.now();

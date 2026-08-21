@@ -52,7 +52,7 @@ import {
 import { runReconciliation, DEFAULT_CHECKPOINT_KEY } from './reconciliation.js';
 import type { ReconcileResult, ReconcileSkipCounts, ReconcileStop } from './reconciliation.js';
 import { runAshbyOperationPass } from './operation-worker.js';
-import { materializeCandidate } from './materialize.js';
+import { materializeCandidate, materializeCandidateShell } from './materialize.js';
 import { extractFileUrl, type AshbyRuntime } from './runtime.js';
 import { MAX_FILE_HANDLE_LEN } from './client.js';
 import { isAshbyError, type AshbyErrorCategory } from './errors.js';
@@ -104,6 +104,49 @@ export const DEFAULT_SCANNER_DEFER_DEADLINE_MS = 28_800_000;
 
 /** Sanitized reason recorded when the bounded ingestion requeue ceiling is hit. */
 export const DEFER_EXHAUSTED_REASON = 'scan_deferral_exhausted';
+
+/**
+ * Delay between PARSE deferrals.
+ *
+ * The two deferrable parse codes are `parse_timeout` (the child was killed on
+ * a contended CPU) and `parse_overload` (the bounded pool refused). Both clear
+ * on the order of one document's worth of work, so this is short — but not as
+ * short as the scanner's transient class, because a parse retry re-downloads
+ * the file and therefore costs a provider call each time.
+ */
+export const DEFAULT_PARSE_DEFER_SECONDS = 120;
+
+/**
+ * Wall-clock bound on how long one job may keep deferring on the parser.
+ *
+ * SHIPPED IN THE SAME CHANGE AS THE DEFERRAL, deliberately. A deferral is a
+ * weakening of a terminal bound, and a weakening whose mitigation lands later
+ * is a weakening that ships alone. One hour: a contended CPU or a saturated
+ * pool that has not cleared in an hour is not busy, it is broken, and the
+ * honest report of a broken parser is a loud failure a human can see.
+ *
+ * Wall clock rather than a defer counter, for the same reason the scanner's
+ * bound is: a counter that gates a control needs a reset lifecycle or it
+ * becomes a one-way latch. A deadline derived from the job's own creation
+ * resets with every new enqueue and needs no lifecycle at all.
+ */
+export const DEFAULT_PARSE_DEFER_DEADLINE_MS = 3_600_000;
+
+/** Sanitized reason recorded when a parse deferral outlives its deadline. */
+export const PARSE_DEFER_DEADLINE_REASON = 'parse_defer_deadline';
+
+/** Sanitized reason recorded when parse requeues hit the bounded ceiling. */
+export const PARSE_DEFER_EXHAUSTED_REASON = 'parse_defer_exhausted';
+
+/**
+ * Sanitized reason recorded when the parse-deferral SEAM is unavailable.
+ *
+ * Fail-loud rather than fail-silent: a runtime that cannot record a wait must
+ * not take one. Resting the row in `failed_review` with its own code keeps the
+ * condition visible and recoverable through the audited admin path, instead of
+ * dropping the job on the floor.
+ */
+export const PARSE_DEFER_UNAVAILABLE_REASON = 'parse_defer_unavailable';
 
 /** Deterministic dedup key for one link's ingestion. */
 export function ingestionDedupKey(applicationLinkId: string): string {
@@ -240,6 +283,10 @@ export interface AshbyHandlerDeps {
   scannerDeferSeconds?: number;
   /** Wall-clock bound on how long one job may keep deferring on the scanner. */
   scannerDeferDeadlineMs?: number;
+  /** Delay applied to a parse deferral (clamped by the queue). */
+  parseDeferSeconds?: number;
+  /** Wall-clock bound on how long one job may keep deferring on the parser. */
+  parseDeferDeadlineMs?: number;
   /** Injectable clock for the deadline (tests). */
   nowMs?: () => number;
 }
@@ -264,6 +311,8 @@ export function buildAshbyHandlers(
   const scannerDeferDeadlineMs = deps.scannerDeferDeadlineMs
     ?? rc?.scannerDeferDeadlineMs
     ?? DEFAULT_SCANNER_DEFER_DEADLINE_MS;
+  const parseDeferSeconds = deps.parseDeferSeconds ?? DEFAULT_PARSE_DEFER_SECONDS;
+  const parseDeferDeadlineMs = deps.parseDeferDeadlineMs ?? DEFAULT_PARSE_DEFER_DEADLINE_MS;
   const nowMs = deps.nowMs ?? (() => Date.now());
   const gates = {
     enabled: true,
@@ -307,7 +356,35 @@ export function buildAshbyHandlers(
         stores: runtime.stores,
         resolveMapping: (jobId) => runtime.resolveMappingByJobId(jobId),
         readResumeFileHandle: (info) => extractResumeHandle(info),
+        // The shell seam. Ownership is resolved HERE, through the same
+        // `resolveMappingForLink` the ready path already uses, so there is one
+        // answer to "who owns rows created for this link" and not two.
+        materializeShell: async (applicationLinkId) => {
+          const link = await runtime.stores.readLink(applicationLinkId);
+          // A terminal application gains no candidate. Not a failure.
+          if (!link || link.terminalState) {
+            return { status: 'skipped', reason: 'blocked_terminal' };
+          }
+          const mapping = await runtime.resolveMappingForLink(applicationLinkId);
+          // Only an ENABLED mapping may create rows (a pause landing between
+          // the import decision and this write). Nothing to own ⇒ no shell,
+          // and no retry loop against a mapping that is off on purpose.
+          if (!mapping) return { status: 'skipped', reason: 'no_mapping' };
+          return materializeCandidateShell(applicationLinkId, {
+            store: runtime.materialization,
+            mapping,
+            isTerminal: false,
+            existingCandidateId: link.candidateId,
+          });
+        },
       });
+      // The shell could not be bound. Throwing is the point: the durable
+      // import job must NOT complete while the row that makes this application
+      // visible does not exist. Every step of `runImport` is idempotent, so
+      // the queue's ordinary bounded retry re-runs it safely, and a job that
+      // exhausts its attempts dead-letters LOUDLY instead of leaving an
+      // invisible candidate behind.
+      if (result.status === 'shell_unbound') throw new Error('ashby_import_shell_unbound');
       if (result.status !== 'imported') return;
 
       // Seed the ephemeral ingestion as durable work — but ONLY when there is
@@ -468,6 +545,57 @@ export function buildAshbyHandlers(
       // out, or lost its database mid-flight. That is not a statement about
       // the resume, so the row must not be written off. It returns to `queued`
       // (0037 retry edge) and the queue job defers with its attempt refunded.
+      // ── Post-parse deferral: the PARSER never produced a verdict ────────
+      // The document was fetched and screened safe; the parser child was then
+      // killed by its wall-clock timeout, or the bounded pool refused the
+      // submission. Neither is a statement about the document, so neither may
+      // rest the row in `failed_review` — the same conflation PR #69 removed
+      // from the scanner and PR #66 removed from the invite budget.
+      //
+      // The durable row is `extracting` here, NOT `queued`: the guard/parse
+      // step transitions first so it is observable. `extracting -> queued` is
+      // therefore the edge that has to exist, and migration 0039 makes it
+      // legal ONLY through this guarded, reason-allowlisted, attempt-charging
+      // RPC — `advance_ashby_ingestion` still refuses it.
+      if (
+        result.status === 'done'
+        && result.outcome.state === 'deferred'
+        && result.outcome.deferSource === 'parse'
+      ) {
+        const parseCode = result.outcome.reason;
+
+        // BOUND, shipped with the weakening it bounds. Derived from the job's
+        // own creation so it resets with every enqueue and needs no counter.
+        const waitedMs = Math.max(0, nowMs() - Date.parse(job.createdAt));
+        if (Number.isFinite(waitedMs) && waitedMs > parseDeferDeadlineMs) {
+          await failIngestion(PARSE_DEFER_DEADLINE_REASON);
+          return;
+        }
+
+        // No seam ⇒ no way to record the wait ⇒ do not take one.
+        if (!runtime.stores.deferIngestionParse) {
+          await failIngestion(PARSE_DEFER_UNAVAILABLE_REASON);
+          return;
+        }
+        const requeued = await runtime.stores.deferIngestionParse(linkId, parseCode);
+        if (requeued.status !== 'ok') {
+          // `retry_exhausted` (the unchanged 0032 ceiling) or a concurrent
+          // cancel. The row cannot go back, so rest it loudly rather than
+          // defer a job whose durable state can never advance again.
+          if (requeued.status === 'retry_exhausted') {
+            await failIngestion(PARSE_DEFER_EXHAUSTED_REASON);
+          } else {
+            await failIngestion(parseCode);
+          }
+          return;
+        }
+        return {
+          outcome: 'defer',
+          reasonCode: parseCode,
+          delaySeconds: parseDeferSeconds,
+        } satisfies QueueDeferDirective;
+      }
+
       if (result.status === 'done' && result.outcome.state === 'deferred') {
         // Normalised through the SAME minting function the readiness gate
         // uses, so both deferral classes land in one durable vocabulary and
@@ -508,11 +636,25 @@ export function buildAshbyHandlers(
       if (result.status === 'done' && result.outcome.state === 'ready') {
         const mapping = await runtime.resolveMappingForLink(linkId);
         if (mapping) {
+          // RE-READ the binding rather than reusing the row captured before
+          // the ingestion ran. `link` was read at the top of this handler,
+          // possibly minutes and one full download/scan/parse ago; the import
+          // that bound the shell may have landed inside that window. A stale
+          // null here would create a SECOND candidate for the same
+          // application — the one outcome the CAS exists to prevent, reached
+          // by never consulting it.
+          // Best-effort: the row is already durably `ready` at this point, so a
+          // throw here would leave the candidate unpopulated forever (a retry
+          // short-circuits on the terminal state). A failed re-read therefore
+          // falls back to the stale value, which is SAFE because the CAS in
+          // `materializeCandidate` catches the race anyway and now populates
+          // the winner rather than abandoning the parse.
+          const fresh = await runtime.stores.readLink(linkId).catch(() => null);
           await materializeCandidate(linkId, result.outcome.structured, {
             store: runtime.materialization,
             mapping,
             isTerminal: false,
-            existingCandidateId: link.candidateId,
+            existingCandidateId: fresh?.candidateId ?? link.candidateId,
           });
         }
       }

@@ -37,6 +37,7 @@ import { createWorkflowStores, createMissionControlStore, type MissionControlSto
 import { createPinnedHttpsTransport } from './resume-transport.js';
 import { fetchEphemeralResume } from './resume-fetch.js';
 import type { UrlPolicy } from './ssrf.js';
+import { PARSE_CLASSIFIER } from './resume-ingestion.js';
 import type { IngestionPorts, ParseOutput, StructuredResume } from './resume-ingestion.js';
 import type { RuntimeWorkflowStores, ResolvedMapping } from './orchestration.js';
 import type { MappingResolver } from './signal-worker.js';
@@ -203,6 +204,72 @@ export function createMaterializationStore(client: SupabaseClient): Materializat
         .single();
       if (error || !data) throw new Error('ashby_candidate_insert_error');
       return { id: (data as { id: string }).id };
+    },
+    async insertCandidateShell(input) {
+      // ── PII-MINIMAL BY CONSTRUCTION ─────────────────────────────────────
+      // Every candidate-derived column is left at its NULL/empty default.
+      // Nothing here is read from Ashby: `role_id`/`owner_id` come from OUR
+      // job mapping, and no external/provider identifier is written as
+      // identity (`ats_external_id` stays null — the application link owns
+      // that relationship, and copying a provider id onto the candidate would
+      // create a second, unversioned join key).
+      //
+      // `status: 'queued'` is the honest funnel position for "imported,
+      // awaiting screening" and is already a member of `chk_candidates_status`
+      // (0004) — no status vocabulary is widened by this change.
+      //
+      // `consent_at` stays null for exactly the reason documented on
+      // `insertCandidate` below: an import is not a consent event.
+      const { data, error } = await client
+        .from('candidates')
+        .insert({
+          role_id: input.roleId,
+          owner_id: input.ownerId,
+          resume_id: null,
+          name: null,
+          email: null,
+          phone_raw: null,
+          phone_e164: null,
+          phone_valid: false,
+          skills: [],
+          experience_years: null,
+          parsed: null,
+          status: 'queued',
+          ats_source: 'ashby',
+        })
+        .select('id')
+        .single();
+      if (error || !data) throw new Error('ashby_candidate_shell_insert_error');
+      return { id: (data as { id: string }).id };
+    },
+    async updateCandidateFromParse(input) {
+      // CAS on `resume_id is null`. Running the ready path twice therefore
+      // writes ONCE: the second run matches zero rows, the caller drops the
+      // resume it created, and no duplicate accumulates.
+      //
+      // The update list is an ALLOWLIST of parse-derived fields. `role_id`,
+      // `owner_id`, `status` and `ats_source` are absent on purpose: ownership
+      // and funnel position were decided at import, and a parse completing is
+      // not an event that may revise either.
+      const p = input.parsed;
+      const { data, error } = await client
+        .from('candidates')
+        .update({
+          resume_id: input.resumeId,
+          name: p.name,
+          email: p.email,
+          phone_raw: p.phone,
+          skills: p.skills ?? [],
+          experience_years: p.experience_years,
+          parsed: p,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', input.candidateId)
+        .is('resume_id', null)
+        .select('id')
+        .maybeSingle();
+      if (error) throw new Error('ashby_candidate_populate_error');
+      return { updated: data != null };
     },
     async bindLinkColumn(input) {
       // Compare-and-set: only bind when the column is still null. Zero rows
@@ -448,6 +515,11 @@ export function createAshbyRuntime(options: CreateAshbyRuntimeOptions): AshbyRun
       // not-safe status as a verdict — the pre-repair behaviour.
       classifyScan: (status) =>
         classifyScanStatus(status as Parameters<typeof classifyScanStatus>[0]),
+      // Tells the ingestion orchestrator which PARSE failures are answers
+      // about the document (terminal) and which mean the parser was simply
+      // unavailable (deferrable). Unwired, the orchestrator treats every parse
+      // failure as a verdict — the pre-repair behaviour, byte for byte.
+      classifyParse: PARSE_CLASSIFIER,
       onState: input.onState,
       extractorVersion: ASHBY_EXTRACTOR_VERSION,
     };

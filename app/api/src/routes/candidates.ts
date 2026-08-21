@@ -43,6 +43,67 @@ function latestAssessmentByCandidate(
   return map;
 }
 
+/**
+ * The ONE sanitized resume-review enum a candidate row may carry.
+ *
+ * `null` for every non-Ashby candidate, and for an Ashby candidate whose
+ * ingestion row cannot be read. Nothing else about the integration crosses
+ * this boundary: no application link id, no external Ashby id, no file handle,
+ * no `failed_reason` text, no attempt counter.
+ */
+export type ResumeReview = 'ready' | 'processing' | 'needs_review' | 'cancelled';
+
+/**
+ * Project a durable 0029 ingestion state onto that enum.
+ *
+ * `failed_review` becomes `needs_review` deliberately: the list says a HUMAN
+ * needs to look, and says nothing whatsoever about why. The nine parse causes,
+ * the scan verdicts and the guard rejections are all operator information and
+ * live in Mission Control, which is admin-gated; a recruiter list is not the
+ * place to disclose that a particular document was rejected by a malware
+ * scanner.
+ *
+ * An unknown state maps to null rather than being guessed at.
+ */
+export function projectResumeReview(state: unknown): ResumeReview | null {
+  switch (state) {
+    case 'ready': return 'ready';
+    case 'cancelled': return 'cancelled';
+    case 'failed_review': return 'needs_review';
+    case 'queued':
+    case 'fetching':
+    case 'scanning':
+    case 'extracting':
+    case 'structuring':
+      return 'processing';
+    default: return null;
+  }
+}
+
+interface RawLinkRow {
+  candidate_id?: unknown;
+  updated_at?: unknown;
+  ashby_resume_ingestions?: Array<{ state?: unknown }> | { state?: unknown } | null;
+}
+
+/**
+ * Reduce link rows (ordered `updated_at` DESC) to one resume-review value per
+ * candidate — first seen wins, the same idiom `latestAssessmentByCandidate`
+ * uses. A candidate holding more than one Ashby application reports its most
+ * recently updated one rather than a list the list view cannot disambiguate.
+ */
+function resumeReviewByCandidate(rows: RawLinkRow[] | null): Map<string, ResumeReview | null> {
+  const map = new Map<string, ResumeReview | null>();
+  for (const row of rows ?? []) {
+    const id = row.candidate_id;
+    if (typeof id !== 'string' || map.has(id)) continue;
+    const embedded = row.ashby_resume_ingestions;
+    const ingestion = Array.isArray(embedded) ? embedded[0] : embedded ?? undefined;
+    map.set(id, projectResumeReview(ingestion?.state));
+  }
+  return map;
+}
+
 // List candidates (optionally by role) — viewer and above.
 // Interviewer sees only own records; admin/viewer see all. Each row is
 // enriched with the latest assessment recommendation + score (nullable),
@@ -80,6 +141,29 @@ candidatesRouter.get('/', requireRole('viewer'), validateQuery(listCandidatesQue
     latest = latestAssessmentByCandidate(assessments as never);
   }
 
+  // ONE additional bounded query for the whole page — an `in (...)` over the
+  // same candidate set the assessments query already uses, with the ingestion
+  // state embedded. Not a per-row lookup: a list of 50 candidates issues one
+  // extra query, not 50.
+  //
+  // A failure here degrades to `null` rather than failing the list: the
+  // resume-review column is strictly additive diagnostic information, and the
+  // candidate list must not stop working because the Ashby tables are
+  // unavailable.
+  let resumeReview = new Map<string, ResumeReview | null>();
+  if (ids.length > 0) {
+    try {
+      const { data: links, error: linkErr } = await supabase
+        .from('ashby_application_links')
+        .select('candidate_id, updated_at, ashby_resume_ingestions ( state )')
+        .eq('provider', 'ashby')
+        .in('candidate_id', ids)
+        .order('updated_at', { ascending: false })
+        .limit(1, { foreignTable: 'ashby_resume_ingestions' });
+      if (!linkErr) resumeReview = resumeReviewByCandidate(links as RawLinkRow[] | null);
+    } catch { /* additive only — never fails the list */ }
+  }
+
   const enriched = rows.map((row) => {
     // Strip the internal block field; it drives suppression only.
     const { decision_use_blocked_at, ...pub } = row;
@@ -89,6 +173,10 @@ candidatesRouter.get('/', requireRole('viewer'), validateQuery(listCandidatesQue
       ...pub,
       latest_recommendation: blocked ? null : la?.recommendation ?? null,
       latest_score: blocked ? null : la?.overall_score ?? null,
+      // Nullable by design, and truthfully so: a PII-minimal shell created at
+      // import has null `name`/`email` and this is the only field that says
+      // anything about it at all.
+      resume_review: resumeReview.get(row.id) ?? null,
     };
   });
 

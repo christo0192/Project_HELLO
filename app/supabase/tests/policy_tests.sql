@@ -6611,13 +6611,22 @@ begin
   perform _policy_tests.assert('ashby 0037: scanning -> queued is a legal retry edge',
     v_res->>'status' = 'ok', 'got ' || coalesce(v_res->>'status','null'));
 
-  -- extracting keeps NO such edge: by then the bytes were parsed.
+  -- extracting keeps no edge ON THIS PATH: by then the bytes were parsed.
+  --
+  -- SUPERSEDED IN MECHANISM BY 0039, NOT IN EFFECT. 0037 refused this at the
+  -- TRIGGER (`invalid_transition`). 0039 makes the edge exist so a parse
+  -- deferral can use it, and moves the refusal into `advance_ashby_ingestion`
+  -- itself (`not_requeueable` / `parse_defer_only`). What matters — that the
+  -- generic path, which `runImport` calls on every webhook redelivery, can
+  -- never requeue a mid-parse row and re-download the resume — is unchanged,
+  -- and this assertion still proves exactly that.
   v_res := screening_v2.advance_ashby_ingestion(v_link, 'fetching', null, null, null, null);
   v_res := screening_v2.advance_ashby_ingestion(v_link, 'scanning', null, null, null, null);
   v_res := screening_v2.advance_ashby_ingestion(v_link, 'extracting', null, null, null, null);
   v_res := screening_v2.advance_ashby_ingestion(v_link, 'queued', null, null, null, null);
-  perform _policy_tests.assert('ashby 0037: extracting -> queued stays illegal',
-    v_res->>'status' = 'invalid_transition', 'got ' || coalesce(v_res->>'status','null'));
+  perform _policy_tests.assert('ashby 0037/0039: the GENERIC path never requeues from extracting',
+    v_res->>'status' = 'not_requeueable' and v_res->>'reason' = 'parse_defer_only',
+    'got ' || coalesce(v_res::text,'null'));
 
   -- An AVAILABILITY failure stays recoverable: it never had a verdict.
   v_res := screening_v2.advance_ashby_ingestion(v_link, 'failed_review', null, null, null,
@@ -6966,6 +6975,325 @@ begin
   -- is exactly the property the reopen audit relies on. The synthetic rows are
   -- left in place deliberately; they carry no candidate data.
   delete from screening_v2.call_sessions where id = v_sid;
+end;
+$$;
+
+-- =====================================================================
+-- 0039: Parse-class ingestion resilience — the guarded extracting -> queued
+--       edge, the BOUNDED audited recovery (deliberately NOT a counter
+--       reset), and the additive parse-failure counter.
+-- =====================================================================
+
+select _policy_tests.assert(
+  'ashby 0039: defer_ashby_ingestion_parse is service-role only',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname = 'defer_ashby_ingestion_parse'
+      and not has_function_privilege('anon', p.oid, 'EXECUTE')
+      and not has_function_privilege('authenticated', p.oid, 'EXECUTE')
+      and has_function_privilege('service_role', p.oid, 'EXECUTE')
+  ) = 1,
+  'the only door to extracting -> queued must not be reachable from a browser role'
+);
+
+select _policy_tests.assert(
+  'ashby 0039: recover_ashby_ingestion_parse is service-role only',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname = 'recover_ashby_ingestion_parse'
+      and not has_function_privilege('anon', p.oid, 'EXECUTE')
+      and not has_function_privilege('authenticated', p.oid, 'EXECUTE')
+      and has_function_privilege('service_role', p.oid, 'EXECUTE')
+  ) = 1,
+  'an audited admin recovery must not be reachable from a browser role'
+);
+
+select _policy_tests.assert(
+  'ashby 0039: both new SECURITY DEFINER RPCs pin search_path',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname in ('defer_ashby_ingestion_parse','recover_ashby_ingestion_parse')
+      and p.prosecdef
+      and array_to_string(coalesce(p.proconfig, '{}'), ',') like '%search_path%'
+  ) = 2,
+  'every SECURITY DEFINER RPC must pin search_path'
+);
+
+select _policy_tests.assert(
+  'ashby 0039: the new audit action is permitted',
+  (select pg_get_constraintdef(oid) from pg_constraint
+    where conname = 'chk_audit_action'
+      and conrelid = 'screening_v2.audit_events'::regclass)
+    like '%ashby_ingestion_parse_recovery%',
+  'the 0039 audit action must be in chk_audit_action'
+);
+
+select _policy_tests.assert(
+  'ashby 0039: re-declaring chk_audit_action dropped none of the earlier actions',
+  (select bool_and(pg_get_constraintdef(c.oid) like ('%' || a || '%'))
+     from pg_constraint c,
+          unnest(array['invite_sent','grant_issued','recording_quarantined',
+                       'ashby_mapping_update','ashby_operation_retry',
+                       'ashby_invite_delivered','ashby_ingestion_attempts_reset']) as a
+    where c.conname = 'chk_audit_action'
+      and c.conrelid = 'screening_v2.audit_events'::regclass),
+  'widening chk_audit_action must be purely additive'
+);
+
+do $$
+declare
+  v_role      uuid;
+  v_map       uuid;
+  v_link      uuid;   -- the parse-deferral path
+  v_link_doc  uuid;   -- document verdict            → refused everywhere
+  v_link_leg  uuid;   -- legacy generic parse_error  → recoverable ONCE per attempt
+  v_link_term uuid;   -- terminal application        → refused
+  v_link_gen  uuid;   -- the generic advance() refusal of extracting -> queued
+  v_res       jsonb;
+  v_att       integer;
+  v_state     text;
+  v_reason    text;
+  v_audit     jsonb;
+  v_backlog   jsonb;
+  v_owner     uuid := '00000000-0000-4000-8000-0000000000ac';
+  i           integer;
+begin
+  select id into v_role from screening_v2.roles limit 1;
+  if v_role is null then
+    perform _policy_tests.assert('ashby 0039 functional: seed role present', false, 'no seed role available');
+    return;
+  end if;
+
+  insert into screening_v2.ashby_job_mappings
+    (external_job_id, role_id, owner_id, ai_screening_stage_id, ta_screening_stage_id, status, delivery_mode)
+  values ('pol39-job', v_role, v_owner, 'pol39-ai', 'pol39-ta', 'enabled', 'manual')
+  returning id into v_map;
+
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol39-app',      'pol39-job', v_map, repeat('h', 64)) returning id into v_link;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol39-app-doc',  'pol39-job', v_map, repeat('h', 64)) returning id into v_link_doc;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol39-app-leg',  'pol39-job', v_map, repeat('h', 64)) returning id into v_link_leg;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol39-app-term', 'pol39-job', v_map, repeat('h', 64)) returning id into v_link_term;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol39-app-gen',  'pol39-job', v_map, repeat('h', 64)) returning id into v_link_gen;
+
+  -- ── The GENERIC path must still refuse extracting -> queued ────────────
+  -- This is the guard that keeps the new edge from becoming a general
+  -- re-download: runImport calls advance(link,'queued') unconditionally on
+  -- every webhook redelivery.
+  perform screening_v2.advance_ashby_ingestion(v_link_gen, 'queued', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_gen, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_gen, 'scanning', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_gen, 'extracting', null, null, null, null);
+  v_res := screening_v2.advance_ashby_ingestion(v_link_gen, 'queued', null, null, null, null);
+  perform _policy_tests.assert(
+    'ashby 0039: advance_ashby_ingestion REFUSES extracting -> queued',
+    v_res->>'status' = 'not_requeueable' and v_res->>'reason' = 'parse_defer_only',
+    'the new edge belongs to defer_ashby_ingestion_parse alone; got ' || coalesce(v_res::text,'<null>'));
+
+  select state, attempts into v_state, v_att
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_gen;
+  perform _policy_tests.assert(
+    'ashby 0039: the refused generic requeue changed nothing',
+    v_state = 'extracting' and v_att = 0,
+    'got state=' || coalesce(v_state,'<null>') || ' attempts=' || coalesce(v_att::text,'<null>'));
+
+  -- ── The guarded deferral: reason allowlist, state guard, terminal guard ─
+  perform screening_v2.advance_ashby_ingestion(v_link, 'queued', null, null, null, null);
+  v_res := screening_v2.defer_ashby_ingestion_parse(v_link, 'parse_timeout');
+  perform _policy_tests.assert(
+    'ashby 0039 refusal: the deferral is legal ONLY from extracting',
+    v_res->>'status' = 'invalid_state' and v_res->>'state' = 'queued',
+    'got ' || coalesce(v_res::text,'<null>'));
+
+  perform screening_v2.advance_ashby_ingestion(v_link, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link, 'scanning', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link, 'extracting', null, null, null, null);
+
+  v_res := screening_v2.defer_ashby_ingestion_parse(v_link, 'parse_extract_failed');
+  perform _policy_tests.assert(
+    'ashby 0039 refusal: a DOCUMENT verdict may never defer',
+    v_res->>'status' = 'not_deferrable' and v_res->>'reason' = 'parse_extract_failed',
+    'only parser AVAILABILITY defers; got ' || coalesce(v_res::text,'<null>'));
+
+  v_res := screening_v2.defer_ashby_ingestion_parse(v_link, 'parse_child_exit');
+  perform _policy_tests.assert(
+    'ashby 0039 refusal: a broken deployment rests loudly rather than waiting silently',
+    v_res->>'status' = 'not_deferrable' and v_res->>'reason' = 'parse_child_exit',
+    'got ' || coalesce(v_res::text,'<null>'));
+
+  -- The ok path: back to queued, no failure reason, ONE attempt charged.
+  v_res := screening_v2.defer_ashby_ingestion_parse(v_link, 'parse_timeout');
+  perform _policy_tests.assert(
+    'ashby 0039: a parse deferral requeues and charges exactly one attempt',
+    v_res->>'status' = 'ok'
+      and v_res->>'state' = 'queued'
+      and (v_res->>'attempts')::int = 1
+      and (v_res->>'max_attempts')::int = 5,
+    'got ' || coalesce(v_res::text,'<null>'));
+
+  select state, failed_reason into v_state, v_reason
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link;
+  perform _policy_tests.assert(
+    'ashby 0039: a deferred row carries NO failure reason',
+    v_state = 'queued' and v_reason is null,
+    'nothing was learned about the document; got state=' || coalesce(v_state,'<null>')
+      || ' reason=' || coalesce(v_reason,'<null>'));
+
+  -- ── The ceiling is NOT relaxed by the deferral. ───────────────────────
+  for i in 1..4 loop
+    perform screening_v2.advance_ashby_ingestion(v_link, 'fetching', null, null, null, null);
+    perform screening_v2.advance_ashby_ingestion(v_link, 'scanning', null, null, null, null);
+    perform screening_v2.advance_ashby_ingestion(v_link, 'extracting', null, null, null, null);
+    perform screening_v2.defer_ashby_ingestion_parse(v_link, 'parse_overload');
+  end loop;
+  perform screening_v2.advance_ashby_ingestion(v_link, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link, 'scanning', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link, 'extracting', null, null, null, null);
+  v_res := screening_v2.defer_ashby_ingestion_parse(v_link, 'parse_overload');
+  perform _policy_tests.assert(
+    'ashby 0039: parse deferrals are bounded by the UNCHANGED 5-attempt ceiling',
+    v_res->>'status' = 'retry_exhausted' and (v_res->>'max_attempts')::int = 5,
+    'a deferral buys bounded patience, not unbounded patience; got ' || coalesce(v_res::text,'<null>'));
+
+  -- ── Recovery: document verdicts are never recoverable ─────────────────
+  perform screening_v2.advance_ashby_ingestion(v_link_doc, 'queued', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_doc, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_doc, 'scanning', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_doc, 'extracting', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_doc, 'failed_review', null, null, null, 'parse_extract_failed');
+  v_res := screening_v2.recover_ashby_ingestion_parse(v_link_doc, v_owner);
+  perform _policy_tests.assert(
+    'ashby 0039 refusal: a document verdict is not recoverable',
+    v_res->>'status' = 'not_a_parse_availability_failure'
+      and v_res->>'failed_reason' = 'parse_extract_failed',
+    'retrying an unparseable document re-burns attempts on a file that needs a human; got '
+      || coalesce(v_res::text,'<null>'));
+
+  v_res := screening_v2.recover_ashby_ingestion_parse(gen_random_uuid(), v_owner);
+  perform _policy_tests.assert(
+    'ashby 0039 refusal: an unknown link is not_found',
+    v_res->>'status' = 'not_found', 'got ' || coalesce(v_res::text,'<null>'));
+
+  perform screening_v2.advance_ashby_ingestion(v_link_term, 'queued', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_term, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_term, 'failed_review', null, null, null, 'parse_timeout');
+  update screening_v2.ashby_application_links set terminal_state = 'withdrawn' where id = v_link_term;
+  v_res := screening_v2.recover_ashby_ingestion_parse(v_link_term, v_owner);
+  perform _policy_tests.assert(
+    'ashby 0039 refusal: a withdrawn application is blocked_terminal',
+    v_res->>'status' = 'blocked_terminal' and v_res->>'terminal_state' = 'withdrawn',
+    'got ' || coalesce(v_res::text,'<null>'));
+
+  v_res := screening_v2.recover_ashby_ingestion_parse(v_link_gen, v_owner);
+  perform _policy_tests.assert(
+    'ashby 0039 refusal: a live (non failed_review) ingestion is not_recoverable',
+    v_res->>'status' = 'not_recoverable',
+    'got ' || coalesce(v_res::text,'<null>'));
+
+  -- ── Legacy `parse_error`: recoverable for RECLASSIFICATION, and BOUNDED ─
+  perform screening_v2.advance_ashby_ingestion(v_link_leg, 'queued', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_leg, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_leg, 'scanning', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_leg, 'extracting', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_leg, 'failed_review', null, null, null, 'parse_error');
+
+  -- The GENERIC path still refuses it: an unknown failure must not be retried
+  -- automatically on every webhook redelivery.
+  v_res := screening_v2.advance_ashby_ingestion(v_link_leg, 'queued', null, null, null, null);
+  perform _policy_tests.assert(
+    'ashby 0039: the generic path still refuses legacy parse_error',
+    v_res->>'status' = 'not_requeueable' and v_res->>'failed_reason' = 'parse_error',
+    'only the audited recovery may reclassify it; got ' || coalesce(v_res::text,'<null>'));
+
+  v_res := screening_v2.recover_ashby_ingestion_parse(v_link_leg, v_owner);
+  perform _policy_tests.assert(
+    'ashby 0039: the audited recovery DOES accept legacy parse_error, and charges an attempt',
+    v_res->>'status' = 'ok'
+      and v_res->>'state' = 'queued'
+      and (v_res->>'attempts_before')::int = 0
+      and (v_res->>'attempts')::int = 1,
+    'a row that never recorded its cause deserves ONE bounded retry to name it; got '
+      || coalesce(v_res::text,'<null>'));
+
+  select state, failed_reason into v_state, v_reason
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_leg;
+  perform _policy_tests.assert(
+    'ashby 0039: the recovered row is queued and carries no stale reason',
+    v_state = 'queued' and v_reason is null,
+    'got state=' || coalesce(v_state,'<null>') || ' reason=' || coalesce(v_reason,'<null>'));
+
+  select metadata into v_audit
+    from screening_v2.audit_events
+   where action = 'ashby_ingestion_parse_recovery'
+     and metadata->>'application_link_id' = v_link_leg::text
+   order by created_at desc limit 1;
+  perform _policy_tests.assert(
+    'ashby 0039: the recovery is audited with the matched reason and both counts',
+    v_audit is not null
+      and v_audit->>'failed_reason' = 'parse_error'
+      and (v_audit->>'attempts_before')::int = 0
+      and (v_audit->>'attempts_after')::int = 1,
+    'an unattributable retry is indistinguishable from a raw UPDATE; got '
+      || coalesce(v_audit::text,'<null>'));
+
+  -- BOUNDED, not resettable: burn the remaining budget and confirm it stops.
+  for i in 1..4 loop
+    perform screening_v2.advance_ashby_ingestion(v_link_leg, 'fetching', null, null, null, null);
+    perform screening_v2.advance_ashby_ingestion(v_link_leg, 'failed_review', null, null, null, 'parse_timeout');
+    perform screening_v2.recover_ashby_ingestion_parse(v_link_leg, v_owner);
+  end loop;
+  perform screening_v2.advance_ashby_ingestion(v_link_leg, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_leg, 'failed_review', null, null, null, 'parse_timeout');
+  v_res := screening_v2.recover_ashby_ingestion_parse(v_link_leg, v_owner);
+  perform _policy_tests.assert(
+    'ashby 0039: the recovery CANNOT reset attempts — it exhausts like any requeue',
+    v_res->>'status' = 'retry_exhausted' and (v_res->>'max_attempts')::int = 5,
+    'this is deliberately not 0036: the ceiling is the bound and stays the bound; got '
+      || coalesce(v_res::text,'<null>'));
+
+  select attempts into v_att
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_leg;
+  perform _policy_tests.assert(
+    'ashby 0039: an exhausted row keeps its counter',
+    v_att = 5, 'got attempts=' || coalesce(v_att::text,'<null>'));
+
+  -- ── The additive backlog counter sees BOTH legacy and sub-classified ───
+  v_backlog := screening_v2.ashby_prerequisite_backlog(900);
+  perform _policy_tests.assert(
+    'ashby 0039: ashby_prerequisite_backlog reports ingestion_failed_parse',
+    v_backlog ? 'ingestion_failed_parse'
+      and (v_backlog->>'ingestion_failed_parse')::int >= 2,
+    'the parse-class queue must be visible to operations (v_link_doc + v_link_leg); got '
+      || coalesce(v_backlog::text,'<null>'));
+
+  perform _policy_tests.assert(
+    'ashby 0039: every pre-existing backlog counter still exists',
+    v_backlog ? 'pending_blocked'
+      and v_backlog ? 'pending_blocked_failed_ingestion'
+      and v_backlog ? 'failed_prerequisite'
+      and v_backlog ? 'ingestion_stuck_queued'
+      and v_backlog ? 'ingestion_stuck_fetching',
+    'widening the counter set must be purely additive; got ' || coalesce(v_backlog::text,'<null>'));
+
+  -- Audit rows are append-only (0007) and deliberately left behind, exactly as
+  -- the 0036 block does; every id they reference is a local fixture.
+  delete from screening_v2.ashby_resume_ingestions
+   where application_link_id in (v_link, v_link_doc, v_link_leg, v_link_term, v_link_gen);
+  delete from screening_v2.ashby_application_links
+   where id in (v_link, v_link_doc, v_link_leg, v_link_term, v_link_gen);
+  delete from screening_v2.ashby_job_mappings where id = v_map;
 end;
 $$;
 
