@@ -124,6 +124,51 @@ if grep -Eq '[[:space:]]FAIL([[:space:]]|$)' "$RESULTS_FILE"; then
   exit 1
 fi
 
+# ===================================================================
+# 0040: GENUINELY CONCURRENT recovery race.
+#
+# `recover_ashby_ingestion_parse` now admits the ashby.ingestion job in
+# its own transaction, so "two operators clicked retry at the same time"
+# must charge one attempt, write one audit row and admit ONE job. The
+# mechanism is a row lock on the application link, which by construction
+# cannot be observed from a single session — so this fires three real,
+# independent backends at one rested row and then asserts the durable
+# consequences. Sequential proof of the same invariant lives in
+# policy_tests.sql; this is the part that suite cannot express.
+# ===================================================================
+readonly POL40C_LINK='40000000-0000-4000-8000-0000000000c1'
+readonly POL40C_ACTOR='00000000-0000-4000-8000-0000000000ad'
+
+log '0040: Seeding the concurrent-recovery fixture...'
+docker exec -i "$SUPABASE_DB_CONTAINER" \
+  psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+  < app/supabase/tests/recovery_concurrency_setup.sql
+
+log '0040: Firing THREE concurrent recover_ashby_ingestion_parse calls...'
+POL40C_OUT="$(mktemp)"
+for _ in 1 2 3; do
+  docker exec "$SUPABASE_DB_CONTAINER" \
+    psql -U postgres -d postgres -t -A -c \
+    "select screening_v2.recover_ashby_ingestion_parse('${POL40C_LINK}'::uuid, '${POL40C_ACTOR}'::uuid)->>'status'" \
+    >> "$POL40C_OUT" 2>&1 &
+done
+wait
+
+POL40C_OK="$(grep -c '^ok$' "$POL40C_OUT" || true)"
+POL40C_REFUSED="$(grep -c '^not_recoverable$' "$POL40C_OUT" || true)"
+if [ "$POL40C_OK" != '1' ] || [ "$POL40C_REFUSED" != '2' ]; then
+  log "ERROR: 0040 concurrency FAILED — expected 1 ok + 2 not_recoverable, got ok=${POL40C_OK} not_recoverable=${POL40C_REFUSED}"
+  cat "$POL40C_OUT"
+  rm -f "$POL40C_OUT"
+  exit 1
+fi
+rm -f "$POL40C_OUT"
+log '0040: One winner, two refusals — asserting the durable consequences...'
+docker exec -i "$SUPABASE_DB_CONTAINER" \
+  psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+  < app/supabase/tests/recovery_concurrency_assert.sql
+log '0040: PASS — concurrent recoveries charge one attempt and admit exactly one job.'
+
 log 'Verifying custom-schema anon denial through PostgREST...'
 ANON_KEY="$(supabase_cli status -o env 2>/dev/null \
   | sed -n 's/^ANON_KEY="\(.*\)"$/\1/p' | head -1)"

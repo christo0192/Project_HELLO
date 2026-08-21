@@ -7362,6 +7362,585 @@ begin
 end;
 $$;
 
+-- =====================================================================
+-- 0040: Queue admission for the audited recovery — the transition and the
+--       durable work are ONE transaction.
+--
+-- 0039 moved `failed_review -> queued`, charged an attempt and wrote a
+-- `success` audit row while scheduling NOTHING: the original
+-- `ashby.ingestion` job had completed, the governing event receipt was
+-- already terminal, and the 0030 outbox therefore declines to re-drive on
+-- every subsequent reconciliation pass and webhook redelivery. The row
+-- rested in `queued` for ever, having LEFT the operator queue that was
+-- watching it. These tests are the assertion that was never written: after
+-- a successful recovery, durable CLAIMABLE work must exist.
+-- =====================================================================
+
+select _policy_tests.assert(
+  'ashby 0040: recover_ashby_ingestion_parse is STILL service-role only',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname = 'recover_ashby_ingestion_parse'
+      and p.prosecdef
+      and array_to_string(coalesce(p.proconfig, '{}'), ',') like '%search_path%'
+      and not has_function_privilege('anon', p.oid, 'EXECUTE')
+      and not has_function_privilege('authenticated', p.oid, 'EXECUTE')
+      and has_function_privilege('service_role', p.oid, 'EXECUTE')
+  ) = 1,
+  'replacing the body must not widen the grant or unpin search_path'
+);
+
+select _policy_tests.assert(
+  'ashby 0040: exactly ONE recover_ashby_ingestion_parse overload exists',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname = 'recover_ashby_ingestion_parse') = 1,
+  'a changed signature would leave the OLD non-enqueuing body callable'
+);
+
+-- The deadlock argument, asserted rather than asserted-in-prose:
+-- `cancel_ashby_application` locks the LINK and then writes the ingestion.
+-- The recovery must take the same two locks in the same order.
+select _policy_tests.assert(
+  'ashby 0040: the recovery locks the LINK before the ingestion',
+  (select position('from screening_v2.ashby_application_links' in body) > 0
+      and position('from screening_v2.ashby_resume_ingestions' in body) > 0
+      and position('from screening_v2.ashby_application_links' in body)
+        < position('from screening_v2.ashby_resume_ingestions' in body)
+     from (select pg_get_functiondef(p.oid) as body
+             from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+            where n.nspname = 'screening_v2'
+              and p.proname = 'recover_ashby_ingestion_parse') s),
+  'cancel_ashby_application takes link-then-ingestion; the reverse order here '
+  'would be a deadlock-prone inversion between two service-role writers'
+);
+
+do $$
+declare
+  v_role      uuid;
+  v_map       uuid;
+  v_link_ok   uuid;   -- happy path: legacy parse_error, no prior job
+  v_link_done uuid;   -- a COMPLETED old job must not block a new one
+  v_link_live uuid;   -- a live pending job must not be duplicated
+  v_link_term uuid;   -- terminal application     → no job, no state change
+  v_link_act  uuid;   -- a job already IN FLIGHT  → refused, nothing spent
+  v_link_can  uuid;   -- fully cancelled          → no job, no audit
+  v_link_doc  uuid;   -- document verdict         → no job
+  v_link_ex   uuid;   -- exhausted budget         → no job
+  v_link_fail uuid;   -- enqueue FAILS            → everything rolls back
+  v_owner     uuid := '00000000-0000-4000-8000-0000000000ad';
+  v_res       jsonb;
+  v_payload   jsonb;
+  v_state     text;
+  v_reason    text;
+  v_att       integer;
+  v_att0      integer;
+  v_cnt       integer;
+  v_audits    integer;
+  v_job       record;
+  v_old_job   uuid;
+  v_now       timestamptz := now();
+  i           integer;
+begin
+  select id into v_role from screening_v2.roles limit 1;
+  if v_role is null then
+    perform _policy_tests.assert('ashby 0040 functional: seed role present', false,
+      'no seed role available');
+    return;
+  end if;
+
+  insert into screening_v2.ashby_job_mappings
+    (external_job_id, role_id, owner_id, ai_screening_stage_id, ta_screening_stage_id,
+     status, delivery_mode)
+  values ('pol40-job', v_role, v_owner, 'pol40-ai', 'pol40-ta', 'enabled', 'manual')
+  returning id into v_map;
+
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol40-app-ok',   'pol40-job', v_map, repeat('h', 64)) returning id into v_link_ok;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol40-app-done', 'pol40-job', v_map, repeat('h', 64)) returning id into v_link_done;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol40-app-live', 'pol40-job', v_map, repeat('h', 64)) returning id into v_link_live;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol40-app-term', 'pol40-job', v_map, repeat('h', 64)) returning id into v_link_term;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol40-app-act',  'pol40-job', v_map, repeat('h', 64)) returning id into v_link_act;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol40-app-can',  'pol40-job', v_map, repeat('h', 64)) returning id into v_link_can;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol40-app-doc',  'pol40-job', v_map, repeat('h', 64)) returning id into v_link_doc;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol40-app-ex',   'pol40-job', v_map, repeat('h', 64)) returning id into v_link_ex;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol40-app-fail', 'pol40-job', v_map, repeat('h', 64)) returning id into v_link_fail;
+
+  -- ═══════════════════════════════════════════════════════════════════
+  -- 1. The assertion that was never written: a successful recovery leaves
+  --    a CLAIMABLE job, not merely a `queued` row.
+  -- ═══════════════════════════════════════════════════════════════════
+  perform screening_v2.advance_ashby_ingestion(v_link_ok, 'queued',    null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_ok, 'fetching',  null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_ok, 'scanning',  null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_ok, 'extracting',null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_ok, 'failed_review', null, null, null,
+                                               'parse_error');
+  select attempts into v_att0
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_ok;
+
+  -- Nothing is live BEFORE the recovery — this is the shipped defect's
+  -- starting state: the original ingestion job COMPLETED long ago.
+  select count(*) into v_cnt
+    from screening_v2.job_queue
+   where name = 'ashby.ingestion'
+     and dedup_key = 'ashby:ingestion:' || v_link_ok::text;
+  perform _policy_tests.assert(
+    'ashby 0040 precondition: no ashby.ingestion job exists before the recovery',
+    v_cnt = 0, 'got ' || v_cnt || ' pre-existing job(s)');
+
+  v_res := screening_v2.recover_ashby_ingestion_parse(v_link_ok, v_owner, v_now);
+  perform _policy_tests.assert(
+    'ashby 0040: the recovery still transitions and charges exactly one attempt',
+    v_res->>'status' = 'ok'
+      and v_res->>'state' = 'queued'
+      and (v_res->>'attempts')::int = v_att0 + 1
+      and (v_res->>'max_attempts')::int = 5,
+    'the 0039 response contract must be byte-for-byte unchanged; got '
+      || coalesce(v_res::text, '<null>'));
+
+  select count(*) into v_cnt
+    from screening_v2.job_queue
+   where name = 'ashby.ingestion'
+     and dedup_key = 'ashby:ingestion:' || v_link_ok::text;
+  select * into v_job
+    from screening_v2.job_queue
+   where name = 'ashby.ingestion'
+     and dedup_key = 'ashby:ingestion:' || v_link_ok::text
+   limit 1;
+
+  perform _policy_tests.assert(
+    'ashby 0040: a successful recovery leaves EXACTLY ONE claimable ingestion job',
+    v_cnt = 1 and v_job.status = 'pending',
+    'a transition that owes work must guarantee the work in the same '
+    'transaction; got ' || v_cnt || ' job(s) status='
+      || coalesce(v_job.status, '<null>'));
+
+  perform _policy_tests.assert(
+    'ashby 0040: the job matches ordinary ingestion enqueue semantics exactly',
+    v_job.max_attempts = 5
+      and v_job.attempts = 0
+      and v_job.priority = 0
+      and v_job.scheduled_at = v_now,
+    'a recovered ingestion must be indistinguishable from an imported one on '
+    'the queue; got max_attempts=' || coalesce(v_job.max_attempts::text, '<null>')
+      || ' attempts=' || coalesce(v_job.attempts::text, '<null>')
+      || ' priority=' || coalesce(v_job.priority::text, '<null>')
+      || ' scheduled_at=' || coalesce(v_job.scheduled_at::text, '<null>'));
+
+  -- The payload the HANDLER reads. camelCase `applicationLinkId`; snake_case
+  -- would dead-letter the job as `malformed_ingestion_payload`.
+  v_payload := v_job.payload;
+  perform _policy_tests.assert(
+    'ashby 0040: the payload is EXACTLY the consumer contract, and nothing else',
+    v_payload = jsonb_build_object('provider', 'ashby',
+                                   'applicationLinkId', v_link_ok::text),
+    'the handler reads payload.applicationLinkId; any other shape dead-letters. '
+    'got ' || coalesce(v_payload::text, '<null>'));
+
+  perform _policy_tests.assert(
+    'ashby 0040: the payload carries no external id, candidate field, handle or PII',
+    (select count(*) from jsonb_object_keys(v_payload)) = 2
+      and v_payload::text not like '%' || repeat('h', 64) || '%'
+      and v_payload::text not like '%pol40-app%'
+      and v_payload::text not like '%pol40-job%'
+      and not (v_payload ? 'external_application_id')
+      and not (v_payload ? 'external_resume_file_handle')
+      and not (v_payload ? 'resume_url')
+      and not (v_payload ? 'failed_reason'),
+    'queue payloads are opaque identifiers only; got '
+      || coalesce(v_payload::text, '<null>'));
+
+  select count(*) into v_audits
+    from screening_v2.audit_events
+   where action = 'ashby_ingestion_parse_recovery'
+     and metadata->>'application_link_id' = v_link_ok::text
+     and result = 'success';
+  perform _policy_tests.assert(
+    'ashby 0040: exactly one success audit row accompanies the admitted job',
+    v_audits = 1, 'got ' || v_audits || ' audit row(s)');
+
+  -- ── A SECOND recovery while the row is queued changes nothing ────────
+  -- This is the observable consequence of the `for update` serialisation:
+  -- the loser sees `queued`, is refused, charges nothing, audits nothing,
+  -- and creates no second job.
+  v_res := screening_v2.recover_ashby_ingestion_parse(v_link_ok, v_owner, v_now);
+  select count(*) into v_cnt
+    from screening_v2.job_queue
+   where name = 'ashby.ingestion'
+     and dedup_key = 'ashby:ingestion:' || v_link_ok::text
+     and status in ('pending', 'active', 'delayed');
+  select attempts into v_att
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_ok;
+  select count(*) into v_audits
+    from screening_v2.audit_events
+   where action = 'ashby_ingestion_parse_recovery'
+     and metadata->>'application_link_id' = v_link_ok::text;
+  perform _policy_tests.assert(
+    'ashby 0040: a repeat recovery is refused and creates no second job/charge/audit',
+    v_res->>'status' = 'not_recoverable'
+      and v_res->>'state' = 'queued'
+      and v_cnt = 1
+      and v_att = v_att0 + 1
+      and v_audits = 1,
+    'got ' || coalesce(v_res::text, '<null>') || ' live_jobs=' || v_cnt
+      || ' attempts=' || coalesce(v_att::text, '<null>') || ' audits=' || v_audits);
+
+  -- ═══════════════════════════════════════════════════════════════════
+  -- 2. A COMPLETED old job does not block a new one.
+  --    `uq_job_queue_dedup_active` is partial over pending/active/delayed.
+  -- ═══════════════════════════════════════════════════════════════════
+  perform screening_v2.advance_ashby_ingestion(v_link_done, 'queued',   null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_done, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_done, 'failed_review', null, null, null,
+                                               'parse_timeout');
+  insert into screening_v2.job_queue
+    (name, payload, status, dedup_key, attempts, max_attempts, priority,
+     scheduled_at, completed_at)
+  values
+    ('ashby.ingestion',
+     jsonb_build_object('provider', 'ashby', 'applicationLinkId', v_link_done),
+     'completed', 'ashby:ingestion:' || v_link_done::text, 1, 5, 0, v_now, v_now)
+  returning id into v_old_job;
+
+  v_res := screening_v2.recover_ashby_ingestion_parse(v_link_done, v_owner, v_now);
+  select count(*) into v_cnt
+    from screening_v2.job_queue
+   where dedup_key = 'ashby:ingestion:' || v_link_done::text
+     and status in ('pending', 'active', 'delayed');
+  perform _policy_tests.assert(
+    'ashby 0040: a COMPLETED old job permits a fresh live one',
+    v_res->>'status' = 'ok' and v_cnt = 1,
+    'the dedup index covers live statuses only — a finished job must never '
+    'make a row unrecoverable; got ' || coalesce(v_res::text, '<null>')
+      || ' live_jobs=' || v_cnt);
+
+  -- ═══════════════════════════════════════════════════════════════════
+  -- 3. A pre-existing LIVE job converges to exactly one — the transition
+  --    still happens, and no duplicate work is admitted.
+  -- ═══════════════════════════════════════════════════════════════════
+  perform screening_v2.advance_ashby_ingestion(v_link_live, 'queued',   null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_live, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_live, 'failed_review', null, null, null,
+                                               'materialize_failed');
+  insert into screening_v2.job_queue
+    (name, payload, status, dedup_key, attempts, max_attempts, priority, scheduled_at)
+  values
+    ('ashby.ingestion',
+     jsonb_build_object('provider', 'ashby', 'applicationLinkId', v_link_live),
+     'pending', 'ashby:ingestion:' || v_link_live::text, 0, 5, 0, v_now);
+
+  v_res := screening_v2.recover_ashby_ingestion_parse(v_link_live, v_owner, v_now);
+  select count(*) into v_cnt
+    from screening_v2.job_queue
+   where dedup_key = 'ashby:ingestion:' || v_link_live::text
+     and status in ('pending', 'active', 'delayed');
+  select state into v_state
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_live;
+  perform _policy_tests.assert(
+    'ashby 0040: a live job is not duplicated, and the transition still holds',
+    v_res->>'status' = 'ok' and v_cnt = 1 and v_state = 'queued',
+    'ok must mean "live work exists", never "a second copy was made"; got '
+      || coalesce(v_res::text, '<null>') || ' live_jobs=' || v_cnt
+      || ' state=' || coalesce(v_state, '<null>'));
+
+  -- ═══════════════════════════════════════════════════════════════════
+  -- 3b. An ACTIVE job is a job a worker has already CLAIMED, and it may be
+  --     seconds from completing. Treating it as "live work exists" would
+  --     recreate the shipped defect inside the fix: `queued` with nothing
+  --     runnable. The dedup index forbids inserting a second one, so the
+  --     honest answer is a refusal — given BEFORE anything is written, so
+  --     no attempt is spent and there is nothing to roll back.
+  -- ═══════════════════════════════════════════════════════════════════
+  perform screening_v2.advance_ashby_ingestion(v_link_act, 'queued',   null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_act, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_act, 'failed_review', null, null, null,
+                                               'parse_timeout');
+  select attempts into v_att0
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_act;
+  insert into screening_v2.job_queue
+    (name, payload, status, dedup_key, attempts, max_attempts, priority,
+     scheduled_at, started_at)
+  values
+    ('ashby.ingestion',
+     jsonb_build_object('provider', 'ashby', 'applicationLinkId', v_link_act),
+     'active', 'ashby:ingestion:' || v_link_act::text, 1, 5, 0, v_now, v_now);
+
+  v_res := screening_v2.recover_ashby_ingestion_parse(v_link_act, v_owner, v_now);
+  select state, attempts into v_state, v_att
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_act;
+  select count(*) into v_audits
+    from screening_v2.audit_events
+   where action = 'ashby_ingestion_parse_recovery'
+     and metadata->>'application_link_id' = v_link_act::text;
+  select count(*) into v_cnt
+    from screening_v2.job_queue
+   where dedup_key = 'ashby:ingestion:' || v_link_act::text;
+  perform _policy_tests.assert(
+    'ashby 0040: an IN-FLIGHT job refuses the retry without spending anything',
+    v_res->>'status' = 'ingestion_job_in_flight'
+      and v_state = 'failed_review'
+      and v_att = v_att0
+      and v_audits = 0
+      and v_cnt = 1,
+    'a claimed job about to complete must never be counted as the work this '
+    'recovery owes; got ' || coalesce(v_res::text, '<null>')
+      || ' state=' || coalesce(v_state, '<null>')
+      || ' attempts=' || coalesce(v_att::text, '<null>')
+      || ' audits=' || v_audits || ' jobs=' || v_cnt);
+
+  -- Once that job finishes, the ordinary recovery admits a fresh one.
+  update screening_v2.job_queue
+     set status = 'completed', completed_at = v_now
+   where dedup_key = 'ashby:ingestion:' || v_link_act::text;
+  v_res := screening_v2.recover_ashby_ingestion_parse(v_link_act, v_owner, v_now);
+  select count(*) into v_cnt
+    from screening_v2.job_queue
+   where dedup_key = 'ashby:ingestion:' || v_link_act::text
+     and status in ('pending', 'active', 'delayed');
+  perform _policy_tests.assert(
+    'ashby 0040: the refusal is a WAIT, not a dead end — the next retry succeeds',
+    v_res->>'status' = 'ok'
+      and (v_res->>'attempts')::int = v_att0 + 1
+      and v_cnt = 1,
+    'got ' || coalesce(v_res::text, '<null>') || ' live_jobs=' || v_cnt);
+
+  -- ═══════════════════════════════════════════════════════════════════
+  -- 4. Every REFUSAL admits nothing. A refused recovery must leave the
+  --    queue exactly as it found it.
+  -- ═══════════════════════════════════════════════════════════════════
+  -- 4a. Terminal application — now decided under the LINK row lock.
+  perform screening_v2.advance_ashby_ingestion(v_link_term, 'queued',   null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_term, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_term, 'failed_review', null, null, null,
+                                               'parse_timeout');
+  select attempts into v_att0
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_term;
+  -- The RACE this closes: the link goes terminal while the ingestion is
+  -- still rested in `failed_review`. Before 0040 the link was read without
+  -- `for update`, so a cancel committing between the check and the update
+  -- could leave `queued` behind — which now also means an admitted job.
+  update screening_v2.ashby_application_links
+     set terminal_state = 'withdrawn' where id = v_link_term;
+  v_res := screening_v2.recover_ashby_ingestion_parse(v_link_term, v_owner, v_now);
+  select count(*) into v_cnt
+    from screening_v2.job_queue
+   where dedup_key = 'ashby:ingestion:' || v_link_term::text;
+  select state, attempts into v_state, v_att
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_term;
+  select count(*) into v_audits
+    from screening_v2.audit_events
+   where action = 'ashby_ingestion_parse_recovery'
+     and metadata->>'application_link_id' = v_link_term::text;
+  perform _policy_tests.assert(
+    'ashby 0040: a TERMINAL application admits NO job, changes no state, audits nothing',
+    v_res->>'status' = 'blocked_terminal'
+      and v_res->>'terminal_state' = 'withdrawn'
+      and v_cnt = 0
+      and v_state = 'failed_review'
+      and v_att = v_att0
+      and v_audits = 0,
+    'terminal is terminal in both tables and on the queue; got '
+      || coalesce(v_res::text, '<null>') || ' jobs=' || v_cnt
+      || ' state=' || coalesce(v_state, '<null>') || ' audits=' || v_audits);
+
+  -- 4a-bis. A FULL cancel also cancels the ingestion (0031), so the row is
+  -- refused one gate earlier — by state rather than by terminality. Either
+  -- way nothing is admitted.
+  perform screening_v2.advance_ashby_ingestion(v_link_can, 'queued',   null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_can, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_can, 'failed_review', null, null, null,
+                                               'parse_timeout');
+  select attempts into v_att0
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_can;
+  perform screening_v2.cancel_ashby_application(v_link_can, 'withdrawn', 'pol40', v_owner,
+                                                'system');
+  v_res := screening_v2.recover_ashby_ingestion_parse(v_link_can, v_owner, v_now);
+  select count(*) into v_cnt
+    from screening_v2.job_queue
+   where dedup_key = 'ashby:ingestion:' || v_link_can::text;
+  select state, attempts into v_state, v_att
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_can;
+  select count(*) into v_audits
+    from screening_v2.audit_events
+   where action = 'ashby_ingestion_parse_recovery'
+     and metadata->>'application_link_id' = v_link_can::text;
+  perform _policy_tests.assert(
+    'ashby 0040: a CANCELLED ingestion admits NO job, changes no state, audits nothing',
+    v_res->>'status' = 'not_recoverable'
+      and v_res->>'state' = 'cancelled'
+      and v_cnt = 0
+      and v_state = 'cancelled'
+      and v_att = v_att0
+      and v_audits = 0,
+    'a cancelled ingestion must never be resurrected onto the queue; got '
+      || coalesce(v_res::text, '<null>') || ' jobs=' || v_cnt
+      || ' state=' || coalesce(v_state, '<null>') || ' audits=' || v_audits);
+
+  -- 4b. Document verdict.
+  perform screening_v2.advance_ashby_ingestion(v_link_doc, 'queued',    null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_doc, 'fetching',  null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_doc, 'scanning',  null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_doc, 'extracting',null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_doc, 'failed_review', null, null, null,
+                                               'parse_extract_failed');
+  v_res := screening_v2.recover_ashby_ingestion_parse(v_link_doc, v_owner, v_now);
+  select count(*) into v_cnt
+    from screening_v2.job_queue
+   where dedup_key = 'ashby:ingestion:' || v_link_doc::text;
+  perform _policy_tests.assert(
+    'ashby 0040: a DOCUMENT verdict admits no job',
+    v_res->>'status' = 'not_a_parse_availability_failure' and v_cnt = 0,
+    'the queue must never be used to re-burn attempts on a file that needs a '
+    'human; got ' || coalesce(v_res::text, '<null>') || ' jobs=' || v_cnt);
+
+  -- 4c. Exhausted budget.
+  perform screening_v2.advance_ashby_ingestion(v_link_ex, 'queued',   null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_ex, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_ex, 'failed_review', null, null, null,
+                                               'parse_timeout');
+  update screening_v2.ashby_resume_ingestions
+     set attempts = 5 where application_link_id = v_link_ex;
+  v_res := screening_v2.recover_ashby_ingestion_parse(v_link_ex, v_owner, v_now);
+  select count(*) into v_cnt
+    from screening_v2.job_queue
+   where dedup_key = 'ashby:ingestion:' || v_link_ex::text;
+  perform _policy_tests.assert(
+    'ashby 0040: an EXHAUSTED row admits no job',
+    v_res->>'status' = 'retry_exhausted' and v_cnt = 0,
+    'the ceiling still bounds the work, not just the bookkeeping; got '
+      || coalesce(v_res::text, '<null>') || ' jobs=' || v_cnt);
+
+  -- ═══════════════════════════════════════════════════════════════════
+  -- 5. THE INVARIANT ITSELF: if the enqueue cannot be made durable, the
+  --    state change, the attempt charge and the audit row all roll back.
+  --    Simulated with a temporary BEFORE INSERT trigger — the ONLY way to
+  --    make a well-formed insert into job_queue fail on demand.
+  -- ═══════════════════════════════════════════════════════════════════
+  perform screening_v2.advance_ashby_ingestion(v_link_fail, 'queued',   null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_fail, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_fail, 'failed_review', null, null, null,
+                                               'parse_timeout');
+  select attempts into v_att0
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_fail;
+
+  create or replace function _policy_tests.block_pol40_enqueue()
+  returns trigger language plpgsql as $trg$
+  begin
+    if new.dedup_key like 'ashby:ingestion:%'
+       and new.payload->>'applicationLinkId' is not null
+       and current_setting('policy_tests.block_link', true) = new.payload->>'applicationLinkId'
+    then
+      raise exception 'pol40_synthetic_enqueue_failure';
+    end if;
+    return new;
+  end;
+  $trg$;
+  create trigger trg_pol40_block_enqueue
+    before insert on screening_v2.job_queue
+    for each row execute function _policy_tests.block_pol40_enqueue();
+  perform set_config('policy_tests.block_link', v_link_fail::text, false);
+
+  begin
+    v_res := screening_v2.recover_ashby_ingestion_parse(v_link_fail, v_owner, v_now);
+    perform _policy_tests.assert(
+      'ashby 0040: a failed enqueue does NOT return ok',
+      false, 'the recovery reported ' || coalesce(v_res::text, '<null>')
+        || ' while no job could be admitted');
+  exception
+    when others then
+      perform _policy_tests.assert(
+        'ashby 0040: a failed enqueue aborts the whole recovery',
+        sqlerrm like '%pol40_synthetic_enqueue_failure%',
+        'expected the enqueue failure to propagate; got ' || sqlerrm);
+  end;
+
+  perform set_config('policy_tests.block_link', '', false);
+  drop trigger trg_pol40_block_enqueue on screening_v2.job_queue;
+
+  select state, failed_reason, attempts into v_state, v_reason, v_att
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_fail;
+  select count(*) into v_audits
+    from screening_v2.audit_events
+   where action = 'ashby_ingestion_parse_recovery'
+     and metadata->>'application_link_id' = v_link_fail::text;
+  select count(*) into v_cnt
+    from screening_v2.job_queue
+   where dedup_key = 'ashby:ingestion:' || v_link_fail::text;
+  perform _policy_tests.assert(
+    'ashby 0040: the rolled-back recovery left state, reason, attempts and audit untouched',
+    v_state = 'failed_review'
+      and v_reason = 'parse_timeout'
+      and v_att = v_att0
+      and v_audits = 0
+      and v_cnt = 0,
+    'a recovery that cannot schedule work must not spend an attempt, leave the '
+    'operator queue, or record a success; got state=' || coalesce(v_state, '<null>')
+      || ' reason=' || coalesce(v_reason, '<null>')
+      || ' attempts=' || coalesce(v_att::text, '<null>')
+      || ' audits=' || v_audits || ' jobs=' || v_cnt);
+
+  -- ── The recovery still works once the fault is gone ─────────────────
+  v_res := screening_v2.recover_ashby_ingestion_parse(v_link_fail, v_owner, v_now);
+  select count(*) into v_cnt
+    from screening_v2.job_queue
+   where dedup_key = 'ashby:ingestion:' || v_link_fail::text
+     and status in ('pending', 'active', 'delayed');
+  perform _policy_tests.assert(
+    'ashby 0040: the row kept its full budget and recovers cleanly afterwards',
+    v_res->>'status' = 'ok'
+      and (v_res->>'attempts')::int = v_att0 + 1
+      and v_cnt = 1,
+    'the rollback must cost the operator nothing; got '
+      || coalesce(v_res::text, '<null>') || ' live_jobs=' || v_cnt);
+
+  -- ── Cleanup (audit rows are append-only, 0007, and left behind) ──────
+  delete from screening_v2.job_queue
+   where dedup_key in ('ashby:ingestion:' || v_link_ok::text,
+                       'ashby:ingestion:' || v_link_done::text,
+                       'ashby:ingestion:' || v_link_live::text,
+                       'ashby:ingestion:' || v_link_term::text,
+                       'ashby:ingestion:' || v_link_act::text,
+                       'ashby:ingestion:' || v_link_can::text,
+                       'ashby:ingestion:' || v_link_doc::text,
+                       'ashby:ingestion:' || v_link_ex::text,
+                       'ashby:ingestion:' || v_link_fail::text);
+  delete from screening_v2.ashby_operations
+   where application_link_id in (v_link_ok, v_link_done, v_link_live, v_link_term,
+                                 v_link_act, v_link_can, v_link_doc, v_link_ex,
+                                 v_link_fail);
+  delete from screening_v2.ashby_resume_ingestions
+   where application_link_id in (v_link_ok, v_link_done, v_link_live, v_link_term,
+                                 v_link_act, v_link_can, v_link_doc, v_link_ex,
+                                 v_link_fail);
+  delete from screening_v2.ashby_application_links
+   where id in (v_link_ok, v_link_done, v_link_live, v_link_term,
+                v_link_act, v_link_can, v_link_doc, v_link_ex, v_link_fail);
+  delete from screening_v2.ashby_job_mappings where id = v_map;
+end;
+$$;
+
+
+
 -- ═══════════════════════════════════════════════════════════════════════
 -- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)
 -- ═══════════════════════════════════════════════════════════════════════
