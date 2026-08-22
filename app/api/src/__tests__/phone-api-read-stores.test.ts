@@ -292,6 +292,21 @@ describe('rows are narrowed, and a driver error is sanitized', () => {
       .rejects.toThrow('phone_attempt_row_invalid');
   });
 
+  it('refuses a row that is missing a required scalar', async () => {
+    // A partial row is drift too — a projection built from it would report a
+    // field as absent rather than saying the read could not be trusted.
+    const { kind, ...noKind } = ATTEMPT;
+    expect(kind).toBe('initial');
+    const { attempt_seq, ...noSeq } = ATTEMPT;
+    expect(attempt_seq).toBe(1);
+    for (const bad of [noKind, noSeq]) {
+      const { client } = fakeClient([{ data: [bad] }]);
+      await expect(createPhoneReadStore(client as never)
+        .listAttemptsForEngagement({ engagementId: 'e1', limit: 1 }))
+        .rejects.toThrow('phone_attempt_row_invalid');
+    }
+  });
+
   it('refuses a row carrying a state outside the 0042 vocabulary', async () => {
     const { client } = fakeClient([{ data: [{ ...ENGAGEMENT, state: 'daydreaming' }] }]);
     await expect(createPhoneReadStore(client as never).getEngagement('e1'))
