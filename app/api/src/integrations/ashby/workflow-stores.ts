@@ -536,6 +536,35 @@ export interface MissionControlStore {
   retryLegacyBadOutput(applicationLinkId: string, actorId: string): Promise<{ status: string }>;
 }
 
+/**
+ * Read the ingestion `state` out of a PostgREST embedded resource.
+ *
+ * PostgREST decides the SHAPE of an embed from the relationship's cardinality:
+ * a to-MANY embed arrives as an ARRAY, a to-ONE embed as a plain OBJECT.
+ * `ashby_resume_ingestions` carries `unique (application_link_id)` (0029), so
+ * it is to-one and arrives as an object — but this projection indexed it as
+ * `[0]`, which on an object is always `undefined`. The result was
+ * `ingestionState: null` on EVERY workflow, including rows demonstrably rested
+ * in `failed_review`: an operator working the Mission Control list could never
+ * see a parse failure there. The failure stayed visible only through the health
+ * surface (`invite_blocked_failed_ingestion`), which is why it went unnoticed.
+ *
+ * The sibling `ashby_operations` embed has no such unique constraint, so it is
+ * genuinely to-many and its existing array handling is correct and untouched.
+ *
+ * Both shapes are accepted here. Not because the cardinality is in doubt, but
+ * because a projection that silently returns `null` when its input shape shifts
+ * is exactly what produced this defect; an absent, null, empty or malformed
+ * embed degrades to `null` explicitly rather than by accident.
+ */
+export function readEmbeddedIngestionState(embed: unknown): string | null {
+  if (embed === null || embed === undefined) return null;
+  const row = Array.isArray(embed) ? embed[0] : embed;
+  if (row === null || typeof row !== 'object') return null;
+  const state = (row as { state?: unknown }).state;
+  return typeof state === 'string' && state.length > 0 ? state : null;
+}
+
 /** Mission Control read/action store (service-role; sanitized projections). */
 export function createMissionControlStore(client: SupabaseClient): MissionControlStore {
   return {
@@ -601,7 +630,6 @@ export function createMissionControlStore(client: SupabaseClient): MissionContro
       }
 
       return rows.map((r) => {
-        const ings = (r.ashby_resume_ingestions as Array<{ state: string }> | null) ?? [];
         const ops = (r.ashby_operations as Array<{ id: string; operation_type: string; state: string; error_code: string | null }> | null) ?? [];
         return {
           applicationLinkId: String(r.id),
@@ -609,7 +637,7 @@ export function createMissionControlStore(client: SupabaseClient): MissionContro
           externalJobId: (r.external_job_id as string | null) ?? null,
           lifecycle: String(r.lifecycle),
           terminalState: (r.terminal_state as string | null) ?? null,
-          ingestionState: ings[0]?.state ?? null,
+          ingestionState: readEmbeddedIngestionState(r.ashby_resume_ingestions),
           operations: ops.map((o) => ({ id: o.id, type: o.operation_type, state: o.state, errorCode: o.error_code ?? null })),
           sessionStatus: typeof r.session_id === 'string' ? sessionStatus.get(r.session_id) ?? null : null,
           // The id is an opaque internal reference, not candidate data. It is
