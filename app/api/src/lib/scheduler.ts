@@ -80,14 +80,61 @@ export interface SchedulerLoopHealth {
    * start. This is deliberately not "when the loop first ticked": `start()`
    * staggers the first tick by up to one whole interval, so between arming and
    * that first tick a perfectly healthy loop has no `lastTickAt` at all.
-   * Liveness is therefore measured from `lastTickAt ?? startedAt` — see
-   * `snapshotScheduler`. Re-stamped on every start, so a restart opens a fresh
-   * grace window rather than inheriting a stale one.
+   * Liveness is therefore measured from the MOST RECENT of `lastTickAt` and
+   * `startedAt` — see {@link loopStaleAnchorMs}. Re-stamped on every start, and
+   * because the anchor is a maximum rather than a nullish fallback, a restart
+   * genuinely opens a fresh grace window instead of inheriting the pre-stop
+   * tick.
    */
   startedAt: string | null;
   ticks: number;
   errors: number;
   consecutiveErrors: number;
+}
+
+/**
+ * The liveness anchor for a loop: the MOST RECENT of its last completed tick
+ * and the moment it was last armed — never a simple `lastTickAt ?? startedAt`.
+ *
+ * The difference only shows up across a restart, and it matters there. `stop()`
+ * clears the timers and marks the loop not-running, but it does NOT clear
+ * `lastTickAt`; `start()` then re-stamps `startedAt`. A loop that ticked before
+ * the stop therefore restarts holding an OLD `lastTickAt`, and a nullish
+ * fallback would keep anchoring on it — reporting the freshly re-armed loop
+ * stale for exactly the window this grace exists to give it. Taking the maximum
+ * is what makes the re-arm actually re-arm.
+ *
+ * A timestamp that will not parse is discarded rather than poisoning the
+ * comparison, and when neither anchor is usable the result is `NaN`, which
+ * callers treat as stale — a running loop with no anchor at all must not read
+ * as healthy.
+ */
+export function loopStaleAnchorMs(
+  loop: Pick<SchedulerLoopHealth, 'lastTickAt' | 'startedAt'>,
+): number {
+  const candidates = [loop.lastTickAt, loop.startedAt]
+    .map((iso) => (iso ? Date.parse(iso) : Number.NaN))
+    .filter((ms) => Number.isFinite(ms));
+  return candidates.length > 0 ? Math.max(...candidates) : Number.NaN;
+}
+
+/**
+ * Whether a loop has gone quiet for longer than its own window.
+ *
+ * Exported and shared ON PURPOSE: this predicate previously existed in two
+ * copies — one per health surface — and only one of them was corrected, so a
+ * single scheduler reported two different staleness rules. One definition is
+ * what stops that recurring.
+ *
+ * A stopped loop is never stale; it is stopped.
+ */
+export function isLoopStale(
+  loop: Pick<SchedulerLoopHealth, 'lastTickAt' | 'startedAt'>,
+  opts: { running: boolean; nowMs: number; windowMs: number },
+): boolean {
+  if (!opts.running) return false;
+  const anchorMs = loopStaleAnchorMs(loop);
+  return !Number.isFinite(anchorMs) || opts.nowMs - anchorMs > opts.windowMs;
 }
 
 export interface LoopSchedulerHandle {

@@ -29,7 +29,7 @@
  */
 
 import { describe, it, expect, afterEach } from 'vitest';
-import { createLoopScheduler } from '../lib/scheduler.js';
+import { createLoopScheduler, loopStaleAnchorMs, isLoopStale } from '../lib/scheduler.js';
 import {
   registerAshbyScheduler,
   clearAshbySchedulerRegistration,
@@ -134,17 +134,44 @@ describe('snapshotScheduler — staleness is measured from the first arming, not
 });
 
 describe('the repair does not weaken the signal it exists to preserve', () => {
-  it('a restart re-arms the grace window rather than inheriting a stale one', async () => {
+  it('a restart re-arms even when the loop TICKED before the stop', async () => {
+    // The case a nullish `lastTickAt ?? startedAt` anchor gets wrong, and the
+    // reason this test lets a tick land first: `stop()` does not clear
+    // `lastTickAt`, so after a restart the loop still holds its pre-stop tick.
+    // Anchoring on that stale value reports the freshly re-armed loop stale
+    // for exactly the window this grace exists to give it.
+    const h = harness();
+    h.scheduler.start();
+    h.advance(INTERVAL);
+    await h.runPendingTick();
+    const tickedAt = h.loop().lastTickAt;
+    expect(tickedAt).not.toBeNull();            // a real tick really happened
+
+    // Let that tick age well past the window, so the OLD anchor is stale...
+    h.advance(WINDOW + 1);
+    expect(h.loop().stale).toBe(true);
+
+    // ...then stop and restart. The pre-stop tick is still on the row.
+    await h.scheduler.stop();
+    h.scheduler.start();
+    expect(h.loop().lastTickAt).toBe(tickedAt);  // inherited, as `stop()` leaves it
+    expect(h.loop().stale).toBe(false);          // but the re-arm wins
+
+    // ...and the restarted loop can still go stale on its own merits.
+    h.advance(WINDOW + 1);
+    expect(h.loop().stale).toBe(true);
+  });
+
+  it('a restart with NO prior tick also re-arms', async () => {
     const h = harness();
     h.scheduler.start();
     h.advance(WINDOW + 1);
-    expect(h.loop().stale).toBe(true);          // genuinely dead
+    expect(h.loop().stale).toBe(true);          // never ticked, genuinely dead
 
     await h.scheduler.stop();
-    h.scheduler.start();                         // re-armed
+    h.scheduler.start();
+    expect(h.loop().lastTickAt).toBeNull();
     expect(h.loop().stale).toBe(false);
-    h.advance(WINDOW + 1);
-    expect(h.loop().stale).toBe(true);           // and can go stale again
   });
 
   it('feeds `scheduler_loop_stale` exactly as before — no reason vocabulary change', () => {
@@ -173,6 +200,35 @@ describe('the repair does not weaken the signal it exists to preserve', () => {
 
     h.advance(WINDOW + 1);
     expect(verdict(h.now()).reasons).toEqual(['scheduler_loop_stale']);
+  });
+});
+
+describe('loopStaleAnchorMs — the anchor is a maximum, not a fallback', () => {
+  const A = '2026-08-22T00:00:00.000Z';
+  const B = '2026-08-22T01:00:00.000Z';
+
+  it('takes the more recent of the two, whichever it is', () => {
+    expect(loopStaleAnchorMs({ lastTickAt: A, startedAt: B })).toBe(Date.parse(B));
+    expect(loopStaleAnchorMs({ lastTickAt: B, startedAt: A })).toBe(Date.parse(B));
+  });
+
+  it('uses whichever anchor exists when only one does', () => {
+    expect(loopStaleAnchorMs({ lastTickAt: A, startedAt: null })).toBe(Date.parse(A));
+    expect(loopStaleAnchorMs({ lastTickAt: null, startedAt: A })).toBe(Date.parse(A));
+  });
+
+  it('discards an unparseable timestamp instead of poisoning the comparison', () => {
+    expect(loopStaleAnchorMs({ lastTickAt: 'not-a-date', startedAt: A })).toBe(Date.parse(A));
+    expect(Number.isNaN(loopStaleAnchorMs({ lastTickAt: 'x', startedAt: 'y' }))).toBe(true);
+  });
+
+  it('is NaN when neither anchor is usable — callers must read that as stale', () => {
+    expect(Number.isNaN(loopStaleAnchorMs({ lastTickAt: null, startedAt: null }))).toBe(true);
+    expect(isLoopStale({ lastTickAt: null, startedAt: null },
+      { running: true, nowMs: Date.parse(A), windowMs: 1_000 })).toBe(true);
+    // ...but a stopped loop is still never stale.
+    expect(isLoopStale({ lastTickAt: null, startedAt: null },
+      { running: false, nowMs: Date.parse(A), windowMs: 1_000 })).toBe(false);
   });
 });
 

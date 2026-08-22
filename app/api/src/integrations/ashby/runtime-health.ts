@@ -30,6 +30,7 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { AshbySchedulerHandle, SchedulerLoopHealth } from './scheduler.js';
+import { isLoopStale } from '../../lib/scheduler.js';
 import { ASHBY_SIGNAL_QUEUE, ASHBY_IMPORT_QUEUE } from './signal-worker.js';
 import { ASHBY_INGESTION_QUEUE } from './runtime-workers.js';
 import { DEFAULT_CHECKPOINT_KEY } from './reconciliation.js';
@@ -134,11 +135,11 @@ export function snapshotScheduler(nowMs: number = Date.now()): SchedulerHealthVi
       // after start instead of instantly. The `!Number.isFinite` clause is
       // retained so a running loop with neither anchor is stale rather than
       // silently healthy.
-      const anchor = loop.lastTickAt ?? startedAt;
-      const last = anchor ? Date.parse(anchor) : NaN;
+      // The anchor is the MOST RECENT of the two, not a nullish fallback: a
+      // loop that ticked before a stop restarts holding an old `lastTickAt`,
+      // and falling back only when that is null would keep anchoring on it.
       // A stopped loop is not "stale" — it is stopped.
-      const stale = health.running
-        && (!Number.isFinite(last) || nowMs - last > window);
+      const stale = isLoopStale(loop, { running: health.running, nowMs, windowMs: window });
       return { ...view, stale };
     }),
   };
