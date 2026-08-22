@@ -10819,6 +10819,153 @@ begin
 end;
 $$;
 
+-- ── B27: terminal immutability upgrades two FKs to de-facto RESTRICT ──
+-- `phone_engagements.role_id` and `.session_id` are `on delete set
+-- null`. A referential SET NULL is an UPDATE, so on a TERMINAL
+-- engagement the transition trigger refuses it — and the DELETE of the
+-- referenced `roles` or `call_sessions` row fails, with an error naming
+-- the engagement rather than the row being deleted.
+--
+-- This is deliberate and is NOT softened here: a finished engagement's
+-- role and session are part of the record of what happened. What is
+-- asserted is that the behaviour is real, that it is a property of
+-- TERMINALITY rather than of the FKs, and that the documented erasure
+-- order gets past both this guard and the ledger's insert-once guard.
+do $$
+declare
+  v_role uuid; v_role2 uuid; v_cand uuid; v_sess uuid; v_map uuid;
+  v_link uuid; v_eng uuid; v_s text; v_blocked boolean; v_err text;
+  v_states text[] := array['queued','fetching','scanning','extracting','structuring','ready'];
+begin
+  perform _policy_tests.phone_teardown('pol42-fkrestrict');
+  delete from screening_v2.roles where title = 'pol42-fkrestrict-role';
+  select id into v_role from screening_v2.roles order by id limit 1;
+
+  -- A role of its own, referenced by NOTHING else. ashby_job_mappings
+  -- .role_id is ON DELETE RESTRICT, so reusing the seed role would have
+  -- the mapping refuse the delete and prove nothing about the trigger.
+  insert into screening_v2.roles (title) values ('pol42-fkrestrict-role') returning id into v_role2;
+
+  insert into screening_v2.candidates (role_id, name, email, phone_e164, phone_valid)
+  values (v_role, 'fk fixture', 'pol42-fkrestrict@example.test', '+919999054321', true)
+  returning id into v_cand;
+  insert into screening_v2.call_sessions (candidate_id, status)
+  values (v_cand, 'created') returning id into v_sess;
+  insert into screening_v2.ashby_job_mappings
+    (external_job_id, role_id, owner_id, ai_screening_stage_id, ta_screening_stage_id,
+     status, delivery_mode)
+  values ('pol42-fkrestrict-job', v_role, '00000000-0000-4000-8000-0000000000ad',
+          'pol42-fkrestrict-ai', 'pol42-fkrestrict-ta', 'enabled', 'manual')
+  returning id into v_map;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id,
+     external_resume_file_handle, candidate_id)
+  values ('pol42-fkrestrict-app', 'pol42-fkrestrict-job', v_map, repeat('h', 64), v_cand)
+  returning id into v_link;
+  foreach v_s in array v_states loop
+    perform screening_v2.advance_ashby_ingestion(v_link, v_s, null, null, null, null);
+  end loop;
+
+  -- ── First, the CONTROL: while the engagement is NON-terminal the
+  --    SET NULL applies normally and the delete goes through. This is
+  --    what makes the two assertions below about TERMINALITY rather
+  --    than about the foreign keys.
+  insert into screening_v2.phone_engagements
+    (application_link_id, candidate_id, role_id, session_id, state)
+  values (v_link, v_cand, v_role2, v_sess, 'pending_prereqs')
+  returning id into v_eng;
+
+  delete from screening_v2.call_sessions where id = v_sess;
+  perform _policy_tests.assert(
+    '0042: a NON-terminal engagement lets its session be deleted, nulling the reference',
+    (select session_id is null from screening_v2.phone_engagements where id = v_eng),
+    'the FKs really are on delete set null; the refusals below are the terminal guard, '
+      || 'not the foreign keys');
+
+  -- ── Now terminalise, and try the same two deletes.
+  insert into screening_v2.call_sessions (candidate_id, status)
+  values (v_cand, 'created') returning id into v_sess;
+  update screening_v2.phone_engagements
+     set session_id = v_sess where id = v_eng;
+  update screening_v2.phone_engagements
+     set state = 'cancelled', terminal_at = '2026-08-24T06:00:00Z' where id = v_eng;
+
+  begin
+    delete from screening_v2.call_sessions where id = v_sess;
+    v_blocked := false; v_err := '<no error>';
+  exception when others then
+    v_blocked := true; v_err := sqlerrm;
+  end;
+  perform _policy_tests.assert(
+    '0042: deleting a call_sessions row referenced by a TERMINAL engagement is refused',
+    v_blocked and v_err like '%is terminal%',
+    'a referential SET NULL is an UPDATE, so terminal immutability turns session_id into a '
+      || 'de-facto restrict, and the error names the ENGAGEMENT rather than the session; '
+      || 'got ' || coalesce(v_err, '<null>'));
+
+  begin
+    delete from screening_v2.roles where id = v_role2;
+    v_blocked := false; v_err := '<no error>';
+  exception when others then
+    v_blocked := true; v_err := sqlerrm;
+  end;
+  perform _policy_tests.assert(
+    '0042: deleting a roles row referenced by a TERMINAL engagement is refused the same way',
+    v_blocked and v_err like '%is terminal%',
+    'role_id carries the same on delete set null and the same consequence; got '
+      || coalesce(v_err, '<null>'));
+
+  -- ── And the DOCUMENTED ERASURE ORDER clears both guards at once:
+  --    the insert-once ledger first, under its hatch, then the phone
+  --    model, and only then the rows it pointed at.
+  perform screening_v2.apply_phone_event('internal', 'hr.cancelled', null, v_eng,
+            'pol42-fkrestrict-ev', null, null, '2026-08-24T06:00:00Z');
+
+  begin
+    perform set_config('app.allow_phone_event_mutation', 'true', true);
+    delete from screening_v2.phone_call_events where engagement_id = v_eng;
+    perform set_config('app.allow_phone_event_mutation', 'false', true);
+    delete from screening_v2.phone_engagements where id = v_eng;
+    delete from screening_v2.call_sessions where id = v_sess;
+    delete from screening_v2.roles where id = v_role2;
+    v_blocked := false; v_err := '<no error>';
+  exception when others then
+    v_blocked := true; v_err := sqlerrm;
+  end;
+  perform _policy_tests.assert(
+    '0042: the documented erasure order — ledger under the hatch, then the phone model, '
+      || 'then the rows it referenced — clears BOTH guards',
+    not v_blocked
+      and not exists (select 1 from screening_v2.phone_engagements where id = v_eng)
+      and not exists (select 1 from screening_v2.call_sessions where id = v_sess)
+      and not exists (select 1 from screening_v2.roles where id = v_role2),
+    'delete out of order and the error points at a table you were not touching; got '
+      || coalesce(v_err, '<null>'));
+
+  perform _policy_tests.phone_teardown('pol42-fkrestrict');
+  delete from screening_v2.roles where title = 'pol42-fkrestrict-role';
+end;
+$$;
+
+-- The guard must not have been quietly weakened to make the above pass:
+-- terminal immutability still refuses an ordinary column write.
+do $$
+declare v_eng uuid; v_ok boolean;
+begin
+  v_eng := _policy_tests.phone_fixture('pol42-imm-intact', 'cancelled');
+  begin
+    update screening_v2.phone_engagements set next_eligible_at = '2026-09-01T00:00:00Z'
+     where id = v_eng;
+    v_ok := false;
+  exception when others then v_ok := sqlerrm like '%is terminal%'; end;
+  perform _policy_tests.assert(
+    '0042: documenting the FK consequence did NOT weaken terminal immutability',
+    v_ok,
+    'the fix for the FK consequence is documentation and an erasure order, never a hole '
+      || 'in the guard');
+end;
+$$;
+
 -- ── Teardown: the phone fixtures leave the database as they found it ──
 -- The GOV-06 synthetic-seed suite asserts GLOBAL cardinality on
 -- screening_v2.candidates and screening_v2.consent_records, so a fixture

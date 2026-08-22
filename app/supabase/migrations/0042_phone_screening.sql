@@ -136,17 +136,53 @@
 -- `missed` (#10) and `fulfilled` are written here, by
 -- `expire_phone_appointments` and by `admit_phone_attempt` respectively.
 --
--- ── ERASURE AND THE APPEND-ONLY LEDGER ────────────────────────────────
--- `phone_call_events` is insert-once, and its FKs to `phone_engagements`
--- and `phone_call_attempts` are `on delete set null`. A referential SET
--- NULL is an UPDATE, so the append-only trigger BLOCKS it: while ledger
--- rows reference them, an engagement and its attempts CANNOT be deleted,
--- and the failure surfaces as `phone_call_events is insert-once` rather
--- than as anything mentioning the parent. That is deliberate — a ledger
--- row must not be orphaned silently — but it means a DPDP erasure or a
--- retention job must delete the ledger rows FIRST, under
--- `set local app.allow_phone_event_mutation = 'true'`. This is asserted
--- by a policy test rather than left to be met in an incident.
+-- ── ERASURE, AND THE TWO PLACES A DELETE IS REFUSED ───────────────────
+-- Two independent guards in this file make ordinary-looking DELETEs
+-- fail, each with an error naming a row the operator was not deleting.
+-- Both are deliberate. Both are stated here, and both are asserted by
+-- policy tests, because the alternative is meeting them for the first
+-- time during an erasure under time pressure.
+--
+-- (1) INTO the phone model. `phone_call_events` is insert-once, and its
+--     FKs to `phone_engagements` and `phone_call_attempts` are
+--     `on delete set null`. A referential SET NULL is an UPDATE, so the
+--     append-only trigger BLOCKS it: while ledger rows reference them,
+--     an engagement and its attempts CANNOT be deleted, and the failure
+--     surfaces as `phone_call_events is insert-once` rather than as
+--     anything mentioning the parent.
+--
+-- (2) OUT OF the phone model, and this one is a consequence of terminal
+--     immutability rather than of the ledger. `phone_engagements.role_id`
+--     and `.session_id` are also `on delete set null`. For a TERMINAL
+--     engagement the transition trigger refuses every row change, so the
+--     SET NULL those FKs would perform is refused too — and deleting the
+--     referenced `screening_v2.roles` or `screening_v2.call_sessions`
+--     row therefore fails with `phone engagement … is terminal and
+--     immutable`, naming the engagement rather than the row being
+--     deleted. In effect a terminal engagement upgrades its own two
+--     `on delete set null` FKs to `restrict`.
+--
+--     This is a KNOWN CONSEQUENCE, not an oversight, and it is not
+--     softened: a finished engagement's role and session are part of the
+--     record of what happened, and silently nulling them out from under
+--     a completed screening would make the audit trail less true. There
+--     is no caller today — nothing in the API deletes a `call_sessions`
+--     or `roles` row — so this is latent, and it becomes live exactly
+--     when the retention/erasure work in (1) arrives.
+--
+-- THE ERASURE ORDER, therefore, is one sequence and it satisfies both:
+--
+--     set local app.allow_phone_event_mutation = 'true';
+--     delete from screening_v2.phone_call_events   where …;   -- (1)
+--     reset / set the hatch back to false;
+--     delete from screening_v2.phone_engagements   where …;   -- cascades
+--                                                             -- attempts
+--                                                             -- and slots
+--     delete from screening_v2.call_sessions       where …;   -- (2) now
+--     delete from screening_v2.roles               where …;   -- unblocked
+--
+-- Delete the phone model first and the rest follows; delete out of order
+-- and the error will point at a table you were not touching.
 --
 -- ── DELIBERATE NON-REUSE ──────────────────────────────────────────────
 -- `screening_v2.call_queue` and `screening_v2.sms_follow_ups` (0001) stay
@@ -844,6 +880,14 @@ begin
   -- a reader would not expect to have to check. No RPC in this file
   -- updates a terminal row; this makes that a property of the schema
   -- rather than a property of the current callers.
+  --
+  -- KNOWN CONSEQUENCE, stated where it bites: a referential SET NULL is
+  -- an UPDATE, so this refusal also blocks deleting the `roles` or
+  -- `call_sessions` row a TERMINAL engagement points at — its two
+  -- `on delete set null` FKs behave as `restrict` once it is terminal,
+  -- and the error names the engagement rather than the row being
+  -- deleted. See the file header for the erasure order that satisfies
+  -- this and the ledger's insert-once guard together.
   if old.terminal_at is not null and new is distinct from old then
     raise exception 'phone engagement % is terminal (%) and immutable', old.id, old.state
       using errcode = 'P0001';
