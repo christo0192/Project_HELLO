@@ -32,6 +32,7 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { SchedulerLoopHealth } from '../scheduler.js';
+import { isLoopStale } from '../scheduler.js';
 import type { RecordingRuntimeHandle } from './runtime.js';
 import { RECORDING_FINALIZE_QUEUE, TERMINAL_SESSION_STATUSES } from './config.js';
 import { RECORDING_FINALIZE_DEFER_REASONS } from '../recording-egress.js';
@@ -88,11 +89,21 @@ export function snapshotRecordingWorker(nowMs: number = Date.now()): RecordingWo
     enabled: true,
     running: health.running,
     loops: health.loops.map((loop: SchedulerLoopHealth): RecordingLoopHealthView => {
+      // `startedAt` is INTERNAL scheduler bookkeeping. It is destructured out
+      // rather than spread through, because `{ ...loop }` would otherwise add
+      // an undeclared field to this shipped operator payload — TypeScript does
+      // not catch that, since excess-property checking does not apply to
+      // spreads. The documented key set is pinned by test.
+      const { startedAt: _startedAt, ...view } = loop;
       const interval = intervals[loop.name] ?? 0;
       const window = Math.max(MIN_STALE_WINDOW_MS, interval * STALE_TICK_MULTIPLIER);
-      const last = loop.lastTickAt ? Date.parse(loop.lastTickAt) : NaN;
-      const stale = health.running && (!Number.isFinite(last) || nowMs - last > window);
-      return { ...loop, stale };
+      // The SAME predicate the Ashby surface uses. These two views previously
+      // carried separate copies of this rule and only one was corrected, so one
+      // scheduler reported two different staleness answers. The recording
+      // runtime arms four staggered loops, so the first-tick grace matters here
+      // for exactly the reason it matters there.
+      const stale = isLoopStale(loop, { running: health.running, nowMs, windowMs: window });
+      return { ...view, stale };
     }),
   };
 }

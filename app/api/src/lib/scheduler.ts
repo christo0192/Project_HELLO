@@ -75,9 +75,66 @@ export interface SchedulerLoopHealth {
   running: boolean;
   /** ISO time of the last completed tick, or null if none yet. */
   lastTickAt: string | null;
+  /**
+   * ISO time at which `start()` last ARMED this loop, or null before the first
+   * start. This is deliberately not "when the loop first ticked": `start()`
+   * staggers the first tick by up to one whole interval, so between arming and
+   * that first tick a perfectly healthy loop has no `lastTickAt` at all.
+   * Liveness is therefore measured from the MOST RECENT of `lastTickAt` and
+   * `startedAt` — see {@link loopStaleAnchorMs}. Re-stamped on every start, and
+   * because the anchor is a maximum rather than a nullish fallback, a restart
+   * genuinely opens a fresh grace window instead of inheriting the pre-stop
+   * tick.
+   */
+  startedAt: string | null;
   ticks: number;
   errors: number;
   consecutiveErrors: number;
+}
+
+/**
+ * The liveness anchor for a loop: the MOST RECENT of its last completed tick
+ * and the moment it was last armed — never a simple `lastTickAt ?? startedAt`.
+ *
+ * The difference only shows up across a restart, and it matters there. `stop()`
+ * clears the timers and marks the loop not-running, but it does NOT clear
+ * `lastTickAt`; `start()` then re-stamps `startedAt`. A loop that ticked before
+ * the stop therefore restarts holding an OLD `lastTickAt`, and a nullish
+ * fallback would keep anchoring on it — reporting the freshly re-armed loop
+ * stale for exactly the window this grace exists to give it. Taking the maximum
+ * is what makes the re-arm actually re-arm.
+ *
+ * A timestamp that will not parse is discarded rather than poisoning the
+ * comparison, and when neither anchor is usable the result is `NaN`, which
+ * callers treat as stale — a running loop with no anchor at all must not read
+ * as healthy.
+ */
+export function loopStaleAnchorMs(
+  loop: Pick<SchedulerLoopHealth, 'lastTickAt' | 'startedAt'>,
+): number {
+  const candidates = [loop.lastTickAt, loop.startedAt]
+    .map((iso) => (iso ? Date.parse(iso) : Number.NaN))
+    .filter((ms) => Number.isFinite(ms));
+  return candidates.length > 0 ? Math.max(...candidates) : Number.NaN;
+}
+
+/**
+ * Whether a loop has gone quiet for longer than its own window.
+ *
+ * Exported and shared ON PURPOSE: this predicate previously existed in two
+ * copies — one per health surface — and only one of them was corrected, so a
+ * single scheduler reported two different staleness rules. One definition is
+ * what stops that recurring.
+ *
+ * A stopped loop is never stale; it is stopped.
+ */
+export function isLoopStale(
+  loop: Pick<SchedulerLoopHealth, 'lastTickAt' | 'startedAt'>,
+  opts: { running: boolean; nowMs: number; windowMs: number },
+): boolean {
+  if (!opts.running) return false;
+  const anchorMs = loopStaleAnchorMs(loop);
+  return !Number.isFinite(anchorMs) || opts.nowMs - anchorMs > opts.windowMs;
 }
 
 export interface LoopSchedulerHandle {
@@ -112,7 +169,7 @@ export function createLoopScheduler(options: LoopSchedulerOptions): LoopSchedule
 
   for (const loop of options.loops) {
     state.set(loop.name, {
-      name: loop.name, running: false, lastTickAt: null,
+      name: loop.name, running: false, lastTickAt: null, startedAt: null,
       ticks: 0, errors: 0, consecutiveErrors: 0,
     });
     idle.set(loop.name, 0);
@@ -177,6 +234,9 @@ export function createLoopScheduler(options: LoopSchedulerOptions): LoopSchedule
       for (const loop of options.loops) {
         const s = state.get(loop.name)!;
         s.running = true;
+        // Stamped BEFORE the stagger is scheduled, so the grace window a health
+        // check measures always covers the whole of that deliberate delay.
+        s.startedAt = new Date(now()).toISOString();
         // Stagger the first tick so the loops (and multiple machines) do not
         // all fire together on boot.
         schedule(loop, Math.max(1, Math.round(loop.intervalMs * random())));
