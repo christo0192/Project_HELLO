@@ -785,21 +785,44 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
    * appointment-addressed reschedule RPC, so the insert has already committed
    * by the time we can tell it should not have happened. `hr_cancelled` is the
    * honest reason: an HR action did create the row and an HR action is undoing
-   * it. If the compensation itself fails, `rolled_back: false` tells the
-   * operator a stray live appointment exists rather than leaving them to
-   * discover it on the calendar.
+   * it, and the real `actorId` is passed so the pair is attributable to the
+   * admin who caused it rather than being stamped `system`.
+   *
+   * ── WHAT IT DOES *NOT* UNDO, AND WHY THE FIELD IS NAMED NARROWLY ──────
+   * The appointment is restored; THE ENGAGEMENT IS NOT. The insert may have
+   * promoted the engagement into `scheduled` (0042 L2506-2513 promotes from
+   * `eligible`/`in_call`/`reconnecting`/`awaiting_retry`), and
+   * `cancel_phone_appointment` then drives it to `eligible` with
+   * `next_eligible_at = p_now` (0042 L2626-2634). Neither the original state
+   * nor the original pacing stamp comes back, and nothing in 0042 can put them
+   * back — an engagement-state restore RPC does not exist and this phase may not
+   * write one.
+   *
+   * That is why the response says `appointment_rolled_back` and not
+   * `rolled_back`: claiming a clean rollback here would be claiming something
+   * this route cannot do. The consequence is BOUNDED — the per-IST-day index
+   * (`uq_phone_attempts_one_per_ist_day`) still refuses another
+   * `initial`/`no_answer_retry`/`scheduled` attempt for that day, so no extra
+   * dial can be bought — but `next_eligible_at` is exactly what `/health`
+   * publishes as the `provider_error_costs_one_ist_day` residual and what
+   * `next_eligible_ist` renders, so it may read "eligible now" when the real
+   * pacing was tomorrow.
    */
   async function undoUnintendedInsert(
     appointmentId: string | undefined,
     version: number | undefined,
+    actorId: string | null,
   ): Promise<boolean> {
-    if (!appointmentId) return false;
+    // No id, or no version to fence with, means no safe cancel. A null expected
+    // version is the "cancel regardless" this route refuses everywhere else,
+    // and it would not be any safer here.
+    if (!appointmentId || version === undefined) return false;
     try {
       const undo = await writeStore().cancelAppointment({
         appointmentId,
         reason: 'hr_cancelled',
-        actorId: null,
-        expectedVersion: version ?? null,
+        actorId,
+        expectedVersion: version,
         now: now(),
       });
       return undo.status === 'ok' || undo.status === 'already_cancelled';
@@ -873,12 +896,37 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
           // unambiguous: this route always sends a non-null expected version,
           // so on the intended path the RPC supersedes the live row and returns
           // its id. Undo the insert and answer `version_conflict`.
-          if (result.supersededAppointmentId == null) {
-            const rolledBack = await undoUnintendedInsert(result.appointmentId, result.version);
+          //
+          // ABSENT is not NULL. The store keeps the two apart, because a key
+          // 0042 renamed would otherwise be read as "superseded nothing" and
+          // this branch would cancel the appointment it just created on EVERY
+          // legitimate reschedule. An absent key is a contract break, not a
+          // lost update, and nothing is undone on it.
+          if (result.supersededAppointmentId === undefined) {
+            res.status(500).json({ ok: false, error: 'phone_rpc_unknown_status' });
+            return;
+          }
+          if (result.supersededAppointmentId === null) {
+            const undone = await undoUnintendedInsert(
+              result.appointmentId,
+              result.version,
+              actorId,
+            );
+            // AUDITED. This path mutated the database twice — an insert and a
+            // cancel — and returning 409 without a row would make the only
+            // double-mutation on this surface the one that leaves no trace.
+            const ok = await auditOrFail(req, res, 'resource.update', 409, {
+              resource: 'phone_appointment',
+              engagement_id: existing.engagementId,
+              appointment_id: result.appointmentId ?? null,
+              outcome: 'lost_update_undone',
+              appointment_rolled_back: undone,
+            });
+            if (!ok) return;
             res.status(409).json({
               ok: false,
               error: 'version_conflict',
-              rolled_back: rolledBack,
+              appointment_rolled_back: undone,
             });
             return;
           }

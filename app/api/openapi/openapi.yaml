@@ -3448,7 +3448,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/PhoneApiError'
         '409':
-          description: not_live when the addressed appointment is cancelled, superseded, fulfilled or missed, or any schedule refusal including version_conflict. A version_conflict here may also mean the addressed row stopped being live between the pre-read and the RPC — schedule_phone_appointment compares the expected version ONLY when it finds a live appointment, so that race would otherwise turn a reschedule into a silent create. The route detects it (nothing was superseded), undoes the insert and reports rolled_back.
+          description: not_live when the addressed appointment is cancelled, superseded, fulfilled or missed, or any schedule refusal including version_conflict. A version_conflict here may also mean the addressed row stopped being live between the pre-read and the RPC — schedule_phone_appointment compares the expected version ONLY when it finds a live appointment, so that race would otherwise turn a reschedule into a silent create. The route detects it (nothing was superseded), undoes the insert, audits the attempt, and reports appointment_rolled_back.
           content:
             application/json:
               schema:
@@ -6789,7 +6789,7 @@ components:
 
     # ── Phone screening operator API (P6) ────────────────────────
     PhoneApiError:
-      description: The stable error envelope of the phone operator surface. The code is always a snake_case constant, never a driver message, a constraint name or a row value. rolled_back appears only on phone_audit_write_failed and says whether the mutation was undone.
+      description: The stable error envelope of the phone operator surface. The code is always a snake_case constant, never a driver message, a constraint name or a row value.
       type: object
       required: [ok, error]
       properties:
@@ -6798,6 +6798,10 @@ components:
         error:
           type: string
         rolled_back:
+          description: Present only on phone_audit_write_failed. True means the mutation this call caused was fully undone — which happens on POST /halt/clear and nowhere else. POST /halt deliberately never undoes a raised kill switch, and an appointment supersede is not reversible at all.
+          type: boolean
+        appointment_rolled_back:
+          description: Present only on the PATCH lost-update path. Deliberately NARROWER than rolled_back — the stray appointment is cancelled, but the ENGAGEMENT is not restored: the insert may have promoted it to scheduled and the compensating cancel drives it to eligible with next_eligible_at set to now. Nothing in 0042 can put the original state or pacing stamp back. Bounded — the per-IST-day attempt index still prevents an extra dial — but next_eligible_at may read as eligible now when the real pacing was the next IST day.
           type: boolean
       additionalProperties: false
 

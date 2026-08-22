@@ -45,12 +45,32 @@ const MODULE_FILES = readModuleFiles();
  * sees identifiers, so it can only ever assert things about the identifier's
  * spelling. What matters is what the identifier HOLDS.
  */
-function columnConstants(body: string): Map<string, string> {
-  const out = new Map<string, string>();
-  for (const m of body.matchAll(/const\s+([A-Z][A-Z0-9_]*)\s*=\s*\n?\s*'([^']*)'/g)) {
-    out.set(m[1], m[2]);
+function columnConstants(body: string): {
+  lists: Map<string, string>;
+  malformed: string[];
+} {
+  const lists = new Map<string, string>();
+  const malformed: string[] = [];
+  // The WHOLE initializer, up to its semicolon — not just the first quoted
+  // literal, and a column list MUST be exactly one plain literal.
+  //
+  // Taking the first literal would let
+  // `const ATTEMPT_COLUMNS = 'id,...,ended_at' + ',lease_token'` through: the
+  // star check sees only the first half, and splitting the raw text on commas
+  // yields the token `lease_token'` WITH a trailing quote, which no
+  // forbidden-name comparison matches. Partially inspecting a computed
+  // initializer is worse than refusing it, so anything that is not a single
+  // literal is reported as malformed and fails the suite.
+  for (const m of body.matchAll(/const\s+([A-Z][A-Z0-9_]*_COLUMNS)\s*=\s*([^;]*);/g)) {
+    const initializer = m[2].trim().replace(/\s+/g, ' ');
+    const single = /^'([^']*)'$/.exec(initializer);
+    if (!single) {
+      malformed.push(`${m[1]} = ${initializer}`);
+      continue;
+    }
+    lists.set(m[1], single[1]);
   }
-  return out;
+  return { lists, malformed };
 }
 
 /** Source with block and line comments removed — for call-site assertions. */
@@ -150,7 +170,8 @@ describe('1. every phone write goes through an RPC', () => {
     // Two assertions instead: every declared list is star-free, and every
     // `.select(` argument is one of those declared identifiers, which is what
     // stops an inline `select('*')` being added beside them.
-    const declared = columnConstants(readBody);
+    const { lists: declared, malformed } = columnConstants(readBody);
+    expect(malformed, 'a column list is not a single plain literal').toEqual([]);
     expect(declared.size).toBeGreaterThanOrEqual(4);
     for (const [name, list] of declared) {
       expect(list, `${name} is a star select`).not.toContain('*');
@@ -167,7 +188,8 @@ describe('1. every phone write goes through an RPC', () => {
     // Omission is the control, not redaction: a column that is never SELECTED
     // cannot be serialized by a later edit that forgets why it was masked.
     const reads = MODULE_FILES.find((f) => f.name === READ_SEAM);
-    const declared = columnConstants(code(reads!.source));
+    const { lists: declared, malformed } = columnConstants(code(reads!.source));
+    expect(malformed, 'a column list is not a single plain literal').toEqual([]);
     const FORBIDDEN = [
       'sip_call_id', 'room_name', 'participant_identity', 'egress_id', 'egress_status',
       'lease_token', 'lease_owner', 'lease_expires_at', 'provider_event_id', 'phone_sha256',
@@ -196,11 +218,17 @@ describe('1. every phone write goes through an RPC', () => {
       const body = code(source);
       expect(body, `${name} reaches a table directly`).not.toMatch(/\.\s*from\s*\(/);
       expect(body, `${name} calls an rpc directly`).not.toMatch(/\.\s*rpc\s*\(/);
+      // Express route REGISTRATIONS are removed first, so `router.delete(` —
+      // the HTTP verb — is not mistaken for a table write. Stripping them is
+      // more robust than a lookbehind on the receiver name, which would quietly
+      // stop excluding the moment somebody renamed `router` to `phoneRouter`.
+      const withoutRegistrations = body.replace(
+        /\b[A-Za-z_$][\w$]*\.(get|post|put|patch|delete)\(/g,
+        '',
+      );
       for (const verb of ['insert', 'update', 'upsert', 'delete']) {
-        // `router.delete(` is the HTTP verb, not a table write — matched on a
-        // bare receiver so the route's own DELETE registration is not a hit.
-        expect(body, `${name} performs a .${verb}()`).not.toMatch(
-          new RegExp(String.raw`(?<!router)\.\s*${verb}\s*\(`),
+        expect(withoutRegistrations, `${name} performs a .${verb}()`).not.toMatch(
+          new RegExp(String.raw`\.\s*${verb}\s*\(`),
         );
       }
     }

@@ -906,7 +906,13 @@ describe('rescheduling supersedes atomically through the same RPC', () => {
       readStore: fakeReadStore().store, stores: write.store,
     })).patch(`/api/phone/appointments/${UUID_A}`).send(body);
     expect(res.status).toBe(409);
-    expect(res.body).toEqual({ ok: false, error: 'version_conflict', rolled_back: true });
+    // NARROWER than `rolled_back`, deliberately: the appointment is cancelled
+    // but the engagement's state and pacing stamp are not restored, and nothing
+    // in 0042 can put them back.
+    expect(res.body).toEqual({
+      ok: false, error: 'version_conflict', appointment_rolled_back: true,
+    });
+    expect(res.body.rolled_back).toBeUndefined();
     // The insert is undone, addressed by the id the RPC actually created and
     // fenced on the version it actually returned.
     expect(write.calls.map((c) => c.op)).toEqual(['scheduleAppointment', 'cancelAppointment']);
@@ -914,8 +920,48 @@ describe('rescheduling supersedes atomically through the same RPC', () => {
     expect(undo.appointmentId).toBe(UUID_OTHER);
     expect(undo.expectedVersion).toBe(1);
     expect(undo.reason).toBe('hr_cancelled');
-    // Nothing is audited as a successful reschedule, because none happened.
-    expect(audited).toEqual([]);
+    // Attributable to the admin who caused it, not stamped `system`.
+    expect(undo.actorId).toBe('66666666-6666-4666-8666-666666666666');
+    // AUDITED. This is the only path on the surface that mutates twice, so it
+    // is the last one that should leave no trace.
+    expect(audited).toHaveLength(1);
+    expect(audited[0].statusCode).toBe(409);
+    expect(audited[0].metadata).toMatchObject({
+      resource: 'phone_appointment',
+      outcome: 'lost_update_undone',
+      appointment_rolled_back: true,
+    });
+  });
+
+  it('undoes NOTHING when the superseded key is ABSENT rather than null', async () => {
+    // Absent means 0042 renamed or dropped the key — a contract break, not a
+    // lost update. Treating the two alike would cancel the freshly created
+    // appointment on EVERY legitimate reschedule.
+    const write = fakeStores({
+      scheduleAppointment: async () => ({ status: 'ok', appointmentId: UUID_OTHER, version: 1 }),
+    });
+    const res = await request(appWith('admin', {
+      readStore: fakeReadStore().store, stores: write.store,
+    })).patch(`/api/phone/appointments/${UUID_A}`).send(body);
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ ok: false, error: 'phone_rpc_unknown_status' });
+    expect(write.calls.map((c) => c.op)).toEqual(['scheduleAppointment']);
+  });
+
+  it('refuses to cancel unfenced when the RPC returned no version', async () => {
+    const write = fakeStores({
+      scheduleAppointment: async () => ({
+        status: 'ok', appointmentId: UUID_OTHER, supersededAppointmentId: null,
+      }),
+    });
+    const res = await request(appWith('admin', {
+      readStore: fakeReadStore().store, stores: write.store,
+    })).patch(`/api/phone/appointments/${UUID_A}`).send(body);
+    expect(res.status).toBe(409);
+    // A null expected version is the "cancel regardless" this surface refuses
+    // everywhere else; it is not safer here.
+    expect(res.body.appointment_rolled_back).toBe(false);
+    expect(write.calls.map((c) => c.op)).toEqual(['scheduleAppointment']);
   });
 
   it('says so when the compensating cancel itself fails', async () => {
@@ -931,7 +977,7 @@ describe('rescheduling supersedes atomically through the same RPC', () => {
     expect(res.status).toBe(409);
     // A stray live appointment now exists; the operator is told rather than
     // left to find it on the calendar.
-    expect(res.body.rolled_back).toBe(false);
+    expect(res.body.appointment_rolled_back).toBe(false);
   });
 
   it('refuses to reschedule an appointment that is no longer live', async () => {
@@ -1198,7 +1244,7 @@ describe('halt', () => {
     }
   });
 
-  it('a concurrent second halt is never lifted by the first adminrolling back', async () => {
+  it('a concurrent second halt is never lifted by the first admin rolling back', async () => {
     // Admin A halts, admin B halts a moment later and is told the dialer is
     // stopped, then A's audit fails. A rollback would lift the halt B is
     // relying on. There is no rollback, so it cannot happen.

@@ -15,6 +15,7 @@ import { describe, it, expect } from 'vitest';
 import {
   PHONE_RPC_NAMES,
   PHONE_RPC_PARAMETERS,
+  PHONE_RPC_RESULT_KEYS,
   PHONE_RPC_STATUSES,
   PHONE_RPC_STATUS_COUNT,
   PHONE_RPC_STATUS_UNION,
@@ -110,6 +111,53 @@ describe('the ten RPCs', () => {
       // the machine clock instead of the injected instant.
       expect([...body.matchAll(/\bnow\(\)/g)]).toHaveLength(1);
       expect(body).toMatch(/p_now\s+timestamptz default now\(\)/);
+    }
+  });
+});
+
+describe('the RESULT keys the API reads', () => {
+  // `PHONE_RPC_PARAMETERS` pins what we SEND; these pin what we READ, and the
+  // two are not the same risk. A renamed parameter is a PostgREST 404 — loud.
+  // A renamed result key is silent, and one of them is load-bearing in a
+  // DESTRUCTIVE direction: the calendar API treats a reschedule whose
+  // `superseded_appointment_id` is null as a lost update and cancels the
+  // appointment it just created. If 0042 renamed that key, every legitimate
+  // reschedule would destroy its own slot and report `version_conflict`.
+
+  it('every declared key appears in the body of the RPC that emits it', () => {
+    const entries = Object.entries(PHONE_RPC_RESULT_KEYS);
+    // Fail closed: an empty map would make the loop vacuous.
+    expect(entries.length).toBeGreaterThanOrEqual(6);
+    for (const [rpc, keys] of entries) {
+      const body = functionBody(rpc);
+      expect(keys.length, `${rpc} declares no result keys`).toBeGreaterThan(0);
+      for (const key of keys) {
+        expect(body, `${rpc} no longer emits ${key}`).toContain(`'${key}'`);
+      }
+    }
+  });
+
+  it('the destructive one is pinned by name, and by what makes its NULL meaningful', () => {
+    // Spelled out because a future edit that trimmed the map would otherwise
+    // remove this key silently and leave the loop above still passing.
+    expect(PHONE_RPC_RESULT_KEYS.schedule_phone_appointment)
+      .toContain('superseded_appointment_id');
+    const body = functionBody('schedule_phone_appointment');
+    // The key is emitted UNCONDITIONALLY in the success payload, and its value
+    // is `v_live.id` — the row found by the live-appointment lookup, which is
+    // NULL exactly when no live appointment existed. That is the whole basis of
+    // the API's lost-update detector: the key is always THERE (so absent means
+    // a contract break, never "superseded nothing"), and its null means "the
+    // expected-version comparison never ran".
+    expect(body).toMatch(/'superseded_appointment_id',\s*v_live\.id\s*\)/);
+    // …and it is emitted from the ONE success return, not from a branch that
+    // could be skipped.
+    expect([...body.matchAll(/'superseded_appointment_id'/g)]).toHaveLength(1);
+  });
+
+  it('every RPC named here is one 0042 actually declares', () => {
+    for (const rpc of Object.keys(PHONE_RPC_RESULT_KEYS)) {
+      expect(PHONE_RPC_NAMES).toContain(rpc);
     }
   });
 });
