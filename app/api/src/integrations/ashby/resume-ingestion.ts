@@ -2,7 +2,8 @@
  * ashby/resume-ingestion.ts — orchestrates ONE ephemeral resume ingestion over
  * injected ports (Wave 2 work item 4). Composes the SSRF-hardened fetch, a
  * FAIL-CLOSED malware scan BEFORE any parse, the magic/MIME guard, the bounded
- * parser, and the deterministic fallback, advancing the 0029 ingestion state
+ * parser, and the TWO-TIER structurer (bounded model, then the deterministic
+ * regex extractor as the floor), advancing the 0029 ingestion state
  * machine (queued → fetching → scanning → extracting → structuring → ready |
  * failed_review | cancelled) and recording hash/version provenance only.
  *
@@ -12,8 +13,37 @@
  *    or a thrown port), and are NEVER written to the resume bucket.
  *  - The malware scan is fail-closed: a not-safe or errored scan blocks the
  *    parse and moves to failed_review — nothing untrusted is ever parsed.
- *  - Structuring is deterministic (regex fallback / bounded parser) — no
- *    provider text can trigger tools or instructions (no LLM in this path).
+ *  - Structuring is TWO-TIER, and this bullet is a DELIBERATE REVERSAL of what
+ *    it used to say. It previously read "structuring is deterministic … no LLM
+ *    in this path", and that stopped being true when the composition root
+ *    (`runtime.ts`, `buildIngestionPorts`) began calling
+ *    `structureResumeWithModel` inside the `parse` port this orchestration
+ *    invokes. Extracted document text — provider-supplied — now reaches a
+ *    model on this path. Stating it plainly, because the previous wording was
+ *    an exclusion a reader could rely on to stop checking.
+ *
+ *    What contains it:
+ *      · the SHARED bounded runner — circuit breaker, wall-clock timeout,
+ *        bounded output, one bounded JSON retry — with no provider
+ *        configuration, key handling or endpoint of its own;
+ *      · a single fixed prompt (`buildExtractionPrompt`), which is the same
+ *        one the recruiter-upload route already sends resume text to, so the
+ *        exposure class is one the product had already accepted — just not,
+ *        until now, on this path;
+ *      · NO tools and no instructions honoured: the reply is parsed as JSON
+ *        and SCHEMA-VALIDATED (`lib/resume-structurer.ts`), never executed,
+ *        and a wrong-typed field rejects the whole result rather than being
+ *        coerced;
+ *      · FAIL-SOFT: the model tier never throws. An outage, an open breaker, a
+ *        timeout, unparseable output or a malformed shape all degrade to the
+ *        deterministic extractor, so a model failure costs a phone number, not
+ *        an ingestion.
+ *
+ *    Only the pure model tag is on the dialable allowlist; a regex-rescued
+ *    phone carries `+fallback` and cannot be dialed. Asserted end-to-end
+ *    against the real parse port in
+ *    `src/__tests__/phone-model-structurer.test.ts` — change this bullet and
+ *    that suite together.
  *  - Only opaque provenance (content sha256, extractor/structurer versions) and
  *    approved structured fields are surfaced for persistence; raw bytes, the
  *    presigned URL, and any token never cross this boundary.

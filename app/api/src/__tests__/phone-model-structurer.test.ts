@@ -19,7 +19,20 @@
  *      produce a populated candidate rather than a failed ingestion.
  *
  * NO PROVIDER IS EVER CONTACTED. Every test injects its own runner through the
- * `modelRunner` seam; the default path is never taken here.
+ * `modelRunner` seam, except the one case that deliberately exercises the
+ * default and mocks the shared module underneath.
+ *
+ * ── PAIRED WITH A SECURITY-POSTURE BULLET ───────────────────────────────────
+ *
+ * The "Security posture" list at the top of
+ * `src/integrations/ashby/resume-ingestion.ts` used to state that structuring
+ * was deterministic with "no LLM in this path". Wiring the model tier reversed
+ * that, and the bullet now describes the two-tier structurer, its containment
+ * and its fail-soft degradation — and points here. These two move TOGETHER: if
+ * the parse port ever stops composing the model tier, or stops degrading to
+ * the deterministic one, the tests below fail and that bullet becomes wrong.
+ * A stale exclusion on the untrusted-input boundary file is exactly the kind
+ * of claim a reviewer relies on to stop checking.
  *
  * Every phone value in this file is synthetic.
  */

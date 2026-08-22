@@ -222,9 +222,26 @@ export function createMaterializationStore(client: SupabaseClient): Materializat
           // absent — an older caller, or any path that did not decide — the
           // coalescing below writes exactly the pre-change shape: the raw
           // string is preserved for the recruiter, and nothing is dialable.
-          // The Ashby structurer is today the DETERMINISTIC regex extractor,
-          // which is not on the dialable allowlist, so this is null/false on
-          // the live path by construction, not by accident.
+          // The live path is TWO-TIER, and `structurerVersion` arrives as one
+          // of exactly three values (see the parse port in
+          // `buildIngestionPorts`, and the matching note in
+          // `runtime-workers.ts`):
+          //
+          //   MODEL_STRUCTURER_VERSION             → the phone came from the
+          //                                          bounded model structurer.
+          //                                          DIALABLE.
+          //   MODEL_STRUCTURER_VERSION+'+fallback' → the model answered, but
+          //                                          the phone was rescued
+          //                                          from the regex. NOT.
+          //   ASHBY_STRUCTURER_VERSION             → no model answer at all.
+          //                                          NOT.
+          //
+          // An earlier revision of this comment said the live path produced
+          // null/false "by construction". That stopped being true the moment
+          // the model tier was wired — the same stale claim its sibling in
+          // `runtime-workers.ts` was already rewritten to disown. What remains
+          // unconditionally true is the fail-closed default below: no decision
+          // supplied ⇒ nothing dialable.
           phone_raw: input.phone ? input.phone.raw : p.phone,
           // `toCandidateColumns` re-applies the strict gate HERE, at the write,
           // so a hand-built decision object cannot put a non-strict value in
