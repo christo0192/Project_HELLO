@@ -34,6 +34,9 @@ cleanup() {
   # The 0040 race section registers its FIFO/result file here so an
   # interrupt mid-race cannot leak either.
   if declare -f pol40c_cleanup >/dev/null 2>&1; then pol40c_cleanup; fi
+  # The 0042 phone-admission races register their FIFO/result file here
+  # too, so an interrupt mid-race cannot leak either.
+  if declare -f pol42c_cleanup >/dev/null 2>&1; then pol42c_cleanup; fi
 }
 trap cleanup EXIT INT TERM
 
@@ -282,6 +285,225 @@ pol40c_race_phase 'ingestion' '40000000-0000-4000-8000-0000000000c2' 'ingestion'
 # one live job. Proven by contention, not by hoping three processes overlap.
 pol40c_race_phase 'legacy'    '40000000-0000-4000-8000-0000000000c3' 'link' \
   'recover_ashby_legacy_bad_output' 'parse_bad_output'
+
+# ===================================================================
+# 0042: DETERMINISTIC concurrent PHONE ADMISSION races.
+#
+# `admit_phone_attempt` must be exactly-once per engagement AND must
+# hold a hard fleet-wide cap of ten live calls. Both properties are
+# invisible from a single session, and both would pass identically with
+# no lock at all if the harness merely HOPED three processes overlapped.
+#
+# So, as in the 0040 section, nothing is left to timing. A BLOCKER
+# session takes a lock and HOLDS it while the racers are launched; the
+# harness then waits until pg_stat_activity shows every racer parked on
+# `wait_event_type='Lock'`. That wait IS the proof — if the RPC did not
+# take the lock, the racers would sail past and the wait would time out,
+# failing the run. Only then is the blocker committed, releasing
+# genuinely contending transactions at once.
+#
+# Three phases, each proving a different lock:
+#   `admission`  — blocker holds the phone_engagements ROW; three
+#                  admissions for ONE engagement must yield one attempt,
+#                  one lease, one live job, one audit row and no budget
+#                  charge. The assert script then proves
+#                  uq_phone_attempts_one_live is load-bearing.
+#   `capacity`   — blocker holds the GLOBAL ADVISORY lock; eleven
+#                  admissions for eleven DISTINCT engagements must fill
+#                  exactly ten slots and refuse the eleventh. Remove the
+#                  advisory lock and the racers never block, so this
+#                  phase fails at the wait.
+#   `lock_order` — six admissions on six distinct engagements run
+#                  concurrently under a deliberately tiny
+#                  `deadlock_timeout`, so a lock-order inversion would
+#                  surface as 40P01 rather than as a slow test. The
+#                  ORDER itself (advisory -> link -> engagement ->
+#                  attempt) is pinned statically in policy_tests.sql.
+#
+# Every wait is a bounded poll that FAILS the run rather than hanging.
+# The clock is fixed and explicit everywhere: no RPC reads the machine
+# clock, so these races give the same answer in Asia and in CI.
+# ===================================================================
+# Each phase gets its OWN fixed instant, a day apart. The fleet cap is
+# global, so a phase inheriting the previous phase's unexpired leases
+# would start with slots already taken and its count would mean nothing.
+# A day of separation puts every earlier 60-second lease comfortably in
+# the past, and each phase's setup drains them before it begins.
+readonly POL42C_TS_ADMISSION='2026-09-10T06:00:00Z'   # 11:30 IST, inside the window
+readonly POL42C_TS_CAPACITY='2026-09-11T06:00:00Z'
+readonly POL42C_TS_LOCKORDER='2026-09-12T06:00:00Z'
+readonly POL42C_POLL_TRIES=150                # x 0.2s = 30s ceiling per wait
+POL42C_FIFO=''
+POL42C_OUT=''
+
+pol42c_cleanup() {
+  [ -n "$POL42C_FIFO" ] && rm -f "$POL42C_FIFO"
+  [ -n "$POL42C_OUT" ] && rm -f "$POL42C_OUT"
+  return 0
+}
+
+pol42c_scalar() {
+  docker exec -i "$SUPABASE_DB_CONTAINER" \
+    psql -U postgres -d postgres -t -A -c "$1"
+}
+
+pol42c_wait_until() {
+  local what="$1" sql="$2" want="$3" i
+  for i in $(seq 1 "$POL42C_POLL_TRIES"); do
+    if [ "$(pol42c_scalar "$sql")" = "$want" ]; then return 0; fi
+    sleep 0.2
+  done
+  log "ERROR: 0042 concurrency FAILED — timed out waiting for ${what} (wanted ${want})"
+  log '       This is what a MISSING lock looks like: the racers never blocked.'
+  pol42c_scalar "select application_name || ' | ' || state || ' | ' || coalesce(wait_event_type,'-')
+                   from pg_stat_activity where application_name like 'pol42c-%'"
+  return 1
+}
+
+# $1 = phase (admission|capacity), $2 = fixture tag, $3 = engagement count,
+# $4 = racer count, $5 = blocker target (engagement|advisory), $6 = instant
+pol42c_race_phase() {
+  local phase="$1" tag="$2" count="$3" racers="$4" target="$5" ts="$6"
+  local blocker_sql ok refused eng i
+
+  log "0042: Seeding ${count} eligible engagement(s) for the ${phase} race..."
+  docker exec -i "$SUPABASE_DB_CONTAINER" \
+    psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+    -v "tag=${tag}" -v "count=${count}" -v "ts=${ts}" \
+    < app/supabase/tests/phone_admission_concurrency_setup.sql
+
+  case "$target" in
+    engagement)
+      eng="$(pol42c_scalar "select engagement_id from _phone_race.fixtures
+                             where tag = '${tag}' and idx = 1")"
+      blocker_sql="select id from screening_v2.phone_engagements where id = '${eng}'::uuid for update;"
+      ;;
+    advisory)
+      blocker_sql="select pg_advisory_xact_lock(hashtext('phone_admission'));"
+      ;;
+    *)
+      log "ERROR: 0042 concurrency: unknown blocker target ${target}"; return 1 ;;
+  esac
+
+  POL42C_FIFO="$(mktemp -u)"
+  mkfifo "$POL42C_FIFO"
+  POL42C_OUT="$(mktemp)"
+
+  docker exec -i -e PGAPPNAME=pol42c-blocker "$SUPABASE_DB_CONTAINER" \
+    psql -U postgres -d postgres -v ON_ERROR_STOP=1 < "$POL42C_FIFO" \
+    > /dev/null 2>&1 &
+  exec 8>"$POL42C_FIFO"
+  printf 'begin;\n%s\n' "$blocker_sql" >&8
+
+  pol42c_wait_until "the ${phase} blocker to hold its lock" \
+    "select count(*) from pg_stat_activity
+      where application_name = 'pol42c-blocker' and state = 'idle in transaction'" '1'
+
+  log "0042: Blocker holds the ${phase} lock — launching ${racers} admission sessions..."
+  for i in $(seq 1 "$racers"); do
+    eng="$(pol42c_scalar "select engagement_id from _phone_race.fixtures
+                           where tag = '${tag}' and idx = $(( count == 1 ? 1 : i ))")"
+    docker exec -e "PGAPPNAME=pol42c-racer-${i}" "$SUPABASE_DB_CONTAINER" \
+      psql -U postgres -d postgres -t -A -c \
+      "select screening_v2.admit_phone_attempt('${eng}'::uuid, 'initial',
+                'pol42c-${i}', 60, '${ts}'::timestamptz)->>'status'" \
+      >> "$POL42C_OUT" 2>&1 &
+  done
+
+  # THE PROOF.
+  pol42c_wait_until "all ${racers} admission sessions to BLOCK on the ${phase} lock" \
+    "select count(*) from pg_stat_activity
+      where application_name like 'pol42c-racer-%' and wait_event_type = 'Lock'" "${racers}"
+  log "0042: All ${racers} sessions are blocked — releasing the blocker."
+
+  printf 'commit;\n' >&8
+  exec 8>&-
+  wait
+
+  ok="$(grep -c '^ok$' "$POL42C_OUT" || true)"
+  case "$phase" in
+    admission)
+      refused="$(grep -cE '^(state_not_admissible|attempt_in_flight)$' "$POL42C_OUT" || true)"
+      if [ "$ok" != '1' ] || [ "$refused" != '2' ]; then
+        log "ERROR: 0042 ${phase} FAILED — expected 1 ok + 2 refusals, got ok=${ok} refused=${refused}"
+        cat "$POL42C_OUT"; return 1
+      fi
+      ;;
+    capacity)
+      refused="$(grep -c '^at_capacity$' "$POL42C_OUT" || true)"
+      if [ "$ok" != '10' ] || [ "$refused" != '1' ]; then
+        log "ERROR: 0042 ${phase} FAILED — expected 10 ok + 1 at_capacity, got ok=${ok} at_capacity=${refused}"
+        cat "$POL42C_OUT"; return 1
+      fi
+      ;;
+  esac
+
+  log "0042: ${phase} — statuses correct. Asserting the durable consequences..."
+  docker exec -i "$SUPABASE_DB_CONTAINER" \
+    psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+    -v "tag=${tag}" -v "mode=${phase}" -v "ts=${ts}" \
+    < app/supabase/tests/phone_admission_concurrency_assert.sql
+
+  pol42c_cleanup
+  POL42C_FIFO=''
+  POL42C_OUT=''
+  log "0042: PASS — ${phase}."
+}
+
+pol42c_race_phase 'admission' 'pol42c-adm' 1  3  'engagement' "$POL42C_TS_ADMISSION"
+pol42c_race_phase 'capacity'  'pol42c-cap' 11 11 'advisory'   "$POL42C_TS_CAPACITY"
+
+# ── Lock-order / deadlock phase ─────────────────────────────────────
+# Eight sessions running a MIXED workload — admit, apply, reclaim — over
+# a shared engagement set, each under `deadlock_timeout='50ms'`.
+#
+# A phase built only from concurrent `admit_phone_attempt` calls would be
+# theatre: the advisory lock is that function's first statement, so they
+# serialise completely and could not deadlock however the row locks were
+# ordered. The cycles that are actually plausible run BETWEEN the
+# functions, and in particular between the sweeper (which touches other
+# sessions' engagements and attempts) and an admission holding an
+# engagement while waiting on the one-live index. Invert the sweeper's
+# two locks and this phase turns red with a 40P01; that inversion is a
+# recorded mutation control.
+log '0042: Seeding eight engagements for the lock-order / deadlock phase...'
+docker exec -i "$SUPABASE_DB_CONTAINER" \
+  psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+  -v 'tag=pol42c-lock' -v 'count=8' -v "ts=${POL42C_TS_LOCKORDER}" \
+  < app/supabase/tests/phone_admission_concurrency_setup.sql
+
+POL42C_OUT="$(mktemp)"
+for i in $(seq 1 8); do
+  docker exec -i -e "PGAPPNAME=pol42c-lock-${i}" "$SUPABASE_DB_CONTAINER" \
+    psql -U postgres -d postgres -t -A \
+    -v "idx=${i}" -v 'tag=pol42c-lock' -v 'count=8' -v "ts=${POL42C_TS_LOCKORDER}" \
+    < app/supabase/tests/phone_lock_order_worker.sql \
+    >> "$POL42C_OUT" 2>&1 &
+done
+wait
+
+if grep -qiE 'deadlock detected|40P01' "$POL42C_OUT"; then
+  log 'ERROR: 0042 lock-order FAILED — a deadlock formed between admit, apply and reclaim.'
+  log '       This is a lock-ORDER defect, not a load problem: some pair of these'
+  log '       functions takes the engagement and the attempt in opposite orders.'
+  cat "$POL42C_OUT"; exit 1
+fi
+if [ "$(grep -c 'completed 10 mixed iterations' "$POL42C_OUT" || true)" != '8' ]; then
+  log 'ERROR: 0042 lock-order FAILED — not every worker finished its ten iterations.'
+  cat "$POL42C_OUT"; exit 1
+fi
+docker exec -i "$SUPABASE_DB_CONTAINER" \
+  psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+  -v 'tag=pol42c-lock' -v 'mode=lock_order' -v "ts=${POL42C_TS_LOCKORDER}" \
+  < app/supabase/tests/phone_admission_concurrency_assert.sql
+pol42c_cleanup
+POL42C_OUT=''
+log '0042: PASS — lock_order: eight concurrent admit/apply/reclaim workers, zero deadlocks.'
+
+# The race schema is scratch state for this section only; the TST-15
+# rehearsal below re-creates the database from scratch anyway.
+docker exec "$SUPABASE_DB_CONTAINER" \
+  psql -U postgres -d postgres -q -c 'drop schema if exists _phone_race cascade' >/dev/null
 
 log 'Verifying custom-schema anon denial through PostgREST...'
 ANON_KEY="$(supabase_cli status -o env 2>/dev/null \
