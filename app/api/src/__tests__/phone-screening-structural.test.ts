@@ -146,17 +146,38 @@ describe('2. no provider, no dialing, no network, no Ashby mutation', () => {
     }
   });
 
-  it('nothing in the repository imports this module yet', () => {
-    // P2 is a domain core. Wiring it into a route, a worker or the composition
-    // root is a later phase's decision, and an unnoticed import would make a
-    // dormant module live.
+  it('only the enumerated P3 ingress files import this module', () => {
+    // P2 shipped this as a dormant domain core and this assertion read
+    // "nothing imports it yet". P3 wires it in, so the assertion moves rather
+    // than dies: an ALLOWLIST of importers keeps the original control alive —
+    // an unnoticed import still fails — while recording, in one place, every
+    // file that was deliberately allowed to make the module live.
+    //
+    // Deleting it instead would have been the worse trade: a tripwire that
+    // cannot fire once the thing it guards changes is not a weaker control,
+    // it is a misleading one.
+    const ALLOWED_IMPORTERS = new Set([
+      'integrations/livekit-phone/config.ts',
+      'integrations/livekit-phone/ingress.ts',
+      'integrations/livekit-phone/reconciliation.ts',
+      'integrations/livekit-phone/stores.ts',
+      'routes/phone-webhook.ts',
+    ]);
+    const seen = new Set<string>();
     for (const file of allSourceFiles(SRC_DIR)) {
       if (file.startsWith(MODULE_DIR)) continue;
       // Match an IMPORT SPECIFIER, not the words: `phone-screening` also
       // appears in ordinary English inside a scoring prompt.
-      expect(readFileSync(file, 'utf8'), `${file} imports phone-screening`)
-        .not.toMatch(/from\s+['"][^'"]*phone-screening[^'"]*['"]/);
+      const imports = /from\s+['"][^'"]*phone-screening[^'"]*['"]/
+        .test(readFileSync(file, 'utf8'));
+      if (!imports) continue;
+      const rel = path.relative(SRC_DIR, file).split(path.sep).join('/');
+      expect(ALLOWED_IMPORTERS.has(rel), `${rel} imports phone-screening`).toBe(true);
+      seen.add(rel);
     }
+    // The allowlist must not outlive its entries either: a stale name would
+    // silently permit a future file to reuse it.
+    expect([...seen].sort()).toEqual([...ALLOWED_IMPORTERS].sort());
   });
 });
 

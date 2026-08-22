@@ -22,6 +22,7 @@ import { notificationsRouter } from './routes/notifications.js';
 import { exportRouter } from './routes/export.js';
 import { appealsRouter } from './routes/appeals.js';
 import { ashbyWebhookRouter } from './routes/ashby-webhook.js';
+import { phoneWebhookRouter } from './routes/phone-webhook.js';
 import { ashbyMissionControlRouter } from './routes/ashby-mission-control.js';
 import { ashbyReviewRouter } from './routes/ashby-review.js';
 import { ashbyCandidateWorkflowRouter } from './routes/ashby-candidate-workflow.js';
@@ -219,6 +220,17 @@ export function createApp(opts: CreateAppOptions = {}) {
   // is still covered by the global per-IP limiter. Disabled by default: it
   // fails closed (503) unless ASHBY_INTEGRATION_ENABLED + a secret are set.
   app.use('/api/integrations/ashby', ashbyWebhookRouter);
+
+  // Inbound LiveKit PHONE webhook receiver. Mounted before recruiter auth for
+  // the same reason as the Ashby receiver: its trust boundary is the
+  // LiveKit-signed `Authorize` JWT verified over the exact raw request bytes,
+  // not a recruiter session. Only `POST /webhook` exists on the router, so any
+  // other method or path under this prefix falls through to the auth
+  // middleware below and is rejected — the public surface is one exact
+  // method-and-path pair, not the prefix. Still covered by the global per-IP
+  // limiter. Disabled by default: it fails closed (503) unless
+  // PHONE_SCREENING_ENABLED is on AND the existing LiveKit key pair is set.
+  app.use('/api/integrations/livekit-phone', phoneWebhookRouter);
 
   // ── Auth middleware: runs after CORS so preflight succeeds ─────
   // Uses DI seam when authDeps is provided (tests).
