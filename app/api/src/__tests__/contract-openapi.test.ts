@@ -2433,12 +2433,17 @@ describe('phone operator API bodies match the documented schemas', () => {
       heartbeatAttempt: async () => ({ status: 'ok' }),
       reclaimAttemptLeases: async () => ({ status: 'ok' }),
       applyEvent: async () => ({ status: 'applied' }),
-      scheduleAppointment: async () => ({
+      // A reschedule (non-null expected version) supersedes the live row and
+      // returns its id; a create supersedes nothing. The route now treats a
+      // reschedule that superseded NOTHING as a lost update, so the fake has to
+      // model the difference rather than always answering null.
+      scheduleAppointment: async (input: { expectedVersion?: number | null }) => ({
         status: 'ok',
         appointmentId: PHONE_APPOINTMENT,
         version: 1,
         engagementState: 'scheduled',
-        supersededAppointmentId: null,
+        supersededAppointmentId:
+          input.expectedVersion == null ? null : '00000000-0000-4000-8000-0000000000a2',
       }),
       cancelAppointment: async () => ({
         status: 'ok', appointmentId: PHONE_APPOINTMENT, version: 4,

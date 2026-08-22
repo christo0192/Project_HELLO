@@ -103,6 +103,26 @@ function nullableStr(row: Row, key: string): string | null {
   return typeof v === 'string' ? v : null;
 }
 
+/**
+ * `chk_phone_engagements_reason` and `chk_phone_appointments_cancel_reason` are
+ * FORMAT rules, not closed allowlists — 0042 deliberately leaves room for a
+ * reason it has not invented yet. Mirroring the format is therefore the right
+ * narrowing: a value that satisfies it is a stable snake_case code and safe to
+ * serialize, and anything else is refused rather than forwarded.
+ *
+ * Without this, these two were the only strings crossing the boundary
+ * unnarrowed, against this file's own stated rule. A future writer that put
+ * free text in either column would have reached a response silently.
+ */
+const REASON_CODE = /^[a-z0-9_.:-]{1,64}$/;
+
+function reasonCode(row: Row, key: string): string | null {
+  const v = row[key];
+  if (typeof v !== 'string') return null;
+  if (!REASON_CODE.test(v)) throw new Error('phone_reason_code_invalid');
+  return v;
+}
+
 function int(row: Row, key: string): number | undefined {
   const v = row[key];
   return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
@@ -156,7 +176,7 @@ function mapAppointment(row: Row): PhoneAppointmentRow {
     status,
     source,
     confirmedAt: nullableStr(row, 'confirmed_at'),
-    cancelReason: nullableStr(row, 'cancel_reason'),
+    cancelReason: reasonCode(row, 'cancel_reason'),
     version,
     createdAt,
     updatedAt,
@@ -186,7 +206,7 @@ function mapEngagement(row: Row): PhoneEngagementRow {
     id,
     candidateId,
     state,
-    stateReason: nullableStr(row, 'state_reason'),
+    stateReason: reasonCode(row, 'state_reason'),
     epoch,
     version,
     noAnswerAttempts,

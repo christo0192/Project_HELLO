@@ -172,12 +172,16 @@ function fakeStores(over: Partial<PhoneStores> = {}): WriteSpy {
     heartbeatAttempt: async () => ({ status: 'ok' }),
     reclaimAttemptLeases: async () => ({ status: 'ok' }),
     applyEvent: async () => ({ status: 'applied' }),
-    scheduleAppointment: async () => ({
+    // A reschedule (non-null expected version) supersedes the live row and
+    // returns its id; a create supersedes nothing. The route treats a
+    // reschedule that superseded NOTHING as a lost update, so the default fake
+    // has to model the difference rather than always answering null.
+    scheduleAppointment: async (input: { expectedVersion?: number | null }) => ({
       status: 'ok',
       appointmentId: UUID_A,
       version: 1,
       engagementState: 'scheduled',
-      supersededAppointmentId: null,
+      supersededAppointmentId: input.expectedVersion == null ? null : UUID_OTHER,
     }),
     cancelAppointment: async () => ({ status: 'ok', appointmentId: UUID_A, version: 4 }),
     expireAppointments: async () => ({ status: 'ok' }),
@@ -605,7 +609,10 @@ describe('the engagement projection', () => {
     // The provider-error residual made visible: five failures, and the next
     // legal instant is a whole IST day away.
     expect(res.body.engagement.next_eligible_at).toBe('2026-08-25T03:30:00.000Z');
-    expect(res.body.engagement.next_eligible_ist).toBe('09:00');
+    // WITH its IST date. The provider-error rule defers to the next legal
+    // instant on the NEXT IST day, so a bare '09:00' would be ambiguous by
+    // exactly one day on the one field that residual is about.
+    expect(res.body.engagement.next_eligible_ist).toBe('2026-08-25 09:00');
   });
 
   it('shows attempt outcomes and nothing about the provider', async () => {
@@ -879,6 +886,54 @@ describe('rescheduling supersedes atomically through the same RPC', () => {
     expect(res.body.superseded_appointment_id).toBe('99999999-9999-4999-8999-999999999999');
   });
 
+  it('refuses a reschedule that superseded NOTHING — the lost update 0042 misses', async () => {
+    // `schedule_phone_appointment` compares p_expected_version ONLY when it
+    // finds a live appointment; when it finds none it skips the comparison and
+    // INSERTS. So if the addressed row is cancelled between the pre-read and
+    // the RPC, a reschedule silently becomes a create and resurrects a slot
+    // another admin just cancelled. A reschedule always sends a non-null
+    // expected version, so "superseded nothing" is exactly that case.
+    const write = fakeStores({
+      scheduleAppointment: async () => ({
+        status: 'ok',
+        appointmentId: UUID_OTHER,
+        version: 1,
+        engagementState: 'scheduled',
+        supersededAppointmentId: null,
+      }),
+    });
+    const res = await request(appWith('admin', {
+      readStore: fakeReadStore().store, stores: write.store,
+    })).patch(`/api/phone/appointments/${UUID_A}`).send(body);
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ ok: false, error: 'version_conflict', rolled_back: true });
+    // The insert is undone, addressed by the id the RPC actually created and
+    // fenced on the version it actually returned.
+    expect(write.calls.map((c) => c.op)).toEqual(['scheduleAppointment', 'cancelAppointment']);
+    const undo = write.calls[1].input as Record<string, unknown>;
+    expect(undo.appointmentId).toBe(UUID_OTHER);
+    expect(undo.expectedVersion).toBe(1);
+    expect(undo.reason).toBe('hr_cancelled');
+    // Nothing is audited as a successful reschedule, because none happened.
+    expect(audited).toEqual([]);
+  });
+
+  it('says so when the compensating cancel itself fails', async () => {
+    const write = fakeStores({
+      scheduleAppointment: async () => ({
+        status: 'ok', appointmentId: UUID_OTHER, version: 1, supersededAppointmentId: null,
+      }),
+      cancelAppointment: async () => { throw new Error('phone_cancel_appointment_error'); },
+    });
+    const res = await request(appWith('admin', {
+      readStore: fakeReadStore().store, stores: write.store,
+    })).patch(`/api/phone/appointments/${UUID_A}`).send(body);
+    expect(res.status).toBe(409);
+    // A stray live appointment now exists; the operator is told rather than
+    // left to find it on the calendar.
+    expect(res.body.rolled_back).toBe(false);
+  });
+
   it('refuses to reschedule an appointment that is no longer live', async () => {
     for (const status of ['cancelled', 'superseded', 'fulfilled', 'missed'] as const) {
       const read = fakeReadStore({ getAppointment: async () => ({ ...APPOINTMENT, status }) });
@@ -1011,6 +1066,22 @@ describe('the health surface', () => {
     }
   });
 
+  it('degrades when the state histogram is absent, rather than reporting an empty one', () => {
+    // `engagementsByState` is optional on PhoneBacklogResult. Rendering an
+    // absent map as {} would say "no engagements in any state" — the exact
+    // healthy zero every sibling block refuses to emit.
+    const { engagementsByState, ...withoutHistogram } = HEALTHY_BACKLOG;
+    expect(engagementsByState).toBeDefined();
+    const stores = fakeStores({ backlog: async () => withoutHistogram as never });
+    return request(appWith('interviewer', { stores: stores.store }))
+      .get('/api/phone/health')
+      .then((res) => {
+        expect(res.body.status).toBe('degraded');
+        expect(res.body.reasons).toEqual(['backlog_unavailable']);
+        expect(res.body.engagements_by_state).toBeNull();
+      });
+  });
+
   it('reports a MISSING control singleton as halted and unreadable', async () => {
     const stores = fakeStores({
       backlog: async () => ({
@@ -1101,52 +1172,41 @@ describe('halt', () => {
     expect((write.calls[0].input as Record<string, unknown>).reason).toBe('provider_incident');
   });
 
-  it('rolls the halt back and returns 500 when the audit write fails', async () => {
+  it('NEVER lifts the halt when the audit write fails — the stop stands', async () => {
+    // Undoing a raised kill switch means resuming the dialer. Compensating here
+    // would fail OPEN on the one control whose purpose is to stop billable
+    // calls to real candidates, on the strength of OUR sink outage — which is
+    // plausibly the same outage the operator halted for. And it is not needed:
+    // 0042's set_phone_halt writes its own audit_events row inside the same
+    // transaction, so the halt is durably audited either way.
+    setAuditSink(() => { throw new Error('audit db insert failed'); });
+    for (const alreadyHalted of [false, true, undefined]) {
+      const write = fakeStores({
+        setHalt: async () => ({
+          status: 'ok',
+          ...(alreadyHalted === undefined ? {} : { alreadyHalted }),
+        }),
+      });
+      const res = await request(appWith('admin', { stores: write.store }))
+        .post('/api/phone/halt').send({ reason: 'operator_pause' });
+      expect(res.status, `alreadyHalted ${alreadyHalted}`).toBe(500);
+      expect(res.body).toEqual({
+        ok: false, error: 'phone_audit_write_failed', rolled_back: false,
+      });
+      // The decisive assertion: no clearHalt, ever.
+      expect(write.calls.map((c) => c.op)).toEqual(['setHalt']);
+    }
+  });
+
+  it('a concurrent second halt is never lifted by the first adminrolling back', async () => {
+    // Admin A halts, admin B halts a moment later and is told the dialer is
+    // stopped, then A's audit fails. A rollback would lift the halt B is
+    // relying on. There is no rollback, so it cannot happen.
     setAuditSink(() => { throw new Error('audit db insert failed'); });
     const write = fakeStores({ setHalt: async () => ({ status: 'ok', alreadyHalted: false }) });
-    const res = await request(appWith('admin', { stores: write.store }))
-      .post('/api/phone/halt').send({ reason: 'operator_pause' });
-    expect(res.status).toBe(500);
-    expect(res.body).toEqual({ ok: false, error: 'phone_audit_write_failed', rolled_back: true });
-    expect(write.calls.map((c) => c.op)).toEqual(['setHalt', 'clearHalt']);
-  });
-
-  it('does NOT roll back a halt that was already in force', async () => {
-    // 0042 preserves the original instant, reason and actor across repeated
-    // halts, so our call changed nothing — clearing would undo somebody else's
-    // decision on the strength of our own audit failure.
-    setAuditSink(() => { throw new Error('audit db insert failed'); });
-    const write = fakeStores({ setHalt: async () => ({ status: 'ok', alreadyHalted: true }) });
-    const res = await request(appWith('admin', { stores: write.store }))
-      .post('/api/phone/halt').send({ reason: 'operator_pause' });
-    expect(res.status).toBe(500);
-    expect(res.body.rolled_back).toBe(false);
-    expect(write.calls.map((c) => c.op)).toEqual(['setHalt']);
-  });
-
-  it('fails CLOSED when the RPC omits already_halted', async () => {
-    // Defaulting an absent field to false would make the compensating clear
-    // lift a halt this call did not cause — somebody else's stop becoming a go
-    // on the strength of our audit failure. Unknown means "not ours".
-    setAuditSink(() => { throw new Error('audit db insert failed'); });
-    const write = fakeStores({ setHalt: async () => ({ status: 'ok' }) });
-    const res = await request(appWith('admin', { stores: write.store }))
-      .post('/api/phone/halt').send({ reason: 'operator_pause' });
-    expect(res.status).toBe(500);
-    expect(res.body.rolled_back).toBe(false);
-    expect(write.calls.map((c) => c.op)).toEqual(['setHalt']);
-  });
-
-  it('reports honestly when the rollback itself fails', async () => {
-    setAuditSink(() => { throw new Error('audit db insert failed'); });
-    const write = fakeStores({
-      setHalt: async () => ({ status: 'ok', alreadyHalted: false }),
-      clearHalt: async () => { throw new Error('phone_clear_halt_error'); },
-    });
-    const res = await request(appWith('admin', { stores: write.store }))
-      .post('/api/phone/halt').send({ reason: 'operator_pause' });
-    expect(res.status).toBe(500);
-    expect(res.body.rolled_back).toBe(false);
+    await request(appWith('admin', { stores: write.store }))
+      .post('/api/phone/halt').send({ reason: 'provider_incident' });
+    expect(write.calls.every((c) => c.op !== 'clearHalt')).toBe(true);
   });
 });
 
@@ -1162,8 +1222,37 @@ describe('halt/clear', () => {
       .post('/api/phone/halt/clear').send({ reason: 'cost_control' });
     expect(res.status).toBe(409);
     expect(res.body.error).toBe('halt_reason_mismatch');
-    // Refused before delegation: an admin who has not looked at why the dialer
-    // was stopped cannot restart it.
+    // Refused before delegation.
+    expect(write.calls.map((c) => c.op)).toEqual(['backlog']);
+    // AUDITED. Five reasons and a distinguishing refusal means brute force
+    // costs five requests — what the interlock actually buys is that every
+    // attempt leaves a trail. And the row must NOT hand the answer to whoever
+    // reads the log later.
+    expect(audited).toHaveLength(1);
+    expect(audited[0].statusCode).toBe(409);
+    expect(audited[0].metadata).toEqual({
+      resource: 'phone_control',
+      action: 'halt_clear_refused',
+      outcome: 'halt_reason_mismatch',
+    });
+    expect(JSON.stringify(audited[0].metadata)).not.toContain('legal_hold');
+  });
+
+  it('a refused clear that cannot be audited is a 500, not a silent 409', async () => {
+    setAuditSink(() => { throw new Error('audit db insert failed'); });
+    const write = fakeStores({
+      backlog: async () => ({
+        ...HEALTHY_BACKLOG,
+        admission: { controlPresent: true, halted: true, haltReason: 'legal_hold' },
+      }),
+    });
+    const res = await request(appWith('admin', { stores: write.store }))
+      .post('/api/phone/halt/clear').send({ reason: 'cost_control' });
+    expect(res.status).toBe(500);
+    // Nothing happened, so there is nothing to roll back.
+    expect(res.body).toEqual({
+      ok: false, error: 'phone_audit_write_failed', rolled_back: false,
+    });
     expect(write.calls.map((c) => c.op)).toEqual(['backlog']);
   });
 

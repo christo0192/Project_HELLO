@@ -3169,6 +3169,24 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PhoneApiError'
+        '401':
+          description: No bearer token, or a token the server could not validate. Emitted by the global auth middleware before the router is reached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '403':
+          description: Authenticated but insufficiently privileged — reads need interviewer or above, every mutation needs admin, and the global viewer read-only guard rejects a viewer mutation before the role gate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '429':
+          description: Per-user rate limit exceeded. NOT a health signal — retry, do not report degraded. This mount uses the default bucket precisely so an operator poll of /api/phone/health cannot be throttled into looking degraded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
   /api/phone/calendar/slots:
     get:
       tags: [phone]
@@ -3203,6 +3221,24 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PhoneApiError'
+        '401':
+          description: No bearer token, or a token the server could not validate. Emitted by the global auth middleware before the router is reached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '403':
+          description: Authenticated but insufficiently privileged — reads need interviewer or above, every mutation needs admin, and the global viewer read-only guard rejects a viewer mutation before the role gate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '429':
+          description: Per-user rate limit exceeded. NOT a health signal — retry, do not report degraded. This mount uses the default bucket precisely so an operator poll of /api/phone/health cannot be throttled into looking degraded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
   /api/phone/engagements/{id}:
     get:
       tags: [phone]
@@ -3244,6 +3280,24 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PhoneApiError'
+        '401':
+          description: No bearer token, or a token the server could not validate. Emitted by the global auth middleware before the router is reached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '403':
+          description: Authenticated but insufficiently privileged — reads need interviewer or above, every mutation needs admin, and the global viewer read-only guard rejects a viewer mutation before the role gate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '429':
+          description: Per-user rate limit exceeded. NOT a health signal — retry, do not report degraded. This mount uses the default bucket precisely so an operator poll of /api/phone/health cannot be throttled into looking degraded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
   /api/phone/health:
     get:
       tags: [phone]
@@ -3254,11 +3308,35 @@ paths:
         - bearerAuth: []
       responses:
         '200':
-          description: Sanitized operational state. Always 200 — degradation is reported in the body, never as an HTTP failure.
+          description: Sanitized operational state. Degradation is reported in the BODY, never as an HTTP status — a degraded phone subsystem still answers 200 with status degraded and null count blocks.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/PhoneHealthResponse'
+        '500':
+          description: phone_read_error. The handler itself failed — distinct from a degraded subsystem, which is a 200. Reachable only if the surface cannot be assembled at all.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '401':
+          description: No bearer token, or a token the server could not validate. Emitted by the global auth middleware before the router is reached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '403':
+          description: Authenticated but insufficiently privileged — reads need interviewer or above, every mutation needs admin, and the global viewer read-only guard rejects a viewer mutation before the role gate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '429':
+          description: Per-user rate limit exceeded. NOT a health signal — retry, do not report degraded. This mount uses the default bucket precisely so an operator poll of /api/phone/health cannot be throttled into looking degraded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
   /api/phone/appointments:
     post:
       tags: [phone]
@@ -3310,6 +3388,24 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PhoneApiError'
+        '401':
+          description: No bearer token, or a token the server could not validate. Emitted by the global auth middleware before the router is reached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '403':
+          description: Authenticated but insufficiently privileged — reads need interviewer or above, every mutation needs admin, and the global viewer read-only guard rejects a viewer mutation before the role gate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '429':
+          description: Per-user rate limit exceeded. NOT a health signal — retry, do not report degraded. This mount uses the default bucket precisely so an operator poll of /api/phone/health cannot be throttled into looking degraded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
   /api/phone/appointments/{id}:
     patch:
       tags: [phone]
@@ -3352,7 +3448,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/PhoneApiError'
         '409':
-          description: not_live when the addressed appointment is cancelled, superseded, fulfilled or missed, or any schedule refusal including version_conflict.
+          description: not_live when the addressed appointment is cancelled, superseded, fulfilled or missed, or any schedule refusal including version_conflict. A version_conflict here may also mean the addressed row stopped being live between the pre-read and the RPC — schedule_phone_appointment compares the expected version ONLY when it finds a live appointment, so that race would otherwise turn a reschedule into a silent create. The route detects it (nothing was superseded), undoes the insert and reports rolled_back.
           content:
             application/json:
               schema:
@@ -3369,6 +3465,24 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PhoneApiError'
+        '401':
+          description: No bearer token, or a token the server could not validate. Emitted by the global auth middleware before the router is reached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '403':
+          description: Authenticated but insufficiently privileged — reads need interviewer or above, every mutation needs admin, and the global viewer read-only guard rejects a viewer mutation before the role gate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '429':
+          description: Per-user rate limit exceeded. NOT a health signal — retry, do not report degraded. This mount uses the default bucket precisely so an operator poll of /api/phone/health cannot be throttled into looking degraded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
     delete:
       tags: [phone]
       operationId: cancelPhoneAppointment
@@ -3427,6 +3541,24 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PhoneApiError'
+        '401':
+          description: No bearer token, or a token the server could not validate. Emitted by the global auth middleware before the router is reached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '403':
+          description: Authenticated but insufficiently privileged — reads need interviewer or above, every mutation needs admin, and the global viewer read-only guard rejects a viewer mutation before the role gate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '429':
+          description: Per-user rate limit exceeded. NOT a health signal — retry, do not report degraded. This mount uses the default bucket precisely so an operator poll of /api/phone/health cannot be throttled into looking degraded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
   /api/phone/halt:
     post:
       tags: [phone]
@@ -3472,6 +3604,24 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PhoneApiError'
+        '401':
+          description: No bearer token, or a token the server could not validate. Emitted by the global auth middleware before the router is reached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '403':
+          description: Authenticated but insufficiently privileged — reads need interviewer or above, every mutation needs admin, and the global viewer read-only guard rejects a viewer mutation before the role gate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '429':
+          description: Per-user rate limit exceeded. NOT a health signal — retry, do not report degraded. This mount uses the default bucket precisely so an operator poll of /api/phone/health cannot be throttled into looking degraded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
   /api/phone/halt/clear:
     post:
       tags: [phone]
@@ -3518,6 +3668,24 @@ paths:
               schema:
                 $ref: '#/components/schemas/PhoneApiError'
 
+        '401':
+          description: No bearer token, or a token the server could not validate. Emitted by the global auth middleware before the router is reached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '403':
+          description: Authenticated but insufficiently privileged — reads need interviewer or above, every mutation needs admin, and the global viewer read-only guard rejects a viewer mutation before the role gate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '429':
+          description: Per-user rate limit exceeded. NOT a health signal — retry, do not report degraded. This mount uses the default bucket precisely so an operator poll of /api/phone/health cannot be throttled into looking degraded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
 components:
   securitySchemes:
     bearerAuth:
@@ -6833,7 +7001,7 @@ components:
         remaining:
           type: integer
         bookable:
-          description: True iff refusals is empty. Advisory, not a reservation.
+          description: True iff refusals is empty. Advisory, not a reservation — and when the response's occupancy_truncated is true this field is OPTIMISTIC, because booked is then only a lower bound.
           type: boolean
         refusals:
           type: array
@@ -6973,7 +7141,7 @@ components:
           format: date-time
           nullable: true
         next_eligible_ist:
-          description: IST wall clock HH-MM of next_eligible_at.
+          description: IST wall clock of next_eligible_at, WITH its calendar date (YYYY-MM-DD HH-MM). The date is not optional here — the provider-error rule defers to the next legal instant on the NEXT IST day, so a bare time would be ambiguous by exactly one day on the one field that residual is about.
           type: string
           nullable: true
         last_attempt_at:

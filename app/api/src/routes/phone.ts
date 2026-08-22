@@ -122,6 +122,24 @@ function istClock(iso: string | null): string | null {
   return `${String(w.hour).padStart(2, '0')}:${String(w.minute).padStart(2, '0')}`;
 }
 
+/**
+ * `YYYY-MM-DD HH:MM` in IST — the wall clock WITH its date.
+ *
+ * Used for `next_eligible_at`, which is the one derived display field where a
+ * bare time is ambiguous by exactly one day: the provider-error rule defers to
+ * the next legal instant on the NEXT IST day, so "09:00" alone reads as this
+ * morning. An appointment's `ist_start` can stay a bare time because its
+ * `ist_date` sits beside it.
+ */
+function istStamp(iso: string | null): string | null {
+  if (iso === null) return null;
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) return null;
+  const w = istWallClock(new Date(ms));
+  const date = `${String(w.year).padStart(4, '0')}-${String(w.month).padStart(2, '0')}-${String(w.day).padStart(2, '0')}`;
+  return `${date} ${String(w.hour).padStart(2, '0')}:${String(w.minute).padStart(2, '0')}`;
+}
+
 /** The window block every read echoes, so no client re-derives the time zone. */
 function windowBlock(): Record<string, unknown> {
   return {
@@ -265,13 +283,29 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
    * in `FAIL_CLOSED_EVENTS`, so `recordAudit` THROWS when the sink fails and
    * the caller must not report success.
    *
-   * `compensate` runs before the 500 when the mutation is reversible. Only the
-   * two halt routes pass one: raising and lowering a kill switch are exactly
-   * invertible, and leaving an unaudited halt state in place is precisely the
-   * thing an auditor would need. An appointment supersede is NOT reversible —
-   * the previous row is already `superseded` and re-creating it would be a
-   * second, differently-shaped mutation — so those routes report the failure
-   * honestly with `rolled_back: false` and the client re-reads.
+   * `compensate` runs before the 500 — but ONLY where undoing is the safe
+   * direction, which is a much shorter list than "wherever undoing is
+   * possible".
+   *
+   * `POST /halt` deliberately passes NO compensation. Undoing a raised kill
+   * switch means resuming the dialer, so compensating there would fail OPEN on
+   * the one control whose entire purpose is to stop billable calls to real
+   * candidates — and it would do so on the strength of OUR sink outage, which
+   * is plausibly the same outage that caused the operator to halt. It would
+   * also be unsound under concurrency: a second admin who halted a moment later
+   * is told the dialer is stopped, and our rollback would lift the halt they
+   * are relying on. And it is not even buying the thing it claims to: 0042's
+   * `set_phone_halt` writes its OWN `audit_events` row inside the same
+   * transaction as the halt, so a raised halt is durably audited whether or not
+   * this route's sink is reachable.
+   *
+   * `POST /halt/clear` DOES compensate, for the mirror-image reason: undoing a
+   * clear means re-raising the stop, which is the fail-closed direction.
+   *
+   * An appointment supersede is not reversible at all — the previous row is
+   * already `superseded` and re-creating it would be a second,
+   * differently-shaped mutation — so it reports `rolled_back: false` and the
+   * client re-reads.
    */
   async function auditOrFail(
     req: Request,
@@ -513,7 +547,7 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
             terminal: engagement.terminalAt !== null,
             terminal_at: engagement.terminalAt,
             next_eligible_at: engagement.nextEligibleAt,
-            next_eligible_ist: istClock(engagement.nextEligibleAt),
+            next_eligible_ist: istStamp(engagement.nextEligibleAt),
             last_attempt_at: engagement.lastAttemptAt,
             created_at: engagement.createdAt,
             updated_at: engagement.updatedAt,
@@ -592,8 +626,12 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
       backlog = null;
     }
 
+    // `engagementsByState` is checked alongside the other four: it is optional
+    // on `PhoneBacklogResult`, and rendering an absent map as `{}` would say
+    // "no engagements in any state" — the exact healthy zero every sibling
+    // block refuses to emit.
     if (!backlog || !backlog.admission || !backlog.attempts || !backlog.appointments
-        || !backlog.events) {
+        || !backlog.events || !backlog.engagementsByState) {
       res.json({
         ok: true,
         enabled: true,
@@ -659,7 +697,7 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
         max_concurrent: backlog.attempts.maxConcurrent,
         oldest_live_age_seconds: backlog.attempts.oldestLiveAgeSeconds,
       },
-      engagements_by_state: backlog.engagementsByState ?? {},
+      engagements_by_state: backlog.engagementsByState,
       appointments: {
         live: backlog.appointments.live,
         overdue: backlog.appointments.overdue,
@@ -739,6 +777,37 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
     },
   );
 
+  /**
+   * Cancel an appointment this route created by accident, and report whether
+   * it succeeded.
+   *
+   * This is a COMPENSATION, not an atomic rollback — 0042 has no
+   * appointment-addressed reschedule RPC, so the insert has already committed
+   * by the time we can tell it should not have happened. `hr_cancelled` is the
+   * honest reason: an HR action did create the row and an HR action is undoing
+   * it. If the compensation itself fails, `rolled_back: false` tells the
+   * operator a stray live appointment exists rather than leaving them to
+   * discover it on the calendar.
+   */
+  async function undoUnintendedInsert(
+    appointmentId: string | undefined,
+    version: number | undefined,
+  ): Promise<boolean> {
+    if (!appointmentId) return false;
+    try {
+      const undo = await writeStore().cancelAppointment({
+        appointmentId,
+        reason: 'hr_cancelled',
+        actorId: null,
+        expectedVersion: version ?? null,
+        now: now(),
+      });
+      return undo.status === 'ok' || undo.status === 'already_cancelled';
+    } catch {
+      return false;
+    }
+  }
+
   // ══════════════════════════════════════════════════════════════════
   //  PATCH /appointments/:id — reschedule
   // ══════════════════════════════════════════════════════════════════
@@ -789,11 +858,35 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
         });
         const status = result.status;
         if (status === 'ok' || status === 'ok_prereqs_pending') {
+          // THE LOST-UPDATE CHECK 0042 CANNOT MAKE.
+          //
+          // `schedule_phone_appointment` compares `p_expected_version` only
+          // when it FINDS a live appointment (0042 L2475-2487); when it finds
+          // none it skips the comparison entirely and inserts. So if the row
+          // this PATCH addressed was cancelled between the pre-read and the
+          // RPC, the version precondition is never evaluated and a reschedule
+          // silently becomes a CREATE — resurrecting a slot another admin just
+          // cancelled, which is exactly the lost update the version exists to
+          // prevent.
+          //
+          // A reschedule that superseded NOTHING is that case, and it is
+          // unambiguous: this route always sends a non-null expected version,
+          // so on the intended path the RPC supersedes the live row and returns
+          // its id. Undo the insert and answer `version_conflict`.
+          if (result.supersededAppointmentId == null) {
+            const rolledBack = await undoUnintendedInsert(result.appointmentId, result.version);
+            res.status(409).json({
+              ok: false,
+              error: 'version_conflict',
+              rolled_back: rolledBack,
+            });
+            return;
+          }
           const ok = await auditOrFail(req, res, 'resource.update', 200, {
             resource: 'phone_appointment',
             engagement_id: existing.engagementId,
             appointment_id: result.appointmentId ?? null,
-            superseded_appointment_id: result.supersededAppointmentId ?? null,
+            superseded_appointment_id: result.supersededAppointmentId,
             outcome: status,
           });
           if (!ok) return;
@@ -889,27 +982,16 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
         // cause — turning somebody else's stop into a go on the strength of
         // our own audit failure. Unknown therefore means "not ours".
         const alreadyHalted = result.alreadyHalted ?? true;
-        const ok = await auditOrFail(
-          req,
-          res,
-          'resource.update',
-          200,
-          {
-            resource: 'phone_control',
-            action: 'halt_set',
-            reason,
-            already_halted: alreadyHalted,
-          },
-          async () => {
-            // Roll back ONLY the transition we caused. A halt that was already
-            // in force is not ours to lift: 0042 preserves the original
-            // instant, reason and actor across repeated halts, so our call
-            // changed nothing and clearing would undo somebody else's decision.
-            if (alreadyHalted) return false;
-            const undo = await writeStore().clearHalt({ actorId, now: now() });
-            return undo.status === 'ok';
-          },
-        );
+        // NO compensation. See `auditOrFail` — lifting a kill switch because
+        // our own audit sink failed is a fail-open on the one control that
+        // exists to stop calls, the halt is already durably audited by 0042's
+        // own row, and another admin may already be relying on the stop.
+        const ok = await auditOrFail(req, res, 'resource.update', 200, {
+          resource: 'phone_control',
+          action: 'halt_set',
+          reason,
+          already_halted: alreadyHalted,
+        });
         if (!ok) return;
         res.json({ ok: true, halted: true, already_halted: alreadyHalted, reason });
       } catch {
@@ -927,11 +1009,25 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
    *
    * 0042 defines no "why I am resuming" vocabulary and this phase may not add
    * one; a second, API-owned vocabulary would have nothing keeping it honest.
-   * Requiring the EXISTING reason instead makes the field an interlock rather
-   * than a formality — an admin who has not looked at why the dialer was
-   * stopped cannot restart it — and it gives the audit-failure path a reason it
-   * VERIFIED rather than one it guessed, so the compensating re-halt restores
-   * the state that was actually there.
+   * Requiring the EXISTING reason instead turns the field from a formality into
+   * a check against CARELESSNESS — an admin who has not looked at why the
+   * dialer was stopped does not restart it by reflex — and it gives the
+   * audit-failure path a reason it VERIFIED rather than one it guessed.
+   *
+   * It is deliberately NOT a secret and must not be described as one: the
+   * vocabulary has five members and a wrong guess returns a distinguishing
+   * `halt_reason_mismatch`, so brute force costs five requests. What it buys is
+   * that every one of those attempts is AUDITED and rate-limited — guessing
+   * leaves a trail instead of being free.
+   *
+   * RESIDUAL — this is time-of-check-to-time-of-use. `phone_control` carries no
+   * version column, so between the control read and `clear_phone_halt` another
+   * admin can raise a halt this route never verified, and the compensating
+   * re-halt would then install the reason THIS caller supplied (0042
+   * `coalesce`s onto a row that is clear by then). Closing it would need a CAS
+   * on the control row, i.e. a migration. The exposure is bounded in the SAFE
+   * direction: the compensation re-raises a stop, and the worst outcome is a
+   * halt carrying a stale but real reason.
    */
   router.post(
     '/halt/clear',
@@ -957,6 +1053,16 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
         }
         const priorReason = before.admission.haltReason;
         if (before.admission.halted && priorReason !== reason) {
+          // AUDITED. A refusal that left no trace would make guessing the
+          // reason free; the previous reason is deliberately NOT recorded here,
+          // so the row proves an attempt happened without handing the answer to
+          // whoever later reads the log.
+          const refusalAudited = await auditOrFail(req, res, 'resource.update', 409, {
+            resource: 'phone_control',
+            action: 'halt_clear_refused',
+            outcome: 'halt_reason_mismatch',
+          });
+          if (!refusalAudited) return;
           res.status(409).json({ ok: false, error: 'halt_reason_mismatch' });
           return;
         }

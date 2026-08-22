@@ -38,6 +38,21 @@ function readModuleFiles(): Array<{ name: string; source: string }> {
 
 const MODULE_FILES = readModuleFiles();
 
+/**
+ * The `const X_COLUMNS = '...'` declarations of a module, as name → list.
+ *
+ * Extracting the DECLARATIONS is the point: a sweep over `.select(` arguments
+ * sees identifiers, so it can only ever assert things about the identifier's
+ * spelling. What matters is what the identifier HOLDS.
+ */
+function columnConstants(body: string): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const m of body.matchAll(/const\s+([A-Z][A-Z0-9_]*)\s*=\s*\n?\s*'([^']*)'/g)) {
+    out.set(m[1], m[2]);
+  }
+  return out;
+}
+
 /** Source with block and line comments removed — for call-site assertions. */
 function code(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
@@ -127,10 +142,24 @@ describe('1. every phone write goes through an RPC', () => {
     // `select('*')` is what turns "we do not expose the lease token" into "we
     // have not exposed it yet": the column arrives in the row and only a
     // hand-written mapper stands between it and a response.
+    //
+    // The check runs over the DECLARED CONSTANTS, not over the `.select(`
+    // arguments. Those arguments are identifiers — `APPOINTMENT_COLUMNS` and
+    // friends — so asserting they contain no asterisk asserts nothing about
+    // what they hold, and `const ENGAGEMENT_COLUMNS = '*'` would sail through.
+    // Two assertions instead: every declared list is star-free, and every
+    // `.select(` argument is one of those declared identifiers, which is what
+    // stops an inline `select('*')` being added beside them.
+    const declared = columnConstants(readBody);
+    expect(declared.size).toBeGreaterThanOrEqual(4);
+    for (const [name, list] of declared) {
+      expect(list, `${name} is a star select`).not.toContain('*');
+    }
     const selects = [...readBody.matchAll(/\.select\(([^)]*)\)/g)].map((m) => m[1].trim());
     expect(selects.length).toBeGreaterThanOrEqual(5);
     for (const arg of selects) {
-      expect(arg, `read-stores.ts selects ${arg}`).not.toContain('*');
+      expect(declared.has(arg), `read-stores.ts selects ${arg}, not a declared column list`)
+        .toBe(true);
     }
   });
 
@@ -138,19 +167,41 @@ describe('1. every phone write goes through an RPC', () => {
     // Omission is the control, not redaction: a column that is never SELECTED
     // cannot be serialized by a later edit that forgets why it was masked.
     const reads = MODULE_FILES.find((f) => f.name === READ_SEAM);
-    const body = code(reads!.source);
+    const declared = columnConstants(code(reads!.source));
     const FORBIDDEN = [
       'sip_call_id', 'room_name', 'participant_identity', 'egress_id', 'egress_status',
-      'lease_token', 'lease_owner', 'provider_event_id', 'phone_sha256', 'metadata',
-      'email', 'phone_raw', 'phone_valid', 'text_extracted',
+      'lease_token', 'lease_owner', 'lease_expires_at', 'provider_event_id', 'phone_sha256',
+      'metadata', 'email', 'phone_raw', 'phone_e164', 'phone_valid', 'text_extracted',
+      'parsed', 'skills', 'created_by', 'application_link_id',
     ];
-    const columnLists = [...body.matchAll(/'([a-z_]+(?:,[a-z_]+)+)'/g)].map((m) => m[1]);
     // Fail closed: an empty sweep would make this assertion vacuous.
-    expect(columnLists.length).toBeGreaterThanOrEqual(4);
-    for (const list of columnLists) {
+    expect(declared.size).toBeGreaterThanOrEqual(4);
+    for (const [name, list] of declared) {
       const columns = list.split(',');
       for (const forbidden of FORBIDDEN) {
-        expect(columns, `a read seam column list selects ${forbidden}`).not.toContain(forbidden);
+        expect(columns, `${name} selects ${forbidden}`).not.toContain(forbidden);
+      }
+    }
+  });
+
+  it('the ROUTE cannot reach a table or an RPC either', () => {
+    // The sweeps above run over `lib/phone-screening` only, which was complete
+    // while nothing outside it held a client. `routes/phone.ts` now imports the
+    // process-wide singleton, so it could `.from('phone_appointments').update()`
+    // with every assertion in this file still green. The seam is only a seam if
+    // the module in front of it cannot go around it.
+    const route = readFileSync(path.join(SRC_DIR, 'routes/phone.ts'), 'utf8');
+    const schema = readFileSync(path.join(SRC_DIR, 'schemas/phone-api.ts'), 'utf8');
+    for (const [name, source] of [['routes/phone.ts', route], ['schemas/phone-api.ts', schema]] as const) {
+      const body = code(source);
+      expect(body, `${name} reaches a table directly`).not.toMatch(/\.\s*from\s*\(/);
+      expect(body, `${name} calls an rpc directly`).not.toMatch(/\.\s*rpc\s*\(/);
+      for (const verb of ['insert', 'update', 'upsert', 'delete']) {
+        // `router.delete(` is the HTTP verb, not a table write — matched on a
+        // bare receiver so the route's own DELETE registration is not a hit.
+        expect(body, `${name} performs a .${verb}()`).not.toMatch(
+          new RegExp(String.raw`(?<!router)\.\s*${verb}\s*\(`),
+        );
       }
     }
   });

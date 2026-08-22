@@ -307,6 +307,33 @@ describe('rows are narrowed, and a driver error is sanitized', () => {
     }
   });
 
+  it('refuses a reason code that is not a stable snake_case code', async () => {
+    // `state_reason` and `cancel_reason` were the only strings crossing this
+    // boundary unnarrowed. 0042 constrains both by a FORMAT rule rather than a
+    // closed allowlist, so mirroring the format is the correct narrowing — and
+    // without it a future writer putting free text in either column would have
+    // reached a response silently.
+    const cases: Array<[Record<string, unknown>, string]> = [
+      [{ ...ENGAGEMENT, state_reason: 'Call the candidate back on Tuesday!' }, 'engagement'],
+      [{ ...ENGAGEMENT, state_reason: 'a'.repeat(65) }, 'over length'],
+      [{ ...ENGAGEMENT, state_reason: 'Provider_Error' }, 'uppercase'],
+    ];
+    for (const [row, label] of cases) {
+      const { client } = fakeClient([{ data: [row] }]);
+      await expect(createPhoneReadStore(client as never).getEngagement('e1'), label)
+        .rejects.toThrow('phone_reason_code_invalid');
+    }
+    // The shapes 0042 actually writes pass, and a null stays null.
+    for (const value of ['provider_budget_exhausted', 'no_answer_budget_exhausted', null]) {
+      const { client } = fakeClient([{ data: [{ ...ENGAGEMENT, state_reason: value }] }]);
+      const row = await createPhoneReadStore(client as never).getEngagement('e1');
+      expect(row!.stateReason).toBe(value);
+    }
+    const { client } = fakeClient([{ data: [{ ...APPOINTMENT, cancel_reason: 'hr cancelled' }] }]);
+    await expect(createPhoneReadStore(client as never).getAppointment('a1'))
+      .rejects.toThrow('phone_reason_code_invalid');
+  });
+
   it('refuses a row carrying a state outside the 0042 vocabulary', async () => {
     const { client } = fakeClient([{ data: [{ ...ENGAGEMENT, state: 'daydreaming' }] }]);
     await expect(createPhoneReadStore(client as never).getEngagement('e1'))
