@@ -8431,6 +8431,1891 @@ $$;
 
 
 -- ═══════════════════════════════════════════════════════════════════════
+-- 0042 — Phone screening substrate: structural contract
+-- ═══════════════════════════════════════════════════════════════════════
+-- These assertions are about the SHAPE of the migration rather than its
+-- behaviour, and they are the ones that stay true when a future edit
+-- looks harmless. Every one of them names an invariant that a reviewer
+-- would otherwise have to re-derive by reading 0042 end to end.
+
+-- The single most important structural fact: the phone model stores NO
+-- phone number. The number lives on screening_v2.candidates, is read at
+-- dial time, and is turned straight into a digest. A column called
+-- phone_e164 / phone_raw / msisdn / number / e164 on any phone_* table
+-- would silently re-create the PII duplication the design forbids.
+select _policy_tests.assert(
+  '0042: no phone_* table carries a raw phone or E.164 column',
+  not exists (
+    select 1
+      from pg_attribute a
+      join pg_class c on c.oid = a.attrelid
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relkind = 'r'
+       and c.relname like 'phone\_%'
+       and a.attnum > 0
+       and not a.attisdropped
+       and (a.attname in ('phone_e164','phone_raw','msisdn','e164','number',
+                          'phone','phone_number','dial_number','to_number','from_number')
+            or a.attname like '%e164%')
+  ),
+  'a phone number stored on a phone table re-creates the PII duplication 0042 exists to avoid');
+
+-- phone_sha256 is the ONE phone-derived column, and it is a digest.
+select _policy_tests.assert(
+  '0042: the only phone-derived column is the suppression SHA-256 digest',
+  exists (
+    select 1 from pg_constraint
+     where conname = 'chk_phone_suppressions_sha'
+       and pg_get_constraintdef(oid) like '%[a-f0-9]{64}%'),
+  'phone_suppressions.phone_sha256 must be constrained to a hex digest, never a number');
+
+do $$
+declare
+  v_tables text[] := array['phone_engagements','phone_call_attempts','phone_appointments',
+                           'phone_call_events','phone_suppressions','phone_control'];
+  v_t text;
+  v_missing text := '';
+begin
+  foreach v_t in array v_tables loop
+    if not exists (select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace
+                    where n.nspname = 'screening_v2' and c.relname = v_t and c.relrowsecurity) then
+      v_missing := v_missing || v_t || ' ';
+    end if;
+  end loop;
+  perform _policy_tests.assert(
+    '0042: RLS is enabled on every phone table',
+    v_missing = '', 'RLS missing on: ' || v_missing);
+end;
+$$;
+
+select _policy_tests.assert(
+  '0042: no phone table grants any privilege to anon or authenticated',
+  not exists (
+    select 1
+      from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relkind = 'r'
+       and c.relname like 'phone\_%'
+       and (has_table_privilege('anon', c.oid, 'SELECT,INSERT,UPDATE,DELETE')
+         or has_table_privilege('authenticated', c.oid, 'SELECT,INSERT,UPDATE,DELETE'))
+  ),
+  'an engagement row plus a suppression digest is a re-identifiable contact record; browsers get nothing');
+
+select _policy_tests.assert(
+  '0042: no RLS policy exists on any phone table',
+  not exists (select 1 from pg_policies
+               where schemaname = 'screening_v2' and tablename like 'phone\_%'),
+  'phone tables are service-role-only; a policy would create a browser surface where none is intended');
+
+-- A comment-stripped, DECLARE-stripped view of a function's executable
+-- body. Position assertions below are about what the function DOES, and
+-- a prose comment or a %rowtype declaration naming a table must not be
+-- mistaken for a statement that touches it.
+create or replace function _policy_tests.fn_body(p_name text)
+returns text language sql stable as $fnb$
+  select substring(
+           regexp_replace(split_part(pg_get_functiondef(p.oid), '$function$', 2),
+                          '--[^\n]*', '', 'g')
+           from position(E'\nbegin' in
+             regexp_replace(split_part(pg_get_functiondef(p.oid), '$function$', 2),
+                            '--[^\n]*', '', 'g')))
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = 'screening_v2' and p.proname = p_name
+   limit 1
+$fnb$;
+
+-- ── Function posture: definer, pinned search_path, service-role-only ──
+do $$
+declare
+  v_fn record;
+  v_bad text := '';
+begin
+  for v_fn in
+    select p.oid, p.proname, p.prosecdef, p.proconfig,
+           pg_get_function_identity_arguments(p.oid) as args
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and (p.proname like 'phone\_%'
+            or p.proname in ('admit_phone_attempt','heartbeat_phone_attempt',
+                             'reclaim_phone_attempt_leases','apply_phone_event',
+                             'schedule_phone_appointment','cancel_phone_appointment',
+                             'set_phone_halt','clear_phone_halt'))
+  loop
+    if not v_fn.prosecdef and v_fn.proname not in ('phone_ist_date','phone_ist_window_open',
+                                                   'phone_ist_window_open_at',
+                                                   'phone_ist_window_close_at',
+                                                   'phone_max_concurrent',
+                                                   'phone_event_metadata_sanitized',
+                                                   'phone_next_window_open',
+                                                   'prevent_phone_call_event_mutation',
+                                                   'enforce_phone_engagement_transition',
+                                                   'enforce_phone_appointment_window') then
+      v_bad := v_bad || v_fn.proname || ':not_definer ';
+    end if;
+    if v_fn.proconfig is null
+       or not exists (select 1 from unnest(v_fn.proconfig) c where c like 'search_path=%') then
+      v_bad := v_bad || v_fn.proname || ':no_search_path ';
+    end if;
+    if has_function_privilege('anon', v_fn.oid, 'EXECUTE')
+       or has_function_privilege('authenticated', v_fn.oid, 'EXECUTE') then
+      v_bad := v_bad || v_fn.proname || ':browser_executable ';
+    end if;
+  end loop;
+  perform _policy_tests.assert(
+    '0042: every phone function is definer-or-helper, pins search_path, and is not browser-executable',
+    v_bad = '', 'violations: ' || v_bad);
+end;
+$$;
+
+-- ── H-3: time is injected; no body reads the machine clock ────────────
+-- A boundary test that reads the machine clock passes in Asia and fails
+-- in CI. Parameter DEFAULTS keep now(); function BODIES may not.
+do $$
+declare
+  v_fn record;
+  v_body text;
+  v_bad text := '';
+begin
+  for v_fn in
+    select p.oid, p.proname, pg_get_functiondef(p.oid) as def
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and (p.proname like 'phone\_%'
+            or p.proname in ('admit_phone_attempt','heartbeat_phone_attempt',
+                             'reclaim_phone_attempt_leases','apply_phone_event',
+                             'schedule_phone_appointment','cancel_phone_appointment',
+                             'set_phone_halt','clear_phone_halt'))
+  loop
+    -- Everything after the opening dollar-quote is the body; the
+    -- signature (and therefore `p_now timestamptz default now()`) is
+    -- everything before it.
+    v_body := _policy_tests.fn_body(v_fn.proname);
+    if v_body ~* '\mnow\s*\(' or v_body ~* '\mcurrent_timestamp\M'
+       or v_body ~* '\mclock_timestamp\s*\(' or v_body ~* '\mstatement_timestamp\s*\(' then
+      v_bad := v_bad || v_fn.proname || ':reads_clock ';
+    end if;
+    -- A blanket `when others` is how a fail-closed guard silently
+    -- becomes fail-open.
+    if v_body ~* 'when\s+others' then
+      v_bad := v_bad || v_fn.proname || ':when_others ';
+    end if;
+    -- No RPC may enable the ledger escape hatch. It exists for a
+    -- deliberate, session-scoped erasure or migration, never for a code
+    -- path that runs on its own.
+    if v_fn.proname <> 'prevent_phone_call_event_mutation'
+       and v_body ~* 'allow_phone_event_mutation' then
+      v_bad := v_bad || v_fn.proname || ':enables_ledger_hatch ';
+    end if;
+  end loop;
+  perform _policy_tests.assert(
+    '0042: no phone function body reads the machine clock or swallows every error',
+    v_bad = '', 'violations: ' || v_bad);
+end;
+$$;
+
+
+-- ── M-5(b): the halt read is not inside an exception handler ──────────
+do $$
+declare
+  v_body    text;
+  v_ctl_pos integer;
+  v_exc_pos integer;
+begin
+  v_body := _policy_tests.fn_body('admit_phone_attempt');
+  v_ctl_pos := position('phone_control' in v_body);
+  v_exc_pos := position('exception' in v_body);
+  perform _policy_tests.assert(
+    '0042: the halt read precedes every exception handler in admit_phone_attempt',
+    v_ctl_pos > 0 and (v_exc_pos = 0 or v_ctl_pos < v_exc_pos),
+    'swallowing the control read is exactly how a kill switch becomes fail-open; '
+      || 'control@' || v_ctl_pos || ' exception@' || v_exc_pos);
+end;
+$$;
+
+-- ── H-1: the pinned lock order, asserted statically ───────────────────
+do $$
+declare
+  v_body text;
+  v_adv integer; v_link integer; v_eng integer; v_att integer; v_first_fu integer;
+begin
+  -- Whitespace-normalised so the assertion is about the statements and
+  -- not about how they happen to be indented.
+  v_body := regexp_replace(_policy_tests.fn_body('admit_phone_attempt'), '\s+', ' ', 'g');
+  v_adv  := position('pg_advisory_xact_lock' in v_body);
+  v_link := position('from screening_v2.ashby_application_links where id = v_link_id for update'
+                     in v_body);
+  v_eng  := position('from screening_v2.phone_engagements where id = p_engagement_id for update'
+                     in v_body);
+  v_att  := position('insert into screening_v2.phone_call_attempts' in v_body);
+  v_first_fu := position('for update' in v_body);
+
+  perform _policy_tests.assert(
+    '0042: admit_phone_attempt takes the advisory lock before ANY row lock',
+    v_adv > 0 and v_first_fu > 0 and v_adv < v_first_fu,
+    'advisory@' || v_adv || ' first for-update@' || v_first_fu
+      || ' — the inverse order is a genuine two-transaction deadlock cycle');
+  -- The engagement is READ before the link is locked, to learn the link
+  -- id at all. That read must stay unlocked, or the pinned order is
+  -- inverted in the one place it matters.
+  perform _policy_tests.assert(
+    '0042: the pre-read that discovers the link id takes no row lock',
+    v_adv > 0 and v_link > v_adv
+      and position('select application_link_id into v_link_id from screening_v2.phone_engagements '
+                   || 'where id = p_engagement_id; ' in v_body) > 0,
+    'the unlocked pre-read is what keeps advisory -> link -> engagement true');
+  perform _policy_tests.assert(
+    '0042: admit_phone_attempt LOCKS advisory -> link -> engagement -> attempt, in that order',
+    v_adv > 0 and v_link > v_adv and v_eng > v_link and v_att > v_eng,
+    'advisory@' || v_adv || ' link-lock@' || v_link || ' engagement-lock@' || v_eng
+      || ' attempt@' || v_att);
+
+  -- The sweeper takes a strict SUFFIX of that order: engagement, then
+  -- attempt. The inverse — attempt first, then engagement — is a real
+  -- cycle against an admission that holds the engagement and is waiting
+  -- on the one-live index entry, and it would surface as a 40P01 in
+  -- production rather than here.
+  v_body := regexp_replace(_policy_tests.fn_body('reclaim_phone_attempt_leases'),
+                           '\s+', ' ', 'g');
+  v_eng := position('from screening_v2.phone_engagements where id = v_row.engagement_id '
+                    || 'for update skip locked' in v_body);
+  v_att := position('from screening_v2.phone_call_attempts where id = v_row.id' in v_body);
+  perform _policy_tests.assert(
+    '0042: reclaim_phone_attempt_leases locks engagement BEFORE attempt, never the reverse',
+    v_eng > 0 and v_att > v_eng,
+    'engagement-lock@' || v_eng || ' attempt-lock@' || v_att
+      || ' — the reverse order deadlocks against a live admission');
+
+  -- apply_phone_event takes the same suffix and no advisory lock, so it
+  -- cannot serialise against dialing and cannot close a cycle either.
+  v_body := regexp_replace(_policy_tests.fn_body('apply_phone_event'), '\s+', ' ', 'g');
+  v_eng := position('from screening_v2.phone_engagements where id = v_eng_id for update' in v_body);
+  v_att := position('from screening_v2.phone_call_attempts where id = p_attempt_id for update'
+                    in v_body);
+  perform _policy_tests.assert(
+    '0042: apply_phone_event locks engagement BEFORE attempt and takes no advisory lock',
+    v_eng > 0 and v_att > v_eng
+      and position('pg_advisory' in v_body) = 0,
+    'engagement-lock@' || v_eng || ' attempt-lock@' || v_att);
+end;
+$$;
+
+-- ── I15: the phone substrate cannot move a stage, email or score ──────
+-- Widening ashby_operations.operation_type would put dialing inside the
+-- machinery that performs stage moves and scorecard writes. It is the
+-- single line whose change would give this feature that blast radius.
+select _policy_tests.assert(
+  '0042: chk_ashby_operations_type is NOT widened by the phone substrate',
+  (select pg_get_constraintdef(oid) from pg_constraint
+    where conname = 'chk_ashby_operations_type')
+    = 'CHECK ((operation_type = ANY (ARRAY[''invite_delivery''::text, ''scorecard_write''::text, ''stage_move''::text])))',
+  'phone must ride a queue NAME (phone.dial), never an Ashby operation type');
+
+select _policy_tests.assert(
+  '0042: no phone table or phone function mentions stage, scorecard or email',
+  not exists (
+    select 1 from pg_attribute a
+      join pg_class c on c.oid = a.attrelid
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2' and c.relkind = 'r' and c.relname like 'phone\_%'
+       and a.attnum > 0 and not a.attisdropped
+       and (a.attname like '%stage%' or a.attname like '%scorecard%' or a.attname like '%email%'))
+  and not exists (
+    select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname in ('admit_phone_attempt','apply_phone_event','reclaim_phone_attempt_leases')
+       and (_policy_tests.fn_body(p.proname) ~* 'ashby_operations'
+         or _policy_tests.fn_body(p.proname) ~* 'scorecard'
+         or _policy_tests.fn_body(p.proname) ~* 'stage_move')),
+  'a phone path that can reach the stage/scorecard/email machinery has the blast radius the design forbids');
+
+-- ── The audit allowlist grew and lost nothing ─────────────────────────
+do $$
+declare
+  v_def text;
+  v_prior text[] := array[
+    'invite_sent','grant_issued','screening_started','assessment_recorded',
+    'candidate_status_changed','session_created','membership_created','role_created',
+    'export_requested','login_success','config_changed','auth_login_success',
+    'rbac_access_denied','resource_create','rate_limit_exceeded','audit_sink_failure',
+    'recording_download','recording_quarantined','admin_session_override','quota_override',
+    'allowlist_linked','ashby_mapping_update','ashby_application_cancel',
+    'ashby_operation_retry','ashby_invite_delivered','ashby_ingestion_attempts_reset',
+    'ashby_ingestion_parse_recovery','ashby_ingestion_legacy_bad_output_recovery'];
+  v_new text[] := array[
+    'phone_attempt_admitted','phone_attempt_classified','phone_attempt_ended',
+    'phone_appointment_scheduled','phone_appointment_cancelled','phone_opt_out_recorded'];
+  v_a text; v_missing text := '';
+begin
+  select pg_get_constraintdef(oid) into v_def
+    from pg_constraint where conname = 'chk_audit_action';
+  foreach v_a in array v_prior loop
+    if position('''' || v_a || '''' in v_def) = 0 then v_missing := v_missing || 'lost:' || v_a || ' '; end if;
+  end loop;
+  foreach v_a in array v_new loop
+    if position('''' || v_a || '''' in v_def) = 0 then v_missing := v_missing || 'absent:' || v_a || ' '; end if;
+  end loop;
+  perform _policy_tests.assert(
+    '0042: chk_audit_action gained the six phone actions and dropped nothing',
+    v_missing = '', v_missing);
+end;
+$$;
+
+do $$
+declare v_def text;
+begin
+  select pg_get_constraintdef(oid) into v_def
+    from pg_constraint where conname = 'chk_call_sessions_terminal_reason';
+  perform _policy_tests.assert(
+    '0042: the cancelled terminal-reason family gained exactly candidate_opt_out and wrong_number',
+    v_def like '%candidate_opt_out%' and v_def like '%wrong_number%'
+      and v_def like '%recruiter_cancelled%' and v_def like '%residency_timeout%'
+      -- Deliberately ABSENT: no call_sessions row is bound before human
+      -- classification, so a machine-answered attempt has no session to
+      -- terminalise and the reason would have no reachable writer.
+      and v_def not like '%voicemail_detected%',
+    'terminal reason families drifted: ' || coalesce(v_def, '<null>'));
+end;
+$$;
+
+-- ── The dormant 0001 tables are labelled, not revived ─────────────────
+select _policy_tests.assert(
+  '0042: call_queue and sms_follow_ups are documented as deliberately dormant',
+  coalesce(obj_description('screening_v2.call_queue'::regclass), '') like '%DORMANT%'
+  and coalesce(obj_description('screening_v2.sms_follow_ups'::regclass), '') like '%DORMANT%',
+  'without the comment the next reader cannot tell "unused" from "forgotten"');
+
+-- ── M-1: the suppression digest is the EXISTING schema-qualified helper
+select _policy_tests.assert(
+  '0042: the suppression digest an RPC writes equals the one a fixture computes',
+  screening_v2.sha256_hex('+919000000099')
+    = encode(digest('+919000000099', 'sha256'), 'hex'),
+  'a bare digest() under a pinned search_path fails at RUNTIME on Supabase, not at deploy');
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- 0042 — Phone screening substrate: behaviour
+-- ═══════════════════════════════════════════════════════════════════════
+-- EVERY test below passes p_now EXPLICITLY. Not one reads the machine
+-- clock, so the IST boundary assertions give the same answer in Asia and
+-- in CI.
+--
+-- On the fixture numbers: India publishes no reserved "documentation"
+-- telephone range, so there is no +1-555 equivalent to reach for. These
+-- fixtures therefore use a fixed synthetic pattern that exists only
+-- inside an ephemeral local container with no provider credentials and
+-- no dial path — and 0042 contains no code that can originate a call at
+-- all. No fixture number is ever dialled, logged, or written into a
+-- phone table; the substrate turns it straight into a digest.
+
+-- Removes one tagged fixture and everything hanging off it, in
+-- dependency order. audit_events and phone_call_events are append-only
+-- by design and are deliberately NOT deleted; every assertion about
+-- their cardinality is therefore scoped to the row it is about.
+create or replace function _policy_tests.phone_teardown(p_tag text)
+returns void language plpgsql as $ptd$
+declare v_links uuid[]; v_engs uuid[]; v_cands uuid[];
+begin
+  select coalesce(array_agg(id), '{}') into v_links
+    from screening_v2.ashby_application_links where external_application_id = p_tag || '-app';
+  select coalesce(array_agg(id), '{}') into v_engs
+    from screening_v2.phone_engagements where application_link_id = any(v_links);
+  select coalesce(array_agg(id), '{}') into v_cands
+    from screening_v2.candidates where email = p_tag || '@example.test';
+
+  delete from screening_v2.job_queue
+   where dedup_key in (select 'phone.dial:' || id::text
+                         from screening_v2.phone_call_attempts
+                        where engagement_id = any(v_engs));
+  -- The documented SET LOCAL escape hatch, used here exactly as an
+  -- erasure or an emergency migration would use it, and scoped to this
+  -- transaction only.
+  perform set_config('app.allow_phone_event_mutation', 'true', true);
+  delete from screening_v2.phone_call_events
+   where engagement_id = any(v_engs) or attempt_id in (
+     select id from screening_v2.phone_call_attempts where engagement_id = any(v_engs));
+  perform set_config('app.allow_phone_event_mutation', 'false', true);
+  delete from screening_v2.phone_call_attempts where engagement_id = any(v_engs);
+  delete from screening_v2.phone_appointments where engagement_id = any(v_engs);
+  delete from screening_v2.phone_engagements where id = any(v_engs);
+  delete from screening_v2.ashby_resume_ingestions where application_link_id = any(v_links);
+  delete from screening_v2.ashby_operations where application_link_id = any(v_links);
+  delete from screening_v2.ashby_application_links where id = any(v_links);
+  delete from screening_v2.ashby_job_mappings where external_job_id = p_tag || '-job';
+  delete from screening_v2.consent_records where candidate_id = any(v_cands);
+  delete from screening_v2.phone_suppressions where candidate_id = any(v_cands);
+  delete from screening_v2.candidates where id = any(v_cands);
+end;
+$ptd$;
+
+create or replace function _policy_tests.phone_fixture(
+  p_tag       text,
+  p_state     text default 'eligible',
+  p_ingestion text default 'ready',
+  p_mapping   text default 'enabled',
+  p_consent   text default 'full',
+  p_phone     text default null
+)
+returns uuid
+language plpgsql as $pf$
+declare
+  v_role uuid; v_cand uuid; v_map uuid; v_link uuid; v_eng uuid;
+  v_states text[] := array['queued','fetching','scanning','extracting','structuring','ready'];
+  v_s text;
+begin
+  select id into v_role from screening_v2.roles order by id limit 1;
+
+  -- Idempotent teardown FIRST, so a re-run of the suite against an
+  -- already-seeded database starts clean rather than colliding with the
+  -- previous run's unique (provider, external_job_id).
+  perform _policy_tests.phone_teardown(p_tag);
+
+  insert into screening_v2.candidates (role_id, name, email, phone_e164, phone_valid)
+  values (v_role, 'phone fixture ' || p_tag, p_tag || '@example.test',
+          coalesce(p_phone, '+9199990' || lpad((abs(hashtext(p_tag)) % 100000)::text, 5, '0')),
+          p_phone is distinct from 'INVALID')
+  returning id into v_cand;
+
+  if p_consent = 'full' then
+    insert into screening_v2.consent_records (candidate_id, status, consents, version)
+    values (v_cand, 'granted',
+            '{ai_interview,recording,purpose,data_processing,retention,rights}'
+              ::screening_v2.consent_type[], '2026-08-04.1');
+  elsif p_consent in ('declined','withdrawn') then
+    insert into screening_v2.consent_records (candidate_id, status, consents, version)
+    values (v_cand, p_consent,
+            '{ai_interview,recording,purpose,data_processing,retention,rights}'
+              ::screening_v2.consent_type[], '2026-08-04.1');
+  elsif p_consent = 'expired' then
+    insert into screening_v2.consent_records (candidate_id, status, consents, version, expires_at)
+    values (v_cand, 'granted',
+            '{ai_interview,recording,purpose,data_processing,retention,rights}'
+              ::screening_v2.consent_type[], '2026-08-04.1', '2020-01-01T00:00:00Z');
+  elsif p_consent = 'subset' then
+    insert into screening_v2.consent_records (candidate_id, status, consents, version)
+    values (v_cand, 'granted', '{job_application}'::screening_v2.consent_type[], '2026-08-04.1');
+  end if;   -- 'none' writes no record at all
+
+  insert into screening_v2.ashby_job_mappings
+    (external_job_id, role_id, owner_id, ai_screening_stage_id, ta_screening_stage_id,
+     status, delivery_mode)
+  values (p_tag || '-job', v_role, '00000000-0000-4000-8000-0000000000ad',
+          p_tag || '-ai', p_tag || '-ta', p_mapping, 'manual')
+  returning id into v_map;
+
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id,
+     external_resume_file_handle, candidate_id)
+  values (p_tag || '-app', p_tag || '-job', v_map,
+          case when p_ingestion = 'no_resume' then null else repeat('h', 64) end, v_cand)
+  returning id into v_link;
+
+  if p_ingestion <> 'no_resume' then
+    foreach v_s in array v_states loop
+      perform screening_v2.advance_ashby_ingestion(v_link, v_s, null, null, null, null);
+      exit when v_s = p_ingestion;
+    end loop;
+  end if;
+
+  insert into screening_v2.phone_engagements
+    (application_link_id, candidate_id, role_id, state, terminal_at)
+  values (v_link, v_cand, v_role, p_state,
+          case when p_state in ('completed','abandoned_no_answer','opted_out',
+                                'wrong_number','failed','cancelled')
+               then '2026-08-01T00:00:00Z'::timestamptz else null end)
+  returning id into v_eng;
+
+  return v_eng;
+end;
+$pf$;
+
+-- ── B1: the IST window, at the boundary, on all seven days ────────────
+do $$
+declare
+  v_eng uuid;
+  v_res jsonb;
+  v_d   integer;
+  v_day date;
+  v_bad text := '';
+  v_no_answer integer; v_reconnects integer; v_failures integer;
+begin
+  v_eng := _policy_tests.phone_fixture('pol42-window');
+
+  -- 2026-08-24 is a Monday, so seven consecutive dates cover every day
+  -- of the week including both weekend days. This substrate calls seven
+  -- days a week; a weekday-only helper would pass six of these.
+  for v_d in 0..6 loop
+    v_day := date '2026-08-24' + v_d;
+
+    -- 08:59:59 IST = 03:29:59Z. Refused.
+    v_res := screening_v2.admit_phone_attempt(
+               v_eng, 'initial', null, 60, (v_day + time '03:29:59') at time zone 'UTC');
+    if v_res->>'status' <> 'window_closed' then
+      v_bad := v_bad || v_day || ':0859=' || (v_res->>'status') || ' '; end if;
+
+    -- 09:00:00 IST = 03:30:00Z. Admitted — the first legal second.
+    v_res := screening_v2.admit_phone_attempt(
+               v_eng, 'initial', null, 60, (v_day + time '03:30:00') at time zone 'UTC');
+    if v_res->>'status' <> 'ok' then
+      v_bad := v_bad || v_day || ':0900=' || (v_res->>'status') || ' '; end if;
+    delete from screening_v2.job_queue
+     where dedup_key = 'phone.dial:' || (v_res->>'attempt_id');
+    delete from screening_v2.phone_call_attempts where id = (v_res->>'attempt_id')::uuid;
+    update screening_v2.phone_engagements set state = 'eligible' where id = v_eng;
+
+    -- 20:59:59 IST = 15:29:59Z. Still inside; the window bounds the
+    -- START of a call, and the last legal second is a legal second.
+    v_res := screening_v2.admit_phone_attempt(
+               v_eng, 'initial', null, 60, (v_day + time '15:29:59') at time zone 'UTC');
+    if v_res->>'status' <> 'ok' then
+      v_bad := v_bad || v_day || ':2059=' || (v_res->>'status') || ' '; end if;
+    delete from screening_v2.job_queue
+     where dedup_key = 'phone.dial:' || (v_res->>'attempt_id');
+    delete from screening_v2.phone_call_attempts where id = (v_res->>'attempt_id')::uuid;
+    update screening_v2.phone_engagements set state = 'eligible' where id = v_eng;
+
+    -- 21:00:00 IST = 15:30:00Z. Refused.
+    v_res := screening_v2.admit_phone_attempt(
+               v_eng, 'initial', null, 60, (v_day + time '15:30:00') at time zone 'UTC');
+    if v_res->>'status' <> 'window_closed' then
+      v_bad := v_bad || v_day || ':2100=' || (v_res->>'status') || ' '; end if;
+  end loop;
+
+  perform _policy_tests.assert(
+    '0042: 08:59:59 refused / 09:00:00 admitted / 20:59:59 admitted / 21:00:00 refused, all seven days',
+    v_bad = '', 'boundary drift: ' || v_bad);
+
+  -- A WAIT COSTS NOTHING. Fourteen window refusals just happened; if one
+  -- of them had charged, a candidate would lose an attempt for being
+  -- asleep.
+  select no_answer_attempts, reconnects_used, provider_failures
+    into v_no_answer, v_reconnects, v_failures
+    from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0042: fourteen window refusals charged no budget at all',
+    v_no_answer = 0 and v_reconnects = 0 and v_failures = 0,
+    'no_answer=' || v_no_answer || ' reconnects=' || v_reconnects || ' failures=' || v_failures);
+end;
+$$;
+
+-- The day rolls at IST midnight, not at UTC midnight. 18:29:59Z is
+-- 23:59:59 IST; one second later is the next IST day while UTC has not
+-- moved.
+select _policy_tests.assert(
+  '0042: the attempt day rolls at IST midnight, not UTC midnight',
+  screening_v2.phone_ist_date('2026-08-23T18:29:59Z') = date '2026-08-23'
+  and screening_v2.phone_ist_date('2026-08-23T18:30:00Z') = date '2026-08-24'
+  and screening_v2.phone_ist_date('2026-08-23T23:59:59Z') = date '2026-08-24',
+  'a UTC-dated budget would give an Indian candidate two attempts on one of their days');
+
+-- ── B2: illegal and terminal transitions, and terminal_at coherence ───
+do $$
+declare
+  v_eng uuid; v_ok boolean;
+begin
+  v_eng := _policy_tests.phone_fixture('pol42-trans');
+
+  begin
+    update screening_v2.phone_engagements set state = 'in_call' where id = v_eng;
+    v_ok := false;
+  exception when others then
+    v_ok := sqlerrm like '%invalid phone engagement transition%';
+  end;
+  perform _policy_tests.assert(
+    '0042: an illegal engagement transition (eligible -> in_call) is refused',
+    v_ok, 'a state machine whose edges live only in TypeScript is a convention, not a machine');
+
+  update screening_v2.phone_engagements
+     set state = 'cancelled', terminal_at = '2026-08-24T06:00:00Z' where id = v_eng;
+  begin
+    update screening_v2.phone_engagements set state = 'eligible', terminal_at = null
+     where id = v_eng;
+    v_ok := false;
+  exception when others then v_ok := true; end;
+  perform _policy_tests.assert(
+    '0042: a terminal engagement cannot be revived',
+    v_ok, 'terminal must be immutable or every budget below it is meaningless');
+
+  begin
+    update screening_v2.phone_engagements
+       set state = 'completed', terminal_at = '2026-08-24T06:00:00Z' where id = v_eng;
+    v_ok := false;
+  exception when others then v_ok := true; end;
+  perform _policy_tests.assert(
+    '0042: terminal-to-terminal is refused too',
+    v_ok, 'cancelled -> completed would rewrite the outcome of a call that already ended');
+end;
+$$;
+
+do $$
+declare v_eng uuid; v_a boolean; v_b boolean;
+begin
+  v_eng := _policy_tests.phone_fixture('pol42-coherence');
+  -- Direction 1: terminal state with no terminal_at.
+  begin
+    update screening_v2.phone_engagements set state = 'cancelled' where id = v_eng;
+    v_a := false;
+  exception when others then v_a := true; end;
+  -- Direction 2: non-terminal state carrying a terminal_at.
+  begin
+    update screening_v2.phone_engagements set terminal_at = '2026-08-24T06:00:00Z'
+     where id = v_eng;
+    v_b := false;
+  exception when others then v_b := true; end;
+  perform _policy_tests.assert(
+    '0042: terminal state and terminal_at are coherent in BOTH directions',
+    v_a and v_b,
+    'terminal-without-a-time=' || v_a || ' time-without-terminal=' || v_b);
+end;
+$$;
+
+-- ── B3: the ingress ledger is insert-once, for service_role too ───────
+do $$
+declare
+  v_eng uuid; v_res jsonb; v_ev uuid; v_u boolean; v_d boolean;
+begin
+  v_eng := _policy_tests.phone_fixture('pol42-ledger');
+  v_res := screening_v2.apply_phone_event('internal', 'prereq.satisfied', null, v_eng,
+                                          null, null, null, '2026-08-24T06:00:00Z');
+  v_ev := (v_res->>'event_id')::uuid;
+
+  begin
+    update screening_v2.phone_call_events set applied = false where id = v_ev;
+    v_u := false;
+  exception when others then v_u := sqlerrm like '%insert-once%'; end;
+  begin
+    delete from screening_v2.phone_call_events where id = v_ev;
+    v_d := false;
+  exception when others then v_d := sqlerrm like '%insert-once%'; end;
+
+  perform _policy_tests.assert(
+    '0042: phone_call_events rejects UPDATE and DELETE for the table owner',
+    v_u and v_d,
+    'update_blocked=' || v_u || ' delete_blocked=' || v_d);
+end;
+$$;
+
+-- The same proof under the role the backend actually uses. A trigger
+-- that only stops an unprivileged role would prove nothing: service_role
+-- owns every grant on these tables and bypasses RLS entirely, so it is
+-- the only writer whose refusal is worth asserting.
+do $$
+declare
+  v_eng uuid; v_res jsonb; v_ev uuid; v_u boolean; v_d boolean;
+begin
+  v_eng := _policy_tests.phone_fixture('pol42-ledger-sr');
+  v_res := screening_v2.apply_phone_event('internal', 'prereq.satisfied', null, v_eng,
+                                          null, null, null, '2026-08-24T06:00:00Z');
+  v_ev := (v_res->>'event_id')::uuid;
+
+  set local role service_role;
+  begin
+    update screening_v2.phone_call_events set applied = false where id = v_ev;
+    v_u := false;
+  exception when others then v_u := sqlerrm like '%insert-once%'; end;
+  begin
+    delete from screening_v2.phone_call_events where id = v_ev;
+    v_d := false;
+  exception when others then v_d := sqlerrm like '%insert-once%'; end;
+  reset role;
+
+  perform _policy_tests.assert(
+    '0042: phone_call_events rejects UPDATE and DELETE as service_role',
+    v_u and v_d,
+    'service_role bypasses RLS and holds every grant, so this is the refusal that matters; '
+      || 'update_blocked=' || v_u || ' delete_blocked=' || v_d);
+  perform _policy_tests.assert(
+    '0042: the role used above really does bypass RLS',
+    (select rolbypassrls from pg_roles where rolname = 'service_role'),
+    'if service_role did not bypass RLS the refusal could be a policy artefact');
+end;
+$$;
+
+-- ── B4: the budget CHECKs reject a DIRECT write, with no RPC involved ─
+do $$
+declare v_eng uuid; v_over boolean; v_neg boolean;
+begin
+  v_eng := _policy_tests.phone_fixture('pol42-budget-check');
+  begin
+    update screening_v2.phone_engagements set no_answer_attempts = 4 where id = v_eng;
+    v_over := false;
+  exception when check_violation then v_over := true; end;
+  begin
+    update screening_v2.phone_engagements set reconnects_used = -1 where id = v_eng;
+    v_neg := false;
+  exception when check_violation then v_neg := true; end;
+  perform _policy_tests.assert(
+    '0042: a direct write of no_answer_attempts=4 or reconnects_used=-1 is rejected by CHECK',
+    v_over and v_neg,
+    'the budget ceilings must hold against any writer, not only against the RPCs; '
+      || 'four=' || v_over || ' negative=' || v_neg);
+end;
+$$;
+
+-- ── B5: every prerequisite refusal is free and leaves no trace ────────
+-- The assertion that matters is not the status string. It is that a
+-- refusal writes NO attempt, NO queue job and NO success audit, and
+-- moves NO budget — because a fail-closed gate that quietly spends a
+-- candidate's attempt is worse than no gate at all.
+do $$
+declare
+  v_cases text[][] := array[
+    ['consent-none',    'consent_missing'],
+    ['consent-decl',    'consent_not_granted'],
+    ['consent-wdrw',    'consent_not_granted'],
+    ['consent-exp',     'consent_expired'],
+    ['consent-sub',     'consent_subset_missing'],
+    ['phone-bad',       'phone_invalid'],
+    ['phone-nonin',     'phone_invalid'],
+    ['map-paused',      'mapping_not_enabled'],
+    ['ing-partial',     'ingestion_not_ready'],
+    ['ing-none',        'ingestion_not_ready'],
+    ['link-terminal',   'application_terminal'],
+    ['suppressed',      'suppressed'],
+    ['window-shut',     'window_closed'],
+    ['halt-on',         'halted'],
+    ['halt-missing',    'halt_unreadable']];
+  v_i integer; v_tag text; v_want text;
+  v_eng uuid; v_res jsonb; v_now timestamptz := '2026-08-24T06:00:00Z';
+  v_bad text := ''; v_attempts integer; v_jobs integer; v_audits integer;
+  v_na integer; v_rc integer; v_pf integer;
+begin
+  for v_i in 1..array_length(v_cases, 1) loop
+    v_tag  := 'pol42-' || v_cases[v_i][1];
+    v_want := v_cases[v_i][2];
+
+    v_eng := case v_cases[v_i][1]
+      when 'consent-none' then _policy_tests.phone_fixture(v_tag,'eligible','ready','enabled','none')
+      when 'consent-decl' then _policy_tests.phone_fixture(v_tag,'eligible','ready','enabled','declined')
+      when 'consent-wdrw' then _policy_tests.phone_fixture(v_tag,'eligible','ready','enabled','withdrawn')
+      when 'consent-exp'  then _policy_tests.phone_fixture(v_tag,'eligible','ready','enabled','expired')
+      when 'consent-sub'  then _policy_tests.phone_fixture(v_tag,'eligible','ready','enabled','subset')
+      when 'phone-bad'    then _policy_tests.phone_fixture(v_tag,'eligible','ready','enabled','full','INVALID')
+      -- A perfectly valid US number. India-only is not a formatting
+      -- rule, it is a jurisdiction rule, and it must fail closed.
+      when 'phone-nonin'  then _policy_tests.phone_fixture(v_tag,'eligible','ready','enabled','full','+14155550100')
+      when 'map-paused'   then _policy_tests.phone_fixture(v_tag,'eligible','ready','paused','full')
+      when 'ing-partial'  then _policy_tests.phone_fixture(v_tag,'eligible','structuring','enabled','full')
+      when 'ing-none'     then _policy_tests.phone_fixture(v_tag,'eligible','no_resume','enabled','full')
+      else _policy_tests.phone_fixture(v_tag)
+    end;
+
+    if v_cases[v_i][1] = 'link-terminal' then
+      update screening_v2.ashby_application_links set terminal_state = 'withdrawn'
+       where id = (select application_link_id from screening_v2.phone_engagements where id = v_eng);
+    elsif v_cases[v_i][1] = 'suppressed' then
+      insert into screening_v2.phone_suppressions (phone_sha256, reason, source)
+      select screening_v2.sha256_hex(c.phone_e164), 'candidate_opt_out', 'candidate'
+        from screening_v2.candidates c
+        join screening_v2.phone_engagements e on e.candidate_id = c.id
+       where e.id = v_eng
+      on conflict (phone_sha256) do nothing;
+    elsif v_cases[v_i][1] = 'halt-on' then
+      perform screening_v2.set_phone_halt('operator_pause',
+                                          '00000000-0000-4000-8000-0000000000ad', v_now);
+    elsif v_cases[v_i][1] = 'halt-missing' then
+      delete from screening_v2.phone_control where control_key = 'default';
+    end if;
+
+    v_res := screening_v2.admit_phone_attempt(
+               v_eng, 'initial', null, 60,
+               case when v_cases[v_i][1] = 'window-shut'
+                    then '2026-08-24T16:30:00Z'::timestamptz   -- 22:00 IST
+                    else v_now end);
+
+    if v_res->>'status' <> v_want then
+      v_bad := v_bad || v_tag || '=' || (v_res->>'status') || '(want ' || v_want || ') ';
+    end if;
+
+    select count(*) into v_attempts
+      from screening_v2.phone_call_attempts where engagement_id = v_eng;
+    select count(*) into v_jobs
+      from screening_v2.job_queue where name = 'phone.dial'
+        and payload->>'attemptId' in (select id::text from screening_v2.phone_call_attempts
+                                       where engagement_id = v_eng);
+    select count(*) into v_audits
+      from screening_v2.audit_events
+     where action = 'phone_attempt_admitted' and metadata->>'engagement_id' = v_eng::text;
+    select no_answer_attempts, reconnects_used, provider_failures into v_na, v_rc, v_pf
+      from screening_v2.phone_engagements where id = v_eng;
+
+    if v_attempts <> 0 or v_jobs <> 0 or v_audits <> 0 or v_na <> 0 or v_rc <> 0 or v_pf <> 0 then
+      v_bad := v_bad || v_tag || ':trace(attempts=' || v_attempts || ',jobs=' || v_jobs
+               || ',audits=' || v_audits || ',budgets=' || v_na || '/' || v_rc || '/' || v_pf || ') ';
+    end if;
+
+    -- Undo the two global side effects immediately, so a later test can
+    -- never inherit a halted or missing kill switch.
+    if v_cases[v_i][1] = 'halt-on' then
+      perform screening_v2.clear_phone_halt('00000000-0000-4000-8000-0000000000ad', v_now);
+    elsif v_cases[v_i][1] = 'halt-missing' then
+      insert into screening_v2.phone_control (control_key) values ('default')
+      on conflict (control_key) do nothing;
+    end if;
+  end loop;
+
+  perform _policy_tests.assert(
+    '0042: all fifteen prerequisite refusals are exact, budget-free and leave no attempt, job or success audit',
+    v_bad = '', v_bad);
+end;
+$$;
+
+-- The active-template gate, isolated: with no active template there is
+-- no authority to point at, so admission must stop even when the
+-- candidate's own record looks complete.
+do $$
+declare v_eng uuid; v_res jsonb;
+begin
+  v_eng := _policy_tests.phone_fixture('pol42-tmpl');
+  update screening_v2.consent_templates set is_active = false where is_active;
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, '2026-08-24T06:00:00Z');
+  update screening_v2.consent_templates set is_active = true where version = '2026-08-04.1';
+  perform _policy_tests.assert(
+    '0042: admission stops when no consent template is active',
+    v_res->>'status' = 'consent_template_inactive',
+    'got ' || coalesce(v_res::text, '<null>'));
+end;
+$$;
+
+-- ── B6: the per-IST-day budget, and what it does and does not block ───
+do $$
+declare
+  v_eng uuid; v_res jsonb; v_att uuid;
+  v_t timestamptz := '2026-08-24T06:00:00Z';   -- 11:30 IST
+  v_na integer; v_rc integer;
+begin
+  v_eng := _policy_tests.phone_fixture('pol42-day');
+
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid;
+  perform _policy_tests.assert('0042: the first attempt of the day is admitted',
+    v_res->>'status' = 'ok', coalesce(v_res::text, '<null>'));
+
+  -- End it truthfully, the way a no-answer would.
+  perform screening_v2.apply_phone_event('internal', 'sip.originate_timeout', v_att, null,
+                                         null, 0, null, v_t + interval '30 seconds');
+  select no_answer_attempts into v_na from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0042: a ring timeout charges exactly one no-answer attempt',
+    v_na = 1, 'no_answer_attempts=' || v_na);
+
+  -- Same IST day, later hour. Refused: one no-answer-class call a day.
+  update screening_v2.phone_engagements set state = 'eligible' where id = v_eng;
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'no_answer_retry', null, 60,
+                                            v_t + interval '4 hours');
+  perform _policy_tests.assert(
+    '0042: a second no-answer-class attempt on the SAME IST day is refused',
+    v_res->>'status' = 'daily_attempt_exists',
+    'calling the same person twice in a day is the harassment this index exists to prevent; got '
+      || coalesce(v_res::text, '<null>'));
+
+  -- An ENDED attempt must not block the next admission; that is the
+  -- mirror of the PR #70 wedge, where a live row nothing could reclaim
+  -- blocked an engagement for ever. The attempt above is already
+  -- `ended` — the ring timeout ended it.
+  update screening_v2.phone_engagements set state = 'eligible' where id = v_eng;
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'no_answer_retry', null, 60,
+                                            v_t + interval '1 day');
+  perform _policy_tests.assert(
+    '0042: an ended attempt permits admission on the next IST day',
+    v_res->>'status' = 'ok', coalesce(v_res::text, '<null>'));
+  v_att := (v_res->>'attempt_id')::uuid;
+
+  update screening_v2.phone_call_attempts set state = 'abandoned' where id = v_att;
+  update screening_v2.phone_engagements set state = 'eligible' where id = v_eng;
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'no_answer_retry', null, 60,
+                                            v_t + interval '2 days');
+  perform _policy_tests.assert(
+    '0042: an abandoned attempt permits admission on a later IST day',
+    v_res->>'status' = 'ok', coalesce(v_res::text, '<null>'));
+end;
+$$;
+
+-- A reconnect is a DIFFERENT budget and is excluded from the per-day
+-- index BY CONSTRUCTION, so a dropped conversation can be resumed within
+-- minutes without spending the candidate's call for that day. This walks
+-- the real path — admit, join, classify, disclose, drop — rather than
+-- forcing states, because the whole claim is that the machine reaches
+-- `reconnecting` legally.
+do $$
+declare
+  v_eng uuid; v_res jsonb; v_att uuid;
+  v_t timestamptz := '2026-08-24T06:00:00Z';
+  v_na integer; v_rc integer; v_state text;
+begin
+  v_eng := _policy_tests.phone_fixture('pol42-reconnect');
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid;
+
+  perform screening_v2.apply_phone_event('livekit_webhook','sip.participant_joined',
+                                         v_att, null, 'pol42-rc-join', 0, null, v_t);
+  perform screening_v2.apply_phone_event('internal','classify.human',
+                                         v_att, null, null, 0, null, v_t);
+  perform screening_v2.apply_phone_event('internal','disclosure.delivered',
+                                         v_att, null, null, 0, null, v_t);
+  select state into v_state from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0042: a delivered disclosure — and only that — opens the conversation',
+    v_state = 'in_call', 'state=' || v_state);
+
+  -- Mid-call drop, inside the window: one reconnect charged, no
+  -- no-answer attempt spent.
+  perform screening_v2.apply_phone_event('livekit_webhook','sip.participant_left',
+                                         v_att, null, 'pol42-rc-left', 1, null,
+                                         v_t + interval '5 minutes');
+  select state, no_answer_attempts, reconnects_used into v_state, v_na, v_rc
+    from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0042: a mid-call drop inside the window charges ONE reconnect and no no-answer attempt',
+    v_state = 'reconnecting' and v_rc = 1 and v_na = 0,
+    'state=' || v_state || ' reconnects=' || v_rc || ' no_answer=' || v_na);
+
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'reconnect', null, 60,
+                                            v_t + interval '7 minutes');
+  select no_answer_attempts, reconnects_used into v_na, v_rc
+    from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0042: the reconnect is admitted the SAME IST day and charges nothing at admission',
+    v_res->>'status' = 'ok' and v_na = 0 and v_rc = 1,
+    'status=' || (v_res->>'status') || ' no_answer=' || v_na || ' reconnects=' || v_rc);
+end;
+$$;
+
+-- ── B7: uq_phone_attempts_one_live is LOAD-BEARING, and a completed
+--        queue row can never authorise a second dial ──────────────────
+-- This is the test whose colour changes when the index is dropped. The
+-- refusal cannot come from the state check (the engagement is forced to
+-- an admissible state) nor from the per-day index (a reconnect is
+-- excluded from it), so only the one-live index is left to say no.
+do $$
+declare
+  v_eng uuid; v_res jsonb; v_att uuid; v_live integer; v_completed integer;
+  v_t timestamptz := '2026-08-24T06:00:00Z';
+begin
+  v_eng := _policy_tests.phone_fixture('pol42-onelive');
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid;
+
+  -- Complete the dial job, exactly as a worker would. The dedup key is
+  -- now released: uq_job_queue_dedup_active is partial over
+  -- pending/active/delayed, so the QUEUE no longer objects to anything.
+  update screening_v2.job_queue set status = 'completed', completed_at = v_t
+   where dedup_key = 'phone.dial:' || v_att::text;
+  select count(*) into v_completed from screening_v2.job_queue
+   where dedup_key = 'phone.dial:' || v_att::text and status = 'completed';
+
+  -- Put the engagement in an admissible state while its attempt is still
+  -- LIVE. `dialing -> reconnecting` is a legal edge (it is how a
+  -- reclaimed reconnect is restored), so this is a state the machine can
+  -- genuinely be in — and `reconnect` is the one kind the per-day index
+  -- does not cover. Neither the state check nor the day index can refuse
+  -- what follows; only uq_phone_attempts_one_live can.
+  update screening_v2.phone_engagements set state = 'reconnecting' where id = v_eng;
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'reconnect', null, 60,
+                                            v_t + interval '2 minutes');
+
+  select count(*) into v_live from screening_v2.phone_call_attempts
+   where engagement_id = v_eng
+     and state in ('admitted','ringing','answered_unclassified','human','machine');
+
+  perform _policy_tests.assert(
+    '0042: a COMPLETED phone.dial job cannot authorise a second live attempt',
+    v_completed = 1 and v_res->>'status' = 'attempt_in_flight' and v_live = 1,
+    'the durable attempt row is the exactly-once authority, never the queue dedup key; '
+      || 'completed_jobs=' || v_completed || ' status=' || (v_res->>'status')
+      || ' live_attempts=' || v_live);
+end;
+$$;
+
+-- ── B7b: a failed enqueue rolls the WHOLE admission back ──────────────
+do $$
+declare
+  v_eng uuid; v_res jsonb; v_state text; v_attempts integer; v_audits integer;
+  v_na integer; v_threw boolean;
+  v_t timestamptz := '2026-08-24T06:00:00Z';
+begin
+  v_eng := _policy_tests.phone_fixture('pol42-enqfail');
+
+  create or replace function _policy_tests.block_pol42_enqueue()
+  returns trigger language plpgsql as $trg$
+  begin
+    if new.name = 'phone.dial'
+       and current_setting('policy_tests.block_eng_42', true) = 'on' then
+      raise exception 'pol42_synthetic_enqueue_failure';
+    end if;
+    return new;
+  end;
+  $trg$;
+  create trigger trg_pol42_block_enqueue
+    before insert on screening_v2.job_queue
+    for each row execute function _policy_tests.block_pol42_enqueue();
+  perform set_config('policy_tests.block_eng_42', 'on', false);
+
+  begin
+    v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+    v_threw := false;
+  exception when others then
+    v_threw := sqlerrm like '%pol42_synthetic_enqueue_failure%';
+  end;
+
+  perform set_config('policy_tests.block_eng_42', 'off', false);
+  drop trigger trg_pol42_block_enqueue on screening_v2.job_queue;
+
+  select state, no_answer_attempts into v_state, v_na
+    from screening_v2.phone_engagements where id = v_eng;
+  select count(*) into v_attempts
+    from screening_v2.phone_call_attempts where engagement_id = v_eng;
+  select count(*) into v_audits from screening_v2.audit_events
+   where action = 'phone_attempt_admitted' and metadata->>'engagement_id' = v_eng::text;
+
+  perform _policy_tests.assert(
+    '0042: an enqueue failure rolls back the attempt, the lease, the transition and the audit together',
+    v_threw and v_state = 'eligible' and v_attempts = 0 and v_audits = 0 and v_na = 0,
+    'an admission that cannot schedule work must not report that it did; threw=' || v_threw
+      || ' state=' || v_state || ' attempts=' || v_attempts || ' audits=' || v_audits);
+
+  -- ...and future eligibility survives the outage untouched.
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  perform _policy_tests.assert(
+    '0042: the engagement is fully admissible once the enqueue fault is gone',
+    v_res->>'status' = 'ok', coalesce(v_res::text, '<null>'));
+end;
+$$;
+
+-- ── B8: the fleet cap, lease renewal, and reclaim ─────────────────────
+-- The cap is a DB-derived count over unexpired leases, never a stored
+-- counter. Its correctness depends on something renewing those leases
+-- for the length of a conversation — that loop is P5's, and this test is
+-- what makes the dependency visible rather than hidden.
+do $$
+declare
+  v_engs uuid[] := '{}'; v_toks uuid[] := '{}'; v_atts uuid[] := '{}';
+  v_i integer; v_res jsonb; v_eng uuid;
+  -- Deliberately a WEEK after every other block in this file. The fleet
+  -- cap is global by design, so this is the one test that must not share
+  -- a clock with its neighbours: an unexpired lease from an earlier
+  -- fixture would occupy a slot and make the count mean nothing.
+  v_t timestamptz := '2026-09-01T06:00:00Z';
+  v_admitted integer := 0; v_bad text := '';
+  v_backlog jsonb; v_state text; v_na integer; v_rc integer; v_pf integer;
+  v_abandoned integer;
+begin
+  for v_i in 1..11 loop
+    v_eng := _policy_tests.phone_fixture('pol42-cap' || v_i);
+    v_engs := v_engs || v_eng;
+  end loop;
+
+  -- Drain every lease left over from the blocks above, so the ten
+  -- admissions below start against an empty fleet.
+  perform screening_v2.reclaim_phone_attempt_leases(500, v_t);
+
+  for v_i in 1..10 loop
+    v_res := screening_v2.admit_phone_attempt(v_engs[v_i], 'initial',
+                                              'owner-' || v_i, 60, v_t);
+    if v_res->>'status' = 'ok' then
+      v_admitted := v_admitted + 1;
+      v_atts := v_atts || (v_res->>'attempt_id')::uuid;
+      v_toks := v_toks || (v_res->>'lease_token')::uuid;
+    else
+      v_bad := v_bad || v_i || '=' || (v_res->>'status') || ' ';
+    end if;
+  end loop;
+
+  v_res := screening_v2.admit_phone_attempt(v_engs[11], 'initial', 'owner-11', 60, v_t);
+  select no_answer_attempts, reconnects_used, provider_failures into v_na, v_rc, v_pf
+    from screening_v2.phone_engagements where id = v_engs[11];
+  perform _policy_tests.assert(
+    '0042: ten concurrent admissions succeed and the eleventh is refused at_capacity, free of charge',
+    v_admitted = 10 and v_res->>'status' = 'at_capacity'
+      and (v_res->>'live')::integer = 10 and v_na = 0 and v_rc = 0 and v_pf = 0,
+    'admitted=' || v_admitted || ' eleventh=' || (v_res->>'status') || ' ' || v_bad);
+
+  v_backlog := screening_v2.phone_backlog(v_t);
+  perform _policy_tests.assert(
+    '0042: phone_backlog reports the ten live leases and nothing identifying',
+    (v_backlog->'attempts'->>'live_with_unexpired_lease')::integer = 10
+      and (v_backlog->'attempts'->>'max_concurrent')::integer = 10
+      and v_backlog::text !~ '\+91' and v_backlog::text !~ '@example',
+    'backlog=' || v_backlog::text);
+
+  -- Renew every lease at T+50s. The ORIGINAL expiry was T+60s.
+  for v_i in 1..10 loop
+    v_res := screening_v2.heartbeat_phone_attempt(v_atts[v_i], v_toks[v_i], 60,
+                                                  v_t + interval '50 seconds');
+    if v_res->>'status' <> 'ok' then v_bad := v_bad || 'hb' || v_i || ' '; end if;
+  end loop;
+
+  -- T+70s is PAST every original expiry. A renewed lease still holds its
+  -- slot, so the fleet is still full — which is the whole reason the
+  -- concurrency lease is not the queue lease.
+  v_res := screening_v2.admit_phone_attempt(v_engs[11], 'initial', 'owner-11', 60,
+                                            v_t + interval '70 seconds');
+  perform _policy_tests.assert(
+    '0042: a heartbeat past the original expiry keeps the fleet full',
+    v_res->>'status' = 'at_capacity' and v_bad = '',
+    'a lease that lapses mid-call would admit an 11th call while the 10th was still talking; got '
+      || (v_res->>'status') || ' ' || v_bad);
+
+  -- A stale token can never renew, so a worker that lost its slot cannot
+  -- silently keep it.
+  v_res := screening_v2.heartbeat_phone_attempt(v_atts[1], gen_random_uuid(), 60,
+                                                v_t + interval '80 seconds');
+  perform _policy_tests.assert(
+    '0042: a wrong lease token is refused, never a silent renew',
+    v_res->>'status' = 'lease_lost', coalesce(v_res::text, '<null>'));
+
+  -- Now let every lease lapse and sweep. A dead worker is our failure,
+  -- not the candidate's attempt: nothing may be charged.
+  v_res := screening_v2.reclaim_phone_attempt_leases(50, v_t + interval '10 minutes');
+  select count(*) into v_abandoned from screening_v2.phone_call_attempts
+   where id = any(v_atts) and state = 'abandoned';
+  select state, no_answer_attempts, reconnects_used, provider_failures
+    into v_state, v_na, v_rc, v_pf
+    from screening_v2.phone_engagements where id = v_engs[1];
+  perform _policy_tests.assert(
+    '0042: reclaim abandons every expired attempt, restores the prior state and charges no budget',
+    (v_res->>'reclaimed')::integer = 10 and v_abandoned = 10
+      and v_state = 'eligible' and v_na = 0 and v_rc = 0 and v_pf = 0,
+    'reclaimed=' || (v_res->>'reclaimed') || ' abandoned=' || v_abandoned
+      || ' state=' || v_state || ' budgets=' || v_na || '/' || v_rc || '/' || v_pf);
+
+  -- The freed slots are real: the eleventh engagement now gets in.
+  v_res := screening_v2.admit_phone_attempt(v_engs[11], 'initial', 'owner-11', 60,
+                                            v_t + interval '11 minutes');
+  perform _policy_tests.assert(
+    '0042: reclaiming an expired lease genuinely frees its fleet slot',
+    v_res->>'status' = 'ok', coalesce(v_res::text, '<null>'));
+
+  -- And a reclaimed engagement is admissible again — on the NEXT IST
+  -- day. The per-day index still holds: an abandoned attempt may well
+  -- have rung the phone before the worker died, and an anti-harassment
+  -- invariant must fail closed on that uncertainty. No budget was spent,
+  -- so the candidate keeps all three attempts.
+  v_res := screening_v2.admit_phone_attempt(v_engs[1], 'initial', 'owner-1', 60,
+                                            v_t + interval '12 minutes');
+  perform _policy_tests.assert(
+    '0042: a reclaimed engagement still respects the per-IST-day call limit',
+    v_res->>'status' = 'daily_attempt_exists', coalesce(v_res::text, '<null>'));
+  v_res := screening_v2.admit_phone_attempt(v_engs[1], 'initial', 'owner-1', 60,
+                                            v_t + interval '1 day');
+  perform _policy_tests.assert(
+    '0042: a reclaimed engagement is fully re-admissible on the next IST day',
+    v_res->>'status' = 'ok', coalesce(v_res::text, '<null>'));
+end;
+$$;
+
+-- ── B9: the dial job's payload is exact, camelCase, and carries no PII
+do $$
+declare
+  v_eng uuid; v_res jsonb; v_att uuid; v_payload jsonb; v_name text; v_key text;
+  v_t timestamptz := '2026-08-24T06:00:00Z';
+begin
+  v_eng := _policy_tests.phone_fixture('pol42-payload');
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid;
+  select name, payload, dedup_key into v_name, v_payload, v_key
+    from screening_v2.job_queue where dedup_key = 'phone.dial:' || v_att::text;
+
+  perform _policy_tests.assert(
+    '0042: the dial job is phone.dial with an attempt-scoped dedup key and an exact camelCase payload',
+    v_name = 'phone.dial'
+      and v_key = 'phone.dial:' || v_att::text
+      and v_payload = jsonb_build_object('provider', 'phone', 'attemptId', v_att::text),
+    'snake_case would dead-letter the job as a malformed payload — the documented 0040 trap; got '
+      || 'name=' || coalesce(v_name, '<null>') || ' key=' || coalesce(v_key, '<null>')
+      || ' payload=' || coalesce(v_payload::text, '<null>'));
+
+  perform _policy_tests.assert(
+    '0042: the dial payload carries exactly two keys and none of them is PII, a token or a URL',
+    (select count(*) from jsonb_object_keys(v_payload)) = 2
+      and v_payload->>'provider' = 'phone'
+      and v_payload->>'attemptId' ~ '^[0-9a-f-]{36}$'
+      -- The only literal 'phone' in the payload is the provider tag
+      -- itself, so the leak check is run over the VALUES the payload
+      -- would have to smuggle something in.
+      and v_payload::text !~* '(e164|\+91|token|url|http|email|secret|handle|error|lease)',
+    'payload=' || coalesce(v_payload::text, '<null>'));
+end;
+$$;
+
+-- ── B10: every ingress verdict, exactly ───────────────────────────────
+do $$
+declare
+  v_eng uuid; v_eng2 uuid; v_res jsonb; v_first jsonb; v_att uuid; v_rows integer;
+  v_t timestamptz := '2026-08-24T06:00:00Z';
+begin
+  v_eng := _policy_tests.phone_fixture('pol42-events');
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid;
+
+  -- duplicate: one row, and the SAME answer both times
+  v_first := screening_v2.apply_phone_event('livekit_webhook','sip.participant_joined',
+                                            v_att, null, 'pol42-dup', 0, null, v_t);
+  v_res   := screening_v2.apply_phone_event('livekit_webhook','sip.participant_joined',
+                                            v_att, null, 'pol42-dup', 0, null, v_t);
+  select count(*) into v_rows from screening_v2.phone_call_events
+   where source = 'livekit_webhook' and provider_event_id = 'pol42-dup';
+  perform _policy_tests.assert(
+    '0042: a duplicate delivery writes ONE row and returns the ORIGINAL outcome',
+    v_rows = 1 and (v_res->>'duplicate')::boolean
+      and v_res->>'event_id' = v_first->>'event_id'
+      and v_res->>'applied' = v_first->>'applied'
+      and (v_first->>'duplicate')::boolean is false,
+    'rows=' || v_rows || ' first=' || v_first::text || ' second=' || v_res::text);
+
+  -- the deterministic synthetic id really is deterministic: a second
+  -- internal event of the same type/epoch for the same attempt dedups
+  v_first := screening_v2.apply_phone_event('internal','classify.human', v_att, null,
+                                            null, 0, null, v_t);
+  v_res   := screening_v2.apply_phone_event('internal','classify.human', v_att, null,
+                                            null, 0, null, v_t);
+  perform _policy_tests.assert(
+    '0042: a non-provider source mints a DETERMINISTIC id, so the ledger dedups it too',
+    (v_res->>'duplicate')::boolean and v_res->>'event_id' = v_first->>'event_id',
+    'a nullable provider id would let every recovery channel insert freely; got ' || v_res::text);
+
+  select count(*) into v_rows from screening_v2.phone_call_events
+   where id = (v_first->>'event_id')::uuid and provider_event_id is not null;
+  perform _policy_tests.assert(
+    '0042: no ledger row can carry a null provider_event_id',
+    v_rows = 1, 'NOT NULL is what makes one unique index cover every channel');
+
+  -- unexpected: a legal event in a state that has no edge for it
+  v_res := screening_v2.apply_phone_event('internal','assessment.completed', v_att, null,
+                                          null, 0, null, v_t);
+  perform _policy_tests.assert(
+    '0042: a (state, event) pair outside the transition table is an explicit no-op',
+    v_res->>'ignored_reason' = 'unexpected_event' and (v_res->>'applied')::boolean is false,
+    'the machine must have no implicit default that mutates state; got ' || v_res::text);
+
+  -- unknown attempt
+  v_res := screening_v2.apply_phone_event('livekit_webhook','sip.participant_joined',
+                                          gen_random_uuid(), null, 'pol42-ghost', 0, null, v_t);
+  perform _policy_tests.assert(
+    '0042: an event for an attempt we never admitted is recorded as unknown_attempt',
+    v_res->>'ignored_reason' = 'unknown_attempt',
+    'a nonzero rate here means admission and ingress have diverged; got ' || v_res::text);
+
+  -- stale epoch
+  v_res := screening_v2.apply_phone_event('internal','disclosure.delivered', v_att, null,
+                                          null, 0, null, v_t);
+  v_res := screening_v2.apply_phone_event('livekit_webhook','sip.participant_left', v_att, null,
+                                          'pol42-stale', 0, null, v_t);
+  perform _policy_tests.assert(
+    '0042: a callback carrying a superseded epoch is fenced out, not timed out',
+    v_res->>'ignored_reason' = 'stale_epoch',
+    'late callbacks are solved by monotonic fencing; got ' || v_res::text);
+
+  -- terminal
+  v_eng2 := _policy_tests.phone_fixture('pol42-events-term', 'cancelled');
+  v_res := screening_v2.apply_phone_event('livekit_webhook','sip.participant_joined',
+                                          null, v_eng2, 'pol42-term', null, null, v_t);
+  perform _policy_tests.assert(
+    '0042: any event for a terminal engagement is recorded and ignored as terminal',
+    v_res->>'ignored_reason' = 'terminal',
+    'recorded, never silently dropped; got ' || v_res::text);
+
+  -- a webhook with no provider id is not dedupable and is refused
+  v_res := screening_v2.apply_phone_event('livekit_webhook','sip.participant_joined',
+                                          v_att, null, null, 1, null, v_t);
+  perform _policy_tests.assert(
+    '0042: a provider callback with no provider event id is refused, never invented',
+    v_res->>'status' = 'provider_event_id_required', coalesce(v_res::text, '<null>'));
+end;
+$$;
+
+-- ── B11: the internal calendar ────────────────────────────────────────
+do $$
+declare
+  v_eng uuid; v_res jsonb; v_apt uuid; v_ver integer; v_state text; v_live integer;
+  v_t timestamptz := '2026-08-24T06:00:00Z';                 -- 11:30 IST
+  v_slot timestamptz := '2026-08-25T09:00:00Z';              -- 14:30 IST next day
+  v_ok boolean;
+begin
+  v_eng := _policy_tests.phone_fixture('pol42-cal');
+
+  v_res := screening_v2.schedule_phone_appointment(
+             v_eng, v_slot, v_slot + interval '30 minutes', 'candidate_voice',
+             null, null, v_t);
+  v_apt := (v_res->>'appointment_id')::uuid;
+  v_ver := (v_res->>'version')::integer;
+  select state into v_state from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0042: a candidate-negotiated slot books and moves the engagement to scheduled',
+    v_res->>'status' = 'ok' and v_state = 'scheduled', coalesce(v_res::text, '<null>'));
+
+  -- Outside the window: 22:00 IST.
+  v_res := screening_v2.schedule_phone_appointment(
+             v_eng, '2026-08-25T16:30:00Z', '2026-08-25T17:00:00Z', 'hr_manual',
+             null, v_ver, v_t);
+  perform _policy_tests.assert(
+    '0042: a slot outside the approved IST window is refused',
+    v_res->>'status' = 'window_closed', coalesce(v_res::text, '<null>'));
+
+  -- Five minutes is not a screening call.
+  v_res := screening_v2.schedule_phone_appointment(
+             v_eng, v_slot, v_slot + interval '5 minutes', 'hr_manual', null, v_ver, v_t);
+  perform _policy_tests.assert(
+    '0042: a slot outside the 15-60 minute envelope is refused',
+    v_res->>'status' = 'slot_duration_invalid', coalesce(v_res::text, '<null>'));
+
+  -- A slot in the past cannot be kept.
+  v_res := screening_v2.schedule_phone_appointment(
+             v_eng, '2026-08-23T06:00:00Z', '2026-08-23T06:30:00Z', 'hr_manual',
+             null, v_ver, v_t);
+  perform _policy_tests.assert(
+    '0042: a slot in the past is refused',
+    v_res->>'status' = 'slot_in_past', coalesce(v_res::text, '<null>'));
+
+  -- One live appointment per engagement, and a blind rebook is refused
+  -- rather than silently replacing what a recruiter is looking at.
+  v_res := screening_v2.schedule_phone_appointment(
+             v_eng, v_slot + interval '2 hours', v_slot + interval '150 minutes',
+             'hr_manual', null, null, v_t);
+  perform _policy_tests.assert(
+    '0042: rebooking without the expected version is refused as appointment_exists',
+    v_res->>'status' = 'appointment_exists', coalesce(v_res::text, '<null>'));
+
+  v_res := screening_v2.schedule_phone_appointment(
+             v_eng, v_slot + interval '2 hours', v_slot + interval '150 minutes',
+             'hr_manual', null, v_ver + 99, v_t);
+  perform _policy_tests.assert(
+    '0042: a stale version is refused as version_conflict',
+    v_res->>'status' = 'version_conflict', coalesce(v_res::text, '<null>'));
+
+  v_res := screening_v2.schedule_phone_appointment(
+             v_eng, v_slot + interval '2 hours', v_slot + interval '150 minutes',
+             'hr_manual', '00000000-0000-4000-8000-0000000000ad', v_ver, v_t);
+  select count(*) into v_live from screening_v2.phone_appointments
+   where engagement_id = v_eng and status in ('scheduled','confirmed');
+  perform _policy_tests.assert(
+    '0042: a correctly-versioned reschedule supersedes the old slot and leaves exactly one live',
+    v_res->>'status' = 'ok' and v_live = 1
+      and (select status from screening_v2.phone_appointments where id = v_apt) = 'superseded',
+    'status=' || (v_res->>'status') || ' live=' || v_live);
+  v_apt := (v_res->>'appointment_id')::uuid;
+
+  -- Cancel returns the engagement to eligible and is idempotent.
+  v_res := screening_v2.cancel_phone_appointment(v_apt, 'hr_cancelled',
+             '00000000-0000-4000-8000-0000000000ad', null, v_t);
+  select state into v_state from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0042: cancelling the only live slot returns the engagement to eligible',
+    v_res->>'status' = 'ok' and v_state = 'eligible',
+    'status=' || (v_res->>'status') || ' state=' || v_state);
+  v_res := screening_v2.cancel_phone_appointment(v_apt, 'hr_cancelled', null, null, v_t);
+  perform _policy_tests.assert(
+    '0042: cancelling an already-cancelled slot is idempotent, not an error',
+    v_res->>'status' = 'already_cancelled', coalesce(v_res::text, '<null>'));
+  v_res := screening_v2.cancel_phone_appointment(v_apt, 'because i said so', null, null, v_t);
+  perform _policy_tests.assert(
+    '0042: a free-text cancel reason is refused by the fixed vocabulary',
+    v_res->>'status' = 'invalid_reason',
+    'provider or operator prose must never reach a durable column; got ' || v_res::text);
+
+  -- The window is a DIRECT-WRITE guarantee, not only an RPC one.
+  begin
+    insert into screening_v2.phone_appointments
+      (engagement_id, starts_at, ends_at, ist_date, status, source)
+    values (v_eng, '2026-08-25T16:30:00Z', '2026-08-25T17:00:00Z',
+            date '2026-08-25', 'scheduled', 'hr_manual');
+    v_ok := false;
+  exception when others then
+    v_ok := sqlerrm like '%outside the approved IST calling window%';
+  end;
+  perform _policy_tests.assert(
+    '0042: a DIRECT insert outside the IST window is rejected by the trigger',
+    v_ok, 'the trigger is the backstop a CHECK could not be, because at time zone is STABLE');
+end;
+$$;
+
+-- ── B12: the largest phone audit row still fits the 4096-byte cap ─────
+select _policy_tests.assert(
+  '0042: every phone audit row written by this suite is inside the 4096-byte metadata cap',
+  coalesce((select max(octet_length(metadata::text)) from screening_v2.audit_events
+             where action like 'phone\_%'), 0) <= 4096
+  and coalesce((select max(octet_length(metadata::text)) from screening_v2.audit_events
+                 where action = 'admin_session_override'
+                   and metadata->>'override' like 'phone\_%'), 0) <= 4096,
+  'chk_audit_metadata_size (0007) rejects the whole INSERT, which would roll back the admission');
+
+select _policy_tests.assert(
+  '0042: no phone audit row leaks a number, an email, a token or a lease',
+  not exists (
+    select 1 from screening_v2.audit_events
+     where (action like 'phone\_%'
+            or (action = 'admin_session_override' and metadata->>'override' like 'phone\_%'))
+       and metadata::text ~* '(\+91|@example|lease_token|token|secret|url|http)'),
+  'audit metadata carries opaque ids and stable codes only');
+
+-- ── B13: the three budgets are EXHAUSTIBLE, and exhaustion is terminal ─
+-- A budget that no test ever spends to its limit is a budget nobody has
+-- checked. These three cases are what make the ceilings real rather than
+-- decorative — and the reconnect one in particular is what catches a
+-- counter that is silently reset by the edge that must respect it.
+do $$
+declare
+  v_eng uuid; v_res jsonb; v_att uuid; v_t timestamptz := '2026-08-24T06:00:00Z';
+  v_i integer; v_rc integer; v_state text; v_term timestamptz; v_reason text;
+  v_bad text := ''; v_epoch integer;
+begin
+  v_eng := _policy_tests.phone_fixture('pol42-rcbudget');
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid;
+
+  -- Three full conversation cycles. Each one delivers a disclosure —
+  -- which bumps the fencing epoch — and then drops.
+  for v_i in 1..3 loop
+    perform screening_v2.apply_phone_event('livekit_webhook','sip.participant_joined',
+              v_att, null, 'pol42-rcb-join-' || v_i, null, null,
+              v_t + (v_i * interval '10 minutes'));
+    perform screening_v2.apply_phone_event('internal','classify.human',
+              v_att, null, null, null, null, v_t + (v_i * interval '10 minutes'));
+    perform screening_v2.apply_phone_event('internal','disclosure.delivered',
+              v_att, null, null, null, null, v_t + (v_i * interval '10 minutes'));
+    select epoch into v_epoch from screening_v2.phone_engagements where id = v_eng;
+    perform screening_v2.apply_phone_event('livekit_webhook','sip.participant_left',
+              v_att, null, 'pol42-rcb-left-' || v_i, v_epoch, null,
+              v_t + (v_i * interval '10 minutes') + interval '2 minutes');
+
+    select reconnects_used, state into v_rc, v_state
+      from screening_v2.phone_engagements where id = v_eng;
+    if v_rc <> v_i or v_state <> 'reconnecting' then
+      v_bad := v_bad || 'cycle' || v_i || '(rc=' || v_rc || ',state=' || v_state || ') ';
+    end if;
+
+    -- Redeem the grant. An engagement whose reconnect has been CHARGED
+    -- must be able to spend it; refusing here would wedge the row.
+    v_res := screening_v2.admit_phone_attempt(v_eng, 'reconnect', null, 60,
+               v_t + (v_i * interval '10 minutes') + interval '4 minutes');
+    if v_res->>'status' <> 'ok' then
+      v_bad := v_bad || 'redeem' || v_i || '=' || (v_res->>'status') || ' ';
+    else
+      v_att := (v_res->>'attempt_id')::uuid;
+    end if;
+  end loop;
+
+  perform _policy_tests.assert(
+    '0042: three successive mid-call drops charge reconnects 1, 2, 3 and each grant is redeemable',
+    v_bad = '',
+    'a reset on the reconnect path would pin this counter at 1 for ever, making '
+      || '"max 3 reconnects" unenforceable on a billable dialer: ' || v_bad);
+
+  -- The FOURTH drop earns no reconnect. Exhaustion must be TERMINAL, not
+  -- a rest in `reconnecting` with nothing able to move it.
+  perform screening_v2.apply_phone_event('livekit_webhook','sip.participant_joined',
+            v_att, null, 'pol42-rcb-join-4', null, null, v_t + interval '50 minutes');
+  perform screening_v2.apply_phone_event('internal','classify.human',
+            v_att, null, null, null, null, v_t + interval '50 minutes');
+  perform screening_v2.apply_phone_event('internal','disclosure.delivered',
+            v_att, null, null, null, null, v_t + interval '50 minutes');
+  select epoch into v_epoch from screening_v2.phone_engagements where id = v_eng;
+  perform screening_v2.apply_phone_event('livekit_webhook','sip.participant_left',
+            v_att, null, 'pol42-rcb-left-4', v_epoch, null, v_t + interval '52 minutes');
+
+  select state, reconnects_used, terminal_at, state_reason
+    into v_state, v_rc, v_term, v_reason
+    from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0042: the fourth drop exhausts the reconnect budget and ends the engagement',
+    v_state = 'failed' and v_rc = 3 and v_term is not null
+      and v_reason = 'reconnect_budget_exhausted',
+    'state=' || v_state || ' rc=' || v_rc || ' terminal_at=' || coalesce(v_term::text,'<null>')
+      || ' reason=' || coalesce(v_reason,'<null>'));
+
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'reconnect', null, 60,
+                                            v_t + interval '55 minutes');
+  perform _policy_tests.assert(
+    '0042: an exhausted engagement admits nothing further',
+    v_res->>'status' = 'engagement_terminal', coalesce(v_res::text, '<null>'));
+end;
+$$;
+
+do $$
+declare
+  v_eng uuid; v_res jsonb; v_att uuid; v_t timestamptz := '2026-08-24T06:00:00Z';
+  v_i integer; v_na integer; v_state text; v_term timestamptz; v_bad text := '';
+begin
+  v_eng := _policy_tests.phone_fixture('pol42-nabudget');
+  -- Three no-answers on three DISTINCT IST days, the way the per-day
+  -- index requires them to happen.
+  for v_i in 0..2 loop
+    if v_i > 0 then
+      update screening_v2.phone_engagements set state = 'eligible' where id = v_eng;
+    end if;
+    v_res := screening_v2.admit_phone_attempt(
+               v_eng, case when v_i = 0 then 'initial' else 'no_answer_retry' end,
+               null, 60, v_t + (v_i * interval '1 day'));
+    if v_res->>'status' <> 'ok' then
+      v_bad := v_bad || 'day' || v_i || '=' || (v_res->>'status') || ' '; continue;
+    end if;
+    v_att := (v_res->>'attempt_id')::uuid;
+    perform screening_v2.apply_phone_event('internal','sip.originate_timeout',
+              v_att, null, null, null, null, v_t + (v_i * interval '1 day') + interval '1 minute');
+    select no_answer_attempts into v_na from screening_v2.phone_engagements where id = v_eng;
+    if v_na <> v_i + 1 then v_bad := v_bad || 'day' || v_i || ':na=' || v_na || ' '; end if;
+  end loop;
+
+  select state, no_answer_attempts, terminal_at into v_state, v_na, v_term
+    from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0042: three no-answers on three IST days spend the budget and end the engagement',
+    v_bad = '' and v_na = 3 and v_state = 'abandoned_no_answer' and v_term is not null,
+    'no stage move and no email follow this — it is a quiet, terminal give-up; '
+      || v_bad || ' na=' || v_na || ' state=' || v_state);
+end;
+$$;
+
+do $$
+declare
+  v_eng uuid; v_res jsonb; v_att uuid; v_t timestamptz := '2026-08-24T06:00:00Z';
+  v_i integer; v_pf integer; v_state text; v_reason text; v_bad text := '';
+begin
+  v_eng := _policy_tests.phone_fixture('pol42-pfbudget');
+  -- The provider budget is INDEPENDENT: five transport failures must
+  -- never touch the candidate's no-answer attempts. Each failure returns
+  -- the engagement to `eligible`, and a reconnect-kind dial is used so
+  -- the per-day index does not interfere with the point being made.
+  for v_i in 1..5 loop
+    v_res := screening_v2.admit_phone_attempt(
+               v_eng, case when v_i = 1 then 'initial' else 'no_answer_retry' end,
+               null, 60, v_t + ((v_i - 1) * interval '1 day'));
+    if v_res->>'status' <> 'ok' then
+      v_bad := v_bad || 'admit' || v_i || '=' || (v_res->>'status') || ' '; exit;
+    end if;
+    v_att := (v_res->>'attempt_id')::uuid;
+    perform screening_v2.apply_phone_event('internal','sip.originate_rejected_transport',
+              v_att, null, null, null, null,
+              v_t + ((v_i - 1) * interval '1 day') + interval '1 minute');
+  end loop;
+
+  select state, provider_failures, state_reason, no_answer_attempts
+    into v_state, v_pf, v_reason, v_i
+    from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0042: five provider failures end the engagement and never touch the no-answer budget',
+    v_bad = '' and v_pf = 5 and v_state = 'failed'
+      and v_reason = 'provider_budget_exhausted' and v_i = 0,
+    'our outage must not spend the candidate''s attempts; ' || v_bad
+      || ' provider_failures=' || v_pf || ' state=' || v_state
+      || ' no_answer=' || v_i);
+end;
+$$;
+
+-- ── B14: a worker that dies MID-CONVERSATION is recoverable ───────────
+-- `dialing` is not the only state an engagement holds a live attempt in.
+-- After a delivered disclosure it is `in_call` while its attempt is
+-- still `human`, and a sweeper that only restores `dialing` strands
+-- exactly that engagement for ever.
+do $$
+declare
+  v_eng uuid; v_res jsonb; v_att uuid; v_t timestamptz := '2026-08-24T06:00:00Z';
+  v_state text; v_astate text; v_na integer; v_rc integer; v_pf integer; v_term timestamptz;
+begin
+  v_eng := _policy_tests.phone_fixture('pol42-incall-reclaim');
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', 'dying-worker', 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid;
+  perform screening_v2.apply_phone_event('livekit_webhook','sip.participant_joined',
+            v_att, null, 'pol42-icr-join', null, null, v_t);
+  perform screening_v2.apply_phone_event('internal','classify.human',
+            v_att, null, null, null, null, v_t);
+  perform screening_v2.apply_phone_event('internal','disclosure.delivered',
+            v_att, null, null, null, null, v_t);
+  select state into v_state from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0042: the fixture really is in_call with a live attempt before the worker dies',
+    v_state = 'in_call', 'state=' || v_state);
+
+  -- The worker dies here. Nothing heartbeats.
+  perform screening_v2.reclaim_phone_attempt_leases(50, v_t + interval '10 minutes');
+
+  select e.state, e.terminal_at, e.no_answer_attempts, e.reconnects_used, e.provider_failures,
+         a.state
+    into v_state, v_term, v_na, v_rc, v_pf, v_astate
+    from screening_v2.phone_engagements e
+    join screening_v2.phone_call_attempts a on a.id = v_att
+   where e.id = v_eng;
+  perform _policy_tests.assert(
+    '0042: a lease that expires mid-conversation abandons the attempt and frees the engagement',
+    v_astate = 'abandoned' and v_state = 'eligible' and v_term is null
+      and v_na = 0 and v_rc = 0 and v_pf = 0,
+    'an engagement stranded in_call with no live attempt has no edge out and no event that '
+      || 'can send one — the PR #70 wedge; attempt=' || v_astate || ' engagement=' || v_state
+      || ' budgets=' || v_na || '/' || v_rc || '/' || v_pf);
+
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'no_answer_retry', null, 60,
+                                            v_t + interval '1 day');
+  perform _policy_tests.assert(
+    '0042: and it is genuinely re-admissible on the next IST day',
+    v_res->>'status' = 'ok', coalesce(v_res::text, '<null>'));
+end;
+$$;
+
+-- The reclaim audit row reports what HAPPENED, not what was intended.
+do $$
+declare
+  v_eng uuid; v_res jsonb; v_att uuid; v_t timestamptz := '2026-08-24T06:00:00Z';
+  v_meta jsonb;
+begin
+  v_eng := _policy_tests.phone_fixture('pol42-reclaim-audit');
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid;
+  -- Terminalise the engagement out from under the live attempt, which is
+  -- what an emergency stop does.
+  perform screening_v2.apply_phone_event('internal','emergency.stop',
+            v_att, null, null, null, null, v_t + interval '1 minute');
+  update screening_v2.phone_call_attempts
+     set state = 'admitted', ended_at = null where id = v_att;
+
+  perform screening_v2.reclaim_phone_attempt_leases(50, v_t + interval '10 minutes');
+  select metadata into v_meta from screening_v2.audit_events
+   where action = 'phone_attempt_ended' and target_id = v_att::text;
+  perform _policy_tests.assert(
+    '0042: reclaiming a terminal engagement''s attempt audits restored=false, not a fiction',
+    (v_meta->>'restored')::boolean is false and v_meta->>'restored_state' is null
+      and (v_meta->>'budget_charged')::boolean is false,
+    'an audit row that claims a restoration that never happened sends an operator '
+      || 'looking in the wrong place; metadata=' || coalesce(v_meta::text, '<null>'));
+end;
+$$;
+
+-- ── B15: the calendar works from every state it claims to ─────────────
+do $$
+declare
+  v_eng uuid; v_res jsonb; v_state text; v_bad text := '';
+  v_t timestamptz := '2026-08-24T06:00:00Z';
+  v_slot timestamptz := '2026-08-25T09:00:00Z';   -- 14:30 IST
+  v_states text[] := array['eligible','awaiting_retry','in_call','reconnecting'];
+  v_s text; v_i integer := 0;
+begin
+  foreach v_s in array v_states loop
+    v_i := v_i + 1;
+    v_eng := _policy_tests.phone_fixture('pol42-cal-' || v_i);
+    -- Reach the state through legal edges only, so the test proves the
+    -- machine allows it rather than that a direct write does.
+    if v_s = 'awaiting_retry' then
+      update screening_v2.phone_engagements set state = 'dialing'  where id = v_eng;
+      update screening_v2.phone_engagements set state = 'awaiting_retry' where id = v_eng;
+    elsif v_s = 'in_call' then
+      update screening_v2.phone_engagements set state = 'dialing' where id = v_eng;
+      update screening_v2.phone_engagements set state = 'in_call' where id = v_eng;
+    elsif v_s = 'reconnecting' then
+      update screening_v2.phone_engagements set state = 'dialing' where id = v_eng;
+      update screening_v2.phone_engagements set state = 'reconnecting' where id = v_eng;
+    end if;
+
+    v_res := screening_v2.schedule_phone_appointment(
+               v_eng, v_slot, v_slot + interval '30 minutes', 'hr_manual',
+               '00000000-0000-4000-8000-0000000000ad', null, v_t);
+    select state into v_state from screening_v2.phone_engagements where id = v_eng;
+    if v_res->>'status' <> 'ok' or v_state <> 'scheduled' then
+      v_bad := v_bad || v_s || '=' || (v_res->>'status') || '/' || v_state || ' ';
+    end if;
+  end loop;
+
+  perform _policy_tests.assert(
+    '0042: a callback can be booked from every non-terminal state the RPC claims to accept',
+    v_bad = '',
+    'booking a callback after a missed call is the most ordinary use of this calendar, and '
+      || 'a transition the trigger rejects turns it into an unhandled exception: ' || v_bad);
+end;
+$$;
+
+-- ── B16: the window is defined ONCE, and the two definitions agree ────
+do $$
+declare
+  v_offsets interval[] := array[
+    interval '0 hours', interval '3 hours', interval '4 hours', interval '6 hours',
+    interval '9 hours', interval '14 hours', interval '15 hours', interval '18 hours',
+    interval '21 hours', interval '23 hours'];
+  v_o interval; v_at timestamptz; v_next timestamptz; v_bad text := '';
+begin
+  foreach v_o in array v_offsets loop
+    v_at   := timestamptz '2026-08-24T00:00:00Z' + v_o;
+    v_next := screening_v2.phone_next_window_open(v_at);
+    if not screening_v2.phone_ist_window_open(v_next) then
+      v_bad := v_bad || v_at::text || '->' || v_next::text || ' ';
+    end if;
+    if v_next < v_at then
+      v_bad := v_bad || 'backwards@' || v_at::text || ' ';
+    end if;
+  end loop;
+  perform _policy_tests.assert(
+    '0042: the next legal instant is ALWAYS inside the window, and never in the past',
+    v_bad = '',
+    'when the open time is written down twice, narrowing the gate makes the deferral '
+      || 'return an instant the appointment trigger then rejects — and the webhook that '
+      || 'triggered it is retried for ever: ' || v_bad);
+end;
+$$;
+
+select _policy_tests.assert(
+  '0042: the window bounds and the fleet cap each have exactly one definition',
+  -- The helpers exist, and no OTHER phone function inlines the literals
+  -- or the number they return.
+  screening_v2.phone_ist_window_open_at() = time '09:00:00'
+  and screening_v2.phone_ist_window_close_at() = time '21:00:00'
+  and screening_v2.phone_max_concurrent() = 10
+  and not exists (
+    select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname in ('phone_ist_window_open','phone_next_window_open',
+                         'admit_phone_attempt','apply_phone_event','phone_backlog',
+                         'schedule_phone_appointment')
+       and (_policy_tests.fn_body(p.proname) ~ '''09:00:00'''
+         or _policy_tests.fn_body(p.proname) ~ '''21:00:00''')),
+  'a bound written down twice is a bound that will drift');
+
+-- ── B17: the ingress ledger cannot be used to smuggle in a payload ────
+do $$
+declare
+  v_eng uuid; v_res jsonb; v_stored jsonb; v_ok boolean;
+  v_t timestamptz := '2026-08-24T06:00:00Z';
+begin
+  -- Started in pending_prereqs so `prereq.satisfied` is a mapped edge and
+  -- the event below is genuinely APPLIED — the point is that a dropped
+  -- payload does not cost the event its verdict.
+  v_eng := _policy_tests.phone_fixture('pol42-meta', 'pending_prereqs');
+
+  v_res := screening_v2.apply_phone_event(
+             'livekit_webhook', 'prereq.satisfied', null, v_eng, 'pol42-meta-raw', null,
+             jsonb_build_object('from', '+919000000099',
+                                'sip_uri', 'sip:x@provider.example/abc',
+                                'error', 'Call failed: no route to host'),
+             v_t);
+  select metadata into v_stored from screening_v2.phone_call_events
+   where id = (v_res->>'event_id')::uuid;
+  perform _policy_tests.assert(
+    '0042: a raw provider envelope is DROPPED rather than persisted, and the event survives',
+    v_res->>'status' = 'applied'
+      and v_stored = jsonb_build_object('metadata_rejected', true),
+    'phone_call_events is append-only: a number written here could only be removed '
+      || 'through the erasure hatch; stored=' || coalesce(v_stored::text, '<null>'));
+
+  v_res := screening_v2.apply_phone_event(
+             'livekit_webhook', 'prereq.lost', null, v_eng, 'pol42-meta-clean', null,
+             jsonb_build_object('reason_code', 'no_route', 'attempt_seq', 2, 'retryable', true),
+             v_t);
+  select metadata into v_stored from screening_v2.phone_call_events
+   where id = (v_res->>'event_id')::uuid;
+  perform _policy_tests.assert(
+    '0042: sanitized metadata is kept verbatim, so the drop is not a blunt instrument',
+    v_stored = jsonb_build_object('reason_code', 'no_route', 'attempt_seq', 2,
+                                  'retryable', true),
+    'stored=' || coalesce(v_stored::text, '<null>'));
+
+  begin
+    insert into screening_v2.phone_call_events
+      (source, provider_event_id, engagement_id, event_type, applied, metadata)
+    values ('internal', 'pol42-meta-direct', v_eng, 'prereq.satisfied', true,
+            jsonb_build_object('from', '+919000000099'));
+    v_ok := false;
+  exception when check_violation then v_ok := true; end;
+  perform _policy_tests.assert(
+    '0042: a DIRECT write of an unsanitized metadata payload is rejected by CHECK',
+    v_ok, 'the RPC is not the only writer; the column must hold the line itself');
+end;
+$$;
+
+select _policy_tests.assert(
+  '0042: no ledger row anywhere in this suite carries a number, an address or a URL',
+  not exists (
+    select 1 from screening_v2.phone_call_events
+     where metadata is not null
+       and metadata::text ~ '(\+[0-9]{6,}|@|//|\shttp)'),
+  'the append-only ledger is the one place an unsanitized write could never be undone');
+
+-- ── B18: fencing is not optional ──────────────────────────────────────
+do $$
+declare
+  v_eng uuid; v_res jsonb; v_att uuid; v_rc integer;
+  v_t timestamptz := '2026-08-24T06:00:00Z';
+begin
+  v_eng := _policy_tests.phone_fixture('pol42-fence');
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid;
+  perform screening_v2.apply_phone_event('livekit_webhook','sip.participant_joined',
+            v_att, null, 'pol42-fence-join', null, null, v_t);
+  perform screening_v2.apply_phone_event('internal','classify.human',
+            v_att, null, null, null, null, v_t);
+  perform screening_v2.apply_phone_event('internal','disclosure.delivered',
+            v_att, null, null, null, null, v_t);
+
+  -- A callback from the SUPERSEDED conversation that carries no epoch at
+  -- all. If the fence only applies when the caller volunteers an epoch,
+  -- this charges a reconnect against a call that is still up.
+  update screening_v2.phone_engagements set epoch = epoch + 1 where id = v_eng;
+  v_res := screening_v2.apply_phone_event('livekit_webhook','sip.participant_left',
+            v_att, null, 'pol42-fence-late', null, null, v_t + interval '1 minute');
+  select reconnects_used into v_rc from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0042: a late callback with NO epoch is fenced against the attempt''s own epoch',
+    v_res->>'ignored_reason' = 'stale_epoch' and v_rc = 0,
+    'a fence the caller can skip by omitting a field is not a fence; got '
+      || v_res::text || ' reconnects=' || v_rc);
+end;
+$$;
+
+-- ── Teardown: the phone fixtures leave the database as they found it ──
+-- The GOV-06 synthetic-seed suite asserts GLOBAL cardinality on
+-- screening_v2.candidates and screening_v2.consent_records, so a fixture
+-- left behind here fails a test three sections away with a message that
+-- points nowhere near the cause. audit_events and phone_call_events are
+-- append-only by design; the events are removed through the same
+-- documented SET LOCAL hatch an erasure request would use, and the audit
+-- trail is deliberately left intact.
+do $$
+declare v_engs uuid[]; v_links uuid[]; v_cands uuid[];
+begin
+  select coalesce(array_agg(id), '{}') into v_cands
+    from screening_v2.candidates where email like 'pol42-%@example.test';
+  select coalesce(array_agg(id), '{}') into v_links
+    from screening_v2.ashby_application_links where external_application_id like 'pol42-%-app';
+  select coalesce(array_agg(id), '{}') into v_engs
+    from screening_v2.phone_engagements where application_link_id = any(v_links);
+
+  perform set_config('app.allow_phone_event_mutation', 'true', true);
+  delete from screening_v2.phone_call_events
+   where engagement_id = any(v_engs)
+      or attempt_id in (select id from screening_v2.phone_call_attempts
+                         where engagement_id = any(v_engs));
+  perform set_config('app.allow_phone_event_mutation', 'false', true);
+
+  delete from screening_v2.job_queue
+   where dedup_key in (select 'phone.dial:' || id::text
+                         from screening_v2.phone_call_attempts
+                        where engagement_id = any(v_engs));
+  delete from screening_v2.phone_call_attempts where engagement_id = any(v_engs);
+  delete from screening_v2.phone_appointments  where engagement_id = any(v_engs);
+  delete from screening_v2.phone_engagements   where id = any(v_engs);
+  delete from screening_v2.ashby_resume_ingestions where application_link_id = any(v_links);
+  delete from screening_v2.ashby_operations        where application_link_id = any(v_links);
+  delete from screening_v2.ashby_application_links where id = any(v_links);
+  delete from screening_v2.ashby_job_mappings where external_job_id like 'pol42-%-job';
+  delete from screening_v2.phone_suppressions
+   where phone_sha256 in (select screening_v2.sha256_hex(phone_e164)
+                            from screening_v2.candidates
+                           where id = any(v_cands) and phone_e164 is not null);
+  delete from screening_v2.consent_records where candidate_id = any(v_cands);
+  delete from screening_v2.candidates where id = any(v_cands);
+end;
+$$;
+
+select _policy_tests.assert(
+  '0042: the phone fixtures left no candidate, consent record, engagement or live job behind',
+  not exists (select 1 from screening_v2.candidates where email like 'pol42-%@example.test')
+  and not exists (select 1 from screening_v2.phone_engagements)
+  and not exists (select 1 from screening_v2.job_queue where name = 'phone.dial'),
+  'a leaked fixture fails the GOV-06 cardinality suite three sections later, '
+    || 'with a message that points nowhere near the cause');
+
+select _policy_tests.assert(
+  '0042: the phone control singleton is present and NOT halted after the suite',
+  (select count(*) from screening_v2.phone_control where control_key = 'default') = 1
+  and (select halted_at is null from screening_v2.phone_control where control_key = 'default'),
+  'the halt tests must never leave the kill switch engaged for the races that follow');
+
+-- ═══════════════════════════════════════════════════════════════════════
 -- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)
 -- ═══════════════════════════════════════════════════════════════════════
 
