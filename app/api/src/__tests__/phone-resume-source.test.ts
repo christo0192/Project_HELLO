@@ -572,7 +572,10 @@ describe('structural boundaries of this change', () => {
     // a phone value passes one into a logger or audit call.
     let scanned = 0;
     for (const f of ['routes/resumes.ts', 'routes/candidates.ts', 'routes/ashby-review.ts',
-      'integrations/ashby/runtime-workers.ts', 'lib/candidate-phone.ts']) {
+      'integrations/ashby/runtime-workers.ts', 'lib/candidate-phone.ts',
+      // The two paths added when model structuring was wired in. The first
+      // HOLDS the full resume text; the second is where it is handed over.
+      'lib/resume-structurer.ts', 'integrations/ashby/runtime.ts']) {
       const src = read(f);
       const calls = src.match(/(?:Logger|logger)\.(?:info|warn|error|debug)\([^)]*\)|recordAudit\([^)]*\)|recordGovernanceAudit\(\{[^}]*\}/g) ?? [];
       scanned += calls.length;
@@ -615,15 +618,27 @@ describe('structural boundaries of this change', () => {
     expect(derive).not.toContain('await client.');
   });
 
-  it('the Ashby structurer is NOT on the dialable allowlist', () => {
-    // The live import path therefore produces `phone_e164 = null,
-    // phone_valid = false` on every candidate, which is exactly the shape
-    // 0042's admission refuses. Stated as an assertion so that wiring a model
-    // structurer into the Ashby path is a deliberate, visible decision.
+  it('the DETERMINISTIC Ashby tag is not on the dialable allowlist', () => {
+    // Narrow by design: this asserts one constant, and nothing about the live
+    // path. An earlier version of this test claimed to be the tripwire for
+    // "the Ashby path can never dial", and it stayed GREEN when the model tier
+    // was wired — because the constant it checks never changed. A safety
+    // assertion that cannot fail when the thing it guards changes is worse
+    // than no assertion, so the live-path claim was moved to a test that
+    // drives the real parse port (`phone-model-structurer.test.ts`).
     const runtime = read('integrations/ashby/runtime.ts');
     const tag = runtime.match(/ASHBY_STRUCTURER_VERSION = '([^']+)'/)?.[1];
     expect(tag).toBeTruthy();
     expect(isDialableStructurer(tag!)).toBe(false);
+  });
+
+  it('a merged result whose phone came from the regex is refused', () => {
+    // The suffix guard is what stops a merge from laundering a digit-run false
+    // positive into a call: the rest of the row can be entirely model-authored
+    // and the phone still is not.
+    expect(isDialableStructurer(`${MODEL_STRUCTURER_VERSION}+fallback`)).toBe(false);
+    expect(deriveCandidatePhone('9876543210', `${MODEL_STRUCTURER_VERSION}+fallback`))
+      .toEqual({ raw: '9876543210', e164: null, valid: false });
   });
 
   it('the candidate write sites fail closed when no decision was supplied', () => {

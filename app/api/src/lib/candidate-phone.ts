@@ -59,10 +59,27 @@ import { normalizePhone } from './phone.js';
 export const STRICT_IN_MOBILE_E164 = /^\+91[6-9][0-9]{9}$/;
 
 /**
- * Structurer version tag for the model extraction in `routes/resumes.ts`.
- * Recorded as provenance, never as PII.
+ * Structurer version tag for the bounded MODEL extraction shared by
+ * `routes/resumes.ts` and the Ashby ingestion port. Recorded as provenance,
+ * never as PII.
+ *
+ * ── WHY THIS TAG NAMES NO VENDOR ────────────────────────────────────────────
+ *
+ * It is deliberately `model-extraction-1` and not a provider name. `lib/claude.ts`
+ * exports `runClaudeJSON`, but that export is a COMPATIBILITY ALIAS that has
+ * already been repointed at the DeepSeek HTTP runner — its own header says so —
+ * and every caller kept the Claude-shaped name without noticing. A provenance
+ * tag that said `claude-…` would therefore be describing a model that does not
+ * run.
+ *
+ * That is not a cosmetic problem here. This tag is what decides whether a
+ * number may be DIALED, so it has to describe the contract it actually
+ * asserts: "produced by the shared bounded model runner, through
+ * `buildExtractionPrompt`, and shape-validated by
+ * `lib/resume-structurer.ts`". That statement stays true across a runner swap;
+ * a vendor name would silently stop being true, exactly as it already did once.
  */
-export const MODEL_STRUCTURER_VERSION = 'claude-extraction-1';
+export const MODEL_STRUCTURER_VERSION = 'model-extraction-1';
 
 /**
  * Structurer version tag for the deterministic regex rescue path.

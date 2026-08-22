@@ -16,8 +16,7 @@
 import { Router } from 'express';
 import multer from 'multer';
 import { supabase, RESUME_BUCKET } from '../lib/supabase.js';
-import { runClaudeJSON } from '../lib/claude.js';
-import { buildExtractionPrompt } from '../lib/prompts.js';
+import { structureResumeWithModel } from '../lib/resume-structurer.js';
 import {
   deriveCandidatePhone,
   toCandidateColumns,
@@ -221,8 +220,28 @@ export function createResumesRouter(deps: ResumesRouterDeps = {}): Router {
         // distinction is what decides whether the number may be dialed.
         let parsed: ParsedResume;
         let structurerVersion = MODEL_STRUCTURER_VERSION;
+        // `structureResumeWithModel` never throws — it returns null for a
+        // provider outage, an open breaker, a timeout, unparseable output OR a
+        // malformed shape. The `try` remains only for the storage cleanup that
+        // the fallback branch performs; the null is what selects the branch.
+        //
+        // This replaced a bare `runClaudeJSON<ParsedResume>(...)`, which was a
+        // CAST and not a check. A model answering `{"phone": 9876543210}` — a
+        // number, an entirely ordinary thing for a model to emit — reached
+        // `normalizePhone`, whose first act is `raw.trim()`, and threw a
+        // TypeError on a value that was never a phone number. Both structuring
+        // paths now share one validator.
         try {
-          parsed = await runClaudeJSON<ParsedResume>(buildExtractionPrompt(text));
+          const modelled = await structureResumeWithModel(text);
+          // A model answering `{}` — or an unrelated object — coerces to an
+          // all-null result, which is NOT a parse. Without this check the
+          // candidate would be created empty AND carry the dialable tag. The
+          // Ashby path applies the same predicate via `usefulStructured`; both
+          // structuring paths now agree on what "the model answered" means.
+          if (!modelled || !hasUsefulFallbackResume(modelled)) {
+            throw new Error('model_structuring_unavailable');
+          }
+          parsed = modelled;
         } catch (err) {
           // LLM structuring failure should not block an otherwise safe/readable
           // resume. Fall back to deterministic extraction from the already

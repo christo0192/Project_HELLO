@@ -311,6 +311,7 @@ describe('GET /api/integrations/ashby/review/:id — the second reader of the sa
     expect(res.status).toBe(200);
     expectRedactedCandidate(res.body.candidate);
   });
+
 });
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -364,6 +365,42 @@ describe('POST /api/resumes — the upload response', () => {
     // The uploader is still told whether what they just submitted is dialable.
     expect(res.body.phone.valid).toBe(true);
     expectRedactedCandidate(res.body.candidate);
+  });
+
+  it('an EMPTY model answer falls back to the deterministic extractor', async () => {
+    // A model answering `{}` — or any unrelated object — coerces to an
+    // all-null-but-non-null result. Accepting it would create an empty
+    // candidate carrying the DIALABLE provenance tag, because "the model
+    // answered" would be true while nothing was actually extracted. The Ashby
+    // path guards this with `usefulStructured`; this asserts the upload path
+    // applies the same rule rather than a weaker one.
+    const claude = await import('../lib/claude.js');
+    const runner = claude.runClaudeJSON as unknown as ReturnType<typeof vi.fn>;
+    runner.mockResolvedValueOnce({});
+    seed();
+
+    const res = await request(appFor(admin))
+      .post('/api/resumes')
+      .set('Authorization', AUTH)
+      .attach(
+        'file',
+        Buffer.from('Grace Hopper\ngrace@example.invalid\nMobile 98765 43210\nCompiler pioneer.'),
+        'resume.txt',
+      );
+
+    expect(res.status).toBe(201);
+    // `res.body.phone` is computed BY THE ROUTE, not echoed from a mocked
+    // insert, so it is the only carrier here that distinguishes the branches.
+    //
+    //   guard present → the deterministic extractor ran, found the number in
+    //                   the text, and `phone_raw` carries it.
+    //   guard absent  → the empty model answer was accepted, `parsed.phone` is
+    //                   null, and `phone_raw` is null too.
+    expect(res.body.phone.raw).toBeTruthy();
+    expect(res.body.phone.raw).toContain('98765');
+    // Rescued by the regex, so NOT dialable regardless.
+    expect(res.body.phone.e164).toBeNull();
+    expect(res.body.phone.valid).toBe(false);
   });
 });
 
