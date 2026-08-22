@@ -30,6 +30,7 @@
  * returned, stored or embedded in an error. Failures are closed vocabulary.
  */
 
+import { APPROVED_PARTICIPANT_ATTRIBUTES } from './events.js';
 import type { LiveKitPhoneEnvelope } from './events.js';
 
 /**
@@ -85,10 +86,40 @@ export interface CreateVerifierOptions {
 }
 
 /**
+ * Reduce a participant's attribute map to the APPROVED KEYS ONLY.
+ *
+ * LiveKit populates SIP participants with `sip.phoneNumber`,
+ * `sip.trunkPhoneNumber` and `sip.callID` automatically, so the raw map is a
+ * subscriber number one property access away. The reduction happens HERE, at
+ * the trust boundary, rather than one module inward: `events.ts` also gates
+ * reads through the same allowlist, but a map that never enters the envelope
+ * cannot be read by anything at all — including a future caller that reaches
+ * for `envelope.participantAttributes` directly without knowing the rule.
+ *
+ * Indexed by exact key. The map is never enumerated, so an attribute LiveKit
+ * adds in a future release is dropped by default rather than admitted by it.
+ */
+function approvedAttributesOnly(
+  attributes: Record<string, string> | undefined,
+): Readonly<Record<string, string>> | null {
+  if (attributes === null || attributes === undefined || typeof attributes !== 'object') {
+    return null;
+  }
+  const projected: Record<string, string> = {};
+  for (const key of APPROVED_PARTICIPANT_ATTRIBUTES) {
+    const value = (attributes as Record<string, unknown>)[key];
+    if (typeof value === 'string') projected[key] = value;
+  }
+  return projected;
+}
+
+/**
  * Project the SDK's `WebhookEvent` onto the narrow envelope this integration
  * reads. Everything not named here — room metadata, tracks, egress info, the
- * automatically-populated `sip.*` attributes — is dropped at the boundary
- * rather than carried inward and filtered later.
+ * participant's name and every unapproved attribute including the
+ * automatically-populated `sip.*` ones — is dropped AT THE BOUNDARY rather
+ * than carried inward and filtered later. That sentence is literal: the raw
+ * attribute map does not survive this function.
  */
 function toEnvelope(event: {
   event?: string;
@@ -100,7 +131,7 @@ function toEnvelope(event: {
     id: typeof event.id === 'string' ? event.id : null,
     participantIdentity:
       typeof event.participant?.identity === 'string' ? event.participant.identity : null,
-    participantAttributes: event.participant?.attributes ?? null,
+    participantAttributes: approvedAttributesOnly(event.participant?.attributes),
   };
 }
 

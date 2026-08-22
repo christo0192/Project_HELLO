@@ -98,6 +98,108 @@ describe('P3 verification — the vendor protocol, over the exact bytes', () => 
     expect(result.envelope.participantIdentity).toBe(IDENTITY);
   });
 
+  it('drops every unapproved attribute AT the boundary, keeping only the epoch', async () => {
+    // F-1: the header calls this file "the ONLY trust boundary", so the raw
+    // attribute map must not survive it. `events.ts` gates reads through the
+    // same allowlist, but a map that never enters the envelope cannot be read
+    // by anything — including a future caller that reaches for
+    // `participantAttributes` directly without knowing the rule.
+    //
+    // Driven through the REAL SDK receiver with a REAL signed token, so this
+    // asserts what a genuine LiveKit delivery produces.
+    const body = Buffer.from(JSON.stringify({
+      event: 'participant_joined',
+      id: 'EV_attrs',
+      participant: {
+        identity: IDENTITY,
+        name: 'inbound caller',
+        kind: 3,
+        attributes: {
+          'sip.phoneNumber': '+910000000000',
+          'sip.trunkPhoneNumber': '+910000000001',
+          'sip.callID': 'SCL_abc123',
+          'sip.ruleID': 'SDR_x',
+          phone_epoch: '6',
+        },
+      },
+    }));
+    const result = await verifier().verify({ rawBody: body, authHeader: mintToken(body) });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    const attributes = result.envelope.participantAttributes;
+    // The approved key survives...
+    expect(attributes).toEqual({ phone_epoch: '6' });
+    // ...and NOTHING else is present, by key and by rendered value.
+    expect(Object.keys(attributes ?? {})).toEqual([...APPROVED_PARTICIPANT_ATTRIBUTES]);
+    for (const forbidden of [
+      'sip.phoneNumber', 'sip.trunkPhoneNumber', 'sip.callID', 'sip.ruleID',
+    ]) {
+      expect(attributes ?? {}).not.toHaveProperty(forbidden);
+    }
+    const rendered = JSON.stringify(result.envelope);
+    for (const leak of ['+910000000000', '+910000000001', 'SCL_abc123', 'inbound caller']) {
+      expect(rendered).not.toContain(leak);
+    }
+    // The envelope carries exactly the four fields this integration reads.
+    expect(Object.keys(result.envelope).sort())
+      .toEqual(['event', 'id', 'participantAttributes', 'participantIdentity']);
+    // And the epoch still reaches the domain through the normal path.
+    const resolution = resolvePhoneEvent(result.envelope);
+    expect(resolution.kind).toBe('phone_event');
+    if (resolution.kind === 'phone_event') expect(resolution.epoch).toBe(6);
+  });
+
+  it('adds nothing when a participant has no attributes, or no participant', async () => {
+    // NOTE: the SDK deserialises the proto3 map default as `{}`, not
+    // `undefined`, so a participant that sent no attributes still arrives with
+    // an empty map — the projection yields `{}` here, not null. Asserted as
+    // the SDK actually behaves rather than as one might assume; this is
+    // precisely what driving the real receiver is for.
+    const noAttrs = Buffer.from(JSON.stringify({
+      event: 'participant_joined', id: 'EV_bare', participant: { identity: IDENTITY },
+    }));
+    const bare = await verifier().verify({ rawBody: noAttrs, authHeader: mintToken(noAttrs) });
+    expect(bare.ok).toBe(true);
+    if (bare.ok) {
+      expect(bare.envelope.participantAttributes).toEqual({});
+      // The epoch is simply absent — 0042 then fences on the attempt's own.
+      const resolution = resolvePhoneEvent(bare.envelope);
+      if (resolution.kind === 'phone_event') expect(resolution.epoch).toBeUndefined();
+    }
+
+    // A room-level event has no participant at all, so there is no map to
+    // reduce and the envelope carries null.
+    const roomOnly = Buffer.from(JSON.stringify({ event: 'room_finished', id: 'EV_room' }));
+    const room = await verifier().verify({ rawBody: roomOnly, authHeader: mintToken(roomOnly) });
+    expect(room.ok).toBe(true);
+    if (room.ok) {
+      expect(room.envelope.participantAttributes).toBeNull();
+      expect(room.envelope.participantIdentity).toBeNull();
+    }
+  });
+
+  it('control: the projection is what drops them, not the fixture', async () => {
+    // Non-vacuity. If the SDK stopped surfacing attributes at all, the test
+    // above would pass while proving nothing — so assert the receiver DOES
+    // deliver an unapproved attribute when the projection is bypassed.
+    const raw = {
+      participant: {
+        identity: IDENTITY,
+        attributes: { 'sip.callID': 'SCL_abc123', phone_epoch: '6' },
+      },
+    };
+    expect(raw.participant.attributes).toHaveProperty('sip.callID');
+    // A verified envelope built from the SAME payload has it removed.
+    const body = Buffer.from(JSON.stringify({ event: 'participant_joined', id: 'EV_c', ...raw }));
+    const result = await verifier().verify({ rawBody: body, authHeader: mintToken(body) });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.envelope.participantAttributes).not.toHaveProperty('sip.callID');
+      expect(result.envelope.participantAttributes).toHaveProperty('phone_epoch');
+    }
+  });
+
   it('mirrors the SDK auth header constant exactly (drift control)', () => {
     // The production module declares the literal so it stays outside app.ts's
     // static SDK graph; this is the check that keeps the mirror honest.

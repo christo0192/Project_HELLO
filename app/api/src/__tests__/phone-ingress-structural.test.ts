@@ -185,6 +185,26 @@ describe('4. no phone number, attribute or provider payload can escape', () => {
     }
   });
 
+  it('the trust boundary itself projects attributes to the allowlist', () => {
+    // The raw attribute map must not survive `verify.ts`. `events.ts` gates
+    // reads through the same allowlist, but a map that never enters the
+    // envelope cannot be read by anything at all — including a future caller
+    // that reaches for `participantAttributes` directly.
+    const verify = code(MODULE_FILES.find((f) => f.name === 'verify.ts')!.source);
+    expect(verify).toContain('APPROVED_PARTICIPANT_ATTRIBUTES');
+    expect(verify, 'verify.ts copies the raw attribute map')
+      .not.toMatch(/participantAttributes:\s*event\.participant\?\.attributes/);
+    expect(verify, 'verify.ts spreads the raw attribute map')
+      .not.toMatch(/\.\.\.\s*(event\.participant\?\.)?attributes/);
+    // Indexed, never enumerated: an attribute a future SDK release adds is
+    // dropped by default rather than admitted by it.
+    for (const enumerate of [
+      'Object.keys(attributes', 'Object.entries(attributes', 'Object.values(attributes',
+    ]) {
+      expect(verify, `verify.ts enumerates attributes via ${enumerate}`).not.toContain(enumerate);
+    }
+  });
+
   it('the attribute reader indexes an allowlist and never enumerates', () => {
     const events = code(MODULE_FILES.find((f) => f.name === 'events.ts')!.source);
     // Enumerating the attribute map is how `sip.phoneNumber` would get in.

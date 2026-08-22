@@ -100,10 +100,15 @@ uuid>`, and 0042 constrains the column. The attempt is therefore recovered by
 > `participant.attributes` would carry the subscriber's number into every log
 > line, error and ledger row it touched.
 
-So attributes are read through a **closed allowlist of exactly one key** —
-`phone_epoch`, the fencing token — by exact name. The reader indexes the
-allowlist; it never enumerates the map. The room-reader port projects each
-participant to its identity alone at the boundary.
+So the attribute map is reduced to a **closed allowlist of exactly one key** —
+`phone_epoch`, the fencing token — **at the trust boundary itself**, inside
+`verify.ts`, before the envelope exists. The raw map does not survive
+verification, so nothing downstream can read an unapproved attribute even by
+reaching for `participantAttributes` directly. `events.ts` gates reads through
+the same allowlist as a second layer. Both index the allowlist by exact key and
+never enumerate the map, so an attribute a future SDK release adds is dropped
+by default rather than admitted by it. The room-reader port likewise projects
+each participant to its identity alone.
 
 ## Event mapping
 
