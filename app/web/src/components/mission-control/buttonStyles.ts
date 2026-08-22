@@ -11,7 +11,10 @@ export function buttonClassNames(
   extra?: string,
 ): string {
   return cx(
-    'inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors',
+    // `min-h-[44px]` is the WCAG 2.5.5 target floor. `px-4 py-2 text-sm`
+    // alone renders ~36px tall, which is below it on touch — and these are
+    // the confirm/cancel controls of every destructive action in the app.
+    'inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors',
     'focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-surface',
     'disabled:cursor-not-allowed disabled:opacity-60',
     variant === 'primary' &&

@@ -744,3 +744,218 @@ export interface AshbyMcActionResponse {
   cancelled_operations?: number;
   cancelled_ingestion?: number;
 }
+
+// ── P7: internal phone screening calendar (sanitized operator projection) ──
+//
+// These mirror the P6 `Phone*` schemas in app/api/openapi/openapi.yaml, which
+// are `additionalProperties: false` and contract-tested against the live
+// handlers. Two rules govern what may appear here, and both are enforced on
+// the server by OMISSION rather than redaction — the read never selects the
+// columns at all:
+//
+//   1. No provider or contact identifier is ever in this projection. No phone
+//      number in any form, no suppression digest, no SIP call id, no room
+//      name, no participant identity, no egress id, no lease token or owner,
+//      no provider event id, no provider metadata, no transcript.
+//   2. Every instant on the wire is a UTC ISO-8601 string ending in `Z`. The
+//      IST wall-clock fields that sit beside them (`ist_date`, `ist_start`,
+//      `ist_end`) are derived by a 0042 trigger, so no client re-derives the
+//      zone and no two clients can disagree about it.
+//
+// Adding a field to any interface below without the API returning it is a
+// silent lie to the operator, so these are kept in step with the OpenAPI
+// document rather than with what a component happens to want.
+
+/** Closed vocabulary of appointment statuses (0042). */
+export type PhoneAppointmentStatus =
+  | 'scheduled'
+  | 'confirmed'
+  | 'cancelled'
+  | 'superseded'
+  | 'fulfilled'
+  | 'missed';
+
+/** How an appointment came to exist. This UI only ever creates `hr_manual`. */
+export type PhoneAppointmentSource = 'candidate_voice' | 'hr_manual' | 'system_deferral';
+
+/** Closed vocabulary of engagement states (0042). Six of these are terminal. */
+export type PhoneEngagementState =
+  | 'pending_prereqs'
+  | 'eligible'
+  | 'scheduled'
+  | 'dialing'
+  | 'in_call'
+  | 'reconnecting'
+  | 'awaiting_retry'
+  | 'completed'
+  | 'abandoned_no_answer'
+  | 'opted_out'
+  | 'wrong_number'
+  | 'failed'
+  | 'cancelled';
+
+/**
+ * The cancel reasons an OPERATOR may give. Deliberately narrower than the
+ * 0042 vocabulary: `superseded` is written only by the scheduling RPC and
+ * `system_deferral_expired` only by the expiry sweep, so offering either here
+ * would let an operator write an audit trail that misdescribes what happened.
+ */
+export type PhoneOperatorCancelReason =
+  | 'candidate_request'
+  | 'hr_cancelled'
+  | 'emergency_stop'
+  | 'engagement_cancelled';
+
+/** The approved IST calling window, mirrored from the 0042 control row. */
+export interface PhoneWindow {
+  time_zone: string;
+  /** Inclusive open, IST wall clock. */
+  open_ist: string;
+  /** Exclusive close, IST wall clock. */
+  close_ist: string;
+}
+
+/**
+ * The candidate fields an operator calendar may show. Never an email address,
+ * never a phone number in any form, never resume content.
+ */
+export interface PhoneCandidateRef {
+  id: string;
+  /** Display name. Null when the candidate row carries none — never invented. */
+  name: string | null;
+  status: string;
+  /** ATS external reference, or null for a candidate that never came from an ATS. */
+  reference: string | null;
+}
+
+/** One calendar row: an appointment plus the engagement and candidate it belongs to. */
+export interface PhoneCalendarAppointment {
+  id: string;
+  engagement_id: string;
+  starts_at: string;
+  ends_at: string;
+  ist_date: string;
+  ist_start: string | null;
+  ist_end: string | null;
+  status: PhoneAppointmentStatus;
+  source: PhoneAppointmentSource;
+  /**
+   * ALWAYS null today — nothing in migration 0042 writes it. Surfaced rather
+   * than dropped so the published residual stays visible.
+   */
+  confirmed_at: string | null;
+  cancel_reason: string | null;
+  /** Optimistic-concurrency token. Required on reschedule and cancel. */
+  version: number;
+  created_at: string;
+  updated_at: string;
+  /** Null only on a torn read between the batched queries, never as a guess. */
+  engagement_state: PhoneEngagementState | null;
+  candidate: PhoneCandidateRef | null;
+}
+
+/** The half-open UTC range that was queried, echoed back verbatim. */
+export interface PhoneCalendarRange {
+  from: string;
+  to: string;
+}
+
+export interface PhoneCalendarResponse {
+  ok: boolean;
+  /** False while the feature flag is off; the list is then empty and no DB work ran. */
+  enabled: boolean;
+  range: PhoneCalendarRange;
+  window: PhoneWindow;
+  count: number;
+  /** True when the range held more than the 200-row cap. Rows are never dropped silently. */
+  truncated: boolean;
+  appointments: PhoneCalendarAppointment[];
+}
+
+/** Why a slot cannot be booked. A closed vocabulary, never free text. */
+export type PhoneSlotRefusal = 'slot_in_past' | 'at_projected_capacity';
+
+export interface PhoneSlot {
+  starts_at: string;
+  /** May fall after the IST close: the window bounds only the START. */
+  ends_at: string;
+  ist_start: string;
+  ist_end: string;
+  /** Live scheduled or confirmed appointments overlapping this slot. */
+  booked: number;
+  remaining: number;
+  /**
+   * True iff `refusals` is empty. ADVISORY, not a reservation — and when the
+   * response's `occupancy_truncated` is true this is OPTIMISTIC, because
+   * `booked` is then only a lower bound.
+   */
+  bookable: boolean;
+  refusals: PhoneSlotRefusal[];
+}
+
+export interface PhoneSlotsResponse {
+  ok: boolean;
+  enabled: boolean;
+  date: string;
+  window: PhoneWindow;
+  /** The grid step. NOT a schema guarantee — reported so it is not mistaken for one. */
+  slot_seconds: number;
+  /**
+   * The fleet cap mirrored from `phone_max_concurrent`. Null means UNKNOWN —
+   * it is null while the feature is disabled — and must never be rendered or
+   * treated as zero.
+   */
+  max_concurrent: number | null;
+  booked_total: number;
+  /**
+   * True when the IST day held more live appointments than the projection
+   * counted. `booked` is then a LOWER bound and `remaining` an UPPER one.
+   */
+  occupancy_truncated: boolean;
+  slots: PhoneSlot[];
+}
+
+// ── P7: phone appointment writes (admin only) ─────────────────────────
+
+/** `source` is deliberately absent: this route books `hr_manual` by definition. */
+export interface PhoneAppointmentCreateInput {
+  engagement_id: string;
+  starts_at: string;
+  ends_at: string;
+}
+
+/** `version` is REQUIRED — a version-free supersede is the lost update it exists to prevent. */
+export interface PhoneAppointmentPatchInput {
+  starts_at: string;
+  ends_at: string;
+  version: number;
+}
+
+export interface PhoneAppointmentCancelInput {
+  reason: PhoneOperatorCancelReason;
+  version: number;
+}
+
+export interface PhoneAppointmentWriteResponse {
+  ok: boolean;
+  appointment_id: string | null;
+  version: number | null;
+  engagement_state: string | null;
+  /**
+   * A SUCCESS with a warning: the slot is real and HR can see it, but the
+   * engagement's prerequisites are unmet, so nothing will dial it. Collapsing
+   * this into plain success would let an operator believe a call is going to
+   * happen at that time.
+   */
+  prereqs_pending: boolean;
+  /** Returned verbatim from the RPC — which row was ACTUALLY superseded. */
+  superseded_appointment_id: string | null;
+}
+
+export interface PhoneCancelResponse {
+  ok: boolean;
+  appointment_id: string;
+  version: number | null;
+  /** Idempotent success, not a conflict: a retry after a dropped response. */
+  already_cancelled: boolean;
+}

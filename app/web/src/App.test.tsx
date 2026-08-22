@@ -69,6 +69,9 @@ vi.mock('./pages/SessionDetailPage', () => ({
 vi.mock('./pages/MissionControlPage', () => ({
   MissionControlPage: () => <div data-testid="page-mission-control">Mission Control</div>,
 }));
+vi.mock('./pages/PhoneCalendarPage', () => ({
+  PhoneCalendarPage: () => <div data-testid="page-phone-calendar">Phone calendar</div>,
+}));
 
 function renderApp(initialEntry = '/dashboard') {
   // App owns its <BrowserRouter>; drive the URL through the history API.
@@ -97,6 +100,16 @@ function authedInterviewer() {
     needsMfa: false,
     factors: [],
     role: 'interviewer',
+  };
+}
+
+function authedViewer() {
+  mockAuth = {
+    isLoading: false,
+    isAuthenticated: true,
+    needsMfa: false,
+    factors: [],
+    role: 'viewer',
   };
 }
 
@@ -149,6 +162,45 @@ describe('App route wiring', () => {
     authedInterviewer();
     renderApp('/mission-control');
     expect(await screen.findByText('Access denied')).toBeInTheDocument();
+  });
+
+  /*
+    The phone calendar is authenticated but NOT role-gated at the route.
+    `ProtectedRoute`'s gate is exact equality, so `requireRole="admin"` would
+    lock out the interviewers the API is happy to serve, and there is no
+    "interviewer or above" gate to use instead. All three authenticated roles
+    therefore REACH the route, and the page itself tells them apart — which is
+    what lets a viewer be shown a truthful panel instead of a redirect, with
+    no phone request made. `PhoneCalendarPage.test.tsx` covers that gating.
+  */
+  it('renders the phone calendar at /phone-calendar for an admin', async () => {
+    renderApp('/phone-calendar');
+    expect(await screen.findByTestId('page-phone-calendar')).toBeInTheDocument();
+  });
+
+  it('renders the phone calendar at /phone-calendar for an interviewer', async () => {
+    authedInterviewer();
+    renderApp('/phone-calendar');
+    expect(await screen.findByTestId('page-phone-calendar')).toBeInTheDocument();
+  });
+
+  it('lets a viewer reach the route so the PAGE can gate them, not a redirect', async () => {
+    authedViewer();
+    renderApp('/phone-calendar');
+    expect(await screen.findByTestId('page-phone-calendar')).toBeInTheDocument();
+  });
+
+  it('sends an unauthenticated visitor to /login, like every protected route', async () => {
+    unauthenticated();
+    renderApp('/phone-calendar');
+    expect(await screen.findByText(/Recruiter sign-in/i)).toBeInTheDocument();
+    expect(screen.queryByTestId('page-phone-calendar')).not.toBeInTheDocument();
+  });
+
+  it('renders the phone calendar inside the app shell, with the nav', async () => {
+    renderApp('/phone-calendar');
+    await screen.findByTestId('page-phone-calendar');
+    expect(screen.getByRole('navigation', { name: 'Main navigation' })).toBeInTheDocument();
   });
 
   it('redirects unknown protected paths to /dashboard when authenticated', async () => {

@@ -137,6 +137,48 @@ export function MissionControlPage() {
         </span>
       </Link>
 
+      {/*
+        The phone calendar is a separate operator surface on its own route.
+        Like the Ashby card above this is a real <Link> — keyboard reachable,
+        focusable, and openable in a new tab — rendered ABOVE the section tabs
+        so it cannot disturb their state or their lazy mounting.
+
+        PERMISSIONS: `/phone-calendar` is authenticated but NOT admin-gated
+        (interviewers may read it; the page and the API both enforce that
+        writes are admin-only). Surfacing it here therefore grants nothing —
+        an admin could already reach it — and every admin reading this page
+        already has strictly more access than the link confers.
+
+        PALETTE: same rule as the card above. Every colour utility must
+        resolve to a key in `tailwind.config.js`; the ink scale's base is
+        `ink`, there is no `ink-primary`, and the focus ring is
+        `ring-brand-500`. The monogram is a neutral, decorative glyph drawn
+        from the page's own tokens — no external icon or logo is fetched.
+      */}
+      <Link
+        to="/phone-calendar"
+        className="mb-6 flex items-center gap-4 rounded-xl border border-line bg-surface p-5 shadow-card transition-colors hover:border-ink-tertiary focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 sm:mb-8 sm:p-6"
+      >
+        <span
+          aria-hidden="true"
+          className="flex h-10 w-10 flex-none items-center justify-center rounded-lg border border-line text-sm font-semibold text-ink-secondary"
+        >
+          PC
+        </span>
+        <span className="min-w-0">
+          <span className="block text-sm font-medium text-ink">
+            Phone calendar
+          </span>
+          <span className="mt-0.5 block text-xs text-ink-tertiary">
+            Internal phone screening schedule in India Standard Time — book,
+            reschedule and cancel calls inside the approved calling window.
+          </span>
+        </span>
+        <span aria-hidden="true" className="ml-auto hidden flex-none text-ink-tertiary sm:block">
+          &rarr;
+        </span>
+      </Link>
+
       <MissionControlSections
         ariaLabel="Mission Control sections"
         defaultId="overview"

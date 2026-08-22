@@ -12,6 +12,7 @@ export type { MobileMenuButtonProps } from './MobileMenuButton';
 export {
   ArrowLeftIcon,
   BriefcaseIcon,
+  CalendarIcon,
   CloseIcon,
   DashboardIcon,
   LogOutIcon,

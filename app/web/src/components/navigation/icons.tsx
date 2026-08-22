@@ -115,3 +115,22 @@ export function ArrowLeftIcon({ className }: IconProps) {
     </svg>
   );
 }
+
+/**
+ * Calendar — the phone screening schedule.
+ *
+ * Drawn from the same primitives as the rest of the set rather than fetched
+ * from an icon service: this app ships no external icon or logo requests, and
+ * a calendar is four strokes. It is decorative and `aria-hidden` like its
+ * siblings; the nav item's own text is the accessible name.
+ */
+export function CalendarIcon({ className }: IconProps) {
+  return (
+    <svg {...base(className)}>
+      <rect x="3" y="5" width="18" height="16" rx="2" />
+      <path d="M3 10h18" />
+      <path d="M8 3v4" />
+      <path d="M16 3v4" />
+    </svg>
+  );
+}

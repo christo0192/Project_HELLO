@@ -123,7 +123,44 @@ describe('Layout shell', () => {
     setAuth({ role: 'interviewer' });
     renderLayout();
     expect(screen.queryByRole('link', { name: /Mission Control/i })).not.toBeInTheDocument();
+  });
+
+  /*
+    The Operations GROUP is no longer admin-only, because the phone calendar
+    inside it is readable by interviewers — that is the API's rule
+    ("interviewer or above may read, admin may write"), and the nav mirrors
+    it. Mission Control's own visibility is unchanged and is still asserted
+    above: its route is `requireRole="admin"`, so offering an interviewer a
+    link that redirects to /unauthorized would be worse than not showing it.
+  */
+  it('renders Operations with the phone calendar for an interviewer, and no Mission Control', () => {
+    setAuth({ role: 'interviewer' });
+    renderLayout();
+    expect(screen.getByText('Operations')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Phone calendar/i })).toHaveAttribute(
+      'href',
+      '/phone-calendar',
+    );
+    expect(screen.queryByRole('link', { name: /Mission Control/i })).not.toBeInTheDocument();
+  });
+
+  it('renders the phone calendar alongside Mission Control for an admin', () => {
+    renderLayout();
+    const operations = screen.getByRole('group', { name: 'Operations' });
+    expect(
+      within(operations).getByRole('link', { name: /Mission Control/i }),
+    ).toBeInTheDocument();
+    expect(
+      within(operations).getByRole('link', { name: /Phone calendar/i }),
+    ).toBeInTheDocument();
+  });
+
+  it('shows a viewer no Operations group at all', () => {
+    setAuth({ role: 'viewer' });
+    renderLayout();
     expect(screen.queryByText('Operations')).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /Phone calendar/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /Mission Control/i })).not.toBeInTheDocument();
   });
 
   it('shows the API online status', async () => {

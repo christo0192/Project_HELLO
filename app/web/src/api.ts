@@ -65,6 +65,13 @@ import type {
   RecordingDownloadResponse,
   Role,
   RoleInput,
+  PhoneAppointmentCancelInput,
+  PhoneAppointmentCreateInput,
+  PhoneAppointmentPatchInput,
+  PhoneAppointmentWriteResponse,
+  PhoneCalendarResponse,
+  PhoneCancelResponse,
+  PhoneSlotsResponse,
   SessionDetail,
   StartLiveKitResult,
   StartScreeningResult,
@@ -467,4 +474,51 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({}),
     }),
+  // ── P7: internal phone screening calendar ────────────────────────
+  // Exact P6 contracts. Reads need interviewer or above; every mutation
+  // needs admin, and the API re-checks both on every request regardless of
+  // what this client sends.
+  //
+  // ABORT SIGNALS AND WHY THE CALLER STILL NEEDS A STALE LATCH:
+  // `signal` is forwarded into `fetch` through `init`. But `request` wraps
+  // EVERY fetch rejection — an abort included — into
+  // `ApiError('Could not reach the server…', 0)`, so an aborted request is
+  // indistinguishable from a genuine network failure by its error alone. A
+  // caller that renders errors must therefore keep its own "this effect is
+  // stale" latch and drop the result before inspecting it; the signal is
+  // only there to stop the request travelling, never to classify it.
+
+  getPhoneCalendar: (from: string, to: string, signal?: AbortSignal) =>
+    request<PhoneCalendarResponse>(
+      `/api/phone/calendar?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
+      { signal },
+    ),
+
+  getPhoneSlots: (date: string, signal?: AbortSignal) =>
+    request<PhoneSlotsResponse>(
+      `/api/phone/calendar/slots?date=${encodeURIComponent(date)}`,
+      { signal },
+    ),
+
+  createPhoneAppointment: (input: PhoneAppointmentCreateInput) =>
+    request<PhoneAppointmentWriteResponse>('/api/phone/appointments', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+
+  reschedulePhoneAppointment: (id: string, input: PhoneAppointmentPatchInput) =>
+    request<PhoneAppointmentWriteResponse>(
+      `/api/phone/appointments/${encodeURIComponent(id)}`,
+      { method: 'PATCH', body: JSON.stringify(input) },
+    ),
+
+  // DELETE carries a body here because the substrate requires BOTH the
+  // operator's reason and the optimistic-concurrency version, and neither
+  // belongs in a URL: the reason is audit content and the version is a
+  // precondition, not an address.
+  cancelPhoneAppointment: (id: string, input: PhoneAppointmentCancelInput) =>
+    request<PhoneCancelResponse>(
+      `/api/phone/appointments/${encodeURIComponent(id)}`,
+      { method: 'DELETE', body: JSON.stringify(input) },
+    ),
 };

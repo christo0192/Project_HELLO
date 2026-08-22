@@ -343,3 +343,103 @@ describe('Ashby Mission Control navigation card', () => {
     expect(screen.queryByRole('link', { name: /Ashby Mission Control/i })).toBeNull();
   });
 });
+
+/**
+ * The phone calendar card. Mirrors the Ashby card's contract above — a real
+ * internal link, keyboard reachable, adding no request — and additionally
+ * asserts that adding it did not disturb the card or the tabs that were
+ * already there.
+ */
+describe('Phone calendar navigation card', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    chartStubs();
+    forceLightMode();
+    apiFns.getMe.mockResolvedValue(ADMIN_ME);
+    apiFns.status.mockResolvedValue(OK_STATUS);
+    apiFns.listAdminSessions.mockResolvedValue({ sessions: [] });
+    apiFns.listAdminAllowlist.mockResolvedValue({ entries: [] });
+  });
+  afterEach(() => { vi.clearAllMocks(); });
+
+  const renderAdmin = () =>
+    render(
+      <MemoryRouter>
+        <ThemeProvider>
+          <MissionControlPage />
+        </ThemeProvider>
+      </MemoryRouter>,
+    );
+
+  const findCard = () => screen.findByRole('link', { name: /Phone calendar/i });
+
+  it('is a visible LINK with an accessible name containing "Phone calendar"', async () => {
+    renderAdmin();
+    expect(await findCard()).toBeVisible();
+  });
+
+  it('points at the internal route and nothing external', async () => {
+    renderAdmin();
+    const link = await findCard();
+
+    expect(link).toHaveAttribute('href', '/phone-calendar');
+    const href = link.getAttribute('href') ?? '';
+    expect(href.startsWith('/')).toBe(true);
+    expect(href).not.toMatch(/^https?:/);
+    expect(href).not.toMatch(/^\/\//);
+    expect(link).not.toHaveAttribute('target');
+    expect(link).not.toHaveAttribute('rel');
+    expect(link).not.toHaveAttribute('download');
+  });
+
+  it('is keyboard reachable — a real anchor, focusable without a tabindex hack', async () => {
+    renderAdmin();
+    const link = await findCard();
+    expect(link.tagName).toBe('A');
+    expect(link).not.toHaveAttribute('tabindex');
+    link.focus();
+    expect(link).toHaveFocus();
+  });
+
+  it('adds NO network request of its own', async () => {
+    renderAdmin();
+    const link = await findCard();
+    const before = Object.values(apiFns).reduce((n, fn) => n + fn.mock.calls.length, 0);
+    link.focus();
+    fireEvent.mouseOver(link);
+    const after = Object.values(apiFns).reduce((n, fn) => n + fn.mock.calls.length, 0);
+    expect(after).toBe(before);
+  });
+
+  it('gives the focus ring a real colour, matching its siblings', async () => {
+    renderAdmin();
+    const link = await findCard();
+    expect(link.className).toContain('focus-visible:ring-2');
+    expect(link.className).toContain('focus-visible:ring-brand-500');
+    expect(link.className).not.toContain('ink-primary');
+  });
+
+  it('leaves the Ashby card and every existing section tab in place', async () => {
+    renderAdmin();
+    await findCard();
+
+    // The card that was already here is untouched.
+    expect(
+      await screen.findByRole('link', { name: /Ashby Mission Control/i }),
+    ).toHaveAttribute('href', '/ashby-mission-control');
+
+    // And the tabs, whose lazy mounting the cards must not disturb.
+    for (const label of ['Overview', 'Access', 'Sessions', 'Quotas', 'Audit', 'Maintenance']) {
+      expect(screen.getByRole('tab', { name: label })).toBeInTheDocument();
+    }
+  });
+
+  it('renders above the tablist, so it cannot disturb tab state', async () => {
+    renderAdmin();
+    const link = await findCard();
+    const tablist = await screen.findByRole('tablist', { name: 'Mission Control sections' });
+    // DOCUMENT_POSITION_FOLLOWING: the tablist comes after the card.
+    expect(link.compareDocumentPosition(tablist) & Node.DOCUMENT_POSITION_FOLLOWING)
+      .toBeTruthy();
+  });
+});
