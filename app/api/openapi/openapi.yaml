@@ -941,6 +941,42 @@ paths:
               schema:
                 $ref: '#/components/schemas/AshbyMcError'
 
+  /api/integrations/ashby/mission-control/ingestions/{applicationLinkId}/retry-legacy-parse:
+    post:
+      tags: [ashby]
+      operationId: retryAshbyLegacyBadOutput
+      summary: One-shot release of a legacy stdout-polluted parse_bad_output ingestion
+      description: Admin-only. Releases ONE resume ingestion rested on parse_bad_output that was written BEFORE the server-stamped stdout-purity boundary - i.e. while a bundled PDF library could still write warnings to the parser child's stdout protocol channel and turn a well-formed result into a document verdict it never earned. Eligibility is decided entirely server-side; no caller value contributes to it. A parse_bad_output written AFTER that boundary is a genuine protocol anomaly and is refused, as is every other document verdict (unparseable document, absent or over-large extractor output, no extractable fields, a rejected magic/MIME guard, an infected scan) and every transport reason. Strictly one release per row, ever, AND still inside the unchanged five-requeue ceiling - whichever is stricter. Issues no invite, moves no stage, calls no provider. The response carries no failure reason, boundary, file handle, external Ashby id, or candidate field.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: applicationLinkId
+          in: path
+          required: true
+          description: Opaque Ashby application link id (UUID). Carries no candidate identifier or PII.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Ingestion re-queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcRetryResponse'
+        '400':
+          description: Invalid application link id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+        '409':
+          description: Not eligible - unknown link, a non-failed_review row, a terminal application, a reason other than parse_bad_output, a parse_bad_output newer than the boundary, a release already spent, an exhausted ceiling, or an ingestion job already in flight.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+
   # ── Ashby candidate-scoped review (authenticated recruiter) ────────
   /api/integrations/ashby/review/{applicationLinkId}:
     parameters:

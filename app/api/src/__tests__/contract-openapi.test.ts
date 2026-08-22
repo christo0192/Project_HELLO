@@ -900,7 +900,12 @@ describe('OpenAPI document integrity', () => {
     //   and application-link-addressed).
     // + POST .../mission-control/ingestions/{applicationLinkId}/retry — the
     //   bounded, audited parse-class ingestion recovery (0039).
-    expect(Object.keys(paths).length).toBe(77);
+    // + POST .../ingestions/{applicationLinkId}/retry-legacy-parse — the
+    //   ONE-SHOT release of a legacy stdout-polluted parse_bad_output row
+    //   (0041). Deliberately its own route rather than a widening of the
+    //   one above, so the ordinary recovery's allowlist keeps refusing
+    //   every document verdict.
+    expect(Object.keys(paths).length).toBe(78);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas

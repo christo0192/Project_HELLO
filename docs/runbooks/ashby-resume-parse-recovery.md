@@ -251,7 +251,7 @@ exists to remove.
 | `parse_defer_clock_invalid` (the job timestamp was unparseable, so the wall-clock bound could not be computed and the wait was stopped rather than left unbounded) | yes |
 | `materialize_failed` (the parse succeeded; writing the approved candidate/resume rows did not) | **yes** — and it additionally self-heals if a genuinely NEW stage-change event arrives; a redelivery or re-observation of the same event does **not** repair it |
 | `parse_error` (legacy) | **yes — one bounded retry, so the new classifier can NAME it** |
-| `parse_extract_failed`, `parse_bad_output`, `parse_no_output`, `parse_output_exceeded` | **no** — document verdict |
+| `parse_extract_failed`, `parse_bad_output`, `parse_no_output`, `parse_output_exceeded` | **no** — document verdict (for legacy `parse_bad_output` only, see §3a) |
 | `no_extractable_fields`, `guard_*`, `scan_infected` | **no** |
 | transport (`fetch_*`) | no — that is 0036's `reset_ashby_ingestion_attempts` |
 
@@ -260,6 +260,45 @@ recovery for a genuinely malformed, encrypted or unsupported document is a new
 application carrying a valid document, plus an operator note. **Malformed,
 encrypted and unsupported documents remain `needs_review`. No heap or timeout
 value makes them acceptable, and none should.**
+
+### 3a — the one-shot legacy `parse_bad_output` release (0041)
+
+`parse_bad_output` never meant "this document is bad": the parser parent raises
+it only when `JSON.parse` of the child's stdout throws, and until the
+stdout-purity fix a bundled PDF library could write warnings to that same
+channel. Rows written then recorded a verdict the document never earned.
+
+```
+POST /api/integrations/ashby/mission-control/ingestions/<applicationLinkId>/retry-legacy-parse
+```
+
+Admin only, audited, and **strictly one release per row, for ever** (plus the
+unchanged five-attempt ceiling). It admits *only* `parse_bad_output`; every
+other verdict is refused whatever its age.
+
+> **Check the date before you use it.** The migration's marker records when the
+> RELEASE shipped, which is **later** than when the stdout-purity fix went live
+> (`deploy-api` completed **2026-08-22T03:45:20Z**). A row that failed between
+> those two instants came from the *fixed* parser and is still admitted by the
+> marker test — so confirm the target's failure predates **03:45:20Z**, not
+> merely the marker, before spending its single shot:
+>
+> ```sql
+> select state, failed_reason, attempts, updated_at, legacy_bad_output_recovered_at
+>   from screening_v2.ashby_resume_ingestions
+>  where application_link_id = '<uuid>';
+> ```
+>
+> `updated_at` after 03:45:20Z means the failure is post-fix: it is a protocol
+> anomaly to investigate, not a legacy row to release. `updated_at` is the last
+> write of any kind, so an unrelated later touch can also push a genuine legacy
+> row past the marker and make it permanently ineligible — the refusal is
+> `not_legacy_bad_output` either way, and the only remedy is a new application.
+
+Expected outcome of a release: the ingestion re-runs under the fixed parser and
+either reaches `ready` or rests on an **honest** code such as
+`parse_extract_failed` — a genuine verdict, which this door has never accepted
+and will not accept on a second attempt.
 
 ### Step 4 — observe
 The retried ingestion re-enters `queued` **and a live `ashby.ingestion` job is

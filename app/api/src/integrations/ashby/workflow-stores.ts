@@ -523,6 +523,17 @@ export interface MissionControlStore {
    * named one. It is still counted, so it cannot be repeated indefinitely.
    */
   retryIngestionParse(applicationLinkId: string, actorId: string): Promise<{ status: string }>;
+  /**
+   * ONE-SHOT release of a LEGACY `parse_bad_output` ingestion (0041).
+   *
+   * Separate from `retryIngestionParse` on purpose. That door asks "is this
+   * a machine-class failure?" and must go on refusing every document
+   * verdict. This one asks a different question — "was this row written
+   * while our own stdout channel could still be polluted?" — and the answer
+   * is decided entirely server-side against a boundary the migration
+   * stamped, never against anything a caller supplies.
+   */
+  retryLegacyBadOutput(applicationLinkId: string, actorId: string): Promise<{ status: string }>;
 }
 
 /** Mission Control read/action store (service-role; sanitized projections). */
@@ -650,6 +661,17 @@ export function createMissionControlStore(client: SupabaseClient): MissionContro
         p_actor_id: actorId,
       });
       if (error) throw new Error('ashby_mc_ingestion_retry_error');
+      return { status: statusOf(data) };
+    },
+    async retryLegacyBadOutput(applicationLinkId, actorId) {
+      // 0041. Every eligibility decision — reason, boundary, one-shot flag,
+      // ceiling, terminal link — is made inside the RPC. Nothing here can
+      // widen it.
+      const { data, error } = await client.rpc('recover_ashby_legacy_bad_output', {
+        p_application_link_id: applicationLinkId,
+        p_actor_id: actorId,
+      });
+      if (error) throw new Error('ashby_mc_legacy_bad_output_error');
       return { status: statusOf(data) };
     },
     async reissueManualInvite(input): Promise<MissionControlInviteIssue> {
