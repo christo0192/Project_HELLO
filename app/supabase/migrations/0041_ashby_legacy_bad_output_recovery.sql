@@ -45,26 +45,67 @@
 --   2. IMMOVABLE: inserted `on conflict do nothing`, so re-applying the
 --      migration — or applying it to a database that already has it —
 --      can never move the boundary forward and re-open a closed door.
---   3. CONSERVATIVE BY CONSTRUCTION: `migrate-production` runs BEFORE
---      `deploy-api` (deploy-fly.yml: deploy-api `needs: migrate-production`),
---      so the boundary is stamped slightly EARLIER than the fixed child
---      goes live. Any row that fails inside that short window is therefore
---      classified as NEW and REFUSED. The error is always in the direction
---      of refusing a legacy row, never of admitting a genuine verdict.
+--   3. LATER THAN THE FIX, NOT EARLIER — read this before widening
+--      anything. The stdout-purity fix (#86) shipped in its OWN, EARLIER
+--      deploy run: its `deploy-api` completed 2026-08-22T03:45:20Z, which
+--      is when the fixed child went live. THIS migration's marker is
+--      stamped whenever the release deploy runs, which is strictly later
+--      — by an hour or more, and by however long this change waited to be
+--      merged.
 --
--- This migration is deliberately STACKED ON the stdout-purity fix, so the
--- boundary cannot be established by a deployment that does not also carry
--- the fixed child. Without that ordering a "legacy" retry would re-run the
--- same polluted parse and burn its one shot for nothing.
+--      `deploy-api needs: migrate-production` (deploy-fly.yml) orders those
+--      two jobs WITHIN ONE RUN. It says nothing about two separate runs,
+--      and the fix and this marker are two separate runs. An earlier draft
+--      of this comment claimed the opposite and called the ordering
+--      "conservative by construction"; it is not, and the difference is
+--      invisible unless you go and read the run timestamps.
+--
+--      The consequence, stated plainly: a `parse_bad_output` row written in
+--      the window [fix live, marker stamped) came from the FIXED child, yet
+--      has `updated_at` below the marker, so this door ADMITS it. That is
+--      accepted deliberately, for three reasons:
+--        * it can only ever be a PROTOCOL ANOMALY, never a document
+--          verdict. The reason gate below still demands exactly
+--          `parse_bad_output`, and every genuine verdict —
+--          parse_extract_failed, parse_no_output, parse_output_exceeded,
+--          no_extractable_fields, guard_*, scan_infected — is refused
+--          whatever its age;
+--        * it is fully bounded even when it happens: ONE audited shot,
+--          recorded durably on the row, plus the unchanged five-attempt
+--          ceiling. A wrongly-admitted row is re-run once and the door
+--          shuts permanently;
+--        * the population is expected to be EMPTY. After #86 the only
+--          remaining way to corrupt the channel is a library writing
+--          directly through `process.stdout.write`, and neither extractor
+--          in the shipped path does that.
+--
+--      So the honest guarantee is narrower than "no wrong row is ever
+--      admitted": it is "no DOCUMENT VERDICT is ever admitted, and anything
+--      admitted in error costs exactly one bounded, audited re-run".
+--
+-- This migration was authored STACKED ON the stdout-purity fix and is
+-- rebased onto a `main` that already contains it, so the marker can never
+-- be stamped by a deployment that lacks the fixed child. That ordering is
+-- what stops a "legacy" release re-running the same polluted parse and
+-- burning its one shot for nothing — it is the property that actually
+-- holds, and it is not the same as the boundary preceding the fix.
+--
+-- OPERATORS: before using this door, confirm the target row predates the
+-- stdout-purity deployment (2026-08-22T03:45:20Z), not merely the marker.
+-- See docs/runbooks/ashby-resume-parse-recovery.md.
 --
 -- ── WHAT IS STILL REFUSED ─────────────────────────────────────────────
--- Everything except a `parse_bad_output` row older than the boundary:
+-- Everything except a `parse_bad_output` row older than the MARKER:
 -- `parse_extract_failed`, `parse_no_output`, `parse_output_exceeded`,
 -- `no_extractable_fields`, every `guard_*`, `scan_infected`, every
--- transport code, and — crucially — any `parse_bad_output` written AFTER
--- the boundary. A post-fix `parse_bad_output` can only mean a genuine
--- protocol anomaly, and widening the door to it would recreate exactly the
--- untruthfulness this repair exists to remove.
+-- transport code, and any `parse_bad_output` written AFTER the marker.
+--
+-- Note the marker, not the fix — see point 3 above. A `parse_bad_output`
+-- from the window between them is a bounded protocol anomaly that this
+-- door admits once; one written after the MARKER is refused outright.
+-- Either way no document verdict is ever admitted, and widening the reason
+-- gate would recreate exactly the untruthfulness this repair exists to
+-- remove.
 --
 -- ── BOUNDS ────────────────────────────────────────────────────────────
 -- ONE shot per row, recorded durably on the row itself, AND the unchanged
@@ -257,10 +298,12 @@ begin
     return jsonb_build_object('status', 'not_legacy_bad_output');
   end if;
 
-  -- THE BOUNDARY. A `parse_bad_output` written after the stdout channel
-  -- was made pure can only be a genuine protocol anomaly, and is refused
-  -- with the same generic status — the caller learns "not eligible",
-  -- never why, and never a timestamp.
+  -- THE BOUNDARY — the MARKER's instant, which is LATER than the moment the
+  -- fixed child went live (header, point 3). A row at or after it is refused
+  -- with the same generic status as a wrong reason: the caller learns "not
+  -- eligible", never why, and never a timestamp. A row from the window
+  -- between the fix and the marker still passes here; it can only be a
+  -- protocol anomaly, and the one-shot flag below is what bounds it.
   if v_ing.updated_at >= v_boundary then
     return jsonb_build_object('status', 'not_legacy_bad_output');
   end if;
