@@ -58,34 +58,101 @@ function allSourceFiles(dir: string): string[] {
   return out;
 }
 
+/**
+ * The two files allowed to name a database client at all. `stores.ts` is the
+ * WRITE seam and may only `.rpc(`; `read-stores.ts` is the READ seam and may
+ * only `.select(`. Splitting the capability across two files is what lets each
+ * one's absence be asserted in the other — a single file holding both could
+ * only be checked against a weaker, hand-waved rule.
+ */
+const WRITE_SEAM = 'stores.ts';
+const READ_SEAM = 'read-stores.ts';
+const CLIENT_FILES = new Set([WRITE_SEAM, READ_SEAM]);
+
 describe('1. every phone write goes through an RPC', () => {
-  it('no module touches a phone table or the job queue directly', () => {
+  it('no module touches the job queue directly', () => {
     for (const { name, source } of MODULE_FILES) {
-      const body = code(source);
-      expect(body, `${name} reaches a phone table directly`).not.toMatch(/\.from\(\s*['"`]phone_/);
-      expect(body, `${name} reaches the job queue directly`)
+      expect(code(source), `${name} reaches the job queue directly`)
         .not.toMatch(/\.from\(\s*['"`]job_queue/);
-      // Nor any other table: the ports interface exposes no table accessor at
-      // all, so a `.from(` here would be a capability the seam denies.
-      expect(body, `${name} uses a table accessor`).not.toMatch(/\bclient\s*\.\s*from\s*\(/);
     }
   });
 
-  it('only stores.ts holds a client, and it only calls .rpc', () => {
+  it('no module anywhere performs a table WRITE', () => {
+    // The rule that matters. 0042's guarantees — the global admission advisory
+    // lock, the pinned lock order, the per-IST-day uniqueness index, the three
+    // budgets and the insert-once ledger — live entirely INSIDE the RPCs. A
+    // direct write would satisfy every type in this repository and bypass all
+    // of them at once. A direct READ bypasses nothing, which is why the read
+    // seam exists and this assertion is about writes rather than about `.from`.
     for (const { name, source } of MODULE_FILES) {
-      if (name === 'stores.ts') continue;
+      const body = code(source);
+      for (const verb of ['insert', 'update', 'upsert', 'delete']) {
+        expect(body, `${name} performs a .${verb}()`).not.toMatch(
+          new RegExp(String.raw`\.\s*${verb}\s*\(`),
+        );
+      }
+    }
+  });
+
+  it('only the two seam files hold a client, and each holds ONE capability', () => {
+    for (const { name, source } of MODULE_FILES) {
+      if (CLIENT_FILES.has(name)) continue;
       expect(code(source), `${name} imports a supabase client`)
         .not.toMatch(/@supabase\/supabase-js/);
       expect(code(source), `${name} imports the process-wide client`)
         .not.toMatch(/from ['"][^'"]*\/supabase\.js['"]/);
+      // Nor any table accessor: outside the two seams the ports interfaces
+      // expose no such capability, so a `.from(` would be one the seam denies.
+      expect(code(source), `${name} uses a table accessor`)
+        .not.toMatch(/\bclient\s*\.\s*from\s*\(/);
     }
-    const stores = MODULE_FILES.find((f) => f.name === 'stores.ts');
+
+    const stores = MODULE_FILES.find((f) => f.name === WRITE_SEAM);
     expect(stores).toBeDefined();
-    const rpcCalls = [...code(stores!.source).matchAll(/client\.rpc\(\s*'([a-z_]+)'/g)]
-      .map((m) => m[1]);
+    const writeBody = code(stores!.source);
+    const rpcCalls = [...writeBody.matchAll(/client\.rpc\(\s*'([a-z_]+)'/g)].map((m) => m[1]);
     expect(new Set(rpcCalls).size).toBe(10);
+    // The write seam reaches NO table, only RPCs.
+    expect(writeBody, 'stores.ts uses a table accessor').not.toMatch(/\bclient\s*\.\s*from\s*\(/);
     // A type-only import of the client type is fine; a VALUE import is not.
-    expect(code(stores!.source)).toMatch(/import type \{ SupabaseClient \}/);
+    expect(writeBody).toMatch(/import type \{ SupabaseClient \}/);
+
+    const reads = MODULE_FILES.find((f) => f.name === READ_SEAM);
+    expect(reads).toBeDefined();
+    const readBody = code(reads!.source);
+    // The read seam calls NO rpc — it cannot invoke a mutation by name.
+    expect(readBody, 'read-stores.ts calls an rpc').not.toMatch(/\.\s*rpc\s*\(/);
+    expect(readBody).toMatch(/import type \{ SupabaseClient \}/);
+    // …and every table it touches is selected with an EXPLICIT column list.
+    // `select('*')` is what turns "we do not expose the lease token" into "we
+    // have not exposed it yet": the column arrives in the row and only a
+    // hand-written mapper stands between it and a response.
+    const selects = [...readBody.matchAll(/\.select\(([^)]*)\)/g)].map((m) => m[1].trim());
+    expect(selects.length).toBeGreaterThanOrEqual(5);
+    for (const arg of selects) {
+      expect(arg, `read-stores.ts selects ${arg}`).not.toContain('*');
+    }
+  });
+
+  it('no column list in the read seam names a forbidden column', () => {
+    // Omission is the control, not redaction: a column that is never SELECTED
+    // cannot be serialized by a later edit that forgets why it was masked.
+    const reads = MODULE_FILES.find((f) => f.name === READ_SEAM);
+    const body = code(reads!.source);
+    const FORBIDDEN = [
+      'sip_call_id', 'room_name', 'participant_identity', 'egress_id', 'egress_status',
+      'lease_token', 'lease_owner', 'provider_event_id', 'phone_sha256', 'metadata',
+      'email', 'phone_raw', 'phone_valid', 'text_extracted',
+    ];
+    const columnLists = [...body.matchAll(/'([a-z_]+(?:,[a-z_]+)+)'/g)].map((m) => m[1]);
+    // Fail closed: an empty sweep would make this assertion vacuous.
+    expect(columnLists.length).toBeGreaterThanOrEqual(4);
+    for (const list of columnLists) {
+      const columns = list.split(',');
+      for (const forbidden of FORBIDDEN) {
+        expect(columns, `a read seam column list selects ${forbidden}`).not.toContain(forbidden);
+      }
+    }
   });
 
   it('no module re-declares a vocabulary that vocabulary.ts owns', () => {
@@ -146,22 +213,34 @@ describe('2. no provider, no dialing, no network, no Ashby mutation', () => {
     }
   });
 
-  it('only the enumerated P3 ingress files import this module', () => {
+  it('only the enumerated phone importers reach this module', () => {
     // P2 shipped this as a dormant domain core and this assertion read
-    // "nothing imports it yet". P3 wires it in, so the assertion moves rather
-    // than dies: an ALLOWLIST of importers keeps the original control alive —
-    // an unnoticed import still fails — while recording, in one place, every
-    // file that was deliberately allowed to make the module live.
+    // "nothing imports it yet". TWO lanes wired it in — P3's LiveKit ingress
+    // and P6's operator API — so the assertion moves rather than dies: an
+    // ALLOWLIST of importers keeps the original control alive (an unnoticed
+    // import still fails) while recording, in one place, every file that was
+    // deliberately allowed to make the module live.
     //
     // Deleting it instead would have been the worse trade: a tripwire that
     // cannot fire once the thing it guards changes is not a weaker control,
     // it is a misleading one.
+    //
+    // Note what is NOT here: no worker, no timer, no scheduler and no
+    // composition-root entry. Both live surfaces are request-scoped — one
+    // pre-auth webhook with its own signature boundary, one recruiter-
+    // authenticated API. Nothing in this repository yet runs the phone domain
+    // on a loop, and adding the first thing that does is a later phase's
+    // decision, not a merge artefact.
     const ALLOWED_IMPORTERS = new Set([
+      // P3 — LiveKit phone webhook ingress and reconciliation.
       'integrations/livekit-phone/config.ts',
       'integrations/livekit-phone/ingress.ts',
       'integrations/livekit-phone/reconciliation.ts',
       'integrations/livekit-phone/stores.ts',
       'routes/phone-webhook.ts',
+      // P6 — the operator calendar/engagement/health/control API.
+      'routes/phone.ts',
+      'schemas/phone-api.ts',
     ]);
     const seen = new Set<string>();
     for (const file of allSourceFiles(SRC_DIR)) {
@@ -176,7 +255,8 @@ describe('2. no provider, no dialing, no network, no Ashby mutation', () => {
       seen.add(rel);
     }
     // The allowlist must not outlive its entries either: a stale name would
-    // silently permit a future file to reuse it.
+    // silently permit a future file to reuse it, and a lane that stopped
+    // importing the domain core would be reimplementing it.
     expect([...seen].sort()).toEqual([...ALLOWED_IMPORTERS].sort());
   });
 });

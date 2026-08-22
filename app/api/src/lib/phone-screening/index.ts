@@ -167,3 +167,32 @@ export {
   type PhoneAdmissionResult,
   type PhoneDeferralCode,
 } from './admission.js';
+
+export type {
+  PhoneAppointmentRow,
+  PhoneAttemptRow,
+  PhoneCandidateRow,
+  PhoneEngagementRow,
+  PhoneReadStore,
+} from './read-ports.js';
+
+export { createPhoneReadStore, boundedRowLimit, PHONE_READ_MAX_ROWS } from './read-stores.js';
+
+export {
+  PHONE_SLOT_REFUSALS,
+  buildPhoneSlotGrid,
+  istDayInstantRange,
+  parseIstCalendarDate,
+  type IstCalendarDate,
+  type PhoneSlot,
+  type PhoneSlotGridInput,
+  type PhoneSlotOccupancy,
+  type PhoneSlotRefusal,
+} from './slots.js';
+
+export {
+  PHONE_RESIDUAL_CODES,
+  PHONE_SUBSTRATE_RESIDUALS,
+  type PhoneResidualCode,
+  type PhoneSubstrateResidual,
+} from './residuals.js';

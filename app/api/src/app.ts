@@ -25,6 +25,7 @@ import { ashbyWebhookRouter } from './routes/ashby-webhook.js';
 import { phoneWebhookRouter } from './routes/phone-webhook.js';
 import { ashbyMissionControlRouter } from './routes/ashby-mission-control.js';
 import { ashbyReviewRouter } from './routes/ashby-review.js';
+import { phoneApiRouter } from './routes/phone.js';
 import { ashbyCandidateWorkflowRouter } from './routes/ashby-candidate-workflow.js';
 import {
   malformedJsonHandler,
@@ -313,6 +314,14 @@ export function createApp(opts: CreateAppOptions = {}) {
   // pre-auth webhook path). Reads are interviewer+, actions admin-only.
   app.use('/api/integrations/ashby/mission-control', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'ashby-mc:', useUserKey: true }));
   app.use('/api/integrations/ashby/review', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'ashby-review:', useUserKey: true }));
+  // Internal phone screening calendar/engagement/health/control surface
+  // (recruiter-authenticated; reads interviewer+, mutations admin-only). The
+  // DEFAULT bucket, deliberately: `/api/phone/health` is an operator poll, and
+  // the strict bucket's 20-per-window would throttle it into looking degraded —
+  // manufacturing the exact false alarm the surface exists to avoid (the
+  // recordings-health precedent above). A throttled caller gets a plain 429,
+  // which the client contract must NOT read as degraded.
+  app.use('/api/phone', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'phone:', useUserKey: true }));
 
   // Public: health endpoint (no auth). Bounded — `{ ok: true }` only, so
   // no model/provider/internal dependency leaks to unauthenticated callers.
@@ -359,6 +368,10 @@ export function createApp(opts: CreateAppOptions = {}) {
   app.use('/api/appeals', appealsRouter);
   app.use('/api/integrations/ashby/mission-control', ashbyMissionControlRouter);
   app.use('/api/integrations/ashby/review', ashbyReviewRouter);
+  // Phone screening operator API. Disabled by default: while
+  // PHONE_SCREENING_ENABLED is off, its reads answer `enabled: false` without
+  // touching the database and its mutations are refused with 503.
+  app.use('/api/phone', phoneApiRouter);
 
   // ── 401/403/429 error paths still carry existing headers (CORS/CSP) ─
   // Handled inline by the auth/rate-limit middleware, no stack traces.

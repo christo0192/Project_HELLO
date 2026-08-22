@@ -1,0 +1,1371 @@
+/**
+ * The phone operator API — authorization, validation, projection, delegation,
+ * audit and the disabled default.
+ *
+ * Two harnesses, deliberately:
+ *   * a BARE express app with an injected `authUser` and injected stores, for
+ *     the status-to-HTTP matrix, the projections and the audit paths;
+ *   * the REAL `createApp`, for the 401 boundary and the viewer read-only guard,
+ *     because those live in middleware the bare harness does not have and a
+ *     test that stubbed them would be asserting its own stub.
+ *
+ * No network, no database, no real Supabase client anywhere.
+ */
+
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import express from 'express';
+import request from 'supertest';
+import { createApp } from '../app.js';
+import { mockAuthGetUser, type AuthUser } from '../lib/auth.js';
+import { MemoryRateLimitStore, setRateLimitStore } from '../lib/rate-limit.js';
+import { getAuditSink, setAuditSink, type AuditEntry } from '../lib/audit.js';
+import { createPhoneApiRouter, type PhoneApiDeps } from '../routes/phone.js';
+import {
+  PHONE_MAX_CONCURRENT,
+  type PhoneAppointmentRow,
+  type PhoneAttemptRow,
+  type PhoneCandidateRow,
+  type PhoneEngagementRow,
+  type PhoneReadStore,
+  type PhoneStores,
+} from '../lib/phone-screening/index.js';
+
+// ════════════════════════════════════════════════════════════════════
+//  Fixtures
+// ════════════════════════════════════════════════════════════════════
+
+const UUID_A = '11111111-1111-4111-8111-111111111111';
+const UUID_E = '22222222-2222-4222-8222-222222222222';
+const UUID_C = '33333333-3333-4333-8333-333333333333';
+const UUID_OTHER = '44444444-4444-4444-8444-444444444444';
+
+/** Injected clock. Every assertion that depends on "now" pins it here. */
+const NOW = new Date('2026-08-23T18:31:00Z');
+
+const APPOINTMENT: PhoneAppointmentRow = {
+  id: UUID_A,
+  engagementId: UUID_E,
+  startsAt: '2026-08-24T03:30:00.000Z',
+  endsAt: '2026-08-24T04:00:00.000Z',
+  istDate: '2026-08-24',
+  status: 'scheduled',
+  source: 'hr_manual',
+  confirmedAt: null,
+  cancelReason: null,
+  version: 3,
+  createdAt: '2026-08-23T10:00:00.000Z',
+  updatedAt: '2026-08-23T10:00:00.000Z',
+};
+
+const ENGAGEMENT: PhoneEngagementRow = {
+  id: UUID_E,
+  candidateId: UUID_C,
+  state: 'scheduled',
+  stateReason: null,
+  epoch: 0,
+  version: 2,
+  noAnswerAttempts: 2,
+  reconnectsUsed: 0,
+  providerFailures: 5,
+  nextEligibleAt: '2026-08-25T03:30:00.000Z',
+  lastAttemptAt: '2026-08-23T05:01:00.000Z',
+  terminalAt: null,
+  createdAt: '2026-08-20T10:00:00.000Z',
+  updatedAt: '2026-08-23T10:00:00.000Z',
+};
+
+const CANDIDATE: PhoneCandidateRow = {
+  id: UUID_C,
+  name: 'Priya Example',
+  status: 'screening',
+  reference: 'ATS-9001',
+};
+
+const ATTEMPT: PhoneAttemptRow = {
+  id: '55555555-5555-4555-8555-555555555555',
+  engagementId: UUID_E,
+  attemptSeq: 1,
+  epoch: 0,
+  kind: 'initial',
+  state: 'ended',
+  outcomeClass: 'no_answer',
+  istDate: '2026-08-23',
+  priorEngagementState: 'eligible',
+  admittedAt: '2026-08-23T05:00:00.000Z',
+  answeredAt: null,
+  classifiedAt: null,
+  endedAt: '2026-08-23T05:01:00.000Z',
+};
+
+const HEALTHY_BACKLOG = {
+  status: 'ok' as const,
+  admission: { controlPresent: true, halted: false, haltReason: null },
+  engagementsByState: { eligible: 3, scheduled: 1 },
+  attempts: {
+    live: 2,
+    liveWithUnexpiredLease: 2,
+    maxConcurrent: PHONE_MAX_CONCURRENT,
+    oldestLiveAgeSeconds: 12,
+  },
+  appointments: { live: 1, overdue: 0 },
+  events: {
+    ignoredLast24h: 7,
+    unknownAttemptLast24h: 2,
+    staleEpochLast24h: 3,
+    terminalLast24h: 1,
+    unexpectedEventLast24h: 1,
+  },
+  windowOpen: true,
+  istDate: '2026-08-24',
+};
+
+// ════════════════════════════════════════════════════════════════════
+//  Fakes
+// ════════════════════════════════════════════════════════════════════
+
+/** Counts every call so a test can assert "zero database work". */
+interface ReadSpy {
+  store: PhoneReadStore;
+  calls: string[];
+}
+
+function fakeReadStore(over: Partial<PhoneReadStore> = {}): ReadSpy {
+  const calls: string[] = [];
+  const track = <T>(name: string, value: T) => {
+    calls.push(name);
+    return Promise.resolve(value);
+  };
+  const base: PhoneReadStore = {
+    listAppointmentsByStart: () => track('listAppointmentsByStart', [APPOINTMENT]),
+    listLiveAppointmentsByStart: () => track('listLiveAppointmentsByStart', [APPOINTMENT]),
+    getAppointment: () => track('getAppointment', APPOINTMENT),
+    getLiveAppointmentForEngagement: () =>
+      track('getLiveAppointmentForEngagement', APPOINTMENT),
+    listEngagementsByIds: () => track('listEngagementsByIds', [ENGAGEMENT]),
+    getEngagement: () => track('getEngagement', ENGAGEMENT),
+    listCandidatesByIds: () => track('listCandidatesByIds', [CANDIDATE]),
+    listAttemptsForEngagement: () => track('listAttemptsForEngagement', [ATTEMPT]),
+  };
+  const store = new Proxy({ ...base, ...over } as PhoneReadStore, {
+    get(target, prop: string) {
+      const fn = (target as unknown as Record<string, unknown>)[prop];
+      if (typeof fn !== 'function') return fn;
+      return (...args: unknown[]) => {
+        if (!(prop in over)) return (fn as (...a: unknown[]) => unknown)(...args);
+        calls.push(prop);
+        return (fn as (...a: unknown[]) => unknown)(...args);
+      };
+    },
+  });
+  return { store, calls };
+}
+
+interface WriteSpy {
+  store: PhoneStores;
+  calls: Array<{ op: string; input: unknown }>;
+}
+
+function fakeStores(over: Partial<PhoneStores> = {}): WriteSpy {
+  const calls: Array<{ op: string; input: unknown }> = [];
+  const defaults: PhoneStores = {
+    admitAttempt: async () => ({ status: 'ok' }),
+    heartbeatAttempt: async () => ({ status: 'ok' }),
+    reclaimAttemptLeases: async () => ({ status: 'ok' }),
+    applyEvent: async () => ({ status: 'applied' }),
+    scheduleAppointment: async () => ({
+      status: 'ok',
+      appointmentId: UUID_A,
+      version: 1,
+      engagementState: 'scheduled',
+      supersededAppointmentId: null,
+    }),
+    cancelAppointment: async () => ({ status: 'ok', appointmentId: UUID_A, version: 4 }),
+    expireAppointments: async () => ({ status: 'ok' }),
+    setHalt: async () => ({ status: 'ok', alreadyHalted: false }),
+    clearHalt: async () => ({ status: 'ok', wasHalted: true }),
+    backlog: async () => HEALTHY_BACKLOG,
+  };
+  const merged = { ...defaults, ...over } as PhoneStores;
+  const store = new Proxy(merged, {
+    get(target, prop: string) {
+      const fn = (target as unknown as Record<string, unknown>)[prop];
+      if (typeof fn !== 'function') return fn;
+      return (input: unknown) => {
+        calls.push({ op: prop, input });
+        return (fn as (i: unknown) => unknown)(input);
+      };
+    },
+  });
+  return { store, calls };
+}
+
+/** `PHONE_SCREENING_ENABLED=true`, injected — never `process.env`. */
+const ENABLED: NodeJS.ProcessEnv = { PHONE_SCREENING_ENABLED: 'true' };
+/** The production default: absent, therefore off. */
+const DISABLED: NodeJS.ProcessEnv = {};
+
+function appWith(role: string | null, deps: PhoneApiDeps = {}) {
+  const app = express();
+  app.use(express.json());
+  app.use((req, _res, next) => {
+    if (role) {
+      (req as unknown as { authUser: unknown }).authUser = {
+        id: '66666666-6666-4666-8666-666666666666',
+        appRole: role,
+      };
+    }
+    next();
+  });
+  app.use(
+    '/api/phone',
+    createPhoneApiRouter({ configSource: ENABLED, now: () => NOW, ...deps }),
+  );
+  return app;
+}
+
+const RANGE = '?from=2026-08-24T00:00:00Z&to=2026-08-25T00:00:00Z';
+
+let originalSink: ReturnType<typeof getAuditSink>;
+let audited: AuditEntry[];
+
+beforeEach(() => {
+  setRateLimitStore(new MemoryRateLimitStore());
+  originalSink = getAuditSink();
+  audited = [];
+  setAuditSink((entry) => {
+    audited.push(entry);
+  });
+});
+
+afterEach(() => {
+  setAuditSink(originalSink);
+  vi.restoreAllMocks();
+});
+
+// ════════════════════════════════════════════════════════════════════
+//  1. Authorization
+// ════════════════════════════════════════════════════════════════════
+
+describe('role scoping', () => {
+  const READS: Array<[string, string]> = [
+    ['get', `/api/phone/calendar${RANGE}`],
+    ['get', '/api/phone/calendar/slots?date=2026-08-24'],
+    ['get', `/api/phone/engagements/${UUID_E}`],
+    ['get', '/api/phone/health'],
+  ];
+  const WRITES: Array<[string, string, unknown]> = [
+    ['post', '/api/phone/appointments', {
+      engagement_id: UUID_E,
+      starts_at: '2026-08-24T04:00:00Z',
+      ends_at: '2026-08-24T04:30:00Z',
+    }],
+    ['patch', `/api/phone/appointments/${UUID_A}`, {
+      starts_at: '2026-08-24T04:00:00Z',
+      ends_at: '2026-08-24T04:30:00Z',
+      version: 3,
+    }],
+    ['delete', `/api/phone/appointments/${UUID_A}`, { reason: 'hr_cancelled', version: 3 }],
+    ['post', '/api/phone/halt', { reason: 'operator_pause' }],
+    ['post', '/api/phone/halt/clear', { reason: 'operator_pause' }],
+  ];
+
+  it('interviewers may read', async () => {
+    for (const [, path] of READS) {
+      const res = await request(appWith('interviewer', { readStore: fakeReadStore().store, stores: fakeStores().store })).get(path);
+      expect(res.status, path).toBe(200);
+    }
+  });
+
+  it('viewers may not read this surface at all', async () => {
+    for (const [, path] of READS) {
+      const res = await request(appWith('viewer')).get(path);
+      expect(res.status, path).toBe(403);
+      expect(res.body.error.type).toBe('authorization_error');
+    }
+  });
+
+  it('a request with no authenticated user is refused on every route', async () => {
+    for (const [, path] of READS) {
+      expect((await request(appWith(null)).get(path)).status, path).toBe(403);
+    }
+    for (const [method, path, body] of WRITES) {
+      const res = await (request(appWith(null)) as never as Record<string, Function>)[method](path)
+        .send(body);
+      expect(res.status, path).toBe(403);
+    }
+  });
+
+  it('interviewers may NOT write — every mutation is admin-only', async () => {
+    const write = fakeStores();
+    for (const [method, path, body] of WRITES) {
+      const agent = request(appWith('interviewer', { stores: write.store, readStore: fakeReadStore().store }));
+      const res = await (agent as never as Record<string, Function>)[method](path).send(body);
+      expect(res.status, `${method} ${path}`).toBe(403);
+    }
+    // The gate runs BEFORE any delegation: nothing reached the substrate.
+    expect(write.calls).toEqual([]);
+  });
+
+  it('admins may write', async () => {
+    const read = fakeReadStore();
+    const write = fakeStores();
+    const app = appWith('admin', { stores: write.store, readStore: read.store });
+    expect((await request(app).post('/api/phone/appointments').send({
+      engagement_id: UUID_E,
+      starts_at: '2026-08-24T04:00:00Z',
+      ends_at: '2026-08-24T04:30:00Z',
+    })).status).toBe(201);
+    expect((await request(app).patch(`/api/phone/appointments/${UUID_A}`).send({
+      starts_at: '2026-08-24T05:00:00Z',
+      ends_at: '2026-08-24T05:30:00Z',
+      version: 3,
+    })).status).toBe(200);
+    expect((await request(app).delete(`/api/phone/appointments/${UUID_A}`)
+      .send({ reason: 'hr_cancelled', version: 3 })).status).toBe(200);
+    expect((await request(app).post('/api/phone/halt').send({ reason: 'operator_pause' })).status)
+      .toBe(200);
+  });
+});
+
+describe('the real app enforces auth before the router is reached', () => {
+  const ADMIN: AuthUser = {
+    id: '77777777-7777-4777-8777-777777777777',
+    email: 'admin@example.test',
+    appRole: 'admin',
+    active: true,
+  } as unknown as AuthUser;
+  const JWT = 'header.eyJhYWwiOiJhYWwyIn0.sig';
+
+  it('answers 401 on every phone route without a bearer token', async () => {
+    const app = createApp({ nodeEnv: 'test', webOrigin: 'http://localhost:5173' });
+    const paths: Array<[string, string]> = [
+      ['get', `/api/phone/calendar${RANGE}`],
+      ['get', '/api/phone/calendar/slots?date=2026-08-24'],
+      ['get', `/api/phone/engagements/${UUID_E}`],
+      ['get', '/api/phone/health'],
+      ['post', '/api/phone/appointments'],
+      ['patch', `/api/phone/appointments/${UUID_A}`],
+      ['delete', `/api/phone/appointments/${UUID_A}`],
+      ['post', '/api/phone/halt'],
+      ['post', '/api/phone/halt/clear'],
+    ];
+    for (const [method, path] of paths) {
+      const res = await (request(app) as never as Record<string, Function>)[method](path).send({});
+      expect(res.status, `${method} ${path}`).toBe(401);
+      expect(res.body.error.type).toBe('authentication_error');
+    }
+  });
+
+  it('the viewer read-only guard rejects a viewer mutation before the role gate', async () => {
+    const app = createApp({
+      nodeEnv: 'test',
+      webOrigin: 'http://localhost:5173',
+      authDeps: {
+        getUser: mockAuthGetUser({ ...ADMIN, appRole: 'viewer' } as AuthUser, JWT),
+      },
+      auditSinkOverride: async () => {},
+    });
+    const res = await request(app)
+      .post('/api/phone/halt')
+      .set('Authorization', `Bearer ${JWT}`)
+      .send({ reason: 'operator_pause' });
+    expect(res.status).toBe(403);
+    expect(res.body.error.type).toBe('authorization_error');
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════
+//  2. Validation
+// ════════════════════════════════════════════════════════════════════
+
+describe('request validation is strict and UTC-only', () => {
+  const app = () => appWith('admin', {
+    readStore: fakeReadStore().store,
+    stores: fakeStores().store,
+  });
+
+  it('refuses a calendar range that is not UTC ISO-8601', async () => {
+    const bad = [
+      'from=2026-08-24&to=2026-08-25',
+      'from=2026-08-24T00:00:00%2B05:30&to=2026-08-25T00:00:00%2B05:30',
+      'from=2026-08-24T00:00:00&to=2026-08-25T00:00:00',
+      'from=2026-08-24 00:00:00Z&to=2026-08-25T00:00:00Z',
+      'from=2026-02-30T00:00:00Z&to=2026-03-02T00:00:00Z',
+    ];
+    for (const q of bad) {
+      const res = await request(app()).get(`/api/phone/calendar?${q}`);
+      expect(res.status, q).toBe(400);
+      expect(res.body.error.type).toBe('validation_error');
+    }
+  });
+
+  it('requires both bounds, in order, and no extra keys', async () => {
+    const cases: Array<[string, string]> = [
+      ['from=2026-08-24T00:00:00Z', 'missing to'],
+      ['to=2026-08-25T00:00:00Z', 'missing from'],
+      ['from=2026-08-25T00:00:00Z&to=2026-08-24T00:00:00Z', 'reversed'],
+      ['from=2026-08-24T00:00:00Z&to=2026-08-24T00:00:00Z', 'empty range'],
+      ['from=2026-08-24T00:00:00Z&to=2026-08-25T00:00:00Z&limit=5', 'extra key'],
+    ];
+    for (const [q, label] of cases) {
+      expect((await request(app()).get(`/api/phone/calendar?${q}`)).status, label).toBe(400);
+    }
+  });
+
+  it('caps the range at 31 days, inclusive of exactly 31', async () => {
+    const ok = await request(app())
+      .get('/api/phone/calendar?from=2026-08-01T00:00:00Z&to=2026-09-01T00:00:00Z');
+    expect(ok.status).toBe(200);
+    const tooWide = await request(app())
+      .get('/api/phone/calendar?from=2026-08-01T00:00:00Z&to=2026-09-01T00:00:01Z');
+    expect(tooWide.status).toBe(400);
+    expect(JSON.stringify(tooWide.body)).toContain('range_exceeds_max_days');
+  });
+
+  it('requires exactly one real IST date on the slots read', async () => {
+    for (const q of ['', 'date=2026-8-24', 'date=2026-02-30', 'date=2026-08-24T00:00:00Z',
+      'date=2026-08-24&date2=x']) {
+      expect((await request(app()).get(`/api/phone/calendar/slots?${q}`)).status, q).toBe(400);
+    }
+    expect((await request(app()).get('/api/phone/calendar/slots?date=2026-08-24')).status).toBe(200);
+  });
+
+  it('refuses a non-uuid engagement or appointment id', async () => {
+    expect((await request(app()).get('/api/phone/engagements/not-a-uuid')).status).toBe(400);
+    expect((await request(app()).delete('/api/phone/appointments/nope')
+      .send({ reason: 'hr_cancelled', version: 1 })).status).toBe(400);
+  });
+
+  it('rejects an unexpected body key on every mutation', async () => {
+    const cases: Array<[string, string, unknown]> = [
+      ['post', '/api/phone/appointments', {
+        engagement_id: UUID_E,
+        starts_at: '2026-08-24T04:00:00Z',
+        ends_at: '2026-08-24T04:30:00Z',
+        source: 'candidate_voice',
+      }],
+      ['patch', `/api/phone/appointments/${UUID_A}`, {
+        starts_at: '2026-08-24T04:00:00Z',
+        ends_at: '2026-08-24T04:30:00Z',
+        version: 1,
+        force: true,
+      }],
+      ['delete', `/api/phone/appointments/${UUID_A}`, {
+        reason: 'hr_cancelled', version: 1, note: 'x',
+      }],
+      ['post', '/api/phone/halt', { reason: 'operator_pause', until: 'later' }],
+      ['post', '/api/phone/halt/clear', { reason: 'operator_pause', why: 'x' }],
+    ];
+    for (const [method, path, body] of cases) {
+      const res = await (request(app()) as never as Record<string, Function>)[method](path)
+        .send(body);
+      expect(res.status, `${method} ${path}`).toBe(400);
+    }
+  });
+
+  it('requires a version on reschedule and on cancel', async () => {
+    expect((await request(app()).patch(`/api/phone/appointments/${UUID_A}`).send({
+      starts_at: '2026-08-24T04:00:00Z',
+      ends_at: '2026-08-24T04:30:00Z',
+    })).status).toBe(400);
+    expect((await request(app()).delete(`/api/phone/appointments/${UUID_A}`)
+      .send({ reason: 'hr_cancelled' })).status).toBe(400);
+    for (const version of [0, -1, 1.5, '3', null]) {
+      expect((await request(app()).delete(`/api/phone/appointments/${UUID_A}`)
+        .send({ reason: 'hr_cancelled', version })).status, `version ${version}`).toBe(400);
+    }
+  });
+
+  it('refuses a cancel reason only the substrate itself may write', async () => {
+    for (const reason of ['superseded', 'system_deferral_expired']) {
+      const res = await request(app()).delete(`/api/phone/appointments/${UUID_A}`)
+        .send({ reason, version: 3 });
+      expect(res.status, reason).toBe(400);
+      expect(JSON.stringify(res.body)).toContain('reason_not_operator_initiated');
+    }
+    for (const reason of ['candidate_request', 'hr_cancelled', 'emergency_stop',
+      'engagement_cancelled']) {
+      expect((await request(app()).delete(`/api/phone/appointments/${UUID_A}`)
+        .send({ reason, version: 3 })).status, reason).toBe(200);
+    }
+  });
+
+  it('refuses a halt reason outside the 0042 vocabulary', async () => {
+    for (const reason of ['because', 'OPERATOR_PAUSE', '', null]) {
+      // Refused by the schema, so 400 stays exclusively a shape failure.
+      expect((await request(app()).post('/api/phone/halt').send({ reason })).status).toBe(400);
+    }
+    // And a vocabulary DRIFT the schema could not have caught is a 409, not a
+    // 400 — the payload was well formed and the substrate refused it.
+    const drifted = fakeStores({ setHalt: async () => ({ status: 'invalid_reason' as never }) });
+    const res = await request(appWith('admin', { stores: drifted.store }))
+      .post('/api/phone/halt').send({ reason: 'operator_pause' });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe('invalid_reason');
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════
+//  3. Projections
+// ════════════════════════════════════════════════════════════════════
+
+describe('the calendar projection', () => {
+  it('joins candidate and engagement in THREE bounded queries, never N+1', async () => {
+    const many = Array.from({ length: 40 }, (_, i) => ({
+      ...APPOINTMENT,
+      id: `${i}`,
+      engagementId: `e${i}`,
+    }));
+    const engagements = many.map((a, i) => ({ ...ENGAGEMENT, id: a.engagementId, candidateId: `c${i}` }));
+    const candidates = engagements.map((e) => ({ ...CANDIDATE, id: e.candidateId }));
+    const read = fakeReadStore({
+      listAppointmentsByStart: async () => many,
+      listEngagementsByIds: async () => engagements,
+      listCandidatesByIds: async () => candidates,
+    });
+    const res = await request(appWith('interviewer', { readStore: read.store }))
+      .get(`/api/phone/calendar${RANGE}`);
+    expect(res.status).toBe(200);
+    expect(res.body.count).toBe(40);
+    // Forty appointments, three queries. A per-row candidate lookup would make
+    // this eighty-one.
+    expect(read.calls).toEqual([
+      'listAppointmentsByStart',
+      'listEngagementsByIds',
+      'listCandidatesByIds',
+    ]);
+  });
+
+  it('reports truncation instead of silently dropping rows', async () => {
+    const overflow = Array.from({ length: 201 }, (_, i) => ({ ...APPOINTMENT, id: `${i}` }));
+    const read = fakeReadStore({ listAppointmentsByStart: async () => overflow });
+    const res = await request(appWith('interviewer', { readStore: read.store }))
+      .get(`/api/phone/calendar${RANGE}`);
+    expect(res.body.truncated).toBe(true);
+    expect(res.body.count).toBe(200);
+    expect(res.body.appointments).toHaveLength(200);
+  });
+
+  it('carries the reference, name, status, IST display and appointment source', async () => {
+    const res = await request(appWith('interviewer', { readStore: fakeReadStore().store }))
+      .get(`/api/phone/calendar${RANGE}`);
+    const row = res.body.appointments[0];
+    expect(row.candidate).toEqual({
+      id: UUID_C,
+      name: 'Priya Example',
+      status: 'screening',
+      reference: 'ATS-9001',
+    });
+    expect(row.ist_start).toBe('09:00');
+    expect(row.ist_end).toBe('09:30');
+    expect(row.source).toBe('hr_manual');
+    expect(row.engagement_state).toBe('scheduled');
+    expect(row.version).toBe(3);
+    // Always null: nothing in 0042 writes it, and the field is reported rather
+    // than dropped so the residual stays visible.
+    expect(row.confirmed_at).toBeNull();
+    expect(res.body.window).toEqual({
+      time_zone: 'Asia/Kolkata',
+      open_ist: '09:00:00',
+      close_ist: '21:00:00',
+    });
+  });
+
+  it('reports a torn read as null rather than guessing a relationship', async () => {
+    const read = fakeReadStore({ listEngagementsByIds: async () => [] });
+    const res = await request(appWith('interviewer', { readStore: read.store }))
+      .get(`/api/phone/calendar${RANGE}`);
+    expect(res.body.appointments[0].engagement_state).toBeNull();
+    expect(res.body.appointments[0].candidate).toBeNull();
+  });
+
+  it('turns a read failure into a stable code, never a driver message', async () => {
+    const read = fakeReadStore({
+      listAppointmentsByStart: async () => {
+        throw new Error('permission denied for relation phone_appointments');
+      },
+    });
+    const res = await request(appWith('interviewer', { readStore: read.store }))
+      .get(`/api/phone/calendar${RANGE}`);
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ ok: false, error: 'phone_read_error' });
+  });
+});
+
+describe('the engagement projection', () => {
+  it('reports budgets against the mirrored 0042 ceilings', async () => {
+    const res = await request(appWith('interviewer', { readStore: fakeReadStore().store }))
+      .get(`/api/phone/engagements/${UUID_E}`);
+    expect(res.status).toBe(200);
+    expect(res.body.engagement.budgets).toEqual({
+      no_answer: { used: 2, ceiling: 3, exhausted: false },
+      reconnect: { used: 0, ceiling: 3, exhausted: false },
+      provider_failure: { used: 5, ceiling: 5, exhausted: true },
+    });
+    // The provider-error residual made visible: five failures, and the next
+    // legal instant is a whole IST day away.
+    expect(res.body.engagement.next_eligible_at).toBe('2026-08-25T03:30:00.000Z');
+    expect(res.body.engagement.next_eligible_ist).toBe('09:00');
+  });
+
+  it('shows attempt outcomes and nothing about the provider', async () => {
+    const res = await request(appWith('interviewer', { readStore: fakeReadStore().store }))
+      .get(`/api/phone/engagements/${UUID_E}`);
+    expect(res.body.attempts).toHaveLength(1);
+    expect(res.body.attempts[0]).toEqual({
+      id: ATTEMPT.id,
+      attempt_seq: 1,
+      epoch: 0,
+      kind: 'initial',
+      state: 'ended',
+      outcome_class: 'no_answer',
+      ist_date: '2026-08-23',
+      prior_engagement_state: 'eligible',
+      admitted_at: ATTEMPT.admittedAt,
+      answered_at: null,
+      classified_at: null,
+      ended_at: ATTEMPT.endedAt,
+    });
+  });
+
+  it('bounds the attempt list and says so', async () => {
+    const many = Array.from({ length: 51 }, (_, i) => ({ ...ATTEMPT, attemptSeq: i + 1 }));
+    const read = fakeReadStore({ listAttemptsForEngagement: async () => many });
+    const res = await request(appWith('interviewer', { readStore: read.store }))
+      .get(`/api/phone/engagements/${UUID_E}`);
+    expect(res.body.attempts).toHaveLength(50);
+    expect(res.body.attempts_truncated).toBe(true);
+  });
+
+  it('answers 404 for an unknown engagement', async () => {
+    const read = fakeReadStore({ getEngagement: async () => null });
+    const res = await request(appWith('interviewer', { readStore: read.store }))
+      .get(`/api/phone/engagements/${UUID_E}`);
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ ok: false, error: 'not_found' });
+  });
+});
+
+describe('the slots projection', () => {
+  it('returns the full IST day grid with the fleet cap and the booked total', async () => {
+    const read = fakeReadStore({ listLiveAppointmentsByStart: async () => [APPOINTMENT] });
+    const res = await request(appWith('interviewer', { readStore: read.store }))
+      .get('/api/phone/calendar/slots?date=2026-08-24');
+    expect(res.status).toBe(200);
+    expect(res.body.slots).toHaveLength(24);
+    expect(res.body.slot_seconds).toBe(1_800);
+    expect(res.body.max_concurrent).toBe(PHONE_MAX_CONCURRENT);
+    expect(res.body.booked_total).toBe(1);
+    expect(res.body.slots[0]).toEqual({
+      starts_at: '2026-08-24T03:30:00.000Z',
+      ends_at: '2026-08-24T04:00:00.000Z',
+      ist_start: '09:00',
+      ist_end: '09:30',
+      booked: 1,
+      remaining: PHONE_MAX_CONCURRENT - 1,
+      bookable: true,
+      refusals: [],
+    });
+    // ONE query for the whole day.
+    expect(read.calls).toEqual(['listLiveAppointmentsByStart']);
+    expect(res.body.occupancy_truncated).toBe(false);
+  });
+
+  it('says so when the day held more bookings than it counted', async () => {
+    // A silent truncation would under-count `booked` and therefore OVER-state
+    // `remaining` — wrong in the unsafe direction. The flag turns the answer
+    // into a stated lower bound.
+    const overflow = Array.from({ length: 401 }, (_, i) => ({ ...APPOINTMENT, id: `${i}` }));
+    const read = fakeReadStore({ listLiveAppointmentsByStart: async () => overflow });
+    const res = await request(appWith('interviewer', { readStore: read.store }))
+      .get('/api/phone/calendar/slots?date=2026-08-24');
+    expect(res.body.occupancy_truncated).toBe(true);
+    expect(res.body.booked_total).toBe(400);
+    expect(res.body.slots[0].remaining).toBe(0);
+    expect(res.body.slots[0].refusals).toEqual(['at_projected_capacity']);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════
+//  4. No PII on the wire
+// ════════════════════════════════════════════════════════════════════
+
+describe('nothing phone-bearing or provider-bearing is serialized', () => {
+  const FORBIDDEN =
+    /phone_e164|phone_raw|sip_call_id|room_name|participant_identity|egress|lease_token|lease_owner|provider_event_id|phone_sha256|transcript|bearer|@example\.test/i;
+
+  it('holds on every read', async () => {
+    const app = appWith('interviewer', {
+      readStore: fakeReadStore().store,
+      stores: fakeStores().store,
+    });
+    for (const path of [
+      `/api/phone/calendar${RANGE}`,
+      '/api/phone/calendar/slots?date=2026-08-24',
+      `/api/phone/engagements/${UUID_E}`,
+      '/api/phone/health',
+    ]) {
+      const res = await request(app).get(path);
+      const body = JSON.stringify(res.body);
+      expect(body, path).not.toMatch(FORBIDDEN);
+      // A digit run of ten or more is what a subscriber number looks like.
+      expect(body.replace(/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/g, ''), path)
+        .not.toMatch(/\d{10,}/);
+    }
+  });
+
+  it('holds in every audit record a mutation writes', async () => {
+    const app = appWith('admin', {
+      readStore: fakeReadStore().store,
+      stores: fakeStores().store,
+    });
+    await request(app).post('/api/phone/appointments').send({
+      engagement_id: UUID_E,
+      starts_at: '2026-08-24T04:00:00Z',
+      ends_at: '2026-08-24T04:30:00Z',
+    });
+    await request(app).delete(`/api/phone/appointments/${UUID_A}`)
+      .send({ reason: 'hr_cancelled', version: 3 });
+    await request(app).post('/api/phone/halt').send({ reason: 'operator_pause' });
+    expect(audited.length).toBeGreaterThanOrEqual(3);
+    for (const entry of audited) {
+      const meta = JSON.stringify(entry.metadata ?? {});
+      expect(meta).not.toMatch(FORBIDDEN);
+      // No candidate identity of any kind: opaque ids, counts and stable
+      // status strings only.
+      expect(meta).not.toContain('Priya');
+      expect(meta).not.toContain('ATS-9001');
+    }
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════
+//  5. Delegation and the status matrix
+// ════════════════════════════════════════════════════════════════════
+
+describe('booking delegates to schedule_phone_appointment', () => {
+  const body = {
+    engagement_id: UUID_E,
+    starts_at: '2026-08-24T04:00:00Z',
+    ends_at: '2026-08-24T04:30:00Z',
+  };
+
+  it('always sends hr_manual, a null expected version and the injected instant', async () => {
+    const write = fakeStores();
+    await request(appWith('admin', { stores: write.store })).post('/api/phone/appointments')
+      .send(body);
+    expect(write.calls).toHaveLength(1);
+    expect(write.calls[0].op).toBe('scheduleAppointment');
+    const input = write.calls[0].input as Record<string, unknown>;
+    expect(input.source).toBe('hr_manual');
+    // A POST must never silently supersede a live appointment.
+    expect(input.expectedVersion).toBeNull();
+    expect(input.now).toEqual(NOW);
+    expect(input.startsAt).toEqual(new Date('2026-08-24T04:00:00Z'));
+  });
+
+  it('reports ok_prereqs_pending as a success with a warning, not as ok', async () => {
+    const write = fakeStores({
+      scheduleAppointment: async () => ({
+        status: 'ok_prereqs_pending',
+        appointmentId: UUID_A,
+        version: 1,
+        engagementState: 'pending_prereqs',
+        supersededAppointmentId: null,
+      }),
+    });
+    const res = await request(appWith('admin', { stores: write.store }))
+      .post('/api/phone/appointments').send(body);
+    expect(res.status).toBe(201);
+    expect(res.body.prereqs_pending).toBe(true);
+    expect(res.body.engagement_state).toBe('pending_prereqs');
+  });
+
+  it('maps every refusal onto a stable status', async () => {
+    // Every refusal is a 409 carrying its own status as the error code, except
+    // `not_found`. `slot_in_past` and `window_closed` are conflicts with the
+    // state of the world, not malformed payloads — and keeping 400 exclusively
+    // for shape validation is what lets a client tell the two apart.
+    const cases: Array<[string, number]> = [
+      ['not_found', 404],
+      ['invalid_slot', 409],
+      ['slot_duration_invalid', 409],
+      ['slot_in_past', 409],
+      ['window_closed', 409],
+      ['slot_straddles_ist_midnight', 409],
+      ['invalid_source', 409],
+      ['appointment_exists', 409],
+      ['attempt_in_flight', 409],
+      ['engagement_terminal', 409],
+      ['version_conflict', 409],
+    ];
+    for (const [status, expected] of cases) {
+      const write = fakeStores({ scheduleAppointment: async () => ({ status: status as never }) });
+      const res = await request(appWith('admin', { stores: write.store }))
+        .post('/api/phone/appointments').send(body);
+      expect(res.status, status).toBe(expected);
+      expect(res.body.error, status).toBe(status === 'not_found' ? 'not_found' : status);
+    }
+  });
+
+  it('treats unknown_status as "we do not know", never as a refusal', async () => {
+    const write = fakeStores({
+      scheduleAppointment: async () => ({ status: 'unknown_status' as never }),
+    });
+    const res = await request(appWith('admin', { stores: write.store }))
+      .post('/api/phone/appointments').send(body);
+    expect(res.status).toBe(500);
+    expect(res.body.error).toBe('phone_rpc_unknown_status');
+  });
+
+  it('sanitizes a thrown store error', async () => {
+    const write = fakeStores({
+      scheduleAppointment: async () => { throw new Error('phone_schedule_appointment_error'); },
+    });
+    const res = await request(appWith('admin', { stores: write.store }))
+      .post('/api/phone/appointments').send(body);
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ ok: false, error: 'phone_action_error' });
+  });
+});
+
+describe('rescheduling supersedes atomically through the same RPC', () => {
+  const body = {
+    starts_at: '2026-08-24T05:00:00Z',
+    ends_at: '2026-08-24T05:30:00Z',
+    version: 3,
+  };
+
+  it('resolves the engagement from the path id and forwards the expected version', async () => {
+    const read = fakeReadStore();
+    const write = fakeStores({
+      scheduleAppointment: async () => ({
+        status: 'ok',
+        appointmentId: UUID_OTHER,
+        version: 1,
+        engagementState: 'scheduled',
+        supersededAppointmentId: UUID_A,
+      }),
+    });
+    const res = await request(appWith('admin', { readStore: read.store, stores: write.store }))
+      .patch(`/api/phone/appointments/${UUID_A}`).send(body);
+    expect(res.status).toBe(200);
+    const input = write.calls[0].input as Record<string, unknown>;
+    expect(input.engagementId).toBe(UUID_E);
+    expect(input.expectedVersion).toBe(3);
+    expect(input.source).toBe('hr_manual');
+    // There is no cancel-then-book here: exactly one RPC call, so there is no
+    // window in which the candidate has no slot at all.
+    expect(write.calls.map((c) => c.op)).toEqual(['scheduleAppointment']);
+    expect(res.body.appointment_id).toBe(UUID_OTHER);
+    expect(res.body.superseded_appointment_id).toBe(UUID_A);
+  });
+
+  it('returns the id the RPC actually superseded, not the one on the path', async () => {
+    // If a concurrent write changed which appointment was live, the RPC is the
+    // authority. Echoing the path id back would assert something we did not do.
+    const write = fakeStores({
+      scheduleAppointment: async () => ({
+        status: 'ok',
+        appointmentId: UUID_OTHER,
+        version: 1,
+        engagementState: 'scheduled',
+        supersededAppointmentId: '99999999-9999-4999-8999-999999999999',
+      }),
+    });
+    const res = await request(appWith('admin', {
+      readStore: fakeReadStore().store, stores: write.store,
+    })).patch(`/api/phone/appointments/${UUID_A}`).send(body);
+    expect(res.body.superseded_appointment_id).toBe('99999999-9999-4999-8999-999999999999');
+  });
+
+  it('refuses to reschedule an appointment that is no longer live', async () => {
+    for (const status of ['cancelled', 'superseded', 'fulfilled', 'missed'] as const) {
+      const read = fakeReadStore({ getAppointment: async () => ({ ...APPOINTMENT, status }) });
+      const write = fakeStores();
+      const res = await request(appWith('admin', { readStore: read.store, stores: write.store }))
+        .patch(`/api/phone/appointments/${UUID_A}`).send(body);
+      expect(res.status, status).toBe(409);
+      expect(res.body.error).toBe('not_live');
+      // Refused BEFORE delegation, so no other engagement's live slot could be
+      // superseded by a request aimed at a dead row.
+      expect(write.calls).toEqual([]);
+    }
+  });
+
+  it('404s an unknown appointment id without delegating', async () => {
+    const read = fakeReadStore({ getAppointment: async () => null });
+    const write = fakeStores();
+    const res = await request(appWith('admin', { readStore: read.store, stores: write.store }))
+      .patch(`/api/phone/appointments/${UUID_A}`).send(body);
+    expect(res.status).toBe(404);
+    expect(write.calls).toEqual([]);
+  });
+
+  it('surfaces a stale version as version_conflict', async () => {
+    const write = fakeStores({
+      scheduleAppointment: async () => ({
+        status: 'version_conflict', appointmentId: UUID_A, version: 7,
+      }),
+    });
+    const res = await request(appWith('admin', {
+      readStore: fakeReadStore().store, stores: write.store,
+    })).patch(`/api/phone/appointments/${UUID_A}`).send(body);
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe('version_conflict');
+  });
+});
+
+describe('cancelling', () => {
+  const body = { reason: 'hr_cancelled', version: 3 };
+
+  it('forwards the required version — never a null the RPC would treat as force', async () => {
+    const write = fakeStores();
+    await request(appWith('admin', { stores: write.store }))
+      .delete(`/api/phone/appointments/${UUID_A}`).send(body);
+    const input = write.calls[0].input as Record<string, unknown>;
+    expect(input.expectedVersion).toBe(3);
+    expect(input.reason).toBe('hr_cancelled');
+    expect(input.appointmentId).toBe(UUID_A);
+  });
+
+  it('treats already_cancelled as idempotent success, not as a conflict', async () => {
+    const write = fakeStores({
+      cancelAppointment: async () => ({
+        status: 'already_cancelled', appointmentId: UUID_A, version: 4,
+      }),
+    });
+    const res = await request(appWith('admin', { stores: write.store }))
+      .delete(`/api/phone/appointments/${UUID_A}`).send(body);
+    expect(res.status).toBe(200);
+    expect(res.body.already_cancelled).toBe(true);
+  });
+
+  it('maps the remaining refusals', async () => {
+    const cases: Array<[string, number]> = [
+      ['not_found', 404],
+      ['invalid_reason', 409],
+      ['not_live', 409],
+      ['version_conflict', 409],
+      ['unknown_status', 500],
+    ];
+    for (const [status, expected] of cases) {
+      const write = fakeStores({ cancelAppointment: async () => ({ status: status as never }) });
+      const res = await request(appWith('admin', { stores: write.store }))
+        .delete(`/api/phone/appointments/${UUID_A}`).send(body);
+      expect(res.status, status).toBe(expected);
+    }
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════
+//  6. Health
+// ════════════════════════════════════════════════════════════════════
+
+describe('the health surface', () => {
+  it('reports ok with split ingress counts when everything is nominal', async () => {
+    const res = await request(appWith('interviewer', { stores: fakeStores().store }))
+      .get('/api/phone/health');
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('ok');
+    expect(res.body.reasons).toEqual([]);
+    // The five ingress verdicts stay SEPARATE: a stale epoch is fencing working
+    // as designed, an unknown attempt is an ingress talking about a call we
+    // have no record of. Collapsing them would hide opposite signals.
+    expect(res.body.ingress).toEqual({
+      ignored_last_24h: 7,
+      unknown_attempt_last_24h: 2,
+      stale_epoch_last_24h: 3,
+      terminal_last_24h: 1,
+      unexpected_event_last_24h: 1,
+    });
+    expect(res.body.concurrency).toEqual({
+      live: 2,
+      live_with_unexpired_lease: 2,
+      max_concurrent: PHONE_MAX_CONCURRENT,
+      oldest_live_age_seconds: 12,
+    });
+    expect(res.body.window.open_now).toBe(true);
+    expect(res.body.window.ist_date).toBe('2026-08-24');
+    expect(res.body.engagements_by_state).toEqual({ eligible: 3, scheduled: 1 });
+  });
+
+  it('degrades with nulls — never a healthy zero — when the backlog is unreadable', async () => {
+    for (const stores of [
+      fakeStores({ backlog: async () => { throw new Error('phone_backlog_error'); } }),
+      fakeStores({ backlog: async () => ({ status: 'unknown_status' as never }) }),
+    ]) {
+      const res = await request(appWith('interviewer', { stores: stores.store }))
+        .get('/api/phone/health');
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('degraded');
+      expect(res.body.reasons).toEqual(['backlog_unavailable']);
+      expect(res.body.backlog_unavailable).toBe(true);
+      // "We could not read it" and "there is none" are different answers, and
+      // only one of them means everything is fine.
+      expect(res.body.admission).toBeNull();
+      expect(res.body.concurrency).toBeNull();
+      expect(res.body.appointments).toBeNull();
+      expect(res.body.ingress).toBeNull();
+      expect(res.body.engagements_by_state).toBeNull();
+    }
+  });
+
+  it('reports a MISSING control singleton as halted and unreadable', async () => {
+    const stores = fakeStores({
+      backlog: async () => ({
+        ...HEALTHY_BACKLOG,
+        admission: { controlPresent: false, halted: true, haltReason: 'halt_unreadable' },
+      }),
+    });
+    const res = await request(appWith('interviewer', { stores: stores.store }))
+      .get('/api/phone/health');
+    expect(res.body.status).toBe('degraded');
+    expect(res.body.reasons).toEqual(['halt_unreadable', 'admission_halted']);
+    expect(res.body.admission.halted).toBe(true);
+  });
+
+  it('raises the operational reasons the counts imply', async () => {
+    const cases: Array<[Record<string, unknown>, string]> = [
+      [{ admission: { controlPresent: true, halted: true, haltReason: 'cost_control' } },
+        'admission_halted'],
+      [{ attempts: { ...HEALTHY_BACKLOG.attempts, live: 5, liveWithUnexpiredLease: 2 } },
+        'attempt_leases_expired'],
+      [{ attempts: { ...HEALTHY_BACKLOG.attempts, live: 10, liveWithUnexpiredLease: 10 } },
+        'fleet_at_capacity'],
+      [{ appointments: { live: 4, overdue: 2 } }, 'appointments_overdue'],
+    ];
+    for (const [patch, reason] of cases) {
+      const stores = fakeStores({ backlog: async () => ({ ...HEALTHY_BACKLOG, ...patch }) });
+      const res = await request(appWith('interviewer', { stores: stores.store }))
+        .get('/api/phone/health');
+      expect(res.body.reasons, reason).toContain(reason);
+      expect(res.body.status).toBe('degraded');
+    }
+  });
+
+  it('always publishes the four P1 residuals', async () => {
+    const res = await request(appWith('interviewer', { stores: fakeStores().store }))
+      .get('/api/phone/health');
+    const codes = res.body.residuals.map((r: { code: string }) => r.code);
+    expect(codes).toEqual([
+      'appointment_confirmed_has_no_writer',
+      'appointment_fulfilled_written_by_admission',
+      'appointment_missed_written_by_expiry_sweep',
+      'provider_error_costs_one_ist_day',
+    ]);
+    expect(res.body.residuals[0].writer).toBeNull();
+  });
+
+  it('reports the configuration as booleans and counts, never as secrets', async () => {
+    const res = await request(appWith('interviewer', { stores: fakeStores().store }))
+      .get('/api/phone/health');
+    expect(res.body.config).toEqual({
+      screeningEnabled: true,
+      runtimeEnabled: false,
+      runtimeActive: false,
+      dialMode: 'off',
+      dialAllowlistSize: 0,
+      liveDialPermitted: false,
+    });
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════
+//  7. The kill switch, and audit fail-closed
+// ════════════════════════════════════════════════════════════════════
+
+describe('halt', () => {
+  it('delegates to set_phone_halt and reports whether it was already in force', async () => {
+    const write = fakeStores({ setHalt: async () => ({ status: 'ok', alreadyHalted: true }) });
+    const res = await request(appWith('admin', { stores: write.store }))
+      .post('/api/phone/halt').send({ reason: 'provider_incident' });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      ok: true, halted: true, already_halted: true, reason: 'provider_incident',
+    });
+    expect((write.calls[0].input as Record<string, unknown>).reason).toBe('provider_incident');
+  });
+
+  it('rolls the halt back and returns 500 when the audit write fails', async () => {
+    setAuditSink(() => { throw new Error('audit db insert failed'); });
+    const write = fakeStores({ setHalt: async () => ({ status: 'ok', alreadyHalted: false }) });
+    const res = await request(appWith('admin', { stores: write.store }))
+      .post('/api/phone/halt').send({ reason: 'operator_pause' });
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ ok: false, error: 'phone_audit_write_failed', rolled_back: true });
+    expect(write.calls.map((c) => c.op)).toEqual(['setHalt', 'clearHalt']);
+  });
+
+  it('does NOT roll back a halt that was already in force', async () => {
+    // 0042 preserves the original instant, reason and actor across repeated
+    // halts, so our call changed nothing — clearing would undo somebody else's
+    // decision on the strength of our own audit failure.
+    setAuditSink(() => { throw new Error('audit db insert failed'); });
+    const write = fakeStores({ setHalt: async () => ({ status: 'ok', alreadyHalted: true }) });
+    const res = await request(appWith('admin', { stores: write.store }))
+      .post('/api/phone/halt').send({ reason: 'operator_pause' });
+    expect(res.status).toBe(500);
+    expect(res.body.rolled_back).toBe(false);
+    expect(write.calls.map((c) => c.op)).toEqual(['setHalt']);
+  });
+
+  it('reports honestly when the rollback itself fails', async () => {
+    setAuditSink(() => { throw new Error('audit db insert failed'); });
+    const write = fakeStores({
+      setHalt: async () => ({ status: 'ok', alreadyHalted: false }),
+      clearHalt: async () => { throw new Error('phone_clear_halt_error'); },
+    });
+    const res = await request(appWith('admin', { stores: write.store }))
+      .post('/api/phone/halt').send({ reason: 'operator_pause' });
+    expect(res.status).toBe(500);
+    expect(res.body.rolled_back).toBe(false);
+  });
+});
+
+describe('halt/clear', () => {
+  it('requires the reason to name the halt currently in force', async () => {
+    const write = fakeStores({
+      backlog: async () => ({
+        ...HEALTHY_BACKLOG,
+        admission: { controlPresent: true, halted: true, haltReason: 'legal_hold' },
+      }),
+    });
+    const res = await request(appWith('admin', { stores: write.store }))
+      .post('/api/phone/halt/clear').send({ reason: 'cost_control' });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe('halt_reason_mismatch');
+    // Refused before delegation: an admin who has not looked at why the dialer
+    // was stopped cannot restart it.
+    expect(write.calls.map((c) => c.op)).toEqual(['backlog']);
+  });
+
+  it('clears when the reason matches', async () => {
+    const write = fakeStores({
+      backlog: async () => ({
+        ...HEALTHY_BACKLOG,
+        admission: { controlPresent: true, halted: true, haltReason: 'legal_hold' },
+      }),
+    });
+    const res = await request(appWith('admin', { stores: write.store }))
+      .post('/api/phone/halt/clear').send({ reason: 'legal_hold' });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      ok: true, halted: false, was_halted: true, previous_reason: 'legal_hold',
+    });
+    expect(write.calls.map((c) => c.op)).toEqual(['backlog', 'clearHalt']);
+  });
+
+  it('refuses to lift a halt it cannot describe', async () => {
+    const unreadable = fakeStores({
+      backlog: async () => ({
+        ...HEALTHY_BACKLOG,
+        admission: { controlPresent: false, halted: true, haltReason: 'halt_unreadable' },
+      }),
+    });
+    const res = await request(appWith('admin', { stores: unreadable.store }))
+      .post('/api/phone/halt/clear').send({ reason: 'operator_pause' });
+    expect(res.status).toBe(503);
+    expect(res.body.error).toBe('halt_unreadable');
+    expect(unreadable.calls.map((c) => c.op)).toEqual(['backlog']);
+
+    const blind = fakeStores({ backlog: async () => { throw new Error('phone_backlog_error'); } });
+    const res2 = await request(appWith('admin', { stores: blind.store }))
+      .post('/api/phone/halt/clear').send({ reason: 'operator_pause' });
+    expect(res2.status).toBe(500);
+  });
+
+  it('re-halts with the verified reason when the audit write fails', async () => {
+    const write = fakeStores({
+      backlog: async () => ({
+        ...HEALTHY_BACKLOG,
+        admission: { controlPresent: true, halted: true, haltReason: 'emergency_stop' },
+      }),
+      clearHalt: async () => ({ status: 'ok', wasHalted: true }),
+    });
+    let seen = 0;
+    setAuditSink(() => {
+      seen += 1;
+      throw new Error('audit db insert failed');
+    });
+    const res = await request(appWith('admin', { stores: write.store }))
+      .post('/api/phone/halt/clear').send({ reason: 'emergency_stop' });
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ ok: false, error: 'phone_audit_write_failed', rolled_back: true });
+    expect(seen).toBe(1);
+    expect(write.calls.map((c) => c.op)).toEqual(['backlog', 'clearHalt', 'setHalt']);
+    // Restored with the reason that was VERIFIED against the control row, not
+    // one this route guessed.
+    expect((write.calls[2].input as Record<string, unknown>).reason).toBe('emergency_stop');
+  });
+
+  it('refuses to clear when the control read itself fails', async () => {
+    // The backlog RPC answered, but not with `ok`. That is not "nothing is
+    // halted" — it is "we do not know", and lifting a kill switch on a guess is
+    // the one thing this route must never do.
+    const write = fakeStores({ backlog: async () => ({ status: 'unknown_status' as never }) });
+    const res = await request(appWith('admin', { stores: write.store }))
+      .post('/api/phone/halt/clear').send({ reason: 'operator_pause' });
+    expect(res.status).toBe(503);
+    expect(res.body.error).toBe('halt_state_unavailable');
+    expect(write.calls.map((c) => c.op)).toEqual(['backlog']);
+  });
+
+  it('surfaces a halt_unreadable from the RPC itself as a 503', async () => {
+    // The singleton can vanish between the pre-read and the clear. 0042
+    // refuses to invent a cleared row and neither does this route.
+    const write = fakeStores({
+      backlog: async () => ({
+        ...HEALTHY_BACKLOG,
+        admission: { controlPresent: true, halted: true, haltReason: 'cost_control' },
+      }),
+      clearHalt: async () => ({ status: 'halt_unreadable' }),
+    });
+    const res = await request(appWith('admin', { stores: write.store }))
+      .post('/api/phone/halt/clear').send({ reason: 'cost_control' });
+    expect(res.status).toBe(503);
+    expect(res.body.error).toBe('halt_unreadable');
+    expect(audited).toEqual([]);
+  });
+
+  it('treats an unrecognised clear answer as "we do not know"', async () => {
+    const write = fakeStores({
+      backlog: async () => ({
+        ...HEALTHY_BACKLOG,
+        admission: { controlPresent: true, halted: true, haltReason: 'cost_control' },
+      }),
+      clearHalt: async () => ({ status: 'unknown_status' as never }),
+    });
+    const res = await request(appWith('admin', { stores: write.store }))
+      .post('/api/phone/halt/clear').send({ reason: 'cost_control' });
+    expect(res.status).toBe(500);
+    expect(res.body.error).toBe('phone_rpc_unknown_status');
+  });
+
+  it('does not re-halt when the clear was already a no-op', async () => {
+    setAuditSink(() => { throw new Error('audit db insert failed'); });
+    const write = fakeStores({
+      backlog: async () => ({
+        ...HEALTHY_BACKLOG,
+        admission: { controlPresent: true, halted: false, haltReason: null },
+      }),
+      clearHalt: async () => ({ status: 'ok', wasHalted: false }),
+    });
+    const res = await request(appWith('admin', { stores: write.store }))
+      .post('/api/phone/halt/clear').send({ reason: 'operator_pause' });
+    expect(res.status).toBe(500);
+    expect(res.body.rolled_back).toBe(false);
+    expect(write.calls.map((c) => c.op)).toEqual(['backlog', 'clearHalt']);
+  });
+});
+
+describe('audit is fail-closed on every appointment mutation', () => {
+  it('returns 500 without claiming a rollback the substrate cannot give', async () => {
+    setAuditSink(() => { throw new Error('audit db insert failed'); });
+    const app = appWith('admin', {
+      readStore: fakeReadStore().store,
+      stores: fakeStores().store,
+    });
+    const create = await request(app).post('/api/phone/appointments').send({
+      engagement_id: UUID_E,
+      starts_at: '2026-08-24T04:00:00Z',
+      ends_at: '2026-08-24T04:30:00Z',
+    });
+    expect(create.status).toBe(500);
+    expect(create.body).toEqual({
+      ok: false, error: 'phone_audit_write_failed', rolled_back: false,
+    });
+    const patch = await request(app).patch(`/api/phone/appointments/${UUID_A}`).send({
+      starts_at: '2026-08-24T05:00:00Z',
+      ends_at: '2026-08-24T05:30:00Z',
+      version: 3,
+    });
+    expect(patch.status).toBe(500);
+    const cancel = await request(app).delete(`/api/phone/appointments/${UUID_A}`)
+      .send({ reason: 'hr_cancelled', version: 3 });
+    expect(cancel.status).toBe(500);
+  });
+
+  it('a failing audit on a READ never turns a 200 into a 500', async () => {
+    // `resource.read`/`resource.list` are fail-open by policy: an audit sink
+    // outage must not take the operator's calendar down.
+    setAuditSink(() => { throw new Error('audit db insert failed'); });
+    const app = appWith('interviewer', {
+      readStore: fakeReadStore().store,
+      stores: fakeStores().store,
+    });
+    for (const path of [
+      `/api/phone/calendar${RANGE}`,
+      '/api/phone/calendar/slots?date=2026-08-24',
+      `/api/phone/engagements/${UUID_E}`,
+      '/api/phone/health',
+    ]) {
+      expect((await request(app).get(path)).status, path).toBe(200);
+    }
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════
+//  8. The disabled default
+// ════════════════════════════════════════════════════════════════════
+
+describe('while PHONE_SCREENING_ENABLED is off', () => {
+  const disabled = (deps: PhoneApiDeps = {}) =>
+    appWith('admin', { configSource: DISABLED, now: () => NOW, ...deps });
+
+  it('reads report the feature as disabled and touch NO store', async () => {
+    const read = fakeReadStore();
+    const write = fakeStores();
+    const app = disabled({ readStore: read.store, stores: write.store });
+    const calendar = await request(app).get(`/api/phone/calendar${RANGE}`);
+    expect(calendar.status).toBe(200);
+    expect(calendar.body).toMatchObject({
+      ok: true, enabled: false, count: 0, truncated: false, appointments: [],
+    });
+    const slots = await request(app).get('/api/phone/calendar/slots?date=2026-08-24');
+    expect(slots.body).toMatchObject({
+      enabled: false, slots: [], max_concurrent: null, occupancy_truncated: false,
+    });
+    const engagement = await request(app).get(`/api/phone/engagements/${UUID_E}`);
+    expect(engagement.status).toBe(200);
+    expect(engagement.body).toMatchObject({ enabled: false, engagement: null, attempts: [] });
+    const health = await request(app).get('/api/phone/health');
+    expect(health.body.status).toBe('disabled');
+    expect(health.body.reasons).toEqual(['phone_screening_disabled']);
+    expect(health.body.admission).toBeNull();
+    // The residuals are still true while the feature is off.
+    expect(health.body.residuals).toHaveLength(4);
+    expect(read.calls).toEqual([]);
+    expect(write.calls).toEqual([]);
+  });
+
+  it('every write is refused with 503 and performs ZERO work', async () => {
+    const read = fakeReadStore();
+    const write = fakeStores();
+    const app = disabled({ readStore: read.store, stores: write.store });
+    const cases: Array<[string, string, unknown]> = [
+      ['post', '/api/phone/appointments', {
+        engagement_id: UUID_E,
+        starts_at: '2026-08-24T04:00:00Z',
+        ends_at: '2026-08-24T04:30:00Z',
+      }],
+      ['patch', `/api/phone/appointments/${UUID_A}`, {
+        starts_at: '2026-08-24T04:00:00Z',
+        ends_at: '2026-08-24T04:30:00Z',
+        version: 3,
+      }],
+      ['delete', `/api/phone/appointments/${UUID_A}`, { reason: 'hr_cancelled', version: 3 }],
+      ['post', '/api/phone/halt', { reason: 'operator_pause' }],
+      ['post', '/api/phone/halt/clear', { reason: 'operator_pause' }],
+    ];
+    for (const [method, path, body] of cases) {
+      const res = await (request(app) as never as Record<string, Function>)[method](path)
+        .send(body);
+      expect(res.status, `${method} ${path}`).toBe(503);
+      expect(res.body).toEqual({ ok: false, error: 'phone_screening_disabled' });
+    }
+    expect(write.calls).toEqual([]);
+    expect(read.calls).toEqual([]);
+    expect(audited).toEqual([]);
+  });
+});
