@@ -19,6 +19,25 @@
  *    written to stderr.
  *  - No relative imports to TypeScript source, so it runs in compiled/production
  *    layouts without tsx.
+ *
+ * STDOUT IS A PROTOCOL CHANNEL, NOT A LOG.
+ *  The parent reads the WHOLE of stdout and `JSON.parse`s it, so a single
+ *  foreign byte on stdout destroys the result. `pdf.js` (bundled inside
+ *  pdf-parse) does exactly that: its `warn()`/`info()` write
+ *  `Warning: …` / `Info: …` through `console.log` — i.e. to STDOUT — and its
+ *  default verbosity level is `warnings`. A PDF with, say, a stale `startxref`
+ *  offset is recovered by pdf.js (it rebuilds the xref) but warns while doing
+ *  so, and that warning line turned a perfectly well-formed child result into
+ *  `bad_output` at the parent, which the ingestion then recorded as
+ *  `parse_bad_output` — a DOCUMENT VERDICT about a document that was never
+ *  judged. The child's real answer, valid JSON, was sitting on the very next
+ *  line.
+ *
+ *  So the console is detached from stdout before ANY library can run: the real
+ *  writer is captured first and used for the one protocol line, and every
+ *  `console.*` sink is redirected to stderr, which the parent already drains
+ *  and discards. This is library-agnostic on purpose — it holds for mammoth
+ *  and for anything added later, not just for today's pdf.js.
  */
 
 // @ts-check
@@ -26,9 +45,38 @@
 const DEFAULT_MAX_INPUT_BYTES = 25 * 1024 * 1024; // 25 MiB
 const DEFAULT_MAX_OUTPUT_CHARS = 50_000;
 
+// ── stdout purity ──────────────────────────────────────────────────────────
+// Captured BEFORE anything else so the protocol line is written through the
+// real sink even after the console has been redirected below.
+const writeProtocolLine = process.stdout.write.bind(process.stdout);
+
+/**
+ * Detach every console sink from stdout, in place, before any library loads.
+ *
+ * Redirected to STDERR rather than dropped: the parent drains and discards
+ * stderr, so a library's diagnostics stay available to a human running the
+ * child by hand while being unable to corrupt the protocol channel. Nothing
+ * sensitive is introduced by this — the parent never stores stderr, exactly as
+ * before.
+ */
+function detachConsoleFromStdout() {
+  const toStderr = (...args) => {
+    try {
+      process.stderr.write(args.map((a) => (typeof a === 'string' ? a : String(a))).join(' ') + '\n');
+    } catch {
+      /* stderr unavailable: drop rather than fall back to stdout */
+    }
+  };
+  for (const method of ['log', 'info', 'warn', 'error', 'debug', 'trace', 'dir']) {
+    console[method] = toStderr;
+  }
+}
+
+detachConsoleFromStdout();
+
 /** Write a stable error result and exit cleanly so the parent can read it. */
 function emitError(code) {
-  process.stdout.write(JSON.stringify({ ok: false, error: code }) + '\n');
+  writeProtocolLine(JSON.stringify({ ok: false, error: code }) + '\n');
   process.exit(0);
 }
 
@@ -98,7 +146,7 @@ async function main() {
     // Unicode-safe truncation by code unit, reporting the pre-truncation length.
     const totalLength = text.length;
     const bounded = totalLength > maxOutputChars ? text.slice(0, maxOutputChars) : text;
-    process.stdout.write(JSON.stringify({ ok: true, text: bounded, totalLength }) + '\n');
+    writeProtocolLine(JSON.stringify({ ok: true, text: bounded, totalLength }) + '\n');
   } catch {
     // Never surface a library's dynamic message (could echo file content).
     emitError('EXTRACT_FAILED');
