@@ -533,6 +533,62 @@ paths:
                 $ref: '#/components/schemas/WorkerContextError'
 
   # ── Ashby integration ──────────────────────────────────────────────
+  /api/integrations/livekit-phone/webhook:
+    post:
+      tags: [phone]
+      operationId: receiveLiveKitPhoneWebhook
+      summary: Receive a LiveKit phone webhook verified by the signed Authorize JWT
+      description: Inbound LiveKit phone webhook receiver for outbound phone screening. The only trust boundary is the LiveKit Authorize JWT, whose sha256 claim is verified against the exact raw request bytes before any JSON parsing, with issuer, expiry and not-before enforced under an explicit clock tolerance (PHONE_WEBHOOK_TOLERANCE_SECONDS, default 300 seconds, a deliberate widening of the SDK default of 10). This is not the Ashby HMAC scheme. Not recruiter authenticated and mounted before auth; only this exact method and path are public. The call attempt is resolved solely from the deterministic phone participant identity, never from a phone number, and no participant attribute other than the fencing epoch is read. Disabled by default and fails closed with no database or network work until the phone screening master flag is on and the existing LiveKit key pair is configured. Duplicate deliveries return the original outcome; unknown, stale, terminal and unexpected events are accepted and recorded with a stable sanitized status.
+      parameters:
+        - name: Authorize
+          in: header
+          required: true
+          description: LiveKit-signed JWT whose sha256 claim is the digest of the raw request body.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Verdict reached and durable, duplicate acknowledged with the original outcome, or a non-phone LiveKit event accepted and ignored without database work.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWebhookAck'
+        '400':
+          description: Empty body, a body that is not valid UTF-8, or a signed event name this SDK version cannot produce (non-retryable).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWebhookError'
+        '401':
+          description: Authorize header missing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWebhookError'
+        '403':
+          description: JWT signature, expiry tolerance, or body hash did not verify.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWebhookError'
+        '413':
+          description: Raw body exceeded PHONE_WEBHOOK_MAX_BYTES.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWebhookError'
+        '500':
+          description: The apply outcome could not be determined and redelivery is wanted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWebhookError'
+        '503':
+          description: Phone screening disabled or LiveKit credentials not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWebhookError'
   /api/integrations/ashby/webhook:
     post:
       tags: [ashby]
@@ -3196,6 +3252,26 @@ components:
       properties:
         ok:
           type: boolean
+      additionalProperties: false
+
+    PhoneWebhookAck:
+      type: object
+      required: [ok, status]
+      properties:
+        ok:
+          type: boolean
+        status:
+          type: string
+      additionalProperties: false
+
+    PhoneWebhookError:
+      type: object
+      required: [ok, error]
+      properties:
+        ok:
+          type: boolean
+        error:
+          type: string
       additionalProperties: false
 
     AshbyWebhookAck:

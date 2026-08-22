@@ -905,12 +905,12 @@ describe('OpenAPI document integrity', () => {
     //   (0041). Deliberately its own route rather than a widening of the
     //   one above, so the ordinary recovery's allowlist keeps refusing
     //   every document verdict.
-    expect(Object.keys(paths).length).toBe(78);
+    expect(Object.keys(paths).length).toBe(79);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
     // + the three candidate-scoped Ashby workflow-card schemas.
-    expect(Object.keys(schemas).length).toBe(160);
+    expect(Object.keys(schemas).length).toBe(162);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.
@@ -968,6 +968,10 @@ describe('auth boundary vs spec security model', () => {
     'POST /api/internal/assess/{sessionId}',
     // Ashby webhook: HMAC-gated (not recruiter-authenticated), mounted pre-auth.
     'POST /api/integrations/ashby/webhook',
+    // LiveKit phone webhook: JWT-gated (not recruiter-authenticated), mounted
+    // pre-auth. Public at this EXACT method+path only; every other method or
+    // path under the prefix falls through to the auth middleware.
+    'POST /api/integrations/livekit-phone/webhook',
     'POST /api/livekit/grant/recording',
     // Phase 9 L4 exact public allowlist (method+path precise).
     'GET /api/status',
