@@ -26,16 +26,21 @@
 -- =====================================================================
 
 -- `\g /dev/null` keeps the parameter plumbing out of the suite's output.
-select set_config('pol40c.link', :'link_id', false),
-       set_config('pol40c.tag',  :'tag',     false) \g /dev/null
+select set_config('pol40c.link',   :'link_id', false),
+       set_config('pol40c.tag',    :'tag',     false),
+       set_config('pol40c.reason', :'reason',  false) \g /dev/null
 
 do $$
 declare
   v_role uuid;
   v_map  uuid;
   v_link constant uuid := current_setting('pol40c.link')::uuid;
-  v_tag  constant text := current_setting('pol40c.tag');
-  v_res  jsonb;
+  v_tag    constant text := current_setting('pol40c.tag');
+  -- `parse_timeout` exercises the 0040 door; `parse_bad_output` (aged behind
+  -- the stdout_purity boundary) exercises the 0041 one-shot door.
+  v_reason constant text := current_setting('pol40c.reason');
+  v_bound  timestamptz;
+  v_res    jsonb;
 begin
   select id into v_role from screening_v2.roles limit 1;
   if v_role is null then
@@ -78,7 +83,7 @@ begin
   perform screening_v2.advance_ashby_ingestion(v_link, 'queued',   null, null, null, null);
   perform screening_v2.advance_ashby_ingestion(v_link, 'fetching', null, null, null, null);
   v_res := screening_v2.advance_ashby_ingestion(v_link, 'failed_review', null, null, null,
-                                                'parse_timeout');
+                                                v_reason);
   if v_res->>'status' <> 'ok' then
     raise exception 'pol40c: fixture could not be rested in failed_review: %', v_res;
   end if;
@@ -99,6 +104,19 @@ begin
     raise exception 'pol40c: link % already carries a recovery audit row; each phase needs a fresh link id', v_link;
   end if;
 
-  raise notice 'pol40c: fixture % ready at % (failed_review / parse_timeout / attempts=0)', v_tag, v_link;
+  -- A legacy fixture must sit strictly BEHIND the server-stamped boundary, or
+  -- the 0041 door would refuse it as a genuine post-fix protocol anomaly.
+  if v_reason = 'parse_bad_output' then
+    select effective_at into v_bound
+      from screening_v2.ashby_parser_fix_markers where marker = 'stdout_purity';
+    if v_bound is null then
+      raise exception 'pol40c: stdout_purity boundary missing; 0041 fixture cannot be aged';
+    end if;
+    update screening_v2.ashby_resume_ingestions
+       set updated_at = v_bound - interval '1 day'
+     where application_link_id = v_link;
+  end if;
+
+  raise notice 'pol40c: fixture % ready at % (failed_review / % / attempts=0)', v_tag, v_link, v_reason;
 end;
 $$;

@@ -7941,6 +7941,495 @@ $$;
 
 
 
+-- =====================================================================
+-- 0041: the ONE-SHOT release of a LEGACY parse_bad_output row.
+--
+-- `parse_bad_output` is raised by the parser parent in exactly one place —
+-- when `JSON.parse` of the child's stdout throws — so it never meant "this
+-- document is bad". Our own dependency was breaking that channel: pdf.js
+-- logs warnings through `console.log`, i.e. to stdout, so a PDF it merely
+-- warned about had a `Warning: ` line prepended to the child's valid JSON.
+-- Those rows recorded a verdict the document never earned, and document
+-- verdicts are refused by the 0039/0040 recovery for ever.
+--
+-- These tests hold the door to exactly one population — `parse_bad_output`
+-- strictly older than the server-stamped boundary — and prove that every
+-- other row, including a NEWER parse_bad_output, is still refused.
+-- =====================================================================
+
+select _policy_tests.assert(
+  'ashby 0041: the boundary marker exists, is stamped, and is service-role only',
+  (select count(*) from screening_v2.ashby_parser_fix_markers
+    where marker = 'stdout_purity' and effective_at is not null) = 1
+  and (select relrowsecurity from pg_class
+        where oid = 'screening_v2.ashby_parser_fix_markers'::regclass),
+  'the discriminator must be durable, present, and not readable from a browser role'
+);
+
+select _policy_tests.assert(
+  'ashby 0041: recover_ashby_legacy_bad_output is service-role only and pins search_path',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname = 'recover_ashby_legacy_bad_output'
+      and p.prosecdef
+      and array_to_string(coalesce(p.proconfig, '{}'), ',') like '%search_path%'
+      and not has_function_privilege('anon', p.oid, 'EXECUTE')
+      and not has_function_privilege('authenticated', p.oid, 'EXECUTE')
+      and has_function_privilege('service_role', p.oid, 'EXECUTE')
+  ) = 1,
+  'a legacy release must not be reachable from a browser role'
+);
+
+select _policy_tests.assert(
+  'ashby 0041: the recovery locks the LINK before the ingestion',
+  (select position('from screening_v2.ashby_application_links' in body) > 0
+      and position('from screening_v2.ashby_resume_ingestions' in body) > 0
+      and position('from screening_v2.ashby_application_links' in body)
+        < position('from screening_v2.ashby_resume_ingestions' in body)
+     from (select pg_get_functiondef(p.oid) as body
+             from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+            where n.nspname = 'screening_v2'
+              and p.proname = 'recover_ashby_legacy_bad_output') s),
+  'cancel_ashby_application takes link-then-ingestion; the reverse here would be '
+  'a deadlock-prone inversion between two service-role writers'
+);
+
+select _policy_tests.assert(
+  'ashby 0041: the new audit action is permitted and nothing earlier was dropped',
+  (select pg_get_constraintdef(oid) from pg_constraint
+    where conname = 'chk_audit_action'
+      and conrelid = 'screening_v2.audit_events'::regclass)
+    like '%ashby_ingestion_legacy_bad_output_recovery%'
+  and (select bool_and(pg_get_constraintdef(c.oid) like ('%' || a || '%'))
+         from pg_constraint c,
+              unnest(array['invite_sent','grant_issued','recording_quarantined',
+                           'ashby_mapping_update','ashby_operation_retry',
+                           'ashby_invite_delivered','ashby_ingestion_attempts_reset',
+                           'ashby_ingestion_parse_recovery']) as a
+        where c.conname = 'chk_audit_action'
+          and c.conrelid = 'screening_v2.audit_events'::regclass),
+  'widening chk_audit_action must be purely additive'
+);
+
+do $$
+declare
+  v_role      uuid;
+  v_map       uuid;
+  v_link_leg  uuid;   -- legacy parse_bad_output           → released ONCE
+  v_link_new  uuid;   -- parse_bad_output AFTER the boundary → refused
+  v_link_ext  uuid;   -- parse_extract_failed               → refused
+  v_link_out  uuid;   -- parse_output_exceeded              → refused
+  v_link_scan uuid;   -- scan_infected                      → refused
+  v_link_term uuid;   -- terminal application               → refused
+  v_link_ex   uuid;   -- exhausted global ceiling           → refused
+  v_link_fail uuid;   -- enqueue fails                      → full rollback
+  v_owner     uuid := '00000000-0000-4000-8000-0000000000ae';
+  v_boundary  timestamptz;
+  v_before    timestamptz;
+  v_res       jsonb;
+  v_state     text;
+  v_reason    text;
+  v_att       integer;
+  v_att0      integer;
+  v_cnt       integer;
+  v_audits    integer;
+  v_shot      timestamptz;
+  v_payload   jsonb;
+  v_job       record;
+  v_now       timestamptz := now();
+begin
+  select id into v_role from screening_v2.roles limit 1;
+  if v_role is null then
+    perform _policy_tests.assert('ashby 0041 functional: seed role present', false,
+      'no seed role available');
+    return;
+  end if;
+
+  select effective_at into v_boundary
+    from screening_v2.ashby_parser_fix_markers where marker = 'stdout_purity';
+  v_before := v_boundary - interval '1 day';   -- unambiguously "legacy"
+
+  insert into screening_v2.ashby_job_mappings
+    (external_job_id, role_id, owner_id, ai_screening_stage_id, ta_screening_stage_id,
+     status, delivery_mode)
+  values ('pol41-job', v_role, v_owner, 'pol41-ai', 'pol41-ta', 'enabled', 'manual')
+  returning id into v_map;
+
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol41-app-leg',  'pol41-job', v_map, repeat('h', 64)) returning id into v_link_leg;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol41-app-new',  'pol41-job', v_map, repeat('h', 64)) returning id into v_link_new;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol41-app-ext',  'pol41-job', v_map, repeat('h', 64)) returning id into v_link_ext;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol41-app-out',  'pol41-job', v_map, repeat('h', 64)) returning id into v_link_out;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol41-app-scan', 'pol41-job', v_map, repeat('h', 64)) returning id into v_link_scan;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol41-app-term', 'pol41-job', v_map, repeat('h', 64)) returning id into v_link_term;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol41-app-ex',   'pol41-job', v_map, repeat('h', 64)) returning id into v_link_ex;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol41-app-fail', 'pol41-job', v_map, repeat('h', 64)) returning id into v_link_fail;
+
+  -- Helper shape: rest a row in failed_review on a given reason, then age it.
+  -- `updated_at` is what the boundary compares, so it is set explicitly rather
+  -- than left to the transition clock.
+  perform screening_v2.advance_ashby_ingestion(v_link_leg, 'queued',   null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_leg, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_leg, 'failed_review', null, null, null,
+                                               'parse_bad_output');
+  update screening_v2.ashby_resume_ingestions
+     set updated_at = v_before where application_link_id = v_link_leg;
+  select attempts into v_att0
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_leg;
+
+  -- ═══════════════════════════════════════════════════════════════════
+  -- 1. The legacy row is released — once, atomically, with a live job
+  -- ═══════════════════════════════════════════════════════════════════
+  select count(*) into v_cnt
+    from screening_v2.job_queue
+   where dedup_key = 'ashby:ingestion:' || v_link_leg::text;
+  perform _policy_tests.assert(
+    'ashby 0041 precondition: the legacy row owns no queue job',
+    v_cnt = 0, 'got ' || v_cnt);
+
+  -- The ORDINARY door must still refuse this exact row. Asserted behaviourally
+  -- rather than by reading the function text, because the 0039/0040 body
+  -- legitimately NAMES parse_bad_output in its document-verdict commentary —
+  -- a string match there proves nothing about the allowlist.
+  v_res := screening_v2.recover_ashby_ingestion_parse(v_link_leg, v_owner, v_now);
+  perform _policy_tests.assert(
+    'ashby 0041: the 0039/0040 allowlist was NOT widened — the ordinary door still refuses',
+    v_res->>'status' = 'not_a_parse_availability_failure'
+      and v_res->>'failed_reason' = 'parse_bad_output',
+    'the two doors ask different questions and must stay separate; got '
+      || coalesce(v_res::text,'<null>'));
+
+  select attempts into v_att0
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_leg;
+
+  v_res := screening_v2.recover_ashby_legacy_bad_output(v_link_leg, v_owner, v_now);
+  perform _policy_tests.assert(
+    'ashby 0041: a LEGACY parse_bad_output row is released and charges one attempt',
+    v_res->>'status' = 'ok'
+      and v_res->>'state' = 'queued'
+      and (v_res->>'attempts')::int = v_att0 + 1
+      and (v_res->>'max_attempts')::int = 5,
+    'got ' || coalesce(v_res::text, '<null>'));
+
+  select state, failed_reason, attempts, legacy_bad_output_recovered_at
+    into v_state, v_reason, v_att, v_shot
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_leg;
+  perform _policy_tests.assert(
+    'ashby 0041: the released row is queued, carries no stale reason, and spends its one shot',
+    v_state = 'queued' and v_reason is null and v_att = v_att0 + 1 and v_shot is not null,
+    'got state=' || coalesce(v_state,'<null>') || ' reason=' || coalesce(v_reason,'<null>')
+      || ' attempts=' || coalesce(v_att::text,'<null>')
+      || ' one_shot=' || coalesce(v_shot::text,'<null>'));
+
+  select count(*) into v_cnt
+    from screening_v2.job_queue
+   where name = 'ashby.ingestion'
+     and dedup_key = 'ashby:ingestion:' || v_link_leg::text;
+  select * into v_job
+    from screening_v2.job_queue
+   where name = 'ashby.ingestion'
+     and dedup_key = 'ashby:ingestion:' || v_link_leg::text
+   limit 1;
+  perform _policy_tests.assert(
+    'ashby 0041: exactly ONE claimable job, on the 0040 contract',
+    v_cnt = 1
+      and v_job.status = 'pending'
+      and v_job.max_attempts = 5
+      and v_job.attempts = 0
+      and v_job.priority = 0
+      and v_job.scheduled_at = v_now,
+    'a released ingestion must be indistinguishable from an imported one; got '
+      || v_cnt || ' job(s)');
+
+  v_payload := v_job.payload;
+  perform _policy_tests.assert(
+    'ashby 0041: the payload is EXACTLY the consumer contract, and carries no PII',
+    v_payload = jsonb_build_object('provider', 'ashby',
+                                   'applicationLinkId', v_link_leg::text)
+      and (select count(*) from jsonb_object_keys(v_payload)) = 2
+      and v_payload::text not like '%' || repeat('h', 64) || '%'
+      and v_payload::text not like '%pol41-app%',
+    'got ' || coalesce(v_payload::text, '<null>'));
+
+  select count(*) into v_audits
+    from screening_v2.audit_events
+   where action = 'ashby_ingestion_legacy_bad_output_recovery'
+     and metadata->>'application_link_id' = v_link_leg::text
+     and result = 'success';
+  select metadata into v_res
+    from screening_v2.audit_events
+   where action = 'ashby_ingestion_legacy_bad_output_recovery'
+     and metadata->>'application_link_id' = v_link_leg::text
+   order by created_at desc limit 1;
+  perform _policy_tests.assert(
+    'ashby 0041: exactly one sanitized audit row, marked as the one-shot release',
+    v_audits = 1
+      and (v_res->>'legacy_one_shot')::boolean
+      and v_res->>'failed_reason' = 'parse_bad_output'
+      and not (v_res ? 'effective_at')
+      and v_res::text not like '%' || repeat('h', 64) || '%',
+    'got audits=' || v_audits || ' metadata=' || coalesce(v_res::text,'<null>'));
+
+  -- ── The door closes behind it ────────────────────────────────────────
+  -- Bring the row back to failed_review on the same reason and age it again:
+  -- even a perfectly "legacy-looking" row is refused once its shot is spent.
+  perform screening_v2.advance_ashby_ingestion(v_link_leg, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_leg, 'failed_review', null, null, null,
+                                               'parse_bad_output');
+  update screening_v2.ashby_resume_ingestions
+     set updated_at = v_before where application_link_id = v_link_leg;
+  select attempts into v_att0
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_leg;
+
+  v_res := screening_v2.recover_ashby_legacy_bad_output(v_link_leg, v_owner, v_now);
+  select attempts into v_att
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_leg;
+  select count(*) into v_audits
+    from screening_v2.audit_events
+   where action = 'ashby_ingestion_legacy_bad_output_recovery'
+     and metadata->>'application_link_id' = v_link_leg::text;
+  perform _policy_tests.assert(
+    'ashby 0041: the release is ONE-SHOT — a second is refused, spending nothing',
+    v_res->>'status' = 'legacy_recovery_exhausted'
+      and v_att = v_att0
+      and v_audits = 1,
+    'this is what stops a loop; got ' || coalesce(v_res::text,'<null>')
+      || ' attempts=' || coalesce(v_att::text,'<null>') || ' audits=' || v_audits);
+
+  -- ═══════════════════════════════════════════════════════════════════
+  -- 2. A NEWER parse_bad_output is a genuine protocol anomaly — refused
+  -- ═══════════════════════════════════════════════════════════════════
+  perform screening_v2.advance_ashby_ingestion(v_link_new, 'queued',   null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_new, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_new, 'failed_review', null, null, null,
+                                               'parse_bad_output');
+  update screening_v2.ashby_resume_ingestions
+     set updated_at = v_boundary + interval '1 second'
+   where application_link_id = v_link_new;
+
+  v_res := screening_v2.recover_ashby_legacy_bad_output(v_link_new, v_owner, v_now);
+  select count(*) into v_cnt
+    from screening_v2.job_queue
+   where dedup_key = 'ashby:ingestion:' || v_link_new::text;
+  select state, legacy_bad_output_recovered_at into v_state, v_shot
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_new;
+  perform _policy_tests.assert(
+    'ashby 0041: a parse_bad_output NEWER than the boundary is refused and admits nothing',
+    v_res->>'status' = 'not_legacy_bad_output'
+      and v_cnt = 0 and v_state = 'failed_review' and v_shot is null,
+    'after the fix, bad_output can only mean a real protocol anomaly; got '
+      || coalesce(v_res::text,'<null>') || ' jobs=' || v_cnt);
+
+  -- The refusal is deliberately INDISTINGUISHABLE from the wrong-reason one:
+  -- the caller learns "not eligible", never why, and never the boundary.
+  perform _policy_tests.assert(
+    'ashby 0041: the boundary refusal leaks no timestamp and no discriminator detail',
+    not (v_res ? 'effective_at') and not (v_res ? 'boundary')
+      and not (v_res ? 'updated_at') and not (v_res ? 'failed_reason'),
+    'got ' || coalesce(v_res::text,'<null>'));
+
+  -- ═══════════════════════════════════════════════════════════════════
+  -- 3. Every other verdict stays refused, boundary or not
+  -- ═══════════════════════════════════════════════════════════════════
+  perform screening_v2.advance_ashby_ingestion(v_link_ext, 'queued',    null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_ext, 'fetching',  null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_ext, 'scanning',  null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_ext, 'extracting',null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_ext, 'failed_review', null, null, null,
+                                               'parse_extract_failed');
+  update screening_v2.ashby_resume_ingestions
+     set updated_at = v_before where application_link_id = v_link_ext;
+
+  perform screening_v2.advance_ashby_ingestion(v_link_out, 'queued',   null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_out, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_out, 'failed_review', null, null, null,
+                                               'parse_output_exceeded');
+  update screening_v2.ashby_resume_ingestions
+     set updated_at = v_before where application_link_id = v_link_out;
+
+  perform screening_v2.advance_ashby_ingestion(v_link_scan, 'queued',   null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_scan, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_scan, 'failed_review', null, null, null,
+                                               'scan_infected');
+  update screening_v2.ashby_resume_ingestions
+     set updated_at = v_before where application_link_id = v_link_scan;
+
+  v_res := screening_v2.recover_ashby_legacy_bad_output(v_link_ext, v_owner, v_now);
+  perform _policy_tests.assert(
+    'ashby 0041: parse_extract_failed is refused even when older than the boundary',
+    v_res->>'status' = 'not_legacy_bad_output',
+    'an unparseable document is a real verdict and stays one; got '
+      || coalesce(v_res::text,'<null>'));
+
+  v_res := screening_v2.recover_ashby_legacy_bad_output(v_link_out, v_owner, v_now);
+  perform _policy_tests.assert(
+    'ashby 0041: parse_output_exceeded is refused even when older than the boundary',
+    v_res->>'status' = 'not_legacy_bad_output',
+    'got ' || coalesce(v_res::text,'<null>'));
+
+  v_res := screening_v2.recover_ashby_legacy_bad_output(v_link_scan, v_owner, v_now);
+  perform _policy_tests.assert(
+    'ashby 0041: scan_infected is refused even when older than the boundary',
+    v_res->>'status' = 'not_legacy_bad_output',
+    'an infected file must never be re-admitted by a parser repair; got '
+      || coalesce(v_res::text,'<null>'));
+
+  select count(*) into v_cnt
+    from screening_v2.job_queue
+   where dedup_key in ('ashby:ingestion:' || v_link_ext::text,
+                       'ashby:ingestion:' || v_link_out::text,
+                       'ashby:ingestion:' || v_link_scan::text);
+  perform _policy_tests.assert(
+    'ashby 0041: no refused verdict admitted any work',
+    v_cnt = 0, 'got ' || v_cnt || ' job(s)');
+
+  -- ═══════════════════════════════════════════════════════════════════
+  -- 4. Terminal application, and the unchanged global ceiling
+  -- ═══════════════════════════════════════════════════════════════════
+  perform screening_v2.advance_ashby_ingestion(v_link_term, 'queued',   null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_term, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_term, 'failed_review', null, null, null,
+                                               'parse_bad_output');
+  update screening_v2.ashby_resume_ingestions
+     set updated_at = v_before where application_link_id = v_link_term;
+  update screening_v2.ashby_application_links
+     set terminal_state = 'withdrawn' where id = v_link_term;
+  v_res := screening_v2.recover_ashby_legacy_bad_output(v_link_term, v_owner, v_now);
+  select count(*) into v_cnt
+    from screening_v2.job_queue
+   where dedup_key = 'ashby:ingestion:' || v_link_term::text;
+  perform _policy_tests.assert(
+    'ashby 0041: a terminal application admits nothing',
+    v_res->>'status' = 'blocked_terminal' and v_cnt = 0,
+    'got ' || coalesce(v_res::text,'<null>') || ' jobs=' || v_cnt);
+
+  perform screening_v2.advance_ashby_ingestion(v_link_ex, 'queued',   null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_ex, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_ex, 'failed_review', null, null, null,
+                                               'parse_bad_output');
+  update screening_v2.ashby_resume_ingestions
+     set attempts = 5, updated_at = v_before where application_link_id = v_link_ex;
+  v_res := screening_v2.recover_ashby_legacy_bad_output(v_link_ex, v_owner, v_now);
+  select count(*) into v_cnt
+    from screening_v2.job_queue
+   where dedup_key = 'ashby:ingestion:' || v_link_ex::text;
+  perform _policy_tests.assert(
+    'ashby 0041: the UNCHANGED five-attempt ceiling still bounds this door',
+    v_res->>'status' = 'retry_exhausted' and v_cnt = 0,
+    'the legacy shot never widens the budget; got '
+      || coalesce(v_res::text,'<null>') || ' jobs=' || v_cnt);
+
+  -- ═══════════════════════════════════════════════════════════════════
+  -- 5. Fail-closed: a failed enqueue rolls back the whole release
+  -- ═══════════════════════════════════════════════════════════════════
+  perform screening_v2.advance_ashby_ingestion(v_link_fail, 'queued',   null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_fail, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_fail, 'failed_review', null, null, null,
+                                               'parse_bad_output');
+  update screening_v2.ashby_resume_ingestions
+     set updated_at = v_before where application_link_id = v_link_fail;
+  select attempts into v_att0
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_fail;
+
+  create or replace function _policy_tests.block_pol41_enqueue()
+  returns trigger language plpgsql as $trg$
+  begin
+    if new.dedup_key like 'ashby:ingestion:%'
+       and current_setting('policy_tests.block_link_41', true) = new.payload->>'applicationLinkId'
+    then
+      raise exception 'pol41_synthetic_enqueue_failure';
+    end if;
+    return new;
+  end;
+  $trg$;
+  create trigger trg_pol41_block_enqueue
+    before insert on screening_v2.job_queue
+    for each row execute function _policy_tests.block_pol41_enqueue();
+  perform set_config('policy_tests.block_link_41', v_link_fail::text, false);
+
+  begin
+    v_res := screening_v2.recover_ashby_legacy_bad_output(v_link_fail, v_owner, v_now);
+    perform _policy_tests.assert(
+      'ashby 0041: a failed enqueue does NOT return ok', false,
+      'reported ' || coalesce(v_res::text,'<null>'));
+  exception
+    when others then
+      perform _policy_tests.assert(
+        'ashby 0041: a failed enqueue aborts the whole release',
+        sqlerrm like '%pol41_synthetic_enqueue_failure%',
+        'got ' || sqlerrm);
+  end;
+
+  perform set_config('policy_tests.block_link_41', '', false);
+  drop trigger trg_pol41_block_enqueue on screening_v2.job_queue;
+
+  select state, failed_reason, attempts, legacy_bad_output_recovered_at
+    into v_state, v_reason, v_att, v_shot
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_fail;
+  select count(*) into v_audits
+    from screening_v2.audit_events
+   where action = 'ashby_ingestion_legacy_bad_output_recovery'
+     and metadata->>'application_link_id' = v_link_fail::text;
+  perform _policy_tests.assert(
+    'ashby 0041: the rolled-back release left state, reason, attempts, ONE-SHOT and audit untouched',
+    v_state = 'failed_review' and v_reason = 'parse_bad_output'
+      and v_att = v_att0 and v_shot is null and v_audits = 0,
+    'the shot must survive a failure, or an operator loses it to an outage; got '
+      || 'state=' || coalesce(v_state,'<null>') || ' reason=' || coalesce(v_reason,'<null>')
+      || ' attempts=' || coalesce(v_att::text,'<null>')
+      || ' one_shot=' || coalesce(v_shot::text,'<null>') || ' audits=' || v_audits);
+
+  -- ...and it still works once the fault is gone.
+  v_res := screening_v2.recover_ashby_legacy_bad_output(v_link_fail, v_owner, v_now);
+  select count(*) into v_cnt
+    from screening_v2.job_queue
+   where dedup_key = 'ashby:ingestion:' || v_link_fail::text
+     and status in ('pending','active','delayed');
+  perform _policy_tests.assert(
+    'ashby 0041: the row kept its shot and releases cleanly afterwards',
+    v_res->>'status' = 'ok' and v_cnt = 1,
+    'got ' || coalesce(v_res::text,'<null>') || ' live_jobs=' || v_cnt);
+
+  -- ── Cleanup (audit rows are append-only, 0007, and left behind) ──────
+  delete from screening_v2.job_queue
+   where dedup_key in ('ashby:ingestion:' || v_link_leg::text,
+                       'ashby:ingestion:' || v_link_new::text,
+                       'ashby:ingestion:' || v_link_ext::text,
+                       'ashby:ingestion:' || v_link_out::text,
+                       'ashby:ingestion:' || v_link_scan::text,
+                       'ashby:ingestion:' || v_link_term::text,
+                       'ashby:ingestion:' || v_link_ex::text,
+                       'ashby:ingestion:' || v_link_fail::text);
+  delete from screening_v2.ashby_operations
+   where application_link_id in (v_link_leg, v_link_new, v_link_ext, v_link_out,
+                                 v_link_scan, v_link_term, v_link_ex, v_link_fail);
+  delete from screening_v2.ashby_resume_ingestions
+   where application_link_id in (v_link_leg, v_link_new, v_link_ext, v_link_out,
+                                 v_link_scan, v_link_term, v_link_ex, v_link_fail);
+  delete from screening_v2.ashby_application_links
+   where id in (v_link_leg, v_link_new, v_link_ext, v_link_out,
+                v_link_scan, v_link_term, v_link_ex, v_link_fail);
+  delete from screening_v2.ashby_job_mappings where id = v_map;
+end;
+$$;
+
+
 -- ═══════════════════════════════════════════════════════════════════════
 -- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)
 -- ═══════════════════════════════════════════════════════════════════════

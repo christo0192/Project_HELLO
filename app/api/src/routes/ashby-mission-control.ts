@@ -551,6 +551,55 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
     }
   });
 
+  /**
+   * ONE-SHOT release of a LEGACY `parse_bad_output` ingestion (0041).
+   *
+   * A DELIBERATELY SEPARATE route rather than a widening of the retry above.
+   * `parse_bad_output` never meant "this document is bad" — the parser parent
+   * raises it only when `JSON.parse` of the child's stdout throws — and our own
+   * dependency was breaking that channel: pdf.js logs warnings through
+   * `console.log`, i.e. to stdout, so a PDF it merely warned about had a
+   * `Warning: ` line prepended to the child's valid JSON. Those rows recorded a
+   * verdict the document never earned, and document verdicts are refused by the
+   * ordinary recovery for ever.
+   *
+   * Everything that decides eligibility is SERVER-SIDE in the RPC: the reason
+   * must be exactly `parse_bad_output`, the row must predate a boundary the
+   * migration stamped at application time, the one-shot flag must be unspent,
+   * the unchanged five-attempt ceiling must still allow it, and the application
+   * must not be terminal. This route contributes authentication, the admin
+   * gate, id validation and the audit record — and nothing else. A newer
+   * `parse_bad_output` is a genuine protocol anomaly and is refused here just
+   * as firmly as an unparseable document.
+   *
+   * It issues no invite, moves no stage, and calls no provider.
+   */
+  router.post('/ingestions/:applicationLinkId/retry-legacy-parse', requireRole('admin'), async (req: Request, res: Response) => {
+    const linkId = req.params.applicationLinkId;
+    if (!UUID_RE.test(linkId)) {
+      res.status(400).json({ ok: false, error: 'invalid_application_link_id' });
+      return;
+    }
+    try {
+      const actorId = req.authUser?.id ?? '';
+      const result = await store().retryLegacyBadOutput(linkId, actorId);
+      // Opaque link id and a stable status only — never the failure reason
+      // text, an external Ashby id, a file handle, a candidate field, or the
+      // boundary itself.
+      await recordAudit(req, 'resource.update', result.status === 'ok' ? 200 : 409, {
+        metadata: {
+          resource: 'ashby_resume_ingestion',
+          application_link_id: linkId,
+          outcome: result.status,
+        },
+      });
+      if (result.status === 'ok') { res.json({ ok: true }); return; }
+      res.status(409).json({ ok: false, error: result.status });
+    } catch {
+      res.status(500).json({ ok: false, error: 'mission_control_action_error' });
+    }
+  });
+
   return router;
 }
 

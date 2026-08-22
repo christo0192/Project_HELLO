@@ -198,7 +198,8 @@ pol40c_wait_until() {
 # append-only (0007), so reusing one would leave the previous phase's row
 # behind and make "exactly one audit row" unassertable.
 pol40c_race_phase() {
-  local phase="$1" link="$2" target="$3" tag blocker_sql ok refused
+  local phase="$1" link="$2" target="$3" rpc="${4:-recover_ashby_ingestion_parse}" reason="${5:-parse_timeout}"
+  local tag blocker_sql ok refused
   tag="pol40c-${phase}"
 
   case "$target" in
@@ -213,7 +214,7 @@ pol40c_race_phase() {
   log "0040: Seeding the concurrent-recovery fixture (phase: ${phase})..."
   docker exec -i "$SUPABASE_DB_CONTAINER" \
     psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
-    -v "link_id=${link}" -v "tag=${tag}" \
+    -v "link_id=${link}" -v "tag=${tag}" -v "reason=${reason}" \
     < app/supabase/tests/recovery_concurrency_setup.sql
 
   POL40C_FIFO="$(mktemp -u)"
@@ -238,7 +239,7 @@ pol40c_race_phase() {
   for i in 1 2 3; do
     docker exec -e "PGAPPNAME=pol40c-racer-${i}" "$SUPABASE_DB_CONTAINER" \
       psql -U postgres -d postgres -t -A -c \
-      "select screening_v2.recover_ashby_ingestion_parse('${link}'::uuid, '${POL40C_ACTOR}'::uuid)->>'status'" \
+      "select screening_v2.${rpc}('${link}'::uuid, '${POL40C_ACTOR}'::uuid)->>'status'" \
       >> "$POL40C_OUT" 2>&1 &
   done
 
@@ -265,7 +266,7 @@ pol40c_race_phase() {
   log "0040: phase ${phase} — one winner, two refusals. Asserting the durable consequences..."
   docker exec -i "$SUPABASE_DB_CONTAINER" \
     psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
-    -v "link_id=${link}" -v "tag=${tag}" \
+    -v "link_id=${link}" -v "tag=${tag}" -v "reason=${reason}" \
     < app/supabase/tests/recovery_concurrency_assert.sql
 
   pol40c_cleanup
@@ -276,6 +277,11 @@ pol40c_race_phase() {
 
 pol40c_race_phase 'link'      '40000000-0000-4000-8000-0000000000c1' 'link'
 pol40c_race_phase 'ingestion' '40000000-0000-4000-8000-0000000000c2' 'ingestion'
+# The 0041 one-shot door takes the SAME two locks in the SAME order, so it must
+# serialise identically: one release, two refusals, one attempt, one audit row,
+# one live job. Proven by contention, not by hoping three processes overlap.
+pol40c_race_phase 'legacy'    '40000000-0000-4000-8000-0000000000c3' 'link' \
+  'recover_ashby_legacy_bad_output' 'parse_bad_output'
 
 log 'Verifying custom-schema anon denial through PostgREST...'
 ANON_KEY="$(supabase_cli status -o env 2>/dev/null \

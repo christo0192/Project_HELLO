@@ -25,8 +25,9 @@
 -- =====================================================================
 
 -- `\g /dev/null` keeps the parameter plumbing out of the suite's output.
-select set_config('pol40c.link', :'link_id', false),
-       set_config('pol40c.tag',  :'tag',     false) \g /dev/null
+select set_config('pol40c.link',   :'link_id', false),
+       set_config('pol40c.tag',    :'tag',     false),
+       set_config('pol40c.reason', :'reason',  false) \g /dev/null
 
 do $$
 declare
@@ -52,7 +53,8 @@ begin
 
   select count(*) into v_audits
     from screening_v2.audit_events
-   where action = 'ashby_ingestion_parse_recovery'
+   where action in ('ashby_ingestion_parse_recovery',
+                    'ashby_ingestion_legacy_bad_output_recovery')
      and metadata->>'application_link_id' = v_link::text;
 
   select payload into v_payload
