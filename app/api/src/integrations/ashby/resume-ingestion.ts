@@ -234,8 +234,21 @@ export interface IngestionPorts {
    * Optional so every existing fake keeps compiling; when it is absent the
    * ingestion behaves exactly as it did before (the caller materializes
    * afterwards), which is what the pure-domain unit tests exercise.
+   *
+   * PROVENANCE IS PASSED WITH THE FIELDS, NOT ASSUMED FROM THE PORT.
+   * The second argument carries the structurer tag that actually produced
+   * `structured` — including the `+fallback` suffix this function appends when
+   * a model parse produced nothing useful and the deterministic extractor
+   * rescued it. The persister needs that distinction to decide whether a
+   * phone number may become dialable (`lib/candidate-phone.ts`), and it cannot
+   * re-derive it: by the time it runs, the rescue has already happened. It is
+   * a second parameter rather than a field on `structured` so that every
+   * existing implementation, which declares one parameter, still type-checks.
    */
-  persist?: (structured: StructuredResume) => Promise<PersistOutcome>;
+  persist?: (
+    structured: StructuredResume,
+    provenance: { structurerVersion: string },
+  ) => Promise<PersistOutcome>;
 }
 
 /**
@@ -441,7 +454,7 @@ export async function runResumeIngestion(
     // Ordered this way on purpose: `ready` is terminal, so it must be the
     // last word, not the first. See `IngestionPorts.persist`.
     if (ports.persist) {
-      const persisted = await ports.persist(structured);
+      const persisted = await ports.persist(structured, { structurerVersion });
       if (!persisted.ok) {
         // Truthful and recoverable: the row does NOT say ready, it says why
         // it is not. `structuring -> failed_review` is a legal 0029 edge and

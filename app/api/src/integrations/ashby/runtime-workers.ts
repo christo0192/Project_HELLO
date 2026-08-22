@@ -30,6 +30,7 @@
  */
 
 import { createLogger } from '../../lib/logger.js';
+import { deriveCandidatePhone } from '../../lib/candidate-phone.js';
 import {
   createQueueRunner,
   type QueueDeferDirective,
@@ -563,7 +564,8 @@ export function buildAshbyHandlers(
         // pure ingestion knows nothing about mappings or candidates.
         buildIngestionPorts: () => ({
           ...ports,
-          persist: (structured) => persistParsedCandidate(runtime, linkId, link, structured),
+          persist: (structured, provenance) =>
+            persistParsedCandidate(runtime, linkId, link, structured, provenance.structurerVersion),
         }),
         isCancelled: async () => {
           const l = await runtime.stores.readLink(linkId);
@@ -720,13 +722,26 @@ async function persistParsedCandidate(
   linkId: string,
   link: WorkflowLinkRow,
   structured: StructuredResume,
+  structurerVersion: string,
 ): Promise<PersistOutcome> {
   const fresh = await runtime.stores.readLink(linkId).catch(() => null);
   const boundCandidateId = fresh?.candidateId ?? link.candidateId;
 
+  // ── THE ONE PLACE AN ASHBY-IMPORTED NUMBER COULD BECOME DIALABLE ────────
+  // Derived here because this is the only layer holding BOTH the extracted
+  // string and the provenance of the structurer that produced it. On the live
+  // path `structurerVersion` is `ASHBY_STRUCTURER_VERSION`
+  // ('deterministic-fallback-1'), which is NOT on the dialable allowlist, so
+  // this evaluates to raw-only and every Ashby candidate keeps
+  // `phone_e164 = null, phone_valid = false` — the shape 0042's admission
+  // refuses. The plumbing exists so that wiring a model structurer is a
+  // one-line allowlist decision, not a re-architecture.
+  const phone = deriveCandidatePhone(structured.phone, structurerVersion);
+
   if (boundCandidateId) {
     const populated = await populateExistingCandidate(boundCandidateId, structured, {
       store: runtime.materialization,
+      phone,
     });
     return populated.status === 'skipped'
       ? { ok: false, reason: MATERIALIZE_FAILED_REASON }
@@ -751,6 +766,7 @@ async function persistParsedCandidate(
     mapping,
     isTerminal: false,
     existingCandidateId: null,
+    phone,
   });
   return created.status === 'skipped'
     ? { ok: false, reason: MATERIALIZE_FAILED_REASON }

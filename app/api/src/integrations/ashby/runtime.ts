@@ -48,6 +48,7 @@ import { classifyScanStatus, resolveScanner } from '../../lib/malware-scanner.js
 import { guardUpload, UploadGuardError } from '../../lib/upload-guard.js';
 import { createResumeParserPool, type ResumeParserPool } from '../../lib/resume-parser-pool.js';
 import { fallbackParseResumeText } from '../../lib/resume-fallback.js';
+import { toCandidateColumns } from '../../lib/candidate-phone.js';
 
 /** Version tags recorded as ingestion provenance (never PII). */
 export const ASHBY_EXTRACTOR_VERSION = 'ashby-ephemeral-1';
@@ -191,9 +192,20 @@ export function createMaterializationStore(client: SupabaseClient): Materializat
           resume_id: input.resumeId,
           name: p.name,
           email: p.email,
-          phone_raw: p.phone,
-          phone_e164: null,
-          phone_valid: false,
+          // ── DIALABILITY IS DECIDED UPSTREAM, AND FAILS CLOSED HERE ──────
+          // `input.phone` is the decision `lib/candidate-phone.ts` made from
+          // the extracted string AND the structurer provenance. When it is
+          // absent — an older caller, or any path that did not decide — the
+          // coalescing below writes exactly the pre-change shape: the raw
+          // string is preserved for the recruiter, and nothing is dialable.
+          // The Ashby structurer is today the DETERMINISTIC regex extractor,
+          // which is not on the dialable allowlist, so this is null/false on
+          // the live path by construction, not by accident.
+          phone_raw: input.phone ? input.phone.raw : p.phone,
+          // `toCandidateColumns` re-applies the strict gate HERE, at the write,
+          // so a hand-built decision object cannot put a non-strict value in
+          // the column the opt-out digest depends on. Absent ⇒ undialable.
+          ...toCandidateColumns(input.phone),
           skills: p.skills ?? [],
           experience_years: p.experience_years,
           parsed: p,
@@ -258,7 +270,14 @@ export function createMaterializationStore(client: SupabaseClient): Materializat
           resume_id: input.resumeId,
           name: p.name,
           email: p.email,
-          phone_raw: p.phone,
+          // Written inside the SAME allowlist and under the SAME
+          // `.is('resume_id', null)` CAS as every other parse-derived field,
+          // so a replay writes zero rows and cannot erase — or invent — a
+          // number. Fail-closed exactly as `insertCandidate` above.
+          phone_raw: input.phone ? input.phone.raw : p.phone,
+          // Same strict re-assertion as `insertCandidate`, inside the SAME
+          // allowlist and under the SAME CAS.
+          ...toCandidateColumns(input.phone),
           skills: p.skills ?? [],
           experience_years: p.experience_years,
           parsed: p,

@@ -4,6 +4,7 @@ import { validateQuery, validateParams } from '../lib/validation.js';
 import { listCandidatesQuerySchema, candidateIdParamSchema } from '../schemas/candidates.js';
 import { requireRole } from '../lib/rbac.js';
 import { recordAudit } from '../lib/audit.js';
+import { redactCandidatePhone } from '../lib/candidate-phone.js';
 
 export const candidatesRouter = Router();
 
@@ -164,9 +165,16 @@ candidatesRouter.get('/', requireRole('viewer'), validateQuery(listCandidatesQue
     } catch { /* additive only — never fails the list */ }
   }
 
+  // The role this list is being rendered for. `phone_e164` is admin-only —
+  // see `redactCandidatePhone`. This endpoint has always SELECTED the column;
+  // what changed is that it can now hold a real number, which makes an
+  // untouched `requireRole('viewer')` route a disclosure the diff would never
+  // show. The boolean `phone_valid` is deliberately left visible to everyone.
+  const role = req.authUser?.appRole;
+
   const enriched = rows.map((row) => {
     // Strip the internal block field; it drives suppression only.
-    const { decision_use_blocked_at, ...pub } = row;
+    const { decision_use_blocked_at, ...pub } = redactCandidatePhone(row, role);
     const blocked = decision_use_blocked_at != null;
     const la = latest.get(row.id);
     return {
@@ -256,5 +264,12 @@ candidatesRouter.get('/:id', requireRole('viewer'), validateParams(candidateIdPa
     .eq('candidate_id', req.params.id)
     .order('created_at', { ascending: false });
 
-  res.json({ candidate, sessions: sessions ?? [], assessments: assessments ?? [] });
+  // `select('*')` returns `phone_raw`, `phone_e164` AND the `parsed` blob, all
+  // three of which carry the same number. One helper covers all three so a
+  // future column cannot be redacted in one route and forgotten in another.
+  res.json({
+    candidate: redactCandidatePhone(candidate as Record<string, unknown>, req.authUser?.appRole),
+    sessions: sessions ?? [],
+    assessments: assessments ?? [],
+  });
 });

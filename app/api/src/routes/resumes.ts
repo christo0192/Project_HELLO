@@ -18,7 +18,14 @@ import multer from 'multer';
 import { supabase, RESUME_BUCKET } from '../lib/supabase.js';
 import { runClaudeJSON } from '../lib/claude.js';
 import { buildExtractionPrompt } from '../lib/prompts.js';
-import { normalizePhone } from '../lib/phone.js';
+import {
+  deriveCandidatePhone,
+  toCandidateColumns,
+  redactCandidatePhone,
+  redactPhoneView,
+  MODEL_STRUCTURER_VERSION,
+  FALLBACK_STRUCTURER_VERSION,
+} from '../lib/candidate-phone.js';
 import { requireUploadedFile, validateBodyFields } from '../lib/validation.js';
 import { guardUpload, UploadGuardError } from '../lib/upload-guard.js';
 import { parseResume } from '../lib/resume-parser.js';
@@ -208,7 +215,12 @@ export function createResumesRouter(deps: ResumesRouterDeps = {}): Router {
         }
 
         // ── 4e. Parse with LLM ──────────────────────────────────────
+        // The structurer tag is tracked, not assumed. It is the ONLY thing
+        // that distinguishes a model-authored phone number from a digit run
+        // the deterministic rescue extractor happened to match, and that
+        // distinction is what decides whether the number may be dialed.
         let parsed: ParsedResume;
+        let structurerVersion = MODEL_STRUCTURER_VERSION;
         try {
           parsed = await runClaudeJSON<ParsedResume>(buildExtractionPrompt(text));
         } catch (err) {
@@ -227,10 +239,16 @@ export function createResumesRouter(deps: ResumesRouterDeps = {}): Router {
             error_type: 'deterministic_fallback_used',
           });
           parsed = fallback;
+          structurerVersion = FALLBACK_STRUCTURER_VERSION;
         }
 
-        // ── 4f. Normalize phone ─────────────────────────────────────
-        const phone = normalizePhone(parsed.phone);
+        // ── 4f. Derive the phone columns ────────────────────────────
+        // Not `normalizePhone` directly. Two gates apply on top of it: the
+        // strict Indian-mobile format 0042's admission enforces, and the
+        // structurer provenance. On the fallback branch above this returns
+        // raw-only, so an LLM outage can never turn an employee id or a date
+        // range on a resume into an outbound call.
+        const phone = deriveCandidatePhone(parsed.phone, structurerVersion);
 
         // ── 4g. Persist resume row ──────────────────────────────────
         const { data: resumeRow, error: rErr } = await supabase
@@ -263,9 +281,11 @@ export function createResumesRouter(deps: ResumesRouterDeps = {}): Router {
             owner_id: (req as any).recruiterId,
             name: parsed.name,
             email: parsed.email,
-            phone_raw: phone.raw || parsed.phone,
-            phone_e164: phone.e164,
-            phone_valid: phone.valid,
+            phone_raw: phone.raw,
+            // The strict gate re-applied at the write — see
+            // `toCandidateColumns`. Belt and braces on the one invariant the
+            // opt-out suppression digest depends on.
+            ...toCandidateColumns(phone),
             skills: parsed.skills ?? [],
             experience_years: parsed.experience_years,
             parsed,
@@ -298,8 +318,24 @@ export function createResumesRouter(deps: ResumesRouterDeps = {}): Router {
           });
         });
 
-        // ── 4j. Success response — no raw parser errors, no signed URLs ──
-        res.status(201).json({ candidate, resume: resumeRow, phone });
+        // ── 4j. Success response — role-redacted; no raw parser errors, no signed URLs ──
+        // This route's guard admits `admin` AND `interviewer`, so the 201 body
+        // is a phone projection like any other and is redacted like one. Three
+        // structured carriers are covered: the inserted candidate row (whose
+        // bare `.select()` returns every column, `phone_raw` included), the
+        // `parsed` blob nested inside both returned rows, and the standalone
+        // `phone` object.
+        //
+        // `resume.text_extracted` is a fourth carrier and is deliberately NOT
+        // redacted: the caller uploaded this exact file seconds ago, so
+        // withholding its text discloses nothing it did not already have, and
+        // it is free text that can never become a dial target.
+        const role = req.authUser?.appRole;
+        res.status(201).json({
+          candidate: redactCandidatePhone(candidate as Record<string, unknown>, role),
+          resume: redactCandidatePhone(resumeRow as Record<string, unknown>, role),
+          phone: redactPhoneView(phone, role),
+        });
       } catch (error) {
         next(error);
       }

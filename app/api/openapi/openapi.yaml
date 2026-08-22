@@ -4141,6 +4141,11 @@ components:
       properties:
         raw:
           type: string
+          # Nullable so the role-based redaction stays TRUTHFUL. The number is
+          # admin-only; below admin both string forms are withheld and `null`
+          # says "withheld", where '' would say "the document held no number".
+          # `valid` is a boolean and survives for every role.
+          nullable: true
         e164:
           type: string
           nullable: true

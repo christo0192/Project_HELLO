@@ -68,6 +68,14 @@ interface TableStore {
   resumes: any[];
 }
 
+/**
+ * The candidate fixtures use a SYNTHETIC strict Indian mobile, not the older
+ * `+1555…` placeholder. `phone_e164` is now guaranteed to be NULL or to match
+ * `^\+91[6-9][0-9]{9}$` — the predicate 0042's admission and its opt-out
+ * suppression digest both depend on — so a fixture carrying a non-strict value
+ * alongside `phone_valid: true` describes a row the system can no longer
+ * produce, and would read as precedent for one that could.
+ */
 function freshTables(): TableStore {
   return {
     retentionPolicies: [
@@ -80,7 +88,7 @@ function freshTables(): TableStore {
     dsarRequests: [],
     governanceAudits: [],
     candidates: [
-      { id: '11111111-1111-4111-8111-111111111111', name: 'Alice Applicant', email: 'alice@example.com', skills: ['JavaScript', 'Python'], consent_source: 'recording_consent', owner_id: '22222222-2222-4222-8222-222222222222', created_at: ts(), updated_at: ts(), role_id: nextId(), phone_e164: '+15551234567', phone_valid: true, status: 'active', experience_years: 5, phone_raw: '+15551234567', parsed: null, consent_at: ts(), ats_external_id: null, ats_source: null, resume_id: null },
+      { id: '11111111-1111-4111-8111-111111111111', name: 'Alice Applicant', email: 'alice@example.com', skills: ['JavaScript', 'Python'], consent_source: 'recording_consent', owner_id: '22222222-2222-4222-8222-222222222222', created_at: ts(), updated_at: ts(), role_id: nextId(), phone_e164: '+919876543210', phone_valid: true, status: 'active', experience_years: 5, phone_raw: '+91 98765-43210', parsed: null, consent_at: ts(), ats_external_id: null, ats_source: null, resume_id: null },
       { id: '33333333-3333-4333-8333-333333333333', name: 'Bob Builder', email: 'bob@example.com', skills: ['Go', 'Rust'], consent_source: 'job_application', owner_id: '22222222-2222-4222-8222-222222222222', created_at: ts(), updated_at: ts(), role_id: nextId(), phone_e164: null, phone_valid: false, status: 'active', experience_years: 3, phone_raw: null, parsed: null, consent_at: ts(), ats_external_id: null, ats_source: null, resume_id: null },
     ],
     callSessions: [

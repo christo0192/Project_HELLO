@@ -24,6 +24,7 @@
 import { Router, type Request } from 'express';
 import { supabase } from '../lib/supabase.js';
 import { requireRole } from '../lib/rbac.js';
+import { redactCandidatePhone } from '../lib/candidate-phone.js';
 import { uuidSchema } from '../schemas/common.js';
 import {
   createCandidateWorkflowStore,
@@ -115,7 +116,15 @@ ashbyReviewRouter.get('/:applicationLinkId', requireRole('viewer'), async (req, 
       .eq('candidate_id', candidateId)
       .order('created_at', { ascending: false });
 
-    res.json({ candidate, sessions: sessions ?? [], assessments: assessments ?? [] });
+    // Same envelope as GET /api/candidates/:id, so the SAME redaction. This is
+    // a separate code path reading the same `select('*')`: redacting one route
+    // and not the other would leave the number readable through the Ashby
+    // review pane by every viewer.
+    res.json({
+      candidate: redactCandidatePhone(candidate as Record<string, unknown>, req.authUser?.appRole),
+      sessions: sessions ?? [],
+      assessments: assessments ?? [],
+    });
   } catch (error) {
     next(error);
   }

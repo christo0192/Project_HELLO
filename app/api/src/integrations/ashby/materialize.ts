@@ -52,6 +52,7 @@ import {
   type ManualDeliveryArtifact,
 } from './invite-delivery.js';
 import type { StructuredResume } from './resume-ingestion.js';
+import type { CandidatePhone } from '../../lib/candidate-phone.js';
 
 /** Sanitized outcome codes. Stable, greppable, never provider text. */
 export type MaterializeReason =
@@ -89,6 +90,17 @@ export interface MaterializationStore {
     ownerId: string;
     resumeId: string | null;
     parsed: StructuredResume;
+    /**
+     * The dialability decision for this candidate, already made by
+     * `lib/candidate-phone.ts` from the extracted string AND the provenance of
+     * the structurer that produced it.
+     *
+     * Optional so a store written before this seam still type-checks, and
+     * FAIL-CLOSED when absent: an implementation that receives no decision
+     * must write `phone_e164 = null, phone_valid = false`. Absence means
+     * "nobody decided", and the safe reading of that is "do not call".
+     */
+    phone?: CandidatePhone;
   }): Promise<{ id: string }>;
 
   /**
@@ -123,6 +135,8 @@ export interface MaterializationStore {
     candidateId: string;
     resumeId: string;
     parsed: StructuredResume;
+    /** See {@link MaterializationStore.insertCandidate}. Fail-closed when absent. */
+    phone?: CandidatePhone;
   }): Promise<{ updated: boolean }>;
 
   /**
@@ -255,6 +269,12 @@ export interface MaterializeCandidateDeps {
   existingCandidateId: string | null;
   /** Bounded extracted text for the resume row, or null to store none. */
   textExtracted?: string | null;
+  /**
+   * The dialability decision, made by the caller (which is the only layer that
+   * holds the structurer provenance). Omitted means undialable — this module
+   * never derives a phone number itself.
+   */
+  phone?: CandidatePhone;
 }
 
 /**
@@ -270,6 +290,12 @@ export interface PopulateCandidateDeps {
   store: MaterializationStore;
   /** Bounded extracted text for the resume row, or null to store none. */
   textExtracted?: string | null;
+  /**
+   * The dialability decision, made by the caller (which is the only layer that
+   * holds the structurer provenance). Omitted means undialable — this module
+   * never derives a phone number itself.
+   */
+  phone?: CandidatePhone;
 }
 
 /**
@@ -300,7 +326,9 @@ export async function populateExistingCandidate(
       parsed: structured,
     });
     resumeId = resume.id;
-    const res = await update.call(deps.store, { candidateId, resumeId, parsed: structured });
+    const res = await update.call(deps.store, {
+      candidateId, resumeId, parsed: structured, phone: deps.phone,
+    });
     if (!res.updated) {
       // Already populated (a repeat run, or a concurrent winner). Drop the
       // resume row we just created; the candidate is authoritative.
@@ -349,6 +377,7 @@ export async function materializeCandidate(
       ownerId: deps.mapping.ownerId,
       resumeId,
       parsed: structured,
+      phone: deps.phone,
     });
     candidateId = candidate.id;
 
@@ -378,7 +407,9 @@ export async function materializeCandidate(
       if (update) {
         let res: { updated: boolean };
         try {
-          res = await update.call(deps.store, { candidateId: winner, resumeId, parsed: structured });
+          res = await update.call(deps.store, {
+            candidateId: winner, resumeId, parsed: structured, phone: deps.phone,
+          });
         } catch {
           // The population THREW. Distinguished from "already populated"
           // deliberately: reporting `reused` here would tell the caller the
