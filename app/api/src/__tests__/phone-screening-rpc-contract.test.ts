@@ -1,0 +1,193 @@
+/**
+ * The RPC contract, extracted from the migration rather than trusted.
+ *
+ * Three failure modes this exists to catch, each of which is silent otherwise:
+ *   * A RENAMED or MISSING parameter is not a type error — PostgREST resolves
+ *     an RPC by argument name, so it is a 404 at runtime.
+ *   * A MISSING status member turns a benign refusal into a thrown error on a
+ *     billable path. `halt_unreadable`, `attempt_required`,
+ *     `ok_prereqs_pending`, `not_live` and `lease_lost` are the easy misses.
+ *   * An EXTRA status member is a refusal we claim to handle and the database
+ *     never produces, which reads as coverage and is not.
+ */
+
+import { describe, it, expect } from 'vitest';
+import {
+  PHONE_RPC_NAMES,
+  PHONE_RPC_PARAMETERS,
+  PHONE_RPC_STATUSES,
+  PHONE_RPC_STATUS_COUNT,
+  PHONE_RPC_STATUS_UNION,
+  PHONE_RPC_UNKNOWN_STATUS,
+  narrowPhoneRpcStatus,
+} from '../lib/phone-screening/rpc-contract.js';
+import {
+  MIGRATION_0042,
+  RPC_NAMES,
+  functionBody,
+  functionParameters,
+  functionStatuses,
+} from './support/phone-migration.js';
+
+
+describe('the extractor itself is not over-broad', () => {
+  // A drift test built on an over-captured body validates a different object
+  // than it names, which is worse than no drift test: it stays green while the
+  // thing it claims to guard changes.
+  it('a name that PREFIXES another does not capture its neighbour', () => {
+    // `phone_ist_window_open` is a strict prefix of `phone_ist_window_open_at`,
+    // and 0042 declares the longer one FIRST.
+    const predicate = functionBody('phone_ist_window_open');
+    expect(predicate.split('\n')[0]).toContain('phone_ist_window_open(p_at timestamptz)');
+    expect(predicate).not.toContain('phone_ist_window_open_at()\nreturns');
+    expect(predicate).not.toContain('phone_max_concurrent()\nreturns');
+    expect(predicate.length).toBeLessThan(1_000);
+  });
+
+  it('a one-line helper terminates at its own inline $$;', () => {
+    for (const name of [
+      'phone_ist_window_open_at', 'phone_ist_window_close_at', 'phone_max_concurrent',
+    ]) {
+      const body = functionBody(name);
+      expect(body.split('\n')[0]).toContain(`screening_v2.${name}(`);
+      expect(body.length).toBeLessThan(400);
+    }
+  });
+
+  it('every extracted body contains exactly one function header', () => {
+    for (const name of [...RPC_NAMES, 'phone_ist_window_open', 'phone_ist_date',
+      'phone_next_window_open', 'phone_max_concurrent']) {
+      const headers = [...functionBody(name)
+        .matchAll(/create or replace function screening_v2\.\w+\(/g)];
+      expect(headers, `${name} over-captured`).toHaveLength(1);
+    }
+  });
+
+  it('the status extractor is not vacuous — it finds what is there', () => {
+    // A silently-empty extraction would make every vocabulary assertion pass.
+    expect(functionStatuses('admit_phone_attempt').size).toBe(26);
+    expect(functionStatuses('schedule_phone_appointment')).toContain('ok_prereqs_pending');
+    expect(() => functionStatuses('phone_ist_date')).toThrow(/no statuses extracted/);
+    expect(() => functionBody('no_such_function')).toThrow(/function missing/);
+  });
+});
+
+describe('the ten RPCs', () => {
+  it('the TS list is exactly the migration\'s service-role RPC set', () => {
+    expect(new Set(PHONE_RPC_NAMES)).toEqual(new Set(RPC_NAMES));
+    expect(PHONE_RPC_NAMES).toHaveLength(10);
+    for (const name of PHONE_RPC_NAMES) {
+      expect(MIGRATION_0042).toContain(`grant execute on function screening_v2.${name}`);
+      // Service-role only: nothing is granted to a browser role.
+      expect(MIGRATION_0042).toContain(
+        `revoke all on function screening_v2.${name}`,
+      );
+    }
+  });
+
+  it('parameter names match the migration signatures, in order', () => {
+    for (const name of PHONE_RPC_NAMES) {
+      expect(PHONE_RPC_PARAMETERS[name]).toEqual(functionParameters(name));
+    }
+  });
+
+  it('every time-dependent RPC takes p_now as its FINAL parameter', () => {
+    for (const name of PHONE_RPC_NAMES) {
+      const params = PHONE_RPC_PARAMETERS[name];
+      expect(params[params.length - 1]).toBe('p_now');
+    }
+  });
+
+  it('no RPC body reads the machine clock', () => {
+    for (const name of PHONE_RPC_NAMES) {
+      const body = functionBody(name);
+      // Column DEFAULTs on tables deliberately keep now(); function BODIES
+      // must not, or a boundary test passes in Asia and fails in CI.
+      expect(body).not.toMatch(/\bclock_timestamp\(\)/);
+      expect(body).not.toMatch(/\bcurrent_timestamp\b/);
+      // `now()` appears EXACTLY once, and only as the `p_now` default in the
+      // signature — never inside the body, where it would make the RPC read
+      // the machine clock instead of the injected instant.
+      expect([...body.matchAll(/\bnow\(\)/g)]).toHaveLength(1);
+      expect(body).toMatch(/p_now\s+timestamptz default now\(\)/);
+    }
+  });
+});
+
+describe('the status vocabulary', () => {
+  for (const name of RPC_NAMES) {
+    it(`${name}: the TS union is exactly the migration's`, () => {
+      expect(new Set(PHONE_RPC_STATUSES[name])).toEqual(functionStatuses(name));
+    });
+  }
+
+  it('44 distinct statuses across all ten RPCs', () => {
+    const fromMigration = new Set(RPC_NAMES.flatMap((n) => [...functionStatuses(n)]));
+    expect(fromMigration.size).toBe(PHONE_RPC_STATUS_COUNT);
+    expect(new Set(PHONE_RPC_STATUS_UNION)).toEqual(fromMigration);
+  });
+
+  it('the easy-to-miss benign refusals are all carried', () => {
+    for (const status of [
+      'halt_unreadable', 'attempt_required', 'ok_prereqs_pending', 'not_live', 'lease_lost',
+    ]) {
+      expect(PHONE_RPC_STATUS_UNION).toContain(status);
+    }
+    expect(PHONE_RPC_STATUSES.clear_phone_halt).toContain('halt_unreadable');
+    expect(PHONE_RPC_STATUSES.admit_phone_attempt).toContain('halt_unreadable');
+    expect(PHONE_RPC_STATUSES.apply_phone_event).toContain('attempt_required');
+    expect(PHONE_RPC_STATUSES.schedule_phone_appointment).toContain('ok_prereqs_pending');
+    expect(PHONE_RPC_STATUSES.cancel_phone_appointment).toContain('not_live');
+    expect(PHONE_RPC_STATUSES.heartbeat_phone_attempt).toContain('lease_lost');
+  });
+
+  it('apply_phone_event has no "ok" — it answers applied or ignored', () => {
+    expect(PHONE_RPC_STATUSES.apply_phone_event).not.toContain('ok');
+    expect(PHONE_RPC_STATUSES.apply_phone_event).toContain('applied');
+    expect(PHONE_RPC_STATUSES.apply_phone_event).toContain('ignored');
+  });
+});
+
+describe('narrowing an answer', () => {
+  it('accepts a declared status for that RPC only', () => {
+    expect(narrowPhoneRpcStatus('admit_phone_attempt', { status: 'window_closed' }))
+      .toBe('window_closed');
+    // `lease_lost` is real, but not an answer admission can give.
+    expect(narrowPhoneRpcStatus('admit_phone_attempt', { status: 'lease_lost' }))
+      .toBe(PHONE_RPC_UNKNOWN_STATUS);
+  });
+
+  it('malformed and unknown bodies narrow to a STABLE sanitized value', () => {
+    for (const body of [
+      null,
+      undefined,
+      {},
+      { status: null },
+      { status: 42 },
+      { status: '' },
+      { status: 'a_status_from_a_future_migration' },
+      { status: { nested: 'ok' } },
+      [{ status: 'ok' }],
+      'ok',
+      { STATUS: 'ok' },
+    ]) {
+      expect(narrowPhoneRpcStatus('admit_phone_attempt', body)).toBe(PHONE_RPC_UNKNOWN_STATUS);
+    }
+  });
+
+  it('the unknown marker is not a member of any RPC vocabulary', () => {
+    // A caller must never confuse "the database refused" with "we never got an
+    // answer", so the marker cannot collide with a real refusal.
+    for (const name of PHONE_RPC_NAMES) {
+      expect(PHONE_RPC_STATUSES[name]).not.toContain(PHONE_RPC_UNKNOWN_STATUS);
+    }
+    expect(PHONE_RPC_STATUS_UNION).not.toContain(PHONE_RPC_UNKNOWN_STATUS);
+  });
+
+  it('narrowing never throws, whatever it is handed', () => {
+    for (const name of PHONE_RPC_NAMES) {
+      expect(() => narrowPhoneRpcStatus(name, Symbol('x'))).not.toThrow();
+      expect(() => narrowPhoneRpcStatus(name, new Error('x'))).not.toThrow();
+    }
+  });
+});
