@@ -1,12 +1,19 @@
 -- =====================================================================
 -- 0042 — Phone screening durable substrate (P1).
 --
--- FORWARD-ONLY and ADDITIVE. Creates six new tables, three triggers, two
--- IST helpers and nine service-role RPCs, and widens exactly two closed
--- CHECK allowlists using the sanctioned drop-IF-EXISTS -> re-create
--- NOT VALID -> VALIDATE pattern. It drops no table, column, index or
--- unique/foreign-key constraint, replaces no existing function body, and
--- leaves 0001-0041 byte-identical.
+-- FORWARD-ONLY and ADDITIVE. Creates six new tables, four triggers, six
+-- helper functions and ten service-role RPCs, and widens exactly two
+-- closed CHECK allowlists using the sanctioned drop-IF-EXISTS ->
+-- re-create NOT VALID -> VALIDATE pattern. It drops no table, column,
+-- index or unique/foreign-key constraint, replaces no existing function
+-- body, and leaves 0001-0041 byte-identical.
+--
+-- The six helpers are `phone_ist_date`, `phone_ist_window_open_at`,
+-- `phone_ist_window_close_at`, `phone_ist_window_open`,
+-- `phone_next_window_open` and `phone_max_concurrent`, plus the
+-- `phone_event_metadata_sanitized` predicate that backs a CHECK. The
+-- four triggers are the engagement transition guard, the appointment
+-- window guard, and the two that make the ingress ledger insert-once.
 --
 -- ── WHAT THIS IS, AND WHAT IT IS NOT ──────────────────────────────────
 -- This is the DATABASE half of outbound phone screening: the state
@@ -20,8 +27,13 @@
 -- writes `candidates.phone_e164 = null, phone_valid = false` on every
 -- import, and `admit_phone_attempt` refuses `phone_invalid` on exactly
 -- that shape. Every fixture in the test suite therefore seeds a
--- synthetic reserved documentation number; a green concurrency test here
--- is evidence about the SUBSTRATE, never about an end-to-end feature.
+-- SYNTHETIC +91 value. Note precisely what that is and is not: India
+-- publishes NO reserved documentation range — there is no +1-555
+-- equivalent to reach for — so these are not "reserved" numbers, they
+-- are synthetic values living only in an ephemeral local container that
+-- has no provider credentials and no dial path. A green concurrency test
+-- here is evidence about the SUBSTRATE, never about an end-to-end
+-- feature.
 --
 -- ── LOCK ORDER (pinned; a static test asserts it) ─────────────────────
 -- Every admission transaction takes locks in exactly this order:
@@ -89,13 +101,52 @@
 -- ── WORK-OWING, SCOPED HONESTLY ───────────────────────────────────────
 -- Only a transition INTO `dialing` guarantees a live `phone.dial` job in
 -- the same transaction. `eligible`, `awaiting_retry` and `scheduled` are
--- SWEEPER-DRIVEN by design (transitions #5/#6/#10/#27) and carry no
--- queue row. The sweeper that re-drives them, and the heartbeat loop
--- that keeps a concurrency lease alive for the length of a conversation,
--- are owned by P5. 0042 EXPOSES `heartbeat_phone_attempt` and
--- `reclaim_phone_attempt_leases` and proves them; it does not run them.
--- The 10-slot cap's correctness depends on P5 heartbeating, and that
--- dependency is stated rather than hidden.
+-- SWEEPER-DRIVEN by design (transitions #5/#6/#27) and carry no queue
+-- row. The sweeper that re-drives them, and the heartbeat loop that
+-- keeps a concurrency lease alive for the length of a conversation, are
+-- owned by P5. 0042 EXPOSES `heartbeat_phone_attempt`,
+-- `reclaim_phone_attempt_leases` and `expire_phone_appointments` and
+-- proves them; it does not run them. The 10-slot cap's correctness
+-- depends on P5 heartbeating, and that dependency is stated rather than
+-- hidden.
+--
+-- The CONVERSE also holds, and is stated because it is the half a
+-- reader would otherwise have to infer: a live `phone.dial` job does NOT
+-- guarantee a live attempt. `reclaim_phone_attempt_leases` completes the
+-- job it can reach, but a job already CLAIMED by a worker is that
+-- worker's to finish. The handler contract is therefore explicit: a
+-- `phone.dial` job whose attempt is not in a live state is a successful
+-- NO-OP completion, never a failure and never a retry. Retrying it to
+-- `max_attempts` would turn an ordinary reclaim into dead-letter noise.
+--
+-- ── WHAT 0042 DELIBERATELY DOES NOT IMPLEMENT ─────────────────────────
+-- The engagement machine implements the design's transitions #1..#31
+-- except the two whose trigger is a worker clock rather than a database
+-- fact, and those are named rather than left to be discovered:
+--
+--   * #26 (`reconnecting` + backoff expiry with the window CLOSED ->
+--     `scheduled`) is P5's: the decision is made when the backoff
+--     ELAPSES, and nothing in the database knows when that is. The
+--     window-closed case at DROP time (#20) IS implemented here.
+--   * `phone_appointments.confirmed` / `confirmed_at` have no writer
+--     here and are P4's: an appointment is confirmed when the bot has
+--     verbally read the slot back to the candidate, which is a voice
+--     event, not a schema one.
+--
+-- `missed` (#10) and `fulfilled` are written here, by
+-- `expire_phone_appointments` and by `admit_phone_attempt` respectively.
+--
+-- ── ERASURE AND THE APPEND-ONLY LEDGER ────────────────────────────────
+-- `phone_call_events` is insert-once, and its FKs to `phone_engagements`
+-- and `phone_call_attempts` are `on delete set null`. A referential SET
+-- NULL is an UPDATE, so the append-only trigger BLOCKS it: while ledger
+-- rows reference them, an engagement and its attempts CANNOT be deleted,
+-- and the failure surfaces as `phone_call_events is insert-once` rather
+-- than as anything mentioning the parent. That is deliberate — a ledger
+-- row must not be orphaned silently — but it means a DPDP erasure or a
+-- retention job must delete the ledger rows FIRST, under
+-- `set local app.allow_phone_event_mutation = 'true'`. This is asserted
+-- by a policy test rather than left to be met in an incident.
 --
 -- ── DELIBERATE NON-REUSE ──────────────────────────────────────────────
 -- `screening_v2.call_queue` and `screening_v2.sms_follow_ups` (0001) stay
@@ -523,7 +574,21 @@ comment on column screening_v2.phone_appointments.version is
 -- Every key must be a short snake_case identifier, every value must be a
 -- scalar, and every string value must be drawn from a character set that
 -- excludes '+' (so no E.164), '@' (so no address), '/' (so no URL) and
--- whitespace (so no prose).
+-- whitespace (so no prose) -- AND must contain no run of seven or more
+-- consecutive digits.
+--
+-- The digit rule is what makes the claim true rather than nearly true.
+-- The character set alone admits "919876543210": a provider `from` field
+-- in national or plus-less E.164 form would have passed every other
+-- guard and landed in an append-only column, removable only through the
+-- erasure hatch. Seven is chosen because it is shorter than any
+-- dialable Indian subscriber number.
+--
+-- The rule also refuses an all-digit UUID segment, and that is accepted
+-- deliberately: this column is for SHORT STABLE CODES, not identifiers.
+-- Identifiers already have typed columns of their own on this table
+-- (`attempt_id`, `engagement_id`, `epoch`), which is where a caller
+-- should put them and where a reader will look for them.
 create or replace function screening_v2.phone_event_metadata_sanitized(p_metadata jsonb)
 returns boolean
 language sql
@@ -538,7 +603,8 @@ as $$
              where kv.key !~ '^[a-z][a-z0-9_]{0,31}$'
                 or jsonb_typeof(kv.value) not in ('string', 'number', 'boolean')
                 or (jsonb_typeof(kv.value) = 'string'
-                    and (kv.value #>> '{}') !~ '^[A-Za-z0-9_.:-]{0,128}$')))
+                    and ((kv.value #>> '{}') !~ '^[A-Za-z0-9_.:-]{0,128}$'
+                      or (kv.value #>> '{}') ~ '[0-9]{7,}'))))
 $$;
 
 revoke all on function screening_v2.phone_event_metadata_sanitized(jsonb)
@@ -548,8 +614,12 @@ grant execute on function screening_v2.phone_event_metadata_sanitized(jsonb) to 
 comment on function screening_v2.phone_event_metadata_sanitized is
   'True when a phone_call_events.metadata payload carries only short '
   'snake_case keys and scalar values drawn from a character set that '
-  'excludes +, @, / and whitespace — so no phone number, address, URL '
-  'or free text can reach an append-only column. Service-role-only.';
+  'excludes +, @, / and whitespace AND containing no run of seven or '
+  'more consecutive digits — so no phone number, in any format, and no '
+  'address, URL or free text can reach an append-only column. The digit '
+  'rule also refuses an all-digit UUID segment: this column is for short '
+  'stable CODES, and identifiers belong in the typed columns beside it. '
+  'Service-role-only.';
 
 create table if not exists screening_v2.phone_call_events (
   id                uuid primary key default gen_random_uuid(),
@@ -742,13 +812,13 @@ comment on table screening_v2.phone_control is
 -- 8. Engagement transition trigger — the machine, not a convention
 -- ═══════════════════════════════════════════════════════════════════════
 -- A state machine whose edges live only in TypeScript is a convention.
--- These are the edges of the design's transition table (#1..#31), with
--- three resolutions the design left open, each stated rather than
--- assumed:
+-- These are the edges of the design's transition table (#1..#31) except
+-- #26, which is named in the file header as P5's, with three resolutions
+-- the design left open, each stated rather than assumed:
 --
 --   * #30 ("lease reclaimed -> prior state") is realised as the edges
---     dialing -> {eligible, scheduled, reconnecting}, restoring the
---     value stored in phone_call_attempts.prior_engagement_state.
+--     dialing/in_call -> {eligible, scheduled, reconnecting}, restoring
+--     the value stored in phone_call_attempts.prior_engagement_state.
 --   * #21 ("reconnects_used = 3 then participant_left -> completed
 --     (partial) or failed") is realised as `failed` when no assessment
 --     completion has been observed; a partial that DID complete arrives
@@ -767,6 +837,18 @@ as $$
 declare
   allowed text[];
 begin
+  -- TERMINAL MEANS TERMINAL, and it is checked before the same-state
+  -- shortcut below. Guarding only `state` would leave a finished
+  -- engagement's budgets, next_eligible_at and consent_record_id
+  -- writable — a narrower guarantee than the word "immutable", and one
+  -- a reader would not expect to have to check. No RPC in this file
+  -- updates a terminal row; this makes that a property of the schema
+  -- rather than a property of the current callers.
+  if old.terminal_at is not null and new is distinct from old then
+    raise exception 'phone engagement % is terminal (%) and immutable', old.id, old.state
+      using errcode = 'P0001';
+  end if;
+
   if old.state = new.state then
     return new;   -- idempotent no-op (#14/#16 and every retry)
   end if;
@@ -816,9 +898,12 @@ create trigger trg_phone_engagement_transition
 
 comment on function screening_v2.enforce_phone_engagement_transition is
   'Enforces the legal phone_engagements state machine on UPDATE; '
-  'same-state is a no-op. The six terminal states (completed, '
-  'abandoned_no_answer, opted_out, wrong_number, failed, cancelled) '
-  'reject every transition, terminal-to-terminal included.';
+  'same-state is a no-op. A row in any of the six terminal states '
+  '(completed, abandoned_no_answer, opted_out, wrong_number, failed, '
+  'cancelled) is immutable in EVERY column, not merely in `state` — so a '
+  'finished engagement''s budgets, eligibility and consent authority '
+  'cannot be rewritten after the fact. Terminal-to-terminal is refused '
+  'like any other transition.';
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- 9. Appointment window trigger — the IST invariant a CHECK cannot hold
@@ -968,14 +1053,20 @@ alter table screening_v2.audit_events
       -- row, i.e. one written while a library could still pollute the child's
       -- stdout protocol channel.
       'ashby_ingestion_legacy_bad_output_recovery',
-      -- Phone screening (0042, additive): the six actions this migration's
-      -- own RPCs write. No stage move, no email, no scorecard.
+      -- Phone screening (0042, additive): the eight actions this
+      -- migration's own RPCs write. No stage move, no email, no
+      -- scorecard.
       'phone_attempt_admitted',
       'phone_attempt_classified',
       'phone_attempt_ended',
       'phone_appointment_scheduled',
       'phone_appointment_cancelled',
-      'phone_opt_out_recorded'
+      'phone_appointment_missed',
+      'phone_opt_out_recorded',
+      -- Written in the SAME transaction as the terminal opt-out that
+      -- earns it; the target id is the line's SHA-256 digest, never a
+      -- number.
+      'phone_suppression_added'
     )
   )
   not valid;
@@ -1120,6 +1211,8 @@ declare
   v_ist_date       date;
   v_job_id         uuid;
   v_dedup_key      text;
+  v_constraint     text;
+  v_apt_id         uuid;
   v_max_concurrent constant integer := screening_v2.phone_max_concurrent();
   v_queue_name     constant text    := 'phone.dial';
   v_job_max_attempts constant integer := 5;
@@ -1339,13 +1432,19 @@ begin
        p_now, p_now)
     returning id into v_attempt_id;
   exception
-    -- The ONLY handled condition, and it is handled narrowly. Either
-    -- uq_phone_attempts_one_live (a concurrent admission already holds
-    -- the single live slot) or uq_phone_attempts_one_per_ist_day (a
-    -- same-day attempt raced past the check above). Both are refusals,
-    -- both are free, and neither is a failure of this function.
+    -- The ONLY handled condition, and it is handled narrowly. Two
+    -- different indexes can raise it and they mean different things, so
+    -- the constraint name is read rather than guessed: reporting a
+    -- same-day race as an in-flight attempt would send an operator
+    -- looking for a call that is not happening.
     when unique_violation then
-      return jsonb_build_object('status', 'attempt_in_flight');
+      get stacked diagnostics v_constraint = constraint_name;
+      if v_constraint = 'uq_phone_attempts_one_per_ist_day' then
+        return jsonb_build_object('status', 'daily_attempt_exists',
+                                  'ist_date', v_ist_date);
+      end if;
+      return jsonb_build_object('status', 'attempt_in_flight',
+                                'constraint', v_constraint);
   end;
 
   update screening_v2.phone_call_attempts
@@ -1410,6 +1509,23 @@ begin
     end if;
   end if;
 
+  -- The slot that authorised this dial has been spent. `fulfilled` is
+  -- written HERE, at the dial, rather than at the answer: the slot's job
+  -- was to authorise a call at a time the candidate agreed to, and that
+  -- job is done the moment the call is admitted. What the call then does
+  -- is the attempt's business, and the attempt records it. Leaving the
+  -- slot live instead would keep a stale entry on HR's calendar and push
+  -- every later booking down the supersede path.
+  if p_kind = 'scheduled' then
+    update screening_v2.phone_appointments
+       set status     = 'fulfilled',
+           version    = version + 1,
+           updated_at = p_now
+     where engagement_id = p_engagement_id
+       and status in ('scheduled', 'confirmed')
+    returning id into v_apt_id;
+  end if;
+
   insert into screening_v2.audit_events
     (actor_id, actor_type, action, target_type, target_id, result, metadata)
   values
@@ -1431,7 +1547,8 @@ begin
                         'epoch', v_eng.epoch,
                         'ist_date', v_ist_date,
                         'live_before', v_live,
-                        'max_concurrent', v_max_concurrent));
+                        'max_concurrent', v_max_concurrent,
+                        'fulfilled_appointment', v_apt_id is not null));
 
   return jsonb_build_object('status', 'ok',
                             'attempt_id', v_attempt_id,
@@ -1546,6 +1663,7 @@ declare
   v_att      screening_v2.phone_call_attempts%rowtype;
   v_eng_id   uuid;
   v_restored integer;
+  v_jobs     integer;
   v_count    integer := 0;
   v_limit   constant integer := greatest(1, least(coalesce(p_limit, 50), 500));
 begin
@@ -1608,6 +1726,22 @@ begin
            ended_at      = p_now
      where id = v_att.id;
 
+    -- Resolve the dial job this attempt owned, in the SAME transaction.
+    -- Leaving it claimable would hand a worker a job whose attempt is
+    -- not live; the handler contract (stated in the file header) makes
+    -- that a no-op completion, but a queue row that outlives its work is
+    -- still noise an operator has to explain. `active` is deliberately
+    -- excluded: a claimed job belongs to the worker holding it, and
+    -- completing it under that worker would be the lease violation this
+    -- sweeper exists to avoid.
+    update screening_v2.job_queue
+       set status       = 'completed',
+           completed_at = p_now
+     where name = 'phone.dial'
+       and dedup_key = 'phone.dial:' || v_att.id::text
+       and status in ('pending', 'delayed');
+    get diagnostics v_jobs = row_count;
+
     -- Back to the state this attempt was admitted FROM, so a reclaimed
     -- reconnect returns to `reconnecting` rather than silently becoming
     -- a fresh daily attempt. Terminal engagements are left alone: a
@@ -1648,7 +1782,8 @@ begin
                           'restored', v_restored > 0,
                           'restored_state',
                           case when v_restored > 0
-                               then v_att.prior_engagement_state else null end));
+                               then v_att.prior_engagement_state else null end,
+                          'dial_jobs_completed', v_jobs));
 
     v_count := v_count + 1;
   end loop;
@@ -1667,9 +1802,13 @@ comment on function screening_v2.reclaim_phone_attempt_leases is
   '#30): the attempt becomes abandoned, its fleet slot is freed and the '
   'engagement is returned to the state it was admitted from. CHARGES NO '
   'BUDGET — a dead worker is our '
-  'failure, not the candidate''s attempt. Separate from '
-  'reclaim_expired_jobs, which is queue-name-agnostic and cannot see '
-  'this table. Service-role-only.';
+  'failure, not the candidate''s attempt. Also COMPLETES the abandoned '
+  'attempt''s pending/delayed phone.dial job in the same transaction, so '
+  'the queue does not keep a row whose work no longer exists; a job '
+  'already claimed by a worker is left to that worker, whose handler '
+  'contract is to treat a non-live attempt as a no-op completion. '
+  'Separate from reclaim_expired_jobs, which is queue-name-agnostic and '
+  'cannot see this table. Service-role-only.';
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- 17. phone_next_window_open — the one place "the next legal dial time"
@@ -1768,6 +1907,10 @@ declare
   v_existing   screening_v2.phone_call_events%rowtype;
   v_slot_start timestamptz;
   v_metadata   jsonb;
+  v_phone      text;
+  v_digest     text;
+  v_suppressed boolean := false;
+  v_defer_at   timestamptz;
 begin
   if p_source is null or p_source not in
      ('livekit_webhook','provider_callback','provider_poll','internal','reconciliation') then
@@ -1913,12 +2056,11 @@ begin
         v_reason := 'candidate_opt_out';
 
       -- ── from `awaiting_retry` ───────────────────────────────────────
-      when v_eng.state = 'awaiting_retry' and p_event_type = 'budget.exhausted'
-           and v_eng.no_answer_attempts >= 3 then
-        v_new_state := 'abandoned_no_answer'; v_reason := 'no_answer_budget_exhausted'; -- #28
-      when v_eng.state = 'awaiting_retry' and p_event_type = 'day.rolled'
-           and v_eng.no_answer_attempts >= 3 then
-        v_new_state := 'abandoned_no_answer'; v_reason := 'no_answer_budget_exhausted';
+      -- #28 has no branch here on purpose. The no-answer charge that
+      -- lands on 3 goes STRAIGHT to `abandoned_no_answer` (below), so an
+      -- `awaiting_retry` engagement always has budget left and a
+      -- `budget.exhausted` branch could never fire. An unreachable
+      -- branch reads as a safety net and is not one.
       when v_eng.state = 'awaiting_retry' and p_event_type = 'day.rolled'
            and screening_v2.phone_ist_date(p_now)
                > screening_v2.phone_ist_date(coalesce(v_eng.last_attempt_at, p_now)) then
@@ -1943,6 +2085,26 @@ begin
       else
         v_ignored := 'unexpected_event';                                -- the §4 default
     end case;
+  end if;
+
+  -- ── An engagement-scoped post cannot drive an attempt-scoped edge ──
+  -- Both attempt writes below are guarded by `v_att.id is not null`, and
+  -- a guard that SKIPS is not a guard: the engagement half of the
+  -- transition would still be applied. `classify.machine` posted with
+  -- only an engagement id would charge a no-answer attempt and move to
+  -- `awaiting_retry` while leaving the attempt live and holding a fleet
+  -- slot; `disclosure.delivered` would bump the engagement's epoch and
+  -- not the attempt's, fencing out every later event on that attempt and
+  -- leaving a conversation nothing could end.
+  --
+  -- So the requirement is decided WITH the verdict, before anything is
+  -- written, and answered with a stable refusal. Nothing is recorded:
+  -- this is a malformed call, not an event that happened.
+  if v_ignored is null and v_att.id is null
+     and (v_att_state is not null or v_bump_epoch) then
+    return jsonb_build_object('status', 'attempt_required',
+                              'event_type', p_event_type,
+                              'engagement_state', v_eng.state);
   end if;
 
   -- ── One INSERT, already carrying the final verdict ─────────────────
@@ -1988,20 +2150,41 @@ begin
     if v_eng.provider_failures + 1 >= 5 then
       v_new_state := 'failed'; v_reason := 'provider_budget_exhausted';
     else
+      -- THE PROVIDER BUDGET IS PACED BY THE IST DAY, DELIBERATELY.
+      -- The engagement returns to `eligible`, but the failed attempt
+      -- keeps kind='initial'/'no_answer_retry' and today's ist_date, so
+      -- uq_phone_attempts_one_per_ist_day refuses the next admission
+      -- with `daily_attempt_exists` until the IST day rolls. Exhausting
+      -- the five-failure budget therefore takes up to five IST days.
+      --
+      -- That is the choice, not an accident. The alternative — letting a
+      -- provider error free the day — would mean an engagement could be
+      -- dialled up to six times in one day whenever our transport was
+      -- flaky, and the per-day index is an ANTI-HARASSMENT invariant.
+      -- We cannot tell from a transport rejection whether the line rang;
+      -- fail closed on that uncertainty, at the cost of throughput and
+      -- never at the candidate's.
+      --
+      -- `next_eligible_at` is set to the next legal instant on the next
+      -- IST day so the row says out loud when it may next be tried,
+      -- rather than looking eligible now and being refused by an index.
       v_new_state := 'eligible';
+      v_defer_at  := screening_v2.phone_next_window_open(
+                       (screening_v2.phone_ist_date(p_now) + 1)::timestamp
+                         at time zone 'Asia/Kolkata');
     end if;
   end if;
 
   -- #18 bumps the engagement's fencing epoch; the LIVE attempt must
   -- carry the new value, or the fallback above would fence the very
   -- conversation that just started.
-  if v_bump_epoch and v_att.id is not null then
+  if v_bump_epoch then
     update screening_v2.phone_call_attempts
        set epoch = v_eng.epoch + 1
      where id = v_att.id;
   end if;
 
-  if v_att_state is not null and v_att.id is not null then
+  if v_att_state is not null then
     update screening_v2.phone_call_attempts
        set state         = v_att_state,
            outcome_class = coalesce(v_outcome, outcome_class),
@@ -2059,7 +2242,10 @@ begin
                                when v_new_state in ('completed','abandoned_no_answer',
                                                     'opted_out','wrong_number','failed','cancelled')
                                then p_now else null end,
-           next_eligible_at = case when v_defer then v_slot_start else next_eligible_at end,
+           next_eligible_at = case
+                                when v_defer then v_slot_start
+                                when v_defer_at is not null then v_defer_at
+                                else next_eligible_at end,
            version          = version + 1,
            updated_at       = p_now
      where id = v_eng.id;
@@ -2078,7 +2264,45 @@ begin
        jsonb_build_object('engagement_id', v_eng.id, 'classification', v_att_state,
                           'event_type', p_event_type));
   end if;
+  -- ── THE SUPPRESSION IS PART OF THE OPT-OUT, NOT A FOLLOW-UP ────────
+  -- An opt-out modelled only on the engagement is enforced PER
+  -- APPLICATION: the same person applying to a second role would be
+  -- dialled again, because the second engagement has its own terminal
+  -- state and knows nothing about the first. The obligation follows the
+  -- LINE, so it is recorded against the line's digest, and it is
+  -- recorded in THIS transaction — a terminal transition that commits
+  -- without its suppression is the split this substrate exists to
+  -- prevent, and a deferred obligation is documentation, not a control.
   if v_new_state in ('opted_out','wrong_number') then
+    select phone_e164 into v_phone
+      from screening_v2.candidates where id = v_eng.candidate_id;
+
+    if v_phone is not null then
+      v_digest := screening_v2.sha256_hex(v_phone);
+      insert into screening_v2.phone_suppressions
+        (candidate_id, phone_sha256, reason, source, created_at)
+      values
+        (v_eng.candidate_id, v_digest,
+         case when v_new_state = 'opted_out' then 'candidate_opt_out' else 'wrong_number' end,
+         'candidate', p_now)
+      -- The line may already be suppressed from an earlier application.
+      -- That is the mechanism working, not a conflict to resolve.
+      on conflict (phone_sha256) do nothing;
+      v_suppressed := true;
+
+      insert into screening_v2.audit_events
+        (actor_id, actor_type, action, target_type, target_id, result, metadata)
+      values
+        ('00000000-0000-0000-0000-000000000000'::uuid, 'candidate',
+         'phone_suppression_added', 'phone_suppression', v_digest, 'success',
+         -- The DIGEST is the target id, and there is no number anywhere
+         -- in this row. That is the whole point of keying on a digest.
+         jsonb_build_object('engagement_id', v_eng.id,
+                            'reason', case when v_new_state = 'opted_out'
+                                           then 'candidate_opt_out' else 'wrong_number' end,
+                            'source', 'candidate'));
+    end if;
+
     insert into screening_v2.audit_events
       (actor_id, actor_type, action, target_type, target_id, result, metadata)
     values
@@ -2086,8 +2310,15 @@ begin
       -- outcome originated with the person on the line.
       ('00000000-0000-0000-0000-000000000000'::uuid, 'candidate',
        'phone_opt_out_recorded', 'phone_engagement', v_eng.id::text, 'success',
+       -- `suppression_written` is read from what actually happened. An
+       -- engagement with no number on record CANNOT suppress a line it
+       -- does not know, and saying so is better than implying a control
+       -- that was not applied. Such an engagement is also undialable
+       -- (admission refuses `phone_invalid`), so the two facts are
+       -- coherent — but an operator must be able to see the gap.
        jsonb_build_object('outcome', v_new_state, 'reason', v_reason,
-                          'event_type', p_event_type));
+                          'event_type', p_event_type,
+                          'suppression_written', v_suppressed));
   end if;
 
   return jsonb_build_object('status', 'applied', 'applied', true,
@@ -2113,7 +2344,13 @@ comment on function screening_v2.apply_phone_event is
   'stale_epoch, unknown_attempt, terminal, unexpected_event. A duplicate '
   'is not one of them — it writes no row at all. Any (state, event) pair outside the transition '
   'table is an explicit no-op — the machine has no implicit default that '
-  'mutates state. Budgets move HERE and nowhere else. Service-role-only.';
+  'mutates state, and a post that omits the attempt an edge needs is '
+  'refused `attempt_required` rather than half-applied. Budgets move '
+  'HERE and nowhere else, and so does SUPPRESSION: reaching opted_out or '
+  'wrong_number writes the line''s digest to phone_suppressions in the '
+  'SAME transaction, because an opt-out enforced only by a terminal '
+  'engagement is enforced per application and would re-dial the same '
+  'person on their next one. Service-role-only.';
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- 19. schedule_phone_appointment / cancel_phone_appointment
@@ -2147,8 +2384,9 @@ as $$
 declare
   v_eng     screening_v2.phone_engagements%rowtype;
   v_live    screening_v2.phone_appointments%rowtype;
-  v_new_id  uuid;
-  v_version integer;
+  v_new_id   uuid;
+  v_version  integer;
+  v_promoted boolean := false;
 begin
   if p_source is null or p_source not in ('candidate_voice','hr_manual','system_deferral') then
     return jsonb_build_object('status', 'invalid_source');
@@ -2227,6 +2465,7 @@ begin
            version    = version + 1,
            updated_at = p_now
      where id = p_engagement_id;
+    v_promoted := true;
   end if;
 
   insert into screening_v2.audit_events
@@ -2243,9 +2482,19 @@ begin
                         'ist_date', screening_v2.phone_ist_date(p_starts_at),
                         'superseded', v_live.id is not null));
 
-  return jsonb_build_object('status', 'ok',
+  -- A booking against an engagement whose prerequisites are still unmet
+  -- is REAL — the slot exists and HR can see it — but it is not
+  -- dialable, because `pending_prereqs` has no edge to `scheduled` and
+  -- admission would refuse it anyway. Returning a plain `ok` would let a
+  -- caller believe a call is now going to happen at that time. The
+  -- distinct status says what was and was not done.
+  return jsonb_build_object('status',
+                            case when v_promoted or v_eng.state = 'scheduled'
+                                 then 'ok' else 'ok_prereqs_pending' end,
                             'appointment_id', v_new_id,
                             'version', v_version,
+                            'engagement_state',
+                            case when v_promoted then 'scheduled' else v_eng.state end,
                             'superseded_appointment_id', v_live.id);
 end;
 $$;
@@ -2262,7 +2511,10 @@ comment on function screening_v2.schedule_phone_appointment is
   'Enforces the approved IST START window, the 15-60 minute slot '
   'envelope and the no-IST-midnight-straddle rule, and refuses a slot in '
   'the past, a terminal engagement and an engagement with a dial in '
-  'flight. No external calendar is contacted. Service-role-only.';
+  'flight. Booking against an engagement whose prerequisites are still '
+  'unmet returns `ok_prereqs_pending` rather than `ok`: the slot is real '
+  'and visible, but nothing will dial it until the prerequisites are '
+  'satisfied. No external calendar is contacted. Service-role-only.';
 
 create or replace function screening_v2.cancel_phone_appointment(
   p_appointment_id   uuid,
@@ -2486,6 +2738,115 @@ comment on function screening_v2.clear_phone_halt is
   'switch on a billable dialer is a stop, not a go. Service-role-only.';
 
 -- ═══════════════════════════════════════════════════════════════════════
+-- 20b. expire_phone_appointments — transition #10
+-- ═══════════════════════════════════════════════════════════════════════
+-- A slot that came and went with no dial must stop being live. Without
+-- this the engagement rests in `scheduled` for ever, HR keeps seeing a
+-- slot that has already passed as though it were real, and
+-- `uq_phone_appointments_one_live` pushes every later booking down the
+-- supersede path because the stale row still occupies the one live slot.
+--
+-- CHARGES NO BUDGET. A slot nobody dialled is a wait, and a wait costs
+-- the candidate nothing. Lock order is the same suffix every other
+-- appointment path uses: engagement, then appointment.
+
+create or replace function screening_v2.expire_phone_appointments(
+  p_grace_seconds integer     default 900,
+  p_limit         integer     default 50,
+  p_now           timestamptz default now()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  v_row     record;
+  v_eng_id  uuid;
+  v_apt     screening_v2.phone_appointments%rowtype;
+  v_count   integer := 0;
+  v_grace   constant integer := greatest(0, least(coalesce(p_grace_seconds, 900), 86400));
+  v_limit   constant integer := greatest(1, least(coalesce(p_limit, 50), 500));
+begin
+  -- Unlocked candidate scan, re-verified under the locks below, so the
+  -- sweeper never queues behind a live booking.
+  for v_row in
+    select id, engagement_id
+      from screening_v2.phone_appointments
+     where status in ('scheduled', 'confirmed')
+       and ends_at + (v_grace * interval '1 second') <= p_now
+     order by ends_at asc
+     limit v_limit
+  loop
+    select id into v_eng_id
+      from screening_v2.phone_engagements
+     where id = v_row.engagement_id
+     for update skip locked;
+    if not found then
+      continue;
+    end if;
+
+    select * into v_apt
+      from screening_v2.phone_appointments
+     where id = v_row.id
+       and status in ('scheduled', 'confirmed')
+       and ends_at + (v_grace * interval '1 second') <= p_now
+     for update skip locked;
+    if not found then
+      continue;
+    end if;
+
+    update screening_v2.phone_appointments
+       set status        = 'missed',
+           cancel_reason = 'system_deferral_expired',
+           version       = version + 1,
+           updated_at    = p_now
+     where id = v_apt.id;
+
+    -- Back to `eligible` so the ordinary admission path can pick the
+    -- engagement up again. A terminal engagement is left alone: its slot
+    -- is expired for tidiness, but nothing resurrects it.
+    update screening_v2.phone_engagements
+       set state            = 'eligible',
+           state_reason     = 'appointment_missed',
+           next_eligible_at = p_now,
+           version          = version + 1,
+           updated_at       = p_now
+     where id = v_apt.engagement_id
+       and terminal_at is null
+       and state = 'scheduled';
+
+    insert into screening_v2.audit_events
+      (actor_id, actor_type, action, target_type, target_id, result, metadata)
+    values
+      ('00000000-0000-0000-0000-000000000000'::uuid, 'system',
+       'phone_appointment_missed', 'phone_appointment', v_apt.id::text, 'success',
+       jsonb_build_object('engagement_id', v_apt.engagement_id,
+                          'grace_seconds', v_grace,
+                          'budget_charged', false));
+
+    v_count := v_count + 1;
+  end loop;
+
+  return jsonb_build_object('status', 'ok', 'expired', v_count,
+                            'grace_seconds', v_grace, 'limit', v_limit);
+end;
+$$;
+
+revoke all on function screening_v2.expire_phone_appointments(integer, integer, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.expire_phone_appointments(integer, integer, timestamptz)
+  to service_role;
+
+comment on function screening_v2.expire_phone_appointments is
+  'Transition #10: a live internal appointment whose slot passed without '
+  'a dial becomes `missed` and its engagement returns to `eligible`. '
+  'Bounded and grace-delayed, CHARGES NO BUDGET, and leaves a terminal '
+  'engagement alone. Without it a passed slot stays live for ever, HR '
+  'sees a stale booking as real, and the one-live index forces every '
+  'later booking through the supersede path. Service-role-only.';
+
+-- ═══════════════════════════════════════════════════════════════════════
 -- 21. phone_backlog — sanitized aggregates for health and Mission Control
 -- ═══════════════════════════════════════════════════════════════════════
 -- Counts and ages ONLY. No identifiers, no candidate fields, no phone
@@ -2511,6 +2872,10 @@ declare
   v_apts         integer;
   v_apts_overdue integer;
   v_ignored      integer;
+  v_unknown      integer;
+  v_stale        integer;
+  v_term_ev      integer;
+  v_unexpected   integer;
 begin
   select halted_at, halt_reason into v_halted_at, v_halt_reason
     from screening_v2.phone_control where control_key = 'default';
@@ -2536,10 +2901,20 @@ begin
     into v_apts, v_apts_overdue
     from screening_v2.phone_appointments;
 
-  select count(*) into v_ignored
+  -- Split by reason, because they are different alarms. A nonzero
+  -- `unknown_attempt` rate means admission and ingress have DIVERGED —
+  -- events arriving for attempts we never made — while `stale_epoch` is
+  -- the fence working as designed and `unexpected_event` is a mapping
+  -- gap. Collapsing them into one counter hides the only one of the four
+  -- that is an incident.
+  select count(*) filter (where ignored_reason = 'unknown_attempt'),
+         count(*) filter (where ignored_reason = 'stale_epoch'),
+         count(*) filter (where ignored_reason = 'terminal'),
+         count(*) filter (where ignored_reason = 'unexpected_event'),
+         count(*) filter (where ignored_reason is not null)
+    into v_unknown, v_stale, v_term_ev, v_unexpected, v_ignored
     from screening_v2.phone_call_events
-   where ignored_reason is not null
-     and received_at > p_now - interval '24 hours';
+   where received_at > p_now - interval '24 hours';
 
   return jsonb_build_object(
     'status', 'ok',
@@ -2556,7 +2931,12 @@ begin
       'max_concurrent', screening_v2.phone_max_concurrent(),
       'oldest_live_age_seconds', v_oldest_live),
     'appointments', jsonb_build_object('live', v_apts, 'overdue', v_apts_overdue),
-    'events', jsonb_build_object('ignored_last_24h', v_ignored),
+    'events', jsonb_build_object(
+      'ignored_last_24h', v_ignored,
+      'unknown_attempt_last_24h', v_unknown,
+      'stale_epoch_last_24h', v_stale,
+      'terminal_last_24h', v_term_ev,
+      'unexpected_event_last_24h', v_unexpected),
     'window_open', screening_v2.phone_ist_window_open(p_now),
     'ist_date', screening_v2.phone_ist_date(p_now));
 end;
@@ -2571,7 +2951,9 @@ comment on function screening_v2.phone_backlog is
   'only, never an identifier, a candidate field, a phone number or a '
   'provider payload. A missing control singleton is reported as halted, '
   'so an unreadable kill switch can never be read as running normally. '
-  'Service-role-only.';
+  'Ignored ingress events are broken out BY REASON, because a nonzero '
+  'unknown_attempt rate means admission and ingress have diverged and is '
+  'the only one of the four that is an incident. Service-role-only.';
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- Verifier: schema reload notification
