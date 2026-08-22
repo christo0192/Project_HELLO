@@ -485,7 +485,11 @@ describe('materializeCandidate against an existing shell', () => {
     });
     // The seam's input shape is the enforcement: there is no field through
     // which ownership or funnel position could be revised.
-    expect(Object.keys(world.populated[0]!).sort()).toEqual(['candidateId', 'parsed', 'resumeId']);
+    // `phone` joined the seam when resume-derived numbers became dialable. It
+    // belongs to the parse-derived allowlist exactly like `parsed`; what the
+    // assertion still enforces is that NOTHING carrying ownership or funnel
+    // position (role_id, owner_id, status, ats_source) can be reached here.
+    expect(Object.keys(world.populated[0]!).sort()).toEqual(['candidateId', 'parsed', 'phone', 'resumeId']);
   });
 
   it('running the ready path TWICE writes once — no duplicate resume, no second candidate', async () => {

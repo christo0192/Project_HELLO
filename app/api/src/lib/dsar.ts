@@ -82,7 +82,22 @@ export interface DSARDeleteResult {
 export interface DSARCorrectResult {
   success: boolean;
   corrections: Array<{ field: string; oldValue: unknown; newValue: unknown }>;
+  /**
+   * Corrections REFUSED by policy, with a stable machine reason.
+   *
+   * A rectification denied on policy grounds must be visible. Without this the
+   * caller receives `200 {success: true}` with the field simply absent from
+   * `corrections` — indistinguishable from a no-op — and the governance audit
+   * records `corrections_applied: 0` with nothing about a denial. That is fine
+   * for a field nobody may ever correct, but refusing to SUBSTITUTE a dial
+   * target is a new, deliberate decision and the data subject is entitled to
+   * be told it was made.
+   */
+  rejected?: Array<{ field: string; reason: string }>;
 }
+
+/** Stable, greppable reason codes for a refused correction. */
+export const CORRECTION_REJECTED_PHONE_SUBSTITUTION = 'phone_substitution_forbidden';
 
 // ── Internal helpers ─────────────────────────────────────────────────
 
@@ -603,6 +618,59 @@ const CORRECTABLE_FIELDS = new Set([
 ]);
 
 /**
+ * DSAR CORRECTION MAY ONLY REMOVE DIALABILITY, NEVER CREATE IT.
+ *
+ * `phone_e164`/`phone_valid` are the admission door of the outbound phone
+ * screener. The approved SOURCE for a dialable number is the resume structurer
+ * and nothing else — no admin entry, no enrichment, no manual fallback. A
+ * rectification endpoint that accepted an arbitrary string into `phone_e164`
+ * would be exactly that manual source, reachable by any interviewer, and it
+ * would also destroy the invariant the opt-out suppression depends on:
+ * `apply_phone_event` digests `phone_e164` with NO format check, so a
+ * non-strict value stored here writes a suppression that admission — which
+ * digests only strict values — can never match.
+ *
+ * So corrections are filtered through {@link applyPhoneCorrection}:
+ *
+ *  - `phone_e164` may be corrected ONLY to null/empty. Erasure is a genuine
+ *    rectification outcome ("do not call me on this"); substitution is a new
+ *    dial target and is rejected like an uncorrectable field.
+ *  - `phone_raw` stays freely correctable — it is a text record and nothing
+ *    dials it — but correcting it CLEARS `phone_e164`/`phone_valid`. If the
+ *    number of record just changed, the number we previously believed dialable
+ *    is no longer trusted, and continuing to dial the old one while displaying
+ *    the new one is the worst available outcome.
+ *
+ * `phone_valid` is not in CORRECTABLE_FIELDS and is never settable directly;
+ * it is written here only as the derived companion of `phone_e164`.
+ */
+function isErasure(value: unknown): boolean {
+  return value === null || value === undefined || (typeof value === 'string' && value.trim() === '');
+}
+
+/**
+ * Decide the candidate-column writes for one phone correction.
+ *
+ * Returns `null` when the correction must be REJECTED (a substitution into
+ * `phone_e164`), and otherwise the exact set of columns to write.
+ */
+export function applyPhoneCorrection(
+  field: 'phone_raw' | 'phone_e164',
+  value: unknown,
+): Record<string, unknown> | null {
+  if (field === 'phone_e164') {
+    if (!isErasure(value)) return null;
+    return { phone_e164: null, phone_valid: false };
+  }
+  // phone_raw — the text of record changes; dialability is withdrawn with it.
+  return {
+    phone_raw: isErasure(value) ? null : value,
+    phone_e164: null,
+    phone_valid: false,
+  };
+}
+
+/**
  * Fields that are NEVER correctable via DSAR (governance/audit protection).
  */
 const NEVER_CORRECTABLE_FIELDS = new Set([
@@ -648,6 +716,7 @@ export async function correctDSAR(
 
   // Validate and apply corrections
   const applied: Array<{ field: string; oldValue: unknown; newValue: unknown }> = [];
+  const rejected: Array<{ field: string; reason: string }> = [];
   const updates: Record<string, unknown> = {};
 
   for (const correction of corrections) {
@@ -659,6 +728,28 @@ export async function correctDSAR(
 
     // Skip no-op corrections
     if (oldValue === correction.value) continue;
+
+    if (correction.field === 'phone_raw' || correction.field === 'phone_e164') {
+      // See applyPhoneCorrection: erase-only for `phone_e164`, and a
+      // `phone_raw` correction withdraws dialability alongside it.
+      const writes = applyPhoneCorrection(correction.field, correction.value);
+      if (!writes) {
+        // Refused, and SAID so. Silence here would report a policy denial as
+        // a no-op.
+        rejected.push({
+          field: correction.field,
+          reason: CORRECTION_REJECTED_PHONE_SUBSTITUTION,
+        });
+        continue;
+      }
+      Object.assign(updates, writes);
+      applied.push({
+        field: correction.field,
+        oldValue,
+        newValue: writes[correction.field] ?? null,
+      });
+      continue;
+    }
 
     updates[correction.field] = correction.value;
     applied.push({
@@ -675,11 +766,17 @@ export async function correctDSAR(
       actorId,
       entityType: 'candidate',
       entityId: candidateId,
-      details: { dsar_id: dsarId, corrections_applied: 0, note: 'All corrections were no-op or rejected' },
+      details: {
+        dsar_id: dsarId,
+        corrections_applied: 0,
+        note: 'All corrections were no-op or rejected',
+        // Field names and reason codes only — never a value.
+        rejected: rejected.map((r) => `${r.field}:${r.reason}`),
+      },
       outcome: 'success',
       correlationId: corrId,
     }, clientOverride);
-    return { success: true, corrections: applied };
+    return { success: true, corrections: applied, rejected };
   }
 
   // Apply updates
@@ -705,12 +802,13 @@ export async function correctDSAR(
       dsar_id: dsarId,
       corrections_applied: applied.length,
       fields: applied.map(a => a.field),
+      rejected: rejected.map((r) => `${r.field}:${r.reason}`),
     },
     outcome: 'success',
     correlationId: corrId,
   }, clientOverride);
 
-  return { success: true, corrections: applied };
+  return { success: true, corrections: applied, rejected };
 }
 
 // ── Row mappers ──────────────────────────────────────────────────────

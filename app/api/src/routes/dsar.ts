@@ -55,6 +55,76 @@ import {
 } from '../schemas/dsar.js';
 import type { Request, Response, NextFunction } from 'express';
 
+
+// ── Phone redaction for DSAR responses ──────────────────────────────────────
+//
+// DSAR here is STAFF-OPERATED, not candidate self-service: `requireRole
+// ('interviewer')` plus an ownership check, with viewers refused outright.
+// The "it is the data subject's own data" justification therefore does not
+// apply to the interviewer reading it, and the same rule the candidate
+// projections enforce applies here — the NUMBER is admin-only.
+//
+// Two STRUCTURED carriers exist in these responses: the export payload's
+// `phone_e164`, and the prior values `correctDSAR` echoes back per applied
+// correction. Both are nulled below admin. `phone_raw` was already excluded
+// from the export payload by `lib/dsar.ts`; the correction echo is where it
+// could still leak.
+//
+// ── ONE DELIBERATE EXCEPTION, NAMED RATHER THAN GLOSSED ────────────────────
+// `exportDSAR` also returns `resumes[].text_extracted` — the full extracted
+// resume text — which contains the number verbatim, and more besides. It is
+// NOT redacted here, and that is a decision, not an oversight:
+//
+//   - It is the data subject's own document, included on purpose
+//     (`lib/dsar.ts`: "the full text IS the candidate's data so include it").
+//     An export is a legal deliverable; blanking it to satisfy an internal
+//     projection rule would damage the right it exists to serve, and the
+//     operator running the export is the person who has to hand it over.
+//   - It is free text, not a dial target. Nothing reads it into
+//     `phone_e164`, and the approved-source rule is about what may become
+//     DIALABLE, which this can never be.
+//
+// So an interviewer running an export can still read the number in the
+// resume text. That residual is recorded in the PR handoff rather than
+// hidden behind a comment claiming full coverage. Narrowing it properly
+// means restricting the export endpoints to `admin`, which is an
+// access-control change beyond this PR's scope.
+function redactDSARExport<T>(exportResult: T, role: string | null | undefined): T {
+  if (role === 'admin' || exportResult == null) return exportResult;
+  const r = exportResult as unknown as { candidate?: Record<string, unknown> };
+  if (!r.candidate || typeof r.candidate !== 'object') return exportResult;
+  return { ...(r as object), candidate: { ...r.candidate, phone_e164: null } } as T;
+}
+
+const PHONE_CORRECTION_FIELDS = new Set(['phone_raw', 'phone_e164']);
+
+function redactCorrections<T extends {
+  corrections: Array<{ field: string; oldValue: unknown; newValue: unknown }>;
+  rejected?: unknown;
+}>(result: T, role: string | null | undefined): T {
+  // `rejected` is stripped from the HTTP body on every path, admin included.
+  //
+  // `correctDSAR` reports refused phone SUBSTITUTIONS so the denial is not
+  // silent, and that report is durably recorded in the `data_corrected`
+  // governance audit (field names and reason codes only — never a value).
+  // Surfacing it to the caller as well would add an undocumented property to
+  // `DSARCorrectEnvelope`; documenting it is an API-contract change outside
+  // this PR's scope, and `contract-openapi.test.ts` correctly refuses an
+  // undocumented field. Returning it to the requester belongs in its own
+  // change — see the PR handoff.
+  const { rejected: _auditOnly, ...body } = result;
+  const base = body as unknown as T;
+  if (role === 'admin') return base;
+  return {
+    ...base,
+    corrections: base.corrections.map((c) => (
+      PHONE_CORRECTION_FIELDS.has(c.field)
+        ? { ...c, oldValue: null, newValue: null }
+        : c
+    )),
+  };
+}
+
 export const dsarRouter = Router();
 
 // ── Auth error body helper ───────────────────────────────────────────
@@ -203,7 +273,7 @@ dsarRouter.get(
       const includeExport = query.include_export === 'true';
       if (includeExport && dsar.requestStatus === 'fulfilled' && dsar.requestType === 'export') {
         const exportData = await exportDSAR(dsarId);
-        res.json({ data: dsar, export: exportData });
+        res.json({ data: dsar, export: redactDSARExport(exportData, req.authUser?.appRole) });
         return;
       }
 
@@ -368,7 +438,7 @@ dsarRouter.post(
         },
       }).catch(() => {});
 
-      res.json({ data: exportResult });
+      res.json({ data: redactDSARExport(exportResult, req.authUser?.appRole) });
     } catch (error) {
       next(error);
     }
@@ -507,7 +577,7 @@ dsarRouter.post(
         },
       }).catch(() => {});
 
-      res.json({ data: result });
+      res.json({ data: redactCorrections(result, req.authUser?.appRole) });
     } catch (error) {
       next(error);
     }

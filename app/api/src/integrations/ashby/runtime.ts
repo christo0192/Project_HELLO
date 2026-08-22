@@ -48,9 +48,26 @@ import { classifyScanStatus, resolveScanner } from '../../lib/malware-scanner.js
 import { guardUpload, UploadGuardError } from '../../lib/upload-guard.js';
 import { createResumeParserPool, type ResumeParserPool } from '../../lib/resume-parser-pool.js';
 import { fallbackParseResumeText } from '../../lib/resume-fallback.js';
+import { toCandidateColumns, MODEL_STRUCTURER_VERSION } from '../../lib/candidate-phone.js';
+import {
+  structureResumeWithModel,
+  mergeStructuredResume,
+  defaultResumeModelRunner,
+  type ResumeModelRunner,
+} from '../../lib/resume-structurer.js';
 
 /** Version tags recorded as ingestion provenance (never PII). */
 export const ASHBY_EXTRACTOR_VERSION = 'ashby-ephemeral-1';
+
+/**
+ * The DETERMINISTIC structurer tag — the regex extractor, and NOT on the
+ * dialable allowlist in `lib/candidate-phone.ts`.
+ *
+ * Still the tag for every parse where the model produced no usable answer, so
+ * a provider outage degrades to exactly the pre-model behaviour: fields are
+ * still extracted, the candidate is still populated, and nothing becomes
+ * dialable. The name is unchanged so existing rows keep their meaning.
+ */
 export const ASHBY_STRUCTURER_VERSION = 'deterministic-fallback-1';
 
 /** Bounded text length persisted with an Ashby-originated resume row. */
@@ -120,6 +137,14 @@ export interface CreateAshbyRuntimeOptions {
   /** Test seam: single-hop resume transport (redirects disabled). */
   resumeTransport?: ReturnType<typeof createPinnedHttpsTransport>;
   parserPool?: ResumeParserPool;
+  /**
+   * Test seam: the bounded model structuring call.
+   *
+   * Injectable so no test ever reaches a provider — every test supplies its
+   * own runner, and the default is the shared bounded path. This is a seam,
+   * not configuration: there is no flag, no key and no endpoint here.
+   */
+  modelRunner?: ResumeModelRunner;
 }
 
 /** Defensive extraction of a presigned URL from an opaque `file.info` payload. */
@@ -191,9 +216,37 @@ export function createMaterializationStore(client: SupabaseClient): Materializat
           resume_id: input.resumeId,
           name: p.name,
           email: p.email,
-          phone_raw: p.phone,
-          phone_e164: null,
-          phone_valid: false,
+          // ── DIALABILITY IS DECIDED UPSTREAM, AND FAILS CLOSED HERE ──────
+          // `input.phone` is the decision `lib/candidate-phone.ts` made from
+          // the extracted string AND the structurer provenance. When it is
+          // absent — an older caller, or any path that did not decide — the
+          // coalescing below writes exactly the pre-change shape: the raw
+          // string is preserved for the recruiter, and nothing is dialable.
+          // The live path is TWO-TIER, and `structurerVersion` arrives as one
+          // of exactly three values (see the parse port in
+          // `buildIngestionPorts`, and the matching note in
+          // `runtime-workers.ts`):
+          //
+          //   MODEL_STRUCTURER_VERSION             → the phone came from the
+          //                                          bounded model structurer.
+          //                                          DIALABLE.
+          //   MODEL_STRUCTURER_VERSION+'+fallback' → the model answered, but
+          //                                          the phone was rescued
+          //                                          from the regex. NOT.
+          //   ASHBY_STRUCTURER_VERSION             → no model answer at all.
+          //                                          NOT.
+          //
+          // An earlier revision of this comment said the live path produced
+          // null/false "by construction". That stopped being true the moment
+          // the model tier was wired — the same stale claim its sibling in
+          // `runtime-workers.ts` was already rewritten to disown. What remains
+          // unconditionally true is the fail-closed default below: no decision
+          // supplied ⇒ nothing dialable.
+          phone_raw: input.phone ? input.phone.raw : p.phone,
+          // `toCandidateColumns` re-applies the strict gate HERE, at the write,
+          // so a hand-built decision object cannot put a non-strict value in
+          // the column the opt-out digest depends on. Absent ⇒ undialable.
+          ...toCandidateColumns(input.phone),
           skills: p.skills ?? [],
           experience_years: p.experience_years,
           parsed: p,
@@ -258,7 +311,14 @@ export function createMaterializationStore(client: SupabaseClient): Materializat
           resume_id: input.resumeId,
           name: p.name,
           email: p.email,
-          phone_raw: p.phone,
+          // Written inside the SAME allowlist and under the SAME
+          // `.is('resume_id', null)` CAS as every other parse-derived field,
+          // so a replay writes zero rows and cannot erase — or invent — a
+          // number. Fail-closed exactly as `insertCandidate` above.
+          phone_raw: input.phone ? input.phone.raw : p.phone,
+          // Same strict re-assertion as `insertCandidate`, inside the SAME
+          // allowlist and under the SAME CAS.
+          ...toCandidateColumns(input.phone),
           skills: p.skills ?? [],
           experience_years: p.experience_years,
           parsed: p,
@@ -395,6 +455,10 @@ export function createAshbyRuntime(options: CreateAshbyRuntimeOptions): AshbyRun
   const scanner = resolveScanner();
   const resumeTransport = options.resumeTransport ?? createPinnedHttpsTransport();
   const resolveHost = options.resolveHost ?? defaultResolveHost;
+  // Resolved once at composition, like every other seam. No flag gates it: the
+  // structurer either answers or it does not, and "does not" is already a
+  // safe, tested path.
+  const modelRunner = options.modelRunner ?? defaultResumeModelRunner;
 
   // EMPTY allowlist ⇒ disabled ⇒ every fetch fails closed. Exact hosts only.
   const urlPolicy: UrlPolicy = {
@@ -504,9 +568,49 @@ export function createAshbyRuntime(options: CreateAshbyRuntimeOptions): AshbyRun
         }
       },
       parse: async (bytes, mime): Promise<ParseOutput> => {
+        // The document parse (child process, bounded, pooled) is UNCHANGED and
+        // still the only step that touches the bytes. Structuring is what
+        // follows, and it is now two-tier.
         const parsed = await parserPool.submit(bytes, mime);
-        const structured: StructuredResume = fallbackParseResumeText(parsed.text);
-        return { text: parsed.text, structured, structurerVersion: ASHBY_STRUCTURER_VERSION };
+
+        // ── TIER 1: the bounded model structurer ────────────────────────────
+        // Never throws: a provider outage, an open breaker, a timeout or a
+        // malformed shape all return null. Ingestion must not fail because
+        // model structuring failed — the document was fetched, screened and
+        // parsed successfully, and that is still true.
+        const modelled = await structureResumeWithModel(parsed.text, modelRunner);
+
+        // ── TIER 2: the deterministic extractor, run ALWAYS ────────────────
+        // Not an else-branch. It is the floor: whatever the regex can find is
+        // what the pre-model path produced, and no model answer may take a
+        // field away. Cheap — a handful of regexes over text that is already
+        // extracted and in memory.
+        const deterministic: StructuredResume = fallbackParseResumeText(parsed.text);
+
+        if (!modelled) {
+          // No model answer at all. Exactly the pre-change behaviour, tagged
+          // NON-dialable: a model outage costs a phone call, not a candidate.
+          return {
+            text: parsed.text,
+            structured: deterministic,
+            structurerVersion: ASHBY_STRUCTURER_VERSION,
+          };
+        }
+
+        // The model wins per FIELD; the regex fills every gap it left.
+        const merged = mergeStructuredResume(modelled, deterministic);
+        return {
+          text: parsed.text,
+          structured: merged.structured,
+          // THE DIALING DECISION, and it follows the PHONE alone. A phone the
+          // model produced carries the dialable tag. A phone rescued from the
+          // regex carries `+fallback`, which `isDialableStructurer` refuses —
+          // so a merge can never launder a digit-run false positive into a
+          // call, no matter how model-authored the rest of the row is.
+          structurerVersion: merged.phoneFromModel
+            ? MODEL_STRUCTURER_VERSION
+            : `${MODEL_STRUCTURER_VERSION}+fallback`,
+        };
       },
       fallbackFromText: (text) => fallbackParseResumeText(text),
       // Tells the ingestion orchestrator which not-safe statuses are ANSWERS

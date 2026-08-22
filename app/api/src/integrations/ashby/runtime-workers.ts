@@ -30,6 +30,7 @@
  */
 
 import { createLogger } from '../../lib/logger.js';
+import { deriveCandidatePhone } from '../../lib/candidate-phone.js';
 import {
   createQueueRunner,
   type QueueDeferDirective,
@@ -563,7 +564,8 @@ export function buildAshbyHandlers(
         // pure ingestion knows nothing about mappings or candidates.
         buildIngestionPorts: () => ({
           ...ports,
-          persist: (structured) => persistParsedCandidate(runtime, linkId, link, structured),
+          persist: (structured, provenance) =>
+            persistParsedCandidate(runtime, linkId, link, structured, provenance.structurerVersion),
         }),
         isCancelled: async () => {
           const l = await runtime.stores.readLink(linkId);
@@ -720,13 +722,41 @@ async function persistParsedCandidate(
   linkId: string,
   link: WorkflowLinkRow,
   structured: StructuredResume,
+  structurerVersion: string,
 ): Promise<PersistOutcome> {
   const fresh = await runtime.stores.readLink(linkId).catch(() => null);
   const boundCandidateId = fresh?.candidateId ?? link.candidateId;
 
+  // ── THE ONE PLACE AN ASHBY-IMPORTED NUMBER BECOMES DIALABLE ─────────────
+  // Derived here because this is the only layer holding BOTH the extracted
+  // string and the provenance of the structurer that produced it.
+  //
+  // The live parse port is TWO-TIER (see `buildIngestionPorts` in runtime.ts).
+  // `structurerVersion` arrives as one of exactly three values:
+  //
+  //   - MODEL_STRUCTURER_VERSION            → the phone came from the bounded
+  //                                           model structurer. DIALABLE.
+  //   - MODEL_STRUCTURER_VERSION+'+fallback' → the model answered, but the
+  //                                           phone was rescued from the regex.
+  //                                           NOT dialable.
+  //   - ASHBY_STRUCTURER_VERSION            → no model answer at all.
+  //                                           NOT dialable.
+  //
+  // `runResumeIngestion` can append a further `+fallback` when a model result
+  // carries nothing useful; the suffix check refuses any tag containing it, so
+  // that case stays non-dialable too.
+  //
+  // An earlier revision of this comment claimed the live path could NEVER
+  // produce a dialable number. That stopped being true the moment the model
+  // tier was wired, which is precisely the kind of stale safety claim that
+  // makes a reader stop checking. The assertions live in
+  // `phone-model-structurer.test.ts`, not here.
+  const phone = deriveCandidatePhone(structured.phone, structurerVersion);
+
   if (boundCandidateId) {
     const populated = await populateExistingCandidate(boundCandidateId, structured, {
       store: runtime.materialization,
+      phone,
     });
     return populated.status === 'skipped'
       ? { ok: false, reason: MATERIALIZE_FAILED_REASON }
@@ -751,6 +781,7 @@ async function persistParsedCandidate(
     mapping,
     isTerminal: false,
     existingCandidateId: null,
+    phone,
   });
   return created.status === 'skipped'
     ? { ok: false, reason: MATERIALIZE_FAILED_REASON }

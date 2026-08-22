@@ -219,8 +219,21 @@ describe('failure then bounded recovery', () => {
     const second = await populateExistingCandidate('cand_shell_1', PARSED, { store });
     expect(second).toEqual({ status: 'updated', candidateId: 'cand_shell_1' });
     expect(world.populated).toEqual([
-      { candidateId: 'cand_shell_1', resumeId: 'resume_1', parsed: PARSED },
+      {
+        candidateId: 'cand_shell_1',
+        resumeId: 'resume_1',
+        parsed: PARSED,
+      },
     ]);
+    // `toEqual` IGNORES undefined-valued properties, so asserting
+    // `phone: undefined` above would assert nothing at all. Assert the key's
+    // presence and its value separately. This test calls
+    // `populateExistingCandidate` directly with no `phone` in its deps, so the
+    // seam carries `undefined` — and the STORE then fails closed to
+    // `phone_e164: null, phone_valid: false`. The absence is the point: a
+    // caller that decided nothing may not produce a dial.
+    expect(Object.prototype.hasOwnProperty.call(world.populated[0]!, 'phone')).toBe(true);
+    expect((world.populated[0] as { phone?: unknown }).phone).toBeUndefined();
     // Exactly one resume and no second candidate across BOTH runs.
     expect(world.resumes).toBe(1);
     expect(world.candidates).toEqual([]);
@@ -246,7 +259,10 @@ describe('failure then bounded recovery', () => {
     await populateExistingCandidate('cand_shell_1', PARSED, { store });
     // The seam's payload is the enforcement: there is no field through which
     // ownership or funnel position could be revised on either run.
-    expect(Object.keys(world.populated[0]!).sort()).toEqual(['candidateId', 'parsed', 'resumeId']);
+    // See the identical assertion in ashby-resume-shell.test.ts: `phone` is a
+    // parse-derived field on the allowlist, and the properties this test
+    // protects (role/owner/status/source) remain unreachable.
+    expect(Object.keys(world.populated[0]!).sort()).toEqual(['candidateId', 'parsed', 'phone', 'resumeId']);
   });
 });
 
@@ -405,7 +421,16 @@ describe('the ingestion worker never writes a blank ready row', () => {
       [ASHBY_INGESTION_QUEUE]!(job());
 
     expect(world.populated).toEqual([
-      { candidateId: 'cand_shell_1', resumeId: 'resume_1', parsed: PARSED },
+      {
+        candidateId: 'cand_shell_1',
+        resumeId: 'resume_1',
+        parsed: PARSED,
+        // UNDIALABLE ON THE LIVE ASHBY PATH. The runtime's structurer is the
+        // deterministic regex extractor, which is not on the dialable
+        // allowlist, so the worker carries a raw-only decision no matter what
+        // the document contained — the shape 0042's admission refuses.
+        phone: { raw: null, e164: null, valid: false },
+      },
     ]);
     expect(transitions.at(-1)?.state).toBe('ready');
     // Populated strictly before the terminal transition.
