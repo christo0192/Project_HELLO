@@ -915,18 +915,26 @@ describe('OpenAPI document integrity', () => {
     //   appointment create, the appointment reschedule/cancel pair on one
     //   path, and the two halt controls.
     //
-    // 78 (base) + 1 (P3) + 8 (P6) = 87. RE-DERIVED from the merged spec on
-    // rebase, not arrived at by adding the two branches' diffs — the whole
-    // point of a hard count is that it is checked against the document.
-    expect(Object.keys(paths).length).toBe(87);
+    // 78 (base) + 1 (P3) + 8 (P6) + 2 (P4) = 89. RE-DERIVED from the merged
+    // spec, not arrived at by adding the branches' diffs — the whole point of
+    // a hard count is that it is checked against the document.
+    //
+    // P4's two are the INTERNAL phone-worker surface: the event post and the
+    // callback booking. Both are service-authenticated with the existing
+    // WORKER_CONTEXT_SECRET rather than a recruiter session, so neither
+    // widens the recruiter-facing surface at all.
+    expect(Object.keys(paths).length).toBe(89);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
     // + the three candidate-scoped Ashby workflow-card schemas.
     // + PhoneWebhookAck and PhoneWebhookError (P3).
     // + the thirty-one phone screening operator schemas (P6).
-    // 160 (base) + 2 (P3) + 31 (P6) = 193, re-derived on rebase.
-    expect(Object.keys(schemas).length).toBe(193);
+    // + the five internal phone-worker schemas (P4): the shared error body,
+    //   the event request/response pair, and the appointment request/response
+    //   pair.
+    // 160 (base) + 2 (P3) + 31 (P6) + 5 (P4) = 198, re-derived.
+    expect(Object.keys(schemas).length).toBe(198);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.
@@ -982,6 +990,14 @@ describe('auth boundary vs spec security model', () => {
     'POST /api/livekit/exchange',
     'POST /api/livekit/worker-context',
     'POST /api/internal/assess/{sessionId}',
+    // P4 internal phone-worker surface. Mounted pre-auth for exactly the same
+    // reason as the scoring callback beside it: the trust boundary is the
+    // constant-time WORKER_CONTEXT_SECRET comparison, not a recruiter session.
+    // Both answer 401 `authentication_required` (the worker contract) rather
+    // than the recruiter middleware's `authentication_error`, which is why
+    // they belong here rather than in the general sweep.
+    'POST /api/internal/phone/events',
+    'POST /api/internal/phone/appointments',
     // Ashby webhook: HMAC-gated (not recruiter-authenticated), mounted pre-auth.
     'POST /api/integrations/ashby/webhook',
     // LiveKit phone webhook: JWT-gated (not recruiter-authenticated), mounted

@@ -372,6 +372,17 @@ describe('errors and malformed answers', () => {
       ['phone_set_halt_error', () => stores.setHalt({ reason: 'operator_pause', now: NOW })],
       ['phone_clear_halt_error', () => stores.clearHalt({ now: NOW })],
       ['phone_backlog_error', () => stores.backlog({ now: NOW })],
+      // 0043's recording-artifact RPCs. These carry OBJECT KEYS, so a leaked
+      // driver error here would be the one place a storage path could escape
+      // alongside a candidate row.
+      ['phone_attach_recording_error', () => stores.attachAttemptRecording({
+        attemptId: 'a', objectKey: 'phone-a-egress.ogg', role: 'authoritative', now: NOW })],
+      ['phone_finalize_recording_error', () => stores.finalizeAttemptRecording({
+        attemptId: 'a', egressStatus: 'complete', now: NOW })],
+      ['phone_list_recordings_error', () => stores.listEngagementRecordings({
+        engagementId: 'e' })],
+      ['phone_clear_recordings_error', () => stores.clearAttemptRecordings({
+        engagementId: 'e', now: NOW })],
     ];
     expect(attempts).toHaveLength(PHONE_RPC_NAMES.length);
     for (const [code, run] of attempts) {

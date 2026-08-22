@@ -311,6 +311,29 @@ export function decidePhoneOutcome(
       };
     }
 
+    // ── 0043: answered, then ended before the disclosure ────────────────
+    // Charges NOTHING — not the no-answer budget, not the reconnect budget,
+    // not the provider budget. A hangup (or a "call me later") during our own
+    // identity line is not evidence the line is bad, and a reconnect grant is
+    // exactly what `reconnects_used` records, so an "uncharged reconnect" is
+    // not a thing that exists.
+    //
+    // The engagement returns to `eligible`, a legal edge out of `dialing`, and
+    // the retry is bounded by `uq_phone_attempts_one_per_ist_day` — an index
+    // that already exists — rather than by a new counter. A gating counter
+    // with no reset lifecycle is the one-way latch this project has already
+    // paid for twice; the IST day supplies the lifecycle for free.
+    case 'abandoned_pre_disclosure':
+      return {
+        ...base,
+        charge: 'none',
+        counters: noCharge(counters),
+        engagementState: 'eligible',
+        terminal: false,
+        stateReason: 'abandoned_pre_disclosure',
+        deferral: 'next_ist_day',
+      };
+
     // ── Declared in the CHECK, written by nothing in 0042 ───────────────
     // Neither has an edge in `apply_phone_event`. Returning an invented
     // transition here would be a decision no migration has made; a null state
@@ -356,6 +379,7 @@ export const PHONE_OUTCOME_MIGRATION_REASONS: Readonly<
   provider_error: ['provider_budget_exhausted'],
   window_closed: [],
   cancelled: ['hr_cancelled', 'emergency_stop', 'ashby_stage_left', 'prereq_lost'],
+  abandoned_pre_disclosure: ['abandoned_pre_disclosure'],
 });
 
 /**

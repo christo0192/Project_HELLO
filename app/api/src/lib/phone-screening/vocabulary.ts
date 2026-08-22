@@ -136,15 +136,64 @@ export const PHONE_OUTCOME_CLASSES = [
   'provider_error',
   'window_closed',
   'cancelled',
+  /**
+   * 0043: the candidate ANSWERED and hung up before the recording
+   * disclosure was delivered.
+   *
+   * Deliberately NOT folded into `disconnected`. `disconnected` means a
+   * conversation dropped and carries a reconnect grant; this means there was
+   * no conversation yet, carries no grant and charges no budget at all. An
+   * operator filtering for calls that reached a human cannot recover the
+   * difference after the fact if the two share a label.
+   */
+  'abandoned_pre_disclosure',
 ] as const;
 
 export type PhoneOutcomeClass = (typeof PHONE_OUTCOME_CLASSES)[number];
 
 const OUTCOME_SET: ReadonlySet<string> = new Set(PHONE_OUTCOME_CLASSES);
 
-/** True iff the value is one of the eleven `outcome_class` members. */
+/** True iff the value is one of the twelve `outcome_class` members. */
 export function isPhoneOutcomeClass(value: string): value is PhoneOutcomeClass {
   return OUTCOME_SET.has(value);
+}
+
+/**
+ * `chk_phone_call_attempts_recording_role` (0043).
+ *
+ * The FIRST consented attempt of an engagement is `authoritative`; every
+ * reconnect that follows is `supplementary`. This is a DATA distinction, not
+ * a documentary one: a partial unique index makes a second authoritative
+ * binding unrepresentable, and an authoritative reader filters on the column
+ * rather than trusting a comment.
+ */
+export const PHONE_RECORDING_ROLES = ['authoritative', 'supplementary'] as const;
+
+export type PhoneRecordingRole = (typeof PHONE_RECORDING_ROLES)[number];
+
+const RECORDING_ROLE_SET: ReadonlySet<string> = new Set(PHONE_RECORDING_ROLES);
+
+/** True iff the value is one of the two `recording_role` members. */
+export function isPhoneRecordingRole(value: string): value is PhoneRecordingRole {
+  return RECORDING_ROLE_SET.has(value);
+}
+
+/**
+ * The EXACT derived artifact names 0043's CHECKs admit. Both are functions of
+ * the attempt id alone: a key the dialer cannot derive is a key the purge
+ * cannot name, and 0043 refuses to store one.
+ */
+export function phoneAttemptRecordingObjectKey(attemptId: string): string {
+  return `phone-${attemptId}-egress.ogg`;
+}
+
+/**
+ * The manifest is a SECOND object with its own suffix. Deleting the recording
+ * and forgetting the manifest is a trap this lane has already hit once, so the
+ * manifest name is derived here rather than assembled at each call site.
+ */
+export function phoneAttemptRecordingManifestKey(attemptId: string): string {
+  return `${phoneAttemptRecordingObjectKey(attemptId)}.json`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════

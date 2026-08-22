@@ -1,0 +1,229 @@
+# Runbook — phone safe dialer (P4)
+
+**Status: DISABLED BY DEFAULT. Nothing in this change dials until an operator turns on
+four independent switches and provisions a trunk.** No production or provider access was
+used to build it, and no real call has been placed.
+
+Companion runbooks: `phone-webhook-ingress.md` (P3, the inbound half).
+
+---
+
+## 1. What this adds
+
+| Piece | Where |
+|---|---|
+| Migration `0043` | `app/supabase/migrations/0043_phone_safe_dialer.sql` |
+| Dialer, room, recording, purge | `app/api/src/integrations/livekit-phone-dial/` |
+| Internal worker endpoints | `app/api/src/routes/phone-worker.ts` |
+| Phone voice gate + tools | `app/voice-livekit/phone.py`, `agent.py` |
+
+It does **not** add a scheduler, a loop, or any caller for the dial controller. Arming
+that is a later phase's decision, exactly as P3 left `runPhoneReconciliation` uncalled.
+
+---
+
+## 2. The switches, and why there are so many
+
+A call reaches a carrier only when **all** of these hold. They are separate on purpose:
+each represents a distinct decision, and none is allowed to imply another.
+
+| Switch | Default | Meaning |
+|---|---|---|
+| `PHONE_SCREENING_ENABLED` | `false` | The domain master switch. |
+| `PHONE_RUNTIME_ENABLED` | `false` | Arms workers/timers, independently. |
+| `PHONE_DIAL_MODE` | `off` | `off` \| `synthetic` \| `live`. Only `live` can reach a carrier. |
+| `PHONE_DIAL_ALLOWLIST` | empty | SHA-256 **digests** of permitted numbers. **Empty is fail-closed.** |
+| `PHONE_SIP_TRUNK_ID` | empty | Provider-neutral trunk. **Empty is fail-closed.** |
+| LiveKit credentials | — | Checked independently of the phone flags. |
+
+`PHONE_AGENT_NAME` is a sixth, orthogonal knob — see §5.
+
+**`synthetic` cannot place a call, structurally.** It is not "a live client we promise
+not to call": `createSyntheticSipClient` contains no reference to the LiveKit SDK at all,
+and a structural test asserts that. There is no configuration in which the synthetic path
+reaches a carrier — which is what makes the Canary-0 / Canary-1 split meaningful.
+
+---
+
+## 3. The one thing to understand: the disclosure gate
+
+**No audio is captured until the candidate has been told they are being recorded and has
+agreed.** That is enforced in the database, not by statement order in a worker:
+
+`attach_phone_attempt_recording` refuses unless the engagement is already `in_call`, and
+0042 reaches `in_call` through exactly one transition — `disclosure.delivered`. So a
+caller that tries to start an egress at originate, at ring, at join, while unclassified,
+on a machine, or after a refusal is refused **before anything records**.
+
+The ordering is deliberately inverted from the obvious one:
+
+1. `attach_phone_attempt_recording` — binds the derived keys and the role. **The gate.**
+2. Start the egress.
+3. `finalize_phone_attempt_recording` — record the provider's egress id.
+
+Asking first and recording second means a refused binding leaves no audio. The reverse
+order records first and asks afterwards. The keys can be bound before the egress exists
+because they are *derived* from the attempt id, which is also why a crash between steps 2
+and 3 still leaves an enumerable artifact for the purge to find.
+
+---
+
+## 4. The purge is ordered and verified — **not** atomic
+
+This is stated plainly because implementing it as "atomic" would be implementing a lie.
+The suppression is a Postgres write; the deletion is object-store calls; no transaction
+spans both.
+
+```
+1. ENUMERATE   list_phone_engagement_recordings   (authoritative AND supplementary,
+                                                   object AND manifest)
+2. DELETE      remove each key, then VERIFY absence
+3. RECORD      clear_phone_attempt_recordings      (records a deletion; performs none)
+4. ACKNOWLEDGE apply_phone_event('disclosure.refused' | 'candidate.opt_out' | ...)
+```
+
+**If any step before 4 fails, steps 3 and 4 must not run.** The request stays
+unacknowledged and is retried. A terminal state committed over audio we failed to delete
+is invisible afterwards — the engagement would look correctly opted out while the
+recording sat in the bucket.
+
+Two rules that are easy to get wrong:
+
+- **It enumerates by ENGAGEMENT, not by session.** The session-scoped key names one
+  object; a reconnect is a second attempt with its own audio. A purge written against the
+  session key alone deletes the first recording, reports success, and leaves the
+  reconnect's audio behind. This is why 0043 puts the keys on the attempt.
+- **This code writes no suppression.** 0042 already writes it *inside*
+  `apply_phone_event`'s transaction (the PR #91 repair). A second writer could only ever
+  disagree with the first.
+
+"Nothing to purge" is a **distinct success**, and an *unreadable* enumeration is never
+treated as an empty one.
+
+---
+
+## 5. Worker isolation — read before deploying
+
+The existing browser worker registers with **no `agent_name`**, so LiveKit
+auto-dispatches it into *every* room in the project.
+
+**Do not name it.** Naming it stops that auto-dispatch for every existing browser
+session, and browser screening would silently get no agent in the window between an API
+deploy and a worker deploy.
+
+Instead:
+
+- The **existing** worker stays unnamed and additionally **skips phone-marked rooms**
+  (matched on both the `phone-<uuid>` room name and `channel: "phone"` in metadata —
+  neither marker alone is a single point of failure).
+- A **separate** deployment sets `PHONE_AGENT_NAME`, which makes that worker *named*.
+  Named workers do not auto-dispatch, so it receives only the phone rooms the API
+  explicitly dispatches it into.
+
+**Rollback is "stop, or never deploy, the named phone worker."** It requires no Python
+change and no browser redeploy.
+
+With `PHONE_AGENT_NAME` unset, a phone room is created and simply has no agent. That is
+correct, not a bug — the alternative is the browser agent talking to an unclassified
+caller.
+
+---
+
+## 6. The lease must outlive the originate
+
+`waitUntilAnswered: true` makes the originate **block**, and the SDK's default `timeout`
+in that mode is 60 s — exactly the default `PHONE_LEASE_SECONDS`.
+
+If the originate outlives its lease, `reclaim_phone_attempt_leases` abandons the attempt
+while the dial is still in flight: two calls hold one fleet slot, and the engagement has
+already been restored to its prior state. Nothing else notices, because P3's
+reconciliation sweep deliberately leaves *held* leases alone.
+
+So the dial controller **extends the lease to cover the worst-case originate, and refuses
+before touching the SDK if it cannot** — including when the heartbeat succeeds but 0042's
+900 s clamp returns less than we asked for. "We asked for enough" is not "we have
+enough".
+
+Keep `PHONE_ORIGINATE_TIMEOUT_SECONDS` (default 30) well below `PHONE_LEASE_SECONDS`
+(default 60).
+
+---
+
+## 7. `abandoned_pre_disclosure`
+
+0042 had no legal edge for a candidate who **answers and hangs up before the
+disclosure** — it surfaced as `unexpected_event`, so the outcome was *unrecorded* rather
+than classified. Both easy answers were lies: `no_answer` after someone demonstrably
+picked up, or an "uncharged reconnect", which is not a thing.
+
+0043 adds a truthful outcome that **charges nothing** — no no-answer, reconnect or
+provider budget — returns the engagement to `eligible`, and is bounded by the
+*already-existing* `uq_phone_attempts_one_per_ist_day` index rather than by a new
+counter. A gating counter with no reset lifecycle is a one-way latch; the IST day
+supplies the lifecycle for free.
+
+It is gated on the **attempt** state (`answered_unclassified` / `human`), not the
+engagement state, because `dialing` outlives the answer. An unanswered drop still falls
+through to `unexpected_event`, unchanged.
+
+`candidate.deferred_pre_disclosure` shares the branch: the candidate answered and asked
+to be called back *before* the disclosure. It is a distinct event type rather than a
+reused `sip.participant_left` because saying "the participant left" about someone still
+holding the handset would be false, and the ledger is where an operator goes to find out
+what actually happened.
+
+---
+
+## 8. The scheduling tool must never confirm an unbooked slot
+
+`schedule_phone_appointment` refuses outright while the engagement is `dialing`
+(`attempt_in_flight`) — a live dial owns the engagement. But "call me later" is *most
+likely* said during the identity/disclosure exchange, i.e. exactly while `dialing`.
+
+So `POST /api/internal/phone/appointments` first ends the attempt truthfully and
+uncharged via `candidate.deferred_pre_disclosure`, then books from a legal state.
+
+**The worker speaks a confirmation only on `ok` / `ok_prereqs_pending`.** Every other
+status — including `unknown_status`, which means we never got an answer we understand —
+is returned as `ok: false` and spoken as a distinct refusal. Confirming a booking that
+did not happen is the worst possible outcome on a call whose purpose is to be truthful.
+
+The server revalidates the 09:00–21:00 IST window and not-in-the-past; the worker only
+proposes. An LLM-driven caller is exactly the client that will confidently propose 03:00.
+
+---
+
+## 9. Enabling, in order
+
+1. Deploy with everything off. Confirm `/api/phone/health` reports the domain disabled.
+2. Set `PHONE_SCREENING_ENABLED=true`, leave the rest off. No dial is possible.
+3. Provision `PHONE_SIP_TRUNK_ID`. Still no dial — the mode is `off`.
+4. `PHONE_DIAL_MODE=synthetic` and `PHONE_RUNTIME_ENABLED=true`. Rehearse. **Structurally
+   cannot reach a carrier.**
+5. Deploy the named phone worker with `PHONE_AGENT_NAME` set. Verify browser screening is
+   unaffected (it must be — the browser worker was not touched).
+6. Only then: add **one** digest to `PHONE_DIAL_ALLOWLIST` and set
+   `PHONE_DIAL_MODE=live`. This is the first call that can reach a carrier, and it can
+   reach exactly one number.
+
+Kill switch at any point: `POST /api/phone/halt`. It refuses admission, which refuses
+every dial.
+
+---
+
+## 10. Known residuals
+
+- **Terminal reasons for phone disconnects are bucketed as `provider_error`.** A
+  candidate rejecting a call is not a provider error. Making it truthful requires
+  widening both `chk_call_sessions_terminal_reason` and `persistence._FAILED_REASONS`
+  together; that pair was left alone deliberately rather than half-done. Blast radius is
+  an operator-facing label on `call_sessions` — no budget is affected.
+- **The default human/machine classifier is a deterministic rule set behind an injectable
+  seam.** An unreadable answer is re-asked once and then fails closed to `machine`, which
+  costs a no-answer budget charge for a mumbling human. The direction is safe (no consent
+  → no recording, no score) but the mis-classification risk is real.
+- **The worker always sends a null epoch.** The phone room name carries only the attempt
+  id; P3 projects `phone_epoch` at the ingress boundary. Both the client and the gate
+  accept an epoch, so wiring it is a one-line change once there is a worker-visible
+  source.
+- **No scheduler is armed.** `dialPhoneAttempt` has no production caller.

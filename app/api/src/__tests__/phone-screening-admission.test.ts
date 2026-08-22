@@ -78,6 +78,12 @@ function fakeStores(admit: AdmitPhoneAttemptResult): FakeStores {
     heartbeatAttempt: unreachable,
     reclaimAttemptLeases: unreachable,
     applyEvent: unreachable,
+    // 0043's recording methods are unreachable from admission by design:
+    // admission happens BEFORE the disclosure that any recording depends on.
+    attachAttemptRecording: unreachable,
+    finalizeAttemptRecording: unreachable,
+    listEngagementRecordings: unreachable,
+    clearAttemptRecordings: unreachable,
     scheduleAppointment: unreachable,
     cancelAppointment: unreachable,
     expireAppointments: unreachable,

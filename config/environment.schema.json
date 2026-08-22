@@ -105,7 +105,11 @@
         "PHONE_RING_TIMEOUT_SECONDS": { "requiredInProduction": false, "secret": false },
         "PHONE_LEASE_SECONDS": { "requiredInProduction": false, "secret": false },
         "PHONE_WEBHOOK_MAX_BYTES": { "requiredInProduction": false, "secret": false },
-        "PHONE_WEBHOOK_TOLERANCE_SECONDS": { "requiredInProduction": false, "secret": false }
+        "PHONE_WEBHOOK_TOLERANCE_SECONDS": { "requiredInProduction": false, "secret": false },
+        "PHONE_SIP_TRUNK_ID": { "requiredInProduction": false, "secret": false, "external": true },
+        "PHONE_AGENT_NAME": { "requiredInProduction": false, "secret": false },
+        "PHONE_ORIGINATE_TIMEOUT_SECONDS": { "requiredInProduction": false, "secret": false },
+        "PHONE_MAX_CALL_SECONDS": { "requiredInProduction": false, "secret": false }
       }
     },
     "web": {
@@ -160,7 +164,11 @@
         "SCORING_HTTP_CONNECT_TIMEOUT": { "requiredInProduction": false, "secret": false },
         "SCORING_HTTP_READ_TIMEOUT": { "requiredInProduction": false, "secret": false },
         "SCORING_HTTP_WRITE_TIMEOUT": { "requiredInProduction": false, "secret": false },
-        "SCORING_HTTP_POOL_TIMEOUT": { "requiredInProduction": false, "secret": false }
+        "SCORING_HTTP_POOL_TIMEOUT": { "requiredInProduction": false, "secret": false },
+        "PHONE_AGENT_NAME": { "requiredInProduction": false, "secret": false },
+        "PHONE_EVENT_TIMEOUT_SEC": { "requiredInProduction": false, "secret": false },
+        "PHONE_PARTICIPANT_WAIT_SEC": { "requiredInProduction": false, "secret": false },
+        "PHONE_CLASSIFY_TIMEOUT_SEC": { "requiredInProduction": false, "secret": false }
       }
     }
   }

@@ -40,6 +40,23 @@ const CONFIG_SOURCE = readFileSync(
   'utf8',
 );
 
+/**
+ * P4 moved the TRANSPORT knobs into `livekit-phone-dial/config.ts`, because
+ * the domain core carries a structural assertion that no file under it names
+ * SIP or a trunk — and a `sipTrunkId` field there would have forced that
+ * assertion to be weakened. So the env contract now spans TWO config files,
+ * and this suite reads both: the invariant being protected is "every PHONE_*
+ * variable is declared, exampled and actually READ SOMEWHERE", which is
+ * exactly as strong across two files as across one, and would be silently
+ * lost if this suite kept reading only the first.
+ */
+const DIAL_CONFIG_SOURCE = readFileSync(
+  fileURLToPath(new URL('../integrations/livekit-phone-dial/config.ts', import.meta.url)),
+  'utf8',
+);
+
+const ALL_CONFIG_SOURCE = `${CONFIG_SOURCE}\n${DIAL_CONFIG_SOURCE}`;
+
 const SCHEMA = JSON.parse(
   readFileSync(fileURLToPath(new URL('../../../../config/environment.schema.json', import.meta.url)), 'utf8'),
 ) as { components: { api: { variables: Record<string, unknown> } } };
@@ -274,6 +291,11 @@ describe('the env contract holds in BOTH directions', () => {
     'PHONE_LEASE_SECONDS',
     'PHONE_WEBHOOK_MAX_BYTES',
     'PHONE_WEBHOOK_TOLERANCE_SECONDS',
+    // P4 transport knobs, read in `livekit-phone-dial/config.ts`.
+    'PHONE_SIP_TRUNK_ID',
+    'PHONE_AGENT_NAME',
+    'PHONE_ORIGINATE_TIMEOUT_SECONDS',
+    'PHONE_MAX_CALL_SECONDS',
   ];
 
   it('every variable is declared, exampled, and read', () => {
@@ -281,8 +303,10 @@ describe('the env contract holds in BOTH directions', () => {
       expect(SCHEMA.components.api.variables).toHaveProperty(name);
       expect(ENV_EXAMPLE).toMatch(new RegExp(`^${name}=`, 'm'));
       // The contract checker greps for a literal `process.env.<NAME>`; the
-      // functional reads go through the injectable `source` map.
-      expect(CONFIG_SOURCE).toContain(`process.env.${name}`);
+      // functional reads go through the injectable `source` map. Both phone
+      // config files are searched — see ALL_CONFIG_SOURCE above for why the
+      // knobs live in two places.
+      expect(ALL_CONFIG_SOURCE).toContain(`process.env.${name}`);
     }
   });
 
@@ -290,7 +314,7 @@ describe('the env contract holds in BOTH directions', () => {
     const inSchema = Object.keys(SCHEMA.components.api.variables).filter((k) =>
       k.startsWith('PHONE_'));
     const inExample = [...ENV_EXAMPLE.matchAll(/^(PHONE_[A-Z0-9_]*)=/gm)].map((m) => m[1]);
-    const inSource = [...CONFIG_SOURCE.matchAll(/process\.env\.(PHONE_[A-Z0-9_]*)/g)]
+    const inSource = [...ALL_CONFIG_SOURCE.matchAll(/process\.env\.(PHONE_[A-Z0-9_]*)/g)]
       .map((m) => m[1]);
     expect(new Set(inSchema)).toEqual(new Set(NAMES));
     expect(new Set(inExample)).toEqual(new Set(NAMES));

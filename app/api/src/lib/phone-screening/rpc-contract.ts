@@ -1,6 +1,7 @@
 /**
- * phone-screening/rpc-contract.ts — the ten 0042 RPCs, their exact parameter
- * names, and their COMPLETE status vocabularies.
+ * phone-screening/rpc-contract.ts — the fourteen phone RPCs (ten from 0042,
+ * four from 0043), their exact parameter names, and their COMPLETE status
+ * vocabularies.
  *
  * ── WHY THE FULL VOCABULARY, NOT JUST THE ONES WE EXPECT ──────────────
  * 0042 can answer with 44 distinct `status` strings across its ten RPCs. A
@@ -25,7 +26,7 @@
  * Pure declarations. No client, no I/O, no configuration.
  */
 
-/** The ten service-role RPCs 0042 exposes. */
+/** The fourteen service-role RPCs 0042 and 0043 expose. */
 export const PHONE_RPC_NAMES = [
   'admit_phone_attempt',
   'heartbeat_phone_attempt',
@@ -37,6 +38,12 @@ export const PHONE_RPC_NAMES = [
   'clear_phone_halt',
   'expire_phone_appointments',
   'phone_backlog',
+  // 0043 — the recording-artifact RPCs. None of them admits, dials or
+  // deletes anything; three write and one reads.
+  'attach_phone_attempt_recording',
+  'finalize_phone_attempt_recording',
+  'list_phone_engagement_recordings',
+  'clear_phone_attempt_recordings',
 ] as const;
 
 export type PhoneRpcName = (typeof PHONE_RPC_NAMES)[number];
@@ -83,6 +90,22 @@ export const PHONE_RPC_PARAMETERS: Readonly<Record<PhoneRpcName, readonly string
     clear_phone_halt: ['p_actor_id', 'p_now'],
     expire_phone_appointments: ['p_grace_seconds', 'p_limit', 'p_now'],
     phone_backlog: ['p_now'],
+    attach_phone_attempt_recording: [
+      'p_attempt_id',
+      'p_object_key',
+      'p_manifest_key',
+      'p_role',
+      'p_egress_id',
+      'p_now',
+    ],
+    finalize_phone_attempt_recording: [
+      'p_attempt_id',
+      'p_egress_status',
+      'p_egress_id',
+      'p_now',
+    ],
+    list_phone_engagement_recordings: ['p_engagement_id'],
+    clear_phone_attempt_recordings: ['p_engagement_id', 'p_actor_id', 'p_now'],
   });
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -214,6 +237,68 @@ export const PHONE_BACKLOG_STATUSES = ['ok'] as const;
 
 export type PhoneBacklogStatus = (typeof PHONE_BACKLOG_STATUSES)[number];
 
+/**
+ * `attach_phone_attempt_recording` (0043) — the ONLY door that binds audio.
+ *
+ * `disclosure_not_delivered` is the load-bearing member and the reason this
+ * RPC exists at all: the engagement must already be `in_call`, which 0042
+ * reaches through exactly one transition (`disclosure.delivered`). A caller
+ * that starts an egress at originate, at ring, at join, while unclassified,
+ * on a machine or after a refusal gets this refusal from the state machine
+ * rather than from the order of two statements in a worker.
+ *
+ * `already_bound` is deliberately distinct from `ok`+duplicate: re-binding the
+ * IDENTICAL triple is idempotent success, re-binding a DIFFERENT one is
+ * refused rather than silently overwriting a key a purge may already have been
+ * told to delete.
+ */
+export const ATTACH_PHONE_ATTEMPT_RECORDING_STATUSES = [
+  'ok',
+  'already_bound',
+  'attempt_not_recordable',
+  'authoritative_exists',
+  'disclosure_not_delivered',
+  'engagement_terminal',
+  'invalid_egress_id',
+  'invalid_manifest_key',
+  'invalid_object_key',
+  'invalid_role',
+  'not_found',
+] as const;
+
+export type AttachPhoneAttemptRecordingStatus =
+  (typeof ATTACH_PHONE_ATTEMPT_RECORDING_STATUSES)[number];
+
+/** `finalize_phone_attempt_recording` (0043). */
+export const FINALIZE_PHONE_ATTEMPT_RECORDING_STATUSES = [
+  'ok',
+  'invalid_egress_id',
+  'invalid_egress_status',
+  'no_recording',
+  'not_found',
+] as const;
+
+export type FinalizePhoneAttemptRecordingStatus =
+  (typeof FINALIZE_PHONE_ATTEMPT_RECORDING_STATUSES)[number];
+
+/**
+ * `list_phone_engagement_recordings` (0043) — what a purge must delete.
+ *
+ * An engagement with NO artifacts answers `ok` with an empty list, which is a
+ * DISTINCT SUCCESS. Conflating "nothing exists" with "we could not tell" is
+ * exactly how a purge quietly reports done.
+ */
+export const LIST_PHONE_ENGAGEMENT_RECORDINGS_STATUSES = ['ok', 'not_found'] as const;
+
+export type ListPhoneEngagementRecordingsStatus =
+  (typeof LIST_PHONE_ENGAGEMENT_RECORDINGS_STATUSES)[number];
+
+/** `clear_phone_attempt_recordings` (0043) — records a VERIFIED deletion. */
+export const CLEAR_PHONE_ATTEMPT_RECORDINGS_STATUSES = ['ok', 'not_found'] as const;
+
+export type ClearPhoneAttemptRecordingsStatus =
+  (typeof CLEAR_PHONE_ATTEMPT_RECORDINGS_STATUSES)[number];
+
 /** The per-RPC vocabularies, keyed by RPC name. */
 export const PHONE_RPC_STATUSES: Readonly<Record<PhoneRpcName, readonly string[]>> =
   Object.freeze({
@@ -227,19 +312,32 @@ export const PHONE_RPC_STATUSES: Readonly<Record<PhoneRpcName, readonly string[]
     clear_phone_halt: CLEAR_PHONE_HALT_STATUSES,
     expire_phone_appointments: EXPIRE_PHONE_APPOINTMENTS_STATUSES,
     phone_backlog: PHONE_BACKLOG_STATUSES,
+    attach_phone_attempt_recording: ATTACH_PHONE_ATTEMPT_RECORDING_STATUSES,
+    finalize_phone_attempt_recording: FINALIZE_PHONE_ATTEMPT_RECORDING_STATUSES,
+    list_phone_engagement_recordings: LIST_PHONE_ENGAGEMENT_RECORDINGS_STATUSES,
+    clear_phone_attempt_recordings: CLEAR_PHONE_ATTEMPT_RECORDINGS_STATUSES,
   });
 
 /**
- * The union of every status any 0042 RPC can return — 44 distinct members.
- * The count is pinned by the drift test so a migration that adds a refusal
- * cannot land without this file being revisited.
+ * The union of every status any phone RPC can return. The count is pinned by
+ * the drift test so a migration that adds a refusal cannot land without this
+ * file being revisited.
  */
 export const PHONE_RPC_STATUS_UNION: readonly string[] = Object.freeze(
   Array.from(new Set(PHONE_RPC_NAMES.flatMap((n) => PHONE_RPC_STATUSES[n]))).sort(),
 );
 
-/** Number of distinct statuses across all ten RPCs, as of 0042. */
-export const PHONE_RPC_STATUS_COUNT = 44;
+/**
+ * Number of DISTINCT statuses across all fourteen RPCs, as of 0043.
+ *
+ * 0042 contributed 44. 0043 adds ten members that were not already in the
+ * union — `already_bound`, `attempt_not_recordable`, `authoritative_exists`,
+ * `disclosure_not_delivered`, `invalid_egress_id`, `invalid_egress_status`,
+ * `invalid_manifest_key`, `invalid_object_key`, `invalid_role` and
+ * `no_recording`. Its other members (`ok`, `not_found`, `engagement_terminal`)
+ * were already present, which is why this is 54 and not 57.
+ */
+export const PHONE_RPC_STATUS_COUNT = 54;
 
 /**
  * RESULT KEYS the API's behaviour DEPENDS on, per RPC.
@@ -267,6 +365,13 @@ export const PHONE_RPC_RESULT_KEYS: Readonly<Record<string, readonly string[]>> 
   clear_phone_halt: ['was_halted'],
   admit_phone_attempt: ['attempt_id', 'lease_token', 'lease_expires_at'],
   apply_phone_event: ['applied', 'ignored_reason', 'event_id', 'duplicate'],
+  // 0043. `artifacts` is load-bearing in the same destructive direction as
+  // `superseded_appointment_id`: a purge that read an absent key as an empty
+  // list would delete nothing and then report success.
+  list_phone_engagement_recordings: ['artifacts', 'count'],
+  clear_phone_attempt_recordings: ['cleared'],
+  attach_phone_attempt_recording: ['attempt_id', 'role', 'duplicate'],
+  finalize_phone_attempt_recording: ['attempt_id', 'egress_status', 'role'],
 });
 
 /**

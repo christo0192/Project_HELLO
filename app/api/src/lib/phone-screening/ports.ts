@@ -1,7 +1,7 @@
 /**
  * phone-screening/ports.ts — the DB-free seam.
  *
- * Every result shape a 0042 RPC can produce, declared without importing a
+ * Every result shape a 0042/0043 RPC can produce, declared without importing a
  * Supabase client. The domain facade depends on THIS file; `stores.ts` is the
  * one place a client appears. Tests drive in-memory fakes through the same
  * interface production wires the thin RPC adapters into — the ports/stores
@@ -23,6 +23,10 @@ import type {
   ReclaimPhoneAttemptLeasesStatus,
   SchedulePhoneAppointmentStatus,
   SetPhoneHaltStatus,
+  AttachPhoneAttemptRecordingStatus,
+  FinalizePhoneAttemptRecordingStatus,
+  ListPhoneEngagementRecordingsStatus,
+  ClearPhoneAttemptRecordingsStatus,
   PHONE_RPC_UNKNOWN_STATUS,
 } from './rpc-contract.js';
 import type {
@@ -34,6 +38,7 @@ import type {
   PhoneEventIgnoredReason,
   PhoneEventSource,
   PhoneHaltReason,
+  PhoneRecordingRole,
 } from './vocabulary.js';
 
 /** Every store result carries either a declared status or `unknown_status`. */
@@ -235,6 +240,66 @@ export interface PhoneBacklogResult {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// 0043 — recording artifacts
+// ═══════════════════════════════════════════════════════════════════════
+
+export interface AttachPhoneAttemptRecordingInput {
+  readonly attemptId: string;
+  readonly objectKey: string;
+  readonly manifestKey?: string | null;
+  readonly role: PhoneRecordingRole;
+  readonly egressId?: string | null;
+  readonly now: Date;
+}
+
+export interface AttachPhoneAttemptRecordingResult {
+  readonly status: AttachPhoneAttemptRecordingStatus | typeof PHONE_RPC_UNKNOWN_STATUS;
+  readonly attemptId?: string;
+  readonly role?: PhoneRecordingRole;
+  /** True when the IDENTICAL triple was already bound. Success, not a refusal. */
+  readonly duplicate?: boolean;
+  /** Present on `disclosure_not_delivered`, so a caller can log WHY it refused. */
+  readonly engagementState?: string;
+  readonly attemptState?: string;
+}
+
+export interface FinalizePhoneAttemptRecordingResult {
+  readonly status: FinalizePhoneAttemptRecordingStatus | typeof PHONE_RPC_UNKNOWN_STATUS;
+  readonly attemptId?: string;
+  readonly egressStatus?: string;
+  readonly role?: PhoneRecordingRole;
+}
+
+/**
+ * One attempt's artifacts. BOTH keys are carried, because deleting the
+ * recording and forgetting the manifest is a documented trap, and the role is
+ * carried so a caller can prove it purged the supplementary ones too.
+ */
+export interface PhoneRecordingArtifact {
+  readonly attemptId: string;
+  readonly role: PhoneRecordingRole;
+  readonly objectKey: string;
+  readonly manifestKey: string | null;
+}
+
+export interface ListPhoneEngagementRecordingsResult {
+  readonly status: ListPhoneEngagementRecordingsStatus | typeof PHONE_RPC_UNKNOWN_STATUS;
+  /**
+   * ABSENT is not the same as EMPTY. An empty array means "this engagement has
+   * nothing to purge", a distinct success; `undefined` means we never got an
+   * answer and the caller must NOT proceed to a terminal event.
+   */
+  readonly artifacts?: readonly PhoneRecordingArtifact[];
+  readonly count?: number;
+}
+
+export interface ClearPhoneAttemptRecordingsResult {
+  readonly status: ClearPhoneAttemptRecordingsStatus | typeof PHONE_RPC_UNKNOWN_STATUS;
+  /** Rows whose keys were forgotten. `0` is a distinct success. */
+  readonly cleared?: number;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // The port
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -269,4 +334,26 @@ export interface PhoneStores {
   }): Promise<SetPhoneHaltResult>;
   clearHalt(input: { actorId?: string | null; now: Date }): Promise<ClearPhoneHaltResult>;
   backlog(input: { now: Date }): Promise<PhoneBacklogResult>;
+  attachAttemptRecording(
+    input: AttachPhoneAttemptRecordingInput,
+  ): Promise<AttachPhoneAttemptRecordingResult>;
+  finalizeAttemptRecording(input: {
+    attemptId: string;
+    egressStatus: 'active' | 'complete' | 'failed';
+    /** Supplied when the egress id was not known at attach time. */
+    egressId?: string | null;
+    now: Date;
+  }): Promise<FinalizePhoneAttemptRecordingResult>;
+  listEngagementRecordings(input: {
+    engagementId: string;
+  }): Promise<ListPhoneEngagementRecordingsResult>;
+  /**
+   * Records that every artifact has ALREADY been deleted and verified absent.
+   * Deletes nothing. See `recording-purge.ts` for the ordering this must obey.
+   */
+  clearAttemptRecordings(input: {
+    engagementId: string;
+    actorId?: string | null;
+    now: Date;
+  }): Promise<ClearPhoneAttemptRecordingsResult>;
 }

@@ -28,6 +28,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import {
   narrowPhoneRpcStatus,
+  PHONE_RPC_UNKNOWN_STATUS,
   type AdmitPhoneAttemptStatus,
   type ApplyPhoneEventStatus,
   type CancelPhoneAppointmentStatus,
@@ -38,6 +39,10 @@ import {
   type ReclaimPhoneAttemptLeasesStatus,
   type SchedulePhoneAppointmentStatus,
   type SetPhoneHaltStatus,
+  type AttachPhoneAttemptRecordingStatus,
+  type FinalizePhoneAttemptRecordingStatus,
+  type ListPhoneEngagementRecordingsStatus,
+  type ClearPhoneAttemptRecordingsStatus,
 } from './rpc-contract.js';
 import type {
   AdmitPhoneAttemptInput,
@@ -57,16 +62,24 @@ import type {
   SchedulePhoneAppointmentInput,
   SchedulePhoneAppointmentResult,
   SetPhoneHaltResult,
+  AttachPhoneAttemptRecordingInput,
+  AttachPhoneAttemptRecordingResult,
+  FinalizePhoneAttemptRecordingResult,
+  ListPhoneEngagementRecordingsResult,
+  ClearPhoneAttemptRecordingsResult,
+  PhoneRecordingArtifact,
 } from './ports.js';
 import {
   PHONE_ATTEMPT_KINDS,
   PHONE_ATTEMPT_STATES,
   PHONE_ENGAGEMENT_STATES,
   PHONE_EVENT_IGNORED_REASONS,
+  PHONE_RECORDING_ROLES,
   type PhoneAttemptKind,
   type PhoneAttemptState,
   type PhoneEngagementState,
   type PhoneEventIgnoredReason,
+  type PhoneRecordingRole,
 } from './vocabulary.js';
 
 /**
@@ -414,6 +427,111 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
         },
         windowOpen: bool(row, 'window_open') ?? false,
         istDate: str(row, 'ist_date'),
+      };
+    },
+    async attachAttemptRecording(
+      input: AttachPhoneAttemptRecordingInput,
+    ): Promise<AttachPhoneAttemptRecordingResult> {
+      const { data, error } = await client.rpc('attach_phone_attempt_recording', {
+        p_attempt_id: input.attemptId,
+        p_object_key: input.objectKey,
+        p_manifest_key: input.manifestKey ?? null,
+        p_role: input.role,
+        p_egress_id: input.egressId ?? null,
+        p_now: isoInstant(input.now),
+      });
+      if (error) throw new Error('phone_attach_recording_error');
+      const row = asRow(data);
+      return {
+        status: narrowPhoneRpcStatus<AttachPhoneAttemptRecordingStatus>(
+          'attach_phone_attempt_recording',
+          row,
+        ),
+        attemptId: str(row, 'attempt_id'),
+        role: member<PhoneRecordingRole>(row, 'role', PHONE_RECORDING_ROLES),
+        duplicate: bool(row, 'duplicate'),
+        engagementState: member<PhoneEngagementState>(
+          row,
+          'engagement_state',
+          PHONE_ENGAGEMENT_STATES,
+        ),
+        attemptState: member<PhoneAttemptState>(row, 'attempt_state', PHONE_ATTEMPT_STATES),
+      };
+    },
+
+    async finalizeAttemptRecording(input): Promise<FinalizePhoneAttemptRecordingResult> {
+      const { data, error } = await client.rpc('finalize_phone_attempt_recording', {
+        p_attempt_id: input.attemptId,
+        p_egress_status: input.egressStatus,
+        p_egress_id: input.egressId ?? null,
+        p_now: isoInstant(input.now),
+      });
+      if (error) throw new Error('phone_finalize_recording_error');
+      const row = asRow(data);
+      return {
+        status: narrowPhoneRpcStatus<FinalizePhoneAttemptRecordingStatus>(
+          'finalize_phone_attempt_recording',
+          row,
+        ),
+        attemptId: str(row, 'attempt_id'),
+        egressStatus: str(row, 'egress_status'),
+        role: member<PhoneRecordingRole>(row, 'role', PHONE_RECORDING_ROLES),
+      };
+    },
+
+    async listEngagementRecordings(input): Promise<ListPhoneEngagementRecordingsResult> {
+      const { data, error } = await client.rpc('list_phone_engagement_recordings', {
+        p_engagement_id: input.engagementId,
+      });
+      if (error) throw new Error('phone_list_recordings_error');
+      const row = asRow(data);
+      const status = narrowPhoneRpcStatus<ListPhoneEngagementRecordingsStatus>(
+        'list_phone_engagement_recordings',
+        row,
+      );
+      // `artifacts` is left UNDEFINED unless the RPC answered `ok` AND sent an
+      // array. A purge treats absent as "we never got an answer" and refuses
+      // to proceed; treating it as an empty list would delete nothing and then
+      // report success, which is the failure this whole path exists to avoid.
+      if (status !== 'ok') return { status };
+      const raw = row?.artifacts;
+      if (!Array.isArray(raw)) return { status };
+      const artifacts: PhoneRecordingArtifact[] = [];
+      for (const item of raw) {
+        const entry = asRow(item);
+        const attemptId = str(entry, 'attempt_id');
+        const objectKey = str(entry, 'object_key');
+        const role = member<PhoneRecordingRole>(entry, 'role', PHONE_RECORDING_ROLES);
+        // A row missing any of the three is DROPPED rather than half-read —
+        // but dropping it would hide an artifact from the purge, so the whole
+        // answer is refused instead.
+        if (attemptId === undefined || objectKey === undefined || role === undefined) {
+          return { status: PHONE_RPC_UNKNOWN_STATUS };
+        }
+        artifacts.push({
+          attemptId,
+          objectKey,
+          role,
+          manifestKey: str(entry, 'manifest_key') ?? null,
+        });
+      }
+      return { status, artifacts, count: num(row, 'count') ?? artifacts.length };
+    },
+
+    async clearAttemptRecordings(input): Promise<ClearPhoneAttemptRecordingsResult> {
+      const { data, error } = await client.rpc('clear_phone_attempt_recordings', {
+        p_engagement_id: input.engagementId,
+        p_actor_id: input.actorId ?? null,
+        p_now: isoInstant(input.now),
+      });
+      if (error) throw new Error('phone_clear_recordings_error');
+      const row = asRow(data);
+      return {
+        status: narrowPhoneRpcStatus<ClearPhoneAttemptRecordingsStatus>(
+          'clear_phone_attempt_recordings',
+          row,
+        ),
+        cleared: num(row, 'cleared'),
       };
     },
   };
