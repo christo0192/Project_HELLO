@@ -1,0 +1,267 @@
+/**
+ * phone-screening/rpc-contract.ts — the ten 0042 RPCs, their exact parameter
+ * names, and their COMPLETE status vocabularies.
+ *
+ * ── WHY THE FULL VOCABULARY, NOT JUST THE ONES WE EXPECT ──────────────
+ * 0042 can answer with 44 distinct `status` strings across its ten RPCs. A
+ * union that omits one turns a BENIGN REFUSAL into a thrown error on a
+ * billable path — `halt_unreadable`, `attempt_required`, `ok_prereqs_pending`,
+ * `not_live` and `lease_lost` are the easy ones to miss, and each of them is a
+ * normal answer the caller must be able to act on. So every member is listed
+ * here, and `phone-screening-rpc-contract.test.ts` EXTRACTS the vocabulary
+ * from the migration text and fails on any member this file does not carry,
+ * in either direction.
+ *
+ * ── PARAMETER NAMES ARE PART OF THE CONTRACT ──────────────────────────
+ * PostgREST resolves an RPC by argument NAME. A renamed or omitted parameter
+ * is not a type error, it is a 404 at runtime, so the names are written down
+ * once here and the same test asserts each against the migration's signature.
+ *
+ * ── TIME IS INJECTED ──────────────────────────────────────────────────
+ * Every time-dependent RPC takes `p_now timestamptz` as its FINAL parameter.
+ * The store layer passes it explicitly so a boundary test cannot depend on the
+ * host clock; production passes the same value it used for its own decisions.
+ *
+ * Pure declarations. No client, no I/O, no configuration.
+ */
+
+/** The ten service-role RPCs 0042 exposes. */
+export const PHONE_RPC_NAMES = [
+  'admit_phone_attempt',
+  'heartbeat_phone_attempt',
+  'reclaim_phone_attempt_leases',
+  'apply_phone_event',
+  'schedule_phone_appointment',
+  'cancel_phone_appointment',
+  'set_phone_halt',
+  'clear_phone_halt',
+  'expire_phone_appointments',
+  'phone_backlog',
+] as const;
+
+export type PhoneRpcName = (typeof PHONE_RPC_NAMES)[number];
+
+/** Exact parameter names, in declaration order, per RPC. */
+export const PHONE_RPC_PARAMETERS: Readonly<Record<PhoneRpcName, readonly string[]>> =
+  Object.freeze({
+    admit_phone_attempt: [
+      'p_engagement_id',
+      'p_kind',
+      'p_lease_owner',
+      'p_lease_seconds',
+      'p_now',
+    ],
+    heartbeat_phone_attempt: ['p_attempt_id', 'p_lease_token', 'p_lease_seconds', 'p_now'],
+    reclaim_phone_attempt_leases: ['p_limit', 'p_now'],
+    apply_phone_event: [
+      'p_source',
+      'p_event_type',
+      'p_attempt_id',
+      'p_engagement_id',
+      'p_provider_event_id',
+      'p_epoch',
+      'p_metadata',
+      'p_now',
+    ],
+    schedule_phone_appointment: [
+      'p_engagement_id',
+      'p_starts_at',
+      'p_ends_at',
+      'p_source',
+      'p_actor_id',
+      'p_expected_version',
+      'p_now',
+    ],
+    cancel_phone_appointment: [
+      'p_appointment_id',
+      'p_reason',
+      'p_actor_id',
+      'p_expected_version',
+      'p_now',
+    ],
+    set_phone_halt: ['p_reason', 'p_actor_id', 'p_now'],
+    clear_phone_halt: ['p_actor_id', 'p_now'],
+    expire_phone_appointments: ['p_grace_seconds', 'p_limit', 'p_now'],
+    phone_backlog: ['p_now'],
+  });
+
+// ═══════════════════════════════════════════════════════════════════════
+// Per-RPC status vocabularies — complete, extracted-and-asserted
+// ═══════════════════════════════════════════════════════════════════════
+
+/** `admit_phone_attempt` — one `ok` and twenty-five distinct free refusals. */
+export const ADMIT_PHONE_ATTEMPT_STATUSES = [
+  'ok',
+  'application_not_found',
+  'application_not_live',
+  'application_terminal',
+  'at_capacity',
+  'attempt_in_flight',
+  'consent_expired',
+  'consent_missing',
+  'consent_not_granted',
+  'consent_subset_missing',
+  'consent_template_inactive',
+  'daily_attempt_exists',
+  'engagement_terminal',
+  'halt_unreadable',
+  'halted',
+  'ingestion_not_ready',
+  'invalid_kind',
+  'kind_not_admissible',
+  'mapping_not_enabled',
+  'no_answer_budget_exhausted',
+  'not_found',
+  'not_yet_eligible',
+  'phone_invalid',
+  'state_not_admissible',
+  'suppressed',
+  'window_closed',
+] as const;
+
+export type AdmitPhoneAttemptStatus = (typeof ADMIT_PHONE_ATTEMPT_STATUSES)[number];
+
+/**
+ * `heartbeat_phone_attempt` — `lease_lost` covers all four losses with one
+ * stable answer: unknown attempt, wrong token, already-reclaimed lease and
+ * non-live attempt. It is never a silent renew.
+ */
+export const HEARTBEAT_PHONE_ATTEMPT_STATUSES = ['ok', 'lease_lost'] as const;
+
+export type HeartbeatPhoneAttemptStatus = (typeof HEARTBEAT_PHONE_ATTEMPT_STATUSES)[number];
+
+/** `reclaim_phone_attempt_leases` — a bounded sweep always answers `ok`. */
+export const RECLAIM_PHONE_ATTEMPT_LEASES_STATUSES = ['ok'] as const;
+
+export type ReclaimPhoneAttemptLeasesStatus =
+  (typeof RECLAIM_PHONE_ATTEMPT_LEASES_STATUSES)[number];
+
+/**
+ * `apply_phone_event`. Note there is no `ok`: the ledger answers `applied` or
+ * `ignored`, and `attempt_required` is a MALFORMED CALL that records nothing —
+ * an engagement-scoped post cannot drive an attempt-scoped edge.
+ */
+export const APPLY_PHONE_EVENT_STATUSES = [
+  'applied',
+  'ignored',
+  'attempt_required',
+  'invalid_source',
+  'invalid_event_type',
+  'invalid_provider_event_id',
+  'provider_event_id_required',
+] as const;
+
+export type ApplyPhoneEventStatus = (typeof APPLY_PHONE_EVENT_STATUSES)[number];
+
+/**
+ * `schedule_phone_appointment`. `ok_prereqs_pending` is a SUCCESS: the slot is
+ * real and HR can see it, but the engagement's prerequisites are unmet so
+ * nothing will dial it. Collapsing it into `ok` would let a caller believe a
+ * call is going to happen at that time.
+ */
+export const SCHEDULE_PHONE_APPOINTMENT_STATUSES = [
+  'ok',
+  'ok_prereqs_pending',
+  'appointment_exists',
+  'attempt_in_flight',
+  'engagement_terminal',
+  'invalid_slot',
+  'invalid_source',
+  'not_found',
+  'slot_duration_invalid',
+  'slot_in_past',
+  'slot_straddles_ist_midnight',
+  'version_conflict',
+  'window_closed',
+] as const;
+
+export type SchedulePhoneAppointmentStatus =
+  (typeof SCHEDULE_PHONE_APPOINTMENT_STATUSES)[number];
+
+/** `cancel_phone_appointment`. `already_cancelled` is idempotent, not an error. */
+export const CANCEL_PHONE_APPOINTMENT_STATUSES = [
+  'ok',
+  'already_cancelled',
+  'invalid_reason',
+  'not_found',
+  'not_live',
+  'version_conflict',
+] as const;
+
+export type CancelPhoneAppointmentStatus = (typeof CANCEL_PHONE_APPOINTMENT_STATUSES)[number];
+
+/** `set_phone_halt` — the kill switch, with a fixed reason vocabulary. */
+export const SET_PHONE_HALT_STATUSES = ['ok', 'invalid_reason'] as const;
+
+export type SetPhoneHaltStatus = (typeof SET_PHONE_HALT_STATUSES)[number];
+
+/**
+ * `clear_phone_halt` — a MISSING control singleton answers `halt_unreadable`
+ * rather than inventing a cleared one, because inventing it would turn a
+ * fail-closed stop into a go.
+ */
+export const CLEAR_PHONE_HALT_STATUSES = ['ok', 'halt_unreadable'] as const;
+
+export type ClearPhoneHaltStatus = (typeof CLEAR_PHONE_HALT_STATUSES)[number];
+
+/** `expire_phone_appointments` — a bounded sweep always answers `ok`. */
+export const EXPIRE_PHONE_APPOINTMENTS_STATUSES = ['ok'] as const;
+
+export type ExpirePhoneAppointmentsStatus = (typeof EXPIRE_PHONE_APPOINTMENTS_STATUSES)[number];
+
+/** `phone_backlog` — a read-only projection always answers `ok`. */
+export const PHONE_BACKLOG_STATUSES = ['ok'] as const;
+
+export type PhoneBacklogStatus = (typeof PHONE_BACKLOG_STATUSES)[number];
+
+/** The per-RPC vocabularies, keyed by RPC name. */
+export const PHONE_RPC_STATUSES: Readonly<Record<PhoneRpcName, readonly string[]>> =
+  Object.freeze({
+    admit_phone_attempt: ADMIT_PHONE_ATTEMPT_STATUSES,
+    heartbeat_phone_attempt: HEARTBEAT_PHONE_ATTEMPT_STATUSES,
+    reclaim_phone_attempt_leases: RECLAIM_PHONE_ATTEMPT_LEASES_STATUSES,
+    apply_phone_event: APPLY_PHONE_EVENT_STATUSES,
+    schedule_phone_appointment: SCHEDULE_PHONE_APPOINTMENT_STATUSES,
+    cancel_phone_appointment: CANCEL_PHONE_APPOINTMENT_STATUSES,
+    set_phone_halt: SET_PHONE_HALT_STATUSES,
+    clear_phone_halt: CLEAR_PHONE_HALT_STATUSES,
+    expire_phone_appointments: EXPIRE_PHONE_APPOINTMENTS_STATUSES,
+    phone_backlog: PHONE_BACKLOG_STATUSES,
+  });
+
+/**
+ * The union of every status any 0042 RPC can return — 44 distinct members.
+ * The count is pinned by the drift test so a migration that adds a refusal
+ * cannot land without this file being revisited.
+ */
+export const PHONE_RPC_STATUS_UNION: readonly string[] = Object.freeze(
+  Array.from(new Set(PHONE_RPC_NAMES.flatMap((n) => PHONE_RPC_STATUSES[n]))).sort(),
+);
+
+/** Number of distinct statuses across all ten RPCs, as of 0042. */
+export const PHONE_RPC_STATUS_COUNT = 44;
+
+/**
+ * The status a store adapter reports when the RPC could not be reached or
+ * answered with something outside its own vocabulary. It is deliberately NOT
+ * a member of any RPC's vocabulary, so a caller can never confuse "the
+ * database refused" with "we never got an answer".
+ */
+export const PHONE_RPC_UNKNOWN_STATUS = 'unknown_status';
+
+/**
+ * Narrow an RPC answer to that RPC's declared vocabulary. Anything else —
+ * a null body, a missing `status`, a status from a newer migration — becomes
+ * `unknown_status`, which callers must treat as "did not happen" rather than
+ * as a refusal they recognise.
+ */
+export function narrowPhoneRpcStatus<T extends string>(
+  rpc: PhoneRpcName,
+  data: unknown,
+): T | typeof PHONE_RPC_UNKNOWN_STATUS {
+  const raw = (data as { status?: unknown } | null | undefined)?.status;
+  if (typeof raw !== 'string') return PHONE_RPC_UNKNOWN_STATUS;
+  return (PHONE_RPC_STATUSES[rpc] as readonly string[]).includes(raw)
+    ? (raw as T)
+    : PHONE_RPC_UNKNOWN_STATUS;
+}
