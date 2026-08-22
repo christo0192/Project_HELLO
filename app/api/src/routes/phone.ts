@@ -548,6 +548,17 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
   // ══════════════════════════════════════════════════════════════════
 
   router.get('/health', requireRole('interviewer'), async (req: Request, res: Response) => {
+    // Express 4 does not catch a rejected promise from an async handler, so a
+    // throw anywhere below would hang the request rather than answer it. Every
+    // other handler is already wrapped; this one is too.
+    try {
+      await handleHealth(req, res);
+    } catch {
+      res.status(500).json({ ok: false, error: 'phone_read_error' });
+    }
+  });
+
+  async function handleHealth(req: Request, res: Response): Promise<void> {
     const cfg = config();
     const configBlock = describePhoneScreeningConfig(cfg);
     if (!cfg.screeningEnabled) {
@@ -667,7 +678,7 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
       backlog_unavailable: false,
       residuals: residualBlock(),
     });
-  });
+  }
 
   // ══════════════════════════════════════════════════════════════════
   //  POST /appointments — book
@@ -872,7 +883,12 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
           sendRefusal(res, result.status);
           return;
         }
-        const alreadyHalted = result.alreadyHalted === true;
+        // FAIL CLOSED on a missing field. `set_phone_halt` always returns
+        // `already_halted`, but if it ever did not, defaulting to false would
+        // make the compensating clear below lift a halt this call did NOT
+        // cause — turning somebody else's stop into a go on the strength of
+        // our own audit failure. Unknown therefore means "not ours".
+        const alreadyHalted = result.alreadyHalted ?? true;
         const ok = await auditOrFail(
           req,
           res,
@@ -956,7 +972,10 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
           sendRefusal(res, result.status);
           return;
         }
-        const wasHalted = result.wasHalted === true;
+        // A missing field falls back to the control row we ALREADY read, which
+        // is a real fact rather than a guess — defaulting to false would skip
+        // the compensating re-halt and leave the dialer running unaudited.
+        const wasHalted = result.wasHalted ?? before.admission.halted;
         const ok = await auditOrFail(
           req,
           res,

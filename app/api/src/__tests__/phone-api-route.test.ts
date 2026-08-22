@@ -1044,6 +1044,20 @@ describe('the health surface', () => {
     }
   });
 
+  it('answers rather than hanging if the handler itself throws', async () => {
+    // Express 4 does not catch a rejected promise from an async handler — an
+    // unguarded throw would leave the request open until the client gave up.
+    const exploding = new Proxy({} as NodeJS.ProcessEnv, {
+      get() { throw new Error('config source unavailable'); },
+    });
+    const res = await request(appWith('interviewer', {
+      stores: fakeStores().store,
+      configSource: exploding,
+    })).get('/api/phone/health');
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ ok: false, error: 'phone_read_error' });
+  });
+
   it('always publishes the four P1 residuals', async () => {
     const res = await request(appWith('interviewer', { stores: fakeStores().store }))
       .get('/api/phone/health');
@@ -1103,6 +1117,19 @@ describe('halt', () => {
     // decision on the strength of our own audit failure.
     setAuditSink(() => { throw new Error('audit db insert failed'); });
     const write = fakeStores({ setHalt: async () => ({ status: 'ok', alreadyHalted: true }) });
+    const res = await request(appWith('admin', { stores: write.store }))
+      .post('/api/phone/halt').send({ reason: 'operator_pause' });
+    expect(res.status).toBe(500);
+    expect(res.body.rolled_back).toBe(false);
+    expect(write.calls.map((c) => c.op)).toEqual(['setHalt']);
+  });
+
+  it('fails CLOSED when the RPC omits already_halted', async () => {
+    // Defaulting an absent field to false would make the compensating clear
+    // lift a halt this call did not cause — somebody else's stop becoming a go
+    // on the strength of our audit failure. Unknown means "not ours".
+    setAuditSink(() => { throw new Error('audit db insert failed'); });
+    const write = fakeStores({ setHalt: async () => ({ status: 'ok' }) });
     const res = await request(appWith('admin', { stores: write.store }))
       .post('/api/phone/halt').send({ reason: 'operator_pause' });
     expect(res.status).toBe(500);
@@ -1240,6 +1267,25 @@ describe('halt/clear', () => {
       .post('/api/phone/halt/clear').send({ reason: 'cost_control' });
     expect(res.status).toBe(500);
     expect(res.body.error).toBe('phone_rpc_unknown_status');
+  });
+
+  it('falls back to the control row it already read when was_halted is absent', async () => {
+    // A missing field must not skip the compensating re-halt and leave the
+    // dialer running unaudited. The pre-read is a real fact, not a guess.
+    setAuditSink(() => { throw new Error('audit db insert failed'); });
+    const write = fakeStores({
+      backlog: async () => ({
+        ...HEALTHY_BACKLOG,
+        admission: { controlPresent: true, halted: true, haltReason: 'legal_hold' },
+      }),
+      clearHalt: async () => ({ status: 'ok' }),
+    });
+    const res = await request(appWith('admin', { stores: write.store }))
+      .post('/api/phone/halt/clear').send({ reason: 'legal_hold' });
+    expect(res.status).toBe(500);
+    expect(res.body.rolled_back).toBe(true);
+    expect(write.calls.map((c) => c.op)).toEqual(['backlog', 'clearHalt', 'setHalt']);
+    expect((write.calls[2].input as Record<string, unknown>).reason).toBe('legal_hold');
   });
 
   it('does not re-halt when the clear was already a no-op', async () => {
