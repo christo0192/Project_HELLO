@@ -75,6 +75,16 @@ export interface SchedulerLoopHealth {
   running: boolean;
   /** ISO time of the last completed tick, or null if none yet. */
   lastTickAt: string | null;
+  /**
+   * ISO time at which `start()` last ARMED this loop, or null before the first
+   * start. This is deliberately not "when the loop first ticked": `start()`
+   * staggers the first tick by up to one whole interval, so between arming and
+   * that first tick a perfectly healthy loop has no `lastTickAt` at all.
+   * Liveness is therefore measured from `lastTickAt ?? startedAt` — see
+   * `snapshotScheduler`. Re-stamped on every start, so a restart opens a fresh
+   * grace window rather than inheriting a stale one.
+   */
+  startedAt: string | null;
   ticks: number;
   errors: number;
   consecutiveErrors: number;
@@ -112,7 +122,7 @@ export function createLoopScheduler(options: LoopSchedulerOptions): LoopSchedule
 
   for (const loop of options.loops) {
     state.set(loop.name, {
-      name: loop.name, running: false, lastTickAt: null,
+      name: loop.name, running: false, lastTickAt: null, startedAt: null,
       ticks: 0, errors: 0, consecutiveErrors: 0,
     });
     idle.set(loop.name, 0);
@@ -177,6 +187,9 @@ export function createLoopScheduler(options: LoopSchedulerOptions): LoopSchedule
       for (const loop of options.loops) {
         const s = state.get(loop.name)!;
         s.running = true;
+        // Stamped BEFORE the stagger is scheduled, so the grace window a health
+        // check measures always covers the whole of that deliberate delay.
+        s.startedAt = new Date(now()).toISOString();
         // Stagger the first tick so the loops (and multiple machines) do not
         // all fire together on boot.
         schedule(loop, Math.max(1, Math.round(loop.intervalMs * random())));

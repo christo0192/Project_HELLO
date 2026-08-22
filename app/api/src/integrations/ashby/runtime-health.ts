@@ -112,14 +112,34 @@ export function snapshotScheduler(nowMs: number = Date.now()): SchedulerHealthVi
     registeredInThisProcess: true,
     running: health.running,
     loops: health.loops.map((loop: SchedulerLoopHealth): LoopHealthView => {
+      // `startedAt` is INTERNAL: it feeds the liveness measurement below and is
+      // deliberately kept out of the sanitized view, so the health payload
+      // stays byte-compatible and OpenAPI needs no change.
+      const { startedAt, ...view } = loop;
       const interval = registered!.intervals[loop.name] ?? 0;
       const window = Math.max(MIN_STALE_WINDOW_MS, interval * STALE_TICK_MULTIPLIER);
-      const last = loop.lastTickAt ? Date.parse(loop.lastTickAt) : NaN;
-      // A running loop that has never ticked, or whose last tick is older than
-      // its window, is stale. A stopped loop is not "stale" — it is stopped.
+
+      // Measure from the last tick, or — when the loop has not ticked yet —
+      // from the moment it was ARMED.
+      //
+      // `start()` staggers the first tick by up to one whole interval so the
+      // loops (and multiple machines) do not all fire together on boot. For
+      // `reconcile` that is up to ~15 minutes. Anchoring on `lastTickAt` alone
+      // made every loop `stale` for the whole of that deliberate delay, which
+      // reported `degraded` after every deploy and cold start — training
+      // operators to ignore a channel that must stay meaningful.
+      //
+      // Anchoring on `startedAt` keeps the property that motivated the original
+      // rule: a loop that never begins ticking IS still caught, one window
+      // after start instead of instantly. The `!Number.isFinite` clause is
+      // retained so a running loop with neither anchor is stale rather than
+      // silently healthy.
+      const anchor = loop.lastTickAt ?? startedAt;
+      const last = anchor ? Date.parse(anchor) : NaN;
+      // A stopped loop is not "stale" — it is stopped.
       const stale = health.running
         && (!Number.isFinite(last) || nowMs - last > window);
-      return { ...loop, stale };
+      return { ...view, stale };
     }),
   };
 }
