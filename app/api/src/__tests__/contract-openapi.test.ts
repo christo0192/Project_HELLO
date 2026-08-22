@@ -34,7 +34,10 @@ import request from 'supertest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import express from 'express';
 import { createApp } from '../app.js';
+import { createPhoneApiRouter } from '../routes/phone.js';
+import { getAuditSink, setAuditSink } from '../lib/audit.js';
 import { mockAuthGetUser, type AuthUser } from '../lib/auth.js';
 import { MemoryRateLimitStore, setRateLimitStore } from '../lib/rate-limit.js';
 import { injectAssessmentRunner } from '../services/assessment.js';
@@ -905,12 +908,25 @@ describe('OpenAPI document integrity', () => {
     //   (0041). Deliberately its own route rather than a widening of the
     //   one above, so the ordinary recovery's allowlist keeps refusing
     //   every document verdict.
-    expect(Object.keys(paths).length).toBe(79);
+    // + POST /api/integrations/livekit-phone/webhook — the pre-auth LiveKit
+    //   phone ingress (P3).
+    // + the eight phone screening operator paths (P6): the calendar range
+    //   read, the IST slot grid, the engagement detail, the health surface,
+    //   appointment create, the appointment reschedule/cancel pair on one
+    //   path, and the two halt controls.
+    //
+    // 78 (base) + 1 (P3) + 8 (P6) = 87. RE-DERIVED from the merged spec on
+    // rebase, not arrived at by adding the two branches' diffs — the whole
+    // point of a hard count is that it is checked against the document.
+    expect(Object.keys(paths).length).toBe(87);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
     // + the three candidate-scoped Ashby workflow-card schemas.
-    expect(Object.keys(schemas).length).toBe(162);
+    // + PhoneWebhookAck and PhoneWebhookError (P3).
+    // + the thirty-one phone screening operator schemas (P6).
+    // 160 (base) + 2 (P3) + 31 (P6) = 193, re-derived on rebase.
+    expect(Object.keys(schemas).length).toBe(193);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.
@@ -2306,5 +2322,241 @@ describe('deriveStartOffsetSec', () => {
 
   it('returns null when egressMs is out of range (negative)', () => {
     expect(deriveStartOffsetSec(1700000005000, -5)).toBeNull();
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════
+//  Phone screening operator API (P6) — live handlers vs documented schemas
+//
+//  Two passes, because neither alone is enough.
+//
+//  1. Through the REAL app. `PHONE_SCREENING_ENABLED` is unset in
+//     `vitest.setup.ts`, which IS the production default, so these four reads
+//     answer their disabled envelope without touching a database. That makes
+//     the default itself contract-tested rather than merely asserted, and it
+//     validates the envelope exactness (`additionalProperties: false`) that a
+//     hand-written spec drifts away from first.
+//  2. Through a locally mounted router with injected stores, for the ENABLED
+//     bodies — the row shapes, the slot grid and the write responses. The real
+//     app's phone router is constructed at import time with no seam, so the
+//     only way to see a populated body is to build one here.
+// ════════════════════════════════════════════════════════════════════
+
+describe('phone operator API bodies match the documented schemas', () => {
+  const PHONE_ENGAGEMENT = '00000000-0000-4000-8000-0000000000e1';
+  const PHONE_APPOINTMENT = '00000000-0000-4000-8000-0000000000a1';
+  const PHONE_CANDIDATE = '00000000-0000-4000-8000-0000000000c1';
+  const PHONE_NOW = new Date('2026-08-23T18:31:00Z');
+
+  const READS: Array<[string, string]> = [
+    ['/api/phone/calendar?from=2026-08-24T00:00:00Z&to=2026-08-25T00:00:00Z',
+      'PhoneCalendarResponse'],
+    ['/api/phone/calendar/slots?date=2026-08-24', 'PhoneSlotsResponse'],
+    [`/api/phone/engagements/${PHONE_ENGAGEMENT}`, 'PhoneEngagementResponse'],
+    ['/api/phone/health', 'PhoneHealthResponse'],
+  ];
+
+  it('the DISABLED default answers each read with its documented envelope', async () => {
+    const app = createContractApp();
+    for (const [path, schema] of READS) {
+      const res = await request(app).get(path).set('Authorization', AUTH_HEADER);
+      expect(res.status, path).toBe(200);
+      expect(res.body.enabled, path).toBe(false);
+      expect(validateNamed(res.body, schema, spec), `${path} vs ${schema}`).toEqual([]);
+    }
+  });
+
+  it('the ENABLED bodies match too, rows and all', async () => {
+    const appointment = {
+      id: PHONE_APPOINTMENT,
+      engagementId: PHONE_ENGAGEMENT,
+      startsAt: '2026-08-24T03:30:00.000Z',
+      endsAt: '2026-08-24T04:00:00.000Z',
+      istDate: '2026-08-24',
+      status: 'scheduled' as const,
+      source: 'hr_manual' as const,
+      confirmedAt: null,
+      cancelReason: null,
+      version: 3,
+      createdAt: '2026-08-23T10:00:00.000Z',
+      updatedAt: '2026-08-23T10:00:00.000Z',
+    };
+    const engagement = {
+      id: PHONE_ENGAGEMENT,
+      candidateId: PHONE_CANDIDATE,
+      state: 'scheduled' as const,
+      stateReason: null,
+      epoch: 0,
+      version: 2,
+      noAnswerAttempts: 1,
+      reconnectsUsed: 0,
+      providerFailures: 0,
+      nextEligibleAt: '2026-08-25T03:30:00.000Z',
+      lastAttemptAt: '2026-08-23T05:01:00.000Z',
+      terminalAt: null,
+      createdAt: '2026-08-20T10:00:00.000Z',
+      updatedAt: '2026-08-23T10:00:00.000Z',
+    };
+    const attempt = {
+      id: '00000000-0000-4000-8000-0000000000b1',
+      engagementId: PHONE_ENGAGEMENT,
+      attemptSeq: 1,
+      epoch: 0,
+      kind: 'initial' as const,
+      state: 'ended' as const,
+      outcomeClass: 'no_answer' as const,
+      istDate: '2026-08-23',
+      priorEngagementState: 'eligible' as const,
+      admittedAt: '2026-08-23T05:00:00.000Z',
+      answeredAt: null,
+      classifiedAt: null,
+      endedAt: '2026-08-23T05:01:00.000Z',
+    };
+    const candidate = {
+      id: PHONE_CANDIDATE,
+      name: 'Contract Fixture',
+      status: 'screening',
+      reference: 'ATS-CONTRACT-1',
+    };
+    const readStore = {
+      listAppointmentsByStart: async () => [appointment],
+      listLiveAppointmentsByStart: async () => [appointment],
+      getAppointment: async () => appointment,
+      getLiveAppointmentForEngagement: async () => appointment,
+      listEngagementsByIds: async () => [engagement],
+      getEngagement: async () => engagement,
+      listCandidatesByIds: async () => [candidate],
+      listAttemptsForEngagement: async () => [attempt],
+    };
+    const stores = {
+      admitAttempt: async () => ({ status: 'ok' }),
+      heartbeatAttempt: async () => ({ status: 'ok' }),
+      reclaimAttemptLeases: async () => ({ status: 'ok' }),
+      applyEvent: async () => ({ status: 'applied' }),
+      // A reschedule (non-null expected version) supersedes the live row and
+      // returns its id; a create supersedes nothing. The route now treats a
+      // reschedule that superseded NOTHING as a lost update, so the fake has to
+      // model the difference rather than always answering null.
+      scheduleAppointment: async (input: { expectedVersion?: number | null }) => ({
+        status: 'ok',
+        appointmentId: PHONE_APPOINTMENT,
+        version: 1,
+        engagementState: 'scheduled',
+        supersededAppointmentId:
+          input.expectedVersion == null ? null : '00000000-0000-4000-8000-0000000000a2',
+      }),
+      cancelAppointment: async () => ({
+        status: 'ok', appointmentId: PHONE_APPOINTMENT, version: 4,
+      }),
+      expireAppointments: async () => ({ status: 'ok' }),
+      setHalt: async () => ({ status: 'ok', alreadyHalted: false }),
+      clearHalt: async () => ({ status: 'ok', wasHalted: true }),
+      backlog: async () => ({
+        status: 'ok',
+        admission: { controlPresent: true, halted: false, haltReason: null },
+        engagementsByState: { eligible: 2 },
+        attempts: { live: 1, liveWithUnexpiredLease: 1, maxConcurrent: 10, oldestLiveAgeSeconds: 4 },
+        appointments: { live: 1, overdue: 0 },
+        events: {
+          ignoredLast24h: 1, unknownAttemptLast24h: 0, staleEpochLast24h: 1,
+          terminalLast24h: 0, unexpectedEventLast24h: 0,
+        },
+        windowOpen: true,
+        istDate: '2026-08-24',
+      }),
+    };
+
+    const phoneApp = express();
+    phoneApp.use(express.json());
+    phoneApp.use((req, _res, next) => {
+      (req as unknown as { authUser: unknown }).authUser = {
+        id: UUID_1, appRole: 'admin',
+      };
+      next();
+    });
+    phoneApp.use('/api/phone', createPhoneApiRouter({
+      readStore: readStore as never,
+      stores: stores as never,
+      configSource: { PHONE_SCREENING_ENABLED: 'true' },
+      now: () => PHONE_NOW,
+    }));
+
+    const originalSink = getAuditSink();
+    setAuditSink(async () => {});
+    try {
+      for (const [path, schema] of READS) {
+        const res = await request(phoneApp).get(path);
+        expect(res.status, path).toBe(200);
+        expect(res.body.enabled, path).toBe(true);
+        expect(validateNamed(res.body, schema, spec), `${path} vs ${schema}`).toEqual([]);
+      }
+      // The populated rows really were exercised, so the array item schemas
+      // above were validated rather than skipped over an empty list.
+      const calendar = await request(phoneApp)
+        .get('/api/phone/calendar?from=2026-08-24T00:00:00Z&to=2026-08-25T00:00:00Z');
+      expect(calendar.body.appointments).toHaveLength(1);
+      const slots = await request(phoneApp).get('/api/phone/calendar/slots?date=2026-08-24');
+      expect(slots.body.slots.length).toBeGreaterThan(0);
+      const detail = await request(phoneApp).get(`/api/phone/engagements/${PHONE_ENGAGEMENT}`);
+      expect(detail.body.attempts).toHaveLength(1);
+
+      const created = await request(phoneApp).post('/api/phone/appointments').send({
+        engagement_id: PHONE_ENGAGEMENT,
+        starts_at: '2026-08-24T04:00:00Z',
+        ends_at: '2026-08-24T04:30:00Z',
+      });
+      expect(created.status).toBe(201);
+      expect(validateNamed(created.body, 'PhoneAppointmentWriteResponse', spec)).toEqual([]);
+
+      const patched = await request(phoneApp)
+        .patch(`/api/phone/appointments/${PHONE_APPOINTMENT}`)
+        .send({
+          starts_at: '2026-08-24T05:00:00Z',
+          ends_at: '2026-08-24T05:30:00Z',
+          version: 3,
+        });
+      expect(patched.status).toBe(200);
+      expect(validateNamed(patched.body, 'PhoneAppointmentWriteResponse', spec)).toEqual([]);
+
+      const cancelled = await request(phoneApp)
+        .delete(`/api/phone/appointments/${PHONE_APPOINTMENT}`)
+        .send({ reason: 'hr_cancelled', version: 3 });
+      expect(cancelled.status).toBe(200);
+      expect(validateNamed(cancelled.body, 'PhoneCancelResponse', spec)).toEqual([]);
+
+      const halted = await request(phoneApp).post('/api/phone/halt')
+        .send({ reason: 'operator_pause' });
+      expect(halted.status).toBe(200);
+      expect(validateNamed(halted.body, 'PhoneHaltResponse', spec)).toEqual([]);
+
+      const cleared = await request(phoneApp).post('/api/phone/halt/clear')
+        .send({ reason: 'operator_pause' });
+      expect(cleared.status).toBe(200);
+      expect(validateNamed(cleared.body, 'PhoneHaltClearResponse', spec)).toEqual([]);
+    } finally {
+      setAuditSink(originalSink);
+    }
+  });
+
+  it('negative control — the phone schemas really are exact', () => {
+    // A validator that accepted anything would make every assertion above
+    // vacuous. An undocumented key and a wrong type must both be caught.
+    const good = {
+      ok: true, halted: true, already_halted: false, reason: 'operator_pause',
+    };
+    expect(validateNamed(good, 'PhoneHaltResponse', spec)).toEqual([]);
+    expect(validateNamed({ ...good, surprise: 1 }, 'PhoneHaltResponse', spec).length)
+      .toBeGreaterThan(0);
+    expect(validateNamed({ ...good, halted: 'yes' }, 'PhoneHaltResponse', spec).length)
+      .toBeGreaterThan(0);
+    const { reason, ...missing } = good;
+    expect(reason).toBe('operator_pause');
+    expect(validateNamed(missing, 'PhoneHaltResponse', spec).length).toBeGreaterThan(0);
+    // And a nullable field must still reject a wrong non-null type.
+    expect(validateNamed(
+      { ok: true, halted: false, was_halted: true, previous_reason: 7 },
+      'PhoneHaltClearResponse',
+      spec,
+    ).length).toBeGreaterThan(0);
   });
 });

@@ -242,6 +242,34 @@ export const PHONE_RPC_STATUS_UNION: readonly string[] = Object.freeze(
 export const PHONE_RPC_STATUS_COUNT = 44;
 
 /**
+ * RESULT KEYS the API's behaviour DEPENDS on, per RPC.
+ *
+ * `PHONE_RPC_PARAMETERS` pins what we send; this pins what we read. The two are
+ * not the same risk. A renamed parameter is a 404 at runtime — loud. A renamed
+ * RESULT key is silent, and at least one of these is load-bearing in a
+ * destructive direction: the calendar API classifies a reschedule whose
+ * `superseded_appointment_id` is absent-or-null as a lost update and CANCELS
+ * the appointment it just created. If 0042 renamed that key, every legitimate
+ * reschedule would destroy its own slot and report `version_conflict`.
+ *
+ * `phone-screening-rpc-contract.test.ts` asserts each key appears in the
+ * corresponding function body, so the rename cannot land unnoticed.
+ */
+export const PHONE_RPC_RESULT_KEYS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  schedule_phone_appointment: [
+    'appointment_id',
+    'version',
+    'engagement_state',
+    'superseded_appointment_id',
+  ],
+  cancel_phone_appointment: ['appointment_id', 'version'],
+  set_phone_halt: ['already_halted'],
+  clear_phone_halt: ['was_halted'],
+  admit_phone_attempt: ['attempt_id', 'lease_token', 'lease_expires_at'],
+  apply_phone_event: ['applied', 'ignored_reason', 'event_id', 'duplicate'],
+});
+
+/**
  * The status a store adapter reports when the RPC could not be reached or
  * answered with something outside its own vocabulary. It is deliberately NOT
  * a member of any RPC's vocabulary, so a caller can never confuse "the

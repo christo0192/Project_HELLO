@@ -3123,6 +3123,569 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
 
+  # ── Phone screening operator API (P6) ───────────────────────────
+  # Internal calendar, engagement, health and control surface over
+  # migration 0042. Reads are interviewer+, every mutation is admin-only
+  # and delegates to a 0042 SECURITY DEFINER RPC. Disabled by default.
+  /api/phone/calendar:
+    get:
+      tags: [phone]
+      operationId: getPhoneCalendar
+      summary: Internal phone screening appointments in a UTC range
+      description: Interviewer role or above. Sanitized operator projection — opaque ids, closed-vocabulary states, the candidate display name, ATS reference and pipeline status, and IST display times. Never a phone number, a suppression digest, a SIP call id, a room name, a participant identity, an egress id, a lease token or owner, a provider event id, provider metadata or a transcript. Both bounds are UTC ISO-8601 with a literal Z; an offset or a naive datetime is refused. The range is half-open and at most 31 days. Results are capped at 200 rows and report truncation rather than dropping rows silently. While PHONE_SCREENING_ENABLED is off the route answers with enabled=false and an empty list, having performed no database work.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: from
+          in: query
+          required: true
+          description: Inclusive lower bound on the appointment start, UTC ISO-8601.
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: true
+          description: Exclusive upper bound on the appointment start, UTC ISO-8601.
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Sanitized appointments in the requested range.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneCalendarResponse'
+        '400':
+          description: Shape validation failed — a non-UTC instant, a reversed or empty range, a range wider than 31 days, or an unexpected query key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '500':
+          description: phone_read_error — the projection could not be read. Never a driver message.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '401':
+          description: No bearer token, or a token the server could not validate. Emitted by the global auth middleware before the router is reached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '403':
+          description: Authenticated but insufficiently privileged — reads need interviewer or above, every mutation needs admin, and the global viewer read-only guard rejects a viewer mutation before the role gate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '429':
+          description: Per-user rate limit exceeded. NOT a health signal — retry, do not report degraded. This mount uses the default bucket precisely so an operator poll of /api/phone/health cannot be throttled into looking degraded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+  /api/phone/calendar/slots:
+    get:
+      tags: [phone]
+      operationId: getPhoneCalendarSlots
+      summary: One IST day's slot grid, projected against live appointments
+      description: Interviewer role or above. The grid runs from the 0900 IST open to the 2100 IST close on all seven days, stepped by the configured slot length, which is clamped into the same 900 to 3600 second envelope the 0042 duration CHECK enforces. Each slot reports booked (live appointments overlapping it), the fleet cap mirrored from phone_max_concurrent, and remaining. IMPORTANT — 0042 has no per-slot capacity model and consumes the fleet cap at dial time, not at booking time, so remaining is an advisory projection rather than a reservation. Refusals are stable codes. A final slot may end after the close because the window bounds only the start.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: date
+          in: query
+          required: true
+          description: IST calendar date, YYYY-MM-DD. A date the calendar does not have is refused rather than rolled over.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The slot grid for the requested IST day.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneSlotsResponse'
+        '400':
+          description: Shape validation failed — not an IST calendar date, or an unexpected query key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '500':
+          description: phone_read_error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '401':
+          description: No bearer token, or a token the server could not validate. Emitted by the global auth middleware before the router is reached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '403':
+          description: Authenticated but insufficiently privileged — reads need interviewer or above, every mutation needs admin, and the global viewer read-only guard rejects a viewer mutation before the role gate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '429':
+          description: Per-user rate limit exceeded. NOT a health signal — retry, do not report degraded. This mount uses the default bucket precisely so an operator poll of /api/phone/health cannot be throttled into looking degraded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+  /api/phone/engagements/{id}:
+    get:
+      tags: [phone]
+      operationId: getPhoneEngagement
+      summary: One phone engagement, sanitized
+      description: Interviewer role or above. Returns the engagement state, the three budgets against their mirrored 0042 ceilings, the next eligible instant, the live appointment if any, and the bounded attempt history with its outcome classes. Provider-bearing attempt columns are ABSENT rather than redacted — the read never selects sip_call_id, room_name, participant_identity, egress_id, egress_status, lease_token or lease_owner.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Phone engagement id.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: The sanitized engagement projection.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneEngagementResponse'
+        '400':
+          description: The id is not a uuid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: not_found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '500':
+          description: phone_read_error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '401':
+          description: No bearer token, or a token the server could not validate. Emitted by the global auth middleware before the router is reached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '403':
+          description: Authenticated but insufficiently privileged — reads need interviewer or above, every mutation needs admin, and the global viewer read-only guard rejects a viewer mutation before the role gate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '429':
+          description: Per-user rate limit exceeded. NOT a health signal — retry, do not report degraded. This mount uses the default bucket precisely so an operator poll of /api/phone/health cannot be throttled into looking degraded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+  /api/phone/health:
+    get:
+      tags: [phone]
+      operationId: getPhoneHealth
+      summary: Phone screening backlog, halt, window and concurrency
+      description: Interviewer role or above. Booleans, bounded integers, counts and stable codes ONLY. A missing phone_control singleton reads as HALTED, matching 0042's fail-closed admission. When the backlog cannot be read every count block becomes null and the status degrades — a zero would say there is none, which is not the same answer. The five ingress verdicts stay split because a stale epoch is fencing working as designed while an unknown attempt is an ingress describing a call we have no record of. Also publishes the four P1 substrate residuals, each drift-tested against 0042.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Sanitized operational state. Degradation is reported in the BODY, never as an HTTP status — a degraded phone subsystem still answers 200 with status degraded and null count blocks.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneHealthResponse'
+        '500':
+          description: phone_read_error. The handler itself failed — distinct from a degraded subsystem, which is a 200. Reachable only if the surface cannot be assembled at all.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '401':
+          description: No bearer token, or a token the server could not validate. Emitted by the global auth middleware before the router is reached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '403':
+          description: Authenticated but insufficiently privileged — reads need interviewer or above, every mutation needs admin, and the global viewer read-only guard rejects a viewer mutation before the role gate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '429':
+          description: Per-user rate limit exceeded. NOT a health signal — retry, do not report degraded. This mount uses the default bucket precisely so an operator poll of /api/phone/health cannot be throttled into looking degraded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+  /api/phone/appointments:
+    post:
+      tags: [phone]
+      operationId: createPhoneAppointment
+      summary: Book an internal phone screening slot
+      description: Admin only. Delegates to the 0042 schedule_phone_appointment RPC and writes nothing directly; slot legality, the IST window, the IST-midnight straddle and the optimistic version are all decided inside the RPC under the engagement row lock. The source is always hr_manual and may not be supplied. No expected version is sent, so a live appointment already existing is refused with appointment_exists rather than silently superseded. Booking causes no call — admit_phone_attempt is the only thing that dials and it is not mounted. Refused with 503 while PHONE_SCREENING_ENABLED is off.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PhoneAppointmentCreateBody'
+      responses:
+        '201':
+          description: The slot was booked. prereqs_pending marks the ok_prereqs_pending answer, where the slot is real but the engagement's prerequisites are unmet so nothing will dial it.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneAppointmentWriteResponse'
+        '400':
+          description: Shape validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: not_found — no such engagement.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '409':
+          description: A substrate refusal, carrying its own status as the error code — invalid_slot, slot_duration_invalid, slot_in_past, window_closed, slot_straddles_ist_midnight, invalid_source, appointment_exists, attempt_in_flight, engagement_terminal or version_conflict.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '500':
+          description: phone_rpc_unknown_status (we never got an answer), phone_action_error, or phone_audit_write_failed when the fail-closed audit sink failed after the write. rolled_back is false here because superseding is not reversible; re-read to reconcile.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '503':
+          description: phone_screening_disabled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '401':
+          description: No bearer token, or a token the server could not validate. Emitted by the global auth middleware before the router is reached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '403':
+          description: Authenticated but insufficiently privileged — reads need interviewer or above, every mutation needs admin, and the global viewer read-only guard rejects a viewer mutation before the role gate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '429':
+          description: Per-user rate limit exceeded. NOT a health signal — retry, do not report degraded. This mount uses the default bucket precisely so an operator poll of /api/phone/health cannot be throttled into looking degraded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+  /api/phone/appointments/{id}:
+    patch:
+      tags: [phone]
+      operationId: reschedulePhoneAppointment
+      summary: Reschedule a live appointment, superseding it atomically
+      description: Admin only. Rescheduling is schedule_phone_appointment with an expected version — it supersedes the live row and inserts the new one inside ONE transaction under the engagement row lock. There is deliberately no cancel-then-book, which would leave a window in which the candidate has no slot at all. The path id is resolved first to find the engagement and to refuse a request aimed at a row that is no longer live; the RPC re-checks the version under the lock and stays the authority, so superseded_appointment_id is returned verbatim from the RPC rather than echoed back from the path.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The live appointment being moved.
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PhoneAppointmentPatchBody'
+      responses:
+        '200':
+          description: The slot was moved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneAppointmentWriteResponse'
+        '400':
+          description: Shape validation failed, including a missing or non-positive version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: not_found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '409':
+          description: not_live when the addressed appointment is cancelled, superseded, fulfilled or missed, or any schedule refusal including version_conflict. A version_conflict here may also mean the addressed row stopped being live between the pre-read and the RPC — schedule_phone_appointment compares the expected version ONLY when it finds a live appointment, so that race would otherwise turn a reschedule into a silent create. The route detects it (nothing was superseded), undoes the insert, audits the attempt, and reports appointment_rolled_back.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '500':
+          description: phone_rpc_unknown_status, phone_action_error or phone_audit_write_failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '503':
+          description: phone_screening_disabled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '401':
+          description: No bearer token, or a token the server could not validate. Emitted by the global auth middleware before the router is reached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '403':
+          description: Authenticated but insufficiently privileged — reads need interviewer or above, every mutation needs admin, and the global viewer read-only guard rejects a viewer mutation before the role gate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '429':
+          description: Per-user rate limit exceeded. NOT a health signal — retry, do not report degraded. This mount uses the default bucket precisely so an operator poll of /api/phone/health cannot be throttled into looking degraded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+    delete:
+      tags: [phone]
+      operationId: cancelPhoneAppointment
+      summary: Cancel a live appointment
+      description: Admin only. Delegates to cancel_phone_appointment with the required expected version — the RPC treats a null version as cancel-regardless, which is exactly the lost update the version column prevents. The reason vocabulary is 0042's, NARROWED to the reasons an operator may give; superseded and system_deferral_expired are written only by the substrate itself and are refused here so the audit trail cannot misdescribe what happened. already_cancelled is idempotent success, not a conflict.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The appointment being cancelled.
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PhoneAppointmentCancelBody'
+      responses:
+        '200':
+          description: Cancelled, or already cancelled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneCancelResponse'
+        '400':
+          description: Shape validation failed, including a reason only the substrate may write.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: not_found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '409':
+          description: not_live, version_conflict or invalid_reason.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '500':
+          description: phone_rpc_unknown_status, phone_action_error or phone_audit_write_failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '503':
+          description: phone_screening_disabled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '401':
+          description: No bearer token, or a token the server could not validate. Emitted by the global auth middleware before the router is reached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '403':
+          description: Authenticated but insufficiently privileged — reads need interviewer or above, every mutation needs admin, and the global viewer read-only guard rejects a viewer mutation before the role gate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '429':
+          description: Per-user rate limit exceeded. NOT a health signal — retry, do not report degraded. This mount uses the default bucket precisely so an operator poll of /api/phone/health cannot be throttled into looking degraded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+  /api/phone/halt:
+    post:
+      tags: [phone]
+      operationId: setPhoneHalt
+      summary: Raise the phone admission kill switch
+      description: Admin only. Delegates to set_phone_halt. An explicit reason from the 0042 vocabulary is required. Repeated halts PRESERVE the original instant, reason and actor, and already_halted says so. The audit is fail-closed — if the sink fails, the halt this call CAUSED is rolled back and the response is 500 with rolled_back true; a halt that was already in force is not rolled back, because our call changed nothing and lifting it would undo somebody else's decision.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PhoneHaltBody'
+      responses:
+        '200':
+          description: The kill switch is in force.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneHaltResponse'
+        '400':
+          description: Shape validation failed — a reason outside the 0042 vocabulary, or an unexpected key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: invalid_reason from the substrate, which can only mean vocabulary drift.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '500':
+          description: phone_rpc_unknown_status, phone_action_error or phone_audit_write_failed with rolled_back.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '503':
+          description: phone_screening_disabled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '401':
+          description: No bearer token, or a token the server could not validate. Emitted by the global auth middleware before the router is reached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '403':
+          description: Authenticated but insufficiently privileged — reads need interviewer or above, every mutation needs admin, and the global viewer read-only guard rejects a viewer mutation before the role gate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '429':
+          description: Per-user rate limit exceeded. NOT a health signal — retry, do not report degraded. This mount uses the default bucket precisely so an operator poll of /api/phone/health cannot be throttled into looking degraded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+  /api/phone/halt/clear:
+    post:
+      tags: [phone]
+      operationId: clearPhoneHalt
+      summary: Lower the phone admission kill switch
+      description: Admin only. The reason on the body must NAME the halt currently in force, verified against the control row before anything is cleared. 0042 defines no separate resume vocabulary and this API does not invent one; requiring the existing reason makes the field a genuine interlock and gives the audit-failure path a reason it verified rather than guessed. A control singleton that cannot be read is never cleared — 0042 reads a missing row as halted and refuses to invent a cleared one, and so does this route. On audit failure the halt is re-raised with that verified reason.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PhoneHaltClearBody'
+      responses:
+        '200':
+          description: The kill switch is cleared.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneHaltClearResponse'
+        '400':
+          description: Shape validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: halt_reason_mismatch — the supplied reason is not the halt in force.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '500':
+          description: phone_rpc_unknown_status, phone_action_error or phone_audit_write_failed with rolled_back.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '503':
+          description: halt_state_unavailable or halt_unreadable when the control singleton could not be read, or phone_screening_disabled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+
+        '401':
+          description: No bearer token, or a token the server could not validate. Emitted by the global auth middleware before the router is reached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '403':
+          description: Authenticated but insufficiently privileged — reads need interviewer or above, every mutation needs admin, and the global viewer read-only guard rejects a viewer mutation before the role gate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '429':
+          description: Per-user rate limit exceeded. NOT a health signal — retry, do not report degraded. This mount uses the default bucket precisely so an operator poll of /api/phone/health cannot be throttled into looking degraded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
 components:
   securitySchemes:
     bearerAuth:
@@ -6222,4 +6785,701 @@ components:
       properties:
         ok:
           type: boolean
+      additionalProperties: false
+
+    # ── Phone screening operator API (P6) ────────────────────────
+    PhoneApiError:
+      description: The stable error envelope of the phone operator surface. The code is always a snake_case constant, never a driver message, a constraint name or a row value.
+      type: object
+      required: [ok, error]
+      properties:
+        ok:
+          type: boolean
+        error:
+          type: string
+        rolled_back:
+          description: Present only on phone_audit_write_failed. True means the mutation this call caused was fully undone — which happens on POST /halt/clear and nowhere else. POST /halt deliberately never undoes a raised kill switch, and an appointment supersede is not reversible at all.
+          type: boolean
+        appointment_rolled_back:
+          description: Present only on the PATCH lost-update path. Deliberately NARROWER than rolled_back — the stray appointment is cancelled, but the ENGAGEMENT is not restored: the insert may have promoted it to scheduled and the compensating cancel drives it to eligible with next_eligible_at set to now. Nothing in 0042 can put the original state or pacing stamp back. Bounded — the per-IST-day attempt index still prevents an extra dial — but next_eligible_at may read as eligible now when the real pacing was the next IST day.
+          type: boolean
+      additionalProperties: false
+
+    PhoneWindow:
+      description: The approved IST calling window, mirrored from phone_ist_window_open_at and phone_ist_window_close_at. Open is inclusive, close is exclusive, and every one of the seven days is a calling day.
+      type: object
+      required: [time_zone, open_ist, close_ist]
+      properties:
+        time_zone:
+          type: string
+        open_ist:
+          type: string
+        close_ist:
+          type: string
+      additionalProperties: false
+
+    PhoneCandidateRef:
+      description: The candidate fields an operator calendar may show. Never an email address, a phone number in any form, a resume, or parsed resume content.
+      type: object
+      required: [id, name, status, reference]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          description: Display name. Null when the candidate row carries none.
+          type: string
+          nullable: true
+        status:
+          description: The candidate's pipeline status.
+          type: string
+        reference:
+          description: The ATS external reference, or null for a candidate that never came from an ATS. No substitute is invented for that case.
+          type: string
+          nullable: true
+      additionalProperties: false
+
+    PhoneAppointment:
+      description: One row of screening_v2.phone_appointments, minus created_by (an operator identity that is never read).
+      type: object
+      required: [id, engagement_id, starts_at, ends_at, ist_date, ist_start, ist_end, status, source, confirmed_at, cancel_reason, version, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        engagement_id:
+          type: string
+          format: uuid
+        starts_at:
+          type: string
+          format: date-time
+        ends_at:
+          type: string
+          format: date-time
+        ist_date:
+          description: The IST calendar date, derived by a 0042 trigger and impossible for a caller to falsify.
+          type: string
+        ist_start:
+          description: IST wall clock HH-MM of the start, so no client re-derives the time zone.
+          type: string
+          nullable: true
+        ist_end:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [scheduled, confirmed, cancelled, superseded, fulfilled, missed]
+        source:
+          type: string
+          enum: [candidate_voice, hr_manual, system_deferral]
+        confirmed_at:
+          description: ALWAYS null today. Nothing in migration 0042 writes it — an appointment is confirmed when the bot reads the slot back to the candidate, which is a voice event owned by a later phase. Reported rather than dropped so the residual stays visible; see the appointment_confirmed_has_no_writer entry on the health surface.
+          type: string
+          format: date-time
+          nullable: true
+        cancel_reason:
+          type: string
+          nullable: true
+        version:
+          description: Optimistic-concurrency token. Required on reschedule and cancel.
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    PhoneCalendarAppointment:
+      description: A calendar row — one appointment plus the engagement state and candidate reference it belongs to. engagement_state and candidate are null only on a torn read between the batched queries, never as a guess.
+      type: object
+      required: [id, engagement_id, starts_at, ends_at, ist_date, ist_start, ist_end, status, source, confirmed_at, cancel_reason, version, created_at, updated_at, engagement_state, candidate]
+      properties:
+        id:
+          type: string
+          format: uuid
+        engagement_id:
+          type: string
+          format: uuid
+        starts_at:
+          type: string
+          format: date-time
+        ends_at:
+          type: string
+          format: date-time
+        ist_date:
+          type: string
+        ist_start:
+          type: string
+          nullable: true
+        ist_end:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [scheduled, confirmed, cancelled, superseded, fulfilled, missed]
+        source:
+          type: string
+          enum: [candidate_voice, hr_manual, system_deferral]
+        confirmed_at:
+          type: string
+          format: date-time
+          nullable: true
+        cancel_reason:
+          type: string
+          nullable: true
+        version:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        engagement_state:
+          type: string
+          nullable: true
+          enum: [pending_prereqs, eligible, scheduled, dialing, in_call, reconnecting, awaiting_retry, completed, abandoned_no_answer, opted_out, wrong_number, failed, cancelled]
+        candidate:
+          nullable: true
+          $ref: '#/components/schemas/PhoneCandidateRef'
+      additionalProperties: false
+
+    PhoneCalendarResponse:
+      type: object
+      required: [ok, enabled, range, window, count, truncated, appointments]
+      properties:
+        ok:
+          type: boolean
+        enabled:
+          description: False while PHONE_SCREENING_ENABLED is off, in which case the list is empty and no database work was performed.
+          type: boolean
+        range:
+          $ref: '#/components/schemas/PhoneCalendarRange'
+        window:
+          $ref: '#/components/schemas/PhoneWindow'
+        count:
+          type: integer
+        truncated:
+          description: True when the range held more than the 200-row cap. Rows are never dropped silently.
+          type: boolean
+        appointments:
+          type: array
+          items:
+            $ref: '#/components/schemas/PhoneCalendarAppointment'
+      additionalProperties: false
+
+    PhoneCalendarRange:
+      description: The half-open UTC range that was queried, echoed back verbatim.
+      type: object
+      required: [from, to]
+      properties:
+        from:
+          type: string
+          format: date-time
+        to:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    PhoneSlot:
+      description: One grid slot. booked and max_concurrent are database facts; remaining is arithmetic over them. remaining is an ADVISORY projection of a dial-time cap onto booking time — 0042 has no per-slot capacity model and consumes the fleet cap at admit_phone_attempt, so booking reserves nothing.
+      type: object
+      required: [starts_at, ends_at, ist_start, ist_end, booked, remaining, bookable, refusals]
+      properties:
+        starts_at:
+          type: string
+          format: date-time
+        ends_at:
+          description: May fall after the IST close. The window bounds only the start, exactly as the 0042 appointment trigger does.
+          type: string
+          format: date-time
+        ist_start:
+          type: string
+        ist_end:
+          type: string
+        booked:
+          description: Live scheduled or confirmed appointments overlapping this slot. Touching intervals do not overlap.
+          type: integer
+        remaining:
+          type: integer
+        bookable:
+          description: True iff refusals is empty. Advisory, not a reservation — and when the response's occupancy_truncated is true this field is OPTIMISTIC, because booked is then only a lower bound.
+          type: boolean
+        refusals:
+          type: array
+          items:
+            type: string
+            enum: [slot_in_past, at_projected_capacity]
+      additionalProperties: false
+
+    PhoneSlotsResponse:
+      type: object
+      required: [ok, enabled, date, window, slot_seconds, max_concurrent, booked_total, occupancy_truncated, slots]
+      properties:
+        ok:
+          type: boolean
+        enabled:
+          type: boolean
+        date:
+          type: string
+        window:
+          $ref: '#/components/schemas/PhoneWindow'
+        slot_seconds:
+          description: The grid step. NOT a schema guarantee — 0042 exposes no slot length, only the 900 to 3600 second duration envelope this value is clamped into. Reported so the grid is never mistaken for a database fact.
+          type: integer
+        max_concurrent:
+          description: The fleet cap mirrored from phone_max_concurrent. Null while the feature is disabled.
+          type: integer
+          nullable: true
+        booked_total:
+          type: integer
+        occupancy_truncated:
+          description: True when the IST day held more live appointments than the projection counted. booked is then a LOWER bound and remaining an UPPER one — a silent truncation would claim more capacity than exists.
+          type: boolean
+        slots:
+          type: array
+          items:
+            $ref: '#/components/schemas/PhoneSlot'
+      additionalProperties: false
+
+    PhoneBudget:
+      description: One of the three 0042 budgets. The ceiling mirrors a CHECK constraint and is drift-tested against the migration text.
+      type: object
+      required: [used, ceiling, exhausted]
+      properties:
+        used:
+          type: integer
+        ceiling:
+          type: integer
+        exhausted:
+          type: boolean
+      additionalProperties: false
+
+    PhoneBudgets:
+      type: object
+      required: [no_answer, reconnect, provider_failure]
+      properties:
+        no_answer:
+          $ref: '#/components/schemas/PhoneBudget'
+        reconnect:
+          $ref: '#/components/schemas/PhoneBudget'
+        provider_failure:
+          description: A provider error costs the engagement its whole IST day, so exhausting this budget takes up to five IST days. See the provider_error_costs_one_ist_day residual.
+          $ref: '#/components/schemas/PhoneBudget'
+      additionalProperties: false
+
+    PhoneAttempt:
+      description: One call attempt, with every provider-bearing column ABSENT rather than redacted — the read never selects sip_call_id, room_name, participant_identity, egress_id, egress_status, lease_token or lease_owner.
+      type: object
+      required: [id, attempt_seq, epoch, kind, state, outcome_class, ist_date, prior_engagement_state, admitted_at, answered_at, classified_at, ended_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        attempt_seq:
+          type: integer
+        epoch:
+          type: integer
+        kind:
+          type: string
+          enum: [initial, no_answer_retry, reconnect, scheduled]
+        state:
+          type: string
+          enum: [admitted, ringing, answered_unclassified, human, machine, ended, abandoned]
+        outcome_class:
+          description: Null while the attempt is live. The eleven members are 0042's, and a value outside them fails the read rather than making the field vanish.
+          type: string
+          nullable: true
+          enum: [completed, disconnected, no_answer, busy, voicemail, declined, wrong_number, opt_out, provider_error, window_closed, cancelled]
+        ist_date:
+          type: string
+        prior_engagement_state:
+          type: string
+          enum: [eligible, scheduled, reconnecting]
+        admitted_at:
+          type: string
+          format: date-time
+        answered_at:
+          type: string
+          format: date-time
+          nullable: true
+        classified_at:
+          type: string
+          format: date-time
+          nullable: true
+        ended_at:
+          type: string
+          format: date-time
+          nullable: true
+      additionalProperties: false
+
+    PhoneEngagementDetail:
+      type: object
+      required: [id, state, state_reason, epoch, version, terminal, terminal_at, next_eligible_at, next_eligible_ist, last_attempt_at, created_at, updated_at, budgets]
+      properties:
+        id:
+          type: string
+          format: uuid
+        state:
+          type: string
+          enum: [pending_prereqs, eligible, scheduled, dialing, in_call, reconnecting, awaiting_retry, completed, abandoned_no_answer, opted_out, wrong_number, failed, cancelled]
+        state_reason:
+          description: A stable snake_case code from 0042, never free text.
+          type: string
+          nullable: true
+        epoch:
+          type: integer
+        version:
+          type: integer
+        terminal:
+          description: True for the six terminal states, whose rows 0042 makes immutable.
+          type: boolean
+        terminal_at:
+          type: string
+          format: date-time
+          nullable: true
+        next_eligible_at:
+          type: string
+          format: date-time
+          nullable: true
+        next_eligible_ist:
+          description: IST wall clock of next_eligible_at, WITH its calendar date (YYYY-MM-DD HH-MM). The date is not optional here — the provider-error rule defers to the next legal instant on the NEXT IST day, so a bare time would be ambiguous by exactly one day on the one field that residual is about.
+          type: string
+          nullable: true
+        last_attempt_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        budgets:
+          $ref: '#/components/schemas/PhoneBudgets'
+      additionalProperties: false
+
+    PhoneEngagementResponse:
+      type: object
+      required: [ok, enabled, engagement, candidate, appointment, attempts, attempts_truncated]
+      properties:
+        ok:
+          type: boolean
+        enabled:
+          type: boolean
+        engagement:
+          nullable: true
+          $ref: '#/components/schemas/PhoneEngagementDetail'
+        candidate:
+          nullable: true
+          $ref: '#/components/schemas/PhoneCandidateRef'
+        appointment:
+          description: The single live scheduled or confirmed appointment, or null.
+          nullable: true
+          $ref: '#/components/schemas/PhoneAppointment'
+        attempts:
+          type: array
+          items:
+            $ref: '#/components/schemas/PhoneAttempt'
+        attempts_truncated:
+          type: boolean
+      additionalProperties: false
+
+    PhoneAdmissionState:
+      description: The 0042 kill switch. A MISSING control singleton reads as halted with reason halt_unreadable — inventing a cleared row would turn a fail-closed stop into a go.
+      type: object
+      required: [control_present, halted, halt_reason]
+      properties:
+        control_present:
+          type: boolean
+        halted:
+          type: boolean
+        halt_reason:
+          type: string
+          nullable: true
+      additionalProperties: false
+
+    PhoneConcurrencyState:
+      description: Fleet concurrency. live counts attempts in a live state; live_with_unexpired_lease additionally requires an unexpired lease, and a gap between the two means slots are held by attempts no worker is heartbeating.
+      type: object
+      required: [live, live_with_unexpired_lease, max_concurrent, oldest_live_age_seconds]
+      properties:
+        live:
+          type: integer
+        live_with_unexpired_lease:
+          type: integer
+        max_concurrent:
+          type: integer
+        oldest_live_age_seconds:
+          type: integer
+      additionalProperties: false
+
+    PhoneAppointmentCounts:
+      type: object
+      required: [live, overdue]
+      properties:
+        live:
+          type: integer
+        overdue:
+          description: Live appointments whose start has passed. Nothing in this phase calls the expiry sweep, so this is the honest signal that the status column has not caught up.
+          type: integer
+      additionalProperties: false
+
+    PhoneIngressCounts:
+      description: The five ingress verdicts of the last 24 hours, deliberately kept SPLIT. Collapsing them would hide the difference between a stale epoch, which is fencing working as designed, and an unknown attempt, which is an ingress describing a call we have no record of.
+      type: object
+      required: [ignored_last_24h, unknown_attempt_last_24h, stale_epoch_last_24h, terminal_last_24h, unexpected_event_last_24h]
+      properties:
+        ignored_last_24h:
+          type: integer
+        unknown_attempt_last_24h:
+          type: integer
+        stale_epoch_last_24h:
+          type: integer
+        terminal_last_24h:
+          type: integer
+        unexpected_event_last_24h:
+          type: integer
+      additionalProperties: false
+
+    PhoneConfigState:
+      description: Booleans, a mode and a COUNT. Never the dial allowlist contents, which are digests of specific people's numbers.
+      type: object
+      required: [screeningEnabled, runtimeEnabled, runtimeActive, dialMode, dialAllowlistSize, liveDialPermitted]
+      properties:
+        screeningEnabled:
+          type: boolean
+        runtimeEnabled:
+          type: boolean
+        runtimeActive:
+          type: boolean
+        dialMode:
+          type: string
+          enum: [off, synthetic, live]
+        dialAllowlistSize:
+          type: integer
+        liveDialPermitted:
+          type: boolean
+      additionalProperties: false
+
+    PhoneHealthWindow:
+      type: object
+      required: [time_zone, open_ist, close_ist, open_now, ist_date]
+      properties:
+        time_zone:
+          type: string
+        open_ist:
+          type: string
+        close_ist:
+          type: string
+        open_now:
+          description: Null when the backlog could not be read. A false would claim the window is shut, which is a different answer.
+          type: boolean
+          nullable: true
+        ist_date:
+          type: string
+          nullable: true
+      additionalProperties: false
+
+    PhoneResidual:
+      description: One P1 substrate residual, each drift-tested against migration 0042. A null writer means NOTHING in 0042 writes the fact, which is the whole point of the entry.
+      type: object
+      required: [code, writer, appointment_status, owner]
+      properties:
+        code:
+          type: string
+          enum: [appointment_confirmed_has_no_writer, appointment_fulfilled_written_by_admission, appointment_missed_written_by_expiry_sweep, provider_error_costs_one_ist_day]
+        writer:
+          type: string
+          nullable: true
+        appointment_status:
+          type: string
+          nullable: true
+        owner:
+          type: string
+      additionalProperties: false
+
+    PhoneHealthResponse:
+      description: Always 200. Degradation is reported in the body. Every count block is NULL rather than zero when the backlog cannot be read, because we could not read it and there is none are different answers and only one of them means everything is fine.
+      type: object
+      required: [ok, enabled, status, reasons, config, window, admission, concurrency, engagements_by_state, appointments, ingress, backlog_unavailable, residuals]
+      properties:
+        ok:
+          type: boolean
+        enabled:
+          type: boolean
+        status:
+          type: string
+          enum: [ok, degraded, disabled]
+        reasons:
+          description: Stable codes only — phone_screening_disabled, backlog_unavailable, halt_unreadable, admission_halted, attempt_leases_expired, fleet_at_capacity, appointments_overdue.
+          type: array
+          items:
+            type: string
+        config:
+          $ref: '#/components/schemas/PhoneConfigState'
+        window:
+          $ref: '#/components/schemas/PhoneHealthWindow'
+        admission:
+          nullable: true
+          $ref: '#/components/schemas/PhoneAdmissionState'
+        concurrency:
+          nullable: true
+          $ref: '#/components/schemas/PhoneConcurrencyState'
+        engagements_by_state:
+          description: Counts keyed by engagement state. Null when the backlog could not be read.
+          type: object
+          nullable: true
+          additionalProperties: true
+        appointments:
+          nullable: true
+          $ref: '#/components/schemas/PhoneAppointmentCounts'
+        ingress:
+          nullable: true
+          $ref: '#/components/schemas/PhoneIngressCounts'
+        backlog_unavailable:
+          type: boolean
+        residuals:
+          type: array
+          items:
+            $ref: '#/components/schemas/PhoneResidual'
+      additionalProperties: false
+
+    PhoneAppointmentCreateBody:
+      description: source is deliberately absent. Every appointment this API books is hr_manual by definition, and because the schema is strict a client that sends source is refused rather than silently overridden.
+      type: object
+      required: [engagement_id, starts_at, ends_at]
+      properties:
+        engagement_id:
+          type: string
+          format: uuid
+        starts_at:
+          description: UTC ISO-8601 with a literal Z. An offset or a naive datetime is refused.
+          type: string
+          format: date-time
+        ends_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    PhoneAppointmentPatchBody:
+      type: object
+      required: [starts_at, ends_at, version]
+      properties:
+        starts_at:
+          type: string
+          format: date-time
+        ends_at:
+          type: string
+          format: date-time
+        version:
+          description: REQUIRED. schedule_phone_appointment treats a null expected version as there must be no live appointment, so an optional version would turn every reschedule into a refusal.
+          type: integer
+      additionalProperties: false
+
+    PhoneAppointmentCancelBody:
+      type: object
+      required: [reason, version]
+      properties:
+        reason:
+          description: The 0042 cancel vocabulary NARROWED to the reasons an operator may give. superseded and system_deferral_expired are written only by the substrate.
+          type: string
+          enum: [candidate_request, hr_cancelled, emergency_stop, engagement_cancelled]
+        version:
+          type: integer
+      additionalProperties: false
+
+    PhoneHaltBody:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          enum: [operator_pause, provider_incident, cost_control, legal_hold, emergency_stop]
+      additionalProperties: false
+
+    PhoneHaltClearBody:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          description: Must NAME the halt currently in force, verified against the control row before anything is cleared.
+          type: string
+          enum: [operator_pause, provider_incident, cost_control, legal_hold, emergency_stop]
+      additionalProperties: false
+
+    PhoneAppointmentWriteResponse:
+      type: object
+      required: [ok, appointment_id, version, engagement_state, prereqs_pending, superseded_appointment_id]
+      properties:
+        ok:
+          type: boolean
+        appointment_id:
+          type: string
+          format: uuid
+          nullable: true
+        version:
+          type: integer
+          nullable: true
+        engagement_state:
+          type: string
+          nullable: true
+        prereqs_pending:
+          description: True on the ok_prereqs_pending answer. The slot is real and HR can see it, but the engagement's prerequisites are unmet so nothing will dial it. Collapsing this into ok would let an operator believe a call is going to happen at that time.
+          type: boolean
+        superseded_appointment_id:
+          description: Returned VERBATIM from the RPC, never echoed back from the path. If a concurrent write changed which appointment was live, this says which row was actually superseded.
+          type: string
+          format: uuid
+          nullable: true
+      additionalProperties: false
+
+    PhoneCancelResponse:
+      type: object
+      required: [ok, appointment_id, version, already_cancelled]
+      properties:
+        ok:
+          type: boolean
+        appointment_id:
+          type: string
+          format: uuid
+        version:
+          type: integer
+          nullable: true
+        already_cancelled:
+          description: Idempotent success, not a conflict — reporting 409 would make a retry after a dropped response look like a failure.
+          type: boolean
+      additionalProperties: false
+
+    PhoneHaltResponse:
+      type: object
+      required: [ok, halted, already_halted, reason]
+      properties:
+        ok:
+          type: boolean
+        halted:
+          type: boolean
+        already_halted:
+          description: True when a halt was ALREADY in force. 0042 preserves the original instant, reason and actor across repeated halts.
+          type: boolean
+        reason:
+          type: string
+      additionalProperties: false
+
+    PhoneHaltClearResponse:
+      type: object
+      required: [ok, halted, was_halted, previous_reason]
+      properties:
+        ok:
+          type: boolean
+        halted:
+          type: boolean
+        was_halted:
+          type: boolean
+        previous_reason:
+          type: string
+          nullable: true
       additionalProperties: false

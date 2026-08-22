@@ -109,6 +109,7 @@ export {
 export {
   PHONE_RPC_NAMES,
   PHONE_RPC_PARAMETERS,
+  PHONE_RPC_RESULT_KEYS,
   PHONE_RPC_STATUSES,
   PHONE_RPC_STATUS_COUNT,
   PHONE_RPC_STATUS_UNION,
@@ -167,3 +168,32 @@ export {
   type PhoneAdmissionResult,
   type PhoneDeferralCode,
 } from './admission.js';
+
+export type {
+  PhoneAppointmentRow,
+  PhoneAttemptRow,
+  PhoneCandidateRow,
+  PhoneEngagementRow,
+  PhoneReadStore,
+} from './read-ports.js';
+
+export { createPhoneReadStore, boundedRowLimit, PHONE_READ_MAX_ROWS } from './read-stores.js';
+
+export {
+  PHONE_SLOT_REFUSALS,
+  buildPhoneSlotGrid,
+  istDayInstantRange,
+  parseIstCalendarDate,
+  type IstCalendarDate,
+  type PhoneSlot,
+  type PhoneSlotGridInput,
+  type PhoneSlotOccupancy,
+  type PhoneSlotRefusal,
+} from './slots.js';
+
+export {
+  PHONE_RESIDUAL_CODES,
+  PHONE_SUBSTRATE_RESIDUALS,
+  type PhoneResidualCode,
+  type PhoneSubstrateResidual,
+} from './residuals.js';

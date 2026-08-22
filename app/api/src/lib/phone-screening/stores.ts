@@ -288,7 +288,16 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
           'engagement_state',
           PHONE_ENGAGEMENT_STATES,
         ),
-        supersededAppointmentId: str(row, 'superseded_appointment_id') ?? null,
+        // `null` and "absent" are DIFFERENT answers, exactly as they are for
+        // `ignored_reason` above. The API classifies a reschedule that
+        // superseded NOTHING as a lost update and cancels the row it just
+        // created, so collapsing a renamed or missing key into `null` would
+        // turn a contract break into silent slot destruction on every
+        // legitimate reschedule.
+        supersededAppointmentId:
+          row && 'superseded_appointment_id' in row
+            ? (str(row, 'superseded_appointment_id') ?? null)
+            : undefined,
       };
     },
 
