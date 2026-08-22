@@ -98,6 +98,14 @@ export function MissionControlPage() {
         destination grants nothing that was not already reachable — and the
         API behind it stays authoritative regardless.
 
+        PALETTE: every colour utility here must resolve to a key in
+        `tailwind.config.js`. The ink scale's BASE is `ink` (`var(--ink)`) —
+        there is no `ink-primary`, and Tailwind emits nothing for an unknown
+        key without erroring, so a typo compiles to a silently colourless
+        class. The focus ring uses `ring-brand-500`, the token the other 11
+        focus rings in this app already use. A test below pins that every
+        colour token in this card exists in the theme.
+
         ICON: the repository carries no Ashby brand asset (`public/icons.svg`
         holds unused social glyphs only), and fetching one would be an
         unlicensed third-party mark. So the treatment is a neutral, decorative
@@ -107,7 +115,7 @@ export function MissionControlPage() {
       */}
       <Link
         to="/ashby-mission-control"
-        className="mb-6 flex items-center gap-4 rounded-xl border border-line bg-surface p-5 shadow-card transition-colors hover:border-ink-tertiary focus:outline-none focus-visible:ring-2 focus-visible:ring-ink-primary sm:mb-8 sm:p-6"
+        className="mb-6 flex items-center gap-4 rounded-xl border border-line bg-surface p-5 shadow-card transition-colors hover:border-ink-tertiary focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 sm:mb-8 sm:p-6"
       >
         <span
           aria-hidden="true"
@@ -116,7 +124,7 @@ export function MissionControlPage() {
           AS
         </span>
         <span className="min-w-0">
-          <span className="block text-sm font-medium text-ink-primary">
+          <span className="block text-sm font-medium text-ink">
             Ashby Mission Control
           </span>
           <span className="mt-0.5 block text-xs text-ink-tertiary">

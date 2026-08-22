@@ -9,6 +9,8 @@
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { ReactNode } from 'react';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { MemoryRouter } from 'react-router-dom';
 import { ThemeProvider } from '../lib/theme';
 import { missionApi, apiFns } from '../components/mission-control/__tests__/apiMock';
@@ -265,6 +267,72 @@ describe('Ashby Mission Control navigation card', () => {
     for (const label of ['Overview', 'Access', 'Sessions', 'Quotas', 'Audit', 'Maintenance']) {
       expect(screen.getByRole('tab', { name: label })).toBeInTheDocument();
     }
+  });
+
+  it('uses only colour tokens that exist in the Tailwind theme', async () => {
+    // Nothing else in this repo can catch a dead Tailwind class on this page:
+    // the candidate palette guard is correctly scoped away from Mission
+    // Control, Tailwind drops an unknown colour key WITHOUT erroring, neither
+    // tsc nor the linter can see inside a class string, and axe cannot compute
+    // colour under jsdom. So an `ink-primary` typo shipped a focus ring with no
+    // colour of its own, falling back to Tailwind's default light blue — on the
+    // most accessibility-relevant state of a brand-new control.
+    //
+    // This resolves every colour utility on the card against the real theme.
+    // `__dirname` + resolve, matching the repo's existing palette guard.
+    const config = readFileSync(resolve(__dirname, '../../tailwind.config.js'), 'utf8');
+
+    // The colour FAMILIES the theme defines, and the full token names.
+    const colorsBlock = config.slice(config.indexOf('colors:'));
+    const tokens = new Set<string>();
+    const families = new Set<string>();
+    for (const m of colorsBlock.matchAll(/^\s+'?([a-z][a-z0-9-]*)'?:\s*(['"]|\{)/gm)) {
+      const key = m[1];
+      if (key === 'colors') continue;
+      tokens.add(key);
+      families.add(key.split('-')[0]);
+    }
+    // Nested numeric scales (brand-500, accent-500, …).
+    for (const fam of ['brand', 'accent']) {
+      for (const n of [50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 950]) {
+        tokens.add(`${fam}-${n}`);
+      }
+    }
+    // Sanity: the extraction actually found the theme, so a silent parse
+    // failure cannot turn this test into a no-op that passes on anything.
+    expect(tokens.has('ink')).toBe(true);
+    expect(tokens.has('brand-500')).toBe(true);
+    expect(tokens.has('ink-primary')).toBe(false);   // the class that broke
+
+    renderAdmin();
+    const link = await findCard();
+    const classNames = [link, ...Array.from(link.querySelectorAll('*'))]
+      .flatMap((el) => Array.from(el.classList));
+
+    const offenders: string[] = [];
+    for (const cls of classNames) {
+      // Strip any variant prefix (hover:, focus-visible:, sm:, …).
+      const bare = cls.slice(cls.lastIndexOf(':') + 1);
+      const m = /^(?:text|bg|border|ring|from|via|to|fill|stroke|divide|outline|shadow)-(.+)$/.exec(bare);
+      if (!m) continue;
+      const token = m[1];
+      // Only judge tokens whose ROOT is a theme colour family — this skips
+      // `text-sm`, `border-2`, `shadow-card` and other non-colour utilities.
+      if (!families.has(token.split('-')[0])) continue;
+      if (!tokens.has(token)) offenders.push(cls);
+    }
+
+    expect(offenders, `unresolvable colour classes: ${offenders.join(', ')}`).toEqual([]);
+  });
+
+  it('gives the focus ring a real colour, matching its siblings', async () => {
+    renderAdmin();
+    const link = await findCard();
+
+    // A ring width with no ring colour renders in Tailwind's default blue.
+    expect(link.className).toContain('focus-visible:ring-2');
+    expect(link.className).toContain('focus-visible:ring-brand-500');
+    expect(link.className).not.toContain('ink-primary');
   });
 
   it('is NOT shown to a non-admin, who still sees the truthful gate', async () => {
