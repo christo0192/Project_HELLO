@@ -95,8 +95,15 @@ export function buildPhoneRoomMetadata(
  * dispatched. A dispatch is minted per attempt, so this is the one place a
  * per-attempt fact can live truthfully.
  *
- * Three closed keys, none derived from a phone number. `attempt_id` is a uuid,
- * so it carries no digit run 0042's metadata sanitizer would reject.
+ * Three closed keys, none derived from a phone number.
+ *
+ * Deliberately NOT claiming this satisfies 0042's metadata sanitizer. That rule
+ * governs `phone_call_events.metadata`, a different surface this payload never
+ * reaches — and the claim would be false on its own terms anyway: a uuid
+ * segment is eight hex characters and may legitimately be all digits
+ * (`11111111-…`), which the 7+ digit-run rule would reject. What holds here is
+ * the property that actually matters: the key set is closed and every value is
+ * an opaque id, so there is no field through which a number could arrive.
  */
 export function buildPhoneDispatchMetadata(
   sessionId: string,

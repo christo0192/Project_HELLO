@@ -27,8 +27,14 @@
  * reconnect after it is `supplementary`. The role is decided by reading what
  * already exists, but it is ENFORCED by a partial unique index — so two
  * concurrent reconnects cannot both win the read and both claim authoritative.
- * The loser gets `authoritative_exists` and retries as supplementary rather
- * than silently overwriting.
+ * The loser gets `authoritative_exists` and RECORDS NOTHING on that pass.
+ *
+ * Note what that is and is not. It does NOT retry as supplementary — there is
+ * no re-attach here, and a reader who assumed otherwise would believe reconnect
+ * audio is always captured when it may not be. It is a safe outcome (no audio
+ * without a binding, which is the direction that never loses data) but it is a
+ * real limitation, so it is stated as one. Capturing the loser's audio would
+ * need a one-shot re-attach as `supplementary`, which this phase does not add.
  */
 
 import {
