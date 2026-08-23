@@ -180,6 +180,22 @@ once scoring lands succeeds.
   snapshot, because the plan is session-scoped. That is intended — a new session
   is a new conversation — but it means "the plan is immutable" is a per-session
   guarantee, not a per-engagement one.
+- **`session_already_bound` is a SCHEDULER bug, not a candidate problem.** Once
+  an engagement carries a `session_id`, `start_phone_assessment` refuses any
+  other session for it, permanently. That is deliberate — `0042` is explicit
+  that one session spans every reconnect attempt and they must share a
+  transcript, so rebinding would orphan the first leg's turns and point the
+  completion interlock at the wrong session. But it means a future scheduler
+  that mints a NEW `call_sessions` row per dial attempt would make every attempt
+  after the first fail to start. It fails LOUDLY (the leg ends
+  `assessment_aborted`, i.e. terminal `failed`) rather than silently, and the
+  fix is in the caller: reuse the engagement's session.
+- **The resume replays the exchange into the PROMPT, not into a `ChatContext`.**
+  `phone.render_resume_context` renders the persisted turns into the system
+  instructions, bounded to the last 24 turns and 600 characters each. This is
+  SDK-independent and testable, where reconstructing a `ChatContext` is neither.
+  The model is never asked to work out from that transcript which questions
+  remain — that comes from the cursor.
 
 ---
 

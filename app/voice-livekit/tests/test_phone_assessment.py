@@ -458,6 +458,65 @@ class TestDefaultPlanDrift(unittest.TestCase):
                 self.assertRegex(key, r"^[A-Za-z0-9_.:-]{1,100}$")
 
 
+# ── Rehydration ───────────────────────────────────────────────────────
+
+class TestResumeContext(unittest.TestCase):
+    """The persisted exchange is replayed into the prompt, and BOUNDED.
+
+    A reconnecting leg's model must be able to refer to what the candidate
+    already said. It must NOT be asked to work out from that transcript which
+    questions remain — that comes from the cursor, and inferring question
+    identity from prose is the failure this phase exists to prevent.
+    """
+
+    def test_no_turns_renders_nothing_at_all(self):
+        self.assertEqual(phone.render_resume_context([]), "")
+        # …and turns with no usable text do not produce a header on their own.
+        self.assertEqual(
+            phone.render_resume_context([{"speaker": "bot", "text": "   "}]), ""
+        )
+
+    def test_the_exchange_is_replayed_with_both_speakers_labelled(self):
+        rendered = phone.render_resume_context([
+            {"speaker": "bot", "text": "How many years?"},
+            {"speaker": "candidate", "text": "About four."},
+        ])
+        self.assertIn("You: How many years?", rendered)
+        self.assertIn("Candidate: About four.", rendered)
+        self.assertIn("do NOT ask these again", rendered)
+
+    def test_it_never_names_a_plan_key_or_a_cursor(self):
+        """The prompt must not become a second, prose-shaped source of
+        question identity."""
+        rendered = phone.render_resume_context([
+            {"speaker": "bot", "text": "How many years?"},
+            {"speaker": "candidate", "text": "Four."},
+        ])
+        for forbidden in ("key", "cursor", "question_index", "k1", "default_"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, rendered)
+
+    def test_it_is_bounded_in_BOTH_directions(self):
+        """A long screening must not grow the prompt without limit on every
+        leg, and one enormous answer must not swallow the instructions."""
+        turns = [
+            {"speaker": "bot" if i % 2 == 0 else "candidate", "text": f"turn {i}"}
+            for i in range(200)
+        ]
+        rendered = phone.render_resume_context(turns)
+        self.assertNotIn("turn 0", rendered)
+        self.assertIn("turn 199", rendered)
+        self.assertLessEqual(
+            len(rendered.splitlines()), phone.RESUME_MAX_TURNS + 2
+        )
+
+        long_turn = phone.render_resume_context([
+            {"speaker": "candidate", "text": "x" * 5000},
+        ])
+        self.assertLess(len(long_turn), phone.RESUME_MAX_CHARS + 400)
+        self.assertIn("...", long_turn)
+
+
 # ── Nothing dialable crosses this boundary ────────────────────────────
 
 class TestNoNumberInAssessmentSurface(unittest.TestCase):

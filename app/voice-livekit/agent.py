@@ -791,6 +791,13 @@ def _apply_phone_instructions(agent: Any, state: "phone.PhoneAssessmentState") -
     which question was covered is decided by the call site and committed with
     the key — never read back out of prose.
 
+    A RESUMING leg also gets the persisted exchange replayed into the prompt,
+    bounded by `phone.render_resume_context`, so the model can refer to what the
+    candidate already said instead of starting the conversation over. It is
+    never asked to work out from that transcript which questions REMAIN — that
+    comes from the cursor, and inferring question identity from prose is the
+    failure this whole phase exists to prevent.
+
     Best effort by design. If the SDK's Agent has no writable `instructions`,
     the screening still runs on the base prompt and every boundary is still
     keyed and committed correctly; the questions are simply less tailored.
@@ -807,6 +814,9 @@ def _apply_phone_instructions(agent: Any, state: "phone.PhoneAssessmentState") -
             resume_facts=None,
             questions=flow,
         )
+        resume = phone.render_resume_context(state.turns)
+        if resume:
+            text = f"{text}\n\n{resume}"
         setattr(agent, "instructions", text)
     except Exception:  # noqa: BLE001
         _log.warn(

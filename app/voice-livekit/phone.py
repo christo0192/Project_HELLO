@@ -823,6 +823,48 @@ def valid_boundary_turns(turns: Any) -> bool:
     return turns[-1].get("speaker") == "candidate"
 
 
+# The rehydration bound. A reconnect's prior exchange is replayed into the
+# prompt so the model can refer to what the candidate already said — but it is
+# BOUNDED, because a long screening's transcript would otherwise grow the system
+# prompt on every leg and eventually crowd out the instructions themselves.
+RESUME_MAX_TURNS = 24
+RESUME_MAX_CHARS = 600
+
+
+def render_resume_context(turns: list[dict[str, str]]) -> str:
+    """Render the persisted exchange for the prompt, or "" when there is none.
+
+    This is how a reconnecting leg's model learns what was already said. It is
+    deliberately NOT how the leg learns what to ask NEXT — that comes from the
+    cursor, and a model reading this transcript is never asked to work out
+    which questions remain. The two are separate on purpose: prose is what has
+    no identity, and inferring identity from it is the failure this phase
+    exists to prevent.
+
+    Only the most recent turns are kept, and each is clipped, so the prompt has
+    a bound no conversation length can breach.
+    """
+    if not turns:
+        return ""
+    recent = turns[-RESUME_MAX_TURNS:]
+    lines = ["EARLIER IN THIS CALL (before the line dropped) — do NOT ask these again:"]
+    for turn in recent:
+        speaker = "You" if turn.get("speaker") == "bot" else "Candidate"
+        text = str(turn.get("text") or "").strip()
+        if not text:
+            continue
+        if len(text) > RESUME_MAX_CHARS:
+            text = text[:RESUME_MAX_CHARS] + "..."
+        lines.append(f"{speaker}: {text}")
+    if len(lines) == 1:
+        return ""
+    lines.append(
+        "Pick up naturally from there. Acknowledge briefly that you were "
+        "disconnected; do not re-run the whole conversation."
+    )
+    return "\n".join(lines)
+
+
 class PhoneAssessmentResult:
     """The verdict of one leg's assessment run.
 
