@@ -254,6 +254,7 @@ function projectAssessmentState(
     completedKeys,
     turns: Array.isArray(rawTurns) ? turns : undefined,
     assessmentExists: bool(row, 'assessment_exists'),
+    alreadyScored: bool(row, 'already_scored'),
     planComplete: bool(row, 'plan_complete'),
   };
 }

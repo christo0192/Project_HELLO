@@ -123,16 +123,45 @@ line. After the attempts are exhausted, an answer we understand aborts
 truthfully; one we cannot parse is a **halt**, because we do not know whether it
 scored and a terminal event either way would be a claim we cannot support.
 
-**A REFUSED START IS NOT PROOF THAT NOTHING HAPPENED.** `session_not_active` is
-exactly what an already-`completed` session presents — which is the state a
-scored-but-unacknowledged screening is in. So a leg whose start is refused that
-way asks the completion endpoint **first**: it is idempotent by construction and
-answers `scored` when the row is there. Aborting blind would drive the engagement
-to terminal `failed` over a screening that exists and is scored, and terminal is
-unrecoverable — `apply_phone_event` short-circuits every later post with
-`ignored: terminal`. Recovery is not a way to claim a completion nobody earned:
-the ROW still decides, and a completion endpoint that says otherwise still
-aborts.
+**A REFUSED START IS NOT PROOF THAT NOTHING HAPPENED**, and there are two rungs
+to that, because there are two different states behind one refusal.
+
+`start_phone_assessment` answers **`already_scored`** when the session is
+`completed` **and** a phone-sourced assessment row exists — a *scored* screening
+whose acknowledgement was lost. It is deliberately DISTINCT from
+`session_not_active`, because the two demand opposite actions: one means "you
+cannot screen", the other means "the screening is finished, go and say so".
+Collapsed together, the engagement can never reach `completed` from any leg — it
+rests non-terminal until a budget or a sweeper ends it, or goes `failed` for an
+untruthful reason.
+
+On `already_scored` the worker posts `assessment.completed` **directly**: no
+completion call, no inference, no second writeback, no question re-asked. The
+post is idempotent by `0042`'s deterministic internal event id, and `0044`'s
+interlock accepts it precisely because the row the RPC just found is there.
+
+On `session_not_active` — completed but **not** scored — the worker asks the
+completion endpoint, which may still be able to finish the job. Either way the
+ROW decides, and an endpoint that says otherwise still aborts.
+
+`already_scored` is decided **after** the binding checks, so it can only ever
+describe a session that named this exact phone room and belongs to this
+engagement's candidate. It carries no plan and no cursor: there is nothing left
+to screen, and handing one back would invite a leg to re-ask answered questions.
+
+> **The two halves of this are NOT interchangeable.** An earlier draft of this
+> runbook said the transport-class retry and the adoption path each closed the
+> gap on their own. That was wrong, and an independent pass corrected it: the
+> **adoption path is load-bearing** and closes it unconditionally, while the
+> retry only closes it when the API comes back inside the ~3-second retry
+> window. The retry is still worth having — it saves a redial on the common
+> short blip, which is a real anti-harassment win — but it is an optimisation.
+> Do not remove the adoption path as redundant.
+
+Note also that the `session_not_active` rung can *cause* scoring rather than
+merely observe it: a session completed but never scored gets a genuine inference
+from the recovery leg, and then legitimately completes. That recovers a case the
+abort-after-retries residual otherwise gives up on.
 
 ---
 
@@ -228,6 +257,17 @@ once scoring lands succeeds.
   forbids skipping *mandatory* keys) and it is the safe direction, but a role
   whose template contains a question that genuinely does not apply will still
   have it asked. Relaxing this needs its own migration and its own review.
+- **A recovery leg dials the candidate and reads the full disclosure.**
+  `start_phone_assessment` requires `in_call`, which requires
+  `disclosure.delivered` — P4's decision #1, deliberately not undone — so an
+  adoption or recovery leg must place a real call and read the recording notice
+  before it can adopt. It then speaks the closing line and hangs up. Two
+  consequences, both recorded as choices rather than oversights: the candidate is
+  disturbed once more for a screening that is already finished, and the leg
+  leaves a **disclosure-only recording stub**, because `assessment.completed` is
+  not in `PURGE_BEFORE_EVENTS` and the stub is retained under normal retention.
+  Neither is new — the pre-adoption refused-start path did the same — but
+  adoption turns this from an error path into a designed success path.
 - **A scoring failure the API can NAME is still terminal.** After three bounded
   attempts, an answer we understand (`scoring_failed`) ends the call with
   `assessment.aborted`, i.e. terminal `failed`. The transcript is durable and
@@ -321,7 +361,7 @@ Kill switch at any point: `POST /api/phone/halt`.
 
 ## 9. The mutation controls, and how to re-run them
 
-Thirty-one controls. Same contract as `phone-safe-dialer.md` §11: every guard
+Thirty-six controls, two of them superseded and marked as such. Same contract as `phone-safe-dialer.md` §11: every guard
 below was deliberately broken, the suite run, the failure recorded, then reverted and re-run green.
 **If deleting a guard leaves its suite green, the guard is decorative.**
 
@@ -346,9 +386,9 @@ Re-run them by hand, on a **clean** tree, one at a time.
 | P4 | Skip `valid_boundary_turns` and commit whatever was captured | Python suite | 2 fail |
 | P5 | Post a terminal event on the halted path | Python suite | 2 fail |
 | M10 | Move the whole shape-validation block after the duplicate read-back | `policy_tests.sql` | 1 fail |
-| M11 | Return `null` for `started_at` from the state RPC | `policy_tests.sql` | 1 fail |
+| ~~M11~~ | ~~Return `null` for `started_at` from the state RPC~~ | — | **SUPERSEDED by M18** — the RPC no longer emits `started_at`, so applying M11 as written is a no-op and comes back GREEN |
 | M12 | Return on a scoring throw instead of running the verifying read | `phone-assessment-route` | 1 fail |
-| M13 | Hardcode `durationSec: 0` again | `phone-assessment-route` | 2 fail |
+| ~~M13~~ | ~~Hardcode `durationSec: 0` again~~ | — | **SUPERSEDED by M17** — `elapsedSeconds` and the whole `durationSec` plumbing are gone, and the two tests M13 reddened were deleted |
 | M14 | Drop `{ source: 'phone' }` from the default `scoreSession` | `phone-assessment-route` | 1 fail |
 | M15 | Trust the caller's `source` instead of deriving it | `phone-assessment-idempotency` | 3 fail |
 | P6 | Put the conversational halts back into `RETRYABLE_HALTS` | Python suite | 2 fail |
@@ -362,6 +402,13 @@ Re-run them by hand, on a **clean** tree, one at a time.
 | P11 | Key the completion retry on `status` only, skipping the transport class | Python suite | 7 fail |
 | P12 | Abort blind on a refused start instead of asking the completion endpoint | Python suite | 2 fail |
 | P13 | Let the recovery claim a completion the endpoint did not confirm | Python suite | 2 fail |
+| M19 | Collapse `already_scored` back into `session_not_active` | `policy_tests.sql` | 1 fail |
+| M20 | Stop naming `already_scored` in the state RPC | `policy_tests.sql` | 1 fail |
+| M21 | Remove the candidate binding check that must precede `already_scored` | `policy_tests.sql` | 2 fail |
+| M22 | Remove the adoption short-circuit in `/assessment/complete` | `phone-assessment-route` | 2 fail |
+| M23 | Drop `already_scored` from the sanitized projection | `phone-assessment-route` | 1 fail |
+| P14 | Make the agent ignore `already_scored` | Python suite | 1 fail |
+| P15 | Treat deterministic auth/config faults as retryable again | Python suite | 3 fail |
 
 `M2` is the one worth keeping: a plpgsql `exception` block opens a
 subtransaction, so the "one transaction" claim is broken by an edit that looks
@@ -378,6 +425,12 @@ always there and only started firing when the suite grew enough to shift which
 files share a worker. The assertions are now scoped to the directories the test
 itself created, and `M16` — deleting the scanner's own `rm` — proves the scoped
 version still catches a real leak.
+
+**M11 and M13 are struck through rather than deleted**, and that matters more
+here than it normally would: this section's own contract is *"if deleting a guard
+leaves its suite green, the guard is decorative."* An operator re-running a stale
+control gets green and draws exactly the wrong conclusion. A superseded control
+must say so, and name the row that replaced it.
 
 `P10` earned its place the hard way. When first written it stayed **green** —
 the gate-copy filter had no test that could fail, because the test double's

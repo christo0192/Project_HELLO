@@ -477,10 +477,27 @@ class TestRetryClassifier(unittest.TestCase):
                 self.assertTrue(phone.retryable_completion(self._answer(status)))
 
     def test_a_TRANSPORT_failure_is_retried_even_though_it_carries_no_status(self):
-        for category in ("transport", "business_error", "malformed_response",
-                         "configuration"):
+        for category in ("transport", "malformed_response"):
             with self.subTest(category=category):
                 self.assertTrue(
+                    phone.retryable_completion(self._answer(None, category))
+                )
+
+    def test_a_DETERMINISTIC_fault_is_NOT_retried(self):
+        """`configuration` and `business_error` are states we DO know.
+
+        The worker secret is missing, or the API answered 401/403/400. Three
+        attempts change nothing — and the caller then treats the exhausted
+        result as "we do not know whether it scored" and posts nothing, which
+        lets the webhook grant and CHARGE a reconnect. Rotating
+        `WORKER_CONTEXT_SECRET` on the API before the worker would 403 every
+        completion in flight and redial each of those candidates up to three
+        times: the same failure as laundering a quiet candidate into a line
+        drop, arriving through the auth door.
+        """
+        for category in ("configuration", "business_error", "event_not_allowed"):
+            with self.subTest(category=category):
+                self.assertFalse(
                     phone.retryable_completion(self._answer(None, category))
                 )
 

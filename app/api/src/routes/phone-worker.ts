@@ -279,6 +279,7 @@ export function sanitizeAssessmentState(state: PhoneAssessmentState): Record<str
       text: t.text,
     })),
     assessment_exists: state.assessmentExists === true,
+    already_scored: state.alreadyScored === true,
   };
 }
 
@@ -552,6 +553,13 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
         // Every refusal is forwarded with its own stable code so the worker can
         // tell "the disclosure was never delivered" from "this session is not
         // yours". None of them is an error the worker should retry blindly.
+        //
+        // `already_scored` is the one that is not really a refusal at all: it
+        // says the screening is FINISHED and its acknowledgement was lost. The
+        // worker's only legitimate action on it is to post
+        // `assessment.completed` — which 0044 accepts precisely because the
+        // row the RPC just found is there. It is forwarded verbatim, like the
+        // rest; this route decides nothing the database has already decided.
         return res.json({ ok: false, status: state.status });
       }
       return res.json({ ok: true, status: 'ok', ...sanitizeAssessmentState(state) });
@@ -622,6 +630,22 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       if (before.status !== 'ok') {
         return res.json({ ok: false, status: before.status });
       }
+      // ── ALREADY SCORED: ADOPT, NEVER RE-SCORE ─────────────────────
+      // The row is already there, so there is nothing to compute and nothing
+      // to write. Short-circuiting here is not an optimisation: it is what
+      // makes "no rescore, no duplicate writeback" STRUCTURAL rather than a
+      // property of how `runAssessment` happens to behave on a second call.
+      // Falling through would reach the scorer, which would adopt the same
+      // row — correct today, and one refactor away from not being.
+      //
+      // It sits ABOVE the plan-completeness check on purpose. A scored
+      // screening is finished whatever the cursor says; refusing it
+      // `plan_incomplete` because a boundary write was lost after the score
+      // landed would strand exactly the case this branch exists for.
+      if (before.alreadyScored === true) {
+        return res.json({ ok: true, status: 'scored', adopted: true });
+      }
+
       // EVERY key, and therefore every turn that answers one, is durable
       // before anything is completed. A leg that lost a boundary write comes
       // back here with an incomplete plan and is refused.
@@ -697,7 +721,7 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
           status: scoringThrew ? 'scoring_failed' : 'assessment_missing',
         });
       }
-      return res.json({ ok: true, status: 'scored' });
+      return res.json({ ok: true, status: 'scored', adopted: false });
     } catch {
       return res.status(500).json({ ok: false, status: 'phone_assessment_error' });
     }

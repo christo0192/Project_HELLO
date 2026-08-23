@@ -5540,7 +5540,7 @@ components:
           description: True only when the assessment may proceed. A refusal is never a reason to ask a question.
         status:
           type: string
-          description: ok, or a stable refusal — disclosure_not_delivered, engagement_terminal, invalid_role_template, plan_missing, session_already_bound, session_binding_mismatch, session_candidate_mismatch, session_not_active, unknown_attempt, unknown_session, unknown_status, invalid_request, phone_assessment_error.
+          description: ok, or a stable refusal — already_scored, disclosure_not_delivered, engagement_terminal, invalid_role_template, plan_missing, session_already_bound, session_binding_mismatch, session_candidate_mismatch, session_not_active, unknown_attempt, unknown_session, unknown_status, invalid_request, phone_assessment_error. `already_scored` is the one that is not really a refusal: it means the screening is FINISHED and its acknowledgement was lost, and it is DISTINCT from session_not_active because the two demand opposite actions.
         context:
           type: object
           description: A strict SUBSET of the browser worker context. No candidate_id, no role_id, no room_name.
@@ -5597,6 +5597,9 @@ components:
             $ref: '#/components/schemas/PhoneAssessmentTurnEntry'
         assessment_exists:
           type: boolean
+        already_scored:
+          type: boolean
+          description: The session is `completed` AND a phone-sourced assessment row exists — a SCORED screening whose acknowledgement was lost. Derived in SQL rather than by each caller, because a two-part condition re-derived in three places is one remembered correctly in two of them. The only legitimate action on it is to post assessment.completed, which 0044 accepts because the row is there.
       additionalProperties: false
 
     PhoneAssessmentTurnRequest:
@@ -5685,6 +5688,9 @@ components:
         status:
           type: string
           description: scored, or a stable refusal — plan_incomplete, completion_failed, scoring_failed, assessment_missing, session_not_active, plan_missing, unknown_session, unknown_status, invalid_request, phone_assessment_error.
+        adopted:
+          type: boolean
+          description: True when the assessment row already existed and was ADOPTED rather than produced — nothing was re-scored and no second writeback occurred.
         cursor:
           type: integer
           nullable: true

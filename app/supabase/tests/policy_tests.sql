@@ -11702,6 +11702,143 @@ begin
 end;
 $$;
 
+-- ── D8: a SCORED screening whose acknowledgement was lost ────────────
+-- F-1. The completion endpoint succeeded, inserted the assessment, and its
+-- response never reached the worker. The leg that saw that halted and posted
+-- nothing, which was right. A LATER leg then calls start — and must be told
+-- the screening is FINISHED, not merely that it cannot screen. Without the
+-- distinction the engagement can never reach `completed` from any leg.
+do $$
+declare
+  v_ids uuid[]; v_res jsonb; v_role uuid; v_cand uuid; v_state jsonb;
+begin
+  v_ids := _policy_tests.phone44_fixture('pol44-adopt');
+  select role_id, candidate_id into v_role, v_cand
+    from screening_v2.phone_engagements where id = v_ids[1];
+  update screening_v2.roles
+     set screening_template = '[{"id":"k1","question":"First?"}]'::jsonb where id = v_role;
+  perform screening_v2.start_phone_assessment(
+            v_ids[2], v_ids[3], '2026-09-01T06:00:00Z'::timestamptz);
+  perform screening_v2.commit_phone_question_boundary(
+            v_ids[3], 'k1', 0, 'ev-1',
+            '[{"speaker":"bot","text":"A?"},{"speaker":"candidate","text":"Y"}]'::jsonb,
+            '2026-09-01T06:01:00Z'::timestamptz);
+
+  -- The session completes. Still UNSCORED at this point.
+  update screening_v2.call_sessions
+     set status = 'completed', terminal_reason = 'conversation_complete',
+         ended_at = '2026-09-01T06:02:00Z'::timestamptz
+   where id = v_ids[3];
+
+  v_res := screening_v2.start_phone_assessment(
+             v_ids[2], v_ids[3], '2026-09-01T06:03:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0044-D8: a completed but UNSCORED session is session_not_active, not already_scored',
+    v_res ->> 'status' = 'session_not_active',
+    'claiming a completion for a session nothing scored is the exact error 0044 exists to '
+      || 'prevent: ' || v_res::text);
+
+  v_state := screening_v2.get_phone_assessment_state(v_ids[3]);
+  perform _policy_tests.assert(
+    '0044-D8: and the state RPC agrees — already_scored is false while no row exists',
+    (v_state -> 'already_scored')::boolean = false
+    and (v_state -> 'assessment_exists')::boolean = false,
+    'the two RPCs must not disagree about the same two-part condition: ' || v_state::text);
+
+  -- Now the row lands, exactly as runAssessment writes it.
+  insert into screening_v2.assessments
+    (session_id, candidate_id, overall_score, recommendation, summary, raw, provenance, source)
+  values (v_ids[3], v_cand, 70, 'advance', 'pol44 adopt', '{}'::jsonb,
+          '{"schema_version":1,"provider":"anthropic","requestedModel":"claude-sonnet-4-20250514","workload":"scoring","prompt_template_version":"2026-07-28.1","timestamp":"2026-07-28T12:00:00Z"}'::jsonb,
+          'phone');
+
+  v_res := screening_v2.start_phone_assessment(
+             v_ids[2], v_ids[3], '2026-09-01T06:04:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0044-D8: a completed AND scored session is already_scored — the adoption path',
+    v_res ->> 'status' = 'already_scored'
+    and (v_res -> 'assessment_exists')::boolean,
+    'a scored screening with no adoption path can never reach completed from any leg: '
+      || v_res::text);
+
+  perform _policy_tests.assert(
+    '0044-D8: already_scored carries NO plan and NO cursor — there is nothing left to screen',
+    not (v_res ? 'questions') and not (v_res ? 'cursor') and not (v_res ? 'next_key'),
+    'handing back a plan would invite a leg to re-ask questions that are already answered');
+
+  v_state := screening_v2.get_phone_assessment_state(v_ids[3]);
+  perform _policy_tests.assert(
+    '0044-D8: the state RPC names the same condition, so no caller re-derives it',
+    (v_state -> 'already_scored')::boolean
+    and (v_state -> 'assessment_exists')::boolean,
+    'a two-part condition re-derived by each caller is one remembered correctly by some of '
+      || 'them: ' || v_state::text);
+
+  -- AND the completion it authorises is accepted, which is the whole point.
+  v_res := screening_v2.apply_phone_event(
+             'internal', 'assessment.completed', v_ids[2], null, null, null, null,
+             '2026-09-01T06:05:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0044-D8: the adopted completion is APPLIED and drives the engagement to completed',
+    v_res ->> 'status' = 'applied'
+    and (select state from screening_v2.phone_engagements where id = v_ids[1]) = 'completed',
+    'adoption that cannot actually complete the engagement is not an adoption path: '
+      || v_res::text);
+
+  perform _policy_tests.assert(
+    '0044-D8: adoption wrote NO second assessment — nothing was re-scored',
+    (select count(*) from screening_v2.assessments where session_id = v_ids[3]) = 1,
+    'the row was already there; the only thing missing was the acknowledgement');
+
+  perform _policy_tests.phone44_teardown('pol44-adopt');
+end;
+$$;
+
+-- CONTROL: `already_scored` is decided AFTER the binding checks, so it can
+-- never describe somebody else's session.
+do $$
+declare
+  v_ids uuid[]; v_res jsonb; v_other uuid; v_role uuid; v_cand uuid;
+begin
+  v_ids := _policy_tests.phone44_fixture('pol44-adopt-bind');
+  select id into v_role from screening_v2.roles order by id limit 1;
+  insert into screening_v2.candidates (role_id, name, email, phone_e164, phone_valid)
+  values (v_role, 'pol44 adopt other', 'pol44-adopt-other@example.test',
+          '+919999012399', true)
+  returning id into v_cand;
+  insert into screening_v2.call_sessions
+    (candidate_id, role_id, mode, provider, external_call_id, status)
+  values (v_cand, v_role, 'live', 'livekit', 'placeholder', 'created')
+  returning id into v_other;
+  update screening_v2.call_sessions
+     set external_call_id = 'phone-' || v_other::text, status = 'waiting'
+   where id = v_other;
+  update screening_v2.call_sessions
+     set status = 'in_progress' where id = v_other;
+  update screening_v2.call_sessions
+     set status = 'completed', terminal_reason = 'conversation_complete'
+   where id = v_other;
+  insert into screening_v2.assessments
+    (session_id, candidate_id, overall_score, recommendation, summary, raw, provenance, source)
+  values (v_other, v_cand, 70, 'advance', 'pol44 other', '{}'::jsonb,
+          '{"schema_version":1,"provider":"anthropic","requestedModel":"claude-sonnet-4-20250514","workload":"scoring","prompt_template_version":"2026-07-28.1","timestamp":"2026-07-28T12:00:00Z"}'::jsonb,
+          'phone');
+
+  v_res := screening_v2.start_phone_assessment(
+             v_ids[2], v_other, '2026-09-01T06:00:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0044-D8: CONTROL — already_scored cannot describe another candidate''s scored session',
+    v_res ->> 'status' = 'session_candidate_mismatch',
+    'the binding checks must run FIRST, or already_scored becomes a way to fish for '
+      || 'somebody else''s completion: ' || v_res::text);
+
+  delete from screening_v2.assessments where session_id = v_other;
+  delete from screening_v2.call_sessions where id = v_other;
+  delete from screening_v2.candidates where email = 'pol44-adopt-other@example.test';
+  perform _policy_tests.phone44_teardown('pol44-adopt-bind');
+end;
+$$;
+
 -- ── D7: the plan and the progress trail are write-once ────────────────
 do $$
 declare

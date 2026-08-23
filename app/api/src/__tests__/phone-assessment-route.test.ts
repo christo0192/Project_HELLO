@@ -84,6 +84,7 @@ function state(over: Partial<PhoneAssessmentState> = {}): PhoneAssessmentState {
     completedKeys: [],
     turns: [],
     assessmentExists: false,
+    alreadyScored: false,
     planComplete: false,
     ...over,
   };
@@ -267,8 +268,25 @@ describe('POST /assessment/start', () => {
     });
   });
 
+  it('forwards `already_scored`, which is the one refusal that means SUCCESS', async () => {
+    // F-1. The session is `completed` and a phone-sourced assessment row
+    // exists: a scored screening whose acknowledgement was lost. It is not
+    // `ok` — there is nothing to screen — but it is not a failure either, and
+    // the worker's only legitimate action on it is to post
+    // `assessment.completed`, which 0044 accepts because the row is there.
+    const h = build({ start: { status: 'already_scored' } as PhoneAssessmentState });
+    const res = await post(h, '/assessment/start', START_BODY);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: false, status: 'already_scored' });
+    // No plan is handed back, so nothing invites a leg to re-ask a question
+    // that is already answered.
+    expect(res.body.plan).toBeUndefined();
+    expect(res.body.progress).toBeUndefined();
+  });
+
   it('forwards every refusal with its own stable code, and never as a success', async () => {
     const refusals = [
+      'already_scored',
       'disclosure_not_delivered',
       'engagement_terminal',
       'invalid_role_template',
@@ -417,9 +435,53 @@ describe('POST /assessment/complete — the ordering this phase exists for', () 
     });
     const res = await post(h, '/assessment/complete', START_BODY);
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ ok: true, status: 'scored' });
+    expect(res.body).toEqual({ ok: true, status: 'scored', adopted: false });
     // THE assertion. `state` twice, with `complete` and `score` between them,
     // and `score` strictly before the verifying read.
+    expect(h.order).toEqual(['state', 'complete', 'score', 'state']);
+  });
+
+  it('ADOPTS an already-scored session without re-scoring anything', async () => {
+    // F-1, at the route. The row is already there, so there is nothing to
+    // compute and nothing to write. Short-circuiting is what makes "no
+    // rescore, no duplicate writeback" STRUCTURAL rather than a property of
+    // how `runAssessment` happens to behave on a second call.
+    const h = build({
+      states: [state({ planComplete: true, cursor: 2, assessmentExists: true, alreadyScored: true })],
+    });
+    const res = await post(h, '/assessment/complete', START_BODY);
+    expect(res.body).toEqual({ ok: true, status: 'scored', adopted: true });
+    expect(h.completeSession).not.toHaveBeenCalled();
+    expect(h.scoreSession).not.toHaveBeenCalled();
+    // ONE read, and nothing else. The verifying second read is not needed:
+    // the row was found before anything was attempted.
+    expect(h.order).toEqual(['state']);
+  });
+
+  it('adopts even when the plan looks INCOMPLETE — a scored screening is finished', async () => {
+    // The case the ordering matters for: a boundary write lost AFTER the score
+    // landed. Refusing `plan_incomplete` here would strand exactly the
+    // situation the adoption path exists for.
+    const h = build({
+      states: [state({ planComplete: false, cursor: 1, assessmentExists: true, alreadyScored: true })],
+    });
+    const res = await post(h, '/assessment/complete', START_BODY);
+    expect(res.body).toEqual({ ok: true, status: 'scored', adopted: true });
+    expect(h.scoreSession).not.toHaveBeenCalled();
+  });
+
+  it('CONTROL — without `alreadyScored` the full path still runs', async () => {
+    // Without this the two assertions above would pass on a route that had
+    // simply stopped scoring anything.
+    const h = build({
+      states: [
+        state({ planComplete: true, cursor: 2, alreadyScored: false }),
+        state({ planComplete: true, cursor: 2, assessmentExists: true }),
+      ],
+    });
+    const res = await post(h, '/assessment/complete', START_BODY);
+    expect(res.body).toEqual({ ok: true, status: 'scored', adopted: false });
+    expect(h.scoreSession).toHaveBeenCalledOnce();
     expect(h.order).toEqual(['state', 'complete', 'score', 'state']);
   });
 
@@ -449,7 +511,7 @@ describe('POST /assessment/complete — the ordering this phase exists for', () 
       ],
     });
     const res = await post(h, '/assessment/complete', START_BODY);
-    expect(res.body).toEqual({ ok: true, status: 'scored' });
+    expect(res.body).toEqual({ ok: true, status: 'scored', adopted: false });
     expect(h.order).toEqual(['state', 'complete', 'score', 'state']);
   });
 
@@ -495,7 +557,7 @@ describe('POST /assessment/complete — the ordering this phase exists for', () 
       ],
     });
     const res = await post(h, '/assessment/complete', START_BODY);
-    expect(res.body).toEqual({ ok: true, status: 'scored' });
+    expect(res.body).toEqual({ ok: true, status: 'scored', adopted: false });
     // …and the verification really did run after the throw.
     expect(h.order).toEqual(['state', 'complete', 'score', 'state']);
   });
@@ -570,7 +632,7 @@ describe('POST /assessment/complete — the ordering this phase exists for', () 
       ],
     });
     const res = await post(h, '/assessment/complete', START_BODY);
-    expect(res.body).toEqual({ ok: true, status: 'scored' });
+    expect(res.body).toEqual({ ok: true, status: 'scored', adopted: false });
     expect(h.completeSession).not.toHaveBeenCalled();
     expect(h.scoreSession).toHaveBeenCalledOnce();
   });
@@ -657,6 +719,19 @@ describe('the response body is a SUBSET, asserted structurally', () => {
     expect(serialized).not.toContain('EG_abcdefgh');
   });
 
+  it('the projection names `already_scored`, so no caller re-derives it', () => {
+    // A two-part condition (`status === 'completed'` AND a row exists)
+    // re-derived by the route, the worker and the agent is one remembered
+    // correctly by some of them. It is decided in SQL and carried through.
+    const scored = sanitizeAssessmentState(
+      state({ sessionStatus: 'completed', assessmentExists: true, alreadyScored: true }),
+    );
+    expect(scored.already_scored).toBe(true);
+    expect(scored.assessment_exists).toBe(true);
+    const live = sanitizeAssessmentState(state());
+    expect(live.already_scored).toBe(false);
+  });
+
   it('CONTROL — the projection is not simply empty', () => {
     // Without this the assertions above would pass on `{}`.
     const body = sanitizeAssessmentState(
@@ -709,7 +784,7 @@ describe('the PRODUCTION defaults, driven with an empty deps object', () => {
       .post('/api/internal/phone/assessment/complete')
       .set('Authorization', `Bearer ${SECRET}`)
       .send(START_BODY);
-    expect(res.body).toEqual({ ok: true, status: 'scored' });
+    expect(res.body).toEqual({ ok: true, status: 'scored', adopted: false });
     expect(transitionSession).toHaveBeenCalledWith(
       SESSION, 'in_progress', 'completed', 'conversation_complete',
     );
@@ -740,7 +815,7 @@ describe('the PRODUCTION defaults, driven with an empty deps object', () => {
       .post('/api/internal/phone/assessment/complete')
       .set('Authorization', `Bearer ${SECRET}`)
       .send(START_BODY);
-    expect(res.body).toEqual({ ok: true, status: 'scored' });
+    expect(res.body).toEqual({ ok: true, status: 'scored', adopted: false });
     expect(runAssessment).toHaveBeenCalledOnce();
   });
 

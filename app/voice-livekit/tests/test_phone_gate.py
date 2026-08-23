@@ -1406,6 +1406,36 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([c[0] for c in client.assessment_calls], ["start", "turn"])
         delete.assert_awaited()
 
+    async def test_an_ALREADY_SCORED_session_is_ADOPTED_without_re_scoring(self):
+        """F-1. The database says: this session is `completed` and a
+        phone-sourced assessment row exists.
+
+        There is nothing to screen, nothing to score and nothing to write — the
+        only thing missing is the acknowledgement, which the leg that produced
+        it could not deliver. So the worker posts the completion DIRECTLY: no
+        completion call, no inference, no second writeback, and no question
+        re-asked. Without this the engagement can never reach `completed` from
+        any leg; it rests non-terminal until a budget or a sweeper ends it, or
+        goes `failed` for an untruthful reason.
+        """
+        client = FakeEventClient(
+            start=phone.PhoneAssessmentState(
+                False, phone.ASSESSMENT_ALREADY_SCORED_STATUS
+            ),
+        )
+        _, client, _, delete, session, _ = await self._run_session(
+            answers=("Yes, that's fine.",), client=client
+        )
+        self.assertIn("assessment.completed", client.event_types)
+        self.assertNotIn("assessment.aborted", client.event_types)
+        # NOTHING was re-done: no completion call, no boundary, no question.
+        self.assertEqual([c[0] for c in client.assessment_calls], ["start"])
+        self.assertEqual(client.committed_keys, [])
+        # …and the candidate is not hung up on mid-call: a leg that SUCCEEDED
+        # must not end worse than one that failed.
+        self.assertEqual(session.spoken[-1], phone.PHONE_ASSESSMENT_CLOSING_TEXT)
+        delete.assert_awaited()
+
     async def test_a_SCORED_session_is_RECOVERED_when_the_start_is_refused(self):
         """A refused start is not proof that nothing happened.
 
@@ -1422,7 +1452,7 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             start=phone.PhoneAssessmentState(False, "session_not_active"),
             complete=phone.PhoneApiOutcome(True, phone.ASSESSMENT_SCORED_STATUS),
         )
-        _, client, _, delete, _, _ = await self._run_session(
+        _, client, _, delete, session, _ = await self._run_session(
             answers=("Yes, that's fine.",), client=client
         )
         self.assertIn("assessment.completed", client.event_types)
@@ -1431,6 +1461,7 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         # ROW still decides, so no question was asked and none was committed.
         self.assertEqual(client.committed_keys, [])
         self.assertEqual([c[0] for c in client.assessment_calls], ["start", "complete"])
+        self.assertEqual(session.spoken[-1], phone.PHONE_ASSESSMENT_CLOSING_TEXT)
         delete.assert_awaited()
 
     async def test_a_refused_start_with_NOTHING_to_recover_still_aborts(self):

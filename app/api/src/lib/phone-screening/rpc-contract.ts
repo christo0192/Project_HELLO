@@ -335,6 +335,13 @@ export type ClearPhoneAttemptRecordingsStatus =
  */
 export const START_PHONE_ASSESSMENT_STATUSES = [
   'ok',
+  // A session that is already `completed` AND already carries a phone-sourced
+  // assessment: a SCORED screening whose acknowledgement was lost. It is kept
+  // DISTINCT from `session_not_active` because the two demand opposite
+  // actions — one means "you cannot screen", the other means "the screening is
+  // finished, go and say so". Collapsing them leaves the engagement with no
+  // way to reach `completed` from any leg.
+  'already_scored',
   'disclosure_not_delivered',
   'engagement_terminal',
   'invalid_role_template',
@@ -435,7 +442,7 @@ export const PHONE_RPC_STATUS_UNION: readonly string[] = Object.freeze(
  * count. The exact number is RE-DERIVED by the drift test from the migration
  * text, so this constant is a tripwire and never the source.
  */
-export const PHONE_RPC_STATUS_COUNT = 67;
+export const PHONE_RPC_STATUS_COUNT = 68;
 
 /**
  * RESULT KEYS the API's behaviour DEPENDS on, per RPC.
@@ -488,6 +495,7 @@ export const PHONE_RPC_RESULT_KEYS: Readonly<Record<string, readonly string[]>> 
     'completed_keys',
     'turns',
     'assessment_exists',
+    'already_scored',
     'plan_complete',
   ],
   commit_phone_question_boundary: [

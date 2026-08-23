@@ -500,6 +500,12 @@ begin
     'completed_keys', v_completed,
     'turns', v_turns,
     'assessment_exists', v_scored,
+    -- The SAME concept `start_phone_assessment` answers with, named ONCE
+    -- and in SQL rather than re-derived by every caller. This lane's own
+    -- record is that the glue is where the errors are; `status = 'completed'
+    -- AND a row exists` is exactly the kind of two-part condition that gets
+    -- half-remembered in one caller and not the other.
+    'already_scored', v_sess.status = 'completed' and v_scored,
     'plan_complete', v_cursor >= v_plan.question_count);
 end;
 $$;
@@ -624,6 +630,39 @@ begin
     return jsonb_build_object('status', 'session_candidate_mismatch');
   end if;
   if v_sess.status not in ('waiting','in_progress') then
+    -- ── ALREADY SCORED IS A DIFFERENT ANSWER FROM NOT ACTIVE ────────
+    -- A session that is `completed` AND already carries a phone-sourced
+    -- assessment is a SCORED screening whose acknowledgement was lost —
+    -- the completion endpoint succeeded, inserted the row, and its
+    -- response never reached the worker. The leg that saw that halted
+    -- and posted nothing, which was right; a LATER leg then arrives
+    -- here, and answering `session_not_active` tells it only that it
+    -- cannot screen. It does not tell it the screening is finished.
+    --
+    -- Collapsing the two leaves the engagement with no way to reach
+    -- `completed` from any leg: it rests non-terminal until a budget or
+    -- a sweeper ends it, or goes `failed` if something posts an abort —
+    -- a truthful terminal for an untruthful reason, over a screening
+    -- that exists and is scored.
+    --
+    -- The binding checks above have ALREADY run, so `already_scored` can
+    -- only ever describe a session that named this exact phone room and
+    -- belongs to this engagement's candidate. A worker cannot fish for
+    -- somebody else's completion with it.
+    --
+    -- It carries NO plan and NO cursor, deliberately: there is nothing
+    -- left to screen. The only legitimate action on it is to post
+    -- `assessment.completed`, which 0044's own interlock will accept
+    -- precisely because the row this branch just found is there.
+    if v_sess.status = 'completed'
+       and exists (
+         select 1 from screening_v2.assessments a
+          where a.session_id = p_session_id
+            and a.source = 'phone') then
+      return jsonb_build_object('status', 'already_scored',
+                                'session_status', v_sess.status,
+                                'assessment_exists', true);
+    end if;
     return jsonb_build_object('status', 'session_not_active',
                               'session_status', v_sess.status);
   end if;

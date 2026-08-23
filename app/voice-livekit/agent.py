@@ -1047,6 +1047,39 @@ async def _run_phone_session(
             "unknown_event", error_type="phone_assessment_unstarted",
             error_category=state.status,
         )
+        # ── ADOPT A SCORED SCREENING, DO NOT RE-DO IT ────────────────
+        # `already_scored` is the database saying: this session is
+        # `completed` and a phone-sourced assessment row exists. There is
+        # nothing to screen, nothing to score and nothing to write — the only
+        # thing missing is the acknowledgement, which the leg that produced it
+        # could not deliver.
+        #
+        # So this posts the completion DIRECTLY. It does not call the
+        # completion endpoint, which would re-enter the scoring path to reach
+        # the same row; it does not re-ask a question; and it cannot produce a
+        # second writeback, because it performs no write at all. The post is
+        # idempotent by 0042's deterministic internal event id, so a leg that
+        # does this twice converges on the first verdict rather than writing a
+        # second ledger row — and 0044's interlock accepts it precisely
+        # because the row the RPC just found is there.
+        if state.status == phone.ASSESSMENT_ALREADY_SCORED_STATUS:
+            _log.info(
+                "unknown_event", error_type="phone_assessment_adopted",
+                error_category=state.status,
+            )
+            # The candidate is on the line and has just heard the recording
+            # disclosure. Hanging up without a word on a leg that SUCCEEDED —
+            # which is what an adoption is — would make a recovered screening
+            # end worse than a failed one. The closing line is fixed copy and
+            # is not a transcript turn, so saying it records nothing.
+            await say(phone.PHONE_ASSESSMENT_CLOSING_TEXT)
+            await events.post_event(attempt_id, "assessment.completed")
+            await _close_phone_room(room_name)
+            return result
+
+        # `session_not_active` WITHOUT a row is the other half: the session was
+        # completed but never scored. The completion endpoint can still finish
+        # that, so it is asked — and the ROW still decides.
         if state.status == "session_not_active":
             recovered = await events.complete_assessment(attempt_id, session_id)
             if recovered.ok:
@@ -1054,6 +1087,7 @@ async def _run_phone_session(
                     "unknown_event", error_type="phone_assessment_recovered",
                     error_category=recovered.status,
                 )
+                await say(phone.PHONE_ASSESSMENT_CLOSING_TEXT)
                 await events.post_event(attempt_id, "assessment.completed")
                 await _close_phone_room(room_name)
                 return result

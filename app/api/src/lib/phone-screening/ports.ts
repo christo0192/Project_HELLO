@@ -356,6 +356,13 @@ export interface PhoneAssessmentState {
   readonly completedKeys?: readonly string[];
   readonly turns?: readonly PhoneAssessmentTurn[];
   readonly assessmentExists?: boolean;
+  /**
+   * The session is `completed` AND a phone-sourced assessment exists — a
+   * scored screening whose acknowledgement was lost. Derived in SQL rather
+   * than by each caller, because a two-part condition re-derived in three
+   * places is a condition remembered correctly in two of them.
+   */
+  readonly alreadyScored?: boolean;
   readonly planComplete?: boolean;
 }
 

@@ -674,6 +674,13 @@ def _response_json(response: Any) -> Any:
 
 ASSESSMENT_SCORED_STATUS = "scored"
 
+#: `start_phone_assessment`'s answer for a session that is already `completed`
+#: AND already carries a phone-sourced assessment: a SCORED screening whose
+#: acknowledgement was lost. It is NOT a refusal to be retried and NOT a reason
+#: to abort — the only legitimate action on it is to post
+#: `assessment.completed`, which 0044 accepts because the row is there.
+ASSESSMENT_ALREADY_SCORED_STATUS = "already_scored"
+
 #: Completion answers worth trying again inside the same leg. Everything else
 #: — `plan_incomplete`, `session_not_active`, `unknown_session`, `plan_missing`
 #: — is a STATE rather than a fault, and retrying cannot change it.
@@ -704,10 +711,27 @@ def retryable_completion(outcome: "PhoneApiOutcome") -> bool:
     worker does not know it, and one leg later a refused start turns it
     terminal. Retrying is safe because the endpoint is idempotent by
     construction, which is what makes this a real fix rather than a hopeful one.
+
+    ── AND THE SECOND CLASS IS NARROW, DELIBERATELY ──────────────────
+    `error_category is not None` was too broad. `_post` also produces
+    `configuration` (the worker secret is missing or under 32 characters) and
+    `business_error` (a 4xx — for this endpoint, a 401/403 from a rotated
+    secret, or a 400 from schema drift). Those are DETERMINISTIC: three
+    attempts change nothing, and the caller then treats the exhausted result as
+    "we do not know whether it scored" and posts nothing — which lets the
+    webhook grant and CHARGE a reconnect, so the candidate is redialled.
+
+    Rotating `WORKER_CONTEXT_SECRET` on the API before the worker would 403
+    every completion in flight and redial each of those candidates up to three
+    times. That is the same failure as laundering a quiet candidate into a line
+    drop, arriving through the auth door instead of the conversational one. A
+    request that never reached a decision-maker is a state we DO know, and it
+    should end the call truthfully rather than spend a budget that belongs to
+    the candidate.
     """
     if outcome.status is not None:
         return outcome.status in RETRYABLE_COMPLETION_STATUSES
-    return outcome.error_category is not None
+    return outcome.error_category in (_ERR_TRANSPORT, _ERR_MALFORMED)
 
 # What the bot says once every question is durable. A CONSTANT, like the
 # disclosure, and for the same reason: the closing of a recorded screening call
@@ -780,7 +804,7 @@ class PhoneAssessmentState:
     __slots__ = (
         "ok", "status", "candidate_name", "questions", "cursor",
         "next_key", "completed_keys", "turns", "assessment_exists",
-        "plan_complete", "plan_source",
+        "already_scored", "plan_complete", "plan_source",
     )
 
     def __init__(self, ok: bool, status: str | None = None) -> None:
@@ -793,6 +817,7 @@ class PhoneAssessmentState:
         self.completed_keys: list[str] = []
         self.turns: list[dict[str, str]] = []
         self.assessment_exists: bool = False
+        self.already_scored: bool = False
         self.plan_complete: bool = False
         self.plan_source: str | None = None
 
@@ -869,6 +894,7 @@ class PhoneAssessmentState:
                     state.turns.append({"speaker": speaker, "text": text})
 
         state.assessment_exists = data.get("assessment_exists") is True
+        state.already_scored = data.get("already_scored") is True
         return state
 
     def question_at(self, index: int) -> PhonePlanQuestion | None:
@@ -1129,9 +1155,15 @@ async def run_phone_assessment(
         # The API gave us a verdict we understand and it is not a score.
         # `assessment.aborted` is the truthful terminal: the conversation
         # happened, the transcript is durable, and nothing scored it.
+        #
+        # `unclassified` covers the one hole left in the classifier: a 200 body
+        # carrying neither a `status` nor an error category. The route always
+        # sets `status`, so reaching it needs code drift — but an abort logged
+        # with NO reason at all is an abort nobody can diagnose, and this branch
+        # is where a screening ends.
         _log.warn(
             "unknown_event", error_type="phone_assessment_unscored",
-            error_category=category,
+            error_category=category or "unclassified",
         )
         return PhoneAssessmentResult(cursor=cursor, completed=completed, status=status)
 
