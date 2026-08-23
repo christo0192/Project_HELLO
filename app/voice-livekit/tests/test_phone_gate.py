@@ -1179,7 +1179,21 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             result = await asyncio.wait_for(task, timeout=5)
         return result, client, recording, delete, session, persistence_spy
 
-    async def test_human_path_records_and_completes(self):
+    async def test_human_path_records_but_never_claims_a_completed_assessment(self):
+        """A clean close is not a completed assessment.
+
+        `assessment.completed` drives 0042 to terminal `completed` with
+        `outcome_class = 'completed'`, which every downstream reader treats as a
+        SCORED screening. This path scores nothing: `persistence_spy` asserts
+        below that not a single persistence call is made, so there is no
+        transcript, no activation and no scoring. Claiming `completed` would be
+        the same lie as calling an answered call `no_answer`, and unrecoverable
+        afterwards because nothing downstream could tell the difference.
+
+        An earlier version of this test asserted `assessment.completed` and so
+        PINNED the defect in place. The invariant, not the literal, is what
+        belongs here.
+        """
         result, client, recording, delete, session, persistence_spy = await self._run_session(
             answers=("Yes, that's fine.",)
         )
@@ -1187,10 +1201,29 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recording, [1])
         self.assertEqual(
             client.event_types,
-            ["classify.human", "disclosure.delivered", "assessment.completed"],
+            ["classify.human", "disclosure.delivered", "assessment.aborted"],
         )
+        # The invariant, stated directly so it survives a rewrite of the list
+        # above: while this path persists nothing, it must never post the event
+        # that means "scored".
+        self.assertNotIn("assessment.completed", client.event_types)
         self.assertEqual(session.spoken[0], phone.PHONE_DISCLOSURE_TEXT)
         delete.assert_awaited()
+        # The reason the assertion above is required: nothing was persisted.
+        self.assertEqual(persistence_spy.mock_calls, [])
+
+    async def test_a_CLEAN_close_still_does_not_claim_completion(self):
+        """The close reason is deliberately not consulted.
+
+        The room closing tidily says the call ended well, not that an
+        assessment exists. This is the case a future reader is most likely to
+        "fix" back into `assessment.completed`.
+        """
+        _, client, _, _, _, persistence_spy = await self._run_session(
+            answers=("Yes, that's fine.",)
+        )
+        self.assertIn("assessment.aborted", client.event_types)
+        self.assertNotIn("assessment.completed", client.event_types)
         self.assertEqual(persistence_spy.mock_calls, [])
 
     async def test_machine_path_cannot_score_writeback_or_record(self):

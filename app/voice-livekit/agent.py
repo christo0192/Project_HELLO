@@ -833,17 +833,37 @@ async def _run_phone_session(
     )
     try:
         await asyncio.wait_for(close_event.wait(), timeout=SESSION_MAX_RESIDENCY_SEC)
-        completed = close_reason.get("reason") is None
     except asyncio.TimeoutError:
-        completed = False
+        pass
     finally:
         silence_task.cancel()
         await asyncio.gather(silence_task, return_exceptions=True)
 
-    await events.post_event(
-        attempt_id,
-        "assessment.completed" if completed else "assessment.aborted",
-    )
+    # ── A CLEAN CLOSE IS NOT A COMPLETED ASSESSMENT ───────────────────
+    # This deliberately posts `assessment.aborted` UNCONDITIONALLY, and the
+    # room's close reason is not consulted.
+    #
+    # `assessment.completed` drives 0042 to terminal `completed` with
+    # `outcome_class = 'completed'`, and every downstream reader — the
+    # engagement state, P6's health backlog, the P7 calendar queue — treats
+    # that as a SCORED screening. On this path nothing is scored: the phone
+    # session persists no transcript turn, never calls `activate_session` or
+    # `complete_session`, and never triggers scoring. A clean hangup means the
+    # call ended tidily, not that an assessment exists.
+    #
+    # So claiming `completed` would be the same lie as calling an answered
+    # call `no_answer` — a terminal state asserting something that did not
+    # happen, and unrecoverable afterwards because nothing downstream can tell
+    # the difference. `assessment.aborted` is terminal `failed` with reason
+    # `assessment_aborted`: truthful that the conversation happened and
+    # produced nothing.
+    #
+    # The conditional belongs back here when the persistence path exists, and
+    # its condition must be "scoring SUCCEEDED", not "the room closed
+    # cleanly". It is left out entirely rather than stubbed behind a flag that
+    # is always false, because an unreachable branch reads as a safety net and
+    # is not one.
+    await events.post_event(attempt_id, "assessment.aborted")
     await _close_phone_room(room_name)
     return result
 

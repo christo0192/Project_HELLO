@@ -302,8 +302,13 @@ allowed).
    **re-asks every question**. There is no artifact — cursor or persisted transcript —
    from which "already answered" could be derived, so this cannot be fixed by a test or a
    small patch; it needs the persistence path built.
-2. A completed phone screening yields **no transcript row and no assessment**. The
-   engagement looks `completed` in 0042 and there is nothing to read.
+2. A finished phone screening yields **no transcript row and no assessment**. It no
+   longer *claims* one: the path posts `assessment.aborted`, so the engagement lands on
+   terminal `failed` with reason `assessment_aborted` rather than on `completed`.
+   That is deliberate and it is the truthful state — the conversation happened and
+   produced nothing. **Every phone engagement will therefore terminate as `failed`
+   until the persistence path lands**, which is correct but will look alarming on an
+   operator dashboard; do not "fix" it by restoring `assessment.completed`.
 
 **Why it is not repaired in this PR.** Building it means adding phone-side turn
 persistence, session activation and a resume path — through `sessions` and
