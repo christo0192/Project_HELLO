@@ -915,15 +915,17 @@ describe('OpenAPI document integrity', () => {
     //   appointment create, the appointment reschedule/cancel pair on one
     //   path, and the two halt controls.
     //
-    // 78 (base) + 1 (P3) + 8 (P6) + 2 (P4) = 89. RE-DERIVED from the merged
-    // spec, not arrived at by adding the branches' diffs — the whole point of
-    // a hard count is that it is checked against the document.
+    // 78 (base) + 1 (P3) + 8 (P6) + 2 (P4) + 3 (P4b) = 92. RE-DERIVED from the
+    // merged spec, not arrived at by adding the branches' diffs — the whole
+    // point of a hard count is that it is checked against the document.
     //
     // P4's two are the INTERNAL phone-worker surface: the event post and the
-    // callback booking. Both are service-authenticated with the existing
-    // WORKER_CONTEXT_SECRET rather than a recruiter session, so neither
-    // widens the recruiter-facing surface at all.
-    expect(Object.keys(paths).length).toBe(89);
+    // callback booking. P4b adds three more to the SAME internal surface:
+    // assessment start, one question boundary, and the completion that awaits
+    // scoring and verifies the row. All five are service-authenticated with
+    // the existing WORKER_CONTEXT_SECRET rather than a recruiter session, so
+    // none of them widens the recruiter-facing surface at all.
+    expect(Object.keys(paths).length).toBe(92);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -933,8 +935,13 @@ describe('OpenAPI document integrity', () => {
     // + the five internal phone-worker schemas (P4): the shared error body,
     //   the event request/response pair, and the appointment request/response
     //   pair.
-    // 160 (base) + 2 (P3) + 31 (P6) + 5 (P4) = 198, re-derived.
-    expect(Object.keys(schemas).length).toBe(198);
+    // + the seven internal phone-assessment schemas (P4b): the start request,
+    //   the plan-question and turn-entry element types, the shared state
+    //   response, the boundary request/response pair, and the complete
+    //   request/response pair — eight names, of which PhoneAssessmentStateResponse
+    //   serves both start and its refusals.
+    // 160 (base) + 2 (P3) + 31 (P6) + 5 (P4) + 8 (P4b) = 206, re-derived.
+    expect(Object.keys(schemas).length).toBe(206);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.
@@ -998,6 +1005,10 @@ describe('auth boundary vs spec security model', () => {
     // they belong here rather than in the general sweep.
     'POST /api/internal/phone/events',
     'POST /api/internal/phone/appointments',
+    // P4b, same surface and same boundary: the durable half of a screening.
+    'POST /api/internal/phone/assessment/start',
+    'POST /api/internal/phone/assessment/turn',
+    'POST /api/internal/phone/assessment/complete',
     // Ashby webhook: HMAC-gated (not recruiter-authenticated), mounted pre-auth.
     'POST /api/integrations/ashby/webhook',
     // LiveKit phone webhook: JWT-gated (not recruiter-authenticated), mounted

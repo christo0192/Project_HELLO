@@ -291,6 +291,18 @@ about the wiring, not a reassurance about the guard.
 
 ## 12. UNMET CONTRACT ITEM — phone-side transcript, cursor and assessment
 
+> **CLOSED by P4b (migration `0044`, `docs/runbooks/phone-assessment-resume.md`).**
+> The section below is kept verbatim as the record of what was true at `620c702`
+> and of the decision the owner was asked to make. Two of its statements are no
+> longer true: a reconnect no longer re-asks every question, and a finished phone
+> screening now yields a transcript and an assessment. The third — *"do not fix
+> the `failed` terminal by restoring `assessment.completed`"* — is now enforced
+> in SQL rather than by convention: `apply_phone_event` refuses that event with
+> `assessment_missing` unless a phone-sourced assessment row already exists.
+>
+> **The activation interlock still stands.** P4b must be deployed with P4a
+> before a real candidate is dialled; see §9 and the P4b runbook.
+
 **This is a scope gap, not a residual, and it is disclosed here because I did not
 disclose it earlier.** The acceptance contract asks for two things this PR does not
 deliver, and both were in scope (`voice-livekit Python/prompt/tools/tests` is explicitly

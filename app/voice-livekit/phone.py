@@ -202,10 +202,45 @@ PHONE_WRONG_NUMBER_TEXT = (
 )
 
 
+#: Fixed copy the bot speaks that is NOT part of the screening record.
+#:
+#: Two kinds live here: the identity/disclosure/refusal lines the GATE speaks
+#: before any screening begins, and the confirmations the callback tool and the
+#: closing speak after it. Neither is evidence of a screening, and both are
+#: delivered through `session.say`, which appends a conversation item exactly
+#: like a generated turn does. Without this filter a scheduling confirmation
+#: spoken mid-call would be captured inside whichever question's boundary
+#: happened to be open, and committed as part of the candidate's answer.
+#:
+#: Matched by exact text because every member is a CONSTANT. A line that
+#: changes has to change here too, which is the point: fixed copy is fixed.
+def gate_copy_texts() -> frozenset[str]:
+    """Every fixed line the bot may speak that is not a screening turn."""
+    return frozenset([
+        PHONE_DISCLOSURE_TEXT,
+        PHONE_REASK_TEXT,
+        PHONE_REFUSED_TEXT,
+        PHONE_OPT_OUT_TEXT,
+        PHONE_WRONG_NUMBER_TEXT,
+        PHONE_ASSESSMENT_CLOSING_TEXT,
+        _SCHEDULE_CONFIRMED_TEXT,
+        _SCHEDULE_REFUSAL_FALLBACK,
+        *_SCHEDULE_REFUSAL_TEXT.values(),
+    ])
+
+
+def is_gate_copy(text: Any) -> bool:
+    """True when this spoken line is fixed copy rather than a screening turn."""
+    return isinstance(text, str) and text.strip() in gate_copy_texts()
+
+
 # ── Worker event API ──────────────────────────────────────────────────
 
 EVENTS_PATH = "/api/internal/phone/events"
 APPOINTMENTS_PATH = "/api/internal/phone/appointments"
+ASSESSMENT_START_PATH = "/api/internal/phone/assessment/start"
+ASSESSMENT_TURN_PATH = "/api/internal/phone/assessment/turn"
+ASSESSMENT_COMPLETE_PATH = "/api/internal/phone/assessment/complete"
 
 # STRICT allowlist. The server enforces its own; this is the worker half, so a
 # typo fails here rather than becoming a 4xx the caller has to interpret.
@@ -261,6 +296,16 @@ def phone_classify_timeout_sec() -> float:
     return _bounded_float(os.getenv("PHONE_CLASSIFY_TIMEOUT_SEC"), 20.0, 1.0, 120.0)
 
 
+def phone_answer_timeout_sec() -> float:
+    """Bounded wall clock for ONE question's exchange.
+
+    A bound, not a target. Without it a candidate who goes quiet mid-answer
+    leaves the leg waiting forever on a queue, holding a fleet slot and a live
+    call, with no boundary to commit and nothing to end it.
+    """
+    return _bounded_float(os.getenv("PHONE_ANSWER_TIMEOUT_SEC"), 90.0, 5.0, 300.0)
+
+
 class PhoneApiOutcome:
     """Result of one internal phone-API call.
 
@@ -269,7 +314,13 @@ class PhoneApiOutcome:
     assuming the server applied something it never confirmed.
     """
 
-    __slots__ = ("ok", "status", "duplicate", "ignored_reason", "error_category")
+    __slots__ = (
+        "ok", "status", "duplicate", "ignored_reason", "error_category",
+        # 0044: carried only by the assessment calls. Declared here rather
+        # than on a subclass so a caller that reads them on an event outcome
+        # gets a truthful `None` instead of an AttributeError.
+        "cursor", "plan_complete", "expected_key",
+    )
 
     def __init__(
         self,
@@ -285,6 +336,9 @@ class PhoneApiOutcome:
         self.duplicate = duplicate
         self.ignored_reason = ignored_reason
         self.error_category = error_category
+        self.cursor: int | None = None
+        self.plan_complete: bool = False
+        self.expected_key: str | None = None
 
     def __repr__(self) -> str:  # pragma: no cover - diagnostics only
         return f"PhoneApiOutcome(ok={self.ok}, status={self.status!r})"
@@ -487,6 +541,114 @@ class PhoneEventClient:
         return PhoneApiOutcome(True, status_str)
 
 
+    # ── 0044: the durable half of a screening ─────────────────────────
+
+    async def start_assessment(
+        self,
+        attempt_id: str,
+        session_id: str,
+    ) -> "PhoneAssessmentState":
+        """Bind, activate and snapshot the plan; get the whole state back.
+
+        Idempotent on the server, so a reconnecting leg calls exactly this and
+        receives ITS OWN conversation — the original plan, the cursor, the
+        completed keys and the persisted turns.
+
+        A refusal is not an exception. The server distinguishes "the disclosure
+        was never delivered" from "this session is not yours", and the caller
+        must be able to act on the difference rather than on a thrown error.
+        """
+        body = {"attempt_id": str(attempt_id), "session_id": str(session_id)}
+        response = await self._post(ASSESSMENT_START_PATH, body, "assessment_start")
+        if isinstance(response, str):
+            return PhoneAssessmentState(False, response)
+        data = _response_json(response)
+        if not isinstance(data, dict):
+            _log.warn(
+                "unknown_event", error_type="phone_api_failed",
+                error_category=_ERR_MALFORMED, schema="assessment_start",
+            )
+            return PhoneAssessmentState(False, _ERR_MALFORMED)
+        return PhoneAssessmentState.parse(data)
+
+    async def commit_boundary(
+        self,
+        session_id: str,
+        question_key: str,
+        expected_index: int,
+        source_event_id: str,
+        turns: list[dict[str, str]],
+    ) -> PhoneApiOutcome:
+        """Commit ONE completed question boundary.
+
+        ``ok`` is the only field a caller may branch on, and it is read from
+        the server's own flag rather than inferred from the status string. A
+        boundary that is not ``ok`` was not written, and the worker must
+        neither ask the next question nor claim a completion.
+        """
+        body = {
+            "session_id": str(session_id),
+            "question_key": str(question_key),
+            "expected_index": int(expected_index),
+            "source_event_id": str(source_event_id),
+            "turns": turns,
+        }
+        response = await self._post(ASSESSMENT_TURN_PATH, body, "assessment_turn")
+        if isinstance(response, str):
+            return PhoneApiOutcome(False, error_category=response)
+        data = _response_json(response)
+        if not isinstance(data, dict):
+            _log.warn(
+                "unknown_event", error_type="phone_api_failed",
+                error_category=_ERR_MALFORMED, schema="assessment_turn",
+            )
+            return PhoneApiOutcome(False, error_category=_ERR_MALFORMED)
+        status = data.get("status")
+        outcome = PhoneApiOutcome(
+            data.get("ok") is True,
+            str(status) if status is not None else None,
+            duplicate=bool(data.get("duplicate")),
+        )
+        # Carried so the caller can re-sync its cursor from the SERVER rather
+        # than from its own count — the count is what a reconnect invalidates.
+        outcome.cursor = _bounded_int(data.get("cursor"))
+        outcome.plan_complete = data.get("plan_complete") is True
+        expected = data.get("expected_key")
+        outcome.expected_key = str(expected) if isinstance(expected, str) else None
+        return outcome
+
+    async def complete_assessment(
+        self,
+        attempt_id: str,
+        session_id: str,
+    ) -> PhoneApiOutcome:
+        """Complete the session, wait for scoring, and verify the row exists.
+
+        ``ok`` here means an assessment EXISTS. It is the only thing that
+        entitles the worker to post ``assessment.completed`` — and 0044 refuses
+        that event anyway when the row is absent, so the claim is gated twice.
+        """
+        body = {"attempt_id": str(attempt_id), "session_id": str(session_id)}
+        response = await self._post(ASSESSMENT_COMPLETE_PATH, body, "assessment_complete")
+        if isinstance(response, str):
+            return PhoneApiOutcome(False, error_category=response)
+        data = _response_json(response)
+        if not isinstance(data, dict):
+            _log.warn(
+                "unknown_event", error_type="phone_api_failed",
+                error_category=_ERR_MALFORMED, schema="assessment_complete",
+            )
+            return PhoneApiOutcome(False, error_category=_ERR_MALFORMED)
+        status = data.get("status")
+        status_str = str(status) if status is not None else None
+        # `ok` alone is not enough, and a future server status must be added
+        # here DELIBERATELY rather than confirmed by default.
+        return PhoneApiOutcome(
+            data.get("ok") is True and status_str == ASSESSMENT_SCORED_STATUS,
+            status_str,
+        )
+
+
 def _response_json(response: Any) -> Any:
     getter = getattr(response, "json", None)
     if not callable(getter):
@@ -495,6 +657,523 @@ def _response_json(response: Any) -> Any:
         return getter()
     except Exception:  # noqa: BLE001
         return None
+
+
+# ── 0044: the assessment plan, the resume, and the boundary loop ──────
+#
+# THE ONE IDEA IN THIS SECTION. A phone screening is a sequence of KEYED
+# question boundaries, and the SERVER owns the key and the cursor. The worker
+# never counts turns, never infers "which question was that", and never decides
+# on its own that a question is done. It asks the key it is told it owes,
+# commits the exchange, and re-reads the cursor from the answer.
+#
+# That is what makes a reconnect work at all: a second leg calls the same start
+# endpoint, gets the same plan and a cursor that already reflects the first
+# leg's work, and carries on from there. Nothing about "already answered" is
+# derived from prose.
+
+ASSESSMENT_SCORED_STATUS = "scored"
+
+#: `start_phone_assessment`'s answer for a session that is already `completed`
+#: AND already carries a phone-sourced assessment: a SCORED screening whose
+#: acknowledgement was lost. It is NOT a refusal to be retried and NOT a reason
+#: to abort — the only legitimate action on it is to post
+#: `assessment.completed`, which 0044 accepts because the row is there.
+ASSESSMENT_ALREADY_SCORED_STATUS = "already_scored"
+
+#: Completion answers worth trying again inside the same leg. Everything else
+#: — `plan_incomplete`, `session_not_active`, `unknown_session`, `plan_missing`
+#: — is a STATE rather than a fault, and retrying cannot change it.
+#:
+#: `phone_assessment_error` is deliberately ABSENT even though the route emits
+#: it: the route emits it only with HTTP 500, and a 5xx is classified as a
+#: transport failure before the body is ever parsed, so that string can never
+#: arrive here as a `status`. Listing it would be vocabulary with no reachable
+#: writer — it would read as coverage this set does not have. The 500 case is
+#: covered by `retryable_completion` below, through the transport class.
+RETRYABLE_COMPLETION_STATUSES: frozenset[str] = frozenset([
+    "scoring_failed",
+    "completion_failed",
+])
+
+
+def retryable_completion(outcome: "PhoneApiOutcome") -> bool:
+    """True when this completion answer is worth trying again in this leg.
+
+    TWO classes, and the second is the one that matters most. A refusal we
+    understand (`scoring_failed`, `completion_failed`) is a fault. A TRANSPORT
+    failure — a reset, a timeout, a 5xx — carries no status at all, and it is
+    precisely the "blip between the worker and the API" this retry exists for.
+    Keying only on `status` skipped it entirely, which meant the endpoint could
+    succeed, insert the assessment, and lose its response, with zero retries.
+
+    That is the worst of the three outcomes: the screening IS scored, the
+    worker does not know it, and one leg later a refused start turns it
+    terminal. Retrying is safe because the endpoint is idempotent by
+    construction, which is what makes this a real fix rather than a hopeful one.
+
+    ── AND THE SECOND CLASS IS NARROW, DELIBERATELY ──────────────────
+    `error_category is not None` was too broad. `_post` also produces
+    `configuration` (the worker secret is missing or under 32 characters) and
+    `business_error` (a 4xx — for this endpoint, a 401/403 from a rotated
+    secret, or a 400 from schema drift). Those are DETERMINISTIC: three
+    attempts change nothing, and the caller then treats the exhausted result as
+    "we do not know whether it scored" and posts nothing — which lets the
+    webhook grant and CHARGE a reconnect, so the candidate is redialled.
+
+    Rotating `WORKER_CONTEXT_SECRET` on the API before the worker would 403
+    every completion in flight and redial each of those candidates up to three
+    times. That is the same failure as laundering a quiet candidate into a line
+    drop, arriving through the auth door instead of the conversational one. A
+    request that never reached a decision-maker is a state we DO know, and it
+    should end the call truthfully rather than spend a budget that belongs to
+    the candidate.
+    """
+    if outcome.status is not None:
+        return outcome.status in RETRYABLE_COMPLETION_STATUSES
+    return outcome.error_category in (_ERR_TRANSPORT, _ERR_MALFORMED)
+
+# What the bot says once every question is durable. A CONSTANT, like the
+# disclosure, and for the same reason: the closing of a recorded screening call
+# is not something a sampler should improvise. It is deliberately NOT persisted
+# as a transcript turn — it is gate copy, exactly like the disclosure line, and
+# the transcript is the evidence of the screening rather than a recording of
+# every noise made on the call.
+PHONE_ASSESSMENT_CLOSING_TEXT = (
+    "That's everything I needed from my side. Thanks so much for your time "
+    "today — the team will be in touch about next steps. Take care, bye."
+)
+
+# Halt reasons. Every one stops the loop; they do NOT all mean the same thing
+# afterwards, and collapsing them was a real defect.
+#
+#   * RETRYABLE (infrastructure): the boundary could not be made durable, or
+#     the scorer could not be reached. The leg posts NO terminal event, because
+#     the conversation is interrupted rather than over and 0042's reconnect
+#     budget owns what happens next.
+#   * CONVERSATIONAL: the candidate stopped answering. That is not a line drop
+#     and must not be laundered into one — posting nothing would let the
+#     webhook's `sip.participant_left` grant and CHARGE a reconnect, and the
+#     candidate would be dialled back up to three times for having gone quiet,
+#     on a dialer whose per-day index exists to prevent exactly that. These end
+#     the call truthfully with `assessment.aborted`.
+HALT_PERSISTENCE = "persistence_failed"
+HALT_SCORING = "scoring_unreachable"
+HALT_MALFORMED_EXCHANGE = "malformed_exchange"
+HALT_NO_ANSWER = "no_exchange_captured"
+
+#: The halt reasons that must post NOTHING. Enumerated rather than inferred, so
+#: a new reason has to declare which kind it is instead of defaulting into the
+#: silent one.
+RETRYABLE_HALTS: frozenset[str] = frozenset([HALT_PERSISTENCE, HALT_SCORING])
+
+
+def halt_is_retryable(reason: Any) -> bool:
+    """True when a halt must post no terminal event at all."""
+    return isinstance(reason, str) and reason in RETRYABLE_HALTS
+
+
+def _bounded_int(raw: Any) -> int | None:
+    """Read a non-negative bounded integer, or None. Never raises."""
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None
+    return raw if 0 <= raw <= 1000 else None
+
+
+class PhonePlanQuestion:
+    """One question in the immutable, session-scoped plan."""
+
+    __slots__ = ("key", "text", "mandatory", "hint")
+
+    def __init__(self, key: str, text: str, mandatory: bool, hint: str | None) -> None:
+        self.key = key
+        self.text = text
+        self.mandatory = mandatory
+        self.hint = hint
+
+
+class PhoneAssessmentState:
+    """What ``/assessment/start`` returned.
+
+    ``ok`` is the only field a caller may branch a SAFETY decision on. A
+    refusal carries its stable ``status`` so the worker can tell
+    ``disclosure_not_delivered`` from ``session_candidate_mismatch``; neither
+    is a reason to ask a question.
+    """
+
+    __slots__ = (
+        "ok", "status", "candidate_name", "questions", "cursor",
+        "next_key", "completed_keys", "turns", "assessment_exists",
+        "already_scored", "plan_complete", "plan_source",
+    )
+
+    def __init__(self, ok: bool, status: str | None = None) -> None:
+        self.ok = ok
+        self.status = status
+        self.candidate_name: str | None = None
+        self.questions: list[PhonePlanQuestion] = []
+        self.cursor: int = 0
+        self.next_key: str | None = None
+        self.completed_keys: list[str] = []
+        self.turns: list[dict[str, str]] = []
+        self.assessment_exists: bool = False
+        self.already_scored: bool = False
+        self.plan_complete: bool = False
+        self.plan_source: str | None = None
+
+    @classmethod
+    def parse(cls, data: dict[str, Any]) -> "PhoneAssessmentState":
+        """Read the body FIELD BY FIELD. Never spreads, never trusts a shape.
+
+        A plan that came back short of what it claims, or with no questions at
+        all, is refused rather than run: a screening with a plan the worker only
+        partly understood would ask a subset of the questions and then report a
+        complete conversation.
+        """
+        status = data.get("status")
+        status_str = str(status) if status is not None else None
+        if data.get("ok") is not True:
+            return cls(False, status_str)
+
+        state = cls(True, status_str)
+        context = data.get("context")
+        if isinstance(context, dict):
+            name = context.get("candidate_name")
+            state.candidate_name = str(name) if isinstance(name, str) and name else None
+
+        plan = data.get("plan")
+        declared = None
+        if isinstance(plan, dict):
+            source = plan.get("source")
+            state.plan_source = str(source) if isinstance(source, str) else None
+            declared = _bounded_int(plan.get("question_count"))
+            raw_questions = plan.get("questions")
+            if isinstance(raw_questions, list):
+                for entry in raw_questions:
+                    if not isinstance(entry, dict):
+                        continue
+                    key = entry.get("key")
+                    text = entry.get("text")
+                    if not isinstance(key, str) or not key:
+                        continue
+                    if not isinstance(text, str) or not text.strip():
+                        continue
+                    hint = entry.get("hint")
+                    state.questions.append(PhonePlanQuestion(
+                        key,
+                        text.strip(),
+                        entry.get("mandatory") is True,
+                        str(hint) if isinstance(hint, str) and hint else None,
+                    ))
+
+        if not state.questions or declared != len(state.questions):
+            _log.warn(
+                "unknown_event", error_type="phone_api_failed",
+                error_category=_ERR_MALFORMED, schema="assessment_plan",
+            )
+            return cls(False, _ERR_MALFORMED)
+
+        progress = data.get("progress")
+        if isinstance(progress, dict):
+            state.cursor = _bounded_int(progress.get("cursor")) or 0
+            nxt = progress.get("next_key")
+            state.next_key = str(nxt) if isinstance(nxt, str) and nxt else None
+            keys = progress.get("completed_keys")
+            if isinstance(keys, list):
+                state.completed_keys = [k for k in keys if isinstance(k, str)]
+            state.plan_complete = progress.get("plan_complete") is True
+
+        raw_turns = data.get("turns")
+        if isinstance(raw_turns, list):
+            for entry in raw_turns:
+                if not isinstance(entry, dict):
+                    continue
+                speaker = entry.get("speaker")
+                text = entry.get("text")
+                if speaker in ("bot", "candidate") and isinstance(text, str) and text:
+                    state.turns.append({"speaker": speaker, "text": text})
+
+        state.assessment_exists = data.get("assessment_exists") is True
+        state.already_scored = data.get("already_scored") is True
+        return state
+
+    def question_at(self, index: int) -> PhonePlanQuestion | None:
+        if 0 <= index < len(self.questions):
+            return self.questions[index]
+        return None
+
+
+def plan_source_event_id(question_key: str) -> str:
+    """The idempotency key for one boundary.
+
+    Derived from the QUESTION KEY, not from a counter or a clock, so a retry
+    of the same boundary — in this leg or in a later one — converges on the
+    original success instead of appending the exchange a second time. The
+    server also enforces one row per (session, key), so the two agree.
+    """
+    return f"q:{question_key}"
+
+
+def valid_boundary_turns(turns: Any) -> bool:
+    """The SAME shape rule 0044 enforces, checked before the network call.
+
+    Not a substitute for the server's check — the server is the authority and
+    refuses `invalid_turns` regardless. This exists so a malformed exchange
+    becomes a local halt instead of a round trip, and so the worker's own
+    notion of "a completed question" cannot silently drift from the database's.
+    """
+    if not isinstance(turns, list) or not 2 <= len(turns) <= 12:
+        return False
+    for turn in turns:
+        if not isinstance(turn, dict):
+            return False
+        if turn.get("speaker") not in ("bot", "candidate"):
+            return False
+        text = turn.get("text")
+        if not isinstance(text, str) or not text.strip() or len(text) > 8000:
+            return False
+    if turns[0].get("speaker") != "bot":
+        return False
+    return turns[-1].get("speaker") == "candidate"
+
+
+# The rehydration bound. A reconnect's prior exchange is replayed into the
+# prompt so the model can refer to what the candidate already said — but it is
+# BOUNDED, because a long screening's transcript would otherwise grow the system
+# prompt on every leg and eventually crowd out the instructions themselves.
+RESUME_MAX_TURNS = 24
+RESUME_MAX_CHARS = 600
+
+
+def render_resume_context(turns: list[dict[str, str]]) -> str:
+    """Render the persisted exchange for the prompt, or "" when there is none.
+
+    This is how a reconnecting leg's model learns what was already said. It is
+    deliberately NOT how the leg learns what to ask NEXT — that comes from the
+    cursor, and a model reading this transcript is never asked to work out
+    which questions remain. The two are separate on purpose: prose is what has
+    no identity, and inferring identity from it is the failure this phase
+    exists to prevent.
+
+    Only the most recent turns are kept, and each is clipped, so the prompt has
+    a bound no conversation length can breach.
+    """
+    if not turns:
+        return ""
+    recent = turns[-RESUME_MAX_TURNS:]
+    lines = ["EARLIER IN THIS CALL (before the line dropped) — do NOT ask these again:"]
+    for turn in recent:
+        speaker = "You" if turn.get("speaker") == "bot" else "Candidate"
+        text = str(turn.get("text") or "").strip()
+        if not text:
+            continue
+        if len(text) > RESUME_MAX_CHARS:
+            text = text[:RESUME_MAX_CHARS] + "..."
+        lines.append(f"{speaker}: {text}")
+    if len(lines) == 1:
+        return ""
+    lines.append(
+        "Pick up naturally from there. Acknowledge briefly that you were "
+        "disconnected; do not re-run the whole conversation."
+    )
+    return "\n".join(lines)
+
+
+class PhoneAssessmentResult:
+    """The verdict of one leg's assessment run.
+
+    Exactly one of the three outcomes is true, and each maps to a DIFFERENT
+    terminal decision:
+
+      * ``scored``  -> the worker may post ``assessment.completed``.
+      * ``halted``  -> a persistence or infrastructure failure. The worker
+        posts NOTHING: the conversation is not over, it is interrupted, and
+        0042's existing reconnect budget owns what happens next. Posting a
+        terminal event here would convert a retryable problem into a lost
+        candidate.
+      * neither     -> the conversation ended without completing. The worker
+        posts ``assessment.aborted``, exactly as P4a did — truthful that the
+        call happened and produced nothing.
+    """
+
+    __slots__ = ("scored", "halted", "halt_reason", "cursor", "completed", "status")
+
+    def __init__(
+        self,
+        *,
+        scored: bool = False,
+        halted: bool = False,
+        halt_reason: str | None = None,
+        cursor: int = 0,
+        completed: Optional[list[str]] = None,
+        status: str | None = None,
+    ) -> None:
+        self.scored = scored
+        self.halted = halted
+        self.halt_reason = halt_reason
+        self.cursor = cursor
+        self.completed = completed if completed is not None else []
+        self.status = status
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return (
+            f"PhoneAssessmentResult(scored={self.scored}, halted={self.halted}, "
+            f"halt_reason={self.halt_reason!r}, cursor={self.cursor})"
+        )
+
+
+async def run_phone_assessment(
+    *,
+    attempt_id: str,
+    session_id: str,
+    client: PhoneEventClient,
+    state: PhoneAssessmentState,
+    ask: Callable[[PhonePlanQuestion, int], Awaitable[Any]],
+    say: Callable[[str], Awaitable[Any]],
+    completion_attempts: int = 3,
+    completion_backoff_sec: float = 1.0,
+    sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+) -> PhoneAssessmentResult:
+    """Ask every unfinished key, commit each boundary, then complete.
+
+    ``ask`` is the injected seam that actually talks: it is handed the question
+    the SERVER says is owed and must return the ordered exchange for it. It is
+    never asked to decide which question comes next, and its answer is never
+    used to work out which question it just covered.
+
+    The loop is driven by the cursor the SERVER returns, not by a local
+    counter. A boundary that is not committed does not advance anything, so the
+    same question is owed again — which is exactly what should happen.
+    """
+    cursor = state.cursor
+    completed = list(state.completed_keys)
+
+    # A plan that is already complete on arrival is a reconnect that dropped
+    # between the last answer and the completion. Skip straight to completing.
+    while cursor < len(state.questions):
+        question = state.question_at(cursor)
+        if question is None:
+            break
+
+        try:
+            turns = await ask(question, cursor)
+        except Exception:  # noqa: BLE001
+            _log.warn(
+                "unknown_event", error_type="phone_assessment_halted",
+                error_category=HALT_NO_ANSWER, schema=question.key,
+            )
+            return PhoneAssessmentResult(
+                halted=True, halt_reason=HALT_NO_ANSWER, cursor=cursor, completed=completed,
+            )
+
+        if not valid_boundary_turns(turns):
+            # No answer was captured, or the exchange is not a completed
+            # question. Halting is the honest response: committing a partial
+            # exchange would record an answer the candidate did not give.
+            _log.warn(
+                "unknown_event", error_type="phone_assessment_halted",
+                error_category=HALT_MALFORMED_EXCHANGE, schema=question.key,
+            )
+            return PhoneAssessmentResult(
+                halted=True, halt_reason=HALT_MALFORMED_EXCHANGE,
+                cursor=cursor, completed=completed,
+            )
+
+        outcome = await client.commit_boundary(
+            session_id, question.key, cursor,
+            plan_source_event_id(question.key), turns,
+        )
+        if not outcome.ok:
+            # NO NEXT QUESTION AND NO COMPLETION. The candidate's answer is not
+            # durable, so continuing would build a conversation whose record
+            # has a hole in it and then score the hole.
+            _log.warn(
+                "unknown_event", error_type="phone_assessment_halted",
+                error_category=HALT_PERSISTENCE, schema=question.key,
+            )
+            return PhoneAssessmentResult(
+                halted=True, halt_reason=HALT_PERSISTENCE, cursor=cursor,
+                completed=completed, status=outcome.status,
+            )
+
+        if outcome.duplicate:
+            # The exchange THIS leg captured was discarded: the boundary was
+            # already committed under the same key, by this leg's earlier
+            # attempt or by a leg that ran before it. Advancing is correct —
+            # the question IS answered and recorded — but the two are not the
+            # same event, and an operator reading the transcript will see the
+            # OTHER exchange. Logged rather than silently equated.
+            _log.info(
+                "unknown_event", error_type="phone_boundary_duplicate",
+                schema=question.key,
+            )
+        completed.append(question.key)
+        # The SERVER's cursor, never a local increment. A local counter is the
+        # thing a reconnect makes wrong.
+        advanced = outcome.cursor
+        cursor = advanced if advanced is not None and advanced > cursor else cursor + 1
+
+    await say(PHONE_ASSESSMENT_CLOSING_TEXT)
+
+    # ── THE COMPLETION IS RETRIED, BOUNDEDLY ──────────────────────────
+    # Every question is durable by this point. A single unlucky inference call
+    # or a blip between the worker and the API would otherwise throw the whole
+    # screening away, because the session is `completed` afterwards and a later
+    # leg's `start_phone_assessment` refuses it — so there is no second chance
+    # from the conversation. `/assessment/complete` is idempotent by
+    # construction (the partial unique index admits one assessment per session
+    # and the loser reuses the winner's row), which is what makes retrying it
+    # safe rather than merely hopeful.
+    done: PhoneApiOutcome | None = None
+    for attempt in range(max(1, completion_attempts)):
+        done = await client.complete_assessment(attempt_id, session_id)
+        if done.ok:
+            break
+        if not retryable_completion(done):
+            # `plan_incomplete`, `session_not_active`, `unknown_session`: a
+            # state, not a fault. Retrying cannot change it.
+            break
+        if attempt + 1 < max(1, completion_attempts):
+            await sleep(completion_backoff_sec * (attempt + 1))
+
+    if done is None or not done.ok:
+        status = done.status if done is not None else None
+        category = status or (done.error_category if done is not None else None)
+        if done is None or (status is None and done.error_category is not None):
+            # We never got an answer we understand — a transport failure or a
+            # malformed body. We do NOT know whether the screening was scored,
+            # and a terminal event either way would be a claim we cannot
+            # support. Halt instead, and let the reconnect path own it.
+            _log.warn(
+                "unknown_event", error_type="phone_assessment_halted",
+                error_category=HALT_SCORING,
+            )
+            return PhoneAssessmentResult(
+                halted=True, halt_reason=HALT_SCORING, cursor=cursor,
+                completed=completed, status=category,
+            )
+        # The API gave us a verdict we understand and it is not a score.
+        # `assessment.aborted` is the truthful terminal: the conversation
+        # happened, the transcript is durable, and nothing scored it.
+        #
+        # `unclassified` covers the one hole left in the classifier: a 200 body
+        # carrying neither a `status` nor an error category. The route always
+        # sets `status`, so reaching it needs code drift — but an abort logged
+        # with NO reason at all is an abort nobody can diagnose, and this branch
+        # is where a screening ends.
+        _log.warn(
+            "unknown_event", error_type="phone_assessment_unscored",
+            error_category=category or "unclassified",
+        )
+        return PhoneAssessmentResult(cursor=cursor, completed=completed, status=status)
+
+    _log.info(
+        "unknown_event", error_type="phone_assessment_scored",
+        error_category=done.status,
+    )
+    return PhoneAssessmentResult(
+        scored=True, cursor=cursor, completed=completed, status=done.status,
+    )
 
 
 # ── The callback-scheduling tool ──────────────────────────────────────

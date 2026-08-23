@@ -43,6 +43,9 @@ import {
   type FinalizePhoneAttemptRecordingStatus,
   type ListPhoneEngagementRecordingsStatus,
   type ClearPhoneAttemptRecordingsStatus,
+  type CommitPhoneQuestionBoundaryStatus,
+  type GetPhoneAssessmentStateStatus,
+  type StartPhoneAssessmentStatus,
 } from './rpc-contract.js';
 import type {
   AdmitPhoneAttemptInput,
@@ -68,6 +71,12 @@ import type {
   ListPhoneEngagementRecordingsResult,
   ClearPhoneAttemptRecordingsResult,
   PhoneRecordingArtifact,
+  CommitPhoneQuestionBoundaryInput,
+  CommitPhoneQuestionBoundaryResult,
+  PhoneAssessmentState,
+  PhoneAssessmentTurn,
+  PhonePlanQuestion,
+  StartPhoneAssessmentInput,
 } from './ports.js';
 import {
   PHONE_ATTEMPT_KINDS,
@@ -175,6 +184,79 @@ function isoInstant(at: Date): string {
     throw new Error('phone_now_invalid');
   }
   return at.toISOString();
+}
+
+
+/**
+ * Project the 0044 assessment-state payload, field by field.
+ *
+ * Nothing is spread. The RPC's answer is read key by key and anything it does
+ * not name here is DISCARDED rather than forwarded, so a future migration
+ * cannot widen what crosses this boundary — and reaches a voice worker and a
+ * language model — without this function changing.
+ *
+ * A question or a turn that does not have the exact shape declared is dropped
+ * rather than coerced, and the drop is visible: a plan whose questions came
+ * back malformed has fewer of them than `questionCount` says, which the API
+ * layer refuses.
+ */
+function projectAssessmentState(
+  rpc: 'start_phone_assessment' | 'get_phone_assessment_state',
+  data: unknown,
+): PhoneAssessmentState {
+  const row = asRow(data);
+  const status =
+    rpc === 'start_phone_assessment'
+      ? narrowPhoneRpcStatus<StartPhoneAssessmentStatus>(rpc, row)
+      : narrowPhoneRpcStatus<GetPhoneAssessmentStateStatus>(rpc, row);
+
+  const questions: PhonePlanQuestion[] = [];
+  const rawQuestions = row?.questions;
+  if (Array.isArray(rawQuestions)) {
+    for (const entry of rawQuestions) {
+      const q = asRow(entry);
+      const key = str(q, 'key');
+      const text = str(q, 'text');
+      if (key === undefined || text === undefined) continue;
+      questions.push({ key, text, mandatory: bool(q, 'mandatory') === true, hint: str(q, 'hint') ?? null });
+    }
+  }
+
+  const turns: PhoneAssessmentTurn[] = [];
+  const rawTurns = row?.turns;
+  if (Array.isArray(rawTurns)) {
+    for (const entry of rawTurns) {
+      const t = asRow(entry);
+      const turnIndex = num(t, 'turn_index');
+      const speaker = member<'bot' | 'candidate'>(t, 'speaker', ['bot', 'candidate']);
+      const text = str(t, 'text');
+      if (turnIndex === undefined || speaker === undefined || text === undefined) continue;
+      turns.push({ turnIndex, speaker, text });
+    }
+  }
+
+  const rawCompleted = row?.completed_keys;
+  const completedKeys = Array.isArray(rawCompleted)
+    ? rawCompleted.filter((k): k is string => typeof k === 'string')
+    : undefined;
+
+  return {
+    status,
+    sessionId: str(row, 'session_id'),
+    sessionStatus: str(row, 'session_status'),
+    terminalReason: row && 'terminal_reason' in row ? (str(row, 'terminal_reason') ?? null) : undefined,
+    candidateName: row && 'candidate_name' in row ? (str(row, 'candidate_name') ?? null) : undefined,
+    planSource: str(row, 'plan_source'),
+    questionCount: num(row, 'question_count'),
+    questions: Array.isArray(rawQuestions) ? questions : undefined,
+    cursor: num(row, 'cursor'),
+    nextKey: row && 'next_key' in row ? (str(row, 'next_key') ?? null) : undefined,
+    completedKeys,
+    turns: Array.isArray(rawTurns) ? turns : undefined,
+    assessmentExists: bool(row, 'assessment_exists'),
+    alreadyScored: bool(row, 'already_scored'),
+    planComplete: bool(row, 'plan_complete'),
+  };
 }
 
 /**
@@ -534,6 +616,63 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
           row,
         ),
         cleared: num(row, 'cleared'),
+      };
+    },
+
+    async startAssessment(input: StartPhoneAssessmentInput): Promise<PhoneAssessmentState> {
+      const { data, error } = await client.rpc('start_phone_assessment', {
+        p_attempt_id: input.attemptId,
+        p_session_id: input.sessionId,
+        p_now: isoInstant(input.now),
+      });
+      if (error) throw new Error('phone_start_assessment_error');
+      return projectAssessmentState('start_phone_assessment', data);
+    },
+
+    async assessmentState(input): Promise<PhoneAssessmentState> {
+      const { data, error } = await client.rpc('get_phone_assessment_state', {
+        p_session_id: input.sessionId,
+      });
+      if (error) throw new Error('phone_assessment_state_error');
+      return projectAssessmentState('get_phone_assessment_state', data);
+    },
+
+    async commitQuestionBoundary(
+      input: CommitPhoneQuestionBoundaryInput,
+    ): Promise<CommitPhoneQuestionBoundaryResult> {
+      const { data, error } = await client.rpc('commit_phone_question_boundary', {
+        p_session_id: input.sessionId,
+        p_question_key: input.questionKey,
+        p_expected_index: input.expectedIndex,
+        p_source_event_id: input.sourceEventId,
+        // Serialized here rather than passed through, so nothing but
+        // `speaker` and `text` can reach the database however the caller
+        // shaped its objects.
+        p_turns: input.turns.map((t) => ({ speaker: t.speaker, text: t.text })),
+        p_now: isoInstant(input.now),
+      });
+      if (error) throw new Error('phone_commit_boundary_error');
+      const row = asRow(data);
+      const status = narrowPhoneRpcStatus<CommitPhoneQuestionBoundaryStatus>(
+        'commit_phone_question_boundary',
+        row,
+      );
+      return {
+        status,
+        // `applied` is read from the ANSWER, never inferred from the status:
+        // a body that said `applied` without the flag is one this layer did
+        // not understand, and a caller must not treat it as a durable write.
+        applied: bool(row, 'applied') === true && status === 'applied',
+        duplicate: bool(row, 'duplicate') === true,
+        questionKey: str(row, 'question_key'),
+        questionIndex: num(row, 'question_index'),
+        firstTurnIndex: num(row, 'first_turn_index'),
+        lastTurnIndex: num(row, 'last_turn_index'),
+        cursor: num(row, 'cursor'),
+        questionCount: num(row, 'question_count'),
+        planComplete: bool(row, 'plan_complete'),
+        expectedKey: str(row, 'expected_key'),
+        sessionStatus: str(row, 'session_status'),
       };
     },
   };

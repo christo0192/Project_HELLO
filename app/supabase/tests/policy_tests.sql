@@ -8542,7 +8542,14 @@ begin
                              'reclaim_phone_attempt_leases','apply_phone_event',
                              'schedule_phone_appointment','cancel_phone_appointment',
                              'expire_phone_appointments',
-                             'set_phone_halt','clear_phone_halt'))
+                             'set_phone_halt','clear_phone_halt',
+                             -- 0044: the three assessment-persistence RPCs.
+                             -- Enumerated because none of them matches the
+                             -- `phone\_%` prefix, and an RPC this check
+                             -- silently skips is one nobody is checking.
+                             'start_phone_assessment',
+                             'get_phone_assessment_state',
+                             'commit_phone_question_boundary'))
   loop
     if not v_fn.prosecdef and v_fn.proname not in ('phone_ist_date','phone_ist_window_open',
                                                    'phone_ist_window_open_at',
@@ -8588,7 +8595,14 @@ begin
                              'reclaim_phone_attempt_leases','apply_phone_event',
                              'schedule_phone_appointment','cancel_phone_appointment',
                              'expire_phone_appointments',
-                             'set_phone_halt','clear_phone_halt'))
+                             'set_phone_halt','clear_phone_halt',
+                             -- 0044: the three assessment-persistence RPCs.
+                             -- Enumerated because none of them matches the
+                             -- `phone\_%` prefix, and an RPC this check
+                             -- silently skips is one nobody is checking.
+                             'start_phone_assessment',
+                             'get_phone_assessment_state',
+                             'commit_phone_question_boundary'))
   loop
     -- Everything after the opening dollar-quote is the body; the
     -- signature (and therefore `p_now timestamptz default now()`) is
@@ -11024,6 +11038,861 @@ select _policy_tests.assert(
   (select count(*) from screening_v2.phone_control where control_key = 'default') = 1
   and (select halted_at is null from screening_v2.phone_control where control_key = 'default'),
   'the halt tests must never leave the kill switch engaged for the races that follow');
+
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- 0044 — Phone assessment persistence, keyed resume, truthful completion
+-- ═══════════════════════════════════════════════════════════════════════
+-- Structure first (the assertions that stay true when a later edit looks
+-- harmless), then behaviour against the real RPCs with an injected clock.
+
+select _policy_tests.assert(
+  '0044: RLS is enabled on both new phone tables',
+  (select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace
+    where n.nspname = 'screening_v2'
+      and c.relname in ('phone_session_plans','phone_session_progress')
+      and c.relrowsecurity) = 2,
+  'a question plan plus a progress trail is a re-identifiable record of one person''s screening');
+
+select _policy_tests.assert(
+  '0044: neither new phone table is readable or writable by a browser role',
+  not exists (
+    select 1 from information_schema.role_table_grants
+     where table_schema = 'screening_v2'
+       and table_name in ('phone_session_plans','phone_session_progress')
+       and grantee in ('anon','authenticated','PUBLIC')),
+  'the phone lane has no browser surface and these tables must not open one');
+
+select _policy_tests.assert(
+  '0044: neither new phone table carries a phone, provider or answer-text column',
+  not exists (
+    select 1 from pg_attribute a
+      join pg_class c on c.oid = a.attrelid
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2'
+       and c.relname in ('phone_session_plans','phone_session_progress')
+       and a.attnum > 0 and not a.attisdropped
+       and (a.attname like '%phone%' or a.attname like '%e164%'
+            or a.attname in ('answer','answer_text','transcript','sip_call_id',
+                             'egress_id','participant_identity','metadata'))),
+  'the answer is the transcript; duplicating it here would create a second copy nothing purges');
+
+select _policy_tests.assert(
+  '0044: the phone assessment uniqueness is PARTIAL over source = phone',
+  exists (
+    select 1 from pg_index i
+      join pg_class ic on ic.oid = i.indexrelid
+      join pg_namespace n on n.oid = ic.relnamespace
+     where n.nspname = 'screening_v2'
+       and ic.relname = 'uq_assessments_phone_session'
+       and i.indisunique
+       and pg_get_expr(i.indpred, i.indrelid) is not null),
+  'a GLOBAL unique index on assessments(session_id) cannot be built NOT VALID and would fail '
+    || 'outright if the browser path has ever produced two rows for one session');
+
+select _policy_tests.assert(
+  '0044: assessments.source defaults to browser, so every legacy row is unconstrained',
+  (select column_default like '''browser''%' and is_nullable = 'NO'
+     from information_schema.columns
+    where table_schema = 'screening_v2' and table_name = 'assessments'
+      and column_name = 'source'),
+  'a default of phone, or a nullable column, would drag every existing row into the new index');
+
+select _policy_tests.assert(
+  '0044: the ignored-reason allowlist was NOT widened — the refusal writes no row at all',
+  (select array_agg(m[1] order by m[1])
+     from pg_constraint,
+          lateral regexp_matches(pg_get_constraintdef(oid), '''([a-z_]+)''', 'g') m
+    where conname = 'chk_phone_call_events_ignored_reason')
+  = array['stale_epoch','terminal','unexpected_event','unknown_attempt'],
+  'assessment_missing is a pre-insert refusal like attempt_required, not a recorded verdict; '
+    || 'recording it under the deterministic internal event id would wedge the call forever');
+
+-- ── Behaviour ─────────────────────────────────────────────────────────
+
+create or replace function _policy_tests.phone44_fixture(
+  p_tag   text,
+  p_state text default 'in_call'
+)
+returns uuid[]
+language plpgsql as $f44$
+declare
+  v_eng uuid; v_att uuid; v_sess uuid; v_cand uuid; v_role uuid;
+begin
+  v_eng := _policy_tests.phone_fixture(p_tag, p_state);
+  select candidate_id, role_id into v_cand, v_role
+    from screening_v2.phone_engagements where id = v_eng;
+
+  -- 0006 requires every session to be born `created`; the dialer moves it
+  -- to `waiting` when the room is provisioned, exactly as the browser
+  -- invite flow does. start_phone_assessment accepts `waiting` and
+  -- `in_progress` and nothing else, which is the same window the browser
+  -- worker-context resolver has always accepted.
+  insert into screening_v2.call_sessions
+    (candidate_id, role_id, mode, provider, external_call_id, status, started_at)
+  values (v_cand, v_role, 'live', 'livekit', 'placeholder', 'created',
+          '2026-09-01T06:00:00Z'::timestamptz)
+  returning id into v_sess;
+  -- The room name is derived from the session id, so it can only be
+  -- written after the row exists. That is exactly the binding
+  -- start_phone_assessment verifies.
+  update screening_v2.call_sessions
+     set external_call_id = 'phone-' || v_sess::text, status = 'waiting'
+   where id = v_sess;
+
+  insert into screening_v2.phone_call_attempts
+    (engagement_id, attempt_seq, epoch, kind, state, ist_date, prior_engagement_state,
+     admitted_at)
+  values (v_eng, 1, (select epoch from screening_v2.phone_engagements where id = v_eng),
+          'initial', 'human',
+          screening_v2.phone_ist_date('2026-09-01T06:00:00Z'::timestamptz), 'eligible',
+          '2026-09-01T06:00:00Z'::timestamptz)
+  returning id into v_att;
+
+  return array[v_eng, v_att, v_sess];
+end;
+$f44$;
+
+create or replace function _policy_tests.phone44_teardown(p_tag text)
+returns void language plpgsql as $t44$
+declare v_sessions uuid[];
+begin
+  select coalesce(array_agg(s.id), '{}') into v_sessions
+    from screening_v2.call_sessions s
+    join screening_v2.candidates c on c.id = s.candidate_id
+   where c.email = p_tag || '@example.test';
+  delete from screening_v2.assessments            where session_id = any(v_sessions);
+  delete from screening_v2.phone_session_progress where session_id = any(v_sessions);
+  delete from screening_v2.phone_session_plans    where session_id = any(v_sessions);
+  delete from screening_v2.transcript_turns       where session_id = any(v_sessions);
+  -- ENGAGEMENT FIRST, DELIBERATELY. A TERMINAL engagement is immutable
+  -- under the 0042 transition trigger, so its `on delete set null`
+  -- session FK behaves as a de-facto RESTRICT: dropping the session out
+  -- from under a completed engagement would try to UPDATE it and be
+  -- refused. Removing the engagement first sidesteps that entirely.
+  perform _policy_tests.phone_teardown(p_tag);
+  delete from screening_v2.call_sessions          where id = any(v_sessions);
+end;
+$t44$;
+
+-- ── D1: the plan is snapshotted once, and a role edit cannot renumber it
+do $$
+declare
+  v_ids uuid[]; v_res jsonb; v_res2 jsonb; v_role uuid;
+begin
+  v_ids := _policy_tests.phone44_fixture('pol44-plan');
+  select role_id into v_role from screening_v2.phone_engagements where id = v_ids[1];
+
+  update screening_v2.roles
+     set screening_template = '[{"id":"k1","question":"First?","mandatory":true},
+                                {"id":"k2","question":"Second?","follow_up_hint":"dig"}]'::jsonb
+   where id = v_role;
+
+  v_res := screening_v2.start_phone_assessment(
+             v_ids[2], v_ids[3], '2026-09-01T06:00:00Z'::timestamptz);
+
+  perform _policy_tests.assert(
+    '0044-D1: the first start snapshots the role template, in order, with its own keys',
+    v_res ->> 'status' = 'ok'
+    and v_res ->> 'plan_source' = 'role_template'
+    and (v_res ->> 'question_count')::int = 2
+    and v_res -> 'questions' -> 0 ->> 'key' = 'k1'
+    and (v_res -> 'questions' -> 0 -> 'mandatory')::boolean
+    and v_res -> 'questions' -> 1 ->> 'hint' = 'dig'
+    and v_res ->> 'next_key' = 'k1',
+    'plan not snapshotted from the role template: ' || coalesce(v_res::text, 'null'));
+
+  perform _policy_tests.assert(
+    '0044-D1: start ACTIVATED the session and BOUND it to the engagement and the attempt',
+    (select status from screening_v2.call_sessions where id = v_ids[3]) = 'in_progress'
+    and (select session_id from screening_v2.phone_engagements where id = v_ids[1]) = v_ids[3]
+    and (select session_id from screening_v2.phone_call_attempts where id = v_ids[2]) = v_ids[3],
+    'a session that is never activated cannot be completed, and an unbound one cannot be scored');
+
+  -- The recruiter edits the role MID-CALL.
+  update screening_v2.roles
+     set screening_template = '[{"id":"zzz","question":"Totally different?"}]'::jsonb
+   where id = v_role;
+
+  v_res2 := screening_v2.start_phone_assessment(
+              v_ids[2], v_ids[3], '2026-09-01T06:05:00Z'::timestamptz);
+
+  perform _policy_tests.assert(
+    '0044-D1: a SECOND start (a reconnect) reuses the ORIGINAL snapshot, edits and all',
+    v_res2 ->> 'status' = 'ok'
+    and (v_res2 ->> 'question_count')::int = 2
+    and v_res2 -> 'questions' -> 0 ->> 'key' = 'k1'
+    and v_res2 ->> 'plan_source' = 'role_template',
+    'a role edited mid-call renumbered a conversation already in progress: ' || v_res2::text);
+
+  perform _policy_tests.phone44_teardown('pol44-plan');
+end;
+$$;
+
+-- ── D2: an empty template falls back to the default plan; a malformed
+--        one is REFUSED rather than silently replaced by it
+do $$
+declare
+  v_ids uuid[]; v_res jsonb; v_role uuid;
+begin
+  v_ids := _policy_tests.phone44_fixture('pol44-default');
+  select role_id into v_role from screening_v2.phone_engagements where id = v_ids[1];
+  update screening_v2.roles set screening_template = '[]'::jsonb where id = v_role;
+
+  v_res := screening_v2.start_phone_assessment(
+             v_ids[2], v_ids[3], '2026-09-01T06:00:00Z'::timestamptz);
+
+  perform _policy_tests.assert(
+    '0044-D2: an empty role template materialises the five-question default plan',
+    v_res ->> 'status' = 'ok'
+    and v_res ->> 'plan_source' = 'default'
+    and (v_res ->> 'question_count')::int = 5
+    and v_res -> 'questions' = screening_v2.phone_default_question_plan()
+    and v_res ->> 'next_key' = 'default_intro',
+    'default plan not materialised: ' || coalesce(v_res::text, 'null'));
+
+  perform _policy_tests.phone44_teardown('pol44-default');
+end;
+$$;
+
+do $$
+declare
+  v_ids uuid[]; v_res jsonb; v_role uuid; v_bad text := '';
+  v_case record;
+begin
+  for v_case in
+    select * from (values
+      ('dupe-key',  '[{"id":"k1","question":"A?"},{"id":"k1","question":"B?"}]'),
+      ('blank-id',  '[{"id":"  ","question":"A?"}]'),
+      ('no-text',   '[{"id":"k1","question":"   "}]'),
+      ('bad-key',   '[{"id":"has space","question":"A?"}]'),
+      ('not-object','["just a string"]'),
+      ('bad-flag',  '[{"id":"k1","question":"A?","mandatory":"yes"}]')
+    ) as t(label, tmpl)
+  loop
+    v_ids := _policy_tests.phone44_fixture('pol44-bad');
+    select role_id into v_role from screening_v2.phone_engagements where id = v_ids[1];
+    update screening_v2.roles set screening_template = v_case.tmpl::jsonb where id = v_role;
+
+    v_res := screening_v2.start_phone_assessment(
+               v_ids[2], v_ids[3], '2026-09-01T06:00:00Z'::timestamptz);
+    if v_res ->> 'status' <> 'invalid_role_template'
+       or exists (select 1 from screening_v2.phone_session_plans where session_id = v_ids[3]) then
+      v_bad := v_bad || v_case.label || '=' || coalesce(v_res ->> 'status', 'null') || ' ';
+    end if;
+    perform _policy_tests.phone44_teardown('pol44-bad');
+  end loop;
+
+  perform _policy_tests.assert(
+    '0044-D2: a malformed role template is REFUSED and writes no plan',
+    v_bad = '',
+    'silently falling back to the defaults screens a candidate against questions nobody chose: '
+      || v_bad);
+end;
+$$;
+
+-- ── D3: the consent gate, and the session binding, are both in SQL ────
+do $$
+declare
+  v_ids uuid[]; v_res jsonb; v_other uuid; v_role uuid;
+begin
+  -- `dialing` is the state a call sits in BEFORE `disclosure.delivered`.
+  v_ids := _policy_tests.phone44_fixture('pol44-gate', 'dialing');
+  v_res := screening_v2.start_phone_assessment(
+             v_ids[2], v_ids[3], '2026-09-01T06:00:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0044-D3: an assessment cannot begin before the disclosure was delivered',
+    v_res ->> 'status' = 'disclosure_not_delivered'
+    and not exists (select 1 from screening_v2.phone_session_plans where session_id = v_ids[3])
+    and (select status from screening_v2.call_sessions where id = v_ids[3]) = 'waiting',
+    'the same gate 0043 puts on recording must gate the screening itself: ' || v_res::text);
+  perform _policy_tests.phone44_teardown('pol44-gate');
+
+  -- A session belonging to somebody else.
+  v_ids := _policy_tests.phone44_fixture('pol44-bind');
+  select id into v_role from screening_v2.roles order by id limit 1;
+  insert into screening_v2.candidates (role_id, name, email, phone_e164, phone_valid)
+  values (v_role, 'pol44 other', 'pol44-other@example.test', '+919999012345', true)
+  returning id into v_other;
+  insert into screening_v2.call_sessions
+    (candidate_id, role_id, mode, provider, external_call_id, status)
+  values (v_other, v_role, 'live', 'livekit', 'placeholder', 'created')
+  returning id into v_other;
+  update screening_v2.call_sessions
+     set external_call_id = 'phone-' || v_other::text, status = 'waiting'
+   where id = v_other;
+
+  v_res := screening_v2.start_phone_assessment(
+             v_ids[2], v_other, '2026-09-01T06:00:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0044-D3: a worker cannot bind a session belonging to another candidate',
+    v_res ->> 'status' = 'session_candidate_mismatch'
+    and not exists (select 1 from screening_v2.phone_session_plans where session_id = v_other),
+    'the binding is verified, not taken on the worker''s word: ' || v_res::text);
+
+  -- A session whose room name is not this session's.
+  update screening_v2.call_sessions set external_call_id = 'phone-not-a-room' where id = v_ids[3];
+  v_res := screening_v2.start_phone_assessment(
+             v_ids[2], v_ids[3], '2026-09-01T06:00:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0044-D3: a session that does not name its own phone room is refused',
+    v_res ->> 'status' = 'session_binding_mismatch',
+    'external_call_id is the binding the browser worker-context has always checked: '
+      || v_res::text);
+
+  delete from screening_v2.call_sessions where id = v_other;
+  delete from screening_v2.candidates where email = 'pol44-other@example.test';
+  perform _policy_tests.phone44_teardown('pol44-bind');
+end;
+$$;
+
+-- ── D4: the question boundary is atomic, keyed, and cursor-checked ────
+do $$
+declare
+  v_ids uuid[]; v_res jsonb; v_role uuid; v_start jsonb;
+  v_turns jsonb := '[{"speaker":"bot","text":"First?"},
+                     {"speaker":"candidate","text":"Four years."}]'::jsonb;
+begin
+  v_ids := _policy_tests.phone44_fixture('pol44-turn');
+  select role_id into v_role from screening_v2.phone_engagements where id = v_ids[1];
+  update screening_v2.roles
+     set screening_template = '[{"id":"k1","question":"First?","mandatory":true},
+                                {"id":"k2","question":"Second?","mandatory":true}]'::jsonb
+   where id = v_role;
+  v_start := screening_v2.start_phone_assessment(
+               v_ids[2], v_ids[3], '2026-09-01T06:00:00Z'::timestamptz);
+
+  -- The model tries to answer the SECOND question first.
+  v_res := screening_v2.commit_phone_question_boundary(
+             v_ids[3], 'k2', 0, 'ev-skip', v_turns, '2026-09-01T06:01:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0044-D4: a key that is not the one the cursor owes is refused, and names the one owed',
+    v_res ->> 'status' = 'key_not_current'
+    and v_res ->> 'expected_key' = 'k1'
+    and not exists (select 1 from screening_v2.transcript_turns where session_id = v_ids[3])
+    and (select current_question_index from screening_v2.call_sessions where id = v_ids[3]) = 0,
+    'a model that can choose its own key can skip a mandatory one: ' || v_res::text);
+
+  -- A stale cursor, and an ABSENT one, are both refused.
+  v_res := screening_v2.commit_phone_question_boundary(
+             v_ids[3], 'k1', 1, 'ev-stale', v_turns, '2026-09-01T06:01:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0044-D4: a stale expected index is refused and reports the real cursor',
+    v_res ->> 'status' = 'stale_cursor' and (v_res ->> 'cursor')::int = 0
+    and not exists (select 1 from screening_v2.transcript_turns where session_id = v_ids[3]),
+    'stale cursor not refused: ' || v_res::text);
+  v_res := screening_v2.commit_phone_question_boundary(
+             v_ids[3], 'k1', null, 'ev-null', v_turns, '2026-09-01T06:01:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0044-D4: an OMITTED expected index is refused too — an absent CAS is not a weaker one',
+    v_res ->> 'status' = 'stale_cursor',
+    'a nullable CAS parameter callers may omit is a guard that can be skipped: ' || v_res::text);
+
+  -- The real boundary.
+  v_res := screening_v2.commit_phone_question_boundary(
+             v_ids[3], 'k1', 0, 'ev-1',
+             '[{"speaker":"bot","text":"So, how many years?"},
+               {"speaker":"candidate","text":"About four."},
+               {"speaker":"bot","text":"Four in total, or four in this stack?"},
+               {"speaker":"candidate","text":"Four in this stack."}]'::jsonb,
+             '2026-09-01T06:02:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0044-D4: a boundary appends every turn, records the key and advances the cursor, once',
+    v_res ->> 'status' = 'applied'
+    and (v_res ->> 'cursor')::int = 1
+    and (v_res ->> 'first_turn_index')::int = 0
+    and (v_res ->> 'last_turn_index')::int = 3
+    and (select count(*) from screening_v2.transcript_turns where session_id = v_ids[3]) = 4
+    and (select current_question_index from screening_v2.call_sessions where id = v_ids[3]) = 1
+    and (select question_key from screening_v2.phone_session_progress
+          where session_id = v_ids[3]) = 'k1',
+    'boundary not committed atomically: ' || v_res::text);
+
+  perform _policy_tests.assert(
+    '0044-D4: the follow-up exchange rode INSIDE the boundary and advanced nothing extra',
+    (select count(*) from screening_v2.phone_session_progress where session_id = v_ids[3]) = 1
+    and (select array_agg(speaker order by turn_index)
+           from screening_v2.transcript_turns where session_id = v_ids[3])
+        = array['bot','candidate','bot','candidate'],
+    'a follow-up that advanced the cursor would skip the question it was following up on');
+
+  -- The SAME source_event_id returns the ORIGINAL success and writes nothing.
+  v_res := screening_v2.commit_phone_question_boundary(
+             v_ids[3], 'k1', 0, 'ev-1', v_turns, '2026-09-01T06:03:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0044-D4: a duplicate boundary returns the ORIGINAL success and appends nothing',
+    v_res ->> 'status' = 'applied'
+    and (v_res -> 'duplicate')::boolean
+    and (v_res ->> 'question_key') = 'k1'
+    and (select count(*) from screening_v2.transcript_turns where session_id = v_ids[3]) = 4
+    and (select current_question_index from screening_v2.call_sessions where id = v_ids[3]) = 1,
+    'a retry after a lost response must converge, not append the exchange twice: ' || v_res::text);
+
+  -- The resuming leg is told exactly what it owes.
+  v_res := screening_v2.get_phone_assessment_state(v_ids[3]);
+  perform _policy_tests.assert(
+    '0044-D4: a resuming leg is told k1 is done and k2 is next, and gets the turns back',
+    v_res ->> 'next_key' = 'k2'
+    and (v_res ->> 'cursor')::int = 1
+    and v_res -> 'completed_keys' = '["k1"]'::jsonb
+    and jsonb_array_length(v_res -> 'turns') = 4
+    and not (v_res -> 'plan_complete')::boolean
+    and not (v_res -> 'assessment_exists')::boolean,
+    'resume state wrong: ' || v_res::text);
+
+  perform _policy_tests.phone44_teardown('pol44-turn');
+end;
+$$;
+
+-- ── D5: a malformed exchange writes NOTHING, and a failing insert takes
+--        the whole boundary with it
+do $$
+declare
+  v_ids uuid[]; v_res jsonb; v_role uuid; v_bad text := ''; v_case record;
+begin
+  v_ids := _policy_tests.phone44_fixture('pol44-shape');
+  select role_id into v_role from screening_v2.phone_engagements where id = v_ids[1];
+  update screening_v2.roles
+     set screening_template = '[{"id":"k1","question":"First?"}]'::jsonb where id = v_role;
+  perform screening_v2.start_phone_assessment(
+            v_ids[2], v_ids[3], '2026-09-01T06:00:00Z'::timestamptz);
+
+  for v_case in
+    select * from (values
+      ('one-turn',     '[{"speaker":"bot","text":"A?"}]'),
+      ('answer-first', '[{"speaker":"candidate","text":"Yes"},{"speaker":"bot","text":"A?"}]'),
+      ('ends-on-bot',  '[{"speaker":"bot","text":"A?"},{"speaker":"candidate","text":"Y"},
+                         {"speaker":"bot","text":"Thanks"}]'),
+      ('bad-speaker',  '[{"speaker":"system","text":"A?"},{"speaker":"candidate","text":"Y"}]'),
+      ('blank-text',   '[{"speaker":"bot","text":"   "},{"speaker":"candidate","text":"Y"}]'),
+      ('not-array',    '{"speaker":"bot","text":"A?"}'),
+      ('too-many',     '[{"speaker":"bot","text":"1"},{"speaker":"candidate","text":"1"},
+                         {"speaker":"bot","text":"2"},{"speaker":"candidate","text":"2"},
+                         {"speaker":"bot","text":"3"},{"speaker":"candidate","text":"3"},
+                         {"speaker":"bot","text":"4"},{"speaker":"candidate","text":"4"},
+                         {"speaker":"bot","text":"5"},{"speaker":"candidate","text":"5"},
+                         {"speaker":"bot","text":"6"},{"speaker":"candidate","text":"6"},
+                         {"speaker":"bot","text":"7"},{"speaker":"candidate","text":"7"}]')
+    ) as t(label, turns)
+  loop
+    v_res := screening_v2.commit_phone_question_boundary(
+               v_ids[3], 'k1', 0, 'ev-' || v_case.label, v_case.turns::jsonb,
+               '2026-09-01T06:01:00Z'::timestamptz);
+    if v_res ->> 'status' <> 'invalid_turns' then
+      v_bad := v_bad || v_case.label || '=' || coalesce(v_res ->> 'status','null') || ' ';
+    end if;
+  end loop;
+
+  perform _policy_tests.assert(
+    '0044-D5: every malformed exchange is refused invalid_turns and writes nothing',
+    v_bad = ''
+    and not exists (select 1 from screening_v2.transcript_turns where session_id = v_ids[3])
+    and not exists (select 1 from screening_v2.phone_session_progress where session_id = v_ids[3])
+    and (select current_question_index from screening_v2.call_sessions where id = v_ids[3]) = 0,
+    'malformed exchanges not refused: ' || v_bad);
+
+  -- ── The partial-pair rollback, proved with a per-row failure ─────
+  -- The boundary writes its turns, its progress row and its cursor
+  -- advance in one transaction. A failure on ANY row must take all three
+  -- with it — a bot turn without its answer, or a progress row without
+  -- its turns, is exactly the state a reconnect misreads.
+  --
+  -- The failure is injected with a trigger rather than contrived from a
+  -- unique collision, because `turn_index` is derived as max+1 under the
+  -- session row lock and therefore cannot collide with an existing row
+  -- at all. Injecting it makes the property testable without pretending
+  -- a collision is reachable.
+  create or replace function _policy_tests.pol44_fail_answer()
+  returns trigger language plpgsql as $ft$
+  begin
+    if new.speaker = 'candidate' then
+      raise exception 'pol44 synthetic per-row failure' using errcode = 'P0001';
+    end if;
+    return new;
+  end;
+  $ft$;
+  create trigger trg_pol44_fail_answer
+    before insert on screening_v2.transcript_turns
+    for each row execute function _policy_tests.pol44_fail_answer();
+
+  begin
+    perform screening_v2.commit_phone_question_boundary(
+              v_ids[3], 'k1', 0, 'ev-rollback',
+              '[{"speaker":"bot","text":"A?"},{"speaker":"candidate","text":"Y"}]'::jsonb,
+              '2026-09-01T06:04:00Z'::timestamptz);
+    v_bad := 'commit-succeeded';
+  exception when others then
+    v_bad := '';
+  end;
+
+  drop trigger trg_pol44_fail_answer on screening_v2.transcript_turns;
+
+  perform _policy_tests.assert(
+    '0044-D5: a per-row failure rolls the WHOLE boundary back — no turn, no progress, no cursor',
+    v_bad = ''
+    and not exists (select 1 from screening_v2.transcript_turns where session_id = v_ids[3])
+    and not exists (select 1 from screening_v2.phone_session_progress where session_id = v_ids[3])
+    and (select current_question_index from screening_v2.call_sessions where id = v_ids[3]) = 0,
+    'half a boundary is exactly the state a reconnect misreads: ' || v_bad);
+
+  -- CONTROL: the identical call, with the injected failure removed,
+  -- succeeds — so the assertion above is about the rollback and not
+  -- about a boundary that could never have committed anyway.
+  perform screening_v2.commit_phone_question_boundary(
+            v_ids[3], 'k1', 0, 'ev-rollback',
+            '[{"speaker":"bot","text":"A?"},{"speaker":"candidate","text":"Y"}]'::jsonb,
+            '2026-09-01T06:05:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0044-D5: CONTROL — the same boundary commits once the injected failure is gone',
+    (select count(*) from screening_v2.transcript_turns where session_id = v_ids[3]) = 2
+    and (select current_question_index from screening_v2.call_sessions where id = v_ids[3]) = 1,
+    'without this control the rollback assertion could pass vacuously');
+
+  -- SHAPE IS CHECKED BEFORE THE DUPLICATE READ-BACK. A malformed body that
+  -- happens to carry an ALREADY-COMMITTED event id must not be answered
+  -- `applied`: nothing is written either way, but a caller told its request
+  -- succeeded has been told something false about a request this function
+  -- never even parsed.
+  v_res := screening_v2.commit_phone_question_boundary(
+             v_ids[3], 'k1', 0, 'ev-rollback',
+             '[{"speaker":"bot","text":"only half an exchange"}]'::jsonb,
+             '2026-09-01T06:06:00Z'::timestamp with time zone);
+  perform _policy_tests.assert(
+    '0044-D5: a malformed body carrying a KNOWN event id is invalid_turns, not applied',
+    v_res ->> 'status' = 'invalid_turns',
+    'the duplicate read-back must not answer for a request that was never parsed: '
+      || v_res::text);
+
+  -- …and the well-formed duplicate still converges, so the check above did not
+  -- simply break idempotency.
+  v_res := screening_v2.commit_phone_question_boundary(
+             v_ids[3], 'k1', 0, 'ev-rollback',
+             '[{"speaker":"bot","text":"A?"},{"speaker":"candidate","text":"Y"}]'::jsonb,
+             '2026-09-01T06:07:00Z'::timestamp with time zone);
+  perform _policy_tests.assert(
+    '0044-D5: CONTROL — a WELL-FORMED duplicate still returns the original success',
+    v_res ->> 'status' = 'applied' and (v_res -> 'duplicate')::boolean
+    and (select count(*) from screening_v2.transcript_turns where session_id = v_ids[3]) = 2,
+    'moving the shape check ahead of the duplicate branch must not break idempotency');
+
+  perform _policy_tests.assert(
+    '0044-D5: the state RPC reports NO session-start instant, and no duration is invented',
+    (screening_v2.get_phone_assessment_state(v_ids[3]) ? 'started_at') = false,
+    'a phone session spans reconnects that 0042 can defer to the NEXT IST DAY, so no single '
+      || 'elapsed number is true of the conversation; call_sessions.duration_sec is left NULL '
+      || 'rather than filled with time-since-provisioning');
+
+  perform _policy_tests.phone44_teardown('pol44-shape');
+end;
+$$;
+
+-- ── D6: the completion claim cannot outrun the score ──────────────────
+do $$
+declare
+  v_ids uuid[]; v_res jsonb; v_role uuid; v_cand uuid; v_state text; v_reason text;
+  v_no_answer integer; v_reconnects integer; v_failures integer;
+  v_no_answer2 integer; v_reconnects2 integer; v_failures2 integer;
+begin
+  v_ids := _policy_tests.phone44_fixture('pol44-complete');
+  select role_id, candidate_id into v_role, v_cand
+    from screening_v2.phone_engagements where id = v_ids[1];
+  update screening_v2.roles
+     set screening_template = '[{"id":"k1","question":"First?"}]'::jsonb where id = v_role;
+  perform screening_v2.start_phone_assessment(
+            v_ids[2], v_ids[3], '2026-09-01T06:00:00Z'::timestamptz);
+  perform screening_v2.commit_phone_question_boundary(
+            v_ids[3], 'k1', 0, 'ev-1',
+            '[{"speaker":"bot","text":"A?"},{"speaker":"candidate","text":"Y"}]'::jsonb,
+            '2026-09-01T06:01:00Z'::timestamptz);
+
+  select no_answer_attempts, reconnects_used, provider_failures
+    into v_no_answer, v_reconnects, v_failures
+    from screening_v2.phone_engagements where id = v_ids[1];
+
+  -- The worker claims a completion with nothing scored.
+  v_res := screening_v2.apply_phone_event(
+             'internal', 'assessment.completed', v_ids[2], null, null, null, null,
+             '2026-09-01T06:05:00Z'::timestamptz);
+  select state, state_reason, no_answer_attempts, reconnects_used, provider_failures
+    into v_state, v_reason, v_no_answer2, v_reconnects2, v_failures2
+    from screening_v2.phone_engagements where id = v_ids[1];
+
+  perform _policy_tests.assert(
+    '0044-D6: assessment.completed is REFUSED while no phone assessment row exists',
+    v_res ->> 'status' = 'assessment_missing'
+    and v_state = 'in_call'
+    and (select terminal_at from screening_v2.phone_engagements where id = v_ids[1]) is null,
+    'a terminal completed with nothing behind it is unrecoverable: ' || v_res::text);
+
+  perform _policy_tests.assert(
+    '0044-D6: the premature claim wrote NO ledger row, so it does not pin itself',
+    not exists (
+      select 1 from screening_v2.phone_call_events
+       where attempt_id = v_ids[2] and event_type = 'assessment.completed'),
+    'the internal source mints a DETERMINISTIC event id, so a recorded refusal would be read '
+      || 'back by every later delivery and the call could never complete');
+
+  perform _policy_tests.assert(
+    '0044-D6: the refusal is FREE — no budget moves, so a retry after scoring is still possible',
+    v_no_answer2 = v_no_answer and v_reconnects2 = v_reconnects and v_failures2 = v_failures,
+    'a refusal that charged a budget would turn a scoring delay into a lost candidate');
+
+  -- Now score it, exactly as runAssessment does.
+  insert into screening_v2.assessments
+    (session_id, candidate_id, overall_score, recommendation, summary, raw, provenance, source)
+  values (v_ids[3], v_cand, 70, 'advance', 'pol44 synthetic', '{}'::jsonb,
+          '{"schema_version":1,"provider":"anthropic","requestedModel":"claude-sonnet-4-20250514","workload":"scoring","prompt_template_version":"2026-07-28.1","timestamp":"2026-07-28T12:00:00Z"}'::jsonb, 'phone');
+
+  perform _policy_tests.assert(
+    '0044-D6: a SECOND phone assessment for the same session is refused by the index',
+    (select count(*) from screening_v2.assessments
+      where session_id = v_ids[3] and source = 'phone') = 1,
+    'without uniqueness "scored exactly once" is a hope, not a fact');
+
+  begin
+    insert into screening_v2.assessments
+      (session_id, candidate_id, overall_score, recommendation, summary, raw, provenance, source)
+    values (v_ids[3], v_cand, 71, 'advance', 'pol44 duplicate', '{}'::jsonb,
+            '{"schema_version":1,"provider":"anthropic","requestedModel":"claude-sonnet-4-20250514","workload":"scoring","prompt_template_version":"2026-07-28.1","timestamp":"2026-07-28T12:00:00Z"}'::jsonb, 'phone');
+    perform _policy_tests.assert(
+      '0044-D6: uq_assessments_phone_session actually refuses the second row',
+      false, 'a second phone assessment was accepted');
+  exception when unique_violation then
+    perform _policy_tests.assert(
+      '0044-D6: uq_assessments_phone_session actually refuses the second row',
+      true, 'unreachable');
+  end;
+
+  -- A BROWSER-sourced second row is deliberately still allowed: the index
+  -- is partial, and widening it is a separate decision with its own
+  -- migration and its own duplicate preflight.
+  insert into screening_v2.assessments
+    (session_id, candidate_id, overall_score, recommendation, summary, raw, provenance)
+  values (v_ids[3], v_cand, 60, 'hold', 'pol44 browser one', '{}'::jsonb,
+          '{"schema_version":1,"provider":"anthropic","requestedModel":"claude-sonnet-4-20250514","workload":"scoring","prompt_template_version":"2026-07-28.1","timestamp":"2026-07-28T12:00:00Z"}'::jsonb);
+  insert into screening_v2.assessments
+    (session_id, candidate_id, overall_score, recommendation, summary, raw, provenance)
+  values (v_ids[3], v_cand, 61, 'hold', 'pol44 browser two', '{}'::jsonb,
+          '{"schema_version":1,"provider":"anthropic","requestedModel":"claude-sonnet-4-20250514","workload":"scoring","prompt_template_version":"2026-07-28.1","timestamp":"2026-07-28T12:00:00Z"}'::jsonb);
+  perform _policy_tests.assert(
+    '0044-D6: the partial index leaves the BROWSER path exactly as it was',
+    (select count(*) from screening_v2.assessments
+      where session_id = v_ids[3] and source = 'browser') = 2,
+    'a global index would have failed to build on data like this, taking the migration with it');
+
+  -- The same claim, now that a score exists.
+  v_res := screening_v2.apply_phone_event(
+             'internal', 'assessment.completed', v_ids[2], null, null, null, null,
+             '2026-09-01T06:06:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0044-D6: with the assessment in place the SAME claim is applied and goes terminal completed',
+    v_res ->> 'status' = 'applied'
+    and (select state from screening_v2.phone_engagements where id = v_ids[1]) = 'completed'
+    and (select outcome_class from screening_v2.phone_call_attempts where id = v_ids[2]) = 'completed',
+    'the interlock must let a legitimate completion through: ' || v_res::text);
+
+  perform _policy_tests.assert(
+    '0044-D6: the completion is budget-neutral, exactly as the aborted path it replaces',
+    (select no_answer_attempts = v_no_answer and reconnects_used = v_reconnects
+            and provider_failures = v_failures
+       from screening_v2.phone_engagements where id = v_ids[1]),
+    'silently changing which counter a hangup touches is the class this substrate keeps repairing');
+
+  perform _policy_tests.phone44_teardown('pol44-complete');
+end;
+$$;
+
+-- ── D8: a SCORED screening whose acknowledgement was lost ────────────
+-- F-1. The completion endpoint succeeded, inserted the assessment, and its
+-- response never reached the worker. The leg that saw that halted and posted
+-- nothing, which was right. A LATER leg then calls start — and must be told
+-- the screening is FINISHED, not merely that it cannot screen. Without the
+-- distinction the engagement can never reach `completed` from any leg.
+do $$
+declare
+  v_ids uuid[]; v_res jsonb; v_role uuid; v_cand uuid; v_state jsonb;
+begin
+  v_ids := _policy_tests.phone44_fixture('pol44-adopt');
+  select role_id, candidate_id into v_role, v_cand
+    from screening_v2.phone_engagements where id = v_ids[1];
+  update screening_v2.roles
+     set screening_template = '[{"id":"k1","question":"First?"}]'::jsonb where id = v_role;
+  perform screening_v2.start_phone_assessment(
+            v_ids[2], v_ids[3], '2026-09-01T06:00:00Z'::timestamptz);
+  perform screening_v2.commit_phone_question_boundary(
+            v_ids[3], 'k1', 0, 'ev-1',
+            '[{"speaker":"bot","text":"A?"},{"speaker":"candidate","text":"Y"}]'::jsonb,
+            '2026-09-01T06:01:00Z'::timestamptz);
+
+  -- The session completes. Still UNSCORED at this point.
+  update screening_v2.call_sessions
+     set status = 'completed', terminal_reason = 'conversation_complete',
+         ended_at = '2026-09-01T06:02:00Z'::timestamptz
+   where id = v_ids[3];
+
+  v_res := screening_v2.start_phone_assessment(
+             v_ids[2], v_ids[3], '2026-09-01T06:03:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0044-D8: a completed but UNSCORED session is session_not_active, not already_scored',
+    v_res ->> 'status' = 'session_not_active',
+    'claiming a completion for a session nothing scored is the exact error 0044 exists to '
+      || 'prevent: ' || v_res::text);
+
+  v_state := screening_v2.get_phone_assessment_state(v_ids[3]);
+  perform _policy_tests.assert(
+    '0044-D8: and the state RPC agrees — already_scored is false while no row exists',
+    (v_state -> 'already_scored')::boolean = false
+    and (v_state -> 'assessment_exists')::boolean = false,
+    'the two RPCs must not disagree about the same two-part condition: ' || v_state::text);
+
+  -- Now the row lands, exactly as runAssessment writes it.
+  insert into screening_v2.assessments
+    (session_id, candidate_id, overall_score, recommendation, summary, raw, provenance, source)
+  values (v_ids[3], v_cand, 70, 'advance', 'pol44 adopt', '{}'::jsonb,
+          '{"schema_version":1,"provider":"anthropic","requestedModel":"claude-sonnet-4-20250514","workload":"scoring","prompt_template_version":"2026-07-28.1","timestamp":"2026-07-28T12:00:00Z"}'::jsonb,
+          'phone');
+
+  v_res := screening_v2.start_phone_assessment(
+             v_ids[2], v_ids[3], '2026-09-01T06:04:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0044-D8: a completed AND scored session is already_scored — the adoption path',
+    v_res ->> 'status' = 'already_scored'
+    and (v_res -> 'assessment_exists')::boolean,
+    'a scored screening with no adoption path can never reach completed from any leg: '
+      || v_res::text);
+
+  perform _policy_tests.assert(
+    '0044-D8: already_scored carries NO plan and NO cursor — there is nothing left to screen',
+    not (v_res ? 'questions') and not (v_res ? 'cursor') and not (v_res ? 'next_key'),
+    'handing back a plan would invite a leg to re-ask questions that are already answered');
+
+  v_state := screening_v2.get_phone_assessment_state(v_ids[3]);
+  perform _policy_tests.assert(
+    '0044-D8: the state RPC names the same condition, so no caller re-derives it',
+    (v_state -> 'already_scored')::boolean
+    and (v_state -> 'assessment_exists')::boolean,
+    'a two-part condition re-derived by each caller is one remembered correctly by some of '
+      || 'them: ' || v_state::text);
+
+  -- AND the completion it authorises is accepted, which is the whole point.
+  v_res := screening_v2.apply_phone_event(
+             'internal', 'assessment.completed', v_ids[2], null, null, null, null,
+             '2026-09-01T06:05:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0044-D8: the adopted completion is APPLIED and drives the engagement to completed',
+    v_res ->> 'status' = 'applied'
+    and (select state from screening_v2.phone_engagements where id = v_ids[1]) = 'completed',
+    'adoption that cannot actually complete the engagement is not an adoption path: '
+      || v_res::text);
+
+  perform _policy_tests.assert(
+    '0044-D8: adoption wrote NO second assessment — nothing was re-scored',
+    (select count(*) from screening_v2.assessments where session_id = v_ids[3]) = 1,
+    'the row was already there; the only thing missing was the acknowledgement');
+
+  perform _policy_tests.phone44_teardown('pol44-adopt');
+end;
+$$;
+
+-- CONTROL: `already_scored` is decided AFTER the binding checks, so it can
+-- never describe somebody else's session.
+do $$
+declare
+  v_ids uuid[]; v_res jsonb; v_other uuid; v_role uuid; v_cand uuid;
+begin
+  v_ids := _policy_tests.phone44_fixture('pol44-adopt-bind');
+  select id into v_role from screening_v2.roles order by id limit 1;
+  insert into screening_v2.candidates (role_id, name, email, phone_e164, phone_valid)
+  values (v_role, 'pol44 adopt other', 'pol44-adopt-other@example.test',
+          '+919999012399', true)
+  returning id into v_cand;
+  insert into screening_v2.call_sessions
+    (candidate_id, role_id, mode, provider, external_call_id, status)
+  values (v_cand, v_role, 'live', 'livekit', 'placeholder', 'created')
+  returning id into v_other;
+  update screening_v2.call_sessions
+     set external_call_id = 'phone-' || v_other::text, status = 'waiting'
+   where id = v_other;
+  update screening_v2.call_sessions
+     set status = 'in_progress' where id = v_other;
+  update screening_v2.call_sessions
+     set status = 'completed', terminal_reason = 'conversation_complete'
+   where id = v_other;
+  insert into screening_v2.assessments
+    (session_id, candidate_id, overall_score, recommendation, summary, raw, provenance, source)
+  values (v_other, v_cand, 70, 'advance', 'pol44 other', '{}'::jsonb,
+          '{"schema_version":1,"provider":"anthropic","requestedModel":"claude-sonnet-4-20250514","workload":"scoring","prompt_template_version":"2026-07-28.1","timestamp":"2026-07-28T12:00:00Z"}'::jsonb,
+          'phone');
+
+  v_res := screening_v2.start_phone_assessment(
+             v_ids[2], v_other, '2026-09-01T06:00:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0044-D8: CONTROL — already_scored cannot describe another candidate''s scored session',
+    v_res ->> 'status' = 'session_candidate_mismatch',
+    'the binding checks must run FIRST, or already_scored becomes a way to fish for '
+      || 'somebody else''s completion: ' || v_res::text);
+
+  delete from screening_v2.assessments where session_id = v_other;
+  delete from screening_v2.call_sessions where id = v_other;
+  delete from screening_v2.candidates where email = 'pol44-adopt-other@example.test';
+  perform _policy_tests.phone44_teardown('pol44-adopt-bind');
+end;
+$$;
+
+-- ── D7: the plan and the progress trail are write-once ────────────────
+do $$
+declare
+  v_ids uuid[]; v_role uuid; v_blocked integer := 0;
+begin
+  v_ids := _policy_tests.phone44_fixture('pol44-immutable');
+  select role_id into v_role from screening_v2.phone_engagements where id = v_ids[1];
+  update screening_v2.roles
+     set screening_template = '[{"id":"k1","question":"First?"}]'::jsonb where id = v_role;
+  perform screening_v2.start_phone_assessment(
+            v_ids[2], v_ids[3], '2026-09-01T06:00:00Z'::timestamptz);
+  perform screening_v2.commit_phone_question_boundary(
+            v_ids[3], 'k1', 0, 'ev-1',
+            '[{"speaker":"bot","text":"A?"},{"speaker":"candidate","text":"Y"}]'::jsonb,
+            '2026-09-01T06:01:00Z'::timestamptz);
+
+  begin
+    update screening_v2.phone_session_plans
+       set questions = '[]'::jsonb where session_id = v_ids[3];
+  exception when others then v_blocked := v_blocked + 1;
+  end;
+  begin
+    update screening_v2.phone_session_progress
+       set question_key = 'k2' where session_id = v_ids[3];
+  exception when others then v_blocked := v_blocked + 1;
+  end;
+
+  perform _policy_tests.assert(
+    '0044-D7: UPDATE is blocked on both new tables, for service_role too',
+    v_blocked = 2
+    and (select questions -> 0 ->> 'key' from screening_v2.phone_session_plans
+          where session_id = v_ids[3]) = 'k1'
+    and (select question_key from screening_v2.phone_session_progress
+          where session_id = v_ids[3]) = 'k1',
+    'an editable plan is a conversation that can be silently renumbered mid-call');
+
+  -- DELETE stays available, because a session cascade and a data-subject
+  -- erasure both need it.
+  delete from screening_v2.phone_session_progress where session_id = v_ids[3];
+  perform _policy_tests.assert(
+    '0044-D7: DELETE is deliberately still permitted, so erasure and cascade both work',
+    not exists (select 1 from screening_v2.phone_session_progress where session_id = v_ids[3]),
+    'a row nothing can delete makes a data-subject request unsatisfiable');
+
+  perform _policy_tests.phone44_teardown('pol44-immutable');
+end;
+$$;
+
+select _policy_tests.assert(
+  '0044: the phone assessment fixtures left nothing behind',
+  not exists (select 1 from screening_v2.phone_session_plans)
+  and not exists (select 1 from screening_v2.phone_session_progress)
+  and not exists (select 1 from screening_v2.candidates where email like 'pol44-%@example.test'),
+  'a leaked fixture fails the GOV-06 cardinality suite with a message that points nowhere near it');
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)

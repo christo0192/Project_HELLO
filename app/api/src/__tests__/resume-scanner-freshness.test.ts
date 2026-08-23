@@ -459,18 +459,32 @@ describe('ClamAvScanner signature gating', () => {
   });
 
   it('removes the scratch directory on every path', async () => {
-    const before = (await readdir(tmpdir())).filter((n) => n.startsWith('hello-resume-scan-'));
+    // SCOPED TO WHAT THIS TEST CREATED, not to a global count of the shared OS
+    // tmpdir. `hello-resume-scan-*` is minted by every ClamAvScanner.scan in
+    // the process, and vitest runs suites in parallel workers — so a count
+    // taken before and after races any other file that scans at the same
+    // instant, and `resume-ingestion.test.ts` does exactly that. The race was
+    // always there; it only started firing when the suite grew enough to shift
+    // which files share a worker. A set difference proves the same property —
+    // this scanner leaves nothing behind — without asserting anything about
+    // somebody else's directories.
+    const before = new Set(
+      (await readdir(tmpdir())).filter((n) => n.startsWith('hello-resume-scan-')),
+    );
     for (const bin of ['true', 'false', 'binary-that-does-not-exist']) {
       await new ClamAvScanner(bin, 30_000, fresh).scan(Buffer.from('bytes to scan'));
     }
     const after = (await readdir(tmpdir())).filter((n) => n.startsWith('hello-resume-scan-'));
-    expect(after.length).toBe(before.length);
+    expect(after.filter((n) => !before.has(n))).toEqual([]);
   });
 
   it('hands the real bytes to clamscan and then wipes them before unlinking', async () => {
     // The stub hard-links the scratch file aside, so the same inode survives
     // the scanner's `rm` and can be inspected afterwards. That makes the
     // in-place zero-overwrite directly observable rather than assumed.
+    const preExisting = new Set(
+      (await readdir(tmpdir())).filter((n) => n.startsWith('hello-resume-scan-')),
+    );
     const spool = await mkdtemp(join(tmpdir(), 'scan-spool-'));
     const link = join(spool, 'linked.bin');
     const secret = 'SENSITIVE-RESUME-BYTES';
@@ -489,8 +503,12 @@ describe('ClamAvScanner signature gating', () => {
       expect(wiped.every((b) => b === 0)).toBe(true);
       expect(wiped.toString('utf8')).not.toContain('SENSITIVE');
 
-      // And the private scratch directory itself is gone.
-      const survivors = (await readdir(tmpdir())).filter((n) => n.startsWith('hello-resume-scan-'));
+      // And the private scratch directory itself is gone — measured as a set
+      // difference for the same reason as the test above: a concurrent worker's
+      // in-flight scan is not this test's business.
+      const survivors = (await readdir(tmpdir())).filter(
+        (n) => n.startsWith('hello-resume-scan-') && !preExisting.has(n),
+      );
       expect(survivors).toEqual([]);
     } finally {
       await cleanup();

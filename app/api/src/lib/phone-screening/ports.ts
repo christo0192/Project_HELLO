@@ -1,7 +1,7 @@
 /**
  * phone-screening/ports.ts — the DB-free seam.
  *
- * Every result shape a 0042/0043 RPC can produce, declared without importing a
+ * Every result shape a 0042/0043/0044 RPC can produce, declared without importing a
  * Supabase client. The domain facade depends on THIS file; `stores.ts` is the
  * one place a client appears. Tests drive in-memory fakes through the same
  * interface production wires the thin RPC adapters into — the ports/stores
@@ -27,6 +27,9 @@ import type {
   FinalizePhoneAttemptRecordingStatus,
   ListPhoneEngagementRecordingsStatus,
   ClearPhoneAttemptRecordingsStatus,
+  CommitPhoneQuestionBoundaryStatus,
+  GetPhoneAssessmentStateStatus,
+  StartPhoneAssessmentStatus,
   PHONE_RPC_UNKNOWN_STATUS,
 } from './rpc-contract.js';
 import type {
@@ -313,6 +316,105 @@ export interface ClearPhoneAttemptRecordingsResult {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// 0044 — assessment persistence, keyed resume, truthful completion
+// ═══════════════════════════════════════════════════════════════════════
+
+/** One question in the immutable, session-scoped plan. */
+export interface PhonePlanQuestion {
+  readonly key: string;
+  readonly text: string;
+  readonly mandatory: boolean;
+  readonly hint: string | null;
+}
+
+/** One persisted turn of the assessment transcript. */
+export interface PhoneAssessmentTurn {
+  readonly turnIndex: number;
+  readonly speaker: 'bot' | 'candidate';
+  readonly text: string;
+}
+
+/**
+ * Everything a resuming leg needs, in one answer.
+ *
+ * `candidateName` and `sessionStatus` are a strict SUBSET of the worker
+ * context the browser path has always resolved; nothing here carries a phone
+ * number, a SIP or provider identifier, a room name, an attempt id or raw
+ * resume text.
+ */
+export interface PhoneAssessmentState {
+  readonly status: PhoneAssessmentStateStatus;
+  readonly sessionId?: string;
+  readonly sessionStatus?: string;
+  readonly terminalReason?: string | null;
+  readonly candidateName?: string | null;
+  readonly planSource?: string;
+  readonly questionCount?: number;
+  readonly questions?: readonly PhonePlanQuestion[];
+  readonly cursor?: number;
+  readonly nextKey?: string | null;
+  readonly completedKeys?: readonly string[];
+  readonly turns?: readonly PhoneAssessmentTurn[];
+  readonly assessmentExists?: boolean;
+  /**
+   * The session is `completed` AND a phone-sourced assessment exists — a
+   * scored screening whose acknowledgement was lost. Derived in SQL rather
+   * than by each caller, because a two-part condition re-derived in three
+   * places is a condition remembered correctly in two of them.
+   */
+  readonly alreadyScored?: boolean;
+  readonly planComplete?: boolean;
+}
+
+export type PhoneAssessmentStateStatus =
+  | GetPhoneAssessmentStateStatus
+  | StartPhoneAssessmentStatus
+  | typeof PHONE_RPC_UNKNOWN_STATUS;
+
+export interface StartPhoneAssessmentInput {
+  readonly attemptId: string;
+  readonly sessionId: string;
+  readonly now: Date;
+}
+
+/** One ordered exchange belonging to a single question boundary. */
+export interface PhoneBoundaryTurn {
+  readonly speaker: 'bot' | 'candidate';
+  readonly text: string;
+}
+
+export interface CommitPhoneQuestionBoundaryInput {
+  readonly sessionId: string;
+  readonly questionKey: string;
+  /**
+   * The cursor the caller believes it is advancing. A CAS, not a hint — the
+   * RPC refuses a null as firmly as a mismatch, because a compare-and-swap a
+   * caller may omit is a guard that can be skipped.
+   */
+  readonly expectedIndex: number;
+  /** The caller's idempotency key. A retry MUST reuse it. */
+  readonly sourceEventId: string;
+  readonly turns: readonly PhoneBoundaryTurn[];
+  readonly now: Date;
+}
+
+export interface CommitPhoneQuestionBoundaryResult {
+  readonly status: CommitPhoneQuestionBoundaryStatus | typeof PHONE_RPC_UNKNOWN_STATUS;
+  readonly applied: boolean;
+  readonly duplicate: boolean;
+  readonly questionKey?: string;
+  readonly questionIndex?: number;
+  readonly firstTurnIndex?: number;
+  readonly lastTurnIndex?: number;
+  readonly cursor?: number;
+  readonly questionCount?: number;
+  readonly planComplete?: boolean;
+  /** Present on `key_not_current`: the key the cursor actually owes. */
+  readonly expectedKey?: string;
+  readonly sessionStatus?: string;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // The port
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -369,4 +471,14 @@ export interface PhoneStores {
     actorId?: string | null;
     now: Date;
   }): Promise<ClearPhoneAttemptRecordingsResult>;
+  /**
+   * Binds the session, activates it and snapshots the plan — all idempotently.
+   * Returns the full assessment state on success, so a resuming leg needs one
+   * round trip rather than two it could observe between.
+   */
+  startAssessment(input: StartPhoneAssessmentInput): Promise<PhoneAssessmentState>;
+  assessmentState(input: { sessionId: string }): Promise<PhoneAssessmentState>;
+  commitQuestionBoundary(
+    input: CommitPhoneQuestionBoundaryInput,
+  ): Promise<CommitPhoneQuestionBoundaryResult>;
 }

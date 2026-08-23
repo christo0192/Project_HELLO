@@ -383,6 +383,15 @@ describe('errors and malformed answers', () => {
         engagementId: 'e' })],
       ['phone_clear_recordings_error', () => stores.clearAttemptRecordings({
         engagementId: 'e', now: NOW })],
+      // 0044's assessment-persistence RPCs. These carry a candidate's own
+      // words, so a leaked driver error here would quote a transcript row.
+      ['phone_start_assessment_error', () => stores.startAssessment({
+        attemptId: 'a', sessionId: 's', now: NOW })],
+      ['phone_assessment_state_error', () => stores.assessmentState({ sessionId: 's' })],
+      ['phone_commit_boundary_error', () => stores.commitQuestionBoundary({
+        sessionId: 's', questionKey: 'k1', expectedIndex: 0, sourceEventId: 'ev-1',
+        turns: [{ speaker: 'bot', text: 'A?' }, { speaker: 'candidate', text: 'Y' }],
+        now: NOW })],
     ];
     expect(attempts).toHaveLength(PHONE_RPC_NAMES.length);
     for (const [code, run] of attempts) {

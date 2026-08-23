@@ -149,6 +149,10 @@ _mock_prompting.build_prompt_context = MagicMock(return_value=("system text", "o
 _mock_prompting.collect_prompt_metadata = MagicMock(return_value={})
 _mock_prompting.opening_line = MagicMock(return_value="opening text")
 _mock_prompting.system_prompt = MagicMock(return_value="system text")
+# 0044: `agent` also imports `format_questions` to render the phone question
+# plan through the SAME helper the browser prompt uses. A stub missing it
+# turns an ImportError into a collection failure for three unrelated modules.
+_mock_prompting.format_questions = MagicMock(return_value="1. question flow")
 sys.modules["prompting"] = _mock_prompting
 
 import agent as agent_mod  # noqa: E402
@@ -285,6 +289,28 @@ class TestTerminationHelpers(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(log, ["prompt", "playout", "goodbye", "playout", "close"])
 
     async def test_candidate_activity_restarts_initial_silence_window(self):
+        """Activity inside the window pushes the prompt deadline out.
+
+        ── WHY THE NUMBERS LOOK LIKE THIS ────────────────────────────────
+        The assertion has to land in a specific gap: AFTER the original
+        deadline (or a broken restart would not have fired yet) and BEFORE the
+        restarted one (or the loop would legitimately prompt). An earlier
+        version used a 50 ms window, set activity at 5 ms and asserted at
+        15 ms — which is before the original deadline, so it could not detect
+        a broken restart at all. Deleting the restart logic entirely left it
+        GREEN; the only way it ever failed was a scheduling stall on a loaded
+        runner, which is exactly what it did in CI. Zero signal, non-zero
+        noise.
+
+        So: a 500 ms window, activity at 300 ms, assertion at 600 ms. The
+        original deadline is 500 ms and the restarted one is ~800 ms, leaving
+        ~200 ms of slack on each side — four times the whole margin the old
+        version had — and a restart that does not work prompts at 500 ms and
+        is caught.
+
+        The opposite direction is pinned by the test above, which lets the
+        window elapse and asserts the full prompt/goodbye/close sequence.
+        """
         log = []
         activity = asyncio.Event()
 
@@ -294,12 +320,13 @@ class TestTerminationHelpers(unittest.IsolatedAsyncioTestCase):
         task = asyncio.create_task(
             agent_mod._silence_termination_loop(
                 _FakeTerminationSession(log), activity, close,
-                prompt_after_sec=0.05, end_after_sec=0.05,
+                prompt_after_sec=0.5, end_after_sec=0.5,
             )
         )
-        await asyncio.sleep(0.005)
+        await asyncio.sleep(0.3)
         activity.set()
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(0.3)
+        # Past the ORIGINAL deadline, before the RESTARTED one.
         self.assertEqual(log, [])
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):

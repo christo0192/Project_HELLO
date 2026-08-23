@@ -19,8 +19,24 @@ export const ERR_SESSION_NOT_COMPLETED = 'ERR_SESSION_NOT_COMPLETED';
 
 // ── Runner abstraction for testability ──────────────────────────────────
 
+/**
+ * 0044: the phone path needs an EXPLICIT source, and the browser path must not
+ * change at all. So the option is optional, its absence means `browser`, and
+ * the browser insert payload is byte-identical to what it was before — the
+ * column is simply not passed and the database default applies.
+ */
+export interface RunAssessmentOptions {
+  /**
+   * Which screening channel is asking. Omit and the source is DERIVED from
+   * the session itself — see `runAssessmentImpl`. Passing `'phone'` forces it;
+   * passing `'browser'` cannot force a phone session into the browser
+   * partition, because the caller does not get to decide what a session is.
+   */
+  readonly source?: 'browser' | 'phone';
+}
+
 export interface AssessmentRunner {
-  (sessionId: string): Promise<Assessment & { id: string }>;
+  (sessionId: string, options?: RunAssessmentOptions): Promise<Assessment & { id: string }>;
 }
 
 /**
@@ -35,25 +51,57 @@ export function injectAssessmentRunner(fn: AssessmentRunner | null): void {
 
 /**
  * Score a completed screening session and persist the assessment.
- * Idempotent-ish: inserts a new assessment row each call.
+ *
+ * BROWSER: unchanged from before 0044 — inserts a new assessment row each
+ * call, guarded only by the non-concurrent `terminal_reason` preflight.
+ * PHONE (`{ source: 'phone' }`): idempotent for real. The partial unique index
+ * `uq_assessments_phone_session` admits exactly one row per session, and a
+ * caller that loses the race REUSES the winner's row without repeating the
+ * notification intent, the candidate status update or the Ashby writeback.
  * Delegates to the injected runner (default: real implementation).
  * The default provenance-aware inference call uses the configured provider's
  * single circuit breaker; no nested breaker is added here. Provider failures
  * affect that breaker, while invalid JSON is a BusinessError and does not.
  */
-export async function runAssessment(sessionId: string): Promise<Assessment & { id: string }> {
-  return _runAssessment(sessionId);
+export async function runAssessment(
+  sessionId: string,
+  options?: RunAssessmentOptions,
+): Promise<Assessment & { id: string }> {
+  return _runAssessment(sessionId, options);
 }
 
 // ── Real implementation ─────────────────────────────────────────────────
 
-async function runAssessmentImpl(sessionId: string): Promise<Assessment & { id: string }> {
+async function runAssessmentImpl(
+  sessionId: string,
+  options?: RunAssessmentOptions,
+): Promise<Assessment & { id: string }> {
   const { data: session, error: sErr } = await supabase
     .from('call_sessions')
-    .select('id,candidate_id,owner_id,role_id,status,terminal_reason')
+    .select('id,candidate_id,owner_id,role_id,status,terminal_reason,external_call_id')
     .eq('id', sessionId)
     .single();
   if (sErr || !session) throw new Error(`session not found: ${sErr?.message}`);
+
+  // ── THE SOURCE IS DERIVED, NOT TRUSTED ──────────────────────────────
+  // Four callers reach this function — the phone completion endpoint, the
+  // worker scoring callback, the admin re-score route and the screening
+  // queue — and only one of them knows it is holding a phone session. If the
+  // source came from the caller, an admin re-scoring a phone session would
+  // write `source = 'browser'`: false provenance, outside
+  // `uq_assessments_phone_session` (so insertable repeatedly, re-firing the
+  // notification intent, the candidate status rewrite and the Ashby
+  // writeback each time), and invisible to `apply_phone_event`'s existence
+  // check — which would then refuse the completion of a screening that IS
+  // scored.
+  //
+  // `external_call_id` is the deterministic phone room name the dialer
+  // provisions and `start_phone_assessment` verifies, so the session itself
+  // is the authority on what channel it belongs to. An explicit `'phone'`
+  // still forces the phone partition; an explicit `'browser'` cannot force a
+  // phone session out of it.
+  const isPhone =
+    options?.source === 'phone' || isPhoneSession(session.external_call_id as unknown);
 
   // VOI-08: technical scoring eligibility — fail closed unless the session is
   // completed with the authoritative initial scoring reason. Blocks
@@ -63,6 +111,20 @@ async function runAssessmentImpl(sessionId: string): Promise<Assessment & { id: 
     session.status !== 'completed' ||
     session.terminal_reason !== 'conversation_complete'
   ) {
+    // 0044: for the PHONE path only, an already-scored session is a SUCCESS,
+    // not a refusal. Two legs racing a completion is the ordinary case a
+    // reconnect creates: the winner scores and flips `terminal_reason` to
+    // `assessment_done`, and the loser arrives here. Throwing would make the
+    // loser report a scoring failure for a screening that is, in fact,
+    // scored — and the worker would then decline to claim a completion that
+    // is legitimately owed.
+    //
+    // The reuse is read from the DATABASE, never assumed from the status: if
+    // there is no phone assessment row, this still throws.
+    if (isPhone) {
+      const existing = await loadPhoneAssessment(sessionId);
+      if (existing) return existing;
+    }
     throw new Error(ERR_SESSION_NOT_COMPLETED);
   }
 
@@ -135,6 +197,13 @@ async function runAssessmentImpl(sessionId: string): Promise<Assessment & { id: 
     raw: assessment, // full object (fallback if optional columns absent)
     provenance: scoringProvenanceValue, // LLM-06 provenance — required, fail closed if missing
   };
+  // 0044: passed ONLY for the phone path. The browser payload therefore has
+  // exactly the keys it had before this migration, and the column default
+  // (`browser`) applies to it — so `uq_assessments_phone_session`, which is
+  // partial over `source = 'phone'`, cannot touch a browser row.
+  if (isPhone) {
+    basePayload.source = 'phone';
+  }
 
   let { data: row, error: aErr } = await supabase
     .from('assessments')
@@ -153,6 +222,21 @@ async function runAssessmentImpl(sessionId: string): Promise<Assessment & { id: 
       .insert(base)
       .select()
       .single());
+  }
+  // ── 0044: EXACTLY ONE phone assessment per session ──────────────────
+  // `uq_assessments_phone_session` is the authority. Two concurrent phone
+  // completions both reach this insert; one wins and one gets 23505, and the
+  // loser must REUSE the winner's row rather than fail. That is what makes
+  // "scored exactly once, and one writeback" true under concurrency, which
+  // the pre-0044 `terminal_reason` flip could not manage — it ran AFTER the
+  // insert and admitted its own TOCTOU race.
+  //
+  // The loser returns HERE, before the notification intent, the candidate
+  // status update, the `terminal_reason` flip and the Ashby completion
+  // observer — so none of those runs twice.
+  if (aErr && isPhone && isUniqueViolation(aErr)) {
+    const existing = await loadPhoneAssessment(sessionId);
+    if (existing) return existing;
   }
   if (aErr) throw new Error(aErr.message);
 
@@ -225,6 +309,52 @@ async function runAssessmentImpl(sessionId: string): Promise<Assessment & { id: 
   });
 
   return { ...assessment, id: row.id };
+}
+
+/**
+ * True when this session belongs to the PHONE channel, decided from the
+ * deterministic room name `phone-<sessionId>` that the dialer provisions and
+ * `start_phone_assessment` verifies before it will bind anything.
+ *
+ * Matched on the prefix only. A UUID check would be a second copy of a format
+ * rule that already lives in two places, and this is not a security boundary —
+ * the binding is enforced in SQL; this decides which partition a row lands in.
+ */
+function isPhoneSession(externalCallId: unknown): boolean {
+  return typeof externalCallId === 'string' && externalCallId.startsWith('phone-');
+}
+
+/**
+ * A PostgREST unique-violation, identified by SQLSTATE rather than by message
+ * text. Matching on the message would also match a driver string that merely
+ * mentions the constraint, and would stop matching the moment the constraint
+ * is renamed.
+ */
+function isUniqueViolation(error: { code?: string | null } | null | undefined): boolean {
+  return error?.code === '23505';
+}
+
+/**
+ * Read back the phone assessment that already exists for this session.
+ *
+ * Returns `null` when there is none — the caller must then fail rather than
+ * invent a success. `maybeSingle()` is deliberate: with the partial unique
+ * index in place there can be at most one, and a second row would be a
+ * schema failure that should surface rather than be silently picked from.
+ */
+async function loadPhoneAssessment(
+  sessionId: string,
+): Promise<(Assessment & { id: string }) | null> {
+  const { data, error } = await supabase
+    .from('assessments')
+    .select('id,raw')
+    .eq('session_id', sessionId)
+    .eq('source', 'phone')
+    .maybeSingle();
+  if (error || !data?.id) return null;
+  const raw = (data.raw ?? null) as Assessment | null;
+  if (!raw) return null;
+  return { ...raw, id: data.id as string };
 }
 
 // ── Weighted overall score (screening-stage; tune here) ──────────────

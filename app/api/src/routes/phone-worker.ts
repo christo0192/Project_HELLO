@@ -1,7 +1,7 @@
 /**
  * routes/phone-worker.ts — the internal, service-authenticated surface the
- * phone voice worker calls. Two endpoints, both `POST`, neither recruiter
- * facing and neither reachable from a browser session.
+ * phone voice worker calls. Five endpoints, all `POST`, none recruiter facing
+ * and none reachable from a browser session.
  *
  * ── AUTH IS THE EXISTING WORKER SECRET, DELIBERATELY ──────────────────
  * `WORKER_CONTEXT_SECRET` already authenticates the worker's two existing
@@ -21,6 +21,20 @@
  * outside it is refused BEFORE the database is touched. Anything else would
  * let a compromised or buggy worker drive arbitrary state transitions.
  *
+ * ── THE THREE 0044 ASSESSMENT ENDPOINTS ───────────────────────────────
+ * `/assessment/start`, `/assessment/turn` and `/assessment/complete` are the
+ * durable half of a phone screening. Two rules govern all three:
+ *
+ *   1. NOTHING IS DECIDED HERE THAT THE DATABASE CAN DECIDE. The consent gate,
+ *      the session binding, the plan snapshot, the cursor CAS, the key the
+ *      model owes and the "an assessment must exist before anything claims a
+ *      completion" interlock all live in 0044's RPCs. This router forwards
+ *      refusals; it does not invent them.
+ *   2. THE RESPONSE IS A PROJECTION, NOT A PASS-THROUGH. `sanitizeAssessmentState`
+ *      builds the body key by key. Whatever a future migration adds to the RPC
+ *      answer does not reach the worker — and therefore does not reach a
+ *      language model — until this file changes.
+ *
  * ── THE ONE RULE OF THE SCHEDULING ENDPOINT ───────────────────────────
  * It must NEVER report success for a booking that did not happen. The worker
  * speaks a confirmation only when this endpoint says `ok`/`ok_prereqs_pending`,
@@ -33,6 +47,8 @@
 import { timingSafeEqual } from 'node:crypto';
 import { Router } from 'express';
 import { z } from 'zod';
+import { runAssessment } from '../services/assessment.js';
+import { transitionSession } from '../lib/session-lifecycle.js';
 import {
   PHONE_APPOINTMENT_MAX_SECONDS,
   PHONE_APPOINTMENT_MIN_SECONDS,
@@ -42,6 +58,7 @@ import {
   istDate,
   istWindowOpen,
   loadPhoneScreeningConfig,
+  type PhoneAssessmentState,
   type PhoneStores,
 } from '../lib/phone-screening/index.js';
 import { supabase } from '../lib/supabase.js';
@@ -127,6 +144,38 @@ const workerScheduleSchema = z
   })
   .strict();
 
+/** A single ordered exchange inside one question boundary. */
+const boundaryTurnSchema = z
+  .object({
+    speaker: z.enum(['bot', 'candidate']),
+    text: z.string().trim().min(1).max(8_000),
+  })
+  .strict();
+
+const assessmentStartSchema = z
+  .object({
+    attempt_id: z.string().regex(UUID_RE),
+    session_id: z.string().regex(UUID_RE),
+  })
+  .strict();
+
+const assessmentTurnSchema = z
+  .object({
+    session_id: z.string().regex(UUID_RE),
+    question_key: z.string().trim().regex(/^[A-Za-z0-9_.:-]{1,100}$/),
+    expected_index: z.number().int().min(0).max(99),
+    source_event_id: z.string().trim().regex(/^[A-Za-z0-9_.:-]{1,200}$/),
+    turns: z.array(boundaryTurnSchema).min(2).max(12),
+  })
+  .strict();
+
+const assessmentCompleteSchema = z
+  .object({
+    attempt_id: z.string().regex(UUID_RE),
+    session_id: z.string().regex(UUID_RE),
+  })
+  .strict();
+
 export interface PhoneWorkerRouterDeps {
   readonly stores?: PhoneStores;
   /** Resolves an attempt to its engagement. Injected so tests need no DB. */
@@ -167,6 +216,71 @@ export interface PhoneWorkerRouterDeps {
   }) => Promise<{ status: string; egressStarted: boolean }>;
   readonly configSource?: NodeJS.ProcessEnv;
   readonly now?: () => Date;
+  /**
+   * Completes the session with the SHARED lifecycle CAS the browser path uses.
+   * Injected only so a test can observe the ORDER and force a conflict; the
+   * production default is `transitionSession` itself.
+   */
+  readonly completeSession?: (input: {
+    sessionId: string;
+  }) => Promise<{ ok: boolean; conflict: boolean }>;
+  /**
+   * Scores the session through the SHARED runner. AWAITED, deliberately — the
+   * browser route fires this on a detached 8-second timer and swallows the
+   * error, which is right for a path where a completed session is durable on
+   * its own and a reconciler can retry. It is wrong here: nothing may claim a
+   * phone completion until the score exists, so the phone path waits for it
+   * and reports the failure.
+   */
+  readonly scoreSession?: (sessionId: string) => Promise<void>;
+}
+
+
+/**
+ * Build the assessment-state body KEY BY KEY.
+ *
+ * This is a projection, not a pass-through, and the difference is the whole
+ * control: whatever a future migration adds to `get_phone_assessment_state`'s
+ * answer does not reach the worker — and therefore does not reach a language
+ * model or a log line — until this function changes.
+ *
+ * `context` is a strict SUBSET of the worker context the browser path has
+ * always resolved (`session_id`, `candidate_name`, `status`). It carries no
+ * `candidate_id`, no `role_id` and no `room_name`, and nothing anywhere in the
+ * body carries a phone number, a SIP or provider identifier, an attempt id, an
+ * egress key or raw resume text.
+ */
+export function sanitizeAssessmentState(state: PhoneAssessmentState): Record<string, unknown> {
+  return {
+    context: {
+      session_id: state.sessionId ?? null,
+      candidate_name: state.candidateName ?? null,
+      status: state.sessionStatus ?? null,
+    },
+    plan: {
+      source: state.planSource ?? null,
+      question_count: state.questionCount ?? 0,
+      questions: (state.questions ?? []).map((q) => ({
+        key: q.key,
+        text: q.text,
+        mandatory: q.mandatory,
+        hint: q.hint,
+      })),
+    },
+    progress: {
+      cursor: state.cursor ?? 0,
+      next_key: state.nextKey ?? null,
+      completed_keys: [...(state.completedKeys ?? [])],
+      plan_complete: state.planComplete === true,
+    },
+    turns: (state.turns ?? []).map((t) => ({
+      turn_index: t.turnIndex,
+      speaker: t.speaker,
+      text: t.text,
+    })),
+    assessment_exists: state.assessmentExists === true,
+    already_scored: state.alreadyScored === true,
+  };
 }
 
 function requireWorkerPhoneAuth(
@@ -199,6 +313,23 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
   const stores = (): PhoneStores => deps.stores ?? createPhoneStores(supabase as never);
   const config = (): ReturnType<typeof loadPhoneScreeningConfig> =>
     loadPhoneScreeningConfig(deps.configSource ?? process.env);
+  // Both seams carry a REAL default. A router built with an empty deps object
+  // must complete and score a call, not silently do neither — a feature that
+  // ships green and inert is a failure mode this project has already paid for.
+  const completeSession = deps.completeSession
+    ?? (async (input: { sessionId: string }) => {
+      const result = await transitionSession(
+        input.sessionId,
+        'in_progress',
+        'completed',
+        'conversation_complete',
+      );
+      return { ok: result.ok, conflict: result.ok === false && result.conflict === true };
+    });
+  const scoreSession = deps.scoreSession
+    ?? (async (sessionId: string): Promise<void> => {
+      await runAssessment(sessionId, { source: 'phone' });
+    });
 
   router.post('/events', requireWorkerPhoneAuth, async (req, res, next) => {
     try {
@@ -396,6 +527,203 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       return res.json({ ok: false, status: booked.status });
     } catch {
       return res.status(500).json({ ok: false, status: 'phone_schedule_error' });
+    }
+  });
+
+
+  // ── POST /assessment/start ────────────────────────────────────────
+  // Binds the session, activates it, snapshots the plan, and hands back
+  // everything a resuming leg needs. Idempotent: a reconnecting leg calls the
+  // same endpoint and gets its own conversation back.
+  router.post('/assessment/start', requireWorkerPhoneAuth, async (req, res) => {
+    try {
+      if (!config().screeningEnabled) {
+        return res.status(503).json({ ok: false, error: 'phone_screening_disabled' });
+      }
+      const parsed = assessmentStartSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ ok: false, status: 'invalid_request' });
+      }
+      const state = await stores().startAssessment({
+        attemptId: parsed.data.attempt_id,
+        sessionId: parsed.data.session_id,
+        now: now(),
+      });
+      if (state.status !== 'ok') {
+        // Every refusal is forwarded with its own stable code so the worker can
+        // tell "the disclosure was never delivered" from "this session is not
+        // yours". None of them is an error the worker should retry blindly.
+        //
+        // `already_scored` is the one that is not really a refusal at all: it
+        // says the screening is FINISHED and its acknowledgement was lost. The
+        // worker's only legitimate action on it is to post
+        // `assessment.completed` — which 0044 accepts precisely because the
+        // row the RPC just found is there. It is forwarded verbatim, like the
+        // rest; this route decides nothing the database has already decided.
+        return res.json({ ok: false, status: state.status });
+      }
+      return res.json({ ok: true, status: 'ok', ...sanitizeAssessmentState(state) });
+    } catch {
+      return res.status(500).json({ ok: false, status: 'phone_assessment_error' });
+    }
+  });
+
+  // ── POST /assessment/turn ─────────────────────────────────────────
+  // One completed question: its ordered turns, its key and its cursor advance,
+  // committed atomically. A worker that does not get `ok` here MUST NOT ask
+  // the next question and MUST NOT claim a completion.
+  router.post('/assessment/turn', requireWorkerPhoneAuth, async (req, res) => {
+    try {
+      if (!config().screeningEnabled) {
+        return res.status(503).json({ ok: false, error: 'phone_screening_disabled' });
+      }
+      const parsed = assessmentTurnSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ ok: false, status: 'invalid_request' });
+      }
+      const result = await stores().commitQuestionBoundary({
+        sessionId: parsed.data.session_id,
+        questionKey: parsed.data.question_key,
+        expectedIndex: parsed.data.expected_index,
+        sourceEventId: parsed.data.source_event_id,
+        turns: parsed.data.turns,
+        now: now(),
+      });
+      // `applied` is read from the RPC's own flag, never inferred from the
+      // status string. A boundary the store layer could not fully understand
+      // is one the worker must treat as "did not happen".
+      return res.json({
+        ok: result.applied,
+        status: result.status,
+        duplicate: result.duplicate,
+        cursor: result.cursor ?? null,
+        question_count: result.questionCount ?? null,
+        plan_complete: result.planComplete ?? false,
+        expected_key: result.expectedKey ?? null,
+      });
+    } catch {
+      return res.status(500).json({ ok: false, status: 'phone_assessment_error' });
+    }
+  });
+
+  // ── POST /assessment/complete ─────────────────────────────────────
+  // THE ORDERING THIS PHASE EXISTS FOR:
+  //   every plan key durable  ->  session completion CAS  ->  AWAIT scoring
+  //   ->  verify the assessment row  ->  only then may anything be claimed.
+  //
+  // This endpoint never posts `assessment.completed` itself. It reports
+  // whether a score exists; the worker posts the event through `/events`, and
+  // 0044's `apply_phone_event` refuses that event outright if the row is not
+  // there. So the claim is gated twice, and the second gate is in SQL.
+  router.post('/assessment/complete', requireWorkerPhoneAuth, async (req, res) => {
+    try {
+      if (!config().screeningEnabled) {
+        return res.status(503).json({ ok: false, error: 'phone_screening_disabled' });
+      }
+      const parsed = assessmentCompleteSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ ok: false, status: 'invalid_request' });
+      }
+      const sessionId = parsed.data.session_id;
+
+      const before = await stores().assessmentState({ sessionId });
+      if (before.status !== 'ok') {
+        return res.json({ ok: false, status: before.status });
+      }
+      // ── ALREADY SCORED: ADOPT, NEVER RE-SCORE ─────────────────────
+      // The row is already there, so there is nothing to compute and nothing
+      // to write. Short-circuiting here is not an optimisation: it is what
+      // makes "no rescore, no duplicate writeback" STRUCTURAL rather than a
+      // property of how `runAssessment` happens to behave on a second call.
+      // Falling through would reach the scorer, which would adopt the same
+      // row — correct today, and one refactor away from not being.
+      //
+      // It sits ABOVE the plan-completeness check on purpose. A scored
+      // screening is finished whatever the cursor says; refusing it
+      // `plan_incomplete` because a boundary write was lost after the score
+      // landed would strand exactly the case this branch exists for.
+      if (before.alreadyScored === true) {
+        return res.json({ ok: true, status: 'scored', adopted: true });
+      }
+
+      // EVERY key, and therefore every turn that answers one, is durable
+      // before anything is completed. A leg that lost a boundary write comes
+      // back here with an incomplete plan and is refused.
+      if (before.planComplete !== true) {
+        return res.json({
+          ok: false,
+          status: 'plan_incomplete',
+          cursor: before.cursor ?? null,
+          question_count: before.questionCount ?? null,
+        });
+      }
+
+      if (before.sessionStatus === 'in_progress') {
+        // ── NO `duration_sec`, DELIBERATELY ─────────────────────────
+        // A phone session spans every reconnect attempt, and 0042 defers a
+        // window-closed reconnect to the NEXT IST DAY — so there is no single
+        // elapsed number that is true of the conversation. `started_at` is
+        // stamped when the session ROW is created (NOT NULL, defaulted, never
+        // updated), so measuring from it would report time-since-provisioning
+        // and clamp at 86,400 on a next-day reconnect: a plausible-looking
+        // measurement of something nobody asked about. A hardcoded 0 was worse
+        // still — it asserted a screening that took no time.
+        //
+        // Omitting it leaves the column NULL, which is the truthful answer:
+        // this path does not measure duration. A phone-specific instant (the
+        // attempt's `answered_at`, or the `disclosure.delivered` transition)
+        // would be measurable, and that is a deliberate later change with its
+        // own migration rather than a number invented here.
+        const completed = await completeSession({ sessionId });
+        // A CONFLICT is not a failure. Two legs racing to complete is exactly
+        // what a reconnect produces, and the loser must still verify — which
+        // is what the scoring call and the row check below do. A NON-conflict
+        // failure is a real one and stops here.
+        if (!completed.ok && !completed.conflict) {
+          return res.json({ ok: false, status: 'completion_failed' });
+        }
+      } else if (before.sessionStatus !== 'completed') {
+        // `failed`, `cancelled`, `expired`: the session is terminal for some
+        // other reason and no completion is owed.
+        return res.json({ ok: false, status: 'session_not_active' });
+      }
+
+      // ── SCORING, THEN VERIFICATION — AND THE VERIFICATION RUNS EITHER WAY ──
+      // A THROW FROM `scoreSession` IS NOT EVIDENCE THAT NOTHING WAS SCORED.
+      // The ordinary reconnect case makes that concrete: the winning leg
+      // inserts the assessment, the losing leg's insert hits 23505, and any
+      // failure to read the winner's row back — a transient read error, a row
+      // with a null `raw` — re-throws. The session IS scored; a leg that
+      // returned `scoring_failed` here would report otherwise, and the worker
+      // would then post `assessment.aborted` and drive the engagement to
+      // terminal `failed` over a screening that exists.
+      //
+      // So the exception is remembered, not returned on, and the ROW decides.
+      let scoringThrew = false;
+      try {
+        await scoreSession(sessionId);
+      } catch {
+        // Sanitized deliberately: a scoring error can quote a provider body
+        // or a row. Nothing about it is forwarded.
+        scoringThrew = true;
+      }
+
+      // THE VERIFICATION. Scoring "succeeding" is not the same as an
+      // assessment existing, and only the row entitles anything to claim a
+      // completed screening.
+      const after = await stores().assessmentState({ sessionId });
+      if (after.status !== 'ok' || after.assessmentExists !== true) {
+        // `scoring_failed` and `assessment_missing` are kept DISTINCT because
+        // the worker treats them differently: one is a provider fault it may
+        // retry, the other is a state it must not.
+        return res.json({
+          ok: false,
+          status: scoringThrew ? 'scoring_failed' : 'assessment_missing',
+        });
+      }
+      return res.json({ ok: true, status: 'scored', adopted: false });
+    } catch {
+      return res.status(500).json({ ok: false, status: 'phone_assessment_error' });
     }
   });
 

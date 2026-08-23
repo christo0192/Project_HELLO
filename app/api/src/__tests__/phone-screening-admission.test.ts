@@ -78,6 +78,10 @@ function fakeStores(admit: AdmitPhoneAttemptResult): FakeStores {
     heartbeatAttempt: unreachable,
     reclaimAttemptLeases: unreachable,
     applyEvent: unreachable,
+    // 0044. Admission never touches the assessment path.
+    startAssessment: unreachable,
+    assessmentState: unreachable,
+    commitQuestionBoundary: unreachable,
     // 0043's recording methods are unreachable from admission by design:
     // admission happens BEFORE the disclosure that any recording depends on.
     attachAttemptRecording: unreachable,

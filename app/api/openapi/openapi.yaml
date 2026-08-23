@@ -637,6 +637,162 @@ paths:
               schema:
                 $ref: '#/components/schemas/PhoneWorkerError'
 
+  /api/internal/phone/assessment/start:
+    post:
+      tags: [phone]
+      operationId: startPhoneWorkerAssessment
+      summary: Bind, activate and snapshot the question plan for a phone screening
+      description: Internal, service-authenticated. Called ONCE per leg, immediately after the disclosure gate is accepted and never before it. 0044's start_phone_assessment refuses unless the engagement is already in_call — the same state-machine consent gate 0043 puts on recording, reachable through exactly one transition — so a screening cannot begin on a call nobody consented to. It binds the call_sessions row to the engagement and the attempt after VERIFYING the binding (the session must already name its own deterministic phone room in external_call_id and must belong to the engagement's candidate; a worker cannot hand us somebody else's session), activates it waiting->in_progress idempotently, and snapshots an IMMUTABLE question plan from the role's validated screening_template — or, when that template is empty, from the deterministic default plan. A malformed template is REFUSED rather than replaced by the defaults, because screening a candidate against questions nobody chose while the recruiter believes their own are running is the worse of the two failures. Every call is idempotent: a reconnecting leg gets the ORIGINAL snapshot back, so a role edited mid-call cannot renumber a conversation in progress. The response is a projection built key by key and is a strict SUBSET of the browser worker context — no phone number, no SIP or provider identifier, no attempt id, no room name, no egress key and no raw resume. Disabled by default.
+      security:
+        - workerBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PhoneAssessmentStartRequest'
+      responses:
+        '200':
+          description: Either the full assessment state (ok=true) or a stable refusal (ok=false), including disclosure_not_delivered, invalid_role_template, session_candidate_mismatch and session_binding_mismatch. A refusal is never a reason to ask a question.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneAssessmentStateResponse'
+        '400':
+          description: Request body failed validation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneAssessmentStateResponse'
+        '401':
+          description: Worker bearer credential required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '403':
+          description: Worker bearer credential invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '500':
+          description: phone_assessment_error — sanitized stable code, never a driver message.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneAssessmentStateResponse'
+        '503':
+          description: Phone screening disabled, or the worker credential is not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+
+  /api/internal/phone/assessment/turn:
+    post:
+      tags: [phone]
+      operationId: commitPhoneWorkerQuestionBoundary
+      summary: Commit one completed question boundary atomically
+      description: Internal, service-authenticated. One call is ONE completed question — its ordered turns, its progress row and its cursor advance, in a single transaction under the session row lock. Half a boundary is precisely the state a reconnect misreads, so any failure rolls the whole thing back and the worker re-drives it under the same source_event_id. turns is an ORDERED array rather than a pair, so a follow-up exchange on the same key rides inside the boundary it belongs to; that is what "a follow-up does not advance the cursor" means mechanically, because the only call that advances the cursor is the one that closes the question. question_key must be the key the cursor currently owes — not any key in the plan and not any unanswered key — so a model can neither skip a mandatory question nor claim another one; a mismatch is refused key_not_current and names the key actually owed. expected_index is a compare-and-swap and an OMITTED value is refused as firmly as a wrong one, because a CAS a caller may leave out is a guard that can be skipped. A repeated source_event_id returns the ORIGINAL success without appending anything. A worker that does not receive ok=true MUST NOT ask the next question and MUST NOT claim a completion. Disabled by default.
+      security:
+        - workerBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PhoneAssessmentTurnRequest'
+      responses:
+        '200':
+          description: ok=true only when the boundary is durable. Every other value — stale_cursor, key_not_current, invalid_turns, plan_missing, plan_complete, session_not_active, unknown_session, unknown_status — means nothing was written.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneAssessmentTurnResponse'
+        '400':
+          description: Request body failed validation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneAssessmentTurnResponse'
+        '401':
+          description: Worker bearer credential required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '403':
+          description: Worker bearer credential invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '500':
+          description: phone_assessment_error — sanitized stable code.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneAssessmentTurnResponse'
+        '503':
+          description: Phone screening disabled, or the worker credential is not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+
+  /api/internal/phone/assessment/complete:
+    post:
+      tags: [phone]
+      operationId: completePhoneWorkerAssessment
+      summary: Complete the session, await scoring, and verify the assessment exists
+      description: Internal, service-authenticated, and the ordering this phase exists for — every plan key durable, then the session completion CAS, then AWAIT the shared runAssessment, then VERIFY the assessment row. The browser route fires scoring on a detached eight-second timer and swallows the error, which is right for a path whose completed session is durable on its own and where a reconciler can retry; it is wrong here, because nothing may claim a phone completion until the score exists. A completion CAS CONFLICT is not a failure — two legs racing to complete is exactly what a reconnect produces — so the loser still scores and still verifies. This endpoint NEVER posts assessment.completed itself: it reports whether a score exists, the worker posts the event through /api/internal/phone/events, and 0044's apply_phone_event refuses that event outright when the row is absent. The claim is therefore gated twice and the second gate is in SQL. Scoring is idempotent for the phone source: a partial unique index admits exactly one assessment per session and the loser of the race reuses the winner's row without repeating the notification intent, the candidate status update or the Ashby writeback. Disabled by default.
+      security:
+        - workerBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PhoneAssessmentCompleteRequest'
+      responses:
+        '200':
+          description: ok=true with status scored means an assessment row exists and a completion may now be claimed. Every other value — plan_incomplete, completion_failed, scoring_failed, assessment_missing, session_not_active, plan_missing, unknown_session, unknown_status — means it may not.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneAssessmentCompleteResponse'
+        '400':
+          description: Request body failed validation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneAssessmentCompleteResponse'
+        '401':
+          description: Worker bearer credential required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '403':
+          description: Worker bearer credential invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '500':
+          description: phone_assessment_error — sanitized stable code.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneAssessmentCompleteResponse'
+        '503':
+          description: Phone screening disabled, or the worker credential is not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+
   # ── Ashby integration ──────────────────────────────────────────────
   /api/integrations/livekit-phone/webhook:
     post:
@@ -5329,6 +5485,218 @@ components:
         version:
           type: integer
           minimum: 1
+      additionalProperties: false
+
+    PhoneAssessmentStartRequest:
+      type: object
+      required: [attempt_id, session_id]
+      properties:
+        attempt_id:
+          type: string
+          format: uuid
+          description: The live attempt. The engagement is resolved from it and must already be in_call.
+        session_id:
+          type: string
+          format: uuid
+          description: The session to bind. VERIFIED, never trusted — it must already name its own deterministic phone room in external_call_id and belong to the engagement's candidate.
+      additionalProperties: false
+
+    PhoneAssessmentPlanQuestion:
+      type: object
+      required: [key, text, mandatory, hint]
+      properties:
+        key:
+          type: string
+          description: The STABLE question identity the cursor and the progress trail point at. Never derived from prose and never from a turn count.
+        text:
+          type: string
+        mandatory:
+          type: boolean
+        hint:
+          type: string
+          nullable: true
+      additionalProperties: false
+
+    PhoneAssessmentTurnEntry:
+      type: object
+      required: [turn_index, speaker, text]
+      properties:
+        turn_index:
+          type: integer
+          minimum: 0
+        speaker:
+          type: string
+          enum: [bot, candidate]
+        text:
+          type: string
+      additionalProperties: false
+
+    PhoneAssessmentStateResponse:
+      type: object
+      required: [ok, status]
+      properties:
+        ok:
+          type: boolean
+          description: True only when the assessment may proceed. A refusal is never a reason to ask a question.
+        status:
+          type: string
+          description: ok, or a stable refusal — already_scored, disclosure_not_delivered, engagement_terminal, invalid_role_template, plan_missing, session_already_bound, session_binding_mismatch, session_candidate_mismatch, session_not_active, unknown_attempt, unknown_session, unknown_status, invalid_request, phone_assessment_error. `already_scored` is the one that is not really a refusal: it means the screening is FINISHED and its acknowledgement was lost, and it is DISTINCT from session_not_active because the two demand opposite actions.
+        context:
+          type: object
+          description: A strict SUBSET of the browser worker context. No candidate_id, no role_id, no room_name.
+          required: [session_id, candidate_name, status]
+          properties:
+            session_id:
+              type: string
+              nullable: true
+            candidate_name:
+              type: string
+              nullable: true
+            status:
+              type: string
+              nullable: true
+          additionalProperties: false
+        plan:
+          type: object
+          required: [source, question_count, questions]
+          properties:
+            source:
+              type: string
+              nullable: true
+              description: role_template when the role carried one, default when it did not.
+            question_count:
+              type: integer
+              minimum: 0
+            questions:
+              type: array
+              items:
+                $ref: '#/components/schemas/PhoneAssessmentPlanQuestion'
+          additionalProperties: false
+        progress:
+          type: object
+          required: [cursor, next_key, completed_keys, plan_complete]
+          properties:
+            cursor:
+              type: integer
+              minimum: 0
+            next_key:
+              type: string
+              nullable: true
+              description: The key the cursor owes. Null once the plan is complete.
+            completed_keys:
+              type: array
+              items:
+                type: string
+            plan_complete:
+              type: boolean
+          additionalProperties: false
+        turns:
+          type: array
+          description: The persisted assessment transcript, in order, so a reconnecting leg can rehydrate the conversation instead of starting it again.
+          items:
+            $ref: '#/components/schemas/PhoneAssessmentTurnEntry'
+        assessment_exists:
+          type: boolean
+        already_scored:
+          type: boolean
+          description: The session is `completed` AND a phone-sourced assessment row exists — a SCORED screening whose acknowledgement was lost. Derived in SQL rather than by each caller, because a two-part condition re-derived in three places is one remembered correctly in two of them. The only legitimate action on it is to post assessment.completed, which 0044 accepts because the row is there.
+      additionalProperties: false
+
+    PhoneAssessmentTurnRequest:
+      type: object
+      required: [session_id, question_key, expected_index, source_event_id, turns]
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        question_key:
+          type: string
+          description: Must be the key the cursor currently owes. Anything else is refused key_not_current, which is what stops a model skipping a mandatory question.
+        expected_index:
+          type: integer
+          minimum: 0
+          maximum: 99
+          description: A compare-and-swap, not a hint. An omitted value is refused as firmly as a wrong one.
+        source_event_id:
+          type: string
+          description: The caller's idempotency key. A retry after a lost response MUST reuse it, and is answered with the ORIGINAL success rather than appending the exchange twice.
+        turns:
+          type: array
+          minItems: 2
+          maxItems: 12
+          description: The ordered exchange, opening with the ask and closing with the answer. Follow-ups on the same key ride inside this array.
+          items:
+            type: object
+            required: [speaker, text]
+            properties:
+              speaker:
+                type: string
+                enum: [bot, candidate]
+              text:
+                type: string
+                minLength: 1
+                maxLength: 8000
+            additionalProperties: false
+      additionalProperties: false
+
+    PhoneAssessmentTurnResponse:
+      type: object
+      required: [ok, status]
+      properties:
+        ok:
+          type: boolean
+          description: THE LOAD-BEARING FIELD. True only when the boundary is durable; a worker that does not see true must not ask the next question and must not claim a completion.
+        status:
+          type: string
+          description: applied, or a stable refusal — stale_cursor, key_not_current, invalid_turns, plan_missing, plan_complete, session_not_active, unknown_session, unknown_status, invalid_request, phone_assessment_error.
+        duplicate:
+          type: boolean
+          description: True when a retry converged on the original boundary.
+        cursor:
+          type: integer
+          nullable: true
+        question_count:
+          type: integer
+          nullable: true
+        plan_complete:
+          type: boolean
+        expected_key:
+          type: string
+          nullable: true
+          description: On key_not_current, the key the cursor actually owes.
+      additionalProperties: false
+
+    PhoneAssessmentCompleteRequest:
+      type: object
+      required: [attempt_id, session_id]
+      properties:
+        attempt_id:
+          type: string
+          format: uuid
+        session_id:
+          type: string
+          format: uuid
+      additionalProperties: false
+
+    PhoneAssessmentCompleteResponse:
+      type: object
+      required: [ok, status]
+      properties:
+        ok:
+          type: boolean
+          description: True only when an assessment row has been VERIFIED to exist. Only then may the worker post assessment.completed — and 0044 refuses that event anyway if the row is absent.
+        status:
+          type: string
+          description: scored, or a stable refusal — plan_incomplete, completion_failed, scoring_failed, assessment_missing, session_not_active, plan_missing, unknown_session, unknown_status, invalid_request, phone_assessment_error.
+        adopted:
+          type: boolean
+          description: True when the assessment row already existed and was ADOPTED rather than produced — nothing was re-scored and no second writeback occurred.
+        cursor:
+          type: integer
+          nullable: true
+        question_count:
+          type: integer
+          nullable: true
       additionalProperties: false
 
     InviteCreateResponse:

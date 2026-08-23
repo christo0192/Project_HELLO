@@ -208,6 +208,9 @@ prompting_mock.build_prompt_context = MagicMock(return_value=("s", "o"))
 prompting_mock.collect_prompt_metadata = MagicMock(return_value={})
 prompting_mock.opening_line = MagicMock(return_value="opening text")
 prompting_mock.system_prompt = MagicMock(return_value="system text")
+# 0044: `agent` also imports `format_questions` to render the phone question
+# plan through the same helper the browser prompt uses.
+prompting_mock.format_questions = MagicMock(return_value="1. question flow")
 sys.modules["prompting"] = prompting_mock
 
 # Load agent.py under a unique module name: completely isolated from the
