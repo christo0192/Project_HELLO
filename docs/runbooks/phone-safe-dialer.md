@@ -227,6 +227,15 @@ every dial.
   accept an epoch, so wiring it is a one-line change once there is a worker-visible
   source.
 - **No scheduler is armed.** `dialPhoneAttempt` has no production caller.
+- **A purge takes two passes when an egress is live.** The first stops the egress and
+  refuses; the retry deletes. That is deliberate — LiveKit uploads asynchronously *after*
+  the stop is accepted, so deleting in the same pass would race the upload exactly as
+  before the fix — but it means a terminal refusal is acknowledged one retry later than
+  the happy path. `/api/internal/phone/events` answers **503** on that pass, which the
+  worker retries. Nothing else is armed to drive it.
+- **`abandoned_pre_disclosure` is bounded per IST day, not overall.** A candidate who
+  hangs up during the identity line every morning is re-dialled each day. The per-day
+  index is the accepted bound; recorded so the choice is deliberate rather than assumed.
 
 ---
 
