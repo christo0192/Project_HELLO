@@ -26,6 +26,7 @@ import { ErrorBoundary } from './ErrorBoundary';
 import {
   Brand,
   BriefcaseIcon,
+  CalendarIcon,
   DashboardIcon,
   LogOutIcon,
   MobileMenuButton,
@@ -220,12 +221,29 @@ export function Layout() {
             />
           </NavGroup>
 
-          {role === 'admin' && (
+          {/*
+            Operations. The GROUP is shown to admins and interviewers, but
+            each link keeps its own visibility rule — Mission Control stays
+            admin-only exactly as before, because its route is still
+            `requireRole="admin"` and offering an interviewer a link that
+            redirects to /unauthorized would be a worse experience than not
+            showing it. The phone calendar is added for both roles, matching
+            the API's "interviewer or above may read" rule.
+          */}
+          {(role === 'admin' || role === 'interviewer') && (
             <NavGroup label="Operations">
+              {role === 'admin' && (
+                <NavLinkItem
+                  to="/mission-control"
+                  label="Mission Control"
+                  icon={<ShieldIcon className="h-4 w-4" />}
+                  onNavigate={closeDrawer}
+                />
+              )}
               <NavLinkItem
-                to="/mission-control"
-                label="Mission Control"
-                icon={<ShieldIcon className="h-4 w-4" />}
+                to="/phone-calendar"
+                label="Phone calendar"
+                icon={<CalendarIcon className="h-4 w-4" />}
                 onNavigate={closeDrawer}
               />
             </NavGroup>

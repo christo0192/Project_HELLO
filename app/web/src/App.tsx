@@ -62,6 +62,10 @@ const MissionControlPage = lazyPage(
   () => import('./pages/MissionControlPage'),
   'MissionControlPage',
 );
+const PhoneCalendarPage = lazyPage(
+  () => import('./pages/PhoneCalendarPage'),
+  'PhoneCalendarPage',
+);
 const AshbyMissionControlPage = lazyPage(
   () => import('./pages/AshbyMissionControlPage'),
   'AshbyMissionControlPage',
@@ -126,6 +130,19 @@ export default function App() {
             <Route path="/candidates/:id" element={<CandidateDetailPage />} />
             <Route path="/sessions/:sessionId" element={<SessionDetailPage />} />
             <Route path="/screening/:sessionId" element={<ScreeningPage />} />
+            {/*
+              Phone calendar — authenticated, but deliberately NOT behind
+              `requireRole`. The API's rule is "interviewer or above may read,
+              admin may write", and ProtectedRoute's gate is exact equality
+              (`role !== requireRole`), so `requireRole="admin"` would lock out
+              the interviewers the API is happy to serve and there is no
+              "or above" gate to use instead. The page tells the three roles
+              apart itself: admins get write controls, interviewers get a
+              read-only view, and a viewer gets a truthful panel with no phone
+              API call made at all. The API re-checks the role on every
+              request regardless.
+            */}
+            <Route path="/phone-calendar" element={<PhoneCalendarPage />} />
           </Route>
         </Route>
 
