@@ -11548,6 +11548,38 @@ begin
     and (select current_question_index from screening_v2.call_sessions where id = v_ids[3]) = 1,
     'without this control the rollback assertion could pass vacuously');
 
+  -- SHAPE IS CHECKED BEFORE THE DUPLICATE READ-BACK. A malformed body that
+  -- happens to carry an ALREADY-COMMITTED event id must not be answered
+  -- `applied`: nothing is written either way, but a caller told its request
+  -- succeeded has been told something false about a request this function
+  -- never even parsed.
+  v_res := screening_v2.commit_phone_question_boundary(
+             v_ids[3], 'k1', 0, 'ev-rollback',
+             '[{"speaker":"bot","text":"only half an exchange"}]'::jsonb,
+             '2026-09-01T06:06:00Z'::timestamp with time zone);
+  perform _policy_tests.assert(
+    '0044-D5: a malformed body carrying a KNOWN event id is invalid_turns, not applied',
+    v_res ->> 'status' = 'invalid_turns',
+    'the duplicate read-back must not answer for a request that was never parsed: '
+      || v_res::text);
+
+  -- …and the well-formed duplicate still converges, so the check above did not
+  -- simply break idempotency.
+  v_res := screening_v2.commit_phone_question_boundary(
+             v_ids[3], 'k1', 0, 'ev-rollback',
+             '[{"speaker":"bot","text":"A?"},{"speaker":"candidate","text":"Y"}]'::jsonb,
+             '2026-09-01T06:07:00Z'::timestamp with time zone);
+  perform _policy_tests.assert(
+    '0044-D5: CONTROL — a WELL-FORMED duplicate still returns the original success',
+    v_res ->> 'status' = 'applied' and (v_res -> 'duplicate')::boolean
+    and (select count(*) from screening_v2.transcript_turns where session_id = v_ids[3]) = 2,
+    'moving the shape check ahead of the duplicate branch must not break idempotency');
+
+  perform _policy_tests.assert(
+    '0044-D5: the state RPC reports the session start, so a completion can time itself',
+    (screening_v2.get_phone_assessment_state(v_ids[3]) ->> 'started_at') is not null,
+    'a hardcoded duration of 0 asserts a screening that took no time');
+
   perform _policy_tests.phone44_teardown('pol44-shape');
 end;
 $$;

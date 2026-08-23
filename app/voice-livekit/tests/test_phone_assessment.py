@@ -313,6 +313,171 @@ class TestRunPhoneAssessment(unittest.TestCase):
         self.assertEqual(result.status, "scoring_failed")
 
 
+# ── The halt taxonomy, and the bounded completion retry ───────────────
+
+class TestHaltTaxonomy(unittest.TestCase):
+    """Not every halt means the same thing afterwards.
+
+    An INFRASTRUCTURE halt posts no terminal event, because the conversation is
+    interrupted rather than over. A CONVERSATIONAL halt — the candidate stopped
+    answering — must NOT be laundered into a line drop: posting nothing lets
+    the webhook grant and CHARGE a reconnect, and the candidate is dialled back
+    up to three times for having gone quiet.
+    """
+
+    def test_the_two_kinds_are_enumerated_not_inferred(self):
+        self.assertTrue(phone.halt_is_retryable(phone.HALT_PERSISTENCE))
+        self.assertTrue(phone.halt_is_retryable(phone.HALT_SCORING))
+        self.assertFalse(phone.halt_is_retryable(phone.HALT_MALFORMED_EXCHANGE))
+        self.assertFalse(phone.halt_is_retryable(phone.HALT_NO_ANSWER))
+
+    def test_an_unknown_or_absent_reason_is_NOT_silently_retryable(self):
+        """A new reason has to declare which kind it is. Defaulting into the
+        silent branch is how a candidate gets lost without a trace."""
+        for reason in (None, "", "something_new", 0, object()):
+            with self.subTest(reason=reason):
+                self.assertFalse(phone.halt_is_retryable(reason))
+
+    def test_every_declared_reason_is_classified(self):
+        declared = {
+            phone.HALT_PERSISTENCE, phone.HALT_SCORING,
+            phone.HALT_MALFORMED_EXCHANGE, phone.HALT_NO_ANSWER,
+        }
+        self.assertEqual(len(declared), 4)
+        self.assertTrue(phone.RETRYABLE_HALTS.issubset(declared))
+
+
+class TestCompletionRetry(unittest.IsolatedAsyncioTestCase):
+    """Every question is durable by the time completion runs.
+
+    A single unlucky inference call would otherwise throw the whole screening
+    away: the session is `completed` afterwards, so a later leg's
+    `start_phone_assessment` refuses it and there is no second chance from the
+    conversation. Retrying is safe rather than merely hopeful because the
+    endpoint is idempotent by construction.
+    """
+
+    async def _run(self, *, answers, attempts=3):
+        slept: list[float] = []
+        calls = {"n": 0}
+
+        class Client(ScriptedClient):
+            async def complete_assessment(self, attempt_id, session_id):
+                self.completions.append((attempt_id, session_id))
+                calls["n"] += 1
+                return answers[min(calls["n"] - 1, len(answers) - 1)]
+
+        async def sleep(seconds):
+            slept.append(seconds)
+
+        client = Client()
+
+        async def ask(question, cursor):
+            return [
+                {"speaker": "bot", "text": f"asking {question.key}"},
+                {"speaker": "candidate", "text": f"answer {question.key}"},
+            ]
+
+        async def say(text):
+            return None
+
+        result = await phone.run_phone_assessment(
+            attempt_id=_ATTEMPT_ID, session_id=_SESSION_ID, client=client,
+            state=phone.PhoneAssessmentState.parse(_body()),
+            ask=ask, say=say,
+            completion_attempts=attempts, completion_backoff_sec=0.01, sleep=sleep,
+        )
+        return result, client, slept
+
+    async def test_a_transient_scoring_failure_is_retried_and_then_succeeds(self):
+        result, client, slept = await self._run(answers=[
+            phone.PhoneApiOutcome(False, "scoring_failed"),
+            phone.PhoneApiOutcome(True, phone.ASSESSMENT_SCORED_STATUS),
+        ])
+        self.assertTrue(result.scored)
+        self.assertEqual(len(client.completions), 2)
+        self.assertEqual(len(slept), 1)
+
+    async def test_the_retry_is_BOUNDED(self):
+        result, client, _ = await self._run(
+            answers=[phone.PhoneApiOutcome(False, "scoring_failed")], attempts=3
+        )
+        self.assertFalse(result.scored)
+        self.assertEqual(len(client.completions), 3)
+
+    async def test_a_STATE_answer_is_not_retried_at_all(self):
+        """`plan_incomplete` and friends are states, not faults. Retrying
+        cannot change them, and hammering the endpoint would only hold the
+        candidate on the line."""
+        for status in ("plan_incomplete", "session_not_active", "unknown_session",
+                       "plan_missing", "assessment_missing"):
+            with self.subTest(status=status):
+                result, client, _ = await self._run(
+                    answers=[phone.PhoneApiOutcome(False, status)]
+                )
+                self.assertFalse(result.scored)
+                self.assertFalse(result.halted)
+                self.assertEqual(len(client.completions), 1)
+
+    async def test_a_verdict_we_UNDERSTAND_aborts_truthfully(self):
+        result, _, _ = await self._run(
+            answers=[phone.PhoneApiOutcome(False, "scoring_failed")]
+        )
+        self.assertFalse(result.scored)
+        # NOT halted: the API gave us an answer we understand, and the truthful
+        # terminal for "the conversation happened and nothing scored it" is
+        # `assessment.aborted`.
+        self.assertFalse(result.halted)
+
+    async def test_a_verdict_we_do_NOT_understand_halts_instead(self):
+        """A transport failure means we do not know whether it scored, and a
+        terminal event either way would be a claim we cannot support."""
+        outcome = phone.PhoneApiOutcome(False, None)
+        outcome.error_category = "transport"
+        result, _, _ = await self._run(answers=[outcome])
+        self.assertFalse(result.scored)
+        self.assertTrue(result.halted)
+        self.assertEqual(result.halt_reason, phone.HALT_SCORING)
+        self.assertTrue(phone.halt_is_retryable(result.halt_reason))
+
+
+# ── Fixed copy is not a screening turn ────────────────────────────────
+
+class TestGateCopyIsNotATurn(unittest.TestCase):
+    def test_every_fixed_line_the_bot_speaks_is_recognised(self):
+        for text in (
+            phone.PHONE_DISCLOSURE_TEXT,
+            phone.PHONE_REASK_TEXT,
+            phone.PHONE_REFUSED_TEXT,
+            phone.PHONE_OPT_OUT_TEXT,
+            phone.PHONE_WRONG_NUMBER_TEXT,
+            phone.PHONE_ASSESSMENT_CLOSING_TEXT,
+            phone.schedule_refusal_text("window_closed"),
+            phone.schedule_refusal_text("something_unrecognised"),
+        ):
+            with self.subTest(text=text[:30]):
+                self.assertTrue(phone.is_gate_copy(text))
+
+    def test_the_booking_CONFIRMATION_is_recognised_too(self):
+        """The one most likely to be spoken mid-screening, and therefore the
+        one most likely to be captured inside an open question's boundary."""
+        turn = _run(phone.schedule_callback_turn(
+            _StubBookingClient(), _ATTEMPT_ID, "2026-09-01T10:00:00Z", 1800,
+        ))
+        self.assertTrue(turn.booked)
+        self.assertTrue(phone.is_gate_copy(turn.spoken))
+
+    def test_a_real_answer_is_NOT_gate_copy(self):
+        for text in ("About four years.", "", None, 42, "  "):
+            with self.subTest(text=text):
+                self.assertFalse(phone.is_gate_copy(text))
+
+
+class _StubBookingClient:
+    async def book_appointment(self, attempt_id, starts_at, duration_seconds):
+        return phone.PhoneApiOutcome(True, "ok")
+
+
 # ── The client ────────────────────────────────────────────────────────
 
 class _Resp:

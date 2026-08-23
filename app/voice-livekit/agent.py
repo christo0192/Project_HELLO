@@ -781,7 +781,7 @@ async def _ask_phone_question(
     return turns
 
 
-def _apply_phone_instructions(agent: Any, state: "phone.PhoneAssessmentState") -> None:
+async def _apply_phone_instructions(agent: Any, state: "phone.PhoneAssessmentState") -> bool:
     """Give the agent the REAL instructions, once the plan is known.
 
     The question flow is formatted through `prompting.format_questions`, the
@@ -817,12 +817,45 @@ def _apply_phone_instructions(agent: Any, state: "phone.PhoneAssessmentState") -
         resume = phone.render_resume_context(state.turns)
         if resume:
             text = f"{text}\n\n{resume}"
-        setattr(agent, "instructions", text)
+        return await _deliver_phone_instructions(agent, text)
     except Exception:  # noqa: BLE001
         _log.warn(
             "unknown_event", error_type="phone_instructions_not_applied",
             error_category="agent_instructions",
         )
+        return False
+
+
+async def _deliver_phone_instructions(agent: Any, text: str) -> bool:
+    """Hand new instructions to a RUNNING agent, and say whether it took.
+
+    `Agent.instructions` is a read-only property on livekit-agents 1.6; the
+    supported mutator is `await agent.update_instructions(...)`. A bare
+    `setattr` therefore raises on the real SDK and succeeds on a stub — which
+    is the worst possible combination, because the tests would be green while
+    the candidate's name, the question flow and the resume replay never reached
+    the model at all.
+
+    So the mutator is tried FIRST and the attribute write is the fallback, and
+    the function REPORTS whether either worked rather than swallowing it. The
+    caller logs a failure; the screening still runs, and every boundary is
+    still keyed and committed correctly, because the question text is passed to
+    `generate_reply` directly and never read back out of the prompt.
+    """
+    update = getattr(agent, "update_instructions", None)
+    if callable(update):
+        try:
+            result = update(text)
+            if inspect.isawaitable(result):
+                await result
+            return True
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        setattr(agent, "instructions", text)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 async def _run_phone_entrypoint(ctx: JobContext, room_name: str) -> None:
@@ -904,6 +937,15 @@ async def _run_phone_session(
         if role == "user":
             candidate_activity.set()
             user_turns.put_nowait(text)
+        elif phone.is_gate_copy(text):
+            # FIXED COPY IS NOT A SCREENING TURN. The disclosure, the re-ask,
+            # every refusal closing, the callback confirmations and the closing
+            # line are all spoken through `session.say`, which appends a
+            # conversation item exactly like a generated turn does. Left in the
+            # queue, a scheduling confirmation spoken mid-call would be
+            # captured inside whichever question's boundary happened to be open
+            # and committed as part of the candidate's answer.
+            return
         exchange.put_nowait({
             "speaker": "candidate" if role == "user" else "bot",
             "text": text,
@@ -999,7 +1041,15 @@ async def _run_phone_session(
     # The plan is now known, so the agent is given the REAL instructions: the
     # candidate's name and the ordered question flow, in the same shape the
     # browser path has always used.
-    _apply_phone_instructions(agent, state)
+    if not await _apply_phone_instructions(agent, state):
+        # The screening still runs — the question text reaches the model
+        # through `generate_reply`, and every boundary is still keyed and
+        # committed by the cursor. What is lost is the tailoring and the
+        # resume replay, so this is worth SEEING rather than swallowing.
+        _log.warn(
+            "unknown_event", error_type="phone_instructions_not_applied",
+            error_category="not_delivered",
+        )
 
     silence_task = asyncio.create_task(
         _silence_termination_loop(
@@ -1062,16 +1112,21 @@ async def _run_phone_session(
     # this is the first of two gates rather than the only one.
     if assessment.scored:
         await events.post_event(attempt_id, "assessment.completed")
-    elif assessment.halted:
-        # A PERSISTENCE OR INFRASTRUCTURE FAILURE POSTS NOTHING.
+    elif phone.halt_is_retryable(assessment.halt_reason):
+        # AN INFRASTRUCTURE FAILURE POSTS NOTHING.
         # The conversation is not over, it is interrupted. Both terminal
         # events available here would end the engagement: `assessment.aborted`
-        # is terminal `failed`, and `assessment.completed` would be a lie. The
-        # candidate's line dropping is what 0042's reconnect budget is FOR, and
+        # is terminal `failed`, and `assessment.completed` would be a lie. A
+        # dropped or unwritable leg is what 0042's reconnect budget is FOR, and
         # the webhook's `sip.participant_left` drives it. Posting a terminal
         # event here would convert a retryable problem into a lost candidate —
-        # which is the mirror of the P4a defect: stopping something that fails
-        # loudly can make it fail silently, so this branch is logged.
+        # the mirror of the P4a defect: stopping something that fails loudly
+        # can make it fail silently, so this branch is logged.
+        #
+        # ONLY the infrastructure halts reach here. A candidate who simply
+        # stopped answering is NOT a line drop, and laundering it into one
+        # would let the webhook grant and CHARGE a reconnect — dialling that
+        # candidate back up to three times for having gone quiet.
         _log.warn(
             "unknown_event", error_type="phone_assessment_halted_leg",
             error_category=assessment.halt_reason,

@@ -114,7 +114,7 @@ const assessmentFixture: Assessment = {
   resume_conflicts: [],
 };
 
-function completedSession() {
+function completedSession(externalCallId: string | null = 'room-browser-1') {
   return {
     id: SESSION_ID,
     candidate_id: CANDIDATE_ID,
@@ -122,8 +122,12 @@ function completedSession() {
     role_id: null,
     status: 'completed',
     terminal_reason: 'conversation_complete',
+    external_call_id: externalCallId,
   };
 }
+
+/** The deterministic room name the dialer provisions for a phone screening. */
+const PHONE_ROOM = `phone-${SESSION_ID}`;
 
 const UNIQUE_VIOLATION = {
   code: '23505',
@@ -289,5 +293,66 @@ describe('an already-scored phone session is a success, not a refusal', () => {
         .rejects.toThrow(ERR_SESSION_NOT_COMPLETED);
       expect(runClaudeJSONWithProvenance, status).not.toHaveBeenCalled();
     }
+  });
+});
+
+
+// ═══════════════════════════════════════════════════════════════════
+describe('the source is DERIVED from the session, not trusted from the caller', () => {
+  // Four callers reach runAssessment — the phone completion endpoint, the
+  // worker scoring callback, the admin re-score route and the screening queue —
+  // and only one of them knows it is holding a phone session. If the source
+  // came from the caller, an admin re-scoring a phone session would write
+  // `source = 'browser'`: false provenance, OUTSIDE the partial unique index
+  // (so insertable repeatedly, re-firing the notification intent, the
+  // candidate status rewrite and the Ashby writeback each time), and invisible
+  // to `apply_phone_event`'s existence check — which would then refuse the
+  // completion of a screening that IS scored.
+
+  it('a PHONE session scores as phone even when the caller says nothing', async () => {
+    setDefault('call_sessions', ok(completedSession(PHONE_ROOM)));
+    await runAssessment(SESSION_ID);
+    const payload = callsFor('assessments', 'insert')[0].args[0] as Record<string, unknown>;
+    expect(payload.source).toBe('phone');
+  });
+
+  it('a caller cannot force a phone session into the browser partition', async () => {
+    setDefault('call_sessions', ok(completedSession(PHONE_ROOM)));
+    await runAssessment(SESSION_ID, { source: 'browser' });
+    const payload = callsFor('assessments', 'insert')[0].args[0] as Record<string, unknown>;
+    expect(payload.source).toBe('phone');
+  });
+
+  it('and the derived phone path gets the idempotent reuse too', async () => {
+    setDefault('call_sessions', ok(completedSession(PHONE_ROOM)));
+    enqueue(
+      'assessments',
+      { data: null, error: UNIQUE_VIOLATION },
+      ok({ id: WINNER_ID, raw: assessmentFixture }),
+    );
+    const result = await runAssessment(SESSION_ID);
+    expect(result.id).toBe(WINNER_ID);
+    expect(observeAshbyCompletion).not.toHaveBeenCalled();
+  });
+
+  it('a BROWSER session is unaffected, whatever its room name looks like', async () => {
+    for (const room of ['room-browser-1', null, '', 'telephone-booth', 'phone']) {
+      calls = [];
+      queues = new Map();
+      setDefault('call_sessions', ok(completedSession(room)));
+      setDefault('assessments', ok({ id: 'fresh-row' }));
+      await runAssessment(SESSION_ID);
+      const payload = callsFor('assessments', 'insert')[0].args[0] as Record<string, unknown>;
+      expect(Object.keys(payload), String(room)).not.toContain('source');
+    }
+  });
+
+  it('an explicit phone source still forces the phone partition', async () => {
+    // The completion endpoint passes it, and it must keep working on a session
+    // whose room name is not yet the derived shape.
+    setDefault('call_sessions', ok(completedSession('room-browser-1')));
+    await runAssessment(SESSION_ID, { source: 'phone' });
+    const payload = callsFor('assessments', 'insert')[0].args[0] as Record<string, unknown>;
+    expect(payload.source).toBe('phone');
   });
 });

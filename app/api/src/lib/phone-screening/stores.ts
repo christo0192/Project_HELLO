@@ -245,6 +245,7 @@ function projectAssessmentState(
     sessionId: str(row, 'session_id'),
     sessionStatus: str(row, 'session_status'),
     terminalReason: row && 'terminal_reason' in row ? (str(row, 'terminal_reason') ?? null) : undefined,
+    startedAt: row && 'started_at' in row ? (iso(row, 'started_at') ?? null) : undefined,
     candidateName: row && 'candidate_name' in row ? (str(row, 'candidate_name') ?? null) : undefined,
     planSource: str(row, 'plan_source'),
     questionCount: num(row, 'question_count'),

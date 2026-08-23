@@ -26,13 +26,29 @@ import express from 'express';
 import request from 'supertest';
 import {
   createPhoneWorkerRouter,
+  elapsedSeconds,
   sanitizeAssessmentState,
 } from '../routes/phone-worker.js';
+import { transitionSession } from '../lib/session-lifecycle.js';
+import { runAssessment } from '../services/assessment.js';
 import type {
   CommitPhoneQuestionBoundaryResult,
   PhoneAssessmentState,
   PhoneStores,
 } from '../lib/phone-screening/index.js';
+
+// M-4: the two production DI defaults are the ONLY thing standing between
+// this router and a feature that ships green and inert. They are mocked at the
+// module boundary so a router built with an EMPTY deps object can be driven and
+// observed — without that test, replacing either default with a no-op leaves
+// the whole suite green, which is exactly the failure the code's own comment
+// invokes.
+vi.mock('../lib/session-lifecycle.js', () => ({
+  transitionSession: vi.fn(async () => ({ ok: true })),
+}));
+vi.mock('../services/assessment.js', () => ({
+  runAssessment: vi.fn(async () => ({ id: 'assessment-1' })),
+}));
 
 const ATTEMPT = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 const SESSION = '99999999-8888-4777-8666-555555555555';
@@ -57,6 +73,7 @@ function state(over: Partial<PhoneAssessmentState> = {}): PhoneAssessmentState {
     sessionId: SESSION,
     sessionStatus: 'in_progress',
     terminalReason: null,
+    startedAt: '2026-09-01T05:58:00.000Z',
     candidateName: 'Asha',
     planSource: 'role_template',
     questionCount: 2,
@@ -449,10 +466,13 @@ describe('POST /assessment/complete — the ordering this phase exists for', () 
     expect(h.scoreSession).not.toHaveBeenCalled();
   });
 
-  it('a scoring failure yields no completion, and quotes nothing', async () => {
+  it('a scoring failure with NO row yields no completion, and quotes nothing', async () => {
     const h = build({
       scoreThrows: true,
-      states: [state({ planComplete: true, cursor: 2 })],
+      states: [
+        state({ planComplete: true, cursor: 2 }),
+        state({ planComplete: true, cursor: 2, assessmentExists: false }),
+      ],
     });
     const res = await post(h, '/assessment/complete', START_BODY);
     expect(res.body).toEqual({ ok: false, status: 'scoring_failed' });
@@ -462,7 +482,69 @@ describe('POST /assessment/complete — the ordering this phase exists for', () 
     expect(JSON.stringify(res.body)).not.toContain('42');
   });
 
-  it('SCORING SUCCEEDING IS NOT AN ASSESSMENT EXISTING', async () => {
+  it('A SCORING THROW WITH A ROW IS STILL SCORED — the exception is not the evidence', async () => {
+    // The ordinary reconnect case, and the inversion it used to produce. The
+    // WINNING leg inserts the assessment; the LOSING leg's insert hits 23505
+    // and any failure to read the winner's row back re-throws. The session IS
+    // scored. A leg that returned `scoring_failed` here would report otherwise,
+    // the worker would post `assessment.aborted`, and the engagement would go
+    // terminal `failed` over a screening that exists.
+    const h = build({
+      scoreThrows: true,
+      states: [
+        state({ planComplete: true, cursor: 2 }),
+        state({ planComplete: true, cursor: 2, assessmentExists: true }),
+      ],
+    });
+    const res = await post(h, '/assessment/complete', START_BODY);
+    expect(res.body).toEqual({ ok: true, status: 'scored' });
+    // …and the verification really did run after the throw.
+    expect(h.order).toEqual(['state', 'complete', 'score', 'state']);
+  });
+
+  it('the two refusals stay DISTINCT — the worker treats them differently', async () => {
+    // `scoring_failed` is a provider fault the worker may retry;
+    // `assessment_missing` is a state it must not.
+    const thrown = build({
+      scoreThrows: true,
+      states: [state({ planComplete: true, cursor: 2 }), state({ planComplete: true, cursor: 2 })],
+    });
+    expect((await post(thrown, '/assessment/complete', START_BODY)).body.status)
+      .toBe('scoring_failed');
+
+    const quiet = build({
+      states: [state({ planComplete: true, cursor: 2 }), state({ planComplete: true, cursor: 2 })],
+    });
+    expect((await post(quiet, '/assessment/complete', START_BODY)).body.status)
+      .toBe('assessment_missing');
+  });
+
+  it('the completion reports the REAL elapsed time, and omits it when it cannot', async () => {
+    const h = build({
+      states: [
+        state({ planComplete: true, cursor: 2, startedAt: '2026-09-01T05:58:00.000Z' }),
+        state({ planComplete: true, cursor: 2, assessmentExists: true }),
+      ],
+    });
+    await post(h, '/assessment/complete', START_BODY);
+    // NOW is 06:00:00Z, the session started at 05:58:00Z.
+    expect(h.completeSession).toHaveBeenCalledWith({ sessionId: SESSION, durationSec: 120 });
+
+    const unknown = build({
+      states: [
+        state({ planComplete: true, cursor: 2, startedAt: null }),
+        state({ planComplete: true, cursor: 2, assessmentExists: true }),
+      ],
+    });
+    await post(unknown, '/assessment/complete', START_BODY);
+    // Omitted, not zero: the lifecycle then leaves the column alone, which is
+    // truthful, where a hardcoded 0 asserts a screening that took no time.
+    expect(unknown.completeSession).toHaveBeenCalledWith({
+      sessionId: SESSION, durationSec: undefined,
+    });
+  });
+
+  it('SCORING RESOLVING IS NOT AN ASSESSMENT EXISTING', async () => {
     // The distinction the whole endpoint turns on. `scoreSession` resolved, and
     // the verifying read still says there is no row — so nothing may be claimed.
     const h = build({
@@ -591,5 +673,112 @@ describe('the response body is a SUBSET, asserted structurally', () => {
     expect(body.turns).toHaveLength(1);
     expect((body.context as { candidate_name: string }).candidate_name).toBe('Asha');
     expect(body.progress).toBeDefined();
+  });
+});
+
+
+// ═══════════════════════════════════════════════════════════════════════
+describe('the PRODUCTION defaults, driven with an empty deps object', () => {
+  // Every other test in this file injects `completeSession` and `scoreSession`.
+  // That is right for asserting ordering, and it means none of them touches
+  // the defaults — so this is the one place the wiring is real.
+  function defaultsHarness(states: PhoneAssessmentState[]) {
+    const queued = [...states];
+    const assessmentState = vi.fn(async () =>
+      queued.length > 0 ? queued.shift()! : state({ planComplete: true, cursor: 2 }));
+    const app = express();
+    app.use(express.json());
+    app.use(
+      '/api/internal/phone',
+      createPhoneWorkerRouter({
+        // No completeSession, no scoreSession: the defaults must reach through.
+        stores: { assessmentState } as unknown as PhoneStores,
+        configSource: ENABLED,
+        now: () => NOW,
+      }),
+    );
+    return app;
+  }
+
+  beforeEach(() => {
+    vi.mocked(transitionSession).mockClear();
+    vi.mocked(runAssessment).mockClear();
+    vi.mocked(transitionSession).mockResolvedValue({ ok: true } as never);
+    vi.mocked(runAssessment).mockResolvedValue({ id: 'assessment-1' } as never);
+  });
+
+  it('completeSession defaults to the SHARED lifecycle CAS the browser uses', async () => {
+    const app = defaultsHarness([
+      state({ planComplete: true, cursor: 2, startedAt: '2026-09-01T05:59:00.000Z' }),
+      state({ planComplete: true, cursor: 2, assessmentExists: true }),
+    ]);
+    const res = await request(app)
+      .post('/api/internal/phone/assessment/complete')
+      .set('Authorization', `Bearer ${SECRET}`)
+      .send(START_BODY);
+    expect(res.body).toEqual({ ok: true, status: 'scored' });
+    expect(transitionSession).toHaveBeenCalledWith(
+      SESSION, 'in_progress', 'completed', 'conversation_complete', { duration_sec: 60 },
+    );
+  });
+
+  it('scoreSession defaults to the SHARED runner, with the PHONE source', async () => {
+    const app = defaultsHarness([
+      state({ planComplete: true, cursor: 2 }),
+      state({ planComplete: true, cursor: 2, assessmentExists: true }),
+    ]);
+    await request(app)
+      .post('/api/internal/phone/assessment/complete')
+      .set('Authorization', `Bearer ${SECRET}`)
+      .send(START_BODY);
+    // The source is what puts the row in the partition the unique index and
+    // the SQL interlock both key on. A default that dropped it would score the
+    // session as `browser` and the completion would then be refused.
+    expect(runAssessment).toHaveBeenCalledWith(SESSION, { source: 'phone' });
+  });
+
+  it('a lifecycle CONFLICT still reaches the scorer through the default', async () => {
+    vi.mocked(transitionSession).mockResolvedValue({ ok: false, conflict: true } as never);
+    const app = defaultsHarness([
+      state({ planComplete: true, cursor: 2 }),
+      state({ planComplete: true, cursor: 2, assessmentExists: true }),
+    ]);
+    const res = await request(app)
+      .post('/api/internal/phone/assessment/complete')
+      .set('Authorization', `Bearer ${SECRET}`)
+      .send(START_BODY);
+    expect(res.body).toEqual({ ok: true, status: 'scored' });
+    expect(runAssessment).toHaveBeenCalledOnce();
+  });
+
+  it('a lifecycle ERROR does NOT reach the scorer', async () => {
+    vi.mocked(transitionSession).mockResolvedValue(
+      { ok: false, conflict: false, code: 'ERR_INVALID_TRANSITION' } as never,
+    );
+    const app = defaultsHarness([state({ planComplete: true, cursor: 2 })]);
+    const res = await request(app)
+      .post('/api/internal/phone/assessment/complete')
+      .set('Authorization', `Bearer ${SECRET}`)
+      .send(START_BODY);
+    expect(res.body).toEqual({ ok: false, status: 'completion_failed' });
+    expect(runAssessment).not.toHaveBeenCalled();
+  });
+});
+
+describe('elapsedSeconds', () => {
+  const at = new Date('2026-09-01T06:00:00.000Z');
+
+  it('reports whole seconds from a real start', () => {
+    expect(elapsedSeconds('2026-09-01T05:58:30.000Z', at)).toBe(90);
+  });
+
+  it('returns undefined rather than 0 for anything unusable', () => {
+    for (const value of [null, undefined, '', 'not-a-date', '2026-09-01T06:00:30.000Z']) {
+      expect(elapsedSeconds(value as string | null, at), String(value)).toBeUndefined();
+    }
+  });
+
+  it('is bounded by the column the lifecycle writes to', () => {
+    expect(elapsedSeconds('2020-01-01T00:00:00.000Z', at)).toBe(86_400);
   });
 });

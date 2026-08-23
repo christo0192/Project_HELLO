@@ -26,7 +26,12 @@ export const ERR_SESSION_NOT_COMPLETED = 'ERR_SESSION_NOT_COMPLETED';
  * column is simply not passed and the database default applies.
  */
 export interface RunAssessmentOptions {
-  /** Which screening channel is asking. Omit for the browser path. */
+  /**
+   * Which screening channel is asking. Omit and the source is DERIVED from
+   * the session itself — see `runAssessmentImpl`. Passing `'phone'` forces it;
+   * passing `'browser'` cannot force a phone session into the browser
+   * partition, because the caller does not get to decide what a session is.
+   */
   readonly source?: 'browser' | 'phone';
 }
 
@@ -71,14 +76,32 @@ async function runAssessmentImpl(
   sessionId: string,
   options?: RunAssessmentOptions,
 ): Promise<Assessment & { id: string }> {
-  const isPhone = options?.source === 'phone';
-
   const { data: session, error: sErr } = await supabase
     .from('call_sessions')
-    .select('id,candidate_id,owner_id,role_id,status,terminal_reason')
+    .select('id,candidate_id,owner_id,role_id,status,terminal_reason,external_call_id')
     .eq('id', sessionId)
     .single();
   if (sErr || !session) throw new Error(`session not found: ${sErr?.message}`);
+
+  // ── THE SOURCE IS DERIVED, NOT TRUSTED ──────────────────────────────
+  // Four callers reach this function — the phone completion endpoint, the
+  // worker scoring callback, the admin re-score route and the screening
+  // queue — and only one of them knows it is holding a phone session. If the
+  // source came from the caller, an admin re-scoring a phone session would
+  // write `source = 'browser'`: false provenance, outside
+  // `uq_assessments_phone_session` (so insertable repeatedly, re-firing the
+  // notification intent, the candidate status rewrite and the Ashby
+  // writeback each time), and invisible to `apply_phone_event`'s existence
+  // check — which would then refuse the completion of a screening that IS
+  // scored.
+  //
+  // `external_call_id` is the deterministic phone room name the dialer
+  // provisions and `start_phone_assessment` verifies, so the session itself
+  // is the authority on what channel it belongs to. An explicit `'phone'`
+  // still forces the phone partition; an explicit `'browser'` cannot force a
+  // phone session out of it.
+  const isPhone =
+    options?.source === 'phone' || isPhoneSession(session.external_call_id as unknown);
 
   // VOI-08: technical scoring eligibility — fail closed unless the session is
   // completed with the authoritative initial scoring reason. Blocks
@@ -286,6 +309,19 @@ async function runAssessmentImpl(
   });
 
   return { ...assessment, id: row.id };
+}
+
+/**
+ * True when this session belongs to the PHONE channel, decided from the
+ * deterministic room name `phone-<sessionId>` that the dialer provisions and
+ * `start_phone_assessment` verifies before it will bind anything.
+ *
+ * Matched on the prefix only. A UUID check would be a second copy of a format
+ * rule that already lives in two places, and this is not a security boundary —
+ * the binding is enforced in SQL; this decides which partition a row lands in.
+ */
+function isPhoneSession(externalCallId: unknown): boolean {
+  return typeof externalCallId === 'string' && externalCallId.startsWith('phone-');
 }
 
 /**

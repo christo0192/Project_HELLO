@@ -481,6 +481,7 @@ export const PHONE_RPC_RESULT_KEYS: Readonly<Record<string, readonly string[]>> 
   // `get_phone_assessment_state`'s payload verbatim, so pinning the same keys
   // against a body that does not contain them would be a vacuous assertion.
   get_phone_assessment_state: [
+    'started_at',
     'questions',
     'question_count',
     'cursor',

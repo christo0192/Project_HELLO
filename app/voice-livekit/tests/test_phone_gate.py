@@ -1194,6 +1194,7 @@ class _FakeSpeech:
 class _FakePhoneSession:
     instances: list = []
     default_answers: list = []
+    default_mid_turn_says: list = []
 
     def __init__(self, **kwargs):
         self.handlers: dict = {}
@@ -1212,6 +1213,7 @@ class _FakePhoneSession:
         # assert the happy one.
         self.answers: list = list(_FakePhoneSession.default_answers)
         self.instructions: list[str] = []
+        self.mid_turn_says: list[str] = list(_FakePhoneSession.default_mid_turn_says)
         _FakePhoneSession.instances.append(self)
 
     def on(self, event):
@@ -1226,6 +1228,12 @@ class _FakePhoneSession:
 
     def say(self, text, **kwargs):
         self.spoken.append(text)
+        # The REAL SDK appends a conversation item for a spoken line exactly as
+        # it does for a generated one. Modelling that is what makes the gate-copy
+        # filter testable at all — without it, the fixed disclosure and the
+        # booking confirmations never reach the exchange queue in a test and the
+        # filter is decorative by construction.
+        self.emit_bot_turn(text)
         return _FakeSpeech()
 
     def emit_user_turn(self, text):
@@ -1250,6 +1258,13 @@ class _FakePhoneSession:
     def generate_reply(self, instructions=None, **kwargs):
         self.instructions.append(str(instructions or ""))
         self.emit_bot_turn(f"asked-{len(self.instructions)}")
+        # A fixed line spoken WHILE a boundary is open — the callback
+        # confirmation is the realistic case, because "call me back" can be
+        # said in the middle of any question. It must not be committed as part
+        # of the candidate's answer.
+        for line in self.mid_turn_says:
+            # Through `say`, exactly as the callback tool does it.
+            self.say(line)
         if self.answers:
             reply = self.answers.pop(0)
             if reply is not None:
@@ -1265,6 +1280,7 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         _FakePhoneSession.instances = []
         _FakePhoneSession.default_answers = []
+        _FakePhoneSession.default_mid_turn_says = []
 
     async def _run_session(
         self,
@@ -1359,9 +1375,11 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("assessment.aborted", client.event_types)
         self.assertNotIn("assessment.completed", client.event_types)
-        # The boundaries still committed: the candidate's answers are durable
-        # even though the screening could not be scored, which is what lets an
-        # operator retry the scoring rather than re-run the call.
+        # The boundaries still committed, so the transcript is durable and the
+        # session is scorable — but note what this does NOT claim: the
+        # engagement is now terminal `failed`, and re-scoring it later produces
+        # an assessment and a scorecard while leaving that terminal state
+        # where it is. There is no path back to `completed`. See the runbook.
         self.assertEqual(client.committed_keys, ["k1", "k2"])
 
     async def test_a_PERSISTENCE_failure_posts_nothing_at_all(self):
@@ -1437,11 +1455,19 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             for turn in boundary["turns"]:
                 self.assertNotIn("recorded so the hiring team", turn["text"])
 
-    async def test_a_silent_candidate_halts_rather_than_committing_half_an_exchange(self):
-        """No answer means no boundary.
+    async def test_a_silent_candidate_ENDS_the_call_rather_than_looking_like_a_drop(self):
+        """No answer means no boundary — and it is NOT a line drop.
 
         Committing the bot's question with nothing after it would record an
         answer the candidate never gave, and the scorer reads that transcript.
+        But posting nothing would be worse in the other direction: the
+        webhook's `sip.participant_left` would then grant and CHARGE a
+        reconnect, and a candidate who simply went quiet would be dialled back
+        up to three times — on a dialer whose per-IST-day index exists to
+        prevent exactly that.
+
+        So a conversational halt ends the call truthfully with
+        `assessment.aborted`, and only an INFRASTRUCTURE halt posts nothing.
         """
         # Comfortably under the harness's 0.05 s residency cap, so the HALT is
         # what ends the leg rather than the residency timeout — two different
@@ -1453,7 +1479,37 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(client.committed_keys, [])
         self.assertNotIn("assessment.completed", client.event_types)
-        self.assertNotIn("assessment.aborted", client.event_types)
+        self.assertIn("assessment.aborted", client.event_types)
+
+    async def test_FIXED_COPY_never_lands_inside_a_committed_boundary(self):
+        """The disclosure and the booking confirmations are not screening turns.
+
+        Both are spoken through `session.say`, which appends a conversation item
+        exactly like a generated turn does. A confirmation spoken mid-question —
+        "call me back" can be said during any of them — would otherwise be
+        captured inside whichever boundary happened to be open and committed as
+        part of the candidate's answer, which the scorer then reads.
+        """
+        _FakePhoneSession.default_mid_turn_says = [
+            phone._SCHEDULE_CONFIRMED_TEXT,
+            phone.schedule_refusal_text("window_closed"),
+        ]
+        _, client, _, _, session, _ = await self._run_session(
+            answers=("Yes, that's fine.",)
+        )
+        self.assertEqual(client.committed_keys, ["k1", "k2"])
+        committed = [t["text"] for b in client.boundaries for t in b["turns"]]
+        self.assertNotIn(phone._SCHEDULE_CONFIRMED_TEXT, committed)
+        self.assertNotIn(phone.schedule_refusal_text("window_closed"), committed)
+        self.assertNotIn(phone.PHONE_DISCLOSURE_TEXT, committed)
+        self.assertNotIn(phone.PHONE_ASSESSMENT_CLOSING_TEXT, committed)
+        # CONTROL — the lines really were spoken, so the assertions above are
+        # about the FILTER and not about a fake that never emitted them.
+        self.assertIn(phone._SCHEDULE_CONFIRMED_TEXT, session.spoken)
+        self.assertIn(phone.PHONE_DISCLOSURE_TEXT, session.spoken)
+        # …and a real generated turn DID survive, so the filter is not simply
+        # dropping everything the bot says.
+        self.assertTrue(any(t.startswith("asked-") for t in committed))
 
     async def test_the_close_reason_is_still_not_what_decides_a_completion(self):
         """A tidy hangup is not evidence of anything.
@@ -1499,6 +1555,115 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             session.started_with["record"],
             {"audio": False, "transcript": False, "traces": False, "logs": False},
         )
+
+
+# ── H-3: the instructions must actually be DELIVERED ──────────────────
+
+class TestInstructionDelivery(unittest.IsolatedAsyncioTestCase):
+    """`render_resume_context` being a well-tested pure function proves nothing
+    about whether its output ever reaches the model.
+
+    `Agent.instructions` is a read-only property on livekit-agents 1.6 and the
+    supported mutator is `await agent.update_instructions(...)`. A bare
+    `setattr` raises on the real SDK and succeeds on a stub — the worst
+    combination, because the suite would be green while the candidate's name,
+    the question flow and the resume replay never reached the model at all.
+    """
+
+    def _state(self, *, turns=None):
+        return phone.PhoneAssessmentState.parse(_plan_payload(turns=turns))
+
+    async def test_it_prefers_the_SDK_mutator_over_a_bare_attribute_write(self):
+        class RealisticAgent:
+            """`instructions` is read-only, exactly as the SDK declares it."""
+
+            def __init__(self):
+                self.delivered = []
+
+            @property
+            def instructions(self):
+                return "base"
+
+            async def update_instructions(self, text):
+                self.delivered.append(text)
+
+        agent = RealisticAgent()
+        # The prompt builders are spied rather than asserted on by their
+        # OUTPUT: `test_agent.py` swaps `sys.modules["prompting"]` for a mock
+        # at import time, so what `system_prompt` returns depends on module
+        # load order. What must be true regardless is that the PLAN and the
+        # candidate's name are what get built into the instructions, and that
+        # the result is delivered through the SDK mutator.
+        with patch.object(agent_mod, "system_prompt", return_value="BUILT") as build, \
+             patch.object(
+                 agent_mod, "prompting_format_questions", return_value="FLOW"
+             ) as flow:
+            ok = await agent_mod._apply_phone_instructions(agent, self._state())
+        self.assertTrue(ok)
+        self.assertEqual(len(agent.delivered), 1)
+        self.assertEqual(agent.delivered[0], "BUILT")
+        self.assertEqual(
+            flow.call_args.args[0],
+            [{"id": "k1", "question": "First question?", "mandatory": True},
+             {"id": "k2", "question": "Second question?", "mandatory": False}],
+        )
+        self.assertEqual(build.call_args.kwargs["candidate_name"], "Asha")
+        self.assertEqual(build.call_args.kwargs["questions"], "FLOW")
+
+    async def test_the_RESUME_replay_is_actually_delivered(self):
+        class RealisticAgent:
+            def __init__(self):
+                self.delivered = []
+
+            async def update_instructions(self, text):
+                self.delivered.append(text)
+
+        agent = RealisticAgent()
+        with patch.object(agent_mod, "system_prompt", return_value="BUILT"):
+            ok = await agent_mod._apply_phone_instructions(agent, self._state(turns=[
+                {"speaker": "bot", "text": "How many years?"},
+                {"speaker": "candidate", "text": "About four."},
+            ]))
+        self.assertTrue(ok)
+        self.assertIn("Candidate: About four.", agent.delivered[0])
+        self.assertIn("do NOT ask these again", agent.delivered[0])
+
+    async def test_the_attribute_write_is_the_FALLBACK_not_the_path(self):
+        class LegacyAgent:
+            instructions = "base"
+
+        agent = LegacyAgent()
+        with patch.object(agent_mod, "system_prompt", return_value="BUILT"):
+            ok = await agent_mod._apply_phone_instructions(agent, self._state())
+        self.assertTrue(ok)
+        self.assertEqual(agent.instructions, "BUILT")
+
+    async def test_a_FAILED_delivery_is_reported_rather_than_swallowed(self):
+        class HostileAgent:
+            @property
+            def instructions(self):
+                return "base"
+
+            async def update_instructions(self, text):
+                raise RuntimeError("not supported")
+
+        # `instructions` has no setter, so the fallback raises too.
+        ok = await agent_mod._apply_phone_instructions(HostileAgent(), self._state())
+        self.assertFalse(ok)
+
+    async def test_a_RAISING_mutator_still_falls_back(self):
+        class FlakyAgent:
+            def __init__(self):
+                self.instructions = "base"
+
+            async def update_instructions(self, text):
+                raise RuntimeError("nope")
+
+        agent = FlakyAgent()
+        with patch.object(agent_mod, "system_prompt", return_value="BUILT"):
+            ok = await agent_mod._apply_phone_instructions(agent, self._state())
+        self.assertTrue(ok)
+        self.assertEqual(agent.instructions, "BUILT")
 
 
 # ── Number safety ─────────────────────────────────────────────────────

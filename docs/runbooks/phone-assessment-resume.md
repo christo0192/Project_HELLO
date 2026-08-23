@@ -88,6 +88,25 @@ awaits it and reports the failure.
 exactly what a reconnect produces. The loser still scores (idempotently) and
 still verifies.
 
+**A scoring *exception* is not evidence that nothing was scored.** In that same
+race the loser's insert hits `23505`, and any failure to read the winner's row
+back re-throws. The session IS scored. So the exception is remembered and the
+**row** decides: `/assessment/complete` runs the verifying read either way, and
+answers `scored` when the row is there. Returning `scoring_failed` on the throw
+would have driven the engagement to terminal `failed` over a screening that
+exists.
+
+**The completion is retried, boundedly.** Every question is durable by then, and
+there is no second chance from the conversation — the session is `completed`
+afterwards, so a later leg's `start_phone_assessment` refuses it with
+`session_not_active`. Three attempts with linear backoff, and only for answers
+that are *faults* (`scoring_failed`, `completion_failed`,
+`phone_assessment_error`); a *state* like `plan_incomplete` is not retried,
+because retrying cannot change it and would only hold the candidate on the line.
+An answer we cannot parse at all (a transport failure) is a **halt**, not an
+abort: we do not know whether it scored, and a terminal event either way would
+be a claim we cannot support.
+
 ---
 
 ## 4. The three terminal decisions, and the one that posts nothing
@@ -98,19 +117,27 @@ collapse into two:
 | Outcome | Worker posts | Why |
 |---|---|---|
 | `scored` | `assessment.completed` | The API verified an assessment row |
-| `halted` | **nothing at all** | A persistence or infrastructure failure. The conversation is interrupted, not over |
+| halted, **infrastructure** (`persistence_failed`, `scoring_unreachable`) | **nothing at all** | The conversation is interrupted, not over |
+| halted, **conversational** (`malformed_exchange`, `no_exchange_captured`) | `assessment.aborted` | The candidate stopped answering. That is not a line drop |
 | neither | `assessment.aborted` | The call happened and produced nothing scorable — P4a's truthful terminal, unchanged |
 
-The middle row is the one worth understanding. Both terminal events available on
-that path would **end** the engagement: `assessment.aborted` is terminal `failed`,
-and `assessment.completed` would be a lie. A dropped or unwritable leg is what
+**The infrastructure row.** Both terminal events available on that path would
+**end** the engagement: `assessment.aborted` is terminal `failed`, and
+`assessment.completed` would be a lie. A dropped or unwritable leg is what
 `0042`'s reconnect budget is *for*, and the webhook's `sip.participant_left`
 drives it. Posting a terminal event there would convert a retryable problem into
-a lost candidate.
-
-It is **logged** (`phone_assessment_halted_leg` with a halt reason) rather than
+a lost candidate. It is **logged** (`phone_assessment_halted_leg`) rather than
 silent, because P4a's own review recorded the mirror lesson: stopping something
 that fails loudly can make it fail silently.
+
+**The conversational row, and why it is separate.** A candidate who simply goes
+quiet produces the same *shape* — a boundary with no answer in it — but posting
+nothing there would let the webhook grant and **charge** a reconnect, and that
+candidate would be dialled back up to three times for having said nothing, on a
+dialer whose per-IST-day index exists to prevent exactly that. So these end the
+call truthfully instead. `phone.halt_is_retryable` enumerates which halts are
+which, and an unknown or absent reason is **not** silently retryable — a new
+reason has to declare its kind rather than defaulting into the silent branch.
 
 ---
 
@@ -164,6 +191,16 @@ once scoring lands succeeds.
   forbids skipping *mandatory* keys) and it is the safe direction, but a role
   whose template contains a question that genuinely does not apply will still
   have it asked. Relaxing this needs its own migration and its own review.
+- **A scoring failure the API can NAME is still terminal.** After three bounded
+  attempts, an answer we understand (`scoring_failed`) ends the call with
+  `assessment.aborted`, i.e. terminal `failed`. The transcript is durable and
+  the session is scorable, so re-scoring it later through
+  `POST /api/assess/:sessionId` produces an assessment and a scorecard — and it
+  now lands in the **phone** partition, because the source is derived from the
+  session rather than taken from the caller. But there is **no path back to
+  `completed`**: the engagement is terminal and `apply_phone_event`
+  short-circuits every later post with `ignored: terminal`. An operator
+  recovery that also corrects the engagement outcome is not built.
 - **A malformed `screening_template` refuses the leg.** It is refused before a
   single question is put, so nothing is lost but the leg — but a role saved
   outside the API's zod validation could make every call to that role fail to
@@ -196,6 +233,23 @@ once scoring lands succeeds.
   SDK-independent and testable, where reconstructing a `ChatContext` is neither.
   The model is never asked to work out from that transcript which questions
   remain — that comes from the cursor.
+- **Delivery of those instructions is BEST EFFORT, and not verified against the
+  real SDK.** `Agent.instructions` is a read-only property on
+  livekit-agents 1.6, so `_deliver_phone_instructions` calls
+  `await agent.update_instructions(...)` first and falls back to an attribute
+  write. Both paths are tested against doubles shaped like each case, and a
+  failure to deliver is **reported and logged** rather than swallowed — but the
+  SDK is not installed in CI, so nobody has yet watched the real one accept it.
+  Whether an instruction update after `session.start()` re-seeds a running
+  session's context is also unverified. If it does not, the screening still runs
+  correctly — the question text reaches the model through `generate_reply` and
+  every boundary is still keyed by the cursor — but the tailoring and the resume
+  replay would be lost. **Watch for `phone_instructions_not_applied` on the
+  first synthetic rehearsal.**
+- **A duplicate boundary advances the cursor, and the exchange this leg captured
+  is discarded.** That is correct — the question is answered and recorded — but
+  the transcript will show the OTHER exchange. Logged as
+  `phone_boundary_duplicate` rather than silently equated.
 
 ---
 
@@ -217,8 +271,8 @@ Kill switch at any point: `POST /api/phone/halt`.
 
 ## 9. The mutation controls, and how to re-run them
 
-Same contract as `phone-safe-dialer.md` §11: every guard below was deliberately
-broken, the suite run, the failure recorded, then reverted and re-run green.
+Twenty-six controls. Same contract as `phone-safe-dialer.md` §11: every guard
+below was deliberately broken, the suite run, the failure recorded, then reverted and re-run green.
 **If deleting a guard leaves its suite green, the guard is decorative.**
 
 Recorded here rather than shipped as a script, for the same reason: a script that
@@ -241,12 +295,42 @@ Re-run them by hand, on a **clean** tree, one at a time.
 | P3 | Post `assessment.completed` unconditionally (the P4a defect, restored) | Python suite | 4 fail |
 | P4 | Skip `valid_boundary_turns` and commit whatever was captured | Python suite | 2 fail |
 | P5 | Post a terminal event on the halted path | Python suite | 2 fail |
+| M10 | Move the whole shape-validation block after the duplicate read-back | `policy_tests.sql` | 1 fail |
+| M11 | Return `null` for `started_at` from the state RPC | `policy_tests.sql` | 1 fail |
+| M12 | Return on a scoring throw instead of running the verifying read | `phone-assessment-route` | 1 fail |
+| M13 | Hardcode `durationSec: 0` again | `phone-assessment-route` | 2 fail |
+| M14 | Drop `{ source: 'phone' }` from the default `scoreSession` | `phone-assessment-route` | 1 fail |
+| M15 | Trust the caller's `source` instead of deriving it | `phone-assessment-idempotency` | 3 fail |
+| P6 | Put the conversational halts back into `RETRYABLE_HALTS` | Python suite | 2 fail |
+| P7 | Remove the bounded completion retry | Python suite | 2 fail |
+| P8 | Terminalise an unparseable completion answer instead of halting | Python suite | 1 fail |
+| P9 | Deliver instructions by bare `setattr` only | Python suite | 1 fail + 1 error |
+| P10 | Let gate copy back into the exchange queue | Python suite | 1 fail |
+| M16 | Delete the scanner's own scratch-directory `rm` | `resume-scanner-freshness` | 2 fail |
 
 `M2` is the one worth keeping: a plpgsql `exception` block opens a
 subtransaction, so the "one transaction" claim is broken by an edit that looks
 like nothing more than defensive error handling. It also trips `0042`'s own
 "no phone function swallows every error" assertion, which is the control working
 twice.
+
+`M16` is not about P4b at all, and it is recorded here because P4b is what
+exposed it. `resume-scanner-freshness.test.ts` asserted a GLOBAL count of
+`hello-resume-scan-*` directories in the shared OS tmpdir — a prefix every
+`ClamAvScanner.scan` in the process mints, and `resume-ingestion.test.ts` scans
+too. Vitest runs suites in parallel workers, so the two raced; the race was
+always there and only started firing when the suite grew enough to shift which
+files share a worker. The assertions are now scoped to the directories the test
+itself created, and `M16` — deleting the scanner's own `rm` — proves the scoped
+version still catches a real leak.
+
+`P10` earned its place the hard way. When first written it stayed **green** —
+the gate-copy filter had no test that could fail, because the test double's
+`say()` did not append a conversation item the way the real SDK does, so the
+fixed lines never reached the queue the filter guards. The double was made
+faithful and the control now goes red. A guard whose test cannot fail is
+decorative, and the way that happens is almost always a fake that is kinder than
+production.
 
 Commands:
 

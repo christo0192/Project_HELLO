@@ -81,9 +81,10 @@
 --
 -- `start_phone_assessment` is the only function that takes both an
 -- engagement lock and a session lock, and it takes them in that order.
--- `commit_phone_question_boundary` takes the SESSION lock only and never
--- reaches for an engagement, so the two can never deadlock against each
--- other: one is a prefix of the other.
+-- `commit_phone_question_boundary` takes the SESSION lock ONLY and never
+-- reaches for an engagement, so the two cannot deadlock against each
+-- other: a single-lock transaction cannot close a cycle, whichever end of
+-- the order its one lock sits at.
 --
 -- ── FORWARD-ONLY, ADDITIVE ────────────────────────────────────────────
 -- Two new tables, one new column with a default, one partial unique
@@ -490,6 +491,9 @@ begin
     'session_id', v_sess.id,
     'session_status', v_sess.status,
     'terminal_reason', v_sess.terminal_reason,
+    -- The completion path needs the REAL elapsed time. A caller with no
+    -- start instant omits `duration_sec` rather than asserting zero.
+    'started_at', v_sess.started_at,
     'candidate_name', v_name,
     'plan_source', v_plan.source,
     'question_count', v_plan.question_count,
@@ -834,38 +838,13 @@ begin
     return jsonb_build_object('status', 'plan_missing');
   end if;
 
-  -- ── DUPLICATE FIRST, AND BEFORE THE ACTIVE-SESSION CHECK ──────────
-  -- A worker whose response was lost retries with the same id. If the
-  -- call has since been completed, refusing here would leave the worker
-  -- unable to tell "already recorded" from "never recorded" on the one
-  -- boundary it cares most about. So an already-committed boundary is
-  -- answered with the ORIGINAL success, whatever the session has since
-  -- become.
-  if p_source_event_id is not null then
-    select * into v_prog from screening_v2.phone_session_progress
-     where session_id = p_session_id and source_event_id = p_source_event_id;
-    if found then
-      return jsonb_build_object(
-        'status', 'applied',
-        'applied', true,
-        'duplicate', true,
-        'question_key', v_prog.question_key,
-        'question_index', v_prog.question_index,
-        'first_turn_index', v_prog.first_turn_index,
-        'last_turn_index', v_prog.last_turn_index,
-        'cursor', greatest(coalesce(v_sess.current_question_index, 0), 0),
-        'question_count', v_plan.question_count,
-        'plan_complete',
-          greatest(coalesce(v_sess.current_question_index, 0), 0) >= v_plan.question_count);
-    end if;
-  end if;
-
-  if v_sess.status <> 'in_progress' then
-    return jsonb_build_object('status', 'session_not_active',
-                              'session_status', v_sess.status);
-  end if;
-
-  -- ── Shape of the exchange ─────────────────────────────────────────
+  -- ── SHAPE FIRST ────────────────────────────────────────────────────
+  -- Validated BEFORE the duplicate read-back, so a malformed body carrying
+  -- a known event id is answered `invalid_turns` rather than `applied`.
+  -- Nothing is written either way, so this is about the answer being
+  -- truthful rather than about safety: a caller told `applied` for an
+  -- exchange this function never even parsed has been told something
+  -- false about its own request.
   if p_source_event_id is null
      or p_source_event_id !~ '^[A-Za-z0-9_.:-]{1,200}$'
      or p_question_key is null
@@ -898,6 +877,37 @@ begin
   if (p_turns -> 0 ->> 'speaker') <> 'bot'
      or (p_turns -> (v_count - 1) ->> 'speaker') <> 'candidate' then
     return jsonb_build_object('status', 'invalid_turns');
+  end if;
+
+  -- ── DUPLICATE NEXT, AND BEFORE THE ACTIVE-SESSION CHECK ───────────
+  -- A worker whose response was lost retries with the same id. If the
+  -- call has since been completed, refusing here would leave the worker
+  -- unable to tell "already recorded" from "never recorded" on the one
+  -- boundary it cares most about. So an already-committed boundary is
+  -- answered with the ORIGINAL success, whatever the session has since
+  -- become.
+  if true then
+    select * into v_prog from screening_v2.phone_session_progress
+     where session_id = p_session_id and source_event_id = p_source_event_id;
+    if found then
+      return jsonb_build_object(
+        'status', 'applied',
+        'applied', true,
+        'duplicate', true,
+        'question_key', v_prog.question_key,
+        'question_index', v_prog.question_index,
+        'first_turn_index', v_prog.first_turn_index,
+        'last_turn_index', v_prog.last_turn_index,
+        'cursor', greatest(coalesce(v_sess.current_question_index, 0), 0),
+        'question_count', v_plan.question_count,
+        'plan_complete',
+          greatest(coalesce(v_sess.current_question_index, 0), 0) >= v_plan.question_count);
+    end if;
+  end if;
+
+  if v_sess.status <> 'in_progress' then
+    return jsonb_build_object('status', 'session_not_active',
+                              'session_status', v_sess.status);
   end if;
 
   -- ── The cursor, and the key it owes ───────────────────────────────

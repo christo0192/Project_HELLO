@@ -223,7 +223,8 @@ export interface PhoneWorkerRouterDeps {
    */
   readonly completeSession?: (input: {
     sessionId: string;
-    durationSec: number;
+    /** Absent when the session carries no usable `started_at`. */
+    durationSec?: number;
   }) => Promise<{ ok: boolean; conflict: boolean }>;
   /**
    * Scores the session through the SHARED runner. AWAITED, deliberately — the
@@ -283,6 +284,21 @@ export function sanitizeAssessmentState(state: PhoneAssessmentState): Record<str
   };
 }
 
+/**
+ * Whole seconds between an ISO instant and now, bounded to the range
+ * `call_sessions.duration_sec` accepts. Returns `undefined` when there is no
+ * usable start — the session lifecycle then leaves the column alone, which is
+ * truthful, where a hardcoded 0 would assert a screening that took no time.
+ */
+export function elapsedSeconds(startedAt: string | null | undefined, at: Date): number | undefined {
+  if (typeof startedAt !== 'string' || startedAt === '') return undefined;
+  const start = new Date(startedAt).getTime();
+  if (!Number.isFinite(start)) return undefined;
+  const seconds = Math.floor((at.getTime() - start) / 1000);
+  if (!Number.isFinite(seconds) || seconds < 0) return undefined;
+  return Math.min(86_400, seconds);
+}
+
 function requireWorkerPhoneAuth(
   req: import('express').Request,
   res: import('express').Response,
@@ -317,13 +333,13 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
   // must complete and score a call, not silently do neither — a feature that
   // ships green and inert is a failure mode this project has already paid for.
   const completeSession = deps.completeSession
-    ?? (async (input: { sessionId: string; durationSec: number }) => {
+    ?? (async (input: { sessionId: string; durationSec?: number }) => {
       const result = await transitionSession(
         input.sessionId,
         'in_progress',
         'completed',
         'conversation_complete',
-        { duration_sec: input.durationSec },
+        input.durationSec === undefined ? undefined : { duration_sec: input.durationSec },
       );
       return { ok: result.ok, conflict: result.ok === false && result.conflict === true };
     });
@@ -639,7 +655,11 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       if (before.sessionStatus === 'in_progress') {
         const completed = await completeSession({
           sessionId,
-          durationSec: 0,
+          // The REAL elapsed time, from the session's own `started_at`, or
+          // omitted when the row does not carry one. A hardcoded 0 would
+          // assert a screening that took no time, and this column is
+          // operator-facing.
+          durationSec: elapsedSeconds(before.startedAt, now()),
         });
         // A CONFLICT is not a failure. Two legs racing to complete is exactly
         // what a reconnect produces, and the loser must still verify — which
@@ -654,12 +674,24 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
         return res.json({ ok: false, status: 'session_not_active' });
       }
 
+      // ── SCORING, THEN VERIFICATION — AND THE VERIFICATION RUNS EITHER WAY ──
+      // A THROW FROM `scoreSession` IS NOT EVIDENCE THAT NOTHING WAS SCORED.
+      // The ordinary reconnect case makes that concrete: the winning leg
+      // inserts the assessment, the losing leg's insert hits 23505, and any
+      // failure to read the winner's row back — a transient read error, a row
+      // with a null `raw` — re-throws. The session IS scored; a leg that
+      // returned `scoring_failed` here would report otherwise, and the worker
+      // would then post `assessment.aborted` and drive the engagement to
+      // terminal `failed` over a screening that exists.
+      //
+      // So the exception is remembered, not returned on, and the ROW decides.
+      let scoringThrew = false;
       try {
         await scoreSession(sessionId);
       } catch {
-        // Sanitized: a scoring error can quote a provider body. The worker
-        // needs one bit — it may not claim a completion — and gets it.
-        return res.json({ ok: false, status: 'scoring_failed' });
+        // Sanitized deliberately: a scoring error can quote a provider body
+        // or a row. Nothing about it is forwarded.
+        scoringThrew = true;
       }
 
       // THE VERIFICATION. Scoring "succeeding" is not the same as an
@@ -667,7 +699,13 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       // completed screening.
       const after = await stores().assessmentState({ sessionId });
       if (after.status !== 'ok' || after.assessmentExists !== true) {
-        return res.json({ ok: false, status: 'assessment_missing' });
+        // `scoring_failed` and `assessment_missing` are kept DISTINCT because
+        // the worker treats them differently: one is a provider fault it may
+        // retry, the other is a state it must not.
+        return res.json({
+          ok: false,
+          status: scoringThrew ? 'scoring_failed' : 'assessment_missing',
+        });
       }
       return res.json({ ok: true, status: 'scored' });
     } catch {
