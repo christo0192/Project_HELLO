@@ -11,7 +11,7 @@ import time
 import asyncio
 import inspect
 from collections.abc import Mapping
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from dotenv import load_dotenv
 
@@ -31,7 +31,13 @@ from observability import (
     start_span,
 )
 from persistence import LifecycleError, WorkerContext
-from prompting import build_prompt_context, collect_prompt_metadata, opening_line, system_prompt
+from prompting import (
+    build_prompt_context,
+    collect_prompt_metadata,
+    format_questions as prompting_format_questions,
+    opening_line,
+    system_prompt,
+)
 from provenance import screening_provenance
 
 load_dotenv()
@@ -699,6 +705,116 @@ async def _classify_phone_answer(
     return phone.CLASSIFY_MACHINE
 
 
+def phone_question_instructions(question: "phone.PhonePlanQuestion") -> str:
+    """The instruction handed to the model for ONE plan question.
+
+    The model may phrase it however it likes — that is the whole point of a
+    voice screening — but it is told exactly which question it is covering,
+    and it is told not to move on. Which question was covered is never
+    inferred afterwards from what was said; it comes from this call site and
+    from the key committed with the answer.
+    """
+    lines = [
+        "Ask the candidate this one question now, in your own natural words:",
+        question.text,
+        "",
+        "Ask ONLY this. Do not move on to another topic, do not summarise the "
+        "call, and do not say goodbye.",
+    ]
+    if question.hint:
+        lines.append(f"If their answer is thin, the thing worth probing is: {question.hint}")
+    return "\n".join(lines)
+
+
+async def _ask_phone_question(
+    *,
+    generate: Callable[[str], Awaitable[Any]],
+    exchange: "asyncio.Queue[dict[str, str]]",
+    question: "phone.PhonePlanQuestion",
+    answer_timeout_sec: float,
+    follow_up: bool,
+) -> list[dict[str, str]]:
+    """Put ONE question and collect the ordered exchange that answers it.
+
+    Returns whatever it captured, including nothing. It does NOT decide whether
+    the result is a completed boundary — `phone.valid_boundary_turns` and the
+    database both do, and this function having its own opinion is how the two
+    would drift.
+
+    The wait is bounded by a WALL CLOCK, not by a turn counter: a candidate who
+    goes quiet mid-answer produces no further items at all, so a counter would
+    never be reached.
+    """
+    # Anything already queued belongs to the previous boundary or to the
+    # disclosure exchange. Carrying it forward would attach one question's
+    # answer to another question's key.
+    while not exchange.empty():
+        try:
+            exchange.get_nowait()
+        except asyncio.QueueEmpty:  # pragma: no cover - defensive
+            break
+
+    turns: list[dict[str, str]] = []
+    rounds = 2 if follow_up else 1
+    for round_index in range(rounds):
+        if round_index == 0:
+            await generate(phone_question_instructions(question))
+        else:
+            await generate(
+                "Ask ONE short follow-up about what they just said, then stop. "
+                "Do not change the subject and do not say goodbye."
+            )
+        deadline = _monotonic() + answer_timeout_sec
+        while len(turns) < 12:
+            remaining = deadline - _monotonic()
+            if remaining <= 0:
+                return turns
+            try:
+                item = await asyncio.wait_for(exchange.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return turns
+            turns.append(item)
+            if item.get("speaker") == "candidate":
+                break
+        if not turns or turns[-1].get("speaker") != "candidate":
+            return turns
+    return turns
+
+
+def _apply_phone_instructions(agent: Any, state: "phone.PhoneAssessmentState") -> None:
+    """Give the agent the REAL instructions, once the plan is known.
+
+    The question flow is formatted through `prompting.format_questions`, the
+    SAME helper the browser path uses, so the two prompts cannot drift into
+    different shapes. The plan's `key` is deliberately NOT put in the prompt:
+    the model is never asked to report which question it covered, because
+    which question was covered is decided by the call site and committed with
+    the key — never read back out of prose.
+
+    Best effort by design. If the SDK's Agent has no writable `instructions`,
+    the screening still runs on the base prompt and every boundary is still
+    keyed and committed correctly; the questions are simply less tailored.
+    """
+    try:
+        flow = prompting_format_questions([
+            {"id": q.key, "question": q.text, "mandatory": q.mandatory}
+            for q in state.questions
+        ])
+        text = system_prompt(
+            candidate_name=state.candidate_name,
+            role_title=None,
+            role_focus=None,
+            resume_facts=None,
+            questions=flow,
+        )
+        setattr(agent, "instructions", text)
+    except Exception:  # noqa: BLE001
+        _log.warn(
+            "unknown_event", error_type="phone_instructions_not_applied",
+            error_category="agent_instructions",
+        )
+
+
 async def _run_phone_entrypoint(ctx: JobContext, room_name: str) -> None:
     """Named-worker entry for a phone room.
 
@@ -735,6 +851,12 @@ async def _run_phone_session(
     events = client if client is not None else phone.PhoneEventClient()
 
     user_turns: "asyncio.Queue[str]" = asyncio.Queue()
+    # 0044: the ORDERED exchange, both speakers, in the order the SDK produced
+    # them. `user_turns` stays a separate, candidate-only queue because the
+    # disclosure classifier reads it and must not be handed the bot's own
+    # lines. Two queues rather than one filtered read: a filter is a thing a
+    # later edit can forget to apply.
+    exchange: "asyncio.Queue[dict[str, str]]" = asyncio.Queue()
     candidate_activity = asyncio.Event()
     close_event = asyncio.Event()
     close_reason: dict[str, Any] = {}
@@ -758,12 +880,24 @@ async def _run_phone_session(
     @session.on("conversation_item_added")
     def _on_phone_item(event):  # noqa: ANN001
         item = getattr(event, "item", None)
-        if getattr(item, "role", None) != "user":
+        role = getattr(item, "role", None)
+        if role not in {"user", "assistant"}:
             return
-        candidate_activity.set()
+        # An INTERRUPTED assistant line was not fully spoken, so recording it
+        # as a bot turn would put words in the transcript the candidate never
+        # heard — and the scorer reads that transcript.
+        if role == "assistant" and getattr(item, "interrupted", False):
+            return
         text = _item_text(item)
-        if text:
+        if not text:
+            return
+        if role == "user":
+            candidate_activity.set()
             user_turns.put_nowait(text)
+        exchange.put_nowait({
+            "speaker": "candidate" if role == "user" else "bot",
+            "text": text,
+        })
 
     @session.on("close")
     def _on_phone_close(event):  # noqa: ANN001
@@ -777,6 +911,10 @@ async def _run_phone_session(
             await wait_for_playout()
 
     agent = phone.phone_agent_class(Agent)(
+        # The prompt is built AFTER the gate, once the plan is known — see
+        # `_start_phone_assessment` below. Until then the agent carries the
+        # base instructions only, because the gate does not screen anybody and
+        # must not be handed the question flow.
         system_prompt(
             candidate_name=None, role_title=None, role_focus=None,
             resume_facts=None, questions=None,
@@ -822,6 +960,37 @@ async def _run_phone_session(
         await _close_phone_room(room_name)
         return result
 
+    # ── 0044: the DURABLE screening ───────────────────────────────────
+    # The session id comes from the ROOM NAME, which the dialer derives from it
+    # — `phone-<sessionId>` — and the server re-verifies that binding before it
+    # will bind anything. A room whose name does not parse is one the worker
+    # cannot account for, so it screens nobody.
+    session_id = phone.session_id_from_room_name(room_name)
+    if session_id is None:
+        _log.warn(
+            "unknown_event", error_type="phone_assessment_unstarted",
+            error_category="session_unresolved",
+        )
+        await _close_phone_room(room_name)
+        return result
+
+    state = await events.start_assessment(attempt_id, session_id)
+    if not state.ok:
+        # No plan, so no screening. The leg ends without claiming anything;
+        # `assessment.aborted` below is the truthful terminal.
+        _log.warn(
+            "unknown_event", error_type="phone_assessment_unstarted",
+            error_category=state.status,
+        )
+        await events.post_event(attempt_id, "assessment.aborted")
+        await _close_phone_room(room_name)
+        return result
+
+    # The plan is now known, so the agent is given the REAL instructions: the
+    # candidate's name and the ordered question flow, in the same shape the
+    # browser path has always used.
+    _apply_phone_instructions(agent, state)
+
     silence_task = asyncio.create_task(
         _silence_termination_loop(
             session,
@@ -831,41 +1000,77 @@ async def _run_phone_session(
             end_after_sec=CANDIDATE_SILENCE_END_SEC,
         )
     )
+
+    async def generate(instructions: str) -> None:
+        speech = session.generate_reply(instructions=instructions)
+        if inspect.isawaitable(speech):
+            speech = await speech
+        wait_for_playout = getattr(speech, "wait_for_playout", None)
+        if callable(wait_for_playout):
+            await wait_for_playout()
+
+    async def ask(question: Any, cursor: int) -> list[dict[str, str]]:
+        return await _ask_phone_question(
+            generate=generate,
+            exchange=exchange,
+            question=question,
+            answer_timeout_sec=phone.phone_answer_timeout_sec(),
+            follow_up=bool(question.hint),
+        )
+
     try:
-        await asyncio.wait_for(close_event.wait(), timeout=SESSION_MAX_RESIDENCY_SEC)
+        assessment = await asyncio.wait_for(
+            phone.run_phone_assessment(
+                attempt_id=attempt_id,
+                session_id=session_id,
+                client=events,
+                state=state,
+                ask=ask,
+                say=say,
+            ),
+            timeout=SESSION_MAX_RESIDENCY_SEC,
+        )
     except asyncio.TimeoutError:
-        pass
+        # The residency cap. Nothing is claimed and nothing is terminalised as
+        # a persistence failure: the conversation ran out of room, which is the
+        # `assessment.aborted` case.
+        assessment = phone.PhoneAssessmentResult()
     finally:
         silence_task.cancel()
         await asyncio.gather(silence_task, return_exceptions=True)
 
-    # ── A CLEAN CLOSE IS NOT A COMPLETED ASSESSMENT ───────────────────
-    # This deliberately posts `assessment.aborted` UNCONDITIONALLY, and the
-    # room's close reason is not consulted.
+    # ── THE CONDITIONAL P4a DELIBERATELY LEFT OUT ─────────────────────
+    # P4a posted `assessment.aborted` UNCONDITIONALLY and said so out loud:
+    # the conditional belonged back here "when the persistence path exists,
+    # and its condition must be 'scoring SUCCEEDED', not 'the room closed
+    # cleanly'". This is that conditional, and that is its condition.
     #
-    # `assessment.completed` drives 0042 to terminal `completed` with
-    # `outcome_class = 'completed'`, and every downstream reader — the
-    # engagement state, P6's health backlog, the P7 calendar queue — treats
-    # that as a SCORED screening. On this path nothing is scored: the phone
-    # session persists no transcript turn, never calls `activate_session` or
-    # `complete_session`, and never triggers scoring. A clean hangup means the
-    # call ended tidily, not that an assessment exists.
-    #
-    # So claiming `completed` would be the same lie as calling an answered
-    # call `no_answer` — a terminal state asserting something that did not
-    # happen, and unrecoverable afterwards because nothing downstream can tell
-    # the difference. `assessment.aborted` is terminal `failed` with reason
-    # `assessment_aborted`: truthful that the conversation happened and
-    # produced nothing.
-    #
-    # The conditional belongs back here when the persistence path exists, and
-    # its condition must be "scoring SUCCEEDED", not "the room closed
-    # cleanly". It is left out entirely rather than stubbed behind a flag that
-    # is always false, because an unreachable branch reads as a safety net and
-    # is not one.
-    await events.post_event(attempt_id, "assessment.aborted")
+    # `assessment.completed` drives 0042 to terminal `completed`, which every
+    # downstream reader treats as a SCORED screening — so it is posted only
+    # when the API has VERIFIED an assessment row exists. 0044's
+    # `apply_phone_event` refuses the event anyway if the row is absent, so
+    # this is the first of two gates rather than the only one.
+    if assessment.scored:
+        await events.post_event(attempt_id, "assessment.completed")
+    elif assessment.halted:
+        # A PERSISTENCE OR INFRASTRUCTURE FAILURE POSTS NOTHING.
+        # The conversation is not over, it is interrupted. Both terminal
+        # events available here would end the engagement: `assessment.aborted`
+        # is terminal `failed`, and `assessment.completed` would be a lie. The
+        # candidate's line dropping is what 0042's reconnect budget is FOR, and
+        # the webhook's `sip.participant_left` drives it. Posting a terminal
+        # event here would convert a retryable problem into a lost candidate —
+        # which is the mirror of the P4a defect: stopping something that fails
+        # loudly can make it fail silently, so this branch is logged.
+        _log.warn(
+            "unknown_event", error_type="phone_assessment_halted_leg",
+            error_category=assessment.halt_reason,
+        )
+    else:
+        await events.post_event(attempt_id, "assessment.aborted")
     await _close_phone_room(room_name)
     return result
+
 
 
 async def _close_phone_room(room_name: str) -> None:

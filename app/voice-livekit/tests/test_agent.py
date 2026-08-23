@@ -149,6 +149,10 @@ _mock_prompting.build_prompt_context = MagicMock(return_value=("system text", "o
 _mock_prompting.collect_prompt_metadata = MagicMock(return_value={})
 _mock_prompting.opening_line = MagicMock(return_value="opening text")
 _mock_prompting.system_prompt = MagicMock(return_value="system text")
+# 0044: `agent` also imports `format_questions` to render the phone question
+# plan through the SAME helper the browser prompt uses. A stub missing it
+# turns an ImportError into a collection failure for three unrelated modules.
+_mock_prompting.format_questions = MagicMock(return_value="1. question flow")
 sys.modules["prompting"] = _mock_prompting
 
 import agent as agent_mod  # noqa: E402

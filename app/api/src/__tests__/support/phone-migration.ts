@@ -21,9 +21,12 @@
  * change: a tripwire that cannot fire once the thing it guards moves is not a
  * weaker control, it is a misleading one.
  *
+ * 0044 does it a second time: it REPLACES `apply_phone_event` again, so for
+ * that function 0043's text is now history too.
+ *
  * So extraction searches migrations NEWEST-FIRST and the newest declaration
- * wins — exactly the resolution order Postgres itself applies. Adding 0044
- * means adding one line to `PHONE_MIGRATIONS`, whose contents are
+ * wins — exactly the resolution order Postgres itself applies. Adding a phone
+ * migration means adding one line to `PHONE_MIGRATIONS`, whose contents are
  * asserted non-empty at import so a missing file fails loudly rather than
  * making every extractor return nothing.
  *
@@ -45,6 +48,12 @@ export const MIGRATION_0043_PATH = fileURLToPath(
 
 export const MIGRATION_0043 = readFileSync(MIGRATION_0043_PATH, 'utf8');
 
+export const MIGRATION_0044_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0044_phone_assessment_resume.sql', import.meta.url),
+);
+
+export const MIGRATION_0044 = readFileSync(MIGRATION_0044_PATH, 'utf8');
+
 /**
  * Every phone migration, NEWEST FIRST. Extraction walks this in order and the
  * first file that declares a thing wins, which is what "the latest declaration
@@ -52,6 +61,7 @@ export const MIGRATION_0043 = readFileSync(MIGRATION_0043_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    { name: '0044', sql: MIGRATION_0044 },
     { name: '0043', sql: MIGRATION_0043 },
     { name: '0042', sql: MIGRATION_0042 },
   ]);
@@ -77,6 +87,8 @@ export const PHONE_MIGRATIONS_TEXT: string = PHONE_MIGRATIONS.map((m) => m.sql).
  */
 export const CLOCK_FREE_RPCS: readonly string[] = Object.freeze([
   'list_phone_engagement_recordings',
+  // 0044: a pure read. Nothing it decides depends on time.
+  'get_phone_assessment_state',
 ]);
 
 /**
@@ -141,6 +153,10 @@ export const RPC_NAMES = [
   'finalize_phone_attempt_recording',
   'list_phone_engagement_recordings',
   'clear_phone_attempt_recordings',
+  // 0044.
+  'start_phone_assessment',
+  'get_phone_assessment_state',
+  'commit_phone_question_boundary',
 ] as const;
 
 /**

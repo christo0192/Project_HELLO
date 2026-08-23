@@ -179,6 +179,13 @@ function fakeStores(over: Partial<PhoneStores> = {}): WriteSpy {
     // 0043. The operator calendar API never binds or purges a recording, so
     // these default to a shape that would fail loudly if it ever did.
     attachAttemptRecording: async () => ({ status: 'not_found' }),
+    // 0044. The operator calendar API never starts, reads or advances an
+    // assessment either; a refusal shape here would fail loudly if it did.
+    startAssessment: async () => ({ status: 'unknown_attempt' }),
+    assessmentState: async () => ({ status: 'unknown_session' }),
+    commitQuestionBoundary: async () => ({
+      status: 'unknown_session', applied: false, duplicate: false,
+    }),
     finalizeAttemptRecording: async () => ({ status: 'not_found' }),
     listEngagementRecordings: async () => ({ status: 'not_found' }),
     clearAttemptRecordings: async () => ({ status: 'not_found' }),

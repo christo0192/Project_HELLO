@@ -161,6 +161,14 @@ export type {
   ListPhoneEngagementRecordingsResult,
   ClearPhoneAttemptRecordingsResult,
   PhoneRecordingArtifact,
+  CommitPhoneQuestionBoundaryInput,
+  CommitPhoneQuestionBoundaryResult,
+  PhoneAssessmentState,
+  PhoneAssessmentStateStatus,
+  PhoneAssessmentTurn,
+  PhoneBoundaryTurn,
+  PhonePlanQuestion,
+  StartPhoneAssessmentInput,
 } from './ports.js';
 
 export { createPhoneStores, PHONE_SYSTEM_ACTOR } from './stores.js';

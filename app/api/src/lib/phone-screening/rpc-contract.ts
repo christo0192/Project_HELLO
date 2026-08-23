@@ -26,7 +26,7 @@
  * Pure declarations. No client, no I/O, no configuration.
  */
 
-/** The fourteen service-role RPCs 0042 and 0043 expose. */
+/** The seventeen service-role RPCs 0042, 0043 and 0044 expose. */
 export const PHONE_RPC_NAMES = [
   'admit_phone_attempt',
   'heartbeat_phone_attempt',
@@ -44,6 +44,12 @@ export const PHONE_RPC_NAMES = [
   'finalize_phone_attempt_recording',
   'list_phone_engagement_recordings',
   'clear_phone_attempt_recordings',
+  // 0044 — the assessment-persistence RPCs. One binds and snapshots, one
+  // reads, one appends a completed question boundary. None of them dials,
+  // records, scores or completes anything.
+  'start_phone_assessment',
+  'get_phone_assessment_state',
+  'commit_phone_question_boundary',
 ] as const;
 
 export type PhoneRpcName = (typeof PHONE_RPC_NAMES)[number];
@@ -106,6 +112,16 @@ export const PHONE_RPC_PARAMETERS: Readonly<Record<PhoneRpcName, readonly string
     ],
     list_phone_engagement_recordings: ['p_engagement_id'],
     clear_phone_attempt_recordings: ['p_engagement_id', 'p_actor_id', 'p_now'],
+    start_phone_assessment: ['p_attempt_id', 'p_session_id', 'p_now'],
+    get_phone_assessment_state: ['p_session_id'],
+    commit_phone_question_boundary: [
+      'p_session_id',
+      'p_question_key',
+      'p_expected_index',
+      'p_source_event_id',
+      'p_turns',
+      'p_now',
+    ],
   });
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -168,6 +184,12 @@ export const APPLY_PHONE_EVENT_STATUSES = [
   'applied',
   'ignored',
   'attempt_required',
+  // 0044. Like `attempt_required`, decided BEFORE the insert and recorded
+  // nowhere: the `internal` source mints a DETERMINISTIC event id, so a
+  // recorded refusal would be read back by every later delivery of the same
+  // claim and a worker that posted one moment too early could never complete
+  // the call at all.
+  'assessment_missing',
   'invalid_source',
   'invalid_event_type',
   'invalid_provider_event_id',
@@ -299,6 +321,72 @@ export const CLEAR_PHONE_ATTEMPT_RECORDINGS_STATUSES = ['ok', 'not_found'] as co
 export type ClearPhoneAttemptRecordingsStatus =
   (typeof CLEAR_PHONE_ATTEMPT_RECORDINGS_STATUSES)[number];
 
+/**
+ * `start_phone_assessment` (0044). `disclosure_not_delivered` is the
+ * load-bearing member and the reason it is a refusal rather than a silent
+ * no-op: the engagement must already be `in_call`, which 0042 reaches through
+ * exactly one transition, so a screening cannot begin on a call nobody
+ * consented to. `invalid_role_template` is the second: a malformed template is
+ * refused rather than replaced by the defaults, because screening somebody
+ * against questions nobody chose — while the recruiter believes their own are
+ * running — is the worse of the two failures. `session_candidate_mismatch` and
+ * `session_binding_mismatch` are what make the binding VERIFIED rather than
+ * taken on the worker's word.
+ */
+export const START_PHONE_ASSESSMENT_STATUSES = [
+  'ok',
+  'disclosure_not_delivered',
+  'engagement_terminal',
+  'invalid_role_template',
+  'plan_missing',
+  'session_already_bound',
+  'session_binding_mismatch',
+  'session_candidate_mismatch',
+  'session_not_active',
+  'unknown_attempt',
+  'unknown_session',
+] as const;
+
+export type StartPhoneAssessmentStatus = (typeof START_PHONE_ASSESSMENT_STATUSES)[number];
+
+/**
+ * `get_phone_assessment_state` (0044) — the only read a resuming leg does.
+ * `plan_missing` is deliberately distinct from `unknown_session`: the caller
+ * must go and START an assessment, and must never invent a plan of its own.
+ */
+export const GET_PHONE_ASSESSMENT_STATE_STATUSES = [
+  'ok',
+  'plan_missing',
+  'unknown_session',
+] as const;
+
+export type GetPhoneAssessmentStateStatus =
+  (typeof GET_PHONE_ASSESSMENT_STATE_STATUSES)[number];
+
+/**
+ * `commit_phone_question_boundary` (0044).
+ *
+ * `key_not_current` is what stops a model choosing its own question — and
+ * therefore what stops it skipping a mandatory one. `stale_cursor` covers an
+ * OMITTED expected index as well as a wrong one, because a CAS a caller may
+ * leave out is a guard that can be skipped. `applied` covers the duplicate
+ * re-post too: a retry after a lost response is answered with the ORIGINAL
+ * success rather than appending the exchange twice.
+ */
+export const COMMIT_PHONE_QUESTION_BOUNDARY_STATUSES = [
+  'applied',
+  'invalid_turns',
+  'key_not_current',
+  'plan_complete',
+  'plan_missing',
+  'session_not_active',
+  'stale_cursor',
+  'unknown_session',
+] as const;
+
+export type CommitPhoneQuestionBoundaryStatus =
+  (typeof COMMIT_PHONE_QUESTION_BOUNDARY_STATUSES)[number];
+
 /** The per-RPC vocabularies, keyed by RPC name. */
 export const PHONE_RPC_STATUSES: Readonly<Record<PhoneRpcName, readonly string[]>> =
   Object.freeze({
@@ -316,6 +404,9 @@ export const PHONE_RPC_STATUSES: Readonly<Record<PhoneRpcName, readonly string[]
     finalize_phone_attempt_recording: FINALIZE_PHONE_ATTEMPT_RECORDING_STATUSES,
     list_phone_engagement_recordings: LIST_PHONE_ENGAGEMENT_RECORDINGS_STATUSES,
     clear_phone_attempt_recordings: CLEAR_PHONE_ATTEMPT_RECORDINGS_STATUSES,
+    start_phone_assessment: START_PHONE_ASSESSMENT_STATUSES,
+    get_phone_assessment_state: GET_PHONE_ASSESSMENT_STATE_STATUSES,
+    commit_phone_question_boundary: COMMIT_PHONE_QUESTION_BOUNDARY_STATUSES,
   });
 
 /**
@@ -328,16 +419,23 @@ export const PHONE_RPC_STATUS_UNION: readonly string[] = Object.freeze(
 );
 
 /**
- * Number of DISTINCT statuses across all fourteen RPCs, as of 0043.
+ * Number of DISTINCT statuses across all seventeen RPCs, as of 0044.
  *
  * 0042 contributed 44. 0043 adds ten members that were not already in the
  * union — `already_bound`, `attempt_not_recordable`, `authoritative_exists`,
  * `disclosure_not_delivered`, `invalid_egress_id`, `invalid_egress_status`,
  * `invalid_manifest_key`, `invalid_object_key`, `invalid_role` and
  * `no_recording`. Its other members (`ok`, `not_found`, `engagement_terminal`)
- * were already present, which is why this is 54 and not 57.
+ * were already present, which is why that was 54 and not 57.
+ *
+ * 0044 adds the assessment RPCs plus `assessment_missing`, the new pre-insert
+ * refusal on `apply_phone_event`. Several of their members were already in the
+ * union (`ok`, `applied`, `disclosure_not_delivered`, `engagement_terminal`,
+ * `unknown_attempt`), which is why the increment is smaller than the member
+ * count. The exact number is RE-DERIVED by the drift test from the migration
+ * text, so this constant is a tripwire and never the source.
  */
-export const PHONE_RPC_STATUS_COUNT = 54;
+export const PHONE_RPC_STATUS_COUNT = 67;
 
 /**
  * RESULT KEYS the API's behaviour DEPENDS on, per RPC.
@@ -372,6 +470,35 @@ export const PHONE_RPC_RESULT_KEYS: Readonly<Record<string, readonly string[]>> 
   clear_phone_attempt_recordings: ['cleared'],
   attach_phone_attempt_recording: ['attempt_id', 'role', 'duplicate'],
   finalize_phone_attempt_recording: ['attempt_id', 'egress_status', 'role'],
+  // 0044. Every one of these is load-bearing for a decision the worker makes
+  // on the wire. `next_key` and `cursor` decide which question is asked next;
+  // `questions` is the plan the model is bound to; `turns` rehydrates the
+  // conversation; `assessment_exists` and `plan_complete` gate the completion
+  // claim. A key that silently went missing would read as "nothing done yet"
+  // and re-ask a question the candidate already answered.
+  //
+  // `start_phone_assessment` is deliberately absent: on success it returns
+  // `get_phone_assessment_state`'s payload verbatim, so pinning the same keys
+  // against a body that does not contain them would be a vacuous assertion.
+  get_phone_assessment_state: [
+    'questions',
+    'question_count',
+    'cursor',
+    'next_key',
+    'completed_keys',
+    'turns',
+    'assessment_exists',
+    'plan_complete',
+  ],
+  commit_phone_question_boundary: [
+    'question_key',
+    'question_index',
+    'first_turn_index',
+    'last_turn_index',
+    'cursor',
+    'plan_complete',
+    'expected_key',
+  ],
 });
 
 /**

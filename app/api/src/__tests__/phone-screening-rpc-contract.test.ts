@@ -75,11 +75,11 @@ describe('the extractor itself is not over-broad', () => {
   });
 });
 
-describe('the fourteen RPCs', () => {
+describe('the seventeen RPCs', () => {
   it('the TS list is exactly the migrations\' service-role RPC set', () => {
     expect(new Set(PHONE_RPC_NAMES)).toEqual(new Set(RPC_NAMES));
     // Ten from 0042, four from 0043.
-    expect(PHONE_RPC_NAMES).toHaveLength(14);
+    expect(PHONE_RPC_NAMES).toHaveLength(17);
     for (const name of PHONE_RPC_NAMES) {
       // Searched across BOTH migrations: the question here is "is this granted
       // anywhere in the phone schema", not "which declaration wins".
@@ -191,7 +191,7 @@ describe('the status vocabulary', () => {
     });
   }
 
-  it('44 distinct statuses across all ten RPCs', () => {
+  it('the distinct-status count is exactly what the migrations declare', () => {
     const fromMigration = new Set(RPC_NAMES.flatMap((n) => [...functionStatuses(n)]));
     expect(fromMigration.size).toBe(PHONE_RPC_STATUS_COUNT);
     expect(new Set(PHONE_RPC_STATUS_UNION)).toEqual(fromMigration);

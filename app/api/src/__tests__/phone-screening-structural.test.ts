@@ -146,10 +146,11 @@ describe('1. every phone write goes through an RPC', () => {
     expect(stores).toBeDefined();
     const writeBody = code(stores!.source);
     const rpcCalls = [...writeBody.matchAll(/client\.rpc\(\s*'([a-z_]+)'/g)].map((m) => m[1]);
-    // FOURTEEN since 0043 added the four recording-artifact RPCs. The count is
-    // pinned rather than merely non-zero so a seam that quietly stopped
-    // routing one call through an RPC would fail here.
-    expect(new Set(rpcCalls).size).toBe(14);
+    // SEVENTEEN since 0044 added the three assessment-persistence RPCs, on
+    // top of 0043's four recording-artifact ones. The count is pinned rather
+    // than merely non-zero so a seam that quietly stopped routing one call
+    // through an RPC would fail here.
+    expect(new Set(rpcCalls).size).toBe(17);
     // The write seam reaches NO table, only RPCs.
     expect(writeBody, 'stores.ts uses a table accessor').not.toMatch(/\bclient\s*\.\s*from\s*\(/);
     // A type-only import of the client type is fine; a VALUE import is not.

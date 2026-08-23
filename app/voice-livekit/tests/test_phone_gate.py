@@ -148,14 +148,60 @@ _NUMBER_LIKE = "+919812345670"
 
 # ── Fakes ─────────────────────────────────────────────────────────────
 
+def _plan_payload(questions=None, cursor=0, completed=None, turns=None, name="Asha"):
+    """The exact body `/assessment/start` returns, built here rather than
+    hand-mocked as a `PhoneAssessmentState`, so `PhoneAssessmentState.parse`
+    — the projection that actually runs in production — is under test too."""
+    questions = questions if questions is not None else [
+        {"key": "k1", "text": "First question?", "mandatory": True, "hint": None},
+        {"key": "k2", "text": "Second question?", "mandatory": False, "hint": None},
+    ]
+    return {
+        "ok": True,
+        "status": "ok",
+        "context": {"session_id": _SESSION_ID, "candidate_name": name, "status": "in_progress"},
+        "plan": {
+            "source": "role_template",
+            "question_count": len(questions),
+            "questions": questions,
+        },
+        "progress": {
+            "cursor": cursor,
+            "next_key": questions[cursor]["key"] if cursor < len(questions) else None,
+            "completed_keys": completed if completed is not None else [],
+            "plan_complete": cursor >= len(questions),
+        },
+        "turns": turns if turns is not None else [],
+        "assessment_exists": False,
+    }
+
+
+def _default_state(**kwargs):
+    return phone.PhoneAssessmentState.parse(_plan_payload(**kwargs))
+
+
 class FakeEventClient:
     """Records every event post; each event's outcome is scripted."""
 
-    def __init__(self, outcomes: dict | None = None, booking=None) -> None:
+    def __init__(
+        self,
+        outcomes: dict | None = None,
+        booking=None,
+        *,
+        start=None,
+        commits: dict | None = None,
+        complete=None,
+    ) -> None:
         self.calls: list[tuple[str, str, dict]] = []
         self.bookings: list[tuple[str, str, int]] = []
         self._outcomes = outcomes or {}
         self._booking = booking
+        # 0044.
+        self._start = start
+        self._commits = commits or {}
+        self._complete = complete
+        self.assessment_calls: list[tuple] = []
+        self.boundaries: list[dict] = []
 
     async def post_event(self, attempt_id, event_type, *, epoch=None):
         self.calls.append((attempt_id, event_type, {"epoch": epoch}))
@@ -169,6 +215,45 @@ class FakeEventClient:
         if isinstance(self._booking, Exception):
             raise self._booking
         return self._booking or phone.PhoneApiOutcome(False, "attempt_in_flight")
+
+    # ── 0044: the assessment surface ──────────────────────────────────
+    # Scripted, and every call is RECORDED, so a test can assert the ORDER of
+    # "commit the boundary" against "ask the next question" and against "claim
+    # a completion" — which is the whole safety property of this phase.
+
+    async def start_assessment(self, attempt_id, session_id):
+        self.assessment_calls.append(("start", attempt_id, session_id))
+        if isinstance(self._start, Exception):
+            raise self._start
+        return self._start if self._start is not None else _default_state()
+
+    async def commit_boundary(
+        self, session_id, question_key, expected_index, source_event_id, turns
+    ):
+        self.boundaries.append({
+            "session_id": session_id,
+            "question_key": question_key,
+            "expected_index": expected_index,
+            "source_event_id": source_event_id,
+            "turns": list(turns),
+        })
+        self.assessment_calls.append(("turn", question_key, expected_index))
+        scripted = self._commits.get(question_key)
+        if scripted is not None:
+            return scripted
+        outcome = phone.PhoneApiOutcome(True, "applied")
+        outcome.cursor = expected_index + 1
+        return outcome
+
+    async def complete_assessment(self, attempt_id, session_id):
+        self.assessment_calls.append(("complete", attempt_id, session_id))
+        if self._complete is not None:
+            return self._complete
+        return phone.PhoneApiOutcome(True, phone.ASSESSMENT_SCORED_STATUS)
+
+    @property
+    def committed_keys(self) -> list[str]:
+        return [b["question_key"] for b in self.boundaries]
 
     @property
     def event_types(self) -> list[str]:
@@ -1108,12 +1193,25 @@ class _FakeSpeech:
 
 class _FakePhoneSession:
     instances: list = []
+    default_answers: list = []
 
     def __init__(self, **kwargs):
         self.handlers: dict = {}
         self.started_with = None
         self.spoken: list[str] = []
         self.start_calls = 0
+        # 0044: scripted candidate replies, one per generate_reply. A `None`
+        # entry means the candidate said nothing at all, which is how the
+        # "no exchange captured" halt is exercised.
+        #
+        # Seeded from the CLASS attribute at construction, deliberately. The
+        # assessment loop starts inside `_run_phone_session` before any test
+        # code regains control, so a script assigned to the instance afterwards
+        # arrives too late — and a test that "passed" because the candidate
+        # never answered would be asserting the timeout path while claiming to
+        # assert the happy one.
+        self.answers: list = list(_FakePhoneSession.default_answers)
+        self.instructions: list[str] = []
         _FakePhoneSession.instances.append(self)
 
     def on(self, event):
@@ -1131,11 +1229,32 @@ class _FakePhoneSession:
         return _FakeSpeech()
 
     def emit_user_turn(self, text):
+        self._emit("user", text)
+
+    def emit_bot_turn(self, text, *, interrupted=False):
+        self._emit("assistant", text, interrupted=interrupted)
+
+    def _emit(self, role, text, *, interrupted=False):
         handler = self.handlers.get("conversation_item_added")
         item = types.SimpleNamespace(
-            role="user", content=[types.SimpleNamespace(text=text)]
+            role=role,
+            content=[types.SimpleNamespace(text=text)],
+            interrupted=interrupted,
         )
         handler(types.SimpleNamespace(item=item))
+
+    # ── 0044: the model's turn ────────────────────────────────────────
+    # `generate_reply` is what the assessment loop drives. The fake emits the
+    # BOT item first and the candidate's reply second, in that order, because
+    # the ordering is exactly what the boundary contract depends on.
+    def generate_reply(self, instructions=None, **kwargs):
+        self.instructions.append(str(instructions or ""))
+        self.emit_bot_turn(f"asked-{len(self.instructions)}")
+        if self.answers:
+            reply = self.answers.pop(0)
+            if reply is not None:
+                self.emit_user_turn(reply)
+        return _FakeSpeech()
 
     def emit_close(self, reason=None):
         handler = self.handlers.get("close")
@@ -1145,10 +1264,23 @@ class _FakePhoneSession:
 class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         _FakePhoneSession.instances = []
+        _FakePhoneSession.default_answers = []
 
-    async def _run_session(self, *, participant=True, answers=(), close_after=True):
+    async def _run_session(
+        self,
+        *,
+        participant=True,
+        answers=(),
+        close_after=True,
+        client=None,
+        replies=None,
+    ):
         ctx = FakeCtx(_PHONE_ROOM, participants=[_participant()] if participant else [])
-        client = FakeEventClient()
+        client = client if client is not None else FakeEventClient()
+        _FakePhoneSession.default_answers = (
+            list(replies) if replies is not None
+            else ["First answer.", "Second answer.", "Third answer."]
+        )
         recording: list[int] = []
 
         async def recording_seam():
@@ -1179,20 +1311,16 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             result = await asyncio.wait_for(task, timeout=5)
         return result, client, recording, delete, session, persistence_spy
 
-    async def test_human_path_records_but_never_claims_a_completed_assessment(self):
-        """A clean close is not a completed assessment.
+    async def test_a_SCORED_screening_is_the_only_thing_that_claims_completion(self):
+        """`assessment.completed` requires a VERIFIED assessment row.
 
-        `assessment.completed` drives 0042 to terminal `completed` with
-        `outcome_class = 'completed'`, which every downstream reader treats as a
-        SCORED screening. This path scores nothing: `persistence_spy` asserts
-        below that not a single persistence call is made, so there is no
-        transcript, no activation and no scoring. Claiming `completed` would be
-        the same lie as calling an answered call `no_answer`, and unrecoverable
-        afterwards because nothing downstream could tell the difference.
-
-        An earlier version of this test asserted `assessment.completed` and so
-        PINNED the defect in place. The invariant, not the literal, is what
-        belongs here.
+        P4a posted `assessment.aborted` unconditionally and said out loud that
+        the conditional belonged back here "when the persistence path exists,
+        and its condition must be 'scoring SUCCEEDED', not 'the room closed
+        cleanly'". This is that conditional, and this test pins its condition:
+        the ONLY thing that produces `assessment.completed` is the completion
+        endpoint answering `scored`, which it does only after it has read the
+        row back.
         """
         result, client, recording, delete, session, persistence_spy = await self._run_session(
             answers=("Yes, that's fine.",)
@@ -1201,28 +1329,144 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recording, [1])
         self.assertEqual(
             client.event_types,
-            ["classify.human", "disclosure.delivered", "assessment.aborted"],
+            ["classify.human", "disclosure.delivered", "assessment.completed"],
         )
-        # The invariant, stated directly so it survives a rewrite of the list
-        # above: while this path persists nothing, it must never post the event
-        # that means "scored".
-        self.assertNotIn("assessment.completed", client.event_types)
+        # Every plan key was committed, in order, before anything was claimed.
+        self.assertEqual(client.committed_keys, ["k1", "k2"])
+        self.assertEqual(
+            [c[0] for c in client.assessment_calls],
+            ["start", "turn", "turn", "complete"],
+        )
         self.assertEqual(session.spoken[0], phone.PHONE_DISCLOSURE_TEXT)
+        self.assertIn(phone.PHONE_ASSESSMENT_CLOSING_TEXT, session.spoken)
         delete.assert_awaited()
-        # The reason the assertion above is required: nothing was persisted.
+        # The worker still writes NOTHING itself: every durable write goes
+        # through the API, so the browser's persistence module is untouched.
         self.assertEqual(persistence_spy.mock_calls, [])
 
-    async def test_a_CLEAN_close_still_does_not_claim_completion(self):
-        """The close reason is deliberately not consulted.
+    async def test_an_UNSCORED_completion_falls_back_to_the_truthful_aborted(self):
+        """Scoring succeeding is not the same as an assessment existing.
 
-        The room closing tidily says the call ended well, not that an
-        assessment exists. This is the case a future reader is most likely to
-        "fix" back into `assessment.completed`.
+        When the completion endpoint refuses — for any reason — nothing may
+        claim a completed screening, and `assessment.aborted` is the truthful
+        terminal: the conversation happened and produced nothing scorable.
         """
-        _, client, _, _, _, persistence_spy = await self._run_session(
-            answers=("Yes, that's fine.",)
+        client = FakeEventClient(
+            complete=phone.PhoneApiOutcome(False, "scoring_failed"),
+        )
+        _, client, _, _, session, _ = await self._run_session(
+            answers=("Yes, that's fine.",), client=client
         )
         self.assertIn("assessment.aborted", client.event_types)
+        self.assertNotIn("assessment.completed", client.event_types)
+        # The boundaries still committed: the candidate's answers are durable
+        # even though the screening could not be scored, which is what lets an
+        # operator retry the scoring rather than re-run the call.
+        self.assertEqual(client.committed_keys, ["k1", "k2"])
+
+    async def test_a_PERSISTENCE_failure_posts_nothing_at_all(self):
+        """The one path that must post NEITHER terminal event.
+
+        A boundary that did not commit means the conversation is interrupted,
+        not over. Both terminal events available here would END the engagement:
+        `assessment.aborted` is terminal `failed`, and `assessment.completed`
+        would be a lie. 0042's reconnect budget is what owns a dropped leg, and
+        posting a terminal event here would convert a retryable problem into a
+        lost candidate.
+        """
+        refusal = phone.PhoneApiOutcome(False, "stale_cursor")
+        client = FakeEventClient(commits={"k1": refusal})
+        _, client, _, delete, _, _ = await self._run_session(
+            answers=("Yes, that's fine.",), client=client
+        )
+        self.assertEqual(client.event_types, ["classify.human", "disclosure.delivered"])
+        self.assertNotIn("assessment.completed", client.event_types)
+        self.assertNotIn("assessment.aborted", client.event_types)
+        # AND the second question was never asked, and no completion was even
+        # attempted — "no next question, no completion" is one property, not two.
+        self.assertEqual(client.committed_keys, ["k1"])
+        self.assertEqual([c[0] for c in client.assessment_calls], ["start", "turn"])
+        delete.assert_awaited()
+
+    async def test_a_refused_start_screens_nobody_and_claims_nothing(self):
+        """No plan, no screening.
+
+        `disclosure_not_delivered` is the case that matters: 0044 refuses to
+        start an assessment on a call whose consent the state machine has not
+        recorded, and the worker must not carry on regardless.
+        """
+        client = FakeEventClient(
+            start=phone.PhoneAssessmentState(False, "disclosure_not_delivered"),
+        )
+        _, client, _, _, _, _ = await self._run_session(
+            answers=("Yes, that's fine.",), client=client
+        )
+        self.assertEqual(client.committed_keys, [])
+        self.assertIn("assessment.aborted", client.event_types)
+        self.assertNotIn("assessment.completed", client.event_types)
+
+    async def test_a_RESUMING_leg_asks_only_what_is_still_owed(self):
+        """The whole point of the phase.
+
+        The server says the cursor is 1 and k1 is done. The leg must ask k2 and
+        ONLY k2 — and it must never re-ask k1, because the candidate already
+        answered it on the leg that dropped.
+        """
+        client = FakeEventClient(
+            start=_default_state(
+                cursor=1,
+                completed=["k1"],
+                turns=[
+                    {"speaker": "bot", "text": "First question?"},
+                    {"speaker": "candidate", "text": "Four years."},
+                ],
+            ),
+        )
+        _, client, _, _, session, _ = await self._run_session(
+            answers=("Yes, that's fine.",), client=client
+        )
+        self.assertEqual(client.committed_keys, ["k2"])
+        self.assertNotIn("k1", client.committed_keys)
+        self.assertEqual(client.boundaries[0]["expected_index"], 1)
+        self.assertIn("assessment.completed", client.event_types)
+        # The DISCLOSURE is re-delivered on the new leg — a new leg may be a
+        # different person — and it is deliberately NOT a transcript turn: it
+        # is gate copy, and no boundary carries it.
+        self.assertEqual(session.spoken[0], phone.PHONE_DISCLOSURE_TEXT)
+        for boundary in client.boundaries:
+            for turn in boundary["turns"]:
+                self.assertNotIn("recorded so the hiring team", turn["text"])
+
+    async def test_a_silent_candidate_halts_rather_than_committing_half_an_exchange(self):
+        """No answer means no boundary.
+
+        Committing the bot's question with nothing after it would record an
+        answer the candidate never gave, and the scorer reads that transcript.
+        """
+        # Comfortably under the harness's 0.05 s residency cap, so the HALT is
+        # what ends the leg rather than the residency timeout — two different
+        # outcomes with two different terminal decisions, and a test that let
+        # them race would be asserting whichever won.
+        with patch.object(phone, "phone_answer_timeout_sec", lambda: 0.005):
+            _, client, _, _, _, _ = await self._run_session(
+                answers=("Yes, that's fine.",), replies=[None, None, None]
+            )
+        self.assertEqual(client.committed_keys, [])
+        self.assertNotIn("assessment.completed", client.event_types)
+        self.assertNotIn("assessment.aborted", client.event_types)
+
+    async def test_the_close_reason_is_still_not_what_decides_a_completion(self):
+        """A tidy hangup is not evidence of anything.
+
+        P4a refused to read the close reason, and 0044 does not start reading
+        it. The condition is the SCORE, and a leg whose boundaries never
+        committed is refused a completion however cleanly the room shut.
+        """
+        refusal = phone.PhoneApiOutcome(False, "session_not_active")
+        client = FakeEventClient(commits={"k1": refusal})
+        _, client, _, _, _, persistence_spy = await self._run_session(
+            answers=("Yes, that's fine.",), client=client, close_after=True
+        )
         self.assertNotIn("assessment.completed", client.event_types)
         self.assertEqual(persistence_spy.mock_calls, [])
 
