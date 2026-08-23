@@ -227,3 +227,38 @@ every dial.
   accept an epoch, so wiring it is a one-line change once there is a worker-visible
   source.
 - **No scheduler is armed.** `dialPhoneAttempt` has no production caller.
+
+---
+
+## 11. The mutation controls, and how to re-run them
+
+Every safety guard below was deliberately broken, the suite run, and the failure
+recorded — then reverted and re-run green. **If deleting a guard leaves its suite
+green, the guard is decorative.** This lane has shipped a green suite around a real
+defect more than once, which is why these are mandatory rather than nice to have.
+
+They are recorded here rather than shipped as a script: a script that edits source and
+reverts with `git checkout` will silently destroy uncommitted work if anyone runs it on
+a dirty tree. Re-run them by hand, on a **clean** tree, one at a time.
+
+| # | Break this | Suite | Expect |
+|---|---|---|---|
+| M1 | The `attached.status !== 'ok'` refusal in `recording.ts` | `phone-recording` | 9 fail |
+| M2 | The `role === undefined` refusal in `recording.ts` | `phone-recording` | 4 fail |
+| M3 | Drop supplementary rows / manifest keys in `artifactKeys` | `phone-recording-purge` | 12 fail |
+| M4 | Force `safeToAcknowledge: true` everywhere | `phone-recording-purge` | 13 fail |
+| M5 | Make the booking branch unconditional in `phone-worker.ts` | `phone-worker-route` | 13 fail |
+| M6 | Replace `z.enum(WORKER_PHONE_EVENTS)` with `z.string()` | `phone-worker-route` | 4 fail |
+| M7 | Skip the `leaseOutlivesOriginate` gate | `phone-dial-controller` | 9 fail |
+| M8 | Skip the purge before a terminal refusal | `phone-worker-route` | 12 fail |
+| M9 | Ignore an `active` egress in the purge | `phone-recording-purge` | 5 fail |
+| M10 | Remove the ring-vs-originate ordering gate | `phone-dial-controller` | 2 fail |
+| P1 | Start the recording before classification (Python) | `test_phone_gate` | 9 fail |
+| P2 | Let a machine-classified call score (Python) | `test_phone_gate` | 5 fail |
+| P3 | Confirm a booking before the server answers (Python) | `test_phone_gate` | 7 fail |
+| P4 | Accept `ignored` as consent (Python) | `test_phone_gate` | 11 fail |
+
+**M8 is the one to understand.** Before the purge had a production caller it could not
+have failed *any* suite — the independent review caught exactly that. A mutation control
+proves nothing about code nothing calls, so a control that stays green is a question
+about the wiring, not a reassurance about the guard.
