@@ -23,7 +23,9 @@ import {
   narrowPhoneRpcStatus,
 } from '../lib/phone-screening/rpc-contract.js';
 import {
+  CLOCK_FREE_RPCS,
   MIGRATION_0042,
+  PHONE_MIGRATIONS_TEXT,
   RPC_NAMES,
   functionBody,
   functionParameters,
@@ -69,19 +71,27 @@ describe('the extractor itself is not over-broad', () => {
     expect(functionStatuses('admit_phone_attempt').size).toBe(26);
     expect(functionStatuses('schedule_phone_appointment')).toContain('ok_prereqs_pending');
     expect(() => functionStatuses('phone_ist_date')).toThrow(/no statuses extracted/);
-    expect(() => functionBody('no_such_function')).toThrow(/function missing/);
+    expect(() => functionBody('no_such_function')).toThrow(/no phone migration declares/);
   });
 });
 
-describe('the ten RPCs', () => {
-  it('the TS list is exactly the migration\'s service-role RPC set', () => {
+describe('the fourteen RPCs', () => {
+  it('the TS list is exactly the migrations\' service-role RPC set', () => {
     expect(new Set(PHONE_RPC_NAMES)).toEqual(new Set(RPC_NAMES));
-    expect(PHONE_RPC_NAMES).toHaveLength(10);
+    // Ten from 0042, four from 0043.
+    expect(PHONE_RPC_NAMES).toHaveLength(14);
     for (const name of PHONE_RPC_NAMES) {
-      expect(MIGRATION_0042).toContain(`grant execute on function screening_v2.${name}`);
+      // Searched across BOTH migrations: the question here is "is this granted
+      // anywhere in the phone schema", not "which declaration wins".
+      expect(PHONE_MIGRATIONS_TEXT).toContain(
+        `grant execute on function screening_v2.${name}`,
+      );
       // Service-role only: nothing is granted to a browser role.
-      expect(MIGRATION_0042).toContain(
+      expect(PHONE_MIGRATIONS_TEXT).toContain(
         `revoke all on function screening_v2.${name}`,
+      );
+      expect(PHONE_MIGRATIONS_TEXT).not.toMatch(
+        new RegExp(`grant execute on function screening_v2\\.${name}[^;]*to (?:anon|authenticated|public)`),
       );
     }
   });
@@ -95,6 +105,13 @@ describe('the ten RPCs', () => {
   it('every time-dependent RPC takes p_now as its FINAL parameter', () => {
     for (const name of PHONE_RPC_NAMES) {
       const params = PHONE_RPC_PARAMETERS[name];
+      if (CLOCK_FREE_RPCS.includes(name)) {
+        // A pure read that decides nothing time-dependent takes no clock. The
+        // exemption is ENUMERATED, not inferred from "has no p_now" — which
+        // would excuse exactly the mistake this test exists to catch.
+        expect(params).not.toContain('p_now');
+        continue;
+      }
       expect(params[params.length - 1]).toBe('p_now');
     }
   });
@@ -109,6 +126,11 @@ describe('the ten RPCs', () => {
       // `now()` appears EXACTLY once, and only as the `p_now` default in the
       // signature — never inside the body, where it would make the RPC read
       // the machine clock instead of the injected instant.
+      if (CLOCK_FREE_RPCS.includes(name)) {
+        // No clock at all — not even the signature default.
+        expect([...body.matchAll(/\bnow\(\)/g)]).toHaveLength(0);
+        continue;
+      }
       expect([...body.matchAll(/\bnow\(\)/g)]).toHaveLength(1);
       expect(body).toMatch(/p_now\s+timestamptz default now\(\)/);
     }

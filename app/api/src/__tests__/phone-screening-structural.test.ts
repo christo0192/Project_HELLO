@@ -146,7 +146,10 @@ describe('1. every phone write goes through an RPC', () => {
     expect(stores).toBeDefined();
     const writeBody = code(stores!.source);
     const rpcCalls = [...writeBody.matchAll(/client\.rpc\(\s*'([a-z_]+)'/g)].map((m) => m[1]);
-    expect(new Set(rpcCalls).size).toBe(10);
+    // FOURTEEN since 0043 added the four recording-artifact RPCs. The count is
+    // pinned rather than merely non-zero so a seam that quietly stopped
+    // routing one call through an RPC would fail here.
+    expect(new Set(rpcCalls).size).toBe(14);
     // The write seam reaches NO table, only RPCs.
     expect(writeBody, 'stores.ts uses a table accessor').not.toMatch(/\bclient\s*\.\s*from\s*\(/);
     // A type-only import of the client type is fine; a VALUE import is not.
@@ -320,6 +323,17 @@ describe('2. no provider, no dialing, no network, no Ashby mutation', () => {
       // P6 — the operator calendar/engagement/health/control API.
       'routes/phone.ts',
       'schemas/phone-api.ts',
+      // P4 — the safe outbound dialer. A SEPARATE directory from the P3
+      // ingress on purpose: `livekit-phone` carries a directory-wide "nothing
+      // here dials" assertion, and housing the dialer beside it would have
+      // forced that assertion to be weakened into a per-file allowlist. A
+      // weakened tripwire is worse than none, because it still reads like a
+      // guarantee.
+      'integrations/livekit-phone-dial/dial.ts',
+      'integrations/livekit-phone-dial/recording.ts',
+      'integrations/livekit-phone-dial/recording-purge.ts',
+      'integrations/livekit-phone-dial/sip.ts',
+      'routes/phone-worker.ts',
     ]);
     const seen = new Set<string>();
     for (const file of allSourceFiles(SRC_DIR)) {

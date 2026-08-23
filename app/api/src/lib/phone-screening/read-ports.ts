@@ -188,4 +188,28 @@ export interface PhoneReadStore {
     engagementId: string;
     limit: number;
   }): Promise<readonly PhoneAttemptRow[]>;
+  /**
+   * Resolve an ATTEMPT to the engagement that owns it, plus the two fields a
+   * caller needs to act on it: the engagement's current state and its session.
+   *
+   * A read, not a write. The internal worker surface knows only an attempt id
+   * — that is what a SIP participant identity encodes — while every write RPC
+   * it needs is engagement-scoped, so something has to bridge the two. Doing it
+   * here keeps the bridge on the READ seam, where P6 established that a read is
+   * not a widening of the write seam.
+   *
+   * `null` when the attempt does not exist. Never throws for a missing row: an
+   * unknown attempt is a normal answer on a surface a retrying worker calls.
+   */
+  getAttemptContext(input: { attemptId: string }): Promise<PhoneAttemptContext | null>;
+}
+
+/** The bridge from a SIP participant identity to something writable. */
+export interface PhoneAttemptContext {
+  readonly attemptId: string;
+  readonly engagementId: string;
+  readonly engagementState: PhoneEngagementState;
+  readonly engagementVersion: number;
+  /** `null` when the engagement has no session bound yet. */
+  readonly sessionId: string | null;
 }

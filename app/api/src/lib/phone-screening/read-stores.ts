@@ -32,6 +32,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type {
   PhoneAppointmentRow,
+  PhoneAttemptContext,
   PhoneAttemptRow,
   PhoneCandidateRow,
   PhoneEngagementRow,
@@ -63,6 +64,22 @@ const APPOINTMENT_COLUMNS =
 
 /** `phone_engagements`. `application_link_id`, `role_id`, `session_id` and
  *  `consent_record_id` are not read: none of them is shown anywhere. */
+/**
+ * The attempt->engagement bridge, read by the internal worker surface. Two
+ * DECLARED lists rather than inline selects, because a structural test admits
+ * only declared lists here — the control that stops a provider-bearing column
+ * being added to a select by hand.
+ */
+const ATTEMPT_LINK_COLUMNS = 'id,engagement_id';
+
+/**
+ * `session_id` appears in THIS list and nowhere else in the read seam. It is
+ * not a provider identifier and is never projected to an operator; it exists
+ * solely to derive the phone room name, which is a function of the session
+ * because one session spans every reconnect attempt.
+ */
+const ENGAGEMENT_LINK_COLUMNS = 'id,state,version,session_id';
+
 const ENGAGEMENT_COLUMNS =
   'id,candidate_id,state,state_reason,epoch,version,no_answer_attempts,reconnects_used,provider_failures,next_eligible_at,last_attempt_at,terminal_at,created_at,updated_at';
 
@@ -408,6 +425,54 @@ export function createPhoneReadStore(client: SupabaseClient): PhoneReadStore {
         .limit(boundedRowLimit(input.limit));
       if (error) throw new Error('phone_attempt_read_error');
       return rows(data).map(mapAttempt);
+    },
+
+    async getAttemptContext(input): Promise<PhoneAttemptContext | null> {
+      // Two reads rather than a join, in the pinned lock order (attempt, then
+      // its engagement) and with the SAME narrow column sets the rest of this
+      // file uses. A join would have to name columns from both tables in one
+      // select string, which is exactly where a provider-bearing column gets
+      // added by accident later.
+      const attempt = await client
+        .from('phone_call_attempts')
+        .select(ATTEMPT_LINK_COLUMNS)
+        .eq('id', input.attemptId)
+        .maybeSingle();
+      if (attempt.error) throw new Error('phone_attempt_read_error');
+      const attemptRow = (attempt.data ?? {}) as Row;
+      const attemptId = str(attemptRow, 'id');
+      const engagementId = str(attemptRow, 'engagement_id');
+      if (attemptId === undefined || engagementId === undefined) return null;
+
+      // `session_id` is read HERE and nowhere else in this file. It is not a
+      // provider identifier and it is not shown to an operator — it exists
+      // solely to derive the phone room name, which is a function of the
+      // session because one session spans every reconnect attempt.
+      const engagement = await client
+        .from('phone_engagements')
+        .select(ENGAGEMENT_LINK_COLUMNS)
+        .eq('id', engagementId)
+        .maybeSingle();
+      if (engagement.error) throw new Error('phone_engagement_read_error');
+      const engagementRow = (engagement.data ?? {}) as Row;
+      const state = member<PhoneEngagementState>(
+        engagementRow,
+        'state',
+        PHONE_ENGAGEMENT_STATES,
+      );
+      const version = int(engagementRow, 'version');
+      // A state outside the closed vocabulary is not narrowed to a default:
+      // the caller decides what to do about an attempt it cannot classify, and
+      // a silently-defaulted state would be one it never learns about.
+      if (state === undefined || version === undefined) return null;
+
+      return {
+        attemptId,
+        engagementId,
+        engagementState: state,
+        engagementVersion: version,
+        sessionId: str(engagementRow, 'session_id') ?? null,
+      };
     },
   };
 }

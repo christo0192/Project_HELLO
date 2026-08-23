@@ -20,6 +20,7 @@ from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli
 from livekit.plugins import openai, sarvam
 
 import persistence
+import phone
 from observability import (
     Span,
     StructuredLogger,
@@ -385,6 +386,22 @@ _CLOSE_REASON_TO_TERMINAL: dict[str | None, str | None] = {
     "stt_error": "provider_error",
     "tts_error": "provider_error",
     "llm_error": "provider_error",
+    # ── P4: SIP/telephony disconnect reasons ──────────────────────────
+    # Added deliberately narrow. These three are the LiveKit DisconnectReason
+    # values a PSTN leg can produce that the browser path never sees; every
+    # other reason, phone or not, is left to fall through to `worker_crash`.
+    #
+    # They map to `provider_error` rather than to a truer name because
+    # `fail_session` accepts only the reasons in persistence._FAILED_REASONS
+    # and the 0006 CHECK, and widening that pair is a migration this lane does
+    # not own. `provider_error` is at least honest about the direction — the
+    # telephony leg failed, the worker did not — and, crucially, it is a
+    # FAILURE bucket: no completion, no scoring, no scorecard for a call that
+    # never had a consenting human on it. The truthful per-attempt outcome is
+    # recorded by the 0042 phone events the gate posts, not by this label.
+    "user_unavailable": "provider_error",
+    "user_rejected": "provider_error",
+    "sip_trunk_failure": "provider_error",
 }
 
 # Mapping of SDK error type names to terminal_reason codes.
@@ -484,8 +501,407 @@ async def _resolve_worker_context_with_retry(
     return resolved
 
 
+# ── P4: worker isolation (browser vs phone) ───────────────────────────
+# The existing worker registers with NO `agent_name`, which means LiveKit
+# auto-dispatches it into EVERY room in the project — including the phone rooms
+# the dialer provisions. Setting `agent_name` on this worker would silently stop
+# browser screening, so the default stays unnamed and instead learns to RECOGNISE
+# a phone room and refuse it. The named phone worker is a separate deployment,
+# enabled by PHONE_AGENT_NAME; rolling it back is not deploying it, which needs
+# no change to the browser path at all.
+
+_PARTICIPANT_POLL_SEC = 0.25
+
+
+def _phone_agent_name() -> str:
+    """The named phone worker's dispatch name, or "" for the default worker.
+
+    Read at call time, not at import: the default must be observable as a
+    default, and a test that cannot change it cannot prove it.
+    """
+    return (os.getenv("PHONE_AGENT_NAME") or "").strip()
+
+
+def _room_metadata_from_context(ctx: JobContext) -> Any:
+    """Room metadata blob, if the SDK has one yet. Never logged, never parsed
+    for anything except the channel marker."""
+    metadata = phone.room_metadata_of(ctx)
+    if metadata:
+        return metadata
+    job = getattr(ctx, "job", None)
+    job_room = getattr(job, "room", None)
+    return getattr(job_room, "metadata", None)
+
+
+def _worker_handles_room(room_name: str, room_metadata: Any) -> bool:
+    """Does THIS worker own this room?
+
+    Symmetric, deliberately: the unnamed browser worker handles everything that
+    is not a phone room, and the named phone worker handles nothing else. A
+    worker dispatched into the other channel's room returns without connecting.
+    """
+    is_phone = phone.is_phone_room(room_name, room_metadata)
+    return is_phone if _phone_agent_name() else not is_phone
+
+
+def build_worker_options() -> WorkerOptions:
+    """Construct WorkerOptions, naming the worker ONLY when configured.
+
+    Unset/empty PHONE_AGENT_NAME must produce byte-for-byte the options the
+    browser worker has always had — no `agent_name` key at all, so automatic
+    dispatch is untouched.
+    """
+    options: dict[str, Any] = {
+        "entrypoint_fnc": entrypoint,
+        # Production default prewarms multiple idle job processes. That is
+        # too memory-heavy for the single shared Fly worker used here and
+        # can leave browser joins stuck with no assistant audio. Start job
+        # processes only on demand.
+        "num_idle_processes": 0,
+        "initialize_process_timeout": 60.0,
+        "job_memory_warn_mb": 1400,
+        "job_memory_limit_mb": 0,
+    }
+    agent_name = _phone_agent_name()
+    if agent_name:
+        options["agent_name"] = agent_name
+    return WorkerOptions(**options)
+
+
+async def _wait_for_sip_participant(ctx: JobContext, timeout_sec: float) -> Any:
+    """Wait, bounded, for a participant to actually appear in the room.
+
+    Returns the participant or None on timeout. A SIP leg being up is not proof
+    of a human — this only establishes that SOMETHING answered, which is the
+    earliest moment at which speaking is not speaking into a ringing line.
+    """
+    deadline = _monotonic() + max(0.0, timeout_sec)
+    while True:
+        room = getattr(ctx, "room", None)
+        participants = getattr(room, "remote_participants", None)
+        values = getattr(participants, "values", None)
+        if callable(values):
+            for participant in list(values()):
+                if participant is not None:
+                    return participant
+        if _monotonic() >= deadline:
+            return None
+        await asyncio.sleep(_PARTICIPANT_POLL_SEC)
+
+
+# ── P4: the default answer classifier ─────────────────────────────────
+# A bounded, deterministic rule set over the FIRST spoken response to the
+# disclosure. It is the default for an injectable seam, and it is deliberately
+# conservative: only an explicit affirmative is consent. Anything it cannot
+# read as one of the five outcomes is a machine, because a machine gets no
+# assessment, no recording and no scorecard — the safe direction to be wrong in.
+
+_MACHINE_RE = re.compile(
+    r"leave (?:a )?(?:your )?message|after the (?:tone|beep)|voice\s?mail|"
+    r"not available (?:right now|at the moment)|record your message|"
+    r"press \d|unable to take your call",
+    re.IGNORECASE,
+)
+_WRONG_NUMBER_RE = re.compile(
+    r"wrong number|no one (?:by|with) that name|nobody (?:by|with) that name|"
+    r"you(?:'ve| have) got the wrong",
+    re.IGNORECASE,
+)
+_OPT_OUT_RE = re.compile(
+    r"do(?:n't| not) (?:ever )?call(?: me)?(?: again)?|stop calling|"
+    r"remove (?:my|this) number|take me off",
+    re.IGNORECASE,
+)
+_REFUSED_RE = re.compile(
+    r"do(?:n't| not) record|no recording|not (?:comfortable|okay|ok) with|"
+    r"^\s*(?:no|nope|no thanks|not interested)\b",
+    re.IGNORECASE,
+)
+# Anchored deliberately. An affirmative has to BE the answer: matching "sure"
+# anywhere in the sentence reads "I'm not sure" as consent, which is the one
+# false positive this whole file exists to prevent.
+_AFFIRMATIVE_RE = re.compile(
+    r"^\s*(?:well|um|uh|so|hi|hello|hey)?[\s,]*"
+    r"(?:yes|yeah|yep|yup|sure|okay|ok|go ahead|that(?:'s| is) fine|"
+    r"fine|please do|carry on|of course)\b",
+    re.IGNORECASE,
+)
+
+
+def classify_answer_text(text: str) -> str | None:
+    """Map one spoken response to a gate outcome, or None if unreadable.
+
+    Order matters: opt-out and wrong-number are checked before refusal, because
+    "don't call me again" is both, and the stronger, more suppressive reading is
+    the one the candidate meant.
+    """
+    value = (text or "").strip()
+    if not value:
+        return None
+    if _MACHINE_RE.search(value):
+        return phone.CLASSIFY_MACHINE
+    if _WRONG_NUMBER_RE.search(value):
+        return phone.CLASSIFY_WRONG_NUMBER
+    if _OPT_OUT_RE.search(value):
+        return phone.CLASSIFY_OPT_OUT
+    if _REFUSED_RE.search(value):
+        return phone.CLASSIFY_REFUSED
+    if _AFFIRMATIVE_RE.search(value):
+        return phone.CLASSIFY_HUMAN
+    return None
+
+
+# ── P4: the phone session ─────────────────────────────────────────────
+# Reached only by the NAMED phone worker, and only for a phone room. Nothing in
+# here touches persistence: a phone attempt's lifecycle lives in 0042 and is
+# advanced by the internal worker events this flow posts, so the worker has no
+# business writing call_sessions rows on this path.
+
+# Recording is OFF at session start, unconditionally. The one and only moment at
+# which it may exist is after `disclosure.delivered` is accepted — see
+# `_phone_recording_permitted`.
+_PHONE_NO_RECORDING = {"audio": False, "transcript": False, "traces": False, "logs": False}
+
+
+async def _phone_recording_permitted() -> None:
+    """The single legal call site for "recording may now exist".
+
+    The worker does not start egress itself — the API half attaches attempt
+    egress when it applies `disclosure.delivered`, which is the same event whose
+    acceptance is the precondition here. This seam exists so that the ordering
+    is observable in a test, and so that any future worker-side recording has
+    exactly one place it is allowed to be called from. It must never be reached
+    on the machine, refusal, opt-out, wrong-number or no-participant paths.
+    """
+    _log.info("unknown_event", error_type="phone_recording_permitted")
+
+
+async def _classify_phone_answer(
+    turns: "asyncio.Queue[str]",
+    say: Callable[[str], Any],
+    *,
+    attempts: int = 2,
+) -> str:
+    """Read the response to the disclosure, re-asking at most once.
+
+    Turn-bounded here; wall-clock-bounded by the gate, which runs this under a
+    hard timeout — so neither a silent line nor an endlessly chatty one can keep
+    the call in the unclassified state where recording is forbidden and the
+    conversation has not started.
+    """
+    for attempt in range(max(1, attempts)):
+        text = await turns.get()
+        decision = classify_answer_text(text)
+        if decision is not None:
+            return decision
+        if attempt + 1 < attempts:
+            await say(phone.PHONE_REASK_TEXT)
+    return phone.CLASSIFY_MACHINE
+
+
+async def _run_phone_entrypoint(ctx: JobContext, room_name: str) -> None:
+    """Named-worker entry for a phone room.
+
+    The attempt id comes off the per-attempt DISPATCH metadata, never off the
+    room name: the room is keyed by SESSION so one session's reconnect attempts
+    share a transcript, and a session id posted as an ``attempt_id`` resolves to
+    no attempt at all — every event would come back ``ignored:
+    unknown_attempt`` and nothing would ever be recorded for the call.
+    """
+    attempt_id = phone.attempt_id_from_dispatch_metadata(ctx)
+    if attempt_id is None:
+        # No attempt to post events against. Fail closed: do not connect, do not
+        # speak, do not activate, do not record, do not post. A call the system
+        # cannot account for is one the worker must not conduct.
+        _log.warn(
+            "unknown_event",
+            error_type="phone_dispatch_unresolved",
+            error_category="attempt_id_missing",
+        )
+        return
+    await _run_phone_session(ctx, room_name, attempt_id)
+
+
+async def _run_phone_session(
+    ctx: JobContext,
+    room_name: str,
+    attempt_id: str,
+    *,
+    client: Any = None,
+    classifier: Callable[..., Any] | None = None,
+) -> phone.PhoneGateResult:
+    """Connect, wait, disclose, classify — then, and only then, screen."""
+    await ctx.connect()
+    events = client if client is not None else phone.PhoneEventClient()
+
+    user_turns: "asyncio.Queue[str]" = asyncio.Queue()
+    candidate_activity = asyncio.Event()
+    close_event = asyncio.Event()
+    close_reason: dict[str, Any] = {}
+
+    session = AgentSession(
+        stt=sarvam.STT(
+            model=os.getenv("SARVAM_STT_MODEL", "saaras:v3"),
+            language=os.getenv("SARVAM_LANGUAGE", "en-IN"),
+        ),
+        tts=sarvam.TTS(
+            model=os.getenv("SARVAM_TTS_MODEL", "bulbul:v3"),
+            speaker=os.getenv("SARVAM_TTS_VOICE", "simran"),
+        ),
+        llm=openai.LLM(
+            model=GEMINI_MODEL,
+            api_key=os.getenv("GEMINI_API_KEY"),
+            base_url=GEMINI_BASE_URL,
+        ),
+    )
+
+    @session.on("conversation_item_added")
+    def _on_phone_item(event):  # noqa: ANN001
+        item = getattr(event, "item", None)
+        if getattr(item, "role", None) != "user":
+            return
+        candidate_activity.set()
+        text = _item_text(item)
+        if text:
+            user_turns.put_nowait(text)
+
+    @session.on("close")
+    def _on_phone_close(event):  # noqa: ANN001
+        close_reason["reason"] = _classify_close_event(event)
+        close_event.set()
+
+    async def say(text: str) -> None:
+        speech = session.say(text, allow_interruptions=False)
+        wait_for_playout = getattr(speech, "wait_for_playout", None)
+        if callable(wait_for_playout):
+            await wait_for_playout()
+
+    agent = phone.phone_agent_class(Agent)(
+        system_prompt(
+            candidate_name=None, role_title=None, role_focus=None,
+            resume_facts=None, questions=None,
+        ),
+        client=events,
+        attempt_id=attempt_id,
+        say=say,
+    )
+
+    async def wait_for_participant() -> Any:
+        """Wait for the answer, and only then open the media session.
+
+        Coupled deliberately: with the session start on this side of the wait,
+        there is no code path on which the agent can speak, run a turn, or start
+        a silence timer before something has actually answered the call.
+        """
+        participant = await _wait_for_sip_participant(
+            ctx, phone.phone_participant_wait_sec()
+        )
+        if participant is None:
+            return None
+        await session.start(agent=agent, room=ctx.room, record=dict(_PHONE_NO_RECORDING))
+        return participant
+
+    async def classify() -> str:
+        if classifier is not None:
+            return await classifier(user_turns, say)
+        return await _classify_phone_answer(user_turns, say)
+
+    result = await phone.run_phone_gate(
+        attempt_id=attempt_id,
+        client=events,
+        wait_for_participant=wait_for_participant,
+        classify=classify,
+        say=say,
+        start_recording=_phone_recording_permitted,
+    )
+
+    if not result.assessment_allowed:
+        # Machine, refusal, opt-out, wrong number, silent line: the attempt is
+        # over. No scoring is triggered and no writeback is attempted, because
+        # neither is reachable from here at all.
+        await _close_phone_room(room_name)
+        return result
+
+    silence_task = asyncio.create_task(
+        _silence_termination_loop(
+            session,
+            candidate_activity,
+            lambda: _close_phone_room(room_name),
+            prompt_after_sec=CANDIDATE_SILENCE_PROMPT_SEC,
+            end_after_sec=CANDIDATE_SILENCE_END_SEC,
+        )
+    )
+    try:
+        await asyncio.wait_for(close_event.wait(), timeout=SESSION_MAX_RESIDENCY_SEC)
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        silence_task.cancel()
+        await asyncio.gather(silence_task, return_exceptions=True)
+
+    # ── A CLEAN CLOSE IS NOT A COMPLETED ASSESSMENT ───────────────────
+    # This deliberately posts `assessment.aborted` UNCONDITIONALLY, and the
+    # room's close reason is not consulted.
+    #
+    # `assessment.completed` drives 0042 to terminal `completed` with
+    # `outcome_class = 'completed'`, and every downstream reader — the
+    # engagement state, P6's health backlog, the P7 calendar queue — treats
+    # that as a SCORED screening. On this path nothing is scored: the phone
+    # session persists no transcript turn, never calls `activate_session` or
+    # `complete_session`, and never triggers scoring. A clean hangup means the
+    # call ended tidily, not that an assessment exists.
+    #
+    # So claiming `completed` would be the same lie as calling an answered
+    # call `no_answer` — a terminal state asserting something that did not
+    # happen, and unrecoverable afterwards because nothing downstream can tell
+    # the difference. `assessment.aborted` is terminal `failed` with reason
+    # `assessment_aborted`: truthful that the conversation happened and
+    # produced nothing.
+    #
+    # The conditional belongs back here when the persistence path exists, and
+    # its condition must be "scoring SUCCEEDED", not "the room closed
+    # cleanly". It is left out entirely rather than stubbed behind a flag that
+    # is always false, because an unreachable branch reads as a safety net and
+    # is not one.
+    await events.post_event(attempt_id, "assessment.aborted")
+    await _close_phone_room(room_name)
+    return result
+
+
+async def _close_phone_room(room_name: str) -> None:
+    """Delete the room so the SIP leg is torn down. Best effort, never raises
+    into the gate's decision."""
+    try:
+        await _delete_livekit_room(room_name)
+    except Exception:  # noqa: BLE001
+        _log.warn(
+            "unknown_event",
+            error_type="phone_room_close_failed",
+            error_category="room_delete",
+        )
+
+
 async def entrypoint(ctx: JobContext) -> None:
     started_at = _monotonic()
+
+    # P4: channel isolation, decided BEFORE ctx.connect(). A worker that does
+    # not own this room must not connect, must not speak, must not activate and
+    # must not write a single row — so the check happens on the job's room
+    # identity, which is available before any media connection exists.
+    room_identity = _room_name_from_context(ctx)
+    room_metadata = _room_metadata_from_context(ctx)
+    if not _worker_handles_room(room_identity, room_metadata):
+        _log.info(
+            "unknown_event",
+            error_type="worker_room_skipped",
+            schema="phone" if phone.is_phone_room(room_identity, room_metadata) else "browser",
+        )
+        return
+
+    if _phone_agent_name():
+        await _run_phone_entrypoint(ctx, room_identity)
+        return
+
     await ctx.connect()
     meta = collect_prompt_metadata(ctx)
     room_name = str(meta.get("room_name") or _room_name_from_context(ctx) or "")
@@ -945,16 +1361,4 @@ async def _run_session(
 
 
 if __name__ == "__main__":
-    cli.run_app(
-        WorkerOptions(
-            entrypoint_fnc=entrypoint,
-            # Production default prewarms multiple idle job processes. That is
-            # too memory-heavy for the single shared Fly worker used here and
-            # can leave browser joins stuck with no assistant audio. Start job
-            # processes only on demand.
-            num_idle_processes=0,
-            initialize_process_timeout=60.0,
-            job_memory_warn_mb=1400,
-            job_memory_limit_mb=0,
-        )
-    )
+    cli.run_app(build_worker_options())

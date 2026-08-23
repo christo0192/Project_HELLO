@@ -145,6 +145,10 @@ function fakeReadStore(over: Partial<PhoneReadStore> = {}): ReadSpy {
     getEngagement: () => track('getEngagement', ENGAGEMENT),
     listCandidatesByIds: () => track('listCandidatesByIds', [CANDIDATE]),
     listAttemptsForEngagement: () => track('listAttemptsForEngagement', [ATTEMPT]),
+    // 0043/P4. The operator calendar API never resolves an attempt to its
+    // engagement — that bridge exists only for the internal worker surface —
+    // so the default answers "unknown" rather than a plausible row.
+    getAttemptContext: () => track('getAttemptContext', null),
   };
   const store = new Proxy({ ...base, ...over } as PhoneReadStore, {
     get(target, prop: string) {
@@ -172,6 +176,12 @@ function fakeStores(over: Partial<PhoneStores> = {}): WriteSpy {
     heartbeatAttempt: async () => ({ status: 'ok' }),
     reclaimAttemptLeases: async () => ({ status: 'ok' }),
     applyEvent: async () => ({ status: 'applied' }),
+    // 0043. The operator calendar API never binds or purges a recording, so
+    // these default to a shape that would fail loudly if it ever did.
+    attachAttemptRecording: async () => ({ status: 'not_found' }),
+    finalizeAttemptRecording: async () => ({ status: 'not_found' }),
+    listEngagementRecordings: async () => ({ status: 'not_found' }),
+    clearAttemptRecordings: async () => ({ status: 'not_found' }),
     // A reschedule (non-null expected version) supersedes the live row and
     // returns its id; a create supersedes nothing. The route treats a
     // reschedule that superseded NOTHING as a lost update, so the default fake

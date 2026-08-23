@@ -32,7 +32,7 @@ import {
   PHONE_BUDGET_CEILINGS,
   type PhoneOutcomeClass,
 } from '../lib/phone-screening/vocabulary.js';
-import { MIGRATION_0042, functionBody } from './support/phone-migration.js';
+import { MIGRATION_0042, PHONE_MIGRATIONS_TEXT, functionBody } from './support/phone-migration.js';
 
 const SEED = 0x0b0dae7;
 const NUM_RUNS = 500;
@@ -311,13 +311,16 @@ describe('outcome map — reasons and the reconnect reset', () => {
           // The four cancellation reasons are DERIVED, not written down:
           // `v_reason := replace(p_event_type, '.', '_')`. So the literal to
           // look for is the EVENT TYPE, and the derivation itself.
-          expect(MIGRATION_0042).toContain(`'${reason.replace('_', '.')}'`);
+          expect(PHONE_MIGRATIONS_TEXT).toContain(`'${reason.replace('_', '.')}'`);
           continue;
         }
-        expect(MIGRATION_0042).toContain(`'${reason}'`);
+        // Searched across BOTH migrations: 0043 introduces
+        // `abandoned_pre_disclosure`, and pinning this to 0042 would make the
+        // assertion unsatisfiable for every reason a later migration adds.
+        expect(PHONE_MIGRATIONS_TEXT).toContain(`'${reason}'`);
       }
     }
-    expect(MIGRATION_0042).toContain("v_reason    := replace(p_event_type, '.', '_')");
+    expect(PHONE_MIGRATIONS_TEXT).toContain("v_reason    := replace(p_event_type, '.', '_')");
   });
 
   it('an outcome-determined reason is returned; an event-determined one is null', () => {

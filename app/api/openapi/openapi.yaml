@@ -532,6 +532,111 @@ paths:
               schema:
                 $ref: '#/components/schemas/WorkerContextError'
 
+  # ── Internal phone worker surface (P4) ─────────────────────────────
+  /api/internal/phone/events:
+    post:
+      tags: [phone]
+      operationId: postPhoneWorkerEvent
+      summary: Post one phone screening event from the named phone voice worker
+      description: Internal, service-authenticated surface for the named phone voice worker. Uses the SAME constant-time WORKER_CONTEXT_SECRET boundary as the scoring callback, not a recruiter session, and is mounted before recruiter auth. The event vocabulary is a CLOSED allowlist, deliberately narrower than apply_phone_event's open event-type FORMAT: the open format exists so an unrecognised PROVIDER event stays recordable, but the worker is our own code with exactly one legitimate vocabulary, and an event outside it is refused before any database work. The sip.originate_* verdicts are absent on purpose — those are the provider's, arrive through the signed webhook, and a worker able to post them could manufacture a no-answer for a call that was answered, charging a real candidate's anti-harassment budget. Disabled by default: answers 503 while PHONE_SCREENING_ENABLED is off, having performed no database work. Duplicate posts converge on the original verdict via the deterministic synthetic provider id 0042 mints for internal events.
+      security:
+        - workerBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PhoneWorkerEventRequest'
+      responses:
+        '200':
+          description: The database reached a verdict. `status` is `applied` or `ignored`; an ignored event is a normal answer, not an error, and `ignored_reason` says which of stale_epoch, unknown_attempt, terminal or unexpected_event applied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerEventResponse'
+        '400':
+          description: Request body failed validation, or the event is outside the closed worker allowlist.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '401':
+          description: Worker bearer credential required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '403':
+          description: Worker bearer credential invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '500':
+          description: phone_event_error — sanitized stable code, never a driver message.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '503':
+          description: Phone screening disabled, or the worker credential is not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+
+  /api/internal/phone/appointments:
+    post:
+      tags: [phone]
+      operationId: bookPhoneWorkerAppointment
+      summary: Book a candidate-requested callback from the phone voice worker
+      description: Internal, service-authenticated callback booking for the "call me later" path. The worker PROPOSES an absolute UTC instant; the SERVER decides whether it is legal, revalidating not-in-the-past and the 09:00-21:00 IST window, because an LLM-driven caller is exactly the client that will confidently propose 03:00 IST. Duration is bounded to the same 900-3600 second envelope 0042's appointment CHECK enforces. Both bounds are UTC ISO-8601 with a literal Z; an offset or naive datetime is refused. IMPORTANT — schedule_phone_appointment refuses outright while the engagement is `dialing` (attempt_in_flight), because a live dial owns the engagement and booking under it would put the calendar and the wire into disagreement. Since "call me later" is most likely said DURING the identity/disclosure exchange, this endpoint first ends the attempt truthfully and WITHOUT CHARGE via 0043's candidate.deferred_pre_disclosure edge, then books from a legal state. A refusal is ALWAYS returned as ok=false so the worker never speaks a confirmation for a booking that did not happen; unknown_status is treated as a refusal, not as success. No Google, no email. Disabled by default.
+      security:
+        - workerBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PhoneWorkerAppointmentRequest'
+      responses:
+        '200':
+          description: Either a booking (ok=true, status ok or ok_prereqs_pending) or a stable refusal (ok=false). ONLY ok=true may be spoken as a confirmation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerAppointmentResponse'
+        '400':
+          description: Body validation failed — bad instant format, or duration outside 900-3600 s.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerAppointmentResponse'
+        '401':
+          description: Worker bearer credential required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '403':
+          description: Worker bearer credential invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '500':
+          description: phone_schedule_error — sanitized stable code.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerAppointmentResponse'
+        '503':
+          description: Phone screening disabled, or the worker credential is not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+
   # ── Ashby integration ──────────────────────────────────────────────
   /api/integrations/livekit-phone/webhook:
     post:
@@ -5126,6 +5231,104 @@ components:
           const: false
         error:
           type: string
+      additionalProperties: false
+
+    PhoneWorkerError:
+      type: object
+      required: [ok, error]
+      properties:
+        ok:
+          type: boolean
+          const: false
+        error:
+          type: string
+          description: Stable snake_case code. Never a driver message and never a phone number.
+      additionalProperties: false
+
+    PhoneWorkerEventRequest:
+      type: object
+      required: [attempt_id, event_type]
+      properties:
+        attempt_id:
+          type: string
+          format: uuid
+          description: The live attempt. Required for EVERY event: an engagement-scoped post cannot drive an attempt-scoped edge, and 0042 refuses one with attempt_required rather than applying half a transition.
+        event_type:
+          type: string
+          description: CLOSED worker vocabulary. Narrower than apply_phone_event's open format on purpose — the provider's sip.originate_* verdicts are excluded because they charge a candidate's anti-harassment budget.
+          enum:
+            - classify.human
+            - classify.machine
+            - disclosure.delivered
+            - disclosure.refused
+            - candidate.opt_out
+            - candidate.wrong_number
+            - candidate.deferred_pre_disclosure
+            - sip.participant_left
+            - assessment.completed
+            - assessment.aborted
+        epoch:
+          type: integer
+          format: int32
+          minimum: 0
+          nullable: true
+          description: Fencing epoch. When omitted, 0042 fences against the epoch stored on the attempt, so a late callback from a superseded conversation is still recorded as stale_epoch rather than applied to a live one.
+      additionalProperties: false
+
+    PhoneWorkerEventResponse:
+      type: object
+      required: [ok, status, ignored_reason, duplicate]
+      properties:
+        ok:
+          type: boolean
+          description: True when the database reached a verdict, whether applied or ignored.
+        status:
+          type: string
+          enum: [applied, ignored, attempt_required, invalid_source, invalid_event_type, invalid_provider_event_id, provider_event_id_required, unknown_status]
+        ignored_reason:
+          type: string
+          nullable: true
+          enum: [stale_epoch, unknown_attempt, terminal, unexpected_event, null]
+          description: Why the event was recorded but not applied. `terminal` and `stale_epoch` both mean "this conversation is over, stop talking".
+        duplicate:
+          type: boolean
+          description: True when a redelivery converged on the original verdict.
+      additionalProperties: false
+
+    PhoneWorkerAppointmentRequest:
+      type: object
+      required: [attempt_id, starts_at, duration_seconds]
+      properties:
+        attempt_id:
+          type: string
+          format: uuid
+        starts_at:
+          type: string
+          format: date-time
+          description: ABSOLUTE UTC ISO-8601 with a literal Z. An offset or a naive datetime is refused rather than coerced — "18:30" means different instants to different readers, and the calendar is pinned to IST precisely so that ambiguity never enters.
+        duration_seconds:
+          type: integer
+          minimum: 900
+          maximum: 3600
+          description: The 0042 appointment duration envelope, enforced identically here.
+      additionalProperties: false
+
+    PhoneWorkerAppointmentResponse:
+      type: object
+      required: [ok, status]
+      properties:
+        ok:
+          type: boolean
+          description: THE LOAD-BEARING FIELD. Only true is a booking. The worker speaks a confirmation on true and NEVER otherwise, so a lenient value here becomes a bot promising a callback that does not exist.
+        status:
+          type: string
+          description: ok / ok_prereqs_pending are bookings. Everything else is a stable refusal, including unknown_status, which means no answer we understand was received and must never be read as success.
+        appointment_id:
+          type: string
+          format: uuid
+        version:
+          type: integer
+          minimum: 1
       additionalProperties: false
 
     InviteCreateResponse:

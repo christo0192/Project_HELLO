@@ -99,11 +99,18 @@ describe('phone-screening vocabulary mirrors 0042 exactly', () => {
     );
   });
 
-  it('EXACTLY eleven outcome classes, matching chk_phone_call_attempts_outcome', () => {
+  it('EXACTLY twelve outcome classes, matching chk_phone_call_attempts_outcome', () => {
+    // TWELVE since 0043, which re-declares this CHECK in full to add
+    // `abandoned_pre_disclosure`. `checkMembers` reads the NEWEST declaration,
+    // so this compares against what the database actually enforces rather than
+    // against 0042's superseded inline list.
     const members = checkMembers('chk_phone_call_attempts_outcome');
     expect(set(PHONE_OUTCOME_CLASSES)).toEqual(set(members));
-    expect(PHONE_OUTCOME_CLASSES).toHaveLength(11);
-    expect(members).toHaveLength(11);
+    expect(PHONE_OUTCOME_CLASSES).toHaveLength(12);
+    expect(members).toHaveLength(12);
+    // The 0043 member specifically, so a re-declaration that silently dropped
+    // it back to eleven would fail on the value and not only on the count.
+    expect(members).toContain('abandoned_pre_disclosure');
   });
 
   it('cold start is NOT an outcome class', () => {

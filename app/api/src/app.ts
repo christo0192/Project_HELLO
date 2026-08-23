@@ -7,6 +7,7 @@ import { resumesRouter } from './routes/resumes.js';
 import { candidatesRouter } from './routes/candidates.js';
 import { screeningRouter } from './routes/screening.js';
 import { assessRouter, workerAssessRouter } from './routes/assess.js';
+import { phoneWorkerRouter } from './routes/phone-worker.js';
 import { livekitRouter } from './routes/livekit.js';
 import { invitesRouter } from './routes/invites.js';
 import { recordingsRouter } from './routes/recordings.js';
@@ -214,6 +215,14 @@ export function createApp(opts: CreateAppOptions = {}) {
   // recruiter auth because it uses a separate constant-time shared-secret
   // boundary and is still covered by the global per-IP limiter.
   app.use('/api/internal/assess', workerAssessRouter);
+
+  // Internal phone-worker surface for the named phone voice worker. Mounted
+  // beside the scoring callback and for the same reason: it uses the SAME
+  // constant-time shared-secret boundary (WORKER_CONTEXT_SECRET), not a
+  // recruiter session, and it is still covered by the global per-IP limiter.
+  // Disabled by default — both endpoints answer 503 while
+  // PHONE_SCREENING_ENABLED is off, having performed no database work.
+  app.use('/api/internal/phone', phoneWorkerRouter);
 
   // Inbound Ashby webhook receiver. Mounted before recruiter auth because its
   // trust boundary is the HMAC-SHA256 Ashby-Signature verified over the raw

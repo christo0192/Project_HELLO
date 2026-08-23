@@ -29,6 +29,10 @@ export {
   PHONE_APPOINTMENT_MIN_SECONDS,
   PHONE_APPOINTMENT_MAX_SECONDS,
   PHONE_EVENT_SOURCES,
+  PHONE_RECORDING_ROLES,
+  isPhoneRecordingRole,
+  phoneAttemptRecordingObjectKey,
+  phoneAttemptRecordingManifestKey,
   PHONE_EVENT_IGNORED_REASONS,
   PHONE_EVENT_TYPE_PATTERN,
   PHONE_PROVIDER_EVENT_ID_PATTERN,
@@ -55,6 +59,7 @@ export {
   type PhoneEventSource,
   type PhoneEventIgnoredReason,
   type PhoneHaltReason,
+  type PhoneRecordingRole,
   type ConsentRecordStatus,
   type ConsentType,
 } from './vocabulary.js';
@@ -126,6 +131,10 @@ export {
   type ReclaimPhoneAttemptLeasesStatus,
   type SchedulePhoneAppointmentStatus,
   type SetPhoneHaltStatus,
+  type AttachPhoneAttemptRecordingStatus,
+  type FinalizePhoneAttemptRecordingStatus,
+  type ListPhoneEngagementRecordingsStatus,
+  type ClearPhoneAttemptRecordingsStatus,
 } from './rpc-contract.js';
 
 export type {
@@ -146,6 +155,12 @@ export type {
   SchedulePhoneAppointmentInput,
   SchedulePhoneAppointmentResult,
   SetPhoneHaltResult,
+  AttachPhoneAttemptRecordingInput,
+  AttachPhoneAttemptRecordingResult,
+  FinalizePhoneAttemptRecordingResult,
+  ListPhoneEngagementRecordingsResult,
+  ClearPhoneAttemptRecordingsResult,
+  PhoneRecordingArtifact,
 } from './ports.js';
 
 export { createPhoneStores, PHONE_SYSTEM_ACTOR } from './stores.js';
