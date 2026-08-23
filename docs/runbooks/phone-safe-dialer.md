@@ -271,3 +271,58 @@ a dirty tree. Re-run them by hand, on a **clean** tree, one at a time.
 have failed *any* suite — the independent review caught exactly that. A mutation control
 proves nothing about code nothing calls, so a control that stays green is a question
 about the wiring, not a reassurance about the guard.
+
+---
+
+## 12. UNMET CONTRACT ITEM — phone-side transcript, cursor and assessment
+
+**This is a scope gap, not a residual, and it is disclosed here because I did not
+disclose it earlier.** The acceptance contract asks for two things this PR does not
+deliver, and both were in scope (`voice-livekit Python/prompt/tools/tests` is explicitly
+allowed).
+
+**What the contract asks**
+
+- Item 6: *"Same session/transcript/current_question_index; new attempt/epoch/participant"*
+- The human path: *"...then and only then start attempt egress, store exact
+  object/manifest keys+role, **activate assessment**/in_call"*
+
+**What is actually true at `620c702`** — verified, not recalled:
+
+| Claim | State |
+|---|---|
+| Same **session** across reconnects | **Met.** The room is session-keyed, a reconnect adopts it, and the engagement's `session_id` is stable. |
+| Same **transcript** | **NOT met.** `_run_phone_session` makes **zero** `persistence.*` calls — no `save_turn`. The phone path persists no turns at all. |
+| Same **`current_question_index`** | **NOT met.** `current_question_index` has **zero** non-test readers or writers anywhere in `app/api/src` or `app/voice-livekit`. |
+| **Activate assessment** | **NOT met.** No `activate_session`, no `complete_session`, no `trigger_scoring`. The session posts `assessment.completed` to 0042 — so the ENGAGEMENT reaches `completed` — while nothing is scored. |
+
+**Consequences, stated plainly**
+
+1. A reconnect leg starts with a fresh `AgentSession` and no prior `ChatContext`, so it
+   **re-asks every question**. There is no artifact — cursor or persisted transcript —
+   from which "already answered" could be derived, so this cannot be fixed by a test or a
+   small patch; it needs the persistence path built.
+2. A completed phone screening yields **no transcript row and no assessment**. The
+   engagement looks `completed` in 0042 and there is nothing to read.
+
+**Why it is not repaired in this PR.** Building it means adding phone-side turn
+persistence, session activation and a resume path — through `sessions` and
+`transcript_turns`, the same write paths the **browser** uses. That is a materially
+larger change than the gate this PR is about, it is unreviewed and untested territory,
+and it lands on a branch that is otherwise green with every blocker repaired. Doing it
+quietly at the end of a long session, on a shared write path, is exactly how a browser
+regression gets introduced.
+
+**This is the owner's call, not mine.** The options are:
+
+- **(a) Ship P4 as the gate it is**, with this recorded as an explicit unmet item, and
+  build transcript/cursor/assessment as its own PR with its own review. Nothing about the
+  safety properties changes: consent still gates recording, a machine still scores
+  nothing — because nothing scores at all.
+- **(b) Hold P4** until the persistence path is added here.
+
+**The safety direction is intact either way.** The failure is that a phone screening is
+currently *incomplete*, not that it is *unsafe*: no audio is captured without consent, no
+machine is scored, no budget is mis-charged. But a phone screening that records the
+candidate and then scores nothing is not a finished feature, and calling P4 done without
+saying so would be the same class of error as claiming a repair I had not made.
