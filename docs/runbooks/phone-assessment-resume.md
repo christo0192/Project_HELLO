@@ -361,7 +361,7 @@ Kill switch at any point: `POST /api/phone/halt`.
 
 ## 9. The mutation controls, and how to re-run them
 
-Thirty-six controls, two of them superseded and marked as such. Same contract as `phone-safe-dialer.md` §11: every guard
+Thirty-seven controls, two of them superseded and marked as such. Same contract as `phone-safe-dialer.md` §11: every guard
 below was deliberately broken, the suite run, the failure recorded, then reverted and re-run green.
 **If deleting a guard leaves its suite green, the guard is decorative.**
 
@@ -409,6 +409,7 @@ Re-run them by hand, on a **clean** tree, one at a time.
 | M23 | Drop `already_scored` from the sanitized projection | `phone-assessment-route` | 1 fail |
 | P14 | Make the agent ignore `already_scored` | Python suite | 1 fail |
 | P15 | Treat deterministic auth/config faults as retryable again | Python suite | 3 fail |
+| P16 | Remove the candidate-activity restart from `_silence_termination_loop` | `test_agent` | 1 fail |
 
 `M2` is the one worth keeping: a plpgsql `exception` block opens a
 subtransaction, so the "one transaction" claim is broken by an edit that looks
@@ -431,6 +432,17 @@ here than it normally would: this section's own contract is *"if deleting a guar
 leaves its suite green, the guard is decorative."* An operator re-running a stale
 control gets green and draws exactly the wrong conclusion. A superseded control
 must say so, and name the row that replaced it.
+
+`P16` is not about P4b either, and it is the second control this branch added to
+a test that could not fail. `test_candidate_activity_restarts_initial_silence_window`
+used a 50 ms window, set activity at 5 ms and asserted at 15 ms — *before* the
+original deadline, so a broken restart would not have fired yet. Deleting the
+restart logic entirely left it GREEN. The only way it could ever fail was a
+scheduling stall on a loaded runner, which is what it did on this PR's CI: **zero
+signal, non-zero noise.** The window is now 500 ms with activity at 300 ms and the
+assertion at 600 ms — past the original deadline, before the restarted one, with
+~200 ms of slack either side — and P16 proves it now catches the regression it
+names.
 
 `P10` earned its place the hard way. When first written it stayed **green** —
 the gate-copy filter had no test that could fail, because the test double's
