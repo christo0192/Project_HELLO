@@ -61,6 +61,7 @@ export const PHONE_PURGE_STATUSES = [
   'purged',
   'nothing_to_purge',
   'enumeration_failed',
+  'egress_still_running',
   'delete_failed',
   'verification_unavailable',
   'still_present',
@@ -86,6 +87,12 @@ export interface PhonePurgeResult {
 export interface PhonePurgeDeps {
   readonly stores: PhoneStores;
   readonly storage: PhoneRecordingStorage;
+  /**
+   * Used to STOP an in-flight egress before anything is deleted. Optional in
+   * the type only so a test can prove what happens without one; a purge that
+   * cannot stop a running egress refuses rather than deleting around it.
+   */
+  readonly egress?: { stopEgress(egressId: string): Promise<unknown> };
 }
 
 /**
@@ -124,6 +131,70 @@ export async function purgePhoneEngagementRecordings(
       deleted: 0,
       enumerated: 0,
       safeToAcknowledge: true,
+    };
+  }
+
+  // ── 1b. STOP ANY EGRESS STILL WRITING ───────────────────────────────
+  // THE CASE THAT MATTERS. The refusal that triggers a purge — an opt-out
+  // during the call — happens while the egress is RUNNING, and LiveKit uploads
+  // the file and its `.json` manifest when the egress STOPS, not continuously.
+  //
+  // So deleting first would delete keys that do not exist yet, probe them,
+  // find them absent, and report `purged` with `safeToAcknowledge: true` — and
+  // the recording would land in the bucket seconds later, now unnameable
+  // because step 3 nulled the keys. The absence probe cannot save us here: it
+  // is telling the truth about a file that has not been written yet.
+  //
+  // Stopping is therefore part of the purge, and a stop we cannot perform or
+  // cannot confirm is a refusal.
+  const running = listed.artifacts.filter((a) => a.egressStatus === 'active');
+  if (running.length > 0) {
+    if (deps.egress === undefined) {
+      return {
+        status: 'egress_still_running',
+        deleted: 0,
+        enumerated: keys.length,
+        safeToAcknowledge: false,
+      };
+    }
+    for (const artifact of running) {
+      if (artifact.egressId === null) {
+        // Active with no id: nothing can stop it, so nothing may claim the
+        // audio is gone.
+        return {
+          status: 'egress_still_running',
+          deleted: 0,
+          enumerated: keys.length,
+          safeToAcknowledge: false,
+        };
+      }
+      try {
+        await deps.egress.stopEgress(artifact.egressId);
+      } catch {
+        return {
+          status: 'egress_still_running',
+          deleted: 0,
+          enumerated: keys.length,
+          safeToAcknowledge: false,
+        };
+      }
+      // Record the stop so a RETRY of this purge does not re-enter this branch
+      // and so the row stops claiming an egress is live.
+      await deps.stores.finalizeAttemptRecording({
+        attemptId: artifact.attemptId,
+        egressStatus: 'complete',
+        now: input.now,
+      });
+    }
+    // Deliberately NOT falling through to the delete in the same pass. The
+    // upload happens asynchronously after the stop is accepted, so deleting
+    // now would race it exactly as before. The caller retries; the next pass
+    // sees no `active` artifact and proceeds.
+    return {
+      status: 'egress_still_running',
+      deleted: 0,
+      enumerated: keys.length,
+      safeToAcknowledge: false,
     };
   }
 

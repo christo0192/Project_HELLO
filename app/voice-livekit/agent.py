@@ -700,14 +700,22 @@ async def _classify_phone_answer(
 
 
 async def _run_phone_entrypoint(ctx: JobContext, room_name: str) -> None:
-    """Named-worker entry for a phone room."""
-    attempt_id = phone.attempt_id_from_room_name(room_name)
+    """Named-worker entry for a phone room.
+
+    The attempt id comes off the per-attempt DISPATCH metadata, never off the
+    room name: the room is keyed by SESSION so one session's reconnect attempts
+    share a transcript, and a session id posted as an ``attempt_id`` resolves to
+    no attempt at all — every event would come back ``ignored:
+    unknown_attempt`` and nothing would ever be recorded for the call.
+    """
+    attempt_id = phone.attempt_id_from_dispatch_metadata(ctx)
     if attempt_id is None:
-        # A metadata-marked phone room with no attempt id in its name: there is
-        # no attempt to post events against, so there is nothing safe to do.
+        # No attempt to post events against. Fail closed: do not connect, do not
+        # speak, do not activate, do not record, do not post. A call the system
+        # cannot account for is one the worker must not conduct.
         _log.warn(
             "unknown_event",
-            error_type="phone_room_unresolved",
+            error_type="phone_dispatch_unresolved",
             error_category="attempt_id_missing",
         )
         return

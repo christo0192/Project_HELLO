@@ -280,6 +280,19 @@ export interface PhoneRecordingArtifact {
   readonly role: PhoneRecordingRole;
   readonly objectKey: string;
   readonly manifestKey: string | null;
+  /**
+   * The provider's egress id, when one was recorded. Carried because a purge
+   * must be able to STOP a running egress, and it cannot stop what it cannot
+   * name.
+   */
+  readonly egressId: string | null;
+  /**
+   * `active` means the egress is still writing, and the object has NOT been
+   * uploaded yet. A purge that deleted at this point would delete nothing,
+   * verify the absence of a file that does not exist yet, and report success
+   * moments before the recording landed.
+   */
+  readonly egressStatus: string | null;
 }
 
 export interface ListPhoneEngagementRecordingsResult {

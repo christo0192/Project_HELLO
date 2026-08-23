@@ -39,7 +39,18 @@
 
 import { requireLiveKitConfigured } from '../../lib/room-provisioning.js';
 
-/** Rooms are keyed by SESSION so reconnect attempts share one transcript. */
+/**
+ * Rooms are keyed by SESSION so reconnect attempts share one transcript.
+ *
+ * THE ROOM NAME THEREFORE CANNOT CARRY THE ATTEMPT ID, and nothing may try to
+ * read one out of it. A session outlives its attempts by construction — that is
+ * the whole point of sharing the room — so a parser that pulled a uuid out of
+ * this string would hand a caller the SESSION id under the name `attemptId`,
+ * and every event posted with it would resolve to no attempt at all.
+ *
+ * The attempt id travels on the DISPATCH metadata instead, which is minted per
+ * dispatch and therefore per attempt. See `buildPhoneDispatchMetadata`.
+ */
 export function phoneRoomName(sessionId: string): string {
   return `phone-${sessionId}`;
 }
@@ -71,6 +82,30 @@ export function buildPhoneRoomMetadata(
     room_name: roomName,
     channel: PHONE_ROOM_CHANNEL,
     correlation_id: correlationId ?? undefined,
+  });
+}
+
+/**
+ * Dispatch metadata — the ONLY channel that carries the attempt id to the
+ * worker.
+ *
+ * Distinct from the room metadata above, and deliberately so. Room metadata is
+ * written once, when the room is created, and is shared by every attempt that
+ * joins it; an attempt id there would be stale the moment a reconnect
+ * dispatched. A dispatch is minted per attempt, so this is the one place a
+ * per-attempt fact can live truthfully.
+ *
+ * Three closed keys, none derived from a phone number. `attempt_id` is a uuid,
+ * so it carries no digit run 0042's metadata sanitizer would reject.
+ */
+export function buildPhoneDispatchMetadata(
+  sessionId: string,
+  attemptId: string,
+): string {
+  return JSON.stringify({
+    session_id: sessionId,
+    attempt_id: attemptId,
+    channel: PHONE_ROOM_CHANNEL,
   });
 }
 
@@ -132,6 +167,11 @@ export interface ProvisionPhoneRoomDeps {
 
 export interface ProvisionPhoneRoomInput {
   readonly sessionId: string;
+  /**
+   * The attempt this dial belongs to. Travels on the DISPATCH metadata, never
+   * in the room name — see `phoneRoomName`.
+   */
+  readonly attemptId: string;
   /**
    * The named phone agent to dispatch, or `''` for none.
    *
@@ -196,11 +236,12 @@ export async function provisionPhoneRoom(
   }
 
   try {
-    // Dispatch metadata is deliberately the SAME closed object as the room
-    // metadata. A second, richer payload here would be a second place a phone
-    // value could be introduced, and the worker already resolves everything it
-    // needs server-side from the session id.
-    await deps.dispatch.createDispatch(roomName, input.agentName, { metadata });
+    // The dispatch carries the ATTEMPT id; the room metadata cannot, because
+    // the room is shared across reconnects. Both payloads are closed objects
+    // over opaque ids, so neither is a place a phone value can enter.
+    await deps.dispatch.createDispatch(roomName, input.agentName, {
+      metadata: buildPhoneDispatchMetadata(input.sessionId, input.attemptId),
+    });
   } catch {
     // The room exists and is correct; only the agent is missing. This is
     // reported rather than swallowed, because a room with no agent will sit

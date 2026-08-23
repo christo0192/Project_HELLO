@@ -700,3 +700,58 @@ describe('P5 dial — the happy path, and what it propagates', () => {
     expect(rendered).not.toContain('9876543210');
   });
 });
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// H-2 — the originate must outlast the ring.
+//
+// If the SDK call gives up while the carrier is still ringing, the controller
+// reports `originate_failed`, the lease (sized off the ORIGINATE bound) lapses,
+// and the reclaimer restores the engagement — while the leg can STILL be
+// answered, landing a real person in a room whose dial we wrote off. That is
+// the failure the lease gate exists to prevent, reintroduced through the other
+// knob, so the two bounds are related in code rather than left to two
+// independent defaults staying ordered forever.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('the ring bound must fit INSIDE the originate bound', () => {
+  it('the shipped DEFAULTS are correctly ordered', () => {
+    const screening = screeningConfig({});
+    const dial = loadPhoneDialConfig({});
+    expect(screening.ringTimeoutSeconds).toBeLessThan(dial.originateTimeoutSeconds);
+  });
+
+  for (const [ring, originate, label] of [
+    ['90', '60', 'ring longer than originate'],
+    ['60', '60', 'ring EQUAL to originate'],
+  ] as const) {
+    it(`refuses before the SDK when ${label}`, async () => {
+      const h = harness({
+        config: screeningConfig({ PHONE_RING_TIMEOUT_SECONDS: ring }),
+        dialConfig: loadPhoneDialConfig({
+          PHONE_SIP_TRUNK_ID: 'trunk-1',
+          PHONE_ORIGINATE_TIMEOUT_SECONDS: originate,
+        }),
+      });
+      const res = await run(h);
+
+      expect(res.status).toBe('refused');
+      expect(res.refusal).toBe('timeouts_misordered');
+      expectNoNetwork(res, h);
+      // Refused BEFORE admission, so no attempt is burned on a misconfiguration.
+      expect(h.admit).not.toHaveBeenCalled();
+    });
+  }
+
+  it('CONTROL — a correctly ordered pair reaches the seam', async () => {
+    const h = harness({
+      config: screeningConfig({ PHONE_RING_TIMEOUT_SECONDS: '20' }),
+      dialConfig: loadPhoneDialConfig({
+        PHONE_SIP_TRUNK_ID: 'trunk-1',
+        PHONE_ORIGINATE_TIMEOUT_SECONDS: '60',
+      }),
+    });
+    const res = await run(h);
+    expect(res.status).toBe('dialing');
+  });
+});

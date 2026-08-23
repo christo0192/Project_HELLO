@@ -17,6 +17,9 @@
  *   * `toString()`  — template literals, string concatenation, `String(x)`
  *   * `toJSON()`    — `JSON.stringify`, every structured logger in this repo
  *   * `util.inspect.custom` — `console.log(obj)`, Node's error formatting
+ *   * and the digits are held in a NON-ENUMERABLE symbol property, so an
+ *     object spread copies nothing — the one path the three hooks miss,
+ *     because a spread produces a plain object that has none of them
  *
  * All three yield `[redacted]`. Reading the digits requires calling
  * `unwrapDialableNumber` by name, which greps as an audit point and appears at
@@ -70,11 +73,22 @@ export function wrapDialableNumber(raw: string): DialableNumber {
   }
   const digest = createHash('sha256').update(raw, 'utf8').digest('hex');
   const wrapped = {
-    [DIGITS]: raw,
     digest,
     toString: (): string => REDACTED,
     toJSON: (): string => REDACTED,
   };
+  // NON-ENUMERABLE. As an ordinary property the symbol would be an ENUMERABLE
+  // own property, and `console.log({ ...number })` would print
+  // `[Symbol(phone.e164)]: '+91…'` — the one render path the three overrides
+  // below do not cover, because a spread copies own enumerable symbols and
+  // then formats a plain object that has no `toString`, no `toJSON` and no
+  // inspect hook.
+  Object.defineProperty(wrapped, DIGITS, {
+    value: raw,
+    enumerable: false,
+    writable: false,
+    configurable: false,
+  });
   // `console.log(obj)` and Node's own error formatting go through
   // `util.inspect`, which ignores `toString`/`toJSON` entirely. Without this
   // the wrapper would redact the two paths a developer thinks about and leak

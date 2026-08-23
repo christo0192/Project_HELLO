@@ -62,6 +62,7 @@ interface Harness {
   scheduleAppointment: ReturnType<typeof vi.fn>;
   resolveEngagement: ReturnType<typeof vi.fn>;
   startRecording: ReturnType<typeof vi.fn>;
+  purgeRecordings: ReturnType<typeof vi.fn>;
   /** Every store method, so ANY database touch is observable. */
   storeCalls: () => number;
 }
@@ -73,6 +74,10 @@ function build(options: {
   sessionId?: string | null;
   /** Omit the seam entirely, to prove the route works without a recorder. */
   withRecorder?: boolean;
+  /** Omit the purge seam, to prove the terminal path is inert without it. */
+  withPurge?: boolean;
+  purgeStatus?: string;
+  purgeSafe?: boolean;
   configSource?: NodeJS.ProcessEnv;
   now?: Date;
 } = {}): Harness {
@@ -97,6 +102,10 @@ function build(options: {
         },
   );
   const startRecording = vi.fn(async () => ({ status: 'started', egressStarted: true }));
+  const purgeRecordings = vi.fn(async () => ({
+    status: options.purgeStatus ?? 'purged',
+    safeToAcknowledge: options.purgeSafe ?? true,
+  }));
 
   const stores = { applyEvent, scheduleAppointment } as unknown as PhoneStores;
 
@@ -111,6 +120,7 @@ function build(options: {
       // is correct with NO recorder configured — which is exactly how a
       // deployment without an egress destination runs.
       startRecording: options.withRecorder === true ? (startRecording as never) : undefined,
+      purgeRecordings: options.withPurge === true ? (purgeRecordings as never) : undefined,
       configSource: options.configSource ?? ENABLED,
       now: () => options.now ?? NOW,
     }),
@@ -122,6 +132,7 @@ function build(options: {
     scheduleAppointment,
     resolveEngagement,
     startRecording,
+    purgeRecordings,
     storeCalls: () => applyEvent.mock.calls.length + scheduleAppointment.mock.calls.length,
   };
 }
@@ -345,26 +356,56 @@ describe('P5 worker route — the event allowlist is CLOSED', () => {
 });
 
 describe('P5 worker route — /events reports which answer it got', () => {
-  it('an `ignored` verdict is a normal answer, not an error', async () => {
+  const IGNORED_REASONS = ['stale_epoch', 'terminal', 'unknown_attempt'] as const;
+
+  for (const reason of IGNORED_REASONS) {
+    it(`an \`ignored\` verdict (${reason}) is RECORDED but is NOT ok`, async () => {
+      // `ok` MEANS APPLIED. The worker branches its SAFETY decisions on this
+      // field — it reads a successful `disclosure.delivered` as permission to
+      // assess and to record. `terminal` is exactly what an HR `emergency.stop`
+      // or `hr.cancelled` produces, so reporting it as `ok` told the worker
+      // that consent had been recorded at the moment the state machine declared
+      // the conversation over, and the agent would have kept the candidate on
+      // the line and run the whole screening.
+      //
+      // The verdict is still forwarded in full, so a caller that legitimately
+      // wants to distinguish "recorded but not applied" from "never reached the
+      // ledger" still can — it just cannot do it by reading `ok`.
+      const h = build({
+        applyEvent: async () =>
+          ({
+            status: 'ignored',
+            applied: false,
+            ignoredReason: reason,
+            duplicate: false,
+          }) as ApplyPhoneEventResult,
+      });
+      const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: 'classify.human' });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        ok: false,
+        status: 'ignored',
+        ignored_reason: reason,
+        duplicate: false,
+      });
+    });
+  }
+
+  it('a DUPLICATE of an already-applied event is still ok — idempotency survives', async () => {
+    // The rule "ok means applied" must not break retries. 0042 answers a
+    // redelivery with the ORIGINAL verdict, so a duplicate of an applied event
+    // comes back `applied` and stays ok.
     const h = build({
       applyEvent: async () =>
-        ({
-          status: 'ignored',
-          applied: false,
-          ignoredReason: 'stale_epoch',
-          duplicate: false,
-        }) as ApplyPhoneEventResult,
+        ({ status: 'applied', applied: true, duplicate: true }) as ApplyPhoneEventResult,
     });
-    const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: 'classify.human' });
+    const res = await post(h, '/events', {
+      attempt_id: ATTEMPT,
+      event_type: 'disclosure.delivered',
+    });
     expect(res.status).toBe(200);
-    // The worker needs to know WHICH: `stale_epoch` and `terminal` mean "this
-    // conversation is over, stop talking"; `applied` does not.
-    expect(res.body).toEqual({
-      ok: true,
-      status: 'ignored',
-      ignored_reason: 'stale_epoch',
-      duplicate: false,
-    });
+    expect(res.body.ok).toBe(true);
+    expect(res.body.duplicate).toBe(true);
   });
 
   it('surfaces `duplicate` so a retry is not mistaken for a second event', async () => {
@@ -850,5 +891,162 @@ describe('recording starts on disclosure.delivered, and on nothing else', () => 
 
     expect(res.status).toBe(200);
     expect(h.startRecording).not.toHaveBeenCalled();
+  });
+});
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// B-3 — the purge runs BEFORE any terminal refusal is acknowledged.
+//
+// `disclosure.refused`, `candidate.opt_out` and `candidate.wrong_number` are
+// TERMINAL in 0042, and the terminal transition writes the suppression in the
+// SAME transaction. Posting one before the audio is gone commits "this line is
+// suppressed and this engagement is over" on top of a recording still sitting
+// in the bucket — and it is invisible afterwards, because the engagement reads
+// as correctly opted out.
+// ═══════════════════════════════════════════════════════════════════════
+
+const TERMINAL_REFUSALS = [
+  'disclosure.refused',
+  'candidate.opt_out',
+  'candidate.wrong_number',
+] as const;
+
+describe('a terminal refusal purges the recordings BEFORE it is acknowledged', () => {
+  for (const event of TERMINAL_REFUSALS) {
+    it(`${event}: purges first, then posts the event`, async () => {
+      const h = build({ withPurge: true });
+      const order: string[] = [];
+      h.purgeRecordings.mockImplementation(async () => {
+        order.push('purge');
+        return { status: 'purged', safeToAcknowledge: true };
+      });
+      h.applyEvent.mockImplementation(async () => {
+        order.push('event');
+        return { status: 'applied', applied: true, duplicate: false } as ApplyPhoneEventResult;
+      });
+
+      const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: event });
+
+      expect(res.status).toBe(200);
+      expect(order).toEqual(['purge', 'event']);
+      expect(h.purgeRecordings).toHaveBeenCalledWith({ engagementId: ENGAGEMENT, now: NOW });
+    });
+
+    it(`${event}: an UNSAFE purge posts NOTHING and stays retryable`, async () => {
+      // The whole point. If the deletion could not be verified, the terminal
+      // event — and the suppression that rides in its transaction — must not
+      // commit. A 503 is retryable; a 200 would be an acknowledgement.
+      const h = build({ withPurge: true, purgeStatus: 'still_present', purgeSafe: false });
+      const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: event });
+
+      expect(res.status).toBe(503);
+      expect(res.body).toEqual({ ok: false, error: 'phone_purge_incomplete' });
+      expect(h.applyEvent).not.toHaveBeenCalled();
+    });
+  }
+
+  for (const status of ['enumeration_failed', 'egress_still_running', 'delete_failed', 'clear_failed']) {
+    it(`does not acknowledge on ${status}`, async () => {
+      const h = build({ withPurge: true, purgeStatus: status, purgeSafe: false });
+      const res = await post(h, '/events', {
+        attempt_id: ATTEMPT,
+        event_type: 'candidate.opt_out',
+      });
+      expect(res.status).toBe(503);
+      expect(h.applyEvent).not.toHaveBeenCalled();
+    });
+  }
+
+  it('a purge that THROWS also posts nothing', async () => {
+    const h = build({ withPurge: true });
+    h.purgeRecordings.mockRejectedValueOnce(new Error('storage exploded'));
+    const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: 'candidate.opt_out' });
+
+    expect(res.status).toBe(503);
+    expect(h.applyEvent).not.toHaveBeenCalled();
+    expect(JSON.stringify(res.body)).not.toContain('exploded');
+  });
+
+  it('an engagement that cannot be RESOLVED posts nothing', async () => {
+    // We cannot name what to purge, so we cannot claim it is gone.
+    const h = build({ withPurge: true, engagementState: null });
+    const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: 'candidate.opt_out' });
+
+    expect(res.status).toBe(503);
+    expect(h.applyEvent).not.toHaveBeenCalled();
+  });
+
+  it('NON-terminal events do not purge at all', async () => {
+    for (const event of WORKER_PHONE_EVENTS.filter((e) => !TERMINAL_REFUSALS.includes(e as never))) {
+      const h = build({ withPurge: true });
+      const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: event });
+      expect(res.status).toBe(200);
+      expect(h.purgeRecordings, `${event} triggered a purge`).not.toHaveBeenCalled();
+    }
+  });
+});
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// H-3 — never confirm a slot admission cannot dial.
+//
+// 0043's pre-disclosure edge moves `next_eligible_at` to the NEXT IST day, and
+// the ended attempt keeps TODAY's `ist_date` and its non-reconnect kind — so
+// `admit_phone_attempt` would refuse a same-day retry twice over
+// (`not_yet_eligible`, then `daily_attempt_exists`). `schedule_phone_appointment`
+// checks neither field, so it would happily book 16:00 today and this endpoint
+// would report success — and the bot would say "I've got that booked" for a
+// call nothing will ever place.
+//
+// "Call me back this afternoon" is the MOST likely deferral there is.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('a pre-disclosure deferral cannot book a SAME-DAY slot', () => {
+  // 2026-09-01T10:00:00Z is 15:30 IST on 2026-09-01.
+  const SAME_IST_DAY = '2026-09-01T10:00:00Z';
+  // 2026-09-02T05:00:00Z is 10:30 IST on 2026-09-02 — the next IST day.
+  const NEXT_IST_DAY = '2026-09-02T05:00:00Z';
+  const BEFORE = new Date('2026-09-01T04:00:00.000Z'); // 09:30 IST, window open
+
+  it('refuses a same-day slot with its own code and books NOTHING', async () => {
+    const h = build({ engagementState: 'dialing', now: BEFORE });
+    const res = await post(h, '/appointments', {
+      attempt_id: ATTEMPT,
+      starts_at: SAME_IST_DAY,
+      duration_seconds: 1800,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(false);
+    expect(res.body.status).toBe('slot_not_yet_eligible');
+    expect(h.scheduleAppointment).not.toHaveBeenCalled();
+  });
+
+  it('accepts the NEXT IST day, which admission can actually reach', async () => {
+    const h = build({ engagementState: 'dialing', now: BEFORE });
+    const res = await post(h, '/appointments', {
+      attempt_id: ATTEMPT,
+      starts_at: NEXT_IST_DAY,
+      duration_seconds: 1800,
+    });
+
+    expect(res.body.ok).toBe(true);
+    expect(h.scheduleAppointment).toHaveBeenCalledTimes(1);
+  });
+
+  it('the rule applies ONLY after a deferral — an in_call booking is unaffected', async () => {
+    // An `in_call` engagement has no deferral and no ended attempt, so a
+    // same-day slot is perfectly dialable. Over-applying the rule would break
+    // the ordinary "later today" reschedule.
+    const h = build({ engagementState: 'in_call', now: BEFORE });
+    const res = await post(h, '/appointments', {
+      attempt_id: ATTEMPT,
+      starts_at: SAME_IST_DAY,
+      duration_seconds: 1800,
+    });
+
+    expect(res.body.ok).toBe(true);
+    expect(h.scheduleAppointment).toHaveBeenCalledTimes(1);
   });
 });

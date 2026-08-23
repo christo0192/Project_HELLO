@@ -24,6 +24,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+/** The attempt this dial belongs to. Travels on the DISPATCH metadata. */
+const ATTEMPT_ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+
 // `requireLiveKitConfigured` reads a module-level `env` snapshot, so clearing
 // `process.env` after import would not move it. The seam is stubbed instead,
 // with a mutable flag so ONE test can exercise the unconfigured branch without
@@ -40,6 +43,7 @@ vi.mock('../lib/room-provisioning.js', () => ({
 const {
   provisionPhoneRoom,
   phoneRoomName,
+  buildPhoneDispatchMetadata,
   buildPhoneRoomMetadata,
   PHONE_ROOM_CHANNEL,
   PHONE_ROOM_MAX_PARTICIPANTS,
@@ -134,7 +138,7 @@ describe('P5 phone room — a phone room NEVER starts an egress', () => {
     const deps = { rooms } satisfies ProvisionDeps;
     expect(Object.keys(deps)).toEqual(['rooms']);
 
-    const result = await provisionPhoneRoom({ sessionId: SESSION, agentName: '' }, deps);
+    const result = await provisionPhoneRoom({ sessionId: SESSION, attemptId: ATTEMPT_ID, agentName: '' }, deps);
 
     expect(result.status).toBe('created');
     // Provisioning succeeded having touched exactly two room methods.
@@ -197,16 +201,51 @@ describe('P5 phone room — metadata is a closed set with no number in it', () =
     expect(Object.keys(parsed)).not.toContain('candidate_id');
   });
 
-  it('is the SAME object the dispatch receives — one payload, one place to leak', async () => {
+  it('is NOT the dispatch payload — the room cannot carry a per-ATTEMPT fact', async () => {
+    // These were the same object in an earlier draft, and that was the bug an
+    // independent review caught. Room metadata is written ONCE, when the room
+    // is created, and the room is shared by every reconnect attempt — so an
+    // attempt id there is stale the moment a reconnect dispatches. The dispatch
+    // is minted per attempt, so it is the only truthful home for one.
     const rooms = roomsFake();
     const createDispatch = dispatchFake();
     await provisionPhoneRoom(
-      { sessionId: SESSION, agentName: AGENT },
+      { sessionId: SESSION, attemptId: ATTEMPT_ID, agentName: AGENT },
       { rooms, dispatch: { createDispatch }, correlationId: 'corr-9' },
     );
-    const roomMetadata = rooms.createRoom.mock.calls[0]![0].metadata;
-    const dispatchMetadata = createDispatch.mock.calls[0]![2]?.metadata;
-    expect(dispatchMetadata).toBe(roomMetadata);
+    const roomMetadata = JSON.parse(rooms.createRoom.mock.calls[0]![0].metadata);
+    const dispatchMetadata = JSON.parse(createDispatch.mock.calls[0]![2]!.metadata!);
+
+    // The room names the session and NEVER an attempt.
+    expect(roomMetadata).not.toHaveProperty('attempt_id');
+    expect(roomMetadata.session_id).toBe(SESSION);
+
+    // The dispatch names the attempt, and is a closed three-key object.
+    expect(dispatchMetadata).toEqual({
+      session_id: SESSION,
+      attempt_id: ATTEMPT_ID,
+      channel: 'phone',
+    });
+  });
+
+  it('the dispatch payload is a CLOSED three-key object over opaque ids', () => {
+    // Note what is NOT asserted here, and why. 0042's metadata sanitizer
+    // rejects any string with 7+ consecutive digits, but that rule governs
+    // `phone_call_events.metadata` — a DIFFERENT surface, which this payload
+    // never reaches. Asserting it here would also be wrong on its own terms: a
+    // uuid segment is eight hex characters and may legitimately be all digits
+    // (`11111111-...`), so the rule would fail on valid input.
+    //
+    // What actually matters is that the key set is closed and every value is an
+    // opaque id, so there is no field through which a number could arrive.
+    const payload = JSON.parse(buildPhoneDispatchMetadata(SESSION, ATTEMPT_ID));
+    expect(Object.keys(payload).sort()).toEqual(['attempt_id', 'channel', 'session_id']);
+    for (const value of Object.values(payload)) {
+      expect(typeof value).toBe('string');
+      // `+` and space are the shape of an E.164 value; neither can appear in a
+      // uuid or in the literal channel marker.
+      expect(value as string).not.toMatch(/[+ ]/);
+    }
   });
 });
 
@@ -245,7 +284,7 @@ describe('P5 phone room — the caps differ from the browser room on purpose', (
 
   it('passes both caps through to the provider verbatim', async () => {
     const rooms = roomsFake();
-    await provisionPhoneRoom({ sessionId: SESSION, agentName: '' }, { rooms });
+    await provisionPhoneRoom({ sessionId: SESSION, attemptId: ATTEMPT_ID, agentName: '' }, { rooms });
     expect(rooms.createRoom).toHaveBeenCalledWith({
       name: ROOM,
       emptyTimeout: PHONE_ROOM_EMPTY_TIMEOUT_SEC,
@@ -268,7 +307,7 @@ describe('P5 phone room — a reconnect adopts the room rather than forking it',
     });
 
     const result = await provisionPhoneRoom(
-      { sessionId: SESSION, agentName: '' },
+      { sessionId: SESSION, attemptId: ATTEMPT_ID, agentName: '' },
       { rooms, correlationId: 'corr-2' },
     );
 
@@ -294,7 +333,7 @@ describe('P5 phone room — a reconnect adopts the room rather than forking it',
       },
     });
 
-    const result = await provisionPhoneRoom({ sessionId: SESSION, agentName: AGENT }, { rooms });
+    const result = await provisionPhoneRoom({ sessionId: SESSION, attemptId: ATTEMPT_ID, agentName: AGENT }, { rooms });
 
     expect(result).toEqual({
       status: 'provider_failed',
@@ -317,7 +356,7 @@ describe('P5 phone room — dispatch is explicit because the phone worker is NAM
     const createDispatch = dispatchFake();
 
     const result = await provisionPhoneRoom(
-      { sessionId: SESSION, agentName: '' },
+      { sessionId: SESSION, attemptId: ATTEMPT_ID, agentName: '' },
       { rooms, dispatch: { createDispatch } },
     );
 
@@ -337,20 +376,21 @@ describe('P5 phone room — dispatch is explicit because the phone worker is NAM
     const createDispatch = dispatchFake();
 
     const result = await provisionPhoneRoom(
-      { sessionId: SESSION, agentName: AGENT },
+      { sessionId: SESSION, attemptId: ATTEMPT_ID, agentName: AGENT },
       { rooms, dispatch: { createDispatch }, correlationId: 'corr-3' },
     );
 
     expect(result).toEqual({ status: 'created', roomName: ROOM, dispatched: true });
     expect(createDispatch).toHaveBeenCalledTimes(1);
+    // The DISPATCH payload, not the room payload — the attempt id lives here.
     expect(createDispatch).toHaveBeenCalledWith(ROOM, AGENT, {
-      metadata: buildPhoneRoomMetadata(SESSION, ROOM, 'corr-3'),
+      metadata: buildPhoneDispatchMetadata(SESSION, ATTEMPT_ID),
     });
   });
 
   it('a name with NO dispatch seam deployed is still `no_named_agent`', async () => {
     const rooms = roomsFake();
-    const result = await provisionPhoneRoom({ sessionId: SESSION, agentName: AGENT }, { rooms });
+    const result = await provisionPhoneRoom({ sessionId: SESSION, attemptId: ATTEMPT_ID, agentName: AGENT }, { rooms });
     expect(result.dispatched).toBe(false);
     expect(result.reason).toBe('no_named_agent');
   });
@@ -362,7 +402,7 @@ describe('P5 phone room — dispatch is explicit because the phone worker is NAM
     });
 
     const result = await provisionPhoneRoom(
-      { sessionId: SESSION, agentName: AGENT },
+      { sessionId: SESSION, attemptId: ATTEMPT_ID, agentName: AGENT },
       { rooms, dispatch: { createDispatch } },
     );
 
@@ -390,7 +430,7 @@ describe('P5 phone room — dispatch is explicit because the phone worker is NAM
     });
 
     const result = await provisionPhoneRoom(
-      { sessionId: SESSION, agentName: AGENT },
+      { sessionId: SESSION, attemptId: ATTEMPT_ID, agentName: AGENT },
       { rooms, dispatch: { createDispatch } },
     );
 
@@ -411,7 +451,7 @@ describe('P5 phone room — an unconfigured LiveKit refuses before the provider'
     const createDispatch = dispatchFake();
 
     const result = await provisionPhoneRoom(
-      { sessionId: SESSION, agentName: AGENT },
+      { sessionId: SESSION, attemptId: ATTEMPT_ID, agentName: AGENT },
       { rooms, dispatch: { createDispatch } },
     );
 

@@ -513,6 +513,8 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
           objectKey,
           role,
           manifestKey: str(entry, 'manifest_key') ?? null,
+          egressId: str(entry, 'egress_id') ?? null,
+          egressStatus: str(entry, 'egress_status') ?? null,
         });
       }
       return { status, artifacts, count: num(row, 'count') ?? artifacts.length };

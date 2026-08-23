@@ -39,6 +39,7 @@ import {
   PHONE_SYSTEM_ACTOR,
   createPhoneReadStore,
   createPhoneStores,
+  istDate,
   istWindowOpen,
   loadPhoneScreeningConfig,
   type PhoneStores,
@@ -46,6 +47,9 @@ import {
 import { supabase } from '../lib/supabase.js';
 import { phoneRoomName } from '../integrations/livekit-phone-dial/phone-room.js';
 import { startPhoneAttemptRecording } from '../integrations/livekit-phone-dial/recording.js';
+import { purgePhoneEngagementRecordings } from '../integrations/livekit-phone-dial/recording-purge.js';
+import { supabaseStorageRecordingStorage } from '../lib/retention.js';
+import { env } from '../lib/env.js';
 import {
   createPhoneEgressClient,
   createPhoneEgressOutput,
@@ -60,6 +64,16 @@ import {
  * A worker that could post them could manufacture a no-answer for a call that
  * was answered — and that charges a real candidate's anti-harassment budget.
  */
+/**
+ * The events whose 0042 transition is TERMINAL and carries a suppression. Each
+ * must have its recordings deleted and verified BEFORE it is posted.
+ */
+export const PURGE_BEFORE_EVENTS: ReadonlySet<string> = new Set([
+  'disclosure.refused',
+  'candidate.opt_out',
+  'candidate.wrong_number',
+]);
+
 export const WORKER_PHONE_EVENTS = [
   'classify.human',
   'classify.machine',
@@ -90,8 +104,16 @@ const workerEventSchema = z
  * refused rather than coerced: "18:30" means two different instants depending
  * on who is reading it, and the whole calendar is pinned to IST precisely so
  * that ambiguity never enters.
+ *
+ * Seconds are OPTIONAL and fractional seconds run to six digits, matching the
+ * worker's own `_ISO_UTC_RE` exactly. The two diverged in an earlier draft, and
+ * the divergence was not benign: a legitimate proposal in a shape the worker
+ * considered valid arrived here as a flat `400 invalid_request`, which the
+ * worker reports as a malformed-response error rather than as a refusal it can
+ * SPEAK. The candidate would have heard a generic failure for a perfectly good
+ * time. Neither shape is ambiguous — both end in `Z`.
  */
-const UTC_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
+const UTC_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?Z$/;
 
 const workerScheduleSchema = z
   .object({
@@ -128,6 +150,15 @@ export interface PhoneWorkerRouterDeps {
    * nobody; recording more than promised is the failure this phase exists to
    * prevent).
    */
+  /**
+   * Deletes and verifies every recording artifact of the engagement, and
+   * reports whether the terminal event may now be posted. Injected so a test
+   * can prove the ORDER; production wires the real purge.
+   */
+  readonly purgeRecordings?: (input: {
+    engagementId: string;
+    now: Date;
+  }) => Promise<{ status: string; safeToAcknowledge: boolean }>;
   readonly startRecording?: (input: {
     engagementId: string;
     attemptId: string;
@@ -181,6 +212,25 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       if (!parsed.success) {
         return res.status(400).json({ ok: false, error: 'invalid_request' });
       }
+      // ── B-3: PURGE BEFORE ACKNOWLEDGING A REFUSAL ───────────────────
+      // `disclosure.refused`, `candidate.opt_out` and `candidate.wrong_number`
+      // are TERMINAL in 0042, and the terminal transition writes the
+      // suppression in the SAME transaction. Posting one of them before the
+      // audio is gone commits "this line is suppressed and this engagement is
+      // over" on top of a recording still sitting in the bucket — and it is
+      // invisible afterwards, because the engagement reads as correctly opted
+      // out.
+      //
+      // So the purge runs FIRST, and the event is posted only when the purge
+      // says it is safe to acknowledge. A purge that could not verify deletion
+      // leaves the request UNACKNOWLEDGED and retryable; nothing is posted.
+      if (PURGE_BEFORE_EVENTS.has(parsed.data.event_type) && deps.purgeRecordings !== undefined) {
+        const purged = await purgeBeforeTerminal(parsed.data.attempt_id, deps, now());
+        if (!purged) {
+          return res.status(503).json({ ok: false, error: 'phone_purge_incomplete' });
+        }
+      }
+
       const result = await stores().applyEvent({
         // `internal` is the correct source, and it mints a deterministic
         // synthetic provider id inside 0042, so a worker retry converges on
@@ -212,11 +262,24 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
         await startRecordingForAttempt(parsed.data.attempt_id, deps, now());
       }
 
-      // Every 0042 verdict is a legitimate answer, including `ignored`. The
-      // worker needs to know WHICH, because `stale_epoch` and `terminal` mean
-      // "this conversation is over, stop talking" while `applied` does not.
+      // ── `ok` MEANS APPLIED. `ignored` IS NOT `ok`. ──────────────────
+      // The worker branches its SAFETY decisions on this field: it treats a
+      // successful `disclosure.delivered` as permission to assess and to
+      // record. `ignored` covers `terminal` — which is exactly what an HR
+      // `emergency.stop` or `hr.cancelled` produces — plus `stale_epoch` and
+      // `unknown_attempt`. Reporting any of those as `ok` told the worker that
+      // consent had been recorded when the state machine had just declared the
+      // conversation over, and the agent would have kept the candidate on the
+      // line and run the whole screening.
+      //
+      // `duplicate` re-posts of an already-applied event return `applied`, so
+      // idempotency is preserved by this rule rather than broken by it.
+      //
+      // The verdict itself is still forwarded in `status`/`ignored_reason`, so
+      // a caller that legitimately wants to distinguish "recorded but not
+      // applied" from "never reached the ledger" still can.
       return res.json({
-        ok: result.status === 'applied' || result.status === 'ignored',
+        ok: result.status === 'applied',
         status: result.status,
         ignored_reason: result.ignoredReason ?? null,
         duplicate: result.duplicate ?? false,
@@ -287,6 +350,22 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
           return res.json({ ok: false, status: 'attempt_in_flight' });
         }
         engagementState = 'eligible';
+        // ── AND THE SLOT MUST BE ONE ADMISSION CAN ACTUALLY DIAL ──────
+        // 0043's pre-disclosure edge moves `next_eligible_at` to the next IST
+        // day, and the ended attempt keeps TODAY's `ist_date` and its
+        // non-reconnect kind — so `admit_phone_attempt` would refuse a
+        // same-day retry twice over (`not_yet_eligible`, then
+        // `daily_attempt_exists`). `schedule_phone_appointment` checks neither
+        // field, so it would happily book 16:00 today and the endpoint would
+        // report success.
+        //
+        // That is the exact failure this route exists to prevent: the bot
+        // would say "I've got that booked" for a call nothing will ever place.
+        // A candidate saying "call me back this afternoon" is the MOST likely
+        // deferral there is, so this is not an edge case.
+        if (istDate(startsAt) <= istDate(at)) {
+          return res.json({ ok: false, status: 'slot_not_yet_eligible' });
+        }
       }
 
       const endsAt = new Date(startsAt.getTime() + parsed.data.duration_seconds * 1000);
@@ -321,6 +400,33 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
   });
 
   return router;
+}
+
+/**
+ * Delete and verify this attempt's engagement recordings, and answer whether
+ * the terminal event may be posted.
+ *
+ * FAILS CLOSED in every ambiguous case. An engagement we cannot resolve, a
+ * purge that throws, and a purge that cannot verify deletion all answer
+ * `false` — because the only alternative is committing a terminal state and a
+ * suppression over audio we did not prove gone.
+ */
+async function purgeBeforeTerminal(
+  attemptId: string,
+  deps: PhoneWorkerRouterDeps,
+  now: Date,
+): Promise<boolean> {
+  try {
+    const resolved = deps.resolveEngagement ? await deps.resolveEngagement(attemptId) : null;
+    if (resolved === null) return false;
+    const result = await deps.purgeRecordings?.({
+      engagementId: resolved.engagementId,
+      now,
+    });
+    return result?.safeToAcknowledge === true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -381,6 +487,16 @@ export const phoneWorkerRouter = createPhoneWorkerRouter({
       version: context.engagementVersion,
       sessionId: context.sessionId ?? undefined,
     };
+  },
+  async purgeRecordings(input) {
+    return purgePhoneEngagementRecordings(
+      { engagementId: input.engagementId, now: input.now },
+      {
+        stores: createPhoneStores(supabase as never),
+        storage: supabaseStorageRecordingStorage(env.recordingsBucket),
+        egress: phoneEgressConfigured() ? await createPhoneEgressClient() : undefined,
+      },
+    );
   },
   startRecording: phoneEgressConfigured()
     ? async (input): Promise<{ status: string; egressStarted: boolean }> =>

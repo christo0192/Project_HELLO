@@ -18,6 +18,7 @@ removed, the corresponding test must fail.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import types
 import unittest
@@ -124,9 +125,23 @@ def _ensure_plugin_classes() -> None:
 _ensure_plugin_classes()
 
 
+# The room is keyed by SESSION and the attempt id arrives on the DISPATCH
+# metadata. They are DIFFERENT uuids here on purpose: the previous fixture built
+# the room name out of the attempt id, so the suite asserted the worker's own
+# (wrong) convention against itself and could never have caught the mismatch.
+_SESSION_ID = "9c4a1e75-2b83-41d7-8f60-1ea55d3c9b02"
 _ATTEMPT_ID = "3f1c9d40-6f5a-4d2b-9a1e-77c0e2b1a5d3"
-_PHONE_ROOM = f"phone-{_ATTEMPT_ID}"
+_PHONE_ROOM = f"phone-{_SESSION_ID}"
 _BROWSER_ROOM = "screening-5b2a34cb-a912-4c68-a2c2-79ccdc1dcdd1"
+
+
+def _dispatch_metadata(
+    *, session_id=_SESSION_ID, attempt_id=_ATTEMPT_ID, channel="phone"
+) -> str:
+    """The exact blob `buildPhoneDispatchMetadata` mints, as JSON text."""
+    return json.dumps(
+        {"session_id": session_id, "attempt_id": attempt_id, "channel": channel}
+    )
 # Never a real number. Used only to prove it does not appear in an output.
 _NUMBER_LIKE = "+919812345670"
 
@@ -142,8 +157,8 @@ class FakeEventClient:
         self._outcomes = outcomes or {}
         self._booking = booking
 
-    async def post_event(self, attempt_id, event_type, *, epoch=None, metadata=None):
-        self.calls.append((attempt_id, event_type, {"epoch": epoch, "metadata": metadata}))
+    async def post_event(self, attempt_id, event_type, *, epoch=None):
+        self.calls.append((attempt_id, event_type, {"epoch": epoch}))
         outcome = self._outcomes.get(event_type)
         if outcome is not None:
             return outcome
@@ -163,7 +178,9 @@ class FakeEventClient:
 class FakeCtx:
     """JobContext stand-in with an inspectable room and connect() call."""
 
-    def __init__(self, room_name: str, metadata=None, participants=None) -> None:
+    def __init__(
+        self, room_name: str, metadata=None, participants=None, dispatch=None
+    ) -> None:
         self.room = types.SimpleNamespace(
             name=room_name,
             metadata=metadata,
@@ -171,7 +188,9 @@ class FakeCtx:
                 p.identity: p for p in (participants or [])
             },
         )
-        self.job = types.SimpleNamespace(room=None, metadata=None)
+        # `dispatch` is the per-ATTEMPT job metadata LiveKit delivers as
+        # `ctx.job.metadata`. It is the only place an attempt id exists.
+        self.job = types.SimpleNamespace(room=None, metadata=dispatch)
         self.connected = 0
 
     async def connect(self):
@@ -210,13 +229,17 @@ def _run(coro):
 # ── Room classification ───────────────────────────────────────────────
 
 class TestRoomClassification(unittest.TestCase):
-    def test_phone_room_name_is_recognised(self):
+    def test_phone_room_name_is_recognised_and_carries_the_SESSION_id(self):
         self.assertTrue(phone.is_phone_room(_PHONE_ROOM))
-        self.assertEqual(phone.attempt_id_from_room_name(_PHONE_ROOM), _ATTEMPT_ID)
+        self.assertEqual(phone.session_id_from_room_name(_PHONE_ROOM), _SESSION_ID)
+
+    def test_no_attempt_id_can_be_read_out_of_a_room_name(self):
+        # The room is session-keyed, so there is no such parser to reach for.
+        self.assertFalse(hasattr(phone, "attempt_id_from_room_name"))
 
     def test_browser_room_is_not_a_phone_room(self):
         self.assertFalse(phone.is_phone_room(_BROWSER_ROOM))
-        self.assertIsNone(phone.attempt_id_from_room_name(_BROWSER_ROOM))
+        self.assertIsNone(phone.session_id_from_room_name(_BROWSER_ROOM))
 
     def test_metadata_channel_marks_a_phone_room(self):
         self.assertTrue(phone.is_phone_room("some-other-room", '{"channel": "phone"}'))
@@ -238,6 +261,46 @@ class TestRoomClassification(unittest.TestCase):
             attributes={"sip.phoneNumber": _NUMBER_LIKE},
         )
         self.assertEqual(phone.participant_identity(participant), "sip_abc")
+
+
+# ── Dispatch metadata: the ONLY source of an attempt id ───────────────
+
+class TestDispatchMetadata(unittest.TestCase):
+    def test_well_formed_dispatch_yields_the_attempt_id(self):
+        ctx = FakeCtx(_PHONE_ROOM, dispatch=_dispatch_metadata())
+        self.assertEqual(phone.attempt_id_from_dispatch_metadata(ctx), _ATTEMPT_ID)
+        # And it is NOT the session id the room name carries.
+        self.assertNotEqual(_ATTEMPT_ID, phone.session_id_from_room_name(_PHONE_ROOM))
+
+    def test_bytes_payload_is_accepted(self):
+        ctx = FakeCtx(_PHONE_ROOM, dispatch=_dispatch_metadata().encode("utf-8"))
+        self.assertEqual(phone.attempt_id_from_dispatch_metadata(ctx), _ATTEMPT_ID)
+
+    def test_missing_malformed_wrong_channel_or_non_uuid_resolves_nothing(self):
+        cases = {
+            "absent": None,
+            "empty": "",
+            "not json": "definitely not json",
+            "json array": "[1, 2, 3]",
+            "json scalar": '"phone"',
+            "no attempt key": json.dumps({"session_id": _SESSION_ID, "channel": "phone"}),
+            "null attempt": _dispatch_metadata(attempt_id=None),
+            "non uuid attempt": _dispatch_metadata(attempt_id="not-a-uuid"),
+            "truncated uuid": _dispatch_metadata(attempt_id=_ATTEMPT_ID[:-1]),
+            "numeric attempt": _dispatch_metadata(attempt_id=12345678),
+            "wrong channel": _dispatch_metadata(channel="browser"),
+            "missing channel": json.dumps(
+                {"session_id": _SESSION_ID, "attempt_id": _ATTEMPT_ID}
+            ),
+            "non string channel": _dispatch_metadata(channel=7),
+        }
+        for label, dispatch in cases.items():
+            with self.subTest(label=label):
+                ctx = FakeCtx(_PHONE_ROOM, dispatch=dispatch)
+                self.assertIsNone(phone.attempt_id_from_dispatch_metadata(ctx))
+
+    def test_no_job_at_all_is_survivable(self):
+        self.assertIsNone(phone.attempt_id_from_dispatch_metadata(object()))
 
 
 # ── Worker isolation ──────────────────────────────────────────────────
@@ -354,12 +417,53 @@ class TestEntrypointIsolation(unittest.TestCase):
         run_phone.assert_not_awaited()
         self.assertEqual(persistence_spy.mock_calls, [])
 
-    def test_phone_room_without_an_attempt_id_does_nothing(self):
-        ctx = FakeCtx("interview-room-7", metadata='{"channel":"phone"}')
+    def test_attempt_id_comes_off_the_dispatch_not_the_room_name(self):
+        ctx = FakeCtx(_PHONE_ROOM, dispatch=_dispatch_metadata())
         with patch.object(agent_mod, "_phone_agent_name", return_value="p"), \
              patch.object(agent_mod, "_run_phone_session", new_callable=AsyncMock) as run:
-            _run(agent_mod._run_phone_entrypoint(ctx, "interview-room-7"))
-        run.assert_not_awaited()
+            _run(agent_mod._run_phone_entrypoint(ctx, _PHONE_ROOM))
+        run.assert_awaited_once()
+        self.assertEqual(run.await_args.args[2], _ATTEMPT_ID)
+        # The session id in the room name is NEVER passed as the attempt id.
+        self.assertNotEqual(run.await_args.args[2], _SESSION_ID)
+
+    def test_unresolvable_dispatch_speaks_nothing_posts_nothing_records_nothing(self):
+        """B-1: with no attempt id there is nothing safe to do — so nothing is done."""
+        cases = {
+            "absent": None,
+            "not json": "garbage",
+            "wrong channel": _dispatch_metadata(channel="browser"),
+            "non uuid attempt": _dispatch_metadata(attempt_id="attempt-1"),
+            "session id in the attempt slot is still not a dispatch": None,
+        }
+        for label, dispatch in cases.items():
+            with self.subTest(label=label):
+                ctx = FakeCtx(_PHONE_ROOM, dispatch=dispatch)
+                client = FakeEventClient()
+                with patch.object(agent_mod, "_phone_agent_name", return_value="p"), \
+                     patch.object(
+                         agent_mod, "_run_phone_session", new_callable=AsyncMock
+                     ) as run, \
+                     patch.object(
+                         agent_mod, "_phone_recording_permitted", new_callable=AsyncMock
+                     ) as recording, \
+                     patch.object(
+                         agent_mod, "AgentSession", _FakePhoneSession
+                     ):
+                    _FakePhoneSession.instances = []
+                    _run(agent_mod._run_phone_entrypoint(ctx, _PHONE_ROOM))
+                run.assert_not_awaited()          # never connected, never activated
+                recording.assert_not_awaited()    # never recorded
+                self.assertEqual(client.calls, [])  # never posted an event
+                self.assertEqual(_FakePhoneSession.instances, [])  # never spoke
+                self.assertEqual(ctx.connected, 0)
+
+    def test_a_session_keyed_room_never_yields_an_attempt_id(self):
+        """The exact B-1 defect: posting the SESSION uuid as the attempt id."""
+        ctx = FakeCtx(_PHONE_ROOM, metadata='{"channel":"phone"}')
+        resolved = phone.attempt_id_from_dispatch_metadata(ctx)
+        self.assertIsNone(resolved)
+        self.assertNotEqual(resolved, _SESSION_ID)
 
 
 # ── The gate ──────────────────────────────────────────────────────────
@@ -493,6 +597,72 @@ class TestPhoneGate(unittest.IsolatedAsyncioTestCase):
                 lowered = closing.lower()
                 self.assertNotIn("record", lowered)
                 self.assertNotIn("delete", lowered)
+
+    async def test_an_ignored_classify_human_is_not_consent(self):
+        """B-2: `ok` is not `applied`.
+
+        `ignored` covers `terminal` — what an HR `emergency.stop` or
+        `hr.cancelled` produces — plus `stale_epoch` and `unknown_attempt`.
+        Reading any of them as consent keeps the candidate on the line and runs
+        the full screening after the system declared the conversation over.
+        """
+        for reason in ("terminal", "stale_epoch", "unknown_attempt"):
+            with self.subTest(reason=reason, event="classify.human"):
+                client = FakeEventClient({
+                    "classify.human": phone.PhoneApiOutcome(
+                        True, "ignored", ignored_reason=reason
+                    )
+                })
+                result, client, recorder = await self._gate(
+                    phone.CLASSIFY_HUMAN, client=client
+                )
+                self.assertIs(result.assessment_allowed, False)
+                self.assertIs(result.recording_allowed, False)
+                self.assertEqual(recorder.recording_calls, 0)
+                # The consent record is never even attempted.
+                self.assertEqual(client.event_types, ["classify.human"])
+                self.assertEqual(result.events, [])
+
+    async def test_an_ignored_disclosure_grants_nothing(self):
+        for reason in ("terminal", "stale_epoch", "unknown_attempt"):
+            with self.subTest(reason=reason, event="disclosure.delivered"):
+                client = FakeEventClient({
+                    "disclosure.delivered": phone.PhoneApiOutcome(
+                        True, "ignored", ignored_reason=reason
+                    )
+                })
+                result, client, recorder = await self._gate(
+                    phone.CLASSIFY_HUMAN, client=client
+                )
+                self.assertIs(result.assessment_allowed, False)
+                self.assertIs(result.recording_allowed, False)
+                self.assertEqual(recorder.recording_calls, 0)
+                self.assertNotIn("disclosure.delivered", result.events)
+
+    async def test_ok_with_any_non_applied_status_grants_nothing(self):
+        for status in (None, "ignored", "queued", "accepted", "APPLIED"):
+            with self.subTest(status=status):
+                client = FakeEventClient({
+                    "disclosure.delivered": phone.PhoneApiOutcome(True, status)
+                })
+                result, _, recorder = await self._gate(
+                    phone.CLASSIFY_HUMAN, client=client
+                )
+                self.assertIs(result.assessment_allowed, False)
+                self.assertIs(result.recording_allowed, False)
+                self.assertEqual(recorder.recording_calls, 0)
+
+    async def test_a_duplicate_applied_event_still_consents(self):
+        client = FakeEventClient({
+            "classify.human": phone.PhoneApiOutcome(True, "applied", duplicate=True),
+            "disclosure.delivered": phone.PhoneApiOutcome(
+                True, "applied", duplicate=True
+            ),
+        })
+        result, _, recorder = await self._gate(phone.CLASSIFY_HUMAN, client=client)
+        self.assertTrue(result.assessment_allowed)
+        self.assertTrue(result.recording_allowed)
+        self.assertEqual(recorder.recording_calls, 1)
 
     async def test_every_gate_event_is_on_the_strict_allowlist(self):
         for decision in phone.PHONE_CLASSIFICATIONS:
@@ -634,32 +804,32 @@ class TestPhoneEventClient(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.error_category, "event_not_allowed")
         self.assertEqual(transport.requests, [])
 
-    async def test_number_like_metadata_is_refused_before_the_wire(self):
-        transport = _RecordingTransport()
-        cases = [
-            {"dialed": _NUMBER_LIKE},
-            {"digits": 9812345670},
-            {"nested": {"a": 1}},
-            {"note": "call 9812345670 back"},
-        ]
-        for metadata in cases:
-            with self.subTest(metadata=metadata):
-                with patch.dict(phone.os.environ, {"WORKER_CONTEXT_SECRET": _GOOD_SECRET}):
-                    outcome = await self._client(transport).post_event(
-                        _ATTEMPT_ID, "classify.human", metadata=metadata
-                    )
-                self.assertFalse(outcome.ok)
-                self.assertEqual(outcome.error_category, "metadata_rejected")
-                self.assertEqual(transport.requests, [])
+    async def test_no_metadata_field_is_ever_sent(self):
+        """M-5: the server schema is `.strict()`; a `metadata` key is a flat 400.
 
-    async def test_benign_metadata_is_allowed_through(self):
+        The parameter is gone, so the body has exactly three keys on every
+        allowlisted event and there is no unreachable guard pretending to
+        protect one.
+        """
+        import inspect
+
+        signature = inspect.signature(phone.PhoneEventClient.post_event)
+        self.assertNotIn("metadata", signature.parameters)
+        self.assertFalse(hasattr(phone, "_rejects_number_like"))
+
         transport = _RecordingTransport()
         with patch.dict(phone.os.environ, {"WORKER_CONTEXT_SECRET": _GOOD_SECRET}):
-            outcome = await self._client(transport).post_event(
-                _ATTEMPT_ID, "classify.machine", metadata={"reason": "voicemail"}
+            for event_type in sorted(phone.PHONE_WORKER_EVENTS):
+                await self._client(transport).post_event(_ATTEMPT_ID, event_type)
+        self.assertEqual(len(transport.requests), len(phone.PHONE_WORKER_EVENTS))
+        for request in transport.requests:
+            self.assertEqual(
+                set(request["json"]), {"attempt_id", "event_type", "epoch"}
             )
-        self.assertTrue(outcome.ok)
-        self.assertEqual(transport.requests[0]["json"]["metadata"], {"reason": "voicemail"})
+
+    async def test_worker_allowlist_agrees_with_the_server(self):
+        """L-4: the deferral event exists on both halves."""
+        self.assertIn("candidate.deferred_pre_disclosure", phone.PHONE_WORKER_EVENTS)
 
     async def test_non_2xx_and_malformed_bodies_fail_closed(self):
         cases = [
@@ -678,16 +848,31 @@ class TestPhoneEventClient(unittest.IsolatedAsyncioTestCase):
                     )
                 self.assertFalse(outcome.ok)
 
-    async def test_duplicate_and_ignored_are_surfaced(self):
+    async def test_duplicate_of_an_applied_event_is_still_applied(self):
         transport = _RecordingTransport(
-            200, {"ok": True, "status": "ignored", "ignored_reason": "terminal", "duplicate": True}
+            200, {"ok": True, "status": "applied", "duplicate": True}
         )
         with patch.dict(phone.os.environ, {"WORKER_CONTEXT_SECRET": _GOOD_SECRET}):
             outcome = await self._client(transport).post_event(_ATTEMPT_ID, "classify.human")
         self.assertTrue(outcome.ok)
-        self.assertEqual(outcome.status, "ignored")
+        self.assertEqual(outcome.status, "applied")
         self.assertTrue(outcome.duplicate)
-        self.assertEqual(outcome.ignored_reason, "terminal")
+        # Idempotency is preserved by the applied rule, not broken by it.
+        self.assertTrue(phone.event_applied(outcome))
+
+    async def test_an_ignored_verdict_from_the_server_fails_closed(self):
+        """The server returns ok:false for every `ignored` verdict."""
+        for reason in ("terminal", "stale_epoch", "unknown_attempt"):
+            with self.subTest(reason=reason):
+                transport = _RecordingTransport(
+                    200, {"ok": False, "status": "ignored", "ignored_reason": reason}
+                )
+                with patch.dict(phone.os.environ, {"WORKER_CONTEXT_SECRET": _GOOD_SECRET}):
+                    outcome = await self._client(transport).post_event(
+                        _ATTEMPT_ID, "classify.human"
+                    )
+                self.assertFalse(outcome.ok)
+                self.assertFalse(phone.event_applied(outcome))
 
     async def test_appointment_body_shape(self):
         transport = _RecordingTransport(200, {"ok": True, "status": "ok"})

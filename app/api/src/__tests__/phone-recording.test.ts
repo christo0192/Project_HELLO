@@ -47,6 +47,8 @@ function authoritativeArtifact(): PhoneRecordingArtifact {
     role: 'authoritative',
     objectKey: phoneAttemptRecordingObjectKey(OTHER_ATTEMPT),
     manifestKey: phoneAttemptRecordingManifestKey(OTHER_ATTEMPT),
+    egressId: null,
+    egressStatus: null,
   };
 }
 

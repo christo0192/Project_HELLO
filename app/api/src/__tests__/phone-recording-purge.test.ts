@@ -51,6 +51,10 @@ function authoritative(): PhoneRecordingArtifact {
     role: 'authoritative',
     objectKey: AUTH_OBJECT,
     manifestKey: AUTH_MANIFEST,
+    // Already stopped. The `active` case has its own suite below — a purge
+    // must never delete around an egress that is still writing.
+    egressId: 'EG_first_attempt',
+    egressStatus: 'complete',
   };
 }
 
@@ -61,6 +65,8 @@ function supplementary(): PhoneRecordingArtifact {
     role: 'supplementary',
     objectKey: SUPP_OBJECT,
     manifestKey: SUPP_MANIFEST,
+    egressId: 'EG_reconnect_attempt',
+    egressStatus: 'complete',
   };
 }
 
@@ -76,6 +82,7 @@ interface Harness {
   list: ReturnType<typeof vi.fn>;
   clear: ReturnType<typeof vi.fn>;
   applyEvent: ReturnType<typeof vi.fn>;
+  finalize: ReturnType<typeof vi.fn>;
   remove: ReturnType<typeof vi.fn>;
   exists?: ReturnType<typeof vi.fn>;
   removed(): string[];
@@ -108,6 +115,10 @@ function harness(opts: {
     order.push('applyEvent');
     return { status: 'applied' } as never;
   });
+  const finalize = vi.fn(async () => {
+    order.push('finalize');
+    return { status: 'ok' } as never;
+  });
 
   const unreachable = async (): Promise<never> => {
     throw new Error('phone_store_method_not_expected');
@@ -126,7 +137,9 @@ function harness(opts: {
     clearHalt: unreachable,
     backlog: unreachable,
     attachAttemptRecording: unreachable,
-    finalizeAttemptRecording: unreachable,
+    // H-1: the purge STOPS a running egress and records the stop, so a retry
+    // does not re-enter that branch forever.
+    finalizeAttemptRecording: finalize,
   } as unknown as PhoneStores;
 
   const remove = vi.fn(async (key: string) => {
@@ -149,6 +162,7 @@ function harness(opts: {
     list,
     clear,
     applyEvent,
+    finalize,
     remove,
     exists: opts.noExists ? undefined : exists,
     removed: () => removedKeys,
@@ -459,4 +473,102 @@ describe('P5 purge — this module writes NO suppression, on any path', () => {
       expect(order).not.toContain('applyEvent');
     });
   }
+});
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// H-1 — an egress that is STILL WRITING must be stopped before anything is
+// deleted.
+//
+// This is the case that actually happens: the refusal that triggers a purge is
+// an opt-out DURING the call, so the egress is running. LiveKit uploads the
+// file and its `.json` manifest when the egress STOPS, not continuously — so
+// deleting first deletes keys that do not exist yet, probes them, finds them
+// absent, and reports `purged` moments before the recording lands. The absence
+// probe cannot save us: it is telling the truth about a file not yet written.
+// ═══════════════════════════════════════════════════════════════════════
+
+function activeArtifact(): PhoneRecordingArtifact {
+  return { ...authoritative(), egressId: 'EG_live_one', egressStatus: 'active' };
+}
+
+/** A list answer carrying exactly these artifacts. */
+function listing(artifacts: readonly PhoneRecordingArtifact[]): unknown {
+  return { status: 'ok', artifacts };
+}
+
+describe('an ACTIVE egress is stopped, and the purge refuses that pass', () => {
+  it('refuses with egress_still_running and deletes NOTHING', async () => {
+    const h = harness({ list: listing([activeArtifact()]) });
+    const stopEgress = vi.fn(async () => undefined);
+    const res = await purgePhoneEngagementRecordings(
+      { engagementId: ENGAGEMENT, now: NOW },
+      { ...h.deps, egress: { stopEgress } },
+    );
+
+    expect(res.status).toBe('egress_still_running');
+    expect(res.safeToAcknowledge).toBe(false);
+    expect(res.deleted).toBe(0);
+    expect(h.remove).not.toHaveBeenCalled();
+    expect(h.clear).not.toHaveBeenCalled();
+    // It DID stop the egress, so the retry can make progress.
+    expect(stopEgress).toHaveBeenCalledWith('EG_live_one');
+  });
+
+  it('records the stop, so a retry does not re-enter this branch forever', async () => {
+    const h = harness({ list: listing([activeArtifact()]) });
+    const stopEgress = vi.fn(async () => undefined);
+    await purgePhoneEngagementRecordings(
+      { engagementId: ENGAGEMENT, now: NOW },
+      { ...h.deps, egress: { stopEgress } },
+    );
+    expect(h.finalize).toHaveBeenCalledWith(
+      expect.objectContaining({ egressStatus: 'complete' }),
+    );
+  });
+
+  it('refuses when there is NO egress seam to stop it with', async () => {
+    const h = harness({ list: listing([activeArtifact()]) });
+    const res = await purgePhoneEngagementRecordings(
+      { engagementId: ENGAGEMENT, now: NOW },
+      h.deps,
+    );
+    expect(res.status).toBe('egress_still_running');
+    expect(res.safeToAcknowledge).toBe(false);
+    expect(h.remove).not.toHaveBeenCalled();
+  });
+
+  it('refuses when an ACTIVE artifact has no egress id to stop', async () => {
+    // Nothing can stop it, so nothing may claim the audio is gone.
+    const h = harness({ list: listing([{ ...activeArtifact(), egressId: null }]) });
+    const res = await purgePhoneEngagementRecordings(
+      { engagementId: ENGAGEMENT, now: NOW },
+      { ...h.deps, egress: { stopEgress: vi.fn(async () => undefined) } },
+    );
+    expect(res.status).toBe('egress_still_running');
+    expect(h.remove).not.toHaveBeenCalled();
+  });
+
+  it('refuses when the stop THROWS', async () => {
+    const h = harness({ list: listing([activeArtifact()]) });
+    const res = await purgePhoneEngagementRecordings(
+      { engagementId: ENGAGEMENT, now: NOW },
+      { ...h.deps, egress: { stopEgress: vi.fn(async () => { throw new Error('nope'); }) } },
+    );
+    expect(res.status).toBe('egress_still_running');
+    expect(h.remove).not.toHaveBeenCalled();
+  });
+
+  it('CONTROL — a COMPLETE egress purges normally through the same harness', async () => {
+    // Without this the suite above could pass because the harness never
+    // deletes anything at all.
+    const h = harness({ list: listing([authoritative()]) });
+    const res = await purgePhoneEngagementRecordings(
+      { engagementId: ENGAGEMENT, now: NOW },
+      { ...h.deps, egress: { stopEgress: vi.fn(async () => undefined) } },
+    );
+    expect(res.status).toBe('purged');
+    expect(res.safeToAcknowledge).toBe(true);
+    expect(h.remove).toHaveBeenCalled();
+  });
 });

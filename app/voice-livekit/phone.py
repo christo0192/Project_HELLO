@@ -7,11 +7,16 @@ production path — keeps exactly the shape it had before P4.
 
 Three things live here:
 
-1. **Room classification.** A phone room is ``phone-<attemptId>`` or carries
-   ``{"channel": "phone"}`` in its room metadata. The default (unnamed) worker
-   auto-dispatches into *every* room in the project, so it must be able to
-   recognise a phone room and refuse it before it connects a session, speaks,
-   activates, or writes anything.
+1. **Room classification, and where the attempt id actually comes from.** A
+   phone room is ``phone-<sessionId>`` or carries ``{"channel": "phone"}`` in
+   its room metadata. The room is keyed by SESSION, deliberately: one session
+   spans every reconnect attempt and they must share a transcript, so the room
+   name CANNOT carry an attempt id. The attempt id arrives instead on the
+   per-attempt DISPATCH metadata (``ctx.job.metadata``), a JSON object of
+   exactly ``{"session_id", "attempt_id", "channel"}``. The default (unnamed)
+   worker auto-dispatches into *every* room in the project, so it must be able
+   to recognise a phone room and refuse it before it connects a session,
+   speaks, activates, or writes anything.
 
 2. **The human / disclosure / recording gate.** A SIP leg being up says nothing
    about who — or what — answered. ``participant_joined`` is not a human, so the
@@ -58,13 +63,17 @@ _COMPANY = os.getenv("COMPANY_NAME", "Interview Kickstart")
 
 
 # ── Room classification ───────────────────────────────────────────────
-# The dialer provisions `phone-<attemptId>` (P4 item 1). The metadata channel
-# marker is the second, independent signal: a room whose name was produced by
-# some other writer still declares its channel, and either signal alone is
-# enough to keep the browser worker out.
+# The dialer provisions `phone-<sessionId>` (P4 item 1). The room is keyed by
+# SESSION, not by attempt: one session spans every reconnect attempt and they
+# share a transcript, so no attempt id is recoverable from the room name and
+# none may ever be read out of it. The metadata channel marker is the second,
+# independent signal: a room whose name was produced by some other writer still
+# declares its channel, and either signal alone is enough to keep the browser
+# worker out.
 
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
-PHONE_ROOM_RE = re.compile(rf"^phone-({_UUID})$", re.IGNORECASE)
+PHONE_ROOM_RE = re.compile(rf"^phone-(?P<session_id>{_UUID})$", re.IGNORECASE)
+_UUID_RE = re.compile(rf"^{_UUID}$", re.IGNORECASE)
 PHONE_CHANNEL = "phone"
 
 # A 7+ digit run is the shape of a dialable number. 0042 rejects metadata that
@@ -72,10 +81,44 @@ PHONE_CHANNEL = "phone"
 _DIGIT_RUN_RE = re.compile(r"\d{7,}")
 
 
-def attempt_id_from_room_name(room_name: str) -> str | None:
-    """Return the attempt id encoded in a phone room name, or None."""
+def session_id_from_room_name(room_name: str) -> str | None:
+    """Return the SESSION id encoded in a phone room name, or None.
+
+    Named for what it is. There was previously an ``attempt_id_from_room_name``
+    here reading the same capture group under the wrong name, and every phone
+    event the worker posted therefore carried a session uuid in the
+    ``attempt_id`` field — which the API resolved to no attempt at all. The two
+    ids can never be confused again because only one of them has a parser here.
+    """
     match = PHONE_ROOM_RE.match(str(room_name or ""))
-    return match.group(1) if match else None
+    return match.group("session_id") if match else None
+
+
+def dispatch_metadata_of(ctx: Any) -> Any:
+    """Read the per-JOB dispatch metadata blob off a JobContext, defensively."""
+    job = getattr(ctx, "job", None)
+    return getattr(job, "metadata", None)
+
+
+def attempt_id_from_dispatch_metadata(ctx: Any) -> str | None:
+    """Return the attempt id from the job's dispatch metadata, or None.
+
+    A dispatch is minted per ATTEMPT, so this is the only per-attempt channel
+    the worker has; the session-keyed room name is not one. The blob is built
+    by ``buildPhoneDispatchMetadata`` on the API side and carries exactly
+    ``{"session_id", "attempt_id", "channel"}``.
+
+    Fails closed: an absent, unparseable, wrong-channel or non-uuid value
+    returns None, and the caller must then do nothing at all.
+    """
+    payload = _json_object(dispatch_metadata_of(ctx))
+    channel = payload.get("channel")
+    if not isinstance(channel, str) or channel.strip().lower() != PHONE_CHANNEL:
+        return None
+    attempt_id = payload.get("attempt_id")
+    if not isinstance(attempt_id, str) or not _UUID_RE.match(attempt_id.strip()):
+        return None
+    return attempt_id.strip()
 
 
 def _json_object(raw: Any) -> dict[str, Any]:
@@ -100,7 +143,7 @@ def is_phone_room(room_name: Any, room_metadata: Any = None) -> bool:
     an explicit ``channel`` marker in the room metadata. Metadata is parsed but
     never logged and never used for anything else.
     """
-    if attempt_id_from_room_name(str(room_name or "")) is not None:
+    if session_id_from_room_name(str(room_name or "")) is not None:
         return True
     channel = _json_object(room_metadata).get("channel")
     return isinstance(channel, str) and channel.strip().lower() == PHONE_CHANNEL
@@ -173,6 +216,7 @@ PHONE_WORKER_EVENTS: frozenset[str] = frozenset([
     "disclosure.refused",
     "candidate.opt_out",
     "candidate.wrong_number",
+    "candidate.deferred_pre_disclosure",
     "sip.participant_left",
     "assessment.completed",
     "assessment.aborted",
@@ -182,7 +226,6 @@ _ERR_CONFIGURATION = "configuration"
 _ERR_TRANSPORT = "transport"
 _ERR_BUSINESS = "business_error"
 _ERR_EVENT_NOT_ALLOWED = "event_not_allowed"
-_ERR_METADATA_REJECTED = "metadata_rejected"
 _ERR_MALFORMED = "malformed_response"
 
 
@@ -245,29 +288,6 @@ class PhoneApiOutcome:
 
     def __repr__(self) -> str:  # pragma: no cover - diagnostics only
         return f"PhoneApiOutcome(ok={self.ok}, status={self.status!r})"
-
-
-def _rejects_number_like(metadata: Any) -> bool:
-    """True when any metadata value looks like it carries a dialable number."""
-    if not isinstance(metadata, dict):
-        return metadata is not None
-    for key, value in metadata.items():
-        if not isinstance(key, str):
-            return True
-        if isinstance(value, bool) or value is None:
-            continue
-        if isinstance(value, (int, float)):
-            if _DIGIT_RUN_RE.search(str(value)):
-                return True
-            continue
-        if isinstance(value, str):
-            if _DIGIT_RUN_RE.search(value):
-                return True
-            continue
-        # Nested structures are refused outright: the body is a FLAT map, and a
-        # nested blob is exactly where an unreviewed field hides.
-        return True
-    return False
 
 
 class PhoneEventClient:
@@ -372,31 +392,27 @@ class PhoneEventClient:
         event_type: str,
         *,
         epoch: int | None = None,
-        metadata: dict[str, Any] | None = None,
     ) -> PhoneApiOutcome:
-        """Post one worker event. Fails closed on anything but a confirmed 200."""
+        """Post one worker event. Fails closed on anything but a confirmed 200.
+
+        There is deliberately NO ``metadata`` parameter. The server's request
+        schema is ``.strict()`` and rejects an unknown key with a flat 400, so a
+        metadata field could only ever have produced a failed post — and the
+        number-shaped-value guard that once sat here guarded a parameter no
+        caller passed, which is a control that cannot fire.
+        """
         if event_type not in PHONE_WORKER_EVENTS:
             _log.warn(
                 "unknown_event", error_type="phone_api_failed",
                 error_category=_ERR_EVENT_NOT_ALLOWED,
             )
             return PhoneApiOutcome(False, error_category=_ERR_EVENT_NOT_ALLOWED)
-        if metadata is not None and _rejects_number_like(metadata):
-            # Refused rather than sanitised: a value we cannot explain is a value
-            # we must not transmit on a channel that carries a phone number.
-            _log.warn(
-                "unknown_event", error_type="phone_api_failed",
-                error_category=_ERR_METADATA_REJECTED,
-            )
-            return PhoneApiOutcome(False, error_category=_ERR_METADATA_REJECTED)
 
         body: dict[str, Any] = {
             "attempt_id": str(attempt_id),
             "event_type": event_type,
             "epoch": epoch,
         }
-        if metadata is not None:
-            body["metadata"] = metadata
 
         response = await self._post(EVENTS_PATH, body, "event")
         if isinstance(response, str):
@@ -503,6 +519,14 @@ _SCHEDULE_REFUSAL_TEXT: dict[str, str] = {
     "window_closed": (
         "I can only set up calls between nine in the morning and nine at night. "
         "Could you pick a time inside that?"
+    ),
+    # The engagement was released for TODAY when this call ended, so the
+    # earliest the team can call back is tomorrow. Say that plainly rather than
+    # falling back to the non-committal line: the fallback is safe (it claims
+    # no booking) but it leaves the candidate with no idea what to ask for.
+    "slot_not_yet_eligible": (
+        "I can't book another call for today, but I can from tomorrow onwards. "
+        "What time would suit you then?"
     ),
     "slot_duration_invalid": (
         "That length doesn't work for this call. I can set aside between fifteen "
@@ -644,6 +668,25 @@ _OUTCOME_CLOSING: dict[str, str] = {
 GATE_NO_PARTICIPANT = "no_participant"
 GATE_PARTICIPANT_LEFT = "participant_left"
 
+# The one status that means the API actually RECORDED the event.
+EVENT_STATUS_APPLIED = "applied"
+
+
+def event_applied(outcome: PhoneApiOutcome) -> bool:
+    """True only when the API confirmed it APPLIED the event.
+
+    ``ok`` alone is not enough, and must never be treated as enough. An
+    ``ignored`` verdict covers ``terminal`` — which is exactly what an HR
+    ``emergency.stop`` or ``hr.cancelled`` produces — as well as ``stale_epoch``
+    and ``unknown_attempt``. Reading any of those as consent keeps the candidate
+    on the line and runs the full screening after the system has already
+    declared the conversation over.
+
+    A ``duplicate`` re-post of an already-applied event comes back ``applied``,
+    so idempotency is preserved by this rule rather than broken by it.
+    """
+    return bool(outcome.ok) and outcome.status == EVENT_STATUS_APPLIED
+
 
 class PhoneGateResult:
     """The gate's verdict.
@@ -751,7 +794,7 @@ async def run_phone_gate(
         outcome = await client.post_event(
             attempt_id, event_type, epoch=epoch,
         )
-        if outcome.ok:
+        if event_applied(outcome):
             events.append(event_type)
         closing = _OUTCOME_CLOSING.get(decision)
         if closing is not None:
@@ -762,7 +805,10 @@ async def run_phone_gate(
         return PhoneGateResult(decision, events=events, spoken=spoken)
 
     human = await client.post_event(attempt_id, "classify.human", epoch=epoch)
-    if not human.ok:
+    if not event_applied(human):
+        # `ok` is not consent. An `ignored` verdict — terminal, stale_epoch,
+        # unknown_attempt — means the API recorded NOTHING, and proceeding on it
+        # would screen a candidate whose conversation the system has ended.
         _log.warn(
             "unknown_event", error_type="phone_gate_blocked",
             error_category="classify_human_failed",
@@ -773,9 +819,10 @@ async def run_phone_gate(
     disclosure = await client.post_event(
         attempt_id, "disclosure.delivered", epoch=epoch,
     )
-    if not disclosure.ok:
+    if not event_applied(disclosure):
         # Consent was given on the wire but not recorded. Proceeding would score
-        # a call whose consent the system cannot prove.
+        # a call whose consent the system cannot prove. An `ignored` verdict is
+        # exactly that case: a 200 body that recorded nothing.
         _log.warn(
             "unknown_event", error_type="phone_gate_blocked",
             error_category="disclosure_not_recorded",

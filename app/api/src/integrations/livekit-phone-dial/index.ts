@@ -50,6 +50,7 @@ export {
   PHONE_ROOM_CHANNEL,
   PHONE_ROOM_EMPTY_TIMEOUT_SEC,
   PHONE_ROOM_MAX_PARTICIPANTS,
+  buildPhoneDispatchMetadata,
   buildPhoneRoomMetadata,
   phoneRoomName,
   provisionPhoneRoom,

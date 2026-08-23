@@ -58,8 +58,15 @@ export const PHONE_DIAL_BOUNDS = {
    * observer would catch it. The maximum is kept well under the lease maximum
    * so the dial controller's "lease outlives the originate" check is
    * satisfiable rather than merely asserted.
+   *
+   * The DEFAULT is 60 s, which must stay STRICTLY GREATER than the default
+   * `PHONE_RING_TIMEOUT_SECONDS` (45 s). If the originate gives up while the
+   * carrier is still ringing, the controller writes the dial off as
+   * `originate_failed` — and the leg can still be answered afterwards, landing
+   * a real person in a room whose dial we have abandoned. `dial.ts` refuses
+   * before the SDK rather than trusting these defaults to stay ordered.
    */
-  originateTimeoutSeconds: { def: 30, min: 5, max: 90 },
+  originateTimeoutSeconds: { def: 60, min: 5, max: 90 },
   /**
    * Hard ceiling on a CONNECTED call, in seconds. Never left to the provider
    * default: an unset billable ceiling is not a default, it is an omission,

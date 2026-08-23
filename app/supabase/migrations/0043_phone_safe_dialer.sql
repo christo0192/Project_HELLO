@@ -821,9 +821,12 @@ grant execute on function screening_v2.apply_phone_event(
 -- rather than by the order of two statements in a worker that a future
 -- refactor could swap. A caller that starts an egress at originate, at
 -- ring, at join, while unclassified, on a machine, or after a refusal
--- cannot record that fact here -- and an egress the database refuses to
--- acknowledge is an egress the purge can still find, because the purge
--- enumerates by engagement.
+-- cannot record that fact here. Note the limit honestly: an egress whose
+-- binding this function REFUSED leaves both key columns null, and
+-- `list_phone_engagement_recordings` filters on a non-null object key, so the
+-- purge would not find it either. That is precisely why the binding is
+-- attempted BEFORE any egress is started -- a refusal here means no egress was
+-- ever started, so there is nothing to orphan.
 --
 -- Idempotency is by VALUE, not by existence: re-attaching the identical
 -- triple is `ok` with `duplicate`, while re-attaching a DIFFERENT triple
@@ -849,19 +852,24 @@ begin
   if p_role is null or p_role not in ('authoritative','supplementary') then
     return jsonb_build_object('status', 'invalid_role');
   end if;
-  if p_object_key is null
-     or p_object_key !~ '^phone-[0-9a-f-]{36}-egress\.ogg$' then
+  if p_attempt_id is null then
+    return jsonb_build_object('status', 'not_found');
+  end if;
+  -- EQUALITY, not a shape match. A regex only says the key LOOKS derived;
+  -- this says it IS derived, from THIS attempt. Without it, attempt A could be
+  -- bound with attempt B's key and the purge would delete the wrong object
+  -- while reporting success for both -- and `[0-9a-f-]{36}` happily admits
+  -- thirty-six hyphens. The header claims the columns hold "the name the
+  -- dialer derives"; this is what makes that claim true.
+  if p_object_key is distinct from ('phone-' || p_attempt_id::text || '-egress.ogg') then
     return jsonb_build_object('status', 'invalid_object_key');
   end if;
   if p_manifest_key is not null
-     and p_manifest_key !~ '^phone-[0-9a-f-]{36}-egress\.ogg\.json$' then
+     and p_manifest_key is distinct from (p_object_key || '.json') then
     return jsonb_build_object('status', 'invalid_manifest_key');
   end if;
   if p_egress_id is not null and p_egress_id !~ '^EG_[A-Za-z0-9_-]{4,200}$' then
     return jsonb_build_object('status', 'invalid_egress_id');
-  end if;
-  if p_attempt_id is null then
-    return jsonb_build_object('status', 'not_found');
   end if;
 
   -- Pinned lock order: engagement, then attempt.
@@ -1049,11 +1057,19 @@ begin
     return jsonb_build_object('status', 'not_found');
   end if;
 
+  -- `egress_id` and `egress_status` are carried because a purge must be able
+  -- to STOP an egress that is still writing before it deletes anything: the
+  -- object is uploaded when the egress STOPS, not continuously, so deleting
+  -- during an active egress deletes nothing and then reports success moments
+  -- before the recording lands. Neither is a phone value; `egress_id` matches
+  -- the opaque `EG_...` shape 0042 already constrains.
   select coalesce(jsonb_agg(jsonb_build_object(
-           'attempt_id',   a.id,
-           'role',         a.recording_role,
-           'object_key',   a.recording_object_key,
-           'manifest_key', a.recording_manifest_key
+           'attempt_id',    a.id,
+           'role',          a.recording_role,
+           'object_key',    a.recording_object_key,
+           'manifest_key',  a.recording_manifest_key,
+           'egress_id',     a.egress_id,
+           'egress_status', a.egress_status
          ) order by a.attempt_seq), '[]'::jsonb)
     into v_items
     from screening_v2.phone_call_attempts a

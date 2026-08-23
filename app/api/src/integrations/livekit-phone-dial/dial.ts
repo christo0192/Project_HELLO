@@ -71,6 +71,7 @@ export const PHONE_DIAL_REFUSALS = [
   'admission_deferred',
   'admission_refused',
   'transport_not_configured',
+  'timeouts_misordered',
   'room_unavailable',
   'lease_too_short',
   'originate_failed',
@@ -133,6 +134,19 @@ export async function dialPhoneAttempt(
   // ── Gate 1: the two flags ───────────────────────────────────────────
   if (!isPhoneRuntimeActive(config)) {
     return { status: 'refused', refusal: 'runtime_disabled', providerContacted: false };
+  }
+
+  // ── Gate 1a: the two time bounds must be ORDERED ────────────────────
+  // The originate must outlast the ring. If it does not, the SDK call gives up
+  // while the carrier is still ringing: the controller reports
+  // `originate_failed`, the lease (sized off the originate bound) lapses, the
+  // reclaimer restores the engagement — and the leg can STILL be answered,
+  // landing a real person in a room whose dial we have written off. That is the
+  // failure the lease gate exists to prevent, reintroduced through the other
+  // knob, so the two are related here rather than left to two independent
+  // defaults staying in the right order forever.
+  if (config.ringTimeoutSeconds >= dialConfig.originateTimeoutSeconds) {
+    return { status: 'refused', refusal: 'timeouts_misordered', providerContacted: false };
   }
 
   // ── Gate 1b: somewhere to send it ───────────────────────────────────
@@ -202,7 +216,7 @@ export async function dialPhoneAttempt(
   // The room is created BEFORE the dial and starts NO egress. A reconnect
   // adopts the existing room, keeping one session and one transcript.
   const room = await provisionPhoneRoom(
-    { sessionId: request.sessionId, agentName: dialConfig.agentName },
+    { sessionId: request.sessionId, attemptId, agentName: dialConfig.agentName },
     deps.room,
   );
   if (room.status === 'not_configured' || room.status === 'provider_failed') {
