@@ -429,6 +429,21 @@ class TestCompletionRetry(unittest.IsolatedAsyncioTestCase):
         # `assessment.aborted`.
         self.assertFalse(result.halted)
 
+    async def test_a_LOST_RESPONSE_is_retried_and_then_succeeds(self):
+        """The worst of the three outcomes if it is NOT retried: the endpoint
+        succeeded, inserted the assessment, and its response never arrived. The
+        screening IS scored, the worker does not know it, and one leg later a
+        refused start would turn it terminal."""
+        lost = phone.PhoneApiOutcome(False, None)
+        lost.error_category = "transport"
+        result, client, slept = await self._run(answers=[
+            lost,
+            phone.PhoneApiOutcome(True, phone.ASSESSMENT_SCORED_STATUS),
+        ])
+        self.assertTrue(result.scored)
+        self.assertEqual(len(client.completions), 2)
+        self.assertEqual(len(slept), 1)
+
     async def test_a_verdict_we_do_NOT_understand_halts_instead(self):
         """A transport failure means we do not know whether it scored, and a
         terminal event either way would be a claim we cannot support."""
@@ -439,6 +454,55 @@ class TestCompletionRetry(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.halted)
         self.assertEqual(result.halt_reason, phone.HALT_SCORING)
         self.assertTrue(phone.halt_is_retryable(result.halt_reason))
+
+
+class TestRetryClassifier(unittest.TestCase):
+    """Which completion answers are worth trying again.
+
+    Two classes, and the second is the one that used to be missed. A refusal we
+    understand is a fault. A TRANSPORT failure carries NO status at all — and it
+    is precisely the "blip between the worker and the API" the retry exists for.
+    Keying only on `status` skipped it entirely, so the endpoint could succeed,
+    insert the assessment and lose its response with zero retries.
+    """
+
+    def _answer(self, status=None, category=None):
+        outcome = phone.PhoneApiOutcome(False, status)
+        outcome.error_category = category
+        return outcome
+
+    def test_a_refusal_we_understand_is_retried(self):
+        for status in ("scoring_failed", "completion_failed"):
+            with self.subTest(status=status):
+                self.assertTrue(phone.retryable_completion(self._answer(status)))
+
+    def test_a_TRANSPORT_failure_is_retried_even_though_it_carries_no_status(self):
+        for category in ("transport", "business_error", "malformed_response",
+                         "configuration"):
+            with self.subTest(category=category):
+                self.assertTrue(
+                    phone.retryable_completion(self._answer(None, category))
+                )
+
+    def test_a_STATE_is_not_retried(self):
+        for status in ("plan_incomplete", "session_not_active", "unknown_session",
+                       "plan_missing", "assessment_missing", "invalid_request"):
+            with self.subTest(status=status):
+                self.assertFalse(phone.retryable_completion(self._answer(status)))
+
+    def test_the_unreachable_member_is_NOT_in_the_status_set(self):
+        """`phone_assessment_error` is emitted only with HTTP 500, and a 5xx is
+        classified as a transport failure before the body is ever parsed — so it
+        can never arrive as a `status`. Listing it would read as coverage this
+        set does not have; the 500 case is covered through the transport class
+        instead."""
+        self.assertNotIn("phone_assessment_error", phone.RETRYABLE_COMPLETION_STATUSES)
+        self.assertEqual(
+            phone.RETRYABLE_COMPLETION_STATUSES,
+            frozenset({"scoring_failed", "completion_failed"}),
+        )
+        # …and a 500 IS retried, through the class that actually carries it.
+        self.assertTrue(phone.retryable_completion(self._answer(None, "transport")))
 
 
 # ── Fixed copy is not a screening turn ────────────────────────────────

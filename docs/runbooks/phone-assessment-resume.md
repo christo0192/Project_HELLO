@@ -99,13 +99,40 @@ exists.
 **The completion is retried, boundedly.** Every question is durable by then, and
 there is no second chance from the conversation — the session is `completed`
 afterwards, so a later leg's `start_phone_assessment` refuses it with
-`session_not_active`. Three attempts with linear backoff, and only for answers
-that are *faults* (`scoring_failed`, `completion_failed`,
-`phone_assessment_error`); a *state* like `plan_incomplete` is not retried,
-because retrying cannot change it and would only hold the candidate on the line.
-An answer we cannot parse at all (a transport failure) is a **halt**, not an
-abort: we do not know whether it scored, and a terminal event either way would
-be a claim we cannot support.
+`session_not_active`. Three attempts with linear backoff, over **two** classes:
+
+* a refusal we understand (`scoring_failed`, `completion_failed`) — a fault;
+* a **transport** failure, which carries no status at all.
+
+`phone.retryable_completion` covers both, and the second is the one that matters
+most: a reset, a timeout or a 5xx is exactly the "blip between the worker and the
+API" the retry exists for, and it is the case where the endpoint may have
+succeeded, inserted the assessment and simply lost its response. Keying only on
+`status` skipped it entirely.
+
+`phone_assessment_error` is deliberately **absent** from
+`RETRYABLE_COMPLETION_STATUSES` even though the route emits it: the route emits
+it only with HTTP 500, and a 5xx is classified as a transport failure before the
+body is ever parsed, so it can never arrive as a `status`. Listing it would read
+as coverage the set does not have; the 500 case is covered through the transport
+class.
+
+A *state* (`plan_incomplete`, `session_not_active`, `unknown_session`) is not
+retried — retrying cannot change it and would only hold the candidate on the
+line. After the attempts are exhausted, an answer we understand aborts
+truthfully; one we cannot parse is a **halt**, because we do not know whether it
+scored and a terminal event either way would be a claim we cannot support.
+
+**A REFUSED START IS NOT PROOF THAT NOTHING HAPPENED.** `session_not_active` is
+exactly what an already-`completed` session presents — which is the state a
+scored-but-unacknowledged screening is in. So a leg whose start is refused that
+way asks the completion endpoint **first**: it is idempotent by construction and
+answers `scored` when the row is there. Aborting blind would drive the engagement
+to terminal `failed` over a screening that exists and is scored, and terminal is
+unrecoverable — `apply_phone_event` short-circuits every later post with
+`ignored: terminal`. Recovery is not a way to claim a completion nobody earned:
+the ROW still decides, and a completion endpoint that says otherwise still
+aborts.
 
 ---
 
@@ -176,6 +203,16 @@ once scoring lands succeeds.
   caller passes the column at all — so the browser insert payload is byte-identical
   to what it was. The browser transcript, completion and scoring suites are run
   and reported, not merely declared unchanged.
+- **No `duration_sec` for a phone screening.** A session spans every reconnect,
+  and `0042` defers a window-closed one to the **next IST day**, so there is no
+  single elapsed number that is true of the conversation. `started_at` is stamped
+  when the session ROW is created — NOT NULL, defaulted, never updated — so
+  measuring from it would report time-since-provisioning and clamp at 86,400 on a
+  next-day reconnect: a plausible-looking measurement of something nobody asked
+  about. A hardcoded `0` was worse still. The column is left NULL, which says
+  "not measured", and that is true. A phone-specific instant (the attempt's
+  `answered_at`, or the `disclosure.delivered` transition) would be measurable,
+  and that is a deliberate later change rather than a number invented here.
 - **The wind-down line is not a transcript turn.** `PHONE_ASSESSMENT_CLOSING_TEXT`
   is a constant, like the disclosure, and is excluded from the transcript for the
   same reason: it is gate copy, not evidence of a screening. The durability
@@ -244,12 +281,25 @@ once scoring lands succeeds.
   session's context is also unverified. If it does not, the screening still runs
   correctly — the question text reaches the model through `generate_reply` and
   every boundary is still keyed by the cursor — but the tailoring and the resume
-  replay would be lost. **Watch for `phone_instructions_not_applied` on the
-  first synthetic rehearsal.**
+  replay would be lost.
+  **`phone_instructions_not_applied` is NOT the observable to watch for that.**
+  It fires when the mutator raises, and on the real SDK it will not raise — the
+  log line watches the mutator's *existence*, not its *effect*. The rehearsal
+  check is behavioural: on a deliberately reconnected leg, does the bot
+  acknowledge the disconnect and avoid re-covering ground the candidate already
+  gave? If it starts cold, the update did not re-seed the running session's
+  context, whatever the logs say.
 - **A duplicate boundary advances the cursor, and the exchange this leg captured
   is discarded.** That is correct — the question is answered and recorded — but
   the transcript will show the OTHER exchange. Logged as
   `phone_boundary_duplicate` rather than silently equated.
+  **There are three causes, and the third is the one to look for.** This leg's own
+  earlier attempt, or a leg that ran before it — both benign. Or **two legs live
+  at once**, which the boundary RPC cannot exclude because it takes no epoch and
+  no attempt id: it is the one place in the phone lane where `0042`'s "fencing
+  must not be optional" doctrine is not applied. If `phone_boundary_duplicate`
+  ever appears in production **without a preceding retry**, that is the unfenced
+  condition, not a retry, and it wants investigating.
 
 ---
 
@@ -271,7 +321,7 @@ Kill switch at any point: `POST /api/phone/halt`.
 
 ## 9. The mutation controls, and how to re-run them
 
-Twenty-six controls. Same contract as `phone-safe-dialer.md` §11: every guard
+Thirty-one controls. Same contract as `phone-safe-dialer.md` §11: every guard
 below was deliberately broken, the suite run, the failure recorded, then reverted and re-run green.
 **If deleting a guard leaves its suite green, the guard is decorative.**
 
@@ -307,6 +357,11 @@ Re-run them by hand, on a **clean** tree, one at a time.
 | P9 | Deliver instructions by bare `setattr` only | Python suite | 1 fail + 1 error |
 | P10 | Let gate copy back into the exchange queue | Python suite | 1 fail |
 | M16 | Delete the scanner's own scratch-directory `rm` | `resume-scanner-freshness` | 2 fail |
+| M17 | Invent a `durationSec` on the completion again | `phone-assessment-route` | 1 fail |
+| M18 | Return `started_at` from the state RPC again | `policy_tests.sql` | 1 fail |
+| P11 | Key the completion retry on `status` only, skipping the transport class | Python suite | 7 fail |
+| P12 | Abort blind on a refused start instead of asking the completion endpoint | Python suite | 2 fail |
+| P13 | Let the recovery claim a completion the endpoint did not confirm | Python suite | 2 fail |
 
 `M2` is the one worth keeping: a plpgsql `exception` block opens a
 subtransaction, so the "one transaction" claim is broken by an edit that looks

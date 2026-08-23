@@ -1028,12 +1028,46 @@ async def _run_phone_session(
 
     state = await events.start_assessment(attempt_id, session_id)
     if not state.ok:
-        # No plan, so no screening. The leg ends without claiming anything;
-        # `assessment.aborted` below is the truthful terminal.
+        # ── A REFUSED START IS NOT PROOF THAT NOTHING HAPPENED ────────
+        # `session_not_active` is exactly what a session that is ALREADY
+        # COMPLETED presents — which is the state a scored-but-unacknowledged
+        # screening is in. The chain that produces it: the completion endpoint
+        # succeeded, inserted the assessment and lost its response; this leg
+        # halted and posted nothing (correct); the webhook granted a reconnect;
+        # and now the reconnecting leg is being told the session is not active.
+        #
+        # Aborting here would drive the engagement to terminal `failed` over a
+        # screening that exists and is scored, and terminal is unrecoverable —
+        # `apply_phone_event` short-circuits every later post with
+        # `ignored: terminal`. So the completion endpoint is asked FIRST. It is
+        # idempotent by construction and answers `scored` when the row is
+        # there, so this recovers the acknowledgement without re-screening
+        # anybody and without inventing a claim: the row still decides.
         _log.warn(
             "unknown_event", error_type="phone_assessment_unstarted",
             error_category=state.status,
         )
+        if state.status == "session_not_active":
+            recovered = await events.complete_assessment(attempt_id, session_id)
+            if recovered.ok:
+                _log.info(
+                    "unknown_event", error_type="phone_assessment_recovered",
+                    error_category=recovered.status,
+                )
+                await events.post_event(attempt_id, "assessment.completed")
+                await _close_phone_room(room_name)
+                return result
+            if phone.retryable_completion(recovered):
+                # Still no answer we can act on. Post NOTHING rather than
+                # terminalising a screening whose state we do not know.
+                _log.warn(
+                    "unknown_event", error_type="phone_assessment_halted_leg",
+                    error_category=phone.HALT_SCORING,
+                )
+                await _close_phone_room(room_name)
+                return result
+        # No plan and nothing to recover. The leg ends without claiming
+        # anything; `assessment.aborted` is the truthful terminal.
         await events.post_event(attempt_id, "assessment.aborted")
         await _close_phone_room(room_name)
         return result

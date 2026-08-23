@@ -677,11 +677,37 @@ ASSESSMENT_SCORED_STATUS = "scored"
 #: Completion answers worth trying again inside the same leg. Everything else
 #: — `plan_incomplete`, `session_not_active`, `unknown_session`, `plan_missing`
 #: — is a STATE rather than a fault, and retrying cannot change it.
+#:
+#: `phone_assessment_error` is deliberately ABSENT even though the route emits
+#: it: the route emits it only with HTTP 500, and a 5xx is classified as a
+#: transport failure before the body is ever parsed, so that string can never
+#: arrive here as a `status`. Listing it would be vocabulary with no reachable
+#: writer — it would read as coverage this set does not have. The 500 case is
+#: covered by `retryable_completion` below, through the transport class.
 RETRYABLE_COMPLETION_STATUSES: frozenset[str] = frozenset([
     "scoring_failed",
     "completion_failed",
-    "phone_assessment_error",
 ])
+
+
+def retryable_completion(outcome: "PhoneApiOutcome") -> bool:
+    """True when this completion answer is worth trying again in this leg.
+
+    TWO classes, and the second is the one that matters most. A refusal we
+    understand (`scoring_failed`, `completion_failed`) is a fault. A TRANSPORT
+    failure — a reset, a timeout, a 5xx — carries no status at all, and it is
+    precisely the "blip between the worker and the API" this retry exists for.
+    Keying only on `status` skipped it entirely, which meant the endpoint could
+    succeed, insert the assessment, and lose its response, with zero retries.
+
+    That is the worst of the three outcomes: the screening IS scored, the
+    worker does not know it, and one leg later a refused start turns it
+    terminal. Retrying is safe because the endpoint is idempotent by
+    construction, which is what makes this a real fix rather than a hopeful one.
+    """
+    if outcome.status is not None:
+        return outcome.status in RETRYABLE_COMPLETION_STATUSES
+    return outcome.error_category is not None
 
 # What the bot says once every question is durable. A CONSTANT, like the
 # disclosure, and for the same reason: the closing of a recorded screening call
@@ -1077,7 +1103,7 @@ async def run_phone_assessment(
         done = await client.complete_assessment(attempt_id, session_id)
         if done.ok:
             break
-        if done.status not in RETRYABLE_COMPLETION_STATUSES:
+        if not retryable_completion(done):
             # `plan_incomplete`, `session_not_active`, `unknown_session`: a
             # state, not a fault. Retrying cannot change it.
             break

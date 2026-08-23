@@ -26,7 +26,6 @@ import express from 'express';
 import request from 'supertest';
 import {
   createPhoneWorkerRouter,
-  elapsedSeconds,
   sanitizeAssessmentState,
 } from '../routes/phone-worker.js';
 import { transitionSession } from '../lib/session-lifecycle.js';
@@ -73,7 +72,6 @@ function state(over: Partial<PhoneAssessmentState> = {}): PhoneAssessmentState {
     sessionId: SESSION,
     sessionStatus: 'in_progress',
     terminalReason: null,
-    startedAt: '2026-09-01T05:58:00.000Z',
     candidateName: 'Asha',
     planSource: 'role_template',
     questionCount: 2,
@@ -519,29 +517,24 @@ describe('POST /assessment/complete — the ordering this phase exists for', () 
       .toBe('assessment_missing');
   });
 
-  it('the completion reports the REAL elapsed time, and omits it when it cannot', async () => {
+  it('the completion reports NO duration at all, which is the truthful answer', async () => {
+    // A phone session spans every reconnect, and 0042 defers a window-closed
+    // one to the NEXT IST DAY, so no single elapsed number is true of the
+    // conversation. `started_at` is stamped when the session ROW is created —
+    // NOT NULL, defaulted, never updated — so measuring from it would report
+    // time-since-provisioning and clamp at 86,400 on a next-day reconnect: a
+    // plausible-looking measurement of something nobody asked about. A
+    // hardcoded 0 was worse still. NULL says "not measured", and that is true.
     const h = build({
       states: [
-        state({ planComplete: true, cursor: 2, startedAt: '2026-09-01T05:58:00.000Z' }),
+        state({ planComplete: true, cursor: 2 }),
         state({ planComplete: true, cursor: 2, assessmentExists: true }),
       ],
     });
     await post(h, '/assessment/complete', START_BODY);
-    // NOW is 06:00:00Z, the session started at 05:58:00Z.
-    expect(h.completeSession).toHaveBeenCalledWith({ sessionId: SESSION, durationSec: 120 });
-
-    const unknown = build({
-      states: [
-        state({ planComplete: true, cursor: 2, startedAt: null }),
-        state({ planComplete: true, cursor: 2, assessmentExists: true }),
-      ],
-    });
-    await post(unknown, '/assessment/complete', START_BODY);
-    // Omitted, not zero: the lifecycle then leaves the column alone, which is
-    // truthful, where a hardcoded 0 asserts a screening that took no time.
-    expect(unknown.completeSession).toHaveBeenCalledWith({
-      sessionId: SESSION, durationSec: undefined,
-    });
+    expect(h.completeSession).toHaveBeenCalledWith({ sessionId: SESSION });
+    const call = h.completeSession.mock.calls[0][0] as Record<string, unknown>;
+    expect(Object.keys(call)).toEqual(['sessionId']);
   });
 
   it('SCORING RESOLVING IS NOT AN ASSESSMENT EXISTING', async () => {
@@ -709,7 +702,7 @@ describe('the PRODUCTION defaults, driven with an empty deps object', () => {
 
   it('completeSession defaults to the SHARED lifecycle CAS the browser uses', async () => {
     const app = defaultsHarness([
-      state({ planComplete: true, cursor: 2, startedAt: '2026-09-01T05:59:00.000Z' }),
+      state({ planComplete: true, cursor: 2 }),
       state({ planComplete: true, cursor: 2, assessmentExists: true }),
     ]);
     const res = await request(app)
@@ -718,7 +711,7 @@ describe('the PRODUCTION defaults, driven with an empty deps object', () => {
       .send(START_BODY);
     expect(res.body).toEqual({ ok: true, status: 'scored' });
     expect(transitionSession).toHaveBeenCalledWith(
-      SESSION, 'in_progress', 'completed', 'conversation_complete', { duration_sec: 60 },
+      SESSION, 'in_progress', 'completed', 'conversation_complete',
     );
   });
 
@@ -765,20 +758,3 @@ describe('the PRODUCTION defaults, driven with an empty deps object', () => {
   });
 });
 
-describe('elapsedSeconds', () => {
-  const at = new Date('2026-09-01T06:00:00.000Z');
-
-  it('reports whole seconds from a real start', () => {
-    expect(elapsedSeconds('2026-09-01T05:58:30.000Z', at)).toBe(90);
-  });
-
-  it('returns undefined rather than 0 for anything unusable', () => {
-    for (const value of [null, undefined, '', 'not-a-date', '2026-09-01T06:00:30.000Z']) {
-      expect(elapsedSeconds(value as string | null, at), String(value)).toBeUndefined();
-    }
-  });
-
-  it('is bounded by the column the lifecycle writes to', () => {
-    expect(elapsedSeconds('2020-01-01T00:00:00.000Z', at)).toBe(86_400);
-  });
-});

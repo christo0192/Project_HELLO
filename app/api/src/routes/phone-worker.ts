@@ -223,8 +223,6 @@ export interface PhoneWorkerRouterDeps {
    */
   readonly completeSession?: (input: {
     sessionId: string;
-    /** Absent when the session carries no usable `started_at`. */
-    durationSec?: number;
   }) => Promise<{ ok: boolean; conflict: boolean }>;
   /**
    * Scores the session through the SHARED runner. AWAITED, deliberately — the
@@ -284,21 +282,6 @@ export function sanitizeAssessmentState(state: PhoneAssessmentState): Record<str
   };
 }
 
-/**
- * Whole seconds between an ISO instant and now, bounded to the range
- * `call_sessions.duration_sec` accepts. Returns `undefined` when there is no
- * usable start — the session lifecycle then leaves the column alone, which is
- * truthful, where a hardcoded 0 would assert a screening that took no time.
- */
-export function elapsedSeconds(startedAt: string | null | undefined, at: Date): number | undefined {
-  if (typeof startedAt !== 'string' || startedAt === '') return undefined;
-  const start = new Date(startedAt).getTime();
-  if (!Number.isFinite(start)) return undefined;
-  const seconds = Math.floor((at.getTime() - start) / 1000);
-  if (!Number.isFinite(seconds) || seconds < 0) return undefined;
-  return Math.min(86_400, seconds);
-}
-
 function requireWorkerPhoneAuth(
   req: import('express').Request,
   res: import('express').Response,
@@ -333,13 +316,12 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
   // must complete and score a call, not silently do neither — a feature that
   // ships green and inert is a failure mode this project has already paid for.
   const completeSession = deps.completeSession
-    ?? (async (input: { sessionId: string; durationSec?: number }) => {
+    ?? (async (input: { sessionId: string }) => {
       const result = await transitionSession(
         input.sessionId,
         'in_progress',
         'completed',
         'conversation_complete',
-        input.durationSec === undefined ? undefined : { duration_sec: input.durationSec },
       );
       return { ok: result.ok, conflict: result.ok === false && result.conflict === true };
     });
@@ -653,14 +635,22 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       }
 
       if (before.sessionStatus === 'in_progress') {
-        const completed = await completeSession({
-          sessionId,
-          // The REAL elapsed time, from the session's own `started_at`, or
-          // omitted when the row does not carry one. A hardcoded 0 would
-          // assert a screening that took no time, and this column is
-          // operator-facing.
-          durationSec: elapsedSeconds(before.startedAt, now()),
-        });
+        // ── NO `duration_sec`, DELIBERATELY ─────────────────────────
+        // A phone session spans every reconnect attempt, and 0042 defers a
+        // window-closed reconnect to the NEXT IST DAY — so there is no single
+        // elapsed number that is true of the conversation. `started_at` is
+        // stamped when the session ROW is created (NOT NULL, defaulted, never
+        // updated), so measuring from it would report time-since-provisioning
+        // and clamp at 86,400 on a next-day reconnect: a plausible-looking
+        // measurement of something nobody asked about. A hardcoded 0 was worse
+        // still — it asserted a screening that took no time.
+        //
+        // Omitting it leaves the column NULL, which is the truthful answer:
+        // this path does not measure duration. A phone-specific instant (the
+        // attempt's `answered_at`, or the `disclosure.delivered` transition)
+        // would be measurable, and that is a deliberate later change with its
+        // own migration rather than a number invented here.
+        const completed = await completeSession({ sessionId });
         // A CONFLICT is not a failure. Two legs racing to complete is exactly
         // what a reconnect produces, and the loser must still verify — which
         // is what the scoring call and the row check below do. A NON-conflict

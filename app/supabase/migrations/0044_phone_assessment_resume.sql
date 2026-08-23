@@ -491,9 +491,6 @@ begin
     'session_id', v_sess.id,
     'session_status', v_sess.status,
     'terminal_reason', v_sess.terminal_reason,
-    -- The completion path needs the REAL elapsed time. A caller with no
-    -- start instant omits `duration_sec` rather than asserting zero.
-    'started_at', v_sess.started_at,
     'candidate_name', v_name,
     'plan_source', v_plan.source,
     'question_count', v_plan.question_count,
@@ -886,23 +883,21 @@ begin
   -- boundary it cares most about. So an already-committed boundary is
   -- answered with the ORIGINAL success, whatever the session has since
   -- become.
-  if true then
-    select * into v_prog from screening_v2.phone_session_progress
-     where session_id = p_session_id and source_event_id = p_source_event_id;
-    if found then
-      return jsonb_build_object(
-        'status', 'applied',
-        'applied', true,
-        'duplicate', true,
-        'question_key', v_prog.question_key,
-        'question_index', v_prog.question_index,
-        'first_turn_index', v_prog.first_turn_index,
-        'last_turn_index', v_prog.last_turn_index,
-        'cursor', greatest(coalesce(v_sess.current_question_index, 0), 0),
-        'question_count', v_plan.question_count,
-        'plan_complete',
-          greatest(coalesce(v_sess.current_question_index, 0), 0) >= v_plan.question_count);
-    end if;
+  select * into v_prog from screening_v2.phone_session_progress
+   where session_id = p_session_id and source_event_id = p_source_event_id;
+  if found then
+    return jsonb_build_object(
+      'status', 'applied',
+      'applied', true,
+      'duplicate', true,
+      'question_key', v_prog.question_key,
+      'question_index', v_prog.question_index,
+      'first_turn_index', v_prog.first_turn_index,
+      'last_turn_index', v_prog.last_turn_index,
+      'cursor', greatest(coalesce(v_sess.current_question_index, 0), 0),
+      'question_count', v_plan.question_count,
+      'plan_complete',
+        greatest(coalesce(v_sess.current_question_index, 0), 0) >= v_plan.question_count);
   end if;
 
   if v_sess.status <> 'in_progress' then

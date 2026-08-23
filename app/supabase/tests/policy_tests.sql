@@ -11576,9 +11576,11 @@ begin
     'moving the shape check ahead of the duplicate branch must not break idempotency');
 
   perform _policy_tests.assert(
-    '0044-D5: the state RPC reports the session start, so a completion can time itself',
-    (screening_v2.get_phone_assessment_state(v_ids[3]) ->> 'started_at') is not null,
-    'a hardcoded duration of 0 asserts a screening that took no time');
+    '0044-D5: the state RPC reports NO session-start instant, and no duration is invented',
+    (screening_v2.get_phone_assessment_state(v_ids[3]) ? 'started_at') = false,
+    'a phone session spans reconnects that 0042 can defer to the NEXT IST DAY, so no single '
+      || 'elapsed number is true of the conversation; call_sessions.duration_sec is left NULL '
+      || 'rather than filled with time-since-provisioning');
 
   perform _policy_tests.phone44_teardown('pol44-shape');
 end;

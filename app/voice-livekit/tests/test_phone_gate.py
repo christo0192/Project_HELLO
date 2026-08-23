@@ -1406,6 +1406,62 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([c[0] for c in client.assessment_calls], ["start", "turn"])
         delete.assert_awaited()
 
+    async def test_a_SCORED_session_is_RECOVERED_when_the_start_is_refused(self):
+        """A refused start is not proof that nothing happened.
+
+        `session_not_active` is exactly what an already-COMPLETED session
+        presents — which is the state a scored-but-unacknowledged screening is
+        in: the completion endpoint succeeded, inserted the assessment and lost
+        its response; that leg halted and posted nothing; the webhook granted a
+        reconnect; and now this leg is being told the session is not active.
+
+        Aborting here would drive the engagement to terminal `failed` over a
+        screening that exists and is scored — and terminal is unrecoverable.
+        """
+        client = FakeEventClient(
+            start=phone.PhoneAssessmentState(False, "session_not_active"),
+            complete=phone.PhoneApiOutcome(True, phone.ASSESSMENT_SCORED_STATUS),
+        )
+        _, client, _, delete, _, _ = await self._run_session(
+            answers=("Yes, that's fine.",), client=client
+        )
+        self.assertIn("assessment.completed", client.event_types)
+        self.assertNotIn("assessment.aborted", client.event_types)
+        # Nobody was re-screened: the completion endpoint is idempotent and the
+        # ROW still decides, so no question was asked and none was committed.
+        self.assertEqual(client.committed_keys, [])
+        self.assertEqual([c[0] for c in client.assessment_calls], ["start", "complete"])
+        delete.assert_awaited()
+
+    async def test_a_refused_start_with_NOTHING_to_recover_still_aborts(self):
+        """The control for the test above. If the completion endpoint says the
+        screening is not scored, the truthful terminal is still `aborted` —
+        recovery must not become a way to claim a completion nobody earned."""
+        client = FakeEventClient(
+            start=phone.PhoneAssessmentState(False, "session_not_active"),
+            complete=phone.PhoneApiOutcome(False, "plan_incomplete"),
+        )
+        _, client, _, _, _, _ = await self._run_session(
+            answers=("Yes, that's fine.",), client=client
+        )
+        self.assertIn("assessment.aborted", client.event_types)
+        self.assertNotIn("assessment.completed", client.event_types)
+
+    async def test_a_refused_start_whose_recovery_is_UNREACHABLE_posts_nothing(self):
+        """Still no answer we can act on. Posting either terminal event would
+        be a claim about a state we do not know."""
+        unreachable = phone.PhoneApiOutcome(False, None)
+        unreachable.error_category = "transport"
+        client = FakeEventClient(
+            start=phone.PhoneAssessmentState(False, "session_not_active"),
+            complete=unreachable,
+        )
+        _, client, _, _, _, _ = await self._run_session(
+            answers=("Yes, that's fine.",), client=client
+        )
+        self.assertNotIn("assessment.completed", client.event_types)
+        self.assertNotIn("assessment.aborted", client.event_types)
+
     async def test_a_refused_start_screens_nobody_and_claims_nothing(self):
         """No plan, no screening.
 
@@ -1422,6 +1478,12 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.committed_keys, [])
         self.assertIn("assessment.aborted", client.event_types)
         self.assertNotIn("assessment.completed", client.event_types)
+        # …and the recovery path is NOT attempted: it exists for
+        # `session_not_active`, which is the one refusal that can mean "already
+        # scored". A consent refusal means the opposite, and asking the
+        # completion endpoint about it would be asking a question with no
+        # legitimate answer.
+        self.assertEqual([c[0] for c in client.assessment_calls], ["start"])
 
     async def test_a_RESUMING_leg_asks_only_what_is_still_owed(self):
         """The whole point of the phase.

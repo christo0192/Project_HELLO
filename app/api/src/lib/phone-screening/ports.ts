@@ -347,8 +347,6 @@ export interface PhoneAssessmentState {
   readonly sessionId?: string;
   readonly sessionStatus?: string;
   readonly terminalReason?: string | null;
-  /** The session's own start instant, so a completion can report a real duration. */
-  readonly startedAt?: string | null;
   readonly candidateName?: string | null;
   readonly planSource?: string;
   readonly questionCount?: number;
