@@ -195,6 +195,15 @@ proposes. An LLM-driven caller is exactly the client that will confidently propo
 
 ## 9. Enabling, in order
 
+> **STOP — steps 1–5 are safe; step 6 is not yet.** Step 6 places a call to a real
+> person. As shipped, that call **records the candidate and produces no transcript and
+> no assessment** (§12), and a reconnect re-asks every question. Do not take step 6 for a
+> real candidate until the persistence path in §12 has landed. Steps 1–5 reach no
+> carrier and are the whole of what this change is ready for.
+>
+> This warning exists because the rest of this section reads like a green light, and an
+> operator following it at 3am would not think to cross-check §12.
+
 1. Deploy with everything off. Confirm `/api/phone/health` reports the domain disabled.
 2. Set `PHONE_SCREENING_ENABLED=true`, leave the rest off. No dial is possible.
 3. Provision `PHONE_SIP_TRUNK_ID`. Still no dial — the mode is `off`.
@@ -202,9 +211,15 @@ proposes. An LLM-driven caller is exactly the client that will confidently propo
    cannot reach a carrier.**
 5. Deploy the named phone worker with `PHONE_AGENT_NAME` set. Verify browser screening is
    unaffected (it must be — the browser worker was not touched).
-6. Only then: add **one** digest to `PHONE_DIAL_ALLOWLIST` and set
-   `PHONE_DIAL_MODE=live`. This is the first call that can reach a carrier, and it can
-   reach exactly one number.
+6. **Blocked on §12.** Adding a digest to `PHONE_DIAL_ALLOWLIST` and setting
+   `PHONE_DIAL_MODE=live` is the first call that can reach a carrier, and it reaches
+   exactly one number — but a real candidate answering it is recorded and screened for
+   nothing. Take this step only once §12 is closed, or knowingly, against a number you
+   control, as a transport rehearsal rather than a screening.
+
+Note also that every phone conversation currently terminates as `failed` /
+`assessment_aborted` by design (§12). That is the truthful state, not a fault to
+investigate, and it is the reason step 6 is gated.
 
 Kill switch at any point: `POST /api/phone/halt`. It refuses admission, which refuses
 every dial.
