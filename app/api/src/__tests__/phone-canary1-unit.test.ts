@@ -559,7 +559,7 @@ describe('6. the bounds are ordered, and the outermost one is derived', () => {
       ringSeconds: ring,
       participantWaitSeconds: boundary,
       // The FIFTH inequality also has an opinion at this boundary: at the
-      // default join wait of 60, `100 >= 60 + 40 + 15` is false, so this case
+      // default join wait of 75, `100 >= 75 + 40 + 15` is false, so this case
       // would refuse `origination_wait_misordered` and stop testing the third
       // inequality at all. Lowering the join wait keeps this case about the
       // one relation it is named for. That interaction is the point of
