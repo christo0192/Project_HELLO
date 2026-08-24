@@ -31,8 +31,9 @@ It is not a mock of the substrate. It calls the real
 `schedule_phone_appointment`, `expire_phone_appointments`, `set_phone_halt` and
 `clear_phone_halt`, and asserts what the database actually did.
 
-What is synthetic is the **wire**: there is no carrier, no trunk, no number and
-no telephony SDK anywhere in the run.
+What is synthetic is the **wire**: the run reaches no carrier, binds no trunk,
+reads no number and loads no telephony SDK. That is a statement about this
+harness, not about what exists at the provider — see §7 TEL-02.
 
 ## 2. Running it
 
@@ -197,6 +198,18 @@ printf '%s' "$ADMIN_TOKEN" | node scripts/phone-canary/halt-drill.mjs halt \
   --api-base https://api.example --execute --confirm "STOP THE PHONE DIALER"
 ```
 
+> **Prerequisite that is NOT in the command line: the master switch must be on.**
+> `POST /api/phone/halt` calls `refuseIfDisabled` before it does anything, so
+> with `PHONE_SCREENING_ENABLED` unset — the shipped production state, where no
+> `PHONE_*` secret is set on `project-hello-api` — it answers **503
+> `phone_screening_disabled`** and the drill cannot execute. That is not a fault
+> in the drill; it is `phone-runtime.md` §11 ordering, which raises the master
+> switch at step 2 and the halt at step 3. Enabling `PHONE_SCREENING_ENABLED`
+> **alone** is safe and reversible: `createPhoneRuntime` returns `null` without
+> *both* switches, so no loop is armed, and no route on the phone router can
+> cause a dial — only the admin-gated appointment endpoints and these halt
+> endpoints stop answering 503. Do that first, or expect the 503.
+
 Production requires **all four**: `--execute`, the exact confirmation phrase, an
 `https` API base, and a token from stdin or the environment. It drives
 `POST /api/phone/halt` and `/halt/clear`, which are admin-gated and write their
@@ -267,7 +280,28 @@ engineering:
    every DLT/UCC, consent, DND, caller-ID, recording and evidence obligation to
    a control, plus the registrations themselves.
 2. **TEL-02** — a verified India-capable provider account, an approved route
-   and an actual number. *We do not have a number to dial from.*
+   and an actual number. **Status: provisioned at the provider, not bound to
+   the application, and not authorised for use.** Plivo India KYC, an Indian
+   number, a Plivo SIP trunk and a LiveKit outbound SIP trunk were configured
+   after this list was first written; **no real call has been placed.**
+   Provisioning a route is not authorisation to use it — TEL-01, TEL-04,
+   TEL-05, TEL-06 and TEL-07 gate that independently, and they are open. The
+   application binding is deliberately deferred too: `PHONE_SIP_TRUNK_ID` is
+   unset on every app and `PHONE_AGENT_NAME` is unset on the API. Binding the
+   trunk is **step 3 of `phone-safe-dialer.md` §9**, and it is *not* the last
+   wire: the two edits that follow it — the `PHONE_DIAL_ALLOWLIST` digest and
+   `PHONE_DIAL_MODE=live` (§9 step 6, `phone-runtime.md` §11 step 9) — are the
+   first configuration that can reach a carrier. `isLiveDialPermitted` requires
+   **four** conditions — `PHONE_SCREENING_ENABLED`, `PHONE_RUNTIME_ENABLED`,
+   `PHONE_DIAL_MODE=live` and a non-empty `PHONE_DIAL_ALLOWLIST` — and the
+   trunk is **not** one of them: trunk readiness is a **separate** gate,
+   `isPhoneTransportReady`, and `resolvePhoneSipClient` requires **both** before
+   it will build a live client. Provisioning the trunk alone therefore dials
+   nothing — not because it is one of several conditions, but because it sits
+   outside the permission gate entirely and satisfies none of it. *(This entry previously read "we do not have a number to dial
+   from". That was stale, and stale in the dangerous direction: it pointed at
+   carrier capability as the blocker when the real blockers are the approvals
+   below and the wiring above.)*
 3. **TEL-03** — authenticated SIP, IP controls, credential rotation, spend caps.
 4. **TEL-04** — Legal-approved disclosure and decline wording.
 5. **TEL-05** — consent-source, DND and opt-out enforcement before every dial.
@@ -316,6 +350,14 @@ no gap list.
   schedules it must verify the phone-aware predicate covers what they enable.
 * **An unanswered `reconnect` charges the no-answer budget**, diverging from the
   P5 acceptance wording. Substrate-level; see `phone-runtime.md` §7.
+* **The provider side is provisioned; the application side is deliberately
+  not wired.** Plivo India KYC, an Indian number, a Plivo SIP trunk and a
+  LiveKit outbound SIP trunk exist; `PHONE_SIP_TRUNK_ID` is bound nowhere, the
+  API's `PHONE_AGENT_NAME` is empty, and no real call has been placed. Read
+  every "no trunk / no number" sentence in this lane's docs at *harness* scope
+  only. A configured trunk authorises nothing, and provisioning
+  `PHONE_SIP_TRUNK_ID` is **not** the last step — the allowlist digest and
+  `PHONE_DIAL_MODE=live` come after it (`phone-safe-dialer.md` §9 steps 3 and 6).
 * **Canary-0 needs Docker.** There is no in-memory fallback and there must not
   be: a fallback would make "the substrate is fine" and "we could not check"
   look the same.

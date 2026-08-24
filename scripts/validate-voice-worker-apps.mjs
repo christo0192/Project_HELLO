@@ -34,8 +34,26 @@
 //      A mismatched non-empty name is never correct in either direction: the
 //      API would create a room and dispatch to a name nothing registers under,
 //      and "a room with no agent sits silent while a real person says hello".
+//   7. DEPLOYMENT REGION (PR104). ALL THREE Fly app configs in this repo —
+//      both worker configs AND app/api/fly.toml — must declare a primary_region
+//      drawn from the reviewed allowlist in scripts/fly-region-policy.mjs. The
+//      first release of the dedicated phone app failed BEFORE machine creation
+//      because fly.phone.toml still named the deprecated `bom`; Fly recommended
+//      `sin`, where every app in this project already runs. `primary_region` is
+//      read when a resource is CREATED, so a deprecated value deploys green
+//      against existing machines and fails only when it matters — which is why
+//      it is checked statically here rather than discovered at release time.
+//      The API config is in scope even though this validator is otherwise about
+//      the two workers: the trap is a property of the region field, not of the
+//      app, and sweeping two of three configs is how a class survives a sweep.
+//   8. NO DUPLICATE top-level `app` / `primary_region` key in any config. The
+//      scanner returns the FIRST match, so a file carrying both a good and a
+//      bad value would validate on the good one. Duplicate keys are invalid
+//      TOML and flyctl rejects the file, but a checker must not be the thing
+//      that says "fine" about a file the deploy will reject.
 
 import { readFileSync } from "node:fs";
+import { APPROVED_WORKER_REGIONS, assertPolicyConsistent, checkPrimaryRegion } from "./fly-region-policy.mjs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -61,14 +79,19 @@ function readApiOptional(rel) {
 }
 
 // Minimal TOML helpers (sufficient for these flat configs).
-function topLevelString(text, key) {
-  // key = "value" appearing at column 0 (top-level table), before any [table].
+function topLevelStringAll(text, key) {
+  // Every `key = "value"` at column 0 (top-level table), before any [table].
+  const found = [];
   for (const line of text.split("\n")) {
     if (/^\s*\[/.test(line)) break; // entered a table; app/... are top-level
     const m = line.match(new RegExp(`^${key}\\s*=\\s*"([^"]*)"`));
-    if (m) return m[1];
+    if (m) found.push(m[1]);
   }
-  return null;
+  return found;
+}
+function topLevelString(text, key) {
+  const found = topLevelStringAll(text, key);
+  return found.length > 0 ? found[0] : null;
 }
 function envValue(text, key) {
   // value of a key inside the [env] table (2-space indented in our files).
@@ -123,6 +146,10 @@ const phoneCfg = read("fly.phone.toml");
 // ── 1 & 2. App identity and named/unnamed posture ────────────────────────
 const browserApp = topLevelString(browser, "app");
 const phoneApp = topLevelString(phoneCfg, "app");
+for (const [label, text] of [["fly.toml", browser], ["fly.phone.toml", phoneCfg]]) {
+  const appKeys = topLevelStringAll(text, "app");
+  ok(appKeys.length <= 1, `${label} declares the top-level app key ${appKeys.length} times — a duplicate key is invalid TOML and hides which app would be deployed`);
+}
 ok(browserApp === "project-hello-voice", `fly.toml app must be project-hello-voice (got ${browserApp})`);
 ok(phoneApp === "project-hello-phone-voice", `fly.phone.toml app must be project-hello-phone-voice (got ${phoneApp})`);
 
@@ -167,6 +194,39 @@ if (typeof phoneName === "string") {
   ok(/^[A-Za-z][A-Za-z0-9_-]*$/.test(phoneName.trim()), "PHONE_AGENT_NAME must be a simple identifier");
 }
 
+// ── 5c. Deployment region contract (PR104) ───────────────────────────────
+// The policy is validated before it is applied: a self-contradicting allowlist
+// (a deprecated region also listed as approved, or `bom` quietly dropped from
+// the deprecated record) would report green while permitting the exact
+// regression this check exists to prevent.
+for (const problem of assertPolicyConsistent()) ok(false, problem);
+
+// Every Fly app config this repo owns, not only the two workers. The API app is
+// included because the creation-time trap belongs to the field, not to the app
+// — and because a class swept in two files out of three is not swept.
+const apiFlyText = readApiOptional("fly.toml");
+const REGION_SCOPED = [
+  ["fly.toml", browser],
+  ["fly.phone.toml", phoneCfg],
+  ...(apiFlyText !== null ? [["app/api/fly.toml", apiFlyText]] : []),
+];
+for (const [label, text] of REGION_SCOPED) {
+  const declared = topLevelStringAll(text, "primary_region");
+  // Duplicate-key fail-closed: the scanner reads the first value, so a file
+  // carrying `sin` then `bom` would validate on the `sin`. Refuse instead.
+  ok(declared.length <= 1,
+    `${label} declares primary_region ${declared.length} times (${declared.map((v) => JSON.stringify(v)).join(", ")}); `
+    + "a duplicate key is invalid TOML and hides the value that would actually apply");
+  if (declared.length > 1) continue;
+  for (const problem of checkPrimaryRegion(label, declared[0] ?? null)) ok(false, problem);
+}
+// The API config being ABSENT must not be a silent pass in the default (real)
+// invocation: that is the file whose region this contract was extended to hold.
+ok(process.argv[3] !== undefined || apiFlyText !== null,
+  "app/api/fly.toml is missing — the region contract covers all three Fly app configs and cannot verify one it cannot read");
+notes.push(`worker_regions_approved=${APPROVED_WORKER_REGIONS.join(",")}`);
+notes.push(`region_configs_checked=${REGION_SCOPED.map(([l]) => l).join(",")}`);
+
 // ── 6. Worker <-> API dispatch-name agreement (H-1) ──────────────────────
 // The API is the dispatcher. Read the name it will dispatch under: fly.toml
 // [env] is the deploy authority when it sets the key, else the documented
@@ -203,4 +263,4 @@ if (failures.length) {
   process.exit(1);
 }
 for (const n of notes) console.error(`voice worker app config note: ${n}`);
-console.log("voice worker app configs valid (browser unnamed; phone named & stopped; isolated; no secrets; worker<->API name agreement surfaced).");
+console.log("voice worker app configs valid (browser unnamed; phone named & stopped; isolated; no secrets; approved deployment region across all three Fly app configs; worker<->API name agreement surfaced).");

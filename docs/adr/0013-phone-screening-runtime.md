@@ -161,10 +161,11 @@ attempt-lease heartbeat and reclaim, the per-candidate guards, and a genuine
 two-session **halt race** in which the stop lands while an admission is already
 blocked on the admission lock.
 
-Every ingress event is synthesised. There is no carrier, no trunk, no number
-and no SDK: the telephony SDK is not resolvable from that directory, no file
-there imports a network module, and every egress primitive Node offers is
-trapped and counted during the run. **The zero is a measured zero** — the traps
+Every ingress event is synthesised. The run reaches no carrier, binds no trunk,
+reads no number and loads no SDK: the telephony SDK is not resolvable from that
+directory, no file there imports a network module, and every egress primitive
+Node offers is trapped and counted during the run. That is a property of the
+harness, not a claim about provider provisioning — see §7. **The zero is a measured zero** — the traps
 are deliberately tripped afterwards and the manifest refuses to validate unless
 they all fired, because a counter that reads zero and a counter that is broken
 are the same observation.
@@ -184,6 +185,25 @@ described in `docs/runbooks/phone-canary-and-halt.md` §7 and it is deliberately
 
 The first is legal: it is a real outbound automated voice call on an Indian
 number, which is exactly what TEL-01 through TEL-06 gate.
+
+TEL-02's provider half is **done** and must not be recorded otherwise: Plivo
+India KYC, an Indian number, a Plivo SIP trunk and a LiveKit outbound SIP trunk
+were configured after the first draft of this record, and **no real call has
+been placed**. That changes nothing about the decision. Provisioning a route is
+not authorisation to use it, and the application is deliberately not wired to
+it: `PHONE_SIP_TRUNK_ID` is bound in no app environment and the API's
+`PHONE_AGENT_NAME` is empty. Trunk binding is **step 3 of
+`phone-safe-dialer.md` §9** — deliberately late, and deliberately *not* last:
+the `PHONE_DIAL_ALLOWLIST` digest and `PHONE_DIAL_MODE=live` (§9 step 6,
+`phone-runtime.md` §11 step 9) follow it and are the first configuration that
+can reach a carrier. `isLiveDialPermitted` requires **four** conditions
+(`PHONE_SCREENING_ENABLED`, `PHONE_RUNTIME_ENABLED`, `PHONE_DIAL_MODE=live`, a
+non-empty `PHONE_DIAL_ALLOWLIST`), so no single one of them is sufficient — and
+the trunk is not among them. Trunk readiness is a separate gate,
+`isPhoneTransportReady`, which `resolvePhoneSipClient` requires *in addition*.
+The trunk alone therefore cannot dial: it satisfies none of the four, and the
+two gates must both hold. The blockers are TEL-01, TEL-04, TEL-05,
+TEL-06 and TEL-07 — approvals, not carrier capability.
 
 The second is technical, and it is the one an engineer is likelier to get
 wrong. There is **no safe ephemeral no-persistence path** through this lane, by
@@ -257,15 +277,25 @@ second case, which is the one a later revert actually produces.
 
 ## Evidence
 
-* `scripts/phone-canary/canary0.mjs` — 10 scenarios, 133 checks, all passing
-  against a real `0001..0045` database; two consecutive runs byte-identical
+* `scripts/phone-canary/canary0.mjs` — 10 scenarios, **133 checks**, all
+  passing against a real `0001..0045` database; two consecutive runs byte-identical
   apart from the timestamp and digest; measured network calls **0** with the
   trap positive control confirmed firing.
-* `scripts/phone-canary/canary0.test.mjs` — 133 offline assertions covering the
+* `scripts/phone-canary/canary0.test.mjs` — **139 offline assertions** covering the
   manifest schema, tamper detection, every leak pattern's positive control, the
   network traps *including a disarmed-trap control*, the static import scan
   including a seeded positive control, and the halt drill's refusal state
-  machine.
+  machine. This count is the gate's own summary line — reproduce with
+  `node scripts/phone-canary/canary0.test.mjs`, which prints
+  `phone-canary offline gate: 139 passed, 0 failed`. It is a DIFFERENT number
+  from the 133 above and always will be: 133 counts the SQL checks the full run
+  makes against a live database, 139 counts the offline assertions that need no
+  database at all. `scripts/check-phone-canary-evidence.test.mjs` runs the
+  offline gate in CI and fails the build in EITHER direction if this record and
+  the gate disagree; it also refuses to let the two counts be collapsed back
+  into one. It does not re-verify the 133 — that needs a live database this
+  gate has no Docker for, and pretending otherwise would be the decorative
+  evidence this lane keeps deleting.
 * `app/api/src/__tests__/phone-canary-verdicts.test.ts` — the health verdict
   assertions (`off` is healthy-disabled; `start_failed` is exclusive; halt,
   unreadable control and sweep errors degrade truthfully; `null` and `0` stay

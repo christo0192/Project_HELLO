@@ -1,5 +1,12 @@
 app = "project-hello-voice"
-primary_region = "bom"
+# Region: `sin` — where this app's machine already runs. The value said `bom`
+# until PR104, which was stale rather than harmless: primary_region is read when
+# a resource is CREATED, so a scale-up or machine re-creation would have tried a
+# region Fly no longer accepts for new resources (it is what broke the first
+# project-hello-phone-voice release). Editing it re-places NO existing machine.
+# Approved regions: scripts/fly-region-policy.mjs, enforced in CI by
+# scripts/validate-voice-worker-apps.mjs.
+primary_region = "sin"
 
 [build]
   dockerfile = "Dockerfile"
