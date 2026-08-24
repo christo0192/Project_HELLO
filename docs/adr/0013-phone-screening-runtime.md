@@ -196,8 +196,13 @@ it: `PHONE_SIP_TRUNK_ID` is bound in no app environment and the API's
 `phone-safe-dialer.md` §9** — deliberately late, and deliberately *not* last:
 the `PHONE_DIAL_ALLOWLIST` digest and `PHONE_DIAL_MODE=live` (§9 step 6,
 `phone-runtime.md` §11 step 9) follow it and are the first configuration that
-can reach a carrier. `isLiveDialPermitted` requires all five conditions, so no
-single one of them is sufficient. The blockers are TEL-01, TEL-04, TEL-05,
+can reach a carrier. `isLiveDialPermitted` requires **four** conditions
+(`PHONE_SCREENING_ENABLED`, `PHONE_RUNTIME_ENABLED`, `PHONE_DIAL_MODE=live`, a
+non-empty `PHONE_DIAL_ALLOWLIST`), so no single one of them is sufficient — and
+the trunk is not among them. Trunk readiness is a separate gate,
+`isPhoneTransportReady`, which `resolvePhoneSipClient` requires *in addition*.
+The trunk alone therefore cannot dial: it satisfies none of the four, and the
+two gates must both hold. The blockers are TEL-01, TEL-04, TEL-05,
 TEL-06 and TEL-07 — approvals, not carrier capability.
 
 The second is technical, and it is the one an engineer is likelier to get

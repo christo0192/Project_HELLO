@@ -292,7 +292,13 @@ engineering:
    wire: the two edits that follow it — the `PHONE_DIAL_ALLOWLIST` digest and
    `PHONE_DIAL_MODE=live` (§9 step 6, `phone-runtime.md` §11 step 9) — are the
    first configuration that can reach a carrier. `isLiveDialPermitted` requires
-   all five conditions, so provisioning the trunk alone dials nothing. *(This entry previously read "we do not have a number to dial
+   **four** conditions — `PHONE_SCREENING_ENABLED`, `PHONE_RUNTIME_ENABLED`,
+   `PHONE_DIAL_MODE=live` and a non-empty `PHONE_DIAL_ALLOWLIST` — and the
+   trunk is **not** one of them: trunk readiness is a **separate** gate,
+   `isPhoneTransportReady`, and `resolvePhoneSipClient` requires **both** before
+   it will build a live client. Provisioning the trunk alone therefore dials
+   nothing — not because it is one of several conditions, but because it sits
+   outside the permission gate entirely and satisfies none of it. *(This entry previously read "we do not have a number to dial
    from". That was stale, and stale in the dangerous direction: it pointed at
    carrier capability as the blocker when the real blockers are the approvals
    below and the wiring above.)*
