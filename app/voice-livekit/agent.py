@@ -21,6 +21,7 @@ from livekit.plugins import openai, sarvam
 
 import persistence
 import phone
+import phone_canary
 from observability import (
     Span,
     StructuredLogger,
@@ -693,7 +694,14 @@ def classify_answer_text(text: str) -> str | None:
 # Recording is OFF at session start, unconditionally. The one and only moment at
 # which it may exist is after `disclosure.delivered` is accepted — see
 # `_phone_recording_permitted`.
-_PHONE_NO_RECORDING = {"audio": False, "transcript": False, "traces": False, "logs": False}
+#
+# THE SAME OBJECT, not a second literal. The canonical definition moved into
+# `phone.py` when Canary-1 gained its own session start: two files each holding
+# their own copy of "recording is off" is exactly how one of them silently stops
+# saying it, and the canary's spoken disclosure claims "this call is not being
+# recorded". This alias keeps every existing reader of `_PHONE_NO_RECORDING`
+# working while making `phone.PHONE_NO_RECORDING` the single source.
+_PHONE_NO_RECORDING = phone.PHONE_NO_RECORDING
 
 
 async def _phone_recording_permitted() -> None:
@@ -885,6 +893,44 @@ async def _deliver_phone_instructions(agent: Any, text: str) -> bool:
         return False
 
 
+def _build_phone_provider_session() -> Any:
+    """The ONE construction site for the phone channel's provider pipeline.
+
+    Extracted verbatim from `_run_phone_session` — same kwargs, same env reads,
+    same order, no behaviour change — so that the Canary-1 branch drives the
+    SAME Sarvam STT, Sarvam TTS and Gemini configuration production drives.
+
+    Without this the canary would be a second copy of the model wiring, and a
+    drifting `SARVAM_TTS_VOICE`, `GEMINI_MODEL` or `GEMINI_BASE_URL` would make
+    Canary-1 green while production was broken. This repository has already paid
+    for a duplicated vocabulary that failed silently when the two copies
+    diverged; a green canary that proves nothing about production is the same
+    defect with a worse blast radius, because it is the thing standing between a
+    deploy and a real candidate's phone ringing.
+
+    NOTE what this shares and what it does not. It shares the PROVIDER
+    PIPELINE. It does not share `phone.phone_agent_class`, its function tools,
+    the human/machine classifier or `run_phone_gate`'s ordering — the canary
+    drives a bare `Agent`. See `docs/runbooks/phone-canary1.md` for the list of
+    what a green canary run does and does not evidence.
+    """
+    return AgentSession(
+        stt=sarvam.STT(
+            model=os.getenv("SARVAM_STT_MODEL", "saaras:v3"),
+            language=os.getenv("SARVAM_LANGUAGE", "en-IN"),
+        ),
+        tts=sarvam.TTS(
+            model=os.getenv("SARVAM_TTS_MODEL", "bulbul:v3"),
+            speaker=os.getenv("SARVAM_TTS_VOICE", "simran"),
+        ),
+        llm=openai.LLM(
+            model=GEMINI_MODEL,
+            api_key=os.getenv("GEMINI_API_KEY"),
+            base_url=GEMINI_BASE_URL,
+        ),
+    )
+
+
 async def _run_phone_entrypoint(ctx: JobContext, room_name: str) -> None:
     """Named-worker entry for a phone room.
 
@@ -894,6 +940,50 @@ async def _run_phone_entrypoint(ctx: JobContext, room_name: str) -> None:
     no attempt at all — every event would come back ``ignored:
     unknown_attempt`` and nothing would ever be recorded for the call.
     """
+    # ── Canary-1: the three-condition branch, before anything else ────
+    # ALL THREE must hold: the worker is armed by its own Fly secret, the
+    # DISPATCH says `mode == "canary"`, and the ROOM says `canary is true`.
+    # Any one of them missing is the existing behaviour, untouched.
+    #
+    # Two independent signals rather than one, and both from closed-key blobs
+    # that the production builders structurally cannot emit. A mismatch is a
+    # refusal, never a fallback: "the dispatch looked like a canary so we
+    # treated it as one" is how a real candidate ends up in a branch that posts
+    # no events and commits no boundaries.
+    #
+    # Placed BEFORE attempt-id resolution because a canary dispatch carries no
+    # attempt id by design. That is also why a DISARMED worker refuses it here
+    # and returns before `ctx.connect()` — the mechanism's strongest control is
+    # that its dispatch is inert on any worker that has not been armed.
+    if phone.phone_canary_enabled():
+        room_metadata = _room_metadata_from_context(ctx)
+        if phone.canary_mode_of(ctx) is not None and phone.is_canary_room(room_metadata):
+            canary_id = phone.canary_id_of(ctx)
+            if canary_id is None:
+                _log.warn(
+                    "unknown_event",
+                    error_type="phone_canary_refused",
+                    error_category="canary_id_missing",
+                )
+                return
+            await phone_canary.run_phone_canary(
+                ctx,
+                room_name,
+                canary_id,
+                session_factory=_build_phone_provider_session,
+                agent_factory=Agent,
+                close_room=_close_phone_room,
+                # The PRODUCTION wait function, with the CANARY's own bound.
+                # Reusing the function keeps one implementation of "has
+                # anything answered yet"; the separate bound exists because
+                # this clock starts at job assignment and must cover dispatch
+                # scheduling, a cold worker start and the whole ring window.
+                wait_for_participant=lambda: _wait_for_sip_participant(
+                    ctx, phone.canary_participant_wait_sec()
+                ),
+            )
+            return
+
     attempt_id = phone.attempt_id_from_dispatch_metadata(ctx)
     if attempt_id is None:
         # No attempt to post events against. Fail closed: do not connect, do not
@@ -953,21 +1043,7 @@ async def _run_phone_session(
     close_event = asyncio.Event()
     close_reason: dict[str, Any] = {}
 
-    session = AgentSession(
-        stt=sarvam.STT(
-            model=os.getenv("SARVAM_STT_MODEL", "saaras:v3"),
-            language=os.getenv("SARVAM_LANGUAGE", "en-IN"),
-        ),
-        tts=sarvam.TTS(
-            model=os.getenv("SARVAM_TTS_MODEL", "bulbul:v3"),
-            speaker=os.getenv("SARVAM_TTS_VOICE", "simran"),
-        ),
-        llm=openai.LLM(
-            model=GEMINI_MODEL,
-            api_key=os.getenv("GEMINI_API_KEY"),
-            base_url=GEMINI_BASE_URL,
-        ),
-    )
+    session = _build_phone_provider_session()
 
     @session.on("conversation_item_added")
     def _on_phone_item(event):  # noqa: ANN001

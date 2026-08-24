@@ -78,6 +78,7 @@ jobs:
             docs/runbooks/supabase-migration-strategy.md \
             docs/runbooks/supabase-prod-apply.md \
             docs/runbooks/phone-canary-and-halt.md \
+            docs/runbooks/phone-canary1.md \
             scripts/phone-canary/; then
             echo 'ERROR: trailing whitespace found'
             exit 1

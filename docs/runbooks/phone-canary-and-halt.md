@@ -9,7 +9,9 @@ is *how*.
 health surface, the knobs), [`phone-safe-dialer.md`](phone-safe-dialer.md) (the
 disclosure gate and the purge path),
 [`phone-assessment-resume.md`](phone-assessment-resume.md) (persistence and
-resume), [`phone-webhook-ingress.md`](phone-webhook-ingress.md) (the ingress).
+resume), [`phone-webhook-ingress.md`](phone-webhook-ingress.md) (the ingress),
+[`phone-canary1.md`](phone-canary1.md) (the owner's own-number test call — see
+§7, whose position this file used to hold and now explicitly reverses).
 
 > **The lane is off.** `PHONE_SCREENING_ENABLED`, `PHONE_RUNTIME_ENABLED` and
 > `PHONE_DIAL_MODE` all ship at their refusing defaults, and nothing in this
@@ -259,19 +261,39 @@ Pinned by `app/api/src/__tests__/phone-canary-verdicts.test.ts`:
 `sweeps_not_ok` means "no sweep has run in this process yet". These are three
 different operational situations and the surface keeps them apart.
 
-## 7. Canary-1 — documented, not implemented
+## 7. Canary-1 — mechanism implemented, shipped DISARMED, not run
 
-Canary-1 is the owner dialling **their own number** over a real trunk. It is
-**not implemented and has not been run.**
+Canary-1 is the owner dialling **their own number** over a real trunk. **No call
+has been placed.** Its mechanism landed in PR105 and ships structurally unable to
+place one: `CANARY1_ARMED` is a source constant shipped `false` and pinned
+`false` by a test, and while it is false the CLI refuses before every provider
+seam. See [`phone-canary1.md`](phone-canary1.md) for how to run it and
+[`ADR-0013 §8`](../adr/0013-phone-screening-runtime.md) for why the position
+below changed.
 
-**Why not implemented.** There is no safe ephemeral no-persistence path through
-this lane, by design. A screening that reaches `disclosure.delivered` writes an
-append-only ledger row, an attempt, a session, a plan snapshot, boundary rows,
-transcript turns and — on completion — an `assessments` row and a terminal
-engagement. That durability *is* the feature. A "canary mode" that skipped it
-would rehearse a different system from the one that runs, and building one would
-mean weakening the runtime to make a test convenient. We do not weaken the
-runtime for the canary.
+**The position this section used to hold, and its explicit reversal.** Until
+2026-08-24 this runbook said, and this paragraph is kept verbatim because a
+reversed position that reads as though it was never held is how the next
+reviewer loses the reasoning:
+
+> "There is no safe ephemeral no-persistence path through this lane, by design.
+> A screening that reaches `disclosure.delivered` writes an append-only ledger
+> row, an attempt, a session, a plan snapshot, boundary rows, transcript turns
+> and — on completion — an `assessments` row and a terminal engagement. That
+> durability *is* the feature. A 'canary mode' that skipped it would rehearse a
+> different system from the one that runs, and building one would mean weakening
+> the runtime to make a test convenient. We do not weaken the runtime for the
+> canary."
+
+**That position is NOT silently edited away, and its first clause still stands.**
+A `canaryMode` / `skipPersistence` branch inside the real runtime and worker
+path remains rejected, for its original reason. What PR105 built is a **parallel
+path that never enters the lane** — no admission, no attempt, no session row, no
+event client, no persistence import — so there is nothing for it to skip, and it
+changes **no environment variable anywhere**. The full four-part record, including
+what the old position's second clause still costs and what ships as a
+consequence, is **[ADR-0013 §8](../adr/0013-phone-screening-runtime.md)**. Read
+it before changing either document.
 
 **The gates in front of it**, all of which are PLAN P0 and none of which is
 engineering:
@@ -361,3 +383,26 @@ no gap list.
 * **Canary-0 needs Docker.** There is no in-memory fallback and there must not
   be: a fallback would make "the substrate is fine" and "we could not check"
   look the same.
+* **Canary-1's inert-dispatch control is now CONDITIONAL, not absolute.** A
+  dispatch carrying no `attempt_id`/`epoch` used to be refused by the worker
+  before `ctx.connect()`, unconditionally. PR105 adds a branch that reaches
+  connect and speech without an attempt id, behind a three-condition gate (a
+  worker-side Fly secret, the dispatch `mode`, the room `canary` marker). It is
+  unreachable from a real candidate because the production metadata builders are
+  literal closed-key constructors that cannot emit either marker — but the
+  absolute form of the claim is no longer what ships. See ADR-0013 §8.4.
+* **A lingering `PHONE_CANARY_ENABLED` secret is invisible to CI.**
+  `validate-voice-worker-apps.mjs` scans only the `[env]` tables of the Fly
+  configs, and the arming flag is a Fly **secret**. The post-run disarm is
+  therefore an **ops assertion** (`fly secrets list`, names only) and not a CI
+  one, and it is a numbered step in `phone-canary1.md` §9 rather than a memory.
+* **The DB halt does not cover Canary-1.** It stops admission and the due pass;
+  Canary-1 never admits. The abort is Ctrl-C, hang up, `fly scale count 0` —
+  a real reduction in emergency-stop coverage, acceptable only for a supervised
+  owner-to-self call with a second person present.
+* **Canary-1's zero-network test claim is weaker than Canary-0's.** Canary-0's
+  structural leg 1 is that the telephony SDK is not resolvable from
+  `scripts/phone-canary/` at all. It IS resolvable from `app/api/src/__tests__`,
+  so Canary-1's suite rests on dependency injection plus the runtime traps.
+  Both facts are asserted by tests rather than described, so the difference
+  cannot be borrowed by accident.

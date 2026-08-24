@@ -173,6 +173,158 @@ def _json_object(raw: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+# ── Canary-1: the separately-armed owner canary ───────────────────────
+# A parallel path that never enters the screening lane. It exists so the owner
+# can place ONE call to their OWN handset and verify transport, audio, STT, TTS
+# and the LLM, without a candidate row, without an admission, and without
+# weakening any gate that protects a real candidate.
+#
+# THE INBOUND GUARD BELOW IS BUILT HERE, NOT INHERITED. An earlier revision of
+# the Canary-1 design claimed `_DIGIT_RUN_RE` already refused inbound metadata
+# blobs. It does not: that constant has zero runtime call sites, and its tests
+# assert an OUTBOUND property of fixed spoken copy. `_json_object` applies no
+# such check. So the guard is implemented, with its own test and its own seeded
+# positive control, rather than cited.
+#
+# It is deliberately whole-blob and fail-closed: an unknown key ANYWHERE, or a
+# 7+ digit run ANYWHERE in the serialized form, refuses the ENTIRE blob. The
+# canary branch is then not entered, and the dispatch is inert — the shipped
+# worker refuses it `phone_dispatch_unresolved` before `ctx.connect()`.
+#
+# The outbound half of the agreement lives in `lib/phone-canary1/ids.ts`: a
+# uuid segment is eight hex characters and may legitimately be all digits, so
+# the CLI re-mints any identifier whose rendering would trip this rule. The
+# strict inbound rule therefore stays strict AND satisfiable, instead of
+# refusing a few percent of honest runs at random — which is how a real guard
+# acquires a reputation for flakiness and gets deleted.
+
+#: The dispatch `mode` value that selects the canary branch.
+CANARY_MODE = "canary"
+
+#: Closed key set for the canary DISPATCH blob. NOTE what is absent:
+#: `attempt_id` and `epoch`. Without them the shipped worker refuses this
+#: dispatch outright, which is what makes a disarmed or rolled-back deployment
+#: degrade to "a room nobody speaks in".
+CANARY_DISPATCH_KEYS: frozenset[str] = frozenset({
+    "session_id", "channel", "mode", "canary_id",
+})
+
+#: Closed key set for the canary ROOM blob.
+CANARY_ROOM_KEYS: frozenset[str] = frozenset({
+    "session_id", "room_name", "channel", "canary",
+})
+
+#: The worker's log handle. Eight lowercase hex characters and nothing else —
+#: not a uuid, so it cannot be mistaken for an attempt or session id.
+_CANARY_ID_RE = re.compile(r"^[0-9a-f]{8}$")
+
+
+def _canary_blob(raw: Any, allowed: frozenset) -> dict:
+    """Validate a canary metadata blob BEFORE reading anything out of it.
+
+    Three refusals, all fail-closed to ``{}``:
+
+      1. not decodable as a JSON object;
+      2. a 7+ digit run anywhere in the serialized form — the shape of a
+         dialable number, and the same rule 0042's metadata sanitizer applies;
+      3. any key outside ``allowed``.
+
+    Whole-blob, not per-field. A per-field check would read the fields it knows
+    about and ignore the one an attacker or a careless edit added.
+    """
+    if not raw:
+        return {}
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="ignore")
+    if not isinstance(raw, str):
+        return {}
+    if _DIGIT_RUN_RE.search(raw):
+        return {}
+    payload = _json_object(raw)
+    if not payload:
+        return {}
+    if not set(payload).issubset(allowed):
+        return {}
+    channel = payload.get("channel")
+    if not isinstance(channel, str) or channel.strip().lower() != PHONE_CHANNEL:
+        return {}
+    return payload
+
+
+def canary_mode_of(ctx: Any) -> str | None:
+    """Return the dispatch ``mode`` when this is a valid canary dispatch."""
+    payload = _canary_blob(dispatch_metadata_of(ctx), CANARY_DISPATCH_KEYS)
+    mode = payload.get("mode")
+    if not isinstance(mode, str) or mode.strip().lower() != CANARY_MODE:
+        return None
+    return CANARY_MODE
+
+
+def canary_id_of(ctx: Any) -> str | None:
+    """Return the opaque canary log handle, or None.
+
+    Strict on the shape so the handle can never carry anything else. It is the
+    ONLY canary identifier the worker ever logs.
+    """
+    payload = _canary_blob(dispatch_metadata_of(ctx), CANARY_DISPATCH_KEYS)
+    canary_id = payload.get("canary_id")
+    if not isinstance(canary_id, str) or not _CANARY_ID_RE.match(canary_id.strip()):
+        return None
+    return canary_id.strip()
+
+
+def is_canary_room(room_metadata: Any) -> bool:
+    """True when the ROOM declares itself a canary room.
+
+    The second of the two signals the branch requires. The production room
+    builder is a literal closed-key constructor that cannot emit ``canary``, so
+    a real candidate's room can never satisfy this — that is a structural fact
+    about the constructor, not an observation about today's values.
+    """
+    payload = _canary_blob(room_metadata, CANARY_ROOM_KEYS)
+    return payload.get("canary") is True
+
+
+def phone_canary_enabled() -> bool:
+    """The third condition: an explicit worker-side arming flag.
+
+    A Fly app SECRET, absent from `fly.phone.toml` and from version control, so
+    the armed state is a deliberate operator action with a matching disarm step
+    rather than something a deploy can carry in by accident.
+    """
+    return (os.getenv("PHONE_CANARY_ENABLED") or "").strip().lower() == "true"
+
+
+def canary_participant_wait_sec() -> float:
+    """The canary's OWN wait for 'something answered'.
+
+    Deliberately NOT `phone_participant_wait_sec()`. That clock starts at JOB
+    ASSIGNMENT, before the originate, so dispatch scheduling, a cold worker
+    start (`num_idle_processes: 0`, `initialize_process_timeout: 60.0`) and the
+    whole ring window are all charged against it. At the production default of
+    45 s it can expire ON THE HEALTHY PATH, and the failure reads to an operator
+    as a provider fault: the worker closes the room while the call is connecting
+    or has just been answered.
+
+    That is a wait charged against a budget sized for failure — the same class
+    as the invite deadline this lane repaired once already. The repair is a
+    dedicated knob sized for the canary sequence, and an inequality the CLI
+    REFUSES on (`waits_misordered`: participant wait >= ring + 60) rather than
+    an ambient hope that two defaults stay ordered.
+    """
+    return _bounded_float(os.getenv("PHONE_CANARY_PARTICIPANT_WAIT_SEC"), 120.0, 1.0, 180.0)
+
+
+def canary_max_call_sec() -> float:
+    """Hard ceiling on the canary conversation, seconds. Bounded, never a default."""
+    return _bounded_float(os.getenv("PHONE_CANARY_MAX_CALL_SEC"), 180.0, 30.0, 300.0)
+
+
+def canary_questions() -> int:
+    """How many of the fixed canary questions to ask. Clamped to what exists."""
+    return int(_bounded_float(os.getenv("PHONE_CANARY_QUESTIONS"), 2.0, 1.0, 3.0))
+
+
 def is_phone_room(room_name: Any, room_metadata: Any = None) -> bool:
     """True when the room belongs to the phone channel.
 
@@ -209,6 +361,22 @@ def participant_identity(participant: Any) -> str | None:
 # Constants, not model output. The identity, the purpose and the recording
 # notice are the three things a screening call is legally and ethically
 # required to say, so none of them may be left to a sampler.
+
+# ── Recording, the SESSION half ───────────────────────────────────────
+# Recording has TWO independent mechanisms in this worker, and only one of them
+# is the egress/attach path gated behind `disclosure.delivered`. The other is
+# the Agents session recorder, passed at `session.start(..., record=...)`. Its
+# default is NOT off, and the browser path deliberately passes a recording
+# configuration — so a phone session that omitted the kwarg would record while
+# the spoken disclosure said it did not.
+#
+# The constant lives HERE rather than in `agent.py` so that the production
+# phone session and the Canary-1 session import the SAME OBJECT. A second
+# literal in a second file is how the two drift, and the canary's disclosure
+# says "this call is not being recorded" — a defect there becomes a spoken
+# falsehood, which is the one class of bug this lane cannot take back.
+PHONE_NO_RECORDING = {"audio": False, "transcript": False, "traces": False, "logs": False}
+
 
 PHONE_DISCLOSURE_TEXT = (
     f"Hi, this is Christy, an AI voice assistant calling from {_COMPANY} "

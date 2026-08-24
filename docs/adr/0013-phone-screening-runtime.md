@@ -177,7 +177,12 @@ object key or a transcript fragment is *unrepresentable* rather than stripped.
 A digest over the whole document detects editing; internal-consistency checks
 detect a re-sealed lie.
 
-### 7. Canary-1 is documented and NOT implemented
+### 7. Canary-1 was documented and NOT implemented (superseded by §8)
+
+> **Superseded on 2026-08-24 by §8.** This section records the position as it
+> was held, verbatim, because a reversed position that reads as though it was
+> never held is how the next reviewer loses the reasoning. Everything below
+> about TEL-01..TEL-07 still stands and still blocks the call.
 
 Canary-1 is the owner dialling **their own number** over a real trunk. It is
 described in `docs/runbooks/phone-canary-and-halt.md` §7 and it is deliberately
@@ -216,6 +221,76 @@ from the one that runs, and adding one would mean weakening the runtime to make
 a test convenient. **We do not weaken the runtime for the canary.** Canary-1
 therefore runs on real rows and is cleaned up afterwards by the documented purge
 path, or it does not run.
+
+### 8. Canary-1's MECHANISM is implemented and ships DISARMED — an explicit reversal of §7's second reason
+
+**Dated 2026-08-24. PR105.** §7's first reason — the legal one — is unchanged
+and still blocks the call. Its **second** reason is reversed here, deliberately
+and on the record.
+
+**1. The position, as it was held.** From `docs/runbooks/phone-canary-and-halt.md`
+§7 and from §7 above, verbatim:
+
+> "There is no safe ephemeral no-persistence path through this lane, by design.
+> A screening that reaches `disclosure.delivered` writes an append-only ledger
+> row, an attempt, a session, a plan snapshot, boundary rows, transcript turns
+> and — on completion — an `assessments` row and a terminal engagement. That
+> durability *is* the feature. A 'canary mode' that skipped it would rehearse a
+> different system from the one that runs, and building one would mean
+> weakening the runtime to make a test convenient. **We do not weaken the
+> runtime for the canary.**"
+
+**2. What changed, and what did not.** We are still not building an ephemeral
+path *through the lane*. A `canaryMode` / `skipPersistence` branch inside the
+real runtime and worker path is **still rejected, for its original reason**: a
+skip-persistence branch in the real path is one refactor from being reachable
+by a real candidate.
+
+What PR105 builds is a **parallel path that never enters the lane**. It performs
+no admission, mints no attempt, writes no session row, constructs no event
+client and imports no persistence, so there is nothing for it to skip. The
+configuration argument is the verifiable half: `isLiveDialPermitted` and
+`isPhoneTransportReady` are pure functions over injected data, so the mechanism
+assembles its own `PhoneScreeningConfig` in process and **changes no environment
+variable anywhere** — not on the API, not on either worker, not in any Fly
+secret that a real candidate's dial reads. No runtime gate is weakened because
+no runtime gate is touched.
+
+**3. What the old position's second clause still costs.** It warned that a
+canary mode "rehearses a different system", and that remains **partly true**.
+The repair reduces it rather than dismissing it: `_build_phone_provider_session`
+is extracted in `agent.py` as a pure refactor and called by BOTH the production
+phone session and the canary, so the Sarvam STT, Sarvam TTS and Gemini
+configuration under test are the production ones — a drifted `SARVAM_TTS_VOICE`
+or `GEMINI_MODEL` fails the canary. What is **not** shared is the screening
+agent: the canary drives a bare `Agent`, so `phone.phone_agent_class`, its
+function tools, the human/machine classifier and `run_phone_gate`'s ordering are
+unexercised. That is the price, and `docs/runbooks/phone-canary1.md` lists it in
+full rather than leaving a green run to be read as coverage.
+
+**4. What ships as a consequence.** Two things, both named rather than absorbed:
+
+* **The inert-dispatch control narrows from absolute to conditional.** Today a
+  dispatch without `attempt_id`/`epoch` is refused by the worker before
+  `ctx.connect()`, unconditionally. PR105 adds a branch that reaches connect and
+  speech WITHOUT an attempt id. It is kept unreachable from a real candidate by
+  a three-condition gate — a worker-side Fly secret, the dispatch `mode`, and
+  the room `canary` marker — and by the production metadata builders being
+  literal closed-key constructors that cannot emit either marker. But "a
+  dispatch with no attempt id is always inert" is no longer what ships, and
+  pretending otherwise would be the stale-tripwire class this lane keeps
+  finding.
+* **A disarm lifecycle is therefore mandatory, not optional.** `CANARY1_ARMED`
+  ships `false` and is pinned false by a test; arming is PR106, which is
+  declared revert-on-completion with its revert commit prepared and linked
+  before the run. The worker's flag is a Fly **secret**, and
+  `scripts/validate-voice-worker-apps.mjs` scans only `[env]` tables — so a
+  lingering secret is invisible to CI, which is exactly why the post-run disarm
+  is an **ops assertion** (`fly secrets list`, names only) and not a CI one.
+
+**Blast radius.** No migration, no API route, no API environment variable, no
+Fly config, no browser-worker change. The browser session in `agent.py`
+constructs separately and is untouched.
 
 ## Consequences
 
@@ -296,6 +371,31 @@ second case, which is the one a later revert actually produces.
   into one. It does not re-verify the 133 — that needs a live database this
   gate has no Docker for, and pretending otherwise would be the decorative
   evidence this lane keeps deleting.
+* `app/api/src/__tests__/phone-canary1-*.test.ts` — **169 declared test cases**
+  across seven files covering Canary-1's structural closure (the explicit file
+  list including `app/api/scripts/phone-canary1.ts`, the moved-not-duplicated
+  `node:fs` read permission, the no-write sweep, the containment ordering), the
+  refusals, the six bounds and their three inequalities, the originate seam, the
+  teardown, a `fast-check` privacy property over the whole valid destination
+  space, and the two-sided cross-language pin against `phone_canary.py`.
+  `scripts/check-phone-canary-evidence.test.mjs` derives this figure from the
+  test sources and fails in EITHER direction if it and this record disagree.
+  This number is **not comparable** to the two above and never will be: 133
+  counts SQL checks against a live database, 139 counts offline assertions in a
+  dependency-free gate, and 169 counts test-case DECLARATIONS in a vitest suite
+  — the runtime total is higher because several cases are `it.each(...)` tables.
+  The checker counts declarations because it runs before `npm ci` in
+  `quality.yml` and cannot execute the suite; `npm test` in `app/api` is what
+  proves they pass. Canary-1's zero-network claim is also weaker than
+  Canary-0's, and is labelled so in `PROTOCOL.md`: the telephony SDK IS
+  resolvable from `app/api/src/__tests__`, so the property rests on dependency
+  injection and the runtime traps rather than on unresolvability.
+* `app/voice-livekit/tests/test_phone_canary.py` — the worker half: the
+  `record=`/`PHONE_NO_RECORDING` identity-of-source pin with its
+  drop-the-kwarg and second-literal controls, the three-condition gate, the
+  disarmed-worker inert-dispatch proof, the inbound closed-key + digit-run
+  guard with a seeded positive control, the per-process one-shot latch, and the
+  Dockerfile COPY closure with a negative control.
 * `app/api/src/__tests__/phone-canary-verdicts.test.ts` — the health verdict
   assertions (`off` is healthy-disabled; `start_failed` is exclusive; halt,
   unreadable control and sweep errors degrade truthfully; `null` and `0` stay
