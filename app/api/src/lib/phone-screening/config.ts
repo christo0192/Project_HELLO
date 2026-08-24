@@ -72,6 +72,22 @@ export type PhoneDialMode = (typeof PHONE_DIAL_MODES)[number];
  * fatal: a malformed value falls back to the default rather than throwing at
  * import, so a typo in an operator's environment cannot take the API down.
  */
+/**
+ * How long the OPENING GATE may take, from the moment somebody answers to the
+ * moment the agent's first heartbeat lands.
+ *
+ * It covers `classify.human`, the spoken disclosure, the candidate's answer,
+ * the `disclosure.delivered` post and the AWAITED LiveKit egress call inside
+ * that same request. It is an allowance, not a measurement: nothing enforces
+ * it on the agent, and its only job here is to size the lease so the gate
+ * cannot outlive the slot it is holding.
+ *
+ * Sixty seconds is deliberately generous. The cost of being too generous is a
+ * fleet slot held slightly longer than necessary; the cost of being too mean
+ * is hanging up on a candidate who has just consented.
+ */
+export const PHONE_OPENING_GATE_SECONDS = 60;
+
 export const PHONE_BOUNDS = {
   /**
    * Default internal-appointment slot length. Bounded by
@@ -92,8 +108,38 @@ export const PHONE_BOUNDS = {
    * Concurrency-lease length handed to `admit_phone_attempt` /
    * `heartbeat_phone_attempt`. Those RPCs clamp independently to [5, 900];
    * these bounds stay inside that range so the two never disagree.
+   *
+   * ── WHY THE DEFAULT IS 180 AND NOT 60 ────────────────────────────
+   * The lease has to cover the whole stretch during which NOBODY IS
+   * HEARTBEATING YET, and that stretch is longer than it looks:
+   *
+   *   originate begins ─ lease is extended once, pre-originate, to
+   *                      max(originateTimeoutSeconds + LEASE_MARGIN, lease)
+   *   the line rings ─── up to `ringTimeoutSeconds` (45 by default, 120 max)
+   *   somebody answers ─ and only now does the opening gate start
+   *   the gate runs ──── classify.human, the spoken disclosure, the
+   *                      candidate's answer, the `disclosure.delivered` post,
+   *                      and an AWAITED LiveKit egress call inside that same
+   *                      request
+   *   the agent beats ── first heartbeat, at last
+   *
+   * At 60 the pre-originate lease was max(75, 60) = 75s from the START of
+   * the originate, so a candidate answering on the last ring left roughly
+   * THIRTY SECONDS for a gate that spends part of it waiting on a provider.
+   * A gate that overran met an already-lapsed lease, the first beat answered
+   * `lease_lost`, and the agent hung up seconds after the candidate had
+   * consented — and because the engagement is `in_call` by then, the room
+   * close charged a reconnect and the next leg carried the same risk.
+   *
+   * 180 covers `ringTimeoutSeconds` at its maximum plus a full
+   * `PHONE_OPENING_GATE_SECONDS`, and still leaves the published heartbeat
+   * cadence (a third of the lease, 60s) comfortably under half of it.
+   *
+   * The relation is ENFORCED, not merely defaulted — see
+   * `lease_too_short_for_gate` in `dialPhoneAttempt`. This PR has twice
+   * shipped a bound that lived only in a paragraph, and twice had it missed.
    */
-  leaseSeconds: { def: 60, min: 5, max: 900 },
+  leaseSeconds: { def: 180, min: 5, max: 900 },
   /** Largest ingress webhook body accepted before it is refused unread. */
   webhookMaxBytes: { def: 65_536, min: 1_024, max: 1_048_576 },
   /** Replay tolerance on a signed ingress timestamp. */

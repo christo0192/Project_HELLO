@@ -50,6 +50,25 @@ export const PHONE_DUE_SKIPS = [
   // empty `skipped` map, so a code for it here could never be emitted — and a
   // vocabulary entry that nothing can produce reads to an operator as a state
   // that has never occurred rather than one that cannot.
+  //
+  // ── WHY `unknown_state` BELOW IS NOT THE SAME CASE ─────────────────
+  // It looks like one: `listDueEngagements` filters `state` to
+  // `PHONE_DUE_STATES` and `dueState()` drops anything else, so
+  // `dueAttemptKind` cannot return null for a row the PRODUCTION reader
+  // produced, and the count should never leave zero in a healthy fleet.
+  //
+  // The difference is that `unknown_state` IS emitted — the `kind === null`
+  // branch below bumps it — and it is reachable, by any reader whose state
+  // filter has drifted from `dueAttemptKind`'s. That is precisely the defect
+  // it exists to report, and it is a code defect rather than an operational
+  // condition, so it must be countable when it happens. `halted` has no such
+  // branch at all: the early return means no code path can reach the map.
+  //
+  // So the rule is not "delete anything with a zero count" — it is "every
+  // member must have a reachable emitter". `unknown_state` has one and
+  // `halted` does not, which is why one is listed here and the other is not.
+  // A non-zero count means the two lists have drifted apart; see the
+  // fail-closed note in `docs/runbooks/phone-runtime.md` §12.
   'not_yet_due',
   'outside_ist_window',
   'candidate_already_offered',

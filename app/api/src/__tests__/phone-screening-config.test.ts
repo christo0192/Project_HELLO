@@ -12,6 +12,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
   MAX_DIAL_ALLOWLIST_ENTRIES,
+  PHONE_OPENING_GATE_SECONDS,
   PHONE_BOUNDS,
   PHONE_DIAL_MODES,
   describePhoneScreeningConfig,
@@ -99,7 +100,11 @@ describe('defaults: an empty environment does nothing', () => {
     expect(c.slotSeconds).toBe(1_800);
     expect(c.reconnectBackoffSeconds).toBe(120);
     expect(c.ringTimeoutSeconds).toBe(45);
-    expect(c.leaseSeconds).toBe(60);
+    // 180, not 60. The lease has to span the whole stretch during which
+    // nobody is heartbeating yet — the ring, then the opening gate with its
+    // awaited egress call — and at 60 a candidate answering on the last ring
+    // left roughly thirty seconds for it.
+    expect(c.leaseSeconds).toBe(180);
     expect(c.webhookMaxBytes).toBe(65_536);
     expect(c.webhookToleranceSeconds).toBe(300);
   });
@@ -356,5 +361,115 @@ describe('the env contract holds in BOTH directions', () => {
       expect((SCHEMA.components.api.variables[name] as { requiredInProduction: boolean })
         .requiredInProduction).toBe(false);
     }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+//  The lease must outlive the stretch nobody heartbeats
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('the shipped lease covers ring + opening gate, and the cadence stays under half of it', () => {
+  it('the DEFAULT lease covers the WORST-CASE ring plus a full opening gate', () => {
+    // Asserted against the bounds, not against literals: raising
+    // `ringTimeoutSeconds.max` without raising the lease is exactly the drift
+    // this is here to catch, and a literal 180 would not notice it.
+    expect(PHONE_BOUNDS.leaseSeconds!.def)
+      .toBeGreaterThanOrEqual(PHONE_BOUNDS.ringTimeoutSeconds!.max + PHONE_OPENING_GATE_SECONDS);
+  });
+
+  it('the published heartbeat cadence is STRICTLY under half the lease, across the whole range', () => {
+    // The route publishes `max(1, floor(leaseSeconds / 3))`. A third is under
+    // a half for every positive integer, so what this really guards is
+    // somebody changing the divisor — which is why it sweeps the bound range
+    // rather than checking the default.
+    const { min, max, def } = PHONE_BOUNDS.leaseSeconds!;
+    for (const lease of [min, def, max, min + 1, Math.floor((min + max) / 2)]) {
+      const cadence = Math.max(1, Math.floor(lease / 3));
+      expect(cadence * 2, `cadence ${cadence} against lease ${lease}`).toBeLessThan(lease);
+    }
+  });
+
+  it('CONTROL — a HALF-lease cadence would fail the same assertion', () => {
+    // Without this the sweep above passes for an assertion that cannot fail.
+    const lease = PHONE_BOUNDS.leaseSeconds!.def;
+    expect(Math.floor(lease / 2) * 2).not.toBeLessThan(lease);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+//  `.env.example` MUST BE A CONFIGURATION THAT DIALS
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('the shipped .env.example satisfies the bounds it will be measured against', () => {
+  /** Every `PHONE_*=<integer>` actually written in `.env.example`. */
+  function exampleInts(): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const m of ENV_EXAMPLE.matchAll(/^(PHONE_[A-Z0-9_]*)=(-?\d+)\s*$/gm)) {
+      out[m[1]] = Number.parseInt(m[2], 10);
+    }
+    return out;
+  }
+
+  it('CONTROL — the parser finds the values this block reasons about', () => {
+    // Without this, every assertion below is vacuously true the moment the
+    // file is reformatted or a knob is commented out: `undefined` would
+    // simply never be compared. This is the guard the guard needed.
+    const ints = exampleInts();
+    for (const name of ['PHONE_LEASE_SECONDS', 'PHONE_RING_TIMEOUT_SECONDS'] as const) {
+      expect(ints, `${name} is not parsed out of .env.example`).toHaveProperty(name);
+      expect(Number.isFinite(ints[name])).toBe(true);
+    }
+  });
+
+  it('the EXAMPLE lease covers the example ring plus a full opening gate', () => {
+    // THE DEFECT THIS EXISTS FOR. `PHONE_BOUNDS.leaseSeconds.def` was raised
+    // to 180 to cover the opening gate, and the dial controller was taught to
+    // REFUSE `lease_too_short_for_gate` below that relation — but
+    // `.env.example` still said 60 against a 45 s ring. Because the file sets
+    // the value EXPLICITLY, the raised default never reached anybody who used
+    // it: an operator copying this file got a lane that refused every single
+    // dial, which is the failure the raise was meant to prevent, inverted.
+    //
+    // Asserted against the example's OWN ring value, not the default, because
+    // the file is free to set both and the relation is between the two.
+    const ints = exampleInts();
+    const lease = ints.PHONE_LEASE_SECONDS;
+    const ring = ints.PHONE_RING_TIMEOUT_SECONDS;
+    expect(
+      lease,
+      `.env.example ships PHONE_LEASE_SECONDS=${lease} against `
+      + `PHONE_RING_TIMEOUT_SECONDS=${ring}; dialPhoneAttempt refuses `
+      + `lease_too_short_for_gate below ${ring + PHONE_OPENING_GATE_SECONDS}, `
+      + 'so this file would place no calls at all',
+    ).toBeGreaterThanOrEqual(ring + PHONE_OPENING_GATE_SECONDS);
+  });
+
+  it('every exampled integer this module bounds is INSIDE its bounds', () => {
+    // A value outside [min,max] is silently clamped, so the file would be
+    // documenting a number the system does not use.
+    const ints = exampleInts();
+    const bounded: ReadonlyArray<[string, keyof typeof PHONE_BOUNDS]> = [
+      ['PHONE_SLOT_SECONDS', 'slotSeconds'],
+      ['PHONE_RECONNECT_BACKOFF_SECONDS', 'reconnectBackoffSeconds'],
+      ['PHONE_RING_TIMEOUT_SECONDS', 'ringTimeoutSeconds'],
+      ['PHONE_LEASE_SECONDS', 'leaseSeconds'],
+      ['PHONE_WEBHOOK_MAX_BYTES', 'webhookMaxBytes'],
+      ['PHONE_WEBHOOK_TOLERANCE_SECONDS', 'webhookToleranceSeconds'],
+    ];
+    for (const [envName, boundKey] of bounded) {
+      const b = PHONE_BOUNDS[boundKey]!;
+      expect(ints, `${envName} missing from .env.example`).toHaveProperty(envName);
+      const v = ints[envName];
+      expect(v, `${envName}=${v} is below its floor ${b.min}`).toBeGreaterThanOrEqual(b.min);
+      expect(v, `${envName}=${v} is above its ceiling ${b.max}`).toBeLessThanOrEqual(b.max);
+    }
+  });
+
+  it('CONTROL — a 60 s lease against the exampled ring WOULD fail the relation', () => {
+    // The old shipped pair, asserted to be rejected by the same arithmetic the
+    // test above applies. Without this, that test passes for a relation that
+    // nothing can violate.
+    const ring = exampleInts().PHONE_RING_TIMEOUT_SECONDS;
+    expect(60).toBeLessThan(ring + PHONE_OPENING_GATE_SECONDS);
   });
 });

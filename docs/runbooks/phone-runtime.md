@@ -46,9 +46,12 @@ loop that can cause a call would return its zero result untouched.
 
 **What P5 is.** The thing P4a and P4b deliberately left out: a *caller*. P4a shipped
 `dialPhoneAttempt` with no production caller and said so; P3 shipped
-`runPhoneReconciliation` uncalled. P5 arms five supervised loops that drive the work
+`runPhoneReconciliation` uncalled. P5 arms **seven** supervised loops that drive the work
 already written and reviewed, and adds one genuinely new capability — reading a
-candidate's `phone_e164` out of SQL (§9).
+candidate's `phone_e164` out of SQL (§9). Five of those loops shipped with P5; two
+(`phone-dayroll`, `phone-stranded`) arrived with `0045`, along with the attempt-lease
+heartbeat, after review found that two transitions `0042` had assigned to P5 still had no
+driver at all.
 
 **What P5 is NOT:**
 
@@ -71,11 +74,18 @@ candidate's `phone_e164` out of SQL (§9).
 
 ---
 
-## 2. The five loops
+## 2. The seven loops
 
-All five are registered on one `createLoopScheduler` with `metricPrefix: 'phone'`.
+All seven are registered on one `createLoopScheduler` with `metricPrefix: 'phone'`.
 `start()` staggers each loop's first tick by up to one whole interval, which is why
 staleness is measured from the later of `lastTickAt` and `startedAt` (§10).
+
+**Two of the seven arrived with `0045`** — `phone-dayroll` and `phone-stranded`.
+`phone-dayroll` drives transition **#27**, which `0042` had assigned to P5 and which had no
+driver at all; `phone-stranded` resolves the wedge that left engagements pointing at an
+ended session. They are the two loop names that can appear in `sweeps_not_ok` alongside
+`reclaim`, `expire` and `reconcile` (§10), so an operator reading a degrade reason will find
+them here.
 
 | Loop | Cadence knob | Bound | What it does |
 |---|---|---|---|
@@ -83,7 +93,28 @@ staleness is measured from the later of `lastTickAt` and `startedAt` (§10).
 | `phone-due` | `PHONE_RUNTIME_DUE_MS` | `PHONE_RUNTIME_DUE_LIMIT` engagements per pass | Offers due engagements to admission. The only loop that can cause a call. |
 | `phone-reclaim` | `PHONE_RUNTIME_RECLAIM_MS` | `PHONE_RUNTIME_RECLAIM_LIMIT` rows per pass | `reclaim_phone_attempt_leases` — expired **attempt** leases, i.e. leaked fleet slots. |
 | `phone-maintain` | `PHONE_RUNTIME_EXPIRE_MS` | `PHONE_RUNTIME_RECLAIM_LIMIT` rows per pass | `expire_phone_appointments`, and nothing else. |
+| `phone-dayroll` | `PHONE_RUNTIME_EXPIRE_MS` | `PHONE_RUNTIME_RECLAIM_LIMIT` rows per pass | **`0045`.** `sweep_phone_day_rolled` — posts `day.rolled`, the only edge out of `awaiting_retry`. **Places no call.** |
+| `phone-stranded` | `PHONE_RUNTIME_EXPIRE_MS` | `PHONE_RUNTIME_RECLAIM_LIMIT` rows per pass | **`0045`.** `sweep_phone_stranded_sessions` — engagements pointing at an already-ended session. **Redials nobody.** |
 | `phone-reconcile` | `PHONE_RUNTIME_RECONCILE_MS` | Its own defaults — 25 attempts, 6 h lookback | `runPhoneReconciliation` — P3's dropped-webhook sweep. |
+
+**`phone-dayroll`** drives transition **#27**, which is the only edge out of
+`awaiting_retry`. Nothing in this repository had ever posted `day.rolled`, so before `0045`
+the FIRST unanswered call ended the ladder and the contract's "three attempts on three
+distinct IST dates" was unreachable. It runs on the **expire** cadence rather than a knob
+of its own, deliberately: a day boundary moves once a day, so anything under an hour is
+already far more often than the thing it watches for. Its dedup id is
+`dayroll:<engagement>:<ist_date>` — passed explicitly, because the `internal:` default is
+identical every day and would have wedged the ladder after one roll.
+
+**`phone-stranded`** removes the residue the heartbeat's absence used to create: a
+screening that was conducted and scored, whose engagement left `in_call` before the
+completion arrived, points at a terminal session, so `ensureSession` refuses and the row is
+skipped `no_session` on every pass for ever. A terminal session **with** a phone assessment
+row completes its engagement; one **without** becomes a truthful `failed`. It never dials.
+
+Both new loops take a **sweep claim** before working (`claim_phone_sweep`) — see the
+replica note in §12. A claim held by another replica is a healthy answer and holds the
+cadence; a *broken* claim backs off rather than hot-spinning.
 
 **`phone-dial`** exists to drain the queue, not to work it. `admit_phone_attempt`
 enqueues a `phone.dial` job *inside* the admitting transaction; an admission that cannot
@@ -379,9 +410,9 @@ far shorter clock."*
 | | `job_queue.lease_token` (0028) | `phone_call_attempts.lease_token` (0042) |
 |---|---|---|
 | Guards | **Work execution** — one claim of one job by one worker | **The fleet slot** — one of the ten simultaneous live calls |
-| Length | `PHONE_RUNTIME_JOB_LEASE_SECONDS`, default 60 s (5–900) | `PHONE_LEASE_SECONDS`, default 60 s (5–900), **renewed for the whole conversation** |
+| Length | `PHONE_RUNTIME_JOB_LEASE_SECONDS`, default 60 s (5–900) | `PHONE_LEASE_SECONDS`, default **180 s** (5–900), **renewed for the whole conversation** |
 | Effective lifetime | One claim — seconds | An originate, a classification and a full assessment — minutes |
-| Renewed by | The queue runner's own heartbeat, at `leaseSeconds / 3` | `heartbeat_phone_attempt` |
+| Renewed by | The queue runner's own heartbeat, at `leaseSeconds / 3` | `heartbeat_phone_attempt_by_epoch`, called by the **agent** via `POST /api/internal/phone/attempt/heartbeat` (`0045`) |
 | Reclaimed by | `reclaim_expired_jobs`, queue-name-agnostic | `reclaim_phone_attempt_leases`, the `phone-reclaim` loop |
 | Losing it means | The job is re-claimable by another worker | The attempt is `abandoned`, the slot is freed, the engagement is restored |
 
@@ -402,6 +433,83 @@ One consequence worth naming: `PHONE_ORIGINATE_TIMEOUT_SECONDS` must stay well b
 lease. `PHONE_RUNTIME_JOB_LEASE_SECONDS` has nothing to do with it, and tuning the wrong
 one changes nothing about the risk it appears to address.
 
+### Who actually renews the attempt lease, and what happens when it lapses
+
+Before `0045` **nobody did** — the lease was extended once, pre-originate, and never again,
+so any conversation outliving that single extension lost its fleet slot mid-call. `0045`
+adds the missing half:
+
+- `heartbeat_phone_attempt_by_epoch` fences on `epoch >= p_epoch`. The agent learns its
+  epoch from dispatch metadata as admission minted it, and `disclosure.delivered` bumps the
+  attempt row's epoch *before* the beating starts, so `>=` admits exactly the one legal
+  in-attempt bump and nothing else. The session term is
+  `(session_id is null or session_id = p_session_id)` on purpose: `start_phone_assessment`
+  binds that column *after* the opening gate, so early beats legitimately arrive with it
+  null, and a strict equality there would answer `lease_lost` to a live call.
+- `POST /api/internal/phone/attempt/heartbeat` is the worker route in front of it. **The
+  server owns the cadence** — it answers `next_heartbeat_seconds` as
+  `max(1, floor(leaseSeconds / 3))` — so a worker cannot drift, and only a literal
+  `lease_lost` from the RPC is forwarded as `lease_lost`. An unrecognised status from a
+  future revision is a retryable 500, because an answer we did not understand is not
+  evidence the lease is gone.
+- The agent loop beats immediately, re-clamps from the server's answer rather than trusting
+  its own timer, treats a raising client as an *unconfirmed* beat rather than dying
+  silently, and halts on `lease_lost`. It tolerates two consecutive failures: the cadence is
+  at most a third of the lease, so the smallest lease consistent with it is `2 × interval`,
+  and after two failures the whole guaranteed margin is spent.
+
+**`lease_lost` means hang up.** It is the one signal that stops a live call, which is why a
+false positive on it is worse than a missed beat — and why the two loosened terms above are
+loosened in the direction of *not* claiming the lease is gone.
+
+### Why the attempt lease defaults to 180 s, and why that is ENFORCED
+
+The attempt lease is extended **once**, pre-originate, to
+`max(originateTimeoutSeconds + 15, leaseSeconds)`. After that **nobody heartbeats** until
+the agent's first beat — and the agent's first beat is a long way off:
+
+```
+originate begins ── lease extended once, here, and not again
+the line rings ──── up to PHONE_RING_TIMEOUT_SECONDS (45 default, 120 max)
+somebody answers ── and only NOW does the opening gate start
+the gate runs ───── classify.human, the spoken disclosure, the candidate's
+                    answer, the `disclosure.delivered` post, and an AWAITED
+                    LiveKit egress call inside that same request
+the agent beats ─── first heartbeat, at last
+```
+
+At the old default of 60 the pre-originate lease was `max(75, 60) = 75 s` from the *start*
+of the originate, so a candidate answering on the last ring left roughly **thirty seconds**
+for a gate that spends part of it waiting on a provider. A gate that overran met an
+already-lapsed lease: the first beat answered `lease_lost` and the agent hung up seconds
+after the candidate had consented — and because the engagement is `in_call` by then, the
+room close charged a **reconnect**, so the next leg carried the same risk.
+
+`PHONE_OPENING_GATE_SECONDS` (60) is the allowance for that gate. It is an allowance, not a
+measurement: nothing enforces it on the agent, and its only job is to size the lease. 180
+covers `ringTimeoutSeconds` **at its maximum** plus a full gate, and still leaves the
+published heartbeat cadence (a third of the lease) under half of it.
+
+**The relation is a refusal, not a default.** `dialPhoneAttempt` answers
+`lease_too_short_for_gate` — before it contacts the provider, and before admission, so a
+misconfiguration burns no attempt, no fleet slot and no day of the candidate's budget —
+whenever:
+
+```
+PHONE_LEASE_SECONDS < PHONE_RING_TIMEOUT_SECONDS + PHONE_OPENING_GATE_SECONDS
+```
+
+It refuses rather than silently stretching the lease, because a lease long enough to be
+safe is a deployment decision and quietly extending it would hold fleet slots nobody
+budgeted for. The consequence to know before tuning: **a lease under that sum places no
+calls at all.** `.env.example` ships 180 against a 45 s ring for exactly this reason — the
+old 60/45 pair is now a refusal, so a config copied from an older deployment will dial
+nothing until the lease is raised.
+
+This bound is asserted in code rather than described here because this lane has twice
+shipped a bound that lived only in a paragraph — `reclaimMs` against the lease, and this
+one — and had it missed both times. A default is a suggestion; a refusal is a bound.
+
 ---
 
 ## 7. The three independent budgets
@@ -411,7 +519,7 @@ comment says they are *"never mixed"*.
 
 | Budget | Column | Bound | Charged |
 |---|---|---|---|
-| No-answer | `no_answer_attempts` | 0..3 | **At the outcome** — `sip.no_answer`, busy, voicemail (#11/#12) |
+| No-answer | `no_answer_attempts` | 0..3 | **At the outcome** — `sip.no_answer`, busy, voicemail (#11/#12), **whatever the attempt's `kind`** — see the exception below |
 | Reconnect | `reconnects_used` | 0..3 | **At the grant** (#19) |
 | Provider | `provider_failures` | 0..5 | At the outcome — `provider_error` (#13); the fifth transitions to `failed` |
 
@@ -428,8 +536,32 @@ The counter is reset only when a genuinely new conversation begins: an epoch bum
 attempt kind is *not* `reconnect`. Resetting it on a reconnect's disclosure would make
 "max 3 reconnects" unenforceable — every reconnect that reached `in_call` would zero it.
 
-**Why a reconnect does not consume the daily no-answer budget.** The two are independent
-because the index that bounds the daily budget **excludes `reconnect` by construction**:
+**An UNANSWERED RECONNECT charges the no-answer budget. This is a known divergence from
+the acceptance contract's wording, and it is deliberate to leave as-is.** The charge
+branches on the *event*, not on the attempt's kind — in `0045`'s `apply_phone_event`, which
+is the authoritative definition:
+
+```sql
+when v_eng.state = 'dialing' and p_event_type = 'sip.originate_timeout' then
+  v_att_state := 'ended'; v_outcome := 'no_answer'; v_charge := 'no_answer'; -- #12
+```
+
+There is no `v_att.kind` test on that branch, and `reconnect` is a kind that reaches
+`dialing`. So a reconnect leg that rings out increments `no_answer_attempts`. The *grant*
+honours the contract exactly — #19 charges `reconnects_used`, and the IST-day index
+excludes `kind='reconnect'` (below) — and only the **unanswered reconnect dial** diverges.
+
+The direction is safe: it spends the candidate's own no-answer allowance rather than
+granting extra calls, so the failure mode is *fewer* rings, never more. It is left in place
+because the alternative — a kind-guarded charge — means an unanswered reconnect costs
+nothing at all, and a flapping call could then be redialled indefinitely on a budget that
+never moves. **Whoever reconciles this should change the acceptance wording, not the
+branch.** Do not "fix" it by adding a kind test without replacing the bound it removes.
+
+**Why a reconnect does not consume the daily *attempt* budget.** Distinct from the above,
+and about a different mechanism — the IST-day index, not the counter. The two are
+independent because the index that bounds the daily budget **excludes `reconnect` by
+construction**:
 
 ```sql
 create unique index if not exists uq_phone_attempts_one_per_ist_day
@@ -644,27 +776,50 @@ fleet-wide question is answered by the **durable backlog** on the same response
 the database and is true of everybody. If the backlog shows live attempts while this
 process reports `enabled: false`, that is a correctly-behaving fleet, not a contradiction.
 
-One important ambiguity: `index.ts` wraps construction in its own try/catch and logs
-`phone_runtime_start_failed` on a throw. At the health surface a runtime that **failed to
-construct** is indistinguishable from one that is **deliberately off** — both are
-`enabled: false`. Check the startup log before concluding the flags are off. See §12.
+**`enabled: false` no longer hides a BROKEN runtime.** This used to be a genuine ambiguity
+— a runtime that threw on construction reported exactly what a deliberately-disabled one
+reports — and it is now closed. `index.ts` still wraps construction in its own try/catch
+and logs `phone_runtime_start_failed`, but the failure is also **recorded** as
+`runtime.start_failed`, and a disabled-but-failed process contributes the
+`phone_runtime_start_failed` degradation reason. Arming is guarded on the same terms:
+`armPhoneRuntime` does `scheduler.start()` and registration in order, records a failure and
+never throws, because a runtime that constructs and then fails to arm is just as broken and
+was just as invisible.
 
-### The five degradation reasons
+So `enabled: false` with **no** reasons is the shipped default and healthy; `enabled: false`
+with `phone_runtime_start_failed` is a fault on this replica. A successful registration
+clears the flag, because a registered runtime is proof that construction succeeded.
 
-These are appended to `reasons` **after** the pre-existing backlog reasons, so the older
-codes keep their order and meaning. They are additive: a stale or erroring loop degrades
-the surface even when every backlog count is healthy — which is precisely the silent-stall
-case, a healthy backlog with no worker turning.
+### The six degradation reasons
+
+Five are additive; the sixth is exclusive. `phone_runtime_start_failed` is returned **on its
+own and nothing else is evaluated** — a runtime that never constructed has no loops to be
+stale and no sweeps to have failed, so every other reason would be noise about a process
+that isn't running.
+
+The other five are appended to `reasons` **after** the pre-existing backlog reasons, so the
+older codes keep their order and meaning. They are additive: a stale or erroring loop
+degrades the surface even when every backlog count is healthy — which is precisely the
+silent-stall case, a healthy backlog with no worker turning.
 
 | Reason | What it means | What to do |
 |---|---|---|
+| `phone_runtime_start_failed` | **Exclusive.** `createPhoneRuntime` or `armPhoneRuntime` threw in this process, so `enabled` is `false` for a *fault* rather than by choice. No other reason is reported alongside it. | This replica is placing no calls and running no sweeps, and it looks disabled. Read the `phone_runtime_start_failed` startup log for the throw. Restart the replica; if it recurs, the construction dependency (config parse, Supabase client, scheduler) is the fault and the flags are not the fault. Confirm cover by reading the durable backlog, which is fleet-wide. |
 | `phone_runtime_stopped` | A runtime **is** registered but `scheduler.health().running` is false. The process has loops that are not turning. | This process is placing no calls and reclaiming no leases. Check whether shutdown ran without clearing the registration, then restart the replica. Confirm another replica is covering by reading `concurrency` and `engagements_by_state` in the backlog block. |
-| `phone_loop_stale` | Some loop's anchor — the **later** of `lastTickAt` and `startedAt` — is older than `max(30 s, interval × 3)`. A tick is wedged, almost always on an `await` that never resolved. | Read `runtime.loops[]` and find *which* loop by name. `phone-due` stale ⇒ nothing is being dialled. `phone-reclaim` stale ⇒ fleet slots are leaking; cross-check `concurrency.live_with_unexpired_lease` against `max_concurrent` (10) and expect `at_capacity` refusals next. `phone-dial` stale ⇒ the queue is filling. `phone-maintain` stale ⇒ appointments will read `overdue`. `phone-reconcile` stale ⇒ dropped webhooks are unrecovered, so attempts whose calls really ended stay live and hold fleet slots. A stale loop is a restart, not a tuning problem. |
+| `phone_loop_stale` | Some loop's anchor — the **later** of `lastTickAt` and `startedAt` — is older than `max(30 s, interval × 3)`. A tick is wedged, almost always on an `await` that never resolved. | Read `runtime.loops[]` and find *which* loop by name. `phone-due` stale ⇒ nothing is being dialled. `phone-reclaim` stale ⇒ fleet slots are leaking; cross-check `concurrency.live_with_unexpired_lease` against `max_concurrent` (10) and expect `at_capacity` refusals next. `phone-dial` stale ⇒ the queue is filling. `phone-maintain` stale ⇒ appointments will read `overdue`. `phone-dayroll` stale ⇒ the no-answer ladder stops advancing, so engagements sit in `awaiting_retry` and are never retried on the next IST day. `phone-stranded` stale ⇒ engagements pointing at ended sessions accumulate and are skipped `no_session` on every pass. `phone-reconcile` stale ⇒ dropped webhooks are unrecovered, so attempts whose calls really ended stay live and hold fleet slots. A stale loop is a restart, not a tuning problem. |
 | `phone_loop_erroring` | Some loop has `consecutiveErrors > 0`. The loop is still armed and still ticking; the errors are counted, not swallowed. | Distinguish transient from persistent by polling twice: `consecutiveErrors` resets on a clean tick. A rising count on `phone-due` with a rising `last_due.refusals` is a downstream refusal, not a loop fault. A rising count with `last_due` unchanged means the pass is throwing before it completes — check database reachability first, since every read in the seam throws a bare code and the detail is deliberately not in the response. |
-| `phone_due_halted` | The most recent due pass returned `status: 'halted'`. **No call was attempted and no session was created.** | Decide *which* halt (§4) using the backlog block on the same response. `admission.halted: true` with a `halt_reason` ⇒ someone raised the kill switch; that is working as intended and the fix is `POST /api/phone/halt/clear`. `halt_unreadable` also present ⇒ the control singleton is missing or unreadable, which is a **database** problem, not a dialer problem, and the lane is correctly refusing to guess. The other four loops keep running throughout — deliberately, because they terminate in-flight work and free slots. Note this reason fires only on a genuine halt: a pass stopped by `PHONE_DIAL_MODE=off` reports `last_due.status: 'disabled'`, which is not a degradation reason at all. |
-| `phone_sweep_not_ok` | A sweep's most recent RPC did not answer `ok`. The offending sweep names itself in `runtime.sweeps_not_ok` (`reclaim`, `expire`), as stable codes only. | This is the reason that exists because a count of `0` could not carry it. On a non-`ok` status the loop reports the count as **`null`**, not `0`, and names the sweep here — so `last_reclaimed: 0` now means "swept, found nothing", `last_reclaimed: null` with `reclaim` in `sweeps_not_ok` means "the sweep did not happen", and `null` with an empty `sweeps_not_ok` means "no sweep has run in this process yet". `reclaim` listed ⇒ expired attempt leases are accumulating and each one holds a fleet slot, so expect `at_capacity` refusals next; check the RPC's grants and that `reclaim_phone_attempt_leases` still exists under that name. `expire` listed ⇒ appointments will read `overdue` in the backlog block. Both are database-side failures, not loop faults: the loop is still ticking, which is why `phone_loop_erroring` does NOT fire alongside. |
+| `phone_due_halted` | The most recent due pass returned `status: 'halted'`. **No call was attempted and no session was created.** | Decide *which* halt (§4) using the backlog block on the same response. `admission.halted: true` with a `halt_reason` ⇒ someone raised the kill switch; that is working as intended and the fix is `POST /api/phone/halt/clear`. `halt_unreadable` also present ⇒ the control singleton is missing or unreadable, which is a **database** problem, not a dialer problem, and the lane is correctly refusing to guess. The other six loops keep running throughout — deliberately, because they terminate in-flight work and free slots. Note this reason fires only on a genuine halt: a pass stopped by `PHONE_DIAL_MODE=off` reports `last_due.status: 'disabled'`, which is not a degradation reason at all. |
+| `phone_sweep_not_ok` | A sweep's most recent RPC did not answer `ok`. The offending sweep names itself in `runtime.sweeps_not_ok` — one or more of `reclaim`, `expire`, `reconcile`, `dayroll`, `stranded` — as stable codes only. | This is the reason that exists because a count of `0` could not carry it. On a non-`ok` status the loop reports the count as **`null`**, not `0`, and names the sweep here — so `last_reclaimed: 0` now means "swept, found nothing", `last_reclaimed: null` with `reclaim` in `sweeps_not_ok` means "the sweep did not happen", and `null` with an empty `sweeps_not_ok` means "no sweep has run in this process yet". `reclaim` listed ⇒ expired attempt leases are accumulating and each one holds a fleet slot, so expect `at_capacity` refusals next; check the RPC's grants and that `reclaim_phone_attempt_leases` still exists under that name. `expire` listed ⇒ appointments will read `overdue` in the backlog block. `dayroll` listed ⇒ transition #27 is not being posted, so the no-answer ladder is stalled and candidates who did not answer are never called again. `stranded` listed ⇒ engagements pointing at a terminal session are not being resolved and are skipped `no_session` every pass. `reconcile` listed ⇒ P3's dropped-webhook sweep is not running. All are database-side failures, not loop faults: the loop is still ticking, which is why `phone_loop_erroring` does NOT fire alongside. **A `broken` sweep claim lands here too** — see the replica note in §12 for why the claim is not an election. |
 
 ### The counts
+
+Alongside `last_reclaimed`, `last_expired` and `last_reconciled`, `0045` adds
+**`last_rolled`** (`phone-dayroll`: rows advanced past the IST day boundary) and
+**`last_stranded`** (`phone-stranded`: engagements resolved — completed plus failed). All
+five follow the same `null`-versus-`0` convention described in the `phone_sweep_not_ok` row
+above: `0` means "swept, found nothing", `null` with the sweep named in `sweeps_not_ok`
+means "the sweep did not happen", and `null` with an empty `sweeps_not_ok` means "no sweep
+has run in this process yet".
 
 `last_due` carries `status` (`ok` / `halted` / `disabled`), `examined`, `offered`,
 `dialing`, and `skipped` / `refusals` keyed by **stable code only** — never by row
@@ -750,16 +905,20 @@ replacing them. Do those first.
    the `off` mode gate in step 4 already stops the due pass — but it costs nothing and it
    is the control you will want to have already proved works.
 4. **`PHONE_RUNTIME_ENABLED=true` on ONE replica, and restart it.** Every knob and flag is
-   read at construction, so this needs a restart. `runtime.enabled` becomes `true`, **five**
-   loops appear in `runtime.loops[]`, and `runtime.config` reports the seven integers this
-   process clamped. `last_due.status` reads **`disabled`**, not `halted` — because
+   read at construction, so this needs a restart. `runtime.enabled` becomes `true`,
+   **seven** loops appear in `runtime.loops[]`, and `runtime.config` reports the seven
+   integers this process clamped. `last_due.status` reads **`disabled`**, not `halted` — because
    `PHONE_DIAL_MODE` is still `off`, and the mode gate is evaluated before the halt (§4).
    Watch `ticks` climb and `consecutiveErrors` stay 0.
-5. **Confirm the three sweep loops are healthy before going further.** `phone-reclaim`,
-   `phone-maintain` and `phone-reconcile` are all doing real work now — reclaiming leases,
-   expiring appointments and reading LiveKit room state — while the due pass does nothing
-   at all. This is the cheapest place to find a credential or connectivity problem, and it
-   is free of any effect on a candidate.
+5. **Confirm the five sweep loops are healthy before going further.** `phone-reclaim`,
+   `phone-maintain`, `phone-dayroll`, `phone-stranded` and `phone-reconcile` are all doing
+   real work now — reclaiming leases, expiring appointments, rolling the IST day, resolving
+   stranded sessions and reading LiveKit room state — while the due pass does nothing at
+   all. This is the cheapest place to find a credential or connectivity problem, and it is
+   free of any effect on a candidate. Check `sweeps_not_ok` is empty and that
+   `last_reclaimed`, `last_expired`, `last_rolled`, `last_stranded` and `last_reconciled`
+   are numbers rather than `null` — a `null` here means the sweep did not run, not that it
+   found nothing.
 6. **`PHONE_DIAL_MODE=synthetic`, and restart.** The due pass now runs, and the halt from
    step 3 stops it: `last_due.status` moves from `disabled` to `halted`. That transition is
    the proof that both gates are wired.
@@ -811,7 +970,7 @@ therefore needs a restart:
 * `PHONE_DIAL_MODE=off` — the due pass returns its disabled zero and touches no seam. This
   now genuinely stops admissions; before the mode became a due-pass gate it only downgraded
   the SIP client, leaving attempt rows, fleet slots and budget charges still moving (§4).
-* `PHONE_RUNTIME_ENABLED=false` — no runtime is constructed on the next boot, so all five
+* `PHONE_RUNTIME_ENABLED=false` — no runtime is constructed on the next boot, so all seven
   loops stop, including the ones that free fleet slots.
 * `PHONE_SCREENING_ENABLED=false` — the whole domain, and with it the reconciliation's own
   internal gate.
@@ -838,25 +997,46 @@ Recorded as choices or as gaps, not smoothed over.
   `PHONE_RUNTIME_RECLAIM_LIMIT` does not reach it.
 - **The appointment expiry shares `PHONE_RUNTIME_RECLAIM_LIMIT`.** There is no separate
   bound; raising the reclaim batch also raises the expiry batch.
-- **There is no leader election and no replica coordination.** Every replica with both
-  flags on runs its own due pass on its own clock. Safety rests entirely on
-  `admit_phone_attempt`'s advisory lock, `uq_phone_attempts_one_live`,
-  `uq_phone_attempts_one_per_ist_day` and the fleet cap — all of which are database
-  guarantees and all of which have been reviewed. What P5 adds is *load*: N replicas mean N
-  due reads, N number reads and N sets of losing admissions per `DUE_MS`. Enabling the
-  runtime on one replica is the recommended posture and is not enforced by anything. The
-  three sweep loops (`phone-reclaim`, `phone-maintain`, `phone-reconcile`) are individually
-  safe to run everywhere — they are bounded sweeps over disjoint predicates — but running
-  them N times over is still N times the load, and `phone-reconcile` is N times the provider
-  traffic.
-- **A construction failure is indistinguishable from "off" at the health surface.**
-  `index.ts` catches, logs `phone_runtime_start_failed` and leaves `phoneRuntime` null, so
-  `runtime.enabled` reads `false` — the same value a deliberately-disabled process reports,
-  and it contributes no degradation reason. The startup log is the only place the
-  difference appears.
+- **There is still no leader election. There IS now partial replica coordination, and it
+  is a CLAIM rather than an election.** Every replica with both flags on runs its own due
+  pass on its own clock. Safety rests on `admit_phone_attempt`'s advisory lock,
+  `uq_phone_attempts_one_live`, `uq_phone_attempts_one_per_ist_day` and the fleet cap — all
+  database guarantees, all reviewed — **plus two things `0045` added that are now
+  load-bearing**:
+
+  *The two candidate guards inside admission.* Guard A refuses when somebody is already on
+  the phone with this person, on any engagement and of any kind; Guard B refuses a second
+  cold call to the same person on the same IST day. Together they close, at the database,
+  the cross-pass and cross-replica halves of the one-offer-per-candidate hazard that the
+  due pass's in-memory `Set` can only close within a single pass. Guard B deliberately
+  excludes `reconnect` **and** `scheduled`: a booked slot is not a cold call, and refusing
+  it would mean the candidate agreed to a time and nobody rang.
+
+  *The sweep claim* (`claim_phone_sweep`), taken by `phone-dayroll` and `phone-stranded`.
+  It is **not an election** and must not be read as one — it can lapse while its holder is
+  still working. That is acceptable only because every sweep behind it is idempotent, and
+  it is the reason those two loops are safe to leave armed on every replica. `claimed()`
+  distinguishes `held_by_other` — the normal answer every replica but one hears, which
+  holds the cadence — from `broken`, a genuine fault that backs off and surfaces as
+  `phone_sweep_not_ok`. Conflating those two would have disabled both new loops fleet-wide
+  behind a green health surface.
+
+  *What P5 adds is load.* N replicas mean N due reads, N number reads and N sets of losing
+  admissions per `DUE_MS`. Enabling the runtime on one replica is the recommended posture
+  and is not enforced by anything. The five sweep loops (`phone-reclaim`, `phone-maintain`,
+  `phone-dayroll`, `phone-stranded`, `phone-reconcile`) are individually safe to run
+  everywhere — they are bounded sweeps over disjoint predicates, and the two newest also
+  take the claim above — but running them N times over is still N times the load, and
+  `phone-reconcile` is N times the provider traffic.
+- **~~A construction failure is indistinguishable from "off" at the health surface.~~
+  CLOSED by `0045`.** `runtime.start_failed` now records the throw and a failed process
+  contributes the exclusive `phone_runtime_start_failed` reason (§10). Arming is guarded on
+  the same terms via `armPhoneRuntime`, because a runtime that constructs and then fails to
+  arm was just as broken and just as invisible. Kept here, struck through, only because the
+  gap was cited in enough places to be worth contradicting explicitly.
 - **All runtime counters are in-process and reset on restart.** `last_due`, `dial_jobs`,
-  `last_reclaimed`, `last_expired` and `last_reconciled` describe this process's life since
-  boot. There is no durable time series and no aggregation across replicas; the durable
+  `last_reclaimed`, `last_expired`, `last_reconciled`, `last_rolled` and `last_stranded`
+  describe this process's life since boot. There is no durable time series and no aggregation across replicas; the durable
   record is `audit_events` and the backlog.
 - **`phone-dial` and `phone-due` share one cadence.** Both scheduler loops are armed at
   `dueMs` (`runtime.ts`, the `loops:` array and the `loopIntervalsMs` map that reports it).
@@ -879,9 +1059,9 @@ Recorded as choices or as gaps, not smoothed over.
   used, by callers that drive their own loop.)
 - **READING HAZARD — `tickAll()` does not tick all.** The handle's `tickAll()` is
   `await runner.tick()` and nothing else: it drives the **queue runner only** and touches
-  none of the five scheduler loops, so it never runs a due pass, a reclaim, an expiry or a
-  reconciliation. Tests that call it are testing the dial queue, whatever the surrounding
-  `describe` is named. If you want a due pass in a test, call the loop's `tick` (or
+  none of the seven scheduler loops, so it never runs a due pass, a reclaim, an expiry, a
+  day roll, a stranded-session resolution or a reconciliation. Tests that call it are
+  testing the dial queue, whatever the surrounding `describe` is named. If you want a due pass in a test, call the loop's `tick` (or
   `runPhoneDuePass`) directly; `tickAll()` will silently do nothing for you. The name is
   the whole hazard — `tickQueue()` would say what it does — and it is left as-is here only
   because it is part of `PhoneRuntimeHandle` and renaming it is a code change.
@@ -891,17 +1071,36 @@ Recorded as choices or as gaps, not smoothed over.
 - **Nothing here drives the P4a recording purge.** `phone-safe-dialer.md` §10 records that
   the purge has no armed driver; P5 does not add one. The maintain loop runs the appointment
   expiry and the webhook reconciliation, and nothing else.
-- **`enabled: false` still hides a stopped fleet.** Because a disabled process contributes
-  no degradation reason, a deployment where **every** replica failed to construct its
-  runtime reports `status: ok` with a healthy-looking backlog and no reason at all — until
-  the backlog itself ages into `attempt_leases_expired` or `appointments_overdue`. There is
-  no "somebody should be running the loops" assertion anywhere, because no process can
-  honestly make it.
-- **The `unknown_state` skip is unreachable in normal operation.** `dueAttemptKind` returns
-  null only for a state outside `PHONE_DUE_STATES`, and `listDueEngagements` filters on
-  exactly those three. It remains as a fail-closed guard rather than a live signal: a
-  non-zero count means the two lists have drifted apart, which is a code defect and not an
-  operational condition.
+- **`enabled: false` still hides a DELIBERATELY stopped fleet — but no longer a broken
+  one.** A deployment where every replica *failed to construct* its runtime now reports
+  `phone_runtime_start_failed` on every replica (§10), so that case is visible. What remains
+  invisible is a fleet where every replica is deliberately disabled: it reports `status: ok`
+  with a healthy-looking backlog and no reason at all, until the backlog itself ages into
+  `attempt_leases_expired` or `appointments_overdue`. There is still no "somebody should be
+  running the loops" assertion anywhere, because no single process can honestly make it —
+  the view is process-local by construction.
+- **An unanswered RECONNECT charges the no-answer budget, which diverges from the
+  acceptance contract's wording.** `apply_phone_event`'s `sip.originate_timeout` branch sets
+  `v_charge := 'no_answer'` without testing `v_att.kind`, and `reconnect` is a kind that
+  reaches `dialing`. The grant side honours the contract exactly; only the unanswered
+  reconnect dial diverges. Documented in full at §7, including why it should be resolved in
+  the contract rather than by adding a kind test — the charge is currently the only thing
+  bounding redials of a flapping call. Substrate-level, so a `0042`-family migration.
+
+- **The `unknown_state` skip is unreachable in normal operation, and is KEPT on purpose.**
+  `dueAttemptKind` returns null only for a state outside `PHONE_DUE_STATES`, and
+  `listDueEngagements` filters on exactly those three, so the production reader cannot
+  produce a row that emits it. It remains as a fail-closed guard rather than a live signal:
+  a non-zero count means the two lists have drifted apart, which is a code defect and not
+  an operational condition — so treat it as a bug report, not a tuning signal.
+
+  It is worth being precise about why this is **not** the same case as the absent `halted`
+  code, since the vocabulary in `due-loop.ts` states the rule for one right above the entry
+  for the other. The rule is *"every member must have a reachable emitter"*, not *"every
+  member must have a non-zero count"*. `unknown_state` has an emitter — the `kind === null`
+  branch — reachable by any reader whose state filter drifts from `dueAttemptKind`.
+  `halted` has no branch at all: the halted pass returns early with an empty map, so no
+  code path could ever reach it.
 - **`findReusableSession` still LOOKS up by candidate; adoption is now scoped by
   ownership.** `call_sessions` carries no engagement column, so the candidate is the only
   key the lookup can use: the newest row for the candidate with `mode = 'live'`, status

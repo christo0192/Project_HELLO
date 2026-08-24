@@ -45,6 +45,7 @@
 
 import {
   admitPhoneEngagement,
+  PHONE_OPENING_GATE_SECONDS,
   isPhoneRuntimeActive,
   type PhoneAdmissionDeps,
   type PhoneAdmissionRequest,
@@ -72,6 +73,7 @@ export const PHONE_DIAL_REFUSALS = [
   'admission_refused',
   'transport_not_configured',
   'timeouts_misordered',
+  'lease_too_short_for_gate',
   'room_unavailable',
   'lease_too_short',
   'originate_failed',
@@ -147,6 +149,28 @@ export async function dialPhoneAttempt(
   // defaults staying in the right order forever.
   if (config.ringTimeoutSeconds >= dialConfig.originateTimeoutSeconds) {
     return { status: 'refused', refusal: 'timeouts_misordered', providerContacted: false };
+  }
+
+  // ── Gate 1a-bis: the lease must cover the OPENING GATE ──────────────
+  // The lease is extended once, pre-originate, and then NOBODY heartbeats
+  // until the agent's first beat — which happens only after the line has
+  // rung, somebody has answered, the disclosure has been delivered and
+  // answered, and an AWAITED LiveKit egress call has returned. A lease that
+  // does not span all of that lapses under a live conversation: the first
+  // beat answers `lease_lost`, the agent hangs up on a candidate who has
+  // just consented, and because the engagement is `in_call` by then the
+  // room close charges a reconnect and the next leg carries the same risk.
+  //
+  // Asserted HERE rather than left to the default, for the same reason
+  // `timeouts_misordered` above is: this lane has now twice shipped a bound
+  // that lived only in a paragraph, and twice had it missed. A default is a
+  // suggestion; a refusal is a bound.
+  //
+  // It refuses rather than silently extending, because a lease long enough
+  // to be safe is a deployment decision — quietly stretching it would hold
+  // fleet slots an operator never budgeted for.
+  if (config.leaseSeconds < config.ringTimeoutSeconds + PHONE_OPENING_GATE_SECONDS) {
+    return { status: 'refused', refusal: 'lease_too_short_for_gate', providerContacted: false };
   }
 
   // ── Gate 1b: somewhere to send it ───────────────────────────────────

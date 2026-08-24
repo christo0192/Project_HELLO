@@ -432,8 +432,15 @@ export function createPhoneRuntimeReader(client: SupabaseClient): PhoneRuntimeRe
      * reconnect, and one clause cannot be both.
      *
      * So the reconnect batch is READ SEPARATELY and merged AHEAD. Both reads
-     * go through `readDueBatch`, so they share the column list, the terminal filter and the ordering — but NOT the clock predicate and NOT the bound, the
-     * column list, the ordering and the bound; only the state filter differs.
+     * go through `readDueBatch`, so they SHARE the column list, the
+     * `terminal_at is null` filter and the `updated_at asc` ordering. Three
+     * things DIFFER, all three deliberately: the **state filter**
+     * (`in PHONE_DUE_STATES` against `eq 'reconnecting'`), the **clock
+     * filter** (`dueClockPredicate` against the `updated_at <= now − backoff`
+     * ceiling below) and the **bound** (`limit` against `limit − 1`). The
+     * clock filter is the one that looks mergeable and is not — see the block
+     * immediately below for what happened when the reconnect read borrowed
+     * the main predicate.
      * The cost is one extra bounded, indexed read per pass — paid on the
      * cheapest and most latency-sensitive loop in the lane.
      *

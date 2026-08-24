@@ -136,7 +136,10 @@ caller.
 ## 6. The lease must outlive the originate
 
 `waitUntilAnswered: true` makes the originate **block**, and the SDK's default `timeout`
-in that mode is 60 s — exactly the default `PHONE_LEASE_SECONDS`.
+in that mode is 60 s. That was once *exactly* the default `PHONE_LEASE_SECONDS`; the lease
+default is now 180 s (see `phone-runtime.md` §6 for why), so the two no longer coincide.
+The hazard was never the coincidence, though — it is that a bound holding a fleet slot
+would otherwise be whatever the provider SDK happens to default to.
 
 If the originate outlives its lease, `reclaim_phone_attempt_leases` abandons the attempt
 while the dial is still in flight: two calls hold one fleet slot, and the engagement has
@@ -148,8 +151,10 @@ before touching the SDK if it cannot** — including when the heartbeat succeeds
 900 s clamp returns less than we asked for. "We asked for enough" is not "we have
 enough".
 
-Keep `PHONE_ORIGINATE_TIMEOUT_SECONDS` (default 30) well below `PHONE_LEASE_SECONDS`
-(default 60).
+Keep `PHONE_ORIGINATE_TIMEOUT_SECONDS` (default **60**, bounded 5–90) well below
+`PHONE_LEASE_SECONDS` (default **180**, bounded 5–900). The originate default was
+documented here as 30 for a while; `PHONE_DIAL_BOUNDS.originateTimeoutSeconds` has always
+read `def: 60`, and 60 is what `.env.example` ships.
 
 ---
 

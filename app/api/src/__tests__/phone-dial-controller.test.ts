@@ -762,3 +762,77 @@ describe('the ring bound must fit INSIDE the originate bound', () => {
     expect(res.status).toBe('dialing');
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+//  R-1 — the lease must cover the stretch nobody heartbeats
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('a lease that cannot span ring + opening gate is REFUSED, not stretched', () => {
+  // The lease is extended once, pre-originate, and then nobody beats until
+  // the agent's first heartbeat — which happens only after the line has rung,
+  // somebody has answered, the disclosure has been delivered AND answered,
+  // and an awaited LiveKit egress call has returned. A lease that does not
+  // span all of that lapses under a live conversation: the first beat says
+  // `lease_lost` and the agent hangs up on a candidate who has just
+  // consented. Because the engagement is `in_call` by then, the room close
+  // charges a reconnect and the next leg carries the same risk.
+
+  for (const [lease, ring, label] of [
+    ['60', '45', 'the OLD shipped default — 60 against a 45s ring'],
+    ['104', '45', 'one second under the relation'],
+    ['5', '5', 'both at their floor'],
+  ] as const) {
+    it(`refuses before the SDK: ${label}`, async () => {
+      const h = harness({
+        config: screeningConfig({
+          PHONE_LEASE_SECONDS: lease,
+          PHONE_RING_TIMEOUT_SECONDS: ring,
+        }),
+        dialConfig: loadPhoneDialConfig({
+          PHONE_SIP_TRUNK_ID: 'trunk-1',
+          PHONE_ORIGINATE_TIMEOUT_SECONDS: '60',
+        }),
+      });
+      const res = await run(h);
+
+      expect(res.status).toBe('refused');
+      expect(res.refusal).toBe('lease_too_short_for_gate');
+      expectNoNetwork(res, h);
+      // Refused BEFORE admission: a misconfiguration must not burn an
+      // attempt, a fleet slot or a day of the candidate's budget.
+      expect(h.admit).not.toHaveBeenCalled();
+    });
+  }
+
+  it('exactly AT the relation is admitted — the bound is >=, not >', async () => {
+    const h = harness({
+      config: screeningConfig({
+        PHONE_LEASE_SECONDS: '105',
+        PHONE_RING_TIMEOUT_SECONDS: '45',
+      }),
+      dialConfig: loadPhoneDialConfig({
+        PHONE_SIP_TRUNK_ID: 'trunk-1',
+        PHONE_ORIGINATE_TIMEOUT_SECONDS: '60',
+      }),
+    });
+    const res = await run(h);
+    expect(res.refusal).not.toBe('lease_too_short_for_gate');
+  });
+
+  it('CONTROL — the SHIPPED defaults satisfy the relation and reach the seam', async () => {
+    // This is the assertion that makes the three refusals above mean
+    // something: without it they are satisfied by a gate that refuses every
+    // configuration, which would take the whole lane down rather than
+    // protecting anybody.
+    const h = harness({
+      config: screeningConfig({}),
+      dialConfig: loadPhoneDialConfig({
+        PHONE_SIP_TRUNK_ID: 'trunk-1',
+        PHONE_ORIGINATE_TIMEOUT_SECONDS: '60',
+      }),
+    });
+    const res = await run(h);
+    expect(res.refusal).not.toBe('lease_too_short_for_gate');
+    expect(h.admit).toHaveBeenCalled();
+  });
+});
