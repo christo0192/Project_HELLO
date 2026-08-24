@@ -562,6 +562,69 @@ for (const [name] of LEAK_PATTERNS) {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// 12. The ADR's blast-radius claim must stay true, in BOTH directions
+// ══════════════════════════════════════════════════════════════════════
+
+/**
+ * ADR-0013 originally said P8B "is scripts, tests and documentation only". It
+ * is not: it also refactors `app/voice-livekit/agent.py`, which is production
+ * worker runtime. The claim was defensible about BEHAVIOUR and false about
+ * BLAST RADIUS, and an auditor reading it would not have gone looking for the
+ * runtime file. An independent review caught it.
+ *
+ * A prose correction rots. This guard is deliberately TWO-SIDED, because each
+ * side alone would decay into a different lie:
+ *
+ *   * if the ADR stops naming `agent.py`, the false-blast-radius state returns;
+ *   * if `agent.py` stops carrying the seam the ADR describes, the ADR is
+ *     describing a refactor that is no longer there.
+ *
+ * A one-sided grep would pass happily through the second case, which is the
+ * one a later revert actually produces.
+ */
+{
+  const adrPath = path.join(REPO, 'docs/adr/0013-phone-screening-runtime.md');
+  const adr = readFileSync(adrPath, 'utf8');
+
+  // Extract the section, and FAIL if the anchor is missing rather than
+  // asserting over an empty string — a renamed heading must not make every
+  // assertion below pass vacuously.
+  const start = adr.indexOf('**Blast radius.**');
+  const end = adr.indexOf('## Evidence');
+  ok('ADR_BLAST_RADIUS_SECTION_EXISTS', start !== -1 && end > start,
+    'the Blast radius paragraph is missing or moved after Evidence');
+  const blast = start !== -1 && end > start ? adr.slice(start, end) : '';
+
+  ok('ADR_NAMES_THE_PRODUCTION_RUNTIME_EDIT',
+    blast.includes('app/voice-livekit/agent.py'),
+    'ADR-0013 no longer names the production runtime file P8B edits');
+  ok('ADR_NAMES_THE_SEAM_IT_CLAIMS',
+    blast.includes('_await_candidate_activity') && blast.includes('wait_for_activity'),
+    'ADR-0013 describes the refactor without naming the seam');
+
+  // The retired claim, pinned as retired. Cheap, and it is the exact sentence
+  // the review flagged.
+  ok('ADR_DROPPED_THE_DOCS_ONLY_CLAIM',
+    !/scripts,? tests,? and documentation only/.test(adr),
+    'the inaccurate "scripts, tests and documentation only" claim is back');
+
+  // ── The other direction: the seam must actually be there ──────────────
+  const agent = readFileSync(path.join(REPO, 'app/voice-livekit/agent.py'), 'utf8');
+  ok('AGENT_CARRIES_THE_EXTRACTED_SEAM',
+    /async def _await_candidate_activity\(/.test(agent),
+    'agent.py no longer defines the seam ADR-0013 describes');
+  // Defaulted, and defaulted TO the production helper — that default is the
+  // whole basis of the "behaviour-preserving" claim, so it is what gets pinned
+  // rather than the parameter's mere presence.
+  ok('AGENT_SEAM_IS_OPTIONAL_AND_DEFAULTS_TO_PRODUCTION',
+    /wait_for_activity: [^\n]*\| None = None/.test(agent)
+    && /wait_for_activity if wait_for_activity is not None else _await_candidate_activity/
+      .test(agent),
+    'the silence loop no longer defaults to the production wait — the ADR\'s '
+    + 'behaviour-preserving claim would be false');
+}
+
+// ══════════════════════════════════════════════════════════════════════
 
 console.log('');
 if (failures.length > 0) {

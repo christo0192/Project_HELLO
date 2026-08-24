@@ -225,8 +225,35 @@ surface publishes booleans, bounded integers, ISO timestamps and stable codes
 and no row identity. Suppression is recorded against a digest and the digest is
 the audit row's target id, so no number appears in the audit trail.
 
-**Migration.** None. P8B adds no migration and changes no runtime behaviour; it
-is scripts, tests and documentation only.
+**Blast radius.** No migration, and no behavioural change — but **not**
+"scripts, tests and docs only", and this record said exactly that in an earlier
+draft. It was wrong in the way that matters: an auditor reading it would not
+have gone looking for the production-runtime file the change actually touches.
+The honest enumeration is:
+
+* **`app/voice-livekit/agent.py` — production worker runtime.**
+  `_await_candidate_activity` is extracted out of `_silence_termination_loop`
+  and passed back in as a defaulted `wait_for_activity` parameter. It is a
+  **behaviour-preserving DI refactor**: the default *is* the `asyncio.wait_for`
+  the loop previously called inline, production passes nothing, and the browser
+  worker's silence handling is byte-for-byte what it was. The claim is not
+  asserted on the strength of the default alone — `test_agent.py` covers the
+  production default directly in both directions, and three mutations (breaking
+  either window's restart, or inverting the default's answer) each turn the new
+  tests red where the old timing-based test could detect none of them.
+* **CI and build wiring** — `.github/workflows/quality.yml` (the offline gate),
+  `.github/workflows/supabase-ci.yml` (path filters, `.mjs` syntax, trailing
+  whitespace), `scripts/supabase-test.sh` (runs Canary-0 against the migrated
+  database before the TST-15 double reset), and `app/api/package.json` (three
+  convenience scripts). These change what CI *runs*, not what the product does.
+* **Everything else** — `scripts/phone-canary/**`, one new API test file, this
+  ADR and `docs/runbooks/phone-canary-and-halt.md`.
+
+The offline gate keeps this list honest, in **both** directions:
+`scripts/phone-canary/canary0.test.mjs` §12 fails if this record stops naming
+`agent.py` or its seam, **and** fails if `agent.py` stops carrying that seam or
+stops defaulting to the production wait. A one-sided grep would sail through the
+second case, which is the one a later revert actually produces.
 
 ## Evidence
 
