@@ -81,6 +81,12 @@ export interface PhoneRuntimeView {
   last_reclaimed: number | null;
   last_expired: number | null;
   last_reconciled: number | null;
+  /**
+   * Names of the sweeps whose last run did NOT answer `ok`. Codes only.
+   * Empty is the healthy state; a count of `0` on a sweep NOT named here
+   * means "ran, nothing to do", which is a different fact.
+   */
+  sweeps_not_ok: string[];
 }
 
 function view(
@@ -125,6 +131,7 @@ export function phoneRuntimeView(now: Date = new Date()): PhoneRuntimeView {
       last_reclaimed: null,
       last_expired: null,
       last_reconciled: null,
+      sweeps_not_ok: [],
     };
   }
 
@@ -153,6 +160,10 @@ export function phoneRuntimeView(now: Date = new Date()): PhoneRuntimeView {
     last_reclaimed: snapshot.lastReclaimed,
     last_expired: snapshot.lastExpired,
     last_reconciled: snapshot.lastReconciled,
+    sweeps_not_ok: Object.entries(snapshot.sweepNotOk)
+      .filter(([, notOk]) => notOk)
+      .map(([name]) => name)
+      .sort(),
   };
 }
 
@@ -170,5 +181,9 @@ export function phoneRuntimeDegradeReasons(view_: PhoneRuntimeView): string[] {
   if (view_.loops.some((l) => l.stale)) reasons.push('phone_loop_stale');
   if (view_.loops.some((l) => l.consecutiveErrors > 0)) reasons.push('phone_loop_erroring');
   if (view_.last_due?.status === 'halted') reasons.push('phone_due_halted');
+  // A sweep that answered non-`ok` is a DEGRADATION, not a quiet zero. Without
+  // this the surface reported `status: ok` with `last_reclaimed: 0` while
+  // expired attempt leases piled up holding fleet slots.
+  if (view_.sweeps_not_ok.length > 0) reasons.push('phone_sweep_not_ok');
   return reasons;
 }

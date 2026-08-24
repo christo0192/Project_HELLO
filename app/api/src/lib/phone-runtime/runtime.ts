@@ -39,8 +39,12 @@
  * ── THE HALT FAILS CLOSED, DELIBERATELY UNLIKE RECORDING ──────────────
  * `lib/recording/halt.ts` fails OPEN and documents why. This lane inverts it:
  * an unreadable `phone_control` row refuses admission, because the thing on
- * the other side of the gate is a telephone call to a person. `shouldClaim`
- * here is therefore NOT the recording pattern, and the difference is the point.
+ * the other side of the gate is a telephone call to a person. The
+ * `shouldClaim` passed to the queue runner therefore fails CLOSED — an
+ * explicit halt, an absent control singleton and an unreadable one all stop
+ * claiming — and a process that has never successfully read the control row
+ * claims nothing at all. That is NOT the recording pattern, and the
+ * difference is the point.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -80,7 +84,12 @@ import {
   type PhoneRuntimeConfig,
 } from './config.js';
 import { createPhoneDialHandler, type PhoneDialJobOutcome } from './dial-handler.js';
-import { createPhoneRuntimeReader, PHONE_SESSION_MODE, type PhoneRuntimeReader } from './read.js';
+import {
+  createPhoneRuntimeReader,
+  PHONE_SESSION_MODE,
+  RESUMABLE_SESSION_STATUSES,
+  type PhoneRuntimeReader,
+} from './read.js';
 import { createPhoneRoomClients } from './livekit-clients.js';
 import {
   runPhoneDuePass,
@@ -106,6 +115,15 @@ export interface PhoneRuntimeSnapshot {
   readonly lastReclaimed: number | null;
   readonly lastExpired: number | null;
   readonly lastReconciled: number | null;
+  /**
+   * Sweeps whose LAST run answered with a non-`ok` RPC status, by name.
+   *
+   * Separate from the counts on purpose. A count of `0` means the sweep ran
+   * and found nothing; a `null` count with a flag here means it did not run.
+   * Collapsing the two would let a sweep that has silently stopped report as
+   * a healthy idle one.
+   */
+  readonly sweepNotOk: Readonly<Record<string, boolean>>;
 }
 
 export interface PhoneRuntimeHandle {
@@ -133,15 +151,84 @@ export interface PhoneRuntimeHandle {
  * it to `waiting` carrying its deterministic room name — the exact shape
  * `start_phone_assessment` verifies before it will bind anything.
  */
-export function createPhoneSessionPort(reader: PhoneRuntimeReader): PhoneSessionPort {
+/**
+ * The two writes this package performs, injectable.
+ *
+ * They were module-level imports, which made `createPhoneSessionPort` — the
+ * ONLY function in `lib/phone-runtime/` that writes to a table — untestable,
+ * and it went untested. Deleting the `transitionSession` call left every one
+ * of the package's tests green while the shipped runtime would have handed
+ * `dialPhoneAttempt` a session with no `external_call_id`, placed the call to
+ * a real person, and had `start_phone_assessment` refuse it
+ * `session_binding_mismatch`: the person picks up and the screening cannot
+ * start. A seam is the difference between that and a red test.
+ */
+export interface PhoneSessionWriter {
+  createSession: typeof createSession;
+  transitionSession: typeof transitionSession;
+}
+
+export function createPhoneSessionPort(
+  reader: PhoneRuntimeReader,
+  writer: PhoneSessionWriter = { createSession, transitionSession },
+): PhoneSessionPort {
   return {
     async ensureSession(input): Promise<string | null> {
-      if (input.existingSessionId !== null) return input.existingSessionId;
+      // ── The session already named on the engagement ──────────────────
+      // VERIFIED, not trusted. This path used to return the column outright
+      // while the adoption path below status-filtered and checked the room
+      // name — so the two disagreed about what a usable session is, and the
+      // disagreement was not academic: an engagement sitting in `reconnecting`
+      // whose session had gone terminal would be handed that dead session,
+      // dialled, answered by a real person, and then refused by
+      // `start_phone_assessment` with `session_not_active`. A call that could
+      // never have gone anywhere, charged against a reconnect budget that is
+      // spent AT THE GRANT.
+      if (input.existingSessionId !== null) {
+        const existing = await reader.readSessionForReuse({
+          sessionId: input.existingSessionId,
+        });
+        if (existing === null || !existing.roomVerified) return null;
+        if (!(RESUMABLE_SESSION_STATUSES as readonly string[]).includes(existing.status)) {
+          return null;
+        }
+        return input.existingSessionId;
+      }
 
-      const adopted = await reader.findReusableSession({ candidateId: input.candidateId });
-      if (adopted !== null) return adopted;
+      // ── Adoption, scoped to THIS engagement ──────────────────────────
+      // `call_sessions` carries no engagement column, so the candidate is the
+      // only key available for the lookup — and the candidate is NOT unique
+      // per engagement. `uq_phone_engagements_application` keys an engagement
+      // to an application link and `idx_phone_engagements_candidate` is
+      // deliberately not unique, so one person applying to two roles has two
+      // engagements with two independent no-answer budgets and two
+      // independent IST-day slots. Adopting by candidate alone would hand
+      // both the same session: two SIP legs into one room, and
+      // `start_phone_assessment` binding one session to two engagements, so
+      // only one of them could ever complete.
+      //
+      // The guard is the ownership check. A session some OTHER engagement has
+      // already bound is not adoptable; this engagement mints its own.
+      // Adoption is allowed only where it is UNAMBIGUOUS. Two guards, and the
+      // first is the one that matters: `engagementOwningSession` can only see
+      // a session some engagement has already BOUND, and the dangerous
+      // session is usually unbound — engagement A dials, nobody answers, A
+      // leaves an adoptable `waiting` session that nothing owns, and
+      // engagement B adopts it. So a candidate with more than one live
+      // engagement adopts nothing and mints its own session. An extra row is
+      // the cheap direction; two SIP legs in one room is not.
+      const liveEngagements = await reader.countLiveEngagements({
+        candidateId: input.candidateId,
+      });
+      if (liveEngagements <= 1) {
+        const adopted = await reader.findReusableSession({ candidateId: input.candidateId });
+        if (adopted !== null) {
+          const owner = await reader.engagementOwningSession({ sessionId: adopted });
+          if (owner === null || owner === input.engagementId) return adopted;
+        }
+      }
 
-      const created = await createSession({
+      const created = await writer.createSession({
         candidate_id: input.candidateId,
         role_id: input.roleId,
         mode: PHONE_SESSION_MODE,
@@ -153,7 +240,7 @@ export function createPhoneSessionPort(reader: PhoneRuntimeReader): PhoneSession
       // `created` -> `waiting` AND the room name in one CAS. A session without
       // `external_call_id` set to its own room can never start an assessment,
       // so leaving it half-provisioned would be worse than not creating it.
-      const moved = await transitionSession(
+      const moved = await writer.transitionSession(
         sessionId,
         'created',
         'waiting',
@@ -187,6 +274,10 @@ export function createPhoneRuntime(
   let lastReclaimed: number | null = null;
   let lastExpired: number | null = null;
   let lastReconciled: number | null = null;
+  // Whether the LAST run of each sweep answered with a non-`ok` status. Kept
+  // apart from the counts because "swept, nothing to do" and "the sweep did
+  // not happen" must reach the health surface as different answers.
+  const sweepNotOk: Record<string, boolean> = { reclaim: false, expire: false };
 
   const credentials = {
     url: env.livekitUrl,
@@ -194,6 +285,37 @@ export function createPhoneRuntime(
     apiSecret: env.livekitApiSecret,
   };
   const roomClients = createPhoneRoomClients(credentials, dialConfig.agentName);
+
+  // ── THE CLAIM GATE, CACHED AND FAIL-CLOSED ───────────────────────────
+  // The header of this file promised a `shouldClaim` that inverts recording's
+  // fail-OPEN halt, and for one commit it promised it without passing one.
+  // That is the worst of both: a reader concludes the queue loop is
+  // halt-gated, and it is not. The gate is real now.
+  //
+  // Cached, because `shouldClaim` is consulted on every poll and its contract
+  // requires a cheap consult. Fail-CLOSED, because the thing on the other
+  // side of this lane's gate is a telephone call to a person, and the cost of
+  // pausing a queue whose handler is a no-op is nothing at all.
+  let haltCheckedAtMs = 0;
+  let haltAdmits = false;
+  const HALT_CACHE_MS = 5_000;
+  const admitsClaims = async (): Promise<boolean> => {
+    const nowMs = Date.now();
+    if (haltCheckedAtMs !== 0 && nowMs - haltCheckedAtMs < HALT_CACHE_MS) return haltAdmits;
+    haltCheckedAtMs = nowMs;
+    try {
+      const backlog = await stores.backlog({ now: new Date() });
+      // The SAME three-shape test the due pass applies: an explicit halt, an
+      // absent control singleton, and (via the catch) an unreadable one all
+      // mean stop. Written as an equality against `false`/`true` rather than
+      // a negation so an `undefined` field cannot read as permission.
+      haltAdmits = backlog.admission?.halted === false
+        && backlog.admission?.controlPresent === true;
+    } catch {
+      haltAdmits = false;
+    }
+    return haltAdmits;
+  };
 
   const runner = createQueueRunner({
     queue,
@@ -205,6 +327,7 @@ export function createPhoneRuntime(
       }),
     },
     owner,
+    shouldClaim: admitsClaims,
     leaseSeconds: runtimeConfig.jobLeaseSeconds,
     concurrency: 1,
     pollMs: runtimeConfig.dueMs,
@@ -288,8 +411,16 @@ export function createPhoneRuntime(
             limit: runtimeConfig.reclaimLimit,
             now: new Date(),
           });
-          lastReclaimed = result.reclaimed ?? 0;
-          return (result.reclaimed ?? 0) > 0;
+          // The STATUS decides, not the count. `?? 0` alone would collapse
+          // "the RPC did not answer with a count" into "nothing needed
+          // doing" — and those are opposite operational facts. A sweep that
+          // silently stopped running lets expired attempt leases accumulate,
+          // each holding one of the ten fleet slots, until admission answers
+          // `at_capacity` for every candidate: the exact failure 0042 says
+          // this loop exists to prevent. `null` means we do not know.
+          sweepNotOk.reclaim = result.status !== 'ok';
+          lastReclaimed = result.status === 'ok' ? (result.reclaimed ?? 0) : null;
+          return (lastReclaimed ?? 0) > 0;
         },
       },
       {
@@ -300,8 +431,9 @@ export function createPhoneRuntime(
             limit: runtimeConfig.reclaimLimit,
             now: new Date(),
           });
-          lastExpired = expired.expired ?? 0;
-          return (expired.expired ?? 0) > 0;
+          sweepNotOk.expire = expired.status !== 'ok';
+          lastExpired = expired.status === 'ok' ? (expired.expired ?? 0) : null;
+          return (lastExpired ?? 0) > 0;
         },
       },
       {
@@ -363,6 +495,7 @@ export function createPhoneRuntime(
       lastReclaimed,
       lastExpired,
       lastReconciled,
+      sweepNotOk: { ...sweepNotOk },
     }),
     async tickAll(): Promise<void> {
       await runner.tick();

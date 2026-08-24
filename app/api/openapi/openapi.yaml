@@ -4252,7 +4252,8 @@ components:
         reconcile:
           description: Last reconciliation pass observed by THIS process, or null when this process has run none (never a fleet-wide claim, and never a claim that no reconciliation happened). Counts and sanitized codes only.
           nullable: true
-          $ref: '#/components/schemas/AshbyReconcilePassState'
+          allOf:
+            - $ref: '#/components/schemas/AshbyReconcilePassState'
         provider:
           description: Always "unknown" — this handler contacts no provider, so it makes no live-connectivity claim.
           type: string
@@ -4647,7 +4648,8 @@ components:
         ok:
           type: boolean
         workflow:
-          $ref: '#/components/schemas/AshbyCandidateWorkflow'
+          allOf:
+            - $ref: '#/components/schemas/AshbyCandidateWorkflow'
           nullable: true
           description: Null when the candidate has no Ashby application link. An ordinary absence, never an error - the web card renders nothing.
       additionalProperties: false
@@ -5118,7 +5120,8 @@ components:
         done:
           type: boolean
         assessment:
-          $ref: '#/components/schemas/Assessment'
+          allOf:
+            - $ref: '#/components/schemas/Assessment'
           nullable: true
         scoringStatus:
           type: string
@@ -5136,7 +5139,8 @@ components:
           items:
             $ref: '#/components/schemas/TranscriptTurn'
         assessment:
-          $ref: '#/components/schemas/AssessmentRecord'
+          allOf:
+            - $ref: '#/components/schemas/AssessmentRecord'
           nullable: true
       additionalProperties: false
 
@@ -5290,7 +5294,8 @@ components:
           type: string
           format: uuid
         english:
-          $ref: '#/components/schemas/LanguageProficiencyScore'
+          allOf:
+            - $ref: '#/components/schemas/LanguageProficiencyScore'
           nullable: true
         tone:
           $ref: '#/components/schemas/Tone'
@@ -7514,7 +7519,8 @@ components:
           enum: [pending_prereqs, eligible, scheduled, dialing, in_call, reconnecting, awaiting_retry, completed, abandoned_no_answer, opted_out, wrong_number, failed, cancelled]
         candidate:
           nullable: true
-          $ref: '#/components/schemas/PhoneCandidateRef'
+          allOf:
+            - $ref: '#/components/schemas/PhoneCandidateRef'
       additionalProperties: false
 
     PhoneCalendarResponse:
@@ -7638,7 +7644,8 @@ components:
           $ref: '#/components/schemas/PhoneBudget'
         provider_failure:
           description: A provider error costs the engagement its whole IST day, so exhausting this budget takes up to five IST days. See the provider_error_costs_one_ist_day residual.
-          $ref: '#/components/schemas/PhoneBudget'
+          allOf:
+            - $ref: '#/components/schemas/PhoneBudget'
       additionalProperties: false
 
     PhoneAttempt:
@@ -7743,14 +7750,17 @@ components:
           type: boolean
         engagement:
           nullable: true
-          $ref: '#/components/schemas/PhoneEngagementDetail'
+          allOf:
+            - $ref: '#/components/schemas/PhoneEngagementDetail'
         candidate:
           nullable: true
-          $ref: '#/components/schemas/PhoneCandidateRef'
+          allOf:
+            - $ref: '#/components/schemas/PhoneCandidateRef'
         appointment:
           description: The single live scheduled or confirmed appointment, or null.
           nullable: true
-          $ref: '#/components/schemas/PhoneAppointment'
+          allOf:
+            - $ref: '#/components/schemas/PhoneAppointment'
         attempts:
           type: array
           items:
@@ -7886,7 +7896,7 @@ components:
           type: string
           enum: [ok, degraded, disabled]
         reasons:
-          description: Stable codes only — phone_screening_disabled, backlog_unavailable, halt_unreadable, admission_halted, attempt_leases_expired, fleet_at_capacity, appointments_overdue, phone_runtime_stopped, phone_loop_stale, phone_loop_erroring, phone_due_halted.
+          description: Stable codes only — phone_screening_disabled, backlog_unavailable, halt_unreadable, admission_halted, attempt_leases_expired, fleet_at_capacity, appointments_overdue, phone_runtime_stopped, phone_loop_stale, phone_loop_erroring, phone_due_halted, phone_sweep_not_ok.
           type: array
           items:
             type: string
@@ -7896,10 +7906,12 @@ components:
           $ref: '#/components/schemas/PhoneHealthWindow'
         admission:
           nullable: true
-          $ref: '#/components/schemas/PhoneAdmissionState'
+          allOf:
+            - $ref: '#/components/schemas/PhoneAdmissionState'
         concurrency:
           nullable: true
-          $ref: '#/components/schemas/PhoneConcurrencyState'
+          allOf:
+            - $ref: '#/components/schemas/PhoneConcurrencyState'
         engagements_by_state:
           description: Counts keyed by engagement state. Null when the backlog could not be read.
           type: object
@@ -7907,10 +7919,12 @@ components:
           additionalProperties: true
         appointments:
           nullable: true
-          $ref: '#/components/schemas/PhoneAppointmentCounts'
+          allOf:
+            - $ref: '#/components/schemas/PhoneAppointmentCounts'
         ingress:
           nullable: true
-          $ref: '#/components/schemas/PhoneIngressCounts'
+          allOf:
+            - $ref: '#/components/schemas/PhoneIngressCounts'
         backlog_unavailable:
           type: boolean
         residuals:
@@ -7924,7 +7938,7 @@ components:
     PhoneRuntimeState:
       description: PROCESS-LOCAL view of the phone runtime loops. Describes the loops running in THIS api process and nothing else; on a multi-process deployment each replica answers for itself, so enabled false means this process is not running the loops, never that the fleet is idle. Aggregates only - counts, stable status and skip/refusal codes, and loop names. No engagement id, candidate id, attempt id, phone number, provider payload or lease token appears anywhere in this object.
       type: object
-      required: [enabled, running, loops, last_due, config, dial_jobs, last_reclaimed, last_expired, last_reconciled]
+      required: [enabled, running, loops, last_due, config, dial_jobs, last_reclaimed, last_expired, last_reconciled, sweeps_not_ok]
       properties:
         enabled:
           description: Whether this process constructed and registered a runtime. False is the shipped default and is not a fault.
@@ -7937,7 +7951,8 @@ components:
             $ref: '#/components/schemas/PhoneRuntimeLoopState'
         last_due:
           nullable: true
-          $ref: '#/components/schemas/PhoneRuntimeDueSummary'
+          allOf:
+            - $ref: '#/components/schemas/PhoneRuntimeDueSummary'
         config:
           description: The cadence knobs THIS process resolved and CLAMPED at boot, as integers. Reported from the running process rather than re-read from the environment, because a knob edited after boot does not take effect until a restart and a surface that re-read it would report the edit as though it had. Empty when this process runs no runtime. Publishable by construction - integers only, no identifier, credential, digest or candidate-derived value.
           type: object
@@ -7949,15 +7964,22 @@ components:
           additionalProperties:
             type: integer
         last_reclaimed:
-          description: Rows touched by the most recent lease reclaim sweep. Null when no sweep has run in this process.
+          description: Rows touched by the most recent lease reclaim sweep. Null when no sweep has run in this process, and ALSO null when the most recent sweep did not answer ok - a count of 0 therefore means "swept, found nothing" and never "the sweep did not happen". sweeps_not_ok says which of the two a null is.
           type: integer
           nullable: true
         last_expired:
+          description: Appointments expired by the most recent maintain sweep. Null on the same two terms as last_reclaimed - no sweep yet in this process, or a most-recent sweep whose RPC status was not ok. sweeps_not_ok says which.
           type: integer
           nullable: true
         last_reconciled:
+          description: Events posted by the most recent dropped-webhook reconciliation. Null only when no reconciliation has run in this process; this sweep reports a count rather than an RPC status, so it never appears in sweeps_not_ok.
           type: integer
           nullable: true
+        sweeps_not_ok:
+          description: Names of the sweeps whose most recent run did NOT answer ok, as stable codes and sorted. Empty is the healthy state. A count of 0 on a sweep that is NOT named here means "ran, nothing to do", which is a different fact from "the sweep did not happen"; only this array distinguishes them. Non-empty contributes the phone_sweep_not_ok degradation reason.
+          type: array
+          items:
+            type: string
       additionalProperties: false
 
     PhoneRuntimeLoopState:

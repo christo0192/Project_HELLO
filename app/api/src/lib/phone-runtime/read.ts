@@ -2,10 +2,18 @@
  * lib/phone-runtime/read.ts — the two reads the runtime needs and nothing
  * else: which engagements are due, and the number to dial one with.
  *
- * ── WHY THE NUMBER IS READ HERE AND NOWHERE ELSE ──────────────────────
- * Until this phase, a candidate's `phone_e164` never left SQL. Admission
- * reads it INSIDE `admit_phone_attempt`, digests it, and compares the digest
- * against the suppression list; the value never crosses a process boundary.
+ * ── WHY THE NUMBER IS READ HERE AND NOWHERE ELSE IN THIS PACKAGE ──────
+ * Stated precisely, because an earlier draft of this comment overclaimed and
+ * a reviewer caught it: this is the only reader of `phone_e164` IN THE PHONE
+ * RUNTIME, and the only place in the codebase that turns the column into a
+ * dialable value. It is NOT the only read of the column in the repository —
+ * `routes/candidates.ts` selects it on a `requireRole('viewer')` route and
+ * redacts it for non-admins via `redactCandidatePhone`. That is a projection
+ * for a human reader, not a dial, and it predates this phase.
+ *
+ * What IS true and load-bearing: the value never crosses a process boundary
+ * on the CALLING path. Admission reads it inside `admit_phone_attempt`,
+ * digests it, and compares the digest against the suppression list.
  * `lib/phone-screening/read-stores.ts` forbids the column outright, and a
  * structural test enumerates it among nineteen others that may not appear in
  * any declared column list.
@@ -70,6 +78,21 @@ export const PHONE_SESSION_MODE = 'live';
 export const REUSABLE_SESSION_STATUSES = ['created', 'waiting'] as const;
 
 const REUSABLE_SESSION_COLUMNS = 'id,status,external_call_id,started_at';
+
+/** One column, because the only question is WHICH engagement, if any. */
+const OWNING_ENGAGEMENT_COLUMNS = 'id';
+
+/**
+ * Statuses in which a session NAMED ON THE ENGAGEMENT may still be reused.
+ *
+ * Wider than `REUSABLE_SESSION_STATUSES` on purpose, and the difference is
+ * load-bearing. Adoption picks up a session that has never started, so it
+ * accepts only `created`/`waiting`. A reconnect resumes a session that
+ * `start_phone_assessment` already activated, so it must also accept
+ * `in_progress` — while still refusing a terminal one, which is exactly the
+ * case the old unchecked path would have dialled a real person for.
+ */
+export const RESUMABLE_SESSION_STATUSES = ['created', 'waiting', 'in_progress'] as const;
 
 /**
  * Consent columns. `ip_address` and `user_agent` are absent deliberately: the
@@ -144,6 +167,57 @@ export interface PhoneRuntimeReader {
   findReusableSession(input: { candidateId: string }): Promise<string | null>;
 
   /**
+   * The engagement that already claims this session, or null.
+   *
+   * `phone_engagements.session_id` is written only by `start_phone_assessment`,
+   * so this answers "has some engagement already bound its conversation to
+   * this session?". Adoption consults it because `call_sessions` carries no
+   * engagement column, and a candidate can legitimately have MORE THAN ONE
+   * engagement: `uq_phone_engagements_application` keys an engagement to an
+   * application link, and `idx_phone_engagements_candidate` is deliberately
+   * NOT unique. Every 0042 budget and both uniqueness indexes are scoped by
+   * engagement, so two engagements of one person are two independent budgets
+   * — and adopting one session across both would put two SIP legs in one room
+   * and bind one session to two engagements.
+   */
+  engagementOwningSession(input: { sessionId: string }): Promise<string | null>;
+
+  /**
+   * How many NON-TERMINAL phone engagements this candidate has, capped at 2.
+   *
+   * Capped because the only question is "more than one?" and an exact count
+   * of a set we will not enumerate is a read we do not need.
+   *
+   * This exists because `engagementOwningSession` is necessary but not
+   * sufficient. `phone_engagements.session_id` is written only by
+   * `start_phone_assessment`, so it identifies a session some engagement has
+   * BOUND — and the dangerous session is usually UNBOUND. Engagement A is
+   * dialled, nobody answers, and A leaves an adoptable `waiting` session that
+   * nothing owns; engagement B, same candidate and a different application,
+   * becomes due and adopts it. Two engagements, one room, and whichever
+   * starts its assessment first binds the session so the other never can.
+   *
+   * So adoption is allowed only where it is unambiguous: a candidate with a
+   * single live engagement. With two, every engagement mints its own session,
+   * which costs an extra row and is the safe direction.
+   */
+  countLiveEngagements(input: { candidateId: string }): Promise<number>;
+
+  /**
+   * The reuse-relevant facts about a session already named on an engagement:
+   * its status, and whether it carries its own derived room name.
+   *
+   * Needed because the ADOPTION path status-filters and verifies the room,
+   * while the `existingSessionId` path historically trusted the column
+   * outright — so the two paths disagreed about what a usable session is. A
+   * session that has gone terminal is not usable by either.
+   */
+  readSessionForReuse(input: { sessionId: string }): Promise<{
+    status: string;
+    roomVerified: boolean;
+  } | null>;
+
+  /**
    * The two reads the ADVISORY consent preflight needs.
    *
    * Advisory is the load-bearing word. `admit_phone_attempt` re-checks consent
@@ -168,6 +242,26 @@ function str(row: Row, key: string): string | undefined {
 function num(row: Row, key: string): number | undefined {
   const v = row[key];
   return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+}
+
+/**
+ * The ONE value this module interpolates into a PostgREST filter.
+ *
+ * The `or` grammar is comma- and dot-delimited, so a string reaching that
+ * position decides how many filter terms the query has. `nowIso` is a plain
+ * `string` on the public `PhoneRuntimeReader` interface, and today's only
+ * caller passes `options.now.toISOString()` — but "today's only caller" is
+ * not a guarantee, it is a fact with an expiry date. Validated to an
+ * ISO-8601 instant here so the guarantee lives at the boundary that needs it.
+ *
+ * Throws rather than falling back to a permissive filter: a clock we cannot
+ * render is not a reason to widen the query.
+ */
+function isoInstant(value: string): string {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/.test(value)) {
+    throw new Error('phone_runtime_bad_now');
+  }
+  return value;
 }
 
 function dueState(value: unknown): PhoneDueState | undefined {
@@ -199,7 +293,8 @@ export function createPhoneRuntimeReader(client: SupabaseClient): PhoneRuntimeRe
         // every reconnect from the pass — which is why the predicate is an
         // `or` and not three chained filters.
         .or(
-          `state.eq.reconnecting,next_eligible_at.is.null,next_eligible_at.lte.${input.nowIso}`,
+          'state.eq.reconnecting,next_eligible_at.is.null,'
+          + `next_eligible_at.lte.${isoInstant(input.nowIso)}`,
         )
         .order('updated_at', { ascending: true })
         .limit(limit);
@@ -335,6 +430,48 @@ export function createPhoneRuntimeReader(client: SupabaseClient): PhoneRuntimeRe
       // anything. A session that does not already carry it is not adoptable —
       // reusing one would produce a leg that could never start its assessment.
       return str(row, 'external_call_id') === phoneRoomName(id) ? id : null;
+    },
+
+    async countLiveEngagements(input): Promise<number> {
+      const { data, error } = await client
+        .from('phone_engagements')
+        .select(OWNING_ENGAGEMENT_COLUMNS)
+        .eq('candidate_id', input.candidateId)
+        .is('terminal_at', null)
+        .limit(2);
+      if (error) throw new Error('phone_runtime_session_read_error');
+      return Array.isArray(data) ? data.length : 0;
+    },
+
+    async engagementOwningSession(input): Promise<string | null> {
+      const { data, error } = await client
+        .from('phone_engagements')
+        .select(OWNING_ENGAGEMENT_COLUMNS)
+        .eq('session_id', input.sessionId)
+        .limit(1);
+      if (error) throw new Error('phone_runtime_session_read_error');
+      const rows = Array.isArray(data) ? (data as Row[]) : [];
+      const row = rows[0];
+      return row === undefined ? null : (str(row, 'id') ?? null);
+    },
+
+    async readSessionForReuse(input): Promise<{ status: string; roomVerified: boolean } | null> {
+      const { data, error } = await client
+        .from('call_sessions')
+        .select(REUSABLE_SESSION_COLUMNS)
+        .eq('id', input.sessionId)
+        .eq('mode', PHONE_SESSION_MODE)
+        .limit(1);
+      if (error) throw new Error('phone_runtime_session_read_error');
+      const rows = Array.isArray(data) ? (data as Row[]) : [];
+      const row = rows[0];
+      if (row === undefined) return null;
+      const status = str(row, 'status');
+      if (status === undefined) return null;
+      return {
+        status,
+        roomVerified: str(row, 'external_call_id') === phoneRoomName(input.sessionId),
+      };
     },
   };
 }

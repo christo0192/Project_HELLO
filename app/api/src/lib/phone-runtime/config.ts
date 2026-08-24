@@ -56,10 +56,22 @@ export interface PhoneRuntimeBound {
 /**
  * Every bound, in one table so the clamps are reviewable together.
  *
- * The reclaim cadence is deliberately FASTER than the due cadence is slow: a
- * lease that has lapsed is holding one of ten fleet slots against every other
- * candidate, whereas a due engagement that waits one extra tick has lost
- * nothing. When in doubt this runtime reclaims sooner and dials later.
+ * The four cadences ESCALATE, ordered by cost rather than by importance:
+ * due 15s < reclaim 30s < reconcile 60s < expire 120s. Dialling is the
+ * cheapest read and the only one a candidate is waiting on; reconciling costs
+ * a LiveKit room read per live attempt; expiring an appointment can wait.
+ *
+ * The one relation that is a CORRECTNESS bound rather than a preference is
+ * `reclaimMs` against the attempt lease. `PHONE_BOUNDS.leaseSeconds` defaults
+ * to 60s, so a sweep every 30s guarantees a lapsed lease is seen within half
+ * a lease-lifetime. Let the sweep grow slower than the lease and a dead
+ * worker's fleet slot is held for the difference, against every other
+ * candidate — which is the starvation 0042 says this loop exists to prevent.
+ *
+ * (An earlier version of this comment claimed reclaim was "faster than the
+ * due cadence is slow". It is not — 30s against 15s — and the test beneath it
+ * compared reclaim to RECONCILE, so the false claim went unchecked. Stated
+ * properly and asserted properly now.)
  */
 export const PHONE_RUNTIME_BOUNDS: Readonly<Record<string, PhoneRuntimeBound>> = Object.freeze({
   /** How often the due sweep looks for an engagement to dial. */
@@ -76,7 +88,7 @@ export const PHONE_RUNTIME_BOUNDS: Readonly<Record<string, PhoneRuntimeBound>> =
    * every other admission answer `at_capacity`.
    */
   dueLimit: { def: 3, min: 1, max: 25 },
-  /** Attempt leases reclaimed per pass. */
+  /** Rows touched per pass by EITHER bounded sweep — the attempt-lease reclaim and the appointment expiry share this bound. Two sweeps, one knob: raising it for a lease backlog also widens the expiry batch. */
   reclaimLimit: { def: 25, min: 1, max: 200 },
   /** Lease seconds for the `phone.dial` QUEUE job — not the attempt lease. */
   jobLeaseSeconds: { def: 60, min: 5, max: 900 },

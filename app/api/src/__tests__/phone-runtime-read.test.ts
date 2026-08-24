@@ -408,7 +408,7 @@ describe('A. listDueEngagements — the query it actually issues', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════
-//  B. listDialableNumbers — the only read of `phone_e164` in the repo
+//  B. listDialableNumbers — the only read of `phone_e164` in this PACKAGE, and the only place the column becomes a dialable value (`routes/candidates.ts` also selects it, redacted, for a human reader)
 // ════════════════════════════════════════════════════════════════════
 
 describe('B. listDialableNumbers — the number read', () => {

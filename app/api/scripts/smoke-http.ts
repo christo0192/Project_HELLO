@@ -55,7 +55,15 @@ async function main() {
   const upRes = await fetch(BASE + '/api/resumes', { method: 'POST', body: form });
   const up = await upRes.json();
   if (!upRes.ok) throw new Error('resume upload failed: ' + JSON.stringify(up));
-  console.log('candidate:', up.candidate.id, '| phone:', up.candidate.phone_e164, 'valid:', up.candidate.phone_valid);
+  // The subscriber number is NEVER printed. This script runs against a live
+  // Supabase DB, so `phone_e164` here is a real number, and stdout ends up in
+  // terminal scrollback, CI logs and pasted bug reports. Presence and validity
+  // are the only things the smoke run needs to see, so that is all it prints —
+  // no digits, not even a partial mask.
+  const phonePresence = typeof up.candidate.phone_e164 === 'string' && up.candidate.phone_e164.length > 0
+    ? '[redacted]'
+    : '(none)';
+  console.log('candidate:', up.candidate.id, '| phone:', phonePresence, 'valid:', up.candidate.phone_valid);
 
   const start = await api('POST', '/api/screening/start', { candidate_id: up.candidate.id });
   console.log('\nMaya:', start.message);

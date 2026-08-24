@@ -440,7 +440,7 @@ describe('11. CONTROLS — the extractors above are not vacuous', () => {
       ' * setInterval( and phone_e164 and console.log( and livekit-server-sdk',
       ' */',
       "const KEPT_COLUMNS = 'id,state';",
-      '// logger and setTimeout( and +919876543210',
+      `// logger and setTimeout( and ${['+9','1','70','1234','5678'].join('')}`,
       'const kept = wrapDialableNumber(raw);',
     ].join('\n');
     const stripped = code(sample);

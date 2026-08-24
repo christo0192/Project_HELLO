@@ -92,15 +92,25 @@ schedule work raises `phone_dial_enqueue_failed` and rolls the whole thing back,
 leave a `pending` row nothing completes — `uq_job_queue_dedup_active` covers `pending`,
 and `reclaim_phone_attempt_leases` only completes jobs for attempts *it* reclaims, so a
 normally-ended attempt's job would sit in the queue forever and the backlog would grow one
-row per call placed. The runner's `pollMs` is also `dueMs`; there is no separate poll knob.
+row per call placed. There is no separate poll knob: the loop's `intervalMs` is `dueMs`
+and that is the only thing setting the cadence. The runner is *also* handed
+`pollMs: dueMs`, but that option is dead — see the reading hazard in §12 before you
+believe the two answers you will find.
 
-**`phone-due`** is the only loop gated on the halt, and the only one that can reach a
-carrier. Its shape is: the three switches and then the halt gate (§4) →
-`listDueEngagements` → one filter pass that resolves the attempt kind, applies the
-runtime clock and, for `scheduled` rows, the appointment gate → **then** fetch numbers,
-once, for the survivors only → ensure a session → `dialPhoneAttempt`. The skip codes,
-in the order they can be emitted: `unknown_state`, `not_yet_due`, `appointment_not_due`,
-`no_dialable_number`, `no_session`.
+**`phone-due`** is the only loop that can reach a carrier. Its shape is: the three
+switches and then the halt gate (§4) → `listDueEngagements` → the **IST window
+preflight** (§8) → one filter pass that resolves the attempt kind, applies the runtime
+clock, allows each candidate at most one offer per pass and, for `scheduled` rows,
+applies the appointment gate → **then** fetch numbers, once, for the survivors only →
+ensure a session → `dialPhoneAttempt`. The skip codes, in the order they can be emitted:
+`outside_ist_window`, `unknown_state`, `not_yet_due`, `candidate_already_offered`,
+`appointment_not_due`, `no_dialable_number`, `no_session` — the seven members of
+`PHONE_DUE_SKIPS` (`due-loop.ts`), which is the type's single source: `PhoneDueSkip` is
+`typeof PHONE_DUE_SKIPS[number]`, so a code that is not in that array will not compile.
+
+It is no longer the only loop consulting the halt: `phone-dial` now refuses to *claim*
+under one too, through the queue runner's `shouldClaim` (§4). `phone-due` is still the
+only one whose halt decision is reported as a `last_due.status`.
 
 **Every time-based gate runs before a single number is read** (§9). The attempt kind is
 resolved once, in that filter pass, and carried forward with the row rather than
@@ -267,6 +277,30 @@ fails **open** and documents why. The inversion is the point, and it should not 
 A halted pass reaches **no write**: no `listDueEngagements`, no number read, no session
 creation, no dial. `phone-runtime-core.test.ts` asserts that against fakes with call
 counters, because "nothing was called" is only an assertion if something is counting.
+
+### The queue runner's `shouldClaim` — the same gate, on the other loop
+
+`createQueueRunner` is now passed a `shouldClaim` (`runtime.ts`, `admitsClaims`). For one
+commit this file's header promised one and none was passed, which is the worst of both:
+a reader concludes the dial loop is halt-gated and it is not.
+
+* **The same three shapes.** `haltAdmits = backlog.admission?.halted === false &&
+  backlog.admission?.controlPresent === true`, with a `catch` that sets it `false`.
+  Written as equalities against `false`/`true` rather than as negations, so an
+  `undefined` field cannot read as permission.
+* **Fail-closed, and cold-start closed.** `haltAdmits` initialises to `false`, so a
+  process that has never successfully read the control row claims **nothing**.
+* **Cached for 5 s** (`HALT_CACHE_MS`), because `shouldClaim` is consulted before *every*
+  claim and its contract requires a cheap consult. At the shipped `dueMs` of 15 s the
+  cache has always expired by the next `phone-dial` tick, so in practice each tick pays
+  one backlog read.
+* **This is deliberately the opposite of `lib/recording/runtime.ts`**, which passes
+  `shouldClaim: () => halt.admits()` over a halt that fails **open**. The inversion is
+  the point: the thing on the other side of this lane's gate is a telephone call to a
+  person, and the cost of pausing a queue whose handler is a no-op (§5) is nothing at all.
+
+A refused claim leaves the job `pending`: no attempt is spent, no lease churns, and the
+row is still there when the halt clears.
 
 ---
 
@@ -438,22 +472,80 @@ comment on `phone_ist_window_open` says "Monday to Sunday" for that reason.
 `admit_phone_attempt` under the advisory lock, is mirrored (never re-declared) in
 `ist-window.ts`, and a structural assertion keeps its bounds out of the phone-screening
 configuration. A second definition would be silent in TypeScript and enforced in SQL,
-which is the drift `0042` was shaped to prevent. If a due pass offers a row at 21:30 IST,
-admission refuses it and the refusal is counted on `runtime.last_due.refusals` — the
-correct outcome, and the reason a `window`-shaped refusal count is not a fault.
+which is the drift `0042` was shaped to prevent.
+
+**The due pass now preflights the window itself**, and it does so by *calling* the shared
+predicate rather than by restating it. `due-loop.ts` takes exactly one value import from
+the domain package — `istWindowOpen` from `lib/phone-screening` — which is the same
+function `admission.ts:190` calls over the same frozen `PHONE_IST_WINDOW` bounds
+(`ist-window.ts:209-212`: `s >= openSeconds && s < closeSeconds`). So there is exactly one
+definition of 09:00-inclusive / 21:00-exclusive in TypeScript, and the runtime cannot
+drift from admission or from 0042.
+
+The preflight sits **after** the halt gate and the due read, and **before** the number
+read, the session mint and the dial — so through the closed hours the pass returns
+`skipped: { outside_ist_window: <examined> }` and writes nothing. Before it existed the
+pass reached admission first, which meant that through every closed hour it read every due
+candidate's `phone_e164` out of SQL and minted a `call_sessions` row for each, four times
+a minute, only to be refused `window_closed` every time.
+
+`admit_phone_attempt` remains the **authority**: it re-evaluates the window under the
+advisory lock, so a row offered at 21:00:00.001 by a replica with a skewed clock is still
+refused there and counted on `runtime.last_due.refusals` — the correct outcome, and the
+reason a `window`-shaped refusal count is not a fault. The preflight is a cheap gate, not
+a second opinion.
 
 `ist_date` on `phone_call_attempts` is a stored column written at admission, and it exists
 solely to carry the per-day uniqueness in §7.
 
 ---
 
-## 9. The one place a phone number is read
+## 9. The one place a phone number becomes dialable
 
-Until P5, a candidate's `phone_e164` **never left SQL**. Admission reads it *inside*
-`admit_phone_attempt`, digests it and compares the digest against the suppression list;
-the value never crosses a process boundary. `lib/phone-screening/read-stores.ts` forbids
-the column outright, and a structural test enumerates it among nineteen others that may
-not appear in any declared column list.
+### State the guarantee at its true scope
+
+An earlier draft of this section — and the header comment on `read.ts` and one test
+name — said that until P5 a candidate's `phone_e164` **never left SQL**. That is wrong
+repo-wide, and a reviewer who trusts it will look for a disclosure in the wrong places.
+A repo-wide grep for the column finds these readers **outside** the phone lane, all of
+them predating P5:
+
+- `app/api/src/routes/candidates.ts:116` — `GET /api/candidates` **selects** the column
+  on a `requireRole('viewer')` route. It is not a leak: every row goes through
+  `redactCandidatePhone` (`lib/candidate-phone.ts:233-243`), which nulls `phone_e164`
+  and drops `phone_raw` for every role below `admin`. `GET /api/candidates/:id` selects
+  `*` and is redacted by the same helper. But it *is* a read, and for an admin the
+  number reaches the response body.
+- `app/api/src/lib/dsar.ts:355` — the DSAR subject-access export copies the column into
+  its payload. `routes/dsar.ts:92-97` (`redactDSARExport`) nulls it below `admin`, and
+  the deliberate residual is named there: `resumes[].text_extracted` still carries the
+  number verbatim for any interviewer running an export.
+- `app/web/src/components/talent/CandidateOverviewSections.tsx:65-67` — the operator UI
+  renders whatever the API returned, i.e. the number for an admin and `null` otherwise.
+- `app/api/scripts/smoke-http.ts` — printed the number to stdout against a **live**
+  Supabase DB. Fixed in this PR: the script now prints `[redacted]` / `(none)` and the
+  `phone_valid` boolean, never digits.
+
+So the honest structural claim, and the one the tests actually enforce, is narrower and
+still worth having:
+
+> **`read.ts` is the only reader of `phone_e164` in the phone-runtime package, and the
+> only place in the repository where the column becomes a *dialable value*.**
+
+Both halves are checkable. `phone-runtime-structural.test.ts:129-138` asserts the column
+appears in exactly one file **of this package** and asserts it as an equality, not a
+containment. The dialable half is the stronger one: everywhere else the column is a
+string that ends up in a response body or a screen, and only `listDialableNumbers` turns
+it into a `DialableNumber` — the opaque wrapper `dialPhoneAttempt` requires and the only
+form the SIP originate will accept. Nothing above can reach a carrier; this one can.
+
+What *is* true unconditionally is the SQL-side story: admission reads the column *inside*
+`admit_phone_attempt`, digests it and compares the digest against the suppression list,
+and that value never crosses a process boundary. `lib/phone-screening/read-stores.ts`
+forbids the column outright, and a structural test enumerates it among nineteen others
+that may not appear in any declared column list.
+
+### The reader itself
 
 `dialPhoneAttempt` needs a `DialableNumber`, and only a process can hold one. So P5 must
 introduce exactly one reader, and the entire cost of that decision is concentrated in
@@ -557,7 +649,7 @@ One important ambiguity: `index.ts` wraps construction in its own try/catch and 
 construct** is indistinguishable from one that is **deliberately off** — both are
 `enabled: false`. Check the startup log before concluding the flags are off. See §12.
 
-### The four degradation reasons
+### The five degradation reasons
 
 These are appended to `reasons` **after** the pre-existing backlog reasons, so the older
 codes keep their order and meaning. They are additive: a stale or erroring loop degrades
@@ -570,16 +662,37 @@ case, a healthy backlog with no worker turning.
 | `phone_loop_stale` | Some loop's anchor — the **later** of `lastTickAt` and `startedAt` — is older than `max(30 s, interval × 3)`. A tick is wedged, almost always on an `await` that never resolved. | Read `runtime.loops[]` and find *which* loop by name. `phone-due` stale ⇒ nothing is being dialled. `phone-reclaim` stale ⇒ fleet slots are leaking; cross-check `concurrency.live_with_unexpired_lease` against `max_concurrent` (10) and expect `at_capacity` refusals next. `phone-dial` stale ⇒ the queue is filling. `phone-maintain` stale ⇒ appointments will read `overdue`. `phone-reconcile` stale ⇒ dropped webhooks are unrecovered, so attempts whose calls really ended stay live and hold fleet slots. A stale loop is a restart, not a tuning problem. |
 | `phone_loop_erroring` | Some loop has `consecutiveErrors > 0`. The loop is still armed and still ticking; the errors are counted, not swallowed. | Distinguish transient from persistent by polling twice: `consecutiveErrors` resets on a clean tick. A rising count on `phone-due` with a rising `last_due.refusals` is a downstream refusal, not a loop fault. A rising count with `last_due` unchanged means the pass is throwing before it completes — check database reachability first, since every read in the seam throws a bare code and the detail is deliberately not in the response. |
 | `phone_due_halted` | The most recent due pass returned `status: 'halted'`. **No call was attempted and no session was created.** | Decide *which* halt (§4) using the backlog block on the same response. `admission.halted: true` with a `halt_reason` ⇒ someone raised the kill switch; that is working as intended and the fix is `POST /api/phone/halt/clear`. `halt_unreadable` also present ⇒ the control singleton is missing or unreadable, which is a **database** problem, not a dialer problem, and the lane is correctly refusing to guess. The other four loops keep running throughout — deliberately, because they terminate in-flight work and free slots. Note this reason fires only on a genuine halt: a pass stopped by `PHONE_DIAL_MODE=off` reports `last_due.status: 'disabled'`, which is not a degradation reason at all. |
+| `phone_sweep_not_ok` | A sweep's most recent RPC did not answer `ok`. The offending sweep names itself in `runtime.sweeps_not_ok` (`reclaim`, `expire`), as stable codes only. | This is the reason that exists because a count of `0` could not carry it. On a non-`ok` status the loop reports the count as **`null`**, not `0`, and names the sweep here — so `last_reclaimed: 0` now means "swept, found nothing", `last_reclaimed: null` with `reclaim` in `sweeps_not_ok` means "the sweep did not happen", and `null` with an empty `sweeps_not_ok` means "no sweep has run in this process yet". `reclaim` listed ⇒ expired attempt leases are accumulating and each one holds a fleet slot, so expect `at_capacity` refusals next; check the RPC's grants and that `reclaim_phone_attempt_leases` still exists under that name. `expire` listed ⇒ appointments will read `overdue` in the backlog block. Both are database-side failures, not loop faults: the loop is still ticking, which is why `phone_loop_erroring` does NOT fire alongside. |
 
 ### The counts
 
 `last_due` carries `status` (`ok` / `halted` / `disabled`), `examined`, `offered`,
 `dialing`, and `skipped` / `refusals` keyed by **stable code only** — never by row
 identity. An operator learns how many were skipped and for which reason, never which
-candidate. The five skip codes are `not_yet_due`, `no_dialable_number`, `no_session`,
-`appointment_not_due` and `unknown_state`; the refusal codes come from the dial
-controller and from `admit_phone_attempt` (`at_capacity`, `phone_invalid`,
-`kind_not_admissible`, `room_unavailable`, …).
+candidate. The seven skip codes are `outside_ist_window`, `not_yet_due`,
+`candidate_already_offered`, `appointment_not_due`, `no_dialable_number`, `no_session`
+and `unknown_state`; the refusal codes come from the dial controller and from
+`admit_phone_attempt` (`at_capacity`, `phone_invalid`, `kind_not_admissible`,
+`room_unavailable`, …).
+
+Two of those seven read as normal operation rather than as trouble.
+`outside_ist_window` equal to `examined` with `offered: 0` is simply the closed hours
+(§8) — expect it on every pass between 21:00 and 09:00 IST, and expect it to be the ONLY
+skip code present, because the window preflight returns before the per-row filter runs.
+`candidate_already_offered` means one person had two due engagements in one pass and the
+second waits a tick (§12); a persistently non-zero count means someone has applied to two
+roles, not that the lane is malfunctioning.
+
+**`last_due` is `null` until this process finishes its first due pass** — which, at the
+shipped defaults (both switches `false`), is *every* process, forever. That makes the
+null the common case, not the edge case, so the OpenAPI schema has to say so. It does:
+`PhoneRuntimeState.last_due` is written as `nullable: true` over
+`allOf: [ { $ref: PhoneRuntimeDueSummary } ]`. The `allOf` is load-bearing and not a
+style choice — the document is OpenAPI **3.0.3**, and in 3.0.x every sibling of a `$ref`
+is ignored, so `nullable: true` written directly beside a `$ref` documents a
+**non-nullable required object** and breaks the first `GET /api/phone/health` any
+generated client makes. `contract-openapi.test.ts` now enforces this as a rule over the
+whole document: no `$ref` anywhere may have a sibling key.
 
 There is deliberately **no `halted` skip code**. The halted case returns early with an
 empty `skipped` map, so a code for it could never be emitted — and a vocabulary entry
@@ -681,6 +794,11 @@ before any read or write. Admission refuses independently, so even an in-flight 
 cannot get a call out. `set_phone_halt` writes its own `audit_events` row inside the same
 transaction as the halt.
 
+**What the halt stops:** the due pass (`status: 'halted'`, no read and no write) and, now,
+the dial loop's *claims* — `shouldClaim` refuses while the halt stands (§4), so `phone.dial`
+rows stay `pending` with no attempt spent and no lease churn, and are drained when it
+clears. The loop itself keeps ticking; it just takes nothing.
+
 **What the halt does NOT stop, deliberately:** `phone-reclaim` keeps reclaiming expired
 attempt leases, `phone-maintain` keeps expiring appointments, and `phone-reconcile` keeps
 reconciling dropped webhooks. Those free fleet slots and terminate in-flight attempts
@@ -740,9 +858,33 @@ Recorded as choices or as gaps, not smoothed over.
   `last_reclaimed`, `last_expired` and `last_reconciled` describe this process's life since
   boot. There is no durable time series and no aggregation across replicas; the durable
   record is `audit_events` and the backlog.
-- **`phone-dial` and `phone-due` share one cadence.** Both use `dueMs`, as does the queue
-  runner's `pollMs`. There is no way to poll the queue more often than the due sweep runs,
-  or less.
+- **`phone-dial` and `phone-due` share one cadence.** Both scheduler loops are armed at
+  `dueMs` (`runtime.ts`, the `loops:` array and the `loopIntervalsMs` map that reports it).
+  There is no way to tick the queue more often than the due sweep runs, or less.
+- **READING HAZARD — `pollMs` on the queue runner is inert, and it is the more obvious of
+  two answers.** `createQueueRunner` is also handed `pollMs: runtimeConfig.dueMs`. That
+  option is **never read**: `pollMs` occurs exactly once in `lib/queue/runner.ts` — its
+  declaration in the options interface (*"Base delay between polls when work was found
+  (ms)"*) — and `createQueueRunner` arms no poll loop of its own. The dial cadence comes
+  entirely from the `phone-dial` scheduler loop, whose `tick` is
+  `queueRunnerTick(runner)` (`lib/scheduler.ts:281-283`, i.e. `runner.tick()` with the
+  return value mapped to a boolean so a productive pass keeps the fast cadence). A reader
+  tracing *"why does the dial loop poll at `dueMs`?"* will find both, and only the
+  scheduler loop is real — change `pollMs` and nothing happens; change the loop's
+  `intervalMs` and the cadence moves. This is a **pre-existing house pattern**, not a P5
+  invention: `recording/runtime.ts` and `integrations/ashby/runtime-workers.ts` pass the
+  same dead option. Left alone deliberately — removing it is a house-wide cleanup of the
+  shared `QueueRunnerOptions` type, not a phone change — so it is recorded here instead.
+  (Unrelated to `nextPollDelayMs` in `runner.ts`, which is a real backoff helper and *is*
+  used, by callers that drive their own loop.)
+- **READING HAZARD — `tickAll()` does not tick all.** The handle's `tickAll()` is
+  `await runner.tick()` and nothing else: it drives the **queue runner only** and touches
+  none of the five scheduler loops, so it never runs a due pass, a reclaim, an expiry or a
+  reconciliation. Tests that call it are testing the dial queue, whatever the surrounding
+  `describe` is named. If you want a due pass in a test, call the loop's `tick` (or
+  `runPhoneDuePass`) directly; `tickAll()` will silently do nothing for you. The name is
+  the whole hazard — `tickQueue()` would say what it does — and it is left as-is here only
+  because it is part of `PhoneRuntimeHandle` and renaming it is a code change.
 - **The dial handler cannot report which case it saw.** By design (§5) it reads nothing, so
   `dial_jobs.completed` counts spent durability records and post-crash records
   indistinguishably. The signal for the crash case is `last_reclaimed`, not `dial_jobs`.
@@ -760,11 +902,56 @@ Recorded as choices or as gaps, not smoothed over.
   exactly those three. It remains as a fail-closed guard rather than a live signal: a
   non-zero count means the two lists have drifted apart, which is a code defect and not an
   operational condition.
-- **`findReusableSession` adopts by candidate, not by engagement.** It takes the newest
-  `call_sessions` row for the candidate with `mode = 'live'` and status `created` or
-  `waiting`, and requires `external_call_id` to already equal `phoneRoomName(id)`. A
-  candidate with two concurrent phone engagements (which `uq_phone_engagements_application`
-  makes unusual, since engagements are keyed per application link) could in principle adopt
-  the other engagement's pending session. `start_phone_assessment`'s `session_already_bound`
-  refusal would then fail that leg loudly — see `phone-assessment-resume.md` §7, which
-  records the same interlock from the other side.
+- **`findReusableSession` still LOOKS up by candidate; adoption is now scoped by
+  ownership.** `call_sessions` carries no engagement column, so the candidate is the only
+  key the lookup can use: the newest row for the candidate with `mode = 'live'`, status
+  `created` or `waiting`, and `external_call_id` already equal to `phoneRoomName(id)`. The
+  scoping is the second step — `ensureSession` then asks `engagementOwningSession`, and
+  adopts only when the session is owned by **this** engagement or by none. A session
+  another engagement has bound through `phone_engagements.session_id` is refused and this
+  engagement mints its own, so two engagements for one person can no longer be pointed at
+  one room. The `existingSessionId` path is verified on the same terms rather than
+  trusted: `readSessionForReuse` must come back with a status in
+  `RESUMABLE_SESSION_STATUSES` (`created`, `waiting`, `in_progress`) **and**
+  `roomVerified`, otherwise the row is skipped `no_session` instead of dialled. Before
+  that check, a `reconnecting` engagement whose session had gone terminal was dialled and
+  then refused `session_not_active` — a real call to a real person that could never have
+  gone anywhere, charged against a reconnect budget that is spent at the grant. See
+  `phone-assessment-resume.md` §7, which records the same interlock from the other side.
+- **One offer per candidate is bounded to ONE PASS, and that is all.** The due pass keeps
+  a `Set` of candidate ids and skips a second row for the same person
+  `candidate_already_offered`. That is a real guard — `uq_phone_engagements_application`
+  keys an engagement to an application link, the candidate index is deliberately not
+  unique, and nothing in 0042 stops two engagements for one person being admitted in the
+  same second, so without it one phone could ring twice from a single pass. But it does
+  **not** close the hazard across passes, and it does not close it across replicas: two
+  processes running their own due passes share no `Set`. Closing it properly needs a
+  per-candidate guard **inside `admit_phone_attempt`** — a partial unique index over the
+  live attempt states via the engagement join — which is a 0042 migration and was
+  deliberately not smuggled into P5. Note also that the slot is claimed by the first due
+  row for that candidate in the pass, *before* the `scheduled` appointment gate runs, so a
+  row that is then skipped `appointment_not_due` has still spent the candidate's offer for
+  that pass. The other row waits one `DUE_MS`.
+- **The global stale-session sweep has no phone exemption, and P5 creates the population
+  it would flag.** `screening_v2.stuck_sessions` (`0011_reconciliation.sql:176-232`)
+  selects on `status` alone — `waiting` over 300 s, `created` over 1 800 s, `in_progress`
+  over 7 200 s — with **no `mode` filter**, so a phone session (`mode = 'live'`, like every
+  other) is in scope. P5 mints `call_sessions` rows that sit in `waiting` *legitimately*
+  for a long time: from the moment the due pass provisions one until the candidate actually
+  answers, and across no-answer retries that fall on distinct IST days. Against a
+  five-minute waiting timeout, every one of those looks stuck.
+
+  **It does not fire today.** `reconcile()` (`lib/reconciliation.ts:143`) is the only entry
+  point that calls `detectStuckSessions`, and it has **no caller outside its own tests** —
+  grepped in both directions. Nothing drives the sweep, so nothing acts on the detection,
+  and `planRepair` / `executeRepair` are likewise undriven.
+
+  So the acceptance clause *"do not weaken global stale-session timeout; use phone-scoped
+  exemption only during bounded active reconnect"* is satisfied by **inaction**: P5 weakens
+  no timeout, and there is no running sweep to exempt anything from. **P5 implements no
+  exemption** — that is stated plainly here rather than dressed up as coverage. The latent
+  residual is for whoever wires the sweep up: the moment `reconcile()` gets a production
+  caller it will flag every phone session in `waiting` as stuck and recommend
+  `transition_to_expired` / `idle_timeout` on sessions that are working correctly. The fix
+  at that point is a `mode`-aware predicate in `stuck_sessions` — a migration — not a
+  change in the phone lane. Read this before you schedule that sweep, not after.

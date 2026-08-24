@@ -298,6 +298,7 @@ interface SchemaNode {
   const?: YValue;
   $ref?: string;
   format?: string;
+  allOf?: SchemaNode[];
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -314,15 +315,53 @@ function resolveRef(ref: string, spec: YMap): SchemaNode {
   return schemas[name] as unknown as SchemaNode;
 }
 
-function deref(schema: SchemaNode | undefined, spec: YMap): SchemaNode | undefined {
+/**
+ * Resolve `$ref` chains AND flatten `allOf`.
+ *
+ * The `allOf` half is not decoration. OpenAPI 3.0.x ignores every sibling of
+ * a `$ref`, so the only way to say "this property is that schema, and it may
+ * also be null" is `nullable: true` next to `allOf: [ { $ref } ]`. If this
+ * validator did not understand `allOf`, every schema written that way would
+ * flatten to a typeless node and validateValue would accept ANYTHING for it —
+ * the spec fix would silently switch off the contract check it was meant to
+ * make honest. Flattening keeps `type`, `required`, `properties` and
+ * `additionalProperties: false` in force through the wrapper.
+ */
+function deref(schema: SchemaNode | undefined, spec: YMap, seen: Set<string> = new Set<string>()): SchemaNode | undefined {
   let s = schema;
-  const seen = new Set<string>();
   while (s && s.$ref) {
     if (seen.has(s.$ref)) throw new Error(`Cyclic $ref "${s.$ref}"`);
     seen.add(s.$ref);
     s = resolveRef(s.$ref, spec);
   }
-  return s;
+  if (!s || !s.allOf) return s;
+
+  const merged: SchemaNode = {};
+  const props: Record<string, SchemaNode> = {};
+  const required: string[] = [];
+  const own: SchemaNode = { ...s };
+  delete own.allOf;
+  // Members first, the wrapper's own keys last, so a wrapper key (typically
+  // `nullable`/`description`) wins over the member it is qualifying.
+  for (const member of [...s.allOf, own]) {
+    const m = deref(member, spec, new Set(seen));
+    if (!m) continue;
+    for (const [key, value] of Object.entries(m)) {
+      if (key === 'allOf') continue;
+      if (key === 'properties') {
+        Object.assign(props, value as Record<string, SchemaNode>);
+        continue;
+      }
+      if (key === 'required') {
+        required.push(...(value as string[]));
+        continue;
+      }
+      (merged as Record<string, unknown>)[key] = value;
+    }
+  }
+  if (Object.keys(props).length > 0) merged.properties = props;
+  if (required.length > 0) merged.required = [...new Set(required)];
+  return merged;
 }
 
 function validateValue(value: unknown, schema: SchemaNode | undefined, spec: YMap, path: string, errors: string[]): void {
@@ -456,6 +495,63 @@ function validateNamed(value: unknown, schemaName: string, spec: YMap): string[]
 
 const specText = readFileSync(SPEC_PATH, 'utf8');
 const spec = parseYamlDocument(specText);
+
+// ════════════════════════════════════════════════════════════════════
+//  $ref-sibling sweep
+//
+//  The document declares OpenAPI 3.0.3 (line 1). In 3.0.x a `$ref` REPLACES
+//  the object that contains it, so every sibling key of a `$ref` is ignored
+//  by every conforming parser, generator and validator. Writing
+//
+//      last_due:
+//        nullable: true
+//        $ref: '#/components/schemas/PhoneRuntimeDueSummary'
+//
+//  therefore documents a REQUIRED, NON-NULLABLE object — while the handler
+//  returns null. The 3.0 idiom that actually works is to demote the $ref into
+//  a single-member `allOf` so the qualifier has an object of its own to sit on:
+//
+//      last_due:
+//        nullable: true
+//        allOf:
+//          - $ref: '#/components/schemas/PhoneRuntimeDueSummary'
+//
+//  This is a general rule over the WHOLE document, not a guard for one schema:
+//  `description`, `example`, `default` and `readOnly` are lost in exactly the
+//  same silent way. The walker below is what the rule is enforced with, and it
+//  is proved to work on fixtures (see the CONTROL tests) before it is trusted
+//  against the real spec.
+// ════════════════════════════════════════════════════════════════════
+
+interface RefSiblingSweep {
+  /** Every object carrying a `$ref` together with at least one other key. */
+  violations: Array<{ path: string; siblings: string[] }>;
+  /** How many `$ref`-bearing objects the walk actually visited (non-vacuity). */
+  refCount: number;
+}
+
+function sweepRefSiblings(root: unknown): RefSiblingSweep {
+  const violations: RefSiblingSweep['violations'] = [];
+  let refCount = 0;
+  const walk = (node: unknown, path: string): void => {
+    if (Array.isArray(node)) {
+      node.forEach((entry, i) => walk(entry, `${path}[${i}]`));
+      return;
+    }
+    if (node === null || typeof node !== 'object') return;
+    const obj = node as Record<string, unknown>;
+    const keys = Object.keys(obj);
+    if (keys.includes('$ref')) {
+      refCount += 1;
+      if (keys.length !== 1) {
+        violations.push({ path, siblings: keys.filter((k) => k !== '$ref').sort() });
+      }
+    }
+    for (const key of keys) walk(obj[key], `${path}.${key}`);
+  };
+  walk(root, '$');
+  return { violations, refCount };
+}
 
 /** { "GET /api/roles": true, ... } — every documented operation. */
 function documentedOperations(): Map<string, string> {
@@ -974,6 +1070,108 @@ describe('OpenAPI document integrity', () => {
       }
     };
     walk(spec);
+  });
+
+  it('CONTROL: the $ref-sibling walker detects a sibling, and descends into nested schemas and arrays', () => {
+    // A sibling buried three levels down, inside an array, inside a property
+    // map — i.e. exactly where the real ones live. If the walker only looked
+    // at the top level (or only at components.schemas), this stays empty and
+    // the CONTROL fails, which is the point of having it.
+    const planted = {
+      components: {
+        schemas: {
+          Outer: {
+            type: 'object',
+            properties: {
+              inner: {
+                type: 'array',
+                items: [
+                  { $ref: '#/components/schemas/Inner', nullable: true, description: 'nope' },
+                ],
+              },
+            },
+          },
+        },
+      },
+    };
+    const bad = sweepRefSiblings(planted);
+    expect(bad.refCount).toBe(1);
+    expect(bad.violations).toEqual([
+      {
+        path: '$.components.schemas.Outer.properties.inner.items[0]',
+        siblings: ['description', 'nullable'],
+      },
+    ]);
+
+    // And the CONTROL's own control: the SAME shape, written the 3.0 way,
+    // is clean — so the rule is not simply "anything nested fails".
+    const fixed = {
+      components: {
+        schemas: {
+          Outer: {
+            type: 'object',
+            properties: {
+              inner: {
+                type: 'array',
+                items: [
+                  {
+                    nullable: true,
+                    description: 'fine',
+                    allOf: [{ $ref: '#/components/schemas/Inner' }],
+                  },
+                ],
+              },
+            },
+          },
+        },
+      },
+    };
+    const good = sweepRefSiblings(fixed);
+    expect(good.refCount).toBe(1);
+    expect(good.violations).toEqual([]);
+  });
+
+  it('no $ref in the document has a sibling key (3.0.x ignores them)', () => {
+    const sweep = sweepRefSiblings(spec);
+    // Non-vacuity: the walk must actually reach the document's $refs. A
+    // walker that visited nothing would report zero violations too.
+    expect(sweep.refCount).toBeGreaterThan(400);
+    expect(
+      sweep.violations,
+      'a $ref with siblings: in OpenAPI 3.0.x the siblings are IGNORED. ' +
+        'Use `nullable: true` (or description/example) alongside ' +
+        '`allOf: [ { $ref: … } ]` instead of alongside the $ref itself.',
+    ).toEqual([]);
+  });
+
+  it('PhoneRuntimeState.last_due accepts the shipped default (null) and still enforces the summary shape', () => {
+    // The concrete bug this rule was written for. Both switches ship false,
+    // so `last_due: null` is what EVERY default deployment returns from
+    // GET /api/phone/health until a due pass completes; a spec that made it
+    // non-nullable broke every generated client on the first call.
+    const base = {
+      enabled: false,
+      running: false,
+      loops: [],
+      last_due: null as unknown,
+      config: {},
+      dial_jobs: {},
+      last_reclaimed: null,
+      last_expired: null,
+      last_reconciled: null,
+      sweeps_not_ok: [],
+    };
+    expect(validateNamed(base, 'PhoneRuntimeState', spec)).toEqual([]);
+
+    // …and the allOf wrapper must NOT have switched the check off: a non-null
+    // last_due is still validated against PhoneRuntimeDueSummary.
+    const summarySchema = ((spec.components as YMap).schemas as YMap).PhoneRuntimeDueSummary as YMap;
+    const summaryKeys = Object.keys(summarySchema.properties as YMap);
+    expect(summaryKeys.length).toBeGreaterThan(0);
+    expect(
+      validateNamed({ ...base, last_due: { not_a_documented_key: 1 } }, 'PhoneRuntimeState', spec).length,
+      'allOf must not weaken validation of a non-null last_due',
+    ).toBeGreaterThan(0);
   });
 
   it('documents every route the app registers and nothing else', () => {

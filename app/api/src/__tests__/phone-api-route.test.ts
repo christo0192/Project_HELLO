@@ -1100,6 +1100,16 @@ function fakeRuntime(over: {
   running?: boolean;
   lastTickAt?: string | null;
   snapshot?: Partial<PhoneRuntimeSnapshot>;
+  /**
+   * Extra fields welded onto the loop-health record the scheduler reports.
+   *
+   * `phoneRuntimeView` projects each loop through an EXPLICIT field list; this
+   * seam exists so a test can put a value there that the list does not name
+   * and prove it does not reach the response. A future edit that adds a
+   * debugging field to `SchedulerLoopHealth` is exactly the change this
+   * guards, so the fixture has to be able to model one.
+   */
+  loopExtra?: Record<string, unknown>;
 } = {}): PhoneRuntimeHandle {
   const explode = () => { throw new Error('unexpected_runtime_call'); };
   return {
@@ -1115,6 +1125,7 @@ function fakeRuntime(over: {
           ticks: 4,
           errors: 0,
           consecutiveErrors: 0,
+          ...over.loopExtra,
         }],
       }),
       start: explode,
@@ -1129,6 +1140,10 @@ function fakeRuntime(over: {
       lastReclaimed: null,
       lastExpired: null,
       lastReconciled: null,
+      // No sweep has answered non-`ok`. Empty rather than absent: the view
+      // reads this map, and a fake that omitted it would be a fake the real
+      // runtime can never produce.
+      sweepNotOk: {},
       ...over.snapshot,
     }),
     tickAll: explode,
@@ -1152,7 +1167,34 @@ function runningRuntimeWithStaleLoop(): PhoneRuntimeHandle {
   });
 }
 
-/** Running and healthy, but carrying a due summary with codes in it. */
+/**
+ * Values that must never reach an operator's screen. They are not decoration:
+ * each is placed BELOW the health surface, in a field a real leak would use,
+ * and the test that names them fails if the surface starts copying it.
+ */
+const LEASE_TOKEN_SENTINEL = 'lease-token-sentinel';
+const SIP_TRUNK_SENTINEL = 'sip-trunk-sentinel';
+
+/**
+ * Running and healthy, carrying a due summary with codes in it — and, welded
+ * onto the SAME objects, four values the view is required to drop.
+ *
+ * The point of the cast: `PhoneDueResult` does not declare these fields today,
+ * so a fixture cannot carry them without one. That is precisely the leak being
+ * guarded. `phoneRuntimeView` re-projects the due summary through an explicit
+ * six-field list rather than spreading the snapshot, and it projects each loop
+ * through a seven-field list rather than spreading the loop health. Both lists
+ * are the only thing standing between "someone adds an engagement id to the
+ * due result for debugging" and that id appearing in `GET /api/phone/health`.
+ * The fixture models that future field; the assertions below prove the lists
+ * still hold.
+ *
+ * NOT covered here, deliberately: an identifier used as a SKIP or REFUSAL
+ * KEY. The view copies those maps verbatim by design (they are stable codes),
+ * so no view-level fixture can catch it — that property is proved by
+ * `phone-runtime-loops.test.ts`'s `NO IDENTIFIER LEAKS`, which drives real
+ * sentinel rows through a real due pass and searches the whole serialized view.
+ */
 function runtimeWithDueSummary(): PhoneRuntimeHandle {
   return fakeRuntime({
     running: true,
@@ -1165,8 +1207,16 @@ function runtimeWithDueSummary(): PhoneRuntimeHandle {
         dialing: 1,
         skipped: { no_dialable_number: 1, appointment_not_due: 1 },
         refusals: { outside_window: 1 },
-      },
+        // ── Not part of the shape. Present anyway. ──────────────────────
+        engagementId: UUID_E,
+        candidateId: UUID_C,
+        attemptId: UUID_A,
+        leaseToken: LEASE_TOKEN_SENTINEL,
+      } as unknown as PhoneRuntimeSnapshot['lastDue'],
     },
+    // The provider payload a loop would be holding if anyone ever put one on
+    // the scheduler's health record.
+    loopExtra: { sipTrunk: SIP_TRUNK_SENTINEL, lastEngagementId: UUID_E },
   });
 }
 
@@ -1347,6 +1397,8 @@ describe('the health surface', () => {
           last_due: null,
           config: {},
           dial_jobs: {},
+          // No sweep has run in a process with no runtime, so none has failed.
+          sweeps_not_ok: [],
           last_reclaimed: null,
           last_expired: null,
           last_reconciled: null,
@@ -1404,16 +1456,62 @@ describe('the health surface', () => {
       expect(res.body.reasons).toEqual(['phone_runtime_stopped']);
     });
 
-    it('carries no identifier, phone number or provider payload', async () => {
-      // The due summary is keyed by STABLE CODE. An operator learns how many
-      // were skipped and for which reason, never which candidate.
+    it("a sweep that did not run reports null and 'phone_sweep_not_ok' — not a quiet 0", async () => {
+      // The whole point of the distinction. `last_expired: 0` means the sweep
+      // RAN and found nothing; `last_reclaimed: null` with `reclaim` named in
+      // `sweeps_not_ok` means it did not run at all. Before the split these
+      // were the same number, and a reclaim sweep that had silently stopped
+      // reported `status: ok` with `last_reclaimed: 0` while expired attempt
+      // leases piled up holding fleet slots.
+      registerPhoneRuntime(fakeRuntime({
+        running: true,
+        lastTickAt: NOW.toISOString(),
+        snapshot: {
+          lastReclaimed: null,
+          lastExpired: 0,
+          sweepNotOk: { reclaim: true, expire: false },
+        },
+      }));
+      const res = await request(appWith('interviewer', { stores: fakeStores().store }))
+        .get('/api/phone/health');
+
+      expect(res.status).toBe(200);
+      // `toBeNull`, never `toBeFalsy` — `0` is falsy and `0` is precisely the
+      // value this repair exists to stop meaning "did not run".
+      expect(res.body.runtime.last_reclaimed).toBeNull();
+      expect(res.body.runtime.last_expired).toBe(0);
+      // Only the sweep that failed is named, and it is named by CODE.
+      expect(res.body.runtime.sweeps_not_ok).toEqual(['reclaim']);
+      expect(res.body.reasons).toContain('phone_sweep_not_ok');
+      expect(res.body.status).toBe('degraded');
+    });
+
+    it('drops identifiers and provider payload carried on the objects it projects', async () => {
+      // The runtime registered here CARRIES all five secrets, on the two
+      // objects the view reads: the due summary and the loop health record.
+      // The view must re-project both through its field lists and drop the
+      // rest — if it ever spreads either object instead, every assertion in
+      // this test goes red at once.
       registerPhoneRuntime(runtimeWithDueSummary());
       const res = await request(appWith('interviewer', { stores: fakeStores().store }))
         .get('/api/phone/health');
+
+      // Non-vacuity: the secrets really are below the surface. Without this,
+      // a fixture that quietly stopped carrying them would leave the sweep
+      // below asserting nothing at all — which is the defect this test had.
+      const beneath = JSON.stringify(runtimeWithDueSummary().snapshot())
+        + JSON.stringify(runtimeWithDueSummary().scheduler.health());
+      for (const secret of [UUID_A, UUID_E, UUID_C, LEASE_TOKEN_SENTINEL, SIP_TRUNK_SENTINEL]) {
+        expect(beneath, `fixture must carry ${secret}`).toContain(secret);
+      }
+
       const serialized = JSON.stringify(res.body.runtime);
-      for (const secret of [UUID_A, UUID_E, UUID_C, 'lease-token-sentinel', 'sip-trunk-sentinel']) {
+      for (const secret of [UUID_A, UUID_E, UUID_C, LEASE_TOKEN_SENTINEL, SIP_TRUNK_SENTINEL]) {
         expect(serialized, secret).not.toContain(secret);
       }
+
+      // The whitelists themselves, stated positively. `toEqual` is exact, so
+      // an extra field survives as a failure rather than as silence.
       expect(res.body.runtime.last_due).toEqual({
         status: 'ok',
         examined: 4,
@@ -1422,6 +1520,9 @@ describe('the health surface', () => {
         skipped: { no_dialable_number: 1, appointment_not_due: 1 },
         refusals: { outside_window: 1 },
       });
+      expect(Object.keys(res.body.runtime.loops[0]).sort()).toEqual([
+        'consecutiveErrors', 'errors', 'lastTickAt', 'name', 'running', 'stale', 'ticks',
+      ]);
     });
   });
 });

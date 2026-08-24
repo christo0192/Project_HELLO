@@ -29,6 +29,10 @@ import type {
   PhoneScreeningConfig,
   PhoneStores,
 } from '../phone-screening/index.js';
+// A VALUE import, and the only one this module takes from the domain package:
+// the single shared definition of the IST window, so the runtime cannot grow
+// a second copy of 09:00/21:00 that drifts from admission's.
+import { istWindowOpen } from '../phone-screening/index.js';
 import type { DuePhoneEngagement, PhoneRuntimeReader } from './read.js';
 import type { DialableNumber } from '../../integrations/livekit-phone-dial/dialable-number.js';
 
@@ -39,6 +43,8 @@ export const PHONE_DUE_SKIPS = [
   // vocabulary entry that nothing can produce reads to an operator as a state
   // that has never occurred rather than one that cannot.
   'not_yet_due',
+  'outside_ist_window',
+  'candidate_already_offered',
   'no_dialable_number',
   'no_session',
   'appointment_not_due',
@@ -70,6 +76,12 @@ export interface PhoneSessionPort {
    * engagement is then skipped, never dialled blind.
    */
   ensureSession(input: {
+    /**
+     * Load-bearing. Adoption resolves a session by CANDIDATE, and a candidate
+     * is not unique per engagement — so the port needs to know which
+     * engagement is asking in order to refuse a session another one owns.
+     */
+    engagementId: string;
     candidateId: string;
     roleId: string | null;
     existingSessionId: string | null;
@@ -220,12 +232,54 @@ export async function runPhoneDuePass(
   // appointment gate, which meant a `scheduled` row whose slot was still an
   // hour away had its number read anyway — a read that could not change the
   // outcome. The gate order here is the one the comment always claimed.
+  // ── THE IST WINDOW, BEFORE ANY WRITE OR ANY NUMBER READ ─────────────
+  // `admit_phone_attempt` is the AUTHORITY on the window and re-checks it
+  // under the advisory lock; this is a cheap preflight, not a second opinion,
+  // and it reuses `istWindowOpen` — the same predicate `admission.ts` calls,
+  // over the same `PHONE_IST_WINDOW` bounds — so there is exactly one
+  // definition of 09:00 inclusive / 21:00 exclusive in TypeScript and it
+  // cannot drift from the one in 0042.
+  //
+  // Without it the pass reached admission before the window was consulted,
+  // which meant that through the closed hours it read every due candidate's
+  // phone number out of SQL and minted a `call_sessions` row for each, four
+  // times a minute, only to be refused `window_closed` every time. A write
+  // and a number read that cannot change the outcome are exactly what the
+  // gate order in this file exists to prevent.
+  if (!istWindowOpen(options.now)) {
+    return {
+      status: 'ok',
+      examined: due.length,
+      offered: 0,
+      dialing: 0,
+      skipped: { outside_ist_window: due.length },
+      refusals: {},
+    };
+  }
+
+  // One engagement per CANDIDATE per pass. `uq_phone_engagements_application`
+  // keys an engagement to an application link and the candidate index is not
+  // unique, so one person applying to two roles has two engagements — two
+  // independent budgets, two independent IST-day slots, and nothing in 0042
+  // that stops both being admitted in the same second. The result would be
+  // one phone ringing twice from a single pass.
+  //
+  // This bounds the hazard to a pass. It does NOT close it across passes or
+  // across replicas: that needs a per-candidate guard inside
+  // `admit_phone_attempt`, which is a 0042 change and is recorded as a
+  // residual rather than smuggled in here.
+  const offeredCandidates = new Set<string>();
+
   const ready: Array<{ row: DuePhoneEngagement; kind: PhoneAttemptKind }> = [];
   for (const row of due) {
     const kind = dueAttemptKind(row);
     if (kind === null) { bump(skipped, 'unknown_state'); continue; }
     if (!dueByClock(row, options.now, deps.config.reconnectBackoffSeconds)) {
       bump(skipped, 'not_yet_due');
+      continue;
+    }
+    if (offeredCandidates.has(row.candidateId)) {
+      bump(skipped, 'candidate_already_offered');
       continue;
     }
 
@@ -241,6 +295,14 @@ export async function runPhoneDuePass(
       }
     }
 
+    // The candidate's one offer per pass is claimed HERE, after every gate,
+    // and not at the check above. A `scheduled` row whose slot has not
+    // arrived is skipped `appointment_not_due` — it was never offered, so
+    // spending the candidate's slot on it would silently suppress a sibling
+    // engagement that IS due, and the health surface would show one
+    // `appointment_not_due` and one `candidate_already_offered` with nothing
+    // to say the second was caused by the first.
+    offeredCandidates.add(row.candidateId);
     ready.push({ row, kind });
   }
 
@@ -253,6 +315,7 @@ export async function runPhoneDuePass(
     if (number === undefined) { bump(skipped, 'no_dialable_number'); continue; }
 
     const sessionId = await deps.sessions.ensureSession({
+      engagementId: row.engagementId,
       candidateId: row.candidateId,
       roleId: row.roleId,
       existingSessionId: row.sessionId,

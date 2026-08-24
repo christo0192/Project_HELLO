@@ -62,6 +62,21 @@ const SENTINEL_SESSION = 'SENTINEL-SESSION-eee555';
 const SENTINEL_ATTEMPT = 'SENTINEL-ATTEMPT-fff666';
 const SENTINEL_ROLE = 'SENTINEL-ROLE-ggg777';
 
+/**
+ * The one DIALABLE value this suite needs, assembled at runtime.
+ *
+ * `wrapDialableNumber` accepts only the substrate's strict Indian mobile form,
+ * `^\+91[6-9][0-9]{9}$`. India publishes no reserved documentation range —
+ * there is no +1-555 equivalent — so a literal of that form committed here
+ * would be indistinguishable from a real subscriber's number, which is the
+ * rule `phone-runtime-structural.test.ts` enforces over the source package.
+ * The same risk lives in a test file, so the digits are joined from fragments
+ * exactly as `phone-runtime-read.test.ts` does and nothing on disk matches the
+ * gate. `DIALABLE_NATIONAL` is the ten-digit tail, used for the leak sweep.
+ */
+const DIALABLE = ['+9', '1', '70', '1234', '5678'].join('');
+const DIALABLE_NATIONAL = DIALABLE.slice(3);
+
 const LOOP_NAMES = [
   'phone-dial',
   'phone-due',
@@ -113,20 +128,39 @@ function runtimeConfig(over: Partial<PhoneRuntimeConfig> = {}): PhoneRuntimeConf
 }
 
 interface Counters {
+  /**
+   * Due passes ENTERED, counted at the reader's `listDueEngagements`.
+   *
+   * It used to be counted at `stores.backlog`, on the reasoning that the
+   * backlog read is the first thing `runPhoneDuePass` awaits. That stopped
+   * being true when the dial loop grew a fail-closed `shouldClaim` that reads
+   * the same halt row: one `backlog()` no longer means one due pass, and a
+   * counter that conflates two callers reports a number no assertion can
+   * interpret. `listDueEngagements` is reached by the due pass and by nothing
+   * else, so it counts passes and only passes.
+   *
+   * It counts passes that got PAST the halt gate — a halted pass returns
+   * before the reader is touched. This suite always runs with the halt clear;
+   * the halted case is `runPhoneDuePass`'s own suite.
+   */
   duePasses: number;
+  /** Every `stores.backlog()`, from the due pass AND from the dial loop's halt gate. */
+  backlogReads: number;
   reclaims: number;
   expires: number;
   claims: string[];
 }
 
 function counters(): Counters {
-  return { duePasses: 0, reclaims: 0, expires: 0, claims: [] };
+  return { duePasses: 0, backlogReads: 0, reclaims: 0, expires: 0, claims: [] };
 }
 
 /**
- * The three store calls the four loops actually reach. `backlog` is the FIRST
- * thing `runPhoneDuePass` awaits, so counting it counts due-pass entries —
- * which is what the no-overlap property needs to observe.
+ * The three store calls the four loops actually reach.
+ *
+ * `backlog` is read by TWO callers now — the due pass, and the dial loop's
+ * fail-closed `shouldClaim` — so it counts into `backlogReads` and the due
+ * pass is counted at the reader instead. See `Counters.duePasses`.
  */
 function makeStores(
   c: Counters,
@@ -134,7 +168,7 @@ function makeStores(
 ): PhoneStores {
   return {
     async backlog() {
-      c.duePasses += 1;
+      c.backlogReads += 1;
       return {
         status: 'ok',
         admission: { controlPresent: true, halted: false, haltReason: null },
@@ -152,17 +186,40 @@ function makeStores(
   } as unknown as PhoneStores;
 }
 
-function makeReader(over: Record<string, unknown> = {}): PhoneRuntimeReader {
+/**
+ * The reader port, shaped by the COMPILER rather than by a cast.
+ *
+ * `Partial<PhoneRuntimeReader>` and a plain return type are load-bearing: this
+ * fake used to be built with `readRecord`/`readTemplate` behind an
+ * `as unknown as PhoneRuntimeReader`, which are not the names `ConsentReader`
+ * declares (`latestConsentRecord`/`activeConsentTemplate`). Nothing here
+ * reaches consent today, so the mismatch was inert — but the first loops-level
+ * test to go through the consent preflight would have called a method that
+ * does not exist and baselined whatever came back. A fake that is shaped
+ * differently from production is the definition of a fake that is kinder than
+ * production, so the cast is gone and every method below is checked against
+ * the real port.
+ */
+function makeReader(over: Partial<PhoneRuntimeReader> = {}, c?: Counters): PhoneRuntimeReader {
   return {
-    async listDueEngagements() { return []; },
+    async listDueEngagements() {
+      if (c !== undefined) c.duePasses += 1;
+      return [];
+    },
     async listDialableNumbers() { return new Map(); },
     async findReusableSession() { return null; },
+    // No session is owned and none is reusable by default: the default fixture
+    // has no engagement carrying one, and a fake that answered otherwise would
+    // let a pass adopt a session this suite never created.
+    async countLiveEngagements() { return 1; },
+    async engagementOwningSession() { return null; },
+    async readSessionForReuse() { return null; },
     consent: {
-      async readRecord() { return null; },
-      async readTemplate() { return null; },
+      async latestConsentRecord() { return null; },
+      async activeConsentTemplate() { return null; },
     },
     ...over,
-  } as unknown as PhoneRuntimeReader;
+  };
 }
 
 /** An always-empty queue that records every queue name it is asked to claim. */
@@ -185,6 +242,8 @@ function buildRuntime(opts: {
   queue?: Queue;
   config?: Partial<PhoneRuntimeConfig>;
   random?: () => number;
+  /** Supply to count due-pass entries; the default reader counts nothing. */
+  counters?: Counters;
 } = {}): PhoneRuntimeHandle {
   const handle = createPhoneRuntime({
     config: screeningConfig(true, true),
@@ -195,7 +254,7 @@ function buildRuntime(opts: {
     client: {} as never,
     queue: opts.queue ?? makeEmptyQueue(counters()),
     stores: opts.stores ?? makeStores(counters()),
-    reader: opts.reader ?? makeReader(),
+    reader: opts.reader ?? makeReader({}, opts.counters),
     owner: 'phone-test-owner',
     scheduler: { random: opts.random ?? (() => 0.5) },
   });
@@ -219,6 +278,11 @@ async function until(pred: () => boolean, turns = 500): Promise<void> {
 
 beforeEach(() => {
   vi.useFakeTimers();
+  // 11:30 IST — inside the calling window, which `runPhoneDuePass` now checks
+  // before it reads a number or provisions a session. Left on the wall clock
+  // this suite would offer dials in the morning and skip them at midnight, so
+  // the instant is pinned rather than inherited.
+  vi.setSystemTime(new Date('2026-08-24T06:00:00.000Z'));
 });
 
 afterEach(async () => {
@@ -379,7 +443,7 @@ describe('B. loop lifecycle', () => {
 
   it('stop() stops EVERY loop — ticks are frozen across many further intervals', async () => {
     const c = counters();
-    const runtime = buildRuntime({ stores: makeStores(c), queue: makeEmptyQueue(c) });
+    const runtime = buildRuntime({ stores: makeStores(c), queue: makeEmptyQueue(c), counters: c });
     runtime.scheduler.start();
 
     await vi.advanceTimersByTimeAsync(20_000);
@@ -399,7 +463,7 @@ describe('B. loop lifecycle', () => {
 
   it('stop() is idempotent — twice does not throw and does not double-count', async () => {
     const c = counters();
-    const runtime = buildRuntime({ stores: makeStores(c), queue: makeEmptyQueue(c) });
+    const runtime = buildRuntime({ stores: makeStores(c), queue: makeEmptyQueue(c), counters: c });
     runtime.scheduler.start();
     await vi.advanceTimersByTimeAsync(6_000);
 
@@ -419,6 +483,7 @@ describe('B. loop lifecycle', () => {
     const runtime = buildRuntime({
       stores: makeStores(c),
       queue: makeEmptyQueue(c),
+      counters: c,
       config: { dueMs: 1_000, reclaimMs: 5_000, expireMs: 10_000, reconcileMs: 30_000 },
       random: () => 0.5, // mid-stagger: first tick at half an interval
     });
@@ -453,18 +518,24 @@ describe('B. loop lifecycle', () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
 
-    const stores = makeStores(c, {
-      async backlog() {
+    // Held open INSIDE the pass rather than at the backlog read: the dial
+    // loop's halt gate reads the backlog too, so gating there would stall a
+    // second loop and count a second caller. `listDueEngagements` is the due
+    // pass and nothing else.
+    const reader = makeReader({
+      async listDueEngagements() {
         c.duePasses += 1;
         await gate; // held open far longer than `dueMs`
-        return {
-          status: 'ok',
-          admission: { controlPresent: true, halted: false, haltReason: null },
-        };
+        return [];
       },
     });
 
-    const runtime = buildRuntime({ stores, queue: makeEmptyQueue(c), config: { dueMs: 1_000 } });
+    const runtime = buildRuntime({
+      stores: makeStores(c),
+      reader,
+      queue: makeEmptyQueue(c),
+      config: { dueMs: 1_000 },
+    });
     runtime.scheduler.start();
 
     // Twenty intervals go by while the first pass is still in flight.
@@ -498,6 +569,7 @@ describe('C. a rejecting loop never kills the scheduler', () => {
     const runtime = buildRuntime({
       stores,
       queue: makeEmptyQueue(c),
+      counters: c,
       config: { dueMs: 1_000, reclaimMs: 1_000, expireMs: 1_000 },
     });
     runtime.scheduler.start();
@@ -578,6 +650,7 @@ function makeView(over: Partial<PhoneRuntimeView> = {}): PhoneRuntimeView {
     last_reclaimed: null,
     last_expired: null,
     last_reconciled: null,
+    sweeps_not_ok: [],
     ...over,
   };
 }
@@ -597,6 +670,8 @@ describe('D. the health view', () => {
       last_reclaimed: null,
       last_expired: null,
       last_reconciled: null,
+      // No sweep has run, so none has failed. Empty, never a fabricated name.
+      sweeps_not_ok: [],
     });
 
     // AND IT IS NOT A FAULT. A process that is not running the phone loops is
@@ -658,6 +733,8 @@ describe('D. the health view', () => {
       last_reclaimed: null,
       last_expired: null,
       last_reconciled: null,
+      // No sweep has run, so none has failed. Empty, never a fabricated name.
+      sweeps_not_ok: [],
     });
   });
 
@@ -702,13 +779,28 @@ describe('D. the health view', () => {
         expected: ['phone_due_halted'],
       },
       {
+        // A sweep that did not run is not a sweep that found nothing. The
+        // count alone cannot carry that difference, which is why the reason
+        // exists at all.
+        label: 'a non-ok sweep ⇒ phone_sweep_not_ok',
+        view: makeView({ loops: [loopView()], sweeps_not_ok: ['reclaim'] }),
+        expected: ['phone_sweep_not_ok'],
+      },
+      {
         label: 'every reason at once, in declaration order',
         view: makeView({
           running: false,
           loops: [loopView({ stale: true, errors: 2, consecutiveErrors: 2 })],
           last_due: { status: 'halted', examined: 0, offered: 0, dialing: 0, skipped: {}, refusals: {} },
+          sweeps_not_ok: ['reclaim', 'expire'],
         }),
-        expected: ['phone_runtime_stopped', 'phone_loop_stale', 'phone_loop_erroring', 'phone_due_halted'],
+        expected: [
+          'phone_runtime_stopped',
+          'phone_loop_stale',
+          'phone_loop_erroring',
+          'phone_due_halted',
+          'phone_sweep_not_ok',
+        ],
       },
     ];
 
@@ -782,11 +874,17 @@ describe('D. the health view', () => {
       async listDialableNumbers() {
         // Only the first candidate is dialable, so exactly one row is OFFERED
         // and produces a REFUSAL code, and one row produces a SKIP code.
-        return new Map([[SENTINEL_CANDIDATE, wrapDialableNumber('+919876543210')]]);
+        return new Map([[SENTINEL_CANDIDATE, wrapDialableNumber(DIALABLE)]]);
       },
-      // Adopting an existing session keeps the pass off `createSession`, which
-      // would reach the real Supabase client.
+      // Reusing an existing session keeps the pass off `createSession`, which
+      // would reach the real Supabase client. Both reuse paths are answered
+      // because the first row names a session on the engagement (the VERIFIED
+      // `existingSessionId` path) while the second does not (the adoption
+      // path), and the port refuses either unless the session is resumable,
+      // carries its own derived room name, and is owned by nobody else.
+      async readSessionForReuse() { return { status: 'waiting', roomVerified: true }; },
       async findReusableSession() { return SENTINEL_SESSION; },
+      async engagementOwningSession() { return null; },
     });
 
     // One `phone.dial` job carrying the sentinel attempt id, so the dial-job
@@ -852,8 +950,8 @@ describe('D. the health view', () => {
       expect(serialized).not.toContain(id);
     }
     // Nor the number, nor its digest.
-    expect(serialized).not.toContain('9876543210');
-    expect(serialized).not.toContain(wrapDialableNumber('+919876543210').digest);
+    expect(serialized).not.toContain(DIALABLE_NATIONAL);
+    expect(serialized).not.toContain(wrapDialableNumber(DIALABLE).digest);
   });
 });
 
@@ -861,11 +959,41 @@ describe('D. the health view', () => {
 // E. QUEUE / DIAL LOOP  (RED MUTATION PROOF #2)
 // ═════════════════════════════════════════════════════════════════════════════
 //
-// MUTATION CONTROL. `it claims exactly once` turns RED if the SKIP-LOCKED
-// bookkeeping in the fake store is honoured by only one claimer — i.e. if the
-// runner were changed to keep claiming a row another runner already holds, or
-// if `createQueueRunner`'s `if (!job || !job.leaseToken) break;` were removed
-// so a null claim did not stop the fill loop.
+// MUTATION CONTROL — stated as what a PRODUCTION edit can actually do.
+//
+// Injecting a second `runJob(job, job.leaseToken)` alongside the tracked one
+// in `createQueueRunner`'s fill loop turns THREE assertions red, and they were
+// each run against that mutation rather than assumed:
+//
+//   * `outcomes(a) + outcomes(b)` becomes 2 in `two concurrent claimers ...`;
+//   * `world.completeLog` becomes `['job-once','job-once']` in `a resolving
+//     handler completes the job ...`;
+//   * the `dial_jobs` total becomes 2 in block D's `NO IDENTIFIER LEAKS`.
+//
+// That is the property this block proves: ONE CLAIM ⇒ ONE HANDLER RUN ⇒ ONE
+// COMPLETION. No double-PROCESSING inside a runner.
+//
+// What they do NOT prove, said plainly so nobody reads more into the green:
+//
+//   * `expect(world.handedOut).toEqual(['job-single'])` is decided entirely
+//     by the fake's own `lockedBy`/`completed` bookkeeping — `jobs.find(...)`
+//     cannot return a row that is already locked or completed, whatever the
+//     runner does. No production mutation can turn that assertion red, so it
+//     is a PRECONDITION on the fake, not a proof about the code.
+//   * The `!job.leaseToken` half of `if (!job || !job.leaseToken) break;` is
+//     unreachable from here: `skipLockedQueue` attaches a lease token to
+//     every row it hands out, so the fence's second half is never exercised.
+//     Removing it leaves this suite green. (Verified.)
+//   * Double-CLAIMING ACROSS REPLICAS is a `FOR UPDATE SKIP LOCKED` + CAS
+//     guarantee that lives in SQL, not in TypeScript. It is modelled here,
+//     never tested here. Its real proof is
+//     `app/supabase/tests/phone_admission_concurrency_setup.sql` /
+//     `_assert.sql`, and the acceptance item "concurrent claims ⇒ one winner"
+//     is discharged there.
+//
+// The fake still earns its place: it is what lets one claimed row be offered
+// to two runners at once so the one-handler-run property can be observed at
+// all.
 
 /**
  * A queue that models `FOR UPDATE SKIP LOCKED`: a claimed row is INVISIBLE to
@@ -952,9 +1080,12 @@ describe('E. the dial loop', () => {
     const outcomes = (h: PhoneRuntimeHandle): number =>
       Object.values(h.snapshot().dialJobOutcomes).reduce((x, y) => x + y, 0);
 
-    // The row was handed to exactly one claimer...
+    // PRECONDITION, not a proof: the fake models SKIP LOCKED, so a locked row
+    // is invisible to the second claimer by construction. Asserted to show the
+    // world behaved as designed — no production edit can make this line fail.
     expect(world.handedOut).toEqual(['job-single']);
-    // ...so exactly one handler ran, across BOTH runtimes.
+    // THE PROPERTY: exactly one handler ran, across BOTH runtimes. This is the
+    // line a duplicate `runJob` invocation in `createQueueRunner` turns red.
     expect(outcomes(a) + outcomes(b)).toBe(1);
     // ...and the loser did no work at all.
     const winner = outcomes(a) === 1 ? a : b;

@@ -53,6 +53,7 @@ import {
 } from '../lib/phone-runtime/dial-handler.js';
 import type { DuePhoneEngagement, PhoneRuntimeReader } from '../lib/phone-runtime/read.js';
 import type { DialableNumber } from '../integrations/livekit-phone-dial/dialable-number.js';
+import { PHONE_BOUNDS } from '../lib/phone-screening/index.js';
 import type { PhoneScreeningConfig, PhoneStores } from '../lib/phone-screening/index.js';
 import type { QueueJob } from '../lib/queue/types.js';
 
@@ -163,14 +164,33 @@ describe('phone runtime config: an empty source yields the documented defaults',
     expect(c.jobLeaseSeconds).toBe(60);
   });
 
-  it('reclaiming is never slower than dialling is fast', () => {
-    // The stated ordering rule of the table: a lapsed lease holds one of ten
-    // fleet slots, a deferred dial costs nothing. If the two defaults are ever
-    // inverted the lane starves itself, so the relation is asserted, not
-    // trusted to the comment that states it.
-    expect(PHONE_RUNTIME_BOUNDS.reclaimMs!.def).toBeLessThanOrEqual(
-      PHONE_RUNTIME_BOUNDS.reconcileMs!.def,
-    );
+  it('the four cadences escalate: due < reclaim < reconcile < expire', () => {
+    // Ordered by COST, not importance. Dialling is the cheapest read and the
+    // only one a candidate is waiting on; reconciling costs a LiveKit room
+    // read per live attempt; expiring an appointment can wait.
+    const { dueMs, reclaimMs, reconcileMs, expireMs } = PHONE_RUNTIME_BOUNDS;
+    expect(dueMs!.def).toBeLessThan(reclaimMs!.def);
+    expect(reclaimMs!.def).toBeLessThan(reconcileMs!.def);
+    expect(reconcileMs!.def).toBeLessThan(expireMs!.def);
+  });
+
+  it('the reclaim sweep is strictly faster than the attempt lease it reclaims', () => {
+    // The one CORRECTNESS bound in the table, as opposed to a preference.
+    // A lapsed lease holds one of ten fleet slots against every other
+    // candidate. Sweeping slower than the lease lifetime means a dead
+    // worker's slot is held for the difference — the starvation 0042 says
+    // this loop exists to prevent.
+    //
+    // Asserted against the REAL lease bound rather than a literal, so raising
+    // `PHONE_LEASE_SECONDS`' floor without revisiting the sweep is caught.
+    const leaseMs = PHONE_BOUNDS.leaseSeconds!.def * 1_000;
+    expect(PHONE_RUNTIME_BOUNDS.reclaimMs!.def).toBeLessThan(leaseMs);
+    // And the ceiling cannot be configured past it either — a knob whose max
+    // breaks the invariant is a knob that ships the bug.
+    expect(PHONE_RUNTIME_BOUNDS.reclaimMs!.min).toBeLessThan(leaseMs);
+  });
+
+  it('a bounded batch cannot be widened past the sweep batch', () => {
     expect(PHONE_RUNTIME_BOUNDS.dueLimit!.max).toBeLessThan(
       PHONE_RUNTIME_BOUNDS.reclaimLimit!.max,
     );
@@ -494,6 +514,19 @@ function harness(options: {
     async findReusableSession() {
       calls.findSession += 1;
       return null;
+    },
+    // Present so the fake matches the PORT rather than a convenient subset of
+    // it. `runPhoneDuePass` never calls these two — `createPhoneSessionPort`
+    // does — but a fake shaped differently from production is how a guard
+    // ends up untestable, so they throw rather than answer politely.
+    async countLiveEngagements() {
+      throw new Error('unexpected_live_engagement_count');
+    },
+    async engagementOwningSession() {
+      throw new Error('unexpected_owning_session_read');
+    },
+    async readSessionForReuse() {
+      throw new Error('unexpected_session_reuse_read');
     },
     consent: {
       async latestConsentRecord() {
@@ -1153,5 +1186,186 @@ describe('CONTROL — the handler performs no I/O whatsoever', () => {
     } finally {
       setInterval.mockRestore();
     }
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════
+//  The IST window, at the runtime seam
+//
+//  `admit_phone_attempt` is the AUTHORITY and re-checks the window under the
+//  advisory lock. This is a preflight, and its value is not correctness — it
+//  is that a refusal costs no write and no number read. Before it existed the
+//  pass minted a `call_sessions` row and pulled every due candidate's
+//  `phone_e164` out of SQL four times a minute through the closed hours, only
+//  to be refused `window_closed` every time.
+//
+//  Asia/Kolkata is UTC+05:30, so the boundary instants are arithmetic:
+//    09:00:00 IST == 03:30:00Z   (open, INCLUSIVE)
+//    21:00:00 IST == 15:30:00Z   (closed, EXCLUSIVE)
+// ════════════════════════════════════════════════════════════════════
+
+describe('the due pass refuses outside 09:00-inclusive / 21:00-exclusive IST', () => {
+  const instants: Array<[string, string, boolean]> = [
+    ['one second before open', '2026-09-01T03:29:59.000Z', false],
+    ['exactly 09:00:00 IST', '2026-09-01T03:30:00.000Z', true],
+    ['one second after open', '2026-09-01T03:30:01.000Z', true],
+    ['midday', '2026-09-01T06:00:00.000Z', true],
+    ['one second before close', '2026-09-01T15:29:59.000Z', true],
+    ['exactly 21:00:00 IST', '2026-09-01T15:30:00.000Z', false],
+    ['one second after close', '2026-09-01T15:30:01.000Z', false],
+    ['the dead of night', '2026-09-01T20:00:00.000Z', false],
+  ];
+
+  for (const [label, iso_, open] of instants) {
+    it(`${label} => ${open ? 'dials' : 'refuses'}`, async () => {
+      const h = harness({ due: [engagement({ nextEligibleAt: null })] });
+      const result = await runPhoneDuePass(h.deps, { now: new Date(iso_), limit: 10 });
+
+      if (open) {
+        expect(result.skipped.outside_ist_window ?? 0, label).toBe(0);
+        expect(h.calls.dial, label).toBe(1);
+      } else {
+        expect(result.skipped, label).toEqual({ outside_ist_window: 1 });
+        expect(h.calls.dial, label).toBe(0);
+        // The whole point: no number left SQL and no session row was written.
+        expect(h.calls.listNumbers, label).toBe(0);
+        expect(h.calls.ensureSession, label).toBe(0);
+      }
+    });
+  }
+
+  it('the window is checked AFTER the halt, so a halted lane reports halted', async () => {
+    // Ordering matters to an operator: `halted` is a decision someone made,
+    // `outside_ist_window` is the clock. Reporting the clock while a halt is
+    // up would hide the halt.
+    const h = harness({ backlogThrows: true });
+    const result = await runPhoneDuePass(
+      h.deps,
+      { now: new Date('2026-09-01T20:00:00.000Z'), limit: 10 },
+    );
+    expect(result.status).toBe('halted');
+  });
+
+  it('CONTROL — the closed-window skip is counted for EVERY due row, not just the first', async () => {
+    // Otherwise `toEqual({ outside_ist_window: 1 })` above would also pass for
+    // an implementation that returned after examining one row.
+    const h = harness({
+      due: [
+        engagement({ engagementId: 'e1', candidateId: 'c1', nextEligibleAt: null }),
+        engagement({ engagementId: 'e2', candidateId: 'c2', nextEligibleAt: null }),
+        engagement({ engagementId: 'e3', candidateId: 'c3', nextEligibleAt: null }),
+      ],
+    });
+    const result = await runPhoneDuePass(h.deps, { now: new Date('2026-09-01T20:00:00.000Z'), limit: 10 });
+    expect(result.skipped).toEqual({ outside_ist_window: 3 });
+    expect(result.examined).toBe(3);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════
+//  One engagement per candidate per pass
+//
+//  `uq_phone_engagements_application` keys an engagement to an APPLICATION
+//  LINK, and `idx_phone_engagements_candidate` is deliberately NOT unique. So
+//  one person applying to two roles has two engagements, each with its own
+//  no-answer budget and its own IST-day slot — and nothing in 0042 stops both
+//  being admitted in the same second. Without this guard a single pass makes
+//  one phone ring twice.
+// ════════════════════════════════════════════════════════════════════
+
+describe('a candidate is offered at most once per pass', () => {
+  it('two engagements for one candidate produce ONE dial', async () => {
+    const h = harness({
+      due: [
+        engagement({ engagementId: 'e-role-a', candidateId: 'shared', nextEligibleAt: null }),
+        engagement({ engagementId: 'e-role-b', candidateId: 'shared', nextEligibleAt: null }),
+      ],
+    });
+    const result = await runPhoneDuePass(h.deps, options());
+
+    expect(h.dialled).toEqual(['e-role-a']);
+    expect(result.dialing).toBe(1);
+    expect(result.skipped).toEqual({ candidate_already_offered: 1 });
+    // The second engagement's number is never even requested.
+    expect(h.numberRequests).toEqual([['shared']]);
+  });
+
+  it('a row skipped by a LATER gate does not spend the candidate\'s offer', async () => {
+    // The offer is claimed after every gate, not at the duplicate check. A
+    // `scheduled` row whose slot has not arrived was never offered, so
+    // spending the candidate's one slot on it would silently suppress a
+    // sibling engagement that IS due — and the health surface would show one
+    // `appointment_not_due` and one `candidate_already_offered` with nothing
+    // to say the second was caused by the first.
+    const h = harness({
+      due: [
+        // Ordered first, so it reaches the duplicate check first.
+        engagement({
+          engagementId: 'e-scheduled-later',
+          candidateId: 'shared',
+          state: 'scheduled',
+          nextEligibleAt: null,
+        }),
+        engagement({ engagementId: 'e-due-now', candidateId: 'shared', nextEligibleAt: null }),
+      ],
+      appointmentStart: () => iso(3_600),
+    });
+    const result = await runPhoneDuePass(h.deps, options());
+
+    expect(h.dialled).toEqual(['e-due-now']);
+    expect(result.skipped).toEqual({ appointment_not_due: 1 });
+    expect(result.skipped.candidate_already_offered ?? 0).toBe(0);
+  });
+
+  it('CONTROL — two engagements for DIFFERENT candidates both dial', async () => {
+    // Without this, the guard above is satisfied by a pass that dials only
+    // ever one row per tick.
+    const h = harness({
+      due: [
+        engagement({ engagementId: 'e1', candidateId: 'c1', nextEligibleAt: null }),
+        engagement({ engagementId: 'e2', candidateId: 'c2', nextEligibleAt: null }),
+      ],
+    });
+    const result = await runPhoneDuePass(h.deps, options());
+
+    expect(h.dialled).toEqual(['e1', 'e2']);
+    expect(result.dialing).toBe(2);
+    expect(result.skipped).toEqual({});
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════
+//  The dial handler's outcome sink
+// ════════════════════════════════════════════════════════════════════
+
+describe('a broken outcome sink cannot become a redialled candidate', () => {
+  it('a THROWING onOutcome still resolves', async () => {
+    // The handler's entire contract is: never throw. A rejected handler makes
+    // the runner FAIL the job, and `maxAttempts: 5` then retries it. The sink
+    // is caller-supplied and therefore caller-fallible — a frozen counter or a
+    // metrics client whose collector is down must not turn into five more
+    // dial jobs.
+    const handler = createPhoneDialHandler({
+      onOutcome: () => { throw new Error('sink_boom'); },
+    });
+    await expect(handler(job(GOOD_PAYLOAD))).resolves.toBeUndefined();
+  });
+
+  it('a THROWING onOutcome still resolves for a malformed payload too', async () => {
+    const handler = createPhoneDialHandler({
+      onOutcome: () => { throw new Error('sink_boom'); },
+    });
+    await expect(handler(job('nonsense'))).resolves.toBeUndefined();
+  });
+
+  it('CONTROL — the throwing sink really was called', async () => {
+    // Otherwise both assertions above are satisfied by a handler that never
+    // consults the sink at all, which would prove nothing about the catch.
+    let called = 0;
+    const handler = createPhoneDialHandler({
+      onOutcome: () => { called += 1; throw new Error('sink_boom'); },
+    });
+    await handler(job(GOOD_PAYLOAD));
+    expect(called).toBe(1);
   });
 });
