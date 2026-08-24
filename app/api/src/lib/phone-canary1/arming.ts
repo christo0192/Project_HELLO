@@ -15,24 +15,30 @@
  * "not today", which is not the same claim.
  *
  * So the predicate is a compile-time constant, shipped `false`, pinned by a
- * test that asserts the literal on `main`. Arming it is PR106: a diff, a
- * review, and a revert commit prepared before the run.
+ * test that asserts the literal on `main`, and — since the activation work — by
+ * a default-branch CI gate (`scripts/check-main-disarmed.mjs`) that fails
+ * `main` if it is ever anything else. Arming lives on `canary1/arm`, a
+ * reviewed, CI-green branch that is NEVER merged: there is no revert to
+ * remember, because nothing is merged to revert.
  *
  * ── WHAT IT GATES, AND WHY THAT IS WIDER THAN THE DESIGN ASKED ────────
  * The accepted design gates `--execute` on this constant. This module gates
  * EVERY provider seam on it — the dry run's `createRoom` and `createDispatch`
  * included — because a `--dry-run` that can create a real LiveKit room is
- * still a merged PR that reaches a provider. The dry run happens after PR106
- * arms the constant (operational sequence step 6), so nothing in the intended
- * sequence is lost, and the property PR105 can claim becomes the stronger one:
- * on `main`, this mechanism contacts nothing.
+ * still a merged PR that reaches a provider. The dry run is conducted from the
+ * activation branch `canary1/arm` (operational sequence step 9), so nothing in
+ * the intended sequence is lost, and the property PR105 can claim becomes the
+ * stronger one: on `main`, this mechanism contacts nothing — permanently, not
+ * until a window opens.
  *
  * No I/O, no imports, nothing to configure.
  */
 
 /**
- * `false` on `main`, always. PR106 flips it and flips the pin test with it;
- * merging PR106's prepared revert flips both back.
+ * `false` on `main`, always — INCLUDING while a canary window is open. The
+ * activation artifact `canary1/arm` flips it and flips the pin test with it,
+ * and is never merged; `scripts/check-main-disarmed.mjs` fails the default
+ * branch if it ever is.
  *
  * Typed as `boolean` rather than inferred as the literal `false`, so the
  * arming check downstream is a real branch the compiler does not fold away —

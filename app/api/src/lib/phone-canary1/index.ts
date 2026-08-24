@@ -51,6 +51,7 @@ export {
   openCanary1Prompt,
   parseCanary1Argv,
   readCanary1Destination,
+  sanitizeCanary1TrunkId,
   type Canary1DestinationResult,
   type Canary1EntryRefusal,
   type Canary1Flags,
@@ -82,14 +83,16 @@ export {
   CANARY1_DEFAULT_AGENT_NAME,
   CANARY1_DISCLOSURE_TEXT,
   CANARY1_DISPATCH_MODE,
+  CANARY1_ORIGINATE_MARGIN_SEC,
   CANARY1_PARTICIPANT_WAIT_MARGIN_SEC,
   CANARY1_QUESTIONS,
-  CANARY1_ROOM_EMPTY_TIMEOUT_SEC,
+  CANARY1_ROOM_EMPTY_MARGIN_SEC,
   CANARY1_ROOM_MAX_PARTICIPANTS,
   CANARY1_SCENARIO,
   CANARY1_SPOKEN_COPY,
   CANARY1_WALL_CLOCK_MARGIN_SEC,
   CANARY1_WORKER_ENV_VARS,
+  canary1RoomEmptyTimeoutSeconds,
 } from './plan.js';
 export {
   CANARY1_PREFLIGHT_CHECKS,
@@ -149,8 +152,8 @@ import {
   CANARY1_BOUNDS,
   CANARY1_DEFAULT_AGENT_NAME,
   CANARY1_DISPATCH_MODE,
-  CANARY1_PARTICIPANT_WAIT_MARGIN_SEC,
   CANARY1_QUESTIONS,
+  canary1RoomEmptyTimeoutSeconds,
 } from './plan.js';
 import { CANARY1_PREFLIGHT_CHECKS, runCanary1Preflight } from './preflight.js';
 import {
@@ -260,11 +263,17 @@ export async function runCanary1(deps: Canary1RunDeps): Promise<Canary1RunResult
 
 
   const flags = parsed.flags;
+  const participantWaitSeconds =
+    flags.participantWaitSeconds ?? CANARY1_BOUNDS.participantWaitSeconds.def;
   const bounds = {
     ringSeconds: flags.ringSeconds ?? CANARY1_BOUNDS.ringSeconds.def,
     originateTimeoutSeconds: CANARY1_BOUNDS.originateTimeoutSeconds.def,
-    participantWaitSeconds:
-      flags.participantWaitSeconds ?? CANARY1_BOUNDS.participantWaitSeconds.def,
+    participantWaitSeconds,
+    joinWaitSeconds: flags.joinWaitSeconds ?? CANARY1_BOUNDS.joinWaitSeconds.def,
+    // DERIVED, and derived HERE so the value the preflight checks is the value
+    // `createRoom` receives. The fourth inequality compares them; a second
+    // derivation site would be a second thing to keep true.
+    roomEmptyTimeoutSeconds: canary1RoomEmptyTimeoutSeconds(participantWaitSeconds),
     maxCallSeconds: flags.maxCallSeconds ?? CANARY1_BOUNDS.maxCallSeconds.def,
     wallClockSeconds: flags.wallClockSeconds ?? CANARY1_BOUNDS.wallClockSeconds.def,
     questions: flags.questions ?? CANARY1_BOUNDS.questions.def,
@@ -322,7 +331,9 @@ export async function runCanary1(deps: Canary1RunDeps): Promise<Canary1RunResult
   // transcript snapshot taken before the `finally` has run.
   const conduct = async (): Promise<void> => {
     providerContacted = true;
-    const room = await createCanary1Room(ids, roomName, deps.rooms);
+    const room = await createCanary1Room(
+      ids, roomName, deps.rooms, bounds.roomEmptyTimeoutSeconds,
+    );
     emitter.check('room_created', room === 'created', room === 'created' ? 'ok' : 'room_create_failed');
     if (room !== 'created') return;
 
@@ -334,25 +345,37 @@ export async function runCanary1(deps: Canary1RunDeps): Promise<Canary1RunResult
     emitter.check('dispatch_created', ok, ok ? 'ok' : 'dispatch_failed');
     if (!ok) return;
 
+    // ── THE WORKER MUST EXIST BEFORE A HANDSET RINGS ──────────────────
+    // BOTH branches wait, and they wait through the SAME call. What differs is
+    // what the observation MEANS, not whether it is made.
+    //
+    // On a dry run it is the EVIDENCE: an earlier shape emitted
+    // `originate_skipped` and fell straight into teardown, deleting the room
+    // within milliseconds of the dispatch — before the worker could possibly
+    // have been assigned the job — and would have reported success for a run
+    // that proved only that a room can be created. Seeing the agent join is
+    // the only offline-safe evidence that arming, the dispatch metadata and
+    // the inbound closed-key/digit-run guard all agree end to end.
+    //
+    // On `--execute` it is a PRECONDITION. If the worker is absent — a
+    // mid-window voice merge scaled it to zero, or the secret was set on the
+    // wrong app — the handset still rings, a real person still answers, and
+    // NOBODY SPEAKS: not even the disclosure, which is the worker's first
+    // action. The leg is then held to `maxCallSeconds`. A merge freeze
+    // mitigates the CAUSE procedurally; this mitigates the EVENT, on the one
+    // path where the failure is audible to a person.
+    //
+    // The wait is CHARGED against the worker's own participant-wait clock,
+    // which starts at job assignment — so `joinWaitSeconds` is its own bounded
+    // knob and the preflight's fifth inequality keeps the sum inside the
+    // window the worker will still be waiting in.
+    const join = await observeAgentJoin(deps, roomName, bounds);
+    emitter.check('worker_present_before_originate', join === 'joined', join);
+    if (join !== 'joined') return;
+
     if (!flags.execute) {
       emitter.check('originate_skipped', true, 'dry_run');
-      // ── THE DRY RUN HAS TO WAIT, OR IT PROVES ALMOST NOTHING ──────
-      // An earlier shape emitted `originate_skipped` and fell straight into
-      // teardown, deleting the room within milliseconds of the dispatch. The
-      // worker starts no idle job processes (`num_idle_processes: 0`,
-      // `initialize_process_timeout: 60.0`) and then waits 120 s for a
-      // participant, so it could not possibly have been assigned the job yet —
-      // and the runbook's claim that the dry run proves the worker "enters the
-      // canary branch, parses the metadata and closes" would have been false
-      // of a run that had already torn the room down.
-      //
-      // So the dry run WATCHES for the agent to appear, bounded, and says what
-      // it saw. Seeing the agent join is the whole point: it is the only
-      // offline-safe evidence that arming, the dispatch metadata and the
-      // inbound closed-key/digit-run guard all agree end to end.
-      const joined = await observeAgentJoin(deps, roomName, bounds);
-      emitter.check('worker_joined', joined, joined ? 'ok' : 'worker_never_joined');
-      exitCode = joined ? 0 : 1;
+      exitCode = 0;
       return;
     }
 
@@ -406,27 +429,49 @@ export async function runCanary1(deps: Canary1RunDeps): Promise<Canary1RunResult
 }
 
 /**
- * Poll for the NAMED WORKER to join the canary room, bounded.
+ * The three things the join observation can find. THREE, not two.
  *
- * The bound covers a cold worker start plus the worker's own participant wait,
- * because that is how long the room legitimately sits with the agent in it and
- * nobody else. The room simply vanishing is NOT read as success: `emptyTimeout`
- * can reap a room the worker never reached, and "the worker ran" and "we could
- * not tell" must not look the same.
+ * `observeOccupancy` has always read `listed.length === 0` as its own case; the
+ * one observer that NEEDS the distinction was the one that lacked it. A room
+ * reaped before any join is a BOUND problem — the remedy is `emptyTimeout`,
+ * which is why the runbook's diagnosis order now names it first — while a
+ * worker that never joined is a STATE problem, whose remedy is the secret, the
+ * scale count or the deploy history. Folding them together sent the operator
+ * to check things that were fine.
+ */
+export type Canary1JoinStatus = 'joined' | 'worker_never_joined' | 'room_reaped_before_join';
+
+/**
+ * Poll for the NAMED WORKER to join the canary room, bounded by
+ * `joinWaitSeconds`.
+ *
+ * The bound is the CLI's own knob rather than the worker's participant wait,
+ * because on `--execute` this wait is SPENT OUT OF that wait: the worker's
+ * clock starts at job assignment, so a naive "wait as long as the worker
+ * waits" would consume the resource it exists to protect. The preflight's
+ * fifth inequality is what keeps `joinWait + ring + margin` inside it.
+ *
+ * The room simply vanishing is NOT read as success and no longer shares a code
+ * with a worker that never arrived.
  */
 async function observeAgentJoin(
   deps: Canary1RunDeps,
   roomName: string,
-  bounds: { readonly participantWaitSeconds: number },
-): Promise<boolean> {
-  const deadline = deps.now()
-    + (bounds.participantWaitSeconds + CANARY1_PARTICIPANT_WAIT_MARGIN_SEC) * 1_000;
+  bounds: { readonly joinWaitSeconds: number },
+): Promise<Canary1JoinStatus> {
+  const deadline = deps.now() + bounds.joinWaitSeconds * 1_000;
+  let reaped = false;
   while (deps.now() < deadline) {
     const listed = await discardingErrors(async () => deps.rooms.listRooms([roomName]));
-    if (listed !== undefined && (listed[0]?.numParticipants ?? 0) >= 1) return true;
+    if (listed !== undefined) {
+      if ((listed[0]?.numParticipants ?? 0) >= 1) return 'joined';
+      // The room is GONE and no join was ever seen. `emptyTimeout` reaped it
+      // out from under the wait — a different fault with a different remedy.
+      if (listed.length === 0) reaped = true;
+    }
     await discardingErrors(async () => deps.sleep(CANARY1_OBSERVE_POLL_MS));
   }
-  return false;
+  return reaped ? 'room_reaped_before_join' : 'worker_never_joined';
 }
 
 /**

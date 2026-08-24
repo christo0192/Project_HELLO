@@ -43,6 +43,12 @@
 import { readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { wrapDialableNumber, type DialableNumber } from '../../integrations/livekit-phone-dial/index.js';
+// The PRODUCTION loader, imported from `config.js` DIRECTLY rather than from
+// the directory barrel. `config.ts` has zero imports of its own, so this adds
+// no transitive dependency; the barrel re-exports `sip.ts`, and pulling the
+// originate seam into this module's graph in order to sanitise a string would
+// be the wrong shape whatever the structural suite made of it.
+import { loadPhoneDialConfig } from '../../integrations/livekit-phone-dial/config.js';
 import { containsDigitRun } from './metadata.js';
 
 /** Every stable refusal this module can produce. */
@@ -129,6 +135,7 @@ export interface Canary1Flags {
   readonly maxCallSeconds: number | undefined;
   readonly ringSeconds: number | undefined;
   readonly participantWaitSeconds: number | undefined;
+  readonly joinWaitSeconds: number | undefined;
   readonly wallClockSeconds: number | undefined;
   readonly agentName: string | undefined;
 }
@@ -167,6 +174,7 @@ export function parseCanary1Argv(argv: readonly string[]): Canary1ParseResult {
     maxCallSeconds: undefined as number | undefined,
     ringSeconds: undefined as number | undefined,
     participantWaitSeconds: undefined as number | undefined,
+    joinWaitSeconds: undefined as number | undefined,
     wallClockSeconds: undefined as number | undefined,
     agentName: undefined as string | undefined,
   };
@@ -244,6 +252,9 @@ export function parseCanary1Argv(argv: readonly string[]): Canary1ParseResult {
         break;
       case '--participant-wait-seconds':
         bad = numeric((n) => { flags.participantWaitSeconds = n; });
+        break;
+      case '--join-wait-seconds':
+        bad = numeric((n) => { flags.joinWaitSeconds = n; });
         break;
       case '--wall-clock-seconds':
         bad = numeric((n) => { flags.wallClockSeconds = n; });
@@ -391,4 +402,34 @@ export async function readCanary1Destination(
   // into a live carrier.
   if (first.digest !== second.digest) return { ok: false, refusal: 'destination_mismatch' };
   return { ok: true, number: first };
+}
+
+/**
+ * The trunk id, through the PRODUCTION loader.
+ *
+ * ── WHY THIS EXISTS AT ALL ────────────────────────────────────────────
+ * The production lane loads the trunk through `loadPhoneDialConfig` ->
+ * `boundedOpaqueId`, which admits only `^[A-Za-z0-9_-]{1,128}$`. `config.ts`
+ * states the reason plainly: `+` and space are outside the class DELIBERATELY,
+ * so the field can never be talked into holding an E.164 value. The canary
+ * reached the same SDK seam without any of it — `process.env.PHONE_SIP_TRUNK_ID
+ * ?? ''` raw, non-emptiness in the preflight, then passed verbatim.
+ *
+ * The realistic failure is not an attack. The operator pastes the trunk id at
+ * a `read -rs` prompt, CANNOT SEE IT, and the paste carries a trailing space or
+ * newline. Everything passes, the destination is typed twice, the room is
+ * created, the worker is dispatched, and the SDK is called with a malformed
+ * trunk — after which the containment layer correctly discards the error and
+ * the transcript says `originate_failed` with no detail, having already spent
+ * the operator's double entry and created live provider state.
+ *
+ * Reusing the production LOADER rather than copying its regex is the point: a
+ * second copy of the rule is a second thing to keep true, and this way
+ * `trunk_not_configured` means "absent, or not a bounded opaque id" — which is
+ * what the refusal already reads as. Surrounding whitespace is TRIMMED rather
+ * than refused, which is the loader's own behaviour and the better outcome for
+ * the one value the operator types blind.
+ */
+export function sanitizeCanary1TrunkId(raw: string | undefined): string {
+  return loadPhoneDialConfig({ PHONE_SIP_TRUNK_ID: raw }).sipTrunkId;
 }

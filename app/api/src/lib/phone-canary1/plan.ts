@@ -50,11 +50,13 @@ export const CANARY1_DISPATCH_MODE = 'canary';
 export const CANARY1_DEFAULT_AGENT_NAME = 'phone-screener';
 
 /**
- * SIX NESTED BOUNDS, none inherited from a provider default.
+ * SEVEN NESTED BOUNDS, none inherited from a provider default.
  *
  *   ring          <  originate                       (mirrors `dial.ts` gate 1a)
  *   participant wait >= ring + PARTICIPANT_WAIT_MARGIN
  *   wall clock    >= participant wait + max call + WALL_CLOCK_MARGIN
+ *   room empty timeout == participant wait + PARTICIPANT_WAIT_MARGIN + ROOM_EMPTY_MARGIN
+ *   participant wait >= join wait + ring + ORIGINATE_MARGIN
  *
  * The second relation exists because the worker's participant-wait clock
  * starts at JOB ASSIGNMENT — before the originate — so dispatch scheduling, a
@@ -69,6 +71,28 @@ export const CANARY1_DEFAULT_AGENT_NAME = 'phone-screener';
  * the wait window is still talking at t=300; a 240 s wall clock would tear the
  * room down mid-sentence and produce exactly the failure signature the second
  * relation exists to eliminate.
+ *
+ * The FOURTH relation applies the same discipline to the room's own
+ * `emptyTimeout`, which used to be a chosen 120 while the join window is
+ * `participantWait + 60` = 180. LiveKit's `empty_timeout` runs from room
+ * CREATION, and the canary room is created empty and stays empty until the
+ * agent joins — unlike a production room, which is dialled within seconds. So
+ * between t=120 and t=180 the provider could reap the room while the CLI was
+ * still waiting for it, and the observer reported the same code it reports for
+ * an unarmed or scaled-to-zero worker. The timeout is now DERIVED from the
+ * wait it must outlive (`canary1RoomEmptyTimeoutSeconds`) and the preflight
+ * refuses `room_timeout_misordered` if a raised wait ever re-opens the gap.
+ *
+ * The FIFTH relation exists because the `--execute` path now waits for the
+ * worker BEFORE it originates, and that wait is not free: the worker's
+ * participant-wait clock starts at JOB ASSIGNMENT, before the originate, so
+ * every second spent watching for the worker is a second subtracted from the
+ * window in which it will still be waiting when the leg is answered. A naive
+ * "just wait for the worker first" consumes the resource it is protecting, and
+ * the failure is the SAME silent answered call it was meant to prevent,
+ * arriving from the other side. Hence
+ * `participantWait >= joinWait + ring + ORIGINATE_MARGIN`, refused as
+ * `origination_wait_misordered`.
  */
 export const CANARY1_BOUNDS = {
   /** How long the line may ring before it is a no-answer. */
@@ -77,6 +101,23 @@ export const CANARY1_BOUNDS = {
   originateTimeoutSeconds: { def: 60, min: 10, max: 90 },
   /** The worker's own wait for "something answered". Its own knob, not the production 45 s. */
   participantWaitSeconds: { def: 120, min: 90, max: 180 },
+  /**
+   * How long the CLI waits for the named worker to appear in the room BEFORE
+   * it originates. Its own knob because it is charged against the worker's
+   * participant wait — see the fifth relation above.
+   *
+   * The floor is 30 because a cold job process is bounded by
+   * `initialize_process_timeout: 60.0` with `num_idle_processes: 0`, so
+   * anything tighter would be dishonest. The ceiling is 150 because at
+   * `participantWaitSeconds`'s maximum of 180 the fifth relation affords
+   * `180 - 15 - ring`, i.e. 160 at the minimum ring of 5 — so 150 sits just
+   * inside the feasible region. It is deliberately NOT satisfiable at the
+   * default ring of 30 (`150 + 30 + 15 = 195 > 180`), and the preflight
+   * refuses that combination rather than quietly accepting it: a knob whose
+   * maximum is reachable only for some settings of another knob is exactly
+   * why the relation is checked instead of assumed.
+   */
+  joinWaitSeconds: { def: 60, min: 30, max: 150 },
   /** Hard ceiling on a CONNECTED call. An unset billable ceiling is an omission. */
   maxCallSeconds: { def: 180, min: 30, max: 300 },
   /** The outermost CLI clock, after which teardown runs regardless. DERIVED — see above. */
@@ -96,8 +137,34 @@ export const CANARY1_PARTICIPANT_WAIT_MARGIN_SEC = 60;
 /** `wall clock >= participant wait + max call + this`. Covers teardown itself. */
 export const CANARY1_WALL_CLOCK_MARGIN_SEC = 30;
 
-/** How long an EMPTY canary room survives, so a room outlives every process we control. */
-export const CANARY1_ROOM_EMPTY_TIMEOUT_SEC = 120;
+/**
+ * `participant wait >= join wait + ring + this`. Covers the gap between job
+ * assignment and the join we can OBSERVE, plus the originate call itself.
+ */
+export const CANARY1_ORIGINATE_MARGIN_SEC = 15;
+
+/**
+ * Added on top of the join window when deriving the room's `emptyTimeout`.
+ * Covers the observer's poll interval and the teardown itself.
+ */
+export const CANARY1_ROOM_EMPTY_MARGIN_SEC = 30;
+
+/**
+ * How long an EMPTY canary room survives, so a room outlives every process we
+ * control — DERIVED from the join window rather than chosen.
+ *
+ * The cost is stated rather than buried: an empty canary room now survives
+ * 120 + 60 + 30 = 210 s at the defaults, and 180 + 60 + 30 = 270 s at
+ * `participantWaitSeconds`'s ceiling, rather than a flat 120, after every
+ * process we control has exited. An empty room holds no leg and costs nothing;
+ * a room reaped mid-wait destroys the evidence the whole window exists to
+ * produce. It is a trade, and it is the right way round.
+ */
+export function canary1RoomEmptyTimeoutSeconds(participantWaitSeconds: number): number {
+  return participantWaitSeconds
+    + CANARY1_PARTICIPANT_WAIT_MARGIN_SEC
+    + CANARY1_ROOM_EMPTY_MARGIN_SEC;
+}
 
 /** One SIP leg and one agent. Nothing else has a role on this call. */
 export const CANARY1_ROOM_MAX_PARTICIPANTS = 2;

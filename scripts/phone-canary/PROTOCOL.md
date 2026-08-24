@@ -42,9 +42,11 @@ redactor -- there is nothing to strip because nothing else can be said.
             Postgres. Places no call and cannot: the telephony SDK is not
             resolvable from `scripts/phone-canary/` at all.
   canary1   the owner's own-number test call, driven by the operator CLI.
-            Ships DISARMED (`CANARY1_ARMED = false`), and while disarmed it
-            refuses before every provider seam. Its zero-network claim is
-            WEAKER than canary0's and is labelled as such: the SDK IS
+            `main` is DISARMED PERMANENTLY (`CANARY1_ARMED = false`, enforced on
+            every push to the default branch by `scripts/check-main-disarmed.mjs`);
+            arming is a reviewed, CI-green branch that is never merged. While
+            disarmed the CLI refuses before every provider seam. Its zero-network
+            claim is WEAKER than canary0's and is labelled as such: the SDK IS
             resolvable from `app/api/src/__tests__`, so the property rests on
             dependency injection and the runtime traps rather than on
             unresolvability.

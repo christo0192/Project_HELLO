@@ -63,10 +63,23 @@ function harness(number: string, over: Partial<Canary1RunDeps> = {}): {
   captured: string[];
 } {
   const captured: string[] = [];
+  let listed = 0;
   const rooms: Canary1RoomClientLike = {
     async createRoom() {},
     async deleteRoom() {},
-    async listRooms() { return []; },
+    // OCCUPIED, since PR106. This file's subject is what happens AT and AFTER
+    // the originate seam, and the worker-presence precondition now stands
+    // between the dispatch and that seam: an empty room refuses
+    // `room_reaped_before_join` and the originate never happens, so every
+    // assertion here would pass for the wrong reason — the leak cannot occur
+    // because the leaking call was never made. A joined worker is the state
+    // these cases are actually about.
+    async listRooms() {
+      listed += 1;
+      // Occupied for the join observation, then GONE, so teardown can still
+      // verify absence on the same fake.
+      return listed <= 1 ? [{ numParticipants: 1 }] : [];
+    },
   };
   const dispatch: Canary1DispatchClientLike = {
     async createDispatch(_room, _agent, options) { captured.push(options.metadata); },
@@ -90,7 +103,13 @@ function harness(number: string, over: Partial<Canary1RunDeps> = {}): {
       credentials: CREDS,
       trunkId: 'ST_canary',
       sleep: async () => {},
-      now: () => { clock += 100_000; return clock; },
+      // 10 s per read. It was 100 s, which is larger than the 60 s join window
+      // the worker-presence precondition polls in — so the loop's deadline had
+      // already passed before its first poll and the run refused
+      // `worker_never_joined` without ever reaching the seam this file is
+      // about. A test clock that steps past a bound is not a fast test, it is
+      // a test of a different code path.
+      now: () => { clock += 10_000; return clock; },
       originate: {
         live: () => ({
           mode: 'live',
