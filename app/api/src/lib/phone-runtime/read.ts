@@ -124,7 +124,13 @@ export interface DuePhoneEngagement {
 
 export interface PhoneRuntimeReader {
   /**
-   * Engagements in a due state, oldest-eligible first, bounded.
+   * Engagements in a due state, RECONNECTS FIRST and then oldest-eligible,
+   * bounded, de-duplicated by engagement id.
+   *
+   * The reconnect priority is not cosmetic — see the implementation. It is
+   * served by a second bounded read rather than by a cleverer ORDER BY,
+   * because `updated_at asc` is right for the no-answer ladder and exactly
+   * wrong for a reconnect, and one clause cannot be both.
    *
    * This read decides only CANDIDACY. Whether any of them may actually be
    * dialled is decided by `admit_phone_attempt` under the advisory lock, which
@@ -271,60 +277,135 @@ function dueState(value: unknown): PhoneDueState | undefined {
     : undefined;
 }
 
+/**
+ * The ONE clock predicate, in one expression, used by BOTH due reads.
+ *
+ * Factored rather than repeated because M-3 gives this reader a second read
+ * (the reconnect batch below) and two copies of a clock predicate are two
+ * things that can drift — the same reasoning that keeps `istWindowOpen` a
+ * single definition shared with admission.
+ *
+ * `state.eq.reconnecting` is the exemption and it is why this is one `or`
+ * rather than three chained filters: a reconnect's due time is NOT in
+ * `next_eligible_at` at all — 0042 leaves the reconnect backoff to a worker
+ * clock, so `dueByClock` derives it from `updated_at`. Filtering reconnects on
+ * a column that does not carry their due time would hide EVERY reconnect from
+ * the pass.
+ */
+function dueClockPredicate(nowIso: string): string {
+  return (
+    'state.eq.reconnecting,next_eligible_at.is.null,'
+    + `next_eligible_at.lte.${isoInstant(nowIso)}`
+  );
+}
+
+/** Project a raw PostgREST payload into the due-engagement shape. */
+function projectDueRows(data: unknown): DuePhoneEngagement[] {
+  const rows = Array.isArray(data) ? (data as Row[]) : [];
+  const out: DuePhoneEngagement[] = [];
+  for (const row of rows) {
+    const engagementId = str(row, 'id');
+    const state = dueState(row.state);
+    const candidateId = str(row, 'candidate_id');
+    // A row missing any of the three is not actionable. Dropping it is
+    // safe in the only direction that matters: nobody is dialled.
+    if (engagementId === undefined || state === undefined || candidateId === undefined) {
+      continue;
+    }
+    out.push({
+      engagementId,
+      state,
+      candidateId,
+      roleId: str(row, 'role_id') ?? null,
+      sessionId: str(row, 'session_id') ?? null,
+      nextEligibleAt: str(row, 'next_eligible_at') ?? null,
+      noAnswerAttempts: num(row, 'no_answer_attempts') ?? 0,
+      updatedAt: str(row, 'updated_at') ?? null,
+    });
+  }
+  return out;
+}
+
+/**
+ * One bounded due read, narrowed either to the whole due set or to a single
+ * state.
+ *
+ * Every part except the state filter is shared with its sibling: the same
+ * explicit column list, the same `terminal_at is null`, the same clock
+ * predicate, the same `updated_at asc` ordering and the same bound. That is
+ * the point of the seam — the reconnect batch must not be able to drift into
+ * a differently-filtered read of the same table.
+ */
+async function readDueBatch(
+  client: SupabaseClient,
+  input: { nowIso: string; limit: number; onlyState: PhoneDueState | null },
+): Promise<DuePhoneEngagement[]> {
+  const base = client
+    .from('phone_engagements')
+    .select(DUE_ENGAGEMENT_COLUMNS)
+    .is('terminal_at', null);
+  const narrowed = input.onlyState === null
+    ? base.in('state', PHONE_DUE_STATES as unknown as string[])
+    : base.eq('state', input.onlyState);
+  const { data, error } = await narrowed
+    .or(dueClockPredicate(input.nowIso))
+    .order('updated_at', { ascending: true })
+    .limit(input.limit);
+  // Sanitized: a PostgREST error carries the failing statement and can
+  // carry row values. None of it propagates.
+  if (error) throw new Error('phone_runtime_due_read_error');
+  return projectDueRows(data);
+}
+
 export function createPhoneRuntimeReader(client: SupabaseClient): PhoneRuntimeReader {
   return {
+    /**
+     * ── RECONNECTS GO FIRST, AND THE ORDERING ALONE CANNOT DO IT ──────
+     * The main batch is ordered `updated_at asc` and BOUNDED (`dueLimit`
+     * defaults to 3). A row entering `reconnecting` was just written by
+     * `apply_phone_event`, so it carries the NEWEST `updated_at` in the due
+     * set and sorts LAST — behind any three `eligible` rows still waiting to
+     * be dialled, which is an ordinary morning backlog. The one due row with
+     * a human already on the line was therefore the lowest-priority row in
+     * the system, and no amount of tuning the single ORDER BY fixes that:
+     * oldest-first is right for the no-answer ladder and wrong for a
+     * reconnect, and one clause cannot be both.
+     *
+     * So the reconnect batch is READ SEPARATELY and merged AHEAD. Both reads
+     * go through `readDueBatch`, so they share the clock predicate, the
+     * column list, the ordering and the bound; only the state filter differs.
+     * The cost is one extra bounded, indexed read per pass — paid on the
+     * cheapest and most latency-sensitive loop in the lane.
+     *
+     * The merged set is DE-DUPLICATED by engagement id, because the main read
+     * selects `reconnecting` too (the state is one of the three): without the
+     * dedupe a single reconnect would occupy two of the three batch slots and
+     * be offered twice in one pass.
+     */
     async listDueEngagements(input): Promise<readonly DuePhoneEngagement[]> {
       const limit = boundedRowLimit(input.limit);
-      const { data, error } = await client
-        .from('phone_engagements')
-        .select(DUE_ENGAGEMENT_COLUMNS)
-        .is('terminal_at', null)
-        .in('state', PHONE_DUE_STATES as unknown as string[])
-        // The clock predicate is applied in SQL as well as in `dueByClock`,
-        // and it is not redundant: the batch is BOUNDED (`dueLimit` defaults
-        // to 3) and ordered `updated_at asc`, so without it three rows whose
-        // `next_eligible_at` is hours away would fill every batch forever and
-        // starve the rows that are genuinely due. A filter applied only after
-        // the read can observe that starvation but cannot cure it.
-        //
-        // `reconnecting` is exempted because its due time is NOT this column:
-        // 0042 leaves the reconnect backoff to a worker clock, so `dueByClock`
-        // derives it from `updated_at`. Excluding those rows here would hide
-        // every reconnect from the pass — which is why the predicate is an
-        // `or` and not three chained filters.
-        .or(
-          'state.eq.reconnecting,next_eligible_at.is.null,'
-          + `next_eligible_at.lte.${isoInstant(input.nowIso)}`,
-        )
-        .order('updated_at', { ascending: true })
-        .limit(limit);
-      // Sanitized: a PostgREST error carries the failing statement and can
-      // carry row values. None of it propagates.
-      if (error) throw new Error('phone_runtime_due_read_error');
+      const reconnecting = await readDueBatch(client, {
+        nowIso: input.nowIso,
+        limit,
+        onlyState: 'reconnecting',
+      });
+      const rest = await readDueBatch(client, {
+        nowIso: input.nowIso,
+        limit,
+        onlyState: null,
+      });
 
-      const rows = Array.isArray(data) ? (data as Row[]) : [];
-      const out: DuePhoneEngagement[] = [];
-      for (const row of rows) {
-        const engagementId = str(row, 'id');
-        const state = dueState(row.state);
-        const candidateId = str(row, 'candidate_id');
-        // A row missing any of the three is not actionable. Dropping it is
-        // safe in the only direction that matters: nobody is dialled.
-        if (engagementId === undefined || state === undefined || candidateId === undefined) {
-          continue;
-        }
-        out.push({
-          engagementId,
-          state,
-          candidateId,
-          roleId: str(row, 'role_id') ?? null,
-          sessionId: str(row, 'session_id') ?? null,
-          nextEligibleAt: str(row, 'next_eligible_at') ?? null,
-          noAnswerAttempts: num(row, 'no_answer_attempts') ?? 0,
-          updatedAt: str(row, 'updated_at') ?? null,
-        });
+      const merged: DuePhoneEngagement[] = [];
+      const seen = new Set<string>();
+      for (const row of [...reconnecting, ...rest]) {
+        if (seen.has(row.engagementId)) continue;
+        seen.add(row.engagementId);
+        merged.push(row);
+        // The BATCH stays bounded by the caller's limit, not by twice it: the
+        // fleet cap is ten and each row here is a call to a person.
+        if (merged.length >= limit) break;
       }
-      return out;
+      return merged;
     },
 
     async listDialableNumbers(input): Promise<ReadonlyMap<string, DialableNumber>> {

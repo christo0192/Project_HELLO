@@ -61,17 +61,40 @@ export interface PhoneRuntimeBound {
  * cheapest read and the only one a candidate is waiting on; reconciling costs
  * a LiveKit room read per live attempt; expiring an appointment can wait.
  *
- * The one relation that is a CORRECTNESS bound rather than a preference is
+ * ── THE ONE CORRECTNESS BOUND, STATED IN TERMS OF THE SCHEDULER ──────
  * `reclaimMs` against the attempt lease. `PHONE_BOUNDS.leaseSeconds` defaults
- * to 60s, so a sweep every 30s guarantees a lapsed lease is seen within half
- * a lease-lifetime. Let the sweep grow slower than the lease and a dead
- * worker's fleet slot is held for the difference, against every other
- * candidate — which is the starvation 0042 says this loop exists to prevent.
+ * to 60s. Let the sweep grow slower than the lease and a dead worker's fleet
+ * slot is held for the difference, against every other candidate — which is
+ * the starvation 0042 says this loop exists to prevent.
+ *
+ * The bound is a statement about the SCHEDULER, not about this table, and the
+ * two are not the same thing. `lib/scheduler.ts` computes each delay as
+ * `nextPollDelayMs(base, idle, random)` = `min(base · 2^idle, 60_000) · [0.5,
+ * 1.0)`, and an idle `phone-reclaim` — reclaiming nothing is its STEADY STATE
+ * — used to drift to the 60s ceiling. The comment here claimed a 30s sweep and
+ * half a lease-lifetime; the reality was 30–60s and up to a FULL one. The old
+ * assertion beneath this comment compared two constants in this table while
+ * the thing that decided the cadence was not in the comparison at all, so the
+ * false claim could not have been caught by changing either of them.
+ *
+ * `runtime.ts` therefore holds `phone-reclaim` (and `phone-due`, for the
+ * reconnect bound — see M-4 there) at the base cadence: `idle` stays 0, so
+ * every interval is `reclaimMs · [0.5, 1.0)` and the sweep runs AT LEAST once
+ * per `reclaimMs`. That gives the two-part bound now asserted in
+ * `phone-runtime-core.test.ts` (the arithmetic, against
+ * `PHONE_BOUNDS.leaseSeconds`) and in `phone-runtime-loops.test.ts` (the
+ * behaviour: the observed interval of an idle `phone-reclaim`, measured
+ * against the scheduler, never exceeds `reclaimMs`):
+ *
+ *     reclaimMs · 2  ≤  leaseSeconds · 1000
+ *
+ * i.e. a lapsed lease is seen within half a lease-lifetime. Error backoff is
+ * untouched: a throwing sweep still backs off, because a throw never produces
+ * the "did work" answer that pins the cadence.
  *
  * (An earlier version of this comment claimed reclaim was "faster than the
  * due cadence is slow". It is not — 30s against 15s — and the test beneath it
- * compared reclaim to RECONCILE, so the false claim went unchecked. Stated
- * properly and asserted properly now.)
+ * compared reclaim to RECONCILE, so the false claim went unchecked.)
  */
 export const PHONE_RUNTIME_BOUNDS: Readonly<Record<string, PhoneRuntimeBound>> = Object.freeze({
   /** How often the due sweep looks for an engagement to dial. */

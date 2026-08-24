@@ -24,6 +24,9 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { vi } from 'vitest';
 import {
   createPhoneRuntime,
@@ -34,20 +37,32 @@ import {
   MIN_STALE_WINDOW_MS,
   STALE_TICK_MULTIPLIER,
   clearPhoneRuntimeRegistration,
+  clearPhoneRuntimeStartFailure,
   phoneRuntimeDegradeReasons,
   phoneRuntimeView,
+  recordPhoneRuntimeStartFailure,
   registerPhoneRuntime,
   type PhoneLoopHealthView,
   type PhoneRuntimeView,
 } from '../lib/phone-runtime/health.js';
-import { PHONE_DIAL_QUEUE, type PhoneRuntimeConfig } from '../lib/phone-runtime/config.js';
 import {
+  PHONE_DIAL_QUEUE,
+  loadPhoneRuntimeConfig,
+  type PhoneRuntimeConfig,
+} from '../lib/phone-runtime/config.js';
+import {
+  PHONE_BOUNDS,
   loadPhoneScreeningConfig,
   type PhoneScreeningConfig,
   type PhoneStores,
 } from '../lib/phone-screening/index.js';
+import {
+  isPhoneWebhookActive,
+  loadLiveKitPhoneConfig,
+} from '../integrations/livekit-phone/index.js';
 import type { PhoneRuntimeReader } from '../lib/phone-runtime/read.js';
 import { wrapDialableNumber } from '../integrations/livekit-phone-dial/dialable-number.js';
+import { loadPhoneDialConfig } from '../integrations/livekit-phone-dial/index.js';
 import type { Queue } from '../lib/queue/index.js';
 import type { QueueJob } from '../lib/queue/types.js';
 
@@ -77,13 +92,37 @@ const SENTINEL_ROLE = 'SENTINEL-ROLE-ggg777';
 const DIALABLE = ['+9', '1', '70', '1234', '5678'].join('');
 const DIALABLE_NATIONAL = DIALABLE.slice(3);
 
-const LOOP_NAMES = [
-  'phone-dial',
-  'phone-due',
-  'phone-reclaim',
-  'phone-maintain',
-  'phone-reconcile',
-] as const;
+/**
+ * THE ONE PLACE THE CURRENT LOOP SET IS PINNED.
+ *
+ * `runtime.ts` keeps the loops in a plain array and DERIVES `loopIntervalsMs`
+ * from it, so the production side needs no count and no second list. A test
+ * does need to pin the set — "no loop missing and no loop extra" is only
+ * assertable against something — but it needs to pin it ONCE. Every assertion
+ * below that names the set reads this table, so adding a loop is one entry
+ * here plus its knob, and nothing else in this file moves.
+ *
+ * The map is name -> the `PhoneRuntimeConfig` knob that loop's cadence must
+ * come from. That pairing is the regression guard: the dropped-webhook sweep
+ * was once welded into `phone-maintain`, so `PHONE_RUNTIME_RECONCILE_MS`
+ * parsed, clamped, appeared in the environment schema — and moved nothing.
+ */
+const LOOP_KNOBS = {
+  'phone-dial': 'dueMs',
+  'phone-due': 'dueMs',
+  'phone-reclaim': 'reclaimMs',
+  'phone-maintain': 'expireMs',
+  'phone-reconcile': 'reconcileMs',
+  // 0045. Both run on the EXPIRE cadence rather than knobs of their own: a
+  // day boundary moves once a day, and a stranded engagement is not urgent.
+  // They share `expireMs` DELIBERATELY, which is why the knob-mapping test
+  // below asserts the reported map against this table rather than asserting
+  // that every loop has a distinct cadence.
+  'phone-dayroll': 'expireMs',
+  'phone-stranded': 'expireMs',
+} as const satisfies Readonly<Record<string, keyof PhoneRuntimeConfig>>;
+
+const LOOP_NAMES = Object.keys(LOOP_KNOBS) as ReadonlyArray<keyof typeof LOOP_KNOBS>;
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -149,14 +188,21 @@ interface Counters {
   reclaims: number;
   expires: number;
   claims: string[];
+  /** 0045. Sweep names handed to `claimSweep`, in order. */
+  sweepClaims: string[];
+  dayRolls: number;
+  strandedSweeps: number;
 }
 
 function counters(): Counters {
-  return { duePasses: 0, backlogReads: 0, reclaims: 0, expires: 0, claims: [] };
+  return {
+    duePasses: 0, backlogReads: 0, reclaims: 0, expires: 0, claims: [],
+    sweepClaims: [], dayRolls: 0, strandedSweeps: 0,
+  };
 }
 
 /**
- * The three store calls the four loops actually reach.
+ * The store calls the loops actually reach.
  *
  * `backlog` is read by TWO callers now — the due pass, and the dial loop's
  * fail-closed `shouldClaim` — so it counts into `backlogReads` and the due
@@ -164,7 +210,13 @@ function counters(): Counters {
  */
 function makeStores(
   c: Counters,
-  over: Partial<Record<'backlog' | 'reclaimAttemptLeases' | 'expireAppointments', unknown>> = {},
+  over: Partial<
+    Record<
+      'backlog' | 'reclaimAttemptLeases' | 'expireAppointments' | 'admitAttempt'
+      | 'claimSweep' | 'sweepDayRolled' | 'sweepStrandedSessions',
+      unknown
+    >
+  > = {},
 ): PhoneStores {
   return {
     async backlog() {
@@ -181,6 +233,22 @@ function makeStores(
     async expireAppointments() {
       c.expires += 1;
       return { status: 'ok', expired: 0 };
+    },
+    // 0045. Present on the fake because the two new sweeps CALL them — a
+    // fake missing a method the loop reaches does not fail, it makes the
+    // loop throw on a tick no test happens to drive, which is how a wired
+    // loop ends up with no coverage at all.
+    async claimSweep(input: { sweep: string }) {
+      c.sweepClaims.push(input.sweep);
+      return { status: 'ok' as const };
+    },
+    async sweepDayRolled() {
+      c.dayRolls += 1;
+      return { status: 'ok' as const, examined: 0, rolled: 0, skipped: 0 };
+    },
+    async sweepStrandedSessions() {
+      c.strandedSweeps += 1;
+      return { status: 'ok' as const, examined: 0, completed: 0, failed: 0, skipped: 0 };
     },
     ...over,
   } as unknown as PhoneStores;
@@ -287,8 +355,11 @@ beforeEach(() => {
 
 afterEach(async () => {
   // Every registration is cleared so no test can leak one into the next — the
-  // registry is process-global and `phoneRuntimeView` reads it directly.
+  // registry is process-global and `phoneRuntimeView` reads it directly. The
+  // construction-failure flag is process-global for the same reason and is
+  // cleared beside it, or one M-9 test would mark every later view degraded.
   clearPhoneRuntimeRegistration();
+  clearPhoneRuntimeStartFailure();
   while (live.length > 0) {
     const handle = live.pop()!;
     await handle.stop();
@@ -381,7 +452,7 @@ describe('A. the disabled gate — nothing is constructed when either switch is 
 // ═════════════════════════════════════════════════════════════════════════════
 
 describe('B. loop lifecycle', () => {
-  it('a started runtime registers exactly the five named loops', () => {
+  it('a started runtime registers exactly the loops LOOP_KNOBS names — no more, no fewer', () => {
     const runtime = buildRuntime();
     runtime.scheduler.start();
 
@@ -402,18 +473,21 @@ describe('B. loop lifecycle', () => {
     // and no name-level assertion could see it. So the mapping is asserted
     // against four DELIBERATELY DISTINCT values, which is the only shape in
     // which "welded to the wrong knob" is visible.
-    const knobs = { dueMs: 1_000, reclaimMs: 2_000, expireMs: 3_000, reconcileMs: 4_000 };
+    const knobs = runtimeConfig({
+      dueMs: 1_000, reclaimMs: 2_000, expireMs: 3_000, reconcileMs: 4_000,
+    });
     const runtime = buildRuntime({ config: knobs });
 
-    expect(runtime.loopIntervalsMs).toEqual({
-      'phone-dial': knobs.dueMs,
-      'phone-due': knobs.dueMs,
-      'phone-reclaim': knobs.reclaimMs,
-      'phone-maintain': knobs.expireMs,
-      'phone-reconcile': knobs.reconcileMs,
-    });
-    expect(runtime.loopIntervalsMs['phone-maintain']).toBe(knobs.expireMs);
-    expect(runtime.loopIntervalsMs['phone-reconcile']).toBe(knobs.reconcileMs);
+    // Built from LOOP_KNOBS rather than written out again: a second literal
+    // list of loops is a second thing to keep in step with the runtime.
+    const expected = Object.fromEntries(
+      LOOP_NAMES.map((name) => [name, knobs[LOOP_KNOBS[name]]]),
+    );
+    expect(runtime.loopIntervalsMs).toEqual(expected);
+    // The four DELIBERATELY DISTINCT values above are what makes "welded to
+    // the wrong knob" visible at all, so the distinctness is asserted too.
+    expect(new Set(Object.values(expected)).size)
+      .toBe(new Set(LOOP_NAMES.map((n) => LOOP_KNOBS[n])).size);
     // The two that were welded must be able to differ.
     expect(runtime.loopIntervalsMs['phone-maintain'])
       .not.toBe(runtime.loopIntervalsMs['phone-reconcile']);
@@ -650,7 +724,10 @@ function makeView(over: Partial<PhoneRuntimeView> = {}): PhoneRuntimeView {
     last_reclaimed: null,
     last_expired: null,
     last_reconciled: null,
+    last_rolled: null,
+    last_stranded: null,
     sweeps_not_ok: [],
+    start_failed: false,
     ...over,
   };
 }
@@ -670,8 +747,13 @@ describe('D. the health view', () => {
       last_reclaimed: null,
       last_expired: null,
       last_reconciled: null,
+    last_rolled: null,
+    last_stranded: null,
       // No sweep has run, so none has failed. Empty, never a fabricated name.
       sweeps_not_ok: [],
+      // Nothing tried to construct a runtime, so nothing failed to. THE ONE
+      // FIELD that separates "off" from "broken" — see M-9 below.
+      start_failed: false,
     });
 
     // AND IT IS NOT A FAULT. A process that is not running the phone loops is
@@ -733,8 +815,13 @@ describe('D. the health view', () => {
       last_reclaimed: null,
       last_expired: null,
       last_reconciled: null,
+    last_rolled: null,
+    last_stranded: null,
       // No sweep has run, so none has failed. Empty, never a fabricated name.
       sweeps_not_ok: [],
+      // Nothing tried to construct a runtime, so nothing failed to. THE ONE
+      // FIELD that separates "off" from "broken" — see M-9 below.
+      start_failed: false,
     });
   });
 
@@ -1124,5 +1211,519 @@ describe('E. the dial loop', () => {
     expect(world.completeLog).toEqual(['job-once']);          // completed ONCE
     expect(runtime.snapshot().dialJobOutcomes).toEqual({ completed: 1 });
     expect(world.claimLog.filter((e) => e.jobId === null).length).toBeGreaterThanOrEqual(5);
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// F. THE CADENCE AND HEALTH-TRUTH REPAIRS  (M-1, M-2, M-4, M-9)
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Three of these four are about a claim that could not be falsified by the
+// thing it claimed to bound:
+//
+//   * M-2 stated a correctness bound (`reclaimMs` against the attempt lease)
+//     by comparing two constants in `config.ts`, while the SCHEDULER decided
+//     the actual cadence and was not in the comparison at all. So the bound is
+//     measured HERE, against a running scheduler, from the intervals it really
+//     produced.
+//   * M-4 is the same shape on `phone-due`, where the drift softens the
+//     contract's "bounded reconnect approximately 120 seconds".
+//   * M-1 and M-9 are health TRUTH: a sweep that is not running, and a runtime
+//     that failed to construct, each used to be indistinguishable from the
+//     healthy case they most resemble.
+
+/** The gaps between successive recorded instants, in ms. */
+function gaps(at: readonly number[]): number[] {
+  const out: number[] = [];
+  for (let i = 1; i < at.length; i++) out.push(at[i] - at[i - 1]);
+  return out;
+}
+
+describe('F. the cadence bounds are measured against the scheduler that decides them', () => {
+  it('M-2: an idle `phone-reclaim` never drifts past its own interval — a lapsed lease is seen within HALF a lease-lifetime', async () => {
+    // THE STEADY STATE OF THIS SWEEP IS RECLAIMING NOTHING. That used to feed
+    // the scheduler's idle backoff, which took the loop to its 60s ceiling
+    // while `config.ts` claimed a 30s sweep. A lapsed lease could therefore go
+    // unreclaimed for a FULL lease-lifetime, holding one of ten fleet slots
+    // against every other candidate.
+    //
+    // The REAL defaults are used, not the fast fixtures, because the bound is
+    // a claim about the shipped configuration. Jitter is pinned to its
+    // WIDEST — `nextPollDelayMs` scales by `[0.5, 1.0)`, so `0.999` is the
+    // worst (longest) interval the loop can produce.
+    const c = counters();
+    const at: number[] = [];
+    const stores = makeStores(c, {
+      async reclaimAttemptLeases() {
+        c.reclaims += 1;
+        at.push(Date.now());
+        return { status: 'ok', reclaimed: 0 }; // nothing to do: the steady state
+      },
+    });
+
+    const knobs = loadPhoneRuntimeConfig({});
+    const runtime = buildRuntime({
+      stores,
+      queue: makeEmptyQueue(c),
+      config: knobs,
+      random: () => 0.999,
+    });
+    runtime.scheduler.start();
+
+    const leaseMs = PHONE_BOUNDS.leaseSeconds!.def * 1_000;
+    // Twenty lease-lifetimes: long enough that a backed-off loop has reached
+    // and settled at the ceiling, so the two behaviours cannot be confused.
+    await vi.advanceTimersByTimeAsync(leaseMs * 20);
+
+    expect(at.length, 'the sweep never ran at all').toBeGreaterThan(2);
+    const observed = gaps(at);
+    const worst = Math.max(...observed);
+
+    // THE BOUND, stated as the scheduler's own behaviour: every interval this
+    // loop produced is at most its configured cadence.
+    expect(worst, `worst observed reclaim interval ${worst}ms`)
+      .toBeLessThanOrEqual(knobs.reclaimMs);
+    // ...and that cadence is at most half the lease, so a lapsed lease is seen
+    // within half a lease-lifetime. This is the sentence `config.ts` claims.
+    expect(worst * 2).toBeLessThanOrEqual(leaseMs);
+    // A count check as well as an interval check: an idle-backed-off loop
+    // reaches the 60s ceiling and manages ~21 ticks over this window, against
+    // ~40 held at the base cadence.
+    expect(at.length).toBeGreaterThanOrEqual(35);
+  });
+
+  it('M-2 CONTROL: a THROWING reclaim still backs off — the fix does not create a hot spin', async () => {
+    // `HOLD_BASE_CADENCE` is a `didWork` answer, and a tick that throws never
+    // reaches it. If the fix had been applied by making the loop unconditional
+    // in the scheduler, a broken sweep would hammer the database at its base
+    // cadence forever. It must not.
+    const c = counters();
+    const at: number[] = [];
+    const stores = makeStores(c, {
+      async reclaimAttemptLeases() {
+        at.push(Date.now());
+        throw new Error('reclaim_boom');
+      },
+    });
+    const runtime = buildRuntime({
+      stores,
+      queue: makeEmptyQueue(c),
+      config: { dueMs: 60_000, reclaimMs: 1_000, expireMs: 60_000, reconcileMs: 60_000 },
+      random: () => 0.999,
+    });
+    runtime.scheduler.start();
+    await vi.advanceTimersByTimeAsync(120_000);
+
+    expect(at.length).toBeGreaterThan(2);
+    // The gaps GROW: an erroring loop is exactly the case backoff exists for.
+    const observed = gaps(at);
+    expect(Math.max(...observed)).toBeGreaterThan(1_000);
+    expect(loopHealth(runtime, 'phone-reclaim').consecutiveErrors).toBeGreaterThan(1);
+  });
+
+  it('M-4: an idle `phone-due` never drifts past its own interval — the reconnect bound is backoff + one due interval', async () => {
+    // `return result.dialing > 0` let a pass that dialled nothing back off
+    // toward the 60s ceiling. A dropped call becomes due
+    // `reconnectBackoffSeconds` after the drop; the pass that would act on it
+    // then waited that PLUS up to a fully backed-off due interval, so the
+    // contract's "approximately 120 seconds" was bounded by nothing stated.
+    const c = counters();
+    const at: number[] = [];
+    const reader = makeReader({
+      async listDueEngagements() {
+        c.duePasses += 1;
+        at.push(Date.now());
+        return []; // nothing due: the idle steady state
+      },
+    });
+
+    const knobs = loadPhoneRuntimeConfig({});
+    const runtime = buildRuntime({
+      stores: makeStores(c),
+      reader,
+      queue: makeEmptyQueue(c),
+      config: knobs,
+      random: () => 0.999,
+    });
+    runtime.scheduler.start();
+    await vi.advanceTimersByTimeAsync(600_000);
+
+    expect(at.length, 'the due pass never ran at all').toBeGreaterThan(2);
+    const worst = Math.max(...gaps(at));
+    expect(worst, `worst observed due interval ${worst}ms`).toBeLessThanOrEqual(knobs.dueMs);
+
+    // THE BOUND THE CONTRACT ASKS FOR, written out: a reconnect is visible to
+    // the pass `reconnectBackoffSeconds` after the drop, and the pass runs at
+    // least once per `dueMs`, so the worst case is their sum.
+    const config = screeningConfig(true, true);
+    const reconnectBoundMs = config.reconnectBackoffSeconds * 1_000 + worst;
+    expect(reconnectBoundMs).toBeLessThanOrEqual(config.reconnectBackoffSeconds * 1_000 + knobs.dueMs);
+    // ...and that sum is inside a small margin of the contract's figure,
+    // rather than the 180s a fully backed-off loop produced.
+    expect(reconnectBoundMs).toBeLessThan(config.reconnectBackoffSeconds * 1_000 * 1.5);
+  });
+});
+
+describe('F. M-1 — a reconcile sweep that is NOT RUNNING is not a sweep that found nothing', () => {
+  it('the reconcile tick reports its STATUS, and a disabled sweep publishes a null count', async () => {
+    // PREMISE, asserted rather than assumed: in this environment the
+    // reconciliation sweep is inactive, so `runPhoneReconciliation` answers
+    // `status: 'disabled'` with `posted: 0`. That is the exact shape that used
+    // to reach the surface as a healthy `last_reconciled: 0`.
+    // Read from `process.env`, which is EXACTLY the call `runtime.ts` makes —
+    // not from an empty map, which would prove something about a config the
+    // runtime never sees.
+    expect(
+      isPhoneWebhookActive(loadLiveKitPhoneConfig()),
+      'premise: the reconcile sweep must be inactive for this test to mean anything',
+    ).toBe(false);
+
+    const c = counters();
+    const runtime = buildRuntime({
+      stores: makeStores(c),
+      queue: makeEmptyQueue(c),
+      config: { dueMs: 60_000, reclaimMs: 60_000, expireMs: 60_000, reconcileMs: 1_000 },
+    });
+    registerPhoneRuntime(runtime);
+    runtime.scheduler.start();
+    await vi.advanceTimersByTimeAsync(4_000);
+
+    expect(loopHealth(runtime, 'phone-reconcile').ticks).toBeGreaterThan(0);
+
+    const snapshot = runtime.snapshot();
+    // NOT `false`, and NOT `0`.
+    expect(snapshot.sweepNotOk.reconcile).toBe(true);
+    expect(snapshot.lastReconciled).toBeNull();
+
+    const v = phoneRuntimeView();
+    expect(v.sweeps_not_ok).toContain('reconcile');
+    expect(v.last_reconciled).toBeNull();
+    // And it DEGRADES, which is the whole point: a dropped-webhook sweep that
+    // has silently stopped means an attempt whose webhook never arrived is
+    // invisible until its lease lapses.
+    expect(phoneRuntimeDegradeReasons(v)).toContain('phone_sweep_not_ok');
+  });
+
+  it('the sweep-status map names EVERY sweep from construction, not only after a failure', async () => {
+    // A map that grew its keys lazily would report an unrun sweep as absent
+    // rather than as unknown, and `sweeps_not_ok` would look clean because
+    // nothing had written to it yet.
+    //
+    // Five since 0045 added the day roll and the stranded resolution. Asserted
+    // as an exact set both ways, so a sweep added without a key here — the
+    // shape that makes an unrun sweep invisible — fails rather than passes.
+    const c = counters();
+    const runtime = buildRuntime({ stores: makeStores(c), queue: makeEmptyQueue(c) });
+    expect(Object.keys(runtime.snapshot().sweepNotOk).sort())
+      .toEqual(['dayroll', 'expire', 'reclaim', 'reconcile', 'stranded']);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+//  0045 — the two sweeps 0042 assigned to P5, and the claim in front of them
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('the day-roll and stranded sweeps run, and the claim gates them', () => {
+  const FAST = { dueMs: 60_000, reclaimMs: 60_000, expireMs: 1_000, reconcileMs: 60_000 };
+
+  it('both sweeps actually RUN, and each claims under its own name', async () => {
+    // These two loops were wired with no test that ticked them. A loop the
+    // suite never drives is indistinguishable from a loop that throws on
+    // every tick — which is exactly what it would have done, since the store
+    // fake had neither method.
+    const c = counters();
+    const runtime = buildRuntime({
+      stores: makeStores(c), queue: makeEmptyQueue(c), config: FAST,
+    });
+    runtime.scheduler.start();
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(c.dayRolls).toBeGreaterThan(0);
+    expect(c.strandedSweeps).toBeGreaterThan(0);
+    // Separate claim names: one sweep taking the other's claim would let a
+    // single replica silently monopolise both.
+    expect(new Set(c.sweepClaims)).toEqual(new Set(['dayroll', 'stranded']));
+  });
+
+  it('a claim HELD BY ANOTHER replica stops the sweep from running at all', async () => {
+    // The point of the claim. Without this the fleet multiplies every sweep
+    // by the replica count.
+    const c = counters();
+    // The override replaces the counting fake, so it records for itself —
+    // otherwise "the claim was attempted" would be asserted against a
+    // counter nothing writes, and the test would pass for the wrong reason.
+    const asked: string[] = [];
+    const runtime = buildRuntime({
+      stores: makeStores(c, {
+        claimSweep: async (input: { sweep: string }) => {
+          asked.push(input.sweep);
+          return { status: 'held_by_other' as const };
+        },
+      }),
+      queue: makeEmptyQueue(c),
+      config: FAST,
+    });
+    runtime.scheduler.start();
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(asked.length).toBeGreaterThan(0);
+    expect(c.dayRolls).toBe(0);
+    expect(c.strandedSweeps).toBe(0);
+  });
+
+  it('a claim that THROWS also stops the sweep — the claim fails closed', async () => {
+    // A claim we could not read is not a claim we hold. Failing open here
+    // would make a database blip the one moment every replica sweeps at once.
+    const c = counters();
+    const runtime = buildRuntime({
+      stores: makeStores(c, {
+        claimSweep: async () => { throw new Error('claim_read_failed'); },
+      }),
+      queue: makeEmptyQueue(c),
+      config: FAST,
+    });
+    runtime.scheduler.start();
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(c.dayRolls).toBe(0);
+    expect(c.strandedSweeps).toBe(0);
+    // And the scheduler survives it: a refused claim is a normal tick.
+    expect(runtime.scheduler.health().running).toBe(true);
+    expect(loopHealth(runtime, 'phone-dayroll').consecutiveErrors).toBe(0);
+  });
+
+  it('a non-ok sweep status nulls its count and names the sweep, like the other three', async () => {
+    const c = counters();
+    const runtime = buildRuntime({
+      stores: makeStores(c, {
+        sweepDayRolled: async () => ({ status: 'unknown' as const }),
+      }),
+      queue: makeEmptyQueue(c),
+      config: FAST,
+    });
+    runtime.scheduler.start();
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    const snap = runtime.snapshot();
+    // `null`, not `0`. "The sweep did not happen" and "it ran and rolled
+    // nothing" are opposite operational facts and must not share a value.
+    expect(snap.lastRolled).toBeNull();
+    expect(snap.sweepNotOk.dayroll).toBe(true);
+    // CONTROL: the sibling sweep in the same pass is unaffected.
+    expect(snap.sweepNotOk.stranded).toBe(false);
+    expect(snap.lastStranded).toBe(0);
+  });
+
+  it('the resolved counts reach the published view', async () => {
+    const c = counters();
+    const runtime = buildRuntime({
+      stores: makeStores(c, {
+        sweepDayRolled: async () => ({ status: 'ok' as const, rolled: 2, examined: 3, skipped: 1 }),
+        sweepStrandedSessions: async () => ({
+          status: 'ok' as const, examined: 4, completed: 3, failed: 1, skipped: 0,
+        }),
+      }),
+      queue: makeEmptyQueue(c),
+      config: FAST,
+    });
+    runtime.scheduler.start();
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    const snap = runtime.snapshot();
+    expect(snap.lastRolled).toBe(2);
+    // Completed PLUS truthfully failed: both are resolutions, and an operator
+    // watching this number wants "how many stopped being stranded".
+    expect(snap.lastStranded).toBe(4);
+  });
+});
+
+describe('F. M-9 — a construction failure and a deliberate disable are different facts', () => {
+  const HERE = path.dirname(fileURLToPath(import.meta.url));
+
+  it('a deliberate disable is `enabled: false` with NO degrade reason', () => {
+    const v = phoneRuntimeView();
+    expect(v.enabled).toBe(false);
+    expect(v.start_failed).toBe(false);
+    // The shipped default. Marking every healthy deployment degraded would
+    // make the surface useless, which is why this case stays reason-free.
+    expect(phoneRuntimeDegradeReasons(v)).toEqual([]);
+  });
+
+  it('a construction failure is `enabled: false` WITH `phone_runtime_start_failed`', () => {
+    recordPhoneRuntimeStartFailure();
+
+    const v = phoneRuntimeView();
+    // Still not enabled — the process genuinely has no runtime.
+    expect(v.enabled).toBe(false);
+    expect(v.running).toBe(false);
+    // ...but no longer indistinguishable from the case above.
+    expect(v.start_failed).toBe(true);
+    expect(phoneRuntimeDegradeReasons(v)).toEqual(['phone_runtime_start_failed']);
+  });
+
+  it('a successful registration clears the flag — a later lane failure cannot mark this one broken', async () => {
+    recordPhoneRuntimeStartFailure();
+    const c = counters();
+    const runtime = buildRuntime({ stores: makeStores(c), queue: makeEmptyQueue(c) });
+    registerPhoneRuntime(runtime);
+    runtime.scheduler.start();
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    const v = phoneRuntimeView();
+    expect(v.enabled).toBe(true);
+    expect(v.start_failed).toBe(false);
+    expect(phoneRuntimeDegradeReasons(v)).not.toContain('phone_runtime_start_failed');
+  });
+
+  it('the flag is a BOOLEAN and carries nothing about why', () => {
+    recordPhoneRuntimeStartFailure();
+    const v = phoneRuntimeView();
+    expect(typeof v.start_failed).toBe('boolean');
+    // The whole view remains publishable: no message, no stack, no config text.
+    expect(JSON.stringify(v)).not.toContain('Error');
+  });
+
+  it('THE WIRING: the composition root RECORDS the failure, not only logs it', () => {
+    // The flag is inert unless `index.ts` sets it, and a log line on one
+    // replica is not a signal anybody is watching. Deleting the call leaves
+    // every assertion above green, so the call itself is asserted.
+    const source = readFileSync(path.join(HERE, '..', 'index.ts'), 'utf8');
+    expect(source).toContain('recordPhoneRuntimeStartFailure');
+
+    const at = source.indexOf("error_category: 'phone_runtime_start_failed'");
+    expect(at, 'the phone start-failure catch block was not found').toBeGreaterThan(0);
+    // Inside the SAME catch block, not merely somewhere in the file.
+    const block = source.slice(at, source.indexOf('\n}', at));
+    expect(block).toContain('recordPhoneRuntimeStartFailure()');
+    expect(block).toContain('phoneRuntime = null');
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// G. M-5 — THE ADMISSION DETAIL SURVIVES THE RUNTIME SEAM
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// `due-loop.ts`'s own suite proves that a detail handed to the pass becomes a
+// per-detail bucket. It cannot prove that the detail ever ARRIVES: the place
+// the value was lost is `runtime.ts`'s dialer adapter, which used to rebuild
+// the result as `{ status, refusal }` and drop `detail` on the floor. A test
+// that stops at the port is green against exactly the defect being repaired.
+//
+// So this one drives the REAL adapter — `createPhoneRuntime`'s `dialer.dial`,
+// through `dialPhoneAttempt` and `admitPhoneEngagement` — and reads the answer
+// off the published health view.
+
+describe('G. the admission detail reaches the health view through the real dialer', () => {
+  /**
+   * A due pass that reaches admission and is refused there.
+   *
+   * Every gate before admission has to be genuinely satisfied, and each one is
+   * satisfied the way production would satisfy it rather than stubbed past:
+   * a configured SIP trunk (`isPhoneTransportReady`), ordered timeouts, a
+   * `synthetic` dial mode that reaches no carrier, a resumable session already
+   * named on the engagement, a dialable number, and a consent preflight that
+   * raises no local objection. Admission then answers a refusal status, which
+   * is what `detail` carries.
+   */
+  function refusedRuntime(admitStatus: string): PhoneRuntimeHandle {
+    const c = counters();
+    const reader = makeReader({
+      async listDueEngagements() {
+        c.duePasses += 1;
+        return [{
+          engagementId: SENTINEL_ENGAGEMENT,
+          state: 'eligible',
+          candidateId: SENTINEL_CANDIDATE,
+          roleId: null,
+          sessionId: SENTINEL_SESSION,
+          nextEligibleAt: null,
+          noAnswerAttempts: 0,
+          updatedAt: null,
+        }];
+      },
+      async listDialableNumbers() {
+        return new Map([[SENTINEL_CANDIDATE, wrapDialableNumber(DIALABLE)]]);
+      },
+      // The engagement already names a session, so the pass takes the
+      // VERIFIED `existingSessionId` branch and never reaches `createSession`.
+      async readSessionForReuse() { return { status: 'waiting', roomVerified: true }; },
+      consent: {
+        async latestConsentRecord() {
+          return { status: 'granted', consents: [], expiresAt: null };
+        },
+        async activeConsentTemplate() { return { requiredConsents: [] }; },
+      },
+    });
+
+    const stores = makeStores(c, {
+      // THE REFUSAL. `admitPhoneEngagement` surfaces the database's status
+      // untranslated, and `dialPhoneAttempt` puts it in `detail` beside
+      // `refusal: 'admission_refused'`.
+      async admitAttempt() { return { status: admitStatus }; },
+    });
+
+    const handle = createPhoneRuntime({
+      config: screeningConfig(true, true),
+      runtimeConfig: runtimeConfig({ dueMs: 1_000 }),
+      // A configured trunk, so `isPhoneTransportReady` passes and admission is
+      // actually reached. The dial mode is still `synthetic`, so the SIP
+      // client resolved holds no SDK reference and no carrier is touched.
+      dialConfig: { ...loadPhoneDialConfig({} as NodeJS.ProcessEnv), sipTrunkId: 'ST_TEST_TRUNK' },
+      client: {} as never,
+      queue: makeEmptyQueue(c),
+      stores,
+      reader,
+      owner: 'phone-test-owner',
+      scheduler: { random: () => 0.5 },
+    });
+    expect(handle).not.toBeNull();
+    live.push(handle!);
+    return handle!;
+  }
+
+  it('M-5: an admission refusal arrives as `admission_refused:<detail>`, not as one collapsed bucket', async () => {
+    const runtime = refusedRuntime('suppressed');
+    registerPhoneRuntime(runtime);
+    runtime.scheduler.start();
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    const v = phoneRuntimeView();
+    expect(v.last_due, 'the due pass never completed').not.toBeNull();
+    expect(v.last_due!.status).toBe('ok');
+    // It really reached admission — otherwise this would be
+    // `transport_not_configured` or `room_unavailable`.
+    expect(v.last_due!.offered).toBe(1);
+    expect(v.last_due!.dialing).toBe(0);
+    expect(v.last_due!.refusals).toEqual({ 'admission_refused:suppressed': 1 });
+    // The collapsed bucket is gone, and the detail did not arrive as
+    // `unknown` — which is what a seam that dropped it would produce.
+    expect(v.last_due!.refusals.admission_refused).toBeUndefined();
+    expect(v.last_due!.refusals['admission_refused:unknown']).toBeUndefined();
+  });
+
+  it('M-5: a DIFFERENT admission refusal is a different bucket end to end', async () => {
+    // Two operationally opposite answers — "today's quota is spent" and
+    // "consent is broken and nobody is being called" — must not be one number.
+    const runtime = refusedRuntime('consent_missing');
+    registerPhoneRuntime(runtime);
+    runtime.scheduler.start();
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(phoneRuntimeView().last_due!.refusals)
+      .toEqual({ 'admission_refused:consent_missing': 1 });
+  });
+
+  it('M-5: an admission status OUTSIDE the vocabulary still cannot reach the surface', async () => {
+    // The closure holds through the whole chain, not only at the pure helper.
+    const HOSTILE = 'SENTINEL-STATUS-<img src=x>-must-not-travel';
+    const runtime = refusedRuntime(HOSTILE);
+    registerPhoneRuntime(runtime);
+    runtime.scheduler.start();
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    const v = phoneRuntimeView();
+    expect(v.last_due!.refusals).toEqual({ 'admission_refused:unknown': 1 });
+    expect(JSON.stringify(v)).not.toContain('SENTINEL-STATUS');
+    expect(JSON.stringify(v)).not.toContain('img src');
   });
 });

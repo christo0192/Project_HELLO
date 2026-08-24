@@ -25,7 +25,9 @@ import {
   PHONE_APPOINTMENT_MAX_SECONDS,
   PHONE_APPOINTMENT_MIN_SECONDS,
   PHONE_SYSTEM_ACTOR,
+  loadPhoneScreeningConfig,
   type ApplyPhoneEventResult,
+  type HeartbeatPhoneAttemptResult,
   type PhoneStores,
   type SchedulePhoneAppointmentResult,
 } from '../lib/phone-screening/index.js';
@@ -60,6 +62,8 @@ interface Harness {
   app: express.Express;
   applyEvent: ReturnType<typeof vi.fn>;
   scheduleAppointment: ReturnType<typeof vi.fn>;
+  /** 0045's epoch-fenced renewal. Observable on BOTH doors that call it. */
+  heartbeatAttemptByEpoch: ReturnType<typeof vi.fn>;
   resolveEngagement: ReturnType<typeof vi.fn>;
   startRecording: ReturnType<typeof vi.fn>;
   purgeRecordings: ReturnType<typeof vi.fn>;
@@ -70,6 +74,7 @@ interface Harness {
 function build(options: {
   applyEvent?: (input: unknown) => Promise<ApplyPhoneEventResult>;
   scheduleAppointment?: (input: unknown) => Promise<SchedulePhoneAppointmentResult>;
+  heartbeat?: (input: unknown) => Promise<HeartbeatPhoneAttemptResult>;
   engagementState?: string | null;
   sessionId?: string | null;
   /** Omit the seam entirely, to prove the route works without a recorder. */
@@ -101,13 +106,23 @@ function build(options: {
             options.sessionId === null ? undefined : (options.sessionId ?? SESSION),
         },
   );
+  // 0045. A REAL default, so the /events renewal actually runs rather than
+  // being swallowed by the route's best-effort catch because the seam is
+  // missing — a test that passes only because the call throws proves nothing.
+  const heartbeatAttemptByEpoch = vi.fn(
+    options.heartbeat ?? (async () => ({ status: 'ok' }) as HeartbeatPhoneAttemptResult),
+  );
   const startRecording = vi.fn(async () => ({ status: 'started', egressStarted: true }));
   const purgeRecordings = vi.fn(async () => ({
     status: options.purgeStatus ?? 'purged',
     safeToAcknowledge: options.purgeSafe ?? true,
   }));
 
-  const stores = { applyEvent, scheduleAppointment } as unknown as PhoneStores;
+  const stores = {
+    applyEvent,
+    scheduleAppointment,
+    heartbeatAttemptByEpoch,
+  } as unknown as PhoneStores;
 
   const app = express();
   app.use(express.json());
@@ -130,10 +145,15 @@ function build(options: {
     app,
     applyEvent,
     scheduleAppointment,
+    heartbeatAttemptByEpoch,
     resolveEngagement,
     startRecording,
     purgeRecordings,
-    storeCalls: () => applyEvent.mock.calls.length + scheduleAppointment.mock.calls.length,
+    // EVERY store method, so a "no database work" assertion means it.
+    storeCalls: () =>
+      applyEvent.mock.calls.length
+      + scheduleAppointment.mock.calls.length
+      + heartbeatAttemptByEpoch.mock.calls.length,
   };
 }
 
@@ -152,7 +172,7 @@ const GOOD_SLOT = '2026-09-01T10:00:00Z'; // 15:30 IST
 // ═══════════════════════════════════════════════════════════════════════
 
 describe('P5 worker route — auth is the existing worker secret', () => {
-  for (const path of ['/events', '/appointments']) {
+  for (const path of ['/events', '/appointments', '/attempt/heartbeat']) {
     it(`${path}: an unset secret is 503, not a 401 that invites guessing`, async () => {
       delete process.env.WORKER_CONTEXT_SECRET;
       const h = build();
@@ -240,6 +260,9 @@ describe('P5 worker route — disabled is indistinguishable from absent', () => 
   for (const [path, body] of [
     ['/events', { attempt_id: ATTEMPT, event_type: 'classify.human' }],
     ['/appointments', { attempt_id: ATTEMPT, starts_at: GOOD_SLOT, duration_seconds: 1800 }],
+    // 0045. The renewal door is behind the SAME master switch, and a disabled
+    // deployment must be indistinguishable from one that never had the route.
+    ['/attempt/heartbeat', { attempt_id: ATTEMPT, session_id: SESSION, epoch: 0 }],
   ] as const) {
     it(`${path}: 503 phone_screening_disabled with NO store call at all`, async () => {
       const h = build({ configSource: DISABLED });
@@ -1048,5 +1071,412 @@ describe('a pre-disclosure deferral cannot book a SAME-DAY slot', () => {
 
     expect(res.body.ok).toBe(true);
     expect(h.scheduleAppointment).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// POST /attempt/heartbeat — 0045
+//
+// B-1: the attempt CONCURRENCY lease (the fleet-slot lease, not the 0028
+// queue lease) is minted by admission and extended just far enough to cover
+// the originate. Nothing renewed it, so it expired mid-call on EVERY answered
+// call: the slot was handed to somebody else while the candidate was still
+// talking, the reclaim sweep marked a live conversation `abandoned`, and the
+// agent's eventual `assessment.completed` was ignored because that edge is
+// gated on `in_call`. A screening that was conducted AND SCORED was lost,
+// silently. This door is the renewal.
+//
+// Two properties carry every test below.
+//
+//   1. NO LEASE TOKEN EVER TRAVELS ON THIS ROUTE — not up, not down. The
+//      conversation runs in the LiveKit agent, not in the process that
+//      admitted the attempt, so a token-fenced renewal would mean shipping
+//      the token onto dispatch metadata and into every log line that ever
+//      printed a request body. 0045 added a second, EPOCH-fenced door
+//      precisely so the token can stay where it was minted.
+//   2. `lease_lost` IS NOT RETRYABLE. It is the one refusal this door has and
+//      it means the slot is gone — possibly to another live call. A worker
+//      that kept beating on a lost lease is the hazard, so the response must
+//      carry no cadence at all.
+// ═══════════════════════════════════════════════════════════════════════
+
+/** A uuid-shaped string that must never be echoed back to the worker. */
+const LEASE_TOKEN = '0de1ca7e-0000-4000-8000-abcdefabcdef';
+
+/** The lease the ROUTE is configured with, read from the same source it reads. */
+function leaseOf(source: NodeJS.ProcessEnv): number {
+  return loadPhoneScreeningConfig(source).leaseSeconds;
+}
+
+function beat(h: Harness, body: Record<string, unknown>) {
+  return post(h, '/attempt/heartbeat', body);
+}
+
+const GOOD_BEAT = { attempt_id: ATTEMPT, session_id: SESSION, epoch: 4 };
+
+describe('P5 /attempt/heartbeat — the schema is STRICT and a token cannot ride on it', () => {
+  // `.strict()` is the control, not a nicety. The whole reason 0045 added an
+  // epoch-fenced RPC is so a lease token can never travel on this route; a
+  // schema that quietly ignored an unknown key would let a worker start
+  // sending one, and the first person to notice would be whoever read a log.
+  for (const [label, body] of [
+    ['missing attempt_id', { session_id: SESSION, epoch: 1 }],
+    ['non-uuid attempt_id', { attempt_id: 'not-a-uuid', session_id: SESSION, epoch: 1 }],
+    ['missing epoch', { attempt_id: ATTEMPT, session_id: SESSION }],
+    ['negative epoch', { attempt_id: ATTEMPT, session_id: SESSION, epoch: -1 }],
+    ['non-integer epoch', { attempt_id: ATTEMPT, session_id: SESSION, epoch: 1.5 }],
+    ['missing session_id', { attempt_id: ATTEMPT, epoch: 1 }],
+    ['an extra lease_token key', { ...GOOD_BEAT, lease_token: LEASE_TOKEN }],
+  ] as Array<[string, Record<string, unknown>]>) {
+    it(`refuses ${label} with a flat 400 and NO database work`, async () => {
+      const h = build();
+      const res = await beat(h, body);
+      expect(res.status, label).toBe(400);
+      expect(res.body).toEqual({ ok: false, status: 'invalid_request' });
+      expect(h.storeCalls(), label).toBe(0);
+    });
+  }
+
+  it('the extra-key refusal is the load-bearing one: a token never reaches the store', async () => {
+    const h = build();
+    const res = await beat(h, { ...GOOD_BEAT, lease_token: LEASE_TOKEN });
+    expect(res.status).toBe(400);
+    expect(h.heartbeatAttemptByEpoch).not.toHaveBeenCalled();
+    // And it is not echoed back either — a 400 that quoted the body would put
+    // the token in the worker's own logs, which is the leak this schema exists
+    // to prevent.
+    expect(JSON.stringify(res.body)).not.toContain(LEASE_TOKEN);
+  });
+});
+
+describe('P5 /attempt/heartbeat — the cadence is the SERVER\'s number', () => {
+  // The response carries no token and no absolute expiry, only when to beat
+  // next. The server owns that number so the lease length stays a server-side
+  // knob and a worker cannot drift off it.
+  for (const lease of [undefined, '5', '31', '90', '900'] as const) {
+    const source = {
+      PHONE_SCREENING_ENABLED: 'true',
+      ...(lease === undefined ? {} : { PHONE_LEASE_SECONDS: lease }),
+    } as NodeJS.ProcessEnv;
+
+    it(`ok → 200 with a cadence at most HALF the configured lease (lease=${lease ?? 'default'})`, async () => {
+      const h = build({ configSource: source });
+      const res = await beat(h, GOOD_BEAT);
+
+      expect(res.status).toBe(200);
+      expect(res.body.ok).toBe(true);
+      expect(res.body.status).toBe('ok');
+
+      const next = res.body.next_heartbeat_seconds;
+      expect(Number.isInteger(next), `${next} must be a whole number of seconds`).toBe(true);
+      expect(next).toBeGreaterThan(0);
+      // Asserted against the CONFIG, not against a number typed into this
+      // file: the requirement is a RELATION. Beating at the lease length
+      // renews exactly as the lease lapses, which is the bug, not the fix.
+      expect(
+        next,
+        'a cadence at or above the lease length renews exactly as the lease dies',
+      ).toBeLessThanOrEqual(leaseOf(source) / 2);
+    });
+  }
+
+  it('forwards the CONFIGURED lease to the store, not a hardcoded one', async () => {
+    const source = { PHONE_SCREENING_ENABLED: 'true', PHONE_LEASE_SECONDS: '120' } as NodeJS.ProcessEnv;
+    const h = build({ configSource: source });
+    await beat(h, GOOD_BEAT);
+    expect(h.heartbeatAttemptByEpoch.mock.calls[0][0].leaseSeconds).toBe(leaseOf(source));
+  });
+});
+
+describe('P5 /attempt/heartbeat — `lease_lost` carries NO cadence', () => {
+  it('200 with status lease_lost and no next_heartbeat_seconds AT ALL', async () => {
+    const h = build({ heartbeat: async () => ({ status: 'lease_lost' }) as HeartbeatPhoneAttemptResult });
+    const res = await beat(h, GOOD_BEAT);
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('lease_lost');
+    // The ABSENCE is the assertion. `lease_lost` is not retryable — the slot
+    // is gone and another call may already hold it — so a worker that kept
+    // beating would be beating on somebody else's conversation. Handing it a
+    // cadence is an invitation to do exactly that.
+    expect(res.body).not.toHaveProperty('next_heartbeat_seconds');
+    expect(res.body).toEqual({ ok: true, status: 'lease_lost' });
+  });
+});
+
+describe('P5 /attempt/heartbeat — only the RPC may say `lease_lost`', () => {
+  it('an unrecognised status is a retryable 500, NEVER a forwarded lease_lost', async () => {
+    // `HeartbeatPhoneAttemptResult.status` is `OrUnknown<...>` precisely
+    // because a future RPC revision can answer something this build does not
+    // know. `lease_lost` is the one word that means "stop the conversation,
+    // the slot is gone, do not retry" — so collapsing every non-`ok` status
+    // into it would let an answer we did not UNDERSTAND silently terminate
+    // live calls. An answer we did not understand is not evidence of loss.
+    const h = build({
+      heartbeat: async () => ({ status: 'unknown_status' }) as unknown as HeartbeatPhoneAttemptResult,
+    });
+    const res = await beat(h, GOOD_BEAT);
+
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ ok: false, status: 'phone_heartbeat_error' });
+    expect(res.body.status).not.toBe('lease_lost');
+  });
+
+  it('`lease_lost` is forwarded only when the RPC actually said it', async () => {
+    const h = build({ heartbeat: async () => ({ status: 'lease_lost' }) as HeartbeatPhoneAttemptResult });
+    const res = await beat(h, GOOD_BEAT);
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('lease_lost');
+  });
+});
+
+describe('P5 /attempt/heartbeat — the response is a PROJECTION, not a pass-through', () => {
+  it('no lease token reaches the worker even when the store hands one back', async () => {
+    // The store is fed a DISHONEST result carrying a token under three
+    // spellings. This is the response-projection property: whatever a future
+    // migration adds to the RPC answer does not reach the worker — and
+    // therefore does not reach a language model, dispatch metadata, or a log
+    // line — until this route changes on purpose.
+    const h = build({
+      heartbeat: async () =>
+        ({
+          status: 'ok',
+          leaseToken: LEASE_TOKEN,
+          lease_token: LEASE_TOKEN,
+          leaseExpiresAt: '2026-08-01T00:01:00.000Z',
+        }) as unknown as HeartbeatPhoneAttemptResult,
+    });
+    const res = await beat(h, GOOD_BEAT);
+
+    expect(res.status).toBe(200);
+    const body = JSON.stringify(res.body);
+    expect(body).not.toContain(LEASE_TOKEN);
+    expect(body).not.toContain('leaseToken');
+    expect(body).not.toContain('lease_token');
+    // Positively: the body is exactly the three documented keys.
+    expect(Object.keys(res.body).sort()).toEqual(['next_heartbeat_seconds', 'ok', 'status']);
+  });
+
+  it('a lease_lost result carrying a token leaks nothing either', async () => {
+    const h = build({
+      heartbeat: async () =>
+        ({ status: 'lease_lost', leaseToken: LEASE_TOKEN }) as unknown as HeartbeatPhoneAttemptResult,
+    });
+    const res = await beat(h, GOOD_BEAT);
+    expect(JSON.stringify(res.body)).not.toContain(LEASE_TOKEN);
+  });
+});
+
+describe('P5 /attempt/heartbeat — a store throw is a bare, sanitized 500', () => {
+  it('500 phone_heartbeat_error with nothing of the error in the body', async () => {
+    const h = build({
+      heartbeat: async () => {
+        throw new Error(
+          `lease ${LEASE_TOKEN} for candidate +919876543210 violates unique constraint`,
+        );
+      },
+    });
+    const res = await beat(h, GOOD_BEAT);
+
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ ok: false, status: 'phone_heartbeat_error' });
+    const body = JSON.stringify(res.body);
+    expect(body).not.toContain(LEASE_TOKEN);
+    expect(body).not.toContain('9876543210');
+    expect(body).not.toContain('constraint');
+  });
+});
+
+describe('P5 /attempt/heartbeat — the epoch is the FENCE and travels verbatim', () => {
+  // 0042 starts an engagement at epoch 0 and bumps it on
+  // `disclosure.delivered`, so a FIRST heartbeat legitimately carries zero. A
+  // route that treated 0 as "absent" — the classic falsy bug — would fence the
+  // opening minutes of every call against the wrong generation, which reads as
+  // `lease_lost` on a perfectly healthy call.
+  for (const epoch of [0, 1, 7, 1_000_000]) {
+    it(`forwards epoch ${epoch} unchanged, alongside the attempt id and the clock`, async () => {
+      const h = build();
+      const res = await beat(h, { attempt_id: ATTEMPT, session_id: SESSION, epoch });
+
+      expect(res.status).toBe(200);
+      expect(h.heartbeatAttemptByEpoch).toHaveBeenCalledTimes(1);
+      expect(h.heartbeatAttemptByEpoch.mock.calls[0][0]).toEqual({
+        attemptId: ATTEMPT,
+        epoch,
+        // Part of the FENCE, not context. A field that is required at the
+        // route and then discarded is worse than an absent one: it reads
+        // like a binding check and binds nothing, so reviewers stop looking.
+        sessionId: SESSION,
+        leaseSeconds: leaseOf(ENABLED),
+        now: NOW,
+      });
+    });
+  }
+
+  it('epoch 0 is accepted, not swallowed as a missing field', async () => {
+    const h = build();
+    const res = await beat(h, { attempt_id: ATTEMPT, session_id: SESSION, epoch: 0 });
+    expect(res.status).toBe(200);
+    expect(h.heartbeatAttemptByEpoch.mock.calls[0][0].epoch).toBe(0);
+    expect(h.heartbeatAttemptByEpoch.mock.calls[0][0].epoch).not.toBeUndefined();
+  });
+
+  it('the session_id is forwarded as part of the fence, not parsed and dropped', async () => {
+    const h = build();
+    await beat(h, GOOD_BEAT);
+    expect(h.heartbeatAttemptByEpoch.mock.calls[0][0].sessionId).toBe(SESSION);
+  });
+
+  it('the input the store receives carries NO token field under any spelling', async () => {
+    const h = build();
+    await beat(h, GOOD_BEAT);
+    const input = h.heartbeatAttemptByEpoch.mock.calls[0][0] as Record<string, unknown>;
+    expect(Object.keys(input).sort()).toEqual([
+      'attemptId',
+      'epoch',
+      'leaseSeconds',
+      'now',
+      'sessionId',
+    ]);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// /events RENEWS NOTHING — and that is now the invariant
+//
+// A draft of 0045 renewed the attempt lease here, on an applied
+// `classify.human` or `disclosure.delivered`, to cover the window between "a
+// human answered" and "the agent's own heartbeat has beaten once". It was
+// REMOVED when the SESSION became part of the heartbeat fence: this route's
+// payload carries an attempt id and an epoch but no session, so renewing from
+// here would mean either passing a session the caller never named or making
+// the fence optional — and a fence that is optional for one caller is a fence
+// a reviewer stops trusting for all of them.
+//
+// So the tests below are the mirror image of the ones that were written for
+// that draft. They exist because the removal is a DECISION, not an omission:
+// re-adding the renewal is exactly the kind of well-meaning edit that would
+// otherwise land unnoticed, and it would have to weaken the fence to work.
+// The residual is bounded and LOUD — a lease that does lapse in that window
+// makes the agent's first heartbeat answer `lease_lost` and the agent halts.
+// B-1 was bad because it was SILENT; this is the same hazard with the silence
+// removed, and closing it properly means sizing the admission lease, not
+// opening a second renewal path on the hottest authenticated path in the lane.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('/events renews no lease, for any event, applied or not', () => {
+  for (const eventType of WORKER_PHONE_EVENTS) {
+    for (const [label, applyEvent] of [
+      [
+        'applied',
+        async () =>
+          ({ status: 'applied', applied: true, duplicate: false }) as ApplyPhoneEventResult,
+      ],
+      [
+        'ignored',
+        async () =>
+          ({
+            status: 'ignored',
+            applied: false,
+            ignoredReason: 'terminal',
+            duplicate: false,
+          }) as ApplyPhoneEventResult,
+      ],
+    ] as Array<[string, () => Promise<ApplyPhoneEventResult>]>) {
+      it(`\`${eventType}\` (${label}) touches the renewal seam not at all`, async () => {
+        const h = build({ applyEvent });
+        const res = await post(h, '/events', {
+          attempt_id: ATTEMPT,
+          event_type: eventType,
+          epoch: 2,
+        });
+
+        expect(res.status, eventType).toBe(200);
+        expect(h.applyEvent, eventType).toHaveBeenCalledTimes(1);
+        // The seam is WIRED — `build()` supplies a working
+        // `heartbeatAttemptByEpoch` — so this asserts a route that chose not
+        // to call it, not a route that could not.
+        expect(h.heartbeatAttemptByEpoch, `${eventType} (${label})`).not.toHaveBeenCalled();
+      });
+    }
+  }
+
+  it('the two events the removed draft renewed on are the ones held down hardest', async () => {
+    // Named explicitly as well as covered by the sweep above, because these
+    // two are where a re-added renewal would go, and a reader deleting the
+    // loop should still trip over the specific case.
+    for (const eventType of ['classify.human', 'disclosure.delivered'] as const) {
+      const h = build();
+      await post(h, '/events', { attempt_id: ATTEMPT, event_type: eventType, epoch: 2 });
+      expect(h.heartbeatAttemptByEpoch, eventType).not.toHaveBeenCalled();
+    }
+  });
+
+  it('a renewal seam that THROWS on contact cannot affect /events at all', async () => {
+    // Belt and braces on the same property from the other side: if some
+    // future edit did reach the seam, this test says the request must still
+    // be the normal applied answer — the event is already durable, and
+    // failing the request would ask the worker to re-deliver a disclosure the
+    // candidate has answered. Today it passes because nothing calls it.
+    const h = build({
+      heartbeat: async () => {
+        throw new Error(`renewal must not be reachable from /events (${LEASE_TOKEN})`);
+      },
+    });
+    const res = await post(h, '/events', {
+      attempt_id: ATTEMPT,
+      event_type: 'disclosure.delivered',
+      epoch: 2,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      ok: true,
+      status: 'applied',
+      ignored_reason: null,
+      duplicate: false,
+    });
+    expect(JSON.stringify(res.body)).not.toContain(LEASE_TOKEN);
+  });
+
+  it('/events carries no session_id — the field the fence would need', async () => {
+    // The MECHANICAL reason the renewal cannot live here. The event schema is
+    // strict, so a caller cannot smuggle one in either; a future renewal would
+    // have to widen this schema first, and that is a visible change.
+    const h = build();
+    const res = await post(h, '/events', {
+      attempt_id: ATTEMPT,
+      event_type: 'classify.human',
+      epoch: 2,
+      session_id: SESSION,
+    });
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ ok: false, error: 'invalid_request' });
+    expect(h.storeCalls()).toBe(0);
+  });
+
+  it('a router built with NO renewal seam behaves identically', async () => {
+    // Nothing about /events depends on the seam existing, which is what
+    // "renews nothing" has to mean to be worth asserting.
+    const applyEvent = vi.fn(
+      async () => ({ status: 'applied', applied: true, duplicate: false }) as ApplyPhoneEventResult,
+    );
+    const app = express();
+    app.use(express.json());
+    app.use(
+      '/api/internal/phone-worker',
+      createPhoneWorkerRouter({
+        stores: { applyEvent } as unknown as PhoneStores,
+        configSource: ENABLED,
+        now: () => NOW,
+      }),
+    );
+    const res = await request(app)
+      .post('/api/internal/phone-worker/events')
+      .set('Authorization', `Bearer ${SECRET}`)
+      .send({ attempt_id: ATTEMPT, event_type: 'disclosure.delivered', epoch: 2 });
+
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
   });
 });

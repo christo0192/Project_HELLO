@@ -39,8 +39,12 @@ import {
   type PhoneRuntimeConfig,
 } from '../lib/phone-runtime/config.js';
 import {
+  PHONE_ADMISSION_REFUSAL,
+  PHONE_ADMISSION_REFUSAL_DETAILS,
+  PHONE_UNKNOWN_ADMISSION_DETAIL,
   dueAttemptKind,
   dueByClock,
+  phoneRefusalCountKey,
   runPhoneDuePass,
   type PhoneDialPort,
   type PhoneDueDeps,
@@ -54,6 +58,7 @@ import {
 import type { DuePhoneEngagement, PhoneRuntimeReader } from '../lib/phone-runtime/read.js';
 import type { DialableNumber } from '../integrations/livekit-phone-dial/dialable-number.js';
 import { PHONE_BOUNDS } from '../lib/phone-screening/index.js';
+import { ADMIT_PHONE_ATTEMPT_STATUSES } from '../lib/phone-screening/rpc-contract.js';
 import type { PhoneScreeningConfig, PhoneStores } from '../lib/phone-screening/index.js';
 import type { QueueJob } from '../lib/queue/types.js';
 
@@ -188,6 +193,16 @@ describe('phone runtime config: an empty source yields the documented defaults',
     // And the ceiling cannot be configured past it either — a knob whose max
     // breaks the invariant is a knob that ships the bug.
     expect(PHONE_RUNTIME_BOUNDS.reclaimMs!.min).toBeLessThan(leaseMs);
+
+    // ── M-2: THE BOUND THE COMMENT ACTUALLY CLAIMS ──────────────────
+    // "within HALF a lease-lifetime", not merely "faster than the lease".
+    // The arithmetic half of the bound lives here; the behavioural half —
+    // that the scheduler really runs the sweep at least once per `reclaimMs`
+    // rather than drifting to its 60s idle ceiling — is measured against a
+    // running scheduler in `phone-runtime-loops.test.ts`. Neither half is
+    // sufficient alone: this one compares two constants, and comparing two
+    // constants is exactly how the original false claim survived.
+    expect(PHONE_RUNTIME_BOUNDS.reclaimMs!.def * 2).toBeLessThanOrEqual(leaseMs);
   });
 
   it('a bounded batch cannot be widened past the sweep batch', () => {
@@ -479,7 +494,9 @@ function harness(options: {
   session?: (candidateId: string) => string | null;
   /** Appointment start per engagement, for the `scheduled` branch. */
   appointmentStart?: (engagementId: string) => string | null;
-  dial?: (engagementId: string) => { status: 'dialing' | 'refused'; refusal?: string };
+  dial?: (
+    engagementId: string,
+  ) => { status: 'dialing' | 'refused'; refusal?: string; detail?: string };
   config?: Partial<PhoneScreeningConfig>;
 } = {}): Harness {
   const calls = {
@@ -917,6 +934,145 @@ describe('a refusal is counted by its stable code and is not a dial', () => {
     const result = await runPhoneDuePass(h.deps, options());
     expect(result.refusals).toEqual({ window_closed: 1, consent_not_granted: 1 });
     expect(result.dialing).toBe(0);
+  });
+
+  // ═══════════════════════════════════════════════════════════════════
+  // M-5 — EVERY ADMISSION REFUSAL USED TO COLLAPSE INTO ONE BUCKET
+  // ═══════════════════════════════════════════════════════════════════
+  //
+  // `dialPhoneAttempt` answers `refusal: 'admission_refused'` with admission's
+  // stable sub-code in `detail`, and the pass DROPPED `detail`. So
+  // `window_closed`, `at_capacity`, `daily_attempt_exists`, `consent_missing`,
+  // `suppressed`, `phone_invalid`, `halt_unreadable` and `ingestion_not_ready`
+  // all surfaced as one number — and those are exactly the answers that
+  // separate "the lane is working and today's quota is spent" from "consent is
+  // broken and nobody is being called".
+  //
+  // The expansion is only safe while the vocabulary stays CLOSED. An
+  // unrecognised detail interpolated into a key would turn a published counter
+  // map into a disclosure channel fed by whatever the dial controller happened
+  // to put there. That is the property the last two tests below pin.
+
+  it('M-5: two admission refusals with different details are two different buckets', async () => {
+    const details: Record<string, string> = {
+      e1: 'consent_missing',
+      e2: 'at_capacity',
+      e3: 'consent_missing',
+    };
+    const h = harness({
+      due: [
+        engagement({ engagementId: 'e1', candidateId: 'c1' }),
+        engagement({ engagementId: 'e2', candidateId: 'c2' }),
+        engagement({ engagementId: 'e3', candidateId: 'c3' }),
+      ],
+      dial: (engagementId) => ({
+        status: 'refused',
+        refusal: 'admission_refused',
+        detail: details[engagementId],
+      }),
+    });
+    const result = await runPhoneDuePass(h.deps, options());
+
+    expect(result.refusals).toEqual({
+      'admission_refused:consent_missing': 2,
+      'admission_refused:at_capacity': 1,
+    });
+    // The collapsed bucket is GONE, not merely joined by the new ones.
+    expect(result.refusals.admission_refused).toBeUndefined();
+    expect(result.offered).toBe(3);
+    expect(result.dialing).toBe(0);
+  });
+
+  it('M-5: an UNRECOGNISED detail becomes a fixed bucket and never reaches the key', async () => {
+    // The disclosure test. The sentinel is the shape a leak would actually
+    // take: a provider string laundered through `detail` by a future edit.
+    const HOSTILE = 'SENTINEL-DETAIL-<script>-9198765432-must-not-travel';
+    const h = harness({
+      due: [engagement({ engagementId: 'e1', candidateId: 'c1' })],
+      dial: () => ({ status: 'refused', refusal: 'admission_refused', detail: HOSTILE }),
+    });
+    const result = await runPhoneDuePass(h.deps, options());
+
+    expect(result.refusals).toEqual({
+      [`admission_refused:${PHONE_UNKNOWN_ADMISSION_DETAIL}`]: 1,
+    });
+    // Not in a key, not in a value, not anywhere in the serialized result —
+    // which is what the health surface publishes.
+    expect(JSON.stringify(result)).not.toContain('SENTINEL-DETAIL');
+    expect(JSON.stringify(result)).not.toContain('script');
+  });
+
+  it('M-5: an ABSENT detail also lands in the fixed bucket, never as a bare `admission_refused`', async () => {
+    const h = harness({
+      due: [engagement({ engagementId: 'e1', candidateId: 'c1' })],
+      dial: () => ({ status: 'refused', refusal: 'admission_refused' }),
+    });
+    const result = await runPhoneDuePass(h.deps, options());
+    expect(result.refusals).toEqual({ 'admission_refused:unknown': 1 });
+  });
+
+  it('M-5: NO OTHER refusal grows a suffix, even when a detail rides along', async () => {
+    // `room_unavailable` carries `detail: room.reason` from `dial.ts`, and
+    // that vocabulary is a DIFFERENT closed set. Only `admission_refused` is
+    // expanded, because only it collapses eight distinct answers into one.
+    const h = harness({
+      due: [engagement({ engagementId: 'e1', candidateId: 'c1' })],
+      dial: () => ({ status: 'refused', refusal: 'room_unavailable', detail: 'not_configured' }),
+    });
+    const result = await runPhoneDuePass(h.deps, options());
+    expect(result.refusals).toEqual({ room_unavailable: 1 });
+  });
+
+  describe('M-5: the detail vocabulary is CLOSED, and the closure is the safety property', () => {
+    it('every member of admission\'s own status vocabulary is recognised', () => {
+      // Read from the RPC contract, not from a list retyped here: a status
+      // added to 0042 and mirrored into `rpc-contract.ts` must not silently
+      // start reporting as `unknown`.
+      for (const detail of ADMIT_PHONE_ATTEMPT_STATUSES) {
+        if (detail === 'ok') continue; // `ok` is never a refusal
+        expect(phoneRefusalCountKey(PHONE_ADMISSION_REFUSAL, detail))
+          .toBe(`admission_refused:${detail}`);
+      }
+      // Plus the one code the dial controller mints itself when admission
+      // answers `ok` WITHOUT an addressable attempt.
+      expect(phoneRefusalCountKey(PHONE_ADMISSION_REFUSAL, 'ok_without_attempt'))
+        .toBe('admission_refused:ok_without_attempt');
+      // And the exported set is exactly that, in both directions.
+      expect([...PHONE_ADMISSION_REFUSAL_DETAILS].sort()).toEqual(
+        [...ADMIT_PHONE_ATTEMPT_STATUSES.filter((x) => x !== 'ok'), 'ok_without_attempt'].sort(),
+      );
+      expect(PHONE_ADMISSION_REFUSAL_DETAILS).not.toContain('ok');
+    });
+
+    it('anything outside it — including near-misses and hostile shapes — maps to the fixed bucket', () => {
+      const outside = [
+        undefined,
+        '',
+        'ok',
+        'consent_missing ',          // trailing space
+        'Consent_Missing',           // wrong case
+        'consent_missing:extra',     // a second separator
+        'admission_refused',         // the refusal itself, not a detail
+        '__proto__',
+        'a'.repeat(4_096),
+        '+919876543210',
+      ];
+      for (const detail of outside) {
+        expect(phoneRefusalCountKey(PHONE_ADMISSION_REFUSAL, detail), String(detail))
+          .toBe(`admission_refused:${PHONE_UNKNOWN_ADMISSION_DETAIL}`);
+      }
+    });
+
+    it('CONTROL: the closure is not vacuous — the bucket names really do differ', () => {
+      // If `phoneRefusalCountKey` were mutated to return `refusal` outright,
+      // every assertion above that expects a suffix turns red; if it were
+      // mutated to interpolate blindly, the hostile cases turn red. This
+      // control stops the pair from being satisfied by a function that returns
+      // one constant.
+      expect(phoneRefusalCountKey(PHONE_ADMISSION_REFUSAL, 'window_closed'))
+        .not.toBe(phoneRefusalCountKey(PHONE_ADMISSION_REFUSAL, 'at_capacity'));
+      expect(phoneRefusalCountKey('lease_too_short', 'window_closed')).toBe('lease_too_short');
+    });
   });
 
   it('a refusal with no code is counted as `unknown` rather than dropped', async () => {

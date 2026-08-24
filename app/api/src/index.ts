@@ -25,6 +25,7 @@ import {
 import {
   registerPhoneRuntime,
   clearPhoneRuntimeRegistration,
+  recordPhoneRuntimeStartFailure,
 } from './lib/phone-runtime/health.js';
 
 const startupLogger = createLogger('startup');
@@ -89,6 +90,12 @@ try {
   // Sanitized: the error is not logged verbatim because it can carry config text.
   startupLogger.warn('unknown_event', { error_category: 'phone_runtime_start_failed' });
   phoneRuntime = null;
+  // ...and RECORDED, not only logged. Without this the health surface reports
+  // `enabled: false` with no degrade reason — identical to a machine where an
+  // operator deliberately left both switches off. On a fleet where the flags
+  // ARE on, that is a false negative on the surface's most important question,
+  // and a log line on one replica is not a signal anybody is watching.
+  recordPhoneRuntimeStartFailure();
 }
 
 server.listen(env.port, () => {

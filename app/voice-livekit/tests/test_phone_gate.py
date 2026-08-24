@@ -135,13 +135,23 @@ _PHONE_ROOM = f"phone-{_SESSION_ID}"
 _BROWSER_ROOM = "screening-5b2a34cb-a912-4c68-a2c2-79ccdc1dcdd1"
 
 
+_EPOCH = 3
+
+
 def _dispatch_metadata(
-    *, session_id=_SESSION_ID, attempt_id=_ATTEMPT_ID, channel="phone"
+    *, session_id=_SESSION_ID, attempt_id=_ATTEMPT_ID, channel="phone",
+    epoch=_EPOCH, drop_epoch=False,
 ) -> str:
-    """The exact blob `buildPhoneDispatchMetadata` mints, as JSON text."""
-    return json.dumps(
-        {"session_id": session_id, "attempt_id": attempt_id, "channel": channel}
-    )
+    """The exact blob `buildPhoneDispatchMetadata` mints, as JSON text.
+
+    P5 added `epoch`: the heartbeat's entire claim to the concurrency lease
+    travels on this blob, so a fixture that omitted it would be asserting a
+    dispatch the worker must refuse.
+    """
+    blob = {"session_id": session_id, "attempt_id": attempt_id, "channel": channel}
+    if not drop_epoch:
+        blob["epoch"] = epoch
+    return json.dumps(blob)
 # Never a real number. Used only to prove it does not appear in an output.
 _NUMBER_LIKE = "+919812345670"
 
@@ -191,6 +201,7 @@ class FakeEventClient:
         start=None,
         commits: dict | None = None,
         complete=None,
+        heartbeats=None,
     ) -> None:
         self.calls: list[tuple[str, str, dict]] = []
         self.bookings: list[tuple[str, str, int]] = []
@@ -202,6 +213,21 @@ class FakeEventClient:
         self._complete = complete
         self.assessment_calls: list[tuple] = []
         self.boundaries: list[dict] = []
+        # P5: every lease renewal, recorded separately from the events so a
+        # test asserting the event ORDER is not perturbed by the heartbeat.
+        self.heartbeats: list[tuple] = []
+        self._heartbeats = list(heartbeats or [])
+
+    async def heartbeat_attempt(self, attempt_id, session_id, *, epoch):
+        self.heartbeats.append((attempt_id, session_id, epoch))
+        scripted = self._heartbeats
+        outcome = (
+            scripted.pop(0) if scripted
+            else phone.PhoneApiOutcome(True, phone.HEARTBEAT_OK_STATUS)
+        )
+        if outcome.ok and outcome.next_heartbeat_seconds is None:
+            outcome.next_heartbeat_seconds = phone.HEARTBEAT_FALLBACK_SEC
+        return outcome
 
     async def post_event(self, attempt_id, event_type, *, epoch=None):
         self.calls.append((attempt_id, event_type, {"epoch": epoch}))
@@ -511,6 +537,8 @@ class TestEntrypointIsolation(unittest.TestCase):
         self.assertEqual(run.await_args.args[2], _ATTEMPT_ID)
         # The session id in the room name is NEVER passed as the attempt id.
         self.assertNotEqual(run.await_args.args[2], _SESSION_ID)
+        # P5: the epoch rides the same blob and reaches the session.
+        self.assertEqual(run.await_args.args[3], _EPOCH)
 
     def test_unresolvable_dispatch_speaks_nothing_posts_nothing_records_nothing(self):
         """B-1: with no attempt id there is nothing safe to do — so nothing is done."""
@@ -541,6 +569,43 @@ class TestEntrypointIsolation(unittest.TestCase):
                 recording.assert_not_awaited()    # never recorded
                 self.assertEqual(client.calls, [])  # never posted an event
                 self.assertEqual(_FakePhoneSession.instances, [])  # never spoke
+                self.assertEqual(ctx.connected, 0)
+
+    def test_a_dispatch_without_a_usable_EPOCH_conducts_no_call_at_all(self):
+        """P5, and fail-closed in the same direction as a missing attempt id.
+
+        The epoch is the heartbeat's whole claim to the concurrency lease.
+        Without one this leg cannot renew it, the slot is reclaimed part-way
+        through the screening, and the assessment it goes on to score is
+        discarded because the engagement has already left `in_call`. Running
+        "without a heartbeat" is not a degraded mode; it is the defect. So the
+        worker does not connect, speak, activate, record or post.
+        """
+        cases = {
+            "no epoch key": _dispatch_metadata(drop_epoch=True),
+            "null epoch": _dispatch_metadata(epoch=None),
+            "string epoch": _dispatch_metadata(epoch="3"),
+            "float epoch": _dispatch_metadata(epoch=3.5),
+            "negative epoch": _dispatch_metadata(epoch=-1),
+        }
+        for label, dispatch in cases.items():
+            with self.subTest(label=label):
+                ctx = FakeCtx(_PHONE_ROOM, dispatch=dispatch)
+                client = FakeEventClient()
+                with patch.object(agent_mod, "_phone_agent_name", return_value="p"), \
+                     patch.object(
+                         agent_mod, "_run_phone_session", new_callable=AsyncMock
+                     ) as run, \
+                     patch.object(
+                         agent_mod, "_phone_recording_permitted", new_callable=AsyncMock
+                     ) as recording, \
+                     patch.object(agent_mod, "AgentSession", _FakePhoneSession):
+                    _FakePhoneSession.instances = []
+                    _run(agent_mod._run_phone_entrypoint(ctx, _PHONE_ROOM))
+                run.assert_not_awaited()
+                recording.assert_not_awaited()
+                self.assertEqual(client.calls, [])
+                self.assertEqual(_FakePhoneSession.instances, [])
                 self.assertEqual(ctx.connected, 0)
 
     def test_a_session_keyed_room_never_yields_an_attempt_id(self):
@@ -1317,7 +1382,8 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
              patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.05):
             task = asyncio.ensure_future(
                 agent_mod._run_phone_session(
-                    ctx, _PHONE_ROOM, _ATTEMPT_ID, client=client, classifier=classifier
+                    ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,
+                    client=client, classifier=classifier,
                 )
             )
             await asyncio.sleep(0.01)
@@ -1326,6 +1392,100 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
                 session.emit_close()
             result = await asyncio.wait_for(task, timeout=5)
         return result, client, recording, delete, session, persistence_spy
+
+    # ── P5: the lease must outlive the conversation ───────────────────
+
+    async def test_the_LEASE_is_heartbeaten_for_the_whole_conversation(self):
+        """B-1. The lease was sized to cover the ORIGINATE; a screening runs
+        for minutes. Unrenewed it lapses mid-call, the fleet slot is freed
+        under a live conversation, the reclaim sweep marks the attempt
+        `abandoned` while the candidate is still speaking, and the assessment
+        this leg then scores is ignored because that edge is gated on
+        `in_call`. This asserts the renewal exists, is handed THIS attempt's
+        triple, and is cancelled when the conversation ends.
+        """
+        seen: dict = {}
+        cancels: list[str] = []
+
+        async def fake_heartbeat(*, attempt_id, session_id, epoch, client, halt):
+            seen.update(
+                attempt_id=attempt_id, session_id=session_id,
+                epoch=epoch, client=client,
+            )
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancels.append("cancelled")
+                raise
+
+        with patch.object(phone, "run_phone_heartbeat", fake_heartbeat):
+            result, client, *_ = await self._run_session(
+                answers=("Yes, that's fine.",)
+            )
+        self.assertTrue(result.assessment_allowed)
+        self.assertEqual(seen["attempt_id"], _ATTEMPT_ID)
+        self.assertEqual(seen["session_id"], _SESSION_ID)
+        self.assertEqual(seen["epoch"], _EPOCH)
+        self.assertIs(seen["client"], client)
+        self.assertIn("assessment.completed", client.event_types)
+        # Cancelled on the NORMAL path, not left beating against a call that
+        # has already ended.
+        self.assertEqual(cancels, ["cancelled"])
+
+    async def test_the_heartbeat_task_cannot_LEAK_past_an_exception(self):
+        """It is cancelled in a `finally`, so an exception path cannot leave a
+        task beating on a conversation that is over."""
+        cancels: list[str] = []
+
+        async def fake_heartbeat(**kwargs):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancels.append("cancelled")
+                raise
+
+        client = FakeEventClient(start=RuntimeError("the screening blew up"))
+        with patch.object(phone, "run_phone_heartbeat", fake_heartbeat):
+            with self.assertRaises(RuntimeError):
+                await self._run_session(
+                    answers=("Yes, that's fine.",), client=client
+                )
+        self.assertEqual(cancels, ["cancelled"])
+
+    async def test_a_LOST_lease_STOPS_the_conversation_and_claims_nothing(self):
+        """End to end, through the real loop: the slot is gone, so the
+        conversation stops.
+
+        Continuing would run two conversations against one fleet slot — the
+        eleventh call is already admissible the instant the lease lapses. And
+        NOTHING is posted: the reclaim sweep has already restored the
+        engagement's previous state, so `assessment.aborted` would be untrue
+        and ignored, and `assessment.completed` would be a lie.
+        """
+        client = FakeEventClient(heartbeats=[
+            phone.PhoneApiOutcome(False, phone.HEARTBEAT_LEASE_LOST_STATUS),
+        ])
+        result, client, recording, delete, session, persistence_spy = (
+            await self._run_session(answers=("Yes, that's fine.",), client=client)
+        )
+        self.assertTrue(result.assessment_allowed)
+        self.assertEqual(client.heartbeats, [(_ATTEMPT_ID, _SESSION_ID, _EPOCH)])
+        self.assertNotIn("assessment.completed", client.event_types)
+        self.assertNotIn("assessment.aborted", client.event_types)
+        # The screening never even began, because the slot was already gone.
+        self.assertEqual(client.assessment_calls, [])
+        self.assertEqual(persistence_spy.mock_calls, [])
+        # The leg is torn down rather than left on a slot it does not hold.
+        delete.assert_awaited()
+
+    async def test_nothing_is_heartbeaten_before_the_gate_CONSENTS(self):
+        """A machine, a refusal or a silent line is not a conversation, and
+        renewing a lease for one would hold a fleet slot for nobody."""
+        result, client, *_ = await self._run_session(
+            answers=("Please leave a message after the tone.",)
+        )
+        self.assertFalse(result.assessment_allowed)
+        self.assertEqual(client.heartbeats, [])
 
     async def test_a_SCORED_screening_is_the_only_thing_that_claims_completion(self):
         """`assessment.completed` requires a VERIFIED assessment row.
@@ -1789,7 +1949,8 @@ class TestNumberNeverCarried(unittest.IsolatedAsyncioTestCase):
              patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.05):
             task = asyncio.ensure_future(
                 agent_mod._run_phone_session(
-                    ctx, _PHONE_ROOM, _ATTEMPT_ID, client=client, classifier=classifier
+                    ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,
+                    client=client, classifier=classifier,
                 )
             )
             await asyncio.sleep(0.01)

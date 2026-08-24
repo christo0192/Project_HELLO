@@ -77,6 +77,10 @@ import type {
   PhoneAssessmentTurn,
   PhonePlanQuestion,
   StartPhoneAssessmentInput,
+  HeartbeatPhoneAttemptByEpochInput,
+  SweepPhoneDayRolledResult,
+  SweepPhoneStrandedSessionsResult,
+  ClaimPhoneSweepResult,
 } from './ports.js';
 import {
   PHONE_ATTEMPT_KINDS,
@@ -305,6 +309,72 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
       return {
         status: narrowPhoneRpcStatus<HeartbeatPhoneAttemptStatus>('heartbeat_phone_attempt', row),
         leaseExpiresAt: iso(row, 'lease_expires_at'),
+      };
+    },
+
+    async heartbeatAttemptByEpoch(input): Promise<HeartbeatPhoneAttemptResult> {
+      const { data, error } = await client.rpc('heartbeat_phone_attempt_by_epoch', {
+        p_attempt_id: input.attemptId,
+        p_epoch: input.epoch,
+        p_session_id: input.sessionId,
+        p_lease_seconds: input.leaseSeconds ?? 60,
+        p_now: isoInstant(input.now),
+      });
+      if (error) throw new Error('phone_heartbeat_attempt_error');
+      const row = asRow(data);
+      return {
+        status: narrowPhoneRpcStatus<HeartbeatPhoneAttemptStatus>(
+          'heartbeat_phone_attempt_by_epoch', row,
+        ),
+        leaseExpiresAt: iso(row, 'lease_expires_at'),
+      };
+    },
+
+    async sweepDayRolled(input): Promise<SweepPhoneDayRolledResult> {
+      const { data, error } = await client.rpc('sweep_phone_day_rolled', {
+        p_limit: input.limit ?? 25,
+        p_now: isoInstant(input.now),
+      });
+      if (error) throw new Error('phone_sweep_day_rolled_error');
+      const row = asRow(data);
+      return {
+        status: narrowPhoneRpcStatus<'ok'>('sweep_phone_day_rolled', row),
+        examined: num(row, 'examined'),
+        rolled: num(row, 'rolled'),
+        skipped: num(row, 'skipped'),
+      };
+    },
+
+    async sweepStrandedSessions(input): Promise<SweepPhoneStrandedSessionsResult> {
+      const { data, error } = await client.rpc('sweep_phone_stranded_sessions', {
+        p_limit: input.limit ?? 25,
+        p_now: isoInstant(input.now),
+      });
+      if (error) throw new Error('phone_sweep_stranded_error');
+      const row = asRow(data);
+      return {
+        status: narrowPhoneRpcStatus<'ok'>('sweep_phone_stranded_sessions', row),
+        examined: num(row, 'examined'),
+        completed: num(row, 'completed'),
+        failed: num(row, 'failed'),
+        skipped: num(row, 'skipped'),
+      };
+    },
+
+    async claimSweep(input): Promise<ClaimPhoneSweepResult> {
+      const { data, error } = await client.rpc('claim_phone_sweep', {
+        p_sweep: input.sweep,
+        p_owner: input.owner,
+        p_ttl_seconds: input.ttlSeconds ?? 60,
+        p_now: isoInstant(input.now),
+      });
+      if (error) throw new Error('phone_claim_sweep_error');
+      const row = asRow(data);
+      return {
+        status: narrowPhoneRpcStatus<'ok' | 'held_by_other' | 'invalid_input'>(
+          'claim_phone_sweep', row,
+        ),
+        expiresAt: iso(row, 'expires_at'),
       };
     },
 

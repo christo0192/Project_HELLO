@@ -33,6 +33,12 @@ import type {
 // the single shared definition of the IST window, so the runtime cannot grow
 // a second copy of 09:00/21:00 that drifts from admission's.
 import { istWindowOpen } from '../phone-screening/index.js';
+// The CLOSED admission vocabulary, imported rather than restated. The whole
+// safety of expanding `admission_refused` into per-detail buckets rests on the
+// detail being a member of a fixed set; a local copy of that set would be a
+// second thing to keep in step with 0042 and the first place it drifted would
+// be the moment an unrecognised string reached a health surface.
+import { ADMIT_PHONE_ATTEMPT_STATUSES } from '../phone-screening/rpc-contract.js';
 import type { DuePhoneEngagement, PhoneRuntimeReader } from './read.js';
 import type { DialableNumber } from '../../integrations/livekit-phone-dial/dialable-number.js';
 
@@ -52,6 +58,64 @@ export const PHONE_DUE_SKIPS = [
 ] as const;
 
 export type PhoneDueSkip = (typeof PHONE_DUE_SKIPS)[number];
+
+/**
+ * The refusal code the dial controller answers when ADMISSION is what said no.
+ * Named rather than spelled inline because it is the one refusal whose count
+ * key is built rather than copied.
+ */
+export const PHONE_ADMISSION_REFUSAL = 'admission_refused';
+
+/**
+ * The bucket an unrecognised admission detail collapses into.
+ *
+ * NOT the detail itself, and that is the entire point. The health surface is
+ * published; interpolating an unrecognised string into a key would turn a
+ * counter map into a disclosure channel fed by whatever the dial controller —
+ * or a future edit of it, or a provider error laundered through it — happened
+ * to put in `detail`. A fixed bucket loses one bit of resolution in the case
+ * nobody has a name for, and closes the channel in every case.
+ */
+export const PHONE_UNKNOWN_ADMISSION_DETAIL = 'unknown';
+
+/**
+ * Every value `dialPhoneAttempt` can legitimately carry in `detail` alongside
+ * `admission_refused`.
+ *
+ * That is `admit_phone_attempt`'s own status vocabulary minus `ok` — `ok` is
+ * never a refusal — plus the one code the controller mints itself when
+ * admission answers `ok` WITHOUT the identifiers that make the attempt
+ * addressable (`dial.ts`). Frozen, and exported so a test can assert the
+ * closure rather than trust it.
+ */
+export const PHONE_ADMISSION_REFUSAL_DETAILS: readonly string[] = Object.freeze([
+  ...ADMIT_PHONE_ATTEMPT_STATUSES.filter((status) => status !== 'ok'),
+  'ok_without_attempt',
+]);
+
+const ADMISSION_REFUSAL_DETAILS = new Set<string>(PHONE_ADMISSION_REFUSAL_DETAILS);
+
+/**
+ * The key an outcome is counted under.
+ *
+ * ── WHY `admission_refused` IS EXPANDED AND THE OTHERS ARE NOT ────────
+ * `window_closed`, `at_capacity`, `daily_attempt_exists`, `consent_missing`,
+ * `suppressed`, `phone_invalid`, `halt_unreadable` and `ingestion_not_ready`
+ * all arrive as ONE refusal code with the distinguishing answer in `detail`.
+ * Collapsed, they are a single number that cannot tell "the lane is working
+ * and today's quota is spent" from "consent is broken and nobody is being
+ * called" — which are the two readings an operator most needs to separate.
+ * Every other member of `PHONE_DIAL_REFUSALS` is already distinct on its own,
+ * so nothing else is expanded and no other refusal grows a suffix.
+ *
+ * The vocabulary stays CLOSED: an unrecognised detail becomes
+ * `admission_refused:unknown`, never the string itself.
+ */
+export function phoneRefusalCountKey(refusal: string, detail: string | undefined): string {
+  if (refusal !== PHONE_ADMISSION_REFUSAL) return refusal;
+  const known = detail !== undefined && ADMISSION_REFUSAL_DETAILS.has(detail);
+  return `${PHONE_ADMISSION_REFUSAL}:${known ? detail : PHONE_UNKNOWN_ADMISSION_DETAIL}`;
+}
 
 export interface PhoneDueResult {
   readonly status: 'disabled' | 'halted' | 'ok';
@@ -97,7 +161,17 @@ export interface PhoneDialPort {
     kind: PhoneAttemptKind;
     number: DialableNumber;
     now: Date;
-  }): Promise<{ status: 'dialing' | 'refused'; refusal?: string }>;
+  }): Promise<{
+    status: 'dialing' | 'refused';
+    refusal?: string;
+    /**
+     * Admission's stable sub-code, when admission is what refused. Carried
+     * through the port rather than dropped at it: the port is exactly where
+     * the old code lost it, and a value that never crosses the seam cannot be
+     * counted on the other side.
+     */
+    detail?: string;
+  }>;
 }
 
 export interface PhoneDueDeps {
@@ -332,7 +406,7 @@ export async function runPhoneDuePass(
       now: options.now,
     });
     if (result.status === 'dialing') dialing += 1;
-    else bump(refusals, result.refusal ?? 'unknown');
+    else bump(refusals, phoneRefusalCountKey(result.refusal ?? 'unknown', result.detail));
   }
 
   return {

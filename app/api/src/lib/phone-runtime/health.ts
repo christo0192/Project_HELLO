@@ -34,12 +34,48 @@ export const MIN_STALE_WINDOW_MS = 30_000;
 
 let registered: PhoneRuntimeHandle | null = null;
 
+/**
+ * Whether `createPhoneRuntime` THREW in this process.
+ *
+ * ── OFF AND BROKEN MUST NOT LOOK THE SAME ────────────────────────────
+ * `index.ts` builds the phone runtime in its own try/catch, and a throw there
+ * logs `phone_runtime_start_failed` and leaves `phoneRuntime = null`. The view
+ * then reported `enabled: false` with no degrade reason — which is exactly
+ * right for the shipped default, where both switches are off and most machines
+ * will never construct a runtime, and exactly WRONG on a fleet where the flags
+ * ARE on: a replica whose runtime failed to construct reported precisely what
+ * a deliberately-disabled replica reports. Health truth is the surface's most
+ * important question and that was a false negative on it.
+ *
+ * So the failure is recorded, and it is a SEPARATE fact from registration:
+ * clearing the registration at shutdown does not un-break a construction that
+ * threw, and a construction that threw is not undone by another lane starting.
+ * A successful registration DOES clear it, because a registered runtime is
+ * proof that construction succeeded.
+ */
+let startFailed = false;
+
 export function registerPhoneRuntime(runtime: PhoneRuntimeHandle): void {
   registered = runtime;
+  // A live handle is direct evidence that construction succeeded.
+  startFailed = false;
 }
 
 export function clearPhoneRuntimeRegistration(): void {
   registered = null;
+}
+
+/**
+ * Record that `createPhoneRuntime` threw. Called from the composition root's
+ * catch, beside the sanitized log line, and nowhere else in production.
+ */
+export function recordPhoneRuntimeStartFailure(): void {
+  startFailed = true;
+}
+
+/** Clear the recorded construction failure. Test hygiene; never production. */
+export function clearPhoneRuntimeStartFailure(): void {
+  startFailed = false;
 }
 
 export interface PhoneLoopHealthView {
@@ -81,12 +117,25 @@ export interface PhoneRuntimeView {
   last_reclaimed: number | null;
   last_expired: number | null;
   last_reconciled: number | null;
+  /** 0045. Rolled onto a new IST day by the last day-roll pass. */
+  last_rolled: number | null;
+  /** 0045. Stranded engagements resolved by the last pass. */
+  last_stranded: number | null;
   /**
    * Names of the sweeps whose last run did NOT answer `ok`. Codes only.
    * Empty is the healthy state; a count of `0` on a sweep NOT named here
    * means "ran, nothing to do", which is a different fact.
    */
   sweeps_not_ok: string[];
+  /**
+   * Whether `createPhoneRuntime` THREW in this process.
+   *
+   * The one field that distinguishes `enabled: false` because nobody armed
+   * the lane from `enabled: false` because arming it failed. A boolean, so it
+   * carries nothing about WHY — the reason is in the sanitized startup log,
+   * and a health surface is not where a configuration error gets rendered.
+   */
+  start_failed: boolean;
 }
 
 function view(
@@ -131,7 +180,11 @@ export function phoneRuntimeView(now: Date = new Date()): PhoneRuntimeView {
       last_reclaimed: null,
       last_expired: null,
       last_reconciled: null,
+      last_rolled: null,
+      last_stranded: null,
       sweeps_not_ok: [],
+      // The ONLY difference between "off" and "broken" on this surface.
+      start_failed: startFailed,
     };
   }
 
@@ -160,10 +213,14 @@ export function phoneRuntimeView(now: Date = new Date()): PhoneRuntimeView {
     last_reclaimed: snapshot.lastReclaimed,
     last_expired: snapshot.lastExpired,
     last_reconciled: snapshot.lastReconciled,
+    last_rolled: snapshot.lastRolled,
+    last_stranded: snapshot.lastStranded,
     sweeps_not_ok: Object.entries(snapshot.sweepNotOk)
       .filter(([, notOk]) => notOk)
       .map(([name]) => name)
       .sort(),
+    // A registered runtime constructed successfully by definition.
+    start_failed: false,
   };
 }
 
@@ -172,10 +229,19 @@ export function phoneRuntimeView(now: Date = new Date()): PhoneRuntimeView {
  *
  * A process with no runtime contributes nothing — that is not a fault, it is
  * the shipped default and the normal state of every machine that is not
- * running the loops.
+ * running the loops. The one exception is a runtime that FAILED to construct:
+ * that is a fault, it is invisible in `enabled`, and `start_failed` is the
+ * boolean that separates the two.
  */
 export function phoneRuntimeDegradeReasons(view_: PhoneRuntimeView): string[] {
-  if (!view_.enabled) return [];
+  if (!view_.enabled) {
+    // A DISABLED process contributes nothing — with one exception. A runtime
+    // that threw on construction is not "off", it is broken, and the two were
+    // indistinguishable here. The deliberate-disable case stays reason-free,
+    // because it is the shipped default and marking every healthy deployment
+    // degraded would make the surface useless.
+    return view_.start_failed ? ['phone_runtime_start_failed'] : [];
+  }
   const reasons: string[] = [];
   if (!view_.running) reasons.push('phone_runtime_stopped');
   if (view_.loops.some((l) => l.stale)) reasons.push('phone_loop_stale');

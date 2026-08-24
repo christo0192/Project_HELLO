@@ -167,6 +167,13 @@ function harness(opts: {
   const stores = {
     admitAttempt: admit,
     heartbeatAttempt: heartbeat,
+    // The dial controller uses the TOKEN-fenced door (it holds the token it
+    // was just handed). The epoch-fenced one is the worker's, and reaching for
+    // it from here would be a bug, so it throws.
+    heartbeatAttemptByEpoch: unreachable,
+    sweepDayRolled: unreachable,
+    sweepStrandedSessions: unreachable,
+    claimSweep: unreachable,
     reclaimAttemptLeases: unreachable,
     applyEvent: unreachable,
     scheduleAppointment: unreachable,

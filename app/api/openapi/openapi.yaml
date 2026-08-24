@@ -793,6 +793,58 @@ paths:
               schema:
                 $ref: '#/components/schemas/PhoneWorkerError'
 
+  /api/internal/phone/attempt/heartbeat:
+    post:
+      tags: [phone]
+      operationId: heartbeatPhoneAttemptLease
+      summary: Renew the attempt concurrency lease for the duration of a live call
+      description: Internal, service-authenticated (0045). Renews the attempt CONCURRENCY lease — the fleet-slot lease, not the 0028 queue lease — for the length of a conversation. The lease is minted by admission and extended only far enough to cover the originate, so without this door it expired mid-call on every answered call: the slot was handed to another dial while the candidate was still talking, the reclaim sweep marked a live conversation abandoned, and the agent's eventual assessment.completed was ignored because that edge is gated on in_call — a screening that was conducted and SCORED was lost silently. The fence is the EPOCH, never a lease token. NO LEASE TOKEN IS ACCEPTED ON THIS REQUEST AND NONE IS EVER RETURNED: the conversation runs in the LiveKit agent rather than in the process that admitted the attempt, so a token-fenced renewal would mean shipping the token onto dispatch metadata and into every log line that printed a request body; 0045 added this second, epoch-fenced RPC precisely so the token can stay where it was minted. The request body is strict — an unknown key, lease_token included, is a flat 400 before any database work. epoch accepts 0, because 0042 starts an engagement at epoch 0 and bumps on disclosure.delivered, so a first heartbeat legitimately carries zero. The response carries no token and no absolute expiry, only next_heartbeat_seconds — the SERVER owns the cadence (a third of the lease) so the lease length stays a server-side knob and a worker cannot drift off it. Only the RPC may say lease_lost: an unrecognised status from a future revision answers 500 phone_heartbeat_error and stays RETRYABLE, because an answer we did not understand is not evidence the lease was lost, and collapsing it into lease_lost would let it silently terminate live calls. status lease_lost IS NOT RETRYABLE: it covers unknown attempt, stale epoch, already-reclaimed lease and non-live attempt with one stable answer, the slot is gone and another call may already hold it, and the worker must STOP the conversation rather than beat harder — which is why no cadence is returned with it. This is the ONLY door that renews the lease: a draft renewed it as a side effect of POST /api/internal/phone/events too, and that was removed when the session became part of the fence, because that route's payload names no session and a fence that is optional for one caller is a fence that is trusted for none. The residual window - a candidate answering on the last ring, whose opening gate can outlive the admission lease before the agent's first beat - is bounded and LOUD rather than silent: the first heartbeat answers lease_lost and the agent halts the call, which is B-1's hazard with B-1's silence removed. Closing it properly means sizing the admission lease to cover the opening gate, not opening a second renewal path. Disabled by default.
+      security:
+        - workerBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PhoneAttemptHeartbeatRequest'
+      responses:
+        '200':
+          description: The database reached a verdict. status ok means the lease was renewed and next_heartbeat_seconds says when to beat again; status lease_lost means the slot is gone, carries NO cadence, and is not retryable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneAttemptHeartbeatResponse'
+        '400':
+          description: Body validation failed — a missing or malformed attempt_id/session_id/epoch, or ANY unknown key (a lease_token has no place on this route and is refused here).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneAttemptHeartbeatResponse'
+        '401':
+          description: Worker bearer credential required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '403':
+          description: Worker bearer credential invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '500':
+          description: phone_heartbeat_error — sanitized stable code, never a driver message and never a lease token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneAttemptHeartbeatResponse'
+        '503':
+          description: Phone screening disabled, or the worker credential is not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+
   # ── Ashby integration ──────────────────────────────────────────────
   /api/integrations/livekit-phone/webhook:
     post:
@@ -5704,6 +5756,43 @@ components:
           nullable: true
       additionalProperties: false
 
+    PhoneAttemptHeartbeatRequest:
+      type: object
+      required: [attempt_id, session_id, epoch]
+      properties:
+        attempt_id:
+          type: string
+          format: uuid
+          description: The live attempt whose concurrency lease is being renewed.
+        session_id:
+          type: string
+          format: uuid
+          description: Part of the FENCE, not context. The RPC matches it against the attempt's own session_id, so a caller must prove it is in the conversation whose fleet slot it is holding open. Required and USED - an earlier draft required it at the route and then discarded it, which is worse than not having it at all, because a field that reads like a binding check and binds nothing is a field reviewers stop looking at.
+        epoch:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+          description: The FENCE, and the only one. The worker names which generation of the attempt it is beating for and the database looks the lease token up itself. 0 is legal and common — 0042 starts an engagement at epoch 0 and bumps on disclosure.delivered, so a first heartbeat legitimately carries zero.
+      additionalProperties: false
+
+    PhoneAttemptHeartbeatResponse:
+      type: object
+      required: [ok, status]
+      properties:
+        ok:
+          type: boolean
+          description: True whenever the database reached a verdict, INCLUDING lease_lost. Read `status`, not this field, to decide whether to keep talking.
+        status:
+          type: string
+          enum: [ok, lease_lost]
+          description: A CLOSED pair. lease_lost covers unknown attempt, stale epoch, already-reclaimed lease and non-live attempt with one stable answer, deliberately — a caller that has lost its lease must not be able to tell WHY, because every reason carries the same instruction. It is NOT RETRYABLE - the slot is gone and another call may already hold it, so the worker must stop the conversation rather than beat harder. Validation and internal failures answer invalid_request and phone_heartbeat_error on 400/500 respectively; neither is part of this enum, and neither is a renewal. An UNRECOGNISED status from the RPC takes the 500 path rather than being folded into lease_lost, so a word this build does not know stays retryable instead of terminating a live call.
+        next_heartbeat_seconds:
+          type: integer
+          minimum: 1
+          description: When to beat next, in seconds - a third of the configured lease. Present ONLY with status ok, and deliberately ABSENT on lease_lost so a worker cannot keep beating on a lease it no longer holds. The SERVER owns this number so the lease length stays a server-side knob and a worker cannot drift off it.
+      additionalProperties: false
+      description: NO LEASE TOKEN AND NO ABSOLUTE EXPIRY ARE EVER RETURNED. The body is built key by key from the three properties above, so whatever a future migration adds to heartbeat_phone_attempt_by_epoch's answer does not reach the worker - and therefore does not reach a language model, dispatch metadata or a log line - until the route changes on purpose.
+
     InviteCreateResponse:
       type: object
       required: [token, expires_at]
@@ -7896,7 +7985,7 @@ components:
           type: string
           enum: [ok, degraded, disabled]
         reasons:
-          description: Stable codes only — phone_screening_disabled, backlog_unavailable, halt_unreadable, admission_halted, attempt_leases_expired, fleet_at_capacity, appointments_overdue, phone_runtime_stopped, phone_loop_stale, phone_loop_erroring, phone_due_halted, phone_sweep_not_ok.
+          description: Stable codes only — phone_screening_disabled, backlog_unavailable, halt_unreadable, admission_halted, attempt_leases_expired, fleet_at_capacity, appointments_overdue, phone_runtime_stopped, phone_loop_stale, phone_loop_erroring, phone_due_halted, phone_sweep_not_ok, phone_runtime_start_failed.
           type: array
           items:
             type: string
@@ -7938,7 +8027,7 @@ components:
     PhoneRuntimeState:
       description: PROCESS-LOCAL view of the phone runtime loops. Describes the loops running in THIS api process and nothing else; on a multi-process deployment each replica answers for itself, so enabled false means this process is not running the loops, never that the fleet is idle. Aggregates only - counts, stable status and skip/refusal codes, and loop names. No engagement id, candidate id, attempt id, phone number, provider payload or lease token appears anywhere in this object.
       type: object
-      required: [enabled, running, loops, last_due, config, dial_jobs, last_reclaimed, last_expired, last_reconciled, sweeps_not_ok]
+      required: [enabled, running, loops, last_due, config, dial_jobs, last_reclaimed, last_expired, last_reconciled, last_rolled, last_stranded, sweeps_not_ok, start_failed]
       properties:
         enabled:
           description: Whether this process constructed and registered a runtime. False is the shipped default and is not a fault.
@@ -7972,14 +8061,25 @@ components:
           type: integer
           nullable: true
         last_reconciled:
-          description: Events posted by the most recent dropped-webhook reconciliation. Null only when no reconciliation has run in this process; this sweep reports a count rather than an RPC status, so it never appears in sweeps_not_ok.
+          description: Recovery events SUBMITTED by the most recent dropped-webhook reconciliation - incremented once per applyEvent CALL. It is NOT a count of recoveries that landed - the outcomes array carrying classifyApplyResult, which is what says whether the ledger applied or ignored each event, is discarded at this seam - and an operator must not read it as the latter. Null when no reconciliation has run in this process, and ALSO null when the most recent run did not answer ok, on exactly the same terms as last_reclaimed and last_expired: runPhoneReconciliation answers status disabled with posted 0 whenever the master switch is off or LiveKit credentials are unprovisioned, and reading the count alone published last_reconciled 0 with no degrade reason for a sweep that WAS NOT RUNNING. This sweep names reconcile in sweeps_not_ok exactly like the others, and it matters more here than for any of them, because this sweep IS the dropped-webhook recovery: with it silently off, an attempt whose webhook never arrives is invisible until its lease lapses.
+          type: integer
+          nullable: true
+        last_rolled:
+          description: 0045. Engagements moved onto a NEW IST day by the most recent day-roll pass. Transition #27 is the only edge out of awaiting_retry and nothing had ever posted day.rolled, so the FIRST unanswered call ended the no-answer ladder and the contract's "three attempts on three distinct IST dates" was unreachable; this count is that driver's evidence. Null on the same two terms as last_reclaimed - no pass yet in this process, or a most-recent pass whose RPC status was not ok - so a 0 means "rolled nothing today", never "the pass did not happen". sweeps_not_ok names dayroll when it is the latter.
+          type: integer
+          nullable: true
+        last_stranded:
+          description: 0045. Stranded engagements RESOLVED by the most recent pass - completed PLUS truthfully failed, summed, because both are resolutions and the operator's question is how many stopped being stranded, not which way they went. A stranded engagement is one still pointing at an already-ended session: ensureSession finds a terminal session, refuses, and the row is skipped no_session on every pass for ever, which is how a conducted and SCORED screening goes missing. The attempt heartbeat removes the common cause; this pass removes the residue, and it redials nobody. Null on the same two terms as last_reclaimed, with sweeps_not_ok naming stranded.
           type: integer
           nullable: true
         sweeps_not_ok:
-          description: Names of the sweeps whose most recent run did NOT answer ok, as stable codes and sorted. Empty is the healthy state. A count of 0 on a sweep that is NOT named here means "ran, nothing to do", which is a different fact from "the sweep did not happen"; only this array distinguishes them. Non-empty contributes the phone_sweep_not_ok degradation reason.
+          description: Names of the sweeps whose most recent run did NOT answer ok, as stable codes and sorted. The vocabulary is FIVE names - reclaim, expire, reconcile, dayroll, stranded. Empty is the healthy state. A count of 0 on a sweep that is NOT named here means "ran, nothing to do", which is a different fact from "the sweep did not happen"; only this array distinguishes them, which is why every one of the five nulls its count and names itself here on a non-ok status rather than publishing a quiet zero. Non-empty contributes the phone_sweep_not_ok degradation reason.
           type: array
           items:
             type: string
+        start_failed:
+          description: Whether createPhoneRuntime THREW in this process. The ONE field that separates "this process was deliberately not armed" from "arming it FAILED" - the composition root catches the throw, logs phone_runtime_start_failed and leaves phoneRuntime null, so a broken replica and a deliberately-disabled one both report enabled false and the fault was invisible on the surface whose most important question is health truth. A BOOLEAN ONLY, deliberately: it carries nothing about WHY, because the reason stays in the sanitized startup log and a health surface is not where a configuration error gets rendered. True contributes the phone_runtime_start_failed degradation reason - the only reason a disabled process contributes at all, since enabled false is the shipped default and marking every healthy deployment degraded would make the surface useless. Always false when enabled is true, a registered runtime being proof that construction succeeded.
+          type: boolean
       additionalProperties: false
 
     PhoneRuntimeLoopState:
@@ -8024,6 +8124,7 @@ components:
           additionalProperties:
             type: integer
         refusals:
+          description: Stable dial-controller refusal codes, counted. One code is EXPANDED and the rest are not - admission_refused is re-keyed as admission_refused:<detail>, because window_closed, at_capacity, daily_attempt_exists, consent_missing, suppressed, phone_invalid, halt_unreadable and ingestion_not_ready all arrive under that single code with the distinguishing answer in detail, and collapsed they are one number that cannot tell "the lane is working and today's quota is spent" from "consent is broken and nobody is being called". The detail vocabulary is CLOSED - ADMIT_PHONE_ATTEMPT_STATUSES minus ok, plus ok_without_attempt, the code the controller mints itself when admission answers ok WITHOUT the identifiers that make the attempt addressable. An unrecognised detail collapses to admission_refused:unknown and is NEVER interpolated raw: this object is published, so a built key fed by whatever a future edit of the dial controller - or a provider error laundered through it - happened to put in detail would turn a counter map into a disclosure channel. Every other refusal is already distinct on its own and grows no suffix. Left as a free-form integer map rather than a key pattern because the closure is asserted in code, where it is enforced rather than described.
           type: object
           additionalProperties:
             type: integer

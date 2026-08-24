@@ -113,10 +113,54 @@ export interface HeartbeatPhoneAttemptResult {
   readonly leaseExpiresAt?: string;
 }
 
+/**
+ * The epoch-fenced renewal, for the worker that CONDUCTS the conversation.
+ *
+ * Deliberately has no `leaseToken` field, and never will. The conversation
+ * runs in the LiveKit agent, not in the process that admitted the attempt, so
+ * a token-fenced renewal would mean shipping the token to the agent — onto
+ * dispatch metadata and into every log line that ever printed a request body.
+ * The worker names an attempt and an epoch; the database looks up the token.
+ */
+export interface HeartbeatPhoneAttemptByEpochInput {
+  readonly attemptId: string;
+  readonly epoch: number;
+  /**
+   * Part of the FENCE, not context. The RPC matches it against the attempt's
+   * own `session_id`, so a caller must prove it is in the conversation whose
+   * fleet slot it is holding open. An earlier draft required this field at the
+   * route and then discarded it, which is worse than not having it: a field
+   * that reads like a binding check and binds nothing stops reviewers looking.
+   */
+  readonly sessionId: string;
+  readonly leaseSeconds?: number;
+  readonly now: Date;
+}
+
 export interface ReclaimPhoneAttemptLeasesResult {
   readonly status: OrUnknown<ReclaimPhoneAttemptLeasesStatus>;
   readonly reclaimed?: number;
   readonly limit?: number;
+}
+
+export interface SweepPhoneDayRolledResult {
+  readonly status: OrUnknown<'ok'>;
+  readonly examined?: number;
+  readonly rolled?: number;
+  readonly skipped?: number;
+}
+
+export interface SweepPhoneStrandedSessionsResult {
+  readonly status: OrUnknown<'ok'>;
+  readonly examined?: number;
+  readonly completed?: number;
+  readonly failed?: number;
+  readonly skipped?: number;
+}
+
+export interface ClaimPhoneSweepResult {
+  readonly status: OrUnknown<'ok' | 'held_by_other' | 'invalid_input'>;
+  readonly expiresAt?: string;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -428,6 +472,31 @@ export interface CommitPhoneQuestionBoundaryResult {
 export interface PhoneStores {
   admitAttempt(input: AdmitPhoneAttemptInput): Promise<AdmitPhoneAttemptResult>;
   heartbeatAttempt(input: HeartbeatPhoneAttemptInput): Promise<HeartbeatPhoneAttemptResult>;
+
+  /** 0045. The epoch-fenced renewal; see `HeartbeatPhoneAttemptByEpochInput`. */
+  heartbeatAttemptByEpoch(
+    input: HeartbeatPhoneAttemptByEpochInput,
+  ): Promise<HeartbeatPhoneAttemptResult>;
+
+  /** 0045. Drives transition #27 — the no-answer ladder's day boundary. */
+  sweepDayRolled(input: {
+    readonly limit?: number;
+    readonly now: Date;
+  }): Promise<SweepPhoneDayRolledResult>;
+
+  /** 0045. Resolves engagements left pointing at an already-ended session. */
+  sweepStrandedSessions(input: {
+    readonly limit?: number;
+    readonly now: Date;
+  }): Promise<SweepPhoneStrandedSessionsResult>;
+
+  /** 0045. Bounded leader CLAIM — not an election. See the migration. */
+  claimSweep(input: {
+    readonly sweep: string;
+    readonly owner: string;
+    readonly ttlSeconds?: number;
+    readonly now: Date;
+  }): Promise<ClaimPhoneSweepResult>;
   reclaimAttemptLeases(input: {
     limit?: number;
     now: Date;

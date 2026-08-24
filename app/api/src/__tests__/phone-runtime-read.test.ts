@@ -115,6 +115,24 @@ function fakeClient(responses: Readonly<Record<string, FakeResponse | FakeRespon
       expect(hits.length, `expected exactly one read of ${table}`).toBe(1);
       return hits[0];
     },
+    /**
+     * Every recorded read of a table, in issue order.
+     *
+     * `listDueEngagements` issues TWO reads of `phone_engagements` — the
+     * reconnect batch and then the main batch (M-3) — so `only()` is not the
+     * right assertion for that table any more. It stays for the tables that
+     * really are read once, and the due assertions below name the count
+     * explicitly instead, in both directions.
+     */
+    all(table: string): RecordedQuery[] {
+      return queries.filter((q) => q.table === table);
+    },
+    /** The two due reads, asserted to be exactly two, reconnect batch first. */
+    dueQueries(): { reconnects: RecordedQuery; main: RecordedQuery; both: RecordedQuery[] } {
+      const hits = queries.filter((q) => q.table === 'phone_engagements');
+      expect(hits.length, 'expected exactly two reads of phone_engagements').toBe(2);
+      return { reconnects: hits[0], main: hits[1], both: hits };
+    },
   };
 }
 
@@ -205,36 +223,53 @@ const GOOD_DUE_ROW = {
 // ════════════════════════════════════════════════════════════════════
 
 describe('A. listDueEngagements — the query it actually issues', () => {
-  it('A1: reads phone_engagements by explicit column list, non-terminal, in the three due states, oldest first, bounded', async () => {
+  it('A1: BOTH due reads share the column list, the terminal filter, the ordering and the bound — only the state filter differs', async () => {
     const fake = fakeClient({ phone_engagements: { data: [GOOD_DUE_ROW] } });
     await createPhoneRuntimeReader(fake.client).listDueEngagements({ nowIso: NOW_ISO, limit: 3 });
 
-    const q = fake.only('phone_engagements');
+    const { reconnects, main, both } = fake.dueQueries();
 
-    // The declared list, spelled out. Not `*`: a star would silently start
-    // fetching every future column of a table that holds candidate-linked
-    // scheduling state.
-    expect(q.columns).toBe(
-      'id,state,candidate_id,role_id,session_id,next_eligible_at,no_answer_attempts,updated_at',
-    );
-    expect(q.columns).not.toContain('*');
-    // And the number is NOT among them — this read decides candidacy only.
-    expect(q.columns).not.toContain('phone_e164');
+    for (const q of both) {
+      // The declared list, spelled out. Not `*`: a star would silently start
+      // fetching every future column of a table that holds candidate-linked
+      // scheduling state.
+      expect(q.columns).toBe(
+        'id,state,candidate_id,role_id,session_id,next_eligible_at,no_answer_attempts,updated_at',
+      );
+      expect(q.columns).not.toContain('*');
+      // And the number is NOT among them — this read decides candidacy only.
+      expect(q.columns).not.toContain('phone_e164');
 
-    // `terminal_at is null`: a finished engagement is never due again.
-    expect(argsOf(q, 'is')).toEqual(['terminal_at', null]);
+      // `terminal_at is null`: a finished engagement is never due again.
+      expect(argsOf(q, 'is')).toEqual(['terminal_at', null]);
 
-    // Exactly the three due states — `dialing` and `in_call` are absent
-    // deliberately: a live conversation is not due for another one.
-    const inArgs = argsOf(q, 'in');
+      expect(argsOf(q, 'order')).toEqual(['updated_at', { ascending: true }]);
+      // BOTH batches are bounded. An unbounded reconnect read would be a
+      // second, uncapped way into the same table.
+      expect(argsOf(q, 'limit')).toEqual([3]);
+    }
+
+    // ── THE PRIORITY READ COMES FIRST AND IS NARROWED TO ONE STATE ────
+    // M-3. `updated_at asc` sorts a row that JUST entered `reconnecting`
+    // LAST, behind any three eligible rows, so the one due row with a human
+    // on the line had the lowest priority in the system. The fix is a second
+    // bounded read merged AHEAD, and the order of issue is what makes it a
+    // priority rather than a duplicate.
+    expect(argsOf(reconnects, 'eq')).toEqual(['state', 'reconnecting']);
+    expect(argsOf(reconnects, 'in'), 'the reconnect batch must not widen to every due state')
+      .toBeUndefined();
+
+    // Exactly the three due states on the MAIN batch — `dialing` and
+    // `in_call` are absent deliberately: a live conversation is not due for
+    // another one.
+    const inArgs = argsOf(main, 'in');
     expect(inArgs?.[0]).toBe('state');
     expect(inArgs?.[1]).toEqual(['eligible', 'reconnecting', 'scheduled']);
+    expect(argsOf(main, 'eq'), 'the main batch must not be narrowed to one state')
+      .toBeUndefined();
     // ...and the exported constant is that same set, so the assertion above
     // cannot drift away from the code by editing only one of them.
     expect([...PHONE_DUE_STATES]).toEqual(['eligible', 'reconnecting', 'scheduled']);
-
-    expect(argsOf(q, 'order')).toEqual(['updated_at', { ascending: true }]);
-    expect(argsOf(q, 'limit')).toEqual([3]);
   });
 
   it('A2: THE CLOCK PREDICATE — one `or` carrying all three disjuncts, including the exact nowIso passed in', async () => {
@@ -261,25 +296,35 @@ describe('A. listDueEngagements — the query it actually issues', () => {
     const fake = fakeClient({ phone_engagements: { data: [] } });
     await createPhoneRuntimeReader(fake.client).listDueEngagements({ nowIso: NOW_ISO, limit: 3 });
 
-    const orArgs = argsOf(fake.only('phone_engagements'), 'or');
-    expect(orArgs, 'no `.or()` clock predicate was applied at all').toBeDefined();
-    const predicate = String(orArgs?.[0]);
+    const { both } = fake.dueQueries();
+    const predicates = both.map((q) => {
+      const orArgs = argsOf(q, 'or');
+      expect(orArgs, 'no `.or()` clock predicate was applied at all').toBeDefined();
+      return String(orArgs?.[0]);
+    });
 
-    expect(predicate).toContain('state.eq.reconnecting');
-    expect(predicate).toContain('next_eligible_at.is.null');
-    expect(predicate).toContain(`next_eligible_at.lte.${NOW_ISO}`);
-    // The exact instant the caller passed, not a re-derived one: a reader that
-    // called `new Date()` itself would drift from the clock the rest of the
-    // pass reasons with.
-    expect(predicate).toContain(NOW_ISO);
+    for (const predicate of predicates) {
+      expect(predicate).toContain('state.eq.reconnecting');
+      expect(predicate).toContain('next_eligible_at.is.null');
+      expect(predicate).toContain(`next_eligible_at.lte.${NOW_ISO}`);
+      // The exact instant the caller passed, not a re-derived one: a reader
+      // that called `new Date()` itself would drift from the clock the rest
+      // of the pass reasons with.
+      expect(predicate).toContain(NOW_ISO);
+    }
+    // ONE predicate, not two copies that can drift. M-3 added the second read;
+    // the clock rule was FACTORED rather than repeated, and this is the
+    // assertion that keeps it factored.
+    expect(predicates[0]).toBe(predicates[1]);
   });
 
   it('A2b: a different nowIso produces a different predicate — the timestamp is not baked in', async () => {
     const other = '2026-01-01T00:00:00.000Z';
     const fake = fakeClient({ phone_engagements: { data: [] } });
     await createPhoneRuntimeReader(fake.client).listDueEngagements({ nowIso: other, limit: 1 });
-    expect(String(argsOf(fake.only('phone_engagements'), 'or')?.[0]))
-      .toContain(`next_eligible_at.lte.${other}`);
+    for (const q of fake.dueQueries().both) {
+      expect(String(argsOf(q, 'or')?.[0])).toContain(`next_eligible_at.lte.${other}`);
+    }
   });
 
   it('A3: the limit handed to `.limit()` is BOUNDED whatever the caller asks for', async () => {
@@ -297,12 +342,17 @@ describe('A. listDueEngagements — the query it actually issues', () => {
     for (const { asked, expected, why } of cases) {
       const fake = fakeClient({ phone_engagements: { data: [] } });
       await createPhoneRuntimeReader(fake.client).listDueEngagements({ nowIso: NOW_ISO, limit: asked });
-      const applied = argsOf(fake.only('phone_engagements'), 'limit')?.[0];
-      expect(applied, why).toBe(expected);
-      // Whatever the case, the value that reaches the driver is a sane integer.
-      expect(Number.isInteger(applied)).toBe(true);
-      expect(applied as number).toBeGreaterThanOrEqual(1);
-      expect(applied as number).toBeLessThanOrEqual(PHONE_RUNTIME_MAX_ROWS);
+      // BOTH reads are bounded by the SAME clamped value — a reconnect batch
+      // that took the caller's raw number would be an unbounded second read
+      // of the same table.
+      for (const q of fake.dueQueries().both) {
+        const applied = argsOf(q, 'limit')?.[0];
+        expect(applied, why).toBe(expected);
+        // Whatever the case, the value that reaches the driver is a sane integer.
+        expect(Number.isInteger(applied)).toBe(true);
+        expect(applied as number).toBeGreaterThanOrEqual(1);
+        expect(applied as number).toBeLessThanOrEqual(PHONE_RUNTIME_MAX_ROWS);
+      }
       expect(boundedRowLimit(asked)).toBe(expected);
     }
   });
@@ -404,6 +454,114 @@ describe('A. listDueEngagements — the query it actually issues', () => {
     await expect(
       createPhoneRuntimeReader(fake.client).listDueEngagements({ nowIso: NOW_ISO, limit: 3 }),
     ).resolves.toEqual([]);
+  });
+
+  // ── M-3: RECONNECTS ARE NOT STARVED BY THE ORDERING ─────────────────
+  //
+  // `updated_at asc` over a batch of three is the right order for the
+  // no-answer ladder and the WORST possible order for a reconnect: a row
+  // entering `reconnecting` was just written by `apply_phone_event`, so it
+  // carries the newest timestamp in the due set and sorts LAST — behind every
+  // eligible row still waiting to be dialled. A reconnect is the one due row
+  // with a human already on the line. The three tests below fail if the
+  // priority read is removed, if the merge order is reversed, if the dedupe
+  // is dropped, or if the merged batch stops being bounded.
+  //
+  // The fake answers the two reads from an ARRAY, in issue order: entry 0 is
+  // the reconnect batch, entry 1 the main batch.
+
+  const RECONNECT_ROW = {
+    id: 'e-reconnect',
+    state: 'reconnecting',
+    candidate_id: 'c-reconnect',
+    role_id: null,
+    session_id: 's-reconnect',
+    next_eligible_at: null,
+    no_answer_attempts: 0,
+    // The NEWEST timestamp in the set — which is exactly why `updated_at asc`
+    // alone puts it last.
+    updated_at: '2026-08-24T03:29:59.000Z',
+  };
+
+  const eligibleRow = (n: number) => ({
+    id: `e-old-${n}`,
+    state: 'eligible',
+    candidate_id: `c-old-${n}`,
+    role_id: null,
+    session_id: null,
+    next_eligible_at: null,
+    no_answer_attempts: 0,
+    updated_at: `2026-08-20T0${n}:00:00.000Z`,
+  });
+
+  it('A6: a reconnect is merged AHEAD of a full batch of older eligible rows', async () => {
+    const fake = fakeClient({
+      phone_engagements: [
+        { data: [RECONNECT_ROW] },
+        // A morning backlog: three eligible rows, every one of them older, so
+        // a single `updated_at asc` read bounded at 3 would return exactly
+        // these and the reconnect would never be seen.
+        { data: [eligibleRow(1), eligibleRow(2), eligibleRow(3)] },
+      ],
+    });
+
+    const out = await createPhoneRuntimeReader(fake.client)
+      .listDueEngagements({ nowIso: NOW_ISO, limit: 3 });
+
+    // TWO reads, and the reconnect one is issued first.
+    expect(argsOf(fake.dueQueries().reconnects, 'eq')).toEqual(['state', 'reconnecting']);
+    // The reconnect is FIRST, and the batch is still three rows.
+    expect(out.map((e) => e.engagementId)).toEqual(['e-reconnect', 'e-old-1', 'e-old-2']);
+    expect(out[0].state).toBe('reconnecting');
+    // ...and the row that fell off the end is the OLDEST-priority one, not
+    // the reconnect.
+    expect(out.map((e) => e.engagementId)).not.toContain('e-old-3');
+  });
+
+  it('A7: a reconnect returned by BOTH reads is offered once, not twice', async () => {
+    // The main read selects all three due states, so a reconnect appears in
+    // both batches. Without the dedupe one reconnect would occupy two of the
+    // three slots and be offered twice in a single pass — two admissions, and
+    // one phone ringing off the back of one row.
+    const fake = fakeClient({
+      phone_engagements: [
+        { data: [RECONNECT_ROW] },
+        { data: [eligibleRow(1), RECONNECT_ROW] },
+      ],
+    });
+
+    const out = await createPhoneRuntimeReader(fake.client)
+      .listDueEngagements({ nowIso: NOW_ISO, limit: 3 });
+
+    expect(out.map((e) => e.engagementId)).toEqual(['e-reconnect', 'e-old-1']);
+    expect(out.filter((e) => e.engagementId === 'e-reconnect')).toHaveLength(1);
+  });
+
+  it('A8: the MERGED batch is bounded by the caller\'s limit, never by twice it', async () => {
+    // Two bounded reads must not compose into an unbounded batch: the fleet
+    // cap is ten and every row here is a call to a person.
+    const fake = fakeClient({
+      phone_engagements: [
+        {
+          data: [
+            { ...RECONNECT_ROW, id: 'e-r1', candidate_id: 'c-r1' },
+            { ...RECONNECT_ROW, id: 'e-r2', candidate_id: 'c-r2' },
+            { ...RECONNECT_ROW, id: 'e-r3', candidate_id: 'c-r3' },
+          ],
+        },
+        { data: [eligibleRow(1), eligibleRow(2), eligibleRow(3)] },
+      ],
+    });
+
+    const out = await createPhoneRuntimeReader(fake.client)
+      .listDueEngagements({ nowIso: NOW_ISO, limit: 3 });
+
+    expect(out).toHaveLength(3);
+    expect(out.map((e) => e.engagementId)).toEqual(['e-r1', 'e-r2', 'e-r3']);
+    // A batch of reconnects fills the batch. That is the intended priority,
+    // not an accident: nobody eligible is dialled while three people are
+    // waiting on a dropped line.
+    expect(out.every((e) => e.state === 'reconnecting')).toBe(true);
   });
 });
 
@@ -879,10 +1037,17 @@ describe('CONTROLS — the harness itself', () => {
     await reader.listDueEngagements({ nowIso: NOW_ISO, limit: 3 });
     await reader.listDialableNumbers({ candidateIds: ['c-good'] });
 
-    expect(fake.queries.map((q) => q.table)).toEqual(['phone_engagements', 'candidates']);
-    expect(fake.queries[0].calls.map((c) => c.op)).toEqual(['is', 'in', 'or', 'order', 'limit']);
-    expect(fake.queries[1].calls.map((c) => c.op)).toEqual(['in', 'limit']);
-    expect(fake.fromCalls()).toBe(2);
+    // Three queries, because the due read is TWO reads (M-3: the reconnect
+    // priority batch, then the main batch) followed by the number read.
+    expect(fake.queries.map((q) => q.table))
+      .toEqual(['phone_engagements', 'phone_engagements', 'candidates']);
+    // The reconnect batch narrows with `eq`; the main batch widens with `in`.
+    // Everything else about the two is identical, which is the shape the
+    // factored builder is supposed to produce.
+    expect(fake.queries[0].calls.map((c) => c.op)).toEqual(['is', 'eq', 'or', 'order', 'limit']);
+    expect(fake.queries[1].calls.map((c) => c.op)).toEqual(['is', 'in', 'or', 'order', 'limit']);
+    expect(fake.queries[2].calls.map((c) => c.op)).toEqual(['in', 'limit']);
+    expect(fake.fromCalls()).toBe(3);
   });
 
   it('CONTROL: `renderings` would actually catch a leaked payload', async () => {

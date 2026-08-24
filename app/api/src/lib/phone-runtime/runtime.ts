@@ -8,7 +8,12 @@
  * claim of this phase, and it is a property of construction rather than of a
  * branch somewhere inside a loop.
  *
- * ── FOUR LOOPS, AND WHY EACH ONE IS LOAD-BEARING ──────────────────────
+ * ── THE LOOPS, AND WHY EACH ONE IS LOAD-BEARING ───────────────────────
+ * The set is deliberately open: `scheduler.loops` is a plain array and
+ * `loopIntervalsMs` is derived from it, so a new loop is one entry plus one
+ * cadence knob. No count is written down here or anywhere in the package;
+ * the only place the CURRENT set is pinned is `LOOP_NAMES` in
+ * `phone-runtime-loops.test.ts`, which is one edit.
  *   phone-dial       drains the durable `phone.dial` intent that
  *                    `admit_phone_attempt` records inside the admitting
  *                    transaction. It does not dial — see `dial-handler.ts` for
@@ -51,7 +56,12 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { Queue } from '../queue/index.js';
 import { PgAdapter } from '../queue/pg-adapter.js';
 import { createQueueRunner, type QueueRunnerHandle } from '../queue/runner.js';
-import { createLoopScheduler, queueRunnerTick, type LoopSchedulerHandle } from '../scheduler.js';
+import {
+  createLoopScheduler,
+  queueRunnerTick,
+  type LoopSchedulerHandle,
+  type SchedulerLoopConfig,
+} from '../scheduler.js';
 import { createLogger } from '../logger.js';
 import { supabase } from '../supabase.js';
 import { createSession, transitionSession } from '../session-lifecycle.js';
@@ -115,6 +125,10 @@ export interface PhoneRuntimeSnapshot {
   readonly lastReclaimed: number | null;
   readonly lastExpired: number | null;
   readonly lastReconciled: number | null;
+  /** 0045. Engagements rolled onto a new IST day by the last day-roll pass. */
+  readonly lastRolled: number | null;
+  /** 0045. Stranded engagements resolved — completed plus truthfully failed. */
+  readonly lastStranded: number | null;
   /**
    * Sweeps whose LAST run answered with a non-`ok` RPC status, by name.
    *
@@ -252,6 +266,32 @@ export function createPhoneSessionPort(
   };
 }
 
+/**
+ * The `didWork` answer of a loop whose INTERVAL IS A CORRECTNESS BOUND rather
+ * than a preference.
+ *
+ * ── WHY NOT `intervalMsFor`, WHICH IS THE OBVIOUS SEAM ────────────────
+ * `SchedulerLoopConfig.intervalMsFor` exists and is real, but it was read
+ * before it was relied on, and it does NOT do this job. It replaces the BASE
+ * handed to `nextPollDelayMs(base, idle, random)`; the idle exponent is then
+ * applied to whatever it returned, so a loop that must not drift cannot be
+ * pinned by it without re-deriving the scheduler's own idle bookkeeping out
+ * here — a second copy of a rule that lives one module away, which is the
+ * pattern this package spends most of its comments avoiding.
+ *
+ * `didWork` is the input the scheduler ACTUALLY consults when it decides
+ * whether to back off, so that is the input these two loops answer. It means
+ * "hold the base cadence", and the delay becomes
+ * `nextPollDelayMs(base, 0, random)` = `base · [0.5, 1.0)` — bounded ABOVE by
+ * the loop's own configured interval, which is the property both bounds below
+ * are stated in terms of and `phone-runtime-loops.test.ts` measures.
+ *
+ * It does NOT suppress ERROR backoff: a throwing tick never reaches this
+ * value, `didWork` stays false, and the loop backs off as before. A broken
+ * sweep must not hot-spin.
+ */
+const HOLD_BASE_CADENCE = true;
+
 export function createPhoneRuntime(
   options: PhoneRuntimeOptions = {},
 ): PhoneRuntimeHandle | null {
@@ -277,7 +317,44 @@ export function createPhoneRuntime(
   // Whether the LAST run of each sweep answered with a non-`ok` status. Kept
   // apart from the counts because "swept, nothing to do" and "the sweep did
   // not happen" must reach the health surface as different answers.
-  const sweepNotOk: Record<string, boolean> = { reclaim: false, expire: false };
+  const sweepNotOk: Record<string, boolean> = {
+    reclaim: false, expire: false, reconcile: false, dayroll: false, stranded: false,
+  };
+  let lastRolled: number | null = null;
+  let lastStranded: number | null = null;
+
+  /**
+   * The bounded leader CLAIM in front of a fleet-wide sweep.
+   *
+   * Every replica runs every loop. For the DUE pass that is now harmless —
+   * admission is globally serialised and, since 0045, candidate-guarded, so a
+   * second replica's dial is REFUSED rather than duplicated. For a sweep it is
+   * merely wasteful, and the waste scales with the fleet.
+   *
+   * This is a claim, NOT an election: it can expire while its holder is still
+   * working, and then two replicas sweep at once. That is acceptable only
+   * because every sweep behind it is idempotent — the day roll dedups on an id
+   * scoped by engagement AND IST date, the stranded resolution dedups per
+   * session. It bounds duplication; it does not establish exclusivity, and
+   * nothing downstream may assume it does.
+   *
+   * Fails CLOSED: a claim we could not read is not a claim we hold.
+   */
+  const claimed = async (sweep: string): Promise<boolean> => {
+    try {
+      const result = await stores.claimSweep({
+        sweep,
+        owner,
+        // The TTL must outlive the pass it guards, or the claim lapses while
+        // its holder works and the bound it exists to provide is gone.
+        ttlSeconds: Math.max(5, Math.ceil((runtimeConfig.expireMs * 2) / 1000)),
+        now: new Date(),
+      });
+      return result.status === 'ok';
+    } catch {
+      return false;
+    }
+  };
 
   const credentials = {
     url: env.livekitUrl,
@@ -343,138 +420,256 @@ export function createPhoneRuntime(
 
   const sessions = createPhoneSessionPort(reader);
 
+  /**
+   * THE LOOP SET, in one array.
+   *
+   * `loopIntervalsMs` below is DERIVED from it rather than written out a
+   * second time. That is not tidiness: the reported cadence map and the armed
+   * cadence were once two literals, and a loop welded to the wrong knob was
+   * invisible to every name-level assertion. Deriving makes "the map says what
+   * the scheduler was armed with" true by construction, and makes adding a
+   * loop one entry rather than two edits that can disagree.
+   */
+  const loops: SchedulerLoopConfig[] = [
+    {
+      name: 'phone-dial',
+      intervalMs: runtimeConfig.dueMs,
+      tick: queueRunnerTick(runner),
+    },
+    {
+      name: 'phone-due',
+      intervalMs: runtimeConfig.dueMs,
+      tick: async () => {
+        const now = new Date();
+        const result = await runPhoneDuePass(
+          {
+            config,
+            reader,
+            stores,
+            sessions,
+            liveAppointmentStart: async (engagementId: string) => {
+              const appointment = await readStore.getLiveAppointmentForEngagement(engagementId);
+              return appointment?.startsAt ?? null;
+            },
+            dialer: {
+              dial: async (input) => {
+                if (roomClients === null) {
+                  // No room client means no room, and `provisionPhoneRoom`
+                  // would answer `not_configured` anyway. Refusing here
+                  // keeps the reason honest instead of laundering a missing
+                  // credential into a provider failure.
+                  return { status: 'refused', refusal: 'room_unavailable' };
+                }
+                // The ONLY selector. Live iff `isLiveDialPermitted` — which
+                // already requires both switches, `dialMode === 'live'`, a
+                // non-empty digest allowlist and a configured trunk. Every
+                // other configuration yields the synthetic client, which
+                // contains no SDK reference at all.
+                const sip = resolvePhoneSipClient(config, dialConfig, credentials, {});
+                const result = await dialPhoneAttempt(input, {
+                  config,
+                  dialConfig,
+                  stores,
+                  admission: { consentReader: reader.consent },
+                  sip: sip.client,
+                  room: roomClients,
+                  leaseOwner: owner,
+                });
+                // `detail` is carried, not dropped. It is admission's
+                // stable sub-code, and dropping it here is precisely how
+                // eight distinct answers — `window_closed`, `at_capacity`,
+                // `daily_attempt_exists`, `consent_missing`, `suppressed`,
+                // `phone_invalid`, `halt_unreadable`,
+                // `ingestion_not_ready` — used to arrive at the health
+                // surface as one number. The due pass closes the vocabulary
+                // before it counts it; see `phoneRefusalCountKey`.
+                return result.refusal === undefined
+                  ? { status: result.status }
+                  : { status: result.status, refusal: result.refusal, detail: result.detail };
+              },
+            },
+          },
+          { now, limit: runtimeConfig.dueLimit },
+        );
+        lastDue = result;
+        // ── M-4: THE RECONNECT BOUND IS THIS LOOP'S CADENCE ─────────
+        // `return result.dialing > 0` let a pass that dialled nothing back
+        // off toward the 60s ceiling. A dropped call becomes due
+        // `reconnectBackoffSeconds` (120s) after the drop, so the pass that
+        // would act on it then waited 120s PLUS up to a fully backed-off
+        // due interval: the contract's "bounded reconnect approximately 120
+        // seconds" was bounded by nothing the code stated. Held at the base
+        // cadence the bound is `reconnectBackoffSeconds + dueMs`, which is
+        // a number this file can state and a test can measure.
+        //
+        // THE ALTERNATIVE, AND WHY IT WAS NOT CHOSEN. The other repair on
+        // offer was to return the base cadence only while some engagement
+        // is `reconnecting`. It cannot work, because this loop learns that
+        // a row is `reconnecting` only by RUNNING a pass — and the pass
+        // that is late is the FIRST one after the drop, whose delay was
+        // chosen by the previous pass, which saw nothing. The condition
+        // becomes true exactly one pass after it would have helped. It also
+        // costs a `PhoneDueResult` field that would exist only to feed a
+        // scheduling decision, and reads as a bound while guaranteeing
+        // none.
+        //
+        // The cost is one bounded `limit`-sized indexed read per `dueMs`
+        // while the lane is idle. That is the cheapest read in the package
+        // and the only one a person is waiting on.
+        return HOLD_BASE_CADENCE;
+      },
+    },
+    {
+      name: 'phone-reclaim',
+      intervalMs: runtimeConfig.reclaimMs,
+      tick: async () => {
+        const result = await stores.reclaimAttemptLeases({
+          limit: runtimeConfig.reclaimLimit,
+          now: new Date(),
+        });
+        // The STATUS decides, not the count. `?? 0` alone would collapse
+        // "the RPC did not answer with a count" into "nothing needed
+        // doing" — and those are opposite operational facts. A sweep that
+        // silently stopped running lets expired attempt leases accumulate,
+        // each holding one of the ten fleet slots, until admission answers
+        // `at_capacity` for every candidate: the exact failure 0042 says
+        // this loop exists to prevent. `null` means we do not know.
+        sweepNotOk.reclaim = result.status !== 'ok';
+        lastReclaimed = result.status === 'ok' ? (result.reclaimed ?? 0) : null;
+        // ── M-2: THE CADENCE IS THE CORRECTNESS BOUND ───────────────
+        // `return (lastReclaimed ?? 0) > 0` was an idle signal, and the
+        // steady state of this sweep is reclaiming nothing — so it settled
+        // at the scheduler's 60s ceiling while `config.ts` claimed a 30s
+        // sweep saw a lapsed lease within half a lease-lifetime. It did
+        // not: a lapsed lease could go unreclaimed for a FULL
+        // lease-lifetime. Held at the base cadence the claim is true again,
+        // and it is asserted against the scheduler's observed interval
+        // rather than against another config constant.
+        return HOLD_BASE_CADENCE;
+      },
+    },
+    {
+      name: 'phone-maintain',
+      intervalMs: runtimeConfig.expireMs,
+      tick: async () => {
+        const expired = await stores.expireAppointments({
+          limit: runtimeConfig.reclaimLimit,
+          now: new Date(),
+        });
+        sweepNotOk.expire = expired.status !== 'ok';
+        lastExpired = expired.status === 'ok' ? (expired.expired ?? 0) : null;
+        return (lastExpired ?? 0) > 0;
+      },
+    },
+    {
+      // The dropped-webhook sweep, on its OWN loop and its own knob.
+      //
+      // It was briefly welded into `phone-maintain`, which made
+      // `PHONE_RUNTIME_RECONCILE_MS` a knob that parsed, clamped, appeared
+      // in `.env.example` and the environment schema — and changed nothing,
+      // because the sweep ran at `expireMs`. A configuration value that
+      // cannot move anything is worse than an absent one: an operator
+      // turning it during an incident would believe they had acted.
+      //
+      // They are also genuinely different jobs. Expiring an appointment is
+      // a cheap local UPDATE; reconciling reads LiveKit room state for
+      // every live attempt, so it wants a slower cadence by default
+      // (60s against 120s) and its own dial when a provider is flapping.
+      name: 'phone-dayroll',
+      intervalMs: runtimeConfig.expireMs,
+      tick: async () => {
+        // ── 0045: THE NO-ANSWER LADDER'S DAY BOUNDARY ────────────────
+        // Transition #27 is the ONLY edge out of `awaiting_retry`, and
+        // nothing in this repository had ever posted `day.rolled` — so the
+        // FIRST unanswered call ended the ladder and the contract's "three
+        // attempts on three distinct IST dates" was unreachable. This is
+        // the driver 0042's header assigned to P5 and P5 did not ship.
+        //
+        // It runs on the EXPIRE cadence rather than a knob of its own: a
+        // day boundary moves once a day, so anything under an hour is
+        // already far more often than the thing it watches for.
+        if (!(await claimed('dayroll'))) return HOLD_BASE_CADENCE;
+        const rolled = await stores.sweepDayRolled({
+          limit: runtimeConfig.reclaimLimit,
+          now: new Date(),
+        });
+        sweepNotOk.dayroll = rolled.status !== 'ok';
+        lastRolled = rolled.status === 'ok' ? (rolled.rolled ?? 0) : null;
+        return HOLD_BASE_CADENCE;
+      },
+    },
+    {
+      name: 'phone-stranded',
+      intervalMs: runtimeConfig.expireMs,
+      tick: async () => {
+        // ── 0045: ENGAGEMENTS POINTING AT AN ALREADY-ENDED SESSION ───
+        // A screening that was conducted and SCORED, whose engagement was
+        // moved out of `in_call` before the completion arrived, is
+        // stranded: `ensureSession` finds a terminal session, refuses, and
+        // the row is skipped `no_session` on every pass for ever. The
+        // heartbeat removes the common cause; this removes the residue,
+        // and it does so WITHOUT redialling anybody.
+        if (!(await claimed('stranded'))) return HOLD_BASE_CADENCE;
+        const resolved = await stores.sweepStrandedSessions({
+          limit: runtimeConfig.reclaimLimit,
+          now: new Date(),
+        });
+        sweepNotOk.stranded = resolved.status !== 'ok';
+        lastStranded = resolved.status === 'ok'
+          ? (resolved.completed ?? 0) + (resolved.failed ?? 0)
+          : null;
+        return HOLD_BASE_CADENCE;
+      },
+    },
+    {
+      name: 'phone-reconcile',
+      intervalMs: runtimeConfig.reconcileMs,
+      tick: async () => {
+        // Gated on the MASTER switch inside itself, not on the runtime
+        // switch, because an operator who disarms the dialer mid-incident
+        // must still be able to record events that TERMINATE in-flight
+        // attempts.
+        const reconciled = await runPhoneReconciliation(
+          {
+            config: loadLiveKitPhoneConfig(),
+            attempts: createDuePhoneAttemptReader(client as never),
+            rooms: createDefaultLiveKitRoomReader(
+              credentials.url,
+              credentials.apiKey,
+              credentials.apiSecret,
+            ),
+            stores,
+          },
+          { now: new Date() },
+        );
+        // ── M-1: THE STATUS DECIDES HERE TOO ────────────────────────
+        // `runPhoneReconciliation` answers `status: 'disabled'` with
+        // `posted: 0` whenever `isPhoneWebhookActive` is false — the master
+        // switch off, or LiveKit credentials unprovisioned. Reading the
+        // count alone published `last_reconciled: 0` and no degrade reason
+        // for a sweep that WAS NOT RUNNING, indistinguishable from "ran,
+        // nothing to recover". It matters more here than for the other two
+        // sweeps, because this sweep IS the dropped-webhook recovery: with
+        // it silently off, an attempt whose webhook never arrives is
+        // invisible until its lease lapses.
+        //
+        // AND `posted` COUNTS SUBMISSIONS, NOT LANDINGS. It is incremented
+        // once per `applyEvent` CALL; the `outcomes` array carrying
+        // `classifyApplyResult` — which is what says whether the ledger
+        // `applied` or `ignored` the event — is discarded here. So
+        // `last_reconciled` is "recovery events posted", never "recoveries
+        // that landed", and an operator must not read it as the latter.
+        sweepNotOk.reconcile = reconciled.status !== 'ok';
+        lastReconciled = reconciled.status === 'ok' ? reconciled.posted : null;
+        return (lastReconciled ?? 0) > 0;
+      },
+    },
+  ];
+
   const scheduler = createLoopScheduler({
     ...(options.scheduler ?? {}),
     metricPrefix: 'phone',
-    loops: [
-      {
-        name: 'phone-dial',
-        intervalMs: runtimeConfig.dueMs,
-        tick: queueRunnerTick(runner),
-      },
-      {
-        name: 'phone-due',
-        intervalMs: runtimeConfig.dueMs,
-        tick: async () => {
-          const now = new Date();
-          const result = await runPhoneDuePass(
-            {
-              config,
-              reader,
-              stores,
-              sessions,
-              liveAppointmentStart: async (engagementId: string) => {
-                const appointment = await readStore.getLiveAppointmentForEngagement(engagementId);
-                return appointment?.startsAt ?? null;
-              },
-              dialer: {
-                dial: async (input) => {
-                  if (roomClients === null) {
-                    // No room client means no room, and `provisionPhoneRoom`
-                    // would answer `not_configured` anyway. Refusing here
-                    // keeps the reason honest instead of laundering a missing
-                    // credential into a provider failure.
-                    return { status: 'refused', refusal: 'room_unavailable' };
-                  }
-                  // The ONLY selector. Live iff `isLiveDialPermitted` — which
-                  // already requires both switches, `dialMode === 'live'`, a
-                  // non-empty digest allowlist and a configured trunk. Every
-                  // other configuration yields the synthetic client, which
-                  // contains no SDK reference at all.
-                  const sip = resolvePhoneSipClient(config, dialConfig, credentials, {});
-                  const result = await dialPhoneAttempt(input, {
-                    config,
-                    dialConfig,
-                    stores,
-                    admission: { consentReader: reader.consent },
-                    sip: sip.client,
-                    room: roomClients,
-                    leaseOwner: owner,
-                  });
-                  return result.refusal === undefined
-                    ? { status: result.status }
-                    : { status: result.status, refusal: result.refusal };
-                },
-              },
-            },
-            { now, limit: runtimeConfig.dueLimit },
-          );
-          lastDue = result;
-          return result.dialing > 0;
-        },
-      },
-      {
-        name: 'phone-reclaim',
-        intervalMs: runtimeConfig.reclaimMs,
-        tick: async () => {
-          const result = await stores.reclaimAttemptLeases({
-            limit: runtimeConfig.reclaimLimit,
-            now: new Date(),
-          });
-          // The STATUS decides, not the count. `?? 0` alone would collapse
-          // "the RPC did not answer with a count" into "nothing needed
-          // doing" — and those are opposite operational facts. A sweep that
-          // silently stopped running lets expired attempt leases accumulate,
-          // each holding one of the ten fleet slots, until admission answers
-          // `at_capacity` for every candidate: the exact failure 0042 says
-          // this loop exists to prevent. `null` means we do not know.
-          sweepNotOk.reclaim = result.status !== 'ok';
-          lastReclaimed = result.status === 'ok' ? (result.reclaimed ?? 0) : null;
-          return (lastReclaimed ?? 0) > 0;
-        },
-      },
-      {
-        name: 'phone-maintain',
-        intervalMs: runtimeConfig.expireMs,
-        tick: async () => {
-          const expired = await stores.expireAppointments({
-            limit: runtimeConfig.reclaimLimit,
-            now: new Date(),
-          });
-          sweepNotOk.expire = expired.status !== 'ok';
-          lastExpired = expired.status === 'ok' ? (expired.expired ?? 0) : null;
-          return (lastExpired ?? 0) > 0;
-        },
-      },
-      {
-        // The dropped-webhook sweep, on its OWN loop and its own knob.
-        //
-        // It was briefly welded into `phone-maintain`, which made
-        // `PHONE_RUNTIME_RECONCILE_MS` a knob that parsed, clamped, appeared
-        // in `.env.example` and the environment schema — and changed nothing,
-        // because the sweep ran at `expireMs`. A configuration value that
-        // cannot move anything is worse than an absent one: an operator
-        // turning it during an incident would believe they had acted.
-        //
-        // They are also genuinely different jobs. Expiring an appointment is
-        // a cheap local UPDATE; reconciling reads LiveKit room state for
-        // every live attempt, so it wants a slower cadence by default
-        // (60s against 120s) and its own dial when a provider is flapping.
-        name: 'phone-reconcile',
-        intervalMs: runtimeConfig.reconcileMs,
-        tick: async () => {
-          // Gated on the MASTER switch inside itself, not on the runtime
-          // switch, because an operator who disarms the dialer mid-incident
-          // must still be able to record events that TERMINATE in-flight
-          // attempts.
-          const reconciled = await runPhoneReconciliation(
-            {
-              config: loadLiveKitPhoneConfig(),
-              attempts: createDuePhoneAttemptReader(client as never),
-              rooms: createDefaultLiveKitRoomReader(
-                credentials.url,
-                credentials.apiKey,
-                credentials.apiSecret,
-              ),
-              stores,
-            },
-            { now: new Date() },
-          );
-          lastReconciled = reconciled.posted;
-          return reconciled.posted > 0;
-        },
-      },
-    ],
+    loops,
   });
 
   return {
@@ -482,19 +677,17 @@ export function createPhoneRuntime(
     scheduler,
     runner,
     queue,
-    loopIntervalsMs: {
-      'phone-dial': runtimeConfig.dueMs,
-      'phone-due': runtimeConfig.dueMs,
-      'phone-reclaim': runtimeConfig.reclaimMs,
-      'phone-maintain': runtimeConfig.expireMs,
-      'phone-reconcile': runtimeConfig.reconcileMs,
-    },
+    loopIntervalsMs: Object.freeze(
+      Object.fromEntries(loops.map((loop) => [loop.name, loop.intervalMs])),
+    ),
     snapshot: () => ({
       lastDue,
       dialJobOutcomes: { ...dialJobOutcomes },
       lastReclaimed,
       lastExpired,
       lastReconciled,
+      lastRolled,
+      lastStranded,
       sweepNotOk: { ...sweepNotOk },
     }),
     async tickAll(): Promise<void> {

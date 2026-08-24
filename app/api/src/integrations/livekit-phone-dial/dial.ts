@@ -216,7 +216,7 @@ export async function dialPhoneAttempt(
   // The room is created BEFORE the dial and starts NO egress. A reconnect
   // adopts the existing room, keeping one session and one transcript.
   const room = await provisionPhoneRoom(
-    { sessionId: request.sessionId, attemptId, agentName: dialConfig.agentName },
+    { sessionId: request.sessionId, attemptId, epoch, agentName: dialConfig.agentName },
     deps.room,
   );
   if (room.status === 'not_configured' || room.status === 'provider_failed') {

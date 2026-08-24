@@ -182,6 +182,12 @@ function fakeStores(over: Partial<PhoneStores> = {}): WriteSpy {
   const defaults: PhoneStores = {
     admitAttempt: async () => ({ status: 'ok' }),
     heartbeatAttempt: async () => ({ status: 'ok' }),
+    heartbeatAttemptByEpoch: async () => ({ status: 'ok' as const }),
+    sweepDayRolled: async () => ({ status: 'ok' as const, examined: 0, rolled: 0, skipped: 0 }),
+    sweepStrandedSessions: async () => ({
+      status: 'ok' as const, examined: 0, completed: 0, failed: 0, skipped: 0,
+    }),
+    claimSweep: async () => ({ status: 'ok' as const }),
     reclaimAttemptLeases: async () => ({ status: 'ok' }),
     applyEvent: async () => ({ status: 'applied' }),
     // 0043. The operator calendar API never binds or purges a recording, so
@@ -1140,6 +1146,8 @@ function fakeRuntime(over: {
       lastReclaimed: null,
       lastExpired: null,
       lastReconciled: null,
+      lastRolled: null,
+      lastStranded: null,
       // No sweep has answered non-`ok`. Empty rather than absent: the view
       // reads this map, and a fake that omitted it would be a fake the real
       // runtime can never produce.
@@ -1402,6 +1410,13 @@ describe('the health surface', () => {
           last_reclaimed: null,
           last_expired: null,
           last_reconciled: null,
+          last_rolled: null,
+          last_stranded: null,
+          // FALSE, not absent. A process that was deliberately not armed and
+          // one whose arming THREW both report `enabled: false`; this boolean
+          // is the only thing that separates them, so it must be present on
+          // the disabled branch or it separates nothing.
+          start_failed: false,
         });
       }
     });

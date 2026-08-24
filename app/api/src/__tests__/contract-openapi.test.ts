@@ -1011,17 +1011,27 @@ describe('OpenAPI document integrity', () => {
     //   appointment create, the appointment reschedule/cancel pair on one
     //   path, and the two halt controls.
     //
-    // 78 (base) + 1 (P3) + 8 (P6) + 2 (P4) + 3 (P4b) = 92. RE-DERIVED from the
-    // merged spec, not arrived at by adding the branches' diffs — the whole
-    // point of a hard count is that it is checked against the document.
+    // + POST /api/internal/phone/attempt/heartbeat — 0045's epoch-fenced
+    //   renewal of the attempt CONCURRENCY lease. Nothing renewed that lease,
+    //   so it expired mid-call on every answered call and a conducted, SCORED
+    //   screening was lost silently; this is the door that renews it. It is a
+    //   PATH of its own rather than a widening of the event post because it is
+    //   fenced on the epoch alone and, unlike every other worker door, must be
+    //   provably incapable of carrying a lease token in either direction.
+    //
+    // 78 (base) + 1 (P3) + 8 (P6) + 2 (P4) + 3 (P4b) + 1 (0045) = 93.
+    // RE-DERIVED from the merged spec, not arrived at by adding the branches'
+    // diffs — the whole point of a hard count is that it is checked against
+    // the document.
     //
     // P4's two are the INTERNAL phone-worker surface: the event post and the
     // callback booking. P4b adds three more to the SAME internal surface:
     // assessment start, one question boundary, and the completion that awaits
-    // scoring and verifies the row. All five are service-authenticated with
-    // the existing WORKER_CONTEXT_SECRET rather than a recruiter session, so
-    // none of them widens the recruiter-facing surface at all.
-    expect(Object.keys(paths).length).toBe(92);
+    // scoring and verifies the row. 0045 adds the sixth, the attempt
+    // heartbeat. All six are service-authenticated with the existing
+    // WORKER_CONTEXT_SECRET rather than a recruiter session, so none of them
+    // widens the recruiter-facing surface at all.
+    expect(Object.keys(paths).length).toBe(93);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -1041,8 +1051,17 @@ describe('OpenAPI document integrity', () => {
     //   PhoneHealthResponse.runtime; P5 adds no new PATH, because the runtime
     //   is observed through the health surface that already exists rather than
     //   through an endpoint of its own.
-    // 160 (base) + 2 (P3) + 31 (P6) + 5 (P4) + 8 (P4b) + 3 (P5) = 209, re-derived.
-    expect(Object.keys(schemas).length).toBe(209);
+    // 0045 adds exactly TWO: PhoneAttemptHeartbeatRequest and
+    //   PhoneAttemptHeartbeatResponse, the strict request/response pair of the
+    //   attempt-lease renewal. Both carry additionalProperties:false, and that
+    //   is load-bearing on the REQUEST rather than cosmetic: the epoch is the
+    //   only fence this door has, and a schema that tolerated an unknown key
+    //   would let a lease_token start riding on the route the second RPC was
+    //   added to avoid. The response documents no token and no absolute expiry
+    //   for the same reason.
+    // 160 (base) + 2 (P3) + 31 (P6) + 5 (P4) + 8 (P4b) + 3 (P5) + 2 (0045)
+    //   = 211, re-derived.
+    expect(Object.keys(schemas).length).toBe(211);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.
@@ -1159,9 +1178,30 @@ describe('OpenAPI document integrity', () => {
       last_reclaimed: null,
       last_expired: null,
       last_reconciled: null,
+      // 0045's three. All REQUIRED, and all present in the disabled shape the
+      // registry returns when no runtime is registered — which is what every
+      // default deployment answers — so a spec that made them optional would
+      // stop catching a handler that dropped one. `start_failed` in
+      // particular is the whole point: it is the ONLY field that separates a
+      // process nobody armed from one whose arming threw, and on the shipped
+      // default it is `false` alongside `enabled: false`.
+      last_rolled: null,
+      last_stranded: null,
+      start_failed: false,
       sweeps_not_ok: [],
     };
     expect(validateNamed(base, 'PhoneRuntimeState', spec)).toEqual([]);
+
+    // …and each of the three is genuinely REQUIRED, not merely documented: a
+    // body missing one must be rejected. Without this the `required` list
+    // could be dropped and every assertion above would still pass.
+    for (const key of ['start_failed', 'last_rolled', 'last_stranded'] as const) {
+      const { [key]: _omitted, ...missing } = base;
+      expect(
+        validateNamed(missing, 'PhoneRuntimeState', spec).length,
+        `${key} must be required on PhoneRuntimeState`,
+      ).toBeGreaterThan(0);
+    }
 
     // …and the allOf wrapper must NOT have switched the check off: a non-null
     // last_due is still validated against PhoneRuntimeDueSummary.
@@ -1212,6 +1252,11 @@ describe('auth boundary vs spec security model', () => {
     'POST /api/internal/phone/assessment/start',
     'POST /api/internal/phone/assessment/turn',
     'POST /api/internal/phone/assessment/complete',
+    // 0045, same surface and same boundary: the attempt-lease renewal. Behind
+    // the worker secret, not a recruiter session, so it answers the worker's
+    // 401 `authentication_required` rather than the middleware's
+    // `authentication_error`.
+    'POST /api/internal/phone/attempt/heartbeat',
     // Ashby webhook: HMAC-gated (not recruiter-authenticated), mounted pre-auth.
     'POST /api/integrations/ashby/webhook',
     // LiveKit phone webhook: JWT-gated (not recruiter-authenticated), mounted
@@ -2661,6 +2706,10 @@ describe('phone operator API bodies match the documented schemas', () => {
     const stores = {
       admitAttempt: async () => ({ status: 'ok' }),
       heartbeatAttempt: async () => ({ status: 'ok' }),
+      heartbeatAttemptByEpoch: async () => ({ status: 'ok' as const }),
+      sweepDayRolled: async () => ({ status: 'ok' as const }),
+      sweepStrandedSessions: async () => ({ status: 'ok' as const }),
+      claimSweep: async () => ({ status: 'ok' as const }),
       reclaimAttemptLeases: async () => ({ status: 'ok' }),
       applyEvent: async () => ({ status: 'applied' }),
       // A reschedule (non-null expected version) supersedes the live row and

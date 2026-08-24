@@ -95,7 +95,21 @@ export function buildPhoneRoomMetadata(
  * dispatched. A dispatch is minted per attempt, so this is the one place a
  * per-attempt fact can live truthfully.
  *
- * Three closed keys, none derived from a phone number.
+ * FOUR closed keys, none derived from a phone number.
+ *
+ * `epoch` joined them for the attempt heartbeat. The agent must renew the
+ * concurrency lease for the length of the conversation, and the renewal is
+ * fenced on (attempt, epoch) precisely so a stale agent from a superseded
+ * attempt cannot renew the live one's lease. That fence only works if the
+ * agent knows which epoch it is; carrying it here is what makes the renewal
+ * safe to expose over a worker route at all.
+ *
+ * The epoch is NOT a secret and is not a credential — it is a small integer
+ * fence. What is deliberately absent from this payload, and from every
+ * response the heartbeat route returns, is the LEASE TOKEN. The token stays
+ * in Postgres; the worker names an attempt and an epoch and the database
+ * decides. A token on this channel would be a credential in a metadata field
+ * readable by anything that can read room state.
  *
  * Deliberately NOT claiming this satisfies 0042's metadata sanitizer. That rule
  * governs `phone_call_events.metadata`, a different surface this payload never
@@ -108,10 +122,12 @@ export function buildPhoneRoomMetadata(
 export function buildPhoneDispatchMetadata(
   sessionId: string,
   attemptId: string,
+  epoch: number,
 ): string {
   return JSON.stringify({
     session_id: sessionId,
     attempt_id: attemptId,
+    epoch,
     channel: PHONE_ROOM_CHANNEL,
   });
 }
@@ -180,6 +196,12 @@ export interface ProvisionPhoneRoomInput {
    */
   readonly attemptId: string;
   /**
+   * The attempt's epoch, as admission minted it. Travels with the attempt id
+   * so the agent can fence its lease renewal on both — see
+   * `buildPhoneDispatchMetadata`.
+   */
+  readonly epoch: number;
+  /**
    * The named phone agent to dispatch, or `''` for none.
    *
    * EMPTY IS A LEGITIMATE, DELIBERATE STATE, not an error. The existing
@@ -247,7 +269,7 @@ export async function provisionPhoneRoom(
     // the room is shared across reconnects. Both payloads are closed objects
     // over opaque ids, so neither is a place a phone value can enter.
     await deps.dispatch.createDispatch(roomName, input.agentName, {
-      metadata: buildPhoneDispatchMetadata(input.sessionId, input.attemptId),
+      metadata: buildPhoneDispatchMetadata(input.sessionId, input.attemptId, input.epoch),
     });
   } catch {
     // The room exists and is correct; only the agent is missing. This is
