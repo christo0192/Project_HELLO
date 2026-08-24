@@ -50,8 +50,11 @@ export const PHONE_DIAL_BOUNDS = {
    * How long the ORIGINATE CALL ITSELF may block, in seconds — NOT how long
    * the line may ring, which is `PHONE_RING_TIMEOUT_SECONDS`.
    *
-   * Explicit because the SDK default is 60 s when `waitUntilAnswered` is true,
-   * which is exactly the default `PHONE_LEASE_SECONDS`. An originate that
+   * Explicit because the SDK default is 60 s when `waitUntilAnswered` is true.
+   * That was once exactly the default `PHONE_LEASE_SECONDS`, and is now well
+   * inside it (180 s) — but the hazard is the dependency, not the arithmetic:
+   * a bound that gates a fleet slot must not be left to a provider SDK's
+   * default, which can change under us. An originate that
    * blocks for the whole lease races `reclaim_phone_attempt_leases`, which
    * would abandon an attempt whose dial is still in flight — and P3's
    * reconciliation sweep deliberately leaves HELD leases alone, so no second

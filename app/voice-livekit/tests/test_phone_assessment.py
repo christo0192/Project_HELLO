@@ -342,9 +342,14 @@ class TestHaltTaxonomy(unittest.TestCase):
         declared = {
             phone.HALT_PERSISTENCE, phone.HALT_SCORING,
             phone.HALT_MALFORMED_EXCHANGE, phone.HALT_NO_ANSWER,
+            # P5: a lost or unprovable concurrency lease. Both are
+            # infrastructure, so both are retryable and post nothing.
+            phone.HALT_LEASE_LOST, phone.HALT_LEASE_UNCONFIRMED,
         }
-        self.assertEqual(len(declared), 4)
+        self.assertEqual(len(declared), 6)
         self.assertTrue(phone.RETRYABLE_HALTS.issubset(declared))
+        self.assertTrue(phone.halt_is_retryable(phone.HALT_LEASE_LOST))
+        self.assertTrue(phone.halt_is_retryable(phone.HALT_LEASE_UNCONFIRMED))
 
 
 class TestCompletionRetry(unittest.IsolatedAsyncioTestCase):

@@ -29,6 +29,14 @@ import {
   type PhoneReadStore,
   type PhoneStores,
 } from '../lib/phone-screening/index.js';
+import {
+  clearPhoneRuntimeRegistration,
+  registerPhoneRuntime,
+} from '../lib/phone-runtime/health.js';
+import type {
+  PhoneRuntimeHandle,
+  PhoneRuntimeSnapshot,
+} from '../lib/phone-runtime/runtime.js';
 
 // ════════════════════════════════════════════════════════════════════
 //  Fixtures
@@ -174,6 +182,12 @@ function fakeStores(over: Partial<PhoneStores> = {}): WriteSpy {
   const defaults: PhoneStores = {
     admitAttempt: async () => ({ status: 'ok' }),
     heartbeatAttempt: async () => ({ status: 'ok' }),
+    heartbeatAttemptByEpoch: async () => ({ status: 'ok' as const }),
+    sweepDayRolled: async () => ({ status: 'ok' as const, examined: 0, rolled: 0, skipped: 0 }),
+    sweepStrandedSessions: async () => ({
+      status: 'ok' as const, examined: 0, completed: 0, failed: 0, skipped: 0,
+    }),
+    claimSweep: async () => ({ status: 'ok' as const }),
     reclaimAttemptLeases: async () => ({ status: 'ok' }),
     applyEvent: async () => ({ status: 'applied' }),
     // 0043. The operator calendar API never binds or purges a recording, so
@@ -1080,6 +1094,140 @@ describe('cancelling', () => {
 //  6. Health
 // ════════════════════════════════════════════════════════════════════
 
+/**
+ * A registered runtime handle, hand-built.
+ *
+ * The view is read through `scheduler.health()`, `snapshot()` and
+ * `loopIntervalsMs`; nothing else on the handle is consulted, so the rest is
+ * stubbed to throw. A fake that silently answered every call would be kinder
+ * than production and would hide a reader we did not intend.
+ */
+function fakeRuntime(over: {
+  running?: boolean;
+  lastTickAt?: string | null;
+  snapshot?: Partial<PhoneRuntimeSnapshot>;
+  /**
+   * Extra fields welded onto the loop-health record the scheduler reports.
+   *
+   * `phoneRuntimeView` projects each loop through an EXPLICIT field list; this
+   * seam exists so a test can put a value there that the list does not name
+   * and prove it does not reach the response. A future edit that adds a
+   * debugging field to `SchedulerLoopHealth` is exactly the change this
+   * guards, so the fixture has to be able to model one.
+   */
+  loopExtra?: Record<string, unknown>;
+} = {}): PhoneRuntimeHandle {
+  const explode = () => { throw new Error('unexpected_runtime_call'); };
+  return {
+    config: { due_ms: 15_000, reclaim_ms: 30_000 },
+    scheduler: {
+      running: over.running ?? false,
+      health: () => ({
+        running: over.running ?? false,
+        loops: [{
+          name: 'phone-due',
+          running: over.running ?? false,
+          lastTickAt: over.lastTickAt === undefined ? null : over.lastTickAt,
+          ticks: 4,
+          errors: 0,
+          consecutiveErrors: 0,
+          ...over.loopExtra,
+        }],
+      }),
+      start: explode,
+      stop: explode,
+    } as unknown as PhoneRuntimeHandle['scheduler'],
+    runner: explode as unknown as PhoneRuntimeHandle['runner'],
+    queue: explode as unknown as PhoneRuntimeHandle['queue'],
+    loopIntervalsMs: { 'phone-due': 15_000 },
+    snapshot: () => ({
+      lastDue: null,
+      dialJobOutcomes: {},
+      lastReclaimed: null,
+      lastExpired: null,
+      lastReconciled: null,
+      lastRolled: null,
+      lastStranded: null,
+      // No sweep has answered non-`ok`. Empty rather than absent: the view
+      // reads this map, and a fake that omitted it would be a fake the real
+      // runtime can never produce.
+      sweepNotOk: {},
+      ...over.snapshot,
+    }),
+    tickAll: explode,
+    stop: explode,
+  };
+}
+
+/**
+ * RUNNING, but its one loop last ticked far longer ago than its own stale
+ * window (interval 15s, so the window is the 30s floor).
+ *
+ * Running is not incidental. `isLoopStale` returns false for a stopped loop
+ * BY DESIGN — a loop that is not running is stopped, not stale, and reporting
+ * both would be two reasons for one fact. So a stale loop can only be
+ * exhibited on a running scheduler.
+ */
+function runningRuntimeWithStaleLoop(): PhoneRuntimeHandle {
+  return fakeRuntime({
+    running: true,
+    lastTickAt: new Date(NOW.getTime() - 10 * 60_000).toISOString(),
+  });
+}
+
+/**
+ * Values that must never reach an operator's screen. They are not decoration:
+ * each is placed BELOW the health surface, in a field a real leak would use,
+ * and the test that names them fails if the surface starts copying it.
+ */
+const LEASE_TOKEN_SENTINEL = 'lease-token-sentinel';
+const SIP_TRUNK_SENTINEL = 'sip-trunk-sentinel';
+
+/**
+ * Running and healthy, carrying a due summary with codes in it — and, welded
+ * onto the SAME objects, four values the view is required to drop.
+ *
+ * The point of the cast: `PhoneDueResult` does not declare these fields today,
+ * so a fixture cannot carry them without one. That is precisely the leak being
+ * guarded. `phoneRuntimeView` re-projects the due summary through an explicit
+ * six-field list rather than spreading the snapshot, and it projects each loop
+ * through a seven-field list rather than spreading the loop health. Both lists
+ * are the only thing standing between "someone adds an engagement id to the
+ * due result for debugging" and that id appearing in `GET /api/phone/health`.
+ * The fixture models that future field; the assertions below prove the lists
+ * still hold.
+ *
+ * NOT covered here, deliberately: an identifier used as a SKIP or REFUSAL
+ * KEY. The view copies those maps verbatim by design (they are stable codes),
+ * so no view-level fixture can catch it — that property is proved by
+ * `phone-runtime-loops.test.ts`'s `NO IDENTIFIER LEAKS`, which drives real
+ * sentinel rows through a real due pass and searches the whole serialized view.
+ */
+function runtimeWithDueSummary(): PhoneRuntimeHandle {
+  return fakeRuntime({
+    running: true,
+    lastTickAt: NOW.toISOString(),
+    snapshot: {
+      lastDue: {
+        status: 'ok',
+        examined: 4,
+        offered: 2,
+        dialing: 1,
+        skipped: { no_dialable_number: 1, appointment_not_due: 1 },
+        refusals: { outside_window: 1 },
+        // ── Not part of the shape. Present anyway. ──────────────────────
+        engagementId: UUID_E,
+        candidateId: UUID_C,
+        attemptId: UUID_A,
+        leaseToken: LEASE_TOKEN_SENTINEL,
+      } as unknown as PhoneRuntimeSnapshot['lastDue'],
+    },
+    // The provider payload a loop would be holding if anyone ever put one on
+    // the scheduler's health record.
+    loopExtra: { sipTrunk: SIP_TRUNK_SENTINEL, lastEngagementId: UUID_E },
+  });
+}
+
 describe('the health surface', () => {
   it('reports ok with split ingress counts when everything is nominal', async () => {
     const res = await request(appWith('interviewer', { stores: fakeStores().store }))
@@ -1215,6 +1363,181 @@ describe('the health surface', () => {
       dialMode: 'off',
       dialAllowlistSize: 0,
       liveDialPermitted: false,
+    });
+  });
+
+  // ──────────────────────────────────────────────────────────────────
+  //  The P5 runtime block
+  //
+  //  The block is PROCESS-LOCAL: it answers for the loops in THIS api
+  //  process and makes no claim about any other replica. That is why the
+  //  unregistered shape below is `enabled: false` with NO reason code — a
+  //  process that is not running the loops is the shipped default, not a
+  //  fault, and a surface that degraded on it would be permanently amber
+  //  on every machine in the fleet.
+  // ──────────────────────────────────────────────────────────────────
+
+  describe('the runtime block', () => {
+    afterEach(() => {
+      // Registration is module-global. Left behind, it would leak into every
+      // later test in this file and make their assertions depend on order.
+      clearPhoneRuntimeRegistration();
+    });
+
+    it('is present on ALL THREE health branches, not only the healthy one', async () => {
+      // An operator needs to know whether the loops are turning precisely
+      // when something else is wrong, so the block cannot be a property of
+      // the happy path alone.
+      const branches: Array<[string, PhoneApiDeps]> = [
+        ['healthy', { stores: fakeStores().store }],
+        ['backlog unreadable', {
+          stores: fakeStores({ backlog: async () => { throw new Error('phone_backlog_error'); } }).store,
+        }],
+        ['screening disabled', { stores: fakeStores().store, configSource: DISABLED }],
+      ];
+      for (const [label, deps] of branches) {
+        const res = await request(appWith('interviewer', deps)).get('/api/phone/health');
+        expect(res.status, label).toBe(200);
+        expect(res.body.runtime, label).toEqual({
+          enabled: false,
+          running: false,
+          loops: [],
+          last_due: null,
+          config: {},
+          dial_jobs: {},
+          // No sweep has run in a process with no runtime, so none has failed.
+          sweeps_not_ok: [],
+          last_reclaimed: null,
+          last_expired: null,
+          last_reconciled: null,
+          last_rolled: null,
+          last_stranded: null,
+          // FALSE, not absent. A process that was deliberately not armed and
+          // one whose arming THREW both report `enabled: false`; this boolean
+          // is the only thing that separates them, so it must be present on
+          // the disabled branch or it separates nothing.
+          start_failed: false,
+        });
+      }
+    });
+
+    it('does not degrade the surface merely because this process runs no loops', async () => {
+      const res = await request(appWith('interviewer', { stores: fakeStores().store }))
+        .get('/api/phone/health');
+      expect(res.body.status).toBe('ok');
+      expect(res.body.reasons).toEqual([]);
+    });
+
+    it('appends runtime reasons WITHOUT displacing the backlog reasons', async () => {
+      // Ordering matters: the backlog reasons are the pre-existing contract
+      // and keep their positions. A stale loop is ADDITIVE — a healthy
+      // backlog with nothing turning is exactly the silent-stall case, so it
+      // must degrade even though every count is nominal.
+      registerPhoneRuntime(runningRuntimeWithStaleLoop());
+      const res = await request(appWith('interviewer', { stores: fakeStores().store }))
+        .get('/api/phone/health');
+      expect(res.body.status).toBe('degraded');
+      expect(res.body.reasons).toEqual(['phone_loop_stale']);
+      expect(res.body.runtime.enabled).toBe(true);
+    });
+
+    it('CONTROL: the same registration on a halted backlog keeps BOTH reason families', async () => {
+      // Without this control the previous test would still pass if runtime
+      // reasons REPLACED the backlog reasons rather than appending to them.
+      registerPhoneRuntime(runningRuntimeWithStaleLoop());
+      const stores = fakeStores({
+        backlog: async () => ({
+          ...HEALTHY_BACKLOG,
+          admission: { controlPresent: true, halted: true, haltReason: 'operator' },
+        }),
+      });
+      const res = await request(appWith('interviewer', { stores: stores.store }))
+        .get('/api/phone/health');
+      expect(res.body.reasons).toEqual([
+        'admission_halted',
+        'phone_loop_stale',
+      ]);
+    });
+
+    it('reports a stopped runtime as stopped, and NOT also as stale', async () => {
+      // Two reasons for one fact would be noise. `isLoopStale` fails to false
+      // for a stopped loop precisely so a halted process reports one cause.
+      registerPhoneRuntime(fakeRuntime({
+        running: false,
+        lastTickAt: new Date(NOW.getTime() - 10 * 60_000).toISOString(),
+      }));
+      const res = await request(appWith('interviewer', { stores: fakeStores().store }))
+        .get('/api/phone/health');
+      expect(res.body.reasons).toEqual(['phone_runtime_stopped']);
+    });
+
+    it("a sweep that did not run reports null and 'phone_sweep_not_ok' — not a quiet 0", async () => {
+      // The whole point of the distinction. `last_expired: 0` means the sweep
+      // RAN and found nothing; `last_reclaimed: null` with `reclaim` named in
+      // `sweeps_not_ok` means it did not run at all. Before the split these
+      // were the same number, and a reclaim sweep that had silently stopped
+      // reported `status: ok` with `last_reclaimed: 0` while expired attempt
+      // leases piled up holding fleet slots.
+      registerPhoneRuntime(fakeRuntime({
+        running: true,
+        lastTickAt: NOW.toISOString(),
+        snapshot: {
+          lastReclaimed: null,
+          lastExpired: 0,
+          sweepNotOk: { reclaim: true, expire: false },
+        },
+      }));
+      const res = await request(appWith('interviewer', { stores: fakeStores().store }))
+        .get('/api/phone/health');
+
+      expect(res.status).toBe(200);
+      // `toBeNull`, never `toBeFalsy` — `0` is falsy and `0` is precisely the
+      // value this repair exists to stop meaning "did not run".
+      expect(res.body.runtime.last_reclaimed).toBeNull();
+      expect(res.body.runtime.last_expired).toBe(0);
+      // Only the sweep that failed is named, and it is named by CODE.
+      expect(res.body.runtime.sweeps_not_ok).toEqual(['reclaim']);
+      expect(res.body.reasons).toContain('phone_sweep_not_ok');
+      expect(res.body.status).toBe('degraded');
+    });
+
+    it('drops identifiers and provider payload carried on the objects it projects', async () => {
+      // The runtime registered here CARRIES all five secrets, on the two
+      // objects the view reads: the due summary and the loop health record.
+      // The view must re-project both through its field lists and drop the
+      // rest — if it ever spreads either object instead, every assertion in
+      // this test goes red at once.
+      registerPhoneRuntime(runtimeWithDueSummary());
+      const res = await request(appWith('interviewer', { stores: fakeStores().store }))
+        .get('/api/phone/health');
+
+      // Non-vacuity: the secrets really are below the surface. Without this,
+      // a fixture that quietly stopped carrying them would leave the sweep
+      // below asserting nothing at all — which is the defect this test had.
+      const beneath = JSON.stringify(runtimeWithDueSummary().snapshot())
+        + JSON.stringify(runtimeWithDueSummary().scheduler.health());
+      for (const secret of [UUID_A, UUID_E, UUID_C, LEASE_TOKEN_SENTINEL, SIP_TRUNK_SENTINEL]) {
+        expect(beneath, `fixture must carry ${secret}`).toContain(secret);
+      }
+
+      const serialized = JSON.stringify(res.body.runtime);
+      for (const secret of [UUID_A, UUID_E, UUID_C, LEASE_TOKEN_SENTINEL, SIP_TRUNK_SENTINEL]) {
+        expect(serialized, secret).not.toContain(secret);
+      }
+
+      // The whitelists themselves, stated positively. `toEqual` is exact, so
+      // an extra field survives as a failure rather than as silence.
+      expect(res.body.runtime.last_due).toEqual({
+        status: 'ok',
+        examined: 4,
+        offered: 2,
+        dialing: 1,
+        skipped: { no_dialable_number: 1, appointment_not_due: 1 },
+        refusals: { outside_window: 1 },
+      });
+      expect(Object.keys(res.body.runtime.loops[0]).sort()).toEqual([
+        'consecutiveErrors', 'errors', 'lastTickAt', 'name', 'running', 'stale', 'ticks',
+      ]);
     });
   });
 });

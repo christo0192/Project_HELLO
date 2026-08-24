@@ -54,6 +54,12 @@ export const MIGRATION_0044_PATH = fileURLToPath(
 
 export const MIGRATION_0044 = readFileSync(MIGRATION_0044_PATH, 'utf8');
 
+export const MIGRATION_0045_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0045_phone_runtime_liveness.sql', import.meta.url),
+);
+
+export const MIGRATION_0045 = readFileSync(MIGRATION_0045_PATH, 'utf8');
+
 /**
  * Every phone migration, NEWEST FIRST. Extraction walks this in order and the
  * first file that declares a thing wins, which is what "the latest declaration
@@ -61,6 +67,7 @@ export const MIGRATION_0044 = readFileSync(MIGRATION_0044_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    { name: '0045', sql: MIGRATION_0045 },
     { name: '0044', sql: MIGRATION_0044 },
     { name: '0043', sql: MIGRATION_0043 },
     { name: '0042', sql: MIGRATION_0042 },
@@ -89,6 +96,9 @@ export const CLOCK_FREE_RPCS: readonly string[] = Object.freeze([
   'list_phone_engagement_recordings',
   // 0044: a pure read. Nothing it decides depends on time.
   'get_phone_assessment_state',
+  // 0045: a constant. It answers how long a phone `waiting` session may
+  // legitimately live, which is a property of the ladder, not of the clock.
+  'phone_stale_session_seconds',
 ]);
 
 /**
@@ -157,6 +167,11 @@ export const RPC_NAMES = [
   'start_phone_assessment',
   'get_phone_assessment_state',
   'commit_phone_question_boundary',
+  // 0045 — the two obligations 0042 assigned to P5, plus the sweep claim.
+  'heartbeat_phone_attempt_by_epoch',
+  'sweep_phone_day_rolled',
+  'sweep_phone_stranded_sessions',
+  'claim_phone_sweep',
 ] as const;
 
 /**

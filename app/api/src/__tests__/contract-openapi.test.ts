@@ -37,6 +37,7 @@ import { dirname, resolve } from 'node:path';
 import express from 'express';
 import { createApp } from '../app.js';
 import { createPhoneApiRouter } from '../routes/phone.js';
+import { createPhoneWorkerRouter } from '../routes/phone-worker.js';
 import { getAuditSink, setAuditSink } from '../lib/audit.js';
 import { mockAuthGetUser, type AuthUser } from '../lib/auth.js';
 import { MemoryRateLimitStore, setRateLimitStore } from '../lib/rate-limit.js';
@@ -298,6 +299,7 @@ interface SchemaNode {
   const?: YValue;
   $ref?: string;
   format?: string;
+  allOf?: SchemaNode[];
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -314,15 +316,53 @@ function resolveRef(ref: string, spec: YMap): SchemaNode {
   return schemas[name] as unknown as SchemaNode;
 }
 
-function deref(schema: SchemaNode | undefined, spec: YMap): SchemaNode | undefined {
+/**
+ * Resolve `$ref` chains AND flatten `allOf`.
+ *
+ * The `allOf` half is not decoration. OpenAPI 3.0.x ignores every sibling of
+ * a `$ref`, so the only way to say "this property is that schema, and it may
+ * also be null" is `nullable: true` next to `allOf: [ { $ref } ]`. If this
+ * validator did not understand `allOf`, every schema written that way would
+ * flatten to a typeless node and validateValue would accept ANYTHING for it —
+ * the spec fix would silently switch off the contract check it was meant to
+ * make honest. Flattening keeps `type`, `required`, `properties` and
+ * `additionalProperties: false` in force through the wrapper.
+ */
+function deref(schema: SchemaNode | undefined, spec: YMap, seen: Set<string> = new Set<string>()): SchemaNode | undefined {
   let s = schema;
-  const seen = new Set<string>();
   while (s && s.$ref) {
     if (seen.has(s.$ref)) throw new Error(`Cyclic $ref "${s.$ref}"`);
     seen.add(s.$ref);
     s = resolveRef(s.$ref, spec);
   }
-  return s;
+  if (!s || !s.allOf) return s;
+
+  const merged: SchemaNode = {};
+  const props: Record<string, SchemaNode> = {};
+  const required: string[] = [];
+  const own: SchemaNode = { ...s };
+  delete own.allOf;
+  // Members first, the wrapper's own keys last, so a wrapper key (typically
+  // `nullable`/`description`) wins over the member it is qualifying.
+  for (const member of [...s.allOf, own]) {
+    const m = deref(member, spec, new Set(seen));
+    if (!m) continue;
+    for (const [key, value] of Object.entries(m)) {
+      if (key === 'allOf') continue;
+      if (key === 'properties') {
+        Object.assign(props, value as Record<string, SchemaNode>);
+        continue;
+      }
+      if (key === 'required') {
+        required.push(...(value as string[]));
+        continue;
+      }
+      (merged as Record<string, unknown>)[key] = value;
+    }
+  }
+  if (Object.keys(props).length > 0) merged.properties = props;
+  if (required.length > 0) merged.required = [...new Set(required)];
+  return merged;
 }
 
 function validateValue(value: unknown, schema: SchemaNode | undefined, spec: YMap, path: string, errors: string[]): void {
@@ -456,6 +496,63 @@ function validateNamed(value: unknown, schemaName: string, spec: YMap): string[]
 
 const specText = readFileSync(SPEC_PATH, 'utf8');
 const spec = parseYamlDocument(specText);
+
+// ════════════════════════════════════════════════════════════════════
+//  $ref-sibling sweep
+//
+//  The document declares OpenAPI 3.0.3 (line 1). In 3.0.x a `$ref` REPLACES
+//  the object that contains it, so every sibling key of a `$ref` is ignored
+//  by every conforming parser, generator and validator. Writing
+//
+//      last_due:
+//        nullable: true
+//        $ref: '#/components/schemas/PhoneRuntimeDueSummary'
+//
+//  therefore documents a REQUIRED, NON-NULLABLE object — while the handler
+//  returns null. The 3.0 idiom that actually works is to demote the $ref into
+//  a single-member `allOf` so the qualifier has an object of its own to sit on:
+//
+//      last_due:
+//        nullable: true
+//        allOf:
+//          - $ref: '#/components/schemas/PhoneRuntimeDueSummary'
+//
+//  This is a general rule over the WHOLE document, not a guard for one schema:
+//  `description`, `example`, `default` and `readOnly` are lost in exactly the
+//  same silent way. The walker below is what the rule is enforced with, and it
+//  is proved to work on fixtures (see the CONTROL tests) before it is trusted
+//  against the real spec.
+// ════════════════════════════════════════════════════════════════════
+
+interface RefSiblingSweep {
+  /** Every object carrying a `$ref` together with at least one other key. */
+  violations: Array<{ path: string; siblings: string[] }>;
+  /** How many `$ref`-bearing objects the walk actually visited (non-vacuity). */
+  refCount: number;
+}
+
+function sweepRefSiblings(root: unknown): RefSiblingSweep {
+  const violations: RefSiblingSweep['violations'] = [];
+  let refCount = 0;
+  const walk = (node: unknown, path: string): void => {
+    if (Array.isArray(node)) {
+      node.forEach((entry, i) => walk(entry, `${path}[${i}]`));
+      return;
+    }
+    if (node === null || typeof node !== 'object') return;
+    const obj = node as Record<string, unknown>;
+    const keys = Object.keys(obj);
+    if (keys.includes('$ref')) {
+      refCount += 1;
+      if (keys.length !== 1) {
+        violations.push({ path, siblings: keys.filter((k) => k !== '$ref').sort() });
+      }
+    }
+    for (const key of keys) walk(obj[key], `${path}.${key}`);
+  };
+  walk(root, '$');
+  return { violations, refCount };
+}
 
 /** { "GET /api/roles": true, ... } — every documented operation. */
 function documentedOperations(): Map<string, string> {
@@ -915,17 +1012,27 @@ describe('OpenAPI document integrity', () => {
     //   appointment create, the appointment reschedule/cancel pair on one
     //   path, and the two halt controls.
     //
-    // 78 (base) + 1 (P3) + 8 (P6) + 2 (P4) + 3 (P4b) = 92. RE-DERIVED from the
-    // merged spec, not arrived at by adding the branches' diffs — the whole
-    // point of a hard count is that it is checked against the document.
+    // + POST /api/internal/phone/attempt/heartbeat — 0045's epoch-fenced
+    //   renewal of the attempt CONCURRENCY lease. Nothing renewed that lease,
+    //   so it expired mid-call on every answered call and a conducted, SCORED
+    //   screening was lost silently; this is the door that renews it. It is a
+    //   PATH of its own rather than a widening of the event post because it is
+    //   fenced on the epoch alone and, unlike every other worker door, must be
+    //   provably incapable of carrying a lease token in either direction.
+    //
+    // 78 (base) + 1 (P3) + 8 (P6) + 2 (P4) + 3 (P4b) + 1 (0045) = 93.
+    // RE-DERIVED from the merged spec, not arrived at by adding the branches'
+    // diffs — the whole point of a hard count is that it is checked against
+    // the document.
     //
     // P4's two are the INTERNAL phone-worker surface: the event post and the
     // callback booking. P4b adds three more to the SAME internal surface:
     // assessment start, one question boundary, and the completion that awaits
-    // scoring and verifies the row. All five are service-authenticated with
-    // the existing WORKER_CONTEXT_SECRET rather than a recruiter session, so
-    // none of them widens the recruiter-facing surface at all.
-    expect(Object.keys(paths).length).toBe(92);
+    // scoring and verifies the row. 0045 adds the sixth, the attempt
+    // heartbeat. All six are service-authenticated with the existing
+    // WORKER_CONTEXT_SECRET rather than a recruiter session, so none of them
+    // widens the recruiter-facing surface at all.
+    expect(Object.keys(paths).length).toBe(93);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -940,8 +1047,34 @@ describe('OpenAPI document integrity', () => {
     //   response, the boundary request/response pair, and the complete
     //   request/response pair — eight names, of which PhoneAssessmentStateResponse
     //   serves both start and its refusals.
-    // 160 (base) + 2 (P3) + 31 (P6) + 5 (P4) + 8 (P4b) = 206, re-derived.
-    expect(Object.keys(schemas).length).toBe(206);
+    // P5 adds exactly THREE: PhoneRuntimeState plus the two objects it
+    //   nests, PhoneRuntimeLoopState and PhoneRuntimeDueSummary. They hang off
+    //   PhoneHealthResponse.runtime; P5 adds no new PATH, because the runtime
+    //   is observed through the health surface that already exists rather than
+    //   through an endpoint of its own.
+    // 0045 adds exactly THREE: PhoneAttemptHeartbeatRequest,
+    //   PhoneAttemptHeartbeatResponse and PhoneAttemptHeartbeatError. The
+    //   first two are the strict request/response pair of the attempt-lease
+    //   renewal. Both carry additionalProperties:false, and that is
+    //   load-bearing on the REQUEST rather than cosmetic: the epoch is the
+    //   only fence this door has, and a schema that tolerated an unknown key
+    //   would let a lease_token start riding on the route the second RPC was
+    //   added to avoid. The response documents no token and no absolute expiry
+    //   for the same reason.
+    //
+    //   The THIRD is M-10's repair and is a schema rather than a reuse.
+    //   400/500 used to $ref PhoneAttemptHeartbeatResponse, whose status is
+    //   enum [ok, lease_lost] under additionalProperties:false, while the
+    //   route answers invalid_request and phone_heartbeat_error — so every
+    //   consumer generated from this spec rejected every 400 and 500 the
+    //   route emits. PhoneWorkerError could not take the job either: it is
+    //   {ok, error} and this route answers {ok, status}. Widening the 200's
+    //   enum was the other way out and is the wrong one — lease_lost is the
+    //   single answer that terminates a live call, and the retryable codes
+    //   must stay outside the pair a worker reads as a verdict.
+    // 160 (base) + 2 (P3) + 31 (P6) + 5 (P4) + 8 (P4b) + 3 (P5) + 3 (0045)
+    //   = 212, re-derived.
+    expect(Object.keys(schemas).length).toBe(212);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.
@@ -969,6 +1102,129 @@ describe('OpenAPI document integrity', () => {
       }
     };
     walk(spec);
+  });
+
+  it('CONTROL: the $ref-sibling walker detects a sibling, and descends into nested schemas and arrays', () => {
+    // A sibling buried three levels down, inside an array, inside a property
+    // map — i.e. exactly where the real ones live. If the walker only looked
+    // at the top level (or only at components.schemas), this stays empty and
+    // the CONTROL fails, which is the point of having it.
+    const planted = {
+      components: {
+        schemas: {
+          Outer: {
+            type: 'object',
+            properties: {
+              inner: {
+                type: 'array',
+                items: [
+                  { $ref: '#/components/schemas/Inner', nullable: true, description: 'nope' },
+                ],
+              },
+            },
+          },
+        },
+      },
+    };
+    const bad = sweepRefSiblings(planted);
+    expect(bad.refCount).toBe(1);
+    expect(bad.violations).toEqual([
+      {
+        path: '$.components.schemas.Outer.properties.inner.items[0]',
+        siblings: ['description', 'nullable'],
+      },
+    ]);
+
+    // And the CONTROL's own control: the SAME shape, written the 3.0 way,
+    // is clean — so the rule is not simply "anything nested fails".
+    const fixed = {
+      components: {
+        schemas: {
+          Outer: {
+            type: 'object',
+            properties: {
+              inner: {
+                type: 'array',
+                items: [
+                  {
+                    nullable: true,
+                    description: 'fine',
+                    allOf: [{ $ref: '#/components/schemas/Inner' }],
+                  },
+                ],
+              },
+            },
+          },
+        },
+      },
+    };
+    const good = sweepRefSiblings(fixed);
+    expect(good.refCount).toBe(1);
+    expect(good.violations).toEqual([]);
+  });
+
+  it('no $ref in the document has a sibling key (3.0.x ignores them)', () => {
+    const sweep = sweepRefSiblings(spec);
+    // Non-vacuity: the walk must actually reach the document's $refs. A
+    // walker that visited nothing would report zero violations too.
+    expect(sweep.refCount).toBeGreaterThan(400);
+    expect(
+      sweep.violations,
+      'a $ref with siblings: in OpenAPI 3.0.x the siblings are IGNORED. ' +
+        'Use `nullable: true` (or description/example) alongside ' +
+        '`allOf: [ { $ref: … } ]` instead of alongside the $ref itself.',
+    ).toEqual([]);
+  });
+
+  it('PhoneRuntimeState.last_due accepts the shipped default (null) and still enforces the summary shape', () => {
+    // The concrete bug this rule was written for. Both switches ship false,
+    // so `last_due: null` is what EVERY default deployment returns from
+    // GET /api/phone/health until a due pass completes; a spec that made it
+    // non-nullable broke every generated client on the first call.
+    const base = {
+      enabled: false,
+      running: false,
+      loops: [],
+      last_due: null as unknown,
+      config: {},
+      dial_jobs: {},
+      last_reclaimed: null,
+      last_expired: null,
+      last_reconciled: null,
+      // 0045's three. All REQUIRED, and all present in the disabled shape the
+      // registry returns when no runtime is registered — which is what every
+      // default deployment answers — so a spec that made them optional would
+      // stop catching a handler that dropped one. `start_failed` in
+      // particular is the whole point: it is the ONLY field that separates a
+      // process nobody armed from one whose arming threw, and on the shipped
+      // default it is `false` alongside `enabled: false`.
+      last_rolled: null,
+      last_stranded: null,
+      start_failed: false,
+      sweeps_not_ok: [],
+    };
+    expect(validateNamed(base, 'PhoneRuntimeState', spec)).toEqual([]);
+
+    // …and each of the three is genuinely REQUIRED, not merely documented: a
+    // body missing one must be rejected. Without this the `required` list
+    // could be dropped and every assertion above would still pass.
+    for (const key of ['start_failed', 'last_rolled', 'last_stranded'] as const) {
+      const { [key]: _omitted, ...missing } = base;
+      expect(
+        validateNamed(missing, 'PhoneRuntimeState', spec).length,
+        `${key} must be required on PhoneRuntimeState`,
+      ).toBeGreaterThan(0);
+    }
+
+    // …and the allOf wrapper must NOT have switched the check off: a non-null
+    // last_due is still validated against PhoneRuntimeDueSummary.
+    const summarySchema = ((spec.components as YMap).schemas as YMap).PhoneRuntimeDueSummary as YMap;
+    const summaryKeys = Object.keys(summarySchema.properties as YMap);
+    expect(summaryKeys.length).toBeGreaterThan(0);
+    expect(
+      validateNamed({ ...base, last_due: { not_a_documented_key: 1 } }, 'PhoneRuntimeState', spec).length,
+      'allOf must not weaken validation of a non-null last_due',
+    ).toBeGreaterThan(0);
   });
 
   it('documents every route the app registers and nothing else', () => {
@@ -1009,6 +1265,11 @@ describe('auth boundary vs spec security model', () => {
     'POST /api/internal/phone/assessment/start',
     'POST /api/internal/phone/assessment/turn',
     'POST /api/internal/phone/assessment/complete',
+    // 0045, same surface and same boundary: the attempt-lease renewal. Behind
+    // the worker secret, not a recruiter session, so it answers the worker's
+    // 401 `authentication_required` rather than the middleware's
+    // `authentication_error`.
+    'POST /api/internal/phone/attempt/heartbeat',
     // Ashby webhook: HMAC-gated (not recruiter-authenticated), mounted pre-auth.
     'POST /api/integrations/ashby/webhook',
     // LiveKit phone webhook: JWT-gated (not recruiter-authenticated), mounted
@@ -2458,6 +2719,10 @@ describe('phone operator API bodies match the documented schemas', () => {
     const stores = {
       admitAttempt: async () => ({ status: 'ok' }),
       heartbeatAttempt: async () => ({ status: 'ok' }),
+      heartbeatAttemptByEpoch: async () => ({ status: 'ok' as const }),
+      sweepDayRolled: async () => ({ status: 'ok' as const }),
+      sweepStrandedSessions: async () => ({ status: 'ok' as const }),
+      claimSweep: async () => ({ status: 'ok' as const }),
       reclaimAttemptLeases: async () => ({ status: 'ok' }),
       applyEvent: async () => ({ status: 'applied' }),
       // A reschedule (non-null expected version) supersedes the live row and
@@ -2585,5 +2850,213 @@ describe('phone operator API bodies match the documented schemas', () => {
       'PhoneHaltClearResponse',
       spec,
     ).length).toBeGreaterThan(0);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════
+//  0045 / M-10 — THE HEARTBEAT'S DOCUMENTED BODIES ARE THE BODIES IT SENDS
+// ════════════════════════════════════════════════════════════════════
+//
+// `references only component schemas that exist` proves the heartbeat's refs
+// RESOLVE. That is the whole of what the suite used to know about them, and
+// resolving is not satisfying: 400 and 500 both pointed at
+// `PhoneAttemptHeartbeatResponse`, whose `status` is `enum: [ok, lease_lost]`
+// under `additionalProperties: false`, while the route answers
+// `invalid_request` and `phone_heartbeat_error`. The schema's own description
+// said in as many words that those are not members of the enum — while the
+// responses pointed at it. A consumer generated from that spec rejects every
+// 400 and every 500 the route emits, and nothing in this file could see it,
+// because a $ref that resolves is all a ref-existence test asks for.
+//
+// So this block drives the REAL route for each documented status and validates
+// the live body against WHATEVER SCHEMA THE SPEC NAMES for that status. It is
+// deliberately not written against schema names: reading the ref out of the
+// document is what makes re-pointing a response at a schema it cannot satisfy
+// fail here rather than in a consumer's generated client.
+
+describe('0045 M-10 — every documented heartbeat status validates against the schema the spec names', () => {
+  const HEARTBEAT_PATH = '/api/internal/phone/attempt/heartbeat';
+  const SECRET = process.env.WORKER_CONTEXT_SECRET as string;
+  const HB_ATTEMPT = '00000000-0000-4000-8000-0000000000c1';
+  const HB_SESSION = '00000000-0000-4000-8000-0000000000c2';
+  const HB_NOW = new Date('2026-08-23T18:31:00Z');
+
+  /** The schema `$ref` the SPEC names for one response status. */
+  function refFor(status: string): string {
+    const paths = (spec as YMap).paths as YMap;
+    const op = (paths[HEARTBEAT_PATH] as YMap).post as YMap;
+    const responses = op.responses as YMap;
+    const entry = responses[status] as YMap | undefined;
+    expect(entry, `${HEARTBEAT_PATH} documents no ${status} response`).toBeDefined();
+    const json = ((entry!.content as YMap)['application/json']) as YMap;
+    const ref = (json.schema as YMap).$ref as string;
+    expect(typeof ref, `${status} has no schema $ref`).toBe('string');
+    return ref;
+  }
+
+  function heartbeatApp(heartbeatAttemptByEpoch: unknown): express.Express {
+    const a = express();
+    a.use(express.json());
+    a.use('/api/internal/phone', createPhoneWorkerRouter({
+      stores: { heartbeatAttemptByEpoch } as never,
+      configSource: { PHONE_SCREENING_ENABLED: 'true' } as never,
+      now: () => HB_NOW,
+    }));
+    return a;
+  }
+
+  const BODY = { attempt_id: HB_ATTEMPT, session_id: HB_SESSION, epoch: 0 };
+
+  it('200 ok — the renewal body matches PhoneAttemptHeartbeatResponse, cadence and all', async () => {
+    const app = heartbeatApp(async () => ({ status: 'ok' as const }));
+    const res = await request(app)
+      .post(HEARTBEAT_PATH)
+      .set('authorization', `Bearer ${SECRET}`)
+      .send(BODY);
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('ok');
+    // The cadence really is present, so the property was validated rather
+    // than skipped over an absent optional field.
+    expect(typeof res.body.next_heartbeat_seconds).toBe('number');
+    expect(validateResponseBody(res.body, refFor('200'), spec)).toEqual([]);
+  });
+
+  it('200 lease_lost — the terminal verdict carries NO cadence, and that is documented', async () => {
+    const app = heartbeatApp(async () => ({ status: 'lease_lost' as const }));
+    const res = await request(app)
+      .post(HEARTBEAT_PATH)
+      .set('authorization', `Bearer ${SECRET}`)
+      .send(BODY);
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('lease_lost');
+    // Deliberately absent: a worker that has lost its lease must not be able
+    // to keep beating on it.
+    expect(res.body.next_heartbeat_seconds).toBeUndefined();
+    expect(validateResponseBody(res.body, refFor('200'), spec)).toEqual([]);
+  });
+
+  it('400 invalid_request — the LEASE TOKEN case, and it must validate against the documented 400', async () => {
+    // The exact rejection the request schema's additionalProperties:false
+    // exists for. Before M-10 the documented 400 was
+    // PhoneAttemptHeartbeatResponse and this body violated its status enum.
+    const app = heartbeatApp(async () => {
+      throw new Error('the RPC must never be reached for a malformed body');
+    });
+    const res = await request(app)
+      .post(HEARTBEAT_PATH)
+      .set('authorization', `Bearer ${SECRET}`)
+      .send({ ...BODY, lease_token: 'must-not-ride-on-this-route' });
+
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ ok: false, status: 'invalid_request' });
+    expect(validateResponseBody(res.body, refFor('400'), spec)).toEqual([]);
+  });
+
+  it('500 phone_heartbeat_error — a thrown store call, validated against the documented 500', async () => {
+    const app = heartbeatApp(async () => { throw new Error('rpc_boom'); });
+    const res = await request(app)
+      .post(HEARTBEAT_PATH)
+      .set('authorization', `Bearer ${SECRET}`)
+      .send(BODY);
+
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ ok: false, status: 'phone_heartbeat_error' });
+    // Sanitized: no driver message reaches the wire.
+    expect(JSON.stringify(res.body)).not.toContain('rpc_boom');
+    expect(validateResponseBody(res.body, refFor('500'), spec)).toEqual([]);
+  });
+
+  it('500 phone_heartbeat_error — an UNRECOGNISED RPC status takes the same documented path', async () => {
+    // The other 500. An answer this build does not understand must stay
+    // retryable rather than being folded into lease_lost.
+    const app = heartbeatApp(async () => ({ status: 'some_future_status' as never }));
+    const res = await request(app)
+      .post(HEARTBEAT_PATH)
+      .set('authorization', `Bearer ${SECRET}`)
+      .send(BODY);
+
+    expect(res.status).toBe(500);
+    expect(res.body.status).toBe('phone_heartbeat_error');
+    expect(JSON.stringify(res.body)).not.toContain('some_future_status');
+    expect(validateResponseBody(res.body, refFor('500'), spec)).toEqual([]);
+  });
+
+  it('401 and 403 really are PhoneWorkerError-shaped, which is why 400/500 are not', async () => {
+    // The contrast that makes the new schema necessary rather than tidy: the
+    // auth refusals answer {ok, error} and the route's own refusals answer
+    // {ok, status}. One schema cannot document both under
+    // additionalProperties:false.
+    const app = heartbeatApp(async () => ({ status: 'ok' as const }));
+
+    const anonymous = await request(app).post(HEARTBEAT_PATH).send(BODY);
+    expect(anonymous.status).toBe(401);
+    expect(validateResponseBody(anonymous.body, refFor('401'), spec)).toEqual([]);
+
+    const wrong = await request(app)
+      .post(HEARTBEAT_PATH)
+      .set('authorization', `Bearer ${'x'.repeat(SECRET.length)}`)
+      .send(BODY);
+    expect(wrong.status).toBe(403);
+    expect(validateResponseBody(wrong.body, refFor('403'), spec)).toEqual([]);
+  });
+
+  it('503 — the disabled deployment answers PhoneWorkerError, as documented', async () => {
+    const a = express();
+    a.use(express.json());
+    a.use('/api/internal/phone', createPhoneWorkerRouter({
+      stores: {} as never,
+      configSource: {} as never,
+      now: () => HB_NOW,
+    }));
+    const res = await request(a)
+      .post(HEARTBEAT_PATH)
+      .set('authorization', `Bearer ${SECRET}`)
+      .send(BODY);
+
+    expect(res.status).toBe(503);
+    expect(validateResponseBody(res.body, refFor('503'), spec)).toEqual([]);
+  });
+
+  it('the 200 enum stayed CLOSED — the repair was a new schema, not a widened verdict', () => {
+    // The other way to make the 400/500 refs "valid" is to add
+    // invalid_request and phone_heartbeat_error to the 200's enum. That is
+    // the wrong repair and this pins it out: lease_lost is the one answer
+    // that terminates a live call, and a retryable code sharing its
+    // vocabulary is how a transient 500 ends a conversation.
+    const schemas = ((spec as YMap).components as YMap).schemas as YMap;
+    const ok = (((schemas.PhoneAttemptHeartbeatResponse as YMap).properties as YMap)
+      .status as YMap).enum as YValue[];
+    expect(ok).toEqual(['ok', 'lease_lost']);
+
+    const err = (((schemas.PhoneAttemptHeartbeatError as YMap).properties as YMap)
+      .status as YMap).enum as YValue[];
+    expect(err).toEqual(['invalid_request', 'phone_heartbeat_error']);
+    // DISJOINT, in both directions.
+    for (const v of err) expect(ok).not.toContain(v);
+    for (const v of ok) expect(err).not.toContain(v);
+    // And the error body is strict, so a driver message cannot ride along.
+    expect((schemas.PhoneAttemptHeartbeatError as YMap).additionalProperties).toBe(false);
+  });
+
+  it('NEGATIVE CONTROL — the validator would have caught the old refs', () => {
+    // Without this the block above could pass against a spec that pointed
+    // 400 and 500 anywhere at all. Validating the live 400 body against the
+    // schema the OLD spec named must produce errors.
+    const invalid = { ok: false, status: 'invalid_request' };
+    expect(validateResponseBody(invalid, 'PhoneAttemptHeartbeatResponse', spec).length)
+      .toBeGreaterThan(0);
+    const failed = { ok: false, status: 'phone_heartbeat_error' };
+    expect(validateResponseBody(failed, 'PhoneAttemptHeartbeatResponse', spec).length)
+      .toBeGreaterThan(0);
+    // ...and PhoneWorkerError, the other candidate, is wrong for the same
+    // body in the opposite direction: it demands `error` and forbids
+    // `status`.
+    expect(validateResponseBody(invalid, 'PhoneWorkerError', spec).length)
+      .toBeGreaterThan(0);
+    // CONTROL: the schema the spec now names accepts both.
+    expect(validateResponseBody(invalid, 'PhoneAttemptHeartbeatError', spec)).toEqual([]);
+    expect(validateResponseBody(failed, 'PhoneAttemptHeartbeatError', spec)).toEqual([]);
   });
 });

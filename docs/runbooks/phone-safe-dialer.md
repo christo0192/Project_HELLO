@@ -20,6 +20,10 @@ Companion runbooks: `phone-webhook-ingress.md` (P3, the inbound half).
 It does **not** add a scheduler, a loop, or any caller for the dial controller. Arming
 that is a later phase's decision, exactly as P3 left `runPhoneReconciliation` uncalled.
 
+> **Superseded by P5.** That later phase has landed: `lib/phone-runtime/` is now the
+> production caller for both `dialPhoneAttempt` and `runPhoneReconciliation`. It ships
+> disabled. See `phone-runtime.md`.
+
 ---
 
 ## 2. The switches, and why there are so many
@@ -132,7 +136,10 @@ caller.
 ## 6. The lease must outlive the originate
 
 `waitUntilAnswered: true` makes the originate **block**, and the SDK's default `timeout`
-in that mode is 60 s — exactly the default `PHONE_LEASE_SECONDS`.
+in that mode is 60 s. That was once *exactly* the default `PHONE_LEASE_SECONDS`; the lease
+default is now 180 s (see `phone-runtime.md` §6 for why), so the two no longer coincide.
+The hazard was never the coincidence, though — it is that a bound holding a fleet slot
+would otherwise be whatever the provider SDK happens to default to.
 
 If the originate outlives its lease, `reclaim_phone_attempt_leases` abandons the attempt
 while the dial is still in flight: two calls hold one fleet slot, and the engagement has
@@ -144,8 +151,10 @@ before touching the SDK if it cannot** — including when the heartbeat succeeds
 900 s clamp returns less than we asked for. "We asked for enough" is not "we have
 enough".
 
-Keep `PHONE_ORIGINATE_TIMEOUT_SECONDS` (default 30) well below `PHONE_LEASE_SECONDS`
-(default 60).
+Keep `PHONE_ORIGINATE_TIMEOUT_SECONDS` (default **60**, bounded 5–90) well below
+`PHONE_LEASE_SECONDS` (default **180**, bounded 5–900). The originate default was
+documented here as 30 for a while; `PHONE_DIAL_BOUNDS.originateTimeoutSeconds` has always
+read `def: 60`, and 60 is what `.env.example` ships.
 
 ---
 
@@ -195,11 +204,21 @@ proposes. An LLM-driven caller is exactly the client that will confidently propo
 
 ## 9. Enabling, in order
 
-> **STOP — steps 1–5 are safe; step 6 is not yet.** Step 6 places a call to a real
-> person. As shipped, that call **records the candidate and produces no transcript and
-> no assessment** (§12), and a reconnect re-asks every question. Do not take step 6 for a
-> real candidate until the persistence path in §12 has landed. Steps 1–5 reach no
-> carrier and are the whole of what this change is ready for.
+> **UPDATED BY P4b — the §12 block is lifted** (merged as `ee09ae1`, PR #98, migration
+> `0044`; see `phone-assessment-resume.md`). Two statements this banner used to make are
+> no longer true. The phone lane now persists a session-scoped question plan, an ordered
+> transcript and a cursor through `start_phone_assessment` and
+> `commit_phone_question_boundary`, so **a reconnect asks the next unfinished key and
+> never re-asks a committed one**; and a completed phone screening now **produces a real
+> scored assessment row** — `/assessment/complete` awaits `runAssessment` and verifies
+> the row before anything claims a completion.
+>
+> **Steps 1–5 are still safe; step 6 still places a call to a real person**, and it is
+> still the step to take deliberately rather than by following a list. What gated it has
+> changed from a block into an interlock: **P4b must be deployed with P4a.** Apply `0044`
+> and deploy the P4b worker before step 6 — on P4a alone the conversation is recorded and
+> scored for nothing, which is exactly what the old block existed to prevent
+> (`phone-assessment-resume.md` §8).
 >
 > This warning exists because the rest of this section reads like a green light, and an
 > operator following it at 3am would not think to cross-check §12.
@@ -211,15 +230,22 @@ proposes. An LLM-driven caller is exactly the client that will confidently propo
    cannot reach a carrier.**
 5. Deploy the named phone worker with `PHONE_AGENT_NAME` set. Verify browser screening is
    unaffected (it must be — the browser worker was not touched).
-6. **Blocked on §12.** Adding a digest to `PHONE_DIAL_ALLOWLIST` and setting
-   `PHONE_DIAL_MODE=live` is the first call that can reach a carrier, and it reaches
-   exactly one number — but a real candidate answering it is recorded and screened for
-   nothing. Take this step only once §12 is closed, or knowingly, against a number you
-   control, as a transport rehearsal rather than a screening.
+6. **The first step that can reach a carrier.** Adding a digest to
+   `PHONE_DIAL_ALLOWLIST` and setting `PHONE_DIAL_MODE=live` reaches exactly one number.
+   §12 is closed, so a candidate answering it is now screened and scored — **provided the
+   deployment carries P4b**. Take this step only where `0044` is applied and the P4b
+   worker is deployed (`phone-assessment-resume.md` §8). On a P4a-only deployment it is a
+   transport rehearsal against a number you control, never a screening.
 
-Note also that every phone conversation currently terminates as `failed` /
-`assessment_aborted` by design (§12). That is the truthful state, not a fault to
-investigate, and it is the reason step 6 is gated.
+Note also that `failed` / `assessment_aborted` is **no longer the outcome of every phone
+conversation** — that was P4a's truthful-but-useless terminal and P4b replaced it. A
+finished screening now reaches `completed`, and it can only get there through a verified
+assessment row: `apply_phone_event` refuses `assessment.completed` with
+`assessment_missing` unless a phone-sourced row already exists, so the completion claim is
+enforced in SQL rather than by worker ordering. `failed` / `assessment_aborted` now means
+what it says — a call that produced nothing scorable, or a named scoring failure that
+survived three bounded retries (`phone-assessment-resume.md` §4 and §7). It is worth
+investigating rather than expected.
 
 Kill switch at any point: `POST /api/phone/halt`. It refuses admission, which refuses
 every dial.
@@ -241,7 +267,9 @@ every dial.
   id; P3 projects `phone_epoch` at the ingress boundary. Both the client and the gate
   accept an epoch, so wiring it is a one-line change once there is a worker-visible
   source.
-- **No scheduler is armed.** `dialPhoneAttempt` has no production caller.
+- ~~**No scheduler is armed.** `dialPhoneAttempt` has no production caller.~~
+  **CLOSED by P5** — `lib/phone-runtime/` is that caller, and it ships disabled. See
+  `phone-runtime.md`.
 - **A purge takes two passes when an egress is live.** The first stops the egress and
   refuses; the retry deletes. That is deliberate — LiveKit uploads asynchronously *after*
   the stop is accepted, so deleting in the same pass would race the upload exactly as

@@ -97,6 +97,7 @@ export {
 } from './ist-window.js';
 
 export {
+  PHONE_OPENING_GATE_SECONDS,
   PHONE_BOUNDS,
   PHONE_DIAL_MODES,
   MAX_DIAL_ALLOWLIST_ENTRIES,

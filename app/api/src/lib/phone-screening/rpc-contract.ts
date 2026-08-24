@@ -50,6 +50,11 @@ export const PHONE_RPC_NAMES = [
   'start_phone_assessment',
   'get_phone_assessment_state',
   'commit_phone_question_boundary',
+  // 0045
+  'heartbeat_phone_attempt_by_epoch',
+  'sweep_phone_day_rolled',
+  'sweep_phone_stranded_sessions',
+  'claim_phone_sweep',
 ] as const;
 
 export type PhoneRpcName = (typeof PHONE_RPC_NAMES)[number];
@@ -122,6 +127,28 @@ export const PHONE_RPC_PARAMETERS: Readonly<Record<PhoneRpcName, readonly string
       'p_turns',
       'p_now',
     ],
+    // ── 0045 ──────────────────────────────────────────────────────────
+    heartbeat_phone_attempt_by_epoch: [
+      'p_attempt_id',
+      'p_epoch',
+      'p_session_id',
+      'p_lease_seconds',
+      'p_now',
+    ],
+    sweep_phone_day_rolled: [
+      'p_limit',
+      'p_now',
+    ],
+    sweep_phone_stranded_sessions: [
+      'p_limit',
+      'p_now',
+    ],
+    claim_phone_sweep: [
+      'p_sweep',
+      'p_owner',
+      'p_ttl_seconds',
+      'p_now',
+    ],
   });
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -156,6 +183,14 @@ export const ADMIT_PHONE_ATTEMPT_STATUSES = [
   'state_not_admissible',
   'suppressed',
   'window_closed',
+  // ── 0045: the two per-CANDIDATE refusals ──────────────────────────────
+  // Every 0042 index is keyed by ENGAGEMENT, and a person is not: one
+  // candidate applying to two roles holds two engagements with two
+  // independent budgets and two independent IST-day slots. These are the
+  // refusals that make the anti-harassment guarantee true of the person
+  // rather than of the row.
+  'candidate_call_in_flight',
+  'candidate_daily_attempt_exists',
 ] as const;
 
 export type AdmitPhoneAttemptStatus = (typeof ADMIT_PHONE_ATTEMPT_STATUSES)[number];
@@ -168,6 +203,24 @@ export type AdmitPhoneAttemptStatus = (typeof ADMIT_PHONE_ATTEMPT_STATUSES)[numb
 export const HEARTBEAT_PHONE_ATTEMPT_STATUSES = ['ok', 'lease_lost'] as const;
 
 export type HeartbeatPhoneAttemptStatus = (typeof HEARTBEAT_PHONE_ATTEMPT_STATUSES)[number];
+
+/**
+ * 0045's epoch-fenced door answers with the SAME two words as the
+ * token-fenced one, deliberately. A caller that has lost its lease must not
+ * be able to tell WHY it lost it — "your epoch is stale" and "your lease was
+ * reclaimed" are the same instruction: stop.
+ */
+export const HEARTBEAT_PHONE_ATTEMPT_BY_EPOCH_STATUSES = ['ok', 'lease_lost'] as const;
+
+/** The two bounded 0045 sweeps. A bounded sweep always answers `ok`. */
+export const SWEEP_PHONE_DAY_ROLLED_STATUSES = ['ok'] as const;
+export const SWEEP_PHONE_STRANDED_SESSIONS_STATUSES = ['ok'] as const;
+
+/**
+ * `claim_phone_sweep` — `held_by_other` is a NORMAL answer, not a fault: it
+ * is what every replica but one hears on every tick.
+ */
+export const CLAIM_PHONE_SWEEP_STATUSES = ['ok', 'held_by_other', 'invalid_input'] as const;
 
 /** `reclaim_phone_attempt_leases` — a bounded sweep always answers `ok`. */
 export const RECLAIM_PHONE_ATTEMPT_LEASES_STATUSES = ['ok'] as const;
@@ -414,6 +467,10 @@ export const PHONE_RPC_STATUSES: Readonly<Record<PhoneRpcName, readonly string[]
     start_phone_assessment: START_PHONE_ASSESSMENT_STATUSES,
     get_phone_assessment_state: GET_PHONE_ASSESSMENT_STATE_STATUSES,
     commit_phone_question_boundary: COMMIT_PHONE_QUESTION_BOUNDARY_STATUSES,
+    heartbeat_phone_attempt_by_epoch: HEARTBEAT_PHONE_ATTEMPT_BY_EPOCH_STATUSES,
+    sweep_phone_day_rolled: SWEEP_PHONE_DAY_ROLLED_STATUSES,
+    sweep_phone_stranded_sessions: SWEEP_PHONE_STRANDED_SESSIONS_STATUSES,
+    claim_phone_sweep: CLAIM_PHONE_SWEEP_STATUSES,
   });
 
 /**
@@ -441,8 +498,15 @@ export const PHONE_RPC_STATUS_UNION: readonly string[] = Object.freeze(
  * `unknown_attempt`), which is why the increment is smaller than the member
  * count. The exact number is RE-DERIVED by the drift test from the migration
  * text, so this constant is a tripwire and never the source.
+ *
+ * 0045 took it from 68 to 72: `candidate_call_in_flight` and
+ * `candidate_daily_attempt_exists` on admission, and `held_by_other` and
+ * `invalid_input` on the sweep claim. The two sweeps and the epoch-fenced
+ * heartbeat added no new members — `ok` and `lease_lost` were already in the
+ * union, which is the whole reason the increment is smaller than the number
+ * of RPCs added.
  */
-export const PHONE_RPC_STATUS_COUNT = 68;
+export const PHONE_RPC_STATUS_COUNT = 72;
 
 /**
  * RESULT KEYS the API's behaviour DEPENDS on, per RPC.

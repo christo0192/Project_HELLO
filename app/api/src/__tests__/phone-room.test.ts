@@ -26,6 +26,10 @@ import { fileURLToPath } from 'node:url';
 
 /** The attempt this dial belongs to. Travels on the DISPATCH metadata. */
 const ATTEMPT_ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+/** The attempt's epoch. Carried on the dispatch so the agent can fence its
+ *  lease renewal on (attempt, epoch) — a stale agent from a superseded attempt
+ *  must not be able to renew the live attempt's lease. */
+const EPOCH = 1;
 
 // `requireLiveKitConfigured` reads a module-level `env` snapshot, so clearing
 // `process.env` after import would not move it. The seam is stubbed instead,
@@ -138,7 +142,7 @@ describe('P5 phone room — a phone room NEVER starts an egress', () => {
     const deps = { rooms } satisfies ProvisionDeps;
     expect(Object.keys(deps)).toEqual(['rooms']);
 
-    const result = await provisionPhoneRoom({ sessionId: SESSION, attemptId: ATTEMPT_ID, agentName: '' }, deps);
+    const result = await provisionPhoneRoom({ sessionId: SESSION, attemptId: ATTEMPT_ID, epoch: EPOCH, agentName: '' }, deps);
 
     expect(result.status).toBe('created');
     // Provisioning succeeded having touched exactly two room methods.
@@ -210,7 +214,7 @@ describe('P5 phone room — metadata is a closed set with no number in it', () =
     const rooms = roomsFake();
     const createDispatch = dispatchFake();
     await provisionPhoneRoom(
-      { sessionId: SESSION, attemptId: ATTEMPT_ID, agentName: AGENT },
+      { sessionId: SESSION, attemptId: ATTEMPT_ID, epoch: EPOCH, agentName: AGENT },
       { rooms, dispatch: { createDispatch }, correlationId: 'corr-9' },
     );
     const roomMetadata = JSON.parse(rooms.createRoom.mock.calls[0]![0].metadata);
@@ -220,15 +224,17 @@ describe('P5 phone room — metadata is a closed set with no number in it', () =
     expect(roomMetadata).not.toHaveProperty('attempt_id');
     expect(roomMetadata.session_id).toBe(SESSION);
 
-    // The dispatch names the attempt, and is a closed three-key object.
+    // The dispatch names the attempt AND its epoch, and is a closed four-key
+    // object. The epoch is what lets the agent fence its lease renewal.
     expect(dispatchMetadata).toEqual({
       session_id: SESSION,
       attempt_id: ATTEMPT_ID,
+      epoch: EPOCH,
       channel: 'phone',
     });
   });
 
-  it('the dispatch payload is a CLOSED three-key object over opaque ids', () => {
+  it('the dispatch payload is a CLOSED four-key object, and carries no lease token', () => {
     // Note what is NOT asserted here, and why. 0042's metadata sanitizer
     // rejects any string with 7+ consecutive digits, but that rule governs
     // `phone_call_events.metadata` — a DIFFERENT surface, which this payload
@@ -238,14 +244,25 @@ describe('P5 phone room — metadata is a closed set with no number in it', () =
     //
     // What actually matters is that the key set is closed and every value is an
     // opaque id, so there is no field through which a number could arrive.
-    const payload = JSON.parse(buildPhoneDispatchMetadata(SESSION, ATTEMPT_ID));
-    expect(Object.keys(payload).sort()).toEqual(['attempt_id', 'channel', 'session_id']);
-    for (const value of Object.values(payload)) {
+    const payload = JSON.parse(buildPhoneDispatchMetadata(SESSION, ATTEMPT_ID, EPOCH));
+    expect(Object.keys(payload).sort()).toEqual(['attempt_id', 'channel', 'epoch', 'session_id']);
+    for (const [key, value] of Object.entries(payload)) {
+      if (key === 'epoch') {
+        // The one non-string, and deliberately so: a fence, not an id. It is
+        // an integer and nothing else can be written through it.
+        expect(Number.isInteger(value)).toBe(true);
+        continue;
+      }
       expect(typeof value).toBe('string');
       // `+` and space are the shape of an E.164 value; neither can appear in a
       // uuid or in the literal channel marker.
       expect(value as string).not.toMatch(/[+ ]/);
     }
+    // THE LEASE TOKEN IS NOT HERE, and this is the assertion that says so.
+    // The agent renews by naming (attempt, epoch); the database looks up the
+    // token itself. A token on this channel would be a credential sitting in
+    // a metadata field readable by anything that can read room state.
+    expect(JSON.stringify(payload)).not.toMatch(/lease|token|secret/i);
   });
 });
 
@@ -284,7 +301,7 @@ describe('P5 phone room — the caps differ from the browser room on purpose', (
 
   it('passes both caps through to the provider verbatim', async () => {
     const rooms = roomsFake();
-    await provisionPhoneRoom({ sessionId: SESSION, attemptId: ATTEMPT_ID, agentName: '' }, { rooms });
+    await provisionPhoneRoom({ sessionId: SESSION, attemptId: ATTEMPT_ID, epoch: EPOCH, agentName: '' }, { rooms });
     expect(rooms.createRoom).toHaveBeenCalledWith({
       name: ROOM,
       emptyTimeout: PHONE_ROOM_EMPTY_TIMEOUT_SEC,
@@ -307,7 +324,7 @@ describe('P5 phone room — a reconnect adopts the room rather than forking it',
     });
 
     const result = await provisionPhoneRoom(
-      { sessionId: SESSION, attemptId: ATTEMPT_ID, agentName: '' },
+      { sessionId: SESSION, attemptId: ATTEMPT_ID, epoch: EPOCH, agentName: '' },
       { rooms, correlationId: 'corr-2' },
     );
 
@@ -333,7 +350,7 @@ describe('P5 phone room — a reconnect adopts the room rather than forking it',
       },
     });
 
-    const result = await provisionPhoneRoom({ sessionId: SESSION, attemptId: ATTEMPT_ID, agentName: AGENT }, { rooms });
+    const result = await provisionPhoneRoom({ sessionId: SESSION, attemptId: ATTEMPT_ID, epoch: EPOCH, agentName: AGENT }, { rooms });
 
     expect(result).toEqual({
       status: 'provider_failed',
@@ -356,7 +373,7 @@ describe('P5 phone room — dispatch is explicit because the phone worker is NAM
     const createDispatch = dispatchFake();
 
     const result = await provisionPhoneRoom(
-      { sessionId: SESSION, attemptId: ATTEMPT_ID, agentName: '' },
+      { sessionId: SESSION, attemptId: ATTEMPT_ID, epoch: EPOCH, agentName: '' },
       { rooms, dispatch: { createDispatch } },
     );
 
@@ -376,7 +393,7 @@ describe('P5 phone room — dispatch is explicit because the phone worker is NAM
     const createDispatch = dispatchFake();
 
     const result = await provisionPhoneRoom(
-      { sessionId: SESSION, attemptId: ATTEMPT_ID, agentName: AGENT },
+      { sessionId: SESSION, attemptId: ATTEMPT_ID, epoch: EPOCH, agentName: AGENT },
       { rooms, dispatch: { createDispatch }, correlationId: 'corr-3' },
     );
 
@@ -384,13 +401,13 @@ describe('P5 phone room — dispatch is explicit because the phone worker is NAM
     expect(createDispatch).toHaveBeenCalledTimes(1);
     // The DISPATCH payload, not the room payload — the attempt id lives here.
     expect(createDispatch).toHaveBeenCalledWith(ROOM, AGENT, {
-      metadata: buildPhoneDispatchMetadata(SESSION, ATTEMPT_ID),
+      metadata: buildPhoneDispatchMetadata(SESSION, ATTEMPT_ID, EPOCH),
     });
   });
 
   it('a name with NO dispatch seam deployed is still `no_named_agent`', async () => {
     const rooms = roomsFake();
-    const result = await provisionPhoneRoom({ sessionId: SESSION, attemptId: ATTEMPT_ID, agentName: AGENT }, { rooms });
+    const result = await provisionPhoneRoom({ sessionId: SESSION, attemptId: ATTEMPT_ID, epoch: EPOCH, agentName: AGENT }, { rooms });
     expect(result.dispatched).toBe(false);
     expect(result.reason).toBe('no_named_agent');
   });
@@ -402,7 +419,7 @@ describe('P5 phone room — dispatch is explicit because the phone worker is NAM
     });
 
     const result = await provisionPhoneRoom(
-      { sessionId: SESSION, attemptId: ATTEMPT_ID, agentName: AGENT },
+      { sessionId: SESSION, attemptId: ATTEMPT_ID, epoch: EPOCH, agentName: AGENT },
       { rooms, dispatch: { createDispatch } },
     );
 
@@ -430,7 +447,7 @@ describe('P5 phone room — dispatch is explicit because the phone worker is NAM
     });
 
     const result = await provisionPhoneRoom(
-      { sessionId: SESSION, attemptId: ATTEMPT_ID, agentName: AGENT },
+      { sessionId: SESSION, attemptId: ATTEMPT_ID, epoch: EPOCH, agentName: AGENT },
       { rooms, dispatch: { createDispatch } },
     );
 
@@ -451,7 +468,7 @@ describe('P5 phone room — an unconfigured LiveKit refuses before the provider'
     const createDispatch = dispatchFake();
 
     const result = await provisionPhoneRoom(
-      { sessionId: SESSION, attemptId: ATTEMPT_ID, agentName: AGENT },
+      { sessionId: SESSION, attemptId: ATTEMPT_ID, epoch: EPOCH, agentName: AGENT },
       { rooms, dispatch: { createDispatch } },
     );
 

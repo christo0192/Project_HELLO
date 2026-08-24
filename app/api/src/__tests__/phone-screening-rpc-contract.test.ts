@@ -68,18 +68,20 @@ describe('the extractor itself is not over-broad', () => {
 
   it('the status extractor is not vacuous — it finds what is there', () => {
     // A silently-empty extraction would make every vocabulary assertion pass.
-    expect(functionStatuses('admit_phone_attempt').size).toBe(26);
+    // 28 since 0045 added candidate_call_in_flight and
+    // candidate_daily_attempt_exists — the two per-CANDIDATE refusals.
+    expect(functionStatuses('admit_phone_attempt').size).toBe(28);
     expect(functionStatuses('schedule_phone_appointment')).toContain('ok_prereqs_pending');
     expect(() => functionStatuses('phone_ist_date')).toThrow(/no statuses extracted/);
     expect(() => functionBody('no_such_function')).toThrow(/no phone migration declares/);
   });
 });
 
-describe('the seventeen RPCs', () => {
+describe('the twenty-one RPCs', () => {
   it('the TS list is exactly the migrations\' service-role RPC set', () => {
     expect(new Set(PHONE_RPC_NAMES)).toEqual(new Set(RPC_NAMES));
     // Ten from 0042, four from 0043.
-    expect(PHONE_RPC_NAMES).toHaveLength(17);
+    expect(PHONE_RPC_NAMES).toHaveLength(21);
     for (const name of PHONE_RPC_NAMES) {
       // Searched across BOTH migrations: the question here is "is this granted
       // anywhere in the phone schema", not "which declaration wins".

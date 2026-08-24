@@ -18,6 +18,15 @@ import {
   registerRecordingRuntime,
   clearRecordingRuntimeRegistration,
 } from './lib/recording/health.js';
+import {
+  createPhoneRuntime,
+  type PhoneRuntimeHandle,
+} from './lib/phone-runtime/index.js';
+import {
+  armPhoneRuntime,
+  clearPhoneRuntimeRegistration,
+  recordPhoneRuntimeStartFailure,
+} from './lib/phone-runtime/health.js';
 
 const startupLogger = createLogger('startup');
 const app = createApp();
@@ -64,6 +73,31 @@ try {
   recordingRuntime = null;
 }
 
+// ── Phone runtime (disabled by default) ──────────────────────────────────────
+// A THIRD independent try/catch, for the same reason the recording runtime has
+// its own: three lanes, three gates, and no lane may prevent another — or the
+// API — from starting.
+//
+// The gate is BOTH `PHONE_SCREENING_ENABLED` and `PHONE_RUNTIME_ENABLED`, and
+// with the shipped defaults both are false, so `createPhoneRuntime` returns
+// null and nothing is constructed: no runner, no scheduler, no timer, no DB
+// poll, no LiveKit object and no call. This build changes nothing about a
+// running deployment until an operator turns two switches on deliberately.
+let phoneRuntime: PhoneRuntimeHandle | null = null;
+try {
+  phoneRuntime = createPhoneRuntime();
+} catch {
+  // Sanitized: the error is not logged verbatim because it can carry config text.
+  startupLogger.warn('unknown_event', { error_category: 'phone_runtime_start_failed' });
+  phoneRuntime = null;
+  // ...and RECORDED, not only logged. Without this the health surface reports
+  // `enabled: false` with no degrade reason — identical to a machine where an
+  // operator deliberately left both switches off. On a fleet where the flags
+  // ARE on, that is a false negative on the surface's most important question,
+  // and a log line on one replica is not a signal anybody is watching.
+  recordPhoneRuntimeStartFailure();
+}
+
 server.listen(env.port, () => {
   if (recordingRuntime) {
     recordingRuntime.scheduler.start();
@@ -78,6 +112,28 @@ server.listen(env.port, () => {
     // real tick bookkeeping instead of configuration. The registry is
     // process-local by design; the fleet-wide signal is the durable backlog.
     registerAshbyScheduler(ashbyWorkers.scheduler, ashbyWorkers.loopIntervalsMs);
+  }
+  if (phoneRuntime) {
+    // ── ARMING IS GUARDED TOO, NOT ONLY CONSTRUCTION ────────────────────
+    // `scheduler.start()` then `registerPhoneRuntime` used to sit here bare.
+    // A throw from `start()` — a metric-name collision from the derived loop
+    // set, a timer failure — skipped the registration, left `start_failed`
+    // false, and published `enabled: false` with NO degrade reason on a fleet
+    // where both switches are ON: the exact false negative the construction
+    // guard above exists to close, left open one line later. The throw also
+    // escaped this callback, where nothing catches it.
+    //
+    // `armPhoneRuntime` does both steps in the right order, records the
+    // failure on the health surface, and never throws. It lives in
+    // `health.ts` because a composition root cannot be unit-tested — this
+    // file opens a socket on import — and an arming provable only by
+    // grepping this file is an arming with no test.
+    if (!armPhoneRuntime(phoneRuntime)) {
+      // Sanitized: the error is not logged verbatim because it can carry
+      // config text. The DURABLE signal is `start_failed` on the health
+      // surface, which `armPhoneRuntime` has already set.
+      startupLogger.warn('unknown_event', { error_category: 'phone_runtime_arm_failed' });
+    }
   }
   startupLogger.info('startup_listen', {
     port: env.port,
@@ -96,6 +152,18 @@ shutdown.boot(server).then(async (code) => {
     try {
       clearAshbySchedulerRegistration();
       await ashbyWorkers.stop();
+    } catch {
+      // Never let a worker-stop failure change the process exit code.
+    }
+  }
+  if (phoneRuntime) {
+    try {
+      clearPhoneRuntimeRegistration();
+      // Stopped in its own try, like the others. An in-flight `phone.dial`
+      // claim either completes or fails UNDER ITS LEASE; an abandoned queue
+      // lease is recovered by `reclaim_expired_jobs`, and an abandoned ATTEMPT
+      // lease by `reclaim_phone_attempt_leases`, on any machine.
+      await phoneRuntime.stop();
     } catch {
       // Never let a worker-stop failure change the process exit code.
     }

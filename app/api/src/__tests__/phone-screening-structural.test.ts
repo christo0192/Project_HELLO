@@ -146,11 +146,14 @@ describe('1. every phone write goes through an RPC', () => {
     expect(stores).toBeDefined();
     const writeBody = code(stores!.source);
     const rpcCalls = [...writeBody.matchAll(/client\.rpc\(\s*'([a-z_]+)'/g)].map((m) => m[1]);
-    // SEVENTEEN since 0044 added the three assessment-persistence RPCs, on
-    // top of 0043's four recording-artifact ones. The count is pinned rather
-    // than merely non-zero so a seam that quietly stopped routing one call
-    // through an RPC would fail here.
-    expect(new Set(rpcCalls).size).toBe(17);
+    // TWENTY-ONE since 0045 added four: the epoch-fenced heartbeat that keeps
+    // an attempt lease alive for the length of a conversation, the two bounded
+    // sweeps (the no-answer day roll and the stranded-session resolution), and
+    // the sweep claim. Seventeen before that — 0044's three
+    // assessment-persistence RPCs on top of 0043's four recording ones. The
+    // count is pinned rather than merely non-zero so a seam that quietly
+    // stopped routing one call through an RPC would fail here.
+    expect(new Set(rpcCalls).size).toBe(21);
     // The write seam reaches NO table, only RPCs.
     expect(writeBody, 'stores.ts uses a table accessor').not.toMatch(/\bclient\s*\.\s*from\s*\(/);
     // A type-only import of the client type is fine; a VALUE import is not.
@@ -335,6 +338,21 @@ describe('2. no provider, no dialing, no network, no Ashby mutation', () => {
       'integrations/livekit-phone-dial/recording-purge.ts',
       'integrations/livekit-phone-dial/sip.ts',
       'routes/phone-worker.ts',
+      // P5 — the runtime orchestration. It lives in its own package for a
+      // structural reason, not a stylistic one: a worker loop needs
+      // `setInterval`, the queue library and a logger, and all three are
+      // forbidden in this module by the FORBIDDEN table above. So the loops
+      // sit beside the domain core and import it, exactly as `lib/recording/`
+      // sits beside the recording domain.
+      //
+      // These are the files that touch the core. `config.ts`,
+      // `dial-handler.ts` and `livekit-clients.ts` are deliberately absent —
+      // they do not import it, and this set is asserted as a BIJECTION, so
+      // listing a file that does not import would fail exactly as loudly as
+      // omitting one that does.
+      'lib/phone-runtime/due-loop.ts',
+      'lib/phone-runtime/read.ts',
+      'lib/phone-runtime/runtime.ts',
     ]);
     const seen = new Set<string>();
     for (const file of allSourceFiles(SRC_DIR)) {

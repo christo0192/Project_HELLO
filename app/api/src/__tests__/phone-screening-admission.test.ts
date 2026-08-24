@@ -76,6 +76,10 @@ function fakeStores(admit: AdmitPhoneAttemptResult): FakeStores {
       return admit;
     },
     heartbeatAttempt: unreachable,
+    heartbeatAttemptByEpoch: unreachable,
+    sweepDayRolled: unreachable,
+    sweepStrandedSessions: unreachable,
+    claimSweep: unreachable,
     reclaimAttemptLeases: unreachable,
     applyEvent: unreachable,
     // 0044. Admission never touches the assessment path.

@@ -159,6 +159,35 @@ const assessmentStartSchema = z
   })
   .strict();
 
+/**
+ * The attempt heartbeat (0045).
+ *
+ * Three keys and `.strict()`. `epoch` is the fence: the worker names which
+ * attempt AND which generation of it, and the database looks the lease token
+ * up itself.
+ *
+ * THERE IS NO `lease_token` FIELD AND THERE MUST NEVER BE ONE. The
+ * conversation runs in the LiveKit agent, not in the process that admitted the
+ * attempt, so a token-fenced renewal would mean shipping the token to the
+ * agent — onto dispatch metadata and through every log line that ever printed
+ * a request body. 0045 added a second, epoch-fenced door precisely so this
+ * schema can stay this shape.
+ *
+ * `epoch` accepts 0: 0042 starts an engagement at epoch 0 and bumps on
+ * `disclosure.delivered`. The epoch a beat carries is normally ONE BEHIND
+ * the attempt row — admission mints it onto the dispatch metadata and the
+ * bump happens before the heartbeat ever starts — which is why the RPC
+ * fences on `epoch >= p_epoch`. An equality there answered `lease_lost` to
+ * the first beat of every consented call.
+ */
+const attemptHeartbeatSchema = z
+  .object({
+    attempt_id: z.string().regex(UUID_RE),
+    session_id: z.string().regex(UUID_RE),
+    epoch: z.number().int().min(0).max(1_000_000),
+  })
+  .strict();
+
 const assessmentTurnSchema = z
   .object({
     session_id: z.string().regex(UUID_RE),
@@ -372,6 +401,36 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
         epoch: parsed.data.epoch ?? undefined,
         now: now(),
       });
+      // ── WHY THERE IS NO EARLY LEASE RENEWAL HERE ────────────────────
+      // A draft of 0045 renewed the attempt lease on `classify.human` and
+      // `disclosure.delivered`, to cover the window between "a human
+      // answered" and "the agent's own heartbeat has beaten once". At the
+      // then-default 60 s lease a candidate who answered on the last ring
+      // arrived with roughly half a minute left, and the opening gate could
+      // spend most of it.
+      //
+      // It was removed when the SESSION became part of the heartbeat fence.
+      // This route's payload carries an attempt id and an epoch but no
+      // session, so renewing from here would mean either passing a session
+      // the caller never named, or making the fence optional — and a fence
+      // that is optional for one caller is a fence a reviewer stops trusting
+      // for all of them. Resolving the attempt's session with an extra read
+      // would work, but it buys a window of seconds at the cost of a read on
+      // the hottest authenticated path in the lane.
+      //
+      // AND THE WINDOW IS NOW CLOSED WHERE IT BELONGED — at the lease, not
+      // with a second renewal path. `PHONE_BOUNDS.leaseSeconds` defaults to
+      // 180, which covers `ringTimeoutSeconds` at its MAXIMUM plus a full
+      // `PHONE_OPENING_GATE_SECONDS`, and `dialPhoneAttempt` REFUSES
+      // `lease_too_short_for_gate` before it contacts the provider if a
+      // deployment configures less. So this route deliberately does nothing
+      // about it, and that is now a closed question rather than an accepted
+      // residual.
+      //
+      // Should the lease ever lapse in that window anyway, the failure stays
+      // LOUD rather than silent: the agent's first heartbeat answers
+      // `lease_lost` and halts the call. B-1 was bad because it was silent.
+
       // ── The ONE place a recording may begin ─────────────────────────
       // Only after `disclosure.delivered` has been APPLIED — not merely
       // posted, and not on any other event. 0043's
@@ -530,6 +589,66 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
     }
   });
 
+
+  // ── POST /attempt/heartbeat ───────────────────────────────────────
+  // 0045. The renewal that keeps a CONCURRENCY lease alive for the length of
+  // a conversation — the fleet-slot lease, not the 0028 queue lease.
+  //
+  // Why this route exists at all: the lease is minted by admission and
+  // extended just far enough to cover the originate. A screening runs for
+  // minutes, so without renewal the lease expired mid-call on every answered
+  // call, the slot was handed to somebody else while the candidate was still
+  // talking, the reclaim sweep marked a live conversation `abandoned`, and the
+  // agent's eventual `assessment.completed` was ignored because that edge is
+  // gated on `in_call`. A screening that was conducted and SCORED was lost,
+  // silently.
+  //
+  // The response carries no lease token and no absolute expiry — only the
+  // cadence the worker should beat at next. The SERVER owns that number, so
+  // the lease length stays a server-side knob and a worker cannot drift off it.
+  router.post('/attempt/heartbeat', requireWorkerPhoneAuth, async (req, res) => {
+    try {
+      if (!config().screeningEnabled) {
+        return res.status(503).json({ ok: false, error: 'phone_screening_disabled' });
+      }
+      const parsed = attemptHeartbeatSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ ok: false, status: 'invalid_request' });
+      }
+      const cfg = config();
+      const result = await stores().heartbeatAttemptByEpoch({
+        attemptId: parsed.data.attempt_id,
+        epoch: parsed.data.epoch,
+        sessionId: parsed.data.session_id,
+        leaseSeconds: cfg.leaseSeconds,
+        now: now(),
+      });
+      // `lease_lost` is forwarded ONLY when the RPC actually said it. It is
+      // the one answer that means "stop the conversation, the slot is gone,
+      // do not retry" — so collapsing every non-`ok` status into it would let
+      // an `unknown` reply from a future RPC revision silently terminate live
+      // calls. `OrUnknown` exists precisely because that can happen, and an
+      // answer we did not understand is not evidence the lease was lost.
+      if (result.status === 'lease_lost') {
+        return res.json({ ok: true, status: 'lease_lost' });
+      }
+      if (result.status !== 'ok') {
+        // Retryable and NOT terminal. The worker keeps beating; if the lease
+        // really has gone, the next beat says so in a word we recognise.
+        return res.status(500).json({ ok: false, status: 'phone_heartbeat_error' });
+      }
+      // A THIRD of the lease, the same ratio `lib/queue/runner.ts` uses for
+      // the queue lease. Under a half is the requirement; a third leaves room
+      // for one beat to be lost entirely without the lease lapsing.
+      return res.json({
+        ok: true,
+        status: 'ok',
+        next_heartbeat_seconds: Math.max(1, Math.floor(cfg.leaseSeconds / 3)),
+      });
+    } catch {
+      return res.status(500).json({ ok: false, status: 'phone_heartbeat_error' });
+    }
+  });
 
   // ── POST /assessment/start ────────────────────────────────────────
   // Binds the session, activates it, snapshots the plan, and hands back

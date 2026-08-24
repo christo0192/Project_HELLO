@@ -392,6 +392,16 @@ describe('errors and malformed answers', () => {
         sessionId: 's', questionKey: 'k1', expectedIndex: 0, sourceEventId: 'ev-1',
         turns: [{ speaker: 'bot', text: 'A?' }, { speaker: 'candidate', text: 'Y' }],
         now: NOW })],
+      // 0045. The heartbeat carries no transcript, but it DOES carry an
+      // attempt id and an epoch, and a leaked PostgREST error quotes the
+      // failing statement — which would put both in a thrown message that
+      // the worker route forwards nowhere but a log.
+      ['phone_heartbeat_attempt_error', () => stores.heartbeatAttemptByEpoch({
+        attemptId: 'a', epoch: 1, sessionId: 's', now: NOW })],
+      ['phone_sweep_day_rolled_error', () => stores.sweepDayRolled({ now: NOW })],
+      ['phone_sweep_stranded_error', () => stores.sweepStrandedSessions({ now: NOW })],
+      ['phone_claim_sweep_error', () => stores.claimSweep({
+        sweep: 'reconcile', owner: 'o', now: NOW })],
     ];
     expect(attempts).toHaveLength(PHONE_RPC_NAMES.length);
     for (const [code, run] of attempts) {

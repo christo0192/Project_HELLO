@@ -76,6 +76,11 @@ PHONE_ROOM_RE = re.compile(rf"^phone-(?P<session_id>{_UUID})$", re.IGNORECASE)
 _UUID_RE = re.compile(rf"^{_UUID}$", re.IGNORECASE)
 PHONE_CHANNEL = "phone"
 
+#: Upper bound on a dispatch epoch. An epoch counts a single attempt's
+#: re-dispatches, so anything past this is drift or a hostile blob, not a
+#: number the worker should carry into a lease claim.
+MAX_DISPATCH_EPOCH = 1_000_000
+
 # A 7+ digit run is the shape of a dialable number. 0042 rejects metadata that
 # carries one; this module refuses to SEND one, so the two ends agree.
 _DIGIT_RUN_RE = re.compile(r"\d{7,}")
@@ -119,6 +124,38 @@ def attempt_id_from_dispatch_metadata(ctx: Any) -> str | None:
     if not isinstance(attempt_id, str) or not _UUID_RE.match(attempt_id.strip()):
         return None
     return attempt_id.strip()
+
+
+def epoch_from_dispatch_metadata(ctx: Any) -> int | None:
+    """Return the attempt EPOCH from the job's dispatch metadata, or None.
+
+    The epoch is minted per DISPATCH, alongside the attempt id and on the same
+    blob, and it is what lets the server tell this leg's claim on the attempt
+    apart from a previous leg's — ``apply_phone_event`` answers ``ignored:
+    stale_epoch`` when they disagree. The heartbeat carries it for exactly that
+    reason: a stale leg must not be able to renew the live leg's lease.
+
+    Fails closed, and the caller must treat that as a REFUSAL TO CONDUCT THE
+    CALL rather than as "heartbeat disabled". Without an epoch the worker
+    cannot renew the concurrency lease; an unrenewed lease lapses part-way
+    through the screening, the reclaim sweep marks the attempt ``abandoned``
+    and frees the fleet slot while the candidate is still speaking, and the
+    assessment this leg eventually scores is then ignored. A conversation the
+    system cannot account for is one the worker must not have.
+
+    Strict on the type on purpose: the API mints a JSON number, so a string, a
+    float or a bool is drift rather than a value to coerce. ``bool`` is
+    excluded explicitly because it is an ``int`` in Python and ``True`` would
+    otherwise read as epoch 1.
+    """
+    payload = _json_object(dispatch_metadata_of(ctx))
+    channel = payload.get("channel")
+    if not isinstance(channel, str) or channel.strip().lower() != PHONE_CHANNEL:
+        return None
+    epoch = payload.get("epoch")
+    if isinstance(epoch, bool) or not isinstance(epoch, int):
+        return None
+    return epoch if 0 <= epoch <= MAX_DISPATCH_EPOCH else None
 
 
 def _json_object(raw: Any) -> dict[str, Any]:
@@ -241,6 +278,13 @@ APPOINTMENTS_PATH = "/api/internal/phone/appointments"
 ASSESSMENT_START_PATH = "/api/internal/phone/assessment/start"
 ASSESSMENT_TURN_PATH = "/api/internal/phone/assessment/turn"
 ASSESSMENT_COMPLETE_PATH = "/api/internal/phone/assessment/complete"
+#: P5: the lease renewal. Under `/api/internal/phone` with every other worker
+#: call, because that is the ONE mount (`app.ts`: `app.use('/api/internal/phone',
+#: phoneWorkerRouter)`). An earlier constant said `/api/phone-worker/...` and
+#: invented a rationale for it in this very comment; nothing served that path,
+#: so every beat 404'd and the agent halted a live call after two of them. A
+#: cross-language test now pins this string against the Express mount.
+HEARTBEAT_PATH = "/api/internal/phone/attempt/heartbeat"
 
 # STRICT allowlist. The server enforces its own; this is the worker half, so a
 # typo fails here rather than becoming a 4xx the caller has to interpret.
@@ -306,6 +350,62 @@ def phone_answer_timeout_sec() -> float:
     return _bounded_float(os.getenv("PHONE_ANSWER_TIMEOUT_SEC"), 90.0, 5.0, 300.0)
 
 
+# ── P5: the heartbeat cadence envelope ────────────────────────────────
+#
+# THE SERVER DICTATES THE CADENCE, because the server owns the lease. These
+# three numbers are not a policy competing with it; they are the envelope the
+# worker can actually honour, and they exist so a missing, absurd or hostile
+# `next_heartbeat_seconds` cannot either spin this loop hot or stretch it past
+# the lease.
+#
+#   * FALLBACK 20 s — `PHONE_BOUNDS.leaseSeconds` defaults to 60 and the queue
+#     runner's own precedent is lease/3. Used only when the server told us
+#     nothing usable.
+#   * MAX 30 s — lease/2 at the default lease. A cadence at or past half the
+#     lease cannot guarantee a second chance before it lapses, and the
+#     consecutive-failure bound below is derived from this ceiling.
+#   * MIN 2 s — `PHONE_BOUNDS.leaseSeconds` admits a lease as short as 5, so
+#     the floor has to sit under half of that. It is a floor at all only so a
+#     zero, negative or NaN value cannot turn the loop into a busy wait.
+HEARTBEAT_FALLBACK_SEC = 20.0
+HEARTBEAT_MIN_SEC = 2.0
+HEARTBEAT_MAX_SEC = 30.0
+
+#: How many CONSECUTIVE unconfirmed beats are tolerated before the leg halts.
+#:
+#: DERIVATION. The worker does not know the lease length — the server does —
+#: but it knows the cadence the server chose under it, and a cadence is only
+#: sound if it is at most half the lease (that is the invariant the clamp above
+#: enforces from this side). So the smallest lease consistent with a cadence of
+#: `interval` is `2 * interval`. Each consecutive failure costs one `interval`
+#: of wall clock plus the request's own timeout, so after 2 of them the whole
+#: GUARANTEED lease margin since the last confirmed renewal is spent and the
+#: lease may already have lapsed. At that moment the hazard is identical to
+#: `lease_lost` — the slot may already belong to another call — so the leg
+#: stops. One blip is a network; two in a row is an unprovable lease.
+HEARTBEAT_MAX_CONSECUTIVE_FAILURES = 2
+
+#: The two statuses `/attempt/heartbeat` answers. Enumerated rather than
+#: inferred: anything else is drift and is treated as "we do not know",
+#: never as a renewal.
+HEARTBEAT_OK_STATUS = "ok"
+HEARTBEAT_LEASE_LOST_STATUS = "lease_lost"
+
+
+def heartbeat_interval_sec(raw: Any) -> float:
+    """Clamp the server's cadence into the envelope the worker can honour.
+
+    `bool` is rejected before the numeric parse for the same reason the epoch
+    reader rejects it: `True` is an `int` and would otherwise clamp to the
+    floor and look like a deliberate 2-second cadence.
+    """
+    if isinstance(raw, bool):
+        return HEARTBEAT_FALLBACK_SEC
+    return _bounded_float(
+        raw, HEARTBEAT_FALLBACK_SEC, HEARTBEAT_MIN_SEC, HEARTBEAT_MAX_SEC
+    )
+
+
 class PhoneApiOutcome:
     """Result of one internal phone-API call.
 
@@ -320,6 +420,10 @@ class PhoneApiOutcome:
         # than on a subclass so a caller that reads them on an event outcome
         # gets a truthful `None` instead of an AttributeError.
         "cursor", "plan_complete", "expected_key",
+        # P5: carried only by `heartbeat_attempt` — the SERVER's cadence for
+        # the next beat, already clamped. Never a lease token: the response
+        # carries none and never will.
+        "next_heartbeat_seconds",
     )
 
     def __init__(
@@ -339,6 +443,7 @@ class PhoneApiOutcome:
         self.cursor: int | None = None
         self.plan_complete: bool = False
         self.expected_key: str | None = None
+        self.next_heartbeat_seconds: float | None = None
 
     def __repr__(self) -> str:  # pragma: no cover - diagnostics only
         return f"PhoneApiOutcome(ok={self.ok}, status={self.status!r})"
@@ -495,6 +600,82 @@ class PhoneEventClient:
                 str(data["ignored_reason"]) if data.get("ignored_reason") else None
             ),
         )
+
+    async def heartbeat_attempt(
+        self,
+        attempt_id: str,
+        session_id: str,
+        *,
+        epoch: int,
+    ) -> PhoneApiOutcome:
+        """Renew this attempt's concurrency lease for one more cadence.
+
+        THREE OUTCOMES, and the caller acts differently on every one of them.
+        Collapsing any two of them is the defect this method exists to make
+        impossible:
+
+          * ``ok`` True, ``status`` ``ok``, ``next_heartbeat_seconds`` set —
+            the lease is renewed and the SERVER has said when to beat next.
+          * ``ok`` False, ``status`` ``lease_lost`` — the slot is gone. The
+            conversation must STOP: the reclaim sweep has already freed the
+            slot and another call may be holding it, so continuing would run
+            two conversations against one fleet slot.
+          * ``ok`` False, ``status`` None, ``error_category`` set — we do not
+            know. A blip is not a lost lease and must not halt a live call, but
+            an unrenewed lease becomes a lost one, which is why the caller
+            bounds how many of these it will accept in a row.
+
+        ``ok`` is read from the server's flag AND its status, exactly as
+        ``complete_assessment`` does. ``lease_lost`` arrives inside a 200 whose
+        body says ``ok: true`` — reading that as success is precisely the
+        mistake that keeps a candidate talking to a leg that owns nothing.
+
+        THE RESPONSE CARRIES NO LEASE TOKEN and never will. The worker's claim
+        on the lease is the triple it sends (attempt, epoch, session); there is
+        nothing here to hold, hand on, or leak. The body is never logged, and
+        neither is any of the triple.
+        """
+        body = {
+            "attempt_id": str(attempt_id),
+            "epoch": int(epoch),
+            "session_id": str(session_id),
+        }
+        response = await self._post(HEARTBEAT_PATH, body, "attempt_heartbeat")
+        if isinstance(response, str):
+            return PhoneApiOutcome(False, error_category=response)
+
+        data = _response_json(response)
+        if not isinstance(data, dict) or data.get("ok") is not True:
+            _log.warn(
+                "unknown_event", error_type="phone_api_failed",
+                error_category=_ERR_MALFORMED, schema="attempt_heartbeat",
+            )
+            return PhoneApiOutcome(False, error_category=_ERR_MALFORMED)
+
+        status = data.get("status")
+        status_str = str(status) if status is not None else None
+        if status_str == HEARTBEAT_LEASE_LOST_STATUS:
+            _log.warn(
+                "unknown_event", error_type="phone_lease_lost",
+                error_category=HEARTBEAT_LEASE_LOST_STATUS,
+            )
+            return PhoneApiOutcome(False, HEARTBEAT_LEASE_LOST_STATUS)
+        if status_str != HEARTBEAT_OK_STATUS:
+            # An unrecognised status is NOT a renewal. It falls into the "we do
+            # not know" class deliberately, so a server that starts answering
+            # something new still runs out the failure bound rather than
+            # letting the leg keep talking on a lease nobody confirmed.
+            _log.warn(
+                "unknown_event", error_type="phone_api_failed",
+                error_category=_ERR_MALFORMED, schema="attempt_heartbeat",
+            )
+            return PhoneApiOutcome(False, error_category=_ERR_MALFORMED)
+
+        outcome = PhoneApiOutcome(True, HEARTBEAT_OK_STATUS)
+        outcome.next_heartbeat_seconds = heartbeat_interval_sec(
+            data.get("next_heartbeat_seconds")
+        )
+        return outcome
 
     async def book_appointment(
         self,
@@ -761,11 +942,26 @@ HALT_PERSISTENCE = "persistence_failed"
 HALT_SCORING = "scoring_unreachable"
 HALT_MALFORMED_EXCHANGE = "malformed_exchange"
 HALT_NO_ANSWER = "no_exchange_captured"
+# P5, and RETRYABLE in exactly the sense above. A lost or unprovable
+# concurrency lease is an infrastructure failure, not a candidate outcome: the
+# reclaim sweep has already moved the engagement out of `in_call` and restored
+# its previous state, so `assessment.aborted` would be both untrue and — being
+# gated on `in_call` — ignored anyway. The conversation is interrupted, and
+# 0042's reconnect budget owns what happens next.
+#
+# TWO reasons rather than one, because they are two different facts and an
+# operator has to be able to tell them apart: the server SAID the lease is gone,
+# versus the worker could no longer prove the lease is his. The hazard is the
+# same, which is why both halt; the diagnosis is not.
+HALT_LEASE_LOST = "lease_lost"
+HALT_LEASE_UNCONFIRMED = "lease_unconfirmed"
 
 #: The halt reasons that must post NOTHING. Enumerated rather than inferred, so
 #: a new reason has to declare which kind it is instead of defaulting into the
 #: silent one.
-RETRYABLE_HALTS: frozenset[str] = frozenset([HALT_PERSISTENCE, HALT_SCORING])
+RETRYABLE_HALTS: frozenset[str] = frozenset([
+    HALT_PERSISTENCE, HALT_SCORING, HALT_LEASE_LOST, HALT_LEASE_UNCONFIRMED,
+])
 
 
 def halt_is_retryable(reason: Any) -> bool:
@@ -1174,6 +1370,104 @@ async def run_phone_assessment(
     return PhoneAssessmentResult(
         scored=True, cursor=cursor, completed=completed, status=done.status,
     )
+
+
+# ── P5: the heartbeat that keeps the lease alive for the whole call ───
+#
+# THE ONE IDEA IN THIS SECTION. A concurrency lease sized to cover the
+# ORIGINATE is not a lease on the CONVERSATION. 0042 sets the fleet cap's slot
+# to be held only while `lease_expires_at > now`, extends the lease far enough
+# to cover the dial, and says in as many words that the cap's correctness
+# depends on the worker renewing it. Nothing renewed it. A screening runs for
+# minutes, so the lease lapsed mid-call on every answered call, the slot was
+# freed under a live conversation, the reclaim sweep marked the attempt
+# `abandoned` while the candidate was still speaking, and the assessment this
+# leg then scored was ignored because its edge is gated on `in_call`.
+#
+# This loop is that renewal. It does exactly one thing and it fails in exactly
+# one direction: when it can no longer PROVE the slot is ours, it stops the
+# conversation rather than keeping a candidate on a line the system has already
+# given to somebody else.
+
+
+async def run_phone_heartbeat(
+    *,
+    attempt_id: str,
+    session_id: str,
+    epoch: int,
+    client: PhoneEventClient,
+    halt: Callable[[str], Awaitable[Any]],
+    sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+    interval_sec: float | None = None,
+    max_consecutive_failures: int = HEARTBEAT_MAX_CONSECUTIVE_FAILURES,
+) -> str | None:
+    """Beat until cancelled, or until the lease can no longer be proved.
+
+    Returns the halt reason it stopped on, or runs forever — the caller is
+    expected to cancel it in a ``finally`` when the conversation ends.
+
+    ``sleep`` is the injected clock seam so the whole loop is testable without
+    wall time. ``halt`` is how it stops the conversation; it is a callback
+    rather than a raise because the conversation is being conducted by another
+    task and the honest way to end it is to cancel that task, not to let an
+    exception escape a background beat nobody is awaiting.
+
+    THE FIRST BEAT IS IMMEDIATE. It is the only chance to learn the server's
+    cadence before spending one, and a call answered on the last ring may have
+    very little of the originate lease left.
+    """
+    interval = heartbeat_interval_sec(interval_sec)
+    bound = max(1, int(max_consecutive_failures))
+    failures = 0
+
+    while True:
+        try:
+            outcome = await client.heartbeat_attempt(
+                attempt_id, session_id, epoch=epoch,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            # A raising client is a fault, not a renewal. It counts against the
+            # bound like any other unconfirmed beat rather than killing this
+            # task silently — a dead heartbeat task is the original defect
+            # wearing a different hat.
+            outcome = PhoneApiOutcome(False, error_category=_ERR_TRANSPORT)
+
+        if outcome.ok:
+            failures = 0
+            # Clamped HERE as well as in the client. The loop is what actually
+            # spends the time, so it does not take the length of its own sleep
+            # on trust from a field somebody else filled in.
+            interval = heartbeat_interval_sec(outcome.next_heartbeat_seconds)
+            _log.info("unknown_event", error_type="phone_lease_renewed")
+        elif outcome.status == HEARTBEAT_LEASE_LOST_STATUS:
+            # THE SLOT IS GONE. Another call may already be holding it, so
+            # there is no version of "carry on" that is safe.
+            _log.warn(
+                "unknown_event", error_type="phone_heartbeat_halted",
+                error_category=HALT_LEASE_LOST,
+            )
+            await halt(HALT_LEASE_LOST)
+            return HALT_LEASE_LOST
+        else:
+            failures += 1
+            _log.warn(
+                "unknown_event", error_type="phone_heartbeat_failed",
+                error_category=outcome.error_category or _ERR_MALFORMED,
+            )
+            if failures >= bound:
+                # The guaranteed lease margin since the last confirmed renewal
+                # is spent — see HEARTBEAT_MAX_CONSECUTIVE_FAILURES. From here
+                # the hazard is indistinguishable from `lease_lost`.
+                _log.warn(
+                    "unknown_event", error_type="phone_heartbeat_halted",
+                    error_category=HALT_LEASE_UNCONFIRMED,
+                )
+                await halt(HALT_LEASE_UNCONFIRMED)
+                return HALT_LEASE_UNCONFIRMED
+
+        await sleep(interval)
 
 
 # ── The callback-scheduling tool ──────────────────────────────────────
