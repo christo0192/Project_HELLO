@@ -5,6 +5,15 @@ name: Deploy (Fly)
 # undeployed on the voice worker while the API advanced — a merge to main now
 # deploys exactly the service(s) whose sources changed.
 #
+# Three deploy targets, three separate Fly apps, three separate deploy tokens:
+#   api          → project-hello-api         (FLY_API_TOKEN_API)
+#   browser-voice→ project-hello-voice       (FLY_API_TOKEN_VOICE)
+#   phone-voice  → project-hello-phone-voice (FLY_API_TOKEN_PHONE_VOICE)
+# The two voice apps run the SAME source image (app/voice-livekit) with
+# different run postures (browser = unnamed auto-dispatch, always-on; phone =
+# named, stopped/min-0 until canary). A change to that shared source therefore
+# deploys BOTH voice apps — each with its OWN app-scoped token, never conflated.
+#
 # Security properties (this file is production security code):
 #  - Least privilege: only `contents: read`. No write scopes.
 #  - Runs ONLY after the Quality workflow concludes success on a push to main
@@ -14,25 +23,34 @@ name: Deploy (Fly)
 #  - Deploys only the service(s) with changed sources (path diff of the merge).
 #  - Third-party and first-party actions are pinned to immutable full commit
 #    SHAs (no floating tags, no @master), consistent with repo hardening policy.
-#  - Database migrations are applied before either application deploy. A failed
-#    or unavailable migration credential blocks both deploys, preventing schema /
-#    runtime skew (for example a worker writing a column that production lacks).
-#  - Per-service Fly tokens: the API job can ONLY use FLY_API_TOKEN_API and the
-#    voice job ONLY FLY_API_TOKEN_VOICE, so a compromise of one job cannot deploy
-#    the other app. Tokens are consumed only as step env for flyctl, never
-#    echoed. Fly APP secrets (provider keys, Supabase, LiveKit) are untouched.
-#  - Post-deploy verification is CURRENT, not historical: API /api/health must
-#    return 200, and the voice worker must log "registered worker" with a
-#    timestamp at/after a watermark captured immediately before the release —
-#    a stale old registration line cannot satisfy the check.
+#  - Database migrations are applied before ANY application deploy. A failed or
+#    unavailable migration credential blocks every app deploy, preventing schema
+#    / runtime skew (for example a worker writing a column production lacks).
+#  - Per-app Fly tokens: each app job can use ONLY its own app-scoped token, so
+#    a compromise of one job cannot deploy another app. Tokens are consumed only
+#    as step env for flyctl, never echoed. Fly APP secrets (provider keys,
+#    Supabase, LiveKit, SIP trunk) are untouched by this workflow.
+#  - Post-deploy verification is CURRENT and POLICY-AWARE, never historical:
+#      * api           → GET /api/health must return 200.
+#      * browser-voice → run policy ALWAYS_ON: the worker must log "registered
+#        worker" with a timestamp at/after a watermark captured immediately
+#        before the release. A stale old registration line cannot satisfy it,
+#        and an absent current registration is a TRUE worker-down failure (the
+#        browser worker is production and must stay min-1/always-on).
+#      * phone-voice   → run policy STOPPED: the app is deployed but scaled to
+#        zero until the canary, so it runs no machine and registers no worker BY
+#        DESIGN. Verification proves a clean release on the correct app and does
+#        NOT demand a live registration — but it still never accepts a stale
+#        "registered worker" line as success (it asserts nothing of the sort).
 #
 # Prerequisite (one-time, owner action — NOT stored in VCS; no secret values):
-#   Two app-scoped repository secrets must exist, each a `fly tokens create
-#   deploy -a <app>` token:
-#     FLY_API_TOKEN_API    → deploy access to project-hello-api ONLY
-#     FLY_API_TOKEN_VOICE  → deploy access to project-hello-voice ONLY
-#     SUPABASE_DB_URL       → production Postgres connection URL used only by
-#                             the serialized migration job
+#   App-scoped repository secrets must exist, each a `fly tokens create deploy
+#   -a <app>` token:
+#     FLY_API_TOKEN_API          → deploy access to project-hello-api ONLY
+#     FLY_API_TOKEN_VOICE        → deploy access to project-hello-voice ONLY
+#     FLY_API_TOKEN_PHONE_VOICE  → deploy access to project-hello-phone-voice ONLY
+#     SUPABASE_DB_URL            → production Postgres connection URL used only by
+#                                  the serialized migration job
 #   Until they exist the corresponding job fails closed before deployment.
 
 on:
@@ -45,7 +63,7 @@ on:
         description: Service to redeploy manually (recovery valve)
         required: true
         type: choice
-        options: [api, voice, both]
+        options: [api, browser-voice, phone-voice, both, all]
 
 permissions:
   contents: read
@@ -66,6 +84,7 @@ jobs:
     outputs:
       api: ${{ steps.decide.outputs.api }}
       voice: ${{ steps.decide.outputs.voice }}
+      phone: ${{ steps.decide.outputs.phone }}
       database: ${{ steps.decide.outputs.database }}
       sha: ${{ steps.decide.outputs.sha }}
     steps:
@@ -86,11 +105,19 @@ jobs:
           sha='${{ steps.sha.outputs.sha }}'
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           if [ "$EVENT" = "workflow_dispatch" ]; then
+            # Default every target off, then turn on exactly what was requested.
+            api=false; voice=false; phone=false
             case "$SVC" in
-              api)   echo "api=true"  >> "$GITHUB_OUTPUT"; echo "voice=false" >> "$GITHUB_OUTPUT" ;;
-              voice) echo "api=false" >> "$GITHUB_OUTPUT"; echo "voice=true"  >> "$GITHUB_OUTPUT" ;;
-              both)  echo "api=true"  >> "$GITHUB_OUTPUT"; echo "voice=true"  >> "$GITHUB_OUTPUT" ;;
+              api)           api=true ;;
+              browser-voice) voice=true ;;
+              phone-voice)   phone=true ;;
+              both)          api=true; voice=true ;;
+              all)           api=true; voice=true; phone=true ;;
+              *) echo "::error::unknown service '$SVC'"; exit 1 ;;
             esac
+            echo "api=$api"     >> "$GITHUB_OUTPUT"
+            echo "voice=$voice" >> "$GITHUB_OUTPUT"
+            echo "phone=$phone" >> "$GITHUB_OUTPUT"
             # Manual application deploys still apply every pending migration first.
             echo "database=true" >> "$GITHUB_OUTPUT"
             exit 0
@@ -98,7 +125,15 @@ jobs:
           # Path diff of the merge commit (fallback to single-commit file list).
           changed="$(git diff --name-only "${sha}^" "${sha}" 2>/dev/null || git show --name-only --format= "${sha}")"
           echo "$changed" | grep -qE '^app/api/'          && echo "api=true"   >> "$GITHUB_OUTPUT" || echo "api=false"   >> "$GITHUB_OUTPUT"
-          echo "$changed" | grep -qE '^app/voice-livekit/' && echo "voice=true" >> "$GITHUB_OUTPUT" || echo "voice=false" >> "$GITHUB_OUTPUT"
+          # The two voice apps share app/voice-livekit sources: a change there
+          # deploys BOTH (browser and phone), each on its own app-scoped token.
+          if echo "$changed" | grep -qE '^app/voice-livekit/'; then
+            echo "voice=true" >> "$GITHUB_OUTPUT"
+            echo "phone=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "voice=false" >> "$GITHUB_OUTPUT"
+            echo "phone=false" >> "$GITHUB_OUTPUT"
+          fi
           echo "$changed" | grep -qE '^app/supabase/migrations/' && echo "database=true" >> "$GITHUB_OUTPUT" || {
             # Any application release first converges pending migrations. This
             # also recovers safely if an earlier migration job was interrupted.
@@ -156,19 +191,19 @@ jobs:
           done
           echo "::error::API health check did not return 200"; exit 1
 
-  deploy-voice:
+  deploy-browser-voice:
     needs: [detect, migrate-production]
     if: needs.detect.outputs.voice == 'true'
     runs-on: ubuntu-latest
     concurrency:
-      group: fly-deploy-voice
+      group: fly-deploy-browser-voice
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.x
         with:
           ref: ${{ needs.detect.outputs.sha }}
       - uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be # v1.5
-      - name: Deploy voice worker
+      - name: Deploy browser voice worker
         id: deploy
         working-directory: app/voice-livekit
         env:
@@ -179,12 +214,15 @@ jobs:
           # cannot be satisfied by a stale historical "registered worker" line.
           echo "watermark=$(date -u +%Y-%m-%dT%H:%M:%S)" >> "$GITHUB_OUTPUT"
           flyctl deploy --remote-only --config fly.toml
-      - name: Verify CURRENT worker registration
+      - name: Verify CURRENT worker registration (run policy ALWAYS_ON)
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_VOICE }}
           WATERMARK: ${{ steps.deploy.outputs.watermark }}
         run: |
           set -euo pipefail
+          # The browser worker is production and MUST stay min-1/always-on. An
+          # absent current registration is a genuine worker-down incident, not a
+          # policy exemption: this check fails closed on it.
           flyctl status -a project-hello-voice
           # Accept ONLY a "registered worker" line whose ISO-8601 log timestamp is
           # at/after the pre-deploy watermark (ISO-8601 sorts lexically), tying the
@@ -195,8 +233,75 @@ jobs:
                   | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}' \
                   | sort | tail -1 || true)"
             if [ -n "$ts" ] && [ "$(printf '%s\n%s\n' "$WATERMARK" "$ts" | sort | tail -1)" = "$ts" ]; then
-              echo "voice worker re-registered at $ts (>= watermark $WATERMARK)"; exit 0
+              echo "browser voice worker re-registered at $ts (>= watermark $WATERMARK)"; exit 0
             fi
             sleep 5
           done
-          echo "::error::no current 'registered worker' log at/after watermark $WATERMARK"; exit 1
+          echo "::error::no current 'registered worker' log at/after watermark $WATERMARK on project-hello-voice"; exit 1
+
+  deploy-phone-voice:
+    needs: [detect, migrate-production]
+    if: needs.detect.outputs.phone == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: fly-deploy-phone-voice
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.x
+        with:
+          ref: ${{ needs.detect.outputs.sha }}
+      - uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be # v1.5
+      - name: Deploy phone voice worker (stopped/min-0 ENFORCED pre+post; non-dispatchable)
+        working-directory: app/voice-livekit
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_PHONE_VOICE }}
+        run: |
+          set -euo pipefail
+          # M-1: bound the live window from BOTH sides.
+          #
+          # Scale to zero BEFORE the release, so a machine left running by a
+          # prior deploy or a manual action is not rolled live by this one, and
+          # again AFTER, so the release's own machine does not persist. `flyctl
+          # deploy` can still briefly create+start+register ONE machine between
+          # these two scales — that transient is unavoidable on a Machines app.
+          #
+          # It is NON-DISPATCHABLE by design, and that is the load-bearing
+          # guarantee, not the scale timing: pre-canary the API's
+          # PHONE_AGENT_NAME is EMPTY (the api_silent_pre_canary state that
+          # scripts/validate-voice-worker-apps.mjs enforces), so the API
+          # dispatches to no name and no room is ever routed to this worker. A
+          # briefly-live worker with nothing dispatching to it places no call.
+          #
+          # Making it live AND dispatchable is the canary's separate, reviewed
+          # workflow change (docs/runbooks/phone-worker-deployment.md §6): the
+          # SAME PR removes both scale-0 lines, adds a watermarked registration
+          # proof, and sets PHONE_AGENT_NAME on project-hello-api. An automatic
+          # shared-source deploy can therefore never make the phone app live and
+          # dispatchable on its own.
+          #
+          # No watermark is captured here — a stopped app has no registration to
+          # gate, and capturing one unused would be a decorative artifact.
+          flyctl scale count 0 -a project-hello-phone-voice --yes 2>/dev/null \
+            || echo "pre-release scale skipped (app not created yet); the post-release scale below is the binding guarantee"
+          flyctl deploy --remote-only --config fly.phone.toml
+          # Every deploy re-asserts count 0, so a merge can never silently leave
+          # the phone worker persistently live.
+          flyctl scale count 0 -a project-hello-phone-voice --yes
+      - name: Verify clean release (run policy STOPPED)
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_PHONE_VOICE }}
+        run: |
+          set -euo pipefail
+          # Policy-aware verification: this app is scaled to zero in steady
+          # state until the canary (a machine may be briefly live during the
+          # release itself — see the deploy step; it is non-dispatchable because
+          # the API name is empty pre-canary). It is CORRECT for it to run no
+          # machine and register no worker. We prove the release landed on the RIGHT app and
+          # deliberately do NOT demand — nor accept — a live worker-registration
+          # log line as evidence.
+          # Flipping this app to always-on is a separate, reviewed canary action
+          # (see docs/runbooks/phone-worker-deployment.md), which drops the
+          # scale-to-zero line above and adds a watermarked registration proof
+          # exactly like the browser worker's.
+          flyctl status -a project-hello-phone-voice
+          echo "phone voice release created on project-hello-phone-voice (stopped/min-0 enforced; no registration expected at count 0)"

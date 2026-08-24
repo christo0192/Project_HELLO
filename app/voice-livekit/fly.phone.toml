@@ -1,0 +1,77 @@
+# Dedicated phone-screening voice worker — SEPARATE Fly app from the browser
+# worker (project-hello-voice), same source image, different run posture.
+#
+# Why a second app at all:
+#  - This worker is NAMED (PHONE_AGENT_NAME below is non-empty). A named LiveKit
+#    Agents worker does NOT auto-dispatch; it receives only the phone rooms the
+#    API explicitly dispatches to its name. The browser worker must stay UNNAMED
+#    to keep auto-dispatching every browser room — so the two run postures
+#    cannot coexist in one app, and naming the browser worker would silently
+#    stop browser screening. Hence a distinct app.
+#  - Rolling this worker back is simply NOT running it (see run policy below);
+#    that requires no change to the browser worker at all.
+#
+# Run policy: STOPPED / min-0 until the phone canary.
+#  - This app is deployed (image built, release created) but scaled to ZERO
+#    machines. The owner keeps it at count 0 with `fly scale count 0 -a
+#    project-hello-phone-voice`; the canary flips it to count 1. Because it runs
+#    NO machine, it registers NO worker and can place NO call — which is the
+#    intended pre-canary posture, NOT a fault. The deploy workflow's phone-voice
+#    verification is policy-aware: it proves a clean release and does NOT demand
+#    a live registration for a stopped app (and never accepts a stale log as
+#    success). See docs/runbooks/phone-worker-deployment.md.
+#  - Cost while stopped is storage-only (the built image); no VM-hours accrue at
+#    count 0. The browser worker's cost/always-on posture is unaffected.
+#
+# No public service: like the browser worker this is a LiveKit Agents worker,
+# not an HTTP server. There is deliberately no [http_service]/[[services]]
+# block, so the app exposes no public ingress and no port.
+#
+# Secrets: NONE are stored here. The LiveKit/Supabase/provider credentials and
+# the SIP trunk value are injected as Fly app secrets at runtime by the owner
+# (`fly secrets set -a project-hello-phone-voice ...`). Only non-secret app
+# identity and the agent NAME live in VCS.
+
+app = "project-hello-phone-voice"
+primary_region = "bom"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  COMPANY_NAME = "Interview Kickstart"
+  SUPABASE_SCHEMA = "screening_v2"
+  API_BASE = "https://project-hello-api.fly.dev"
+  GEMINI_MODEL = "gemini-3.1-flash-lite"
+  GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+  SARVAM_STT_MODEL = "saaras:v3"
+  SARVAM_LANGUAGE = "en-IN"
+  SARVAM_TTS_MODEL = "bulbul:v3"
+  SARVAM_TTS_VOICE = "simran"
+  LIVEKIT_WORKER_DRAIN_SEC = "10"
+  CANDIDATE_SILENCE_PROMPT_SEC = "30"
+  CANDIDATE_SILENCE_END_SEC = "20"
+  WORKER_CONTEXT_TIMEOUT_SEC = "20"
+  SCORING_BREAKER_THRESHOLD = "3"
+  SCORING_BREAKER_COOLDOWN_SEC = "30"
+  SCORING_BREAKER_TIMEOUT_SEC = "180"
+  SCORING_HTTP_CONNECT_TIMEOUT = "10"
+  SCORING_HTTP_READ_TIMEOUT = "180"
+  SCORING_HTTP_WRITE_TIMEOUT = "30"
+  SCORING_HTTP_POOL_TIMEOUT = "10"
+  # ── Phone worker identity ─────────────────────────────────────────────
+  # NON-EMPTY on purpose: this is what makes the worker named. An empty value
+  # here would turn this app into a second auto-dispatching browser worker,
+  # which is exactly the failure this separate app exists to prevent — the
+  # deploy validator rejects an empty/absent PHONE_AGENT_NAME in this config.
+  # This is a dispatch name, not a secret and not the SIP trunk value.
+  PHONE_AGENT_NAME = "phone-screener"
+  PHONE_EVENT_TIMEOUT_SEC = "10"
+  PHONE_PARTICIPANT_WAIT_SEC = "45"
+  PHONE_CLASSIFY_TIMEOUT_SEC = "20"
+  PHONE_ANSWER_TIMEOUT_SEC = "90"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 2048

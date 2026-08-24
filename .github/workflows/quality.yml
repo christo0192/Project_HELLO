@@ -32,6 +32,8 @@ jobs:
         run: node scripts/check-env-contract.mjs && node scripts/check-env-contract.test.mjs
       - name: Validate Fly deploy workflow contract
         run: node scripts/deploy-fly-workflow.test.mjs
+      - name: Validate voice worker app configs (browser vs phone isolation)
+        run: node scripts/validate-voice-worker-apps.mjs && node scripts/validate-voice-worker-apps.test.mjs
       - name: Validate architecture decision records
         run: node scripts/check-adrs.mjs
       - name: Install, typecheck, and test API
