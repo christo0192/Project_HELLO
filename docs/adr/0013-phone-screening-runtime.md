@@ -371,7 +371,7 @@ second case, which is the one a later revert actually produces.
   into one. It does not re-verify the 133 — that needs a live database this
   gate has no Docker for, and pretending otherwise would be the decorative
   evidence this lane keeps deleting.
-* `app/api/src/__tests__/phone-canary1-*.test.ts` — **163 declared test cases**
+* `app/api/src/__tests__/phone-canary1-*.test.ts` — **169 declared test cases**
   across seven files covering Canary-1's structural closure (the explicit file
   list including `app/api/scripts/phone-canary1.ts`, the moved-not-duplicated
   `node:fs` read permission, the no-write sweep, the containment ordering), the
@@ -382,7 +382,7 @@ second case, which is the one a later revert actually produces.
   test sources and fails in EITHER direction if it and this record disagree.
   This number is **not comparable** to the two above and never will be: 133
   counts SQL checks against a live database, 139 counts offline assertions in a
-  dependency-free gate, and 163 counts test-case DECLARATIONS in a vitest suite
+  dependency-free gate, and 169 counts test-case DECLARATIONS in a vitest suite
   — the runtime total is higher because several cases are `it.each(...)` tables.
   The checker counts declarations because it runs before `npm ci` in
   `quality.yml` and cannot execute the suite; `npm test` in `app/api` is what

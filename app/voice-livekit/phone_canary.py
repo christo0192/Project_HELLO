@@ -219,7 +219,17 @@ async def run_phone_canary(
             return "canary_no_participant"
 
         await session.start(
-            agent=agent_factory(CANARY_AGENT_INSTRUCTIONS),
+            # BY KEYWORD. `livekit-agents` 1.6.4 declares `Agent.__init__` with
+            # `instructions` keyword-only, and every other construction of this
+            # base class in this repository already passes it that way
+            # (`agent.py`'s `Christy`, `phone.py`'s `PhoneScreeningAgent`).
+            # A positional call would raise `TypeError` HERE — at
+            # `session.start`, which is AFTER the owner has picked up the
+            # handset — and every stub in the tree accepts a positional
+            # argument, so no test could have seen it. That is the
+            # "cover the seam's DEFAULT or the feature dies green" class,
+            # landing on the one line that makes this mechanism speak.
+            agent=agent_factory(instructions=CANARY_AGENT_INSTRUCTIONS),
             room=ctx.room,
             # THE SAME IMPORTED OBJECT as the production phone session. Never a
             # second literal — see the module docstring.

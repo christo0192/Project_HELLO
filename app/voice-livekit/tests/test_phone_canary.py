@@ -234,6 +234,19 @@ class FakeSession:
         handler(types.SimpleNamespace(item=item))
 
 
+def _canary_agent_stub(*, instructions: str):
+    """A stand-in for `livekit.agents.Agent` that is as STRICT as the real one.
+
+    `Agent.__init__` is `(self, *, instructions: str, ...)` in the pinned
+    1.6.4 series, and `agent.py`'s `Christy` and `phone.py`'s
+    `PhoneScreeningAgent` both construct it by keyword. Modelling that here is
+    the point: a permissive fake accepts a call the real SDK refuses, and the
+    refusal would land at `session.start` -- after the owner had answered the
+    phone -- with the whole suite green.
+    """
+    return types.SimpleNamespace(instructions=instructions)
+
+
 def _participant(identity="sip_owner"):
     return types.SimpleNamespace(identity=identity)
 
@@ -438,8 +451,14 @@ class TestCanaryCall(unittest.IsolatedAsyncioTestCase):
             outcome = await phone_canary.run_phone_canary(
                 ctx, _ROOM, _CANARY_ID,
                 session_factory=lambda: session,
-                agent_factory=lambda instructions: types.SimpleNamespace(
-                    instructions=instructions),
+                # KEYWORD-ONLY, deliberately. `livekit-agents` 1.6.4 declares
+                # `Agent.__init__(self, *, instructions: str, ...)`, and every
+                # other construction of that base class in this repository
+                # passes it by keyword. A stub that accepted a positional
+                # argument would be a fake more permissive than the real class
+                # -- which is exactly how a `TypeError` at `session.start`, on a
+                # live call, after the owner answered, stayed invisible.
+                agent_factory=_canary_agent_stub,
                 close_room=close_room,
                 wait_for_participant=wait_for_participant,
             )
@@ -554,7 +573,7 @@ class TestCanaryCall(unittest.IsolatedAsyncioTestCase):
         outcome = await phone_canary.run_phone_canary(
             ctx, _ROOM, _CANARY_ID,
             session_factory=lambda: self.fail("a second session was built"),
-            agent_factory=lambda instructions: None,
+            agent_factory=_canary_agent_stub,
             close_room=lambda name: closed.append(name),
             wait_for_participant=lambda: self.fail("a second wait was started"),
         )
@@ -659,11 +678,23 @@ class TestNoPersistenceSurface(unittest.TestCase):
             with self.subTest(line=line[:32]):
                 self.assertIsNone(re.search(r"\d{7,}", line))
 
+    def test_the_agent_is_constructed_BY_KEYWORD_against_a_strict_stub(self):
+        # A positional call raises on the real class. Proved here by calling
+        # the strict stub both ways: keyword works, positional raises -- so the
+        # stub is genuinely strict and the assertion is not vacuous.
+        self.assertEqual(_canary_agent_stub(instructions="x").instructions, "x")
+        with self.assertRaises(TypeError):
+            _canary_agent_stub("x")  # type: ignore[misc]
+
     def test_the_canary_drives_a_BARE_agent_and_says_so(self):
         # Honest scoping: `phone_agent_class`, its function tools, the
         # human/machine classifier and `run_phone_gate`'s ordering are all
         # UNEXERCISED by a green canary run.
-        self.assertIn("agent_factory(CANARY_AGENT_INSTRUCTIONS)", PHONE_CANARY_CODE)
+        # BY KEYWORD. This pin used to assert the POSITIONAL form, so the
+        # correct fix would have gone red against its own tripwire -- a
+        # tripwire that pins the riskier shape is worse than none.
+        self.assertIn("agent_factory(instructions=CANARY_AGENT_INSTRUCTIONS)", PHONE_CANARY_CODE)
+        self.assertNotIn("agent_factory(CANARY_AGENT_INSTRUCTIONS)", PHONE_CANARY_CODE)
         self.assertIn("bare ``Agent``", PHONE_CANARY_SRC)
 
 

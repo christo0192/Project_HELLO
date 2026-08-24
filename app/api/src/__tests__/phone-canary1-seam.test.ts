@@ -398,6 +398,41 @@ describe('3. one invocation, one room, at most one originate', () => {
       .toContain('CANARY|canary1|worker_joined|FAIL|worker_never_joined');
   });
 
+  it('a BARE invocation on a bare machine says DISARMED, not "no trunk"', async () => {
+    // The ordering LOW-2 fixed. With the trunk and credential refusals ahead of
+    // the arming gate, an operator running `npm run canary:phone1` on a fresh
+    // machine saw a missing-trunk message and the disarmed state — the property
+    // this whole mechanism exists to demonstrate — was never printed at all.
+    const h = harness({
+      argv: [],
+      armed: false,
+      trunkId: '',
+      credentials: { url: '', apiKey: '', apiSecret: '' },
+    });
+    const result = await runCanary1(h.deps);
+    expect(result.lines).toContain(`CANARY|canary1|armed|FAIL|${CANARY1_NOT_ARMED}`);
+    // And NOT the messages that used to shadow it.
+    expect(result.lines.some((l) => l.includes('trunk_not_configured'))).toBe(false);
+    expect(result.lines.some((l) => l.includes('livekit_credentials_missing'))).toBe(false);
+    expect(result.lines.some((l) => l.includes('credentials_persisted'))).toBe(false);
+    expect(h.calls).toEqual([]);
+    expect(result.providerContacted).toBe(false);
+  });
+
+  it('the two PRIVACY refusals still fire ahead of the arming gate', async () => {
+    // A destination in argv or in an environment variable is already durable —
+    // in `/proc/<pid>/cmdline`, in a shell history file — by the time this
+    // process starts. An operator who did that must be told whether or not the
+    // mechanism is armed, so those two stay ABOVE the arming gate.
+    const argvRun = await runCanary1(harness({ argv: ['--number', FAKE_NUMBER], armed: false }).deps);
+    expect(argvRun.lines)
+      .toContain('CANARY|canary1|argv_accepted|FAIL|destination_in_argv');
+    const envRun = await runCanary1(
+      harness({ argv: [], armed: false, env: { CANARY_TO: FAKE_NUMBER } }).deps);
+    expect(envRun.lines)
+      .toContain('CANARY|canary1|environment_accepted|FAIL|destination_in_environment');
+  });
+
   it('a failed preflight touches no client at all', async () => {
     const h = harness({ trunkId: '' });
     const result = await runCanary1(h.deps);

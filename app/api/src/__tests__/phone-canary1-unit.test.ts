@@ -90,6 +90,41 @@ describe('1. the destination cannot arrive in argv', () => {
     if (!result.ok) expect(result.refusal).toBe('destination_in_argv');
   });
 
+  it('scans the --agent-name VALUE too — no flag is exempt', () => {
+    // This was the one flag out of seven whose value skipped the scan. Its
+    // shape check admits `a919812345670`, which would reach
+    // `/proc/<pid>/cmdline`, shell history, and `createDispatch`'s agent name —
+    // a field OUTSIDE the metadata blob, so the worker's digit-run guard never
+    // sees it.
+    expect(parseCanary1Argv(['--agent-name', 'a919812345670']))
+      .toMatchObject({ refusal: 'destination_in_argv' });
+    expect(parseCanary1Argv(['--agent-name', FAKE_NUMBER]))
+      .toMatchObject({ refusal: 'destination_in_argv' });
+    // A digit run ANYWHERE is refused, even behind a leading letter that makes
+    // it a legal identifier — the same rule the Fly-config validator already
+    // applies to `PHONE_AGENT_NAME`.
+    expect(parseCanary1Argv(['--agent-name', 'worker9812345670']))
+      .toMatchObject({ refusal: 'destination_in_argv' });
+    // The legitimate value still passes, and still through the shape check.
+    const ok = parseCanary1Argv(['--agent-name', 'phone-screener']);
+    expect(ok.ok).toBe(true);
+    if (ok.ok) expect(ok.flags.agentName).toBe('phone-screener');
+    expect(parseCanary1Argv(['--agent-name', '9-not-an-identifier']))
+      .toMatchObject({ refusal: 'unknown_flag' });
+  });
+
+  it('EVERY value-taking flag scans its value — asserted as a set, not per flag', () => {
+    // The defect LOW-1 fixed was an INCONSISTENCY, so the repair is asserted as
+    // a property of the whole flag set rather than of the one flag that was
+    // wrong. A new value-taking flag that forgets the scan fails here.
+    const valueFlags = ['--confirm', '--agent-name', '--questions', '--max-call-seconds',
+      '--ring-seconds', '--participant-wait-seconds', '--wall-clock-seconds'];
+    for (const flag of valueFlags) {
+      expect(parseCanary1Argv([flag, FAKE_NUMBER]), `${flag} accepted a destination`)
+        .toMatchObject({ refusal: 'destination_in_argv' });
+    }
+  });
+
   it('refuses an unknown flag rather than ignoring it', () => {
     const result = parseCanary1Argv(['--yolo']);
     expect(result.ok).toBe(false);

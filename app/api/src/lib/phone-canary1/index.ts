@@ -230,10 +230,34 @@ export async function runCanary1(deps: Canary1RunDeps): Promise<Canary1RunResult
   }
   emitter.check('environment_accepted', true, 'ok');
 
+  // ── THE ARMING GATE — FIRST OF EVERYTHING THAT CAN REFUSE ───────────
+  // Wider than the design required in two ways, both deliberate.
+  //
+  // It gates the DRY RUN as well as `--execute`, so `main` carries a mechanism
+  // that contacts nothing rather than one that contacts nothing when asked not
+  // to. And it is checked FIRST — ahead of the trunk, the credentials, the
+  // bounds and the prompt — so the refusal an operator sees on `main` is the
+  // one that is actually true of `main`. An earlier ordering ran the credential
+  // and trunk preflight first, which meant a bare invocation on a fresh machine
+  // reported a missing trunk and never printed the disarmed state at all: the
+  // property this whole mechanism exists to demonstrate was the one thing the
+  // terminal did not say.
+  //
+  // The two refusals ABOVE this line stay above it on purpose. A destination in
+  // argv or in an environment variable is already durable — in
+  // `/proc/<pid>/cmdline`, in a shell history file — by the time this process
+  // starts, so an operator who did that must be told whether or not the
+  // mechanism is armed. Everything below this line is a precondition for
+  // running, and there is no point stating a precondition for a run that cannot
+  // happen.
+  if (!(deps.armed ?? CANARY1_ARMED)) return refused(emitter, 'armed', CANARY1_NOT_ARMED);
+  emitter.check('armed', true, 'ok');
+
   if (livekitCredentialsPersisted(deps.readEnvFile)) {
     return refused(emitter, 'credentials_transient', 'credentials_persisted');
   }
   emitter.check('credentials_transient', true, 'ok');
+
 
   const flags = parsed.flags;
   const bounds = {
@@ -257,13 +281,6 @@ export async function runCanary1(deps: Canary1RunDeps): Promise<Canary1RunResult
   }
   for (const check of Object.values(CANARY1_PREFLIGHT_CHECKS)) emitter.check(check, true, 'ok');
 
-  // ── THE ARMING GATE, BEFORE ANY SEAM AND BEFORE THE PROMPT ──────────
-  // Wider than the design required: it gates the dry run too, so `main`
-  // carries a mechanism that contacts nothing rather than one that contacts
-  // nothing when asked not to. It is also before the prompt, so an operator is
-  // never asked to type their number into a run that cannot use it.
-  if (!(deps.armed ?? CANARY1_ARMED)) return refused(emitter, 'armed', CANARY1_NOT_ARMED);
-  emitter.check('armed', true, 'ok');
 
   const destination = await readCanary1Destination(deps.prompt, deps.write);
   if (!destination.ok) {

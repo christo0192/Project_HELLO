@@ -102,11 +102,26 @@ intrinsic to placing a call — see §10 R-1.
 
 ```bash
 cd app/api
-# Default. Does nothing and says so while CANARY1_ARMED is false.
+# Default. Does nothing and says so while CANARY1_ARMED is false — and says
+# THAT, first, on a bare machine with no trunk and no credentials exported.
 npm run canary:phone1 -- --dry-run
 # After PR106 arms the constant, and only then:
 npm run canary:phone1 -- --execute --confirm "CALL MY OWN PHONE"
 ```
+
+**The arming gate is the FIRST thing that can refuse**, ahead of the trunk, the
+credentials, the bounds and the prompt. That ordering is deliberate: the refusal
+an operator sees on `main` should be the one that is actually true of `main`. An
+earlier ordering ran the credential and trunk preflight first, so a bare
+invocation on a fresh machine reported a missing trunk and never printed the
+disarmed state at all — the property this whole mechanism exists to demonstrate
+was the one thing the terminal did not say.
+
+The only two refusals ahead of it are the destination-in-argv and
+destination-in-environment ones, because a destination that reached either is
+already durable — in `/proc/<pid>/cmdline`, in a shell history file — by the
+time this process starts, so an operator who did that must be told whether or
+not the mechanism is armed.
 
 **Credentials go in a transient subshell, never a `.env`.** The CLI **refuses
 to run** (`credentials_persisted`) if `app/api/.env` exists and carries any
@@ -148,6 +163,7 @@ is the only evidence this mechanism produces.
 ```
 CANARY|canary1|argv_accepted|PASS|ok
 CANARY|canary1|environment_accepted|PASS|ok
+CANARY|canary1|armed|PASS|ok
 CANARY|canary1|credentials_transient|PASS|ok
 CANARY|canary1|preflight_trunk_configured|PASS|ok
 CANARY|canary1|preflight_livekit_credentials|PASS|ok
@@ -156,7 +172,6 @@ CANARY|canary1|preflight_timeouts_ordered|PASS|ok
 CANARY|canary1|preflight_waits_ordered|PASS|ok
 CANARY|canary1|preflight_bounds_ordered|PASS|ok
 CANARY|canary1|preflight_questions_in_range|PASS|ok
-CANARY|canary1|armed|PASS|ok
 CANARY|canary1|preflight_destination_accepted|PASS|ok
 CANARY|canary1|room_created|PASS|ok
 CANARY|canary1|dispatch_created|PASS|ok

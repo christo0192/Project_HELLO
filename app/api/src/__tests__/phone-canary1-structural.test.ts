@@ -364,6 +364,32 @@ describe('4. the entry script installs containment before it loads the prompt', 
       .toBeGreaterThan(inverted.indexOf('await import('));
   });
 
+  it('the entry script passes NO arming override — this is the whole PR\'s predicate', () => {
+    // `runCanary1` accepts `armed?: boolean` so the orchestration tests can
+    // exercise the armed path without shipping an armed constant. That seam
+    // must never be reachable from production.
+    //
+    // §9's arming pin is NOT this control. It checks that the constant is the
+    // literal `false` and that no closure file ASSIGNS it — and neither fires
+    // if a future edit adds `armed: process.env.CANARY1_ARM === 'true'` to the
+    // entry script. That single line would turn "this branch structurally
+    // cannot place a call" into "this branch places a call when an environment
+    // variable says so", with every check still green and `CANARY1_ARMED`
+    // still literally `false`. The whole rhetorical weight of PR105 rests on
+    // this one predicate, so the seam gets the same treatment `readEnvFile`
+    // already had.
+    expect(body, 'the entry script injects an arming override').not.toMatch(/\barmed\b/);
+    // Nor may it reach the constant to re-derive one.
+    expect(body, 'the entry script names the arming constant').not.toContain('CANARY1_ARMED');
+  });
+
+  it('CONTROL — the arming-override matcher bites on the line it exists to catch', () => {
+    const seeded = "  armed: process.env.CANARY1_ARM === 'true',";
+    expect(/\barmed\b/.test(seeded)).toBe(true);
+    // ...and does not fire on ordinary entry-script vocabulary.
+    expect(/\barmed\b/.test('const disarmedNote = 1;')).toBe(false);
+  });
+
   it('the entry script passes NO env reader, so the credential refusal cannot be bypassed', () => {
     // `runCanary1` accepts an injectable reader so the orchestration tests are
     // hermetic on a machine that has a real `app/api/.env`. That seam must not

@@ -43,6 +43,7 @@
 import { readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { wrapDialableNumber, type DialableNumber } from '../../integrations/livekit-phone-dial/index.js';
+import { containsDigitRun } from './metadata.js';
 
 /** Every stable refusal this module can produce. */
 export const CANARY1_ENTRY_REFUSALS = [
@@ -150,8 +151,13 @@ function integerOrNull(raw: string | undefined): number | null {
  * Parse argv, refusing anything that could be a destination.
  *
  * `--dry-run` is the DEFAULT and is accepted explicitly so a cautious operator
- * can type it; a bare invocation is a dry run that then refuses on the arming
- * constant and says so.
+ * can type it. A bare invocation is a dry run that refuses on the arming
+ * constant and says so — and that is true of a BARE invocation, on a machine
+ * with no credentials and no trunk exported, because `runCanary1` checks
+ * arming ahead of every credential and bound gate. An earlier ordering put the
+ * trunk and credential refusals first, so the message an operator actually saw
+ * on `main` was about a missing trunk, and the disarmed state — the property
+ * this whole mechanism is about — was never printed.
  */
 export function parseCanary1Argv(argv: readonly string[]): Canary1ParseResult {
   const flags = {
@@ -204,6 +210,24 @@ export function parseCanary1Argv(argv: readonly string[]): Canary1ParseResult {
       case '--agent-name': {
         const raw = argv[i + 1];
         if (raw === undefined) return refuse('flag_value_missing');
+        // The destination scan FIRST, exactly as every other value-taking flag
+        // does it. This was the one exception, and the exception was the
+        // defect: the value reaches `/proc/<pid>/cmdline`, shell history, and
+        // `createDispatch`'s agent name — a field OUTSIDE the metadata blob,
+        // so the worker's digit-run guard never sees it.
+        //
+        // TWO predicates, because one is not enough for THIS field. The
+        // separator-stripping scan catches the forms a person types a number
+        // in, but the shape check below admits `a919812345670`: a leading
+        // letter makes it a legal identifier and not a legal destination. So
+        // the digit-run rule is applied as well — the SAME rule
+        // `validate-voice-worker-apps.mjs` already applies to
+        // `PHONE_AGENT_NAME` ("must be a dispatch name, not a phone/trunk
+        // number"), mirrored here so the CLI and the config validator agree
+        // about what an agent name may say.
+        if (looksLikeDestination(raw) || containsDigitRun(raw)) {
+          return refuse('destination_in_argv');
+        }
         if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(raw)) return refuse('unknown_flag');
         flags.agentName = raw;
         i += 1;
