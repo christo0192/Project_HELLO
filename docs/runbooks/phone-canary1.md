@@ -301,12 +301,60 @@ list -a project-hello-phone-voice` shows no `PHONE_CANARY_ENABLED`.* Nothing can
 have dialled from it on its own — `CANARY1_ARMED` is read by a hand-run CLI only
 — so this is the abort of a **state**, not of a call (§7).
 
-**One thing this file cannot confirm, and you must.** Whether a red `quality`
-**blocks** a merge depends on `quality` being a **required status check** under
-branch protection. That is repository settings, **not visible from a worktree and
-therefore UNVERIFIED here** — confirm it in the repository's branch-protection
-settings. Detection holds either way: the gate reports the accident on the next
-push to `main` regardless. It is the **enforcement** half that needs confirming.
+### The enforcement half — OBSERVED, and it is absent
+
+**This is no longer an open question. It was queried and the answer is no.**
+
+**Observed 2026-08-24, twice and independently** (by the owner, and again from
+this session), against `christo0192/Project_HELLO`:
+
+| Query | Result |
+|---|---|
+| `gh api repos/christo0192/Project_HELLO/branches/main/protection` | **HTTP 404** — `"Branch not protected"` |
+| `gh api repos/christo0192/Project_HELLO/rulesets` | **`[]`** — no rulesets at all |
+
+**Therefore: `main` has NO branch protection, and `quality` is NOT a required
+status check.** Neither query returns a secret; both are repository
+configuration, and this is recorded as an observation with its date because a
+setting can change and a claim about a setting rots (§0 of every card in this
+lane). **Re-run both before the window** — if either answer has changed, this
+section is stale and the controls below can be relaxed accordingly, not before.
+
+**What that costs, stated exactly.**
+
+* **The gate still DETECTS.** A merge of the activation artifact turns `main` red
+  on the next push, in one CI run, with the remedy in the failure message. That
+  half is unaffected and needs no repository setting.
+* **The gate CANNOT PREVENT.** With no required check, a red `quality` — on a
+  pull request or on `main` — **blocks nothing**. The merge button stays
+  available; the accident is reported **after** it has happened, not stopped
+  before it. `check-main-disarmed.mjs` is a **smoke alarm, not a door lock.**
+* **The same applies to the wiring test.** A PR that deletes or loosens the gate
+  goes red — and can still be merged. Detection, again, not prevention.
+
+**So the pre-merge control has to be something that does not depend on a
+repository setting.** It is the artifact's **DRAFT state**: a draft pull request
+**cannot be merged by GitHub at all** — the merge button is disabled and the
+merge API refuses — regardless of branch protection, required checks, or who
+clicks. That is a property of the pull request itself, which is why the
+activation artifact is opened as a **draft** and stays one (§9 step 3). It is
+the only pre-merge control in this design that this repository can actually
+hold, and it is why the instruction is pinned by
+`scripts/check-main-disarmed.test.mjs` rather than left as prose somebody can
+soften.
+
+**The three controls, and which half of the problem each answers:**
+
+| Control | Prevents? | Detects? |
+|---|---|---|
+| The artifact is a **DRAFT** PR | **YES** — GitHub refuses to merge a draft | — |
+| Auto-merge **off** on that PR | **YES** — nothing merges it unattended | — |
+| `check-main-disarmed.mjs` on `main` | **no** — no required check to enforce it | **YES**, on the next push |
+
+**The one repository setting that would change this** is making `quality` a
+required status check under branch protection. **Nothing in this session or in
+PR106 changes any repository setting**, and none of the controls above depends
+on one.
 
 ## 4c. Knobs that are expectations, not controls
 
@@ -657,7 +705,10 @@ with a live leg on the line.**
 **If the activation artifact turns out to have been merged**, that is the abort
 of a **state**, not of a call: revert the merge commit, delete `canary1/arm`, and
 confirm `fly secrets list` shows no `PHONE_CANARY_ENABLED`. Nothing can have
-dialled from it on its own. See §4b.
+dialled from it on its own. See §4b — and note that with no branch protection the
+disarm gate **reports** this after the fact and could not have stopped it; the
+control that was supposed to stop it is the artifact's **draft** state (§9
+step 3).
 
 If teardown cannot verify the room gone it prints
 `teardown_room_absent|FAIL|cleanup_failed`, exits non-zero, and the remedy is
@@ -717,11 +768,39 @@ before the window opens, and the app is left at zero. Confirm the browser worker
 re-registered (its job fails closed if not) and run one ordinary browser
 screening — the shared-image blast-radius check ADR-0013 promises.
 
-**3. Open the activation artifact.** From `main`, branch `canary1/arm`, PR titled
-**"ACTIVATION ARTIFACT — DO NOT MERGE"**, carrying the two-file flip
-(`arming.ts` and its structural pin) and nothing else. Let CI go green. **Record
-the sha. Do not merge.** Explicitly confirm auto-merge is **off** for this PR —
-this lane has already been bitten once by an auto-merge dropping a gate.
+**3. Open the activation artifact — AS A DRAFT.** From `main`, branch
+`canary1/arm`, carrying the two-file flip (`arming.ts` and its structural pin)
+and nothing else.
+
+```bash
+gh pr create --draft \
+  --title "ACTIVATION ARTIFACT — DO NOT MERGE" \
+  --base main --head canary1/arm
+gh pr view <n> --json isDraft,autoMergeRequest,title \
+  -q '"draft="+(.isDraft|tostring)+" automerge="+((.autoMergeRequest!=null)|tostring)+" | "+.title'
+# REQUIRED: draft=true automerge=false, and the title EXACTLY as above.
+```
+
+**The draft state is the pre-merge control, and it is the only one this
+repository has.** `main` has **no branch protection** and `quality` is **not a
+required status check** — observed, §4b — so a red check blocks nothing and the
+disarm gate can only report the accident **after** the merge. **GitHub refuses
+to merge a draft PR outright**, independently of any repository setting, so
+`--draft` is what actually holds the door. **If the PR is not a draft, close it
+and re-open it as one.** Do not "just be careful"; the whole point of §4b is
+that carefulness is not a control.
+
+**Three assertions, all required before moving on:**
+
+* `isDraft` is **true**. Never mark it ready for review — there is nothing to
+  review it *into*; it is never merged.
+* auto-merge is **off** (`autoMergeRequest` is null). This lane has already been
+  bitten once by an auto-merge dropping a gate. Note that auto-merge cannot even
+  be enabled on a draft — that is belt and braces, and it is checked anyway
+  because the PR could be un-drafted.
+* the title is **exactly** `ACTIVATION ARTIFACT — DO NOT MERGE`.
+
+Let CI go green. **Record the sha. Do not merge, and do not un-draft.**
 
 **4. MERGE FREEZE begins.** From here until step 10, **no merge to `main` may
 touch `app/voice-livekit/`**: such a merge deploys and re-zeroes the phone app
@@ -957,7 +1036,7 @@ there is no `git checkout main` to remember, and the shared checkout was never o
 the armed branch to begin with.
 
 **11. Handover.** Record the PR105/PR106 shas, the `canary1/arm` sha **and that
-it is unmerged**, the dry-run verdict lines (safe by grammar), the worker counter
+it is unmerged and still a DRAFT**, the dry-run verdict lines (safe by grammar), the worker counter
 lines, the step-9b key names, the abort card, the arming/disarm state, and —
 explicitly — **that no number was entered into anything durable and none appears
 in the handover.**
@@ -987,8 +1066,10 @@ console. **What the attestation does not cover, stated so it is not over-read:**
   has been answered (§5).
 
 **So the remaining gate on the live call is:** PR106 merged, `canary1/arm` cut
-and reviewed, a clean dry run, the wait bound and the **session-built** line
-confirmed, and the owner present with TEL-07's second person.
+and opened as a **draft** artifact with auto-merge off (§9 step 3 — the draft
+state is the pre-merge control, because there is no branch protection: §4b), a
+clean dry run, the wait bound and the **session-built** line confirmed, and the
+owner present with TEL-07's second person.
 
 ## 10. Residuals
 
@@ -1109,5 +1190,11 @@ merged to revert: arming never reaches `main` (§4b).
 **Layer 0, always in force and needing no preparation:**
 `scripts/check-main-disarmed.mjs`. It is not a rollback *action* — it is what
 **tells you a rollback is needed**, on the one failure the layers above cannot
-report: the activation artifact having been merged. See §4b for the remedy, and
-for the one thing about it this file cannot confirm.
+report: the activation artifact having been merged.
+
+**And it tells you AFTERWARDS.** `main` has no branch protection and `quality` is
+not a required status check (**observed**, §4b), so the gate **detects** the
+merge on the next push and **cannot prevent** it. The control that prevents it is
+the artifact being a **draft** pull request, which GitHub will not merge at all
+(§9 step 3). Layer 0 is the smoke alarm; the draft state is the door lock. See
+§4b for the remedy.

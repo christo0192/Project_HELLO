@@ -36,9 +36,33 @@
 // fire when the guarded thing changes" class this lane keeps paying for, so the
 // trigger is pinned here alongside the guard that reads it.
 //
-// CHECK_MAIN_DISARMED_WORKFLOW: optional path override for the workflow file,
-// used only to drive this file's own red controls against a mutated copy. It
-// defaults to the real workflow, so CI — which never sets it — is unaffected.
+// Assertion 9 pins the OTHER half of the same control, and they are here
+// because of an OBSERVED fact rather than a hypothetical one: queried
+// 2026-08-24, `GET /repos/.../branches/main/protection` returns HTTP 404
+// ("Branch not protected") and `GET .../rulesets` returns `[]`. There is NO
+// branch protection and `quality` is NOT a required status check.
+//
+// So everything above proves only that the gate DETECTS. With nothing required,
+// a red check is a report and not a veto: an accidental merge of the activation
+// artifact is reported on the next push to `main` and was never blocked. The
+// control that actually PREVENTS it cannot be a CI result at all — it has to be
+// something GitHub itself refuses to merge, which is a DRAFT pull request.
+//
+// That makes the runbook's "open it as a draft" line a load-bearing control
+// rather than advice, and a control written only in prose is one edit away from
+// being softened by someone who does not know what it is holding. Assertions
+// 9 reads `docs/runbooks/phone-canary1.md` as text and fails if the draft
+// requirement, the exact artifact title, the auto-merge-off requirement, the
+// observed absence of branch protection, or the statement of what the gate can
+// and cannot do ever leaves the file. Each is pinned as an EXACT phrase: a
+// loose regex over a 1,200-line document matches something somewhere and stops
+// being a control — a seeded removal of the claim survived the regex form while
+// this file was being written.
+//
+// CHECK_MAIN_DISARMED_WORKFLOW / CHECK_MAIN_DISARMED_RUNBOOK: optional path
+// overrides for the workflow and runbook files, used only to drive this file's
+// own red controls against mutated copies. They default to the real files, so
+// CI — which never sets them — is unaffected.
 //
 // Dependency-free: node builtins only.
 
@@ -52,6 +76,10 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const wfPath = process.env.CHECK_MAIN_DISARMED_WORKFLOW
   ? path.resolve(process.env.CHECK_MAIN_DISARMED_WORKFLOW)
   : path.join(root, ".github/workflows/quality.yml");
+const runbookRel = "docs/runbooks/phone-canary1.md";
+const runbookPath = process.env.CHECK_MAIN_DISARMED_RUNBOOK
+  ? path.resolve(process.env.CHECK_MAIN_DISARMED_RUNBOOK)
+  : path.join(root, runbookRel);
 
 const failures = [];
 const ok = (cond, msg) => { if (!cond) failures.push(msg); };
@@ -221,6 +249,59 @@ if (wiringBlocks.length === 1) {
     + `\`${wiringBlocks[0].job}\`.`);
 }
 
+// ── 9. The artifact is opened as a DRAFT, and the runbook still says so ───
+// The pre-merge control, pinned so it cannot be softened back into advice. Each
+// phrase carries the reason it is required, because a bare "string must be
+// present" assertion teaches the next editor nothing about what they are about
+// to delete.
+ok(existsSync(runbookPath),
+  `${runbookRel} is missing. The activation artifact's pre-merge control — that it is opened as a `
+  + "DRAFT pull request — is written there and nowhere else.");
+
+const ARTIFACT_TITLE = "ACTIVATION ARTIFACT — DO NOT MERGE";
+if (existsSync(runbookPath)) {
+  const rb = readFileSync(runbookPath, "utf8");
+  const required = [
+    ["gh pr create --draft",
+      "the artifact must be OPENED as a draft. GitHub refuses to merge a draft PR outright, which "
+      + "is the only pre-merge control that does not depend on a repository setting — and there is "
+      + "no branch protection on this repository, so no CI result blocks a merge."],
+    [ARTIFACT_TITLE,
+      "the artifact's title must stay exactly `" + ARTIFACT_TITLE + "`. It is the one thing a "
+      + "reviewer sees before clicking, on a PR whose whole purpose is never to be clicked."],
+    ["Never mark it ready for review",
+      "un-drafting the artifact removes the ONLY control that prevents its merge. Nothing reviews "
+      + "it into anything; there is no state after draft."],
+    ["auto-merge is **off**",
+      "auto-merge must be explicitly confirmed off. This lane has already been bitten once by an "
+      + "auto-merge dropping a gate."],
+    ["no branch protection",
+      "the runbook must record the OBSERVED absence of branch protection. Without it a reader "
+      + "assumes a red `quality` blocks the merge, which is exactly the false belief that makes "
+      + "the draft requirement look optional."],
+    // ── 10. What the GATE cannot do — the honest half ──────────────────
+    // Pinned as two EXACT sentences rather than as a loose "detect…cannot
+    // prevent" regex. A regex spread over a 1,200-line document matches
+    // something somewhere and quietly stops being a control: while writing this
+    // file, a seeded mutation that removed the claim still passed the regex
+    // form. Exact phrases fail when the phrase goes, which is the only thing
+    // this assertion is for.
+    ["**The gate still DETECTS.**",
+      "the runbook must keep saying that the default-branch gate DETECTS an accidental merge of "
+      + "the activation artifact — that half is real and needs no repository setting."],
+    ["**The gate CANNOT PREVENT.**",
+      "the runbook must keep saying that the gate CANNOT PREVENT that merge. With no required "
+      + "status check a red `quality` is a report, not a veto. Delete this sentence and the gate "
+      + "reads as a door lock when it is a smoke alarm — and the draft requirement, which is the "
+      + "actual door lock, starts to look like belt-and-braces."],
+  ];
+  for (const [needle, why] of required) {
+    ok(rb.includes(needle),
+      `${runbookRel} no longer contains \`${needle}\`. ${why}`);
+  }
+
+}
+
 if (failures.length) {
   console.error(`main-disarmed gate wiring FAILED (${failures.length}):`);
   for (const f of failures) console.error(" - " + f);
@@ -230,5 +311,7 @@ console.log(
   "main-disarmed gate wiring OK (predicate green + seeded-red on fixtures; "
   + `${ARMING_PATH} present; quality.yml triggers on push to main, runs the gate in the `
   + `\`${GATE_JOB}\` job under \`${PUSH_TO_MAIN}\` asserting \`${GATE_VERDICT}\`, `
-  + "and runs the wiring check unconditionally).",
+  + `and runs the wiring check unconditionally; ${runbookRel} still requires the activation `
+  + `artifact to be a DRAFT PR titled \`${ARTIFACT_TITLE}\` with auto-merge off, and still says `
+  + "the gate detects an accidental merge but cannot prevent one).",
 );

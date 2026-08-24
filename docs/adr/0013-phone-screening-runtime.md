@@ -284,7 +284,9 @@ full rather than leaving a green run to be read as coverage.
   2026-08-24 it is a *permanent* disarm, not a window.** `CANARY1_ARMED` ships
   `false`, is pinned `false` by a test, and **stays `false` on `main` forever**.
   Arming lives on `canary1/arm`: a reviewed, CI-green branch that is **never
-  merged**. There is no prepared revert, because nothing is merged to revert.
+  merged** and is opened as a **DRAFT** pull request titled
+  `ACTIVATION ARTIFACT — DO NOT MERGE` with auto-merge off. There is no prepared
+  revert, because nothing is merged to revert.
 
   **Why, stated as the decision it is.** `CANARY1_ARMED` is read by exactly
   **one** program — `app/api/scripts/phone-canary1.ts`, a `tsx` script the owner
@@ -304,7 +306,26 @@ full rather than leaving a green run to be read as coverage.
   artifact is green too. A test the artifact can rewrite is not a gate against
   the artifact. Its wiring is asserted unguarded on every PR by
   `scripts/check-main-disarmed.test.mjs`, so removing or loosening the gate goes
-  red before it can merge. See `docs/runbooks/phone-canary1.md` §4b.
+  **red** on that PR.
+
+  **That red does not BLOCK anything, and this record must not imply it does.**
+  Queried 2026-08-24, twice and independently:
+  `GET /repos/christo0192/Project_HELLO/branches/main/protection` returns
+  **HTTP 404 ("Branch not protected")** and `GET …/rulesets` returns **`[]`**.
+  **`main` has no branch protection and `quality` is not a required status
+  check.** An earlier revision of this bullet said the gate's removal "goes red
+  before it can merge"; with nothing required, a red check is a **report, not a
+  veto** — the merge button stays live. The gate **detects** an accidental merge
+  of the artifact on the next push to `main`; it **cannot prevent** one.
+
+  **The prevention is therefore placed where it does not depend on a repository
+  setting: the artifact is a DRAFT pull request**, which GitHub refuses to merge
+  outright whatever the branch settings say. That instruction is itself pinned by
+  a static assertion in `scripts/check-main-disarmed.test.mjs`, so it cannot
+  regress to a non-draft in prose. Neither observation above is a secret; both
+  are repository configuration and both carry their date, because a claim about a
+  setting rots. **Nothing in this ADR or in PR106 changes any repository
+  setting.** See `docs/runbooks/phone-canary1.md` §4b.
 
   The worker's flag is a Fly **secret**, and
   `scripts/validate-voice-worker-apps.mjs` scans only `[env]` tables — so a
