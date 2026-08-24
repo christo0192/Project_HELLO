@@ -110,6 +110,12 @@ await checkAsync("Dockerfile contract", async () => {
   assert.doesNotMatch(dockerfile, /COPY .*\.env/);
   assert.match(dockerfile, /--no-cache-dir/);
   assert.match(dockerfile, /PYTHONPYCACHEPREFIX/);
+  // The worker sources must land in the interpreter's search path. A COPY to
+  // any other destination ships every module and still dies at startup with
+  // the PR102 `ModuleNotFoundError`, so the destination is pinned here as well
+  // as being resolved by scripts/docker_import_closure.py.
+  assert.match(dockerfile, /^WORKDIR \/app$/m);
+  assert.match(dockerfile, /^COPY agent\.py .*\.\/$/m);
 });
 check("Dockerfile production command is start (not dev)", async () => {
   const dockerfile = await read("app/voice-livekit/Dockerfile");
@@ -204,7 +210,8 @@ await checkAsync("validate-container baseline passes (static subset)", async () 
 await checkAsync("validate-container rejects a HEALTHCHECK-bearing Dockerfile", async () => {
   await withFixture({
     "requirements.txt": "livekit-agents==1.6.4\n",
-    "Dockerfile": "FROM python:3.12-slim AS builder\nRUN true\nFROM python:3.12-slim AS runtime\nUSER 1000:1000\nHEALTHCHECK CMD echo ok\nENTRYPOINT [\"python\",\"agent.py\",\"start\"]\n",
+    "Dockerfile": "FROM python:3.12-slim AS builder\nRUN true\nFROM python:3.12-slim AS runtime\nWORKDIR /app\nUSER 1000:1000\nCOPY agent.py ./\nHEALTHCHECK CMD echo ok\nENTRYPOINT [\"python\",\"agent.py\",\"start\"]\n",
+    "agent.py": "X = 1\n",
     ".dockerignore": ".env\n.git\n",
     "docker-compose.yml": "services:\n  x:\n    user: \"1000:1000\"\n",
   }, async (fixture) => {
@@ -216,7 +223,8 @@ await checkAsync("validate-container rejects a HEALTHCHECK-bearing Dockerfile", 
 await checkAsync("validate-container rejects a dev-mode entrypoint", async () => {
   await withFixture({
     "requirements.txt": "livekit-agents==1.6.4\n",
-    "Dockerfile": "FROM python:3.12-slim AS builder\nRUN true\nFROM python:3.12-slim AS runtime\nUSER 1000:1000\nENTRYPOINT [\"python\",\"agent.py\",\"dev\"]\n",
+    "Dockerfile": "FROM python:3.12-slim AS builder\nRUN true\nFROM python:3.12-slim AS runtime\nWORKDIR /app\nUSER 1000:1000\nCOPY agent.py ./\nENTRYPOINT [\"python\",\"agent.py\",\"dev\"]\n",
+    "agent.py": "X = 1\n",
     ".dockerignore": ".env\n.git\n",
     "docker-compose.yml": "services:\n  x:\n    user: \"1000:1000\"\n",
   }, async (fixture) => {
@@ -228,7 +236,8 @@ await checkAsync("validate-container rejects a dev-mode entrypoint", async () =>
 await checkAsync("validate-container rejects non-== pins", async () => {
   await withFixture({
     "requirements.txt": "livekit-agents>=1.6.4\n",
-    "Dockerfile": "FROM python:3.12-slim AS builder\nRUN true\nFROM python:3.12-slim AS runtime\nUSER 1000:1000\nENTRYPOINT [\"python\",\"agent.py\",\"start\"]\n",
+    "Dockerfile": "FROM python:3.12-slim AS builder\nRUN true\nFROM python:3.12-slim AS runtime\nWORKDIR /app\nUSER 1000:1000\nCOPY agent.py ./\nENTRYPOINT [\"python\",\"agent.py\",\"start\"]\n",
+    "agent.py": "X = 1\n",
     ".dockerignore": ".env\n.git\n",
     "docker-compose.yml": "services:\n  x:\n    user: \"1000:1000\"\n",
   }, async (fixture) => {
@@ -240,13 +249,18 @@ await checkAsync("validate-container rejects non-== pins", async () => {
 // ── import→COPY closure validator (the PR102 defect class) ────────────────
 // A valid multi-stage Dockerfile parameterized only by its worker-source COPY
 // line, so these fixtures isolate the closure rule from every other contract.
-const closureDockerfile = (copyLine) =>
-  "FROM python:3.12-slim AS builder\n" +
-  "RUN pip install --no-cache-dir -r requirements.txt\n" +
-  "FROM python:3.12-slim AS runtime\n" +
-  "RUN groupadd --gid 1000 agent\nUSER 1000:1000\n" +
-  copyLine + "\n" +
-  'ENTRYPOINT ["python","agent.py","start"]\n';
+const closureDockerfile = (copyLine, opts = {}) => {
+  const { workdir = "/app", entrypoint = 'ENTRYPOINT ["python","agent.py","start"]' } = opts;
+  return (
+    "FROM python:3.12-slim AS builder\n" +
+    "RUN pip install --no-cache-dir -r requirements.txt\n" +
+    "FROM python:3.12-slim AS runtime\n" +
+    (workdir === null ? "" : `WORKDIR ${workdir}\n`) +
+    "RUN groupadd --gid 1000 agent\nUSER 1000:1000\n" +
+    copyLine + "\n" +
+    (entrypoint === null ? "" : entrypoint + "\n")
+  );
+};
 const closureBaseFiles = {
   "requirements.txt": "livekit-agents==1.6.4\n",
   ".dockerignore": ".env\n.env.*\n.git\ntests\n.venv\n__pycache__\nDockerfile\n",
@@ -320,6 +334,166 @@ await checkAsync("validate-container catches a secret on a COPY continuation lin
     const result = spawnSync("bash", [CONTAINER_VALIDATOR, fixture], { encoding: "utf8" });
     assert.notEqual(result.status, 0, `continuation-secret fixture must fail (got ${result.status})`);
     assert.match(result.stdout, /FORBIDDEN_COPY id_rsa/);
+  });
+});
+
+// ── COPY destination must resolve under the runtime WORKDIR (L-1) ─────────
+// Every module can be COPY'd and the container still dies with the PR102
+// `ModuleNotFoundError` if the destination is outside the interpreter's search
+// path. These are the controls for that failure mode.
+
+await checkAsync("validate-container rejects a worker COPY whose destination is not /app", async () => {
+  await withFixture({
+    ...closureBaseFiles,
+    "Dockerfile": closureDockerfile("COPY agent.py helper.py /elsewhere/"),
+    "agent.py": "import helper\n",
+    "helper.py": "X = 1\n",
+  }, async (fixture) => {
+    const result = spawnSync("bash", [CONTAINER_VALIDATOR, fixture], { encoding: "utf8" });
+    assert.notEqual(result.status, 0, `wrong-destination fixture must fail (got ${result.status})`);
+    assert.match(result.stdout, /BAD_COPY_DEST .*\/elsewhere\//);
+  });
+});
+
+await checkAsync("validate-container rejects a relative worker COPY with no WORKDIR to resolve it", async () => {
+  await withFixture({
+    ...closureBaseFiles,
+    "Dockerfile": closureDockerfile("COPY agent.py helper.py ./", { workdir: null }),
+    "agent.py": "import helper\n",
+    "helper.py": "X = 1\n",
+  }, async (fixture) => {
+    const result = spawnSync("bash", [CONTAINER_VALIDATOR, fixture], { encoding: "utf8" });
+    assert.notEqual(result.status, 0, `unresolvable-destination fixture must fail (got ${result.status})`);
+    assert.match(result.stdout, /BAD_COPY_DEST .*WORKDIR unset/);
+  });
+});
+
+await checkAsync("validate-container accepts an absolute /app worker COPY destination", async () => {
+  await withFixture({
+    ...closureBaseFiles,
+    "Dockerfile": closureDockerfile("COPY agent.py helper.py /app/", { workdir: null }),
+    "agent.py": "import helper\n",
+    "helper.py": "X = 1\n",
+  }, async (fixture) => {
+    const result = spawnSync("bash", [CONTAINER_VALIDATOR, fixture], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  });
+});
+
+// ── Closure root is derived from the ENTRYPOINT, not hardcoded (L-2) ───────
+// A hardcoded `agent` root silently skips (renamed entrypoint) or roots the
+// walk at a file that no longer starts the worker (wrong entrypoint). Both
+// shapes are pinned here, plus the unparseable-entrypoint failures.
+
+await checkAsync("validate-container follows a renamed entrypoint (closure root is derived)", async () => {
+  await withFixture({
+    ...closureBaseFiles,
+    // No agent.py at all: the worker starts main.py, whose dependency is not
+    // COPY'd. A hardcoded `agent` root would skip the rule entirely.
+    "Dockerfile": closureDockerfile("COPY main.py ./", {
+      entrypoint: 'ENTRYPOINT ["python","main.py","start"]',
+    }),
+    "main.py": "import helper\n",
+    "helper.py": "X = 1\n",
+  }, async (fixture) => {
+    const result = spawnSync("bash", [CONTAINER_VALIDATOR, fixture], { encoding: "utf8" });
+    assert.notEqual(result.status, 0, `renamed-entrypoint fixture must fail (got ${result.status})`);
+    assert.match(result.stdout, /ENTRYPOINT_ROOT main/);
+    assert.match(result.stdout, /MISSING_COPY helper\.py/);
+  });
+});
+
+await checkAsync("validate-container roots the closure at the ENTRYPOINT even when agent.py exists", async () => {
+  await withFixture({
+    ...closureBaseFiles,
+    // agent.py is present and fully covered, but it is NOT what runs. The real
+    // root, main.py, needs helper.py and does not get it.
+    "Dockerfile": closureDockerfile("COPY agent.py main.py ./", {
+      entrypoint: 'ENTRYPOINT ["python","main.py","start"]',
+    }),
+    "agent.py": "X = 1\n",
+    "main.py": "import helper\n",
+    "helper.py": "Y = 2\n",
+  }, async (fixture) => {
+    const result = spawnSync("bash", [CONTAINER_VALIDATOR, fixture], { encoding: "utf8" });
+    assert.notEqual(result.status, 0, `wrong-root fixture must fail (got ${result.status})`);
+    assert.match(result.stdout, /ENTRYPOINT_ROOT main/);
+    assert.match(result.stdout, /MISSING_COPY helper\.py/);
+  });
+});
+
+await checkAsync("validate-container rejects a Dockerfile with no ENTRYPOINT to root the closure at", async () => {
+  await withFixture({
+    ...closureBaseFiles,
+    "Dockerfile": closureDockerfile("COPY agent.py helper.py ./", { entrypoint: null }) + 'CMD ["python","agent.py","start"]\n',
+    "agent.py": "import helper\n",
+    "helper.py": "X = 1\n",
+  }, async (fixture) => {
+    const result = spawnSync("bash", [CONTAINER_VALIDATOR, fixture], { encoding: "utf8" });
+    assert.notEqual(result.status, 0, `no-entrypoint fixture must fail (got ${result.status})`);
+    assert.match(result.stdout, /ENTRYPOINT_MISSING/);
+  });
+});
+
+await checkAsync("validate-container rejects a shell-form ENTRYPOINT", async () => {
+  await withFixture({
+    ...closureBaseFiles,
+    "Dockerfile": closureDockerfile("COPY agent.py helper.py ./", {
+      entrypoint: "ENTRYPOINT python agent.py start",
+    }),
+    "agent.py": "import helper\n",
+    "helper.py": "X = 1\n",
+  }, async (fixture) => {
+    const result = spawnSync("bash", [CONTAINER_VALIDATOR, fixture], { encoding: "utf8" });
+    assert.notEqual(result.status, 0, `shell-form fixture must fail (got ${result.status})`);
+    assert.match(result.stdout, /ENTRYPOINT_NOT_EXEC_FORM/);
+  });
+});
+
+await checkAsync("validate-container rejects a malformed JSON ENTRYPOINT", async () => {
+  await withFixture({
+    ...closureBaseFiles,
+    "Dockerfile": closureDockerfile("COPY agent.py helper.py ./", {
+      entrypoint: 'ENTRYPOINT ["python","agent.py",',
+    }),
+    "agent.py": "import helper\n",
+    "helper.py": "X = 1\n",
+  }, async (fixture) => {
+    const result = spawnSync("bash", [CONTAINER_VALIDATOR, fixture], { encoding: "utf8" });
+    assert.notEqual(result.status, 0, `malformed-entrypoint fixture must fail (got ${result.status})`);
+    assert.match(result.stdout, /ENTRYPOINT_UNPARSEABLE/);
+  });
+});
+
+await checkAsync("validate-container rejects a non-Python ENTRYPOINT", async () => {
+  await withFixture({
+    ...closureBaseFiles,
+    "Dockerfile": closureDockerfile("COPY agent.py helper.py ./", {
+      entrypoint: 'ENTRYPOINT ["/bin/sh","-c","start"]',
+    }),
+    "agent.py": "import helper\n",
+    "helper.py": "X = 1\n",
+  }, async (fixture) => {
+    const result = spawnSync("bash", [CONTAINER_VALIDATOR, fixture], { encoding: "utf8" });
+    assert.notEqual(result.status, 0, `non-python-entrypoint fixture must fail (got ${result.status})`);
+    assert.match(result.stdout, /ENTRYPOINT_NOT_PYTHON/);
+  });
+});
+
+await checkAsync("validate-container rejects an ENTRYPOINT script outside the first-party source set", async () => {
+  await withFixture({
+    ...closureBaseFiles,
+    // /opt/vendor/run.py is not in the build context, so no closure can be
+    // computed from it — that is a failure, never a silent skip.
+    "Dockerfile": closureDockerfile("COPY agent.py helper.py ./", {
+      entrypoint: 'ENTRYPOINT ["python","/opt/vendor/run.py","start"]',
+    }),
+    "agent.py": "import helper\n",
+    "helper.py": "X = 1\n",
+  }, async (fixture) => {
+    const result = spawnSync("bash", [CONTAINER_VALIDATOR, fixture], { encoding: "utf8" });
+    assert.notEqual(result.status, 0, `foreign-entrypoint fixture must fail (got ${result.status})`);
+    assert.match(result.stdout, /ENTRYPOINT_NOT_FIRST_PARTY/);
   });
 });
 

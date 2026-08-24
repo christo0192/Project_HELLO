@@ -11,9 +11,12 @@
 #  4. No .env file exists in the build context.
 #  5. docker-compose.yml runs the same non-root user and has no healthcheck.
 #  6. The Dockerfile COPY list covers the EXACT first-party import closure of
-#     the entrypoint agent.py (AST-parsed, transitive) and copies no secret/env
-#     file. This is what prevents a re-run of PR102 (agent.py imported `phone`
-#     but the image omitted phone.py → ModuleNotFoundError at startup).
+#     the Python script named by the JSON ENTRYPOINT (AST-parsed, transitive;
+#     the root is derived, never hardcoded), every worker-source COPY resolves
+#     to /app under the WORKDIR in force, and no secret/env file is copied.
+#     This is what prevents a re-run of PR102 (agent.py imported `phone` but
+#     the image omitted phone.py → ModuleNotFoundError at startup) and the
+#     adjacent shape where the modules ship but land outside /app.
 #
 # Optional bounded Docker execution (NOT run in CI; run locally by the owner
 # or verifier) — `--docker` requires Docker and a bounded build:
@@ -102,142 +105,32 @@ fi
 # ── 6. First-party import closure ⊆ Dockerfile COPY (non-vacuous) ─────────
 # The defect this catches (PR102): agent.py grew `import phone` but the image
 # COPY list did not, so `python agent.py start` died with ModuleNotFoundError.
-# We parse the entrypoint's transitive first-party import closure with a real
-# AST walk and assert every local module file it needs is COPY'd — and that no
-# secret/env file is COPY'd. Skipped only when agent.py is absent (mini
-# negative-control fixtures that exercise other rules); the real context always
-# has it, so this is not a vacuity hole.
-if [ -f "$ctx/agent.py" ] && [ -n "$dockerfile" ]; then
+# scripts/docker_import_closure.py is the single implementation (shared with
+# app/voice-livekit/tests/test_docker_packaging.py, so the unit mutation
+# controls exercise exactly the code CI runs here). It:
+#   - derives the closure ROOT from the Dockerfile's JSON ENTRYPOINT rather
+#     than hardcoding `agent.py`, and fails closed if the entrypoint is
+#     absent, shell-form, malformed, non-Python, ambiguous, or names a file
+#     outside the first-party source set;
+#   - AST-walks the transitive first-party import closure from that root and
+#     fails on any un-COPY'd module (MISSING_COPY);
+#   - resolves each worker-source COPY destination against the WORKDIR in
+#     force and fails unless it lands in /app (BAD_COPY_DEST) — a destination
+#     outside the interpreter search path reproduces the very same startup
+#     ModuleNotFoundError while every other rule stays green;
+#   - fails on any secret/env file in a COPY (FORBIDDEN_COPY).
+# It is never skipped: a context whose Dockerfile cannot be rooted is a
+# failure, not a pass.
+if [ -n "$dockerfile" ]; then
   if ! command -v python3 >/dev/null 2>&1; then
     fail "python3 required to validate the import→COPY closure (refusing to skip)"
   else
-    closure_out=$(python3 - "$ctx" <<'PY'
-import ast, os, re, sys
-
-ctx = sys.argv[1]
-entry = "agent"
-
-# Local (first-party) importable names: top-level .py modules and packages
-# (directories with __init__.py) that live in the build context.
-local = {}
-for e in sorted(os.listdir(ctx)):
-    p = os.path.join(ctx, e)
-    if e.endswith(".py"):
-        local[e[:-3]] = e
-    elif os.path.isdir(p) and os.path.isfile(os.path.join(p, "__init__.py")):
-        local[e] = e  # package directory
-
-def top_imports(pyfile):
-    try:
-        tree = ast.parse(open(pyfile, encoding="utf-8").read(), filename=pyfile)
-    except (OSError, SyntaxError) as exc:
-        print("PARSE_ERROR %s: %s" % (pyfile, exc))
-        sys.exit(3)
-    names = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for a in node.names:
-                names.add(a.name.split(".")[0])
-        elif isinstance(node, ast.ImportFrom):
-            if node.module:
-                # `from pkg[.sub] import x` — top segment may be a local pkg.
-                names.add(node.module.split(".")[0])
-            elif node.level:
-                # `from . import sibling` (module is None): each imported name
-                # is a sibling module/package in the same package.
-                for a in node.names:
-                    names.add(a.name.split(".")[0])
-        elif isinstance(node, ast.Call):
-            # Literal-string dynamic imports: importlib.import_module("phone")
-            # or __import__("phone"). Non-literal args are unresolvable and are
-            # a documented limitation (see the Dockerfile COPY comment).
-            fn = node.func
-            is_dyn = (isinstance(fn, ast.Attribute) and fn.attr == "import_module") or \
-                     (isinstance(fn, ast.Name) and fn.id == "__import__")
-            if is_dyn and node.args:
-                arg = node.args[0]
-                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                    names.add(arg.value.split(".")[0])
-    return names
-
-# BFS the closure from the entrypoint through first-party modules only.
-closure, stack = set(), [entry]
-while stack:
-    m = stack.pop()
-    if m in closure or m not in local:
-        continue
-    closure.add(m)
-    src = os.path.join(ctx, local[m])
-    files = [src]
-    if os.path.isdir(src):
-        files = [os.path.join(r, f) for r, _, fs in os.walk(src)
-                 for f in fs if f.endswith(".py")]
-    for f in files:
-        for n in top_imports(f):
-            if n in local and n not in closure:
-                stack.append(n)
-
-# COPY sources in the Dockerfile. Robust to real Dockerfile shapes:
-#  - backslash line-continuations are joined first;
-#  - the COPY keyword is matched case-insensitively (Docker is);
-#  - `--from=` stage copies (the venv) are ignored;
-#  - leading `--chown=`/`--chmod=`/`--link` flag tokens are dropped, not
-#    mistaken for source paths.
-def copy_sources(text):
-    text = re.sub(r"\\\s*\n", " ", text)  # join line-continuations
-    srcs = []
-    for raw in text.splitlines():
-        s = raw.strip()
-        if not s or s.startswith("#"):
-            continue
-        toks = s.split()
-        if toks[0].lower() != "copy":
-            continue
-        toks = toks[1:]
-        if any(t.startswith("--from=") for t in toks):
-            continue
-        toks = [t for t in toks if not t.startswith("--")]  # drop flags
-        if len(toks) >= 2:
-            srcs.extend(toks[:-1])  # drop the destination token
-    return srcs
-
-copy_srcs = copy_sources(open(os.path.join(ctx, "Dockerfile"), encoding="utf-8").read())
-copy_set = {t.rstrip("/") for t in copy_srcs}
-
-# Every closure module's file/dir must be COPY'd.
-missing = sorted(local[m].rstrip("/") for m in closure if local[m].rstrip("/") not in copy_set)
-
-# No secret/env file may be COPY'd (basename-based; defense-in-depth behind
-# .dockerignore + the "no .env in context" check). Not exhaustive, but covers
-# the common credential shapes.
-SECRET_NAMES = {"id_rsa", "id_ed25519", "id_ecdsa", "credentials", "secrets",
-                ".netrc", ".pgpass", ".htpasswd", "kubeconfig", ".dockercfg",
-                ".dockerconfigjson", ".npmrc", "service-account.json"}
-SECRET_SUBSTR = ("secret", "credential", "password", "passwd", "apikey", "api_key", "token")
-forbidden = []
-for src in copy_srcs:
-    base = os.path.basename(src.rstrip("/"))
-    low = base.lower()
-    is_env = base == ".env" or (base.startswith(".env.") and base != ".env.example")
-    is_secret = (low.endswith((".pem", ".key", ".p12", ".pfx", ".pkcs12"))
-                 or low in SECRET_NAMES
-                 or any(sub in low for sub in SECRET_SUBSTR))
-    if is_env or is_secret:
-        forbidden.append(src)
-
-print("CLOSURE " + ",".join(sorted(closure)))
-if missing:
-    print("MISSING_COPY " + ",".join(missing))
-if forbidden:
-    print("FORBIDDEN_COPY " + ",".join(sorted(set(forbidden))))
-sys.exit(1 if (missing or forbidden) else 0)
-PY
-    ) && closure_rc=0 || closure_rc=$?
+    closure_out=$(python3 "$root/scripts/docker_import_closure.py" "$ctx") && closure_rc=0 || closure_rc=$?
     echo "$closure_out" | sed 's/^/  /'
     if [ "${closure_rc:-0}" -ne 0 ]; then
-      fail "Dockerfile COPY does not cover the first-party import closure of agent.py"
+      fail "Dockerfile packaging contract (entrypoint-rooted import closure -> COPY -> /app) violated"
     else
-      pass "Dockerfile COPY covers the exact first-party import closure of agent.py (no secret/env files)"
+      pass "Dockerfile COPY covers the exact first-party import closure of the ENTRYPOINT script, lands in /app, and copies no secret/env file"
     fi
   fi
 fi

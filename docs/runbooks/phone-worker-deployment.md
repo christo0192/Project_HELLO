@@ -254,6 +254,27 @@ statically so this cannot recur silently:
   (drop a first-party COPY → red; new local import without COPY → red; secret/env
   COPY → red).
 
+**Follow-up (PR102 post-merge).** An independent review of PR102 found the static
+gate complete for the shipped defect but incomplete in two adjacent directions,
+both closed in the follow-up branch:
+- the COPY **destination** was never checked, so `COPY agent.py … /elsewhere/`
+  shipped every module and still crashed with the same `ModuleNotFoundError`.
+  The destination is now resolved against the `WORKDIR` in force and must land
+  in `/app`.
+- the closure **root** was hardcoded to `agent`, so a renamed entrypoint would
+  silently skip the rule and a wrong entrypoint would root the walk at a file
+  that no longer starts the worker. The root is now derived from the
+  Dockerfile's JSON `ENTRYPOINT`, and an absent, shell-form, malformed,
+  non-Python, ambiguous or non-first-party entrypoint fails closed.
+Both rules live in `scripts/docker_import_closure.py`, the single analyzer that
+`scripts/validate-container.sh` (CI) and the Python unit controls both run.
+
+The same review recorded that PR102's Quality run passed on **attempt 3** of an
+unchanged SHA; attempts 1 and 2 failed on the pre-existing
+`resume-scanner-freshness` global-tmpdir flake in `app/api`, unrelated to the
+packaging change. That test now observes a private temp root instead of counting
+entries in the OS-wide tmpdir.
+
 **Recovery for a live machine.** Redeploy from a build that includes this fix
 (image rebuilt from `app/voice-livekit`), confirm a current registration, then
 `fly machine start`/`scale count 1` for the affected app. No data or schema change

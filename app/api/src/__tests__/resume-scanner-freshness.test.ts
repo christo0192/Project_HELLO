@@ -25,7 +25,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { chmod, mkdtemp, mkdir, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { readFileSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import type { ChildProcess } from 'node:child_process';
@@ -116,6 +116,48 @@ async function stubScanner(body: string): Promise<{ bin: string; cleanup: () => 
   const bin = join(dir, 'clamscan-stub.sh');
   await writeFile(bin, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
   return { bin, cleanup: () => rm(dir, { recursive: true, force: true }) };
+}
+
+/**
+ * Run `fn` with an EXCLUSIVE temp root that `ClamAvScanner` will use.
+ *
+ * The scanner mints its scratch directory with `mkdtemp(join(tmpdir(), …))`,
+ * and `os.tmpdir()` reads TMPDIR/TMP/TEMP on every call — so pointing those at
+ * a private directory moves the production scratch path into a namespace only
+ * this test can see. That matters: counting `hello-resume-scan-*` entries in
+ * the OS-wide tmpdir is not an isolated observation. Every ClamAvScanner.scan
+ * in the process family creates and deletes one, vitest runs suites in
+ * parallel workers, and a concurrent create or delete moves the count in
+ * EITHER direction — both were observed on an unchanged SHA (PR102 Quality
+ * attempts 1 and 2). With a private root the assertions below are absolute
+ * ("nothing was written") instead of a delta over somebody else's directory.
+ *
+ * The env vars are per-process and vitest isolates each test file into its own
+ * process, so this cannot leak into another suite; tests inside one file run
+ * sequentially, so it cannot leak into a sibling test either.
+ */
+async function withPrivateTmpRoot(fn: (root: string) => Promise<void>): Promise<void> {
+  const root = await mkdtemp(join(tmpdir(), 'scanner-tmproot-'));
+  const saved = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP };
+  process.env.TMPDIR = root;
+  process.env.TMP = root;
+  process.env.TEMP = root;
+  try {
+    // The seam is only useful if the scanner really lands here.
+    if (tmpdir() !== root) throw new Error(`tmpdir() did not follow TMPDIR: ${tmpdir()}`);
+    await fn(root);
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+/** `hello-resume-scan-*` scratch directories currently present in `dir`. */
+async function scratchDirs(dir: string): Promise<string[]> {
+  return (await readdir(dir)).filter((n) => n.startsWith('hello-resume-scan-'));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -373,14 +415,30 @@ describe('ClamAvScanner signature gating', () => {
   });
 
   it('does not write the untrusted bytes to disk at all when signatures are stale', async () => {
-    const before = (await readdir(tmpdir())).filter((n) => n.startsWith('hello-resume-scan-'));
-    const scanner = new ClamAvScanner('true', 30_000, async () => ({
-      fresh: false, ageSec: null, maxAgeSec: 86_400, reason: 'signatures_missing' as const,
-    }));
-    const result = await scanner.scan(Buffer.from('an ordinary resume'));
-    expect(result.status).toBe('scanner_signatures_unavailable');
-    const after = (await readdir(tmpdir())).filter((n) => n.startsWith('hello-resume-scan-'));
-    expect(after.length).toBe(before.length);
+    await withPrivateTmpRoot(async (root) => {
+      // Positive control FIRST: in this very root, a scan that IS allowed to
+      // proceed mints a `hello-resume-scan-*` scratch directory, and mints it
+      // here. Without it, the zero below could be the zero of an empty
+      // namespace rather than of a scan that refused to write.
+      const marker = join(root, 'scratch-parent');
+      const { bin, cleanup } = await stubScanner(`dirname "$4" > "${marker}"\nexit 0`);
+      try {
+        const allowed = await new ClamAvScanner(bin, 30_000, fresh).scan(Buffer.from('an ordinary resume'));
+        expect(allowed.status).toBe('clean');
+        const scratch = readFileSync(marker, 'utf8').trim();
+        expect(basename(scratch).startsWith('hello-resume-scan-')).toBe(true);
+        expect(dirname(scratch)).toBe(root);
+      } finally { await cleanup(); }
+
+      // The production invariant: stale/absent signatures fail closed BEFORE
+      // the untrusted bytes ever reach the disk.
+      const scanner = new ClamAvScanner('true', 30_000, async () => ({
+        fresh: false, ageSec: null, maxAgeSec: 86_400, reason: 'signatures_missing' as const,
+      }));
+      const result = await scanner.scan(Buffer.from('an ordinary resume'));
+      expect(result.status).toBe('scanner_signatures_unavailable');
+      expect(await scratchDirs(root)).toEqual([]);
+    });
   });
 
   it.each([
@@ -459,61 +517,50 @@ describe('ClamAvScanner signature gating', () => {
   });
 
   it('removes the scratch directory on every path', async () => {
-    // SCOPED TO WHAT THIS TEST CREATED, not to a global count of the shared OS
-    // tmpdir. `hello-resume-scan-*` is minted by every ClamAvScanner.scan in
-    // the process, and vitest runs suites in parallel workers — so a count
-    // taken before and after races any other file that scans at the same
-    // instant, and `resume-ingestion.test.ts` does exactly that. The race was
-    // always there; it only started firing when the suite grew enough to shift
-    // which files share a worker. A set difference proves the same property —
-    // this scanner leaves nothing behind — without asserting anything about
-    // somebody else's directories.
-    const before = new Set(
-      (await readdir(tmpdir())).filter((n) => n.startsWith('hello-resume-scan-')),
-    );
-    for (const bin of ['true', 'false', 'binary-that-does-not-exist']) {
-      await new ClamAvScanner(bin, 30_000, fresh).scan(Buffer.from('bytes to scan'));
-    }
-    const after = (await readdir(tmpdir())).filter((n) => n.startsWith('hello-resume-scan-'));
-    expect(after.filter((n) => !before.has(n))).toEqual([]);
+    // Observed inside a private temp root, so "nothing is left behind" is an
+    // absolute statement about this scanner rather than a delta over a shared
+    // directory other vitest workers are concurrently writing to.
+    await withPrivateTmpRoot(async (root) => {
+      expect(await scratchDirs(root)).toEqual([]);
+      for (const bin of ['true', 'false', 'binary-that-does-not-exist']) {
+        await new ClamAvScanner(bin, 30_000, fresh).scan(Buffer.from('bytes to scan'));
+      }
+      expect(await scratchDirs(root)).toEqual([]);
+    });
   });
 
   it('hands the real bytes to clamscan and then wipes them before unlinking', async () => {
     // The stub hard-links the scratch file aside, so the same inode survives
     // the scanner's `rm` and can be inspected afterwards. That makes the
     // in-place zero-overwrite directly observable rather than assumed.
-    const preExisting = new Set(
-      (await readdir(tmpdir())).filter((n) => n.startsWith('hello-resume-scan-')),
-    );
-    const spool = await mkdtemp(join(tmpdir(), 'scan-spool-'));
-    const link = join(spool, 'linked.bin');
-    const secret = 'SENSITIVE-RESUME-BYTES';
-    const { bin, cleanup } = await stubScanner(
-      `cp "$4" "${join(spool, 'copy.bin')}"\nln "$4" "${link}"\nexit 0`,
-    );
-    try {
-      const result = await new ClamAvScanner(bin, 30_000, fresh).scan(Buffer.from(secret, 'utf-8'));
-      expect(result).toMatchObject({ safe: true, status: 'clean' });
-
-      // clamscan really saw the bytes...
-      expect(readFileSync(join(spool, 'copy.bin'), 'utf8')).toBe(secret);
-      // ...and the scratch inode no longer holds them.
-      const wiped = readFileSync(link);
-      expect(wiped.length).toBe(secret.length);
-      expect(wiped.every((b) => b === 0)).toBe(true);
-      expect(wiped.toString('utf8')).not.toContain('SENSITIVE');
-
-      // And the private scratch directory itself is gone — measured as a set
-      // difference for the same reason as the test above: a concurrent worker's
-      // in-flight scan is not this test's business.
-      const survivors = (await readdir(tmpdir())).filter(
-        (n) => n.startsWith('hello-resume-scan-') && !preExisting.has(n),
+    await withPrivateTmpRoot(async (root) => {
+      expect(await scratchDirs(root)).toEqual([]);
+      const spool = await mkdtemp(join(tmpdir(), 'scan-spool-'));
+      const link = join(spool, 'linked.bin');
+      const secret = 'SENSITIVE-RESUME-BYTES';
+      const { bin, cleanup } = await stubScanner(
+        `cp "$4" "${join(spool, 'copy.bin')}"\nln "$4" "${link}"\nexit 0`,
       );
-      expect(survivors).toEqual([]);
-    } finally {
-      await cleanup();
-      await rm(spool, { recursive: true, force: true });
-    }
+      try {
+        const result = await new ClamAvScanner(bin, 30_000, fresh).scan(Buffer.from(secret, 'utf-8'));
+        expect(result).toMatchObject({ safe: true, status: 'clean' });
+
+        // clamscan really saw the bytes...
+        expect(readFileSync(join(spool, 'copy.bin'), 'utf8')).toBe(secret);
+        // ...and the scratch inode no longer holds them.
+        const wiped = readFileSync(link);
+        expect(wiped.length).toBe(secret.length);
+        expect(wiped.every((b) => b === 0)).toBe(true);
+        expect(wiped.toString('utf8')).not.toContain('SENSITIVE');
+
+        // And the private scratch directory itself is gone — an absolute
+        // emptiness check inside this test's own temp root.
+        expect(await scratchDirs(root)).toEqual([]);
+      } finally {
+        await cleanup();
+        await rm(spool, { recursive: true, force: true });
+      }
+    });
   });
 });
 
