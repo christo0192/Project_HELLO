@@ -163,10 +163,28 @@ const phoneCode = phone
   .join("\n");
 ok(/flyctl scale count 0 -a project-hello-phone-voice/.test(phoneCode),
   "comment-stripping must leave the executable scale lines intact (else every assertion below is vacuous)");
-ok(!/scale count 0[^\n]*2>\/dev\/null/.test(phoneCode),
+// L-1: the historical form spanned a backslash line-continuation
+//   flyctl scale count 0 -a … --yes 2>/dev/null \
+//     || echo "pre-release scale skipped (app not created yet); …"
+// so a `[^\n]*` guard could not match the shape it named — restoring the real
+// prior code would have left it green. Match the LOGICAL line instead: the
+// command plus any number of continued physical lines.
+const LOGICAL_SCALE = String.raw`scale count 0(?:[^\n]*\\\n)*[^\n]*`;
+ok(!new RegExp(`${LOGICAL_SCALE}2>\\/dev\\/null`).test(phoneCode),
   "deploy-phone-voice must not silence the pre-release scale's stderr — the failure text is what tells the two causes apart");
-ok(!/scale count 0[^\n]*\|\|\s*echo/.test(phoneCode),
-  "deploy-phone-voice must not swallow a pre-release scale failure with `|| echo` — that is the misattribution M-1 records");
+ok(!new RegExp(`${LOGICAL_SCALE}\\|\\|\\s*echo`).test(phoneCode),
+  "deploy-phone-voice must not swallow a pre-release scale failure with `|| echo`, on one line or across a continuation — that is the misattribution M-1 records");
+// The guard must be able to see across a continuation. A positive control on the
+// matcher itself, because a regex that cannot match the shape it forbids is the
+// guard-that-cannot-fire class: feed it the REAL historical two-line form.
+{
+  const historical = 'flyctl scale count 0 -a project-hello-phone-voice --yes 2>/dev/null \\\n'
+    + '  || echo "pre-release scale skipped (app not created yet); the post-release scale below is the binding guarantee"\n';
+  ok(new RegExp(`${LOGICAL_SCALE}\\|\\|\\s*echo`).test(historical),
+    "the `|| echo` guard must match the ACTUAL historical continuation form, not only a single-line reconstruction");
+  ok(new RegExp(`${LOGICAL_SCALE}2>\\/dev\\/null`).test(historical),
+    "the stderr-suppression guard must match the actual historical form");
+}
 ok(/could not find app/i.test(phoneCode),
   "deploy-phone-voice must match flyctl's app-not-found text explicitly rather than assuming it");
 ok(/::error::pre-release scale precondition FAILED[\s\S]*?exit 1/.test(phoneCode),
@@ -218,29 +236,48 @@ function stepScript(jobText, nameFragment) {
   ok(script !== null && /flyctl deploy --remote-only --config fly\.phone\.toml/.test(script || ""),
     "must be able to extract the phone deploy step's shell script for behavioural testing");
   if (script) {
-    // status_mode drives the stub: ok | notfound | nocred
-    const runWithStub = (statusMode) => {
+    // The stub answers `status` per mode and, in scalefail mode, fails `scale`.
+    // Modes: ok | notfound | nocred | scalefail.
+    //
+    // L-4 — SAFETY INVARIANT, stated and then enforced: this harness executes
+    // the workflow's REAL shell, which contains `flyctl deploy`. Nothing may
+    // reach Fly. Two things guarantee that and both are asserted below, not
+    // assumed: the child's PATH is replaced (not prepended to), so only the
+    // stub directory and the base system dirs are searched; and `command -v
+    // flyctl` is resolved IN THE CHILD ENV and required to be the stub. No Fly
+    // token is passed either — the step reads it from the job `env`, which this
+    // harness does not provide.
+    const stubDirFor = (statusMode) => {
       const dir = mkdtempSync(path.join(tmpdir(), "fly-stub-"));
       const bin = path.join(dir, "flyctl");
       writeFileSync(bin, [
         "#!/usr/bin/env bash",
         'if [ "$1" = "status" ]; then',
         `  case "${statusMode}" in`,
-        "    ok) echo 'App: project-hello-phone-voice'; exit 0 ;;",
+        "    ok|scalefail) echo 'App: project-hello-phone-voice'; exit 0 ;;",
         "    notfound) echo 'Error: Could not find App \"project-hello-phone-voice\"' >&2; exit 1 ;;",
         "    nocred) echo 'Error: no access token available' >&2; exit 1 ;;",
         "  esac",
+        "fi",
+        `if [ "$1" = "scale" ] && [ "${statusMode}" = "scalefail" ]; then`,
+        "  echo 'Error: could not scale app: machine update failed' >&2; exit 1",
         "fi",
         'echo "STUB flyctl $*"',
         "exit 0",
       ].join("\n"));
       chmodSync(bin, 0o755);
-      const r = spawnSync("bash", ["-c", script], {
-        encoding: "utf8",
-        env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
-      });
+      return dir;
+    };
+    const HERMETIC_PATH = (dir) => `${dir}:/usr/bin:/bin`;
+    const runWithStub = (statusMode) => {
+      const dir = stubDirFor(statusMode);
+      const env = { ...process.env, PATH: HERMETIC_PATH(dir) };
+      // Resolve flyctl in the SAME environment the step will run in.
+      const which = spawnSync("bash", ["-c", "command -v flyctl"], { encoding: "utf8", env });
+      const resolved = (which.stdout || "").trim();
+      const r = spawnSync("bash", ["-c", script], { encoding: "utf8", env });
       rmSync(dir, { recursive: true, force: true });
-      return { code: r.status, out: (r.stdout || "") + (r.stderr || "") };
+      return { code: r.status, out: (r.stdout || "") + (r.stderr || ""), resolved, stubBin: path.join(dir, "flyctl") };
     };
 
     // (a) App reachable → the pre-release scale actually RUNS, then the release.
@@ -277,6 +314,29 @@ function stepScript(jobText, nameFragment) {
       "credential failure: the underlying flyctl message must be surfaced, not swallowed");
     ok(!/STUB flyctl deploy/.test(nc.out),
       "credential failure: NO release may be pushed once the scale controls are untrustworthy");
+
+    // (d) L-4: `flyctl status` succeeds but the pre-release SCALE fails. Under
+    //     `set -e` the step must abort — an unscaled release is exactly the
+    //     unbounded live window the pre-release scale exists to prevent.
+    const sf = runWithStub("scalefail");
+    ok(sf.code !== 0, `scale failure: the step must abort, got exit ${sf.code}:\n${sf.out}`);
+    ok(!/STUB flyctl deploy/.test(sf.out),
+      "scale failure: NO release may be pushed when the pre-release scale itself fails");
+
+    // L-4: the harness is hermetic — prove it rather than assume it. Every mode
+    // must have resolved `flyctl` to the throwaway stub, never to a real binary.
+    for (const [label, r] of [["reachable", okRun], ["absent", nf], ["credential", nc], ["scale-failure", sf]]) {
+      ok(r.resolved === r.stubBin,
+        `${label}: flyctl must resolve to the test stub (${r.stubBin}), got ${JSON.stringify(r.resolved)} — this harness runs the real workflow shell and must never reach Fly`);
+    }
+    // The step must not carry a credential inline: the token arrives via job
+    // `env` (GitHub-masked), which this harness deliberately does not provide.
+    // A mention inside a diagnostic message is fine; an assignment or a
+    // `secrets.` interpolation inside the shell would not be.
+    ok(!/FLY_API_TOKEN[A-Z_]*\s*=/.test(script),
+      "the extracted step must not ASSIGN a Fly token inline — it is job env, and absent in this harness");
+    ok(!/\$\{\{\s*secrets\./.test(script),
+      "the extracted step must not interpolate a `secrets.` expression into the shell");
   }
 }
 

@@ -191,10 +191,14 @@ India KYC, an Indian number, a Plivo SIP trunk and a LiveKit outbound SIP trunk
 were configured after the first draft of this record, and **no real call has
 been placed**. That changes nothing about the decision. Provisioning a route is
 not authorisation to use it, and the application is deliberately not wired to
-it: `PHONE_SIP_TRUNK_ID` is bound in no app environment, the API's
-`PHONE_AGENT_NAME` is empty, and both are the last edits before a canary rather
-than the first (`phone-runtime.md` §11 steps 8–9). The blockers are TEL-01,
-TEL-04, TEL-05, TEL-06 and TEL-07 — approvals, not carrier capability.
+it: `PHONE_SIP_TRUNK_ID` is bound in no app environment and the API's
+`PHONE_AGENT_NAME` is empty. Trunk binding is **step 3 of
+`phone-safe-dialer.md` §9** — deliberately late, and deliberately *not* last:
+the `PHONE_DIAL_ALLOWLIST` digest and `PHONE_DIAL_MODE=live` (§9 step 6,
+`phone-runtime.md` §11 step 9) follow it and are the first configuration that
+can reach a carrier. `isLiveDialPermitted` requires all five conditions, so no
+single one of them is sufficient. The blockers are TEL-01, TEL-04, TEL-05,
+TEL-06 and TEL-07 — approvals, not carrier capability.
 
 The second is technical, and it is the one an engineer is likelier to get
 wrong. There is **no safe ephemeral no-persistence path** through this lane, by

@@ -1,5 +1,13 @@
 app = "project-hello-api"
-primary_region = "bom"
+# Region: `sin` — where this app's machine already runs. It said `bom` until
+# PR104. `primary_region` is consulted when a resource is CREATED, so the stale
+# value was invisible to every deploy of the existing machine and would have
+# fired on the first host loss, scale-up or machine re-creation — the same wall
+# that killed the first project-hello-phone-voice release. Editing it re-places
+# no existing machine. All THREE Fly app configs in this repo are held to the
+# allowlist in scripts/fly-region-policy.mjs by
+# scripts/validate-voice-worker-apps.mjs.
+primary_region = "sin"
 
 [build]
   dockerfile = "Dockerfile"

@@ -45,18 +45,28 @@ one, neither may declare a public service, and neither may bake a secret or a
 SIP-trunk key (the trunk guard is an **exact-key** check, so a real `ST_…` id
 with no digit run is caught, not just a numeric one).
 
-**Deployment region is an allowlist, and it is not cosmetic.** Both configs must
-name a region from `scripts/fly-region-policy.mjs` (today: `sin`), enforced by
-the same validator. Both said `bom` until PR104, and that is what broke the
-FIRST release of `project-hello-phone-voice`: Fly no longer accepts `bom` for
-**new** resource creation and recommended `sin`. The trap is quiet by
-construction — `primary_region` is consulted when a resource is **created**, so
-a deprecated value deploys green forever against machines that already exist and
-fails only on the one deploy that has to create one. The browser worker and the
-API were never affected because their machines predate the deprecation; the
-browser config was corrected in the same PR because a future scale-up would have
-hit the identical wall. Adding a region to the allowlist is a reviewed edit, and
-the policy refuses to allowlist a region it also records as deprecated.
+**Deployment region is an allowlist, and it is not cosmetic.** **All three** Fly
+app configs in this repo — `fly.toml`, `fly.phone.toml` and `app/api/fly.toml` —
+must name a region from `scripts/fly-region-policy.mjs` (today: `sin`), enforced
+by `scripts/validate-voice-worker-apps.mjs` in CI. All three said `bom` until
+PR104, and that is what broke the FIRST release of `project-hello-phone-voice`:
+Fly no longer accepts `bom` for **new** resource creation and recommended `sin`.
+
+The trap is quiet by construction — `primary_region` is consulted when a
+resource is **created**, so a deprecated value deploys green forever against
+machines that already exist and fails only on the one deploy that has to create
+one. The browser worker and the API had never *fired* it, because their machines
+predate the deprecation and already run in `sin`; they were still **carrying**
+it, and would have hit the identical wall on a host loss, a scale-up or any
+machine re-creation. Never-fired is not cleared. All three were corrected
+together, and the API config is inside this validator's region scope — the trap
+belongs to the field, not to the app, and a class swept in two files out of
+three is not swept.
+
+Adding a region to the allowlist is a reviewed edit, and the policy refuses to
+allowlist a region it also records as deprecated, or to drop `bom` from its
+deprecated record. A config declaring `primary_region` twice is refused rather
+than read on its first value.
 
 **`PHONE_AGENT_NAME` is a TWO-SIDED name, and both sides are validated.** A named
 worker receives work **only** by explicit dispatch to its name, and the API
@@ -175,7 +185,9 @@ app — including the phone app — deploys.
 deploy token is app-scoped, so the app must exist before its token can be
 minted.**
 ```
-# 1. the app must exist first (phone app only — the other two already do)
+# 1. the app must exist BEFORE its token is minted. Skip this for any app that
+#    already exists (`fly status -a <app>` answers); creating it twice is not
+#    the hazard — minting a token for an app that does not exist is.
 fly apps create project-hello-phone-voice          # same org as the other two
 
 # 2. then, and only then, the app-scoped deploy tokens

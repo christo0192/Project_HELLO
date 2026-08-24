@@ -27,6 +27,7 @@
  *  `sin` (Singapore) is where every existing app in this project actually runs
  *  and is the region Fly recommended when it refused `bom`. */
 export const APPROVED_WORKER_REGIONS = Object.freeze(["sin"]);
+const APPROVED_REGIONS_DEFAULT = APPROVED_WORKER_REGIONS;
 
 /** Regions that must never appear in a worker config again, each with the
  *  region that supersedes it, so a failure message can tell an operator what to
@@ -39,12 +40,22 @@ export const DEPRECATED_REGIONS = Object.freeze({
       + "it failed the first project-hello-phone-voice release before machine creation",
   }),
 });
+const DEPRECATED_REGIONS_DEFAULT = DEPRECATED_REGIONS;
 
 /** Structural self-checks on the policy itself. Returns a list of failures
  *  (empty when the policy is well formed). A policy that contradicts itself is
  *  worse than none: it would let a future edit launder a deprecated region into
- *  the allowlist and still report green. */
-export function assertPolicyConsistent() {
+ *  the allowlist and still report green.
+ *
+ *  The two tables are PARAMETERS with the shipped policy as their defaults, so
+ *  the checker can be given a deliberately contradictory policy and observed to
+ *  fire. Without that it could only ever be run against a policy that passes,
+ *  and "it returned no problems" would be indistinguishable from "it cannot
+ *  return problems" — the guard-that-cannot-fire class this lane deletes. */
+export function assertPolicyConsistent(
+  APPROVED_WORKER_REGIONS = APPROVED_REGIONS_DEFAULT,
+  DEPRECATED_REGIONS = DEPRECATED_REGIONS_DEFAULT,
+) {
   const problems = [];
   if (APPROVED_WORKER_REGIONS.length === 0) {
     problems.push("fly region policy: APPROVED_WORKER_REGIONS is empty — every region would be rejected and the contract would be unusable");

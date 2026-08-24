@@ -5,7 +5,7 @@
 // namespace) and is run through the validator as a subprocess.
 
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -35,6 +35,8 @@ function run2(voiceDir, apiDir) {
     "real configs must SURFACE the pre-canary silent state as a stable code");
   ok(/worker_regions_approved=sin/.test(out),
     "real configs must SURFACE the approved worker region allowlist as a stable code");
+  ok(/region_configs_checked=fly\.toml,fly\.phone\.toml,app\/api\/fly\.toml/.test(out),
+    "the region contract must cover ALL THREE Fly app configs, and say which it checked");
 }
 
 const GOOD_BROWSER = `app = "project-hello-voice"
@@ -118,6 +120,12 @@ const NEG = [
   // A deprecated region must stay rejected even when its case is varied — the
   // evasion a case-sensitive denylist would miss.
   ["phone worker on upper-case BOM", GOOD_BROWSER, GOOD_PHONE.replace('primary_region = "sin"', 'primary_region = "BOM"')],
+  // L-3: the scanner reads the FIRST match, so a good value followed by a bad
+  // one would validate on the good one. Invalid TOML that flyctl would reject
+  // outright — but a checker must never be the thing that calls it fine.
+  ["phone worker declares primary_region twice (sin then bom)", GOOD_BROWSER, GOOD_PHONE.replace('primary_region = "sin"', 'primary_region = "sin"\nprimary_region = "bom"')],
+  ["browser worker declares primary_region twice (sin then bom)", GOOD_BROWSER.replace('primary_region = "sin"', 'primary_region = "sin"\nprimary_region = "bom"'), GOOD_PHONE],
+  ["phone worker declares the app key twice", GOOD_BROWSER, GOOD_PHONE.replace('app = "project-hello-phone-voice"', 'app = "project-hello-phone-voice"\napp = "project-hello-voice"')],
 ];
 for (const [label, browser, phone] of NEG) {
   const dir = fixture(browser, phone);
@@ -170,13 +178,82 @@ for (const [label, browser, phone] of NEG) {
   ok(Object.prototype.hasOwnProperty.call(policy.DEPRECATED_REGIONS, "bom"),
     "bom must stay recorded as deprecated — dropping the record is how the regression returns");
   ok(policy.DEPRECATED_REGIONS.bom.superseded_by === "sin", "the bom record must name sin as its replacement");
-  // Positive control on the consistency checker itself: it must FIRE on a
-  // contradictory policy, or its green above proves nothing.
+
+  // L-2: a REAL positive control on assertPolicyConsistent itself. The check
+  // above can only ever run against a policy that passes, so on its own it
+  // cannot tell "no problems" from "cannot report problems". These feed it
+  // deliberately broken policies and require the SPECIFIC diagnosis — the
+  // failure mode, not merely a non-empty array.
+  const fires = (label, approved, deprecated, pattern) => {
+    const problems = policy.assertPolicyConsistent(approved, deprecated);
+    ok(problems.some((p) => pattern.test(p)),
+      `assertPolicyConsistent must fire on ${label}, got: ${JSON.stringify(problems)}`);
+  };
+  fires("a deprecated region that is also allowlisted", ["sin", "bom"], policy.DEPRECATED_REGIONS,
+    /bom is both APPROVED and DEPRECATED/);
+  fires("bom dropped from the deprecated record", policy.APPROVED_WORKER_REGIONS, {},
+    /bom must stay recorded as DEPRECATED/);
+  fires("an empty allowlist", [], policy.DEPRECATED_REGIONS,
+    /APPROVED_WORKER_REGIONS is empty/);
+  fires("a non-region-code entry", ["singapore"], { bom: { superseded_by: "singapore" } },
+    /is not a Fly region code/);
+  fires("a deprecated region pointing at an unapproved replacement", ["sin"], { bom: { superseded_by: "xyz" } },
+    /must name an APPROVED superseded_by region/);
+  // …and must NOT fire on a well-formed alternative policy, or it would be
+  // firing on everything rather than on contradictions.
+  ok(policy.assertPolicyConsistent(["sin", "iad"], { bom: { superseded_by: "sin" } }).length === 0,
+    "assertPolicyConsistent must accept a well-formed policy it did not ship with");
+
   const contradictory = policy.checkPrimaryRegion("probe", "bom");
   ok(contradictory.length === 1 && /DEPRECATED/.test(contradictory[0]),
     "checkPrimaryRegion must reject a deprecated region with a DEPRECATED verdict");
   ok(policy.checkPrimaryRegion("probe", "sin").length === 0, "checkPrimaryRegion must accept an approved region");
   ok(policy.checkPrimaryRegion("probe", null).length === 1, "checkPrimaryRegion must reject an ABSENT region");
+}
+
+// ── M-B: the region contract covers app/api/fly.toml too ────────────────
+// The API app carries the identical creation-time trap. Sweeping two configs
+// out of three is how a class survives a sweep, so the third is driven here
+// through the same checker, in both directions.
+{
+  const API_FLY = (region) => `app = "project-hello-api"\nprimary_region = "${region}"\n\n[env]\n  NODE_ENV = "production"\n\n[http_service]\n  internal_port = 8787\n`;
+  const withApiFly = (apiFly) => {
+    const voice = mkdtempSync(path.join(tmpdir(), "voice-apps-v-"));
+    writeFileSync(path.join(voice, "fly.toml"), GOOD_BROWSER);
+    writeFileSync(path.join(voice, "fly.phone.toml"), GOOD_PHONE);
+    const api = mkdtempSync(path.join(tmpdir(), "voice-apps-api-"));
+    writeFileSync(path.join(api, ".env.example"), "PHONE_AGENT_NAME=\n");
+    if (apiFly !== null) writeFileSync(path.join(api, "fly.toml"), apiFly);
+    return { voice, api };
+  };
+  const drive = (apiFly) => {
+    const { voice, api } = withApiFly(apiFly);
+    const r = run2(voice, api);
+    rmSync(voice, { recursive: true, force: true });
+    rmSync(api, { recursive: true, force: true });
+    return r;
+  };
+  const good = drive(API_FLY("sin"));
+  ok(good.code === 0, `an API config on an approved region must PASS: ${good.out}`);
+  ok(/region_configs_checked=fly\.toml,fly\.phone\.toml,app\/api\/fly\.toml/.test(good.out),
+    "the API config must be named among the region-checked configs");
+  const bad = drive(API_FLY("bom"));
+  ok(bad.code !== 0, `an API config on the deprecated region must FAIL: ${bad.out}`);
+  ok(/app\/api\/fly\.toml primary_region "bom" is DEPRECATED/.test(bad.out),
+    `the failure must name app/api/fly.toml specifically, got:\n${bad.out}`);
+  ok(/voice worker app config contract FAILED \(1\)/.test(bad.out),
+    `the API region mutation must produce EXACTLY one failure, got:\n${bad.out}`);
+  const unapproved = drive(API_FLY("iad"));
+  ok(unapproved.code !== 0, "an API config on an unapproved region must FAIL");
+  const dup = drive(`app = "project-hello-api"\nprimary_region = "sin"\nprimary_region = "bom"\n\n[env]\n  NODE_ENV = "production"\n`);
+  ok(dup.code !== 0, "an API config declaring primary_region twice must FAIL");
+  // The real repo's API config must actually be on the approved region — the
+  // synthetic controls above would pass even if the shipped file were stale.
+  const realApiFly = readFileSync(path.join(here, "..", "app/api/fly.toml"), "utf8");
+  ok(/^primary_region = "sin"$/m.test(realApiFly),
+    "the SHIPPED app/api/fly.toml must declare primary_region = \"sin\"");
+  ok(!/^primary_region = "bom"$/m.test(realApiFly),
+    "the SHIPPED app/api/fly.toml must not declare the deprecated region");
 }
 
 // ── H-1: worker <-> API dispatch-name agreement ─────────────────────────
@@ -192,7 +269,10 @@ function fixture2(browser, phone, apiEnvExample, apiFlyToml) {
   return { voice, api };
 }
 const PHONE_NAMED_DIFF = GOOD_PHONE.replace('"phone-screener"', '"totally-different-name"');
-const API_FLY_WITH = (name) => `app = "project-hello-api"\n\n[env]\n  PHONE_AGENT_NAME = "${name}"\n\n[http_service]\n  internal_port = 8080\n  min_machines_running = 1\n`;
+// The synthetic API config carries an approved primary_region because the real
+// one must: the region contract covers all three Fly app configs (M-B), and a
+// fixture that omitted it would be testing a file shape the validator rejects.
+const API_FLY_WITH = (name) => `app = "project-hello-api"\nprimary_region = "sin"\n\n[env]\n  PHONE_AGENT_NAME = "${name}"\n\n[http_service]\n  internal_port = 8080\n  min_machines_running = 1\n`;
 
 // Positive: the CURRENT state — worker named, API .env.example silent — passes
 // AND surfaces the code (H-1 requires the pre-canary state be visible).
