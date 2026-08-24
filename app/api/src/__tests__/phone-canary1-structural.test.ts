@@ -634,14 +634,16 @@ describe('8. canary and production metadata cannot be confused', () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════
-// 9. The arming constant is `false` on `main`.
+// 9. The arming constant is `true` on `canary1/arm` — the artifact that is
+//    never merged. On `main` this pin is inverted, and `main` additionally
+//    carries `scripts/check-main-disarmed.mjs`, which this branch never edits.
 // ══════════════════════════════════════════════════════════════════════
 
-describe('9. PR105 ships structurally disarmed', () => {
-  it('CANARY1_ARMED is the literal false in source', () => {
+describe('9. the activation artifact is structurally ARMED', () => {
+  it('CANARY1_ARMED is the literal true in source', () => {
     const body = code(file('arming.ts').source);
-    expect(body).toMatch(/export const CANARY1_ARMED:\s*boolean\s*=\s*false;/);
-    expect(body, 'the arming constant became true').not.toMatch(/CANARY1_ARMED[^=]*=\s*true/);
+    expect(body).toMatch(/export const CANARY1_ARMED:\s*boolean\s*=\s*true;/);
+    expect(body, 'the arming constant reverted to false').not.toMatch(/CANARY1_ARMED[^=]*=\s*false/);
   });
 
   it('nothing in the closure can flip it at runtime', () => {
