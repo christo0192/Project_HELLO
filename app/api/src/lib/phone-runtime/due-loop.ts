@@ -29,10 +29,12 @@ import type {
   PhoneScreeningConfig,
   PhoneStores,
 } from '../phone-screening/index.js';
-// A VALUE import, and the only one this module takes from the domain package:
-// the single shared definition of the IST window, so the runtime cannot grow
-// a second copy of 09:00/21:00 that drifts from admission's.
-import { istWindowOpen } from '../phone-screening/index.js';
+// TWO VALUE imports from the domain package, and both are shared DEFINITIONS
+// rather than conveniences: the single definition of the IST window, so the
+// runtime cannot grow a second copy of 09:00/21:00 that drifts from
+// admission's, and the closed deferral vocabulary, so the runtime cannot grow
+// a second copy of the codes `admitPhoneEngagement` can defer with.
+import { istWindowOpen, PHONE_DEFERRAL_CODES } from '../phone-screening/index.js';
 // The CLOSED admission vocabulary, imported rather than restated. The whole
 // safety of expanding `admission_refused` into per-detail buckets rests on the
 // detail being a member of a fixed set; a local copy of that set would be a
@@ -67,6 +69,16 @@ export type PhoneDueSkip = (typeof PHONE_DUE_SKIPS)[number];
 export const PHONE_ADMISSION_REFUSAL = 'admission_refused';
 
 /**
+ * The refusal the dial controller answers when the LOCAL PREFLIGHT — not the
+ * database — was what said no.
+ *
+ * `dial.ts` returns it with `detail: admitted.code`, and that code is a
+ * `PhoneDeferralCode`. It is the second refusal whose count key is built
+ * rather than copied, for exactly the reason `admission_refused` is the first.
+ */
+export const PHONE_ADMISSION_DEFERRAL = 'admission_deferred';
+
+/**
  * The bucket an unrecognised admission detail collapses into.
  *
  * NOT the detail itself, and that is the entire point. The health surface is
@@ -96,25 +108,72 @@ export const PHONE_ADMISSION_REFUSAL_DETAILS: readonly string[] = Object.freeze(
 const ADMISSION_REFUSAL_DETAILS = new Set<string>(PHONE_ADMISSION_REFUSAL_DETAILS);
 
 /**
+ * Every value `dialPhoneAttempt` can legitimately carry in `detail` alongside
+ * `admission_deferred`.
+ *
+ * That is `PhoneDeferralCode`'s whole closed set, IMPORTED rather than
+ * restated — the same rule `PHONE_ADMISSION_REFUSAL_DETAILS` follows. A local
+ * copy would be a second thing to keep in step with `admission.ts`, and the
+ * first place it drifted would be the moment a deferral code this file has
+ * never heard of started reporting as `:unknown` on a health surface.
+ */
+export const PHONE_ADMISSION_DEFERRAL_DETAILS: readonly string[] =
+  Object.freeze([...PHONE_DEFERRAL_CODES]);
+
+const ADMISSION_DEFERRAL_DETAILS = new Set<string>(PHONE_ADMISSION_DEFERRAL_DETAILS);
+
+/**
+ * The refusals that are EXPANDED by their detail, and the closed vocabulary
+ * each one's detail must belong to.
+ *
+ * A map rather than two branches, so adding a third expanded refusal is one
+ * entry and cannot be half-added: the vocabulary and the expansion arrive
+ * together or not at all.
+ */
+const EXPANDED_REFUSAL_DETAILS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  [PHONE_ADMISSION_REFUSAL, ADMISSION_REFUSAL_DETAILS as ReadonlySet<string>],
+  [PHONE_ADMISSION_DEFERRAL, ADMISSION_DEFERRAL_DETAILS as ReadonlySet<string>],
+]);
+
+/**
  * The key an outcome is counted under.
  *
- * ── WHY `admission_refused` IS EXPANDED AND THE OTHERS ARE NOT ────────
- * `window_closed`, `at_capacity`, `daily_attempt_exists`, `consent_missing`,
- * `suppressed`, `phone_invalid`, `halt_unreadable` and `ingestion_not_ready`
- * all arrive as ONE refusal code with the distinguishing answer in `detail`.
- * Collapsed, they are a single number that cannot tell "the lane is working
- * and today's quota is spent" from "consent is broken and nobody is being
- * called" — which are the two readings an operator most needs to separate.
- * Every other member of `PHONE_DIAL_REFUSALS` is already distinct on its own,
- * so nothing else is expanded and no other refusal grows a suffix.
+ * ── WHY TWO REFUSALS ARE EXPANDED AND THE OTHERS ARE NOT ──────────────
+ * `dial.ts` answers with a refusal code plus a `detail`, and for exactly two
+ * of the eight refusals the code alone is not an answer:
  *
- * The vocabulary stays CLOSED: an unrecognised detail becomes
- * `admission_refused:unknown`, never the string itself.
+ *   * `admission_refused` — `window_closed`, `at_capacity`,
+ *     `daily_attempt_exists`, `consent_missing`, `suppressed`,
+ *     `phone_invalid`, `halt_unreadable` and `ingestion_not_ready` all arrive
+ *     under it. Collapsed, they are a single number that cannot tell "the
+ *     lane is working and today's quota is spent" from "consent is broken and
+ *     nobody is being called".
+ *   * `admission_deferred` — the LOCAL preflight's refusal, carrying a
+ *     `PhoneDeferralCode`: `cold_start`, `screening_disabled`,
+ *     `runtime_disabled`, `dial_mode_off`, `dial_not_allowlisted`,
+ *     `window_closed_defer` and `consent_preflight_refused`. Collapsed, an
+ *     operator reading `admission_deferred: 3` cannot tell "these three
+ *     numbers are not on the live allowlist" from "consent preflight refused
+ *     for three candidates" — the same pair of readings, one gate earlier.
+ *
+ * An earlier revision expanded only the first and asserted in this comment
+ * that "every other member of `PHONE_DIAL_REFUSALS` is already distinct on
+ * its own". That was false of `admission_deferred`, whose detail was dropped
+ * by the early return below, and the false sentence is why nobody looked
+ * again. Every OTHER member genuinely is distinct: `runtime_disabled`,
+ * `transport_not_configured`, `timeouts_misordered`, `lease_too_short` and
+ * `originate_failed` carry no detail at all, and `room_unavailable` carries a
+ * reason from a different closed set whose members are not operationally
+ * opposite to one another.
+ *
+ * Both vocabularies stay CLOSED: an unrecognised detail becomes
+ * `<refusal>:unknown`, never the string itself.
  */
 export function phoneRefusalCountKey(refusal: string, detail: string | undefined): string {
-  if (refusal !== PHONE_ADMISSION_REFUSAL) return refusal;
-  const known = detail !== undefined && ADMISSION_REFUSAL_DETAILS.has(detail);
-  return `${PHONE_ADMISSION_REFUSAL}:${known ? detail : PHONE_UNKNOWN_ADMISSION_DETAIL}`;
+  const vocabulary = EXPANDED_REFUSAL_DETAILS.get(refusal);
+  if (vocabulary === undefined) return refusal;
+  const known = detail !== undefined && vocabulary.has(detail);
+  return `${refusal}:${known ? detail : PHONE_UNKNOWN_ADMISSION_DETAIL}`;
 }
 
 export interface PhoneDueResult {
@@ -293,6 +352,10 @@ export async function runPhoneDuePass(
   const due = await deps.reader.listDueEngagements({
     nowIso: options.now.toISOString(),
     limit: options.limit,
+    // The SAME value `dueByClock` uses below. Passed rather than duplicated
+    // so the SQL filter and the JS filter cannot drift apart into a batch
+    // that reads rows it then always rejects.
+    reconnectBackoffSeconds: deps.config.reconnectBackoffSeconds,
   });
 
   const skipped: Record<string, number> = {};

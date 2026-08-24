@@ -174,7 +174,11 @@ const assessmentStartSchema = z
  * schema can stay this shape.
  *
  * `epoch` accepts 0: 0042 starts an engagement at epoch 0 and bumps on
- * `disclosure.delivered`, so a first heartbeat legitimately carries zero.
+ * `disclosure.delivered`. The epoch a beat carries is normally ONE BEHIND
+ * the attempt row — admission mints it onto the dispatch metadata and the
+ * bump happens before the heartbeat ever starts — which is why the RPC
+ * fences on `epoch >= p_epoch`. An equality there answered `lease_lost` to
+ * the first beat of every consented call.
  */
 const attemptHeartbeatSchema = z
   .object({

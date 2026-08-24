@@ -39,6 +39,8 @@ import {
   type PhoneRuntimeConfig,
 } from '../lib/phone-runtime/config.js';
 import {
+  PHONE_ADMISSION_DEFERRAL,
+  PHONE_ADMISSION_DEFERRAL_DETAILS,
   PHONE_ADMISSION_REFUSAL,
   PHONE_ADMISSION_REFUSAL_DETAILS,
   PHONE_UNKNOWN_ADMISSION_DETAIL,
@@ -57,7 +59,7 @@ import {
 } from '../lib/phone-runtime/dial-handler.js';
 import type { DuePhoneEngagement, PhoneRuntimeReader } from '../lib/phone-runtime/read.js';
 import type { DialableNumber } from '../integrations/livekit-phone-dial/dialable-number.js';
-import { PHONE_BOUNDS } from '../lib/phone-screening/index.js';
+import { PHONE_BOUNDS, PHONE_DEFERRAL_CODES } from '../lib/phone-screening/index.js';
 import { ADMIT_PHONE_ATTEMPT_STATUSES } from '../lib/phone-screening/rpc-contract.js';
 import type { PhoneScreeningConfig, PhoneStores } from '../lib/phone-screening/index.js';
 import type { QueueJob } from '../lib/queue/types.js';
@@ -1011,16 +1013,113 @@ describe('a refusal is counted by its stable code and is not a dial', () => {
     expect(result.refusals).toEqual({ 'admission_refused:unknown': 1 });
   });
 
-  it('M-5: NO OTHER refusal grows a suffix, even when a detail rides along', async () => {
+  it('M-5: an UNEXPANDED refusal grows no suffix, even when a detail rides along', async () => {
     // `room_unavailable` carries `detail: room.reason` from `dial.ts`, and
-    // that vocabulary is a DIFFERENT closed set. Only `admission_refused` is
-    // expanded, because only it collapses eight distinct answers into one.
+    // that vocabulary is a DIFFERENT closed set whose members are not
+    // operationally opposite to one another. Only the two admission refusals
+    // are expanded, because only they collapse answers an operator must
+    // separate into one number.
     const h = harness({
       due: [engagement({ engagementId: 'e1', candidateId: 'c1' })],
       dial: () => ({ status: 'refused', refusal: 'room_unavailable', detail: 'not_configured' }),
     });
     const result = await runPhoneDuePass(h.deps, options());
     expect(result.refusals).toEqual({ room_unavailable: 1 });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════
+  // M-6 — `admission_deferred` WAS THE OTHER COLLAPSED BUCKET
+  // ═══════════════════════════════════════════════════════════════════
+  //
+  // The M-5 repair expanded `admission_refused` and asserted, in the comment
+  // above `phoneRefusalCountKey`, that "every other member of
+  // `PHONE_DIAL_REFUSALS` is already distinct on its own". That was false.
+  // `dial.ts` returns `refusal: 'admission_deferred'` with
+  // `detail: admitted.code`, and `PhoneDeferralCode` has SEVEN members. The
+  // early return dropped the detail, so an operator reading
+  // `admission_deferred: 3` could not tell "these three numbers are not on
+  // the live allowlist" from "consent preflight refused for three
+  // candidates" — the exact pair M-5 said must be separable, one gate
+  // earlier and with a comment asserting it had been handled.
+
+  it('M-6: two deferrals with different codes are two different buckets', async () => {
+    const details: Record<string, string> = {
+      e1: 'dial_not_allowlisted',
+      e2: 'consent_preflight_refused',
+      e3: 'dial_not_allowlisted',
+    };
+    const h = harness({
+      due: [
+        engagement({ engagementId: 'e1', candidateId: 'c1' }),
+        engagement({ engagementId: 'e2', candidateId: 'c2' }),
+        engagement({ engagementId: 'e3', candidateId: 'c3' }),
+      ],
+      dial: (engagementId) => ({
+        status: 'refused',
+        refusal: 'admission_deferred',
+        detail: details[engagementId],
+      }),
+    });
+    const result = await runPhoneDuePass(h.deps, options());
+
+    expect(result.refusals).toEqual({
+      'admission_deferred:dial_not_allowlisted': 2,
+      'admission_deferred:consent_preflight_refused': 1,
+    });
+    // The collapsed bucket is GONE, not merely joined by the new ones.
+    expect(result.refusals.admission_deferred).toBeUndefined();
+    expect(result.offered).toBe(3);
+    expect(result.dialing).toBe(0);
+  });
+
+  it('M-6: EVERY member of the closed deferral set is recognised', () => {
+    // Read from `PHONE_DEFERRAL_CODES` itself, not from a list retyped here:
+    // a code added to `admission.ts` must not silently start reporting as
+    // `unknown` on a health surface.
+    expect(PHONE_DEFERRAL_CODES.length).toBeGreaterThanOrEqual(7);
+    for (const code of PHONE_DEFERRAL_CODES) {
+      expect(phoneRefusalCountKey(PHONE_ADMISSION_DEFERRAL, code))
+        .toBe(`admission_deferred:${code}`);
+    }
+    // The exported set is exactly that vocabulary, in both directions.
+    expect([...PHONE_ADMISSION_DEFERRAL_DETAILS].sort())
+      .toEqual([...PHONE_DEFERRAL_CODES].sort());
+    // And the two expanded vocabularies do not borrow from each other: a
+    // deferral code must not be recognised as an admission STATUS.
+    for (const code of PHONE_DEFERRAL_CODES) {
+      expect(PHONE_ADMISSION_REFUSAL_DETAILS).not.toContain(code);
+    }
+  });
+
+  it('M-6: the pair M-5 named — allowlist vs consent preflight — really is separable', () => {
+    // Stated as the two keys rather than as a count, because the count is
+    // what an operator sees and the keys are what makes it readable.
+    expect(phoneRefusalCountKey(PHONE_ADMISSION_DEFERRAL, 'dial_not_allowlisted'))
+      .not.toBe(phoneRefusalCountKey(PHONE_ADMISSION_DEFERRAL, 'consent_preflight_refused'));
+  });
+
+  it('M-6: an unrecognised or absent deferral code lands in the SAME fixed bucket', async () => {
+    // The closure is the safety property here for the same reason it is for
+    // `admission_refused`: this key is published.
+    const HOSTILE = 'SENTINEL-DEFER-<script>-9198765432-must-not-travel';
+    expect(phoneRefusalCountKey(PHONE_ADMISSION_DEFERRAL, HOSTILE))
+      .toBe(`admission_deferred:${PHONE_UNKNOWN_ADMISSION_DETAIL}`);
+    expect(phoneRefusalCountKey(PHONE_ADMISSION_DEFERRAL, undefined))
+      .toBe(`admission_deferred:${PHONE_UNKNOWN_ADMISSION_DETAIL}`);
+    // Near-misses too, exactly as the admission set is pinned.
+    for (const near of ['', 'Cold_Start', 'cold_start ', 'window_closed', '__proto__']) {
+      expect(phoneRefusalCountKey(PHONE_ADMISSION_DEFERRAL, near), near)
+        .toBe(`admission_deferred:${PHONE_UNKNOWN_ADMISSION_DETAIL}`);
+    }
+
+    const h = harness({
+      due: [engagement({ engagementId: 'e1', candidateId: 'c1' })],
+      dial: () => ({ status: 'refused', refusal: 'admission_deferred', detail: HOSTILE }),
+    });
+    const result = await runPhoneDuePass(h.deps, options());
+    expect(result.refusals).toEqual({ 'admission_deferred:unknown': 1 });
+    expect(JSON.stringify(result)).not.toContain('SENTINEL-DEFER');
+    expect(JSON.stringify(result)).not.toContain('script');
   });
 
   describe('M-5: the detail vocabulary is CLOSED, and the closure is the safety property', () => {

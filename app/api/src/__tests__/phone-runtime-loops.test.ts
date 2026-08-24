@@ -25,6 +25,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
+import * as http from 'node:http';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { vi } from 'vitest';
@@ -36,6 +37,7 @@ import {
 import {
   MIN_STALE_WINDOW_MS,
   STALE_TICK_MULTIPLIER,
+  armPhoneRuntime,
   clearPhoneRuntimeRegistration,
   clearPhoneRuntimeStartFailure,
   phoneRuntimeDegradeReasons,
@@ -1362,6 +1364,208 @@ describe('F. the cadence bounds are measured against the scheduler that decides 
     // rather than the 180s a fully backed-off loop produced.
     expect(reconnectBoundMs).toBeLessThan(config.reconnectBackoffSeconds * 1_000 * 1.5);
   });
+
+  // ═══════════════════════════════════════════════════════════════════
+  // M-7 — THE HOLD MUST NOT SURVIVE A PERSISTENT NON-THROWING FAILURE
+  // ═══════════════════════════════════════════════════════════════════
+  //
+  // `HOLD_BASE_CADENCE` is a `didWork` answer, and the scheduler backs off
+  // unless `didWork && consecutiveErrors === 0`. The M-2/M-4 repairs returned
+  // it UNCONDITIONALLY, and the comment beside it claimed only a THROW could
+  // still cause backoff. That is incomplete: a non-`ok` RPC status and a due
+  // pass answering `status: 'halted'` are both failures and neither throws.
+  //
+  // The concrete cost, from the review: with the `phone_control` singleton
+  // missing, `runPhoneDuePass` answers `halted` on every pass, so instead of
+  // backing off to the 60s ceiling the loop re-ran the halt and backlog RPCs
+  // every ~7.5-15s indefinitely, on EVERY replica, for the whole length of an
+  // incident. Below, each direction is measured against a control that
+  // differs in exactly one thing: whether the pass succeeded.
+  //
+  // Tick COUNTS rather than gaps, because the halted pass returns before it
+  // reaches the reader and `stores.backlog` is read by two callers — a
+  // timestamp recorded there would conflate the due loop with the dial
+  // loop's halt gate. `loopHealth(...).ticks` is per-loop and unambiguous.
+
+  /** Ticks one named loop managed over `windowMs`, at the widest jitter. */
+  async function ticksOver(
+    runtime: PhoneRuntimeHandle,
+    loop: string,
+    windowMs: number,
+  ): Promise<number> {
+    runtime.scheduler.start();
+    await vi.advanceTimersByTimeAsync(windowMs);
+    return loopHealth(runtime, loop).ticks;
+  }
+
+  const SLOW = { dueMs: 1_000, reclaimMs: 600_000, expireMs: 600_000, reconcileMs: 600_000 };
+  const WINDOW = 120_000;
+  /**
+   * Held at a 1s base cadence a loop ticks ~120 times in 120s; backed off to
+   * the 60s ceiling it manages under ten. The threshold sits in the empty
+   * space between, so neither direction is a near miss.
+   */
+  const BACKED_OFF = 15;
+  const HELD = 90;
+
+  it('M-7: a persistently HALTED due pass backs off — it does not pin the base cadence', async () => {
+    const c = counters();
+    const runtime = buildRuntime({
+      stores: makeStores(c, {
+        // The `phone_control` singleton is missing. `runPhoneDuePass` reads
+        // an absent control row as HALTED and returns without throwing.
+        async backlog() {
+          c.backlogReads += 1;
+          return {
+            status: 'ok',
+            admission: { controlPresent: false, halted: false, haltReason: null },
+          };
+        },
+      }),
+      queue: makeEmptyQueue(c),
+      config: SLOW,
+      random: () => 0.999,
+    });
+    registerPhoneRuntime(runtime);
+
+    const ticks = await ticksOver(runtime, 'phone-due', WINDOW);
+
+    // PREMISE, asserted rather than assumed: the pass really did halt, and
+    // it really did not throw.
+    expect(runtime.snapshot().lastDue?.status).toBe('halted');
+    expect(loopHealth(runtime, 'phone-due').consecutiveErrors).toBe(0);
+    // THE REPAIR: an incident does not become a hot loop on every replica.
+    expect(ticks, `halted due ticks in ${WINDOW}ms`).toBeLessThan(BACKED_OFF);
+    // And the halt is visible on the surface, so the quiet loop is explained.
+    expect(phoneRuntimeDegradeReasons(phoneRuntimeView())).toContain('phone_due_halted');
+  });
+
+  it('M-7 CONTROL: a SUCCESSFUL due pass that dialled nothing still holds the base cadence', async () => {
+    // The half of M-4 that must survive the repair. This is the reconnect
+    // bound: a pass that found nothing is not a failed pass, and backing off
+    // here is what made the contract's "approximately 120 seconds" unbounded.
+    const c = counters();
+    const runtime = buildRuntime({
+      stores: makeStores(c),
+      reader: makeReader({}, c),
+      queue: makeEmptyQueue(c),
+      config: SLOW,
+      random: () => 0.999,
+    });
+
+    const ticks = await ticksOver(runtime, 'phone-due', WINDOW);
+
+    expect(runtime.snapshot().lastDue?.status).toBe('ok');
+    expect(runtime.snapshot().lastDue?.dialing).toBe(0);
+    expect(ticks, `idle-but-ok due ticks in ${WINDOW}ms`).toBeGreaterThan(HELD);
+  });
+
+  it('M-7: a persistently NON-OK reclaim status backs off; an `ok` sweep that reclaimed nothing does not', async () => {
+    // Same shape one loop over, and the same non-throwing failure: a sweep
+    // RPC that answers a status we do not recognise.
+    const cBroken = counters();
+    const broken = buildRuntime({
+      stores: makeStores(cBroken, {
+        async reclaimAttemptLeases() {
+          cBroken.reclaims += 1;
+          return { status: 'unknown' as const };
+        },
+      }),
+      queue: makeEmptyQueue(cBroken),
+      config: { dueMs: 600_000, reclaimMs: 1_000, expireMs: 600_000, reconcileMs: 600_000 },
+      random: () => 0.999,
+    });
+    const brokenTicks = await ticksOver(broken, 'phone-reclaim', WINDOW);
+
+    expect(broken.snapshot().sweepNotOk.reclaim).toBe(true);
+    expect(loopHealth(broken, 'phone-reclaim').consecutiveErrors).toBe(0);
+    expect(brokenTicks, `non-ok reclaim ticks in ${WINDOW}ms`).toBeLessThan(BACKED_OFF);
+    await broken.stop();
+
+    // CONTROL: the M-2 bound. `reclaimed: 0` under `status: 'ok'` is this
+    // sweep's steady state and must still hold the cadence.
+    const cOk = counters();
+    const healthy = buildRuntime({
+      stores: makeStores(cOk),
+      queue: makeEmptyQueue(cOk),
+      config: { dueMs: 600_000, reclaimMs: 1_000, expireMs: 600_000, reconcileMs: 600_000 },
+      random: () => 0.999,
+    });
+    const okTicks = await ticksOver(healthy, 'phone-reclaim', WINDOW);
+
+    expect(healthy.snapshot().sweepNotOk.reclaim).toBe(false);
+    expect(healthy.snapshot().lastReclaimed).toBe(0);
+    expect(okTicks, `ok-but-idle reclaim ticks in ${WINDOW}ms`).toBeGreaterThan(HELD);
+    await healthy.stop();
+  });
+
+  it('M-7: a BROKEN sweep claim backs off; a claim HELD BY ANOTHER replica does not', async () => {
+    // A missed `grant execute` on `claim_phone_sweep` answers on every tick
+    // for ever without throwing at the loop — the exact shape H-3 named. It
+    // must not hot-spin. `held_by_other` is the opposite: it is the normal
+    // answer every replica but one hears, and holding the cadence there is
+    // what lets this replica take the claim over promptly when its holder
+    // dies.
+    const cBroken = counters();
+    const broken = buildRuntime({
+      stores: makeStores(cBroken, {
+        async claimSweep() { throw new Error('claim_read_failed'); },
+      }),
+      queue: makeEmptyQueue(cBroken),
+      config: { dueMs: 600_000, reclaimMs: 600_000, expireMs: 1_000, reconcileMs: 600_000 },
+      random: () => 0.999,
+    });
+    const brokenTicks = await ticksOver(broken, 'phone-dayroll', WINDOW);
+
+    expect(broken.snapshot().sweepNotOk.dayroll).toBe(true);
+    expect(cBroken.dayRolls).toBe(0);
+    expect(brokenTicks, `broken-claim dayroll ticks in ${WINDOW}ms`).toBeLessThan(BACKED_OFF);
+    await broken.stop();
+
+    const cTheirs = counters();
+    const theirs = buildRuntime({
+      stores: makeStores(cTheirs, {
+        async claimSweep(input: { sweep: string }) {
+          cTheirs.sweepClaims.push(input.sweep);
+          return { status: 'held_by_other' as const };
+        },
+      }),
+      queue: makeEmptyQueue(cTheirs),
+      config: { dueMs: 600_000, reclaimMs: 600_000, expireMs: 1_000, reconcileMs: 600_000 },
+      random: () => 0.999,
+    });
+    const theirsTicks = await ticksOver(theirs, 'phone-dayroll', WINDOW);
+
+    // A healthy fleet is not amber, and it is not slow to take over either.
+    expect(theirs.snapshot().sweepNotOk.dayroll).toBe(false);
+    expect(cTheirs.dayRolls).toBe(0);
+    expect(theirsTicks, `held-by-other dayroll ticks in ${WINDOW}ms`).toBeGreaterThan(HELD);
+    await theirs.stop();
+  });
+
+  it('M-7: a non-ok STRANDED sweep backs off too — the pairing is at every site', async () => {
+    const c = counters();
+    const runtime = buildRuntime({
+      stores: makeStores(c, {
+        async sweepStrandedSessions() {
+          c.strandedSweeps += 1;
+          return { status: 'unknown' as const };
+        },
+      }),
+      queue: makeEmptyQueue(c),
+      config: { dueMs: 600_000, reclaimMs: 600_000, expireMs: 1_000, reconcileMs: 600_000 },
+      random: () => 0.999,
+    });
+    const ticks = await ticksOver(runtime, 'phone-stranded', WINDOW);
+
+    expect(runtime.snapshot().sweepNotOk.stranded).toBe(true);
+    expect(runtime.snapshot().lastStranded).toBeNull();
+    expect(ticks, `non-ok stranded ticks in ${WINDOW}ms`).toBeLessThan(BACKED_OFF);
+    // CONTROL: its SIBLING on the same cadence answered `ok` and is still
+    // held, so the backoff is the loop's own and not the whole scheduler's.
+    expect(runtime.snapshot().sweepNotOk.dayroll).toBe(false);
+    expect(loopHealth(runtime, 'phone-dayroll').ticks).toBeGreaterThan(HELD);
+  });
 });
 
 describe('F. M-1 — a reconcile sweep that is NOT RUNNING is not a sweep that found nothing', () => {
@@ -1469,6 +1673,68 @@ describe('the day-roll and stranded sweeps run, and the claim gates them', () =>
     expect(asked.length).toBeGreaterThan(0);
     expect(c.dayRolls).toBe(0);
     expect(c.strandedSweeps).toBe(0);
+  });
+
+  it('"held by another replica" and "the claim is BROKEN" are different facts', async () => {
+    // Collapsing them into one `false` is how a missed grant on
+    // `claim_phone_sweep` silently disables BOTH new loops on EVERY replica
+    // for ever — day.rolled never posted, the no-answer ladder still ending
+    // at attempt 1 — while health reports `sweeps_not_ok: []` and
+    // `status: ok`. This work already hit a missed revoke/grant pair once,
+    // on a different function, so the failure mode is not hypothetical.
+    const c = counters();
+    const broken = buildRuntime({
+      stores: makeStores(c, {
+        claimSweep: async () => { throw new Error('claim_read_failed'); },
+      }),
+      queue: makeEmptyQueue(c),
+      config: FAST,
+    });
+    broken.scheduler.start();
+    await vi.advanceTimersByTimeAsync(5_000);
+    const brokenSnap = broken.snapshot();
+    expect(brokenSnap.sweepNotOk.dayroll).toBe(true);
+    expect(brokenSnap.sweepNotOk.stranded).toBe(true);
+    await broken.stop();
+
+    // The NORMAL case every replica but one hears on every tick. It must be
+    // silent, or a healthy fleet is permanently amber.
+    const c2 = counters();
+    const theirs = buildRuntime({
+      stores: makeStores(c2, { claimSweep: async () => ({ status: 'held_by_other' as const }) }),
+      queue: makeEmptyQueue(c2),
+      config: FAST,
+    });
+    theirs.scheduler.start();
+    await vi.advanceTimersByTimeAsync(5_000);
+    const theirsSnap = theirs.snapshot();
+    expect(theirsSnap.sweepNotOk.dayroll).toBe(false);
+    expect(theirsSnap.sweepNotOk.stranded).toBe(false);
+    await theirs.stop();
+  });
+
+  it('a replica that stops sweeping stops publishing its last count', async () => {
+    // A stale `4` reads as a sweep that worked minutes ago rather than one
+    // that has not run in days. Both non-running verdicts null the count.
+    const c = counters();
+    let grant = true;
+    const runtime = buildRuntime({
+      stores: makeStores(c, {
+        claimSweep: async () => (grant
+          ? { status: 'ok' as const }
+          : { status: 'held_by_other' as const }),
+        sweepDayRolled: async () => ({ status: 'ok' as const, rolled: 4 }),
+      }),
+      queue: makeEmptyQueue(c),
+      config: FAST,
+    });
+    runtime.scheduler.start();
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(runtime.snapshot().lastRolled).toBe(4);
+
+    grant = false;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(runtime.snapshot().lastRolled).toBeNull();
   });
 
   it('a claim that THROWS also stops the sweep — the claim fails closed', async () => {
@@ -1583,7 +1849,7 @@ describe('F. M-9 — a construction failure and a deliberate disable are differe
     expect(JSON.stringify(v)).not.toContain('Error');
   });
 
-  it('THE WIRING: the composition root RECORDS the failure, not only logs it', () => {
+  it('THE WIRING: the composition root RECORDS the construction failure, not only logs it', () => {
     // The flag is inert unless `index.ts` sets it, and a log line on one
     // replica is not a signal anybody is watching. Deleting the call leaves
     // every assertion above green, so the call itself is asserted.
@@ -1596,6 +1862,141 @@ describe('F. M-9 — a construction failure and a deliberate disable are differe
     const block = source.slice(at, source.indexOf('\n}', at));
     expect(block).toContain('recordPhoneRuntimeStartFailure()');
     expect(block).toContain('phoneRuntime = null');
+  });
+
+  // ═══════════════════════════════════════════════════════════════════
+  // M-5 — THE ARMING WAS OUTSIDE THE GUARDED REGION
+  // ═══════════════════════════════════════════════════════════════════
+  //
+  // `recordPhoneRuntimeStartFailure` wrapped only `createPhoneRuntime`. The
+  // ARMING — `scheduler.start()` then `registerPhoneRuntime` — sat in the
+  // `server.listen` callback with no try/catch and no failure record. If
+  // `start()` threw (a metric-name collision from the derived loop set, a
+  // timer failure), `registerPhoneRuntime` never ran, `startFailed` stayed
+  // false, and the view reported `enabled: false, start_failed: false` with
+  // NO degrade reason on a fleet where both switches are on — the exact false
+  // negative M-9 was supposed to close, left open one line later. The throw
+  // also escaped the listen callback, where nothing catches it.
+  //
+  // ── AND THE OLD TEST OF THIS WIRING WAS VACUOUS ──────────────────
+  // It was a `readFileSync` + `toContain` grep of `index.ts`. Rewriting the
+  // call site to `if (Math.random() < -1) recordPhoneRuntimeStartFailure();`
+  // — making the call dead code — left the suite green. A grep proves a
+  // string is present, never that it runs. So the arming now lives in
+  // `armPhoneRuntime` (in `health.ts`, because `index.ts` opens a socket on
+  // import and cannot be unit-tested) and is EXERCISED below.
+
+  /**
+   * A handle whose `scheduler.start()` throws and whose every other member
+   * is a trap. Nothing but `start()` may be reached on the failing path: a
+   * `snapshot()` on an unarmed runtime would mean the failure had been
+   * published as a live one.
+   */
+  function unstartableRuntime(): PhoneRuntimeHandle {
+    return {
+      config: {},
+      loopIntervalsMs: {},
+      scheduler: {
+        start(): void { throw new Error('phone_metric_name_collision'); },
+        stop(): void {},
+        health(): never { throw new Error('an unarmed runtime must not be read'); },
+      },
+      runner: {} as never,
+      queue: {} as never,
+      snapshot(): never { throw new Error('an unarmed runtime must not be snapshotted'); },
+      async tickAll(): Promise<void> {},
+      async stop(): Promise<void> {},
+    } as unknown as PhoneRuntimeHandle;
+  }
+
+  it('M-5: an ARMING that throws is recorded exactly as a construction failure is', () => {
+    const armed = armPhoneRuntime(unstartableRuntime());
+    expect(armed).toBe(false);
+
+    const v = phoneRuntimeView();
+    // Still not enabled — the runtime never reached the registry.
+    expect(v.enabled).toBe(false);
+    expect(v.running).toBe(false);
+    // ...and NOT indistinguishable from a deliberately-disabled replica,
+    // which is the whole defect.
+    expect(v.start_failed).toBe(true);
+    expect(phoneRuntimeDegradeReasons(v)).toEqual(['phone_runtime_start_failed']);
+    // The view stays publishable: no message, no stack, no config text.
+    expect(JSON.stringify(v)).not.toContain('phone_metric_name_collision');
+  });
+
+  it('M-5: the throw does not escape, and the process still LISTENS', async () => {
+    // The second half of the defect: the bare `scheduler.start()` sat inside
+    // the `server.listen` callback, so its throw escaped uncaught. Proved
+    // against a real socket rather than by inspection — real timers, because
+    // a listening socket is not a timer.
+    vi.useRealTimers();
+    const server = http.createServer((_req, res) => res.end('ok'));
+    let armed: boolean | null = null;
+    let threw: unknown = null;
+
+    await new Promise<void>((resolve, reject) => {
+      server.on('error', reject);
+      server.listen(0, '127.0.0.1', () => {
+        // EXACTLY the shape `index.ts` uses.
+        try {
+          armed = armPhoneRuntime(unstartableRuntime());
+        } catch (e) {
+          threw = e;
+        }
+        resolve();
+      });
+    });
+
+    try {
+      expect(threw, 'the arming threw out of the listen callback').toBeNull();
+      expect(armed).toBe(false);
+      // THE POINT: the API is serving HTTP even though the phone lane is not.
+      expect(server.listening).toBe(true);
+      // ...and the failure is on the surface rather than only in a log line.
+      expect(phoneRuntimeView().start_failed).toBe(true);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it('M-5 CONTROL: a runtime that arms cleanly is enabled, running and NOT failed', async () => {
+    // Without this the pair above is satisfied by an `armPhoneRuntime` that
+    // always answers false.
+    const c = counters();
+    const runtime = buildRuntime({ stores: makeStores(c), queue: makeEmptyQueue(c) });
+
+    expect(armPhoneRuntime(runtime)).toBe(true);
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    const v = phoneRuntimeView();
+    expect(v.enabled).toBe(true);
+    expect(v.running).toBe(true);
+    expect(v.start_failed).toBe(false);
+    expect(phoneRuntimeDegradeReasons(v)).not.toContain('phone_runtime_start_failed');
+    // The scheduler really was started, in the right ORDER: a handle
+    // published before `start()` would report every loop `running: false`.
+    expect(v.loops.length).toBeGreaterThan(0);
+    expect(v.loops.every((l) => l.running)).toBe(true);
+  });
+
+  it('M-5: the composition root DELEGATES the arming rather than doing it bare', () => {
+    // The behavioural tests above prove `armPhoneRuntime` is correct; this
+    // proves `index.ts` is the caller. It is a source assertion and it is
+    // deliberately NARROW — it pins the one line the defect was, inside the
+    // phone branch of the listen callback, rather than grepping the file.
+    const source = readFileSync(path.join(HERE, '..', 'index.ts'), 'utf8');
+    const at = source.indexOf('if (phoneRuntime) {');
+    expect(at, 'the phone arming branch was not found in index.ts').toBeGreaterThan(0);
+    const branch = source.slice(at, source.indexOf('\n  }', at));
+
+    expect(branch).toContain('armPhoneRuntime(phoneRuntime)');
+    // THE REGRESSION: the bare, unguarded pair must not come back.
+    expect(branch).not.toContain('phoneRuntime.scheduler.start()');
+    expect(branch).not.toContain('registerPhoneRuntime(phoneRuntime)');
+    // And the whole file no longer imports the unguarded registration at
+    // all, so it cannot be reintroduced without a visible import change.
+    expect(source).not.toContain('registerPhoneRuntime,');
   });
 });
 

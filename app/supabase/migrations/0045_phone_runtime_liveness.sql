@@ -85,7 +85,26 @@
 -- lifetime — a distinction the P5 package's own structural test blurred
 -- by calling the queue runner's renewal "the heartbeat".
 --
--- The fence is (attempt, epoch) AND the attempt still being live with an
+-- ── WHY THE EPOCH TERM IS `>=` AND NOT `=` ────────────────────────────
+-- It was `=` for one commit, and that broke every consented call.
+--
+-- The agent learns its epoch from the DISPATCH METADATA, minted by
+-- admission. `apply_phone_event` #18 (`disclosure.delivered`) then bumps the
+-- ATTEMPT ROW's epoch — and the heartbeat only starts after the gate that
+-- posts it. So the agent's very first beat legitimately carries an epoch one
+-- behind the row; an equality answers `lease_lost`; and the agent hangs up on
+-- a candidate seconds after telling them they are being recorded. Four times,
+-- because each hang-up raises `sip.participant_left` and charges a reconnect.
+--
+-- The equality also bought nothing. A superseded leg is a DIFFERENT ATTEMPT
+-- ROW, so `id = p_attempt_id` already excludes it, and there is no reachable
+-- state in which two holders of one attempt id disagree about its epoch other
+-- than this one legal in-attempt bump. `>=` keeps the sanity check — you must
+-- name an epoch this attempt has actually had — while tolerating the bump the
+-- protocol requires.
+--
+-- The fence is therefore (attempt, epoch-not-from-the-future, session) AND
+-- the attempt still being live with an
 -- unexpired lease. All four losses collapse to one stable answer,
 -- deliberately, exactly as the token-fenced sibling does:
 --
@@ -146,7 +165,7 @@ begin
      set lease_expires_at = p_now + (greatest(5, least(coalesce(p_lease_seconds, 60), 900))
                                      * interval '1 second')
    where id = p_attempt_id
-     and epoch = p_epoch
+     and epoch >= p_epoch
      and (session_id is null or session_id = p_session_id)
      and state in ('admitted','ringing','answered_unclassified','human','machine')
      and lease_expires_at > p_now
@@ -500,8 +519,16 @@ begin
     -- nameless status. This form keeps the tripwire honest -- and note
     -- that the extractor does not strip comments, so prose must avoid the
     -- marker sequence too.
+    -- A DUPLICATE IS NOT WORK. `apply_phone_event`'s duplicate branch
+    -- replays the ORIGINAL verdict, so a raced replica's post comes back
+    -- `applied` with a null `ignored_reason` — identical to a fresh
+    -- application — and the only thing that separates them is the
+    -- `duplicate` flag already on the wire. Without checking it, two
+    -- replicas sweeping concurrently (which this design explicitly permits)
+    -- each report the same roll and the count is 2x the real work.
     if (v_result ->> 'status') is not distinct from 'applied'
-       and (v_result ->> 'ignored_reason') is null then
+       and (v_result ->> 'ignored_reason') is null
+       and not coalesce((v_result ->> 'duplicate')::boolean, false) then
       v_rolled := v_rolled + 1;
     else
       -- A duplicate (this replica raced another), or a transition the
@@ -818,12 +845,28 @@ begin
     return jsonb_build_object('status', 'candidate_call_in_flight');
   end if;
 
-  -- Guard B — this person has not already been called today, on ANY
-  -- engagement. Scoped to the day-consuming kinds exactly as the
-  -- per-engagement index is, so `reconnect` is excluded by the same
-  -- construction: a reconnect redeems a budget already charged at the
-  -- grant and must not be refused by a daily counter.
-  if p_kind in ('initial','no_answer_retry','scheduled')
+  -- Guard B — this person has not already been COLD-CALLED today, on any
+  -- engagement.
+  --
+  -- `reconnect` is excluded for the same reason the per-engagement index
+  -- excludes it: it redeems a budget already charged at the grant and must
+  -- not be refused by a daily counter.
+  --
+  -- `scheduled` is excluded too, and that exclusion is the whole difference
+  -- between an anti-harassment guard and a broken promise. A scheduled dial
+  -- is NOT a cold call — it is a slot the candidate or HR booked
+  -- (`schedule_phone_appointment` sources `hr_manual` / `candidate_voice`),
+  -- and it is booked on an engagement whose owner cannot see the person's
+  -- other engagements. Refusing it means the candidate agreed to a time,
+  -- nobody rang, the appointment sat `scheduled` until the expiry sweep
+  -- dropped it, and the only signal was a counter on a health page. The
+  -- person asked to be called; declining to call them is not protecting
+  -- them.
+  --
+  -- What still protects them is Guard A: if the other engagement is on the
+  -- phone with them right now, the scheduled dial is refused
+  -- `candidate_call_in_flight` — one line, one conversation, always.
+  if p_kind in ('initial','no_answer_retry')
      and exists (
     select 1
       from screening_v2.phone_call_attempts a
@@ -1225,7 +1268,24 @@ begin
   -- order, so taking no lock here cannot close a cycle, and the value is
   -- only ever used to permit a refusal-free transition that a separate
   -- interlock re-checks.
+  -- ── AND ONLY THE SWEEP MAY DRIVE IT ────────────────────────────────
+  -- `v_stranded` is a property of the ENGAGEMENT, not of the caller, and a
+  -- first draft stopped there. That is not an interlock: ANY caller posting
+  -- these two event types drives the same widened edges — including
+  -- `POST /api/internal/phone/events`, whose worker allowlist contains
+  -- `assessment.aborted`, which carries no assessment interlock of its own.
+  -- A delayed or retried `assessment.aborted` landing after the engagement
+  -- had moved to `reconnecting` with a bound terminal session was
+  -- `unexpected_event` and harmless before 0045; after it, it was terminal
+  -- `failed`.
+  --
+  -- So the branch is additionally gated on the SHAPE ONLY THE SWEEP
+  -- PRODUCES: an `internal` post carrying NO attempt id. Every worker post
+  -- names its attempt, so no worker can reach these edges however delayed
+  -- or replayed it is.
   if v_eng_id is not null
+     and p_source = 'internal'
+     and p_attempt_id is null
      and v_eng.terminal_at is null
      and v_eng.state in ('eligible','scheduled','reconnecting')
      and v_eng.session_id is not null then
@@ -1774,8 +1834,26 @@ comment on function screening_v2.apply_phone_event is
 -- resolved exactly once, for ever, and a replica that races another one
 -- lands on the same id and is deduped.
 create or replace function screening_v2.sweep_phone_stranded_sessions(
-  p_limit integer     default 25,
-  p_now   timestamptz default now()
+  p_limit         integer     default 25,
+  p_now           timestamptz default now(),
+  -- ── THE GRACE, AND WHY IT IS NOT OPTIONAL ─────────────────────────
+  -- A first draft of this sweep raced a LIVE RECOVERY and won with
+  -- probability ~1. `/assessment/complete` completes the session BEFORE it
+  -- awaits scoring, so a scoring outage leaves exactly the shape this sweep
+  -- reads as "stranded, unscored": a `completed` session with no assessment
+  -- row. The engagement is meanwhile in `reconnecting` with a reconnect
+  -- already GRANTED AND CHARGED, and it cannot be redialled for
+  -- `reconnectBackoffSeconds`. The sweep ran at 120s with no idle backoff,
+  -- fired first, posted `assessment.aborted`, and made a transient scoring
+  -- outage a permanently terminal-`failed` candidate — destroying the
+  -- documented retry path the agent already implements.
+  --
+  -- So nothing is resolved until the engagement AND its session have both
+  -- been still for this long. A granted reconnect touches `updated_at`, so
+  -- the grace restarts and the live path always wins. 15 minutes is well
+  -- past the 120s reconnect plus a due pass, and it is the difference
+  -- between "we are recovering" and "nothing is coming".
+  p_grace_seconds integer     default 900
 )
 returns jsonb
 language plpgsql
@@ -1784,6 +1862,7 @@ set search_path = pg_catalog, screening_v2
 as $$
 declare
   v_limit     integer := greatest(1, least(coalesce(p_limit, 25), 200));
+  v_grace     integer := greatest(60, least(coalesce(p_grace_seconds, 900), 86400));
   v_row       record;
   v_result    jsonb;
   v_event     text;
@@ -1806,6 +1885,10 @@ begin
        and e.state in ('eligible','scheduled','reconnecting')
        and e.session_id is not null
        and s.status in ('completed','failed','cancelled','expired')
+       -- Both clocks, and the LATER of them. A session that ended long ago
+       -- says nothing if the engagement moved a second ago.
+       and greatest(coalesce(s.ended_at, s.started_at), e.updated_at)
+           <= p_now - (v_grace * interval '1 second')
      order by e.updated_at asc
      limit v_limit
   loop
@@ -1830,7 +1913,8 @@ begin
     );
 
     if (v_result ->> 'status') is not distinct from 'applied'
-       and (v_result ->> 'ignored_reason') is null then
+       and (v_result ->> 'ignored_reason') is null
+       and not coalesce((v_result ->> 'duplicate')::boolean, false) then
       if v_row.scored then v_completed := v_completed + 1;
       else v_failed := v_failed + 1;
       end if;
@@ -1845,19 +1929,164 @@ begin
     'completed', v_completed,
     'failed',    v_failed,
     'skipped',   v_skipped,
-    'limit',     v_limit
+    'limit',     v_limit,
+    'grace_seconds', v_grace
   );
 end;
 $$;
 
-revoke all on function screening_v2.sweep_phone_stranded_sessions(integer, timestamptz) from public, anon, authenticated;
-grant execute on function screening_v2.sweep_phone_stranded_sessions(integer, timestamptz) to service_role;
+revoke all on function screening_v2.sweep_phone_stranded_sessions(integer, timestamptz, integer) from public, anon, authenticated;
+grant execute on function screening_v2.sweep_phone_stranded_sessions(integer, timestamptz, integer) to service_role;
 
 comment on function screening_v2.sweep_phone_stranded_sessions is
   'Bounded driver for the 0045 stranded-session edges. A terminal session with '
   'a phone assessment row completes its engagement without anybody being '
   'redialled; one without becomes a truthful failed. Decides nothing itself — '
-  'apply_phone_event re-checks the interlock under the row lock. Idempotent '
+  'apply_phone_event re-checks the interlock under the row lock. Resolves '
+  'nothing until the engagement AND its session have both been still for '
+  'p_grace_seconds, so it can never win a race against a live recovery whose '
+  'reconnect has already been granted and charged. Idempotent '
   'per session. Service-role-only.';
+
+notify pgrst, 'reload schema';
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- 8. The rest of 0011's reconciler family, made phone-aware
+-- ═══════════════════════════════════════════════════════════════════════
+-- `stuck_sessions` was the one the acceptance named, and fixing only it
+-- makes the family LOOK handled. It is not: three siblings are equally
+-- mode-blind, and P5 is the phase that gives them phone rows to be wrong
+-- about. Each is corrected in the narrowest way that leaves non-phone
+-- behaviour byte-identical, using the same discriminator — a phone session
+-- carries its own derived room name, because `mode = 'live'` is shared with
+-- browser sessions and is not a discriminator at all.
+--
+-- None of these has a production caller today. That is exactly why they are
+-- being fixed now: the change is free while nothing runs them, and whoever
+-- schedules them later will not know they inherited a lane full of false
+-- positives.
+create or replace function screening_v2.sessions_missing_recording()
+returns table (
+  session_id        uuid,
+  candidate_id      uuid,
+  ended_at          timestamptz,
+  status            text
+)
+language sql
+stable
+set search_path = pg_catalog
+as $$
+  -- Phone recordings are ATTEMPT-scoped: `attach_phone_attempt_recording`
+  -- (0043) writes `phone_call_attempts.recording_object_key`, and nothing
+  -- ever writes `call_sessions.recording_object_key` for a phone session.
+  -- So every completed phone session reported as "missing a recording" was
+  -- a false positive, 100% of the time — and a detector that is always
+  -- wrong about a lane teaches an operator to ignore it about every lane.
+  select
+    s.id,
+    s.candidate_id,
+    s.ended_at,
+    s.status
+  from screening_v2.call_sessions s
+  where s.status = 'completed'
+    and s.recording_object_key is null
+    and s.external_call_id is distinct from ('phone-' || s.id::text);
+$$;
+
+revoke all on function screening_v2.sessions_missing_recording() from anon, authenticated;
+grant execute on function screening_v2.sessions_missing_recording() to service_role;
+
+comment on function screening_v2.sessions_missing_recording is
+  'Completed sessions with no recording key. Phone sessions are EXCLUDED since '
+  '0045: their recordings are attempt-scoped (0043), so this column is null for '
+  'them by construction and every phone row here was a false positive.';
+
+create or replace function screening_v2.missing_assessment_sessions()
+returns table (
+  session_id        uuid,
+  candidate_id      uuid,
+  completed_at      timestamptz,
+  status            text
+)
+language sql
+stable
+set search_path = pg_catalog
+as $$
+  -- The `not exists` was unscoped, so a phone session carrying a `browser`
+  -- assessment row would read as scored and 0044's `source='phone'`
+  -- partition was invisible to it. Non-phone behaviour is unchanged: for a
+  -- browser session the extra predicate is satisfied by its own row.
+  select
+    s.id,
+    s.candidate_id,
+    s.ended_at,
+    s.status
+  from screening_v2.call_sessions s
+  where s.status = 'completed'
+    and not exists (
+      select 1
+      from screening_v2.assessments a
+      where a.session_id = s.id
+        and (
+          s.external_call_id is distinct from ('phone-' || s.id::text)
+          or a.source = 'phone'
+        )
+    );
+$$;
+
+revoke all on function screening_v2.missing_assessment_sessions() from anon, authenticated;
+grant execute on function screening_v2.missing_assessment_sessions() to service_role;
+
+comment on function screening_v2.missing_assessment_sessions is
+  'Completed sessions with no assessment. Since 0045 a PHONE session must have a '
+  'source=phone row specifically — 0044 partitions assessments by source, and an '
+  'unscoped exists() would let a browser row satisfy a phone session.';
+
+create or replace function screening_v2.sessions_without_transcripts()
+returns table (
+  session_id        uuid,
+  candidate_id      uuid,
+  ended_at          timestamptz,
+  status            text
+)
+language sql
+stable
+set search_path = pg_catalog
+as $$
+  -- A phone session that ends `failed` on `assessment.aborted` legitimately
+  -- has no turns: the call was abandoned before the first question boundary
+  -- committed. Only a COMPLETED phone session owes a transcript. Non-phone
+  -- sessions keep both statuses, unchanged.
+  select
+    s.id,
+    s.candidate_id,
+    s.ended_at,
+    s.status
+  from screening_v2.call_sessions s
+  where s.status in ('completed','failed')
+    -- `is not distinct from`, NOT `=`. A browser session has a NULL
+    -- `external_call_id`, and `NULL = 'phone-...'` is NULL — so `not (false
+    -- and NULL)` is NULL and the row is filtered out by the WHERE. Written
+    -- with `=` this predicate silently excluded EVERY session with no
+    -- external call id, which is every browser session: a phone exemption
+    -- that quietly disabled the detector for the lane it was not about.
+    and not (
+      s.status = 'failed'
+      and s.external_call_id is not distinct from ('phone-' || s.id::text)
+    )
+    and not exists (
+      select 1
+      from screening_v2.transcript_turns t
+      where t.session_id = s.id
+    );
+$$;
+
+revoke all on function screening_v2.sessions_without_transcripts() from anon, authenticated;
+grant execute on function screening_v2.sessions_without_transcripts() to service_role;
+
+comment on function screening_v2.sessions_without_transcripts is
+  'Sessions that ended with no transcript. Since 0045 a FAILED phone session is '
+  'excluded: an abandoned call has no turns by construction, and reporting it '
+  'teaches an operator to ignore the detector.';
 
 notify pgrst, 'reload schema';

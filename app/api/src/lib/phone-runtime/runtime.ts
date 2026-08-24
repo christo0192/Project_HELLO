@@ -52,6 +52,7 @@
  * difference is the point.
  */
 
+import { randomUUID } from 'node:crypto';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { Queue } from '../queue/index.js';
 import { PgAdapter } from '../queue/pg-adapter.js';
@@ -286,11 +287,30 @@ export function createPhoneSessionPort(
  * the loop's own configured interval, which is the property both bounds below
  * are stated in terms of and `phone-runtime-loops.test.ts` measures.
  *
- * It does NOT suppress ERROR backoff: a throwing tick never reaches this
- * value, `didWork` stays false, and the loop backs off as before. A broken
- * sweep must not hot-spin.
+ * ── IT IS RETURNED ONLY BY A TICK THAT ACTUALLY SUCCEEDED ────────────
+ * A throwing tick never reaches this value at all: `didWork` stays false and
+ * the scheduler backs off as before. But a throw is NOT the only way a pass
+ * fails. `runPhoneDuePass` answers `status: 'halted'` without throwing when
+ * the `phone_control` singleton is missing or unreadable, and every sweep RPC
+ * can answer a non-`ok` status without throwing. An earlier revision returned
+ * this constant unconditionally, and the comment here claimed only throws
+ * mattered — so with the control row absent the due loop re-ran the halt and
+ * backlog reads every ~7.5-15 s, on every replica, for the whole length of an
+ * incident, instead of backing off to the 60 s ceiling.
+ *
+ * So every site below pairs it with `false` on the failing branch. The
+ * reconnect-priority intent of M-2/M-4 is untouched, because that intent is
+ * about a SUCCESSFUL pass that found nothing to do — `status: 'ok'` with
+ * `dialing: 0`, `reclaimed: 0` — which still holds the base cadence.
  */
 const HOLD_BASE_CADENCE = true;
+
+/**
+ * The `didWork` answer of a tick that did NOT succeed: let the scheduler back
+ * off. Named so the two branches read as a pair at every site rather than as
+ * a bare boolean whose polarity has to be re-derived.
+ */
+const ALLOW_IDLE_BACKOFF = false;
 
 export function createPhoneRuntime(
   options: PhoneRuntimeOptions = {},
@@ -304,7 +324,14 @@ export function createPhoneRuntime(
   const logger = createLogger('phone-runtime');
   const client = options.client ?? (supabase as unknown as SupabaseClient);
   const queue = options.queue ?? new Queue(new PgAdapter(client), { defaultMaxAttempts: 5 });
-  const owner = options.owner ?? `phone-${process.pid}`;
+  // ── THE OWNER MUST BE UNIQUE PER PROCESS, NOT PER PID ──────────────
+  // `phone-${process.pid}` alone is `phone-1` in every container: the API is
+  // PID 1 under Docker and Kubernetes. `claim_phone_sweep` renews when the
+  // owner matches, so every replica would read its own owner back and every
+  // replica would win — the claim table would buy exactly nothing in the
+  // deployment shape it was written for.
+  const owner = options.owner
+    ?? `phone-${process.pid}-${randomUUID().slice(0, 8)}`;
   const stores = options.stores ?? createPhoneStores(client as never);
   const reader = options.reader ?? createPhoneRuntimeReader(client);
   const readStore = createPhoneReadStore(client as never);
@@ -340,7 +367,7 @@ export function createPhoneRuntime(
    *
    * Fails CLOSED: a claim we could not read is not a claim we hold.
    */
-  const claimed = async (sweep: string): Promise<boolean> => {
+  const claimed = async (sweep: string): Promise<'mine' | 'theirs' | 'broken'> => {
     try {
       const result = await stores.claimSweep({
         sweep,
@@ -350,10 +377,40 @@ export function createPhoneRuntime(
         ttlSeconds: Math.max(5, Math.ceil((runtimeConfig.expireMs * 2) / 1000)),
         now: new Date(),
       });
-      return result.status === 'ok';
+      if (result.status === 'ok') return 'mine';
+      // ── `held_by_other` AND "the claim does not work" ARE NOT THE SAME ──
+      // Collapsing them into one `false` is how a missed grant on
+      // `claim_phone_sweep` silently disables BOTH new loops on EVERY
+      // replica for ever — `day.rolled` never posted, the no-answer ladder
+      // still ending at attempt 1 — while `/api/phone/health` reports
+      // `sweeps_not_ok: []` and `status: ok`. This commit already hit a
+      // missed revoke/grant pair once, on a different function.
+      //
+      // `held_by_other` is the NORMAL answer every replica but one hears on
+      // every tick and must stay silent. Anything else is a fault.
+      return result.status === 'held_by_other' ? 'theirs' : 'broken';
     } catch {
-      return false;
+      return 'broken';
     }
+  };
+
+  /**
+   * Apply a claim verdict to the sweep's published state.
+   *
+   * Returns whether the sweep should run. The COUNT is nulled in both
+   * non-running cases, because a replica that has stopped sweeping must not
+   * keep publishing the number from the last pass it did run — a stale `4`
+   * reads as a sweep that worked minutes ago rather than one that has not
+   * run in days. Symmetrically, a `theirs` verdict CLEARS the fault flag, so
+   * a replica cannot report `degraded` for ever after the problem is fixed.
+   */
+  const applyClaim = (sweep: string, verdict: 'mine' | 'theirs' | 'broken'): boolean => {
+    if (verdict === 'mine') return true;
+    sweepNotOk[sweep] = verdict === 'broken';
+    if (sweep === 'dayroll') lastRolled = null;
+    if (sweep === 'stranded') lastStranded = null;
+    if (sweep === 'reconcile') lastReconciled = null;
+    return false;
   };
 
   const credentials = {
@@ -516,7 +573,16 @@ export function createPhoneRuntime(
         // The cost is one bounded `limit`-sized indexed read per `dueMs`
         // while the lane is idle. That is the cheapest read in the package
         // and the only one a person is waiting on.
-        return HOLD_BASE_CADENCE;
+        //
+        // ── M-7: ONLY A PASS THAT SUCCEEDED HOLDS THE CADENCE ───────
+        // `halted` and `disabled` are returned WITHOUT throwing, so an
+        // unconditional hold pinned the base cadence through exactly the
+        // incident it should have backed off for: with `phone_control`
+        // missing, every pass answers `halted` and the loop re-ran the halt
+        // and backlog reads every ~7.5-15 s on every replica, indefinitely.
+        // A successful pass that dialled NOTHING still holds — that is the
+        // reconnect bound above and it is unaffected.
+        return result.status === 'ok' ? HOLD_BASE_CADENCE : ALLOW_IDLE_BACKOFF;
       },
     },
     {
@@ -545,7 +611,13 @@ export function createPhoneRuntime(
         // lease-lifetime. Held at the base cadence the claim is true again,
         // and it is asserted against the scheduler's observed interval
         // rather than against another config constant.
-        return HOLD_BASE_CADENCE;
+        //
+        // M-7: gated on the STATUS, not returned outright. A sweep RPC that
+        // answers a non-`ok` status does not throw, so an unconditional hold
+        // kept a permanently broken sweep hammering the database at its base
+        // cadence. `reclaimed: 0` under `status: 'ok'` is the idle steady
+        // state this bound is about, and it still holds.
+        return result.status === 'ok' ? HOLD_BASE_CADENCE : ALLOW_IDLE_BACKOFF;
       },
     },
     {
@@ -588,14 +660,22 @@ export function createPhoneRuntime(
         // It runs on the EXPIRE cadence rather than a knob of its own: a
         // day boundary moves once a day, so anything under an hour is
         // already far more often than the thing it watches for.
-        if (!(await claimed('dayroll'))) return HOLD_BASE_CADENCE;
+        // M-7: a claim held by ANOTHER replica is a healthy answer and holds
+        // the cadence, so this replica takes the claim over promptly when its
+        // holder dies. A BROKEN claim is a persistent non-throwing failure —
+        // a missed grant on `claim_phone_sweep` answers it on every tick for
+        // ever — and must back off rather than hot-spin.
+        const verdict = await claimed('dayroll');
+        if (!applyClaim('dayroll', verdict)) {
+          return verdict === 'theirs' ? HOLD_BASE_CADENCE : ALLOW_IDLE_BACKOFF;
+        }
         const rolled = await stores.sweepDayRolled({
           limit: runtimeConfig.reclaimLimit,
           now: new Date(),
         });
         sweepNotOk.dayroll = rolled.status !== 'ok';
         lastRolled = rolled.status === 'ok' ? (rolled.rolled ?? 0) : null;
-        return HOLD_BASE_CADENCE;
+        return rolled.status === 'ok' ? HOLD_BASE_CADENCE : ALLOW_IDLE_BACKOFF;
       },
     },
     {
@@ -609,7 +689,12 @@ export function createPhoneRuntime(
         // the row is skipped `no_session` on every pass for ever. The
         // heartbeat removes the common cause; this removes the residue,
         // and it does so WITHOUT redialling anybody.
-        if (!(await claimed('stranded'))) return HOLD_BASE_CADENCE;
+        // M-7: same pairing as the day roll — `theirs` holds, `broken` backs
+        // off, and a sweep that answered a non-`ok` status backs off too.
+        const verdict = await claimed('stranded');
+        if (!applyClaim('stranded', verdict)) {
+          return verdict === 'theirs' ? HOLD_BASE_CADENCE : ALLOW_IDLE_BACKOFF;
+        }
         const resolved = await stores.sweepStrandedSessions({
           limit: runtimeConfig.reclaimLimit,
           now: new Date(),
@@ -618,13 +703,24 @@ export function createPhoneRuntime(
         lastStranded = resolved.status === 'ok'
           ? (resolved.completed ?? 0) + (resolved.failed ?? 0)
           : null;
-        return HOLD_BASE_CADENCE;
+        return resolved.status === 'ok' ? HOLD_BASE_CADENCE : ALLOW_IDLE_BACKOFF;
       },
     },
     {
       name: 'phone-reconcile',
       intervalMs: runtimeConfig.reconcileMs,
       tick: async () => {
+        // THE CLAIM BELONGS HERE MOST OF ALL. The migration names this loop
+        // as the reason the claim table exists — it reads LiveKit room state
+        // for every live attempt, so N replicas make N times the provider
+        // calls — and for one commit it was the only sweep NOT behind it,
+        // while two cheap local UPDATEs were.
+        // M-7: `theirs` holds the cadence, `broken` backs off. The success
+        // path below already answered on the count rather than outright.
+        const verdict = await claimed('reconcile');
+        if (!applyClaim('reconcile', verdict)) {
+          return verdict === 'theirs' ? HOLD_BASE_CADENCE : ALLOW_IDLE_BACKOFF;
+        }
         // Gated on the MASTER switch inside itself, not on the runtime
         // switch, because an operator who disarms the dialer mid-incident
         // must still be able to record events that TERMINATE in-flight

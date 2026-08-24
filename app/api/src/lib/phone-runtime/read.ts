@@ -141,6 +141,14 @@ export interface PhoneRuntimeReader {
   listDueEngagements(input: {
     nowIso: string;
     limit: number;
+    /**
+     * The reconnect backoff, so the RECONNECT batch can be clock-filtered in
+     * SQL. It has to be here rather than derived: a reconnect's due time is
+     * `updated_at + backoff`, `next_eligible_at` does not carry it, and the
+     * batch is bounded before any JS filter runs — so a filter applied after
+     * the read cannot stop not-yet-due reconnects consuming every slot.
+     */
+    reconnectBackoffSeconds: number;
   }): Promise<readonly DuePhoneEngagement[]>;
 
   /**
@@ -270,6 +278,30 @@ function isoInstant(value: string): string {
   return value;
 }
 
+/**
+ * The instant a reconnect must have been updated BEFORE to be due.
+ *
+ * `nowIso` is validated at this boundary and the backoff arrived without the
+ * same treatment, which is the gap `isoInstant`'s own comment warns about:
+ * today's only caller is a fact with an expiry date, not a guarantee. Two
+ * concrete failures it leaves open:
+ *
+ *   * a non-finite value makes `new Date(NaN).toISOString()` throw a raw
+ *     `RangeError` — the one path in this file that would have escaped as
+ *     something other than a bare stable code;
+ *   * a NEGATIVE value pushes the ceiling into the FUTURE, silently admitting
+ *     reconnects that are not due — a quieter version of the very bug the
+ *     SQL ceiling was added to fix, and one that fails open rather than loud.
+ */
+function reconnectDueCeiling(nowIso: string, backoffSeconds: number): string {
+  if (!Number.isFinite(backoffSeconds) || backoffSeconds < 0) {
+    throw new Error('phone_runtime_bad_backoff');
+  }
+  return new Date(
+    Date.parse(isoInstant(nowIso)) - Math.floor(backoffSeconds) * 1_000,
+  ).toISOString();
+}
+
 function dueState(value: unknown): PhoneDueState | undefined {
   return typeof value === 'string'
     && (PHONE_DUE_STATES as readonly string[]).includes(value)
@@ -278,7 +310,7 @@ function dueState(value: unknown): PhoneDueState | undefined {
 }
 
 /**
- * The ONE clock predicate, in one expression, used by BOTH due reads.
+ * The clock predicate for the ORDINARY due read.
  *
  * Factored rather than repeated because M-3 gives this reader a second read
  * (the reconnect batch below) and two copies of a clock predicate are two
@@ -330,7 +362,12 @@ function projectDueRows(data: unknown): DuePhoneEngagement[] {
  * One bounded due read, narrowed either to the whole due set or to a single
  * state.
  *
- * Every part except the state filter is shared with its sibling: the same
+ * Most of the shape is shared with its sibling — the column list, the
+ * terminal filter, the ordering — but the CLOCK and the BOUND are not, and
+ * both differences are deliberate. The reconnect batch filters on
+ * `updated_at` (its due time lives there, not on `next_eligible_at`) and is
+ * capped at `limit - 1` so the ordinary lane always keeps a slot. An earlier
+ * version of this comment claimed both were shared; they are not: the same
  * explicit column list, the same `terminal_at is null`, the same clock
  * predicate, the same `updated_at asc` ordering and the same bound. That is
  * the point of the seam — the reconnect batch must not be able to drift into
@@ -338,7 +375,12 @@ function projectDueRows(data: unknown): DuePhoneEngagement[] {
  */
 async function readDueBatch(
   client: SupabaseClient,
-  input: { nowIso: string; limit: number; onlyState: PhoneDueState | null },
+  input: {
+    nowIso: string;
+    limit: number;
+    onlyState: PhoneDueState | null;
+    reconnectBackoffSeconds: number;
+  },
 ): Promise<DuePhoneEngagement[]> {
   const base = client
     .from('phone_engagements')
@@ -347,8 +389,26 @@ async function readDueBatch(
   const narrowed = input.onlyState === null
     ? base.in('state', PHONE_DUE_STATES as unknown as string[])
     : base.eq('state', input.onlyState);
-  const { data, error } = await narrowed
-    .or(dueClockPredicate(input.nowIso))
+  // ── THE RECONNECT BATCH NEEDS ITS OWN CLOCK, IN SQL ────────────────
+  // `dueClockPredicate`'s first disjunct is `state.eq.reconnecting`, which
+  // is trivially TRUE for every row of the reconnect-only read — so that
+  // read had no due-time filter at all, and its due time was decided only
+  // afterwards by `dueByClock`. Combined with reading reconnects FIRST into
+  // a hard-capped batch, three not-yet-due reconnects filled every slot of
+  // every pass and the lane dialled nobody. Worse: an admission refusal is
+  // free by design and bumps no `updated_at`, so three permanently-refused
+  // reconnects stayed the oldest rows for ever.
+  //
+  // A reconnect's due time is `updated_at + reconnectBackoffSeconds` — the
+  // same arithmetic `dueByClock` does — so it can be expressed here, and
+  // must be, because the batch is bounded before the JS filter ever runs.
+  const filtered = input.onlyState === 'reconnecting'
+    ? narrowed.lte(
+      'updated_at',
+      reconnectDueCeiling(input.nowIso, input.reconnectBackoffSeconds),
+    )
+    : narrowed.or(dueClockPredicate(input.nowIso));
+  const { data, error } = await filtered
     .order('updated_at', { ascending: true })
     .limit(input.limit);
   // Sanitized: a PostgREST error carries the failing statement and can
@@ -372,7 +432,7 @@ export function createPhoneRuntimeReader(client: SupabaseClient): PhoneRuntimeRe
      * reconnect, and one clause cannot be both.
      *
      * So the reconnect batch is READ SEPARATELY and merged AHEAD. Both reads
-     * go through `readDueBatch`, so they share the clock predicate, the
+     * go through `readDueBatch`, so they share the column list, the terminal filter and the ordering — but NOT the clock predicate and NOT the bound, the
      * column list, the ordering and the bound; only the state filter differs.
      * The cost is one extra bounded, indexed read per pass — paid on the
      * cheapest and most latency-sensitive loop in the lane.
@@ -384,15 +444,25 @@ export function createPhoneRuntimeReader(client: SupabaseClient): PhoneRuntimeRe
      */
     async listDueEngagements(input): Promise<readonly DuePhoneEngagement[]> {
       const limit = boundedRowLimit(input.limit);
-      const reconnecting = await readDueBatch(client, {
-        nowIso: input.nowIso,
-        limit,
-        onlyState: 'reconnecting',
-      });
+      // AT MOST `limit - 1` reconnects, so the main batch can never be
+      // starved to zero. Priority is not precedence: a reconnect goes first
+      // among those dialled, but it may not be the only thing dialled. With
+      // `limit` of 1 the reservation is 0 and the ordinary batch is the
+      // whole pass — a single-slot pass has no room for a priority lane.
+      const reconnectSlots = Math.max(0, limit - 1);
+      const reconnecting = reconnectSlots === 0
+        ? []
+        : await readDueBatch(client, {
+          nowIso: input.nowIso,
+          limit: reconnectSlots,
+          onlyState: 'reconnecting',
+          reconnectBackoffSeconds: input.reconnectBackoffSeconds,
+        });
       const rest = await readDueBatch(client, {
         nowIso: input.nowIso,
         limit,
         onlyState: null,
+        reconnectBackoffSeconds: input.reconnectBackoffSeconds,
       });
 
       const merged: DuePhoneEngagement[] = [];

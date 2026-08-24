@@ -52,6 +52,11 @@ interface RecordedCall {
   readonly args: readonly unknown[];
 }
 
+/** A raw PostgREST row, as the fake hands it back. */
+interface Row {
+  readonly [key: string]: unknown;
+}
+
 interface RecordedQuery {
   readonly table: string;
   readonly columns: string;
@@ -97,9 +102,37 @@ function fakeClient(responses: Readonly<Record<string, FakeResponse | FakeRespon
             };
           }
           // Thenable, exactly as a PostgREST builder is: awaiting it runs it.
+          //
+          // ── THE BOUND AND THE CLOCK ARE HONOURED, NOT MERELY RECORDED ──
+          // H-2. A fake that returned every configured row whatever `.limit()`
+          // said could not tell a reconnect batch capped at `limit - 1` from
+          // one capped at `limit` — which is exactly the head-of-line-blocking
+          // distinction this suite has to be able to fail on. And a fake that
+          // ignored `.lte('updated_at', ...)` could not tell a reconnect read
+          // that carries the backoff clock from one that carries none, which is
+          // the whole of the bug. Both are applied here, and nothing else is:
+          // `.or`, `.eq` and `.in` are still recorded-only, so the assertions
+          // about them stay assertions about the QUERY, not about this fake.
           builder.then = (
             resolve: (v: { data: unknown; error: unknown }) => unknown,
-          ): unknown => resolve(answerFor(table));
+          ): unknown => {
+            const answer = answerFor(table);
+            let data = answer.data;
+            if (Array.isArray(data)) {
+              for (const call of record.calls) {
+                if (call.op !== 'lte') continue;
+                const [column, ceiling] = call.args as [string, string];
+                data = (data as Row[]).filter((row) => {
+                  const value = row?.[column];
+                  // SQL semantics: `null <= x` is unknown, so the row is out.
+                  return typeof value === 'string' && value <= ceiling;
+                });
+              }
+              const bound = record.calls.find((c) => c.op === 'limit')?.args[0];
+              if (typeof bound === 'number') data = (data as unknown[]).slice(0, bound);
+            }
+            return resolve({ data, error: answer.error });
+          };
           return builder;
         },
       };
@@ -169,6 +202,26 @@ function renderings(value: unknown): string {
 const NOW_ISO = '2026-08-24T03:30:00.000Z';
 
 /**
+ * The reconnect backoff the pass runs with, in seconds.
+ *
+ * H-2 made this an INPUT to `listDueEngagements` rather than something the
+ * reader could derive: a reconnect's due time is `updated_at + backoff`,
+ * `next_eligible_at` does not carry it, and the reconnect batch is bounded
+ * before any in-process filter runs — so the clock has to be in the SQL.
+ */
+const RECONNECT_BACKOFF_SECONDS = 120;
+
+/**
+ * The instant the reconnect batch must filter `updated_at` at, COMPUTED from
+ * the two inputs rather than written out as a literal. A literal would go on
+ * agreeing with a reader that had stopped subtracting the backoff at all, as
+ * long as somebody remembered to edit the literal too.
+ */
+function reconnectDueBefore(nowIso: string, backoffSeconds: number): string {
+  return new Date(Date.parse(nowIso) - backoffSeconds * 1_000).toISOString();
+}
+
+/**
  * A value the substrate's `^\+91[6-9][0-9]{9}$` gate accepts, ASSEMBLED rather
  * than committed — see the header. No fragment below is itself dialable, and
  * the concatenation exists only inside a running process.
@@ -223,9 +276,13 @@ const GOOD_DUE_ROW = {
 // ════════════════════════════════════════════════════════════════════
 
 describe('A. listDueEngagements — the query it actually issues', () => {
-  it('A1: BOTH due reads share the column list, the terminal filter, the ordering and the bound — only the state filter differs', async () => {
+  it('A1: BOTH due reads share the column list, the terminal filter and the ordering — the state filter, the clock filter and the bound are what differ', async () => {
     const fake = fakeClient({ phone_engagements: { data: [GOOD_DUE_ROW] } });
-    await createPhoneRuntimeReader(fake.client).listDueEngagements({ nowIso: NOW_ISO, limit: 3 });
+    await createPhoneRuntimeReader(fake.client).listDueEngagements({
+        nowIso: NOW_ISO,
+        limit: 3,
+        reconnectBackoffSeconds: RECONNECT_BACKOFF_SECONDS,
+      });
 
     const { reconnects, main, both } = fake.dueQueries();
 
@@ -246,8 +303,18 @@ describe('A. listDueEngagements — the query it actually issues', () => {
       expect(argsOf(q, 'order')).toEqual(['updated_at', { ascending: true }]);
       // BOTH batches are bounded. An unbounded reconnect read would be a
       // second, uncapped way into the same table.
-      expect(argsOf(q, 'limit')).toEqual([3]);
+      const bound = argsOf(q, 'limit')?.[0];
+      expect(bound, 'a due read was issued with no bound at all').toBeDefined();
+      expect(Number.isInteger(bound)).toBe(true);
+      expect(bound as number).toBeGreaterThanOrEqual(1);
     }
+
+    // ── AND THE BOUNDS ARE NOT THE SAME BOUND ─────────────────────────
+    // H-2. The ordinary batch gets the caller's whole limit; the reconnect
+    // batch gets at most `limit - 1`, so the ordinary batch can never be
+    // starved to zero by a queue of reconnects. Priority is not precedence.
+    expect(argsOf(main, 'limit')).toEqual([3]);
+    expect(argsOf(reconnects, 'limit')).toEqual([2]);
 
     // ── THE PRIORITY READ COMES FIRST AND IS NARROWED TO ONE STATE ────
     // M-3. `updated_at asc` sorts a row that JUST entered `reconnecting`
@@ -272,7 +339,7 @@ describe('A. listDueEngagements — the query it actually issues', () => {
     expect([...PHONE_DUE_STATES]).toEqual(['eligible', 'reconnecting', 'scheduled']);
   });
 
-  it('A2: THE CLOCK PREDICATE — one `or` carrying all three disjuncts, including the exact nowIso passed in', async () => {
+  it('A2: THE CLOCK PREDICATE — one `or` on the ORDINARY batch, carrying all three disjuncts including the exact nowIso passed in', async () => {
     // WHY EACH DISJUNCT IS THERE:
     //
     // `next_eligible_at.lte.<now>` and `next_eligible_at.is.null` are the
@@ -290,41 +357,69 @@ describe('A. listDueEngagements — the query it actually issues', () => {
     // rather than three chained filters. A reconnect's due time is NOT in
     // `next_eligible_at` at all: 0042 leaves the reconnect backoff to a worker
     // clock, so it is derived from `updated_at + reconnectBackoffSeconds`.
-    // Filtering reconnects on a column that does not carry their due time would
-    // hide EVERY reconnect from the pass — a silent, total loss of the
-    // reconnect path rather than a delay.
+    // On THIS batch — which selects all three due states — filtering
+    // reconnects on a column that does not carry their due time would hide
+    // every reconnect that also reached the ordinary read, so the exemption is
+    // still correct here and is asserted here.
+    //
+    // What CHANGED (H-2): the same disjunct is trivially TRUE for every row of
+    // the reconnect-only read, so on THAT batch this predicate is no filter at
+    // all. It has moved to a real `updated_at` ceiling there — see A9/A10.
     const fake = fakeClient({ phone_engagements: { data: [] } });
-    await createPhoneRuntimeReader(fake.client).listDueEngagements({ nowIso: NOW_ISO, limit: 3 });
-
-    const { both } = fake.dueQueries();
-    const predicates = both.map((q) => {
-      const orArgs = argsOf(q, 'or');
-      expect(orArgs, 'no `.or()` clock predicate was applied at all').toBeDefined();
-      return String(orArgs?.[0]);
+    await createPhoneRuntimeReader(fake.client).listDueEngagements({
+      nowIso: NOW_ISO,
+      limit: 3,
+      reconnectBackoffSeconds: RECONNECT_BACKOFF_SECONDS,
     });
 
-    for (const predicate of predicates) {
-      expect(predicate).toContain('state.eq.reconnecting');
-      expect(predicate).toContain('next_eligible_at.is.null');
-      expect(predicate).toContain(`next_eligible_at.lte.${NOW_ISO}`);
-      // The exact instant the caller passed, not a re-derived one: a reader
-      // that called `new Date()` itself would drift from the clock the rest
-      // of the pass reasons with.
-      expect(predicate).toContain(NOW_ISO);
-    }
-    // ONE predicate, not two copies that can drift. M-3 added the second read;
-    // the clock rule was FACTORED rather than repeated, and this is the
-    // assertion that keeps it factored.
-    expect(predicates[0]).toBe(predicates[1]);
+    const { reconnects, main } = fake.dueQueries();
+
+    const orArgs = argsOf(main, 'or');
+    expect(orArgs, 'no `.or()` clock predicate was applied to the ordinary batch').toBeDefined();
+    const predicate = String(orArgs?.[0]);
+
+    expect(predicate).toContain('state.eq.reconnecting');
+    expect(predicate).toContain('next_eligible_at.is.null');
+    expect(predicate).toContain(`next_eligible_at.lte.${NOW_ISO}`);
+    // The exact instant the caller passed, not a re-derived one: a reader
+    // that called `new Date()` itself would drift from the clock the rest
+    // of the pass reasons with.
+    expect(predicate).toContain(NOW_ISO);
+    // The whole predicate, spelled out, in order — the operator sequence is a
+    // pin, not a smoke test. An extra disjunct, a reordering, or a dropped
+    // term all fail here.
+    expect(predicate).toBe(
+      `state.eq.reconnecting,next_eligible_at.is.null,next_eligible_at.lte.${NOW_ISO}`,
+    );
+    expect(allArgsOf(main, 'or')).toHaveLength(1);
+
+    // ...and EXACTLY ONE `or` is issued in the whole pass. Two copies of a
+    // clock rule are two things that can drift; and the copy that used to sit
+    // on the reconnect batch was worse than a duplicate, it was a no-op.
+    const orsInPass = fake.dueQueries().both.flatMap((q) => allArgsOf(q, 'or'));
+    expect(orsInPass).toHaveLength(1);
+    expect(argsOf(reconnects, 'or')).toBeUndefined();
   });
 
-  it('A2b: a different nowIso produces a different predicate — the timestamp is not baked in', async () => {
+  it('A2b: a different nowIso moves BOTH filters — the ordinary predicate and the reconnect ceiling', async () => {
     const other = '2026-01-01T00:00:00.000Z';
     const fake = fakeClient({ phone_engagements: { data: [] } });
-    await createPhoneRuntimeReader(fake.client).listDueEngagements({ nowIso: other, limit: 1 });
-    for (const q of fake.dueQueries().both) {
-      expect(String(argsOf(q, 'or')?.[0])).toContain(`next_eligible_at.lte.${other}`);
-    }
+    await createPhoneRuntimeReader(fake.client).listDueEngagements({
+      nowIso: other,
+      limit: 3,
+      reconnectBackoffSeconds: RECONNECT_BACKOFF_SECONDS,
+    });
+    const { reconnects, main } = fake.dueQueries();
+    expect(String(argsOf(main, 'or')?.[0])).toContain(`next_eligible_at.lte.${other}`);
+    // The reconnect ceiling is derived from the SAME clock, one backoff back.
+    expect(argsOf(reconnects, 'lte')).toEqual([
+      'updated_at',
+      reconnectDueBefore(other, RECONNECT_BACKOFF_SECONDS),
+    ]);
+    // ...and it is genuinely a different instant from the NOW_ISO the rest of
+    // this suite uses, so neither assertion can be satisfied by a baked-in one.
+    expect(reconnectDueBefore(other, RECONNECT_BACKOFF_SECONDS))
+      .not.toBe(reconnectDueBefore(NOW_ISO, RECONNECT_BACKOFF_SECONDS));
   });
 
   it('A3: the limit handed to `.limit()` is BOUNDED whatever the caller asks for', async () => {
@@ -341,14 +436,35 @@ describe('A. listDueEngagements — the query it actually issues', () => {
 
     for (const { asked, expected, why } of cases) {
       const fake = fakeClient({ phone_engagements: { data: [] } });
-      await createPhoneRuntimeReader(fake.client).listDueEngagements({ nowIso: NOW_ISO, limit: asked });
+      await createPhoneRuntimeReader(fake.client).listDueEngagements({
+        nowIso: NOW_ISO,
+        limit: asked,
+        reconnectBackoffSeconds: RECONNECT_BACKOFF_SECONDS,
+      });
       // BOTH reads are bounded by the SAME clamped value — a reconnect batch
-      // that took the caller's raw number would be an unbounded second read
-      // of the same table.
-      for (const q of fake.dueQueries().both) {
-        const applied = argsOf(q, 'limit')?.[0];
-        expect(applied, why).toBe(expected);
+      // that took the caller's raw number would be an unbounded second read of
+      // the same table — except that the reconnect batch reserves at most
+      // `limit - 1` slots (H-2), and at a clamped limit of 1 that reservation
+      // is zero, so no reconnect read is issued at all.
+      const reads = fake.all('phone_engagements');
+      expect(reads.length, `${why}: wrong number of due reads`)
+        .toBe(expected === 1 ? 1 : 2);
+
+      const main = reads[reads.length - 1];
+      expect(argsOf(main, 'in')?.[0], `${why}: the last read is not the ordinary batch`)
+        .toBe('state');
+      expect(argsOf(main, 'limit')?.[0], why).toBe(expected);
+
+      if (expected !== 1) {
+        const reconnects = reads[0];
+        expect(argsOf(reconnects, 'eq')).toEqual(['state', 'reconnecting']);
+        expect(argsOf(reconnects, 'limit')?.[0], `${why}: reconnect slots`)
+          .toBe(expected - 1);
+      }
+
+      for (const q of reads) {
         // Whatever the case, the value that reaches the driver is a sane integer.
+        const applied = argsOf(q, 'limit')?.[0];
         expect(Number.isInteger(applied)).toBe(true);
         expect(applied as number).toBeGreaterThanOrEqual(1);
         expect(applied as number).toBeLessThanOrEqual(PHONE_RUNTIME_MAX_ROWS);
@@ -362,7 +478,11 @@ describe('A. listDueEngagements — the query it actually issues', () => {
     const reader = createPhoneRuntimeReader(fake.client);
 
     const thrown = await reader
-      .listDueEngagements({ nowIso: NOW_ISO, limit: 3 })
+      .listDueEngagements({
+        nowIso: NOW_ISO,
+        limit: 3,
+        reconnectBackoffSeconds: RECONNECT_BACKOFF_SECONDS,
+      })
       .then(() => null, (e: unknown) => e);
 
     expect(thrown).toBeInstanceOf(Error);
@@ -399,7 +519,11 @@ describe('A. listDueEngagements — the query it actually issues', () => {
     for (const { label, row } of bad) {
       const fake = fakeClient({ phone_engagements: { data: [row, GOOD_DUE_ROW] } });
       const out = await createPhoneRuntimeReader(fake.client)
-        .listDueEngagements({ nowIso: NOW_ISO, limit: 10 });
+        .listDueEngagements({
+        nowIso: NOW_ISO,
+        limit: 10,
+        reconnectBackoffSeconds: RECONNECT_BACKOFF_SECONDS,
+      });
 
       // Dropped, never coerced into a half-valid engagement.
       expect(out.map((e) => e.engagementId), `${label}: bad row survived`)
@@ -423,7 +547,11 @@ describe('A. listDueEngagements — the query it actually issues', () => {
       },
     });
     const out = await createPhoneRuntimeReader(fake.client)
-      .listDueEngagements({ nowIso: NOW_ISO, limit: 10 });
+      .listDueEngagements({
+        nowIso: NOW_ISO,
+        limit: 10,
+        reconnectBackoffSeconds: RECONNECT_BACKOFF_SECONDS,
+      });
 
     expect(out).toEqual([
       {
@@ -452,7 +580,11 @@ describe('A. listDueEngagements — the query it actually issues', () => {
   it('A5c: a non-array payload yields an empty batch rather than a throw', async () => {
     const fake = fakeClient({ phone_engagements: { data: null } });
     await expect(
-      createPhoneRuntimeReader(fake.client).listDueEngagements({ nowIso: NOW_ISO, limit: 3 }),
+      createPhoneRuntimeReader(fake.client).listDueEngagements({
+        nowIso: NOW_ISO,
+        limit: 3,
+        reconnectBackoffSeconds: RECONNECT_BACKOFF_SECONDS,
+      }),
     ).resolves.toEqual([]);
   });
 
@@ -479,7 +611,18 @@ describe('A. listDueEngagements — the query it actually issues', () => {
     next_eligible_at: null,
     no_answer_attempts: 0,
     // The NEWEST timestamp in the set — which is exactly why `updated_at asc`
-    // alone puts it last.
+    // alone puts it last. Still comfortably older than
+    // `NOW_ISO - RECONNECT_BACKOFF_SECONDS`, so it is genuinely DUE: after H-2
+    // the reconnect batch carries a real `updated_at` ceiling, and a fixture
+    // that was not due would make every merge assertion below vacuous.
+    updated_at: '2026-08-24T03:20:00.000Z',
+  };
+
+  /** A reconnect written moments ago — NOT yet due under the backoff. */
+  const FRESH_RECONNECT_ROW = {
+    ...RECONNECT_ROW,
+    id: 'e-fresh',
+    candidate_id: 'c-fresh',
     updated_at: '2026-08-24T03:29:59.000Z',
   };
 
@@ -506,10 +649,18 @@ describe('A. listDueEngagements — the query it actually issues', () => {
     });
 
     const out = await createPhoneRuntimeReader(fake.client)
-      .listDueEngagements({ nowIso: NOW_ISO, limit: 3 });
+      .listDueEngagements({
+        nowIso: NOW_ISO,
+        limit: 3,
+        reconnectBackoffSeconds: RECONNECT_BACKOFF_SECONDS,
+      });
 
-    // TWO reads, and the reconnect one is issued first.
-    expect(argsOf(fake.dueQueries().reconnects, 'eq')).toEqual(['state', 'reconnecting']);
+    // TWO reads, and the reconnect one is issued first — bounded at
+    // `limit - 1`, not at `limit` (H-2).
+    const { reconnects, main } = fake.dueQueries();
+    expect(argsOf(reconnects, 'eq')).toEqual(['state', 'reconnecting']);
+    expect(argsOf(reconnects, 'limit')).toEqual([2]);
+    expect(argsOf(main, 'limit')).toEqual([3]);
     // The reconnect is FIRST, and the batch is still three rows.
     expect(out.map((e) => e.engagementId)).toEqual(['e-reconnect', 'e-old-1', 'e-old-2']);
     expect(out[0].state).toBe('reconnecting');
@@ -531,15 +682,30 @@ describe('A. listDueEngagements — the query it actually issues', () => {
     });
 
     const out = await createPhoneRuntimeReader(fake.client)
-      .listDueEngagements({ nowIso: NOW_ISO, limit: 3 });
+      .listDueEngagements({
+        nowIso: NOW_ISO,
+        limit: 3,
+        reconnectBackoffSeconds: RECONNECT_BACKOFF_SECONDS,
+      });
 
     expect(out.map((e) => e.engagementId)).toEqual(['e-reconnect', 'e-old-1']);
     expect(out.filter((e) => e.engagementId === 'e-reconnect')).toHaveLength(1);
   });
 
-  it('A8: the MERGED batch is bounded by the caller\'s limit, never by twice it', async () => {
+  it('A8: the MERGED batch is bounded by the caller\'s limit, never by twice it — and never by reconnects alone', async () => {
     // Two bounded reads must not compose into an unbounded batch: the fleet
     // cap is ten and every row here is a call to a person.
+    //
+    // WHAT CHANGED, AND WHY THE OLD EXPECTATION WAS THE BUG (H-2). This test
+    // used to assert that three reconnects filled a batch of three and that
+    // `out.every(state === 'reconnecting')` — "nobody eligible is dialled
+    // while three people are waiting on a dropped line". That is precisely
+    // head-of-line blocking, and an admission refusal is free by design
+    // (`candidate_call_in_flight` / `at_capacity` / `phone_invalid` write no
+    // row and bump no `updated_at`), so three permanently-refused reconnects
+    // stay the OLDEST reconnect rows for ever and the lane dials nobody for
+    // ever. The reconnect batch now reserves at most `limit - 1` slots, so the
+    // ordinary batch is structurally guaranteed at least one.
     const fake = fakeClient({
       phone_engagements: [
         {
@@ -554,14 +720,255 @@ describe('A. listDueEngagements — the query it actually issues', () => {
     });
 
     const out = await createPhoneRuntimeReader(fake.client)
-      .listDueEngagements({ nowIso: NOW_ISO, limit: 3 });
+      .listDueEngagements({
+        nowIso: NOW_ISO,
+        limit: 3,
+        reconnectBackoffSeconds: RECONNECT_BACKOFF_SECONDS,
+      });
 
     expect(out).toHaveLength(3);
-    expect(out.map((e) => e.engagementId)).toEqual(['e-r1', 'e-r2', 'e-r3']);
-    // A batch of reconnects fills the batch. That is the intended priority,
-    // not an accident: nobody eligible is dialled while three people are
-    // waiting on a dropped line.
-    expect(out.every((e) => e.state === 'reconnecting')).toBe(true);
+    // Reconnects still go FIRST — the priority is intact — but only two of
+    // them, and the third slot belongs to the ordinary lane.
+    expect(out.map((e) => e.engagementId)).toEqual(['e-r1', 'e-r2', 'e-old-1']);
+    expect(out.filter((e) => e.state === 'reconnecting')).toHaveLength(2);
+    expect(out.some((e) => e.state === 'eligible'), 'the ordinary lane was starved to zero')
+      .toBe(true);
+  });
+
+  // ── H-2: THE RECONNECT BATCH CARRIES ITS OWN CLOCK, IN SQL ──────────
+  //
+  // The M-3 repair above reads reconnects FIRST into a hard-capped batch. The
+  // regression it introduced: `dueClockPredicate`'s first disjunct is
+  // `state.eq.reconnecting`, trivially TRUE for every row of a reconnect-only
+  // read — so that read had NO due-time filter, and the due time was decided
+  // afterwards, in JS, on a batch that had already been bounded. Three
+  // not-yet-due reconnects filled every slot of every pass and the lane
+  // dialled nobody. The tests below fail if the `or` comes back, if the
+  // `updated_at` ceiling goes away, if the backoff stops being subtracted, or
+  // if the reservation goes back to the full limit.
+
+  it('A9: the reconnect batch is filtered on `updated_at` at exactly `nowIso - reconnectBackoffSeconds`', async () => {
+    const fake = fakeClient({ phone_engagements: { data: [] } });
+    await createPhoneRuntimeReader(fake.client).listDueEngagements({
+      nowIso: NOW_ISO,
+      limit: 3,
+      reconnectBackoffSeconds: RECONNECT_BACKOFF_SECONDS,
+    });
+
+    const { reconnects, main } = fake.dueQueries();
+
+    // COMPUTED from the two inputs, never a literal: a literal would go on
+    // agreeing with a reader that had stopped subtracting the backoff.
+    const ceiling = reconnectDueBefore(NOW_ISO, RECONNECT_BACKOFF_SECONDS);
+    expect(ceiling).not.toBe(NOW_ISO);
+    expect(argsOf(reconnects, 'lte'), 'the reconnect batch carries no clock filter at all')
+      .toEqual(['updated_at', ceiling]);
+    expect(allArgsOf(reconnects, 'lte')).toHaveLength(1);
+
+    // A reconnect's due time is `updated_at + backoff`; `next_eligible_at`
+    // does not carry it, so the ceiling must be on `updated_at` and on
+    // nothing else.
+    expect(String(argsOf(reconnects, 'lte')?.[0])).toBe('updated_at');
+    // ...and the ORDINARY batch does not acquire one. Its clock is the `or`.
+    expect(argsOf(main, 'lte')).toBeUndefined();
+  });
+
+  it('A10: the reconnect batch does NOT carry the `or` clock predicate — it would be trivially true', async () => {
+    const fake = fakeClient({ phone_engagements: { data: [] } });
+    await createPhoneRuntimeReader(fake.client).listDueEngagements({
+      nowIso: NOW_ISO,
+      limit: 3,
+      reconnectBackoffSeconds: RECONNECT_BACKOFF_SECONDS,
+    });
+
+    const { reconnects } = fake.dueQueries();
+    // The read is `state = 'reconnecting'`, so `state.eq.reconnecting` matches
+    // every row it can return: an `or` here is not a filter, it is a licence.
+    expect(argsOf(reconnects, 'or'), 'the trivially-true clock predicate is back on the reconnect batch')
+      .toBeUndefined();
+    expect(allArgsOf(reconnects, 'or')).toEqual([]);
+    // Spelled out at the operator level, because the shape is the finding:
+    // narrow, then clock-filter, then order, then bound.
+    expect(reconnects.calls.map((c) => c.op)).toEqual(['is', 'eq', 'lte', 'order', 'limit']);
+  });
+
+  it('A11: the ORDINARY batch still carries the `or` predicate unchanged, `state.eq.reconnecting` included', async () => {
+    // The exemption is still CORRECT on this batch. It selects all three due
+    // states, so without the disjunct a reconnect whose `next_eligible_at` is
+    // null-or-future would be hidden from the ordinary read entirely — and
+    // this is the read that catches a reconnect the priority batch could not
+    // fit. Removing it here would be a different bug, not a fix for H-2.
+    const fake = fakeClient({ phone_engagements: { data: [] } });
+    await createPhoneRuntimeReader(fake.client).listDueEngagements({
+      nowIso: NOW_ISO,
+      limit: 3,
+      reconnectBackoffSeconds: RECONNECT_BACKOFF_SECONDS,
+    });
+
+    const { main } = fake.dueQueries();
+    expect(argsOf(main, 'or')).toEqual([
+      `state.eq.reconnecting,next_eligible_at.is.null,next_eligible_at.lte.${NOW_ISO}`,
+    ]);
+    expect(main.calls.map((c) => c.op)).toEqual(['is', 'in', 'or', 'order', 'limit']);
+  });
+
+  it('A12: HEAD-OF-LINE BLOCKING IS IMPOSSIBLE — five due reconnects take at most `limit - 1` slots, and the ordinary batch is still consulted with the full limit', async () => {
+    // The failure this reproduces: a LiveKit blip drops several live calls,
+    // every one of them becomes a `reconnecting` row, and — because an
+    // admission refusal bumps no `updated_at` — they stay the oldest
+    // reconnects for ever. Under the old shape they occupied every slot of
+    // every pass and the fifty candidates behind them were never dialled.
+    const fiveDueReconnects = [1, 2, 3, 4, 5].map((n) => ({
+      ...RECONNECT_ROW,
+      id: `e-r${n}`,
+      candidate_id: `c-r${n}`,
+      // All comfortably past the backoff, so the SQL ceiling admits every one
+      // of them: the cap under test is the SLOT reservation, not the clock.
+      updated_at: `2026-08-24T03:0${n}:00.000Z`,
+    }));
+    const fake = fakeClient({
+      phone_engagements: [
+        { data: fiveDueReconnects },
+        { data: [eligibleRow(1), eligibleRow(2), eligibleRow(3)] },
+      ],
+    });
+
+    const out = await createPhoneRuntimeReader(fake.client)
+      .listDueEngagements({
+        nowIso: NOW_ISO,
+        limit: 3,
+        reconnectBackoffSeconds: RECONNECT_BACKOFF_SECONDS,
+      });
+
+    const { reconnects, main } = fake.dueQueries();
+
+    // (a) AT MOST `limit - 1` come back from the reconnect read — asserted on
+    //     the bound handed to the driver AND on what the read returned.
+    expect(argsOf(reconnects, 'limit')).toEqual([2]);
+    expect(out.filter((e) => e.state === 'reconnecting').length).toBeLessThanOrEqual(2);
+
+    // (b) The ordinary batch is still consulted, with the CALLER'S FULL limit
+    //     — not with whatever the reconnect read left over.
+    expect(main).toBeDefined();
+    expect(argsOf(main, 'in')?.[1]).toEqual(['eligible', 'reconnecting', 'scheduled']);
+    expect(argsOf(main, 'limit')).toEqual([3]);
+
+    // ...and the pass therefore dials somebody who is not a reconnect.
+    expect(out).toHaveLength(3);
+    expect(out.map((e) => e.engagementId)).toEqual(['e-r1', 'e-r2', 'e-old-1']);
+    expect(out.some((e) => e.state === 'eligible'), 'the whole batch was reconnects again')
+      .toBe(true);
+  });
+
+  it('A13: a limit of 1 issues NO reconnect read at all', async () => {
+    // A single-slot pass has no room for a priority lane: `limit - 1` is zero,
+    // and a reconnect read bounded at zero would be either a wasted round trip
+    // or — worse, if it were left at 1 — the whole pass.
+    const fake = fakeClient({
+      phone_engagements: [{ data: [RECONNECT_ROW] }, { data: [eligibleRow(1)] }],
+    });
+
+    const out = await createPhoneRuntimeReader(fake.client)
+      .listDueEngagements({
+        nowIso: NOW_ISO,
+        limit: 1,
+        reconnectBackoffSeconds: RECONNECT_BACKOFF_SECONDS,
+      });
+
+    // The CALL COUNT on the fake, not merely the result: a reconnect read that
+    // was issued and then discarded would still be a round trip, and its rows
+    // would still be the first entry the response array hands out.
+    expect(fake.all('phone_engagements')).toHaveLength(1);
+    expect(fake.fromCalls()).toBe(1);
+
+    const only = fake.all('phone_engagements')[0];
+    expect(argsOf(only, 'eq'), 'the one read was narrowed to reconnects').toBeUndefined();
+    expect(argsOf(only, 'in')?.[1]).toEqual(['eligible', 'reconnecting', 'scheduled']);
+    expect(argsOf(only, 'limit')).toEqual([1]);
+
+    // The single read is answered by the FIRST configured response, so the
+    // result proves the reconnect read was never the one that consumed it.
+    expect(out.map((e) => e.engagementId)).toEqual(['e-reconnect']);
+  });
+
+  it('A14: a different `reconnectBackoffSeconds` moves the reconnect filter — the value is threaded, not defaulted', async () => {
+    // If the reader defaulted the backoff internally — or ignored the input
+    // and used `nowIso` directly — every ceiling below would be identical.
+    const seen = new Map<number, string>();
+    for (const backoff of [30, 120, 900]) {
+      const fake = fakeClient({ phone_engagements: { data: [] } });
+      await createPhoneRuntimeReader(fake.client).listDueEngagements({
+        nowIso: NOW_ISO,
+        limit: 3,
+        reconnectBackoffSeconds: backoff,
+      });
+      const applied = argsOf(fake.dueQueries().reconnects, 'lte');
+      expect(applied, `backoff ${backoff}: no reconnect clock filter`).toEqual([
+        'updated_at',
+        reconnectDueBefore(NOW_ISO, backoff),
+      ]);
+      seen.set(backoff, String(applied?.[1]));
+    }
+    // Three distinct instants, all strictly before `nowIso`, ordered by how
+    // long the backoff is.
+    expect(new Set(seen.values()).size).toBe(3);
+    for (const value of seen.values()) expect(value < NOW_ISO).toBe(true);
+    expect(seen.get(900)! < seen.get(120)!).toBe(true);
+    expect(seen.get(120)! < seen.get(30)!).toBe(true);
+  });
+
+  it('A15: a NOT-yet-due reconnect is excluded by the SQL ceiling, before the batch is bounded', async () => {
+    // The whole point of moving the clock into SQL: a reconnect written
+    // moments ago must never occupy a slot. Under the old shape it did, and
+    // was then discarded by `dueByClock` — after the batch had been capped.
+    const fake = fakeClient({
+      phone_engagements: [
+        { data: [FRESH_RECONNECT_ROW] },
+        // The ordinary batch is empty so nothing else can supply the row and
+        // make the exclusion ambiguous.
+        { data: [] },
+      ],
+    });
+
+    const out = await createPhoneRuntimeReader(fake.client)
+      .listDueEngagements({
+        nowIso: NOW_ISO,
+        limit: 3,
+        reconnectBackoffSeconds: RECONNECT_BACKOFF_SECONDS,
+      });
+
+    // The fixture really is fresher than the ceiling — otherwise this test
+    // would pass against a reader that filtered nothing.
+    expect(FRESH_RECONNECT_ROW.updated_at > reconnectDueBefore(NOW_ISO, RECONNECT_BACKOFF_SECONDS))
+      .toBe(true);
+    expect(FRESH_RECONNECT_ROW.updated_at < NOW_ISO).toBe(true);
+    expect(out).toEqual([]);
+  });
+
+  it('A16: CONTROL — a reconnect whose `updated_at` IS old enough comes back', async () => {
+    // Without this, every assertion above is satisfied by a reconnect read
+    // that returns nothing at all: an over-tight ceiling would hide EVERY
+    // reconnect from the pass, which is a silent total loss of the reconnect
+    // path rather than a delay, and is the failure the `or` exemption on the
+    // ordinary batch exists to prevent.
+    const fake = fakeClient({
+      phone_engagements: [{ data: [RECONNECT_ROW] }, { data: [] }],
+    });
+
+    const out = await createPhoneRuntimeReader(fake.client)
+      .listDueEngagements({
+        nowIso: NOW_ISO,
+        limit: 3,
+        reconnectBackoffSeconds: RECONNECT_BACKOFF_SECONDS,
+      });
+
+    // The fixture is genuinely due — asserted, not assumed.
+    expect(RECONNECT_ROW.updated_at <= reconnectDueBefore(NOW_ISO, RECONNECT_BACKOFF_SECONDS))
+      .toBe(true);
+    expect(out.map((e) => e.engagementId)).toEqual(['e-reconnect']);
+    expect(out[0].state).toBe('reconnecting');
+    // And it came from the RECONNECT read: the ordinary batch was empty.
+    expect(fake.dueQueries().reconnects).toBeDefined();
   });
 });
 
@@ -1003,6 +1410,45 @@ describe('D. consent — the two advisory preflight reads', () => {
 //  CONTROLS — the fixtures and the fake are not vacuous
 // ════════════════════════════════════════════════════════════════════
 
+describe('the reconnect backoff is validated at the boundary, like nowIso', () => {
+  // `nowIso` is validated here and the backoff arrived without the same
+  // treatment. Both of these escaped as something other than a bare stable
+  // code, or worse, silently.
+  const bad: Array<[string, number]> = [
+    ['NaN', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+    ['-Infinity', Number.NEGATIVE_INFINITY],
+    // A NEGATIVE backoff pushes the ceiling into the FUTURE, admitting
+    // reconnects that are not due — a quieter version of the bug the SQL
+    // ceiling exists to fix, and one that fails OPEN.
+    ['negative', -120],
+  ];
+
+  for (const [label, backoff] of bad) {
+    it(`${label} is refused with a bare stable code, not a RangeError`, async () => {
+      const fake = fakeClient({ phone_engagements: { data: [] } });
+      const reader = createPhoneRuntimeReader(fake.client);
+      await expect(reader.listDueEngagements({
+        nowIso: NOW_ISO,
+        limit: 3,
+        reconnectBackoffSeconds: backoff,
+      })).rejects.toThrow(/^phone_runtime_bad_backoff$/);
+    });
+  }
+
+  it('CONTROL — a legitimate backoff is not refused', async () => {
+    // Otherwise the four cases above pass for a reader that refuses every
+    // backoff, which would take the whole reconnect lane down.
+    const fake = fakeClient({ phone_engagements: { data: [] } });
+    const reader = createPhoneRuntimeReader(fake.client);
+    await expect(reader.listDueEngagements({
+      nowIso: NOW_ISO,
+      limit: 3,
+      reconnectBackoffSeconds: 120,
+    })).resolves.toEqual([]);
+  });
+});
+
 describe('CONTROLS — the harness itself', () => {
   it('CONTROL: the assembled DIALABLE really is what the substrate accepts, and the sentinel really is not', () => {
     // If DIALABLE stopped matching, B9 would be asserting that a bad number is
@@ -1034,17 +1480,23 @@ describe('CONTROLS — the harness itself', () => {
       candidates: { data: [{ id: 'c-good', phone_e164: DIALABLE, phone_valid: true }] },
     });
     const reader = createPhoneRuntimeReader(fake.client);
-    await reader.listDueEngagements({ nowIso: NOW_ISO, limit: 3 });
+    await reader.listDueEngagements({
+        nowIso: NOW_ISO,
+        limit: 3,
+        reconnectBackoffSeconds: RECONNECT_BACKOFF_SECONDS,
+      });
     await reader.listDialableNumbers({ candidateIds: ['c-good'] });
 
     // Three queries, because the due read is TWO reads (M-3: the reconnect
     // priority batch, then the main batch) followed by the number read.
     expect(fake.queries.map((q) => q.table))
       .toEqual(['phone_engagements', 'phone_engagements', 'candidates']);
-    // The reconnect batch narrows with `eq`; the main batch widens with `in`.
-    // Everything else about the two is identical, which is the shape the
-    // factored builder is supposed to produce.
-    expect(fake.queries[0].calls.map((c) => c.op)).toEqual(['is', 'eq', 'or', 'order', 'limit']);
+    // The reconnect batch narrows with `eq` and clock-filters with `lte`; the
+    // main batch widens with `in` and clock-filters with `or`. Everything else
+    // about the two is identical, which is the shape the factored builder is
+    // supposed to produce — and the `lte`/`or` split is H-2 itself: the `or`
+    // predicate is trivially true on a reconnect-only read.
+    expect(fake.queries[0].calls.map((c) => c.op)).toEqual(['is', 'eq', 'lte', 'order', 'limit']);
     expect(fake.queries[1].calls.map((c) => c.op)).toEqual(['is', 'in', 'or', 'order', 'limit']);
     expect(fake.queries[2].calls.map((c) => c.op)).toEqual(['in', 'limit']);
     expect(fake.fromCalls()).toBe(3);

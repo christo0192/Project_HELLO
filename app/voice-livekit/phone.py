@@ -278,10 +278,13 @@ APPOINTMENTS_PATH = "/api/internal/phone/appointments"
 ASSESSMENT_START_PATH = "/api/internal/phone/assessment/start"
 ASSESSMENT_TURN_PATH = "/api/internal/phone/assessment/turn"
 ASSESSMENT_COMPLETE_PATH = "/api/internal/phone/assessment/complete"
-#: P5: the lease renewal. Not under `/api/internal/` with the others — it lives
-#: on the worker surface that `requireWorkerPhoneAuth` guards, behind the same
-#: bearer secret every other call here uses.
-HEARTBEAT_PATH = "/api/phone-worker/attempt/heartbeat"
+#: P5: the lease renewal. Under `/api/internal/phone` with every other worker
+#: call, because that is the ONE mount (`app.ts`: `app.use('/api/internal/phone',
+#: phoneWorkerRouter)`). An earlier constant said `/api/phone-worker/...` and
+#: invented a rationale for it in this very comment; nothing served that path,
+#: so every beat 404'd and the agent halted a live call after two of them. A
+#: cross-language test now pins this string against the Express mount.
+HEARTBEAT_PATH = "/api/internal/phone/attempt/heartbeat"
 
 # STRICT allowlist. The server enforces its own; this is the worker half, so a
 # typo fails here rather than becoming a 4xx the caller has to interpret.

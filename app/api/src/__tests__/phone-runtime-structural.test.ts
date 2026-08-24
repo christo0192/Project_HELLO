@@ -487,3 +487,106 @@ describe('11. CONTROLS — the extractors above are not vacuous', () => {
     expect(rawLines.length).toBe(3);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+//  THE WIRE — cross-language constants that no single-language suite sees
+//
+//  Two fatal defects shipped past a 793-assertion SQL suite and a 591-line
+//  Python suite because BOTH ends tested themselves and neither tested the
+//  join between them: the agent posted its heartbeat to a path nothing
+//  served, and it beat with an epoch the attempt no longer had. A 404 and a
+//  `lease_lost` on the first beat of every consented call.
+//
+//  These assertions read the OTHER language's source. That is unusual here
+//  and it is the point: a constant that must agree across a process boundary
+//  has no owner, so it needs a test that belongs to neither side.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('the worker paths the Python agent posts to are actually mounted', () => {
+  const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../..');
+  const PHONE_PY = readFileSync(path.join(REPO, 'app/voice-livekit/phone.py'), 'utf8');
+  const APP_TS = readFileSync(path.join(REPO, 'app/api/src/app.ts'), 'utf8');
+
+  /** `app.use('<mount>', phoneWorkerRouter)` — the ONE mount. */
+  function workerMount(): string {
+    const m = APP_TS.match(/app\.use\(\s*'([^']+)'\s*,\s*phoneWorkerRouter\s*\)/);
+    expect(m, 'the phone worker router mount could not be found in app.ts').not.toBeNull();
+    return m![1];
+  }
+
+  it('CONTROL — the extractors find real content', () => {
+    // Fail closed: an empty read would make every assertion below vacuous.
+    expect(PHONE_PY.length).toBeGreaterThan(2_000);
+    expect(APP_TS.length).toBeGreaterThan(1_000);
+    expect(workerMount()).toBe('/api/internal/phone');
+  });
+
+  it('EVERY *_PATH constant in phone.py sits under the mounted prefix', () => {
+    const paths = [...PHONE_PY.matchAll(/^[A-Z_]*PATH\s*=\s*"([^"]+)"/gm)].map((m) => m[1]);
+    // Non-vacuity: there are several, and one of them is the heartbeat.
+    expect(paths.length).toBeGreaterThanOrEqual(4);
+    expect(paths).toContain('/api/internal/phone/attempt/heartbeat');
+    for (const p of paths) {
+      expect(p, `${p} is not under the mounted worker prefix`).toMatch(
+        new RegExp(`^${workerMount()}/`),
+      );
+    }
+  });
+
+  it('each of those paths is a route the worker router actually registers', () => {
+    const router = readFileSync(
+      path.join(REPO, 'app/api/src/routes/phone-worker.ts'),
+      'utf8',
+    );
+    const registered = new Set(
+      [...router.matchAll(/router\.post\(\s*'([^']+)'/g)].map((m) => m[1]),
+    );
+    expect(registered.size).toBeGreaterThanOrEqual(4);
+    const mount = workerMount();
+    for (const p of [...PHONE_PY.matchAll(/^[A-Z_]*PATH\s*=\s*"([^"]+)"/gm)].map((m) => m[1])) {
+      const suffix = p.slice(mount.length);
+      expect(registered.has(suffix), `${p} maps to no router.post('${suffix}')`).toBe(true);
+    }
+  });
+});
+
+describe('the epoch the agent can hold is the one the heartbeat accepts', () => {
+  const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../..');
+  const MIGRATION = readFileSync(
+    path.join(REPO, 'app/supabase/migrations/0045_phone_runtime_liveness.sql'),
+    'utf8',
+  );
+
+  it('the heartbeat fence is `>=`, never `=`', () => {
+    // The agent learns its epoch from the dispatch metadata, minted by
+    // admission — and `disclosure.delivered` bumps the ATTEMPT ROW's epoch
+    // before the heartbeat ever starts. An equality here answers
+    // `lease_lost` to the first beat of every consented call, and the agent
+    // hangs up on the candidate seconds after the disclosure.
+    //
+    // Asserted on the migration text because this is a cross-boundary
+    // invariant: nothing on the TypeScript side can see it, and the SQL
+    // suite proved it only because a draft of that suite read the post-bump
+    // epoch out of the database — a value the agent has no seam to obtain.
+    const fn = MIGRATION.slice(
+      MIGRATION.indexOf('function screening_v2.heartbeat_phone_attempt_by_epoch'),
+    ).split('$$;')[0];
+    expect(fn.length).toBeGreaterThan(200);
+    expect(fn).toContain('and epoch >= p_epoch');
+    expect(fn).not.toMatch(/and\s+epoch\s*=\s*p_epoch/);
+  });
+
+  it('the dispatch metadata carries the epoch the agent reads', () => {
+    const room = readFileSync(
+      path.join(REPO, 'app/api/src/integrations/livekit-phone-dial/phone-room.ts'),
+      'utf8',
+    );
+    // The producer writes `epoch`; the consumer reads `epoch`. A rename on
+    // either side is silent at runtime — the agent would simply find nothing
+    // and refuse every call.
+    expect(room).toMatch(/buildPhoneDispatchMetadata\([\s\S]{0,200}epoch: number/);
+    expect(room).toContain('epoch,');
+    const py = readFileSync(path.join(REPO, 'app/voice-livekit/phone.py'), 'utf8');
+    expect(py).toMatch(/payload\.get\(\s*["']epoch["']\s*\)/);
+  });
+});

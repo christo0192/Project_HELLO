@@ -23,7 +23,7 @@ import {
   type PhoneRuntimeHandle,
 } from './lib/phone-runtime/index.js';
 import {
-  registerPhoneRuntime,
+  armPhoneRuntime,
   clearPhoneRuntimeRegistration,
   recordPhoneRuntimeStartFailure,
 } from './lib/phone-runtime/health.js';
@@ -114,11 +114,26 @@ server.listen(env.port, () => {
     registerAshbyScheduler(ashbyWorkers.scheduler, ashbyWorkers.loopIntervalsMs);
   }
   if (phoneRuntime) {
-    phoneRuntime.scheduler.start();
-    // Register the LIVE scheduler so /api/phone/health reports real tick
-    // bookkeeping rather than configuration. Process-local by design; the
-    // fleet-wide signal remains the durable backlog the same route reads.
-    registerPhoneRuntime(phoneRuntime);
+    // ── ARMING IS GUARDED TOO, NOT ONLY CONSTRUCTION ────────────────────
+    // `scheduler.start()` then `registerPhoneRuntime` used to sit here bare.
+    // A throw from `start()` — a metric-name collision from the derived loop
+    // set, a timer failure — skipped the registration, left `start_failed`
+    // false, and published `enabled: false` with NO degrade reason on a fleet
+    // where both switches are ON: the exact false negative the construction
+    // guard above exists to close, left open one line later. The throw also
+    // escaped this callback, where nothing catches it.
+    //
+    // `armPhoneRuntime` does both steps in the right order, records the
+    // failure on the health surface, and never throws. It lives in
+    // `health.ts` because a composition root cannot be unit-tested — this
+    // file opens a socket on import — and an arming provable only by
+    // grepping this file is an arming with no test.
+    if (!armPhoneRuntime(phoneRuntime)) {
+      // Sanitized: the error is not logged verbatim because it can carry
+      // config text. The DURABLE signal is `start_failed` on the health
+      // surface, which `armPhoneRuntime` has already set.
+      startupLogger.warn('unknown_event', { error_category: 'phone_runtime_arm_failed' });
+    }
   }
   startupLogger.info('startup_listen', {
     port: env.port,

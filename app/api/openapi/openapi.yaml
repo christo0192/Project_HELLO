@@ -798,7 +798,7 @@ paths:
       tags: [phone]
       operationId: heartbeatPhoneAttemptLease
       summary: Renew the attempt concurrency lease for the duration of a live call
-      description: Internal, service-authenticated (0045). Renews the attempt CONCURRENCY lease — the fleet-slot lease, not the 0028 queue lease — for the length of a conversation. The lease is minted by admission and extended only far enough to cover the originate, so without this door it expired mid-call on every answered call: the slot was handed to another dial while the candidate was still talking, the reclaim sweep marked a live conversation abandoned, and the agent's eventual assessment.completed was ignored because that edge is gated on in_call — a screening that was conducted and SCORED was lost silently. The fence is the EPOCH, never a lease token. NO LEASE TOKEN IS ACCEPTED ON THIS REQUEST AND NONE IS EVER RETURNED: the conversation runs in the LiveKit agent rather than in the process that admitted the attempt, so a token-fenced renewal would mean shipping the token onto dispatch metadata and into every log line that printed a request body; 0045 added this second, epoch-fenced RPC precisely so the token can stay where it was minted. The request body is strict — an unknown key, lease_token included, is a flat 400 before any database work. epoch accepts 0, because 0042 starts an engagement at epoch 0 and bumps on disclosure.delivered, so a first heartbeat legitimately carries zero. The response carries no token and no absolute expiry, only next_heartbeat_seconds — the SERVER owns the cadence (a third of the lease) so the lease length stays a server-side knob and a worker cannot drift off it. Only the RPC may say lease_lost: an unrecognised status from a future revision answers 500 phone_heartbeat_error and stays RETRYABLE, because an answer we did not understand is not evidence the lease was lost, and collapsing it into lease_lost would let it silently terminate live calls. status lease_lost IS NOT RETRYABLE: it covers unknown attempt, stale epoch, already-reclaimed lease and non-live attempt with one stable answer, the slot is gone and another call may already hold it, and the worker must STOP the conversation rather than beat harder — which is why no cadence is returned with it. This is the ONLY door that renews the lease: a draft renewed it as a side effect of POST /api/internal/phone/events too, and that was removed when the session became part of the fence, because that route's payload names no session and a fence that is optional for one caller is a fence that is trusted for none. The residual window - a candidate answering on the last ring, whose opening gate can outlive the admission lease before the agent's first beat - is bounded and LOUD rather than silent: the first heartbeat answers lease_lost and the agent halts the call, which is B-1's hazard with B-1's silence removed. Closing it properly means sizing the admission lease to cover the opening gate, not opening a second renewal path. Disabled by default.
+      description: Internal, service-authenticated (0045). Renews the attempt CONCURRENCY lease — the fleet-slot lease, not the 0028 queue lease — for the length of a conversation. The lease is minted by admission and extended only far enough to cover the originate, so without this door it expired mid-call on every answered call: the slot was handed to another dial while the candidate was still talking, the reclaim sweep marked a live conversation abandoned, and the agent's eventual assessment.completed was ignored because that edge is gated on in_call — a screening that was conducted and SCORED was lost silently. The fence is the EPOCH, never a lease token. NO LEASE TOKEN IS ACCEPTED ON THIS REQUEST AND NONE IS EVER RETURNED: the conversation runs in the LiveKit agent rather than in the process that admitted the attempt, so a token-fenced renewal would mean shipping the token onto dispatch metadata and into every log line that printed a request body; 0045 added this second, epoch-fenced RPC precisely so the token can stay where it was minted. The request body is strict — an unknown key, lease_token included, is a flat 400 before any database work. epoch accepts 0, and the epoch a beat carries is normally ONE BEHIND the attempt row: admission mints it onto the dispatch metadata, disclosure.delivered then bumps the attempt's epoch, and the heartbeat only starts after the gate that posts it. The RPC therefore fences on epoch >= the named one. An equality there answered lease_lost to the first beat of every consented call — the agent hung up seconds after the disclosure, four times, and the candidate was never screened. The cross-leg fence is the ATTEMPT ID: a superseded leg is a different attempt row, so the equality never carried that weight. The response carries no token and no absolute expiry, only next_heartbeat_seconds — the SERVER owns the cadence (a third of the lease) so the lease length stays a server-side knob and a worker cannot drift off it. Only the RPC may say lease_lost: an unrecognised status from a future revision answers 500 phone_heartbeat_error and stays RETRYABLE, because an answer we did not understand is not evidence the lease was lost, and collapsing it into lease_lost would let it silently terminate live calls. status lease_lost IS NOT RETRYABLE: it covers unknown attempt, stale epoch, already-reclaimed lease and non-live attempt with one stable answer, the slot is gone and another call may already hold it, and the worker must STOP the conversation rather than beat harder — which is why no cadence is returned with it. This is the ONLY door that renews the lease: a draft renewed it as a side effect of POST /api/internal/phone/events too, and that was removed when the session became part of the fence, because that route's payload names no session and a fence that is optional for one caller is a fence that is trusted for none. The residual window - a candidate answering on the last ring, whose opening gate can outlive the admission lease before the agent's first beat - is bounded and LOUD rather than silent: the first heartbeat answers lease_lost and the agent halts the call, which is B-1's hazard with B-1's silence removed. Closing it properly means sizing the admission lease to cover the opening gate, not opening a second renewal path. Disabled by default.
       security:
         - workerBearer: []
       requestBody:
@@ -815,11 +815,11 @@ paths:
               schema:
                 $ref: '#/components/schemas/PhoneAttemptHeartbeatResponse'
         '400':
-          description: Body validation failed — a missing or malformed attempt_id/session_id/epoch, or ANY unknown key (a lease_token has no place on this route and is refused here).
+          description: Body validation failed — a missing or malformed attempt_id/session_id/epoch, or ANY unknown key (a lease_token has no place on this route and is refused here). The body is ok=false with status invalid_request, which is NOT a member of PhoneAttemptHeartbeatResponse's closed status pair, so it is documented by its own schema rather than by one whose enum it violates.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/PhoneAttemptHeartbeatResponse'
+                $ref: '#/components/schemas/PhoneAttemptHeartbeatError'
         '401':
           description: Worker bearer credential required.
           content:
@@ -833,11 +833,11 @@ paths:
               schema:
                 $ref: '#/components/schemas/PhoneWorkerError'
         '500':
-          description: phone_heartbeat_error — sanitized stable code, never a driver message and never a lease token.
+          description: phone_heartbeat_error — sanitized stable code, never a driver message and never a lease token. RETRYABLE, and deliberately not folded into lease_lost. Like the 400 this body is ok=false with a status outside PhoneAttemptHeartbeatResponse's closed pair, so it carries its own schema.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/PhoneAttemptHeartbeatResponse'
+                $ref: '#/components/schemas/PhoneAttemptHeartbeatError'
         '503':
           description: Phone screening disabled, or the worker credential is not configured.
           content:
@@ -5772,7 +5772,7 @@ components:
           type: integer
           minimum: 0
           maximum: 1000000
-          description: The FENCE, and the only one. The worker names which generation of the attempt it is beating for and the database looks the lease token up itself. 0 is legal and common — 0042 starts an engagement at epoch 0 and bumps on disclosure.delivered, so a first heartbeat legitimately carries zero.
+          description: The FENCE, and the only one. The worker names which generation of the attempt it is beating for and the database looks the lease token up itself. 0 is legal and common. The value a beat carries is normally ONE BEHIND the attempt row — admission mints it onto the dispatch metadata and disclosure.delivered then bumps the row before the heartbeat ever starts — so the RPC fences on epoch >= the named one. An equality answered lease_lost to the first beat of every consented call.
       additionalProperties: false
 
     PhoneAttemptHeartbeatResponse:
@@ -5792,6 +5792,21 @@ components:
           description: When to beat next, in seconds - a third of the configured lease. Present ONLY with status ok, and deliberately ABSENT on lease_lost so a worker cannot keep beating on a lease it no longer holds. The SERVER owns this number so the lease length stays a server-side knob and a worker cannot drift off it.
       additionalProperties: false
       description: NO LEASE TOKEN AND NO ABSOLUTE EXPIRY ARE EVER RETURNED. The body is built key by key from the three properties above, so whatever a future migration adds to heartbeat_phone_attempt_by_epoch's answer does not reach the worker - and therefore does not reach a language model, dispatch metadata or a log line - until the route changes on purpose.
+
+    PhoneAttemptHeartbeatError:
+      type: object
+      required: [ok, status]
+      properties:
+        ok:
+          type: boolean
+          const: false
+          description: Always false. This body is never a verdict about the lease — the route did not reach one — so a caller must not read it as lease_lost and must not stop the conversation on it.
+        status:
+          type: string
+          enum: [invalid_request, phone_heartbeat_error]
+          description: A CLOSED pair, and DISJOINT from PhoneAttemptHeartbeatResponse's. invalid_request is the 400 — a malformed body or any unknown key, refused before any database work. phone_heartbeat_error is the 500 — a thrown store call, or a status from heartbeat_phone_attempt_by_epoch that this build does not recognise. Both are RETRYABLE, which is the whole reason they are not members of the 200 enum: lease_lost is the one answer that terminates a live call, and a word we did not understand is not evidence the lease was lost.
+      additionalProperties: false
+      description: The 400/500 body of the attempt heartbeat. It exists because the route's failure bodies carry a status OUTSIDE the 200's enum [ok, lease_lost] and the 200 schema is additionalProperties:false — pointing the failure responses at it, as an earlier revision did, documented a contract the route cannot satisfy and made every generated consumer reject every 400 and 500 the route emits. It is not PhoneWorkerError either: that shape is {ok, error} and this route answers {ok, status}, so PhoneWorkerError would have been the same mistake with a different name. PhoneWorkerError still documents 401/403/503, which really do answer {ok, error}. No lease token, no absolute expiry and no driver message ever appears here.
 
     InviteCreateResponse:
       type: object

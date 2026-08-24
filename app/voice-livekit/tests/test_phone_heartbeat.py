@@ -270,8 +270,19 @@ class TestHeartbeatClient(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(outcome.ok)
         request = transport.requests[0]
         self.assertEqual(request["method"], "POST")
+        # Under `/api/internal/phone` with every other worker call, because
+        # that is the ONE mount. This assertion previously hardcoded
+        # `/api/phone-worker/...` — the same wrong value the constant held —
+        # so the suite agreed with the defect instead of catching it. It now
+        # reads the constant AND pins the prefix, so a path that drifts off
+        # the mount fails here as well as in the cross-language test on the
+        # TypeScript side.
         self.assertEqual(
-            request["url"], "http://api.test/api/phone-worker/attempt/heartbeat"
+            request["url"], f"http://api.test{phone.HEARTBEAT_PATH}"
+        )
+        self.assertTrue(
+            phone.HEARTBEAT_PATH.startswith("/api/internal/phone/"),
+            f"heartbeat path {phone.HEARTBEAT_PATH} is off the worker mount",
         )
         # The server schema is `.strict()`: an extra key is a flat 400, so the
         # body carries exactly the three the contract names.

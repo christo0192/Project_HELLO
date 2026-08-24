@@ -39,7 +39,10 @@ let registered: PhoneRuntimeHandle | null = null;
  *
  * ── OFF AND BROKEN MUST NOT LOOK THE SAME ────────────────────────────
  * `index.ts` builds the phone runtime in its own try/catch, and a throw there
- * logs `phone_runtime_start_failed` and leaves `phoneRuntime = null`. The view
+ * logs `phone_runtime_start_failed` and leaves `phoneRuntime = null`. ARMING
+ * it — `scheduler.start()` then `registerPhoneRuntime` — is guarded too, by
+ * `armPhoneRuntime` below, because a runtime that constructs and then fails
+ * to arm is just as broken and was just as invisible. The view
  * then reported `enabled: false` with no degrade reason — which is exactly
  * right for the shipped default, where both switches are off and most machines
  * will never construct a runtime, and exactly WRONG on a fleet where the flags
@@ -66,11 +69,57 @@ export function clearPhoneRuntimeRegistration(): void {
 }
 
 /**
- * Record that `createPhoneRuntime` threw. Called from the composition root's
- * catch, beside the sanitized log line, and nowhere else in production.
+ * Record that starting the phone runtime FAILED in this process — whether it
+ * was construction or arming that threw. Called from the composition root,
+ * beside the sanitized log line, and nowhere else in production.
  */
 export function recordPhoneRuntimeStartFailure(): void {
   startFailed = true;
+}
+
+/**
+ * ARM the phone runtime: start its scheduler, then publish it to this view.
+ *
+ * ── WHY THIS IS A FUNCTION AND NOT TWO LINES IN `index.ts` ────────────
+ * It used to be two lines in `index.ts`, inside the `server.listen` callback,
+ * with no try/catch and no failure record — while CONSTRUCTION three lines
+ * earlier had both. That is the M-9 false negative left half-open. If
+ * `scheduler.start()` throws (a metric-name collision from the derived loop
+ * set, a timer failure), `registerPhoneRuntime` never runs, `startFailed`
+ * stays false, and the view reports `enabled: false, start_failed: false` with
+ * no degrade reason — indistinguishable from a machine where an operator
+ * deliberately left both switches off, on a fleet where the flags are ON. The
+ * throw also escapes the listen callback, where nothing catches it.
+ *
+ * It lives HERE rather than in the composition root because it is the same
+ * fact `recordPhoneRuntimeStartFailure` and `registerPhoneRuntime` are about,
+ * and because a composition root cannot be unit-tested: `index.ts` opens a
+ * socket on import. An arming that can only be proved by grepping the file
+ * that performs it is an arming with no test at all — which is exactly what
+ * the previous revision had, and it was proved vacuous.
+ *
+ * ORDER IS LOAD-BEARING: `start()` first, `registerPhoneRuntime` second. A
+ * handle published before its scheduler is armed would be reported `enabled`
+ * with every loop `running: false`, which reads as a stopped runtime rather
+ * than as one that never started.
+ *
+ * Returns whether the runtime is now armed, so the caller can log. NEVER
+ * throws: no lane may prevent the API from serving HTTP.
+ */
+export function armPhoneRuntime(runtime: PhoneRuntimeHandle): boolean {
+  try {
+    runtime.scheduler.start();
+    registerPhoneRuntime(runtime);
+    return true;
+  } catch {
+    // Nothing partially-armed stays published. `registerPhoneRuntime` is the
+    // ONLY writer of `registered`, so on the `start()` throw there is nothing
+    // to clear — but a throw from the registration itself must not leave a
+    // half-published handle behind, and clearing is free.
+    registered = null;
+    recordPhoneRuntimeStartFailure();
+    return false;
+  }
 }
 
 /** Clear the recorded construction failure. Test hygiene; never production. */
@@ -128,7 +177,10 @@ export interface PhoneRuntimeView {
    */
   sweeps_not_ok: string[];
   /**
-   * Whether `createPhoneRuntime` THREW in this process.
+   * Whether STARTING the phone runtime failed in this process —
+   * construction or arming. Both are guarded and both record here; an
+   * earlier revision guarded only construction, so a scheduler that threw on
+   * `start()` reported exactly what a deliberately-disabled replica reports.
    *
    * The one field that distinguishes `enabled: false` because nobody armed
    * the lane from `enabled: false` because arming it failed. A boolean, so it
