@@ -18,6 +18,14 @@ import {
   registerRecordingRuntime,
   clearRecordingRuntimeRegistration,
 } from './lib/recording/health.js';
+import {
+  createPhoneRuntime,
+  type PhoneRuntimeHandle,
+} from './lib/phone-runtime/index.js';
+import {
+  registerPhoneRuntime,
+  clearPhoneRuntimeRegistration,
+} from './lib/phone-runtime/health.js';
 
 const startupLogger = createLogger('startup');
 const app = createApp();
@@ -64,6 +72,25 @@ try {
   recordingRuntime = null;
 }
 
+// ── Phone runtime (disabled by default) ──────────────────────────────────────
+// A THIRD independent try/catch, for the same reason the recording runtime has
+// its own: three lanes, three gates, and no lane may prevent another — or the
+// API — from starting.
+//
+// The gate is BOTH `PHONE_SCREENING_ENABLED` and `PHONE_RUNTIME_ENABLED`, and
+// with the shipped defaults both are false, so `createPhoneRuntime` returns
+// null and nothing is constructed: no runner, no scheduler, no timer, no DB
+// poll, no LiveKit object and no call. This build changes nothing about a
+// running deployment until an operator turns two switches on deliberately.
+let phoneRuntime: PhoneRuntimeHandle | null = null;
+try {
+  phoneRuntime = createPhoneRuntime();
+} catch {
+  // Sanitized: the error is not logged verbatim because it can carry config text.
+  startupLogger.warn('unknown_event', { error_category: 'phone_runtime_start_failed' });
+  phoneRuntime = null;
+}
+
 server.listen(env.port, () => {
   if (recordingRuntime) {
     recordingRuntime.scheduler.start();
@@ -78,6 +105,13 @@ server.listen(env.port, () => {
     // real tick bookkeeping instead of configuration. The registry is
     // process-local by design; the fleet-wide signal is the durable backlog.
     registerAshbyScheduler(ashbyWorkers.scheduler, ashbyWorkers.loopIntervalsMs);
+  }
+  if (phoneRuntime) {
+    phoneRuntime.scheduler.start();
+    // Register the LIVE scheduler so /api/phone/health reports real tick
+    // bookkeeping rather than configuration. Process-local by design; the
+    // fleet-wide signal remains the durable backlog the same route reads.
+    registerPhoneRuntime(phoneRuntime);
   }
   startupLogger.info('startup_listen', {
     port: env.port,
@@ -96,6 +130,18 @@ shutdown.boot(server).then(async (code) => {
     try {
       clearAshbySchedulerRegistration();
       await ashbyWorkers.stop();
+    } catch {
+      // Never let a worker-stop failure change the process exit code.
+    }
+  }
+  if (phoneRuntime) {
+    try {
+      clearPhoneRuntimeRegistration();
+      // Stopped in its own try, like the others. An in-flight `phone.dial`
+      // claim either completes or fails UNDER ITS LEASE; an abandoned queue
+      // lease is recovered by `reclaim_expired_jobs`, and an abandoned ATTEMPT
+      // lease by `reclaim_phone_attempt_leases`, on any machine.
+      await phoneRuntime.stop();
     } catch {
       // Never let a worker-stop failure change the process exit code.
     }

@@ -940,8 +940,13 @@ describe('OpenAPI document integrity', () => {
     //   response, the boundary request/response pair, and the complete
     //   request/response pair — eight names, of which PhoneAssessmentStateResponse
     //   serves both start and its refusals.
-    // 160 (base) + 2 (P3) + 31 (P6) + 5 (P4) + 8 (P4b) = 206, re-derived.
-    expect(Object.keys(schemas).length).toBe(206);
+    // P5 adds exactly THREE: PhoneRuntimeState plus the two objects it
+    //   nests, PhoneRuntimeLoopState and PhoneRuntimeDueSummary. They hang off
+    //   PhoneHealthResponse.runtime; P5 adds no new PATH, because the runtime
+    //   is observed through the health surface that already exists rather than
+    //   through an endpoint of its own.
+    // 160 (base) + 2 (P3) + 31 (P6) + 5 (P4) + 8 (P4b) + 3 (P5) = 209, re-derived.
+    expect(Object.keys(schemas).length).toBe(209);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.

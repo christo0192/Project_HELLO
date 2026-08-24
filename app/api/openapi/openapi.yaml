@@ -7876,7 +7876,7 @@ components:
     PhoneHealthResponse:
       description: Always 200. Degradation is reported in the body. Every count block is NULL rather than zero when the backlog cannot be read, because we could not read it and there is none are different answers and only one of them means everything is fine.
       type: object
-      required: [ok, enabled, status, reasons, config, window, admission, concurrency, engagements_by_state, appointments, ingress, backlog_unavailable, residuals]
+      required: [ok, enabled, status, reasons, config, window, admission, concurrency, engagements_by_state, appointments, ingress, backlog_unavailable, residuals, runtime]
       properties:
         ok:
           type: boolean
@@ -7886,7 +7886,7 @@ components:
           type: string
           enum: [ok, degraded, disabled]
         reasons:
-          description: Stable codes only — phone_screening_disabled, backlog_unavailable, halt_unreadable, admission_halted, attempt_leases_expired, fleet_at_capacity, appointments_overdue.
+          description: Stable codes only — phone_screening_disabled, backlog_unavailable, halt_unreadable, admission_halted, attempt_leases_expired, fleet_at_capacity, appointments_overdue, phone_runtime_stopped, phone_loop_stale, phone_loop_erroring, phone_due_halted.
           type: array
           items:
             type: string
@@ -7917,6 +7917,94 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/PhoneResidual'
+        runtime:
+          $ref: '#/components/schemas/PhoneRuntimeState'
+      additionalProperties: false
+
+    PhoneRuntimeState:
+      description: PROCESS-LOCAL view of the phone runtime loops. Describes the loops running in THIS api process and nothing else; on a multi-process deployment each replica answers for itself, so enabled false means this process is not running the loops, never that the fleet is idle. Aggregates only - counts, stable status and skip/refusal codes, and loop names. No engagement id, candidate id, attempt id, phone number, provider payload or lease token appears anywhere in this object.
+      type: object
+      required: [enabled, running, loops, last_due, config, dial_jobs, last_reclaimed, last_expired, last_reconciled]
+      properties:
+        enabled:
+          description: Whether this process constructed and registered a runtime. False is the shipped default and is not a fault.
+          type: boolean
+        running:
+          type: boolean
+        loops:
+          type: array
+          items:
+            $ref: '#/components/schemas/PhoneRuntimeLoopState'
+        last_due:
+          nullable: true
+          $ref: '#/components/schemas/PhoneRuntimeDueSummary'
+        config:
+          description: The cadence knobs THIS process resolved and CLAMPED at boot, as integers. Reported from the running process rather than re-read from the environment, because a knob edited after boot does not take effect until a restart and a surface that re-read it would report the edit as though it had. Empty when this process runs no runtime. Publishable by construction - integers only, no identifier, credential, digest or candidate-derived value.
+          type: object
+          additionalProperties:
+            type: integer
+        dial_jobs:
+          description: phone.dial job outcome counts since this process started, keyed by stable outcome code.
+          type: object
+          additionalProperties:
+            type: integer
+        last_reclaimed:
+          description: Rows touched by the most recent lease reclaim sweep. Null when no sweep has run in this process.
+          type: integer
+          nullable: true
+        last_expired:
+          type: integer
+          nullable: true
+        last_reconciled:
+          type: integer
+          nullable: true
+      additionalProperties: false
+
+    PhoneRuntimeLoopState:
+      description: One scheduler loop. stale is derived from the loop's own configured interval rather than a fixed window, so a slow loop is not reported as stalled merely for being slow.
+      type: object
+      required: [name, running, lastTickAt, ticks, errors, consecutiveErrors, stale]
+      properties:
+        name:
+          type: string
+        running:
+          type: boolean
+        lastTickAt:
+          type: string
+          format: date-time
+          nullable: true
+        ticks:
+          type: integer
+        errors:
+          type: integer
+        consecutiveErrors:
+          type: integer
+        stale:
+          type: boolean
+      additionalProperties: false
+
+    PhoneRuntimeDueSummary:
+      description: Counts from the most recent due pass. skipped and refusals are keyed by STABLE CODE and never by row identity - an operator learns how many were skipped and for which reason, never which candidate.
+      type: object
+      required: [status, examined, offered, dialing, skipped, refusals]
+      properties:
+        status:
+          type: string
+          enum: [ok, halted, disabled]
+        examined:
+          type: integer
+        offered:
+          type: integer
+        dialing:
+          type: integer
+        skipped:
+          type: object
+          additionalProperties:
+            type: integer
+        refusals:
+          type: object
+          additionalProperties:
+            type: integer
       additionalProperties: false
 
     PhoneAppointmentCreateBody:

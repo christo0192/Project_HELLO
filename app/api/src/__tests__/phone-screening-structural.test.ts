@@ -335,6 +335,21 @@ describe('2. no provider, no dialing, no network, no Ashby mutation', () => {
       'integrations/livekit-phone-dial/recording-purge.ts',
       'integrations/livekit-phone-dial/sip.ts',
       'routes/phone-worker.ts',
+      // P5 — the runtime orchestration. It lives in its own package for a
+      // structural reason, not a stylistic one: a worker loop needs
+      // `setInterval`, the queue library and a logger, and all three are
+      // forbidden in this module by the FORBIDDEN table above. So the loops
+      // sit beside the domain core and import it, exactly as `lib/recording/`
+      // sits beside the recording domain.
+      //
+      // These are the files that touch the core. `config.ts`,
+      // `dial-handler.ts` and `livekit-clients.ts` are deliberately absent —
+      // they do not import it, and this set is asserted as a BIJECTION, so
+      // listing a file that does not import would fail exactly as loudly as
+      // omitting one that does.
+      'lib/phone-runtime/due-loop.ts',
+      'lib/phone-runtime/read.ts',
+      'lib/phone-runtime/runtime.ts',
     ]);
     const seen = new Set<string>();
     for (const file of allSourceFiles(SRC_DIR)) {

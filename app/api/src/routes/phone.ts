@@ -85,6 +85,10 @@ import {
   type PhoneReadStore,
   type PhoneStores,
 } from '../lib/phone-screening/index.js';
+import {
+  phoneRuntimeView,
+  phoneRuntimeDegradeReasons,
+} from '../lib/phone-runtime/health.js';
 
 // ═══════════════════════════════════════════════════════════════════════
 // Bounds
@@ -595,6 +599,14 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
   async function handleHealth(req: Request, res: Response): Promise<void> {
     const cfg = config();
     const configBlock = describePhoneScreeningConfig(cfg);
+    // PROCESS-LOCAL. This block describes the loops running in THIS api
+    // process and nothing else. On a multi-process deployment each replica
+    // answers for itself, so a reader must not treat `enabled: false` here as
+    // "the fleet is idle" — only as "this process is not running the loops".
+    // It is computed before the branch because all three responses carry it:
+    // a disabled screening flag and an unreadable backlog are both states in
+    // which an operator still needs to know whether the loops are turning.
+    const runtimeBlock = phoneRuntimeView(now());
     if (!cfg.screeningEnabled) {
       res.json({
         ok: true,
@@ -610,6 +622,7 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
         ingress: null,
         backlog_unavailable: false,
         residuals: residualBlock(),
+        runtime: runtimeBlock,
       });
       return;
     }
@@ -646,6 +659,7 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
         ingress: null,
         backlog_unavailable: true,
         residuals: residualBlock(),
+        runtime: runtimeBlock,
       });
       return;
     }
@@ -670,6 +684,11 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
     // in this phase calls `expire_phone_appointments`, so the status column
     // cannot catch up on its own. See the `appointment_missed_*` residual.
     if (backlog.appointments.overdue > 0) reasons.push('appointments_overdue');
+    // Appended LAST so the pre-existing backlog reasons keep their order and
+    // meaning. These are additive: a stale or erroring loop degrades the
+    // surface even when every backlog count is healthy, because a healthy
+    // backlog with no worker turning is precisely the silent-stall case.
+    reasons.push(...phoneRuntimeDegradeReasons(runtimeBlock));
 
     await recordAudit(req, 'resource.read', 200, {
       metadata: { resource: 'phone_health', reason_count: reasons.length },
@@ -715,6 +734,7 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
       },
       backlog_unavailable: false,
       residuals: residualBlock(),
+      runtime: runtimeBlock,
     });
   }
 

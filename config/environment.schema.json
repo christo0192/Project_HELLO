@@ -109,7 +109,14 @@
         "PHONE_SIP_TRUNK_ID": { "requiredInProduction": false, "secret": false, "external": true },
         "PHONE_AGENT_NAME": { "requiredInProduction": false, "secret": false },
         "PHONE_ORIGINATE_TIMEOUT_SECONDS": { "requiredInProduction": false, "secret": false },
-        "PHONE_MAX_CALL_SECONDS": { "requiredInProduction": false, "secret": false }
+        "PHONE_MAX_CALL_SECONDS": { "requiredInProduction": false, "secret": false },
+        "PHONE_RUNTIME_DUE_MS": { "requiredInProduction": false, "secret": false },
+        "PHONE_RUNTIME_RECLAIM_MS": { "requiredInProduction": false, "secret": false },
+        "PHONE_RUNTIME_RECONCILE_MS": { "requiredInProduction": false, "secret": false },
+        "PHONE_RUNTIME_EXPIRE_MS": { "requiredInProduction": false, "secret": false },
+        "PHONE_RUNTIME_DUE_LIMIT": { "requiredInProduction": false, "secret": false },
+        "PHONE_RUNTIME_RECLAIM_LIMIT": { "requiredInProduction": false, "secret": false },
+        "PHONE_RUNTIME_JOB_LEASE_SECONDS": { "requiredInProduction": false, "secret": false }
       }
     },
     "web": {

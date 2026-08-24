@@ -55,7 +55,24 @@ const DIAL_CONFIG_SOURCE = readFileSync(
   'utf8',
 );
 
-const ALL_CONFIG_SOURCE = `${CONFIG_SOURCE}\n${DIAL_CONFIG_SOURCE}`;
+/**
+ * THIRD config file, for the same reason as the second.
+ *
+ * P5's cadence knobs cannot live in `phone-screening/config.ts`: that module
+ * is forbidden from importing a timer, a queue or a logger (enforced by
+ * `phone-screening-structural`), and its config type is the DOMAIN's, not the
+ * runtime's. So the seven `PHONE_RUNTIME_*` knobs are read where they are
+ * used. The invariant this suite protects — every PHONE_* variable is
+ * declared, exampled and actually READ SOMEWHERE — is exactly as strong
+ * across three files as across one, and would be silently lost if the suite
+ * kept reading only two.
+ */
+const RUNTIME_CONFIG_SOURCE = readFileSync(
+  fileURLToPath(new URL('../lib/phone-runtime/config.ts', import.meta.url)),
+  'utf8',
+);
+
+const ALL_CONFIG_SOURCE = `${CONFIG_SOURCE}\n${DIAL_CONFIG_SOURCE}\n${RUNTIME_CONFIG_SOURCE}`;
 
 const SCHEMA = JSON.parse(
   readFileSync(fileURLToPath(new URL('../../../../config/environment.schema.json', import.meta.url)), 'utf8'),
@@ -296,6 +313,17 @@ describe('the env contract holds in BOTH directions', () => {
     'PHONE_AGENT_NAME',
     'PHONE_ORIGINATE_TIMEOUT_SECONDS',
     'PHONE_MAX_CALL_SECONDS',
+    // P5 runtime cadence and batch knobs, read in `lib/phone-runtime/config.ts`.
+    // Every one of them is a BOUND, not a switch: the two switches that decide
+    // whether the loops run at all are PHONE_SCREENING_ENABLED and
+    // PHONE_RUNTIME_ENABLED, both already above.
+    'PHONE_RUNTIME_DUE_MS',
+    'PHONE_RUNTIME_RECLAIM_MS',
+    'PHONE_RUNTIME_RECONCILE_MS',
+    'PHONE_RUNTIME_EXPIRE_MS',
+    'PHONE_RUNTIME_DUE_LIMIT',
+    'PHONE_RUNTIME_RECLAIM_LIMIT',
+    'PHONE_RUNTIME_JOB_LEASE_SECONDS',
   ];
 
   it('every variable is declared, exampled, and read', () => {
