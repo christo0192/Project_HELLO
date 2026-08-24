@@ -442,8 +442,21 @@ export async function runCanary1(deps: Canary1RunDeps): Promise<Canary1RunResult
 export type Canary1JoinStatus = 'joined' | 'worker_never_joined' | 'room_reaped_before_join';
 
 /**
- * Poll for the NAMED WORKER to join the canary room, bounded by
- * `joinWaitSeconds`.
+ * Poll the canary room until it is OCCUPIED, bounded by `joinWaitSeconds`.
+ *
+ * ── WHAT THIS ESTABLISHES, STATED NARROWLY ──────────────────────────
+ * It reads ONE field — `numParticipants` — so what it proves is OCCUPANCY, not
+ * IDENTITY. It does not read the participant list and does not check that the
+ * occupant is `CANARY1_DEFAULT_AGENT_NAME`. On this path nothing else holds a
+ * token: the room is freshly created for this run, `maxParticipants` is 2, the
+ * only dispatch is the one this CLI just made, and on the dry-run branch no SIP
+ * leg is ever originated — so an occupant IS the dispatched worker. That is a
+ * property of the path, not of the check, which is why it is written down here
+ * rather than assumed from the check's name.
+ *
+ * The verdict line is still called `worker_present_before_originate` because
+ * that is what an operator needs it to mean; the name is honest about the
+ * conclusion and this comment is honest about the evidence.
  *
  * The bound is the CLI's own knob rather than the worker's participant wait,
  * because on `--execute` this wait is SPENT OUT OF that wait: the worker's
@@ -460,18 +473,31 @@ async function observeAgentJoin(
   bounds: { readonly joinWaitSeconds: number },
 ): Promise<Canary1JoinStatus> {
   const deadline = deps.now() + bounds.joinWaitSeconds * 1_000;
-  let reaped = false;
+  // NOT STICKY, and not latched. An earlier shape set a `reaped` flag on the
+  // first empty listing and kept it for the rest of the wait, so one transient
+  // miss made a genuine `worker_never_joined` report `room_reaped_before_join`
+  // — which is the FIRST branch of the runbook's diagnosis order and sends the
+  // operator to bounds when the fault is state. The flag now tracks the LAST
+  // observation only.
+  let lastEmpty = false;
   while (deps.now() < deadline) {
     const listed = await discardingErrors(async () => deps.rooms.listRooms([roomName]));
     if (listed !== undefined) {
       if ((listed[0]?.numParticipants ?? 0) >= 1) return 'joined';
+      const empty = listed.length === 0;
       // The room is GONE and no join was ever seen. `emptyTimeout` reaped it
       // out from under the wait — a different fault with a different remedy.
-      if (listed.length === 0) reaped = true;
+      //
+      // CONFIRMED BY TWO CONSECUTIVE LISTINGS, then returned IMMEDIATELY. Two
+      // because a single miss is not a reap; immediately because a room that
+      // is really gone never comes back, so spending the rest of the join wait
+      // polling it only delays a verdict already known.
+      if (empty && lastEmpty) return 'room_reaped_before_join';
+      lastEmpty = empty;
     }
     await discardingErrors(async () => deps.sleep(CANARY1_OBSERVE_POLL_MS));
   }
-  return reaped ? 'room_reaped_before_join' : 'worker_never_joined';
+  return lastEmpty ? 'room_reaped_before_join' : 'worker_never_joined';
 }
 
 /**

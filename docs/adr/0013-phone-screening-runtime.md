@@ -394,7 +394,7 @@ second case, which is the one a later revert actually produces.
   into one. It does not re-verify the 133 — that needs a live database this
   gate has no Docker for, and pretending otherwise would be the decorative
   evidence this lane keeps deleting.
-* `app/api/src/__tests__/phone-canary1-*.test.ts` — **181 declared test cases**
+* `app/api/src/__tests__/phone-canary1-*.test.ts` — **183 declared test cases**
   across seven files covering Canary-1's structural closure (the explicit file
   list including `app/api/scripts/phone-canary1.ts`, the moved-not-duplicated
   `node:fs` read permission, the no-write sweep, the containment ordering), the
@@ -404,7 +404,10 @@ second case, which is the one a later revert actually produces.
   The count moved from 169 with PR106's live-call close-out, which adds the
   worker-presence precondition on the originate path, the derived room
   `emptyTimeout` and its ordering inequality, the join-wait inequality, and the
-  trunk-id sanitiser — each with the control that goes red without it. **The
+  trunk-id sanitiser — each with the control that goes red without it — and then
+  to 183 with PR106's review repair, which adds the two cases proving the join
+  observation does not latch a transient empty listing into
+  `room_reaped_before_join` and returns at once on a confirmed reap. **The
   number above is whatever the gate below reports; it is not a remembered
   constant and must not be edited to match a memory.**
   `scripts/check-phone-canary-evidence.test.mjs` derives this figure from the

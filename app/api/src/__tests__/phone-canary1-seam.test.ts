@@ -354,9 +354,13 @@ describe('3. one invocation, one room, at most one originate', () => {
     expect(h.seen).toEqual([]);
     expect(h.calls).toContain('createDispatch');
     expect(result.lines).toContain('CANARY|canary1|originate_skipped|PASS|dry_run');
-    // The line that makes the dry run worth running: the named worker was
-    // OBSERVED in the room, which is the only offline-safe evidence that
-    // arming, the dispatch metadata and the worker's inbound guard agree.
+    // The line that makes the dry run worth running: the room was OBSERVED
+    // OCCUPIED, which on this path means the dispatched worker joined — the
+    // only offline-safe evidence that arming, the dispatch metadata and the
+    // worker's inbound guard agree. (Occupancy, not identity: `observeAgentJoin`
+    // reads `numParticipants` and nothing else. The inference is a property of
+    // the path — fresh room, `maxParticipants` 2, one dispatch, no originate on
+    // this branch — and is written down where the check lives.)
     // The SAME line the `--execute` path gates on — one observation, two
     // meanings, deliberately not two implementations.
     expect(result.lines).toContain('CANARY|canary1|worker_present_before_originate|PASS|joined');
@@ -626,6 +630,75 @@ describe('3. one invocation, one room, at most one originate', () => {
     expect(empty).toContain('worker_never_joined');
     expect(gone).toContain('room_reaped_before_join');
     expect(empty).not.toBe(gone);
+  });
+
+  it('E3b — a TRANSIENT empty listing is not a reap, and does not stick', async () => {
+    // The defect: an earlier shape latched `reaped` on the FIRST empty listing
+    // and kept it for the whole wait. One transient miss then turned a genuine
+    // `worker_never_joined` into `room_reaped_before_join` — the FIRST branch
+    // of the runbook's diagnosis order, sending the operator to bounds when the
+    // fault is state. These two runs share that first empty listing and must
+    // still end in DIFFERENT places.
+    const runWith = async (listings: Array<Array<{ numParticipants: number }>>) => {
+      let clock = 0;
+      let i = 0;
+      const h = harness();
+      const result = await runCanary1({
+        ...h.deps,
+        rooms: {
+          async createRoom() {},
+          async deleteRoom() {},
+          async listRooms() { return listings[Math.min(i++, listings.length - 1)]; },
+        },
+        now: () => { clock += 10_000; return clock; },
+        sleep: async () => {},
+      });
+      return {
+        line: result.lines.find((l) => l.includes('worker_present_before_originate')),
+        polls: i,
+        seen: h.seen,
+      };
+    };
+
+    // Miss, then the worker is there: JOINED. A latch could not produce this.
+    const recovered = await runWith([[], [{ numParticipants: 1 }]]);
+    expect(recovered.line).toContain('PASS|joined');
+
+    // Miss, then a room that exists and stays empty: a STATE problem, reported
+    // as one. Under the latched shape this printed `room_reaped_before_join`.
+    const never = await runWith([[], [{ numParticipants: 0 }]]);
+    expect(never.line).toContain('FAIL|worker_never_joined');
+    expect(never.line).not.toContain('room_reaped_before_join');
+    expect(never.seen).toEqual([]);
+  });
+
+  it('E3c — a CONFIRMED reap returns at once instead of burning the join wait', async () => {
+    // Two consecutive empty listings confirm it; a room that is really gone
+    // never comes back, so polling it for the rest of the window only delays a
+    // verdict already known. The assertion is on the POLL COUNT, because
+    // "returns promptly" is a claim about work done, not about a line printed.
+    let clock = 0;
+    let polls = 0;
+    const h = harness();
+    const result = await runCanary1({
+      ...h.deps,
+      rooms: {
+        async createRoom() {},
+        async deleteRoom() {},
+        async listRooms() { polls += 1; return []; },
+      },
+      // 10 s steps against the 75 s default window: a loop that ran to the
+      // deadline would poll SEVEN times before returning.
+      now: () => { clock += 10_000; return clock; },
+      sleep: async () => {},
+    });
+    expect(result.lines)
+      .toContain('CANARY|canary1|worker_present_before_originate|FAIL|room_reaped_before_join');
+    // THREE listings in the whole run: two to confirm the reap, plus the one
+    // teardown makes to verify the room's absence. Running to the deadline
+    // would be eight.
+    expect(polls).toBe(3);
+    expect(h.seen).toEqual([]);
   });
 
   it('E6 — createRoom receives the DERIVED empty timeout, not a chosen constant', async () => {

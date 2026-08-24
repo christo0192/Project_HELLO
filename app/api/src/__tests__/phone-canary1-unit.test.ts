@@ -468,7 +468,7 @@ describe('5. the identifiers are unrelated and satisfiable by the far end', () =
 });
 
 // ══════════════════════════════════════════════════════════════════════
-// 6. The six bounds, and the two inequalities the CLI refuses on.
+// 6. The seven bounds, and the five inequalities the CLI refuses on.
 // ══════════════════════════════════════════════════════════════════════
 
 const CREDS = { url: 'wss://x', apiKey: 'k', apiSecret: 's' };
@@ -609,12 +609,29 @@ describe('6. the bounds are ordered, and the outermost one is derived', () => {
     );
     expect(b.roomEmptyTimeoutSeconds)
       .toBeGreaterThanOrEqual(canary1RoomEmptyTimeoutSeconds(b.participantWaitSeconds));
-    // SLACK, not a tie: 120 >= 60 + 30 + 15 = 105. A tie would mean the
-    // shipped configuration sat exactly on a refusal boundary, where any
-    // rounding or any future margin change refuses the defaults themselves.
+    // FULLY ALLOCATED, and that is the accounting rather than an oversight:
+    // `120 = 75 + 30 + 15`. The participant wait is exactly its three
+    // consumers — the join window the CLI can observe, the ring, and
+    // `ORIGINATE_MARGIN`, which covers the gap between job assignment and the
+    // join we can see plus the originate call itself.
+    //
+    // The previous default was 60 with 15 s left over, described as "slack".
+    // It was not slack: 60 IS the worker's `initialize_process_timeout`, so
+    // the join window had zero margin for dispatch scheduling, process spawn,
+    // registration and `ctx.connect()`, and a HEALTHY cold start could report
+    // `worker_never_joined`. The leftover was an under-spent join window; the
+    // protection was always `ORIGINATE_MARGIN`, and it is still here.
+    //
+    // The consequence is asserted rather than described: at equality the
+    // preflight ADMITS the shipped defaults (the relation is `>=`, and E4
+    // pins that boundary from both sides), and any future raise of the ring or
+    // either margin refuses those defaults at the preflight — loudly, before a
+    // provider is contacted.
     const charged = b.joinWaitSeconds + b.ringSeconds + CANARY1_ORIGINATE_MARGIN_SEC;
-    expect(charged).toBe(105);
-    expect(b.participantWaitSeconds - charged).toBe(15);
+    expect(b.joinWaitSeconds).toBe(75);
+    expect(charged).toBe(120);
+    expect(b.participantWaitSeconds - charged).toBe(0);
+    expect(preflight()).toMatchObject({ ok: true });
     // And the worker-side bound stays inside `phone.py`'s clamp of [1, 180].
     expect(b.participantWaitSeconds).toBeLessThanOrEqual(180);
   });

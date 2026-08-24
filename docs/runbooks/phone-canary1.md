@@ -29,7 +29,13 @@ disclosure gate and the purge path),
 
 > **The live call is NO-GO.** It is blocked on TEL-01, TEL-04, TEL-06 and TEL-07
 > sign-off and a clean dry run. Those are approvals, not code, and nothing in
-> PR105, PR106 or the activation artifact moves them. See §9.
+> PR105, PR106 or the activation artifact moves them.
+>
+> **The owner has REPORTED those approvals** (§9, "What the remaining gate now
+> is"). That is an owner **attestation** — no approval artifact was observed
+> here — and it is why this line still says NO-GO: the observed half (a clean
+> dry run, §9 steps 4-9b) has not happened yet. Read the two together, not
+> either alone. See §9.
 
 ---
 
@@ -337,11 +343,27 @@ agree, and are pinned as a pair cross-language by
 `phone-canary1-cross-language.test.ts` — but a *flag* is not the default, and
 nothing pins a flag to a secret.
 
-**`--join-wait-seconds` is a real control** (default 60, range [30,150]): it
+**`--join-wait-seconds` is a real control** (default **75**, range [30,150]): it
 bounds how long the CLI waits for the worker to appear before it originates, and
 it is **charged against** the worker's participant wait by the inequality above.
-At the defaults that reads `120 >= 60 + 30 + 15 = 105` — 15 s of slack, not a
-tie. **150 is not satisfiable at the default ring of 30** (`150 + 30 + 15 = 195 >
+
+**The default is derived, not chosen.** 75 = the worker's cold-start bound
+(`initialize_process_timeout: 60.0` with `num_idle_processes: 0`) **plus the same
+15 s margin** that covers the unobservable gap everywhere else. An earlier
+revision shipped 60 — the cold-start timeout itself, with **zero** margin for
+dispatch scheduling, process spawn, LiveKit registration and `ctx.connect()` — so
+a **healthy** system could report `worker_never_joined` on the first cold dry run
+and send the operator into a diagnosis order that would find nothing wrong.
+
+At the defaults the inequality then reads `120 = 75 + 30 + 15` — **fully
+allocated, at equality, and that is the accounting**. The participant wait is
+exactly its three consumers: the join window the CLI can observe, the ring, and
+the margin covering the part it cannot. The relation is `>=`, so equality
+**passes**. What follows from it is stated rather than buried: **raising
+`--ring-seconds` without raising `--participant-wait-seconds` now refuses the
+shipped defaults** at the preflight — loudly, before any provider is contacted,
+which is the right direction for a bound to fail in. **150 is not satisfiable at
+the default ring of 30** (`150 + 30 + 15 = 195 >
 180`), and the preflight refuses that combination rather than quietly accepting
 it: a knob whose maximum is reachable only for some settings of another knob is
 exactly why the relation is checked instead of assumed.
@@ -404,7 +426,17 @@ never arrives, because otherwise the handset rings, a real person answers, and
 nobody speaks — not even the disclosure, which is the worker's first action.
 Same code, two meanings, which is exactly why it must not be two
 implementations. Its three codes are `joined`, `worker_never_joined` and
-`room_reaped_before_join`; see §9 step 9 for the diagnosis order. A dry run then
+`room_reaped_before_join`; see §9 step 9 for the diagnosis order.
+
+**What the check actually reads, stated narrowly.** It reads ONE field —
+`numParticipants` — so what it establishes is **occupancy**, not **identity**.
+It does not enumerate the participant list and does not verify that the occupant
+is `phone-screener`. On this path an occupant *is* the dispatched worker, but
+that follows from the **path** and not from the check: the room is freshly
+created for this run, `maxParticipants` is 2, the only dispatch is the one this
+CLI just made, and on the dry-run branch no SIP leg is ever originated. Written
+down here so the verdict's name is not read as more evidence than the field
+carries. A dry run then
 emits `originate_skipped|PASS|dry_run` and tears down.
 
 **The bound of that gate, stated so it is not over-read.**
@@ -414,10 +446,29 @@ and *then* `session_factory()`, and the provider plugins read `SARVAM_API_KEY`
 from the environment rather than receiving it as a kwarg — so a worker missing a
 provider key **joins the room, opens this gate, and then dies constructing the
 session**. On `--execute` that is again a ringing handset, an answered call and
-silence, from a cause this gate cannot see. The observation that closes it is the
-dry run's `phone_canary_session_started` line (§5a), and — like
-`phone_canary_wait_bound` — it must be **seen before `--execute` is
-considered**. §9 step 5a checks the provider keys by name for the same reason.
+silence, from a cause this gate cannot see.
+
+**The observation that closes it is `phone_canary_session_built`** (§5a) — the
+line the worker emits *immediately after* `session_factory()` returns, which is
+**before** the participant wait. Like `phone_canary_wait_bound`, it must be
+**seen before `--execute` is considered**.
+
+> **`phone_canary_session_started` is NOT dry-run evidence and must never be
+> required as such.** It is emitted only *after* something has answered
+> (`phone_canary.py` starts the session on the far side of the participant
+> wait). A dry run originates nothing, so no remote participant ever arrives,
+> the wait times out and the worker returns `canary_no_participant` — that line
+> is **unreachable on a dry run by construction**, not merely hard to catch. An
+> earlier revision of this runbook required it before `--execute`; a gate that
+> cannot pass is a gate that gets waived, and what it was guarding is the
+> audible failure this whole mechanism exists to bound.
+
+**What `session_built` does NOT prove — the residual, stated rather than
+closed.** Construction validates key **presence**, not key **validity**. A
+present-but-wrong `SARVAM_API_KEY` constructs the plugins happily and fails
+mid-call. Step 5a's names-only check plus `phone_canary_session_built` is the
+honest ceiling here; nothing offline can raise it. §9 step 5a checks the provider
+keys by name for the same reason.
 
 Anything that fails the grammar prints
 `CANARY|canary1|emitter_refused|FAIL|unprintable` and **never** the offending
@@ -440,8 +491,9 @@ vocabulary):
 |---|---|---|
 | `phone_canary_start` | `schema=<canary_id>` | the canary branch was entered — arming and the three-condition gate all held |
 | `phone_canary_wait_bound` | `duration_sec` | **the worker's EFFECTIVE `PHONE_CANARY_PARTICIPANT_WAIT_SEC`.** This is the §4c control. Confirm it before `--execute` |
+| `phone_canary_session_built` | — | **the provider session CONSTRUCTED** — the STT/TTS/LLM plugins were built, so `SARVAM_API_KEY` and `GEMINI_API_KEY` were present. Emitted *before* the participant wait, so it is the **one session line a dry run can produce**. Confirm it before `--execute` (§5). Presence, **not** validity |
 | `phone_canary_participant_waited` | `duration_sec` | how long the participant wait actually took — on **both** branches, so a near-bound value on a *healthy* run is visible rather than inferred |
-| `phone_canary_session_started` | — | the provider session opened. Separates "the session constructed" from "the conversation happened"; a failure between `start` and this line is a provider-key/config fault, not a telephony one |
+| `phone_canary_session_started` | — | the provider session **opened against an answered leg**. Emitted only after the participant wait succeeds, so it appears on a real call and **never on a dry run** — do not treat its absence from a dry run as a fault, and never gate `--execute` on it (§5). Separates "the session constructed" (`phone_canary_session_built`) from "the conversation happened" |
 | `phone_canary_question_asked` | `turn_index` | one line per question actually asked |
 | `phone_canary_answer_observed` / `phone_canary_answer_silent` | `turn_index` | per turn: something was heard, or nothing was. **Never what was said** |
 | `phone_canary_room_closed` | — | the worker's own deleter ran. See the caveat below |
@@ -484,6 +536,12 @@ at all therefore depends on whether the job survives its room being deleted:
 wait inequality: there was no originate and no ring to charge against it. That
 measurement exists only on a real call.
 
+**`phone_canary_wait_bound` and `phone_canary_session_built` are NOT subject to
+that caveat**, which is why they are the two required observations (§9 step 9).
+Both are emitted on the near side of the participant wait — the first before
+`ctx.connect()`, the second immediately after the session is constructed — so
+neither depends on the job surviving the CLI's ~2 s teardown of a dry-run room.
+
 ## 6. The seven bounds, and the five inequalities
 
 | Bound | Default | Enforced by | Fails to |
@@ -491,7 +549,7 @@ measurement exists only on a real call.
 | ring | 30 s | LiveKit SIP | no-answer, teardown |
 | originate | 60 s, **must exceed ring** | LiveKit SIP; CLI refuses `timeouts_misordered` before any seam | refusal, no call |
 | worker participant wait | `PHONE_CANARY_PARTICIPANT_WAIT_SEC` = 120 s | the worker; CLI refuses `waits_misordered` unless **wait ≥ ring + 60** | refusal, no call |
-| **join wait** (`--join-wait-seconds`) | **60 s**, range [30, 150] | the CLI; refuses `origination_wait_misordered` unless **wait ≥ join wait + ring + 15** | refusal, no call |
+| **join wait** (`--join-wait-seconds`) | **75 s, derived** (cold start 60 + 15), range [30, 150] | the CLI; refuses `origination_wait_misordered` unless **wait ≥ join wait + ring + 15** | refusal, no call |
 | connected call | `PHONE_CANARY_MAX_CALL_SEC` = 180 s | LiveKit SIP + an `asyncio.wait_for` in the worker | provider drops the leg; room closed |
 | CLI wall clock | 330 s, **derived** | the CLI; refuses `bounds_misordered` unless **wall ≥ wait + max call + 30** | teardown runs regardless |
 | empty room | **210 s, derived** (`wait + 60 + 30`) | LiveKit room; CLI refuses `room_timeout_misordered` if the value passed to `createRoom` is not that derivation | the room reaps itself even if both processes die |
@@ -528,7 +586,11 @@ will still be waiting when the leg is answered. "Just wait for the worker first"
 consumes the very resource it is protecting, and the failure is the *same*
 silent-answered-call it was meant to prevent, arriving from the other side.
 Hence the inequality, with a 15 s margin covering the gap between job assignment
-and the join we can actually *observe*, plus the originate call itself. The
+and the join we can actually *observe*, plus the originate call itself. **The
+join wait's own default is derived from the same two numbers** — the worker's
+60 s cold-start bound plus that 15 s margin — so at the defaults the relation is
+satisfied at equality and the participant wait is exactly its three consumers
+(§4c). The
 older `wait ≥ ring + 60` check is **kept**: it still governs the dry run, and two
 inequalities that agree cost nothing — deleting the older one to avoid
 redundancy would delete the reason it exists.
@@ -688,8 +750,8 @@ fly secrets list -a project-hello-phone-voice     # NAMES ONLY, never values
 |---|---|
 | `PHONE_CANARY_ENABLED` | **STOP. Do not scale up.** The canary branch is unreachable |
 | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | the worker cannot register at all |
-| `SARVAM_API_KEY` | **the worker JOINS and then dies at `session.start`** |
-| `GEMINI_API_KEY` | likewise |
+| `SARVAM_API_KEY` | **the worker JOINS and then dies at `session_factory()`** — at CONSTRUCTION, before the participant wait, so `phone_canary_session_built` is absent (§5a) |
+| `GEMINI_API_KEY` | likewise — same line, same absent counter |
 
 **Why the provider keys belong in this check and not in a diagnosis step.** If
 `PHONE_CANARY_ENABLED` did not take, `phone.phone_canary_enabled()` is false, the
@@ -705,8 +767,10 @@ worker-presence gate cannot see: `run_phone_canary` does `ctx.connect()` and
 **then** `session_factory()`, and the provider plugins read `SARVAM_API_KEY` from
 the environment rather than receiving it as a kwarg. So a worker missing one
 **joins the room, opens the gate, and dies constructing the session** — on
-`--execute`, a ringing handset, an answered call and silence. Names only, never
-values. Paired with step 10's names-only confirmation that `PHONE_CANARY_ENABLED`
+`--execute`, a ringing handset, an answered call and silence. The counter that
+makes that visible on a **dry run** is `phone_canary_session_built` (§5a): it is
+emitted immediately after construction succeeds, so its **absence** is the
+symptom. Names only, never values. Paired with step 10's names-only confirmation that `PHONE_CANARY_ENABLED`
 is **gone**, this is two-sided: one command at each end.
 
 **6. Capture the watermark BY HAND, then scale up.** The phone deploy job
@@ -779,7 +843,7 @@ CANARY|canary1|preflight_questions_in_range|PASS|ok
 CANARY|canary1|preflight_destination_accepted|PASS|ok
 CANARY|canary1|room_created|PASS|ok
 CANARY|canary1|dispatch_created|PASS|ok
-   ↑ then a bounded wait of up to `--join-wait-seconds` (60 s by default,
+   ↑ then a bounded wait of up to `--join-wait-seconds` (75 s by default,
      NOT the participant wait) while the worker cold-starts
 CANARY|canary1|worker_present_before_originate|PASS|joined
 CANARY|canary1|originate_skipped|PASS|dry_run
@@ -809,22 +873,61 @@ than a **state**:
    `emptyTimeout` (§6). This code exists precisely so this case stops being
    reported as a missing worker.
 2. **`worker_never_joined`** — a **state** problem, in this order:
-   **secret** (step 5a: is `PHONE_CANARY_ENABLED` still present?) → **scale**
-   (`fly scale count` — is the machine still there?) → **deploy history**
-   (`gh run list --workflow "Deploy (Fly)" --limit 5` — did a voice-touching
-   merge land mid-window and re-zero the app? residual R-12) → **dispatch**
-   (agent name agreement) → **the trunk LAST.** The trunk is not involved in a
-   dry run at all, and reaching for it first is the misdiagnosis this order
-   exists to prevent.
+
+   **0. `canary_already_run` — CHECK THIS FIRST if ANY canary dispatch was sent
+   earlier in this window** (including the dry run above, and including a
+   repeated dry run). `run_phone_canary` sets its one-shot latch **before**
+   `ctx.connect()`, so a worker that has already taken a canary job refuses the
+   next one **without joining** — and the CLI reports exactly
+   `worker_present_before_originate|FAIL|worker_never_joined`, indistinguishable
+   from a missing secret or a mid-window re-zeroing. Look for it directly:
+
+   ```bash
+   fly logs -a project-hello-phone-voice --no-tail | grep canary_already_run
+   ```
+
+   > **A dry run CONSUMES the one-shot** if the job process is reused for the
+   > next job (see R-m — whether it is, is UNVERIFIED). Assume it does.
+   >
+   > **The remedy — clear the latch by replacing the process, then RE-WATERMARK.**
+   > `_canary_ran` is module-level, so nothing clears it in place, and **nothing
+   > here resets it in production or retries into it**:
+   >
+   > ```bash
+   > fly scale count 0 -a project-hello-phone-voice
+   > WM="$(date -u +%Y-%m-%dT%H:%M:%S)"; echo "$WM"     # a NEW watermark — step 6's is now stale
+   > fly scale count 1 -a project-hello-phone-voice
+   > fly logs -a project-hello-phone-voice --no-tail | grep 'registered worker'
+   > # Accept ONLY a 'registered worker' line whose timestamp is >= $WM.
+   > ```
+   >
+   > The re-watermark is **mandatory, not hygiene**: after a scale cycle the
+   > earlier `registered worker` line is from a machine that no longer exists,
+   > and accepting it would let step 9 proceed against a worker that has not
+   > come back. Then confirm `fly status` shows exactly **one** machine and
+   > re-run the dry run.
+
+   Then, and only then: **secret** (step 5a: is `PHONE_CANARY_ENABLED` still
+   present?) → **scale** (`fly scale count` — is the machine still there?) →
+   **deploy history** (`gh run list --workflow "Deploy (Fly)" --limit 5` — did a
+   voice-touching merge land mid-window and re-zero the app? residual R-12) →
+   **dispatch** (agent name agreement) → **the trunk LAST.** The trunk is not
+   involved in a dry run at all, and reaching for it first is the misdiagnosis
+   this order exists to prevent.
 
 **In a second terminal**, `fly logs -a project-hello-phone-voice` (§5a). Two
 observations are **required before `--execute` is ever considered**:
 
 * **`phone_canary_wait_bound`** — its `duration_sec` must equal the value the
   CLI's join-wait inequality was checked against (§4c).
-* **`phone_canary_session_started`** — the only thing that shows the provider
-  session actually constructs. The worker-presence gate cannot see this failure
-  (§5).
+* **`phone_canary_session_built`** — the only thing that shows the provider
+  session actually **constructs**. The worker-presence gate cannot see this
+  failure (§5). It is emitted *before* the participant wait, so it survives the
+  CLI's ~2 s teardown of a dry-run room.
+
+> **Do NOT wait for `phone_canary_session_started` here.** It is emitted only
+> after an answered leg, and a dry run originates nothing — it cannot appear,
+> and requiring it would block this step forever. See §5.
 
 Then record which of the two `phone_canary_room_closed` outcomes happened (§5a).
 It is an observation, not a pass/fail.
@@ -879,10 +982,12 @@ console. **What the attestation does not cover, stated so it is not over-read:**
   — not that a carrier path works** (§4a).
 * **An approval does not close a code gap**, and it does not substitute for an
   observation. A clean dry run including 9b is still required, and so are the
-  `phone_canary_wait_bound` and `phone_canary_session_started` confirmations.
+  `phone_canary_wait_bound` and `phone_canary_session_built` confirmations.
+  **Not `phone_canary_session_started`** — that line cannot exist before a call
+  has been answered (§5).
 
 **So the remaining gate on the live call is:** PR106 merged, `canary1/arm` cut
-and reviewed, a clean dry run, the wait bound and the session-started line
+and reviewed, a clean dry run, the wait bound and the **session-built** line
 confirmed, and the owner present with TEL-07's second person.
 
 ## 10. Residuals
@@ -948,25 +1053,44 @@ confirmed, and the owner present with TEL-07's second person.
   `phone-worker-deployment.md` §6 — a much larger posture change that leaves the
   phone worker persistently live and requires the API's `PHONE_AGENT_NAME` to move
   with it. Canary-1 does neither (`phone-worker-deployment.md` §6a).
-* **R-m — the worker's one-shot latch may be weaker than it reads. UNVERIFIED.**
+* **R-m — the worker's one-shot latch. UNVERIFIED, AND IT CUTS BOTH WAYS.**
   `_canary_ran` is module-level and therefore **per job process**. With
-  `num_idle_processes: 0` a job process is created on demand, so if
-  `livekit-agents` runs each job in its own process the latch guards against a
-  second dispatch into the *same* process, not against a second *job*. This could
-  not be settled offline (the SDK is not installed and there is no network), and
-  the comment in `phone_canary.py` has been softened to match: it now claims that
-  a second conversation requires a second **deliberate act**, not that arming
-  buys exactly one conversation. **The observation that settles it:** during the
-  window, send a **second dry-run dispatch** and see whether the worker refuses
-  `canary_already_run` or conducts a second run. Until then the one-conversation
-  property rests only on the controls known to hold — the CLI's own single-shot,
-  `fly scale count 1`, and the operator.
+  `num_idle_processes: 0` a job process is created on demand, and whether
+  `livekit-agents` reuses that process for the next job is what is unsettled.
+  This could not be settled offline (the SDK is not installed and there is no
+  network). Both directions are consequences, and only one of them was written
+  down before:
+
+  * **If each job gets a FRESH process, the latch is WEAKER than it reads.** It
+    then guards a second dispatch into the *same* process, not a second *job*.
+    The comment in `phone_canary.py` is softened to match: it claims a second
+    conversation requires a second **deliberate act**, not that arming buys
+    exactly one conversation. The one-conversation property rests on the
+    controls known to hold — the CLI's own single-shot, `fly scale count 1`,
+    and the operator.
+  * **If the process IS reused, the latch WEDGES THE WINDOW.** The very first
+    canary dispatch — **including the dry run of step 9** — sets `_canary_ran`
+    before `ctx.connect()`. Every later dispatch in the window, `--execute`
+    included, is then refused `canary_already_run` **without joining**, and the
+    CLI reports `worker_present_before_originate|FAIL|worker_never_joined` — the
+    same line a missing secret and a mid-window re-zeroing produce, with a
+    different remedy again. **§9 step 9's diagnosis order names this cause
+    first** for any `worker_never_joined` that follows an earlier dispatch, and
+    carries the remedy: scale to zero, re-watermark, scale back to one. The
+    latch is **never reset in production and never retried into**.
+
+  **The observation that settles it:** during the window, send a **second
+  dry-run dispatch** and see whether the worker refuses `canary_already_run` or
+  conducts a second run. **That experiment wedges the window if it succeeds** —
+  run it only when you are prepared to do the scale-cycle recovery above, or
+  leave it unsettled.
 
 ## 11. Rollback card
 
-Six subtractive layers, least- to most-drastic. **None touches the API, the
-browser worker, the database, or any production flag — because none of them was
-ever changed.**
+**Five** subtractive layers, least- to most-drastic — the five numbered rows
+below. **None touches the API, the browser worker, the database, or any
+production flag — because none of them was ever changed.** (Layer 0, at the foot
+of this section, is deliberately **not** one of them: it is not an action.)
 
 | # | Action | Effect | Reversible by |
 |---|---|---|---|

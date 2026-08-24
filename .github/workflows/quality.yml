@@ -57,9 +57,19 @@ jobs:
       #    `github.event_name == 'push'`. That is a deliberate, stated limit: the
       #    manual path is the local `node scripts/check-main-disarmed.mjs`, which is
       #    what an operator should run anyway (runbook §4b). ──
+      #    The verdict LINE is asserted, not just the exit code: a module that
+      #    declines to run its assertion also exits 0, and that green would be
+      #    indistinguishable from a real pass. `$(...)` is used rather than a
+      #    pipe because `cmd | grep` reports GREP's exit code, not the gate's.
       - name: Validate main is disarmed (default branch only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: node scripts/check-main-disarmed.mjs
+        run: |
+          verdict="$(node scripts/check-main-disarmed.mjs)"
+          echo "$verdict"
+          case "$verdict" in
+            *"main disarmed OK"*) ;;
+            *) echo "the disarm gate produced NO verdict line - it evaluated nothing"; exit 1 ;;
+          esac
       - name: Validate the disarm gate is wired (always)
         run: node scripts/check-main-disarmed.test.mjs
       # ── P8B — Canary-0's OFFLINE half. No database, no Docker, no network.

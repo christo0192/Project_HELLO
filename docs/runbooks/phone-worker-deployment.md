@@ -218,7 +218,7 @@ never appear in `fly.phone.toml`. The set the shared image actually reads is:
 | Key | Why the worker needs it |
 |---|---|
 | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | register with LiveKit and accept a dispatched job |
-| `SARVAM_API_KEY` | STT and TTS. **Not** passed as a kwarg — the plugin reads it from the environment, so its absence surfaces at `session.start`, i.e. after a handset is answered |
+| `SARVAM_API_KEY` | STT and TTS. **Not** passed as a kwarg — the plugin reads it from the environment at **construction**, so its absence surfaces where the session is BUILT (`_build_phone_provider_session`), not at `session.start`. On the production path that is still after a handset is answered; on the Canary-1 path construction happens before the participant wait, which is what makes `phone_canary_session_built` observable on a dry run (`phone-canary1.md` §5) |
 | `GEMINI_API_KEY` | the LLM half of the same session |
 | Supabase keys, `WORKER_CONTEXT_SECRET` | the production screening path's context fetch |
 

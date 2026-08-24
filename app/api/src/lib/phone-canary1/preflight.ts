@@ -144,7 +144,7 @@ export function runCanary1Preflight(input: Canary1PreflightInput): Canary1Prefli
   // A declared range that nothing enforces is exactly the decorative control
   // this lane keeps deleting.
   //
-  // Checked BEFORE the three inequalities so a nonsense value is reported as
+  // Checked BEFORE the five inequalities so a nonsense value is reported as
   // out of range rather than as misordered — the refusal has to name the thing
   // the operator actually typed.
   for (const [name, value] of [

@@ -73,8 +73,27 @@ export function isCanary1Disarmed(source) {
 // pathToFileURL(undefined) throws. Without the first conjunct, any eval-context
 // import throws FROM INSIDE THE GATE — and the line the operator then deletes to
 // make the error go away is the one keeping the artifact's PR green.
-if (process.argv[1] !== undefined
-    && import.meta.url === pathToFileURL(process.argv[1]).href) {
+//
+// ── AND WHY THE URL COMPARISON IS NOT THE ONLY CONDITION ──────────────────
+// A guard that can silently decline to run is a guard that evaluated nothing:
+// under a symlinked path or a wrapper invocation the URL comparison can fail to
+// match even though this file IS the entry point, and the module would then
+// import, assert nothing, print nothing and exit 0 — a GREEN step that ran no
+// gate. The second condition catches exactly that case by asking a different
+// question of the same fact: is the process's entry point this FILE, by name?
+// It cannot be true for the wiring test (whose entry point is
+// `check-main-disarmed.test.mjs`) or for any eval context (no `argv[1]`), so
+// the artifact's PR stays green.
+//
+// The workflow step is the other half: it asserts the verdict line below is
+// actually printed, so "the gate ran" is evidence rather than an inference from
+// an exit code that a no-op also produces.
+const entry = process.argv[1];
+const isEntryModule = entry !== undefined
+  && import.meta.url === pathToFileURL(entry).href;
+const isEntryFileByName = entry !== undefined
+  && path.basename(entry) === "check-main-disarmed.mjs";
+if (isEntryModule || isEntryFileByName) {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   if (!isCanary1Disarmed(readFileSync(path.join(repoRoot, ARMING_PATH), "utf8"))) {
     console.error(

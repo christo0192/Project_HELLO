@@ -927,6 +927,7 @@ class TestRunCounters(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(capture.codes, [
             "phone_canary_start",
             "phone_canary_wait_bound",
+            "phone_canary_session_built",
             "phone_canary_participant_waited",
             "phone_canary_session_started",
             "phone_canary_question_asked",
@@ -944,6 +945,67 @@ class TestRunCounters(unittest.IsolatedAsyncioTestCase):
         # the whole reason no count field exists.
         self.assertEqual(len(capture.where("phone_canary_question_asked")),
                          phone.canary_questions())
+
+    async def test_session_BUILT_is_emitted_before_the_wait_and_survives_a_dry_run(self):
+        # THE DRY-RUN GATE. `phone_canary_session_started` is emitted only
+        # after something has ANSWERED, so on a dry run -- which originates
+        # nothing, so no remote participant ever arrives -- it is unreachable
+        # by construction. Requiring it as dry-run evidence would be a gate
+        # that cannot pass, which is a gate that gets waived.
+        #
+        # `phone_canary_session_built` is the half that IS reachable: it is
+        # emitted at construction, which is where a missing provider key
+        # actually fails, and it is emitted BEFORE the wait rather than after
+        # it.
+        order: list[str] = []
+
+        class _Session(FakeSession):
+            pass
+
+        async def wait():
+            order.append("wait_entered")
+            return None
+
+        capture = _Capture()
+        outcome, _, session, _ = await _drive(
+            capture=capture, session=_Session(), wait=wait)
+        self.assertEqual(outcome, "canary_no_participant")
+        # The line exists on the path a dry run actually takes...
+        self.assertEqual(len(capture.where("phone_canary_session_built")), 1)
+        # ...and `session_started` does NOT, which is the whole point.
+        self.assertEqual(capture.where("phone_canary_session_started"), [])
+        self.assertEqual(session.start_calls, 0)
+        # ...and it precedes the wait, so the CLI's ~2 s teardown of a dry-run
+        # room cannot swallow it the way it can swallow
+        # `phone_canary_participant_waited`.
+        self.assertEqual(order, ["wait_entered"])
+        self.assertLess(capture.codes.index("phone_canary_session_built"),
+                        capture.codes.index("phone_canary_participant_waited"))
+
+    async def test_NEGATIVE_CONTROL_a_failing_session_factory_emits_no_built_line(self):
+        # The control ON the assertion above: `session_built` claims the
+        # session was CONSTRUCTED. If the constructor raises -- which is
+        # exactly what a missing `SARVAM_API_KEY` does, because the plugin
+        # reads it from the environment at construction -- the line must not
+        # appear, or it would report a session that does not exist.
+        capture = _Capture()
+        ctx = FakeCtx(metadata=_room_meta(), dispatch=_dispatch())
+
+        def boom():
+            raise RuntimeError("provider key missing")
+
+        with patch.object(phone_canary, "_log", _real_logger(capture)):
+            with self.assertRaises(RuntimeError):
+                await phone_canary.run_phone_canary(
+                    ctx, _ROOM, _CANARY_ID,
+                    session_factory=boom,
+                    agent_factory=_canary_agent_stub,
+                    close_room=lambda name: None,
+                    wait_for_participant=lambda: None,
+                )
+        self.assertEqual(capture.codes,
+                         ["phone_canary_start", "phone_canary_wait_bound"])
+        self.assertNotIn("phone_canary_session_built", capture.codes)
 
     async def test_a_silent_answer_is_its_own_code_at_the_same_index(self):
         capture = _Capture()
@@ -1069,6 +1131,7 @@ class TestRunCounters(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(capture.codes, [
             "phone_canary_start",
             "phone_canary_wait_bound",
+            "phone_canary_session_built",
             "phone_canary_participant_waited",
             "phone_canary_refused",
             "phone_canary_room_closed",

@@ -154,7 +154,8 @@ CANARY_REFUSALS = (
 #: new log call cannot introduce an unreviewed vocabulary.
 CANARY_LOG_EVENTS: tuple[str, ...] = (
     "phone_canary_start", "phone_canary_wait_bound",
-    "phone_canary_participant_waited", "phone_canary_session_started",
+    "phone_canary_session_built", "phone_canary_participant_waited",
+    "phone_canary_session_started",
     "phone_canary_question_asked", "phone_canary_answer_observed",
     "phone_canary_answer_silent", "phone_canary_room_closed",
     "phone_canary_outcome", "phone_canary_refused",
@@ -267,6 +268,31 @@ async def run_phone_canary(
     await ctx.connect()
 
     session = session_factory()
+    # ── THE ONLY SESSION EVIDENCE A DRY RUN CAN PRODUCE ───────────────
+    # `phone_canary_session_started` (below) is emitted only AFTER something
+    # has answered. A dry run originates nothing, so no remote participant
+    # ever arrives, the wait below times out and that line is unreachable BY
+    # CONSTRUCTION -- not merely hard to catch. Requiring it as dry-run
+    # evidence would be a gate that cannot pass, which is a gate that gets
+    # waived.
+    #
+    # Construction is where the failure the worker-presence gate cannot see
+    # actually lands: `_build_phone_provider_session` constructs the STT, TTS
+    # and LLM plugins HERE, and those plugins read `SARVAM_API_KEY` /
+    # `GEMINI_API_KEY` from the environment rather than receiving them as
+    # kwargs. So a worker missing a provider key joins the room, opens the
+    # gate, and dies on the line ABOVE this one.
+    #
+    # It lands within milliseconds of `ctx.connect()`, i.e. well before the
+    # CLI's teardown deletes the room, which is what makes it reliably
+    # observable in `fly logs` on a dry run -- unlike
+    # `phone_canary_participant_waited`, which is on the other side of a wait
+    # the dry run's room does not survive.
+    #
+    # WHAT IT DOES NOT PROVE: key PRESENCE, not key VALIDITY. A present-but-
+    # wrong key still constructs and still fails mid-call. That residual is
+    # named in the runbook rather than papered over.
+    _log.info("unknown_event", error_type="phone_canary_session_built")
     turns: "asyncio.Queue[str]" = asyncio.Queue()
 
     @session.on("conversation_item_added")
@@ -319,6 +345,10 @@ async def run_phone_canary(
             # second literal — see the module docstring.
             record=dict(phone.PHONE_NO_RECORDING),
         )
+        # ANSWERED-CALL EVIDENCE ONLY. Everything above this line is
+        # reachable on a dry run; this line is not, because it sits after a
+        # wait that only an answered leg satisfies. `phone_canary_session_built`
+        # is the dry-run half of the same question.
         _log.info("unknown_event", error_type="phone_canary_session_started")
 
         conversation_started = time.monotonic()
