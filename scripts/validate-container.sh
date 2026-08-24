@@ -10,13 +10,15 @@
 #  3. .dockerignore excludes .env/.git/venv/caches/tests.
 #  4. No .env file exists in the build context.
 #  5. docker-compose.yml runs the same non-root user and has no healthcheck.
-#  6. The Dockerfile COPY list covers the EXACT first-party import closure of
-#     the Python script named by the JSON ENTRYPOINT (AST-parsed, transitive;
-#     the root is derived, never hardcoded), every worker-source COPY resolves
-#     to /app under the WORKDIR in force, and no secret/env file is copied.
-#     This is what prevents a re-run of PR102 (agent.py imported `phone` but
-#     the image omitted phone.py → ModuleNotFoundError at startup) and the
-#     adjacent shape where the modules ship but land outside /app.
+#  6. The FINAL build stage's COPY list covers the EXACT first-party import
+#     closure of the Python script named by that stage's JSON ENTRYPOINT
+#     (AST-parsed, transitive; the root is derived, never hardcoded), every
+#     worker-source COPY resolves to /app, the EFFECTIVE final WORKDIR is
+#     where the entrypoint script actually resolves, and no secret/env file is
+#     copied. This prevents a re-run of PR102 (agent.py imported `phone` but
+#     the image omitted phone.py → ModuleNotFoundError at startup) and its two
+#     adjacent disguises: the modules shipping outside /app, and the modules
+#     landing in /app while the interpreter starts somewhere else.
 #
 # Optional bounded Docker execution (NOT run in CI; run locally by the owner
 # or verifier) — `--docker` requires Docker and a bounded build:
@@ -108,16 +110,22 @@ fi
 # scripts/docker_import_closure.py is the single implementation (shared with
 # app/voice-livekit/tests/test_docker_packaging.py, so the unit mutation
 # controls exercise exactly the code CI runs here). It:
-#   - derives the closure ROOT from the Dockerfile's JSON ENTRYPOINT rather
-#     than hardcoding `agent.py`, and fails closed if the entrypoint is
-#     absent, shell-form, malformed, non-Python, ambiguous, or names a file
-#     outside the first-party source set;
+#   - derives the closure ROOT from the FINAL STAGE's JSON ENTRYPOINT rather
+#     than hardcoding `agent.py` (FROM resets ENTRYPOINT, so an earlier
+#     stage's is not what the image runs), and fails closed if it is absent,
+#     shell-form, malformed, non-Python, script-less, ambiguous, or names a
+#     file outside the first-party source set;
 #   - AST-walks the transitive first-party import closure from that root and
-#     fails on any un-COPY'd module (MISSING_COPY);
+#     fails on any module not COPY'd IN THE FINAL STAGE (MISSING_COPY) — a
+#     module copied only into the builder never reaches the image;
 #   - resolves each worker-source COPY destination against the WORKDIR in
 #     force and fails unless it lands in /app (BAD_COPY_DEST) — a destination
 #     outside the interpreter search path reproduces the very same startup
 #     ModuleNotFoundError while every other rule stays green;
+#   - resolves the entrypoint script against the EFFECTIVE FINAL WORKDIR and
+#     fails unless that is the COPY'd file under /app (BAD_WORKDIR). Files in
+#     the right place plus a cwd in the wrong place is still a crash-loop:
+#     `python: can't open file '/srv/agent.py'`;
 #   - fails on any secret/env file in a COPY (FORBIDDEN_COPY).
 # It is never skipped: a context whose Dockerfile cannot be rooted is a
 # failure, not a pass.
@@ -128,9 +136,9 @@ if [ -n "$dockerfile" ]; then
     closure_out=$(python3 "$root/scripts/docker_import_closure.py" "$ctx") && closure_rc=0 || closure_rc=$?
     echo "$closure_out" | sed 's/^/  /'
     if [ "${closure_rc:-0}" -ne 0 ]; then
-      fail "Dockerfile packaging contract (entrypoint-rooted import closure -> COPY -> /app) violated"
+      fail "Dockerfile packaging contract (entrypoint-rooted import closure -> COPY -> /app -> start in /app) violated"
     else
-      pass "Dockerfile COPY covers the exact first-party import closure of the ENTRYPOINT script, lands in /app, and copies no secret/env file"
+      pass "Dockerfile final stage: COPY covers the exact first-party import closure of its ENTRYPOINT script, lands in /app, starts in /app, and copies no secret/env file"
     fi
   fi
 fi

@@ -11,12 +11,17 @@ These tests exercise `scripts/docker_import_closure.py` — the SAME analyzer
 mutation control here is a control on the shipped gate. They pin four
 properties of the real Dockerfile and prove each one non-vacuously:
 
-  1. the closure ROOT is derived from the JSON ENTRYPOINT (a renamed or
-     unparseable entrypoint must fail, never silently skip);
-  2. the transitive first-party import closure of that root is fully COPY'd;
-  3. every worker-source COPY resolves to /app under the WORKDIR in force
-     (the adjacent failure: all modules ship, none are importable);
-  4. no secret/env file is COPY'd.
+  1. the closure ROOT is derived from the FINAL STAGE's JSON ENTRYPOINT (a
+     renamed or unparseable entrypoint must fail, never silently skip; an
+     earlier stage's ENTRYPOINT is not what the image runs);
+  2. the transitive first-party import closure of that root is fully COPY'd
+     IN THE FINAL STAGE;
+  3. every worker-source COPY resolves to /app (the adjacent failure: all
+     modules ship, none are importable);
+  4. the EFFECTIVE final WORKDIR is where the entrypoint script resolves (the
+     second disguise: the modules land in /app and the interpreter starts in
+     /srv, dying with `can't open file '/srv/agent.py'`);
+  5. no secret/env file is COPY'd.
 
 Pure static analysis: no LiveKit SDK import, no network, no Docker. Runs under
 the same `unittest discover` as every other worker test (quality.yml).
@@ -59,16 +64,22 @@ def _write_fixture(directory: str, files: dict) -> None:
 
 
 def _fixture_dockerfile(copy_line: str, workdir: str | None = "/app",
-                        entrypoint: str | None = 'ENTRYPOINT ["python", "agent.py", "start"]') -> str:
+                        entrypoint: str | None = 'ENTRYPOINT ["python", "agent.py", "start"]',
+                        workdir_after_copy: str | None = None,
+                        builder_entrypoint: str | None = None) -> str:
     parts = [
         "FROM python:3.12-slim AS builder",
         "RUN pip install --no-cache-dir -r requirements.txt",
-        "FROM python:3.12-slim AS runtime",
     ]
+    if builder_entrypoint is not None:
+        parts.append(builder_entrypoint)
+    parts.append("FROM python:3.12-slim AS runtime")
     if workdir is not None:
         parts.append("WORKDIR " + workdir)
     parts.append("USER 1000:1000")
     parts.append(copy_line)
+    if workdir_after_copy is not None:
+        parts.append("WORKDIR " + workdir_after_copy)
     if entrypoint is not None:
         parts.append(entrypoint)
     return "\n".join(parts) + "\n"
@@ -78,7 +89,9 @@ class DockerPackagingTest(unittest.TestCase):
     def setUp(self) -> None:
         self.local = dic.local_modules(CTX)
         self.dockerfile = _read(DOCKERFILE)
-        self.entry, self.entry_error = dic.entrypoint_root(self.dockerfile, self.local)
+        self.entry, self.entry_script, self.entry_error = dic.entrypoint_root(
+            self.dockerfile, self.local
+        )
         self.assertIsNone(self.entry_error, self.entry_error)
         self.closure = dic.import_closure(CTX, self.entry)
         self.copy_srcs = dic.copy_sources(self.dockerfile)
@@ -90,7 +103,16 @@ class DockerPackagingTest(unittest.TestCase):
         self.assertIsNone(self.result["entry_error"])
         self.assertEqual(self.result["missing"], [])
         self.assertEqual(self.result["bad_dest"], [])
+        self.assertEqual(self.result["bad_workdir"], [])
         self.assertEqual(self.result["forbidden"], [])
+
+    def test_real_image_starts_where_the_modules_land(self) -> None:
+        # The effective final WORKDIR, and the path the interpreter will open.
+        self.assertEqual(self.result["final_workdir"], "/app")
+        self.assertEqual(
+            dic.entrypoint_start_path(self.entry_script, self.result["final_workdir"]),
+            "/app/agent.py",
+        )
 
     def test_closure_root_is_derived_from_the_entrypoint(self) -> None:
         # Not hardcoded: the root is whatever the container actually starts.
@@ -134,15 +156,33 @@ class DockerPackagingTest(unittest.TestCase):
         # Backslash continuation, lowercase keyword, and a --chown flag: the
         # source on the continuation line must still be seen, the flag must not
         # be treated as a source, and the destination must be dropped.
-        text = "copy --chown=1000:1000 agent.py \\\n     phone.py ./\n"
+        text = "FROM python:3.12-slim\ncopy --chown=1000:1000 agent.py \\\n     phone.py ./\n"
         self.assertEqual(sorted(dic.copy_sources(text)), ["agent.py", "phone.py"])
         # A `--from=` stage copy is ignored.
-        self.assertEqual(dic.copy_sources("COPY --from=builder /opt/venv /opt/venv\n"), [])
+        self.assertEqual(
+            dic.copy_sources("FROM python:3.12-slim\nCOPY --from=builder /opt/venv /opt/venv\n"), []
+        )
+
+    def test_instructions_before_the_first_from_belong_to_no_stage(self) -> None:
+        # Docker rejects a COPY that precedes every FROM, so such a line cannot
+        # put anything in an image. Pinned so the boundary is a decision rather
+        # than an accident of the parser.
+        self.assertEqual(dic.copy_sources("COPY agent.py ./\n"), [])
+        self.assertEqual(dic.parse_stages("COPY agent.py ./\n"), [])
+        # And a stage's WORKDIR/ENTRYPOINT do not leak across FROM.
+        stages = dic.parse_stages(
+            "FROM base AS a\nWORKDIR /build\nENTRYPOINT [\"python\", \"a.py\"]\n"
+            "FROM base AS b\nCOPY agent.py ./\n"
+        )
+        self.assertEqual(len(stages), 2)
+        self.assertEqual(stages[0]["workdir"], "/build")
+        self.assertIsNone(stages[1]["workdir"])
+        self.assertIsNone(stages[1]["entrypoint"])
 
     def test_secret_on_continuation_line_is_caught(self) -> None:
         # The exact false-green the review flagged: a secret hidden on a COPY
         # continuation line must not slip past the source parser + detector.
-        srcs = dic.copy_sources("COPY agent.py \\\n     id_rsa ./\n")
+        srcs = dic.copy_sources("FROM python:3.12-slim\nCOPY agent.py \\\n     id_rsa ./\n")
         self.assertIn("id_rsa", srcs)
         self.assertTrue(any(dic.is_forbidden(os.path.basename(s)) for s in srcs))
         for name in ("service-account.json", ".netrc", "app.key", "my_secret.txt"):
@@ -183,6 +223,15 @@ class DockerPackagingTest(unittest.TestCase):
         self.assertFalse(dic.resolves_under_app("/app/sub/", "/app"))
         self.assertFalse(dic.resolves_under_app("./", "/srv"))
         self.assertFalse(dic.resolves_under_app("./", None))
+        # A single source copied to an explicitly named destination file is a
+        # valid Docker shape: its PARENT is what must be /app.
+        self.assertTrue(dic.resolves_under_app("/app/agent.py", "/app", ["agent.py"]))
+        self.assertTrue(dic.resolves_under_app("/app/agent.py", None, ["agent.py"]))
+        self.assertFalse(dic.resolves_under_app("/srv/agent.py", "/app", ["agent.py"]))
+        # ...and it stays a directory rule for multi-source and trailing-slash
+        # forms, so the relaxation cannot be used to smuggle a bad destination.
+        self.assertFalse(dic.resolves_under_app("/app/agent.py", "/app", ["agent.py", "helper.py"]))
+        self.assertFalse(dic.resolves_under_app("/app/sub/", "/app", ["agent.py"]))
 
     def test_mutated_destination_goes_red_end_to_end(self) -> None:
         # The reviewed false-green: every module COPY'd, none importable.
@@ -196,6 +245,18 @@ class DockerPackagingTest(unittest.TestCase):
             self.assertEqual(result["missing"], [])  # the modules DO ship...
             self.assertTrue(result["bad_dest"], "wrong destination must be reported")
             self.assertIn("/elsewhere/", result["bad_dest"][0])
+        # A single-source COPY naming the destination file is accepted.
+        with tempfile.TemporaryDirectory() as fixture:
+            _write_fixture(fixture, {
+                "Dockerfile": _fixture_dockerfile(
+                    "COPY agent.py /app/agent.py\nCOPY helper.py /app/helper.py"
+                ),
+                "agent.py": "import helper\n",
+                "helper.py": "X = 1\n",
+            })
+            result = dic.analyze(fixture)
+            self.assertEqual(result["bad_dest"], [])
+            self.assertEqual(result["missing"], [])
         # Positive control on the same fixture shape: /app is accepted.
         with tempfile.TemporaryDirectory() as fixture:
             _write_fixture(fixture, {
@@ -254,20 +315,123 @@ class DockerPackagingTest(unittest.TestCase):
         }
         for expected, text in cases.items():
             with self.subTest(expected):
-                root, error = dic.entrypoint_root(text, local)
+                root, script, error = dic.entrypoint_root(text, local)
                 self.assertIsNone(root)
+                self.assertIsNone(script)
                 self.assertIsNotNone(error)
                 self.assertTrue(error.startswith(expected), error)
-        # An ambiguous two-script entrypoint is also unusable.
-        root, error = dic.entrypoint_root(
-            _fixture_dockerfile("COPY agent.py ./", entrypoint='ENTRYPOINT ["python", "a.py", "b.py"]'),
-            local,
-        )
-        self.assertIsNone(root)
-        self.assertTrue(error.startswith("ENTRYPOINT_NOT_PYTHON"), error)
         # Positive control: the good shape still resolves.
-        root, error = dic.entrypoint_root(_fixture_dockerfile("COPY agent.py ./"), local)
-        self.assertEqual((root, error), ("agent", None))
+        root, script, error = dic.entrypoint_root(_fixture_dockerfile("COPY agent.py ./"), local)
+        self.assertEqual((root, script, error), ("agent", "agent.py", None))
+
+    def test_failure_codes_name_the_actual_cause(self) -> None:
+        # A code that misnames the cause is a false explanation in a CI log:
+        # `python -m agent` has NO script and two .py args are AMBIGUOUS —
+        # neither is "the interpreter is not python".
+        local = {"agent": "agent.py", "helper": "helper.py"}
+        for entrypoint, expected in (
+            ('ENTRYPOINT ["python", "-m", "agent"]', "ENTRYPOINT_NO_SCRIPT"),
+            ('ENTRYPOINT ["python", "agent.py", "helper.py"]', "ENTRYPOINT_AMBIGUOUS"),
+            ('ENTRYPOINT ["/bin/sh", "-c", "start"]', "ENTRYPOINT_NOT_PYTHON"),
+        ):
+            with self.subTest(expected):
+                _root, _script, error = dic.entrypoint_root(
+                    _fixture_dockerfile("COPY agent.py ./", entrypoint=entrypoint), local
+                )
+                self.assertTrue(error.startswith(expected), error)
+
+    def test_entrypoint_is_scoped_to_the_final_stage(self) -> None:
+        # FROM resets ENTRYPOINT: an entrypoint declared only in the builder is
+        # not what the image runs, so it must not root the closure.
+        local = {"agent": "agent.py"}
+        text = _fixture_dockerfile(
+            "COPY agent.py ./",
+            entrypoint=None,
+            builder_entrypoint='ENTRYPOINT ["python", "agent.py", "start"]',
+        )
+        root, _script, error = dic.entrypoint_root(text, local)
+        self.assertIsNone(root)
+        self.assertTrue(error.startswith("ENTRYPOINT_MISSING"), error)
+
+    # ── the interpreter must start where the modules landed (M-1) ─────────
+    def test_final_workdir_moved_after_the_copy_goes_red(self) -> None:
+        # Every module lands in /app, every other rule is green, and the
+        # container still dies with `can't open file '/srv/agent.py'`.
+        with tempfile.TemporaryDirectory() as fixture:
+            _write_fixture(fixture, {
+                "Dockerfile": _fixture_dockerfile("COPY agent.py helper.py ./", workdir_after_copy="/srv"),
+                "agent.py": "import helper\n",
+                "helper.py": "X = 1\n",
+            })
+            result = dic.analyze(fixture)
+            self.assertEqual(result["missing"], [])
+            self.assertEqual(result["bad_dest"], [])       # the destination IS /app...
+            self.assertEqual(result["final_workdir"], "/srv")
+            self.assertTrue(result["bad_workdir"], "moved final WORKDIR must be reported")
+            self.assertIn("/srv/agent.py", result["bad_workdir"][0])
+
+    def test_workdir_subdirectory_with_parent_destination_goes_red(self) -> None:
+        # The same hole from the other side: destination /app, cwd /app/x.
+        with tempfile.TemporaryDirectory() as fixture:
+            _write_fixture(fixture, {
+                "Dockerfile": _fixture_dockerfile("COPY agent.py helper.py ../", workdir="/app/x"),
+                "agent.py": "import helper\n",
+                "helper.py": "X = 1\n",
+            })
+            result = dic.analyze(fixture)
+            self.assertEqual(result["bad_dest"], [])
+            self.assertTrue(result["bad_workdir"])
+            self.assertIn("/app/x/agent.py", result["bad_workdir"][0])
+
+    def test_entrypoint_start_path_resolution(self) -> None:
+        self.assertEqual(dic.entrypoint_start_path("agent.py", "/app"), "/app/agent.py")
+        self.assertEqual(dic.entrypoint_start_path("agent.py", "/srv"), "/srv/agent.py")
+        self.assertEqual(dic.entrypoint_start_path("/app/agent.py", None), "/app/agent.py")
+        self.assertEqual(dic.entrypoint_start_path("/opt/agent.py", "/app"), "/opt/agent.py")
+        # A relative script with no declared WORKDIR is not statically knowable.
+        self.assertIsNone(dic.entrypoint_start_path("agent.py", None))
+
+    def test_absolute_entrypoint_outside_app_goes_red(self) -> None:
+        with tempfile.TemporaryDirectory() as fixture:
+            _write_fixture(fixture, {
+                "Dockerfile": _fixture_dockerfile(
+                    "COPY agent.py helper.py ./",
+                    entrypoint='ENTRYPOINT ["python", "/opt/agent.py", "start"]',
+                ),
+                "agent.py": "import helper\n",
+                "helper.py": "X = 1\n",
+            })
+            result = dic.analyze(fixture)
+            self.assertTrue(result["bad_workdir"])
+            self.assertIn("/opt/agent.py", result["bad_workdir"][0])
+        # Positive control: the absolute /app form is accepted.
+        with tempfile.TemporaryDirectory() as fixture:
+            _write_fixture(fixture, {
+                "Dockerfile": _fixture_dockerfile(
+                    "COPY agent.py helper.py ./",
+                    entrypoint='ENTRYPOINT ["python", "/app/agent.py", "start"]',
+                ),
+                "agent.py": "import helper\n",
+                "helper.py": "X = 1\n",
+            })
+            self.assertEqual(dic.analyze(fixture)["bad_workdir"], [])
+
+    def test_builder_stage_copy_does_not_cover_the_closure(self) -> None:
+        # A module COPY'd only into the builder never reaches the image.
+        with tempfile.TemporaryDirectory() as fixture:
+            _write_fixture(fixture, {
+                "Dockerfile":
+                    "FROM python:3.12-slim AS builder\n"
+                    "RUN pip install --no-cache-dir -r requirements.txt\n"
+                    "COPY helper.py ./\n"
+                    "FROM python:3.12-slim AS runtime\n"
+                    "WORKDIR /app\nUSER 1000:1000\n"
+                    "COPY agent.py ./\n"
+                    'ENTRYPOINT ["python", "agent.py", "start"]\n',
+                "agent.py": "import helper\n",
+                "helper.py": "X = 1\n",
+            })
+            self.assertEqual(dic.analyze(fixture)["missing"], ["helper.py"])
 
 
 if __name__ == "__main__":

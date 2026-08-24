@@ -4,21 +4,29 @@
 Single source of truth for the rule that stops PR102 recurring: the runtime
 image must contain the EXACT transitive first-party import closure of the
 Python file the container actually starts, copied to a destination that
-resolves under the runtime WORKDIR, and nothing secret.
+resolves under the runtime WORKDIR, reachable from the directory the
+interpreter actually starts in, and nothing secret.
 
-Four independent findings are produced from one parse:
+Findings, all produced from one parse of the FINAL build stage (the stage that
+becomes the image; `FROM` resets WORKDIR and ENTRYPOINT exactly as Docker does):
 
-  ENTRYPOINT_*   the closure root is derived from the Dockerfile's JSON
+  ENTRYPOINT_*   the closure root is derived from the final stage's JSON
                  ``ENTRYPOINT`` — not hardcoded. Absent, shell-form,
-                 malformed, non-Python, ambiguous or not-first-party all fail
-                 closed, because a root that cannot be established means the
-                 closure below proves nothing.
+                 malformed, non-Python, script-less, ambiguous or
+                 not-first-party all fail closed, because a root that cannot
+                 be established means the closure below proves nothing.
   MISSING_COPY   a first-party module the entrypoint transitively imports is
-                 not COPY'd into the image (`ModuleNotFoundError` at startup).
+                 not COPY'd into the final stage (`ModuleNotFoundError` at
+                 startup).
   BAD_COPY_DEST  a first-party module IS COPY'd, but to a destination that
-                 does not resolve to the runtime WORKDIR /app — the modules
-                 land outside the interpreter's search path and the container
-                 dies with the same `ModuleNotFoundError` class.
+                 does not resolve to /app — the modules land outside the
+                 interpreter's search path and the container dies with the
+                 same `ModuleNotFoundError` class.
+  BAD_WORKDIR    the modules land in /app, but the EFFECTIVE final WORKDIR is
+                 not /app, so a relative ENTRYPOINT script is resolved against
+                 the wrong directory: `python: can't open file '/srv/agent.py'`.
+                 Landing the files correctly and starting the interpreter
+                 somewhere else is the same outage wearing a different message.
   FORBIDDEN_COPY a secret/env file is COPY'd into the image.
 
 Used by scripts/validate-container.sh (CI) and by
@@ -37,7 +45,8 @@ import posixpath
 import re
 import sys
 
-#: The runtime working directory every worker source must resolve under.
+#: The runtime working directory every worker source must resolve under, and
+#: the directory the interpreter must start in.
 APP_DIR = "/app"
 
 SECRET_NAMES = {
@@ -123,18 +132,23 @@ def _join_continuations(text: str) -> str:
     return re.sub(r"\\\s*\n", " ", text)
 
 
-def copy_entries(dockerfile_text: str) -> list:
-    """``(sources, destination, workdir)`` for every first-party ``COPY``.
+def parse_stages(dockerfile_text: str) -> list:
+    """Split a Dockerfile into build stages.
 
-    Robust to real Dockerfile shapes: backslash line-continuations are joined
-    first, the keyword is matched case-insensitively (Docker is), ``--from=``
-    stage copies are skipped, and leading ``--chown=``/``--chmod=``/``--link``
-    flag tokens are dropped rather than mistaken for sources. ``workdir`` is
-    the WORKDIR in force at that instruction (``None`` if never set in the
-    current stage), so a relative destination can be resolved.
+    Each stage is ``{"workdir": <effective WORKDIR at the end of the stage>,
+    "entrypoint": <raw text after the last ENTRYPOINT keyword, or None>,
+    "copies": [(sources, destination, workdir_in_force)]}``.
+
+    `FROM` starts a stage and resets BOTH `WORKDIR` and `ENTRYPOINT`, which is
+    what Docker does: the final image inherits its own base image's entrypoint,
+    never an earlier stage's. Parsing is robust to real Dockerfile shapes —
+    backslash line-continuations are joined first, keywords are matched
+    case-insensitively (Docker is), `--from=` stage copies are skipped, and
+    leading `--chown=`/`--chmod=`/`--link` flag tokens are dropped rather than
+    mistaken for sources.
     """
-    entries = []
-    workdir = None
+    stages: list = []
+    current = None
     for raw in _join_continuations(dockerfile_text).splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -142,23 +156,32 @@ def copy_entries(dockerfile_text: str) -> list:
         toks = line.split()
         keyword = toks[0].lower()
         if keyword == "from":
-            workdir = None  # a new stage starts with no WORKDIR of its own
+            current = {"workdir": None, "entrypoint": None, "copies": []}
+            stages.append(current)
             continue
+        if current is None:
+            continue  # ARG/comment before the first FROM: belongs to no stage
         if keyword == "workdir" and len(toks) >= 2:
             target = toks[1]
-            workdir = target if target.startswith("/") else posixpath.normpath(
-                posixpath.join(workdir or "/", target)
+            current["workdir"] = target if target.startswith("/") else posixpath.normpath(
+                posixpath.join(current["workdir"] or "/", target)
             )
-            continue
-        if keyword != "copy":
-            continue
-        rest = toks[1:]
-        if any(t.startswith("--from=") for t in rest):
-            continue
-        rest = [t for t in rest if not t.startswith("--")]
-        if len(rest) >= 2:
-            entries.append((rest[:-1], rest[-1], workdir))
-    return entries
+        elif keyword == "entrypoint":
+            current["entrypoint"] = line[len(toks[0]):].strip()  # last in the stage wins
+        elif keyword == "copy":
+            rest = toks[1:]
+            if any(t.startswith("--from=") for t in rest):
+                continue
+            rest = [t for t in rest if not t.startswith("--")]  # drop flags
+            if len(rest) >= 2:
+                current["copies"].append((rest[:-1], rest[-1], current["workdir"]))
+    return stages
+
+
+def copy_entries(dockerfile_text: str) -> list:
+    """``(sources, destination, workdir)`` for every first-party ``COPY`` in
+    the file, in order, across all stages."""
+    return [entry for stage in parse_stages(dockerfile_text) for entry in stage["copies"]]
 
 
 def copy_sources(dockerfile_text: str) -> list:
@@ -166,58 +189,82 @@ def copy_sources(dockerfile_text: str) -> list:
     return [src for srcs, _dest, _wd in copy_entries(dockerfile_text) for src in srcs]
 
 
-def resolves_under_app(dest: str, workdir) -> bool:
+def resolves_under_app(dest: str, workdir, sources=None) -> bool:
     """True iff ``dest`` lands exactly in ``/app`` inside the image.
 
     Accepts an absolute ``/app`` / ``/app/`` and a relative ``./`` / ``.``
     under ``WORKDIR /app``. A relative destination with no WORKDIR in force
     cannot be resolved, so it fails closed.
+
+    ``sources`` enables the single-file form Docker also accepts:
+    ``COPY agent.py /app/agent.py`` names the destination FILE, not a
+    directory, so the parent is what must be ``/app``.
     """
     target = dest
     if not target.startswith("/"):
         if not workdir:
             return False
         target = posixpath.join(workdir, target)
-    return posixpath.normpath(target) == APP_DIR
+    normalized = posixpath.normpath(target)
+    if normalized == APP_DIR:
+        return True
+    # Single source copied to an explicitly named destination file/dir of the
+    # same basename: resolve its parent instead.
+    if sources and len(sources) == 1 and not dest.endswith("/"):
+        if posixpath.basename(normalized) == posixpath.basename(sources[0].rstrip("/")):
+            return posixpath.dirname(normalized) == APP_DIR
+    return False
 
 
 def entrypoint_root(dockerfile_text: str, local: dict):
-    """Derive the Python closure root from the Dockerfile ``ENTRYPOINT``.
+    """Derive the Python closure root from the FINAL stage's ``ENTRYPOINT``.
 
-    Returns ``(module, error)``; exactly one is non-None. The root is what the
-    container actually executes, so hardcoding it would let a legitimate
-    entrypoint rename silently re-root (or skip) the closure check.
+    Returns ``(module, script, error)``; on failure ``module``/``script`` are
+    None. The root is what the built image actually executes, so hardcoding it
+    would let a legitimate entrypoint rename silently re-root (or skip) the
+    closure check, and reading an earlier stage's ENTRYPOINT would root it at
+    something the image does not run at all.
     """
-    line = None
-    for raw in _join_continuations(dockerfile_text).splitlines():
-        stripped = raw.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        toks = stripped.split()
-        if toks[0].lower() == "entrypoint":
-            line = stripped[len(toks[0]):].strip()  # last ENTRYPOINT wins, as in Docker
+    stages = parse_stages(dockerfile_text)
+    line = stages[-1]["entrypoint"] if stages else None
     if line is None:
-        return None, "ENTRYPOINT_MISSING no ENTRYPOINT instruction to root the import closure at"
+        return None, None, "ENTRYPOINT_MISSING the final build stage declares no ENTRYPOINT to root the import closure at"
     if not line.startswith("["):
-        return None, "ENTRYPOINT_NOT_EXEC_FORM shell-form ENTRYPOINT cannot be parsed: %s" % line
+        return None, None, "ENTRYPOINT_NOT_EXEC_FORM shell-form ENTRYPOINT cannot be parsed: %s" % line
     try:
         argv = json.loads(line)
     except ValueError as exc:
-        return None, "ENTRYPOINT_UNPARSEABLE %s (%s)" % (line, exc)
+        return None, None, "ENTRYPOINT_UNPARSEABLE %s (%s)" % (line, exc)
     if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
-        return None, "ENTRYPOINT_UNPARSEABLE not a non-empty JSON array of strings: %s" % line
+        return None, None, "ENTRYPOINT_UNPARSEABLE not a non-empty JSON array of strings: %s" % line
     if not posixpath.basename(argv[0]).startswith("python"):
-        return None, "ENTRYPOINT_NOT_PYTHON interpreter is %r, not python" % argv[0]
+        return None, None, "ENTRYPOINT_NOT_PYTHON interpreter is %r, not python" % argv[0]
     scripts = [a for a in argv[1:] if a.endswith(".py")]
-    if len(scripts) != 1:
-        return None, "ENTRYPOINT_NOT_PYTHON expected exactly one .py argument, found %d in %s" % (
+    if not scripts:
+        return None, None, "ENTRYPOINT_NO_SCRIPT no .py script argument to root the closure at: %s" % line
+    if len(scripts) > 1:
+        return None, None, "ENTRYPOINT_AMBIGUOUS %d .py arguments, cannot tell which one starts the worker: %s" % (
             len(scripts), line,
         )
-    name = posixpath.basename(scripts[0])
+    script = scripts[0]
+    name = posixpath.basename(script)
     module = name[:-3]
     if local.get(module) != name:
-        return None, "ENTRYPOINT_NOT_FIRST_PARTY %s is not a first-party module in the build context" % scripts[0]
-    return module, None
+        return None, None, "ENTRYPOINT_NOT_FIRST_PARTY %s is not a first-party module in the build context" % script
+    return module, script, None
+
+
+def entrypoint_start_path(script: str, final_workdir):
+    """Absolute path the interpreter will try to open, or None if unresolvable.
+
+    A relative ENTRYPOINT script is resolved against the container's cwd — the
+    EFFECTIVE final WORKDIR — not against wherever the COPY happened to land.
+    """
+    if script.startswith("/"):
+        return posixpath.normpath(script)
+    if not final_workdir:
+        return None
+    return posixpath.normpath(posixpath.join(final_workdir, script))
 
 
 def is_forbidden(basename: str) -> bool:
@@ -237,31 +284,39 @@ def analyze(ctx: str) -> dict:
     with open(os.path.join(ctx, "Dockerfile"), encoding="utf-8") as handle:
         dockerfile = handle.read()
     local = local_modules(ctx)
+    stages = parse_stages(dockerfile)
+    final = stages[-1] if stages else {"workdir": None, "entrypoint": None, "copies": []}
 
-    entry, entry_error = entrypoint_root(dockerfile, local)
+    entry, script, entry_error = entrypoint_root(dockerfile, local)
     result = {
         "entry": entry,
+        "entry_script": script,
         "entry_error": entry_error,
+        "final_workdir": final["workdir"],
         "closure": set(),
         "missing": [],
         "bad_dest": [],
+        "bad_workdir": [],
         "forbidden": [],
     }
 
-    entries = copy_entries(dockerfile)
-    copy_srcs = [src for srcs, _d, _w in entries for src in srcs]
-    copy_set = {t.rstrip("/") for t in copy_srcs}
+    # Only the FINAL stage's COPYs put files in the image. A first-party module
+    # copied solely into the builder stage never reaches the runtime image, so
+    # counting it as covered would be a fail-open.
+    final_copies = final["copies"]
+    copy_set = {t.rstrip("/") for srcs, _d, _w in final_copies for t in srcs}
     first_party_files = {name.rstrip("/") for name in local.values()}
 
-    # FORBIDDEN and BAD_COPY_DEST do not depend on the closure root, so they are
-    # still reported when the entrypoint itself is unusable.
-    for src in copy_srcs:
-        if is_forbidden(os.path.basename(src.rstrip("/"))):
-            result["forbidden"].append(src)
-    for srcs, dest, workdir in entries:
+    # FORBIDDEN is scanned across every stage (defence in depth: a secret must
+    # not enter any layer). BAD_COPY_DEST is a property of the final stage.
+    for srcs, _dest, _wd in copy_entries(dockerfile):
+        for src in srcs:
+            if is_forbidden(os.path.basename(src.rstrip("/"))):
+                result["forbidden"].append(src)
+    for srcs, dest, workdir in final_copies:
         if not any(s.rstrip("/") in first_party_files for s in srcs):
-            continue  # not a worker-source COPY (e.g. requirements.txt in the builder)
-        if not resolves_under_app(dest, workdir):
+            continue  # not a worker-source COPY (e.g. requirements.txt)
+        if not resolves_under_app(dest, workdir, srcs):
             result["bad_dest"].append(
                 "%s -> %s (WORKDIR %s)" % (",".join(srcs), dest, workdir or "unset")
             )
@@ -272,6 +327,25 @@ def analyze(ctx: str) -> dict:
         result["missing"] = sorted(
             local[m].rstrip("/") for m in closure if local[m].rstrip("/") not in copy_set
         )
+        # Where does the interpreter actually start, and is the entrypoint
+        # script there? Files in the right place plus a cwd in the wrong place
+        # is still a startup crash-loop.
+        start = entrypoint_start_path(script, final["workdir"])
+        expected = posixpath.join(APP_DIR, local[entry])
+        if start is None:
+            # The base image's own WORKDIR is not knowable from this file, so
+            # a relative script with no declared WORKDIR is refused rather than
+            # guessed. (For python:3.12-slim the cwd would be `/`, and the
+            # container would die with `can't open file '/<script>'`.)
+            result["bad_workdir"].append(
+                "relative ENTRYPOINT script %s with no WORKDIR declared in the final stage; "
+                "the start directory is not statically knowable" % script
+            )
+        elif start != expected:
+            result["bad_workdir"].append(
+                "ENTRYPOINT starts %s (final WORKDIR %s), expected %s"
+                % (start, final["workdir"] or "unset", expected)
+            )
     return result
 
 
@@ -290,16 +364,23 @@ def main(argv: list) -> int:
         print(result["entry_error"])
     else:
         print("ENTRYPOINT_ROOT " + result["entry"])
+        print("FINAL_WORKDIR " + (result["final_workdir"] or "unset"))
         print("CLOSURE " + ",".join(sorted(result["closure"])))
     if result["missing"]:
         print("MISSING_COPY " + ",".join(result["missing"]))
     if result["bad_dest"]:
         print("BAD_COPY_DEST " + "; ".join(result["bad_dest"]))
+    if result["bad_workdir"]:
+        print("BAD_WORKDIR " + "; ".join(result["bad_workdir"]))
     if result["forbidden"]:
         print("FORBIDDEN_COPY " + ",".join(sorted(set(result["forbidden"]))))
 
     failed = bool(
-        result["entry_error"] or result["missing"] or result["bad_dest"] or result["forbidden"]
+        result["entry_error"]
+        or result["missing"]
+        or result["bad_dest"]
+        or result["bad_workdir"]
+        or result["forbidden"]
     )
     return 1 if failed else 0
 

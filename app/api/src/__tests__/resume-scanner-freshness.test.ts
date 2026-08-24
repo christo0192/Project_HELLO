@@ -522,6 +522,16 @@ describe('ClamAvScanner signature gating', () => {
     // directory other vitest workers are concurrently writing to.
     await withPrivateTmpRoot(async (root) => {
       expect(await scratchDirs(root)).toEqual([]);
+      // Own positive control: an absolute-emptiness assertion is only worth
+      // anything if the scanner really scratches in THIS root. Without it the
+      // test would stay green even if the scanner escaped the namespace.
+      const marker = join(root, 'scratch-parent');
+      const { bin: recorder, cleanup } = await stubScanner(`dirname "$4" > "${marker}"\nexit 0`);
+      try {
+        await new ClamAvScanner(recorder, 30_000, fresh).scan(Buffer.from('bytes to scan'));
+        expect(dirname(readFileSync(marker, 'utf8').trim())).toBe(root);
+      } finally { await cleanup(); }
+
       for (const bin of ['true', 'false', 'binary-that-does-not-exist']) {
         await new ClamAvScanner(bin, 30_000, fresh).scan(Buffer.from('bytes to scan'));
       }
@@ -538,15 +548,18 @@ describe('ClamAvScanner signature gating', () => {
       const spool = await mkdtemp(join(tmpdir(), 'scan-spool-'));
       const link = join(spool, 'linked.bin');
       const secret = 'SENSITIVE-RESUME-BYTES';
+      const parent = join(spool, 'scratch-parent');
       const { bin, cleanup } = await stubScanner(
-        `cp "$4" "${join(spool, 'copy.bin')}"\nln "$4" "${link}"\nexit 0`,
+        `cp "$4" "${join(spool, 'copy.bin')}"\nln "$4" "${link}"\ndirname "$4" > "${parent}"\nexit 0`,
       );
       try {
         const result = await new ClamAvScanner(bin, 30_000, fresh).scan(Buffer.from(secret, 'utf-8'));
         expect(result).toMatchObject({ safe: true, status: 'clean' });
 
-        // clamscan really saw the bytes...
+        // clamscan really saw the bytes, and scratched inside THIS root — the
+        // positive control that keeps the emptiness assertion below non-vacuous.
         expect(readFileSync(join(spool, 'copy.bin'), 'utf8')).toBe(secret);
+        expect(dirname(readFileSync(parent, 'utf8').trim())).toBe(root);
         // ...and the scratch inode no longer holds them.
         const wiped = readFileSync(link);
         expect(wiped.length).toBe(secret.length);

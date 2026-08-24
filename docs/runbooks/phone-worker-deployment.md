@@ -266,8 +266,20 @@ both closed in the follow-up branch:
   that no longer starts the worker. The root is now derived from the
   Dockerfile's JSON `ENTRYPOINT`, and an absent, shell-form, malformed,
   non-Python, ambiguous or non-first-party entrypoint fails closed.
-Both rules live in `scripts/docker_import_closure.py`, the single analyzer that
-`scripts/validate-container.sh` (CI) and the Python unit controls both run.
+A second independent review of that follow-up then found the destination rule
+itself still half-complete, closed in the same branch:
+- proving the files land in `/app` says nothing about where the **interpreter
+  starts**. `WORKDIR /srv` added after the COPY left every rule green while the
+  container died with `python: can't open file '/srv/agent.py'`. The analyzer
+  now derives the **effective final WORKDIR** and requires the entrypoint
+  script to resolve to the COPY'd first-party file under `/app`.
+- `ENTRYPOINT` and the closure-coverage COPY set are now scoped to the **final
+  build stage**, because `FROM` resets `ENTRYPOINT` and a module copied only
+  into the builder never reaches the image.
+
+All of these rules live in `scripts/docker_import_closure.py`, the single
+analyzer that `scripts/validate-container.sh` (CI) and the Python unit controls
+both run.
 
 The same review recorded that PR102's Quality run passed on **attempt 3** of an
 unchanged SHA; attempts 1 and 2 failed on the pre-existing
