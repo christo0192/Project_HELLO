@@ -237,6 +237,92 @@ await checkAsync("validate-container rejects non-== pins", async () => {
   });
 });
 
+// ── import→COPY closure validator (the PR102 defect class) ────────────────
+// A valid multi-stage Dockerfile parameterized only by its worker-source COPY
+// line, so these fixtures isolate the closure rule from every other contract.
+const closureDockerfile = (copyLine) =>
+  "FROM python:3.12-slim AS builder\n" +
+  "RUN pip install --no-cache-dir -r requirements.txt\n" +
+  "FROM python:3.12-slim AS runtime\n" +
+  "RUN groupadd --gid 1000 agent\nUSER 1000:1000\n" +
+  copyLine + "\n" +
+  'ENTRYPOINT ["python","agent.py","start"]\n';
+const closureBaseFiles = {
+  "requirements.txt": "livekit-agents==1.6.4\n",
+  ".dockerignore": ".env\n.env.*\n.git\ntests\n.venv\n__pycache__\nDockerfile\n",
+  "docker-compose.yml": 'services:\n  x:\n    user: "1000:1000"\n',
+};
+
+await checkAsync("validate-container passes when COPY covers the import closure (non-vacuity: green side)", async () => {
+  await withFixture({
+    ...closureBaseFiles,
+    "Dockerfile": closureDockerfile("COPY agent.py helper.py ./"),
+    "agent.py": "import helper\n",
+    "helper.py": "X = 1\n",
+  }, async (fixture) => {
+    const result = spawnSync("bash", [CONTAINER_VALIDATOR, fixture], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.match(result.stdout, /import closure/);
+  });
+});
+
+await checkAsync("validate-container rejects a removed first-party COPY (the phone.py regression)", async () => {
+  await withFixture({
+    ...closureBaseFiles,
+    // agent.py imports helper, but the COPY omits helper.py — exactly the
+    // shape of `import phone` shipping without phone.py.
+    "Dockerfile": closureDockerfile("COPY agent.py ./"),
+    "agent.py": "import helper\n",
+    "helper.py": "X = 1\n",
+  }, async (fixture) => {
+    const result = spawnSync("bash", [CONTAINER_VALIDATOR, fixture], { encoding: "utf8" });
+    assert.notEqual(result.status, 0, `missing-COPY fixture must fail (got ${result.status})`);
+    assert.match(result.stdout, /MISSING_COPY helper\.py/);
+  });
+});
+
+await checkAsync("validate-container rejects a new local import with no matching COPY", async () => {
+  await withFixture({
+    ...closureBaseFiles,
+    "Dockerfile": closureDockerfile("COPY agent.py helper.py ./"),
+    // A second local import (extra) is added but never COPY'd.
+    "agent.py": "import helper\nimport extra\n",
+    "helper.py": "X = 1\n",
+    "extra.py": "Y = 2\n",
+  }, async (fixture) => {
+    const result = spawnSync("bash", [CONTAINER_VALIDATOR, fixture], { encoding: "utf8" });
+    assert.notEqual(result.status, 0, `new-import fixture must fail (got ${result.status})`);
+    assert.match(result.stdout, /MISSING_COPY extra\.py/);
+  });
+});
+
+await checkAsync("validate-container rejects a COPY'd secret/env file", async () => {
+  await withFixture({
+    ...closureBaseFiles,
+    "Dockerfile": closureDockerfile("COPY agent.py .env ./"),
+    "agent.py": "X = 1\n",
+    ".env": "LIVEKIT_API_SECRET=replace_me\n",
+  }, async (fixture) => {
+    const result = spawnSync("bash", [CONTAINER_VALIDATOR, fixture], { encoding: "utf8" });
+    assert.notEqual(result.status, 0, `env-COPY fixture must fail (got ${result.status})`);
+    assert.match(result.stdout, /FORBIDDEN_COPY \.env/);
+  });
+});
+
+await checkAsync("validate-container catches a secret on a COPY continuation line", async () => {
+  // A backslash-continued COPY must not hide a secret from the parser.
+  await withFixture({
+    ...closureBaseFiles,
+    "Dockerfile": closureDockerfile("COPY agent.py \\\n     id_rsa ./"),
+    "agent.py": "X = 1\n",
+    "id_rsa": "-----BEGIN OPENSSH PRIVATE KEY-----\n",
+  }, async (fixture) => {
+    const result = spawnSync("bash", [CONTAINER_VALIDATOR, fixture], { encoding: "utf8" });
+    assert.notEqual(result.status, 0, `continuation-secret fixture must fail (got ${result.status})`);
+    assert.match(result.stdout, /FORBIDDEN_COPY id_rsa/);
+  });
+});
+
 // ── ADRs ──────────────────────────────────────────────────────────────────
 await checkAsync("ADR-0010 present and accepted with required sections", async () => {
   const adr = await read("docs/adr/0010-hosting-topology.md");
