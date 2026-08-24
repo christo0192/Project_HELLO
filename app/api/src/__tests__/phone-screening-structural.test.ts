@@ -353,6 +353,18 @@ describe('2. no provider, no dialing, no network, no Ashby mutation', () => {
       'lib/phone-runtime/due-loop.ts',
       'lib/phone-runtime/read.ts',
       'lib/phone-runtime/runtime.ts',
+      // PR105 — Canary-1's operator CLI. It imports the domain core for ONE
+      // reason: it builds a `PhoneScreeningConfig` IN PROCESS and calls
+      // `isDialAllowedForDigest` on it, so the real permission gate is on the
+      // real path. That is possible only because the gates are pure functions
+      // over injected data — which is exactly what lets Canary-1 obtain a live
+      // client while CHANGING NO ENVIRONMENT VARIABLE ANYWHERE, and therefore
+      // weakening nothing that protects a real candidate.
+      //
+      // `originate.ts` is the only file in that package that touches the core.
+      // The other ten do not, and this set is a BIJECTION, so listing one that
+      // does not import would fail as loudly as omitting one that does.
+      'lib/phone-canary1/originate.ts',
     ]);
     const seen = new Set<string>();
     for (const file of allSourceFiles(SRC_DIR)) {

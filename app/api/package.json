@@ -18,6 +18,7 @@
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "canary:phone": "node ../../scripts/phone-canary/canary0.mjs",
+    "canary:phone1": "tsx scripts/phone-canary1.ts",
     "canary:phone:offline": "node ../../scripts/phone-canary/canary0.test.mjs",
     "halt:drill": "node ../../scripts/phone-canary/halt-drill.mjs"
   },

@@ -65,13 +65,16 @@ COPY --from=builder /opt/venv /opt/venv
 # (`python: can't open file '/srv/agent.py'`). phone.py was added in P4a
 # (`import phone` in agent.py) and MUST ship, or the worker dies at startup
 # with `ModuleNotFoundError: No module named 'phone'`.
+# phone_canary.py was added the same way (`import phone_canary` in agent.py,
+# for the Canary-1 branch) and ships for the same reason: an armed worker that
+# cannot import it crash-loops at startup instead of refusing a dispatch.
 # Deliberately excluded (not on the runtime import path): voice_quality_harness.py,
 # model_governance/, tests/ — see .dockerignore.
 # Limitation: the static closure resolves absolute, relative, and literal-string
 # dynamic imports (importlib.import_module("x")/__import__("x")); a first-party
 # module pulled in only via a computed/non-literal import name cannot be seen
 # statically and must be added here by hand.
-COPY agent.py observability.py persistence.py phone.py prompting.py provenance.py provider_resilience.py ./
+COPY agent.py observability.py persistence.py phone.py phone_canary.py prompting.py provenance.py provider_resilience.py ./
 
 USER 1000:1000
 

@@ -22,6 +22,22 @@
 //     same kind of decorative evidence. What is enforced is that the two counts
 //     stay distinct and separately labelled, so a future editor cannot collapse
 //     them back into the single ambiguous number that produced L-1.
+//   * TWO-SIDED on the CANARY-1 count (PR105), and DELIBERATELY A DIFFERENT
+//     MEASUREMENT. Canary-1's suite is vitest under `app/api`, which needs an
+//     `npm ci` this step does not have — quality.yml runs this checker BEFORE
+//     the API install. So the count that can be verified here without lying
+//     about what was verified is the number of test CASES DECLARED across
+//     `app/api/src/__tests__/phone-canary1-*.test.ts`, computed from the
+//     sources. It is two-sided in exactly the same way: the ADR drifting and
+//     the suite growing both fail here.
+//
+//     It is WEAKER than the offline-gate check above, and the difference is
+//     named rather than blurred: this counts declarations, not passing
+//     assertions, and it does not run the suite. The runtime total is higher
+//     than the declared one because several cases are `it.each(...)` tables;
+//     pinning the runtime number would need the install, so the count that is
+//     pinned is the one this gate can actually derive. `npm test` in
+//     `app/api` is what proves they pass.
 //
 // Dependency-free; runs the offline gate in a subprocess (no DB, no network).
 
@@ -30,9 +46,12 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
+import { readdirSync } from "node:fs";
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const adrPath = path.join(root, "docs/adr/0013-phone-screening-runtime.md");
 const gatePath = path.join(root, "scripts/phone-canary/canary0.test.mjs");
+const canary1Dir = path.join(root, "app/api/src/__tests__");
 const adr = readFileSync(adrPath, "utf8");
 
 const failures = [];
@@ -80,6 +99,46 @@ if (offlineClaim && sqlClaim) {
     "ADR-0013 must say in words that the two counts are different measurements, not a typo to be reconciled");
 }
 
+// ── 5. Canary-1's declared test-case count, two-sided (PR105) ────────────
+// Counted from the sources rather than from a run, for the reason in the
+// header. The matcher is anchored to a statement start so an `it(` inside a
+// string or a comment cannot inflate it.
+const CANARY1_CASE_RE = /^\s*it(?:\.each\([\s\S]*?\))?\(/gm;
+let canary1Files = [];
+try {
+  canary1Files = readdirSync(canary1Dir)
+    .filter((f) => /^phone-canary1-.*\.test\.ts$/.test(f))
+    .sort();
+} catch {
+  canary1Files = [];
+}
+ok(canary1Files.length >= 6,
+  `expected the Canary-1 suite under app/api/src/__tests__ (found ${canary1Files.length} files) — `
+  + "a missing suite must fail here rather than silently agreeing with a stale ADR count");
+let actualCanary1 = 0;
+for (const name of canary1Files) {
+  actualCanary1 += (readFileSync(path.join(canary1Dir, name), "utf8").match(CANARY1_CASE_RE) || []).length;
+}
+ok(actualCanary1 > 0, "the Canary-1 suite declares no test cases");
+
+const canary1Claim = adr.match(/phone-canary1-\*\.test\.ts`\s*—\s*\*\*(\d+) declared test cases\*\*/);
+ok(canary1Claim !== null,
+  "ADR-0013 must state the Canary-1 count as `phone-canary1-*.test.ts` — **N declared test cases**");
+if (canary1Claim) {
+  ok(Number(canary1Claim[1]) === actualCanary1,
+    `ADR-0013 claims ${canary1Claim[1]} declared Canary-1 test cases; the suite declares ${actualCanary1}. `
+    + "Update the ADR (or the suite), not this check — the evidence numbers are the auditable claim.");
+  // The THIRD count must stay distinct from the other two, and must be
+  // labelled as a different measurement, for the same reason the first two do.
+  if (offlineClaim) {
+    ok(Number(canary1Claim[1]) !== Number(offlineClaim[1]),
+      "ADR-0013 states the same number for the Canary-0 offline assertions and the Canary-1 "
+      + "declared cases; they measure different things in different suites.");
+  }
+  ok(/declared test cases[\s\S]{0,1400}?not comparable/.test(adr),
+    "ADR-0013 must say in words that the Canary-1 count is not comparable to the Canary-0 counts");
+}
+
 if (failures.length) {
   console.error(`phone canary evidence-count agreement FAILED (${failures.length}):`);
   for (const f of failures) console.error(" - " + f);
@@ -87,5 +146,6 @@ if (failures.length) {
 }
 console.log(
   `phone canary evidence agreement OK (ADR-0013 offline=${actualOffline} matches the gate; `
-  + `live-database checks=${sqlClaim ? sqlClaim[1] : "?"} kept distinct).`,
+  + `live-database checks=${sqlClaim ? sqlClaim[1] : "?"} kept distinct; `
+  + `canary-1 declared cases=${actualCanary1} across ${canary1Files.length} files, kept distinct).`,
 );
