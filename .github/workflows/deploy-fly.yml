@@ -251,33 +251,52 @@ jobs:
         with:
           ref: ${{ needs.detect.outputs.sha }}
       - uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be # v1.5
-      - name: Deploy phone voice worker (stopped/min-0 ENFORCED)
+      - name: Deploy phone voice worker (stopped/min-0 ENFORCED pre+post; non-dispatchable)
         working-directory: app/voice-livekit
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_PHONE_VOICE }}
         run: |
           set -euo pipefail
-          # `flyctl deploy` builds the image and creates the release. On a fresh
-          # Machines app it may create+start one machine, which for a NAMED worker
-          # would come up live and register BEFORE the reviewed canary. So the
-          # stopped/min-0 posture is not left to a manual precondition: this job
-          # ENFORCES it by scaling the app to zero immediately after the release.
-          # No watermark is captured — a stopped app has no registration to gate,
-          # and capturing one unused would be a decorative artifact.
+          # M-1: bound the live window from BOTH sides.
+          #
+          # Scale to zero BEFORE the release, so a machine left running by a
+          # prior deploy or a manual action is not rolled live by this one, and
+          # again AFTER, so the release's own machine does not persist. `flyctl
+          # deploy` can still briefly create+start+register ONE machine between
+          # these two scales — that transient is unavoidable on a Machines app.
+          #
+          # It is NON-DISPATCHABLE by design, and that is the load-bearing
+          # guarantee, not the scale timing: pre-canary the API's
+          # PHONE_AGENT_NAME is EMPTY (the api_silent_pre_canary state that
+          # scripts/validate-voice-worker-apps.mjs enforces), so the API
+          # dispatches to no name and no room is ever routed to this worker. A
+          # briefly-live worker with nothing dispatching to it places no call.
+          #
+          # Making it live AND dispatchable is the canary's separate, reviewed
+          # workflow change (docs/runbooks/phone-worker-deployment.md §6): the
+          # SAME PR removes both scale-0 lines, adds a watermarked registration
+          # proof, and sets PHONE_AGENT_NAME on project-hello-api. An automatic
+          # shared-source deploy can therefore never make the phone app live and
+          # dispatchable on its own.
+          #
+          # No watermark is captured here — a stopped app has no registration to
+          # gate, and capturing one unused would be a decorative artifact.
+          flyctl scale count 0 -a project-hello-phone-voice --yes 2>/dev/null \
+            || echo "pre-release scale skipped (app not created yet); the post-release scale below is the binding guarantee"
           flyctl deploy --remote-only --config fly.phone.toml
-          # Pre-canary guarantee: the named phone worker runs NO machine. The
-          # canary (docs/runbooks/phone-worker-deployment.md §6) removes this line
-          # in a reviewed edit and scales to 1; until then every deploy re-asserts
-          # count 0, so a merge can never silently leave the phone worker live.
+          # Every deploy re-asserts count 0, so a merge can never silently leave
+          # the phone worker persistently live.
           flyctl scale count 0 -a project-hello-phone-voice --yes
       - name: Verify clean release (run policy STOPPED)
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_PHONE_VOICE }}
         run: |
           set -euo pipefail
-          # Policy-aware verification: this app is intentionally scaled to zero
-          # until the canary, so it is CORRECT for it to run no machine and
-          # register no worker. We prove the release landed on the RIGHT app and
+          # Policy-aware verification: this app is scaled to zero in steady
+          # state until the canary (a machine may be briefly live during the
+          # release itself — see the deploy step; it is non-dispatchable because
+          # the API name is empty pre-canary). It is CORRECT for it to run no
+          # machine and register no worker. We prove the release landed on the RIGHT app and
           # deliberately do NOT demand — nor accept — a live worker-registration
           # log line as evidence.
           # Flipping this app to always-on is a separate, reviewed canary action

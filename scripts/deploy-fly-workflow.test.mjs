@@ -124,6 +124,23 @@ ok(!/project-hello-phone-voice/.test(voice) && !/fly\.phone\.toml/.test(voice), 
 // must NOT demand or grep for a live registration line (no stale-log acceptance).
 ok(/fly\.phone\.toml/.test(phone), "deploy-phone-voice must deploy with fly.phone.toml");
 ok(/flyctl scale count 0 -a project-hello-phone-voice/.test(phone), "deploy-phone-voice must ENFORCE stopped/min-0 by scaling the app to count 0 (default-safe by code, not by manual precondition)");
+// M-1: the live window is bounded from BOTH sides — a scale-to-zero must run
+// BEFORE the release (not only after), so a machine left live by a prior state
+// is not rolled live by this deploy. Assert a scale-0 precedes the deploy AND a
+// scale-0 follows it.
+{
+  const preScale = phone.indexOf("flyctl scale count 0 -a project-hello-phone-voice");
+  const deployAt = phone.indexOf("flyctl deploy --remote-only --config fly.phone.toml");
+  const postScale = phone.lastIndexOf("flyctl scale count 0 -a project-hello-phone-voice");
+  ok(preScale !== -1 && deployAt !== -1 && preScale < deployAt,
+    "deploy-phone-voice must scale to count 0 BEFORE the release (M-1: bound the live window from both sides)");
+  ok(postScale > deployAt,
+    "deploy-phone-voice must scale to count 0 AFTER the release as well");
+}
+// M-1: the transient must be documented as non-dispatchable, tied to the empty
+// API name — the guarantee is the missing dispatch target, not the scale timing.
+ok(/non-dispatchable/i.test(phone) && /PHONE_AGENT_NAME/.test(phone),
+  "deploy-phone-voice must document the release transient as non-dispatchable while the API PHONE_AGENT_NAME is empty");
 ok(/status -a project-hello-phone-voice/.test(phone), "deploy-phone-voice must verify status on project-hello-phone-voice");
 ok(!/registered worker/.test(phone), "deploy-phone-voice (stopped policy) must NOT require or accept a 'registered worker' line");
 ok(!/project-hello-voice\b/.test(phone.replace(/project-hello-phone-voice/g, "")), "deploy-phone-voice must not target the browser app");
