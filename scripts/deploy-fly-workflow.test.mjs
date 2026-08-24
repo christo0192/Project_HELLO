@@ -30,8 +30,12 @@ function jobBlock(name) {
 const detect = jobBlock("detect");
 const migration = jobBlock("migrate-production");
 const api = jobBlock("deploy-api");
-const voice = jobBlock("deploy-voice");
-ok(detect && migration && api && voice, "expected detect, migrate-production, deploy-api, deploy-voice jobs to exist");
+const voice = jobBlock("deploy-browser-voice");
+const phone = jobBlock("deploy-phone-voice");
+ok(
+  detect && migration && api && voice && phone,
+  "expected detect, migrate-production, deploy-api, deploy-browser-voice, deploy-phone-voice jobs to exist",
+);
 
 // 1. main-success gating + failed-Quality → no deploy
 ok(/workflow_run\.conclusion == 'success'/.test(detect), "gate must require Quality conclusion == success (failed/cancelled must not deploy)");
@@ -44,33 +48,53 @@ ok(/types:\s*\[completed\]/.test(wf), "workflow_run must listen to completed");
 
 // 3. Path selection
 ok(/grep -qE '\^app\/api\//.test(detect), "detect must select the API service by app/api/ path");
-ok(/grep -qE '\^app\/voice-livekit\//.test(detect), "detect must select the voice service by app/voice-livekit/ path");
+ok(/grep -qE '\^app\/voice-livekit\//.test(detect), "detect must select the voice services by app/voice-livekit/ path");
 ok(/if:\s*needs\.detect\.outputs\.api == 'true'/.test(api), "deploy-api must gate on detect.outputs.api == true");
-ok(/if:\s*needs\.detect\.outputs\.voice == 'true'/.test(voice), "deploy-voice must gate on detect.outputs.voice == true");
+ok(/if:\s*needs\.detect\.outputs\.voice == 'true'/.test(voice), "deploy-browser-voice must gate on detect.outputs.voice == true");
+ok(/if:\s*needs\.detect\.outputs\.phone == 'true'/.test(phone), "deploy-phone-voice must gate on detect.outputs.phone == true");
 ok(/\^app\/supabase\/migrations\//.test(detect), "detect must select production migrations by app/supabase/migrations/ path");
 ok(/database=true/.test(detect), "application/manual deploys must request migration convergence");
 
+// 3b. Shared voice source deploys BOTH voice apps (browser + phone), and the
+// detect job declares both outputs.
+ok(/api:\s*\$\{\{\s*steps\.decide\.outputs\.api\s*\}\}/.test(detect), "detect must output api");
+ok(/voice:\s*\$\{\{\s*steps\.decide\.outputs\.voice\s*\}\}/.test(detect), "detect must output voice");
+ok(/phone:\s*\$\{\{\s*steps\.decide\.outputs\.phone\s*\}\}/.test(detect), "detect must output phone");
+// In the push path, a voice-livekit change sets BOTH voice=true and phone=true
+// in the same branch (shared source → both apps).
+ok(
+  /grep -qE '\^app\/voice-livekit\/';\s*then\s*\n\s*echo "voice=true"[\s\S]*?echo "phone=true"/.test(detect),
+  "a app/voice-livekit change must set BOTH voice=true and phone=true",
+);
+
 // 4. Database-before-application ordering and secret isolation
 ok(/needs:\s*\[detect, migrate-production\]/.test(api), "deploy-api must require successful production migrations");
-ok(/needs:\s*\[detect, migrate-production\]/.test(voice), "deploy-voice must require successful production migrations");
+ok(/needs:\s*\[detect, migrate-production\]/.test(voice), "deploy-browser-voice must require successful production migrations");
+ok(/needs:\s*\[detect, migrate-production\]/.test(phone), "deploy-phone-voice must require successful production migrations");
 ok(/if:\s*needs\.detect\.outputs\.database == 'true'/.test(migration), "migration job must gate on detect.outputs.database");
 ok(/secrets\.SUPABASE_DB_URL\b/.test(migration), "migration job must use SUPABASE_DB_URL");
 ok(/test -n "\$SUPABASE_DB_URL"/.test(migration), "migration job must fail closed when DB URL is absent");
 ok(/supabase@2\.110\.0 db push/.test(migration) && /--include-all/.test(migration), "migration job must run a pinned Supabase CLI db push");
-ok(!/SUPABASE_DB_URL/.test(api) && !/SUPABASE_DB_URL/.test(voice), "application jobs must not receive the database credential");
+ok(!/SUPABASE_DB_URL/.test(api) && !/SUPABASE_DB_URL/.test(voice) && !/SUPABASE_DB_URL/.test(phone), "application jobs must not receive the database credential");
 ok(/group:\s*supabase-production-migrations/.test(migration) && /cancel-in-progress:\s*false/.test(migration), "migrations must be globally serialized and never cancelled in flight");
 
-// 5. Per-service secret separation (the core hardening ask)
+// 5. Per-app secret separation across THREE tokens (the core hardening ask).
+//    Each app job may use ONLY its own token and no other.
 ok(/secrets\.FLY_API_TOKEN_API\b/.test(api), "deploy-api must use FLY_API_TOKEN_API");
-ok(!/FLY_API_TOKEN_VOICE/.test(api), "deploy-api must NOT reference the voice token");
-ok(/secrets\.FLY_API_TOKEN_VOICE\b/.test(voice), "deploy-voice must use FLY_API_TOKEN_VOICE");
-ok(!/FLY_API_TOKEN_API/.test(voice), "deploy-voice must NOT reference the api token");
+ok(!/FLY_API_TOKEN_VOICE/.test(api) && !/FLY_API_TOKEN_PHONE_VOICE/.test(api), "deploy-api must NOT reference any voice token");
+ok(/secrets\.FLY_API_TOKEN_VOICE\b/.test(voice), "deploy-browser-voice must use FLY_API_TOKEN_VOICE");
+ok(!/FLY_API_TOKEN_API/.test(voice) && !/FLY_API_TOKEN_PHONE_VOICE/.test(voice), "deploy-browser-voice must NOT reference the api or phone token");
+ok(/secrets\.FLY_API_TOKEN_PHONE_VOICE\b/.test(phone), "deploy-phone-voice must use FLY_API_TOKEN_PHONE_VOICE");
+ok(!/FLY_API_TOKEN_API/.test(phone) && !/FLY_API_TOKEN_VOICE\b/.test(phone), "deploy-phone-voice must NOT reference the api or the BROWSER voice token");
+// The phone token name contains the browser token name as a prefix-free suffix;
+// assert the browser job never grabs the phone token by loose matching.
 ok(!/secrets\.FLY_API_TOKEN\b(?!_)/.test(wf), "the single cross-app secrets.FLY_API_TOKEN must not be used anywhere");
 
-// 6. Concurrency: top-level + per-service groups, never cancel in-flight
+// 6. Concurrency: top-level + per-app groups, never cancel in-flight
 ok(/^concurrency:/m.test(wf), "must declare top-level concurrency");
 ok(/group:\s*fly-deploy-api/.test(api) && /cancel-in-progress:\s*false/.test(api), "deploy-api needs its own concurrency group with cancel-in-progress: false");
-ok(/group:\s*fly-deploy-voice/.test(voice) && /cancel-in-progress:\s*false/.test(voice), "deploy-voice needs its own concurrency group with cancel-in-progress: false");
+ok(/group:\s*fly-deploy-browser-voice/.test(voice) && /cancel-in-progress:\s*false/.test(voice), "deploy-browser-voice needs its own concurrency group with cancel-in-progress: false");
+ok(/group:\s*fly-deploy-phone-voice/.test(phone) && /cancel-in-progress:\s*false/.test(phone), "deploy-phone-voice needs its own concurrency group with cancel-in-progress: false");
 
 // 7. Immutable action pins — every `uses:` must be a full 40-hex commit SHA
 const uses = [...wf.matchAll(/uses:\s*(\S+)/g)].map((m) => m[1]);
@@ -81,23 +105,47 @@ for (const u of uses) {
 }
 ok(/superfly\/flyctl-actions\/setup-flyctl@[0-9a-f]{40}/.test(wf), "setup-flyctl must be SHA-pinned");
 
-// 8. Health / current-registration verification
+// 8. Health / current-registration verification, PER APP and policy-aware.
 ok(/\/api\/health/.test(api) && /"200"/.test(api), "deploy-api must verify /api/health returns 200");
-ok(/date -u \+/.test(voice) && /watermark=/.test(voice), "deploy-voice must capture a pre-release watermark");
-ok(/WATERMARK/.test(voice) && /registered worker/.test(voice), "deploy-voice must verify a CURRENT 'registered worker' log against the watermark");
+// Browser voice: ALWAYS_ON — watermark + CURRENT registration on the correct app.
+// These assertions pin the LIVE check, not prose: each string below appears only
+// in the executable verification, so deleting the guard fails the test.
+ok(/date -u \+/.test(voice) && /echo "watermark=/.test(voice), "deploy-browser-voice must capture a pre-release watermark");
+ok(/flyctl logs -a project-hello-voice[\s\S]*?grep 'registered worker'/.test(voice), "deploy-browser-voice must grep a CURRENT 'registered worker' line from project-hello-voice logs");
+// The anti-stale-log core: the extracted timestamp MUST be compared >= the
+// pre-release watermark. Deleting this comparison (accepting any line) must fail.
+ok(/sort \| tail -1\)" = "\$ts"/.test(voice), "deploy-browser-voice must compare the log timestamp against the watermark (no stale-log acceptance)");
+ok(/printf '%s\\n%s\\n' "\$WATERMARK" "\$ts"/.test(voice), "deploy-browser-voice watermark comparison must use the captured WATERMARK");
+// Fail-closed: an absent current registration must exit non-zero (a true
+// worker-down incident is surfaced, never swallowed).
+ok(/::error::no current 'registered worker'[\s\S]*?exit 1/.test(voice), "deploy-browser-voice must FAIL CLOSED (exit 1) when no current registration is found");
+ok(!/project-hello-phone-voice/.test(voice) && !/fly\.phone\.toml/.test(voice), "deploy-browser-voice must not touch the phone app or its config");
+// Phone voice: STOPPED — release on the correct app, ENFORCED to count 0, and it
+// must NOT demand or grep for a live registration line (no stale-log acceptance).
+ok(/fly\.phone\.toml/.test(phone), "deploy-phone-voice must deploy with fly.phone.toml");
+ok(/flyctl scale count 0 -a project-hello-phone-voice/.test(phone), "deploy-phone-voice must ENFORCE stopped/min-0 by scaling the app to count 0 (default-safe by code, not by manual precondition)");
+ok(/status -a project-hello-phone-voice/.test(phone), "deploy-phone-voice must verify status on project-hello-phone-voice");
+ok(!/registered worker/.test(phone), "deploy-phone-voice (stopped policy) must NOT require or accept a 'registered worker' line");
+ok(!/project-hello-voice\b/.test(phone.replace(/project-hello-phone-voice/g, "")), "deploy-phone-voice must not target the browser app");
+ok(/STOPPED/.test(phone), "deploy-phone-voice must document its STOPPED run policy");
+ok(/ALWAYS_ON/.test(voice), "deploy-browser-voice must document its ALWAYS_ON run policy");
 
 // 9. Least privilege
 const perm = (wf.match(/permissions:\n((?:\s+\S.*\n)+)/) || [, ""])[1];
 ok(/contents:\s*read/.test(perm), "permissions must grant contents: read");
 ok(!/\bwrite\b/.test(perm), "permissions must not grant any write scope");
 
-// 10. Manual recovery valve
+// 10. Manual recovery valve exposes the full service matrix
 ok(/workflow_dispatch:/.test(wf), "must expose a workflow_dispatch recovery valve");
-ok(/options:\s*\[api, voice, both\]/.test(wf), "manual dispatch must offer api|voice|both");
+ok(/options:\s*\[api, browser-voice, phone-voice, both, all\]/.test(wf), "manual dispatch must offer api|browser-voice|phone-voice|both|all");
+// 'both' = api + browser-voice (no phone); 'all' = every app including phone.
+ok(/both\)\s*api=true; voice=true ;;/.test(detect), "'both' must select api + browser-voice only (never phone)");
+ok(/all\)\s*api=true; voice=true; phone=true ;;/.test(detect), "'all' must select api + browser-voice + phone-voice");
+ok(/phone-voice\)\s*phone=true ;;/.test(detect), "'phone-voice' must select only the phone app");
 
 if (failures.length) {
   console.error(`deploy-fly workflow contract FAILED (${failures.length}):`);
   for (const f of failures) console.error(" - " + f);
   process.exit(1);
 }
-console.log("deploy-fly workflow contract valid (12 property groups).");
+console.log("deploy-fly workflow contract valid (three-app matrix, token isolation, policy-aware verification).");
