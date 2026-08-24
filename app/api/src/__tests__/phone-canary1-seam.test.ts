@@ -21,12 +21,14 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 import {
+  CANARY1_BOUNDS,
   CANARY1_CONFIRM_PHRASE,
   CANARY1_DISPATCH_MODE,
   CANARY1_EPOCH,
   CANARY1_NOT_ARMED,
   buildCanary1DialConfig,
   buildCanary1ScreeningConfig,
+  canary1RoomEmptyTimeoutSeconds,
   mintCanary1Ids,
   originateCanary1Call,
   runCanary1,
@@ -263,8 +265,11 @@ function harness(over: Partial<Canary1RunDeps> = {}, answers = [FAKE_NUMBER, FAK
     async listRooms() {
       calls.push('listRooms');
       listCount += 1;
-      // Occupied once, then gone — the shape of a completed canary call.
-      return listCount === 1 ? [{ numParticipants: 2 }] : [];
+      // Occupied for the join observation AND for the occupancy observation,
+      // then gone — the shape of a completed canary call. Two occupied polls,
+      // not one, because since the worker-presence precondition BOTH branches
+      // observe the join before anything else happens.
+      return listCount <= 2 ? [{ numParticipants: 2 }] : [];
     },
   };
   const dispatch: Canary1DispatchClientLike = {
@@ -349,10 +354,19 @@ describe('3. one invocation, one room, at most one originate', () => {
     expect(h.seen).toEqual([]);
     expect(h.calls).toContain('createDispatch');
     expect(result.lines).toContain('CANARY|canary1|originate_skipped|PASS|dry_run');
-    // The line that makes the dry run worth running: the named worker was
-    // OBSERVED in the room, which is the only offline-safe evidence that
-    // arming, the dispatch metadata and the worker's inbound guard agree.
-    expect(result.lines).toContain('CANARY|canary1|worker_joined|PASS|ok');
+    // The line that makes the dry run worth running: the room was OBSERVED
+    // OCCUPIED, which on this path means the dispatched worker joined — the
+    // only offline-safe evidence that arming, the dispatch metadata and the
+    // worker's inbound guard agree. (Occupancy, not identity: `observeAgentJoin`
+    // reads `numParticipants` and nothing else. The inference is a property of
+    // the path — fresh room, `maxParticipants` 2, one dispatch, no originate on
+    // this branch — and is written down where the check lives.)
+    // The SAME line the `--execute` path gates on — one observation, two
+    // meanings, deliberately not two implementations.
+    expect(result.lines).toContain('CANARY|canary1|worker_present_before_originate|PASS|joined');
+    // And it precedes the skip, because both branches wait before they diverge.
+    expect(result.lines.indexOf('CANARY|canary1|worker_present_before_originate|PASS|joined'))
+      .toBeLessThan(result.lines.indexOf('CANARY|canary1|originate_skipped|PASS|dry_run'));
     expect(result.exitCode).toBe(0);
   });
 
@@ -375,13 +389,18 @@ describe('3. one invocation, one room, at most one originate', () => {
       sleep: async () => {},
     });
     expect(result.lines)
-      .toContain('CANARY|canary1|worker_joined|FAIL|worker_never_joined');
+      .toContain('CANARY|canary1|worker_present_before_originate|FAIL|worker_never_joined');
     expect(result.exitCode).toBe(1);
   });
 
-  it('a vanished room is NOT read as the worker having run', async () => {
+  it('a vanished room is NOT read as the worker having run, and has its OWN code', async () => {
     // `emptyTimeout` can reap a room the worker never reached. "The worker ran"
-    // and "we could not tell" must not look the same.
+    // and "we could not tell" must not look the same — and neither must "we
+    // could not tell" and "the room was taken away from us". A reaped room is a
+    // BOUND problem whose remedy is `emptyTimeout`; a worker that never joined
+    // is a STATE problem whose remedy is the secret, the scale count or the
+    // deploy history. Folding them together sent the operator to check things
+    // that were fine.
     let clock = 0;
     const h = harness({ argv: [] });
     const result = await runCanary1({
@@ -395,7 +414,8 @@ describe('3. one invocation, one room, at most one originate', () => {
       sleep: async () => {},
     });
     expect(result.lines)
-      .toContain('CANARY|canary1|worker_joined|FAIL|worker_never_joined');
+      .toContain('CANARY|canary1|worker_present_before_originate|FAIL|room_reaped_before_join');
+    expect(result.lines.some((l) => l.includes('worker_never_joined'))).toBe(false);
   });
 
   it('a BARE invocation on a bare machine says DISARMED, not "no trunk"', async () => {
@@ -488,6 +508,243 @@ describe('3. one invocation, one room, at most one originate', () => {
     expect(result.lines).toContain('CANARYCOUNT|canary1|teardown_delete_returned|0');
     expect(result.lines.some((l) => l.startsWith('CANARY|canary1|teardown_room_deleted')))
       .toBe(false);
+  });
+
+  // ── PR106 §2.5.1 / §2.5.2 — the live-call close-out ────────────────
+  //
+  // E1 is the one that would have caught the defect: `--execute` dispatched and
+  // originated IMMEDIATELY, with nothing between `dispatch_created` and
+  // `createSipParticipant` establishing that a worker existed. If it did not —
+  // a mid-window voice merge scaled it to zero, or the secret was set on the
+  // wrong app — the handset rang, a real person answered, and NOBODY SPOKE,
+  // not even the disclosure, which is the worker's first action. The leg was
+  // then held to `maxCallSeconds`. A merge freeze mitigates the cause
+  // procedurally; these cases are the code control on the event.
+
+  it('E1 — EXECUTE with an absent worker refuses and makes ZERO originate calls', async () => {
+    let clock = 0;
+    const h = harness();
+    const result = await runCanary1({
+      ...h.deps,
+      rooms: {
+        async createRoom() { h.calls.push('createRoom'); },
+        async deleteRoom() { h.calls.push('deleteRoom'); },
+        // The room exists and no agent ever arrives.
+        async listRooms() { h.calls.push('listRooms'); return [{ numParticipants: 0 }]; },
+      },
+      now: () => { clock += 30_000; return clock; },
+      sleep: async () => {},
+    });
+    expect(result.lines)
+      .toContain('CANARY|canary1|worker_present_before_originate|FAIL|worker_never_joined');
+    // THE assertion. Not "the line was printed" — the seam was not reached.
+    expect(h.seen).toEqual([]);
+    expect(result.lines.some((l) => l.includes('originate_answered'))).toBe(false);
+    // Still torn down, and still a non-zero exit.
+    expect(h.calls.filter((c) => c === 'deleteRoom').length).toBeGreaterThanOrEqual(1);
+    expect(result.exitCode).toBe(1);
+  });
+
+  it('E1 CONTROL — without the gate the absent-worker run WOULD have originated', async () => {
+    // The mutation the gate exists to stop, driven through the seam directly
+    // rather than by deleting the gate: with no worker-presence precondition
+    // the very next thing `conduct()` does is originate, and this proves that
+    // call reaches a live client and returns `answered` — i.e. a ringing
+    // handset — on exactly the inputs E1 refuses.
+    const fake = fakeSipClient();
+    const number = wrapDialableNumber(FAKE_NUMBER);
+    const ids = mintCanary1Ids();
+    const outcome = await originateCanary1Call(
+      {
+        ids,
+        roomName: `phone-${ids.sessionId}`,
+        number,
+        config: buildCanary1ScreeningConfig(number.digest, 30),
+        dialConfig: buildCanary1DialConfig(TRUNK, 'phone-screener', 60, 180),
+        credentials: CREDS,
+        ringSeconds: 30,
+        maxCallSeconds: 180,
+      },
+      { live: () => fake.client },
+    );
+    expect(outcome.status).toBe('answered');
+    expect(fake.seen).toHaveLength(1);
+  });
+
+  it('E2 — EXECUTE with a worker present originates ONCE, after the observation', async () => {
+    const h = harness();
+    const result = await runCanary1(h.deps);
+    expect(h.seen).toHaveLength(1);
+    expect(result.lines)
+      .toContain('CANARY|canary1|worker_present_before_originate|PASS|joined');
+    // Asserted on the RECORDED CALL ORDER, not on statement order in the file:
+    // the first `listRooms` is the join observation and it happens before the
+    // originate. A file-order assertion would survive a refactor that moved
+    // the call.
+    const firstList = h.calls.indexOf('listRooms');
+    const observation = result.lines
+      .indexOf('CANARY|canary1|worker_present_before_originate|PASS|joined');
+    const originated = result.lines.indexOf('CANARY|canary1|originate_answered|PASS|ok');
+    expect(firstList).toBeGreaterThan(h.calls.indexOf('createDispatch'));
+    expect(observation).toBeGreaterThanOrEqual(0);
+    expect(originated).toBeGreaterThan(observation);
+    expect(result.exitCode).toBe(0);
+  });
+
+  it('E3 — a room reaped before any join refuses EXECUTE with its own code', async () => {
+    let clock = 0;
+    const h = harness();
+    const result = await runCanary1({
+      ...h.deps,
+      rooms: {
+        async createRoom() {},
+        async deleteRoom() {},
+        async listRooms() { return []; },
+      },
+      now: () => { clock += 30_000; return clock; },
+      sleep: async () => {},
+    });
+    expect(result.lines)
+      .toContain('CANARY|canary1|worker_present_before_originate|FAIL|room_reaped_before_join');
+    expect(h.seen).toEqual([]);
+    expect(result.exitCode).toBe(1);
+  });
+
+  it('E3 CONTROL — the two absent-worker causes do not share a code', async () => {
+    // Folding `listed.length === 0` back into `worker_never_joined` is the
+    // mutation. If it were folded, these two runs would print the same line —
+    // so the assertion is that they DIFFER, which no folding can satisfy.
+    const codeFor = async (listRooms: () => Promise<Array<{ numParticipants: number }>>) => {
+      let clock = 0;
+      const h = harness();
+      const result = await runCanary1({
+        ...h.deps,
+        rooms: { async createRoom() {}, async deleteRoom() {}, listRooms },
+        now: () => { clock += 30_000; return clock; },
+        sleep: async () => {},
+      });
+      return result.lines.find((l) => l.includes('worker_present_before_originate'));
+    };
+    const empty = await codeFor(async () => [{ numParticipants: 0 }]);
+    const gone = await codeFor(async () => []);
+    expect(empty).toContain('worker_never_joined');
+    expect(gone).toContain('room_reaped_before_join');
+    expect(empty).not.toBe(gone);
+  });
+
+  it('E3b — a TRANSIENT empty listing is not a reap, and does not stick', async () => {
+    // The defect: an earlier shape latched `reaped` on the FIRST empty listing
+    // and kept it for the whole wait. One transient miss then turned a genuine
+    // `worker_never_joined` into `room_reaped_before_join` — the FIRST branch
+    // of the runbook's diagnosis order, sending the operator to bounds when the
+    // fault is state. These two runs share that first empty listing and must
+    // still end in DIFFERENT places.
+    const runWith = async (listings: Array<Array<{ numParticipants: number }>>) => {
+      let clock = 0;
+      let i = 0;
+      const h = harness();
+      const result = await runCanary1({
+        ...h.deps,
+        rooms: {
+          async createRoom() {},
+          async deleteRoom() {},
+          async listRooms() { return listings[Math.min(i++, listings.length - 1)]; },
+        },
+        now: () => { clock += 10_000; return clock; },
+        sleep: async () => {},
+      });
+      return {
+        line: result.lines.find((l) => l.includes('worker_present_before_originate')),
+        polls: i,
+        seen: h.seen,
+      };
+    };
+
+    // Miss, then the worker is there: JOINED. A latch could not produce this.
+    const recovered = await runWith([[], [{ numParticipants: 1 }]]);
+    expect(recovered.line).toContain('PASS|joined');
+
+    // Miss, then a room that exists and stays empty: a STATE problem, reported
+    // as one. Under the latched shape this printed `room_reaped_before_join`.
+    const never = await runWith([[], [{ numParticipants: 0 }]]);
+    expect(never.line).toContain('FAIL|worker_never_joined');
+    expect(never.line).not.toContain('room_reaped_before_join');
+    expect(never.seen).toEqual([]);
+  });
+
+  it('E3c — a CONFIRMED reap returns at once instead of burning the join wait', async () => {
+    // Two consecutive empty listings confirm it; a room that is really gone
+    // never comes back, so polling it for the rest of the window only delays a
+    // verdict already known. The assertion is on the POLL COUNT, because
+    // "returns promptly" is a claim about work done, not about a line printed.
+    let clock = 0;
+    let polls = 0;
+    const h = harness();
+    const result = await runCanary1({
+      ...h.deps,
+      rooms: {
+        async createRoom() {},
+        async deleteRoom() {},
+        async listRooms() { polls += 1; return []; },
+      },
+      // 10 s steps against the 75 s default window: a loop that ran to the
+      // deadline would poll SEVEN times before returning.
+      now: () => { clock += 10_000; return clock; },
+      sleep: async () => {},
+    });
+    expect(result.lines)
+      .toContain('CANARY|canary1|worker_present_before_originate|FAIL|room_reaped_before_join');
+    // THREE listings in the whole run: two to confirm the reap, plus the one
+    // teardown makes to verify the room's absence. Running to the deadline
+    // would be eight.
+    expect(polls).toBe(3);
+    expect(h.seen).toEqual([]);
+  });
+
+  it('E6 — createRoom receives the DERIVED empty timeout, not a chosen constant', async () => {
+    const seenTimeouts: number[] = [];
+    const h = harness({ argv: [] });
+    await runCanary1({
+      ...h.deps,
+      rooms: {
+        async createRoom(options: { emptyTimeout: number }) {
+          seenTimeouts.push(options.emptyTimeout);
+        },
+        async deleteRoom() {},
+        async listRooms() { return [{ numParticipants: 1 }]; },
+      },
+    });
+    expect(seenTimeouts).toEqual([
+      canary1RoomEmptyTimeoutSeconds(CANARY1_BOUNDS.participantWaitSeconds.def),
+    ]);
+    // 210 at the defaults, and STRICTLY GREATER than the join window it must
+    // outlive. The old flat 120 sat UNDER that window, so between t=120 and
+    // t=180 the provider could reap the room while the CLI was still watching
+    // it — and the observer reported the same code an unarmed worker produces.
+    expect(seenTimeouts[0]).toBe(210);
+    expect(seenTimeouts[0]).toBeGreaterThan(120);
+  });
+
+  it('E6 CONTROL — a raised participant wait raises the room timeout with it', async () => {
+    // The half a hardcoded constant cannot do. If `createRoom` read a constant,
+    // this run would pass the same number as the one above.
+    const seenTimeouts: number[] = [];
+    const h = harness({
+      argv: ['--participant-wait-seconds', '180', '--wall-clock-seconds', '400',
+        '--join-wait-seconds', '135'],
+    });
+    await runCanary1({
+      ...h.deps,
+      rooms: {
+        async createRoom(options: { emptyTimeout: number }) {
+          seenTimeouts.push(options.emptyTimeout);
+        },
+        async deleteRoom() {},
+        async listRooms() { return [{ numParticipants: 1 }]; },
+      },
+    });
+    expect(seenTimeouts).toEqual([canary1RoomEmptyTimeoutSeconds(180)]);
+    expect(seenTimeouts[0]).toBe(270);
   });
 
   it('a room that never opens does not dispatch and still tears down', async () => {

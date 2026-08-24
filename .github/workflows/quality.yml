@@ -36,6 +36,42 @@ jobs:
         run: node scripts/validate-voice-worker-apps.mjs && node scripts/validate-voice-worker-apps.test.mjs
       - name: Validate architecture decision records
         run: node scripts/check-adrs.mjs
+      # ── PR106 — Canary-1 arming lives on the never-merged activation branch
+      #    `canary1/arm`, which flips CANARY1_ARMED to true. The in-suite pin
+      #    (phone-canary1-structural.test.ts §9) CANNOT catch a merge of that
+      #    artifact: the pin travels WITH the branch, so the artifact inverts it
+      #    and stays green. This gate does not travel — it lives on main and asks
+      #    one question about main.
+      #
+      #    Runs on the DEFAULT BRANCH ONLY. On a pull request this step is skipped
+      #    and the step below still runs, so a PR proves the gate is WIRED without
+      #    ever evaluating it. That asymmetry is deliberate: the activation
+      #    artifact's own PR must stay green, and a merge of it must turn main red.
+      #
+      #    A STEP rather than a job, because a skipped job surfaces as a NEUTRAL
+      #    check, and a required status check that is sometimes neutral is how
+      #    branch protection starts blocking merges for reasons nobody wants to
+      #    debug during a canary window. A skipped step changes no check's identity.
+      #
+      #    `workflow_dispatch` on main does NOT run this, because the guard tests
+      #    `github.event_name == 'push'`. That is a deliberate, stated limit: the
+      #    manual path is the local `node scripts/check-main-disarmed.mjs`, which is
+      #    what an operator should run anyway (runbook §4b). ──
+      #    The verdict LINE is asserted, not just the exit code: a module that
+      #    declines to run its assertion also exits 0, and that green would be
+      #    indistinguishable from a real pass. `$(...)` is used rather than a
+      #    pipe because `cmd | grep` reports GREP's exit code, not the gate's.
+      - name: Validate main is disarmed (default branch only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          verdict="$(node scripts/check-main-disarmed.mjs)"
+          echo "$verdict"
+          case "$verdict" in
+            *"main disarmed OK"*) ;;
+            *) echo "the disarm gate produced NO verdict line - it evaluated nothing"; exit 1 ;;
+          esac
+      - name: Validate the disarm gate is wired (always)
+        run: node scripts/check-main-disarmed.test.mjs
       # ── P8B — Canary-0's OFFLINE half. No database, no Docker, no network.
       #    It gates the sanitized manifest's schema and tamper detection, the
       #    zero-PSTN traps (including a disarmed-trap control), the static

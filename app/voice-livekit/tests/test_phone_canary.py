@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
 import sys
@@ -744,6 +745,520 @@ class TestPackaging(unittest.TestCase):
         # credential-ish substring; a module named e.g. `phone_token.py` would
         # be silently unshippable.
         self.assertFalse(self.dic.is_forbidden("phone_canary.py"))
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  6. The run counters (PR106) — structured LOG LINES, not metrics.
+# ══════════════════════════════════════════════════════════════════════
+#
+# A canary run that produces an outcome code and nothing else is unreadable
+# after the fact: an operator holding "canary_deadline_exceeded" cannot tell
+# whether the owner answered, whether a question was ever asked, or whether the
+# leg was given its whole wait. These tests defend the counters that answer
+# that -- and, as much, defend the two ways a counter here dies SILENTLY:
+#
+#   * through `counter_metric()`, whose sink in this process is
+#     `_NoOpMetricSink` -- a validated, filtered, discarded number;
+#   * through a meta key outside `observability._ALLOWED_META_KEYS`, which
+#     `_emit` drops without a word: the call succeeds, the line is written, and
+#     the field is simply not in it.
+#
+# So every counter assertion below runs against the REAL `StructuredLogger`.
+# A stub logger would record a kwarg the production allowlist throws away.
+
+_FIXED_CLOCK = "2026-08-24T00:00:00.000Z"
+
+#: Seeded into the fake candidate's speech so the leak sweep has something real
+#: to look for. `_item_text` returns these; nothing may log them.
+_PLANTED_NUMBER = "9812345670"
+_PLANTED_TEXT = "the flat above mine has a leaking pipe and the landlord"
+
+
+class _Capture:
+    """A writer that keeps every line the real logger actually emitted."""
+
+    def __init__(self):
+        self.lines: list[str] = []
+
+    def __call__(self, line: str) -> None:
+        self.lines.append(line)
+
+    @property
+    def entries(self) -> list[dict]:
+        return [json.loads(line) for line in self.lines]
+
+    @property
+    def codes(self) -> list[str]:
+        return [entry.get("error_type") for entry in self.entries]
+
+    def where(self, code: str) -> list[dict]:
+        return [e for e in self.entries if e.get("error_type") == code]
+
+
+def _real_logger(capture: _Capture):
+    """The PRODUCTION logger, with only the sink and the clock replaced.
+
+    Not a stub. The allowlist, the per-field validation and the defence scan
+    are the things under test: a stub would happily record a kwarg that
+    `observability` drops on the floor, and the counter would be green here and
+    absent in Fly's log stream.
+    """
+    from observability import StructuredLogger
+    return StructuredLogger("phone_canary", clock=lambda: _FIXED_CLOCK, writer=capture)
+
+
+async def _drive(*, capture, participant=True, answers=("yes I can hear you",),
+                 questions="2", session=None, wait=None, monotonic=None):
+    """Drive one full canary run through the existing fakes, capturing logs.
+
+    Same shape as `TestCanaryCall._run` -- same fakes, same patched per-answer
+    bound -- with the module logger swapped for the real one writing into
+    *capture*.
+    """
+    ctx = FakeCtx(metadata=_room_meta(), dispatch=_dispatch())
+    session = session if session is not None else FakeSession()
+    session.answers = list(answers)
+    closed: list[str] = []
+
+    async def close_room(name):
+        closed.append(name)
+
+    async def wait_for_participant():
+        if wait is not None:
+            return await wait()
+        return _participant() if participant else None
+
+    clock_patch = (
+        patch.object(phone_canary, "time", types.SimpleNamespace(monotonic=monotonic))
+        if monotonic is not None
+        # Patching the module ATTRIBUTE, never `time.monotonic` itself: the
+        # event loop reads the same function, and a loop whose clock runs
+        # backwards does not run this test, it hangs it.
+        else patch.object(phone_canary, "time", phone_canary.time)
+    )
+
+    with patch.dict(os.environ, {"PHONE_CANARY_QUESTIONS": questions}), \
+         patch.object(phone_canary, "CANARY_ANSWER_TIMEOUT_SEC", 0.01), \
+         patch.object(phone_canary, "_log", _real_logger(capture)), \
+         clock_patch:
+        outcome = await phone_canary.run_phone_canary(
+            ctx, _ROOM, _CANARY_ID,
+            session_factory=lambda: session,
+            agent_factory=_canary_agent_stub,
+            close_room=close_room,
+            wait_for_participant=wait_for_participant,
+        )
+    return outcome, ctx, session, closed
+
+
+def _scan_log_calls(source: str):
+    """Every `_log.<level>(...)` call in *source*, as (kwargs, error_type codes).
+
+    Parsed, not regexed. A regex over source text cannot tell a kwarg from a
+    nested call's kwarg or from a `==` comparison, and this scan is the thing
+    that decides whether a NEW log line is reviewed -- a scan that mis-reads
+    the source is a gate that passes whatever it failed to parse.
+    """
+    import ast
+    kwargs: list[str] = []
+    codes: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Name) and func.value.id == "_log"):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg is None:      # **kwargs would defeat the whole scan
+                kwargs.append("**")
+                continue
+            kwargs.append(keyword.arg)
+            if keyword.arg == "error_type":
+                codes.extend(_literal_strings(keyword.value))
+    return kwargs, codes
+
+
+def _literal_strings(node) -> list[str]:
+    """Every string literal an `error_type=` expression can evaluate to.
+
+    Handles the conditional form (`"a" if cond else "b"`); anything else that
+    is not a plain literal is reported as the unreviewable value it is.
+    """
+    import ast
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value]
+    if isinstance(node, ast.IfExp):
+        return _literal_strings(node.body) + _literal_strings(node.orelse)
+    return ["<not-a-literal>"]
+
+
+def _leaks(line: str) -> str | None:
+    """What a log line must never carry. Returns the reason, or None."""
+    if re.search(r"\d{7,}", line):
+        return "digit_run"
+    if _PLANTED_NUMBER in line:
+        return "planted_number"
+    if _PLANTED_TEXT in line:
+        return "planted_text"
+    if _ROOM in line:
+        return "room_name"
+    return None
+
+
+class TestRunCounters(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        phone_canary.reset_canary_latch()
+
+    # ── T1 ────────────────────────────────────────────────────────────
+
+    async def test_the_happy_run_emits_the_vocabulary_IN_ORDER(self):
+        # SCOPED TO THE COMPLETED RUN, deliberately. The refusal paths have
+        # DIFFERENT orders -- `canary_no_participant` returns from inside the
+        # `try`, so its refusal precedes the `finally`'s `room_closed` and
+        # `phone_canary_outcome` is never reached at all, and
+        # `canary_already_run` returns before the `try` and emits nothing else.
+        # Asserting one sequence over all three would either be wrong or would
+        # have to be loosened until it asserted nothing. T5 owns the refusals.
+        capture = _Capture()
+        outcome, _, _, _ = await _drive(capture=capture, answers=("yes", "sunny"),
+                                        questions="2")
+        self.assertEqual(outcome, "canary_completed")
+        self.assertEqual(capture.codes, [
+            "phone_canary_start",
+            "phone_canary_wait_bound",
+            "phone_canary_session_built",
+            "phone_canary_participant_waited",
+            "phone_canary_session_started",
+            "phone_canary_question_asked",
+            "phone_canary_answer_observed",
+            "phone_canary_question_asked",
+            "phone_canary_answer_observed",
+            "phone_canary_room_closed",
+            "phone_canary_outcome",
+        ])
+        # The indices are indices: 0 then 1, never a running total.
+        self.assertEqual(
+            [e["turn_index"] for e in capture.where("phone_canary_question_asked")],
+            [0, 1])
+        # And the count of questions is DERIVED by counting the lines, which is
+        # the whole reason no count field exists.
+        self.assertEqual(len(capture.where("phone_canary_question_asked")),
+                         phone.canary_questions())
+
+    async def test_session_BUILT_is_emitted_before_the_wait_and_survives_a_dry_run(self):
+        # THE DRY-RUN GATE. `phone_canary_session_started` is emitted only
+        # after something has ANSWERED, so on a dry run -- which originates
+        # nothing, so no remote participant ever arrives -- it is unreachable
+        # by construction. Requiring it as dry-run evidence would be a gate
+        # that cannot pass, which is a gate that gets waived.
+        #
+        # `phone_canary_session_built` is the half that IS reachable: it is
+        # emitted at construction, which is where a missing provider key
+        # actually fails, and it is emitted BEFORE the wait rather than after
+        # it.
+        order: list[str] = []
+
+        class _Session(FakeSession):
+            pass
+
+        async def wait():
+            order.append("wait_entered")
+            return None
+
+        capture = _Capture()
+        outcome, _, session, _ = await _drive(
+            capture=capture, session=_Session(), wait=wait)
+        self.assertEqual(outcome, "canary_no_participant")
+        # The line exists on the path a dry run actually takes...
+        self.assertEqual(len(capture.where("phone_canary_session_built")), 1)
+        # ...and `session_started` does NOT, which is the whole point.
+        self.assertEqual(capture.where("phone_canary_session_started"), [])
+        self.assertEqual(session.start_calls, 0)
+        # ...and it precedes the wait, so the CLI's ~2 s teardown of a dry-run
+        # room cannot swallow it the way it can swallow
+        # `phone_canary_participant_waited`.
+        self.assertEqual(order, ["wait_entered"])
+        self.assertLess(capture.codes.index("phone_canary_session_built"),
+                        capture.codes.index("phone_canary_participant_waited"))
+
+    async def test_NEGATIVE_CONTROL_a_failing_session_factory_emits_no_built_line(self):
+        # The control ON the assertion above: `session_built` claims the
+        # session was CONSTRUCTED. If the constructor raises -- which is
+        # exactly what a missing `SARVAM_API_KEY` does, because the plugin
+        # reads it from the environment at construction -- the line must not
+        # appear, or it would report a session that does not exist.
+        capture = _Capture()
+        ctx = FakeCtx(metadata=_room_meta(), dispatch=_dispatch())
+
+        def boom():
+            raise RuntimeError("provider key missing")
+
+        with patch.object(phone_canary, "_log", _real_logger(capture)):
+            with self.assertRaises(RuntimeError):
+                await phone_canary.run_phone_canary(
+                    ctx, _ROOM, _CANARY_ID,
+                    session_factory=boom,
+                    agent_factory=_canary_agent_stub,
+                    close_room=lambda name: None,
+                    wait_for_participant=lambda: None,
+                )
+        self.assertEqual(capture.codes,
+                         ["phone_canary_start", "phone_canary_wait_bound"])
+        self.assertNotIn("phone_canary_session_built", capture.codes)
+
+    async def test_a_silent_answer_is_its_own_code_at_the_same_index(self):
+        capture = _Capture()
+        await _drive(capture=capture, answers=(), questions="2")
+        self.assertEqual(capture.codes.count("phone_canary_answer_silent"), 2)
+        self.assertEqual(capture.codes.count("phone_canary_answer_observed"), 0)
+        self.assertEqual(
+            [e["turn_index"] for e in capture.where("phone_canary_answer_silent")],
+            [0, 1])
+
+    # ── T2 ────────────────────────────────────────────────────────────
+
+    async def test_the_counters_SURVIVE_the_observability_allowlist(self):
+        # The failure this defends against is invisible: `_emit` drops a
+        # non-allowlisted key silently, so a "counter" on a new key produces a
+        # log line that looks right and carries nothing.
+        capture = _Capture()
+        await _drive(capture=capture, answers=("yes", "sunny"), questions="2")
+        durations = [e for e in capture.entries if "duration_sec" in e]
+        indices = [e for e in capture.entries if "turn_index" in e]
+        self.assertEqual(
+            sorted({e["error_type"] for e in durations}),
+            ["phone_canary_outcome", "phone_canary_participant_waited",
+             "phone_canary_wait_bound"])
+        self.assertEqual(
+            sorted({e["error_type"] for e in indices}),
+            ["phone_canary_answer_observed", "phone_canary_question_asked"])
+        for entry in durations:
+            self.assertIsInstance(entry["duration_sec"], (int, float))
+        for entry in indices:
+            self.assertIsInstance(entry["turn_index"], int)
+
+    def test_POSITIVE_CONTROL_a_renamed_key_vanishes_from_the_line(self):
+        # The control ON the assertion above: the same real logger, the same
+        # call shape, one key renamed -- and the field is simply not there. No
+        # exception, no warning, no line missing. That is what makes "the field
+        # is present" a claim worth asserting.
+        capture = _Capture()
+        log = _real_logger(capture)
+        log.info("unknown_event", error_type="phone_canary_outcome", duration_sec=1.5)
+        log.info("unknown_event", error_type="phone_canary_outcome", elapsed_sec=1.5)
+        kept, renamed = capture.entries
+        self.assertEqual(kept["duration_sec"], 1.5)
+        self.assertNotIn("elapsed_sec", renamed)
+        self.assertNotIn("duration_sec", renamed)
+        # The LINE still arrived, which is exactly why the drop is invisible.
+        self.assertEqual(renamed["error_type"], "phone_canary_outcome")
+
+    # ── T3 ────────────────────────────────────────────────────────────
+
+    def test_every_log_call_uses_a_DECLARED_key_and_a_DECLARED_code(self):
+        kwargs, codes = _scan_log_calls(PHONE_CANARY_SRC)
+        self.assertGreater(len(kwargs), 10, "the scan found no log calls to check")
+        for name in sorted(set(kwargs)):
+            with self.subTest(kwarg=name):
+                self.assertIn(name, phone_canary.CANARY_LOG_META_KEYS)
+        for code in sorted(set(codes)):
+            with self.subTest(code=code):
+                self.assertIn(code, phone_canary.CANARY_LOG_EVENTS)
+        # Both declarations must be honest in the other direction too: a code
+        # declared and never used is a vocabulary nobody reviewed against.
+        self.assertEqual(set(codes), set(phone_canary.CANARY_LOG_EVENTS))
+
+    def test_POSITIVE_CONTROL_the_source_scan_catches_a_seeded_call(self):
+        seeded_key = PHONE_CANARY_SRC + (
+            '\n_log.info("unknown_event", error_type="phone_canary_start", model="x")\n')
+        kwargs, _ = _scan_log_calls(seeded_key)
+        self.assertIn("model", kwargs)
+        self.assertNotIn("model", phone_canary.CANARY_LOG_META_KEYS)
+
+        seeded_code = PHONE_CANARY_SRC + (
+            '\n_log.info("unknown_event", error_type="phone_canary_undeclared")\n')
+        _, codes = _scan_log_calls(seeded_code)
+        self.assertIn("phone_canary_undeclared", codes)
+        self.assertNotIn("phone_canary_undeclared", phone_canary.CANARY_LOG_EVENTS)
+
+        # ...and a computed `error_type` is reported as unreviewable rather
+        # than quietly skipped, which is how a scan goes vacuous.
+        seeded_dynamic = PHONE_CANARY_SRC + (
+            '\n_log.info("unknown_event", error_type=outcome)\n')
+        _, dynamic = _scan_log_calls(seeded_dynamic)
+        self.assertIn("<not-a-literal>", dynamic)
+
+    def test_the_module_routes_no_counter_through_the_NOOP_metric_sink(self):
+        # `observability._metric_sink` is `_NoOpMetricSink` in this process and
+        # in production. A counter through it is validated, filtered, and then
+        # handed to a method whose body is `pass`.
+        for symbol in ("counter_metric", "gauge_metric", "histogram_metric"):
+            with self.subTest(symbol=symbol):
+                self.assertNotIn(symbol, PHONE_CANARY_CODE)
+
+    # ── T4 ────────────────────────────────────────────────────────────
+
+    async def test_no_counter_line_carries_a_number_a_transcript_or_a_room(self):
+        capture = _Capture()
+        await _drive(capture=capture, questions="2",
+                     answers=(f"you can call me back on {_PLANTED_NUMBER} any time",
+                              _PLANTED_TEXT))
+        self.assertTrue(capture.lines)
+        for line in capture.lines:
+            with self.subTest(line=line[:80]):
+                self.assertIsNone(_leaks(line))
+        # The seeded speech DID reach `_item_text` -- otherwise the sweep swept
+        # a run in which there was nothing to find.
+        self.assertEqual(len(capture.where("phone_canary_answer_observed")), 2)
+
+    def test_POSITIVE_CONTROL_the_leak_sweep_can_actually_fire(self):
+        # A sweep that cannot fire is not a sweep. Same function, same planted
+        # values, on a synthetic line.
+        self.assertEqual(_leaks(json.dumps({"schema": _PLANTED_NUMBER})), "digit_run")
+        self.assertEqual(_leaks(json.dumps({"schema": _PLANTED_TEXT})), "planted_text")
+        self.assertEqual(_leaks(json.dumps({"schema": _ROOM})), "room_name")
+        self.assertIsNone(_leaks(json.dumps({"error_type": "phone_canary_outcome"})))
+
+    # ── T5 ────────────────────────────────────────────────────────────
+
+    async def test_the_no_participant_refusal_still_reports_its_WAIT(self):
+        # The wait IS the evidence: "no participant" after two seconds and "no
+        # participant" after the full budget are different incidents.
+        capture = _Capture()
+        outcome, ctx, session, closed = await _drive(capture=capture, participant=False)
+        self.assertEqual(outcome, "canary_no_participant")
+        self.assertEqual(capture.codes, [
+            "phone_canary_start",
+            "phone_canary_wait_bound",
+            "phone_canary_session_built",
+            "phone_canary_participant_waited",
+            "phone_canary_refused",
+            "phone_canary_room_closed",
+        ])
+        waited, = capture.where("phone_canary_participant_waited")
+        self.assertIn("duration_sec", waited)
+        self.assertGreaterEqual(waited["duration_sec"], 0.0)
+        # No outcome line: the function returned from inside the `try`.
+        self.assertEqual(capture.where("phone_canary_outcome"), [])
+        self.assertEqual(closed, [_ROOM])
+        self.assertEqual(session.start_calls, 0)
+
+    async def test_the_deadline_refusal_still_reports_the_call_DURATION(self):
+        class HungSession(FakeSession):
+            def say(self, text, **kwargs):
+                self.spoken.append(text)
+
+                class _Hang:
+                    async def wait_for_playout(self):
+                        await asyncio.sleep(10)
+                return _Hang()
+
+        capture = _Capture()
+        with patch.object(phone, "canary_max_call_sec", lambda: 0.05):
+            outcome, _, _, closed = await _drive(capture=capture, session=HungSession())
+        self.assertEqual(outcome, "canary_deadline_exceeded")
+        outcome_line, = capture.where("phone_canary_outcome")
+        self.assertEqual(outcome_line["error_category"], "canary_deadline_exceeded")
+        self.assertIn("duration_sec", outcome_line)
+        self.assertGreaterEqual(outcome_line["duration_sec"], 0.0)
+        # The room still closed, and it closed BEFORE the outcome was written.
+        self.assertEqual(closed, [_ROOM])
+        self.assertLess(capture.codes.index("phone_canary_room_closed"),
+                        capture.codes.index("phone_canary_outcome"))
+
+    async def test_the_latch_refusal_emits_its_refusal_and_NOTHING_else(self):
+        first_capture = _Capture()
+        first, _, _, _ = await _drive(capture=first_capture)
+        self.assertEqual(first, "canary_completed")
+
+        capture = _Capture()
+        ctx = FakeCtx(metadata=_room_meta(), dispatch=_dispatch())
+        closed: list[str] = []
+        with patch.object(phone_canary, "_log", _real_logger(capture)):
+            outcome = await phone_canary.run_phone_canary(
+                ctx, _ROOM, _CANARY_ID,
+                session_factory=lambda: self.fail("a second session was built"),
+                agent_factory=_canary_agent_stub,
+                close_room=lambda name: closed.append(name),
+                wait_for_participant=lambda: self.fail("a second wait was started"),
+            )
+        self.assertEqual(outcome, "canary_already_run")
+        self.assertEqual(capture.codes, ["phone_canary_refused"])
+        self.assertEqual(capture.entries[0]["error_category"], "canary_already_run")
+        # Not even a wait bound: the refusal is BEFORE the `try`, and before
+        # `ctx.connect()`.
+        self.assertEqual(ctx.connected, 0)
+        self.assertEqual(closed, [])
+
+    # ── T6 ────────────────────────────────────────────────────────────
+
+    async def test_a_duration_is_never_negative_and_never_non_finite(self):
+        # A monotonic source that goes BACKWARDS. `duration_sec` outside
+        # [0, 1e6] -- or non-finite -- is dropped by `_validate_numeric_field`,
+        # and a dropped field is invisible: the counter would not read wrong,
+        # it would silently cease to exist.
+        import itertools
+        backwards = itertools.count(1000.0, -100.0)
+        capture = _Capture()
+        outcome, _, _, _ = await _drive(capture=capture, answers=("yes", "sunny"),
+                                        questions="2",
+                                        monotonic=lambda: next(backwards))
+        self.assertEqual(outcome, "canary_completed")
+        durations = [e["duration_sec"] for e in capture.entries if "duration_sec" in e]
+        self.assertGreaterEqual(len(durations), 3)
+        for value in durations:
+            with self.subTest(value=value):
+                self.assertGreaterEqual(value, 0.0)
+                self.assertTrue(math.isfinite(value))
+        # Every line that should carry one still does -- the clamp keeps the
+        # field, it does not drop it.
+        self.assertIn("duration_sec", capture.where("phone_canary_outcome")[0])
+
+    def test_the_clamp_handles_what_a_bad_clock_can_actually_produce(self):
+        self.assertEqual(phone_canary._duration(-5.0), 0.0)
+        self.assertEqual(phone_canary._duration(float("nan")), 0.0)
+        self.assertEqual(phone_canary._duration(float("-inf")), 0.0)
+        self.assertEqual(phone_canary._duration(float("inf")), 0.0)
+        # The upper clamp is for a finite absurdity -- 1e6 is the exact ceiling
+        # `_validate_numeric_field` drops above, so a value past it must land
+        # ON the ceiling rather than be dropped.
+        self.assertEqual(phone_canary._duration(2_000_000.0), 1_000_000.0)
+        self.assertEqual(phone_canary._duration(1.2345), 1.2)
+        # And each clamped value SURVIVES the numeric validator, which is the
+        # property that matters -- not the arithmetic.
+        capture = _Capture()
+        log = _real_logger(capture)
+        for raw in (-5.0, float("nan"), float("inf"), 2_000_000.0, 1.2345):
+            log.info("unknown_event", error_type="phone_canary_outcome",
+                     duration_sec=phone_canary._duration(raw))
+        for entry in capture.entries:
+            with self.subTest(entry=entry):
+                self.assertIn("duration_sec", entry)
+
+    # ── T7 ────────────────────────────────────────────────────────────
+
+    async def test_the_wait_BOUND_is_logged_once_at_entry(self):
+        # Without it, "participant_waited: 118.4" is unreadable: an operator
+        # cannot tell a wait that nearly expired from one with a minute to
+        # spare, and the bound lives in a different file.
+        capture = _Capture()
+        await _drive(capture=capture)
+        bounds = capture.where("phone_canary_wait_bound")
+        self.assertEqual(len(bounds), 1)
+        self.assertEqual(capture.codes.index("phone_canary_wait_bound"), 1)
+        self.assertEqual(bounds[0]["duration_sec"], phone.canary_participant_wait_sec())
+        # It is the CANARY's knob, not production's -- the distinction this
+        # lane already paid for once.
+        self.assertNotEqual(phone.canary_participant_wait_sec(),
+                            phone.phone_participant_wait_sec())
+
+    async def test_the_wait_bound_FOLLOWS_the_configured_knob(self):
+        capture = _Capture()
+        with patch.dict(os.environ, {"PHONE_CANARY_PARTICIPANT_WAIT_SEC": "90"}):
+            await _drive(capture=capture)
+            self.assertEqual(
+                capture.where("phone_canary_wait_bound")[0]["duration_sec"], 90.0)
 
 
 if __name__ == "__main__":

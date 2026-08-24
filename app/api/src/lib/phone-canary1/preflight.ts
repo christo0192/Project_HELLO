@@ -1,6 +1,6 @@
 /**
  * lib/phone-canary1/preflight.ts — every refusal that must happen BEFORE a
- * seam is touched, and the arithmetic that makes the outermost bound derived
+ * seam is touched, and the arithmetic that makes the outermost bounds derived
  * rather than chosen.
  *
  * Each refusal reports `providerContacted: false`, and a test asserts that a
@@ -8,7 +8,7 @@
  * client with zero calls. "Refused before the seam" is a claim about call
  * counts, not about statement order in a file.
  *
- * ── WHY THE THREE INEQUALITIES ARE CHECKED AND NOT ASSUMED ────────────
+ * ── WHY THE FIVE INEQUALITIES ARE CHECKED AND NOT ASSUMED ─────────────
  * `dial.ts` refuses `timeouts_misordered` rather than trusting two defaults to
  * stay ordered, with the reasoning written next to it: if the originate gives
  * up while the carrier is still ringing, the leg can STILL be answered
@@ -27,6 +27,11 @@
  * fault. `wall >= participant_wait + max_call + margin` makes the outermost
  * bound a consequence of the inner ones.
  *
+ * The fourth and fifth are the same discipline applied to the room's own
+ * `emptyTimeout` and to the pre-originate wait. Both are stated in full next
+ * to the code that checks them, and both refuse rather than clamp: a bound
+ * that silently moves is a bound nobody can reason about from a transcript.
+ *
  * ── AND WHY THE CREDENTIAL GATE IS SEPARATE FROM THE TRUNK GATE ───────
  * `isLiveDialPermitted` speaks for the phone flags; `isPhoneTransportReady`
  * speaks for the trunk; the credentials are a third, independent question. An
@@ -38,8 +43,10 @@
 
 import {
   CANARY1_BOUNDS,
+  CANARY1_ORIGINATE_MARGIN_SEC,
   CANARY1_PARTICIPANT_WAIT_MARGIN_SEC,
   CANARY1_WALL_CLOCK_MARGIN_SEC,
+  canary1RoomEmptyTimeoutSeconds,
 } from './plan.js';
 
 /** Every stable refusal the preflight may produce, in the order it checks them. */
@@ -50,6 +57,8 @@ export const CANARY1_PREFLIGHT_REFUSALS = [
   'timeouts_misordered',
   'waits_misordered',
   'bounds_misordered',
+  'room_timeout_misordered',
+  'origination_wait_misordered',
   'questions_out_of_range',
 ] as const;
 
@@ -64,6 +73,8 @@ export const CANARY1_PREFLIGHT_CHECKS: Readonly<Record<Canary1PreflightRefusal, 
     timeouts_misordered: 'preflight_timeouts_ordered',
     waits_misordered: 'preflight_waits_ordered',
     bounds_misordered: 'preflight_bounds_ordered',
+    room_timeout_misordered: 'preflight_room_timeout_ordered',
+    origination_wait_misordered: 'preflight_origination_wait_ordered',
     questions_out_of_range: 'preflight_questions_in_range',
   });
 
@@ -71,6 +82,13 @@ export interface Canary1TimeBounds {
   readonly ringSeconds: number;
   readonly originateTimeoutSeconds: number;
   readonly participantWaitSeconds: number;
+  readonly joinWaitSeconds: number;
+  /**
+   * The room's `emptyTimeout`, in seconds. DERIVED by the caller from
+   * `participantWaitSeconds` and passed in — see the fourth inequality below
+   * for why it is an input rather than a recomputation.
+   */
+  readonly roomEmptyTimeoutSeconds: number;
   readonly maxCallSeconds: number;
   readonly wallClockSeconds: number;
   readonly questions: number;
@@ -126,15 +144,21 @@ export function runCanary1Preflight(input: Canary1PreflightInput): Canary1Prefli
   // A declared range that nothing enforces is exactly the decorative control
   // this lane keeps deleting.
   //
-  // Checked BEFORE the three inequalities so a nonsense value is reported as
+  // Checked BEFORE the five inequalities so a nonsense value is reported as
   // out of range rather than as misordered — the refusal has to name the thing
   // the operator actually typed.
   for (const [name, value] of [
     ['ringSeconds', b.ringSeconds],
     ['originateTimeoutSeconds', b.originateTimeoutSeconds],
     ['participantWaitSeconds', b.participantWaitSeconds],
+    ['joinWaitSeconds', b.joinWaitSeconds],
     ['maxCallSeconds', b.maxCallSeconds],
     ['wallClockSeconds', b.wallClockSeconds],
+    // `roomEmptyTimeoutSeconds` is deliberately ABSENT from this loop: it is
+    // not an operator knob and has no `{def,min,max}` to check against. Its
+    // range IS the fourth inequality below, which is stronger than a static
+    // window because it moves with the wait it must outlive.
+    //
     // `questions` is deliberately ABSENT from this loop. Its real range is
     // 1..(the number of question texts that exist), which is checked below
     // against `questionsAvailable`. Checking it here too would make that
@@ -160,6 +184,53 @@ export function runCanary1Preflight(input: Canary1PreflightInput): Canary1Prefli
     < b.participantWaitSeconds + b.maxCallSeconds + CANARY1_WALL_CLOCK_MARGIN_SEC
   ) {
     return refuse('bounds_misordered');
+  }
+
+  // ── THE FOURTH AND FIFTH INEQUALITIES ───────────────────────────────
+  // Their POSITION here must match their position in
+  // `CANARY1_PREFLIGHT_REFUSALS` / `CANARY1_PREFLIGHT_CHECKS`, because the
+  // passing lines are emitted in the record's INSERTION order while the
+  // refusal order comes from the statement order in this function. The two
+  // orders are the same transcript to an operator, so they are edited
+  // together or the runbook's expected sequence stops being true.
+  //
+  // Fourth: the room must outlive the window in which we are still waiting for
+  // the worker. `emptyTimeout` runs from room CREATION and the canary room is
+  // created EMPTY, so a chosen value shorter than the join window means the
+  // provider reaps the room while the CLI is still watching it — and the
+  // observer then reports the same code an unarmed or scaled-to-zero worker
+  // produces. Derived, so a raised `--participant-wait-seconds` cannot
+  // silently re-open the gap.
+  //
+  // The value CHECKED is the one that will be passed to `createRoom`, not one
+  // recomputed here. That is what makes this a real gate rather than a
+  // tautology: comparing a derivation against itself can never fail, so the
+  // caller supplies the number it is actually going to use and this compares
+  // it against the minimum the join window demands. A future edit that
+  // hardcodes the old flat 120 back into the room builder refuses HERE, before
+  // a room exists — which is precisely the mutation that produced the defect.
+  if (b.roomEmptyTimeoutSeconds < canary1RoomEmptyTimeoutSeconds(b.participantWaitSeconds)) {
+    return refuse('room_timeout_misordered');
+  }
+
+  // Fifth: the pre-originate wait is CHARGED against the worker's own
+  // participant wait, which starts at job assignment. If the CLI may spend
+  // `joinWait` watching for the worker and then `ring` seconds ringing, the
+  // worker must still be waiting when the leg is answered — otherwise it gives
+  // up mid-ring, closes the room, and an answered handset hears nothing. That
+  // is the exact failure the pre-originate wait exists to prevent, arriving
+  // from the other side.
+  //
+  // The older `participantWait >= ring + PARTICIPANT_WAIT_MARGIN` above is
+  // KEPT. It is the PR#66 repair, it still governs the dry run, and where
+  // `joinWait + ORIGINATE_MARGIN >= PARTICIPANT_WAIT_MARGIN` this one
+  // dominates anyway. Two inequalities that agree cost nothing; deleting the
+  // older one "to avoid redundancy" would delete the reason it exists.
+  if (
+    b.participantWaitSeconds
+    < b.joinWaitSeconds + b.ringSeconds + CANARY1_ORIGINATE_MARGIN_SEC
+  ) {
+    return refuse('origination_wait_misordered');
   }
 
   // Derived from the copy that exists, so it stays reachable from both ends:

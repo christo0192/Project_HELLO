@@ -275,8 +275,20 @@ jobs:
           # guarantee, not the scale timing: pre-canary the API's
           # PHONE_AGENT_NAME is EMPTY (the api_silent_pre_canary state that
           # scripts/validate-voice-worker-apps.mjs enforces), so the API
-          # dispatches to no name and no room is ever routed to this worker. A
-          # briefly-live worker with nothing dispatching to it places no call.
+          # dispatches to no name, so no PRODUCTION room is ever routed to this
+          # worker.
+          #
+          # THAT IS A STATEMENT ABOUT THE API, NOT ABOUT THE SYSTEM. Since
+          # PR105 there is a SECOND dispatcher this workflow knows nothing
+          # about: the Canary-1 CLI (app/api/scripts/phone-canary1.ts)
+          # dispatches to this name DIRECTLY to LiveKit, bypassing the API
+          # entirely. It is gated by CANARY1_ARMED (false on main, enforced on
+          # every push to the default branch by scripts/check-main-disarmed.mjs)
+          # plus the PHONE_CANARY_ENABLED Fly secret (unset). Neither is
+          # reachable from this workflow, so the conclusion below still holds —
+          # but it now holds for TWO reasons, and this one is not automatic.
+          #
+          # A briefly-live worker with nothing dispatching to it places no call.
           #
           # Making it live AND dispatchable is the canary's separate, reviewed
           # workflow change (docs/runbooks/phone-worker-deployment.md §6): the

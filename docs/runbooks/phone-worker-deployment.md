@@ -210,9 +210,43 @@ opposite remedies):
 Only the first is tolerated, and only because the **post-release** scale is
 unconditional: it is the binding stopped/min-0 guarantee, and it fails the job
 if it cannot run.
-Provider/LiveKit/Supabase keys and the **SIP trunk value** are Fly **app**
-secrets set with `fly secrets set -a project-hello-phone-voice ...`; they are
-untouched by this workflow and must never appear in `fly.phone.toml`.
+**Worker app secrets — and the one key that must NOT be here.** The phone
+worker's Fly **app** secrets are set with `fly secrets set -a
+project-hello-phone-voice ...`; they are untouched by this workflow and must
+never appear in `fly.phone.toml`. The set the shared image actually reads is:
+
+| Key | Why the worker needs it |
+|---|---|
+| `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | register with LiveKit and accept a dispatched job |
+| `SARVAM_API_KEY` | STT and TTS. **Not** passed as a kwarg — the plugin reads it from the environment at **construction**, so its absence surfaces where the session is BUILT (`_build_phone_provider_session`), not at `session.start`. On the production path that is still after a handset is answered; on the Canary-1 path construction happens before the participant wait, which is what makes `phone_canary_session_built` observable on a dry run (`phone-canary1.md` §5) |
+| `GEMINI_API_KEY` | the LLM half of the same session |
+| Supabase keys, `WORKER_CONTEXT_SECRET` | the production screening path's context fetch |
+
+**`PHONE_SIP_TRUNK_ID` does not belong on this app.** An earlier revision of
+this file listed "the SIP trunk value" among the worker's app secrets. That was
+false three ways, and each is checkable from this repository: **(a)** no `.py`
+file under `app/voice-livekit/` names `PHONE_SIP_TRUNK_ID`; **(b)** it is absent
+from the `voice-livekit` component of `config/environment.schema.json` — it
+exists only under `api`; **(c)** the repo's own record of the deployed state
+(`ADR-0013 §7`, `phone-canary-and-halt.md`) is that it is bound in **no** app
+environment, which is the *correct* pre-canary state rather than a gap.
+
+The trunk id has exactly **two** legitimate homes:
+
+1. **`project-hello-api`** — the production dial lane, which loads it through
+   `loadPhoneDialConfig`. Not needed, and not set, before that lane opens.
+2. **The operator's transient subshell** for Canary-1 — the CLI reads
+   `process.env.PHONE_SIP_TRUNK_ID` in its own process and the value dies with
+   the subshell (`phone-canary1.md` §4a).
+
+Never the worker app. It matters in both directions. Staging the live trunk
+identifier as a durable secret on an app that never reads it is **new provider-
+identifier exposure for zero benefit**, on the one app this lane is otherwise
+careful to keep minimal. And having "set the trunk", an operator may reasonably
+read the trunk requirement as satisfied and then be surprised by
+`preflight_trunk_configured|FAIL|trunk_not_configured` during the canary — which
+is the one gate whose message is correct, and whose cause a wrong instruction
+here would have made confusing.
 
 ---
 
@@ -242,6 +276,38 @@ is always-on (min-1) and bills for its single shared VM continuously; that is
 its intended production posture, unchanged by this work.
 
 ---
+
+## 6a. Canary-1 window — NOT the §6 flip
+
+**Read this before §6 if what you are doing is the owner's own-number test
+call.** Canary-1 (`docs/runbooks/phone-canary1.md`) needs a phone worker that is
+running and dispatchable **by the operator's CLI**, for one supervised window.
+§6 is a different and much larger posture change: it makes the phone lane live
+for the **API**, permanently, until reverted. Doing §6 in order to run Canary-1
+would leave the production dial path armed after the window closed.
+
+**The four things §6 does that Canary-1 must NOT do:**
+
+| §6 step | Canary-1 |
+|---|---|
+| Set `PHONE_AGENT_NAME` on `project-hello-api` | **No.** The CLI dispatches by name **directly to LiveKit**, bypassing the API entirely. The API stays silent and `scripts/validate-voice-worker-apps.mjs` must keep reporting `phone_agent_name_state=api_silent_pre_canary` for the whole window — that state *is* the proof the API is not a participant |
+| Remove the two `flyctl scale count 0 -a project-hello-phone-voice` lines from `deploy-phone-voice` | **No.** Both lines stay. They are what returns the app to zero after the window, and after any later deploy |
+| Add a watermarked `registered worker` proof to the workflow | **No.** A stopped app has no registration to gate, so the job deliberately captures none. The owner captures one **by hand** before the run (`phone-canary1.md` §9 step 6) and must reject a stale line |
+| Update `scripts/deploy-fly-workflow.test.mjs` to match | **No.** No executable line of the workflow moves for Canary-1 |
+
+**Scale-up is a manual action, and the next deploy reverts it.** `fly scale count
+1 -a project-hello-phone-voice` is typed by the operator and is not recorded
+anywhere the workflow reads. Because the two `scale count 0` lines stay,
+**any** merge to `main` touching `app/voice-livekit/` re-deploys the phone app
+and scales it back to zero — mid-window if that is when it lands. That is why
+`phone-canary1.md` §9 step 4 opens a **merge freeze** over the window, and why
+`worker_present_before_originate|FAIL|worker_never_joined` has *two* causes with
+opposite remedies (the arming secret, and a mid-window re-zeroing). The freeze
+is checked with `gh run list --workflow "Deploy (Fly)" --limit 5` before and
+after the window.
+
+Rollback for Canary-1 is subtractive and needs nothing prepared here: scale to
+zero, unset the secret. See `phone-canary1.md` §11.
 
 ## 6. Canary flip (deferred, reviewed)
 

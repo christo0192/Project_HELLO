@@ -53,10 +53,7 @@ import type { PhoneDialConfig } from '../../integrations/livekit-phone-dial/conf
 import { discardingErrors, scrubVerbosity } from './containment.js';
 import { buildCanary1DispatchMetadata, buildCanary1RoomMetadata } from './metadata.js';
 import type { Canary1Ids } from './ids.js';
-import {
-  CANARY1_ROOM_EMPTY_TIMEOUT_SEC,
-  CANARY1_ROOM_MAX_PARTICIPANTS,
-} from './plan.js';
+import { CANARY1_ROOM_MAX_PARTICIPANTS } from './plan.js';
 import type { Canary1RoomTeardownClientLike } from './teardown.js';
 
 /** The room surface the canary needs: create, plus teardown's delete and list. */
@@ -125,16 +122,26 @@ export function buildCanary1DialConfig(
 export type Canary1RoomOutcome = 'created' | 'room_create_failed';
 export type Canary1DispatchOutcome = 'dispatched' | 'dispatch_failed';
 
-/** Create the canary room. Closed-key metadata, both bounds explicit. */
+/**
+ * Create the canary room. Closed-key metadata, both bounds explicit.
+ *
+ * `emptyTimeout` is a PARAMETER, not a constant read here. It is derived from
+ * the run's own participant wait by `canary1RoomEmptyTimeoutSeconds` and
+ * checked by the preflight's fourth inequality before this function is
+ * reached, so the room provably outlives the window in which the CLI is still
+ * waiting for the worker to appear in it. A constant read here is exactly the
+ * shape that let a chosen 120 sit under a 180 s join window.
+ */
 export async function createCanary1Room(
   ids: Canary1Ids,
   roomName: string,
   rooms: Canary1RoomClientLike,
+  emptyTimeoutSeconds: number,
 ): Promise<Canary1RoomOutcome> {
   const created = await discardingErrors(async () => {
     await rooms.createRoom({
       name: roomName,
-      emptyTimeout: CANARY1_ROOM_EMPTY_TIMEOUT_SEC,
+      emptyTimeout: emptyTimeoutSeconds,
       maxParticipants: CANARY1_ROOM_MAX_PARTICIPANTS,
       metadata: buildCanary1RoomMetadata(ids),
     });

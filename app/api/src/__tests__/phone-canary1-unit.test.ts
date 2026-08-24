@@ -18,13 +18,16 @@ import {
   CANARY1_ENV_PATH,
   CANARY1_ID_MINT_FAILED,
   CANARY1_LIVEKIT_ENV_KEY_RE,
+  CANARY1_ORIGINATE_MARGIN_SEC,
   CANARY1_PARTICIPANT_WAIT_MARGIN_SEC,
   CANARY1_QUESTIONS,
+  CANARY1_ROOM_EMPTY_MARGIN_SEC,
   CANARY1_UNPRINTABLE_LINE,
   CANARY1_WALL_CLOCK_MARGIN_SEC,
   canary1CountLine,
   canary1DoneLine,
   canary1MinimumWallClockSeconds,
+  canary1RoomEmptyTimeoutSeconds,
   canary1VerdictLine,
   createCanary1Emitter,
   destinationInEnvironment,
@@ -36,6 +39,7 @@ import {
   quietEnv,
   readCanary1Destination,
   runCanary1Preflight,
+  sanitizeCanary1TrunkId,
   scrubVerbosity,
   type Canary1PromptInterface,
   type Canary1TimeBounds,
@@ -464,7 +468,7 @@ describe('5. the identifiers are unrelated and satisfiable by the far end', () =
 });
 
 // ══════════════════════════════════════════════════════════════════════
-// 6. The six bounds, and the two inequalities the CLI refuses on.
+// 6. The seven bounds, and the five inequalities the CLI refuses on.
 // ══════════════════════════════════════════════════════════════════════
 
 const CREDS = { url: 'wss://x', apiKey: 'k', apiSecret: 's' };
@@ -472,6 +476,13 @@ const DEFAULT_BOUNDS: Canary1TimeBounds = {
   ringSeconds: CANARY1_BOUNDS.ringSeconds.def,
   originateTimeoutSeconds: CANARY1_BOUNDS.originateTimeoutSeconds.def,
   participantWaitSeconds: CANARY1_BOUNDS.participantWaitSeconds.def,
+  joinWaitSeconds: CANARY1_BOUNDS.joinWaitSeconds.def,
+  // DERIVED from the wait, exactly as `runCanary1` derives it. Writing a
+  // literal here would make every case below agree with a number the product
+  // does not compute.
+  roomEmptyTimeoutSeconds: canary1RoomEmptyTimeoutSeconds(
+    CANARY1_BOUNDS.participantWaitSeconds.def,
+  ),
   maxCallSeconds: CANARY1_BOUNDS.maxCallSeconds.def,
   wallClockSeconds: CANARY1_BOUNDS.wallClockSeconds.def,
   questions: CANARY1_BOUNDS.questions.def,
@@ -547,6 +558,14 @@ describe('6. the bounds are ordered, and the outermost one is derived', () => {
     expect(preflight({
       ringSeconds: ring,
       participantWaitSeconds: boundary,
+      // The FIFTH inequality also has an opinion at this boundary: at the
+      // default join wait of 75, `100 >= 75 + 40 + 15` is false, so this case
+      // would refuse `origination_wait_misordered` and stop testing the third
+      // inequality at all. Lowering the join wait keeps this case about the
+      // one relation it is named for. That interaction is the point of
+      // checking both rather than assuming they agree.
+      joinWaitSeconds: 30,
+      roomEmptyTimeoutSeconds: canary1RoomEmptyTimeoutSeconds(boundary),
       wallClockSeconds: boundary + DEFAULT_BOUNDS.maxCallSeconds + CANARY1_WALL_CLOCK_MARGIN_SEC,
     })).toMatchObject({ ok: true });
   });
@@ -580,7 +599,7 @@ describe('6. the bounds are ordered, and the outermost one is derived', () => {
     }
   });
 
-  it('the shipped defaults satisfy all three inequalities by arithmetic', () => {
+  it('the shipped defaults satisfy all FIVE inequalities by arithmetic', () => {
     const b = DEFAULT_BOUNDS;
     expect(b.ringSeconds).toBeLessThan(b.originateTimeoutSeconds);
     expect(b.participantWaitSeconds)
@@ -588,8 +607,164 @@ describe('6. the bounds are ordered, and the outermost one is derived', () => {
     expect(b.wallClockSeconds).toBeGreaterThanOrEqual(
       b.participantWaitSeconds + b.maxCallSeconds + CANARY1_WALL_CLOCK_MARGIN_SEC,
     );
+    expect(b.roomEmptyTimeoutSeconds)
+      .toBeGreaterThanOrEqual(canary1RoomEmptyTimeoutSeconds(b.participantWaitSeconds));
+    // FULLY ALLOCATED, and that is the accounting rather than an oversight:
+    // `120 = 75 + 30 + 15`. The participant wait is exactly its three
+    // consumers — the join window the CLI can observe, the ring, and
+    // `ORIGINATE_MARGIN`, which covers the gap between job assignment and the
+    // join we can see plus the originate call itself.
+    //
+    // The previous default was 60 with 15 s left over, described as "slack".
+    // It was not slack: 60 IS the worker's `initialize_process_timeout`, so
+    // the join window had zero margin for dispatch scheduling, process spawn,
+    // registration and `ctx.connect()`, and a HEALTHY cold start could report
+    // `worker_never_joined`. The leftover was an under-spent join window; the
+    // protection was always `ORIGINATE_MARGIN`, and it is still here.
+    //
+    // The consequence is asserted rather than described: at equality the
+    // preflight ADMITS the shipped defaults (the relation is `>=`, and E4
+    // pins that boundary from both sides), and any future raise of the ring or
+    // either margin refuses those defaults at the preflight — loudly, before a
+    // provider is contacted.
+    const charged = b.joinWaitSeconds + b.ringSeconds + CANARY1_ORIGINATE_MARGIN_SEC;
+    expect(b.joinWaitSeconds).toBe(75);
+    expect(charged).toBe(120);
+    expect(b.participantWaitSeconds - charged).toBe(0);
+    expect(preflight()).toMatchObject({ ok: true });
     // And the worker-side bound stays inside `phone.py`'s clamp of [1, 180].
     expect(b.participantWaitSeconds).toBeLessThanOrEqual(180);
+  });
+
+  // ── PR106 §2.5 — the fourth and fifth inequalities ──────────────────
+
+  it('E5 — refuses room_timeout_misordered when the room would be reaped mid-wait', () => {
+    // The DEFECT this encodes: `emptyTimeout` was a chosen 120 while the join
+    // window is `participantWait + 60` = 180 at the defaults. LiveKit's
+    // `empty_timeout` runs from room CREATION, and the canary room is created
+    // EMPTY and stays empty until the agent joins — unlike a production room,
+    // which is dialled within seconds. So between t=120 and t=180 the provider
+    // could reap the room while the CLI was still waiting for it.
+    const required = canary1RoomEmptyTimeoutSeconds(DEFAULT_BOUNDS.participantWaitSeconds);
+    expect(required).toBe(210);
+    // One second under refuses; the derived value passes; above passes.
+    expect(preflight({ roomEmptyTimeoutSeconds: required - 1 }))
+      .toMatchObject({ refusal: 'room_timeout_misordered', providerContacted: false });
+    expect(preflight({ roomEmptyTimeoutSeconds: required })).toMatchObject({ ok: true });
+    expect(preflight({ roomEmptyTimeoutSeconds: required + 1 })).toMatchObject({ ok: true });
+    // And THE mutation: the old chosen constant, against the shipped wait.
+    expect(preflight({ roomEmptyTimeoutSeconds: 120 }))
+      .toMatchObject({ refusal: 'room_timeout_misordered' });
+  });
+
+  it('E5 CONTROL — the requirement MOVES with the wait, so it cannot be a constant', () => {
+    // A raised `--participant-wait-seconds` must not silently re-open the gap.
+    // If the fourth inequality compared against a fixed number, the run below
+    // would pass with a timeout that is 60 s short of its own join window.
+    const raised = 180;
+    expect(canary1RoomEmptyTimeoutSeconds(raised)).toBe(270);
+    expect(preflight({
+      participantWaitSeconds: raised,
+      joinWaitSeconds: 30,
+      wallClockSeconds: 400,
+      roomEmptyTimeoutSeconds: canary1RoomEmptyTimeoutSeconds(120),
+    })).toMatchObject({ refusal: 'room_timeout_misordered' });
+    expect(CANARY1_ROOM_EMPTY_MARGIN_SEC).toBe(30);
+  });
+
+  it('E4 — refuses origination_wait_misordered when the pre-originate wait overspends', () => {
+    // The pre-originate wait is CHARGED against the worker's own participant
+    // wait, whose clock starts at JOB ASSIGNMENT. A naive "wait for the worker
+    // first" consumes the resource it is protecting: the worker gives up
+    // mid-ring, closes the room, and the answered handset hears nothing —
+    // which is the same silent answered call the wait exists to prevent,
+    // arriving from the other side.
+    const b = DEFAULT_BOUNDS;
+    const feasible = b.participantWaitSeconds - b.ringSeconds - CANARY1_ORIGINATE_MARGIN_SEC;
+    expect(feasible).toBe(75);
+    // One second over the feasible join wait refuses; at equality it passes,
+    // because the relation is `>=` — `participantWait >= joinWait + ring +
+    // margin`. The boundary is asserted from BOTH sides so neither a `>` nor a
+    // `<` typo survives.
+    expect(preflight({ joinWaitSeconds: feasible + 1 }))
+      .toMatchObject({ refusal: 'origination_wait_misordered', providerContacted: false });
+    expect(preflight({ joinWaitSeconds: feasible })).toMatchObject({ ok: true });
+    expect(preflight({ joinWaitSeconds: feasible - 1 })).toMatchObject({ ok: true });
+  });
+
+  it('E4 CONTROL — the knob ceiling is only reachable for SOME settings of the others', () => {
+    // 150 is inside `joinWaitSeconds`'s declared range, so the range check
+    // accepts it — and the fifth inequality refuses it at the default ring,
+    // because `150 + 30 + 15 = 195 > 180`. A knob whose maximum is reachable
+    // only for some settings of another knob is exactly why the relation is
+    // CHECKED rather than assumed, and why the refusal must not be a clamp.
+    expect(CANARY1_BOUNDS.joinWaitSeconds.max).toBe(150);
+    expect(preflight({
+      joinWaitSeconds: 150,
+      participantWaitSeconds: 180,
+      wallClockSeconds: 400,
+      roomEmptyTimeoutSeconds: canary1RoomEmptyTimeoutSeconds(180),
+    })).toMatchObject({ refusal: 'origination_wait_misordered' });
+    // At the MINIMUM ring it is satisfiable — `150 + 5 + 15 = 170 <= 180`.
+    expect(preflight({
+      joinWaitSeconds: 150,
+      ringSeconds: 5,
+      participantWaitSeconds: 180,
+      wallClockSeconds: 400,
+      roomEmptyTimeoutSeconds: canary1RoomEmptyTimeoutSeconds(180),
+    })).toMatchObject({ ok: true });
+    // And the knob's own range is still enforced, ahead of the relation, so
+    // the refusal names the thing the operator actually typed.
+    expect(preflight({ joinWaitSeconds: 29 }))
+      .toMatchObject({ refusal: 'bounds_out_of_range' });
+    expect(preflight({ joinWaitSeconds: 151 }))
+      .toMatchObject({ refusal: 'bounds_out_of_range' });
+  });
+
+  it('E7 — the trunk id goes through the PRODUCTION sanitiser', () => {
+    // The realistic failure is not an attack: the operator pastes the trunk id
+    // at a `read -rs` prompt, CANNOT SEE IT, and the paste carries a trailing
+    // space or a newline. Raw, that value reached the SDK — after the
+    // destination had been typed twice, the room created and the worker
+    // dispatched — and the transcript then said `originate_failed` with no
+    // detail, having already spent the double entry and created live provider
+    // state.
+    expect(sanitizeCanary1TrunkId('ST_abc-123')).toBe('ST_abc-123');
+
+    // SURROUNDING WHITESPACE IS NORMALISED, NOT REFUSED — and that is the
+    // production behaviour, not a weakening. `boundedOpaqueId` trims BEFORE it
+    // matches, so the blind-paste case is repaired rather than rejected, which
+    // is the better outcome for the one value the operator cannot see. Stated
+    // here explicitly because the accepted plan predicted a refusal for these
+    // four, and a test written to the prediction rather than to the loader
+    // would have pinned behaviour the product does not have.
+    for (const pasted of ['ST_abc ', 'ST_abc\n', ' ST_abc\t', '  ST_abc  ']) {
+      expect(sanitizeCanary1TrunkId(pasted), `mangled ${JSON.stringify(pasted)}`)
+        .toBe('ST_abc');
+    }
+
+    // What DOES reduce to '' — and therefore to `trunk_not_configured` before
+    // any seam — is everything the opaque-id class exists to exclude.
+    for (const raw of [
+      '+919812345670',        // the E.164 shape; `+` is outside the class DELIBERATELY
+      '+91 98123 45670',
+      'ST abc',               // an interior space is not trimmable
+      'ST/abc',
+      'a'.repeat(129),        // past the 128-character bound
+      '',
+      undefined,
+    ]) {
+      expect(sanitizeCanary1TrunkId(raw), `admitted ${JSON.stringify(raw)}`).toBe('');
+    }
+
+    // And an empty result is what `trunk_not_configured` is made of, so the
+    // sanitiser and the refusal are ONE control rather than two that must
+    // agree. `config.ts` states the reason for the class in the same terms:
+    // this field can never be talked into holding an E.164 value.
+    expect(preflight({}, sanitizeCanary1TrunkId('+919812345670')))
+      .toMatchObject({ refusal: 'trunk_not_configured', providerContacted: false });
+    // A legitimate id still reaches the preflight intact.
+    expect(preflight({}, sanitizeCanary1TrunkId('ST_abc-123\n'))).toMatchObject({ ok: true });
   });
 });
 

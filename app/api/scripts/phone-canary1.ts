@@ -76,9 +76,12 @@ installCanary1Containment({
 });
 
 // ── (1) Only now is the rest of the mechanism loaded. ─────────────────
-const { runCanary1, openCanary1Prompt, createCanary1LiveClients } = await import(
-  '../src/lib/phone-canary1/index.js'
-);
+const {
+  runCanary1,
+  openCanary1Prompt,
+  createCanary1LiveClients,
+  sanitizeCanary1TrunkId,
+} = await import('../src/lib/phone-canary1/index.js');
 
 const credentials = {
   url: process.env.LIVEKIT_URL ?? '',
@@ -125,7 +128,13 @@ const result = await runCanary1({
   rooms: clients.rooms,
   dispatch: clients.dispatch,
   credentials,
-  trunkId: process.env.PHONE_SIP_TRUNK_ID ?? '',
+  // Through the PRODUCTION sanitiser, not raw. The operator types this value
+  // BLIND at a `read -rs` prompt, so a trailing space or newline on a paste is
+  // the realistic failure — and raw it would reach the SDK, fail there, and
+  // spend the double entry and a live room first. Anything that is not a
+  // bounded opaque id becomes '' and refuses `trunk_not_configured` before a
+  // seam.
+  trunkId: sanitizeCanary1TrunkId(process.env.PHONE_SIP_TRUNK_ID),
   sleep: (ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms); }),
   now: () => Date.now(),
   onAbort: (teardown) => { abortTeardown = teardown; },

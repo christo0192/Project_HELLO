@@ -56,6 +56,8 @@ untrue while recording them.
 from __future__ import annotations
 
 import asyncio
+import math
+import time
 from typing import Any, Awaitable, Callable
 
 import phone
@@ -124,14 +126,62 @@ CANARY_REFUSALS = (
 )
 
 
+# ── The run counters, and why they are LOG LINES ──────────────────────
+# They are structured log lines, not metrics, for one reason: the metric sink
+# in this process is `observability._NoOpMetricSink`. `counter_metric()` here
+# would validate its name, filter its labels, and then hand the value to a
+# method whose body is `pass` — a counter nobody can ever read, which is worse
+# than no counter because it LOOKS like coverage.
+#
+# Every counter therefore rides a meta key `observability._ALLOWED_META_KEYS`
+# already contains (`error_type`, `error_category`, `schema`, `turn_index`,
+# `duration_sec`). A key outside that set is dropped SILENTLY by `_emit` — the
+# call succeeds, the line is written, and the field is simply not in it. So a
+# "new counter field" is not a small addition here; it is an invisible one.
+#
+# WHAT IS DELIBERATELY NOT EMITTED
+#   * a COUNT of anything. There is no allowlisted count key, and overloading
+#     `turn_index` — whose contract across this repo is *an index* — to also
+#     mean *a total* would put a second meaning on a shared field, which is how
+#     a dashboard silently sums indices. The number of questions asked is
+#     derivable by COUNTING `phone_canary_question_asked` lines;
+#   * the room name, a participant identity or its attribute map, `_item_text`
+#     output, an exception object, any destination-derived value, or a digest.
+#     The whole point of this module is that a phone number never reaches a log
+#     line, and a counter is still a log line.
+
+#: Every stable code this module may log. Pinned by test_phone_canary.py so a
+#: new log call cannot introduce an unreviewed vocabulary.
+CANARY_LOG_EVENTS: tuple[str, ...] = (
+    "phone_canary_start", "phone_canary_wait_bound",
+    "phone_canary_session_built", "phone_canary_participant_waited",
+    "phone_canary_session_started",
+    "phone_canary_question_asked", "phone_canary_answer_observed",
+    "phone_canary_answer_silent", "phone_canary_room_closed",
+    "phone_canary_outcome", "phone_canary_refused",
+)
+
+#: Every meta key this module may pass to the logger. A key outside this set is
+#: either dropped by observability (invisible) or a new free-text channel.
+CANARY_LOG_META_KEYS: frozenset[str] = frozenset(
+    {"error_type", "error_category", "schema", "turn_index", "duration_sec"}
+)
+
+
 # ── The one-shot latch ────────────────────────────────────────────────
 # PER PROCESS, and module-level on purpose. Without it an armed worker is a
 # STANDING CONVERSATIONAL ENDPOINT: every canary-shaped dispatch it ever
 # receives would be answered with a live conversation, indefinitely, and the
 # only thing stopping a second call would be nobody sending a second dispatch.
 #
-# Combined with the CLI's own single-shot latch and the operator's scale-down,
-# arming this worker buys exactly one conversation.
+# What it buys is that a SECOND conversation requires a second deliberate act.
+# It is NOT by itself a proof of "exactly one conversation": `_canary_ran` is
+# module-level, so it is per PROCESS, and the phone worker runs with
+# `num_idle_processes: 0` (agent.py:594), which means job processes are created
+# on demand. Whether a second JOB re-enters a FRESH process — and so a fresh,
+# unset latch — is unsettled (runbook R-m). Until it is settled, the
+# one-conversation property rests on the CLI's own single-shot latch,
+# `fly scale count 1`, and the operator — not on this variable.
 _canary_ran = False
 
 
@@ -148,6 +198,26 @@ def reset_canary_latch() -> None:
 def canary_has_run() -> bool:
     """Whether this process has already conducted its one canary call."""
     return _canary_ran
+
+
+def _duration(seconds: float) -> float:
+    """A wall-clock span, shaped so `observability` cannot silently drop it.
+
+    `_validate_numeric_field` drops `duration_sec` unless it is finite and in
+    [0, 1e6]. A dropped field is INVISIBLE — the line still appears, just
+    without the counter — so a clock oddity (a monotonic source that went
+    backwards across a suspend, an infinity out of a stubbed clock) would not
+    show up as a broken counter, it would show up as no counter at all.
+    Clamping here is what makes "the field is absent" mean "we never logged it".
+    """
+    if not math.isfinite(seconds):
+        return 0.0
+    return min(1_000_000.0, max(0.0, round(seconds, 1)))
+
+
+def _elapsed_since(started: float) -> float:
+    """Clamped wall seconds since a `time.monotonic()` reading."""
+    return _duration(time.monotonic() - started)
 
 
 async def _say(session: Any, text: str) -> None:
@@ -190,9 +260,39 @@ async def run_phone_canary(
     _canary_ran = True
 
     _log.info("unknown_event", error_type="phone_canary_start", schema=canary_id)
+    # The BOUND, logged at entry, so the wait below is readable against the
+    # budget it was actually given rather than against a default a reader has
+    # to go and look up in a second file.
+    _log.info("unknown_event", error_type="phone_canary_wait_bound",
+              duration_sec=_duration(phone.canary_participant_wait_sec()))
     await ctx.connect()
 
     session = session_factory()
+    # ── THE ONLY SESSION EVIDENCE A DRY RUN CAN PRODUCE ───────────────
+    # `phone_canary_session_started` (below) is emitted only AFTER something
+    # has answered. A dry run originates nothing, so no remote participant
+    # ever arrives, the wait below times out and that line is unreachable BY
+    # CONSTRUCTION -- not merely hard to catch. Requiring it as dry-run
+    # evidence would be a gate that cannot pass, which is a gate that gets
+    # waived.
+    #
+    # Construction is where the failure the worker-presence gate cannot see
+    # actually lands: `_build_phone_provider_session` constructs the STT, TTS
+    # and LLM plugins HERE, and those plugins read `SARVAM_API_KEY` /
+    # `GEMINI_API_KEY` from the environment rather than receiving them as
+    # kwargs. So a worker missing a provider key joins the room, opens the
+    # gate, and dies on the line ABOVE this one.
+    #
+    # It lands within milliseconds of `ctx.connect()`, i.e. well before the
+    # CLI's teardown deletes the room, which is what makes it reliably
+    # observable in `fly logs` on a dry run -- unlike
+    # `phone_canary_participant_waited`, which is on the other side of a wait
+    # the dry run's room does not survive.
+    #
+    # WHAT IT DOES NOT PROVE: key PRESENCE, not key VALIDITY. A present-but-
+    # wrong key still constructs and still fails mid-call. That residual is
+    # named in the runbook rather than papered over.
+    _log.info("unknown_event", error_type="phone_canary_session_built")
     turns: "asyncio.Queue[str]" = asyncio.Queue()
 
     @session.on("conversation_item_added")
@@ -205,6 +305,10 @@ async def run_phone_canary(
             turns.put_nowait(text)
 
     outcome = "canary_completed"
+    # Set BEFORE the try so the outcome line always has a duration to carry,
+    # and re-set once the conversation actually begins so the number means the
+    # conversation rather than the wait that preceded it.
+    conversation_started = time.monotonic()
     try:
         # ── ORDER IS LOAD-BEARING: WAIT, THEN START ───────────────────
         # The session is opened only AFTER something has answered, exactly as
@@ -212,7 +316,13 @@ async def run_phone_canary(
         # wait there is a code path on which the agent speaks, runs a turn or
         # starts a timer into a RINGING line — measuring the network rather
         # than the person.
+        wait_started = time.monotonic()
         participant = await wait_for_participant()
+        # BOTH branches. On the refusal branch the wait IS the evidence: an
+        # operator reading "no participant" needs to know whether the leg was
+        # given its whole budget or gave up in two seconds.
+        _log.info("unknown_event", error_type="phone_canary_participant_waited",
+                  duration_sec=_elapsed_since(wait_started))
         if participant is None:
             _log.warn("unknown_event", error_type="phone_canary_refused",
                       error_category="canary_no_participant")
@@ -235,7 +345,13 @@ async def run_phone_canary(
             # second literal — see the module docstring.
             record=dict(phone.PHONE_NO_RECORDING),
         )
+        # ANSWERED-CALL EVIDENCE ONLY. Everything above this line is
+        # reachable on a dry run; this line is not, because it sits after a
+        # wait that only an answered leg satisfies. `phone_canary_session_built`
+        # is the dry-run half of the same question.
+        _log.info("unknown_event", error_type="phone_canary_session_started")
 
+        conversation_started = time.monotonic()
         await asyncio.wait_for(
             _converse(session, turns), timeout=phone.canary_max_call_sec(),
         )
@@ -250,8 +366,11 @@ async def run_phone_canary(
         # the room's `emptyTimeout` means no single point of failure, and a
         # room whose processes both died still reaps itself.
         await close_room(room_name)
+        # The room name itself is NEVER the payload — only that a close ran.
+        _log.info("unknown_event", error_type="phone_canary_room_closed")
 
-    _log.info("unknown_event", error_type="phone_canary_outcome", error_category=outcome)
+    _log.info("unknown_event", error_type="phone_canary_outcome", error_category=outcome,
+              duration_sec=_elapsed_since(conversation_started))
     return outcome
 
 
@@ -262,7 +381,16 @@ async def _converse(session: Any, turns: "asyncio.Queue[str]") -> None:
     asked = min(phone.canary_questions(), len(CANARY_QUESTIONS))
     for index in range(asked):
         await _say(session, CANARY_QUESTIONS[index])
+        # `turn_index` carries the INDEX, and only the index. The count of
+        # questions asked is derived by counting these lines — see the note by
+        # `CANARY_LOG_EVENTS` on why it is not a field.
+        _log.info("unknown_event", error_type="phone_canary_question_asked",
+                  turn_index=index)
         answered = await _await_answer(turns)
+        _log.info("unknown_event",
+                  error_type=("phone_canary_answer_observed" if answered
+                              else "phone_canary_answer_silent"),
+                  turn_index=index)
         if not answered:
             # A silent answer is not a failure of the call — it is one datum
             # about this leg. The sequence continues so the operator still

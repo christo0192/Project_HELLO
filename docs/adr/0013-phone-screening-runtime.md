@@ -280,10 +280,54 @@ full rather than leaving a green run to be read as coverage.
   dispatch with no attempt id is always inert" is no longer what ships, and
   pretending otherwise would be the stale-tripwire class this lane keeps
   finding.
-* **A disarm lifecycle is therefore mandatory, not optional.** `CANARY1_ARMED`
-  ships `false` and is pinned false by a test; arming is PR106, which is
-  declared revert-on-completion with its revert commit prepared and linked
-  before the run. The worker's flag is a Fly **secret**, and
+* **A disarm lifecycle is therefore mandatory, not optional — and as of
+  2026-08-24 it is a *permanent* disarm, not a window.** `CANARY1_ARMED` ships
+  `false`, is pinned `false` by a test, and **stays `false` on `main` forever**.
+  Arming lives on `canary1/arm`: a reviewed, CI-green branch that is **never
+  merged** and is opened as a **DRAFT** pull request titled
+  `ACTIVATION ARTIFACT — DO NOT MERGE` with auto-merge off. There is no prepared
+  revert, because nothing is merged to revert.
+
+  **Why, stated as the decision it is.** `CANARY1_ARMED` is read by exactly
+  **one** program — `app/api/scripts/phone-canary1.ts`, a `tsx` script the owner
+  runs by hand from a local checkout. No Fly app runs it, no API route reaches
+  it, and no deploy consumes it. So merging `true` to `main` grants **zero**
+  operational capability that the owner's checkout does not already grant, while
+  paying for that nothing with a standing-armed default branch and a revert
+  somebody has to remember. An activation branch buys the same capability with
+  none of the standing risk, and it makes the accident single and nameable:
+  somebody merges the artifact.
+
+  That accident is what `scripts/check-main-disarmed.mjs` exists for. It runs on
+  **pushes to the default branch only**, and it fails `main` if the constant is
+  ever anything but the disarmed literal. It has to be a separate gate because
+  the structural pin **travels with the branch** — the artifact flips the
+  constant and the pin in one commit, so the artifact is green and a merge of the
+  artifact is green too. A test the artifact can rewrite is not a gate against
+  the artifact. Its wiring is asserted unguarded on every PR by
+  `scripts/check-main-disarmed.test.mjs`, so removing or loosening the gate goes
+  **red** on that PR.
+
+  **That red does not BLOCK anything, and this record must not imply it does.**
+  Queried 2026-08-24, twice and independently:
+  `GET /repos/christo0192/Project_HELLO/branches/main/protection` returns
+  **HTTP 404 ("Branch not protected")** and `GET …/rulesets` returns **`[]`**.
+  **`main` has no branch protection and `quality` is not a required status
+  check.** An earlier revision of this bullet said the gate's removal "goes red
+  before it can merge"; with nothing required, a red check is a **report, not a
+  veto** — the merge button stays live. The gate **detects** an accidental merge
+  of the artifact on the next push to `main`; it **cannot prevent** one.
+
+  **The prevention is therefore placed where it does not depend on a repository
+  setting: the artifact is a DRAFT pull request**, which GitHub refuses to merge
+  outright whatever the branch settings say. That instruction is itself pinned by
+  a static assertion in `scripts/check-main-disarmed.test.mjs`, so it cannot
+  regress to a non-draft in prose. Neither observation above is a secret; both
+  are repository configuration and both carry their date, because a claim about a
+  setting rots. **Nothing in this ADR or in PR106 changes any repository
+  setting.** See `docs/runbooks/phone-canary1.md` §4b.
+
+  The worker's flag is a Fly **secret**, and
   `scripts/validate-voice-worker-apps.mjs` scans only `[env]` tables — so a
   lingering secret is invisible to CI, which is exactly why the post-run disarm
   is an **ops assertion** (`fly secrets list`, names only) and not a CI one.
@@ -371,18 +415,27 @@ second case, which is the one a later revert actually produces.
   into one. It does not re-verify the 133 — that needs a live database this
   gate has no Docker for, and pretending otherwise would be the decorative
   evidence this lane keeps deleting.
-* `app/api/src/__tests__/phone-canary1-*.test.ts` — **169 declared test cases**
+* `app/api/src/__tests__/phone-canary1-*.test.ts` — **183 declared test cases**
   across seven files covering Canary-1's structural closure (the explicit file
   list including `app/api/scripts/phone-canary1.ts`, the moved-not-duplicated
   `node:fs` read permission, the no-write sweep, the containment ordering), the
-  refusals, the six bounds and their three inequalities, the originate seam, the
+  refusals, the bounds and their inequalities, the originate seam, the
   teardown, a `fast-check` privacy property over the whole valid destination
   space, and the two-sided cross-language pin against `phone_canary.py`.
+  The count moved from 169 with PR106's live-call close-out, which adds the
+  worker-presence precondition on the originate path, the derived room
+  `emptyTimeout` and its ordering inequality, the join-wait inequality, and the
+  trunk-id sanitiser — each with the control that goes red without it — and then
+  to 183 with PR106's review repair, which adds the two cases proving the join
+  observation does not latch a transient empty listing into
+  `room_reaped_before_join` and returns at once on a confirmed reap. **The
+  number above is whatever the gate below reports; it is not a remembered
+  constant and must not be edited to match a memory.**
   `scripts/check-phone-canary-evidence.test.mjs` derives this figure from the
   test sources and fails in EITHER direction if it and this record disagree.
   This number is **not comparable** to the two above and never will be: 133
   counts SQL checks against a live database, 139 counts offline assertions in a
-  dependency-free gate, and 169 counts test-case DECLARATIONS in a vitest suite
+  dependency-free gate, and 181 counts test-case DECLARATIONS in a vitest suite
   — the runtime total is higher because several cases are `it.each(...)` tables.
   The checker counts declarations because it runs before `npm ci` in
   `quality.yml` and cannot execute the suite; `npm test` in `app/api` is what
