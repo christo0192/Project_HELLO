@@ -22,7 +22,7 @@
  * at all". Nothing can be quoted by a message that was never printed.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import fc from 'fast-check';
 import { createHash } from 'node:crypto';
 
@@ -31,6 +31,7 @@ import {
   buildCanary1DispatchMetadata,
   buildCanary1RoomMetadata,
   mintCanary1Ids,
+  installCanary1Containment,
   runCanary1,
   type Canary1DispatchClientLike,
   type Canary1PromptInterface,
@@ -231,6 +232,97 @@ describe('3. a leaking provider error produces no number, no Error, no stack', (
     expect(result.lines)
       .toContain('CANARY|canary1|originate_answered|FAIL|originate_failed');
     expect(result.exitCode).toBe(1);
+  });
+
+  it('nothing reaches the REAL process streams — not stdout, not stderr', async () => {
+    // The assertions above read an in-memory array of what `deps.write`
+    // received. That cannot see a leak arriving by `console.error`, by a direct
+    // `process.stderr.write`, or by Node's own top-level printer — which are
+    // the three routes the containment layer exists to close. So this one
+    // watches the streams themselves.
+    const number = '+916012345678';
+    const captured: string[] = [];
+    const record = (chunk: unknown): boolean => {
+      captured.push(String(chunk));
+      return true;
+    };
+    const outSpy = vi.spyOn(process.stdout, 'write').mockImplementation(record as never);
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(record as never);
+    try {
+      const h = harness(number, {
+        // Write through the REAL stdout, as the entry script does.
+        write: (line) => { process.stdout.write(`${line}\n`); },
+        originate: {
+          live: () => ({
+            mode: 'live',
+            createSipParticipant: async () => {
+              const error = new Error(`rpc failed for ${number} on trunk ST_x`);
+              error.stack = `Error: rpc failed for ${number}\n    at Sip.create (sdk.js:1:1)`;
+              throw error;
+            },
+          }),
+        },
+      });
+      await runCanary1(h.deps);
+    } finally {
+      outSpy.mockRestore();
+      errSpy.mockRestore();
+    }
+    const streamed = captured.join('');
+    expect(streamed.length, 'the spies captured nothing at all').toBeGreaterThan(50);
+    expect(streamed).not.toContain('6012345678');
+    expect(streamed).not.toContain('rpc failed');
+    expect(streamed).not.toContain('ST_x');
+    expect(streamed).not.toMatch(/^Error:/m);
+    expect(streamed).not.toMatch(/\bat \w+.*\(.*:\d+:\d+\)/);
+    expect(streamed).toContain('CANARY|canary1|originate_answered|FAIL|originate_failed');
+  });
+
+  it('the REAL process handlers print a bare code and nothing else', async () => {
+    // The handler layer is registered on the real `process`, its listener is
+    // taken off again immediately (so nothing else in this suite inherits it),
+    // and then invoked directly with the containment's own emitter wired to the
+    // real streams. Invoking it directly rather than throwing for real is
+    // deliberate: a genuine uncaught exception would take the vitest worker
+    // with it and prove nothing about what was printed.
+    const number = '+916012345678';
+    const captured: string[] = [];
+    const before = process.listeners('uncaughtException').length;
+    let handler: ((...args: unknown[]) => void) | undefined;
+    const outSpy = vi.spyOn(process.stdout, 'write')
+      .mockImplementation(((c: unknown) => { captured.push(String(c)); return true; }) as never);
+    const errSpy = vi.spyOn(process.stderr, 'write')
+      .mockImplementation(((c: unknown) => { captured.push(String(c)); return true; }) as never);
+    try {
+      installCanary1Containment({
+        emit: (code) => { process.stdout.write(`CANARY|canary1|process_containment|FAIL|${code}\n`); },
+        teardown: async () => {},
+        exit: () => {},
+      });
+      const listeners = process.listeners('uncaughtException');
+      expect(listeners.length, 'the handler was not registered on the real process')
+        .toBe(before + 1);
+      handler = listeners[listeners.length - 1] as (...args: unknown[]) => void;
+      process.removeListener('uncaughtException', handler as never);
+      const rejection = process.listeners('unhandledRejection');
+      process.removeListener(
+        'unhandledRejection', rejection[rejection.length - 1] as never);
+
+      // THE ARITY IS THE CONTROL. Node passes the error as the first argument;
+      // a handler that declared a parameter would be one careless line away
+      // from printing it. This one cannot, because there is no identifier.
+      expect(handler.length, 'the handler binds the error Node hands it').toBe(0);
+
+      handler(new Error(`rpc failed for ${number}`));
+      await new Promise((r) => { setTimeout(r, 0); });
+    } finally {
+      outSpy.mockRestore();
+      errSpy.mockRestore();
+    }
+    const streamed = captured.join('');
+    expect(streamed).toBe('CANARY|canary1|process_containment|FAIL|uncaught_exception\n');
+    expect(streamed).not.toContain('6012345678');
+    expect(process.listeners('uncaughtException').length).toBe(before);
   });
 
   it('POSITIVE CONTROL — the stack matchers DO fire on a real stack', () => {

@@ -10,9 +10,9 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
+import { PassThrough, Writable } from 'node:stream';
 
 import {
-  CANARY1_ARGV_NUMBER_RE,
   CANARY1_CONFIRM_PHRASE,
   CANARY1_DESTINATION_ENV_RE,
   CANARY1_ENV_PATH,
@@ -31,6 +31,7 @@ import {
   livekitCredentialsPersisted,
   mintCanary1Ids,
   looksLikeDestination,
+  openCanary1Prompt,
   parseCanary1Argv,
   quietEnv,
   readCanary1Destination,
@@ -127,8 +128,13 @@ describe('1. the destination cannot arrive in argv', () => {
       '(98123)-45670', '91-98123-45670']) {
       expect(looksLikeDestination(token), `missed ${token}`).toBe(true);
     }
-    // The exported regex still recognises the unseparated forms.
-    expect(CANARY1_ARGV_NUMBER_RE.test('+919812345670')).toBe(true);
+    // And a seven-digit FLAG VALUE is reported as a destination, deliberately:
+    // seven consecutive digits is the shape the predicate exists to catch, and
+    // the safe direction to be wrong in.
+    expect(parseCanary1Argv(['--max-call-seconds', '1234567']))
+      .toMatchObject({ refusal: 'destination_in_argv' });
+    expect(parseCanary1Argv(['--max-call-seconds', '123456']))
+      .toMatchObject({ ok: true });
   });
 });
 
@@ -296,6 +302,93 @@ describe('4. the destination is typed twice, hidden, and never retained', () => 
 });
 
 // ══════════════════════════════════════════════════════════════════════
+// 4b. THE REAL readline interface — M-5, against `node:readline` itself.
+// ══════════════════════════════════════════════════════════════════════
+
+describe('4b. the real prompt suppresses echo and retains nothing', () => {
+  /**
+   * The tests above drive `readCanary1Destination` through a hand-written
+   * fake, which proves the CALLER empties an array. It cannot prove that
+   * `node:readline` was configured to keep nothing in the first place, and
+   * deleting `terminal: true`, `historySize: 0` and the `_writeToOutput`
+   * override would leave every one of them green.
+   *
+   * These construct the REAL `openCanary1Prompt` over in-memory streams.
+   */
+  function realPrompt(): {
+    rl: ReturnType<typeof openCanary1Prompt>;
+    written: string[];
+    input: PassThrough;
+  } {
+    const input = new PassThrough();
+    const written: string[] = [];
+    const output = new Writable({
+      write(chunk: Buffer | string, _enc, cb) {
+        written.push(chunk.toString());
+        cb();
+      },
+    }) as unknown as NodeJS.WritableStream;
+    return { rl: openCanary1Prompt(input, output), written, input };
+  }
+
+  it('the typed value is NEVER echoed to the output stream', async () => {
+    const { rl, written, input } = realPrompt();
+    const answer = rl.question('> ');
+    input.write(`${FAKE_NUMBER}\n`);
+    expect(await answer).toBe(FAKE_NUMBER);
+    rl.close();
+    const all = written.join('');
+    // The prompt itself is written; not one digit of the value is.
+    expect(all).toContain('> ');
+    expect(all).not.toContain(FAKE_NUMBER);
+    expect(all).not.toContain('9812345670');
+    expect(all).not.toMatch(/\d{4,}/);
+  });
+
+  it('readline itself retains no history, before anything clears it', async () => {
+    const { rl, input } = realPrompt();
+    const answer = rl.question('> ');
+    input.write(`${FAKE_NUMBER}\n`);
+    await answer;
+    // NOT cleared by the caller here — this is what `node:readline` kept on
+    // its own, which is what `historySize: 0` is for.
+    expect(rl.history).toEqual([]);
+    rl.close();
+  });
+
+  it('the whole double entry leaves nothing in either real interface', async () => {
+    const input = new PassThrough();
+    const written: string[] = [];
+    const output = new Writable({
+      write(chunk: Buffer | string, _enc, cb) { written.push(chunk.toString()); cb(); },
+    }) as unknown as NodeJS.WritableStream;
+    const opened: Array<ReturnType<typeof openCanary1Prompt>> = [];
+    const result = readCanary1Destination(
+      {
+        isTty: true,
+        openPrompt: () => {
+          const rl = openCanary1Prompt(input, output);
+          opened.push(rl);
+          return rl;
+        },
+      },
+      (text) => written.push(text),
+    );
+    input.write(`${FAKE_NUMBER}\n`);
+    await new Promise((r) => { setImmediate(r); });
+    input.write(`${FAKE_NUMBER}\n`);
+    const destination = await result;
+
+    expect(destination.ok).toBe(true);
+    expect(opened).toHaveLength(2);
+    for (const rl of opened) expect(rl.history).toEqual([]);
+    const all = written.join('');
+    expect(all).not.toContain(FAKE_NUMBER);
+    expect(all).not.toMatch(/\d{4,}/);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
 // 5. Three unrelated identifiers, and the digit-run agreement.
 // ══════════════════════════════════════════════════════════════════════
 
@@ -372,23 +465,52 @@ describe('6. the bounds are ordered, and the outermost one is derived', () => {
     })).toMatchObject({ refusal: 'livekit_credentials_missing', providerContacted: false });
   });
 
+  it('refuses bounds_out_of_range BEFORE it reasons about order', () => {
+    // The declared `{min,max}` used to be read by nothing, so an operator flag
+    // was unbounded: `--max-call-seconds 3600` would have set a one-hour
+    // ceiling on a live PSTN leg, and `--participant-wait-seconds 500` would
+    // have been checked against a value `phone.py` clamps away to 180.
+    for (const over of [
+      { ringSeconds: 0 },
+      { ringSeconds: 61 },
+      { originateTimeoutSeconds: 5 },
+      { maxCallSeconds: 3_600, wallClockSeconds: 3_750 },
+      { participantWaitSeconds: 500, wallClockSeconds: 900 },
+      { wallClockSeconds: 60 },
+      { ringSeconds: 30.5 },
+    ]) {
+      expect(preflight(over), JSON.stringify(over))
+        .toMatchObject({ refusal: 'bounds_out_of_range', providerContacted: false });
+    }
+    // Every declared default is inside its own declared range — otherwise the
+    // shipped configuration would refuse itself.
+    for (const [name, bound] of Object.entries(CANARY1_BOUNDS)) {
+      expect(bound.def, `${name} default is outside its own range`)
+        .toBeGreaterThanOrEqual(bound.min);
+      expect(bound.def, `${name} default is outside its own range`)
+        .toBeLessThanOrEqual(bound.max);
+    }
+  });
+
   it('refuses timeouts_misordered when the originate could expire mid-ring', () => {
     // `dial.ts` gate 1a, mirrored: if the originate gives up while the carrier
-    // is still ringing, the leg can STILL be answered afterwards.
+    // is still ringing, the leg can STILL be answered afterwards. Both values
+    // are IN RANGE, so this proves the ordering check and not the range check.
     expect(preflight({ ringSeconds: 60, originateTimeoutSeconds: 60 }))
       .toMatchObject({ refusal: 'timeouts_misordered' });
-    expect(preflight({ ringSeconds: 61, originateTimeoutSeconds: 60 }))
+    expect(preflight({ ringSeconds: 60, originateTimeoutSeconds: 10 }))
       .toMatchObject({ refusal: 'timeouts_misordered' });
   });
 
   it('refuses waits_misordered — a wait charged against a failure budget', () => {
     // The worker's wait clock starts at JOB ASSIGNMENT, before the originate.
-    expect(preflight({ participantWaitSeconds: 45 }))
-      .toMatchObject({ refusal: 'waits_misordered' });
-    const boundary = DEFAULT_BOUNDS.ringSeconds + CANARY1_PARTICIPANT_WAIT_MARGIN_SEC;
-    expect(preflight({ participantWaitSeconds: boundary - 1 }))
+    // Both values in range, so this is the ordering check, not the range check.
+    const ring = 40;
+    const boundary = ring + CANARY1_PARTICIPANT_WAIT_MARGIN_SEC;
+    expect(preflight({ ringSeconds: ring, participantWaitSeconds: boundary - 1 }))
       .toMatchObject({ refusal: 'waits_misordered' });
     expect(preflight({
+      ringSeconds: ring,
       participantWaitSeconds: boundary,
       wallClockSeconds: boundary + DEFAULT_BOUNDS.maxCallSeconds + CANARY1_WALL_CLOCK_MARGIN_SEC,
     })).toMatchObject({ ok: true });
@@ -411,10 +533,16 @@ describe('6. the bounds are ordered, and the outermost one is derived', () => {
     expect(preflight({ wallClockSeconds: minimum })).toMatchObject({ ok: true });
   });
 
-  it('refuses a question count the worker cannot honour', () => {
+  it('refuses a question count the copy cannot honour, from BOTH ends', () => {
+    // One guard, derived from the number of question texts that exist — not a
+    // second range check that could never fire while the copy holds three.
     expect(preflight({ questions: 0 })).toMatchObject({ refusal: 'questions_out_of_range' });
     expect(preflight({ questions: CANARY1_QUESTIONS.length + 1 }))
       .toMatchObject({ refusal: 'questions_out_of_range' });
+    // And every count the copy CAN honour is accepted.
+    for (let n = 1; n <= CANARY1_QUESTIONS.length; n += 1) {
+      expect(preflight({ questions: n }), `rejected ${n}`).toMatchObject({ ok: true });
+    }
   });
 
   it('the shipped defaults satisfy all three inequalities by arithmetic', () => {

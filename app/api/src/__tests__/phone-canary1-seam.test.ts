@@ -25,7 +25,6 @@ import {
   CANARY1_DISPATCH_MODE,
   CANARY1_EPOCH,
   CANARY1_NOT_ARMED,
-  CANARY1_PARTICIPANT_ATTRIBUTES,
   buildCanary1DialConfig,
   buildCanary1ScreeningConfig,
   mintCanary1Ids,
@@ -135,11 +134,6 @@ describe('1. the originate seam carries exactly what it must', () => {
     expect(JSON.stringify({ n: request.number })).toBe('{"n":"[redacted]"}');
   });
 
-  it('sets exactly one participant attribute, by exact key', () => {
-    expect(Object.keys(CANARY1_PARTICIPANT_ATTRIBUTES)).toEqual([PHONE_EPOCH_ATTRIBUTE]);
-    expect(CANARY1_PARTICIPANT_ATTRIBUTES[PHONE_EPOCH_ATTRIBUTE]).toBe(String(CANARY1_EPOCH));
-  });
-
   it('CROSS-FILE PIN — the live client still hides the number from room state', () => {
     // The canary relies on `hidePhoneNumber: true`, which lives in `sip.ts`.
     // Asserting it here means the canary's claim goes red if that line is ever
@@ -150,6 +144,19 @@ describe('1. the originate seam carries exactly what it must', () => {
     );
     expect(sip).toContain('hidePhoneNumber: true');
     expect(sip).toContain('unwrapDialableNumber(request.number)');
+
+    // EXACTLY ONE participant attribute, by exact key, and sourced from the
+    // request's own epoch. This is pinned HERE, against the real construction
+    // site, because `PhoneOriginateRequest` has no attributes field — so an
+    // injected fake cannot observe them, and a canary-side constant asserting
+    // their shape would be asserting a value nothing sends. An earlier revision
+    // exported exactly such a constant; it was deleted rather than tested.
+    expect(sip).toContain(
+      "participantAttributes: { [PHONE_EPOCH_ATTRIBUTE]: String(request.epoch) },");
+    const attributeSites = [...sip.matchAll(/participantAttributes:/g)].length;
+    expect(attributeSites, 'a second participant-attribute site appeared').toBe(1);
+    // And the allowlist that key is indexed out of still holds exactly one name.
+    expect(PHONE_EPOCH_ATTRIBUTE).toBe('phone_epoch');
     // And the unwrap still has exactly ONE call site in the whole package.
     const unwraps = [...sip.matchAll(/unwrapDialableNumber\(/g)].length;
     expect(unwraps).toBe(1);
@@ -336,13 +343,59 @@ describe('3. one invocation, one room, at most one originate', () => {
     expect(result.lines.some((l) => l.includes('preflight_destination_accepted'))).toBe(false);
   });
 
-  it('a DRY RUN dispatches and tears down without originating', async () => {
+  it('a DRY RUN dispatches, WAITS for the worker, and tears down without originating', async () => {
     const h = harness({ argv: [] });
     const result = await runCanary1(h.deps);
     expect(h.seen).toEqual([]);
     expect(h.calls).toContain('createDispatch');
     expect(result.lines).toContain('CANARY|canary1|originate_skipped|PASS|dry_run');
+    // The line that makes the dry run worth running: the named worker was
+    // OBSERVED in the room, which is the only offline-safe evidence that
+    // arming, the dispatch metadata and the worker's inbound guard agree.
+    expect(result.lines).toContain('CANARY|canary1|worker_joined|PASS|ok');
     expect(result.exitCode).toBe(0);
+  });
+
+  it('a DRY RUN whose worker never joins FAILS rather than reporting success', async () => {
+    // An earlier shape emitted `originate_skipped` and fell straight into
+    // teardown, deleting the room within milliseconds of the dispatch — before
+    // the worker could possibly have been assigned the job. It would have
+    // reported success for a run that proved only that a room can be created.
+    let clock = 0;
+    const h = harness({ argv: [] });
+    const result = await runCanary1({
+      ...h.deps,
+      rooms: {
+        async createRoom() {},
+        async deleteRoom() {},
+        // Present, but empty: the room exists and no agent ever arrives.
+        async listRooms() { return [{ numParticipants: 0 }]; },
+      },
+      now: () => { clock += 30_000; return clock; },
+      sleep: async () => {},
+    });
+    expect(result.lines)
+      .toContain('CANARY|canary1|worker_joined|FAIL|worker_never_joined');
+    expect(result.exitCode).toBe(1);
+  });
+
+  it('a vanished room is NOT read as the worker having run', async () => {
+    // `emptyTimeout` can reap a room the worker never reached. "The worker ran"
+    // and "we could not tell" must not look the same.
+    let clock = 0;
+    const h = harness({ argv: [] });
+    const result = await runCanary1({
+      ...h.deps,
+      rooms: {
+        async createRoom() {},
+        async deleteRoom() {},
+        async listRooms() { return []; },
+      },
+      now: () => { clock += 30_000; return clock; },
+      sleep: async () => {},
+    });
+    expect(result.lines)
+      .toContain('CANARY|canary1|worker_joined|FAIL|worker_never_joined');
   });
 
   it('a failed preflight touches no client at all', async () => {
@@ -380,6 +433,26 @@ describe('3. one invocation, one room, at most one originate', () => {
     expect(h.calls).toEqual([]);
     expect(result.lines)
       .toContain('CANARY|canary1|environment_accepted|FAIL|destination_in_environment');
+  });
+
+  it('a delete that THROWS on an already-reaped room is not a failure', async () => {
+    // `teardown.ts` treats this as a success, with the reason written next to
+    // it. An earlier orchestration drove `teardown_room_deleted` off
+    // `deleteCalled`, so it printed FAIL and forced a non-zero exit for a room
+    // that does not exist — sending an operator to the LiveKit console for
+    // nothing, which is precisely what teardown's own comment warns against.
+    const h = harness();
+    const result = await runCanary1({
+      ...h.deps,
+      rooms: {
+        async createRoom() {},
+        async deleteRoom() { throw new Error('room already gone'); },
+        async listRooms() { return [{ numParticipants: 2 }]; },
+      },
+    });
+    expect(result.lines).toContain('CANARYCOUNT|canary1|teardown_delete_returned|0');
+    expect(result.lines.some((l) => l.startsWith('CANARY|canary1|teardown_room_deleted')))
+      .toBe(false);
   });
 
   it('a room that never opens does not dispatch and still tears down', async () => {

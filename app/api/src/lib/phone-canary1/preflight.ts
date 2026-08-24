@@ -37,6 +37,7 @@
  */
 
 import {
+  CANARY1_BOUNDS,
   CANARY1_PARTICIPANT_WAIT_MARGIN_SEC,
   CANARY1_WALL_CLOCK_MARGIN_SEC,
 } from './plan.js';
@@ -45,6 +46,7 @@ import {
 export const CANARY1_PREFLIGHT_REFUSALS = [
   'trunk_not_configured',
   'livekit_credentials_missing',
+  'bounds_out_of_range',
   'timeouts_misordered',
   'waits_misordered',
   'bounds_misordered',
@@ -58,6 +60,7 @@ export const CANARY1_PREFLIGHT_CHECKS: Readonly<Record<Canary1PreflightRefusal, 
   Object.freeze({
     trunk_not_configured: 'preflight_trunk_configured',
     livekit_credentials_missing: 'preflight_livekit_credentials',
+    bounds_out_of_range: 'preflight_bounds_in_range',
     timeouts_misordered: 'preflight_timeouts_ordered',
     waits_misordered: 'preflight_waits_ordered',
     bounds_misordered: 'preflight_bounds_ordered',
@@ -113,6 +116,37 @@ export function runCanary1Preflight(input: Canary1PreflightInput): Canary1Prefli
     return refuse('livekit_credentials_missing');
   }
 
+  // ── RANGE BEFORE ORDER ──────────────────────────────────────────────
+  // `CANARY1_BOUNDS` declares a `{def, min, max}` for every knob, and an
+  // earlier revision read only `def` — so the ranges were decorative and an
+  // operator flag was unbounded. `--max-call-seconds 3600` would have set a
+  // one-hour ceiling on a live PSTN leg past a declared maximum of 300, and
+  // `--participant-wait-seconds 500` would have been checked against a value
+  // the worker never uses, because `phone.py` clamps that knob to [1, 180].
+  // A declared range that nothing enforces is exactly the decorative control
+  // this lane keeps deleting.
+  //
+  // Checked BEFORE the three inequalities so a nonsense value is reported as
+  // out of range rather than as misordered — the refusal has to name the thing
+  // the operator actually typed.
+  for (const [name, value] of [
+    ['ringSeconds', b.ringSeconds],
+    ['originateTimeoutSeconds', b.originateTimeoutSeconds],
+    ['participantWaitSeconds', b.participantWaitSeconds],
+    ['maxCallSeconds', b.maxCallSeconds],
+    ['wallClockSeconds', b.wallClockSeconds],
+    // `questions` is deliberately ABSENT from this loop. Its real range is
+    // 1..(the number of question texts that exist), which is checked below
+    // against `questionsAvailable`. Checking it here too would make that
+    // second guard unreachable while the copy holds three questions — a guard
+    // that cannot fire reads as a safety net and is not one.
+  ] as const) {
+    const bound = CANARY1_BOUNDS[name];
+    if (!Number.isSafeInteger(value) || value < bound.min || value > bound.max) {
+      return refuse('bounds_out_of_range');
+    }
+  }
+
   // Mirrors `dial.ts` gate 1a. STRICTLY greater, not "greater or equal": an
   // originate that expires on the same tick the ring does is the same race.
   if (b.ringSeconds >= b.originateTimeoutSeconds) return refuse('timeouts_misordered');
@@ -128,6 +162,9 @@ export function runCanary1Preflight(input: Canary1PreflightInput): Canary1Prefli
     return refuse('bounds_misordered');
   }
 
+  // Derived from the copy that exists, so it stays reachable from both ends:
+  // 0 and 4 both fire today, and it starts refusing 3 the moment a question is
+  // deleted from `CANARY1_QUESTIONS`.
   if (
     !Number.isSafeInteger(b.questions)
     || b.questions < 1

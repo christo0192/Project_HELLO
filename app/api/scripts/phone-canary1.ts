@@ -38,11 +38,13 @@ import {
   scrubVerbosity,
 } from '../src/lib/phone-canary1/containment.js';
 
-// ── (0) CONTAINMENT FIRST. Literally the first statements. ────────────
-// The handlers take no parameter, so there is no identifier holding the error
-// that a later edit could reach for. A provider message may quote the dialled
-// number; Node's default top-level printer would put it on stderr inside a
-// stack trace.
+// ── (0) SCRUB, THEN CONTAIN — both ahead of any TTY read. ─────────────
+// Order within this pair does not matter — neither reads a TTY — but both must
+// precede the destination being read, which is what the structural suite
+// asserts. The handlers take no parameter, so there is no identifier holding
+// the error that a later edit could reach for. A provider message may quote the
+// dialled number; Node's default top-level printer would put it on stderr
+// inside a stack trace.
 // A verbose SDK is a provider message on stderr, which is the leak the
 // containment layer exists to prevent, arriving by a route it cannot catch.
 // Scrubbed IN PLACE, in the map the SDK will read, because a scrubbed copy
@@ -101,7 +103,7 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
       try {
         if (abortTeardown !== null) await abortTeardown();
       } catch {
-        write('CANARY|canary1|teardown_room_deleted|FAIL|cleanup_failed');
+        write('CANARY|canary1|teardown_room_absent|FAIL|cleanup_failed');
       } finally {
         // The abort ENDS the process. Leaving it alive to finish an originate
         // the operator just cancelled is the opposite of an abort.

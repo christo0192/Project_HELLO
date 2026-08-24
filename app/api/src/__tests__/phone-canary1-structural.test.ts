@@ -527,17 +527,38 @@ describe('7. one invocation, one destination, at most one originate', () => {
     const testFiles = readdirSync(TESTS_DIR).filter((f) => f.endsWith('.test.ts'));
     expect(testFiles.length, 'the sweep found no test files').toBeGreaterThan(20);
 
-    const canary1 = testFiles.filter((f) => f.startsWith('phone-canary1-'));
-    expect(canary1.length, 'the canary-1 suite was not found').toBeGreaterThanOrEqual(6);
-    const offenders = canary1.filter((name) =>
-      /\bcreateLiveSipClient\s*\(/.test(readFileSync(path.join(TESTS_DIR, name), 'utf8')));
-    expect(offenders).toEqual([]);
+    // The scan is on the IMPORT, not on a call shape. An earlier form matched
+    // `createLiveSipClient\s*\(\s*URL`, which found the one existing file only
+    // because its fixture happens to be named `URL_` — a new file writing
+    // `createLiveSipClient(url, key, secret)` would have slipped straight
+    // past the pin that claims to catch exactly that. Importing the symbol is
+    // the real precondition for constructing it, and it cannot be spelled
+    // around.
+    const importsLive = (name: string): boolean =>
+      /import\s*\{[^}]*\bcreateLiveSipClient\b[^}]*\}/s
+        .test(readFileSync(path.join(TESTS_DIR, name), 'utf8'));
 
-    // And the pre-existing exemption is PINNED, so a new file joining it is a
-    // failure rather than an unremarked drift.
-    const constructors = testFiles.filter((name) =>
-      /\bcreateLiveSipClient\s*\(\s*URL/.test(readFileSync(path.join(TESTS_DIR, name), 'utf8')));
-    expect(constructors).toEqual(['phone-dial-sip.test.ts']);
+    // THIS file is excluded, by name and for a stated reason: it is the
+    // scanner, and it carries the seeded control below, so it must be able to
+    // write the pattern it looks for. Exactly one exclusion, asserted, so the
+    // exemption cannot quietly grow.
+    const SCANNER = 'phone-canary1-structural.test.ts';
+    const scanned = testFiles.filter((f) => f !== SCANNER);
+    expect(testFiles).toContain(SCANNER);
+
+    const canary1 = scanned.filter((f) => f.startsWith('phone-canary1-'));
+    expect(canary1.length, 'the canary-1 suite was not found').toBeGreaterThanOrEqual(6);
+    expect(canary1.filter(importsLive)).toEqual([]);
+
+    // And the pre-existing exemption is PINNED by name, so a new file joining
+    // it is a failure rather than an unremarked drift.
+    expect(scanned.filter(importsLive)).toEqual(['phone-dial-sip.test.ts']);
+
+    // NON-VACUOUS: the matcher finds the one file that really does import it,
+    // in the multi-line form that file actually uses.
+    expect(importsLive('phone-dial-sip.test.ts')).toBe(true);
+    expect(/import\s*\{[^}]*\bcreateLiveSipClient\b[^}]*\}/s
+      .test("import {\n  createLiveSipClient,\n} from './x.js';")).toBe(true);
   });
 
   it('the canary resolves its client by injection, never by construction', () => {

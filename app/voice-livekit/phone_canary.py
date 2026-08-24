@@ -85,7 +85,7 @@ CANARY_DISCLOSURE_TEXT = (
     "This is an automated test call from Interview Kickstart's screening system, "
     "placed by the system owner to their own number. No candidate is involved, "
     "this call is not being recorded, and nothing you say is stored. "
-    "I'll ask two short questions to check the audio and then hang up."
+    "I'll ask a few short questions to check the audio and then hang up."
 )
 
 #: Open enough to produce a real answer — the point is turn-taking, barge-in,

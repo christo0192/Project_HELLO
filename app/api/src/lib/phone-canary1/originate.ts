@@ -42,7 +42,6 @@
  */
 
 import {
-  PHONE_EPOCH_ATTRIBUTE,
   resolvePhoneSipClient,
   type DialableNumber,
   type PhoneOriginateResult,
@@ -236,11 +235,6 @@ export async function originateCanary1Call(
   return { status: 'answered', result, mode: resolution.client.mode };
 }
 
-/** The attribute set on the SIP participant. Exactly one key, by exact name. */
-export const CANARY1_PARTICIPANT_ATTRIBUTES: Readonly<Record<string, string>> = Object.freeze({
-  [PHONE_EPOCH_ATTRIBUTE]: String(CANARY1_EPOCH),
-});
-
 /**
  * Build the real LiveKit room and dispatch clients.
  *
@@ -250,8 +244,9 @@ export const CANARY1_PARTICIPANT_ATTRIBUTES: Readonly<Record<string, string>> = 
  * did would be one credential away from a real room, and the suite asserts
  * that `createLiveSipClient` is never named in a test file.
  *
- * The SDK is constructed against `quietEnv`-scrubbed values so no debug level
- * can turn a provider message into a line on stderr.
+ * The verbosity keys are scrubbed from the environment map the SDK will read
+ * before it is constructed, so no debug level can turn a provider message into
+ * a line on stderr.
  */
 export function createCanary1LiveClients(
   credentials: Canary1Credentials,

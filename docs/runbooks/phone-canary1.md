@@ -151,6 +151,7 @@ CANARY|canary1|environment_accepted|PASS|ok
 CANARY|canary1|credentials_transient|PASS|ok
 CANARY|canary1|preflight_trunk_configured|PASS|ok
 CANARY|canary1|preflight_livekit_credentials|PASS|ok
+CANARY|canary1|preflight_bounds_in_range|PASS|ok
 CANARY|canary1|preflight_timeouts_ordered|PASS|ok
 CANARY|canary1|preflight_waits_ordered|PASS|ok
 CANARY|canary1|preflight_bounds_ordered|PASS|ok
@@ -162,18 +163,25 @@ CANARY|canary1|dispatch_created|PASS|ok
 CANARY|canary1|originate_answered|PASS|ok
 CANARY|canary1|conversation_observed|PASS|room_occupied
 CANARYCOUNT|canary1|call_seconds|63
-CANARY|canary1|teardown_room_deleted|PASS|ok
+CANARYCOUNT|canary1|teardown_delete_returned|1
 CANARY|canary1|teardown_room_absent|PASS|ok
 CANARYCOUNT|canary1|teardown_attempts|1
 CANARYDONE|1
 ```
+
+**Only `teardown_room_absent` decides.** `teardown_delete_returned` is a count,
+not a verdict: a delete can legitimately throw on a room the provider has
+already reaped, and reporting a cleanup failure for a room that does not exist
+sends an operator to the LiveKit console for nothing and trains them to ignore
+the line that matters.
 
 `conversation_observed` is an **observation, not an inference**: the CLI cannot
 hear the call, and does not claim to. `room_occupied` means it saw the room hold
 both the SIP leg and the agent. Whether the audio was intelligible is what the
 owner's ear is for. A disarmed run stops at
 `CANARY|canary1|armed|FAIL|canary1_not_armed`; a dry run stops at
-`CANARY|canary1|originate_skipped|PASS|dry_run`.
+`CANARY|canary1|originate_skipped|PASS|dry_run` and then WAITS for
+`worker_joined` — see §9 step 6.
 
 Anything that fails the grammar prints
 `CANARY|canary1|emitter_refused|FAIL|unprintable` and **never** the offending
@@ -189,6 +197,13 @@ value.
 | connected call | `PHONE_CANARY_MAX_CALL_SEC` = 180 s | LiveKit SIP + an `asyncio.wait_for` in the worker | provider drops the leg; room closed |
 | CLI wall clock | 330 s, **derived** | the CLI; refuses `bounds_misordered` unless **wall ≥ wait + max call + 30** | teardown runs regardless |
 | empty room | 120 s | LiveKit room | the room reaps itself even if both processes die |
+
+Every one of those knobs also has a declared `{min, max}` in
+`CANARY1_BOUNDS`, and the CLI refuses `bounds_out_of_range` **before** it
+reasons about ordering. That is not decoration: without it
+`--max-call-seconds 3600` would set a one-hour ceiling on a live PSTN leg, and
+`--participant-wait-seconds 500` would be checked against a value the worker
+never uses, because `phone.py` clamps that knob to [1, 180].
 
 **Why the third row has its own knob.** The worker's participant-wait clock
 starts at **job assignment**, before the originate — so dispatch scheduling, a
@@ -279,11 +294,18 @@ real-candidate call closes.
    **current** watermarked `registered worker` line.
 6. **Dry run — the last step before a call.** In a transient subshell:
    `npm run canary:phone1 -- --dry-run`, destination typed at the prompt. It
-   creates the room, dispatches, the worker enters the canary branch, finds no
-   participant and closes; the CLI tears down and verifies absence. **No
-   originate.** This proves dispatch, isolation, arming, metadata parsing
-   (including the inbound guard), the wait/ring inequality, teardown and the
-   grammar, with zero telephony.
+   creates the room, dispatches, and then **WAITS** — bounded by the worker's
+   participant wait plus a cold-start margin — for the named worker to appear
+   in the room, emitting `worker_joined`. **No originate.** Seeing the agent
+   join is the whole point: it is the only offline-safe evidence that arming,
+   the dispatch metadata and the worker's inbound closed-key/digit-run guard
+   all agree end to end. The CLI then tears down and verifies absence.
+
+   Expect this step to take up to ~3 minutes and to look idle while it does:
+   the worker starts no idle job processes, so a cold start alone can be a
+   minute. `worker_joined|FAIL|worker_never_joined` means the dispatch did not
+   reach an armed worker — check the Fly secret and `fly scale count`, not the
+   trunk.
    **6b.** Read the room state **once, by hand**, during a dry run and record
    **only the key names** present on the participant. This converts
    `hidePhoneNumber` from an assumption into an observation, *before* it is ever

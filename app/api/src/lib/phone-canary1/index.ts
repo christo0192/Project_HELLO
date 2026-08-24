@@ -38,7 +38,6 @@ export {
   type Canary1ProcessLike,
 } from './containment.js';
 export {
-  CANARY1_ARGV_NUMBER_RE,
   CANARY1_ARGV_SEPARATORS_RE,
   CANARY1_CONFIRM_PHRASE,
   CANARY1_DESTINATION_ENV_RE,
@@ -104,7 +103,6 @@ export {
 } from './preflight.js';
 export {
   CANARY1_EPOCH,
-  CANARY1_PARTICIPANT_ATTRIBUTES,
   buildCanary1DialConfig,
   buildCanary1ScreeningConfig,
   createCanary1LiveClients,
@@ -151,6 +149,7 @@ import {
   CANARY1_BOUNDS,
   CANARY1_DEFAULT_AGENT_NAME,
   CANARY1_DISPATCH_MODE,
+  CANARY1_PARTICIPANT_WAIT_MARGIN_SEC,
   CANARY1_QUESTIONS,
 } from './plan.js';
 import { CANARY1_PREFLIGHT_CHECKS, runCanary1Preflight } from './preflight.js';
@@ -289,7 +288,14 @@ export async function runCanary1(deps: Canary1RunDeps): Promise<Canary1RunResult
     if (tornDown) return;
     tornDown = true;
     const result = await tearDownCanary1Room(roomName, { rooms: deps.rooms, sleep: deps.sleep });
-    emitter.check('teardown_room_deleted', result.deleteCalled, result.deleteCalled ? 'ok' : 'cleanup_failed');
+    // ONLY ABSENCE DECIDES. `deleteCalled` is an observation, reported as a
+    // count, because a delete can legitimately throw on a room the provider has
+    // already reaped — `teardown.ts` treats that as a success and says why:
+    // reporting a cleanup failure for a room that does not exist sends an
+    // operator to the LiveKit console for nothing and trains them to ignore the
+    // line that matters. Driving a FAIL off it here would do exactly that, and
+    // would force a non-zero exit on a clean run.
+    emitter.count('teardown_delete_returned', result.deleteCalled ? 1 : 0);
     emitter.check('teardown_room_absent', result.verifiedAbsent, result.verifiedAbsent ? 'ok' : 'cleanup_failed');
     emitter.count('teardown_attempts', result.attempts);
   };
@@ -312,11 +318,24 @@ export async function runCanary1(deps: Canary1RunDeps): Promise<Canary1RunResult
     if (!ok) return;
 
     if (!flags.execute) {
-      // The dry run stops here, deliberately and visibly. It has proved
-      // dispatch, arming, metadata parsing, the inequalities, teardown and the
-      // grammar — with zero telephony.
       emitter.check('originate_skipped', true, 'dry_run');
-      exitCode = 0;
+      // ── THE DRY RUN HAS TO WAIT, OR IT PROVES ALMOST NOTHING ──────
+      // An earlier shape emitted `originate_skipped` and fell straight into
+      // teardown, deleting the room within milliseconds of the dispatch. The
+      // worker starts no idle job processes (`num_idle_processes: 0`,
+      // `initialize_process_timeout: 60.0`) and then waits 120 s for a
+      // participant, so it could not possibly have been assigned the job yet —
+      // and the runbook's claim that the dry run proves the worker "enters the
+      // canary branch, parses the metadata and closes" would have been false
+      // of a run that had already torn the room down.
+      //
+      // So the dry run WATCHES for the agent to appear, bounded, and says what
+      // it saw. Seeing the agent join is the whole point: it is the only
+      // offline-safe evidence that arming, the dispatch metadata and the
+      // inbound closed-key/digit-run guard all agree end to end.
+      const joined = await observeAgentJoin(deps, roomName, bounds);
+      emitter.check('worker_joined', joined, joined ? 'ok' : 'worker_never_joined');
+      exitCode = joined ? 0 : 1;
       return;
     }
 
@@ -367,6 +386,30 @@ export async function runCanary1(deps: Canary1RunDeps): Promise<Canary1RunResult
     lines: emitter.lines(),
     providerContacted,
   };
+}
+
+/**
+ * Poll for the NAMED WORKER to join the canary room, bounded.
+ *
+ * The bound covers a cold worker start plus the worker's own participant wait,
+ * because that is how long the room legitimately sits with the agent in it and
+ * nobody else. The room simply vanishing is NOT read as success: `emptyTimeout`
+ * can reap a room the worker never reached, and "the worker ran" and "we could
+ * not tell" must not look the same.
+ */
+async function observeAgentJoin(
+  deps: Canary1RunDeps,
+  roomName: string,
+  bounds: { readonly participantWaitSeconds: number },
+): Promise<boolean> {
+  const deadline = deps.now()
+    + (bounds.participantWaitSeconds + CANARY1_PARTICIPANT_WAIT_MARGIN_SEC) * 1_000;
+  while (deps.now() < deadline) {
+    const listed = await discardingErrors(async () => deps.rooms.listRooms([roomName]));
+    if (listed !== undefined && (listed[0]?.numParticipants ?? 0) >= 1) return true;
+    await discardingErrors(async () => deps.sleep(CANARY1_OBSERVE_POLL_MS));
+  }
+  return false;
 }
 
 /**

@@ -80,9 +80,16 @@ export const CANARY1_FORBIDDEN_FLAGS = ['--number', '--to', '--dest', '--destina
  * still refused the run but told the operator the wrong thing. In a mechanism
  * whose refusals are supposed to teach, the wrong reason is a defect.
  *
- * It is loose on purpose. A false positive costs an operator one confusing
- * refusal; a false negative puts a number in `/proc/<pid>/cmdline` and in a
- * shell history file forever.
+ * It is loose on purpose, and it is applied to FLAG VALUES as well as to bare
+ * positionals. A consequence worth stating rather than discovering:
+ * `--max-call-seconds 1234567` is refused `destination_in_argv`, not
+ * `flag_value_not_an_integer`, because seven consecutive digits in an argv
+ * token is the shape this predicate exists to catch and the two cases are not
+ * distinguishable from the token alone. That is the safe direction to be wrong
+ * in — a false positive costs an operator one confusing refusal; a false
+ * negative puts a number in `/proc/<pid>/cmdline` and in a shell history file
+ * forever. Every bound this could plausibly collide with is at most three
+ * digits, so no legitimate value reaches seven.
  */
 export const CANARY1_ARGV_SEPARATORS_RE = /[\s()+.-]/g;
 
@@ -90,14 +97,6 @@ export function looksLikeDestination(token: string): boolean {
   const digits = token.replace(CANARY1_ARGV_SEPARATORS_RE, '');
   return /^[0-9]{7,}$/.test(digits);
 }
-
-/**
- * Kept as the exported name the closure's structural test and the runbook both
- * refer to. It answers the same question as `looksLikeDestination` for the
- * unseparated forms, and the predicate above is what argv is actually checked
- * against.
- */
-export const CANARY1_ARGV_NUMBER_RE = /^\+?[0-9][0-9 ()-]{6,}$/;
 
 /**
  * Environment names that would be holding a destination.

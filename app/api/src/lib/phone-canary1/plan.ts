@@ -10,6 +10,14 @@
  * length-bounded, and it is parsed by a guard that refuses digit runs. Fixed
  * copy belongs in source, where a reviewer reads it and a diff shows a change.
  *
+ * ── WHY THE COPY DOES NOT NAME A NUMBER OF QUESTIONS ──────────────────
+ * It used to say "two short questions". `PHONE_CANARY_QUESTIONS` admits 1..3
+ * and `--questions` accepts the same range, so the line was false whenever the
+ * operator asked for anything but two — and this is the one place a
+ * configuration mismatch becomes a SPOKEN FALSEHOOD to a person on a telephone.
+ * The copy is now true for every admissible count. It is also what goes to
+ * TEL-04 as written, which is the other reason it must not depend on a knob.
+ *
  * The pin is BUILT here rather than inherited. The design's first revision
  * cited `HEARTBEAT_PATH` as an existing two-sided pin; it is not one — the
  * Python side is asserted only by a prefix check and the TypeScript side
@@ -73,8 +81,13 @@ export const CANARY1_BOUNDS = {
   maxCallSeconds: { def: 180, min: 30, max: 300 },
   /** The outermost CLI clock, after which teardown runs regardless. DERIVED — see above. */
   wallClockSeconds: { def: 330, min: 120, max: 900 },
-  /** How many of the fixed questions the worker is expected to ask. */
-  questions: { def: 2, min: 2, max: 3 },
+  /**
+   * How many of the fixed questions the worker is expected to ask. The range
+   * matches `phone.py`'s clamp on `PHONE_CANARY_QUESTIONS`, and the CLI's real
+   * upper bound is the number of question texts that exist — see
+   * `questions_out_of_range`.
+   */
+  questions: { def: 2, min: 1, max: 3 },
 } as const;
 
 /** `participant wait >= ring + this`. Covers dispatch scheduling and a cold worker start. */
@@ -98,7 +111,7 @@ export const CANARY1_DISCLOSURE_TEXT =
   "This is an automated test call from Interview Kickstart's screening system, "
   + 'placed by the system owner to their own number. No candidate is involved, '
   + 'this call is not being recorded, and nothing you say is stored. '
-  + "I'll ask two short questions to check the audio and then hang up.";
+  + "I'll ask a few short questions to check the audio and then hang up.";
 
 /**
  * The fixed questions. Three are defined; the worker asks the first
