@@ -264,6 +264,23 @@ async def _close_after_playout(
     await close_room_once()
 
 
+async def _await_candidate_activity(
+    candidate_activity: asyncio.Event,
+    timeout_sec: float,
+) -> bool:
+    """Wait one silence window. True if activity arrived, False if it lapsed.
+
+    The production seam, and the ONLY place this loop reads a clock. Factored
+    out so the termination loop's decisions can be driven deterministically in
+    a test instead of by sleeping and hoping — see the loop's own note.
+    """
+    try:
+        await asyncio.wait_for(candidate_activity.wait(), timeout=timeout_sec)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
 async def _silence_termination_loop(
     session: Any,
     candidate_activity: asyncio.Event,
@@ -271,19 +288,32 @@ async def _silence_termination_loop(
     *,
     prompt_after_sec: float,
     end_after_sec: float,
+    wait_for_activity: Callable[[asyncio.Event, float], Awaitable[bool]] | None = None,
 ) -> None:
     """Prompt once per silent period, then speak a final goodbye and close.
 
     Candidate activity restarts the full silence window. The final room close
     occurs only after the goodbye's SpeechHandle confirms playout.
+
+    ── WHY THE WAIT IS A SEAM ────────────────────────────────────────────
+    The behaviour is unchanged: `wait_for_activity` defaults to
+    `_await_candidate_activity`, which is exactly the `asyncio.wait_for` this
+    loop used inline, and production passes nothing.
+
+    What changes is that a test can decide "activity arrived" or "the window
+    lapsed" DIRECTLY, instead of racing a real clock. The test that covered the
+    restart used a 50 ms window and asserted 10 ms after setting the event, so
+    it failed whenever a loaded runner stalled that assertion sleep past the
+    RESTARTED deadline — which is what it did in CI — and it could not detect a
+    broken restart at all, because 15 ms is before the original 50 ms deadline.
+    Widening the sleeps only moves the race; removing the clock from the
+    decision removes it.
     """
+    wait = wait_for_activity if wait_for_activity is not None else _await_candidate_activity
     while True:
         candidate_activity.clear()
-        try:
-            await asyncio.wait_for(candidate_activity.wait(), timeout=prompt_after_sec)
+        if await wait(candidate_activity, prompt_after_sec):
             continue
-        except asyncio.TimeoutError:
-            pass
 
         prompt_handle = session.say(
             "Are you still there? No worries if you need a moment.",
@@ -292,11 +322,8 @@ async def _silence_termination_loop(
         await prompt_handle.wait_for_playout()
 
         candidate_activity.clear()
-        try:
-            await asyncio.wait_for(candidate_activity.wait(), timeout=end_after_sec)
+        if await wait(candidate_activity, end_after_sec):
             continue
-        except asyncio.TimeoutError:
-            pass
 
         goodbye_handle = session.say(
             "Looks like you're unavailable, so I'll end the screening here. Thanks for your time, and goodbye.",

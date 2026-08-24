@@ -7,10 +7,12 @@ on:
       - 'scripts/*synthetic*'
       - 'scripts/*seed*'
       - 'scripts/supabase-*.sh'
+      - 'scripts/phone-canary/**'
       - 'docs/runbooks/synthetic-*.md'
       - 'docs/runbooks/supabase-*.md'
       - 'docs/runbooks/mig-*.md'
       - 'docs/runbooks/phase6-*.md'
+      - 'docs/runbooks/phone-canary-*.md'
       - 'scripts/migrate-export.test.mjs'
       - 'scripts/migrate-reconcile.test.mjs'
       - 'scripts/storage-manifest.test.mjs'
@@ -23,10 +25,12 @@ on:
       - 'scripts/*synthetic*'
       - 'scripts/*seed*'
       - 'scripts/supabase-*.sh'
+      - 'scripts/phone-canary/**'
       - 'docs/runbooks/synthetic-*.md'
       - 'docs/runbooks/supabase-*.md'
       - 'docs/runbooks/mig-*.md'
       - 'docs/runbooks/phase6-*.md'
+      - 'docs/runbooks/phone-canary-*.md'
       - 'scripts/migrate-export.test.mjs'
       - 'scripts/migrate-reconcile.test.mjs'
       - 'scripts/storage-manifest.test.mjs'
@@ -61,8 +65,8 @@ jobs:
       - name: Validate shell, JS, and text hygiene
         run: |
           bash -n scripts/supabase-local.sh scripts/supabase-test.sh
-          # JS syntax check for all .mjs files
-          for f in scripts/*.mjs; do node -c "$f" 2>&1 || exit 1; done
+          # JS syntax check for all .mjs files, including the phone canary
+          for f in scripts/*.mjs scripts/phone-canary/*.mjs; do node -c "$f" 2>&1 || exit 1; done
           if git grep -n -I -E '[[:blank:]]+$' -- \
             app/supabase/seed.sql \
             app/supabase/tests/synthetic_seed_tests.sql \
@@ -72,7 +76,9 @@ jobs:
             scripts/check-synthetic-seed.test.mjs \
             docs/runbooks/synthetic-demo-data.md \
             docs/runbooks/supabase-migration-strategy.md \
-            docs/runbooks/supabase-prod-apply.md; then
+            docs/runbooks/supabase-prod-apply.md \
+            docs/runbooks/phone-canary-and-halt.md \
+            scripts/phone-canary/; then
             echo 'ERROR: trailing whitespace found'
             exit 1
           fi

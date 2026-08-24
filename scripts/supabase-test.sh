@@ -505,6 +505,32 @@ log '0042: PASS — lock_order: eight concurrent admit/apply/reclaim workers, ze
 docker exec "$SUPABASE_DB_CONTAINER" \
   psql -U postgres -d postgres -q -c 'drop schema if exists _phone_race cascade' >/dev/null
 
+# ===================================================================
+# P8B: Canary-0 — the no-PSTN rehearsal of the phone screening lane.
+#
+# Ten scenarios against THIS database, driven entirely by synthetic ingress
+# events. It is the only gate that executes the phone state machine end to
+# end; the vitest tier reads migration TEXT and structurally cannot see a
+# resolution that is dead code while reporting itself healthy (0045 records
+# exactly that defect, and that a real-Postgres test is what caught it).
+#
+# It runs HERE, before the TST-15 restore rehearsal below, because that
+# rehearsal resets the database twice. Canary-0 installs its own schema and
+# removes it again, so it leaves this database as it found it.
+#
+# The runner exits non-zero on a failed scenario, an unparseable verdict
+# line, an invalid manifest, a non-zero network-call count, or a trap
+# positive control that did not fire. `set -e` is on; a failure stops CI.
+# ===================================================================
+log 'P8B: Running Canary-0 (no-PSTN phone screening rehearsal)...'
+PHONE_CANARY_MANIFEST="$(mktemp)"
+node scripts/phone-canary/canary0.mjs \
+  --container "$SUPABASE_DB_CONTAINER" \
+  --out "$PHONE_CANARY_MANIFEST"
+log "P8B: Canary-0 manifest written ($(wc -c < "$PHONE_CANARY_MANIFEST") bytes, sanitized)."
+rm -f "$PHONE_CANARY_MANIFEST"
+log 'P8B: PASS — Canary-0 rehearsed every phone outcome with zero network egress.'
+
 log 'Verifying custom-schema anon denial through PostgREST...'
 ANON_KEY="$(supabase_cli status -o env 2>/dev/null \
   | sed -n 's/^ANON_KEY="\(.*\)"$/\1/p' | head -1)"
