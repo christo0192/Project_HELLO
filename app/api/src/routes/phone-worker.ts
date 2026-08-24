@@ -404,9 +404,10 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       // ── WHY THERE IS NO EARLY LEASE RENEWAL HERE ────────────────────
       // A draft of 0045 renewed the attempt lease on `classify.human` and
       // `disclosure.delivered`, to cover the window between "a human
-      // answered" and "the agent's own heartbeat has beaten once". A
-      // candidate who answers on the last ring arrives with roughly half a
-      // minute of lease left and the opening gate can spend most of it.
+      // answered" and "the agent's own heartbeat has beaten once". At the
+      // then-default 60 s lease a candidate who answered on the last ring
+      // arrived with roughly half a minute left, and the opening gate could
+      // spend most of it.
       //
       // It was removed when the SESSION became part of the heartbeat fence.
       // This route's payload carries an attempt id and an epoch but no
@@ -417,12 +418,18 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       // would work, but it buys a window of seconds at the cost of a read on
       // the hottest authenticated path in the lane.
       //
-      // The residual is bounded and, crucially, LOUD: if the lease does lapse
-      // in that window the agent's first heartbeat answers `lease_lost` and
-      // the agent halts the call. B-1 was bad because it was silent. This is
-      // the same hazard with the silence removed, and closing it properly
-      // means sizing the admission lease to cover the opening gate — a P4a
-      // knob, not a second renewal path here.
+      // AND THE WINDOW IS NOW CLOSED WHERE IT BELONGED — at the lease, not
+      // with a second renewal path. `PHONE_BOUNDS.leaseSeconds` defaults to
+      // 180, which covers `ringTimeoutSeconds` at its MAXIMUM plus a full
+      // `PHONE_OPENING_GATE_SECONDS`, and `dialPhoneAttempt` REFUSES
+      // `lease_too_short_for_gate` before it contacts the provider if a
+      // deployment configures less. So this route deliberately does nothing
+      // about it, and that is now a closed question rather than an accepted
+      // residual.
+      //
+      // Should the lease ever lapse in that window anyway, the failure stays
+      // LOUD rather than silent: the agent's first heartbeat answers
+      // `lease_lost` and halts the call. B-1 was bad because it was silent.
 
       // ── The ONE place a recording may begin ─────────────────────────
       // Only after `disclosure.delivered` has been APPLIED — not merely

@@ -26,9 +26,10 @@
  *
  * ── WHY THE LEASE GATE IS NOT OPTIONAL ────────────────────────────────
  * `waitUntilAnswered: true` makes the originate BLOCK. The SDK's default
- * `timeout` in that mode is 60 s, which is exactly the default
- * `PHONE_LEASE_SECONDS`. So an originate can outlive the lease that reserves
- * its fleet slot — and when it does, `reclaim_phone_attempt_leases` abandons
+ * `timeout` in that mode is 60 s — once exactly the default
+ * `PHONE_LEASE_SECONDS`, and still well within the reach of a lease an
+ * operator is free to set as low as 5 s. So an originate can outlive the lease
+ * that reserves its fleet slot — and when it does, `reclaim_phone_attempt_leases` abandons
  * the attempt while its dial is still in flight. Two calls then hold one slot,
  * and the reclaimer has already restored the engagement to its prior state, so
  * the answer that eventually arrives lands on a row that has moved on.
