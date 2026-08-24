@@ -254,6 +254,39 @@ statically so this cannot recur silently:
   (drop a first-party COPY → red; new local import without COPY → red; secret/env
   COPY → red).
 
+**Follow-up (PR102 post-merge).** An independent review of PR102 found the static
+gate complete for the shipped defect but incomplete in two adjacent directions,
+both closed in the follow-up branch:
+- the COPY **destination** was never checked, so `COPY agent.py … /elsewhere/`
+  shipped every module and still crashed with the same `ModuleNotFoundError`.
+  The destination is now resolved against the `WORKDIR` in force and must land
+  in `/app`.
+- the closure **root** was hardcoded to `agent`, so a renamed entrypoint would
+  silently skip the rule and a wrong entrypoint would root the walk at a file
+  that no longer starts the worker. The root is now derived from the
+  Dockerfile's JSON `ENTRYPOINT`, and an absent, shell-form, malformed,
+  non-Python, ambiguous or non-first-party entrypoint fails closed.
+A second independent review of that follow-up then found the destination rule
+itself still half-complete, closed in the same branch:
+- proving the files land in `/app` says nothing about where the **interpreter
+  starts**. `WORKDIR /srv` added after the COPY left every rule green while the
+  container died with `python: can't open file '/srv/agent.py'`. The analyzer
+  now derives the **effective final WORKDIR** and requires the entrypoint
+  script to resolve to the COPY'd first-party file under `/app`.
+- `ENTRYPOINT` and the closure-coverage COPY set are now scoped to the **final
+  build stage**, because `FROM` resets `ENTRYPOINT` and a module copied only
+  into the builder never reaches the image.
+
+All of these rules live in `scripts/docker_import_closure.py`, the single
+analyzer that `scripts/validate-container.sh` (CI) and the Python unit controls
+both run.
+
+The same review recorded that PR102's Quality run passed on **attempt 3** of an
+unchanged SHA; attempts 1 and 2 failed on the pre-existing
+`resume-scanner-freshness` global-tmpdir flake in `app/api`, unrelated to the
+packaging change. That test now observes a private temp root instead of counting
+entries in the OS-wide tmpdir.
+
 **Recovery for a live machine.** Redeploy from a build that includes this fix
 (image rebuilt from `app/voice-livekit`), confirm a current registration, then
 `fly machine start`/`scale count 1` for the affected app. No data or schema change

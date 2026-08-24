@@ -50,11 +50,19 @@ COPY --from=builder /opt/venv /opt/venv
 # (see .dockerignore). No .env is ever copied into the image.
 #
 # This list is the EXACT first-party import closure of the entrypoint
-# `agent.py` (transitively via `import phone`, `import persistence`, etc.),
-# and nothing more. It is enforced statically, not by convention:
-# scripts/validate-container.sh parses the closure from agent.py with an AST
-# walk and fails the build contract if any transitively-imported local module
-# is not COPY'd here (or if a secret/env file is). phone.py was added in P4a
+# (transitively via `import phone`, `import persistence`, etc.), and nothing
+# more. It is enforced statically, not by convention:
+# scripts/docker_import_closure.py — run by scripts/validate-container.sh in
+# CI — derives the closure ROOT from this final stage's JSON ENTRYPOINT below
+# (never hardcoded; FROM resets ENTRYPOINT, so an earlier stage's does not
+# count), AST-walks the transitive closure from it, and fails the build
+# contract if any transitively-imported local module is not COPY'd here in the
+# final stage, if a secret/env file is, if the destination does not resolve to
+# /app, or if the EFFECTIVE final WORKDIR is not where the entrypoint script
+# resolves. The last two are the same outage in different disguises: modules
+# outside the interpreter search path, and modules in /app with the
+# interpreter started somewhere else
+# (`python: can't open file '/srv/agent.py'`). phone.py was added in P4a
 # (`import phone` in agent.py) and MUST ship, or the worker dies at startup
 # with `ModuleNotFoundError: No module named 'phone'`.
 # Deliberately excluded (not on the runtime import path): voice_quality_harness.py,
