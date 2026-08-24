@@ -31,8 +31,9 @@ It is not a mock of the substrate. It calls the real
 `schedule_phone_appointment`, `expire_phone_appointments`, `set_phone_halt` and
 `clear_phone_halt`, and asserts what the database actually did.
 
-What is synthetic is the **wire**: there is no carrier, no trunk, no number and
-no telephony SDK anywhere in the run.
+What is synthetic is the **wire**: the run reaches no carrier, binds no trunk,
+reads no number and loads no telephony SDK. That is a statement about this
+harness, not about what exists at the provider — see §7 TEL-02.
 
 ## 2. Running it
 
@@ -267,7 +268,19 @@ engineering:
    every DLT/UCC, consent, DND, caller-ID, recording and evidence obligation to
    a control, plus the registrations themselves.
 2. **TEL-02** — a verified India-capable provider account, an approved route
-   and an actual number. *We do not have a number to dial from.*
+   and an actual number. **Status: provisioned at the provider, not bound to
+   the application, and not authorised for use.** Plivo India KYC, an Indian
+   number, a Plivo SIP trunk and a LiveKit outbound SIP trunk were configured
+   after this list was first written; **no real call has been placed.**
+   Provisioning a route is not authorisation to use it — TEL-01, TEL-04,
+   TEL-05, TEL-06 and TEL-07 gate that independently, and they are open. The
+   application binding is deliberately deferred too: `PHONE_SIP_TRUNK_ID` is
+   unset on every app, `PHONE_AGENT_NAME` is unset on the API, and binding the
+   trunk is the LAST wire to connect (`phone-runtime.md` §11 steps 8–9), not
+   the first. *(This entry previously read "we do not have a number to dial
+   from". That was stale, and stale in the dangerous direction: it pointed at
+   carrier capability as the blocker when the real blockers are the approvals
+   below and the wiring above.)*
 3. **TEL-03** — authenticated SIP, IP controls, credential rotation, spend caps.
 4. **TEL-04** — Legal-approved disclosure and decline wording.
 5. **TEL-05** — consent-source, DND and opt-out enforcement before every dial.
@@ -316,6 +329,12 @@ no gap list.
   schedules it must verify the phone-aware predicate covers what they enable.
 * **An unanswered `reconnect` charges the no-answer budget**, diverging from the
   P5 acceptance wording. Substrate-level; see `phone-runtime.md` §7.
+* **The provider side is provisioned; the application side is deliberately
+  not wired.** Plivo India KYC, an Indian number, a Plivo SIP trunk and a
+  LiveKit outbound SIP trunk exist; `PHONE_SIP_TRUNK_ID` is bound nowhere, the
+  API's `PHONE_AGENT_NAME` is empty, and no real call has been placed. Read
+  every "no trunk / no number" sentence in this lane's docs at *harness* scope
+  only. A configured trunk authorises nothing.
 * **Canary-0 needs Docker.** There is no in-memory fallback and there must not
   be: a fallback would make "the substrate is fine" and "we could not check"
   look the same.

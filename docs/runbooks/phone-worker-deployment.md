@@ -33,6 +33,7 @@ posture, and the postures are mutually exclusive within one app:
 | LiveKit dispatch | auto-dispatch into every room | named → only rooms dispatched to it |
 | Run policy | always-on (owner-managed, see below) | **stopped / min-0** until canary |
 | Deploy token | `FLY_API_TOKEN_VOICE` | `FLY_API_TOKEN_PHONE_VOICE` |
+| `primary_region` | `sin` | `sin` |
 
 A LiveKit Agents worker auto-dispatches **iff** it is unnamed. Naming the
 browser worker would silently stop browser screening; leaving the phone worker
@@ -43,6 +44,19 @@ must **not** set `PHONE_AGENT_NAME`, the phone config **must** set a non-empty
 one, neither may declare a public service, and neither may bake a secret or a
 SIP-trunk key (the trunk guard is an **exact-key** check, so a real `ST_…` id
 with no digit run is caught, not just a numeric one).
+
+**Deployment region is an allowlist, and it is not cosmetic.** Both configs must
+name a region from `scripts/fly-region-policy.mjs` (today: `sin`), enforced by
+the same validator. Both said `bom` until PR104, and that is what broke the
+FIRST release of `project-hello-phone-voice`: Fly no longer accepts `bom` for
+**new** resource creation and recommended `sin`. The trap is quiet by
+construction — `primary_region` is consulted when a resource is **created**, so
+a deprecated value deploys green forever against machines that already exist and
+fails only on the one deploy that has to create one. The browser worker and the
+API were never affected because their machines predate the deprecation; the
+browser config was corrected in the same PR because a future scale-up would have
+hit the identical wall. Adding a region to the allowlist is a reviewed edit, and
+the policy refuses to allowlist a region it also records as deprecated.
 
 **`PHONE_AGENT_NAME` is a TWO-SIDED name, and both sides are validated.** A named
 worker receives work **only** by explicit dispatch to its name, and the API
@@ -157,13 +171,33 @@ never cancelled in flight), and fails closed without `SUPABASE_DB_URL`. No
 application job receives the database credential. Schema converges before any
 app — including the phone app — deploys.
 
-**One-time owner secret setup** (values never enter VCS):
+**One-time owner secret setup** (values never enter VCS). **Order matters: a Fly
+deploy token is app-scoped, so the app must exist before its token can be
+minted.**
 ```
+# 1. the app must exist first (phone app only — the other two already do)
+fly apps create project-hello-phone-voice          # same org as the other two
+
+# 2. then, and only then, the app-scoped deploy tokens
 fly tokens create deploy -a project-hello-api          # → FLY_API_TOKEN_API
 fly tokens create deploy -a project-hello-voice        # → FLY_API_TOKEN_VOICE
 fly tokens create deploy -a project-hello-phone-voice  # → FLY_API_TOKEN_PHONE_VOICE
 # SUPABASE_DB_URL  → production Postgres URL (migration job only)
 ```
+
+**Reading a failed `deploy-phone-voice` job.** Its pre-release scale classifies
+its own failure instead of guessing (audit M-1: the first release printed "app
+not created yet" when the real cause was an empty token, and the two have
+opposite remedies):
+
+| log line | meaning | remedy |
+|---|---|---|
+| `pre-release scale skipped: … is NOT VISIBLE to this deploy token … app-not-found` | the app is absent, **or** the token is scoped elsewhere — `flyctl` cannot tell these apart, so the message does not pretend to | run the two commands above, in that order |
+| `::error::pre-release scale precondition FAILED and this is NOT an absent app` | credential / permission / transport failure; the job **fails closed here** and pushes no release | fix `FLY_API_TOKEN_PHONE_VOICE` |
+
+Only the first is tolerated, and only because the **post-release** scale is
+unconditional: it is the binding stopped/min-0 guarantee, and it fails the job
+if it cannot run.
 Provider/LiveKit/Supabase keys and the **SIP trunk value** are Fly **app**
 secrets set with `fly secrets set -a project-hello-phone-voice ...`; they are
 untouched by this workflow and must never appear in `fly.phone.toml`.

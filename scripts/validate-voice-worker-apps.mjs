@@ -34,8 +34,18 @@
 //      A mismatched non-empty name is never correct in either direction: the
 //      API would create a room and dispatch to a name nothing registers under,
 //      and "a room with no agent sits silent while a real person says hello".
+//   7. DEPLOYMENT REGION (PR104). Both worker configs must declare a
+//      primary_region drawn from the reviewed allowlist in
+//      scripts/fly-region-policy.mjs. The first release of the dedicated phone
+//      app failed BEFORE machine creation because fly.phone.toml still named
+//      the deprecated `bom`; Fly recommended `sin`, where every app in this
+//      project already runs. `primary_region` is read when a resource is
+//      CREATED, so a deprecated value deploys green against existing machines
+//      and fails only when it matters — which is why it is checked statically
+//      here rather than discovered at release time.
 
 import { readFileSync } from "node:fs";
+import { APPROVED_WORKER_REGIONS, assertPolicyConsistent, checkPrimaryRegion } from "./fly-region-policy.mjs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -167,6 +177,18 @@ if (typeof phoneName === "string") {
   ok(/^[A-Za-z][A-Za-z0-9_-]*$/.test(phoneName.trim()), "PHONE_AGENT_NAME must be a simple identifier");
 }
 
+// ── 5c. Deployment region contract (PR104) ───────────────────────────────
+// The policy is validated before it is applied: a self-contradicting allowlist
+// (a deprecated region also listed as approved, or `bom` quietly dropped from
+// the deprecated record) would report green while permitting the exact
+// regression this check exists to prevent.
+for (const problem of assertPolicyConsistent()) ok(false, problem);
+for (const [label, text] of [["fly.toml", browser], ["fly.phone.toml", phoneCfg]]) {
+  const region = topLevelString(text, "primary_region");
+  for (const problem of checkPrimaryRegion(label, region)) ok(false, problem);
+}
+notes.push(`worker_regions_approved=${APPROVED_WORKER_REGIONS.join(",")}`);
+
 // ── 6. Worker <-> API dispatch-name agreement (H-1) ──────────────────────
 // The API is the dispatcher. Read the name it will dispatch under: fly.toml
 // [env] is the deploy authority when it sets the key, else the documented
@@ -203,4 +225,4 @@ if (failures.length) {
   process.exit(1);
 }
 for (const n of notes) console.error(`voice worker app config note: ${n}`);
-console.log("voice worker app configs valid (browser unnamed; phone named & stopped; isolated; no secrets; worker<->API name agreement surfaced).");
+console.log("voice worker app configs valid (browser unnamed; phone named & stopped; isolated; no secrets; approved deployment region; worker<->API name agreement surfaced).");

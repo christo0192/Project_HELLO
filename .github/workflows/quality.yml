@@ -43,6 +43,12 @@ jobs:
       #    substrate half runs in supabase-ci.yml, which has a real Postgres. ──
       - name: Phone Canary-0 offline gate (P8B)
         run: node scripts/phone-canary/canary0.test.mjs
+      # ── PR104 (audit L-1) — ADR-0013's evidence counts are the auditable
+      #    claim, so they are checked against what the suites actually report
+      #    rather than maintained by hand. Two-sided: the ADR drifting and the
+      #    gate growing both fail here. ──
+      - name: Phone Canary-0 evidence-count agreement (ADR-0013)
+        run: node scripts/check-phone-canary-evidence.test.mjs
       - name: Install, typecheck, and test API
         working-directory: app/api
         run: npm ci && npm run typecheck && npm test

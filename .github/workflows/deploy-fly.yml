@@ -30,6 +30,12 @@ name: Deploy (Fly)
 #    a compromise of one job cannot deploy another app. Tokens are consumed only
 #    as step env for flyctl, never echoed. Fly APP secrets (provider keys,
 #    Supabase, LiveKit, SIP trunk) are untouched by this workflow.
+#  - Ops messages do not GUESS (M-1, PR104). The phone job's pre-release scale
+#    classifies its own failure before it speaks: app-not-visible-to-this-token
+#    is reported as such and tolerated (the post-release scale still fails
+#    closed), while a credential / permission / transport failure fails the job
+#    CLOSED instead of being printed as "app not created yet". The two have
+#    opposite remedies, and the old blanket `|| echo` destroyed the difference.
 #  - Post-deploy verification is CURRENT and POLICY-AWARE, never historical:
 #      * api           → GET /api/health must return 200.
 #      * browser-voice → run policy ALWAYS_ON: the worker must log "registered
@@ -281,8 +287,42 @@ jobs:
           #
           # No watermark is captured here — a stopped app has no registration to
           # gate, and capturing one unused would be a decorative artifact.
-          flyctl scale count 0 -a project-hello-phone-voice --yes 2>/dev/null \
-            || echo "pre-release scale skipped (app not created yet); the post-release scale below is the binding guarantee"
+          # M-1 (PR104): the pre-release scale must not GUESS why it failed.
+          #
+          # The previous form was `flyctl scale count 0 ... 2>/dev/null || echo
+          # "app not created yet"`, which swallowed EVERY failure and attributed
+          # all of them to a missing app. The first real phone release proved how
+          # wrong that is: the token was empty, the message still said "app not
+          # created yet", and the job died several steps later on `no access
+          # token available`. The two causes have opposite remedies — create the
+          # app, versus fix the credential — so the difference is exactly what
+          # the operator needs and exactly what the message destroyed.
+          #
+          # Classify first, then act. An ABSENT app is the one benign case (this
+          # app is created by the owner's one-time setup, and the post-release
+          # scale is the binding guarantee that still fails closed). ANY other
+          # failure — empty/invalid/unauthorised token, org mismatch, API outage
+          # — is fatal HERE, before a release is pushed with an unbounded live
+          # window ahead of it.
+          set +e
+          status_out="$(flyctl status -a project-hello-phone-voice 2>&1)"
+          status_rc=$?
+          set -e
+          if [ "$status_rc" -eq 0 ]; then
+            flyctl scale count 0 -a project-hello-phone-voice --yes
+          elif printf '%s' "$status_out" | grep -qiE "could not find app|could not resolve app|app .* not found|no such app"; then
+            # Honest about what flyctl can actually distinguish: an app-not-found
+            # answer means the app is not VISIBLE TO THIS TOKEN. That is almost
+            # always "not created yet", but a token scoped to another app looks
+            # identical from here, so the message says both rather than picking
+            # the flattering one. Either way the post-release scale still fails
+            # closed, so this branch cannot let an unscaled release stand.
+            echo "pre-release scale skipped: app project-hello-phone-voice is NOT VISIBLE to this deploy token (flyctl status rc=${status_rc}, app-not-found) - either it has not been created yet, or the token is scoped to a different app. Remedy: the owner's one-time app creation + app-scoped deploy token, per docs/runbooks/phone-worker-deployment.md. The post-release scale below is the binding guarantee and fails closed."
+          else
+            echo "::error::pre-release scale precondition FAILED and this is NOT an absent app (flyctl status rc=${status_rc}). This is a credential / permission / transport failure - e.g. an empty or unauthorised FLY_API_TOKEN_PHONE_VOICE. Refusing to release: a deploy whose scale controls cannot be trusted must not run."
+            printf '%s\n' "$status_out"
+            exit 1
+          fi
           flyctl deploy --remote-only --config fly.phone.toml
           # Every deploy re-asserts count 0, so a merge can never silently leave
           # the phone worker persistently live.

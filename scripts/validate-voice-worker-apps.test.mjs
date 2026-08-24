@@ -6,7 +6,7 @@
 
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -33,10 +33,12 @@ function run2(voiceDir, apiDir) {
   ok(r.status === 0, `real voice worker configs must pass, got:\n${out}`);
   ok(/phone_agent_name_state=api_silent_pre_canary/.test(out),
     "real configs must SURFACE the pre-canary silent state as a stable code");
+  ok(/worker_regions_approved=sin/.test(out),
+    "real configs must SURFACE the approved worker region allowlist as a stable code");
 }
 
 const GOOD_BROWSER = `app = "project-hello-voice"
-primary_region = "bom"
+primary_region = "sin"
 
 [build]
   dockerfile = "Dockerfile"
@@ -48,7 +50,7 @@ primary_region = "bom"
   cpus = 1
 `;
 const GOOD_PHONE = `app = "project-hello-phone-voice"
-primary_region = "bom"
+primary_region = "sin"
 
 [build]
   dockerfile = "Dockerfile"
@@ -94,12 +96,87 @@ const NEG = [
   // missed it. The exact-key guard must reject it regardless of value shape.
   ["baked PHONE_SIP_TRUNK_ID (ST_ format, no digit run)", GOOD_BROWSER, GOOD_PHONE.replace("[env]\n", '[env]\n  PHONE_SIP_TRUNK_ID = "ST_a1b2c3d4e5f6"\n')],
   ["baked a future *_TRUNK_* key (arn value)", GOOD_BROWSER, GOOD_PHONE.replace("[env]\n", '[env]\n  MY_TRUNK_ARN = "arn:aws:chime:trunk/abc"\n')],
+  // ── PR104 region contract. The phone worker regressing to the deprecated
+  // `bom` is the exact release failure this contract exists to prevent, so it
+  // gets its own control in BOTH configs — the browser worker shares the image
+  // and the same creation-time trap.
+  ["phone worker regresses to deprecated bom", GOOD_BROWSER, GOOD_PHONE.replace('primary_region = "sin"', 'primary_region = "bom"')],
+  ["browser worker regresses to deprecated bom", GOOD_BROWSER.replace('primary_region = "sin"', 'primary_region = "bom"'), GOOD_PHONE],
+  ["both workers on deprecated bom", GOOD_BROWSER.replace('primary_region = "sin"', 'primary_region = "bom"'), GOOD_PHONE.replace('primary_region = "sin"', 'primary_region = "bom"')],
+  // Allowlist, not denylist: a region that is merely absent from the approved
+  // list must be rejected too, or the next region Fly deprecates sails through.
+  ["phone worker on an unapproved (not-yet-deprecated) region", GOOD_BROWSER, GOOD_PHONE.replace('primary_region = "sin"', 'primary_region = "iad"')],
+  ["browser worker on an unapproved region", GOOD_BROWSER.replace('primary_region = "sin"', 'primary_region = "fra"'), GOOD_PHONE],
+  // Absence is not a pass: without primary_region Fly places new machines by
+  // deploy-host proximity, so "not stated" must not equal "stated correctly".
+  ["phone worker omits primary_region entirely", GOOD_BROWSER, GOOD_PHONE.replace('primary_region = "sin"\n', "")],
+  ["browser worker omits primary_region entirely", GOOD_BROWSER.replace('primary_region = "sin"\n', ""), GOOD_PHONE],
+  // Fly matches the region code literally; a padded/upper-case value would not
+  // resolve, and must not be laundered into "sin" by a lenient comparison.
+  ["phone worker region is padded", GOOD_BROWSER, GOOD_PHONE.replace('primary_region = "sin"', 'primary_region = " sin "')],
+  ["phone worker region is upper-case", GOOD_BROWSER, GOOD_PHONE.replace('primary_region = "sin"', 'primary_region = "SIN"')],
+  // A deprecated region must stay rejected even when its case is varied — the
+  // evasion a case-sensitive denylist would miss.
+  ["phone worker on upper-case BOM", GOOD_BROWSER, GOOD_PHONE.replace('primary_region = "sin"', 'primary_region = "BOM"')],
 ];
 for (const [label, browser, phone] of NEG) {
   const dir = fixture(browser, phone);
   const r = run(dir);
   ok(r.code !== 0, `negative control should FAIL but passed: ${label}`);
   rmSync(dir, { recursive: true, force: true });
+}
+
+// ── PR104: the region guard must be EFFECTIVE, not merely present ───────
+// A negative control proves the validator rejects a bad region; these prove the
+// guard is load-bearing — that the rejection comes from the region and nothing
+// else, and that the failure names the region and its replacement so an operator
+// is told what to write. A guard whose message does not identify the defect is
+// how "bom" survived a review in the first place.
+{
+  const dir = fixture(GOOD_BROWSER, GOOD_PHONE.replace('primary_region = "sin"', 'primary_region = "bom"'));
+  const r = run(dir);
+  ok(r.code !== 0, "deprecated-region fixture must fail");
+  ok(/fly\.phone\.toml primary_region "bom" is DEPRECATED/.test(r.out),
+    `the failure must name the offending config AND region, got:\n${r.out}`);
+  ok(/use "sin"/.test(r.out), `the failure must name the replacement region, got:\n${r.out}`);
+  ok(!/fly\.toml primary_region/.test(r.out.replace(/fly\.phone\.toml primary_region/g, "")),
+    "only the offending config may be reported — a blanket region failure would hide which file is wrong");
+  rmSync(dir, { recursive: true, force: true });
+}
+// Isolation of the mutation: the ONLY difference between the passing and the
+// failing fixture is the region string, so the rejection cannot be attributed to
+// anything else in the config.
+{
+  const good = fixture(GOOD_BROWSER, GOOD_PHONE);
+  const bad = fixture(GOOD_BROWSER, GOOD_PHONE.replace('primary_region = "sin"', 'primary_region = "bom"'));
+  const rg = run(good);
+  const rb = run(bad);
+  ok(rg.code === 0 && rb.code !== 0,
+    `a single region character change must flip the verdict (good=${rg.code}, bad=${rb.code})`);
+  ok(/voice worker app config contract FAILED \(1\)/.test(rb.out),
+    `the region mutation must produce EXACTLY one failure, got:\n${rb.out}`);
+  rmSync(good, { recursive: true, force: true });
+  rmSync(bad, { recursive: true, force: true });
+}
+// The policy itself must be internally consistent, and must keep naming `bom`
+// as deprecated: the cheapest way to "fix" a region failure is to allowlist the
+// deprecated region, and that must be impossible rather than merely discouraged.
+{
+  const policy = await import(pathToFileURL(path.join(here, "fly-region-policy.mjs")).href);
+  ok(policy.assertPolicyConsistent().length === 0,
+    `the shipped region policy must be self-consistent: ${policy.assertPolicyConsistent().join("; ")}`);
+  ok(policy.APPROVED_WORKER_REGIONS.includes("sin"), "sin must be an approved worker region");
+  ok(!policy.APPROVED_WORKER_REGIONS.includes("bom"), "bom must never be an approved worker region");
+  ok(Object.prototype.hasOwnProperty.call(policy.DEPRECATED_REGIONS, "bom"),
+    "bom must stay recorded as deprecated — dropping the record is how the regression returns");
+  ok(policy.DEPRECATED_REGIONS.bom.superseded_by === "sin", "the bom record must name sin as its replacement");
+  // Positive control on the consistency checker itself: it must FIRE on a
+  // contradictory policy, or its green above proves nothing.
+  const contradictory = policy.checkPrimaryRegion("probe", "bom");
+  ok(contradictory.length === 1 && /DEPRECATED/.test(contradictory[0]),
+    "checkPrimaryRegion must reject a deprecated region with a DEPRECATED verdict");
+  ok(policy.checkPrimaryRegion("probe", "sin").length === 0, "checkPrimaryRegion must accept an approved region");
+  ok(policy.checkPrimaryRegion("probe", null).length === 1, "checkPrimaryRegion must reject an ABSENT region");
 }
 
 // ── H-1: worker <-> API dispatch-name agreement ─────────────────────────
@@ -161,4 +238,4 @@ if (failures.length) {
   for (const f of failures) console.error(" - " + f);
   process.exit(1);
 }
-console.log(`validate-voice-worker-apps.test OK (real configs + ${NEG.length} negative + agreement controls).`);
+console.log(`validate-voice-worker-apps.test OK (real configs + ${NEG.length} negative + region/mutation + agreement controls).`);

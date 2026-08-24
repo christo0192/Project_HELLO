@@ -33,7 +33,14 @@
 # identity and the agent NAME live in VCS.
 
 app = "project-hello-phone-voice"
-primary_region = "bom"
+# Region: `sin`, matching project-hello-voice and project-hello-api. NOT `bom`:
+# Fly no longer accepts bom for NEW resource creation and recommended sin, and
+# because this app had never been created, its very first release failed on that
+# value before a machine existed. primary_region is consulted at CREATION time,
+# so a deprecated value is invisible to a deploy of an already-created machine
+# and fatal to the one deploy that has to create one. The allowlist in
+# scripts/fly-region-policy.mjs is enforced by scripts/validate-voice-worker-apps.mjs.
+primary_region = "sin"
 
 [build]
   dockerfile = "Dockerfile"

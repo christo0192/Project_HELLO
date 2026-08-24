@@ -5,8 +5,10 @@
 // to Fly). These tests lock its security-relevant contract so a future edit
 // cannot silently weaken it. Dependency-free: text + per-job assertions only.
 
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdtempSync, rmSync, chmodSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { tmpdir } from "node:os";
 import path from "node:path";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -147,6 +149,137 @@ ok(!/project-hello-voice\b/.test(phone.replace(/project-hello-phone-voice/g, "")
 ok(/STOPPED/.test(phone), "deploy-phone-voice must document its STOPPED run policy");
 ok(/ALWAYS_ON/.test(voice), "deploy-browser-voice must document its ALWAYS_ON run policy");
 
+// ── 8b. M-1 (PR104): the pre-release scale must CLASSIFY its failure ─────
+// The old form was `flyctl scale count 0 ... 2>/dev/null || echo "app not
+// created yet"`: every failure, including the empty token that actually
+// occurred, was reported as a missing app. These controls pin the repair as
+// TEXT (the misattributing shape is gone from the EXECUTED lines) and then,
+// below, as BEHAVIOUR. Comments are stripped first — the job documents the old
+// form on purpose, and a guard that a comment can satisfy (or trip) is not a
+// guard on the code.
+const phoneCode = phone
+  .split("\n")
+  .filter((l) => !/^\s*#/.test(l))
+  .join("\n");
+ok(/flyctl scale count 0 -a project-hello-phone-voice/.test(phoneCode),
+  "comment-stripping must leave the executable scale lines intact (else every assertion below is vacuous)");
+ok(!/scale count 0[^\n]*2>\/dev\/null/.test(phoneCode),
+  "deploy-phone-voice must not silence the pre-release scale's stderr — the failure text is what tells the two causes apart");
+ok(!/scale count 0[^\n]*\|\|\s*echo/.test(phoneCode),
+  "deploy-phone-voice must not swallow a pre-release scale failure with `|| echo` — that is the misattribution M-1 records");
+ok(/could not find app/i.test(phoneCode),
+  "deploy-phone-voice must match flyctl's app-not-found text explicitly rather than assuming it");
+ok(/::error::pre-release scale precondition FAILED[\s\S]*?exit 1/.test(phoneCode),
+  "deploy-phone-voice must FAIL CLOSED (exit 1) when the pre-release precondition fails for a reason other than an absent app");
+// Ordering: the tolerant branch must be GUARDED by the not-found match, i.e. the
+// classification must precede the benign message, never follow it.
+{
+  const notFoundAt = phoneCode.search(/could not find app/i);
+  const skipMsgAt = phoneCode.indexOf("pre-release scale skipped");
+  const failClosedAt = phoneCode.indexOf("::error::pre-release scale precondition FAILED");
+  ok(notFoundAt !== -1 && skipMsgAt !== -1 && notFoundAt < skipMsgAt,
+    "the app-not-found classification must GUARD the benign 'skipped' message, not trail it");
+  ok(failClosedAt > skipMsgAt,
+    "the fail-closed branch must be the fallthrough after the classified benign case");
+}
+// The post-release scale is unconditional and unguarded — it is the binding
+// guarantee the benign branch leans on, so it must never acquire a fallback.
+{
+  const after = phoneCode.slice(phoneCode.indexOf("flyctl deploy --remote-only --config fly.phone.toml"));
+  ok(/^\s*flyctl scale count 0 -a project-hello-phone-voice --yes\s*$/m.test(after),
+    "a bare, unguarded post-release scale must follow the release");
+  ok(!/scale count 0[^\n]*(\|\||2>)/.test(after),
+    "the post-release scale must carry no fallback and no stderr suppression");
+}
+
+// ── 8c. M-1 BEHAVIOUR: run the step's real shell against a stubbed flyctl ──
+// A text assertion proves the branch is written; only executing it proves the
+// branch works. The step's script is extracted verbatim from the workflow and
+// run with a `flyctl` stub on PATH, so the three outcomes are observed, not
+// asserted about. No network, no Fly, no token.
+function stepScript(jobText, nameFragment) {
+  const lines = jobText.split("\n");
+  const at = lines.findIndex((l) => l.includes("- name:") && l.includes(nameFragment));
+  if (at === -1) return null;
+  const runAt = lines.findIndex((l, i) => i > at && /^\s*run: \|\s*$/.test(l));
+  if (runAt === -1) return null;
+  const indent = lines[runAt + 1].match(/^\s*/)[0].length;
+  const body = [];
+  for (let i = runAt + 1; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.trim() === "") { body.push(""); continue; }
+    if (l.match(/^\s*/)[0].length < indent) break;
+    body.push(l.slice(indent));
+  }
+  return body.join("\n");
+}
+{
+  const script = stepScript(phone, "Deploy phone voice worker");
+  ok(script !== null && /flyctl deploy --remote-only --config fly\.phone\.toml/.test(script || ""),
+    "must be able to extract the phone deploy step's shell script for behavioural testing");
+  if (script) {
+    // status_mode drives the stub: ok | notfound | nocred
+    const runWithStub = (statusMode) => {
+      const dir = mkdtempSync(path.join(tmpdir(), "fly-stub-"));
+      const bin = path.join(dir, "flyctl");
+      writeFileSync(bin, [
+        "#!/usr/bin/env bash",
+        'if [ "$1" = "status" ]; then',
+        `  case "${statusMode}" in`,
+        "    ok) echo 'App: project-hello-phone-voice'; exit 0 ;;",
+        "    notfound) echo 'Error: Could not find App \"project-hello-phone-voice\"' >&2; exit 1 ;;",
+        "    nocred) echo 'Error: no access token available' >&2; exit 1 ;;",
+        "  esac",
+        "fi",
+        'echo "STUB flyctl $*"',
+        "exit 0",
+      ].join("\n"));
+      chmodSync(bin, 0o755);
+      const r = spawnSync("bash", ["-c", script], {
+        encoding: "utf8",
+        env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+      });
+      rmSync(dir, { recursive: true, force: true });
+      return { code: r.status, out: (r.stdout || "") + (r.stderr || "") };
+    };
+
+    // (a) App reachable → the pre-release scale actually RUNS, then the release.
+    const okRun = runWithStub("ok");
+    ok(okRun.code === 0, `reachable app: the step must succeed, got ${okRun.code}:\n${okRun.out}`);
+    ok(/STUB flyctl scale count 0 -a project-hello-phone-voice --yes/.test(okRun.out),
+      "reachable app: the PRE-release scale must run");
+    ok((okRun.out.match(/scale count 0 -a project-hello-phone-voice/g) || []).length === 2,
+      "reachable app: BOTH the pre- and post-release scales must run");
+    ok(!/pre-release scale skipped/.test(okRun.out),
+      "reachable app: the step must not claim it skipped anything");
+
+    // (b) App not visible → tolerated, said accurately, and the release proceeds
+    //     with the post-release scale still binding.
+    const nf = runWithStub("notfound");
+    ok(nf.code === 0, `absent app: the step must continue, got ${nf.code}:\n${nf.out}`);
+    ok(/pre-release scale skipped: app project-hello-phone-voice is NOT VISIBLE/.test(nf.out),
+      "absent app: the message must name the observed condition (not visible to this token)");
+    ok(!/::error::/.test(nf.out), "absent app: must not raise a workflow error");
+    ok(/STUB flyctl deploy --remote-only --config fly.phone.toml/.test(nf.out),
+      "absent app: the release must still proceed");
+    ok((nf.out.match(/scale count 0 -a project-hello-phone-voice/g) || []).length === 1,
+      "absent app: exactly the POST-release scale must run (the binding guarantee)");
+
+    // (c) Credential failure → FAILS CLOSED, and never prints the absent-app
+    //     story. This is the exact case that was misreported in production.
+    const nc = runWithStub("nocred");
+    ok(nc.code !== 0, `credential failure: the step must FAIL CLOSED, got exit ${nc.code}:\n${nc.out}`);
+    ok(/::error::pre-release scale precondition FAILED/.test(nc.out),
+      "credential failure: must raise a workflow error naming the precondition");
+    ok(!/pre-release scale skipped/.test(nc.out) && !/not been created/i.test(nc.out.split("::error::")[0] || ""),
+      "credential failure: must NOT be reported as an absent app (the M-1 misattribution)");
+    ok(/no access token available/.test(nc.out),
+      "credential failure: the underlying flyctl message must be surfaced, not swallowed");
+    ok(!/STUB flyctl deploy/.test(nc.out),
+      "credential failure: NO release may be pushed once the scale controls are untrustworthy");
+  }
+}
+
 // 9. Least privilege
 const perm = (wf.match(/permissions:\n((?:\s+\S.*\n)+)/) || [, ""])[1];
 ok(/contents:\s*read/.test(perm), "permissions must grant contents: read");
@@ -165,4 +298,4 @@ if (failures.length) {
   for (const f of failures) console.error(" - " + f);
   process.exit(1);
 }
-console.log("deploy-fly workflow contract valid (three-app matrix, token isolation, policy-aware verification).");
+console.log("deploy-fly workflow contract valid (three-app matrix, token isolation, policy-aware verification, classified pre-release precondition).");
