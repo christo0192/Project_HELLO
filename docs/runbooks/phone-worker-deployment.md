@@ -229,3 +229,32 @@ worker with an API still dispatching to nobody. The validator refuses a mismatch
 non-empty name (§1), so a half-done rename fails CI rather than shipping silently.
 
 Rollback at any step is §5.
+
+## Incident: `ModuleNotFoundError: No module named 'phone'` (PR102)
+
+**Symptom.** `project-hello-voice` v40 started `python agent.py start` and crashed
+in a loop with `ModuleNotFoundError: No module named 'phone'`; the machine was
+stopped to end the loop.
+
+**Cause.** P4a (PR #97) added `import phone` to `agent.py`, but the runtime image
+`COPY` list in `app/voice-livekit/Dockerfile` was not updated, so `phone.py` never
+entered the image. Both voice apps run this same image (`fly.toml` and
+`fly.phone.toml` both `dockerfile = "Dockerfile"`), so both were exposed.
+
+**Fix (PR102).** Add `phone.py` to the Dockerfile `COPY`. The COPY list is now
+the **exact** transitive first-party import closure of `agent.py`, enforced
+statically so this cannot recur silently:
+- `scripts/validate-container.sh` AST-parses the closure from `agent.py` and fails
+  the contract if any transitively-imported local module is missing from the COPY
+  (or if a secret/env file is copied). Run locally with `--docker` to also build
+  the image and prove `import phone, agent` resolves from `/app` under
+  `--network none` (no LiveKit/provider contact).
+- `scripts/validate-hosting-foundation.test.mjs` and
+  `app/voice-livekit/tests/test_docker_packaging.py` carry the negative controls
+  (drop a first-party COPY → red; new local import without COPY → red; secret/env
+  COPY → red).
+
+**Recovery for a live machine.** Redeploy from a build that includes this fix
+(image rebuilt from `app/voice-livekit`), confirm a current registration, then
+`fly machine start`/`scale count 1` for the affected app. No data or schema change
+is involved.

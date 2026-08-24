@@ -48,7 +48,22 @@ COPY --from=builder /opt/venv /opt/venv
 
 # Worker sources only — the build context excludes everything else
 # (see .dockerignore). No .env is ever copied into the image.
-COPY agent.py observability.py persistence.py prompting.py provenance.py provider_resilience.py ./
+#
+# This list is the EXACT first-party import closure of the entrypoint
+# `agent.py` (transitively via `import phone`, `import persistence`, etc.),
+# and nothing more. It is enforced statically, not by convention:
+# scripts/validate-container.sh parses the closure from agent.py with an AST
+# walk and fails the build contract if any transitively-imported local module
+# is not COPY'd here (or if a secret/env file is). phone.py was added in P4a
+# (`import phone` in agent.py) and MUST ship, or the worker dies at startup
+# with `ModuleNotFoundError: No module named 'phone'`.
+# Deliberately excluded (not on the runtime import path): voice_quality_harness.py,
+# model_governance/, tests/ — see .dockerignore.
+# Limitation: the static closure resolves absolute, relative, and literal-string
+# dynamic imports (importlib.import_module("x")/__import__("x")); a first-party
+# module pulled in only via a computed/non-literal import name cannot be seen
+# statically and must be added here by hand.
+COPY agent.py observability.py persistence.py phone.py prompting.py provenance.py provider_resilience.py ./
 
 USER 1000:1000
 
