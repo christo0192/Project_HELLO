@@ -36,6 +36,13 @@ jobs:
         run: node scripts/validate-voice-worker-apps.mjs && node scripts/validate-voice-worker-apps.test.mjs
       - name: Validate architecture decision records
         run: node scripts/check-adrs.mjs
+      # ── P8B — Canary-0's OFFLINE half. No database, no Docker, no network.
+      #    It gates the sanitized manifest's schema and tamper detection, the
+      #    zero-PSTN traps (including a disarmed-trap control), the static
+      #    import scan, and the halt drill's refusal state machine. The
+      #    substrate half runs in supabase-ci.yml, which has a real Postgres. ──
+      - name: Phone Canary-0 offline gate (P8B)
+        run: node scripts/phone-canary/canary0.test.mjs
       - name: Install, typecheck, and test API
         working-directory: app/api
         run: npm ci && npm run typecheck && npm test

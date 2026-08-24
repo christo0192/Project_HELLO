@@ -16,7 +16,10 @@
     "bench:parser": "tsx scripts/bench-resume-parser.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "canary:phone": "node ../../scripts/phone-canary/canary0.mjs",
+    "canary:phone:offline": "node ../../scripts/phone-canary/canary0.test.mjs",
+    "halt:drill": "node ../../scripts/phone-canary/halt-drill.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",

@@ -289,27 +289,72 @@ class TestTerminationHelpers(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(log, ["prompt", "playout", "goodbye", "playout", "close"])
 
     async def test_candidate_activity_restarts_initial_silence_window(self):
-        """Activity inside the window pushes the prompt deadline out.
+        """Activity inside the window restarts it, so no prompt fires.
 
-        ── WHY THE NUMBERS LOOK LIKE THIS ────────────────────────────────
-        The assertion has to land in a specific gap: AFTER the original
-        deadline (or a broken restart would not have fired yet) and BEFORE the
-        restarted one (or the loop would legitimately prompt). An earlier
-        version used a 50 ms window, set activity at 5 ms and asserted at
-        15 ms — which is before the original deadline, so it could not detect
-        a broken restart at all. Deleting the restart logic entirely left it
-        GREEN; the only way it ever failed was a scheduling stall on a loaded
-        runner, which is exactly what it did in CI. Zero signal, non-zero
-        noise.
+        ── NO CLOCK, DELIBERATELY ────────────────────────────────────────
+        This used to sleep 5 ms, set the event, sleep 10 ms and assert. Two
+        things were wrong with it, and the second is worse than the first.
 
-        So: a 500 ms window, activity at 300 ms, assertion at 600 ms. The
-        original deadline is 500 ms and the restarted one is ~800 ms, leaving
-        ~200 ms of slack on each side — four times the whole margin the old
-        version had — and a restart that does not work prompts at 500 ms and
-        is caught.
+        It was FRAGILE: the assertion had to land inside the RESTARTED window,
+        so a runner that stalled that 10 ms sleep past ~40 ms saw a legitimate
+        prompt and failed. That is what it did in CI, and the mechanism is
+        reproducible — injecting a 45 ms stall AFTER `set()` yields the same
+        `['prompt', 'playout']` on both 3.12 and 3.14. (A stall BEFORE `set()`
+        does not, because expired timers dispatch earliest-deadline-first, so
+        the 5 ms sleep still wins. The vulnerable sleep was the assertion one.)
 
-        The opposite direction is pinned by the test above, which lets the
-        window elapse and asserts the full prompt/goodbye/close sequence.
+        It was also NON-DISCRIMINATING: the assertion at 15 ms sat *before* the
+        original 50 ms deadline, so deleting the restart from the loop entirely
+        left it green. Zero signal, non-zero noise.
+
+        Widening the sleeps only moves the race. So the clock is gone from the
+        decision instead: the seam reports "activity arrived" or "the window
+        lapsed" directly, and the loop's BEHAVIOUR is asserted rather than its
+        timing. The real `asyncio.wait_for` default stays covered by
+        `test_silence_prompt_then_goodbye_then_close` above and by
+        `test_the_PRODUCTION_wait_seam_answers_both_ways` below.
+        """
+        log = []
+        activity = asyncio.Event()
+        seen: list[tuple[bool, float]] = []
+
+        async def close():
+            log.append("close")
+
+        async def wait_for_activity(event, timeout):
+            # Record whether the loop CLEARED the event before waiting. That
+            # clear is what makes the window restart rather than resolve
+            # instantly on a stale set.
+            seen.append((event.is_set(), timeout))
+            if len(seen) == 1:
+                return True                   # activity arrived in window one
+            await asyncio.Event().wait()      # then hold, so the test can assert
+
+        task = asyncio.create_task(
+            agent_mod._silence_termination_loop(
+                _FakeTerminationSession(log), activity, close,
+                prompt_after_sec=0.5, end_after_sec=0.5,
+                wait_for_activity=wait_for_activity,
+            )
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        # Nothing was said: activity restarted the window instead.
+        self.assertEqual(log, [])
+        # The loop went back round and is waiting on the PROMPT window again,
+        # having cleared the event before each wait.
+        self.assertEqual(seen, [(False, 0.5), (False, 0.5)])
+
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+    async def test_CONTROL_a_lapsed_window_really_does_prompt(self):
+        """Without this the test above would pass on a loop that never speaks.
+
+        Same seam, opposite answer: the window lapses, so the prompt fires and
+        then the goodbye and the close. Deterministic — no clock either.
         """
         log = []
         activity = asyncio.Event()
@@ -317,20 +362,63 @@ class TestTerminationHelpers(unittest.IsolatedAsyncioTestCase):
         async def close():
             log.append("close")
 
+        async def always_lapsed(event, timeout):
+            return False
+
+        await agent_mod._silence_termination_loop(
+            _FakeTerminationSession(log), activity, close,
+            prompt_after_sec=0.5, end_after_sec=0.5,
+            wait_for_activity=always_lapsed,
+        )
+        self.assertEqual(log, ["prompt", "playout", "goodbye", "playout", "close"])
+
+    async def test_activity_in_the_SECOND_window_cancels_the_goodbye(self):
+        """The other restart: after the prompt, activity must stop the close.
+
+        A candidate who answers "are you still there?" must not then be hung up
+        on. The loop goes back to the top instead.
+        """
+        log = []
+        activity = asyncio.Event()
+        answers = [False, True]
+
+        async def close():
+            log.append("close")
+
+        async def scripted(event, timeout):
+            if answers:
+                return answers.pop(0)
+            await asyncio.Event().wait()
+
         task = asyncio.create_task(
             agent_mod._silence_termination_loop(
                 _FakeTerminationSession(log), activity, close,
                 prompt_after_sec=0.5, end_after_sec=0.5,
+                wait_for_activity=scripted,
             )
         )
-        await asyncio.sleep(0.3)
-        activity.set()
-        await asyncio.sleep(0.3)
-        # Past the ORIGINAL deadline, before the RESTARTED one.
-        self.assertEqual(log, [])
+        for _ in range(6):
+            await asyncio.sleep(0)
+
+        # Prompted, then the candidate answered — so no goodbye and no close.
+        self.assertEqual(log, ["prompt", "playout"])
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await task
+
+    async def test_the_PRODUCTION_wait_seam_answers_both_ways(self):
+        """The default is what production runs, so it is covered directly.
+
+        Both directions, and the timing bias of each is SAFE: the True case
+        completes as soon as the event is set, and the False case waits FOR a
+        lapse. A slow runner can only make either later, never wrong — which is
+        the property the old test lacked.
+        """
+        already = asyncio.Event()
+        already.set()
+        self.assertTrue(await agent_mod._await_candidate_activity(already, 5.0))
+        never = asyncio.Event()
+        self.assertFalse(await agent_mod._await_candidate_activity(never, 0.001))
 
     def test_final_goodbye_marker_is_bounded(self):
         for closing in (
