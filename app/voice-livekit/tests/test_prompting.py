@@ -6,7 +6,7 @@ from pathlib import Path
 import tomllib
 import unittest
 
-from prompting import opening_line, system_prompt
+from prompting import format_resume_facts, opening_line, system_prompt
 
 
 class TestOpeningAndIdentityDisclosure(unittest.TestCase):
@@ -32,6 +32,28 @@ class TestOpeningAndIdentityDisclosure(unittest.TestCase):
         self.assertIn("Only if the candidate explicitly asks", prompt)
         self.assertIn("answer truthfully", prompt)
         self.assertIn("Never claim to be human", prompt)
+
+    def test_resume_facts_include_bounded_recent_role_evidence(self):
+        facts = format_resume_facts({
+            "name": "Asha",
+            "current_role": "Advisor",
+            "recent_role": {
+                "title": "Program Advisor",
+                "employer": "Example Co",
+                "period": "2024-present",
+                "highlights": ["Exceeded target", "x" * 400],
+            },
+            "prior_roles": [{"title": "Sales Associate", "employer": "Prior Co"}],
+            "career_highlights": ["Top performer"],
+            "education": ["MBA"],
+            "certifications": ["Salesforce Administrator"],
+        })
+
+        self.assertIn("untrusted resume claims", facts)
+        self.assertIn("Program Advisor | Example Co | 2024-present", facts)
+        self.assertIn("Sales Associate | Prior Co", facts)
+        self.assertIn("Top performer", facts)
+        self.assertNotIn("x" * 241, facts)
 
     def test_production_uses_bulbul_v3_simran(self):
         fly_config = tomllib.loads(

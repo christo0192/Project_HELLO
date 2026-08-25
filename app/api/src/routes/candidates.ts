@@ -1,10 +1,17 @@
 import { Router } from 'express';
 import { supabase } from '../lib/supabase.js';
-import { validateQuery, validateParams } from '../lib/validation.js';
-import { listCandidatesQuerySchema, candidateIdParamSchema } from '../schemas/candidates.js';
+import { validateQuery, validateParams, validateBody } from '../lib/validation.js';
+import {
+  listCandidatesQuerySchema,
+  candidateIdParamSchema,
+  manualPhoneCallBodySchema,
+} from '../schemas/candidates.js';
 import { requireRole } from '../lib/rbac.js';
 import { recordAudit } from '../lib/audit.js';
 import { redactCandidatePhone } from '../lib/candidate-phone.js';
+import { createLogger } from '../lib/logger.js';
+
+const candidateLogger = createLogger('candidates');
 
 export const candidatesRouter = Router();
 
@@ -236,6 +243,66 @@ candidatesRouter.get('/summary', requireRole('viewer'), async (req, res, next) =
     recommendation_distribution: distribution,
   });
 });
+
+// Manual phone request — interviewer/admin. This route only creates/adopts the
+// application-scoped engagement. The due pass and `admit_phone_attempt` remain
+// the only path that can originate a call, so an HTTP retry cannot dial twice.
+candidatesRouter.post(
+  '/:id/phone-call',
+  requireRole('interviewer'),
+  validateParams(candidateIdParamSchema),
+  validateBody(manualPhoneCallBodySchema),
+  async (req, res) => {
+    if (process.env.PHONE_SCREENING_ENABLED !== 'true') {
+      res.status(503).json({ ok: false, error: 'phone_screening_disabled' });
+      return;
+    }
+
+    try {
+      let query = supabase
+        .from('candidates')
+        .select('id, owner_id')
+        .eq('id', req.params.id);
+      if (req.authUser?.appRole === 'interviewer') {
+        query = query.eq('owner_id', req.authUser.id);
+      }
+      const { data: candidate, error: candidateError } = await query.maybeSingle();
+      if (candidateError || !candidate) {
+        res.status(404).json({ ok: false, error: 'candidate_not_found' });
+        return;
+      }
+
+      const { data, error } = await supabase.rpc('request_candidate_phone_call', {
+        p_candidate_id: req.params.id,
+        p_now: new Date().toISOString(),
+      });
+      if (error) {
+        candidateLogger.warn('unknown_event', {
+          error_category: 'manual_phone_request',
+          error_type: 'rpc_failed',
+        });
+        res.status(503).json({ ok: false, error: 'phone_request_unavailable' });
+        return;
+      }
+
+      const status = data && typeof data === 'object' && 'status' in data
+        ? String((data as { status: unknown }).status)
+        : 'unknown';
+      const accepted = status === 'eligible' || status === 'scheduled_next_window'
+        || status === 'already_requested';
+      await recordAudit(req, 'resource.create', accepted ? 202 : 409, {
+        metadata: { resource: 'phone_call_request', status },
+      });
+      if (!accepted) {
+        res.status(409).json({ ok: false, error: 'phone_request_refused', status });
+        return;
+      }
+      res.status(202).json({ ok: true, status: status === 'already_requested' ? 'already_requested' : 'requested' });
+    } catch {
+      res.status(503).json({ ok: false, error: 'phone_request_unavailable' });
+    }
+  },
+);
 
 // Candidate detail incl. latest assessment + session list — viewer and above.
 // Interviewer sees only own records; admin sees all.

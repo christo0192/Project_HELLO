@@ -470,7 +470,7 @@ export function createAshbyRuntime(options: CreateAshbyRuntimeOptions): AshbyRun
   async function resolveMappingByJobId(externalJobId: string): Promise<ResolvedMapping> {
     const { data, error } = await supabase
       .from('ashby_job_mappings')
-      .select('id, status, ai_screening_stage_id, delivery_mode')
+      .select('id, status, ai_screening_stage_id, delivery_mode, screening_mode')
       .eq('provider', 'ashby')
       .eq('external_job_id', externalJobId)
       .maybeSingle();
@@ -487,6 +487,7 @@ export function createAshbyRuntime(options: CreateAshbyRuntimeOptions): AshbyRun
       aiScreeningStageId: (r.ai_screening_stage_id as string | null) ?? null,
       id: String(r.id),
       deliveryMode: mode === 'email' || mode === 'both' ? (mode as 'email' | 'both') : 'manual',
+      screeningMode: r.screening_mode === 'phone_primary' ? 'phone_primary' : 'browser_primary',
     };
   }
 

@@ -6,6 +6,13 @@ export interface ScreeningQuestion {
   mandatory?: boolean;     // must be asked and answered, e.g. years of exp, why-left, CTC
 }
 
+export interface ResumeRoleEvidence {
+  title: string | null;
+  employer: string | null;
+  period: string | null;
+  highlights: string[];
+}
+
 export interface ParsedResume {
   name: string | null;
   email: string | null;
@@ -14,6 +21,12 @@ export interface ParsedResume {
   experience_years: number | null;
   current_role: string | null;
   summary: string | null;
+  /** Bounded evidence copied from the resume; absent on legacy rows. */
+  recent_role?: ResumeRoleEvidence | null;
+  prior_roles?: ResumeRoleEvidence[];
+  career_highlights?: string[];
+  education?: string[];
+  certifications?: string[];
 }
 
 export interface TranscriptTurn {

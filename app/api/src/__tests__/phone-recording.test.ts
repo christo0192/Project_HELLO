@@ -197,16 +197,16 @@ describe('P4 recording — ordering is attach, then egress, then finalize', () =
 // ═══════════════════════════════════════════════════════════════════════
 
 describe('P4 recording — the exact derived keys, manifest suffix included', () => {
-  it('binds `phone-<attemptId>-egress.ogg` and `phone-<attemptId>-egress.ogg.json`', async () => {
+  it('binds `phone-<attemptId>-egress.mp3` and `phone-<attemptId>-egress.mp3.json`', async () => {
     const h = harness();
     const res = await run(h);
 
-    expect(res.objectKey).toBe(`phone-${ATTEMPT}-egress.ogg`);
-    expect(res.manifestKey).toBe(`phone-${ATTEMPT}-egress.ogg.json`);
+    expect(res.objectKey).toBe(`phone-${ATTEMPT}-egress.mp3`);
+    expect(res.manifestKey).toBe(`phone-${ATTEMPT}-egress.mp3.json`);
     expect(h.attach.mock.calls[0][0]).toEqual({
       attemptId: ATTEMPT,
-      objectKey: `phone-${ATTEMPT}-egress.ogg`,
-      manifestKey: `phone-${ATTEMPT}-egress.ogg.json`,
+      objectKey: `phone-${ATTEMPT}-egress.mp3`,
+      manifestKey: `phone-${ATTEMPT}-egress.mp3.json`,
       role: 'authoritative',
       now: NOW,
     });
@@ -221,7 +221,7 @@ describe('P4 recording — the exact derived keys, manifest suffix included', ()
     const res = await run(h);
     expect(res.manifestKey).not.toBe(`phone-${ATTEMPT}-egress.json`);
     expect(res.manifestKey).toBe(`${res.objectKey}.json`);
-    expect(res.manifestKey!.endsWith('.ogg.json')).toBe(true);
+    expect(res.manifestKey!.endsWith('.mp3.json')).toBe(true);
   });
 
   it('and the egress writes to the object key, never to the manifest key', async () => {

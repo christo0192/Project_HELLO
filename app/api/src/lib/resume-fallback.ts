@@ -80,7 +80,22 @@ export function fallbackParseResumeText(text: string): ParsedResume {
     return cleaned ? cleaned.slice(0, 500) : null;
   })();
 
-  return { name, email, phone, skills, experience_years, current_role, summary };
+  return {
+    name,
+    email,
+    phone,
+    skills,
+    experience_years,
+    current_role,
+    summary,
+    recent_role: current_role
+      ? { title: current_role, employer: null, period: null, highlights: [] }
+      : null,
+    prior_roles: [],
+    career_highlights: [],
+    education: [],
+    certifications: [],
+  };
 }
 
 export function hasUsefulFallbackResume(parsed: ParsedResume): boolean {

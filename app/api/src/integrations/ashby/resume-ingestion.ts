@@ -60,6 +60,13 @@ export type IngestionState =
   | 'queued' | 'fetching' | 'scanning' | 'extracting' | 'structuring' | 'ready' | 'failed_review' | 'cancelled';
 
 /** Structured resume fields (approved, PII-bearing — persisted to the sensitive model only). */
+export interface StructuredResumeRoleEvidence {
+  title: string | null;
+  employer: string | null;
+  period: string | null;
+  highlights: string[];
+}
+
 export interface StructuredResume {
   name: string | null;
   email: string | null;
@@ -68,6 +75,12 @@ export interface StructuredResume {
   experience_years: number | null;
   current_role: string | null;
   summary: string | null;
+  /** Bounded evidence copied from the resume; optional for legacy adapters. */
+  recent_role?: StructuredResumeRoleEvidence | null;
+  prior_roles?: StructuredResumeRoleEvidence[];
+  career_highlights?: string[];
+  education?: string[];
+  certifications?: string[];
 }
 
 /** Scanner verdict shape (subset of the repo malware-scanner ScanResult). */

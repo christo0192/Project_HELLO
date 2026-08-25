@@ -26,6 +26,8 @@ export interface ApplicationView {
   applicationId?: string;
   jobId?: string;
   currentStageId?: string;
+  /** Source-authentic application submission instant, when present. */
+  submittedAt?: string;
   /** Candidate identity used only for the candidate.info resume fallback. */
   candidateId?: string;
 }

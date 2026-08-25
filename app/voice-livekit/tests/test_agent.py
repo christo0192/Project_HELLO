@@ -153,6 +153,7 @@ _mock_prompting.system_prompt = MagicMock(return_value="system text")
 # plan through the SAME helper the browser prompt uses. A stub missing it
 # turns an ImportError into a collection failure for three unrelated modules.
 _mock_prompting.format_questions = MagicMock(return_value="1. question flow")
+_mock_prompting.format_resume_facts = MagicMock(return_value="resume facts")
 sys.modules["prompting"] = _mock_prompting
 
 import agent as agent_mod  # noqa: E402

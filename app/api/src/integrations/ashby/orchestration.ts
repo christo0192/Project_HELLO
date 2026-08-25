@@ -98,7 +98,10 @@ export interface WorkflowStores {
     externalStageId: string;
     jobMappingId: string | null;
     externalResumeFileHandle: string | null;
+    submittedAt: string | null;
   }): Promise<{ id: string }>;
+  /** Backfill source-authentic submission evidence on a reused link. */
+  bindLinkSubmittedAt?(applicationLinkId: string, submittedAt: string): Promise<void>;
   advanceIngestion(
     applicationLinkId: string,
     nextState: string,
@@ -208,6 +211,8 @@ export interface RuntimeWorkflowStores extends WorkflowStores {
   ): Promise<{ status: string; attempts?: number }>;
   /** Park a completed application as `writeback_pending` (audited, idempotent). */
   markWritebackPending(applicationLinkId: string, reason: string): Promise<{ status: string }>;
+  /** Materialize/adopt the phone-primary engagement after resume readiness. */
+  ensurePhoneEngagement?(applicationLinkId: string): Promise<{ status: string }>;
   /** Enqueue the verified scorecard sink after a durable assessment insert. */
   enqueueScorecardWrite?(applicationLinkId: string, sessionId: string): Promise<{ status: string }>;
   /**
@@ -248,6 +253,8 @@ export interface WorkflowLinkRow {
 export interface ResolvedMapping extends MappingActivity {
   id: string | null;
   deliveryMode: DeliveryMode;
+  /** Defaults to browser_primary for legacy/injected mappings. */
+  screeningMode?: 'browser_primary' | 'phone_primary';
   externalResumeFileHandleFromApp?: string | null;
 }
 
@@ -367,6 +374,9 @@ export async function runImport(externalApplicationId: string, deps: ImportDeps)
     if (resumeHandle && !existing.externalResumeFileHandle && deps.stores.bindLinkResumeHandle) {
       await deps.stores.bindLinkResumeHandle(linkId, resumeHandle);
     }
+    if (view.submittedAt && deps.stores.bindLinkSubmittedAt) {
+      await deps.stores.bindLinkSubmittedAt(linkId, view.submittedAt);
+    }
   } else {
     const created = await deps.stores.createLink({
       externalApplicationId: appId,
@@ -374,6 +384,7 @@ export async function runImport(externalApplicationId: string, deps: ImportDeps)
       externalStageId: decision.stageId,
       jobMappingId: mapping.id,
       externalResumeFileHandle: resumeHandle,
+      submittedAt: view.submittedAt ?? null,
     });
     linkId = created.id;
     reused = false;
@@ -403,15 +414,18 @@ export async function runImport(externalApplicationId: string, deps: ImportDeps)
     candidateId = bound.status === 'skipped' ? null : bound.candidateId;
   }
 
+  // In phone-primary mode the browser path remains available to recruiters,
+  // but no invite is automatically delivered merely because the application
+  // entered the stage. The post-parse engagement is the primary path.
   const channels = channelsForMode(mapping.deliveryMode);
-  if (channels.email) {
+  if (mapping.screeningMode !== 'phone_primary' && channels.email) {
     await deps.stores.enqueueOperation({
       applicationLinkId: linkId,
       operationType: 'invite_delivery',
       operationKey: inviteDeliveryOperationKey({ externalApplicationId: appId, channel: 'email', inviteId: 'pending' }),
     });
   }
-  if (channels.manual) {
+  if (mapping.screeningMode !== 'phone_primary' && channels.manual) {
     await deps.stores.enqueueOperation({
       applicationLinkId: linkId,
       operationType: 'invite_delivery',

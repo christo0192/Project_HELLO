@@ -91,7 +91,7 @@ begin
   end if;
   att  := (r->>'attempt_id')::uuid;
   sess := _phone_canary.new_session(cand, t);
-  okey := 'phone-' || att::text || '-egress.ogg';
+  okey := 'phone-' || att::text || '-egress.mp3';
   mkey := okey || '.json';
 
   -- ── The gate, BEFORE the disclosure ────────────────────────────────
@@ -280,7 +280,7 @@ begin
     return;
   end if;
   att := (r->>'attempt_id')::uuid;
-  okey := 'phone-' || att::text || '-egress.ogg';
+  okey := 'phone-' || att::text || '-egress.mp3';
   mkey := okey || '.json';
 
   r := _phone_canary.sip(att, 'classify.machine', t + interval '30 seconds', 1);

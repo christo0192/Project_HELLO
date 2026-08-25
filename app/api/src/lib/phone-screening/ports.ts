@@ -392,6 +392,11 @@ export interface PhoneAssessmentState {
   readonly sessionStatus?: string;
   readonly terminalReason?: string | null;
   readonly candidateName?: string | null;
+  readonly roleTitle?: string | null;
+  readonly roleFocus?: string | null;
+  readonly roleRequiredSkills?: readonly string[];
+  readonly interviewerInstructions?: string | null;
+  readonly resumeFacts?: Readonly<Record<string, unknown>>;
   readonly planSource?: string;
   readonly questionCount?: number;
   readonly questions?: readonly PhonePlanQuestion[];

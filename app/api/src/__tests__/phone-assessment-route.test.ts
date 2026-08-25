@@ -664,6 +664,8 @@ describe('the response body is a SUBSET, asserted structurally', () => {
   // subset check.
   const WORKER_CONTEXT_KEYS = [
     'session_id', 'candidate_id', 'role_id', 'candidate_name', 'room_name', 'status',
+    'role_title', 'role_focus', 'role_required_skills', 'interviewer_instructions',
+    'candidate_evidence',
   ];
 
   it('`context` carries only keys the browser worker context already had', () => {
@@ -691,7 +693,7 @@ describe('the response body is a SUBSET, asserted structurally', () => {
     const serialized = JSON.stringify(body);
     for (const forbidden of [
       'phone', 'e164', 'sip', 'egress', 'attempt', 'room_name',
-      'lease', 'provider', 'resume', 'engagement',
+      'lease', 'provider', 'engagement',
     ]) {
       expect(serialized.toLowerCase(), forbidden).not.toContain(forbidden);
     }

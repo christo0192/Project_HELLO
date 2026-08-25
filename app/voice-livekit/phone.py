@@ -1166,8 +1166,9 @@ class PhoneAssessmentState:
     """
 
     __slots__ = (
-        "ok", "status", "candidate_name", "questions", "cursor",
-        "next_key", "completed_keys", "turns", "assessment_exists",
+        "ok", "status", "candidate_name", "role_title", "role_focus",
+        "role_required_skills", "interviewer_instructions", "resume_facts",
+        "questions", "cursor", "next_key", "completed_keys", "turns", "assessment_exists",
         "already_scored", "plan_complete", "plan_source",
     )
 
@@ -1175,6 +1176,11 @@ class PhoneAssessmentState:
         self.ok = ok
         self.status = status
         self.candidate_name: str | None = None
+        self.role_title: str | None = None
+        self.role_focus: str | None = None
+        self.role_required_skills: list[str] = []
+        self.interviewer_instructions: str | None = None
+        self.resume_facts: dict[str, Any] = {}
         self.questions: list[PhonePlanQuestion] = []
         self.cursor: int = 0
         self.next_key: str | None = None
@@ -1204,6 +1210,26 @@ class PhoneAssessmentState:
         if isinstance(context, dict):
             name = context.get("candidate_name")
             state.candidate_name = str(name) if isinstance(name, str) and name else None
+            role_title = context.get("role_title")
+            state.role_title = str(role_title)[:200] if isinstance(role_title, str) and role_title else None
+            role_focus = context.get("role_focus")
+            state.role_focus = str(role_focus)[:900] if isinstance(role_focus, str) and role_focus else None
+            required = context.get("role_required_skills")
+            if isinstance(required, list):
+                state.role_required_skills = [
+                    str(item)[:200] for item in required[:100]
+                    if isinstance(item, str) and item.strip()
+                ]
+            instructions = context.get("interviewer_instructions")
+            state.interviewer_instructions = (
+                str(instructions)[:10000]
+                if isinstance(instructions, str) and instructions else None
+            )
+            facts = context.get("candidate_evidence")
+            if isinstance(facts, dict):
+                # Keep the projection as data; prompting.format_resume_facts
+                # applies the field-specific bounds before model delivery.
+                state.resume_facts = dict(facts)
 
         plan = data.get("plan")
         declared = None

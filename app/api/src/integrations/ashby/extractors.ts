@@ -154,6 +154,8 @@ export interface ApplicationInfoView {
   applicationId?: string;
   jobId?: string;
   currentStageId?: string;
+  /** Source-authentic application submission instant, when Ashby supplies it. */
+  submittedAt?: string;
   /** Opaque candidate id for an authoritative candidate.info resume fallback. */
   candidateId?: string;
 }
@@ -165,11 +167,19 @@ export function extractApplicationInfo(results: unknown): ApplicationInfoView {
   // application.info may nest under `application` or return the app directly.
   const app = asObject(root.application) ?? root;
   const candidateId = firstSafeId(app, [['candidate', 'id'], ['candidateId']]);
+  const submittedRaw = firstSafeId(app, [
+    ['submittedAt'], ['applicationSubmittedAt'], ['createdAt'],
+  ]);
+  const submittedMs = submittedRaw ? Date.parse(submittedRaw) : Number.NaN;
+  // Canonicalize so only a real instant crosses into persistence. Missing or
+  // malformed evidence remains absent and therefore cannot unlock calling.
+  const submittedAt = Number.isFinite(submittedMs) ? new Date(submittedMs).toISOString() : undefined;
   return {
     applicationId: firstSafeId(app, [['id']]) ?? firstSafeId(root, [['applicationId']]),
     jobId: firstSafeId(app, [['job', 'id'], ['jobId']]),
     currentStageId:
       firstSafeId(app, [['currentInterviewStage', 'id'], ['currentStageId'], ['stageId']]),
+    ...(submittedAt ? { submittedAt } : {}),
     ...(candidateId ? { candidateId } : {}),
   };
 }

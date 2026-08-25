@@ -80,6 +80,15 @@ describe('extractApplicationInfo', () => {
     expect(extractApplicationInfo({ application: { id: 'a', job: { id: 'j' }, candidate: { id: 'c' }, currentInterviewStage: { id: 's' } } }))
       .toEqual({ applicationId: 'a', jobId: 'j', currentStageId: 's', candidateId: 'c' });
   });
+  it('canonicalizes a source submission instant and rejects malformed values', () => {
+    expect(extractApplicationInfo({ application: {
+      id: 'a', job: { id: 'j' }, submittedAt: '2026-08-25T10:00:00+05:30',
+    } })).toEqual({
+      applicationId: 'a', jobId: 'j', submittedAt: '2026-08-25T04:30:00.000Z',
+    });
+    expect(extractApplicationInfo({ application: { id: 'a', submittedAt: 'not-a-date' } }))
+      .toEqual({ applicationId: 'a' });
+  });
   it('returns {} for a non-object', () => {
     expect(extractApplicationInfo(null)).toEqual({});
   });
