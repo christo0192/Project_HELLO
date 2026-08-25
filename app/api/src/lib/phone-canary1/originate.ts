@@ -41,14 +41,39 @@
  * attempt at all.
  */
 
+// ── EVERY IMPORT BELOW NAMES A LEAF MODULE, NEVER A DIRECTORY BARREL ──
+// PR108. `resolvePhoneSipClient` used to be imported from
+// `livekit-phone-dial/index.js`. That barrel re-exports `phone-room.ts`, which
+// imports `lib/room-provisioning.ts`, which imports `lib/env.ts` — and
+// `lib/env.ts` throws at module scope when `SUPABASE_URL` is unset. A barrel
+// re-export is EAGER: ESM evaluates every re-exported module even when the
+// importer names one symbol. So the operator's terminal got
+// `process_containment|FAIL|uncaught_exception` and nothing else — before the
+// arming gate, before any prompt, with the cause inside the containment layer
+// that exists to keep error objects off the screen.
+//
+// A second, quieter consequence, which did not fire in the incident but was
+// one populated variable away from doing so: `lib/env.ts` opens with
+// `import 'dotenv/config'`, which merges a `.env` read FROM THE PROCESS CWD
+// into `process.env`. This mechanism refuses to run beside persisted LiveKit
+// credentials — `credentials_persisted` — but that refusal reads a path pinned
+// relative to the module, so under any other cwd the barrel could have loaded
+// a dotfile the refusal never looked at. The repair removes `dotenv` from the
+// closure outright rather than reasoning about which cwd is safe.
+//
+// The canary CLI is not the API. It holds no Supabase credential and must
+// require none. These imports are therefore pinned to the exact leaf modules
+// that define the symbols, and `phone-canary1-import-closure.test.ts` walks the
+// real static graph from both roots and fails if a barrel — or `lib/env` —
+// re-enters it.
 import {
   resolvePhoneSipClient,
-  type DialableNumber,
   type PhoneOriginateResult,
   type PhoneSipClient,
   type SipClientResolution,
-} from '../../integrations/livekit-phone-dial/index.js';
-import { isDialAllowedForDigest, type PhoneScreeningConfig } from '../phone-screening/index.js';
+} from '../../integrations/livekit-phone-dial/sip.js';
+import type { DialableNumber } from '../../integrations/livekit-phone-dial/dialable-number.js';
+import { isDialAllowedForDigest, type PhoneScreeningConfig } from '../phone-screening/config.js';
 import type { PhoneDialConfig } from '../../integrations/livekit-phone-dial/config.js';
 import { discardingErrors, scrubVerbosity } from './containment.js';
 import { buildCanary1DispatchMetadata, buildCanary1RoomMetadata } from './metadata.js';

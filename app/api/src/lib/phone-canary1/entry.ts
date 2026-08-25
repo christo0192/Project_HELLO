@@ -42,7 +42,11 @@
 
 import { readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
-import { wrapDialableNumber, type DialableNumber } from '../../integrations/livekit-phone-dial/index.js';
+// PR108. Was `livekit-phone-dial/index.js`. `dialable-number.ts` imports
+// `node:crypto` and nothing else, whereas the barrel is an EAGER re-export of
+// `phone-room.ts` -> `lib/room-provisioning.ts` -> `lib/env.ts`, which throws
+// at module scope without `SUPABASE_URL`. See the header of `originate.ts`.
+import { wrapDialableNumber, type DialableNumber } from '../../integrations/livekit-phone-dial/dialable-number.js';
 // The PRODUCTION loader, imported from `config.js` DIRECTLY rather than from
 // the directory barrel. `config.ts` has zero imports of its own, so this adds
 // no transitive dependency; the barrel re-exports `sip.ts`, and pulling the

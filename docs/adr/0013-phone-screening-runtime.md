@@ -415,8 +415,8 @@ second case, which is the one a later revert actually produces.
   into one. It does not re-verify the 133 — that needs a live database this
   gate has no Docker for, and pretending otherwise would be the decorative
   evidence this lane keeps deleting.
-* `app/api/src/__tests__/phone-canary1-*.test.ts` — **183 declared test cases**
-  across seven files covering Canary-1's structural closure (the explicit file
+* `app/api/src/__tests__/phone-canary1-*.test.ts` — **200 declared test cases**
+  across eight files covering Canary-1's structural closure (the explicit file
   list including `app/api/scripts/phone-canary1.ts`, the moved-not-duplicated
   `node:fs` read permission, the no-write sweep, the containment ordering), the
   refusals, the bounds and their inequalities, the originate seam, the
@@ -428,14 +428,15 @@ second case, which is the one a later revert actually produces.
   trunk-id sanitiser — each with the control that goes red without it — and then
   to 183 with PR106's review repair, which adds the two cases proving the join
   observation does not latch a transient empty listing into
-  `room_reaped_before_join` and returns at once on a confirmed reap. **The
+  `room_reaped_before_join` and returns at once on a confirmed reap, and to 200
+  with PR108's import-closure repair. **The
   number above is whatever the gate below reports; it is not a remembered
   constant and must not be edited to match a memory.**
   `scripts/check-phone-canary-evidence.test.mjs` derives this figure from the
   test sources and fails in EITHER direction if it and this record disagree.
   This number is **not comparable** to the two above and never will be: 133
   counts SQL checks against a live database, 139 counts offline assertions in a
-  dependency-free gate, and 181 counts test-case DECLARATIONS in a vitest suite
+  dependency-free gate, and 200 counts test-case DECLARATIONS in a vitest suite
   — the runtime total is higher because several cases are `it.each(...)` tables.
   The checker counts declarations because it runs before `npm ci` in
   `quality.yml` and cannot execute the suite; `npm test` in `app/api` is what
@@ -443,6 +444,15 @@ second case, which is the one a later revert actually produces.
   Canary-0's, and is labelled so in `PROTOCOL.md`: the telephony SDK IS
   resolvable from `app/api/src/__tests__`, so the property rests on dependency
   injection and the runtime traps rather than on unresolvability.
+  PR108's eighth file, `phone-canary1-import-closure.test.ts`, is the only one
+  of the eight that does not rely on this suite's environment: it walks the
+  CLI's runtime import graph from both roots WITHOUT loading it, and separately
+  starts the CLI in a child process whose environment holds `PATH` and `HOME`
+  and nothing else. Both halves exist because `vitest.setup.ts` assigns
+  `SUPABASE_URL` before any test module loads, so every in-suite Canary-1 test
+  passed while the CLI itself could not start — it reached
+  `lib/env.ts` through an eager barrel re-export and died before the arming
+  gate, printing only `process_containment|FAIL|uncaught_exception`.
 * `app/voice-livekit/tests/test_phone_canary.py` — the worker half: the
   `record=`/`PHONE_NO_RECORDING` identity-of-source pin with its
   drop-the-kwarg and second-literal controls, the three-condition gate, the
