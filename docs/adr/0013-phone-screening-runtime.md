@@ -415,7 +415,7 @@ second case, which is the one a later revert actually produces.
   into one. It does not re-verify the 133 — that needs a live database this
   gate has no Docker for, and pretending otherwise would be the decorative
   evidence this lane keeps deleting.
-* `app/api/src/__tests__/phone-canary1-*.test.ts` — **200 declared test cases**
+* `app/api/src/__tests__/phone-canary1-*.test.ts` — **202 declared test cases**
   across eight files covering Canary-1's structural closure (the explicit file
   list including `app/api/scripts/phone-canary1.ts`, the moved-not-duplicated
   `node:fs` read permission, the no-write sweep, the containment ordering), the
@@ -428,15 +428,16 @@ second case, which is the one a later revert actually produces.
   trunk-id sanitiser — each with the control that goes red without it — and then
   to 183 with PR106's review repair, which adds the two cases proving the join
   observation does not latch a transient empty listing into
-  `room_reaped_before_join` and returns at once on a confirmed reap, and to 200
-  with PR108's import-closure repair. **The
+  `room_reaped_before_join` and returns at once on a confirmed reap, to 200
+  with PR108's import-closure repair, and to 202 with PR109's branch
+  neutrality repair (below). **The
   number above is whatever the gate below reports; it is not a remembered
   constant and must not be edited to match a memory.**
   `scripts/check-phone-canary-evidence.test.mjs` derives this figure from the
   test sources and fails in EITHER direction if it and this record disagree.
   This number is **not comparable** to the two above and never will be: 133
   counts SQL checks against a live database, 139 counts offline assertions in a
-  dependency-free gate, and 200 counts test-case DECLARATIONS in a vitest suite
+  dependency-free gate, and 202 counts test-case DECLARATIONS in a vitest suite
   — the runtime total is higher because several cases are `it.each(...)` tables.
   The checker counts declarations because it runs before `npm ci` in
   `quality.yml` and cannot execute the suite; `npm test` in `app/api` is what
@@ -453,6 +454,21 @@ second case, which is the one a later revert actually produces.
   passed while the CLI itself could not start — it reached
   `lib/env.ts` through an eager barrel re-export and died before the arming
   gate, printing only `process_containment|FAIL|uncaught_exception`.
+  PR109 makes that eighth file BRANCH-NEUTRAL. PR108 asserted the child's
+  terminus by naming `main`'s (`armed|FAIL|canary1_not_armed`), but
+  `runCanary1` checks arming ahead of every credential and bound gate, so on
+  the activation artifact `canary1/arm` the same bare child walks past
+  `armed|PASS` and `credentials_transient|PASS` and stops at
+  `preflight_trunk_configured|FAIL|trunk_not_configured` — which made a
+  regression test for a start-up crash go red on the one branch that ever
+  starts the program. The terminus is now DERIVED from `CANARY1_ARMED`, the
+  same constant the child reads, with the two expectation sets held disjoint by
+  a control so the repair is a derivation rather than a widening; the arming
+  verdict is asserted in both directions; and a new unconditional invariant
+  proves a bare-environment `--dry-run` reaches no provider seam on either
+  branch. Verified by running the suite against both an unmodified tree and a
+  locally armed one, and by confirming PR108's assertion fails against the
+  latter.
 * `app/voice-livekit/tests/test_phone_canary.py` — the worker half: the
   `record=`/`PHONE_NO_RECORDING` identity-of-source pin with its
   drop-the-kwarg and second-literal controls, the three-condition gate, the
