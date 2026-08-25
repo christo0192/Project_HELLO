@@ -58,10 +58,11 @@ async function loadContext(candidateId: string): Promise<{
   let jd: string | null = null;
   let requiredSkills: string[] = [];
   let template: ScreeningQuestion[] = [];
+  let interviewerInstructions = '';
   if (candidate.role_id) {
     const { data: role } = await supabase
       .from('roles')
-      .select('title,jd,required_skills,screening_template')
+      .select('title,jd,required_skills,screening_template,interviewer_instructions')
       .eq('id', candidate.role_id)
       .single();
     if (role) {
@@ -69,6 +70,7 @@ async function loadContext(candidateId: string): Promise<{
       jd = role.jd;
       requiredSkills = (role.required_skills as string[]) ?? [];
       template = (role.screening_template as ScreeningQuestion[]) ?? [];
+      interviewerInstructions = (role.interviewer_instructions as string) ?? '';
     }
   }
 
@@ -85,6 +87,7 @@ async function loadContext(candidateId: string): Promise<{
       candidateSkills: (candidate.skills as string[]) ?? [],
       resumeFacts: formatResumeFacts(parsed),
       template,
+      interviewerInstructions,
     },
   };
 }

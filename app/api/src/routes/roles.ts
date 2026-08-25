@@ -46,7 +46,7 @@ rolesRouter.get('/:id', requireRole('viewer'), validateParams(roleIdParamSchema)
 // Create role (with screening template) — interviewer and above
 // Stamps owner_id from the authenticated user
 rolesRouter.post('/', requireRole('interviewer'), validateBody(createRoleSchema), async (req, res, next) => {
-  const { title, jd, required_skills, screening_template } = req.body;
+  const { title, jd, required_skills, screening_template, interviewer_instructions } = req.body;
   const ownerId = req.authUser!.id;
 
   const { data, error } = await supabase
@@ -56,6 +56,7 @@ rolesRouter.post('/', requireRole('interviewer'), validateBody(createRoleSchema)
       jd: jd ?? null,
       required_skills: required_skills ?? [],
       screening_template: screening_template ?? [],
+      interviewer_instructions: interviewer_instructions ?? '',
       owner_id: ownerId,
     })
     .select()
@@ -85,12 +86,13 @@ rolesRouter.put(
   validateParams(roleIdParamSchema),
   validateBody(updateRoleSchema),
   async (req, res, next) => {
-    const { title, jd, required_skills, screening_template, is_active } = req.body;
+    const { title, jd, required_skills, screening_template, interviewer_instructions, is_active } = req.body;
     const patch: Record<string, unknown> = {};
     if (title !== undefined) patch.title = title;
     if (jd !== undefined) patch.jd = jd;
     if (required_skills !== undefined) patch.required_skills = required_skills;
     if (screening_template !== undefined) patch.screening_template = screening_template;
+    if (interviewer_instructions !== undefined) patch.interviewer_instructions = interviewer_instructions;
     if (is_active !== undefined) patch.is_active = is_active;
 
     let q = supabase

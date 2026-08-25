@@ -1515,14 +1515,15 @@ async def _run_session(
     if worker_ctx is not None:
         sys_text = system_prompt(
             candidate_name=worker_ctx.candidate_name,
-            role_title=None,
-            role_focus=None,
+            role_title=worker_ctx.role_title,
+            role_focus=worker_ctx.role_focus,
             resume_facts=None,
-            questions=None,
+            questions=prompting_format_questions(worker_ctx.screening_template),
+            interviewer_instructions=worker_ctx.interviewer_instructions,
         )
         open_text = opening_line(
             candidate_name=worker_ctx.candidate_name,
-            role_title=None,
+            role_title=worker_ctx.role_title,
         )
     else:
         # Fallback (no server context) — use env-only prompt, no room metadata
