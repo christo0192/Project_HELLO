@@ -216,7 +216,7 @@ describe('runtime mapping resolvers', () => {
       },
     });
     const r = await runtimeWith(client).resolveMappingByJobId('job_1');
-    expect(r).toEqual({ status: 'enabled', aiScreeningStageId: 'stage_ai', id: 'map_1', deliveryMode: 'both' });
+    expect(r).toEqual({ status: 'enabled', aiScreeningStageId: 'stage_ai', id: 'map_1', deliveryMode: 'both', screeningMode: 'browser_primary' });
   });
 
   it('reports unknown for a job with no mapping rather than inventing one', async () => {

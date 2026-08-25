@@ -12,8 +12,9 @@
  *
  * The bucket, credentials and codec deliberately mirror
  * `lib/recording-egress.ts` rather than inventing a second convention: a phone
- * recording and a browser recording land in the same bucket, in the same
- * container format, and are read by the same tooling. Only the KEY differs, and
+ * recording and a browser recording land in the same bucket. Phone output is
+ * MP3 so it is directly usable by recruiters and downstream transcription.
+ * Only the KEY differs, and
  * it differs because it must — an attempt-scoped key is the thing that makes a
  * reconnect's audio nameable, and therefore deletable.
  */
@@ -46,7 +47,7 @@ export function phoneEgressConfigured(): boolean {
  *
  * ASYNC, because the SDK is imported lazily and its enums cannot be read at
  * module load — several suites partially mock `livekit-server-sdk`, and a
- * top-level `EncodedFileType.OGG` would throw under one. This is the same
+ * top-level `EncodedFileType.MP3` would throw under one. This is the same
  * constraint that keeps `recording-egress.ts`'s `terminalEgressStatuses()` a
  * function rather than a const.
  *
@@ -59,7 +60,7 @@ export function phoneEgressConfigured(): boolean {
 export async function createPhoneEgressOutput(objectKey: string): Promise<unknown> {
   const { EncodedFileOutput, EncodedFileType, S3Upload } = await import('livekit-server-sdk');
   return new EncodedFileOutput({
-    fileType: EncodedFileType.OGG,
+    fileType: EncodedFileType.MP3,
     filepath: objectKey,
     disableManifest: false,
     output: {

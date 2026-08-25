@@ -41,7 +41,7 @@ vi.mock('livekit-server-sdk', () => ({
   // The enum is read lazily by the module under test. A top-level read would
   // throw under exactly this kind of partial mock, which is why the adapter is
   // async in the first place.
-  EncodedFileType: { OGG: 'OGG' },
+  EncodedFileType: { MP3: 'MP3' },
   EgressClient: class {
     constructor(...args: unknown[]) {
       constructed.egress.push(args);
@@ -143,14 +143,14 @@ describe('createPhoneEgressOutput — the descriptor the recording is written th
     process.env.RECORDINGS_BUCKET = 'recordings_v2';
   });
 
-  it('writes to the EXACT key it is given, as OGG, with the manifest ENABLED', async () => {
+  it('writes to the EXACT key it is given, as MP3, with the manifest ENABLED', async () => {
     const mod = await load();
-    await mod.createPhoneEgressOutput('phone-abc-egress.ogg');
+    await mod.createPhoneEgressOutput('phone-abc-egress.mp3');
 
     expect(constructed.file).toHaveLength(1);
     const options = constructed.file[0] as Record<string, unknown>;
-    expect(options.filepath).toBe('phone-abc-egress.ogg');
-    expect(options.fileType).toBe('OGG');
+    expect(options.filepath).toBe('phone-abc-egress.mp3');
+    expect(options.fileType).toBe('MP3');
     // The manifest is WANTED. 0043 stores its key alongside the recording's
     // precisely so a purge deletes both; disabling it would make that column
     // dead weight and leave the purge describing an object that never existed.
@@ -162,14 +162,14 @@ describe('createPhoneEgressOutput — the descriptor the recording is written th
     // that form. A prefix added here would make the stored key and the written
     // object disagree — and the purge deletes the STORED one.
     const mod = await load();
-    await mod.createPhoneEgressOutput('phone-zzz-egress.ogg');
+    await mod.createPhoneEgressOutput('phone-zzz-egress.mp3');
     expect((constructed.file[0] as Record<string, unknown>).filepath)
-      .toBe('phone-zzz-egress.ogg');
+      .toBe('phone-zzz-egress.mp3');
   });
 
   it('targets the same bucket and path style as the browser recording path', async () => {
     const mod = await load();
-    await mod.createPhoneEgressOutput('phone-abc-egress.ogg');
+    await mod.createPhoneEgressOutput('phone-abc-egress.mp3');
 
     expect(constructed.s3).toHaveLength(1);
     const s3 = constructed.s3[0] as Record<string, unknown>;

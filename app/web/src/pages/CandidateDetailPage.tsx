@@ -161,6 +161,8 @@ function OverviewTab({
           candidateName={candidate.name}
         />
 
+        <ManualPhoneCallCard candidateId={candidate.id} />
+
         <LiveCallPanel
           candidateId={candidate.id}
           candidateName={candidate.name || undefined}
@@ -176,6 +178,72 @@ function OverviewTab({
         <AppealsSection candidateId={candidate.id} sessions={sessions} />
       </div>
     </div>
+  );
+}
+
+function ManualPhoneCallCard({ candidateId }: { candidateId: string }) {
+  const headingId = useId();
+  const [confirming, setConfirming] = useState(false);
+  const [requesting, setRequesting] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const [failure, setFailure] = useState<string | null>(null);
+
+  async function requestCall() {
+    setRequesting(true);
+    setMessage(null);
+    setFailure(null);
+    try {
+      const result = await api.requestCandidatePhoneCall(candidateId);
+      setConfirming(false);
+      setMessage(result.status === "already_requested"
+        ? "A phone screening is already queued or in progress."
+        : "Phone screening requested. It will run only when all call gates permit it.");
+    } catch (error) {
+      setFailure(error instanceof ApiError ? error.message : "Phone screening could not be requested.");
+    } finally {
+      setRequesting(false);
+    }
+  }
+
+  return (
+    <SurfaceCard as="section" labelledBy={headingId} className="p-4 sm:p-5">
+      <h2 id={headingId} className="text-sm font-semibold text-ink">Phone screening</h2>
+      <p className="mt-1 max-w-prose text-sm text-ink-secondary">
+        Request a gated phone screen. The recruiter-confirmed action does not bypass eligibility,
+        quiet hours, suppression, budget, halt, or concurrency controls.
+      </p>
+      <CandidateButton
+        className="mt-3"
+        variant="primary"
+        onClick={() => { setFailure(null); setMessage(null); setConfirming(true); }}
+        disabled={requesting}
+      >
+        Call candidate
+      </CandidateButton>
+      {message && <p role="status" className="mt-2 text-sm text-ink-secondary">{message}</p>}
+      {failure && <p role="alert" className="mt-2 text-sm text-ink-secondary">{failure}</p>}
+      {confirming && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby={`${headingId}-confirm`}
+          className="mt-4 rounded-lg border border-[var(--c-border)] bg-[var(--c-surface-muted)] p-4"
+        >
+          <h3 id={`${headingId}-confirm`} className="text-sm font-semibold text-ink">Confirm phone screening</h3>
+          <p className="mt-1 text-sm text-ink-secondary">
+            Request one phone screening for this candidate? The system will call only if every safety gate passes.
+          </p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <CandidateButton variant="primary" onClick={() => void requestCall()} loading={requesting}>
+              Confirm call
+            </CandidateButton>
+            <CandidateButton variant="secondary" onClick={() => setConfirming(false)} disabled={requesting}>
+              Cancel
+            </CandidateButton>
+          </div>
+        </div>
+      )}
+    </SurfaceCard>
   );
 }
 

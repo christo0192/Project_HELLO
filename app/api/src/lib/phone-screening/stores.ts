@@ -125,6 +125,30 @@ function bool(row: Row, key: string): boolean | undefined {
   return typeof v === 'boolean' ? v : undefined;
 }
 
+function boundedResumeFacts(row: Row): Readonly<Record<string, unknown>> {
+  const raw = row?.candidate_evidence;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const source = raw as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const key of [
+    'name', 'current_role', 'experience_years', 'skills', 'summary',
+    'recent_role', 'prior_roles', 'career_highlights', 'education', 'certifications',
+  ]) {
+    const value = source[key];
+    if (typeof value === 'string' || typeof value === 'number' || value === null) {
+      out[key] = typeof value === 'string' ? value.slice(0, 500) : value;
+    } else if (Array.isArray(value)) {
+      out[key] = value
+        .filter((item): item is string => typeof item === 'string')
+        .slice(0, 30)
+        .map((item) => item.slice(0, 240));
+    } else if (value && typeof value === 'object') {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
 /** `timestamptz` arrives as an ISO string; anything else is dropped. */
 function iso(row: Row, key: string): string | undefined {
   return str(row, key);
@@ -250,6 +274,14 @@ function projectAssessmentState(
     sessionStatus: str(row, 'session_status'),
     terminalReason: row && 'terminal_reason' in row ? (str(row, 'terminal_reason') ?? null) : undefined,
     candidateName: row && 'candidate_name' in row ? (str(row, 'candidate_name') ?? null) : undefined,
+    roleTitle: row && 'role_title' in row ? (str(row, 'role_title') ?? null) : undefined,
+    roleFocus: row && 'role_focus' in row ? (str(row, 'role_focus') ?? null) : undefined,
+    roleRequiredSkills: Array.isArray(row?.role_required_skills)
+      ? row!.role_required_skills.filter((v): v is string => typeof v === 'string').slice(0, 100)
+      : undefined,
+    interviewerInstructions: row && 'interviewer_instructions' in row
+      ? (str(row, 'interviewer_instructions') ?? null) : undefined,
+    resumeFacts: boundedResumeFacts(row),
     planSource: str(row, 'plan_source'),
     questionCount: num(row, 'question_count'),
     questions: Array.isArray(rawQuestions) ? questions : undefined,

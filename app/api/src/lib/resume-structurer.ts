@@ -70,6 +70,13 @@ const MAX_SKILL_LEN = 80;
 const MAX_PHONE_LEN = 64;
 /** A sane human range; outside it the value is noise, not an answer. */
 const MAX_EXPERIENCE_YEARS = 80;
+/** Rich screening context remains small enough for prompt and storage bounds. */
+const MAX_ROLE_EVIDENCE = 5;
+const MAX_ROLE_HIGHLIGHTS = 5;
+const MAX_CAREER_HIGHLIGHTS = 8;
+const MAX_EDUCATION = 6;
+const MAX_CERTIFICATIONS = 6;
+const MAX_EVIDENCE_LEN = 240;
 
 /** `undefined` (key absent) and `null` both mean "the model had no value". */
 function absent(v: unknown): boolean {
@@ -111,22 +118,54 @@ function coerceString(v: unknown, max: number): string | null {
   return trimmed.slice(0, max);
 }
 
-function coerceSkills(v: unknown): string[] {
+function coerceStringList(v: unknown, limit: number, itemLimit: number): string[] {
   if (absent(v)) return [];
   if (!Array.isArray(v)) throw new MalformedShape();
   const out: string[] = [];
   const seen = new Set<string>();
   for (const item of v) {
     // A non-string ENTRY is skipped rather than fatal: one bad element in an
-    // otherwise good list is noise, and skills decide nothing dangerous.
+    // otherwise good list is noise, and these fields decide nothing dangerous.
     if (typeof item !== 'string') continue;
-    const s = item.trim().slice(0, MAX_SKILL_LEN);
+    const s = item.trim().slice(0, itemLimit);
     if (s === '' || seen.has(s.toLowerCase())) continue;
     seen.add(s.toLowerCase());
     out.push(s);
-    if (out.length >= MAX_SKILLS) break;
+    if (out.length >= limit) break;
   }
   return out;
+}
+
+function coerceSkills(v: unknown): string[] {
+  return coerceStringList(v, MAX_SKILLS, MAX_SKILL_LEN);
+}
+
+type RoleEvidence = NonNullable<ParsedResume['recent_role']>;
+
+function coerceRoleEvidence(v: unknown): RoleEvidence | null {
+  if (absent(v)) return null;
+  if (typeof v !== 'object' || Array.isArray(v)) throw new MalformedShape();
+  const r = v as Record<string, unknown>;
+  const own = (k: string): unknown => (Object.hasOwn(r, k) ? r[k] : undefined);
+  const role = {
+    title: coerceString(own('title'), MAX_DISPLAY_LEN),
+    employer: coerceString(own('employer'), MAX_DISPLAY_LEN),
+    period: coerceString(own('period'), MAX_DISPLAY_LEN),
+    highlights: coerceStringList(own('highlights'), MAX_ROLE_HIGHLIGHTS, MAX_EVIDENCE_LEN),
+  };
+  return role.title || role.employer || role.period || role.highlights.length > 0 ? role : null;
+}
+
+function coercePriorRoles(v: unknown): RoleEvidence[] {
+  if (absent(v)) return [];
+  if (!Array.isArray(v)) throw new MalformedShape();
+  const roles: RoleEvidence[] = [];
+  for (const item of v) {
+    const role = coerceRoleEvidence(item);
+    if (role) roles.push(role);
+    if (roles.length >= MAX_ROLE_EVIDENCE) break;
+  }
+  return roles;
 }
 
 function coerceYears(v: unknown): number | null {
@@ -195,6 +234,11 @@ function coerceChecked(raw: unknown): ParsedResume | null {
       experience_years: coerceYears(own('experience_years')),
       current_role: coerceString(own('current_role'), MAX_DISPLAY_LEN),
       summary: coerceString(own('summary'), MAX_SUMMARY_LEN),
+      recent_role: coerceRoleEvidence(own('recent_role')),
+      prior_roles: coercePriorRoles(own('prior_roles')),
+      career_highlights: coerceStringList(own('career_highlights'), MAX_CAREER_HIGHLIGHTS, MAX_EVIDENCE_LEN),
+      education: coerceStringList(own('education'), MAX_EDUCATION, MAX_EVIDENCE_LEN),
+      certifications: coerceStringList(own('certifications'), MAX_CERTIFICATIONS, MAX_EVIDENCE_LEN),
     };
   } catch {
     // MalformedShape, or anything unexpected thrown by a hostile getter on a
@@ -259,6 +303,13 @@ export function mergeStructuredResume(
         : deterministic.experience_years,
       current_role: pick(model.current_role, deterministic.current_role),
       summary: pick(model.summary, deterministic.summary),
+      recent_role: model.recent_role ?? deterministic.recent_role ?? null,
+      prior_roles: (model.prior_roles?.length ?? 0) > 0 ? model.prior_roles : deterministic.prior_roles ?? [],
+      career_highlights: (model.career_highlights?.length ?? 0) > 0
+        ? model.career_highlights : deterministic.career_highlights ?? [],
+      education: (model.education?.length ?? 0) > 0 ? model.education : deterministic.education ?? [],
+      certifications: (model.certifications?.length ?? 0) > 0
+        ? model.certifications : deterministic.certifications ?? [],
     },
     // No phone from either side means nothing is dialable regardless, so the
     // model remains the structurer of record.

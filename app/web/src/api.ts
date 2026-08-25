@@ -170,6 +170,11 @@ export const api = {
     ),
   getCandidate: (id: string) =>
     request<CandidateDetail>(`/api/candidates/${id}`),
+  requestCandidatePhoneCall: (id: string) =>
+    request<{ ok: true; status: 'requested' | 'already_requested' }>(
+      `/api/candidates/${id}/phone-call`,
+      { method: 'POST', body: JSON.stringify({ confirm: true }) },
+    ),
   getCandidatesSummary: () =>
     request<CandidatesSummary>('/api/candidates/summary'),
 

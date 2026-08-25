@@ -59,3 +59,10 @@ export interface RecruiterAuthGuard {
 // ── Path params ───────────────────────────────────────────────────
 
 export const candidateIdParamSchema = idParamSchema;
+
+/** Explicit confirmation is required; the server still applies every phone gate. */
+export const manualPhoneCallBodySchema = z
+  .object({ confirm: z.literal(true) })
+  .strict();
+
+export type ManualPhoneCallBodyInput = z.infer<typeof manualPhoneCallBodySchema>;

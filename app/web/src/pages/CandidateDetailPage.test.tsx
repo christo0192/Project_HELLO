@@ -28,6 +28,7 @@ const mockApi = {
   // Default: this candidate is not Ashby-linked, so the read-only Ashby
   // pipeline card contributes nothing to the Overview.
   getCandidateAshbyWorkflow: vi.fn().mockResolvedValue({ ok: true, workflow: null }),
+  requestCandidatePhoneCall: vi.fn().mockResolvedValue({ ok: true, status: 'requested' }),
 };
 
 vi.mock('../api', () => ({
@@ -43,6 +44,7 @@ vi.mock('../api', () => ({
     startLiveKitScreening: vi.fn().mockRejectedValue(new Error('mock')),
     listCandidates: vi.fn().mockResolvedValue([]),
     getCandidateAshbyWorkflow: (...args: any[]) => mockApi.getCandidateAshbyWorkflow(...args),
+    requestCandidatePhoneCall: (...args: any[]) => mockApi.requestCandidatePhoneCall(...args),
   },
   ApiError: class extends Error {
     status: number;
@@ -161,6 +163,17 @@ describe('CandidateDetailPage', () => {
     renderDetailPage();
     expect(await screen.findByText('LiveKit voice screening')).toBeInTheDocument();
     expect(screen.getByText('Live call')).toBeInTheDocument();
+  });
+
+  it('requires confirmation before requesting a phone screening', async () => {
+    renderDetailPage();
+    await screen.findByText('Jane Doe');
+    expect(mockApi.requestCandidatePhoneCall).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole('button', { name: 'Call candidate' }));
+    expect(screen.getByRole('dialog', { name: 'Confirm phone screening' })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm call' }));
+    await waitFor(() => expect(mockApi.requestCandidatePhoneCall).toHaveBeenCalledWith('candidate-1'));
+    expect(await screen.findByRole('status')).toHaveTextContent(/Phone screening requested/);
   });
 
   it('renders the session summary in Overview', async () => {

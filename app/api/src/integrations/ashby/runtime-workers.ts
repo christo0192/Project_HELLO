@@ -683,6 +683,17 @@ export function buildAshbyHandlers(
       // `outcome.state === 'ready'` therefore means the candidate is already
       // populated, and a persistence failure has already parked the row in
       // `failed_review / materialize_failed` instead of marking it done.
+      //
+      // Phone-primary materialization is deliberately AFTER `ready`: the
+      // database RPC re-checks that terminal state under lock, creates at most
+      // one engagement per application, and leaves missing prerequisites as a
+      // visible pending row. It does not dial; admit_phone_attempt remains the
+      // only billable authority. Older injected stores omit this optional seam.
+      if (result.status === 'done'
+        && result.outcome.state === 'ready'
+        && runtime.stores.ensurePhoneEngagement) {
+        await runtime.stores.ensurePhoneEngagement(linkId);
+      }
     },
   };
 }

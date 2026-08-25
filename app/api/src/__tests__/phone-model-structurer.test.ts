@@ -69,6 +69,7 @@ import {
   isDialableStructurer,
   MODEL_STRUCTURER_VERSION,
 } from '../lib/candidate-phone.js';
+import { formatResumeFacts } from '../lib/prompts.js';
 
 const APIKEY = 'SENTINEL_APIKEY_aaaaaaaaaaaaaaaaaaaa';
 const SECRET = 'SENTINEL_SECRET_bbbbbbbbbbbbbbbbbbbb';
@@ -363,6 +364,8 @@ describe('coerceStructuredResume — the validator that replaced a cast', () => 
     expect(coerceStructuredResume({})).toEqual({
       name: null, email: null, phone: null, skills: [],
       experience_years: null, current_role: null, summary: null,
+      recent_role: null, prior_roles: [], career_highlights: [],
+      education: [], certifications: [],
     });
   });
 
@@ -423,6 +426,27 @@ describe('coerceStructuredResume — the validator that replaced a cast', () => 
     expect(out.skills).toEqual(['TypeScript', 'Postgres']);   // trimmed, deduped
   });
 
+  it('keeps bounded recent-role and career evidence without inventing fields', () => {
+    const out = coerceStructuredResume({
+      recent_role: {
+        title: 'Program Advisor', employer: 'Example Co', period: '2024-present',
+        highlights: [...Array(20)].map((_, i) => `achievement-${i}-${'x'.repeat(300)}`),
+      },
+      prior_roles: [...Array(20)].map((_, i) => ({ title: `Role ${i}`, highlights: [] })),
+      career_highlights: [...Array(20)].map((_, i) => `highlight-${i}`),
+      education: ['MBA', 'BSc'],
+      certifications: ['Salesforce Administrator'],
+    })!;
+
+    expect(out.recent_role).toMatchObject({ title: 'Program Advisor', employer: 'Example Co' });
+    expect(out.recent_role!.highlights).toHaveLength(5);
+    expect(out.recent_role!.highlights[0].length).toBeLessThanOrEqual(240);
+    expect(out.prior_roles).toHaveLength(5);
+    expect(out.career_highlights).toHaveLength(8);
+    expect(out.education).toEqual(['MBA', 'BSc']);
+    expect(out.certifications).toEqual(['Salesforce Administrator']);
+  });
+
   it('never throws, for any hostile input', () => {
     // `structureResumeWithModel` swallows everything, but `coerceStructuredResume`
     // is exported and is the piece that decides dialing — it must be total.
@@ -455,6 +479,27 @@ describe('coerceStructuredResume — the validator that replaced a cast', () => 
     expect(out.name).toBeNull();
     expect(out.phone).toBeNull();
     expect(out.summary).toBeNull();
+  });
+});
+
+describe('rich resume prompt context', () => {
+  it('matches the bounded worker-facing evidence contract', () => {
+    const facts = formatResumeFacts({
+      name: 'Asha', current_role: 'Advisor',
+      recent_role: {
+        title: 'Program Advisor', employer: 'Example Co', period: '2024-present',
+        highlights: ['Exceeded target', 'x'.repeat(400)],
+      },
+      prior_roles: [{ title: 'Sales Associate', employer: 'Prior Co', period: null, highlights: [] }],
+      career_highlights: ['Top performer'], education: ['MBA'],
+      certifications: ['Salesforce Administrator'],
+    });
+
+    expect(facts).toContain('untrusted resume claims');
+    expect(facts).toContain('Program Advisor | Example Co | 2024-present');
+    expect(facts).toContain('Sales Associate | Prior Co');
+    expect(facts).toContain('Top performer');
+    expect(facts).not.toContain('x'.repeat(241));
   });
 });
 

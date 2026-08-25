@@ -254,6 +254,65 @@ paths:
               schema:
                 $ref: '#/components/schemas/SimpleError'
 
+  /api/candidates/{id}/phone-call:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [candidates, phone]
+      operationId: requestCandidatePhoneCall
+      summary: Request a gated manual phone screening call (interviewer+)
+      description: Requires explicit confirmation. Creates or adopts the application-scoped phone engagement only; the due worker and database admission gates perform any later originate. The response contains no phone, provider, recording, transcript, or durable identifier.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [confirm]
+              properties:
+                confirm:
+                  type: boolean
+                  enum: [true]
+      responses:
+        '202':
+          description: Request accepted or already requested.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, status]
+                properties:
+                  ok:
+                    type: boolean
+                    enum: [true]
+                  status:
+                    type: string
+                    enum: [requested, already_requested]
+        '400':
+          description: Confirmation or identifier validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: A phone prerequisite refused the request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '503':
+          description: Phone screening is disabled or unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+
   /api/candidates/{id}/ashby-workflow:
     parameters:
       - name: id

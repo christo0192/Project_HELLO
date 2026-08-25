@@ -89,6 +89,15 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
         .is('external_resume_file_handle', null);
       if (error) throw new Error('ashby_link_handle_backfill_error');
     },
+    async bindLinkSubmittedAt(applicationLinkId, submittedAt): Promise<void> {
+      const { error } = await client
+        .from('ashby_application_links')
+        .update({ submitted_at: submittedAt })
+        .eq('provider', 'ashby')
+        .eq('id', applicationLinkId)
+        .is('submitted_at', null);
+      if (error) throw new Error('ashby_link_submission_backfill_error');
+    },
     async createLink(input): Promise<{ id: string }> {
       const { data, error } = await client
         .from('ashby_application_links')
@@ -99,6 +108,7 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
           external_stage_id: input.externalStageId,
           job_mapping_id: input.jobMappingId,
           external_resume_file_handle: input.externalResumeFileHandle,
+          submitted_at: input.submittedAt,
           lifecycle: 'imported',
         })
         .select('id')
@@ -305,6 +315,14 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
         p_actor_id: actorId,
       });
       if (error) throw new Error('ashby_writeback_pending_error');
+      return { status: statusOf(data) };
+    },
+    async ensurePhoneEngagement(applicationLinkId): Promise<{ status: string }> {
+      const { data, error } = await client.rpc('ensure_ashby_phone_engagement', {
+        p_application_link_id: applicationLinkId,
+        p_now: new Date().toISOString(),
+      });
+      if (error) throw new Error('ashby_phone_engagement_error');
       return { status: statusOf(data) };
     },
     async enqueueScorecardWrite(applicationLinkId, sessionId): Promise<{ status: string }> {

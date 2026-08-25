@@ -285,6 +285,11 @@ export function sanitizeAssessmentState(state: PhoneAssessmentState): Record<str
       session_id: state.sessionId ?? null,
       candidate_name: state.candidateName ?? null,
       status: state.sessionStatus ?? null,
+      role_title: state.roleTitle ?? null,
+      role_focus: state.roleFocus ?? null,
+      role_required_skills: [...(state.roleRequiredSkills ?? [])],
+      interviewer_instructions: state.interviewerInstructions ?? null,
+      candidate_evidence: state.resumeFacts ?? {},
     },
     plan: {
       source: state.planSource ?? null,

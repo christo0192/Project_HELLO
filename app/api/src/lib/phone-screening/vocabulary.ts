@@ -179,12 +179,12 @@ export function isPhoneRecordingRole(value: string): value is PhoneRecordingRole
 }
 
 /**
- * The EXACT derived artifact names 0043's CHECKs admit. Both are functions of
+ * The EXACT derived MP3 artifact names 0043/0050's CHECKs admit. Both are functions of
  * the attempt id alone: a key the dialer cannot derive is a key the purge
  * cannot name, and 0043 refuses to store one.
  */
 export function phoneAttemptRecordingObjectKey(attemptId: string): string {
-  return `phone-${attemptId}-egress.ogg`;
+  return `phone-${attemptId}-egress.mp3`;
 }
 
 /**

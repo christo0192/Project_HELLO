@@ -36,6 +36,7 @@ from prompting import (
     build_prompt_context,
     collect_prompt_metadata,
     format_questions as prompting_format_questions,
+    format_resume_facts as prompting_format_resume_facts,
     opening_line,
     system_prompt,
 )
@@ -844,10 +845,11 @@ async def _apply_phone_instructions(agent: Any, state: "phone.PhoneAssessmentSta
         ])
         text = system_prompt(
             candidate_name=state.candidate_name,
-            role_title=None,
-            role_focus=None,
-            resume_facts=None,
+            role_title=state.role_title,
+            role_focus=state.role_focus or ", ".join(state.role_required_skills),
+            resume_facts=prompting_format_resume_facts(state.resume_facts),
             questions=flow,
+            interviewer_instructions=state.interviewer_instructions,
         )
         resume = phone.render_resume_context(state.turns)
         if resume:
