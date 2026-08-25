@@ -405,6 +405,46 @@ function runInBareChild(args: readonly string[]): { stdout: string; status: numb
   }
 }
 
+/** `arming.ts`, the single file both arming gates read. */
+const ARMING_TS = path.join(SRC, 'lib/phone-canary1/arming.ts');
+
+/**
+ * Whether the tree UNDER TEST is armed, derived from the source rather than
+ * assumed. `CANARY1_ARMED` is `false` on `main` and `true` on the activation
+ * artifact `canary1/arm`, which is reviewed, CI-green and NEVER MERGED. The
+ * dry run below therefore stops at a different — and equally legal — gate on
+ * each branch, and pinning either terminus unconditionally makes this suite
+ * fail on the other branch for a reason that is not a defect.
+ *
+ * ── WHY THIS IS NOT A TEST THAT AGREES WITH WHATEVER IT FINDS ─────────
+ * Deriving the expectation from the code under test is only sound if the
+ * derivation itself cannot silently go wrong. So both literals are matched
+ * EXACTLY, anchored, and a source matching NEITHER — or somehow both — throws
+ * instead of defaulting to a branch. A predicate that fell back to `false`
+ * would quietly assert the disarmed terminus on an armed tree; one that fell
+ * back to `true` would accept any preflight refusal on `main`, including the
+ * crash this file exists to catch. The `: boolean` annotation is part of both
+ * patterns for the same reason `scripts/check-main-disarmed.mjs` includes it:
+ * it is load-bearing in the source, so its removal should be noticed here
+ * rather than shrugged at. `\r?$` is tolerated so a CRLF checkout does not make
+ * a perfectly normal `arming.ts` throw. The CONTROL case below pins this
+ * predicate against synthetic sources — checking it without reading the tree —
+ * and one final assertion then confirms the real file resolves to one of the
+ * two rather than throwing.
+ */
+function armedInSourceText(source: string): boolean {
+  const armed = /^export const CANARY1_ARMED:\s*boolean\s*=\s*true;\r?$/m.test(source);
+  const disarmed = /^export const CANARY1_ARMED:\s*boolean\s*=\s*false;\r?$/m.test(source);
+  if (armed === disarmed) {
+    throw new Error(
+      'arming.ts declares CANARY1_ARMED as neither exactly `true` nor exactly `false`',
+    );
+  }
+  return armed;
+}
+
+const armedInTree = (): boolean => armedInSourceText(readFileSync(ARMING_TS, 'utf8'));
+
 describe('4. the CLI starts under an environment holding no API variables', () => {
   it('PRECONDITION — the child cwd holds no dotfile that could populate it', () => {
     expect(existsSync(path.join(TESTS_DIR, '.env'))).toBe(false);
@@ -425,18 +465,56 @@ describe('4. the CLI starts under an environment holding no API variables', () =
     expect(stdout).not.toContain('LOADED');
   });
 
+  it('CONTROL — the arming derivation tracks the source and refuses ambiguity', () => {
+    // Without this, `armedInTree()` could be wrong in the same direction as the
+    // tree and the terminus assertion below would still be green.
+    expect(armedInSourceText('export const CANARY1_ARMED: boolean = true;')).toBe(true);
+    expect(armedInSourceText('export const CANARY1_ARMED: boolean = false;')).toBe(false);
+    // Neither literal, both literals, and a dropped annotation all THROW.
+    expect(() => armedInSourceText('')).toThrow();
+    expect(() => armedInSourceText('export const CANARY1_ARMED: boolean = flag;')).toThrow();
+    expect(() => armedInSourceText('export const CANARY1_ARMED = true;')).toThrow();
+    expect(() =>
+      armedInSourceText(
+        'export const CANARY1_ARMED: boolean = true;\nexport const CANARY1_ARMED: boolean = false;',
+      ),
+    ).toThrow();
+    // A commented-out declaration is not a declaration.
+    expect(() => armedInSourceText(' * export const CANARY1_ARMED: boolean = true;')).toThrow();
+    // And the real file resolves to one of the two rather than throwing.
+    expect(typeof armedInTree()).toBe('boolean');
+  });
+
   it('the dry run reaches its refusal grammar instead of crashing', () => {
     const { stdout } = runInBareChild([path.join(API_ROOT, 'scripts/phone-canary1.ts'), '--dry-run']);
     // THE REGRESSION. This exact line, alone, is what the incident produced.
     expect(stdout).not.toContain('process_containment|FAIL|uncaught_exception');
     expect(stdout).toContain('CANARY|canary1|argv_accepted|PASS|ok');
     expect(stdout).toContain('CANARYDONE|');
-    // The disarmed terminus, or the dotfile refusal if the developer running
-    // this has persisted LiveKit credentials at the pinned path. Both are legal
-    // outcomes of a CLI that STARTED; the crash is not.
-    expect(stdout).toMatch(
-      /CANARY\|canary1\|armed\|FAIL\|canary1_not_armed|CANARY\|canary1\|credentials_transient\|FAIL\|credentials_persisted/,
-    );
+
+    // Whichever branch this tree is, the CLI must have STARTED and then stopped
+    // at a NAMED gate. The crash is not a gate.
+    if (armedInTree()) {
+      // `canary1/arm`. The arming gate passes, so the run continues to the first
+      // precondition a bare environment cannot satisfy — and which one that is
+      // is decided by the ENVIRONMENT, not by the branch, so it is named rather
+      // than globbed. `BARE_ENV` sets no `PHONE_SIP_TRUNK_ID`, the sanitiser
+      // therefore yields '', and the preflight refuses `trunk_not_configured`
+      // ahead of the credentials and every bound. A developer holding persisted
+      // LiveKit credentials at the pinned path stops one gate earlier instead.
+      // Globbing `preflight_[a-z_]+` here would have re-admitted exactly the
+      // slack the disarmed branch below was tightened to remove.
+      expect(stdout).toContain('CANARY|canary1|armed|PASS|ok');
+      expect(stdout).toMatch(
+        /CANARY\|canary1\|credentials_transient\|FAIL\|credentials_persisted|CANARY\|canary1\|preflight_trunk_configured\|FAIL\|trunk_not_configured/,
+      );
+    } else {
+      // `main`. The arming gate is checked AHEAD of the trunk, the credentials
+      // and the prompt, so the disarmed refusal is the only terminus reachable
+      // here — `credentials_persisted` is not, and pinning it as an alternative
+      // would have accepted a run that never evaluated arming at all.
+      expect(stdout).toContain('CANARY|canary1|armed|FAIL|canary1_not_armed');
+    }
   });
 
   it('the orchestrator module imports cleanly with no API variable set', () => {

@@ -415,28 +415,20 @@ second case, which is the one a later revert actually produces.
   into one. It does not re-verify the 133 — that needs a live database this
   gate has no Docker for, and pretending otherwise would be the decorative
   evidence this lane keeps deleting.
-* `app/api/src/__tests__/phone-canary1-*.test.ts` — **200 declared test cases**
+* `app/api/src/__tests__/phone-canary1-*.test.ts` — **201 declared test cases**
   across eight files covering Canary-1's structural closure (the explicit file
   list including `app/api/scripts/phone-canary1.ts`, the moved-not-duplicated
   `node:fs` read permission, the no-write sweep, the containment ordering), the
   refusals, the bounds and their inequalities, the originate seam, the
   teardown, a `fast-check` privacy property over the whole valid destination
   space, and the two-sided cross-language pin against `phone_canary.py`.
-  The count moved from 169 with PR106's live-call close-out, which adds the
-  worker-presence precondition on the originate path, the derived room
-  `emptyTimeout` and its ordering inequality, the join-wait inequality, and the
-  trunk-id sanitiser — each with the control that goes red without it — and then
-  to 183 with PR106's review repair, which adds the two cases proving the join
-  observation does not latch a transient empty listing into
-  `room_reaped_before_join` and returns at once on a confirmed reap, and to 200
-  with PR108's import-closure repair. **The
-  number above is whatever the gate below reports; it is not a remembered
+  **The number above is whatever the gate below reports; it is not a remembered
   constant and must not be edited to match a memory.**
   `scripts/check-phone-canary-evidence.test.mjs` derives this figure from the
   test sources and fails in EITHER direction if it and this record disagree.
   This number is **not comparable** to the two above and never will be: 133
   counts SQL checks against a live database, 139 counts offline assertions in a
-  dependency-free gate, and 200 counts test-case DECLARATIONS in a vitest suite
+  dependency-free gate, and 201 counts test-case DECLARATIONS in a vitest suite
   — the runtime total is higher because several cases are `it.each(...)` tables.
   The checker counts declarations because it runs before `npm ci` in
   `quality.yml` and cannot execute the suite; `npm test` in `app/api` is what
@@ -444,6 +436,21 @@ second case, which is the one a later revert actually produces.
   Canary-0's, and is labelled so in `PROTOCOL.md`: the telephony SDK IS
   resolvable from `app/api/src/__tests__`, so the property rests on dependency
   injection and the runtime traps rather than on unresolvability.
+  The count's history, kept BELOW the `not comparable` sentence on purpose: the
+  evidence gate asserts that sentence appears within a bounded distance of the
+  count, so a per-PR history growing above it would eventually push the two
+  apart and fail with a message claiming the ADR omits a sentence that is
+  plainly there. It moved from 169 with PR106's live-call close-out, which adds
+  the worker-presence precondition on the originate path, the derived room
+  `emptyTimeout` and its ordering inequality, the join-wait inequality, and the
+  trunk-id sanitiser — each with the control that goes red without it — then to
+  183 with PR106's review repair, which adds the two cases proving the join
+  observation does not latch a transient empty listing into
+  `room_reaped_before_join` and returns at once on a confirmed reap, then to 200
+  with PR108's import-closure repair, and to 201 with PR109, which makes that
+  repair's dry-run terminus assertion branch-neutral and adds the control
+  proving its source-derived arming predicate cannot silently agree with
+  whatever it finds.
   PR108's eighth file, `phone-canary1-import-closure.test.ts`, is the only one
   of the eight that does not rely on this suite's environment: it walks the
   CLI's runtime import graph from both roots WITHOUT loading it, and separately
