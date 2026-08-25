@@ -17,6 +17,7 @@ export const createRoleSchema = z
     jd: z.string().max(100_000).nullable().optional(),
     required_skills: z.array(z.string().trim().min(1).max(200)).max(100).optional(),
     screening_template: z.array(screeningQuestionSchema).max(100).optional(),
+    interviewer_instructions: z.string().trim().max(10_000).optional(),
   })
   .strict();
 
@@ -28,6 +29,7 @@ export const updateRoleSchema = z
     jd: z.string().max(100_000).nullable().optional(),
     required_skills: z.array(z.string().trim().min(1).max(200)).max(100).optional(),
     screening_template: z.array(screeningQuestionSchema).max(100).optional(),
+    interviewer_instructions: z.string().trim().max(10_000).optional(),
     is_active: z.boolean().optional(),
   })
   .strict()

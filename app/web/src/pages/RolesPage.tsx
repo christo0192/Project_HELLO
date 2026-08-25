@@ -122,6 +122,46 @@ export function RolesPage() {
   );
 }
 
+function PromptPreview({
+  title,
+  jd,
+  skills,
+  instructions,
+  questions,
+}: {
+  title: string;
+  jd: string;
+  skills: string;
+  instructions: string;
+  questions: QuestionRow[];
+}) {
+  const questionLines = questions
+    .filter((q) => q.question.trim())
+    .map((q, i) => `${i + 1}. ${q.question.trim()}`);
+  const focus = jd.trim() || skills.trim() || "Use the role requirements provided by the recruiter.";
+  const prompt = [
+    `You are conducting a first-round screening interview for ${title.trim() || "this role"}.`,
+    "Interview conversationally, ask one question at a time, and adapt follow-ups to the candidate's answers.",
+    `Role focus: ${focus}`,
+    instructions.trim() ? `Recruiter guidance: ${instructions.trim()}` : "Recruiter guidance: none provided.",
+    "Flow: opening → relevant experience → role evidence → one realistic scenario → logistics → candidate questions → closing.",
+    questionLines.length ? `Recruiter questions:\n${questionLines.join("\\n")}` : "Recruiter questions: none; generate role-specific questions from the focus.",
+    "Do not ask protected or sensitive questions, reveal scores, promise a hiring outcome, or invent company facts.",
+  ].join("\\n\\n");
+
+  return (
+    <div className="rounded-lg border border-indigo-100 bg-indigo-50/50 p-4">
+      <div className="mb-2 flex items-center justify-between">
+        <Label>Generated voice prompt preview</Label>
+        <span className="text-xs text-gray-500">updates as you edit</span>
+      </div>
+      <pre className="max-h-72 overflow-auto whitespace-pre-wrap rounded-md bg-white p-3 text-xs leading-5 text-gray-700">
+        {prompt}
+      </pre>
+    </div>
+  );
+}
+
 function RoleForm({
   role,
   onCancel,
@@ -133,6 +173,9 @@ function RoleForm({
 }) {
   const [title, setTitle] = useState(role?.title ?? "");
   const [jd, setJd] = useState(role?.jd ?? "");
+  const [interviewerInstructions, setInterviewerInstructions] = useState(
+    role?.interviewer_instructions ?? "",
+  );
   const [skillsText, setSkillsText] = useState(
     role?.required_skills.join(", ") ?? "",
   );
@@ -187,6 +230,7 @@ function RoleForm({
       jd: jd.trim(),
       required_skills,
       screening_template,
+      interviewer_instructions: interviewerInstructions.trim(),
     };
 
     setSaving(true);
@@ -290,6 +334,28 @@ function RoleForm({
             ))}
           </div>
         </div>
+
+        <div>
+          <Label htmlFor="role-instructions">Interviewer instructions</Label>
+          <Textarea
+            id="role-instructions"
+            value={interviewerInstructions}
+            onChange={(e) => setInterviewerInstructions(e.target.value)}
+            rows={5}
+            placeholder="Optional guidance: what good evidence looks like, which probes to prioritize, and what the interviewer should avoid…"
+          />
+          <p className="mt-1 text-xs text-gray-400">
+            This is included in the generated voice prompt and remains editable.
+          </p>
+        </div>
+
+        <PromptPreview
+          title={title}
+          jd={jd}
+          skills={skillsText}
+          instructions={interviewerInstructions}
+          questions={questions}
+        />
 
         {formError && (
           <p className="text-sm text-red-600" role="alert">

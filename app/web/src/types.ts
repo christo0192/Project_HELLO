@@ -13,6 +13,7 @@ export interface Role {
   jd: string;
   required_skills: string[];
   screening_template: ScreeningQuestion[];
+  interviewer_instructions?: string;
   is_active: boolean;
   created_at: string;
 }
@@ -22,6 +23,7 @@ export interface RoleInput {
   jd: string;
   required_skills: string[];
   screening_template: ScreeningQuestion[];
+  interviewer_instructions: string;
 }
 
 export type CandidateStatus = string;

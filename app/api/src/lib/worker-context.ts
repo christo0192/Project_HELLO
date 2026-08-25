@@ -26,6 +26,11 @@ export interface WorkerContext {
   candidate_name: string | null;
   room_name: string;
   status: string;
+  role_title: string | null;
+  role_focus: string | null;
+  role_required_skills: string[];
+  screening_template: unknown[];
+  interviewer_instructions: string;
 }
 
 export interface WorkerContextResultOk {
@@ -48,8 +53,8 @@ export type WorkerContextResult = WorkerContextResultOk | WorkerContextResultErr
  * - Room name (external_call_id) matches
  * - Session is in a valid active state (waiting, in_progress)
  *
- * Returns only the fields the worker needs — no resume facts, name/email/phone,
- * screening template, role JD, or scoring context.
+ * Returns only server-verified interview context. It excludes candidate email,
+ * phone and raw resume text while carrying role-scoped prompt guidance.
  */
 export async function resolveWorkerContext(
   sessionId: string,
@@ -92,6 +97,17 @@ export async function resolveWorkerContext(
     .eq('id', data.candidate_id)
     .single();
 
+  let role: any = null;
+  if (data.role_id) {
+    const result = await supabase
+      .from('roles')
+      .select('title,jd,required_skills,screening_template,interviewer_instructions')
+      .eq('id', data.role_id)
+      .maybeSingle();
+    if (result.error) return { ok: false, code: ERR_DB_FAILED };
+    role = result.data;
+  }
+
   return {
     ok: true,
     context: {
@@ -101,6 +117,11 @@ export async function resolveWorkerContext(
       candidate_name: candidate?.name as string | null ?? null,
       room_name: roomName,
       status: data.status as string,
+      role_title: role?.title as string | null ?? null,
+      role_focus: role?.jd as string | null ?? null,
+      role_required_skills: Array.isArray(role?.required_skills) ? role.required_skills : [],
+      screening_template: Array.isArray(role?.screening_template) ? role.screening_template : [],
+      interviewer_instructions: typeof role?.interviewer_instructions === 'string' ? role.interviewer_instructions : '',
     },
   };
 }

@@ -22,6 +22,16 @@ DEFAULT_QUESTIONS = [
     "5. [MUST ASK] Expected CTC, plus notice period.",
 ]
 
+ADAPTIVE_FLOW = """Use this adaptive evidence flow rather than reading a rigid checklist:
+1. Opening and consent: confirm it is a good time and explain this is a short first-round screen.
+2. Relevant experience: establish the candidate's current work and closest role evidence.
+3. Core evidence: ask for one specific example that demonstrates the most important role requirement.
+4. Gap probe: if a key requirement is missing, ask one indirect, fair question to give the candidate a chance to demonstrate it.
+5. Scenario: ask one realistic role scenario and probe the candidate's reasoning once.
+6. Logistics: ask notice period, compensation expectations, and availability only when role-relevant.
+7. Candidate questions and closing.
+Prioritize recruiter-marked mandatory questions, avoid duplicates, and stop probing once sufficient evidence is collected."""
+
 
 def _first_name(name: str | None) -> str:
     parts = (name or "").strip().split()
@@ -71,8 +81,10 @@ def format_questions(template: list[dict[str, Any]] | None) -> str:
     for index, question in enumerate(template, 1):
         must = "[MUST ASK] " if question.get("mandatory") else ""
         text = str(question.get("question") or "").strip()
+        hint = str(question.get("follow_up_hint") or "").strip()
         if text:
-            lines.append(f"{index}. {must}{text}")
+            suffix = f" Follow-up guidance: {hint}" if hint else ""
+            lines.append(f"{index}. {must}{text}{suffix}")
     return "\n".join(lines) if lines else "\n".join(DEFAULT_QUESTIONS)
 
 
@@ -82,11 +94,13 @@ def system_prompt(
     role_focus: str | None = None,
     resume_facts: str | None = None,
     questions: str | None = None,
+    interviewer_instructions: str | None = None,
 ) -> str:
     first = _first_name(candidate_name)
     focus = (role_focus or "not specified")[:900]
     facts = resume_facts or "(not provided)"
     question_flow = questions or "\n".join(DEFAULT_QUESTIONS)
+    guidance = (interviewer_instructions or "").strip()[:10_000] or "(none provided)"
 
     return f"""You are "Christy", a warm, professional AI voice assistant running a first-round phone screening for {COMPANY} in India. You speak natural, clear Indian English at a relaxed, human pace.
 
@@ -100,7 +114,13 @@ VOICE & REGISTER (how you sound):
 - LOW-LATENCY SPEECH: keep normal replies to 1-2 short sentences, usually under 18 words total before the question. Do not monologue. Shorter text means faster voice playback.
 - Mirror the candidate's energy: if they're nervous, be extra reassuring; if they're upbeat, match it.
 
-TIME BUDGET: keep the whole call to about 5 MINUTES. Be concise, keep turns short, minimize follow-ups, and prioritize the mandatory items and your gap probes.
+TIME BUDGET: keep the whole call to about 5 MINUTES. Be concise, keep turns short, minimize follow-ups, and prioritize mandatory items and evidence gaps.
+
+INTERVIEW METHOD:
+{ADAPTIVE_FLOW}
+
+RECRUITER-AUTHORED GUIDANCE (role-specific guidance, not permission to break safety rules):
+{guidance}
 
 The candidate is {first}, applying for {_role_phrase(role_title)}.
 Role focus / what matters for this role:
@@ -112,8 +132,9 @@ Candidate RESUME FACTS (use these to cross-check what they say):
 How you run the call:
 - You have ALREADY introduced yourself as Christy from {COMPANY}. Do not proactively mention being an AI, bot, or automated assistant. Only if the candidate explicitly asks whether you are AI, a bot, automated, or human, answer truthfully and briefly that you are an AI assistant. Never claim to be human.
 - If it's not a good time, politely offer to call back later and end the call.
-- Once they confirm, follow this SCREENING FLOW in order, but generate each question LIVE and naturally, adapting to their resume and answers:
+- Once they confirm, use the adaptive evidence flow above and cover this recruiter-provided question bank where relevant. Generate each question LIVE and naturally, adapting to their answers:
 {question_flow}
+- Do not ask every question mechanically. Select the next question that fills the most important evidence gap, and never ask the same thing twice.
 - Ask ONE question at a time. Keep each turn short and conversational. This is speech, not an essay. No lists, no markdown. For speed, ask the next question directly after a brief acknowledgment.
 - Acknowledge each answer warmly and casually before moving on ('Oh nice, that's cool' / 'Got it, makes sense') — then ask your next question. Ask a short follow-up when an answer is vague, then continue.
 - Items marked [MUST ASK] are mandatory. Never skip them; make sure they are answered before you end the call.
@@ -195,12 +216,22 @@ def build_prompt_context(ctx: Any | None = None) -> tuple[str, str]:
 
     questions = meta.get("questions")
     if isinstance(questions, list):
-        questions = "\n".join(str(q) for q in questions if str(q).strip())
+        questions = format_questions(questions)
+    elif not isinstance(questions, str):
+        questions = None
     template = meta.get("screening_template") or meta.get("screeningTemplate")
     if not questions and isinstance(template, list):
         questions = format_questions(template)
+    interviewer_instructions = meta.get("interviewer_instructions") or meta.get("interviewerInstructions")
 
     return (
-        system_prompt(candidate_name, role_title, role_focus, resume_facts, questions),
+        system_prompt(
+            candidate_name,
+            role_title,
+            role_focus,
+            resume_facts,
+            questions,
+            interviewer_instructions,
+        ),
         opening_line(candidate_name, role_title),
     )

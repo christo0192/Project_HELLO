@@ -740,7 +740,7 @@ _ERR_CONTEXT_API_ERROR = "context_api_error"
 class WorkerContext:
     """Minimal server-side worker context — no PII, no resume data."""
 
-    __slots__ = ("session_id", "candidate_id", "role_id", "candidate_name", "room_name", "status")
+    __slots__ = ("session_id", "candidate_id", "role_id", "candidate_name", "room_name", "status", "role_title", "role_focus", "role_required_skills", "screening_template", "interviewer_instructions")
 
     def __init__(
         self,
@@ -750,6 +750,11 @@ class WorkerContext:
         candidate_name: str | None,
         room_name: str,
         status: str,
+        role_title: str | None = None,
+        role_focus: str | None = None,
+        role_required_skills: list[str] | None = None,
+        screening_template: list[dict[str, Any]] | None = None,
+        interviewer_instructions: str = "",
     ) -> None:
         self.session_id = session_id
         self.candidate_id = candidate_id
@@ -757,6 +762,11 @@ class WorkerContext:
         self.candidate_name = candidate_name
         self.room_name = room_name
         self.status = status
+        self.role_title = role_title
+        self.role_focus = role_focus
+        self.role_required_skills = role_required_skills or []
+        self.screening_template = screening_template or []
+        self.interviewer_instructions = interviewer_instructions
 
 
 def parse_worker_context(data: dict) -> WorkerContext:
@@ -768,6 +778,11 @@ def parse_worker_context(data: dict) -> WorkerContext:
         candidate_name=data.get("candidate_name"),
         room_name=str(data.get("room_name", "")),
         status=str(data.get("status", "")),
+        role_title=data.get("role_title"),
+        role_focus=data.get("role_focus"),
+        role_required_skills=data.get("role_required_skills"),
+        screening_template=data.get("screening_template"),
+        interviewer_instructions=str(data.get("interviewer_instructions", "")),
     )
 
 

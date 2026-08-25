@@ -5403,7 +5403,7 @@ components:
 
     WorkerContext:
       type: object
-      required: [session_id, candidate_id, role_id, candidate_name, room_name, status]
+      required: [session_id, candidate_id, role_id, candidate_name, room_name, status, role_title, role_focus, role_required_skills, screening_template, interviewer_instructions]
       properties:
         session_id:
           type: string
@@ -5421,6 +5421,23 @@ components:
         room_name:
           type: string
         status:
+          type: string
+        role_title:
+          type: string
+          nullable: true
+        role_focus:
+          type: string
+          nullable: true
+        role_required_skills:
+          type: array
+          items:
+            type: string
+        screening_template:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        interviewer_instructions:
           type: string
       additionalProperties: false
 
