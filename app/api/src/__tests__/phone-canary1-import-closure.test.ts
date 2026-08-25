@@ -39,6 +39,30 @@
  * barrel could load a dotfile from a different cwd that the refusal never
  * looked at. Removing the barrel removes `dotenv` from the closure entirely,
  * which is why the bare-specifier allowlist below names it.
+ *
+ * ── PR109: THIS SUITE MUST BE BRANCH-NEUTRAL ──────────────────────────
+ * The property under test — the CLI STARTS rather than dying in its own
+ * containment handler — is true of `main` and of the activation artifact
+ * `canary1/arm` alike, and it is on `canary1/arm` that the property actually
+ * matters, because that is the only branch from which the CLI is ever run.
+ *
+ * But the TERMINUS differs by branch, and PR108 asserted the terminus by
+ * naming `main`'s. `runCanary1` checks the arming constant ahead of every
+ * credential and bound gate, so a disarmed tree stops at
+ * `armed|FAIL|canary1_not_armed` while an armed one walks on through
+ * `armed|PASS` and `credentials_transient|PASS` to the first gate a bare
+ * environment cannot satisfy — `preflight_trunk_configured|FAIL|
+ * trunk_not_configured`. Pinning `main`'s terminus therefore made this suite
+ * fail on the arm branch: a regression test for a start-up crash that itself
+ * goes red on the one branch that starts the program.
+ *
+ * The repair is to DERIVE the expected terminus from `CANARY1_ARMED` — the
+ * same constant the child process reads — instead of naming one branch's. The
+ * two expectations stay mutually exclusive (a control below pins that), so
+ * this is not the other, easy fix of accepting any terminus at all. Everything
+ * ABOVE the terminus is asserted unconditionally, and a new unconditional
+ * invariant is added in both directions: a `--dry-run` in a bare child must
+ * reach NO provider seam on either branch.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -46,6 +70,11 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+// The constant the CHILD will read, read here by the same means, so the
+// expected terminus is derived from the tree under test rather than from an
+// assumption about which branch this is. `arming.ts` imports nothing at all,
+// so naming it here adds no module to this suite's own graph.
+import { CANARY1_ARMED } from '../lib/phone-canary1/arming.js';
 
 const API_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const SRC = path.join(API_ROOT, 'src');
@@ -405,6 +434,53 @@ function runInBareChild(args: readonly string[]): { stdout: string; status: numb
   }
 }
 
+/**
+ * ── THE TERMINUS, DERIVED ─────────────────────────────────────────────
+ * `runCanary1` checks arming ahead of every credential and bound gate, so the
+ * last check line a bare child can print is a function of `CANARY1_ARMED` and
+ * of nothing else this suite can vary.
+ *
+ * Disarmed: the run stops AT the arming gate.
+ * Armed: it passes arming, passes `credentials_transient` (a bare child has no
+ * `app/api/.env` — unless the operator running this holds persisted LiveKit
+ * credentials at the pinned path, which is the second legal armed terminus),
+ * and stops at the first gate a bare environment cannot satisfy: the trunk.
+ *
+ * Every one of these is a REFUSAL BEFORE A SEAM. None of them contacts a
+ * provider, which is why this suite may assert them from CI on either branch.
+ */
+const DISARMED_TERMINI = ['CANARY|canary1|armed|FAIL|canary1_not_armed'] as const;
+
+const ARMED_TERMINI = [
+  'CANARY|canary1|preflight_trunk_configured|FAIL|trunk_not_configured',
+  'CANARY|canary1|credentials_transient|FAIL|credentials_persisted',
+] as const;
+
+const EXPECTED_TERMINI: readonly string[] = CANARY1_ARMED ? ARMED_TERMINI : DISARMED_TERMINI;
+
+/**
+ * Check names that can only be printed AFTER a provider client has been asked
+ * to do something. A bare `--dry-run` must reach none of them on EITHER branch:
+ * on `main` the arming gate stops it, on `canary1/arm` the trunk gate does. If
+ * this list ever appears in the transcript of this test, a CI run has touched
+ * LiveKit.
+ */
+const PROVIDER_SEAM_CHECKS = [
+  'room_created',
+  'dispatch_created',
+  'worker_present_before_originate',
+  'originate_answered',
+  'originate_skipped',
+  'conversation_observed',
+  'teardown_room_absent',
+] as const;
+
+/** The last `CANARY|` check line, which is the run's terminus. */
+function terminusOf(stdout: string): string {
+  const lines = stdout.split('\n').filter((l) => l.startsWith('CANARY|'));
+  return lines[lines.length - 1] ?? '<no CANARY line at all>';
+}
+
 describe('4. the CLI starts under an environment holding no API variables', () => {
   it('PRECONDITION — the child cwd holds no dotfile that could populate it', () => {
     expect(existsSync(path.join(TESTS_DIR, '.env'))).toBe(false);
@@ -425,18 +501,59 @@ describe('4. the CLI starts under an environment holding no API variables', () =
     expect(stdout).not.toContain('LOADED');
   });
 
+  it('CONTROL — the two terminus expectations are disjoint, so neither branch is waved through', () => {
+    // The lazy repair for a branch-sensitive assertion is to accept both sets
+    // on both branches, which would pass a disarmed tree that silently armed
+    // itself and an armed tree that silently disarmed. This arm is what makes
+    // the derivation above a gate rather than a widening.
+    for (const armed of ARMED_TERMINI) {
+      expect(DISARMED_TERMINI as readonly string[], 'terminus sets overlap').not.toContain(armed);
+    }
+    expect(EXPECTED_TERMINI).toEqual(CANARY1_ARMED ? ARMED_TERMINI : DISARMED_TERMINI);
+    // …and the constant is the one the CHILD reads, not a copy.
+    const armingSource = readFileSync(path.join(SRC, 'lib/phone-canary1/arming.ts'), 'utf8');
+    expect(stripToRuntime(armingSource)).toContain(
+      `export const CANARY1_ARMED: boolean = ${String(CANARY1_ARMED)};`,
+    );
+  });
+
   it('the dry run reaches its refusal grammar instead of crashing', () => {
     const { stdout } = runInBareChild([path.join(API_ROOT, 'scripts/phone-canary1.ts'), '--dry-run']);
     // THE REGRESSION. This exact line, alone, is what the incident produced.
+    // Unconditional: it is a crash on any branch.
     expect(stdout).not.toContain('process_containment|FAIL|uncaught_exception');
+    // Everything above the arming gate is branch-independent, and is asserted
+    // as such rather than folded into the terminus.
     expect(stdout).toContain('CANARY|canary1|argv_accepted|PASS|ok');
+    expect(stdout).toContain('CANARY|canary1|environment_accepted|PASS|ok');
     expect(stdout).toContain('CANARYDONE|');
-    // The disarmed terminus, or the dotfile refusal if the developer running
-    // this has persisted LiveKit credentials at the pinned path. Both are legal
-    // outcomes of a CLI that STARTED; the crash is not.
-    expect(stdout).toMatch(
-      /CANARY\|canary1\|armed\|FAIL\|canary1_not_armed|CANARY\|canary1\|credentials_transient\|FAIL\|credentials_persisted/,
-    );
+
+    // The terminus itself, DERIVED — see EXPECTED_TERMINI. Asserted as the LAST
+    // check line rather than as "appears somewhere", which is strictly stronger
+    // than the alternation this replaces.
+    const terminus = terminusOf(stdout);
+    expect(EXPECTED_TERMINI, `unexpected terminus for CANARY1_ARMED=${String(CANARY1_ARMED)}`)
+      .toContain(terminus);
+
+    // The arming gate's own verdict must match the constant in BOTH directions,
+    // so an armed tree cannot pass by printing the disarmed refusal or vice
+    // versa.
+    if (CANARY1_ARMED) {
+      expect(stdout).toContain('CANARY|canary1|armed|PASS|ok');
+      expect(stdout).not.toContain('canary1_not_armed');
+    } else {
+      expect(stdout).toContain('CANARY|canary1|armed|FAIL|canary1_not_armed');
+      expect(stdout).not.toContain('CANARY|canary1|armed|PASS|ok');
+    }
+  });
+
+  it('UNCONDITIONAL — a bare dry run reaches no provider seam on either branch', () => {
+    // This is the invariant that lets the assertion above be branch-derived
+    // without the armed branch quietly gaining reach: whichever gate stops the
+    // run, it stops BEFORE any client is asked for anything.
+    const { stdout } = runInBareChild([path.join(API_ROOT, 'scripts/phone-canary1.ts'), '--dry-run']);
+    const reached = PROVIDER_SEAM_CHECKS.filter((check) => stdout.includes(`|${check}|`));
+    expect(reached, 'a bare-environment dry run touched a provider seam').toEqual([]);
   });
 
   it('the orchestrator module imports cleanly with no API variable set', () => {
