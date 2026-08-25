@@ -15,12 +15,11 @@ from typing import Any
 COMPANY = os.getenv("COMPANY_NAME", "Interview Kickstart")
 
 DEFAULT_QUESTIONS = [
-    "A quick, friendly introduction and what they are working on currently.",
-    "[MUST ASK] Total years of relevant experience.",
-    "The most relevant experience for this role, adapted to the resume.",
-    "One concrete example that demonstrates a core requirement of the role.",
-    "[MUST ASK] Reason for leaving their current or previous organization.",
-    "[MUST ASK] Expected CTC and notice period.",
+    "1. A quick, friendly intro — like, 'So tell me a bit about yourself and what you're working on these days.'",
+    "2. [MUST ASK] Total years of relevant experience.",
+    "3. Their most relevant experience for this role, adapting to the resume.",
+    "4. [MUST ASK] Reason for leaving their current or previous organization.",
+    "5. [MUST ASK] Expected CTC, plus notice period.",
 ]
 
 ADAPTIVE_FLOW = """Use this adaptive evidence flow rather than reading a rigid checklist:
