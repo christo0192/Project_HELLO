@@ -60,6 +60,12 @@ export const MIGRATION_0045_PATH = fileURLToPath(
 
 export const MIGRATION_0045 = readFileSync(MIGRATION_0045_PATH, 'utf8');
 
+export const MIGRATION_0051_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0051_phone_session_egress_stamp.sql', import.meta.url),
+);
+
+export const MIGRATION_0051 = readFileSync(MIGRATION_0051_PATH, 'utf8');
+
 /**
  * Every phone migration, NEWEST FIRST. Extraction walks this in order and the
  * first file that declares a thing wins, which is what "the latest declaration
@@ -67,6 +73,12 @@ export const MIGRATION_0045 = readFileSync(MIGRATION_0045_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    // NOTE (residual, pre-existing): 0046–0050 are not registered here, so
+    // declarations they carry (e.g. 0050's re-definition of
+    // attach_phone_attempt_recording) are invisible to the extractor and the
+    // 0043 originals win. 0051 is registered because its RPC exists NOWHERE
+    // earlier — without this line the contract test could not see it at all.
+    { name: '0051', sql: MIGRATION_0051 },
     { name: '0045', sql: MIGRATION_0045 },
     { name: '0044', sql: MIGRATION_0044 },
     { name: '0043', sql: MIGRATION_0043 },
@@ -163,6 +175,8 @@ export const RPC_NAMES = [
   'finalize_phone_attempt_recording',
   'list_phone_engagement_recordings',
   'clear_phone_attempt_recordings',
+  // 0051 — the session-level egress stamp.
+  'stamp_phone_session_egress',
   // 0044.
   'start_phone_assessment',
   'get_phone_assessment_state',

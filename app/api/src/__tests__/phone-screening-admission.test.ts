@@ -75,6 +75,7 @@ function fakeStores(admit: AdmitPhoneAttemptResult): FakeStores {
       calls += 1;
       return admit;
     },
+    stampSessionEgress: unreachable,
     heartbeatAttempt: unreachable,
     heartbeatAttemptByEpoch: unreachable,
     sweepDayRolled: unreachable,

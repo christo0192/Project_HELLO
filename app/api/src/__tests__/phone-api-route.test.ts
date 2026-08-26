@@ -181,6 +181,7 @@ function fakeStores(over: Partial<PhoneStores> = {}): WriteSpy {
   const calls: Array<{ op: string; input: unknown }> = [];
   const defaults: PhoneStores = {
     admitAttempt: async () => ({ status: 'ok' }),
+    stampSessionEgress: async () => ({ status: 'ok' as const, duplicate: false }),
     heartbeatAttempt: async () => ({ status: 'ok' }),
     heartbeatAttemptByEpoch: async () => ({ status: 'ok' as const }),
     sweepDayRolled: async () => ({ status: 'ok' as const, examined: 0, rolled: 0, skipped: 0 }),

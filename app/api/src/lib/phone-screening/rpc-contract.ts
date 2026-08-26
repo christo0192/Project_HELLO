@@ -44,6 +44,9 @@ export const PHONE_RPC_NAMES = [
   'finalize_phone_attempt_recording',
   'list_phone_engagement_recordings',
   'clear_phone_attempt_recordings',
+  // 0051 — the session-level egress stamp: makes phone recordings visible to
+  // the 0038 finalize convergence and the recruiter download route.
+  'stamp_phone_session_egress',
   // 0044 — the assessment-persistence RPCs. One binds and snapshots, one
   // reads, one appends a completed question boundary. None of them dials,
   // records, scores or completes anything.
@@ -106,6 +109,12 @@ export const PHONE_RPC_PARAMETERS: Readonly<Record<PhoneRpcName, readonly string
       'p_object_key',
       'p_manifest_key',
       'p_role',
+      'p_egress_id',
+      'p_now',
+    ],
+    stamp_phone_session_egress: [
+      'p_session_id',
+      'p_attempt_id',
       'p_egress_id',
       'p_now',
     ],
@@ -341,6 +350,20 @@ export const ATTACH_PHONE_ATTEMPT_RECORDING_STATUSES = [
   'not_found',
 ] as const;
 
+export const STAMP_PHONE_SESSION_EGRESS_STATUSES = [
+  'ok',
+  'egress_already_bound',
+  'invalid_egress_id',
+  'not_found',
+  'recording_terminal',
+  'session_already_bound',
+  'session_candidate_mismatch',
+  'session_not_found',
+] as const;
+
+export type StampPhoneSessionEgressStatus =
+  (typeof STAMP_PHONE_SESSION_EGRESS_STATUSES)[number];
+
 export type AttachPhoneAttemptRecordingStatus =
   (typeof ATTACH_PHONE_ATTEMPT_RECORDING_STATUSES)[number];
 
@@ -461,6 +484,7 @@ export const PHONE_RPC_STATUSES: Readonly<Record<PhoneRpcName, readonly string[]
     expire_phone_appointments: EXPIRE_PHONE_APPOINTMENTS_STATUSES,
     phone_backlog: PHONE_BACKLOG_STATUSES,
     attach_phone_attempt_recording: ATTACH_PHONE_ATTEMPT_RECORDING_STATUSES,
+    stamp_phone_session_egress: STAMP_PHONE_SESSION_EGRESS_STATUSES,
     finalize_phone_attempt_recording: FINALIZE_PHONE_ATTEMPT_RECORDING_STATUSES,
     list_phone_engagement_recordings: LIST_PHONE_ENGAGEMENT_RECORDINGS_STATUSES,
     clear_phone_attempt_recordings: CLEAR_PHONE_ATTEMPT_RECORDINGS_STATUSES,
@@ -506,7 +530,7 @@ export const PHONE_RPC_STATUS_UNION: readonly string[] = Object.freeze(
  * union, which is the whole reason the increment is smaller than the number
  * of RPCs added.
  */
-export const PHONE_RPC_STATUS_COUNT = 72;
+export const PHONE_RPC_STATUS_COUNT = 75;
 
 /**
  * RESULT KEYS the API's behaviour DEPENDS on, per RPC.
@@ -540,6 +564,7 @@ export const PHONE_RPC_RESULT_KEYS: Readonly<Record<string, readonly string[]>> 
   list_phone_engagement_recordings: ['artifacts', 'count'],
   clear_phone_attempt_recordings: ['cleared'],
   attach_phone_attempt_recording: ['attempt_id', 'role', 'duplicate'],
+  stamp_phone_session_egress: ['duplicate'],
   finalize_phone_attempt_recording: ['attempt_id', 'egress_status', 'role'],
   // 0044. Every one of these is load-bearing for a decision the worker makes
   // on the wire. `next_key` and `cursor` decide which question is asked next;

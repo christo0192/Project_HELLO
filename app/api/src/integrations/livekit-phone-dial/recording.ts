@@ -81,12 +81,27 @@ export interface StartPhoneRecordingResult {
   readonly refusal?: string;
   /** Explicit, so "no recording started" can be asserted rather than inferred. */
   readonly egressStarted: boolean;
+  /**
+   * 0051: whether the SESSION-level egress stamp landed. False means the
+   * recording is UNFINDABLE by the session-keyed read path until repaired;
+   * the route caller logs it loudly (this package is console-free).
+   */
+  readonly sessionStamped?: boolean;
+  readonly stampStatus?: string;
 }
 
 export interface StartPhoneRecordingInput {
   readonly engagementId: string;
   readonly attemptId: string;
   readonly roomName: string;
+  /**
+   * The session whose room is being recorded — the same id the room name
+   * carries. Needed for the 0051 session-level egress stamp, without which
+   * the 0038 finalize convergence and the recruiter download route cannot
+   * see the recording (the first live MP3 landed in the bucket and the
+   * dashboard truthfully said "Recording not found").
+   */
+  readonly sessionId: string;
   readonly now: Date;
 }
 
@@ -173,7 +188,34 @@ export async function startPhoneAttemptRecording(
     now: input.now,
   });
 
-  return { status: 'started', role, objectKey, manifestKey, egressId, egressStarted: true };
+  // ── STEP 4. Make the SESSION see it (0051). ─────────────────────────
+  // Everything downstream of a recording is session-keyed: the 0038 finalize
+  // trigger, the sweeper, and the recruiter download route all read
+  // `call_sessions`. Without this stamp the MP3 lands and no reader can ever
+  // find it. Best-effort: a failed stamp must not end a consented call (the
+  // attempt keys above still let the purge find the object). This file
+  // deliberately does not log — the dialer package is console-free by
+  // structural pin — so the OUTCOME is returned and the route caller is the
+  // one that must say it out loud: an unstamped recording is unfindable, and
+  // silence is exactly how the first one stayed unfindable.
+  let stampStatus: string;
+  try {
+    const stamped = await deps.stores.stampSessionEgress({
+      sessionId: input.sessionId,
+      attemptId: input.attemptId,
+      egressId,
+      now: input.now,
+    });
+    stampStatus = stamped.status;
+  } catch {
+    stampStatus = 'store_error';
+  }
+
+  return {
+    status: 'started', role, objectKey, manifestKey, egressId, egressStarted: true,
+    sessionStamped: stampStatus === 'ok',
+    stampStatus,
+  };
 }
 
 /**

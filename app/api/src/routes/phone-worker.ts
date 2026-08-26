@@ -264,6 +264,8 @@ export interface PhoneWorkerRouterDeps {
     engagementId: string;
     attemptId: string;
     roomName: string;
+    /** For the 0051 session-level egress stamp (the read path is session-keyed). */
+    sessionId: string;
     now: Date;
   }) => Promise<{ status: string; egressStarted: boolean }>;
   readonly configSource?: NodeJS.ProcessEnv;
@@ -970,12 +972,27 @@ async function startRecordingForAttempt(
       }));
       return;
     }
-    await deps.startRecording?.({
+    const started = await deps.startRecording?.({
       engagementId: resolved.engagementId,
       attemptId,
       roomName: phoneRoomName(sessionId),
+      sessionId,
       now,
     });
+    // The dialer package is console-free by structural pin, so the stamp
+    // outcome is reported HERE. An unstamped recording is unfindable by the
+    // session-keyed read path — silence is how the first live MP3 stayed
+    // "not found", and that class does not get to be quiet again.
+    if (started !== undefined && started.egressStarted === true
+        && (started as { sessionStamped?: boolean }).sessionStamped !== true) {
+      console.warn(JSON.stringify({
+        level: 'warn',
+        component: 'phone-worker',
+        event: 'phone_session_egress_stamp_missed',
+        error_category: String((started as { stampStatus?: string }).stampStatus ?? 'unknown'),
+        attempt_id: attemptId,
+      }));
+    }
   } catch {
     // Deliberately silent to the caller. The keys, if they were bound, are
     // already on the attempt row, so the purge can still find whatever exists.
