@@ -128,7 +128,11 @@ verification is policy-aware and app-correct:
   absent current registration **fails closed** — a true worker-down incident is
   surfaced, not hidden. (For this deploy the prior failure would still fail,
   correctly: the remedy is to bring the always-on worker back up, see §5.)
-- **Phone worker — `STOPPED`.** Deployed but scaled to zero in steady state until
+- **Phone worker — `STOPPED`** *(SUPERSEDED by the §6 flip: the phone job is
+  now `ALWAYS_ON` with the same watermarked registration proof as the browser
+  job, the scale-0 enforcement below no longer exists, and the API's
+  `PHONE_AGENT_NAME` is set — the rest of this bullet is kept as the historical
+  record of the pre-flip posture).* Deployed but scaled to zero in steady state until
   the canary. This is **enforced by the deploy job**, not left to a manual
   precondition: it scales the app to zero **both before and after** the release
   (`flyctl scale count 0 -a project-hello-phone-voice`), so a machine left running
@@ -258,6 +262,17 @@ fly scale count 0 -a project-hello-phone-voice
 # or, to also stop accepting a release:
 fly apps suspend project-hello-phone-voice
 ```
+
+**After the §6 flip, scale-to-zero alone is NOT durable.** The flip removed the
+deploy job's own scale-0 convergence, so the next `app/voice-livekit/` merge
+(or a manual `phone-voice`/`all` dispatch) re-deploys the app — and `flyctl
+deploy` on a zero-machine Machines app CREATES and starts a machine, whose
+fresh registration then *passes* the ALWAYS_ON verification. A durable rollback
+is therefore **two actions, both required**: revert the §6 posture PR
+(restoring the scale-0 lines, the STOPPED verification, and an empty API
+`PHONE_AGENT_NAME`) **and** scale the app to zero. Until the revert merges,
+treat every voice-source merge as a re-activation of the phone lane.
+
 This touches **only** `project-hello-phone-voice`. The browser worker
 (`project-hello-voice`) is a different app with a different token and is never
 referenced by the phone job (asserted by the contract test). Its always-on
@@ -278,6 +293,13 @@ its intended production posture, unchanged by this work.
 ---
 
 ## 6a. Canary-1 window — NOT the §6 flip
+
+> **Historical note (post-flip):** this section was written for the PRE-flip
+> workflow. Once the §6 posture PR is merged, the two `scale count 0` lines it
+> says "stay" no longer exist and a later deploy no longer reverts a manual
+> scale-up — see the §5 durable-rollback note. Canary-1 run before the flip is
+> unaffected; do not run Canary-1 after the flip without re-deriving its
+> worker-posture assumptions.
 
 **Read this before §6 if what you are doing is the owner's own-number test
 call.** Canary-1 (`docs/runbooks/phone-canary1.md`) needs a phone worker that is

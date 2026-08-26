@@ -91,8 +91,10 @@ export interface PhoneDialConfig {
    * The existing browser worker stays UNNAMED and auto-dispatching on purpose.
    * Naming it would stop it auto-dispatching into every existing browser room
    * and would break browser screening in the window between an API deploy and
-   * a worker deploy. Rollback here is "do not deploy the named phone worker",
-   * which needs no Python change at all.
+   * a worker deploy. Since the §6 canary flip the named phone worker IS
+   * deployed always-on and this value is non-empty in production; rollback is
+   * the §5 pair — revert the posture PR AND scale the phone app to zero
+   * (docs/runbooks/phone-worker-deployment.md §5) — no Python change needed.
    */
   agentName: string;
   originateTimeoutSeconds: number;

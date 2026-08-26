@@ -229,6 +229,9 @@ jobs:
           WATERMARK: ${{ steps.deploy.outputs.watermark }}
         run: |
           set -euo pipefail
+          if [ -z "${WATERMARK:-}" ]; then
+            echo "::error::empty pre-release watermark - the deploy step's output did not arrive; refusing to verify (an empty watermark would accept ANY historical 'registered worker' line)"; exit 1
+          fi
           # The browser worker is production and MUST stay min-1/always-on. An
           # absent current registration is a genuine worker-down incident, not a
           # policy exemption: this check fails closed on it.
@@ -246,6 +249,9 @@ jobs:
             fi
             sleep 5
           done
+          # Surface ONE unsuppressed logs attempt so a logs-transport or token
+          # failure is distinguishable from a genuinely unregistered worker.
+          flyctl logs -a project-hello-voice --no-tail || true
           echo "::error::no current 'registered worker' log at/after watermark $WATERMARK on project-hello-voice"; exit 1
 
   deploy-phone-voice:
@@ -267,22 +273,11 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_PHONE_VOICE }}
         run: |
           set -euo pipefail
-          # §6 canary flip (docs/runbooks/phone-worker-deployment.md): the phone
-          # worker is live and dispatchable. The API's PHONE_AGENT_NAME
-          # (app/api/fly.toml, set in the SAME PR as this change — the two are
-          # halves of one posture) names this worker, and this job holds it to
-          # the same current-registration proof as the browser worker.
-          #
-          # The STOPPED-era pre/post `flyctl scale count 0` lines are gone ON
-          # PURPOSE: re-zeroing on every shared-source merge is exactly what
-          # would silently kill a live canary window mid-flight (runbook §6a
-          # documents that failure as `worker_never_joined` with a mid-window
-          # re-zeroing as one of its two causes). Rollback is runbook §5 —
-          # revert this PR and scale the app to zero — not a conditional here.
-          #
-          # Watermark captured BEFORE the release so the registration check
-          # below cannot be satisfied by a stale historical "registered worker"
-          # line.
+          # §6 canary flip: live and dispatchable (API PHONE_AGENT_NAME names
+          # this worker; same PR). The STOPPED-era scale-to-zero is gone on
+          # purpose — see the header note and runbook §6a/§5. Watermark
+          # captured BEFORE the release so the registration check below cannot
+          # be satisfied by a stale historical "registered worker" line.
           echo "watermark=$(date -u +%Y-%m-%dT%H:%M:%S)" >> "$GITHUB_OUTPUT"
           flyctl deploy --remote-only --config fly.phone.toml
       - name: Verify CURRENT worker registration (run policy ALWAYS_ON)
@@ -291,6 +286,9 @@ jobs:
           WATERMARK: ${{ steps.deploy.outputs.watermark }}
         run: |
           set -euo pipefail
+          if [ -z "${WATERMARK:-}" ]; then
+            echo "::error::empty pre-release watermark - the deploy step's output did not arrive; refusing to verify (an empty watermark would accept ANY historical 'registered worker' line)"; exit 1
+          fi
           # The phone worker is dispatchable by name from the API, so an absent
           # current registration is a genuine dispatch-into-silence incident,
           # not a policy exemption: this check fails closed on it.
@@ -309,4 +307,7 @@ jobs:
             fi
             sleep 5
           done
+          # Surface ONE unsuppressed logs attempt so a logs-transport or token
+          # failure is distinguishable from a genuinely unregistered worker.
+          flyctl logs -a project-hello-phone-voice --no-tail || true
           echo "::error::no current 'registered worker' log at/after watermark $WATERMARK on project-hello-phone-voice"; exit 1

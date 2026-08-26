@@ -1,5 +1,16 @@
 # Phone lane — Canary-1 (the owner's own-number test call)
 
+> **Post-§6-flip note.** This runbook predates the §6 canary flip
+> (phone-worker-deployment.md §6). Since that flip: `deploy-phone-voice` no
+> longer runs `flyctl scale count 0` before/after a release (a later deploy
+> does NOT revert a manual scale-up, and re-creates a machine on a
+> zero-machine app), the phone job DOES capture a watermarked registration
+> proof, and the API's `PHONE_AGENT_NAME` is set (`names_agree`, no longer
+> `api_silent_pre_canary`). Every statement below that leans on those
+> pre-flip facts — R-12, §9's `worker_never_joined` diagnosis order, the
+> merge-freeze rationale — must be re-derived before running a Canary-1
+> ceremony post-flip.
+
 **Status: MECHANISM ONLY, SHIPPED DISARMED. No call has been placed, and `main`
 cannot place one.** `CANARY1_ARMED` is a source constant shipped `false` and
 pinned `false` by a test; while it is false the CLI refuses before **every**

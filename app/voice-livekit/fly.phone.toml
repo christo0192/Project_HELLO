@@ -11,17 +11,20 @@
 #  - Rolling this worker back is simply NOT running it (see run policy below);
 #    that requires no change to the browser worker at all.
 #
-# Run policy: STOPPED / min-0 until the phone canary.
-#  - This app is deployed (image built, release created) but scaled to ZERO
-#    machines. The owner keeps it at count 0 with `fly scale count 0 -a
-#    project-hello-phone-voice`; the canary flips it to count 1. Because it runs
-#    NO machine, it registers NO worker and can place NO call — which is the
-#    intended pre-canary posture, NOT a fault. The deploy workflow's phone-voice
-#    verification is policy-aware: it proves a clean release and does NOT demand
-#    a live registration for a stopped app (and never accepts a stale log as
-#    success). See docs/runbooks/phone-worker-deployment.md.
-#  - Cost while stopped is storage-only (the built image); no VM-hours accrue at
-#    count 0. The browser worker's cost/always-on posture is unaffected.
+# Run policy: ALWAYS_ON since the §6 canary flip
+# (docs/runbooks/phone-worker-deployment.md §6).
+#  - The owner scales this app to count 1 for the canary (`fly scale count 1 -a
+#    project-hello-phone-voice`) and the deploy workflow's phone-voice job now
+#    holds every release to the same watermarked CURRENT-registration proof as
+#    the browser worker — an absent current registration fails the deploy
+#    closed, and a stale log line can never satisfy it.
+#  - Do NOT casually `fly scale count 0` this app while the API's
+#    PHONE_AGENT_NAME names it: a dispatchable API with no worker is
+#    dispatch-into-silence (§6a's worker_never_joined). Durable shutdown is the
+#    §5 rollback — revert the §6 posture PR AND scale to zero; scale-to-zero
+#    alone is resurrected by the next voice-source deploy.
+#  - While (exceptionally) at count 0 the app accrues no VM-hours, storage only.
+#    The browser worker's cost/always-on posture is unaffected either way.
 #
 # No public service: like the browser worker this is a LiveKit Agents worker,
 # not an HTTP server. There is deliberately no [http_service]/[[services]]

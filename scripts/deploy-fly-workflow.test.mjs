@@ -5,8 +5,10 @@
 // to Fly). These tests lock its security-relevant contract so a future edit
 // cannot silently weaken it. Dependency-free: text + per-job assertions only.
 
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdtempSync, rmSync, chmodSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { tmpdir } from "node:os";
 import path from "node:path";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -120,6 +122,14 @@ ok(/printf '%s\\n%s\\n' "\$WATERMARK" "\$ts"/.test(voice), "deploy-browser-voice
 // worker-down incident is surfaced, never swallowed).
 ok(/::error::no current 'registered worker'[\s\S]*?exit 1/.test(voice), "deploy-browser-voice must FAIL CLOSED (exit 1) when no current registration is found");
 ok(!/project-hello-phone-voice/.test(voice) && !/fly\.phone\.toml/.test(voice), "deploy-browser-voice must not touch the phone app or its config");
+ok(/ALWAYS_ON/.test(voice), "deploy-browser-voice must document its ALWAYS_ON run policy");
+// An EMPTY watermark would degrade the >= comparison into accepting ANY
+// historical line; both lanes must refuse to verify on one.
+ok(/empty pre-release watermark[\s\S]*?exit 1/.test(voice), "deploy-browser-voice must FAIL CLOSED on an empty watermark (else the anti-stale comparison is vacuous)");
+// The failure path must surface one UNSUPPRESSED flyctl logs attempt, so a
+// logs-transport/credential failure is distinguishable from an unregistered
+// worker (the M-1 misattribution class).
+ok(/flyctl logs -a project-hello-voice --no-tail \|\| true/.test(voice), "deploy-browser-voice failure path must run one unsuppressed flyctl logs attempt before the fail-closed error");
 // Phone voice: ALWAYS_ON since the §6 canary flip
 // (docs/runbooks/phone-worker-deployment.md §6) — the SAME watermark +
 // CURRENT-registration contract as the browser job, against the phone app.
@@ -134,13 +144,121 @@ ok(/printf '%s\\n%s\\n' "\$WATERMARK" "\$ts"/.test(phone), "deploy-phone-voice w
 // dispatchable phone lane with no registered worker is dispatch-into-silence.
 ok(/::error::no current 'registered worker'[\s\S]*?exit 1/.test(phone), "deploy-phone-voice must FAIL CLOSED (exit 1) when no current registration is found");
 ok(/status -a project-hello-phone-voice/.test(phone), "deploy-phone-voice must verify status on project-hello-phone-voice");
+ok(/empty pre-release watermark[\s\S]*?exit 1/.test(phone), "deploy-phone-voice must FAIL CLOSED on an empty watermark (else the anti-stale comparison is vacuous)");
+ok(/flyctl logs -a project-hello-phone-voice --no-tail \|\| true/.test(phone), "deploy-phone-voice failure path must run one unsuppressed flyctl logs attempt before the fail-closed error");
 // The §6 flip REMOVED the stopped-era scale-to-zero. Guard that REMOVAL
 // two-sided: the scale lines coming back would re-zero a live canary window on
 // every unrelated shared-source merge (runbook §6a names that failure mode),
 // so their absence is part of the reviewed posture, not an accident.
-ok(!/scale count 0 -a project-hello-phone-voice/.test(phone), "deploy-phone-voice must NOT scale the phone app to zero — the §6 flip made it ALWAYS_ON, and a scale-0 here silently kills a live canary window (runbook §6a); reverting to STOPPED is a reviewed posture change, not a line edit");
+{
+  const phoneCode = phone
+    .split("\n")
+    .filter((l) => !/^\s*#/.test(l))
+    .join("\n");
+  ok(/flyctl deploy --remote-only --config fly\.phone\.toml/.test(phoneCode),
+    "comment-stripping must leave the executable deploy line intact (else the ban below is vacuous)");
+  ok(!/flyctl\s+(scale|machine)\b/.test(phoneCode),
+    "deploy-phone-voice must contain NO flyctl scale/machine command — the §6 flip made it ALWAYS_ON, and any re-zeroing (scale count 0 under either flag spelling, machine stop/destroy) silently kills a live canary window (runbook §6a); reverting to STOPPED is a reviewed posture change, not a line edit");
+}
 ok(/ALWAYS_ON/.test(phone), "deploy-phone-voice must document its ALWAYS_ON run policy");
 ok(!/project-hello-voice\b/.test(phone.replace(/project-hello-phone-voice/g, "")), "deploy-phone-voice must not target the browser app");
+
+
+// ── 8b. BEHAVIOUR: run the phone verify step's real shell against a stub ──
+// Text assertions prove the guards are written; only executing the shell
+// proves they fire. The step's script is extracted verbatim and run with stub
+// `flyctl` and `sleep` binaries on a REPLACED PATH (hermetic — asserted, not
+// assumed; no token is provided, so nothing can reach Fly).
+function stepScript(jobText, nameFragment) {
+  const lines = jobText.split("\n");
+  const at = lines.findIndex((l) => l.includes("- name:") && l.includes(nameFragment));
+  if (at === -1) return null;
+  const runAt = lines.findIndex((l, i) => i > at && /^\s*run: \|\s*$/.test(l));
+  if (runAt === -1) return null;
+  const indent = lines[runAt + 1].match(/^\s*/)[0].length;
+  const body = [];
+  for (let i = runAt + 1; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.trim() === "") { body.push(""); continue; }
+    if (l.match(/^\s*/)[0].length < indent) break;
+    body.push(l.slice(indent));
+  }
+  return body.join("\n");
+}
+{
+  const script = stepScript(phone, "Verify CURRENT worker registration");
+  ok(script !== null && /registered worker/.test(script || ""),
+    "must be able to extract the phone verify step's shell script for behavioural testing");
+  if (script) {
+    const stubDirFor = (logsMode) => {
+      const dir = mkdtempSync(path.join(tmpdir(), "fly-stub-"));
+      const bin = path.join(dir, "flyctl");
+      writeFileSync(bin, [
+        "#!/usr/bin/env bash",
+        'if [ "$1" = "logs" ]; then',
+        `  case "${logsMode}" in`,
+        "    registered) echo '2099-01-01T00:00:00 registered worker id=stub' ;;",
+        "    silent) : ;;",
+        "  esac",
+        "  exit 0",
+        "fi",
+        'echo "STUB flyctl $*"',
+        "exit 0",
+      ].join("\n"));
+      chmodSync(bin, 0o755);
+      // No-op sleep so the 24-attempt failure loop completes instantly.
+      const slp = path.join(dir, "sleep");
+      writeFileSync(slp, "#!/usr/bin/env bash\nexit 0\n");
+      chmodSync(slp, 0o755);
+      return dir;
+    };
+    const runWithStub = (logsMode, watermark) => {
+      const dir = stubDirFor(logsMode);
+      const env = { ...process.env, PATH: `${dir}:/usr/bin:/bin`, WATERMARK: watermark };
+      const which = spawnSync("bash", ["-c", "command -v flyctl"], { encoding: "utf8", env });
+      const r = spawnSync("bash", ["-c", script], { encoding: "utf8", env });
+      const resolved = (which.stdout || "").trim();
+      rmSync(dir, { recursive: true, force: true });
+      return { code: r.status, out: (r.stdout || "") + (r.stderr || ""), resolved, stubBin: path.join(dir, "flyctl") };
+    };
+
+    // (a) Current registration at/after the watermark → verify passes.
+    const okRun = runWithStub("registered", "2020-01-01T00:00:00");
+    ok(okRun.code === 0, `current registration: verify must pass, got ${okRun.code}:\n${okRun.out}`);
+    ok(/re-registered at 2099-01-01T00:00:00/.test(okRun.out),
+      "current registration: the accepted timestamp must be the one from the log line");
+
+    // (b) No registration ever → FAILS CLOSED with the named error.
+    const silent = runWithStub("silent", "2020-01-01T00:00:00");
+    ok(silent.code !== 0, `no registration: verify must FAIL CLOSED, got exit ${silent.code}:\n${silent.out}`);
+    ok(/::error::no current 'registered worker'/.test(silent.out),
+      "no registration: must raise the named workflow error");
+
+    // (c) EMPTY watermark → refuse BEFORE consulting logs; a stale line must
+    //     not be given the chance to satisfy a vacuous comparison.
+    const empty = runWithStub("registered", "");
+    ok(empty.code !== 0, `empty watermark: verify must FAIL CLOSED, got exit ${empty.code}:\n${empty.out}`);
+    ok(/empty pre-release watermark/.test(empty.out),
+      "empty watermark: must name the refusal (not report an unregistered worker)");
+    ok(!/re-registered/.test(empty.out),
+      "empty watermark: must never accept a registration line");
+
+    // (d) A registration line OLDER than the watermark is STALE evidence and
+    //     must be rejected — this is the entire point of the watermark.
+    const stale = runWithStub("registered", "2100-01-01T00:00:00");
+    ok(stale.code !== 0, `stale registration: verify must FAIL CLOSED, got exit ${stale.code}:\n${stale.out}`);
+    ok(!/re-registered/.test(stale.out),
+      "stale registration: a pre-watermark line must never be accepted");
+
+    // Hermetic: flyctl must resolve to the throwaway stub in every mode.
+    for (const [label, r] of [["registered", okRun], ["silent", silent], ["empty-watermark", empty], ["stale", stale]]) {
+      ok(r.resolved === r.stubBin,
+        `${label}: flyctl must resolve to the test stub (${r.stubBin}), got ${JSON.stringify(r.resolved)} — this harness runs the real workflow shell and must never reach Fly`);
+    }
+    ok(!/\$\{\{\s*secrets\./.test(script),
+      "the extracted verify step must not interpolate a `secrets.` expression into the shell");
+  }
+}
 
 // 9. Least privilege
 const perm = (wf.match(/permissions:\n((?:\s+\S.*\n)+)/) || [, ""])[1];
