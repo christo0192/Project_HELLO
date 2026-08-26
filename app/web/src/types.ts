@@ -39,6 +39,26 @@ export type CandidateStatus = string;
  */
 export type ResumeReview = 'ready' | 'processing' | 'needs_review' | 'cancelled';
 
+export interface CandidateResumeFacts {
+  current_role?: string | null;
+  recent_role?: {
+    title?: string | null;
+    employer?: string | null;
+    period?: string | null;
+    highlights?: string[];
+  } | null;
+  prior_roles?: Array<{
+    title?: string | null;
+    employer?: string | null;
+    period?: string | null;
+    highlights?: string[];
+  }>;
+  career_highlights?: string[];
+  education?: string[];
+  certifications?: string[];
+  summary?: string | null;
+}
+
 export interface Candidate {
   id: string;
   /**
@@ -65,6 +85,8 @@ export interface Candidate {
    * that predate the field; null when the candidate has no Ashby ingestion.
    */
   resume_review?: ResumeReview | null;
+  /** Bounded parsed resume evidence returned on candidate detail. */
+  parsed?: CandidateResumeFacts | null;
 }
 
 /** Aggregate pipeline assessment metrics (GET /api/candidates/summary). */
