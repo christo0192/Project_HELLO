@@ -26,13 +26,16 @@ function run2(voiceDir, apiDir) {
 }
 
 // 1. The real configs must pass (no dir arg → defaults to app/voice-livekit +
-//    the real app/api). The current state is worker-named / API-silent.
+//    the real app/api). Since the §6 canary flip the API names the worker, so
+//    the surfaced state is names_agree — worker-named / API-dispatching. (The
+//    pre-flip pin here was api_silent_pre_canary; asserting the CURRENT posture
+//    keeps this test truthful on the branch that runs it.)
 {
   const r = spawnSync(process.execPath, [validator], { encoding: "utf8" });
   const out = (r.stdout || "") + (r.stderr || "");
   ok(r.status === 0, `real voice worker configs must pass, got:\n${out}`);
-  ok(/phone_agent_name_state=api_silent_pre_canary/.test(out),
-    "real configs must SURFACE the pre-canary silent state as a stable code");
+  ok(/phone_agent_name_state=names_agree/.test(out),
+    "real configs must SURFACE the worker<->API name agreement as a stable code");
   ok(/worker_regions_approved=sin/.test(out),
     "real configs must SURFACE the approved worker region allowlist as a stable code");
   ok(/region_configs_checked=fly\.toml,fly\.phone\.toml,app\/api\/fly\.toml/.test(out),

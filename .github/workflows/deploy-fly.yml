@@ -11,7 +11,8 @@ name: Deploy (Fly)
 #   phone-voice  → project-hello-phone-voice (FLY_API_TOKEN_PHONE_VOICE)
 # The two voice apps run the SAME source image (app/voice-livekit) with
 # different run postures (browser = unnamed auto-dispatch, always-on; phone =
-# named, stopped/min-0 until canary). A change to that shared source therefore
+# named, dispatch-only, always-on since the §6 canary flip of
+# docs/runbooks/phone-worker-deployment.md). A change to that shared source
 # deploys BOTH voice apps — each with its OWN app-scoped token, never conflated.
 #
 # Security properties (this file is production security code):
@@ -30,12 +31,13 @@ name: Deploy (Fly)
 #    a compromise of one job cannot deploy another app. Tokens are consumed only
 #    as step env for flyctl, never echoed. Fly APP secrets (provider keys,
 #    Supabase, LiveKit, SIP trunk) are untouched by this workflow.
-#  - Ops messages do not GUESS (M-1, PR104). The phone job's pre-release scale
-#    classifies its own failure before it speaks: app-not-visible-to-this-token
-#    is reported as such and tolerated (the post-release scale still fails
-#    closed), while a credential / permission / transport failure fails the job
-#    CLOSED instead of being printed as "app not created yet". The two have
-#    opposite remedies, and the old blanket `|| echo` destroyed the difference.
+#  - The phone job's STOPPED-era pre/post scale-to-zero (and its M-1-classified
+#    precondition, PR104) were REMOVED by the §6 canary flip
+#    (docs/runbooks/phone-worker-deployment.md §6): re-zeroing on every
+#    shared-source merge is exactly what would silently kill a live canary
+#    window (§6a). The phone lane's fail-closed control is now the same
+#    current-registration proof the browser job carries. Rollback is runbook
+#    §5: revert this posture PR and scale the phone app to zero.
 #  - Post-deploy verification is CURRENT and POLICY-AWARE, never historical:
 #      * api           → GET /api/health must return 200.
 #      * browser-voice → run policy ALWAYS_ON: the worker must log "registered
@@ -43,11 +45,12 @@ name: Deploy (Fly)
 #        before the release. A stale old registration line cannot satisfy it,
 #        and an absent current registration is a TRUE worker-down failure (the
 #        browser worker is production and must stay min-1/always-on).
-#      * phone-voice   → run policy STOPPED: the app is deployed but scaled to
-#        zero until the canary, so it runs no machine and registers no worker BY
-#        DESIGN. Verification proves a clean release on the correct app and does
-#        NOT demand a live registration — but it still never accepts a stale
-#        "registered worker" line as success (it asserts nothing of the sort).
+#      * phone-voice   → run policy ALWAYS_ON (since the §6 canary flip): the
+#        SAME watermarked current-registration proof as browser-voice, against
+#        project-hello-phone-voice. A stale line cannot satisfy it, and an
+#        absent current registration fails closed — a dispatchable phone lane
+#        with no registered worker is dispatch-into-silence, not a policy
+#        exemption.
 #
 # Prerequisite (one-time, owner action — NOT stored in VCS; no secret values):
 #   App-scoped repository secrets must exist, each a `fly tokens create deploy
@@ -257,103 +260,53 @@ jobs:
         with:
           ref: ${{ needs.detect.outputs.sha }}
       - uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be # v1.5
-      - name: Deploy phone voice worker (stopped/min-0 ENFORCED pre+post; non-dispatchable)
+      - name: Deploy phone voice worker (run policy ALWAYS_ON; dispatched by API name)
+        id: deploy
         working-directory: app/voice-livekit
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_PHONE_VOICE }}
         run: |
           set -euo pipefail
-          # M-1: bound the live window from BOTH sides.
+          # §6 canary flip (docs/runbooks/phone-worker-deployment.md): the phone
+          # worker is live and dispatchable. The API's PHONE_AGENT_NAME
+          # (app/api/fly.toml, set in the SAME PR as this change — the two are
+          # halves of one posture) names this worker, and this job holds it to
+          # the same current-registration proof as the browser worker.
           #
-          # Scale to zero BEFORE the release, so a machine left running by a
-          # prior deploy or a manual action is not rolled live by this one, and
-          # again AFTER, so the release's own machine does not persist. `flyctl
-          # deploy` can still briefly create+start+register ONE machine between
-          # these two scales — that transient is unavoidable on a Machines app.
+          # The STOPPED-era pre/post `flyctl scale count 0` lines are gone ON
+          # PURPOSE: re-zeroing on every shared-source merge is exactly what
+          # would silently kill a live canary window mid-flight (runbook §6a
+          # documents that failure as `worker_never_joined` with a mid-window
+          # re-zeroing as one of its two causes). Rollback is runbook §5 —
+          # revert this PR and scale the app to zero — not a conditional here.
           #
-          # It is NON-DISPATCHABLE by design, and that is the load-bearing
-          # guarantee, not the scale timing: pre-canary the API's
-          # PHONE_AGENT_NAME is EMPTY (the api_silent_pre_canary state that
-          # scripts/validate-voice-worker-apps.mjs enforces), so the API
-          # dispatches to no name, so no PRODUCTION room is ever routed to this
-          # worker.
-          #
-          # THAT IS A STATEMENT ABOUT THE API, NOT ABOUT THE SYSTEM. Since
-          # PR105 there is a SECOND dispatcher this workflow knows nothing
-          # about: the Canary-1 CLI (app/api/scripts/phone-canary1.ts)
-          # dispatches to this name DIRECTLY to LiveKit, bypassing the API
-          # entirely. It is gated by CANARY1_ARMED (false on main, enforced on
-          # every push to the default branch by scripts/check-main-disarmed.mjs)
-          # plus the PHONE_CANARY_ENABLED Fly secret (unset). Neither is
-          # reachable from this workflow, so the conclusion below still holds —
-          # but it now holds for TWO reasons, and this one is not automatic.
-          #
-          # A briefly-live worker with nothing dispatching to it places no call.
-          #
-          # Making it live AND dispatchable is the canary's separate, reviewed
-          # workflow change (docs/runbooks/phone-worker-deployment.md §6): the
-          # SAME PR removes both scale-0 lines, adds a watermarked registration
-          # proof, and sets PHONE_AGENT_NAME on project-hello-api. An automatic
-          # shared-source deploy can therefore never make the phone app live and
-          # dispatchable on its own.
-          #
-          # No watermark is captured here — a stopped app has no registration to
-          # gate, and capturing one unused would be a decorative artifact.
-          # M-1 (PR104): the pre-release scale must not GUESS why it failed.
-          #
-          # The previous form was `flyctl scale count 0 ... 2>/dev/null || echo
-          # "app not created yet"`, which swallowed EVERY failure and attributed
-          # all of them to a missing app. The first real phone release proved how
-          # wrong that is: the token was empty, the message still said "app not
-          # created yet", and the job died several steps later on `no access
-          # token available`. The two causes have opposite remedies — create the
-          # app, versus fix the credential — so the difference is exactly what
-          # the operator needs and exactly what the message destroyed.
-          #
-          # Classify first, then act. An ABSENT app is the one benign case (this
-          # app is created by the owner's one-time setup, and the post-release
-          # scale is the binding guarantee that still fails closed). ANY other
-          # failure — empty/invalid/unauthorised token, org mismatch, API outage
-          # — is fatal HERE, before a release is pushed with an unbounded live
-          # window ahead of it.
-          set +e
-          status_out="$(flyctl status -a project-hello-phone-voice 2>&1)"
-          status_rc=$?
-          set -e
-          if [ "$status_rc" -eq 0 ]; then
-            flyctl scale count 0 -a project-hello-phone-voice --yes
-          elif printf '%s' "$status_out" | grep -qiE "could not find app|could not resolve app|app .* not found|no such app"; then
-            # Honest about what flyctl can actually distinguish: an app-not-found
-            # answer means the app is not VISIBLE TO THIS TOKEN. That is almost
-            # always "not created yet", but a token scoped to another app looks
-            # identical from here, so the message says both rather than picking
-            # the flattering one. Either way the post-release scale still fails
-            # closed, so this branch cannot let an unscaled release stand.
-            echo "pre-release scale skipped: app project-hello-phone-voice is NOT VISIBLE to this deploy token (flyctl status rc=${status_rc}, app-not-found) - either it has not been created yet, or the token is scoped to a different app. Remedy: the owner's one-time app creation + app-scoped deploy token, per docs/runbooks/phone-worker-deployment.md. The post-release scale below is the binding guarantee and fails closed."
-          else
-            echo "::error::pre-release scale precondition FAILED and this is NOT an absent app (flyctl status rc=${status_rc}). This is a credential / permission / transport failure - e.g. an empty or unauthorised FLY_API_TOKEN_PHONE_VOICE. Refusing to release: a deploy whose scale controls cannot be trusted must not run."
-            printf '%s\n' "$status_out"
-            exit 1
-          fi
+          # Watermark captured BEFORE the release so the registration check
+          # below cannot be satisfied by a stale historical "registered worker"
+          # line.
+          echo "watermark=$(date -u +%Y-%m-%dT%H:%M:%S)" >> "$GITHUB_OUTPUT"
           flyctl deploy --remote-only --config fly.phone.toml
-          # Every deploy re-asserts count 0, so a merge can never silently leave
-          # the phone worker persistently live.
-          flyctl scale count 0 -a project-hello-phone-voice --yes
-      - name: Verify clean release (run policy STOPPED)
+      - name: Verify CURRENT worker registration (run policy ALWAYS_ON)
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_PHONE_VOICE }}
+          WATERMARK: ${{ steps.deploy.outputs.watermark }}
         run: |
           set -euo pipefail
-          # Policy-aware verification: this app is scaled to zero in steady
-          # state until the canary (a machine may be briefly live during the
-          # release itself — see the deploy step; it is non-dispatchable because
-          # the API name is empty pre-canary). It is CORRECT for it to run no
-          # machine and register no worker. We prove the release landed on the RIGHT app and
-          # deliberately do NOT demand — nor accept — a live worker-registration
-          # log line as evidence.
-          # Flipping this app to always-on is a separate, reviewed canary action
-          # (see docs/runbooks/phone-worker-deployment.md), which drops the
-          # scale-to-zero line above and adds a watermarked registration proof
-          # exactly like the browser worker's.
+          # The phone worker is dispatchable by name from the API, so an absent
+          # current registration is a genuine dispatch-into-silence incident,
+          # not a policy exemption: this check fails closed on it.
           flyctl status -a project-hello-phone-voice
-          echo "phone voice release created on project-hello-phone-voice (stopped/min-0 enforced; no registration expected at count 0)"
+          # Accept ONLY a "registered worker" line whose ISO-8601 log timestamp
+          # is at/after the pre-deploy watermark (ISO-8601 sorts lexically),
+          # tying the evidence to the release this job just created — not an
+          # old log line.
+          for i in $(seq 1 24); do
+            ts="$(flyctl logs -a project-hello-phone-voice --no-tail 2>/dev/null \
+                  | grep 'registered worker' \
+                  | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}' \
+                  | sort | tail -1 || true)"
+            if [ -n "$ts" ] && [ "$(printf '%s\n%s\n' "$WATERMARK" "$ts" | sort | tail -1)" = "$ts" ]; then
+              echo "phone voice worker re-registered at $ts (>= watermark $WATERMARK)"; exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::no current 'registered worker' log at/after watermark $WATERMARK on project-hello-phone-voice"; exit 1
