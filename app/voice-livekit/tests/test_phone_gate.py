@@ -52,8 +52,16 @@ def _ensure_stub_sdk() -> None:
         class _Agent:
             def __init__(self, instructions: str = "") -> None:
                 self.instructions = instructions
+                self.chat_ctx = types.SimpleNamespace(items=[])
+
+            async def update_chat_ctx(self, ctx):
+                self.chat_ctx = ctx
 
         agents.Agent = _Agent
+    if not hasattr(agents, "StopResponse"):
+        class _StopResponse(Exception):
+            pass
+        agents.StopResponse = _StopResponse
     if not hasattr(agents, "AgentSession"):
         class _AgentSession:
             def __init__(self, **kwargs):
@@ -1220,6 +1228,53 @@ class TestScheduleCallback(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(_claims_a_booking(result))
         self.assertFalse(agent.bookings[0].booked)
 
+    async def test_user_turn_is_committed_but_livekit_auto_reply_is_stopped(self):
+        class FakeStopResponse(Exception):
+            pass
+
+        class BaseAgent:
+            def __init__(self, instructions=""):
+                self.instructions = instructions
+                self.updated = None
+
+            async def update_chat_ctx(self, ctx):
+                self.updated = ctx
+
+        observed: list[str] = []
+        agents = sys.modules["livekit.agents"]
+        original = getattr(agents, "StopResponse", None)
+        agents.StopResponse = FakeStopResponse
+        try:
+            cls = phone.phone_agent_class(BaseAgent)
+            agent = cls(
+                "instructions", client=FakeEventClient(),
+                attempt_id=_ATTEMPT_ID, say=AsyncMock(),
+                on_user_turn=observed.append,
+            )
+            ctx = types.SimpleNamespace(items=[])
+            message = types.SimpleNamespace(text_content="Please repeat the role")
+            with self.assertRaises(FakeStopResponse):
+                await agent.on_user_turn_completed(ctx, message)
+        finally:
+            if original is None:
+                delattr(agents, "StopResponse")
+            else:
+                agents.StopResponse = original
+
+        self.assertEqual(ctx.items, [message])
+        self.assertIs(agent.updated, ctx)
+        self.assertEqual(observed, ["Please repeat the role"])
+
+    def test_explicit_end_call_language_is_narrow_and_deterministic(self):
+        for text in (
+            "Can you disconnect the call?", "Please hang up", "End this call now",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(phone.is_explicit_end_call_request(text))
+        for text in ("stop asking that question", "the call quality is good", "not now"):
+            with self.subTest(text=text):
+                self.assertFalse(phone.is_explicit_end_call_request(text))
+
 
 class TestFunctionToolBinding(unittest.TestCase):
     """The SDK symbol is read by its real name — a rename must fail loudly."""
@@ -1337,6 +1392,16 @@ class _FakePhoneSession:
     async def start(self, **kwargs):
         self.start_calls += 1
         self.started_with = kwargs
+        self.agent = kwargs.get("agent")
+        # Other test modules may have installed an additive minimal Agent stub
+        # before this file. Supply the two public context surfaces the real SDK
+        # always has so suite order cannot change this fake's semantics.
+        if not hasattr(self.agent, "chat_ctx"):
+            self.agent.chat_ctx = types.SimpleNamespace(items=[])
+        if not hasattr(self.agent, "update_chat_ctx"):
+            async def update_chat_ctx(ctx):
+                self.agent.chat_ctx = ctx
+            self.agent.update_chat_ctx = update_chat_ctx
 
     def say(self, text, **kwargs):
         self.spoken.append(text)
@@ -1349,7 +1414,14 @@ class _FakePhoneSession:
         return _FakeSpeech()
 
     def emit_user_turn(self, text):
-        self._emit("user", text)
+        async def complete_turn():
+            message = types.SimpleNamespace(text_content=text)
+            ctx = types.SimpleNamespace(items=list(getattr(self.agent.chat_ctx, "items", [])))
+            try:
+                await self.agent.on_user_turn_completed(ctx, message)
+            except sys.modules["livekit.agents"].StopResponse:
+                pass
+        asyncio.create_task(complete_turn())
 
     def emit_bot_turn(self, text, *, interrupted=False):
         self._emit("assistant", text, interrupted=interrupted)
