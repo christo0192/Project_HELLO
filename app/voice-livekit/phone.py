@@ -1327,6 +1327,57 @@ def valid_boundary_turns(turns: Any) -> bool:
     return turns[-1].get("speaker") == "candidate"
 
 
+def repair_exchange_shape(
+    turns: Any, question_text: str | None,
+) -> list[dict[str, str]]:
+    """Repair the two capture artefacts REAL telephony produces, and only those.
+
+    The first live canary call (2026-08-26) ended `malformed_exchange` because
+    the candidate answered over the tail of the question — normal phone
+    behaviour — so the SDK marked the assistant's line `interrupted`, the
+    capture handler dropped it (recording words the candidate never heard would
+    poison the transcript), and the exchange arrived at validation as
+    `[candidate]`: no leading bot turn, length 1, halt. Interrupting the first
+    question must not end the call.
+
+    Two repairs, both honesty-preserving, nothing else:
+
+    * LEADING BOT TURN SYNTHESISED FROM THE PLAN. Which question was asked is
+      not something to recover from SDK items — it is `question.text`, the
+      server's own plan entry, chosen by the call site and committed with the
+      key. When a candidate answer was captured but the bot turn that prompted
+      it was dropped as interrupted, prepending the PLAN text records exactly
+      what the call site asked the model to convey. It invents no answer, and
+      the plan text (not model prose) is already the only phrasing the plan
+      ever promised.
+    * TRAILING BOT TURNS TRIMMED. A follow-up the candidate never answered
+      leaves `[bot, candidate, bot]`. The unanswered follow-up adds nothing
+      scoreable; the completed head of the exchange is the honest boundary.
+
+    NO repair produces an answer: an exchange with no candidate turn is
+    returned as captured, and the caller's shape check halts it exactly as
+    before. And NO repair runs on input that is not entirely turn-shaped: a
+    single non-dict item returns the capture UNCHANGED, so validation halts it
+    — silently discarding malformed items and then synthesising around the
+    gap would launder garbage into a committable exchange. The server
+    re-validates regardless — this widens nothing.
+    """
+    if not isinstance(turns, list):
+        return turns  # type: ignore[return-value]
+    if any(not isinstance(t, dict) for t in turns):
+        return turns
+    out = list(turns)
+    while out and out[-1].get("speaker") == "bot":
+        out.pop()
+    if not any(t.get("speaker") == "candidate" for t in out):
+        return out
+    if out and out[0].get("speaker") != "bot":
+        text = (question_text or "").strip()
+        if text:
+            out.insert(0, {"speaker": "bot", "text": text[:8000]})
+    return out
+
+
 # The rehydration bound. A reconnect's prior exchange is replayed into the
 # prompt so the model can refer to what the candidate already said — but it is
 # BOUNDED, because a long screening's transcript would otherwise grow the system

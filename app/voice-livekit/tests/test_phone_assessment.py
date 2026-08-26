@@ -201,6 +201,90 @@ class TestBoundaryShape(unittest.TestCase):
 
 # ── The loop ──────────────────────────────────────────────────────────
 
+class TestRepairExchangeShape(unittest.TestCase):
+    """The 2026-08-26 live-call defect class: real telephony timing vs shape.
+
+    The first live canary ended `malformed_exchange` because the candidate
+    answered over the tail of the question, the SDK marked the assistant line
+    `interrupted`, the capture handler dropped it, and the exchange arrived as
+    `[candidate]`. The repair must fix EXACTLY the two capture artefacts and
+    must never invent an answer.
+    """
+
+    Q = "Tell me about your experience."
+
+    def test_interrupted_question_gets_its_bot_turn_back_from_the_plan(self):
+        got = phone.repair_exchange_shape(
+            [{"speaker": "candidate", "text": "I have five years."}], self.Q,
+        )
+        self.assertTrue(phone.valid_boundary_turns(got))
+        self.assertEqual(got[0], {"speaker": "bot", "text": self.Q})
+        self.assertEqual(got[1]["speaker"], "candidate")
+
+    def test_unanswered_follow_up_is_trimmed_to_the_completed_head(self):
+        got = phone.repair_exchange_shape(
+            [
+                {"speaker": "bot", "text": self.Q},
+                {"speaker": "candidate", "text": "Five years."},
+                {"speaker": "bot", "text": "Anything else?"},
+            ],
+            self.Q,
+        )
+        self.assertTrue(phone.valid_boundary_turns(got))
+        self.assertEqual(len(got), 2)
+
+    def test_no_candidate_answer_is_never_manufactured(self):
+        # Only a bot turn captured: trimming leaves nothing, and the repair
+        # must NOT synthesise anything — the caller's halt stays honest.
+        self.assertEqual(
+            phone.repair_exchange_shape([{"speaker": "bot", "text": self.Q}], self.Q),
+            [],
+        )
+        # Nothing captured at all: unchanged.
+        self.assertEqual(phone.repair_exchange_shape([], self.Q), [])
+
+    def test_a_well_formed_exchange_passes_through_untouched(self):
+        ok = [
+            {"speaker": "bot", "text": self.Q},
+            {"speaker": "candidate", "text": "Five years."},
+        ]
+        self.assertEqual(phone.repair_exchange_shape(list(ok), self.Q), ok)
+
+    def test_missing_plan_text_cannot_synthesise_an_empty_bot_turn(self):
+        # A blank question text must not create a turn the shape rule would
+        # reject anyway — the exchange is returned as captured and halts.
+        got = phone.repair_exchange_shape(
+            [{"speaker": "candidate", "text": "Five years."}], "   ",
+        )
+        self.assertFalse(phone.valid_boundary_turns(got))
+
+    def test_malformed_non_dict_items_are_never_silently_repaired(self):
+        """Review finding on the first draft: a dict-filter here would DISCARD
+        malformed items and then synthesise around the gap, laundering garbage
+        into a committable exchange. Any non-dict item must return the capture
+        unchanged so the shape check halts it."""
+        polluted = ["garbage", {"speaker": "candidate", "text": "Five years."}]
+        got = phone.repair_exchange_shape(list(polluted), self.Q)
+        self.assertEqual(got, polluted)
+        self.assertFalse(phone.valid_boundary_turns(got))
+        # Same when the pollution is anywhere else in the list.
+        tail = [{"speaker": "candidate", "text": "Five years."}, None]
+        self.assertEqual(phone.repair_exchange_shape(list(tail), self.Q), tail)
+        # And a non-list capture is returned as-is, not coerced.
+        self.assertEqual(phone.repair_exchange_shape("nope", self.Q), "nope")
+
+    def test_both_artefacts_together(self):
+        got = phone.repair_exchange_shape(
+            [
+                {"speaker": "candidate", "text": "Five years."},
+                {"speaker": "bot", "text": "Anything else?"},
+            ],
+            self.Q,
+        )
+        self.assertTrue(phone.valid_boundary_turns(got))
+        self.assertEqual([t["speaker"] for t in got], ["bot", "candidate"])
+
+
 class TestRunPhoneAssessment(unittest.TestCase):
     def _run_loop(self, *, state=None, client=None, asks=None, ask=None):
         client = client or ScriptedClient()
