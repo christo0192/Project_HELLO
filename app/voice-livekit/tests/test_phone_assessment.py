@@ -218,7 +218,13 @@ class TestRepairExchangeShape(unittest.TestCase):
             [{"speaker": "candidate", "text": "I have five years."}], self.Q,
         )
         self.assertTrue(phone.valid_boundary_turns(got))
-        self.assertEqual(got[0], {"speaker": "bot", "text": self.Q})
+        # MARKED as synthesis: the first live transcript showed the plan's
+        # interviewer-directed meta-text ("Ask about X") rendered as if the
+        # bot had spoken it. The prefix makes the synthesis explicit.
+        self.assertEqual(
+            got[0],
+            {"speaker": "bot", "text": phone.SYNTHESIZED_QUESTION_PREFIX + self.Q},
+        )
         self.assertEqual(got[1]["speaker"], "candidate")
 
     def test_unanswered_follow_up_is_trimmed_to_the_completed_head(self):
@@ -286,7 +292,7 @@ class TestRepairExchangeShape(unittest.TestCase):
 
 
 class TestRunPhoneAssessment(unittest.TestCase):
-    def _run_loop(self, *, state=None, client=None, asks=None, ask=None):
+    def _run_loop(self, *, state=None, client=None, asks=None, ask=None, booking_made=None):
         client = client or ScriptedClient()
         spoken: list[str] = []
         asked: list[str] = []
@@ -310,8 +316,58 @@ class TestRunPhoneAssessment(unittest.TestCase):
             state=state or phone.PhoneAssessmentState.parse(_body()),
             ask=ask or default_ask,
             say=say,
+            booking_made=booking_made,
         ))
         return result, client, asked, spoken
+
+    def test_a_confirmed_booking_ends_the_leg_before_the_next_question(self):
+        """The first live call: the candidate said "I'm busy, call me
+        tomorrow", the schedule_callback tool's signal had NO READER, and the
+        loop fired four more questions at them. A booking made mid-question
+        must end the leg: no further ask, no commit of the deferring
+        candidate's partial exchange, and the post-nothing halt (the server
+        already moved the engagement to `scheduled`)."""
+        booked = {"value": False}
+
+        async def ask_and_book(question, cursor):
+            # The candidate defers during the FIRST question; the tool books.
+            booked["value"] = True
+            return [{"speaker": "bot", "text": "asking"}]
+
+        result, client, asked, _ = self._run_loop(
+            ask=ask_and_book, booking_made=lambda: booked["value"],
+        )
+        self.assertTrue(result.halted)
+        self.assertEqual(result.halt_reason, phone.HALT_CALLBACK_SCHEDULED)
+        # Post-nothing family: the caller must not post a terminal event.
+        self.assertTrue(phone.halt_is_retryable(phone.HALT_CALLBACK_SCHEDULED))
+        # Nothing was committed for the question the candidate deferred out of,
+        # and no further question was asked.
+        self.assertEqual(client.keys, [])
+        self.assertEqual(len(client.completions), 0)
+
+    def test_a_booking_present_before_the_loop_asks_nothing_at_all(self):
+        result, client, asked, _ = self._run_loop(booking_made=lambda: True)
+        self.assertTrue(result.halted)
+        self.assertEqual(result.halt_reason, phone.HALT_CALLBACK_SCHEDULED)
+        self.assertEqual(asked, [])
+        self.assertEqual(client.keys, [])
+
+    def test_a_raising_booking_signal_reads_as_no_booking(self):
+        def boom():
+            raise RuntimeError("seam broke")
+        result, client, asked, _ = self._run_loop(booking_made=boom)
+        # The signal failing must not end a healthy interview.
+        self.assertTrue(result.scored)
+        self.assertEqual(asked, ["k1", "k2"])
+
+    def test_the_callback_policy_names_the_tool_and_bans_improvised_promises(self):
+        """Content pin for the policy the first live call proved missing (the
+        model improvised "I'll send you a link" — a promise it cannot keep)."""
+        policy = phone.PHONE_CALLBACK_POLICY_TEXT
+        self.assertIn("schedule_callback", policy)
+        self.assertIn("Never promise", policy)
+        self.assertIn("STOP asking interview questions", policy)
 
     def test_the_happy_path_commits_every_key_in_order_then_completes(self):
         result, client, asked, spoken = self._run_loop()
@@ -429,11 +485,16 @@ class TestHaltTaxonomy(unittest.TestCase):
             # P5: a lost or unprovable concurrency lease. Both are
             # infrastructure, so both are retryable and post nothing.
             phone.HALT_LEASE_LOST, phone.HALT_LEASE_UNCONFIRMED,
+            # A confirmed callback booking. Post-nothing because the server
+            # already moved the engagement to `scheduled` — not because it is
+            # retryable in any sense.
+            phone.HALT_CALLBACK_SCHEDULED,
         }
-        self.assertEqual(len(declared), 6)
+        self.assertEqual(len(declared), 7)
         self.assertTrue(phone.RETRYABLE_HALTS.issubset(declared))
         self.assertTrue(phone.halt_is_retryable(phone.HALT_LEASE_LOST))
         self.assertTrue(phone.halt_is_retryable(phone.HALT_LEASE_UNCONFIRMED))
+        self.assertTrue(phone.halt_is_retryable(phone.HALT_CALLBACK_SCHEDULED))
 
 
 class TestCompletionRetry(unittest.IsolatedAsyncioTestCase):
