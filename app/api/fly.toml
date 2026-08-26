@@ -83,6 +83,15 @@ primary_region = "sin"
   ASHBY_RECONCILE_INTERVAL_MS = "900000"
   ASHBY_RECLAIM_INTERVAL_MS = "60000"
   ASHBY_LEASE_SECONDS = "60"
+  # Phone canary flip (docs/runbooks/phone-worker-deployment.md §6): the exact
+  # name of the dedicated phone worker (fly.phone.toml's PHONE_AGENT_NAME).
+  # Non-empty means the API DISPATCHES phone rooms to that worker by name; the
+  # validator (scripts/validate-voice-worker-apps.mjs) requires this to be
+  # identical to the worker's value (`names_agree`) or absent entirely. This is
+  # a dispatch name, not a secret. Setting it does NOT place calls by itself:
+  # PHONE_SCREENING_ENABLED / PHONE_RUNTIME_ENABLED / PHONE_DIAL_MODE are
+  # separate Fly SECRETS, all default-off.
+  PHONE_AGENT_NAME = "phone-screener"
 
 [http_service]
   internal_port = 8787

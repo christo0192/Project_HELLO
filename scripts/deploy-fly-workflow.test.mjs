@@ -122,99 +122,53 @@ ok(/printf '%s\\n%s\\n' "\$WATERMARK" "\$ts"/.test(voice), "deploy-browser-voice
 // worker-down incident is surfaced, never swallowed).
 ok(/::error::no current 'registered worker'[\s\S]*?exit 1/.test(voice), "deploy-browser-voice must FAIL CLOSED (exit 1) when no current registration is found");
 ok(!/project-hello-phone-voice/.test(voice) && !/fly\.phone\.toml/.test(voice), "deploy-browser-voice must not touch the phone app or its config");
-// Phone voice: STOPPED — release on the correct app, ENFORCED to count 0, and it
-// must NOT demand or grep for a live registration line (no stale-log acceptance).
-ok(/fly\.phone\.toml/.test(phone), "deploy-phone-voice must deploy with fly.phone.toml");
-ok(/flyctl scale count 0 -a project-hello-phone-voice/.test(phone), "deploy-phone-voice must ENFORCE stopped/min-0 by scaling the app to count 0 (default-safe by code, not by manual precondition)");
-// M-1: the live window is bounded from BOTH sides — a scale-to-zero must run
-// BEFORE the release (not only after), so a machine left live by a prior state
-// is not rolled live by this deploy. Assert a scale-0 precedes the deploy AND a
-// scale-0 follows it.
-{
-  const preScale = phone.indexOf("flyctl scale count 0 -a project-hello-phone-voice");
-  const deployAt = phone.indexOf("flyctl deploy --remote-only --config fly.phone.toml");
-  const postScale = phone.lastIndexOf("flyctl scale count 0 -a project-hello-phone-voice");
-  ok(preScale !== -1 && deployAt !== -1 && preScale < deployAt,
-    "deploy-phone-voice must scale to count 0 BEFORE the release (M-1: bound the live window from both sides)");
-  ok(postScale > deployAt,
-    "deploy-phone-voice must scale to count 0 AFTER the release as well");
-}
-// M-1: the transient must be documented as non-dispatchable, tied to the empty
-// API name — the guarantee is the missing dispatch target, not the scale timing.
-ok(/non-dispatchable/i.test(phone) && /PHONE_AGENT_NAME/.test(phone),
-  "deploy-phone-voice must document the release transient as non-dispatchable while the API PHONE_AGENT_NAME is empty");
-ok(/status -a project-hello-phone-voice/.test(phone), "deploy-phone-voice must verify status on project-hello-phone-voice");
-ok(!/registered worker/.test(phone), "deploy-phone-voice (stopped policy) must NOT require or accept a 'registered worker' line");
-ok(!/project-hello-voice\b/.test(phone.replace(/project-hello-phone-voice/g, "")), "deploy-phone-voice must not target the browser app");
-ok(/STOPPED/.test(phone), "deploy-phone-voice must document its STOPPED run policy");
 ok(/ALWAYS_ON/.test(voice), "deploy-browser-voice must document its ALWAYS_ON run policy");
+// An EMPTY watermark would degrade the >= comparison into accepting ANY
+// historical line; both lanes must refuse to verify on one.
+ok(/empty pre-release watermark[\s\S]*?exit 1/.test(voice), "deploy-browser-voice must FAIL CLOSED on an empty watermark (else the anti-stale comparison is vacuous)");
+// The failure path must surface one UNSUPPRESSED flyctl logs attempt, so a
+// logs-transport/credential failure is distinguishable from an unregistered
+// worker (the M-1 misattribution class).
+ok(/flyctl logs -a project-hello-voice --no-tail \|\| true/.test(voice), "deploy-browser-voice failure path must run one unsuppressed flyctl logs attempt before the fail-closed error");
+// Phone voice: ALWAYS_ON since the §6 canary flip
+// (docs/runbooks/phone-worker-deployment.md §6) — the SAME watermark +
+// CURRENT-registration contract as the browser job, against the phone app.
+ok(/fly\.phone\.toml/.test(phone), "deploy-phone-voice must deploy with fly.phone.toml");
+ok(/date -u \+/.test(phone) && /echo "watermark=/.test(phone), "deploy-phone-voice must capture a pre-release watermark");
+ok(/flyctl logs -a project-hello-phone-voice[\s\S]*?grep 'registered worker'/.test(phone), "deploy-phone-voice must grep a CURRENT 'registered worker' line from project-hello-phone-voice logs");
+// The anti-stale-log core: the extracted timestamp MUST be compared >= the
+// pre-release watermark. Deleting this comparison (accepting any line) must fail.
+ok(/sort \| tail -1\)" = "\$ts"/.test(phone), "deploy-phone-voice must compare the log timestamp against the watermark (no stale-log acceptance)");
+ok(/printf '%s\\n%s\\n' "\$WATERMARK" "\$ts"/.test(phone), "deploy-phone-voice watermark comparison must use the captured WATERMARK");
+// Fail-closed: an absent current registration must exit non-zero — a
+// dispatchable phone lane with no registered worker is dispatch-into-silence.
+ok(/::error::no current 'registered worker'[\s\S]*?exit 1/.test(phone), "deploy-phone-voice must FAIL CLOSED (exit 1) when no current registration is found");
+ok(/status -a project-hello-phone-voice/.test(phone), "deploy-phone-voice must verify status on project-hello-phone-voice");
+ok(/empty pre-release watermark[\s\S]*?exit 1/.test(phone), "deploy-phone-voice must FAIL CLOSED on an empty watermark (else the anti-stale comparison is vacuous)");
+ok(/flyctl logs -a project-hello-phone-voice --no-tail \|\| true/.test(phone), "deploy-phone-voice failure path must run one unsuppressed flyctl logs attempt before the fail-closed error");
+// The §6 flip REMOVED the stopped-era scale-to-zero. Guard that REMOVAL
+// two-sided: the scale lines coming back would re-zero a live canary window on
+// every unrelated shared-source merge (runbook §6a names that failure mode),
+// so their absence is part of the reviewed posture, not an accident.
+{
+  const phoneCode = phone
+    .split("\n")
+    .filter((l) => !/^\s*#/.test(l))
+    .join("\n");
+  ok(/flyctl deploy --remote-only --config fly\.phone\.toml/.test(phoneCode),
+    "comment-stripping must leave the executable deploy line intact (else the ban below is vacuous)");
+  ok(!/flyctl\s+(scale|machine)\b/.test(phoneCode),
+    "deploy-phone-voice must contain NO flyctl scale/machine command — the §6 flip made it ALWAYS_ON, and any re-zeroing (scale count 0 under either flag spelling, machine stop/destroy) silently kills a live canary window (runbook §6a); reverting to STOPPED is a reviewed posture change, not a line edit");
+}
+ok(/ALWAYS_ON/.test(phone), "deploy-phone-voice must document its ALWAYS_ON run policy");
+ok(!/project-hello-voice\b/.test(phone.replace(/project-hello-phone-voice/g, "")), "deploy-phone-voice must not target the browser app");
 
-// ── 8b. M-1 (PR104): the pre-release scale must CLASSIFY its failure ─────
-// The old form was `flyctl scale count 0 ... 2>/dev/null || echo "app not
-// created yet"`: every failure, including the empty token that actually
-// occurred, was reported as a missing app. These controls pin the repair as
-// TEXT (the misattributing shape is gone from the EXECUTED lines) and then,
-// below, as BEHAVIOUR. Comments are stripped first — the job documents the old
-// form on purpose, and a guard that a comment can satisfy (or trip) is not a
-// guard on the code.
-const phoneCode = phone
-  .split("\n")
-  .filter((l) => !/^\s*#/.test(l))
-  .join("\n");
-ok(/flyctl scale count 0 -a project-hello-phone-voice/.test(phoneCode),
-  "comment-stripping must leave the executable scale lines intact (else every assertion below is vacuous)");
-// L-1: the historical form spanned a backslash line-continuation
-//   flyctl scale count 0 -a … --yes 2>/dev/null \
-//     || echo "pre-release scale skipped (app not created yet); …"
-// so a `[^\n]*` guard could not match the shape it named — restoring the real
-// prior code would have left it green. Match the LOGICAL line instead: the
-// command plus any number of continued physical lines.
-const LOGICAL_SCALE = String.raw`scale count 0(?:[^\n]*\\\n)*[^\n]*`;
-ok(!new RegExp(`${LOGICAL_SCALE}2>\\/dev\\/null`).test(phoneCode),
-  "deploy-phone-voice must not silence the pre-release scale's stderr — the failure text is what tells the two causes apart");
-ok(!new RegExp(`${LOGICAL_SCALE}\\|\\|\\s*echo`).test(phoneCode),
-  "deploy-phone-voice must not swallow a pre-release scale failure with `|| echo`, on one line or across a continuation — that is the misattribution M-1 records");
-// The guard must be able to see across a continuation. A positive control on the
-// matcher itself, because a regex that cannot match the shape it forbids is the
-// guard-that-cannot-fire class: feed it the REAL historical two-line form.
-{
-  const historical = 'flyctl scale count 0 -a project-hello-phone-voice --yes 2>/dev/null \\\n'
-    + '  || echo "pre-release scale skipped (app not created yet); the post-release scale below is the binding guarantee"\n';
-  ok(new RegExp(`${LOGICAL_SCALE}\\|\\|\\s*echo`).test(historical),
-    "the `|| echo` guard must match the ACTUAL historical continuation form, not only a single-line reconstruction");
-  ok(new RegExp(`${LOGICAL_SCALE}2>\\/dev\\/null`).test(historical),
-    "the stderr-suppression guard must match the actual historical form");
-}
-ok(/could not find app/i.test(phoneCode),
-  "deploy-phone-voice must match flyctl's app-not-found text explicitly rather than assuming it");
-ok(/::error::pre-release scale precondition FAILED[\s\S]*?exit 1/.test(phoneCode),
-  "deploy-phone-voice must FAIL CLOSED (exit 1) when the pre-release precondition fails for a reason other than an absent app");
-// Ordering: the tolerant branch must be GUARDED by the not-found match, i.e. the
-// classification must precede the benign message, never follow it.
-{
-  const notFoundAt = phoneCode.search(/could not find app/i);
-  const skipMsgAt = phoneCode.indexOf("pre-release scale skipped");
-  const failClosedAt = phoneCode.indexOf("::error::pre-release scale precondition FAILED");
-  ok(notFoundAt !== -1 && skipMsgAt !== -1 && notFoundAt < skipMsgAt,
-    "the app-not-found classification must GUARD the benign 'skipped' message, not trail it");
-  ok(failClosedAt > skipMsgAt,
-    "the fail-closed branch must be the fallthrough after the classified benign case");
-}
-// The post-release scale is unconditional and unguarded — it is the binding
-// guarantee the benign branch leans on, so it must never acquire a fallback.
-{
-  const after = phoneCode.slice(phoneCode.indexOf("flyctl deploy --remote-only --config fly.phone.toml"));
-  ok(/^\s*flyctl scale count 0 -a project-hello-phone-voice --yes\s*$/m.test(after),
-    "a bare, unguarded post-release scale must follow the release");
-  ok(!/scale count 0[^\n]*(\|\||2>)/.test(after),
-    "the post-release scale must carry no fallback and no stderr suppression");
-}
 
-// ── 8c. M-1 BEHAVIOUR: run the step's real shell against a stubbed flyctl ──
-// A text assertion proves the branch is written; only executing it proves the
-// branch works. The step's script is extracted verbatim from the workflow and
-// run with a `flyctl` stub on PATH, so the three outcomes are observed, not
-// asserted about. No network, no Fly, no token.
+// ── 8b. BEHAVIOUR: run the phone verify step's real shell against a stub ──
+// Text assertions prove the guards are written; only executing the shell
+// proves they fire. The step's script is extracted verbatim and run with stub
+// `flyctl` and `sleep` binaries on a REPLACED PATH (hermetic — asserted, not
+// assumed; no token is provided, so nothing can reach Fly).
 function stepScript(jobText, nameFragment) {
   const lines = jobText.split("\n");
   const at = lines.findIndex((l) => l.includes("- name:") && l.includes(nameFragment));
@@ -232,111 +186,77 @@ function stepScript(jobText, nameFragment) {
   return body.join("\n");
 }
 {
-  const script = stepScript(phone, "Deploy phone voice worker");
-  ok(script !== null && /flyctl deploy --remote-only --config fly\.phone\.toml/.test(script || ""),
-    "must be able to extract the phone deploy step's shell script for behavioural testing");
+  const script = stepScript(phone, "Verify CURRENT worker registration");
+  ok(script !== null && /registered worker/.test(script || ""),
+    "must be able to extract the phone verify step's shell script for behavioural testing");
   if (script) {
-    // The stub answers `status` per mode and, in scalefail mode, fails `scale`.
-    // Modes: ok | notfound | nocred | scalefail.
-    //
-    // L-4 — SAFETY INVARIANT, stated and then enforced: this harness executes
-    // the workflow's REAL shell, which contains `flyctl deploy`. Nothing may
-    // reach Fly. Two things guarantee that and both are asserted below, not
-    // assumed: the child's PATH is replaced (not prepended to), so only the
-    // stub directory and the base system dirs are searched; and `command -v
-    // flyctl` is resolved IN THE CHILD ENV and required to be the stub. No Fly
-    // token is passed either — the step reads it from the job `env`, which this
-    // harness does not provide.
-    const stubDirFor = (statusMode) => {
+    const stubDirFor = (logsMode) => {
       const dir = mkdtempSync(path.join(tmpdir(), "fly-stub-"));
       const bin = path.join(dir, "flyctl");
       writeFileSync(bin, [
         "#!/usr/bin/env bash",
-        'if [ "$1" = "status" ]; then',
-        `  case "${statusMode}" in`,
-        "    ok|scalefail) echo 'App: project-hello-phone-voice'; exit 0 ;;",
-        "    notfound) echo 'Error: Could not find App \"project-hello-phone-voice\"' >&2; exit 1 ;;",
-        "    nocred) echo 'Error: no access token available' >&2; exit 1 ;;",
+        'if [ "$1" = "logs" ]; then',
+        `  case "${logsMode}" in`,
+        "    registered) echo '2099-01-01T00:00:00 registered worker id=stub' ;;",
+        "    silent) : ;;",
         "  esac",
-        "fi",
-        `if [ "$1" = "scale" ] && [ "${statusMode}" = "scalefail" ]; then`,
-        "  echo 'Error: could not scale app: machine update failed' >&2; exit 1",
+        "  exit 0",
         "fi",
         'echo "STUB flyctl $*"',
         "exit 0",
       ].join("\n"));
       chmodSync(bin, 0o755);
+      // No-op sleep so the 24-attempt failure loop completes instantly.
+      const slp = path.join(dir, "sleep");
+      writeFileSync(slp, "#!/usr/bin/env bash\nexit 0\n");
+      chmodSync(slp, 0o755);
       return dir;
     };
-    const HERMETIC_PATH = (dir) => `${dir}:/usr/bin:/bin`;
-    const runWithStub = (statusMode) => {
-      const dir = stubDirFor(statusMode);
-      const env = { ...process.env, PATH: HERMETIC_PATH(dir) };
-      // Resolve flyctl in the SAME environment the step will run in.
+    const runWithStub = (logsMode, watermark) => {
+      const dir = stubDirFor(logsMode);
+      const env = { ...process.env, PATH: `${dir}:/usr/bin:/bin`, WATERMARK: watermark };
       const which = spawnSync("bash", ["-c", "command -v flyctl"], { encoding: "utf8", env });
-      const resolved = (which.stdout || "").trim();
       const r = spawnSync("bash", ["-c", script], { encoding: "utf8", env });
+      const resolved = (which.stdout || "").trim();
       rmSync(dir, { recursive: true, force: true });
       return { code: r.status, out: (r.stdout || "") + (r.stderr || ""), resolved, stubBin: path.join(dir, "flyctl") };
     };
 
-    // (a) App reachable → the pre-release scale actually RUNS, then the release.
-    const okRun = runWithStub("ok");
-    ok(okRun.code === 0, `reachable app: the step must succeed, got ${okRun.code}:\n${okRun.out}`);
-    ok(/STUB flyctl scale count 0 -a project-hello-phone-voice --yes/.test(okRun.out),
-      "reachable app: the PRE-release scale must run");
-    ok((okRun.out.match(/scale count 0 -a project-hello-phone-voice/g) || []).length === 2,
-      "reachable app: BOTH the pre- and post-release scales must run");
-    ok(!/pre-release scale skipped/.test(okRun.out),
-      "reachable app: the step must not claim it skipped anything");
+    // (a) Current registration at/after the watermark → verify passes.
+    const okRun = runWithStub("registered", "2020-01-01T00:00:00");
+    ok(okRun.code === 0, `current registration: verify must pass, got ${okRun.code}:\n${okRun.out}`);
+    ok(/re-registered at 2099-01-01T00:00:00/.test(okRun.out),
+      "current registration: the accepted timestamp must be the one from the log line");
 
-    // (b) App not visible → tolerated, said accurately, and the release proceeds
-    //     with the post-release scale still binding.
-    const nf = runWithStub("notfound");
-    ok(nf.code === 0, `absent app: the step must continue, got ${nf.code}:\n${nf.out}`);
-    ok(/pre-release scale skipped: app project-hello-phone-voice is NOT VISIBLE/.test(nf.out),
-      "absent app: the message must name the observed condition (not visible to this token)");
-    ok(!/::error::/.test(nf.out), "absent app: must not raise a workflow error");
-    ok(/STUB flyctl deploy --remote-only --config fly.phone.toml/.test(nf.out),
-      "absent app: the release must still proceed");
-    ok((nf.out.match(/scale count 0 -a project-hello-phone-voice/g) || []).length === 1,
-      "absent app: exactly the POST-release scale must run (the binding guarantee)");
+    // (b) No registration ever → FAILS CLOSED with the named error.
+    const silent = runWithStub("silent", "2020-01-01T00:00:00");
+    ok(silent.code !== 0, `no registration: verify must FAIL CLOSED, got exit ${silent.code}:\n${silent.out}`);
+    ok(/::error::no current 'registered worker'/.test(silent.out),
+      "no registration: must raise the named workflow error");
 
-    // (c) Credential failure → FAILS CLOSED, and never prints the absent-app
-    //     story. This is the exact case that was misreported in production.
-    const nc = runWithStub("nocred");
-    ok(nc.code !== 0, `credential failure: the step must FAIL CLOSED, got exit ${nc.code}:\n${nc.out}`);
-    ok(/::error::pre-release scale precondition FAILED/.test(nc.out),
-      "credential failure: must raise a workflow error naming the precondition");
-    ok(!/pre-release scale skipped/.test(nc.out) && !/not been created/i.test(nc.out.split("::error::")[0] || ""),
-      "credential failure: must NOT be reported as an absent app (the M-1 misattribution)");
-    ok(/no access token available/.test(nc.out),
-      "credential failure: the underlying flyctl message must be surfaced, not swallowed");
-    ok(!/STUB flyctl deploy/.test(nc.out),
-      "credential failure: NO release may be pushed once the scale controls are untrustworthy");
+    // (c) EMPTY watermark → refuse BEFORE consulting logs; a stale line must
+    //     not be given the chance to satisfy a vacuous comparison.
+    const empty = runWithStub("registered", "");
+    ok(empty.code !== 0, `empty watermark: verify must FAIL CLOSED, got exit ${empty.code}:\n${empty.out}`);
+    ok(/empty pre-release watermark/.test(empty.out),
+      "empty watermark: must name the refusal (not report an unregistered worker)");
+    ok(!/re-registered/.test(empty.out),
+      "empty watermark: must never accept a registration line");
 
-    // (d) L-4: `flyctl status` succeeds but the pre-release SCALE fails. Under
-    //     `set -e` the step must abort — an unscaled release is exactly the
-    //     unbounded live window the pre-release scale exists to prevent.
-    const sf = runWithStub("scalefail");
-    ok(sf.code !== 0, `scale failure: the step must abort, got exit ${sf.code}:\n${sf.out}`);
-    ok(!/STUB flyctl deploy/.test(sf.out),
-      "scale failure: NO release may be pushed when the pre-release scale itself fails");
+    // (d) A registration line OLDER than the watermark is STALE evidence and
+    //     must be rejected — this is the entire point of the watermark.
+    const stale = runWithStub("registered", "2100-01-01T00:00:00");
+    ok(stale.code !== 0, `stale registration: verify must FAIL CLOSED, got exit ${stale.code}:\n${stale.out}`);
+    ok(!/re-registered/.test(stale.out),
+      "stale registration: a pre-watermark line must never be accepted");
 
-    // L-4: the harness is hermetic — prove it rather than assume it. Every mode
-    // must have resolved `flyctl` to the throwaway stub, never to a real binary.
-    for (const [label, r] of [["reachable", okRun], ["absent", nf], ["credential", nc], ["scale-failure", sf]]) {
+    // Hermetic: flyctl must resolve to the throwaway stub in every mode.
+    for (const [label, r] of [["registered", okRun], ["silent", silent], ["empty-watermark", empty], ["stale", stale]]) {
       ok(r.resolved === r.stubBin,
         `${label}: flyctl must resolve to the test stub (${r.stubBin}), got ${JSON.stringify(r.resolved)} — this harness runs the real workflow shell and must never reach Fly`);
     }
-    // The step must not carry a credential inline: the token arrives via job
-    // `env` (GitHub-masked), which this harness deliberately does not provide.
-    // A mention inside a diagnostic message is fine; an assignment or a
-    // `secrets.` interpolation inside the shell would not be.
-    ok(!/FLY_API_TOKEN[A-Z_]*\s*=/.test(script),
-      "the extracted step must not ASSIGN a Fly token inline — it is job env, and absent in this harness");
     ok(!/\$\{\{\s*secrets\./.test(script),
-      "the extracted step must not interpolate a `secrets.` expression into the shell");
+      "the extracted verify step must not interpolate a `secrets.` expression into the shell");
   }
 }
 
@@ -358,4 +278,4 @@ if (failures.length) {
   for (const f of failures) console.error(" - " + f);
   process.exit(1);
 }
-console.log("deploy-fly workflow contract valid (three-app matrix, token isolation, policy-aware verification, classified pre-release precondition).");
+console.log("deploy-fly workflow contract valid (three-app matrix, token isolation, policy-aware ALWAYS_ON verification on both voice apps).");

@@ -263,4 +263,4 @@ if (failures.length) {
   process.exit(1);
 }
 for (const n of notes) console.error(`voice worker app config note: ${n}`);
-console.log("voice worker app configs valid (browser unnamed; phone named & stopped; isolated; no secrets; approved deployment region across all three Fly app configs; worker<->API name agreement surfaced).");
+console.log("voice worker app configs valid (browser unnamed; phone named & API-dispatched; isolated; no secrets; approved deployment region across all three Fly app configs; worker<->API name agreement surfaced).");
