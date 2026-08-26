@@ -258,6 +258,21 @@ class TestRepairExchangeShape(unittest.TestCase):
         )
         self.assertFalse(phone.valid_boundary_turns(got))
 
+    def test_malformed_non_dict_items_are_never_silently_repaired(self):
+        """Review finding on the first draft: a dict-filter here would DISCARD
+        malformed items and then synthesise around the gap, laundering garbage
+        into a committable exchange. Any non-dict item must return the capture
+        unchanged so the shape check halts it."""
+        polluted = ["garbage", {"speaker": "candidate", "text": "Five years."}]
+        got = phone.repair_exchange_shape(list(polluted), self.Q)
+        self.assertEqual(got, polluted)
+        self.assertFalse(phone.valid_boundary_turns(got))
+        # Same when the pollution is anywhere else in the list.
+        tail = [{"speaker": "candidate", "text": "Five years."}, None]
+        self.assertEqual(phone.repair_exchange_shape(list(tail), self.Q), tail)
+        # And a non-list capture is returned as-is, not coerced.
+        self.assertEqual(phone.repair_exchange_shape("nope", self.Q), "nope")
+
     def test_both_artefacts_together(self):
         got = phone.repair_exchange_shape(
             [

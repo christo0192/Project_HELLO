@@ -1356,11 +1356,17 @@ def repair_exchange_shape(
 
     NO repair produces an answer: an exchange with no candidate turn is
     returned as captured, and the caller's shape check halts it exactly as
-    before. The server re-validates regardless — this widens nothing.
+    before. And NO repair runs on input that is not entirely turn-shaped: a
+    single non-dict item returns the capture UNCHANGED, so validation halts it
+    — silently discarding malformed items and then synthesising around the
+    gap would launder garbage into a committable exchange. The server
+    re-validates regardless — this widens nothing.
     """
     if not isinstance(turns, list):
         return turns  # type: ignore[return-value]
-    out = [t for t in turns if isinstance(t, dict)]
+    if any(not isinstance(t, dict) for t in turns):
+        return turns
+    out = list(turns)
     while out and out[-1].get("speaker") == "bot":
         out.pop()
     if not any(t.get("speaker") == "candidate" for t in out):
