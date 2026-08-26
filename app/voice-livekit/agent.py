@@ -1301,13 +1301,19 @@ async def _run_phone_session(
                 await wait_for_playout()
 
         async def ask(question: Any, cursor: int) -> list[dict[str, str]]:
-            return await _ask_phone_question(
+            captured = await _ask_phone_question(
                 generate=generate,
                 exchange=exchange,
                 question=question,
                 answer_timeout_sec=phone.phone_answer_timeout_sec(),
                 follow_up=bool(question.hint),
             )
+            # Repair the capture artefacts real telephony produces (a question
+            # answered over its tail loses its bot turn to the interrupted-item
+            # drop; an unanswered follow-up leaves a trailing bot turn) using
+            # the PLAN's own question text — never inventing an answer. See
+            # phone.repair_exchange_shape for the full contract.
+            return phone.repair_exchange_shape(captured, question.text)
 
         try:
             assessment = await asyncio.wait_for(
