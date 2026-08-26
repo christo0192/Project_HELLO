@@ -31,6 +31,7 @@ import {
 const ENGAGEMENT = '11111111-2222-4333-8444-555555555555';
 const ATTEMPT = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 const OTHER_ATTEMPT = 'aaaaaaaa-bbbb-4ccc-8ddd-ffffffffffff';
+const SESSION = '99999999-8888-4777-8666-555555555555';
 const ROOM = `phone-${ENGAGEMENT}`;
 const NOW = new Date('2026-09-01T05:30:00.000Z');
 
@@ -60,6 +61,7 @@ interface Harness {
   startEgress: ReturnType<typeof vi.fn>;
   buildOutput: ReturnType<typeof vi.fn>;
   stopEgress: ReturnType<typeof vi.fn>;
+  stamp: ReturnType<typeof vi.fn>;
 }
 
 function harness(opts: {
@@ -86,21 +88,24 @@ function harness(opts: {
   const stopEgress = vi.fn(async () => undefined);
   const buildOutput = vi.fn((objectKey: string) => ({ filepath: objectKey }));
 
+  const stamp = vi.fn(async () => ({ status: 'ok' as const, duplicate: false }));
+
   const stores = {
     listEngagementRecordings: list,
     attachAttemptRecording: attach,
     finalizeAttemptRecording: finalize,
+    stampSessionEgress: stamp,
   } as unknown as PhoneStores;
 
   const egress = { startRoomCompositeEgress: startEgress, stopEgress } as unknown as
     PhoneEgressClientLike;
 
-  return { deps: { stores, egress, buildOutput }, attach, finalize, list, startEgress, buildOutput, stopEgress };
+  return { deps: { stores, egress, buildOutput }, attach, finalize, list, startEgress, buildOutput, stopEgress, stamp };
 }
 
 function run(h: Harness) {
   return startPhoneAttemptRecording(
-    { engagementId: ENGAGEMENT, attemptId: ATTEMPT, roomName: ROOM, now: NOW },
+    { engagementId: ENGAGEMENT, attemptId: ATTEMPT, roomName: ROOM, sessionId: SESSION, now: NOW },
     h.deps,
   );
 }
@@ -195,6 +200,48 @@ describe('P4 recording — ordering is attach, then egress, then finalize', () =
 // ═══════════════════════════════════════════════════════════════════════
 // KEYS — including the manifest-suffix trap.
 // ═══════════════════════════════════════════════════════════════════════
+
+describe('0051 — the session-level stamp that makes the recording FINDABLE', () => {
+  it('stamps the session with the egress id, after the egress exists', async () => {
+    const h = harness({});
+    const res = await run(h);
+    expect(res.status).toBe('started');
+    expect(h.stamp).toHaveBeenCalledTimes(1);
+    expect(h.stamp.mock.calls[0][0]).toMatchObject({
+      sessionId: SESSION,
+      attemptId: ATTEMPT,
+      egressId: 'EG_abcd1234',
+    });
+    expect(res.sessionStamped).toBe(true);
+  });
+
+  it('a REFUSED stamp does not end the consented call, and is surfaced for the caller to log', async () => {
+    // The dialer package is console-free by structural pin; the caller logs.
+    const h = harness({});
+    h.stamp.mockResolvedValueOnce({ status: 'session_candidate_mismatch' });
+    const res = await run(h);
+    expect(res.status).toBe('started');
+    expect(res.sessionStamped).toBe(false);
+    expect(res.stampStatus).toBe('session_candidate_mismatch');
+  });
+
+  it('a THROWING stamp store reads as store_error, never as a failed recording', async () => {
+    const h = harness({});
+    h.stamp.mockRejectedValueOnce(new Error('db down'));
+    const res = await run(h);
+    expect(res.status).toBe('started');
+    expect(res.sessionStamped).toBe(false);
+    expect(res.stampStatus).toBe('store_error');
+  });
+
+  it('no stamp is attempted when the egress never started', async () => {
+    const h = harness({});
+    h.startEgress.mockRejectedValueOnce(new Error('egress down'));
+    const res = await run(h);
+    expect(res.status).toBe('egress_failed');
+    expect(h.stamp).not.toHaveBeenCalled();
+  });
+});
 
 describe('P4 recording — the exact derived keys, manifest suffix included', () => {
   it('binds `phone-<attemptId>-egress.mp3` and `phone-<attemptId>-egress.mp3.json`', async () => {

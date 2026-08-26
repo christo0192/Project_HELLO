@@ -40,6 +40,7 @@ import {
   type SchedulePhoneAppointmentStatus,
   type SetPhoneHaltStatus,
   type AttachPhoneAttemptRecordingStatus,
+  StampPhoneSessionEgressStatus,
   type FinalizePhoneAttemptRecordingStatus,
   type ListPhoneEngagementRecordingsStatus,
   type ClearPhoneAttemptRecordingsStatus,
@@ -67,6 +68,7 @@ import type {
   SetPhoneHaltResult,
   AttachPhoneAttemptRecordingInput,
   AttachPhoneAttemptRecordingResult,
+  StampPhoneSessionEgressResult,
   FinalizePhoneAttemptRecordingResult,
   ListPhoneEngagementRecordingsResult,
   ClearPhoneAttemptRecordingsResult,
@@ -640,6 +642,24 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
           PHONE_ENGAGEMENT_STATES,
         ),
         attemptState: member<PhoneAttemptState>(row, 'attempt_state', PHONE_ATTEMPT_STATES),
+      };
+    },
+
+    async stampSessionEgress(input): Promise<StampPhoneSessionEgressResult> {
+      const { data, error } = await client.rpc('stamp_phone_session_egress', {
+        p_session_id: input.sessionId,
+        p_attempt_id: input.attemptId,
+        p_egress_id: input.egressId,
+        p_now: isoInstant(input.now),
+      });
+      if (error) throw new Error('phone_stamp_session_egress_error');
+      const row = asRow(data);
+      return {
+        status: narrowPhoneRpcStatus<StampPhoneSessionEgressStatus>(
+          'stamp_phone_session_egress',
+          row,
+        ),
+        duplicate: bool(row, 'duplicate'),
       };
     },
 

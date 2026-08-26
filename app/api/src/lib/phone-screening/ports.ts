@@ -27,6 +27,7 @@ import type {
   FinalizePhoneAttemptRecordingStatus,
   ListPhoneEngagementRecordingsStatus,
   ClearPhoneAttemptRecordingsStatus,
+  StampPhoneSessionEgressStatus,
   CommitPhoneQuestionBoundaryStatus,
   GetPhoneAssessmentStateStatus,
   StartPhoneAssessmentStatus,
@@ -310,6 +311,12 @@ export interface AttachPhoneAttemptRecordingResult {
   readonly attemptState?: string;
 }
 
+export interface StampPhoneSessionEgressResult {
+  readonly status: StampPhoneSessionEgressStatus | typeof PHONE_RPC_UNKNOWN_STATUS;
+  /** True when the SAME egress id was already stamped. Success, not a refusal. */
+  readonly duplicate?: boolean;
+}
+
 export interface FinalizePhoneAttemptRecordingResult {
   readonly status: FinalizePhoneAttemptRecordingStatus | typeof PHONE_RPC_UNKNOWN_STATUS;
   readonly attemptId?: string;
@@ -533,6 +540,19 @@ export interface PhoneStores {
     egressId?: string | null;
     now: Date;
   }): Promise<FinalizePhoneAttemptRecordingResult>;
+  /**
+   * 0051. Stamps SESSION-level egress bookkeeping (`recording_egress_id` +
+   * `'active'` status on `call_sessions`) the moment a phone attempt's egress
+   * starts, so the 0038 finalize convergence and the recruiter download route
+   * can see phone recordings at all. Integrity columns remain the finalizer's
+   * alone. Candidate-association guarded and idempotent per egress id.
+   */
+  stampSessionEgress(input: {
+    sessionId: string;
+    attemptId: string;
+    egressId: string;
+    now: Date;
+  }): Promise<StampPhoneSessionEgressResult>;
   listEngagementRecordings(input: {
     engagementId: string;
   }): Promise<ListPhoneEngagementRecordingsResult>;

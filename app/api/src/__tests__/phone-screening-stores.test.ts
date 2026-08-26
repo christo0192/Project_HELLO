@@ -379,6 +379,8 @@ describe('errors and malformed answers', () => {
         attemptId: 'a', objectKey: 'phone-a-egress.ogg', role: 'authoritative', now: NOW })],
       ['phone_finalize_recording_error', () => stores.finalizeAttemptRecording({
         attemptId: 'a', egressStatus: 'complete', now: NOW })],
+      ['phone_stamp_session_egress_error', () => stores.stampSessionEgress({
+        sessionId: 's', attemptId: 'a', egressId: 'EG_test', now: NOW })],
       ['phone_list_recordings_error', () => stores.listEngagementRecordings({
         engagementId: 'e' })],
       ['phone_clear_recordings_error', () => stores.clearAttemptRecordings({
