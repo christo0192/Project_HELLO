@@ -66,6 +66,7 @@ interface Harness {
   heartbeatAttemptByEpoch: ReturnType<typeof vi.fn>;
   resolveEngagement: ReturnType<typeof vi.fn>;
   startRecording: ReturnType<typeof vi.fn>;
+  verifySessionHint: ReturnType<typeof vi.fn>;
   purgeRecordings: ReturnType<typeof vi.fn>;
   /** Every store method, so ANY database touch is observable. */
   storeCalls: () => number;
@@ -79,6 +80,9 @@ function build(options: {
   sessionId?: string | null;
   /** Omit the seam entirely, to prove the route works without a recorder. */
   withRecorder?: boolean;
+  /** Wire the session-hint verifier; absent = a hint is unusable (fail-closed). */
+  withHintVerifier?: boolean;
+  verifySessionHint?: (input: { sessionId: string; engagementId: string }) => Promise<boolean>;
   /** Omit the purge seam, to prove the terminal path is inert without it. */
   withPurge?: boolean;
   purgeStatus?: string;
@@ -113,6 +117,9 @@ function build(options: {
     options.heartbeat ?? (async () => ({ status: 'ok' }) as HeartbeatPhoneAttemptResult),
   );
   const startRecording = vi.fn(async () => ({ status: 'started', egressStarted: true }));
+  const verifySessionHint = vi.fn(
+    options.verifySessionHint ?? (async () => true),
+  );
   const purgeRecordings = vi.fn(async () => ({
     status: options.purgeStatus ?? 'purged',
     safeToAcknowledge: options.purgeSafe ?? true,
@@ -135,6 +142,9 @@ function build(options: {
       // is correct with NO recorder configured — which is exactly how a
       // deployment without an egress destination runs.
       startRecording: options.withRecorder === true ? (startRecording as never) : undefined,
+      // The verifier is wired only when a test asks for it, so the DEFAULT
+      // path proves a hint is unusable without one (fail-closed).
+      verifySessionHint: options.withHintVerifier === true ? (verifySessionHint as never) : undefined,
       purgeRecordings: options.withPurge === true ? (purgeRecordings as never) : undefined,
       configSource: options.configSource ?? ENABLED,
       now: () => options.now ?? NOW,
@@ -148,6 +158,7 @@ function build(options: {
     heartbeatAttemptByEpoch,
     resolveEngagement,
     startRecording,
+    verifySessionHint,
     purgeRecordings,
     // EVERY store method, so a "no database work" assertion means it.
     storeCalls: () =>
@@ -840,6 +851,106 @@ describe('recording starts on disclosure.delivered, and on nothing else', () => 
     });
   });
 
+  it('uses the worker\'s session HINT when the DB binding does not exist yet (the unrecorded-first-call incident)', async () => {
+    // 2026-08-26: the session is bound to the attempt only at
+    // /assessment/start, which is AFTER the disclosure — so the DB read here
+    // found nothing and recording silently skipped on EVERY call. The worker
+    // forwards the session it already holds; the route must use it.
+    const h = build({ withRecorder: true, withHintVerifier: true, sessionId: null });
+    const res = await post(h, '/events', {
+      attempt_id: ATTEMPT,
+      event_type: 'disclosure.delivered',
+      session_id: SESSION,
+    });
+
+    expect(res.status).toBe(200);
+    expect(h.verifySessionHint).toHaveBeenCalledWith({
+      sessionId: SESSION,
+      engagementId: ENGAGEMENT,
+    });
+    expect(h.startRecording).toHaveBeenCalledTimes(1);
+    expect(h.startRecording.mock.calls[0][0]).toMatchObject({
+      engagementId: ENGAGEMENT,
+      attemptId: ATTEMPT,
+      roomName: `phone-${SESSION}`,
+    });
+  });
+
+  it('refuses a valid-but-UNRELATED session hint (the server checks the association, not the shape)', async () => {
+    // Independent review of the first draft: a UUID-shaped hint could point
+    // the egress at another conversation's room. The verifier answers false
+    // for a session that does not belong to this attempt's candidate, and the
+    // recording must be refused — while the consent event itself still lands.
+    const h = build({
+      withRecorder: true,
+      withHintVerifier: true,
+      sessionId: null,
+      verifySessionHint: async () => false,
+    });
+    const res = await post(h, '/events', {
+      attempt_id: ATTEMPT,
+      event_type: 'disclosure.delivered',
+      session_id: '77777777-6666-4555-8444-333333333333',
+    });
+
+    expect(res.status).toBe(200);
+    expect(h.startRecording).not.toHaveBeenCalled();
+  });
+
+  it('a hint is unusable when NO verifier is wired (fail-closed by absence)', async () => {
+    const h = build({ withRecorder: true, sessionId: null });
+    const res = await post(h, '/events', {
+      attempt_id: ATTEMPT,
+      event_type: 'disclosure.delivered',
+      session_id: SESSION,
+    });
+
+    expect(res.status).toBe(200);
+    expect(h.startRecording).not.toHaveBeenCalled();
+  });
+
+  it('prefers the DB binding over the hint when both exist', async () => {
+    // The database is the authority once /assessment/start has bound the
+    // session; a worker hint that disagrees must not redirect the egress.
+    const OTHER = '77777777-6666-4555-8444-333333333333';
+    const h = build({ withRecorder: true, withHintVerifier: true });
+    const res = await post(h, '/events', {
+      attempt_id: ATTEMPT,
+      event_type: 'disclosure.delivered',
+      session_id: OTHER,
+    });
+
+    expect(res.status).toBe(200);
+    expect(h.startRecording.mock.calls[0][0]).toMatchObject({ roomName: `phone-${SESSION}` });
+    // The bound session needs no verification, and consulting the verifier
+    // for it would make the DB's own binding second-guess itself.
+    expect(h.verifySessionHint).not.toHaveBeenCalled();
+  });
+
+  it('starts NO recording with neither a binding nor a hint (and the event still succeeds)', async () => {
+    const h = build({ withRecorder: true, sessionId: null });
+    const res = await post(h, '/events', {
+      attempt_id: ATTEMPT,
+      event_type: 'disclosure.delivered',
+    });
+
+    expect(res.status).toBe(200);
+    expect(h.startRecording).not.toHaveBeenCalled();
+  });
+
+  it('refuses a malformed session hint with 400 before any database work', async () => {
+    const h = build({ withRecorder: true });
+    const res = await post(h, '/events', {
+      attempt_id: ATTEMPT,
+      event_type: 'disclosure.delivered',
+      session_id: 'not-a-uuid',
+    });
+
+    expect(res.status).toBe(400);
+    expect(h.startRecording).not.toHaveBeenCalled();
+    expect(h.storeCalls()).toBe(0);
+  });
+
   for (const event of WORKER_PHONE_EVENTS.filter((e) => e !== 'disclosure.delivered')) {
     it(`starts NO recording on ${event}`, async () => {
       const h = build({ withRecorder: true });
@@ -1439,20 +1550,30 @@ describe('/events renews no lease, for any event, applied or not', () => {
     expect(JSON.stringify(res.body)).not.toContain(LEASE_TOKEN);
   });
 
-  it('/events carries no session_id — the field the fence would need', async () => {
-    // The MECHANICAL reason the renewal cannot live here. The event schema is
-    // strict, so a caller cannot smuggle one in either; a future renewal would
-    // have to widen this schema first, and that is a visible change.
-    const h = build();
-    const res = await post(h, '/events', {
-      attempt_id: ATTEMPT,
-      event_type: 'classify.human',
-      epoch: 2,
-      session_id: SESSION,
-    });
-    expect(res.status).toBe(400);
-    expect(res.body).toEqual({ ok: false, error: 'invalid_request' });
-    expect(h.storeCalls()).toBe(0);
+  it('/events accepts the session HINT, and the renewal fence still holds', async () => {
+    // The previous pin was mechanical: the schema had no session field, so a
+    // renewal could not live here — and that pin itself said a future widening
+    // "is a visible change" that must re-argue the fence. The recording
+    // ordering fix (2026-08-26) is that widening: `session_id` now exists as
+    // an OPTIONAL hint whose only consumer is the recording starter. So the
+    // fence is re-pinned at the invariant that actually matters: no event,
+    // with or without a session in the payload, ever reaches the lease
+    // renewal. Renewal still requires the /attempt/heartbeat door and its
+    // epoch fence.
+    const h = build({ withRecorder: true });
+    for (const event_type of ['classify.human', 'disclosure.delivered']) {
+      const res = await post(h, '/events', {
+        attempt_id: ATTEMPT,
+        event_type,
+        epoch: 2,
+        session_id: SESSION,
+      });
+      expect(res.status).toBe(200);
+    }
+    expect(h.heartbeatAttemptByEpoch).not.toHaveBeenCalled();
+    // The hint's ONE consumer: the disclosure started a recording; nothing
+    // else read it.
+    expect(h.startRecording).toHaveBeenCalledTimes(1);
   });
 
   it('a router built with NO renewal seam behaves identically', async () => {

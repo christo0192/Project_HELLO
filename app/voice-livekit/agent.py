@@ -1130,6 +1130,12 @@ async def _run_phone_session(
         classify=classify,
         say=say,
         start_recording=_phone_recording_permitted,
+        # The session hint for the server-side recording start: derived from
+        # the room name the dialer minted (`phone-<sessionId>`), the same
+        # derivation 0044's binding re-verifies. Without it the server's
+        # disclosure-time DB read finds no session (it is bound only at
+        # /assessment/start) and the egress silently never starts.
+        session_id=phone.session_id_from_room_name(room_name),
     )
 
     if not result.assessment_allowed:

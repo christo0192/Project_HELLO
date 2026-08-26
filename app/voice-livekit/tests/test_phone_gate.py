@@ -229,8 +229,8 @@ class FakeEventClient:
             outcome.next_heartbeat_seconds = phone.HEARTBEAT_FALLBACK_SEC
         return outcome
 
-    async def post_event(self, attempt_id, event_type, *, epoch=None):
-        self.calls.append((attempt_id, event_type, {"epoch": epoch}))
+    async def post_event(self, attempt_id, event_type, *, epoch=None, session_id=None):
+        self.calls.append((attempt_id, event_type, {"epoch": epoch, "session_id": session_id}))
         outcome = self._outcomes.get(event_type)
         if outcome is not None:
             return outcome
@@ -619,7 +619,7 @@ class TestEntrypointIsolation(unittest.TestCase):
 # ── The gate ──────────────────────────────────────────────────────────
 
 class TestPhoneGate(unittest.IsolatedAsyncioTestCase):
-    async def _gate(self, decision, *, participant=True, client=None, recorder=None):
+    async def _gate(self, decision, *, participant=True, client=None, recorder=None, session_id=None):
         recorder = recorder or Recorder()
         client = client or FakeEventClient()
 
@@ -643,8 +643,30 @@ class TestPhoneGate(unittest.IsolatedAsyncioTestCase):
             say=recorder.say,
             start_recording=recorder.start_recording,
             classify_timeout_sec=0.05,
+            session_id=session_id,
         )
         return result, client, recorder
+
+    async def test_disclosure_carries_the_session_hint_and_nothing_else_does(self):
+        """The recording ordering fix (2026-08-26): the server starts the
+        egress at `disclosure.delivered`, before /assessment/start binds the
+        session to the row, so the worker must forward the session it already
+        holds — on the disclosure, and ONLY the disclosure. classify.human is
+        a consent event, not a recording trigger, and widening the hint to
+        every event would turn a targeted fix into ambient plumbing."""
+        result, client, _ = await self._gate(
+            phone.CLASSIFY_HUMAN, session_id=_SESSION_ID,
+        )
+        self.assertTrue(result.recording_allowed)
+        by_type = {etype: kw for (_aid, etype, kw) in client.calls}
+        self.assertEqual(by_type["disclosure.delivered"]["session_id"], _SESSION_ID)
+        self.assertIsNone(by_type["classify.human"]["session_id"])
+
+    async def test_gate_without_a_hint_still_consents_with_none(self):
+        result, client, _ = await self._gate(phone.CLASSIFY_HUMAN)
+        self.assertTrue(result.recording_allowed)
+        by_type = {etype: kw for (_aid, etype, kw) in client.calls}
+        self.assertIsNone(by_type["disclosure.delivered"]["session_id"])
 
     async def test_no_participant_means_no_speech_no_event_no_recording(self):
         result, client, recorder = await self._gate(phone.CLASSIFY_HUMAN, participant=False)
@@ -976,6 +998,31 @@ class TestPhoneEventClient(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 set(request["json"]), {"attempt_id", "event_type", "epoch"}
             )
+
+    async def test_session_hint_is_sent_only_when_it_is_a_uuid(self):
+        """The session hint (recording ordering fix) widens the wire body to a
+        FOURTH key only when a well-formed session id is supplied. Anything
+        else is omitted, not nulled: the server schema is `.strict()` and the
+        absence of knowledge must look like absence, and a malformed value
+        must never reach a schema that would 400 the whole consent event."""
+        transport = _RecordingTransport()
+        with patch.dict(phone.os.environ, {"WORKER_CONTEXT_SECRET": _GOOD_SECRET}):
+            await self._client(transport).post_event(
+                _ATTEMPT_ID, "disclosure.delivered", session_id=_SESSION_ID,
+            )
+            await self._client(transport).post_event(
+                _ATTEMPT_ID, "disclosure.delivered", session_id="not-a-uuid",
+            )
+            await self._client(transport).post_event(
+                _ATTEMPT_ID, "disclosure.delivered",
+            )
+        bodies = [r["json"] for r in transport.requests]
+        self.assertEqual(bodies[0].get("session_id"), _SESSION_ID)
+        self.assertEqual(
+            set(bodies[0]), {"attempt_id", "event_type", "epoch", "session_id"}
+        )
+        for body in bodies[1:]:
+            self.assertEqual(set(body), {"attempt_id", "event_type", "epoch"})
 
     async def test_worker_allowlist_agrees_with_the_server(self):
         """L-4: the deferral event exists on both halves."""
