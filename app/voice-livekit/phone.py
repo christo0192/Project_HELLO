@@ -1136,12 +1136,23 @@ HALT_NO_ANSWER = "no_exchange_captured"
 # same, which is why both halt; the diagnosis is not.
 HALT_LEASE_LOST = "lease_lost"
 HALT_LEASE_UNCONFIRMED = "lease_unconfirmed"
+# A BOOKED CALLBACK. Not an infrastructure failure and not a candidate who went
+# quiet: the schedule_callback tool ran, the server said ok, and 0042 has
+# already moved the engagement to `scheduled` (in_call -> scheduled), so the
+# room close's participant_left drop-edge (gated on in_call) is a no-op — no
+# reconnect is charged and the redial happens at the booked slot. The leg must
+# post NOTHING: `assessment.aborted` would terminalise an engagement the
+# server just scheduled, and `assessment.completed` would be a lie.
+HALT_CALLBACK_SCHEDULED = "callback_scheduled"
 
 #: The halt reasons that must post NOTHING. Enumerated rather than inferred, so
 #: a new reason has to declare which kind it is instead of defaulting into the
 #: silent one.
+#: (`callback_scheduled` is in this set for its post-nothing PROPERTY, not
+#: because it is retryable: the booking already owns the engagement's future.)
 RETRYABLE_HALTS: frozenset[str] = frozenset([
     HALT_PERSISTENCE, HALT_SCORING, HALT_LEASE_LOST, HALT_LEASE_UNCONFIRMED,
+    HALT_CALLBACK_SCHEDULED,
 ])
 
 
@@ -1340,6 +1351,35 @@ def valid_boundary_turns(turns: Any) -> bool:
     return turns[-1].get("speaker") == "candidate"
 
 
+#: The phone-call policy appended to the assessment agent's instructions.
+#: The first live call proved its absence: the candidate said "I'm busy, call
+#: me tomorrow" and the model IMPROVISED a promise ("I'll send you a link")
+#: it has no ability to keep, while the question loop kept going. The policy
+#: names the one legitimate path and forbids the improvisation.
+PHONE_CALLBACK_POLICY_TEXT = (
+    "\n\nPhone-call policy (mandatory):\n"
+    "- If the candidate says they are busy, cannot talk, or asks to be called "
+    "back later, STOP asking interview questions immediately.\n"
+    "- Offer to book a callback and, once they name a time, call the "
+    "schedule_callback tool with that time. The tool speaks the confirmation "
+    "itself.\n"
+    "- Never promise links, emails, messages, or follow-ups of any kind: you "
+    "cannot send anything. Booking through schedule_callback is the ONLY "
+    "commitment you may make.\n"
+    "- If the tool refuses, say only what it said; do not improvise an "
+    "alternative promise.\n"
+    "- Ask one question at a time and wait for the answer. Never re-ask a "
+    "question the candidate has already answered; briefly acknowledge and "
+    "move on instead."
+)
+
+
+#: Prefix for a bot turn synthesised from the PLAN when the spoken ask was
+#: lost to an interruption. A constant so the dashboard and the scorer can
+#: recognise (and render/weigh) synthesis explicitly rather than heuristically.
+SYNTHESIZED_QUESTION_PREFIX = "[planned question] "
+
+
 def repair_exchange_shape(
     turns: Any, question_text: str | None,
 ) -> list[dict[str, str]]:
@@ -1387,7 +1427,16 @@ def repair_exchange_shape(
     if out and out[0].get("speaker") != "bot":
         text = (question_text or "").strip()
         if text:
-            out.insert(0, {"speaker": "bot", "text": text[:8000]})
+            # MARKED, not impersonated (first live transcript, 2026-08-26: the
+            # plan text is interviewer-directed meta-text — "Ask about X" — and
+            # inserting it bare made the transcript read as if the bot spoke
+            # its own stage directions). The prefix states what this turn IS:
+            # the planned question whose spoken phrasing was lost to an
+            # interruption. Scorer and dashboard both see an honest record.
+            out.insert(0, {
+                "speaker": "bot",
+                "text": (SYNTHESIZED_QUESTION_PREFIX + text)[:8000],
+            })
     return out
 
 
@@ -1484,6 +1533,7 @@ async def run_phone_assessment(
     state: PhoneAssessmentState,
     ask: Callable[[PhonePlanQuestion, int], Awaitable[Any]],
     say: Callable[[str], Awaitable[Any]],
+    booking_made: Callable[[], bool] | None = None,
     completion_attempts: int = 3,
     completion_backoff_sec: float = 1.0,
     sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
@@ -1504,7 +1554,30 @@ async def run_phone_assessment(
 
     # A plan that is already complete on arrival is a reconnect that dropped
     # between the last answer and the completion. Skip straight to completing.
+    def _callback_booked() -> bool:
+        try:
+            return booking_made is not None and bool(booking_made())
+        except Exception:  # noqa: BLE001
+            return False
+
     while cursor < len(state.questions):
+        # ── The booking exit (first live call, 2026-08-26) ────────────────
+        # The schedule_callback tool wrote to `bookings` and NOTHING read it:
+        # a candidate who said "I'm busy, call me tomorrow" got a confirmed
+        # booking AND four more interview questions. The loop now checks the
+        # signal before every ask and after every capture; a booked callback
+        # ends the leg with the post-nothing halt (the server already moved
+        # the engagement to `scheduled`).
+        if _callback_booked():
+            _log.info(
+                "unknown_event", error_type="phone_assessment_halted",
+                error_category=HALT_CALLBACK_SCHEDULED,
+            )
+            return PhoneAssessmentResult(
+                halted=True, halt_reason=HALT_CALLBACK_SCHEDULED,
+                cursor=cursor, completed=completed,
+            )
+
         question = state.question_at(cursor)
         if question is None:
             break
@@ -1518,6 +1591,16 @@ async def run_phone_assessment(
             )
             return PhoneAssessmentResult(
                 halted=True, halt_reason=HALT_NO_ANSWER, cursor=cursor, completed=completed,
+            )
+
+        if _callback_booked():
+            _log.info(
+                "unknown_event", error_type="phone_assessment_halted",
+                error_category=HALT_CALLBACK_SCHEDULED,
+            )
+            return PhoneAssessmentResult(
+                halted=True, halt_reason=HALT_CALLBACK_SCHEDULED,
+                cursor=cursor, completed=completed,
             )
 
         if not valid_boundary_turns(turns):

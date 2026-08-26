@@ -1380,12 +1380,95 @@ class _FakePhoneSession:
         if self.answers:
             reply = self.answers.pop(0)
             if reply is not None:
-                self.emit_user_turn(reply)
+                # AFTER playout, never inside it. The first live call proved
+                # the real timing: an un-interrupted ask's playout always
+                # finishes before the answer's STT final arrives, and the
+                # capture loop's playout fence drops any candidate final that
+                # predates it. A fake that answered synchronously here would
+                # be exercising a timing the fence exists to refuse.
+                import asyncio as _asyncio
+                _asyncio.get_event_loop().call_soon(self.emit_user_turn, reply)
         return _FakeSpeech()
 
     def emit_close(self, reason=None):
         handler = self.handlers.get("close")
         handler(types.SimpleNamespace(error=None, reason=reason))
+
+
+class TestPlayoutFence(unittest.IsolatedAsyncioTestCase):
+    """The boundary-drift defect from the first live call: STT finals lag
+    speech, so the tail of the PREVIOUS answer arrives while THIS question's
+    ask is playing out — and was captured into this boundary, drifting every
+    answer one question off and producing the "double answering" transcript.
+    The fence drops candidate finals already queued when playout completes."""
+
+    def _question(self):
+        return phone.PhonePlanQuestion("k1", "Ask about experience.", False, None)
+
+    async def test_a_stale_final_queued_during_playout_is_dropped(self):
+        exchange: "asyncio.Queue[dict[str, str]]" = asyncio.Queue()
+
+        async def generate(instructions):
+            # During playout: the ask's own bot line lands, and the PREVIOUS
+            # answer's late final arrives. The fence must keep the bot line
+            # and drop the stale candidate final.
+            exchange.put_nowait({"speaker": "bot", "text": "the ask"})
+            exchange.put_nowait({"speaker": "candidate", "text": "STALE tail"})
+
+        async def real_answer():
+            await asyncio.sleep(0)
+            exchange.put_nowait({"speaker": "candidate", "text": "the real answer"})
+
+        task = asyncio.ensure_future(real_answer())
+        turns = await agent_mod._ask_phone_question(
+            generate=generate,
+            exchange=exchange,
+            question=self._question(),
+            answer_timeout_sec=1.0,
+            follow_up=False,
+        )
+        await task
+        self.assertEqual(
+            turns,
+            [
+                {"speaker": "bot", "text": "the ask"},
+                {"speaker": "candidate", "text": "the real answer"},
+            ],
+        )
+
+    async def test_an_interrupting_answer_lands_after_the_fence_and_is_kept(self):
+        exchange: "asyncio.Queue[dict[str, str]]" = asyncio.Queue()
+
+        async def generate(instructions):
+            # Interruption cuts playout early: generate returns with NOTHING
+            # queued; the interrupting candidate's final lands afterwards.
+            return None
+
+        async def late_final():
+            await asyncio.sleep(0)
+            exchange.put_nowait({"speaker": "candidate", "text": "answered over the ask"})
+
+        task = asyncio.ensure_future(late_final())
+        turns = await agent_mod._ask_phone_question(
+            generate=generate,
+            exchange=exchange,
+            question=self._question(),
+            answer_timeout_sec=1.0,
+            follow_up=False,
+        )
+        await task
+        # The bot turn was lost to the interruption (repair_exchange_shape owns
+        # that); the answer itself must be captured, not fenced away.
+        self.assertEqual(turns, [{"speaker": "candidate", "text": "answered over the ask"}])
+
+    def test_the_booking_signal_has_a_reader_in_the_agent(self):
+        """Structural: the first live call's tool wrote `bookings` and nothing
+        read it. The assessment call site must wire `booking_made` from the
+        agent's bookings — a reader the signal cannot silently lose again."""
+        import inspect
+        src = inspect.getsource(agent_mod)
+        self.assertIn("booking_made=lambda", src)
+        self.assertIn('getattr(agent, "bookings"', src)
 
 
 class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
@@ -1901,7 +1984,7 @@ class TestInstructionDelivery(unittest.IsolatedAsyncioTestCase):
             ok = await agent_mod._apply_phone_instructions(agent, self._state())
         self.assertTrue(ok)
         self.assertEqual(len(agent.delivered), 1)
-        self.assertEqual(agent.delivered[0], "BUILT")
+        self.assertEqual(agent.delivered[0], "BUILT" + phone.PHONE_CALLBACK_POLICY_TEXT)
         self.assertEqual(
             flow.call_args.args[0],
             [{"id": "k1", "question": "First question?", "mandatory": True},
@@ -1936,7 +2019,7 @@ class TestInstructionDelivery(unittest.IsolatedAsyncioTestCase):
         with patch.object(agent_mod, "system_prompt", return_value="BUILT"):
             ok = await agent_mod._apply_phone_instructions(agent, self._state())
         self.assertTrue(ok)
-        self.assertEqual(agent.instructions, "BUILT")
+        self.assertEqual(agent.instructions, "BUILT" + phone.PHONE_CALLBACK_POLICY_TEXT)
 
     async def test_a_FAILED_delivery_is_reported_rather_than_swallowed(self):
         class HostileAgent:
@@ -1963,7 +2046,7 @@ class TestInstructionDelivery(unittest.IsolatedAsyncioTestCase):
         with patch.object(agent_mod, "system_prompt", return_value="BUILT"):
             ok = await agent_mod._apply_phone_instructions(agent, self._state())
         self.assertTrue(ok)
-        self.assertEqual(agent.instructions, "BUILT")
+        self.assertEqual(agent.instructions, "BUILT" + phone.PHONE_CALLBACK_POLICY_TEXT)
 
 
 # ── Number safety ─────────────────────────────────────────────────────

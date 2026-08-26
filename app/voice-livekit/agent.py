@@ -800,6 +800,37 @@ async def _ask_phone_question(
                 "Ask ONE short follow-up about what they just said, then stop. "
                 "Do not change the subject and do not say goodbye."
             )
+        # ── The playout fence (first live call, 2026-08-26) ──────────────
+        # STT finals lag speech. The tail of the PREVIOUS question's answer
+        # regularly arrives while THIS question's ask is playing out, and it
+        # was being captured into this boundary — every answer drifted one
+        # question off, and the model, seeing the stale answer in the new
+        # context, acknowledged it again and re-asked ("double answering").
+        # `generate` has awaited playout, so any CANDIDATE item queued right
+        # now predates this question and is dropped — a partial loss the
+        # previous boundary already tolerated, chosen over a misattribution
+        # the scorer would trust. Bot items are kept: the ask's own line may
+        # legitimately be queued already. A candidate who INTERRUPTS this ask
+        # is unaffected: interruption cuts playout early, and their final
+        # lands after this fence.
+        stale = 0
+        keep: list[dict[str, str]] = []
+        while not exchange.empty():
+            try:
+                fenced = exchange.get_nowait()
+            except asyncio.QueueEmpty:  # pragma: no cover - defensive
+                break
+            if fenced.get("speaker") == "candidate":
+                stale += 1
+            else:
+                keep.append(fenced)
+        for fenced in keep:
+            exchange.put_nowait(fenced)
+        if stale:
+            _log.info(
+                "unknown_event", error_type="phone_stale_finals_dropped",
+                error_category=str(stale),
+            )
         deadline = _monotonic() + answer_timeout_sec
         while len(turns) < 12:
             remaining = deadline - _monotonic()
@@ -851,6 +882,7 @@ async def _apply_phone_instructions(agent: Any, state: "phone.PhoneAssessmentSta
             questions=flow,
             interviewer_instructions=state.interviewer_instructions,
         )
+        text = text + phone.PHONE_CALLBACK_POLICY_TEXT
         resume = phone.render_resume_context(state.turns)
         if resume:
             text = f"{text}\n\n{resume}"
@@ -1330,6 +1362,14 @@ async def _run_phone_session(
                     state=state,
                     ask=ask,
                     say=say,
+                    # The schedule_callback tool records its outcomes on the
+                    # agent; a CONFIRMED booking (booked=True — the tool's own
+                    # fail-closed verdict, never prose) ends the leg. This is
+                    # the reader the signal never had.
+                    booking_made=lambda: any(
+                        bool(getattr(t, "booked", False))
+                        for t in (getattr(agent, "bookings", None) or [])
+                    ),
                 ),
                 timeout=SESSION_MAX_RESIDENCY_SEC,
             )
