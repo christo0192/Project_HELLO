@@ -89,6 +89,19 @@ begin
     return jsonb_build_object('status', 'session_candidate_mismatch');
   end if;
 
+  -- Candidate equality alone is not a room binding: one candidate can have
+  -- multiple sessions. Require the exact phone-session invariants established
+  -- by ensureSession and re-checked by start_phone_assessment. Without these,
+  -- a stale UUID-shaped hint could stamp an unrelated browser/old session for
+  -- the same candidate and make that session claim this egress.
+  if v_ses.mode is distinct from 'live'
+     or v_ses.external_call_id is distinct from ('phone-' || p_session_id::text) then
+    return jsonb_build_object('status', 'session_binding_mismatch');
+  end if;
+  if v_ses.status not in ('waiting', 'in_progress') then
+    return jsonb_build_object('status', 'session_not_active');
+  end if;
+
   if v_att.session_id is not null and v_att.session_id <> p_session_id then
     return jsonb_build_object('status', 'session_already_bound');
   end if;

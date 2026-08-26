@@ -357,7 +357,9 @@ export const STAMP_PHONE_SESSION_EGRESS_STATUSES = [
   'not_found',
   'recording_terminal',
   'session_already_bound',
+  'session_binding_mismatch',
   'session_candidate_mismatch',
+  'session_not_active',
   'session_not_found',
 ] as const;
 
