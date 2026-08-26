@@ -507,10 +507,20 @@ describe('the worker paths the Python agent posts to are actually mounted', () =
   const PHONE_PY = readFileSync(path.join(REPO, 'app/voice-livekit/phone.py'), 'utf8');
   const APP_TS = readFileSync(path.join(REPO, 'app/api/src/app.ts'), 'utf8');
 
-  /** `app.use('<mount>', phoneWorkerRouter)` — the ONE mount. */
+  /**
+   * `app.use('<mount>', express.json(...), phoneWorkerRouter)` — the ONE
+   * mount. The scoped body parser between the path and the router is
+   * LOAD-BEARING (the 2026-08-26 incident: the router sits above the global
+   * `express.json()`, so without its own parser every worker POST body arrived
+   * `undefined` and the consent gate 400'd on a live call), so the extractor
+   * matches it explicitly rather than tolerating arbitrary middleware — a
+   * mount that LOSES the parser must fail this extractor, not slip past it.
+   */
   function workerMount(): string {
-    const m = APP_TS.match(/app\.use\(\s*'([^']+)'\s*,\s*phoneWorkerRouter\s*\)/);
-    expect(m, 'the phone worker router mount could not be found in app.ts').not.toBeNull();
+    const m = APP_TS.match(
+      /app\.use\(\s*'([^']+)'\s*,\s*express\.json\([^)]*\)\s*,\s*phoneWorkerRouter\s*\)/,
+    );
+    expect(m, 'the phone worker router mount (with its scoped express.json body parser) could not be found in app.ts').not.toBeNull();
     return m![1];
   }
 
