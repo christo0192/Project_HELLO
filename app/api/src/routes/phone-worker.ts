@@ -113,6 +113,15 @@ const workerEventSchema = z
     attempt_id: z.string().regex(UUID_RE),
     event_type: z.enum(WORKER_PHONE_EVENTS),
     epoch: z.number().int().min(0).max(2_147_483_647).nullable().optional(),
+    // The SESSION HINT (recording ordering fix, 2026-08-26). The recording
+    // egress starts when `disclosure.delivered` is applied, but the session is
+    // bound to the attempt row only at /assessment/start — later — so the
+    // disclosure-time DB read found no session and the start silently skipped
+    // on EVERY call. The worker has the session from its dispatch metadata /
+    // room name and forwards it here; it is used ONLY as the fallback for
+    // deriving the room to record, never written to any row (0044's bind at
+    // /assessment/start remains the sole writer and re-verifies the binding).
+    session_id: z.string().regex(UUID_RE).nullable().optional(),
   })
   .strict();
 
@@ -415,13 +424,15 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       // spend most of it.
       //
       // It was removed when the SESSION became part of the heartbeat fence.
-      // This route's payload carries an attempt id and an epoch but no
-      // session, so renewing from here would mean either passing a session
-      // the caller never named, or making the fence optional — and a fence
-      // that is optional for one caller is a fence a reviewer stops trusting
-      // for all of them. Resolving the attempt's session with an extra read
-      // would work, but it buys a window of seconds at the cost of a read on
-      // the hottest authenticated path in the lane.
+      // Since the recording ordering fix (2026-08-26) this route's payload MAY
+      // carry a `session_id` — but it is a HINT whose one consumer is the
+      // recording starter below, and it must never become the renewal's
+      // session: the worker names it for room derivation, not as a fence
+      // credential, and a fence satisfied by a field the same caller supplies
+      // for another purpose is a fence a reviewer stops trusting. Renewal
+      // still requires the /attempt/heartbeat door and its epoch fence, and
+      // the route test pins that no event — session hint or not — reaches the
+      // renewal seam.
       //
       // AND THE WINDOW IS NOW CLOSED WHERE IT BELONGED — at the lease, not
       // with a second renewal path. `PHONE_BOUNDS.leaseSeconds` defaults to
@@ -454,7 +465,12 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
         && result.status === 'applied'
         && deps.startRecording !== undefined
       ) {
-        await startRecordingForAttempt(parsed.data.attempt_id, deps, now());
+        await startRecordingForAttempt(
+          parsed.data.attempt_id,
+          deps,
+          now(),
+          parsed.data.session_id ?? undefined,
+        );
       }
 
       // ── `ok` MEANS APPLIED. `ignored` IS NOT `ok`. ──────────────────
@@ -892,16 +908,33 @@ async function startRecordingForAttempt(
   attemptId: string,
   deps: PhoneWorkerRouterDeps,
   now: Date,
+  sessionIdHint?: string,
 ): Promise<void> {
   try {
     const resolved = deps.resolveEngagement
       ? await deps.resolveEngagement(attemptId)
       : null;
-    if (resolved === null || resolved.sessionId === undefined) return;
+    if (resolved === null) return;
+    // The DB binding is the authority when it exists; the worker's hint covers
+    // the window before /assessment/start binds it (which is exactly when the
+    // disclosure fires). Without the hint, this skipped SILENTLY on every call
+    // — the console.warn below is the tripwire that must never let that class
+    // of nothing-happened hide again. Sanitized: a stable code and a uuid.
+    const sessionId = resolved.sessionId ?? sessionIdHint;
+    if (sessionId === undefined) {
+      console.warn(JSON.stringify({
+        level: 'warn',
+        component: 'phone-worker',
+        event: 'phone_recording_skipped',
+        error_category: 'no_session_for_attempt',
+        attempt_id: attemptId,
+      }));
+      return;
+    }
     await deps.startRecording?.({
       engagementId: resolved.engagementId,
       attemptId,
-      roomName: phoneRoomName(resolved.sessionId),
+      roomName: phoneRoomName(sessionId),
       now,
     });
   } catch {

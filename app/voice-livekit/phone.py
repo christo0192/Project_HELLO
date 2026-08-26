@@ -719,6 +719,7 @@ class PhoneEventClient:
         event_type: str,
         *,
         epoch: int | None = None,
+        session_id: str | None = None,
     ) -> PhoneApiOutcome:
         """Post one worker event. Fails closed on anything but a confirmed 200.
 
@@ -740,6 +741,18 @@ class PhoneEventClient:
             "event_type": event_type,
             "epoch": epoch,
         }
+        # The SESSION HINT (recording ordering fix, 2026-08-26). The server
+        # starts the recording egress when `disclosure.delivered` is APPLIED,
+        # but the session is not bound to the attempt row until
+        # `/assessment/start` — later than the disclosure — so its DB read
+        # came back empty and the recording start silently skipped on EVERY
+        # call. The worker has known the session all along (dispatch metadata
+        # and the `phone-<session>` room name), so it forwards it; the server
+        # uses it only as the fallback for deriving the room to record. Omitted
+        # entirely when absent: the server schema treats it as optional, and a
+        # null key would say "I know it is null" rather than "I do not know".
+        if session_id is not None and _UUID_RE.match(str(session_id).strip()):
+            body["session_id"] = str(session_id).strip()
 
         response = await self._post(EVENTS_PATH, body, "event")
         if isinstance(response, str):
@@ -1956,6 +1969,7 @@ async def run_phone_gate(
     start_recording: Optional[Callable[[], Awaitable[Any]]] = None,
     epoch: int | None = None,
     classify_timeout_sec: float | None = None,
+    session_id: str | None = None,
 ) -> PhoneGateResult:
     """Run the phone screening's opening, in the ONLY order that is safe.
 
@@ -2035,7 +2049,7 @@ async def run_phone_gate(
     events.append("classify.human")
 
     disclosure = await client.post_event(
-        attempt_id, "disclosure.delivered", epoch=epoch,
+        attempt_id, "disclosure.delivered", epoch=epoch, session_id=session_id,
     )
     if not event_applied(disclosure):
         # Consent was given on the wire but not recorded. Proceeding would score
