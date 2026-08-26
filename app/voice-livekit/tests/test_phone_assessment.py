@@ -292,7 +292,7 @@ class TestRepairExchangeShape(unittest.TestCase):
 
 
 class TestRunPhoneAssessment(unittest.TestCase):
-    def _run_loop(self, *, state=None, client=None, asks=None, ask=None, booking_made=None):
+    def _run_loop(self, *, state=None, client=None, asks=None, ask=None, booking_made=None, candidate_requested_end=None):
         client = client or ScriptedClient()
         spoken: list[str] = []
         asked: list[str] = []
@@ -317,6 +317,7 @@ class TestRunPhoneAssessment(unittest.TestCase):
             ask=ask or default_ask,
             say=say,
             booking_made=booking_made,
+            candidate_requested_end=candidate_requested_end,
         ))
         return result, client, asked, spoken
 
@@ -352,6 +353,26 @@ class TestRunPhoneAssessment(unittest.TestCase):
         self.assertEqual(result.halt_reason, phone.HALT_CALLBACK_SCHEDULED)
         self.assertEqual(asked, [])
         self.assertEqual(client.keys, [])
+
+    def test_an_explicit_end_call_request_stops_before_another_question(self):
+        ended = {"value": False}
+
+        async def ask_and_end(question, cursor):
+            ended["value"] = True
+            return [
+                {"speaker": "bot", "text": "Are you still there?"},
+                {"speaker": "candidate", "text": "Please disconnect the call."},
+            ]
+
+        result, client, _, _ = self._run_loop(
+            ask=ask_and_end,
+            candidate_requested_end=lambda: ended["value"],
+        )
+        self.assertTrue(result.halted)
+        self.assertEqual(result.halt_reason, phone.HALT_CANDIDATE_ENDED)
+        self.assertFalse(phone.halt_is_retryable(result.halt_reason))
+        self.assertEqual(client.keys, [])
+        self.assertEqual(client.completions, [])
 
     def test_a_raising_booking_signal_reads_as_no_booking(self):
         def boom():
@@ -489,8 +510,11 @@ class TestHaltTaxonomy(unittest.TestCase):
             # already moved the engagement to `scheduled` — not because it is
             # retryable in any sense.
             phone.HALT_CALLBACK_SCHEDULED,
+            # Explicitly ending this call is terminal but not a future-contact
+            # opt-out, so it is classified outside the post-nothing family.
+            phone.HALT_CANDIDATE_ENDED,
         }
-        self.assertEqual(len(declared), 7)
+        self.assertEqual(len(declared), 8)
         self.assertTrue(phone.RETRYABLE_HALTS.issubset(declared))
         self.assertTrue(phone.halt_is_retryable(phone.HALT_LEASE_LOST))
         self.assertTrue(phone.halt_is_retryable(phone.HALT_LEASE_UNCONFIRMED))

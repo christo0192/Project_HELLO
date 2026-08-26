@@ -1074,6 +1074,7 @@ async def _run_phone_session(
     # later edit can forget to apply.
     exchange: "asyncio.Queue[dict[str, str]]" = asyncio.Queue()
     candidate_activity = asyncio.Event()
+    candidate_end_requested = asyncio.Event()
     close_event = asyncio.Event()
     close_reason: dict[str, Any] = {}
 
@@ -1093,10 +1094,13 @@ async def _run_phone_session(
         text = _item_text(item)
         if not text:
             return
+        # Candidate turns are delivered by PhoneScreeningAgent's
+        # on_user_turn_completed hook. That hook commits the turn to context,
+        # feeds both queues, and raises StopResponse so LiveKit cannot generate
+        # an autonomous second answer beside the scripted assessment loop.
         if role == "user":
-            candidate_activity.set()
-            user_turns.put_nowait(text)
-        elif phone.is_gate_copy(text):
+            return
+        if phone.is_gate_copy(text):
             # FIXED COPY IS NOT A SCREENING TURN. The disclosure, the re-ask,
             # every refusal closing, the callback confirmations and the closing
             # line are all spoken through `session.say`, which appends a
@@ -1121,6 +1125,13 @@ async def _run_phone_session(
         if callable(wait_for_playout):
             await wait_for_playout()
 
+    def on_candidate_turn(text: str) -> None:
+        candidate_activity.set()
+        user_turns.put_nowait(text)
+        exchange.put_nowait({"speaker": "candidate", "text": text})
+        if phone.is_explicit_end_call_request(text):
+            candidate_end_requested.set()
+
     agent = phone.phone_agent_class(Agent)(
         # The prompt is built AFTER the gate, once the plan is known — see
         # `_start_phone_assessment` below. Until then the agent carries the
@@ -1133,6 +1144,7 @@ async def _run_phone_session(
         client=events,
         attempt_id=attempt_id,
         say=say,
+        on_user_turn=on_candidate_turn,
     )
 
     async def wait_for_participant() -> Any:
@@ -1370,6 +1382,7 @@ async def _run_phone_session(
                         bool(getattr(t, "booked", False))
                         for t in (getattr(agent, "bookings", None) or [])
                     ),
+                    candidate_requested_end=candidate_end_requested.is_set,
                 ),
                 timeout=SESSION_MAX_RESIDENCY_SEC,
             )

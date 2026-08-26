@@ -40,6 +40,7 @@ This module never enumerates a participant attribute map and never logs one.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -1144,6 +1145,10 @@ HALT_LEASE_UNCONFIRMED = "lease_unconfirmed"
 # post NOTHING: `assessment.aborted` would terminalise an engagement the
 # server just scheduled, and `assessment.completed` would be a lie.
 HALT_CALLBACK_SCHEDULED = "callback_scheduled"
+# The candidate explicitly asked to end THIS call. This is not an opt-out from
+# future contact, so it must not write the digest suppression used by
+# `candidate.opt_out`; the assessment is aborted and the room is closed.
+HALT_CANDIDATE_ENDED = "candidate_ended_call"
 
 #: The halt reasons that must post NOTHING. Enumerated rather than inferred, so
 #: a new reason has to declare which kind it is instead of defaulting into the
@@ -1534,6 +1539,7 @@ async def run_phone_assessment(
     ask: Callable[[PhonePlanQuestion, int], Awaitable[Any]],
     say: Callable[[str], Awaitable[Any]],
     booking_made: Callable[[], bool] | None = None,
+    candidate_requested_end: Callable[[], bool] | None = None,
     completion_attempts: int = 3,
     completion_backoff_sec: float = 1.0,
     sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
@@ -1560,7 +1566,21 @@ async def run_phone_assessment(
         except Exception:  # noqa: BLE001
             return False
 
+    def _candidate_ended() -> bool:
+        try:
+            return candidate_requested_end is not None and bool(candidate_requested_end())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _ended_result() -> PhoneAssessmentResult:
+        return PhoneAssessmentResult(
+            halted=True, halt_reason=HALT_CANDIDATE_ENDED,
+            cursor=cursor, completed=completed,
+        )
+
     while cursor < len(state.questions):
+        if _candidate_ended():
+            return _ended_result()
         # ── The booking exit (first live call, 2026-08-26) ────────────────
         # The schedule_callback tool wrote to `bookings` and NOTHING read it:
         # a candidate who said "I'm busy, call me tomorrow" got a confirmed
@@ -1602,6 +1622,9 @@ async def run_phone_assessment(
                 halted=True, halt_reason=HALT_CALLBACK_SCHEDULED,
                 cursor=cursor, completed=completed,
             )
+
+        if _candidate_ended():
+            return _ended_result()
 
         if not valid_boundary_turns(turns):
             # No answer was captured, or the exchange is not a completed
@@ -2163,6 +2186,18 @@ async def run_phone_gate(
 # ── The phone agent ───────────────────────────────────────────────────
 
 
+_END_CALL_RE = re.compile(
+    r"\b(?:disconnect|hang\s*up|end|stop)\s+(?:the\s+|this\s+)?call\b|"
+    r"\b(?:please\s+)?(?:disconnect|hang\s*up)\b",
+    re.IGNORECASE,
+)
+
+
+def is_explicit_end_call_request(text: Any) -> bool:
+    """Recognise an unambiguous request to end the current call only."""
+    return isinstance(text, str) and _END_CALL_RE.search(text) is not None
+
+
 def phone_agent_class(agent_base: Any) -> Any:
     """Build the phone Agent subclass over the SDK's ``Agent``.
 
@@ -2181,12 +2216,38 @@ def phone_agent_class(agent_base: Any) -> Any:
             client: PhoneEventClient,
             attempt_id: str,
             say: Callable[[str], Awaitable[Any]],
+            on_user_turn: Callable[[str], Any] | None = None,
         ) -> None:
             super().__init__(instructions=instructions)
             self._client = client
             self._attempt_id = attempt_id
             self._say = say
+            self._on_user_turn = on_user_turn
             self.bookings: list[ScheduleTurn] = []
+
+        async def on_user_turn_completed(self, turn_ctx: Any, new_message: Any) -> None:
+            """Persist the user turn but suppress LiveKit's automatic reply.
+
+            The phone assessment loop is the sole response scheduler and calls
+            ``session.generate_reply`` for exactly one planned question. The
+            SDK otherwise generates a second autonomous reply after every user
+            turn, producing the observed acknowledgment + next-question pairs.
+            """
+            items = getattr(turn_ctx, "items", None)
+            if not isinstance(items, list):
+                raise RuntimeError("phone_turn_context_unavailable")
+            items.append(new_message)
+            await self.update_chat_ctx(turn_ctx)
+            text = getattr(new_message, "text_content", "")
+            if self._on_user_turn is not None and isinstance(text, str) and text.strip():
+                observed = self._on_user_turn(text.strip())
+                if inspect.isawaitable(observed):
+                    await observed
+            # This is the SDK-supported escape hatch consumed by
+            # AgentActivity._user_turn_completed_task. The user message is
+            # already committed above; only the automatic generation stops.
+            from livekit.agents import StopResponse  # noqa: PLC0415
+            raise StopResponse()
 
         @_tool
         async def schedule_callback(
