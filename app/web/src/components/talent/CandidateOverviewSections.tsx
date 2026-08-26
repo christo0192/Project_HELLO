@@ -18,7 +18,7 @@
 import { useId } from 'react';
 import type { ReactNode } from 'react';
 import { Link } from 'react-router-dom';
-import type { CandidateDetail, Note, Session } from '../../types';
+import type { CandidateDetail, CandidateResumeFacts, Note, Session } from '../../types';
 import { StatusBadge } from '../design';
 import { SurfaceCard, Tag } from '../design/candidate';
 import {
@@ -100,6 +100,7 @@ export function CandidateProfileCard({
           </dd>
         </div>
       </dl>
+      <ResumeEvidence facts={candidate.parsed} />
       {footnote && (
         <SurfaceCard level="sunken" className="mt-5 p-3">
           <p className="max-w-prose text-xs leading-relaxed text-ink-secondary">
@@ -108,6 +109,39 @@ export function CandidateProfileCard({
         </SurfaceCard>
       )}
     </SurfaceCard>
+  );
+}
+
+function ResumeEvidence({ facts }: { facts?: CandidateResumeFacts | null }) {
+  if (!facts) return null;
+  const recent = facts.recent_role;
+  const recentLabel = recent
+    ? [recent.title, recent.employer, recent.period].filter(Boolean).join(' · ')
+    : facts.current_role;
+  const prior = (facts.prior_roles ?? []).map((role) =>
+    [role.title, role.employer, role.period].filter(Boolean).join(' · '),
+  ).filter(Boolean);
+  const listSection = (label: string, values?: string[]) => values && values.length > 0 ? (
+    <div>
+      <dt className="mb-1 text-xs font-medium text-ink-secondary">{label}</dt>
+      <dd className="text-sm leading-relaxed text-ink">{values.join(' · ')}</dd>
+    </div>
+  ) : null;
+  const hasEvidence = recentLabel || prior.length || (facts.career_highlights?.length ?? 0) ||
+    (facts.education?.length ?? 0) || (facts.certifications?.length ?? 0) || facts.summary;
+  if (!hasEvidence) return null;
+  return (
+    <div className="mt-5 border-t border-line pt-4">
+      <h3 className="mb-3 text-xs font-semibold uppercase tracking-wide text-ink-secondary">Resume evidence</h3>
+      <dl className="space-y-3">
+        {recentLabel && <Field label="Latest role"><span className="text-right">{recentLabel}</span></Field>}
+        {prior.length > 0 && <div><dt className="mb-1 text-xs font-medium text-ink-secondary">Previous roles</dt><dd className="space-y-1 text-sm text-ink">{prior.map((role, i) => <div key={`${role}-${i}`}>{role}</div>)}</dd></div>}
+        {listSection('Career highlights', facts.career_highlights)}
+        {listSection('Education', facts.education)}
+        {listSection('Certifications', facts.certifications)}
+        {facts.summary && <div><dt className="mb-1 text-xs font-medium text-ink-secondary">Summary</dt><dd className="text-sm leading-relaxed text-ink">{facts.summary}</dd></div>}
+      </dl>
+    </div>
   );
 }
 
