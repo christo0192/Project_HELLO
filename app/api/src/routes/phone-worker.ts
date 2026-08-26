@@ -225,6 +225,20 @@ export interface PhoneWorkerRouterDeps {
     sessionId?: string;
   } | null>;
   /**
+   * Server-side association check for the worker's SESSION HINT (independent
+   * review of the recording ordering fix): a hint is only a room-derivation
+   * fallback, and a stale, mismatched or hostile hint must not be able to
+   * point the egress at another conversation's room. True iff the hinted
+   * session belongs to the SAME CANDIDATE as the attempt's engagement — the
+   * binding `ensureSession` established at dial time and 0044 re-verifies at
+   * /assessment/start. FAIL-CLOSED: when this seam is absent, a hint is
+   * unusable and the recording is skipped (and logged), never trusted.
+   */
+  readonly verifySessionHint?: (input: {
+    sessionId: string;
+    engagementId: string;
+  }) => Promise<boolean>;
+  /**
    * Starts THIS attempt's recording. Called on exactly one event —
    * `disclosure.delivered` — and never on any other, because that is the only
    * transition after which a candidate has been told they are being recorded
@@ -920,7 +934,32 @@ async function startRecordingForAttempt(
     // disclosure fires). Without the hint, this skipped SILENTLY on every call
     // — the console.warn below is the tripwire that must never let that class
     // of nothing-happened hide again. Sanitized: a stable code and a uuid.
-    const sessionId = resolved.sessionId ?? sessionIdHint;
+    let sessionId = resolved.sessionId;
+    if (sessionId === undefined && sessionIdHint !== undefined) {
+      // The hint is worker-supplied and only UUID-shaped by schema. Before it
+      // may name the room to record, the server verifies the association the
+      // DB can already prove: the hinted session was provisioned for this
+      // attempt's candidate (`ensureSession` at dial time). Absent seam or
+      // failed check both refuse — a recording of the wrong room is the exact
+      // harm this phase exists to prevent, so the default direction is closed.
+      const verified = deps.verifySessionHint !== undefined
+        && await deps.verifySessionHint({
+          sessionId: sessionIdHint,
+          engagementId: resolved.engagementId,
+        });
+      if (verified) {
+        sessionId = sessionIdHint;
+      } else {
+        console.warn(JSON.stringify({
+          level: 'warn',
+          component: 'phone-worker',
+          event: 'phone_recording_skipped',
+          error_category: 'session_hint_unverified',
+          attempt_id: attemptId,
+        }));
+        return;
+      }
+    }
     if (sessionId === undefined) {
       console.warn(JSON.stringify({
         level: 'warn',
@@ -961,6 +1000,34 @@ async function startRecordingForAttempt(
  *     recording more than promised is the failure this phase exists to prevent.
  */
 export const phoneWorkerRouter = createPhoneWorkerRouter({
+  async verifySessionHint({ sessionId, engagementId }) {
+    // Two narrow reads, both by primary key, both fail-closed: any error, any
+    // missing row, any null candidate refuses the hint. The predicate is the
+    // one `ensureSession` established at dial time — the session was
+    // provisioned/adopted FOR THIS CANDIDATE — so a hint that names any other
+    // conversation's session cannot pass it.
+    try {
+      const eng = await (supabase as never as {
+        from(t: string): {
+          select(c: string): {
+            eq(k: string, v: string): { maybeSingle(): Promise<{ data: { candidate_id?: string } | null; error: unknown }> };
+          };
+        };
+      }).from('phone_engagements').select('candidate_id').eq('id', engagementId).maybeSingle();
+      if (eng.error || !eng.data?.candidate_id) return false;
+      const ses = await (supabase as never as {
+        from(t: string): {
+          select(c: string): {
+            eq(k: string, v: string): { maybeSingle(): Promise<{ data: { candidate_id?: string } | null; error: unknown }> };
+          };
+        };
+      }).from('call_sessions').select('candidate_id').eq('id', sessionId).maybeSingle();
+      if (ses.error || !ses.data?.candidate_id) return false;
+      return ses.data.candidate_id === eng.data.candidate_id;
+    } catch {
+      return false;
+    }
+  },
   async resolveEngagement(attemptId) {
     const context = await createPhoneReadStore(supabase as never).getAttemptContext({
       attemptId,
