@@ -87,6 +87,48 @@ describe('POST /api/internal/phone/events — body parser is wired at the real m
     expect(res.body.error).toBe('invalid_request');
   });
 
+  it('accepts a near-maximum schema-valid /assessment/turn payload (limit covers the schema, not a guess)', async () => {
+    // Independent review of the first draft caught the limit set to 64kb while
+    // the turn schema admits 12 turns x 8,000 chars — ~96KB of text in plain
+    // ASCII before JSON overhead, more in UTF-8 or escaped form. This pins the
+    // reconciliation: a payload at the schema's ceiling must never die at the
+    // parser. (ASCII here already exceeds the old 64kb, so a regression to any
+    // limit below the schema maximum turns this red.)
+    const turns = Array.from({ length: 12 }, (_, i) => ({
+      speaker: i % 2 === 0 ? 'bot' : 'candidate',
+      text: 'a'.repeat(8_000),
+    }));
+    const res = await request(app())
+      .post('/api/internal/phone/assessment/turn')
+      .set('Authorization', `Bearer ${SECRET}`)
+      .set('Content-Type', 'application/json')
+      .send({
+        session_id: ATTEMPT,
+        question_key: 'q1',
+        expected_index: 0,
+        source_event_id: 'evt-1',
+        turns,
+      });
+
+    // Parser must not reject it (413) and schema must accept it (not
+    // invalid_request). A downstream store/DB failure (500) is fine — it
+    // proves the body was parsed and validated.
+    expect(res.status).not.toBe(413);
+    expect(res.body?.status).not.toBe('invalid_request');
+  });
+
+  it('still rejects an over-limit body intentionally (413), so the limit exists at all', async () => {
+    // Positive control on the OTHER side: the limit is real, not unbounded.
+    // ~1.2MB of body comfortably exceeds the 1mb limit.
+    const res = await request(app())
+      .post('/api/internal/phone/assessment/turn')
+      .set('Authorization', `Bearer ${SECRET}`)
+      .set('Content-Type', 'application/json')
+      .send({ session_id: ATTEMPT, question_key: 'q1', expected_index: 0, source_event_id: 'evt-1', turns: [{ speaker: 'bot', text: 'x'.repeat(1_300_000) }, { speaker: 'candidate', text: 'y' }] });
+
+    expect(res.status).toBe(413);
+  });
+
   it('rejects the body-parser limit being absent by proving a JSON body round-trips at all', async () => {
     // A second positive control on a different route that also parses a body:
     // the heartbeat. Same wiring, same parser — if the mount ever loses its

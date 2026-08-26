@@ -230,9 +230,18 @@ export function createApp(opts: CreateAppOptions = {}) {
   // this line `req.body` is `undefined` at this router and every worker POST
   // fails schema validation with a flat 400 — which the worker reads as a 4xx
   // `business_error` and, on `classify.human`, hangs up the live call at the
-  // consent gate. The limit is small on purpose: these payloads are a handful
-  // of ids and a closed-vocabulary event type, never bulk data.
-  app.use('/api/internal/phone', express.json({ limit: '64kb' }), phoneWorkerRouter);
+  // consent gate.
+  //
+  // The limit is DERIVED FROM THE SCHEMA, not guessed (an earlier draft said
+  // 64kb because "these payloads are a handful of ids" — false for
+  // `/assessment/turn`, whose schema admits 12 turns x 8,000 chars = 96,000
+  // chars of transcript text). `express.json`'s limit counts RAW WIRE BYTES:
+  // worst schema-valid case is 96,000 chars at up to 6 bytes each once
+  // JSON-escaped (`\uXXXX`), ~563 KiB, plus a small envelope. 1mb covers that
+  // with headroom and is still half the global 2mb parser. Changing the turn
+  // schema's bounds means re-deriving this number — the regression test pins
+  // a near-maximum payload so the two cannot drift apart silently.
+  app.use('/api/internal/phone', express.json({ limit: '1mb' }), phoneWorkerRouter);
 
   // Inbound Ashby webhook receiver. Mounted before recruiter auth because its
   // trust boundary is the HMAC-SHA256 Ashby-Signature verified over the raw
