@@ -116,6 +116,7 @@ export const PHONE_RPC_PARAMETERS: Readonly<Record<PhoneRpcName, readonly string
       'p_session_id',
       'p_attempt_id',
       'p_egress_id',
+      'p_egress_started_at_ms',
       'p_now',
     ],
     finalize_phone_attempt_recording: [
@@ -354,6 +355,7 @@ export const STAMP_PHONE_SESSION_EGRESS_STATUSES = [
   'ok',
   'egress_already_bound',
   'invalid_egress_id',
+  'invalid_egress_started_at',
   'not_found',
   'recording_terminal',
   'session_already_bound',
@@ -532,7 +534,7 @@ export const PHONE_RPC_STATUS_UNION: readonly string[] = Object.freeze(
  * union, which is the whole reason the increment is smaller than the number
  * of RPCs added.
  */
-export const PHONE_RPC_STATUS_COUNT = 75;
+export const PHONE_RPC_STATUS_COUNT = 76;
 
 /**
  * RESULT KEYS the API's behaviour DEPENDS on, per RPC.

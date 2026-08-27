@@ -261,7 +261,12 @@ function projectAssessmentState(
       const speaker = member<'bot' | 'candidate'>(t, 'speaker', ['bot', 'candidate']);
       const text = str(t, 'text');
       if (turnIndex === undefined || speaker === undefined || text === undefined) continue;
-      turns.push({ turnIndex, speaker, text });
+      turns.push({
+        turnIndex,
+        speaker,
+        text,
+        turnStartedAtMs: num(t, 'turn_started_at_ms') ?? null,
+      });
     }
   }
 
@@ -650,6 +655,7 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
         p_session_id: input.sessionId,
         p_attempt_id: input.attemptId,
         p_egress_id: input.egressId,
+        p_egress_started_at_ms: input.egressStartedAtMs ?? null,
         p_now: isoInstant(input.now),
       });
       if (error) throw new Error('phone_stamp_session_egress_error');
@@ -770,7 +776,11 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
         // Serialized here rather than passed through, so nothing but
         // `speaker` and `text` can reach the database however the caller
         // shaped its objects.
-        p_turns: input.turns.map((t) => ({ speaker: t.speaker, text: t.text })),
+        p_turns: input.turns.map((t) => ({
+          speaker: t.speaker,
+          text: t.text,
+          turn_started_at_ms: t.turnStartedAtMs ?? null,
+        })),
         p_now: isoInstant(input.now),
       });
       if (error) throw new Error('phone_commit_boundary_error');

@@ -50,7 +50,7 @@ export interface PhoneEgressClientLike {
     roomName: string,
     output: unknown,
     options?: { audioOnly?: boolean; videoOnly?: boolean },
-  ): Promise<{ egressId?: string }>;
+  ): Promise<{ egressId?: string; startedAt?: bigint | null }>;
   stopEgress(egressId: string): Promise<unknown>;
 }
 
@@ -60,6 +60,12 @@ export interface PhoneEgressClientLike {
  * objects, and so this module names no SDK symbol at all.
  */
 export type PhoneEgressOutputFactory = (objectKey: string) => unknown | Promise<unknown>;
+
+function normalizeEgressStartedAtMs(value: bigint | null | undefined): number | null {
+  if (typeof value !== 'bigint' || value <= 0n) return null;
+  const ms = Number(value / 1_000_000n);
+  return Number.isSafeInteger(ms) && ms > 0 && ms < 4_102_444_800_000 ? ms : null;
+}
 
 export const PHONE_RECORDING_STATUSES = [
   'started',
@@ -88,6 +94,8 @@ export interface StartPhoneRecordingResult {
    */
   readonly sessionStamped?: boolean;
   readonly stampStatus?: string;
+  /** LiveKit's provider-reported start anchor, when supplied by the SDK. */
+  readonly egressStartedAtMs?: number | null;
 }
 
 export interface StartPhoneRecordingInput {
@@ -154,6 +162,7 @@ export async function startPhoneAttemptRecording(
 
   // ── STEP 2. Only now may audio be captured. ─────────────────────────
   let egressId: string | undefined;
+  let egressStartedAtMs: number | null = null;
   try {
     const info = await deps.egress.startRoomCompositeEgress(
       input.roomName,
@@ -163,6 +172,7 @@ export async function startPhoneAttemptRecording(
       { audioOnly: true, videoOnly: false },
     );
     egressId = typeof info.egressId === 'string' ? info.egressId : undefined;
+    egressStartedAtMs = normalizeEgressStartedAtMs(info.startedAt);
   } catch {
     // The binding exists and the egress does not. That is the SAFE asymmetry:
     // the purge enumerates by binding, so it will look for an object that may
@@ -180,6 +190,9 @@ export async function startPhoneAttemptRecording(
     return { status: 'orphaned', role, objectKey, manifestKey, egressStarted: true };
   }
 
+  // The provider response is the only trustworthy recording origin. Do not
+  // substitute the request time: the egress may start after the RPC returns,
+  // and that drift is visible when a recruiter seeks the MP3.
   // ── STEP 3. Record the provider's identifier. ───────────────────────
   await deps.stores.finalizeAttemptRecording({
     attemptId: input.attemptId,
@@ -204,6 +217,7 @@ export async function startPhoneAttemptRecording(
       sessionId: input.sessionId,
       attemptId: input.attemptId,
       egressId,
+      egressStartedAtMs,
       now: input.now,
     });
     stampStatus = stamped.status;
@@ -215,6 +229,7 @@ export async function startPhoneAttemptRecording(
     status: 'started', role, objectKey, manifestKey, egressId, egressStarted: true,
     sessionStamped: stampStatus === 'ok',
     stampStatus,
+    egressStartedAtMs,
   };
 }
 

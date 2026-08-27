@@ -941,7 +941,7 @@ class PhoneEventClient:
         question_key: str,
         expected_index: int,
         source_event_id: str,
-        turns: list[dict[str, str]],
+        turns: list[dict[str, Any]],
     ) -> PhoneApiOutcome:
         """Commit ONE completed question boundary.
 
@@ -1387,11 +1387,12 @@ PHONE_CALLBACK_POLICY_TEXT = (
 #: lost to an interruption. A constant so the dashboard and the scorer can
 #: recognise (and render/weigh) synthesis explicitly rather than heuristically.
 SYNTHESIZED_QUESTION_PREFIX = "[planned question] "
+INTERRUPTED_QUESTION_PREFIX = "[interrupted question] "
 
 
 def repair_exchange_shape(
     turns: Any, question_text: str | None,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     """Repair the two capture artefacts REAL telephony produces, and only those.
 
     The first live canary call (2026-08-26) ended `malformed_exchange` because
@@ -1442,6 +1443,9 @@ def repair_exchange_shape(
             # its own stage directions). The prefix states what this turn IS:
             # the planned question whose spoken phrasing was lost to an
             # interruption. Scorer and dashboard both see an honest record.
+            # The interrupted assistant item normally supplies its own anchor;
+            # if it was not emitted by the SDK, the boundary remains accurately
+            # untimed rather than being assigned a made-up clock.
             out.insert(0, {
                 "speaker": "bot",
                 "text": (SYNTHESIZED_QUESTION_PREFIX + text)[:8000],
@@ -2272,6 +2276,29 @@ def has_substantive_candidate_answer(turns: Any) -> bool:
     )
 
 
+def _message_text(message: Any) -> str:
+    """Read the complete text surface exposed by LiveKit ChatMessage.
+
+    The SDK's normal surface is ``text_content``. A few provider/test message
+    shapes expose content parts instead, so falling back to every text-bearing
+    part prevents the first or last fragment from disappearing at the adapter
+    boundary.
+    """
+    text = getattr(message, "text_content", None)
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    content = getattr(message, "content", None) or []
+    parts: list[str] = []
+    for part in content:
+        if isinstance(part, str):
+            parts.append(part)
+        else:
+            value = getattr(part, "text", None)
+            if isinstance(value, str):
+                parts.append(value)
+    return "".join(parts).strip()
+
+
 def phone_agent_class(agent_base: Any) -> Any:
     """Build the phone Agent subclass over the SDK's ``Agent``.
 
@@ -2290,7 +2317,7 @@ def phone_agent_class(agent_base: Any) -> Any:
             client: PhoneEventClient,
             attempt_id: str,
             say: Callable[[str], Awaitable[Any]],
-            on_user_turn: Callable[[str], Any] | None = None,
+            on_user_turn: Callable[[str, Any], Any] | None = None,
         ) -> None:
             super().__init__(instructions=instructions)
             self._client = client
@@ -2312,9 +2339,9 @@ def phone_agent_class(agent_base: Any) -> Any:
                 raise RuntimeError("phone_turn_context_unavailable")
             items.append(new_message)
             await self.update_chat_ctx(turn_ctx)
-            text = getattr(new_message, "text_content", "")
-            if self._on_user_turn is not None and isinstance(text, str) and text.strip():
-                observed = self._on_user_turn(text.strip())
+            text = _message_text(new_message)
+            if self._on_user_turn is not None and text:
+                observed = self._on_user_turn(text, new_message)
                 if inspect.isawaitable(observed):
                     await observed
             # This is the SDK-supported escape hatch consumed by

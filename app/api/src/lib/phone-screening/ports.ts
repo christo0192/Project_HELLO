@@ -383,6 +383,7 @@ export interface PhoneAssessmentTurn {
   readonly turnIndex: number;
   readonly speaker: 'bot' | 'candidate';
   readonly text: string;
+  readonly turnStartedAtMs?: number | null;
 }
 
 /**
@@ -437,6 +438,7 @@ export interface StartPhoneAssessmentInput {
 export interface PhoneBoundaryTurn {
   readonly speaker: 'bot' | 'candidate';
   readonly text: string;
+  readonly turnStartedAtMs?: number | null;
 }
 
 export interface CommitPhoneQuestionBoundaryInput {
@@ -551,6 +553,8 @@ export interface PhoneStores {
     sessionId: string;
     attemptId: string;
     egressId: string;
+    /** Provider-reported start time; null means timing is unavailable. */
+    egressStartedAtMs?: number | null;
     now: Date;
   }): Promise<StampPhoneSessionEgressResult>;
   listEngagementRecordings(input: {

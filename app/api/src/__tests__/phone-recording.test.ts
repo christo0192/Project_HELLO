@@ -67,7 +67,7 @@ interface Harness {
 function harness(opts: {
   attach?: unknown;
   list?: unknown;
-  egress?: () => Promise<{ egressId?: string }>;
+  egress?: () => Promise<{ egressId?: string; startedAt?: bigint | null }>;
 } = {}): Harness {
   const list = vi.fn(async () => {
     order.push('list');
@@ -202,6 +202,17 @@ describe('P4 recording — ordering is attach, then egress, then finalize', () =
 // ═══════════════════════════════════════════════════════════════════════
 
 describe('0051 — the session-level stamp that makes the recording FINDABLE', () => {
+  it('preserves the provider-reported egress origin for accurate playback timing', async () => {
+    const h = harness({
+      egress: async () => ({ egressId: 'EG_abcd1234', startedAt: 1_723_000_000_250_000_000n }),
+    });
+    const res = await run(h);
+    expect(res.egressStartedAtMs).toBe(1_723_000_000_250);
+    expect(h.stamp.mock.calls[0][0]).toMatchObject({
+      egressStartedAtMs: 1_723_000_000_250,
+    });
+  });
+
   it('stamps the session with the egress id, after the egress exists', async () => {
     const h = harness({});
     const res = await run(h);

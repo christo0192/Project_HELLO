@@ -345,13 +345,19 @@ async def _delete_livekit_room(room_name: str) -> None:
 
 
 def _item_text(item: Any) -> str:
+    """Extract all text without losing SDK text-only message surfaces."""
+    text_content = getattr(item, "text_content", None)
+    if isinstance(text_content, str) and text_content.strip():
+        return text_content.strip()
     content = getattr(item, "content", None) or []
     chunks: list[str] = []
     for part in content:
         if isinstance(part, str):
             chunks.append(part)
         elif hasattr(part, "text"):
-            chunks.append(str(part.text))
+            value = getattr(part, "text", None)
+            if isinstance(value, str):
+                chunks.append(value)
     return "".join(chunks).strip()
 
 
@@ -372,7 +378,10 @@ def _turn_anchor_ms(item: Any) -> int | None:
         anchor = persistence.normalize_turn_anchor_ms(metrics.get("started_speaking_at"))
         if anchor is not None:
             return anchor
-    return persistence.normalize_turn_anchor_ms(getattr(item, "created_at", None))
+    created_at = getattr(item, "created_at", None)
+    if created_at is None:
+        return None
+    return persistence.normalize_turn_anchor_ms(created_at)
 
 
 # ── Bounded session outcome counter mapping (OBS-06) ────────────────
@@ -769,11 +778,11 @@ def phone_question_instructions(question: "phone.PhonePlanQuestion") -> str:
 async def _ask_phone_question(
     *,
     generate: Callable[[str], Awaitable[Any]],
-    exchange: "asyncio.Queue[dict[str, str]]",
+    exchange: "asyncio.Queue[dict[str, Any]]",
     question: "phone.PhonePlanQuestion",
     answer_timeout_sec: float,
     follow_up: bool,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     """Put ONE question and collect the ordered exchange that answers it.
 
     Returns whatever it captured, including nothing. It does NOT decide whether
@@ -1153,7 +1162,7 @@ async def _run_phone_session(
     # disclosure classifier reads it and must not be handed the bot's own
     # lines. Two queues rather than one filtered read: a filter is a thing a
     # later edit can forget to apply.
-    exchange: "asyncio.Queue[dict[str, str]]" = asyncio.Queue()
+    exchange: "asyncio.Queue[dict[str, Any]]" = asyncio.Queue()
     candidate_activity = asyncio.Event()
     candidate_end_requested = asyncio.Event()
     # Monotonic, process-local and content-free. Read exactly once by the next
@@ -1171,12 +1180,14 @@ async def _run_phone_session(
         role = getattr(item, "role", None)
         if role not in {"user", "assistant"}:
             return
-        # An INTERRUPTED assistant line was not fully spoken, so recording it
-        # as a bot turn would put words in the transcript the candidate never
-        # heard — and the scorer reads that transcript.
-        if role == "assistant" and getattr(item, "interrupted", False):
-            return
+        interrupted = role == "assistant" and getattr(item, "interrupted", False)
         text = _item_text(item)
+        if interrupted:
+            # Keep the generated fragment instead of silently deleting the
+            # question at the start of an interrupted turn. The label is
+            # evidence, not spoken text; the dashboard renders it separately
+            # and the scorer can distinguish it from a fully delivered answer.
+            text = (phone.INTERRUPTED_QUESTION_PREFIX + text).strip()
         if not text:
             return
         # Candidate turns are delivered by PhoneScreeningAgent's
@@ -1197,6 +1208,7 @@ async def _run_phone_session(
         exchange.put_nowait({
             "speaker": "candidate" if role == "user" else "bot",
             "text": text,
+            "turn_started_at_ms": _turn_anchor_ms(item),
         })
 
     @session.on("close")
@@ -1210,11 +1222,15 @@ async def _run_phone_session(
         if callable(wait_for_playout):
             await wait_for_playout()
 
-    def on_candidate_turn(text: str) -> None:
+    def on_candidate_turn(text: str, message: Any = None) -> None:
         candidate_activity.set()
         candidate_turn_observed_at[0] = _monotonic()
         user_turns.put_nowait(text)
-        exchange.put_nowait({"speaker": "candidate", "text": text})
+        exchange.put_nowait({
+            "speaker": "candidate",
+            "text": text,
+            "turn_started_at_ms": _turn_anchor_ms(message) if message is not None else None,
+        })
         if phone.is_explicit_end_call_request(text):
             candidate_end_requested.set()
 
@@ -1450,7 +1466,7 @@ async def _run_phone_session(
             if callable(wait_for_playout):
                 await wait_for_playout()
 
-        async def ask(question: Any, cursor: int) -> list[dict[str, str]]:
+        async def ask(question: Any, cursor: int) -> list[dict[str, Any]]:
             captured = await _ask_phone_question(
                 generate=generate,
                 exchange=exchange,
