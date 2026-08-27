@@ -1272,10 +1272,15 @@ async def _run_native_phone_screening(
         except asyncio.TimeoutError:
             terminal_reason["reason"] = phone.HALT_NO_ANSWER
             reason = terminal_reason["reason"]
-        done = await events.complete_assessment(attempt_id, session_id) if reason == "completed" else None
-        if done.ok:
-            await events.post_event(attempt_id, "assessment.completed")
+        if reason == "completed":
+            done = await events.complete_assessment(attempt_id, session_id)
+            if done.ok:
+                await events.post_event(attempt_id, "assessment.completed")
+            else:
+                await events.post_event(attempt_id, "assessment.aborted")
         else:
+            # The final reply did not start, so this leg is not a verified
+            # completion. Keep the truthful non-scored terminal outcome.
             await events.post_event(attempt_id, "assessment.aborted")
     elif reason == phone.HALT_CANDIDATE_ENDED:
         await events.post_event(attempt_id, "assessment.aborted")
