@@ -1,4 +1,5 @@
 const PLANNED_QUESTION_PREFIX = '[planned question] ';
+const INTERRUPTED_QUESTION_PREFIX = '[interrupted question] ';
 
 export interface TranscriptPresentation {
   text: string;
@@ -15,10 +16,14 @@ export function presentTranscriptTurn(
   speaker: 'bot' | 'candidate',
   text: string,
 ): TranscriptPresentation {
-  const plannedEvidence = speaker === 'bot' && text.startsWith(PLANNED_QUESTION_PREFIX);
+  const plannedEvidence = speaker === 'bot'
+    && (text.startsWith(PLANNED_QUESTION_PREFIX) || text.startsWith(INTERRUPTED_QUESTION_PREFIX));
   if (plannedEvidence) {
+    const prefix = text.startsWith(INTERRUPTED_QUESTION_PREFIX)
+      ? INTERRUPTED_QUESTION_PREFIX
+      : PLANNED_QUESTION_PREFIX;
     return {
-      text: text.slice(PLANNED_QUESTION_PREFIX.length),
+      text: text.slice(prefix.length),
       label: 'Interrupted question',
       plannedEvidence: true,
     };

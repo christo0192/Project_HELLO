@@ -1250,7 +1250,7 @@ class TestScheduleCallback(unittest.IsolatedAsyncioTestCase):
             agent = cls(
                 "instructions", client=FakeEventClient(),
                 attempt_id=_ATTEMPT_ID, say=AsyncMock(),
-                on_user_turn=observed.append,
+                on_user_turn=lambda text, _message: observed.append(text),
             )
             ctx = types.SimpleNamespace(items=[])
             message = types.SimpleNamespace(text_content="Please repeat the role")
@@ -1363,6 +1363,7 @@ class _FakePhoneSession:
     instances: list = []
     default_answers: list = []
     default_mid_turn_says: list = []
+    include_timing: bool = False
 
     def __init__(self, **kwargs):
         self.handlers: dict = {}
@@ -1382,6 +1383,7 @@ class _FakePhoneSession:
         self.answers: list = list(_FakePhoneSession.default_answers)
         self.instructions: list[str] = []
         self.mid_turn_says: list[str] = list(_FakePhoneSession.default_mid_turn_says)
+        self._anchor_index = 0
         _FakePhoneSession.instances.append(self)
 
     def on(self, event):
@@ -1416,7 +1418,15 @@ class _FakePhoneSession:
 
     def emit_user_turn(self, text):
         async def complete_turn():
-            message = types.SimpleNamespace(text_content=text)
+            message = types.SimpleNamespace(
+                text_content=text,
+                metrics=(
+                    {"started_speaking_at": 1723000000.0 + self._anchor_index}
+                    if _FakePhoneSession.include_timing else None
+                ),
+                created_at=(1723000000.0 + self._anchor_index) if _FakePhoneSession.include_timing else None,
+            )
+            self._anchor_index += 1
             ctx = types.SimpleNamespace(items=list(getattr(self.agent.chat_ctx, "items", [])))
             try:
                 await self.agent.on_user_turn_completed(ctx, message)
@@ -1433,7 +1443,13 @@ class _FakePhoneSession:
             role=role,
             content=[types.SimpleNamespace(text=text)],
             interrupted=interrupted,
+            metrics=(
+                {"started_speaking_at": 1723000000.0 + self._anchor_index}
+                if _FakePhoneSession.include_timing else None
+            ),
+            created_at=(1723000000.0 + self._anchor_index) if _FakePhoneSession.include_timing else None,
         )
+        self._anchor_index += 1
         handler(types.SimpleNamespace(item=item))
 
     # ── 0044: the model's turn ────────────────────────────────────────
@@ -1605,6 +1621,7 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         _FakePhoneSession.instances = []
         _FakePhoneSession.default_answers = []
         _FakePhoneSession.default_mid_turn_says = []
+        _FakePhoneSession.include_timing = False
 
     async def _run_session(
         self,
@@ -2084,6 +2101,14 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
     async def test_phone_session_registers_provider_latency_metrics(self):
         _, _, _, _, session, _ = await self._run_session(answers=("Yes, sure.",))
         self.assertIn("metrics_collected", session.handlers)
+
+    async def test_phone_boundary_carries_sdk_speech_start_anchors(self):
+        _FakePhoneSession.include_timing = True
+        with patch.object(agent_mod, "_turn_anchor_ms", return_value=1723000000000):
+            _, client, _, _, _, _ = await self._run_session(answers=("Yes, sure.",))
+        boundary = client.boundaries[0]["turns"]
+        self.assertIsInstance(boundary[0]["turn_started_at_ms"], int)
+        self.assertIsInstance(boundary[-1]["turn_started_at_ms"], int)
 
 
 # ── H-3: the instructions must actually be DELIVERED ──────────────────

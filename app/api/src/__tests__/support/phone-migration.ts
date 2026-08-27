@@ -66,6 +66,12 @@ export const MIGRATION_0051_PATH = fileURLToPath(
 
 export const MIGRATION_0051 = readFileSync(MIGRATION_0051_PATH, 'utf8');
 
+export const MIGRATION_0052_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0052_phone_turn_timing.sql', import.meta.url),
+);
+
+export const MIGRATION_0052 = readFileSync(MIGRATION_0052_PATH, 'utf8');
+
 /**
  * Every phone migration, NEWEST FIRST. Extraction walks this in order and the
  * first file that declares a thing wins, which is what "the latest declaration
@@ -78,6 +84,7 @@ export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: s
     // attach_phone_attempt_recording) are invisible to the extractor and the
     // 0043 originals win. 0051 is registered because its RPC exists NOWHERE
     // earlier — without this line the contract test could not see it at all.
+    { name: '0052', sql: MIGRATION_0052 },
     { name: '0051', sql: MIGRATION_0051 },
     { name: '0045', sql: MIGRATION_0045 },
     { name: '0044', sql: MIGRATION_0044 },

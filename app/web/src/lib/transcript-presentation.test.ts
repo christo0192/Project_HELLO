@@ -8,6 +8,11 @@ describe('presentTranscriptTurn', () => {
       label: 'Interrupted question',
       plannedEvidence: true,
     });
+    expect(presentTranscriptTurn('bot', '[interrupted question] Tell me about this role.')).toEqual({
+      text: 'Tell me about this role.',
+      label: 'Interrupted question',
+      plannedEvidence: true,
+    });
   });
 
   it('leaves ordinary bot and candidate dialogue unchanged', () => {

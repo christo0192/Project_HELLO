@@ -83,7 +83,7 @@ export async function createPhoneEgressClient(): Promise<{
     roomName: string,
     output: unknown,
     options?: { audioOnly?: boolean; videoOnly?: boolean },
-  ): Promise<{ egressId?: string }>;
+  ): Promise<{ egressId?: string; startedAt?: bigint | null }>;
   stopEgress(egressId: string): Promise<unknown>;
 }> {
   const { EgressClient } = await import('livekit-server-sdk');
@@ -93,7 +93,7 @@ export async function createPhoneEgressClient(): Promise<{
       roomName: string,
       output: unknown,
       options?: { audioOnly?: boolean; videoOnly?: boolean },
-    ): Promise<{ egressId?: string }>;
+    ): Promise<{ egressId?: string; startedAt?: bigint | null }>;
     stopEgress(egressId: string): Promise<unknown>;
   };
 }

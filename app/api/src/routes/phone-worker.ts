@@ -158,6 +158,10 @@ const boundaryTurnSchema = z
   .object({
     speaker: z.enum(['bot', 'candidate']),
     text: z.string().trim().min(1).max(8_000),
+    // Optional epoch-ms speech-start anchor. Legacy workers may omit it;
+    // current workers pass the SDK's ChatMessage.metrics anchor through the
+    // durable boundary so the dashboard can align it with the egress.
+    turn_started_at_ms: z.number().int().positive().lt(4_102_444_800_000).nullable().optional(),
   })
   .strict();
 
