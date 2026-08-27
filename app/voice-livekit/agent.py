@@ -1243,7 +1243,9 @@ async def _run_native_phone_screening(
         else:
             agent.instructions = text
 
-    async def on_native_turn(text: str, message: Any = None) -> None:
+    async def on_native_turn(
+        text: str, message: Any = None, turn_ctx: Any = None,
+    ) -> None:
         nonlocal cursor
         if candidate_end_requested.is_set() or phone.is_explicit_end_call_request(text):
             candidate_end_requested.set()
@@ -1289,12 +1291,26 @@ async def _run_native_phone_screening(
         # Do not generate or wait for speech here. Returning hands the turn back
         # to AgentActivity, which owns the native single-reply path.
 
+    async def native_say(text: str) -> None:
+        speech = session.say(text, allow_interruptions=True)
+        wait = getattr(speech, "wait_for_playout", None)
+        if callable(wait):
+            value = wait()
+            if inspect.isawaitable(value):
+                await value
+
+    async def on_booking(turn: Any) -> None:
+        if bool(getattr(turn, "booked", False)):
+            terminal_reason["reason"] = phone.HALT_CALLBACK_SCHEDULED
+            finished.set()
+
     screening_agent = phone.phone_agent_class(Agent)(
         getattr(agent, "instructions", ""),
         client=events,
         attempt_id=attempt_id,
-        say=lambda text: session.say(text, allow_interruptions=True),
+        say=native_say,
         on_user_turn=on_native_turn,
+        on_booking=on_booking,
         native_turns=True,
     )
     update_agent = getattr(session, "update_agent", None)

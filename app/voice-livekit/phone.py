@@ -2235,6 +2235,13 @@ _GENERAL_CLARIFICATION_RE = re.compile(
     r"\b(?:forgot|not\s+sure)\b.{0,40}\bwhich\b",
     re.IGNORECASE,
 )
+_CONNECTIVITY_RE = re.compile(
+    r"^(?:(?:yeah|yes|okay|ok|hello|hi|sorry)[\s,.-]+){0,3}"
+    r"(?:can|could|do)\s+you\s+(?:still\s+)?(?:hear|see)\s+me\??$|"
+    r"^(?:(?:yeah|yes|okay|ok|hello|hi)[\s,.-]+){0,3}"
+    r"(?:are\s+you\s+there|is\s+the\s+line\s+(?:working|clear))\??$",
+    re.IGNORECASE,
+)
 
 
 def candidate_turn_route(text: Any) -> str | None:
@@ -2255,6 +2262,8 @@ def candidate_turn_route(text: Any) -> str | None:
         return "hesitation"
     if _ROLE_CLARIFICATION_RE.search(clean):
         return "role_clarification"
+    if _CONNECTIVITY_RE.fullmatch(clean):
+        return "connectivity_check"
     if _GENERAL_CLARIFICATION_RE.search(clean):
         return "candidate_question"
     if clean.endswith("?") and _QUESTION_OPEN_RE.search(clean):
@@ -2317,7 +2326,8 @@ def phone_agent_class(agent_base: Any) -> Any:
             client: PhoneEventClient,
             attempt_id: str,
             say: Callable[[str], Awaitable[Any]],
-            on_user_turn: Callable[[str, Any], Any] | None = None,
+            on_user_turn: Callable[[str, Any, Any], Any] | None = None,
+            on_booking: Callable[[ScheduleTurn], Any] | None = None,
             native_turns: bool = False,
         ) -> None:
             super().__init__(instructions=instructions)
@@ -2325,6 +2335,7 @@ def phone_agent_class(agent_base: Any) -> Any:
             self._attempt_id = attempt_id
             self._say = say
             self._on_user_turn = on_user_turn
+            self._on_booking = on_booking
             # Native mode lets LiveKit continue its normal reply lifecycle after
             # the durable callback. The legacy scripted loop remains available
             # only to old injected callers while the migration is staged.
@@ -2338,18 +2349,27 @@ def phone_agent_class(agent_base: Any) -> Any:
             after the durable callback, LiveKit owns the ordinary reply,
             interruption, and playout lifecycle just as it does for WebRTC.
             """
+            text = _message_text(new_message)
+            if self._native_turns:
+                # `turn_ctx` is the SDK's temporary context for THIS reply.
+                # Do not mutate the durable Agent chat context or append the
+                # user message: AgentActivity owns both, and will add the
+                # message exactly once after this hook returns.
+                if self._on_user_turn is not None and text:
+                    observed = self._on_user_turn(text, new_message, turn_ctx)
+                    if inspect.isawaitable(observed):
+                        await observed
+                return
+
             items = getattr(turn_ctx, "items", None)
             if not isinstance(items, list):
                 raise RuntimeError("phone_turn_context_unavailable")
             items.append(new_message)
             await self.update_chat_ctx(turn_ctx)
-            text = _message_text(new_message)
             if self._on_user_turn is not None and text:
                 observed = self._on_user_turn(text, new_message)
                 if inspect.isawaitable(observed):
                     await observed
-            if self._native_turns:
-                return
             # Legacy scripted-loop compatibility. Native production screening
             # never reaches this branch.
             from livekit.agents import StopResponse  # noqa: PLC0415
@@ -2373,6 +2393,10 @@ def phone_agent_class(agent_base: Any) -> Any:
             )
             self.bookings.append(turn)
             await self._say(turn.spoken)
+            if turn.booked and self._on_booking is not None:
+                observed = self._on_booking(turn)
+                if inspect.isawaitable(observed):
+                    await observed
             return turn.spoken
 
     return PhoneScreeningAgent
