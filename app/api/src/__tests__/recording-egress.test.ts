@@ -36,10 +36,14 @@ import {
   MAX_EPOCH_MS_ANCHOR,
 } from '../lib/recording-egress.js';
 
-function fakeDb(singleRows: unknown[], bytes = Buffer.from('synthetic audio')) {
+function fakeDb(
+  singleRows: unknown[],
+  bytes = Buffer.from('synthetic audio'),
+  phoneAttemptRows: unknown[] = [],
+) {
   const updates: unknown[] = [];
   const rpc = vi.fn().mockResolvedValue({ data: { status: 'ok' }, error: null });
-  const from = vi.fn(() => {
+  const from = vi.fn((table: string) => {
     let operation = 'select';
     const chain: any = {
       select: vi.fn(() => chain),
@@ -50,7 +54,16 @@ function fakeDb(singleRows: unknown[], bytes = Buffer.from('synthetic audio')) {
       }),
       eq: vi.fn(() => chain),
       is: vi.fn(() => chain),
+      not: vi.fn(() => chain),
+      order: vi.fn(() => chain),
+      limit: vi.fn(() => chain),
       single: vi.fn(async () => ({ data: singleRows.shift() ?? null, error: null })),
+      maybeSingle: vi.fn(async () => ({
+        data: table === 'phone_call_attempts'
+          ? (phoneAttemptRows.shift() ?? null)
+          : (singleRows.shift() ?? null),
+        error: null,
+      })),
       then: (resolve: (value: unknown) => void) => resolve(
         operation === 'update' ? { data: [{ id: 'session' }], error: null } : { data: [], error: null },
       ),
@@ -137,6 +150,28 @@ describe('authoritative recording egress', () => {
       p_content_type: 'audio/ogg',
       p_sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
       p_recording_egress_started_at_ms: 1700000000000,
+    }));
+  });
+
+  it('uses the bound phone MP3 instead of deriving the browser OGG key', async () => {
+    const attemptKey = 'phone-00000000-0000-4000-8000-000000000002-egress.mp3';
+    const { db, rpc } = fakeDb([
+      {
+        recording_object_key: null,
+        recording_provenance: null,
+        recording_egress_id: 'EG_synthetic123',
+        recording_egress_status: 'active',
+        mode: 'live',
+      },
+    ], Buffer.from('synthetic mp3'), [{ recording_object_key: attemptKey }]);
+    const result = await finalizeAuthoritativeRecording(
+      '00000000-0000-4000-8000-000000000001',
+      { db, client: fakeClient(), sleep: async () => undefined },
+    );
+    expect(result).toBe('ready');
+    expect(rpc).toHaveBeenCalledWith('finalize_authoritative_recording', expect.objectContaining({
+      p_object_key: attemptKey,
+      p_content_type: 'audio/mpeg',
     }));
   });
 
