@@ -1156,6 +1156,8 @@ async def _run_native_phone_screening(
     latest_assistant: list[str | None],
     candidate_end_requested: asyncio.Event,
     reply_started: asyncio.Event,
+    candidate_activity: asyncio.Event,
+    close_event: asyncio.Event,
 ) -> phone.PhoneGateResult:
     """Run post-consent screening through LiveKit's native turn lifecycle.
 
@@ -1168,6 +1170,60 @@ async def _run_native_phone_screening(
     completed = list(state.completed_keys)
     finished = asyncio.Event()
     terminal_reason: dict[str, str] = {}
+
+    async def wait_for_activity(timeout: float) -> str:
+        """Wait on LiveKit activity or close without creating a turn queue."""
+        activity = asyncio.create_task(candidate_activity.wait())
+        closed = asyncio.create_task(close_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                (activity, closed), timeout=max(0.0, timeout),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if closed in done:
+                return "closed"
+            if activity in done:
+                return "activity"
+            return "timeout"
+        finally:
+            for task in (activity, closed):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(activity, closed, return_exceptions=True)
+
+    async def native_silence_loop() -> None:
+        """Use LiveKit state/activity as the only phone inactivity authority."""
+        while not finished.is_set():
+            candidate_activity.clear()
+            outcome = await wait_for_activity(CANDIDATE_SILENCE_PROMPT_SEC)
+            if outcome != "timeout":
+                if outcome == "closed":
+                    terminal_reason["reason"] = "disconnect"
+                    finished.set()
+                continue
+            prompt = session.say(
+                "Are you still there? No worries if you need a moment.",
+                allow_interruptions=True,
+            )
+            wait = getattr(prompt, "wait_for_playout", None)
+            if callable(wait):
+                await wait()
+            outcome = await wait_for_activity(CANDIDATE_SILENCE_END_SEC)
+            if outcome != "timeout":
+                continue
+            goodbye = session.say(
+                "Looks like you're unavailable, so I'll end the screening here. "
+                "Thanks for your time, and goodbye.",
+                allow_interruptions=True,
+            )
+            wait = getattr(goodbye, "wait_for_playout", None)
+            if callable(wait):
+                await wait()
+            if not candidate_activity.is_set() and not close_event.is_set():
+                terminal_reason["reason"] = phone.HALT_NO_ANSWER
+                finished.set()
+
+    silence_task = asyncio.create_task(native_silence_loop())
 
     async def set_instructions(question: Any | None, *, closing: bool = False) -> None:
         if closing:
@@ -1264,6 +1320,9 @@ async def _run_native_phone_screening(
         await asyncio.wait_for(finished.wait(), timeout=phone.phone_answer_timeout_sec())
     except asyncio.TimeoutError:
         terminal_reason["reason"] = phone.HALT_NO_ANSWER
+    finally:
+        silence_task.cancel()
+        await asyncio.gather(silence_task, return_exceptions=True)
 
     reason = terminal_reason.get("reason")
     if reason == "completed":
@@ -1331,6 +1390,11 @@ async def _run_phone_session(
     @session.on("speech_created")
     def _on_phone_speech_created(event):  # noqa: ANN001
         reply_started.set()
+
+    @session.on("user_state_changed")
+    def _on_phone_user_state_changed(event):  # noqa: ANN001
+        if getattr(event, "new_state", None) == "speaking":
+            candidate_activity.set()
 
     @session.on("conversation_item_added")
     def _on_phone_item(event):  # noqa: ANN001
@@ -1598,6 +1662,8 @@ async def _run_phone_session(
                 latest_assistant=latest_assistant,
                 candidate_end_requested=candidate_end_requested,
                 reply_started=reply_started,
+                candidate_activity=candidate_activity,
+                close_event=close_event,
             )
 
         # The legacy scripted path is retained only for compatibility with
