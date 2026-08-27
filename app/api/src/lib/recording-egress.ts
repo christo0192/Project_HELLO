@@ -412,7 +412,7 @@ export async function finalizeAuthoritativeRecording(
   const db = deps.db ?? supabase;
   const { data: session, error } = await db
     .from('call_sessions')
-    .select('recording_object_key, recording_provenance, recording_egress_id, recording_egress_status')
+    .select('recording_object_key, recording_provenance, recording_egress_id, recording_egress_status, mode')
     .eq('id', sessionId)
     .single();
   if (error || !session) throw new Error('recording session not found');
@@ -434,6 +434,29 @@ export async function finalizeAuthoritativeRecording(
 
   const client = deps.client ?? egressClient();
   const egressId = String(session.recording_egress_id);
+  let objectKey = egressObjectKey(sessionId);
+  let contentType = 'audio/ogg';
+
+  // Phone egress writes an attempt-scoped MP3. The session row stores the
+  // provider egress id, but the object key is owned by the bound attempt. Do
+  // not guess the browser OGG key for a live phone session: that turns a
+  // successfully captured call into an exhausted `object_unreadable` loop.
+  if (session.mode === 'live') {
+    const { data: attempt, error: attemptError } = await db
+      .from('phone_call_attempts')
+      .select('recording_object_key')
+      .eq('session_id', sessionId)
+      .eq('egress_id', egressId)
+      .not('recording_object_key', 'is', null)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (attemptError) throw new Error('phone recording binding read failed');
+    if (!attempt?.recording_object_key) return defer('object_absent');
+    objectKey = String(attempt.recording_object_key);
+    contentType = 'audio/mpeg';
+  }
+
   await client.stopEgress(egressId).catch(() => undefined);
   const waited = await waitForTerminalEgress(client, egressId, deps.sleep ?? sleep);
   if (waited.kind === 'timeout') {
@@ -450,7 +473,6 @@ export async function finalizeAuthoritativeRecording(
     return 'fallback_required';
   }
 
-  const objectKey = egressObjectKey(sessionId);
   const { data: object, error: downloadError } = await db.storage
     .from(env.recordingsBucket)
     .download(objectKey);
@@ -495,7 +517,7 @@ export async function finalizeAuthoritativeRecording(
     p_object_key: objectKey,
     p_sha256: sha256,
     p_size_bytes: bytes.length,
-    p_content_type: 'audio/ogg',
+    p_content_type: contentType,
     p_correlation_id: null,
     p_recording_egress_started_at_ms: egressStartedAtMs,
   });
