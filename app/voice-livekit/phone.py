@@ -406,6 +406,11 @@ PHONE_WRONG_NUMBER_TEXT = (
     "Sorry about that, I've reached the wrong person. I'll have this number "
     "corrected. Thanks, and goodbye."
 )
+PHONE_SILENCE_PROMPT_TEXT = "Are you still there? No worries if you need a moment."
+PHONE_SILENCE_GOODBYE_TEXT = (
+    "Looks like you're unavailable, so I'll end the screening here. "
+    "Thanks for your time, and goodbye."
+)
 
 
 #: Fixed copy the bot speaks that is NOT part of the screening record.
@@ -430,6 +435,8 @@ def gate_copy_texts() -> frozenset[str]:
         PHONE_WRONG_NUMBER_TEXT,
         PHONE_ASSESSMENT_CLOSING_TEXT,
         PHONE_CANDIDATE_END_TEXT,
+        PHONE_SILENCE_PROMPT_TEXT,
+        PHONE_SILENCE_GOODBYE_TEXT,
         _SCHEDULE_CONFIRMED_TEXT,
         _SCHEDULE_REFUSAL_FALLBACK,
         *_SCHEDULE_REFUSAL_TEXT.values(),
@@ -1337,29 +1344,6 @@ def plan_source_event_id(question_key: str) -> str:
     return f"q:{question_key}"
 
 
-def valid_boundary_turns(turns: Any) -> bool:
-    """The SAME shape rule 0044 enforces, checked before the network call.
-
-    Not a substitute for the server's check — the server is the authority and
-    refuses `invalid_turns` regardless. This exists so a malformed exchange
-    becomes a local halt instead of a round trip, and so the worker's own
-    notion of "a completed question" cannot silently drift from the database's.
-    """
-    if not isinstance(turns, list) or not 2 <= len(turns) <= 12:
-        return False
-    for turn in turns:
-        if not isinstance(turn, dict):
-            return False
-        if turn.get("speaker") not in ("bot", "candidate"):
-            return False
-        text = turn.get("text")
-        if not isinstance(text, str) or not text.strip() or len(text) > 8000:
-            return False
-    if turns[0].get("speaker") != "bot":
-        return False
-    return turns[-1].get("speaker") == "candidate"
-
-
 #: The phone-call policy appended to the assessment agent's instructions.
 #: The first live call proved its absence: the candidate said "I'm busy, call
 #: me tomorrow" and the model IMPROVISED a promise ("I'll send you a link")
@@ -1383,74 +1367,7 @@ PHONE_CALLBACK_POLICY_TEXT = (
 )
 
 
-#: Prefix for a bot turn synthesised from the PLAN when the spoken ask was
-#: lost to an interruption. A constant so the dashboard and the scorer can
-#: recognise (and render/weigh) synthesis explicitly rather than heuristically.
-SYNTHESIZED_QUESTION_PREFIX = "[planned question] "
 INTERRUPTED_QUESTION_PREFIX = "[interrupted question] "
-
-
-def repair_exchange_shape(
-    turns: Any, question_text: str | None,
-) -> list[dict[str, Any]]:
-    """Repair the two capture artefacts REAL telephony produces, and only those.
-
-    The first live canary call (2026-08-26) ended `malformed_exchange` because
-    the candidate answered over the tail of the question — normal phone
-    behaviour — so the SDK marked the assistant's line `interrupted`, the
-    capture handler dropped it (recording words the candidate never heard would
-    poison the transcript), and the exchange arrived at validation as
-    `[candidate]`: no leading bot turn, length 1, halt. Interrupting the first
-    question must not end the call.
-
-    Two repairs, both honesty-preserving, nothing else:
-
-    * LEADING BOT TURN SYNTHESISED FROM THE PLAN. Which question was asked is
-      not something to recover from SDK items — it is `question.text`, the
-      server's own plan entry, chosen by the call site and committed with the
-      key. When a candidate answer was captured but the bot turn that prompted
-      it was dropped as interrupted, prepending the PLAN text records exactly
-      what the call site asked the model to convey. It invents no answer, and
-      the plan text (not model prose) is already the only phrasing the plan
-      ever promised.
-    * TRAILING BOT TURNS TRIMMED. A follow-up the candidate never answered
-      leaves `[bot, candidate, bot]`. The unanswered follow-up adds nothing
-      scoreable; the completed head of the exchange is the honest boundary.
-
-    NO repair produces an answer: an exchange with no candidate turn is
-    returned as captured, and the caller's shape check halts it exactly as
-    before. And NO repair runs on input that is not entirely turn-shaped: a
-    single non-dict item returns the capture UNCHANGED, so validation halts it
-    — silently discarding malformed items and then synthesising around the
-    gap would launder garbage into a committable exchange. The server
-    re-validates regardless — this widens nothing.
-    """
-    if not isinstance(turns, list):
-        return turns  # type: ignore[return-value]
-    if any(not isinstance(t, dict) for t in turns):
-        return turns
-    out = list(turns)
-    while out and out[-1].get("speaker") == "bot":
-        out.pop()
-    if not any(t.get("speaker") == "candidate" for t in out):
-        return out
-    if out and out[0].get("speaker") != "bot":
-        text = (question_text or "").strip()
-        if text:
-            # MARKED, not impersonated (first live transcript, 2026-08-26: the
-            # plan text is interviewer-directed meta-text — "Ask about X" — and
-            # inserting it bare made the transcript read as if the bot spoke
-            # its own stage directions). The prefix states what this turn IS:
-            # the planned question whose spoken phrasing was lost to an
-            # interruption. Scorer and dashboard both see an honest record.
-            # The interrupted assistant item normally supplies its own anchor;
-            # if it was not emitted by the SDK, the boundary remains accurately
-            # untimed rather than being assigned a made-up clock.
-            out.insert(0, {
-                "speaker": "bot",
-                "text": (SYNTHESIZED_QUESTION_PREFIX + text)[:8000],
-            })
-    return out
 
 
 # The rehydration bound. A reconnect's prior exchange is replayed into the
@@ -1541,213 +1458,6 @@ class PhoneAssessmentResult:
             f"PhoneAssessmentResult(scored={self.scored}, halted={self.halted}, "
             f"halt_reason={self.halt_reason!r}, cursor={self.cursor})"
         )
-
-
-async def run_phone_assessment(
-    *,
-    attempt_id: str,
-    session_id: str,
-    client: PhoneEventClient,
-    state: PhoneAssessmentState,
-    ask: Callable[[PhonePlanQuestion, int], Awaitable[Any]],
-    say: Callable[[str], Awaitable[Any]],
-    booking_made: Callable[[], bool] | None = None,
-    candidate_requested_end: Callable[[], bool] | None = None,
-    completion_attempts: int = 3,
-    completion_backoff_sec: float = 1.0,
-    sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
-) -> PhoneAssessmentResult:
-    """Ask every unfinished key, commit each boundary, then complete.
-
-    ``ask`` is the injected seam that actually talks: it is handed the question
-    the SERVER says is owed and must return the ordered exchange for it. It is
-    never asked to decide which question comes next, and its answer is never
-    used to work out which question it just covered.
-
-    The loop is driven by the cursor the SERVER returns, not by a local
-    counter. A boundary that is not committed does not advance anything, so the
-    same question is owed again — which is exactly what should happen.
-    """
-    cursor = state.cursor
-    completed = list(state.completed_keys)
-
-    # A plan that is already complete on arrival is a reconnect that dropped
-    # between the last answer and the completion. Skip straight to completing.
-    def _callback_booked() -> bool:
-        try:
-            return booking_made is not None and bool(booking_made())
-        except Exception:  # noqa: BLE001
-            return False
-
-    def _candidate_ended() -> bool:
-        try:
-            return candidate_requested_end is not None and bool(candidate_requested_end())
-        except Exception:  # noqa: BLE001
-            return False
-
-    def _ended_result() -> PhoneAssessmentResult:
-        return PhoneAssessmentResult(
-            halted=True, halt_reason=HALT_CANDIDATE_ENDED,
-            cursor=cursor, completed=completed,
-        )
-
-    while cursor < len(state.questions):
-        if _candidate_ended():
-            return _ended_result()
-        # ── The booking exit (first live call, 2026-08-26) ────────────────
-        # The schedule_callback tool wrote to `bookings` and NOTHING read it:
-        # a candidate who said "I'm busy, call me tomorrow" got a confirmed
-        # booking AND four more interview questions. The loop now checks the
-        # signal before every ask and after every capture; a booked callback
-        # ends the leg with the post-nothing halt (the server already moved
-        # the engagement to `scheduled`).
-        if _callback_booked():
-            _log.info(
-                "unknown_event", error_type="phone_assessment_halted",
-                error_category=HALT_CALLBACK_SCHEDULED,
-            )
-            return PhoneAssessmentResult(
-                halted=True, halt_reason=HALT_CALLBACK_SCHEDULED,
-                cursor=cursor, completed=completed,
-            )
-
-        question = state.question_at(cursor)
-        if question is None:
-            break
-
-        try:
-            turns = await ask(question, cursor)
-        except Exception:  # noqa: BLE001
-            _log.warn(
-                "unknown_event", error_type="phone_assessment_halted",
-                error_category=HALT_NO_ANSWER, schema=question.key,
-            )
-            return PhoneAssessmentResult(
-                halted=True, halt_reason=HALT_NO_ANSWER, cursor=cursor, completed=completed,
-            )
-
-        if _callback_booked():
-            _log.info(
-                "unknown_event", error_type="phone_assessment_halted",
-                error_category=HALT_CALLBACK_SCHEDULED,
-            )
-            return PhoneAssessmentResult(
-                halted=True, halt_reason=HALT_CALLBACK_SCHEDULED,
-                cursor=cursor, completed=completed,
-            )
-
-        if _candidate_ended():
-            return _ended_result()
-
-        if not valid_boundary_turns(turns) or not has_substantive_candidate_answer(turns):
-            # No substantive answer was captured, or the exchange is not a
-            # completed question. A hesitation or a question TO the interviewer
-            # is honest conversation but is not evidence for the planned key.
-            # Halting rather than advancing keeps the durable cursor truthful.
-            _log.warn(
-                "unknown_event", error_type="phone_assessment_halted",
-                error_category=HALT_MALFORMED_EXCHANGE, schema=question.key,
-            )
-            return PhoneAssessmentResult(
-                halted=True, halt_reason=HALT_MALFORMED_EXCHANGE,
-                cursor=cursor, completed=completed,
-            )
-
-        outcome = await client.commit_boundary(
-            session_id, question.key, cursor,
-            plan_source_event_id(question.key), turns,
-        )
-        if not outcome.ok:
-            # NO NEXT QUESTION AND NO COMPLETION. The candidate's answer is not
-            # durable, so continuing would build a conversation whose record
-            # has a hole in it and then score the hole.
-            _log.warn(
-                "unknown_event", error_type="phone_assessment_halted",
-                error_category=HALT_PERSISTENCE, schema=question.key,
-            )
-            return PhoneAssessmentResult(
-                halted=True, halt_reason=HALT_PERSISTENCE, cursor=cursor,
-                completed=completed, status=outcome.status,
-            )
-
-        if outcome.duplicate:
-            # The exchange THIS leg captured was discarded: the boundary was
-            # already committed under the same key, by this leg's earlier
-            # attempt or by a leg that ran before it. Advancing is correct —
-            # the question IS answered and recorded — but the two are not the
-            # same event, and an operator reading the transcript will see the
-            # OTHER exchange. Logged rather than silently equated.
-            _log.info(
-                "unknown_event", error_type="phone_boundary_duplicate",
-                schema=question.key,
-            )
-        completed.append(question.key)
-        # The SERVER's cursor, never a local increment. A local counter is the
-        # thing a reconnect makes wrong.
-        advanced = outcome.cursor
-        cursor = advanced if advanced is not None and advanced > cursor else cursor + 1
-
-    await say(PHONE_ASSESSMENT_CLOSING_TEXT)
-
-    # ── THE COMPLETION IS RETRIED, BOUNDEDLY ──────────────────────────
-    # Every question is durable by this point. A single unlucky inference call
-    # or a blip between the worker and the API would otherwise throw the whole
-    # screening away, because the session is `completed` afterwards and a later
-    # leg's `start_phone_assessment` refuses it — so there is no second chance
-    # from the conversation. `/assessment/complete` is idempotent by
-    # construction (the partial unique index admits one assessment per session
-    # and the loser reuses the winner's row), which is what makes retrying it
-    # safe rather than merely hopeful.
-    done: PhoneApiOutcome | None = None
-    for attempt in range(max(1, completion_attempts)):
-        done = await client.complete_assessment(attempt_id, session_id)
-        if done.ok:
-            break
-        if not retryable_completion(done):
-            # `plan_incomplete`, `session_not_active`, `unknown_session`: a
-            # state, not a fault. Retrying cannot change it.
-            break
-        if attempt + 1 < max(1, completion_attempts):
-            await sleep(completion_backoff_sec * (attempt + 1))
-
-    if done is None or not done.ok:
-        status = done.status if done is not None else None
-        category = status or (done.error_category if done is not None else None)
-        if done is None or (status is None and done.error_category is not None):
-            # We never got an answer we understand — a transport failure or a
-            # malformed body. We do NOT know whether the screening was scored,
-            # and a terminal event either way would be a claim we cannot
-            # support. Halt instead, and let the reconnect path own it.
-            _log.warn(
-                "unknown_event", error_type="phone_assessment_halted",
-                error_category=HALT_SCORING,
-            )
-            return PhoneAssessmentResult(
-                halted=True, halt_reason=HALT_SCORING, cursor=cursor,
-                completed=completed, status=category,
-            )
-        # The API gave us a verdict we understand and it is not a score.
-        # `assessment.aborted` is the truthful terminal: the conversation
-        # happened, the transcript is durable, and nothing scored it.
-        #
-        # `unclassified` covers the one hole left in the classifier: a 200 body
-        # carrying neither a `status` nor an error category. The route always
-        # sets `status`, so reaching it needs code drift — but an abort logged
-        # with NO reason at all is an abort nobody can diagnose, and this branch
-        # is where a screening ends.
-        _log.warn(
-            "unknown_event", error_type="phone_assessment_unscored",
-            error_category=category or "unclassified",
-        )
-        return PhoneAssessmentResult(cursor=cursor, completed=completed, status=status)
-
-    _log.info(
-        "unknown_event", error_type="phone_assessment_scored",
-        error_category=done.status,
-    )
-    return PhoneAssessmentResult(
-        scored=True, cursor=cursor, completed=completed, status=done.status,
-    )
 
 
 # ── P5: the heartbeat that keeps the lease alive for the whole call ───
@@ -2242,6 +1952,14 @@ _CONNECTIVITY_RE = re.compile(
     r"(?:are\s+you\s+there|is\s+the\s+line\s+(?:working|clear))\??$",
     re.IGNORECASE,
 )
+_CALLBACK_DEFERRAL_RE = re.compile(
+    r"\b(?:call|ring)\s+me\s+(?:back\s+)?(?:later|tomorrow|another\s+time)\b|"
+    r"\b(?:can|could)\s+(?:you|we)\s+(?:call\s+back|reschedule)\b|"
+    r"\b(?:i(?:'m|\s+am)\s+busy\s+(?:right\s+now|at\s+the\s+moment)|"
+    r"i\s+(?:cannot|can't)\s+talk\s+(?:right\s+now|at\s+the\s+moment)|"
+    r"this\s+is\s+not\s+a\s+good\s+time)\b",
+    re.IGNORECASE,
+)
 
 
 def candidate_turn_route(text: Any) -> str | None:
@@ -2264,25 +1982,13 @@ def candidate_turn_route(text: Any) -> str | None:
         return "role_clarification"
     if _CONNECTIVITY_RE.fullmatch(clean):
         return "connectivity_check"
+    if _CALLBACK_DEFERRAL_RE.search(clean):
+        return "callback_deferral"
     if _GENERAL_CLARIFICATION_RE.search(clean):
         return "candidate_question"
     if clean.endswith("?") and _QUESTION_OPEN_RE.search(clean):
         return "candidate_question"
     return None
-
-
-def has_substantive_candidate_answer(turns: Any) -> bool:
-    """True only when a captured candidate turn is evidence, not routing."""
-    if not isinstance(turns, list):
-        return False
-    return any(
-        isinstance(turn, dict)
-        and turn.get("speaker") == "candidate"
-        and isinstance(turn.get("text"), str)
-        and candidate_turn_route(turn["text"]) is None
-        and not is_explicit_end_call_request(turn["text"])
-        for turn in turns
-    )
 
 
 def _message_text(message: Any) -> str:
@@ -2397,6 +2103,12 @@ def phone_agent_class(agent_base: Any) -> Any:
                 observed = self._on_booking(turn)
                 if inspect.isawaitable(observed):
                     await observed
+                if self._native_turns:
+                    # Fixed confirmation already completed playout. Suppress
+                    # only the tool follow-up so the model cannot append another
+                    # promise or interview question after a booked callback.
+                    from livekit.agents import StopResponse  # noqa: PLC0415
+                    raise StopResponse()
             return turn.spoken
 
     return PhoneScreeningAgent

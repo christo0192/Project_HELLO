@@ -148,6 +148,7 @@
         "LIVEKIT_WORKER_DRAIN_SEC": { "requiredInProduction": true, "secret": false },
         "CANDIDATE_SILENCE_PROMPT_SEC": { "requiredInProduction": true, "secret": false },
         "CANDIDATE_SILENCE_END_SEC": { "requiredInProduction": true, "secret": false },
+        "PHONE_TERMINAL_REPLY_TIMEOUT_SEC": { "requiredInProduction": true, "secret": false },
         "SESSION_MAX_RESIDENCY_SEC": { "requiredInProduction": false, "secret": false },
         "GOPU_CANDIDATE_NAME": { "requiredInProduction": false, "secret": false, "productionAllowed": false },
         "GOPU_ROLE_TITLE": { "requiredInProduction": false, "secret": false, "productionAllowed": false },
