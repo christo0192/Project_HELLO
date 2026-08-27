@@ -453,9 +453,10 @@ class TestWorkerOptions(unittest.TestCase):
         self.assertEqual(options["job_memory_limit_mb"], 0)
         self.assertIs(options["entrypoint_fnc"], agent_mod.entrypoint)
 
-    def test_named_worker_sets_agent_name(self):
+    def test_named_worker_sets_agent_name_and_prewarms_one_process(self):
         options = self._build("phone-screener")
         self.assertEqual(options["agent_name"], "phone-screener")
+        self.assertEqual(options["num_idle_processes"], 1)
 
     def test_blank_agent_name_stays_unnamed(self):
         for value in ("", "   "):
@@ -1533,6 +1534,62 @@ class TestPlayoutFence(unittest.IsolatedAsyncioTestCase):
         # that); the answer itself must be captured, not fenced away.
         self.assertEqual(turns, [{"speaker": "candidate", "text": "answered over the ask"}])
 
+    async def test_role_clarification_does_not_advance_the_planned_question(self):
+        """Production session 828e3ba3: asking which role this is is not an
+        answer to the CRM question and must not earn that question's cursor."""
+        exchange: "asyncio.Queue[dict[str, str]]" = asyncio.Queue()
+        generated: list[str] = []
+        replies = iter([
+            "Which job role did I apply for?",
+            "I keep concise notes and schedule every callback in the CRM.",
+        ])
+
+        async def generate(instructions):
+            generated.append(instructions)
+            exchange.put_nowait({"speaker": "bot", "text": f"ask-{len(generated)}"})
+            asyncio.get_running_loop().call_soon(
+                exchange.put_nowait, {"speaker": "candidate", "text": next(replies)},
+            )
+
+        turns = await agent_mod._ask_phone_question(
+            generate=generate,
+            exchange=exchange,
+            question=self._question(),
+            answer_timeout_sec=1.0,
+            follow_up=False,
+        )
+
+        self.assertEqual(len(generated), 2)
+        self.assertIn("role", generated[1].lower())
+        self.assertEqual(turns[-1]["text"], "I keep concise notes and schedule every callback in the CRM.")
+
+    async def test_hesitation_is_not_committed_as_a_substantive_answer(self):
+        self.assertEqual(
+            phone.candidate_turn_route("Sorry, so I totally forgot which Hmm"),
+            "candidate_question",
+        )
+        exchange: "asyncio.Queue[dict[str, str]]" = asyncio.Queue()
+        generated: list[str] = []
+        replies = iter(["Um", "I have four years of customer-facing experience."])
+
+        async def generate(instructions):
+            generated.append(instructions)
+            exchange.put_nowait({"speaker": "bot", "text": f"ask-{len(generated)}"})
+            asyncio.get_running_loop().call_soon(
+                exchange.put_nowait, {"speaker": "candidate", "text": next(replies)},
+            )
+
+        turns = await agent_mod._ask_phone_question(
+            generate=generate,
+            exchange=exchange,
+            question=self._question(),
+            answer_timeout_sec=1.0,
+            follow_up=False,
+        )
+
+        self.assertEqual(len(generated), 2)
+        self.assertEqual(turns[-1]["text"], "I have four years of customer-facing experience.")
+
     def test_the_booking_signal_has_a_reader_in_the_agent(self):
         """Structural: the first live call's tool wrote `bookings` and nothing
         read it. The assessment call site must wire `booking_made` from the
@@ -1910,6 +1967,19 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             for turn in boundary["turns"]:
                 self.assertNotIn("recorded so the hiring team", turn["text"])
 
+    async def test_explicit_disconnect_speaks_once_and_schedules_no_later_question(self):
+        _, client, _, delete, session, _ = await self._run_session(
+            answers=("Yes, that's fine.",),
+            replies=["Can you disconnect the call?", "This must never be consumed."],
+            close_after=False,
+        )
+
+        self.assertEqual(len(session.instructions), 1)
+        self.assertEqual(client.committed_keys, [])
+        self.assertIn("assessment.aborted", client.event_types)
+        self.assertEqual(session.spoken[-1], phone.PHONE_CANDIDATE_END_TEXT)
+        delete.assert_awaited_once_with(_PHONE_ROOM)
+
     async def test_a_silent_candidate_ENDS_the_call_rather_than_looking_like_a_drop(self):
         """No answer means no boundary — and it is NOT a line drop.
 
@@ -2011,6 +2081,10 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             {"audio": False, "transcript": False, "traces": False, "logs": False},
         )
 
+    async def test_phone_session_registers_provider_latency_metrics(self):
+        _, _, _, _, session, _ = await self._run_session(answers=("Yes, sure.",))
+        self.assertIn("metrics_collected", session.handlers)
+
 
 # ── H-3: the instructions must actually be DELIVERED ──────────────────
 
@@ -2049,21 +2123,15 @@ class TestInstructionDelivery(unittest.IsolatedAsyncioTestCase):
         # load order. What must be true regardless is that the PLAN and the
         # candidate's name are what get built into the instructions, and that
         # the result is delivered through the SDK mutator.
-        with patch.object(agent_mod, "system_prompt", return_value="BUILT") as build, \
-             patch.object(
-                 agent_mod, "prompting_format_questions", return_value="FLOW"
-             ) as flow:
+        with patch.object(agent_mod, "system_prompt", return_value="BUILT") as build:
             ok = await agent_mod._apply_phone_instructions(agent, self._state())
         self.assertTrue(ok)
         self.assertEqual(len(agent.delivered), 1)
         self.assertEqual(agent.delivered[0], "BUILT" + phone.PHONE_CALLBACK_POLICY_TEXT)
-        self.assertEqual(
-            flow.call_args.args[0],
-            [{"id": "k1", "question": "First question?", "mandatory": True},
-             {"id": "k2", "question": "Second question?", "mandatory": False}],
-        )
         self.assertEqual(build.call_args.kwargs["candidate_name"], "Asha")
-        self.assertEqual(build.call_args.kwargs["questions"], "FLOW")
+        self.assertIn("exact currently owed question", build.call_args.kwargs["questions"])
+        self.assertNotIn("First question?", build.call_args.kwargs["questions"])
+        self.assertNotIn("Second question?", build.call_args.kwargs["questions"])
 
     async def test_the_RESUME_replay_is_actually_delivered(self):
         class RealisticAgent:

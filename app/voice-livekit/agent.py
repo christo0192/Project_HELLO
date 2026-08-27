@@ -588,11 +588,12 @@ def build_worker_options() -> WorkerOptions:
     """
     options: dict[str, Any] = {
         "entrypoint_fnc": entrypoint,
-        # Production default prewarms multiple idle job processes. That is
-        # too memory-heavy for the single shared Fly worker used here and
-        # can leave browser joins stuck with no assistant audio. Start job
-        # processes only on demand.
-        "num_idle_processes": 0,
+        # The browser worker keeps its zero-idle memory posture. The named
+        # phone worker is a separate 2 GB app and keeps ONE process warm: the
+        # production call at 09:00 waited for an on-demand process before the
+        # first turn, an avoidable cold-path delay that did not exist at the
+        # conversational layer.
+        "num_idle_processes": 1 if _phone_agent_name() else 0,
         "initialize_process_timeout": 60.0,
         "job_memory_warn_mb": 1400,
         "job_memory_limit_mb": 0,
@@ -751,11 +752,14 @@ def phone_question_instructions(question: "phone.PhonePlanQuestion") -> str:
     from the key committed with the answer.
     """
     lines = [
-        "Ask the candidate this one question now, in your own natural words:",
+        "Continue the live phone conversation naturally, then ask this one planned question:",
         question.text,
         "",
-        "Ask ONLY this. Do not move on to another topic, do not summarise the "
-        "call, and do not say goodbye.",
+        "Briefly acknowledge the candidate's latest substantive answer when "
+        "there is one. Ask exactly ONE question in this response. Do not move "
+        "past the planned topic, summarise the call, or say goodbye. Treat "
+        "resume details as unverified claims: never present them as confirmed "
+        "employment history.",
     ]
     if question.hint:
         lines.append(f"If their answer is thin, the thing worth probing is: {question.hint}")
@@ -791,15 +795,13 @@ async def _ask_phone_question(
             break
 
     turns: list[dict[str, str]] = []
-    rounds = 2 if follow_up else 1
-    for round_index in range(rounds):
-        if round_index == 0:
-            await generate(phone_question_instructions(question))
-        else:
-            await generate(
-                "Ask ONE short follow-up about what they just said, then stop. "
-                "Do not change the subject and do not say goodbye."
-            )
+    redirect_count = 0
+    thin_follow_up_used = False
+    instruction = phone_question_instructions(question)
+    deadline = _monotonic() + answer_timeout_sec
+
+    while len(turns) < 12:
+        await generate(instruction)
         # ── The playout fence (first live call, 2026-08-26) ──────────────
         # STT finals lag speech. The tail of the PREVIOUS question's answer
         # regularly arrives while THIS question's ask is playing out, and it
@@ -831,7 +833,8 @@ async def _ask_phone_question(
                 "unknown_event", error_type="phone_stale_finals_dropped",
                 error_category=str(stale),
             )
-        deadline = _monotonic() + answer_timeout_sec
+
+        candidate_text: str | None = None
         while len(turns) < 12:
             remaining = deadline - _monotonic()
             if remaining <= 0:
@@ -842,21 +845,84 @@ async def _ask_phone_question(
                 return turns
             turns.append(item)
             if item.get("speaker") == "candidate":
+                candidate_text = str(item.get("text") or "").strip()
                 break
-        if not turns or turns[-1].get("speaker") != "candidate":
+        if candidate_text is None:
             return turns
+        if phone.is_explicit_end_call_request(candidate_text):
+            return turns
+
+        route = phone.candidate_turn_route(candidate_text)
+        if route is not None:
+            redirect_count += 1
+            if redirect_count >= 3:
+                # Keep the utterances honest, but do not let three fillers or
+                # interviewer questions earn a completed assessment boundary.
+                return turns
+            if route == "hesitation":
+                instruction = (
+                    "Briefly reassure the candidate without changing topic, then "
+                    "repeat the same planned question in fresh, simple words. Ask "
+                    "one question only and wait."
+                )
+            else:
+                instruction = (
+                    "Answer the candidate's question directly and briefly using "
+                    "only the verified role context in your instructions. Never "
+                    "state resume claims as confirmed facts. Then repeat the same "
+                    "planned question naturally, ask nothing else, and wait."
+                )
+            continue
+
+        words = re.findall(r"[A-Za-z0-9]+", candidate_text)
+        if follow_up and not thin_follow_up_used and len(words) < 5:
+            thin_follow_up_used = True
+            guidance = (question.hint or question.text)[:600]
+            instruction = (
+                "Their answer was very short. Ask ONE simple follow-up on the "
+                "same planned topic, then stop and wait. Do not change subject. "
+                f"Follow-up focus: {guidance}"
+            )
+            continue
+        return turns
     return turns
+
+
+def _compact_phone_resume_evidence(evidence: Any) -> dict[str, Any]:
+    """Bound phone prompt evidence to what can improve the next spoken turn."""
+    if not isinstance(evidence, dict):
+        return {}
+    compact: dict[str, Any] = {}
+    for key in ("name", "current_role", "experience_years"):
+        if key in evidence:
+            compact[key] = evidence[key]
+    recent = evidence.get("recent_role")
+    if isinstance(recent, dict):
+        compact["recent_role"] = {
+            key: recent[key] for key in ("title", "employer", "period")
+            if key in recent
+        }
+        highlights = recent.get("highlights")
+        if isinstance(highlights, list):
+            compact["recent_role"]["highlights"] = highlights[:2]
+    for key, limit in (("prior_roles", 2), ("skills", 12), ("career_highlights", 3)):
+        value = evidence.get(key)
+        if isinstance(value, list):
+            compact[key] = value[:limit]
+    summary = evidence.get("summary")
+    if isinstance(summary, str):
+        compact["summary"] = summary[:300]
+    return compact
 
 
 async def _apply_phone_instructions(agent: Any, state: "phone.PhoneAssessmentState") -> bool:
     """Give the agent the REAL instructions, once the plan is known.
 
-    The question flow is formatted through `prompting.format_questions`, the
-    SAME helper the browser path uses, so the two prompts cannot drift into
-    different shapes. The plan's `key` is deliberately NOT put in the prompt:
-    the model is never asked to report which question it covered, because
-    which question was covered is decided by the call site and committed with
-    the key — never read back out of prose.
+    The full question bank is deliberately NOT repeated in the system prompt:
+    the durable loop supplies exactly one owed question to each generation.
+    The plan's `key` is also absent: the model is never asked to report which
+    question it covered, because identity comes from the call site and the
+    committed key — never from prose.
 
     A RESUMING leg also gets the persisted exchange replayed into the prompt,
     bounded by `phone.render_resume_context`, so the model can refer to what the
@@ -870,17 +936,22 @@ async def _apply_phone_instructions(agent: Any, state: "phone.PhoneAssessmentSta
     keyed and committed correctly; the questions are simply less tailored.
     """
     try:
-        flow = prompting_format_questions([
-            {"id": q.key, "question": q.text, "mandatory": q.mandatory}
-            for q in state.questions
-        ])
+        # The durable loop supplies the exact owed question to every
+        # `generate_reply`. Repeating the entire 100-question bank here only
+        # enlarges the cold first request and invites the model to jump ahead.
+        # Keep role/evidence context, but make question identity single-source.
         text = system_prompt(
             candidate_name=state.candidate_name,
             role_title=state.role_title,
-            role_focus=state.role_focus or ", ".join(state.role_required_skills),
-            resume_facts=prompting_format_resume_facts(state.resume_facts),
-            questions=flow,
-            interviewer_instructions=state.interviewer_instructions,
+            role_focus=(state.role_focus or ", ".join(state.role_required_skills))[:600],
+            resume_facts=prompting_format_resume_facts(
+                _compact_phone_resume_evidence(state.resume_facts)
+            ),
+            questions=(
+                "The exact currently owed question is supplied separately for "
+                "each response. Never select or advance a question yourself."
+            ),
+            interviewer_instructions=(state.interviewer_instructions or "")[:2000],
         )
         text = text + phone.PHONE_CALLBACK_POLICY_TEXT
         resume = phone.render_resume_context(state.turns)
@@ -948,7 +1019,7 @@ def _build_phone_provider_session() -> Any:
     drives a bare `Agent`. See `docs/runbooks/phone-canary1.md` for the list of
     what a green canary run does and does not evidence.
     """
-    return AgentSession(
+    session = AgentSession(
         stt=sarvam.STT(
             model=os.getenv("SARVAM_STT_MODEL", "saaras:v3"),
             language=os.getenv("SARVAM_LANGUAGE", "en-IN"),
@@ -963,6 +1034,16 @@ def _build_phone_provider_session() -> Any:
             base_url=GEMINI_BASE_URL,
         ),
     )
+
+    # The browser path already emitted these bounded provider timings; the
+    # phone construction site did not register the handler, leaving the exact
+    # first/second-turn latency complaint unmeasurable. The shared recorder
+    # logs timings and component names only — never transcript, room or IDs.
+    @session.on("metrics_collected")
+    def _on_phone_metrics_collected(event):  # noqa: ANN001
+        _record_provider_metrics(event)
+
+    return session
 
 
 async def _run_phone_entrypoint(ctx: JobContext, room_name: str) -> None:
@@ -1075,6 +1156,10 @@ async def _run_phone_session(
     exchange: "asyncio.Queue[dict[str, str]]" = asyncio.Queue()
     candidate_activity = asyncio.Event()
     candidate_end_requested = asyncio.Event()
+    # Monotonic, process-local and content-free. Read exactly once by the next
+    # scripted generation so we can measure the candidate-turn -> generation
+    # scheduling gap without logging a room, candidate, transcript or ID.
+    candidate_turn_observed_at: list[float | None] = [None]
     close_event = asyncio.Event()
     close_reason: dict[str, Any] = {}
 
@@ -1127,6 +1212,7 @@ async def _run_phone_session(
 
     def on_candidate_turn(text: str) -> None:
         candidate_activity.set()
+        candidate_turn_observed_at[0] = _monotonic()
         user_turns.put_nowait(text)
         exchange.put_nowait({"speaker": "candidate", "text": text})
         if phone.is_explicit_end_call_request(text):
@@ -1343,6 +1429,20 @@ async def _run_phone_session(
         )
 
         async def generate(instructions: str) -> None:
+            observed_at = candidate_turn_observed_at[0]
+            if observed_at is not None:
+                delay = max(0.0, _monotonic() - observed_at)
+                candidate_turn_observed_at[0] = None
+                _safe_emit(
+                    histogram_metric,
+                    "phone_turn_to_generation_sec",
+                    round(delay, 3),
+                )
+                _log.info(
+                    "unknown_event",
+                    error_type="phone_turn_to_generation",
+                    duration_sec=round(delay, 3),
+                )
             speech = session.generate_reply(instructions=instructions)
             if inspect.isawaitable(speech):
                 speech = await speech
@@ -1406,6 +1506,19 @@ async def _run_phone_session(
         # when the API has VERIFIED an assessment row exists. 0044's
         # `apply_phone_event` refuses the event anyway if the row is absent, so
         # this is the first of two gates rather than the only one.
+        if assessment.halt_reason == phone.HALT_CANDIDATE_ENDED:
+            # A candidate asking to disconnect owns the latency budget. Speak
+            # the fixed acknowledgment while the durable abort event is in
+            # flight, then tear down the room immediately after playout. The
+            # assessment loop has already stopped, so no later question can be
+            # scheduled beside this goodbye.
+            abort_task = asyncio.create_task(
+                events.post_event(attempt_id, "assessment.aborted")
+            )
+            await say(phone.PHONE_CANDIDATE_END_TEXT)
+            await _close_phone_room(room_name)
+            await asyncio.gather(abort_task, return_exceptions=True)
+            return result
         if assessment.scored:
             await events.post_event(attempt_id, "assessment.completed")
         elif phone.halt_is_retryable(assessment.halt_reason):
