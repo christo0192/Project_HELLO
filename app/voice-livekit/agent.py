@@ -1261,6 +1261,14 @@ async def _run_native_phone_screening(
         if candidate_end_requested.is_set() or phone.is_explicit_end_call_request(text):
             candidate_end_requested.set()
             reply_plan[0] = "Of course. I'll end the call now. Thanks for your time, and goodbye."
+            # Terminal copy is intentionally retained in the temporary
+            # context for transcript evidence. Phone preemptive generation is
+            # disabled, so this cannot invalidate an ordinary reply.
+            add_turn_instruction(
+                turn_ctx,
+                "Say exactly: Of course. I'll end the call now. Thanks for your time, "
+                "and goodbye. Do not ask another question.",
+            )
             reply_handle[0] = None
             reply_started.clear()
             terminal_reply_required["value"] = True
@@ -1347,6 +1355,11 @@ async def _run_native_phone_screening(
         next_question = state.question_at(cursor)
         if next_question is None:
             reply_plan[0] = "Thanks for your time, and goodbye."
+            add_turn_instruction(
+                turn_ctx,
+                "Thank the candidate briefly and say exactly: Thanks for your time, "
+                "and goodbye. Do not ask another question.",
+            )
             # The native reply is scheduled only after this hook returns. Keep
             # terminalization behind complete playout so room teardown cannot
             # cut off the final response.
