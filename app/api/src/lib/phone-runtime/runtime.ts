@@ -90,11 +90,13 @@ import {
 import { env } from '../env.js';
 import {
   PHONE_DIAL_QUEUE,
+  PHONE_ASSESSMENT_QUEUE,
   describePhoneRuntimeConfig,
   loadPhoneRuntimeConfig,
   type PhoneRuntimeConfig,
 } from './config.js';
 import { createPhoneDialHandler, type PhoneDialJobOutcome } from './dial-handler.js';
+import { createPhoneAssessmentHandler } from './assessment-handler.js';
 import {
   createPhoneRuntimeReader,
   PHONE_SESSION_MODE,
@@ -433,7 +435,11 @@ export function createPhoneRuntime(
   let haltCheckedAtMs = 0;
   let haltAdmits = false;
   const HALT_CACHE_MS = 5_000;
-  const admitsClaims = async (): Promise<boolean> => {
+  const admitsClaims = async (queueName: string): Promise<boolean> => {
+    // Scoring is post-call durable work. It must continue while the phone
+    // dialing halt is raised; only the queue that can originate a new call is
+    // controlled by the phone halt.
+    if (queueName !== PHONE_DIAL_QUEUE) return true;
     const nowMs = Date.now();
     if (haltCheckedAtMs !== 0 && nowMs - haltCheckedAtMs < HALT_CACHE_MS) return haltAdmits;
     haltCheckedAtMs = nowMs;
@@ -459,6 +465,7 @@ export function createPhoneRuntime(
           dialJobOutcomes[outcome] = (dialJobOutcomes[outcome] ?? 0) + 1;
         },
       }),
+      [PHONE_ASSESSMENT_QUEUE]: createPhoneAssessmentHandler({ client }),
     },
     owner,
     shouldClaim: admitsClaims,

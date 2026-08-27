@@ -49,6 +49,7 @@ import {
 } from '../lib/phone-runtime/health.js';
 import {
   PHONE_DIAL_QUEUE,
+  PHONE_ASSESSMENT_QUEUE,
   loadPhoneRuntimeConfig,
   type PhoneRuntimeConfig,
 } from '../lib/phone-runtime/config.js';
@@ -1147,8 +1148,11 @@ describe('E. the dial loop', () => {
     await until(() => runtime.runner.inFlight() === 0);
 
     expect(PHONE_DIAL_QUEUE).toBe('phone.dial');
-    expect(c.claims).toEqual([PHONE_DIAL_QUEUE]);
-    expect([...new Set(c.claims)]).toEqual(['phone.dial']);
+    expect(c.claims).toEqual([PHONE_DIAL_QUEUE, PHONE_ASSESSMENT_QUEUE]);
+    expect([...new Set(c.claims)]).toEqual([
+      PHONE_DIAL_QUEUE,
+      PHONE_ASSESSMENT_QUEUE,
+    ]);
   });
 
   it('two concurrent claimers over one job ⇒ the handler runs EXACTLY ONCE', async () => {
@@ -1184,7 +1188,10 @@ describe('E. the dial loop', () => {
     expect(loser.snapshot().dialJobOutcomes).toEqual({});
     // Both nonetheless asked, and both asked only `phone.dial`.
     expect(world.claimLog.length).toBeGreaterThanOrEqual(2);
-    expect([...new Set(world.claimLog.map((e) => e.queueName))]).toEqual([PHONE_DIAL_QUEUE]);
+    expect([...new Set(world.claimLog.map((e) => e.queueName))]).toEqual([
+      PHONE_DIAL_QUEUE,
+      PHONE_ASSESSMENT_QUEUE,
+    ]);
     expect(world.completeLog).toEqual(['job-single']);
   });
 

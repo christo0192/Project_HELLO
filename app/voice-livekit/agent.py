@@ -1422,11 +1422,17 @@ async def _run_native_phone_screening(
 
     if reason == "completed":
         done = None
-        for _ in range(3):
+        for attempt in range(20):
             done = await events.complete_assessment(attempt_id, session_id)
             if done.ok or not phone.retryable_completion(done):
                 break
-        if done is not None and done.ok:
+            # `scoring_queued` is an acknowledged durable handoff, not a
+            # transport failure. Give the API worker time to score before
+            # asking again; the worker never posts completion until the row
+            # exists, so a retry remains idempotent and fail-closed.
+            if done.status == phone.ASSESSMENT_QUEUED_STATUS:
+                await asyncio.sleep(min(2.0, 0.25 + attempt * 0.1))
+        if done is not None and done.ok and not done.adopted:
             await events.post_event(attempt_id, "assessment.completed")
         elif done is not None and done.status is not None:
             # A known non-score verdict is truthfully terminal. A transport

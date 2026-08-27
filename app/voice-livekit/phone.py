@@ -604,7 +604,7 @@ class PhoneApiOutcome:
         # 0044: carried only by the assessment calls. Declared here rather
         # than on a subclass so a caller that reads them on an event outcome
         # gets a truthful `None` instead of an AttributeError.
-        "cursor", "plan_complete", "expected_key",
+        "cursor", "plan_complete", "expected_key", "adopted",
         # P5: carried only by `heartbeat_attempt` — the SERVER's cadence for
         # the next beat, already clamped. Never a lease token: the response
         # carries none and never will.
@@ -628,6 +628,7 @@ class PhoneApiOutcome:
         self.cursor: int | None = None
         self.plan_complete: bool = False
         self.expected_key: str | None = None
+        self.adopted: bool = False
         self.next_heartbeat_seconds: float | None = None
 
     def __repr__(self) -> str:  # pragma: no cover - diagnostics only
@@ -1022,10 +1023,12 @@ class PhoneEventClient:
         status_str = str(status) if status is not None else None
         # `ok` alone is not enough, and a future server status must be added
         # here DELIBERATELY rather than confirmed by default.
-        return PhoneApiOutcome(
+        outcome = PhoneApiOutcome(
             data.get("ok") is True and status_str == ASSESSMENT_SCORED_STATUS,
             status_str,
         )
+        outcome.adopted = data.get("adopted") is True
+        return outcome
 
 
 def _response_json(response: Any) -> Any:
@@ -1052,6 +1055,7 @@ def _response_json(response: Any) -> Any:
 # derived from prose.
 
 ASSESSMENT_SCORED_STATUS = "scored"
+ASSESSMENT_QUEUED_STATUS = "scoring_queued"
 
 #: `start_phone_assessment`'s answer for a session that is already `completed`
 #: AND already carries a phone-sourced assessment: a SCORED screening whose
@@ -1073,6 +1077,7 @@ ASSESSMENT_ALREADY_SCORED_STATUS = "already_scored"
 RETRYABLE_COMPLETION_STATUSES: frozenset[str] = frozenset([
     "scoring_failed",
     "completion_failed",
+    "scoring_queued",
 ])
 
 

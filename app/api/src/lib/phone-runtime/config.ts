@@ -46,6 +46,10 @@ void _contractVisibleEnvReads;
 
 /** The durable queue this runtime drains. `0042` enqueues into it by name. */
 export const PHONE_DIAL_QUEUE = 'phone.dial';
+/** Durable scoring work; it is safe to claim while phone dialing is halted. */
+export const PHONE_ASSESSMENT_QUEUE = 'phone.assessment';
+export const phoneAssessmentDedupKey = (sessionId: string): string =>
+  `${PHONE_ASSESSMENT_QUEUE}:${sessionId}`;
 
 export interface PhoneRuntimeBound {
   readonly def: number;
