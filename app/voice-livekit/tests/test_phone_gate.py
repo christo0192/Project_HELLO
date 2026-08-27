@@ -1279,13 +1279,15 @@ class TestScheduleCallback(unittest.IsolatedAsyncioTestCase):
         cls = phone.phone_agent_class(BaseAgent)
         agent = cls(
             "instructions", client=FakeEventClient(), attempt_id=_ATTEMPT_ID,
-            say=AsyncMock(), on_user_turn=lambda text, _message: observed.append(text),
+            say=AsyncMock(), on_user_turn=lambda text, _message, _ctx: observed.append(text),
             native_turns=True,
         )
         ctx = types.SimpleNamespace(items=[])
         message = types.SimpleNamespace(text_content="My experience is relevant")
         await agent.on_user_turn_completed(ctx, message)
-        self.assertEqual(ctx.items, [message])
+        # Native mode deliberately leaves the temporary context untouched;
+        # AgentActivity appends the user item exactly once after the hook.
+        self.assertEqual(ctx.items, [])
         self.assertEqual(observed, ["My experience is relevant"])
 
     def test_explicit_end_call_language_is_narrow_and_deterministic(self):
