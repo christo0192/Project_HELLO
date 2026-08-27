@@ -1105,6 +1105,7 @@ async def _run_native_phone_screening(
     result: phone.PhoneGateResult,
     latest_assistant: list[str | None],
     latest_assistant_anchor: list[int | None],
+    latest_candidate_anchor: list[int | None],
     candidate_end_requested: asyncio.Event,
     reply_started: asyncio.Event,
     reply_handle: list[Any],
@@ -1325,9 +1326,12 @@ async def _run_native_phone_screening(
             },
             {
                 "speaker": "candidate", "text": text,
-                "turn_started_at_ms": _turn_anchor_ms(message),
+                "turn_started_at_ms": (
+                    _turn_anchor_ms(message) or latest_candidate_anchor[0]
+                ),
             },
         ]
+        latest_candidate_anchor[0] = None
         outcome = await events.commit_boundary(
             session_id, question.key, cursor,
             phone.plan_source_event_id(question.key), turns,
@@ -1438,11 +1442,17 @@ async def _run_native_phone_screening(
 
     if reason == "completed":
         done = None
-        for _ in range(3):
+        for attempt in range(20):
             done = await events.complete_assessment(attempt_id, session_id)
             if done.ok or not phone.retryable_completion(done):
                 break
-        if done is not None and done.ok:
+            # `scoring_queued` is an acknowledged durable handoff, not a
+            # transport failure. Give the API worker time to score before
+            # asking again; the worker never posts completion until the row
+            # exists, so a retry remains idempotent and fail-closed.
+            if done.status == phone.ASSESSMENT_QUEUED_STATUS:
+                await asyncio.sleep(min(2.0, 0.25 + attempt * 0.1))
+        if done is not None and done.ok and not done.adopted:
             await events.post_event(attempt_id, "assessment.completed")
         elif done is not None and done.status is not None:
             # A known non-score verdict is truthfully terminal. A transport
@@ -1491,6 +1501,7 @@ async def _run_phone_session(
     # Used only as evidence for the server-keyed native boundary.
     latest_assistant: list[str | None] = [None]
     latest_assistant_anchor: list[int | None] = [None]
+    latest_candidate_anchor: list[int | None] = [None]
 
     session = _build_phone_provider_session()
     reply_started = asyncio.Event()
@@ -1505,6 +1516,10 @@ async def _run_phone_session(
     def _on_phone_user_state_changed(event):  # noqa: ANN001
         if getattr(event, "new_state", None) == "speaking":
             candidate_activity.set()
+            # LiveKit 1.6.4 does not guarantee speech-start metrics on every
+            # finalized ChatMessage. This event is the real local VAD anchor,
+            # used only when the message has no provider timestamp.
+            latest_candidate_anchor[0] = int(round(time.time() * 1000))
 
     @session.on("user_input_transcribed")
     def _on_phone_transcript_activity(event):  # noqa: ANN001
@@ -1513,7 +1528,10 @@ async def _run_phone_session(
 
     @session.on("agent_state_changed")
     def _on_phone_agent_state_changed(event):  # noqa: ANN001
-        if getattr(event, "new_state", None) in {"idle", "listening"}:
+        new_state = getattr(event, "new_state", None)
+        if new_state == "speaking":
+            latest_assistant_anchor[0] = int(round(time.time() * 1000))
+        if new_state in {"idle", "listening"}:
             agent_listening.set()
         else:
             agent_listening.clear()
@@ -1552,7 +1570,11 @@ async def _run_phone_session(
             # and committed as part of the candidate's answer.
             return
         latest_assistant[0] = text
-        latest_assistant_anchor[0] = _turn_anchor_ms(item)
+        # Keep the state-event anchor when the later conversation item carries
+        # no metrics/created_at value. Never replace a real anchor with null.
+        item_anchor = _turn_anchor_ms(item)
+        if item_anchor is not None:
+            latest_assistant_anchor[0] = item_anchor
 
     @session.on("close")
     def _on_phone_close(event):  # noqa: ANN001
@@ -1773,6 +1795,7 @@ async def _run_phone_session(
             result=result,
             latest_assistant=latest_assistant,
             latest_assistant_anchor=latest_assistant_anchor,
+            latest_candidate_anchor=latest_candidate_anchor,
             candidate_end_requested=candidate_end_requested,
             reply_started=reply_started,
             reply_handle=reply_handle,

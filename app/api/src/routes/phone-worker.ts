@@ -62,6 +62,9 @@ import {
   type PhoneStores,
 } from '../lib/phone-screening/index.js';
 import { supabase } from '../lib/supabase.js';
+import { Queue } from '../lib/queue/index.js';
+import { PgAdapter } from '../lib/queue/pg-adapter.js';
+import { PHONE_ASSESSMENT_QUEUE, phoneAssessmentDedupKey } from '../lib/phone-runtime/assessment-handler.js';
 import { phoneRoomName } from '../integrations/livekit-phone-dial/phone-room.js';
 import { startPhoneAttemptRecording } from '../integrations/livekit-phone-dial/recording.js';
 import { purgePhoneEngagementRecordings } from '../integrations/livekit-phone-dial/recording-purge.js';
@@ -291,6 +294,8 @@ export interface PhoneWorkerRouterDeps {
    * and reports the failure.
    */
   readonly scoreSession?: (sessionId: string) => Promise<void>;
+  /** Existing durable queue seam; production uses the phone runtime queue. */
+  readonly assessmentQueue?: Pick<Queue, 'enqueue'>;
 }
 
 
@@ -393,6 +398,11 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
     ?? (async (sessionId: string): Promise<void> => {
       await runAssessment(sessionId, { source: 'phone' });
     });
+  const assessmentQueue = deps.assessmentQueue
+    ?? new Queue(new PgAdapter(supabase as never), { defaultMaxAttempts: 5 });
+  // Test routers that inject scoreSession retain the synchronous contract;
+  // production's default route uses the durable phone.assessment queue.
+  const queueAssessment = deps.scoreSession === undefined && deps.assessmentQueue !== undefined;
 
   router.post('/events', requireWorkerPhoneAuth, async (req, res, next) => {
     try {
@@ -848,6 +858,22 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
         return res.json({ ok: false, status: 'session_not_active' });
       }
 
+      if (queueAssessment) {
+        try {
+          await assessmentQueue.enqueue(
+            PHONE_ASSESSMENT_QUEUE,
+            { session_id: sessionId, attempt_id: parsed.data.attempt_id },
+            { dedupKey: phoneAssessmentDedupKey(sessionId), maxAttempts: 5 },
+          );
+          // The queue worker owns scoring and the terminal event. Returning
+          // immediately prevents the PSTN worker from timing out while Gemini
+          // scores a completed transcript.
+          return res.json({ ok: true, status: 'scoring_queued' });
+        } catch {
+          return res.json({ ok: false, status: 'completion_failed' });
+        }
+      }
+
       // ── SCORING, THEN VERIFICATION — AND THE VERIFICATION RUNS EITHER WAY ──
       // A THROW FROM `scoreSession` IS NOT EVIDENCE THAT NOTHING WAS SCORED.
       // The ordinary reconnect case makes that concrete: the winning leg
@@ -1021,6 +1047,9 @@ async function startRecordingForAttempt(
  *     recording more than promised is the failure this phase exists to prevent.
  */
 export const phoneWorkerRouter = createPhoneWorkerRouter({
+  // Explicit production wiring enables durable post-call scoring. Test routers
+  // that intentionally inject only the legacy scoring seam remain synchronous.
+  assessmentQueue: new Queue(new PgAdapter(supabase as never), { defaultMaxAttempts: 5 }),
   async verifySessionHint({ sessionId, engagementId }) {
     // Two narrow reads, both by primary key, both fail-closed: any error, any
     // missing row, any null candidate refuses the hint. The predicate is the

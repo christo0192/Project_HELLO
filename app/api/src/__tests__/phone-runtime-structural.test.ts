@@ -93,6 +93,7 @@ const LOGGER_FILE = 'runtime.ts';
 
 describe('1. file inventory', () => {
   const EXPECTED_FILES = [
+    'assessment-handler.ts',
     'config.ts',
     'dial-handler.ts',
     'due-loop.ts',
@@ -425,7 +426,7 @@ describe('11. CONTROLS — the extractors above are not vacuous', () => {
     // Every rule in this suite is a `for` over MODULE_FILES. If the directory
     // moved or the filter stopped matching, all of them would pass while
     // asserting nothing. This is the assertion that would fail instead.
-    expect(MODULE_FILES.length).toBe(8);
+    expect(MODULE_FILES.length).toBe(9);
     expect(MODULE_FILES.every((f) => f.source.length > 0)).toBe(true);
   });
 

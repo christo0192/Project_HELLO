@@ -267,7 +267,7 @@ class TestRetryClassifier(unittest.TestCase):
         self.assertNotIn("phone_assessment_error", phone.RETRYABLE_COMPLETION_STATUSES)
         self.assertEqual(
             phone.RETRYABLE_COMPLETION_STATUSES,
-            frozenset({"scoring_failed", "completion_failed"}),
+            frozenset({"scoring_failed", "completion_failed", "scoring_queued"}),
         )
         # …and a 500 IS retried, through the class that actually carries it.
         self.assertTrue(phone.retryable_completion(self._answer(None, "transport")))
