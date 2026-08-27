@@ -1155,6 +1155,7 @@ async def _run_native_phone_screening(
     result: phone.PhoneGateResult,
     latest_assistant: list[str | None],
     candidate_end_requested: asyncio.Event,
+    reply_started: asyncio.Event,
 ) -> phone.PhoneGateResult:
     """Run post-consent screening through LiveKit's native turn lifecycle.
 
@@ -1222,6 +1223,10 @@ async def _run_native_phone_screening(
         next_question = state.question_at(cursor)
         if next_question is None:
             await set_instructions(None, closing=True)
+            # The native reply is scheduled only after this hook returns. Keep
+            # terminalization behind its first audio signal so room teardown
+            # cannot cut off the final response.
+            reply_started.clear()
             terminal_reason["reason"] = "completed"
         else:
             await set_instructions(next_question)
@@ -1262,7 +1267,12 @@ async def _run_native_phone_screening(
 
     reason = terminal_reason.get("reason")
     if reason == "completed":
-        done = await events.complete_assessment(attempt_id, session_id)
+        try:
+            await asyncio.wait_for(reply_started.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            terminal_reason["reason"] = phone.HALT_NO_ANSWER
+            reason = terminal_reason["reason"]
+        done = await events.complete_assessment(attempt_id, session_id) if reason == "completed" else None
         if done.ok:
             await events.post_event(attempt_id, "assessment.completed")
         else:
@@ -1311,6 +1321,11 @@ async def _run_phone_session(
     latest_assistant: list[str | None] = [None]
 
     session = _build_phone_provider_session()
+    reply_started = asyncio.Event()
+
+    @session.on("speech_created")
+    def _on_phone_speech_created(event):  # noqa: ANN001
+        reply_started.set()
 
     @session.on("conversation_item_added")
     def _on_phone_item(event):  # noqa: ANN001
@@ -1577,6 +1592,7 @@ async def _run_phone_session(
                 result=result,
                 latest_assistant=latest_assistant,
                 candidate_end_requested=candidate_end_requested,
+                reply_started=reply_started,
             )
 
         # The legacy scripted path is retained only for compatibility with
