@@ -941,8 +941,8 @@ async def _deliver_phone_instructions(agent: Any, text: str) -> bool:
         return False
 
 
-def _build_phone_provider_session() -> Any:
-    """The ONE construction site for the phone channel's provider pipeline.
+def _build_provider_session() -> Any:
+    """The one provider/turn-session construction used by WebRTC and phone.
 
     Extracted verbatim from `_run_phone_session` — same kwargs, same env reads,
     same order, no behaviour change — so that the Canary-1 branch drives the
@@ -987,6 +987,11 @@ def _build_phone_provider_session() -> Any:
         _record_provider_metrics(event)
 
     return session
+
+
+def _build_phone_provider_session() -> Any:
+    """Compatibility seam for Canary-1; delegates to the shared session factory."""
+    return _build_provider_session()
 
 
 async def _run_phone_entrypoint(ctx: JobContext, room_name: str) -> None:
@@ -2125,32 +2130,10 @@ async def _run_session(
 
         async def _setup_session(span: Span | None) -> None:
             nonlocal session
-            session = AgentSession(
-                stt=sarvam.STT(
-                    model=os.getenv("SARVAM_STT_MODEL", "saaras:v3"),
-                    language=os.getenv("SARVAM_LANGUAGE", "en-IN"),
-                ),
-                tts=sarvam.TTS(
-                    model=os.getenv("SARVAM_TTS_MODEL", "bulbul:v3"),
-                    speaker=os.getenv("SARVAM_TTS_VOICE", "simran"),
-                ),
-                # LiveKit's OpenAI-compatible adapter always consumes a token
-                # stream. Point it directly at Google so first tokens are not
-                # delayed by the previous iKey gateway hop.
-                llm=openai.LLM(
-                    model=GEMINI_MODEL,
-                    api_key=os.getenv("GEMINI_API_KEY"),
-                    base_url=GEMINI_BASE_URL,
-                ),
-                # Do not provide custom VAD or turn-detection components here.
-                # LiveKit Agents owns turn handling via its AgentSession defaults.
-                # This avoids deprecated endpointing knobs and keeps behavior on
-                # the SDK-supported path.
-            )
-
-            @session.on("metrics_collected")
-            def _on_metrics_collected(event):  # noqa: ANN001
-                _record_provider_metrics(event)
+            # The browser and phone paths share this exact AgentSession
+            # provider/turn construction. Channel-specific code begins only at
+            # the gate, persistence, and presentation handlers below.
+            session = _build_provider_session()
 
             @session.on("speech_created")
             def _on_speech_created(event):  # noqa: ANN001

@@ -266,27 +266,22 @@ describe('4. the worker halves are wired as the design requires', () => {
     expect(AGENT_PY).toContain('record=dict(_PHONE_NO_RECORDING)');
   });
 
-  it('the PHONE provider session has exactly one construction site, and the browser one is named', () => {
-    // There are TWO `AgentSession(` sites in `agent.py`, and that is correct:
-    // the browser session is a SEPARATE construction with a different
-    // recording configuration, and it is deliberately untouched — the canary's
-    // whole blast-radius argument is that browser screening needs no Python
-    // change. So the claim is not "one AgentSession in the file"; it is "one
-    // construction site for the PHONE provider pipeline, and the browser one
-    // accounted for by name".
+  it('phone, canary, and browser share exactly one AgentSession construction site', () => {
+    // Turn-detection parity is structural: one provider/AgentSession factory is
+    // used by browser WebRTC, production phone, and Canary-1. Recording remains
+    // a session.start concern and does not require another AgentSession.
     const sites = [...AGENT_PY.matchAll(/AgentSession\(\n/g)].length;
-    expect(sites, 'a THIRD AgentSession construction site appeared').toBe(2);
+    expect(sites, 'another AgentSession construction site appeared').toBe(1);
 
-    // Site 1: the factory, used by BOTH phone callers.
+    expect(AGENT_PY).toContain('def _build_provider_session()');
     expect(AGENT_PY).toContain('def _build_phone_provider_session()');
     expect(AGENT_PY).toContain('session = AgentSession(');
     expect(AGENT_PY).toContain('return session');
     expect(AGENT_PY).toContain('session = _build_phone_provider_session()');
     expect(AGENT_PY).toContain('session_factory=_build_phone_provider_session');
 
-    // Site 2: the browser session, identified by the recording configuration
-    // only it has. If the phone path ever grew a second construction, it would
-    // not carry this line and the count above would be three.
+    // Browser uses the shared factory and retains its own recording start policy.
+    expect(AGENT_PY).toContain('session = _build_provider_session()');
     expect(AGENT_PY).toContain('record={"audio": True, "transcript": True');
 
     // And the canary constructs NONE of its own: it is handed the factory.

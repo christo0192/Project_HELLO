@@ -2161,6 +2161,18 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         self.assertNotIn("exchange", source)
         self.assertNotIn("booking_made", source)
 
+    def test_phone_and_webrtc_share_one_agent_session_factory(self):
+        self.assertIn(
+            "_build_provider_session()",
+            inspect.getsource(agent_mod._build_phone_provider_session),
+        )
+        self.assertIn(
+            "session = _build_provider_session()",
+            inspect.getsource(agent_mod._run_session),
+        )
+        factory = inspect.getsource(agent_mod._build_provider_session)
+        self.assertEqual(factory.count("AgentSession("), 1)
+
     def test_sdk_transcript_extras_are_removed_before_logging(self):
         import logging
         record = logging.LogRecord("livekit.agents", logging.WARNING, __file__, 1, "x", (), None)
