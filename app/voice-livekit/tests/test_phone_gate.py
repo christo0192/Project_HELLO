@@ -1266,6 +1266,28 @@ class TestScheduleCallback(unittest.IsolatedAsyncioTestCase):
         self.assertIs(agent.updated, ctx)
         self.assertEqual(observed, ["Please repeat the role"])
 
+    async def test_native_user_turn_returns_to_livekit_without_stop_response(self):
+        class BaseAgent:
+            def __init__(self, instructions=""):
+                self.instructions = instructions
+                self.updated = None
+
+            async def update_chat_ctx(self, ctx):
+                self.updated = ctx
+
+        observed: list[str] = []
+        cls = phone.phone_agent_class(BaseAgent)
+        agent = cls(
+            "instructions", client=FakeEventClient(), attempt_id=_ATTEMPT_ID,
+            say=AsyncMock(), on_user_turn=lambda text, _message: observed.append(text),
+            native_turns=True,
+        )
+        ctx = types.SimpleNamespace(items=[])
+        message = types.SimpleNamespace(text_content="My experience is relevant")
+        await agent.on_user_turn_completed(ctx, message)
+        self.assertEqual(ctx.items, [message])
+        self.assertEqual(observed, ["My experience is relevant"])
+
     def test_explicit_end_call_language_is_narrow_and_deterministic(self):
         for text in (
             "Can you disconnect the call?", "Please hang up", "End this call now",

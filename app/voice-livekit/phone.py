@@ -2318,21 +2318,25 @@ def phone_agent_class(agent_base: Any) -> Any:
             attempt_id: str,
             say: Callable[[str], Awaitable[Any]],
             on_user_turn: Callable[[str, Any], Any] | None = None,
+            native_turns: bool = False,
         ) -> None:
             super().__init__(instructions=instructions)
             self._client = client
             self._attempt_id = attempt_id
             self._say = say
             self._on_user_turn = on_user_turn
+            # Native mode lets LiveKit continue its normal reply lifecycle after
+            # the durable callback. The legacy scripted loop remains available
+            # only to old injected callers while the migration is staged.
+            self._native_turns = native_turns
             self.bookings: list[ScheduleTurn] = []
 
         async def on_user_turn_completed(self, turn_ctx: Any, new_message: Any) -> None:
-            """Persist the user turn but suppress LiveKit's automatic reply.
+            """Persist the user turn and optionally return to LiveKit's scheduler.
 
-            The phone assessment loop is the sole response scheduler and calls
-            ``session.generate_reply`` for exactly one planned question. The
-            SDK otherwise generates a second autonomous reply after every user
-            turn, producing the observed acknowledgment + next-question pairs.
+            Native phone screening deliberately does not raise ``StopResponse``:
+            after the durable callback, LiveKit owns the ordinary reply,
+            interruption, and playout lifecycle just as it does for WebRTC.
             """
             items = getattr(turn_ctx, "items", None)
             if not isinstance(items, list):
@@ -2344,9 +2348,10 @@ def phone_agent_class(agent_base: Any) -> Any:
                 observed = self._on_user_turn(text, new_message)
                 if inspect.isawaitable(observed):
                     await observed
-            # This is the SDK-supported escape hatch consumed by
-            # AgentActivity._user_turn_completed_task. The user message is
-            # already committed above; only the automatic generation stops.
+            if self._native_turns:
+                return
+            # Legacy scripted-loop compatibility. Native production screening
+            # never reaches this branch.
             from livekit.agents import StopResponse  # noqa: PLC0415
             raise StopResponse()
 

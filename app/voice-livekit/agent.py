@@ -1143,6 +1143,142 @@ async def _run_phone_entrypoint(ctx: JobContext, room_name: str) -> None:
     await _run_phone_session(ctx, room_name, attempt_id, epoch)
 
 
+async def _run_native_phone_screening(
+    *,
+    session: Any,
+    agent: Any,
+    events: Any,
+    state: Any,
+    attempt_id: str,
+    session_id: str,
+    room_name: str,
+    result: phone.PhoneGateResult,
+    latest_assistant: list[str | None],
+    candidate_end_requested: asyncio.Event,
+) -> phone.PhoneGateResult:
+    """Run post-consent screening through LiveKit's native turn lifecycle.
+
+    The durable question cursor remains server-owned, but this coordinator is
+    deliberately not an audio scheduler: ``on_user_turn_completed`` commits
+    the completed boundary, updates the next-topic instruction, and returns.
+    LiveKit then performs the one ordinary reply, interruption, and playout.
+    """
+    cursor = state.cursor
+    completed = list(state.completed_keys)
+    finished = asyncio.Event()
+    terminal_reason: dict[str, str] = {}
+
+    async def set_instructions(question: Any | None, *, closing: bool = False) -> None:
+        if closing:
+            text = (
+                "Thank the candidate briefly and say exactly: Thanks for your time, "
+                "and goodbye. Do not ask another question."
+            )
+        elif question is not None:
+            text = phone.phone_question_instructions(question)
+        else:
+            text = "Do not say anything further."
+        update = getattr(agent, "update_instructions", None)
+        if callable(update):
+            value = update(text)
+            if inspect.isawaitable(value):
+                await value
+        else:
+            agent.instructions = text
+
+    async def on_native_turn(text: str, message: Any = None) -> None:
+        nonlocal cursor
+        if candidate_end_requested.is_set() or phone.is_explicit_end_call_request(text):
+            candidate_end_requested.set()
+            terminal_reason["reason"] = phone.HALT_CANDIDATE_ENDED
+            finished.set()
+            return
+        if phone.candidate_turn_route(text) is not None:
+            question = state.question_at(cursor)
+            await set_instructions(question)
+            return
+        question = state.question_at(cursor)
+        prompt = (latest_assistant[0] or "").strip()
+        if question is None or not prompt:
+            terminal_reason["reason"] = phone.HALT_MALFORMED_EXCHANGE
+            finished.set()
+            return
+        turns = [
+            {"speaker": "bot", "text": prompt},
+            {"speaker": "candidate", "text": text},
+        ]
+        outcome = await events.commit_boundary(
+            session_id, question.key, cursor,
+            phone.plan_source_event_id(question.key), turns,
+        )
+        if not outcome.ok:
+            terminal_reason["reason"] = phone.HALT_PERSISTENCE
+            finished.set()
+            return
+        if question.key not in completed:
+            completed.append(question.key)
+        advanced = outcome.cursor
+        cursor = advanced if advanced is not None and advanced > cursor else cursor + 1
+        next_question = state.question_at(cursor)
+        if next_question is None:
+            await set_instructions(None, closing=True)
+            terminal_reason["reason"] = "completed"
+        else:
+            await set_instructions(next_question)
+        # Do not generate or wait for speech here. Returning hands the turn back
+        # to AgentActivity, which owns the native single-reply path.
+
+    screening_agent = phone.phone_agent_class(Agent)(
+        getattr(agent, "instructions", ""),
+        client=events,
+        attempt_id=attempt_id,
+        say=lambda text: session.say(text, allow_interruptions=True),
+        on_user_turn=on_native_turn,
+        native_turns=True,
+    )
+    update_agent = getattr(session, "update_agent", None)
+    if not callable(update_agent):
+        raise RuntimeError("native_phone_agent_handoff_unavailable")
+    value = update_agent(screening_agent)
+    if inspect.isawaitable(value):
+        await value
+    agent = screening_agent
+    await set_instructions(state.question_at(cursor))
+
+    question = state.question_at(cursor)
+    if question is None:
+        await set_instructions(None, closing=True)
+    else:
+        speech = session.generate_reply(
+            instructions=phone.phone_question_instructions(question),
+        )
+        if inspect.isawaitable(speech):
+            await speech
+
+    try:
+        await asyncio.wait_for(finished.wait(), timeout=phone.phone_answer_timeout_sec())
+    except asyncio.TimeoutError:
+        terminal_reason["reason"] = phone.HALT_NO_ANSWER
+
+    reason = terminal_reason.get("reason")
+    if reason == "completed":
+        done = await events.complete_assessment(attempt_id, session_id)
+        if done.ok:
+            await events.post_event(attempt_id, "assessment.completed")
+        else:
+            await events.post_event(attempt_id, "assessment.aborted")
+    elif reason == phone.HALT_CANDIDATE_ENDED:
+        await events.post_event(attempt_id, "assessment.aborted")
+    elif reason in {phone.HALT_PERSISTENCE, phone.HALT_MALFORMED_EXCHANGE}:
+        # No boundary was released; leave the attempt non-terminal for the
+        # existing reconnect/recovery path.
+        pass
+    else:
+        await events.post_event(attempt_id, "assessment.aborted")
+    await _close_phone_room(room_name)
+    return result
+
+
 async def _run_phone_session(
     ctx: JobContext,
     room_name: str,
@@ -1171,6 +1307,8 @@ async def _run_phone_session(
     candidate_turn_observed_at: list[float | None] = [None]
     close_event = asyncio.Event()
     close_reason: dict[str, Any] = {}
+    # Used only as evidence for the server-keyed native boundary.
+    latest_assistant: list[str | None] = [None]
 
     session = _build_phone_provider_session()
 
@@ -1196,6 +1334,7 @@ async def _run_phone_session(
         # an autonomous second answer beside the scripted assessment loop.
         if role == "user":
             return
+        latest_assistant[0] = text
         if phone.is_gate_copy(text):
             # FIXED COPY IS NOT A SCREENING TURN. The disclosure, the re-ask,
             # every refusal closing, the callback confirmations and the closing
@@ -1421,6 +1560,27 @@ async def _run_phone_session(
             await _close_phone_room(room_name)
             return result
 
+        # Native parity path: the completed-turn hook performs only durable
+        # coordination; LiveKit owns ordinary replies and interruptions. Test
+        # doubles from the pre-native suite lack `update_agent`; they continue
+        # through the compatibility path below until their event model is
+        # migrated, while the production SDK always takes this branch.
+        if callable(getattr(session, "update_agent", None)):
+            return await _run_native_phone_screening(
+                session=session,
+                agent=agent,
+                events=events,
+                state=state,
+                attempt_id=attempt_id,
+                session_id=session_id,
+                room_name=room_name,
+                result=result,
+                latest_assistant=latest_assistant,
+                candidate_end_requested=candidate_end_requested,
+            )
+
+        # The legacy scripted path is retained only for compatibility with
+        # older injected test sessions and is not reachable in production.
         # The plan is now known, so the agent is given the REAL instructions: the
         # candidate's name and the ordered question flow, in the same shape the
         # browser path has always used.
