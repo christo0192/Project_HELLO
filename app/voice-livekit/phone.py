@@ -503,8 +503,16 @@ def _bounded_float(raw: Any, default: float, lo: float, hi: float) -> float:
 
 
 def phone_event_timeout_sec() -> float:
-    """Bounded per-call timeout for the internal worker event API."""
-    return _bounded_float(os.getenv("PHONE_EVENT_TIMEOUT_SEC"), 10.0, 1.0, 60.0)
+    """Bounded timeout for internal worker events, including final scoring.
+
+    Completion performs the durable session CAS and may synchronously invoke
+    the scorer before returning. Ten seconds is shorter than the observed
+    provider/API path, so it converts a successful call into a worker timeout
+    and prevents the terminal event from being posted. Keep the bound finite;
+    operators can narrow it, but the production default must cover normal
+    completion latency.
+    """
+    return _bounded_float(os.getenv("PHONE_EVENT_TIMEOUT_SEC"), 30.0, 1.0, 60.0)
 
 
 def phone_participant_wait_sec() -> float:

@@ -530,6 +530,21 @@ class TestNoNumberInAssessmentSurface(unittest.TestCase):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, lowered)
 
+    def test_event_timeout_covers_synchronous_completion_by_default(self):
+        saved = os.environ.get("PHONE_EVENT_TIMEOUT_SEC")
+        try:
+            os.environ.pop("PHONE_EVENT_TIMEOUT_SEC", None)
+            self.assertEqual(phone.phone_event_timeout_sec(), 30.0)
+            os.environ["PHONE_EVENT_TIMEOUT_SEC"] = "0.001"
+            self.assertEqual(phone.phone_event_timeout_sec(), 1.0)
+            os.environ["PHONE_EVENT_TIMEOUT_SEC"] = "99999"
+            self.assertEqual(phone.phone_event_timeout_sec(), 60.0)
+        finally:
+            if saved is None:
+                os.environ.pop("PHONE_EVENT_TIMEOUT_SEC", None)
+            else:
+                os.environ["PHONE_EVENT_TIMEOUT_SEC"] = saved
+
     def test_the_answer_timeout_is_bounded_in_both_directions(self):
         saved = os.environ.get("PHONE_ANSWER_TIMEOUT_SEC")
         try:
