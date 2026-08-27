@@ -2163,7 +2163,7 @@ class TestNativePhoneArchitecture(unittest.TestCase):
 
     def test_phone_and_webrtc_share_one_agent_session_factory(self):
         self.assertIn(
-            "_build_provider_session()",
+            "_build_provider_session(",
             inspect.getsource(agent_mod._build_phone_provider_session),
         )
         self.assertIn(

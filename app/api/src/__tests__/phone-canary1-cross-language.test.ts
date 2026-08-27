@@ -273,7 +273,7 @@ describe('4. the worker halves are wired as the design requires', () => {
     const sites = [...AGENT_PY.matchAll(/AgentSession\(\n/g)].length;
     expect(sites, 'another AgentSession construction site appeared').toBe(1);
 
-    expect(AGENT_PY).toContain('def _build_provider_session()');
+    expect(AGENT_PY).toContain('def _build_provider_session(');
     expect(AGENT_PY).toContain('def _build_phone_provider_session()');
     expect(AGENT_PY).toContain('session = AgentSession(');
     expect(AGENT_PY).toContain('return session');
@@ -281,7 +281,7 @@ describe('4. the worker halves are wired as the design requires', () => {
     expect(AGENT_PY).toContain('session_factory=_build_phone_provider_session');
 
     // Browser uses the shared factory and retains its own recording start policy.
-    expect(AGENT_PY).toContain('session = _build_provider_session()');
+    expect(AGENT_PY).toContain('session = _build_provider_session(');
     expect(AGENT_PY).toContain('record={"audio": True, "transcript": True');
 
     // And the canary constructs NONE of its own: it is handed the factory.

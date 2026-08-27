@@ -2043,6 +2043,7 @@ def phone_agent_class(agent_base: Any) -> Any:
             on_user_turn: Callable[[str, Any, Any], Any] | None = None,
             on_booking: Callable[[ScheduleTurn], Any] | None = None,
             native_turns: bool = False,
+            native_reply_plan: Callable[[], str | None] | None = None,
         ) -> None:
             super().__init__(instructions=instructions)
             self._client = client
@@ -2054,7 +2055,27 @@ def phone_agent_class(agent_base: Any) -> Any:
             # the durable callback. The legacy scripted loop remains available
             # only to old injected callers while the migration is staged.
             self._native_turns = native_turns
+            self._native_reply_plan = native_reply_plan
             self.bookings: list[ScheduleTurn] = []
+
+        async def llm_node(self, chat_ctx: Any, tools: list[Any], model_settings: Any) -> Any:
+            """Use a prepared fixed reply without starting a second LLM call.
+
+            The native phone coordinator prepares the next question only after
+            the durable boundary commits. LiveKit calls this node afterwards,
+            so the fixed reply is still scheduled, interrupted, and played by
+            AgentSession. Clarification/callback turns leave the plan empty and
+            use the same Gemini node as the browser agent.
+            """
+            planned = self._native_reply_plan() if self._native_reply_plan is not None else None
+            if planned:
+                yield planned
+                return
+            result = super().llm_node(chat_ctx, tools, model_settings)
+            if inspect.isawaitable(result):
+                result = await result
+            async for chunk in result:
+                yield chunk
 
         async def on_user_turn_completed(self, turn_ctx: Any, new_message: Any) -> None:
             """Persist the user turn and optionally return to LiveKit's scheduler.

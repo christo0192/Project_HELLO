@@ -941,7 +941,7 @@ async def _deliver_phone_instructions(agent: Any, text: str) -> bool:
         return False
 
 
-def _build_provider_session() -> Any:
+def _build_provider_session(*, phone_mode: bool = False) -> Any:
     """The one provider/turn-session construction used by WebRTC and phone.
 
     Extracted verbatim from `_run_phone_session` — same kwargs, same env reads,
@@ -962,6 +962,16 @@ def _build_provider_session() -> Any:
     drives a bare `Agent`. See `docs/runbooks/phone-canary1.md` for the list of
     what a green canary run does and does not evidence.
     """
+    session_options: dict[str, Any] = {}
+    if phone_mode:
+        # Phone's durable cursor selects the next question after the user turn,
+        # while LiveKit may already be preparing a speculative reply. The
+        # phone reply planner supplies a fixed next question after the CAS;
+        # disabling preemptive generation for this lane prevents LiveKit from
+        # discarding a speculative request when the per-turn plan is updated.
+        # AgentSession still owns EOU, interruption, scheduling and playout.
+        session_options["preemptive_generation"] = False
+
     session = AgentSession(
         stt=sarvam.STT(
             model=os.getenv("SARVAM_STT_MODEL", "saaras:v3"),
@@ -976,6 +986,7 @@ def _build_provider_session() -> Any:
             api_key=os.getenv("GEMINI_API_KEY"),
             base_url=GEMINI_BASE_URL,
         ),
+        **session_options,
     )
 
     # The browser path already emitted these bounded provider timings; the
@@ -990,8 +1001,8 @@ def _build_provider_session() -> Any:
 
 
 def _build_phone_provider_session() -> Any:
-    """Compatibility seam for Canary-1; delegates to the shared session factory."""
-    return _build_provider_session()
+    """Phone seam delegates to the shared provider session factory."""
+    return _build_provider_session(phone_mode=True)
 
 
 async def _run_phone_entrypoint(ctx: JobContext, room_name: str) -> None:
@@ -1115,6 +1126,13 @@ async def _run_native_phone_screening(
     terminal_reason: dict[str, str] = {}
     terminal_reply_required = {"value": False}
     silence_prompted = {"value": False}
+    # Set only after the durable cursor CAS succeeds. The native Agent's
+    # llm_node consumes this fixed reply inside LiveKit's normal scheduler;
+    # ordinary phone questions therefore do not wait for a second Gemini call.
+    reply_plan: list[str | None] = [None]
+
+    def fixed_question_reply(question: Any) -> str:
+        return f"Thanks for sharing. {question.text}"
 
     async def wait_for_activity(timeout: float) -> str:
         """Wait on LiveKit activity or close without creating a turn queue."""
@@ -1231,6 +1249,10 @@ async def _run_native_phone_screening(
         text: str, message: Any = None, turn_ctx: Any = None,
     ) -> None:
         nonlocal cursor
+        # A plan belongs to exactly one completed user turn. Clearing it before
+        # routing prevents a prior fixed question from leaking into a
+        # clarification, callback, or terminal race.
+        reply_plan[0] = None
         if finished.is_set():
             # A terminal decision already owns the leg. Suppress only this late
             # terminal-race turn; ordinary turns always return to LiveKit.
@@ -1238,11 +1260,7 @@ async def _run_native_phone_screening(
             raise StopResponse()
         if candidate_end_requested.is_set() or phone.is_explicit_end_call_request(text):
             candidate_end_requested.set()
-            add_turn_instruction(
-                turn_ctx,
-                "Say exactly: Of course. I'll end the call now. Thanks for your time, "
-                "and goodbye. Do not ask another question.",
-            )
+            reply_plan[0] = "Of course. I'll end the call now. Thanks for your time, and goodbye."
             reply_handle[0] = None
             reply_started.clear()
             terminal_reply_required["value"] = True
@@ -1285,11 +1303,7 @@ async def _run_native_phone_screening(
         question = state.question_at(cursor)
         prompt = (latest_assistant[0] or "").strip()
         if question is None or not prompt:
-            add_turn_instruction(
-                turn_ctx,
-                "Say exactly: I'm sorry, I can't safely continue this screening right now. "
-                "Thanks for your time. Do not ask another question.",
-            )
+            reply_plan[0] = "I'm sorry, I can't safely continue this screening right now. Thanks for your time."
             reply_handle[0] = None
             reply_started.clear()
             terminal_reply_required["value"] = True
@@ -1311,11 +1325,7 @@ async def _run_native_phone_screening(
             phone.plan_source_event_id(question.key), turns,
         )
         if not outcome.ok:
-            add_turn_instruction(
-                turn_ctx,
-                "Say exactly: I'm sorry, I can't safely continue this screening right now. "
-                "Thanks for your time. Do not ask another question.",
-            )
+            reply_plan[0] = "I'm sorry, I can't safely continue this screening right now. Thanks for your time."
             reply_handle[0] = None
             reply_started.clear()
             terminal_reply_required["value"] = True
@@ -1324,11 +1334,7 @@ async def _run_native_phone_screening(
             return
         advanced = outcome.cursor
         if advanced != cursor + 1:
-            add_turn_instruction(
-                turn_ctx,
-                "Say exactly: I'm sorry, I can't safely continue this screening right now. "
-                "Thanks for your time. Do not ask another question.",
-            )
+            reply_plan[0] = "I'm sorry, I can't safely continue this screening right now. Thanks for your time."
             reply_handle[0] = None
             reply_started.clear()
             terminal_reply_required["value"] = True
@@ -1340,11 +1346,7 @@ async def _run_native_phone_screening(
         cursor = advanced
         next_question = state.question_at(cursor)
         if next_question is None:
-            add_turn_instruction(
-                turn_ctx,
-                "Thank the candidate briefly and say exactly: Thanks for your time, "
-                "and goodbye. Do not ask another question.",
-            )
+            reply_plan[0] = "Thanks for your time, and goodbye."
             # The native reply is scheduled only after this hook returns. Keep
             # terminalization behind complete playout so room teardown cannot
             # cut off the final response.
@@ -1354,7 +1356,7 @@ async def _run_native_phone_screening(
             terminal_reason["reason"] = "completed"
             finished.set()
         else:
-            add_turn_instruction(turn_ctx, phone_question_instructions(next_question))
+            reply_plan[0] = fixed_question_reply(next_question)
         # Do not generate or wait for speech here. Returning hands the turn back
         # to AgentActivity, which owns the native single-reply path.
 
@@ -1379,6 +1381,7 @@ async def _run_native_phone_screening(
         on_user_turn=on_native_turn,
         on_booking=on_booking,
         native_turns=True,
+        native_reply_plan=lambda: reply_plan[0],
     )
     update_agent = getattr(session, "update_agent", None)
     if not callable(update_agent):
