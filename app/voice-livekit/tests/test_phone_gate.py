@@ -18,6 +18,7 @@ removed, the corresponding test must fail.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import sys
 import types
@@ -212,6 +213,7 @@ class FakeEventClient:
         heartbeats=None,
     ) -> None:
         self.calls: list[tuple[str, str, dict]] = []
+        self.timeline: list[str] = []
         self.bookings: list[tuple[str, str, int]] = []
         self._outcomes = outcomes or {}
         self._booking = booking
@@ -238,6 +240,7 @@ class FakeEventClient:
         return outcome
 
     async def post_event(self, attempt_id, event_type, *, epoch=None, session_id=None):
+        self.timeline.append(f"event:{event_type}")
         self.calls.append((attempt_id, event_type, {"epoch": epoch, "session_id": session_id}))
         outcome = self._outcomes.get(event_type)
         if outcome is not None:
@@ -280,6 +283,7 @@ class FakeEventClient:
         return outcome
 
     async def complete_assessment(self, attempt_id, session_id):
+        self.timeline.append("assessment.complete")
         self.assessment_calls.append(("complete", attempt_id, session_id))
         if self._complete is not None:
             return self._complete
@@ -1216,6 +1220,26 @@ class TestScheduleCallback(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(spoken, [result])
         self.assertTrue(agent.bookings[0].booked)
 
+    async def test_native_booking_notifies_terminal_coordinator_after_playout(self):
+        order: list[str] = []
+
+        async def say(_text):
+            order.append("spoken")
+
+        async def booked(turn):
+            self.assertTrue(turn.booked)
+            order.append("terminal")
+
+        client = FakeEventClient(booking=phone.PhoneApiOutcome(True, "ok"))
+        cls = phone.phone_agent_class(agent_mod.Agent)
+        agent = cls(
+            "instructions", client=client, attempt_id=_ATTEMPT_ID,
+            say=say, on_booking=booked, native_turns=True,
+        )
+        with self.assertRaises(sys.modules["livekit.agents"].StopResponse):
+            await agent.schedule_callback("2026-08-25T09:30:00Z", 1800)
+        self.assertEqual(order, ["spoken", "terminal"])
+
     async def test_agent_tool_refusal_speaks_no_confirmation(self):
         spoken: list[str] = []
 
@@ -1387,6 +1411,9 @@ class _FakePhoneSession:
     instances: list = []
     default_answers: list = []
     default_mid_turn_says: list = []
+    default_interruptions: list[bool] = []
+    default_silence_reply: str | None = None
+    default_emit_auto_speech: bool = True
     include_timing: bool = False
 
     def __init__(self, **kwargs):
@@ -1406,7 +1433,11 @@ class _FakePhoneSession:
         # assert the happy one.
         self.answers: list = list(_FakePhoneSession.default_answers)
         self.instructions: list[str] = []
+        self.turn_contexts: list[list] = []
         self.mid_turn_says: list[str] = list(_FakePhoneSession.default_mid_turn_says)
+        self.interruptions: list[bool] = list(_FakePhoneSession.default_interruptions)
+        self.silence_reply = _FakePhoneSession.default_silence_reply
+        self.emit_auto_speech = _FakePhoneSession.default_emit_auto_speech
         self._anchor_index = 0
         _FakePhoneSession.instances.append(self)
 
@@ -1416,13 +1447,10 @@ class _FakePhoneSession:
             return fn
         return deco
 
-    async def start(self, **kwargs):
-        self.start_calls += 1
-        self.started_with = kwargs
-        self.agent = kwargs.get("agent")
+    def _install_agent(self, agent):
+        self.agent = agent
         # Other test modules may have installed an additive minimal Agent stub
-        # before this file. Supply the two public context surfaces the real SDK
-        # always has so suite order cannot change this fake's semantics.
+        # before this file. Supply the public context surfaces the real SDK has.
         if not hasattr(self.agent, "chat_ctx"):
             self.agent.chat_ctx = types.SimpleNamespace(items=[])
         if not hasattr(self.agent, "update_chat_ctx"):
@@ -1430,14 +1458,33 @@ class _FakePhoneSession:
                 self.agent.chat_ctx = ctx
             self.agent.update_chat_ctx = update_chat_ctx
 
+    async def start(self, **kwargs):
+        self.start_calls += 1
+        self.started_with = kwargs
+        self._install_agent(kwargs.get("agent"))
+
+    def update_agent(self, agent):
+        self._install_agent(agent)
+
+    async def wait_for_idle(self):
+        return None
+
     def say(self, text, **kwargs):
         self.spoken.append(text)
+        state_handler = self.handlers.get("agent_state_changed")
+        if state_handler is not None:
+            state_handler(types.SimpleNamespace(new_state="speaking"))
         # The REAL SDK appends a conversation item for a spoken line exactly as
         # it does for a generated one. Modelling that is what makes the gate-copy
         # filter testable at all — without it, the fixed disclosure and the
         # booking confirmations never reach the exchange queue in a test and the
         # filter is decorative by construction.
         self.emit_bot_turn(text)
+        if state_handler is not None:
+            state_handler(types.SimpleNamespace(new_state="idle"))
+        if text == phone.PHONE_SILENCE_PROMPT_TEXT and self.silence_reply is not None:
+            reply, self.silence_reply = self.silence_reply, None
+            asyncio.get_event_loop().call_soon(self.emit_user_turn, reply)
         return _FakeSpeech()
 
     def emit_user_turn(self, text):
@@ -1455,7 +1502,11 @@ class _FakePhoneSession:
             try:
                 await self.agent.on_user_turn_completed(ctx, message)
             except sys.modules["livekit.agents"].StopResponse:
-                pass
+                return
+            self.turn_contexts.append(list(ctx.items))
+            # Model AgentActivity's native one-reply scheduling after the hook
+            # returns normally.
+            self.generate_reply()
         asyncio.create_task(complete_turn())
 
     def emit_bot_turn(self, text, *, interrupted=False):
@@ -1482,7 +1533,12 @@ class _FakePhoneSession:
     # the ordering is exactly what the boundary contract depends on.
     def generate_reply(self, instructions=None, **kwargs):
         self.instructions.append(str(instructions or ""))
-        self.emit_bot_turn(f"asked-{len(self.instructions)}")
+        speech = _FakeSpeech()
+        handler = self.handlers.get("speech_created")
+        if handler is not None and (instructions or self.emit_auto_speech):
+            handler(types.SimpleNamespace(speech_handle=speech))
+        interrupted = self.interruptions.pop(0) if self.interruptions else False
+        self.emit_bot_turn(f"asked-{len(self.instructions)}", interrupted=interrupted)
         # A fixed line spoken WHILE a boundary is open — the callback
         # confirmation is the realistic case, because "call me back" can be
         # said in the middle of any question. It must not be committed as part
@@ -1501,143 +1557,11 @@ class _FakePhoneSession:
                 # be exercising a timing the fence exists to refuse.
                 import asyncio as _asyncio
                 _asyncio.get_event_loop().call_soon(self.emit_user_turn, reply)
-        return _FakeSpeech()
+        return speech
 
     def emit_close(self, reason=None):
         handler = self.handlers.get("close")
         handler(types.SimpleNamespace(error=None, reason=reason))
-
-
-class TestPlayoutFence(unittest.IsolatedAsyncioTestCase):
-    """The boundary-drift defect from the first live call: STT finals lag
-    speech, so the tail of the PREVIOUS answer arrives while THIS question's
-    ask is playing out — and was captured into this boundary, drifting every
-    answer one question off and producing the "double answering" transcript.
-    The fence drops candidate finals already queued when playout completes."""
-
-    def _question(self):
-        return phone.PhonePlanQuestion("k1", "Ask about experience.", False, None)
-
-    async def test_a_stale_final_queued_during_playout_is_dropped(self):
-        exchange: "asyncio.Queue[dict[str, str]]" = asyncio.Queue()
-
-        async def generate(instructions):
-            # During playout: the ask's own bot line lands, and the PREVIOUS
-            # answer's late final arrives. The fence must keep the bot line
-            # and drop the stale candidate final.
-            exchange.put_nowait({"speaker": "bot", "text": "the ask"})
-            exchange.put_nowait({"speaker": "candidate", "text": "STALE tail"})
-
-        async def real_answer():
-            await asyncio.sleep(0)
-            exchange.put_nowait({"speaker": "candidate", "text": "the real answer"})
-
-        task = asyncio.ensure_future(real_answer())
-        turns = await agent_mod._ask_phone_question(
-            generate=generate,
-            exchange=exchange,
-            question=self._question(),
-            answer_timeout_sec=1.0,
-            follow_up=False,
-        )
-        await task
-        self.assertEqual(
-            turns,
-            [
-                {"speaker": "bot", "text": "the ask"},
-                {"speaker": "candidate", "text": "the real answer"},
-            ],
-        )
-
-    async def test_an_interrupting_answer_lands_after_the_fence_and_is_kept(self):
-        exchange: "asyncio.Queue[dict[str, str]]" = asyncio.Queue()
-
-        async def generate(instructions):
-            # Interruption cuts playout early: generate returns with NOTHING
-            # queued; the interrupting candidate's final lands afterwards.
-            return None
-
-        async def late_final():
-            await asyncio.sleep(0)
-            exchange.put_nowait({"speaker": "candidate", "text": "answered over the ask"})
-
-        task = asyncio.ensure_future(late_final())
-        turns = await agent_mod._ask_phone_question(
-            generate=generate,
-            exchange=exchange,
-            question=self._question(),
-            answer_timeout_sec=1.0,
-            follow_up=False,
-        )
-        await task
-        # The bot turn was lost to the interruption (repair_exchange_shape owns
-        # that); the answer itself must be captured, not fenced away.
-        self.assertEqual(turns, [{"speaker": "candidate", "text": "answered over the ask"}])
-
-    async def test_role_clarification_does_not_advance_the_planned_question(self):
-        """Production session 828e3ba3: asking which role this is is not an
-        answer to the CRM question and must not earn that question's cursor."""
-        exchange: "asyncio.Queue[dict[str, str]]" = asyncio.Queue()
-        generated: list[str] = []
-        replies = iter([
-            "Which job role did I apply for?",
-            "I keep concise notes and schedule every callback in the CRM.",
-        ])
-
-        async def generate(instructions):
-            generated.append(instructions)
-            exchange.put_nowait({"speaker": "bot", "text": f"ask-{len(generated)}"})
-            asyncio.get_running_loop().call_soon(
-                exchange.put_nowait, {"speaker": "candidate", "text": next(replies)},
-            )
-
-        turns = await agent_mod._ask_phone_question(
-            generate=generate,
-            exchange=exchange,
-            question=self._question(),
-            answer_timeout_sec=1.0,
-            follow_up=False,
-        )
-
-        self.assertEqual(len(generated), 2)
-        self.assertIn("role", generated[1].lower())
-        self.assertEqual(turns[-1]["text"], "I keep concise notes and schedule every callback in the CRM.")
-
-    async def test_hesitation_is_not_committed_as_a_substantive_answer(self):
-        self.assertEqual(
-            phone.candidate_turn_route("Sorry, so I totally forgot which Hmm"),
-            "candidate_question",
-        )
-        exchange: "asyncio.Queue[dict[str, str]]" = asyncio.Queue()
-        generated: list[str] = []
-        replies = iter(["Um", "I have four years of customer-facing experience."])
-
-        async def generate(instructions):
-            generated.append(instructions)
-            exchange.put_nowait({"speaker": "bot", "text": f"ask-{len(generated)}"})
-            asyncio.get_running_loop().call_soon(
-                exchange.put_nowait, {"speaker": "candidate", "text": next(replies)},
-            )
-
-        turns = await agent_mod._ask_phone_question(
-            generate=generate,
-            exchange=exchange,
-            question=self._question(),
-            answer_timeout_sec=1.0,
-            follow_up=False,
-        )
-
-        self.assertEqual(len(generated), 2)
-        self.assertEqual(turns[-1]["text"], "I have four years of customer-facing experience.")
-
-    def test_the_booking_signal_has_a_reader_in_the_agent(self):
-        """Structural: the first live call's tool wrote `bookings` and nothing
-        read it. The assessment call site must wire `booking_made` from the
-        agent's bookings — a reader the signal cannot silently lose again."""
-        import inspect
-        src = inspect.getsource(agent_mod)
-        self.assertIn("booking_made=lambda", src)
-        self.assertIn('getattr(agent, "bookings"', src)
 
 
 class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
@@ -1645,6 +1569,9 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         _FakePhoneSession.instances = []
         _FakePhoneSession.default_answers = []
         _FakePhoneSession.default_mid_turn_says = []
+        _FakePhoneSession.default_interruptions = []
+        _FakePhoneSession.default_silence_reply = None
+        _FakePhoneSession.default_emit_auto_speech = True
         _FakePhoneSession.include_timing = False
 
     async def _run_session(
@@ -1655,6 +1582,9 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         close_after=True,
         client=None,
         replies=None,
+        interruptions=(),
+        silence_reply=None,
+        emit_auto_speech=True,
     ):
         ctx = FakeCtx(_PHONE_ROOM, participants=[_participant()] if participant else [])
         client = client if client is not None else FakeEventClient()
@@ -1662,6 +1592,9 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             list(replies) if replies is not None
             else ["First answer.", "Second answer.", "Third answer."]
         )
+        _FakePhoneSession.default_interruptions = list(interruptions)
+        _FakePhoneSession.default_silence_reply = silence_reply
+        _FakePhoneSession.default_emit_auto_speech = emit_auto_speech
         recording: list[int] = []
 
         async def recording_seam():
@@ -1675,7 +1608,10 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         persistence_spy = MagicMock()
         with patch.object(agent_mod, "AgentSession", _FakePhoneSession), \
              patch.object(agent_mod, "persistence", persistence_spy), \
-             patch.object(agent_mod, "_delete_livekit_room", new_callable=AsyncMock) as delete, \
+             patch.object(
+                 agent_mod, "_delete_livekit_room", new_callable=AsyncMock,
+                 side_effect=lambda _room: client.timeline.append("room.delete"),
+             ) as delete, \
              patch.object(
                  agent_mod, "_phone_recording_permitted", new=recording_seam
              ), \
@@ -1814,11 +1750,49 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             ["start", "turn", "turn", "complete"],
         )
         self.assertEqual(session.spoken[0], phone.PHONE_DISCLOSURE_TEXT)
-        self.assertIn(phone.PHONE_ASSESSMENT_CLOSING_TEXT, session.spoken)
+        terminal_context = str(session.turn_contexts[-1]).lower()
+        self.assertIn("goodbye", terminal_context)
+        self.assertIn("do not ask another question", terminal_context)
         delete.assert_awaited()
         # The worker still writes NOTHING itself: every durable write goes
         # through the API, so the browser's persistence module is untouched.
         self.assertEqual(persistence_spy.mock_calls, [])
+
+    async def test_terminal_persistence_precedes_room_teardown(self):
+        _, client, _, _, _, _ = await self._run_session(answers=("Yes, sure.",))
+        self.assertLess(
+            client.timeline.index("assessment.complete"),
+            client.timeline.index("event:assessment.completed"),
+        )
+        self.assertLess(
+            client.timeline.index("event:assessment.completed"),
+            client.timeline.index("room.delete"),
+        )
+
+    async def test_connectivity_clarification_repeats_without_advancing(self):
+        _, client, _, _, session, _ = await self._run_session(
+            answers=("Yes, sure.",),
+            replies=[
+                "Yeah, can you hear me?",
+                "I have four years of relevant experience.",
+                "I am available to start next month.",
+            ],
+        )
+        self.assertEqual(client.committed_keys, ["k1", "k2"])
+        self.assertEqual(
+            client.boundaries[0]["turns"][-1]["text"],
+            "I have four years of relevant experience.",
+        )
+        self.assertTrue(any("repeat this same planned question" in str(c) for c in session.turn_contexts))
+
+    async def test_interrupted_question_is_committed_once_as_labelled_evidence(self):
+        _, client, _, _, _, _ = await self._run_session(
+            answers=("Yes, sure.",),
+            interruptions=(True, False, False),
+        )
+        first = client.boundaries[0]["turns"]
+        self.assertTrue(first[0]["text"].startswith(phone.INTERRUPTED_QUESTION_PREFIX))
+        self.assertEqual(client.committed_keys.count("k1"), 1)
 
     async def test_an_UNSCORED_completion_falls_back_to_the_truthful_aborted(self):
         """Scoring succeeding is not the same as an assessment existing.
@@ -1976,6 +1950,29 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         # legitimate answer.
         self.assertEqual([c[0] for c in client.assessment_calls], ["start"])
 
+    async def test_ok_boundary_without_server_cursor_releases_no_next_question(self):
+        malformed_ok = phone.PhoneApiOutcome(True, "applied")
+        malformed_ok.cursor = None
+        client = FakeEventClient(commits={"k1": malformed_ok})
+        _, client, _, _, _, _ = await self._run_session(
+            answers=("Yes, sure.",), client=client,
+        )
+        self.assertEqual(client.committed_keys, ["k1"])
+        self.assertNotIn("assessment.completed", client.event_types)
+        self.assertNotIn("assessment.aborted", client.event_types)
+        self.assertNotIn("complete", [call[0] for call in client.assessment_calls])
+
+    async def test_failed_apology_playout_does_not_terminalize_persistence_halt(self):
+        refusal = phone.PhoneApiOutcome(False, "stale_cursor")
+        client = FakeEventClient(commits={"k1": refusal})
+        with patch.object(agent_mod, "PHONE_TERMINAL_REPLY_TIMEOUT_SEC", 0.001):
+            _, client, _, _, _, _ = await self._run_session(
+                answers=("Yes, sure.",), client=client, emit_auto_speech=False,
+            )
+        self.assertEqual(client.committed_keys, ["k1"])
+        self.assertNotIn("assessment.completed", client.event_types)
+        self.assertNotIn("assessment.aborted", client.event_types)
+
     async def test_a_RESUMING_leg_asks_only_what_is_still_owed(self):
         """The whole point of the phase.
 
@@ -2015,10 +2012,13 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             close_after=False,
         )
 
-        self.assertEqual(len(session.instructions), 1)
+        # One seeded question plus one LiveKit-native terminal response.
+        self.assertEqual(len(session.instructions), 2)
         self.assertEqual(client.committed_keys, [])
         self.assertIn("assessment.aborted", client.event_types)
-        self.assertEqual(session.spoken[-1], phone.PHONE_CANDIDATE_END_TEXT)
+        terminal_context = str(session.turn_contexts[-1]).lower()
+        self.assertIn("end the call", terminal_context)
+        self.assertIn("do not ask another question", terminal_context)
         delete.assert_awaited_once_with(_PHONE_ROOM)
 
     async def test_a_silent_candidate_ENDS_the_call_rather_than_looking_like_a_drop(self):
@@ -2039,13 +2039,31 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         # what ends the leg rather than the residency timeout — two different
         # outcomes with two different terminal decisions, and a test that let
         # them race would be asserting whichever won.
-        with patch.object(phone, "phone_answer_timeout_sec", lambda: 0.005):
+        with patch.object(agent_mod, "CANDIDATE_SILENCE_PROMPT_SEC", 0.001), \
+             patch.object(agent_mod, "CANDIDATE_SILENCE_END_SEC", 0.001):
             _, client, _, _, _, _ = await self._run_session(
-                answers=("Yes, that's fine.",), replies=[None, None, None]
+                answers=("Yes, that's fine.",), replies=[None, None, None],
+                close_after=False,
             )
         self.assertEqual(client.committed_keys, [])
         self.assertNotIn("assessment.completed", client.event_types)
         self.assertIn("assessment.aborted", client.event_types)
+
+    async def test_silence_recovery_repeats_question_without_advancing(self):
+        with patch.object(agent_mod, "CANDIDATE_SILENCE_PROMPT_SEC", 0.001), \
+             patch.object(agent_mod, "CANDIDATE_SILENCE_END_SEC", 0.05):
+            _, client, _, _, _, _ = await self._run_session(
+                answers=("Yes, sure.",),
+                replies=[None, "My actual first answer.", "My second answer."],
+                silence_reply="Yes, I'm here.",
+                close_after=False,
+            )
+        self.assertEqual(client.committed_keys, ["k1", "k2"])
+        self.assertEqual(client.boundaries[0]["turns"][-1]["text"], "My actual first answer.")
+        self.assertNotIn(
+            "Yes, I'm here.",
+            [boundary["turns"][-1]["text"] for boundary in client.boundaries],
+        )
 
     async def test_FIXED_COPY_never_lands_inside_a_committed_boundary(self):
         """The disclosure and the booking confirmations are not screening turns.
@@ -2133,6 +2151,56 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         boundary = client.boundaries[0]["turns"]
         self.assertIsInstance(boundary[0]["turn_started_at_ms"], int)
         self.assertIsInstance(boundary[-1]["turn_started_at_ms"], int)
+
+
+class TestNativePhoneArchitecture(unittest.TestCase):
+    def test_no_legacy_phone_scheduler_remains(self):
+        self.assertFalse(hasattr(agent_mod, "_ask_phone_question"))
+        self.assertFalse(hasattr(phone, "run_phone_assessment"))
+        source = inspect.getsource(agent_mod._run_phone_session)
+        self.assertNotIn("exchange", source)
+        self.assertNotIn("booking_made", source)
+
+    def test_sdk_transcript_extras_are_removed_before_logging(self):
+        import logging
+        record = logging.LogRecord("livekit.agents", logging.WARNING, __file__, 1, "x", (), None)
+        record.user_input = "private candidate words"
+        record.transcript = "more private words"
+        self.assertTrue(agent_mod._LIVEKIT_TRANSCRIPT_FILTER.filter(record))
+        self.assertFalse(hasattr(record, "user_input"))
+        self.assertFalse(hasattr(record, "transcript"))
+
+    def test_native_routing_keeps_non_answers_off_the_cursor(self):
+        self.assertEqual(phone.candidate_turn_route("Yeah, can you hear me?"), "connectivity_check")
+        self.assertEqual(phone.candidate_turn_route("I'm busy right now"), "callback_deferral")
+        self.assertEqual(phone.candidate_turn_route("Please call me back tomorrow"), "callback_deferral")
+        self.assertEqual(phone.candidate_turn_route("Um"), "hesitation")
+        self.assertIsNone(phone.candidate_turn_route("I led the support team for four years."))
+
+    def test_silence_copy_cannot_become_boundary_evidence(self):
+        self.assertTrue(phone.is_gate_copy(phone.PHONE_SILENCE_PROMPT_TEXT))
+        self.assertTrue(phone.is_gate_copy(phone.PHONE_SILENCE_GOODBYE_TEXT))
+
+    def test_anchor_order_suppresses_only_provably_stale_finals(self):
+        message = types.SimpleNamespace(
+            metrics={"started_speaking_at": 1723000000.0}, created_at=None,
+        )
+        self.assertTrue(agent_mod._native_turn_predates_question(message, 1723000001000))
+        self.assertFalse(agent_mod._native_turn_predates_question(message, 1722999999000))
+        self.assertFalse(agent_mod._native_turn_predates_question(message, None))
+
+    def test_chat_message_stage_metrics_are_content_free(self):
+        item = types.SimpleNamespace(
+            role="assistant",
+            text_content="must never become a metric label",
+            metrics={"llm_node_ttft": 0.4, "tts_node_ttfb": 0.2, "e2e_latency": 0.8},
+        )
+        with patch.object(agent_mod, "histogram_metric") as emit:
+            agent_mod._record_turn_metrics(item, "phone")
+        self.assertEqual(emit.call_count, 3)
+        rendered = repr(emit.call_args_list)
+        self.assertNotIn("must never", rendered)
+        self.assertNotIn("text_content", rendered)
 
 
 # ── H-3: the instructions must actually be DELIVERED ──────────────────

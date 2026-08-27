@@ -10,6 +10,7 @@ import re
 import time
 import asyncio
 import inspect
+import logging
 from collections.abc import Mapping
 from typing import Any, Awaitable, Callable
 
@@ -51,6 +52,20 @@ GEMINI_BASE_URL = os.getenv(
     "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"
 )
 _log = StructuredLogger("agent")
+
+
+class _LiveKitTranscriptFilter(logging.Filter):
+    """Remove candidate text extras from SDK records before any handler sees them."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.__dict__.pop("user_input", None)
+        record.__dict__.pop("transcript", None)
+        return True
+
+
+_LIVEKIT_TRANSCRIPT_FILTER = _LiveKitTranscriptFilter()
+logging.getLogger("livekit.agents").addFilter(_LIVEKIT_TRANSCRIPT_FILTER)
+
 ROOM_SESSION_RE = re.compile(
     r"^screening-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
     re.IGNORECASE,
@@ -93,6 +108,7 @@ def _float_env(name: str, default: float) -> float:
 
 CANDIDATE_SILENCE_PROMPT_SEC = _float_env("CANDIDATE_SILENCE_PROMPT_SEC", 30.0)
 CANDIDATE_SILENCE_END_SEC = _float_env("CANDIDATE_SILENCE_END_SEC", 20.0)
+PHONE_TERMINAL_REPLY_TIMEOUT_SEC = _float_env("PHONE_TERMINAL_REPLY_TIMEOUT_SEC", 10.0)
 
 
 def _bounded_float_env(name: str, default: float, lo: float, hi: float) -> float:
@@ -168,6 +184,37 @@ def _provider_metric_number(metric: Any, *names: str) -> float | None:
         if isinstance(value, (int, float)):
             return float(value)
     return None
+
+
+_TURN_METRIC_FIELDS: tuple[tuple[str, str], ...] = (
+    ("transcription_delay", "transcription"),
+    ("end_of_turn_delay", "end_of_turn"),
+    ("on_user_turn_completed_delay", "turn_hook"),
+    ("llm_node_ttft", "llm_first_token"),
+    ("tts_node_ttfb", "tts_first_audio"),
+    ("playback_latency", "playback"),
+    ("e2e_latency", "e2e"),
+)
+
+
+def _record_turn_metrics(item: Any, channel: str) -> None:
+    """Emit LiveKit ChatMessage stage timing without content or identifiers."""
+    metrics = getattr(item, "metrics", None)
+    if not isinstance(metrics, Mapping):
+        return
+    role = str(getattr(item, "role", "unknown"))
+    if role not in {"user", "assistant"}:
+        return
+    for field, component in _TURN_METRIC_FIELDS:
+        value = metrics.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        _safe_emit(
+            histogram_metric,
+            "voice_turn_stage_duration_sec",
+            max(0.0, float(value)),
+            {"channel": channel, "component": component, "role": role},
+        )
 
 
 def _record_provider_metrics(event: Any) -> None:
@@ -382,6 +429,16 @@ def _turn_anchor_ms(item: Any) -> int | None:
     if created_at is None:
         return None
     return persistence.normalize_turn_anchor_ms(created_at)
+
+
+def _native_turn_predates_question(message: Any, question_anchor_ms: int | None) -> bool:
+    """True only when both real anchors prove the final belongs before this ask."""
+    started_ms = _turn_anchor_ms(message)
+    return (
+        started_ms is not None
+        and question_anchor_ms is not None
+        and started_ms < question_anchor_ms
+    )
 
 
 # ── Bounded session outcome counter mapping (OBS-06) ────────────────
@@ -775,128 +832,6 @@ def phone_question_instructions(question: "phone.PhonePlanQuestion") -> str:
     return "\n".join(lines)
 
 
-async def _ask_phone_question(
-    *,
-    generate: Callable[[str], Awaitable[Any]],
-    exchange: "asyncio.Queue[dict[str, Any]]",
-    question: "phone.PhonePlanQuestion",
-    answer_timeout_sec: float,
-    follow_up: bool,
-) -> list[dict[str, Any]]:
-    """Put ONE question and collect the ordered exchange that answers it.
-
-    Returns whatever it captured, including nothing. It does NOT decide whether
-    the result is a completed boundary — `phone.valid_boundary_turns` and the
-    database both do, and this function having its own opinion is how the two
-    would drift.
-
-    The wait is bounded by a WALL CLOCK, not by a turn counter: a candidate who
-    goes quiet mid-answer produces no further items at all, so a counter would
-    never be reached.
-    """
-    # Anything already queued belongs to the previous boundary or to the
-    # disclosure exchange. Carrying it forward would attach one question's
-    # answer to another question's key.
-    while not exchange.empty():
-        try:
-            exchange.get_nowait()
-        except asyncio.QueueEmpty:  # pragma: no cover - defensive
-            break
-
-    turns: list[dict[str, str]] = []
-    redirect_count = 0
-    thin_follow_up_used = False
-    instruction = phone_question_instructions(question)
-    deadline = _monotonic() + answer_timeout_sec
-
-    while len(turns) < 12:
-        await generate(instruction)
-        # ── The playout fence (first live call, 2026-08-26) ──────────────
-        # STT finals lag speech. The tail of the PREVIOUS question's answer
-        # regularly arrives while THIS question's ask is playing out, and it
-        # was being captured into this boundary — every answer drifted one
-        # question off, and the model, seeing the stale answer in the new
-        # context, acknowledged it again and re-asked ("double answering").
-        # `generate` has awaited playout, so any CANDIDATE item queued right
-        # now predates this question and is dropped — a partial loss the
-        # previous boundary already tolerated, chosen over a misattribution
-        # the scorer would trust. Bot items are kept: the ask's own line may
-        # legitimately be queued already. A candidate who INTERRUPTS this ask
-        # is unaffected: interruption cuts playout early, and their final
-        # lands after this fence.
-        stale = 0
-        keep: list[dict[str, str]] = []
-        while not exchange.empty():
-            try:
-                fenced = exchange.get_nowait()
-            except asyncio.QueueEmpty:  # pragma: no cover - defensive
-                break
-            if fenced.get("speaker") == "candidate":
-                stale += 1
-            else:
-                keep.append(fenced)
-        for fenced in keep:
-            exchange.put_nowait(fenced)
-        if stale:
-            _log.info(
-                "unknown_event", error_type="phone_stale_finals_dropped",
-                error_category=str(stale),
-            )
-
-        candidate_text: str | None = None
-        while len(turns) < 12:
-            remaining = deadline - _monotonic()
-            if remaining <= 0:
-                return turns
-            try:
-                item = await asyncio.wait_for(exchange.get(), timeout=remaining)
-            except asyncio.TimeoutError:
-                return turns
-            turns.append(item)
-            if item.get("speaker") == "candidate":
-                candidate_text = str(item.get("text") or "").strip()
-                break
-        if candidate_text is None:
-            return turns
-        if phone.is_explicit_end_call_request(candidate_text):
-            return turns
-
-        route = phone.candidate_turn_route(candidate_text)
-        if route is not None:
-            redirect_count += 1
-            if redirect_count >= 3:
-                # Keep the utterances honest, but do not let three fillers or
-                # interviewer questions earn a completed assessment boundary.
-                return turns
-            if route == "hesitation":
-                instruction = (
-                    "Briefly reassure the candidate without changing topic, then "
-                    "repeat the same planned question in fresh, simple words. Ask "
-                    "one question only and wait."
-                )
-            else:
-                instruction = (
-                    "Answer the candidate's question directly and briefly using "
-                    "only the verified role context in your instructions. Never "
-                    "state resume claims as confirmed facts. Then repeat the same "
-                    "planned question naturally, ask nothing else, and wait."
-                )
-            continue
-
-        words = re.findall(r"[A-Za-z0-9]+", candidate_text)
-        if follow_up and not thin_follow_up_used and len(words) < 5:
-            thin_follow_up_used = True
-            guidance = (question.hint or question.text)[:600]
-            instruction = (
-                "Their answer was very short. Ask ONE simple follow-up on the "
-                "same planned topic, then stop and wait. Do not change subject. "
-                f"Follow-up focus: {guidance}"
-            )
-            continue
-        return turns
-    return turns
-
-
 def _compact_phone_resume_evidence(evidence: Any) -> dict[str, Any]:
     """Bound phone prompt evidence to what can improve the next spoken turn."""
     if not isinstance(evidence, dict):
@@ -924,6 +859,26 @@ def _compact_phone_resume_evidence(evidence: Any) -> dict[str, Any]:
     return compact
 
 
+def _phone_instructions_text(state: "phone.PhoneAssessmentState") -> str:
+    """Build the bounded role/evidence instructions shared by native and legacy phone agents."""
+    text = system_prompt(
+        candidate_name=state.candidate_name,
+        role_title=state.role_title,
+        role_focus=(state.role_focus or ", ".join(state.role_required_skills))[:600],
+        resume_facts=prompting_format_resume_facts(
+            _compact_phone_resume_evidence(state.resume_facts)
+        ),
+        questions=(
+            "The exact currently owed question is supplied separately for "
+            "each response. Never select or advance a question yourself."
+        ),
+        interviewer_instructions=(state.interviewer_instructions or "")[:2000],
+    )
+    text = text + phone.PHONE_CALLBACK_POLICY_TEXT
+    resume = phone.render_resume_context(state.turns)
+    return f"{text}\n\n{resume}" if resume else text
+
+
 async def _apply_phone_instructions(agent: Any, state: "phone.PhoneAssessmentState") -> bool:
     """Give the agent the REAL instructions, once the plan is known.
 
@@ -945,28 +900,7 @@ async def _apply_phone_instructions(agent: Any, state: "phone.PhoneAssessmentSta
     keyed and committed correctly; the questions are simply less tailored.
     """
     try:
-        # The durable loop supplies the exact owed question to every
-        # `generate_reply`. Repeating the entire 100-question bank here only
-        # enlarges the cold first request and invites the model to jump ahead.
-        # Keep role/evidence context, but make question identity single-source.
-        text = system_prompt(
-            candidate_name=state.candidate_name,
-            role_title=state.role_title,
-            role_focus=(state.role_focus or ", ".join(state.role_required_skills))[:600],
-            resume_facts=prompting_format_resume_facts(
-                _compact_phone_resume_evidence(state.resume_facts)
-            ),
-            questions=(
-                "The exact currently owed question is supplied separately for "
-                "each response. Never select or advance a question yourself."
-            ),
-            interviewer_instructions=(state.interviewer_instructions or "")[:2000],
-        )
-        text = text + phone.PHONE_CALLBACK_POLICY_TEXT
-        resume = phone.render_resume_context(state.turns)
-        if resume:
-            text = f"{text}\n\n{resume}"
-        return await _deliver_phone_instructions(agent, text)
+        return await _deliver_phone_instructions(agent, _phone_instructions_text(state))
     except Exception:  # noqa: BLE001
         _log.warn(
             "unknown_event", error_type="phone_instructions_not_applied",
@@ -1154,9 +1088,13 @@ async def _run_native_phone_screening(
     room_name: str,
     result: phone.PhoneGateResult,
     latest_assistant: list[str | None],
+    latest_assistant_anchor: list[int | None],
     candidate_end_requested: asyncio.Event,
     reply_started: asyncio.Event,
+    reply_handle: list[Any],
     candidate_activity: asyncio.Event,
+    agent_listening: asyncio.Event,
+    agent_activity_changed: asyncio.Event,
     close_event: asyncio.Event,
 ) -> phone.PhoneGateResult:
     """Run post-consent screening through LiveKit's native turn lifecycle.
@@ -1170,124 +1108,248 @@ async def _run_native_phone_screening(
     completed = list(state.completed_keys)
     finished = asyncio.Event()
     terminal_reason: dict[str, str] = {}
+    terminal_reply_required = {"value": False}
+    silence_prompted = {"value": False}
 
     async def wait_for_activity(timeout: float) -> str:
         """Wait on LiveKit activity or close without creating a turn queue."""
         activity = asyncio.create_task(candidate_activity.wait())
+        agent_changed = asyncio.create_task(agent_activity_changed.wait())
         closed = asyncio.create_task(close_event.wait())
         try:
             done, _ = await asyncio.wait(
-                (activity, closed), timeout=max(0.0, timeout),
+                (activity, agent_changed, closed), timeout=max(0.0, timeout),
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if closed in done:
                 return "closed"
             if activity in done:
                 return "activity"
+            if agent_changed in done:
+                return "agent_state"
             return "timeout"
         finally:
-            for task in (activity, closed):
+            for task in (activity, agent_changed, closed):
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(activity, closed, return_exceptions=True)
+            await asyncio.gather(activity, agent_changed, closed, return_exceptions=True)
 
     async def native_silence_loop() -> None:
         """Use LiveKit state/activity as the only phone inactivity authority."""
         while not finished.is_set():
+            if not agent_listening.is_set():
+                ready = asyncio.create_task(agent_listening.wait())
+                closed = asyncio.create_task(close_event.wait())
+                try:
+                    done, _ = await asyncio.wait(
+                        (ready, closed), return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if closed in done and not finished.is_set():
+                        terminal_reason.setdefault("reason", "disconnect")
+                        finished.set()
+                finally:
+                    for task in (ready, closed):
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(ready, closed, return_exceptions=True)
+                continue
             candidate_activity.clear()
+            agent_activity_changed.clear()
             outcome = await wait_for_activity(CANDIDATE_SILENCE_PROMPT_SEC)
             if outcome != "timeout":
-                if outcome == "closed":
-                    terminal_reason["reason"] = "disconnect"
+                if outcome == "closed" and not finished.is_set():
+                    terminal_reason.setdefault("reason", "disconnect")
                     finished.set()
                 continue
+            silence_prompted["value"] = True
             prompt = session.say(
-                "Are you still there? No worries if you need a moment.",
+                phone.PHONE_SILENCE_PROMPT_TEXT,
                 allow_interruptions=True,
             )
             wait = getattr(prompt, "wait_for_playout", None)
             if callable(wait):
                 await wait()
+            if candidate_activity.is_set():
+                continue
+            candidate_activity.clear()
+            # Ignore the prompt's own speaking→idle transitions. New agent
+            # activity in the second window still wakes the wait below.
+            agent_activity_changed.clear()
             outcome = await wait_for_activity(CANDIDATE_SILENCE_END_SEC)
             if outcome != "timeout":
                 continue
             goodbye = session.say(
-                "Looks like you're unavailable, so I'll end the screening here. "
-                "Thanks for your time, and goodbye.",
+                phone.PHONE_SILENCE_GOODBYE_TEXT,
                 allow_interruptions=True,
             )
             wait = getattr(goodbye, "wait_for_playout", None)
             if callable(wait):
                 await wait()
-            if not candidate_activity.is_set() and not close_event.is_set():
-                terminal_reason["reason"] = phone.HALT_NO_ANSWER
+            if (
+                not finished.is_set()
+                and not candidate_activity.is_set()
+                and not close_event.is_set()
+            ):
+                terminal_reason.setdefault("reason", phone.HALT_NO_ANSWER)
                 finished.set()
 
     silence_task = asyncio.create_task(native_silence_loop())
 
-    async def set_instructions(question: Any | None, *, closing: bool = False) -> None:
-        if closing:
-            text = (
-                "Thank the candidate briefly and say exactly: Thanks for your time, "
-                "and goodbye. Do not ask another question."
+    def add_turn_instruction(turn_ctx: Any, text: str) -> None:
+        """Add an instruction only to the SDK's temporary context for this reply."""
+        add_message = getattr(turn_ctx, "add_message", None)
+        if callable(add_message):
+            add_message(role="developer", content=text)
+            return
+        items = getattr(turn_ctx, "items", None)
+        if isinstance(items, list):
+            items.append({"role": "developer", "content": text})
+            return
+        raise RuntimeError("phone_turn_context_unavailable")
+
+    async def wait_for_terminal_reply() -> bool:
+        try:
+            await asyncio.wait_for(
+                reply_started.wait(), timeout=PHONE_TERMINAL_REPLY_TIMEOUT_SEC,
             )
-        elif question is not None:
-            text = phone.phone_question_instructions(question)
-        else:
-            text = "Do not say anything further."
-        update = getattr(agent, "update_instructions", None)
-        if callable(update):
-            value = update(text)
+        except asyncio.TimeoutError:
+            return False
+        handle = reply_handle[0]
+        wait = getattr(handle, "wait_for_playout", None)
+        if callable(wait):
+            value = wait()
             if inspect.isawaitable(value):
                 await value
-        else:
-            agent.instructions = text
+        return handle is not None
 
     async def on_native_turn(
         text: str, message: Any = None, turn_ctx: Any = None,
     ) -> None:
         nonlocal cursor
+        if finished.is_set():
+            # A terminal decision already owns the leg. Suppress only this late
+            # terminal-race turn; ordinary turns always return to LiveKit.
+            from livekit.agents import StopResponse  # noqa: PLC0415
+            raise StopResponse()
         if candidate_end_requested.is_set() or phone.is_explicit_end_call_request(text):
             candidate_end_requested.set()
+            add_turn_instruction(
+                turn_ctx,
+                "Say exactly: Of course. I'll end the call now. Thanks for your time, "
+                "and goodbye. Do not ask another question.",
+            )
+            reply_handle[0] = None
+            reply_started.clear()
+            terminal_reply_required["value"] = True
             terminal_reason["reason"] = phone.HALT_CANDIDATE_ENDED
             finished.set()
             return
-        if phone.candidate_turn_route(text) is not None:
-            question = state.question_at(cursor)
-            await set_instructions(question)
+        question = state.question_at(cursor)
+        if silence_prompted["value"]:
+            silence_prompted["value"] = False
+            if question is not None:
+                add_turn_instruction(turn_ctx, phone_question_instructions(question))
             return
+
+        route = phone.candidate_turn_route(text)
+        if route is not None:
+            if question is not None and route == "callback_deferral":
+                add_turn_instruction(
+                    turn_ctx,
+                    "Acknowledge that this is not a good time. Offer to schedule a callback, "
+                    "ask for the time if needed, and use schedule_callback once the time is "
+                    "clear. Do not answer or advance the planned interview question.",
+                )
+            elif question is not None:
+                add_turn_instruction(
+                    turn_ctx,
+                    "Answer the candidate briefly using only verified role context, then "
+                    "repeat this same planned question and wait:\n" + question.text,
+                )
+            return
+
+        if _native_turn_predates_question(message, latest_assistant_anchor[0]):
+            _log.info(
+                "unknown_event",
+                error_type="phone_stale_final_suppressed",
+                error_category="anchor_order",
+            )
+            from livekit.agents import StopResponse  # noqa: PLC0415
+            raise StopResponse()
+
         question = state.question_at(cursor)
         prompt = (latest_assistant[0] or "").strip()
         if question is None or not prompt:
+            add_turn_instruction(
+                turn_ctx,
+                "Say exactly: I'm sorry, I can't safely continue this screening right now. "
+                "Thanks for your time. Do not ask another question.",
+            )
+            reply_handle[0] = None
+            reply_started.clear()
+            terminal_reply_required["value"] = True
             terminal_reason["reason"] = phone.HALT_MALFORMED_EXCHANGE
             finished.set()
             return
         turns = [
-            {"speaker": "bot", "text": prompt},
-            {"speaker": "candidate", "text": text},
+            {
+                "speaker": "bot", "text": prompt,
+                "turn_started_at_ms": latest_assistant_anchor[0],
+            },
+            {
+                "speaker": "candidate", "text": text,
+                "turn_started_at_ms": _turn_anchor_ms(message),
+            },
         ]
         outcome = await events.commit_boundary(
             session_id, question.key, cursor,
             phone.plan_source_event_id(question.key), turns,
         )
         if not outcome.ok:
+            add_turn_instruction(
+                turn_ctx,
+                "Say exactly: I'm sorry, I can't safely continue this screening right now. "
+                "Thanks for your time. Do not ask another question.",
+            )
+            reply_handle[0] = None
+            reply_started.clear()
+            terminal_reply_required["value"] = True
+            terminal_reason["reason"] = phone.HALT_PERSISTENCE
+            finished.set()
+            return
+        advanced = outcome.cursor
+        if advanced != cursor + 1:
+            add_turn_instruction(
+                turn_ctx,
+                "Say exactly: I'm sorry, I can't safely continue this screening right now. "
+                "Thanks for your time. Do not ask another question.",
+            )
+            reply_handle[0] = None
+            reply_started.clear()
+            terminal_reply_required["value"] = True
             terminal_reason["reason"] = phone.HALT_PERSISTENCE
             finished.set()
             return
         if question.key not in completed:
             completed.append(question.key)
-        advanced = outcome.cursor
-        cursor = advanced if advanced is not None and advanced > cursor else cursor + 1
+        cursor = advanced
         next_question = state.question_at(cursor)
         if next_question is None:
-            await set_instructions(None, closing=True)
+            add_turn_instruction(
+                turn_ctx,
+                "Thank the candidate briefly and say exactly: Thanks for your time, "
+                "and goodbye. Do not ask another question.",
+            )
             # The native reply is scheduled only after this hook returns. Keep
-            # terminalization behind its first audio signal so room teardown
-            # cannot cut off the final response.
+            # terminalization behind complete playout so room teardown cannot
+            # cut off the final response.
+            reply_handle[0] = None
             reply_started.clear()
+            terminal_reply_required["value"] = True
             terminal_reason["reason"] = "completed"
+            finished.set()
         else:
-            await set_instructions(next_question)
+            add_turn_instruction(turn_ctx, phone_question_instructions(next_question))
         # Do not generate or wait for speech here. Returning hands the turn back
         # to AgentActivity, which owns the native single-reply path.
 
@@ -1305,7 +1367,7 @@ async def _run_native_phone_screening(
             finished.set()
 
     screening_agent = phone.phone_agent_class(Agent)(
-        getattr(agent, "instructions", ""),
+        _phone_instructions_text(state),
         client=events,
         attempt_id=attempt_id,
         say=native_say,
@@ -1320,48 +1382,61 @@ async def _run_native_phone_screening(
     if inspect.isawaitable(value):
         await value
     agent = screening_agent
-    await set_instructions(state.question_at(cursor))
+    wait_for_idle = getattr(session, "wait_for_idle", None)
+    if callable(wait_for_idle):
+        value = wait_for_idle()
+        if inspect.isawaitable(value):
+            await value
 
     question = state.question_at(cursor)
     if question is None:
-        await set_instructions(None, closing=True)
+        terminal_reason["reason"] = "completed"
+        finished.set()
     else:
         speech = session.generate_reply(
-            instructions=phone.phone_question_instructions(question),
+            instructions=phone_question_instructions(question),
         )
         if inspect.isawaitable(speech):
             await speech
 
     try:
-        await asyncio.wait_for(finished.wait(), timeout=phone.phone_answer_timeout_sec())
+        # This bounds the whole leg, not one answer. Per-turn inactivity is
+        # owned by the LiveKit activity-driven silence loop above.
+        await asyncio.wait_for(finished.wait(), timeout=SESSION_MAX_RESIDENCY_SEC)
     except asyncio.TimeoutError:
-        terminal_reason["reason"] = phone.HALT_NO_ANSWER
+        terminal_reason["reason"] = "residency_timeout"
     finally:
         silence_task.cancel()
         await asyncio.gather(silence_task, return_exceptions=True)
 
     reason = terminal_reason.get("reason")
+    if terminal_reply_required["value"]:
+        terminal_reply_played = await wait_for_terminal_reply()
+        if reason == "completed" and not terminal_reply_played:
+            reason = phone.HALT_NO_ANSWER
+
     if reason == "completed":
-        try:
-            await asyncio.wait_for(reply_started.wait(), timeout=10.0)
-        except asyncio.TimeoutError:
-            terminal_reason["reason"] = phone.HALT_NO_ANSWER
-            reason = terminal_reason["reason"]
-        if reason == "completed":
+        done = None
+        for _ in range(3):
             done = await events.complete_assessment(attempt_id, session_id)
-            if done.ok:
-                await events.post_event(attempt_id, "assessment.completed")
-            else:
-                await events.post_event(attempt_id, "assessment.aborted")
-        else:
-            # The final reply did not start, so this leg is not a verified
-            # completion. Keep the truthful non-scored terminal outcome.
+            if done.ok or not phone.retryable_completion(done):
+                break
+        if done is not None and done.ok:
+            await events.post_event(attempt_id, "assessment.completed")
+        elif done is not None and done.status is not None:
+            # A known non-score verdict is truthfully terminal. A transport
+            # failure has no status and remains non-terminal for recovery.
             await events.post_event(attempt_id, "assessment.aborted")
-    elif reason == phone.HALT_CANDIDATE_ENDED:
+    elif reason in {phone.HALT_CANDIDATE_ENDED, phone.HALT_NO_ANSWER}:
         await events.post_event(attempt_id, "assessment.aborted")
-    elif reason in {phone.HALT_PERSISTENCE, phone.HALT_MALFORMED_EXCHANGE}:
-        # No boundary was released; leave the attempt non-terminal for the
-        # existing reconnect/recovery path.
+    elif reason in {
+        phone.HALT_CALLBACK_SCHEDULED,
+        phone.HALT_PERSISTENCE,
+        phone.HALT_MALFORMED_EXCHANGE,
+        "disconnect",
+    }:
+        # Callback already changed the engagement; infrastructure and transport
+        # halts remain non-terminal for existing reconnect/recovery ownership.
         pass
     else:
         await events.post_event(attempt_id, "assessment.aborted")
@@ -1382,29 +1457,27 @@ async def _run_phone_session(
     await ctx.connect()
     events = client if client is not None else phone.PhoneEventClient()
 
+    # Candidate-only queue used exclusively by the pre-consent disclosure
+    # classifier. Post-consent turns remain inside LiveKit AgentSession.
     user_turns: "asyncio.Queue[str]" = asyncio.Queue()
-    # 0044: the ORDERED exchange, both speakers, in the order the SDK produced
-    # them. `user_turns` stays a separate, candidate-only queue because the
-    # disclosure classifier reads it and must not be handed the bot's own
-    # lines. Two queues rather than one filtered read: a filter is a thing a
-    # later edit can forget to apply.
-    exchange: "asyncio.Queue[dict[str, Any]]" = asyncio.Queue()
     candidate_activity = asyncio.Event()
+    agent_listening = asyncio.Event()
+    agent_listening.set()
+    agent_activity_changed = asyncio.Event()
     candidate_end_requested = asyncio.Event()
-    # Monotonic, process-local and content-free. Read exactly once by the next
-    # scripted generation so we can measure the candidate-turn -> generation
-    # scheduling gap without logging a room, candidate, transcript or ID.
-    candidate_turn_observed_at: list[float | None] = [None]
     close_event = asyncio.Event()
     close_reason: dict[str, Any] = {}
     # Used only as evidence for the server-keyed native boundary.
     latest_assistant: list[str | None] = [None]
+    latest_assistant_anchor: list[int | None] = [None]
 
     session = _build_phone_provider_session()
     reply_started = asyncio.Event()
+    reply_handle: list[Any] = [None]
 
     @session.on("speech_created")
     def _on_phone_speech_created(event):  # noqa: ANN001
+        reply_handle[0] = getattr(event, "speech_handle", None)
         reply_started.set()
 
     @session.on("user_state_changed")
@@ -1412,12 +1485,27 @@ async def _run_phone_session(
         if getattr(event, "new_state", None) == "speaking":
             candidate_activity.set()
 
+    @session.on("user_input_transcribed")
+    def _on_phone_transcript_activity(event):  # noqa: ANN001
+        if str(getattr(event, "transcript", "") or "").strip():
+            candidate_activity.set()
+
+    @session.on("agent_state_changed")
+    def _on_phone_agent_state_changed(event):  # noqa: ANN001
+        if getattr(event, "new_state", None) in {"idle", "listening"}:
+            agent_listening.set()
+        else:
+            agent_listening.clear()
+        # Wake the inactivity controller without pretending the candidate spoke.
+        agent_activity_changed.set()
+
     @session.on("conversation_item_added")
     def _on_phone_item(event):  # noqa: ANN001
         item = getattr(event, "item", None)
         role = getattr(item, "role", None)
         if role not in {"user", "assistant"}:
             return
+        _record_turn_metrics(item, "phone")
         interrupted = role == "assistant" and getattr(item, "interrupted", False)
         text = _item_text(item)
         if interrupted:
@@ -1428,13 +1516,11 @@ async def _run_phone_session(
             text = (phone.INTERRUPTED_QUESTION_PREFIX + text).strip()
         if not text:
             return
-        # Candidate turns are delivered by PhoneScreeningAgent's
-        # on_user_turn_completed hook. That hook commits the turn to context,
-        # feeds both queues, and raises StopResponse so LiveKit cannot generate
-        # an autonomous second answer beside the scripted assessment loop.
+        # Candidate turns are owned by LiveKit's completed-turn hook. Assistant
+        # items are retained only as evidence for the server-keyed boundary.
         if role == "user":
+            candidate_activity.set()
             return
-        latest_assistant[0] = text
         if phone.is_gate_copy(text):
             # FIXED COPY IS NOT A SCREENING TURN. The disclosure, the re-ask,
             # every refusal closing, the callback confirmations and the closing
@@ -1444,11 +1530,8 @@ async def _run_phone_session(
             # captured inside whichever question's boundary happened to be open
             # and committed as part of the candidate's answer.
             return
-        exchange.put_nowait({
-            "speaker": "candidate" if role == "user" else "bot",
-            "text": text,
-            "turn_started_at_ms": _turn_anchor_ms(item),
-        })
+        latest_assistant[0] = text
+        latest_assistant_anchor[0] = _turn_anchor_ms(item)
 
     @session.on("close")
     def _on_phone_close(event):  # noqa: ANN001
@@ -1463,13 +1546,7 @@ async def _run_phone_session(
 
     def on_candidate_turn(text: str, message: Any = None) -> None:
         candidate_activity.set()
-        candidate_turn_observed_at[0] = _monotonic()
         user_turns.put_nowait(text)
-        exchange.put_nowait({
-            "speaker": "candidate",
-            "text": text,
-            "turn_started_at_ms": _turn_anchor_ms(message) if message is not None else None,
-        })
         if phone.is_explicit_end_call_request(text):
             candidate_end_requested.set()
 
@@ -1660,169 +1737,29 @@ async def _run_phone_session(
             await _close_phone_room(room_name)
             return result
 
-        # Native parity path: the completed-turn hook performs only durable
-        # coordination; LiveKit owns ordinary replies and interruptions. Test
-        # doubles from the pre-native suite lack `update_agent`; they continue
-        # through the compatibility path below until their event model is
-        # migrated, while the production SDK always takes this branch.
-        if callable(getattr(session, "update_agent", None)):
-            return await _run_native_phone_screening(
-                session=session,
-                agent=agent,
-                events=events,
-                state=state,
-                attempt_id=attempt_id,
-                session_id=session_id,
-                room_name=room_name,
-                result=result,
-                latest_assistant=latest_assistant,
-                candidate_end_requested=candidate_end_requested,
-                reply_started=reply_started,
-                candidate_activity=candidate_activity,
-                close_event=close_event,
-            )
-
-        # The legacy scripted path is retained only for compatibility with
-        # older injected test sessions and is not reachable in production.
-        # The plan is now known, so the agent is given the REAL instructions: the
-        # candidate's name and the ordered question flow, in the same shape the
-        # browser path has always used.
-        if not await _apply_phone_instructions(agent, state):
-            # The screening still runs — the question text reaches the model
-            # through `generate_reply`, and every boundary is still keyed and
-            # committed by the cursor. What is lost is the tailoring and the
-            # resume replay, so this is worth SEEING rather than swallowing.
-            _log.warn(
-                "unknown_event", error_type="phone_instructions_not_applied",
-                error_category="not_delivered",
-            )
-
-        silence_task = asyncio.create_task(
-            _silence_termination_loop(
-                session,
-                candidate_activity,
-                lambda: _close_phone_room(room_name),
-                prompt_after_sec=CANDIDATE_SILENCE_PROMPT_SEC,
-                end_after_sec=CANDIDATE_SILENCE_END_SEC,
-            )
+        # The production SDK must expose the public handoff API. Failing here
+        # is safer than reviving a second speech scheduler.
+        if not callable(getattr(session, "update_agent", None)):
+            raise RuntimeError("native_phone_agent_handoff_unavailable")
+        return await _run_native_phone_screening(
+            session=session,
+            agent=agent,
+            events=events,
+            state=state,
+            attempt_id=attempt_id,
+            session_id=session_id,
+            room_name=room_name,
+            result=result,
+            latest_assistant=latest_assistant,
+            latest_assistant_anchor=latest_assistant_anchor,
+            candidate_end_requested=candidate_end_requested,
+            reply_started=reply_started,
+            reply_handle=reply_handle,
+            candidate_activity=candidate_activity,
+            agent_listening=agent_listening,
+            agent_activity_changed=agent_activity_changed,
+            close_event=close_event,
         )
-
-        async def generate(instructions: str) -> None:
-            observed_at = candidate_turn_observed_at[0]
-            if observed_at is not None:
-                delay = max(0.0, _monotonic() - observed_at)
-                candidate_turn_observed_at[0] = None
-                _safe_emit(
-                    histogram_metric,
-                    "phone_turn_to_generation_sec",
-                    round(delay, 3),
-                )
-                _log.info(
-                    "unknown_event",
-                    error_type="phone_turn_to_generation",
-                    duration_sec=round(delay, 3),
-                )
-            speech = session.generate_reply(instructions=instructions)
-            if inspect.isawaitable(speech):
-                speech = await speech
-            wait_for_playout = getattr(speech, "wait_for_playout", None)
-            if callable(wait_for_playout):
-                await wait_for_playout()
-
-        async def ask(question: Any, cursor: int) -> list[dict[str, Any]]:
-            captured = await _ask_phone_question(
-                generate=generate,
-                exchange=exchange,
-                question=question,
-                answer_timeout_sec=phone.phone_answer_timeout_sec(),
-                follow_up=bool(question.hint),
-            )
-            # Repair the capture artefacts real telephony produces (a question
-            # answered over its tail loses its bot turn to the interrupted-item
-            # drop; an unanswered follow-up leaves a trailing bot turn) using
-            # the PLAN's own question text — never inventing an answer. See
-            # phone.repair_exchange_shape for the full contract.
-            return phone.repair_exchange_shape(captured, question.text)
-
-        try:
-            assessment = await asyncio.wait_for(
-                phone.run_phone_assessment(
-                    attempt_id=attempt_id,
-                    session_id=session_id,
-                    client=events,
-                    state=state,
-                    ask=ask,
-                    say=say,
-                    # The schedule_callback tool records its outcomes on the
-                    # agent; a CONFIRMED booking (booked=True — the tool's own
-                    # fail-closed verdict, never prose) ends the leg. This is
-                    # the reader the signal never had.
-                    booking_made=lambda: any(
-                        bool(getattr(t, "booked", False))
-                        for t in (getattr(agent, "bookings", None) or [])
-                    ),
-                    candidate_requested_end=candidate_end_requested.is_set,
-                ),
-                timeout=SESSION_MAX_RESIDENCY_SEC,
-            )
-        except asyncio.TimeoutError:
-            # The residency cap. Nothing is claimed and nothing is terminalised as
-            # a persistence failure: the conversation ran out of room, which is the
-            # `assessment.aborted` case.
-            assessment = phone.PhoneAssessmentResult()
-        finally:
-            silence_task.cancel()
-            await asyncio.gather(silence_task, return_exceptions=True)
-
-        # ── THE CONDITIONAL P4a DELIBERATELY LEFT OUT ─────────────────────
-        # P4a posted `assessment.aborted` UNCONDITIONALLY and said so out loud:
-        # the conditional belonged back here "when the persistence path exists,
-        # and its condition must be 'scoring SUCCEEDED', not 'the room closed
-        # cleanly'". This is that conditional, and that is its condition.
-        #
-        # `assessment.completed` drives 0042 to terminal `completed`, which every
-        # downstream reader treats as a SCORED screening — so it is posted only
-        # when the API has VERIFIED an assessment row exists. 0044's
-        # `apply_phone_event` refuses the event anyway if the row is absent, so
-        # this is the first of two gates rather than the only one.
-        if assessment.halt_reason == phone.HALT_CANDIDATE_ENDED:
-            # A candidate asking to disconnect owns the latency budget. Speak
-            # the fixed acknowledgment while the durable abort event is in
-            # flight, then tear down the room immediately after playout. The
-            # assessment loop has already stopped, so no later question can be
-            # scheduled beside this goodbye.
-            abort_task = asyncio.create_task(
-                events.post_event(attempt_id, "assessment.aborted")
-            )
-            await say(phone.PHONE_CANDIDATE_END_TEXT)
-            await _close_phone_room(room_name)
-            await asyncio.gather(abort_task, return_exceptions=True)
-            return result
-        if assessment.scored:
-            await events.post_event(attempt_id, "assessment.completed")
-        elif phone.halt_is_retryable(assessment.halt_reason):
-            # AN INFRASTRUCTURE FAILURE POSTS NOTHING.
-            # The conversation is not over, it is interrupted. Both terminal
-            # events available here would end the engagement: `assessment.aborted`
-            # is terminal `failed`, and `assessment.completed` would be a lie. A
-            # dropped or unwritable leg is what 0042's reconnect budget is FOR, and
-            # the webhook's `sip.participant_left` drives it. Posting a terminal
-            # event here would convert a retryable problem into a lost candidate —
-            # the mirror of the P4a defect: stopping something that fails loudly
-            # can make it fail silently, so this branch is logged.
-            #
-            # ONLY the infrastructure halts reach here. A candidate who simply
-            # stopped answering is NOT a line drop, and laundering it into one
-            # would let the webhook grant and CHARGE a reconnect — dialling that
-            # candidate back up to three times for having gone quiet.
-            _log.warn(
-                "unknown_event", error_type="phone_assessment_halted_leg",
-                error_category=assessment.halt_reason,
-            )
-        else:
-            await events.post_event(attempt_id, "assessment.aborted")
-        await _close_phone_room(room_name)
-        return result
 
     heartbeat_task = asyncio.create_task(
         phone.run_phone_heartbeat(
@@ -2232,6 +2169,7 @@ async def _run_session(
                 role = getattr(item, "role", None)
                 if role not in {"assistant", "user"}:
                     return
+                _record_turn_metrics(item, "webrtc")
                 if role == "assistant" and getattr(item, "interrupted", False):
                     return
                 text = _item_text(item)
