@@ -9,6 +9,7 @@
 import type { TranscriptLine } from '../../types';
 import { SkeletonText } from '../design/Skeleton';
 import { cx } from '../design/cx';
+import { presentTranscriptTurn } from '../../lib/transcript-presentation';
 
 export interface TranscriptListProps {
   transcript: TranscriptLine[];
@@ -60,13 +61,14 @@ export function TranscriptList({
       <ul className="space-y-3">
         {transcript.map((line, index) => {
           const isBot = line.speaker === 'bot';
+          const presented = presentTranscriptTurn(line.speaker, line.text);
           return (
             <li
               key={index}
               className={cx('flex flex-col', isBot ? 'items-start' : 'items-end')}
             >
               <span className="mb-0.5 px-1 text-[11px] font-medium uppercase tracking-wide text-ink-tertiary">
-                {isBot ? 'Bot' : 'Candidate'}
+                {presented.label}
               </span>
               <div
                 className={cx(
@@ -76,7 +78,7 @@ export function TranscriptList({
                     : 'rounded-tr-sm bg-brand-600 text-white',
                 )}
               >
-                {line.text}
+                {presented.text}
               </div>
             </li>
           );

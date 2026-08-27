@@ -4,6 +4,7 @@ import { api, ApiError } from "../api";
 import { Scorecard } from "./Scorecard";
 import { Card } from "./ui";
 import type { Assessment, Recommendation } from "../types";
+import { presentTranscriptTurn } from "../lib/transcript-presentation";
 
 /* ---------------- Row types (screening_v2 schema) ---------------- */
 
@@ -263,13 +264,16 @@ export function LiveCallPanel({
           ) : (
             turns.map((turn) => {
               const isBot = turn.speaker === "bot";
+              const presented = presentTranscriptTurn(turn.speaker, turn.text);
               return (
                 <div
                   key={turn.id}
                   className={`flex flex-col ${isBot ? "items-start" : "items-end"}`}
                 >
                   <span className="mb-0.5 px-1 text-[11px] font-medium text-gray-400">
-                    {isBot ? "Christy" : candidateName || "Candidate"}
+                    {presented.plannedEvidence
+                      ? presented.label
+                      : isBot ? "Christy" : candidateName || "Candidate"}
                   </span>
                   <div
                     className={`max-w-[85%] whitespace-pre-wrap rounded-2xl px-3.5 py-2 text-sm leading-relaxed ${
@@ -278,7 +282,7 @@ export function LiveCallPanel({
                         : "rounded-tr-sm bg-accent-600 text-white"
                     }`}
                   >
-                    {turn.text}
+                    {presented.text}
                   </div>
                 </div>
               );
