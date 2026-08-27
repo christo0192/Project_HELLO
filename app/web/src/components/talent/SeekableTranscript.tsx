@@ -17,6 +17,7 @@ import { useEffect, useRef, useState, useMemo } from 'react';
 import type { TranscriptLine } from '../../types';
 import { cx } from '../design/cx';
 import { SkeletonText } from '../design/Skeleton';
+import { presentTranscriptTurn } from '../../lib/transcript-presentation';
 
 export interface SeekableTranscriptProps {
   transcript: TranscriptLine[];
@@ -73,8 +74,8 @@ export function SeekableTranscript({
   useEffect(() => {
     if (activeTurnIndex != null && transcript[activeTurnIndex]) {
       const t = transcript[activeTurnIndex];
-      const speaker = t.speaker === 'bot' ? 'Bot' : 'Candidate';
-      setAnnouncement(`Now playing turn ${activeTurnIndex + 1}: ${speaker}`);
+      const presented = presentTranscriptTurn(t.speaker, t.text);
+      setAnnouncement(`Now playing turn ${activeTurnIndex + 1}: ${presented.label}`);
     }
   }, [activeTurnIndex, transcript]);
 
@@ -128,7 +129,8 @@ export function SeekableTranscript({
           {transcript.map((turn, index) => {
             const timed = hasTiming(turn);
             const active = activeTurnIndex === index;
-            const speaker = turn.speaker === 'bot' ? 'Bot' : 'Candidate';
+            const presented = presentTranscriptTurn(turn.speaker, turn.text);
+            const speaker = presented.label;
 
             if (timed) {
               return (
@@ -156,7 +158,7 @@ export function SeekableTranscript({
                       </span>
                     </span>
                     <span className="mt-0.5 block whitespace-pre-wrap text-sm leading-relaxed text-ink">
-                      {turn.text}
+                      {presented.text}
                     </span>
                   </button>
                 </li>
@@ -178,7 +180,7 @@ export function SeekableTranscript({
                     </span>
                   </span>
                   <span className="mt-0.5 block whitespace-pre-wrap text-sm leading-relaxed text-ink">
-                    {turn.text}
+                    {presented.text}
                   </span>
                 </div>
               </li>

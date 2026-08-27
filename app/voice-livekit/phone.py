@@ -429,6 +429,7 @@ def gate_copy_texts() -> frozenset[str]:
         PHONE_OPT_OUT_TEXT,
         PHONE_WRONG_NUMBER_TEXT,
         PHONE_ASSESSMENT_CLOSING_TEXT,
+        PHONE_CANDIDATE_END_TEXT,
         _SCHEDULE_CONFIRMED_TEXT,
         _SCHEDULE_REFUSAL_FALLBACK,
         *_SCHEDULE_REFUSAL_TEXT.values(),
@@ -1106,6 +1107,9 @@ PHONE_ASSESSMENT_CLOSING_TEXT = (
     "That's everything I needed from my side. Thanks so much for your time "
     "today — the team will be in touch about next steps. Take care, bye."
 )
+PHONE_CANDIDATE_END_TEXT = (
+    "Of course. I'll end the call now. Thanks for your time. Goodbye."
+)
 
 # Halt reasons. Every one stops the loop; they do NOT all mean the same thing
 # afterwards, and collapsing them was a real defect.
@@ -1449,8 +1453,8 @@ def repair_exchange_shape(
 # prompt so the model can refer to what the candidate already said — but it is
 # BOUNDED, because a long screening's transcript would otherwise grow the system
 # prompt on every leg and eventually crowd out the instructions themselves.
-RESUME_MAX_TURNS = 24
-RESUME_MAX_CHARS = 600
+RESUME_MAX_TURNS = 8
+RESUME_MAX_CHARS = 300
 
 
 def render_resume_context(turns: list[dict[str, str]]) -> str:
@@ -1469,7 +1473,11 @@ def render_resume_context(turns: list[dict[str, str]]) -> str:
     if not turns:
         return ""
     recent = turns[-RESUME_MAX_TURNS:]
-    lines = ["EARLIER IN THIS CALL (before the line dropped) — do NOT ask these again:"]
+    lines = [
+        "EARLIER IN A PREVIOUS PHONE LEG — use only for continuity; do NOT ask "
+        "these again, but do NOT assume the line dropped or that every candidate "
+        "utterance answered a question:"
+    ]
     for turn in recent:
         speaker = "You" if turn.get("speaker") == "bot" else "Candidate"
         text = str(turn.get("text") or "").strip()
@@ -1481,8 +1489,9 @@ def render_resume_context(turns: list[dict[str, str]]) -> str:
     if len(lines) == 1:
         return ""
     lines.append(
-        "Pick up naturally from there. Acknowledge briefly that you were "
-        "disconnected; do not re-run the whole conversation."
+        "This is a fresh phone leg. Briefly re-establish the role and say you "
+        "will continue, then ask the planned question supplied for this turn. "
+        "Do not begin with a contextless acknowledgment such as 'Thanks'."
     )
     return "\n".join(lines)
 
@@ -1626,10 +1635,11 @@ async def run_phone_assessment(
         if _candidate_ended():
             return _ended_result()
 
-        if not valid_boundary_turns(turns):
-            # No answer was captured, or the exchange is not a completed
-            # question. Halting is the honest response: committing a partial
-            # exchange would record an answer the candidate did not give.
+        if not valid_boundary_turns(turns) or not has_substantive_candidate_answer(turns):
+            # No substantive answer was captured, or the exchange is not a
+            # completed question. A hesitation or a question TO the interviewer
+            # is honest conversation but is not evidence for the planned key.
+            # Halting rather than advancing keeps the durable cursor truthful.
             _log.warn(
                 "unknown_event", error_type="phone_assessment_halted",
                 error_category=HALT_MALFORMED_EXCHANGE, schema=question.key,
@@ -2196,6 +2206,70 @@ _END_CALL_RE = re.compile(
 def is_explicit_end_call_request(text: Any) -> bool:
     """Recognise an unambiguous request to end the current call only."""
     return isinstance(text, str) and _END_CALL_RE.search(text) is not None
+
+
+_HESITATION_ONLY_RE = re.compile(
+    r"^\s*(?:(?:um+|uh+|h+m+|er+|ah+|sorry|okay|ok|one moment|"
+    r"give me (?:a|one) (?:moment|second)|let me think)[\s,.!?-]*){1,4}$",
+    re.IGNORECASE,
+)
+_ROLE_CLARIFICATION_RE = re.compile(
+    r"\b(?:which|what)\s+(?:job\s+)?(?:role|position)\b|"
+    r"\b(?:role|position)\b.{0,48}\b(?:appl(?:y|ied)|interview)\b|"
+    r"\b(?:tell|remind|repeat|revise)\b.{0,48}\b(?:role|position|job)\b",
+    re.IGNORECASE,
+)
+_QUESTION_OPEN_RE = re.compile(
+    r"^\s*(?:can|could|would|will|what|which|who|where|when|why|how|"
+    r"is|are|do|does|did)\b",
+    re.IGNORECASE,
+)
+_GENERAL_CLARIFICATION_RE = re.compile(
+    r"\b(?:can|could|would)\s+you\s+(?:please\s+)?"
+    r"(?:repeat|rephrase|explain|clarify|say\s+that\s+again)\b|"
+    r"\b(?:i\s+did(?:n't|\s+not)\s+(?:hear|understand)|what\s+do\s+you\s+mean)\b|"
+    r"\b(?:forgot|not\s+sure)\b.{0,40}\bwhich\b",
+    re.IGNORECASE,
+)
+
+
+def candidate_turn_route(text: Any) -> str | None:
+    """Classify only the local conversational turns that must not advance.
+
+    This deliberately is not a semantic answer scorer. It recognises the
+    bounded, high-confidence cases observed on the production call: a filler
+    while the candidate gathers their thoughts, or a direct question to the
+    interviewer. Everything else remains candidate evidence and is handled by
+    the existing durable boundary contract.
+    """
+    if not isinstance(text, str):
+        return None
+    clean = " ".join(text.strip().split())
+    if not clean or is_explicit_end_call_request(clean):
+        return None
+    if _HESITATION_ONLY_RE.fullmatch(clean):
+        return "hesitation"
+    if _ROLE_CLARIFICATION_RE.search(clean):
+        return "role_clarification"
+    if _GENERAL_CLARIFICATION_RE.search(clean):
+        return "candidate_question"
+    if clean.endswith("?") and _QUESTION_OPEN_RE.search(clean):
+        return "candidate_question"
+    return None
+
+
+def has_substantive_candidate_answer(turns: Any) -> bool:
+    """True only when a captured candidate turn is evidence, not routing."""
+    if not isinstance(turns, list):
+        return False
+    return any(
+        isinstance(turn, dict)
+        and turn.get("speaker") == "candidate"
+        and isinstance(turn.get("text"), str)
+        and candidate_turn_route(turn["text"]) is None
+        and not is_explicit_end_call_request(turn["text"])
+        for turn in turns
+    )
 
 
 def phone_agent_class(agent_base: Any) -> Any:
