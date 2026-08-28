@@ -445,12 +445,10 @@ export function createPhoneRuntime(
     haltCheckedAtMs = nowMs;
     try {
       const backlog = await stores.backlog({ now: new Date() });
-      // The SAME three-shape test the due pass applies: an explicit halt, an
-      // absent control singleton, and (via the catch) an unreadable one all
-      // mean stop. Written as an equality against `false`/`true` rather than
-      // a negation so an `undefined` field cannot read as permission.
-      haltAdmits = backlog.admission?.halted === false
-        && backlog.admission?.controlPresent === true;
+      // phone.dial is a spent, originate-free queue record. It is safe to
+      // drain while halted; only the due/admission path can contact a provider.
+      // Still fail closed when the control singleton cannot be read.
+      haltAdmits = backlog.admission?.controlPresent === true;
     } catch {
       haltAdmits = false;
     }
