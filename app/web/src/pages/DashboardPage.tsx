@@ -51,6 +51,8 @@ import {
   sessionsPerDay,
 } from '../components/talent';
 import { formatDateTime } from '../lib/datetime';
+import { addIstDays, istDayStartUtcIso, istToday } from '../lib/ist-datetime';
+import type { PhoneCalendarResponse } from '../types';
 import type { StatusTone } from '../components/design/StatusBadge';
 
 const INTENT_KIND_META: Record<string, { title: string; tone: StatusTone }> = {
@@ -66,6 +68,8 @@ export function DashboardPage() {
   const [intents, setIntents] = useState<NotificationIntent[] | null>(null);
   const [summary, setSummary] = useState<CandidatesSummary | null>(null);
   const [summaryError, setSummaryError] = useState<string | null>(null);
+  const [phoneSchedule, setPhoneSchedule] = useState<PhoneCalendarResponse | null>(null);
+  const [phoneScheduleError, setPhoneScheduleError] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [intentsError, setIntentsError] = useState<string | null>(null);
 
@@ -76,6 +80,8 @@ export function DashboardPage() {
     setIntents(null);
     setSummary(null);
     setSummaryError(null);
+    setPhoneSchedule(null);
+    setPhoneScheduleError(null);
     setIntentsError(null);
 
     // Aggregate assessment metrics (viewer+, owner-scoped server-side).
@@ -95,6 +101,16 @@ export function DashboardPage() {
             .listNotificationIntents()
             .then((r) => setIntents(r.intents))
             .catch((e: ApiError) => setIntentsError(e.message));
+
+          // The dashboard only asks for the schedule after the authoritative
+          // role response says this account may read it. Viewers therefore
+          // never make a phone-calendar request, even transiently.
+          const from = istDayStartUtcIso(istToday());
+          const to = istDayStartUtcIso(addIstDays(istToday(), 7));
+          api
+            .getPhoneCalendar(from, to)
+            .then(setPhoneSchedule)
+            .catch((e: ApiError) => setPhoneScheduleError(e.message));
         }
       })
       .catch((e: ApiError) => setLoadError(e.message));
@@ -261,6 +277,10 @@ export function DashboardPage() {
         />
       </div>
 
+      {me.role !== 'viewer' && (
+        <PhoneScheduleCard data={phoneSchedule} error={phoneScheduleError} />
+      )}
+
       {me.role === 'admin' && (
         <p className="mt-6 text-sm text-ink-secondary">
           Looking for session operations, recordings integrity and quotas?{' '}
@@ -272,6 +292,112 @@ export function DashboardPage() {
           </Link>
         </p>
       )}
+    </div>
+  );
+}
+
+/* ── Phone schedule visibility ──────────────────────────────────────── */
+
+function PhoneScheduleCard({
+  data,
+  error,
+}: {
+  data: PhoneCalendarResponse | null;
+  error: string | null;
+}) {
+  const live = data?.appointments.filter(
+    (appointment) => appointment.status === 'scheduled' || appointment.status === 'confirmed',
+  ) ?? [];
+  const now = Date.now();
+  const upcoming = live.filter((appointment) => Date.parse(appointment.starts_at) >= now);
+  const overdue = live.filter((appointment) => Date.parse(appointment.starts_at) < now);
+  const next = upcoming.slice(0, 3);
+
+  return (
+    <section
+      aria-labelledby="phone-schedule-heading"
+      className="mt-6 rounded-xl border border-line bg-surface p-5 shadow-card"
+    >
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p className="text-xs font-medium uppercase tracking-wide text-ink-secondary">Operations</p>
+          <h2 id="phone-schedule-heading" className="mt-1 text-lg font-semibold text-ink">
+            Phone schedule
+          </h2>
+          <p className="mt-1 text-sm text-ink-secondary">
+            Upcoming callbacks and screening appointments in IST.
+          </p>
+        </div>
+        <Link
+          to="/phone-calendar"
+          className="inline-flex min-h-11 items-center rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-medium text-ink-secondary transition-colors hover:bg-surface-tertiary hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
+        >
+          Open phone calendar
+        </Link>
+      </div>
+
+      {error ? (
+        <p role="status" className="mt-4 text-sm text-error">
+          Phone schedule unavailable. Open the phone calendar to retry.
+        </p>
+      ) : data === null ? (
+        <p role="status" className="mt-4 text-sm text-ink-tertiary">Loading schedule…</p>
+      ) : !data.enabled ? (
+        <p role="status" className="mt-4 text-sm text-ink-secondary">
+          Phone screening is turned off. No appointments were loaded.
+        </p>
+      ) : (
+        <>
+          <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3">
+            <ScheduleMetric label="Upcoming" value={upcoming.length} />
+            <ScheduleMetric label="Overdue" value={overdue.length} tone={overdue.length > 0 ? 'warning' : undefined} />
+            <ScheduleMetric label="Loaded" value={data.count} />
+          </div>
+          {data.truncated && (
+            <p role="status" className="mt-3 text-xs text-warning">
+              The schedule is larger than this summary window; open the calendar for the full bounded view.
+            </p>
+          )}
+          {next.length > 0 ? (
+            <ul className="mt-4 divide-y divide-line" aria-label="Next phone appointments">
+              {next.map((appointment) => (
+                <li key={appointment.id} className="flex flex-wrap items-center justify-between gap-2 py-2 text-sm">
+                  <div>
+                    <p className="font-medium text-ink">
+                      {appointment.candidate?.name ?? 'Candidate'}
+                    </p>
+                    <p className="text-xs text-ink-tertiary">
+                      {formatDateTime(appointment.starts_at)} · {appointment.ist_start ?? 'IST time unavailable'} IST
+                    </p>
+                  </div>
+                  <StatusBadge tone="info">{appointment.status}</StatusBadge>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="mt-4 text-sm text-ink-secondary">No upcoming appointments in the next seven days.</p>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
+function ScheduleMetric({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: number;
+  tone?: 'warning';
+}) {
+  return (
+    <div className="rounded-lg border border-line bg-surface-muted p-3">
+      <p className="text-xs font-medium uppercase tracking-wide text-ink-tertiary">{label}</p>
+      <p className={`mt-1 text-2xl font-semibold tabular-nums ${tone === 'warning' ? 'text-warning' : 'text-ink'}`}>
+        {value}
+      </p>
     </div>
   );
 }
