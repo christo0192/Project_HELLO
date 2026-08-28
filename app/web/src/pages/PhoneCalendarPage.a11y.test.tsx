@@ -21,6 +21,7 @@ import {
   calendarResponse,
   phoneApi,
   slotsResponse,
+  PHONE_BOOKING_CANDIDATES,
 } from '../components/phone-calendar/__tests__/phoneFixtures';
 import { stubMatchMedia } from '../components/design/__tests__/helpers';
 
@@ -66,6 +67,7 @@ beforeEach(() => {
   apiFns.getMe.mockResolvedValue(ADMIN_ME);
   apiFns.getPhoneCalendar.mockResolvedValue(BUSY_WEEK);
   apiFns.getPhoneSlots.mockResolvedValue(slotsResponse());
+  apiFns.listCandidates.mockResolvedValue(PHONE_BOOKING_CANDIDATES);
   stubMatchMedia(false, '(max-width: 639px)');
 });
 
@@ -95,7 +97,7 @@ describe('axe — no WCAG A/AA violations', () => {
     const { container } = renderPage();
     await screen.findByRole('table');
     await userEvent.click(screen.getByRole('button', { name: 'Book a screening' }));
-    await screen.findByLabelText('Engagement id');
+    await screen.findByLabelText('Candidate');
     await expect(container).toHaveNoViolations();
   });
 
@@ -266,7 +268,7 @@ describe('palette — every colour utility resolves to a real token', () => {
     await userEvent.click(await screen.findByRole('button', { name: 'Reschedule…' }));
     await screen.findAllByRole('radio');
     await userEvent.click(screen.getByRole('button', { name: 'Book a screening' }));
-    await screen.findByLabelText('Engagement id');
+    await screen.findByLabelText('Candidate');
 
     const values = colourValues(container);
     // Non-vacuous: this surface really does carry theme colours.

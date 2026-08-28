@@ -14,6 +14,7 @@ import {
   INTERVIEWER_ME,
   MockApiError,
   VIEWER_ME,
+  PHONE_BOOKING_CANDIDATES,
   apiFns,
   appointment,
   calendarResponse,
@@ -47,6 +48,7 @@ beforeEach(() => {
   apiFns.getMe.mockResolvedValue(ADMIN_ME);
   apiFns.getPhoneCalendar.mockResolvedValue(calendarResponse());
   apiFns.getPhoneSlots.mockResolvedValue(slotsResponse());
+  apiFns.listCandidates.mockResolvedValue(PHONE_BOOKING_CANDIDATES);
   stubMatchMedia(false, '(max-width: 639px)');
 });
 
