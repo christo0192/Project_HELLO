@@ -1046,6 +1046,104 @@ paths:
               schema:
                 $ref: '#/components/schemas/PhoneWorkerError'
 
+  /api/internal/phone/assessment/probe:
+    post:
+      tags: [phone]
+      operationId: recordPhoneWorkerProbe
+      summary: Record one candidate-specific same-objective probe
+      description: Internal service-authenticated boundary. The server owns the question identity and enforces at most one probe per session/question. The worker supplies only the opaque current-session key and CAS index; no question text or model-selected index is accepted.
+      security:
+        - workerBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PhoneAssessmentProbeRequest'
+      responses:
+        '200':
+          description: Probe recorded, duplicate, or safely denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneAssessmentProbeResponse'
+        '400':
+          description: Request body failed validation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneAssessmentProbeResponse'
+        '401':
+          description: Worker bearer credential required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '403':
+          description: Worker bearer credential invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '503':
+          description: Phone screening disabled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+
+  /api/internal/phone/assessment/consent-start:
+    post:
+      tags: [phone]
+      operationId: consentAndStartPhoneWorkerAssessment
+      summary: Atomically authorize consent and start a phone assessment
+      description: Internal, service-authenticated. The worker has already classified an affirmative response deterministically. The server applies classify.human, disclosure.delivered, binds the session, activates the assessment, and snapshots its immutable question plan in one transaction. Any failure authorizes no screening audio. Recording activation is started asynchronously after this durable boundary and is reconciled separately.
+      security:
+        - workerBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PhoneConsentStartRequest'
+      responses:
+        '200':
+          description: Full sanitized assessment state only after durable consent and start.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneAssessmentStateResponse'
+        '400':
+          description: Request body failed validation or legacy worker lacks the atomic seam.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneAssessmentStateResponse'
+        '401':
+          description: Worker bearer credential required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '403':
+          description: Worker bearer credential invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '500':
+          description: phone_consent_start_error — sanitized stable code.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneAssessmentStateResponse'
+        '503':
+          description: Phone screening disabled, or the worker credential is not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+
   /api/internal/phone/assessment/start:
     post:
       tags: [phone]
@@ -5968,6 +6066,53 @@ components:
         version:
           type: integer
           minimum: 1
+      additionalProperties: false
+
+    PhoneAssessmentProbeRequest:
+      type: object
+      required: [session_id, question_key, expected_index, source_event_id]
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        question_key:
+          type: string
+        expected_index:
+          type: integer
+          minimum: 0
+        source_event_id:
+          type: string
+      additionalProperties: false
+
+    PhoneAssessmentProbeResponse:
+      type: object
+      required: [ok, status]
+      properties:
+        ok:
+          type: boolean
+        status:
+          type: string
+        duplicate:
+          type: boolean
+      additionalProperties: false
+
+    PhoneConsentStartRequest:
+      type: object
+      required: [attempt_id, session_id, epoch]
+      properties:
+        attempt_id:
+          type: string
+          format: uuid
+          description: The live attempt whose affirmative consent was classified.
+        session_id:
+          type: string
+          format: uuid
+          description: The verified phone session to bind.
+        epoch:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+          description: The dispatch epoch fence.
       additionalProperties: false
 
     PhoneAssessmentStartRequest:

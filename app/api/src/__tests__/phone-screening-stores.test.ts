@@ -428,6 +428,8 @@ describe('errors and malformed answers', () => {
       ['phone_record_probe_error', () => stores.recordProbe!({
         sessionId: 's', questionKey: 'q1', expectedIndex: 0,
         sourceEventId: 'ev-1', now: NOW })],
+      ['phone_consent_start_error', () => stores.consentAndStart!({
+        attemptId: 'a', sessionId: 's', epoch: 0, now: NOW })],
     ];
     expect(attempts).toHaveLength(PHONE_RPC_NAMES.length);
     for (const [code, run] of attempts) {

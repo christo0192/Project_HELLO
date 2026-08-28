@@ -453,7 +453,9 @@ def is_gate_copy(text: Any) -> bool:
 EVENTS_PATH = "/api/internal/phone/events"
 APPOINTMENTS_PATH = "/api/internal/phone/appointments"
 ASSESSMENT_START_PATH = "/api/internal/phone/assessment/start"
+CONSENT_START_PATH = "/api/internal/phone/assessment/consent-start"
 ASSESSMENT_TURN_PATH = "/api/internal/phone/assessment/turn"
+PROBE_PATH = "/api/internal/phone/assessment/probe"
 ASSESSMENT_COMPLETE_PATH = "/api/internal/phone/assessment/complete"
 #: P5: the lease renewal. Under `/api/internal/phone` with every other worker
 #: call, because that is the ONE mount (`app.ts`: `app.use('/api/internal/phone',
@@ -923,6 +925,26 @@ class PhoneEventClient:
 
     # ── 0044: the durable half of a screening ─────────────────────────
 
+    async def consent_and_start_assessment(
+        self,
+        attempt_id: str,
+        session_id: str,
+        epoch: int,
+    ) -> "PhoneAssessmentState":
+        """Atomically apply affirmative consent and start the assessment."""
+        body = {
+            "attempt_id": str(attempt_id),
+            "session_id": str(session_id),
+            "epoch": int(epoch),
+        }
+        response = await self._post(CONSENT_START_PATH, body, "consent_start")
+        if isinstance(response, str):
+            return PhoneAssessmentState(False, response)
+        data = _response_json(response)
+        if not isinstance(data, dict):
+            return PhoneAssessmentState(False, _ERR_MALFORMED)
+        return PhoneAssessmentState.parse(data)
+
     async def start_assessment(
         self,
         attempt_id: str,
@@ -950,6 +972,30 @@ class PhoneEventClient:
             )
             return PhoneAssessmentState(False, _ERR_MALFORMED)
         return PhoneAssessmentState.parse(data)
+
+    async def record_probe(
+        self,
+        session_id: str,
+        question_key: str,
+        expected_index: int,
+        source_event_id: str,
+    ) -> PhoneApiOutcome:
+        body = {
+            "session_id": str(session_id),
+            "question_key": str(question_key),
+            "expected_index": int(expected_index),
+            "source_event_id": str(source_event_id),
+        }
+        response = await self._post(PROBE_PATH, body, "assessment_probe")
+        if isinstance(response, str):
+            return PhoneApiOutcome(False, error_category=response)
+        data = _response_json(response)
+        if not isinstance(data, dict):
+            return PhoneApiOutcome(False, error_category=_ERR_MALFORMED)
+        status = data.get("status")
+        status_str = str(status) if status is not None else None
+        return PhoneApiOutcome(status_str in {"probe_recorded", "duplicate"}, status_str,
+                               duplicate=status_str == "duplicate")
 
     async def commit_boundary(
         self,
@@ -1879,6 +1925,21 @@ async def run_phone_gate(
         )
         return PhoneGateResult(decision, events=events, spoken=spoken)
 
+    # New clients use the single atomic consent/start boundary. Legacy fakes
+    # remain supported during rollout, but production's client always exposes
+    # this method and cannot return an authorized state without the RPC.
+    consent_start = getattr(client, "consent_and_start_assessment", None)
+    if callable(consent_start) and session_id is not None and epoch is not None:
+        combined = await consent_start(attempt_id, session_id, epoch)
+        if not combined.ok:
+            _log.warn("unknown_event", error_type="phone_gate_blocked", error_category="consent_start_failed")
+            return PhoneGateResult(CLASSIFY_HUMAN, events=events, spoken=spoken)
+        events.extend(["classify.human", "disclosure.delivered"])
+        if start_recording is not None:
+            await start_recording()
+        return PhoneGateResult(CLASSIFY_HUMAN, assessment_allowed=True,
+                               recording_allowed=True, events=events, spoken=spoken)
+
     human = await client.post_event(attempt_id, "classify.human", epoch=epoch)
     if not event_applied(human):
         # `ok` is not consent. An `ignored` verdict — terminal, stale_epoch,
@@ -2047,6 +2108,8 @@ def phone_agent_class(agent_base: Any) -> Any:
             say: Callable[[str], Awaitable[Any]],
             on_user_turn: Callable[[str, Any, Any], Any] | None = None,
             on_booking: Callable[[ScheduleTurn], Any] | None = None,
+            on_probe: Callable[[], Any] | None = None,
+            on_advance: Callable[[], Any] | None = None,
             native_turns: bool = False,
             native_reply_plan: Callable[[], str | None] | None = None,
         ) -> None:
@@ -2056,12 +2119,28 @@ def phone_agent_class(agent_base: Any) -> Any:
             self._say = say
             self._on_user_turn = on_user_turn
             self._on_booking = on_booking
+            self._on_probe = on_probe
+            self._on_advance = on_advance
+            self._turn_policy = "pre_consent"
             # Native mode lets LiveKit continue its normal reply lifecycle after
             # the durable callback. The legacy scripted loop remains available
             # only to old injected callers while the migration is staged.
             self._native_turns = native_turns
             self._native_reply_plan = native_reply_plan
+            self._screening_authorized = False
             self.bookings: list[ScheduleTurn] = []
+
+        def authorize_screening(self) -> None:
+            """Release the held consent-phase Gemini output after API grant."""
+            self._screening_authorized = True
+            self._turn_policy = "substantive"
+
+        def set_turn_policy(self, policy: str) -> None:
+            self._turn_policy = policy if policy in {"pre_consent", "substantive", "clarification", "callback", "closing"} else "substantive"
+
+        @staticmethod
+        def _tool_name(tool: Any) -> str:
+            return str(getattr(tool, "name", None) or getattr(tool, "__name__", ""))
 
         async def llm_node(self, chat_ctx: Any, tools: list[Any], model_settings: Any) -> Any:
             """Use a prepared fixed reply without starting a second LLM call.
@@ -2072,13 +2151,33 @@ def phone_agent_class(agent_base: Any) -> Any:
             AgentSession. Clarification/callback turns leave the plan empty and
             use the same Gemini node as the browser agent.
             """
-            planned = self._native_reply_plan() if self._native_reply_plan is not None else None
-            if planned:
-                yield planned
-                return
+            if self._turn_policy == "substantive":
+                tools = [tool for tool in tools if self._tool_name(tool) in {"request_probe", "advance_screening"}]
+                try:
+                    from dataclasses import replace
+                    model_settings = replace(model_settings, tool_choice="required")
+                except (TypeError, ValueError):
+                    pass
+            elif self._turn_policy == "callback":
+                tools = [tool for tool in tools if self._tool_name(tool) == "schedule_callback"]
+            else:
+                tools = []
+                try:
+                    from dataclasses import replace
+                    model_settings = replace(model_settings, tool_choice="none")
+                except (TypeError, ValueError):
+                    pass
             result = super().llm_node(chat_ctx, tools, model_settings)
             if inspect.isawaitable(result):
                 result = await result
+            if not self._screening_authorized:
+                # Gemini still participates in the consent-response turn, but
+                # its speculative output is structurally unschedulable and is
+                # discarded before playout/recording. The deterministic
+                # classifier remains the sole authorization authority.
+                async for _ in result:
+                    pass
+                return
             async for chunk in result:
                 yield chunk
 
@@ -2114,6 +2213,26 @@ def phone_agent_class(agent_base: Any) -> Any:
             # never reaches this branch.
             from livekit.agents import StopResponse  # noqa: PLC0415
             raise StopResponse()
+
+        @_tool
+        async def request_probe(self) -> str:
+            """Authorize one same-objective follow-up through the server."""
+            if not self._screening_authorized or self._on_probe is None:
+                return "No probe is authorized."
+            result = self._on_probe()
+            if inspect.isawaitable(result):
+                result = await result
+            return str(result)
+
+        @_tool
+        async def advance_screening(self) -> str:
+            """Commit the current answer and authorize the exact next question."""
+            if not self._screening_authorized or self._on_advance is None:
+                return "Screening is not authorized."
+            result = self._on_advance()
+            if inspect.isawaitable(result):
+                result = await result
+            return str(result)
 
         @_tool
         async def schedule_callback(

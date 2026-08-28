@@ -48,6 +48,7 @@ import {
   type CommitPhoneQuestionBoundaryStatus,
   type GetPhoneAssessmentStateStatus,
   type RecordPhoneProbeStatus,
+  type ConsentAndStartPhoneAssessmentStatus,
   type StartPhoneAssessmentStatus,
 } from './rpc-contract.js';
 import type {
@@ -81,6 +82,8 @@ import type {
   CommitPhoneQuestionBoundaryResult,
   RecordPhoneProbeInput,
   RecordPhoneProbeResult,
+  ConsentAndStartPhoneAssessmentInput,
+  ConsentAndStartPhoneAssessmentResult,
   PhoneAssessmentState,
   PhoneAssessmentTurn,
   PhonePlanQuestion,
@@ -833,6 +836,24 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
         planComplete: bool(row, 'plan_complete'),
         expectedKey: str(row, 'expected_key'),
         sessionStatus: str(row, 'session_status'),
+      };
+    },
+
+    async consentAndStart(input: ConsentAndStartPhoneAssessmentInput): Promise<ConsentAndStartPhoneAssessmentResult> {
+      const { data, error } = await client.rpc('consent_and_start_phone_assessment', {
+        p_attempt_id: input.attemptId,
+        p_session_id: input.sessionId,
+        p_epoch: input.epoch,
+        p_now: isoInstant(input.now),
+      });
+      if (error) throw new Error('phone_consent_start_error');
+      const row = asRow(data);
+      const status = narrowPhoneRpcStatus<ConsentAndStartPhoneAssessmentStatus>(
+        'consent_and_start_phone_assessment', row,
+      );
+      return {
+        status,
+        state: status === 'ok' ? projectAssessmentState('start_phone_assessment', data) : undefined,
       };
     },
 

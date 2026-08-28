@@ -175,6 +175,8 @@ export type {
   StartPhoneAssessmentInput,
   RecordPhoneProbeInput,
   RecordPhoneProbeResult,
+  ConsentAndStartPhoneAssessmentInput,
+  ConsentAndStartPhoneAssessmentResult,
 } from './ports.js';
 
 export { createPhoneStores, PHONE_SYSTEM_ACTOR } from './stores.js';
