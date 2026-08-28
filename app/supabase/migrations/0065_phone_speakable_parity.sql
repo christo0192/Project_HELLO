@@ -96,22 +96,27 @@ comment on function screening_v2.phone_default_question_plan is
 -- which is how "Ask the candidate to summarise their current work" reached a
 -- live candidate's ear verbatim on 2026-08-28.
 --
--- The corrected gate is STRICTER than what production enforced. A role
--- template whose rows are instruction prose (no question mark, no
--- interrogative word) now refuses at plan materialization with
--- `invalid_role_template` — loudly, before anything is asked — instead of
--- being spoken aloud. Operators must re-author such templates as spoken
--- questions (the role editor previews them); an empty template falls back to
--- the speakable default plan above.
+-- WHAT THE GATE MEANS NOW. Since the delivery sites hand every question to
+-- the model to phrase ("ask this planned topic in your own natural words"),
+-- plan text is a TOPIC, not speech — so the positive requirement accepts
+-- both spoken-question shape ("What's your notice period?") and recruiter
+-- directive shape ("Ask about notice period and availability"), which is
+-- how recruiters actually author templates. What the gate still refuses is
+-- text that is neither — meta/prompt-shaped rows (`system`, `prompt`,
+-- `instruction`, bracketed markup, "don't reveal" chains) that would steer
+-- the model rather than name a topic. The one verbatim path left is the
+-- say() FALLBACK when the opening generation fails; a directive row spoken
+-- once on that rare path is an accepted trade for not forcing every
+-- template to be re-authored.
 
 create or replace function screening_v2.cagv_question_is_speakable(p_text text)
 returns boolean language sql immutable
 as $$
   select p_text is not null
     and length(btrim(p_text)) between 1 and 2000
-    and btrim(p_text) ~* '\?|\m(tell|describe|walk|explain|what|how|why|when|where|which|could|can|have|did|would|are|do|is)\M'
+    and btrim(p_text) ~* '\?|\m(tell|describe|walk|explain|what|how|why|when|where|which|could|can|have|did|would|are|do|is|ask|probe|explore|cover|check|confirm|discuss|understand|find)\M'
     and btrim(p_text) !~* '\m(system|developer|assistant|model|prompt|instruction|interviewer|recruiter)\M'
-    and btrim(p_text) !~* '\m(must|should|do not|don''t)\s+(ask|say|tell|mention|reveal|ignore)\M'
+    and btrim(p_text) !~* '\m(must|should|do not|don''t)\s+(say|tell|mention|reveal|ignore)\M'
     and btrim(p_text) !~ '[\[\]{}<>]'
 $$;
 
