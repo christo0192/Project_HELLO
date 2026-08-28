@@ -1,5 +1,6 @@
 import { z } from 'zod';
-import { idParamSchema, roleIdQuerySchema } from './common.js';
+import { idParamSchema, roleIdQuerySchema, uuidSchema } from './common.js';
+import { appointmentVersionSchema, utcInstantSchema } from './phone-api.js';
 
 // ── GET /api/candidates — list candidates ────────────────────────
 
@@ -95,3 +96,21 @@ export const phoneVerificationBodySchema = z
   .strict();
 
 export type PhoneVerificationBodyInput = z.infer<typeof phoneVerificationBodySchema>;
+
+/** Candidate-profile booking uses the same UTC/slot shape as the calendar API. */
+export const phoneCandidateAppointmentCreateSchema = z
+  .object({ starts_at: utcInstantSchema, ends_at: utcInstantSchema })
+  .strict();
+
+export type PhoneCandidateAppointmentCreateInput = z.infer<typeof phoneCandidateAppointmentCreateSchema>;
+
+export const phoneCandidateAppointmentPatchSchema = z
+  .object({
+    appointment_id: uuidSchema,
+    starts_at: utcInstantSchema,
+    ends_at: utcInstantSchema,
+    version: appointmentVersionSchema,
+  })
+  .strict();
+
+export type PhoneCandidateAppointmentPatchInput = z.infer<typeof phoneCandidateAppointmentPatchSchema>;

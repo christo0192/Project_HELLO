@@ -71,6 +71,8 @@ import type {
   PhoneAppointmentWriteResponse,
   PhoneCalendarResponse,
   PhoneCancelResponse,
+  PhoneCandidateAppointmentCreateInput,
+  PhoneCandidateAppointmentPatchInput,
   PhoneRescreenInput,
   PhoneRescreenResponse,
   PhoneScreeningsResponse,
@@ -182,6 +184,21 @@ export const api = {
     ),
   getCandidatePhoneScreenings: (id: string) =>
     request<PhoneScreeningsResponse>(`/api/candidates/${encodeURIComponent(id)}/phone-cycles`),
+  scheduleCandidatePhoneAppointment: (id: string, body: PhoneCandidateAppointmentCreateInput) =>
+    request<PhoneAppointmentWriteResponse>(`/api/candidates/${encodeURIComponent(id)}/phone-appointments`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  rescheduleCandidatePhoneAppointment: (id: string, appointmentId: string, body: PhoneCandidateAppointmentPatchInput) =>
+    request<PhoneAppointmentWriteResponse>(
+      `/api/candidates/${encodeURIComponent(id)}/phone-appointments/${encodeURIComponent(appointmentId)}`,
+      { method: 'PATCH', body: JSON.stringify(body) },
+    ),
+  cancelCandidatePhoneAppointment: (id: string, appointmentId: string, body: PhoneAppointmentCancelInput) =>
+    request<PhoneCancelResponse>(
+      `/api/candidates/${encodeURIComponent(id)}/phone-appointments/${encodeURIComponent(appointmentId)}`,
+      { method: 'DELETE', body: JSON.stringify(body) },
+    ),
   requestPhoneRescreen: (id: string, body: PhoneRescreenInput) =>
     request<PhoneRescreenResponse>(`/api/candidates/${encodeURIComponent(id)}/phone-rescreens`, {
       method: 'POST',

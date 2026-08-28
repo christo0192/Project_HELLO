@@ -960,6 +960,17 @@ export interface PhoneAppointmentCancelInput {
   version: number;
 }
 
+export interface PhoneCandidateAppointmentCreateInput {
+  starts_at: string;
+  ends_at: string;
+}
+
+export interface PhoneCandidateAppointmentPatchInput {
+  starts_at: string;
+  ends_at: string;
+  version: number;
+}
+
 export interface PhoneAppointmentWriteResponse {
   ok: boolean;
   appointment_id: string | null;
@@ -992,6 +1003,7 @@ export type PhoneRescreenReason =
   | 'quality_review';
 
 export interface PhoneScreeningCycleAppointment {
+  appointment_id: string | null;
   starts_at: string | null;
   ends_at: string | null;
   status: string | null;

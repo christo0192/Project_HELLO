@@ -40,6 +40,10 @@ import {
   sessionStatusLabel,
 } from "../components/talent";
 import { formatDateTime } from "../lib/datetime";
+import { PhoneSlotPicker } from "../components/phone-calendar";
+import { istToday } from "../lib/ist-datetime";
+import type { IstDate } from "../lib/ist-datetime";
+import type { PhoneSlot } from "../types";
 
 /**
  * HELLO Lane 3 — CandidateDetail as one recruiter review workspace.
@@ -232,6 +236,9 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
   const [requesting, setRequesting] = useState(false);
   const [verifying, setVerifying] = useState(false);
   const [phone, setPhone] = useState("");
+  const [slotDate, setSlotDate] = useState<IstDate>(() => istToday());
+  const [selectedSlot, setSelectedSlot] = useState<PhoneSlot | null>(null);
+  const [savingAppointment, setSavingAppointment] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
   const load = useCallback(() => {
@@ -290,6 +297,56 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
     }
   }
 
+  async function saveAppointment() {
+    if (!selectedSlot) return;
+    setSavingAppointment(true);
+    setMessage(null);
+    try {
+      if (current?.appointment?.appointment_id && current.appointment.version != null) {
+        await api.rescheduleCandidatePhoneAppointment(candidateId, current.appointment.appointment_id, {
+          starts_at: selectedSlot.starts_at,
+          ends_at: selectedSlot.ends_at,
+          version: current.appointment.version,
+        });
+        setMessage("Appointment moved. The previous slot has been superseded.");
+      } else {
+        const result = await api.scheduleCandidatePhoneAppointment(candidateId, {
+          starts_at: selectedSlot.starts_at,
+          ends_at: selectedSlot.ends_at,
+        });
+        setMessage(result.prereqs_pending
+          ? "Appointment booked, but prerequisites are still pending; no dial is promised until admission re-checks them."
+          : "Appointment booked. The call will still pass through normal admission gates.");
+      }
+      setSelectedSlot(null);
+      load();
+    } catch (e) {
+      setMessage(e instanceof ApiError ? e.message : "The appointment could not be saved.");
+    } finally {
+      setSavingAppointment(false);
+    }
+  }
+
+  async function cancelAppointment() {
+    const appointment = current?.appointment;
+    if (!appointment?.appointment_id || appointment.version == null) return;
+    setSavingAppointment(true);
+    setMessage(null);
+    try {
+      await api.cancelCandidatePhoneAppointment(candidateId, appointment.appointment_id, {
+        reason: "hr_cancelled",
+        version: appointment.version,
+      });
+      setMessage("Appointment cancelled.");
+      setSelectedSlot(null);
+      load();
+    } catch (e) {
+      setMessage(e instanceof ApiError ? e.message : "The appointment could not be cancelled.");
+    } finally {
+      setSavingAppointment(false);
+    }
+  }
+
   async function verifyNumber() {
     setVerifying(true);
     setMessage(null);
@@ -344,6 +401,25 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
               </div>
             </div>
           )}
+          <div className="mt-4 rounded-lg border border-line bg-surface-muted p-3">
+            <h3 className="text-xs font-medium uppercase tracking-wide text-ink-secondary">Schedule a slot</h3>
+            <p className="mt-1 text-xs text-ink-tertiary">
+              Choose an IST slot. Availability is advisory; normal admission gates still decide whether a call can start.
+            </p>
+            <div className="mt-3">
+              <PhoneSlotPicker
+                date={slotDate}
+                onDateChange={(date) => { setSlotDate(date); setSelectedSlot(null); }}
+                value={selectedSlot?.starts_at ?? null}
+                onChange={setSelectedSlot}
+                idPrefix={`${headingId}-slot`}
+                disabled={savingAppointment}
+              />
+            </div>
+            <CandidateButton className="mt-3" variant="primary" onClick={() => void saveAppointment()} loading={savingAppointment} disabled={!selectedSlot}>
+              Book slot
+            </CandidateButton>
+          </div>
         </>
       ) : (
         <>
@@ -407,6 +483,42 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
           ) : current?.terminal_at ? (
             <p className="mt-3 text-sm text-ink-secondary">This cycle is terminal; no new cycle can be started from its current state.</p>
           ) : null}
+
+          {(!current || current.terminal_at === null) && (
+            <div className="mt-4 rounded-lg border border-line bg-surface-muted p-3">
+              <h3 className="text-xs font-medium uppercase tracking-wide text-ink-secondary">
+                {current?.appointment ? "Move appointment" : "Schedule a slot"}
+              </h3>
+              <p className="mt-1 text-xs text-ink-tertiary">
+                Choose an IST slot. Availability is advisory; the normal admission gates still decide whether a call can start.
+              </p>
+              {current?.appointment && (
+                <p className="mt-2 text-sm text-ink-secondary">
+                  Current slot: {current.appointment.starts_at ? formatDateTime(current.appointment.starts_at) : "time unavailable"}
+                </p>
+              )}
+              <div className="mt-3">
+                <PhoneSlotPicker
+                  date={slotDate}
+                  onDateChange={(date) => { setSlotDate(date); setSelectedSlot(null); }}
+                  value={selectedSlot?.starts_at ?? null}
+                  onChange={setSelectedSlot}
+                  idPrefix={`${headingId}-slot`}
+                  disabled={savingAppointment}
+                />
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <CandidateButton variant="primary" onClick={() => void saveAppointment()} loading={savingAppointment} disabled={!selectedSlot}>
+                  {current?.appointment ? "Move appointment" : "Book slot"}
+                </CandidateButton>
+                {current?.appointment && (
+                  <CandidateButton variant="secondary" onClick={() => void cancelAppointment()} loading={savingAppointment}>
+                    Cancel appointment
+                  </CandidateButton>
+                )}
+              </div>
+            </div>
+          )}
         </>
       )}
       {message && <p role="status" className="mt-3 text-sm text-ink-secondary">{message}</p>}
