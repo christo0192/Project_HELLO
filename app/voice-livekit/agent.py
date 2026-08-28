@@ -970,7 +970,7 @@ def _build_provider_session(*, phone_mode: bool = False) -> Any:
         # disabling preemptive generation for this lane prevents LiveKit from
         # discarding a speculative request when the per-turn plan is updated.
         # AgentSession still owns EOU, interruption, scheduling and playout.
-        session_options["preemptive_generation"] = False
+        session_options["preemptive_generation"] = True
 
     session = AgentSession(
         stt=sarvam.STT(
@@ -1109,6 +1109,7 @@ async def _run_native_phone_screening(
     candidate_end_requested: asyncio.Event,
     reply_started: asyncio.Event,
     reply_handle: list[Any],
+    assistant_delivery_complete: asyncio.Event,
     candidate_activity: asyncio.Event,
     agent_listening: asyncio.Event,
     agent_activity_changed: asyncio.Event,
@@ -1280,6 +1281,11 @@ async def _run_native_phone_screening(
         if _native_turn_predates_question(message, latest_assistant_anchor[0]):
             from livekit.agents import StopResponse  # noqa: PLC0415
             raise StopResponse()
+        if not assistant_delivery_complete.is_set():
+            # A final transcript that arrived before the planned question was
+            # audibly delivered is evidence of interruption, not an answer.
+            add_turn_instruction(turn_ctx, "The previous question was interrupted. Repeat the same planned question and wait; do not advance.")
+            return
         prompt = (latest_assistant[0] or "").strip()
         if question is None or not prompt:
             terminal_reason["reason"] = phone.HALT_MALFORMED_EXCHANGE
@@ -1392,6 +1398,9 @@ async def _run_native_phone_screening(
         terminal_reason["reason"] = "completed"
         finished.set()
     else:
+        set_policy = getattr(agent, "set_turn_policy", None)
+        if callable(set_policy):
+            set_policy("opening")
         speech = session.generate_reply(
             instructions=phone_question_instructions(question),
         )
@@ -1416,6 +1425,7 @@ async def _run_native_phone_screening(
 
     if reason == "completed":
         done = None
+        queue_owned = False
         for attempt in range(20):
             done = await events.complete_assessment(attempt_id, session_id)
             if done.ok or not phone.retryable_completion(done):
@@ -1425,10 +1435,14 @@ async def _run_native_phone_screening(
             # asking again; the worker never posts completion until the row
             # exists, so a retry remains idempotent and fail-closed.
             if done.status == phone.ASSESSMENT_QUEUED_STATUS:
-                await asyncio.sleep(min(2.0, 0.25 + attempt * 0.1))
-        if done is not None and done.ok and not done.adopted:
+                # Terminal ownership has transferred completely to the
+                # durable queue worker. The PSTN worker must not poll, retry,
+                # or post assessment.completed after this handoff.
+                queue_owned = True
+                break
+        if not queue_owned and done is not None and done.ok and not done.adopted:
             await events.post_event(attempt_id, "assessment.completed")
-        elif done is not None and done.status is not None:
+        elif not queue_owned and done is not None and done.status is not None:
             # A known non-score verdict is truthfully terminal. A transport
             # failure has no status and remains non-terminal for recovery.
             await events.post_event(attempt_id, "assessment.aborted")
@@ -1479,12 +1493,28 @@ async def _run_phone_session(
 
     session = _build_phone_provider_session()
     reply_started = asyncio.Event()
+    assistant_delivery_complete = asyncio.Event()
     reply_handle: list[Any] = [None]
 
     @session.on("speech_created")
     def _on_phone_speech_created(event):  # noqa: ANN001
         reply_handle[0] = getattr(event, "speech_handle", None)
         reply_started.set()
+        assistant_delivery_complete.clear()
+        handle = reply_handle[0]
+        wait = getattr(handle, "wait_for_playout", None)
+        if callable(wait):
+            async def mark_delivered() -> None:
+                try:
+                    value = wait()
+                    if inspect.isawaitable(value):
+                        await value
+                    assistant_delivery_complete.set()
+                except Exception:
+                    assistant_delivery_complete.clear()
+            asyncio.create_task(mark_delivered())
+        else:
+            assistant_delivery_complete.set()
 
     @session.on("user_state_changed")
     def _on_phone_user_state_changed(event):  # noqa: ANN001
@@ -1770,6 +1800,7 @@ async def _run_phone_session(
             candidate_end_requested=candidate_end_requested,
             reply_started=reply_started,
             reply_handle=reply_handle,
+            assistant_delivery_complete=assistant_delivery_complete,
             candidate_activity=candidate_activity,
             agent_listening=agent_listening,
             agent_activity_changed=agent_activity_changed,
