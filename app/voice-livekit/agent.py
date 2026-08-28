@@ -23,6 +23,7 @@ from livekit.plugins import openai, sarvam
 import persistence
 import phone
 import phone_canary
+from closing import ClosingState, ClosingStateMachine
 from observability import (
     Span,
     StructuredLogger,
@@ -1127,6 +1128,7 @@ async def _run_native_phone_screening(
     finished = asyncio.Event()
     terminal_reason: dict[str, str] = {}
     terminal_reply_required = {"value": False}
+    closing = ClosingStateMachine()
     silence_prompted = {"value": False}
     # The coordinator owns pending evidence; durable effects happen only from
     # coordinator-bound tools after LiveKit authorizes the scheduled reply.
@@ -1245,6 +1247,8 @@ async def _run_native_phone_screening(
             value = wait()
             if inspect.isawaitable(value):
                 await value
+        if handle is not None and closing.state is ClosingState.CLOSING_PENDING:
+            closing.closing_delivered()
         return handle is not None
 
     async def on_native_turn(
@@ -1263,6 +1267,14 @@ async def _run_native_phone_screening(
             terminal_reply_required["value"] = True
             terminal_reason["reason"] = phone.HALT_CANDIDATE_ENDED
             finished.set()
+            return
+        if closing.state is ClosingState.CANDIDATE_QNA:
+            closing.candidate_questions_handled()
+            setattr(agent, "_turn_policy", "closing")
+            terminal_reply_required["value"] = True
+            terminal_reason["reason"] = "completed"
+            finished.set()
+            add_turn_instruction(turn_ctx, "Answer the candidate's question briefly if they asked one. Then thank them, say the team will be in touch, and say goodbye. Do not ask another question.")
             return
         question = state.question_at(cursor)
         if silence_prompted["value"]:
@@ -1357,6 +1369,12 @@ async def _run_native_phone_screening(
         pending["question"] = None
         next_question = state.question_at(cursor)
         if next_question is None:
+            if callable(getattr(events, "record_probe", None)):
+                closing.plan_completed()
+                closing.wind_down_delivered()
+                if pending.get("turn_ctx") is not None:
+                    add_turn_instruction(pending["turn_ctx"], "The screening is complete. Ask the candidate whether they have any questions about the role, team, company, or process. Do not say goodbye yet.")
+                return "Advance authorized. Ask whether the candidate has any questions. Do not close the call yet."
             terminal_reply_required["value"] = True
             terminal_reason["reason"] = "completed"
             finished.set()
