@@ -1479,12 +1479,35 @@ class _FakePhoneSession:
         # filter testable at all — without it, the fixed disclosure and the
         # booking confirmations never reach the exchange queue in a test and the
         # filter is decorative by construction.
-        self.emit_bot_turn(text)
+        planned_question = (
+            getattr(self.agent, "_screening_authorized", False)
+            and not phone.is_gate_copy(text)
+            and bool(self.answers)
+        )
+        interrupted = self.interruptions.pop(0) if planned_question and self.interruptions else False
+        self.emit_bot_turn(text, interrupted=interrupted)
         if state_handler is not None:
             state_handler(types.SimpleNamespace(new_state="idle"))
         if text == phone.PHONE_SILENCE_PROMPT_TEXT and self.silence_reply is not None:
             reply, self.silence_reply = self.silence_reply, None
             asyncio.get_event_loop().call_soon(self.emit_user_turn, reply)
+        elif (
+            getattr(self.agent, "_screening_authorized", False)
+            and not phone.is_gate_copy(text)
+            and self.answers
+        ):
+            # Production speaks the exact server-owned first question through
+            # session.say so the opening cannot enter the coordinator-tool LLM
+            # loop. Model its speech-created/playout fence and then the
+            # candidate answer, just as generate_reply does for later turns.
+            speech = _FakeSpeech()
+            handler = self.handlers.get("speech_created")
+            if handler is not None:
+                handler(types.SimpleNamespace(speech_handle=speech))
+            reply = self.answers.pop(0)
+            if reply is not None:
+                asyncio.get_event_loop().call_soon(self.emit_user_turn, reply)
+            return speech
         return _FakeSpeech()
 
     def emit_user_turn(self, text):
@@ -1758,6 +1781,25 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         # through the API, so the browser's persistence module is untouched.
         self.assertEqual(persistence_spy.mock_calls, [])
 
+    async def test_first_post_consent_question_is_fixed_playout_not_llm_generation(self):
+        """Regression: an LLM opening inherited the substantive tool policy,
+        repeatedly called advance_screening without candidate evidence, hit the
+        SDK function-step ceiling, and closed the live room. The first question
+        must therefore be exact server-owned copy with zero generate_reply call.
+        """
+        _, client, _, _, session, _ = await self._run_session(
+            answers=("Yes, that's fine.",),
+            replies=["First answer.", "Second answer."],
+        )
+        self.assertEqual(session.spoken[:2], [
+            phone.PHONE_DISCLOSURE_TEXT,
+            "First question?",
+        ])
+        self.assertEqual(client.committed_keys, ["k1", "k2"])
+        # Only later model-mediated replies are recorded here. If the opening
+        # regresses to generate_reply this becomes three instead of two.
+        self.assertEqual(len(session.instructions), 2)
+
     async def test_terminal_persistence_precedes_room_teardown(self):
         _, client, _, _, _, _ = await self._run_session(answers=("Yes, sure.",))
         self.assertLess(
@@ -2013,7 +2055,9 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         )
 
         # One seeded question plus one LiveKit-native terminal response.
-        self.assertEqual(len(session.instructions), 2)
+        # The first planned question is fixed server-owned copy delivered by
+        # session.say; only the terminal response enters model generation.
+        self.assertEqual(len(session.instructions), 1)
         self.assertEqual(client.committed_keys, [])
         self.assertIn("assessment.aborted", client.event_types)
         terminal_context = str(session.turn_contexts[-1]).lower()
