@@ -13074,6 +13074,120 @@ select _policy_tests.assert(
     || 'that points nowhere near the cause');
 
 -- ═══════════════════════════════════════════════════════════════════════
+-- G: IMMUTABLE PHONE RE-SCREEN CYCLES (0057)
+-- ═══════════════════════════════════════════════════════════════════════
+-- This fixture uses no contact data. It proves that an explicit request creates
+-- one child cycle, retries are idempotent, active cycles block a second child,
+-- terminal history cannot be reopened, and no dial work is created by intent.
+do $$
+declare
+  v_candidate uuid := '57000000-0000-4000-a000-000000000001';
+  v_role uuid := '57000000-0000-4000-a000-000000000002';
+  v_link uuid := '57000000-0000-4000-a000-000000000003';
+  v_first uuid := '57000000-0000-4000-a000-000000000004';
+  v_second uuid;
+  v_third uuid;
+  v_result jsonb;
+  v_t timestamptz := '2026-08-28T06:00:00Z';
+  v_actor uuid := '57000000-0000-4000-a000-000000000099';
+  v_state text;
+  v_cycle integer;
+begin
+  insert into screening_v2.roles (id, title) values (v_role, 'Synthetic phone role');
+  insert into screening_v2.candidates (id, role_id, name, status)
+    values (v_candidate, v_role, null, 'screened');
+  insert into screening_v2.consent_records
+    (candidate_id, source, consents, status, created_at, updated_at)
+    values (v_candidate, 'job_application',
+      '{ai_interview,recording,purpose,data_processing,retention,rights}',
+      'granted', v_t, v_t);
+  insert into screening_v2.ashby_application_links
+    (id, provider, external_application_id, job_mapping_id, candidate_id, lifecycle)
+    values (v_link, 'ashby', 'synthetic-rescreen-application', null, v_candidate, 'ready');
+  insert into screening_v2.phone_engagements
+    (id, application_link_id, candidate_id, role_id, cycle_number,
+     no_answer_limit, state, terminal_at, created_at, updated_at)
+    values (v_first, v_link, v_candidate, v_role, 1, 3, 'completed',
+      v_t, v_t, v_t);
+
+  v_result := screening_v2.request_phone_rescreen(
+    v_candidate, 'technical_issue', 'policy-rescreen-1', 'hr_manual', v_actor, v_t);
+  v_second := (v_result->>'engagement_id')::uuid;
+  perform _policy_tests.assert(
+    '0057-G1: explicit request creates cycle 2 and no dial work',
+    v_result->>'status' = 'ok'
+      and (v_result->>'cycle_number')::integer = 2
+      and exists (select 1 from screening_v2.phone_engagements
+                  where id = v_second and cycle_number = 2
+                    and state = 'pending_prereqs' and no_answer_limit = 1)
+      and not exists (select 1 from screening_v2.phone_call_attempts where engagement_id = v_second)
+      and not exists (select 1 from screening_v2.job_queue
+                      where payload->>'attemptId' in
+                        (select id::text from screening_v2.phone_call_attempts
+                         where engagement_id = v_second)),
+    coalesce(v_result::text, '<null>'));
+
+  v_result := screening_v2.request_phone_rescreen(
+    v_candidate, 'technical_issue', 'policy-rescreen-1', 'hr_manual', v_actor, v_t);
+  perform _policy_tests.assert(
+    '0057-G2: retrying the same intent returns the original child exactly once',
+    v_result->>'status' = 'already_requested'
+      and (v_result->>'engagement_id')::uuid = v_second
+      and (select count(*) from screening_v2.phone_rescreen_requests
+           where source = 'hr_manual' and request_id = 'policy-rescreen-1') = 1,
+    coalesce(v_result::text, '<null>'));
+
+  v_result := screening_v2.request_phone_rescreen(
+    v_candidate, 'quality_review', 'policy-rescreen-active', 'hr_manual', v_actor, v_t);
+  perform _policy_tests.assert(
+    '0057-G3: an active cycle refuses a second child',
+    v_result->>'status' = 'active_cycle'
+      and (select count(*) from screening_v2.phone_engagements where application_link_id = v_link) = 2,
+    coalesce(v_result::text, '<null>'));
+
+  select state, cycle_number into v_state, v_cycle
+    from screening_v2.phone_engagements where id = v_first;
+  perform _policy_tests.assert(
+    '0057-G4: predecessor remains terminal and immutable',
+    v_state = 'completed' and v_cycle = 1
+      and (select terminal_at from screening_v2.phone_engagements where id = v_first) = v_t,
+    'the original cycle changed');
+
+  update screening_v2.phone_engagements
+     set state = 'cancelled', terminal_at = v_t + interval '1 second', updated_at = v_t + interval '1 second'
+   where id = v_second;
+  v_result := screening_v2.request_phone_rescreen(
+    v_candidate, 'candidate_requested', 'policy-rescreen-2', 'hr_manual', v_actor, v_t);
+  v_third := (v_result->>'engagement_id')::uuid;
+  perform _policy_tests.assert(
+    '0057-G5: a second terminal cycle creates cycle 3 with the tighter budget',
+    v_result->>'status' = 'ok'
+      and (v_result->>'cycle_number')::integer = 3
+      and exists (select 1 from screening_v2.phone_engagements
+                  where id = v_third and cycle_number = 3 and no_answer_limit = 1),
+    coalesce(v_result::text, '<null>'));
+
+  update screening_v2.phone_engagements
+     set state = 'cancelled', terminal_at = v_t + interval '2 seconds', updated_at = v_t + interval '2 seconds'
+   where id = v_third;
+  v_result := screening_v2.request_phone_rescreen(
+    v_candidate, 'quality_review', 'policy-rescreen-cap', 'hr_manual', v_actor, v_t);
+  perform _policy_tests.assert(
+    '0057-G6: the bounded three-cycle policy refuses cycle 4',
+    v_result->>'status' = 'cycle_limit_reached'
+      and (select count(*) from screening_v2.phone_engagements where application_link_id = v_link) = 3,
+    coalesce(v_result::text, '<null>'));
+
+  delete from screening_v2.phone_rescreen_requests where candidate_id = v_candidate;
+  delete from screening_v2.phone_engagements where application_link_id = v_link;
+  delete from screening_v2.ashby_application_links where id = v_link;
+  delete from screening_v2.consent_records where candidate_id = v_candidate;
+  delete from screening_v2.candidates where id = v_candidate;
+  delete from screening_v2.roles where id = v_role;
+end;
+$$;
+
+-- ═══════════════════════════════════════════════════════════════════════
 -- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)
 -- ═══════════════════════════════════════════════════════════════════════
 

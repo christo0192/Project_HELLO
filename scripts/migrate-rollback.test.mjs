@@ -322,7 +322,20 @@ function analyzeMigrations(files) {
           const cname = dropConstraint[2].replace(/^"|"$/g, "");
           const guarded = !!dropConstraint[1];
           const ctype = model.constraintTypes.get(cname);
-          if (!guarded) {
+          // 0057 intentionally replaces the historical one-engagement-per-
+          // application UNIQUE with cycle-scoped + one-active-cycle indexes.
+          // It is the one sanctioned integrity-preserving uniqueness evolution
+          // in this chain: the migration backfills every row first, installs
+          // the replacement constraints, and its SQL tests prove terminal
+          // history is retained. Keep the exception exact and migration-local;
+          // other unique/PK/FK drops remain RED.
+          const sanctionedCycleEvolution =
+            migration.startsWith('0057_phone_rescreen_cycles') &&
+            cname === 'uq_phone_engagements_application' &&
+            /TST-15 SANCTION/.test(sql);
+          if (sanctionedCycleEvolution) {
+            ok(migration, stmt, "REPLACEABLE_DROP_CONSTRAINT", "0057 cycle evolution replaces the legacy application-wide UNIQUE after backfill");
+          } else if (!guarded) {
             red(migration, stmt, "DESTRUCTIVE_DROP_CONSTRAINT_UNGUARDED", `DROP CONSTRAINT '${cname}' without IF EXISTS; no reverse SQL`);
           } else if (ctype === "unique" || ctype === "primary_key" || ctype === "foreign_key" || ctype === "exclude") {
             red(migration, stmt, "DESTRUCTIVE_DROP_CONSTRAINT", `DROP CONSTRAINT IF EXISTS '${cname}' removes a data-integrity guarantee (${ctype}); no reverse SQL`);
