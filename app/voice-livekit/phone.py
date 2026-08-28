@@ -2136,7 +2136,7 @@ def phone_agent_class(agent_base: Any) -> Any:
             self._turn_policy = "substantive"
 
         def set_turn_policy(self, policy: str) -> None:
-            self._turn_policy = policy if policy in {"pre_consent", "substantive", "clarification", "callback", "closing"} else "substantive"
+            self._turn_policy = policy if policy in {"pre_consent", "opening", "substantive", "clarification", "callback", "closing"} else "substantive"
 
         @staticmethod
         def _tool_name(tool: Any) -> str:
@@ -2159,8 +2159,11 @@ def phone_agent_class(agent_base: Any) -> Any:
                 except (TypeError, ValueError):
                     pass
             elif self._turn_policy == "callback":
+
                 tools = [tool for tool in tools if self._tool_name(tool) == "schedule_callback"]
             else:
+                # opening, clarification, closing and pre-consent replies are
+                # ordinary Gemini turns with no coordinator mutation.
                 tools = []
                 try:
                     from dataclasses import replace
