@@ -418,7 +418,11 @@ class TestDefaultPlanDrift(unittest.TestCase):
     # clause unmatchable or vacuously true).
     _INTERROGATIVE = re.compile(
         r"\?|\b(tell|describe|walk|explain|what|how|why|when|where|which|"
-        r"could|can|have|did|would|are|do|is)\b",
+        r"could|can|have|did|would|are|do|is|"
+        # Directive topic shape ("Ask about notice period") is accepted:
+        # the delivery sites hand plan text to the model to phrase, so a
+        # recruiter directive names a topic exactly as well as a question.
+        r"ask|probe|explore|cover|check|confirm|discuss|understand|find)\b",
         re.IGNORECASE,
     )
     _BANNED_WORDS = re.compile(
@@ -426,7 +430,7 @@ class TestDefaultPlanDrift(unittest.TestCase):
         re.IGNORECASE,
     )
     _IMPERATIVE = re.compile(
-        r"\b(must|should|do not|don't)\s+(ask|say|tell|mention|reveal|ignore)\b",
+        r"\b(must|should|do not|don't)\s+(say|tell|mention|reveal|ignore)\b",
         re.IGNORECASE,
     )
     _BRACKETS = re.compile(r"[\[\]{}<>]")
@@ -498,6 +502,20 @@ class TestDefaultPlanDrift(unittest.TestCase):
         for key, text, _mandatory in self._sql_entries():
             with self.subTest(key=key):
                 self.assertNotIn(text, browser_texts)
+
+    def test_recruiter_directive_rows_pass_the_gate(self):
+        # Recruiters author templates as topic directives, and the delivery
+        # sites hand plan text to the model to phrase — so directive shape is
+        # a first-class citizen, pinned here with the production role's own
+        # style (2026-08-28).
+        for text in (
+            "Ask the candidate to introduce themselves and summarize their current work.",
+            "Ask about total experience and customer-facing, counselling, advisory, or sales experience.",
+            "Ask about their Current CTC and expected CTC",
+            "Probe on notice period and practical availability for the role.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(self._speakable(text), text)
 
     def test_the_browser_topic_prose_would_be_refused_by_the_gate(self):
         # The browser prose is the negative control: if the speakability
