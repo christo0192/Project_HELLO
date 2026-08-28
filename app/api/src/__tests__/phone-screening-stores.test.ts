@@ -425,6 +425,9 @@ describe('errors and malformed answers', () => {
       ['phone_sweep_stranded_error', () => stores.sweepStrandedSessions({ now: NOW })],
       ['phone_claim_sweep_error', () => stores.claimSweep({
         sweep: 'reconcile', owner: 'o', now: NOW })],
+      ['phone_record_probe_error', () => stores.recordProbe!({
+        sessionId: 's', questionKey: 'q1', expectedIndex: 0,
+        sourceEventId: 'ev-1', now: NOW })],
     ];
     expect(attempts).toHaveLength(PHONE_RPC_NAMES.length);
     for (const [code, run] of attempts) {

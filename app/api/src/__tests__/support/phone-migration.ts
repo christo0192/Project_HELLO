@@ -78,6 +78,12 @@ export const MIGRATION_0057_PATH = fileURLToPath(
 
 export const MIGRATION_0057 = readFileSync(MIGRATION_0057_PATH, 'utf8');
 
+export const MIGRATION_0060_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0060_phone_cagv_contract.sql', import.meta.url),
+);
+
+export const MIGRATION_0060 = readFileSync(MIGRATION_0060_PATH, 'utf8');
+
 /**
  * Every phone migration, NEWEST FIRST. Extraction walks this in order and the
  * first file that declares a thing wins, which is what "the latest declaration
@@ -85,6 +91,7 @@ export const MIGRATION_0057 = readFileSync(MIGRATION_0057_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    { name: '0060', sql: MIGRATION_0060 },
     { name: '0057', sql: MIGRATION_0057 },
     // NOTE (residual, pre-existing): 0046–0050 are not registered here, so
     // declarations they carry (e.g. 0050's re-definition of
@@ -203,6 +210,7 @@ export const RPC_NAMES = [
   // 0057 — explicit cycle door. PII-bearing number verification is
   // intentionally outside the phone-domain RPC contract.
   'request_phone_rescreen',
+  'record_phone_probe',
 ] as const;
 
 /**

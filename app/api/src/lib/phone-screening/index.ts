@@ -173,6 +173,8 @@ export type {
   PhoneBoundaryTurn,
   PhonePlanQuestion,
   StartPhoneAssessmentInput,
+  RecordPhoneProbeInput,
+  RecordPhoneProbeResult,
 } from './ports.js';
 
 export { createPhoneStores, PHONE_SYSTEM_ACTOR } from './stores.js';
