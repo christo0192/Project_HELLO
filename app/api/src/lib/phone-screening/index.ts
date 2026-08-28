@@ -180,6 +180,9 @@ export type {
   RecordPhoneProbeResult,
   ConsentAndStartPhoneAssessmentInput,
   ConsentAndStartPhoneAssessmentResult,
+  CommitPhoneGateTurnsInput,
+  CommitPhoneGateTurnsResult,
+  CommitPhoneGateTurnsStatus,
 } from './ports.js';
 
 export { createPhoneStores, PHONE_SYSTEM_ACTOR } from './stores.js';

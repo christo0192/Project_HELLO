@@ -133,7 +133,11 @@ async function getTranscript(sessionId: string): Promise<TranscriptTurn[]> {
   const [turnsResult, sessionResult] = await Promise.all([
     supabase
       .from('transcript_turns')
-      .select('speaker,text,turn_started_at_ms')
+      // 0067: the recruiter transcript INCLUDES the pre-consent (gate) turns —
+      // it selects all rows and additionally reads `is_gate` so the UI can tag
+      // them later. This is deliberately the mirror of the scorer, which
+      // EXCLUDES `is_gate = true`. Additive only; no filter is applied here.
+      .select('speaker,text,turn_started_at_ms,is_gate')
       .eq('session_id', sessionId)
       .order('turn_index', { ascending: true }),
     supabase
@@ -157,6 +161,9 @@ async function getTranscript(sessionId: string): Promise<TranscriptTurn[]> {
       speaker: t.speaker as 'bot' | 'candidate',
       text: t.text as string,
       start_offset_sec,
+      // 0067: additive flag so the UI could distinguish the pre-consent gate
+      // turns from the scored assessment turns. Absent/legacy rows read false.
+      is_gate: t.is_gate === true,
     };
   });
 }

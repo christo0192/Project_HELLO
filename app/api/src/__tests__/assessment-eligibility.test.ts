@@ -247,6 +247,28 @@ describe('VOI-08 assessment eligibility preflight', () => {
   });
 
   // ══════════════════════════════════════════════════════════════════
+  //  0067 — the scorer EXCLUDES the pre-consent (gate) transcript turns
+  // ══════════════════════════════════════════════════════════════════
+
+  it('the transcript fetch filters is_gate = true out of the scored transcript', async () => {
+    configureTable('call_sessions', ok(sessionRow('completed', 'conversation_complete')));
+    configureTable('transcript_turns', ok([]));
+    configureTable('roles', ok({ title: 'Frontend Engineer', required_skills: ['TypeScript'] }));
+    configureTable('candidates', ok({ name: 'Alice Example', parsed: { summary: 'Senior engineer' } }));
+    configureTable('assessments', ok({ id: ASSESSMENT_ID }));
+
+    await runAssessment(SESSION_ID);
+
+    // The transcript select must carry an `.eq('is_gate', false)` — the gate
+    // turns (greeting/consent exchange) are NOT part of the scored screening.
+    const eqCalls = callsFor('transcript_turns', 'eq');
+    expect(eqCalls.some((c) => c.args[0] === 'is_gate' && c.args[1] === false)).toBe(true);
+    // And it still scopes to the session, so the filter is ADDITIVE, not a
+    // replacement of the session predicate.
+    expect(eqCalls.some((c) => c.args[0] === 'session_id' && c.args[1] === SESSION_ID)).toBe(true);
+  });
+
+  // ══════════════════════════════════════════════════════════════════
   //  3. NOT_FOUND — existing session-not-found error preserved
   // ══════════════════════════════════════════════════════════════════
 

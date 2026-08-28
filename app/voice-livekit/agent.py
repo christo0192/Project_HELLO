@@ -791,6 +791,7 @@ async def _classify_phone_answer(
     say: Callable[[str], Any],
     *,
     attempts: int = 2,
+    consumed: "list[str] | None" = None,
 ) -> str:
     """Read the response to the disclosure, re-asking at most once.
 
@@ -798,9 +799,16 @@ async def _classify_phone_answer(
     hard timeout — so neither a silent line nor an endlessly chatty one can keep
     the call in the unclassified state where recording is forbidden and the
     conversation has not started.
+
+    Every utterance this consumes is appended to ``consumed`` when provided, so
+    the gate can read the RAW consent reply (the last consumed text) it decided
+    HUMAN on and commit it as the candidate half of the gate transcript. The
+    classifier reads it; the gate records it — no text is inferred after.
     """
     for attempt in range(max(1, attempts)):
         text = await turns.get()
+        if consumed is not None and isinstance(text, str) and text.strip():
+            consumed.append(text)
         decision = classify_answer_text(text)
         if decision is not None:
             return decision
@@ -1614,12 +1622,29 @@ async def _run_phone_session(
 
     @session.on("user_state_changed")
     def _on_phone_user_state_changed(event):  # noqa: ANN001
-        if getattr(event, "new_state", None) == "speaking":
+        new_state = getattr(event, "new_state", None)
+        if new_state == "speaking":
             candidate_activity.set()
             # LiveKit 1.6.4 does not guarantee speech-start metrics on every
             # finalized ChatMessage. This event is the real local VAD anchor,
             # used only when the message has no provider timestamp.
             latest_candidate_anchor[0] = int(round(time.time() * 1000))
+        # DISCONNECT DIAGNOSTICS. A candidate going 'away' (LiveKit's own
+        # inactivity state) and coming back is exactly the shape a dropped or
+        # muted leg leaves behind, and the live call had no record of it. Log
+        # the transition to/from 'away' in FIXED strings only — no transcript,
+        # no ids, no dynamic values.
+        old_state = getattr(event, "old_state", None)
+        if new_state == "away":
+            _log.info(
+                "unknown_event", error_type="phone_user_state",
+                error_category="user_away",
+            )
+        elif old_state == "away":
+            _log.info(
+                "unknown_event", error_type="phone_user_state",
+                error_category="user_active",
+            )
 
     @session.on("user_input_transcribed")
     def _on_phone_transcript_activity(event):  # noqa: ANN001
@@ -1689,7 +1714,21 @@ async def _run_phone_session(
 
     @session.on("close")
     def _on_phone_close(event):  # noqa: ANN001
-        close_reason["reason"] = _classify_close_event(event)
+        reason = _classify_close_event(event)
+        close_reason["reason"] = reason
+        # DISCONNECT DIAGNOSTICS. The 2026-08-28 live call died with the close
+        # reason computed but never surfaced — and it was almost certainly a
+        # CLEAN remote close, the one shape a failure-only log would exclude.
+        # EVERY close is logged: `clean_close` for the SDK's normal shape
+        # (reason None), otherwise one of the fixed codes
+        # `_classify_close_event` returns. Never raw reason text.
+        bounded = reason if reason in {
+            "shutdown_forced", "provider_error", "worker_crash",
+        } else ("clean_close" if reason is None else "other_failure")
+        _log.warn(
+            "unknown_event", error_type="phone_session_closed",
+            error_category=bounded,
+        )
         close_event.set()
 
     async def say(text: str) -> None:
@@ -1741,10 +1780,59 @@ async def _run_phone_session(
         await session.start(agent=agent, room=ctx.room, record=dict(_PHONE_NO_RECORDING))
         return participant
 
+    # The raw consent utterance the classifier consumed, threaded out so the
+    # gate can commit it as the candidate half of the gate transcript.
+    consent_reply_out: list[str] = []
+
     async def classify() -> str:
         if classifier is not None:
             return await classifier(user_turns, say)
-        return await _classify_phone_answer(user_turns, say)
+        return await _classify_phone_answer(
+            user_turns, say, consumed=consent_reply_out
+        )
+
+    async def speak_opening() -> str | None:
+        """Generate a warm, verified opening through the tool-less gate window.
+
+        Sets the agent's `_gate_opening` window so `llm_node` streams the
+        generated greeting even though screening is not yet authorized, asks the
+        model to greet as Christy, disclose recording (including the fixed
+        recording-disclosure sentence verbatim), and ask consent, then reads the
+        exact spoken text back out of the same `latest_assistant` capture the
+        native loop uses. Returns None on any failure so the gate falls back to
+        the fixed disclosure — the gate verifies the text before trusting it.
+        """
+        generate = getattr(session, "generate_reply", None)
+        if not callable(generate):
+            return None
+        setter = getattr(agent, "set_gate_opening", None)
+        if callable(setter):
+            setter(True)
+        latest_assistant[0] = None
+        try:
+            handle = generate(instructions=(
+                "You are Christy, an AI voice assistant calling from the company "
+                "about the candidate's job application. Greet the candidate warmly "
+                "and briefly by voice. You MUST include this exact sentence "
+                "verbatim, word for word, somewhere in your reply: "
+                f"\"{phone.PHONE_DISCLOSURE_RECORDING_SENTENCE}\" "
+                "Then ask whether it is okay to continue. Keep it to two or three "
+                "short sentences and end with the consent question."
+            ))
+            if inspect.isawaitable(handle):
+                handle = await handle
+            wait = getattr(handle, "wait_for_playout", None)
+            if callable(wait):
+                value = wait()
+                if inspect.isawaitable(value):
+                    await value
+        except Exception:  # noqa: BLE001
+            return None
+        finally:
+            if callable(setter):
+                setter(False)
+        spoken_text = latest_assistant[0]
+        return spoken_text if isinstance(spoken_text, str) and spoken_text.strip() else None
 
     result = await phone.run_phone_gate(
         attempt_id=attempt_id,
@@ -1753,6 +1841,12 @@ async def _run_phone_session(
         classify=classify,
         say=say,
         start_recording=_phone_recording_permitted,
+        epoch=epoch,
+        # Recording-from-answer: post call.answered before the disclosure so the
+        # server can start the egress from the top of the call.
+        post_call_answered=True,
+        speak_opening=speak_opening,
+        consent_reply_out=consent_reply_out,
         # The session hint for the server-side recording start: derived from
         # the room name the dialer minted (`phone-<sessionId>`), the same
         # derivation 0044's binding re-verifies. Without it the server's

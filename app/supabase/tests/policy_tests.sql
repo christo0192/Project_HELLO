@@ -13212,6 +13212,245 @@ end;
 $$;
 
 -- ═══════════════════════════════════════════════════════════════════════
+-- 0067 — Phone Parity 2: call.answered, bind-from-answer, gate transcript
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- ── G1: call.answered applies from a live attempt, stamps answered_at,
+--        moves the engagement nowhere, and is idempotent ─────────────────
+do $$
+declare
+  v_eng uuid; v_att uuid; v_res jsonb; v_first jsonb; v_rows integer;
+  v_t timestamptz := '2026-09-07T06:00:00Z';                 -- 11:30 IST Monday
+  v_answered1 timestamptz; v_answered2 timestamptz; v_state text; v_att_state text;
+begin
+  v_eng := _policy_tests.phone_fixture('pol67-answered');
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid;
+
+  v_first := screening_v2.apply_phone_event('livekit_webhook','call.answered',
+                                            v_att, null, 'pol67-ans-1', 0, null, v_t);
+  select answered_at, state into v_answered1, v_att_state
+    from screening_v2.phone_call_attempts where id = v_att;
+  select state into v_state from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0067-G1: call.answered applies, stamps answered_at, and moves the engagement NOWHERE',
+    v_first->>'status' = 'applied' and (v_first->>'applied')::boolean
+      and v_answered1 = v_t and v_att_state = 'answered_unclassified'
+      and v_state = 'dialing',
+    'answer is a first-class fact, not consent; got ' || v_first::text
+      || ' att_state=' || v_att_state || ' eng_state=' || v_state);
+
+  -- Idempotent: a redelivery carrying the same provider id writes no second
+  -- row and returns the ORIGINAL verdict; answered_at is not moved.
+  v_res := screening_v2.apply_phone_event('livekit_webhook','call.answered',
+                                          v_att, null, 'pol67-ans-1', 0, null,
+                                          '2026-09-07T06:05:00Z'::timestamptz);
+  select count(*) into v_rows from screening_v2.phone_call_events
+   where source = 'livekit_webhook' and provider_event_id = 'pol67-ans-1';
+  select answered_at into v_answered2 from screening_v2.phone_call_attempts where id = v_att;
+  perform _policy_tests.assert(
+    '0067-G1: a duplicate call.answered writes ONE row, returns the ORIGINAL verdict, keeps answered_at',
+    v_rows = 1 and (v_res->>'duplicate')::boolean
+      and v_res->>'event_id' = v_first->>'event_id'
+      and v_answered2 = v_answered1,
+    'rows=' || v_rows || ' second=' || v_res::text);
+
+  perform _policy_tests.phone_teardown('pol67-answered');
+end;
+$$;
+
+-- ── G2: call.answered from a TERMINAL attempt is ignored, matching the
+--        ignored shape every other event uses ──────────────────────────
+do $$
+declare
+  v_eng uuid; v_res jsonb;
+  v_t timestamptz := '2026-09-07T06:00:00Z';
+begin
+  -- A terminal engagement, posted BY ENGAGEMENT exactly as the 0042 events
+  -- test does for the `terminal` case.
+  v_eng := _policy_tests.phone_fixture('pol67-answered-term', 'cancelled');
+  v_res := screening_v2.apply_phone_event('livekit_webhook','call.answered',
+                                          null, v_eng, 'pol67-ans-term', null, null, v_t);
+  perform _policy_tests.assert(
+    '0067-G2: call.answered for a terminal engagement is recorded and ignored as terminal',
+    v_res->>'ignored_reason' = 'terminal' and (v_res->>'applied')::boolean is false,
+    'recorded, never silently dropped; got ' || v_res::text);
+
+  perform _policy_tests.phone_teardown('pol67-answered-term');
+end;
+$$;
+
+-- ── G3: attach_phone_attempt_recording binds in the PRE-CONSENT answered
+--        state, and still refuses a terminal engagement ─────────────────
+do $$
+declare
+  v_ids uuid[]; v_res jsonb; v_key text; v_state text;
+  v_eng2 uuid; v_att2 uuid; v_res2 jsonb;
+begin
+  -- phone44_fixture leaves the engagement `dialing` when asked, with an
+  -- attempt in the answered `human` state and a live `waiting` session — the
+  -- exact pre-consent shape Parity 2 records from.
+  v_ids := _policy_tests.phone44_fixture('pol67-bind', 'dialing');
+  v_key := 'phone-' || v_ids[2]::text || '-egress.mp3';
+
+  v_res := screening_v2.attach_phone_attempt_recording(
+             v_ids[2], v_key, v_key || '.json', 'authoritative', 'EG_pol67bind',
+             '2026-09-01T06:00:00Z'::timestamptz);
+  select state into v_state from screening_v2.phone_engagements where id = v_ids[1];
+  perform _policy_tests.assert(
+    '0067-G3: a recording binds in the pre-consent answered (dialing) state',
+    v_res->>'status' = 'ok' and (v_res->>'duplicate')::boolean is false
+      and v_res->>'role' = 'authoritative'
+      and v_state = 'dialing'
+      and (select recording_object_key from screening_v2.phone_call_attempts
+             where id = v_ids[2]) = v_key,
+    'record-from-answer must bind before disclosure; got ' || v_res::text);
+  perform _policy_tests.phone44_teardown('pol67-bind');
+
+  -- A live but PRE-answer attempt (admitted) still cannot bind: the attempt
+  -- gate is what keeps `dialing` safe.
+  v_eng2 := _policy_tests.phone_fixture('pol67-bind-early');
+  v_res2 := screening_v2.admit_phone_attempt(v_eng2, 'initial', null, 60,
+                                             '2026-09-07T06:00:00Z'::timestamptz);
+  v_att2 := (v_res2->>'attempt_id')::uuid;
+  v_res2 := screening_v2.attach_phone_attempt_recording(
+              v_att2, 'phone-' || v_att2::text || '-egress.mp3',
+              null, 'authoritative', null, '2026-09-07T06:00:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0067-G3: a merely-admitted (unanswered) attempt still cannot bind a recording',
+    v_res2->>'status' = 'attempt_not_recordable',
+    'the attempt gate must still require an ANSWERED leg; got ' || v_res2::text);
+  perform _policy_tests.phone_teardown('pol67-bind-early');
+
+  -- A terminal engagement still refuses outright.
+  v_ids := _policy_tests.phone44_fixture('pol67-bind-term', 'cancelled');
+  v_key := 'phone-' || v_ids[2]::text || '-egress.mp3';
+  v_res := screening_v2.attach_phone_attempt_recording(
+             v_ids[2], v_key, null, 'authoritative', null,
+             '2026-09-01T06:00:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0067-G3: a terminal engagement still refuses a recording bind',
+    v_res->>'status' = 'engagement_terminal',
+    'terminal immutability is unchanged; got ' || v_res::text);
+  perform _policy_tests.phone44_teardown('pol67-bind-term');
+end;
+$$;
+
+-- ── G4: commit_phone_gate_turns writes N gate turns, is idempotent at the
+--        gate, and refuses a malformed array and an unknown session ──────
+do $$
+declare
+  v_ids uuid[]; v_res jsonb; v_rows integer; v_gate integer; v_max integer;
+  v_turns jsonb := '[{"speaker":"bot","text":"Hi, is this a good time?"},
+                     {"speaker":"candidate","text":"Yes, who is this?"},
+                     {"speaker":"bot","text":"Calling about your application."}]'::jsonb;
+begin
+  v_ids := _policy_tests.phone44_fixture('pol67-gate');
+
+  v_res := screening_v2.commit_phone_gate_turns(
+             v_ids[3], 'pol67-gate-ev', v_turns, '2026-09-01T06:00:00Z'::timestamptz);
+  select count(*), count(*) filter (where is_gate), coalesce(max(turn_index), -1)
+    into v_rows, v_gate, v_max
+    from screening_v2.transcript_turns where session_id = v_ids[3];
+  perform _policy_tests.assert(
+    '0067-G4: gate turns are written with is_gate=true and contiguous turn_index from 0',
+    v_res->>'status' = 'ok' and (v_res->>'turns_written')::int = 3
+      and v_rows = 3 and v_gate = 3 and v_max = 2,
+    'gate transcript not written as expected; got ' || v_res::text
+      || ' rows=' || v_rows || ' gate=' || v_gate);
+
+  -- A second call is idempotent AT THE GATE: already_recorded, nothing added.
+  v_res := screening_v2.commit_phone_gate_turns(
+             v_ids[3], 'pol67-gate-ev2',
+             '[{"speaker":"bot","text":"Second gate?"},
+               {"speaker":"candidate","text":"No."}]'::jsonb,
+             '2026-09-01T06:01:00Z'::timestamptz);
+  select count(*) into v_rows from screening_v2.transcript_turns where session_id = v_ids[3];
+  perform _policy_tests.assert(
+    '0067-G4: a second gate commit returns already_recorded and writes nothing',
+    v_res->>'status' = 'already_recorded' and v_rows = 3,
+    'the gate transcript is written once; got ' || v_res::text || ' rows=' || v_rows);
+
+  -- A malformed turns array is refused (a candidate-first exchange is fine
+  -- for the gate, but a blank text is not).
+  v_res := screening_v2.commit_phone_gate_turns(
+             v_ids[3], 'pol67-gate-bad',
+             '[{"speaker":"bot","text":"   "}]'::jsonb,
+             '2026-09-01T06:02:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0067-G4: a malformed gate turns array is refused as invalid_turns',
+    v_res->>'status' = 'invalid_turns',
+    'shape is validated; got ' || v_res::text);
+
+  -- An unknown session is refused, distinct from a shape error.
+  v_res := screening_v2.commit_phone_gate_turns(
+             gen_random_uuid(), 'pol67-gate-ghost', v_turns,
+             '2026-09-01T06:03:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0067-G4: an unknown session is refused as unknown_session',
+    v_res->>'status' = 'unknown_session',
+    'a missing session is distinct from a malformed body; got ' || v_res::text);
+
+  perform _policy_tests.phone44_teardown('pol67-gate');
+end;
+$$;
+
+-- ── G5: a question boundary AFTER gate turns continues turn_index without
+--        collision — one monotonic sequence across gate and assessment ───
+do $$
+declare
+  v_ids uuid[]; v_res jsonb; v_role uuid; v_start jsonb;
+  v_indexes integer[]; v_gate_count integer; v_scored_count integer;
+begin
+  v_ids := _policy_tests.phone44_fixture('pol67-seq', 'dialing');
+  select role_id into v_role from screening_v2.phone_engagements where id = v_ids[1];
+  update screening_v2.roles
+     set screening_template = '[{"id":"k1","question":"First?","mandatory":true}]'::jsonb
+   where id = v_role;
+
+  -- Move the engagement to in_call so the assessment can start; the fixture's
+  -- attempt is already answered `human`.
+  update screening_v2.phone_engagements set state = 'in_call', version = version + 1
+   where id = v_ids[1];
+
+  -- Gate turns FIRST (session still activates on start; gate accepts waiting).
+  v_res := screening_v2.commit_phone_gate_turns(
+             v_ids[3], 'pol67-seq-gate',
+             '[{"speaker":"bot","text":"Hi, good time?"},
+               {"speaker":"candidate","text":"Sure."}]'::jsonb,
+             '2026-09-01T06:00:00Z'::timestamptz);
+
+  v_start := screening_v2.start_phone_assessment(
+               v_ids[2], v_ids[3], '2026-09-01T06:00:30Z'::timestamptz);
+
+  -- The assessment boundary appends AFTER the two gate turns.
+  v_res := screening_v2.commit_phone_question_boundary(
+             v_ids[3], 'k1', 0, 'pol67-seq-b1',
+             '[{"speaker":"bot","text":"How many years?"},
+               {"speaker":"candidate","text":"Four."}]'::jsonb,
+             '2026-09-01T06:01:00Z'::timestamptz);
+
+  select array_agg(turn_index order by turn_index),
+         count(*) filter (where is_gate),
+         count(*) filter (where not is_gate)
+    into v_indexes, v_gate_count, v_scored_count
+    from screening_v2.transcript_turns where session_id = v_ids[3];
+
+  perform _policy_tests.assert(
+    '0067-G5: a boundary after gate turns continues turn_index without collision',
+    v_res->>'status' = 'applied'
+      and (v_res->>'first_turn_index')::int = 2
+      and (v_res->>'last_turn_index')::int = 3
+      and v_indexes = array[0,1,2,3]
+      and v_gate_count = 2 and v_scored_count = 2,
+    'gate and assessment turns must share one monotonic sequence; got '
+      || v_res::text || ' indexes=' || v_indexes::text);
+
+  perform _policy_tests.phone44_teardown('pol67-seq');
+end;
+$$;
+
+-- ═══════════════════════════════════════════════════════════════════════
 -- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)
 -- ═══════════════════════════════════════════════════════════════════════
 

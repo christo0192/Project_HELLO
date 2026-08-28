@@ -86,6 +86,9 @@ import type {
   RecordPhoneProbeResult,
   ConsentAndStartPhoneAssessmentInput,
   ConsentAndStartPhoneAssessmentResult,
+  CommitPhoneGateTurnsInput,
+  CommitPhoneGateTurnsResult,
+  CommitPhoneGateTurnsStatus,
   PhoneAssessmentState,
   PhoneAssessmentTurn,
   PhonePlanQuestion,
@@ -930,6 +933,40 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
         probeCount: num(row, 'probe_count'),
         questionKey: str(row, 'question_key'),
         questionIndex: num(row, 'question_index'),
+      };
+    },
+
+    async commitGateTurns(input: CommitPhoneGateTurnsInput): Promise<CommitPhoneGateTurnsResult> {
+      const { data, error } = await client.rpc('commit_phone_gate_turns', {
+        p_session_id: input.sessionId,
+        p_source_event_id: input.sourceEventId,
+        // Serialized here rather than passed through, so nothing but `speaker`,
+        // `text` and the timing anchor can reach the database however the
+        // caller shaped its objects.
+        p_turns: input.turns.map((t) => ({
+          speaker: t.speaker,
+          text: t.text,
+          turn_started_at_ms: t.turnStartedAtMs ?? null,
+        })),
+        p_now: isoInstant(input.now),
+      });
+      if (error) throw new Error('phone_commit_gate_turns_error');
+      const row = asRow(data);
+      // Narrowed INLINE against the gate RPC's closed vocabulary — this RPC is
+      // deliberately outside the drift-validated `PHONE_RPC_NAMES` contract, so
+      // `narrowPhoneRpcStatus` does not know it. An answer this layer does not
+      // recognise becomes the shared unknown sentinel, which the caller treats
+      // as "did not happen".
+      const raw = str(row, 'status');
+      const GATE_STATUSES: readonly CommitPhoneGateTurnsStatus[] = [
+        'ok', 'already_recorded', 'invalid_turns', 'unknown_session', 'session_not_active',
+      ];
+      const status = raw !== undefined && (GATE_STATUSES as readonly string[]).includes(raw)
+        ? (raw as CommitPhoneGateTurnsStatus)
+        : PHONE_RPC_UNKNOWN_STATUS;
+      return {
+        status,
+        turnsWritten: num(row, 'turns_written'),
       };
     },
   };

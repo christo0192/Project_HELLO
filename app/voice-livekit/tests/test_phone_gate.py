@@ -857,6 +857,337 @@ class TestPhoneGate(unittest.IsolatedAsyncioTestCase):
                     self.assertIn(event_type, phone.PHONE_WORKER_EVENTS)
 
 
+# ── Phone Parity 2: call.answered, LLM opening, consent bridge, gate turns ──
+
+class _AtomicEventClient(FakeEventClient):
+    """A production-shaped client: exposes the atomic consent/start RPC and the
+    gate-turn commit, both scripted and recorded."""
+
+    def __init__(self, *, consent=None, gate=None, gate_raises=False, **kwargs):
+        super().__init__(**kwargs)
+        self._consent = consent
+        self._gate = gate
+        self._gate_raises = gate_raises
+        self.consent_calls: list[tuple] = []
+        self.gate_commits: list[dict] = []
+
+    async def consent_and_start_assessment(self, attempt_id, session_id, epoch):
+        self.consent_calls.append((attempt_id, session_id, epoch))
+        self.timeline.append("consent_and_start")
+        if self._consent is not None:
+            return self._consent
+        return _default_state()
+
+    async def commit_gate_turns(self, session_id, turns, source_event_id):
+        self.gate_commits.append({
+            "session_id": session_id,
+            "turns": list(turns),
+            "source_event_id": source_event_id,
+        })
+        self.timeline.append("gate_turns")
+        if self._gate_raises:
+            raise RuntimeError("gate turns boom")
+        if self._gate is not None:
+            return self._gate
+        return phone.PhoneApiOutcome(True, "ok")
+
+
+_VERIFIED_OPENING = (
+    "Hi, this is Christy from the company about your job application. "
+    "This call is recorded so the hiring team can review it. "
+    "Is it okay to continue?"
+)
+
+
+class TestPhoneParity2Gate(unittest.IsolatedAsyncioTestCase):
+    """The Phone Parity 2 additions to the gate, tested at the seam."""
+
+    async def _atomic_gate(
+        self, *, decision=phone.CLASSIFY_HUMAN, client=None, recorder=None,
+        speak_opening=None, post_call_answered=True, consent_reply="Yes, that's fine.",
+        answered=None,
+    ):
+        recorder = recorder or Recorder()
+        client = client or _AtomicEventClient()
+        if answered is not None:
+            client._outcomes["call.answered"] = answered
+        consent_reply_out: list[str] = []
+
+        async def wait_for_participant():
+            recorder.order.append("participant_wait")
+            return _participant()
+
+        async def classify():
+            recorder.order.append("classify")
+            if consent_reply is not None:
+                consent_reply_out.append(consent_reply)
+            return decision
+
+        result = await phone.run_phone_gate(
+            attempt_id=_ATTEMPT_ID,
+            client=client,
+            wait_for_participant=wait_for_participant,
+            classify=classify,
+            say=recorder.say,
+            start_recording=recorder.start_recording,
+            classify_timeout_sec=0.05,
+            session_id=_SESSION_ID,
+            epoch=_EPOCH,
+            post_call_answered=post_call_answered,
+            speak_opening=speak_opening,
+            consent_reply_out=consent_reply_out,
+        )
+        return result, client, recorder
+
+    # ── call.answered ────────────────────────────────────────────────────
+
+    async def test_call_answered_is_posted_after_participant_before_disclosure(self):
+        result, client, recorder = await self._atomic_gate()
+        self.assertTrue(result.assessment_allowed)
+        # First event on the wire is call.answered, and it carries the session hint.
+        first = client.calls[0]
+        self.assertEqual(first[1], "call.answered")
+        self.assertEqual(first[2]["session_id"], _SESSION_ID)
+        self.assertEqual(first[2]["epoch"], _EPOCH)
+        # Ordering: participant, then call.answered event, then disclosure say.
+        self.assertEqual(recorder.order[0], "participant_wait")
+        answered_at = client.timeline.index("event:call.answered")
+        # The disclosure (fixed, since no speak_opening) is said after the post.
+        self.assertIn(phone.PHONE_DISCLOSURE_TEXT, recorder.spoken)
+
+    async def test_gate_proceeds_when_call_answered_is_ignored(self):
+        ignored = phone.PhoneApiOutcome(True, "ignored")
+        result, client, recorder = await self._atomic_gate(answered=ignored)
+        # Ignored call.answered does NOT record the event, but the call continues.
+        self.assertTrue(result.assessment_allowed)
+        self.assertNotIn("call.answered", result.events)
+        self.assertEqual(client.calls[0][1], "call.answered")
+
+    async def test_call_answered_transport_failure_does_not_kill_the_call(self):
+        boom = phone.PhoneApiOutcome(False, error_category="transport")
+        result, client, recorder = await self._atomic_gate(answered=boom)
+        self.assertTrue(result.assessment_allowed)
+        self.assertNotIn("call.answered", result.events)
+
+    async def test_legacy_caller_never_posts_call_answered(self):
+        # Default post_call_answered=False keeps the legacy event order intact.
+        recorder = Recorder()
+        client = _AtomicEventClient()
+
+        async def wait_for_participant():
+            return _participant()
+
+        async def classify():
+            return phone.CLASSIFY_HUMAN
+
+        result = await phone.run_phone_gate(
+            attempt_id=_ATTEMPT_ID, client=client,
+            wait_for_participant=wait_for_participant, classify=classify,
+            say=recorder.say, start_recording=recorder.start_recording,
+            classify_timeout_sec=0.05, session_id=_SESSION_ID, epoch=_EPOCH,
+        )
+        self.assertNotIn("call.answered", [c[1] for c in client.calls])
+
+    # ── LLM opening + verification/fallback ──────────────────────────────
+
+    async def test_llm_opening_is_used_captured_and_gate_turns_committed_once(self):
+        spoken_openings: list[str] = []
+
+        async def speak_opening():
+            spoken_openings.append(_VERIFIED_OPENING)
+            return _VERIFIED_OPENING
+
+        result, client, recorder = await self._atomic_gate(speak_opening=speak_opening)
+        self.assertTrue(result.assessment_allowed)
+        # The generated opening was used, NOT the fixed disclosure.
+        self.assertNotIn(phone.PHONE_DISCLOSURE_TEXT, recorder.spoken)
+        self.assertEqual(len(spoken_openings), 1)
+        # Gate turns committed exactly once, [bot opening, candidate reply],
+        # with the deterministic gate:<session> source id.
+        self.assertEqual(len(client.gate_commits), 1)
+        commit = client.gate_commits[0]
+        self.assertEqual(commit["source_event_id"], f"gate:{_SESSION_ID}")
+        self.assertEqual([t["speaker"] for t in commit["turns"]], ["bot", "candidate"])
+        self.assertEqual(commit["turns"][0]["text"], _VERIFIED_OPENING)
+        self.assertEqual(commit["turns"][1]["text"], "Yes, that's fine.")
+
+    async def test_unverified_opening_falls_back_and_still_commits_fixed_text(self):
+        async def speak_opening():
+            # Warm but discloses nothing and asks nothing → verification fails.
+            return "Hi there, lovely to reach you today."
+
+        result, client, recorder = await self._atomic_gate(speak_opening=speak_opening)
+        self.assertTrue(result.assessment_allowed)
+        # Fell back to the fixed disclosure...
+        self.assertIn(phone.PHONE_DISCLOSURE_TEXT, recorder.spoken)
+        # ...and STILL committed the gate turns, with the fixed opening text.
+        self.assertEqual(len(client.gate_commits), 1)
+        self.assertEqual(
+            client.gate_commits[0]["turns"][0]["text"], phone.PHONE_DISCLOSURE_TEXT
+        )
+
+    async def test_speak_opening_that_raises_falls_back_to_fixed_disclosure(self):
+        async def speak_opening():
+            raise RuntimeError("generate_reply unavailable")
+
+        result, client, recorder = await self._atomic_gate(speak_opening=speak_opening)
+        self.assertTrue(result.assessment_allowed)
+        self.assertIn(phone.PHONE_DISCLOSURE_TEXT, recorder.spoken)
+        self.assertEqual(
+            client.gate_commits[0]["turns"][0]["text"], phone.PHONE_DISCLOSURE_TEXT
+        )
+
+    def test_opening_verification_predicate(self):
+        # record + question shape → verified.
+        self.assertTrue(phone._opening_is_verified(
+            "This call is recorded. Is it okay to continue?"
+        ))
+        self.assertTrue(phone._opening_is_verified(
+            "We record this call so the team can review; okay to continue"
+        ))
+        # missing 'record' → not verified.
+        self.assertFalse(phone._opening_is_verified("Is it okay to continue?"))
+        # missing question shape → not verified.
+        self.assertFalse(phone._opening_is_verified("This call is recorded."))
+        self.assertFalse(phone._opening_is_verified(""))
+        self.assertFalse(phone._opening_is_verified(None))
+
+    # ── consent bridge ───────────────────────────────────────────────────
+
+    async def test_consent_bridge_is_spoken_after_human_and_is_gate_copy(self):
+        result, client, recorder = await self._atomic_gate()
+        self.assertTrue(result.assessment_allowed)
+        self.assertIn(phone.PHONE_CONSENT_BRIDGE_TEXT, recorder.spoken)
+        self.assertTrue(phone.is_gate_copy(phone.PHONE_CONSENT_BRIDGE_TEXT))
+        # It overlaps the RPC: the bridge say and the consent RPC both happen,
+        # and the bridge is reaped before the gate returns.
+        self.assertIn("consent_and_start", client.timeline)
+
+    async def test_a_failing_bridge_never_fails_the_gate(self):
+        class _BridgeBoomRecorder(Recorder):
+            async def say(self, text):
+                if text == phone.PHONE_CONSENT_BRIDGE_TEXT:
+                    raise RuntimeError("bridge playout failed")
+                await super().say(text)
+
+        result, client, recorder = await self._atomic_gate(
+            recorder=_BridgeBoomRecorder()
+        )
+        # The gate still consents and starts despite the bridge raising.
+        self.assertTrue(result.assessment_allowed)
+        self.assertEqual(len(client.consent_calls), 1)
+
+    # ── gate-turn commit failure ─────────────────────────────────────────
+
+    async def test_gate_turns_commit_failure_does_not_fail_the_call(self):
+        client = _AtomicEventClient(gate=phone.PhoneApiOutcome(False, "invalid_turns"))
+        result, client, recorder = await self._atomic_gate(client=client)
+        self.assertTrue(result.assessment_allowed)
+        self.assertEqual(len(client.gate_commits), 1)
+
+    async def test_gate_turns_commit_exception_does_not_fail_the_call(self):
+        client = _AtomicEventClient(gate_raises=True)
+        result, client, recorder = await self._atomic_gate(client=client)
+        self.assertTrue(result.assessment_allowed)
+
+    async def test_no_consent_reply_still_commits_the_opening_only(self):
+        async def speak_opening():
+            return _VERIFIED_OPENING
+
+        result, client, recorder = await self._atomic_gate(
+            speak_opening=speak_opening, consent_reply=None
+        )
+        self.assertTrue(result.assessment_allowed)
+        self.assertEqual(len(client.gate_commits), 1)
+        turns = client.gate_commits[0]["turns"]
+        self.assertEqual([t["speaker"] for t in turns], ["bot"])
+
+    async def test_classify_timeout_logs_the_stage(self):
+        recorder = Recorder()
+        client = _AtomicEventClient()
+
+        async def wait_for_participant():
+            return _participant()
+
+        async def classify():
+            await asyncio.sleep(5)
+            return phone.CLASSIFY_HUMAN
+
+        with self.assertLogs(level="WARNING") if False else _noop_ctx():
+            result = await phone.run_phone_gate(
+                attempt_id=_ATTEMPT_ID, client=client,
+                wait_for_participant=wait_for_participant, classify=classify,
+                say=recorder.say, classify_timeout_sec=0.02,
+                session_id=_SESSION_ID, epoch=_EPOCH, post_call_answered=True,
+            )
+        # A classify timeout fails closed to machine — the diagnostic log is the
+        # point, and the machine verdict proves the timeout path was taken.
+        self.assertEqual(result.outcome, phone.CLASSIFY_MACHINE)
+
+
+class _noop_ctx:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class TestCommitGateTurnsClient(unittest.IsolatedAsyncioTestCase):
+    """The PhoneEventClient.commit_gate_turns method: happy and failure paths."""
+
+    def _client(self, transport):
+        return phone.PhoneEventClient(
+            transport_factory=lambda: transport, api_base="http://api.test"
+        )
+
+    async def _commit(self, body):
+        transport = _RecordingTransport(body=body)
+        with patch.dict(phone.os.environ, {"WORKER_CONTEXT_SECRET": _GOOD_SECRET}):
+            outcome = await self._client(transport).commit_gate_turns(
+                _SESSION_ID,
+                [{"speaker": "bot", "text": "hi"}, {"speaker": "candidate", "text": "yes"}],
+                f"gate:{_SESSION_ID}",
+            )
+        return outcome, transport
+
+    async def test_ok_status_is_success_and_posts_the_exact_body(self):
+        outcome, transport = await self._commit({"ok": True, "status": "ok"})
+        self.assertTrue(outcome.ok)
+        request = transport.requests[0]
+        self.assertEqual(request["method"], "POST")
+        self.assertEqual(request["url"], "http://api.test" + phone.GATE_TURNS_PATH)
+        self.assertEqual(request["json"]["session_id"], _SESSION_ID)
+        self.assertEqual(request["json"]["source_event_id"], f"gate:{_SESSION_ID}")
+        self.assertEqual(len(request["json"]["turns"]), 2)
+
+    async def test_already_recorded_is_also_success(self):
+        outcome, _ = await self._commit({"ok": True, "status": "already_recorded"})
+        self.assertTrue(outcome.ok)
+        self.assertTrue(outcome.duplicate)
+
+    async def test_invalid_turns_is_not_success(self):
+        outcome, _ = await self._commit({"ok": False, "status": "invalid_turns"})
+        self.assertFalse(outcome.ok)
+
+    async def test_ok_flag_with_off_allowlist_status_fails_closed(self):
+        outcome, _ = await self._commit({"ok": True, "status": "unknown_session"})
+        self.assertFalse(outcome.ok)
+
+    async def test_malformed_body_fails_closed(self):
+        outcome, _ = await self._commit("not-a-dict")
+        self.assertFalse(outcome.ok)
+
+    async def test_short_secret_never_reaches_the_wire(self):
+        transport = _RecordingTransport()
+        with patch.dict(phone.os.environ, {"WORKER_CONTEXT_SECRET": "short"}):
+            outcome = await self._client(transport).commit_gate_turns(
+                _SESSION_ID, [{"speaker": "bot", "text": "hi"}], f"gate:{_SESSION_ID}"
+            )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(transport.requests, [])
+
+
 # ── The default answer classifier ─────────────────────────────────────
 
 class TestAnswerClassifier(unittest.TestCase):
@@ -1415,11 +1746,23 @@ class _FakePhoneSession:
     default_silence_reply: str | None = None
     default_emit_auto_speech: bool = True
     include_timing: bool = False
+    # The verified opening the gate-opening window "speaks" through
+    # generate_reply. Discloses recording and asks, so `_opening_is_verified`
+    # accepts it; a test can override it to exercise the fallback.
+    gate_opening_text: str = (
+        "Hi, this is Christy from the company about your job application. "
+        "This call is recorded so the hiring team can review it. "
+        "Is it okay to continue?"
+    )
 
     def __init__(self, **kwargs):
         self.handlers: dict = {}
         self.started_with = None
         self.spoken: list[str] = []
+        # Every bot turn EMITTED as a conversation item, whether via `say` or
+        # `generate_reply`. Used by tests that must confirm the generated gate
+        # opening reached the transcript without going through `say`.
+        self.emitted_bot_turns: list[str] = []
         self.start_calls = 0
         # 0044: scripted candidate replies, one per generate_reply. A `None`
         # entry means the candidate said nothing at all, which is how the
@@ -1533,6 +1876,7 @@ class _FakePhoneSession:
         asyncio.create_task(complete_turn())
 
     def emit_bot_turn(self, text, *, interrupted=False):
+        self.emitted_bot_turns.append(text)
         self._emit("assistant", text, interrupted=interrupted)
 
     def _emit(self, role, text, *, interrupted=False):
@@ -1560,6 +1904,14 @@ class _FakePhoneSession:
         handler = self.handlers.get("speech_created")
         if handler is not None and (instructions or self.emit_auto_speech):
             handler(types.SimpleNamespace(speech_handle=speech))
+        # The GATE-OPENING window: before consent, the gate asks the model for a
+        # warm opening. Model it as a verified opening bot turn (it discloses
+        # recording and asks) and do NOT consume a screening answer — the consent
+        # reply arrives through the classifier's turn queue, not through here.
+        if getattr(self.agent, "_gate_opening", False):
+            opening = self.gate_opening_text
+            self.emit_bot_turn(opening)
+            return speech
         interrupted = self.interruptions.pop(0) if self.interruptions else False
         self.emit_bot_turn(f"asked-{len(self.instructions)}", interrupted=interrupted)
         # A fixed line spoken WHILE a boundary is open — the callback
@@ -1764,7 +2116,7 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recording, [1])
         self.assertEqual(
             client.event_types,
-            ["classify.human", "disclosure.delivered", "assessment.completed"],
+            ["call.answered", "classify.human", "disclosure.delivered", "assessment.completed"],
         )
         # Every plan key was committed, in order, before anything was claimed.
         self.assertEqual(client.committed_keys, ["k1", "k2"])
@@ -1772,7 +2124,12 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             [c[0] for c in client.assessment_calls],
             ["start", "turn", "turn", "complete"],
         )
-        self.assertEqual(session.spoken[0], phone.PHONE_DISCLOSURE_TEXT)
+        # The opening is the verified model greeting (through generate_reply),
+        # carrying the recording sentence — never spoken as the fixed disclosure.
+        self.assertIn(
+            phone.PHONE_DISCLOSURE_RECORDING_SENTENCE, session.instructions[0]
+        )
+        self.assertNotIn(phone.PHONE_DISCLOSURE_TEXT, session.spoken)
         terminal_context = str(session.turn_contexts[-1]).lower()
         self.assertIn("goodbye", terminal_context)
         self.assertIn("do not ask another question", terminal_context)
@@ -1797,14 +2154,17 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             answers=("Yes, that's fine.",),
             replies=["First answer.", "Second answer."],
         )
+        # instructions[0] is the GATE opening (greeting + disclosure), generated
+        # before consent. The first planned question is the next generation.
+        self.assertIn("okay to continue", session.instructions[0].lower())
         # The planned text reaches the model as an instruction, not the ear
         # as verbatim speech.
-        self.assertIn("First question?", session.instructions[0])
-        self.assertIn("planned question", session.instructions[0])
+        self.assertIn("First question?", session.instructions[1])
+        self.assertIn("planned question", session.instructions[1])
         self.assertNotIn("First question?", session.spoken)
         self.assertEqual(client.committed_keys, ["k1", "k2"])
-        # Opening generation plus the two answer-mediated replies.
-        self.assertEqual(len(session.instructions), 3)
+        # Gate opening + first-question generation + the two answer-mediated replies.
+        self.assertEqual(len(session.instructions), 4)
 
     async def test_first_question_falls_back_to_fixed_playout_without_generate_reply(self):
         """A session without `generate_reply` still asks the exact planned text."""
@@ -1911,7 +2271,7 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         _, client, _, delete, _, _ = await self._run_session(
             answers=("Yes, that's fine.",), client=client
         )
-        self.assertEqual(client.event_types, ["classify.human", "disclosure.delivered"])
+        self.assertEqual(client.event_types, ["call.answered", "classify.human", "disclosure.delivered"])
         self.assertNotIn("assessment.completed", client.event_types)
         self.assertNotIn("assessment.aborted", client.event_types)
         # AND the second question was never asked, and no completion was even
@@ -2078,9 +2438,13 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.boundaries[0]["expected_index"], 1)
         self.assertIn("assessment.completed", client.event_types)
         # The DISCLOSURE is re-delivered on the new leg — a new leg may be a
-        # different person — and it is deliberately NOT a transcript turn: it
-        # is gate copy, and no boundary carries it.
-        self.assertEqual(session.spoken[0], phone.PHONE_DISCLOSURE_TEXT)
+        # different person — through the verified model opening (which MUST carry
+        # the recording sentence). It is deliberately NOT a transcript turn: the
+        # gate opening is gate copy, and no boundary carries it.
+        self.assertIn(
+            phone.PHONE_DISCLOSURE_RECORDING_SENTENCE, session.instructions[0]
+        )
+        self.assertNotIn(phone.PHONE_DISCLOSURE_TEXT, session.spoken)
         for boundary in client.boundaries:
             for turn in boundary["turns"]:
                 self.assertNotIn("recorded so the hiring team", turn["text"])
@@ -2092,8 +2456,9 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             close_after=False,
         )
 
-        # The LLM-phrased opening plus one LiveKit-native terminal response.
-        self.assertEqual(len(session.instructions), 2)
+        # The gate opening, the LLM-phrased first question, plus one
+        # LiveKit-native terminal response.
+        self.assertEqual(len(session.instructions), 3)
         self.assertEqual(client.committed_keys, [])
         self.assertIn("assessment.aborted", client.event_types)
         terminal_context = str(session.turn_contexts[-1]).lower()
@@ -2166,11 +2531,14 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(phone._SCHEDULE_CONFIRMED_TEXT, committed)
         self.assertNotIn(phone.schedule_refusal_text("window_closed"), committed)
         self.assertNotIn(phone.PHONE_DISCLOSURE_TEXT, committed)
+        self.assertNotIn(_FakePhoneSession.gate_opening_text, committed)
         self.assertNotIn(phone.PHONE_ASSESSMENT_CLOSING_TEXT, committed)
         # CONTROL — the lines really were spoken, so the assertions above are
-        # about the FILTER and not about a fake that never emitted them.
+        # about the FILTER and not about a fake that never emitted them. The
+        # confirmations go through `say`; the gate opening is a generated
+        # conversation item (verified, so never the fixed disclosure via say).
         self.assertIn(phone._SCHEDULE_CONFIRMED_TEXT, session.spoken)
-        self.assertIn(phone.PHONE_DISCLOSURE_TEXT, session.spoken)
+        self.assertIn(_FakePhoneSession.gate_opening_text, session.emitted_bot_turns)
         # …and a real generated turn DID survive, so the filter is not simply
         # dropping everything the bot says.
         self.assertTrue(any(t.startswith("asked-") for t in committed))
@@ -2196,7 +2564,10 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(result.assessment_allowed)
         self.assertEqual(recording, [])
-        self.assertEqual(client.event_types, ["classify.machine"])
+        # call.answered is posted best-effort before the disclosure so the
+        # server can record from the answer; the machine path then posts only
+        # classify.machine and never records or scores.
+        self.assertEqual(client.event_types, ["call.answered", "classify.machine"])
         self.assertNotIn("assessment.completed", client.event_types)
         # No scoring trigger, no session writeback — persistence is untouched.
         self.assertEqual(persistence_spy.mock_calls, [])
@@ -2231,6 +2602,83 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         boundary = client.boundaries[0]["turns"]
         self.assertIsInstance(boundary[0]["turn_started_at_ms"], int)
         self.assertIsInstance(boundary[-1]["turn_started_at_ms"], int)
+
+    # ── Disconnect diagnostics ───────────────────────────────────────────
+
+    async def test_a_failing_close_reason_is_logged_with_a_clamped_category(self):
+        """The live call died with the close reason computed but never logged.
+
+        A close with a failure reason now emits `phone_session_closed`, and the
+        category is CLAMPED to the bounded `_classify_close_event` vocabulary —
+        never raw reason text.
+        """
+        spy = MagicMock(wraps=agent_mod._log)
+        with patch.object(agent_mod, "_log", spy):
+            ctx = FakeCtx(_PHONE_ROOM, participants=[_participant()])
+            client = FakeEventClient()
+
+            async def classifier(turns, say):
+                return phone.CLASSIFY_MACHINE
+
+            async def recording_seam():
+                return None
+
+            with patch.object(agent_mod, "AgentSession", _FakePhoneSession), \
+                 patch.object(agent_mod, "persistence", MagicMock()), \
+                 patch.object(agent_mod, "_delete_livekit_room", new_callable=AsyncMock), \
+                 patch.object(agent_mod, "_phone_recording_permitted", new=recording_seam), \
+                 patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.05):
+                task = asyncio.ensure_future(
+                    agent_mod._run_phone_session(
+                        ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,
+                        client=client, classifier=classifier,
+                    )
+                )
+                await asyncio.sleep(0.01)
+                session = _FakePhoneSession.instances[-1]
+                session.emit_close(reason="DisconnectReason.SIP_TRUNK_FAILURE")
+                await asyncio.wait_for(task, timeout=5)
+        closed = [
+            c for c in spy.warn.call_args_list
+            if c.kwargs.get("error_type") == "phone_session_closed"
+        ]
+        self.assertTrue(closed)
+        category = closed[0].kwargs.get("error_category")
+        self.assertIn(category, {"shutdown_forced", "provider_error", "worker_crash"})
+        self.assertEqual(category, "provider_error")
+
+    async def test_a_clean_close_is_logged_as_clean_close_not_a_failure(self):
+        spy = MagicMock(wraps=agent_mod._log)
+        with patch.object(agent_mod, "_log", spy):
+            await self._run_session(answers=("Yes, sure.",), close_after=True)
+        closed = [
+            c for c in spy.warn.call_args_list
+            if c.kwargs.get("error_type") == "phone_session_closed"
+        ]
+        # EVERY close is surfaced — the 2026-08-28 live disconnect was a clean
+        # remote close, exactly the shape a failure-only log would hide. A
+        # clean close is named `clean_close`, never one of the failure codes.
+        self.assertTrue(closed)
+        category = closed[0].kwargs.get("error_category")
+        self.assertEqual(category, "clean_close")
+
+    async def test_user_away_and_active_transitions_are_logged(self):
+        spy = MagicMock(wraps=agent_mod._log)
+        with patch.object(agent_mod, "_log", spy):
+            _, _, _, _, session, _ = await self._run_session(answers=("Yes, sure.",))
+            handler = session.handlers.get("user_state_changed")
+            self.assertIsNotNone(handler)
+            # Fire transitions while the spy is still installed — the handler
+            # resolves `_log` as a module global at call time.
+            handler(types.SimpleNamespace(old_state="active", new_state="away"))
+            handler(types.SimpleNamespace(old_state="away", new_state="active"))
+        states = [
+            c.kwargs.get("error_category")
+            for c in spy.info.call_args_list
+            if c.kwargs.get("error_type") == "phone_user_state"
+        ]
+        self.assertIn("user_away", states)
+        self.assertIn("user_active", states)
 
 
 class TestNativePhoneArchitecture(unittest.TestCase):
@@ -2457,6 +2905,20 @@ class TestNumberNeverCarried(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(text=text):
                 self.assertIsNone(digits.search(text))
+
+
+class TestDisclosureSentencePin(unittest.TestCase):
+    """The verbatim recording sentence and the fixed disclosure cannot drift.
+
+    `PHONE_DISCLOSURE_TEXT` deliberately repeats the sentence as a plain
+    literal (the API's cross-language extractor cannot see f-string lines),
+    so containment is pinned here instead of by interpolation.
+    """
+
+    def test_disclosure_contains_the_recording_sentence_verbatim(self):
+        self.assertIn(
+            phone.PHONE_DISCLOSURE_RECORDING_SENTENCE, phone.PHONE_DISCLOSURE_TEXT,
+        )
 
 
 class TestToolResolvedLatch(unittest.IsolatedAsyncioTestCase):

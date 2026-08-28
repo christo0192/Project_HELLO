@@ -1305,6 +1305,58 @@ paths:
               schema:
                 $ref: '#/components/schemas/PhoneWorkerError'
 
+  /api/internal/phone/assessment/gate-turns:
+    post:
+      tags: [phone]
+      operationId: commitPhoneWorkerGateTurns
+      summary: Persist the pre-consent (gate) transcript
+      description: Internal, service-authenticated. 0067. Appends 1..6 ordered PRE-CONSENT turns — the greeting and consent exchange that happens before disclosure.delivered — flagged is_gate=true and DISTINCT from the scored assessment turns a question boundary commits. The recruiter transcript includes these turns; the scorer excludes them. Idempotent at the gate; a session that already carries any gate row answers already_recorded (a success) and writes nothing. The turn text is never echoed back in the response. Disabled by default.
+      security:
+        - workerBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PhoneGateTurnsRequest'
+      responses:
+        '200':
+          description: ok=true for status ok or already_recorded — the gate transcript is durable either way.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneGateTurnsResponse'
+        '400':
+          description: Request body failed validation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneGateTurnsResponse'
+        '401':
+          description: Worker bearer credential required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '403':
+          description: Worker bearer credential invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '409':
+          description: A DB refusal — invalid_turns, unknown_session, session_not_active, or unknown_status. Distinct from a transport fault so the worker does not retry blindly.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneGateTurnsResponse'
+        '503':
+          description: Phone screening disabled, the worker credential is not configured, or an RPC transport fault (phone_gate_turns_error).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+
   /api/internal/phone/assessment/complete:
     post:
       tags: [phone]
@@ -5577,6 +5629,9 @@ components:
           type: number
           nullable: true
           description: Seconds from the authoritative recording start to this turn start. NULL when either anchor is missing (legacy rows, simulation sessions, non-egress recordings).
+        is_gate:
+          type: boolean
+          description: 0067 — true for a pre-consent (gate) turn (the greeting/consent exchange). Shown in the recruiter transcript but excluded from scoring. Absent/legacy rows are false.
       additionalProperties: false
 
     AssessmentRecord:
@@ -6349,6 +6404,51 @@ components:
           type: string
           nullable: true
           description: On key_not_current, the key the cursor actually owes.
+      additionalProperties: false
+
+    PhoneGateTurnsRequest:
+      type: object
+      required: [session_id, source_event_id, turns]
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        source_event_id:
+          type: string
+          description: The caller's idempotency key (^[A-Za-z0-9_.:-]{1,200}$).
+        turns:
+          type: array
+          minItems: 1
+          maxItems: 6
+          description: The ordered pre-consent (gate) exchange — the greeting and consent turns.
+          items:
+            type: object
+            required: [speaker, text]
+            properties:
+              speaker:
+                type: string
+                enum: [bot, candidate]
+              text:
+                type: string
+                minLength: 1
+                maxLength: 8000
+              turn_started_at_ms:
+                type: integer
+                nullable: true
+                description: Optional epoch-ms speech-start anchor; coerced to null when absent or out of range.
+            additionalProperties: false
+      additionalProperties: false
+
+    PhoneGateTurnsResponse:
+      type: object
+      required: [ok, status]
+      properties:
+        ok:
+          type: boolean
+          description: True for ok and already_recorded; false for every refusal.
+        status:
+          type: string
+          description: ok, already_recorded, invalid_turns, unknown_session, session_not_active, unknown_status, invalid_request, or phone_gate_turns_error. The turn text is never included.
       additionalProperties: false
 
     PhoneAssessmentCompleteRequest:
