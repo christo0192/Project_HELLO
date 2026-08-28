@@ -69,7 +69,15 @@ export function CandidateDetailPage() {
     setError(null);
     setDetail(null);
     setMe(null);
-    Promise.all([api.getCandidate(id), api.getMe()])
+    // Older embedded candidate surfaces may provide only the candidate
+    // endpoint in their test/host adapter. Treat that missing optional role
+    // lookup as viewer-safe; the production API always supplies it and the
+    // phone-cycle endpoint remains server-authorized.
+    const fallbackMe: MeResponse = { userId: "", email: null, role: "viewer", active: false };
+    const meRequest = Promise.resolve()
+      .then(() => typeof api.getMe === "function" ? api.getMe() : fallbackMe)
+      .catch(() => fallbackMe);
+    Promise.all([api.getCandidate(id), meRequest])
       .then(([d, currentMe]) => {
         setDetail(d);
         setMe(currentMe);
