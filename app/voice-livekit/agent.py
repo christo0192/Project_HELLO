@@ -1508,6 +1508,8 @@ async def _run_phone_session(
     latest_assistant: list[str | None] = [None]
     latest_assistant_anchor: list[int | None] = [None]
     latest_candidate_anchor: list[int | None] = [None]
+    latest_candidate_stopped_anchor: list[int | None] = [None]
+    participant_present_anchor: list[int | None] = [None]
 
     session = _build_phone_provider_session()
     reply_started = asyncio.Event()
@@ -1581,6 +1583,11 @@ async def _run_phone_session(
         # items are retained only as evidence for the server-keyed boundary.
         if role == "user":
             candidate_activity.set()
+            metrics = getattr(item, "metrics", None)
+            if isinstance(metrics, Mapping):
+                stopped = persistence.normalize_turn_anchor_ms(metrics.get("stopped_speaking_at"))
+                if stopped is not None:
+                    latest_candidate_stopped_anchor[0] = stopped
             return
         if phone.is_gate_copy(text):
             # FIXED COPY IS NOT A SCREENING TURN. The disclosure, the re-ask,
@@ -1591,6 +1598,12 @@ async def _run_phone_session(
             # captured inside whichever question's boundary happened to be open
             # and committed as part of the candidate's answer.
             return
+        metrics = getattr(item, "metrics", None)
+        if isinstance(metrics, Mapping):
+            started = persistence.normalize_turn_anchor_ms(metrics.get("started_speaking_at"))
+            if started is not None and latest_candidate_stopped_anchor[0] is not None and started >= latest_candidate_stopped_anchor[0]:
+                _safe_emit(histogram_metric, "voice_phone_candidate_to_first_audio_sec", (started - latest_candidate_stopped_anchor[0]) / 1000.0, {"channel": "phone"})
+                latest_candidate_stopped_anchor[0] = None
         latest_assistant[0] = text
         # Keep the state-event anchor when the later conversation item carries
         # no metrics/created_at value. Never replace a real anchor with null.
@@ -1604,10 +1617,15 @@ async def _run_phone_session(
         close_event.set()
 
     async def say(text: str) -> None:
+        started_ms = int(round(time.time() * 1000))
         speech = session.say(text, allow_interruptions=False)
         wait_for_playout = getattr(speech, "wait_for_playout", None)
         if callable(wait_for_playout):
             await wait_for_playout()
+        if text == phone.PHONE_DISCLOSURE_TEXT and participant_present_anchor[0] is not None:
+            delta_ms = started_ms - participant_present_anchor[0]
+            if delta_ms >= 0:
+                _safe_emit(histogram_metric, "voice_phone_participant_to_disclosure_sec", delta_ms / 1000.0, {"channel": "phone"})
 
     def on_candidate_turn(text: str, message: Any = None, turn_ctx: Any = None) -> None:
         candidate_activity.set()
@@ -1643,6 +1661,7 @@ async def _run_phone_session(
         )
         if participant is None:
             return None
+        participant_present_anchor[0] = int(round(time.time() * 1000))
         await session.start(agent=agent, room=ctx.room, record=dict(_PHONE_NO_RECORDING))
         return participant
 
