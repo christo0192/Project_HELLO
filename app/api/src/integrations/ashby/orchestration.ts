@@ -87,6 +87,8 @@ export interface OperationClaimRow {
   attempts: number;
   maxAttempts: number;
   marker: string | null;
+  /** Exact assessment session for cycle-specific scorecard operations. */
+  sourceSessionId?: string | null;
 }
 
 /** Durable persistence for the workflow (0029/0031 tables + RPCs). */
@@ -168,7 +170,10 @@ export interface RuntimeWorkflowStores extends WorkflowStores {
   /** Read the link row needed to materialize an invite (opaque ids only). */
   readLink(applicationLinkId: string): Promise<WorkflowLinkRow | null>;
   /** Read only bounded assessment fields needed for the approved scorecard sink. */
-  readScorecardSource?(applicationLinkId: string): Promise<import('./scorecard.js').ScorecardSource | null>;
+  readScorecardSource?(
+    applicationLinkId: string,
+    sourceSessionId?: string | null,
+  ): Promise<import('./scorecard.js').ScorecardSource | null>;
   /**
    * DEFER a running operation back to pending because a prerequisite stopped
    * holding after the claim. Refunds the attempt the claim charged and

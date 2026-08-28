@@ -214,6 +214,7 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
         attempts: typeof row?.attempts === 'number' ? row.attempts : 0,
         maxAttempts: typeof row?.max_attempts === 'number' ? row.max_attempts : 5,
         marker: typeof row?.marker === 'string' ? row.marker : null,
+        sourceSessionId: typeof row?.source_session_id === 'string' ? row.source_session_id : null,
       };
     },
     async readIngestion(applicationLinkId): Promise<{ state: string; attempts: number } | null> {
@@ -228,18 +229,19 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
       const row = data as { state: string; attempts: number };
       return { state: String(row.state), attempts: Number(row.attempts) || 0 };
     },
-    async readScorecardSource(applicationLinkId): Promise<ScorecardSource | null> {
+    async readScorecardSource(applicationLinkId, sourceSessionId = null): Promise<ScorecardSource | null> {
       const { data: link, error: linkError } = await client
         .from('ashby_application_links')
         .select('external_application_id, session_id')
         .eq('provider', 'ashby')
         .eq('id', applicationLinkId)
         .maybeSingle();
-      if (linkError || !link || typeof link.session_id !== 'string') return null;
+      const sessionId = sourceSessionId ?? (typeof link?.session_id === 'string' ? link.session_id : null);
+      if (linkError || !link || !sessionId) return null;
       const { data: assessment, error: assessmentError } = await client
         .from('assessments')
         .select('english, tone, communication, motivation, role_fit, overall_score, recommendation, summary, provenance, created_at')
-        .eq('session_id', link.session_id)
+        .eq('session_id', sessionId)
         .order('created_at', { ascending: false })
         .limit(1)
         .maybeSingle();
@@ -326,7 +328,43 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
       return { status: statusOf(data) };
     },
     async enqueueScorecardWrite(applicationLinkId, sessionId): Promise<{ status: string }> {
-      // LINK-SCOPED idempotency, ahead of everything else. An Ashby scorecard
+      // Cycle writeback is opt-in until the tenant contract is verified to
+      // accept multiple feedback submissions on one application. The default
+      // remains the legacy, one-scorecard-per-link behavior for cycle 1.
+      let cycleNumber = 1;
+      let cycleExisting: { id: string } | null = null;
+      if (process.env.ASHBY_RESCREEN_SCORECARD_ENABLED === 'true') {
+        const { data: phoneEngagement, error: phoneError } = await client
+          .from('phone_engagements')
+          .select('application_link_id,cycle_number')
+          .eq('session_id', sessionId)
+          .maybeSingle();
+        if (phoneError) throw new Error('ashby_scorecard_enqueue_error');
+        if (
+          phoneEngagement &&
+          phoneEngagement.application_link_id === applicationLinkId &&
+          typeof phoneEngagement.cycle_number === 'number'
+        ) {
+          cycleNumber = phoneEngagement.cycle_number;
+          if (cycleNumber > 1) {
+            const { data: existingCycle, error: existingCycleError } = await client
+              .from('ashby_operations')
+              .select('id')
+              .eq('provider', 'ashby')
+              .eq('application_link_id', applicationLinkId)
+              .eq('operation_type', 'scorecard_write')
+              .eq('source_session_id', sessionId)
+              .limit(1)
+              .maybeSingle();
+            if (existingCycleError) throw new Error('ashby_scorecard_enqueue_error');
+            cycleExisting = existingCycle ? { id: String((existingCycle as { id: unknown }).id) } : null;
+            if (cycleExisting) return { status: 'duplicate' };
+          }
+        }
+      }
+
+      // LINK-SCOPED idempotency for the initial cycle, ahead of everything
+      // else. An Ashby scorecard
       // cannot be retracted, so at most ONE scorecard_write operation may ever
       // exist per application link — regardless of which historical marker
       // version (or review-path shape) produced the first one. This covers
@@ -337,13 +375,15 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
       // "no scorecard yet" and produce a second provider write. The read lives
       // in `findScorecardWriteOperation` so the saga's `enqueueScorecard` uses
       // the SAME guard through the store seam instead of a second copy of it.
-      let existing: { id: string } | null;
-      try {
-        existing = await findScorecardWriteOperation(applicationLinkId);
-      } catch {
-        throw new Error('ashby_scorecard_enqueue_error');
+      let existing: { id: string } | null = null;
+      if (cycleNumber === 1) {
+        try {
+          existing = await findScorecardWriteOperation(applicationLinkId);
+        } catch {
+          throw new Error('ashby_scorecard_enqueue_error');
+        }
+        if (existing) return { status: 'duplicate' };
       }
-      if (existing) return { status: 'duplicate' };
 
       const { data: link, error: linkError } = await client
         .from('ashby_application_links')
@@ -399,18 +439,25 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
       };
       const built = buildScorecard(source, { min: 1, max: 4 });
       if (!built.ok) return { status: `scorecard_${built.reason}` };
-      const result = await client.rpc('enqueue_ashby_operation', {
-        p_application_link_id: applicationLinkId,
-        p_operation_type: 'scorecard_write',
-        // Link-derived and marker-INDEPENDENT: the (provider, operation_key)
-        // unique constraint is then itself the durable one-scorecard-per-link
-        // guard, so two racing enqueues collapse to `duplicate` in the database
-        // even if their content markers differ.
-        p_operation_key: `ashby:scorecard:link:${applicationLinkId}`,
-        p_depends_on: null,
-        p_marker: built.marker,
-        p_actor_id: actorId,
-      });
+      const result = cycleNumber > 1
+        ? await client.rpc('enqueue_ashby_cycle_scorecard', {
+          p_application_link_id: applicationLinkId,
+          p_session_id: sessionId,
+          p_operation_key: `ashby:scorecard:cycle:${applicationLinkId}:${sessionId}`,
+          p_marker: built.marker,
+          p_actor_id: actorId,
+          p_now: new Date().toISOString(),
+        })
+        : await client.rpc('enqueue_ashby_operation', {
+          p_application_link_id: applicationLinkId,
+          p_operation_type: 'scorecard_write',
+          // Link-derived and marker-INDEPENDENT for the initial cycle: the
+          // existing unique key remains the durable one-scorecard guard.
+          p_operation_key: `ashby:scorecard:link:${applicationLinkId}`,
+          p_depends_on: null,
+          p_marker: built.marker,
+          p_actor_id: actorId,
+        });
       if (result.error) throw new Error('ashby_scorecard_enqueue_error');
       return { status: statusOf(result.data) };
     },
@@ -425,15 +472,38 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
 export function createAshbyLinkLookup(client: SupabaseClient): AshbyLinkLookup {
   return {
     async findLinkBySessionId(sessionId) {
-      const { data, error } = await client
+      // Browser/legacy sessions may still be linked directly on the
+      // application row. Phone cycles are linked through their own immutable
+      // engagement row because one application may now have several sessions.
+      const { data: direct, error: directError } = await client
         .from('ashby_application_links')
         .select('id, terminal_state')
         .eq('provider', 'ashby')
         .eq('session_id', sessionId)
         .maybeSingle();
-      if (error) throw new Error('ashby_link_by_session_error');
-      if (!data) return null;
-      const row = data as { id: string; terminal_state: string | null };
+      if (directError) throw new Error('ashby_link_by_session_error');
+      if (direct) {
+        const row = direct as { id: string; terminal_state: string | null };
+        return { id: String(row.id), terminalState: row.terminal_state ?? null };
+      }
+
+      const { data: phone, error: phoneError } = await client
+        .from('phone_engagements')
+        .select('application_link_id')
+        .eq('session_id', sessionId)
+        .limit(1)
+        .maybeSingle();
+      if (phoneError) throw new Error('ashby_link_by_session_error');
+      if (!phone || typeof phone.application_link_id !== 'string') return null;
+      const { data: link, error: linkError } = await client
+        .from('ashby_application_links')
+        .select('id, terminal_state')
+        .eq('provider', 'ashby')
+        .eq('id', phone.application_link_id)
+        .maybeSingle();
+      if (linkError) throw new Error('ashby_link_by_session_error');
+      if (!link) return null;
+      const row = link as { id: string; terminal_state: string | null };
       return { id: String(row.id), terminalState: row.terminal_state ?? null };
     },
   };
