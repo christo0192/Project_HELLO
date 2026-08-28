@@ -23,11 +23,12 @@ import {
   allowEchartsInitWarnings,
 } from '../components/design/__tests__/helpers';
 
-const { getMe, listCandidates, listNotificationIntents, getCandidatesSummary } = vi.hoisted(() => ({
+const { getMe, listCandidates, listNotificationIntents, getCandidatesSummary, getPhoneCalendar } = vi.hoisted(() => ({
   getMe: vi.fn(),
   listCandidates: vi.fn(),
   listNotificationIntents: vi.fn(),
   getCandidatesSummary: vi.fn(),
+  getPhoneCalendar: vi.fn(),
 }));
 
 vi.mock('../api', () => ({
@@ -36,6 +37,7 @@ vi.mock('../api', () => ({
     listCandidates: (...args: any[]) => listCandidates(...args),
     listNotificationIntents: (...args: any[]) => listNotificationIntents(...args),
     getCandidatesSummary: (...args: any[]) => getCandidatesSummary(...args),
+    getPhoneCalendar: (...args: any[]) => getPhoneCalendar(...args),
   },
   ApiError: class extends Error {
     status: number;
@@ -67,6 +69,16 @@ const SUMMARY = {
   assessed_count: 3,
   average_score: 64,
   recommendation_distribution: { advance: 2, hold: 0, reject: 1 },
+};
+
+const PHONE_CALENDAR = {
+  ok: true,
+  enabled: true,
+  range: { from: '2026-06-04T18:30:00.000Z', to: '2026-06-11T18:30:00.000Z' },
+  window: { time_zone: 'Asia/Kolkata', open_ist: '09:00:00', close_ist: '21:00:00' },
+  count: 0,
+  truncated: false,
+  appointments: [],
 };
 
 function CandidatesProbe() {
@@ -107,9 +119,22 @@ describe('DashboardPage', () => {
     listCandidates.mockResolvedValue(CANDIDATES);
     listNotificationIntents.mockResolvedValue({ intents: [] });
     getCandidatesSummary.mockResolvedValue(SUMMARY);
+    getPhoneCalendar.mockResolvedValue(PHONE_CALENDAR);
   });
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it('loads the phone schedule only for recruiter roles', async () => {
+    renderDashboard();
+    await screen.findByRole('heading', { name: 'Phone schedule' });
+    expect(getPhoneCalendar).toHaveBeenCalledTimes(1);
+
+    getPhoneCalendar.mockClear();
+    getMe.mockResolvedValue(VIEWER_ME);
+    renderDashboard();
+    await screen.findByRole('link', { name: /candidates in pipeline/i });
+    expect(getPhoneCalendar).not.toHaveBeenCalled();
   });
 
   it('shows a loading state until the core data loads', () => {
