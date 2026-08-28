@@ -149,10 +149,12 @@ describe('1. every phone write goes through an RPC', () => {
     // TWENTY-TWO since 0051 added the session-level egress stamp that makes a
     // phone MP3 visible to the session-keyed finalizer and download route.
     // 0045 added four before it: the epoch-fenced heartbeat, two bounded
-    // sweeps, and the sweep claim. The count is pinned rather than merely
-    // non-zero so a seam that quietly stops routing one call through an RPC
-    // fails here.
-    expect(new Set(rpcCalls).size).toBe(27);
+    // sweeps, and the sweep claim. 0067 added a 28th — `commit_phone_gate_turns`,
+    // the pre-consent transcript writer — which is a leaf outside the
+    // drift-validated `PHONE_RPC_NAMES` contract but still a real RPC this seam
+    // routes through. The count is pinned rather than merely non-zero so a seam
+    // that quietly stops routing one call through an RPC fails here.
+    expect(new Set(rpcCalls).size).toBe(28);
     // The write seam reaches NO table, only RPCs.
     expect(writeBody, 'stores.ts uses a table accessor').not.toMatch(/\bclient\s*\.\s*from\s*\(/);
     // A type-only import of the client type is fine; a VALUE import is not.

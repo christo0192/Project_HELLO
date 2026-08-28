@@ -576,3 +576,46 @@ describe('an ACTIVE egress is stopped, and the purge refuses that pass', () => {
     expect(h.remove).toHaveBeenCalled();
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// 0067 — the machine-pickup path: recordings exist, but the egress was never
+// finalized. Since 0067 the egress starts at ANSWER, so a `classify.machine`
+// exit can leave attached rows whose `egressStatus` is null (attach happened,
+// no finalize row was ever written) rather than `complete`. Only an `active`
+// egress blocks the purge; a null (unfinalized-but-not-running) status is
+// deleted and cleared like any other, so the machine exit destroys its
+// pre-consent audio before the event posts.
+// ═══════════════════════════════════════════════════════════════════════
+
+function unfinalizedArtifact(): PhoneRecordingArtifact {
+  // Attach wrote the keys, but no finalize ever ran, so egressStatus is null
+  // and egressId may be null too — the row is NOT `active`.
+  return { ...authoritative(), egressId: null, egressStatus: null };
+}
+
+describe('0067 — an unfinalized (null egressStatus) recording is purged, not blocked', () => {
+  it('deletes the keys and clears the rows for a machine-pickup attempt', async () => {
+    const h = harness({ list: listing([unfinalizedArtifact()]) });
+    const res = await run(h);
+
+    // A null status is not `active`, so the purge proceeds — no
+    // egress_still_running refusal despite there being no `complete` finalize.
+    expect(res.status).toBe('purged');
+    expect(res.safeToAcknowledge).toBe(true);
+    expect(h.remove).toHaveBeenCalledWith(AUTH_OBJECT);
+    expect(h.remove).toHaveBeenCalledWith(AUTH_MANIFEST);
+    expect(h.clear).toHaveBeenCalledTimes(1);
+  });
+
+  it('needs NO egress seam to purge an unfinalized recording (nothing to stop)', async () => {
+    // Contrast with the ACTIVE case, which refuses without an egress seam.
+    // There is nothing running here, so the absence of a stopper is irrelevant.
+    const h = harness({ list: listing([unfinalizedArtifact()]) });
+    const res = await purgePhoneEngagementRecordings(
+      { engagementId: ENGAGEMENT, now: NOW },
+      h.deps,
+    );
+    expect(res.status).toBe('purged');
+    expect(res.safeToAcknowledge).toBe(true);
+  });
+});

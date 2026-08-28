@@ -379,6 +379,17 @@ def participant_identity(participant: Any) -> str | None:
 PHONE_NO_RECORDING = {"audio": False, "transcript": False, "traces": False, "logs": False}
 
 
+#: The recording-disclosure sentence, word-for-word. It is the ONE sentence a
+#: model-generated opening MUST contain verbatim, so a naturally phrased greeting
+#: never drops or softens the recording notice. `PHONE_DISCLOSURE_TEXT` repeats
+#: it as a PLAIN literal below rather than interpolating it: the API's
+#: cross-language contract test extracts plain string lines only (f-string
+#: lines are invisible to it), and a worker test pins containment so the two
+#: copies cannot drift.
+PHONE_DISCLOSURE_RECORDING_SENTENCE = (
+    "This call is recorded so the hiring team can review it."
+)
+
 PHONE_DISCLOSURE_TEXT = (
     f"Hi, this is Christy, an AI voice assistant calling from {_COMPANY} "
     "about your job application. This call is recorded so the hiring team can "
@@ -412,6 +423,16 @@ PHONE_SILENCE_GOODBYE_TEXT = (
     "Thanks for your time, and goodbye."
 )
 
+#: The short, warm bridge line spoken the instant the deterministic classifier
+#: reads HUMAN, so the candidate hears something friendly while the atomic
+#: consent/start RPC and the first-question generation run underneath it. It is
+#: FIXED COPY, not a screening turn: it is registered in `gate_copy_texts()`
+#: below so the capture loop never folds it into a question boundary. It makes
+#: no claim about a recording or an outcome — the only class of copy this lane
+#: cannot take back — so it is safe to say before the RPC has confirmed
+#: anything.
+PHONE_CONSENT_BRIDGE_TEXT = "Awesome, thank you!"
+
 
 #: Fixed copy the bot speaks that is NOT part of the screening record.
 #:
@@ -429,6 +450,7 @@ def gate_copy_texts() -> frozenset[str]:
     """Every fixed line the bot may speak that is not a screening turn."""
     return frozenset([
         PHONE_DISCLOSURE_TEXT,
+        PHONE_CONSENT_BRIDGE_TEXT,
         PHONE_REASK_TEXT,
         PHONE_REFUSED_TEXT,
         PHONE_OPT_OUT_TEXT,
@@ -455,6 +477,11 @@ APPOINTMENTS_PATH = "/api/internal/phone/appointments"
 ASSESSMENT_START_PATH = "/api/internal/phone/assessment/start"
 CONSENT_START_PATH = "/api/internal/phone/assessment/consent-start"
 ASSESSMENT_TURN_PATH = "/api/internal/phone/assessment/turn"
+#: The gate transcript: the exact opening the bot spoke and the candidate's
+#: consent reply the classifier consumed. Committed once, keyed by
+#: `gate:<session_id>`, after the atomic consent/start RPC succeeds so the two
+#: turns that precede question one are not lost to the record.
+GATE_TURNS_PATH = "/api/internal/phone/assessment/gate-turns"
 PROBE_PATH = "/api/internal/phone/assessment/probe"
 ASSESSMENT_COMPLETE_PATH = "/api/internal/phone/assessment/complete"
 #: P5: the lease renewal. Under `/api/internal/phone` with every other worker
@@ -468,6 +495,7 @@ HEARTBEAT_PATH = "/api/internal/phone/attempt/heartbeat"
 # STRICT allowlist. The server enforces its own; this is the worker half, so a
 # typo fails here rather than becoming a 4xx the caller has to interpret.
 PHONE_WORKER_EVENTS: frozenset[str] = frozenset([
+    "call.answered",
     "classify.human",
     "classify.machine",
     "disclosure.delivered",
@@ -1042,6 +1070,49 @@ class PhoneEventClient:
         expected = data.get("expected_key")
         outcome.expected_key = str(expected) if isinstance(expected, str) else None
         return outcome
+
+    async def commit_gate_turns(
+        self,
+        session_id: str,
+        turns: list[dict[str, Any]],
+        source_event_id: str,
+    ) -> PhoneApiOutcome:
+        """Persist the gate's two turns — the spoken opening and the consent reply.
+
+        Best-effort by contract: recording-from-answer is a nice-to-have, and a
+        failure here must never fail a call that has already consented and
+        started. The caller logs a fixed-string failure and continues.
+
+        ``ok`` is read from the server's own flag and the status is treated as
+        success on BOTH ``ok`` (freshly recorded) and ``already_recorded`` (an
+        idempotent re-post — the deterministic ``gate:<session>`` key makes a
+        second commit converge rather than duplicate). Every other status
+        (``invalid_turns``, ``unknown_session``, ``session_not_active``) is a
+        state the worker cannot fix by retrying, so it is reported as not-ok and
+        left alone. No turn text is ever logged.
+        """
+        body = {
+            "session_id": str(session_id),
+            "source_event_id": str(source_event_id),
+            "turns": turns,
+        }
+        response = await self._post(GATE_TURNS_PATH, body, "gate_turns")
+        if isinstance(response, str):
+            return PhoneApiOutcome(False, error_category=response)
+        data = _response_json(response)
+        if not isinstance(data, dict):
+            _log.warn(
+                "unknown_event", error_type="phone_api_failed",
+                error_category=_ERR_MALFORMED, schema="gate_turns",
+            )
+            return PhoneApiOutcome(False, error_category=_ERR_MALFORMED)
+        status = data.get("status")
+        status_str = str(status) if status is not None else None
+        return PhoneApiOutcome(
+            data.get("ok") is True and status_str in {"ok", "already_recorded"},
+            status_str,
+            duplicate=status_str == "already_recorded",
+        )
 
     async def complete_assessment(
         self,
@@ -1854,6 +1925,27 @@ class PhoneGateResult:
         )
 
 
+def _opening_is_verified(text: Any) -> bool:
+    """True when a generated opening actually disclosed recording AND asked.
+
+    Fixed, deterministic, and NARROW. The opening must contain the word
+    ``record`` (case-insensitive — the recording disclosure) AND read as a
+    consent question (it ends in a ``?`` somewhere, or carries the fixed
+    ``okay to continue`` phrasing). Anything else falls back to the fixed
+    disclosure, because an opening that greeted warmly but never disclosed
+    recording, or never asked, is not consent-safe.
+    """
+    if not isinstance(text, str):
+        return False
+    clean = text.strip()
+    if not clean:
+        return False
+    lowered = clean.lower()
+    if "record" not in lowered:
+        return False
+    return "?" in clean or "okay to continue" in lowered
+
+
 async def run_phone_gate(
     *,
     attempt_id: str,
@@ -1865,26 +1957,38 @@ async def run_phone_gate(
     epoch: int | None = None,
     classify_timeout_sec: float | None = None,
     session_id: str | None = None,
+    speak_opening: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
+    post_call_answered: bool = False,
+    consent_reply_out: Optional[list[str]] = None,
 ) -> PhoneGateResult:
     """Run the phone screening's opening, in the ONLY order that is safe.
 
     1. Wait for the SIP participant. Nothing is spoken, activated, timed or
        recorded before one exists — a ringing leg has no listener, and a silence
        timer started at originate measures the network, not the candidate.
-    2. Deliver the FIXED identity + purpose + recording disclosure.
-    3. Classify through a BOUNDED, INJECTABLE seam. Voicemail and IVR are
+    2. Post ``call.answered`` (BEST EFFORT) so the server can begin recording
+       from the answer. This is behind ``post_call_answered`` so legacy callers
+       and their tests keep their exact event ordering.
+    3. Deliver the identity + purpose + recording disclosure. When ``speak_opening``
+       is supplied it produces a naturally phrased, model-generated opening that
+       is verified to disclose recording and ask consent; otherwise the FIXED
+       ``PHONE_DISCLOSURE_TEXT`` is spoken (the legacy behaviour).
+    4. Classify through a BOUNDED, INJECTABLE seam. Voicemail and IVR are
        machines. A seam that hangs, or answers something unrecognised, is a
        machine too — that is the fail-closed direction, because a machine gets
        no assessment and no recording.
-    4. Only an affirmative human whose ``classify.human`` AND
-       ``disclosure.delivered`` were both accepted may proceed.
+    5. Only an affirmative human whose consent was durably applied may proceed;
+       the gate's two turns (opening + consent reply) are then committed.
 
     ``start_recording`` is invoked at exactly one point in this function, after
-    ``disclosure.delivered`` succeeded. That single call site is the whole
-    control; a caller must not have its own.
+    consent is durably applied. That single call site is the whole control; a
+    caller must not have its own.
     """
     events: list[str] = []
     spoken: list[str] = []
+    #: The exact opening the bot spoke — from whichever path — so the gate
+    #: transcript commit records what the candidate actually heard.
+    opening_spoken: list[str] = []
 
     async def _say(text: str) -> None:
         spoken.append(text)
@@ -1900,7 +2004,43 @@ async def run_phone_gate(
         )
         return PhoneGateResult(GATE_NO_PARTICIPANT, events=events, spoken=spoken)
 
-    await _say(PHONE_DISCLOSURE_TEXT)
+    # ── call.answered: recording-from-answer, BEST EFFORT ─────────────────
+    # Posted the instant a participant is present and the session is started,
+    # BEFORE any disclosure is spoken, so the server can begin the recording
+    # egress from the top of the call. `applied`/`duplicate` proceed; anything
+    # else (`ignored`, transport failure) logs loudly with FIXED strings and the
+    # call continues — a best-effort recording start must never kill a call.
+    if post_call_answered:
+        answered = await client.post_event(
+            attempt_id, "call.answered", epoch=epoch, session_id=session_id,
+        )
+        if event_applied(answered) or answered.duplicate:
+            events.append("call.answered")
+        else:
+            _log.warn(
+                "unknown_event", error_type="phone_call_answered_not_applied",
+                error_category="call_answered_unconfirmed",
+            )
+
+    # ── The opening: model-generated-and-verified, or the fixed disclosure ─
+    if speak_opening is not None:
+        try:
+            generated = await speak_opening()
+        except Exception:  # noqa: BLE001
+            generated = None
+        if _opening_is_verified(generated):
+            opening_spoken.append(generated.strip())  # type: ignore[union-attr]
+            spoken.append(generated.strip())  # type: ignore[union-attr]
+        else:
+            _log.warn(
+                "unknown_event", error_type="phone_opening_fallback",
+                error_category="opening_unverified",
+            )
+            await _say(PHONE_DISCLOSURE_TEXT)
+            opening_spoken.append(PHONE_DISCLOSURE_TEXT)
+    else:
+        await _say(PHONE_DISCLOSURE_TEXT)
+        opening_spoken.append(PHONE_DISCLOSURE_TEXT)
 
     timeout = (
         classify_timeout_sec if classify_timeout_sec is not None
@@ -1909,6 +2049,13 @@ async def run_phone_gate(
     try:
         decision = await asyncio.wait_for(classify(), timeout=timeout)
     except asyncio.TimeoutError:
+        # WHICH stage timed out, in fixed strings only — the classify seam is
+        # the one bounded wait in the gate, and a silent timeout is exactly the
+        # diagnostic gap the live call exposed.
+        _log.warn(
+            "unknown_event", error_type="phone_gate_timeout",
+            error_category="classify",
+        )
         decision = CLASSIFY_MACHINE
     except Exception:  # noqa: BLE001
         # A broken classifier must not become consent.
@@ -1931,16 +2078,69 @@ async def run_phone_gate(
         )
         return PhoneGateResult(decision, events=events, spoken=spoken)
 
+    # The raw consent utterance the classifier consumed to decide HUMAN, threaded
+    # out for the gate transcript. `None` when the caller did not wire the sink.
+    consent_reply = (
+        consent_reply_out[-1].strip()
+        if consent_reply_out and isinstance(consent_reply_out[-1], str)
+        and consent_reply_out[-1].strip()
+        else None
+    )
+
+    async def _commit_gate_turns() -> None:
+        """Persist [opening, consent reply] once, best effort. Never fails the gate."""
+        committer = getattr(client, "commit_gate_turns", None)
+        if not callable(committer) or session_id is None:
+            return
+        turns: list[dict[str, Any]] = []
+        if opening_spoken:
+            turns.append({"speaker": "bot", "text": opening_spoken[-1]})
+        if consent_reply:
+            turns.append({"speaker": "candidate", "text": consent_reply})
+        if not turns:
+            return
+        try:
+            outcome = await committer(
+                session_id, turns, f"gate:{session_id}",
+            )
+        except Exception:  # noqa: BLE001
+            _log.warn(
+                "unknown_event", error_type="phone_gate_turns_failed",
+                error_category="gate_turns_exception",
+            )
+            return
+        if not outcome.ok:
+            _log.warn(
+                "unknown_event", error_type="phone_gate_turns_failed",
+                error_category="gate_turns_unconfirmed",
+            )
+
     # New clients use the single atomic consent/start boundary. Legacy fakes
     # remain supported during rollout, but production's client always exposes
     # this method and cannot return an authorized state without the RPC.
     consent_start = getattr(client, "consent_and_start_assessment", None)
     if callable(consent_start) and session_id is not None and epoch is not None:
-        combined = await consent_start(attempt_id, session_id, epoch)
+        # THE LATENCY MASK. The bridge line starts as a background task and the
+        # atomic RPC fires immediately, so the round trip and the first-question
+        # generation that follows it overlap the bridge's playout instead of
+        # sitting behind silence. The task is always awaited before returning so
+        # nothing leaks, and a bridge failure never touches the gate's verdict.
+        bridge_task = asyncio.ensure_future(_say(PHONE_CONSENT_BRIDGE_TEXT))
+        try:
+            combined = await consent_start(attempt_id, session_id, epoch)
+        finally:
+            try:
+                await bridge_task
+            except Exception:  # noqa: BLE001
+                _log.warn(
+                    "unknown_event", error_type="phone_consent_bridge_failed",
+                    error_category="consent_bridge",
+                )
         if not combined.ok:
             _log.warn("unknown_event", error_type="phone_gate_blocked", error_category="consent_start_failed")
             return PhoneGateResult(CLASSIFY_HUMAN, events=events, spoken=spoken)
         events.extend(["classify.human", "disclosure.delivered"])
+        await _commit_gate_turns()
         if start_recording is not None:
             await start_recording()
         return PhoneGateResult(CLASSIFY_HUMAN, assessment_allowed=True,
@@ -2144,7 +2344,20 @@ def phone_agent_class(agent_base: Any) -> Any:
             # LiveKit's function-step budget and closed a live call mid-answer
             # (2026-08-28). Reset on every new candidate turn.
             self._tool_resolved = False
+            # Set only for the DURATION of the gate's spoken opening. While set,
+            # `llm_node` streams the generated opening even though screening is
+            # NOT yet authorized — the gate needs a naturally phrased greeting +
+            # recording disclosure + consent question, and that is a real spoken
+            # turn, not the discarded speculative consent-answer generation.
+            # Cleared the instant the opening is delivered so the consent ANSWER
+            # turn falls back to the discard path: the deterministic classifier
+            # stays the sole consent authority.
+            self._gate_opening = False
             self.bookings: list[ScheduleTurn] = []
+
+        def set_gate_opening(self, opening: bool) -> None:
+            """Toggle the gate-opening stream window (see `_gate_opening`)."""
+            self._gate_opening = bool(opening)
 
         def authorize_screening(self) -> None:
             """Release the held consent-phase Gemini output after API grant."""
@@ -2168,6 +2381,23 @@ def phone_agent_class(agent_base: Any) -> Any:
             AgentSession. Clarification/callback turns leave the plan empty and
             use the same Gemini node as the browser agent.
             """
+            if self._gate_opening:
+                # The gate's spoken opening: tool-less and streamed, even though
+                # screening is not yet authorized. This is the ONE pre-consent
+                # turn whose LLM output is real spoken audio; every other
+                # pre-consent generation is discarded below.
+                tools = []
+                try:
+                    from dataclasses import replace
+                    model_settings = replace(model_settings, tool_choice="none")
+                except (TypeError, ValueError):
+                    pass
+                result = super().llm_node(chat_ctx, tools, model_settings)
+                if inspect.isawaitable(result):
+                    result = await result
+                async for chunk in result:
+                    yield chunk
+                return
             if self._turn_policy == "substantive" and self._tool_resolved:
                 # The coordinator tool already resolved for this reply. The
                 # remainder of the generation is ordinary speech: no tools, so

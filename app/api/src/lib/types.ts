@@ -37,6 +37,10 @@ export interface TranscriptTurn {
    *  NULL when either anchor is missing (legacy rows, simulation sessions,
    *  non-egress recordings). */
   start_offset_sec?: number | null;
+  /** 0067: true for a PRE-CONSENT (gate) turn — the greeting/consent exchange
+   *  the recruiter transcript shows but the scorer excludes. Additive and
+   *  optional; the scoring path never sets it. */
+  is_gate?: boolean;
 }
 
 export interface LanguageProficiencyScore {

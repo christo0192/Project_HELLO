@@ -523,6 +523,40 @@ export interface ConsentAndStartPhoneAssessmentResult {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// 0067 — the PRE-CONSENT (gate) transcript
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * The five sanitized answers `commit_phone_gate_turns` can give, narrowed to a
+ * closed union HERE rather than through the drift-validated
+ * `narrowPhoneRpcStatus`. The gate RPC is deliberately OUTSIDE the phone-domain
+ * RPC contract (`PHONE_RPC_NAMES`): it is a leaf that appends flagged transcript
+ * rows and touches none of 0042's admission machinery, so it does not join the
+ * contract every core RPC is drift-checked against. Its statuses are pinned by
+ * the route test instead.
+ */
+export type CommitPhoneGateTurnsStatus =
+  | 'ok'
+  | 'already_recorded'
+  | 'invalid_turns'
+  | 'unknown_session'
+  | 'session_not_active';
+
+export interface CommitPhoneGateTurnsInput {
+  readonly sessionId: string;
+  /** The caller's idempotency key. A retry MUST reuse it. */
+  readonly sourceEventId: string;
+  readonly turns: readonly PhoneBoundaryTurn[];
+  readonly now: Date;
+}
+
+export interface CommitPhoneGateTurnsResult {
+  readonly status: CommitPhoneGateTurnsStatus | typeof PHONE_RPC_UNKNOWN_STATUS;
+  /** Present only on `ok`. The number of gate rows written. */
+  readonly turnsWritten?: number;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // The port
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -658,4 +692,10 @@ export interface PhoneStores {
   /** 0060; optional for legacy test doubles until P-3 adopts probes. */
   recordProbe?(input: RecordPhoneProbeInput): Promise<RecordPhoneProbeResult>;
   consentAndStart?(input: ConsentAndStartPhoneAssessmentInput): Promise<ConsentAndStartPhoneAssessmentResult>;
+  /**
+   * 0067. Appends 1..6 ordered PRE-CONSENT (gate) transcript turns, flagged
+   * `is_gate = true` and idempotent at the gate. Optional for legacy test
+   * doubles that predate the gate-transcript endpoint.
+   */
+  commitGateTurns?(input: CommitPhoneGateTurnsInput): Promise<CommitPhoneGateTurnsResult>;
 }

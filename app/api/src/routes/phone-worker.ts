@@ -85,16 +85,33 @@ import {
  * was answered — and that charges a real candidate's anti-harassment budget.
  */
 /**
- * The events whose 0042 transition is TERMINAL and carries a suppression. Each
- * must have its recordings deleted and verified BEFORE it is posted.
+ * The events after which a recording may exist but MUST be destroyed before the
+ * event posts. The posture since 0067 is "record from answer, keep only if
+ * consented": the egress now starts at `call.answered`, BEFORE consent, so every
+ * exit that ends the engagement without consent — a refusal, an opt-out, a wrong
+ * number, a machine pickup, or a pre-disclosure deferral — must delete and
+ * verify the pre-consent audio in the SAME step, before the terminal (or
+ * deferral) event's transition and any suppression it carries commits.
+ *
+ * The purge is idempotent and fails closed: an attempt that has recordings but
+ * whose egress never finalized is still enumerated and cleared, and a purge that
+ * cannot verify deletion leaves the request unacknowledged and retryable.
  */
 export const PURGE_BEFORE_EVENTS: ReadonlySet<string> = new Set([
   'disclosure.refused',
   'candidate.opt_out',
   'candidate.wrong_number',
+  // 0067: recordings may now exist pre-consent, so these two non-consenting
+  // exits must destroy them before the event posts, exactly like the refusals.
+  'classify.machine',
+  'candidate.deferred_pre_disclosure',
 ]);
 
 export const WORKER_PHONE_EVENTS = [
+  // Parity 2 (0067): a leg was answered. Stamps the attempt's answered_at and
+  // moves the engagement nowhere — it is not consent. Added to the closed
+  // vocabulary so the new first-class event can reach apply_phone_event.
+  'call.answered',
   'classify.human',
   'classify.machine',
   'disclosure.delivered',
@@ -238,6 +255,24 @@ const assessmentCompleteSchema = z
   })
   .strict();
 
+/**
+ * 0067 — the PRE-CONSENT (gate) transcript.
+ *
+ * The bounds MIRROR `commit_phone_gate_turns` exactly: 1..6 turns, text trimmed
+ * and 1..8,000 chars, `source_event_id` `^[A-Za-z0-9_.:-]{1,200}$`. The RPC
+ * enforces every one of these itself and answers `invalid_turns` — this schema
+ * refuses the same shapes a round trip earlier, so a malformed body is a flat
+ * 400 rather than a database call. The turn shape reuses `boundaryTurnSchema`,
+ * the SAME shape `/assessment/turn` validates, so the two cannot drift.
+ */
+const gateTurnsSchema = z
+  .object({
+    session_id: z.string().regex(UUID_RE),
+    source_event_id: z.string().trim().regex(/^[A-Za-z0-9_.:-]{1,200}$/),
+    turns: z.array(boundaryTurnSchema).min(1).max(6),
+  })
+  .strict();
+
 export interface PhoneWorkerRouterDeps {
   readonly stores?: PhoneStores;
   /** Resolves an attempt to its engagement. Injected so tests need no DB. */
@@ -263,10 +298,10 @@ export interface PhoneWorkerRouterDeps {
     engagementId: string;
   }) => Promise<boolean>;
   /**
-   * Starts THIS attempt's recording. Called on exactly one event —
-   * `disclosure.delivered` — and never on any other, because that is the only
-   * transition after which a candidate has been told they are being recorded
-   * and has agreed.
+   * Starts THIS attempt's recording. Since 0067 it is called on `call.answered`
+   * (the recording now begins at answer, capturing the greeting/consent
+   * exchange) and again, idempotently, on `disclosure.delivered` as a fallback —
+   * and on no other event. Both callers run only when the event was APPLIED.
    *
    * Optional so a test can assert it is NOT called on every other path. In
    * production it is supplied only when an egress destination is actually
@@ -494,22 +529,36 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       // LOUD rather than silent: the agent's first heartbeat answers
       // `lease_lost` and halts the call. B-1 was bad because it was silent.
 
-      // ── The ONE place a recording may begin ─────────────────────────
-      // Only after `disclosure.delivered` has been APPLIED — not merely
-      // posted, and not on any other event. 0043's
-      // `attach_phone_attempt_recording` independently refuses unless the
-      // engagement is already `in_call`, so this is the second of two locks
-      // rather than the only one; if this call site were ever moved or
-      // duplicated, the database would still refuse.
+      // ── The place a recording may begin — now at ANSWER ─────────────
+      // 0067 moves the recording start to the earliest lawful point: the
+      // moment a leg is ANSWERED (`call.answered`), so the greeting and consent
+      // exchange are captured. The SAME shared seam still runs on
+      // `disclosure.delivered` as an idempotent FALLBACK — if the answered-time
+      // attach failed or the answered event never arrived, the disclosure path
+      // still attaches. Both are gated on the event being APPLIED (not merely
+      // posted, and not on duplicate/ignored). 0067's
+      // `attach_phone_attempt_recording` binds only while the engagement is
+      // `dialing` OR `in_call` and the attempt is answered_unclassified/human,
+      // and both attach + egress + the 0051 session stamp REFUSE a second start,
+      // so re-running on the disclosure fallback is safe and needs no dedup
+      // state of our own.
       //
-      // A recording failure does NOT undo the event. The disclosure has been
-      // delivered and the transition is durable; failing the request would ask
-      // the worker to re-deliver a disclosure the candidate already answered.
-      // The asymmetry is deliberate and safe in this direction: the candidate
-      // was told the call is recorded and it may not be, which harms nobody.
+      // A recording failure does NOT undo the event. The transition is durable;
+      // failing the request would ask the worker to re-run a step the candidate
+      // has already moved past. The asymmetry is deliberate and safe in this
+      // direction: the candidate may be recorded slightly less than promised,
+      // which harms nobody. The session-hint verification below applies to the
+      // `call.answered` path EXACTLY as it does to disclosure.
       if (
-        parsed.data.event_type === 'disclosure.delivered'
+        (parsed.data.event_type === 'call.answered'
+          || parsed.data.event_type === 'disclosure.delivered')
         && result.status === 'applied'
+        // NOT on a duplicate re-post. `apply_phone_event` is idempotent, so a
+        // redelivery returns `applied` with `duplicate: true`; the recording is
+        // driven on the FIRST application only. The attach/egress/stamp are
+        // idempotent too, so this is belt-and-braces rather than the sole
+        // guard — but it keeps a worker retry from re-contacting the egress.
+        && result.duplicate !== true
         && deps.startRecording !== undefined
       ) {
         await startRecordingForAttempt(
@@ -843,6 +892,52 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       });
     } catch {
       return res.status(500).json({ ok: false, status: 'phone_assessment_error' });
+    }
+  });
+
+  // ── POST /assessment/gate-turns ───────────────────────────────────
+  // 0067. Persists the PRE-CONSENT (gate) transcript — the greeting and
+  // consent exchange that happens before `disclosure.delivered`. These turns
+  // are written with `is_gate = true` and are DISTINCT from the scored
+  // assessment turns `/assessment/turn` commits: the scorer excludes them, and
+  // the recruiter transcript view includes them.
+  //
+  // Idempotent at the gate: a session that already carries any gate row answers
+  // `already_recorded`, which is a SUCCESS. `ok` and `already_recorded` are
+  // 200; the refusals (`invalid_turns`, `unknown_session`, `session_not_active`)
+  // are 409, because none of them is a transport fault the worker should retry
+  // blindly. An RPC transport error is 503. The turn TEXT is never echoed back.
+  router.post('/assessment/gate-turns', requireWorkerPhoneAuth, async (req, res) => {
+    try {
+      if (!config().screeningEnabled) {
+        return res.status(503).json({ ok: false, error: 'phone_screening_disabled' });
+      }
+      const parsed = gateTurnsSchema.safeParse(req.body);
+      const commitGateTurns = stores().commitGateTurns;
+      if (!parsed.success || typeof commitGateTurns !== 'function') {
+        return res.status(400).json({ ok: false, status: 'invalid_request' });
+      }
+      const result = await commitGateTurns({
+        sessionId: parsed.data.session_id,
+        sourceEventId: parsed.data.source_event_id,
+        turns: parsed.data.turns,
+        now: now(),
+      });
+      // `ok` and `already_recorded` are both success — the gate transcript is
+      // durable either way. `turns_written` is intentionally NOT returned: the
+      // worker does not act on the count, and echoing it back tells it nothing
+      // it needs. The turn text is never in the response at all.
+      if (result.status === 'ok' || result.status === 'already_recorded') {
+        return res.json({ ok: true, status: result.status });
+      }
+      // A refusal the DB decided — the shape was bad, the session was unknown,
+      // or the session was not live. Forwarded as a 409 so the worker can tell
+      // it apart from a transport fault (503) it may retry.
+      return res.status(409).json({ ok: false, status: result.status });
+    } catch {
+      // A store throw is an RPC transport fault. 503, bare and sanitized: a
+      // driver message here could quote a transcript row.
+      return res.status(503).json({ ok: false, status: 'phone_gate_turns_error' });
     }
   });
 

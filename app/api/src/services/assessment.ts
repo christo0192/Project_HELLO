@@ -128,10 +128,16 @@ async function runAssessmentImpl(
     throw new Error(ERR_SESSION_NOT_COMPLETED);
   }
 
+  // 0067: the PRE-CONSENT (gate) turns — the greeting and consent exchange —
+  // are flagged `is_gate = true` and are NOT part of the scored screening. They
+  // exist for the recruiter transcript, not for the model. Excluded here so the
+  // score is computed over the assessment proper. The column defaults to false,
+  // so legacy rows (and every browser session) are unaffected.
   const { data: turns } = await supabase
     .from('transcript_turns')
     .select('speaker,text')
     .eq('session_id', sessionId)
+    .eq('is_gate', false)
     .order('turn_index', { ascending: true });
 
   const transcript: TranscriptTurn[] = (turns ?? []).map((t) => ({

@@ -20,7 +20,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import express from 'express';
 import request from 'supertest';
-import { createPhoneWorkerRouter, WORKER_PHONE_EVENTS } from '../routes/phone-worker.js';
+import { createPhoneWorkerRouter, WORKER_PHONE_EVENTS, PURGE_BEFORE_EVENTS } from '../routes/phone-worker.js';
 import {
   PHONE_APPOINTMENT_MAX_SECONDS,
   PHONE_APPOINTMENT_MIN_SECONDS,
@@ -962,7 +962,12 @@ describe('recording starts on disclosure.delivered, and on nothing else', () => 
     expect(h.storeCalls()).toBe(0);
   });
 
-  for (const event of WORKER_PHONE_EVENTS.filter((e) => e !== 'disclosure.delivered')) {
+  // 0067: `call.answered` now ALSO starts a recording (the recording begins at
+  // answer). Both recording events are excluded from this "starts NO recording"
+  // sweep; each has its own positive coverage above/below.
+  for (const event of WORKER_PHONE_EVENTS.filter(
+    (e) => e !== 'disclosure.delivered' && e !== 'call.answered',
+  )) {
     it(`starts NO recording on ${event}`, async () => {
       const h = build({ withRecorder: true });
       const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: event });
@@ -1039,6 +1044,137 @@ describe('recording starts on disclosure.delivered, and on nothing else', () => 
   });
 });
 
+// ═══════════════════════════════════════════════════════════════════════
+// 0067 — the recording begins at ANSWER, not at disclosure.
+//
+// `call.answered` now starts the attach + egress + 0051 session stamp, so the
+// greeting and consent exchange are captured. `disclosure.delivered` remains an
+// idempotent FALLBACK. Both fire ONLY when the event was APPLIED, never on
+// duplicate/ignored, and both apply the same session-hint verification.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('0067 — recording starts on an APPLIED call.answered', () => {
+  it('starts the recording for the attempt on call.answered, in that session\'s room', async () => {
+    const h = build({ withRecorder: true });
+    const res = await post(h, '/events', {
+      attempt_id: ATTEMPT,
+      event_type: 'call.answered',
+    });
+
+    expect(res.status).toBe(200);
+    expect(h.startRecording).toHaveBeenCalledTimes(1);
+    expect(h.startRecording.mock.calls[0][0]).toMatchObject({
+      engagementId: ENGAGEMENT,
+      attemptId: ATTEMPT,
+      roomName: `phone-${SESSION}`,
+    });
+  });
+
+  it('uses the worker session HINT on call.answered when the DB binding does not exist yet', async () => {
+    // The session is bound to the attempt only at /assessment/start, which is
+    // AFTER the answer — so the DB read here finds nothing and the worker's
+    // hint (verified against the attempt's candidate) is used.
+    const h = build({ withRecorder: true, withHintVerifier: true, sessionId: null });
+    const res = await post(h, '/events', {
+      attempt_id: ATTEMPT,
+      event_type: 'call.answered',
+      session_id: SESSION,
+    });
+
+    expect(res.status).toBe(200);
+    expect(h.verifySessionHint).toHaveBeenCalledWith({ sessionId: SESSION, engagementId: ENGAGEMENT });
+    expect(h.startRecording).toHaveBeenCalledTimes(1);
+    expect(h.startRecording.mock.calls[0][0]).toMatchObject({ roomName: `phone-${SESSION}` });
+  });
+
+  it('refuses an UNRELATED session hint on call.answered exactly as disclosure does', async () => {
+    const h = build({
+      withRecorder: true,
+      withHintVerifier: true,
+      sessionId: null,
+      verifySessionHint: async () => false,
+    });
+    const res = await post(h, '/events', {
+      attempt_id: ATTEMPT,
+      event_type: 'call.answered',
+      session_id: '77777777-6666-4555-8444-333333333333',
+    });
+
+    expect(res.status).toBe(200);
+    expect(h.startRecording).not.toHaveBeenCalled();
+  });
+
+  it('does NOT start a recording on a DUPLICATE call.answered', async () => {
+    // A duplicate is a re-post of an already-applied event. 0067 begins the
+    // recording only on the FIRST application; the attach/egress/stamp are
+    // idempotent anyway, but the route must not re-drive them on a duplicate.
+    const h = build({
+      withRecorder: true,
+      applyEvent: async () =>
+        ({ status: 'applied', applied: true, duplicate: true }) as ApplyPhoneEventResult,
+    });
+    const res = await post(h, '/events', {
+      attempt_id: ATTEMPT,
+      event_type: 'call.answered',
+    });
+
+    expect(res.status).toBe(200);
+    // `duplicate` short-circuits the recording start: the guard is
+    // `result.status === 'applied'`, and a duplicate returns `applied` — so
+    // this asserts the route does not re-drive on a re-post.
+    expect(h.startRecording).not.toHaveBeenCalled();
+  });
+
+  it('does NOT start a recording on an IGNORED call.answered', async () => {
+    const h = build({
+      withRecorder: true,
+      applyEvent: async () =>
+        ({
+          status: 'ignored',
+          applied: false,
+          ignoredReason: 'stale_epoch',
+          duplicate: false,
+        }) as ApplyPhoneEventResult,
+    });
+    const res = await post(h, '/events', {
+      attempt_id: ATTEMPT,
+      event_type: 'call.answered',
+    });
+
+    expect(res.status).toBe(200);
+    expect(h.startRecording).not.toHaveBeenCalled();
+  });
+
+  it('disclosure.delivered STILL attaches as a fallback when the answer never recorded', async () => {
+    // The two paths share ONE seam. Even if call.answered never arrived or its
+    // attach failed, the disclosure path still starts the recording — the
+    // attach/egress/stamp are idempotent, so this is a safe re-drive.
+    const h = build({ withRecorder: true });
+    const res = await post(h, '/events', {
+      attempt_id: ATTEMPT,
+      event_type: 'disclosure.delivered',
+    });
+
+    expect(res.status).toBe(200);
+    expect(h.startRecording).toHaveBeenCalledTimes(1);
+    expect(h.startRecording.mock.calls[0][0]).toMatchObject({ roomName: `phone-${SESSION}` });
+  });
+
+  it('a call.answered recording failure stays LOUD-but-non-fatal (the event still applies)', async () => {
+    const h = build({ withRecorder: true });
+    h.startRecording.mockRejectedValueOnce(new Error('egress exploded'));
+    const res = await post(h, '/events', {
+      attempt_id: ATTEMPT,
+      event_type: 'call.answered',
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.status).toBe('applied');
+    expect(JSON.stringify(res.body)).not.toContain('exploded');
+  });
+});
+
 
 // ═══════════════════════════════════════════════════════════════════════
 // B-3 — the purge runs BEFORE any terminal refusal is acknowledged.
@@ -1051,13 +1187,23 @@ describe('recording starts on disclosure.delivered, and on nothing else', () => 
 // as correctly opted out.
 // ═══════════════════════════════════════════════════════════════════════
 
+// 0067: the purge set now also covers the two NON-consenting exits that can
+// have pre-consent audio — a machine pickup and a pre-disclosure deferral —
+// because the recording now starts at ANSWER, before consent. The behaviour is
+// identical to the refusals: destroy and verify before the event posts.
 const TERMINAL_REFUSALS = [
   'disclosure.refused',
   'candidate.opt_out',
   'candidate.wrong_number',
+  'classify.machine',
+  'candidate.deferred_pre_disclosure',
 ] as const;
 
 describe('a terminal refusal purges the recordings BEFORE it is acknowledged', () => {
+  it('the purge set is exactly the five non-consenting exits (record from answer, keep only if consented)', () => {
+    expect([...PURGE_BEFORE_EVENTS].sort()).toEqual([...TERMINAL_REFUSALS].sort());
+  });
+
   for (const event of TERMINAL_REFUSALS) {
     it(`${event}: purges first, then posts the event`, async () => {
       const h = build({ withPurge: true });
@@ -1610,5 +1756,196 @@ describe('/events renews no lease, for any event, applied or not', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.ok).toBe(true);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 0067 — POST /assessment/gate-turns, the PRE-CONSENT transcript writer.
+//
+// `ok`/`already_recorded` are success (200). The DB refusals — `invalid_turns`,
+// `unknown_session`, `session_not_active` — are 409, distinct from a transport
+// fault (503). The turn TEXT is never echoed back.
+// ═══════════════════════════════════════════════════════════════════════
+
+const GATE_SECRET_TEXT = 'a-turn-of-transcript-text-that-must-never-echo';
+
+function buildGate(options: {
+  commitGateTurns?: (input: unknown) => Promise<{ status: string; turnsWritten?: number }>;
+  configSource?: NodeJS.ProcessEnv;
+  /** Omit the seam to prove the route is a flat 400 without it. */
+  withSeam?: boolean;
+} = {}) {
+  const commitGateTurns = vi.fn(
+    options.commitGateTurns ?? (async () => ({ status: 'ok', turnsWritten: 2 })),
+  );
+  const stores = (
+    options.withSeam === false ? {} : { commitGateTurns }
+  ) as unknown as PhoneStores;
+  const app = express();
+  app.use(express.json());
+  app.use(
+    '/api/internal/phone-worker',
+    createPhoneWorkerRouter({
+      stores,
+      configSource: options.configSource ?? ENABLED,
+      now: () => NOW,
+    }),
+  );
+  return { app, commitGateTurns };
+}
+
+const GATE_BODY = {
+  session_id: SESSION,
+  source_event_id: 'gate:1',
+  turns: [
+    { speaker: 'bot', text: 'Hi, this call may be recorded. Is that ok?' },
+    { speaker: 'candidate', text: 'Yes, that is fine.' },
+  ],
+};
+
+function postGate(app: express.Express, body: Record<string, unknown>) {
+  return request(app)
+    .post('/api/internal/phone-worker/assessment/gate-turns')
+    .set('Authorization', `Bearer ${SECRET}`)
+    .send(body);
+}
+
+describe('POST /assessment/gate-turns — auth and the master switch', () => {
+  it('requires the worker bearer', async () => {
+    const { app } = buildGate();
+    const res = await request(app)
+      .post('/api/internal/phone-worker/assessment/gate-turns')
+      .send(GATE_BODY);
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual({ ok: false, error: 'authentication_required' });
+  });
+
+  it('a wrong bearer is 403', async () => {
+    const { app } = buildGate();
+    const res = await request(app)
+      .post('/api/internal/phone-worker/assessment/gate-turns')
+      .set('Authorization', `Bearer ${'z'.repeat(SECRET.length)}`)
+      .send(GATE_BODY);
+    expect(res.status).toBe(403);
+  });
+
+  it('is 503 and inert while phone screening is disabled', async () => {
+    const { app, commitGateTurns } = buildGate({ configSource: DISABLED });
+    const res = await postGate(app, GATE_BODY);
+    expect(res.status).toBe(503);
+    expect(res.body).toEqual({ ok: false, error: 'phone_screening_disabled' });
+    expect(commitGateTurns).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /assessment/gate-turns — validation mirrors the RPC bounds', () => {
+  for (const [label, body] of [
+    ['a non-uuid session id', { ...GATE_BODY, session_id: 'nope' }],
+    ['a missing session id', { source_event_id: 'g:1', turns: GATE_BODY.turns }],
+    ['a bad source_event_id (spaces)', { ...GATE_BODY, source_event_id: 'has spaces' }],
+    ['a source_event_id over 200 chars', { ...GATE_BODY, source_event_id: 'a'.repeat(201) }],
+    ['zero turns', { ...GATE_BODY, turns: [] }],
+    ['seven turns', { ...GATE_BODY, turns: Array.from({ length: 7 }, () => ({ speaker: 'bot', text: 'x' })) }],
+    ['a bad speaker', { ...GATE_BODY, turns: [{ speaker: 'narrator', text: 'x' }] }],
+    ['empty turn text', { ...GATE_BODY, turns: [{ speaker: 'bot', text: '   ' }] }],
+    ['turn text over 8000 chars', { ...GATE_BODY, turns: [{ speaker: 'bot', text: 'x'.repeat(8001) }] }],
+    ['an extra unknown key (.strict)', { ...GATE_BODY, phone_number: '+919876543210' }],
+  ] as Array<[string, Record<string, unknown>]>) {
+    it(`refuses ${label} with a 400 and NO store call`, async () => {
+      const { app, commitGateTurns } = buildGate();
+      const res = await postGate(app, body);
+      expect(res.status, label).toBe(400);
+      expect(res.body).toEqual({ ok: false, status: 'invalid_request' });
+      expect(commitGateTurns, label).not.toHaveBeenCalled();
+    });
+  }
+
+  it('accepts the boundaries — 1 and 6 turns, 8000-char text', async () => {
+    const { app, commitGateTurns } = buildGate();
+    for (const turns of [
+      [{ speaker: 'candidate', text: 'y'.repeat(8000) }],
+      Array.from({ length: 6 }, (_, i) => ({ speaker: i % 2 ? 'candidate' : 'bot', text: 'ok' })),
+    ]) {
+      const res = await postGate(app, { ...GATE_BODY, turns });
+      expect(res.status).toBe(200);
+    }
+    expect(commitGateTurns).toHaveBeenCalledTimes(2);
+  });
+
+  it('a router with NO gate seam is a flat 400, never a crash', async () => {
+    const { app } = buildGate({ withSeam: false });
+    const res = await postGate(app, GATE_BODY);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ ok: false, status: 'invalid_request' });
+  });
+});
+
+describe('POST /assessment/gate-turns — status mapping and no text echo', () => {
+  for (const status of ['ok', 'already_recorded'] as const) {
+    it(`\`${status}\` is a 200 success`, async () => {
+      const { app } = buildGate({ commitGateTurns: async () => ({ status }) });
+      const res = await postGate(app, GATE_BODY);
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ ok: true, status });
+      // `turns_written` is not echoed and the text never appears.
+      expect(res.body).not.toHaveProperty('turns_written');
+    });
+  }
+
+  for (const status of ['invalid_turns', 'unknown_session', 'session_not_active', 'unknown_status'] as const) {
+    it(`\`${status}\` is a 409 refusal`, async () => {
+      const { app } = buildGate({ commitGateTurns: async () => ({ status }) });
+      const res = await postGate(app, GATE_BODY);
+      expect(res.status).toBe(409);
+      expect(res.body).toEqual({ ok: false, status });
+    });
+  }
+
+  it('an RPC transport error is a sanitized 503', async () => {
+    const { app } = buildGate({
+      commitGateTurns: async () => {
+        throw new Error(`pg: transcript row for candidate +919876543210 — ${GATE_SECRET_TEXT}`);
+      },
+    });
+    const res = await postGate(app, GATE_BODY);
+    expect(res.status).toBe(503);
+    expect(res.body).toEqual({ ok: false, status: 'phone_gate_turns_error' });
+    const body = JSON.stringify(res.body);
+    expect(body).not.toContain('9876543210');
+    expect(body).not.toContain(GATE_SECRET_TEXT);
+  });
+
+  it('the turn text is forwarded to the store but NEVER echoed in any response', async () => {
+    const { app, commitGateTurns } = buildGate();
+    const res = await postGate(app, {
+      ...GATE_BODY,
+      turns: [
+        { speaker: 'bot', text: GATE_SECRET_TEXT },
+        { speaker: 'candidate', text: 'yes' },
+      ],
+    });
+    expect(res.status).toBe(200);
+    // The store DID receive it (it must persist the transcript)…
+    const gateInput = commitGateTurns.mock.calls[0][0] as {
+      turns: Array<{ text: string }>;
+    };
+    expect(gateInput.turns[0].text).toBe(GATE_SECRET_TEXT);
+    // …but the response body carries none of it.
+    expect(JSON.stringify(res.body)).not.toContain(GATE_SECRET_TEXT);
+    expect(res.body).toEqual({ ok: true, status: 'ok' });
+  });
+
+  it('forwards the session id, source event id, turns and clock to the store', async () => {
+    const { app, commitGateTurns } = buildGate();
+    await postGate(app, GATE_BODY);
+    const input = commitGateTurns.mock.calls[0][0] as {
+      sessionId: string; sourceEventId: string; now: Date; turns: unknown[];
+    };
+    expect(input).toMatchObject({
+      sessionId: SESSION,
+      sourceEventId: 'gate:1',
+      now: NOW,
+    });
+    expect(input.turns).toHaveLength(2);
   });
 });
