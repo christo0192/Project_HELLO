@@ -94,12 +94,15 @@ begin
   okey := 'phone-' || att::text || '-egress.mp3';
   mkey := okey || '.json';
 
-  -- ── The gate, BEFORE the disclosure ────────────────────────────────
-  -- Both of these must refuse. The engagement is `dialing`; `in_call` is
-  -- reachable through exactly one edge and that edge is the disclosure.
+  -- ── The gate, BEFORE the ANSWER ────────────────────────────────────
+  -- 0067 inverted the recording posture: audio may exist from the moment a
+  -- human ANSWERS (kept only if they consent), but never before. Here the
+  -- attempt is still `admitted` — nobody has answered — so the ATTEMPT gate
+  -- refuses. The assessment gate below is unchanged: screening still starts
+  -- only at the disclosure edge.
   r := screening_v2.attach_phone_attempt_recording(att, okey, mkey, 'authoritative', null, t);
-  perform _phone_canary.chk(s, 'recording_refused_before_disclosure',
-                            r->>'status' = 'disclosure_not_delivered',
+  perform _phone_canary.chk(s, 'recording_refused_before_answer',
+                            r->>'status' = 'attempt_not_recordable',
                             _phone_canary.code(r->>'status'));
   r := screening_v2.start_phone_assessment(att, sess, t);
   perform _phone_canary.chk(s, 'assessment_refused_before_disclosure',
@@ -114,6 +117,15 @@ begin
     (select state from screening_v2.phone_call_attempts where id = att)
       = 'answered_unclassified',
     _phone_canary.code((select state from screening_v2.phone_call_attempts where id = att)));
+
+  -- ── Recording binds FROM THE ANSWER (0067) ─────────────────────────
+  -- An answered, not-yet-classified leg may now carry a recording, so the
+  -- greeting and the consent exchange are on the tape; every non-consent
+  -- exit purges it before its event posts.
+  r := screening_v2.attach_phone_attempt_recording(att, okey, mkey, 'authoritative', null,
+                                                   t + interval '6 seconds');
+  perform _phone_canary.chk(s, 'recording_allowed_from_answer', r->>'status' = 'ok',
+                            _phone_canary.code(r->>'status'));
 
   r := _phone_canary.sip(att, 'classify.human', t + interval '8 seconds', 2);
   perform _phone_canary.chk(s, 'classified_human',
