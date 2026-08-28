@@ -11,21 +11,14 @@
 -- Re-screen creation itself never creates an attempt or a queue job; all later
 -- dialing remains behind the existing admit_phone_attempt gate.
 
+-- Defaults backfill existing rows without issuing an UPDATE. The engagement
+-- immutability trigger correctly rejects updates to terminal history, while an
+-- additive column default is metadata/schema evolution and preserves every
+-- historical value without firing the state-machine trigger.
 alter table screening_v2.phone_engagements
-  add column if not exists cycle_number integer;
+  add column if not exists cycle_number integer not null default 1;
 alter table screening_v2.phone_engagements
-  add column if not exists no_answer_limit integer;
-
-update screening_v2.phone_engagements
-   set cycle_number = coalesce(cycle_number, 1),
-       no_answer_limit = coalesce(no_answer_limit, 3)
- where cycle_number is null or no_answer_limit is null;
-
-alter table screening_v2.phone_engagements
-  alter column cycle_number set default 1,
-  alter column cycle_number set not null,
-  alter column no_answer_limit set default 3,
-  alter column no_answer_limit set not null;
+  add column if not exists no_answer_limit integer not null default 3;
 
 -- TST-15 SANCTION: the legacy application-wide UNIQUE is replaced by the
 -- additive (application_link_id, cycle_number) UNIQUE plus the one-active-cycle
