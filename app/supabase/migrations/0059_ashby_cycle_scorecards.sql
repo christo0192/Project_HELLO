@@ -106,9 +106,11 @@ begin
 
   select o.* into v_op
     from screening_v2.ashby_operations o
+    join screening_v2.ashby_application_links l on l.id = o.application_link_id
    where o.provider = 'ashby'
      and o.state = 'pending'
      and o.scheduled_at <= p_now
+     and l.terminal_state is null
      and (p_operation_type is null or o.operation_type = p_operation_type)
      and (o.lease_expires_at is null or o.lease_expires_at <= p_now)
      and (
@@ -118,8 +120,27 @@ begin
           where d.id = o.depends_on_operation_id and d.state = 'succeeded'
        )
      )
+     -- ── 0035 prerequisite gate for invite delivery ────────────────────
+     and (
+       o.operation_type <> 'invite_delivery'
+       or (
+         -- (b) an ENABLED mapping is what authorizes contacting a candidate.
+         exists (
+           select 1 from screening_v2.ashby_job_mappings m
+            where m.id = l.job_mapping_id and m.status = 'enabled'
+         )
+         -- (c) a resume-backed link waits for its OWN ingestion to be ready.
+         and (
+           l.external_resume_file_handle is null
+           or exists (
+             select 1 from screening_v2.ashby_resume_ingestions i
+              where i.application_link_id = l.id and i.state = 'ready'
+           )
+         )
+       )
+     )
    order by o.scheduled_at, o.id
-   for update skip locked
+   for update of o skip locked
    limit 1;
 
   if not found then
@@ -139,6 +160,7 @@ begin
     'status', 'claimed',
     'id', v_op.id,
     'operation_type', v_op.operation_type,
+    'operation_key', v_op.operation_key,
     'application_link_id', v_op.application_link_id,
     'lease_token', v_token,
     'attempts', v_op.attempts + 1,

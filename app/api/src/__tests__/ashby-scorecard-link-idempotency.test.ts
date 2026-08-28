@@ -17,7 +17,7 @@
  *      concurrency-safe one-scorecard-per-link guard.
  */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { createWorkflowStores } from '../integrations/ashby/workflow-stores.js';
 import { enqueueScorecard } from '../integrations/ashby/orchestration.js';
 import type { WorkflowStores } from '../integrations/ashby/orchestration.js';
@@ -79,6 +79,7 @@ const ASSESSMENT: TableResult = {
 };
 
 describe('enqueueScorecardWrite — one scorecard per application link, ever', () => {
+  afterEach(() => vi.unstubAllEnvs());
   it('refuses when the link already has a scorecard_write under a LEGACY marker', async () => {
     // The historical row was written when the marker still hashed
     // /sessions/<id>; its marker no longer matches anything we would compute.
@@ -131,6 +132,29 @@ describe('enqueueScorecardWrite — one scorecard per application link, ever', (
     // mint a second operation_key and slip past uq_ashby_operations_key.
     expect(String(args.p_operation_key)).not.toContain(String(args.p_marker));
     expect(String(args.p_marker)).toMatch(/^[a-f0-9]{32}$/);
+  });
+
+  it('publishes a later phone cycle through a session-bound operation when enabled', async () => {
+    vi.stubEnv('ASHBY_RESCREEN_SCORECARD_ENABLED', 'true');
+    const { client, rpc } = fakeClient({
+      phone_engagements: {
+        data: { application_link_id: LINK_ID, cycle_number: 2 }, error: null,
+      },
+      ashby_operations: { data: null, error: null },
+      ashby_application_links: ACTIVE_LINK,
+      assessments: ASSESSMENT,
+    });
+    const stores = createWorkflowStores(client as never);
+
+    const result = await stores.enqueueScorecardWrite!(LINK_ID, SESSION_ID);
+
+    expect(result).toEqual({ status: 'inserted' });
+    expect(rpc).toHaveBeenCalledTimes(1);
+    const [fn, args] = rpc.mock.calls[0] as unknown as [string, Record<string, unknown>];
+    expect(fn).toBe('enqueue_ashby_cycle_scorecard');
+    expect(args.p_application_link_id).toBe(LINK_ID);
+    expect(args.p_session_id).toBe(SESSION_ID);
+    expect(args.p_operation_key).toBe(`ashby:scorecard:cycle:${LINK_ID}:${SESSION_ID}`);
   });
 
   it('keeps the mapping and assessment gates ahead of any enqueue', async () => {
