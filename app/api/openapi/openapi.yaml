@@ -1056,7 +1056,7 @@ paths:
       tags: [phone]
       operationId: bookPhoneWorkerAppointment
       summary: Book a candidate-requested callback from the phone voice worker
-      description: Internal, service-authenticated callback booking for the "call me later" path. The worker PROPOSES an absolute UTC instant; the SERVER decides whether it is legal, revalidating not-in-the-past and the 09:00-21:00 IST window, because an LLM-driven caller is exactly the client that will confidently propose 03:00 IST. Duration is bounded to the same 900-3600 second envelope 0042's appointment CHECK enforces. Both bounds are UTC ISO-8601 with a literal Z; an offset or naive datetime is refused. IMPORTANT — schedule_phone_appointment refuses outright while the engagement is `dialing` (attempt_in_flight), because a live dial owns the engagement and booking under it would put the calendar and the wire into disagreement. Since "call me later" is most likely said DURING the identity/disclosure exchange, this endpoint first ends the attempt truthfully and WITHOUT CHARGE via 0043's candidate.deferred_pre_disclosure edge, then books from a legal state. A refusal is ALWAYS returned as ok=false so the worker never speaks a confirmation for a booking that did not happen; unknown_status is treated as a refusal, not as success. No Google, no email. Disabled by default.
+      description: Internal, service-authenticated callback booking for the "call me later" path. The worker PROPOSES an absolute UTC instant; the SERVER decides whether it is legal, revalidating not-in-the-past and the bounded effective IST calling window (24/7 through 2026-09-06 inclusive, then 09:00-21:00), because an LLM-driven caller is exactly the client that will confidently propose an illegal time. Duration is bounded to the same 900-3600 second envelope 0042's appointment CHECK enforces. Both bounds are UTC ISO-8601 with a literal Z; an offset or naive datetime is refused. IMPORTANT — schedule_phone_appointment refuses outright while the engagement is `dialing` (attempt_in_flight), because a live dial owns the engagement and booking under it would put the calendar and the wire into disagreement. Since "call me later" is most likely said DURING the identity/disclosure exchange, this endpoint first ends the attempt truthfully and WITHOUT CHARGE via 0043's candidate.deferred_pre_disclosure edge, then books from a legal state. A refusal is ALWAYS returned as ok=false so the worker never speaks a confirmation for a booking that did not happen; unknown_status is treated as a refusal, not as success. No Google, no email. Disabled by default.
       security:
         - workerBearer: []
       requestBody:
@@ -4219,7 +4219,7 @@ paths:
       tags: [phone]
       operationId: createPhoneAppointment
       summary: Book an internal phone screening slot
-      description: Admin only. Delegates to the 0042 schedule_phone_appointment RPC and writes nothing directly; slot legality, the IST window, the IST-midnight straddle and the optimistic version are all decided inside the RPC under the engagement row lock. The source is always hr_manual and may not be supplied. No expected version is sent, so a live appointment already existing is refused with appointment_exists rather than silently superseded. Booking causes no call — admit_phone_attempt is the only thing that dials and it is not mounted. Refused with 503 while PHONE_SCREENING_ENABLED is off.
+      description: Admin only. Delegates to the 0042 schedule_phone_appointment RPC and writes nothing directly; slot legality, the effective IST window (including the fixed 2026-09-06 temporary cutoff), the IST-midnight straddle and the optimistic version are all decided inside the RPC under the engagement row lock. The source is always hr_manual and may not be supplied. No expected version is sent, so a live appointment already existing is refused with appointment_exists rather than silently superseded. Booking causes no call — admit_phone_attempt is the only thing that dials and it is not mounted. Refused with 503 while PHONE_SCREENING_ENABLED is off.
       security:
         - bearerAuth: []
       requestBody:
@@ -8114,9 +8114,9 @@ components:
       additionalProperties: false
 
     PhoneWindow:
-      description: The approved IST calling window, mirrored from phone_ist_window_open_at and phone_ist_window_close_at. Open is inclusive, close is exclusive, and every one of the seven days is a calling day.
+      description: The approved IST calling window. The normal 09:00 inclusive / 21:00 exclusive bounds remain the permanent fallback; temporary_247_until_ist identifies the reviewed inclusive cutoff for the bounded all-day override.
       type: object
-      required: [time_zone, open_ist, close_ist]
+      required: [time_zone, open_ist, close_ist, temporary_247_until_ist]
       properties:
         time_zone:
           type: string
@@ -8124,6 +8124,10 @@ components:
           type: string
         close_ist:
           type: string
+        temporary_247_until_ist:
+          description: Inclusive final IST calendar date of the temporary 24/7 calling window. The normal window resumes on the next IST date.
+          type: string
+          format: date
       additionalProperties: false
 
     PhoneCandidateRef:
@@ -8580,7 +8584,7 @@ components:
 
     PhoneHealthWindow:
       type: object
-      required: [time_zone, open_ist, close_ist, open_now, ist_date]
+      required: [time_zone, open_ist, close_ist, temporary_247_until_ist, open_now, ist_date]
       properties:
         time_zone:
           type: string
@@ -8588,6 +8592,10 @@ components:
           type: string
         close_ist:
           type: string
+        temporary_247_until_ist:
+          description: Inclusive final IST calendar date of the temporary 24/7 calling window. The normal window resumes on the next IST date.
+          type: string
+          format: date
         open_now:
           description: Null when the backlog could not be read. A false would claim the window is shut, which is a different answer.
           type: boolean

@@ -22,10 +22,10 @@ import {
   type PhoneSlotOccupancy,
 } from '../lib/phone-screening/index.js';
 
-/** IST is UTC+05:30, so 09:00 IST is 03:30Z and 21:00 IST is 15:30Z. */
-const DAY = { year: 2026, month: 8, day: 24 };
+/** A post-cutoff IST day, where the original 09:00–21:00 gate is active. */
+const DAY = { year: 2026, month: 9, day: 7 };
 /** Well before the window on that IST day, so nothing is in the past. */
-const BEFORE_WINDOW = new Date('2026-08-23T18:31:00Z');
+const BEFORE_WINDOW = new Date('2026-09-06T18:31:00Z');
 
 function grid(over: Partial<Parameters<typeof buildPhoneSlotGrid>[0]> = {}) {
   return buildPhoneSlotGrid({
@@ -67,8 +67,8 @@ describe('parseIstCalendarDate', () => {
 describe('istDayInstantRange', () => {
   it('spans IST midnight to IST midnight, not UTC midnight', () => {
     expect(istDayInstantRange(DAY)).toEqual({
-      fromIso: '2026-08-23T18:30:00.000Z',
-      toIso: '2026-08-24T18:30:00.000Z',
+      fromIso: '2026-09-06T18:30:00.000Z',
+      toIso: '2026-09-07T18:30:00.000Z',
     });
   });
 
@@ -91,7 +91,7 @@ describe('the grid honours the window boundaries', () => {
   it('opens at 09:00 IST inclusive and never starts a slot at 21:00', () => {
     const slots = grid();
     expect(slots[0].istStart).toBe(PHONE_IST_WINDOW_OPEN_AT.slice(0, 5));
-    expect(slots[0].startsAt).toBe('2026-08-24T03:30:00.000Z');
+    expect(slots[0].startsAt).toBe('2026-09-07T03:30:00.000Z');
     const closeHm = PHONE_IST_WINDOW_CLOSE_AT.slice(0, 5);
     for (const slot of slots) {
       expect(slot.istStart < closeHm, `${slot.istStart} starts at or after the close`).toBe(true);
@@ -103,7 +103,20 @@ describe('the grid honours the window boundaries', () => {
     expect(slots).toHaveLength(24);
     expect(slots.at(-1)!.istStart).toBe('20:30');
     expect(slots.at(-1)!.istEnd).toBe('21:00');
-    expect(slots.at(-1)!.endsAt).toBe('2026-08-24T15:30:00.000Z');
+    expect(slots.at(-1)!.endsAt).toBe('2026-09-07T15:30:00.000Z');
+  });
+
+  it('uses the full temporary day through September 6, without offering a cross-midnight slot', () => {
+    const slots = buildPhoneSlotGrid({
+      date: { year: 2026, month: 9, day: 6 },
+      slotSeconds: 1_800,
+      now: new Date('2026-09-05T18:30:00Z'),
+      occupancy: [],
+    });
+    expect(slots[0].istStart).toBe('00:00');
+    expect(slots).toHaveLength(47);
+    expect(slots.at(-1)?.istStart).toBe('23:00');
+    expect(slots.at(-1)?.istEnd).toBe('23:30');
   });
 
   it('is contiguous — each slot begins where the last ended', () => {
@@ -151,12 +164,12 @@ describe('the grid honours the window boundaries', () => {
 
 describe('the grid is identical on all seven days', () => {
   it('offers the same slot count and the same IST wall times, Monday to Sunday', () => {
-    // 2026-08-24 is a Monday; seven consecutive dates therefore cover every
-    // weekday exactly once.
+    // 2026-09-07 is a Monday; seven consecutive dates therefore cover every
+    // weekday exactly once after the temporary override.
     const weekdaysSeen = new Set<number>();
     const reference = grid().map((s) => `${s.istStart}-${s.istEnd}`);
     for (let offset = 0; offset < 7; offset += 1) {
-      const d = new Date(Date.UTC(2026, 7, 24 + offset));
+      const d = new Date(Date.UTC(2026, 8, 7 + offset));
       weekdaysSeen.add(d.getUTCDay());
       const slots = buildPhoneSlotGrid({
         date: { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate() },
@@ -175,7 +188,7 @@ describe('the grid is identical on all seven days', () => {
 describe('capacity comes from database facts, never from a guess', () => {
   const at = (istHm: string): string => {
     const [h, m] = istHm.split(':').map(Number);
-    return new Date(Date.UTC(2026, 7, 24, h - 5, m - 30)).toISOString();
+    return new Date(Date.UTC(2026, 8, 7, h - 5, m - 30)).toISOString();
   };
   const booking = (from: string, to: string): PhoneSlotOccupancy => ({
     startsAt: at(from),

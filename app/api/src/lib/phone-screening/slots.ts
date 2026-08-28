@@ -4,11 +4,11 @@
  *
  * ── WHAT 0042 ACTUALLY GUARANTEES ─────────────────────────────────────
  * Three facts, and only three:
- *   1. `phone_ist_window_open_at()` / `phone_ist_window_close_at()` — 09:00
- *      INCLUSIVE to 21:00 EXCLUSIVE IST, every one of the seven days. It is a
- *      START-TIME predicate; the appointment trigger applies it to `starts_at`
- *      and to nothing else, so a slot that BEGINS at 20:45 is legal even though
- *      it ends after the close.
+ *   1. `phone_ist_window_open_at()` / `phone_ist_window_close_at()` remain the
+ *      permanent 09:00 INCLUSIVE to 21:00 EXCLUSIVE IST bounds. Migration 0064
+ *      temporarily makes the effective start-time predicate 24/7 through
+ *      2026-09-06 inclusive; the appointment trigger applies it to `starts_at`
+ *      and to nothing else.
  *   2. `phone_max_concurrent()` — the fleet-wide cap of ten simultaneous live
  *      attempts.
  *   3. The live appointments themselves: `status in ('scheduled','confirmed')`
@@ -45,8 +45,8 @@ import {
   PHONE_APPOINTMENT_MIN_SECONDS,
 } from './vocabulary.js';
 import {
-  PHONE_IST_WINDOW,
   PHONE_MAX_CONCURRENT,
+  istWindowForDate,
   istWallClock,
   istWallClockToInstant,
   type IstWindowBounds,
@@ -156,7 +156,8 @@ export function buildPhoneSlotGrid(input: PhoneSlotGridInput): readonly PhoneSlo
   if (!(input.now instanceof Date) || Number.isNaN(input.now.getTime())) {
     throw new Error('phone_now_invalid');
   }
-  const bounds = input.bounds ?? PHONE_IST_WINDOW;
+  const date = `${String(input.date.year).padStart(4, '0')}-${String(input.date.month).padStart(2, '0')}-${String(input.date.day).padStart(2, '0')}`;
+  const bounds = input.bounds ?? istWindowForDate(date);
   const nowMs = input.now.getTime();
 
   // Occupancy is reduced to numbers ONCE, so the inner loop is arithmetic
@@ -170,9 +171,16 @@ export function buildPhoneSlotGrid(input: PhoneSlotGridInput): readonly PhoneSlo
   }
 
   const slots: PhoneSlot[] = [];
+  // The appointment trigger requires starts_at and ends_at to remain on the
+  // same IST date. A full-day temporary window therefore stops offering starts
+  // before the final slot would cross midnight; the dial admission itself is
+  // still legal at every instant through the cutoff.
+  const latestStartExclusive = bounds.closeSeconds === 86_400
+    ? bounds.closeSeconds - slotSeconds
+    : bounds.closeSeconds;
   for (
     let offset = bounds.openSeconds;
-    offset < bounds.closeSeconds;
+    offset < latestStartExclusive;
     offset += slotSeconds
   ) {
     const startsAt = istWallClockToInstant(

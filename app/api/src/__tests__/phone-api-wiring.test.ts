@@ -172,9 +172,10 @@ describe('the default stores resolve to the process-wide client', () => {
   it('the slot grid uses the real clock and the configured step', async () => {
     const res = await request(productionApp()).get('/api/phone/calendar/slots?date=2026-08-24');
     expect(res.status).toBe(200);
-    // The default step is 1800s, so the twelve-hour window yields 24 slots.
+    // The default step is 1800s. This date is inside the temporary all-day
+    // window, so the grid yields 47 same-day starts without a cross-midnight slot.
     expect(res.body.slot_seconds).toBe(1_800);
-    expect(res.body.slots).toHaveLength(24);
+    expect(res.body.slots).toHaveLength(47);
     expect(selectCalls.map((c) => c.table)).toEqual(['phone_appointments']);
   });
 

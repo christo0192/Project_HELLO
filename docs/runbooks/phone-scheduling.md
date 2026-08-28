@@ -21,7 +21,9 @@ operators to copy an internal engagement UUID.
 
 ## Booking semantics
 
-1. Select an IST date and a slot between 09:00 inclusive and 21:00 exclusive.
+1. Through September 6, 2026 inclusive, calling may start at any hour in IST. From
+   September 7, the existing 09:00 inclusive to 21:00 exclusive IST window applies
+   again automatically. The calendar response exposes the cutoff.
 2. Treat the capacity label as an advisory projection, not a reservation.
 3. Candidate-profile booking resolves the current active cycle and appointment
    in one database transaction.
@@ -44,8 +46,9 @@ before the appointment is booked. The worker confirms a callback only after the
 server returns an accepted appointment result.
 
 Past, illegal, out-of-window, unclear, or unavailable slots are refusals and
-must not be spoken as confirmations. A booked callback must not be converted
-into a completed or re-screened cycle.
+must not be spoken as confirmations. The temporary 24/7 period does not bypass
+consent, halt, capacity, budget, or any other admission control. A booked callback
+must not be converted into a completed or re-screened cycle.
 
 ## Reschedule and cancellation
 

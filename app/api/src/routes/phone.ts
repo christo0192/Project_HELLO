@@ -69,6 +69,7 @@ import {
   PHONE_BUDGET_CEILINGS,
   PHONE_IST_WINDOW_CLOSE_AT,
   PHONE_IST_WINDOW_OPEN_AT,
+  PHONE_TEMPORARY_247_UNTIL_IST,
   PHONE_SUBSTRATE_RESIDUALS,
   buildPhoneSlotGrid,
   createPhoneReadStore,
@@ -150,6 +151,7 @@ function windowBlock(): Record<string, unknown> {
     time_zone: IST_TIME_ZONE,
     open_ist: PHONE_IST_WINDOW_OPEN_AT,
     close_ist: PHONE_IST_WINDOW_CLOSE_AT,
+    temporary_247_until_ist: PHONE_TEMPORARY_247_UNTIL_IST,
   };
 }
 

@@ -835,8 +835,10 @@ export interface PhoneWindow {
   time_zone: string;
   /** Inclusive open, IST wall clock. */
   open_ist: string;
-  /** Exclusive close, IST wall clock. */
+  /** Exclusive close, IST wall clock for the restored normal schedule. */
   close_ist: string;
+  /** Inclusive final IST date for the temporary all-day calling window. */
+  temporary_247_until_ist: string;
 }
 
 /**
