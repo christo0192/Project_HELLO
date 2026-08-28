@@ -1520,6 +1520,13 @@ async def _run_phone_session(
     def _on_phone_speech_created(event):  # noqa: ANN001
         reply_handle[0] = getattr(event, "speech_handle", None)
         reply_started.set()
+        # Once an authorized reply has been created, the next interim
+        # generation must default to substantive tool-first policy. The
+        # current reply already captured its route-specific settings; this
+        # prevents clarification/opening policy from leaking into the next
+        # speculative turn before the final hook runs.
+        if getattr(agent, "_screening_authorized", False):
+            setattr(agent, "_turn_policy", "substantive")
         assistant_delivery_complete.clear()
         handle = reply_handle[0]
         wait = getattr(handle, "wait_for_playout", None)
