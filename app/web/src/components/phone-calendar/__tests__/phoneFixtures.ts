@@ -14,6 +14,7 @@
  */
 import { vi } from 'vitest';
 import type {
+  Candidate,
   MeResponse,
   PhoneCalendarAppointment,
   PhoneCalendarResponse,
@@ -36,6 +37,8 @@ const hoisted = vi.hoisted(() => {
     getMe: vi.fn(),
     getPhoneCalendar: vi.fn(),
     getPhoneSlots: vi.fn(),
+    listCandidates: vi.fn(),
+    scheduleCandidatePhoneAppointment: vi.fn(),
     createPhoneAppointment: vi.fn(),
     reschedulePhoneAppointment: vi.fn(),
     cancelPhoneAppointment: vi.fn(),
@@ -45,6 +48,8 @@ const hoisted = vi.hoisted(() => {
     getMe: fns.getMe,
     getPhoneCalendar: fns.getPhoneCalendar,
     getPhoneSlots: fns.getPhoneSlots,
+    listCandidates: fns.listCandidates,
+    scheduleCandidatePhoneAppointment: fns.scheduleCandidatePhoneAppointment,
     createPhoneAppointment: fns.createPhoneAppointment,
     reschedulePhoneAppointment: fns.reschedulePhoneAppointment,
     cancelPhoneAppointment: fns.cancelPhoneAppointment,
@@ -81,6 +86,19 @@ export const VIEWER_ME: MeResponse = {
   email: 'viewer@example.com',
   role: 'viewer',
 } as unknown as MeResponse;
+
+export const PHONE_BOOKING_CANDIDATES: Candidate[] = [{
+  id: 'cand-1',
+  name: 'Asha Rao',
+  email: null,
+  phone_e164: null,
+  phone_valid: false,
+  skills: [],
+  experience_years: null,
+  status: 'screening',
+  role_id: null,
+  created_at: '2026-08-20T10:00:00Z',
+}];
 
 // ── The approved calling window ──────────────────────────────────────
 

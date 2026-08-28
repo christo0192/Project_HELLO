@@ -27,6 +27,7 @@ import {
   phoneApi,
   slot,
   slotsResponse,
+  PHONE_BOOKING_CANDIDATES,
 } from '../components/phone-calendar/__tests__/phoneFixtures';
 import { stubMatchMedia } from '../components/design/__tests__/helpers';
 
@@ -34,7 +35,6 @@ vi.mock('../api', () => ({ api: phoneApi.api, ApiError: phoneApi.ApiError }));
 
 import { PhoneCalendarPage } from './PhoneCalendarPage';
 
-const ENGAGEMENT_ID = '11111111-2222-4333-8444-555555555555';
 
 function renderPage(search = '?week=2026-08-24') {
   return render(
@@ -49,7 +49,8 @@ beforeEach(() => {
   apiFns.getMe.mockResolvedValue(ADMIN_ME);
   apiFns.getPhoneCalendar.mockResolvedValue(calendarResponse());
   apiFns.getPhoneSlots.mockResolvedValue(slotsResponse());
-  apiFns.createPhoneAppointment.mockResolvedValue({
+  apiFns.listCandidates.mockResolvedValue(PHONE_BOOKING_CANDIDATES);
+  apiFns.scheduleCandidatePhoneAppointment.mockResolvedValue({
     ok: true,
     appointment_id: 'new-1',
     version: 1,
@@ -78,8 +79,8 @@ beforeEach(() => {
 async function openBookingForm() {
   await screen.findByRole('table');
   await userEvent.click(screen.getByRole('button', { name: 'Book a screening' }));
-  const idField = await screen.findByLabelText('Engagement id');
-  await userEvent.type(idField, ENGAGEMENT_ID);
+  await screen.findByLabelText('Candidate');
+  await userEvent.selectOptions(screen.getByLabelText('Candidate'), 'cand-1');
   const radios = await screen.findAllByRole('radio');
   await userEvent.click(radios[0]);
 }
@@ -104,10 +105,10 @@ describe('booking', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Book' }));
     await userEvent.click(await screen.findByRole('button', { name: 'Confirm' }));
 
-    await waitFor(() => expect(apiFns.createPhoneAppointment).toHaveBeenCalledTimes(1));
-    const body = apiFns.createPhoneAppointment.mock.calls[0][0];
+    await waitFor(() => expect(apiFns.scheduleCandidatePhoneAppointment).toHaveBeenCalledTimes(1));
+    const [candidateId, body] = apiFns.scheduleCandidatePhoneAppointment.mock.calls[0];
+    expect(candidateId).toBe('cand-1');
     expect(body).toEqual({
-      engagement_id: ENGAGEMENT_ID,
       starts_at: '2026-08-26T09:00:00Z',
       ends_at: '2026-08-26T09:30:00Z',
     });
@@ -135,17 +136,17 @@ describe('booking', () => {
 
     // The confirmation panel is open; nothing has been sent.
     expect(await screen.findByRole('button', { name: 'Confirm' })).toBeInTheDocument();
-    expect(apiFns.createPhoneAppointment).not.toHaveBeenCalled();
+    expect(apiFns.scheduleCandidatePhoneAppointment).not.toHaveBeenCalled();
 
     await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
-    expect(apiFns.createPhoneAppointment).not.toHaveBeenCalled();
+    expect(apiFns.scheduleCandidatePhoneAppointment).not.toHaveBeenCalled();
   });
 
   it('states the prerequisites warning instead of reporting a plain success', async () => {
     // `ok_prereqs_pending` is a success WITH a warning: the slot is real, but
     // nothing will dial it. Collapsing it into "booked" would let an operator
     // believe a call is going to happen.
-    apiFns.createPhoneAppointment.mockResolvedValue({
+    apiFns.scheduleCandidatePhoneAppointment.mockResolvedValue({
       ok: true,
       appointment_id: 'new-1',
       version: 1,
@@ -167,11 +168,11 @@ describe('booking', () => {
     renderPage();
     await screen.findByRole('table');
     await userEvent.click(screen.getByRole('button', { name: 'Book a screening' }));
-    await userEvent.type(await screen.findByLabelText('Engagement id'), 'not-a-uuid');
+    await screen.findByLabelText('Candidate');
 
-    expect(screen.getByLabelText('Engagement id')).toHaveAttribute('aria-invalid', 'true');
+    expect(screen.getByRole('combobox', { name: 'Candidate' })).toHaveValue('');
     expect(screen.getByRole('button', { name: 'Book' })).toBeDisabled();
-    expect(apiFns.createPhoneAppointment).not.toHaveBeenCalled();
+    expect(apiFns.scheduleCandidatePhoneAppointment).not.toHaveBeenCalled();
   });
 });
 
@@ -487,7 +488,7 @@ describe('interviewer', () => {
     expect(screen.queryByRole('button', { name: 'Cancel appointment' })).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Cancellation reason')).not.toBeInTheDocument();
 
-    expect(apiFns.createPhoneAppointment).not.toHaveBeenCalled();
+    expect(apiFns.scheduleCandidatePhoneAppointment).not.toHaveBeenCalled();
     expect(apiFns.reschedulePhoneAppointment).not.toHaveBeenCalled();
     expect(apiFns.cancelPhoneAppointment).not.toHaveBeenCalled();
     // And never asks for slots, which only a booking flow needs.
@@ -506,7 +507,7 @@ describe('a failed mutation never says the wrong thing happened', () => {
     // POST /halt/clear does. So on this path the row really was written and
     // only its audit record is missing. Telling the operator it was "not
     // applied" would send them to book the same slot a second time.
-    apiFns.createPhoneAppointment.mockRejectedValue(
+    apiFns.scheduleCandidatePhoneAppointment.mockRejectedValue(
       new MockApiError('phone_audit_write_failed', 500),
     );
     renderPage();
@@ -563,8 +564,8 @@ describe('a refusal does not throw away the operator input', () => {
   it('keeps the engagement id and the slot when booking is refused', async () => {
     // `window_closed` is not in REFRESH_REQUIRED, so the panel stays mounted
     // with a message telling the operator to try again. Clearing the fields
-    // would discard a UUID they hand-copied from another surface.
-    apiFns.createPhoneAppointment.mockRejectedValue(
+    // would discard the selected candidate and slot.
+    apiFns.scheduleCandidatePhoneAppointment.mockRejectedValue(
       new MockApiError('window_closed', 409),
     );
     renderPage();
@@ -573,7 +574,7 @@ describe('a refusal does not throw away the operator input', () => {
     await userEvent.click(await screen.findByRole('button', { name: 'Confirm' }));
 
     await screen.findByText(/outside the approved calling window/i);
-    expect(screen.getByLabelText('Engagement id')).toHaveValue(ENGAGEMENT_ID);
+    expect(screen.getByLabelText('Candidate')).toHaveValue('cand-1');
     expect((await screen.findAllByRole('radio'))[0]).toBeChecked();
   });
 
@@ -584,7 +585,7 @@ describe('a refusal does not throw away the operator input', () => {
     await userEvent.click(await screen.findByRole('button', { name: 'Confirm' }));
 
     await waitFor(() =>
-      expect(screen.getByLabelText('Engagement id')).toHaveValue(''),
+      expect(screen.getByLabelText('Candidate')).toHaveValue(''),
     );
   });
 

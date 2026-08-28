@@ -207,9 +207,10 @@ describe('no direct network access', () => {
     const allowed = new Set([
       'getPhoneCalendar',
       'getPhoneSlots',
-      'createPhoneAppointment',
       'reschedulePhoneAppointment',
       'cancelPhoneAppointment',
+      'listCandidates',
+      'scheduleCandidatePhoneAppointment',
       'getMe',
     ]);
     // Whitespace is permitted around the dot: the page writes several of
@@ -227,11 +228,12 @@ describe('no direct network access', () => {
     // call from the scan fails here rather than weakening the allowlist.
     expect([...used].sort()).toEqual([
       'cancelPhoneAppointment',
-      'createPhoneAppointment',
       'getMe',
       'getPhoneCalendar',
       'getPhoneSlots',
+      'listCandidates',
       'reschedulePhoneAppointment',
+      'scheduleCandidatePhoneAppointment',
     ]);
     expect([...used].filter((name) => !allowed.has(name))).toEqual([]);
   });

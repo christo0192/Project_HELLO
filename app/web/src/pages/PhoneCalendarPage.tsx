@@ -49,7 +49,7 @@ import { api, ApiError } from '../api';
 import type {
   MeResponse,
   PhoneAppointmentCancelInput,
-  PhoneAppointmentCreateInput,
+  PhoneCandidateAppointmentCreateInput,
   PhoneAppointmentPatchInput,
   PhoneCalendarResponse,
 } from '../types';
@@ -259,11 +259,11 @@ export function PhoneCalendarPage() {
   );
 
   const handleCreate = useCallback(
-    (input: PhoneAppointmentCreateInput): Promise<boolean> =>
+    (candidateId: string, input: PhoneCandidateAppointmentCreateInput): Promise<boolean> =>
       runMutation(async () => {
-        const res = await api.createPhoneAppointment(input);
+        const res = await api.scheduleCandidatePhoneAppointment(candidateId, input);
         return res.prereqs_pending
-          ? 'Appointment booked, but this engagement’s prerequisites are not met, so nothing will dial at that time until they are.'
+          ? 'Appointment booked, but this cycle’s prerequisites are not met, so nothing will dial at that time until they are.'
           : 'Appointment booked.';
       }),
     [runMutation],

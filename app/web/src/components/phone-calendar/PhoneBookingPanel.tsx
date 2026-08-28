@@ -1,48 +1,24 @@
 /**
- * Book a new appointment. Admin only.
+ * Candidate-profile-first booking for the global phone calendar.
  *
- * ── WHY THE OPERATOR TYPES AN ENGAGEMENT ID ───────────────────────────
- * This is the one place the interface is less convenient than it looks like
- * it should be, and the reason is worth stating rather than papering over.
- *
- * The calendar read returns appointments. An engagement that has NO
- * appointment yet — exactly the engagement you would want to book — appears
- * in no read this API offers: there is no "engagements awaiting a call"
- * endpoint in the P6 contract. So a picker of bookable candidates cannot be
- * built from the data available, and building one from a different source
- * would mean showing a list this surface cannot verify.
- *
- * Rather than invent that list, the panel asks for the engagement id the
- * operator already has from the engagement view they came from. The id is
- * checked for shape here so an obvious typo is caught before a round trip,
- * but the substrate remains the authority on whether it names anything.
- *
- * ── SOURCE IS NOT A FIELD ─────────────────────────────────────────────
- * Every appointment booked here is `hr_manual` by definition, and the API's
- * create schema is strict: it has no `source` property and refuses a request
- * that sends one. So this panel does not offer it — the other two sources
- * describe events that did not happen here.
+ * The old form required an operator to paste an internal engagement UUID. That
+ * was both hard to discover and unsafe around initial-cycle creation. The
+ * bounded candidate picker below delegates candidate-to-cycle resolution to
+ * the API's atomic candidate booking operation; the global calendar remains
+ * an operations view, not a second scheduler.
  */
 
-import { useId, useState } from 'react';
-import type { PhoneAppointmentCreateInput, PhoneSlot } from '../../types';
+import { useEffect, useId, useState } from 'react';
+import { api, ApiError } from '../../api';
+import type { Candidate, PhoneCandidateAppointmentCreateInput, PhoneSlot } from '../../types';
 import { ConfirmButton } from '../mission-control/ConfirmButton';
 import { buttonClassNames } from '../mission-control/buttonStyles';
 import { formatIstLongDayLabel, formatIstTimeRange, type IstDate } from '../../lib/ist-datetime';
 import { PhoneSlotPicker } from './PhoneSlotPicker';
 
-/** Shape only. The substrate decides whether the id names a real engagement. */
-const UUID_PATTERN =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 export interface PhoneBookingPanelProps {
-  /**
-   * Performs the booking and RESOLVES WITH WHETHER IT SUCCEEDED. It must not
-   * reject: the page owns error reporting, and a rejecting handler would put
-   * an unhandled rejection through `ConfirmButton`'s catch. The boolean is
-   * what tells this panel whether it may throw the operator's input away.
-   */
-  onCreate: (input: PhoneAppointmentCreateInput) => Promise<boolean>;
+  /** Returns whether the candidate-scoped booking was accepted. */
+  onCreate: (candidateId: string, input: PhoneCandidateAppointmentCreateInput) => Promise<boolean>;
   today: IstDate;
 }
 
@@ -50,24 +26,29 @@ export function PhoneBookingPanel({ onCreate, today }: PhoneBookingPanelProps) {
   const rawId = useId();
   const idPrefix = `book-${rawId.replace(/:/g, '-')}`;
   const formId = `${idPrefix}-form`;
-  const engagementFieldId = `${idPrefix}-engagement`;
-  const engagementHintId = `${idPrefix}-engagement-hint`;
+  const candidateFieldId = `${idPrefix}-candidate`;
+  const candidateHintId = `${idPrefix}-candidate-hint`;
 
-  /**
-   * Collapsed until asked for. The slot picker fetches a day's grid the
-   * moment it mounts, so an always-open form would put a second request on
-   * every admin page load — for a form most visits never use. Opening it is
-   * an explicit intent, and that is when the fetch is warranted.
-   */
   const [open, setOpen] = useState(false);
-  const [engagementId, setEngagementId] = useState('');
+  const [candidates, setCandidates] = useState<Candidate[] | null>(null);
+  const [candidateError, setCandidateError] = useState<string | null>(null);
+  const [candidateId, setCandidateId] = useState('');
   const [slotDate, setSlotDate] = useState<IstDate>(today);
   const [slot, setSlot] = useState<PhoneSlot | null>(null);
 
-  const trimmed = engagementId.trim();
-  const idLooksValid = UUID_PATTERN.test(trimmed);
-  const showIdError = trimmed.length > 0 && !idLooksValid;
-  const ready = idLooksValid && slot !== null;
+  useEffect(() => {
+    if (!open || candidates !== null) return;
+    let live = true;
+    setCandidateError(null);
+    api
+      .listCandidates()
+      .then((rows) => { if (live) setCandidates(rows); })
+      .catch((error: ApiError) => { if (live) setCandidateError(error.message); });
+    return () => { live = false; };
+  }, [open, candidates]);
+
+  const selected = candidates?.find((candidate) => candidate.id === candidateId);
+  const ready = selected !== undefined && slot !== null;
 
   return (
     <section
@@ -76,13 +57,12 @@ export function PhoneBookingPanel({ onCreate, today }: PhoneBookingPanelProps) {
     >
       <h2 className="text-sm font-semibold text-ink">Book a phone screening</h2>
       <p className="mt-0.5 text-xs text-ink-secondary">
-        Books against an existing phone engagement. The engagement must already
-        exist — this does not create one.
+        Choose a candidate and an IST slot. The server resolves the active cycle atomically.
       </p>
 
       <button
         type="button"
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
         aria-controls={open ? formId : undefined}
         className={buttonClassNames('secondary', 'mt-3 min-h-[44px]')}
@@ -91,77 +71,74 @@ export function PhoneBookingPanel({ onCreate, today }: PhoneBookingPanelProps) {
       </button>
 
       {!open ? null : (
-      <div id={formId}>
-      <div className="mt-4">
-        <label
-          htmlFor={engagementFieldId}
-          className="block text-xs font-medium text-ink-secondary"
-        >
-          Engagement id
-        </label>
-        <input
-          id={engagementFieldId}
-          type="text"
-          inputMode="text"
-          autoComplete="off"
-          spellCheck={false}
-          value={engagementId}
-          onChange={(e) => setEngagementId(e.target.value)}
-          aria-describedby={engagementHintId}
-          aria-invalid={showIdError || undefined}
-          className="mt-1 w-full min-h-[44px] rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 sm:max-w-md"
-        />
-        <p id={engagementHintId} className="mt-1 text-xs text-ink-tertiary">
-          {showIdError
-            ? 'That is not a valid engagement id. Copy it from the engagement you want to book.'
-            : 'Copy the engagement id from the engagement you want to book.'}
-        </p>
-      </div>
+        <div id={formId}>
+          <div className="mt-4">
+            <label htmlFor={candidateFieldId} className="block text-xs font-medium text-ink-secondary">
+              Candidate
+            </label>
+            {candidateError ? (
+              <p id={candidateHintId} role="status" className="mt-1 text-sm text-error">
+                Candidate list unavailable. Close and reopen to retry.
+              </p>
+            ) : candidates === null ? (
+              <p id={candidateHintId} role="status" className="mt-1 text-sm text-ink-tertiary">Loading candidates…</p>
+            ) : candidates.length === 0 ? (
+              <p id={candidateHintId} role="status" className="mt-1 text-sm text-ink-secondary">No candidates are available.</p>
+            ) : (
+              <>
+                <select
+                  id={candidateFieldId}
+                  value={candidateId}
+                  onChange={(event) => { setCandidateId(event.target.value); setSlot(null); }}
+                  aria-describedby={candidateHintId}
+                  className="mt-1 min-h-[44px] w-full rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 sm:max-w-md"
+                >
+                  <option value="">Select a candidate</option>
+                  {candidates.map((candidate) => (
+                    <option key={candidate.id} value={candidate.id}>
+                      {candidate.name ?? 'Candidate'} · {candidate.status}
+                    </option>
+                  ))}
+                </select>
+                <p id={candidateHintId} className="mt-1 text-xs text-ink-tertiary">
+                  The candidate's current phone-screening cycle will be resolved by the server.
+                </p>
+              </>
+            )}
+          </div>
 
-      <div className="mt-4">
-        <PhoneSlotPicker
-          idPrefix={idPrefix}
-          date={slotDate}
-          onDateChange={setSlotDate}
-          value={slot?.starts_at ?? null}
-          onChange={setSlot}
-        />
-      </div>
+          <div className="mt-4">
+            <PhoneSlotPicker
+              idPrefix={idPrefix}
+              date={slotDate}
+              onDateChange={(date) => { setSlotDate(date); setSlot(null); }}
+              value={slot?.starts_at ?? null}
+              onChange={setSlot}
+              disabled={candidates === null || candidates.length === 0}
+            />
+          </div>
 
-      <ConfirmButton
-        className="mt-4"
-        label="Book"
-        disabled={!ready}
-        summary={
-          ready && slot
-            ? `Book a phone screening on ${formatIstLongDayLabel(
-                slotDate,
-              )}, ${formatIstTimeRange(
-                slot.starts_at,
-                slot.ends_at,
-              )}. Booking records the slot; it does not reserve dial capacity, which is applied when the call is placed.`
-            : 'Enter a valid engagement id and pick a slot first.'
-        }
-        onConfirm={async () => {
-          if (!slot || !idLooksValid) return;
-          const created = await onCreate({
-            engagement_id: trimmed,
-            starts_at: slot.starts_at,
-            ends_at: slot.ends_at,
-          });
-          // ONLY on success. Several refusals — a closed window, a slot that
-          // has just passed, a terminal engagement, a rate limit — leave this
-          // panel mounted with a message telling the operator to try again,
-          // and clearing here would have thrown away the engagement id they
-          // hand-copied and the slot they picked. The page's error handler
-          // never rethrows, so the resolved boolean is the only signal
-          // available.
-          if (!created) return;
-          setEngagementId('');
-          setSlot(null);
-        }}
-      />
-      </div>
+          <ConfirmButton
+            className="mt-4"
+            label="Book"
+            disabled={!ready}
+            summary={
+              ready && slot && selected
+                ? `Book ${selected.name ?? 'the candidate'} on ${formatIstLongDayLabel(slotDate)}, ${formatIstTimeRange(slot.starts_at, slot.ends_at)}. Booking records the slot; dial capacity is applied when the call is placed.`
+                : 'Select a candidate and a slot first.'
+            }
+            onConfirm={async () => {
+              if (!selected || !slot) return;
+              const created = await onCreate(selected.id, {
+                starts_at: slot.starts_at,
+                ends_at: slot.ends_at,
+              });
+              if (!created) return;
+              setCandidateId('');
+              setSlot(null);
+            }}
+          />
+        </div>
       )}
     </section>
   );
