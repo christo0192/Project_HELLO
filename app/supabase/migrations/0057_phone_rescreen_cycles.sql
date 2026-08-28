@@ -185,7 +185,6 @@ declare
   v_new_id uuid;
   v_cycle integer;
   v_verified_at timestamptz;
-  v_prereq jsonb;
 begin
   if p_source is null or p_source not in ('hr_manual','automation') then
     return jsonb_build_object('status', 'invalid_source');
@@ -298,11 +297,10 @@ begin
   -- Re-run the ordinary Ashby prerequisite evaluator immediately so a new
   -- cycle does not remain pending forever. It may leave the child pending
   -- with a stable reason, but it never creates an attempt or a queue job.
-  v_prereq := screening_v2.ensure_ashby_phone_engagement(v_link.id, p_now);
+  perform screening_v2.ensure_ashby_phone_engagement(v_link.id, p_now);
 
   return jsonb_build_object('status', 'ok', 'engagement_id', v_new_id,
-    'cycle_number', v_cycle, 'predecessor_engagement_id', v_prev.id,
-    'prereq_status', coalesce(v_prereq->>'status', 'unknown_status'));
+    'cycle_number', v_cycle, 'predecessor_engagement_id', v_prev.id);
 end;
 $$;
 revoke all on function screening_v2.request_phone_rescreen(uuid, text, text, text, uuid, timestamptz)
