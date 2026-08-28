@@ -7,13 +7,34 @@ import {
   manualPhoneCallBodySchema,
   phoneRescreenBodySchema,
   phoneVerificationBodySchema,
+  phoneCandidateAppointmentCreateSchema,
+  phoneCandidateAppointmentPatchSchema,
 } from '../schemas/candidates.js';
+import { phoneAppointmentCancelSchema } from '../schemas/phone-api.js';
+import { idParamSchema, uuidSchema } from '../schemas/common.js';
 import { requireRole } from '../lib/rbac.js';
 import { recordAudit } from '../lib/audit.js';
 import { redactCandidatePhone } from '../lib/candidate-phone.js';
 import { createLogger } from '../lib/logger.js';
 
 const candidateLogger = createLogger('candidates');
+
+/** Resolve visibility before any phone-cycle or appointment read. */
+async function candidateVisibleToRecruiter(
+  candidateId: string,
+  user: { id: string; appRole: 'admin' | 'interviewer' | 'viewer' } | undefined,
+): Promise<boolean> {
+  let query = supabase.from('candidates').select('id,owner_id').eq('id', candidateId);
+  if (user?.appRole === 'interviewer') query = query.eq('owner_id', user.id);
+  const { data, error } = await query.maybeSingle();
+  return !error && Boolean(data);
+}
+
+function rpcStatus(data: unknown): string {
+  return data && typeof data === 'object' && 'status' in data
+    ? String((data as { status?: unknown }).status)
+    : 'unknown_status';
+}
 
 export const candidatesRouter = Router();
 
@@ -306,6 +327,215 @@ candidatesRouter.post(
   },
 );
 
+// Candidate-profile appointment booking resolves the active cycle and slot in
+// one SQL transaction. There is no raw engagement-id input and no provider
+// operation; the normal due loop remains the only dial path.
+candidatesRouter.post(
+  '/:id/phone-appointments',
+  requireRole('interviewer'),
+  validateParams(candidateIdParamSchema),
+  validateBody(phoneCandidateAppointmentCreateSchema),
+  async (req, res) => {
+    if (process.env.PHONE_SCREENING_ENABLED !== 'true') {
+      res.status(503).json({ ok: false, error: 'phone_screening_disabled' });
+      return;
+    }
+    if (!(await candidateVisibleToRecruiter(req.params.id, req.authUser))) {
+      res.status(404).json({ ok: false, error: 'candidate_not_found' });
+      return;
+    }
+    const body = req.body as { starts_at: string; ends_at: string };
+    try {
+      const { data, error } = await supabase.rpc('schedule_candidate_phone_appointment', {
+        p_candidate_id: req.params.id,
+        p_starts_at: body.starts_at,
+        p_ends_at: body.ends_at,
+        p_actor_id: req.authUser?.id ?? null,
+        p_now: new Date().toISOString(),
+      });
+      if (error) {
+        res.status(503).json({ ok: false, error: 'phone_schedule_unavailable' });
+        return;
+      }
+      const status = rpcStatus(data);
+      if (status === 'ok' || status === 'ok_prereqs_pending') {
+        await recordAudit(req, 'resource.create', 201, {
+          metadata: { resource: 'phone_appointment', outcome: status },
+        });
+        const row = data as Record<string, unknown>;
+        res.status(201).json({
+          ok: true,
+          appointment_id: typeof row.appointment_id === 'string' ? row.appointment_id : null,
+          version: typeof row.version === 'number' ? row.version : null,
+          engagement_state: typeof row.engagement_state === 'string' ? row.engagement_state : null,
+          prereqs_pending: status === 'ok_prereqs_pending',
+          superseded_appointment_id: null,
+        });
+        return;
+      }
+      res.status(409).json({ ok: false, error: status === 'unknown_status' ? 'phone_rpc_unknown_status' : status });
+    } catch {
+      res.status(503).json({ ok: false, error: 'phone_schedule_unavailable' });
+    }
+  },
+);
+
+// Reschedule/cancel from a candidate profile. The appointment id is checked
+// against the candidate before the mutation, and the SQL RPC re-checks its
+// version under the engagement lock.
+candidatesRouter.patch(
+  '/:id/phone-appointments/:appointmentId',
+  requireRole('interviewer'),
+  validateParams(idParamSchema.extend({ appointmentId: uuidSchema })),
+  validateBody(phoneCandidateAppointmentPatchSchema.omit({ appointment_id: true })),
+  async (req, res) => {
+    if (process.env.PHONE_SCREENING_ENABLED !== 'true') {
+      res.status(503).json({ ok: false, error: 'phone_screening_disabled' });
+      return;
+    }
+    if (!(await candidateVisibleToRecruiter(req.params.id, req.authUser))) {
+      res.status(404).json({ ok: false, error: 'candidate_not_found' });
+      return;
+    }
+    try {
+      const { data: appointment, error: appointmentError } = await supabase
+        .from('phone_appointments')
+        .select('id,engagement_id,status,version')
+        .eq('id', req.params.appointmentId)
+        .maybeSingle();
+      if (appointmentError || !appointment) {
+        res.status(404).json({ ok: false, error: 'appointment_not_found' });
+        return;
+      }
+      const { data: engagement, error: engagementError } = await supabase
+        .from('phone_engagements')
+        .select('candidate_id')
+        .eq('id', appointment.engagement_id)
+        .maybeSingle();
+      if (engagementError || !engagement || engagement.candidate_id !== req.params.id) {
+        res.status(404).json({ ok: false, error: 'appointment_not_found' });
+        return;
+      }
+      const body = req.body as { starts_at: string; ends_at: string; version: number };
+      const { data, error } = await supabase.rpc('schedule_phone_appointment', {
+        p_engagement_id: appointment.engagement_id,
+        p_starts_at: body.starts_at,
+        p_ends_at: body.ends_at,
+        p_source: 'hr_manual',
+        p_actor_id: req.authUser?.id ?? null,
+        p_expected_version: body.version,
+        p_now: new Date().toISOString(),
+      });
+      if (error) {
+        res.status(503).json({ ok: false, error: 'phone_schedule_unavailable' });
+        return;
+      }
+      const status = rpcStatus(data);
+      const row = data as Record<string, unknown>;
+      if ((status === 'ok' || status === 'ok_prereqs_pending') && 'superseded_appointment_id' in row) {
+        if (row.superseded_appointment_id === null) {
+          // A concurrent cancel won between the read and the RPC. Undo the
+          // create that schedule_phone_appointment necessarily performed when
+          // it found no live row, then report the lost update.
+          if (typeof row.appointment_id === 'string' && typeof row.version === 'number') {
+            await supabase.rpc('cancel_phone_appointment', {
+              p_appointment_id: row.appointment_id,
+              p_reason: 'hr_cancelled',
+              p_actor_id: req.authUser?.id ?? null,
+              p_expected_version: row.version,
+              p_now: new Date().toISOString(),
+            });
+          }
+          res.status(409).json({ ok: false, error: 'version_conflict' });
+          return;
+        }
+        await recordAudit(req, 'resource.update', 200, {
+          metadata: { resource: 'phone_appointment', outcome: status },
+        });
+        res.json({
+          ok: true,
+          appointment_id: typeof row.appointment_id === 'string' ? row.appointment_id : null,
+          version: typeof row.version === 'number' ? row.version : null,
+          engagement_state: typeof row.engagement_state === 'string' ? row.engagement_state : null,
+          prereqs_pending: status === 'ok_prereqs_pending',
+          superseded_appointment_id: typeof row.superseded_appointment_id === 'string'
+            ? row.superseded_appointment_id : null,
+        });
+        return;
+      }
+      res.status(409).json({ ok: false, error: status === 'unknown_status' ? 'phone_rpc_unknown_status' : status });
+    } catch {
+      res.status(503).json({ ok: false, error: 'phone_schedule_unavailable' });
+    }
+  },
+);
+
+candidatesRouter.delete(
+  '/:id/phone-appointments/:appointmentId',
+  requireRole('interviewer'),
+  validateParams(idParamSchema.extend({ appointmentId: uuidSchema })),
+  validateBody(phoneAppointmentCancelSchema),
+  async (req, res) => {
+    if (process.env.PHONE_SCREENING_ENABLED !== 'true') {
+      res.status(503).json({ ok: false, error: 'phone_screening_disabled' });
+      return;
+    }
+    if (!(await candidateVisibleToRecruiter(req.params.id, req.authUser))) {
+      res.status(404).json({ ok: false, error: 'candidate_not_found' });
+      return;
+    }
+    try {
+      const { data: appointment, error: appointmentError } = await supabase
+        .from('phone_appointments')
+        .select('id,engagement_id,status')
+        .eq('id', req.params.appointmentId)
+        .maybeSingle();
+      if (appointmentError || !appointment) {
+        res.status(404).json({ ok: false, error: 'appointment_not_found' });
+        return;
+      }
+      const { data: engagement, error: engagementError } = await supabase
+        .from('phone_engagements')
+        .select('candidate_id')
+        .eq('id', appointment.engagement_id)
+        .maybeSingle();
+      if (engagementError || !engagement || engagement.candidate_id !== req.params.id) {
+        res.status(404).json({ ok: false, error: 'appointment_not_found' });
+        return;
+      }
+      const body = req.body as { reason: string; version: number };
+      const { data, error } = await supabase.rpc('cancel_phone_appointment', {
+        p_appointment_id: req.params.appointmentId,
+        p_reason: body.reason,
+        p_actor_id: req.authUser?.id ?? null,
+        p_expected_version: body.version,
+        p_now: new Date().toISOString(),
+      });
+      if (error) {
+        res.status(503).json({ ok: false, error: 'phone_schedule_unavailable' });
+        return;
+      }
+      const status = rpcStatus(data);
+      if (status === 'ok' || status === 'already_cancelled') {
+        await recordAudit(req, 'resource.delete', 200, {
+          metadata: { resource: 'phone_appointment', outcome: status },
+        });
+        const row = data as Record<string, unknown>;
+        res.json({
+          ok: true,
+          appointment_id: typeof row.appointment_id === 'string' ? row.appointment_id : req.params.appointmentId,
+          version: typeof row.version === 'number' ? row.version : null,
+          already_cancelled: status === 'already_cancelled',
+        });
+        return;
+      }
+      res.status(409).json({ ok: false, error: status === 'unknown_status' ? 'phone_rpc_unknown_status' : status });
+    } catch {
+      res.status(503).json({ ok: false, error: 'phone_schedule_unavailable' });
+    }
+  },
+);
+
 // Phone-cycle history is deliberately a separate, bounded projection. It is
 // candidate-owned rather than a generic phone-calendar read, so the interviewer
 // ownership check happens before any service-role phone query.
@@ -357,7 +587,7 @@ candidatesRouter.get(
           ? Promise.resolve({ data: [], error: null })
           : supabase
             .from('phone_appointments')
-            .select('engagement_id,starts_at,ends_at,status,source,version')
+            .select('id,engagement_id,starts_at,ends_at,status,source,version')
             .in('engagement_id', engagementIds)
             .in('status', ['scheduled', 'confirmed'])
             .order('starts_at', { ascending: true })
@@ -409,6 +639,7 @@ candidatesRouter.get(
           has_session: typeof row.session_id === 'string',
           has_assessment: typeof row.session_id === 'string' && scoredSessions.has(row.session_id),
           appointment: appointment ? {
+            appointment_id: typeof appointment.id === 'string' ? appointment.id : null,
             starts_at: typeof appointment.starts_at === 'string' ? appointment.starts_at : null,
             ends_at: typeof appointment.ends_at === 'string' ? appointment.ends_at : null,
             status: typeof appointment.status === 'string' ? appointment.status : null,

@@ -17,6 +17,18 @@ const mockApi = {
   getCandidate: vi.fn(),
   getMe: vi.fn(),
   getCandidatePhoneScreenings: vi.fn(),
+  getPhoneSlots: vi.fn(),
+  scheduleCandidatePhoneAppointment: vi.fn().mockResolvedValue({
+    ok: true, appointment_id: 'appointment-1', version: 1, engagement_state: 'scheduled',
+    prereqs_pending: false, superseded_appointment_id: null,
+  }),
+  rescheduleCandidatePhoneAppointment: vi.fn().mockResolvedValue({
+    ok: true, appointment_id: 'appointment-1', version: 2, engagement_state: 'scheduled',
+    prereqs_pending: false, superseded_appointment_id: 'appointment-0',
+  }),
+  cancelCandidatePhoneAppointment: vi.fn().mockResolvedValue({
+    ok: true, appointment_id: 'appointment-1', version: 2, already_cancelled: false,
+  }),
   requestPhoneRescreen: vi.fn().mockResolvedValue({ ok: true, status: 'ok', cycle_number: 2 }),
   verifyCandidatePhone: vi.fn().mockResolvedValue({ ok: true }),
   getRecordingDownloadUrl: vi.fn(),
@@ -40,6 +52,10 @@ vi.mock('../api', () => ({
     getCandidate: (...args: any[]) => mockApi.getCandidate(...args),
     getMe: (...args: any[]) => mockApi.getMe(...args),
     getCandidatePhoneScreenings: (...args: any[]) => mockApi.getCandidatePhoneScreenings(...args),
+    getPhoneSlots: (...args: any[]) => mockApi.getPhoneSlots(...args),
+    scheduleCandidatePhoneAppointment: (...args: any[]) => mockApi.scheduleCandidatePhoneAppointment(...args),
+    rescheduleCandidatePhoneAppointment: (...args: any[]) => mockApi.rescheduleCandidatePhoneAppointment(...args),
+    cancelCandidatePhoneAppointment: (...args: any[]) => mockApi.cancelCandidatePhoneAppointment(...args),
     requestPhoneRescreen: (...args: any[]) => mockApi.requestPhoneRescreen(...args),
     verifyCandidatePhone: (...args: any[]) => mockApi.verifyCandidatePhone(...args),
     getRecordingDownloadUrl: (...args: any[]) => mockApi.getRecordingDownloadUrl(...args),
@@ -111,6 +127,17 @@ describe('CandidateDetailPage', () => {
       enabled: true,
       cycles: [],
       current_cycle: null,
+    });
+    mockApi.getPhoneSlots.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      date: '2026-08-28',
+      window: { time_zone: 'Asia/Kolkata', open_ist: '09:00:00', close_ist: '21:00:00' },
+      slot_seconds: 1800,
+      max_concurrent: 10,
+      booked_total: 0,
+      occupancy_truncated: false,
+      slots: [],
     });
     mockApi.getSession.mockResolvedValue(mockSessionDetail);
   });
