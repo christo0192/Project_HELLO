@@ -1416,14 +1416,22 @@ async def _run_native_phone_screening(
         terminal_reason["reason"] = "completed"
         finished.set()
     else:
-        set_policy = getattr(agent, "set_turn_policy", None)
-        if callable(set_policy):
-            set_policy("opening")
-        speech = session.generate_reply(
-            instructions=phone_question_instructions(question),
-        )
-        if inspect.isawaitable(speech):
-            await speech
+        # The first post-consent question is server-owned fixed text, not a
+        # model decision. Sending it through generate_reply used the same Agent
+        # whose substantive policy requires a coordinator tool. A stale
+        # speech_created transition could switch that policy before the opening
+        # generation ran, causing Gemini to call advance_screening repeatedly
+        # without candidate evidence until LiveKit exhausted its function-step
+        # budget and closed the room. Speak the exact planned question through
+        # LiveKit's normal playout path instead: no tool is available, no LLM
+        # latency is paid, and conversation_item_added still supplies the
+        # assistant evidence/anchor used by the durable boundary.
+        speech = session.say(question.text, allow_interruptions=True)
+        wait = getattr(speech, "wait_for_playout", None)
+        if callable(wait):
+            value = wait()
+            if inspect.isawaitable(value):
+                await value
 
     try:
         # This bounds the whole leg, not one answer. Per-turn inactivity is
