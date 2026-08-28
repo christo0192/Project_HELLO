@@ -58,9 +58,9 @@ export const PHONE_RPC_NAMES = [
   'sweep_phone_day_rolled',
   'sweep_phone_stranded_sessions',
   'claim_phone_sweep',
-  // 0057 — governed immutable cycle operations.
+  // 0057 — governed immutable cycle operations. Number verification is
+  // deliberately outside this domain contract because its input is PII.
   'request_phone_rescreen',
-  'verify_candidate_phone',
 ] as const;
 
 export type PhoneRpcName = (typeof PHONE_RPC_NAMES)[number];
@@ -170,12 +170,6 @@ export const PHONE_RPC_PARAMETERS: Readonly<Record<PhoneRpcName, readonly string
       'p_actor_id',
       'p_now',
     ],
-    verify_candidate_phone: [
-      'p_candidate_id',
-      'p_phone_e164',
-      'p_actor_id',
-      'p_now',
-    ],
   });
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -278,14 +272,6 @@ export const REQUEST_PHONE_RESCREEN_STATUSES = [
 ] as const;
 export type RequestPhoneRescreenStatus = (typeof REQUEST_PHONE_RESCREEN_STATUSES)[number];
 
-/** `verify_candidate_phone` (0057) — writes only the verified dialable value. */
-export const VERIFY_CANDIDATE_PHONE_STATUSES = [
-  'ok',
-  'invalid_phone',
-  'candidate_not_found',
-  'actor_required',
-] as const;
-export type VerifyCandidatePhoneStatus = (typeof VERIFY_CANDIDATE_PHONE_STATUSES)[number];
 
 /**
  * `apply_phone_event`. Note there is no `ok`: the ledger answers `applied` or
@@ -549,7 +535,6 @@ export const PHONE_RPC_STATUSES: Readonly<Record<PhoneRpcName, readonly string[]
     sweep_phone_stranded_sessions: SWEEP_PHONE_STRANDED_SESSIONS_STATUSES,
     claim_phone_sweep: CLAIM_PHONE_SWEEP_STATUSES,
     request_phone_rescreen: REQUEST_PHONE_RESCREEN_STATUSES,
-    verify_candidate_phone: VERIFY_CANDIDATE_PHONE_STATUSES,
   });
 
 /**
@@ -585,7 +570,7 @@ export const PHONE_RPC_STATUS_UNION: readonly string[] = Object.freeze(
  * union, which is the whole reason the increment is smaller than the number
  * of RPCs added.
  */
-export const PHONE_RPC_STATUS_COUNT = 88;
+export const PHONE_RPC_STATUS_COUNT = 87;
 
 /**
  * RESULT KEYS the API's behaviour DEPENDS on, per RPC.

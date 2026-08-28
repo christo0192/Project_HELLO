@@ -215,6 +215,7 @@ function fakeStores(over: Partial<PhoneStores> = {}): WriteSpy {
       engagementState: 'scheduled',
       supersededAppointmentId: input.expectedVersion == null ? null : UUID_OTHER,
     }),
+    requestRescreen: async () => ({ status: 'ok' as const, cycleNumber: 2 }),
     cancelAppointment: async () => ({ status: 'ok', appointmentId: UUID_A, version: 4 }),
     expireAppointments: async () => ({ status: 'ok' }),
     setHalt: async () => ({ status: 'ok', alreadyHalted: false }),

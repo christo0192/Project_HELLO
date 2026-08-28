@@ -38,6 +38,7 @@ import {
   type PhoneBacklogStatus,
   type ReclaimPhoneAttemptLeasesStatus,
   type SchedulePhoneAppointmentStatus,
+  type RequestPhoneRescreenStatus,
   type SetPhoneHaltStatus,
   type AttachPhoneAttemptRecordingStatus,
   StampPhoneSessionEgressStatus,
@@ -65,6 +66,8 @@ import type {
   ReclaimPhoneAttemptLeasesResult,
   SchedulePhoneAppointmentInput,
   SchedulePhoneAppointmentResult,
+  RequestPhoneRescreenInput,
+  RequestPhoneRescreenResult,
   SetPhoneHaltResult,
   AttachPhoneAttemptRecordingInput,
   AttachPhoneAttemptRecordingResult,
@@ -502,6 +505,28 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
           row && 'superseded_appointment_id' in row
             ? (str(row, 'superseded_appointment_id') ?? null)
             : undefined,
+      };
+    },
+
+    async requestRescreen(
+      input: RequestPhoneRescreenInput,
+    ): Promise<RequestPhoneRescreenResult> {
+      const { data, error } = await client.rpc('request_phone_rescreen', {
+        p_candidate_id: input.candidateId,
+        p_reason: input.reason,
+        p_request_id: input.requestId,
+        p_source: input.source,
+        p_actor_id: input.actorId ?? null,
+        p_now: isoInstant(input.now),
+      });
+      if (error) throw new Error('phone_request_rescreen_error');
+      const row = asRow(data);
+      return {
+        status: narrowPhoneRpcStatus<RequestPhoneRescreenStatus>('request_phone_rescreen', row),
+        engagementId: str(row, 'engagement_id'),
+        cycleNumber: num(row, 'cycle_number'),
+        predecessorEngagementId: str(row, 'predecessor_engagement_id'),
+        requestId: str(row, 'request_id'),
       };
     },
 

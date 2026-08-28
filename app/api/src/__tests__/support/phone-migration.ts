@@ -200,9 +200,9 @@ export const RPC_NAMES = [
   'sweep_phone_day_rolled',
   'sweep_phone_stranded_sessions',
   'claim_phone_sweep',
-  // 0057 — explicit cycle and verified-number doors.
+  // 0057 — explicit cycle door. PII-bearing number verification is
+  // intentionally outside the phone-domain RPC contract.
   'request_phone_rescreen',
-  'verify_candidate_phone',
 ] as const;
 
 /**

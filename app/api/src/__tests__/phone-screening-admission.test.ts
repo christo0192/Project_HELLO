@@ -94,6 +94,7 @@ function fakeStores(admit: AdmitPhoneAttemptResult): FakeStores {
     listEngagementRecordings: unreachable,
     clearAttemptRecordings: unreachable,
     scheduleAppointment: unreachable,
+    requestRescreen: unreachable,
     cancelAppointment: unreachable,
     expireAppointments: unreachable,
     setHalt: unreachable,

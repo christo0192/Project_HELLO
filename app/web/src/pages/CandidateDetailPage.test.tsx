@@ -192,6 +192,42 @@ describe('CandidateDetailPage', () => {
     expect(await screen.findByRole('status')).toHaveTextContent(/Phone screening requested/);
   });
 
+  it('requests a governed new cycle from an eligible terminal cycle', async () => {
+    mockApi.getCandidatePhoneScreenings.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      current_cycle: 1,
+      cycles: [{
+        cycle_number: 1,
+        state: 'completed',
+        state_reason: null,
+        version: 2,
+        no_answer_attempts: 0,
+        no_answer_limit: 3,
+        reconnects_used: 0,
+        provider_failures: 0,
+        next_eligible_at: null,
+        last_attempt_at: null,
+        terminal_at: '2026-08-27T10:00:00Z',
+        created_at: '2026-08-27T09:00:00Z',
+        updated_at: '2026-08-27T10:00:00Z',
+        has_session: true,
+        has_assessment: true,
+        appointment: null,
+      }],
+    });
+    renderDetailPage();
+    await screen.findByRole('button', { name: 'Request re-screen' });
+    fireEvent.change(screen.getByRole('combobox', { name: 'Reason for new cycle' }), {
+      target: { value: 'technical_issue' },
+    });
+    await userEvent.click(screen.getByRole('button', { name: 'Request re-screen' }));
+    await waitFor(() => expect(mockApi.requestPhoneRescreen).toHaveBeenCalledWith(
+      'candidate-1',
+      expect.objectContaining({ request_id: expect.stringMatching(/^ui-/), reason: 'technical_issue' }),
+    ));
+  });
+
   it('renders the session summary in Overview', async () => {
     renderDetailPage();
     expect(await screen.findByText('Screening sessions')).toBeInTheDocument();
