@@ -313,6 +313,211 @@ paths:
               schema:
                 $ref: '#/components/schemas/SimpleError'
 
+  /api/candidates/{id}/phone-screenings:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [candidates, phone]
+      operationId: getCandidatePhoneScreenings
+      summary: Read bounded immutable phone-screening cycle history (interviewer+)
+      description: Returns sanitized cycle state and appointment summaries for an owned candidate. Terminal cycles remain historical and are never reopened. No phone number, provider identifier, transcript, recording key, lease, or consent secret is returned.
+      responses:
+        '200':
+          description: Cycle history, or an empty projection while phone screening is disabled.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok, enabled, cycles, current_cycle]
+                properties:
+                  ok:
+                    type: boolean
+                    enum: [true]
+                  enabled:
+                    type: boolean
+                  current_cycle:
+                    type: integer
+                    nullable: true
+                  cycles:
+                    type: array
+                    maxItems: 10
+                    items:
+                      type: object
+                      additionalProperties: false
+                      required: [cycle_number, state, state_reason, version, no_answer_attempts, no_answer_limit, reconnects_used, provider_failures, next_eligible_at, last_attempt_at, terminal_at, created_at, updated_at, has_session, has_assessment, appointment]
+                      properties:
+                        cycle_number: { type: integer, nullable: true }
+                        state: { type: string }
+                        state_reason: { type: string, nullable: true }
+                        version: { type: integer, nullable: true }
+                        no_answer_attempts: { type: integer, nullable: true }
+                        no_answer_limit: { type: integer, nullable: true }
+                        reconnects_used: { type: integer, nullable: true }
+                        provider_failures: { type: integer, nullable: true }
+                        next_eligible_at: { type: string, nullable: true }
+                        last_attempt_at: { type: string, nullable: true }
+                        terminal_at: { type: string, nullable: true }
+                        created_at: { type: string, nullable: true }
+                        updated_at: { type: string, nullable: true }
+                        has_session: { type: boolean }
+                        has_assessment: { type: boolean }
+                        appointment:
+                          type: object
+                          nullable: true
+                          additionalProperties: false
+                          required: [starts_at, ends_at, status, source, version]
+                          properties:
+                            starts_at: { type: string, nullable: true }
+                            ends_at: { type: string, nullable: true }
+                            status: { type: string, nullable: true }
+                            source: { type: string, nullable: true }
+                            version: { type: integer, nullable: true }
+        '404':
+          description: Candidate unknown, not owned by the caller, or malformed id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '503':
+          description: Phone projection unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+
+  /api/candidates/{id}/phone-rescreens:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [candidates, phone]
+      operationId: requestPhoneRescreen
+      summary: Request a governed new phone screening cycle (interviewer+)
+      description: Creates one append-only cycle from an eligible terminal cycle. The request is idempotent by request_id and does not dial; the normal phone admission pipeline remains the only dial path.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [request_id, reason]
+              properties:
+                request_id:
+                  type: string
+                  pattern: '^[A-Za-z0-9_.:-]{1,128}$'
+                reason:
+                  type: string
+                  enum: [candidate_requested, incomplete_screening, technical_issue, role_changed, quality_review]
+      responses:
+        '202':
+          description: New cycle created or the same request replayed.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok, status, cycle_number]
+                properties:
+                  ok: { type: boolean, enum: [true] }
+                  status: { type: string, enum: [ok, already_requested] }
+                  cycle_number: { type: integer, nullable: true }
+        '400':
+          description: Request shape validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Candidate unknown, not owned by the caller, or malformed id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '409':
+          description: State, consent, verification, limit, or idempotency policy refused the request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '503':
+          description: Phone screening is disabled or unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+
+  /api/candidates/{id}/phone-number-verification:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [candidates, phone]
+      operationId: verifyCandidatePhone
+      summary: Verify a replacement Indian phone number (admin only)
+      description: Stores only the dialable candidate value and a digest-backed verification event. The number is never returned, logged, or included in audit metadata.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [phone_e164]
+              properties:
+                phone_e164:
+                  type: string
+                  pattern: '^\\+91[6-9][0-9]{9}$'
+      responses:
+        '200':
+          description: Number verified.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok]
+                properties:
+                  ok: { type: boolean, enum: [true] }
+        '400':
+          description: Number shape validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Candidate not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '409':
+          description: Verification policy refused the request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '503':
+          description: Phone screening is disabled or unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+
   /api/candidates/{id}/ashby-workflow:
     parameters:
       - name: id

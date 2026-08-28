@@ -15,6 +15,10 @@ import { mockCandidateDetail, mockSessionDetail } from '../test/helpers';
 
 const mockApi = {
   getCandidate: vi.fn(),
+  getMe: vi.fn(),
+  getCandidatePhoneScreenings: vi.fn(),
+  requestPhoneRescreen: vi.fn().mockResolvedValue({ ok: true, status: 'ok', cycle_number: 2 }),
+  verifyCandidatePhone: vi.fn().mockResolvedValue({ ok: true }),
   getRecordingDownloadUrl: vi.fn(),
   getSession: vi.fn(),
   listNotes: vi.fn().mockResolvedValue({ notes: [] }),
@@ -34,6 +38,10 @@ const mockApi = {
 vi.mock('../api', () => ({
   api: {
     getCandidate: (...args: any[]) => mockApi.getCandidate(...args),
+    getMe: (...args: any[]) => mockApi.getMe(...args),
+    getCandidatePhoneScreenings: (...args: any[]) => mockApi.getCandidatePhoneScreenings(...args),
+    requestPhoneRescreen: (...args: any[]) => mockApi.requestPhoneRescreen(...args),
+    verifyCandidatePhone: (...args: any[]) => mockApi.verifyCandidatePhone(...args),
     getRecordingDownloadUrl: (...args: any[]) => mockApi.getRecordingDownloadUrl(...args),
     getSession: (...args: any[]) => mockApi.getSession(...args),
     listNotes: (...args: any[]) => mockApi.listNotes(...args),
@@ -97,6 +105,13 @@ describe('CandidateDetailPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockApi.getCandidate.mockResolvedValue(mockCandidateDetail);
+    mockApi.getMe.mockResolvedValue({ userId: 'u-admin', email: null, role: 'admin', active: true });
+    mockApi.getCandidatePhoneScreenings.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      cycles: [],
+      current_cycle: null,
+    });
     mockApi.getSession.mockResolvedValue(mockSessionDetail);
   });
 
@@ -168,6 +183,7 @@ describe('CandidateDetailPage', () => {
   it('requires confirmation before requesting a phone screening', async () => {
     renderDetailPage();
     await screen.findByText('Jane Doe');
+    await screen.findByRole('button', { name: 'Call candidate' });
     expect(mockApi.requestCandidatePhoneCall).not.toHaveBeenCalled();
     await userEvent.click(screen.getByRole('button', { name: 'Call candidate' }));
     expect(screen.getByRole('dialog', { name: 'Confirm phone screening' })).toBeInTheDocument();

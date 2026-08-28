@@ -136,6 +136,8 @@ export {
   type FinalizePhoneAttemptRecordingStatus,
   type ListPhoneEngagementRecordingsStatus,
   type ClearPhoneAttemptRecordingsStatus,
+  type RequestPhoneRescreenStatus,
+  type VerifyCandidatePhoneStatus,
 } from './rpc-contract.js';
 
 export type {
