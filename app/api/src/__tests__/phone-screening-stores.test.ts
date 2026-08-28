@@ -232,6 +232,25 @@ describe('the adapters call the RPCs by name, with the declared keys', () => {
       p_now: NOW.toISOString(),
     });
 
+    const rr = fakeClient({
+      status: 'already_requested', engagement_id: 'e2', cycle_number: 2,
+      predecessor_engagement_id: 'e1', request_id: 'request-1',
+    });
+    expect(await createPhoneStores(rr.client).requestRescreen({
+      candidateId: 'c1', reason: 'technical_issue', requestId: 'request-1',
+      source: 'hr_manual', actorId: 'actor-1', now: NOW,
+    })).toEqual({
+      status: 'already_requested', engagementId: 'e2', cycleNumber: 2,
+      predecessorEngagementId: 'e1', requestId: 'request-1',
+    });
+    expect(rr.calls[0]).toEqual({
+      name: 'request_phone_rescreen',
+      args: {
+        p_candidate_id: 'c1', p_reason: 'technical_issue', p_request_id: 'request-1',
+        p_source: 'hr_manual', p_actor_id: 'actor-1', p_now: NOW.toISOString(),
+      },
+    });
+
     const cx = fakeClient({ status: 'already_cancelled', appointment_id: 'ap1', version: 2 });
     expect(await createPhoneStores(cx.client).cancelAppointment({
       appointmentId: 'ap1', reason: 'hr_cancelled', now: NOW,
@@ -366,6 +385,8 @@ describe('errors and malformed answers', () => {
       ['phone_apply_event_error', () => stores.applyEvent({ source: 'internal', eventType: 'x.y', now: NOW })],
       ['phone_schedule_appointment_error', () => stores.scheduleAppointment({
         engagementId: 'e', startsAt: NOW, endsAt: NOW, source: 'hr_manual', now: NOW })],
+      ['phone_request_rescreen_error', () => stores.requestRescreen({
+        candidateId: 'c', reason: 'technical_issue', requestId: 'r', source: 'hr_manual', now: NOW })],
       ['phone_cancel_appointment_error', () => stores.cancelAppointment({
         appointmentId: 'ap', reason: 'hr_cancelled', now: NOW })],
       ['phone_expire_appointments_error', () => stores.expireAppointments({ now: NOW })],

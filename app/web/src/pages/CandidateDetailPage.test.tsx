@@ -15,6 +15,10 @@ import { mockCandidateDetail, mockSessionDetail } from '../test/helpers';
 
 const mockApi = {
   getCandidate: vi.fn(),
+  getMe: vi.fn(),
+  getCandidatePhoneScreenings: vi.fn(),
+  requestPhoneRescreen: vi.fn().mockResolvedValue({ ok: true, status: 'ok', cycle_number: 2 }),
+  verifyCandidatePhone: vi.fn().mockResolvedValue({ ok: true }),
   getRecordingDownloadUrl: vi.fn(),
   getSession: vi.fn(),
   listNotes: vi.fn().mockResolvedValue({ notes: [] }),
@@ -34,6 +38,10 @@ const mockApi = {
 vi.mock('../api', () => ({
   api: {
     getCandidate: (...args: any[]) => mockApi.getCandidate(...args),
+    getMe: (...args: any[]) => mockApi.getMe(...args),
+    getCandidatePhoneScreenings: (...args: any[]) => mockApi.getCandidatePhoneScreenings(...args),
+    requestPhoneRescreen: (...args: any[]) => mockApi.requestPhoneRescreen(...args),
+    verifyCandidatePhone: (...args: any[]) => mockApi.verifyCandidatePhone(...args),
     getRecordingDownloadUrl: (...args: any[]) => mockApi.getRecordingDownloadUrl(...args),
     getSession: (...args: any[]) => mockApi.getSession(...args),
     listNotes: (...args: any[]) => mockApi.listNotes(...args),
@@ -97,6 +105,13 @@ describe('CandidateDetailPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockApi.getCandidate.mockResolvedValue(mockCandidateDetail);
+    mockApi.getMe.mockResolvedValue({ userId: 'u-admin', email: null, role: 'admin', active: true });
+    mockApi.getCandidatePhoneScreenings.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      cycles: [],
+      current_cycle: null,
+    });
     mockApi.getSession.mockResolvedValue(mockSessionDetail);
   });
 
@@ -168,12 +183,49 @@ describe('CandidateDetailPage', () => {
   it('requires confirmation before requesting a phone screening', async () => {
     renderDetailPage();
     await screen.findByText('Jane Doe');
+    await screen.findByRole('button', { name: 'Call candidate' });
     expect(mockApi.requestCandidatePhoneCall).not.toHaveBeenCalled();
     await userEvent.click(screen.getByRole('button', { name: 'Call candidate' }));
     expect(screen.getByRole('dialog', { name: 'Confirm phone screening' })).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Confirm call' }));
     await waitFor(() => expect(mockApi.requestCandidatePhoneCall).toHaveBeenCalledWith('candidate-1'));
     expect(await screen.findByRole('status')).toHaveTextContent(/Phone screening requested/);
+  });
+
+  it('requests a governed new cycle from an eligible terminal cycle', async () => {
+    mockApi.getCandidatePhoneScreenings.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      current_cycle: 1,
+      cycles: [{
+        cycle_number: 1,
+        state: 'completed',
+        state_reason: null,
+        version: 2,
+        no_answer_attempts: 0,
+        no_answer_limit: 3,
+        reconnects_used: 0,
+        provider_failures: 0,
+        next_eligible_at: null,
+        last_attempt_at: null,
+        terminal_at: '2026-08-27T10:00:00Z',
+        created_at: '2026-08-27T09:00:00Z',
+        updated_at: '2026-08-27T10:00:00Z',
+        has_session: true,
+        has_assessment: true,
+        appointment: null,
+      }],
+    });
+    renderDetailPage();
+    await screen.findByRole('button', { name: 'Request re-screen' });
+    fireEvent.change(screen.getByRole('combobox', { name: 'Reason for new cycle' }), {
+      target: { value: 'technical_issue' },
+    });
+    await userEvent.click(screen.getByRole('button', { name: 'Request re-screen' }));
+    await waitFor(() => expect(mockApi.requestPhoneRescreen).toHaveBeenCalledWith(
+      'candidate-1',
+      expect.objectContaining({ request_id: expect.stringMatching(/^ui-/), reason: 'technical_issue' }),
+    ));
   });
 
   it('renders the session summary in Overview', async () => {

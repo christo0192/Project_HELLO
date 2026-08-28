@@ -72,6 +72,12 @@ export const MIGRATION_0052_PATH = fileURLToPath(
 
 export const MIGRATION_0052 = readFileSync(MIGRATION_0052_PATH, 'utf8');
 
+export const MIGRATION_0057_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0057_phone_rescreen_cycles.sql', import.meta.url),
+);
+
+export const MIGRATION_0057 = readFileSync(MIGRATION_0057_PATH, 'utf8');
+
 /**
  * Every phone migration, NEWEST FIRST. Extraction walks this in order and the
  * first file that declares a thing wins, which is what "the latest declaration
@@ -79,6 +85,7 @@ export const MIGRATION_0052 = readFileSync(MIGRATION_0052_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    { name: '0057', sql: MIGRATION_0057 },
     // NOTE (residual, pre-existing): 0046–0050 are not registered here, so
     // declarations they carry (e.g. 0050's re-definition of
     // attach_phone_attempt_recording) are invisible to the extractor and the
@@ -193,6 +200,9 @@ export const RPC_NAMES = [
   'sweep_phone_day_rolled',
   'sweep_phone_stranded_sessions',
   'claim_phone_sweep',
+  // 0057 — explicit cycle door. PII-bearing number verification is
+  // intentionally outside the phone-domain RPC contract.
+  'request_phone_rescreen',
 ] as const;
 
 /**
@@ -241,7 +251,7 @@ export function functionParameters(name: string): string[] {
   const close = body.indexOf(')\nreturns');
   if (open === -1 || close === -1) throw new Error(`phone signature unreadable: ${name}`);
   const params = body.slice(open + 1, close);
-  return [...params.matchAll(/(?:^|,)\s*(p_[a-z_]+)\s/g)].map((m) => m[1]);
+  return [...params.matchAll(/(?:^|,)\s*(p_[a-z0-9_]+)\s/g)].map((m) => m[1]);
 }
 
 /**

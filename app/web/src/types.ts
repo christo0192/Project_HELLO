@@ -983,3 +983,63 @@ export interface PhoneCancelResponse {
   /** Idempotent success, not a conflict: a retry after a dropped response. */
   already_cancelled: boolean;
 }
+
+export type PhoneRescreenReason =
+  | 'candidate_requested'
+  | 'incomplete_screening'
+  | 'technical_issue'
+  | 'role_changed'
+  | 'quality_review';
+
+export interface PhoneScreeningCycleAppointment {
+  starts_at: string | null;
+  ends_at: string | null;
+  status: string | null;
+  source: string | null;
+  version: number | null;
+}
+
+export interface PhoneScreeningCycle {
+  cycle_number: number | null;
+  state: PhoneEngagementState | 'unknown';
+  state_reason: string | null;
+  version: number | null;
+  no_answer_attempts: number | null;
+  no_answer_limit: number | null;
+  reconnects_used: number | null;
+  provider_failures: number | null;
+  next_eligible_at: string | null;
+  last_attempt_at: string | null;
+  terminal_at: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  has_session: boolean;
+  has_assessment: boolean;
+  appointment: PhoneScreeningCycleAppointment | null;
+}
+
+export interface PhoneScreeningsResponse {
+  ok: boolean;
+  enabled: boolean;
+  cycles: PhoneScreeningCycle[];
+  current_cycle: number | null;
+}
+
+export interface PhoneRescreenResponse {
+  ok: boolean;
+  status: 'ok' | 'already_requested';
+  cycle_number: number | null;
+}
+
+export interface PhoneRescreenInput {
+  request_id: string;
+  reason: PhoneRescreenReason;
+}
+
+export interface PhoneVerificationInput {
+  phone_e164: string;
+}
+
+export interface PhoneVerificationResponse {
+  ok: boolean;
+}

@@ -5,6 +5,8 @@ import {
   listCandidatesQuerySchema,
   candidateIdParamSchema,
   manualPhoneCallBodySchema,
+  phoneRescreenBodySchema,
+  phoneVerificationBodySchema,
 } from '../schemas/candidates.js';
 import { requireRole } from '../lib/rbac.js';
 import { recordAudit } from '../lib/audit.js';
@@ -300,6 +302,236 @@ candidatesRouter.post(
       res.status(202).json({ ok: true, status: status === 'already_requested' ? 'already_requested' : 'requested' });
     } catch {
       res.status(503).json({ ok: false, error: 'phone_request_unavailable' });
+    }
+  },
+);
+
+// Phone-cycle history is deliberately a separate, bounded projection. It is
+// candidate-owned rather than a generic phone-calendar read, so the interviewer
+// ownership check happens before any service-role phone query.
+candidatesRouter.get(
+  '/:id/phone-cycles',
+  requireRole('interviewer'),
+  validateParams(candidateIdParamSchema),
+  async (req, res) => {
+    if (process.env.PHONE_SCREENING_ENABLED !== 'true') {
+      res.json({ ok: true, enabled: false, cycles: [], current_cycle: null });
+      return;
+    }
+
+    let candidateQuery = supabase
+      .from('candidates')
+      .select('id,owner_id')
+      .eq('id', req.params.id);
+    if (req.authUser?.appRole === 'interviewer') {
+      candidateQuery = candidateQuery.eq('owner_id', req.authUser.id);
+    }
+    const { data: candidate, error: candidateError } = await candidateQuery.maybeSingle();
+    if (candidateError || !candidate) {
+      res.status(404).json({ ok: false, error: 'candidate_not_found' });
+      return;
+    }
+
+    try {
+      const { data: rows, error } = await supabase
+        .from('phone_engagements')
+        .select('id,cycle_number,state,state_reason,version,no_answer_attempts,no_answer_limit,reconnects_used,provider_failures,next_eligible_at,last_attempt_at,terminal_at,created_at,updated_at,session_id')
+        .eq('candidate_id', req.params.id)
+        .order('cycle_number', { ascending: false })
+        .limit(10);
+      if (error) {
+        res.status(503).json({ ok: false, error: 'phone_read_error' });
+        return;
+      }
+
+      const engagements = (rows ?? []) as Array<Record<string, unknown>>;
+      const engagementIds = engagements
+        .map((row) => typeof row.id === 'string' ? row.id : null)
+        .filter((id): id is string => id !== null);
+      const sessionIds = engagements
+        .map((row) => typeof row.session_id === 'string' ? row.session_id : null)
+        .filter((id): id is string => id !== null);
+
+      const [appointmentsResult, assessmentsResult] = await Promise.all([
+        engagementIds.length === 0
+          ? Promise.resolve({ data: [], error: null })
+          : supabase
+            .from('phone_appointments')
+            .select('engagement_id,starts_at,ends_at,status,source,version')
+            .in('engagement_id', engagementIds)
+            .in('status', ['scheduled', 'confirmed'])
+            .order('starts_at', { ascending: true })
+            .limit(10),
+        sessionIds.length === 0
+          ? Promise.resolve({ data: [], error: null })
+          : supabase
+            .from('assessments')
+            .select('session_id')
+            .in('session_id', sessionIds)
+            .eq('source', 'phone')
+            .limit(10),
+      ]);
+      if (appointmentsResult.error || assessmentsResult.error) {
+        res.status(503).json({ ok: false, error: 'phone_read_error' });
+        return;
+      }
+
+      const appointments = (appointmentsResult.data ?? []) as Array<Record<string, unknown>>;
+      const appointmentByEngagement = new Map<string, Record<string, unknown>>();
+      for (const appointment of appointments) {
+        if (typeof appointment.engagement_id === 'string') {
+          appointmentByEngagement.set(appointment.engagement_id, appointment);
+        }
+      }
+      const scoredSessions = new Set(
+        ((assessmentsResult.data ?? []) as Array<Record<string, unknown>>)
+          .map((row) => typeof row.session_id === 'string' ? row.session_id : null)
+          .filter((id): id is string => id !== null),
+      );
+
+      const cycles = engagements.map((row) => {
+        const id = typeof row.id === 'string' ? row.id : '';
+        const appointment = appointmentByEngagement.get(id);
+        return {
+          cycle_number: typeof row.cycle_number === 'number' ? row.cycle_number : null,
+          state: typeof row.state === 'string' ? row.state : 'unknown',
+          state_reason: typeof row.state_reason === 'string' ? row.state_reason : null,
+          version: typeof row.version === 'number' ? row.version : null,
+          no_answer_attempts: typeof row.no_answer_attempts === 'number' ? row.no_answer_attempts : null,
+          no_answer_limit: typeof row.no_answer_limit === 'number' ? row.no_answer_limit : null,
+          reconnects_used: typeof row.reconnects_used === 'number' ? row.reconnects_used : null,
+          provider_failures: typeof row.provider_failures === 'number' ? row.provider_failures : null,
+          next_eligible_at: typeof row.next_eligible_at === 'string' ? row.next_eligible_at : null,
+          last_attempt_at: typeof row.last_attempt_at === 'string' ? row.last_attempt_at : null,
+          terminal_at: typeof row.terminal_at === 'string' ? row.terminal_at : null,
+          created_at: typeof row.created_at === 'string' ? row.created_at : null,
+          updated_at: typeof row.updated_at === 'string' ? row.updated_at : null,
+          has_session: typeof row.session_id === 'string',
+          has_assessment: typeof row.session_id === 'string' && scoredSessions.has(row.session_id),
+          appointment: appointment ? {
+            starts_at: typeof appointment.starts_at === 'string' ? appointment.starts_at : null,
+            ends_at: typeof appointment.ends_at === 'string' ? appointment.ends_at : null,
+            status: typeof appointment.status === 'string' ? appointment.status : null,
+            source: typeof appointment.source === 'string' ? appointment.source : null,
+            version: typeof appointment.version === 'number' ? appointment.version : null,
+          } : null,
+        };
+      });
+      const current = cycles.find((cycle) => cycle.terminal_at === null) ?? cycles[0] ?? null;
+      await recordAudit(req, 'resource.read', 200, {
+        metadata: { resource: 'phone_screening_cycles', cycle_count: cycles.length },
+      });
+      res.json({ ok: true, enabled: true, cycles, current_cycle: current?.cycle_number ?? null });
+    } catch {
+      res.status(503).json({ ok: false, error: 'phone_read_error' });
+    }
+  },
+);
+
+// Request a new immutable phone cycle. The browser supplies only a bounded
+// reason and idempotency key; the database resolves the application link and
+// enforces the terminal-state, consent, cooldown and cycle-limit policy.
+candidatesRouter.post(
+  '/:id/phone-rescreens',
+  requireRole('interviewer'),
+  validateParams(candidateIdParamSchema),
+  validateBody(phoneRescreenBodySchema),
+  async (req, res) => {
+    if (process.env.PHONE_SCREENING_ENABLED !== 'true') {
+      res.status(503).json({ ok: false, error: 'phone_screening_disabled' });
+      return;
+    }
+    let candidateQuery = supabase
+      .from('candidates')
+      .select('id,owner_id')
+      .eq('id', req.params.id);
+    if (req.authUser?.appRole === 'interviewer') {
+      candidateQuery = candidateQuery.eq('owner_id', req.authUser.id);
+    }
+    const { data: candidate, error: candidateError } = await candidateQuery.maybeSingle();
+    if (candidateError || !candidate) {
+      res.status(404).json({ ok: false, error: 'candidate_not_found' });
+      return;
+    }
+
+    const body = req.body as { request_id: string; reason: string };
+    try {
+      const { data, error } = await supabase.rpc('request_phone_rescreen', {
+        p_candidate_id: req.params.id,
+        p_reason: body.reason,
+        p_request_id: body.request_id,
+        p_source: 'hr_manual',
+        p_actor_id: req.authUser?.id ?? null,
+        p_now: new Date().toISOString(),
+      });
+      if (error) {
+        res.status(503).json({ ok: false, error: 'phone_rescreen_unavailable' });
+        return;
+      }
+      const status = data && typeof data === 'object' && 'status' in data
+        ? String((data as { status?: unknown }).status)
+        : 'unknown_status';
+      if (status === 'ok' || status === 'already_requested') {
+        await recordAudit(req, 'resource.create', 202, {
+          metadata: { resource: 'phone_rescreen', outcome: status },
+        });
+        res.status(202).json({
+          ok: true,
+          status,
+          cycle_number: typeof (data as { cycle_number?: unknown })?.cycle_number === 'number'
+            ? (data as { cycle_number: number }).cycle_number : null,
+        });
+        return;
+      }
+      await recordAudit(req, 'resource.create', 409, {
+        metadata: { resource: 'phone_rescreen', outcome: status },
+      });
+      res.status(409).json({ ok: false, error: 'phone_rescreen_refused', status });
+    } catch {
+      res.status(503).json({ ok: false, error: 'phone_rescreen_unavailable' });
+    }
+  },
+);
+
+// A wrong-number cycle may be resumed only after an administrator verifies a
+// replacement number. The value is sent to the SQL boundary and never echoed,
+// logged or placed in an audit payload.
+candidatesRouter.post(
+  '/:id/phone-number-verification',
+  requireRole('admin'),
+  validateParams(candidateIdParamSchema),
+  validateBody(phoneVerificationBodySchema),
+  async (req, res) => {
+    if (process.env.PHONE_SCREENING_ENABLED !== 'true') {
+      res.status(503).json({ ok: false, error: 'phone_screening_disabled' });
+      return;
+    }
+    const body = req.body as { phone_e164: string };
+    try {
+      const { data, error } = await supabase.rpc('verify_candidate_phone', {
+        p_candidate_id: req.params.id,
+        p_phone_e164: body.phone_e164,
+        p_actor_id: req.authUser?.id ?? null,
+        p_now: new Date().toISOString(),
+      });
+      if (error) {
+        res.status(503).json({ ok: false, error: 'phone_verification_unavailable' });
+        return;
+      }
+      const status = data && typeof data === 'object' && 'status' in data
+        ? String((data as { status?: unknown }).status)
+        : 'unknown_status';
+      if (status === 'ok') {
+        res.json({ ok: true });
+        return;
+      }
+      res.status(status === 'candidate_not_found' ? 404 : 409).json({
+        ok: false,
+        error: 'phone_verification_refused',
+        status,
+      });
+    } catch {
+      res.status(503).json({ ok: false, error: 'phone_verification_unavailable' });
     }
   },
 );

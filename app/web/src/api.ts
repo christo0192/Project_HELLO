@@ -71,6 +71,11 @@ import type {
   PhoneAppointmentWriteResponse,
   PhoneCalendarResponse,
   PhoneCancelResponse,
+  PhoneRescreenInput,
+  PhoneRescreenResponse,
+  PhoneScreeningsResponse,
+  PhoneVerificationInput,
+  PhoneVerificationResponse,
   PhoneSlotsResponse,
   SessionDetail,
   StartLiveKitResult,
@@ -174,6 +179,18 @@ export const api = {
     request<{ ok: true; status: 'requested' | 'already_requested' }>(
       `/api/candidates/${id}/phone-call`,
       { method: 'POST', body: JSON.stringify({ confirm: true }) },
+    ),
+  getCandidatePhoneScreenings: (id: string) =>
+    request<PhoneScreeningsResponse>(`/api/candidates/${encodeURIComponent(id)}/phone-cycles`),
+  requestPhoneRescreen: (id: string, body: PhoneRescreenInput) =>
+    request<PhoneRescreenResponse>(`/api/candidates/${encodeURIComponent(id)}/phone-rescreens`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  verifyCandidatePhone: (id: string, body: PhoneVerificationInput) =>
+    request<PhoneVerificationResponse>(
+      `/api/candidates/${encodeURIComponent(id)}/phone-number-verification`,
+      { method: 'POST', body: JSON.stringify(body) },
     ),
   getCandidatesSummary: () =>
     request<CandidatesSummary>('/api/candidates/summary'),

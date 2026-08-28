@@ -198,7 +198,7 @@ describe('outcome map — the exact ordinals', () => {
 
   it('the ordinals are the migration\'s, read from apply_phone_event', () => {
     const body = functionBody('apply_phone_event');
-    expect(body).toContain('if v_eng.no_answer_attempts + 1 >= 3 then');
+    expect(body).toContain('if v_eng.no_answer_attempts + 1 >= v_eng.no_answer_limit then');
     expect(body).toContain('if v_eng.provider_failures + 1 >= 5 then');
     expect(body).toContain('if v_eng.reconnects_used >= 3 then');
   });

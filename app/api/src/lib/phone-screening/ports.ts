@@ -31,6 +31,7 @@ import type {
   CommitPhoneQuestionBoundaryStatus,
   GetPhoneAssessmentStateStatus,
   StartPhoneAssessmentStatus,
+  RequestPhoneRescreenStatus,
   PHONE_RPC_UNKNOWN_STATUS,
 } from './rpc-contract.js';
 import type {
@@ -217,6 +218,24 @@ export interface SchedulePhoneAppointmentResult {
   readonly version?: number;
   readonly engagementState?: PhoneEngagementState;
   readonly supersededAppointmentId?: string | null;
+}
+
+/** Explicit cycle creation. No phone value crosses this seam. */
+export interface RequestPhoneRescreenInput {
+  readonly candidateId: string;
+  readonly reason: string;
+  readonly requestId: string;
+  readonly source: 'hr_manual' | 'automation';
+  readonly actorId?: string | null;
+  readonly now: Date;
+}
+
+export interface RequestPhoneRescreenResult {
+  readonly status: OrUnknown<RequestPhoneRescreenStatus>;
+  readonly engagementId?: string;
+  readonly cycleNumber?: number;
+  readonly predecessorEngagementId?: string;
+  readonly requestId?: string;
 }
 
 export interface CancelPhoneAppointmentInput {
@@ -519,6 +538,7 @@ export interface PhoneStores {
   scheduleAppointment(
     input: SchedulePhoneAppointmentInput,
   ): Promise<SchedulePhoneAppointmentResult>;
+  requestRescreen(input: RequestPhoneRescreenInput): Promise<RequestPhoneRescreenResult>;
   cancelAppointment(input: CancelPhoneAppointmentInput): Promise<CancelPhoneAppointmentResult>;
   expireAppointments(input: {
     graceSeconds?: number;

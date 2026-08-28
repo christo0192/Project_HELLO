@@ -66,3 +66,32 @@ export const manualPhoneCallBodySchema = z
   .strict();
 
 export type ManualPhoneCallBodyInput = z.infer<typeof manualPhoneCallBodySchema>;
+
+/** Closed, auditable reasons for starting a new immutable phone cycle. */
+export const PHONE_RESCREEN_REASONS = [
+  'candidate_requested',
+  'incomplete_screening',
+  'technical_issue',
+  'role_changed',
+  'quality_review',
+] as const;
+
+export const phoneRescreenBodySchema = z
+  .object({
+    request_id: z
+      .string()
+      .regex(/^[A-Za-z0-9_.:-]{1,128}$/, 'request_id must be a bounded idempotency key'),
+    reason: z.enum(PHONE_RESCREEN_REASONS),
+  })
+  .strict();
+
+export type PhoneRescreenBodyInput = z.infer<typeof phoneRescreenBodySchema>;
+
+/** Admin-only number reverification input. The value is never echoed or audited. */
+export const phoneVerificationBodySchema = z
+  .object({
+    phone_e164: z.string().regex(/^\\+91[6-9][0-9]{9}$/, 'phone_e164 must be an Indian mobile'),
+  })
+  .strict();
+
+export type PhoneVerificationBodyInput = z.infer<typeof phoneVerificationBodySchema>;

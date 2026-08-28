@@ -58,6 +58,9 @@ export const PHONE_RPC_NAMES = [
   'sweep_phone_day_rolled',
   'sweep_phone_stranded_sessions',
   'claim_phone_sweep',
+  // 0057 — governed immutable cycle operations. Number verification is
+  // deliberately outside this domain contract because its input is PII.
+  'request_phone_rescreen',
 ] as const;
 
 export type PhoneRpcName = (typeof PHONE_RPC_NAMES)[number];
@@ -159,6 +162,14 @@ export const PHONE_RPC_PARAMETERS: Readonly<Record<PhoneRpcName, readonly string
       'p_ttl_seconds',
       'p_now',
     ],
+    request_phone_rescreen: [
+      'p_candidate_id',
+      'p_reason',
+      'p_request_id',
+      'p_source',
+      'p_actor_id',
+      'p_now',
+    ],
   });
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -237,6 +248,30 @@ export const RECLAIM_PHONE_ATTEMPT_LEASES_STATUSES = ['ok'] as const;
 
 export type ReclaimPhoneAttemptLeasesStatus =
   (typeof RECLAIM_PHONE_ATTEMPT_LEASES_STATUSES)[number];
+
+/** `request_phone_rescreen` (0057) — explicit, bounded cycle intent. */
+export const REQUEST_PHONE_RESCREEN_STATUSES = [
+  'ok',
+  'already_requested',
+  'active_cycle',
+  'application_not_found',
+  'application_not_live',
+  'candidate_not_found',
+  'consent_expired',
+  'consent_not_granted',
+  'cycle_limit_reached',
+  'engagement_not_found',
+  'idempotency_conflict',
+  'invalid_reason',
+  'invalid_request_id',
+  'invalid_source',
+  'not_eligible',
+  'opted_out',
+  'wrong_number_unverified',
+  'actor_required',
+] as const;
+export type RequestPhoneRescreenStatus = (typeof REQUEST_PHONE_RESCREEN_STATUSES)[number];
+
 
 /**
  * `apply_phone_event`. Note there is no `ok`: the ledger answers `applied` or
@@ -499,6 +534,7 @@ export const PHONE_RPC_STATUSES: Readonly<Record<PhoneRpcName, readonly string[]
     sweep_phone_day_rolled: SWEEP_PHONE_DAY_ROLLED_STATUSES,
     sweep_phone_stranded_sessions: SWEEP_PHONE_STRANDED_SESSIONS_STATUSES,
     claim_phone_sweep: CLAIM_PHONE_SWEEP_STATUSES,
+    request_phone_rescreen: REQUEST_PHONE_RESCREEN_STATUSES,
   });
 
 /**
@@ -534,7 +570,7 @@ export const PHONE_RPC_STATUS_UNION: readonly string[] = Object.freeze(
  * union, which is the whole reason the increment is smaller than the number
  * of RPCs added.
  */
-export const PHONE_RPC_STATUS_COUNT = 76;
+export const PHONE_RPC_STATUS_COUNT = 87;
 
 /**
  * RESULT KEYS the API's behaviour DEPENDS on, per RPC.
@@ -600,6 +636,7 @@ export const PHONE_RPC_RESULT_KEYS: Readonly<Record<string, readonly string[]>> 
     'plan_complete',
     'expected_key',
   ],
+  request_phone_rescreen: ['engagement_id', 'cycle_number', 'predecessor_engagement_id', 'request_id'],
 });
 
 /**

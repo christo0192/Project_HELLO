@@ -1,7 +1,15 @@
 import { useCallback, useEffect, useId, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api, ApiError } from "../api";
-import type { AppealRow, CandidateDetail, Note } from "../types";
+import type {
+  AppealRow,
+  CandidateDetail,
+  MeResponse,
+  Note,
+  PhoneRescreenReason,
+  PhoneScreeningCycle,
+  PhoneScreeningsResponse,
+} from "../types";
 import { LiveCallPanel } from "../components/LiveCallPanel";
 import { LiveKitCallCard } from "../components/LiveKitCallCard";
 import { StatusBadge } from "../components/design";
@@ -53,15 +61,27 @@ import { formatDateTime } from "../lib/datetime";
 export function CandidateDetailPage() {
   const { id } = useParams<{ id: string }>();
   const [detail, setDetail] = useState<CandidateDetail | null>(null);
+  const [me, setMe] = useState<MeResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(() => {
     if (!id) return;
     setError(null);
     setDetail(null);
-    api
-      .getCandidate(id)
-      .then((d) => setDetail(d))
+    setMe(null);
+    // Older embedded candidate surfaces may provide only the candidate
+    // endpoint in their test/host adapter. Treat that missing optional role
+    // lookup as viewer-safe; the production API always supplies it and the
+    // phone-cycle endpoint remains server-authorized.
+    const fallbackMe: MeResponse = { userId: "", email: null, role: "viewer", active: false };
+    const meRequest = Promise.resolve()
+      .then(() => typeof api.getMe === "function" ? api.getMe() : fallbackMe)
+      .catch(() => fallbackMe);
+    Promise.all([api.getCandidate(id), meRequest])
+      .then(([d, currentMe]) => {
+        setDetail(d);
+        setMe(currentMe);
+      })
       .catch((e: ApiError) => setError(e.message));
   }, [id]);
 
@@ -73,7 +93,7 @@ export function CandidateDetailPage() {
         <CandidateErrorState message={error} onRetry={load} />
       </CandidateShell>
     );
-  if (!detail)
+  if (!detail || !me)
     return (
       <CandidateShell variant="inset">
         <CandidateLoadingState label="Loading candidate…" />
@@ -116,7 +136,11 @@ export function CandidateDetailPage() {
               id: "overview",
               label: "Overview",
               panel: (
-                <OverviewTab candidate={candidate} sessions={sessions} />
+                <OverviewTab
+                  candidate={candidate}
+                  sessions={sessions}
+                  phoneRole={me.role}
+                />
               ),
             },
             {
@@ -142,9 +166,11 @@ export function CandidateDetailPage() {
 function OverviewTab({
   candidate,
   sessions,
+  phoneRole,
 }: {
   candidate: CandidateDetail["candidate"];
   sessions: CandidateDetail["sessions"];
+  phoneRole: MeResponse["role"];
 }) {
   return (
     <div className="grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-3">
@@ -161,7 +187,11 @@ function OverviewTab({
           candidateName={candidate.name}
         />
 
-        <ManualPhoneCallCard candidateId={candidate.id} />
+        {phoneRole !== "viewer" && (
+          <>
+            <PhoneCycleCard candidateId={candidate.id} admin={phoneRole === "admin"} />
+          </>
+        )}
 
         <LiveCallPanel
           candidateId={candidate.id}
@@ -181,68 +211,205 @@ function OverviewTab({
   );
 }
 
-function ManualPhoneCallCard({ candidateId }: { candidateId: string }) {
+function cycleLabel(cycle: PhoneScreeningCycle): string {
+  return cycle.cycle_number == null ? "Screening cycle" : `Screening cycle ${cycle.cycle_number}`;
+}
+
+const RESCREEN_REASONS: Array<{ value: PhoneRescreenReason; label: string }> = [
+  { value: "candidate_requested", label: "Candidate requested another screen" },
+  { value: "incomplete_screening", label: "Screening was incomplete" },
+  { value: "technical_issue", label: "Technical issue" },
+  { value: "role_changed", label: "Role changed" },
+  { value: "quality_review", label: "Quality review" },
+];
+
+function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: boolean }) {
   const headingId = useId();
+  const [data, setData] = useState<PhoneScreeningsResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [reason, setReason] = useState<PhoneRescreenReason>("candidate_requested");
   const [confirming, setConfirming] = useState(false);
   const [requesting, setRequesting] = useState(false);
+  const [verifying, setVerifying] = useState(false);
+  const [phone, setPhone] = useState("");
   const [message, setMessage] = useState<string | null>(null);
-  const [failure, setFailure] = useState<string | null>(null);
 
-  async function requestCall() {
+  const load = useCallback(() => {
+    setError(null);
+    api
+      .getCandidatePhoneScreenings(candidateId)
+      .then(setData)
+      .catch((e: ApiError) => {
+        // A disabled phone deployment is a truthful empty state, while a
+        // transient projection failure remains visibly retryable.
+        setError(e.message);
+      });
+  }, [candidateId]);
+
+  useEffect(load, [load]);
+
+  const current = data?.cycles.find((cycle) => cycle.cycle_number === data.current_cycle)
+    ?? data?.cycles[0]
+    ?? null;
+  const canRescreen = current != null
+    && current.terminal_at != null
+    && ["completed", "failed", "abandoned_no_answer", "cancelled", "wrong_number"].includes(current.state);
+  const requiresVerification = current?.state === "wrong_number";
+
+  async function requestInitialCall() {
     setRequesting(true);
     setMessage(null);
-    setFailure(null);
     try {
       const result = await api.requestCandidatePhoneCall(candidateId);
       setConfirming(false);
       setMessage(result.status === "already_requested"
         ? "A phone screening is already queued or in progress."
         : "Phone screening requested. It will run only when all call gates permit it.");
-    } catch (error) {
-      setFailure(error instanceof ApiError ? error.message : "Phone screening could not be requested.");
+      load();
+    } catch (e) {
+      setMessage(e instanceof ApiError ? e.message : "The phone screening could not be requested.");
     } finally {
       setRequesting(false);
     }
   }
 
+  async function requestRescreen() {
+    setRequesting(true);
+    setMessage(null);
+    try {
+      const requestId = `ui-${crypto.randomUUID()}`;
+      const result = await api.requestPhoneRescreen(candidateId, { request_id: requestId, reason });
+      setMessage(result.status === "already_requested"
+        ? "That re-screen request was already accepted."
+        : `Re-screen cycle ${result.cycle_number ?? ""} requested. It will run only when all call gates permit it.`);
+      load();
+    } catch (e) {
+      setMessage(e instanceof ApiError ? e.message : "The re-screen request could not be created.");
+    } finally {
+      setRequesting(false);
+    }
+  }
+
+  async function verifyNumber() {
+    setVerifying(true);
+    setMessage(null);
+    try {
+      await api.verifyCandidatePhone(candidateId, { phone_e164: phone.trim() });
+      setPhone("");
+      setMessage("Replacement number verified. Request a re-screen when ready.");
+      load();
+    } catch (e) {
+      setMessage(e instanceof ApiError ? e.message : "The number could not be verified.");
+    } finally {
+      setVerifying(false);
+    }
+  }
+
   return (
     <SurfaceCard as="section" labelledBy={headingId} className="p-4 sm:p-5">
-      <h2 id={headingId} className="text-sm font-semibold text-ink">Phone screening</h2>
-      <p className="mt-1 max-w-prose text-sm text-ink-secondary">
-        Request a gated phone screen. The recruiter-confirmed action does not bypass eligibility,
-        quiet hours, suppression, budget, halt, or concurrency controls.
-      </p>
-      <CandidateButton
-        className="mt-3"
-        variant="primary"
-        onClick={() => { setFailure(null); setMessage(null); setConfirming(true); }}
-        disabled={requesting}
-      >
-        Call candidate
-      </CandidateButton>
-      {message && <p role="status" className="mt-2 text-sm text-ink-secondary">{message}</p>}
-      {failure && <p role="alert" className="mt-2 text-sm text-ink-secondary">{failure}</p>}
-      {confirming && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby={`${headingId}-confirm`}
-          className="mt-4 rounded-lg border border-[var(--c-border)] bg-[var(--c-surface-muted)] p-4"
-        >
-          <h3 id={`${headingId}-confirm`} className="text-sm font-semibold text-ink">Confirm phone screening</h3>
-          <p className="mt-1 text-sm text-ink-secondary">
-            Request one phone screening for this candidate? The system will call only if every safety gate passes.
-          </p>
-          <div className="mt-3 flex flex-wrap gap-2">
-            <CandidateButton variant="primary" onClick={() => void requestCall()} loading={requesting}>
-              Confirm call
-            </CandidateButton>
-            <CandidateButton variant="secondary" onClick={() => setConfirming(false)} disabled={requesting}>
-              Cancel
-            </CandidateButton>
-          </div>
+      <h2 id={headingId} className="text-sm font-semibold text-ink">Phone screening cycles</h2>
+      {error ? (
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          <p role="alert" className="text-sm text-ink-secondary">Phone cycle history unavailable.</p>
+          <CandidateButton variant="secondary" onClick={load}>Retry</CandidateButton>
         </div>
+      ) : data === null ? (
+        <p className="mt-2 text-sm text-ink-tertiary">Loading cycle history…</p>
+      ) : !data.enabled ? (
+        <p className="mt-2 text-sm text-ink-secondary">Phone screening is turned off.</p>
+      ) : data.cycles.length === 0 ? (
+        <>
+          <p className="mt-2 text-sm text-ink-secondary">No phone screening cycle has been created.</p>
+          <CandidateButton className="mt-3" variant="primary" onClick={() => { setMessage(null); setConfirming(true); }} disabled={requesting}>
+            Call candidate
+          </CandidateButton>
+          {confirming && (
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby={`${headingId}-confirm`}
+              className="mt-4 rounded-lg border border-[var(--c-border)] bg-[var(--c-surface-muted)] p-4"
+            >
+              <h3 id={`${headingId}-confirm`} className="text-sm font-semibold text-ink">Confirm phone screening</h3>
+              <p className="mt-1 text-sm text-ink-secondary">
+                Request one phone screening for this candidate? The system will call only if every safety gate passes.
+              </p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <CandidateButton variant="primary" onClick={() => void requestInitialCall()} loading={requesting}>
+                  Confirm call
+                </CandidateButton>
+                <CandidateButton variant="secondary" onClick={() => setConfirming(false)} disabled={requesting}>
+                  Cancel
+                </CandidateButton>
+              </div>
+            </div>
+          )}
+        </>
+      ) : (
+        <>
+          <ul className="mt-3 divide-y divide-line" aria-label="Phone screening cycle history">
+            {data.cycles.map((cycle) => (
+              <li key={`${cycle.cycle_number}-${cycle.created_at}`} className="py-2 text-sm">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="font-medium text-ink">{cycleLabel(cycle)}</span>
+                  <StatusBadge tone={cycle.terminal_at ? "neutral" : "info"}>{cycle.state}</StatusBadge>
+                </div>
+                <p className="mt-1 text-xs text-ink-tertiary">
+                  {cycle.has_assessment ? "Assessment recorded" : cycle.has_session ? "Session recorded" : "No session yet"}
+                  {cycle.appointment ? ` · ${cycle.appointment.status ?? "appointment"}` : ""}
+                </p>
+              </li>
+            ))}
+          </ul>
+
+          {current?.state === "opted_out" ? (
+            <p className="mt-3 text-sm text-warning">
+              Re-screening is unavailable because the candidate opted out. Renewed consent requires separate governance.
+            </p>
+          ) : canRescreen && requiresVerification && !admin ? (
+            <p className="mt-3 text-sm text-warning">An administrator must verify a replacement number before this cycle can be re-screened.</p>
+          ) : canRescreen && requiresVerification && admin ? (
+            <div className="mt-4 rounded-lg border border-line bg-surface-muted p-3">
+              <label htmlFor={`${headingId}-phone`} className="block text-xs font-medium text-ink-secondary">
+                Verify replacement Indian mobile
+              </label>
+              <div className="mt-2 flex flex-wrap gap-2">
+                <CandidateInput
+                  id={`${headingId}-phone`}
+                  value={phone}
+                  onChange={(event) => setPhone(event.target.value)}
+                  placeholder="+91…"
+                  inputMode="tel"
+                  autoComplete="off"
+                />
+                <CandidateButton variant="secondary" onClick={() => void verifyNumber()} loading={verifying} disabled={!phone.trim()}>
+                  Verify number
+                </CandidateButton>
+              </div>
+            </div>
+          ) : canRescreen ? (
+            <div className="mt-4 rounded-lg border border-line bg-surface-muted p-3">
+              <label htmlFor={`${headingId}-reason`} className="block text-xs font-medium text-ink-secondary">
+                Reason for new cycle
+              </label>
+              <CandidateSelect
+                id={`${headingId}-reason`}
+                value={reason}
+                onChange={(event) => setReason(event.target.value as PhoneRescreenReason)}
+                className="mt-2 block w-full"
+              >
+                {RESCREEN_REASONS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+              </CandidateSelect>
+              <CandidateButton className="mt-3" variant="primary" onClick={() => void requestRescreen()} loading={requesting}>
+                Request re-screen
+              </CandidateButton>
+            </div>
+          ) : current?.terminal_at ? (
+            <p className="mt-3 text-sm text-ink-secondary">This cycle is terminal; no new cycle can be started from its current state.</p>
+          ) : null}
+        </>
       )}
+      {message && <p role="status" className="mt-3 text-sm text-ink-secondary">{message}</p>}
     </SurfaceCard>
   );
 }
