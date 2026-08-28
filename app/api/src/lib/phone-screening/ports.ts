@@ -66,6 +66,7 @@ export interface AdmitPhoneAttemptInput {
 
 export interface AdmitPhoneAttemptResult {
   readonly status: OrUnknown<AdmitPhoneAttemptStatus>;
+
   /** Present only on `ok`. Returning `ok` means live work exists. */
   readonly attemptId?: string;
   readonly attemptSeq?: number;
@@ -532,8 +533,33 @@ export interface ConsentAndStartPhoneAssessmentResult {
  * the append-only ledger — live entirely inside the RPCs, so a seam that could
  * insert a row directly would be a seam that can bypass all of them.
  */
+export interface AdmitPhoneTestAttemptInput extends AdmitPhoneAttemptInput {
+  readonly testGateId: string;
+}
+
+export interface ArmPhoneTestGateInput {
+  readonly candidateId: string;
+  readonly engagementId: string;
+  readonly actorId: string;
+  readonly requestId: string;
+  readonly expiresAt: Date;
+  readonly now: Date;
+}
+
+export interface ArmPhoneTestGateResult {
+  readonly status: string;
+  readonly gateId?: string;
+  readonly candidateId?: string;
+  readonly engagementId?: string;
+  readonly expiresAt?: string;
+}
+
 export interface PhoneStores {
   admitAttempt(input: AdmitPhoneAttemptInput): Promise<AdmitPhoneAttemptResult>;
+  /** 0063. Optional for legacy fakes; required when a test gate is supplied. */
+  admitTestAttempt?(input: AdmitPhoneTestAttemptInput): Promise<AdmitPhoneAttemptResult>;
+  /** 0063. Arms one globally exclusive candidate test gate. */
+  armTestGate?(input: ArmPhoneTestGateInput): Promise<ArmPhoneTestGateResult>;
   heartbeatAttempt(input: HeartbeatPhoneAttemptInput): Promise<HeartbeatPhoneAttemptResult>;
 
   /** 0045. The epoch-fenced renewal; see `HeartbeatPhoneAttemptByEpochInput`. */

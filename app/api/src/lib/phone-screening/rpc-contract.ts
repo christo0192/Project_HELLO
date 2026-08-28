@@ -64,6 +64,9 @@ export const PHONE_RPC_NAMES = [
   // 0060 — max-one candidate-specific same-objective probe.
   'record_phone_probe',
   'consent_and_start_phone_assessment',
+  // 0063 — exclusive candidate-scoped production test gate.
+  'arm_phone_test_gate',
+  'admit_phone_test_attempt',
 ] as const;
 
 export type PhoneRpcName = (typeof PHONE_RPC_NAMES)[number];
@@ -182,6 +185,12 @@ export const PHONE_RPC_PARAMETERS: Readonly<Record<PhoneRpcName, readonly string
     ],
     consent_and_start_phone_assessment: [
       'p_attempt_id', 'p_session_id', 'p_epoch', 'p_now',
+    ],
+    arm_phone_test_gate: [
+      'p_candidate_id', 'p_engagement_id', 'p_actor_id', 'p_request_id', 'p_expires_at', 'p_now',
+    ],
+    admit_phone_test_attempt: [
+      'p_test_gate_id', 'p_engagement_id', 'p_kind', 'p_lease_owner', 'p_lease_seconds', 'p_now',
     ],
   });
 
@@ -531,6 +540,18 @@ export type RecordPhoneProbeStatus = (typeof RECORD_PHONE_PROBE_STATUSES)[number
 export const CONSENT_AND_START_PHONE_ASSESSMENT_STATUSES = ['ok', 'invalid_input', 'consent_start_failed'] as const;
 export type ConsentAndStartPhoneAssessmentStatus = (typeof CONSENT_AND_START_PHONE_ASSESSMENT_STATUSES)[number];
 
+export const ARM_PHONE_TEST_GATE_STATUSES = [
+  'ok', 'already_armed', 'actor_required', 'invalid_request_id', 'invalid_expiry',
+  'halt_unreadable', 'test_gate_requires_halt', 'test_gate_halt_not_permitted',
+  'candidate_mismatch', 'application_not_found',
+  'engagement_not_found', 'test_gate_not_eligible', 'test_gate_already_armed',
+  'idempotency_conflict',
+] as const;
+export type ArmPhoneTestGateStatus = (typeof ARM_PHONE_TEST_GATE_STATUSES)[number];
+
+export const ADMIT_PHONE_TEST_ATTEMPT_STATUSES = ['ok', 'halted'] as const;
+export type AdmitPhoneTestAttemptStatus = (typeof ADMIT_PHONE_TEST_ATTEMPT_STATUSES)[number];
+
 /** The per-RPC vocabularies, keyed by RPC name. */
 export const PHONE_RPC_STATUSES: Readonly<Record<PhoneRpcName, readonly string[]>> =
   Object.freeze({
@@ -559,6 +580,8 @@ export const PHONE_RPC_STATUSES: Readonly<Record<PhoneRpcName, readonly string[]
     request_phone_rescreen: REQUEST_PHONE_RESCREEN_STATUSES,
     record_phone_probe: RECORD_PHONE_PROBE_STATUSES,
     consent_and_start_phone_assessment: CONSENT_AND_START_PHONE_ASSESSMENT_STATUSES,
+    arm_phone_test_gate: ARM_PHONE_TEST_GATE_STATUSES,
+    admit_phone_test_attempt: ADMIT_PHONE_TEST_ATTEMPT_STATUSES,
   });
 
 /**
@@ -594,7 +617,7 @@ export const PHONE_RPC_STATUS_UNION: readonly string[] = Object.freeze(
  * union, which is the whole reason the increment is smaller than the number
  * of RPCs added.
  */
-export const PHONE_RPC_STATUS_COUNT = 91;
+export const PHONE_RPC_STATUS_COUNT = 98;
 
 /**
  * RESULT KEYS the API's behaviour DEPENDS on, per RPC.
@@ -661,6 +684,7 @@ export const PHONE_RPC_RESULT_KEYS: Readonly<Record<string, readonly string[]>> 
     'expected_key',
   ],
   request_phone_rescreen: ['engagement_id', 'cycle_number', 'predecessor_engagement_id', 'request_id'],
+  arm_phone_test_gate: ['gate_id', 'candidate_id', 'engagement_id', 'expires_at'],
 });
 
 /**

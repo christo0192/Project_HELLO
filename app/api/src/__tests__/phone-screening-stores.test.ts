@@ -380,6 +380,11 @@ describe('errors and malformed answers', () => {
     const stores = createPhoneStores(fakeClient(null, raw).client);
     const attempts: Array<[string, () => Promise<unknown>]> = [
       ['phone_admit_attempt_error', () => stores.admitAttempt({ engagementId: 'e', kind: 'initial', now: NOW })],
+      ['phone_admit_test_attempt_error', () => stores.admitTestAttempt!({
+        testGateId: 'g', engagementId: 'e', kind: 'initial', now: NOW })],
+      ['phone_arm_test_gate_error', () => stores.armTestGate!({
+        candidateId: 'c', engagementId: 'e', actorId: 'a', requestId: 'r',
+        expiresAt: new Date(NOW.getTime() + 60000), now: NOW })],
       ['phone_heartbeat_attempt_error', () => stores.heartbeatAttempt({ attemptId: 'a', leaseToken: 't', now: NOW })],
       ['phone_reclaim_leases_error', () => stores.reclaimAttemptLeases({ now: NOW })],
       ['phone_apply_event_error', () => stores.applyEvent({ source: 'internal', eventType: 'x.y', now: NOW })],

@@ -141,6 +141,8 @@ export interface PhoneAdmissionDeps {
   readonly stores: PhoneStores;
   readonly config: PhoneScreeningConfig;
   readonly consentReader: ConsentReader;
+  /** 0063. Substitute only the final DB admission door, never the local gates. */
+  readonly admitAttempt?: PhoneStores['admitAttempt'];
 }
 
 /**
@@ -156,6 +158,7 @@ export async function admitPhoneEngagement(
   request: PhoneAdmissionRequest,
 ): Promise<PhoneAdmissionResult> {
   const { config, stores, consentReader } = deps;
+  const admitAttempt = deps.admitAttempt ?? stores.admitAttempt;
 
   if (!config.screeningEnabled) {
     return { decision: 'deferred', code: 'screening_disabled', charged: false };
@@ -208,7 +211,7 @@ export async function admitPhoneEngagement(
   // `no_local_objection` authorises NOTHING. The only thing that can grant a
   // dial is the call below.
 
-  const result = await stores.admitAttempt({
+  const result = await admitAttempt({
     engagementId: request.engagementId,
     kind: request.kind,
     leaseOwner: request.leaseOwner ?? null,

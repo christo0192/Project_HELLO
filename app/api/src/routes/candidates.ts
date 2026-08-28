@@ -6,6 +6,7 @@ import {
   candidateIdParamSchema,
   manualPhoneCallBodySchema,
   phoneRescreenBodySchema,
+  phoneTestGateBodySchema,
   phoneVerificationBodySchema,
   phoneCandidateAppointmentCreateSchema,
   phoneCandidateAppointmentPatchSchema,
@@ -720,6 +721,84 @@ candidatesRouter.post(
       res.status(409).json({ ok: false, error: 'phone_rescreen_refused', status });
     } catch {
       res.status(503).json({ ok: false, error: 'phone_rescreen_unavailable' });
+    }
+  },
+);
+
+// Arm a single candidate-scoped production test while the global operator
+// pause remains raised. The RPC creates the immutable rescreen intent first,
+// then arms an exclusive ten-minute gate; admission consumes it atomically.
+candidatesRouter.post(
+  '/:id/phone-test-gate',
+  requireRole('admin'),
+  validateParams(candidateIdParamSchema),
+  validateBody(phoneTestGateBodySchema),
+  async (req, res) => {
+    if (process.env.PHONE_SCREENING_ENABLED !== 'true') {
+      res.status(503).json({ ok: false, error: 'phone_screening_disabled' });
+      return;
+    }
+    const candidateId = req.params.id;
+    const actorId = req.authUser?.id;
+    if (!actorId) {
+      res.status(403).json({ ok: false, error: 'admin_identity_required' });
+      return;
+    }
+    const { request_id: requestId } = req.body as { request_id: string };
+    const now = new Date();
+    try {
+      const { data: rescreen, error: rescreenError } = await supabase.rpc('request_phone_rescreen', {
+        p_candidate_id: candidateId,
+        p_reason: 'technical_issue',
+        p_request_id: requestId,
+        p_source: 'hr_manual',
+        p_actor_id: actorId,
+        p_now: now.toISOString(),
+      });
+      if (rescreenError) {
+        res.status(503).json({ ok: false, error: 'phone_test_gate_unavailable' });
+        return;
+      }
+      const rescreenStatus = rpcStatus(rescreen);
+      if (rescreenStatus !== 'ok' && rescreenStatus !== 'already_requested') {
+        res.status(409).json({ ok: false, error: 'phone_rescreen_refused', status: rescreenStatus });
+        return;
+      }
+      const engagementId = rescreen && typeof rescreen === 'object' && 'engagement_id' in rescreen
+        ? (rescreen as { engagement_id?: unknown }).engagement_id : undefined;
+      if (typeof engagementId !== 'string') {
+        res.status(503).json({ ok: false, error: 'phone_test_gate_unavailable' });
+        return;
+      }
+      const expiresAt = new Date(now.getTime() + 10 * 60 * 1000);
+      const { data: gate, error: gateError } = await supabase.rpc('arm_phone_test_gate', {
+        p_candidate_id: candidateId,
+        p_engagement_id: engagementId,
+        p_actor_id: actorId,
+        p_request_id: requestId,
+        p_expires_at: expiresAt.toISOString(),
+        p_now: now.toISOString(),
+      });
+      if (gateError) {
+        res.status(503).json({ ok: false, error: 'phone_test_gate_unavailable' });
+        return;
+      }
+      const status = rpcStatus(gate);
+      if (status !== 'ok' && status !== 'already_armed') {
+        res.status(409).json({ ok: false, error: 'phone_test_gate_refused', status });
+        return;
+      }
+      await recordAudit(req, 'resource.update', 202, {
+        metadata: { resource: 'phone_test_gate', outcome: status },
+      });
+      res.status(202).json({
+        ok: true,
+        status: 'armed',
+        cycle_number: rescreen && typeof rescreen === 'object' && 'cycle_number' in rescreen
+          ? (rescreen as { cycle_number?: unknown }).cycle_number : null,
+      });
+    } catch {
+      res.status(503).json({ ok: false, error: 'phone_test_gate_unavailable' });
     }
   },
 );

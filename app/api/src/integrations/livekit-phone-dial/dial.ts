@@ -106,6 +106,8 @@ export interface PhoneDialRequest {
   /** Read from the candidate row by the caller; self-redacting. */
   readonly number: DialableNumber;
   readonly now: Date;
+  /** 0063. Present only for the exclusive candidate test gate. */
+  readonly testGateId?: string;
 }
 
 export interface PhoneDialDeps {
@@ -197,7 +199,17 @@ export async function dialPhoneAttempt(
     runtimeReady: true,
   };
   const admitted = await admitPhoneEngagement(
-    { ...deps.admission, stores: deps.stores, config },
+    {
+      ...deps.admission,
+      stores: deps.stores,
+      config,
+      admitAttempt: request.testGateId === undefined
+        ? undefined
+        : async (input) => {
+          if (!deps.stores.admitTestAttempt) return { status: 'halted' };
+          return deps.stores.admitTestAttempt({ ...input, testGateId: request.testGateId! });
+        },
+    },
     admissionRequest,
   );
   if (admitted.decision === 'deferred') {
