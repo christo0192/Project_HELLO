@@ -122,6 +122,13 @@ export const PHONE_UNKNOWN_ADMISSION_DETAIL = 'unknown';
 export const PHONE_ADMISSION_REFUSAL_DETAILS: readonly string[] = Object.freeze([
   ...ADMIT_PHONE_ATTEMPT_STATUSES.filter((status) => status !== 'ok'),
   'ok_without_attempt',
+  // 0063's test-gate wrapper guards, surfaced through the refusal
+  // `constraint` (the wrapper's own status is always `halted`). Without
+  // these, the gate-specific refusals count as `:unknown` and an operator
+  // cannot tell a vanished gate from a genuinely unnameable answer.
+  'test_gate_unavailable',
+  'test_gate_halt_not_permitted',
+  'candidate_mismatch',
 ]);
 
 const ADMISSION_REFUSAL_DETAILS = new Set<string>(PHONE_ADMISSION_REFUSAL_DETAILS);

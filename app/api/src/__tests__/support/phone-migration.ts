@@ -102,6 +102,12 @@ export const MIGRATION_0064_PATH = fileURLToPath(
 
 export const MIGRATION_0064 = readFileSync(MIGRATION_0064_PATH, 'utf8');
 
+export const MIGRATION_0065_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0065_phone_speakable_parity.sql', import.meta.url),
+);
+
+export const MIGRATION_0065 = readFileSync(MIGRATION_0065_PATH, 'utf8');
+
 /**
  * Every phone migration, NEWEST FIRST. Extraction walks this in order and the
  * first file that declares a thing wins, which is what "the latest declaration
@@ -109,6 +115,7 @@ export const MIGRATION_0064 = readFileSync(MIGRATION_0064_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    { name: '0065', sql: MIGRATION_0065 },
     { name: '0064', sql: MIGRATION_0064 },
     { name: '0063', sql: MIGRATION_0063 },
     { name: '0061', sql: MIGRATION_0061 },

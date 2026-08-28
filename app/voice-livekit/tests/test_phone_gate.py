@@ -1781,24 +1781,62 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         # through the API, so the browser's persistence module is untouched.
         self.assertEqual(persistence_spy.mock_calls, [])
 
-    async def test_first_post_consent_question_is_fixed_playout_not_llm_generation(self):
-        """Regression: an LLM opening inherited the substantive tool policy,
-        repeatedly called advance_screening without candidate evidence, hit the
-        SDK function-step ceiling, and closed the live room. The first question
-        must therefore be exact server-owned copy with zero generate_reply call.
+    async def test_first_post_consent_question_is_llm_phrased_in_tool_less_opening(self):
+        """The first question is delivered through the model, phrased naturally.
+
+        PR #157 pinned this to fixed `session.say` because a raced opening
+        generation under the substantive tool policy could loop on
+        advance_screening until the SDK step ceiling closed the room. The
+        tool-resolved latch and the idempotent duplicate-advance reply disarm
+        that trap structurally, so the opening returns to `generate_reply` in
+        the tool-less "opening" policy — the browser lane's behavior. The
+        WHICH-question authority is unchanged: the committed keys still come
+        from the call site, never from the spoken prose.
         """
         _, client, _, _, session, _ = await self._run_session(
             answers=("Yes, that's fine.",),
             replies=["First answer.", "Second answer."],
         )
-        self.assertEqual(session.spoken[:2], [
-            phone.PHONE_DISCLOSURE_TEXT,
-            "First question?",
-        ])
+        # The planned text reaches the model as an instruction, not the ear
+        # as verbatim speech.
+        self.assertIn("First question?", session.instructions[0])
+        self.assertIn("planned question", session.instructions[0])
+        self.assertNotIn("First question?", session.spoken)
         self.assertEqual(client.committed_keys, ["k1", "k2"])
-        # Only later model-mediated replies are recorded here. If the opening
-        # regresses to generate_reply this becomes three instead of two.
-        self.assertEqual(len(session.instructions), 2)
+        # Opening generation plus the two answer-mediated replies.
+        self.assertEqual(len(session.instructions), 3)
+
+    async def test_first_question_falls_back_to_fixed_playout_without_generate_reply(self):
+        """A session without `generate_reply` still asks the exact planned text."""
+        class _NoGenerateSession(_FakePhoneSession):
+            generate_reply = None
+
+        ctx = FakeCtx(_PHONE_ROOM, participants=[_participant()])
+        client = FakeEventClient()
+        _FakePhoneSession.default_answers = []
+
+        async def classifier(turns, say):
+            return phone.CLASSIFY_HUMAN
+
+        async def recording_seam():
+            return None
+
+        with patch.object(agent_mod, "AgentSession", _NoGenerateSession), \
+             patch.object(agent_mod, "persistence", MagicMock()), \
+             patch.object(
+                 agent_mod, "_delete_livekit_room", new_callable=AsyncMock,
+             ), \
+             patch.object(agent_mod, "_phone_recording_permitted", new=recording_seam), \
+             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.05):
+            await asyncio.wait_for(
+                agent_mod._run_phone_session(
+                    ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,
+                    client=client, classifier=classifier,
+                ),
+                timeout=5,
+            )
+        session = _FakePhoneSession.instances[-1]
+        self.assertIn("First question?", session.spoken)
 
     async def test_terminal_persistence_precedes_room_teardown(self):
         _, client, _, _, _, _ = await self._run_session(answers=("Yes, sure.",))
@@ -1825,7 +1863,7 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             client.boundaries[0]["turns"][-1]["text"],
             "I have four years of relevant experience.",
         )
-        self.assertTrue(any("repeat this same planned question" in str(c) for c in session.turn_contexts))
+        self.assertTrue(any("ask this same planned topic again" in str(c) for c in session.turn_contexts))
 
     async def test_interrupted_question_is_committed_once_as_labelled_evidence(self):
         _, client, _, _, _, _ = await self._run_session(
@@ -2054,10 +2092,8 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             close_after=False,
         )
 
-        # One seeded question plus one LiveKit-native terminal response.
-        # The first planned question is fixed server-owned copy delivered by
-        # session.say; only the terminal response enters model generation.
-        self.assertEqual(len(session.instructions), 1)
+        # The LLM-phrased opening plus one LiveKit-native terminal response.
+        self.assertEqual(len(session.instructions), 2)
         self.assertEqual(client.committed_keys, [])
         self.assertIn("assessment.aborted", client.event_types)
         terminal_context = str(session.turn_contexts[-1]).lower()
@@ -2421,6 +2457,108 @@ class TestNumberNeverCarried(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(text=text):
                 self.assertIsNone(digits.search(text))
+
+
+class TestToolResolvedLatch(unittest.IsolatedAsyncioTestCase):
+    """The 2026-08-28 runaway-loop regression, pinned structurally.
+
+    On the live call, the substantive policy forced `tool_choice="required"`
+    on EVERY step of the reply — including the step after advance_screening
+    had already resolved. The model's only legal move was another tool call,
+    the duplicate advance found an empty pending exchange, the coordinator
+    halted the call, and the candidate was disconnected mid-answer. The latch
+    releases the post-tool step to ordinary speech; these tests replay the
+    exact policy sequence the SDK drives.
+    """
+
+    def _agent(self, on_advance=None, on_probe=None):
+        calls: list[tuple[list, str]] = []
+
+        class BaseAgent:
+            def __init__(self, instructions=""):
+                self.instructions = instructions
+
+            async def llm_node(self, chat_ctx, tools, model_settings):
+                calls.append((
+                    [phone_tool_name(t) for t in tools],
+                    getattr(model_settings, "tool_choice", None),
+                ))
+
+                async def chunks():
+                    yield "chunk"
+                return chunks()
+
+        def phone_tool_name(tool):
+            return str(getattr(tool, "name", None) or getattr(tool, "__name__", ""))
+
+        cls = phone.phone_agent_class(BaseAgent)
+        agent = cls(
+            "instructions", client=FakeEventClient(), attempt_id=_ATTEMPT_ID,
+            say=AsyncMock(), native_turns=True,
+            on_user_turn=lambda *args, **kwargs: None,
+            on_advance=on_advance, on_probe=on_probe,
+        )
+        agent.authorize_screening()
+        return agent, calls
+
+    @staticmethod
+    def _tools():
+        return [
+            types.SimpleNamespace(name="request_probe"),
+            types.SimpleNamespace(name="advance_screening"),
+            types.SimpleNamespace(name="schedule_callback"),
+        ]
+
+    @staticmethod
+    def _settings():
+        from dataclasses import dataclass
+
+        @dataclass
+        class Settings:
+            tool_choice: str = "auto"
+        return Settings()
+
+    async def _run_node(self, agent):
+        chunks = []
+        async for chunk in agent.llm_node(None, self._tools(), self._settings()):
+            chunks.append(chunk)
+        return chunks
+
+    async def test_substantive_requires_a_coordinator_tool_first(self):
+        agent, calls = self._agent(on_advance=lambda: "Advance authorized.")
+        await self._run_node(agent)
+        tools, choice = calls[-1]
+        self.assertEqual(sorted(tools), ["advance_screening", "request_probe"])
+        self.assertEqual(choice, "required")
+
+    async def test_a_resolved_advance_releases_the_speech_step(self):
+        agent, calls = self._agent(on_advance=lambda: "Advance authorized.")
+        await self._run_node(agent)
+        result = await agent.advance_screening()
+        self.assertIn("Advance authorized", result)
+        await self._run_node(agent)
+        tools, choice = calls[-1]
+        self.assertEqual(tools, [])
+        self.assertEqual(choice, "none")
+
+    async def test_a_resolved_probe_releases_the_speech_step_even_when_denied(self):
+        agent, calls = self._agent(on_probe=lambda: "Probe denied. Ask the planned question.")
+        await self._run_node(agent)
+        await agent.request_probe()
+        await self._run_node(agent)
+        tools, choice = calls[-1]
+        self.assertEqual(tools, [])
+        self.assertEqual(choice, "none")
+
+    async def test_a_new_candidate_turn_rearms_the_tool_requirement(self):
+        agent, calls = self._agent(on_advance=lambda: "Advance authorized.")
+        await agent.advance_screening()
+        message = types.SimpleNamespace(text_content="Next answer.")
+        await agent.on_user_turn_completed(types.SimpleNamespace(items=[]), message)
+        await self._run_node(agent)
+        tools, choice = calls[-1]
+        self.assertEqual(sorted(tools), ["advance_screening", "request_probe"])
+        self.assertEqual(choice, "required")
 
 
 if __name__ == "__main__":

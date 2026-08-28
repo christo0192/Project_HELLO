@@ -36,6 +36,12 @@ _MIGRATION = (
     Path(__file__).resolve().parents[2]
     / "supabase" / "migrations" / "0044_phone_assessment_resume.sql"
 )
+# The default plan was REDEFINED by 0065 (speakable candidate-facing text);
+# the drift assertions must parse the definition Postgres actually runs.
+_PLAN_MIGRATION = (
+    Path(__file__).resolve().parents[2]
+    / "supabase" / "migrations" / "0065_phone_speakable_parity.sql"
+)
 
 
 def _run(coro):
@@ -396,16 +402,47 @@ class TestAssessmentClient(unittest.IsolatedAsyncioTestCase):
 # ── The default plan, and the SQL it must agree with ──────────────────
 
 class TestDefaultPlanDrift(unittest.TestCase):
-    """`phone_default_question_plan()` in 0044 and `DEFAULT_QUESTIONS` here.
+    """`phone_default_question_plan()` in 0065 versus `DEFAULT_QUESTIONS` here.
 
-    Two copies of one vocabulary is how they silently diverge, and this lane
-    has already paid for that once. The SQL is parsed INDEPENDENTLY — the
-    expected values are derived from `prompting.DEFAULT_QUESTIONS`, never from
-    the file being validated — so a change to either side turns this red.
+    The two lists now agree on STRUCTURE and deliberately DIVERGE on text:
+    `prompting.DEFAULT_QUESTIONS` is browser model-guidance topic prose, the
+    SQL plan is candidate-facing SPEECH (2026-08-28 RCA: topic prose from the
+    plan was spoken verbatim to a live candidate). So this class asserts, per
+    slot: same order, same mandatory flag, a stable `default_*` key, a text
+    that PASSES the speakability contract — and that nobody has quietly
+    copied the browser prose back into the plan.
     """
 
+    # Python mirror of the CORRECTED screening_v2.cagv_question_is_speakable
+    # (0065 fixed 0060's doubled-backslash escaping, which had made every
+    # clause unmatchable or vacuously true).
+    _INTERROGATIVE = re.compile(
+        r"\?|\b(tell|describe|walk|explain|what|how|why|when|where|which|"
+        r"could|can|have|did|would|are|do|is)\b",
+        re.IGNORECASE,
+    )
+    _BANNED_WORDS = re.compile(
+        r"\b(system|developer|assistant|model|prompt|instruction|interviewer|recruiter)\b",
+        re.IGNORECASE,
+    )
+    _IMPERATIVE = re.compile(
+        r"\b(must|should|do not|don't)\s+(ask|say|tell|mention|reveal|ignore)\b",
+        re.IGNORECASE,
+    )
+    _BRACKETS = re.compile(r"[\[\]{}<>]")
+
+    def _speakable(self, text: str) -> bool:
+        stripped = text.strip()
+        return (
+            1 <= len(stripped) <= 2000
+            and self._INTERROGATIVE.search(stripped) is not None
+            and self._BANNED_WORDS.search(stripped) is None
+            and self._IMPERATIVE.search(stripped) is None
+            and self._BRACKETS.search(stripped) is None
+        )
+
     def setUp(self):
-        self.sql = _MIGRATION.read_text(encoding="utf-8")
+        self.sql = _PLAN_MIGRATION.read_text(encoding="utf-8")
         anchor = "create or replace function screening_v2.phone_default_question_plan()"
         start = self.sql.index(anchor)
         end = self.sql.index("$$;", start)
@@ -433,7 +470,7 @@ class TestDefaultPlanDrift(unittest.TestCase):
     def test_the_extractor_is_not_vacuous(self):
         self.assertEqual(len(self._sql_entries()), 5)
 
-    def test_the_sql_plan_says_exactly_what_DEFAULT_QUESTIONS_says(self):
+    def _browser_topics(self):
         expected = []
         for line in prompting.DEFAULT_QUESTIONS:
             stripped = re.sub(r"^\d+\.\s*", "", line)
@@ -441,9 +478,33 @@ class TestDefaultPlanDrift(unittest.TestCase):
             if mandatory:
                 stripped = stripped[len("[MUST ASK] "):]
             expected.append((stripped, mandatory))
+        return expected
 
-        actual = [(text, mandatory) for _key, text, mandatory in self._sql_entries()]
-        self.assertEqual(actual, expected)
+    def test_the_sql_plan_matches_DEFAULT_QUESTIONS_structure(self):
+        expected_flags = [mandatory for _text, mandatory in self._browser_topics()]
+        actual_flags = [mandatory for _key, _text, mandatory in self._sql_entries()]
+        self.assertEqual(actual_flags, expected_flags)
+
+    def test_every_sql_question_is_speakable(self):
+        for key, text, _mandatory in self._sql_entries():
+            with self.subTest(key=key):
+                self.assertTrue(self._speakable(text), text)
+
+    def test_the_browser_topic_prose_did_not_leak_back_into_the_plan(self):
+        # The 0044 regression this class now exists to prevent: the browser
+        # topic list is instructions to a model, and speaking it verbatim is
+        # the "bot reads its instructions" defect heard on a live call.
+        browser_texts = {text for text, _mandatory in self._browser_topics()}
+        for key, text, _mandatory in self._sql_entries():
+            with self.subTest(key=key):
+                self.assertNotIn(text, browser_texts)
+
+    def test_the_browser_topic_prose_would_be_refused_by_the_gate(self):
+        # The browser prose is the negative control: if the speakability
+        # mirror accepts what 0044 shipped, the mirror is vacuous and this
+        # class proves nothing. At least one browser topic line must FAIL.
+        verdicts = [self._speakable(text) for text, _m in self._browser_topics()]
+        self.assertIn(False, verdicts)
 
     def test_every_default_key_is_stable_distinct_and_legal(self):
         keys = [key for key, _t, _m in self._sql_entries()]

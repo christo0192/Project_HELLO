@@ -125,11 +125,14 @@ begin
   insert into screening_v2.roles (title, jd, required_skills, screening_template, is_active)
   values (
     'canary0 role', 'canary0 fixture role', '[]'::jsonb,
+    -- Spoken-question shape, because 0065's corrected speakability gate now
+    -- actually fires (0060's regexes were vacuous) and validates this
+    -- template at plan materialization like any recruiter-authored one.
     jsonb_build_array(
-      jsonb_build_object('id','canary_q1','question','Question one.','mandatory',false),
-      jsonb_build_object('id','canary_q2','question','Question two.','mandatory',true),
-      jsonb_build_object('id','canary_q3','question','Question three.','mandatory',false),
-      jsonb_build_object('id','canary_q4','question','Question four.','mandatory',true)
+      jsonb_build_object('id','canary_q1','question','Question one?','mandatory',false),
+      jsonb_build_object('id','canary_q2','question','Question two?','mandatory',true),
+      jsonb_build_object('id','canary_q3','question','Question three?','mandatory',false),
+      jsonb_build_object('id','canary_q4','question','Question four?','mandatory',true)
     ),
     true)
   returning id into v_id;

@@ -221,10 +221,18 @@ export async function dialPhoneAttempt(
     };
   }
   if (admitted.decision !== 'admitted') {
+    // The test-gate wrapper collapses its guard refusals AND the inner
+    // admission's refusal to `status: 'halted'` with the real answer in
+    // `constraint`. Counting the wrapper status made the health surface
+    // report the KILL SWITCH while the actual refusal was, live on
+    // 2026-08-28, `daily_attempt_exists` — a 40-minute misdirection. Prefer
+    // the constraint; `phoneRefusalCountKey` still closes the vocabulary, so
+    // an unrecognised constraint collapses to `:unknown`, never leaks.
+    const constraint = admitted.result?.detail?.constraint;
     return {
       status: 'refused',
       refusal: 'admission_refused',
-      detail: admitted.status,
+      detail: typeof constraint === 'string' ? constraint : admitted.status,
       providerContacted: false,
     };
   }

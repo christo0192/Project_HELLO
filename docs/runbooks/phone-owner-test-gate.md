@@ -48,3 +48,32 @@ candidates to a dial.
 If the call must stop, use the existing room/worker abort card. Raising the
 ordinary global halt is still valid for all ordinary admissions, but it does
 not terminate an already-connected call.
+
+## Cadence: why an armed gate can still dial nobody
+
+The gate bypasses only the `operator_pause` halt. Every other admission rule
+still applies, and two of them are per-IST-day (midnight = 18:30 UTC):
+
+- **Per-engagement**: one `initial`/`no_answer_retry`/`scheduled` attempt per
+  engagement per IST day. A gate on an engagement that already dialled today
+  is refused `daily_attempt_exists` until the IST day rolls.
+- **Per-candidate**: one cold call (`initial`/`no_answer_retry`) per candidate
+  per IST day across ALL engagements. `scheduled` dials are exempt — a booked
+  slot is not a cold call.
+
+So the repeatable owner cadence is: one gated test call per owner candidate
+per IST day. For a second same-day test, use a different owner candidate row
+(each has its own per-candidate budget), or book an appointment (the
+`scheduled` kind) on a fresh cycle.
+
+Two more traps, both fixed by 0065 but worth knowing:
+
+- Re-POSTing the endpoint with a prior request key now REFRESHES an expired,
+  unconsumed gate. A CONSUMED key stays spent — arm a new request id.
+- The health surface expands `admission_refused` by its real constraint (for
+  example `admission_refused:daily_attempt_exists`), so a refused gate names
+  its reason instead of reporting `halted`.
+
+Also remember `cycle_limit_reached`: three cycles per application is the
+ceiling. An owner candidate whose application has burned all three cycles
+cannot be re-gated at all; keep a spare owner candidate row for that case.
