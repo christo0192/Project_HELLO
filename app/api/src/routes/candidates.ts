@@ -310,7 +310,7 @@ candidatesRouter.post(
 // candidate-owned rather than a generic phone-calendar read, so the interviewer
 // ownership check happens before any service-role phone query.
 candidatesRouter.get(
-  '/:id/phone-screenings',
+  '/:id/phone-cycles',
   requireRole('interviewer'),
   validateParams(candidateIdParamSchema),
   async (req, res) => {

@@ -181,7 +181,7 @@ export const api = {
       { method: 'POST', body: JSON.stringify({ confirm: true }) },
     ),
   getCandidatePhoneScreenings: (id: string) =>
-    request<PhoneScreeningsResponse>(`/api/candidates/${encodeURIComponent(id)}/phone-screenings`),
+    request<PhoneScreeningsResponse>(`/api/candidates/${encodeURIComponent(id)}/phone-cycles`),
   requestPhoneRescreen: (id: string, body: PhoneRescreenInput) =>
     request<PhoneRescreenResponse>(`/api/candidates/${encodeURIComponent(id)}/phone-rescreens`, {
       method: 'POST',

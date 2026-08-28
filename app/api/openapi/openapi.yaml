@@ -313,7 +313,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/SimpleError'
 
-  /api/candidates/{id}/phone-screenings:
+  /api/candidates/{id}/phone-cycles:
     parameters:
       - name: id
         in: path
@@ -323,7 +323,7 @@ paths:
           format: uuid
     get:
       tags: [candidates, phone]
-      operationId: getCandidatePhoneScreenings
+      operationId: getCandidatePhoneCycles
       summary: Read bounded immutable phone-screening cycle history (interviewer+)
       description: Returns sanitized cycle state and appointment summaries for an owned candidate. Terminal cycles remain historical and are never reopened. No phone number, provider identifier, transcript, recording key, lease, or consent secret is returned.
       responses:
