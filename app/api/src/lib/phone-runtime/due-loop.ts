@@ -31,8 +31,8 @@ import type {
 } from '../phone-screening/index.js';
 // TWO VALUE imports from the domain package, and both are shared DEFINITIONS
 // rather than conveniences: the single definition of the IST window, so the
-// runtime cannot grow a second copy of 09:00/21:00 that drifts from
-// admission's, and the closed deferral vocabulary, so the runtime cannot grow
+// runtime cannot grow a second copy of the effective IST window that drifts
+// from admission's, and the closed deferral vocabulary, so the runtime cannot grow
 // a second copy of the codes `admitPhoneEngagement` can defer with.
 import { istWindowOpen, PHONE_DEFERRAL_CODES } from '../phone-screening/index.js';
 // The CLOSED admission vocabulary, imported rather than restated. The whole
@@ -408,9 +408,9 @@ export async function runPhoneDuePass(
   // `admit_phone_attempt` is the AUTHORITY on the window and re-checks it
   // under the advisory lock; this is a cheap preflight, not a second opinion,
   // and it reuses `istWindowOpen` — the same predicate `admission.ts` calls,
-  // over the same `PHONE_IST_WINDOW` bounds — so there is exactly one
-  // definition of 09:00 inclusive / 21:00 exclusive in TypeScript and it
-  // cannot drift from the one in 0042.
+  // through the same effective-window policy — so there is exactly one
+  // temporary-cutoff and permanent-bound definition in TypeScript and it
+  // cannot drift from the one in the database migrations.
   //
   // Without it the pass reached admission before the window was consulted,
   // which meant that through the closed hours it read every due candidate's

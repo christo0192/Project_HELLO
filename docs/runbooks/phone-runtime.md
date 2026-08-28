@@ -587,18 +587,26 @@ state can be admitted with.
 
 ## 8. The IST calling window
 
-**09:00:00 inclusive to 21:00:00 exclusive, Asia/Kolkata, all seven days.** Defined once,
-in SQL:
+The permanent fallback is **09:00:00 inclusive to 21:00:00 exclusive, Asia/Kolkata,
+all seven days**. The reviewed temporary override is **24/7 through September 6, 2026
+inclusive**; the permanent 09:00–21:00 window resumes automatically on September 7,
+2026 IST. The override is fixed in migration `0064_phone_temporary_247_window.sql`,
+not an environment variable and not an operator-editable bypass.
+
+The permanent bounds remain defined once in SQL:
 
 ```sql
 phone_ist_window_open_at()  -> time '09:00:00'
 phone_ist_window_close_at() -> time '21:00:00'
-phone_ist_window_open(at)   -> (at at time zone 'Asia/Kolkata')::time >= open_at()
-                            and (at at time zone 'Asia/Kolkata')::time <  close_at()
+phone_temporary_247_until() -> date '2026-09-06'
 ```
 
-There is **no weekday exclusion** — Saturday and Sunday are inside the window, and the
-comment on `phone_ist_window_open` says "Monday to Sunday" for that reason.
+`phone_ist_window_open(at)` applies the temporary all-day rule through the cutoff and
+then applies the permanent bounds. `phone_next_window_open(at)` follows the same rule,
+so a deferred call is never parked at a time the admission function would reject.
+There is **no weekday exclusion** — Saturday and Sunday are calling days in both modes.
+The API exposes `temporary_247_until_ist` so operators can see the automatic reversion.
+
 
 `lib/phone-runtime/` re-declares no part of it. The window is enforced in
 `admit_phone_attempt` under the advisory lock, is mirrored (never re-declared) in
@@ -609,10 +617,10 @@ which is the drift `0042` was shaped to prevent.
 **The due pass now preflights the window itself**, and it does so by *calling* the shared
 predicate rather than by restating it. `due-loop.ts` takes exactly one value import from
 the domain package — `istWindowOpen` from `lib/phone-screening` — which is the same
-function `admission.ts:190` calls over the same frozen `PHONE_IST_WINDOW` bounds
-(`ist-window.ts:209-212`: `s >= openSeconds && s < closeSeconds`). So there is exactly one
-definition of 09:00-inclusive / 21:00-exclusive in TypeScript, and the runtime cannot
-drift from admission or from 0042.
+function `admission.ts:190` calls through the same effective-window policy in
+`ist-window.ts`. So there is exactly one TypeScript policy matching admission and 0064,
+while the permanent 09:00-inclusive / 21:00-exclusive bounds remain available for
+automatic reversion.
 
 The preflight sits **after** the halt gate and the due read, and **before** the number
 read, the session mint and the dial — so through the closed hours the pass returns
@@ -621,11 +629,11 @@ pass reached admission first, which meant that through every closed hour it read
 candidate's `phone_e164` out of SQL and minted a `call_sessions` row for each, four times
 a minute, only to be refused `window_closed` every time.
 
-`admit_phone_attempt` remains the **authority**: it re-evaluates the window under the
-advisory lock, so a row offered at 21:00:00.001 by a replica with a skewed clock is still
-refused there and counted on `runtime.last_due.refusals` — the correct outcome, and the
-reason a `window`-shaped refusal count is not a fault. The preflight is a cheap gate, not
-a second opinion.
+`admit_phone_attempt` remains the **authority**: it re-evaluates the effective window
+under the advisory lock, so a row offered during the temporary period is still checked
+against the cutoff, while a row offered at 21:00:00.001 after September 6 is refused
+there and counted on `runtime.last_due.refusals`. The preflight is a cheap gate, not a
+second opinion.
 
 `ist_date` on `phone_call_attempts` is a stored column written at admission, and it exists
 solely to carry the per-day uniqueness in §7.

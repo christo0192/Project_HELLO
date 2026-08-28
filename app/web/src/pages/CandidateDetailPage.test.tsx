@@ -132,7 +132,7 @@ describe('CandidateDetailPage', () => {
       ok: true,
       enabled: true,
       date: '2026-08-28',
-      window: { time_zone: 'Asia/Kolkata', open_ist: '09:00:00', close_ist: '21:00:00' },
+      window: { time_zone: 'Asia/Kolkata', open_ist: '09:00:00', close_ist: '21:00:00', temporary_247_until_ist: '2026-09-06' },
       slot_seconds: 1800,
       max_concurrent: 10,
       booked_total: 0,

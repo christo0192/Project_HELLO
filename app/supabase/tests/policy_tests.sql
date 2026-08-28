@@ -8554,6 +8554,7 @@ begin
     if not v_fn.prosecdef and v_fn.proname not in ('phone_ist_date','phone_ist_window_open',
                                                    'phone_ist_window_open_at',
                                                    'phone_ist_window_close_at',
+                                                   'phone_temporary_247_until',
                                                    'phone_max_concurrent',
                                                    'phone_event_metadata_sanitized',
                                                    'phone_next_window_open',
@@ -9004,11 +9005,11 @@ declare
 begin
   v_eng := _policy_tests.phone_fixture('pol42-window');
 
-  -- 2026-08-24 is a Monday, so seven consecutive dates cover every day
-  -- of the week including both weekend days. This substrate calls seven
-  -- days a week; a weekday-only helper would pass six of these.
+  -- 2026-09-07 is a Monday, so seven consecutive dates cover every day
+  -- of the week including both weekend days. This is AFTER the temporary
+  -- 24/7 override and proves the normal gate is restored.
   for v_d in 0..6 loop
-    v_day := date '2026-08-24' + v_d;
+    v_day := date '2026-09-07' + v_d;
 
     -- 08:59:59 IST = 03:29:59Z. Refused.
     v_res := screening_v2.admit_phone_attempt(
@@ -9060,6 +9061,29 @@ begin
     'no_answer=' || v_no_answer || ' reconnects=' || v_reconnects || ' failures=' || v_failures);
 end;
 $$;
+
+-- ── B1-T: the reviewed temporary 24/7 window ─────────────────────────
+select _policy_tests.assert(
+  '0064: temporary window is open at every tested hour through 2026-09-06',
+  screening_v2.phone_temporary_247_until() = date '2026-09-06'
+  and screening_v2.phone_ist_window_open('2026-09-06T00:00:00Z')
+  and screening_v2.phone_ist_window_open('2026-09-05T18:30:00Z')
+  and screening_v2.phone_ist_window_open('2026-09-06T18:29:59Z'),
+  'the temporary cutoff or 24/7 predicate drifted');
+
+select _policy_tests.assert(
+  '0064: normal 09:00-21:00 IST gate resumes on 2026-09-07',
+  not screening_v2.phone_ist_window_open('2026-09-07T00:00:00Z')
+  and screening_v2.phone_ist_window_open('2026-09-07T03:30:00Z')
+  and screening_v2.phone_ist_window_open('2026-09-07T15:29:59Z')
+  and not screening_v2.phone_ist_window_open('2026-09-07T15:30:00Z'),
+  'the original daily gate was not restored after the cutoff');
+
+select _policy_tests.assert(
+  '0064: next legal instant is now during override and 09:00 IST after it',
+  screening_v2.phone_next_window_open('2026-09-06T18:29:59Z') = '2026-09-06T18:29:59Z'::timestamptz
+  and screening_v2.phone_next_window_open('2026-09-07T00:00:00Z') = '2026-09-07T03:30:00Z'::timestamptz,
+  'next-window calculation did not follow the bounded override');
 
 -- The day rolls at IST midnight, not at UTC midnight. 18:29:59Z is
 -- 23:59:59 IST; one second later is the next IST day while UTC has not
@@ -9239,7 +9263,7 @@ declare
     ['halt-on',         'halted'],
     ['halt-missing',    'halt_unreadable']];
   v_i integer; v_tag text; v_want text;
-  v_eng uuid; v_res jsonb; v_now timestamptz := '2026-08-24T06:00:00Z';
+  v_eng uuid; v_res jsonb; v_now timestamptz := '2026-09-07T06:00:00Z';
   v_bad text := ''; v_attempts integer; v_jobs integer; v_audits integer;
   v_na integer; v_rc integer; v_pf integer;
 begin
@@ -9283,7 +9307,7 @@ begin
     v_res := screening_v2.admit_phone_attempt(
                v_eng, 'initial', null, 60,
                case when v_cases[v_i][1] = 'window-shut'
-                    then '2026-08-24T16:30:00Z'::timestamptz   -- 22:00 IST
+                    then '2026-09-07T16:30:00Z'::timestamptz   -- 22:00 IST
                     else v_now end);
 
     if v_res->>'status' <> v_want then
@@ -9791,8 +9815,8 @@ $$;
 do $$
 declare
   v_eng uuid; v_res jsonb; v_apt uuid; v_ver integer; v_state text; v_live integer;
-  v_t timestamptz := '2026-08-24T06:00:00Z';                 -- 11:30 IST
-  v_slot timestamptz := '2026-08-25T09:00:00Z';              -- 14:30 IST next day
+  v_t timestamptz := '2026-09-07T06:00:00Z';                 -- 11:30 IST
+  v_slot timestamptz := '2026-09-08T09:00:00Z';              -- 14:30 IST next day
   v_ok boolean;
 begin
   v_eng := _policy_tests.phone_fixture('pol42-cal');
@@ -9807,9 +9831,9 @@ begin
     '0042: a candidate-negotiated slot books and moves the engagement to scheduled',
     v_res->>'status' = 'ok' and v_state = 'scheduled', coalesce(v_res::text, '<null>'));
 
-  -- Outside the window: 22:00 IST.
+  -- Outside the restored window: 22:00 IST.
   v_res := screening_v2.schedule_phone_appointment(
-             v_eng, '2026-08-25T16:30:00Z', '2026-08-25T17:00:00Z', 'hr_manual',
+             v_eng, '2026-09-07T16:30:00Z', '2026-09-07T17:00:00Z', 'hr_manual',
              null, v_ver, v_t);
   perform _policy_tests.assert(
     '0042: a slot outside the approved IST window is refused',
@@ -9880,8 +9904,8 @@ begin
   begin
     insert into screening_v2.phone_appointments
       (engagement_id, starts_at, ends_at, ist_date, status, source)
-    values (v_eng, '2026-08-25T16:30:00Z', '2026-08-25T17:00:00Z',
-            date '2026-08-25', 'scheduled', 'hr_manual');
+    values (v_eng, '2026-09-07T16:30:00Z', '2026-09-07T17:00:00Z',
+            date '2026-09-07', 'scheduled', 'hr_manual');
     v_ok := false;
   exception when others then
     v_ok := sqlerrm like '%outside the approved IST calling window%';
@@ -10523,7 +10547,7 @@ $$;
 do $$
 declare
   v_eng uuid; v_res jsonb; v_att uuid; v_next timestamptz; v_pf integer;
-  v_t timestamptz := '2026-08-24T06:00:00Z';
+  v_t timestamptz := '2026-09-07T06:00:00Z';
 begin
   v_eng := _policy_tests.phone_fixture('pol42-pfday');
   v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
@@ -10535,7 +10559,7 @@ begin
     from screening_v2.phone_engagements where id = v_eng;
   perform _policy_tests.assert(
     '0042: a provider error charges only the provider budget and points at the next IST day',
-    v_pf = 1 and v_next = timestamptz '2026-08-25T03:30:00Z',
+    v_pf = 1 and v_next = timestamptz '2026-09-08T03:30:00Z',
     'the row must say out loud when it may next be tried, rather than looking eligible now '
       || 'and being refused by an index; provider_failures=' || v_pf
       || ' next_eligible_at=' || coalesce(v_next::text, '<null>'));
@@ -10555,7 +10579,7 @@ begin
     '0042: a second dial after a provider error on the SAME IST day is refused, with the instant',
     v_res->>'status' in ('not_yet_eligible', 'daily_attempt_exists')
       and (v_res->>'status' <> 'not_yet_eligible'
-           or (v_res->>'next_eligible_at')::timestamptz = timestamptz '2026-08-25T03:30:00Z'),
+           or (v_res->>'next_eligible_at')::timestamptz = timestamptz '2026-09-08T03:30:00Z'),
     'documented and intended: exhausting the five-failure budget takes up to five IST '
       || 'days; got ' || coalesce(v_res::text, '<null>'));
 

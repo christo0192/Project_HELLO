@@ -80,6 +80,8 @@ export {
 export {
   IST_TIME_ZONE,
   PHONE_IST_WINDOW,
+  PHONE_24X7_WINDOW,
+  PHONE_TEMPORARY_247_UNTIL_IST,
   PHONE_IST_WINDOW_OPEN_AT,
   PHONE_IST_WINDOW_CLOSE_AT,
   PHONE_MAX_CONCURRENT,
@@ -87,6 +89,7 @@ export {
   istSecondsOfDay,
   istWallClock,
   istWallClockToInstant,
+  istWindowForDate,
   istWindowOpen,
   narrowIstWindow,
   nextIstDayWindowOpen,

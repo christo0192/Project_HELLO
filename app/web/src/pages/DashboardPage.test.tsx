@@ -75,7 +75,7 @@ const PHONE_CALENDAR = {
   ok: true,
   enabled: true,
   range: { from: '2026-06-04T18:30:00.000Z', to: '2026-06-11T18:30:00.000Z' },
-  window: { time_zone: 'Asia/Kolkata', open_ist: '09:00:00', close_ist: '21:00:00' },
+  window: { time_zone: 'Asia/Kolkata', open_ist: '09:00:00', close_ist: '21:00:00', temporary_247_until_ist: '2026-09-06' },
   count: 0,
   truncated: false,
   appointments: [],

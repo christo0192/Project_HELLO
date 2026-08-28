@@ -4,13 +4,11 @@
  *
  * ── THE DATABASE OWNS THE WINDOW ──────────────────────────────────────
  * `screening_v2.phone_ist_window_open_at()`, `phone_ist_window_close_at()`
- * and `phone_max_concurrent()` are the SINGLE definitions of the calling
- * window and the fleet cap. The constants below are MIRRORS, and
- * `phone-screening-db-drift.test.ts` reads the migration text and fails if any
- * of the three disagrees. TypeScript may NARROW the window — a caller can
- * refuse to dial before 10:00 — but `narrowIstWindow` refuses any bound that
- * would widen it, because a widened TS window is silently enforced only in SQL
- * and every refusal then looks like a bug in the caller.
+ * and `phone_max_concurrent()` are the SINGLE definitions of the permanent
+ * bounds and fleet cap. Migration 0064 owns the reviewed, date-bounded
+ * temporary override; the effective predicate below mirrors that policy.
+ * TypeScript may NARROW the permanent bounds — a caller can refuse to dial
+ * before 10:00 — but `narrowIstWindow` refuses any bound that would widen it.
  *
  * ── TIME IS INJECTED, ALWAYS ──────────────────────────────────────────
  * No function here reads the machine clock. Every entry point takes the
@@ -35,6 +33,15 @@ export const PHONE_IST_WINDOW_OPEN_AT = '09:00:00';
 
 /** Mirror of `screening_v2.phone_ist_window_close_at()` — 21:00 IST, EXCLUSIVE. */
 export const PHONE_IST_WINDOW_CLOSE_AT = '21:00:00';
+
+/** Inclusive final IST date of the reviewed temporary all-day window. */
+export const PHONE_TEMPORARY_247_UNTIL_IST = '2026-09-06';
+
+/** The temporary window's full-day bounds. The normal bounds remain above. */
+export const PHONE_24X7_WINDOW: IstWindowBounds = Object.freeze({
+  openSeconds: 0,
+  closeSeconds: 86_400,
+});
 
 /** Mirror of `screening_v2.phone_max_concurrent()` — the fleet-wide cap. */
 export const PHONE_MAX_CONCURRENT = 10;
@@ -202,38 +209,63 @@ export function istWallClockToInstant(
 // ═══════════════════════════════════════════════════════════════════════
 
 /**
- * Mirror of `screening_v2.phone_ist_window_open` — 09:00 INCLUSIVE to 21:00
- * EXCLUSIVE, all seven days. This is an ADMISSION / START-TIME predicate: it
+ * Mirror of `screening_v2.phone_ist_window_open` — 24/7 through the reviewed
+ * cutoff, then 09:00 INCLUSIVE to 21:00 EXCLUSIVE, all seven days. This is an
+ * ADMISSION / START-TIME predicate: it
  * says whether a call may BEGIN now, never how long one already begun may run.
  */
-export function istWindowOpen(at: Date, bounds: IstWindowBounds = PHONE_IST_WINDOW): boolean {
+function effectiveWindowForInstant(at: Date, bounds?: IstWindowBounds): IstWindowBounds {
+  if (bounds !== undefined) return bounds;
+  return istDate(at) <= PHONE_TEMPORARY_247_UNTIL_IST
+    ? PHONE_24X7_WINDOW
+    : PHONE_IST_WINDOW;
+}
+
+/** The effective bounds for a validated IST calendar date. */
+export function istWindowForDate(date: string): IstWindowBounds {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('phone_ist_date_invalid');
+  return date <= PHONE_TEMPORARY_247_UNTIL_IST
+    ? PHONE_24X7_WINDOW
+    : PHONE_IST_WINDOW;
+}
+
+export function istWindowOpen(at: Date, bounds?: IstWindowBounds): boolean {
   const s = istSecondsOfDay(at);
-  return s >= bounds.openSeconds && s < bounds.closeSeconds;
+  const effective = effectiveWindowForInstant(at, bounds);
+  return s >= effective.openSeconds && s < effective.closeSeconds;
 }
 
 /**
  * Mirror of `screening_v2.phone_next_window_open` — the next instant at or
  * after `at` at which the window is open.
  *
- * Three cases, exactly as the SQL has them: before today's open is today's
- * open; inside the window is `at` itself; at or after today's close is
- * tomorrow's open. Every day is a calling day, so there is no weekend skip to
- * get wrong.
+ * During the temporary period every instant is already legal. Afterward the
+ * normal three cases apply: before today's open is today's open; inside the
+ * window is `at` itself; at or after today's close is tomorrow's open. Every
+ * day is a calling day, so there is no weekend skip to get wrong.
  */
-export function nextIstWindowOpen(at: Date, bounds: IstWindowBounds = PHONE_IST_WINDOW): Date {
+export function nextIstWindowOpen(at: Date, bounds?: IstWindowBounds): Date {
   const w = istWallClock(at);
+  const effective = effectiveWindowForInstant(at, bounds);
   const s = w.hour * 3600 + w.minute * 60 + w.second;
-  if (s < bounds.openSeconds) {
-    return istWallClockToInstant(w.year, w.month, w.day, bounds.openSeconds);
+  if (s < effective.openSeconds) {
+    return istWallClockToInstant(w.year, w.month, w.day, effective.openSeconds);
   }
-  if (s < bounds.closeSeconds) return at;
+  if (s < effective.closeSeconds) return at;
   // Tomorrow's IST date, normalised by `Date.UTC` so month/year roll correctly.
   const tomorrow = new Date(Date.UTC(w.year, w.month - 1, w.day + 1));
+  const tomorrowMidnight = istWallClockToInstant(
+    tomorrow.getUTCFullYear(),
+    tomorrow.getUTCMonth() + 1,
+    tomorrow.getUTCDate(),
+    0,
+  );
+  const tomorrowBounds = effectiveWindowForInstant(tomorrowMidnight, bounds);
   return istWallClockToInstant(
     tomorrow.getUTCFullYear(),
     tomorrow.getUTCMonth() + 1,
     tomorrow.getUTCDate(),
-    bounds.openSeconds,
+    tomorrowBounds.openSeconds,
   );
 }
 
@@ -241,13 +273,20 @@ export function nextIstWindowOpen(at: Date, bounds: IstWindowBounds = PHONE_IST_
  * The next legal instant on the NEXT IST day — the shape `apply_phone_event`
  * uses when a provider failure costs the engagement its IST day.
  */
-export function nextIstDayWindowOpen(at: Date, bounds: IstWindowBounds = PHONE_IST_WINDOW): Date {
+export function nextIstDayWindowOpen(at: Date, bounds?: IstWindowBounds): Date {
   const w = istWallClock(at);
   const tomorrow = new Date(Date.UTC(w.year, w.month - 1, w.day + 1));
+  const tomorrowMidnight = istWallClockToInstant(
+    tomorrow.getUTCFullYear(),
+    tomorrow.getUTCMonth() + 1,
+    tomorrow.getUTCDate(),
+    0,
+  );
+  const effective = effectiveWindowForInstant(tomorrowMidnight, bounds);
   return istWallClockToInstant(
     tomorrow.getUTCFullYear(),
     tomorrow.getUTCMonth() + 1,
     tomorrow.getUTCDate(),
-    bounds.openSeconds,
+    effective.openSeconds,
   );
 }

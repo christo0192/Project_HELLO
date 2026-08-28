@@ -605,6 +605,7 @@ describe('the calendar projection', () => {
       time_zone: 'Asia/Kolkata',
       open_ist: '09:00:00',
       close_ist: '21:00:00',
+      temporary_247_until_ist: '2026-09-06',
     });
   });
 
@@ -692,19 +693,27 @@ describe('the slots projection', () => {
     const res = await request(appWith('interviewer', { readStore: read.store }))
       .get('/api/phone/calendar/slots?date=2026-08-24');
     expect(res.status).toBe(200);
-    expect(res.body.slots).toHaveLength(24);
+    expect(res.body.slots).toHaveLength(47);
     expect(res.body.slot_seconds).toBe(1_800);
     expect(res.body.max_concurrent).toBe(PHONE_MAX_CONCURRENT);
     expect(res.body.booked_total).toBe(1);
     expect(res.body.slots[0]).toEqual({
+      starts_at: '2026-08-23T18:30:00.000Z',
+      ends_at: '2026-08-23T19:00:00.000Z',
+      ist_start: '00:00',
+      ist_end: '00:30',
+      booked: 0,
+      remaining: PHONE_MAX_CONCURRENT,
+      bookable: false,
+      refusals: ['slot_in_past'],
+    });
+    expect(res.body.slots[18]).toMatchObject({
       starts_at: '2026-08-24T03:30:00.000Z',
       ends_at: '2026-08-24T04:00:00.000Z',
       ist_start: '09:00',
       ist_end: '09:30',
       booked: 1,
       remaining: PHONE_MAX_CONCURRENT - 1,
-      bookable: true,
-      refusals: [],
     });
     // ONE query for the whole day.
     expect(read.calls).toEqual(['listLiveAppointmentsByStart']);
@@ -721,8 +730,8 @@ describe('the slots projection', () => {
       .get('/api/phone/calendar/slots?date=2026-08-24');
     expect(res.body.occupancy_truncated).toBe(true);
     expect(res.body.booked_total).toBe(400);
-    expect(res.body.slots[0].remaining).toBe(0);
-    expect(res.body.slots[0].refusals).toEqual(['at_projected_capacity']);
+    expect(res.body.slots[18].remaining).toBe(0);
+    expect(res.body.slots[18].refusals).toEqual(['at_projected_capacity']);
   });
 });
 

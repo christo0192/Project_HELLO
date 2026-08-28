@@ -66,10 +66,10 @@ const ATTEMPT = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 const EPOCH = 7;
 const LEASE_OWNER = 'dialer-a';
 
-/** 15:00 IST — inside the 09:00–21:00 window 0042 enforces. */
-const NOW = new Date('2026-08-22T09:30:00.000Z');
-/** 01:30 IST — outside it. */
-const NIGHT = new Date('2026-08-22T20:00:00.000Z');
+/** 15:00 IST — inside the restored 09:00–21:00 window. */
+const NOW = new Date('2026-09-07T09:30:00.000Z');
+/** 01:30 IST — outside the restored window. */
+const NIGHT = new Date('2026-09-07T20:00:00.000Z');
 
 const NUMBER = wrapDialableNumber('+919876543210');
 const DIGEST = NUMBER.digest;
