@@ -390,6 +390,24 @@ describe('P5 dial — a database refusal is surfaced verbatim', () => {
     });
   }
 
+  it('prefers the refusal constraint over a wrapper status that masks it', async () => {
+    // The 0063 test-gate wrapper answers `halted` for EVERY refusal it
+    // carries, with the real answer in `constraint`. Counting the wrapper
+    // status made the health surface report the kill switch while the live
+    // refusal (2026-08-28) was `daily_attempt_exists`.
+    const h = harness({
+      admit: {
+        status: 'halted',
+        detail: { constraint: 'daily_attempt_exists' },
+      } as AdmitPhoneAttemptResult,
+    });
+    const res = await run(h);
+    expect(res.status).toBe('refused');
+    expect(res.refusal).toBe('admission_refused');
+    expect(res.detail).toBe('daily_attempt_exists');
+    expectNoNetwork(res, h);
+  });
+
   it('refuses an `ok` that carries no addressable attempt', async () => {
     // Nothing downstream could fence, heartbeat or reconcile such a dial, so
     // it is refused BEFORE the SDK rather than placed blind.

@@ -1136,9 +1136,17 @@ describe('a refusal is counted by its stable code and is not a dial', () => {
       // answers `ok` WITHOUT an addressable attempt.
       expect(phoneRefusalCountKey(PHONE_ADMISSION_REFUSAL, 'ok_without_attempt'))
         .toBe('admission_refused:ok_without_attempt');
-      // And the exported set is exactly that, in both directions.
+      // And the exported set is exactly that, in both directions — plus the
+      // 0063 test-gate guard constraints, which arrive through the refusal
+      // `constraint` because the wrapper's own status is always `halted`.
       expect([...PHONE_ADMISSION_REFUSAL_DETAILS].sort()).toEqual(
-        [...ADMIT_PHONE_ATTEMPT_STATUSES.filter((x) => x !== 'ok'), 'ok_without_attempt'].sort(),
+        [
+          ...ADMIT_PHONE_ATTEMPT_STATUSES.filter((x) => x !== 'ok'),
+          'ok_without_attempt',
+          'test_gate_unavailable',
+          'test_gate_halt_not_permitted',
+          'candidate_mismatch',
+        ].sort(),
       );
       expect(PHONE_ADMISSION_REFUSAL_DETAILS).not.toContain('ok');
     });

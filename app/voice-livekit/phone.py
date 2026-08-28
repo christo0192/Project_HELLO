@@ -1823,6 +1823,7 @@ class PhoneGateResult:
         "recording_allowed",
         "events",
         "spoken",
+        "assessment_state",
     )
 
     def __init__(
@@ -1833,12 +1834,17 @@ class PhoneGateResult:
         recording_allowed: bool = False,
         events: Optional[list[str]] = None,
         spoken: Optional[list[str]] = None,
+        assessment_state: Optional["PhoneAssessmentState"] = None,
     ) -> None:
         self.outcome = outcome
         self.assessment_allowed = assessment_allowed
         self.recording_allowed = recording_allowed
         self.events = events if events is not None else []
         self.spoken = spoken if spoken is not None else []
+        # The state the atomic consent/start RPC already returned, carried so
+        # the caller does not pay a second `/assessment/start` round trip in
+        # the audible consent→first-question gap. None on legacy paths.
+        self.assessment_state = assessment_state
 
     def __repr__(self) -> str:  # pragma: no cover - diagnostics only
         return (
@@ -1938,7 +1944,8 @@ async def run_phone_gate(
         if start_recording is not None:
             await start_recording()
         return PhoneGateResult(CLASSIFY_HUMAN, assessment_allowed=True,
-                               recording_allowed=True, events=events, spoken=spoken)
+                               recording_allowed=True, events=events, spoken=spoken,
+                               assessment_state=combined)
 
     human = await client.post_event(attempt_id, "classify.human", epoch=epoch)
     if not event_applied(human):
@@ -2128,12 +2135,22 @@ def phone_agent_class(agent_base: Any) -> Any:
             self._native_turns = native_turns
             self._native_reply_plan = native_reply_plan
             self._screening_authorized = False
+            # Set when a coordinator tool has RESOLVED within the current
+            # reply. While set, the substantive policy stops forcing
+            # `tool_choice="required"` so the same generation can speak the
+            # authorized question. Without this latch the post-tool step is
+            # still forbidden from producing text, so the model's only legal
+            # move is another tool call — the runaway loop that exhausted
+            # LiveKit's function-step budget and closed a live call mid-answer
+            # (2026-08-28). Reset on every new candidate turn.
+            self._tool_resolved = False
             self.bookings: list[ScheduleTurn] = []
 
         def authorize_screening(self) -> None:
             """Release the held consent-phase Gemini output after API grant."""
             self._screening_authorized = True
             self._turn_policy = "substantive"
+            self._tool_resolved = False
 
         def set_turn_policy(self, policy: str) -> None:
             self._turn_policy = policy if policy in {"pre_consent", "opening", "substantive", "clarification", "callback", "closing"} else "substantive"
@@ -2151,7 +2168,18 @@ def phone_agent_class(agent_base: Any) -> Any:
             AgentSession. Clarification/callback turns leave the plan empty and
             use the same Gemini node as the browser agent.
             """
-            if self._turn_policy == "substantive":
+            if self._turn_policy == "substantive" and self._tool_resolved:
+                # The coordinator tool already resolved for this reply. The
+                # remainder of the generation is ordinary speech: no tools, so
+                # a duplicate advance/probe is structurally impossible and the
+                # model can actually say the authorized question.
+                tools = []
+                try:
+                    from dataclasses import replace
+                    model_settings = replace(model_settings, tool_choice="none")
+                except (TypeError, ValueError):
+                    pass
+            elif self._turn_policy == "substantive":
                 tools = [tool for tool in tools if self._tool_name(tool) in {"request_probe", "advance_screening"}]
                 try:
                     from dataclasses import replace
@@ -2193,6 +2221,10 @@ def phone_agent_class(agent_base: Any) -> Any:
             """
             text = _message_text(new_message)
             if self._native_turns:
+                # A new candidate turn starts a fresh tool cycle: the reply it
+                # triggers must resolve its own coordinator tool before the
+                # speech step is released again.
+                self._tool_resolved = False
                 # `turn_ctx` is the SDK's temporary context for THIS reply.
                 # Do not mutate the durable Agent chat context or append the
                 # user message: AgentActivity owns both, and will add the
@@ -2225,6 +2257,9 @@ def phone_agent_class(agent_base: Any) -> Any:
             result = self._on_probe()
             if inspect.isawaitable(result):
                 result = await result
+            # Any resolution — authorized or denied — releases the speech
+            # step: the result text already tells the model what to say next.
+            self._tool_resolved = True
             return str(result)
 
         @_tool
@@ -2235,6 +2270,7 @@ def phone_agent_class(agent_base: Any) -> Any:
             result = self._on_advance()
             if inspect.isawaitable(result):
                 result = await result
+            self._tool_resolved = True
             return str(result)
 
         @_tool

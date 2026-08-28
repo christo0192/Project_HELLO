@@ -967,11 +967,14 @@ def _build_provider_session(*, phone_mode: bool = False) -> Any:
     if phone_mode:
         # Phone's durable cursor selects the next question after the user turn,
         # while LiveKit may already be preparing a speculative reply. The
-        # phone reply planner supplies a fixed next question after the CAS;
-        # disabling preemptive generation for this lane prevents LiveKit from
-        # discarding a speculative request when the per-turn plan is updated.
+        # coordinator injects the per-turn instruction inside
+        # `on_user_turn_completed`, which ALWAYS invalidates the speculation —
+        # the live call on 2026-08-28 logged "chat context or tools have
+        # changed after on_user_turn_completed" on every substantive turn, so
+        # the lane paid for a Gemini request it then discarded, every time.
+        # Disabling it here matches what this comment has always claimed.
         # AgentSession still owns EOU, interruption, scheduling and playout.
-        session_options["preemptive_generation"] = True
+        session_options["preemptive_generation"] = False
 
     session = AgentSession(
         stt=sarvam.STT(
@@ -1137,6 +1140,13 @@ async def _run_native_phone_screening(
         "question": None, "prompt": None, "candidate": None,
         "message": None, "probe_used": False, "source_event_id": None,
     }
+    # The last successful advance result for the CURRENT reply. Gemini may
+    # emit two advance calls in one step, or a second one after the first
+    # resolved; both used to read an empty `pending` and halt the whole call
+    # (`HALT_PERSISTENCE`, observed live 2026-08-28). A duplicate advance is
+    # answered with the SAME instruction instead — the durable commit is
+    # idempotent on `source_event_id`, so nothing double-writes.
+    last_advance: dict[str, str | None] = {"text": None}
 
     async def wait_for_activity(timeout: float) -> str:
         """Wait on LiveKit activity or close without creating a turn queue."""
@@ -1288,7 +1298,7 @@ async def _run_native_phone_screening(
             if question is not None and route == "callback_deferral":
                 add_turn_instruction(turn_ctx, "Address the callback request and use schedule_callback only when the time is clear. Do not answer or advance the planned question.")
             elif question is not None:
-                add_turn_instruction(turn_ctx, "Answer briefly from verified role context, then repeat this same planned question:\n" + question.text)
+                add_turn_instruction(turn_ctx, "Answer briefly from verified role context, then ask this same planned topic again as ONE natural spoken question in your own words:\n" + question.text)
             return
         if _native_turn_predates_question(message, latest_assistant_anchor[0]):
             from livekit.agents import StopResponse  # noqa: PLC0415
@@ -1296,7 +1306,7 @@ async def _run_native_phone_screening(
         if not assistant_delivery_complete.is_set():
             # A final transcript that arrived before the planned question was
             # audibly delivered is evidence of interruption, not an answer.
-            add_turn_instruction(turn_ctx, "The previous question was interrupted. Repeat the same planned question and wait; do not advance.")
+            add_turn_instruction(turn_ctx, "The previous question was interrupted. Ask that same topic again in your own natural words and wait; do not advance.")
             return
         prompt = (latest_assistant[0] or "").strip()
         if question is None or not prompt:
@@ -1312,13 +1322,17 @@ async def _run_native_phone_screening(
             "probe_used": False,
             "source_event_id": phone.plan_source_event_id(question.key),
         })
+        last_advance["text"] = None
         latest_candidate_anchor[0] = None
         setattr(agent, "_turn_policy", "substantive")
         add_turn_instruction(
             turn_ctx,
-            "You must call exactly one coordinator tool before any spoken text. "
+            "You must call exactly ONE coordinator tool before any spoken text. "
             "Choose request_probe for one useful same-topic follow-up when the answer is thin; "
-            "otherwise choose advance_screening. Never speak before the tool result.",
+            "otherwise choose advance_screening. Never speak before the tool result. "
+            "After the tool result, briefly acknowledge one specific detail from the "
+            "candidate's answer, then ask the authorized topic as ONE natural spoken "
+            "question in your own words.",
         )
         # Legacy/in-memory clients without the new probe endpoint use the
         # deterministic thin-answer fallback. Production PhoneEventClient
@@ -1342,7 +1356,11 @@ async def _run_native_phone_screening(
         if not outcome.ok and outcome.status != "duplicate":
             return "Probe denied. Call advance_screening without asking a follow-up."
         pending["probe_used"] = True
-        return "Probe authorized. Acknowledge briefly and ask one same-topic follow-up about: " + question.text
+        hint = f" The most useful angle: {question.hint}" if question.hint else ""
+        return (
+            "Probe authorized. Acknowledge briefly, then ask ONE follow-up question "
+            "in your own natural words on this same topic: " + question.text + hint
+        )
 
     async def on_advance() -> str:
         nonlocal cursor
@@ -1351,6 +1369,11 @@ async def _run_native_phone_screening(
         candidate = pending.get("candidate")
         message = pending.get("message")
         if question is None or not prompt or not isinstance(candidate, str):
+            # A duplicate advance in the SAME reply (the first one cleared
+            # `pending`) is answered idempotently, never by ending the call.
+            duplicate = last_advance["text"]
+            if duplicate:
+                return duplicate
             terminal_reason["reason"] = phone.HALT_PERSISTENCE
             finished.set()
             return "Advance unavailable; do not ask another question."
@@ -1359,6 +1382,11 @@ async def _run_native_phone_screening(
             {"speaker": "candidate", "text": candidate, "turn_started_at_ms": _turn_anchor_ms(message) if message is not None else None},
         ]
         outcome = await events.commit_boundary(session_id, question.key, cursor, pending["source_event_id"], turns)
+        if outcome.ok and outcome.cursor == cursor and last_advance["text"] is not None:
+            # A concurrent duplicate of an advance that already applied: the
+            # commit is idempotent on `source_event_id` and the local cursor
+            # has already moved. Repeat the authorization; do not halt.
+            return last_advance["text"]
         if not outcome.ok or outcome.cursor != cursor + 1:
             terminal_reason["reason"] = phone.HALT_PERSISTENCE
             finished.set()
@@ -1374,15 +1402,23 @@ async def _run_native_phone_screening(
                 closing.wind_down_delivered()
                 if pending.get("turn_ctx") is not None:
                     add_turn_instruction(pending["turn_ctx"], "The screening is complete. Ask the candidate whether they have any questions about the role, team, company, or process. Do not say goodbye yet.")
-                return "Advance authorized. Ask whether the candidate has any questions. Do not close the call yet."
+                last_advance["text"] = "Advance authorized. Ask whether the candidate has any questions. Do not close the call yet."
+                return last_advance["text"]
             terminal_reply_required["value"] = True
             terminal_reason["reason"] = "completed"
             finished.set()
             if pending.get("turn_ctx") is not None:
                 add_turn_instruction(pending["turn_ctx"], "Thank the candidate briefly, say goodbye, and complete the final closing. Do not ask another question.")
-            return "Advance authorized. Thank the candidate briefly, say goodbye, and complete the final closing."
+            last_advance["text"] = "Advance authorized. Thank the candidate briefly, say goodbye, and complete the final closing."
+            return last_advance["text"]
         pending["probe_used"] = False
-        return "Advance authorized. Acknowledge briefly and ask exactly this next question: " + next_question.text
+        hint = f" The most useful angle if their answer is thin: {next_question.hint}" if next_question.hint else ""
+        last_advance["text"] = (
+            "Advance authorized. Briefly acknowledge one specific detail from their "
+            "answer, then ask ONE question in your own natural words covering exactly "
+            "this topic: " + next_question.text + hint
+        )
+        return last_advance["text"]
 
     async def native_say(text: str) -> None:
         speech = session.say(text, allow_interruptions=True)
@@ -1416,22 +1452,47 @@ async def _run_native_phone_screening(
         terminal_reason["reason"] = "completed"
         finished.set()
     else:
-        # The first post-consent question is server-owned fixed text, not a
-        # model decision. Sending it through generate_reply used the same Agent
-        # whose substantive policy requires a coordinator tool. A stale
-        # speech_created transition could switch that policy before the opening
-        # generation ran, causing Gemini to call advance_screening repeatedly
-        # without candidate evidence until LiveKit exhausted its function-step
-        # budget and closed the room. Speak the exact planned question through
-        # LiveKit's normal playout path instead: no tool is available, no LLM
-        # latency is paid, and conversation_item_added still supplies the
-        # assistant evidence/anchor used by the durable boundary.
-        speech = session.say(question.text, allow_interruptions=True)
-        wait = getattr(speech, "wait_for_playout", None)
-        if callable(wait):
-            value = wait()
-            if inspect.isawaitable(value):
-                await value
+        # The first post-consent question is delivered through Gemini in the
+        # tool-less "opening" policy so it is phrased naturally — the same
+        # behavior the browser lane has always had. PR #157 pinned this to
+        # fixed `session.say` because a stale policy transition could trap the
+        # opening generation in a required-tool loop until LiveKit exhausted
+        # its function-step budget and closed the room. That trap is now
+        # structurally disarmed: the tool-resolved latch releases speech after
+        # one tool resolution and a duplicate advance is answered
+        # idempotently, so the worst a raced generation can do is speak. The
+        # fixed-text path remains as the fallback when the LLM path is
+        # unavailable, and the WHICH-question authority is unchanged — it is
+        # this call site and the committed key, never the spoken prose.
+        spoke = False
+        generate = getattr(session, "generate_reply", None)
+        if callable(generate):
+            setattr(agent, "_turn_policy", "opening")
+            try:
+                handle = generate(instructions=phone_question_instructions(question))
+                if inspect.isawaitable(handle):
+                    handle = await handle
+                wait = getattr(handle, "wait_for_playout", None)
+                if callable(wait):
+                    value = wait()
+                    if inspect.isawaitable(value):
+                        await value
+                spoke = True
+            except Exception:  # noqa: BLE001
+                _log.warn(
+                    "unknown_event", error_type="phone_first_question_fallback",
+                    error_category="generate_reply_failed",
+                )
+                spoke = False
+            finally:
+                setattr(agent, "_turn_policy", "substantive")
+        if not spoke:
+            speech = session.say(question.text, allow_interruptions=True)
+            wait = getattr(speech, "wait_for_playout", None)
+            if callable(wait):
+                value = wait()
+                if inspect.isawaitable(value):
+                    await value
 
     try:
         # This bounds the whole leg, not one answer. Per-turn inactivity is
@@ -1757,7 +1818,13 @@ async def _run_phone_session(
             task.cancel()
 
     async def _screen() -> phone.PhoneGateResult:
-        state = await events.start_assessment(attempt_id, session_id)
+        # The atomic consent/start RPC already returned the full assessment
+        # state; a second `/assessment/start` round trip here was pure audible
+        # dead air between consent and the first question. Legacy gate paths
+        # (no combined RPC) still fetch it.
+        gate_state = getattr(result, "assessment_state", None)
+        state = gate_state if gate_state is not None and gate_state.ok \
+            else await events.start_assessment(attempt_id, session_id)
         if not state.ok:
             # ── A REFUSED START IS NOT PROOF THAT NOTHING HAPPENED ────────
             # `session_not_active` is exactly what a session that is ALREADY
