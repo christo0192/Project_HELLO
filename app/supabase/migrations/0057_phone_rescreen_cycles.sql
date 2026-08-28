@@ -294,6 +294,11 @@ begin
        'predecessor_engagement_id', v_prev.id, 'cycle_number', v_cycle,
        'source', p_source, 'reason', p_reason));
 
+  -- Re-run the ordinary Ashby prerequisite evaluator immediately so a new
+  -- cycle does not remain pending forever. It may leave the child pending
+  -- with a stable reason, but it never creates an attempt or a queue job.
+  perform screening_v2.ensure_ashby_phone_engagement(v_link.id, p_now);
+
   return jsonb_build_object('status', 'ok', 'engagement_id', v_new_id,
     'cycle_number', v_cycle, 'predecessor_engagement_id', v_prev.id);
 end;
