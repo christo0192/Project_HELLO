@@ -47,6 +47,7 @@ import {
   type ClearPhoneAttemptRecordingsStatus,
   type CommitPhoneQuestionBoundaryStatus,
   type GetPhoneAssessmentStateStatus,
+  type RecordPhoneProbeStatus,
   type StartPhoneAssessmentStatus,
 } from './rpc-contract.js';
 import type {
@@ -78,6 +79,8 @@ import type {
   PhoneRecordingArtifact,
   CommitPhoneQuestionBoundaryInput,
   CommitPhoneQuestionBoundaryResult,
+  RecordPhoneProbeInput,
+  RecordPhoneProbeResult,
   PhoneAssessmentState,
   PhoneAssessmentTurn,
   PhonePlanQuestion,
@@ -830,6 +833,26 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
         planComplete: bool(row, 'plan_complete'),
         expectedKey: str(row, 'expected_key'),
         sessionStatus: str(row, 'session_status'),
+      };
+    },
+
+    async recordProbe(input: RecordPhoneProbeInput): Promise<RecordPhoneProbeResult> {
+      const { data, error } = await client.rpc('record_phone_probe', {
+        p_session_id: input.sessionId,
+        p_question_key: input.questionKey,
+        p_expected_index: input.expectedIndex,
+        p_source_event_id: input.sourceEventId,
+        p_now: isoInstant(input.now),
+      });
+      if (error) throw new Error('phone_record_probe_error');
+      const row = asRow(data);
+      const status = narrowPhoneRpcStatus<RecordPhoneProbeStatus>('record_phone_probe', row);
+      return {
+        status,
+        duplicate: status === 'duplicate',
+        probeCount: num(row, 'probe_count'),
+        questionKey: str(row, 'question_key'),
+        questionIndex: num(row, 'question_index'),
       };
     },
   };

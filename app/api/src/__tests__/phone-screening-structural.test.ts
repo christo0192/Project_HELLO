@@ -152,7 +152,7 @@ describe('1. every phone write goes through an RPC', () => {
     // sweeps, and the sweep claim. The count is pinned rather than merely
     // non-zero so a seam that quietly stops routing one call through an RPC
     // fails here.
-    expect(new Set(rpcCalls).size).toBe(23);
+    expect(new Set(rpcCalls).size).toBe(24);
     // The write seam reaches NO table, only RPCs.
     expect(writeBody, 'stores.ts uses a table accessor').not.toMatch(/\bclient\s*\.\s*from\s*\(/);
     // A type-only import of the client type is fine; a VALUE import is not.
@@ -364,6 +364,9 @@ describe('2. no provider, no dialing, no network, no Ashby mutation', () => {
       // The other ten do not, and this set is a BIJECTION, so listing one that
       // does not import would fail as loudly as omitting one that does.
       'lib/phone-canary1/originate.ts',
+      // P-1 role admission uses the same pure question contract so malformed
+      // candidate-facing templates cannot be written.
+      'schemas/roles.ts',
     ]);
     const seen = new Set<string>();
     for (const file of allSourceFiles(SRC_DIR)) {

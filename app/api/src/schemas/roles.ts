@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { idParamSchema } from './common.js';
+import { phoneQuestionIssueMessage, validatePhoneQuestionTemplate } from '../lib/phone-screening/question-validation.js';
 
 const screeningQuestionSchema = z
   .object({
@@ -19,7 +20,13 @@ export const createRoleSchema = z
     screening_template: z.array(screeningQuestionSchema).max(100).optional(),
     interviewer_instructions: z.string().trim().max(10_000).optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((value, ctx) => {
+    if (!value.screening_template) return;
+    for (const [index, issues] of validatePhoneQuestionTemplate(value.screening_template)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['screening_template', index, 'question'], message: phoneQuestionIssueMessage(index, issues) });
+    }
+  });
 
 export type CreateRoleInput = z.infer<typeof createRoleSchema>;
 
@@ -35,6 +42,12 @@ export const updateRoleSchema = z
   .strict()
   .refine((value) => Object.keys(value).length > 0, {
     message: 'at least one field is required',
+  })
+  .superRefine((value, ctx) => {
+    if (!value.screening_template) return;
+    for (const [index, issues] of validatePhoneQuestionTemplate(value.screening_template)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['screening_template', index, 'question'], message: phoneQuestionIssueMessage(index, issues) });
+    }
   });
 
 export type UpdateRoleInput = z.infer<typeof updateRoleSchema>;

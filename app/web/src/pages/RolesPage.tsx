@@ -24,6 +24,27 @@ function emptyQuestion(index: number): QuestionRow {
   return { id: `q${index}`, question: "", weight: 1 };
 }
 
+function spokenQuestionIssue(question: string, allQuestions: QuestionRow[], index: number): string | null {
+  const text = question.trim();
+  if (!text) return null;
+  if (text.length > 2000) return "Question is too long.";
+  if (/\\b(system|developer|assistant|model|prompt|instruction|interviewer|recruiter)\\b|\\b(must|should|do not|don't)\\s+(ask|say|tell|mention|reveal|ignore)\\b|[\\[\\]{}<>]/i.test(text)) {
+    return "Use candidate-facing spoken language, not instructions or markup.";
+  }
+  if (!/[?]|\\b(tell|describe|walk|explain|what|how|why|when|where|which|could|can|have|did|would|are|do|is)\\b/i.test(text)) {
+    return "Write a speakable candidate-facing question.";
+  }
+  const normalized = text.toLocaleLowerCase().replace(/[^\\p{L}\\p{N}]+/gu, " ").trim().replace(/\\s+/g, " ");
+  if (normalized && allQuestions.some((other, otherIndex) => otherIndex !== index && spokenQuestionIssueKey(other.question) === normalized)) {
+    return "This question duplicates another question.";
+  }
+  return null;
+}
+
+function spokenQuestionIssueKey(value: string): string {
+  return value.toLocaleLowerCase().replace(/[^\\p{L}\\p{N}]+/gu, " ").trim().replace(/\\s+/g, " ");
+}
+
 export function RolesPage() {
   const [roles, setRoles] = useState<Role[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -211,6 +232,13 @@ function RoleForm({
       setFormError("Title is required.");
       return;
     }
+    const questionIssue = questions
+      .map((q, index) => spokenQuestionIssue(q.question, questions, index))
+      .find(Boolean);
+    if (questionIssue) {
+      setFormError(questionIssue);
+      return;
+    }
 
     const required_skills = skillsText
       .split(",")
@@ -305,7 +333,13 @@ function RoleForm({
                       updateQuestion(idx, { question: e.target.value })
                     }
                     placeholder="Question text…"
+                    aria-invalid={Boolean(spokenQuestionIssue(q.question, questions, idx))}
                   />
+                  {spokenQuestionIssue(q.question, questions, idx) && (
+                    <p className="mt-1 text-xs text-amber-700" role="status">
+                      {spokenQuestionIssue(q.question, questions, idx)}
+                    </p>
+                  )}
                 </div>
                 <div className="w-20 shrink-0">
                   <Input

@@ -61,6 +61,8 @@ export const PHONE_RPC_NAMES = [
   // 0057 — governed immutable cycle operations. Number verification is
   // deliberately outside this domain contract because its input is PII.
   'request_phone_rescreen',
+  // 0060 — max-one candidate-specific same-objective probe.
+  'record_phone_probe',
 ] as const;
 
 export type PhoneRpcName = (typeof PHONE_RPC_NAMES)[number];
@@ -168,6 +170,13 @@ export const PHONE_RPC_PARAMETERS: Readonly<Record<PhoneRpcName, readonly string
       'p_request_id',
       'p_source',
       'p_actor_id',
+      'p_now',
+    ],
+    record_phone_probe: [
+      'p_session_id',
+      'p_question_key',
+      'p_expected_index',
+      'p_source_event_id',
       'p_now',
     ],
   });
@@ -509,6 +518,12 @@ export const COMMIT_PHONE_QUESTION_BOUNDARY_STATUSES = [
 export type CommitPhoneQuestionBoundaryStatus =
   (typeof COMMIT_PHONE_QUESTION_BOUNDARY_STATUSES)[number];
 
+export const RECORD_PHONE_PROBE_STATUSES = [
+  'probe_recorded', 'probe_denied', 'duplicate', 'invalid_input',
+  'unknown_session', 'plan_missing', 'session_not_active', 'stale_cursor', 'key_not_current',
+] as const;
+export type RecordPhoneProbeStatus = (typeof RECORD_PHONE_PROBE_STATUSES)[number];
+
 /** The per-RPC vocabularies, keyed by RPC name. */
 export const PHONE_RPC_STATUSES: Readonly<Record<PhoneRpcName, readonly string[]>> =
   Object.freeze({
@@ -535,6 +550,7 @@ export const PHONE_RPC_STATUSES: Readonly<Record<PhoneRpcName, readonly string[]
     sweep_phone_stranded_sessions: SWEEP_PHONE_STRANDED_SESSIONS_STATUSES,
     claim_phone_sweep: CLAIM_PHONE_SWEEP_STATUSES,
     request_phone_rescreen: REQUEST_PHONE_RESCREEN_STATUSES,
+    record_phone_probe: RECORD_PHONE_PROBE_STATUSES,
   });
 
 /**
@@ -570,7 +586,7 @@ export const PHONE_RPC_STATUS_UNION: readonly string[] = Object.freeze(
  * union, which is the whole reason the increment is smaller than the number
  * of RPCs added.
  */
-export const PHONE_RPC_STATUS_COUNT = 87;
+export const PHONE_RPC_STATUS_COUNT = 90;
 
 /**
  * RESULT KEYS the API's behaviour DEPENDS on, per RPC.
