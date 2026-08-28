@@ -63,6 +63,7 @@ export const PHONE_RPC_NAMES = [
   'request_phone_rescreen',
   // 0060 — max-one candidate-specific same-objective probe.
   'record_phone_probe',
+  'consent_and_start_phone_assessment',
 ] as const;
 
 export type PhoneRpcName = (typeof PHONE_RPC_NAMES)[number];
@@ -178,6 +179,9 @@ export const PHONE_RPC_PARAMETERS: Readonly<Record<PhoneRpcName, readonly string
       'p_expected_index',
       'p_source_event_id',
       'p_now',
+    ],
+    consent_and_start_phone_assessment: [
+      'p_attempt_id', 'p_session_id', 'p_epoch', 'p_now',
     ],
   });
 
@@ -524,6 +528,9 @@ export const RECORD_PHONE_PROBE_STATUSES = [
 ] as const;
 export type RecordPhoneProbeStatus = (typeof RECORD_PHONE_PROBE_STATUSES)[number];
 
+export const CONSENT_AND_START_PHONE_ASSESSMENT_STATUSES = ['ok', 'invalid_input', 'consent_start_failed'] as const;
+export type ConsentAndStartPhoneAssessmentStatus = (typeof CONSENT_AND_START_PHONE_ASSESSMENT_STATUSES)[number];
+
 /** The per-RPC vocabularies, keyed by RPC name. */
 export const PHONE_RPC_STATUSES: Readonly<Record<PhoneRpcName, readonly string[]>> =
   Object.freeze({
@@ -551,6 +558,7 @@ export const PHONE_RPC_STATUSES: Readonly<Record<PhoneRpcName, readonly string[]
     claim_phone_sweep: CLAIM_PHONE_SWEEP_STATUSES,
     request_phone_rescreen: REQUEST_PHONE_RESCREEN_STATUSES,
     record_phone_probe: RECORD_PHONE_PROBE_STATUSES,
+    consent_and_start_phone_assessment: CONSENT_AND_START_PHONE_ASSESSMENT_STATUSES,
   });
 
 /**
@@ -586,7 +594,7 @@ export const PHONE_RPC_STATUS_UNION: readonly string[] = Object.freeze(
  * union, which is the whole reason the increment is smaller than the number
  * of RPCs added.
  */
-export const PHONE_RPC_STATUS_COUNT = 90;
+export const PHONE_RPC_STATUS_COUNT = 91;
 
 /**
  * RESULT KEYS the API's behaviour DEPENDS on, per RPC.

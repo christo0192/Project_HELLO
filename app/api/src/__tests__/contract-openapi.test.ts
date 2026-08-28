@@ -1032,7 +1032,7 @@ describe('OpenAPI document integrity', () => {
     // heartbeat. All six are service-authenticated with the existing
     // WORKER_CONTEXT_SECRET rather than a recruiter session, so none of them
     // widens the recruiter-facing surface at all.
-    expect(Object.keys(paths).length).toBe(99);
+    expect(Object.keys(paths).length).toBe(101);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -1074,7 +1074,7 @@ describe('OpenAPI document integrity', () => {
     //   must stay outside the pair a worker reads as a verdict.
     // 160 (base) + 2 (P3) + 31 (P6) + 5 (P4) + 8 (P4b) + 3 (P5) + 3 (0045)
     //   = 212, re-derived.
-    expect(Object.keys(schemas).length).toBe(212);
+    expect(Object.keys(schemas).length).toBe(215);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.
@@ -1262,6 +1262,8 @@ describe('auth boundary vs spec security model', () => {
     'POST /api/internal/phone/events',
     'POST /api/internal/phone/appointments',
     // P4b, same surface and same boundary: the durable half of a screening.
+    'POST /api/internal/phone/assessment/probe',
+    'POST /api/internal/phone/assessment/consent-start',
     'POST /api/internal/phone/assessment/start',
     'POST /api/internal/phone/assessment/turn',
     'POST /api/internal/phone/assessment/complete',

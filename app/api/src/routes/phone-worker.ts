@@ -175,6 +175,23 @@ const assessmentStartSchema = z
   })
   .strict();
 
+const assessmentProbeSchema = z
+  .object({
+    session_id: z.string().regex(UUID_RE),
+    question_key: z.string().trim().regex(/^[A-Za-z0-9_.:-]{1,100}$/),
+    expected_index: z.number().int().min(0).max(99),
+    source_event_id: z.string().trim().regex(/^[A-Za-z0-9_.:-]{1,200}$/),
+  })
+  .strict();
+
+const consentStartSchema = z
+  .object({
+    attempt_id: z.string().regex(UUID_RE),
+    session_id: z.string().regex(UUID_RE),
+    epoch: z.number().int().min(0).max(1_000_000),
+  })
+  .strict();
+
 /**
  * The attempt heartbeat (0045).
  *
@@ -698,6 +715,59 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       });
     } catch {
       return res.status(500).json({ ok: false, status: 'phone_heartbeat_error' });
+    }
+  });
+
+  // ── POST /assessment/probe ───────────────────────────────────────
+  router.post('/assessment/probe', requireWorkerPhoneAuth, async (req, res) => {
+    try {
+      if (!config().screeningEnabled) return res.status(503).json({ ok: false, error: 'phone_screening_disabled' });
+      const parsed = assessmentProbeSchema.safeParse(req.body);
+      const recordProbe = stores().recordProbe;
+      if (!parsed.success || typeof recordProbe !== 'function') return res.status(400).json({ ok: false, status: 'invalid_request' });
+      const result = await recordProbe({
+        sessionId: parsed.data.session_id,
+        questionKey: parsed.data.question_key,
+        expectedIndex: parsed.data.expected_index,
+        sourceEventId: parsed.data.source_event_id,
+        now: now(),
+      });
+      return res.json({ ok: result.status === 'probe_recorded' || result.status === 'duplicate', status: result.status, duplicate: result.duplicate === true });
+    } catch {
+      return res.status(500).json({ ok: false, status: 'phone_assessment_error' });
+    }
+  });
+
+  // ── POST /assessment/consent-start ────────────────────────────────
+  // The only consent-to-assessment boundary. The SQL RPC applies the
+  // deterministic human/disclosure events and starts the assessment in one
+  // transaction; recording begins asynchronously after that commit.
+  router.post('/assessment/consent-start', requireWorkerPhoneAuth, async (req, res) => {
+    try {
+      if (!config().screeningEnabled) {
+        return res.status(503).json({ ok: false, error: 'phone_screening_disabled' });
+      }
+      const parsed = consentStartSchema.safeParse(req.body);
+      const consentAndStart = stores().consentAndStart;
+      if (!parsed.success || typeof consentAndStart !== 'function') {
+        return res.status(400).json({ ok: false, status: 'invalid_request' });
+      }
+      const result = await consentAndStart({
+        attemptId: parsed.data.attempt_id,
+        sessionId: parsed.data.session_id,
+        epoch: parsed.data.epoch,
+        now: now(),
+      });
+      if (result.status !== 'ok' || result.state === undefined) {
+        return res.json({ ok: false, status: result.status });
+      }
+      // This is deliberately detached from the consent transaction. A slow
+      // egress provider must not delay the first authorized question; the
+      // recording reconciler owns one audited retry for the pending marker.
+      void startRecordingForAttempt(parsed.data.attempt_id, deps, now());
+      return res.json({ ok: true, status: 'ok', ...sanitizeAssessmentState(result.state) });
+    } catch {
+      return res.status(500).json({ ok: false, status: 'phone_consent_start_error' });
     }
   });
 

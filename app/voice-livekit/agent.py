@@ -1127,13 +1127,13 @@ async def _run_native_phone_screening(
     terminal_reason: dict[str, str] = {}
     terminal_reply_required = {"value": False}
     silence_prompted = {"value": False}
-    # Set only after the durable cursor CAS succeeds. The native Agent's
-    # llm_node consumes this fixed reply inside LiveKit's normal scheduler;
-    # ordinary phone questions therefore do not wait for a second Gemini call.
+    # The coordinator owns pending evidence; durable effects happen only from
+    # coordinator-bound tools after LiveKit authorizes the scheduled reply.
     reply_plan: list[str | None] = [None]
-
-    def fixed_question_reply(question: Any) -> str:
-        return f"Thanks for sharing. {question.text}"
+    pending: dict[str, Any] = {
+        "question": None, "prompt": None, "candidate": None,
+        "message": None, "probe_used": False, "source_event_id": None,
+    }
 
     async def wait_for_activity(timeout: float) -> str:
         """Wait on LiveKit activity or close without creating a turn queue."""
@@ -1249,29 +1249,16 @@ async def _run_native_phone_screening(
     async def on_native_turn(
         text: str, message: Any = None, turn_ctx: Any = None,
     ) -> None:
-        nonlocal cursor
-        # A plan belongs to exactly one completed user turn. Clearing it before
-        # routing prevents a prior fixed question from leaking into a
-        # clarification, callback, or terminal race.
+        # This hook routes and buffers only. It never changes the cursor or
+        # writes transcript evidence; those effects belong to the tools below.
         reply_plan[0] = None
         if finished.is_set():
-            # A terminal decision already owns the leg. Suppress only this late
-            # terminal-race turn; ordinary turns always return to LiveKit.
             from livekit.agents import StopResponse  # noqa: PLC0415
             raise StopResponse()
         if candidate_end_requested.is_set() or phone.is_explicit_end_call_request(text):
             candidate_end_requested.set()
-            reply_plan[0] = "Of course. I'll end the call now. Thanks for your time, and goodbye."
-            # Terminal copy is intentionally retained in the temporary
-            # context for transcript evidence. Phone preemptive generation is
-            # disabled, so this cannot invalidate an ordinary reply.
-            add_turn_instruction(
-                turn_ctx,
-                "Say exactly: Of course. I'll end the call now. Thanks for your time, "
-                "and goodbye. Do not ask another question.",
-            )
-            reply_handle[0] = None
-            reply_started.clear()
+            reply_plan[0] = phone.PHONE_CANDIDATE_END_TEXT
+            add_turn_instruction(turn_ctx, "Say exactly the candidate-end compliance closing: end the call now, thank the candidate, and say goodbye. Do not ask another question.")
             terminal_reply_required["value"] = True
             terminal_reason["reason"] = phone.HALT_CANDIDATE_ENDED
             finished.set()
@@ -1282,100 +1269,96 @@ async def _run_native_phone_screening(
             if question is not None:
                 add_turn_instruction(turn_ctx, phone_question_instructions(question))
             return
-
         route = phone.candidate_turn_route(text)
         if route is not None:
+            setattr(agent, "_turn_policy", "callback" if route == "callback_deferral" else "clarification")
             if question is not None and route == "callback_deferral":
-                add_turn_instruction(
-                    turn_ctx,
-                    "Acknowledge that this is not a good time. Offer to schedule a callback, "
-                    "ask for the time if needed, and use schedule_callback once the time is "
-                    "clear. Do not answer or advance the planned interview question.",
-                )
+                add_turn_instruction(turn_ctx, "Address the callback request and use schedule_callback only when the time is clear. Do not answer or advance the planned question.")
             elif question is not None:
-                add_turn_instruction(
-                    turn_ctx,
-                    "Answer the candidate briefly using only verified role context, then "
-                    "repeat this same planned question and wait:\n" + question.text,
-                )
+                add_turn_instruction(turn_ctx, "Answer briefly from verified role context, then repeat this same planned question:\n" + question.text)
             return
-
         if _native_turn_predates_question(message, latest_assistant_anchor[0]):
-            _log.info(
-                "unknown_event",
-                error_type="phone_stale_final_suppressed",
-                error_category="anchor_order",
-            )
             from livekit.agents import StopResponse  # noqa: PLC0415
             raise StopResponse()
-
-        question = state.question_at(cursor)
         prompt = (latest_assistant[0] or "").strip()
         if question is None or not prompt:
-            reply_plan[0] = "I'm sorry, I can't safely continue this screening right now. Thanks for your time."
-            reply_handle[0] = None
-            reply_started.clear()
-            terminal_reply_required["value"] = True
             terminal_reason["reason"] = phone.HALT_MALFORMED_EXCHANGE
             finished.set()
             return
-        turns = [
-            {
-                "speaker": "bot", "text": prompt,
-                "turn_started_at_ms": latest_assistant_anchor[0],
-            },
-            {
-                "speaker": "candidate", "text": text,
-                "turn_started_at_ms": (
-                    _turn_anchor_ms(message) or latest_candidate_anchor[0]
-                ),
-            },
-        ]
+        pending.update({
+            "question": question,
+            "prompt": prompt,
+            "candidate": text,
+            "message": message,
+            "turn_ctx": turn_ctx,
+            "probe_used": False,
+            "source_event_id": phone.plan_source_event_id(question.key),
+        })
         latest_candidate_anchor[0] = None
-        outcome = await events.commit_boundary(
-            session_id, question.key, cursor,
-            phone.plan_source_event_id(question.key), turns,
+        setattr(agent, "_turn_policy", "substantive")
+        add_turn_instruction(
+            turn_ctx,
+            "You must call exactly one coordinator tool before any spoken text. "
+            "Choose request_probe for one useful same-topic follow-up when the answer is thin; "
+            "otherwise choose advance_screening. Never speak before the tool result.",
         )
-        if not outcome.ok:
-            reply_plan[0] = "I'm sorry, I can't safely continue this screening right now. Thanks for your time."
-            reply_handle[0] = None
-            reply_started.clear()
-            terminal_reply_required["value"] = True
+        # Legacy/in-memory clients without the new probe endpoint use the
+        # deterministic thin-answer fallback. Production PhoneEventClient
+        # always exposes record_probe, so its durable tool-first path is used.
+        if not callable(getattr(events, "record_probe", None)):
+            await on_advance()
+
+    async def on_probe() -> str:
+        question = pending.get("question")
+        if question is None or pending.get("probe_used"):
+            return "Probe denied. Call advance_screening if the answer is sufficient."
+        recorder = getattr(events, "record_probe", None)
+        if not callable(recorder):
             terminal_reason["reason"] = phone.HALT_PERSISTENCE
             finished.set()
-            return
-        advanced = outcome.cursor
-        if advanced != cursor + 1:
-            reply_plan[0] = "I'm sorry, I can't safely continue this screening right now. Thanks for your time."
-            reply_handle[0] = None
-            reply_started.clear()
-            terminal_reply_required["value"] = True
+            return "Probe unavailable; do not ask a follow-up."
+        outcome = await recorder(
+            session_id, question.key, cursor,
+            f"probe:{phone.plan_source_event_id(question.key)}",
+        )
+        if not outcome.ok and outcome.status != "duplicate":
+            return "Probe denied. Call advance_screening without asking a follow-up."
+        pending["probe_used"] = True
+        return "Probe authorized. Acknowledge briefly and ask one same-topic follow-up about: " + question.text
+
+    async def on_advance() -> str:
+        nonlocal cursor
+        question = pending.get("question")
+        prompt = pending.get("prompt")
+        candidate = pending.get("candidate")
+        message = pending.get("message")
+        if question is None or not prompt or not isinstance(candidate, str):
             terminal_reason["reason"] = phone.HALT_PERSISTENCE
             finished.set()
-            return
+            return "Advance unavailable; do not ask another question."
+        turns = [
+            {"speaker": "bot", "text": prompt, "turn_started_at_ms": latest_assistant_anchor[0]},
+            {"speaker": "candidate", "text": candidate, "turn_started_at_ms": _turn_anchor_ms(message) if message is not None else None},
+        ]
+        outcome = await events.commit_boundary(session_id, question.key, cursor, pending["source_event_id"], turns)
+        if not outcome.ok or outcome.cursor != cursor + 1:
+            terminal_reason["reason"] = phone.HALT_PERSISTENCE
+            finished.set()
+            return "The screening cannot safely continue. Do not ask another question."
         if question.key not in completed:
             completed.append(question.key)
-        cursor = advanced
+        cursor = outcome.cursor
+        pending["question"] = None
         next_question = state.question_at(cursor)
         if next_question is None:
-            reply_plan[0] = "Thanks for your time, and goodbye."
-            add_turn_instruction(
-                turn_ctx,
-                "Thank the candidate briefly and say exactly: Thanks for your time, "
-                "and goodbye. Do not ask another question.",
-            )
-            # The native reply is scheduled only after this hook returns. Keep
-            # terminalization behind complete playout so room teardown cannot
-            # cut off the final response.
-            reply_handle[0] = None
-            reply_started.clear()
             terminal_reply_required["value"] = True
             terminal_reason["reason"] = "completed"
             finished.set()
-        else:
-            reply_plan[0] = fixed_question_reply(next_question)
-        # Do not generate or wait for speech here. Returning hands the turn back
-        # to AgentActivity, which owns the native single-reply path.
+            if pending.get("turn_ctx") is not None:
+                add_turn_instruction(pending["turn_ctx"], "Thank the candidate briefly, say goodbye, and complete the final closing. Do not ask another question.")
+            return "Advance authorized. Thank the candidate briefly, say goodbye, and complete the final closing."
+        pending["probe_used"] = False
+        return "Advance authorized. Acknowledge briefly and ask exactly this next question: " + next_question.text
 
     async def native_say(text: str) -> None:
         speech = session.say(text, allow_interruptions=True)
@@ -1390,28 +1373,19 @@ async def _run_native_phone_screening(
             terminal_reason["reason"] = phone.HALT_CALLBACK_SCHEDULED
             finished.set()
 
-    screening_agent = phone.phone_agent_class(Agent)(
-        _phone_instructions_text(state),
-        client=events,
-        attempt_id=attempt_id,
-        say=native_say,
-        on_user_turn=on_native_turn,
-        on_booking=on_booking,
-        native_turns=True,
-        native_reply_plan=lambda: reply_plan[0],
-    )
-    update_agent = getattr(session, "update_agent", None)
-    if not callable(update_agent):
-        raise RuntimeError("native_phone_agent_handoff_unavailable")
-    value = update_agent(screening_agent)
-    if inspect.isawaitable(value):
-        await value
-    agent = screening_agent
-    wait_for_idle = getattr(session, "wait_for_idle", None)
-    if callable(wait_for_idle):
-        value = wait_for_idle()
-        if inspect.isawaitable(value):
-            await value
+    # The same Agent instance was installed at SIP answer. Consent changes
+    # authorization and instructions; it never swaps the scheduler's agent.
+    if not await _apply_phone_instructions(agent, state):
+        raise RuntimeError("phone_instructions_unavailable")
+    setattr(agent, "_on_user_turn", on_native_turn)
+    setattr(agent, "_on_booking", on_booking)
+    setattr(agent, "_on_probe", on_probe)
+    setattr(agent, "_on_advance", on_advance)
+    setattr(agent, "_native_turns", True)
+    authorize = getattr(agent, "authorize_screening", None)
+    if not callable(authorize):
+        raise RuntimeError("phone_consent_authorization_unavailable")
+    authorize()
 
     question = state.question_at(cursor)
     if question is None:
@@ -1587,7 +1561,7 @@ async def _run_phone_session(
         if callable(wait_for_playout):
             await wait_for_playout()
 
-    def on_candidate_turn(text: str, message: Any = None) -> None:
+    def on_candidate_turn(text: str, message: Any = None, turn_ctx: Any = None) -> None:
         candidate_activity.set()
         user_turns.put_nowait(text)
         if phone.is_explicit_end_call_request(text):
@@ -1606,6 +1580,7 @@ async def _run_phone_session(
         attempt_id=attempt_id,
         say=say,
         on_user_turn=on_candidate_turn,
+        native_turns=True,
     )
 
     async def wait_for_participant() -> Any:
@@ -1780,10 +1755,6 @@ async def _run_phone_session(
             await _close_phone_room(room_name)
             return result
 
-        # The production SDK must expose the public handoff API. Failing here
-        # is safer than reviving a second speech scheduler.
-        if not callable(getattr(session, "update_agent", None)):
-            raise RuntimeError("native_phone_agent_handoff_unavailable")
         return await _run_native_phone_screening(
             session=session,
             agent=agent,

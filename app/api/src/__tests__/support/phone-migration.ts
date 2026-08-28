@@ -84,6 +84,12 @@ export const MIGRATION_0060_PATH = fileURLToPath(
 
 export const MIGRATION_0060 = readFileSync(MIGRATION_0060_PATH, 'utf8');
 
+export const MIGRATION_0061_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0061_phone_consent_start.sql', import.meta.url),
+);
+
+export const MIGRATION_0061 = readFileSync(MIGRATION_0061_PATH, 'utf8');
+
 /**
  * Every phone migration, NEWEST FIRST. Extraction walks this in order and the
  * first file that declares a thing wins, which is what "the latest declaration
@@ -91,6 +97,7 @@ export const MIGRATION_0060 = readFileSync(MIGRATION_0060_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    { name: '0061', sql: MIGRATION_0061 },
     { name: '0060', sql: MIGRATION_0060 },
     { name: '0057', sql: MIGRATION_0057 },
     // NOTE (residual, pre-existing): 0046–0050 are not registered here, so
@@ -211,6 +218,7 @@ export const RPC_NAMES = [
   // intentionally outside the phone-domain RPC contract.
   'request_phone_rescreen',
   'record_phone_probe',
+  'consent_and_start_phone_assessment',
 ] as const;
 
 /**

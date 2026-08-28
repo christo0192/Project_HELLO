@@ -31,6 +31,7 @@ import type {
   CommitPhoneQuestionBoundaryStatus,
   GetPhoneAssessmentStateStatus,
   RecordPhoneProbeStatus,
+  ConsentAndStartPhoneAssessmentStatus,
   StartPhoneAssessmentStatus,
   RequestPhoneRescreenStatus,
   PHONE_RPC_UNKNOWN_STATUS,
@@ -508,6 +509,18 @@ export interface RecordPhoneProbeResult {
   readonly questionIndex?: number;
 }
 
+export interface ConsentAndStartPhoneAssessmentInput {
+  readonly attemptId: string;
+  readonly sessionId: string;
+  readonly epoch: number;
+  readonly now: Date;
+}
+
+export interface ConsentAndStartPhoneAssessmentResult {
+  readonly status: ConsentAndStartPhoneAssessmentStatus | typeof PHONE_RPC_UNKNOWN_STATUS;
+  readonly state?: PhoneAssessmentState;
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // The port
 // ═══════════════════════════════════════════════════════════════════════
@@ -618,4 +631,5 @@ export interface PhoneStores {
   ): Promise<CommitPhoneQuestionBoundaryResult>;
   /** 0060; optional for legacy test doubles until P-3 adopts probes. */
   recordProbe?(input: RecordPhoneProbeInput): Promise<RecordPhoneProbeResult>;
+  consentAndStart?(input: ConsentAndStartPhoneAssessmentInput): Promise<ConsentAndStartPhoneAssessmentResult>;
 }
