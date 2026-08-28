@@ -75,6 +75,7 @@
         "ASHBY_INTEGRATION_ENABLED": { "requiredInProduction": false, "secret": false },
         "ASHBY_WEBHOOK_SECRET": { "requiredInProduction": false, "secret": true, "external": true },
         "ASHBY_RUNTIME_ENABLED": { "requiredInProduction": false, "secret": false },
+        "ASHBY_RESCREEN_SCORECARD_ENABLED": { "requiredInProduction": false, "secret": false },
         "ASHBY_API_KEY": { "requiredInProduction": false, "secret": true, "external": true },
         "ASHBY_RESUME_HOSTS": { "requiredInProduction": false, "secret": false, "external": true },
         "ASHBY_SIGNAL_POLL_MS": { "requiredInProduction": false, "secret": false },

@@ -209,7 +209,10 @@ export async function runClaimedAshbyOperation(
         const r = await deps.stores.failOperation(claim.id, claim.leaseToken, 'scorecard_sink_unavailable', false);
         return { claimed: true, operationType: claim.operationType, committed: false, staleLease: r === 'not_owned', code: 'scorecard_sink_unavailable' };
       }
-      const source = await deps.stores.readScorecardSource(claim.applicationLinkId);
+      const source = await deps.stores.readScorecardSource(
+        claim.applicationLinkId,
+        claim.sourceSessionId,
+      );
       if (!source) {
         const r = await deps.stores.failOperation(claim.id, claim.leaseToken, 'assessment_missing', true);
         return { claimed: true, operationType: claim.operationType, committed: false, staleLease: r === 'not_owned', code: 'assessment_missing' };
