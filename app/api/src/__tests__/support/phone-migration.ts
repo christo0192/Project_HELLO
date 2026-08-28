@@ -90,6 +90,12 @@ export const MIGRATION_0061_PATH = fileURLToPath(
 
 export const MIGRATION_0061 = readFileSync(MIGRATION_0061_PATH, 'utf8');
 
+export const MIGRATION_0063_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0063_phone_candidate_test_gate.sql', import.meta.url),
+);
+
+export const MIGRATION_0063 = readFileSync(MIGRATION_0063_PATH, 'utf8');
+
 /**
  * Every phone migration, NEWEST FIRST. Extraction walks this in order and the
  * first file that declares a thing wins, which is what "the latest declaration
@@ -97,6 +103,7 @@ export const MIGRATION_0061 = readFileSync(MIGRATION_0061_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    { name: '0063', sql: MIGRATION_0063 },
     { name: '0061', sql: MIGRATION_0061 },
     { name: '0060', sql: MIGRATION_0060 },
     { name: '0057', sql: MIGRATION_0057 },
@@ -217,6 +224,8 @@ export const RPC_NAMES = [
   // 0057 — explicit cycle door. PII-bearing number verification is
   // intentionally outside the phone-domain RPC contract.
   'request_phone_rescreen',
+  'arm_phone_test_gate',
+  'admit_phone_test_attempt',
   'record_phone_probe',
   'consent_and_start_phone_assessment',
 ] as const;

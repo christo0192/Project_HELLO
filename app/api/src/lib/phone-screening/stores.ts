@@ -29,7 +29,9 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import {
   narrowPhoneRpcStatus,
   PHONE_RPC_UNKNOWN_STATUS,
+  ADMIT_PHONE_ATTEMPT_STATUSES,
   type AdmitPhoneAttemptStatus,
+  type ArmPhoneTestGateStatus,
   type ApplyPhoneEventStatus,
   type CancelPhoneAppointmentStatus,
   type ClearPhoneHaltStatus,
@@ -340,6 +342,60 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
         leaseToken: str(row, 'lease_token'),
         leaseExpiresAt: iso(row, 'lease_expires_at'),
         liveBefore: num(row, 'live_before'),
+      };
+    },
+
+    async admitTestAttempt(input) {
+      const { data, error } = await client.rpc('admit_phone_test_attempt', {
+        p_test_gate_id: input.testGateId,
+        p_engagement_id: input.engagementId,
+        p_kind: input.kind,
+        p_lease_owner: input.leaseOwner ?? null,
+        p_lease_seconds: input.leaseSeconds ?? 60,
+        p_now: isoInstant(input.now),
+      });
+      if (error) throw new Error('phone_admit_test_attempt_error');
+      const row = asRow(data);
+      const raw = str(row, 'status');
+      // The wrapper forwards the ordinary admission result. Its own guard
+      // statuses are intentionally collapsed to `halted` at this seam so the
+      // calling domain never grows a second admission vocabulary.
+      const status = raw && (ADMIT_PHONE_ATTEMPT_STATUSES as readonly string[]).includes(raw)
+        ? raw as AdmitPhoneAttemptStatus
+        : 'halted' as AdmitPhoneAttemptStatus;
+      if (status !== 'ok') return { status, detail: raw === status ? refusalDetail(row) : { constraint: raw ?? 'unknown' } };
+      return {
+        status,
+        attemptId: str(row, 'attempt_id'),
+        attemptSeq: num(row, 'attempt_seq'),
+        kind: member<PhoneAttemptKind>(row, 'kind', PHONE_ATTEMPT_KINDS),
+        epoch: num(row, 'epoch'),
+        istDate: str(row, 'ist_date'),
+        leaseToken: str(row, 'lease_token'),
+        leaseExpiresAt: iso(row, 'lease_expires_at'),
+        liveBefore: num(row, 'live_before'),
+      };
+    },
+
+    async armTestGate(input) {
+      const { data, error } = await client.rpc('arm_phone_test_gate', {
+        p_candidate_id: input.candidateId,
+        p_engagement_id: input.engagementId,
+        p_actor_id: input.actorId,
+        p_request_id: input.requestId,
+        p_expires_at: isoInstant(input.expiresAt),
+        p_now: isoInstant(input.now),
+      });
+      if (error) throw new Error('phone_arm_test_gate_error');
+      const row = asRow(data);
+      return {
+        status: narrowPhoneRpcStatus<ArmPhoneTestGateStatus>(
+          'arm_phone_test_gate', row,
+        ),
+        gateId: str(row, 'gate_id'),
+        candidateId: str(row, 'candidate_id'),
+        engagementId: str(row, 'engagement_id'),
+        expiresAt: iso(row, 'expires_at'),
       };
     },
 

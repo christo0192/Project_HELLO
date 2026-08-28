@@ -59,6 +59,7 @@ export type PhoneDueState = (typeof PHONE_DUE_STATES)[number];
 /** Explicit column lists. Never `*`, and never a column this file does not use. */
 const DUE_ENGAGEMENT_COLUMNS =
   'id,state,candidate_id,role_id,session_id,next_eligible_at,no_answer_attempts,updated_at';
+const PHONE_TEST_GATE_COLUMNS = 'id,candidate_id,engagement_id,expires_at';
 
 /**
  * The candidate read is TWO columns and both are about dialability. `name`,
@@ -110,6 +111,13 @@ export function boundedRowLimit(limit: number): number {
   return Math.min(PHONE_RUNTIME_MAX_ROWS, Math.floor(limit));
 }
 
+export interface PhoneTestGate {
+  readonly id: string;
+  readonly candidateId: string;
+  readonly engagementId: string;
+  readonly expiresAt: string;
+}
+
 export interface DuePhoneEngagement {
   readonly engagementId: string;
   readonly state: PhoneDueState;
@@ -138,6 +146,9 @@ export interface PhoneRuntimeReader {
    * per-IST-day index, the fleet cap and the number. Nothing here duplicates
    * any of that; a second copy of a gate is how the two come to disagree.
    */
+  /** The one active candidate gate, if any. Read-only and bounded. */
+  activeTestGate?(input: { now: Date }): Promise<PhoneTestGate | null>;
+
   listDueEngagements(input: {
     nowIso: string;
     limit: number;
@@ -149,6 +160,8 @@ export interface PhoneRuntimeReader {
      * the read cannot stop not-yet-due reconnects consuming every slot.
      */
     reconnectBackoffSeconds: number;
+    /** Restrict the due read to the gate's one engagement. */
+    onlyEngagementId?: string;
   }): Promise<readonly DuePhoneEngagement[]>;
 
   /**
@@ -380,6 +393,7 @@ async function readDueBatch(
     limit: number;
     onlyState: PhoneDueState | null;
     reconnectBackoffSeconds: number;
+    onlyEngagementId?: string;
   },
 ): Promise<DuePhoneEngagement[]> {
   const base = client
@@ -389,6 +403,9 @@ async function readDueBatch(
   const narrowed = input.onlyState === null
     ? base.in('state', PHONE_DUE_STATES as unknown as string[])
     : base.eq('state', input.onlyState);
+  const scoped = input.onlyEngagementId === undefined
+    ? narrowed
+    : narrowed.eq('id', input.onlyEngagementId);
   // ── THE RECONNECT BATCH NEEDS ITS OWN CLOCK, IN SQL ────────────────
   // `dueClockPredicate`'s first disjunct is `state.eq.reconnecting`, which
   // is trivially TRUE for every row of the reconnect-only read — so that
@@ -403,11 +420,11 @@ async function readDueBatch(
   // same arithmetic `dueByClock` does — so it can be expressed here, and
   // must be, because the batch is bounded before the JS filter ever runs.
   const filtered = input.onlyState === 'reconnecting'
-    ? narrowed.lte(
+    ? scoped.lte(
       'updated_at',
       reconnectDueCeiling(input.nowIso, input.reconnectBackoffSeconds),
     )
-    : narrowed.or(dueClockPredicate(input.nowIso));
+    : scoped.or(dueClockPredicate(input.nowIso));
   const { data, error } = await filtered
     .order('updated_at', { ascending: true })
     .limit(input.limit);
@@ -419,6 +436,27 @@ async function readDueBatch(
 
 export function createPhoneRuntimeReader(client: SupabaseClient): PhoneRuntimeReader {
   return {
+    async activeTestGate(input): Promise<PhoneTestGate | null> {
+      const { data, error } = await client
+        .from('phone_test_gates')
+        .select(PHONE_TEST_GATE_COLUMNS)
+        .is('consumed_at', null)
+        .gt('expires_at', isoInstant(input.now.toISOString()))
+        .order('expires_at', { ascending: true })
+        .limit(1);
+      if (error) throw new Error('phone_runtime_test_gate_read_error');
+      const row = (Array.isArray(data) ? (data as Row[]) : [])[0];
+      if (row === undefined) return null;
+      const id = str(row, 'id');
+      const candidateId = str(row, 'candidate_id');
+      const engagementId = str(row, 'engagement_id');
+      const expiresAt = str(row, 'expires_at');
+      if (!id || !candidateId || !engagementId || !expiresAt) {
+        throw new Error('phone_runtime_test_gate_read_error');
+      }
+      return { id, candidateId, engagementId, expiresAt };
+    },
+
     /**
      * ── RECONNECTS GO FIRST, AND THE ORDERING ALONE CANNOT DO IT ──────
      * The main batch is ordered `updated_at asc` and BOUNDED (`dueLimit`
@@ -464,12 +502,14 @@ export function createPhoneRuntimeReader(client: SupabaseClient): PhoneRuntimeRe
           limit: reconnectSlots,
           onlyState: 'reconnecting',
           reconnectBackoffSeconds: input.reconnectBackoffSeconds,
+          onlyEngagementId: input.onlyEngagementId,
         });
       const rest = await readDueBatch(client, {
         nowIso: input.nowIso,
         limit,
         onlyState: null,
         reconnectBackoffSeconds: input.reconnectBackoffSeconds,
+        onlyEngagementId: input.onlyEngagementId,
       });
 
       const merged: DuePhoneEngagement[] = [];

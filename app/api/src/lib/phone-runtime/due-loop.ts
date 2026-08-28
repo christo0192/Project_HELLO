@@ -239,6 +239,7 @@ export interface PhoneDialPort {
     kind: PhoneAttemptKind;
     number: DialableNumber;
     now: Date;
+    testGateId?: string;
   }): Promise<{
     status: 'dialing' | 'refused';
     refusal?: string;
@@ -354,17 +355,31 @@ export async function runPhoneDuePass(
   }
 
   // ── THE HALT, FIRST, AND FAIL CLOSED ────────────────────────────────
-  // A control row we cannot read is a stop, not a go. `phone_backlog` already
-  // reports a missing singleton as `halted: true`; a thrown read is treated
-  // the same way here rather than being allowed to mean "carry on".
-  let halted = true;
+  // A control row we cannot read is a stop, not a go. A candidate test gate
+  // is the only narrowly-scoped exception, and it is valid only while the
+  // named global halt is the ordinary operator pause.
+  let testGate = null as Awaited<ReturnType<NonNullable<PhoneRuntimeReader['activeTestGate']>>>;
   try {
-    const backlog = await deps.stores.backlog({ now: options.now });
-    halted = backlog.admission?.halted !== false || backlog.admission?.controlPresent !== true;
+    testGate = deps.reader.activeTestGate
+      ? await deps.reader.activeTestGate({ now: options.now })
+      : null;
   } catch {
-    halted = true;
+    return { ...ZERO, status: 'halted' };
   }
-  if (halted) {
+  let backlog: Awaited<ReturnType<PhoneStores['backlog']>>;
+  try {
+    backlog = await deps.stores.backlog({ now: options.now });
+  } catch {
+    return { ...ZERO, status: 'halted' };
+  }
+  const halted = backlog.admission?.halted !== false || backlog.admission?.controlPresent !== true;
+  const gateMayRun = testGate !== null
+    && backlog.admission?.controlPresent === true
+    && backlog.admission.halted === true
+    && backlog.admission.haltReason === 'operator_pause';
+  // An active gate also freezes the ordinary lane if somebody has cleared the
+  // halt unexpectedly: otherwise the gate would cease to be exclusive.
+  if ((halted && !gateMayRun) || (!halted && testGate !== null)) {
     return { ...ZERO, status: 'halted' };
   }
 
@@ -375,6 +390,7 @@ export async function runPhoneDuePass(
     // so the SQL filter and the JS filter cannot drift apart into a batch
     // that reads rows it then always rejects.
     reconnectBackoffSeconds: deps.config.reconnectBackoffSeconds,
+    onlyEngagementId: testGate?.engagementId,
   });
 
   const skipped: Record<string, number> = {};
@@ -486,6 +502,7 @@ export async function runPhoneDuePass(
       kind,
       number,
       now: options.now,
+      testGateId: testGate?.id,
     });
     if (result.status === 'dialing') dialing += 1;
     else bump(refusals, phoneRefusalCountKey(result.refusal ?? 'unknown', result.detail));

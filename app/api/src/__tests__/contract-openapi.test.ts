@@ -1032,7 +1032,7 @@ describe('OpenAPI document integrity', () => {
     // heartbeat. All six are service-authenticated with the existing
     // WORKER_CONTEXT_SECRET rather than a recruiter session, so none of them
     // widens the recruiter-facing surface at all.
-    expect(Object.keys(paths).length).toBe(101);
+    expect(Object.keys(paths).length).toBe(102);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas

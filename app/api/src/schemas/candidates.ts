@@ -88,6 +88,17 @@ export const phoneRescreenBodySchema = z
 
 export type PhoneRescreenBodyInput = z.infer<typeof phoneRescreenBodySchema>;
 
+/** Admin-only, one-shot production test gate. The server fixes the expiry. */
+export const phoneTestGateBodySchema = z
+  .object({
+    request_id: z
+      .string()
+      .regex(/^[A-Za-z0-9_.:-]{1,128}$/, 'request_id must be a bounded idempotency key'),
+  })
+  .strict();
+
+export type PhoneTestGateBodyInput = z.infer<typeof phoneTestGateBodySchema>;
+
 /** Admin-only number reverification input. The value is never echoed or audited. */
 export const phoneVerificationBodySchema = z
   .object({

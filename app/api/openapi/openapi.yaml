@@ -602,6 +602,63 @@ paths:
               schema:
                 $ref: '#/components/schemas/SimpleError'
 
+  /api/candidates/{id}/phone-test-gate:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [candidates, phone]
+      operationId: armPhoneTestGate
+      summary: Arm one exclusive candidate phone test (admin only)
+      description: Creates or reuses an immutable rescreen cycle and arms a ten-minute, globally exclusive test gate. It bypasses only an operator_pause for the named candidate; emergency, provider, legal, and cost-control halts remain absolute. The gate is consumed atomically by admission and no other candidate can dial while it is active.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [request_id]
+              properties:
+                request_id:
+                  type: string
+                  pattern: '^[A-Za-z0-9_.:-]{1,128}$'
+      responses:
+        '202':
+          description: Exclusive test gate armed or the same request replayed.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok, status, cycle_number]
+                properties:
+                  ok: { type: boolean, enum: [true] }
+                  status: { type: string, enum: [armed] }
+                  cycle_number: { type: integer, nullable: true }
+        '400':
+          description: Request shape validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: Candidate, cycle, consent, halt, or exclusive-gate policy refused the request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '503':
+          description: Phone screening is disabled or unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+
   /api/candidates/{id}/phone-number-verification:
     parameters:
       - name: id
