@@ -20,6 +20,8 @@ import { wrapDialableNumber } from '../integrations/livekit-phone-dial/dialable-
 import type { ApplyPhoneEventResult } from '../lib/phone-screening/index.js';
 
 const ATTEMPT = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+/** The wire form Plivo can actually deliver: dash-free (alphanumeric-only). */
+const ATTEMPT_WIRE = ATTEMPT.replace(/-/g, '');
 const CANDIDATE_E164 = '+919812345678';
 const CALLER_ID = '+919800000001';
 const TOKEN = 'plivo-auth-token-abcdef';
@@ -100,7 +102,7 @@ describe('plivo route — disabled does nothing at all', () => {
     const res = await request(app)
       .post('/api/integrations/plivo/answer')
       .type('form')
-      .send({ 'X-PH-Hello-Attempt': ATTEMPT });
+      .send({ 'X-PH-HELLOATTEMPT': ATTEMPT_WIRE });
     expect(res.status).toBe(503);
     expect(resolveForAnswer).not.toHaveBeenCalled();
   });
@@ -110,7 +112,7 @@ describe('plivo /answer — bridges only a valid, live, signed request', () => {
   it('returns the Dial XML with callerId from config and number resolved server-side', async () => {
     const app = buildApp({ config: ENABLED, bounceStore: bridgingStore(), stores: { applyEvent: vi.fn() } });
     const res = await signedPost(app, '/api/integrations/plivo/answer', ANSWER_URL, {
-      'X-PH-Hello-Attempt': ATTEMPT,
+      'X-PH-HELLOATTEMPT': ATTEMPT_WIRE,
       To: CALLER_ID,
       From: CANDIDATE_E164,
     });
@@ -125,7 +127,7 @@ describe('plivo /answer — bridges only a valid, live, signed request', () => {
     const store = bridgingStore();
     const app = buildApp({ config: ENABLED, bounceStore: store, stores: { applyEvent: vi.fn() } });
     const res = await signedPost(app, '/api/integrations/plivo/answer', ANSWER_URL, {
-      'X-PH-Hello-Attempt': ATTEMPT,
+      'X-PH-HELLOATTEMPT': ATTEMPT_WIRE,
       To: '+910000000000',
     });
     // The number came from the store, not the request param.
@@ -140,7 +142,7 @@ describe('plivo /answer — bridges only a valid, live, signed request', () => {
       .type('form')
       .set('X-Plivo-Signature-V3', 'AAAAwrongAAAA=')
       .set('X-Plivo-Signature-V3-Nonce', 'nonce-xyz')
-      .send({ 'X-PH-Hello-Attempt': ATTEMPT });
+      .send({ 'X-PH-HELLOATTEMPT': ATTEMPT_WIRE });
     expect(res.status).toBe(200);
     expect(res.text).toBe('<Response><Hangup/></Response>');
   });
@@ -151,12 +153,30 @@ describe('plivo /answer — bridges only a valid, live, signed request', () => {
     expect(res.text).toBe('<Response><Hangup/></Response>');
   });
 
-  it('hangs up when the correlation id is not a uuid', async () => {
+  it('hangs up when the correlation id is not a uuid or 32-hex value', async () => {
+    const app = buildApp({ config: ENABLED, bounceStore: bridgingStore(), stores: { applyEvent: vi.fn() } });
+    for (const bad of ['not-a-uuid', 'zz'.repeat(16), ATTEMPT_WIRE.slice(0, 31)]) {
+      const res = await signedPost(app, '/api/integrations/plivo/answer', ANSWER_URL, {
+        'X-PH-HELLOATTEMPT': bad,
+      });
+      expect(res.text).toBe('<Response><Hangup/></Response>');
+    }
+  });
+
+  it('still tolerates a dashed uuid, should one ever survive the wire', async () => {
     const app = buildApp({ config: ENABLED, bounceStore: bridgingStore(), stores: { applyEvent: vi.fn() } });
     const res = await signedPost(app, '/api/integrations/plivo/answer', ANSWER_URL, {
-      'X-PH-Hello-Attempt': 'not-a-uuid',
+      'X-PH-HELLOATTEMPT': ATTEMPT,
     });
-    expect(res.text).toBe('<Response><Hangup/></Response>');
+    expect(res.text).toContain('<Dial');
+  });
+
+  it('re-dashes an UPPERCASE hex wire value to the canonical lowercase uuid', async () => {
+    const app = buildApp({ config: ENABLED, bounceStore: bridgingStore(), stores: { applyEvent: vi.fn() } });
+    const res = await signedPost(app, '/api/integrations/plivo/answer', ANSWER_URL, {
+      'X-PH-HELLOATTEMPT': ATTEMPT_WIRE.toUpperCase(),
+    });
+    expect(res.text).toContain('<Dial');
   });
 
   it('hangs up for an unknown / terminal / non-bridgeable attempt', async () => {
@@ -167,7 +187,7 @@ describe('plivo /answer — bridges only a valid, live, signed request', () => {
     });
     const app = buildApp({ config: ENABLED, bounceStore: store, stores: { applyEvent: vi.fn() } });
     const res = await signedPost(app, '/api/integrations/plivo/answer', ANSWER_URL, {
-      'X-PH-Hello-Attempt': ATTEMPT,
+      'X-PH-HELLOATTEMPT': ATTEMPT_WIRE,
     });
     expect(res.text).toBe('<Response><Hangup/></Response>');
   });
@@ -175,7 +195,7 @@ describe('plivo /answer — bridges only a valid, live, signed request', () => {
   it('accepts the correlation param case-INSENSITIVELY', async () => {
     const app = buildApp({ config: ENABLED, bounceStore: bridgingStore(), stores: { applyEvent: vi.fn() } });
     const res = await signedPost(app, '/api/integrations/plivo/answer', ANSWER_URL, {
-      'x-ph-hello-attempt': ATTEMPT,
+      'x-ph-helloattempt': ATTEMPT_WIRE,
     });
     expect(res.text).toContain('<Dial');
   });
@@ -186,7 +206,7 @@ describe('plivo /dial-status — applies the right ledger event', () => {
     const applyEvent = vi.fn(async () => okApply);
     const app = buildApp({ config: ENABLED, bounceStore: bridgingStore(), stores: { applyEvent } });
     const res = await signedPost(app, '/api/integrations/plivo/dial-status', DIAL_STATUS_URL, {
-      'X-PH-Hello-Attempt': ATTEMPT,
+      'X-PH-HELLOATTEMPT': ATTEMPT_WIRE,
       DialStatus: 'answer',
       CallUUID: 'call-uuid-1',
     });
@@ -202,7 +222,7 @@ describe('plivo /dial-status — applies the right ledger event', () => {
     const applyEvent = vi.fn(async () => okApply);
     const app = buildApp({ config: ENABLED, bounceStore: bridgingStore(), stores: { applyEvent } });
     await signedPost(app, '/api/integrations/plivo/dial-status', DIAL_STATUS_URL, {
-      'X-PH-Hello-Attempt': ATTEMPT,
+      'X-PH-HELLOATTEMPT': ATTEMPT_WIRE,
       DialStatus: 'busy',
       CallUUID: 'call-uuid-2',
     });
@@ -217,7 +237,7 @@ describe('plivo /dial-status — applies the right ledger event', () => {
       const applyEvent = vi.fn(async () => okApply);
       const app = buildApp({ config: ENABLED, bounceStore: bridgingStore(), stores: { applyEvent } });
       await signedPost(app, '/api/integrations/plivo/dial-status', DIAL_STATUS_URL, {
-        'X-PH-Hello-Attempt': ATTEMPT,
+        'X-PH-HELLOATTEMPT': ATTEMPT_WIRE,
         DialStatus: status,
         CallUUID: `uuid-${status}`,
       });
@@ -235,7 +255,7 @@ describe('plivo /dial-status — applies the right ledger event', () => {
       .type('form')
       .set('X-Plivo-Signature-V3', 'AAAAwrongAAAA=')
       .set('X-Plivo-Signature-V3-Nonce', 'nonce-xyz')
-      .send({ 'X-PH-Hello-Attempt': ATTEMPT, DialStatus: 'answer' });
+      .send({ 'X-PH-HELLOATTEMPT': ATTEMPT_WIRE, DialStatus: 'answer' });
     expect(res.status).toBe(200);
     expect(applyEvent).not.toHaveBeenCalled();
   });
@@ -246,7 +266,7 @@ describe('plivo /dial-status — applies the right ledger event', () => {
     });
     const app = buildApp({ config: ENABLED, bounceStore: bridgingStore(), stores: { applyEvent } });
     const res = await signedPost(app, '/api/integrations/plivo/dial-status', DIAL_STATUS_URL, {
-      'X-PH-Hello-Attempt': ATTEMPT,
+      'X-PH-HELLOATTEMPT': ATTEMPT_WIRE,
       DialStatus: 'answer',
       CallUUID: 'x',
     });
@@ -288,12 +308,12 @@ describe('plivo routes — no route logs or echoes a phone number', () => {
     try {
       const app = buildApp({ config: ENABLED, bounceStore: bridgingStore(), stores: { applyEvent: vi.fn(async () => okApply) } });
       await signedPost(app, '/api/integrations/plivo/answer', ANSWER_URL, {
-        'X-PH-Hello-Attempt': ATTEMPT,
+        'X-PH-HELLOATTEMPT': ATTEMPT_WIRE,
         To: CALLER_ID,
         From: CANDIDATE_E164,
       });
       await signedPost(app, '/api/integrations/plivo/dial-status', DIAL_STATUS_URL, {
-        'X-PH-Hello-Attempt': ATTEMPT,
+        'X-PH-HELLOATTEMPT': ATTEMPT_WIRE,
         DialStatus: 'answer',
         CallUUID: 'c',
         To: CANDIDATE_E164,

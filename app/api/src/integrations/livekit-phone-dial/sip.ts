@@ -79,9 +79,12 @@ export function phoneParticipantIdentity(attemptId: string): string {
 
 /**
  * The participant attribute carrying the correlation attempt id in BOUNCE
- * mode. The bounce trunk maps it to the SIP header `X-PH-HELLO-ATTEMPT`, which
- * Plivo forwards to its answer callback as a request param, and the callback
- * uses it to resolve WHICH attempt this instant-answer belongs to.
+ * mode — kept for OBSERVABILITY only (it names the attempt on the LiveKit
+ * participant). It is NOT the correlation transport: the trunk-level
+ * `attributesToHeaders` mapping applies only to BYE/REFER requests, never the
+ * initial INVITE (livekit/sip#404) — call 12 (2026-08-29) proved the answer
+ * callback arrived with no correlation param at all. The INVITE header is
+ * sent explicitly per-participant instead; see PHONE_HELLO_ATTEMPT_HEADER.
  *
  * Deliberately NOT in P3's inbound `APPROVED_PARTICIPANT_ATTRIBUTES` allowlist:
  * that allowlist governs what the LiveKit WEBHOOK reader is willing to read
@@ -90,6 +93,28 @@ export function phoneParticipantIdentity(attemptId: string): string {
  * uuid, so it can never hold a phone number.
  */
 export const PHONE_HELLO_ATTEMPT_ATTRIBUTE = 'xhelloattempt';
+
+/**
+ * The SIP header carrying the correlation attempt id on the bounce INVITE,
+ * sent via `CreateSIPParticipantOptions.headers` ("sent as-is" on the INVITE —
+ * the only LiveKit mechanism that actually reaches the INVITE).
+ *
+ * The shape is dictated by Plivo's SIP-header rules, which are STRICTER than
+ * SIP: a forwarded `X-PH-` header's remaining NAME may only contain [A-Za-z0-9]
+ * (max 24 chars) and its VALUE only [A-Za-z0-9%] (max 120). So:
+ *   * the name is `X-PH-HELLOATTEMPT` — no dash after the mandated prefix;
+ *   * the value is the attempt uuid with its dashes STRIPPED (32 lowercase hex
+ *     chars — pure alphanumeric, and still incapable of holding a phone
+ *     number). The webhook re-inserts the dashes before resolution.
+ * A dashed name or a dashed uuid value is silently DROPPED by Plivo — that
+ * silence is exactly the call-12 failure mode this constant encodes against.
+ */
+export const PHONE_HELLO_ATTEMPT_HEADER = 'X-PH-HELLOATTEMPT';
+
+/** The attempt uuid as Plivo-safe header value: dashes stripped, 32 hex. */
+export function helloAttemptHeaderValue(attemptId: string): string {
+  return attemptId.replace(/-/g, '');
+}
 
 /**
  * What the dial targets. Two shapes, one seam:
@@ -196,6 +221,17 @@ export function createLiveSipClient(
               [PHONE_HELLO_ATTEMPT_ATTRIBUTE]: request.attemptId,
             }
           : { [PHONE_EPOCH_ATTRIBUTE]: String(request.epoch) };
+      // The CORRELATION TRANSPORT (bounce only): an explicit INVITE header.
+      // The trunk's attributesToHeaders mapping never touches the INVITE
+      // (BYE/REFER only — livekit/sip#404), so this per-participant header is
+      // the one channel Plivo's answer callback can actually receive. The
+      // value is the attempt uuid dash-stripped to satisfy Plivo's
+      // alphanumeric-only header-value rule; carrying no dashes, it can never
+      // be mistaken for (or hold) a phone number.
+      const inviteHeaders: Record<string, string> | undefined =
+        request.target.kind === 'bounce'
+          ? { [PHONE_HELLO_ATTEMPT_HEADER]: helloAttemptHeaderValue(request.attemptId) }
+          : undefined;
       const info = await client.createSipParticipant(
         request.trunkId,
         sipCallTo,
@@ -207,6 +243,9 @@ export function createLiveSipClient(
           // indexes only `phone_epoch` by exact name, so `xhelloattempt` is
           // never read back off a participant by our own webhook path.
           participantAttributes,
+          // Sent as-is on the INVITE (bounce only; undefined otherwise, so the
+          // candidate path's INVITE is byte-identical to before this change).
+          headers: inviteHeaders,
           // In bounce mode there is no candidate number in this call at all, so
           // `hidePhoneNumber` guards nothing here — but it stays TRUE
           // unconditionally: the endpoint username is not sensitive, and a
