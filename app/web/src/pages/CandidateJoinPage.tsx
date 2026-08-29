@@ -149,7 +149,7 @@ function plainText(markdown: string): string {
 
 export function CandidateJoinPage() {
   const [phase, setPhase] = useState<JoinPhase>('loading');
-  const [status, setStatus] = useState<'ready' | 'joining' | 'live' | 'ended'>('ready');
+  const [status, setStatus] = useState<'ready' | 'joining' | 'live' | 'ending' | 'ended'>('ready');
   const [error, setError] = useState<string | null>(null);
   const [template, setTemplate] = useState<CandidateConsentTemplate | null>(null);
   const [checked, setChecked] = useState<Record<string, boolean>>({});
@@ -157,6 +157,8 @@ export function CandidateJoinPage() {
   const [candidateStage, setCandidateStage] = useState<'landing' | 'consent' | 'readiness'>('consent');
   const [inviteHasConsent, setInviteHasConsent] = useState(false);
   const [interviewerLevel, setInterviewerLevel] = useState(0);
+  const [microphoneMuted, setMicrophoneMuted] = useState(false);
+  const [completionKind, setCompletionKind] = useState<'completed' | 'closed'>('completed');
   const [liveTranscript, setLiveTranscript] = useState<LiveTranscriptSegment[]>([]);
   const inviteRef = useRef<string | null>(null);
   const roomRef = useRef<Room | null>(null);
@@ -167,12 +169,20 @@ export function CandidateJoinPage() {
   const recorderRef = useRef<MediaRecorder | null>(null);
   const recordingChunksRef = useRef<BlobPart[]>([]);
   const finalizationPromiseRef = useRef<Promise<void> | null>(null);
+  const manualCloseRef = useRef(false);
   const capabilityStatus = useCapabilitySupport();
 
   // ── Invite capture: fragment → memory only, fragment removed immediately ─
   useEffect(() => {
     const raw = window.location.hash.slice(1);
-    const invite = raw ? decodeURIComponent(raw) : '';
+    let invite = '';
+    try {
+      invite = raw ? decodeURIComponent(raw) : '';
+    } catch {
+      // Malformed percent-encoding is treated exactly like any other invalid
+      // invite. The fragment is still removed below and no API call is made.
+      invite = '';
+    }
     // Fail closed on missing/malformed fragments — never call the API with a
     // value that cannot be a real invite (64-hex).
     inviteRef.current = INVITE_TOKEN_RE.test(invite) ? invite : null;
@@ -455,6 +465,8 @@ export function CandidateJoinPage() {
       // browser permission/device step fails, the invite remains reusable.
       const localTrack = preflightTrack ?? await acquireLocalAudioTrack();
       localTrackRef.current = localTrack;
+      manualCloseRef.current = false;
+      setMicrophoneMuted(false);
 
       joinStep = 'exchange';
       const access = await api.exchangeCandidateInvite(invite);
@@ -504,7 +516,8 @@ export function CandidateJoinPage() {
         });
       });
       room.on(RoomEvent.Disconnected, () => {
-        setStatus('ended');
+        if (!manualCloseRef.current) setCompletionKind('completed');
+        setStatus('ending');
         void finalizeCandidateCall(false);
       });
       await room.connect(access.url, access.livekit_token);
@@ -525,7 +538,22 @@ export function CandidateJoinPage() {
     }
   }
 
+  async function toggleMicrophone() {
+    const track = localTrackRef.current;
+    if (!track) return;
+    try {
+      if (track.isMuted) await track.unmute();
+      else await track.mute();
+      setMicrophoneMuted(track.isMuted);
+    } catch {
+      setError('We could not change your microphone state. Please try again.');
+    }
+  }
+
   async function leave() {
+    manualCloseRef.current = true;
+    setCompletionKind('closed');
+    setStatus('ending');
     await finalizeCandidateCall(true);
   }
 
@@ -537,22 +565,22 @@ export function CandidateJoinPage() {
   const allChecked = template ? allRequiredChecked(template) : false;
 
   if (phase === 'declined') {
-    return <main className="candidate-experience candidate-shell"><div className="candidate-shell__inner"><div className="candidate-brand"><img src="/ik-logo.png" alt="Interview Kickstart" /><div><b>Interview Kickstart</b><span>Candidate interview</span></div></div><div className="candidate-glass-card candidate-landing" style={{ margin: '100px auto 0' }}><p className="candidate-eyebrow">Invitation closed</p><h1>Consent declined</h1><p className="candidate-muted">This screening cannot start without the required consent.</p></div></div></main>;
+    return <main className="candidate-experience candidate-shell candidate-scope"><div className="candidate-shell__inner"><div className="candidate-brand"><img src="/ik-logo.png" alt="Interview Kickstart" /><div><b>Interview Kickstart</b><span>Candidate interview</span></div></div><div className="candidate-glass-card candidate-landing candidate-status-card"><p className="candidate-eyebrow">Invitation closed</p><h1>Consent declined</h1><p className="candidate-muted">This screening cannot start without the required consent.</p></div></div></main>;
   }
 
   return (
-    <main className="candidate-experience candidate-shell">
+    <main className="candidate-experience candidate-shell candidate-scope">
       <div className="candidate-shell__inner">
         <header className="candidate-brand" aria-label="Interview Kickstart">
           <img src="/ik-logo.png" alt="Interview Kickstart" />
           <div><b>Interview Kickstart</b><span>Private candidate interview</span></div>
         </header>
 
-        {phase === 'loading' && <p className="candidate-glass-card" style={{ margin: '100px auto 0', padding: 30 }} role="status">Checking your invitation…</p>}
-        {phase === 'error' && <div className="candidate-glass-card candidate-landing" style={{ margin: '100px auto 0' }}><p className="candidate-eyebrow">Unable to continue</p><h1>We couldn’t open this invite</h1><p className="candidate-error" role="alert">{error}</p></div>}
+        {phase === 'loading' && <p className="candidate-glass-card candidate-status-card" role="status">Checking your invitation…</p>}
+        {phase === 'error' && <div className="candidate-glass-card candidate-landing candidate-status-card"><p className="candidate-eyebrow">Unable to continue</p><h1>We couldn’t open this invite</h1><p className="candidate-error" role="alert">{error}</p></div>}
 
         {phase === 'need-consent' && candidateStage === 'landing' && (
-          <section className="candidate-glass-card candidate-landing" style={{ margin: '100px auto 0' }} aria-labelledby="invite-title">
+          <section className="candidate-glass-card candidate-landing candidate-status-card" aria-labelledby="invite-title">
             <p className="candidate-eyebrow">Your invitation</p>
             <h1 id="invite-title">Audio screening interview</h1>
             <h2 className="candidate-role">{roleTitle}</h2>
@@ -563,13 +591,13 @@ export function CandidateJoinPage() {
         )}
 
         {phase === 'granted' && candidateStage === 'landing' && (
-          <section className="candidate-glass-card candidate-landing" style={{ margin: '100px auto 0' }} aria-labelledby="invite-title">
+          <section className="candidate-glass-card candidate-landing candidate-status-card" aria-labelledby="invite-title">
             <p className="candidate-eyebrow">Your invitation</p><h1 id="invite-title">Audio screening interview</h1><h2 className="candidate-role">{roleTitle}</h2><p className="candidate-muted">Your consent is on file. Let’s check your audio and connection before we begin.</p><Button className="candidate-primary-cta" onClick={() => setCandidateStage('readiness')}>Prepare my audio</Button>
           </section>
         )}
 
         {phase === 'need-consent' && candidateStage === 'consent' && template && (
-          <section className="candidate-glass-card candidate-consent" style={{ margin: '100px auto 0' }} aria-labelledby="consent-title">
+          <section className="candidate-glass-card candidate-consent candidate-status-card" aria-labelledby="consent-title">
             <p className="candidate-eyebrow">Step 2 of 4 · Consent</p><h1 id="consent-title">A few things before we begin</h1><h2 className="sr-only">Screening consent</h2>
             <p className="candidate-consent__summary">{template.summary ?? 'Please review and accept each item to continue to your audio screening.'}</p>
             <fieldset><legend className="candidate-field-label">Required consent</legend>
@@ -584,20 +612,22 @@ export function CandidateJoinPage() {
 
         {phase === 'granted' && candidateStage === 'readiness' && modernFlow && status !== 'live' && (
           capabilityStatus === 'unsupported'
-            ? <div className="candidate-glass-card candidate-landing" style={{ margin: '100px auto 0' }} role="alert"><h1>Browser not supported</h1><p className="candidate-error">Your browser does not support the microphone and WebRTC features this screening requires. Please use a current browser over HTTPS.</p></div>
+            ? <div className="candidate-glass-card candidate-landing candidate-status-card" role="alert"><h1>Browser not supported</h1><p className="candidate-error">Your browser does not support the microphone and WebRTC features this screening requires. Please use a current browser over HTTPS.</p></div>
             : <AudioReadinessStep inviteToken={inviteRef.current ?? ''} roleTitle={roleTitle} onBack={() => setCandidateStage(inviteHasConsent ? 'landing' : 'consent')} onReady={(track) => { localTrackRef.current = track; void join(track); }} />
         )}
 
         {phase === 'granted' && status === 'live' && (
           <section className="candidate-interview" aria-label="Live audio interview">
-            <div className="candidate-glass-card candidate-interview__stage"><div><p className="candidate-eyebrow">Live interview</p><h1 className="candidate-role">{roleTitle}</h1><InterviewerAura level={interviewerLevel} speaking={interviewerLevel > 0.025} /><div className="candidate-interview__controls"><button type="button" onClick={() => { const track = localTrackRef.current; if (track) void (track.isMuted ? track.unmute() : track.mute()); }}>{localTrackRef.current?.isMuted ? 'Unmute microphone' : 'Mute microphone'}</button><button type="button" onClick={() => void leave()}>Leave screening</button></div></div></div>
+            <div className="candidate-glass-card candidate-interview__stage"><div><p className="candidate-eyebrow">Live interview</p><h1 className="candidate-role">{roleTitle}</h1><InterviewerAura level={interviewerLevel} speaking={interviewerLevel > 0.025} /><div className="candidate-interview__controls"><button type="button" aria-pressed={microphoneMuted} onClick={() => void toggleMicrophone()}>{microphoneMuted ? 'Unmute microphone' : 'Mute microphone'}</button><button type="button" onClick={() => void leave()}>Leave screening</button></div></div></div>
             <section role="region" className="candidate-glass-card candidate-interview__captions" aria-label="Live transcript"><h2 id="interviewer-caption-title">Interviewer</h2><div className="candidate-caption-list" aria-live="polite">{liveTranscript.length === 0 ? <p className="candidate-muted">Listening for the interviewer…</p> : liveTranscript.map((segment) => <p className="candidate-caption" key={segment.id}><small>{segment.final ? 'Interviewer' : 'Speaking'}</small>{segment.text}</p>)}</div></section>
           </section>
         )}
 
-        {phase === 'granted' && status === 'ended' && <div className="candidate-glass-card candidate-landing" style={{ margin: '100px auto 0' }}><p className="candidate-eyebrow">Complete</p><h1>The screening has ended.</h1><p className="candidate-muted">Thank you for your time.</p></div>}
+        {phase === 'granted' && status === 'ending' && <div className="candidate-glass-card candidate-landing candidate-status-card" role="status"><p className="candidate-eyebrow">Wrapping up</p><h1>Saving your screening…</h1><p className="candidate-muted">Please keep this tab open for a moment while we securely finish.</p></div>}
 
-        {phase === 'granted' && status !== 'live' && status !== 'ended' && !modernFlow && (capabilityStatus === 'unsupported' ? <div role="alert" className="candidate-glass-card candidate-landing" style={{ margin: '100px auto 0' }}><h1>Browser not supported</h1><p className="candidate-error">Your browser does not support the microphone and WebRTC features this screening requires.</p></div> : <Button className="candidate-primary-cta" style={{ maxWidth: 700, margin: '100px auto 0', display: 'flex' }} onClick={() => void join()} loading={status === 'joining'}>Join screening</Button>)}
+        {phase === 'granted' && status === 'ended' && <div className="candidate-glass-card candidate-landing candidate-status-card"><p className="candidate-eyebrow">{completionKind === 'completed' ? 'Screening complete' : 'Screening closed'}</p><h1>{completionKind === 'completed' ? 'Your screening is complete.' : 'Your screening has been closed.'}</h1><p className="candidate-muted">{completionKind === 'completed' ? 'Thank you for your time. You can now close this browser tab.' : 'You can now close this browser tab.'}</p></div>}
+
+        {phase === 'granted' && status !== 'live' && status !== 'ending' && status !== 'ended' && !modernFlow && (capabilityStatus === 'unsupported' ? <div role="alert" className="candidate-glass-card candidate-landing candidate-status-card"><h1>Browser not supported</h1><p className="candidate-error">Your browser does not support the microphone and WebRTC features this screening requires.</p></div> : <Button className="candidate-primary-cta candidate-fallback-cta" onClick={() => void join()} loading={status === 'joining'}>Join screening</Button>)}
 
         {error && phase !== 'error' && <p className="candidate-error" role="alert">{error}</p>}
         <audio ref={remoteAudioRef} autoPlay playsInline className="hidden" />
