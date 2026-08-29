@@ -119,7 +119,7 @@ describe('plivo /answer — bridges only a valid, live, signed request', () => {
     expect(res.status).toBe(200);
     expect(res.type).toMatch(/xml/);
     expect(res.text).toBe(
-      `<Response><Dial callerId="${CALLER_ID}" action="${DIAL_STATUS_URL}" method="POST" redirect="false"><Number>${CANDIDATE_E164}</Number></Dial></Response>`,
+      `<Response><Dial callerId="${CALLER_ID}" action="${DIAL_STATUS_URL}" method="POST" redirect="false" callbackUrl="${DIAL_STATUS_URL}" callbackMethod="POST"><Number>${CANDIDATE_E164}</Number></Dial></Response>`,
     );
   });
 
