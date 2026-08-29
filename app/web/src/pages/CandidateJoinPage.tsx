@@ -6,12 +6,18 @@ import {
   Room,
   RoomEvent,
   Track,
+  ParticipantKind,
   type TranscriptionSegment,
 } from 'livekit-client';
 import { api, ApiError } from '../api';
 import type { CandidateConsentTemplate } from '../types';
-import { Button, Card } from '../components/ui';
+import { Button } from '../components/ui';
+import { AudioReadinessStep } from '../components/candidate-join/AudioReadinessStep';
+import { InterviewerAura } from '../components/candidate-join/InterviewerAura';
 import { useCapabilitySupport } from '../lib/capability-check';
+import '../styles/candidate-experience.css';
+
+const AGENT_PARTICIPANT_KIND = (ParticipantKind as unknown as { AGENT?: unknown } | undefined)?.AGENT;
 
 /**
  * Phase 9 L4 — candidate join with SERVER-AUTHORITATIVE consent.
@@ -52,7 +58,6 @@ const MAX_LIVE_TRANSCRIPT_SEGMENTS = 100;
 interface LiveTranscriptSegment {
   id: string;
   text: string;
-  speaker: 'christy' | 'candidate';
   final: boolean;
 }
 
@@ -147,6 +152,10 @@ export function CandidateJoinPage() {
   const [error, setError] = useState<string | null>(null);
   const [template, setTemplate] = useState<CandidateConsentTemplate | null>(null);
   const [checked, setChecked] = useState<Record<string, boolean>>({});
+  const [roleTitle, setRoleTitle] = useState('your screening role');
+  const [candidateStage, setCandidateStage] = useState<'landing' | 'consent' | 'readiness'>('consent');
+  const [inviteHasConsent, setInviteHasConsent] = useState(false);
+  const [interviewerLevel, setInterviewerLevel] = useState(0);
   const [liveTranscript, setLiveTranscript] = useState<LiveTranscriptSegment[]>([]);
   const inviteRef = useRef<string | null>(null);
   const roomRef = useRef<Room | null>(null);
@@ -253,6 +262,12 @@ export function CandidateJoinPage() {
       try {
         const consent = await api.candidateConsentStatus({ invite_token: invite });
         if (cancelled) return;
+        const modernCandidateFlow = Boolean(
+          consent.role_title && typeof api.candidateLiveKitPreflight === 'function',
+        );
+        if (consent.role_title) setRoleTitle(consent.role_title);
+        setInviteHasConsent(consent.has_consent);
+        if (modernCandidateFlow) setCandidateStage('landing');
         if (consent.has_consent) {
           setPhase('granted');
           return;
@@ -260,6 +275,7 @@ export function CandidateJoinPage() {
         const tpl = await api.getCandidateConsentTemplate(LOCALE);
         if (cancelled) return;
         setTemplate(tpl);
+        setCandidateStage(modernCandidateFlow ? 'landing' : 'consent');
         setPhase('need-consent');
       } catch (err) {
         if (cancelled) return;
@@ -288,6 +304,9 @@ export function CandidateJoinPage() {
         consents: template.required_consents.filter((r) => checked[r] === true),
         status: 'granted',
       });
+      if (typeof api.candidateLiveKitPreflight === 'function' && roleTitle !== 'your screening role') {
+        setCandidateStage('readiness');
+      }
       setPhase('granted');
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Unable to record your consent.');
@@ -417,7 +436,7 @@ export function CandidateJoinPage() {
     return finalization;
   }
 
-  async function join() {
+  async function join(preflightTrack?: LocalAudioTrack) {
     const invite = inviteRef.current;
     if (!invite || phase !== 'granted') {
       setError('This invite is missing, expired, revoked, or already used.');
@@ -430,7 +449,7 @@ export function CandidateJoinPage() {
     try {
       // Acquire microphone access before consuming the one-time invite. If the
       // browser permission/device step fails, the invite remains reusable.
-      const localTrack = await acquireLocalAudioTrack();
+      const localTrack = preflightTrack ?? await acquireLocalAudioTrack();
       localTrackRef.current = localTrack;
 
       joinStep = 'exchange';
@@ -448,9 +467,21 @@ export function CandidateJoinPage() {
           track.attach(remoteAudioRef.current);
         }
       });
+      room.on(RoomEvent.ActiveSpeakersChanged, (participants) => {
+        const interviewer = participants.find((participant) => (
+          (AGENT_PARTICIPANT_KIND !== undefined && participant.kind === AGENT_PARTICIPANT_KIND) ||
+          (participant.kind as unknown) === 'agent' ||
+          participant.attributes?.hello_speaker === 'interviewer'
+        ));
+        setInterviewerLevel(interviewer ? Math.max(0, Math.min(1, interviewer.audioLevel)) : 0);
+      });
       room.on(RoomEvent.TranscriptionReceived, (segments, participant) => {
-        const speaker: LiveTranscriptSegment['speaker'] =
-          participant?.identity === room.localParticipant.identity ? 'candidate' : 'christy';
+        const isInterviewer = participant && (
+          (AGENT_PARTICIPANT_KIND !== undefined && participant.kind === AGENT_PARTICIPANT_KIND) ||
+          (participant.kind as unknown) === 'agent' ||
+          participant.attributes?.hello_speaker === 'interviewer'
+        );
+        if (!isInterviewer) return;
         setLiveTranscript((previous) => {
           const next = [...previous];
           for (const segment of segments as TranscriptionSegment[]) {
@@ -459,7 +490,6 @@ export function CandidateJoinPage() {
             const value: LiveTranscriptSegment = {
               id: segment.id,
               text,
-              speaker,
               final: segment.final,
             };
             const existing = next.findIndex((item) => item.id === segment.id);
@@ -495,163 +525,75 @@ export function CandidateJoinPage() {
     await finalizeCandidateCall(true);
   }
 
-  // ── Decline is terminal: no join button, no exchange, no media access ──
+  const modernFlow = candidateStage !== 'consent' || Boolean(roleTitle !== 'your screening role' && typeof api.candidateLiveKitPreflight === 'function');
+  const consentItems = template?.consent_items?.filter((item) => template.required_consents.includes(item.type)) ??
+    template?.required_consents.map((type) => ({ type, label: `I agree to ${type.replace(/_/g, ' ')}.` })) ?? [];
+  const allChecked = template ? allRequiredChecked(template) : false;
+
   if (phase === 'declined') {
-    return (
-      <main className="mx-auto flex min-h-screen max-w-xl items-center px-4">
-        <Card className="w-full p-6">
-          <h1 className="text-xl font-semibold text-gray-900">Consent declined</h1>
-          <p className="mt-2 text-sm text-gray-600">
-            You declined the screening consent. You cannot join this screening
-            without providing the required consent.
-          </p>
-          <p className="mt-3 text-xs text-gray-400">
-            Your choice is recorded and this invitation has not been used.
-          </p>
-        </Card>
-      </main>
-    );
+    return <main className="candidate-experience candidate-shell"><div className="candidate-shell__inner"><div className="candidate-brand"><img src="/ik-logo.png" alt="Interview Kickstart" /><div><b>Interview Kickstart</b><span>Candidate interview</span></div></div><div className="candidate-glass-card candidate-landing" style={{ margin: '100px auto 0' }}><p className="candidate-eyebrow">Invitation closed</p><h1>Consent declined</h1><p className="candidate-muted">This screening cannot start without the required consent.</p></div></div></main>;
   }
 
   return (
-    <main className="mx-auto flex min-h-screen max-w-xl items-center px-4">
-      <Card className="w-full p-6">
-        <h1 className="text-xl font-semibold text-gray-900">Candidate voice screening</h1>
-        <p className="mt-2 text-sm text-gray-600">
-          Your one-time invite grants access only to this screening room.
-        </p>
+    <main className="candidate-experience candidate-shell">
+      <div className="candidate-shell__inner">
+        <header className="candidate-brand" aria-label="Interview Kickstart">
+          <img src="/ik-logo.png" alt="Interview Kickstart" />
+          <div><b>Interview Kickstart</b><span>Private candidate interview</span></div>
+        </header>
 
-        {phase === 'loading' && (
-          <p className="mt-4 text-sm text-gray-500" role="status">
-            Checking your invitation…
-          </p>
-        )}
+        {phase === 'loading' && <p className="candidate-glass-card" style={{ margin: '100px auto 0', padding: 30 }} role="status">Checking your invitation…</p>}
+        {phase === 'error' && <div className="candidate-glass-card candidate-landing" style={{ margin: '100px auto 0' }}><p className="candidate-eyebrow">Unable to continue</p><h1>We couldn’t open this invite</h1><p className="candidate-error" role="alert">{error}</p></div>}
 
-        {phase === 'error' && (
-          <p className="mt-4 text-sm text-red-600" role="alert">
-            {error}
-          </p>
-        )}
-
-        {phase === 'need-consent' && template && (
-          <section aria-label="Screening consent" className="mt-5">
-            <h2 className="text-sm font-semibold text-gray-900">{template.title}</h2>
-            <div className="mt-2 rounded-md border border-gray-200 bg-gray-50 p-4 text-sm leading-relaxed text-gray-700">
-              {/* Plain text only — the template is never executed as HTML. */}
-              <p className="whitespace-pre-wrap">{plainText(template.body_md)}</p>
-            </div>
-
-            <fieldset className="mt-4">
-              <legend className="text-sm font-medium text-gray-700">
-                Required consent (must accept all to continue)
-              </legend>
-              <div className="mt-2 space-y-3">
-                {template.required_consents.map((type) => (
-                  <label
-                    key={type}
-                    className="flex items-start gap-3 text-sm text-gray-700"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={checked[type] === true}
-                      onChange={(e) =>
-                        setChecked((prev) => ({ ...prev, [type]: e.target.checked }))
-                      }
-                      className="mt-0.5 h-4 w-4 rounded border-gray-300 text-accent-600 focus:ring-accent-500"
-                    />
-                    <span>{type.replace(/_/g, ' ')}</span>
-                  </label>
-                ))}
-              </div>
-            </fieldset>
-
-            <div className="mt-5 flex flex-col gap-3 sm:flex-row">
-              <Button
-                onClick={grantConsent}
-                disabled={!allRequiredChecked(template)}
-                className="flex-1"
-              >
-                Accept and continue
-              </Button>
-              <Button variant="secondary" onClick={declineConsent} className="flex-1">
-                Decline
-              </Button>
-            </div>
-            <p className="mt-2 text-xs text-gray-400">
-              You can review the{' '}
-              <Link to="/privacy-notice" className="font-medium text-accent-600 hover:underline">
-                privacy notice
-              </Link>{' '}
-              at any time.
-            </p>
+        {phase === 'need-consent' && candidateStage === 'landing' && (
+          <section className="candidate-glass-card candidate-landing" style={{ margin: '100px auto 0' }} aria-labelledby="invite-title">
+            <p className="candidate-eyebrow">Your invitation</p>
+            <h1 id="invite-title">Audio screening interview</h1>
+            <h2 className="candidate-role">{roleTitle}</h2>
+            <p className="candidate-muted">A short, audio-only conversation with our AI interviewer. No camera is needed.</p>
+            <div className="candidate-landing__meta"><span className="candidate-pill">Audio only</span><span className="candidate-pill">Approx. 20 minutes</span><span className="candidate-pill">Private and secure</span></div>
+            <Button className="candidate-primary-cta" onClick={() => setCandidateStage('consent')}>Review consent</Button>
           </section>
         )}
 
-        {phase === 'granted' && (
-          <>
-            {status === 'live' ? (
-              <>
-                <section
-                  aria-label="Live transcript"
-                  aria-live="polite"
-                  className="mt-5 max-h-72 overflow-y-auto rounded-lg border border-gray-200 bg-gray-50 p-4"
-                >
-                  <div className="mb-3 flex items-center justify-between gap-3">
-                    <h2 className="text-sm font-semibold text-gray-900">Live transcript</h2>
-                    <span className="text-xs text-gray-500">Final text is saved after each turn</span>
-                  </div>
-                  {liveTranscript.length === 0 ? (
-                    <p className="text-sm text-gray-500">Waiting for the conversation to start…</p>
-                  ) : (
-                    <ol className="space-y-3">
-                      {liveTranscript.map((segment) => (
-                        <li
-                          key={segment.id}
-                          className={segment.speaker === 'candidate' ? 'text-right' : 'text-left'}
-                        >
-                          <span className="block text-xs font-medium text-gray-500">
-                            {segment.speaker === 'candidate' ? 'You' : 'Christy'}
-                          </span>
-                          <span
-                            className={`mt-1 inline-block max-w-[90%] rounded-xl px-3 py-2 text-sm ${
-                              segment.speaker === 'candidate'
-                                ? 'bg-accent-600 text-white'
-                                : 'bg-white text-gray-800 ring-1 ring-gray-200'
-                            } ${segment.final ? '' : 'italic opacity-70'}`}
-                          >
-                            {segment.text}
-                          </span>
-                        </li>
-                      ))}
-                    </ol>
-                  )}
-                </section>
-                <Button className="mt-5" onClick={leave}>Leave screening</Button>
-              </>
-            ) : status === 'ended' ? (
-              <p className="mt-5 text-sm font-medium text-gray-700">The screening has ended.</p>
-            ) : capabilityStatus === 'checking' ? (
-              null
-            ) : capabilityStatus === 'unsupported' ? (
-              <div role="alert" className="mt-5 rounded-md border border-red-200 bg-red-50 p-3">
-                <p className="text-sm text-red-800">
-                  Your browser does not support the microphone and WebRTC features this
-                  screening requires. Please use a current version of a supported browser.
-                </p>
-              </div>
-            ) : (
-              <Button className="mt-5" onClick={join} loading={status === 'joining'}>
-                Join screening
-              </Button>
-            )}
-          </>
+        {phase === 'granted' && candidateStage === 'landing' && (
+          <section className="candidate-glass-card candidate-landing" style={{ margin: '100px auto 0' }} aria-labelledby="invite-title">
+            <p className="candidate-eyebrow">Your invitation</p><h1 id="invite-title">Audio screening interview</h1><h2 className="candidate-role">{roleTitle}</h2><p className="candidate-muted">Your consent is on file. Let’s check your audio and connection before we begin.</p><Button className="candidate-primary-cta" onClick={() => setCandidateStage('readiness')}>Prepare my audio</Button>
+          </section>
         )}
 
-        {error && phase !== 'error' && (
-          <p className="mt-3 text-sm text-red-600" role="alert">{error}</p>
+        {phase === 'need-consent' && candidateStage === 'consent' && template && (
+          <section className="candidate-glass-card candidate-consent" style={{ margin: '100px auto 0' }} aria-labelledby="consent-title">
+            <p className="candidate-eyebrow">Step 2 of 4 · Consent</p><h1 id="consent-title">A few things before we begin</h1><h2 className="sr-only">Screening consent</h2>
+            <p className="candidate-consent__summary">{template.summary ?? 'Please review and accept each item to continue to your audio screening.'}</p>
+            <fieldset><legend className="candidate-field-label">Required consent</legend>
+              <label className="candidate-consent__all"><input type="checkbox" checked={allChecked} ref={(input) => { if (input) input.indeterminate = !allChecked && template.required_consents.some((type) => checked[type]); }} onChange={(event) => { const value = event.target.checked; setChecked(Object.fromEntries(template.required_consents.map((type) => [type, value]))); }} /><span>Select all required consents</span></label>
+              <div className="candidate-consent__items">{consentItems.map((item) => <label className="candidate-consent__item" key={item.type}><input type="checkbox" aria-label={item.type.replace(/_/g, ' ')} checked={checked[item.type] === true} onChange={(event) => setChecked((prev) => ({ ...prev, [item.type]: event.target.checked }))} /><span>{item.label}</span></label>)}</div>
+            </fieldset>
+            <details className="candidate-consent__details"><summary>Read full consent details</summary><p>{plainText(template.body_md)}</p></details>
+            <div className="candidate-interview__controls"><Button onClick={grantConsent} disabled={!allChecked}>Accept and continue</Button><Button variant="secondary" onClick={declineConsent}>Decline</Button></div>
+            <p className="candidate-privacy-note">Questions? <Link to="/privacy-notice">Review the privacy notice</Link>.</p>
+          </section>
         )}
+
+        {phase === 'granted' && candidateStage === 'readiness' && modernFlow && status !== 'live' && (
+          <AudioReadinessStep inviteToken={inviteRef.current ?? ''} roleTitle={roleTitle} onBack={() => setCandidateStage(inviteHasConsent ? 'landing' : 'consent')} onReady={(track) => { localTrackRef.current = track; void join(track); }} />
+        )}
+
+        {phase === 'granted' && status === 'live' && (
+          <section className="candidate-interview" aria-label="Live audio interview">
+            <div className="candidate-glass-card candidate-interview__stage"><div><p className="candidate-eyebrow">Live interview</p><h1 className="candidate-role">{roleTitle}</h1><InterviewerAura level={interviewerLevel} speaking={interviewerLevel > 0.025} /><div className="candidate-interview__controls"><button type="button" onClick={() => { const track = localTrackRef.current; if (track) void (track.isMuted ? track.unmute() : track.mute()); }}>{localTrackRef.current?.isMuted ? 'Unmute microphone' : 'Mute microphone'}</button><button type="button" onClick={() => void leave()}>Leave screening</button></div></div></div>
+            <section role="region" className="candidate-glass-card candidate-interview__captions" aria-label="Live transcript"><h2 id="interviewer-caption-title">Interviewer</h2><div className="candidate-caption-list" aria-live="polite">{liveTranscript.length === 0 ? <p className="candidate-muted">Listening for the interviewer…</p> : liveTranscript.map((segment) => <p className="candidate-caption" key={segment.id}><small>{segment.final ? 'Interviewer' : 'Speaking'}</small>{segment.text}</p>)}</div></section>
+          </section>
+        )}
+
+        {phase === 'granted' && status === 'ended' && <div className="candidate-glass-card candidate-landing" style={{ margin: '100px auto 0' }}><p className="candidate-eyebrow">Complete</p><h1>The screening has ended.</h1><p className="candidate-muted">Thank you for your time.</p></div>}
+
+        {phase === 'granted' && status !== 'live' && status !== 'ended' && !modernFlow && (capabilityStatus === 'unsupported' ? <div role="alert" className="candidate-glass-card candidate-landing" style={{ margin: '100px auto 0' }}><h1>Browser not supported</h1><p className="candidate-error">Your browser does not support the microphone and WebRTC features this screening requires.</p></div> : <Button className="candidate-primary-cta" style={{ maxWidth: 700, margin: '100px auto 0', display: 'flex' }} onClick={() => void join()} loading={status === 'joining'}>Join screening</Button>)}
+
+        {error && phase !== 'error' && <p className="candidate-error" role="alert">{error}</p>}
         <audio ref={remoteAudioRef} autoPlay playsInline className="hidden" />
-      </Card>
+      </div>
     </main>
   );
 }
