@@ -36,6 +36,8 @@ jobs:
         run: node scripts/validate-voice-worker-apps.mjs && node scripts/validate-voice-worker-apps.test.mjs
       - name: Validate architecture decision records
         run: node scripts/check-adrs.mjs
+      - name: Validate approved HR design system
+        run: node scripts/validate-hr-design-system.mjs
       # ── PR106 — Canary-1 arming lives on the never-merged activation branch
       #    `canary1/arm`, which flips CANARY1_ARMED to true. The in-suite pin
       #    (phone-canary1-structural.test.ts §9) CANNOT catch a merge of that
