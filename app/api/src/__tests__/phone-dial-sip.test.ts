@@ -235,22 +235,27 @@ describe('P5 sip — the exact SDK call', () => {
       expect(Number.isInteger(opts[key]), `${key} is not an integer`).toBe(true);
     }
 
-    // SECONDS, exactly the configured values. The three configured numbers are
-    // distinct, so a swap between any two of them fails here.
+    // SECONDS, exactly the configured values.
     expect(opts.timeout).toBe(ORIGINATE_SECONDS);
-    expect(opts.ringingTimeout).toBe(RING_SECONDS);
+    // 2026-08-29 (second live kill): the SIP-layer ring timer is DEFUSED —
+    // pinned to the max-call bound — because broken server-side answer
+    // detection made it tear down consented mid-question calls at the 45s
+    // mark. The DOMAIN ring bound (no-answer at ~45s) is owned by the
+    // worker's participant-wait; a ringing leg never produces a participant.
+    expect(opts.ringingTimeout).toBe(MAX_CALL_SECONDS);
+    expect(opts.ringingTimeout).not.toBe(RING_SECONDS);
     expect(opts.maxCallDuration).toBe(MAX_CALL_SECONDS);
 
     // NOT milliseconds. Stated separately because `toBe(30)` and
     // `not.toBe(30000)` fail for different reasons and a reader of a failure
     // should be able to tell a unit bug from a wiring bug.
     expect(opts.timeout).not.toBe(ORIGINATE_SECONDS * 1000);
-    expect(opts.ringingTimeout).not.toBe(RING_SECONDS * 1000);
+    expect(opts.ringingTimeout).not.toBe(MAX_CALL_SECONDS * 1000);
     expect(opts.maxCallDuration).not.toBe(MAX_CALL_SECONDS * 1000);
 
     // And each equals what the LOADER produced, not a literal typed twice.
     expect(opts.timeout).toBe(dialConfig().originateTimeoutSeconds);
-    expect(opts.ringingTimeout).toBe(screeningConfig().ringTimeoutSeconds);
+    expect(opts.ringingTimeout).toBe(dialConfig().maxCallSeconds);
     expect(opts.maxCallDuration).toBe(dialConfig().maxCallSeconds);
   });
 

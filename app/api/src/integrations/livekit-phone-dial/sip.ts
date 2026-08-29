@@ -173,10 +173,22 @@ export function createLiveSipClient(
           // tears down a genuinely unanswered leg. Nothing blocks, so
           // nothing can time out under a live call.
           waitUntilAnswered: false,
-          // All three explicit, all three in SECONDS. See the header. With
-          // no answer-wait, `timeout` bounds only participant creation.
+          // All explicit, all in SECONDS. See the header. With no
+          // answer-wait, `timeout` bounds only participant creation.
           timeout: request.originateTimeoutSeconds,
-          ringingTimeout: request.ringTimeoutSeconds,
+          // The SIP-layer ring timer is DEFUSED, not tuned (2026-08-29,
+          // second live kill): with the blocking wait removed, the same
+          // broken answer-detection made `ringingTimeout` the executioner —
+          // the server still believed a consented, mid-question call was
+          // RINGING and tore it down at the 45s mark (ROOM_DELETED, again).
+          // The no-answer bound this timer was carrying is already owned by
+          // the WORKER: a ringing leg never produces a SIP participant, so
+          // the gate's participant-wait (45s) ends a genuinely unanswered
+          // call at the same bound, and a carrier-side voicemail "answer" is
+          // classified and refused by the gate as before. Pinning the ring
+          // timer to the max-call bound means NO timer at the SIP layer can
+          // outrun the conversation it cannot see.
+          ringingTimeout: request.maxCallSeconds,
           maxCallDuration: request.maxCallSeconds,
         },
       );
