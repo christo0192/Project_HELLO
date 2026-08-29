@@ -1155,6 +1155,17 @@ async def _run_native_phone_screening(
     # answered with the SAME instruction instead — the durable commit is
     # idempotent on `source_event_id`, so nothing double-writes.
     last_advance: dict[str, str | None] = {"text": None}
+    # F0b — MALFORMED-EXCHANGE GUARD RECOVERY STATE. The guard below used to
+    # `finished.set()` the instant it saw an empty question prompt, and the main
+    # loop then deleted the room — silently killing a healthy call (live
+    # 2026-08-29). A single empty read is far more likely a transient tracking
+    # race than a genuine malfunction, so the guard now RE-ASKS the planned
+    # question once and lets the conversation continue. Only a SECOND consecutive
+    # empty read at the SAME cursor position is treated as a real malfunction and
+    # allowed to end the call. This records the cursor the guard last recovered
+    # at, so consecutive-at-the-same-position can be distinguished from a single
+    # recovered blip that later advanced normally.
+    malformed_guard: dict[str, int | None] = {"recovered_cursor": None}
 
     async def wait_for_activity(timeout: float) -> str:
         """Wait on LiveKit activity or close without creating a turn queue."""
@@ -1351,9 +1362,37 @@ async def _run_native_phone_screening(
             return
         prompt = (latest_assistant[0] or "").strip()
         if question is None or not prompt:
+            # F0b — DEGRADE, DO NOT EXECUTE. An empty question prompt here means
+            # the native tracking the guard reads was not populated for the ask
+            # this answer belongs to. Historically this set HALT_MALFORMED_EXCHANGE
+            # and `finished.set()`, and the main loop then DELETED THE ROOM under a
+            # live, active call (2026-08-29) with no log line at all. A single
+            # empty read is recovered: re-ask the current planned question (the
+            # same `add_turn_instruction` + `phone_question_instructions` idiom the
+            # interrupted-question case uses) and return, so the conversation
+            # continues. Only when the guard fires a SECOND consecutive time for
+            # the SAME cursor position do we accept it as a genuine malfunction and
+            # end the call — truthfully, as an aborted assessment (see the main
+            # loop), never as a silent room delete.
+            if question is not None and malformed_guard["recovered_cursor"] != cursor:
+                malformed_guard["recovered_cursor"] = cursor
+                _log.info(
+                    "unknown_event", error_type="phone_turn_guard",
+                    error_category="malformed_exchange_recovered",
+                )
+                add_turn_instruction(turn_ctx, phone_question_instructions(question))
+                return
+            _log.info(
+                "unknown_event", error_type="phone_turn_guard",
+                error_category="malformed_exchange_terminal",
+            )
             terminal_reason["reason"] = phone.HALT_MALFORMED_EXCHANGE
             finished.set()
             return
+        # A well-formed exchange clears the one-shot recovery latch, so a later
+        # empty read at this same cursor gets its own recovery attempt rather than
+        # inheriting a stale "already recovered here" mark.
+        malformed_guard["recovered_cursor"] = None
         pending.update({
             "question": question,
             "prompt": prompt,
@@ -1534,6 +1573,43 @@ async def _run_native_phone_screening(
                 value = wait()
                 if inspect.isawaitable(value):
                     await value
+        # F0a — PRIME THE NATIVE TURN TRACKING AT THE GATE HANDOFF.
+        # The first planned question is delivered HERE, at the consent→screening
+        # handoff, through `generate_reply`/`say`. The native turn hook
+        # (`on_native_turn`) reads three pieces of tracking to decide whether the
+        # candidate's next utterance is a real answer: `latest_assistant[0]` (the
+        # question text it is answering), `latest_assistant_anchor[0]` (the moment
+        # the question was asked), and `assistant_delivery_complete` (proof the
+        # ask was audibly finished, not interrupted). In production those are
+        # populated ASYNCHRONOUSLY by the SDK's `conversation_item_added` /
+        # `agent_state_changed` / `speech_created` handlers — and on a live call
+        # 2026-08-29 they had NOT landed by the time the candidate's first plain
+        # answer arrived. The malformed-exchange guard then read an empty
+        # `latest_assistant[0]`, declared the exchange malformed, and the main
+        # loop DELETED THE ROOM under a healthy, active SIP call. Prime the exact
+        # fields the guard consumes with the delivered question text and an anchor
+        # of "now", so a first answer that races ahead of the SDK events is still
+        # measured against a real, populated ask instead of an empty one.
+        #
+        # FALLBACK ONLY — this fills the gaps the SDK events left, it never
+        # overwrites them. When the `conversation_item_added` / `agent_state_changed`
+        # / `speech_created` handlers DID land, they carry the authoritative
+        # values (including the real speech-start anchor and the interrupted-question
+        # evidence prefix), and clobbering those would corrupt the committed
+        # boundary. So prime a field only when it is still unset: an empty
+        # `latest_assistant[0]` gets the delivered question text; a missing anchor
+        # gets "now" (a first answer necessarily arrives after the ask, so "now"
+        # keeps `_native_turn_predates_question` from mis-reading it); and an
+        # un-set delivery flag is set, because reaching here means the ask's
+        # playout already awaited above. It never touches the durable cursor or
+        # the committed key — WHICH question is authoritative is unchanged.
+        if question is not None:
+            if not (latest_assistant[0] or "").strip():
+                latest_assistant[0] = question.text
+            if latest_assistant_anchor[0] is None:
+                latest_assistant_anchor[0] = int(round(time.time() * 1000))
+            if not assistant_delivery_complete.is_set():
+                assistant_delivery_complete.set()
 
     try:
         # This bounds the whole leg, not one answer. Per-turn inactivity is
@@ -1574,19 +1650,49 @@ async def _run_native_phone_screening(
             # A known non-score verdict is truthfully terminal. A transport
             # failure has no status and remains non-terminal for recovery.
             await events.post_event(attempt_id, "assessment.aborted")
-    elif reason in {phone.HALT_CANDIDATE_ENDED, phone.HALT_NO_ANSWER}:
-        await events.post_event(attempt_id, "assessment.aborted")
     elif reason in {
-        phone.HALT_CALLBACK_SCHEDULED,
-        phone.HALT_PERSISTENCE,
+        phone.HALT_CANDIDATE_ENDED,
+        phone.HALT_NO_ANSWER,
+        # F0b — a TERMINAL malformed exchange is a genuine, truthful end of the
+        # screening (the guard already recovered once and the same cursor still
+        # produced no usable ask). It is NOT infrastructure-retryable, so it
+        # belongs with the honest aborts and posts `assessment.aborted` — it was
+        # previously in the no-op set below, which is exactly what let a killed
+        # call end with no terminal signal AND no log.
         phone.HALT_MALFORMED_EXCHANGE,
-        "disconnect",
     }:
+        await events.post_event(attempt_id, "assessment.aborted")
+    elif reason == "disconnect":
+        # F4 — 'disconnect' stays NON-TERMINAL: the room/connection died
+        # externally and the reclaim/reconnect machinery owns what happens next
+        # (do NOT post here — that ownership is unchanged). But an external room
+        # death used to be completely invisible. LOG it so the drop is
+        # observable, then fall through to the (no-op on a dead room) teardown.
+        _log.info(
+            "unknown_event", error_type="phone_session_terminal",
+            error_category="disconnect_nonterminal",
+        )
+    elif reason in {phone.HALT_CALLBACK_SCHEDULED, phone.HALT_PERSISTENCE}:
         # Callback already changed the engagement; infrastructure and transport
         # halts remain non-terminal for existing reconnect/recovery ownership.
         pass
     else:
         await events.post_event(attempt_id, "assessment.aborted")
+    # F0c — NEVER SILENTLY DELETE A LIVE ROOM. `_close_phone_room` deletes the
+    # LiveKit room via RoomService, which terminates every participant — and on
+    # 2026-08-29 that ran against a HEALTHY, `sip.callStatus: "active"` call with
+    # zero log output, so the kill was unattributable from the outside. Every
+    # room teardown now emits the terminal reason first (the fixed reason code
+    # only — no transcript, ids, or room name). The invariant this establishes:
+    # there is NO path that deletes a room without a log line naming why. The
+    # deletion itself is unchanged — genuinely-ended calls (completed,
+    # candidate_ended, no_answer, callback_scheduled, terminal malformed) still
+    # tear down, and for `disconnect` the delete is a harmless no-op on a room
+    # that is already gone.
+    _log.info(
+        "unknown_event", error_type="phone_room_teardown",
+        error_category=_bounded_outcome(reason),
+    )
     await _close_phone_room(room_name)
     return result
 
@@ -2122,6 +2228,18 @@ async def _run_phone_session(
 async def _close_phone_room(room_name: str) -> None:
     """Delete the room so the SIP leg is torn down. Best effort, never raises
     into the gate's decision."""
+    # F0c — THE INVARIANT ENFORCER. Every phone room deletion funnels through
+    # here, so a single log line at this chokepoint guarantees NO room is ever
+    # deleted without an attributable log — the property whose absence let a
+    # healthy `sip.callStatus: "active"` call be killed silently on 2026-08-29.
+    # The specific terminal REASON is named by the caller (the main loop's
+    # `phone_room_teardown` / the lease-cancel `phone_assessment_halted_leg`
+    # logs) because only the caller knows it; this line proves the deletion
+    # itself is never invisible even on the pre-conversation gate-refusal paths.
+    # Fixed strings only — no room name, ids, or transcript.
+    _log.info(
+        "unknown_event", error_type="phone_room_deleted",
+    )
     try:
         await _delete_livekit_room(room_name)
     except Exception:  # noqa: BLE001
