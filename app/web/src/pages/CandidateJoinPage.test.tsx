@@ -292,6 +292,34 @@ describe('CandidateJoinPage', () => {
     expect(screen.getAllByText('Hello there')).toHaveLength(1);
   });
 
+  it('mute and unmute toggle the microphone state and accessible label', async () => {
+    const track = {
+      isMuted: false,
+      stop: vi.fn(),
+      mute: vi.fn(async () => { track.isMuted = true; }),
+      unmute: vi.fn(async () => { track.isMuted = false; }),
+    };
+    createLocalAudioTrack.mockResolvedValue(track);
+    candidateConsentStatus.mockResolvedValue({
+      has_consent: true,
+      template_version: '1.0',
+      locale: 'en-IN',
+      required_consents: ['ai_interview', 'recording'],
+    });
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
+    await userEvent.click(await screen.findByRole('button', { name: 'Join screening' }));
+
+    const mute = await screen.findByRole('button', { name: 'Mute microphone' });
+    await userEvent.click(mute);
+    expect(await screen.findByRole('button', { name: 'Unmute microphone' })).toHaveAttribute('aria-pressed', 'true');
+    expect(track.mute).toHaveBeenCalledTimes(1);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Unmute microphone' }));
+    expect(await screen.findByRole('button', { name: 'Mute microphone' })).toHaveAttribute('aria-pressed', 'false');
+    expect(track.unmute).toHaveBeenCalledTimes(1);
+  });
+
   it('manual Leave finalizes exactly once and prefers authoritative Egress', async () => {
     candidateConsentStatus.mockResolvedValue({
       has_consent: true,
@@ -306,7 +334,8 @@ describe('CandidateJoinPage', () => {
 
     await waitFor(() => expect(completeCandidateScreening).toHaveBeenCalledTimes(1));
     expect(uploadCandidateRecording).not.toHaveBeenCalled();
-    expect(await screen.findByText('The screening has ended.')).toBeInTheDocument();
+    expect(await screen.findByText('Your screening has been closed.')).toBeInTheDocument();
+    expect(screen.getByText(/close this browser tab/i)).toBeInTheDocument();
   });
 
   it('server-forced disconnect finalizes once and uploads captured bytes only on Egress failure', async () => {
@@ -354,6 +383,8 @@ describe('CandidateJoinPage', () => {
     await waitFor(() => expect(uploadCandidateRecording).toHaveBeenCalledTimes(1));
     expect(completeCandidateScreening).toHaveBeenCalledTimes(1);
     expect(uploadCandidateRecording.mock.calls[0]?.[2]).toBeInstanceOf(Blob);
+    expect(await screen.findByText('Your screening is complete.')).toBeInTheDocument();
+    expect(screen.getByText(/close this browser tab/i)).toBeInTheDocument();
   });
 
   it('does not report microphone failure when invite exchange fails after mic access succeeds', async () => {

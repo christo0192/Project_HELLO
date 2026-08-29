@@ -172,8 +172,8 @@ export function AudioReadinessStep({ inviteToken, roleTitle, onReady, onBack }: 
       roomRef.current = null;
       setLevel(0);
       setState('passed');
-      onReady(track);
-      trackRef.current = null;
+      // Keep the tested track alive until the candidate explicitly continues.
+      // This makes the CTA meaningful and prevents a second permission prompt.
       if (analyserCleanupRef.current) await analyserCleanupRef.current().catch(() => undefined);
       analyserCleanupRef.current = null;
     } catch (error) {
@@ -183,7 +183,7 @@ export function AudioReadinessStep({ inviteToken, roleTitle, onReady, onBack }: 
       setState('failed');
       setMessage(messageFor(error));
     }
-  }, [cleanupTrack, inviteToken, onReady]);
+  }, [cleanupTrack, inviteToken]);
 
   async function chooseDevice(deviceId: string) {
     setSelectedDevice(deviceId);
@@ -191,6 +191,17 @@ export function AudioReadinessStep({ inviteToken, roleTitle, onReady, onBack }: 
     setMessage(null);
     setLevel(0);
     await cleanupTrack();
+  }
+
+  function continueToInterview() {
+    const track = trackRef.current;
+    if (!track) {
+      setState('failed');
+      setMessage('Your microphone test expired. Please test it again before continuing.');
+      return;
+    }
+    trackRef.current = null;
+    onReady(track);
   }
 
   return (
@@ -233,7 +244,7 @@ export function AudioReadinessStep({ inviteToken, roleTitle, onReady, onBack }: 
 
       {message && <p className="candidate-error" role="alert">{message}</p>}
       {state === 'passed' ? (
-        <Button className="candidate-primary-cta" onClick={() => trackRef.current && onReady(trackRef.current)}>Continue to interview</Button>
+        <Button className="candidate-primary-cta" onClick={continueToInterview}>Continue to interview</Button>
       ) : (
         <Button className="candidate-primary-cta" onClick={() => void startAudioTest()} loading={state === 'microphone' || state === 'network'}>
           {state === 'failed' ? 'Test again' : 'Test microphone and connection'}
