@@ -65,15 +65,25 @@ export function plivoV3SignedString(
   params: Record<string, string | readonly string[]>,
   nonce: string,
 ): string {
+  const keys = Object.keys(params).sort();
   const parts: string[] = [];
-  for (const key of Object.keys(params).sort()) {
+  for (const key of keys) {
     const raw = params[key];
     const values = Array.isArray(raw) ? [...raw].sort() : [String(raw)];
     for (const value of values) {
       parts.push(`${key}${value}`);
     }
   }
-  return `${signedUrl}${parts.join('')}.${nonce}`;
+  // Plivo's `construct_post_url` runs the URL through `construct_get_url` with
+  // `empty_post_params = isEmpty(params)`, and for NON-EMPTY POST params that
+  // branch appends a bare `?` before the sorted `key+value` string — so the
+  // signed base is `URL?<sortedParams>.<nonce>`, NOT `URL<sortedParams>...`.
+  // The first reimplementation omitted the `?`, so EVERY live webhook
+  // signature mismatched and every bounce call fail-closed to <Hangup/>
+  // (2026-08-29). Verified byte-for-byte against plivo-node's own
+  // validateV3Signature. Empty params → no `?` (matches the empty branch).
+  const query = keys.length > 0 ? '?' : '';
+  return `${signedUrl}${query}${parts.join('')}.${nonce}`;
 }
 
 /**
