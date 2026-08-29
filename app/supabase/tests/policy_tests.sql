@@ -6979,6 +6979,255 @@ end;
 $$;
 
 -- =====================================================================
+-- 0071 — continuous transcript persistence (X4) and crashed-session
+--        recording finalization (X5). RCA: live call 22, 2026-08-29,
+--        session f0636659 — a mid-call worker crash lost all but 4 of a
+--        6.5-minute transcript, and the session sat in_progress forever
+--        with recording_egress_status='active', object_key null,
+--        finalize_attempts 0, so the MP3 never finalized.
+-- =====================================================================
+
+-- ── X4 shape: the new column, its guard, and the partial unique index ──
+select _policy_tests.assert(
+  '0071: transcript_turns.source_item_id is a nullable text column',
+  (select data_type from information_schema.columns
+     where table_schema = 'screening_v2' and table_name = 'transcript_turns'
+       and column_name = 'source_item_id') = 'text',
+  'the per-item idempotency key must exist as nullable text'
+);
+
+select _policy_tests.assert(
+  '0071: a partial unique index enforces one row per (session, item)',
+  exists (select 1 from pg_indexes
+            where schemaname = 'screening_v2'
+              and indexname = 'uq_transcript_turns_source_item'),
+  'without the partial unique index, ON CONFLICT cannot dedup a redelivered item'
+);
+
+select _policy_tests.assert(
+  '0071: the two new RPCs are service-role only',
+  not exists (
+    select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname in ('commit_phone_item_turn', 'sweep_phone_stranded_recordings')
+       and (has_function_privilege('anon', p.oid, 'EXECUTE')
+         or has_function_privilege('authenticated', p.oid, 'EXECUTE'))
+  ),
+  'browser roles must never execute the per-item writer or the recording sweep'
+);
+
+-- ── X4 live behaviour: per-item writes, dedup, and the boundary guard ──
+do $$
+declare
+  v_cand  uuid;
+  v_sid   uuid;
+  v_res   jsonb;
+  v_n     integer;
+begin
+  select id into v_cand from screening_v2.candidates limit 1;
+  if v_cand is null then
+    perform _policy_tests.assert('0071: X4 per-item persistence',
+      true, 'skipped: no candidate row available');
+    return;
+  end if;
+
+  insert into screening_v2.call_sessions (candidate_id, mode, status)
+  values (v_cand, 'live', 'created') returning id into v_sid;
+  update screening_v2.call_sessions set status = 'waiting'     where id = v_sid;
+  update screening_v2.call_sessions set status = 'in_progress' where id = v_sid;
+
+  -- Three items persist three rows, with NO boundary committed at all — the
+  -- crash-window property the boundary-only path could never have.
+  v_res := screening_v2.commit_phone_item_turn(v_sid, 'bot', 'Q one?', 'itm-1');
+  perform _policy_tests.assert('0071: first per-item write applies at index 0',
+    (v_res->>'status') = 'applied' and (v_res->>'turn_index')::int = 0,
+    'got ' || v_res::text);
+  perform screening_v2.commit_phone_item_turn(v_sid, 'candidate', 'A one.', 'itm-2');
+  perform screening_v2.commit_phone_item_turn(v_sid, 'bot', 'Q two?', 'itm-3');
+  select count(*) into v_n from screening_v2.transcript_turns where session_id = v_sid;
+  perform _policy_tests.assert(
+    '0071: N items with ZERO boundaries persist N rows',
+    v_n = 3, 'expected 3 rows, got ' || v_n::text);
+
+  -- A duplicate delivery of the SAME item does not double-insert.
+  v_res := screening_v2.commit_phone_item_turn(v_sid, 'candidate', 'A one.', 'itm-2');
+  select count(*) into v_n from screening_v2.transcript_turns where session_id = v_sid;
+  perform _policy_tests.assert(
+    '0071: a redelivered item is deduped, never a second row',
+    (v_res->>'duplicate')::boolean = true and v_n = 3,
+    'dup=' || coalesce(v_res->>'duplicate','null') || ' rows=' || v_n::text);
+
+  -- The per-item turns are NON-gate (is_gate false) — the gate transcript is
+  -- a separate writer and must not be affected by this path.
+  perform _policy_tests.assert(
+    '0071: per-item turns are non-gate',
+    not exists (select 1 from screening_v2.transcript_turns
+                 where session_id = v_sid and coalesce(is_gate, false) = true),
+    'the per-item writer must never produce gate turns');
+
+  -- THE AUTHORSHIP GUARD: with per-item rows present, the boundary RPC must
+  -- NOT insert its turns (no double-write), but must still advance progress.
+  -- A plan is required for the boundary to reach its insert; insert one with a
+  -- synthetic engagement_id under the FK-bypass hatch (this test isolates the
+  -- turn-insert guard, not the engagement chain).
+  set local session_replication_role = replica;
+  insert into screening_v2.phone_session_plans
+    (session_id, engagement_id, source, question_count, questions)
+  values (v_sid, gen_random_uuid(), 'default', 2,
+    '[{"key":"k1","text":"Q1","hint":null},{"key":"k2","text":"Q2","hint":null}]'::jsonb);
+  set local session_replication_role = origin;
+
+  v_res := screening_v2.commit_phone_question_boundary(
+    v_sid, 'k1', 0, 'q:k1',
+    '[{"speaker":"bot","text":"Q one?"},{"speaker":"candidate","text":"A one."}]'::jsonb);
+  select count(*) into v_n from screening_v2.transcript_turns where session_id = v_sid;
+  perform _policy_tests.assert(
+    '0071: with per-item rows present the boundary inserts NO turns (no double-write)',
+    (v_res->>'status') = 'applied' and v_n = 3,
+    'status=' || (v_res->>'status') || ' rows=' || v_n::text
+      || ' (a double-write would have made this 5)');
+  perform _policy_tests.assert(
+    '0071: the boundary still advanced the cursor and recorded progress',
+    (v_res->>'cursor')::int = 1
+      and exists (select 1 from screening_v2.phone_session_progress
+                   where session_id = v_sid and question_key = 'k1'),
+    'the guard suppresses only the turn insert, never the cursor/progress');
+
+  delete from screening_v2.call_sessions where id = v_sid;
+end;
+$$;
+
+-- ── X4 old-worker compatibility: no per-item rows -> boundary inserts ──
+do $$
+declare
+  v_cand uuid; v_sid uuid; v_res jsonb; v_n integer;
+begin
+  select id into v_cand from screening_v2.candidates limit 1;
+  if v_cand is null then
+    perform _policy_tests.assert('0071: X4 old-worker compat', true, 'skipped: no candidate');
+    return;
+  end if;
+  insert into screening_v2.call_sessions (candidate_id, mode, status)
+  values (v_cand, 'live', 'created') returning id into v_sid;
+  update screening_v2.call_sessions set status = 'waiting'     where id = v_sid;
+  update screening_v2.call_sessions set status = 'in_progress' where id = v_sid;
+  set local session_replication_role = replica;
+  insert into screening_v2.phone_session_plans
+    (session_id, engagement_id, source, question_count, questions)
+  values (v_sid, gen_random_uuid(), 'default', 2,
+    '[{"key":"k1","text":"Q1","hint":null},{"key":"k2","text":"Q2","hint":null}]'::jsonb);
+  set local session_replication_role = origin;
+
+  -- No per-item rows exist (an OLD worker never calls the item endpoint), so
+  -- the guard passes and the boundary inserts its pair exactly as 0052 did.
+  v_res := screening_v2.commit_phone_question_boundary(
+    v_sid, 'k1', 0, 'q:k1',
+    '[{"speaker":"bot","text":"Q one?"},{"speaker":"candidate","text":"A one."}]'::jsonb);
+  select count(*) into v_n from screening_v2.transcript_turns where session_id = v_sid;
+  perform _policy_tests.assert(
+    '0071: an OLD boundary-only worker still persists turns on the new migration',
+    (v_res->>'status') = 'applied' and v_n = 2,
+    'the compatibility guard must keep the boundary inserting when no per-item '
+      || 'rows exist; status=' || (v_res->>'status') || ' rows=' || v_n::text);
+  delete from screening_v2.call_sessions where id = v_sid;
+end;
+$$;
+
+-- ── X5b live behaviour: the stranded-recording sweeper fires 0038 ──────
+do $$
+declare
+  v_cand uuid; v_stuck uuid; v_live uuid; v_res jsonb; v_jobs integer;
+  v_stuck_status text; v_stuck_reason text; v_live_status text;
+begin
+  select id into v_cand from screening_v2.candidates limit 1;
+  if v_cand is null then
+    perform _policy_tests.assert('0071: X5b sweeper', true, 'skipped: no candidate');
+    return;
+  end if;
+
+  -- A STUCK session: in_progress, active egress, no object key, and (via the
+  -- FK-bypass hatch, since a trigger manages updated_at) a stale updated_at —
+  -- exactly session f0636659's shape.
+  set local session_replication_role = replica;
+  insert into screening_v2.call_sessions
+    (candidate_id, mode, status, recording_egress_id, recording_egress_status,
+     started_at, updated_at)
+  values (v_cand, 'live', 'in_progress', 'EG_pol71stuck', 'active',
+          now() - interval '3 hours', now() - interval '3 hours')
+  returning id into v_stuck;
+  -- A HEALTHY LIVE session: same recording shape but a RECENT updated_at.
+  insert into screening_v2.call_sessions
+    (candidate_id, mode, status, recording_egress_id, recording_egress_status,
+     started_at, updated_at)
+  values (v_cand, 'live', 'in_progress', 'EG_pol71live', 'active', now(), now())
+  returning id into v_live;
+  set local session_replication_role = origin;
+
+  v_res := screening_v2.sweep_phone_stranded_recordings(25, 7200, now());
+  perform _policy_tests.assert(
+    '0071: the sweep terminalizes exactly the ONE stranded session',
+    (v_res->>'status') = 'ok' and (v_res->>'finalized')::int = 1,
+    'got ' || v_res::text);
+
+  select status, terminal_reason into v_stuck_status, v_stuck_reason
+    from screening_v2.call_sessions where id = v_stuck;
+  perform _policy_tests.assert(
+    '0071: the stranded session is driven expired/grace_timeout',
+    v_stuck_status = 'expired' and v_stuck_reason = 'grace_timeout',
+    'status=' || v_stuck_status || ' reason=' || coalesce(v_stuck_reason,'null'));
+
+  -- The terminal transition fires the 0038 trigger, enqueuing finalization.
+  select count(*) into v_jobs from screening_v2.job_queue
+   where dedup_key = 'recording.finalize:' || v_stuck::text;
+  perform _policy_tests.assert(
+    '0071: terminalizing a crashed session fires the 0038 finalize trigger',
+    v_jobs = 1, 'expected 1 finalize job, got ' || v_jobs::text);
+
+  -- The healthy live session is NEVER touched.
+  select status into v_live_status from screening_v2.call_sessions where id = v_live;
+  select count(*) into v_jobs from screening_v2.job_queue
+   where dedup_key = 'recording.finalize:' || v_live::text;
+  perform _policy_tests.assert(
+    '0071: a healthy live session (recent updated_at) is left alone',
+    v_live_status = 'in_progress' and v_jobs = 0,
+    'a live call must never be terminalized; status=' || v_live_status
+      || ' jobs=' || v_jobs::text);
+
+  delete from screening_v2.call_sessions where id in (v_stuck, v_live);
+end;
+$$;
+
+-- ── X5a: reclaim terminalizes a crashed in_progress session ───────────
+-- The reclaim path (0071 §3) is the primary X5 fix. It restores an engagement
+-- and, in the same transaction, drives a crashed session terminal. Building
+-- the full engagement/attempt chain here would duplicate the 0042 fixtures;
+-- the shared behaviour — the terminal transition that fires 0038 — is the SAME
+-- UPDATE proven above by the sweeper. This asserts the reclaim body CARRIES
+-- that step (so a future edit that drops it turns this red), extracted from the
+-- effective function text rather than trusted.
+-- `_policy_tests.fn_body` is defined later in this file, so read the effective
+-- body directly with pg_get_functiondef (the same source it wraps).
+do $$
+declare
+  v_body text;
+begin
+  select pg_get_functiondef(p.oid) into v_body
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = 'screening_v2' and p.proname = 'reclaim_phone_attempt_leases'
+   limit 1;
+  perform _policy_tests.assert(
+    '0071: reclaim_phone_attempt_leases drives a crashed session terminal for finalization',
+    v_body is not null
+    and position('''expired''' in v_body) > 0
+    and position('recording_egress_status = ''active''' in v_body) > 0
+    and position('''grace_timeout''' in v_body) > 0,
+    'the reclaim restore branch must terminalize a crashed session with an '
+      || 'active egress so the 0038 trigger fires; the step is the X5a fix'
+  );
+end;
+$$;
+
+-- =====================================================================
 -- 0039: Parse-class ingestion resilience — the guarded extracting -> queued
 --       edge, the BOUNDED audited recovery (deliberately NOT a counter
 --       reset), and the additive parse-failure counter.

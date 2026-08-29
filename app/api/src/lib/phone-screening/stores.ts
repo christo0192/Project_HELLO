@@ -49,6 +49,7 @@ import {
   type ListPhoneEngagementRecordingsStatus,
   type ClearPhoneAttemptRecordingsStatus,
   type CommitPhoneQuestionBoundaryStatus,
+  type CommitPhoneItemTurnStatus,
   type GetPhoneAssessmentStateStatus,
   type RecordPhoneProbeStatus,
   type ConsentAndStartPhoneAssessmentStatus,
@@ -99,6 +100,8 @@ import type {
   HeartbeatPhoneAttemptByEpochInput,
   SweepPhoneDayRolledResult,
   SweepPhoneStrandedSessionsResult,
+  SweepPhoneStrandedRecordingsResult,
+  CommitPhoneItemTurnResult,
   ClaimPhoneSweepResult,
 } from './ports.js';
 import {
@@ -468,6 +471,25 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
         examined: num(row, 'examined'),
         completed: num(row, 'completed'),
         failed: num(row, 'failed'),
+        skipped: num(row, 'skipped'),
+      };
+    },
+
+    async sweepStrandedRecordings(input): Promise<SweepPhoneStrandedRecordingsResult> {
+      const { data, error } = await client.rpc('sweep_phone_stranded_recordings', {
+        p_limit: input.limit ?? 25,
+        p_now: isoInstant(input.now),
+        // Omitted when the caller does not override, so the migration's
+        // residency-derived default (7200s) governs. `?? null` sends an
+        // explicit null the RPC coalesces, keeping the arg-name contract.
+        p_grace_seconds: input.graceSeconds ?? null,
+      });
+      if (error) throw new Error('phone_sweep_stranded_recordings_error');
+      const row = asRow(data);
+      return {
+        status: narrowPhoneRpcStatus<'ok'>('sweep_phone_stranded_recordings', row),
+        examined: num(row, 'examined'),
+        finalized: num(row, 'finalized'),
         skipped: num(row, 'skipped'),
       };
     },
@@ -922,6 +944,30 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
         planComplete: bool(row, 'plan_complete'),
         expectedKey: str(row, 'expected_key'),
         sessionStatus: str(row, 'session_status'),
+      };
+    },
+
+    async commitItemTurn(input): Promise<CommitPhoneItemTurnResult> {
+      const { data, error } = await client.rpc('commit_phone_item_turn', {
+        p_session_id: input.sessionId,
+        p_speaker: input.speaker,
+        p_text: input.text,
+        p_source_item_id: input.sourceItemId,
+        p_turn_started_at_ms: input.turnStartedAtMs ?? null,
+        p_now: isoInstant(input.now),
+      });
+      if (error) throw new Error('phone_commit_item_turn_error');
+      const row = asRow(data);
+      const status = narrowPhoneRpcStatus<CommitPhoneItemTurnStatus>(
+        'commit_phone_item_turn',
+        row,
+      );
+      return {
+        status,
+        // `applied` read from the ANSWER, never inferred from the status.
+        applied: bool(row, 'applied') === true && status === 'applied',
+        duplicate: bool(row, 'duplicate') === true,
+        turnIndex: num(row, 'turn_index'),
       };
     },
 

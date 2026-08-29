@@ -132,6 +132,12 @@ export const MIGRATION_0070_PATH = fileURLToPath(
 
 export const MIGRATION_0070 = readFileSync(MIGRATION_0070_PATH, 'utf8');
 
+export const MIGRATION_0071_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0071_phone_persistence_finalization.sql', import.meta.url),
+);
+
+export const MIGRATION_0071 = readFileSync(MIGRATION_0071_PATH, 'utf8');
+
 /**
  * Every phone migration, NEWEST FIRST. Extraction walks this in order and the
  * first file that declares a thing wins, which is what "the latest declaration
@@ -139,6 +145,11 @@ export const MIGRATION_0070 = readFileSync(MIGRATION_0070_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    // 0071 re-declares commit_phone_question_boundary (authorship-guarded turn
+    // insert) and reclaim_phone_attempt_leases (crashed-session terminalize) in
+    // full, and adds commit_phone_item_turn + sweep_phone_stranded_recordings,
+    // so it must be NEWEST-FIRST for the extractor to read the effective bodies.
+    { name: '0071', sql: MIGRATION_0071 },
     // 0070 re-declares get_phone_assessment_state in full (is_gate-filtered
     // resume turns + the gate_recorded signal), so it must be NEWEST-FIRST for
     // the extractor to read the effective body rather than 0049's.
@@ -274,6 +285,10 @@ export const RPC_NAMES = [
   'admit_phone_test_attempt',
   'record_phone_probe',
   'consent_and_start_phone_assessment',
+  // 0071 — per-item transcript persistence (X4) and the crashed-session
+  // recording-finalization backstop sweep (X5).
+  'commit_phone_item_turn',
+  'sweep_phone_stranded_recordings',
 ] as const;
 
 /**

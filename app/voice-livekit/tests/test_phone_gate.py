@@ -226,6 +226,11 @@ class FakeEventClient:
         self._complete = complete
         self.assessment_calls: list[tuple] = []
         self.boundaries: list[dict] = []
+        # 0071 / X4: every per-item transcript write, in order. Modeled with
+        # the server's idempotency: a repeat source_item_id converges on the
+        # first row (duplicate=True) rather than appending, so a test can
+        # assert exactly-once the way the real RPC enforces it.
+        self.item_turns: list[dict] = []
         # P5: every lease renewal, recorded separately from the events so a
         # test asserting the event ORDER is not perturbed by the heartbeat.
         self.heartbeats: list[tuple] = []
@@ -300,6 +305,23 @@ class FakeEventClient:
         outcome = phone.PhoneApiOutcome(True, "applied")
         outcome.cursor = expected_index + 1
         return outcome
+
+    async def commit_item_turn(
+        self, session_id, speaker, text, source_item_id, turn_started_at_ms=None
+    ):
+        # Mirror the server's source_item_id dedup: a repeat converges on the
+        # original row rather than appending a second.
+        for existing in self.item_turns:
+            if existing["source_item_id"] == source_item_id:
+                return phone.PhoneApiOutcome(True, "applied", duplicate=True)
+        self.item_turns.append({
+            "session_id": session_id,
+            "speaker": speaker,
+            "text": text,
+            "source_item_id": source_item_id,
+            "turn_started_at_ms": turn_started_at_ms,
+        })
+        return phone.PhoneApiOutcome(True, "applied", duplicate=False)
 
     async def complete_assessment(self, attempt_id, session_id):
         self.timeline.append("assessment.complete")
@@ -2589,6 +2611,105 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         # The worker still writes NOTHING itself: every durable write goes
         # through the API, so the browser's persistence module is untouched.
         self.assertEqual(persistence_spy.mock_calls, [])
+
+    async def test_X4_assessment_turns_are_persisted_PER_ITEM_as_they_happen(self):
+        """0071 / X4. Each assessment conversation item is persisted the moment
+        it lands, not only in pairs at the boundary. Live call 22 (2026-08-29)
+        crashed mid-call and only 4 of a 6.5-minute transcript survived, because
+        the phone path buffered turns and wrote them only at question
+        boundaries. This asserts the per-item write fires — every bot item the
+        fake session emits during the SCORED phase reaches `commit_item_turn`
+        with a stable per-item key — and that it coexists with the boundary
+        commits rather than replacing them.
+        """
+        result, client, *_ = await self._run_session(answers=("Yes, that's fine.",))
+        self.assertTrue(result.assessment_allowed)
+        # The boundary path still runs (the durable resume authority).
+        self.assertEqual(client.committed_keys, ["k1", "k2"])
+        # And every assessment bot item was ALSO persisted per-item, in order,
+        # each with a distinct stable source_item_id. (The fake models the bot
+        # items; the candidate reply hook does not emit a conversation item, so
+        # the per-item candidate path is covered by the focused test below.)
+        self.assertGreaterEqual(len(client.item_turns), 2)
+        self.assertTrue(all(t["speaker"] == "bot" for t in client.item_turns))
+        keys = [t["source_item_id"] for t in client.item_turns]
+        self.assertEqual(len(keys), len(set(keys)), "per-item keys must be unique")
+        self.assertTrue(all(k.startswith("phone-item-") for k in keys))
+        # None of the persisted per-item turns is gate copy — the writer is
+        # armed only for the SCORED phase.
+        self.assertTrue(
+            all(not phone.is_gate_copy(t["text"]) for t in client.item_turns))
+
+    async def test_X4_N_items_persist_N_rows_with_ZERO_boundaries_and_dedup(self):
+        """0071 / X4. The property `max+1`-at-boundary can never have: a
+        conversation that produces N items persists N rows even when NO boundary
+        is ever committed (a crash before the first boundary), and a duplicate
+        delivery of the same item does not double-insert.
+
+        Driven at the client seam the worker uses, with the FakeEventClient
+        modelling the server's source_item_id dedup exactly as the RPC enforces
+        it. Zero calls to `commit_boundary` are made — this is the crash window.
+        """
+        client = FakeEventClient()
+        # Six items, no boundary at all.
+        seq = 0
+        for speaker, text in [
+            ("bot", "Question one, please?"),
+            ("candidate", "Here is answer one."),
+            ("bot", "Question two, please?"),
+            ("candidate", "Here is answer two."),
+            ("bot", "Question three, please?"),
+            ("candidate", "Here is answer three."),
+        ]:
+            seq += 1
+            outcome = await client.commit_item_turn(
+                "11111111-1111-4111-8111-111111111111", speaker, text,
+                f"phone-item-{seq}")
+            self.assertTrue(outcome.ok)
+            self.assertFalse(outcome.duplicate)
+        self.assertEqual(len(client.item_turns), 6)
+        self.assertEqual(client.boundaries, [])  # crashed before any boundary
+        # A redelivered item (same source_item_id) converges, never appends.
+        dup = await client.commit_item_turn(
+            "11111111-1111-4111-8111-111111111111", "candidate",
+            "Here is answer two.", "phone-item-4")
+        self.assertTrue(dup.ok)
+        self.assertTrue(dup.duplicate)
+        self.assertEqual(len(client.item_turns), 6)  # still six
+
+    async def test_X4_item_turn_client_posts_the_stable_key_and_reads_ok(self):
+        """0071 / X4. The client sends the per-item key and anchor to
+        ITEM_TURN_PATH and reads `ok`/`duplicate` from the server's own flags,
+        never inferring them. Best-effort: a transport error is a not-ok
+        outcome the caller may swallow, never an exception on the hot path.
+        """
+        client = phone.PhoneEventClient()
+        posts: list = []
+
+        async def fake_post(path, body, hint):
+            posts.append((path, body, hint))
+            return types.SimpleNamespace(
+                status_code=200,
+                json=lambda: {"ok": True, "status": "applied", "duplicate": False},
+            )
+
+        with patch.object(client, "_post", fake_post):
+            outcome = await client.commit_item_turn(
+                "sid-1", "candidate", "an answer", "phone-item-7", 1723000000123)
+        self.assertTrue(outcome.ok)
+        self.assertFalse(outcome.duplicate)
+        self.assertEqual(len(posts), 1)
+        path, body, hint = posts[0]
+        self.assertEqual(path, phone.ITEM_TURN_PATH)
+        self.assertEqual(body["source_item_id"], "phone-item-7")
+        self.assertEqual(body["speaker"], "candidate")
+        self.assertEqual(body["turn_started_at_ms"], 1723000000123)
+        # A transport error string is a not-ok outcome, never a raise.
+        async def fake_post_err(path, body, hint):
+            return "transport"
+        with patch.object(client, "_post", fake_post_err):
+            errored = await client.commit_item_turn("sid-1", "bot", "q", "phone-item-8")
+        self.assertFalse(errored.ok)
 
     async def test_first_post_consent_question_is_llm_phrased_in_tool_less_opening(self):
         """The first question is delivered through the model, phrased naturally.

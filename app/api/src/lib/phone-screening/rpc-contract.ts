@@ -68,6 +68,10 @@ export const PHONE_RPC_NAMES = [
   // 0063 — exclusive candidate-scoped production test gate.
   'arm_phone_test_gate',
   'admit_phone_test_attempt',
+  // 0071 — per-item transcript persistence (X4) and the crashed-session
+  // recording-finalization backstop sweep (X5b).
+  'commit_phone_item_turn',
+  'sweep_phone_stranded_recordings',
 ] as const;
 
 export type PhoneRpcName = (typeof PHONE_RPC_NAMES)[number];
@@ -193,6 +197,14 @@ export const PHONE_RPC_PARAMETERS: Readonly<Record<PhoneRpcName, readonly string
     ],
     admit_phone_test_attempt: [
       'p_test_gate_id', 'p_engagement_id', 'p_kind', 'p_lease_owner', 'p_lease_seconds', 'p_now',
+    ],
+    // 0071.
+    commit_phone_item_turn: [
+      'p_session_id', 'p_speaker', 'p_text', 'p_source_item_id',
+      'p_turn_started_at_ms', 'p_now',
+    ],
+    sweep_phone_stranded_recordings: [
+      'p_limit', 'p_grace_seconds', 'p_now',
     ],
   });
 
@@ -563,6 +575,22 @@ export type ArmPhoneTestGateStatus = (typeof ARM_PHONE_TEST_GATE_STATUSES)[numbe
 export const ADMIT_PHONE_TEST_ATTEMPT_STATUSES = ['ok', 'halted'] as const;
 export type AdmitPhoneTestAttemptStatus = (typeof ADMIT_PHONE_TEST_ATTEMPT_STATUSES)[number];
 
+/**
+ * `commit_phone_item_turn` (0071 / X4) — the per-item transcript writer.
+ * `applied` on both a fresh write and an idempotent duplicate; `invalid_turn`
+ * (SINGULAR — distinct from the boundary's `invalid_turns`) on a bad shape;
+ * the two live-session refusals otherwise.
+ */
+export const COMMIT_PHONE_ITEM_TURN_STATUSES = [
+  'applied', 'invalid_turn', 'unknown_session', 'session_not_active',
+] as const;
+export type CommitPhoneItemTurnStatus = (typeof COMMIT_PHONE_ITEM_TURN_STATUSES)[number];
+
+/** `sweep_phone_stranded_recordings` (0071 / X5b) — a bounded sweep answers `ok`. */
+export const SWEEP_PHONE_STRANDED_RECORDINGS_STATUSES = ['ok'] as const;
+export type SweepPhoneStrandedRecordingsStatus =
+  (typeof SWEEP_PHONE_STRANDED_RECORDINGS_STATUSES)[number];
+
 /** The per-RPC vocabularies, keyed by RPC name. */
 export const PHONE_RPC_STATUSES: Readonly<Record<PhoneRpcName, readonly string[]>> =
   Object.freeze({
@@ -594,6 +622,8 @@ export const PHONE_RPC_STATUSES: Readonly<Record<PhoneRpcName, readonly string[]
     consent_and_start_phone_assessment: CONSENT_AND_START_PHONE_ASSESSMENT_STATUSES,
     arm_phone_test_gate: ARM_PHONE_TEST_GATE_STATUSES,
     admit_phone_test_attempt: ADMIT_PHONE_TEST_ATTEMPT_STATUSES,
+    commit_phone_item_turn: COMMIT_PHONE_ITEM_TURN_STATUSES,
+    sweep_phone_stranded_recordings: SWEEP_PHONE_STRANDED_RECORDINGS_STATUSES,
   });
 
 /**
@@ -628,8 +658,16 @@ export const PHONE_RPC_STATUS_UNION: readonly string[] = Object.freeze(
  * heartbeat added no new members — `ok` and `lease_lost` were already in the
  * union, which is the whole reason the increment is smaller than the number
  * of RPCs added.
+ *
+ * 0071 takes it from 102 to 103: `commit_phone_item_turn` adds exactly ONE new
+ * member, `invalid_turn` (SINGULAR — the boundary's `invalid_turns` is a
+ * different string). Its other members (`applied`, `unknown_session`,
+ * `session_not_active`) were already in the union, and
+ * `sweep_phone_stranded_recordings` answers only `ok`, which was too — so a
+ * two-RPC migration moves the count by one. The exact number is RE-DERIVED by
+ * the drift test from the migration text; this constant is only a tripwire.
  */
-export const PHONE_RPC_STATUS_COUNT = 102;
+export const PHONE_RPC_STATUS_COUNT = 103;
 
 /**
  * RESULT KEYS the API's behaviour DEPENDS on, per RPC.

@@ -299,6 +299,27 @@ const gateTurnsSchema = z
   })
   .strict();
 
+/**
+ * 0071 / X4 — the per-item transcript writer.
+ *
+ * ONE turn, persisted the moment the worker sees it, so a mid-call crash
+ * between question boundaries no longer loses everything since the last one
+ * (live call 22, 2026-08-29: 4 of a 6.5-minute transcript survived). Bounds
+ * MIRROR `commit_phone_item_turn`: speaker bot|candidate, text 1..8,000 after
+ * trim, `source_item_id` `^[A-Za-z0-9_.:-]{1,200}$` (the per-item idempotency
+ * key), optional epoch-ms anchor. The RPC re-enforces every one, so a
+ * malformed body is a flat 400 rather than a database round trip.
+ */
+const itemTurnSchema = z
+  .object({
+    session_id: z.string().regex(UUID_RE),
+    speaker: z.enum(['bot', 'candidate']),
+    text: z.string().trim().min(1).max(8_000),
+    source_item_id: z.string().trim().regex(/^[A-Za-z0-9_.:-]{1,200}$/),
+    turn_started_at_ms: z.number().int().positive().lt(4_102_444_800_000).nullable().optional(),
+  })
+  .strict();
+
 export interface PhoneWorkerRouterDeps {
   readonly stores?: PhoneStores;
   /** Read-only appointment/attempt seam for proposal validation. */
@@ -1113,6 +1134,50 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       });
     } catch {
       return res.status(500).json({ ok: false, status: 'phone_assessment_error' });
+    }
+  });
+
+  // ── POST /assessment/item-turn ────────────────────────────────────
+  // 0071 / X4. Persists ONE transcript turn AS IT HAPPENS, so a mid-call
+  // crash between question boundaries no longer loses every turn since the
+  // last boundary. Deduped on `source_item_id`, so a redelivered item does not
+  // double-insert. This is best-effort by contract: a failure here must NEVER
+  // fail a live call — the boundary path remains the resume authority — so the
+  // worker logs and continues on any non-2xx. `applied` (fresh) and `applied`
+  // with `duplicate:true` are both success; the two live-session refusals are
+  // 409 (state the worker cannot fix by retrying) and a store throw is 503.
+  router.post('/assessment/item-turn', requireWorkerPhoneAuth, async (req, res) => {
+    try {
+      if (!config().screeningEnabled) {
+        return res.status(503).json({ ok: false, error: 'phone_screening_disabled' });
+      }
+      const parsed = itemTurnSchema.safeParse(req.body);
+      const commitItemTurn = stores().commitItemTurn;
+      if (!parsed.success || typeof commitItemTurn !== 'function') {
+        return res.status(400).json({ ok: false, status: 'invalid_request' });
+      }
+      const result = await commitItemTurn({
+        sessionId: parsed.data.session_id,
+        speaker: parsed.data.speaker,
+        text: parsed.data.text,
+        sourceItemId: parsed.data.source_item_id,
+        turnStartedAtMs: parsed.data.turn_started_at_ms ?? null,
+        now: now(),
+      });
+      if (result.status === 'applied') {
+        return res.json({
+          ok: result.applied,
+          status: result.status,
+          duplicate: result.duplicate,
+        });
+      }
+      // A refusal the DB decided — bad shape, unknown session, or a session no
+      // longer live. 409 so the worker can tell it from a transport fault.
+      return res.status(409).json({ ok: false, status: result.status });
+    } catch {
+      // A store throw is an RPC transport fault. Sanitized 503: a driver
+      // message here could quote a transcript row.
+      return res.status(503).json({ ok: false, status: 'phone_item_turn_error' });
     }
   });
 

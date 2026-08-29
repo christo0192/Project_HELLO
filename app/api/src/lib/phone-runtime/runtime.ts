@@ -133,6 +133,11 @@ export interface PhoneRuntimeSnapshot {
   /** 0045. Stranded engagements resolved — completed plus truthfully failed. */
   readonly lastStranded: number | null;
   /**
+   * 0071 / X5b. Sessions driven terminal by the last stranded-recording pass
+   * so a crashed call's recording could finalize. Distinct from lastStranded.
+   */
+  readonly lastRecStranded: number | null;
+  /**
    * Sweeps whose LAST run answered with a non-`ok` RPC status, by name.
    *
    * Separate from the counts on purpose. A count of `0` means the sweep ran
@@ -348,9 +353,14 @@ export function createPhoneRuntime(
   // not happen" must reach the health surface as different answers.
   const sweepNotOk: Record<string, boolean> = {
     reclaim: false, expire: false, reconcile: false, dayroll: false, stranded: false,
+    recstrand: false,
   };
   let lastRolled: number | null = null;
   let lastStranded: number | null = null;
+  // 0071 / X5b: sessions driven terminal so a crashed call's recording could
+  // finalize. Kept apart from `stranded` (0045), which resolves the opposite
+  // shape — an engagement pointing at an already-terminal session.
+  let lastRecStranded: number | null = null;
 
   /**
    * The bounded leader CLAIM in front of a fleet-wide sweep.
@@ -411,6 +421,7 @@ export function createPhoneRuntime(
     sweepNotOk[sweep] = verdict === 'broken';
     if (sweep === 'dayroll') lastRolled = null;
     if (sweep === 'stranded') lastStranded = null;
+    if (sweep === 'recstrand') lastRecStranded = null;
     if (sweep === 'reconcile') lastReconciled = null;
     return false;
   };
@@ -712,6 +723,44 @@ export function createPhoneRuntime(
       },
     },
     {
+      name: 'phone-recstrand',
+      intervalMs: runtimeConfig.expireMs,
+      tick: async () => {
+        // ── 0071 / X5b: CRASHED SESSIONS WHOSE RECORDING NEVER FINALIZED ─
+        // A worker crash posts no terminal session status, so a session sits
+        // `in_progress` with a live egress and no object key and the 0038
+        // finalize trigger — which fires only on a terminal transition —
+        // never runs. `reclaim_phone_attempt_leases` (0071 §3) covers the
+        // common case at lease loss; this is the backstop for anything it
+        // cannot reach, and for legacy rows from before that shipped. It
+        // drives such sessions to expired/grace_timeout so the trigger fires.
+        // Idempotent (the terminal transition dedups on the 0038 job key) and
+        // self-limiting (only the exact stuck shape, past a residency-derived
+        // grace), so it rides the same bounded leader CLAIM as the other
+        // sweeps. Runs on the EXPIRE cadence: the thing it watches for is a
+        // dead call, which does not need sub-minute detection.
+        // M-7: `theirs` holds, `broken`/non-`ok` backs off.
+        const verdict = await claimed('recstrand');
+        if (!applyClaim('recstrand', verdict)) {
+          return verdict === 'theirs' ? HOLD_BASE_CADENCE : ALLOW_IDLE_BACKOFF;
+        }
+        const sweep = stores.sweepStrandedRecordings;
+        if (typeof sweep !== 'function') {
+          // A store double without the method: publish a truthful null rather
+          // than a stale count, and idle-back-off.
+          lastRecStranded = null;
+          return ALLOW_IDLE_BACKOFF;
+        }
+        const resolved = await sweep({
+          limit: runtimeConfig.reclaimLimit,
+          now: new Date(),
+        });
+        sweepNotOk.recstrand = resolved.status !== 'ok';
+        lastRecStranded = resolved.status === 'ok' ? (resolved.finalized ?? 0) : null;
+        return resolved.status === 'ok' ? HOLD_BASE_CADENCE : ALLOW_IDLE_BACKOFF;
+      },
+    },
+    {
       name: 'phone-reconcile',
       intervalMs: runtimeConfig.reconcileMs,
       tick: async () => {
@@ -789,6 +838,7 @@ export function createPhoneRuntime(
       lastReconciled,
       lastRolled,
       lastStranded,
+      lastRecStranded,
       sweepNotOk: { ...sweepNotOk },
     }),
     async tickAll(): Promise<void> {
