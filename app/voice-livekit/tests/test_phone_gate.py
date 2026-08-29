@@ -2167,6 +2167,13 @@ class TestPhoneDisconnectMapping(unittest.TestCase):
 # ── The phone session ─────────────────────────────────────────────────
 
 class _FakeSpeech:
+    def __init__(self, interrupted: bool = False):
+        # F3 (call 24): the SDK's SpeechHandle exposes `interrupted`; the
+        # terminal-reply waiter reads it to decide whether the goodbye actually
+        # played to completion. Default False = a clean playout (pre-F3 shape),
+        # which is why every existing test is unaffected.
+        self.interrupted = interrupted
+
     async def wait_for_playout(self):
         return None
 
@@ -2178,6 +2185,7 @@ class _FakePhoneSession:
     default_interruptions: list[bool] = []
     default_silence_reply: str | None = None
     default_emit_auto_speech: bool = True
+    default_terminal_reply_interrupted: bool = False
     include_timing: bool = False
     # The verified opening the gate-opening window "speaks" through
     # generate_reply. Discloses recording and asks, so `_opening_is_verified`
@@ -2214,6 +2222,7 @@ class _FakePhoneSession:
         self.interruptions: list[bool] = list(_FakePhoneSession.default_interruptions)
         self.silence_reply = _FakePhoneSession.default_silence_reply
         self.emit_auto_speech = _FakePhoneSession.default_emit_auto_speech
+        self.terminal_reply_interrupted = _FakePhoneSession.default_terminal_reply_interrupted
         self._anchor_index = 0
         _FakePhoneSession.instances.append(self)
 
@@ -2332,8 +2341,21 @@ class _FakePhoneSession:
     # BOT item first and the candidate's reply second, in that order, because
     # the ordering is exactly what the boundary contract depends on.
     def generate_reply(self, instructions=None, **kwargs):
-        self.instructions.append(str(instructions or ""))
-        speech = _FakeSpeech()
+        instr_text = str(instructions or "")
+        self.instructions.append(instr_text)
+        # F3 (call 24): model an INTERRUPTED goodbye. The goodbye instruction is
+        # injected into the FINAL answer's turn context (not this call's
+        # `instructions`), so the terminal reply is the reply to a turn whose
+        # developer message said "say goodbye". When the toggle is set and the
+        # most recent turn context carried that instruction, the SpeechHandle
+        # for this reply reports `interrupted=True`, exactly as the live call did
+        # ("...your time and", room closed). The terminal-reply waiter must then
+        # speak the fixed closing before teardown.
+        last_ctx = str(self.turn_contexts[-1]).lower() if self.turn_contexts else ""
+        is_goodbye = "say goodbye" in last_ctx or "final closing" in last_ctx
+        speech = _FakeSpeech(
+            interrupted=(is_goodbye and self.terminal_reply_interrupted)
+        )
         handler = self.handlers.get("speech_created")
         if handler is not None and (instructions or self.emit_auto_speech):
             handler(types.SimpleNamespace(speech_handle=speech))
@@ -2380,6 +2402,7 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         _FakePhoneSession.default_interruptions = []
         _FakePhoneSession.default_silence_reply = None
         _FakePhoneSession.default_emit_auto_speech = True
+        _FakePhoneSession.default_terminal_reply_interrupted = False
         _FakePhoneSession.include_timing = False
 
     async def _run_session(
@@ -2828,6 +2851,58 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         # an assessment and a scorecard while leaving that terminal state
         # where it is. There is no path back to `completed`. See the runbook.
         self.assertEqual(client.committed_keys, ["k1", "k2"])
+
+    async def test_the_exact_role_is_SPOKEN_at_the_top_of_the_screening(self):
+        """F1 (call 24): the opening was generic and the model later hallucinated
+        the role. The exact server-verified title is now spoken deterministically
+        before the first question, as fixed gate copy (never a boundary)."""
+        role = "Sales Program Advisor"
+        client = FakeEventClient(start=_default_state())
+        client._start.role_title = role
+        _, client, _, _, session, _ = await self._run_session(
+            answers=("Yes, that's fine.",), client=client,
+        )
+        role_line = phone.phone_role_opening_text(role)
+        self.assertIn(role_line, session.spoken)
+        # And it never became a committed screening boundary.
+        for b in client.boundaries:
+            for turn in b["turns"]:
+                self.assertNotIn(role_line, turn.get("text", ""))
+
+    async def test_no_role_opening_when_the_state_has_no_role(self):
+        """Byte-unchanged when no role is known: nothing extra is spoken."""
+        _, _, _, _, session, _ = await self._run_session(
+            answers=("Yes, that's fine.",),
+        )
+        for line in session.spoken:
+            self.assertFalse(line.startswith("Before we dive in, just to confirm"))
+
+    async def test_an_INTERRUPTED_goodbye_still_speaks_the_fixed_closing(self):
+        """F3 (call 24): the goodbye started, was interrupted mid-sentence
+        ("...your time and"), and the room closed with no complete goodbye. The
+        terminal path now speaks the FIXED closing before teardown whenever the
+        model's goodbye did not play to completion — and it stays `completed`
+        (the screening finished; only the goodbye was cut off)."""
+        _FakePhoneSession.default_terminal_reply_interrupted = True
+        _, client, _, delete, session, _ = await self._run_session(
+            answers=("Yes, that's fine.",),
+        )
+        self.assertIn(phone.PHONE_ASSESSMENT_CLOSING_TEXT, session.spoken)
+        # The assessment is still complete — the fallback is a goodbye, not a
+        # downgrade to an abort.
+        self.assertIn("assessment.completed", client.event_types)
+        self.assertNotIn("assessment.aborted", client.event_types)
+        delete.assert_awaited()
+
+    async def test_a_CLEAN_goodbye_does_NOT_double_speak_the_fixed_closing(self):
+        """The fixed-closing fallback fires ONLY on an interrupted/absent reply.
+        A goodbye that played to completion must not be followed by a second,
+        fixed one."""
+        _, client, _, _, session, _ = await self._run_session(
+            answers=("Yes, that's fine.",),
+        )
+        self.assertIn("assessment.completed", client.event_types)
+        self.assertNotIn(phone.PHONE_ASSESSMENT_CLOSING_TEXT, session.spoken)
 
     async def test_a_PERSISTENCE_failure_posts_nothing_at_all(self):
         """The one path that must post NEITHER terminal event.
@@ -4026,6 +4101,7 @@ class TestSilentRoomKillGuard(unittest.IsolatedAsyncioTestCase):
         _FakePhoneSession.instances = []
         _FakePhoneSession.default_answers = []
         _FakePhoneSession.default_emit_auto_speech = True
+        _FakePhoneSession.default_terminal_reply_interrupted = False
         _FakePhoneSession.include_timing = False
 
     async def _run(self, *, session_cls, answers, replies, complete=None):
@@ -4033,6 +4109,7 @@ class TestSilentRoomKillGuard(unittest.IsolatedAsyncioTestCase):
         client = FakeEventClient(complete=complete)
         _FakePhoneSession.default_answers = list(replies)
         _FakePhoneSession.default_emit_auto_speech = True
+        _FakePhoneSession.default_terminal_reply_interrupted = False
 
         async def classifier(turns, say):
             return phone.CLASSIFY_HUMAN
@@ -4198,6 +4275,7 @@ class TestSilentRoomKillGuard(unittest.IsolatedAsyncioTestCase):
         # session closes externally, which the silence loop reads as disconnect.
         _FakePhoneSession.default_answers = ["First answer."]
         _FakePhoneSession.default_emit_auto_speech = True
+        _FakePhoneSession.default_terminal_reply_interrupted = False
 
         async def classifier(turns, say):
             return phone.CLASSIFY_HUMAN
@@ -4432,6 +4510,7 @@ class TestToollessSessionFlow(unittest.IsolatedAsyncioTestCase):
         _FakePhoneSession.default_interruptions = []
         _FakePhoneSession.default_silence_reply = None
         _FakePhoneSession.default_emit_auto_speech = True
+        _FakePhoneSession.default_terminal_reply_interrupted = False
         _FakePhoneSession.include_timing = False
         self._harness = TestPhoneSessionFlow()
 
@@ -4646,6 +4725,129 @@ class TestPhoneRoleDeterminism(unittest.TestCase):
         self.assertIn("role_title_absent", categories)
 
 
+class TestCall24Regressions(unittest.TestCase):
+    """PR-7 (call 24) — deterministic role, delivery-proof blocks, no markdown."""
+
+    def _question(self):
+        return phone.PhonePlanQuestion(
+            key="k1", text="Tell me about your last role.",
+            mandatory=True, hint=None,
+        )
+
+    # ── F4: markdown stripped for speech ──────────────────────────────
+    def test_strip_markdown_removes_emphasis_glyphs(self):
+        got = phone.strip_markdown_for_speech(
+            "You are the **Software Engineer** _for now_ `x` ~~old~~"
+        )
+        self.assertNotIn("*", got)
+        self.assertNotIn("_", got)
+        self.assertNotIn("`", got)
+        self.assertNotIn("~", got)
+        # Word content and spacing are preserved.
+        self.assertIn("Software Engineer", got)
+        self.assertIn("for now", got)
+
+    def test_strip_markdown_non_str_is_empty(self):
+        self.assertEqual(phone.strip_markdown_for_speech(None), "")
+        self.assertEqual(phone.strip_markdown_for_speech(42), "")
+
+    def test_strip_markdown_survives_split_marker(self):
+        # A `*` split across chunks is still removed because it is a per-char
+        # translation, never a pair rewrite.
+        self.assertEqual(
+            phone.strip_markdown_for_speech("*") + phone.strip_markdown_for_speech("*bold"),
+            "bold",
+        )
+
+    def test_tts_node_strips_markdown_from_stream(self):
+        class BaseAgent:
+            def __init__(self, instructions=""):
+                self.instructions = instructions
+
+            async def tts_node(self, text, model_settings):
+                # The SDK's tts_node consumes the (already-cleaned) text stream;
+                # this stub just re-emits the chunks so the test can inspect them.
+                async for chunk in text:
+                    yield chunk
+
+        agent = phone.phone_agent_class(BaseAgent)(
+            "sys", client=FakeEventClient(), attempt_id=_ATTEMPT_ID, say=AsyncMock(),
+            on_user_turn=lambda *a, **k: None, native_turns=True,
+        )
+
+        async def _src():
+            for chunk in ("Hi **there** ", "`code` ", "done_"):
+                yield chunk
+
+        async def run():
+            out = []
+            async for frame in agent.tts_node(_src(), None):
+                out.append(frame)
+            return "".join(out)
+
+        spoken = asyncio.run(run())
+        self.assertNotIn("*", spoken)
+        self.assertNotIn("`", spoken)
+        self.assertNotIn("_", spoken)
+        self.assertIn("there", spoken)
+        self.assertIn("code", spoken)
+
+    # ── F1: deterministic role opening ────────────────────────────────
+    def test_role_opening_text_names_the_exact_role(self):
+        line = phone.phone_role_opening_text("Sales Program Advisor")
+        self.assertIsNotNone(line)
+        self.assertIn("Sales Program Advisor", line)
+        # No markdown in fixed copy.
+        for glyph in "*_`~":
+            self.assertNotIn(glyph, line)
+
+    def test_role_opening_text_none_when_no_role(self):
+        for title in (None, "", "   "):
+            self.assertIsNone(phone.phone_role_opening_text(title))
+
+    def test_role_opening_is_gate_copy_not_a_boundary(self):
+        line = phone.phone_role_opening_text("Sales Program Advisor")
+        self.assertTrue(phone.is_gate_copy(line))
+
+    # ── F2: the compact style reminder rides the PER-TURN payload ──────
+    def test_per_turn_payload_carries_style_reminder(self):
+        text = agent_mod.phone_question_instructions(self._question(), "Data Engineer")
+        self.assertIn(phone.PHONE_PER_TURN_STYLE_TEXT, text)
+        # The style reminder forbids markdown and enforces one question.
+        self.assertIn("never markdown", phone.PHONE_PER_TURN_STYLE_TEXT)
+        self.assertIn("ONE question", phone.PHONE_PER_TURN_STYLE_TEXT)
+
+    def test_per_turn_payload_carries_role_and_style_together(self):
+        text = agent_mod.phone_question_instructions(self._question(), "Data Engineer")
+        self.assertIn('The role is exactly: "Data Engineer"', text)
+        self.assertIn(phone.PHONE_PER_TURN_STYLE_TEXT, text)
+
+    # ── F3: a mid-plan candidate meta-question is a QUESTION, not an answer ──
+    def test_candidate_meta_question_routes_as_a_question(self):
+        # The exact call-24 turn-23 shape: the candidate asks the bot for
+        # feedback mid-interview. It must route as `candidate_question` (answer
+        # briefly, re-ask the current planned topic), never advance the plan.
+        self.assertEqual(
+            phone.candidate_turn_route(
+                "And what do you think about my workflow? "
+                "Is there anything we can improve on this?"
+            ),
+            "candidate_question",
+        )
+        self.assertEqual(
+            phone.candidate_turn_route("So how does that work?"),
+            "candidate_question",
+        )
+
+    def test_leading_filler_answer_is_NOT_a_question(self):
+        # The tolerant leading-conjunction rule must not swallow substantive
+        # answers or thinking fragments that merely START with "so"/"hmm".
+        self.assertIsNone(phone.candidate_turn_route("so I led a team of five"))
+        self.assertIsNone(
+            phone.candidate_turn_route("hmm so the challenging part would be")
+        )
+
+
 class TestTeardownLabelVocabulary(unittest.TestCase):
     """X7b — the teardown log has its own bounded vocabulary."""
 
@@ -4760,6 +4962,7 @@ class TestPatienceGateTurnHook(unittest.IsolatedAsyncioTestCase):
         _FakePhoneSession.instances = []
         _FakePhoneSession.default_answers = []
         _FakePhoneSession.default_emit_auto_speech = True
+        _FakePhoneSession.default_terminal_reply_interrupted = False
         _FakePhoneSession.include_timing = False
 
     @staticmethod

@@ -441,6 +441,35 @@ PHONE_SILENCE_GOODBYE_TEXT = (
 PHONE_CONSENT_BRIDGE_TEXT = "Awesome, thank you!"
 
 
+#: The DETERMINISTIC role announcement (F1, call 24). Owner decision: "the bot
+#: actually says the role in the beginning; exact role is fine — production
+#: passes the real role." On call 24 the opening was generic ("...regarding your
+#: job application...") and, when later asked which role, the model HALLUCINATED
+#: "Software Engineer" (the DB title was "Sales Program Advisor"). The role title
+#: reaches the worker verbatim from the server projection (`state.role_title`),
+#: available the instant the atomic consent/start RPC returns — before the first
+#: question is spoken — so the exact role is stated deterministically here rather
+#: than left to a per-turn instruction the model can paraphrase or ignore.
+#:
+#: This is FIXED COPY around a verbatim server value, spoken once at the top of
+#: the screening. It is NOT a screening turn, so `is_gate_copy` recognises it by
+#: prefix and the capture loop never folds it into a question boundary. Returns
+#: None when no role is known, so a role-less state stays byte-unchanged (no
+#: hollow "the role you applied for" announcement is forced).
+_PHONE_ROLE_OPENING_PREFIX = "Before we dive in, just to confirm — "
+
+
+def phone_role_opening_text(role_title: str | None) -> str | None:
+    """The one deterministic sentence naming the exact role, or None."""
+    role = (role_title or "").strip()
+    if not role:
+        return None
+    return (
+        f"{_PHONE_ROLE_OPENING_PREFIX}this is about the {role} role. "
+        "Let's get started."
+    )
+
+
 #: Fixed copy the bot speaks that is NOT part of the screening record.
 #:
 #: Two kinds live here: the identity/disclosure/refusal lines the GATE speaks
@@ -479,7 +508,7 @@ def is_gate_copy(text: Any) -> bool:
     clean = text.strip()
     return clean in gate_copy_texts() or (
         clean.startswith("I can call you back on ") and clean.endswith("?")
-    )
+    ) or clean.startswith(_PHONE_ROLE_OPENING_PREFIX)
 
 
 # ── Worker event API ──────────────────────────────────────────────────
@@ -1986,6 +2015,74 @@ PHONE_EXPRESSIVENESS_TEXT = (
 )
 
 
+#: Voice never speaks markup. A live call on 2026-08-29 (call 24) had the bot
+#: answer "You are currently being considered for the **Software Engineer**
+#: position." — the literal asterisks were synthesised by TTS. The per-turn
+#: prompt now forbids markdown (see `_role_turn_line` / the discipline line), and
+#: this is the DEFENSIVE net: emphasis markup that slips through is stripped from
+#: the text stream on the way to the TTS node, so nothing the model emits can be
+#: spoken as punctuation. Pure function, applied per chunk so it is safe across
+#: streaming boundaries (it removes characters, never rewrites pairs, so a `*`
+#: split across two chunks is still removed).
+_MARKDOWN_SPEECH_CHARS = str.maketrans("", "", "*_`~")
+
+
+def strip_markdown_for_speech(text: Any) -> str:
+    """Remove markdown emphasis characters that TTS would pronounce as noise.
+
+    Only the inline emphasis/code markers (`*`, `_`, backtick, `~`) are removed.
+    Word content, spacing and sentence punctuation are untouched — a spoken
+    "asterisk" the candidate literally said would arrive as the word, not the
+    glyph, so this never changes meaning. Non-str input returns "".
+    """
+    if not isinstance(text, str):
+        return ""
+    return text.translate(_MARKDOWN_SPEECH_CHARS)
+
+
+async def _aiter_text(text: Any) -> Any:
+    """Normalise a TTS-node text source to an async iterator of str chunks.
+
+    livekit-agents hands `tts_node` an async iterable of text chunks; tests and
+    stubs may hand a plain str or a sync iterable. This yields str chunks from
+    any of those shapes so the markdown strip is uniform. Non-str chunks are
+    coerced with `str`; a bare str is a single chunk.
+    """
+    if isinstance(text, str):
+        yield text
+        return
+    aiter = getattr(text, "__aiter__", None)
+    if callable(aiter):
+        async for chunk in text:
+            yield chunk if isinstance(chunk, str) else str(chunk)
+        return
+    for chunk in text:  # sync iterable fallback
+        yield chunk if isinstance(chunk, str) else str(chunk)
+
+
+#: COMPACT per-turn style reminder (F2, call 24). The full expressiveness /
+#: discipline / resume-conflict blocks are appended in `_phone_instructions_text`,
+#: which rides `update_instructions` — a NO-OP on livekit-agents 1.6.4's read-only
+#: `Agent.instructions`, so on call 24 none of them reached the live model (flat
+#: tone, stacked questions, markdown asterisks, no conflict probe). The per-turn
+#: developer message is the surface the model provably reads every turn, so a
+#: SHORT reminder of the same rules rides here. It is deliberately compact: the
+#: authoritative long-form copy lives in the construction-time payload
+#: (`_phone_instructions_text`) AND, for the toolless lane, in the first-turn
+#: injection, so per-turn payloads do not balloon by ~2 KB every turn.
+PHONE_PER_TURN_STYLE_TEXT = (
+    "Style (phone line): plain spoken text only — never markdown, asterisks, "
+    "underscores or backticks. Ask exactly ONE question this turn, never two. "
+    "React with genuine warmth and light professional humour (the line is "
+    "narrow, so carry the energy in your words), but never joke about the "
+    "candidate or their answers, and never during consent, recording "
+    "disclosure, compensation, or a resume discrepancy. If a spoken answer "
+    "clearly conflicts with the resume facts you were given, ask ONE polite "
+    "clarifying question about that specific point, then continue — at most "
+    "once per discrepancy, never accusing."
+)
+
+
 INTERRUPTED_QUESTION_PREFIX = "[interrupted question] "
 
 
@@ -2973,7 +3070,14 @@ _ROLE_CLARIFICATION_RE = re.compile(
     re.IGNORECASE,
 )
 _QUESTION_OPEN_RE = re.compile(
-    r"^\s*(?:can|could|would|will|what|which|who|where|when|why|how|"
+    # A leading conjunction / filler is tolerated so a mid-interview candidate
+    # question phrased "And what do you think...?" / "So how does...?" is still
+    # recognised as a QUESTION and routed to answer-then-re-ask, not mistaken
+    # for a substantive answer (call 24, turn 23: "And what do you think about
+    # my workflow? ..." fell through this gate because it did not start with an
+    # interrogative). Up to two leading conjunctions/fillers are skipped.
+    r"^\s*(?:(?:and|so|but|ok|okay|well|hmm+|now)[\s,.!?-]+){0,2}"
+    r"(?:can|could|would|will|what|which|who|where|when|why|how|"
     r"is|are|do|does|did)\b",
     re.IGNORECASE,
 )
@@ -3417,6 +3521,29 @@ def phone_agent_class(agent_base: Any) -> Any:
             # never reaches this branch.
             from livekit.agents import StopResponse  # noqa: PLC0415
             raise StopResponse()
+
+        async def tts_node(self, text: Any, model_settings: Any) -> Any:
+            """Strip markdown emphasis from spoken text (F4, call 24).
+
+            The TTS node is the last seam every spoken turn passes through,
+            downstream of both the streamed LLM output and any fixed `say`
+            copy. A live call spoke literal asterisks around a (hallucinated)
+            role title; the per-turn prompt now forbids markdown, and this is
+            the defensive net: each text chunk has its emphasis/code markers
+            removed before synthesis. Applied per chunk with a character-removal
+            translation (never a pair rewrite), so a marker split across two
+            streaming chunks is still stripped. PHONE ONLY — this override lives
+            on the phone Agent subclass; the browser Agent uses the SDK default.
+            """
+            async def _cleaned() -> Any:
+                async for chunk in _aiter_text(text):
+                    yield strip_markdown_for_speech(chunk)
+
+            result = super().tts_node(_cleaned(), model_settings)
+            if inspect.isawaitable(result):
+                result = await result
+            async for frame in result:
+                yield frame
 
         @_tool
         async def request_probe(self) -> str:

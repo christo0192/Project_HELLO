@@ -908,6 +908,11 @@ def phone_question_instructions(
     role_line = _role_turn_line(role_title)
     if role_line is not None:
         lines.append(role_line)
+    # F2 (call 24): the compact style reminder rides the SAME per-turn developer
+    # message the model provably reads, because the full expressiveness /
+    # discipline / no-markdown blocks in `_phone_instructions_text` never reach
+    # the live model on livekit-agents 1.6.4 (read-only `Agent.instructions`).
+    lines.append(phone.PHONE_PER_TURN_STYLE_TEXT)
     return "\n".join(lines)
 
 
@@ -1426,6 +1431,18 @@ async def _run_native_phone_screening(
         raise RuntimeError("phone_turn_context_unavailable")
 
     async def wait_for_terminal_reply() -> bool:
+        """Wait for the model's goodbye to PLAY TO COMPLETION.
+
+        F3 (call 24): the goodbye was authored and started but the candidate's
+        overlapping turn INTERRUPTED it mid-sentence ("...your time and"), the
+        room closed, and no complete goodbye was ever spoken. This used to
+        return `handle is not None` — true even for an interrupted reply — so
+        the caller believed a goodbye played. It now returns True only when the
+        reply finished WITHOUT interruption, so the caller can speak the fixed
+        closing when the model's goodbye did not fully land. `interrupted` is
+        read defensively: an SDK/stub that does not expose it is treated as a
+        clean completion (the pre-F3 behaviour) rather than forcing a fallback.
+        """
         try:
             await asyncio.wait_for(
                 reply_started.wait(), timeout=PHONE_TERMINAL_REPLY_TIMEOUT_SEC,
@@ -1438,9 +1455,12 @@ async def _run_native_phone_screening(
             value = wait()
             if inspect.isawaitable(value):
                 await value
-        if handle is not None and closing.state is ClosingState.CLOSING_PENDING:
+        if handle is None:
+            return False
+        interrupted = bool(getattr(handle, "interrupted", False))
+        if not interrupted and closing.state is ClosingState.CLOSING_PENDING:
             closing.closing_delivered()
-        return handle is not None
+        return not interrupted
 
     async def on_native_turn(
         text: str, message: Any = None, turn_ctx: Any = None,
@@ -1459,7 +1479,21 @@ async def _run_native_phone_screening(
             terminal_reason["reason"] = phone.HALT_CANDIDATE_ENDED
             finished.set()
             return
+        question = state.question_at(cursor)
         if closing.state is ClosingState.CANDIDATE_QNA:
+            # F3 (call 24): `completed` is UNREACHABLE while a planned question
+            # remains. CANDIDATE_QNA is only entered when the cursor exhausted
+            # the plan (see `on_advance`), but a background commit race or a
+            # future edit could leave a question owed while the FSM sits in QNA;
+            # ending here then would drop the interview with questions unasked
+            # (the call-24 failure: notice period / CTC / expected CTC never
+            # asked, yet the call ended "completed"). If a question is still
+            # owed, do NOT complete — answer the candidate briefly and return to
+            # that owed question, exactly like the mid-plan question route below.
+            if question is not None:
+                setattr(agent, "_turn_policy", "clarification")
+                add_turn_instruction(turn_ctx, "Answer the candidate's question briefly, then continue the screening by asking this same planned topic again as ONE natural spoken question in your own words:\n" + question.text)
+                return
             closing.candidate_questions_handled()
             setattr(agent, "_turn_policy", "closing")
             terminal_reply_required["value"] = True
@@ -1467,7 +1501,6 @@ async def _run_native_phone_screening(
             finished.set()
             add_turn_instruction(turn_ctx, "Answer the candidate's question briefly if they asked one. Then thank them, say the team will be in touch, and say goodbye. Do not ask another question.")
             return
-        question = state.question_at(cursor)
         if silence_prompted["value"]:
             silence_prompted["value"] = False
             if question is not None:
@@ -1863,6 +1896,21 @@ async def _run_native_phone_screening(
         raise RuntimeError("phone_consent_authorization_unavailable")
     authorize()
 
+    # F1 (call 24): state the EXACT role deterministically at the top of the
+    # screening. `state.role_title` is the server-verified title returned by the
+    # atomic consent/start RPC, available here before the first question is
+    # spoken. This is fixed copy around a verbatim value (see
+    # `phone.phone_role_opening_text` / `is_gate_copy`), so it is never captured
+    # as a screening boundary. None when no role is known → byte-unchanged.
+    role_opening = phone.phone_role_opening_text(state.role_title)
+    if role_opening is not None:
+        role_speech = session.say(role_opening, allow_interruptions=True)
+        role_wait = getattr(role_speech, "wait_for_playout", None)
+        if callable(role_wait):
+            role_value = role_wait()
+            if inspect.isawaitable(role_value):
+                await role_value
+
     question = state.question_at(cursor)
     if question is None:
         terminal_reason["reason"] = "completed"
@@ -1976,8 +2024,38 @@ async def _run_native_phone_screening(
     reason = terminal_reason.get("reason")
     if terminal_reply_required["value"]:
         terminal_reply_played = await wait_for_terminal_reply()
+        # F3 (call 24): the goodbye MUST be spoken. When the model's terminal
+        # reply did not play to completion — it was interrupted mid-sentence
+        # ("...your time and", room closed), or it never started — speak the
+        # FIXED closing line before teardown so no completed screening ever ends
+        # without a spoken goodbye. This does NOT downgrade a genuinely-complete
+        # assessment: reaching a "completed" terminal reason means the plan (or
+        # the post-plan candidate Q&A) finished, so the screening is done and
+        # only the goodbye is owed. The fixed line is gate copy (never a
+        # boundary) and its markdown-free by construction.
         if reason == "completed" and not terminal_reply_played:
-            reason = phone.HALT_NO_ANSWER
+            _log.info(
+                "unknown_event", error_type="phone_terminal_reply",
+                error_category="fixed_closing_fallback",
+            )
+            try:
+                closing_speech = session.say(
+                    phone.PHONE_ASSESSMENT_CLOSING_TEXT, allow_interruptions=False,
+                )
+                closing_wait = getattr(closing_speech, "wait_for_playout", None)
+                if callable(closing_wait):
+                    closing_value = closing_wait()
+                    if inspect.isawaitable(closing_value):
+                        await closing_value
+            except Exception:  # noqa: BLE001
+                # A failed goodbye must not change the truthful terminal reason
+                # or take the leg down; the assessment is still complete.
+                _log.warn(
+                    "unknown_event", error_type="phone_terminal_reply",
+                    error_category="fixed_closing_failed",
+                )
+            if closing.state is ClosingState.CLOSING_PENDING:
+                closing.closing_delivered()
 
     if reason == "completed":
         done = None
