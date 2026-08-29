@@ -64,17 +64,46 @@ import { createPhoneStores, type PhoneStores } from '../lib/phone-screening/inde
 /** Transport ceiling — a Plivo callback body is small form-encoded metadata. */
 const TRANSPORT_BODY_LIMIT = '256kb';
 
-/** A lowercase-hex uuid, the form `xhelloattempt` carries. */
+/** A lowercase-hex uuid, the canonical attempt-id form after re-dashing. */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
+/** The wire form: 32 hex chars, dashes stripped to satisfy Plivo's value rule. */
+const HEX32_RE = /^[0-9a-fA-F]{32}$/;
+
 /**
- * The forwarded SIP-header param, case-insensitive. The bounce trunk maps our
- * `xhelloattempt` participant attribute to the SIP header `X-PH-HELLO-ATTEMPT`,
- * and Plivo delivers a forwarded `X-PH-*` header to the answer callback as a
- * request PARAM named `X-PH-Hello-Attempt` — but casing varies by path, so the
- * param name is matched case-insensitively against this canonical form.
+ * The forwarded SIP-header param, case-insensitive. The INVITE carries the
+ * header `X-PH-HELLOATTEMPT` (set explicitly per participant — the trunk
+ * attribute mapping never reaches the INVITE, livekit/sip#404), and Plivo
+ * forwards `X-PH-*` headers to the answer callback as request params. The
+ * name is dash-free after the prefix and the value is a dash-free uuid
+ * because Plivo's header rules allow ONLY alphanumerics in the name and
+ * alphanumerics+% in the value — a dashed header or value is silently
+ * dropped, which is precisely how call 12 (2026-08-29) arrived with no
+ * correlation at all. Casing varies by path, so matching is case-insensitive.
  */
-const HELLO_ATTEMPT_PARAM = 'x-ph-hello-attempt';
+const HELLO_ATTEMPT_PARAM = 'x-ph-helloattempt';
+
+/** Re-dash a 32-hex wire value into the canonical uuid, or undefined. */
+function attemptIdFromWire(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  if (UUID_RE.test(value)) return value; // tolerate a dashed uuid if one survives
+  if (!HEX32_RE.test(value)) return undefined;
+  const h = value.toLowerCase();
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
+/**
+ * The received param NAMES (never values), sanitized to a closed grammar and
+ * bounded, for the no-correlation diagnostics. Call 12 died unobservable
+ * because the log said only "no correlation" — the keys say what DID arrive.
+ */
+function sanitizedParamKeys(body: Record<string, unknown>): string {
+  return Object.keys(body)
+    .filter((k) => /^[A-Za-z0-9_-]{1,64}$/.test(k))
+    .sort()
+    .slice(0, 40)
+    .join(',');
+}
 
 /** Read a param case-insensitively from a parsed form body. */
 function readParamCaseInsensitive(
@@ -193,13 +222,15 @@ export function createPlivoWebhookRouter(deps: PlivoWebhookRouterDeps = {}): Rou
       return sendXml(res, PLIVO_HANGUP_XML);
     }
 
-    const attemptId = readParamCaseInsensitive(
-      (req.body ?? {}) as Record<string, unknown>,
-      HELLO_ATTEMPT_PARAM,
+    const answerBody = (req.body ?? {}) as Record<string, unknown>;
+    const attemptId = attemptIdFromWire(
+      readParamCaseInsensitive(answerBody, HELLO_ATTEMPT_PARAM),
     );
-    if (attemptId === undefined || !UUID_RE.test(attemptId)) {
+    if (attemptId === undefined) {
       logger.warn('unknown_event', {
         error_category: 'plivo_answer_no_correlation',
+        // Key NAMES only (closed grammar, bounded) — what Plivo DID send.
+        error_type: sanitizedParamKeys(answerBody),
         http_status: 200,
       });
       return sendXml(res, PLIVO_HANGUP_XML);
@@ -268,13 +299,14 @@ export function createPlivoWebhookRouter(deps: PlivoWebhookRouterDeps = {}): Rou
     }
 
     const body = (req.body ?? {}) as Record<string, unknown>;
-    const attemptId = readParamCaseInsensitive(body, HELLO_ATTEMPT_PARAM);
+    const attemptId = attemptIdFromWire(readParamCaseInsensitive(body, HELLO_ATTEMPT_PARAM));
     const dialStatus = (readParamCaseInsensitive(body, 'dialstatus') ?? '').toLowerCase();
     // Plivo's CallUUID makes the ledger dedup deterministic across redeliveries.
     const callUuid = readParamCaseInsensitive(body, 'calluuid');
-    if (attemptId === undefined || !UUID_RE.test(attemptId)) {
+    if (attemptId === undefined) {
       logger.warn('unknown_event', {
         error_category: 'plivo_dial_status_no_correlation',
+        error_type: sanitizedParamKeys(body),
         http_status: 200,
       });
       // Nothing to record. Acknowledge so Plivo does not storm.

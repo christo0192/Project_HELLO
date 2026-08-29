@@ -19,6 +19,8 @@ import {
 import {
   createLiveSipClient,
   PHONE_HELLO_ATTEMPT_ATTRIBUTE,
+  PHONE_HELLO_ATTEMPT_HEADER,
+  helloAttemptHeaderValue,
   PHONE_EPOCH_ATTRIBUTE,
   type PhoneOriginateRequest,
 } from '../integrations/livekit-phone-dial/sip.js';
@@ -99,9 +101,15 @@ describe('bounce config — ON is fail-closed on the bounce path', () => {
 async function captureLiveOriginate(request: PhoneOriginateRequest): Promise<{
   sipCallTo: string;
   attributes: Record<string, string>;
+  headers: Record<string, string> | undefined;
   trunkId: string;
 }> {
-  const captured = { sipCallTo: '', attributes: {} as Record<string, string>, trunkId: '' };
+  const captured = {
+    sipCallTo: '',
+    attributes: {} as Record<string, string>,
+    headers: undefined as Record<string, string> | undefined,
+    trunkId: '',
+  };
   // Patch the dynamic import target by monkeypatching the SDK module cache is
   // heavy; instead exercise via the module's own live client with a stub SDK.
   // The live client does `await import('livekit-server-sdk')`, so we intercept
@@ -123,15 +131,21 @@ vi.mock('livekit-server-sdk', () => ({
       trunkId: string,
       sipCallTo: string,
       _roomName: string,
-      opts: { participantAttributes?: Record<string, string> },
+      opts: { participantAttributes?: Record<string, string>; headers?: Record<string, string> },
     ) {
       const cap = (globalThis as unknown as {
-        __plivoCapture?: { sipCallTo: string; attributes: Record<string, string>; trunkId: string };
+        __plivoCapture?: {
+          sipCallTo: string;
+          attributes: Record<string, string>;
+          headers: Record<string, string> | undefined;
+          trunkId: string;
+        };
       }).__plivoCapture;
       if (cap) {
         cap.trunkId = trunkId;
         cap.sipCallTo = sipCallTo;
         cap.attributes = opts.participantAttributes ?? {};
+        cap.headers = opts.headers;
       }
       return { participantIdentity: `phone-${ATTEMPT}`, sipCallId: 'sc_123' };
     }
@@ -158,6 +172,8 @@ describe('bounce dial — the live client targets and attributes', () => {
     expect(cap.sipCallTo).toBe('+919812345678');
     expect(cap.attributes).toEqual({ [PHONE_EPOCH_ATTRIBUTE]: '7' });
     expect(cap.attributes[PHONE_HELLO_ATTEMPT_ATTRIBUTE]).toBeUndefined();
+    // No custom INVITE headers on the candidate path — byte-identical to before.
+    expect(cap.headers).toBeUndefined();
   });
 
   it('bounce path: dials the endpoint user and carries xhelloattempt = attemptId', async () => {
@@ -172,5 +188,25 @@ describe('bounce dial — the live client targets and attributes', () => {
     expect(cap.attributes[PHONE_HELLO_ATTEMPT_ATTRIBUTE]).toBe(ATTEMPT);
     // The candidate number never appears on the bounce path.
     expect(cap.sipCallTo).not.toContain('+91');
+  });
+
+  it('bounce path: the correlation rides the INVITE as a Plivo-legal header', async () => {
+    const cap = await captureLiveOriginate({
+      trunkId: 'bounce-trunk',
+      target: { kind: 'bounce', bounceUser: 'hello_bounce' },
+      ...baseRequest,
+    });
+    // The trunk attributesToHeaders mapping never touches the INVITE
+    // (livekit/sip#404) — the header must be set explicitly, and in the shape
+    // Plivo will not silently drop: dash-free name after the X-PH- prefix,
+    // dash-free (pure alphanumeric) value.
+    expect(cap.headers).toEqual({
+      [PHONE_HELLO_ATTEMPT_HEADER]: helloAttemptHeaderValue(ATTEMPT),
+    });
+    const sent = cap.headers?.[PHONE_HELLO_ATTEMPT_HEADER] ?? '';
+    expect(sent).toMatch(/^[0-9a-f]{32}$/);
+    expect(sent).toBe(ATTEMPT.replace(/-/g, ''));
+    // Plivo name rule: X-PH- prefix, then alphanumerics only, max 24 chars.
+    expect(PHONE_HELLO_ATTEMPT_HEADER).toMatch(/^X-PH-[A-Za-z0-9]{1,24}$/);
   });
 });
