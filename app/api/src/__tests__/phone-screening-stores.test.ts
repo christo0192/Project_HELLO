@@ -437,6 +437,16 @@ describe('errors and malformed answers', () => {
         sourceEventId: 'ev-1', now: NOW })],
       ['phone_consent_start_error', () => stores.consentAndStart!({
         attemptId: 'a', sessionId: 's', epoch: 0, now: NOW })],
+      // 0071 / X4. The per-item writer carries a candidate's own words, so a
+      // leaked driver error here would quote a transcript row exactly as the
+      // boundary would.
+      ['phone_commit_item_turn_error', () => stores.commitItemTurn!({
+        sessionId: 's', speaker: 'candidate', text: 'a word',
+        sourceItemId: 'phone-item-1', now: NOW })],
+      // 0071 / X5b. The recording sweep carries no transcript, but a leaked
+      // PostgREST error still quotes the failing statement.
+      ['phone_sweep_stranded_recordings_error', () => stores.sweepStrandedRecordings!({
+        now: NOW })],
     ];
     expect(attempts).toHaveLength(PHONE_RPC_NAMES.length);
     for (const [code, run] of attempts) {

@@ -1159,6 +1159,7 @@ function fakeRuntime(over: {
       lastReconciled: null,
       lastRolled: null,
       lastStranded: null,
+      lastRecStranded: null,
       // No sweep has answered non-`ok`. Empty rather than absent: the view
       // reads this map, and a fake that omitted it would be a fake the real
       // runtime can never produce.
@@ -1423,6 +1424,7 @@ describe('the health surface', () => {
           last_reconciled: null,
           last_rolled: null,
           last_stranded: null,
+          last_rec_stranded: null,
           // FALSE, not absent. A process that was deliberately not armed and
           // one whose arming THREW both report `enabled: false`; this boolean
           // is the only thing that separates them, so it must be present on

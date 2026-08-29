@@ -123,6 +123,9 @@ const LOOP_KNOBS = {
   // that every loop has a distinct cadence.
   'phone-dayroll': 'expireMs',
   'phone-stranded': 'expireMs',
+  // 0071 / X5b. The crashed-session recording-finalization backstop, on the
+  // EXPIRE cadence too: a dead call does not need sub-minute detection.
+  'phone-recstrand': 'expireMs',
 } as const satisfies Readonly<Record<string, keyof PhoneRuntimeConfig>>;
 
 const LOOP_NAMES = Object.keys(LOOP_KNOBS) as ReadonlyArray<keyof typeof LOOP_KNOBS>;
@@ -195,12 +198,14 @@ interface Counters {
   sweepClaims: string[];
   dayRolls: number;
   strandedSweeps: number;
+  /** 0071 / X5b. Crashed-session recording-finalization sweep passes. */
+  recStrandedSweeps: number;
 }
 
 function counters(): Counters {
   return {
     duePasses: 0, backlogReads: 0, reclaims: 0, expires: 0, claims: [],
-    sweepClaims: [], dayRolls: 0, strandedSweeps: 0,
+    sweepClaims: [], dayRolls: 0, strandedSweeps: 0, recStrandedSweeps: 0,
   };
 }
 
@@ -252,6 +257,12 @@ function makeStores(
     async sweepStrandedSessions() {
       c.strandedSweeps += 1;
       return { status: 'ok' as const, examined: 0, completed: 0, failed: 0, skipped: 0 };
+    },
+    // 0071 / X5b. Same reason as the 0045 sweeps above: the loop CALLS this, so
+    // a fake missing it would leave the new loop uncovered.
+    async sweepStrandedRecordings() {
+      c.recStrandedSweeps += 1;
+      return { status: 'ok' as const, examined: 0, finalized: 0, skipped: 0 };
     },
     ...over,
   } as unknown as PhoneStores;
@@ -729,6 +740,7 @@ function makeView(over: Partial<PhoneRuntimeView> = {}): PhoneRuntimeView {
     last_reconciled: null,
     last_rolled: null,
     last_stranded: null,
+    last_rec_stranded: null,
     sweeps_not_ok: [],
     start_failed: false,
     ...over,
@@ -752,6 +764,7 @@ describe('D. the health view', () => {
       last_reconciled: null,
     last_rolled: null,
     last_stranded: null,
+    last_rec_stranded: null,
       // No sweep has run, so none has failed. Empty, never a fabricated name.
       sweeps_not_ok: [],
       // Nothing tried to construct a runtime, so nothing failed to. THE ONE
@@ -820,6 +833,7 @@ describe('D. the health view', () => {
       last_reconciled: null,
     last_rolled: null,
     last_stranded: null,
+    last_rec_stranded: null,
       // No sweep has run, so none has failed. Empty, never a fabricated name.
       sweeps_not_ok: [],
       // Nothing tried to construct a runtime, so nothing failed to. THE ONE
@@ -1620,13 +1634,14 @@ describe('F. M-1 — a reconcile sweep that is NOT RUNNING is not a sweep that f
     // rather than as unknown, and `sweeps_not_ok` would look clean because
     // nothing had written to it yet.
     //
-    // Five since 0045 added the day roll and the stranded resolution. Asserted
-    // as an exact set both ways, so a sweep added without a key here — the
-    // shape that makes an unrun sweep invisible — fails rather than passes.
+    // Six since 0071 added the crashed-session recording-finalization sweep
+    // (recstrand) to the 0045 five. Asserted as an exact set both ways, so a
+    // sweep added without a key here — the shape that makes an unrun sweep
+    // invisible — fails rather than passes.
     const c = counters();
     const runtime = buildRuntime({ stores: makeStores(c), queue: makeEmptyQueue(c) });
     expect(Object.keys(runtime.snapshot().sweepNotOk).sort())
-      .toEqual(['dayroll', 'expire', 'reclaim', 'reconcile', 'stranded']);
+      .toEqual(['dayroll', 'expire', 'reclaim', 'reconcile', 'recstrand', 'stranded']);
   });
 });
 
@@ -1652,8 +1667,8 @@ describe('the day-roll and stranded sweeps run, and the claim gates them', () =>
     expect(c.dayRolls).toBeGreaterThan(0);
     expect(c.strandedSweeps).toBeGreaterThan(0);
     // Separate claim names: one sweep taking the other's claim would let a
-    // single replica silently monopolise both.
-    expect(new Set(c.sweepClaims)).toEqual(new Set(['dayroll', 'stranded']));
+    // single replica silently monopolise both. 0071 adds `recstrand`.
+    expect(new Set(c.sweepClaims)).toEqual(new Set(['dayroll', 'stranded', 'recstrand']));
   });
 
   it('a claim HELD BY ANOTHER replica stops the sweep from running at all', async () => {

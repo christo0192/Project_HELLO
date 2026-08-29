@@ -494,6 +494,12 @@ ASSESSMENT_START_PATH = "/api/internal/phone/assessment/start"
 ASSESSMENT_STATE_PATH = "/api/internal/phone/assessment/state"
 CONSENT_START_PATH = "/api/internal/phone/assessment/consent-start"
 ASSESSMENT_TURN_PATH = "/api/internal/phone/assessment/turn"
+#: 0071 / X4. ONE assessment transcript turn, persisted the moment the worker
+#: sees it. Keyed by a per-item `source_item_id` so a redelivery cannot
+#: double-insert; gives the phone path the browser path's per-turn durability
+#: (live call 22, 2026-08-29: only 4 of a 6.5-minute transcript survived a
+#: mid-call crash between question boundaries).
+ITEM_TURN_PATH = "/api/internal/phone/assessment/item-turn"
 #: The gate transcript: the exact opening the bot spoke and the candidate's
 #: consent reply the classifier consumed. Committed once, keyed by
 #: `gate:<session_id>`, after the atomic consent/start RPC succeeds so the two
@@ -1399,6 +1405,48 @@ class PhoneEventClient:
         expected = data.get("expected_key")
         outcome.expected_key = str(expected) if isinstance(expected, str) else None
         return outcome
+
+    async def commit_item_turn(
+        self,
+        session_id: str,
+        speaker: str,
+        text: str,
+        source_item_id: str,
+        turn_started_at_ms: Optional[int] = None,
+    ) -> PhoneApiOutcome:
+        """Persist ONE assessment transcript turn AS IT HAPPENS (0071 / X4).
+
+        Best-effort by contract: the durable boundary remains the resume
+        authority, so a failure here only means resume re-reads that span from
+        the boundary — it must never fail a live call. ``ok`` is read from the
+        server's own flag; a duplicate delivery (same ``source_item_id``)
+        converges on the original row and is answered ``ok`` with
+        ``duplicate=True``. The turn TEXT is never logged.
+        """
+        body = {
+            "session_id": str(session_id),
+            "speaker": str(speaker),
+            "text": text,
+            "source_item_id": str(source_item_id),
+        }
+        if turn_started_at_ms is not None:
+            body["turn_started_at_ms"] = int(turn_started_at_ms)
+        response = await self._post(ITEM_TURN_PATH, body, "item_turn")
+        if isinstance(response, str):
+            return PhoneApiOutcome(False, error_category=response)
+        data = _response_json(response)
+        if not isinstance(data, dict):
+            _log.warn(
+                "unknown_event", error_type="phone_api_failed",
+                error_category=_ERR_MALFORMED, schema="item_turn",
+            )
+            return PhoneApiOutcome(False, error_category=_ERR_MALFORMED)
+        status = data.get("status")
+        return PhoneApiOutcome(
+            data.get("ok") is True,
+            str(status) if status is not None else None,
+            duplicate=bool(data.get("duplicate")),
+        )
 
     async def commit_gate_turns(
         self,

@@ -2019,6 +2019,69 @@ async def _run_phone_session(
     latest_candidate_stopped_anchor: list[int | None] = [None]
     participant_present_anchor: list[int | None] = [None]
 
+    # ── 0071 / X4: PER-ITEM TRANSCRIPT DURABILITY IN THE PHONE PATH ────────
+    # The browser path persists every turn as it happens; the phone path
+    # buffered turns and persisted them only in pairs at question boundaries,
+    # so a mid-call crash between boundaries lost everything since the last one
+    # (live call 22, 2026-08-29: 4 of a 6.5-minute transcript survived). These
+    # drive a best-effort per-item write for the ASSESSMENT phase only — the
+    # gate transcript keeps its own is_gate=true writer. `[False]` until the
+    # durable screening begins, so gate-phase items are never persisted here as
+    # non-gate turns. `_item_seq` is a monotonic per-session id used purely as
+    # the server-side idempotency key (it need not agree with turn_index — the
+    # server assigns that); it makes a duplicate delivery converge.
+    assessment_persist_active: list[bool] = [False]
+    item_seq: list[int] = [0]
+    persist_session_id = phone.session_id_from_room_name(room_name)
+    persist_tasks: set[asyncio.Task] = set()
+
+    async def _persist_phone_item(speaker: str, text: str, anchor_ms: int | None,
+                                  source_item_id: str) -> None:
+        """Best-effort per-item transcript write (0071 / X4).
+
+        A failure here NEVER fails the call: the boundary path remains the
+        durable resume authority, so a lost per-item write only means resume
+        re-reads that span from the boundary. Any transport/refusal is logged
+        without text and swallowed. Deduped server-side on `source_item_id`.
+        """
+        commit = getattr(events, "commit_item_turn", None)
+        if not callable(commit) or not persist_session_id:
+            return
+        try:
+            outcome = await commit(persist_session_id, speaker, text,
+                                   source_item_id, anchor_ms)
+        except Exception:  # noqa: BLE001
+            _log.warn(
+                "unknown_event", error_type="phone_item_persist",
+                error_category="item_persist_failed",
+            )
+            return
+        if outcome is not None and not getattr(outcome, "ok", False):
+            _log.warn(
+                "unknown_event", error_type="phone_item_persist",
+                error_category="item_persist_not_ok",
+            )
+
+    def _spawn_item_persist(speaker: str, text: str, anchor_ms: int | None,
+                            seq: int) -> None:
+        """Fire the per-item write off the speech path (sync-hook safe).
+
+        The key is `phone-item-<seq>`, a stable per-session id: a redelivered
+        item carries the same seq and the server dedups on it, so a duplicate
+        cannot double-insert. Never awaited on the hot path; tracked so a
+        stop can drain it.
+        """
+        try:
+            task = asyncio.create_task(
+                _persist_phone_item(speaker, text, anchor_ms,
+                                    f"phone-item-{seq}"))
+        except RuntimeError:
+            # No running loop (e.g. a synthetic test emitting outside the
+            # session loop): the boundary path still persists the pair.
+            return
+        persist_tasks.add(task)
+        task.add_done_callback(persist_tasks.discard)
+
     # Read the per-turn coordination mode ONCE at session start and log it, so
     # every later decision (provider speculation, `llm_node` policy, the commit
     # path) reads the same value and an operator can see which lane a call ran.
@@ -2131,6 +2194,17 @@ async def _run_phone_session(
                 stopped = persistence.normalize_turn_anchor_ms(metrics.get("stopped_speaking_at"))
                 if stopped is not None:
                     latest_candidate_stopped_anchor[0] = stopped
+            # 0071 / X4: persist the candidate turn the moment it lands, so a
+            # crash before the next boundary does not lose it. Only in the
+            # ASSESSMENT phase — the gate's consent reply has its own is_gate
+            # writer — and best-effort, so a persist failure never drops the
+            # call. The boundary still commits the pair; the migration's
+            # authorship guard makes the boundary insert a no-op once these
+            # per-item rows exist, so the two never double-write.
+            if assessment_persist_active[0]:
+                item_seq[0] += 1
+                _spawn_item_persist(
+                    "candidate", text, _turn_anchor_ms(item), item_seq[0])
             return
         if phone.is_gate_copy(text):
             # FIXED COPY IS NOT A SCREENING TURN. The disclosure, the re-ask,
@@ -2141,6 +2215,10 @@ async def _run_phone_session(
             # captured inside whichever question's boundary happened to be open
             # and committed as part of the candidate's answer.
             return
+        # 0071 / X4: persist the bot turn per-item too (assessment phase only).
+        if assessment_persist_active[0]:
+            item_seq[0] += 1
+            _spawn_item_persist("bot", text, _turn_anchor_ms(item), item_seq[0])
         metrics = getattr(item, "metrics", None)
         if isinstance(metrics, Mapping):
             started = persistence.normalize_turn_anchor_ms(metrics.get("started_speaking_at"))
@@ -2492,6 +2570,14 @@ async def _run_phone_session(
             await _close_phone_room(room_name)
             return result
 
+        # 0071 / X4: the session is `in_progress` and the plan is snapshotted,
+        # so every conversation item from here is a scored assessment turn.
+        # Arm per-item persistence: `_on_phone_item` now writes each turn as it
+        # lands (is_gate=false), giving the phone path the browser path's crash
+        # durability. Gate-phase items above this line stay unpersisted here —
+        # they belong to the is_gate=true gate writer.
+        assessment_persist_active[0] = True
+
         return await _run_native_phone_screening(
             session=session,
             agent=agent,
@@ -2553,6 +2639,23 @@ async def _run_phone_session(
     finally:
         heartbeat_task.cancel()
         await asyncio.gather(heartbeat_task, return_exceptions=True)
+        # 0071 / X4: drain any in-flight per-item transcript writes so a clean
+        # end does not drop the last turn's persistence. Best-effort and
+        # bounded: a wedged write must not stall teardown, and the boundary
+        # path remains the durable authority for anything not yet flushed.
+        if persist_tasks:
+            inflight = [t for t in persist_tasks if not t.done()]
+            if inflight:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*inflight, return_exceptions=True),
+                        timeout=PHONE_TERMINAL_REPLY_TIMEOUT_SEC,
+                    )
+                except asyncio.TimeoutError:
+                    _log.warn(
+                        "unknown_event", error_type="phone_item_persist",
+                        error_category="item_persist_drain_timeout",
+                    )
 
 
 

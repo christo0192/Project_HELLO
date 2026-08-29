@@ -80,8 +80,9 @@ describe('the extractor itself is not over-broad', () => {
 describe('the phone RPCs', () => {
   it('the TS list is exactly the migrations\' service-role RPC set', () => {
     expect(new Set(PHONE_RPC_NAMES)).toEqual(new Set(RPC_NAMES));
-    // Core phone RPCs plus recording, assessment, liveness and cycle doors.
-    expect(PHONE_RPC_NAMES).toHaveLength(28);
+    // Core phone RPCs plus recording, assessment, liveness and cycle doors,
+    // plus 0071's per-item turn writer and stranded-recording sweep.
+    expect(PHONE_RPC_NAMES).toHaveLength(30);
     for (const name of PHONE_RPC_NAMES) {
       // Searched across BOTH migrations: the question here is "is this granted
       // anywhere in the phone schema", not "which declaration wins".

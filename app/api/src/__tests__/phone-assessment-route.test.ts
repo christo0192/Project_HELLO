@@ -95,6 +95,7 @@ interface Harness {
   startAssessment: ReturnType<typeof vi.fn>;
   assessmentState: ReturnType<typeof vi.fn>;
   commitQuestionBoundary: ReturnType<typeof vi.fn>;
+  commitItemTurn: ReturnType<typeof vi.fn>;
   completeSession: ReturnType<typeof vi.fn>;
   scoreSession: ReturnType<typeof vi.fn>;
   /** Every seam call, in the order it happened. THE ordering assertion. */
@@ -138,6 +139,10 @@ function build(options: {
       }
     );
   });
+  const commitItemTurn = vi.fn(async () => {
+    order.push('item');
+    return { status: 'applied' as const, applied: true, duplicate: false, turnIndex: 0 };
+  });
   const completeSession = vi.fn(async () => {
     order.push('complete');
     return { ok: options.completeOk !== false, conflict: options.completeConflict === true };
@@ -151,6 +156,7 @@ function build(options: {
     startAssessment,
     assessmentState,
     commitQuestionBoundary,
+    commitItemTurn,
   } as unknown as PhoneStores;
 
   const app = express();
@@ -167,7 +173,7 @@ function build(options: {
   );
 
   return {
-    app, startAssessment, assessmentState, commitQuestionBoundary,
+    app, startAssessment, assessmentState, commitQuestionBoundary, commitItemTurn,
     completeSession, scoreSession, order,
   };
 }
@@ -191,7 +197,7 @@ const TURN_BODY = {
   ],
 };
 
-const PATHS = ['/assessment/start', '/assessment/state', '/assessment/turn', '/assessment/complete'] as const;
+const PATHS = ['/assessment/start', '/assessment/state', '/assessment/turn', '/assessment/item-turn', '/assessment/complete'] as const;
 
 // ═══════════════════════════════════════════════════════════════════════
 describe('the assessment endpoints sit behind the SAME worker boundary', () => {
@@ -224,6 +230,7 @@ describe('the assessment endpoints sit behind the SAME worker boundary', () => {
       expect(h.startAssessment).not.toHaveBeenCalled();
       expect(h.assessmentState).not.toHaveBeenCalled();
       expect(h.commitQuestionBoundary).not.toHaveBeenCalled();
+      expect(h.commitItemTurn).not.toHaveBeenCalled();
       expect(h.completeSession).not.toHaveBeenCalled();
       expect(h.scoreSession).not.toHaveBeenCalled();
     });
@@ -469,6 +476,75 @@ describe('POST /assessment/turn', () => {
     const res = await post(h, '/assessment/turn', withoutCas);
     expect(res.status).toBe(400);
     expect(h.order).toEqual([]);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 0071 / X4 — the per-item transcript writer.
+// ═══════════════════════════════════════════════════════════════════════
+const ITEM_BODY = {
+  session_id: SESSION,
+  speaker: 'candidate' as const,
+  text: 'About four years.',
+  source_item_id: 'phone-item-7',
+};
+
+describe('POST /assessment/item-turn — the per-item transcript writer', () => {
+  it('forwards a valid item to the store and reports ok/duplicate', async () => {
+    const h = build();
+    const res = await post(h, '/assessment/item-turn', ITEM_BODY);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, status: 'applied', duplicate: false });
+    expect(h.commitItemTurn).toHaveBeenCalledWith({
+      sessionId: SESSION,
+      speaker: 'candidate',
+      text: 'About four years.',
+      sourceItemId: 'phone-item-7',
+      turnStartedAtMs: null,
+      now: NOW,
+    });
+  });
+
+  it('a duplicate delivery is 200 and carries duplicate:true', async () => {
+    const h = build();
+    h.commitItemTurn.mockResolvedValueOnce({
+      status: 'applied', applied: true, duplicate: true, turnIndex: 3,
+    });
+    const res = await post(h, '/assessment/item-turn', ITEM_BODY);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, status: 'applied', duplicate: true });
+  });
+
+  it('a state refusal is 409, tellable from a transport fault', async () => {
+    const h = build();
+    h.commitItemTurn.mockResolvedValueOnce({ status: 'session_not_active' });
+    const res = await post(h, '/assessment/item-turn', ITEM_BODY);
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ ok: false, status: 'session_not_active' });
+  });
+
+  it('a store throw is a bare, sanitized 503', async () => {
+    const h = build();
+    h.commitItemTurn.mockRejectedValueOnce(new Error('driver quoted a transcript row'));
+    const res = await post(h, '/assessment/item-turn', ITEM_BODY);
+    expect(res.status).toBe(503);
+    expect(res.body).toEqual({ ok: false, status: 'phone_item_turn_error' });
+    expect(JSON.stringify(res.body)).not.toContain('transcript row');
+  });
+
+  it('a malformed body is a flat 400 with no store call', async () => {
+    for (const body of [
+      {},
+      { ...ITEM_BODY, speaker: 'narrator' },
+      { ...ITEM_BODY, text: '' },
+      { ...ITEM_BODY, source_item_id: 'has spaces' },
+      { ...ITEM_BODY, extra: true },
+    ]) {
+      const h = build();
+      const res = await post(h, '/assessment/item-turn', body);
+      expect(res.status, JSON.stringify(body).slice(0, 50)).toBe(400);
+      expect(h.commitItemTurn).not.toHaveBeenCalled();
+    }
   });
 });
 

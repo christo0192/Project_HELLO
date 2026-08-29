@@ -164,6 +164,25 @@ export interface SweepPhoneStrandedSessionsResult {
   readonly skipped?: number;
 }
 
+/** 0071 / X5b — the crashed-session recording-finalization backstop sweep. */
+export interface SweepPhoneStrandedRecordingsResult {
+  readonly status: OrUnknown<'ok'>;
+  readonly examined?: number;
+  /** Sessions driven terminal so the 0038 finalize trigger fired. */
+  readonly finalized?: number;
+  readonly skipped?: number;
+}
+
+/** 0071 / X4 — the per-item phone transcript writer. */
+export interface CommitPhoneItemTurnResult {
+  readonly status: OrUnknown<
+    'applied' | 'invalid_turn' | 'unknown_session' | 'session_not_active'
+  >;
+  readonly applied?: boolean;
+  readonly duplicate?: boolean;
+  readonly turnIndex?: number;
+}
+
 export interface ClaimPhoneSweepResult {
   readonly status: OrUnknown<'ok' | 'held_by_other' | 'invalid_input'>;
   readonly expiresAt?: string;
@@ -634,6 +653,17 @@ export interface PhoneStores {
     readonly now: Date;
   }): Promise<SweepPhoneStrandedSessionsResult>;
 
+  /**
+   * 0071 / X5b. Drives sessions left in_progress with an active recording
+   * egress and no object key (a crashed call) terminal so the 0038 finalize
+   * trigger fires. Optional so legacy test doubles need not implement it.
+   */
+  sweepStrandedRecordings?(input: {
+    readonly limit?: number;
+    readonly now: Date;
+    readonly graceSeconds?: number;
+  }): Promise<SweepPhoneStrandedRecordingsResult>;
+
   /** 0045. Bounded leader CLAIM — not an election. See the migration. */
   claimSweep(input: {
     readonly sweep: string;
@@ -713,6 +743,18 @@ export interface PhoneStores {
   commitQuestionBoundary(
     input: CommitPhoneQuestionBoundaryInput,
   ): Promise<CommitPhoneQuestionBoundaryResult>;
+  /**
+   * 0071 / X4. Persists ONE phone transcript turn as it happens, deduped on
+   * `sourceItemId`. Optional so legacy test doubles need not implement it.
+   */
+  commitItemTurn?(input: {
+    readonly sessionId: string;
+    readonly speaker: 'bot' | 'candidate';
+    readonly text: string;
+    readonly sourceItemId: string;
+    readonly turnStartedAtMs?: number | null;
+    readonly now: Date;
+  }): Promise<CommitPhoneItemTurnResult>;
   /** 0060; optional for legacy test doubles until P-3 adopts probes. */
   recordProbe?(input: RecordPhoneProbeInput): Promise<RecordPhoneProbeResult>;
   consentAndStart?(input: ConsentAndStartPhoneAssessmentInput): Promise<ConsentAndStartPhoneAssessmentResult>;

@@ -1489,6 +1489,58 @@ paths:
               schema:
                 $ref: '#/components/schemas/PhoneWorkerError'
 
+  /api/internal/phone/assessment/item-turn:
+    post:
+      tags: [phone]
+      operationId: commitPhoneWorkerItemTurn
+      summary: Persist one assessment transcript turn as it happens
+      description: Internal, service-authenticated. 0071 / X4. Appends ONE scored assessment turn (is_gate=false) the moment the worker sees it, rather than only in pairs at a question boundary — so a mid-call crash between boundaries no longer loses the transcript since the last one (live call 22, 2026-08-29 lost all but 4 of a 6.5-minute transcript). The server assigns turn_index under the session row lock; dedup is on source_item_id (a stable per-item key the worker mints), so a redelivered item converges on the original row (duplicate=true) rather than double-inserting. Best-effort by contract — the question boundary remains the durable resume authority, and the boundary's own turn insert becomes a no-op once these per-item rows exist, so the two never double-write. The turn text is never echoed back. Disabled by default.
+      security:
+        - workerBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PhoneItemTurnRequest'
+      responses:
+        '200':
+          description: ok=true when the turn is durable; duplicate=true when a redelivered item converged on the original row.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneItemTurnResponse'
+        '400':
+          description: Request body failed validation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneItemTurnResponse'
+        '401':
+          description: Worker bearer credential required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '403':
+          description: Worker bearer credential invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '409':
+          description: A DB refusal — invalid_turn, unknown_session, session_not_active, or unknown_status. Distinct from a transport fault so the worker does not retry blindly.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneItemTurnResponse'
+        '503':
+          description: Phone screening disabled, the worker credential is not configured, or an RPC transport fault (phone_item_turn_error).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+
   /api/internal/phone/assessment/complete:
     post:
       tags: [phone]
@@ -6887,6 +6939,44 @@ components:
           description: ok, already_recorded, invalid_turns, unknown_session, session_not_active, unknown_status, invalid_request, or phone_gate_turns_error. The turn text is never included.
       additionalProperties: false
 
+    PhoneItemTurnRequest:
+      type: object
+      required: [session_id, speaker, text, source_item_id]
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        speaker:
+          type: string
+          enum: [bot, candidate]
+        text:
+          type: string
+          minLength: 1
+          maxLength: 8000
+        source_item_id:
+          type: string
+          description: The worker's stable per-item idempotency key (^[A-Za-z0-9_.:-]{1,200}$). A redelivered item carries the same value and is deduped server-side.
+        turn_started_at_ms:
+          type: integer
+          nullable: true
+          description: Optional epoch-ms speech-start anchor; coerced to null when absent or out of range.
+      additionalProperties: false
+
+    PhoneItemTurnResponse:
+      type: object
+      required: [ok, status]
+      properties:
+        ok:
+          type: boolean
+          description: True when the turn is durable (status applied); false for every refusal.
+        status:
+          type: string
+          description: applied, invalid_turn, unknown_session, session_not_active, unknown_status, invalid_request, or phone_item_turn_error. The turn text is never included.
+        duplicate:
+          type: boolean
+          description: True when a redelivered item converged on the original row rather than inserting a second.
+      additionalProperties: false
+
     PhoneAssessmentCompleteRequest:
       type: object
       required: [attempt_id, session_id]
@@ -9261,7 +9351,7 @@ components:
     PhoneRuntimeState:
       description: PROCESS-LOCAL view of the phone runtime loops. Describes the loops running in THIS api process and nothing else; on a multi-process deployment each replica answers for itself, so enabled false means this process is not running the loops, never that the fleet is idle. Aggregates only - counts, stable status and skip/refusal codes, and loop names. No engagement id, candidate id, attempt id, phone number, provider payload or lease token appears anywhere in this object.
       type: object
-      required: [enabled, running, loops, last_due, config, dial_jobs, last_reclaimed, last_expired, last_reconciled, last_rolled, last_stranded, sweeps_not_ok, start_failed]
+      required: [enabled, running, loops, last_due, config, dial_jobs, last_reclaimed, last_expired, last_reconciled, last_rolled, last_stranded, last_rec_stranded, sweeps_not_ok, start_failed]
       properties:
         enabled:
           description: Whether this process constructed and registered a runtime. False is the shipped default and is not a fault.
@@ -9306,8 +9396,12 @@ components:
           description: 0045. Stranded engagements RESOLVED by the most recent pass - completed PLUS truthfully failed, summed, because both are resolutions and the operator's question is how many stopped being stranded, not which way they went. A stranded engagement is one still pointing at an already-ended session: ensureSession finds a terminal session, refuses, and the row is skipped no_session on every pass for ever, which is how a conducted and SCORED screening goes missing. The attempt heartbeat removes the common cause; this pass removes the residue, and it redials nobody. Null on the same two terms as last_reclaimed, with sweeps_not_ok naming stranded.
           type: integer
           nullable: true
+        last_rec_stranded:
+          description: 0071 / X5b. Sessions driven terminal by the most recent stranded-recording pass so a crashed call's authoritative recording could finalize. The OPPOSITE shape from last_stranded - a still-in_progress SESSION with an active egress and no object key, which a worker crash leaves forever because the 0038 finalize trigger fires only on a terminal transition. The pass drives it to expired/grace_timeout, which fires that trigger and enqueues finalization; it never touches a live session (grace >= the worker residency cap). Null on the same two terms as last_reclaimed, with sweeps_not_ok naming recstrand.
+          type: integer
+          nullable: true
         sweeps_not_ok:
-          description: Names of the sweeps whose most recent run did NOT answer ok, as stable codes and sorted. The vocabulary is FIVE names - reclaim, expire, reconcile, dayroll, stranded. Empty is the healthy state. A count of 0 on a sweep that is NOT named here means "ran, nothing to do", which is a different fact from "the sweep did not happen"; only this array distinguishes them, which is why every one of the five nulls its count and names itself here on a non-ok status rather than publishing a quiet zero. Non-empty contributes the phone_sweep_not_ok degradation reason.
+          description: Names of the sweeps whose most recent run did NOT answer ok, as stable codes and sorted. The vocabulary is SIX names - reclaim, expire, reconcile, dayroll, stranded, recstrand. Empty is the healthy state. A count of 0 on a sweep that is NOT named here means "ran, nothing to do", which is a different fact from "the sweep did not happen"; only this array distinguishes them, which is why every one of the six nulls its count and names itself here on a non-ok status rather than publishing a quiet zero. Non-empty contributes the phone_sweep_not_ok degradation reason.
           type: array
           items:
             type: string

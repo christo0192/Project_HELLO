@@ -1043,7 +1043,10 @@ describe('OpenAPI document integrity', () => {
     // consent probe a re-dispatched leg reads to skip a second consent ask
     // (2026-08-29 replay). It binds and writes nothing and stays on the same
     // worker-authenticated surface, so it widens no recruiter-facing route.
-    expect(Object.keys(paths).length).toBe(111);
+    // 0071 adds ONE internal path — /assessment/item-turn, the per-item
+    // transcript writer (X4). Same worker-authenticated surface; widens no
+    // recruiter-facing route.
+    expect(Object.keys(paths).length).toBe(112);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -1097,7 +1100,10 @@ describe('OpenAPI document integrity', () => {
     // request of the read-only /assessment/state probe (additionalProperties:
     // false — it must not carry an attempt id or any write-triggering key). The
     // response reuses PhoneAssessmentStateResponse, now carrying gate_recorded.
-    expect(Object.keys(schemas).length).toBe(224);
+    // 0071 adds TWO: PhoneItemTurnRequest and PhoneItemTurnResponse, the
+    // per-item transcript writer's strict body and its {ok, status, duplicate}
+    // answer (X4). Neither ever carries the turn text back.
+    expect(Object.keys(schemas).length).toBe(226);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.
@@ -1223,6 +1229,8 @@ describe('OpenAPI document integrity', () => {
       // default it is `false` alongside `enabled: false`.
       last_rolled: null,
       last_stranded: null,
+      // 0071 / X5b: required and present in the disabled default shape too.
+      last_rec_stranded: null,
       start_failed: false,
       sweeps_not_ok: [],
     };
@@ -1294,6 +1302,8 @@ describe('auth boundary vs spec security model', () => {
     // 0070, same surface and same boundary: the read-only durable-consent probe.
     'POST /api/internal/phone/assessment/state',
     'POST /api/internal/phone/assessment/turn',
+    // 0071, same surface and same boundary: the per-item transcript writer (X4).
+    'POST /api/internal/phone/assessment/item-turn',
     // 0067, same surface and same boundary: the pre-consent (gate) transcript.
     'POST /api/internal/phone/assessment/gate-turns',
     'POST /api/internal/phone/assessment/complete',

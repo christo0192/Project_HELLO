@@ -170,6 +170,8 @@ export interface PhoneRuntimeView {
   last_rolled: number | null;
   /** 0045. Stranded engagements resolved by the last pass. */
   last_stranded: number | null;
+  /** 0071 / X5b. Crashed sessions terminalized so their recordings finalize. */
+  last_rec_stranded: number | null;
   /**
    * Names of the sweeps whose last run did NOT answer `ok`. Codes only.
    * Empty is the healthy state; a count of `0` on a sweep NOT named here
@@ -234,6 +236,7 @@ export function phoneRuntimeView(now: Date = new Date()): PhoneRuntimeView {
       last_reconciled: null,
       last_rolled: null,
       last_stranded: null,
+      last_rec_stranded: null,
       sweeps_not_ok: [],
       // The ONLY difference between "off" and "broken" on this surface.
       start_failed: startFailed,
@@ -267,6 +270,8 @@ export function phoneRuntimeView(now: Date = new Date()): PhoneRuntimeView {
     last_reconciled: snapshot.lastReconciled,
     last_rolled: snapshot.lastRolled,
     last_stranded: snapshot.lastStranded,
+    // 0071 / X5b: crashed sessions terminalized so their recordings finalize.
+    last_rec_stranded: snapshot.lastRecStranded,
     sweeps_not_ok: Object.entries(snapshot.sweepNotOk)
       .filter(([, notOk]) => notOk)
       .map(([name]) => name)

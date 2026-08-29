@@ -152,8 +152,10 @@ describe('1. every phone write goes through an RPC', () => {
     // sweeps, and the sweep claim. 0067 added `commit_phone_gate_turns`, and
     // 0068 added candidate callback confirmation. The count is pinned rather
     // than merely non-zero so a seam that quietly stops routing one call
-    // through an RPC fails here.
-    expect(new Set(rpcCalls).size).toBe(29);
+    // through an RPC fails here. 0071 added two: the per-item transcript writer
+    // (commit_phone_item_turn) and the crashed-session recording sweep
+    // (sweep_phone_stranded_recordings).
+    expect(new Set(rpcCalls).size).toBe(31);
     // The write seam reaches NO table, only RPCs.
     expect(writeBody, 'stores.ts uses a table accessor').not.toMatch(/\bclient\s*\.\s*from\s*\(/);
     // A type-only import of the client type is fine; a VALUE import is not.
