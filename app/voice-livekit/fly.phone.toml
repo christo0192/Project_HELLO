@@ -82,7 +82,12 @@ primary_region = "sin"
   PHONE_CLASSIFY_TIMEOUT_SEC = "20"
   PHONE_ANSWER_TIMEOUT_SEC = "90"
 
+# X1/VM PIN (2026-08-29 CPU-starvation incident): on `shared` CPU the worker's
+# VAD/EOU compute backed up (VAD backlog 67 s), the Sarvam STT websocket died
+# on a 1006 keepalive timeout, and a live mid-interview room was killed. The
+# machines were scaled to performance-1x live that day; this pins that state so
+# the next deploy does not REVERT them back to `shared`.
 [[vm]]
-  cpu_kind = "shared"
+  cpu_kind = "performance"
   cpus = 1
   memory_mb = 2048

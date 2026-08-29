@@ -466,6 +466,33 @@ def _bounded_outcome(reason: str | None) -> str:
     return _SESSION_OUTCOME_ALLOWLIST.get(reason, "other_failure")
 
 
+# ── Bounded room-teardown label vocabulary (X7b, 2026-08-29) ──────────
+# `_bounded_outcome` above is a session-OUTCOME allowlist: it only knows the
+# crash/shutdown/provider/residency buckets, so every HALT reason a phone leg
+# ends on (``candidate_ended_call``, ``callback_scheduled``, ``disconnect``,
+# ``malformed_exchange``, ``persistence_failed`` …) collapsed into
+# ``other_failure`` when the teardown log reused it — a candidate saying goodbye
+# and a worker crash were indistinguishable in the one log line that names WHY a
+# room was deleted. The teardown gets its own vocabulary covering the real HALT
+# strings plus ``completed`` and ``disconnect``; anything unlisted still falls
+# back to ``other_failure``. Fixed strings only — never transcript, ids, room.
+_ROOM_TEARDOWN_LABELS: dict[str | None, str] = {
+    None: "conversation_complete",
+    "completed": "conversation_complete",
+    "disconnect": "transport_disconnect",
+    phone.HALT_CANDIDATE_ENDED: "candidate_ended",
+    phone.HALT_NO_ANSWER: "no_exchange_captured",
+    phone.HALT_MALFORMED_EXCHANGE: "malformed_exchange",
+    phone.HALT_CALLBACK_SCHEDULED: "callback_scheduled",
+    phone.HALT_PERSISTENCE: "persistence_failed",
+}
+
+
+def _teardown_label(reason: str | None) -> str:
+    """Bounded label for the room-teardown log. Unknown → other_failure."""
+    return _ROOM_TEARDOWN_LABELS.get(reason, "other_failure")
+
+
 # ── Explicit close-reason mapping (SDK enum values only) ──────────────
 # None value → conversation_complete (normal completion with explicit signal)
 # str value → terminal_reason code (fail case)
@@ -484,6 +511,16 @@ _CLOSE_REASON_TO_TERMINAL: dict[str | None, str | None] = {
     "cancelled": "shutdown_forced",
     "timeout": "shutdown_forced",
     "disconnected": "shutdown_forced",
+    # X7a (2026-08-29): the verified 1.6.4 `CloseReason.ERROR` value ("error")
+    # is what the SDK emits when the AgentSession closes on an unrecoverable
+    # error — the exact shape a Sarvam STT websocket death (close 1006 keepalive
+    # timeout under CPU starvation) produces. It carries an `error` attribute of
+    # type STTError/LLMError/TTSError/RealtimeModelError, whose class name is not
+    # in `_CLOSE_ERROR_NAME_TO_TERMINAL`, so it USED TO fall through the error
+    # branch to `None` → logged `clean_close`. A transport death is never a clean
+    # close. Map it to the `provider_error` FAILURE bucket so the close is
+    # labelled truthfully.
+    "error": "provider_error",
     "provider_error": "provider_error",
     "stt_error": "provider_error",
     "tts_error": "provider_error",
@@ -820,7 +857,29 @@ async def _classify_phone_answer(
     return phone.CLASSIFY_MACHINE
 
 
-def phone_question_instructions(question: "phone.PhonePlanQuestion") -> str:
+def _role_turn_line(role_title: str | None) -> str | None:
+    """The verbatim role line appended to EVERY per-turn phone instruction (X3c).
+
+    Returns None when no role is known, so a role-less state adds nothing rather
+    than a hollow "the role is exactly: none". The title is used VERBATIM from
+    the server-verified assessment state — never invented, never a placeholder
+    like "software engineer" (the exact wrong title a live call spoke on
+    2026-08-29 when the role reached the LLM only through the best-effort
+    `update_instructions` mutation, which is a no-op on the read-only 1.6.4
+    `Agent.instructions` property).
+    """
+    role = (role_title or "").strip()
+    if not role:
+        return None
+    return (
+        f'The role is exactly: "{role}" — always name it exactly if asked; '
+        "never invent a job title."
+    )
+
+
+def phone_question_instructions(
+    question: "phone.PhonePlanQuestion", role_title: str | None = None,
+) -> str:
     """The instruction handed to the model for ONE plan question.
 
     The model may phrase it however it likes — that is the whole point of a
@@ -828,6 +887,11 @@ def phone_question_instructions(question: "phone.PhonePlanQuestion") -> str:
     and it is told not to move on. Which question was covered is never
     inferred afterwards from what was said; it comes from this call site and
     from the key committed with the answer.
+
+    X3c: the verbatim role line is appended here so EVERY per-turn instruction
+    carries the role, independent of whether the system-prompt mutation reached
+    the live LLM context. `role_title` defaults to None (no line) so the browser
+    lane and any role-less caller are byte-unchanged.
     """
     lines = [
         "Continue the live phone conversation naturally, then ask this one planned question:",
@@ -841,6 +905,9 @@ def phone_question_instructions(question: "phone.PhonePlanQuestion") -> str:
     ]
     if question.hint:
         lines.append(f"If their answer is thin, the thing worth probing is: {question.hint}")
+    role_line = _role_turn_line(role_title)
+    if role_line is not None:
+        lines.append(role_line)
     return "\n".join(lines)
 
 
@@ -910,15 +977,56 @@ async def _apply_phone_instructions(agent: Any, state: "phone.PhoneAssessmentSta
     Best effort by design. If the SDK's Agent has no writable `instructions`,
     the screening still runs on the base prompt and every boundary is still
     keyed and committed correctly; the questions are simply less tailored.
+
+    X3b (2026-08-29 role-determinism): after delivery, VERIFY the role title
+    actually reached the agent instead of trusting the mutation blindly. On
+    livekit-agents 1.6.4 `update_instructions` routes to the live `_activity`
+    when the session is running and does NOT update the readable `instructions`
+    property, so a read-back can be stale even on success — the check is
+    therefore best-effort and only ever RAISES A LOUD LOG, never fails the leg.
+    Determinism does not depend on this mutation landing: the role is appended
+    to every per-turn instruction (see `_role_turn_line`), which is the path the
+    live LLM provably reads. This log is the observability that was missing when
+    a call spoke the wrong job title on 2026-08-29.
     """
+    text = _phone_instructions_text(state)
     try:
-        return await _deliver_phone_instructions(agent, _phone_instructions_text(state))
+        delivered = await _deliver_phone_instructions(agent, text)
     except Exception:  # noqa: BLE001
         _log.warn(
             "unknown_event", error_type="phone_instructions_not_applied",
             error_category="agent_instructions",
         )
         return False
+    _verify_role_instructions_applied(agent, state.role_title, text)
+    return delivered
+
+
+def _verify_role_instructions_applied(
+    agent: Any, role_title: str | None, applied_text: str,
+) -> None:
+    """Log loudly if the role title is absent from the effective instructions.
+
+    Read-back never fails the leg (see `_apply_phone_instructions`). It reads the
+    best surface 1.6.4 exposes — the `instructions` property when it is a plain
+    string — and falls back to the text WE built and handed to the mutator, so a
+    stale property read does not produce a false alarm. Fixed error categories
+    only; never the title, transcript, ids or room name.
+    """
+    role = (role_title or "").strip()
+    if not role:
+        # No role to assert — nothing to verify, and nothing was owed.
+        return
+    effective = getattr(agent, "instructions", None)
+    if not isinstance(effective, str) or role not in effective:
+        # Fall back to what we actually delivered: the mutator may have routed
+        # the update to the live activity, leaving the readable property stale.
+        effective = applied_text
+    if role not in effective:
+        _log.warn(
+            "unknown_event", error_type="phone_instructions_not_applied",
+            error_category="role_title_absent",
+        )
 
 
 async def _deliver_phone_instructions(agent: Any, text: str) -> bool:
@@ -996,6 +1104,21 @@ def _build_provider_session(*, phone_mode: bool = False, turn_mode: str | None =
         # no worse than today's always-normal path — so leave it ON regardless.
         session_options["preemptive_generation"] = (
             turn_mode == phone.PHONE_TURN_MODE_TOOLLESS
+        )
+        # X8 (2026-08-29 CPU-starvation): rollback-first endpointing offload. On
+        # `local` (DEFAULT) nothing is added here — the SDK's default local
+        # endpointing (Silero VAD + v1-mini EOU) runs exactly as today, so
+        # merging changes nothing. On `stt` the phone session delegates
+        # end-of-utterance to the STT provider (Sarvam runs `vad_signals=true`),
+        # moving that decision off the worker's own VAD/EOU compute. PHONE ONLY:
+        # this whole block is `phone_mode`-gated, so the browser session never
+        # receives `turn_detection`. Logged once below at construction.
+        turn_detection = phone.phone_turn_detection()
+        if turn_detection == phone.PHONE_TURN_DETECTION_STT:
+            session_options["turn_detection"] = "stt"
+        _log.info(
+            "unknown_event", error_type="phone_turn_detection",
+            error_category=turn_detection,
         )
 
     session = AgentSession(
@@ -1330,7 +1453,7 @@ async def _run_native_phone_screening(
         if silence_prompted["value"]:
             silence_prompted["value"] = False
             if question is not None:
-                add_turn_instruction(turn_ctx, phone_question_instructions(question))
+                add_turn_instruction(turn_ctx, phone_question_instructions(question, state.role_title))
             return
         # A proposal is a two-turn protocol. Its pending state is local to this
         # live worker and the server confirmation RPC is the durable boundary.
@@ -1401,7 +1524,7 @@ async def _run_native_phone_screening(
                     "unknown_event", error_type="phone_turn_guard",
                     error_category="malformed_exchange_recovered",
                 )
-                add_turn_instruction(turn_ctx, phone_question_instructions(question))
+                add_turn_instruction(turn_ctx, phone_question_instructions(question, state.role_title))
                 return
             _log.info(
                 "unknown_event", error_type="phone_turn_guard",
@@ -1456,7 +1579,7 @@ async def _run_native_phone_screening(
             # BACKGROUND after the reply is delivered — see `commit_after_reply`.
             add_turn_instruction(
                 turn_ctx,
-                phone_question_instructions(question)
+                phone_question_instructions(question, state.role_title)
                 + "\n\nBriefly acknowledge one specific detail from the candidate's "
                 "answer, then ask the next planned topic — or, if their answer was "
                 "thin, one natural same-topic follow-up (your judgment) — as ONE "
@@ -1678,7 +1801,7 @@ async def _run_native_phone_screening(
         if callable(generate):
             setattr(agent, "_turn_policy", "opening")
             try:
-                handle = generate(instructions=phone_question_instructions(question))
+                handle = generate(instructions=phone_question_instructions(question, state.role_title))
                 if inspect.isawaitable(handle):
                     handle = await handle
                 wait = getattr(handle, "wait_for_playout", None)
@@ -1810,13 +1933,33 @@ async def _run_native_phone_screening(
     elif reason == "disconnect":
         # F4 — 'disconnect' stays NON-TERMINAL: the room/connection died
         # externally and the reclaim/reconnect machinery owns what happens next
-        # (do NOT post here — that ownership is unchanged). But an external room
-        # death used to be completely invisible. LOG it so the drop is
-        # observable, then fall through to the (no-op on a dead room) teardown.
+        # (do NOT post here — that ownership is unchanged).
+        #
+        # X2 (2026-08-29 CPU-starvation incident): this branch used to LOG and
+        # then FALL THROUGH to `_close_phone_room`, whose comment claimed the
+        # delete was "a harmless no-op on a room that is already gone". That is
+        # PROVEN FALSE for this class. CPU starvation killed the Sarvam STT
+        # websocket (close 1006 keepalive timeout); the AgentSession closed with
+        # `CloseReason.ERROR`; the close chain set terminal reason "disconnect";
+        # and the fall-through deleted a LIVE room — LiveKit payloads showed the
+        # SIP participant `callStatus: "active"` at ROOM_DELETED. The room is
+        # exactly what LiveKit re-dispatch needs to resume the call (the
+        # `gate_recorded` consent-skip path is PROVEN to resume a live room when
+        # a worker dies — call 20's deploy restart). So on `disconnect` we do NOT
+        # delete: log a structured preserved event and RETURN, leaving the room
+        # for re-dispatch. The room's own `emptyTimeout` (120 s) garbage-collects
+        # it if the candidate actually hung up. Every OTHER terminal reason keeps
+        # its delete below. This preserves the "no deletion without a reason log"
+        # invariant from PR #176 — nothing here deletes, so no delete-log is owed.
         _log.info(
             "unknown_event", error_type="phone_session_terminal",
             error_category="disconnect_nonterminal",
         )
+        _log.info(
+            "unknown_event", error_type="phone_room_preserved",
+            error_category="disconnect",
+        )
+        return result
     elif reason in {phone.HALT_CALLBACK_SCHEDULED, phone.HALT_PERSISTENCE}:
         # Callback already changed the engagement; infrastructure and transport
         # halts remain non-terminal for existing reconnect/recovery ownership.
@@ -1832,11 +1975,15 @@ async def _run_native_phone_screening(
     # there is NO path that deletes a room without a log line naming why. The
     # deletion itself is unchanged — genuinely-ended calls (completed,
     # candidate_ended, no_answer, callback_scheduled, terminal malformed) still
-    # tear down, and for `disconnect` the delete is a harmless no-op on a room
-    # that is already gone.
+    # tear down. `disconnect` no longer reaches here at all (it returned above).
+    #
+    # X7b: the label is `_teardown_label`, a teardown-specific bounded vocabulary,
+    # NOT `_bounded_outcome` (a session-OUTCOME allowlist that mapped every HALT
+    # reason to `other_failure`, making a candidate goodbye and a crash
+    # indistinguishable in the one log line that says WHY a room was deleted).
     _log.info(
         "unknown_event", error_type="phone_room_teardown",
-        error_category=_bounded_outcome(reason),
+        error_category=_teardown_label(reason),
     )
     await _close_phone_room(room_name)
     return result

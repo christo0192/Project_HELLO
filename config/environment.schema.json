@@ -163,6 +163,7 @@
         "SESSION_MAX_RESIDENCY_SEC": { "requiredInProduction": false, "secret": false },
         "PHONE_BOUNCE_MODE": { "requiredInProduction": false, "secret": false },
         "PHONE_TURN_MODE": { "requiredInProduction": false, "secret": false },
+        "PHONE_TURN_DETECTION": { "requiredInProduction": false, "secret": false },
         "GOPU_CANDIDATE_NAME": { "requiredInProduction": false, "secret": false, "productionAllowed": false },
         "GOPU_ROLE_TITLE": { "requiredInProduction": false, "secret": false, "productionAllowed": false },
         "GOPU_ROLE_FOCUS": { "requiredInProduction": false, "secret": false, "productionAllowed": false },
