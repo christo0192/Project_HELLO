@@ -1908,6 +1908,84 @@ PHONE_ROLE_GROUNDING_TEXT = (
 )
 
 
+#: The ONE short encouragement injected when the candidate explicitly says they
+#: are thinking (e.g. "let me think", "I'm thinking how to put it"). The patience
+#: gate routes these here instead of suppressing: the candidate is telling us
+#: they are working on it, so we acknowledge warmly and wait — no new question,
+#: no advancing. Reuses the tone of the silence prompt path. Phone-only.
+PHONE_PATIENCE_ENCOURAGEMENT_TEXT = (
+    "The candidate is gathering their thoughts and has not answered yet. Give "
+    "ONE short, warm encouragement such as \"Take your time.\" and NOTHING "
+    "else — do not ask a new question, do not repeat the question, and do not "
+    "move to the next topic. Then wait for their answer."
+)
+
+
+#: Single-question discipline + no-advance-without-substance, appended to the
+#: PHONE instruction assembly only (X10, live call 23). The browser prompt is
+#: sha-pinned, so this rides `_phone_instructions_text` and never the shared
+#: `system_prompt`. It hardens the plan-adherence the per-turn instruction
+#: already carries against the stt-endpointing failure mode where thinking
+#: fragments were answered, advanced past, and stacked on.
+PHONE_TURN_DISCIPLINE_TEXT = (
+    "\n\nConversation discipline (mandatory):\n"
+    "- Ask exactly ONE question per turn — never two. Do not stack a second "
+    "question while the candidate is still forming their answer.\n"
+    "- If the candidate has not yet substantively answered the current "
+    "question — a filler, a hesitation, or a half-formed thought is not an "
+    "answer — do not move to the next topic. Wait, or briefly encourage them, "
+    "and stay on the current question.\n"
+    "- If the candidate asks you to repeat the question or asks which question "
+    "you meant, restate the CURRENT question only — never skip ahead to a "
+    "different one."
+)
+
+
+#: Resume-conflict probing directive (X10, owner-requested). Appended to the
+#: PHONE instruction assembly ONLY, and ONLY when compacted resume evidence is
+#: present (see `_phone_instructions_text`) so there is never a dangling
+#: reference to facts the model was not given. Toolless mode rides the LLM's
+#: judgment — no tools, no schema. The clarification is a follow-up WITHIN the
+#: current flow, so it does not advance the plan cursor: the substance-gated
+#: commit only fires on a planned-question answer, so a model-authored
+#: clarifying question (which is not a planned-question answer boundary) leaves
+#: the cursor where it is.
+PHONE_RESUME_CONFLICT_TEXT = (
+    "\n\nResume-conflict probing (when it arises):\n"
+    "- You have the candidate's resume facts above. If a spoken answer clearly "
+    "CONFLICTS with or exposes a GAP versus those facts — a different company, "
+    "a contradictory length of experience, or an unexplained employment gap "
+    "their answer touches — address it naturally in the flow: ask exactly ONE "
+    "polite clarifying question about that specific discrepancy (for example, "
+    "\"Earlier your resume mentions X — help me reconcile that with what you "
+    "just said\"), then continue the planned questions.\n"
+    "- At most one such clarification per discrepancy. Never accuse. Never "
+    "repeat a clarification you already resolved. If nothing conflicts, say "
+    "nothing about the resume and just continue."
+)
+
+
+#: Lexical expressiveness + light professional humor (X10 Fix 4, T4 RCA). The
+#: PSTN 8 kHz band strips prosody and acoustic liveliness, so the phone must
+#: compensate LEXICALLY — the words carry the warmth the narrowband line drops.
+#: Phone-only: appended in `_phone_instructions_text`, never in the sha-pinned
+#: browser prompt (the browser lane has full-band audio and needs no lexical
+#: compensation).
+PHONE_EXPRESSIVENESS_TEXT = (
+    "\n\nExpressiveness on the phone line (mandatory):\n"
+    "- The telephone line flattens your voice, so put the energy in your "
+    "words: react with genuine, varied expressiveness (\"Oh nice!\", \"That's "
+    "a great way to put it\", a warm chuckle in words), mirror the candidate's "
+    "energy, and use light, professional humor sparingly — a friendly quip "
+    "here and there is welcome.\n"
+    "- Never joke at the candidate's expense, never about the quality of their "
+    "answers, and never during the consent or recording disclosure, or when "
+    "discussing compensation or a resume discrepancy.\n"
+    "- Keep it natural — at most one playful remark every few turns, never "
+    "forced."
+)
+
+
 INTERRUPTED_QUESTION_PREFIX = "[interrupted question] "
 
 
@@ -2950,6 +3028,144 @@ def candidate_turn_route(text: Any) -> str | None:
     if clean.endswith("?") and _QUESTION_OPEN_RE.search(clean):
         return "candidate_question"
     return None
+
+
+# ── The patience gate (X10, live call 23, 2026-08-29) ─────────────────
+#
+# PHONE_TURN_DETECTION=stt delivers a final transcript on EVERY pause. On call
+# 23 the candidate thought out loud — "Hmm", "So the most", "challenging part",
+# "would say is" — and each Sarvam final completed a turn, so the bot answered
+# hesitations as if they were answers and advanced the plan past unanswered
+# questions. The patience gate classifies a candidate final as `substantive`,
+# `hesitation`, or `thinking` so the turn hook can stay silent (suppress the
+# reply, keep the fragment in context) until a real answer lands, encourage
+# once on an explicit "let me think", and NEVER advance or stack on a non-answer.
+#
+# The gate is deliberately CONSERVATIVE: a false suppression is an awkward
+# silence, a false pass is exactly today's behaviour, so anything that is not a
+# CLEAR hesitation or thinking statement is treated as substantive (respond).
+# These are pure functions, unit-tested against the live-call truth table.
+
+# Explicit "I need a moment to think" statements. These are NOT suppressed:
+# the candidate is telling us they are working on it, so the right response is
+# ONE short encouragement (see PHONE_PATIENCE_ENCOURAGEMENT_TEXT), never silence
+# and never a new question. Kept separate from the hesitation regex because the
+# behaviours differ (encourage vs. stay silent).
+_THINKING_STATEMENT_RE = re.compile(
+    r"^\s*(?:(?:um+|uh+|er+|well|okay|ok|so|hmm+|sorry)[\s,.!?-]+){0,3}"
+    r"(?:"
+    # "let me think" (about ... / how to phrase it ...) — a clear thinking
+    # signal, so anything trailing after "think" is still a thinking statement.
+    r"let me think\b.*|"
+    # "I'm thinking [about] how to put/phrase/word/say it ..." — the live case.
+    r"(?:i'?m|i am|just)\s+thinking\b(?:\s+(?:about\s+)?how\s+to\s+"
+    r"(?:put|phrase|word|say)\b.*)?|"
+    r"give me (?:a|one) (?:moment|second|sec|minute)\b.*|"
+    r"(?:one\s+)?(?:moment|second|sec)\s+please\b.*|"
+    r"let me (?:gather|collect) my thoughts\b.*|"
+    r"(?:i\s+)?(?:need|want)\s+(?:a\s+)?(?:moment|second)(?:\s+to\s+think)?\b.*"
+    r")"
+    r"[\s,.!?-]*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Pure-hesitation / thinking-fragment finals that carry no answer content. These
+# ARE suppressed (StopResponse): the fragment stays in the chat context and the
+# bot waits for the substantive final. Extended cautiously from the observed
+# live fillers — bare fillers, "yeah so", "I would say", and mid-thought
+# fragments that trail off on a conjunction/preposition. Real short answers
+# ("yes", "no", "twelve lakhs", "12 LPA") must NOT match — they are validated by
+# the substantive-short allowlist below, which is checked FIRST.
+_HESITATION_FRAGMENT_RE = re.compile(
+    r"^\s*(?:"
+    r"um+|uh+|h+m+|er+|ah+|oh+|hmph+|"
+    r"well|so|and|but|okay|ok|right|like|"
+    r"yeah\s+so|yeah\s+um|so\s+the|so\s+the\s+most|"
+    r"i\s+(?:would|will|wanna|want\s+to)\s+say|i'?d\s+say|"
+    r"the\s+(?:most|main|hardest|biggest)|challenging\s+part|"
+    r"how\s+(?:do|can)\s+i\s+(?:put|say|phrase)|"
+    r"what\s+i\s+mean\s+is"
+    r")\s*(?:is|was|would|,|\.|\.\.\.|…)?\s*$",
+    re.IGNORECASE,
+)
+
+# Conjunctions / prepositions / fillers that, when a SHORT fragment ends on one,
+# mark it as an unfinished thought (mid-thought/incomplete) rather than an answer.
+_DANGLING_TAIL_RE = re.compile(
+    r"\b(?:"
+    r"and|but|or|so|because|that|which|the|a|an|to|of|in|on|for|with|"
+    r"about|is|was|would|like|um|uh|hmm|well|it'?s|i'?m"
+    r")\s*[,.\-]*\.{0,3}\s*$",
+    re.IGNORECASE,
+)
+
+# Recognised complete SHORT answers that must always pass as substantive even
+# though they are only one or two tokens. This is the guardrail against a false
+# suppression swallowing a real terse reply. Money/number phrases are handled by
+# the digit/content check in `phone_turn_substance`, not enumerated here.
+_SUBSTANTIVE_SHORT_RE = re.compile(
+    r"^\s*(?:"
+    r"yes|yeah|yep|yup|no|nope|nah|correct|right|sure|exactly|absolutely|"
+    r"definitely|agreed|true|false|none|never|always|maybe|perhaps|"
+    r"done|ready|understood|got it|of course|not really|i did|i didn'?t|"
+    r"i do|i don'?t|i have|i haven'?t|i can|i can'?t|i will|i won'?t"
+    r")\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
+
+# Any run of digits (money, years, counts) makes a short reply an answer.
+_CONTENT_DIGIT_RE = re.compile(r"\d")
+
+PHONE_SUBSTANCE_SUBSTANTIVE = "substantive"
+PHONE_SUBSTANCE_HESITATION = "hesitation"
+PHONE_SUBSTANCE_THINKING = "thinking"
+
+
+def phone_turn_substance(text: Any) -> str:
+    """Classify a candidate final as substantive, hesitation, or thinking.
+
+    Returns one of ``PHONE_SUBSTANCE_SUBSTANTIVE`` / ``_HESITATION`` /
+    ``_THINKING``. The turn hook uses it to (respond normally) / (stay silent
+    and wait) / (give ONE short encouragement). Balanced toward `substantive`:
+    only a CLEAR hesitation or thinking statement diverts from today's behaviour.
+    """
+    if not isinstance(text, str):
+        return PHONE_SUBSTANCE_SUBSTANTIVE
+    clean = " ".join(text.strip().split())
+    if not clean:
+        # An empty final is not an answer; treat as hesitation so the bot waits
+        # rather than replying to nothing.
+        return PHONE_SUBSTANCE_HESITATION
+    # Explicit thinking statement → encourage, never suppress. Checked before the
+    # substantive-short allowlist so a leading "okay" filler cannot mask it.
+    if _THINKING_STATEMENT_RE.fullmatch(clean):
+        return PHONE_SUBSTANCE_THINKING
+    # A recognised complete short answer or any digit content is substantive.
+    if _SUBSTANTIVE_SHORT_RE.fullmatch(clean) or _CONTENT_DIGIT_RE.search(clean):
+        return PHONE_SUBSTANCE_SUBSTANTIVE
+    # Pure hesitation / thinking fragment → suppress.
+    if _HESITATION_FRAGMENT_RE.fullmatch(clean):
+        return PHONE_SUBSTANCE_HESITATION
+    # Mid-thought/incomplete: a SHORT fragment (< ~4 words) that trails off on a
+    # dangling conjunction/preposition/filler. Conservative — only a short,
+    # clearly-unfinished fragment is suppressed; anything longer is an answer.
+    words = clean.split()
+    if len(words) < 4 and _DANGLING_TAIL_RE.search(clean):
+        return PHONE_SUBSTANCE_HESITATION
+    return PHONE_SUBSTANCE_SUBSTANTIVE
+
+
+def phone_patience_gate_enabled() -> bool:
+    """Kill switch for the patience gate. Default ON; rollback with `off`.
+
+    `PHONE_PATIENCE_GATE` defaults to on. Only the literal `off` (case-
+    insensitive, trimmed) disables it; empty/unknown/`on` all keep it enabled,
+    so the gate is on unless someone deliberately turns it off for rollback.
+    Read at the call site with the literal name so the env-contract scanner sees
+    it. When off, the phone turn hook behaves exactly as it did before X10:
+    hesitation fragments are answered and can advance the plan.
+    """
+    return (os.getenv("PHONE_PATIENCE_GATE") or "").strip().lower() != "off"
 
 
 def _message_text(message: Any) -> str:

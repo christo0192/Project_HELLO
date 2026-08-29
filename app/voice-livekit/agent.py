@@ -939,21 +939,39 @@ def _compact_phone_resume_evidence(evidence: Any) -> dict[str, Any]:
 
 
 def _phone_instructions_text(state: "phone.PhoneAssessmentState") -> str:
-    """Build the bounded role/evidence instructions shared by native and legacy phone agents."""
+    """Build the bounded role/evidence instructions shared by native and legacy phone agents.
+
+    Every block appended AFTER `system_prompt` here is PHONE-ONLY. The browser
+    (WebRTC) prompt surface is sha-pinned (`tests/test_browser_prompt_pin.py`),
+    and the browser lane renders only `system_prompt`, so these appends cannot
+    shift it. The resume-conflict directive (X10) is added ONLY when compacted
+    resume evidence is actually present, so a role-less / resume-less call never
+    carries a dangling reference to facts the model was not given.
+    """
+    compact_resume = _compact_phone_resume_evidence(state.resume_facts)
     text = system_prompt(
         candidate_name=state.candidate_name,
         role_title=state.role_title,
         role_focus=(state.role_focus or ", ".join(state.role_required_skills))[:600],
-        resume_facts=prompting_format_resume_facts(
-            _compact_phone_resume_evidence(state.resume_facts)
-        ),
+        resume_facts=prompting_format_resume_facts(compact_resume),
         questions=(
             "The exact currently owed question is supplied separately for "
             "each response. Never select or advance a question yourself."
         ),
         interviewer_instructions=(state.interviewer_instructions or "")[:2000],
     )
-    text = text + phone.PHONE_CALLBACK_POLICY_TEXT + phone.PHONE_ROLE_GROUNDING_TEXT
+    text = (
+        text
+        + phone.PHONE_CALLBACK_POLICY_TEXT
+        + phone.PHONE_ROLE_GROUNDING_TEXT
+        + phone.PHONE_TURN_DISCIPLINE_TEXT
+        + phone.PHONE_EXPRESSIVENESS_TEXT
+    )
+    # Resume-conflict probing rides the compacted evidence: only offer the
+    # directive when there is evidence to reconcile against. Omitting it when
+    # `compact_resume` is empty keeps the reference from dangling.
+    if compact_resume:
+        text = text + phone.PHONE_RESUME_CONFLICT_TEXT
     resume = phone.render_resume_context(state.turns)
     return f"{text}\n\n{resume}" if resume else text
 
@@ -1482,8 +1500,28 @@ async def _run_native_phone_screening(
                     "read back are correct. Do not book until the candidate says yes.",
                 )
             return
+        # ROUTE CHECKS FIRST (X10). The bounded conversational routes —
+        # end-call, callback deferral, role/general clarification, connectivity —
+        # are recognised BEFORE the patience gate so a SHORT clarification like
+        # "can you repeat the question" still routes to a spoken reply instead of
+        # being suppressed as a fragment. The one exception is the `hesitation`
+        # route: when the patience gate is on, a bare filler is SUPPRESSED (the
+        # bot stays silent and the fragment stays in context) rather than being
+        # answered with a re-ask, which is the pre-X10 behaviour that made the
+        # bot respond to thinking-out-loud on the stt-endpointing path.
+        patience_on = phone.phone_patience_gate_enabled()
         route = phone.candidate_turn_route(text)
         if route is not None:
+            if route == "hesitation":
+                if patience_on:
+                    setattr(agent, "_turn_policy", "patience_suppressed")
+                    from livekit.agents import StopResponse  # noqa: PLC0415
+                    raise StopResponse()
+                # Gate off: preserve the pre-X10 re-ask behaviour exactly.
+                setattr(agent, "_turn_policy", "clarification")
+                if question is not None:
+                    add_turn_instruction(turn_ctx, "Answer briefly from verified role context, then ask this same planned topic again as ONE natural spoken question in your own words:\n" + question.text)
+                return
             setattr(agent, "_turn_policy", "callback" if route == "callback_deferral" else "clarification")
             if question is not None and route == "callback_deferral":
                 add_turn_instruction(
@@ -1496,6 +1534,23 @@ async def _run_native_phone_screening(
             elif question is not None:
                 add_turn_instruction(turn_ctx, "Answer briefly from verified role context, then ask this same planned topic again as ONE natural spoken question in your own words:\n" + question.text)
             return
+        # THE PATIENCE GATE (X10). Not a recognised route: classify the final as
+        # substantive / hesitation / thinking. A thinking statement earns ONE
+        # short encouragement (no advance, no new question); a hesitation
+        # fragment is suppressed so the bot waits for the real answer; a
+        # substantive final falls through to the normal flow. Consecutive
+        # suppressed fragments accumulate in the SDK chat context, so when the
+        # substantive final lands the reply naturally sees the whole thought.
+        if patience_on:
+            substance = phone.phone_turn_substance(text)
+            if substance == phone.PHONE_SUBSTANCE_THINKING:
+                setattr(agent, "_turn_policy", "patience_encourage")
+                add_turn_instruction(turn_ctx, phone.PHONE_PATIENCE_ENCOURAGEMENT_TEXT)
+                return
+            if substance == phone.PHONE_SUBSTANCE_HESITATION:
+                setattr(agent, "_turn_policy", "patience_suppressed")
+                from livekit.agents import StopResponse  # noqa: PLC0415
+                raise StopResponse()
         if _native_turn_predates_question(message, latest_assistant_anchor[0]):
             from livekit.agents import StopResponse  # noqa: PLC0415
             raise StopResponse()
@@ -1716,7 +1771,29 @@ async def _run_native_phone_screening(
         that one topic, which is acceptable pilot behavior. We therefore log the
         failure and leave `on_advance`'s own halt decision intact rather than
         swallowing it or force-killing the leg here.
+
+        X10 SUBSTANCE GATE. The boundary commit advances the durable cursor, so
+        it must fire ONLY for a substantive candidate turn. A suppressed
+        hesitation never reaches `pending.update`, so in the normal path this
+        task is only ever scheduled for a substantive turn — but as
+        defense-in-depth (and to honour the never-advance-without-substance
+        contract even if a fragment slips past the gate), re-classify the exact
+        `pending['candidate']` text here and SKIP the commit when it is not
+        substantive. Skipping leaves the cursor where it is, so the next answer
+        commits under the same still-owed key; the server-owned resume is
+        untouched. Bypassed when the gate is off, restoring the pre-X10 path.
         """
+        candidate_text = pending.get("candidate")
+        if (
+            phone.phone_patience_gate_enabled()
+            and phone.phone_turn_substance(candidate_text)
+            != phone.PHONE_SUBSTANCE_SUBSTANTIVE
+        ):
+            _log.info(
+                "unknown_event", error_type="phone_toolless_commit",
+                error_category="non_substantive_commit_skipped",
+            )
+            return
         try:
             await asyncio.wait_for(
                 assistant_delivery_complete.wait(),
@@ -1773,6 +1850,13 @@ async def _run_native_phone_screening(
     setattr(agent, "_on_booking", on_booking)
     setattr(agent, "_on_probe", on_probe)
     setattr(agent, "_on_advance", on_advance)
+    # Test seam (same idiom as `_on_advance`/`_on_probe`): the background commit
+    # coroutine and its `pending` buffer are exposed so the substance-gated
+    # commit (X10 Fix 2a) can be exercised directly with a seeded non-substantive
+    # `pending`, which the live turn hook can never produce because it suppresses
+    # first. Not read on any production path.
+    setattr(agent, "_commit_after_reply", commit_after_reply)
+    setattr(agent, "_pending", pending)
     setattr(agent, "_native_turns", True)
     authorize = getattr(agent, "authorize_screening", None)
     if not callable(authorize):
