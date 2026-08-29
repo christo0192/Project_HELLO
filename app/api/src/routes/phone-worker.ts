@@ -53,12 +53,18 @@ import {
   PHONE_APPOINTMENT_MAX_SECONDS,
   PHONE_APPOINTMENT_MIN_SECONDS,
   PHONE_SYSTEM_ACTOR,
+  PHONE_MAX_CONCURRENT,
+  PHONE_VOICE_CALLBACK_DURATION_SECONDS,
+  PHONE_VOICE_CALLBACK_MIN_LEAD_SECONDS,
   createPhoneReadStore,
   createPhoneStores,
   istDate,
   istWindowOpen,
+  istWallClock,
+  istDayInstantRange,
   loadPhoneScreeningConfig,
   type PhoneAssessmentState,
+  type PhoneReadStore,
   type PhoneStores,
 } from '../lib/phone-screening/index.js';
 import { supabase } from '../lib/supabase.js';
@@ -174,6 +180,13 @@ const workerScheduleSchema = z
   })
   .strict();
 
+const voiceCallbackSchema = z
+  .object({
+    attempt_id: z.string().regex(UUID_RE),
+    starts_at: z.string().regex(UTC_ISO_RE),
+  })
+  .strict();
+
 /** A single ordered exchange inside one question boundary. */
 const boundaryTurnSchema = z
   .object({
@@ -276,6 +289,8 @@ const gateTurnsSchema = z
 
 export interface PhoneWorkerRouterDeps {
   readonly stores?: PhoneStores;
+  /** Read-only appointment/attempt seam for proposal validation. */
+  readonly readStore?: PhoneReadStore;
   /** Resolves an attempt to its engagement. Injected so tests need no DB. */
   readonly resolveEngagement?: (attemptId: string) => Promise<{
     engagementId: string;
@@ -444,6 +459,7 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
   const router = Router();
   const now = deps.now ?? ((): Date => new Date());
   const stores = (): PhoneStores => deps.stores ?? createPhoneStores(supabase as never);
+  const readStore = (): PhoneReadStore => deps.readStore ?? createPhoneReadStore(supabase as never);
   const config = (): ReturnType<typeof loadPhoneScreeningConfig> =>
     loadPhoneScreeningConfig(deps.configSource ?? process.env);
   // Both seams carry a REAL default. A router built with an empty deps object
@@ -607,6 +623,115 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
     } catch {
       // Bare, sanitized. A driver message here could quote a row.
       return res.status(500).json({ ok: false, error: 'phone_event_error' });
+    }
+  });
+
+  // Proposal is deliberately read-only. The bot may speak a normalized
+  // server-derived read-back, but no appointment exists until confirmation.
+  router.post('/callbacks/propose', requireWorkerPhoneAuth, async (req, res) => {
+    try {
+      if (!config().screeningEnabled) {
+        return res.status(503).json({ ok: false, error: 'phone_screening_disabled' });
+      }
+      const parsed = voiceCallbackSchema.safeParse(req.body);
+      if (!parsed.success) return res.status(400).json({ ok: false, status: 'invalid_request' });
+      const startsAt = new Date(parsed.data.starts_at);
+      const at = now();
+      if (Number.isNaN(startsAt.getTime())) {
+        return res.status(400).json({ ok: false, status: 'invalid_request' });
+      }
+      const resolved = deps.resolveEngagement
+        ? await deps.resolveEngagement(parsed.data.attempt_id)
+        : null;
+      if (!resolved) return res.json({ ok: false, status: 'unknown_attempt' });
+      if (resolved.engagementState === 'scheduled') {
+        return res.json({ ok: false, status: 'attempt_in_flight' });
+      }
+      if (startsAt.getTime() < at.getTime() + PHONE_VOICE_CALLBACK_MIN_LEAD_SECONDS * 1000) {
+        return res.json({ ok: false, status: 'lead_time_too_short' });
+      }
+      if (!istWindowOpen(startsAt)) return res.json({ ok: false, status: 'window_closed' });
+      const endsAt = new Date(
+        startsAt.getTime() + PHONE_VOICE_CALLBACK_DURATION_SECONDS * 1000,
+      );
+      if (istDate(startsAt) !== istDate(endsAt)) {
+        return res.json({ ok: false, status: 'slot_straddles_ist_midnight' });
+      }
+      if (resolved.engagementState === 'dialing' || resolved.engagementState === 'in_call') {
+        const attempts = await readStore().listAttemptsForEngagement({
+          engagementId: resolved.engagementId,
+          limit: 20,
+        });
+        if (attempts.some((attempt) =>
+          attempt.istDate === istDate(startsAt) &&
+          ['initial', 'no_answer_retry', 'scheduled'].includes(attempt.kind)
+        )) {
+          return res.json({ ok: false, status: 'slot_not_yet_eligible' });
+        }
+      }
+      const day = istDayInstantRange({
+        year: Number(istDate(startsAt).slice(0, 4)),
+        month: Number(istDate(startsAt).slice(5, 7)),
+        day: Number(istDate(startsAt).slice(8, 10)),
+      });
+      const live = await readStore().listLiveAppointmentsByStart({
+        fromIso: day.fromIso,
+        toIso: day.toIso,
+        limit: PHONE_MAX_CONCURRENT + 1,
+      });
+      const overlapping = live.filter((appointment) =>
+        new Date(appointment.startsAt).getTime() < endsAt.getTime() &&
+        new Date(appointment.endsAt).getTime() > startsAt.getTime() &&
+        appointment.engagementId !== resolved.engagementId,
+      ).length;
+      if (overlapping >= PHONE_MAX_CONCURRENT) {
+        return res.json({ ok: false, status: 'slot_full' });
+      }
+      const wall = istWallClock(startsAt);
+      return res.json({
+        ok: true,
+        status: 'proposal_valid',
+        starts_at: startsAt.toISOString(),
+        ends_at: endsAt.toISOString(),
+        ist_date: istDate(startsAt),
+        weekday: new Intl.DateTimeFormat('en-IN', {
+          timeZone: 'Asia/Kolkata', weekday: 'long',
+        }).format(startsAt),
+        ist_time: `${String(wall.hour).padStart(2, '0')}:${String(wall.minute).padStart(2, '0')}`,
+        time_zone: 'Asia/Kolkata',
+        duration_seconds: PHONE_VOICE_CALLBACK_DURATION_SECONDS,
+      });
+    } catch {
+      return res.status(503).json({ ok: false, status: 'phone_callback_proposal_error' });
+    }
+  });
+
+  router.post('/callbacks/confirm', requireWorkerPhoneAuth, async (req, res) => {
+    try {
+      if (!config().screeningEnabled) {
+        return res.status(503).json({ ok: false, error: 'phone_screening_disabled' });
+      }
+      const parsed = voiceCallbackSchema.safeParse(req.body);
+      const confirm = stores().confirmCandidateVoiceCallback;
+      if (!parsed.success || typeof confirm !== 'function') {
+        return res.status(400).json({ ok: false, status: 'invalid_request' });
+      }
+      const result = await confirm({
+        attemptId: parsed.data.attempt_id,
+        startsAt: new Date(parsed.data.starts_at),
+        now: now(),
+      });
+      if (result.status === 'ok' || result.status === 'already_confirmed') {
+        return res.json({
+          ok: true,
+          status: result.status,
+          appointment_id: result.appointmentId,
+          version: result.version,
+        });
+      }
+      return res.json({ ok: false, status: result.status });
+    } catch {
+      return res.status(503).json({ ok: false, status: 'phone_callback_confirmation_error' });
     }
   });
 

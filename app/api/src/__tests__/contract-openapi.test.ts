@@ -1039,7 +1039,7 @@ describe('OpenAPI document integrity', () => {
     // Plivo callbacks (/plivo/answer, /plivo/dial-status, /plivo/hangup), all
     // gated behind either the worker secret or the Plivo V3 signature — none
     // widens the recruiter-facing surface.
-    expect(Object.keys(paths).length).toBe(107);
+    expect(Object.keys(paths).length).toBe(109);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -1089,7 +1089,7 @@ describe('OpenAPI document integrity', () => {
     //   boolean readiness answer of the worker poll (no PII). The three Plivo
     //   callbacks document their bodies inline (XML strings / a bare ok) and
     //   reuse PhoneWorkerError, so they add no named schema.
-    expect(Object.keys(schemas).length).toBe(218);
+    expect(Object.keys(schemas).length).toBe(221);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.
@@ -1276,6 +1276,8 @@ describe('auth boundary vs spec security model', () => {
     // they belong here rather than in the general sweep.
     'POST /api/internal/phone/events',
     'POST /api/internal/phone/appointments',
+    'POST /api/internal/phone/callbacks/propose',
+    'POST /api/internal/phone/callbacks/confirm',
     // P4b, same surface and same boundary: the durable half of a screening.
     'POST /api/internal/phone/assessment/probe',
     'POST /api/internal/phone/assessment/consent-start',

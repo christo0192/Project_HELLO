@@ -33,6 +33,7 @@ export const PHONE_RPC_NAMES = [
   'reclaim_phone_attempt_leases',
   'apply_phone_event',
   'schedule_phone_appointment',
+  'confirm_candidate_voice_callback',
   'cancel_phone_appointment',
   'set_phone_halt',
   'clear_phone_halt',
@@ -102,6 +103,7 @@ export const PHONE_RPC_PARAMETERS: Readonly<Record<PhoneRpcName, readonly string
       'p_expected_version',
       'p_now',
     ],
+    confirm_candidate_voice_callback: ['p_attempt_id', 'p_starts_at', 'p_now'],
     cancel_phone_appointment: [
       'p_appointment_id',
       'p_reason',
@@ -343,6 +345,15 @@ export const SCHEDULE_PHONE_APPOINTMENT_STATUSES = [
 export type SchedulePhoneAppointmentStatus =
   (typeof SCHEDULE_PHONE_APPOINTMENT_STATUSES)[number];
 
+export const CONFIRM_CANDIDATE_VOICE_CALLBACK_STATUSES = [
+  'ok', 'already_confirmed', 'invalid_input', 'unknown_attempt',
+  'engagement_terminal', 'attempt_in_flight', 'lead_time_too_short',
+  'window_closed', 'slot_straddles_ist_midnight', 'slot_not_yet_eligible',
+  'daily_attempt_exists', 'slot_full',
+] as const;
+export type ConfirmCandidateVoiceCallbackStatus =
+  (typeof CONFIRM_CANDIDATE_VOICE_CALLBACK_STATUSES)[number];
+
 /** `cancel_phone_appointment`. `already_cancelled` is idempotent, not an error. */
 export const CANCEL_PHONE_APPOINTMENT_STATUSES = [
   'ok',
@@ -560,6 +571,7 @@ export const PHONE_RPC_STATUSES: Readonly<Record<PhoneRpcName, readonly string[]
     reclaim_phone_attempt_leases: RECLAIM_PHONE_ATTEMPT_LEASES_STATUSES,
     apply_phone_event: APPLY_PHONE_EVENT_STATUSES,
     schedule_phone_appointment: SCHEDULE_PHONE_APPOINTMENT_STATUSES,
+    confirm_candidate_voice_callback: CONFIRM_CANDIDATE_VOICE_CALLBACK_STATUSES,
     cancel_phone_appointment: CANCEL_PHONE_APPOINTMENT_STATUSES,
     set_phone_halt: SET_PHONE_HALT_STATUSES,
     clear_phone_halt: CLEAR_PHONE_HALT_STATUSES,
@@ -617,7 +629,7 @@ export const PHONE_RPC_STATUS_UNION: readonly string[] = Object.freeze(
  * union, which is the whole reason the increment is smaller than the number
  * of RPCs added.
  */
-export const PHONE_RPC_STATUS_COUNT = 98;
+export const PHONE_RPC_STATUS_COUNT = 102;
 
 /**
  * RESULT KEYS the API's behaviour DEPENDS on, per RPC.
@@ -638,6 +650,11 @@ export const PHONE_RPC_RESULT_KEYS: Readonly<Record<string, readonly string[]>> 
     'appointment_id',
     'version',
     'engagement_state',
+    'superseded_appointment_id',
+  ],
+  confirm_candidate_voice_callback: [
+    'appointment_id',
+    'version',
     'superseded_appointment_id',
   ],
   cancel_phone_appointment: ['appointment_id', 'version'],

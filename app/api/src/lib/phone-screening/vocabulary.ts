@@ -232,9 +232,13 @@ export const PHONE_APPOINTMENT_CANCEL_REASONS = [
 
 export type PhoneAppointmentCancelReason = (typeof PHONE_APPOINTMENT_CANCEL_REASONS)[number];
 
-/** `chk_phone_appointments_duration` — 15 to 60 minutes, in seconds. */
+/** Operator-created appointment envelope — 15 to 60 minutes, in seconds. */
 export const PHONE_APPOINTMENT_MIN_SECONDS = 900;
 export const PHONE_APPOINTMENT_MAX_SECONDS = 3600;
+
+/** Storage and candidate voice callback contract. */
+export const PHONE_VOICE_CALLBACK_DURATION_SECONDS = 600;
+export const PHONE_VOICE_CALLBACK_MIN_LEAD_SECONDS = 300;
 
 // ═══════════════════════════════════════════════════════════════════════
 // The append-only ingress ledger
