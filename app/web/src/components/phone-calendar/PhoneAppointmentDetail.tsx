@@ -36,6 +36,7 @@ import { StatusBadge } from '../design';
 import { ConfirmButton } from '../mission-control/ConfirmButton';
 import { buttonClassNames } from '../mission-control/buttonStyles';
 import {
+  formatIstDateTime,
   formatIstLongDayLabel,
   formatIstTimeRange,
   istDateOf,
@@ -139,17 +140,10 @@ export function PhoneAppointmentDetail({
         )}
       </dl>
 
-      {/*
-        A published residual, surfaced rather than hidden: nothing in the
-        current substrate writes `confirmed_at`. Showing a blank "confirmed"
-        field would read as "not yet confirmed", implying a confirmation step
-        that exists and has not happened. It does not exist yet.
-      */}
-      {appointment.confirmed_at === null && live && (
-        <p className="mt-3 text-xs text-ink-tertiary">
-          Read-back confirmation by the candidate is not recorded yet — nothing
-          in the current system writes it, so its absence does not mean the
-          candidate has not been told.
+      {appointment.source === 'candidate_voice' && appointment.confirmed_at && (
+        <p className="mt-3 rounded-lg border border-success/30 bg-success-soft px-3 py-2 text-sm text-success">
+          Candidate confirmed this callback on {formatIstDateTime(appointment.confirmed_at)}. The
+          ten-minute reservation is rechecked again when the callback becomes due.
         </p>
       )}
 

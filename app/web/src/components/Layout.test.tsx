@@ -196,11 +196,9 @@ describe('Layout shell', () => {
     expect(screen.getByRole('button', { name: 'Sign out' })).toBeInTheDocument();
   });
 
-  it('renders the theme toggle', () => {
+  it('renders the light-first workspace context', () => {
     renderLayout();
-    expect(
-      screen.getByRole('button', { name: /Switch to (dark|light) theme/ }),
-    ).toBeInTheDocument();
+    expect(screen.getByText('Recruiter workspace')).toBeInTheDocument();
   });
 });
 

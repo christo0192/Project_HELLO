@@ -189,6 +189,17 @@ export function formatIstTime(utcIso: string): string {
   return `${timeFormatter.format(new Date(ms))} IST`;
 }
 
+/** A full, unambiguous confirmation timestamp in India time. */
+export function formatIstDateTime(utcIso: string): string {
+  const ms = instantMs(utcIso);
+  if (ms === null) return 'time unavailable';
+  return `${new Intl.DateTimeFormat('en-GB', {
+    timeZone: IST_TIME_ZONE,
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(new Date(ms))} IST`;
+}
+
 /** `14:30–15:00 IST` across two instants. */
 export function formatIstTimeRange(startIso: string, endIso: string): string {
   const start = instantMs(startIso);

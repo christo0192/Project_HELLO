@@ -572,18 +572,21 @@ describe('no sensitive identifiers', () => {
   });
 });
 
-describe('published residuals are surfaced, not hidden', () => {
-  it('explains that read-back confirmation has no writer yet', async () => {
-    // `confirmed_at` is ALWAYS null: nothing in the current substrate writes
-    // it. A blank "confirmed" field would read as "not yet confirmed",
-    // implying a step that exists and has not happened.
+describe('candidate callback confirmation evidence', () => {
+  it('shows the server-stamped confirmation and ten-minute recheck', async () => {
+    apiFns.getPhoneCalendar.mockResolvedValue(calendarResponse({
+      appointments: [appointment({
+        source: 'candidate_voice',
+        confirmed_at: '2026-08-24T12:00:00.000Z',
+      })],
+    }));
     renderPage();
     await screen.findByRole('table');
     await userEvent.click(screen.getByRole('button', { name: /ATS-4417/ }));
 
-    const note = await screen.findByText(/not recorded yet/i);
-    expect(note.textContent).toMatch(/nothing in the current system writes it/i);
-    expect(note.textContent).toMatch(/does not mean the candidate has not been told/i);
+    const note = await screen.findByText(/Candidate confirmed this callback/i);
+    expect(note.textContent).toMatch(/ten-minute reservation is rechecked/i);
+    expect(note.textContent).toMatch(/IST/i);
   });
 
   it('reports a truncated week and a truncated occupancy as separate facts', async () => {
