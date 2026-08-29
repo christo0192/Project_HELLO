@@ -18,6 +18,7 @@ import { useCapabilitySupport } from '../lib/capability-check';
 import '../styles/candidate-experience.css';
 
 const AGENT_PARTICIPANT_KIND = (ParticipantKind as unknown as { AGENT?: unknown } | undefined)?.AGENT;
+const MODERN_CANDIDATE_EXPERIENCE = import.meta.env.VITE_CANDIDATE_WEBRTC_V2 !== 'false';
 
 /**
  * Phase 9 L4 — candidate join with SERVER-AUTHORITATIVE consent.
@@ -262,9 +263,12 @@ export function CandidateJoinPage() {
       try {
         const consent = await api.candidateConsentStatus({ invite_token: invite });
         if (cancelled) return;
-        const modernCandidateFlow = Boolean(
-          consent.role_title && typeof api.candidateLiveKitPreflight === 'function',
-        );
+        const modernCandidateFlow = MODERN_CANDIDATE_EXPERIENCE && typeof api.candidateLiveKitPreflight === 'function';
+        if (modernCandidateFlow && !consent.role_title) {
+          setPhase('error');
+          setError('screening_context_unavailable');
+          return;
+        }
         if (consent.role_title) setRoleTitle(consent.role_title);
         setInviteHasConsent(consent.has_consent);
         if (modernCandidateFlow) setCandidateStage('landing');
@@ -304,7 +308,7 @@ export function CandidateJoinPage() {
         consents: template.required_consents.filter((r) => checked[r] === true),
         status: 'granted',
       });
-      if (typeof api.candidateLiveKitPreflight === 'function' && roleTitle !== 'your screening role') {
+      if (MODERN_CANDIDATE_EXPERIENCE && typeof api.candidateLiveKitPreflight === 'function') {
         setCandidateStage('readiness');
       }
       setPhase('granted');
@@ -525,9 +529,11 @@ export function CandidateJoinPage() {
     await finalizeCandidateCall(true);
   }
 
-  const modernFlow = candidateStage !== 'consent' || Boolean(roleTitle !== 'your screening role' && typeof api.candidateLiveKitPreflight === 'function');
-  const consentItems = template?.consent_items?.filter((item) => template.required_consents.includes(item.type)) ??
-    template?.required_consents.map((type) => ({ type, label: `I agree to ${type.replace(/_/g, ' ')}.` })) ?? [];
+  const modernFlow = MODERN_CANDIDATE_EXPERIENCE && typeof api.candidateLiveKitPreflight === 'function';
+  const presentedItems = template?.consent_items?.filter((item) => template.required_consents.includes(item.type)) ?? [];
+  const consentItems = template && presentedItems.length === template.required_consents.length
+    ? presentedItems
+    : template?.required_consents.map((type) => ({ type, label: `I agree to ${type.replace(/_/g, ' ')}.` })) ?? [];
   const allChecked = template ? allRequiredChecked(template) : false;
 
   if (phase === 'declined') {
@@ -577,7 +583,9 @@ export function CandidateJoinPage() {
         )}
 
         {phase === 'granted' && candidateStage === 'readiness' && modernFlow && status !== 'live' && (
-          <AudioReadinessStep inviteToken={inviteRef.current ?? ''} roleTitle={roleTitle} onBack={() => setCandidateStage(inviteHasConsent ? 'landing' : 'consent')} onReady={(track) => { localTrackRef.current = track; void join(track); }} />
+          capabilityStatus === 'unsupported'
+            ? <div className="candidate-glass-card candidate-landing" style={{ margin: '100px auto 0' }} role="alert"><h1>Browser not supported</h1><p className="candidate-error">Your browser does not support the microphone and WebRTC features this screening requires. Please use a current browser over HTTPS.</p></div>
+            : <AudioReadinessStep inviteToken={inviteRef.current ?? ''} roleTitle={roleTitle} onBack={() => setCandidateStage(inviteHasConsent ? 'landing' : 'consent')} onReady={(track) => { localTrackRef.current = track; void join(track); }} />
         )}
 
         {phase === 'granted' && status === 'live' && (
