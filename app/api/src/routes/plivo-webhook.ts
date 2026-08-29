@@ -121,8 +121,23 @@ function readParamCaseInsensitive(
   return undefined;
 }
 
-/** The DialStatus values Plivo reports on the action callback. */
-const DIAL_ANSWERED = 'answer';
+/**
+ * Plivo's dial-status vocabulary — TWO channels, one route:
+ *
+ *   * `callbackUrl` (REAL-TIME, while the call is live): param `DialAction`
+ *     with values `answer` / `connected` / `hangup` / `digits`. `answer` is
+ *     the one signal that can reach the worker's bounce answer-wait IN TIME —
+ *     it applies `call.answered` mid-call.
+ *   * `action` (COMPLETION, after the dial ends): param `DialStatus` with
+ *     values `completed` / `busy` / `failed` / `cancel` / `timeout` /
+ *     `no-answer`. NOTE `answer` IS NOT IN THIS VOCABULARY — the previous
+ *     `DialStatus === 'answer'` branch was unreachable, so every answered
+ *     call completed as `completed` and was mischarged as a no-answer
+ *     (call 13, 2026-08-29: candidate answered, bot silent, attempt charged).
+ */
+const DIAL_ACTION_ANSWER = 'answer';
+/** Completion status of a dial that connected — NOT a no-answer. */
+const DIAL_COMPLETED = 'completed';
 /** Non-answer terminal dial results — each charges a no-answer/provider outcome. */
 const DIAL_BUSY = 'busy';
 
@@ -252,6 +267,9 @@ export function createPlivoWebhookRouter(deps: PlivoWebhookRouterDeps = {}): Rou
         candidateE164: unwrapDialableNumber(resolution.candidateNumber),
         callerId: config.callerId,
         actionUrl: config.dialStatusUrl,
+        // Real-time events (DialAction=answer while the call is LIVE) post to
+        // the same signed dial-status URL — one config URL, one verifier.
+        callbackUrl: config.dialStatusUrl,
       });
       logger.info('unknown_event', {
         error_category: 'plivo_answer_bridged',
@@ -313,13 +331,49 @@ export function createPlivoWebhookRouter(deps: PlivoWebhookRouterDeps = {}): Rou
       return sendXml(res, PLIVO_HANGUP_XML);
     }
 
+    // callbackUrl events carry `DialAction`; the action completion carries
+    // `DialStatus`. Read both — exactly one is present per request.
+    const dialAction = (readParamCaseInsensitive(body, 'dialaction') ?? '').toLowerCase();
+
     try {
-      if (dialStatus === DIAL_ANSWERED) {
-        // The SAME event the worker posts on answer. `internal` mints a
-        // deterministic synthetic provider id, so a redelivery converges on the
-        // original verdict; the worker's own `call.answered` (if it also posts)
-        // dedups against the ledger. This drives only the ledger transition —
-        // the recording/egress/stamp hook lives on the worker route.
+      if (dialAction !== '') {
+        if (dialAction === DIAL_ACTION_ANSWER) {
+          // THE mid-call answer signal — the only one that can arrive while
+          // the worker's bounce answer-wait is still polling. The SAME event
+          // the worker posts on answer. `internal` mints a deterministic
+          // synthetic provider id, so a redelivery converges on the original
+          // verdict; a duplicate (e.g. the completion fallback below) dedups
+          // against the ledger. This drives only the ledger transition — the
+          // recording/egress/stamp hook lives on the worker route.
+          await resolveStores().applyEvent({
+            source: 'internal',
+            eventType: 'call.answered',
+            attemptId,
+            now: clock(),
+          });
+          logger.info('unknown_event', {
+            error_category: 'plivo_dial_status_answered',
+            http_status: 200,
+          });
+        } else {
+          // connected / hangup / digits — observable, no ledger transition:
+          // hangup teardown is owned by `sip.participant_left` + the action
+          // completion below.
+          logger.info('unknown_event', {
+            error_category: 'plivo_dial_callback_event',
+            http_status: 200,
+          });
+        }
+        // A callback response is ignored by Plivo; answer with inert XML that
+        // cannot be misread as an instruction.
+        return sendXml(res, '<Response></Response>');
+      }
+
+      if (dialStatus === DIAL_COMPLETED) {
+        // The dial CONNECTED and later ended. Normally `call.answered` already
+        // landed via DialAction=answer; this is the lost-callback fallback,
+        // and the ledger dedups the duplicate. It is emphatically NOT a
+        // no-answer — mapping it there mischarged every answered call.
         await resolveStores().applyEvent({
           source: 'internal',
           eventType: 'call.answered',
@@ -327,7 +381,7 @@ export function createPlivoWebhookRouter(deps: PlivoWebhookRouterDeps = {}): Rou
           now: clock(),
         });
         logger.info('unknown_event', {
-          error_category: 'plivo_dial_status_answered',
+          error_category: 'plivo_dial_status_completed',
           http_status: 200,
         });
         return sendXml(res, PLIVO_HANGUP_XML);

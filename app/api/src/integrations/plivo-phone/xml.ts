@@ -39,6 +39,16 @@ export interface PlivoAnswerXmlInput {
   readonly callerId: string;
   /** The Dial ACTION callback URL (the `/plivo/dial-status` endpoint). */
   readonly actionUrl: string;
+  /**
+   * The REAL-TIME callback URL (`callbackUrl`) — the same `/plivo/dial-status`
+   * endpoint. The action URL fires ONLY when the dial COMPLETES; the answer
+   * signal the worker's bounce answer-wait polls for (`call.answered`) must
+   * arrive WHILE the call is live, and `DialAction=answer` on the callbackUrl
+   * is the only Plivo mechanism that delivers it. Call 13 (2026-08-29) proved
+   * the omission: candidate answered, the bot waited for an answer signal that
+   * could not exist until hangup, and the call died in silence.
+   */
+  readonly callbackUrl: string;
 }
 
 /**
@@ -50,10 +60,12 @@ export interface PlivoAnswerXmlInput {
 export function buildPlivoAnswerXml(input: PlivoAnswerXmlInput): string {
   const callerId = xmlEscape(input.callerId);
   const action = xmlEscape(input.actionUrl);
+  const callback = xmlEscape(input.callbackUrl);
   const number = xmlEscape(input.candidateE164);
   return (
     '<Response>'
-    + `<Dial callerId="${callerId}" action="${action}" method="POST" redirect="false">`
+    + `<Dial callerId="${callerId}" action="${action}" method="POST" redirect="false"`
+    + ` callbackUrl="${callback}" callbackMethod="POST">`
     + `<Number>${number}</Number>`
     + '</Dial>'
     + '</Response>'
