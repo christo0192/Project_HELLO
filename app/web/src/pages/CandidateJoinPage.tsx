@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import {
   createLocalAudioTrack,
   LocalAudioTrack,
@@ -160,6 +160,8 @@ export function CandidateJoinPage() {
   const [microphoneMuted, setMicrophoneMuted] = useState(false);
   const [completionKind, setCompletionKind] = useState<'completed' | 'closed'>('completed');
   const [liveTranscript, setLiveTranscript] = useState<LiveTranscriptSegment[]>([]);
+  const navigate = useNavigate();
+  const endedRedirectedRef = useRef(false);
   const inviteRef = useRef<string | null>(null);
   const roomRef = useRef<Room | null>(null);
   const localTrackRef = useRef<LocalAudioTrack | null>(null);
@@ -171,6 +173,18 @@ export function CandidateJoinPage() {
   const finalizationPromiseRef = useRef<Promise<void> | null>(null);
   const manualCloseRef = useRef(false);
   const capabilityStatus = useCapabilitySupport();
+
+  useEffect(() => {
+    if (phase !== 'granted' || status !== 'ended' || endedRedirectedRef.current) return;
+    endedRedirectedRef.current = true;
+    // Keep the terminal screen on a separate route. No invite, session, or
+    // grant data is placed in the URL or navigation state.
+    navigate('/candidate/ended', { replace: true });
+  }, [navigate, phase, status]);
+
+  useEffect(() => {
+    if (status === 'live' && window.scrollY > 0) window.scrollTo(0, 0);
+  }, [status]);
 
   // ── Invite capture: fragment → memory only, fragment removed immediately ─
   useEffect(() => {
