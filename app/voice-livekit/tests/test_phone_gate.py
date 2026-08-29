@@ -3419,5 +3419,412 @@ class TestToolResolvedLatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(choice, "required")
 
 
+class _RacedTrackingSession(_FakePhoneSession):
+    """A session that reproduces the 2026-08-29 silent-room-kill race.
+
+    On the live call the first planned question WAS delivered, but the SDK
+    events that populate the native turn tracking (`conversation_item_added`,
+    `agent_state_changed`, `speech_created`) had NOT landed by the time the
+    candidate's first plain answer arrived. `on_native_turn` then read an empty
+    `latest_assistant[0]`, tripped the malformed-exchange guard, and the main
+    loop deleted a healthy, active SIP room.
+
+    This fake models exactly that: when it delivers the FIRST authorized
+    planned question it fires NO tracking events (it stays silent on the wire
+    as far as the tracking is concerned) and simply schedules the candidate's
+    reply. Every later turn behaves like the parent so the conversation can
+    continue once the guard degrades.
+    """
+
+    first_question_delivered: bool = False
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.first_question_delivered = False
+
+    def _deliver_first_question_silently(self):
+        # Deliver the planned first question WITHOUT priming any tracking: no
+        # conversation item, no agent-state transition, no speech_created. Then
+        # schedule the candidate's answer exactly as the parent does.
+        self.first_question_delivered = True
+        speech = _FakeSpeech()
+        if self.answers:
+            reply = self.answers.pop(0)
+            if reply is not None:
+                asyncio.get_event_loop().call_soon(self.emit_user_turn, reply)
+        return speech
+
+    def _is_first_authorized_question(self, text):
+        return (
+            getattr(self.agent, "_screening_authorized", False)
+            and not phone.is_gate_copy(text)
+            and not self.first_question_delivered
+        )
+
+    def say(self, text, **kwargs):
+        if self._is_first_authorized_question(text):
+            self.spoken.append(text)
+            return self._deliver_first_question_silently()
+        return super().say(text, **kwargs)
+
+    def generate_reply(self, instructions=None, **kwargs):
+        # The gate opening still runs through the parent (it must disclose and
+        # consent). The first PLANNED question is the one delivered silently.
+        if (
+            not getattr(self.agent, "_gate_opening", False)
+            and self._is_first_authorized_question(str(instructions or ""))
+        ):
+            self.instructions.append(str(instructions or ""))
+            return self._deliver_first_question_silently()
+        return super().generate_reply(instructions=instructions, **kwargs)
+
+
+class _InertSession:
+    """A session that installs the coordinator's turn hook but drives nothing.
+
+    The native coordinator delivers the first question through
+    `generate_reply`/`say`; here those do NOTHING (no events, no scheduled
+    answers) so the test owns the tracking lists and can drive `on_native_turn`
+    by hand — the only way to exercise the guard's two-strike logic in
+    isolation.
+    """
+
+    def __init__(self):
+        self.handlers: dict = {}
+        self.instructions: list[str] = []
+        self.spoken: list[str] = []
+
+    def on(self, event):
+        def deco(fn):
+            self.handlers[event] = fn
+            return fn
+        return deco
+
+    def generate_reply(self, instructions=None, **kwargs):
+        self.instructions.append(str(instructions or ""))
+        return _FakeSpeech()
+
+    def say(self, text, **kwargs):
+        self.spoken.append(text)
+        return _FakeSpeech()
+
+
+async def _make_native_coordinator():
+    """Start a REAL `_run_native_phone_screening` and return its live turn hook.
+
+    Returns `(agent, session, state, client, hooks)` where `hooks` exposes the
+    installed `on_native_turn`, the tracking lists/events the guard reads (which
+    the coordinator takes as parameters, so the test genuinely owns them), the
+    `finished`/`terminal_reason` it decides on, a `_log` spy, and a
+    `drive_terminal` coroutine that awaits the coordinator's terminal handling.
+    """
+    class BaseAgent:
+        def __init__(self, instructions=""):
+            self.instructions = instructions
+
+    agent = phone.phone_agent_class(BaseAgent)(
+        "instructions", client=FakeEventClient(), attempt_id=_ATTEMPT_ID,
+        say=AsyncMock(), native_turns=True,
+    )
+    session = _InertSession()
+    state = _default_state()
+    client = FakeEventClient()
+
+    latest_assistant: list = [None]
+    latest_assistant_anchor: list = [None]
+    latest_candidate_anchor: list = [None]
+    candidate_end_requested = asyncio.Event()
+    reply_started = asyncio.Event()
+    reply_handle: list = [None]
+    assistant_delivery_complete = asyncio.Event()
+    candidate_activity = asyncio.Event()
+    agent_listening = asyncio.Event()
+    agent_activity_changed = asyncio.Event()
+    close_event = asyncio.Event()
+
+    spy = MagicMock(wraps=agent_mod._log)
+    log_patch = patch.object(agent_mod, "_log", spy)
+    log_patch.start()
+
+    task = asyncio.ensure_future(
+        agent_mod._run_native_phone_screening(
+            session=session, agent=agent, events=client, state=state,
+            attempt_id=_ATTEMPT_ID, session_id=_SESSION_ID, room_name=_PHONE_ROOM,
+            result=phone.PhoneGateResult(
+                phone.CLASSIFY_HUMAN, assessment_allowed=True,
+            ),
+            latest_assistant=latest_assistant,
+            latest_assistant_anchor=latest_assistant_anchor,
+            latest_candidate_anchor=latest_candidate_anchor,
+            candidate_end_requested=candidate_end_requested,
+            reply_started=reply_started, reply_handle=reply_handle,
+            assistant_delivery_complete=assistant_delivery_complete,
+            candidate_activity=candidate_activity,
+            agent_listening=agent_listening,
+            agent_activity_changed=agent_activity_changed,
+            close_event=close_event,
+        )
+    )
+    # Let the coordinator install its hook and deliver the (inert) first question.
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if getattr(agent, "_on_user_turn", None) is not None:
+            break
+
+    async def drive_terminal():
+        # Let the coordinator run its terminal handling to completion. The
+        # room delete is patched so the teardown does not touch the SDK; the
+        # `assessment.*` posting and the teardown log are the observable
+        # terminal effects the test asserts on.
+        with patch.object(agent_mod, "_delete_livekit_room", new_callable=AsyncMock):
+            await asyncio.wait_for(task, timeout=5)
+        log_patch.stop()
+
+    hooks = {
+        "on_native_turn": agent._on_user_turn,
+        "latest_assistant": latest_assistant,
+        "latest_assistant_anchor": latest_assistant_anchor,
+        "assistant_delivery_complete": assistant_delivery_complete,
+        "close_event": close_event,
+        "log": spy,
+        "task": task,
+        "log_patch": log_patch,
+        "drive_terminal": drive_terminal,
+    }
+    return agent, session, state, client, hooks
+
+
+class TestSilentRoomKillGuard(unittest.IsolatedAsyncioTestCase):
+    """PR-1 (F0a/F0b/F0c/F4): the worker must not delete a live room silently.
+
+    Root cause (live 2026-08-29): the consent→screening handoff seeded the
+    first question but never primed the native turn tracking. The candidate's
+    first plain answer read an empty `latest_assistant[0]` at the guard
+    (agent.py on_native_turn), which set HALT_MALFORMED_EXCHANGE and finished
+    the leg; the main loop then treated that as post-nothing and
+    unconditionally deleted the LiveKit room — killing a healthy call with no
+    log. These tests pin the four parts of the fix.
+    """
+
+    def setUp(self):
+        # `_FakePhoneSession.__init__` reads answers from — and appends
+        # instances to — the BASE class attributes, so the harness is driven
+        # through the base class even for subclasses.
+        _FakePhoneSession.instances = []
+        _FakePhoneSession.default_answers = []
+        _FakePhoneSession.default_emit_auto_speech = True
+        _FakePhoneSession.include_timing = False
+
+    async def _run(self, *, session_cls, answers, replies, complete=None):
+        ctx = FakeCtx(_PHONE_ROOM, participants=[_participant()])
+        client = FakeEventClient(complete=complete)
+        _FakePhoneSession.default_answers = list(replies)
+        _FakePhoneSession.default_emit_auto_speech = True
+
+        async def classifier(turns, say):
+            return phone.CLASSIFY_HUMAN
+
+        async def recording_seam():
+            return None
+
+        spy = MagicMock(wraps=agent_mod._log)
+        with patch.object(agent_mod, "_log", spy), \
+             patch.object(agent_mod, "AgentSession", session_cls), \
+             patch.object(agent_mod, "persistence", MagicMock()), \
+             patch.object(
+                 agent_mod, "_delete_livekit_room", new_callable=AsyncMock,
+                 side_effect=lambda _room: client.timeline.append("room.delete"),
+             ) as delete, \
+             patch.object(agent_mod, "_phone_recording_permitted", new=recording_seam), \
+             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.2):
+            task = asyncio.ensure_future(
+                agent_mod._run_phone_session(
+                    ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,
+                    client=client, classifier=classifier,
+                )
+            )
+            await asyncio.sleep(0.05)
+            session = _FakePhoneSession.instances[-1] if _FakePhoneSession.instances else None
+            if session is not None and session.start_calls:
+                session.emit_close()
+            await asyncio.wait_for(task, timeout=5)
+        return client, delete, session, spy
+
+    @staticmethod
+    def _log_categories(spy, error_type):
+        calls = list(spy.info.call_args_list) + list(spy.warn.call_args_list)
+        return [
+            c.kwargs.get("error_category")
+            for c in calls
+            if c.kwargs.get("error_type") == error_type
+        ]
+
+    async def test_the_incident_call_now_completes_and_every_close_is_logged(self):
+        """F0a + F0c: the exact incident call now runs to completion.
+
+        The raced session delivers the first question with no tracking primed —
+        the precise 2026-08-29 condition that killed a healthy call. F0a primes
+        the tracking at the handoff so the first answer is a clean advance, the
+        boundary commits, and the call completes. And F0c's invariant holds end
+        to end: the room is torn down only at the genuine end AND only after a
+        reason log names it — the property whose absence made the kill silent.
+        """
+        client, delete, session, spy = await self._run(
+            session_cls=_RacedTrackingSession,
+            answers=("Yes, that's fine.",),
+            replies=["First answer.", "Second answer."],
+        )
+        # The exchange was NOT declared malformed — the call completed.
+        self.assertIn("assessment.completed", client.event_types)
+        self.assertEqual(client.committed_keys, ["k1", "k2"])
+        # The room WAS torn down (the call genuinely ended) but only AFTER a
+        # reason log — never silently.
+        delete.assert_awaited()
+        teardown = self._log_categories(spy, "phone_room_teardown")
+        self.assertTrue(teardown)
+        # And the deletion chokepoint itself is attributable.
+        self.assertTrue(
+            any(
+                c.kwargs.get("error_type") == "phone_room_deleted"
+                for c in spy.info.call_args_list
+            )
+        )
+
+    async def test_gate_handoff_primes_tracking_so_a_plain_first_answer_survives(self):
+        """F0a: the priming is what makes the raced first answer survive.
+
+        Without the handoff priming this exact session trips the guard on the
+        first answer. The test asserts the positive outcome the priming buys:
+        the first plain answer is committed as a real boundary and the guard
+        never records a malformed-exchange recovery or terminal for cursor 0.
+        """
+        client, delete, session, spy = await self._run(
+            session_cls=_RacedTrackingSession,
+            answers=("Yes, that's fine.",),
+            replies=["First answer.", "Second answer."],
+        )
+        self.assertEqual(client.committed_keys, ["k1", "k2"])
+        # The guard neither recovered nor terminated — the priming meant it was
+        # never reached with empty tracking at all.
+        self.assertEqual(
+            self._log_categories(spy, "phone_turn_guard"), []
+        )
+
+    async def test_guard_recovers_once_then_terminates_truthfully_on_a_second_hit(self):
+        """F0b: two consecutive empty reads at the same cursor is a real fault.
+
+        Driving the REAL coordinator's installed `on_native_turn` (the unit the
+        guard lives in) with the tracking forced empty: the first empty read
+        RE-ASKS the planned question and does NOT finish (recovered); the second
+        empty read at the SAME cursor logs the terminal category, and the
+        coordinator then POSTS `assessment.aborted` (not nothing) and LOGS the
+        teardown reason before the room is deleted.
+        """
+        agent, session, state, client, hooks = await _make_native_coordinator()
+        on_turn = hooks["on_native_turn"]
+        # Force the empty-tracking condition the guard reads: delivery complete
+        # (so it is not mistaken for an interruption) but no captured question.
+        hooks["latest_assistant"][0] = None
+        hooks["latest_assistant_anchor"][0] = 1
+        hooks["assistant_delivery_complete"].set()
+
+        # First empty read → recovered: the planned question is re-asked and the
+        # leg is NOT finished (the task is still running).
+        turn_ctx = types.SimpleNamespace(items=[])
+        await on_turn(
+            "A plain answer.",
+            types.SimpleNamespace(text_content="A plain answer."),
+            turn_ctx,
+        )
+        self.assertFalse(hooks["task"].done())
+        reask = " ".join(
+            m["content"] if isinstance(m, dict) else "" for m in turn_ctx.items
+        ).lower()
+        self.assertIn("first question", reask)
+        self.assertEqual(
+            self._log_categories(hooks["log"], "phone_turn_guard"),
+            ["malformed_exchange_recovered"],
+        )
+
+        # Second empty read at the SAME cursor → terminal. Keep the tracking
+        # empty so the guard reads it as malformed again.
+        hooks["latest_assistant"][0] = None
+        turn_ctx2 = types.SimpleNamespace(items=[])
+        await on_turn(
+            "Still nothing usable.",
+            types.SimpleNamespace(text_content="x"),
+            turn_ctx2,
+        )
+        self.assertEqual(
+            self._log_categories(hooks["log"], "phone_turn_guard"),
+            ["malformed_exchange_recovered", "malformed_exchange_terminal"],
+        )
+        # The coordinator now finishes. It must POST the truthful terminal and
+        # LOG the teardown reason before the room is deleted.
+        await hooks["drive_terminal"]()
+        self.assertIn("assessment.aborted", client.event_types)
+        self.assertNotIn("assessment.completed", client.event_types)
+        self.assertTrue(self._log_categories(hooks["log"], "phone_room_teardown"))
+
+    async def test_a_disconnect_is_logged_nonterminal_and_still_names_the_teardown(self):
+        """F4 + F0c: an external room death (`disconnect`) posts NOTHING but LOGS.
+
+        The candidate's connection dies mid-leg: the native silence loop sees
+        the close and sets `disconnect`. The reclaim/reconnect machinery still
+        owns that reason — neither terminal event is posted. But the drop must
+        be observable (`phone_session_terminal`/`disconnect_nonterminal`) and
+        the teardown must still name its reason before the room is deleted.
+        """
+        ctx = FakeCtx(_PHONE_ROOM, participants=[_participant()])
+        client = FakeEventClient()
+        # One screening answer, then no further candidate activity — the
+        # session closes externally, which the silence loop reads as disconnect.
+        _FakePhoneSession.default_answers = ["First answer."]
+        _FakePhoneSession.default_emit_auto_speech = True
+
+        async def classifier(turns, say):
+            return phone.CLASSIFY_HUMAN
+
+        async def recording_seam():
+            return None
+
+        spy = MagicMock(wraps=agent_mod._log)
+        with patch.object(agent_mod, "_log", spy), \
+             patch.object(agent_mod, "AgentSession", _DisconnectingSession), \
+             patch.object(agent_mod, "persistence", MagicMock()), \
+             patch.object(
+                 agent_mod, "_delete_livekit_room", new_callable=AsyncMock,
+             ) as delete, \
+             patch.object(agent_mod, "_phone_recording_permitted", new=recording_seam), \
+             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 1.0):
+            task = asyncio.ensure_future(
+                agent_mod._run_phone_session(
+                    ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,
+                    client=client, classifier=classifier,
+                )
+            )
+            await asyncio.sleep(0.05)
+            session = _FakePhoneSession.instances[-1]
+            # The leg drops: the close event fires while the loop is waiting.
+            session.emit_close()
+            await asyncio.wait_for(task, timeout=5)
+        # NON-TERMINAL: neither terminal event is posted for a disconnect.
+        self.assertNotIn("assessment.completed", client.event_types)
+        self.assertNotIn("assessment.aborted", client.event_types)
+        # The disconnect is logged non-terminal, and the teardown is named.
+        self.assertIn(
+            "disconnect_nonterminal",
+            self._log_categories(spy, "phone_session_terminal"),
+        )
+        self.assertTrue(self._log_categories(spy, "phone_room_teardown"))
+        delete.assert_awaited()
+
+
+class _DisconnectingSession(_FakePhoneSession):
+    """A normal session whose candidate stops responding after consent — the
+    external close then drops the leg, which the silence loop reads as
+    `disconnect`. Behaves exactly like the parent otherwise."""
+
+
 if __name__ == "__main__":
     unittest.main()
