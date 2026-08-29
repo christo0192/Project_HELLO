@@ -24,13 +24,16 @@ operators to copy an internal engagement UUID.
 1. Through September 6, 2026 inclusive, calling may start at any hour in IST. From
    September 7, the existing 09:00 inclusive to 21:00 exclusive IST window applies
    again automatically. The calendar response exposes the cutoff.
-2. Treat the capacity label as an advisory projection, not a reservation.
-3. Candidate-profile booking resolves the current active cycle and appointment
+2. Candidate voice reservations are exactly ten minutes; this is a calendar
+   reservation/target and never a ten-minute forced disconnect.
+3. Operator-created slots remain 15–60 minutes. Candidate voice confirmation
+   uses its dedicated RPC and cannot widen the operator API.
+4. Candidate-profile booking resolves the current active cycle and appointment
    in one database transaction.
-4. `ok_prereqs_pending` means the appointment exists but a call is **not**
+5. `ok_prereqs_pending` means the appointment exists but a call is **not**
    promised until admission re-checks mapping, ingestion, consent, number,
    suppression, halt, calling window, daily contact, concurrency, and budget.
-5. A terminal cycle returns `rescreen_required`; it is never reopened by
+6. A terminal cycle returns `rescreen_required`; it is never reopened by
    scheduling.
 
 At the appointment start, the due loop invokes normal `admit_phone_attempt`
@@ -40,15 +43,26 @@ capacity, or daily-attempt refusal produces no dial and no fabricated success.
 ## Candidate voice callbacks
 
 A candidate saying they are busy remains in the current cycle. The voice worker
-books through the internal appointment endpoint with source `candidate_voice`.
-Before disclosure, the attempt is ended as an uncharged pre-disclosure deferral
-before the appointment is booked. The worker confirms a callback only after the
-server returns an accepted appointment result.
+uses a two-phase protocol:
 
-Past, illegal, out-of-window, unclear, or unavailable slots are refusals and
-must not be spoken as confirmations. The temporary 24/7 period does not bypass
-consent, halt, capacity, budget, or any other admission control. A booked callback
-must not be converted into a completed or re-screened cycle.
+1. `POST /api/internal/phone/callbacks/propose` validates an absolute UTC instant
+   and returns the server-normalized weekday, IST date/time, and ten-minute
+   duration. It performs no write.
+2. The bot reads those exact values back and asks whether they are correct.
+3. Only an unambiguous affirmative response unlocks
+   `POST /api/internal/phone/callbacks/confirm`.
+4. The confirmation RPC atomically rechecks five-minute lead, calling window,
+   midnight, daily-contact, capacity, idempotency, and the active answered
+   attempt; it records `confirmed_at`, closes the current leg, supersedes the
+   previous live appointment, and moves the engagement to `scheduled`.
+
+Before disclosure, the older `/appointments` compatibility path ends the attempt
+as an uncharged pre-disclosure deferral before booking. New candidate confirmation
+never uses that compatibility path. Past, illegal, out-of-window, ambiguous,
+full, or unavailable slots are refusals and must not be spoken as confirmations.
+The temporary 24/7 period does not bypass consent, halt, capacity, budget, or any
+other admission control. A booked callback must not be converted into a completed
+or re-screened cycle.
 
 ## Reschedule and cancellation
 
@@ -61,6 +75,20 @@ must not be converted into a completed or re-screened cycle.
   start; the conversation outcome is recorded separately.
 - A missed appointment is expired by the bounded sweep and does not consume a
   dial budget.
+
+## Synthetic validation
+
+Run the callback contract and voice protocol tests with no provider credentials:
+
+```bash
+cd app/api && npm test -- --run src/__tests__/phone-worker-route.test.ts src/__tests__/phone-screening-rpc-contract.test.ts
+cd app/voice-livekit && python3 -m unittest tests.test_phone_callback -v
+```
+
+These tests prove proposal-without-write, five-minute rejection, normalized IST
+read-back, explicit confirmation routing, refusal truthfulness, and the ten-minute
+reservation/no-forced-disconnect distinction. They must run with PSTN/SIP
+network access blocked.
 
 ## Troubleshooting
 

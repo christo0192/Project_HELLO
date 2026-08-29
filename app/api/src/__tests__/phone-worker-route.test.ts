@@ -27,7 +27,9 @@ import {
   PHONE_SYSTEM_ACTOR,
   loadPhoneScreeningConfig,
   type ApplyPhoneEventResult,
+  type ConfirmCandidateVoiceCallbackResult,
   type HeartbeatPhoneAttemptResult,
+  type PhoneReadStore,
   type PhoneStores,
   type SchedulePhoneAppointmentResult,
 } from '../lib/phone-screening/index.js';
@@ -62,6 +64,7 @@ interface Harness {
   app: express.Express;
   applyEvent: ReturnType<typeof vi.fn>;
   scheduleAppointment: ReturnType<typeof vi.fn>;
+  confirmCandidateVoiceCallback: ReturnType<typeof vi.fn>;
   /** 0045's epoch-fenced renewal. Observable on BOTH doors that call it. */
   heartbeatAttemptByEpoch: ReturnType<typeof vi.fn>;
   resolveEngagement: ReturnType<typeof vi.fn>;
@@ -75,6 +78,7 @@ interface Harness {
 function build(options: {
   applyEvent?: (input: unknown) => Promise<ApplyPhoneEventResult>;
   scheduleAppointment?: (input: unknown) => Promise<SchedulePhoneAppointmentResult>;
+  confirmCandidateVoiceCallback?: (input: unknown) => Promise<ConfirmCandidateVoiceCallbackResult>;
   heartbeat?: (input: unknown) => Promise<HeartbeatPhoneAttemptResult>;
   engagementState?: string | null;
   sessionId?: string | null;
@@ -88,6 +92,7 @@ function build(options: {
   purgeStatus?: string;
   purgeSafe?: boolean;
   configSource?: NodeJS.ProcessEnv;
+  readStore?: PhoneReadStore;
   now?: Date;
   /** Bounce answered-state read; absent = fail-closed (not answered). */
   readAnsweredState?: (attemptId: string) => Promise<{ answered: boolean; terminal: boolean }>;
@@ -101,6 +106,11 @@ function build(options: {
     options.scheduleAppointment ??
       (async () =>
         ({ status: 'ok', appointmentId: 'appt-1', version: 3 }) as SchedulePhoneAppointmentResult),
+  );
+  const confirmCandidateVoiceCallback = vi.fn(
+    options.confirmCandidateVoiceCallback ??
+      (async () =>
+        ({ status: 'ok', appointmentId: 'appt-voice-1', version: 1 }) as ConfirmCandidateVoiceCallbackResult),
   );
   const resolveEngagement = vi.fn(async () =>
     options.engagementState === null
@@ -127,10 +137,15 @@ function build(options: {
     status: options.purgeStatus ?? 'purged',
     safeToAcknowledge: options.purgeSafe ?? true,
   }));
+  const readStore = options.readStore ?? ({
+    listAttemptsForEngagement: async () => [],
+    listLiveAppointmentsByStart: async () => [],
+  } as unknown as PhoneReadStore);
 
   const stores = {
     applyEvent,
     scheduleAppointment,
+    confirmCandidateVoiceCallback,
     heartbeatAttemptByEpoch,
   } as unknown as PhoneStores;
 
@@ -140,6 +155,7 @@ function build(options: {
     '/api/internal/phone-worker',
     createPhoneWorkerRouter({
       stores,
+      readStore,
       resolveEngagement: resolveEngagement as never,
       // Absent unless a test asks for it, so the default path proves the route
       // is correct with NO recorder configured — which is exactly how a
@@ -162,6 +178,7 @@ function build(options: {
     app,
     applyEvent,
     scheduleAppointment,
+    confirmCandidateVoiceCallback,
     heartbeatAttemptByEpoch,
     resolveEngagement,
     startRecording,
@@ -171,6 +188,7 @@ function build(options: {
     storeCalls: () =>
       applyEvent.mock.calls.length
       + scheduleAppointment.mock.calls.length
+      + confirmCandidateVoiceCallback.mock.calls.length
       + heartbeatAttemptByEpoch.mock.calls.length,
   };
 }
@@ -186,6 +204,88 @@ function post(h: Harness, path: string, body: Record<string, unknown>) {
 const GOOD_SLOT = '2026-09-01T10:00:00Z'; // 15:30 IST
 
 // ═══════════════════════════════════════════════════════════════════════
+// Explicit callback proposal/confirmation
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('candidate voice callback proposal and confirmation', () => {
+  it('validates and normalizes a proposal without touching a write store', async () => {
+    const attempts = vi.fn(async () => []);
+    const live = vi.fn(async () => []);
+    const h = build({
+      engagementState: 'in_call',
+      readStore: {
+        listAttemptsForEngagement: attempts,
+        listLiveAppointmentsByStart: live,
+      } as unknown as PhoneReadStore,
+    });
+    const res = await post(h, '/callbacks/propose', {
+      attempt_id: ATTEMPT,
+      starts_at: GOOD_SLOT,
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      ok: true,
+      status: 'proposal_valid',
+      starts_at: '2026-09-01T10:00:00.000Z',
+      duration_seconds: 600,
+      time_zone: 'Asia/Kolkata',
+      ist_time: '15:30',
+    });
+    expect(attempts).toHaveBeenCalledOnce();
+    expect(live).toHaveBeenCalledOnce();
+    expect(h.confirmCandidateVoiceCallback).not.toHaveBeenCalled();
+    expect(h.scheduleAppointment).not.toHaveBeenCalled();
+  });
+
+  it('rejects a proposal with less than five minutes lead', async () => {
+    const h = build({ now: new Date('2026-08-01T00:00:00.000Z') });
+    const res = await post(h, '/callbacks/propose', {
+      attempt_id: ATTEMPT,
+      starts_at: '2026-08-01T00:04:59Z',
+    });
+    expect(res.body).toEqual({ ok: false, status: 'lead_time_too_short' });
+    expect(h.resolveEngagement).toHaveBeenCalledOnce();
+    expect(h.scheduleAppointment).not.toHaveBeenCalled();
+    expect(h.confirmCandidateVoiceCallback).not.toHaveBeenCalled();
+  });
+
+  it('confirms only through the dedicated idempotent callback seam', async () => {
+    const confirm = vi.fn(async () =>
+      ({ status: 'already_confirmed', appointmentId: 'appt-voice-1', version: 2 }) as ConfirmCandidateVoiceCallbackResult,
+    );
+    const h = build({ confirmCandidateVoiceCallback: confirm });
+    const res = await post(h, '/callbacks/confirm', {
+      attempt_id: ATTEMPT,
+      starts_at: GOOD_SLOT,
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      ok: true,
+      status: 'already_confirmed',
+      appointment_id: 'appt-voice-1',
+      version: 2,
+    });
+    expect(confirm).toHaveBeenCalledWith({
+      attemptId: ATTEMPT,
+      startsAt: new Date(GOOD_SLOT),
+      now: NOW,
+    });
+    expect(h.scheduleAppointment).not.toHaveBeenCalled();
+  });
+
+  it('never turns a confirmation refusal into a success', async () => {
+    const h = build({
+      confirmCandidateVoiceCallback: async () =>
+        ({ status: 'slot_full' }) as ConfirmCandidateVoiceCallbackResult,
+    });
+    const res = await post(h, '/callbacks/confirm', {
+      attempt_id: ATTEMPT,
+      starts_at: GOOD_SLOT,
+    });
+    expect(res.body).toEqual({ ok: false, status: 'slot_full' });
+  });
+});
+
 // Auth
 // ═══════════════════════════════════════════════════════════════════════
 

@@ -46,6 +46,7 @@
 
 import { timingSafeEqual } from 'node:crypto';
 import { Router } from 'express';
+import { createLogger } from '../lib/logger.js';
 import { z } from 'zod';
 import { runAssessment } from '../services/assessment.js';
 import { transitionSession } from '../lib/session-lifecycle.js';
@@ -82,6 +83,8 @@ import {
   createPhoneEgressOutput,
   phoneEgressConfigured,
 } from '../integrations/livekit-phone-dial/egress-output.js';
+
+const phoneWorkerLog = createLogger('phone-worker');
 
 /**
  * The CLOSED set of events the worker may post.
@@ -643,7 +646,10 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       const resolved = deps.resolveEngagement
         ? await deps.resolveEngagement(parsed.data.attempt_id)
         : null;
-      if (!resolved) return res.json({ ok: false, status: 'unknown_attempt' });
+      if (!resolved) {
+        phoneWorkerLog.info('unknown_event', { schema: 'callback_proposal', error_category: 'unknown_attempt' });
+        return res.json({ ok: false, status: 'unknown_attempt' });
+      }
       if (resolved.engagementState === 'scheduled') {
         return res.json({ ok: false, status: 'attempt_in_flight' });
       }
@@ -685,9 +691,11 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
         appointment.engagementId !== resolved.engagementId,
       ).length;
       if (overlapping >= PHONE_MAX_CONCURRENT) {
+        phoneWorkerLog.info('unknown_event', { schema: 'callback_proposal', error_category: 'slot_full' });
         return res.json({ ok: false, status: 'slot_full' });
       }
       const wall = istWallClock(startsAt);
+      phoneWorkerLog.info('unknown_event', { schema: 'callback_proposal', error_category: 'proposal_valid' });
       return res.json({
         ok: true,
         status: 'proposal_valid',
@@ -722,6 +730,7 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
         now: now(),
       });
       if (result.status === 'ok' || result.status === 'already_confirmed') {
+        phoneWorkerLog.info('unknown_event', { schema: 'callback_confirmation', error_category: result.status });
         return res.json({
           ok: true,
           status: result.status,
@@ -729,8 +738,10 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
           version: result.version,
         });
       }
+      phoneWorkerLog.info('unknown_event', { schema: 'callback_confirmation', error_category: result.status });
       return res.json({ ok: false, status: result.status });
     } catch {
+      phoneWorkerLog.warn('unknown_event', { schema: 'callback_confirmation', error_category: 'phone_callback_confirmation_error' });
       return res.status(503).json({ ok: false, status: 'phone_callback_confirmation_error' });
     }
   });
