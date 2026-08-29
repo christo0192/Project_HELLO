@@ -36,6 +36,7 @@ import { StatusBadge } from '../design';
 import { ConfirmButton } from '../mission-control/ConfirmButton';
 import { buttonClassNames } from '../mission-control/buttonStyles';
 import {
+  formatIstDateTime,
   formatIstLongDayLabel,
   formatIstTimeRange,
   istDateOf,
@@ -141,10 +142,8 @@ export function PhoneAppointmentDetail({
 
       {appointment.source === 'candidate_voice' && appointment.confirmed_at && (
         <p className="mt-3 rounded-lg border border-success/30 bg-success-soft px-3 py-2 text-sm text-success">
-          Candidate confirmed this callback on {new Intl.DateTimeFormat('en-IN', {
-            timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short',
-          }).format(new Date(appointment.confirmed_at))} India time. The ten-minute
-          reservation is rechecked again when the callback becomes due.
+          Candidate confirmed this callback on {formatIstDateTime(appointment.confirmed_at)}. The
+          ten-minute reservation is rechecked again when the callback becomes due.
         </p>
       )}
 

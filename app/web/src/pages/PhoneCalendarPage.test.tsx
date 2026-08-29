@@ -586,7 +586,7 @@ describe('candidate callback confirmation evidence', () => {
 
     const note = await screen.findByText(/Candidate confirmed this callback/i);
     expect(note.textContent).toMatch(/ten-minute reservation is rechecked/i);
-    expect(note.textContent).toMatch(/India time/i);
+    expect(note.textContent).toMatch(/IST/i);
   });
 
   it('reports a truncated week and a truncated occupancy as separate facts', async () => {
