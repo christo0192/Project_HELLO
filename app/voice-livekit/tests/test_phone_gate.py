@@ -2907,6 +2907,48 @@ class TestNumberNeverCarried(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(digits.search(text))
 
 
+class TestOpeningGenerationSeed(unittest.IsolatedAsyncioTestCase):
+    """The opening generation must never reach the model with empty contents.
+
+    Live 2026-08-29: the first generation of a call ran against an empty chat
+    context and Gemini refused it (400 contents-not-specified), so the natural
+    opening fell back to fixed copy on EVERY call. The seed is one synthetic
+    user turn ("Hello?") passed through `generate_reply(user_input=...)`.
+    """
+
+    async def test_the_opening_passes_a_user_input_seed(self):
+        seen: dict = {}
+
+        class _SeedProbeSession(_FakePhoneSession):
+            def generate_reply(self, instructions=None, **kwargs):
+                seen.setdefault("user_input", kwargs.get("user_input"))
+                return super().generate_reply(instructions=instructions, **kwargs)
+
+        ctx = FakeCtx(_PHONE_ROOM, participants=[_participant()])
+        client = FakeEventClient()
+        _FakePhoneSession.default_answers = ["Yes, that's fine.", "First answer."]
+
+        async def classifier(turns, say):
+            return phone.CLASSIFY_HUMAN
+
+        async def recording_seam():
+            return None
+
+        with patch.object(agent_mod, "AgentSession", _SeedProbeSession), \
+             patch.object(agent_mod, "persistence", MagicMock()), \
+             patch.object(agent_mod, "_delete_livekit_room", new_callable=AsyncMock), \
+             patch.object(agent_mod, "_phone_recording_permitted", new=recording_seam), \
+             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.05):
+            await asyncio.wait_for(
+                agent_mod._run_phone_session(
+                    ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,
+                    client=client, classifier=classifier,
+                ),
+                timeout=5,
+            )
+        self.assertEqual(seen.get("user_input"), "Hello?")
+
+
 class TestDisclosureSentencePin(unittest.TestCase):
     """The verbatim recording sentence and the fixed disclosure cannot drift.
 

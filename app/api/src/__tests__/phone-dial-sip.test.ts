@@ -214,7 +214,11 @@ describe('P5 sip — the exact SDK call', () => {
     expect(opts.participantIdentity).toBe(`phone-${ATTEMPT}`);
     expect(opts.participantIdentity).toBe(phoneParticipantIdentity(ATTEMPT));
     expect(opts.hidePhoneNumber).toBe(true);
-    expect(opts.waitUntilAnswered).toBe(true);
+    // 2026-08-29 RCA: a blocking answer-wait timed out under live answered
+    // calls (this trunk never delivers the answered notification to the
+    // waiting client) and the server deleted the room mid-conversation.
+    // The originate must NEVER block on the answer.
+    expect(opts.waitUntilAnswered).toBe(false);
   });
 
   it('sets all three time bounds explicitly, as integers, in SECONDS', async () => {
