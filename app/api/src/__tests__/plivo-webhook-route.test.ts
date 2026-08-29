@@ -199,16 +199,30 @@ describe('plivo /answer — bridges only a valid, live, signed request', () => {
     });
     expect(res.text).toContain('<Dial');
   });
+
+  it('the bridge XML wires BOTH channels: completion action AND real-time callbackUrl', async () => {
+    const app = buildApp({ config: ENABLED, bounceStore: bridgingStore(), stores: { applyEvent: vi.fn() } });
+    const res = await signedPost(app, '/api/integrations/plivo/answer', ANSWER_URL, {
+      'X-PH-HELLOATTEMPT': ATTEMPT_WIRE,
+    });
+    // Without callbackUrl there is NO mid-call answer signal at all: the
+    // action URL fires only at dial END, the worker's answer-wait starves,
+    // and the bot sits silent on an answered call (call 13, 2026-08-29).
+    expect(res.text).toContain(`action="${DIAL_STATUS_URL}"`);
+    expect(res.text).toContain(`callbackUrl="${DIAL_STATUS_URL}"`);
+    expect(res.text).toContain('callbackMethod="POST"');
+    expect(res.text).toContain('redirect="false"');
+  });
 });
 
 describe('plivo /dial-status — applies the right ledger event', () => {
-  it('DialStatus=answer applies call.answered via internal apply_phone_event', async () => {
+  it('DialAction=answer (real-time callback) applies call.answered mid-call', async () => {
     const applyEvent = vi.fn(async () => okApply);
     const app = buildApp({ config: ENABLED, bounceStore: bridgingStore(), stores: { applyEvent } });
     const res = await signedPost(app, '/api/integrations/plivo/dial-status', DIAL_STATUS_URL, {
       'X-PH-HELLOATTEMPT': ATTEMPT_WIRE,
-      DialStatus: 'answer',
-      CallUUID: 'call-uuid-1',
+      DialAction: 'answer',
+      DialBLegUUID: 'bleg-uuid-1',
     });
     expect(res.status).toBe(200);
     expect(applyEvent).toHaveBeenCalledTimes(1);
@@ -216,6 +230,34 @@ describe('plivo /dial-status — applies the right ledger event', () => {
     expect(arg.eventType).toBe('call.answered');
     expect(arg.source).toBe('internal');
     expect(arg.attemptId).toBe(ATTEMPT);
+  });
+
+  it('DialStatus=completed (action after a connected call) is the answered FALLBACK, never a no-answer', async () => {
+    const applyEvent = vi.fn(async () => okApply);
+    const app = buildApp({ config: ENABLED, bounceStore: bridgingStore(), stores: { applyEvent } });
+    const res = await signedPost(app, '/api/integrations/plivo/dial-status', DIAL_STATUS_URL, {
+      'X-PH-HELLOATTEMPT': ATTEMPT_WIRE,
+      DialStatus: 'completed',
+      CallUUID: 'call-uuid-c',
+    });
+    expect(res.status).toBe(200);
+    expect(applyEvent).toHaveBeenCalledTimes(1);
+    const arg = (applyEvent.mock.calls[0] as unknown[])[0] as { eventType: string; source: string };
+    expect(arg.eventType).toBe('call.answered');
+    expect(arg.source).toBe('internal');
+  });
+
+  it('DialAction=hangup / connected are acknowledged with NO ledger transition', async () => {
+    const applyEvent = vi.fn(async () => okApply);
+    const app = buildApp({ config: ENABLED, bounceStore: bridgingStore(), stores: { applyEvent } });
+    for (const action of ['hangup', 'connected', 'digits']) {
+      const res = await signedPost(app, '/api/integrations/plivo/dial-status', DIAL_STATUS_URL, {
+        'X-PH-HELLOATTEMPT': ATTEMPT_WIRE,
+        DialAction: action,
+      });
+      expect(res.status).toBe(200);
+    }
+    expect(applyEvent).not.toHaveBeenCalled();
   });
 
   it('DialStatus=busy charges the busy provider event', async () => {
@@ -255,7 +297,7 @@ describe('plivo /dial-status — applies the right ledger event', () => {
       .type('form')
       .set('X-Plivo-Signature-V3', 'AAAAwrongAAAA=')
       .set('X-Plivo-Signature-V3-Nonce', 'nonce-xyz')
-      .send({ 'X-PH-HELLOATTEMPT': ATTEMPT_WIRE, DialStatus: 'answer' });
+      .send({ 'X-PH-HELLOATTEMPT': ATTEMPT_WIRE, DialAction: 'answer' });
     expect(res.status).toBe(200);
     expect(applyEvent).not.toHaveBeenCalled();
   });
@@ -267,7 +309,7 @@ describe('plivo /dial-status — applies the right ledger event', () => {
     const app = buildApp({ config: ENABLED, bounceStore: bridgingStore(), stores: { applyEvent } });
     const res = await signedPost(app, '/api/integrations/plivo/dial-status', DIAL_STATUS_URL, {
       'X-PH-HELLOATTEMPT': ATTEMPT_WIRE,
-      DialStatus: 'answer',
+      DialAction: 'answer',
       CallUUID: 'x',
     });
     expect(res.status).toBe(500);
@@ -314,7 +356,7 @@ describe('plivo routes — no route logs or echoes a phone number', () => {
       });
       await signedPost(app, '/api/integrations/plivo/dial-status', DIAL_STATUS_URL, {
         'X-PH-HELLOATTEMPT': ATTEMPT_WIRE,
-        DialStatus: 'answer',
+        DialAction: 'answer',
         CallUUID: 'c',
         To: CANDIDATE_E164,
       });
