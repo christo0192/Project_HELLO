@@ -26,6 +26,7 @@ decision. Proposed ADRs are not authority to deploy their option.
 - [ADR-0011: Recruiter single-factor authentication with server-side allowlist authorization](0011-recruiter-single-factor-allowlist-auth.md)
 - [ADR-0012: Ashby runtime execution topology](0012-ashby-runtime-execution-topology.md)
 - [ADR-0013: Phone screening runtime](0013-phone-screening-runtime.md)
+- [ADR-0014: Candidate WebRTC readiness and audio-first invite UI](0014-candidate-webrtc-readiness-and-ui.md)
 
 Create new records from [the template](template.md). Never rewrite an accepted
 decision's outcome; supersede it with a new ADR so the history remains legible.

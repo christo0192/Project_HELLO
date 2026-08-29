@@ -135,6 +135,10 @@ export function AudioReadinessStep({ inviteToken, roleTitle, onReady, onBack }: 
       setMessage(messageFor(error));
       await cleanupTrack();
     }
+    // runNetworkTest is declared below and intentionally kept out of this
+    // callback's identity; this handler is recreated only when the selected
+    // device or cleanup adapter changes.
+    // oxlint-disable-next-line react-hooks/exhaustive-deps
   }, [cleanupTrack, loadDevices, selectedDevice]);
 
   const runNetworkTest = useCallback(async (track: LocalAudioTrack) => {
