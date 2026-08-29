@@ -5,19 +5,19 @@ import { describe, it, expect } from 'vitest';
 import { chartPalette, chartTheme } from '..';
 
 describe('chartPalette', () => {
-  it('uses logo cyan as the light primary', () => {
+  it('uses the approved categorical cycle in light mode', () => {
     const light = chartPalette('light');
-    expect(light.colors[0]).toBe('#3996d2');
-    expect(light.text).toBe('#101f31');
-    expect(light.splitLine).toBe('#e2e8f0');
+    expect(light.colors.slice(0, 4)).toEqual(['#4E6BA6', '#398AA2', '#1E7590', '#D8B5BE']);
+    expect(light.text).toBe('#0f172a');
+    expect(light.splitLine).toBe('#eaeef6');
   });
 
-  it('switches to bright navy-based colors in dark mode', () => {
+  it('keeps the approved palette under the legacy dark compatibility mode', () => {
     const dark = chartPalette('dark');
-    expect(dark.colors[0]).toBe('#54a7d6');
-    expect(dark.text).toBe('#e8eef5');
-    expect(dark.splitLine).toBe('#1e3048');
-    expect(dark.tooltipBg).toBe('#122032');
+    expect(dark.colors[0]).toBe('#4E6BA6');
+    expect(dark.text).toBe('#0f172a');
+    expect(dark.splitLine).toBe('#eaeef6');
+    expect(dark.tooltipBg).toBe('#ffffff');
   });
 });
 

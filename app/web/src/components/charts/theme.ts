@@ -12,22 +12,19 @@ export interface ChartPalette {
 }
 
 /**
- * Semantic chart palette derived from the resolved theme. Values mirror the
- * CSS tokens in index.css (logo cyan #3996d2, navy #344158) so charts stay
- * in sync with surfaces without reading computed styles (test-safe).
+ * Categorical chart palette derived from the approved HR screenshot cycle.
+ * The `theme` argument remains for API compatibility; all application charts
+ * intentionally render the single approved light-first palette.
  */
-export function chartPalette(theme: Theme): ChartPalette {
-  const dark = theme === 'dark';
+export function chartPalette(_theme: Theme): ChartPalette {
   return {
-    colors: dark
-      ? ['#54a7d6', '#8fa3bd', '#2fb17f', '#d8a05c', '#ef6a6a', '#a99de0']
-      : ['#3996d2', '#344158', '#0d8a63', '#b45409', '#d13b3b', '#7a6cc4'],
-    text: dark ? '#e8eef5' : '#101f31',
-    subtext: dark ? '#a6b4c5' : '#46586d',
-    axisLine: dark ? '#2d4462' : '#c7d2de',
-    splitLine: dark ? '#1e3048' : '#e2e8f0',
-    tooltipBg: dark ? '#122032' : '#ffffff',
-    tooltipBorder: dark ? '#2d4462' : '#e2e8f0',
+    colors: ['#4E6BA6', '#398AA2', '#1E7590', '#D8B5BE', '#938FB8', '#7BA7C7', '#A9CAD6', '#C4A6B8', '#6B8E9F', '#B5C8D8', '#8FB0A8', '#D0B8A0'],
+    text: '#0f172a',
+    subtext: '#334155',
+    axisLine: '#dbe1ec',
+    splitLine: '#eaeef6',
+    tooltipBg: '#ffffff',
+    tooltipBorder: '#dbe1ec',
   };
 }
 

@@ -5,38 +5,37 @@ export default {
   theme: {
     extend: {
       colors: {
-        // InterviewKickstart brand — derived from the authorized ik-logo.png
-        // (dominant logo primaries: cyan #3996d2 primary, navy #344158
-        // secondary). See src/index.css for the semantic token system.
+        // HR-approved screenshot palette. Semantic application colors are
+        // CSS variables below; these scales keep legacy utilities on the same
+        // visual system while page migrations are completed.
         brand: {
-          50: '#eef7fc',
-          100: '#d9edf8',
-          200: '#b2d9ee',
-          300: '#86c0e2',
-          400: '#55a7d6',
-          500: '#3996d2',
-          600: '#2a7cb2',
-          700: '#256694',
-          800: '#20537a',
-          900: '#1c4665',
-          950: '#122d42',
+          50: '#f4f6fb',
+          100: '#eaeef6',
+          200: '#dbe1ec',
+          300: '#b5c8d8',
+          400: '#7ba7c7',
+          500: '#4E6BA6',
+          600: '#4E6BA6',
+          700: '#1E7590',
+          800: '#334155',
+          900: '#0f172a',
+          950: '#0f172a',
         },
-        // Legacy alias so pre-existing components re-theme to the IK brand
-        // without churn. Kept under both names until consumers migrate.
+        // Compatibility alias for existing accent utilities.
         accent: {
-          50: '#eef7fc',
-          100: '#d9edf8',
-          200: '#b2d9ee',
-          300: '#86c0e2',
-          400: '#55a7d6',
-          500: '#3996d2',
-          600: '#2a7cb2',
-          700: '#256694',
-          800: '#20537a',
-          900: '#1c4665',
-          950: '#122d42',
+          50: '#f4f6fb',
+          100: '#eaeef6',
+          200: '#dbe1ec',
+          300: '#b5c8d8',
+          400: '#7BA7C7',
+          500: '#4E6BA6',
+          600: '#4E6BA6',
+          700: '#1E7590',
+          800: '#334155',
+          900: '#0f172a',
+          950: '#0f172a',
         },
-        // Semantic tokens — values switch with the `.dark` class (index.css).
+        // Semantic tokens — light-first values from index.css.
         surface: 'var(--surface)',
         'surface-secondary': 'var(--surface-secondary)',
         'surface-tertiary': 'var(--surface-tertiary)',

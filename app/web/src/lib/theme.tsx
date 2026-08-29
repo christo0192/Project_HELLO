@@ -61,7 +61,10 @@ function readSystemTheme(): Theme {
   return window.matchMedia(DARK_QUERY).matches ? 'dark' : 'light';
 }
 
-export function ThemeProvider({ children }: { children: ReactNode }) {
+export function ThemeProvider({
+  children,
+  lightOnly = false,
+}: { children: ReactNode; lightOnly?: boolean }) {
   const [mode, setModeState] = useState<ThemeMode>(readStoredMode);
   const [systemPref, setSystemPref] = useState<Theme>(readSystemTheme);
 
@@ -77,7 +80,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     return () => mql.removeEventListener('change', onChange);
   }, []);
 
-  const theme: Theme = mode === 'system' ? systemPref : mode;
+  const theme: Theme = lightOnly ? 'light' : mode === 'system' ? systemPref : mode;
 
   // Apply the class + color-scheme to <html>.
   useEffect(() => {

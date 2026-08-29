@@ -21,7 +21,6 @@ import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import { useAuth, type MembershipRole } from '../lib/auth';
 import { Spinner } from './ui';
-import { ThemeToggle } from './design';
 import { ErrorBoundary } from './ErrorBoundary';
 import {
   Brand,
@@ -299,7 +298,7 @@ export function Layout() {
             <Brand compact />
           </div>
           <div className="flex-1" />
-          <ThemeToggle />
+          <span className="hidden text-xs font-medium text-ink-tertiary sm:inline">Recruiter workspace</span>
         </header>
 
         <main
