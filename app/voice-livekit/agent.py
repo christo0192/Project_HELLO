@@ -1809,16 +1809,33 @@ async def _run_phone_session(
         if callable(setter):
             setter(True)
         latest_assistant[0] = None
+        opening_instructions = (
+            "You are Christy, an AI voice assistant calling from the company "
+            "about the candidate's job application. Greet the candidate warmly "
+            "and briefly by voice. You MUST include this exact sentence "
+            "verbatim, word for word, somewhere in your reply: "
+            f"\"{phone.PHONE_DISCLOSURE_RECORDING_SENTENCE}\" "
+            "Then ask whether it is okay to continue. Keep it to two or three "
+            "short sentences and end with the consent question."
+        )
         try:
-            handle = generate(instructions=(
-                "You are Christy, an AI voice assistant calling from the company "
-                "about the candidate's job application. Greet the candidate warmly "
-                "and briefly by voice. You MUST include this exact sentence "
-                "verbatim, word for word, somewhere in your reply: "
-                f"\"{phone.PHONE_DISCLOSURE_RECORDING_SENTENCE}\" "
-                "Then ask whether it is okay to continue. Keep it to two or three "
-                "short sentences and end with the consent question."
-            ))
+            # The FIRST generation of a call runs against an EMPTY chat
+            # context, and Gemini refuses a request with no contents
+            # (400 INVALID_ARGUMENT, observed live 2026-08-29 — the opening
+            # fell back to fixed copy on every call). `user_input` seeds one
+            # user turn ("Hello?", which is what answering a phone sounds
+            # like) so the request always carries contents. It is model
+            # context only: it is not an STT turn, fires no turn hooks, and
+            # the gate transcript takes the candidate's consent reply from
+            # the classifier path, never from here.
+            try:
+                handle = generate(
+                    user_input="Hello?", instructions=opening_instructions,
+                )
+            except TypeError:
+                # An older/stubbed session without the `user_input` seam:
+                # generate bare and let the verification/fallback decide.
+                handle = generate(instructions=opening_instructions)
             if inspect.isawaitable(handle):
                 handle = await handle
             wait = getattr(handle, "wait_for_playout", None)
