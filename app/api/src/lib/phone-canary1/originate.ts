@@ -141,7 +141,18 @@ export function buildCanary1DialConfig(
   originateTimeoutSeconds: number,
   maxCallSeconds: number,
 ): PhoneDialConfig {
-  return { sipTrunkId: trunkId, agentName, originateTimeoutSeconds, maxCallSeconds };
+  // Canary-1 is the direct-dial smoke test and NEVER bounces: the bounce
+  // fields are pinned OFF/empty here so the config is complete and the canary's
+  // dial is byte-identical to the pre-bounce path.
+  return {
+    sipTrunkId: trunkId,
+    agentName,
+    originateTimeoutSeconds,
+    maxCallSeconds,
+    bounceMode: false,
+    bounceTrunkId: '',
+    bounceSipUser: '',
+  };
 }
 
 export type Canary1RoomOutcome = 'created' | 'room_create_failed';
@@ -250,7 +261,10 @@ export async function originateCanary1Call(
   const result = await discardingErrors(async () =>
     resolution.client.createSipParticipant({
       trunkId: input.dialConfig.sipTrunkId,
-      number: input.number,
+      // Canary-1 is the direct-dial smoke test and is ORTHOGONAL to bounce
+      // mode: it always dials its fixed test number down the direct trunk. The
+      // discriminated target keeps that explicit.
+      target: { kind: 'number', number: input.number },
       roomName: input.roomName,
       // THE THIRD ID. Not the session id, not the canary id.
       attemptId: input.ids.originateAttemptId,

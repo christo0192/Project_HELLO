@@ -211,6 +211,7 @@ class FakeEventClient:
         commits: dict | None = None,
         complete=None,
         heartbeats=None,
+        answers=None,
     ) -> None:
         self.calls: list[tuple[str, str, dict]] = []
         self.timeline: list[str] = []
@@ -227,6 +228,22 @@ class FakeEventClient:
         # test asserting the event ORDER is not perturbed by the heartbeat.
         self.heartbeats: list[tuple] = []
         self._heartbeats = list(heartbeats or [])
+        # Bounce mode: every answered-probe is RECORDED and its outcome scripted.
+        # A test asserting the answer WAIT is not perturbed by the other calls.
+        self.answered_calls: list[str] = []
+        self._answers = list(answers or [])
+
+    async def attempt_answered(self, attempt_id):
+        self.answered_calls.append(attempt_id)
+        scripted = self._answers
+        if scripted:
+            outcome = scripted.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        # Default: the server confirms an answer immediately, so a session test
+        # that does not care about the wait still proceeds.
+        return phone.PhoneAnswerProbe(True, answered=True)
 
     async def heartbeat_attempt(self, attempt_id, session_id, *, epoch):
         self.heartbeats.append((attempt_id, session_id, epoch))
@@ -857,6 +874,225 @@ class TestPhoneGate(unittest.IsolatedAsyncioTestCase):
                     self.assertIn(event_type, phone.PHONE_WORKER_EVENTS)
 
 
+# ── Answer-first origination (Plivo bounce): the answer wait ───────────
+
+class TestBounceAnswerWait(unittest.IsolatedAsyncioTestCase):
+    """The bounce-mode wait for the SERVER-VERIFIED answer, at the seam.
+
+    The SIP participant is present ~1 s after dispatch; in bounce mode the gate
+    must NOT speak until the server confirms the real candidate answered.
+    """
+
+    async def _noskip_sleep(self, _sec):
+        # Deterministic clock seam: no wall time, but yield so other tasks run.
+        return None
+
+    async def _bounce_gate(
+        self, *, answers, decision=None, answer_wait_sec=0.5,
+    ):
+        recorder = Recorder()
+        client = FakeEventClient(answers=answers)
+        decision = phone.CLASSIFY_HUMAN if decision is None else decision
+
+        async def wait_for_participant():
+            recorder.order.append("participant_wait")
+            return _participant()
+
+        async def classify():
+            recorder.order.append("classify")
+            return decision
+
+        result = await phone.run_phone_gate(
+            attempt_id=_ATTEMPT_ID,
+            client=client,
+            wait_for_participant=wait_for_participant,
+            classify=classify,
+            say=recorder.say,
+            start_recording=recorder.start_recording,
+            classify_timeout_sec=0.05,
+            session_id=_SESSION_ID,
+            post_call_answered=True,
+            bounce_mode=True,
+            answer_wait_sec=answer_wait_sec,
+            answer_poll_interval_sec=0.0,
+            answer_wait_sleep=self._noskip_sleep,
+        )
+        return result, client, recorder
+
+    async def test_nothing_is_spoken_before_the_answer_is_verified(self):
+        # The candidate is "still ringing" for two polls, then answers. Nothing
+        # may be said, and no event posted, until that answered poll resolves.
+        answers = [
+            phone.PhoneAnswerProbe(True, answered=False),
+            phone.PhoneAnswerProbe(True, answered=False),
+            phone.PhoneAnswerProbe(True, answered=True),
+        ]
+        result, client, recorder = await self._bounce_gate(answers=answers)
+        # It polled three times before anything was spoken.
+        self.assertEqual(len(client.answered_calls), 3)
+        # The wait resolves before any spoken line: participant_wait is first,
+        # and a disclosure ("say:") is only reached after the answer verifies.
+        self.assertEqual(recorder.order[0], "participant_wait")
+        self.assertTrue(any(o.startswith("say:") for o in recorder.order))
+        # A verified human still consents and records, exactly as today.
+        self.assertTrue(result.assessment_allowed)
+        self.assertTrue(result.recording_allowed)
+
+    async def test_answered_then_normal_gate_continues(self):
+        # Immediate answer → the gate is byte-identical to the non-bounce human
+        # path from here: classify.human then disclosure.delivered then record.
+        answers = [phone.PhoneAnswerProbe(True, answered=True)]
+        result, client, recorder = await self._bounce_gate(answers=answers)
+        self.assertTrue(result.assessment_allowed)
+        self.assertTrue(result.recording_allowed)
+        self.assertEqual(recorder.recording_calls, 1)
+        # call.answered was posted (belt-and-braces) AFTER the wait, then the
+        # human consent events, in order.
+        self.assertEqual(
+            client.event_types,
+            ["call.answered", "classify.human", "disclosure.delivered"],
+        )
+        self.assertEqual(recorder.order[-1], "recording")
+
+    async def test_timeout_speaks_nothing_and_returns_no_participant(self):
+        # Every poll says "still ringing"; the budget expires. Nothing is ever
+        # spoken, nothing is posted, and the gate returns the no-participant
+        # outcome so the caller's close/reclaim path owns the rest.
+        answers = [phone.PhoneAnswerProbe(True, answered=False) for _ in range(50)]
+        result, client, recorder = await self._bounce_gate(
+            answers=answers, answer_wait_sec=0.0,
+        )
+        self.assertEqual(result.outcome, phone.GATE_NO_PARTICIPANT)
+        self.assertFalse(result.assessment_allowed)
+        self.assertFalse(result.recording_allowed)
+        self.assertEqual(recorder.spoken, [])
+        self.assertEqual(recorder.recording_calls, 0)
+        # No worker event was posted at all — not even call.answered.
+        self.assertEqual(client.calls, [])
+
+    async def test_terminal_speaks_nothing_and_returns_no_participant(self):
+        answers = [phone.PhoneAnswerProbe(True, terminal=True)]
+        result, client, recorder = await self._bounce_gate(answers=answers)
+        self.assertEqual(result.outcome, phone.GATE_NO_PARTICIPANT)
+        self.assertFalse(result.assessment_allowed)
+        self.assertEqual(recorder.spoken, [])
+        self.assertEqual(recorder.recording_calls, 0)
+        self.assertEqual(client.calls, [])
+
+    async def test_transport_failures_are_retried_within_the_budget(self):
+        # Two unconfirmed readings (transport / malformed) are NOT give-ups:
+        # the poll keeps trying and the eventual answer proceeds normally.
+        answers = [
+            phone.PhoneAnswerProbe(False, error_category="transport"),
+            phone.PhoneAnswerProbe(False, error_category="malformed_response"),
+            phone.PhoneAnswerProbe(True, answered=True),
+        ]
+        result, client, recorder = await self._bounce_gate(answers=answers)
+        self.assertEqual(len(client.answered_calls), 3)
+        self.assertTrue(result.assessment_allowed)
+
+    async def test_a_raising_client_is_a_fault_not_an_answer(self):
+        # An exception from the probe must be caught and treated as unconfirmed,
+        # never as answered/terminal — then the next reading proceeds.
+        answers = [
+            RuntimeError("boom"),
+            phone.PhoneAnswerProbe(True, answered=True),
+        ]
+        result, client, _ = await self._bounce_gate(answers=answers)
+        self.assertEqual(len(client.answered_calls), 2)
+        self.assertTrue(result.assessment_allowed)
+
+    async def test_bounce_off_never_polls_and_is_byte_identical(self):
+        # The DEFAULT: bounce_mode omitted → the answered probe is never called
+        # and the human path is exactly the legacy one.
+        recorder = Recorder()
+        client = FakeEventClient(answers=[phone.PhoneAnswerProbe(True, answered=True)])
+
+        async def wait_for_participant():
+            return _participant()
+
+        async def classify():
+            return phone.CLASSIFY_HUMAN
+
+        result = await phone.run_phone_gate(
+            attempt_id=_ATTEMPT_ID,
+            client=client,
+            wait_for_participant=wait_for_participant,
+            classify=classify,
+            say=recorder.say,
+            start_recording=recorder.start_recording,
+            classify_timeout_sec=0.05,
+            session_id=_SESSION_ID,
+        )
+        self.assertEqual(client.answered_calls, [])
+        self.assertTrue(result.assessment_allowed)
+
+
+class TestWaitForVerifiedAnswer(unittest.IsolatedAsyncioTestCase):
+    """The standalone answer-wait poller, with injected clocks."""
+
+    def _clock(self, times):
+        seq = list(times)
+        def now():
+            return seq.pop(0) if len(seq) > 1 else seq[0]
+        return now
+
+    async def _sleep(self, _sec):
+        return None
+
+    async def test_answered_returns_immediately(self):
+        client = FakeEventClient(answers=[phone.PhoneAnswerProbe(True, answered=True)])
+        verdict = await phone.wait_for_verified_answer(
+            attempt_id=_ATTEMPT_ID, client=client, timeout_sec=5.0,
+            poll_interval_sec=0.0, sleep=self._sleep,
+            monotonic=self._clock([0.0, 0.0]),
+        )
+        self.assertEqual(verdict, "answered")
+        self.assertEqual(len(client.answered_calls), 1)
+
+    async def test_terminal_gives_up_with_the_terminal_reason(self):
+        client = FakeEventClient(answers=[phone.PhoneAnswerProbe(True, terminal=True)])
+        verdict = await phone.wait_for_verified_answer(
+            attempt_id=_ATTEMPT_ID, client=client, timeout_sec=5.0,
+            poll_interval_sec=0.0, sleep=self._sleep,
+            monotonic=self._clock([0.0, 0.0]),
+        )
+        self.assertEqual(verdict, phone.BOUNCE_GIVEUP_TERMINAL)
+
+    async def test_budget_expiry_on_still_ringing_is_a_timeout(self):
+        client = FakeEventClient(
+            answers=[phone.PhoneAnswerProbe(True, answered=False) for _ in range(10)]
+        )
+        # monotonic jumps past the deadline on the second read.
+        verdict = await phone.wait_for_verified_answer(
+            attempt_id=_ATTEMPT_ID, client=client, timeout_sec=1.0,
+            poll_interval_sec=0.0, sleep=self._sleep,
+            monotonic=self._clock([0.0, 2.0]),
+        )
+        self.assertEqual(verdict, phone.BOUNCE_GIVEUP_TIMEOUT)
+
+    async def test_budget_expiry_on_a_transport_failure_is_distinguishable(self):
+        client = FakeEventClient(
+            answers=[phone.PhoneAnswerProbe(False, error_category="transport")]
+        )
+        verdict = await phone.wait_for_verified_answer(
+            attempt_id=_ATTEMPT_ID, client=client, timeout_sec=1.0,
+            poll_interval_sec=0.0, sleep=self._sleep,
+            monotonic=self._clock([0.0, 2.0]),
+        )
+        self.assertEqual(verdict, phone.BOUNCE_GIVEUP_TRANSPORT)
+
+    async def test_give_up_reasons_are_a_bounded_set(self):
+        self.assertEqual(
+            {
+                phone.BOUNCE_GIVEUP_TIMEOUT,
+                phone.BOUNCE_GIVEUP_TERMINAL,
+                phone.BOUNCE_GIVEUP_TRANSPORT,
+            },
+            {"answer_wait_timeout", "attempt_terminal", "answer_wait_transport"},
+        )
+
+
 # ── Phone Parity 2: call.answered, LLM opening, consent bridge, gate turns ──
 
 class _AtomicEventClient(FakeEventClient):
@@ -1442,6 +1678,71 @@ class TestPhoneEventClient(unittest.IsolatedAsyncioTestCase):
             )
         self.assertFalse(outcome.ok)
         self.assertEqual(outcome.status, "window_closed")
+
+    # ── Bounce mode: the server-verified answer probe ─────────────────
+
+    async def test_answered_probe_is_a_GET_to_the_attempt_scoped_path(self):
+        transport = _RecordingTransport(
+            200, {"ok": True, "answered": True, "terminal": False}
+        )
+        with patch.dict(phone.os.environ, {"WORKER_CONTEXT_SECRET": _GOOD_SECRET}):
+            probe = await self._client(transport).attempt_answered(_ATTEMPT_ID)
+        self.assertTrue(probe.ok)
+        self.assertTrue(probe.answered)
+        self.assertFalse(probe.terminal)
+        request = transport.requests[0]
+        self.assertEqual(request["method"], "GET")
+        self.assertEqual(
+            request["url"],
+            f"http://api.test/api/internal/phone/attempt/{_ATTEMPT_ID}/answered",
+        )
+        # A GET carries no body, and the bearer/correlation contract still holds.
+        self.assertIsNone(request["json"])
+        self.assertEqual(request["headers"]["Authorization"], f"Bearer {_GOOD_SECRET}")
+
+    async def test_answered_probe_reads_both_booleans_verbatim(self):
+        cases = [
+            ({"ok": True, "answered": False, "terminal": False}, (True, False, False)),
+            ({"ok": True, "answered": True, "terminal": False}, (True, True, False)),
+            ({"ok": True, "answered": False, "terminal": True}, (True, False, True)),
+        ]
+        for body, (ok, answered, terminal) in cases:
+            with self.subTest(body=body):
+                transport = _RecordingTransport(200, body)
+                with patch.dict(phone.os.environ, {"WORKER_CONTEXT_SECRET": _GOOD_SECRET}):
+                    probe = await self._client(transport).attempt_answered(_ATTEMPT_ID)
+                self.assertIs(probe.ok, ok)
+                self.assertIs(probe.answered, answered)
+                self.assertIs(probe.terminal, terminal)
+
+    async def test_answered_probe_short_secret_fails_closed_before_transport(self):
+        transport = _RecordingTransport()
+        with patch.dict(phone.os.environ, {"WORKER_CONTEXT_SECRET": "short"}):
+            probe = await self._client(transport).attempt_answered(_ATTEMPT_ID)
+        self.assertFalse(probe.ok)
+        self.assertFalse(probe.answered)
+        self.assertFalse(probe.terminal)
+        self.assertEqual(probe.error_category, "configuration")
+        self.assertEqual(transport.requests, [])
+
+    async def test_answered_probe_non_2xx_and_malformed_fail_closed(self):
+        cases = [
+            (500, {"ok": True, "answered": True}),   # 5xx → transport, counted
+            (403, {"ok": True, "answered": True}),   # 4xx → business_error
+            (200, {"ok": False}),                    # not ok → malformed
+            (200, {"answered": True}),               # missing ok → malformed
+            (200, "not a dict"),
+            (200, None),
+        ]
+        for status, body in cases:
+            with self.subTest(status=status, body=body):
+                transport = _RecordingTransport(status, body)
+                with patch.dict(phone.os.environ, {"WORKER_CONTEXT_SECRET": _GOOD_SECRET}):
+                    probe = await self._client(transport).attempt_answered(_ATTEMPT_ID)
+                # A failed reading is never mistaken for an answer or a terminal.
+                self.assertFalse(probe.ok)
+                self.assertFalse(probe.answered)
+                self.assertFalse(probe.terminal)
 
 
 # ── The scheduling tool ───────────────────────────────────────────────
@@ -2097,6 +2398,47 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(result.assessment_allowed)
         self.assertEqual(client.heartbeats, [])
+
+    # ── Answer-first origination (Plivo bounce), wired through the session ─
+
+    async def test_bounce_mode_answered_runs_the_full_screening(self):
+        """With PHONE_BOUNCE_MODE on and the server confirming an answer, the
+        session behaves exactly as it does today from the gate onward."""
+        client = FakeEventClient(answers=[phone.PhoneAnswerProbe(True, answered=True)])
+        with patch.dict(phone.os.environ, {"PHONE_BOUNCE_MODE": "true"}):
+            result, client, recording, delete, session, _ = await self._run_session(
+                answers=("Yes, that's fine.",), client=client,
+            )
+        self.assertTrue(result.assessment_allowed)
+        self.assertGreaterEqual(len(client.answered_calls), 1)
+        self.assertEqual(recording, [1])
+        # The lease is heartbeaten — this became a real conversation.
+        self.assertTrue(client.heartbeats)
+
+    async def test_bounce_mode_terminal_speaks_nothing_and_screens_nobody(self):
+        """The server reports the attempt terminal before an answer. The worker
+        speaks nothing, screens nobody, heartbeats nothing, and closes the room
+        — the no-participant-style outcome, wired end to end."""
+        client = FakeEventClient(answers=[phone.PhoneAnswerProbe(True, terminal=True)])
+        with patch.dict(phone.os.environ, {"PHONE_BOUNCE_MODE": "true"}):
+            result, client, recording, delete, session, persistence_spy = await self._run_session(
+                answers=("Yes, that's fine.",), client=client, close_after=False,
+            )
+        self.assertEqual(result.outcome, phone.GATE_NO_PARTICIPANT)
+        self.assertFalse(result.assessment_allowed)
+        self.assertEqual(recording, [])
+        self.assertEqual(client.heartbeats, [])
+        # No worker event was posted (not even call.answered), and nothing spoken.
+        self.assertEqual(client.calls, [])
+        if session is not None:
+            self.assertEqual(session.spoken, [])
+        delete.assert_awaited()
+
+    async def test_bounce_off_by_default_never_probes_the_answer(self):
+        """The default env → the answered probe is never called; today's flow."""
+        result, client, *_ = await self._run_session(answers=("Yes, sure.",))
+        self.assertTrue(result.assessment_allowed)
+        self.assertEqual(client.answered_calls, [])
 
     async def test_a_SCORED_screening_is_the_only_thing_that_claims_completion(self):
         """`assessment.completed` requires a VERIFIED assessment row.

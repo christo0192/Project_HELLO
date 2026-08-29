@@ -132,8 +132,11 @@ describe('1. the originate seam carries exactly what it must', () => {
 
   it('hands the seam a self-redacting number, never a string', async () => {
     const request = await originate();
-    expect(String(request.number)).toBe('[redacted]');
-    expect(JSON.stringify({ n: request.number })).toBe('{"n":"[redacted]"}');
+    // The canary always dials its fixed test number (never the bounce path).
+    expect(request.target.kind).toBe('number');
+    const number = request.target.kind === 'number' ? request.target.number : undefined;
+    expect(String(number)).toBe('[redacted]');
+    expect(JSON.stringify({ n: number })).toBe('{"n":"[redacted]"}');
   });
 
   it('CROSS-FILE PIN — the live client still hides the number from room state', () => {
@@ -145,18 +148,21 @@ describe('1. the originate seam carries exactly what it must', () => {
       'utf8',
     );
     expect(sip).toContain('hidePhoneNumber: true');
-    expect(sip).toContain('unwrapDialableNumber(request.number)');
+    expect(sip).toContain('unwrapDialableNumber(request.target.number)');
 
-    // EXACTLY ONE participant attribute, by exact key, and sourced from the
-    // request's own epoch. This is pinned HERE, against the real construction
-    // site, because `PhoneOriginateRequest` has no attributes field — so an
-    // injected fake cannot observe them, and a canary-side constant asserting
-    // their shape would be asserting a value nothing sends. An earlier revision
-    // exported exactly such a constant; it was deleted rather than tested.
-    expect(sip).toContain(
-      "participantAttributes: { [PHONE_EPOCH_ATTRIBUTE]: String(request.epoch) },");
-    const attributeSites = [...sip.matchAll(/participantAttributes:/g)].length;
-    expect(attributeSites, 'a second participant-attribute site appeared').toBe(1);
+    // The epoch attribute, by exact key, sourced from the request's own epoch.
+    // This is pinned HERE, against the real construction site, because
+    // `PhoneOriginateRequest` has no attributes field — so an injected fake
+    // cannot observe them, and a canary-side constant asserting their shape
+    // would be asserting a value nothing sends. Since answer-first origination
+    // (bounce mode) the attribute MAP is built into a local `participantAttributes`
+    // const — in the candidate path it holds only the epoch; in the bounce path
+    // it additionally carries the `xhelloattempt` correlation id — and that
+    // const is passed to the SDK by shorthand at exactly one option site.
+    expect(sip).toContain('[PHONE_EPOCH_ATTRIBUTE]: String(request.epoch)');
+    // Exactly one place hands attributes to the SDK: the shorthand option key.
+    const attributeOptionSites = [...sip.matchAll(/^\s*participantAttributes,\s*$/gm)].length;
+    expect(attributeOptionSites, 'the attribute map is passed to the SDK exactly once').toBe(1);
     // And the allowlist that key is indexed out of still holds exactly one name.
     expect(PHONE_EPOCH_ATTRIBUTE).toBe('phone_epoch');
     // And the unwrap still has exactly ONE call site in the whole package.

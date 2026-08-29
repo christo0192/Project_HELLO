@@ -1461,6 +1461,60 @@ paths:
               schema:
                 $ref: '#/components/schemas/PhoneWorkerError'
 
+  /api/internal/phone/attempt/{attemptId}/answered:
+    get:
+      tags: [phone]
+      operationId: readPhoneAttemptAnswered
+      summary: The answer-first ("bounce") readiness poll for the phone worker
+      description: Internal, service-authenticated. In answer-first ("bounce") mode LiveKit dials a Plivo voice-app SIP endpoint that answers INSTANTLY, so the LiveKit participant is present BEFORE the candidate has actually answered. The worker polls this before speaking the disclosure and returns two booleans derived from the attempt/engagement rows — no PII. answered is true when the attempt's answered_at is set OR its state is in the answered family; terminal is true when the engagement is terminal (stop polling). Same WORKER_CONTEXT_SECRET boundary as the other internal phone endpoints. Disabled by default (503 while phone screening is off).
+      security:
+        - workerBearer: []
+      parameters:
+        - name: attemptId
+          in: path
+          required: true
+          description: The attempt uuid.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: The answered/terminal state of the attempt.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneAnsweredStateResponse'
+        '400':
+          description: The attempt id is not a uuid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '401':
+          description: Worker bearer credential required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '403':
+          description: Worker bearer credential invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '500':
+          description: phone_answered_state_error — sanitized stable code.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '503':
+          description: Phone screening disabled, or the worker credential is not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+
   # ── Ashby integration ──────────────────────────────────────────────
   /api/integrations/livekit-phone/webhook:
     post:
@@ -1518,6 +1572,126 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PhoneWebhookError'
+
+  # ── Plivo answer-first ("bounce") callbacks ─────────────────────────
+  /api/integrations/plivo/answer:
+    post:
+      tags: [phone]
+      operationId: receivePlivoAnswer
+      summary: The Plivo SIP-endpoint answer callback — return the bridge XML
+      description: Answer-first ("bounce") mode. LiveKit dials a Plivo voice-app SIP endpoint that answers instantly; Plivo then asks THIS callback what to do, and the response is Plivo XML that dials the candidate and bridges. The only trust boundary is the Plivo V3 signature (X-Plivo-Signature-V3 plus nonce, HMAC over the request URL, sorted POST params and nonce). The correlation attempt id arrives on the forwarded SIP header param X-PH-HELLO-ATTEMPT (case-insensitive, validated as a uuid). The candidate number is resolved SERVER-SIDE, never from the request. Fails closed to a Hangup response on any missing/invalid/terminal precondition. Mounted before auth; gated on PHONE_BOUNCE_MODE plus a configured Plivo auth token. Disabled by default (503). The response body carries a phone number and is never logged.
+      parameters:
+        - name: X-Plivo-Signature-V3
+          in: header
+          required: true
+          schema: { type: string }
+        - name: X-Plivo-Signature-V3-Nonce
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '200':
+          description: Plivo XML — either the bridge <Dial> or a fail-closed <Hangup/>.
+          content:
+            text/xml:
+              schema: { type: string }
+        '503':
+          description: Bounce mode disabled or the Plivo auth token is not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+
+  /api/integrations/plivo/dial-status:
+    post:
+      tags: [phone]
+      operationId: receivePlivoDialStatus
+      summary: The Plivo <Dial> action callback — apply the ledger outcome
+      description: The Dial action callback. Plivo V3 signature validated. On DialStatus=answer it applies call.answered through the same apply_phone_event seam the worker uses (idempotent; the 0067 post-apply hook attaches recording/egress/stamp on the worker route). On busy/no-answer/failure/cancel it applies the outcome the system already charges via the provider sip.originate_* events (busy maps to sip.originate_rejected_busy, else sip.originate_timeout), keyed on the Plivo CallUUID so a redelivery dedups. Params carry phone numbers and are never echoed. Disabled by default (503).
+      parameters:
+        - name: X-Plivo-Signature-V3
+          in: header
+          required: true
+          schema: { type: string }
+        - name: X-Plivo-Signature-V3-Nonce
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '200':
+          description: The outcome was applied (or the request was acknowledged). Plivo XML.
+          content:
+            text/xml:
+              schema: { type: string }
+        '500':
+          description: The store threw; Plivo should redeliver (the deterministic id makes that safe).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '503':
+          description: Bounce mode disabled or the Plivo auth token is not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+
+  /api/integrations/plivo/hangup:
+    post:
+      tags: [phone]
+      operationId: receivePlivoHangup
+      summary: The Plivo app hangup callback — validated, logged, no transition
+      description: The application hangup callback. Plivo V3 signature validated. It performs NO state transition: a mid-call candidate hangup already drives the existing sip.participant_left path when the SIP leg leaves the LiveKit room. This callback exists so Plivo has a place to POST its hangup and so its receipt is observable; params are never echoed. Disabled by default (503).
+      parameters:
+        - name: X-Plivo-Signature-V3
+          in: header
+          required: true
+          schema: { type: string }
+        - name: X-Plivo-Signature-V3-Nonce
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '200':
+          description: Acknowledged.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok:
+                    type: boolean
+                    const: true
+                additionalProperties: false
+        '503':
+          description: Bounce mode disabled or the Plivo auth token is not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+
   /api/integrations/ashby/webhook:
     post:
       tags: [ashby]
@@ -6092,6 +6266,20 @@ components:
         error:
           type: string
           description: Stable snake_case code. Never a driver message and never a phone number.
+      additionalProperties: false
+
+    PhoneAnsweredStateResponse:
+      type: object
+      required: [ok, answered, terminal]
+      description: Answer-first ("bounce") readiness. Two booleans only — no PII. answered is true when the attempt's answered_at is set OR its state is in the answered family; terminal is true when the engagement is terminal (stop polling). Fails closed to answered=false, terminal=false when the read seam is absent.
+      properties:
+        ok:
+          type: boolean
+          const: true
+        answered:
+          type: boolean
+        terminal:
+          type: boolean
       additionalProperties: false
 
     PhoneWorkerEventRequest:

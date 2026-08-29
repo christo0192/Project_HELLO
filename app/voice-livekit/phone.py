@@ -44,6 +44,7 @@ import inspect
 import json
 import os
 import re
+import time as time_module
 from typing import Any, Awaitable, Callable, Optional
 
 from observability import StructuredLogger, get_correlation_id
@@ -491,6 +492,15 @@ ASSESSMENT_COMPLETE_PATH = "/api/internal/phone/assessment/complete"
 #: so every beat 404'd and the agent halted a live call after two of them. A
 #: cross-language test now pins this string against the Express mount.
 HEARTBEAT_PATH = "/api/internal/phone/attempt/heartbeat"
+#: Answer-first origination (Plivo bounce): the SERVER-VERIFIED answer probe.
+#: In bounce mode the SIP participant appears ~1s after dispatch — long before
+#: the real candidate has answered — so participant-present is no longer a proxy
+#: for "answered". This endpoint is the authority: the worker polls it and does
+#: not speak until it says `answered`. `{attempt_id}` is substituted at the call
+#: site; the id is a uuid, so the interpolation cannot inject a path. Under the
+#: one `/api/internal/phone` mount with every other worker call, and pinned by
+#: the same cross-language mount test as `HEARTBEAT_PATH`.
+ANSWERED_PATH = "/api/internal/phone/attempt/{attempt_id}/answered"
 
 # STRICT allowlist. The server enforces its own; this is the worker half, so a
 # typo fails here rather than becoming a 4xx the caller has to interpret.
@@ -513,6 +523,49 @@ _ERR_TRANSPORT = "transport"
 _ERR_BUSINESS = "business_error"
 _ERR_EVENT_NOT_ALLOWED = "event_not_allowed"
 _ERR_MALFORMED = "malformed_response"
+
+
+class PhoneAnswerProbe:
+    """One reading of the server-verified answer state (bounce mode).
+
+    THREE fields, and the caller must act on all three. Collapsing any two is
+    the defect this type exists to prevent:
+
+      * ``answered`` — the SERVER confirmed the real candidate is on the line.
+        Only this permits the disclosure/opening to be spoken.
+      * ``terminal`` — the attempt is over (no-answer, busy, HR-cancelled, a
+        provider hangup). The leg must stop WITHOUT speaking, exactly like the
+        no-participant path: nothing was said, so there is nothing to close out
+        conversationally.
+      * ``ok`` — whether this reading is TRUSTWORTHY at all. A transport
+        failure, a missing body, or a malformed one is ``ok=False`` with both
+        booleans False, so the poller keeps waiting (within its budget) rather
+        than mistaking a blip for either an answer or a terminal.
+
+    ``ok`` is never inferred from the booleans; a False reading says nothing
+    about whether the candidate answered, only that we could not find out.
+    """
+
+    __slots__ = ("ok", "answered", "terminal", "error_category")
+
+    def __init__(
+        self,
+        ok: bool,
+        *,
+        answered: bool = False,
+        terminal: bool = False,
+        error_category: str | None = None,
+    ) -> None:
+        self.ok = ok
+        self.answered = bool(answered)
+        self.terminal = bool(terminal)
+        self.error_category = error_category
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return (
+            f"PhoneAnswerProbe(ok={self.ok}, answered={self.answered}, "
+            f"terminal={self.terminal})"
+        )
 
 
 def _bounded_float(raw: Any, default: float, lo: float, hi: float) -> float:
@@ -561,8 +614,32 @@ def phone_answer_timeout_sec() -> float:
     A bound, not a target. Without it a candidate who goes quiet mid-answer
     leaves the leg waiting forever on a queue, holding a fleet slot and a live
     call, with no boundary to commit and nothing to end it.
+
+    Reused, deliberately, as the BOUNCE-MODE answer-wait ceiling: the wall-clock
+    bound on "how long the worker waits for the server-verified answer before
+    giving up" is the same shape as this one — a bound sized for a real human
+    picking up, not a target — and adding a second knob for it would be two
+    numbers an operator has to keep ordered for one fact.
     """
     return _bounded_float(os.getenv("PHONE_ANSWER_TIMEOUT_SEC"), 90.0, 5.0, 300.0)
+
+
+def phone_bounce_mode() -> bool:
+    """Answer-first origination (Plivo bounce) switch. Default OFF.
+
+    LiveKit's outbound SIP answer detection is broken server-side and kills
+    every live call ~45 s in. The bounce architecture works around it: LiveKit
+    dials a Plivo app endpoint that answers INSTANTLY, and Plivo then dials the
+    real candidate and bridges. The consequence for THIS worker is that the SIP
+    participant is present ~1 s after dispatch — long before the real candidate
+    has answered — so participant-present is no longer "answered".
+
+    When this is OFF the gate behaves byte-for-byte as it does today
+    (participant-present is treated as answered). When it is ON the gate waits
+    for the SERVER-VERIFIED answer (`attempt_answered`) before it speaks. Read
+    at the CALL SITE with the literal name so the env-contract scanner sees it.
+    """
+    return (os.getenv("PHONE_BOUNCE_MODE") or "").strip().lower() == "true"
 
 
 # ── P5: the heartbeat cadence envelope ────────────────────────────────
@@ -760,6 +837,98 @@ class PhoneEventClient:
                 error_category=_ERR_TRANSPORT, schema=hint,
             )
             return _ERR_TRANSPORT
+
+    async def _get(self, path: str, hint: str) -> Any | str:
+        """GET the internal API, mirroring ``_post``'s fail-closed contract.
+
+        Same bearer/correlation headers, same circuit breaker, same
+        transport-error taxonomy, and the SAME no-PII, fixed-string logging.
+        Returns the response object on a confirmed 2xx, or one of the
+        ``_ERR_*`` category strings on any failure. There is no body — a GET
+        carries none — so ``call_with_breaker`` is invoked with ``json_body``
+        left None.
+        """
+        headers = self._headers()
+        if headers is None:
+            _log.warn(
+                "unknown_event", error_type="phone_api_failed",
+                error_category=_ERR_CONFIGURATION, schema=hint,
+            )
+            return _ERR_CONFIGURATION
+        try:
+            transport = self._transport_factory()
+        except Exception:  # noqa: BLE001
+            _log.warn(
+                "unknown_event", error_type="phone_api_failed",
+                error_category=_ERR_TRANSPORT, schema=hint,
+            )
+            return _ERR_TRANSPORT
+        try:
+            return await call_with_breaker(
+                "GET",
+                f"{self._api_base}{path}",
+                breaker=self._breaker,
+                transport=transport,
+                headers=headers,
+                json_body=None,
+                endpoint_hint="unknown",
+                log_failures=False,
+            )
+        except ProviderError as exc:
+            _log.warn(
+                "unknown_event", error_type="phone_api_failed",
+                error_category=exc.category, schema=hint,
+            )
+            return _ERR_TRANSPORT
+        except BusinessError:
+            _log.warn(
+                "unknown_event", error_type="phone_api_failed",
+                error_category=_ERR_BUSINESS, schema=hint,
+            )
+            return _ERR_BUSINESS
+        except Exception:  # noqa: BLE001
+            _log.warn(
+                "unknown_event", error_type="phone_api_failed",
+                error_category=_ERR_TRANSPORT, schema=hint,
+            )
+            return _ERR_TRANSPORT
+
+    async def attempt_answered(self, attempt_id: str) -> PhoneAnswerProbe:
+        """Read the server-verified answer state for one attempt (bounce mode).
+
+        GET ``/attempt/{attempt_id}/answered``. The server owns the truth — in
+        bounce mode the Plivo webhook is what applies ``call.answered`` — and
+        this worker only reads it. THREE outcomes, mapped onto
+        ``PhoneAnswerProbe``:
+
+          * a confirmed 200 whose body is ``{ok:true, answered, terminal}`` —
+            the booleans are taken verbatim from the server.
+          * a 200 body that is missing, not a dict, or does not carry
+            ``ok:true`` — ``ok=False``, ``malformed_response``. The poller keeps
+            waiting: a garbled reading is not a terminal and is not an answer.
+          * a transport failure / non-2xx — ``ok=False`` with the transport
+            category. Same treatment: unknown, so keep waiting within budget.
+
+        No id and no body field is ever logged — the failure log carries only
+        the fixed category and the ``answered`` schema hint.
+        """
+        response = await self._get(
+            ANSWERED_PATH.format(attempt_id=str(attempt_id)), "answered",
+        )
+        if isinstance(response, str):
+            return PhoneAnswerProbe(False, error_category=response)
+        data = _response_json(response)
+        if not isinstance(data, dict) or data.get("ok") is not True:
+            _log.warn(
+                "unknown_event", error_type="phone_api_failed",
+                error_category=_ERR_MALFORMED, schema="answered",
+            )
+            return PhoneAnswerProbe(False, error_category=_ERR_MALFORMED)
+        return PhoneAnswerProbe(
+            True,
+            answered=data.get("answered") is True,
+            terminal=data.get("terminal") is True,
+        )
 
     async def post_event(
         self,
@@ -1859,6 +2028,114 @@ _OUTCOME_CLOSING: dict[str, str] = {
 GATE_NO_PARTICIPANT = "no_participant"
 GATE_PARTICIPANT_LEFT = "participant_left"
 
+# ── Bounce-mode answer wait ───────────────────────────────────────────
+# In answer-first origination the SIP participant is present ~1 s after
+# dispatch, before the real candidate has answered, so the gate cannot treat
+# participant-present as answered. It polls `attempt_answered` on this cadence
+# until the server confirms `answered`, or the attempt goes `terminal`, or the
+# wall-clock budget (`phone_answer_timeout_sec`) is spent. Only `answered`
+# proceeds to speak; the other two close the leg out like the no-participant
+# path — nothing was said, so there is nothing to say goodbye to.
+BOUNCE_POLL_INTERVAL_SEC = 1.0
+
+#: The three fixed categories a bounce answer-wait can give up on, logged so an
+#: operator can tell a genuine no-answer (`answer_wait_timeout`) from a provider
+#: terminal (`attempt_terminal`) from a plumbing fault (`answer_wait_transport`).
+#: Bounded on purpose: a give-up reason is one of exactly these.
+BOUNCE_GIVEUP_TIMEOUT = "answer_wait_timeout"
+BOUNCE_GIVEUP_TERMINAL = "attempt_terminal"
+BOUNCE_GIVEUP_TRANSPORT = "answer_wait_transport"
+
+
+async def wait_for_verified_answer(
+    *,
+    attempt_id: str,
+    client: PhoneEventClient,
+    timeout_sec: float,
+    poll_interval_sec: float = BOUNCE_POLL_INTERVAL_SEC,
+    sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+    monotonic: Callable[[], float] = time_module.monotonic,
+) -> str:
+    """Poll the server for the verified answer. Returns a bounded verdict.
+
+    Bounce mode only. The SIP leg is up but the real candidate may not have
+    answered, so this asks the server — the sole authority — every
+    ``poll_interval_sec`` until one of three things is true, and it returns a
+    fixed string for each:
+
+      * ``"answered"`` — the server confirmed a real human answered. The gate
+        may now speak.
+      * ``BOUNCE_GIVEUP_TERMINAL`` — the attempt is over. Give up WITHOUT
+        speaking; the dialer's terminal accounting owns the outcome.
+      * ``BOUNCE_GIVEUP_TIMEOUT`` — the wall-clock budget is spent with no
+        answer. Give up without speaking; this is the bounce-mode no-answer.
+
+    A transport / malformed reading is NEVER a give-up on its own: it is
+    retried on the next tick within the same budget, because "we could not
+    reach the server" is not "the candidate did not answer". Only when the
+    budget itself expires while the last readings were failing does it end —
+    and it ends as ``BOUNCE_GIVEUP_TIMEOUT`` regardless, because from the
+    candidate's side an answer that never arrived and an answer we could not
+    confirm are the same leg with nobody proven on it. The transport category
+    is surfaced to the CALLER's log via the returned reason only when the
+    budget expired on a transport failure specifically, so the two are still
+    distinguishable in the logs.
+
+    Clocks (`sleep`, `monotonic`) are injected so the whole wait is testable
+    without wall time. The budget is measured on `monotonic`, not by counting
+    ticks, so a slow API round trip cannot make the wait outlast its bound.
+    """
+    deadline = monotonic() + max(0.0, timeout_sec)
+    interval = poll_interval_sec if poll_interval_sec > 0 else BOUNCE_POLL_INTERVAL_SEC
+    last_was_transport = False
+
+    while True:
+        try:
+            probe = await client.attempt_answered(attempt_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            # A raising client is a fault, not a terminal and not an answer.
+            probe = PhoneAnswerProbe(False, error_category=_ERR_TRANSPORT)
+
+        if probe.ok and probe.answered:
+            return "answered"
+        if probe.ok and probe.terminal:
+            _log.info(
+                "unknown_event", error_type="phone_answer_wait",
+                error_category=BOUNCE_GIVEUP_TERMINAL,
+            )
+            return BOUNCE_GIVEUP_TERMINAL
+
+        # Not answered, not terminal: either "still ringing" (ok, both False)
+        # or an unconfirmed reading. Both mean keep waiting until the budget.
+        last_was_transport = not probe.ok
+
+        if monotonic() >= deadline:
+            reason = (
+                BOUNCE_GIVEUP_TRANSPORT if last_was_transport
+                else BOUNCE_GIVEUP_TIMEOUT
+            )
+            _log.warn(
+                "unknown_event", error_type="phone_answer_wait",
+                error_category=reason,
+            )
+            return reason
+
+        await sleep(interval)
+        if monotonic() >= deadline:
+            # The sleep itself can carry us past the deadline; re-check before
+            # spending another round trip so the bound is a real ceiling.
+            reason = (
+                BOUNCE_GIVEUP_TRANSPORT if last_was_transport
+                else BOUNCE_GIVEUP_TIMEOUT
+            )
+            _log.warn(
+                "unknown_event", error_type="phone_answer_wait",
+                error_category=reason,
+            )
+            return reason
+
 # The one status that means the API actually RECORDED the event.
 EVENT_STATUS_APPLIED = "applied"
 
@@ -1960,12 +2237,23 @@ async def run_phone_gate(
     speak_opening: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
     post_call_answered: bool = False,
     consent_reply_out: Optional[list[str]] = None,
+    bounce_mode: bool = False,
+    answer_wait_sec: float | None = None,
+    answer_poll_interval_sec: float = BOUNCE_POLL_INTERVAL_SEC,
+    answer_wait_sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
 ) -> PhoneGateResult:
     """Run the phone screening's opening, in the ONLY order that is safe.
 
     1. Wait for the SIP participant. Nothing is spoken, activated, timed or
        recorded before one exists — a ringing leg has no listener, and a silence
        timer started at originate measures the network, not the candidate.
+    1a. (BOUNCE MODE ONLY) Wait for the SERVER-VERIFIED answer. Under answer-first
+       origination the SIP participant is present ~1 s after dispatch, before the
+       real candidate has answered, so participant-present is not "answered".
+       The gate polls ``attempt_answered`` until the server confirms it; a
+       terminal attempt or a spent budget closes the leg exactly like the
+       no-participant path, having spoken nothing. Off by default — every other
+       caller's ordering is byte-identical.
     2. Post ``call.answered`` (BEST EFFORT) so the server can begin recording
        from the answer. This is behind ``post_call_answered`` so legacy callers
        and their tests keep their exact event ordering.
@@ -2003,6 +2291,42 @@ async def run_phone_gate(
             schema=GATE_NO_PARTICIPANT,
         )
         return PhoneGateResult(GATE_NO_PARTICIPANT, events=events, spoken=spoken)
+
+    # ── Bounce mode: WAIT for the server-verified answer before speaking ──
+    # In answer-first origination the SIP participant is present ~1 s after
+    # dispatch — the Plivo bridge answered instantly — but the REAL candidate
+    # has not. Speaking now would deliver the disclosure to a bridge, not a
+    # person. So the gate holds here until the server (which the Plivo webhook
+    # updates) confirms `answered`, and only THEN does anything get spoken.
+    #
+    # A terminal attempt or a spent budget closes the leg the SAME WAY the
+    # no-participant path does: nothing has been said, so there is nothing to
+    # close out conversationally, and the outcome belongs to the dialer's
+    # no-answer/terminal accounting rather than to a worker event. The silence
+    # machinery downstream never runs because the gate returns before the
+    # session's turn loop is ever handed a spoken opening.
+    if bounce_mode:
+        wait_budget = (
+            answer_wait_sec if answer_wait_sec is not None
+            else phone_answer_timeout_sec()
+        )
+        verdict = await wait_for_verified_answer(
+            attempt_id=attempt_id,
+            client=client,
+            timeout_sec=wait_budget,
+            poll_interval_sec=answer_poll_interval_sec,
+            sleep=answer_wait_sleep,
+        )
+        if verdict != "answered":
+            # `answer_wait_timeout`, `attempt_terminal`, or
+            # `answer_wait_transport` — all "nobody proven on the line". Speak
+            # nothing, post nothing, and hand back the no-participant-style
+            # outcome so the caller's room-close/reclaim path owns the rest.
+            _log.info(
+                "unknown_event", error_type="phone_gate_outcome",
+                schema=GATE_NO_PARTICIPANT, error_category=verdict,
+            )
+            return PhoneGateResult(GATE_NO_PARTICIPANT, events=events, spoken=spoken)
 
     # ── call.answered: recording-from-answer, BEST EFFORT ─────────────────
     # Posted the instant a participant is present and the session is started,

@@ -73,7 +73,26 @@ const RUNTIME_CONFIG_SOURCE = readFileSync(
   'utf8',
 );
 
-const ALL_CONFIG_SOURCE = `${CONFIG_SOURCE}\n${DIAL_CONFIG_SOURCE}\n${RUNTIME_CONFIG_SOURCE}`;
+/**
+ * FOURTH config file, for the same reason as the second and third.
+ *
+ * Answer-first origination ("bounce" mode) adds a Plivo webhook surface whose
+ * enablement gate reads `PHONE_BOUNCE_CALLER_ID` (the caller id the candidate
+ * sees). It lives OUTSIDE the domain core for the same reason the dial transport
+ * knobs do — the core may not name a provider — so its `PHONE_*` read is here,
+ * and this suite reads it so the "declared, exampled and READ SOMEWHERE"
+ * invariant stays whole. (The other three bounce knobs — `PHONE_BOUNCE_MODE`,
+ * `PHONE_BOUNCE_TRUNK_ID`, `PHONE_BOUNCE_SIP_USER` — are read in the dial config
+ * above; the PLIVO_* names are provider credentials, not PHONE_* knobs, so they
+ * are outside this bijection by construction.)
+ */
+const PLIVO_CONFIG_SOURCE = readFileSync(
+  fileURLToPath(new URL('../integrations/plivo-phone/config.ts', import.meta.url)),
+  'utf8',
+);
+
+const ALL_CONFIG_SOURCE =
+  `${CONFIG_SOURCE}\n${DIAL_CONFIG_SOURCE}\n${RUNTIME_CONFIG_SOURCE}\n${PLIVO_CONFIG_SOURCE}`;
 
 const SCHEMA = JSON.parse(
   readFileSync(fileURLToPath(new URL('../../../../config/environment.schema.json', import.meta.url)), 'utf8'),
@@ -318,6 +337,14 @@ describe('the env contract holds in BOTH directions', () => {
     'PHONE_AGENT_NAME',
     'PHONE_ORIGINATE_TIMEOUT_SECONDS',
     'PHONE_MAX_CALL_SECONDS',
+    // Answer-first origination ("bounce") transport knobs. The first three are
+    // read in `livekit-phone-dial/config.ts`; the caller id is read in
+    // `plivo-phone/config.ts`. All four are OFF/empty by default (bounce is a
+    // deliberate flip), so none is required in production.
+    'PHONE_BOUNCE_MODE',
+    'PHONE_BOUNCE_TRUNK_ID',
+    'PHONE_BOUNCE_SIP_USER',
+    'PHONE_BOUNCE_CALLER_ID',
     // P5 runtime cadence and batch knobs, read in `lib/phone-runtime/config.ts`.
     // Every one of them is a BOUND, not a switch: the two switches that decide
     // whether the loops run at all are PHONE_SCREENING_ENABLED and

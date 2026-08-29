@@ -1034,7 +1034,12 @@ describe('OpenAPI document integrity', () => {
     // widens the recruiter-facing surface at all.
     // 0067 adds ONE internal path — /assessment/gate-turns, the pre-consent
     // transcript writer on the same worker-authenticated surface.
-    expect(Object.keys(paths).length).toBe(103);
+    // Answer-first ("bounce") origination adds FOUR: the worker-authenticated
+    // GET /attempt/{attemptId}/answered readiness poll, and the three pre-auth
+    // Plivo callbacks (/plivo/answer, /plivo/dial-status, /plivo/hangup), all
+    // gated behind either the worker secret or the Plivo V3 signature — none
+    // widens the recruiter-facing surface.
+    expect(Object.keys(paths).length).toBe(107);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -1080,7 +1085,11 @@ describe('OpenAPI document integrity', () => {
     //   strict request/response pair of the pre-consent transcript writer. Both
     //   carry additionalProperties:false; the response deliberately documents
     //   only {ok, status} and never the turn text.
-    expect(Object.keys(schemas).length).toBe(217);
+    // Answer-first ("bounce") adds ONE: PhoneAnsweredStateResponse, the two-
+    //   boolean readiness answer of the worker poll (no PII). The three Plivo
+    //   callbacks document their bodies inline (XML strings / a bare ok) and
+    //   reuse PhoneWorkerError, so they add no named schema.
+    expect(Object.keys(schemas).length).toBe(218);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.
@@ -1280,12 +1289,25 @@ describe('auth boundary vs spec security model', () => {
     // 401 `authentication_required` rather than the middleware's
     // `authentication_error`.
     'POST /api/internal/phone/attempt/heartbeat',
+    // Answer-first ("bounce") readiness poll, same surface and same boundary:
+    // the worker GETs it behind WORKER_CONTEXT_SECRET, answering the worker's
+    // 401 `authentication_required` rather than the recruiter middleware's
+    // `authentication_error`.
+    'GET /api/internal/phone/attempt/{attemptId}/answered',
     // Ashby webhook: HMAC-gated (not recruiter-authenticated), mounted pre-auth.
     'POST /api/integrations/ashby/webhook',
     // LiveKit phone webhook: JWT-gated (not recruiter-authenticated), mounted
     // pre-auth. Public at this EXACT method+path only; every other method or
     // path under the prefix falls through to the auth middleware.
     'POST /api/integrations/livekit-phone/webhook',
+    // Plivo answer-first ("bounce") callbacks: Plivo-V3-signature-gated (not
+    // recruiter-authenticated), mounted pre-auth. Disabled by default, so they
+    // answer 503 `plivo_webhook_disabled` here rather than a recruiter 401 —
+    // they never fall through to the recruiter middleware, which is exactly the
+    // property this allowlist records.
+    'POST /api/integrations/plivo/answer',
+    'POST /api/integrations/plivo/dial-status',
+    'POST /api/integrations/plivo/hangup',
     'POST /api/livekit/grant/recording',
     // Phase 9 L4 exact public allowlist (method+path precise).
     'GET /api/status',

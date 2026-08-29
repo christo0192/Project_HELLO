@@ -576,9 +576,15 @@ describe('7. one invocation, one destination, at most one originate', () => {
     expect(canary1.length, 'the canary-1 suite was not found').toBeGreaterThanOrEqual(6);
     expect(canary1.filter(importsLive)).toEqual([]);
 
-    // And the pre-existing exemption is PINNED by name, so a new file joining
-    // it is a failure rather than an unremarked drift.
-    expect(scanned.filter(importsLive)).toEqual(['phone-dial-sip.test.ts']);
+    // And the exemption is PINNED by name, so a new file joining it is a
+    // failure rather than an unremarked drift. Two files legitimately construct
+    // the live client to inspect the arguments it hands the SDK — the P4 sip
+    // test and the answer-first ("bounce") dial test, which asserts the bounce
+    // target/user/attribute against the real live client with a mocked SDK.
+    // Neither is a CANARY-1 test (asserted above), so neither can place a call.
+    expect(scanned.filter(importsLive).sort()).toEqual(
+      ['phone-bounce-dial.test.ts', 'phone-dial-sip.test.ts'].sort(),
+    );
 
     // NON-VACUOUS: the matcher finds the one file that really does import it,
     // in the multi-line form that file actually uses.
