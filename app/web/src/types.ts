@@ -306,6 +306,13 @@ export interface CandidateConsentStatus {
   template_version: string | null;
   locale: string | null;
   required_consents: string[];
+  role_title?: string;
+}
+
+export interface CandidateConsentItem {
+  type: string;
+  label: string;
+  description?: string;
 }
 
 export interface CandidateConsentTemplate {
@@ -314,6 +321,15 @@ export interface CandidateConsentTemplate {
   title: string;
   body_md: string;
   required_consents: string[];
+  summary?: string;
+  consent_items?: CandidateConsentItem[];
+}
+
+export interface CandidatePreflightResult {
+  url: string;
+  livekit_token: string;
+  expires_at: string;
+  policy_version: 'voice-v1';
 }
 
 export interface CandidateConsentSubmitInput {

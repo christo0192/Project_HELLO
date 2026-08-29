@@ -37,6 +37,27 @@ import { validateInvite, STABLE_INVITE_ERROR } from '../lib/invite-validation.js
 
 const consentLogger = createLogger('candidate-consent');
 
+/** Bounded role context for the candidate shell; failures remain generic. */
+async function readInviteRoleTitle(sessionId: string): Promise<string | null> {
+  try {
+    const { data: session } = await supabase
+      .from('call_sessions')
+      .select('role_id')
+      .eq('id', sessionId)
+      .maybeSingle();
+    if (!session?.role_id) return null;
+    const { data: role } = await supabase
+      .from('roles')
+      .select('title')
+      .eq('id', session.role_id)
+      .maybeSingle();
+    const title = typeof role?.title === 'string' ? role.title.trim() : '';
+    return title.length > 0 && title.length <= 200 ? title : null;
+  } catch {
+    return null;
+  }
+}
+
 export const candidateConsentRouter = Router();
 
 /**
@@ -77,6 +98,7 @@ candidateConsentRouter.post(
         .maybeSingle();
       const requiredConsents = (template?.required_consents ?? []) as string[];
       const grantedConsents = Array.isArray(latest?.consents) ? latest.consents as string[] : [];
+      const roleTitle = await readInviteRoleTitle(invite.session_id);
       const hasConsent = Boolean(
         template &&
         latest &&
@@ -90,6 +112,7 @@ candidateConsentRouter.post(
         template_version: template?.version ?? null,
         locale: template?.locale ?? null,
         required_consents: requiredConsents,
+        ...(roleTitle ? { role_title: roleTitle } : {}),
       };
       res.json(body);
     } catch (error) {
@@ -111,7 +134,7 @@ candidateConsentRouter.get(
       const locale = (req.query.locale as string | undefined) ?? 'en-IN';
       const { data: template } = await supabase
         .from('consent_templates')
-        .select('version, locale, title, body_md, required_consents')
+        .select('version, locale, title, body_md, required_consents, summary, consent_items')
         .eq('is_active', true)
         .eq('locale', locale)
         .order('version', { ascending: false })
@@ -120,12 +143,34 @@ candidateConsentRouter.get(
 
       if (!template) return res.status(404).json({ error: 'consent_template_unavailable' });
 
+      const requiredConsents = (template.required_consents ?? []) as string[];
+      const rawItems = Array.isArray(template.consent_items) ? template.consent_items as unknown[] : [];
+      const consentItems = rawItems
+        .filter((item): item is { type: string; label: string; description?: string } => (
+          typeof item === 'object' && item !== null &&
+          typeof (item as { type?: unknown }).type === 'string' &&
+          typeof (item as { label?: unknown }).label === 'string'
+        ))
+        .map((item) => ({
+          type: item.type,
+          label: item.label.trim(),
+          ...(typeof item.description === 'string' && item.description.trim()
+            ? { description: item.description.trim() }
+            : {}),
+        }));
+      const completePresentation = consentItems.length === requiredConsents.length &&
+        requiredConsents.every((type, index) => consentItems[index]?.type === type) &&
+        consentItems.every((item) => item.label.length > 0);
       const body: ConsentTemplateResponse = {
         version: template.version,
         locale: template.locale,
         title: template.title,
         body_md: template.body_md,
-        required_consents: (template.required_consents ?? []) as string[],
+        required_consents: requiredConsents,
+        ...(typeof template.summary === 'string' && template.summary.trim()
+          ? { summary: template.summary.trim() }
+          : {}),
+        ...(completePresentation ? { consent_items: consentItems } : {}),
       };
       res.json(body);
     } catch (error) {

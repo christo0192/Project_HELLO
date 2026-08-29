@@ -35,6 +35,20 @@ export const inviteExchangeSchema = z
 
 export type InviteExchangeInput = z.infer<typeof inviteExchangeSchema>;
 
+/** Non-consuming candidate microphone/network preflight request. */
+export const invitePreflightSchema = z
+  .object({ invite_token: z.string().regex(/^[a-f0-9]{64}$/, 'invite token is invalid') })
+  .strict();
+
+export type InvitePreflightInput = z.infer<typeof invitePreflightSchema>;
+
+export interface InvitePreflightResponse {
+  url: string;
+  livekit_token: string;
+  expires_at: string;
+  policy_version: 'voice-v1';
+}
+
 /**
  * Response after exchanging an invite token.
  * Contains a short-lived opaque access grant and LiveKit connection details.

@@ -27,6 +27,7 @@
  * Consumed = consumed_at SET. Revoked = revoked_at SET.
  */
 
+import { randomUUID } from 'node:crypto';
 import { Router, Request, Response, NextFunction } from 'express';
 import { supabase } from '../lib/supabase.js';
 import {
@@ -38,15 +39,18 @@ import { validateBody } from '../lib/validation.js';
 import {
   inviteCreateSchema,
   inviteExchangeSchema,
+  invitePreflightSchema,
+  type InvitePreflightResponse,
 } from '../schemas/invites.js';
 import { createGrant } from '../lib/candidate-access.js';
 import { readMaintenanceState, maintenanceBlockedBody } from '../lib/maintenance.js';
 import type { InviteCreateResponse, InviteExchangeResponse } from '../schemas/invites.js';
-import { AccessToken } from 'livekit-server-sdk';
+import { AccessToken, RoomServiceClient, TrackSource } from 'livekit-server-sdk';
 import {
   provisionRoomForCreatedSession,
   requireLiveKitConfigured,
 } from '../lib/room-provisioning.js';
+import { validateInvite, STABLE_INVITE_ERROR } from '../lib/invite-validation.js';
 
 export const invitesRouter = Router();
 
@@ -228,6 +232,88 @@ async function checkExchangeConsentGate(invite: {
 
   return { ok: true };
 }
+
+// ── POST /api/livekit/preflight ──────────────────────────────────────
+// Candidate gets short-lived credentials for a disposable microphone-only
+// diagnostic room. This path never consumes the invite or touches the session.
+invitesRouter.post(
+  '/preflight',
+  validateBody(invitePreflightSchema),
+  async (req, res, next) => {
+    let diagnosticRoom: string | null = null;
+    try {
+      requireLiveKitConfigured();
+      const { invite_token } = req.body as { invite_token: string };
+      const result = await validateInvite(invite_token);
+      if (!result.ok) return res.status(404).json({ error: STABLE_INVITE_ERROR });
+
+      const maintenance = await readMaintenanceState();
+      if (!maintenance.ok || maintenance.enabled) {
+        return res.status(503).json(maintenanceBlockedBody());
+      }
+
+      const { data: latest } = await supabase
+        .from('consent_records')
+        .select('status, consents, expires_at')
+        .eq('candidate_id', result.invite.candidate_id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      const { data: template } = await supabase
+        .from('consent_templates')
+        .select('required_consents')
+        .eq('is_active', true)
+        .order('version', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      const granted = latest?.status === 'granted' &&
+        (!latest.expires_at || new Date(latest.expires_at) > new Date());
+      const required = Array.isArray(template?.required_consents)
+        ? template.required_consents as string[] : [];
+      const consents = Array.isArray(latest?.consents) ? latest.consents as string[] : [];
+      if (!granted || !template || required.length === 0 || required.some((type) => !consents.includes(type))) {
+        return res.status(409).json({ error: 'consent_required' });
+      }
+
+      const rooms = new RoomServiceClient(env.livekitUrl, env.livekitApiKey, env.livekitApiSecret);
+      diagnosticRoom = `preflight-${randomUUID()}`;
+      await rooms.createRoom({
+        name: diagnosticRoom,
+        emptyTimeout: 45,
+        departureTimeout: 15,
+        maxParticipants: 1,
+        metadata: JSON.stringify({ channel: 'preflight', schema: 1 }),
+      });
+
+      const expiresAt = new Date(Date.now() + 2 * 60 * 1000);
+      const token = new AccessToken(env.livekitApiKey, env.livekitApiSecret, {
+        identity: `preflight-${randomUUID()}`,
+        ttl: '2m',
+      });
+      token.addGrant({
+        room: diagnosticRoom,
+        roomJoin: true,
+        canPublish: true,
+        canPublishSources: [TrackSource.MICROPHONE],
+        canSubscribe: false,
+        canPublishData: false,
+      });
+      const response: InvitePreflightResponse = {
+        url: env.livekitUrl,
+        livekit_token: await token.toJwt(),
+        expires_at: expiresAt.toISOString(),
+        policy_version: 'voice-v1',
+      };
+      res.set('Cache-Control', 'no-store').json(response);
+    } catch (error) {
+      if (diagnosticRoom) {
+        await new RoomServiceClient(env.livekitUrl, env.livekitApiKey, env.livekitApiSecret)
+          .deleteRoom(diagnosticRoom).catch(() => undefined);
+      }
+      next(error);
+    }
+  },
+);
 
 // ── POST /api/livekit/exchange ───────────────────────────────────────
 // Candidate exchanges an invite token for a short-lived access grant.
