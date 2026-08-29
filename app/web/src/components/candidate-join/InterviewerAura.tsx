@@ -25,6 +25,7 @@ export function InterviewerAura({ level, speaking }: InterviewerAuraProps) {
       <span className="candidate-aura__halo candidate-aura__halo--outer" aria-hidden="true" />
       <span className="candidate-aura__halo candidate-aura__halo--middle" aria-hidden="true" />
       <span className="candidate-aura__halo candidate-aura__halo--inner" aria-hidden="true" />
+      <span className="candidate-aura__bubble" aria-hidden="true" />
       <span className="candidate-aura__logo-plate">
         <img src="/ik-logo.png" alt="Interview Kickstart" draggable={false} />
       </span>

@@ -63,6 +63,7 @@
 .candidate-shell { min-height: 100vh; padding: 28px 20px 36px; }
 .candidate-shell__inner { width: min(100%, 1120px); margin: 0 auto; }
 .candidate-status-card { margin: 100px auto 0; padding: 30px; }
+.candidate-status-card h1 { margin: 8px 0 12px; font-size: clamp(30px, 5vw, 48px); letter-spacing: -.045em; line-height: 1.06; }
 .candidate-brand { display: flex; align-items: center; gap: 12px; color: var(--c-ink); }
 .candidate-brand img { width: 42px; height: 42px; object-fit: contain; border-radius: 13px; background: #fff; padding: 5px; box-shadow: 0 5px 16px rgb(52 65 88 / 0.12); }
 .candidate-brand b { font-size: 15px; letter-spacing: -0.02em; }
@@ -110,19 +111,32 @@
 .candidate-landing__meta { display: flex; flex-wrap: wrap; gap: 8px; margin: 22px 0 32px; }
 .candidate-pill { padding: 8px 12px; border-radius: 999px; background: rgb(255 255 255 / .7); color: var(--c-ink-secondary); font-size: 12px; }
 .candidate-readiness { margin: 24px auto 0; padding: 32px; }
-.candidate-interview { display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, 360px); gap: 20px; width: min(100%, 1180px); margin: 24px auto 0; }
-.candidate-interview__stage { display: grid; min-height: min(720px, calc(100vh - 150px)); place-items: center; padding: 30px; }
-.candidate-interview__captions { display: flex; min-height: min(720px, calc(100vh - 150px)); flex-direction: column; padding: 25px; }
+.candidate-interview { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 360px); align-items: stretch; gap: 20px; width: min(100%, 1180px); margin: 32px auto 0; }
+.candidate-interview__stage { display: grid; min-height: min(720px, calc(100vh - 190px)); place-items: center; align-content: center; padding: 34px; }
+.candidate-interview__stage > div { display: flex; width: 100%; flex-direction: column; align-items: center; }
+.candidate-interview__stage .candidate-eyebrow { margin: 0; }
+.candidate-interview__stage .candidate-role { width: min(100%, 780px); text-align: center; }
+.candidate-interview__captions { display: flex; min-height: min(720px, calc(100vh - 190px)); flex-direction: column; padding: 28px; }
 .candidate-interview__captions h2 { margin: 0; font-size: 17px; letter-spacing: -.02em; }
 .candidate-caption-list { flex: 1; overflow: auto; margin-top: 18px; padding-right: 4px; }
 .candidate-caption { margin: 0 0 18px; color: var(--c-ink-secondary); font-size: 16px; line-height: 1.55; }
 .candidate-caption small { display: block; margin-bottom: 4px; color: var(--c-accent); font-size: 10px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
 .candidate-aura { --speech-level: 0; position: relative; display: grid; width: min(70vw, 440px); aspect-ratio: 1; place-items: center; }
-.candidate-aura__halo { position: absolute; border-radius: 50%; pointer-events: none; transform: scale(calc(1 + var(--speech-level) * .14)); transition: transform 100ms ease-out, opacity 180ms ease-out; }
-.candidate-aura__halo--outer { width: 100%; height: 100%; border: 1px solid rgb(78 107 166 / calc(.12 + var(--speech-level) * .2)); box-shadow: 0 0 65px rgb(78 107 166 / calc(.08 + var(--speech-level) * .24)); opacity: calc(.38 + var(--speech-level) * .62); }
-.candidate-aura__halo--middle { width: 78%; height: 78%; border: 1px solid rgb(57 138 162 / calc(.18 + var(--speech-level) * .24)); transform: scale(calc(1 + var(--speech-level) * .18)); opacity: calc(.46 + var(--speech-level) * .54); }
-.candidate-aura__halo--inner { width: 60%; height: 60%; background: radial-gradient(circle, rgb(169 202 214 / calc(.18 + var(--speech-level) * .32)), transparent 70%); transform: scale(calc(1 + var(--speech-level) * .22)); opacity: calc(.54 + var(--speech-level) * .46); }
-.candidate-aura__logo-plate { z-index: 1; display: grid; width: 126px; height: 126px; place-items: center; border: 1px solid rgb(255 255 255 / .9); border-radius: 36px; background: rgb(255 255 255 / .82); box-shadow: 0 18px 45px rgb(52 65 88 / .18), 0 0 calc(18px + var(--speech-level) * 42px) rgb(78 107 166 / calc(.10 + var(--speech-level) * .28)); }
+.candidate-aura__halo { position: absolute; border-radius: 50%; pointer-events: none; transform: scale(calc(1 + var(--speech-level) * .05)); transition: transform 260ms ease-out, opacity 320ms ease-out; }
+.candidate-aura__halo--outer { width: 100%; height: 100%; border: 1px solid rgb(78 107 166 / calc(.07 + var(--speech-level) * .1)); box-shadow: 0 0 65px rgb(78 107 166 / calc(.04 + var(--speech-level) * .1)); opacity: calc(.2 + var(--speech-level) * .32); }
+.candidate-aura__halo--middle { width: 78%; height: 78%; border: 1px solid rgb(57 138 162 / calc(.09 + var(--speech-level) * .12)); transform: scale(calc(1 + var(--speech-level) * .06)); opacity: calc(.24 + var(--speech-level) * .34); }
+.candidate-aura__halo--inner { width: 60%; height: 60%; background: radial-gradient(circle, rgb(169 202 214 / calc(.1 + var(--speech-level) * .18)), transparent 70%); transform: scale(calc(1 + var(--speech-level) * .08)); opacity: calc(.3 + var(--speech-level) * .35); }
+.candidate-aura__bubble { z-index: 1; position: absolute; width: 46%; aspect-ratio: 1.06; border-radius: 43% 57% 52% 48% / 52% 43% 57% 48%; background: radial-gradient(circle at 26% 24%, rgb(169 202 214 / .82), transparent 34%), radial-gradient(circle at 76% 25%, rgb(147 143 184 / .7), transparent 38%), radial-gradient(circle at 74% 78%, rgb(57 138 162 / .78), transparent 44%), radial-gradient(circle at 25% 78%, rgb(216 181 190 / .64), transparent 42%), conic-gradient(from 145deg, rgb(57 138 162 / .68), rgb(169 202 214 / .72), rgb(147 143 184 / .62), rgb(216 181 190 / .58), rgb(57 138 162 / .68)); box-shadow: 0 18px 55px rgb(78 107 166 / .16), inset 10px -8px 22px rgb(255 255 255 / .26); opacity: calc(.68 + var(--speech-level) * .2); transform: scale(calc(.94 + var(--speech-level) * .08)) rotate(calc(var(--speech-level) * 3deg)); transition: transform 280ms ease-out, opacity 360ms ease-out, border-radius 700ms ease-in-out; animation: candidate-bubble-idle 10s ease-in-out infinite alternate; }
+.candidate-aura[data-speaking="true"] .candidate-aura__bubble { animation: candidate-bubble-speaking 2.8s ease-in-out infinite alternate; }
+@keyframes candidate-bubble-idle {
+  from { border-radius: 43% 57% 52% 48% / 52% 43% 57% 48%; transform: scale(calc(.94 + var(--speech-level) * .08)) rotate(calc(var(--speech-level) * 3deg)); }
+  to { border-radius: 51% 49% 45% 55% / 44% 55% 45% 56%; transform: scale(calc(.97 + var(--speech-level) * .08)) rotate(calc(var(--speech-level) * 3deg + 2deg)); }
+}
+@keyframes candidate-bubble-speaking {
+  from { border-radius: 43% 57% 52% 48% / 52% 43% 57% 48%; transform: scale(calc(.97 + var(--speech-level) * .08)) rotate(calc(var(--speech-level) * 3deg)); }
+  to { border-radius: 48% 52% 55% 45% / 48% 50% 50% 52%; transform: scale(calc(1.02 + var(--speech-level) * .08)) rotate(calc(var(--speech-level) * 3deg - 2deg)); }
+}
+.candidate-aura__logo-plate { z-index: 2; display: grid; width: 126px; height: 126px; place-items: center; border: 1px solid rgb(255 255 255 / .9); border-radius: 36px; background: rgb(255 255 255 / .82); box-shadow: 0 18px 45px rgb(52 65 88 / .18), 0 0 calc(18px + var(--speech-level) * 42px) rgb(78 107 166 / calc(.10 + var(--speech-level) * .28)); }
 .candidate-aura__logo-plate img { width: 88px; height: 88px; object-fit: contain; }
 .candidate-aura__status { position: absolute; bottom: 7%; color: var(--c-ink-muted); font-size: 12px; font-weight: 700; }
 .candidate-interview__controls { display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 20px; }
@@ -132,9 +146,11 @@
 @media (prefers-reduced-motion: reduce) {
   .candidate-experience::before,
   .candidate-experience::after,
+  .candidate-aura__bubble,
   .candidate-aura__halo,
   .candidate-level-meter i { animation: none; transition: none; }
-  .candidate-aura__halo { transform: none !important; }
+  .candidate-aura__halo,
+  .candidate-aura__bubble { transform: none !important; }
 }
 @media (max-width: 760px) {
   .candidate-shell { padding: 18px 12px 24px; }
@@ -148,4 +164,5 @@
 @media (prefers-reduced-transparency: reduce), (forced-colors: active) {
   .candidate-glass-card, .candidate-meter-card, .candidate-interview__controls button { background: #fff; backdrop-filter: none; }
   .candidate-aura__halo { border-color: currentColor; box-shadow: none; }
+  .candidate-aura__bubble { background: Canvas; border: 1px solid currentColor; box-shadow: none; opacity: 1; }
 }

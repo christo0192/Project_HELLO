@@ -30,6 +30,7 @@ import { consumeReturnTo } from './lib/return-to';
 import { LoginPage } from './pages/LoginPage';
 import { UnauthorizedPage } from './pages/UnauthorizedPage';
 import { CandidateJoinPage } from './pages/CandidateJoinPage';
+import { CandidateScreeningEndedPage } from './pages/CandidateScreeningEndedPage';
 import { PrivacyNoticePage } from './pages/PrivacyNoticePage';
 import { RolesPage } from './pages/RolesPage';
 import { CandidatesPage } from './pages/CandidatesPage';
@@ -117,6 +118,7 @@ export default function App() {
         <Route path="/unauthorized" element={<UnauthorizedPage />} />
         <Route path="/privacy-notice" element={<PrivacyNoticePage />} />
         <Route path="/candidate/join" element={<CandidateJoinPage />} />
+        <Route path="/candidate/ended" element={<CandidateScreeningEndedPage />} />
         <Route path="/status" element={<StatusPage />} />
         <Route path="/appeal" element={<AppealPage />} />
 
