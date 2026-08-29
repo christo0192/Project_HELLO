@@ -2596,6 +2596,51 @@ paths:
               schema:
                 $ref: '#/components/schemas/SimpleError'
 
+  /api/livekit/preflight:
+    post:
+      tags: [livekit]
+      operationId: candidateLiveKitPreflight
+      summary: Run a non-consuming, microphone-only LiveKit readiness check
+      description: Creates a short-lived diagnostic room after invite and consent validation. It never consumes the invite, provisions the screening room, creates a grant, or starts recording.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InvitePreflightRequest'
+      responses:
+        '200':
+          description: Short-lived diagnostic connection credentials.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvitePreflightResponse'
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Stable invalid invite response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '409':
+          description: Consent is missing or invalid; invite remains reusable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '503':
+          description: Maintenance or diagnostic provider unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
   /api/livekit/exchange:
     post:
       tags: [livekit]
@@ -7691,6 +7736,31 @@ components:
           format: uuid
       additionalProperties: false
 
+    InvitePreflightRequest:
+      type: object
+      required: [invite_token]
+      properties:
+        invite_token:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+      additionalProperties: false
+
+    InvitePreflightResponse:
+      type: object
+      required: [url, livekit_token, expires_at, policy_version]
+      properties:
+        url:
+          type: string
+        livekit_token:
+          type: string
+        expires_at:
+          type: string
+          format: date-time
+        policy_version:
+          type: string
+          enum: [voice-v1]
+      additionalProperties: false
+
     InviteExchangeRequest:
       type: object
       required: [token]
@@ -8290,6 +8360,7 @@ components:
     CandidateConsentStatusResponse:
       type: object
       required: [has_consent, template_version, locale, required_consents]
+      description: Role title is included only when the invite-bound role resolves; no candidate PII is returned.
       properties:
         has_consent:
           type: boolean
@@ -8303,6 +8374,9 @@ components:
           type: array
           items:
             type: string
+        role_title:
+          type: string
+          maxLength: 200
       additionalProperties: false
 
     CandidateConsentTemplateResponse:
@@ -8321,6 +8395,24 @@ components:
           type: array
           items:
             type: string
+        summary:
+          type: string
+          maxLength: 500
+        consent_items:
+          type: array
+          minItems: 1
+          maxItems: 16
+          items:
+            type: object
+            required: [type, label]
+            properties:
+              type:
+                type: string
+              label:
+                type: string
+              description:
+                type: string
+            additionalProperties: false
       additionalProperties: false
 
     CandidateConsentSubmitRequest:
