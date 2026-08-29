@@ -638,10 +638,13 @@ def _room_metadata_from_context(ctx: JobContext) -> Any:
 def _worker_handles_room(room_name: str, room_metadata: Any) -> bool:
     """Does THIS worker own this room?
 
+    Diagnostic candidate preflight rooms are provider-only and must never
+    dispatch an interviewer, resolve session context, persist, or record.
     Symmetric, deliberately: the unnamed browser worker handles everything that
-    is not a phone room, and the named phone worker handles nothing else. A
-    worker dispatched into the other channel's room returns without connecting.
+    is not a phone room, and the named phone worker handles nothing else.
     """
+    if phone.is_preflight_room(room_metadata):
+        return False
     is_phone = phone.is_phone_room(room_name, room_metadata)
     return is_phone if _phone_agent_name() else not is_phone
 
