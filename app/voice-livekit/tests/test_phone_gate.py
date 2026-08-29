@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 import sys
 import types
 import unittest
@@ -4057,14 +4058,18 @@ class TestSilentRoomKillGuard(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("assessment.completed", client.event_types)
         self.assertTrue(self._log_categories(hooks["log"], "phone_room_teardown"))
 
-    async def test_a_disconnect_is_logged_nonterminal_and_still_names_the_teardown(self):
-        """F4 + F0c: an external room death (`disconnect`) posts NOTHING but LOGS.
+    async def test_a_disconnect_preserves_the_room_and_never_deletes(self):
+        """X2 (2026-08-29 CPU-starvation): a `disconnect` PRESERVES the room.
 
         The candidate's connection dies mid-leg: the native silence loop sees
-        the close and sets `disconnect`. The reclaim/reconnect machinery still
-        owns that reason — neither terminal event is posted. But the drop must
-        be observable (`phone_session_terminal`/`disconnect_nonterminal`) and
-        the teardown must still name its reason before the room is deleted.
+        the close and sets `disconnect`. Under the old contract this LOGGED and
+        then FELL THROUGH to `_close_phone_room`, deleting a LIVE room whose SIP
+        participant was still `callStatus: "active"` — killing exactly the room
+        LiveKit re-dispatch needs to resume the call. The new contract: log the
+        non-terminal drop, log `phone_room_preserved`, and RETURN without
+        deleting. The room's own `emptyTimeout` (120 s) garbage-collects it if
+        the candidate actually hung up. Neither terminal event is posted — the
+        reclaim/reconnect machinery still owns that reason.
         """
         ctx = FakeCtx(_PHONE_ROOM, participants=[_participant()])
         client = FakeEventClient()
@@ -4102,13 +4107,18 @@ class TestSilentRoomKillGuard(unittest.IsolatedAsyncioTestCase):
         # NON-TERMINAL: neither terminal event is posted for a disconnect.
         self.assertNotIn("assessment.completed", client.event_types)
         self.assertNotIn("assessment.aborted", client.event_types)
-        # The disconnect is logged non-terminal, and the teardown is named.
+        # The disconnect is logged non-terminal AND the room is logged preserved.
         self.assertIn(
             "disconnect_nonterminal",
             self._log_categories(spy, "phone_session_terminal"),
         )
-        self.assertTrue(self._log_categories(spy, "phone_room_teardown"))
-        delete.assert_awaited()
+        self.assertIn(
+            "disconnect", self._log_categories(spy, "phone_room_preserved"),
+        )
+        # The room is NOT torn down: no teardown log, no delete — LiveKit
+        # re-dispatch owns the live room, emptyTimeout owns a real hangup.
+        self.assertEqual(self._log_categories(spy, "phone_room_teardown"), [])
+        delete.assert_not_awaited()
 
 
 class _DisconnectingSession(_FakePhoneSession):
@@ -4329,6 +4339,214 @@ class TestToollessSessionFlow(unittest.IsolatedAsyncioTestCase):
         # The mode line is emitted once; we cannot see the module _log here, but
         # the committed keys prove the toolless path ran end to end.
         self.assertEqual(client.committed_keys, ["k1", "k2"])
+
+
+class _CapturingSession:
+    """An AgentSession stub that records the kwargs it was constructed with."""
+
+    last_kwargs: dict | None = None
+
+    def __init__(self, **kwargs):
+        _CapturingSession.last_kwargs = dict(kwargs)
+        self._handlers = {}
+
+    def on(self, event):
+        def deco(fn):
+            self._handlers[event] = fn
+            return fn
+        return deco
+
+    async def start(self, **kwargs):
+        return None
+
+
+class TestPhoneTurnDetectionFlag(unittest.TestCase):
+    """X8 — STT-endpointing offload flag. Rollback-first: local == today."""
+
+    def test_flag_parsing_local_is_default(self):
+        for value in ("", "local", "LOCAL", "  local  ", "garbage", "STT_MODE"):
+            with patch.dict(os.environ, {"PHONE_TURN_DETECTION": value}, clear=False):
+                self.assertEqual(
+                    phone.phone_turn_detection(), phone.PHONE_TURN_DETECTION_LOCAL,
+                )
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PHONE_TURN_DETECTION", None)
+            self.assertEqual(
+                phone.phone_turn_detection(), phone.PHONE_TURN_DETECTION_LOCAL,
+            )
+
+    def test_flag_parsing_stt(self):
+        for value in ("stt", "STT", "  stt  "):
+            with patch.dict(os.environ, {"PHONE_TURN_DETECTION": value}, clear=False):
+                self.assertEqual(
+                    phone.phone_turn_detection(), phone.PHONE_TURN_DETECTION_STT,
+                )
+
+    def test_phone_session_gets_stt_turn_detection_when_flagged(self):
+        _CapturingSession.last_kwargs = None
+        with patch.object(agent_mod, "AgentSession", _CapturingSession), \
+             patch.dict(os.environ, {"PHONE_TURN_DETECTION": "stt"}, clear=False):
+            agent_mod._build_phone_provider_session()
+        self.assertEqual(_CapturingSession.last_kwargs.get("turn_detection"), "stt")
+
+    def test_phone_session_has_no_turn_detection_when_local(self):
+        _CapturingSession.last_kwargs = None
+        with patch.object(agent_mod, "AgentSession", _CapturingSession), \
+             patch.dict(os.environ, {"PHONE_TURN_DETECTION": "local"}, clear=False):
+            agent_mod._build_phone_provider_session()
+        self.assertNotIn("turn_detection", _CapturingSession.last_kwargs)
+
+    def test_browser_session_never_gets_turn_detection(self):
+        # Even with the flag set to stt, the browser (non-phone) build path is
+        # phone_mode=False, so it must never receive the override.
+        _CapturingSession.last_kwargs = None
+        with patch.object(agent_mod, "AgentSession", _CapturingSession), \
+             patch.dict(os.environ, {"PHONE_TURN_DETECTION": "stt"}, clear=False):
+            agent_mod._build_provider_session()
+        self.assertNotIn("turn_detection", _CapturingSession.last_kwargs)
+
+    def test_mode_is_logged_once_at_phone_session_start(self):
+        spy = MagicMock(wraps=agent_mod._log)
+        with patch.object(agent_mod, "AgentSession", _CapturingSession), \
+             patch.object(agent_mod, "_log", spy), \
+             patch.dict(os.environ, {"PHONE_TURN_DETECTION": "stt"}, clear=False):
+            agent_mod._build_phone_provider_session()
+        detection_logs = [
+            c.kwargs.get("error_category")
+            for c in spy.info.call_args_list
+            if c.kwargs.get("error_type") == "phone_turn_detection"
+        ]
+        self.assertEqual(detection_logs, ["stt"])
+
+
+class TestPhoneRoleDeterminism(unittest.TestCase):
+    """X3 — the role reaches every per-turn instruction, verbatim."""
+
+    def _question(self):
+        return phone.PhonePlanQuestion(
+            key="k1", text="Tell me about your last role.",
+            mandatory=True, hint=None,
+        )
+
+    def test_per_turn_instruction_contains_the_verbatim_title(self):
+        title = "Sales Advisor / Program Advisor - Synthetic Canary"
+        text = agent_mod.phone_question_instructions(self._question(), title)
+        self.assertIn(f'The role is exactly: "{title}"', text)
+        self.assertIn("never invent a job title", text)
+
+    def test_no_role_line_when_title_absent(self):
+        for title in (None, "", "   "):
+            text = agent_mod.phone_question_instructions(self._question(), title)
+            self.assertNotIn("The role is exactly", text)
+
+    def test_default_arg_is_byte_identical_to_no_role(self):
+        # The browser/legacy callers pass no role — the default must add nothing.
+        q = self._question()
+        self.assertEqual(
+            agent_mod.phone_question_instructions(q),
+            agent_mod.phone_question_instructions(q, None),
+        )
+
+    def test_role_turn_line_helper(self):
+        self.assertIsNone(agent_mod._role_turn_line(None))
+        self.assertIsNone(agent_mod._role_turn_line("   "))
+        line = agent_mod._role_turn_line("Data Engineer")
+        self.assertIn('"Data Engineer"', line)
+
+    def test_apply_instructions_noop_mutation_does_not_falsely_alarm(self):
+        """X3b end-to-end: a fake agent whose update_instructions is a no-op
+        (does not update the readable property) still gets the role into the
+        DELIVERED text, so the verifier reads it back from what we delivered and
+        does NOT falsely alarm. (`system_prompt` is patched to a role-bearing
+        string because `test_agent.py` swaps `sys.modules['prompting']` for a
+        mock at import time — the same reason the sibling `_apply_phone_
+        instructions` test patches the builder rather than asserting its output.)
+        """
+        role = "Sales Advisor / Program Advisor - Synthetic Canary"
+        st = phone.PhoneAssessmentState(ok=True)
+        st.candidate_name = "Test Candidate"
+        st.role_title = role
+        st.role_focus = "advising"
+
+        applied = {}
+
+        class _Agent:
+            instructions = "base prompt with no role"  # stays stale (no-op)
+
+            async def update_instructions(self, text):
+                applied["text"] = text  # routed to live activity, not property
+
+        spy = MagicMock(wraps=agent_mod._log)
+        built = f"You are Christy screening for the {role} role."
+
+        async def run():
+            with patch.object(agent_mod, "_log", spy), \
+                 patch.object(agent_mod, "system_prompt", return_value=built):
+                return await agent_mod._apply_phone_instructions(_Agent(), st)
+
+        ok = asyncio.run(run())
+        self.assertTrue(ok)
+        self.assertIn(role, applied["text"])
+        categories = [
+            c.kwargs.get("error_category")
+            for c in list(spy.info.call_args_list) + list(spy.warn.call_args_list)
+            if c.kwargs.get("error_type") == "phone_instructions_not_applied"
+        ]
+        self.assertEqual(categories, [])
+
+    def test_apply_instructions_flags_when_builder_drops_the_role(self):
+        """X3b: if the delivered prompt does NOT name the role (and the readable
+        property is stale), the verifier logs loudly — this is the observability
+        that was missing when a live call spoke the wrong job title."""
+        st = phone.PhoneAssessmentState(ok=True)
+        st.candidate_name = "Test Candidate"
+        st.role_title = "Data Engineer"
+        st.role_focus = "pipelines"
+
+        class _Agent:
+            instructions = "base prompt with no role"
+
+            async def update_instructions(self, text):
+                return None
+
+        spy = MagicMock(wraps=agent_mod._log)
+
+        async def run():
+            with patch.object(agent_mod, "_log", spy), \
+                 patch.object(agent_mod, "system_prompt", return_value="no title here"):
+                return await agent_mod._apply_phone_instructions(_Agent(), st)
+
+        asyncio.run(run())
+        categories = [
+            c.kwargs.get("error_category")
+            for c in list(spy.info.call_args_list) + list(spy.warn.call_args_list)
+            if c.kwargs.get("error_type") == "phone_instructions_not_applied"
+        ]
+        self.assertIn("role_title_absent", categories)
+
+
+class TestTeardownLabelVocabulary(unittest.TestCase):
+    """X7b — the teardown log has its own bounded vocabulary."""
+
+    def test_halt_reasons_are_distinguishable(self):
+        # A candidate goodbye and a crash must NOT both read `other_failure`.
+        self.assertEqual(
+            agent_mod._teardown_label(phone.HALT_CANDIDATE_ENDED), "candidate_ended",
+        )
+        self.assertEqual(
+            agent_mod._teardown_label(phone.HALT_CALLBACK_SCHEDULED), "callback_scheduled",
+        )
+        self.assertEqual(
+            agent_mod._teardown_label("disconnect"), "transport_disconnect",
+        )
+        self.assertEqual(
+            agent_mod._teardown_label(phone.HALT_MALFORMED_EXCHANGE), "malformed_exchange",
+        )
+        self.assertEqual(agent_mod._teardown_label("completed"), "conversation_complete")
+        self.assertEqual(agent_mod._teardown_label(None), "conversation_complete")
+
+    def test_unknown_reason_falls_back_to_other_failure(self):
+        self.assertEqual(agent_mod._teardown_label("something_new"), "other_failure")
 
 
 if __name__ == "__main__":

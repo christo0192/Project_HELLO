@@ -567,6 +567,22 @@ class TestClassifyCloseEvent(unittest.TestCase):
         result = agent_mod._classify_close_event(event)
         self.assertIsNone(result)
 
+    def test_close_reason_error_is_provider_error_not_clean_close(self):
+        """X7a: the 1.6.4 `CloseReason.ERROR` value ("error") — the shape a
+        Sarvam STT websocket death (close 1006 keepalive timeout) produces — is
+        classified as `provider_error`, never `None` (clean_close)."""
+        # Reason "error" WITH a provider error object attached, as the SDK emits.
+        event = FakeCloseEvent(
+            error=RuntimeError("STTError: websocket closed 1006"),
+            reason="CloseReason.ERROR",
+        )
+        self.assertEqual(agent_mod._classify_close_event(event), "provider_error")
+
+    def test_close_reason_error_bare_enum_string_is_provider_error(self):
+        """The bare enum value form is classified identically."""
+        event = FakeCloseEvent(error=None, reason=FakeAgentSessionCloseReason("error"))
+        self.assertEqual(agent_mod._classify_close_event(event), "provider_error")
+
 
 class TestEntrypointActivationFailClosed(unittest.TestCase):
     """Non-SUCCESS activation aborts before provider construction."""
@@ -741,6 +757,80 @@ class TestWorkerContextResolveRetry(unittest.IsolatedAsyncioTestCase):
         self.assertIs(result, wc)
         self.assertEqual(
             agent_mod.persistence.resolve_worker_context.await_count, 1
+        )
+
+
+class TestRoleInstructionVerification(unittest.TestCase):
+    """X3b: the verifier logs loudly only when the role landed in NEITHER the
+    readable instructions property NOR the text we delivered. (Integration
+    through `_apply_phone_instructions` with the REAL prompt lives in
+    test_phone_gate.py, where prompting is not stubbed.)"""
+
+    @staticmethod
+    def _categories(spy, error_type):
+        calls = list(spy.info.call_args_list) + list(spy.warn.call_args_list)
+        return [
+            c.kwargs.get("error_category")
+            for c in calls
+            if c.kwargs.get("error_type") == error_type
+        ]
+
+    def test_no_alarm_when_delivered_text_carries_the_role(self):
+        """Stale property (no-op mutation) but the delivered text has the role
+        verbatim → no false alarm."""
+
+        class _Agent:
+            instructions = "base prompt with no role"  # stale (no-op mutation)
+
+        spy = MagicMock(wraps=agent_mod._log)
+        with patch.object(agent_mod, "_log", spy):
+            agent_mod._verify_role_instructions_applied(
+                _Agent(), "Data Engineer",
+                "delivered prompt naming the Data Engineer role",
+            )
+        self.assertEqual(
+            self._categories(spy, "phone_instructions_not_applied"), [],
+        )
+
+    def test_no_alarm_when_no_role_to_assert(self):
+        class _Agent:
+            instructions = "base"
+
+        spy = MagicMock(wraps=agent_mod._log)
+        with patch.object(agent_mod, "_log", spy):
+            agent_mod._verify_role_instructions_applied(_Agent(), None, "text")
+            agent_mod._verify_role_instructions_applied(_Agent(), "  ", "text")
+        self.assertEqual(
+            self._categories(spy, "phone_instructions_not_applied"), [],
+        )
+
+    def test_logs_when_role_missing_from_both_surfaces(self):
+        class _Agent:
+            instructions = "base prompt without the title"
+
+        spy = MagicMock(wraps=agent_mod._log)
+        with patch.object(agent_mod, "_log", spy):
+            agent_mod._verify_role_instructions_applied(
+                _Agent(), "Data Engineer", "delivered text also lacks it",
+            )
+        self.assertIn(
+            "role_title_absent",
+            self._categories(spy, "phone_instructions_not_applied"),
+        )
+
+    def test_reads_the_role_from_the_property_when_present(self):
+        """When the readable property DID take the mutation, that is enough."""
+
+        class _Agent:
+            instructions = "live prompt naming the Data Engineer role"
+
+        spy = MagicMock(wraps=agent_mod._log)
+        with patch.object(agent_mod, "_log", spy):
+            agent_mod._verify_role_instructions_applied(
+                _Agent(), "Data Engineer", "delivered text lacks it entirely",
+            )
+        self.assertEqual(
+            self._categories(spy, "phone_instructions_not_applied"), [],
         )
 
 

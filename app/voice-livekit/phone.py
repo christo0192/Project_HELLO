@@ -690,6 +690,36 @@ def phone_turn_mode() -> str:
     return PHONE_TURN_MODE_TOOLLESS if value == PHONE_TURN_MODE_TOOLLESS else PHONE_TURN_MODE_TOOLFIRST
 
 
+# The two endpointing shapes the phone lane can run (X8, 2026-08-29).
+PHONE_TURN_DETECTION_LOCAL = "local"
+PHONE_TURN_DETECTION_STT = "stt"
+
+
+def phone_turn_detection() -> str:
+    """Endpointing mode for the PHONE session only. Default `local`.
+
+    `local` (DEFAULT, and what any unknown or empty value falls back to) is
+    today's behavior byte-for-byte: the SDK's default local endpointing (Silero
+    VAD + the v1-mini EOU model). When this reader returns `local` the phone
+    AgentSession is constructed with no `turn_detection` override, which is
+    exactly what it does today — that is the rollback story: unset the var (or
+    set it back to `local`) and the byte-path is restored.
+
+    `stt`: delegate endpointing to the STT provider by passing
+    `turn_detection="stt"` into the phone AgentSession. Sarvam's STT websocket
+    already runs with `vad_signals=true`, so provider endpointing signals exist;
+    this offloads the end-of-utterance decision from the worker's own VAD/EOU
+    compute, which is the load that backed up under CPU starvation on 2026-08-29
+    (VAD backlog 67 s). The BROWSER session is never given this — the flag is
+    read only on the phone construction path.
+
+    Read at the call site with the literal name so the env-contract scanner sees
+    it.
+    """
+    value = (os.getenv("PHONE_TURN_DETECTION") or "").strip().lower()
+    return PHONE_TURN_DETECTION_STT if value == PHONE_TURN_DETECTION_STT else PHONE_TURN_DETECTION_LOCAL
+
+
 # ── P5: the heartbeat cadence envelope ────────────────────────────────
 #
 # THE SERVER DICTATES THE CADENCE, because the server owns the lease. These
