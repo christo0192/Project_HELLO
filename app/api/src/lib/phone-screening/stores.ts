@@ -313,6 +313,7 @@ function projectAssessmentState(
     nextKey: row && 'next_key' in row ? (str(row, 'next_key') ?? null) : undefined,
     completedKeys,
     turns: Array.isArray(rawTurns) ? turns : undefined,
+    gateRecorded: bool(row, 'gate_recorded'),
     assessmentExists: bool(row, 'assessment_exists'),
     alreadyScored: bool(row, 'already_scored'),
     planComplete: bool(row, 'plan_complete'),

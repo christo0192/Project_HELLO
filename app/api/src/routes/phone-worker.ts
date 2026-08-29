@@ -209,6 +209,15 @@ const assessmentStartSchema = z
   })
   .strict();
 
+// The read-only state probe a re-dispatched leg makes BEFORE the gate speaks,
+// so it can tell an already-consented conversation apart from a fresh one. Takes
+// only the session id — it writes nothing and starts nothing.
+const assessmentStateSchema = z
+  .object({
+    session_id: z.string().regex(UUID_RE),
+  })
+  .strict();
+
 const assessmentProbeSchema = z
   .object({
     session_id: z.string().regex(UUID_RE),
@@ -429,6 +438,10 @@ export function sanitizeAssessmentState(state: PhoneAssessmentState): Record<str
       speaker: t.speaker,
       text: t.text,
     })),
+    // The durable-consent signal a re-dispatched leg reads to skip the gate:
+    // gate turns already recorded ⇒ disclosure+consent already ran. A boolean,
+    // never a turn text, so nothing of the gate transcript itself crosses.
+    gate_recorded: state.gateRecorded === true,
     assessment_exists: state.assessmentExists === true,
     already_scored: state.alreadyScored === true,
   };
@@ -1030,6 +1043,33 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
         // `assessment.completed` — which 0044 accepts precisely because the
         // row the RPC just found is there. It is forwarded verbatim, like the
         // rest; this route decides nothing the database has already decided.
+        return res.json({ ok: false, status: state.status });
+      }
+      return res.json({ ok: true, status: 'ok', ...sanitizeAssessmentState(state) });
+    } catch {
+      return res.status(500).json({ ok: false, status: 'phone_assessment_error' });
+    }
+  });
+
+  // ── POST /assessment/state ────────────────────────────────────────
+  // READ-ONLY. A re-dispatched leg (worker deploy/crash mid-call) calls this
+  // before the gate speaks, so it can tell an already-consented conversation
+  // apart from a fresh one and NOT ask for consent a second time (2026-08-29).
+  // It binds nothing, activates nothing and writes nothing — it forwards
+  // `get_phone_assessment_state`, whose `gate_recorded` flag is the durable
+  // proof that the gate already ran. A fresh call has no plan yet, so this
+  // returns `plan_missing` and the worker runs the full gate as before.
+  router.post('/assessment/state', requireWorkerPhoneAuth, async (req, res) => {
+    try {
+      if (!config().screeningEnabled) {
+        return res.status(503).json({ ok: false, error: 'phone_screening_disabled' });
+      }
+      const parsed = assessmentStateSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ ok: false, status: 'invalid_request' });
+      }
+      const state = await stores().assessmentState({ sessionId: parsed.data.session_id });
+      if (state.status !== 'ok') {
         return res.json({ ok: false, status: state.status });
       }
       return res.json({ ok: true, status: 'ok', ...sanitizeAssessmentState(state) });

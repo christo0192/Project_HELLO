@@ -191,7 +191,7 @@ const TURN_BODY = {
   ],
 };
 
-const PATHS = ['/assessment/start', '/assessment/turn', '/assessment/complete'] as const;
+const PATHS = ['/assessment/start', '/assessment/state', '/assessment/turn', '/assessment/complete'] as const;
 
 // ═══════════════════════════════════════════════════════════════════════
 describe('the assessment endpoints sit behind the SAME worker boundary', () => {
@@ -330,6 +330,54 @@ describe('POST /assessment/start', () => {
   it('a store failure becomes a sanitized code, never a driver message', async () => {
     const h = build({ storeThrows: true });
     const res = await post(h, '/assessment/start', START_BODY);
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ ok: false, status: 'phone_assessment_error' });
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+describe('POST /assessment/state — the read-only durable-consent probe', () => {
+  const STATE_BODY = { session_id: SESSION };
+
+  it('is READ-ONLY: it calls assessmentState and NEVER startAssessment', async () => {
+    const h = build({ states: [state({ gateRecorded: true })] });
+    const res = await post(h, '/assessment/state', STATE_BODY);
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.gate_recorded).toBe(true);
+    // The whole point: no binding, no activation, no plan snapshot.
+    expect(h.assessmentState).toHaveBeenCalledWith({ sessionId: SESSION });
+    expect(h.startAssessment).not.toHaveBeenCalled();
+    expect(h.order).toEqual(['state']);
+  });
+
+  it('forwards a refusal (a fresh call has no plan yet) so the leg gates', async () => {
+    const h = build({ states: [{ status: 'plan_missing' } as PhoneAssessmentState] });
+    const res = await post(h, '/assessment/state', STATE_BODY);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: false, status: 'plan_missing' });
+    expect(res.body.plan).toBeUndefined();
+  });
+
+  it('takes ONLY a session id — attempt_id or extra keys are refused', async () => {
+    for (const body of [
+      {},
+      { session_id: 'not-a-uuid' },
+      { session_id: SESSION, attempt_id: ATTEMPT },
+      { session_id: SESSION, extra: 1 },
+    ]) {
+      const h = build();
+      const res = await post(h, '/assessment/state', body);
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ ok: false, status: 'invalid_request' });
+      expect(h.order).toEqual([]);
+    }
+  });
+
+  it('a store failure becomes a sanitized code, never a driver message', async () => {
+    const h = build();
+    h.assessmentState.mockRejectedValueOnce(new Error('driver detail: session 42'));
+    const res = await post(h, '/assessment/state', STATE_BODY);
     expect(res.status).toBe(500);
     expect(res.body).toEqual({ ok: false, status: 'phone_assessment_error' });
   });
@@ -732,6 +780,16 @@ describe('the response body is a SUBSET, asserted structurally', () => {
     expect(scored.assessment_exists).toBe(true);
     const live = sanitizeAssessmentState(state());
     expect(live.already_scored).toBe(false);
+  });
+
+  it('the projection carries `gate_recorded` — the durable-consent signal', () => {
+    // A re-dispatched leg reads this to skip a second consent ask (2026-08-29).
+    // It is a boolean derived in SQL, never a turn text, so nothing of the gate
+    // transcript itself crosses.
+    const consented = sanitizeAssessmentState(state({ gateRecorded: true }));
+    expect(consented.gate_recorded).toBe(true);
+    const fresh = sanitizeAssessmentState(state());
+    expect(fresh.gate_recorded).toBe(false);
   });
 
   it('CONTROL — the projection is not simply empty', () => {

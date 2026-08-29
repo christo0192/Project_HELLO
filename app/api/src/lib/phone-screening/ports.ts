@@ -448,6 +448,13 @@ export interface PhoneAssessmentState {
   readonly nextKey?: string | null;
   readonly completedKeys?: readonly string[];
   readonly turns?: readonly PhoneAssessmentTurn[];
+  /**
+   * The gate has recorded its turns for this session — the single side effect
+   * of `commit_phone_gate_turns`, and therefore the durable proof that
+   * disclosure+consent already ran. A re-dispatched leg reads this to SKIP the
+   * consent gate instead of asking a second time mid-call (2026-08-29 replay).
+   */
+  readonly gateRecorded?: boolean;
   readonly assessmentExists?: boolean;
   /**
    * The session is `completed` AND a phone-sourced assessment exists — a

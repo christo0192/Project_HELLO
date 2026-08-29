@@ -489,6 +489,9 @@ APPOINTMENTS_PATH = "/api/internal/phone/appointments"
 CALLBACK_PROPOSE_PATH = "/api/internal/phone/callbacks/propose"
 CALLBACK_CONFIRM_PATH = "/api/internal/phone/callbacks/confirm"
 ASSESSMENT_START_PATH = "/api/internal/phone/assessment/start"
+#: READ-ONLY state probe. A re-dispatched leg consults this before the gate
+#: speaks so it can skip a second consent ask; it binds and writes nothing.
+ASSESSMENT_STATE_PATH = "/api/internal/phone/assessment/state"
 CONSENT_START_PATH = "/api/internal/phone/assessment/consent-start"
 ASSESSMENT_TURN_PATH = "/api/internal/phone/assessment/turn"
 #: The gate transcript: the exact opening the bot spoke and the candidate's
@@ -1240,6 +1243,31 @@ class PhoneEventClient:
             return PhoneAssessmentState(False, _ERR_MALFORMED)
         return PhoneAssessmentState.parse(data)
 
+    async def fetch_assessment_state(
+        self,
+        session_id: str,
+    ) -> "PhoneAssessmentState":
+        """READ-ONLY: fetch the durable state WITHOUT binding or starting.
+
+        The gate consults this before speaking so a re-dispatched leg can skip a
+        second consent ask (2026-08-29 replay). It calls no write RPC — it maps
+        to `get_phone_assessment_state` — so a fresh call whose plan does not yet
+        exist gets back a refusal (`plan_missing`) and the gate runs in full.
+        `gate_recorded` on an `ok` state is the durable-consent signal.
+        """
+        body = {"session_id": str(session_id)}
+        response = await self._post(ASSESSMENT_STATE_PATH, body, "assessment_state")
+        if isinstance(response, str):
+            return PhoneAssessmentState(False, response)
+        data = _response_json(response)
+        if not isinstance(data, dict):
+            _log.warn(
+                "unknown_event", error_type="phone_api_failed",
+                error_category=_ERR_MALFORMED, schema="assessment_state",
+            )
+            return PhoneAssessmentState(False, _ERR_MALFORMED)
+        return PhoneAssessmentState.parse(data)
+
     async def record_probe(
         self,
         session_id: str,
@@ -1578,7 +1606,7 @@ class PhoneAssessmentState:
         "ok", "status", "candidate_name", "role_title", "role_focus",
         "role_required_skills", "interviewer_instructions", "resume_facts",
         "questions", "cursor", "next_key", "completed_keys", "turns", "assessment_exists",
-        "already_scored", "plan_complete", "plan_source",
+        "already_scored", "plan_complete", "plan_source", "gate_recorded",
     )
 
     def __init__(self, ok: bool, status: str | None = None) -> None:
@@ -1599,6 +1627,11 @@ class PhoneAssessmentState:
         self.already_scored: bool = False
         self.plan_complete: bool = False
         self.plan_source: str | None = None
+        # Durable-consent signal (2026-08-29 replay fix). True once the gate has
+        # recorded its turns for this session; a re-dispatched leg reads this to
+        # SKIP the disclosure instead of asking for consent a second time.
+        # Absent on legacy bodies → False, which keeps every fresh call gating.
+        self.gate_recorded: bool = False
 
     @classmethod
     def parse(cls, data: dict[str, Any]) -> "PhoneAssessmentState":
@@ -1687,6 +1720,13 @@ class PhoneAssessmentState:
             for entry in raw_turns:
                 if not isinstance(entry, dict):
                     continue
+                # Defense-in-depth for the 2026-08-29 cross-leg leak: the server
+                # already excludes gate turns from the resume projection (0070),
+                # but if a turn ever arrives flagged `is_gate` truthy, drop it
+                # here too rather than feed the pre-consent gate exchange into
+                # the resuming leg's model. Tolerant when the field is absent.
+                if entry.get("is_gate"):
+                    continue
                 speaker = entry.get("speaker")
                 text = entry.get("text")
                 if speaker in ("bot", "candidate") and isinstance(text, str) and text:
@@ -1694,6 +1734,7 @@ class PhoneAssessmentState:
 
         state.assessment_exists = data.get("assessment_exists") is True
         state.already_scored = data.get("already_scored") is True
+        state.gate_recorded = data.get("gate_recorded") is True
         return state
 
     def question_at(self, index: int) -> PhonePlanQuestion | None:
@@ -1735,6 +1776,25 @@ PHONE_CALLBACK_POLICY_TEXT = (
     "- Ask one question at a time and wait for the answer. Never re-ask a "
     "question the candidate has already answered; briefly acknowledge and "
     "move on instead."
+)
+
+
+#: The role-title grounding constraint, appended to the PHONE side only.
+#: A live call on 2026-08-29 had the bot announce "Senior Project Manager"
+#: when the role row's title was correct all along — a paraphrase the model
+#: invented. The role title reaches the prompt verbatim from the server
+#: projection, so the fix is to forbid the model from restating it any way but
+#: exactly. Phone-only: the browser prompt surface is sha-pinned and this must
+#: not shift it, so it is appended here in `_phone_instructions_text` rather
+#: than inside the shared `system_prompt`.
+PHONE_ROLE_GROUNDING_TEXT = (
+    "\n\nRole-title grounding (mandatory):\n"
+    "- When you state or refer to the role, use the role title EXACTLY as it "
+    "was provided to you, word for word. Never invent, guess, paraphrase, "
+    "expand, or abbreviate a job title, and never add a seniority level the "
+    "title does not contain.\n"
+    "- If you are unsure of the exact title, do not make one up: say \"the "
+    "role you applied for\" instead."
 )
 
 
@@ -2381,6 +2441,9 @@ async def run_phone_gate(
     answer_wait_sec: float | None = None,
     answer_poll_interval_sec: float = BOUNCE_POLL_INTERVAL_SEC,
     answer_wait_sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+    fetch_durable_consent: Optional[
+        Callable[[], Awaitable[Optional["PhoneAssessmentState"]]]
+    ] = None,
 ) -> PhoneGateResult:
     """Run the phone screening's opening, in the ONLY order that is safe.
 
@@ -2411,6 +2474,19 @@ async def run_phone_gate(
     ``start_recording`` is invoked at exactly one point in this function, after
     consent is durably applied. That single call site is the whole control; a
     caller must not have its own.
+
+    ``fetch_durable_consent`` (optional) is consulted ONCE, after a participant
+    is proven on the line and before a single word of the disclosure is spoken.
+    It returns the server's assessment state, and when that state reports
+    ``gate_recorded`` — the gate has already recorded its turns for this
+    session, which happens only AFTER consent was durably applied — the gate is
+    a RE-ENTRY into an already-consented call (a worker deploy/crash mid-
+    conversation, 2026-08-29). In that case the disclosure, classification and
+    consent application are all SKIPPED: re-asking for consent mid-interview is
+    the defect. The resumed cursor is server-owned, so the caller's screening
+    loop still continues from exactly where it left off. When no durable
+    consent exists — a fresh call, or a new-epoch reconnect that never
+    consented — this is a no-op and every existing behaviour is unchanged.
     """
     events: list[str] = []
     spoken: list[str] = []
@@ -2484,6 +2560,36 @@ async def run_phone_gate(
             _log.warn(
                 "unknown_event", error_type="phone_call_answered_not_applied",
                 error_category="call_answered_unconfirmed",
+            )
+
+    # ── Durable consent short-circuit: a re-entry never re-asks ────────────
+    # A worker deploy/crash mid-call re-dispatches this leg into a conversation
+    # that has ALREADY consented. Speaking the disclosure again would ask a
+    # candidate mid-interview for consent a SECOND time (2026-08-29: two
+    # `disclosure.delivered` on one session). Before any word is spoken, consult
+    # the server's durable state: `gate_recorded` is written only AFTER consent
+    # is applied, so it is the proof that the gate already ran for this session.
+    # When it is set, skip the disclosure, the classification and the consent
+    # application entirely and hand the caller the resumed state — its screening
+    # loop continues from the server-owned cursor, and `render_resume_context`
+    # supplies the brief spoken re-establishment the resume path already has.
+    #
+    # Fail OPEN toward gating: any fetch failure, a not-ok state, or absent
+    # `gate_recorded` falls through to the normal gate, so a fresh call and a
+    # new-epoch-no-consent reconnect both still run the full disclosure.
+    if fetch_durable_consent is not None:
+        try:
+            durable = await fetch_durable_consent()
+        except Exception:  # noqa: BLE001
+            durable = None
+        if durable is not None and durable.ok and durable.gate_recorded:
+            _log.info(
+                "unknown_event", error_type="phone_gate_outcome",
+                schema="gate_resumed_consent",
+            )
+            return PhoneGateResult(
+                CLASSIFY_HUMAN, assessment_allowed=True, recording_allowed=True,
+                events=events, spoken=spoken, assessment_state=durable,
             )
 
     # ── The opening: model-generated-and-verified, or the fixed disclosure ─
