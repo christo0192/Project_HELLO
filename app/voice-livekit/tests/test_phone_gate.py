@@ -3357,7 +3357,7 @@ class TestInstructionDelivery(unittest.IsolatedAsyncioTestCase):
             ok = await agent_mod._apply_phone_instructions(agent, self._state())
         self.assertTrue(ok)
         self.assertEqual(len(agent.delivered), 1)
-        self.assertEqual(agent.delivered[0], "BUILT" + phone.PHONE_CALLBACK_POLICY_TEXT + phone.PHONE_ROLE_GROUNDING_TEXT)
+        self.assertEqual(agent.delivered[0], "BUILT" + phone.PHONE_CALLBACK_POLICY_TEXT + phone.PHONE_ROLE_GROUNDING_TEXT + phone.PHONE_TURN_DISCIPLINE_TEXT + phone.PHONE_EXPRESSIVENESS_TEXT)
         self.assertEqual(build.call_args.kwargs["candidate_name"], "Asha")
         self.assertIn("exact currently owed question", build.call_args.kwargs["questions"])
         self.assertNotIn("First question?", build.call_args.kwargs["questions"])
@@ -3389,7 +3389,7 @@ class TestInstructionDelivery(unittest.IsolatedAsyncioTestCase):
         with patch.object(agent_mod, "system_prompt", return_value="BUILT"):
             ok = await agent_mod._apply_phone_instructions(agent, self._state())
         self.assertTrue(ok)
-        self.assertEqual(agent.instructions, "BUILT" + phone.PHONE_CALLBACK_POLICY_TEXT + phone.PHONE_ROLE_GROUNDING_TEXT)
+        self.assertEqual(agent.instructions, "BUILT" + phone.PHONE_CALLBACK_POLICY_TEXT + phone.PHONE_ROLE_GROUNDING_TEXT + phone.PHONE_TURN_DISCIPLINE_TEXT + phone.PHONE_EXPRESSIVENESS_TEXT)
 
     async def test_a_FAILED_delivery_is_reported_rather_than_swallowed(self):
         class HostileAgent:
@@ -3416,7 +3416,7 @@ class TestInstructionDelivery(unittest.IsolatedAsyncioTestCase):
         with patch.object(agent_mod, "system_prompt", return_value="BUILT"):
             ok = await agent_mod._apply_phone_instructions(agent, self._state())
         self.assertTrue(ok)
-        self.assertEqual(agent.instructions, "BUILT" + phone.PHONE_CALLBACK_POLICY_TEXT + phone.PHONE_ROLE_GROUNDING_TEXT)
+        self.assertEqual(agent.instructions, "BUILT" + phone.PHONE_CALLBACK_POLICY_TEXT + phone.PHONE_ROLE_GROUNDING_TEXT + phone.PHONE_TURN_DISCIPLINE_TEXT + phone.PHONE_EXPRESSIVENESS_TEXT)
 
 
 # ── F3: role-title grounding (phone side only) ─────────────────────────
@@ -4668,6 +4668,354 @@ class TestTeardownLabelVocabulary(unittest.TestCase):
 
     def test_unknown_reason_falls_back_to_other_failure(self):
         self.assertEqual(agent_mod._teardown_label("something_new"), "other_failure")
+
+
+class TestPatienceSubstanceClassifier(unittest.TestCase):
+    """X10 — the pure substance classifier behind the patience gate.
+
+    Truth table drawn from live call 23 (transcript-verified): thinking
+    fragments that must be SUPPRESSED, real short answers that must PASS, and
+    explicit thinking statements that must earn ENCOURAGEMENT (not silence).
+    """
+
+    def test_real_short_answers_pass_as_substantive(self):
+        for text in (
+            "yes", "No.", "Yeah", "nope", "correct", "twelve lakhs",
+            "12 LPA", "About 8 years", "3", "I did", "Not really",
+            "I led the support team for four years.",
+        ):
+            self.assertEqual(
+                phone.phone_turn_substance(text),
+                phone.PHONE_SUBSTANCE_SUBSTANTIVE,
+                f"{text!r} should be substantive",
+            )
+
+    def test_hesitation_fragments_are_suppressed(self):
+        for text in (
+            "Hmm", "hmm", "Um", "uh", "So the most", "so the most",
+            "I would say", "I'd say", "yeah so", "well", "and",
+            "the biggest", "challenging part",
+        ):
+            self.assertEqual(
+                phone.phone_turn_substance(text),
+                phone.PHONE_SUBSTANCE_HESITATION,
+                f"{text!r} should be a hesitation",
+            )
+
+    def test_mid_thought_dangling_fragments_are_suppressed(self):
+        for text in (
+            "would say is", "it is about", "the thing is", "so it's",
+        ):
+            self.assertEqual(
+                phone.phone_turn_substance(text),
+                phone.PHONE_SUBSTANCE_HESITATION,
+                f"{text!r} should be a mid-thought fragment",
+            )
+
+    def test_explicit_thinking_statements_route_to_encouragement(self):
+        for text in (
+            "let me think", "Let me think about it",
+            "I'm thinking about how to put it in the right way",
+            "give me a second", "give me a moment", "one second please",
+            "let me gather my thoughts",
+        ):
+            self.assertEqual(
+                phone.phone_turn_substance(text),
+                phone.PHONE_SUBSTANCE_THINKING,
+                f"{text!r} should be a thinking statement",
+            )
+
+    def test_a_longer_answer_that_merely_starts_with_a_filler_is_substantive(self):
+        # Conservative: only SHORT clearly-unfinished fragments suppress. A real
+        # answer that opens with a filler is not swallowed.
+        text = "Well, I spent four years leading the onboarding team and then moved into ops."
+        self.assertEqual(
+            phone.phone_turn_substance(text), phone.PHONE_SUBSTANCE_SUBSTANTIVE,
+        )
+
+    def test_non_string_and_empty_are_safe(self):
+        self.assertEqual(
+            phone.phone_turn_substance(None), phone.PHONE_SUBSTANCE_SUBSTANTIVE,
+        )
+        self.assertEqual(
+            phone.phone_turn_substance("   "), phone.PHONE_SUBSTANCE_HESITATION,
+        )
+
+    def test_gate_flag_defaults_on_and_only_off_disables(self):
+        for value, expected in (
+            ("", True), ("on", True), ("ON", True), ("garbage", True),
+            ("  on ", True), ("off", False), ("OFF", False), ("  off  ", False),
+        ):
+            with patch.dict(phone.os.environ, {"PHONE_PATIENCE_GATE": value}):
+                self.assertEqual(phone.phone_patience_gate_enabled(), expected)
+
+
+class TestPatienceGateTurnHook(unittest.IsolatedAsyncioTestCase):
+    """X10 — the turn hook applies the patience gate: routes first, then
+    suppress hesitations, encourage thinking, pass substantive — and never
+    advance the cursor on a non-answer.
+    """
+
+    def setUp(self):
+        _FakePhoneSession.instances = []
+        _FakePhoneSession.default_answers = []
+        _FakePhoneSession.default_emit_auto_speech = True
+        _FakePhoneSession.include_timing = False
+
+    @staticmethod
+    def _stop_response():
+        return sys.modules["livekit.agents"].StopResponse
+
+    async def _drain(self, predicate, tries=200):
+        for _ in range(tries):
+            await asyncio.sleep(0)
+            if predicate():
+                return True
+        return False
+
+    def _ready_turn(self, hooks):
+        # A well-formed exchange: the ask was delivered and captured.
+        hooks["latest_assistant"][0] = "First question?"
+        hooks["latest_assistant_anchor"][0] = 1
+        hooks["assistant_delivery_complete"].set()
+
+    async def test_a_hesitation_fragment_is_suppressed_and_never_commits(self):
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless",
+        )
+        on_turn = hooks["on_native_turn"]
+        self._ready_turn(hooks)
+        turn_ctx = types.SimpleNamespace(items=[])
+        with self.assertRaises(self._stop_response()):
+            await on_turn(
+                "So the most", types.SimpleNamespace(text_content="So the most"),
+                turn_ctx,
+            )
+        # No reply instruction injected, no commit scheduled, cursor untouched.
+        self.assertEqual(turn_ctx.items, [])
+        self.assertEqual(getattr(agent, "_turn_policy"), "patience_suppressed")
+        # Give any (erroneously scheduled) background commit a chance to run.
+        await asyncio.sleep(0)
+        self.assertEqual(client.committed_keys, [])
+        hooks["close_event"].set()
+        await hooks["drive_terminal"]()
+
+    async def test_an_explicit_thinking_statement_earns_one_encouragement(self):
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless",
+        )
+        on_turn = hooks["on_native_turn"]
+        self._ready_turn(hooks)
+        turn_ctx = types.SimpleNamespace(items=[])
+        # Not suppressed: the model gets ONE short-encouragement instruction and
+        # nothing else, and no commit is scheduled.
+        await on_turn(
+            "Let me think about how to put it in the right way.",
+            types.SimpleNamespace(text_content="Let me think about how to put it in the right way."),
+            turn_ctx,
+        )
+        injected = " ".join(
+            m["content"] if isinstance(m, dict) else "" for m in turn_ctx.items
+        ).lower()
+        self.assertIn("encouragement", injected)
+        self.assertIn("do not ask a new question", injected)
+        self.assertEqual(getattr(agent, "_turn_policy"), "patience_encourage")
+        await asyncio.sleep(0)
+        self.assertEqual(client.committed_keys, [])
+        hooks["close_event"].set()
+        await hooks["drive_terminal"]()
+
+    async def test_a_substantive_answer_flows_normally_and_commits(self):
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless",
+        )
+        on_turn = hooks["on_native_turn"]
+        self._ready_turn(hooks)
+        turn_ctx = types.SimpleNamespace(items=[])
+        await on_turn(
+            "I led the support team for four years and cut resolution time in half.",
+            types.SimpleNamespace(text_content="I led the support team for four years and cut resolution time in half."),
+            turn_ctx,
+        )
+        self.assertEqual(getattr(agent, "_turn_policy"), "substantive")
+        committed = await self._drain(lambda: client.committed_keys == ["k1"])
+        self.assertTrue(committed, "a substantive turn must commit the boundary")
+        hooks["close_event"].set()
+        await hooks["drive_terminal"]()
+
+    async def test_routes_are_checked_before_the_patience_gate(self):
+        # A SHORT clarification would look like a fragment to the substance
+        # classifier, but the route check runs first, so it still gets a spoken
+        # reply (a clarification instruction), not silence.
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless",
+        )
+        on_turn = hooks["on_native_turn"]
+        self._ready_turn(hooks)
+        text = "Can you repeat the question?"
+        self.assertEqual(phone.candidate_turn_route(text), "candidate_question")
+        turn_ctx = types.SimpleNamespace(items=[])
+        await on_turn(text, types.SimpleNamespace(text_content=text), turn_ctx)
+        # It routed (a clarification instruction was injected); it was not
+        # suppressed and did not commit.
+        self.assertEqual(getattr(agent, "_turn_policy"), "clarification")
+        self.assertNotEqual(turn_ctx.items, [])
+        self.assertEqual(client.committed_keys, [])
+        hooks["close_event"].set()
+        await hooks["drive_terminal"]()
+
+    async def test_a_bare_hesitation_route_is_suppressed_when_gate_on(self):
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless",
+        )
+        on_turn = hooks["on_native_turn"]
+        self._ready_turn(hooks)
+        # "Um" is a `hesitation` route; with the gate on it suppresses instead of
+        # the pre-X10 re-ask.
+        self.assertEqual(phone.candidate_turn_route("Um"), "hesitation")
+        turn_ctx = types.SimpleNamespace(items=[])
+        with self.assertRaises(self._stop_response()):
+            await on_turn("Um", types.SimpleNamespace(text_content="Um"), turn_ctx)
+        self.assertEqual(getattr(agent, "_turn_policy"), "patience_suppressed")
+        self.assertEqual(client.committed_keys, [])
+        hooks["close_event"].set()
+        await hooks["drive_terminal"]()
+
+    async def test_gate_off_restores_the_pre_x10_reask_behaviour(self):
+        with patch.dict(phone.os.environ, {"PHONE_PATIENCE_GATE": "off"}):
+            agent, session, state, client, hooks = await _make_native_coordinator(
+                turn_mode="toolless",
+            )
+            on_turn = hooks["on_native_turn"]
+            self._ready_turn(hooks)
+            turn_ctx = types.SimpleNamespace(items=[])
+            # A hesitation route now re-asks (speaks) rather than suppressing.
+            await on_turn("Um", types.SimpleNamespace(text_content="Um"), turn_ctx)
+            self.assertEqual(getattr(agent, "_turn_policy"), "clarification")
+            self.assertNotEqual(turn_ctx.items, [])
+            hooks["close_event"].set()
+            await hooks["drive_terminal"]()
+
+
+class TestSubstanceGatedCommit(unittest.IsolatedAsyncioTestCase):
+    """X10 Fix 2a — the background commit re-checks substance and SKIPS the
+    boundary for a non-substantive turn even if one slips past the turn gate.
+    """
+
+    @staticmethod
+    def _log_categories(spy, error_type):
+        calls = list(spy.info.call_args_list) + list(spy.warn.call_args_list)
+        return [
+            c.kwargs.get("error_category")
+            for c in calls
+            if c.kwargs.get("error_type") == error_type
+        ]
+
+    async def _drain(self, predicate, tries=200):
+        for _ in range(tries):
+            await asyncio.sleep(0)
+            if predicate():
+                return True
+        return False
+
+    async def test_a_non_substantive_pending_commit_is_skipped(self):
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless",
+        )
+        # Seed the coordinator's pending buffer with a NON-substantive candidate
+        # (the live hook can never do this — it suppresses first — so this is the
+        # defense-in-depth path), then run the background commit directly.
+        agent._pending.update({
+            "question": state.question_at(0),
+            "prompt": "First question?",
+            "candidate": "So the most",  # a hesitation fragment, not an answer
+            "message": None,
+            "source_event_id": phone.plan_source_event_id("k1"),
+            "probe_used": False,
+        })
+        hooks["assistant_delivery_complete"].set()
+        await agent._commit_after_reply()
+        # The commit was skipped: the cursor did not advance and it was logged.
+        self.assertEqual(client.committed_keys, [])
+        self.assertIn(
+            "non_substantive_commit_skipped",
+            self._log_categories(hooks["log"], "phone_toolless_commit"),
+        )
+        hooks["close_event"].set()
+        await hooks["drive_terminal"]()
+
+    async def test_a_substantive_pending_commit_proceeds(self):
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless",
+        )
+        agent._pending.update({
+            "question": state.question_at(0),
+            "prompt": "First question?",
+            "candidate": "I led the team for four years.",
+            "message": None,
+            "source_event_id": phone.plan_source_event_id("k1"),
+            "probe_used": False,
+        })
+        hooks["assistant_delivery_complete"].set()
+        await agent._commit_after_reply()
+        self.assertEqual(client.committed_keys, ["k1"])
+        hooks["close_event"].set()
+        await hooks["drive_terminal"]()
+
+
+class TestPhoneInstructionAssembly(unittest.TestCase):
+    """X10 — the phone-only instruction blocks are present in phone instructions,
+    the resume-conflict directive is conditional on resume evidence, and the
+    sha-pinned browser prompt surface is untouched.
+    """
+
+    def _state(self, *, resume_facts=None):
+        state = _default_state()
+        state.resume_facts = resume_facts if resume_facts is not None else {}
+        return state
+
+    def test_single_question_and_expressiveness_blocks_are_always_present(self):
+        text = agent_mod._phone_instructions_text(self._state())
+        low = text.lower()
+        self.assertIn("ask exactly one question per turn", low)
+        self.assertIn("do not move to the next topic", low)
+        self.assertIn("restate the current question only", low)
+        # Fix 4 — lexical expressiveness / light professional humor.
+        self.assertIn("the telephone line flattens your voice", low)
+        self.assertIn("light, professional humor", low)
+        self.assertIn("at the candidate's expense", low)
+
+    def test_resume_conflict_directive_only_when_resume_evidence_exists(self):
+        without = agent_mod._phone_instructions_text(self._state())
+        self.assertNotIn("resume-conflict probing", without.lower())
+        with_facts = agent_mod._phone_instructions_text(
+            self._state(resume_facts={
+                "name": "Asha",
+                "recent_role": {"title": "Ops Lead", "employer": "Acme"},
+            }),
+        )
+        self.assertIn("resume-conflict probing", with_facts.lower())
+        self.assertIn("help me reconcile", with_facts.lower())
+        self.assertIn("at most one such clarification", with_facts.lower())
+
+    def test_browser_prompt_surface_is_byte_identical(self):
+        # The phone-only blocks must never leak into the shared system_prompt.
+        surface = prompting.system_prompt(
+            candidate_name="Pin Candidate",
+            role_title="Pin Role",
+            role_focus="pin focus",
+            resume_facts="pin facts",
+            questions=prompting.format_questions(None),
+            interviewer_instructions="pin guidance",
+        )
+        low = surface.lower()
+        for leaked in (
+            "ask exactly one question per turn",
+            "the telephone line flattens your voice",
+            "resume-conflict probing",
+            "light, professional humor",
+        ):
+            self.assertNotIn(leaked, low, f"{leaked!r} leaked into the browser prompt")
 
 
 if __name__ == "__main__":
