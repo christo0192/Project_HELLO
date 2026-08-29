@@ -22,24 +22,33 @@ const PARAMS = {
   'X-PH-Hello-Attempt': 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
 };
 
-/** The plivo-node algorithm, reimplemented independently for the pin. */
+/**
+ * The plivo-node algorithm, reimplemented independently for the pin — and it
+ * must mirror `construct_post_url`'s `?` before the sorted params for
+ * non-empty POSTs (v3Security.js). The first version of this reference
+ * omitted the `?` in lockstep with the code it was checking, so both were
+ * wrong together and every live signature mismatched (2026-08-29). Verified
+ * byte-for-byte against plivo-node's own validateV3Signature.
+ */
 function referenceSignature(
   token: string,
   url: string,
   params: Record<string, string>,
   nonce: string,
 ): string {
+  const keys = Object.keys(params).sort();
   const parts: string[] = [];
-  for (const k of Object.keys(params).sort()) parts.push(`${k}${params[k]}`);
-  const base = `${url}${parts.join('')}.${nonce}`;
+  for (const k of keys) parts.push(`${k}${params[k]}`);
+  const query = keys.length > 0 ? '?' : '';
+  const base = `${url}${query}${parts.join('')}.${nonce}`;
   return createHmac('sha256', token).update(base).digest('base64');
 }
 
 describe('plivo V3 — the signed string is exactly Plivo\'s', () => {
-  it('builds URL + sorted key+value pairs + . + nonce, no separators', () => {
+  it('builds URL + ? + sorted key+value pairs + . + nonce, no separators', () => {
     const s = plivoV3SignedString(URL, PARAMS, NONCE);
     expect(s).toBe(
-      `${URL}From+919800000000To+919812345678X-PH-Hello-Attemptaaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.${NONCE}`,
+      `${URL}?From+919800000000To+919812345678X-PH-Hello-Attemptaaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.${NONCE}`,
     );
   });
 
@@ -51,7 +60,12 @@ describe('plivo V3 — the signed string is exactly Plivo\'s', () => {
 
   it('sorts multiple values of one key (case-sensitive, Unix)', () => {
     const s = plivoV3SignedString(URL, { k: ['b', 'a'] }, NONCE);
-    expect(s).toBe(`${URL}kakb.${NONCE}`);
+    expect(s).toBe(`${URL}?kakb.${NONCE}`);
+  });
+
+  it('empty params add no ? (matches Plivo empty-POST branch)', () => {
+    const s = plivoV3SignedString(URL, {}, NONCE);
+    expect(s).toBe(`${URL}.${NONCE}`);
   });
 });
 
