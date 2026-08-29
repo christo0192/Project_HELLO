@@ -402,6 +402,13 @@ class TestRoomClassification(unittest.TestCase):
         )
         self.assertEqual(phone.participant_identity(participant), "sip_abc")
 
+    def test_preflight_requires_exact_channel_and_schema_marker(self):
+        self.assertTrue(phone.is_preflight_room('{"channel":"preflight","schema":1}'))
+        self.assertFalse(phone.is_preflight_room('{"channel":"preflight","schema":2}'))
+        self.assertFalse(phone.is_preflight_room('{"channel":"phone","schema":1}'))
+        self.assertFalse(phone.is_preflight_room('{"channel":"preflight"}'))
+
+
 
 # ── Dispatch metadata: the ONLY source of an attempt id ───────────────
 
@@ -499,6 +506,11 @@ class TestWorkerRoomOwnership(unittest.TestCase):
         self.assertTrue(self._handles(_PHONE_ROOM, agent_name="phone-screener"))
         self.assertTrue(self._handles("odd-room", '{"channel": "phone"}', agent_name="p"))
         self.assertFalse(self._handles(_BROWSER_ROOM, agent_name="phone-screener"))
+
+    def test_neither_worker_owns_preflight_rooms(self):
+        metadata = '{"channel":"preflight","schema":1}'
+        self.assertFalse(self._handles("preflight-random", metadata))
+        self.assertFalse(self._handles("preflight-random", metadata, agent_name="phone-screener"))
 
 
 class TestEntrypointIsolation(unittest.TestCase):

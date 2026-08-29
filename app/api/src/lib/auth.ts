@@ -587,6 +587,7 @@ export const PUBLIC_ROUTES: { method: string; path: string }[] = [
   { method: 'POST', path: '/api/csp-report' },
   // Each route below performs its own candidate-grant or worker authentication.
   { method: 'POST', path: '/api/livekit/exchange' },
+  { method: 'POST', path: '/api/livekit/preflight' },
   { method: 'POST', path: '/api/livekit/worker-context' },
   { method: 'POST', path: '/api/livekit/grant/recording' },
   // Phase 9 L4: exact public allowlist entries. Each public candidate route

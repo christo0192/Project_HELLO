@@ -41,6 +41,7 @@ import type {
   CandidateConsentSubmitInput,
   CandidateConsentSubmitResponse,
   CandidateConsentTemplate,
+  CandidatePreflightResult,
   CandidateDetail,
   CandidatesSummary,
   CandidateInviteExchangeResult,
@@ -232,6 +233,11 @@ export const api = {
     request<CandidateInviteExchangeResult>('/api/livekit/exchange', {
       method: 'POST',
       body: JSON.stringify({ token }),
+    }),
+  candidateLiveKitPreflight: (inviteToken: string) =>
+    request<CandidatePreflightResult>('/api/livekit/preflight', {
+      method: 'POST',
+      body: JSON.stringify({ invite_token: inviteToken }),
     }),
   /**
    * Signal that the candidate's screening is over.

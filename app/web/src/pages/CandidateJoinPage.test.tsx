@@ -66,6 +66,7 @@ vi.mock('livekit-client', () => ({
     Disconnected: 'disconnected',
   },
   Track: { Kind: { Audio: 'audio' } },
+  ParticipantKind: { AGENT: 4 },
   LocalAudioTrack: class {
     mediaStreamTrack: unknown;
     stop = vi.fn();
@@ -270,24 +271,24 @@ describe('CandidateJoinPage', () => {
     expect(receive).toBeDefined();
     receive?.(
       [{ id: 'seg-1', text: 'Hel', final: false }],
-      { identity: 'agent-worker' },
+      { identity: 'agent-worker', kind: 'agent' },
     );
-    expect(await screen.findByText('Hel')).toHaveClass('italic');
-    expect(screen.getByText('Christy')).toBeInTheDocument();
+    expect(await screen.findByText('Hel')).toHaveClass('candidate-caption');
+    expect(screen.getByText('Interviewer')).toBeInTheDocument();
 
     receive?.(
       [{ id: 'seg-1', text: 'Hello there', final: true }],
-      { identity: 'agent-worker' },
+      { identity: 'agent-worker', kind: 'agent' },
     );
     await waitFor(() => expect(screen.queryByText('Hel')).not.toBeInTheDocument());
     expect(screen.getByText('Hello there')).not.toHaveClass('italic');
 
     receive?.(
       [{ id: 'seg-2', text: 'Thank you', final: true }],
-      { identity: 'candidate-local' },
+      { identity: 'candidate-local', kind: 'standard' },
     );
-    expect(await screen.findByText('Thank you')).toBeInTheDocument();
-    expect(screen.getByText('You')).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText('Thank you')).not.toBeInTheDocument());
+    expect(screen.queryByText('You')).not.toBeInTheDocument();
     expect(screen.getAllByText('Hello there')).toHaveLength(1);
   });
 

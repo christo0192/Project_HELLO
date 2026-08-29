@@ -55,6 +55,14 @@ export interface ConsentStatusResponse {
   template_version: string | null;
   locale: string | null;
   required_consents: string[];
+  /** Present only when the invite's role context resolves successfully. */
+  role_title?: string;
+}
+
+export interface ConsentItemResponse {
+  type: string;
+  label: string;
+  description?: string;
 }
 
 export interface ConsentTemplateResponse {
@@ -63,6 +71,8 @@ export interface ConsentTemplateResponse {
   title: string;
   body_md: string;
   required_consents: string[];
+  summary?: string;
+  consent_items?: ConsentItemResponse[];
 }
 
 export interface ConsentSubmitResponse {

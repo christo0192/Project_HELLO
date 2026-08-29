@@ -346,6 +346,12 @@ def room_metadata_of(ctx: Any) -> Any:
     return getattr(room, "metadata", None)
 
 
+def is_preflight_room(room_metadata: Any = None) -> bool:
+    """True only for the exact disposable candidate network-test marker."""
+    payload = _json_object(room_metadata)
+    return payload.get("channel") == "preflight" and payload.get("schema") == 1
+
+
 def participant_identity(participant: Any) -> str | None:
     """Return ONLY the participant identity.
 
