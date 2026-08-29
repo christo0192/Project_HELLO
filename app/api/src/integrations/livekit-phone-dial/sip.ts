@@ -159,8 +159,22 @@ export function createLiveSipClient(
           // would still put it in the room for another reader to find.
           participantAttributes: { [PHONE_EPOCH_ATTRIBUTE]: String(request.epoch) },
           hidePhoneNumber: true,
-          // All three explicit, all three in SECONDS. See the header.
-          waitUntilAnswered: true,
+          // NOT waiting for the answer, deliberately (2026-08-29 RCA). With
+          // `waitUntilAnswered: true` this call blocked until the SDK noticed
+          // the answer — and on this trunk that notification never arrives,
+          // so every live call died at the `timeout` mark: the server tore
+          // down the "unanswered" origination and DELETED THE ROOM under a
+          // consented, mid-question conversation (three identical drops at
+          // ~52-58s after dispatch; the agent logged ROOM_DELETED). The ring
+          // state itself ended correctly on answer (`ringingTimeout` never
+          // fired), so the truth the block waited for already exists
+          // elsewhere: the worker posts `call.answered` the moment the
+          // participant is present, and the ringing timeout below still
+          // tears down a genuinely unanswered leg. Nothing blocks, so
+          // nothing can time out under a live call.
+          waitUntilAnswered: false,
+          // All three explicit, all three in SECONDS. See the header. With
+          // no answer-wait, `timeout` bounds only participant creation.
           timeout: request.originateTimeoutSeconds,
           ringingTimeout: request.ringTimeoutSeconds,
           maxCallDuration: request.maxCallSeconds,
