@@ -242,9 +242,9 @@ describe('plivo /dial-status — applies the right ledger event', () => {
     });
     expect(res.status).toBe(200);
     expect(applyEvent).toHaveBeenCalledTimes(2);
-    const calls = applyEvent.mock.calls.map(([arg]) => arg as { eventType: string; source: string; providerEventId?: string });
-    expect(calls[0]).toMatchObject({ eventType: 'call.answered', source: 'internal' });
-    expect(calls[1]).toMatchObject({
+    const calls = applyEvent.mock.calls as unknown as unknown[][];
+    expect(calls[0]?.[0]).toMatchObject({ eventType: 'call.answered', source: 'internal' });
+    expect(calls[1]?.[0]).toMatchObject({
       eventType: 'sip.participant_left',
       source: 'provider_callback',
       providerEventId: 'plivo:call-uuid-c:sip.participant_left',
