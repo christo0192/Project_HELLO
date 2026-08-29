@@ -886,7 +886,7 @@ def _phone_instructions_text(state: "phone.PhoneAssessmentState") -> str:
         ),
         interviewer_instructions=(state.interviewer_instructions or "")[:2000],
     )
-    text = text + phone.PHONE_CALLBACK_POLICY_TEXT
+    text = text + phone.PHONE_CALLBACK_POLICY_TEXT + phone.PHONE_ROLE_GROUNDING_TEXT
     resume = phone.render_resume_context(state.turns)
     return f"{text}\n\n{resume}" if resume else text
 
@@ -1993,6 +1993,30 @@ async def _run_phone_session(
         spoken_text = latest_assistant[0]
         return spoken_text if isinstance(spoken_text, str) and spoken_text.strip() else None
 
+    async def fetch_durable_consent() -> "phone.PhoneAssessmentState | None":
+        """The READ that lets a re-dispatched leg skip a second consent ask.
+
+        Read-only by construction: `fetch_assessment_state` maps to
+        `get_phone_assessment_state`, so it binds nothing and starts nothing. A
+        fresh call has no plan yet and gets back `plan_missing` (not ok), so the
+        gate runs the full disclosure; a RE-ENTRY into an already-consented
+        conversation gets back the live state, whose `gate_recorded` the gate
+        reads to skip the disclosure. A resolvable session id is required —
+        without one there is nothing durable to consult.
+        """
+        sid = phone.session_id_from_room_name(room_name)
+        if sid is None:
+            return None
+        fetch = getattr(events, "fetch_assessment_state", None)
+        if not callable(fetch):
+            # A legacy client without the read-only seam: consult nothing and
+            # gate as before rather than reach for a write RPC.
+            return None
+        try:
+            return await fetch(sid)
+        except Exception:  # noqa: BLE001
+            return None
+
     result = await phone.run_phone_gate(
         attempt_id=attempt_id,
         client=events,
@@ -2001,6 +2025,9 @@ async def _run_phone_session(
         say=say,
         start_recording=_phone_recording_permitted,
         epoch=epoch,
+        # F2 (2026-08-29 consent replay): consulted once before the disclosure
+        # so a mid-call re-dispatch resumes instead of re-asking for consent.
+        fetch_durable_consent=fetch_durable_consent,
         # Recording-from-answer: post call.answered before the disclosure so the
         # server can start the egress from the top of the call.
         post_call_answered=True,

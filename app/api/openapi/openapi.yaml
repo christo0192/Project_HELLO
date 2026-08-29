@@ -1333,6 +1333,58 @@ paths:
               schema:
                 $ref: '#/components/schemas/PhoneWorkerError'
 
+  /api/internal/phone/assessment/state:
+    post:
+      tags: [phone]
+      operationId: readPhoneWorkerAssessmentState
+      summary: Read-only durable-consent probe for a re-dispatched phone leg
+      description: Internal, service-authenticated, and strictly READ-ONLY — it binds nothing, activates nothing and snapshots no plan. A worker re-dispatched into a live conversation (a deploy or crash mid-call) calls this before the disclosure gate speaks so it can tell an already-consented call apart from a fresh one and NOT ask for consent a second time (2026-08-29 replay incident). It forwards 0070's get_phone_assessment_state, whose gate_recorded flag is the durable proof that the gate already ran; a fresh call has no plan yet and is answered plan_missing, so the worker runs the full disclosure exactly as before. Takes only the session id — no attempt id — and returns the same allowlisted projection as /assessment/start. Disabled by default.
+      security:
+        - workerBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PhoneAssessmentStateRequest'
+      responses:
+        '200':
+          description: Either the full assessment state (ok=true, carrying gate_recorded) or a stable refusal (ok=false), e.g. plan_missing for a call that has not started an assessment. A refusal means the leg runs the full gate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneAssessmentStateResponse'
+        '400':
+          description: Request body failed validation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneAssessmentStateResponse'
+        '401':
+          description: Worker bearer credential required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '403':
+          description: Worker bearer credential invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '500':
+          description: phone_assessment_error — sanitized stable code, never a driver message.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneAssessmentStateResponse'
+        '503':
+          description: Phone screening disabled, or the worker credential is not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+
   /api/internal/phone/assessment/turn:
     post:
       tags: [phone]
@@ -6612,6 +6664,16 @@ components:
           description: The session to bind. VERIFIED, never trusted — it must already name its own deterministic phone room in external_call_id and belong to the engagement's candidate.
       additionalProperties: false
 
+    PhoneAssessmentStateRequest:
+      type: object
+      required: [session_id]
+      properties:
+        session_id:
+          type: string
+          format: uuid
+          description: The session whose durable state is read. No attempt id — this is a read-only probe that binds and starts nothing.
+      additionalProperties: false
+
     PhoneAssessmentPlanQuestion:
       type: object
       required: [key, text, mandatory, hint]
@@ -6706,6 +6768,9 @@ components:
           description: The persisted assessment transcript, in order, so a reconnecting leg can rehydrate the conversation instead of starting it again.
           items:
             $ref: '#/components/schemas/PhoneAssessmentTurnEntry'
+        gate_recorded:
+          type: boolean
+          description: The gate has recorded its turns for this session — the single side effect of commit_phone_gate_turns and therefore the durable proof that disclosure+consent already ran. A re-dispatched leg reads this to SKIP the consent gate instead of asking a second time (2026-08-29 replay). A boolean, never a turn text, so nothing of the gate transcript itself crosses.
         assessment_exists:
           type: boolean
         already_scored:

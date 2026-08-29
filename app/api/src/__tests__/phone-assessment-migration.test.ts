@@ -21,6 +21,7 @@ import {
   MIGRATION_0042,
   MIGRATION_0043,
   MIGRATION_0044,
+  MIGRATION_0070,
   PHONE_MIGRATIONS_TEXT,
   functionBody,
   functionParameters,
@@ -350,5 +351,71 @@ describe('the three new RPCs', () => {
     ]) {
       expect(body, forbidden).not.toContain(forbidden);
     }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 0070 — gate-free resume context + the durable-consent signal.
+//
+// The effective declaration of `get_phone_assessment_state` is now 0070's,
+// which the extractor reads because it is registered NEWEST-FIRST. These pin
+// the two behaviours the migration exists for: the resume `turns` exclude the
+// pre-consent gate turns (the 2026-08-29 cross-leg leak), and `gate_recorded`
+// exposes whether the gate has run so a re-dispatched leg can skip a second
+// consent ask.
+// ═══════════════════════════════════════════════════════════════════
+describe('0070 — the resume projection is gate-free and reports gate_recorded', () => {
+  const body = functionBody('get_phone_assessment_state');
+
+  it('resolves to 0070 — the newest declaration is the effective one', () => {
+    expect(MIGRATION_0070).toContain(
+      'create or replace function screening_v2.get_phone_assessment_state(',
+    );
+    // The 0070-only locals prove the extractor read the new body, not 0044/0049.
+    expect(body).toContain('v_gate');
+  });
+
+  it('EXCLUDES gate turns from the resume context, NULL treated as not-a-gate', () => {
+    // The turns aggregation must filter is_gate; a NULL (a legacy row) reads as
+    // false so it stays in the resume context, exactly as before 0067.
+    const agg = body.slice(body.indexOf("'turn_index'"));
+    expect(agg).toContain('coalesce(t.is_gate, false) = false');
+    // The filter sits inside the transcript_turns read, not somewhere inert.
+    const turnsRead = body.indexOf('from screening_v2.transcript_turns t');
+    const filter = body.indexOf('coalesce(t.is_gate, false) = false');
+    expect(turnsRead).toBeGreaterThan(-1);
+    expect(filter).toBeGreaterThan(turnsRead);
+  });
+
+  it('DERIVES gate_recorded from the UNFILTERED is_gate = true rows', () => {
+    // The durable-consent signal counts the gate rows themselves — the ones the
+    // resume context excludes — so it must NOT carry the coalesce=false filter.
+    expect(body).toContain("'gate_recorded', v_gate");
+    const gateSelect = body.slice(body.indexOf('into v_gate'));
+    expect(body).toMatch(/where g\.session_id = p_session_id and g\.is_gate = true/);
+    void gateSelect;
+  });
+
+  it('still takes no clock and returns no forbidden field — the guardrails hold', () => {
+    expect(functionParameters('get_phone_assessment_state')).toEqual(['p_session_id']);
+    expect(body).not.toMatch(/\bnow\s*\(/);
+    for (const forbidden of [
+      'phone_e164', 'sip_call_id', 'participant_identity', 'egress_id',
+      'lease_token', 'room_name', 'attempt_id',
+    ]) {
+      expect(body, forbidden).not.toContain(forbidden);
+    }
+  });
+
+  it('is granted to service_role only and revoked from everyone else', () => {
+    expect(MIGRATION_0070).toContain(
+      'grant execute on function screening_v2.get_phone_assessment_state(uuid)',
+    );
+    expect(MIGRATION_0070).toContain(
+      'revoke all on function screening_v2.get_phone_assessment_state(uuid)',
+    );
+    expect(MIGRATION_0070).not.toMatch(
+      /grant execute on function[^;]*to (anon|authenticated)/,
+    );
   });
 });

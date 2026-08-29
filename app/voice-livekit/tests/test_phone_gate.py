@@ -113,6 +113,7 @@ _ensure_stub_sdk()
 
 import agent as agent_mod  # noqa: E402
 import phone  # noqa: E402
+import prompting  # noqa: E402
 
 
 def _ensure_plugin_classes() -> None:
@@ -1371,6 +1372,102 @@ class TestPhoneParity2Gate(unittest.IsolatedAsyncioTestCase):
         # A classify timeout fails closed to machine — the diagnostic log is the
         # point, and the machine verdict proves the timeout path was taken.
         self.assertEqual(result.outcome, phone.CLASSIFY_MACHINE)
+
+    # ── F2: durable consent on re-dispatch never re-asks ─────────────────
+    # A worker deploy/crash mid-call re-dispatches the leg into a conversation
+    # that has ALREADY consented. Speaking the disclosure again asked the
+    # candidate for consent a SECOND time (2026-08-29). The gate consults the
+    # server's durable state before speaking and skips the whole gate when the
+    # gate turns were already recorded.
+
+    def _consented_state(self):
+        payload = _plan_payload(cursor=1, completed=["k1"])
+        payload["gate_recorded"] = True
+        return phone.PhoneAssessmentState.parse(payload)
+
+    async def _gate_with_durable(self, *, durable, client=None, recorder=None):
+        recorder = recorder or Recorder()
+        client = client or _AtomicEventClient()
+        consent_reply_out: list[str] = []
+        classified = {"ran": False}
+
+        async def wait_for_participant():
+            return _participant()
+
+        async def classify():
+            classified["ran"] = True
+            consent_reply_out.append("Yes, that's fine.")
+            return phone.CLASSIFY_HUMAN
+
+        async def fetch_durable_consent():
+            return durable
+
+        result = await phone.run_phone_gate(
+            attempt_id=_ATTEMPT_ID,
+            client=client,
+            wait_for_participant=wait_for_participant,
+            classify=classify,
+            say=recorder.say,
+            start_recording=recorder.start_recording,
+            classify_timeout_sec=0.05,
+            session_id=_SESSION_ID,
+            epoch=_EPOCH,
+            post_call_answered=True,
+            consent_reply_out=consent_reply_out,
+            fetch_durable_consent=fetch_durable_consent,
+        )
+        return result, client, recorder, classified
+
+    async def test_redispatch_with_gate_recorded_skips_disclosure_and_consent(self):
+        durable = self._consented_state()
+        result, client, recorder, classified = await self._gate_with_durable(
+            durable=durable
+        )
+        # Authorized to screen, resumed from the SERVER-owned state, WITHOUT the
+        # disclosure, the classification, or a second consent application.
+        self.assertTrue(result.assessment_allowed)
+        self.assertIs(result.assessment_state, durable)
+        self.assertNotIn(phone.PHONE_DISCLOSURE_TEXT, recorder.spoken)
+        self.assertFalse(classified["ran"])
+        # No consent-start RPC and no disclosure event on a re-entry.
+        self.assertEqual(len(client.consent_calls), 0)
+        self.assertNotIn("disclosure.delivered", result.events)
+        self.assertNotIn("classify.human", result.events)
+        # It does NOT re-commit the gate turns (already recorded) and does NOT
+        # re-start the recording (the original consent already bound it).
+        self.assertEqual(len(client.gate_commits), 0)
+        self.assertEqual(recorder.recording_calls, 0)
+        self.assertTrue(result.recording_allowed)
+
+    async def test_fresh_call_with_no_durable_consent_still_gates(self):
+        # gate_recorded absent → False. The full gate runs exactly as before.
+        result, client, recorder, classified = await self._gate_with_durable(
+            durable=_default_state()
+        )
+        self.assertTrue(result.assessment_allowed)
+        self.assertIn(phone.PHONE_DISCLOSURE_TEXT, recorder.spoken)
+        self.assertTrue(classified["ran"])
+        self.assertEqual(len(client.consent_calls), 1)
+
+    async def test_new_epoch_not_ok_state_still_gates(self):
+        # A new-epoch reconnect that never consented: start returns not-ok
+        # (disclosure_not_delivered). The gate must run the disclosure.
+        not_consented = phone.PhoneAssessmentState(False, "disclosure_not_delivered")
+        result, client, recorder, classified = await self._gate_with_durable(
+            durable=not_consented
+        )
+        self.assertTrue(result.assessment_allowed)
+        self.assertIn(phone.PHONE_DISCLOSURE_TEXT, recorder.spoken)
+        self.assertTrue(classified["ran"])
+
+    async def test_durable_fetch_failure_falls_through_to_the_gate(self):
+        # None (a fetch failure, an unresolved session) fails OPEN toward gating.
+        result, client, recorder, classified = await self._gate_with_durable(
+            durable=None
+        )
+        self.assertTrue(result.assessment_allowed)
+        self.assertIn(phone.PHONE_DISCLOSURE_TEXT, recorder.spoken)
+        self.assertTrue(classified["ran"])
 
 
 class _noop_ctx:
@@ -3138,7 +3235,7 @@ class TestInstructionDelivery(unittest.IsolatedAsyncioTestCase):
             ok = await agent_mod._apply_phone_instructions(agent, self._state())
         self.assertTrue(ok)
         self.assertEqual(len(agent.delivered), 1)
-        self.assertEqual(agent.delivered[0], "BUILT" + phone.PHONE_CALLBACK_POLICY_TEXT)
+        self.assertEqual(agent.delivered[0], "BUILT" + phone.PHONE_CALLBACK_POLICY_TEXT + phone.PHONE_ROLE_GROUNDING_TEXT)
         self.assertEqual(build.call_args.kwargs["candidate_name"], "Asha")
         self.assertIn("exact currently owed question", build.call_args.kwargs["questions"])
         self.assertNotIn("First question?", build.call_args.kwargs["questions"])
@@ -3170,7 +3267,7 @@ class TestInstructionDelivery(unittest.IsolatedAsyncioTestCase):
         with patch.object(agent_mod, "system_prompt", return_value="BUILT"):
             ok = await agent_mod._apply_phone_instructions(agent, self._state())
         self.assertTrue(ok)
-        self.assertEqual(agent.instructions, "BUILT" + phone.PHONE_CALLBACK_POLICY_TEXT)
+        self.assertEqual(agent.instructions, "BUILT" + phone.PHONE_CALLBACK_POLICY_TEXT + phone.PHONE_ROLE_GROUNDING_TEXT)
 
     async def test_a_FAILED_delivery_is_reported_rather_than_swallowed(self):
         class HostileAgent:
@@ -3197,7 +3294,43 @@ class TestInstructionDelivery(unittest.IsolatedAsyncioTestCase):
         with patch.object(agent_mod, "system_prompt", return_value="BUILT"):
             ok = await agent_mod._apply_phone_instructions(agent, self._state())
         self.assertTrue(ok)
-        self.assertEqual(agent.instructions, "BUILT" + phone.PHONE_CALLBACK_POLICY_TEXT)
+        self.assertEqual(agent.instructions, "BUILT" + phone.PHONE_CALLBACK_POLICY_TEXT + phone.PHONE_ROLE_GROUNDING_TEXT)
+
+
+# ── F3: role-title grounding (phone side only) ─────────────────────────
+
+class TestPhoneRoleGrounding(unittest.TestCase):
+    """The role-title grounding constraint (2026-08-29: the bot invented
+    'Senior Project Manager'). It must appear in the PHONE instructions and
+    must NOT touch the sha-pinned browser surface — so it is appended in
+    `_phone_instructions_text`, never inside the shared `system_prompt`."""
+
+    def _state(self):
+        payload = _plan_payload()
+        payload["context"]["role_title"] = "Project Manager"
+        return phone.PhoneAssessmentState.parse(payload)
+
+    def test_constraint_forbids_inventing_a_title_and_names_the_fallback(self):
+        text = phone.PHONE_ROLE_GROUNDING_TEXT
+        self.assertIn("EXACTLY", text)
+        self.assertIn("Never invent", text)
+        self.assertIn("the role you applied for", text)
+
+    def test_it_appears_in_the_phone_instructions(self):
+        with patch.object(agent_mod, "system_prompt", return_value="BUILT"):
+            built = agent_mod._phone_instructions_text(self._state())
+        self.assertIn(phone.PHONE_ROLE_GROUNDING_TEXT, built)
+        # And after the callback policy, so both phone-only blocks are present.
+        self.assertIn(phone.PHONE_CALLBACK_POLICY_TEXT, built)
+
+    def test_it_does_NOT_appear_in_the_browser_system_prompt(self):
+        # The real (unmocked) shared prompt the browser lane renders must not
+        # carry the phone-only constraint.
+        browser = prompting.system_prompt(
+            candidate_name="Asha", role_title="Project Manager",
+        )
+        self.assertNotIn(phone.PHONE_ROLE_GROUNDING_TEXT, browser)
+        self.assertNotIn("Role-title grounding", browser)
 
 
 # ── Number safety ─────────────────────────────────────────────────────

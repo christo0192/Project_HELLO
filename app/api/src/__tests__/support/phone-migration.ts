@@ -126,6 +126,12 @@ export const MIGRATION_0068_PATH = fileURLToPath(
 
 export const MIGRATION_0068 = readFileSync(MIGRATION_0068_PATH, 'utf8');
 
+export const MIGRATION_0070_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0070_phone_gate_free_resume_context.sql', import.meta.url),
+);
+
+export const MIGRATION_0070 = readFileSync(MIGRATION_0070_PATH, 'utf8');
+
 /**
  * Every phone migration, NEWEST FIRST. Extraction walks this in order and the
  * first file that declares a thing wins, which is what "the latest declaration
@@ -133,6 +139,10 @@ export const MIGRATION_0068 = readFileSync(MIGRATION_0068_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    // 0070 re-declares get_phone_assessment_state in full (is_gate-filtered
+    // resume turns + the gate_recorded signal), so it must be NEWEST-FIRST for
+    // the extractor to read the effective body rather than 0049's.
+    { name: '0070', sql: MIGRATION_0070 },
     { name: '0068', sql: MIGRATION_0068 },
     { name: '0067', sql: MIGRATION_0067 },
     { name: '0066', sql: MIGRATION_0066 },

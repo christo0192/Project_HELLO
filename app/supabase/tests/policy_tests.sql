@@ -13451,6 +13451,80 @@ end;
 $$;
 
 -- ═══════════════════════════════════════════════════════════════════════
+-- 0070 — the resume projection is gate-free, and reports gate_recorded.
+--
+-- The cross-leg leak (2026-08-29): the resume `turns` the worker replays into
+-- the model must be the SCORED transcript only. A prior leg's pre-consent gate
+-- exchange (is_gate=true) leaking into resume context is exactly how the bot
+-- answered a question from a previous call's gate. And `gate_recorded` must
+-- report that the gate ran, so a re-dispatched leg can skip a second consent.
+-- ═══════════════════════════════════════════════════════════════════════
+do $$
+declare
+  v_ids uuid[]; v_res jsonb; v_role uuid; v_start jsonb; v_state jsonb;
+  v_turn_texts text[]; v_speakers text[];
+begin
+  v_ids := _policy_tests.phone44_fixture('pol70-resume', 'dialing');
+  select role_id into v_role from screening_v2.phone_engagements where id = v_ids[1];
+  update screening_v2.roles
+     set screening_template = '[{"id":"k1","question":"First?","mandatory":true}]'::jsonb
+   where id = v_role;
+  update screening_v2.phone_engagements set state = 'in_call', version = version + 1
+   where id = v_ids[1];
+
+  -- BEFORE any gate turns exist, gate_recorded must read false: nothing has
+  -- consented on this session, so a leg here must still run the disclosure.
+  v_start := screening_v2.start_phone_assessment(
+               v_ids[2], v_ids[3], '2026-09-01T06:00:30Z'::timestamptz);
+  v_state := screening_v2.get_phone_assessment_state(v_ids[3]);
+  perform _policy_tests.assert(
+    '0070: gate_recorded is false before any gate turns exist',
+    (v_state -> 'gate_recorded')::boolean = false,
+    'a session with no gate turns has no durable consent to skip on: ' || v_state::text);
+
+  -- Now the gate records its pre-consent turns, and an assessment boundary
+  -- appends its scored turns after them.
+  v_res := screening_v2.commit_phone_gate_turns(
+             v_ids[3], 'pol70-resume-gate',
+             '[{"speaker":"bot","text":"Hi, is this a good time to talk?"},
+               {"speaker":"candidate","text":"Actually what is this about?"}]'::jsonb,
+             '2026-09-01T06:01:00Z'::timestamptz);
+  v_res := screening_v2.commit_phone_question_boundary(
+             v_ids[3], 'k1', 0, 'pol70-resume-b1',
+             '[{"speaker":"bot","text":"How many years of experience?"},
+               {"speaker":"candidate","text":"About four."}]'::jsonb,
+             '2026-09-01T06:02:00Z'::timestamptz);
+
+  v_state := screening_v2.get_phone_assessment_state(v_ids[3]);
+
+  select array_agg(t ->> 'text' order by (t ->> 'turn_index')::int),
+         array_agg(t ->> 'speaker' order by (t ->> 'turn_index')::int)
+    into v_turn_texts, v_speakers
+    from jsonb_array_elements(v_state -> 'turns') t;
+
+  perform _policy_tests.assert(
+    '0070: the resume turns EXCLUDE the pre-consent gate exchange',
+    v_turn_texts = array['How many years of experience?', 'About four.']
+      and v_speakers = array['bot', 'candidate'],
+    'the resume projection must carry only scored (non-gate) turns; got '
+      || coalesce(v_turn_texts::text, 'null'));
+
+  perform _policy_tests.assert(
+    '0070: the leaked gate line is provably absent from the resume context',
+    not (v_state::text like '%what is this about%'),
+    'a previous leg''s gate chatter must never reach the resuming model: ' || v_state::text);
+
+  perform _policy_tests.assert(
+    '0070: gate_recorded is true once the gate has recorded its turns',
+    (v_state -> 'gate_recorded')::boolean = true,
+    'the durable-consent signal must be set so a re-dispatch skips the disclosure: '
+      || v_state::text);
+
+  perform _policy_tests.phone44_teardown('pol70-resume');
+end;
+$$;
+
+-- ═══════════════════════════════════════════════════════════════════════
 -- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)
 -- ═══════════════════════════════════════════════════════════════════════
 
