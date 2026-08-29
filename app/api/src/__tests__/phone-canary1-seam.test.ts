@@ -157,7 +157,7 @@ describe('1. the originate seam carries exactly what it must', () => {
     // would be asserting a value nothing sends. Since answer-first origination
     // (bounce mode) the attribute MAP is built into a local `participantAttributes`
     // const — in the candidate path it holds only the epoch; in the bounce path
-    // it additionally carries the `x-hello-attempt` correlation id — and that
+    // it additionally carries the `xhelloattempt` correlation id — and that
     // const is passed to the SDK by shorthand at exactly one option site.
     expect(sip).toContain('[PHONE_EPOCH_ATTRIBUTE]: String(request.epoch)');
     // Exactly one place hands attributes to the SDK: the shorthand option key.

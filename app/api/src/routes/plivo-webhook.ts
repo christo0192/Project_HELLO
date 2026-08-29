@@ -64,12 +64,12 @@ import { createPhoneStores, type PhoneStores } from '../lib/phone-screening/inde
 /** Transport ceiling — a Plivo callback body is small form-encoded metadata. */
 const TRANSPORT_BODY_LIMIT = '256kb';
 
-/** A lowercase-hex uuid, the form `x-hello-attempt` carries. */
+/** A lowercase-hex uuid, the form `xhelloattempt` carries. */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /**
  * The forwarded SIP-header param, case-insensitive. The bounce trunk maps our
- * `x-hello-attempt` participant attribute to the SIP header `X-PH-HELLO-ATTEMPT`,
+ * `xhelloattempt` participant attribute to the SIP header `X-PH-HELLO-ATTEMPT`,
  * and Plivo delivers a forwarded `X-PH-*` header to the answer callback as a
  * request PARAM named `X-PH-Hello-Attempt` — but casing varies by path, so the
  * param name is matched case-insensitively against this canonical form.

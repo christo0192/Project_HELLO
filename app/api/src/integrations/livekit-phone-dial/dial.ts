@@ -296,7 +296,7 @@ export async function dialPhoneAttempt(
   // endpoint answers instantly (satisfying LiveKit's outbound-SIP answer
   // timers, which never register a real answer on this Plivo trunk), and
   // Plivo's app then dials the candidate — resolved server-side from the
-  // correlation attempt id carried on the `x-hello-attempt` attribute — and
+  // correlation attempt id carried on the `xhelloattempt` attribute — and
   // bridges. Off, this is byte-identical: the direct trunk, the candidate
   // number, no correlation attribute.
   const bounce = dialConfig.bounceMode;

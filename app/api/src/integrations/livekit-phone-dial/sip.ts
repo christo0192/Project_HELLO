@@ -89,7 +89,7 @@ export function phoneParticipantIdentity(attemptId: string): string {
  * that path — it travels OUT to Plivo, never back in. A plain lowercase-hex
  * uuid, so it can never hold a phone number.
  */
-export const PHONE_HELLO_ATTEMPT_ATTRIBUTE = 'x-hello-attempt';
+export const PHONE_HELLO_ATTEMPT_ATTRIBUTE = 'xhelloattempt';
 
 /**
  * What the dial targets. Two shapes, one seam:
@@ -204,7 +204,7 @@ export function createLiveSipClient(
           participantIdentity: phoneParticipantIdentity(request.attemptId),
           // The epoch is set on every dial. In bounce mode the correlation
           // attribute rides alongside it (see above). P3's INBOUND reader still
-          // indexes only `phone_epoch` by exact name, so `x-hello-attempt` is
+          // indexes only `phone_epoch` by exact name, so `xhelloattempt` is
           // never read back off a participant by our own webhook path.
           participantAttributes,
           // In bounce mode there is no candidate number in this call at all, so

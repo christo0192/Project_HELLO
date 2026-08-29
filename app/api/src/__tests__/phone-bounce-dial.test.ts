@@ -5,7 +5,7 @@
  *   1. OFF is byte-identical: the dialer targets the direct trunk with the
  *      candidate number and sets NO correlation attribute.
  *   2. ON re-routes ONLY the transport: the dial targets the BOUNCE trunk and
- *      the bounce endpoint user, carries the `x-hello-attempt` attribute, and
+ *      the bounce endpoint user, carries the `xhelloattempt` attribute, and
  *      the candidate number still passes admission unchanged (it is simply not
  *      what is dialled).
  */
@@ -160,7 +160,7 @@ describe('bounce dial — the live client targets and attributes', () => {
     expect(cap.attributes[PHONE_HELLO_ATTEMPT_ATTRIBUTE]).toBeUndefined();
   });
 
-  it('bounce path: dials the endpoint user and carries x-hello-attempt = attemptId', async () => {
+  it('bounce path: dials the endpoint user and carries xhelloattempt = attemptId', async () => {
     const cap = await captureLiveOriginate({
       trunkId: 'bounce-trunk',
       target: { kind: 'bounce', bounceUser: 'hello_bounce' },

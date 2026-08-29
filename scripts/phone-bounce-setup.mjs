@@ -12,7 +12,7 @@
  * satisfied), and Plivo's app then dials the candidate and bridges. This script
  * provisions the LiveKit half — the outbound trunk pointing at Plivo's voice-app
  * SIP domain, authenticated with the Plivo ENDPOINT credentials, mapping our
- * `x-hello-attempt` participant attribute onto the SIP header `X-PH-HELLO-ATTEMPT`
+ * `xhelloattempt` participant attribute onto the SIP header `X-PH-HELLO-ATTEMPT`
  * so Plivo's answer callback can correlate the leg back to our attempt.
  *
  * ── THE FOUR RULES (same posture as scripts/phone-canary/halt-drill.mjs) ──
@@ -59,7 +59,7 @@
 export const PLIVO_SIP_ADDRESS = 'phone.plivo.com';
 
 /** The attribute→header mapping that carries the correlation id to Plivo. */
-export const BOUNCE_ATTRIBUTE = 'x-hello-attempt';
+export const BOUNCE_ATTRIBUTE = 'xhelloattempt';
 export const BOUNCE_HEADER = 'X-PH-HELLO-ATTEMPT';
 
 /** The default trunk name (a non-secret identifier). */
@@ -153,7 +153,7 @@ export function desiredTrunkInfo(protocol, cfg) {
     numbers: cfg.callerId === '' ? [] : [cfg.callerId],
     authUsername: cfg.endpointUsername,
     authPassword: cfg.endpointPassword,
-    // THE LOAD-BEARING MAPPING. Our `x-hello-attempt` participant attribute is
+    // THE LOAD-BEARING MAPPING. Our `xhelloattempt` participant attribute is
     // emitted as the SIP header Plivo forwards to the answer callback.
     attributesToHeaders: { [BOUNCE_ATTRIBUTE]: BOUNCE_HEADER },
   });
