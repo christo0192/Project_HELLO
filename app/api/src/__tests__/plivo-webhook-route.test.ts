@@ -232,7 +232,7 @@ describe('plivo /dial-status — applies the right ledger event', () => {
     expect(arg.attemptId).toBe(ATTEMPT);
   });
 
-  it('DialStatus=completed (action after a connected call) is the answered FALLBACK, never a no-answer', async () => {
+  it('DialStatus=completed (action after a connected call) answers and closes the leg, never a no-answer', async () => {
     const applyEvent = vi.fn(async () => okApply);
     const app = buildApp({ config: ENABLED, bounceStore: bridgingStore(), stores: { applyEvent } });
     const res = await signedPost(app, '/api/integrations/plivo/dial-status', DIAL_STATUS_URL, {
@@ -241,16 +241,37 @@ describe('plivo /dial-status — applies the right ledger event', () => {
       CallUUID: 'call-uuid-c',
     });
     expect(res.status).toBe(200);
-    expect(applyEvent).toHaveBeenCalledTimes(1);
-    const arg = (applyEvent.mock.calls[0] as unknown[])[0] as { eventType: string; source: string };
-    expect(arg.eventType).toBe('call.answered');
-    expect(arg.source).toBe('internal');
+    expect(applyEvent).toHaveBeenCalledTimes(2);
+    const calls = applyEvent.mock.calls.map(([arg]) => arg as { eventType: string; source: string; providerEventId?: string });
+    expect(calls[0]).toMatchObject({ eventType: 'call.answered', source: 'internal' });
+    expect(calls[1]).toMatchObject({
+      eventType: 'sip.participant_left',
+      source: 'provider_callback',
+      providerEventId: 'plivo:call-uuid-c:sip.participant_left',
+    });
   });
 
-  it('DialAction=hangup / connected are acknowledged with NO ledger transition', async () => {
+  it('DialAction=hangup applies the idempotent participant-left fallback', async () => {
     const applyEvent = vi.fn(async () => okApply);
     const app = buildApp({ config: ENABLED, bounceStore: bridgingStore(), stores: { applyEvent } });
-    for (const action of ['hangup', 'connected', 'digits']) {
+    const res = await signedPost(app, '/api/integrations/plivo/dial-status', DIAL_STATUS_URL, {
+      'X-PH-HELLOATTEMPT': ATTEMPT_WIRE,
+      DialAction: 'hangup',
+      CallUUID: 'call-uuid-h',
+    });
+    expect(res.status).toBe(200);
+    expect(applyEvent).toHaveBeenCalledTimes(1);
+    expect((applyEvent.mock.calls[0] as unknown[])[0]).toMatchObject({
+      eventType: 'sip.participant_left',
+      source: 'provider_callback',
+      providerEventId: 'plivo:call-uuid-h:sip.participant_left',
+    });
+  });
+
+  it('DialAction=connected / digits are acknowledged with NO ledger transition', async () => {
+    const applyEvent = vi.fn(async () => okApply);
+    const app = buildApp({ config: ENABLED, bounceStore: bridgingStore(), stores: { applyEvent } });
+    for (const action of ['connected', 'digits']) {
       const res = await signedPost(app, '/api/integrations/plivo/dial-status', DIAL_STATUS_URL, {
         'X-PH-HELLOATTEMPT': ATTEMPT_WIRE,
         DialAction: action,

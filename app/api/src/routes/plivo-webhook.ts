@@ -355,10 +355,26 @@ export function createPlivoWebhookRouter(deps: PlivoWebhookRouterDeps = {}): Rou
             error_category: 'plivo_dial_status_answered',
             http_status: 200,
           });
+        } else if (dialAction === 'hangup') {
+          // The LiveKit participant-left webhook is not guaranteed when the
+          // room is deleted by the provider/worker. Plivo's real-time hangup
+          // callback is an equivalent provider fact: the bridged leg ended.
+          // Apply the same idempotent ledger event, rather than leaving the
+          // attempt live until lease reclaim. The completion callback below
+          // repeats this event with the same deterministic id.
+          await resolveStores().applyEvent({
+            source: 'provider_callback',
+            eventType: 'sip.participant_left',
+            attemptId,
+            providerEventId: `plivo:${callUuid ?? attemptId}:sip.participant_left`,
+            now: clock(),
+          });
+          logger.info('unknown_event', {
+            error_category: 'plivo_dial_callback_hangup',
+            http_status: 200,
+          });
         } else {
-          // connected / hangup / digits — observable, no ledger transition:
-          // hangup teardown is owned by `sip.participant_left` + the action
-          // completion below.
+          // connected / digits — observable, no ledger transition.
           logger.info('unknown_event', {
             error_category: 'plivo_dial_callback_event',
             http_status: 200,
@@ -378,6 +394,18 @@ export function createPlivoWebhookRouter(deps: PlivoWebhookRouterDeps = {}): Rou
           source: 'internal',
           eventType: 'call.answered',
           attemptId,
+          now: clock(),
+        });
+        // A completed bridged dial is also authoritative teardown evidence.
+        // Do not wait for LiveKit's participant-left webhook: the observed
+        // clean room close can omit it, leaving the attempt/egress stranded
+        // until lease reclaim. This event is insert-once and safe to repeat
+        // after the real-time DialAction=hangup callback.
+        await resolveStores().applyEvent({
+          source: 'provider_callback',
+          eventType: 'sip.participant_left',
+          attemptId,
+          providerEventId: `plivo:${callUuid ?? attemptId}:sip.participant_left`,
           now: clock(),
         });
         logger.info('unknown_event', {
