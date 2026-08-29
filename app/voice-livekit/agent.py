@@ -953,7 +953,7 @@ async def _deliver_phone_instructions(agent: Any, text: str) -> bool:
         return False
 
 
-def _build_provider_session(*, phone_mode: bool = False) -> Any:
+def _build_provider_session(*, phone_mode: bool = False, turn_mode: str | None = None) -> Any:
     """The one provider/turn-session construction used by WebRTC and phone.
 
     Extracted verbatim from `_run_phone_session` — same kwargs, same env reads,
@@ -985,7 +985,18 @@ def _build_provider_session(*, phone_mode: bool = False) -> Any:
         # the lane paid for a Gemini request it then discarded, every time.
         # Disabling it here matches what this comment has always claimed.
         # AgentSession still owns EOU, interruption, scheduling and playout.
-        session_options["preemptive_generation"] = False
+        #
+        # TOOLLESS re-enables speculation. The reason it was disabled above is
+        # the tool-first lane's DISCARD: the muzzled required-tool pass ran a
+        # Gemini request the lane threw away every substantive turn. Toolless has
+        # no muzzled pass — it is one ordinary generation — so speculating it is
+        # a real latency win. The per-turn instruction is still injected in
+        # `on_user_turn_completed`; if the SDK invalidates the speculation
+        # because of that, it simply falls back to a normal generation, which is
+        # no worse than today's always-normal path — so leave it ON regardless.
+        session_options["preemptive_generation"] = (
+            turn_mode == phone.PHONE_TURN_MODE_TOOLLESS
+        )
 
     session = AgentSession(
         stt=sarvam.STT(
@@ -1015,9 +1026,9 @@ def _build_provider_session(*, phone_mode: bool = False) -> Any:
     return session
 
 
-def _build_phone_provider_session() -> Any:
+def _build_phone_provider_session(turn_mode: str | None = None) -> Any:
     """Phone seam delegates to the shared provider session factory."""
-    return _build_provider_session(phone_mode=True)
+    return _build_provider_session(phone_mode=True, turn_mode=turn_mode)
 
 
 async def _run_phone_entrypoint(ctx: JobContext, room_name: str) -> None:
@@ -1129,6 +1140,7 @@ async def _run_native_phone_screening(
     agent_listening: asyncio.Event,
     agent_activity_changed: asyncio.Event,
     close_event: asyncio.Event,
+    turn_mode: str = phone.PHONE_TURN_MODE_TOOLFIRST,
 ) -> phone.PhoneGateResult:
     """Run post-consent screening through LiveKit's native turn lifecycle.
 
@@ -1169,6 +1181,12 @@ async def _run_native_phone_screening(
     # at, so consecutive-at-the-same-position can be distinguished from a single
     # recovered blip that later advanced normally.
     malformed_guard: dict[str, int | None] = {"recovered_cursor": None}
+    # TOOLLESS: background boundary-commit tasks. In toolless mode the durable
+    # commit is moved OFF the speech path — it runs after the assistant reply is
+    # delivered instead of inside a muzzled tool leg. These tasks are retained so
+    # the terminal teardown can cancel any still in flight; a small, bounded set
+    # (one per candidate turn) that lives only for the leg.
+    commit_tasks: set[asyncio.Task] = set()
 
     async def wait_for_activity(timeout: float) -> str:
         """Wait on LiveKit activity or close without creating a turn queue."""
@@ -1396,6 +1414,27 @@ async def _run_native_phone_screening(
         # empty read at this same cursor gets its own recovery attempt rather than
         # inheriting a stale "already recovered here" mark.
         malformed_guard["recovered_cursor"] = None
+        if turn_mode == phone.PHONE_TURN_MODE_TOOLLESS and commit_tasks:
+            # TOOLLESS ORDERING GUARD. The background commit reads shared `pending`
+            # via `on_advance`. Turn-taking normally means the previous turn's
+            # commit has already run by the time the next answer arrives, but the
+            # loop does not guarantee the scheduled commit executed before this
+            # hook overwrites `pending`. Drain any in-flight commit BEFORE the
+            # update so a turn's boundary is never committed under the next turn's
+            # key. Almost always a no-op (the task already finished); bounded so a
+            # wedged commit cannot stall the live turn.
+            inflight = [t for t in commit_tasks if not t.done()]
+            if inflight:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*inflight, return_exceptions=True),
+                        timeout=PHONE_TERMINAL_REPLY_TIMEOUT_SEC,
+                    )
+                except asyncio.TimeoutError:
+                    _log.warn(
+                        "unknown_event", error_type="phone_toolless_commit",
+                        error_category="prior_commit_drain_timeout",
+                    )
         pending.update({
             "question": question,
             "prompt": prompt,
@@ -1408,6 +1447,25 @@ async def _run_native_phone_screening(
         last_advance["text"] = None
         latest_candidate_anchor[0] = None
         setattr(agent, "_turn_policy", "substantive")
+        if turn_mode == phone.PHONE_TURN_MODE_TOOLLESS:
+            # TOOLLESS (browser-style). No mandatory coordinator tool: the model
+            # authors and speaks the reply in ONE Gemini call. Adherence to the
+            # question plan rides this per-turn instruction (the same
+            # current-question context, minus the "call exactly ONE coordinator
+            # tool" requirement). The durable boundary is committed in the
+            # BACKGROUND after the reply is delivered — see `commit_after_reply`.
+            add_turn_instruction(
+                turn_ctx,
+                phone_question_instructions(question)
+                + "\n\nBriefly acknowledge one specific detail from the candidate's "
+                "answer, then ask the next planned topic — or, if their answer was "
+                "thin, one natural same-topic follow-up (your judgment) — as ONE "
+                "question in your own words.",
+            )
+            task = asyncio.create_task(commit_after_reply())
+            commit_tasks.add(task)
+            task.add_done_callback(commit_tasks.discard)
+            return
         add_turn_instruction(
             turn_ctx,
             "You must call exactly ONE coordinator tool before any spoken text. "
@@ -1502,6 +1560,74 @@ async def _run_native_phone_screening(
             "this topic: " + next_question.text + hint
         )
         return last_advance["text"]
+
+    async def commit_after_reply() -> None:
+        """TOOLLESS: commit the boundary in the background after the reply.
+
+        The tool-first lane commits INSIDE a muzzled `advance_screening` leg
+        before the speech leg runs — two sequential Gemini calls per turn. In
+        toolless there is one call: the model already authored and is delivering
+        its reply. This coroutine waits for that reply to finish playing, then
+        fires the SAME idempotent `commit_boundary` (via `on_advance`, keyed on
+        the identical `source_event_id`), so the cursor moves and the exact same
+        committed keys the scorer aligns on are produced — just off the speech
+        path.
+
+        The delivery wait is BEST-EFFORT, not a correctness fence.
+        `assistant_delivery_complete` is a session-lifetime event that may still
+        be set from the PREVIOUS reply when this task starts, so the wait can
+        return immediately and the commit can land before the current reply
+        finishes playing. That is harmless: the boundary is the candidate's
+        ALREADY-CAPTURED answer, the model's reply does not depend on the commit
+        (toolless strips the coordinator tools and the per-turn instruction is
+        already injected), and the commit is idempotent on `source_event_id`. The
+        only effect of an early commit is the cursor advancing a moment sooner —
+        and the next candidate turn is serialized behind this task by the toolless
+        ordering guard in `on_native_turn`, so `pending` cannot be corrupted.
+
+        `on_advance` is idempotent and self-guarding: a duplicate or stale commit
+        is answered without ending the call, and a genuine persistence failure
+        sets `HALT_PERSISTENCE` and `finished`. Per the pilot contract, a FAILED
+        background commit must be LOUD and must NOT drop the call — the server is
+        the durable resume authority, so a lost commit only means resume re-asks
+        that one topic, which is acceptable pilot behavior. We therefore log the
+        failure and leave `on_advance`'s own halt decision intact rather than
+        swallowing it or force-killing the leg here.
+        """
+        try:
+            await asyncio.wait_for(
+                assistant_delivery_complete.wait(),
+                timeout=PHONE_TERMINAL_REPLY_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            # The reply never signalled delivery. Commit anyway: the boundary is
+            # about the candidate's answer, not the bot's playout, and the
+            # server-keyed idempotency makes an early commit safe. Do not drop
+            # the call on a missing delivery signal.
+            _log.info(
+                "unknown_event", error_type="phone_toolless_commit",
+                error_category="delivery_timeout_commit_anyway",
+            )
+        try:
+            outcome = await on_advance()
+        except Exception:  # noqa: BLE001
+            # A background commit must never take the call down by raising into
+            # a bare task. Log loudly; the server remains the durable authority
+            # and resume re-asks the topic. `finished` is untouched here.
+            _log.warn(
+                "unknown_event", error_type="phone_toolless_commit",
+                error_category="background_commit_failed",
+            )
+            return
+        # `on_advance` returns an instruction string on success and on its
+        # idempotent duplicate/stale paths; it sets HALT_PERSISTENCE + finished
+        # itself on a genuine failure. Surface a loud line either way so a lost
+        # commit (resume will re-ask that topic) is observable in the logs.
+        if terminal_reason.get("reason") == phone.HALT_PERSISTENCE:
+            _log.warn(
+                "unknown_event", error_type="phone_toolless_commit",
+                error_category="commit_halted_persistence",
+            )
 
     async def native_say(text: str) -> None:
         speech = session.say(text, allow_interruptions=True)
@@ -1623,6 +1749,22 @@ async def _run_native_phone_screening(
     finally:
         silence_task.cancel()
         await asyncio.gather(silence_task, return_exceptions=True)
+        # TOOLLESS: let any in-flight background commit finish so a boundary the
+        # candidate already answered is not lost to teardown, but bound the wait
+        # so a wedged commit cannot hold the leg open. A commit that does not
+        # settle in time is left to the server's durable resume authority.
+        if commit_tasks:
+            pending_commits = [t for t in commit_tasks if not t.done()]
+            if pending_commits:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*pending_commits, return_exceptions=True),
+                        timeout=PHONE_TERMINAL_REPLY_TIMEOUT_SEC,
+                    )
+                except asyncio.TimeoutError:
+                    for t in pending_commits:
+                        t.cancel()
+                    await asyncio.gather(*pending_commits, return_exceptions=True)
 
     reason = terminal_reason.get("reason")
     if terminal_reply_required["value"]:
@@ -1730,7 +1872,18 @@ async def _run_phone_session(
     latest_candidate_stopped_anchor: list[int | None] = [None]
     participant_present_anchor: list[int | None] = [None]
 
-    session = _build_phone_provider_session()
+    # Read the per-turn coordination mode ONCE at session start and log it, so
+    # every later decision (provider speculation, `llm_node` policy, the commit
+    # path) reads the same value and an operator can see which lane a call ran.
+    # `PHONE_TURN_MODE` defaults to `toolfirst` (today's byte-path); `toolless`
+    # opts into the browser-style one-call turn. Read at the call site with the
+    # literal name so the env-contract scanner sees it.
+    turn_mode = phone.phone_turn_mode()
+    _log.info(
+        "unknown_event", error_type="phone_turn_mode",
+        error_category=turn_mode,
+    )
+    session = _build_phone_provider_session(turn_mode)
     reply_started = asyncio.Event()
     assistant_delivery_complete = asyncio.Event()
     reply_handle: list[Any] = [None]
@@ -1904,6 +2057,7 @@ async def _run_phone_session(
         say=say,
         on_user_turn=on_candidate_turn,
         native_turns=True,
+        turn_mode=turn_mode,
     )
 
     async def wait_for_participant() -> Any:
@@ -2211,6 +2365,7 @@ async def _run_phone_session(
             agent_listening=agent_listening,
             agent_activity_changed=agent_activity_changed,
             close_event=close_event,
+            turn_mode=turn_mode,
         )
 
     heartbeat_task = asyncio.create_task(

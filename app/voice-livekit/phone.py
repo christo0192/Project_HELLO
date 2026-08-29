@@ -658,6 +658,38 @@ def phone_bounce_mode() -> bool:
     return (os.getenv("PHONE_BOUNCE_MODE") or "").strip().lower() == "true"
 
 
+# The two per-turn coordination shapes the phone lane can run.
+PHONE_TURN_MODE_TOOLFIRST = "toolfirst"
+PHONE_TURN_MODE_TOOLLESS = "toolless"
+
+
+def phone_turn_mode() -> str:
+    """Per-turn coordination mode. Default `toolfirst` (today's behavior).
+
+    `toolfirst` (DEFAULT): every substantive candidate turn costs TWO sequential
+    Gemini legs — a muzzled `tool_choice="required"` pass that calls exactly one
+    coordinator tool (request_probe / advance_screening), the durable
+    `commit_boundary` RPC, then a `tool_choice="none"` speech pass. This is the
+    lane that ships today; when this reader returns `toolfirst` the byte-path is
+    unchanged, which is the rollback story.
+
+    `toolless`: the browser lane's ONE-call-per-turn shape. `llm_node` passes the
+    substantive turn straight through to generation with `tool_choice="auto"`
+    (no muzzled first leg, no latch), question-plan adherence rides the per-turn
+    prompt, and the same idempotent `commit_boundary` fires in the BACKGROUND
+    after the reply is delivered. The four jobs the mandatory tool call did are
+    preserved: the cursor moves off the speech path (background commit), plan
+    integrity moves to the prompt + server-owned resume, scoring alignment stays
+    on the SAME committed `source_event_id` keys, and the governed mid-call
+    actions (callback, candidate-end) keep their existing triggers.
+
+    Unknown or empty values FAIL SAFE to `toolfirst`. Read at the call site with
+    the literal name so the env-contract scanner sees it.
+    """
+    value = (os.getenv("PHONE_TURN_MODE") or "").strip().lower()
+    return PHONE_TURN_MODE_TOOLLESS if value == PHONE_TURN_MODE_TOOLLESS else PHONE_TURN_MODE_TOOLFIRST
+
+
 # ── P5: the heartbeat cadence envelope ────────────────────────────────
 #
 # THE SERVER DICTATES THE CADENCE, because the server owns the lease. These
@@ -2889,6 +2921,7 @@ def phone_agent_class(agent_base: Any) -> Any:
             on_advance: Callable[[], Any] | None = None,
             native_turns: bool = False,
             native_reply_plan: Callable[[], str | None] | None = None,
+            turn_mode: str = PHONE_TURN_MODE_TOOLFIRST,
         ) -> None:
             super().__init__(instructions=instructions)
             self._client = client
@@ -2898,6 +2931,14 @@ def phone_agent_class(agent_base: Any) -> Any:
             self._on_booking = on_booking
             self._on_probe = on_probe
             self._on_advance = on_advance
+            # `toolfirst` (default) forces the muzzled required-tool pass on every
+            # substantive turn; `toolless` passes the turn straight through with
+            # `tool_choice="auto"` (browser-style) and commits the boundary in the
+            # background. Anything unrecognized fails safe to `toolfirst`.
+            self._turn_mode = (
+                PHONE_TURN_MODE_TOOLLESS if turn_mode == PHONE_TURN_MODE_TOOLLESS
+                else PHONE_TURN_MODE_TOOLFIRST
+            )
             self._turn_policy = "pre_consent"
             # Native mode lets LiveKit continue its normal reply lifecycle after
             # the durable callback. The legacy scripted loop remains available
@@ -2969,7 +3010,35 @@ def phone_agent_class(agent_base: Any) -> Any:
                 async for chunk in result:
                     yield chunk
                 return
-            if self._turn_policy == "substantive" and self._tool_resolved:
+            if self._turn_policy == "substantive" and self._turn_mode == PHONE_TURN_MODE_TOOLLESS:
+                # TOOLLESS substantive turn (browser-style). ONE Gemini call:
+                # the turn is passed straight through to generation with
+                # `tool_choice="auto"`, exactly like the browser Christy agent.
+                # There is no muzzled required-tool leg and no `_tool_resolved`
+                # latch — question-plan adherence rides the per-turn prompt the
+                # coordinator injected, and the durable boundary commits in the
+                # BACKGROUND after this reply is delivered.
+                #
+                # The cursor is owned SOLELY by that background commit, so the
+                # coordinator tools (advance_screening / request_probe) are
+                # REMOVED here: leaving them available under `tool_choice="auto"`
+                # let the model fire a SECOND `on_advance` concurrently with the
+                # background one, racing the shared cursor and its
+                # `outcome.cursor != cursor+1` check into a spurious
+                # HALT_PERSISTENCE. Only the GOVERNED mid-call tools stay
+                # available (propose/confirm/schedule callback), which is exactly
+                # the toolless contract: those need a tool to act, the substantive
+                # cursor move does not.
+                tools = [
+                    tool for tool in tools
+                    if self._tool_name(tool) not in {"request_probe", "advance_screening"}
+                ]
+                try:
+                    from dataclasses import replace
+                    model_settings = replace(model_settings, tool_choice="auto")
+                except (TypeError, ValueError):
+                    pass
+            elif self._turn_policy == "substantive" and self._tool_resolved:
                 # The coordinator tool already resolved for this reply. The
                 # remainder of the generation is ordinary speech: no tools, so
                 # a duplicate advance/probe is structurally impossible and the

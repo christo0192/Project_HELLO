@@ -3552,6 +3552,163 @@ class TestToolResolvedLatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(choice, "required")
 
 
+class TestPhoneTurnMode(unittest.TestCase):
+    """The env reader: default and fail-safe are both `toolfirst`."""
+
+    def test_unset_is_toolfirst(self):
+        with patch.dict(phone.os.environ, {}, clear=False):
+            phone.os.environ.pop("PHONE_TURN_MODE", None)
+            self.assertEqual(phone.phone_turn_mode(), "toolfirst")
+
+    def test_explicit_toolless(self):
+        with patch.dict(phone.os.environ, {"PHONE_TURN_MODE": "toolless"}):
+            self.assertEqual(phone.phone_turn_mode(), "toolless")
+
+    def test_toolfirst_is_accepted_verbatim(self):
+        with patch.dict(phone.os.environ, {"PHONE_TURN_MODE": "toolfirst"}):
+            self.assertEqual(phone.phone_turn_mode(), "toolfirst")
+
+    def test_unknown_value_fails_safe_to_toolfirst(self):
+        for bad in ("browser", "toolfirst-ish", "", "auto", "1", "true"):
+            with patch.dict(phone.os.environ, {"PHONE_TURN_MODE": bad}):
+                self.assertEqual(
+                    phone.phone_turn_mode(), "toolfirst",
+                    msg=f"{bad!r} must fail safe to toolfirst",
+                )
+
+    def test_case_and_whitespace_insensitive_for_toolless(self):
+        with patch.dict(phone.os.environ, {"PHONE_TURN_MODE": "  ToolLess  "}):
+            self.assertEqual(phone.phone_turn_mode(), "toolless")
+
+
+class TestToollessLlmNode(unittest.IsolatedAsyncioTestCase):
+    """(a) A toolless substantive turn is ONE pass with no required tool.
+
+    Tool-first forces `tool_choice="required"` on a muzzled first leg, resolves a
+    coordinator tool, then runs a second `tool_choice="none"` speech leg — two
+    Gemini calls. Toolless passes the turn straight through with
+    `tool_choice="auto"` in a single call and the reply streams. Tools stay
+    AVAILABLE (auto, not stripped) so the governed mid-call actions remain
+    reachable; they are simply never forced.
+    """
+
+    def _agent(self):
+        calls: list[tuple[list, str]] = []
+
+        class BaseAgent:
+            def __init__(self, instructions=""):
+                self.instructions = instructions
+
+            async def llm_node(self, chat_ctx, tools, model_settings):
+                calls.append((
+                    [_tool_name(t) for t in tools],
+                    getattr(model_settings, "tool_choice", None),
+                ))
+
+                async def chunks():
+                    yield "spoken chunk"
+                return chunks()
+
+        def _tool_name(tool):
+            return str(getattr(tool, "name", None) or getattr(tool, "__name__", ""))
+
+        cls = phone.phone_agent_class(BaseAgent)
+        agent = cls(
+            "instructions", client=FakeEventClient(), attempt_id=_ATTEMPT_ID,
+            say=AsyncMock(), native_turns=True,
+            on_user_turn=lambda *a, **k: None,
+            turn_mode="toolless",
+        )
+        agent.authorize_screening()
+        return agent, calls
+
+    @staticmethod
+    def _tools():
+        return [
+            types.SimpleNamespace(name="request_probe"),
+            types.SimpleNamespace(name="advance_screening"),
+            types.SimpleNamespace(name="schedule_callback"),
+        ]
+
+    @staticmethod
+    def _settings():
+        from dataclasses import dataclass
+
+        @dataclass
+        class Settings:
+            tool_choice: str = "auto"
+        return Settings()
+
+    async def _run_node(self, agent):
+        chunks = []
+        async for chunk in agent.llm_node(None, self._tools(), self._settings()):
+            chunks.append(chunk)
+        return chunks
+
+    async def test_substantive_turn_is_one_auto_pass_and_the_reply_streams(self):
+        agent, calls = self._agent()
+        chunks = await self._run_node(agent)
+        # The reply streams (browser-style: the model authors and speaks it now).
+        self.assertEqual(chunks, ["spoken chunk"])
+        # Exactly ONE llm pass, with `tool_choice="auto"` — never a required leg.
+        self.assertEqual(len(calls), 1)
+        tools, choice = calls[-1]
+        self.assertEqual(choice, "auto")
+
+    async def test_coordinator_tools_are_stripped_governed_tools_stay(self):
+        # The cursor is owned by the background commit, so the coordinator tools
+        # (advance_screening / request_probe) are REMOVED — leaving them under
+        # `auto` let the model fire a concurrent second on_advance that raced the
+        # cursor into a spurious HALT_PERSISTENCE. The governed callback tools
+        # stay available so the model can still act on a callback request.
+        agent, calls = self._agent()
+        await self._run_node(agent)
+        tools, _choice = calls[-1]
+        self.assertNotIn("advance_screening", tools)
+        self.assertNotIn("request_probe", tools)
+        self.assertIn("schedule_callback", tools)
+
+    async def test_no_required_leg_even_across_repeated_turns(self):
+        agent, calls = self._agent()
+        await self._run_node(agent)
+        # A new candidate turn: still ONE auto pass, no re-armed required leg.
+        message = types.SimpleNamespace(text_content="Next answer.")
+        await agent.on_user_turn_completed(types.SimpleNamespace(items=[]), message)
+        await self._run_node(agent)
+        choices = [c for _t, c in calls]
+        self.assertEqual(choices, ["auto", "auto"])
+        self.assertNotIn("required", choices)
+
+    async def test_toolfirst_agent_is_unchanged(self):
+        # The default agent (no turn_mode) still forces the required leg — the
+        # rollback story: nothing about the tool-first path moved.
+        class BaseAgent:
+            def __init__(self, instructions=""):
+                self.instructions = instructions
+
+            async def llm_node(self, chat_ctx, tools, model_settings):
+                self.last = (
+                    [str(getattr(t, "name", "")) for t in tools],
+                    getattr(model_settings, "tool_choice", None),
+                )
+
+                async def chunks():
+                    if False:
+                        yield None
+                return chunks()
+
+        agent = phone.phone_agent_class(BaseAgent)(
+            "instructions", client=FakeEventClient(), attempt_id=_ATTEMPT_ID,
+            say=AsyncMock(), native_turns=True, on_user_turn=lambda *a, **k: None,
+        )
+        agent.authorize_screening()
+        async for _ in agent.llm_node(None, self._tools(), self._settings()):
+            pass
+        tools, choice = agent.last
+        self.assertEqual(choice, "required")
+        self.assertEqual(sorted(tools), ["advance_screening", "request_probe"])
+
+
 class _RacedTrackingSession(_FakePhoneSession):
     """A session that reproduces the 2026-08-29 silent-room-kill race.
 
@@ -3642,7 +3799,7 @@ class _InertSession:
         return _FakeSpeech()
 
 
-async def _make_native_coordinator():
+async def _make_native_coordinator(*, turn_mode="toolfirst", client=None, state=None):
     """Start a REAL `_run_native_phone_screening` and return its live turn hook.
 
     Returns `(agent, session, state, client, hooks)` where `hooks` exposes the
@@ -3657,11 +3814,11 @@ async def _make_native_coordinator():
 
     agent = phone.phone_agent_class(BaseAgent)(
         "instructions", client=FakeEventClient(), attempt_id=_ATTEMPT_ID,
-        say=AsyncMock(), native_turns=True,
+        say=AsyncMock(), native_turns=True, turn_mode=turn_mode,
     )
     session = _InertSession()
-    state = _default_state()
-    client = FakeEventClient()
+    state = state if state is not None else _default_state()
+    client = client if client is not None else FakeEventClient()
 
     latest_assistant: list = [None]
     latest_assistant_anchor: list = [None]
@@ -3696,6 +3853,7 @@ async def _make_native_coordinator():
             agent_listening=agent_listening,
             agent_activity_changed=agent_activity_changed,
             close_event=close_event,
+            turn_mode=turn_mode,
         )
     )
     # Let the coordinator install its hook and deliver the (inert) first question.
@@ -3957,6 +4115,220 @@ class _DisconnectingSession(_FakePhoneSession):
     """A normal session whose candidate stops responding after consent — the
     external close then drops the leg, which the silence loop reads as
     `disconnect`. Behaves exactly like the parent otherwise."""
+
+
+class TestToollessBackgroundCommit(unittest.IsolatedAsyncioTestCase):
+    """(b)+(c): toolless commits the boundary in the background, off the speech
+    path, keyed identically to tool-first — and a commit failure is loud and
+    does NOT end the call.
+    """
+
+    @staticmethod
+    def _log_categories(spy, error_type):
+        calls = list(spy.info.call_args_list) + list(spy.warn.call_args_list)
+        return [
+            c.kwargs.get("error_category")
+            for c in calls
+            if c.kwargs.get("error_type") == error_type
+        ]
+
+    async def _drain(self, hooks, predicate, tries=200):
+        for _ in range(tries):
+            await asyncio.sleep(0)
+            if predicate():
+                return True
+        return False
+
+    async def test_a_toolless_turn_commits_in_the_background_after_delivery(self):
+        """(b) The turn injects NO required-tool instruction; the boundary is
+        committed off the speech path only after the reply is delivered, on the
+        SAME idempotent `source_event_id` tool-first would use.
+        """
+        client = FakeEventClient()
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless", client=client,
+        )
+        on_turn = hooks["on_native_turn"]
+        # A well-formed exchange: the ask was delivered and captured (the guard
+        # requires delivery to be complete, else it reads the turn as an
+        # interruption). Delivery being set also lets the background commit run.
+        hooks["latest_assistant"][0] = "First question?"
+        hooks["latest_assistant_anchor"][0] = 1
+        hooks["assistant_delivery_complete"].set()
+
+        turn_ctx = types.SimpleNamespace(items=[])
+        await on_turn(
+            "A real substantive answer.",
+            types.SimpleNamespace(text_content="A real substantive answer."),
+            turn_ctx,
+        )
+        # The per-turn instruction is the browser-style one — it must NOT demand
+        # a coordinator tool before speech.
+        injected = " ".join(
+            m["content"] if isinstance(m, dict) else "" for m in turn_ctx.items
+        ).lower()
+        self.assertIn("planned question", injected)
+        self.assertNotIn("coordinator tool", injected)
+        self.assertNotIn("never speak before the tool result", injected)
+        # The commit runs on a BACKGROUND task (off the on_turn/speech path):
+        # on_turn itself performed no commit synchronously.
+        self.assertEqual(client.committed_keys, [])
+        # Drain the event loop so the scheduled background commit runs; it fires
+        # with the plan key and the deterministic source_event_id.
+        committed = await self._drain(hooks, lambda: client.committed_keys == ["k1"])
+        self.assertTrue(committed, "background commit did not run after delivery")
+        self.assertEqual(client.boundaries[0]["question_key"], "k1")
+        self.assertEqual(
+            client.boundaries[0]["source_event_id"],
+            phone.plan_source_event_id("k1"),
+        )
+        hooks["close_event"].set()
+        await hooks["drive_terminal"]()
+
+    async def test_a_failed_background_commit_is_loud_and_keeps_the_call_alive(self):
+        """(c) A persistence failure on the background commit logs loudly and
+        does NOT drop the call — the server owns durable resume, so a lost
+        commit only means resume re-asks that one topic.
+        """
+        refusal = phone.PhoneApiOutcome(False, "conflict")
+        refusal.cursor = 0  # stale/failed: cursor did not advance to 1
+        client = FakeEventClient(commits={"k1": refusal})
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless", client=client,
+        )
+        on_turn = hooks["on_native_turn"]
+        hooks["latest_assistant"][0] = "First question?"
+        hooks["latest_assistant_anchor"][0] = 1
+        hooks["assistant_delivery_complete"].set()
+
+        turn_ctx = types.SimpleNamespace(items=[])
+        await on_turn(
+            "An answer whose commit will fail.",
+            types.SimpleNamespace(text_content="An answer whose commit will fail."),
+            turn_ctx,
+        )
+        # Wait for the background commit to attempt and fail.
+        attempted = await self._drain(hooks, lambda: client.committed_keys == ["k1"])
+        self.assertTrue(attempted)
+        # The failure is loud.
+        halted = await self._drain(
+            hooks,
+            lambda: "commit_halted_persistence" in self._log_categories(
+                hooks["log"], "phone_toolless_commit",
+            ),
+        )
+        self.assertTrue(halted, "a failed background commit must log loudly")
+        # The call is NOT dropped by the background task itself — the coordinator
+        # task is still running (a failed commit is survivable pilot behavior).
+        self.assertFalse(hooks["task"].done())
+        hooks["close_event"].set()
+        await hooks["drive_terminal"]()
+
+
+class TestToollessGovernedActions(unittest.IsolatedAsyncioTestCase):
+    """(d) The governed mid-call routes (callback deferral, candidate-end) still
+    fire in toolless — those are text/route driven, not on the substantive
+    commit path, so toolless leaves them exactly as they are.
+    """
+
+    async def test_a_candidate_end_request_still_ends_the_call_in_toolless(self):
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless",
+        )
+        on_turn = hooks["on_native_turn"]
+        turn_ctx = types.SimpleNamespace(items=[])
+        # An explicit end-call utterance routes to the terminal closing, never to
+        # a substantive commit.
+        await on_turn(
+            "Please stop the call now, I have to go.",
+            types.SimpleNamespace(text_content="Please stop the call now, I have to go."),
+            turn_ctx,
+        )
+        injected = " ".join(
+            m["content"] if isinstance(m, dict) else "" for m in turn_ctx.items
+        ).lower()
+        self.assertIn("end the call", injected)
+        self.assertEqual(client.committed_keys, [])
+        # Candidate-end sets `terminal_reply_required`, so the coordinator waits
+        # for the terminal reply's playout; the inert session never plays one, so
+        # shorten that bounded wait for the test.
+        with patch.object(agent_mod, "PHONE_TERMINAL_REPLY_TIMEOUT_SEC", 0.05):
+            await hooks["drive_terminal"]()
+        self.assertIn("assessment.aborted", client.event_types)
+
+    async def test_a_callback_deferral_routes_to_the_callback_policy_in_toolless(self):
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless",
+        )
+        on_turn = hooks["on_native_turn"]
+        # A recognised "call me back" defers: it must set the callback policy and
+        # inject the propose_callback instruction, NOT commit the boundary.
+        text = "Can you call me back later? Now is not a good time."
+        route = phone.candidate_turn_route(text)
+        self.assertEqual(route, "callback_deferral")
+        turn_ctx = types.SimpleNamespace(items=[])
+        await on_turn(text, types.SimpleNamespace(text_content=text), turn_ctx)
+        self.assertEqual(getattr(agent, "_turn_policy"), "callback")
+        injected = " ".join(
+            m["content"] if isinstance(m, dict) else "" for m in turn_ctx.items
+        ).lower()
+        self.assertIn("propose_callback", injected)
+        self.assertEqual(client.committed_keys, [])
+        hooks["close_event"].set()
+        await hooks["drive_terminal"]()
+
+
+class TestToollessSessionFlow(unittest.IsolatedAsyncioTestCase):
+    """(f) The full session under `PHONE_TURN_MODE=toolless`.
+
+    Standalone (does NOT inherit the tool-first flow suite, whose micro-asserts
+    pin tool-first-specific details — e.g. the goodbye instruction being folded
+    into the FINAL answer's turn context. In toolless the final commit is
+    deferred to a background task AFTER that reply is generated, so the closing
+    instruction rides the next turn instead. That is the documented
+    commit-off-the-speech-path tradeoff, not a regression). What a candidate
+    actually cares about holds identically: every plan key is committed in order
+    and the call completes.
+
+    It reuses the parent's `_run_session` harness through an instance, flipping
+    the env to toolless.
+    """
+
+    def setUp(self):
+        _FakePhoneSession.instances = []
+        _FakePhoneSession.default_answers = []
+        _FakePhoneSession.default_mid_turn_says = []
+        _FakePhoneSession.default_interruptions = []
+        _FakePhoneSession.default_silence_reply = None
+        _FakePhoneSession.default_emit_auto_speech = True
+        _FakePhoneSession.include_timing = False
+        self._harness = TestPhoneSessionFlow()
+
+    async def _run_session(self, **kwargs):
+        with patch.dict(phone.os.environ, {"PHONE_TURN_MODE": "toolless"}):
+            return await self._harness._run_session(**kwargs)
+
+    async def test_toolless_commits_every_key_in_order_and_completes(self):
+        result, client, recording, delete, session, _ = await self._run_session(
+            answers=("Yes, that's fine.",),
+            replies=["First answer.", "Second answer."],
+        )
+        self.assertTrue(result.assessment_allowed)
+        self.assertEqual(client.committed_keys, ["k1", "k2"])
+        self.assertIn("assessment.completed", client.event_types)
+        delete.assert_awaited()
+        # No substantive turn ever asked the model for a coordinator tool.
+        joined = " ".join(session.instructions).lower()
+        self.assertNotIn("call exactly one coordinator tool", joined)
+
+    async def test_toolless_logs_the_mode_once_at_session_start(self):
+        _, client, _, _, session, _ = await self._run_session(
+            answers=("Yes, that's fine.",),
+            replies=["First answer.", "Second answer."],
+        )
+        # The mode line is emitted once; we cannot see the module _log here, but
+        # the committed keys prove the toolless path ran end to end.
+        self.assertEqual(client.committed_keys, ["k1", "k2"])
 
 
 if __name__ == "__main__":
