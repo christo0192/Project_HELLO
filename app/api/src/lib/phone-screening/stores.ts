@@ -40,6 +40,7 @@ import {
   type PhoneBacklogStatus,
   type ReclaimPhoneAttemptLeasesStatus,
   type SchedulePhoneAppointmentStatus,
+  type ConfirmCandidateVoiceCallbackStatus,
   type RequestPhoneRescreenStatus,
   type SetPhoneHaltStatus,
   type AttachPhoneAttemptRecordingStatus,
@@ -70,6 +71,8 @@ import type {
   ReclaimPhoneAttemptLeasesResult,
   SchedulePhoneAppointmentInput,
   SchedulePhoneAppointmentResult,
+  ConfirmCandidateVoiceCallbackInput,
+  ConfirmCandidateVoiceCallbackResult,
   RequestPhoneRescreenInput,
   RequestPhoneRescreenResult,
   SetPhoneHaltResult,
@@ -566,6 +569,29 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
         // created, so collapsing a renamed or missing key into `null` would
         // turn a contract break into silent slot destruction on every
         // legitimate reschedule.
+        supersededAppointmentId:
+          row && 'superseded_appointment_id' in row
+            ? (str(row, 'superseded_appointment_id') ?? null)
+            : undefined,
+      };
+    },
+
+    async confirmCandidateVoiceCallback(
+      input: ConfirmCandidateVoiceCallbackInput,
+    ): Promise<ConfirmCandidateVoiceCallbackResult> {
+      const { data, error } = await client.rpc('confirm_candidate_voice_callback', {
+        p_attempt_id: input.attemptId,
+        p_starts_at: isoInstant(input.startsAt),
+        p_now: isoInstant(input.now),
+      });
+      if (error) throw new Error('phone_confirm_callback_error');
+      const row = asRow(data);
+      return {
+        status: narrowPhoneRpcStatus<ConfirmCandidateVoiceCallbackStatus>(
+          'confirm_candidate_voice_callback', row,
+        ),
+        appointmentId: str(row, 'appointment_id'),
+        version: num(row, 'version'),
         supersededAppointmentId:
           row && 'superseded_appointment_id' in row
             ? (str(row, 'superseded_appointment_id') ?? null)

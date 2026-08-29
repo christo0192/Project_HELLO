@@ -22,6 +22,7 @@ import type {
   PhoneBacklogStatus,
   ReclaimPhoneAttemptLeasesStatus,
   SchedulePhoneAppointmentStatus,
+  ConfirmCandidateVoiceCallbackStatus,
   SetPhoneHaltStatus,
   AttachPhoneAttemptRecordingStatus,
   FinalizePhoneAttemptRecordingStatus,
@@ -220,6 +221,19 @@ export interface SchedulePhoneAppointmentResult {
   readonly appointmentId?: string;
   readonly version?: number;
   readonly engagementState?: PhoneEngagementState;
+  readonly supersededAppointmentId?: string | null;
+}
+
+export interface ConfirmCandidateVoiceCallbackInput {
+  readonly attemptId: string;
+  readonly startsAt: Date;
+  readonly now: Date;
+}
+
+export interface ConfirmCandidateVoiceCallbackResult {
+  readonly status: OrUnknown<ConfirmCandidateVoiceCallbackStatus>;
+  readonly appointmentId?: string;
+  readonly version?: number;
   readonly supersededAppointmentId?: string | null;
 }
 
@@ -628,6 +642,9 @@ export interface PhoneStores {
   scheduleAppointment(
     input: SchedulePhoneAppointmentInput,
   ): Promise<SchedulePhoneAppointmentResult>;
+  confirmCandidateVoiceCallback?(
+    input: ConfirmCandidateVoiceCallbackInput,
+  ): Promise<ConfirmCandidateVoiceCallbackResult>;
   requestRescreen(input: RequestPhoneRescreenInput): Promise<RequestPhoneRescreenResult>;
   cancelAppointment(input: CancelPhoneAppointmentInput): Promise<CancelPhoneAppointmentResult>;
   expireAppointments(input: {

@@ -468,13 +468,20 @@ def gate_copy_texts() -> frozenset[str]:
 
 def is_gate_copy(text: Any) -> bool:
     """True when this spoken line is fixed copy rather than a screening turn."""
-    return isinstance(text, str) and text.strip() in gate_copy_texts()
+    if not isinstance(text, str):
+        return False
+    clean = text.strip()
+    return clean in gate_copy_texts() or (
+        clean.startswith("I can call you back on ") and clean.endswith("?")
+    )
 
 
 # ── Worker event API ──────────────────────────────────────────────────
 
 EVENTS_PATH = "/api/internal/phone/events"
 APPOINTMENTS_PATH = "/api/internal/phone/appointments"
+CALLBACK_PROPOSE_PATH = "/api/internal/phone/callbacks/propose"
+CALLBACK_CONFIRM_PATH = "/api/internal/phone/callbacks/confirm"
 ASSESSMENT_START_PATH = "/api/internal/phone/assessment/start"
 CONSENT_START_PATH = "/api/internal/phone/assessment/consent-start"
 ASSESSMENT_TURN_PATH = "/api/internal/phone/assessment/turn"
@@ -742,8 +749,25 @@ class PhoneApiOutcome:
         return f"PhoneApiOutcome(ok={self.ok}, status={self.status!r})"
 
 
+class CallbackProposal:
+    """Server-normalized callback proposal; no model-generated date is spoken."""
+
+    __slots__ = ("starts_at", "ends_at", "weekday", "ist_date", "ist_time", "time_zone")
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        required = ("starts_at", "ends_at", "weekday", "ist_date", "ist_time", "time_zone")
+        if any(not isinstance(data.get(key), str) or not data[key].strip() for key in required):
+            raise ValueError("callback_proposal_malformed")
+        self.starts_at = data["starts_at"]
+        self.ends_at = data["ends_at"]
+        self.weekday = data["weekday"]
+        self.ist_date = data["ist_date"]
+        self.ist_time = data["ist_time"]
+        self.time_zone = data["time_zone"]
+
+
 class PhoneEventClient:
-    """Authenticated worker → API client for the two internal phone endpoints.
+    """Authenticated worker → API client for the internal phone endpoints.
 
     Shares the project's circuit-breaker boundary and its bearer contract: the
     worker secret must be at least 32 characters or the client fails closed
@@ -1074,6 +1098,46 @@ class PhoneEventClient:
             data.get("next_heartbeat_seconds")
         )
         return outcome
+
+    async def propose_callback(
+        self,
+        attempt_id: str,
+        starts_at: str,
+    ) -> tuple[PhoneApiOutcome, CallbackProposal | None]:
+        response = await self._post(
+            CALLBACK_PROPOSE_PATH,
+            {"attempt_id": str(attempt_id), "starts_at": str(starts_at)},
+            "callback_proposal",
+        )
+        if isinstance(response, str):
+            return PhoneApiOutcome(False, error_category=response), None
+        data = _response_json(response)
+        if not isinstance(data, dict):
+            return PhoneApiOutcome(False, error_category=_ERR_MALFORMED), None
+        status = data.get("status")
+        if data.get("ok") is not True or status != "proposal_valid":
+            return PhoneApiOutcome(False, str(status) if status is not None else _ERR_MALFORMED), None
+        try:
+            proposal = CallbackProposal(data)
+        except (TypeError, ValueError):
+            return PhoneApiOutcome(False, error_category=_ERR_MALFORMED), None
+        return PhoneApiOutcome(True, "proposal_valid"), proposal
+
+    async def confirm_callback(self, attempt_id: str, starts_at: str) -> PhoneApiOutcome:
+        response = await self._post(
+            CALLBACK_CONFIRM_PATH,
+            {"attempt_id": str(attempt_id), "starts_at": str(starts_at)},
+            "callback_confirmation",
+        )
+        if isinstance(response, str):
+            return PhoneApiOutcome(False, error_category=response)
+        data = _response_json(response)
+        if not isinstance(data, dict):
+            return PhoneApiOutcome(False, error_category=_ERR_MALFORMED)
+        status = data.get("status")
+        if data.get("ok") is not True or status not in {"ok", "already_confirmed"}:
+            return PhoneApiOutcome(False, str(status) if status is not None else _ERR_MALFORMED)
+        return PhoneApiOutcome(True, str(status))
 
     async def book_appointment(
         self,
@@ -1652,12 +1716,14 @@ PHONE_CALLBACK_POLICY_TEXT = (
     "\n\nPhone-call policy (mandatory):\n"
     "- If the candidate says they are busy, cannot talk, or asks to be called "
     "back later, STOP asking interview questions immediately.\n"
-    "- Offer to book a callback and, once they name a time, call the "
-    "schedule_callback tool with that time. The tool speaks the confirmation "
-    "itself.\n"
+    "- Offer to arrange a callback and, once they name an exact time, call "
+    "propose_callback. It only checks the time and reads back the exact "
+    "weekday, date and India time; it does not book anything.\n"
+    "- Book only after the candidate clearly says yes to that exact read-back. "
+    "Then call confirm_callback. Never call confirm_callback without that yes.\n"
     "- Never promise links, emails, messages, or follow-ups of any kind: you "
-    "cannot send anything. Booking through schedule_callback is the ONLY "
-    "commitment you may make.\n"
+    "cannot send anything. Callback confirmation is the ONLY commitment you "
+    "may make.\n"
     "- If the tool refuses, say only what it said; do not improvise an "
     "alternative promise.\n"
     "- Ask one question at a time and wait for the answer. Never re-ask a "
@@ -1876,6 +1942,21 @@ _SCHEDULE_REFUSAL_TEXT: dict[str, str] = {
         "That time has already gone by, so I can't set it up. Could you give me "
         "a time that's still ahead of us?"
     ),
+    "lead_time_too_short": (
+        "I need at least five minutes to set that up safely. What later time "
+        "would work for you?"
+    ),
+    "slot_full": (
+        "That time is already full. Could you choose another time?"
+    ),
+    "daily_attempt_exists": (
+        "I can't arrange another call on that same India-time day. What time "
+        "would work on the next available day?"
+    ),
+    "slot_straddles_ist_midnight": (
+        "That time is too close to midnight for a ten-minute call. Could you "
+        "choose an earlier time?"
+    ),
     "window_closed": (
         "I can only set up calls between nine in the morning and nine at night. "
         "Could you pick a time inside that?"
@@ -1891,6 +1972,10 @@ _SCHEDULE_REFUSAL_TEXT: dict[str, str] = {
     "slot_duration_invalid": (
         "That length doesn't work for this call. I can set aside between fifteen "
         "minutes and an hour. What suits you?"
+    ),
+    "phone_callback_proposal_error": (
+        "I couldn't safely check that time, so I won't promise it. Please give "
+        "me another time."
     ),
     "version_conflict": (
         "Something just changed on my side, so I couldn't hold that slot. The "
@@ -1909,6 +1994,55 @@ _SCHEDULE_CONFIRMED_TEXT = (
     "Done, I've got that booked. Someone will call you back then. "
     "Thanks for your time, and goodbye."
 )
+_CALLBACK_PROPOSAL_PROMPT = (
+    "I can call you back on {weekday}, {date} at {time} India time for a "
+    "ten-minute call. Is that correct?"
+)
+_CALLBACK_CONFIRMATION_YES = re.compile(
+    r"\b(yes|yeah|yep|correct|that's right|that is right|sounds good|confirm|okay|ok)\b",
+    re.IGNORECASE,
+)
+_CALLBACK_CONFIRMATION_NO = re.compile(
+    r"\b(no|nope|not quite|change|different|another|instead|continue)\b",
+    re.IGNORECASE,
+)
+
+
+def callback_confirmation_decision(text: Any) -> str | None:
+    """Classify only the explicit read-back response; ambiguity returns None."""
+    if not isinstance(text, str):
+        return None
+    clean = " ".join(text.strip().split())
+    if not clean:
+        return None
+    if _CALLBACK_CONFIRMATION_NO.search(clean):
+        return "declined"
+    if _CALLBACK_CONFIRMATION_YES.search(clean):
+        return "confirmed"
+    return None
+
+
+async def propose_callback_turn(
+    client: PhoneEventClient,
+    attempt_id: str,
+    starts_at: str,
+) -> tuple[ScheduleTurn, CallbackProposal | None]:
+    """Validate a proposal without creating an appointment."""
+    proposer = getattr(client, "propose_callback", None)
+    if not callable(proposer):
+        return ScheduleTurn(schedule_refusal_text("phone_callback_proposal_error"), False, "phone_callback_proposal_error"), None
+    try:
+        outcome, proposal = await proposer(attempt_id, starts_at)
+    except Exception:  # noqa: BLE001
+        return ScheduleTurn(_SCHEDULE_REFUSAL_FALLBACK, False, "phone_callback_proposal_error"), None
+    if not outcome.ok or proposal is None:
+        return ScheduleTurn(schedule_refusal_text(outcome.status), False, outcome.status), None
+    spoken = _CALLBACK_PROPOSAL_PROMPT.format(
+        weekday=proposal.weekday,
+        date=proposal.ist_date,
+        time=proposal.ist_time,
+    )
+    return ScheduleTurn(spoken, False, "proposal_valid"), proposal
 
 
 def schedule_refusal_text(status: Any) -> str:
@@ -2677,6 +2811,7 @@ def phone_agent_class(agent_base: Any) -> Any:
             # turn falls back to the discard path: the deterministic classifier
             # stays the sole consent authority.
             self._gate_opening = False
+            self._callback_proposal: CallbackProposal | None = None
             self.bookings: list[ScheduleTurn] = []
 
         def set_gate_opening(self, opening: bool) -> None:
@@ -2741,8 +2876,13 @@ def phone_agent_class(agent_base: Any) -> Any:
                 except (TypeError, ValueError):
                     pass
             elif self._turn_policy == "callback":
-
-                tools = [tool for tool in tools if self._tool_name(tool) == "schedule_callback"]
+                wanted = "confirm_callback" if self._callback_proposal is not None else "propose_callback"
+                tools = [tool for tool in tools if self._tool_name(tool) == wanted]
+                try:
+                    from dataclasses import replace
+                    model_settings = replace(model_settings, tool_choice="required")
+                except (TypeError, ValueError):
+                    pass
             else:
                 # opening, clarification, closing and pre-consent replies are
                 # ordinary Gemini turns with no coordinator mutation.
@@ -2826,6 +2966,54 @@ def phone_agent_class(agent_base: Any) -> Any:
                 result = await result
             self._tool_resolved = True
             return str(result)
+
+        def callback_confirmation_pending(self) -> bool:
+            return self._callback_proposal is not None
+
+        def clear_callback_proposal(self) -> None:
+            self._callback_proposal = None
+
+        @_tool
+        async def propose_callback(self, starts_at: str) -> str:
+            """Validate and read back a callback without booking it."""
+            turn, proposal = await propose_callback_turn(
+                self._client, self._attempt_id, starts_at
+            )
+            self.bookings.append(turn)
+            if proposal is not None:
+                self._callback_proposal = proposal
+            await self._say(turn.spoken)
+            self._tool_resolved = True
+            if self._native_turns:
+                from livekit.agents import StopResponse  # noqa: PLC0415
+                raise StopResponse()
+            return turn.spoken
+
+        @_tool
+        async def confirm_callback(self) -> str:
+            """Book only the currently pending, explicitly read-back proposal."""
+            proposal = self._callback_proposal
+            if proposal is None:
+                return "There is no callback time waiting for confirmation."
+            outcome = await self._client.confirm_callback(self._attempt_id, proposal.starts_at)
+            if outcome.ok and outcome.status in {"ok", "already_confirmed"}:
+                turn = ScheduleTurn(_SCHEDULE_CONFIRMED_TEXT, True, outcome.status)
+                self.bookings.append(turn)
+                self._callback_proposal = None
+                await self._say(turn.spoken)
+                if self._on_booking is not None:
+                    observed = self._on_booking(turn)
+                    if inspect.isawaitable(observed):
+                        await observed
+                if self._native_turns:
+                    from livekit.agents import StopResponse  # noqa: PLC0415
+                    raise StopResponse()
+                return turn.spoken
+            turn = ScheduleTurn(schedule_refusal_text(outcome.status), False, outcome.status)
+            self.bookings.append(turn)
+            self._callback_proposal = None
+            await self._say(turn.spoken)
+            return turn.spoken
 
         @_tool
         async def schedule_callback(

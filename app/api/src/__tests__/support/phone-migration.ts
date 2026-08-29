@@ -120,6 +120,12 @@ export const MIGRATION_0067_PATH = fileURLToPath(
 
 export const MIGRATION_0067 = readFileSync(MIGRATION_0067_PATH, 'utf8');
 
+export const MIGRATION_0068_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0068_phone_voice_callback_confirmation.sql', import.meta.url),
+);
+
+export const MIGRATION_0068 = readFileSync(MIGRATION_0068_PATH, 'utf8');
+
 /**
  * Every phone migration, NEWEST FIRST. Extraction walks this in order and the
  * first file that declares a thing wins, which is what "the latest declaration
@@ -127,6 +133,7 @@ export const MIGRATION_0067 = readFileSync(MIGRATION_0067_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    { name: '0068', sql: MIGRATION_0068 },
     { name: '0067', sql: MIGRATION_0067 },
     { name: '0066', sql: MIGRATION_0066 },
     { name: '0065', sql: MIGRATION_0065 },
@@ -228,6 +235,7 @@ export const RPC_NAMES = [
   'reclaim_phone_attempt_leases',
   'apply_phone_event',
   'schedule_phone_appointment',
+  'confirm_candidate_voice_callback',
   'cancel_phone_appointment',
   'set_phone_halt',
   'clear_phone_halt',

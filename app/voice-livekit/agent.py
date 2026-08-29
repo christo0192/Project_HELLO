@@ -1300,11 +1300,44 @@ async def _run_native_phone_screening(
             if question is not None:
                 add_turn_instruction(turn_ctx, phone_question_instructions(question))
             return
+        # A proposal is a two-turn protocol. Its pending state is local to this
+        # live worker and the server confirmation RPC is the durable boundary.
+        if getattr(agent, "callback_confirmation_pending", lambda: False)():
+            decision = phone.callback_confirmation_decision(text)
+            setattr(agent, "_turn_policy", "callback")
+            if decision == "confirmed":
+                add_turn_instruction(
+                    turn_ctx,
+                    "The candidate explicitly confirmed the exact callback read-back. "
+                    "Call confirm_callback now and do not speak before its result.",
+                )
+            elif decision == "declined":
+                getattr(agent, "clear_callback_proposal")()
+                add_turn_instruction(
+                    turn_ctx,
+                    "The candidate did not confirm that time. Ask for an exact new "
+                    "IST date and time, then call propose_callback only after it is clear. "
+                    "Do not book or advance the interview.",
+                )
+            else:
+                setattr(agent, "_turn_policy", "clarification")
+                add_turn_instruction(
+                    turn_ctx,
+                    "Ask only whether the exact callback date and India time you just "
+                    "read back are correct. Do not book until the candidate says yes.",
+                )
+            return
         route = phone.candidate_turn_route(text)
         if route is not None:
             setattr(agent, "_turn_policy", "callback" if route == "callback_deferral" else "clarification")
             if question is not None and route == "callback_deferral":
-                add_turn_instruction(turn_ctx, "Address the callback request and use schedule_callback only when the time is clear. Do not answer or advance the planned question.")
+                add_turn_instruction(
+                    turn_ctx,
+                    "Address the callback request. Ask for an exact IST date and time "
+                    "if needed, then call propose_callback. It only validates and reads "
+                    "back the time; it does not book anything. Do not answer or advance "
+                    "the planned question.",
+                )
             elif question is not None:
                 add_turn_instruction(turn_ctx, "Answer briefly from verified role context, then ask this same planned topic again as ONE natural spoken question in your own words:\n" + question.text)
             return
