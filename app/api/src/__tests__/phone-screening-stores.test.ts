@@ -390,6 +390,8 @@ describe('errors and malformed answers', () => {
       ['phone_apply_event_error', () => stores.applyEvent({ source: 'internal', eventType: 'x.y', now: NOW })],
       ['phone_schedule_appointment_error', () => stores.scheduleAppointment({
         engagementId: 'e', startsAt: NOW, endsAt: NOW, source: 'hr_manual', now: NOW })],
+      ['phone_confirm_callback_error', () => stores.confirmCandidateVoiceCallback!({
+        attemptId: 'a', startsAt: NOW, now: NOW })],
       ['phone_request_rescreen_error', () => stores.requestRescreen({
         candidateId: 'c', reason: 'technical_issue', requestId: 'r', source: 'hr_manual', now: NOW })],
       ['phone_cancel_appointment_error', () => stores.cancelAppointment({

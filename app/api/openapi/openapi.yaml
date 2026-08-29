@@ -1051,6 +1051,86 @@ paths:
               schema:
                 $ref: '#/components/schemas/PhoneWorkerError'
 
+  /api/internal/phone/callbacks/propose:
+    post:
+      tags: [phone]
+      operationId: proposePhoneVoiceCallback
+      summary: Validate a candidate callback time without booking it
+      description: Internal worker-only, read-only proposal validation. The server normalizes the exact IST weekday/date/time and enforces five-minute lead, calling-window, midnight, daily-contact, and capacity rules. No appointment is created until the candidate explicitly confirms the read-back through the confirmation endpoint.
+      security:
+        - workerBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PhoneVoiceCallbackRequest'
+      responses:
+        '200':
+          description: A normalized proposal or a stable refusal.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneVoiceCallbackProposalResponse'
+        '400':
+          description: Invalid request shape.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerCallbackResponse'
+        '401':
+          description: Worker bearer credential required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '503':
+          description: Phone screening disabled or proposal read failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+
+  /api/internal/phone/callbacks/confirm:
+    post:
+      tags: [phone]
+      operationId: confirmPhoneVoiceCallback
+      summary: Confirm and book a candidate callback after explicit read-back confirmation
+      description: Internal worker-only confirmation. The database atomically reserves exactly ten minutes, requires five minutes lead, enforces IST and capacity rules, preserves the daily-contact ledger, supersedes an existing live appointment, and closes the current answered leg. Replays are idempotent by source attempt.
+      security:
+        - workerBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PhoneVoiceCallbackRequest'
+      responses:
+        '200':
+          description: A confirmed booking or a stable refusal. Only ok=true is a booking.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerCallbackResponse'
+        '400':
+          description: Invalid request shape.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerCallbackResponse'
+        '401':
+          description: Worker bearer credential required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '503':
+          description: Phone screening disabled or confirmation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+
   /api/internal/phone/appointments:
     post:
       tags: [phone]
@@ -6348,6 +6428,64 @@ components:
           minimum: 900
           maximum: 3600
           description: The 0042 appointment duration envelope, enforced identically here.
+      additionalProperties: false
+
+    PhoneVoiceCallbackRequest:
+      type: object
+      required: [attempt_id, starts_at]
+      properties:
+        attempt_id:
+          type: string
+          format: uuid
+        starts_at:
+          type: string
+          format: date-time
+          description: Absolute UTC ISO-8601 instant with a literal Z.
+      additionalProperties: false
+
+    PhoneVoiceCallbackProposalResponse:
+      type: object
+      required: [ok, status]
+      properties:
+        ok:
+          type: boolean
+        status:
+          type: string
+          description: proposal_valid or a stable refusal code.
+        starts_at:
+          type: string
+          format: date-time
+        ends_at:
+          type: string
+          format: date-time
+        ist_date:
+          type: string
+          format: date
+        weekday:
+          type: string
+        ist_time:
+          type: string
+        time_zone:
+          type: string
+        duration_seconds:
+          type: integer
+          const: 600
+      additionalProperties: false
+
+    PhoneWorkerCallbackResponse:
+      type: object
+      required: [ok, status]
+      properties:
+        ok:
+          type: boolean
+        status:
+          type: string
+        appointment_id:
+          type: string
+          format: uuid
+        version:
+          type: integer
+          minimum: 1
       additionalProperties: false
 
     PhoneWorkerAppointmentResponse:
