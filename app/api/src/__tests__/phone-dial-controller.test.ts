@@ -683,9 +683,35 @@ describe('P5 dial — the happy path, and what it propagates', () => {
     expect(req.ringTimeoutSeconds).toBe(h.deps.config.ringTimeoutSeconds);
     expect(req.originateTimeoutSeconds).toBe(DIAL_CONFIG.originateTimeoutSeconds);
     expect(req.maxCallSeconds).toBe(DIAL_CONFIG.maxCallSeconds);
-    // The number crosses as the self-redacting wrapper, never as digits.
-    expect(req.number).toBe(NUMBER);
-    expect(String(req.number)).toBe('[redacted]');
+    // Bounce OFF (the default): the target is the candidate number, and it
+    // crosses as the self-redacting wrapper, never as digits.
+    const target = req.target as { kind: string; number?: unknown };
+    expect(target.kind).toBe('number');
+    expect(target.number).toBe(NUMBER);
+    expect(String(target.number)).toBe('[redacted]');
+  });
+
+  it('BOUNCE MODE — targets the bounce trunk and endpoint user, not the candidate number', async () => {
+    // Admission still reads the candidate number's digest (proven by the admit
+    // assertions elsewhere); bounce changes ONLY what the SDK dials.
+    const bounceConfig = loadPhoneDialConfig({
+      PHONE_BOUNCE_MODE: 'true',
+      PHONE_BOUNCE_TRUNK_ID: 'bounce-trunk',
+      PHONE_BOUNCE_SIP_USER: 'hello_bounce',
+      PHONE_AGENT_NAME: 'phone-worker',
+    } as NodeJS.ProcessEnv);
+    const h = harness({ dialConfig: bounceConfig });
+    await run(h);
+
+    expect(h.originate).toHaveBeenCalledTimes(1);
+    const req = h.originate.mock.calls[0][0] as Record<string, unknown>;
+    // The bounce trunk, not the direct one.
+    expect(req.trunkId).toBe('bounce-trunk');
+    const target = req.target as { kind: string; bounceUser?: string };
+    expect(target.kind).toBe('bounce');
+    expect(target.bounceUser).toBe('hello_bounce');
+    // No candidate number crosses on the bounce path.
+    expect(JSON.stringify(target)).not.toContain('number');
   });
 
   it('reports providerContacted FALSE for the synthetic client, which is not the provider', async () => {

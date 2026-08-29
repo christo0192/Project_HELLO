@@ -402,7 +402,7 @@ describe('4. the number is named in as few places as the dialer can manage', () 
       }
     }
     expect(callSites).toEqual([
-      { name: 'sip.ts', line: 'unwrapDialableNumber(request.number),' },
+      { name: 'sip.ts', line: '? unwrapDialableNumber(request.target.number)' },
     ]);
     // And that call site sits inside the LIVE client, not the synthetic one.
     expect(functionBody(file('sip.ts').source, LIVE_DECL)).toContain('unwrapDialableNumber(');

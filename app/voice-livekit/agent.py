@@ -1864,6 +1864,13 @@ async def _run_phone_session(
         post_call_answered=True,
         speak_opening=speak_opening,
         consent_reply_out=consent_reply_out,
+        # Answer-first origination (Plivo bounce). OFF by default → byte-identical
+        # current behavior. When ON, the gate waits for the server-verified
+        # answer (the Plivo webhook applies `call.answered`) before it speaks a
+        # word, because the SIP participant is present ~1s after dispatch, long
+        # before the real candidate has picked up. The wait budget is the same
+        # `PHONE_ANSWER_TIMEOUT_SEC` bound used elsewhere in the gate.
+        bounce_mode=phone.phone_bounce_mode(),
         # The session hint for the server-side recording start: derived from
         # the room name the dialer minted (`phone-<sessionId>`), the same
         # derivation 0044's binding re-verifies. Without it the server's

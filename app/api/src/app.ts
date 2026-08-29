@@ -24,6 +24,7 @@ import { exportRouter } from './routes/export.js';
 import { appealsRouter } from './routes/appeals.js';
 import { ashbyWebhookRouter } from './routes/ashby-webhook.js';
 import { phoneWebhookRouter } from './routes/phone-webhook.js';
+import { plivoWebhookRouter } from './routes/plivo-webhook.js';
 import { ashbyMissionControlRouter } from './routes/ashby-mission-control.js';
 import { ashbyReviewRouter } from './routes/ashby-review.js';
 import { phoneApiRouter } from './routes/phone.js';
@@ -260,6 +261,17 @@ export function createApp(opts: CreateAppOptions = {}) {
   // limiter. Disabled by default: it fails closed (503) unless
   // PHONE_SCREENING_ENABLED is on AND the existing LiveKit key pair is set.
   app.use('/api/integrations/livekit-phone', phoneWebhookRouter);
+
+  // Inbound Plivo answer-first ("bounce") callbacks. Mounted before recruiter
+  // auth for the same reason as the other webhooks: its trust boundary is the
+  // Plivo V3 signature over the request, not a recruiter session. Only the
+  // three POST callbacks exist on the router, so any other method/path under
+  // this prefix falls through to the auth middleware and is rejected. Still
+  // covered by the global per-IP limiter. Disabled by default: fails closed
+  // (503) unless PHONE_BOUNCE_MODE is on AND a Plivo auth token is set. The
+  // router carries its OWN scoped urlencoded parser (Plivo posts form-encoded
+  // params, and the global JSON parser is mounted far below, after auth).
+  app.use('/api/integrations/plivo', plivoWebhookRouter);
 
   // ── Auth middleware: runs after CORS so preflight succeeds ─────
   // Uses DI seam when authDeps is provided (tests).

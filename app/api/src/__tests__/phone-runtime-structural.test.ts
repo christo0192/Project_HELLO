@@ -549,14 +549,21 @@ describe('the worker paths the Python agent posts to are actually mounted', () =
       path.join(REPO, 'app/api/src/routes/phone-worker.ts'),
       'utf8',
     );
+    // The worker posts to most endpoints and GETs the answer-first readiness
+    // poll, so both verbs are scanned. Path PARAMETERS are normalised to a
+    // canonical `{}` placeholder so the Python `{attempt_id}` form and the
+    // Express `:attemptId` form compare equal — the route SHAPE is what must
+    // agree, not the placeholder spelling.
+    const canonicalise = (p: string): string =>
+      p.replace(/:[A-Za-z0-9_]+/g, '{}').replace(/\{[A-Za-z0-9_]+\}/g, '{}');
     const registered = new Set(
-      [...router.matchAll(/router\.post\(\s*'([^']+)'/g)].map((m) => m[1]),
+      [...router.matchAll(/router\.(?:post|get)\(\s*'([^']+)'/g)].map((m) => canonicalise(m[1])),
     );
     expect(registered.size).toBeGreaterThanOrEqual(4);
     const mount = workerMount();
     for (const p of [...PHONE_PY.matchAll(/^[A-Z_]*PATH\s*=\s*"([^"]+)"/gm)].map((m) => m[1])) {
-      const suffix = p.slice(mount.length);
-      expect(registered.has(suffix), `${p} maps to no router.post('${suffix}')`).toBe(true);
+      const suffix = canonicalise(p.slice(mount.length));
+      expect(registered.has(suffix), `${p} maps to no worker router route ('${suffix}')`).toBe(true);
     }
   });
 });

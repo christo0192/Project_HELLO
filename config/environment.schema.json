@@ -117,7 +117,16 @@
         "PHONE_RUNTIME_EXPIRE_MS": { "requiredInProduction": false, "secret": false },
         "PHONE_RUNTIME_DUE_LIMIT": { "requiredInProduction": false, "secret": false },
         "PHONE_RUNTIME_RECLAIM_LIMIT": { "requiredInProduction": false, "secret": false },
-        "PHONE_RUNTIME_JOB_LEASE_SECONDS": { "requiredInProduction": false, "secret": false }
+        "PHONE_RUNTIME_JOB_LEASE_SECONDS": { "requiredInProduction": false, "secret": false },
+        "PHONE_BOUNCE_MODE": { "requiredInProduction": false, "secret": false },
+        "PHONE_BOUNCE_TRUNK_ID": { "requiredInProduction": false, "secret": false, "external": true },
+        "PHONE_BOUNCE_SIP_USER": { "requiredInProduction": false, "secret": false },
+        "PHONE_BOUNCE_CALLER_ID": { "requiredInProduction": false, "secret": false, "external": true },
+        "PLIVO_AUTH_ID": { "requiredInProduction": false, "secret": false, "external": true },
+        "PLIVO_AUTH_TOKEN": { "requiredInProduction": false, "secret": true, "external": true },
+        "PLIVO_ANSWER_URL": { "requiredInProduction": false, "secret": false, "external": true },
+        "PLIVO_DIAL_STATUS_URL": { "requiredInProduction": false, "secret": false, "external": true },
+        "PLIVO_HANGUP_URL": { "requiredInProduction": false, "secret": false, "external": true }
       }
     },
     "web": {
@@ -151,6 +160,7 @@
         "CANDIDATE_SILENCE_END_SEC": { "requiredInProduction": true, "secret": false },
         "PHONE_TERMINAL_REPLY_TIMEOUT_SEC": { "requiredInProduction": true, "secret": false },
         "SESSION_MAX_RESIDENCY_SEC": { "requiredInProduction": false, "secret": false },
+        "PHONE_BOUNCE_MODE": { "requiredInProduction": false, "secret": false },
         "GOPU_CANDIDATE_NAME": { "requiredInProduction": false, "secret": false, "productionAllowed": false },
         "GOPU_ROLE_TITLE": { "requiredInProduction": false, "secret": false, "productionAllowed": false },
         "GOPU_ROLE_FOCUS": { "requiredInProduction": false, "secret": false, "productionAllowed": false },

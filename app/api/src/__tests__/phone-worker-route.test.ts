@@ -89,6 +89,9 @@ function build(options: {
   purgeSafe?: boolean;
   configSource?: NodeJS.ProcessEnv;
   now?: Date;
+  /** Bounce answered-state read; absent = fail-closed (not answered). */
+  readAnsweredState?: (attemptId: string) => Promise<{ answered: boolean; terminal: boolean }>;
+  withAnsweredState?: boolean;
 } = {}): Harness {
   const applyEvent = vi.fn(
     options.applyEvent ??
@@ -146,6 +149,10 @@ function build(options: {
       // path proves a hint is unusable without one (fail-closed).
       verifySessionHint: options.withHintVerifier === true ? (verifySessionHint as never) : undefined,
       purgeRecordings: options.withPurge === true ? (purgeRecordings as never) : undefined,
+      readAnsweredState:
+        options.withAnsweredState === true
+          ? (options.readAnsweredState ?? (async () => ({ answered: true, terminal: false })))
+          : undefined,
       configSource: options.configSource ?? ENABLED,
       now: () => options.now ?? NOW,
     }),
@@ -1947,5 +1954,61 @@ describe('POST /assessment/gate-turns — status mapping and no text echo', () =
       now: NOW,
     });
     expect(input.turns).toHaveLength(2);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// GET /attempt/:attemptId/answered — the answer-first ("bounce") readiness poll
+// ═══════════════════════════════════════════════════════════════════════
+
+function getAnswered(h: Harness, attemptId: string) {
+  return request(h.app)
+    .get(`/api/internal/phone-worker/attempt/${attemptId}/answered`)
+    .set('Authorization', `Bearer ${SECRET}`);
+}
+
+describe('P-answer GET /attempt/:id/answered', () => {
+  it('requires the worker secret', async () => {
+    const h = build({ withAnsweredState: true });
+    const res = await request(h.app).get(`/api/internal/phone-worker/attempt/${ATTEMPT}/answered`);
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects a non-uuid attempt id with 400', async () => {
+    const h = build({ withAnsweredState: true });
+    const res = await getAnswered(h, 'not-a-uuid');
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ ok: false, error: 'invalid_request' });
+  });
+
+  it('returns the read seam answer verbatim', async () => {
+    const readAnsweredState = vi.fn(async () => ({ answered: true, terminal: false }));
+    const h = build({ withAnsweredState: true, readAnsweredState });
+    const res = await getAnswered(h, ATTEMPT);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, answered: true, terminal: false });
+    expect(readAnsweredState).toHaveBeenCalledWith(ATTEMPT);
+  });
+
+  it('reports terminal true when the engagement is terminal', async () => {
+    const h = build({
+      withAnsweredState: true,
+      readAnsweredState: async () => ({ answered: false, terminal: true }),
+    });
+    const res = await getAnswered(h, ATTEMPT);
+    expect(res.body).toEqual({ ok: true, answered: false, terminal: true });
+  });
+
+  it('fails closed to not-answered when the seam is absent', async () => {
+    const h = build({}); // no withAnsweredState
+    const res = await getAnswered(h, ATTEMPT);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, answered: false, terminal: false });
+  });
+
+  it('503s when screening is disabled', async () => {
+    const h = build({ withAnsweredState: true, configSource: {} as NodeJS.ProcessEnv });
+    const res = await getAnswered(h, ATTEMPT);
+    expect(res.status).toBe(503);
   });
 });

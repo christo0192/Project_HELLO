@@ -136,7 +136,7 @@ function originateRequest(number: DialableNumber): PhoneOriginateRequest {
   const screening = screeningConfig();
   return {
     trunkId: dial.sipTrunkId,
-    number,
+    target: { kind: 'number', number },
     roomName: ROOM,
     attemptId: ATTEMPT,
     epoch: EPOCH,

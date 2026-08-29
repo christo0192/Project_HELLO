@@ -339,6 +339,14 @@ describe('2. no provider, no dialing, no network, no Ashby mutation', () => {
       'integrations/livekit-phone-dial/recording-purge.ts',
       'integrations/livekit-phone-dial/sip.ts',
       'routes/phone-worker.ts',
+      // Answer-first origination ("bounce") — the Plivo callbacks. The store
+      // reads the closed vocabulary predicates (`isLiveAttemptState`,
+      // `isTerminalEngagementState`) to decide bridgeability; the route applies
+      // events through `createPhoneStores`. Both consume the domain core's PURE
+      // reads/verdicts and neither re-implements a transition, exactly like the
+      // dialer files above.
+      'integrations/plivo-phone/stores.ts',
+      'routes/plivo-webhook.ts',
       // P5 — the runtime orchestration. It lives in its own package for a
       // structural reason, not a stylistic one: a worker loop needs
       // `setInterval`, the queue library and a logger, and all three are

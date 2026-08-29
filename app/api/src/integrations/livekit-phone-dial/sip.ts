@@ -77,9 +77,42 @@ export function phoneParticipantIdentity(attemptId: string): string {
   return `phone-${attemptId}`;
 }
 
+/**
+ * The participant attribute carrying the correlation attempt id in BOUNCE
+ * mode. The bounce trunk maps it to the SIP header `X-PH-HELLO-ATTEMPT`, which
+ * Plivo forwards to its answer callback as a request param, and the callback
+ * uses it to resolve WHICH attempt this instant-answer belongs to.
+ *
+ * Deliberately NOT in P3's inbound `APPROVED_PARTICIPANT_ATTRIBUTES` allowlist:
+ * that allowlist governs what the LiveKit WEBHOOK reader is willing to read
+ * back off a participant, and the correlation id has no business re-entering
+ * that path — it travels OUT to Plivo, never back in. A plain lowercase-hex
+ * uuid, so it can never hold a phone number.
+ */
+export const PHONE_HELLO_ATTEMPT_ATTRIBUTE = 'x-hello-attempt';
+
+/**
+ * What the dial targets. Two shapes, one seam:
+ *
+ *   * `{ number }`      — the candidate path (today). A self-redacting
+ *     `DialableNumber`; the ONLY unwrap in the codebase is the live SDK call.
+ *   * `{ bounceUser }`  — the bounce path. A plain, bounded, opaque SIP
+ *     endpoint username (e.g. `hello_bounce`) — NOT a phone number, and NOT
+ *     wrapped, because there is no number to protect. The candidate number
+ *     never travels this path; it is dialled by Plivo's app AFTER the bounce
+ *     endpoint answers, resolved SERVER-SIDE by the answer callback.
+ *
+ * Keeping them a discriminated union rather than an optional `number` means a
+ * bounce dial CANNOT accidentally carry — or leak — a candidate number, and a
+ * candidate dial cannot accidentally omit one: exactly one is present.
+ */
+export type PhoneOriginateTarget =
+  | { readonly kind: 'number'; readonly number: DialableNumber }
+  | { readonly kind: 'bounce'; readonly bounceUser: string };
+
 export interface PhoneOriginateRequest {
   readonly trunkId: string;
-  readonly number: DialableNumber;
+  readonly target: PhoneOriginateTarget;
   readonly roomName: string;
   readonly attemptId: string;
   readonly epoch: number;
@@ -145,19 +178,40 @@ export function createLiveSipClient(
     async createSipParticipant(request: PhoneOriginateRequest): Promise<PhoneOriginateResult> {
       const { SipClient } = await import('livekit-server-sdk');
       const client = new SipClient(url, apiKey, apiSecret);
+      // The SIP address is EITHER the candidate number (unwrapped here, the one
+      // legitimate unwrap site) OR the bounce endpoint username, which is not a
+      // number and needs no wrapper. The bounce path ADDS the correlation
+      // attribute so Plivo's answer callback can resolve the attempt; the epoch
+      // is set on both, exactly as before.
+      const sipCallTo =
+        request.target.kind === 'number'
+          // THE ONLY unwrap in the codebase. Everything upstream of this line
+          // handles the number as an opaque, self-redacting value.
+          ? unwrapDialableNumber(request.target.number)
+          : request.target.bounceUser;
+      const participantAttributes: Record<string, string> =
+        request.target.kind === 'bounce'
+          ? {
+              [PHONE_EPOCH_ATTRIBUTE]: String(request.epoch),
+              [PHONE_HELLO_ATTEMPT_ATTRIBUTE]: request.attemptId,
+            }
+          : { [PHONE_EPOCH_ATTRIBUTE]: String(request.epoch) };
       const info = await client.createSipParticipant(
         request.trunkId,
-        // THE ONLY unwrap in the codebase. Everything upstream of this line
-        // handles the number as an opaque, self-redacting value.
-        unwrapDialableNumber(request.number),
+        sipCallTo,
         request.roomName,
         {
           participantIdentity: phoneParticipantIdentity(request.attemptId),
-          // The epoch is the ONLY attribute we set. P3's reader indexes an
-          // allowlist of exactly this one key by exact name, so anything else
-          // set here would be dropped at the boundary anyway — and setting it
-          // would still put it in the room for another reader to find.
-          participantAttributes: { [PHONE_EPOCH_ATTRIBUTE]: String(request.epoch) },
+          // The epoch is set on every dial. In bounce mode the correlation
+          // attribute rides alongside it (see above). P3's INBOUND reader still
+          // indexes only `phone_epoch` by exact name, so `x-hello-attempt` is
+          // never read back off a participant by our own webhook path.
+          participantAttributes,
+          // In bounce mode there is no candidate number in this call at all, so
+          // `hidePhoneNumber` guards nothing here — but it stays TRUE
+          // unconditionally: the endpoint username is not sensitive, and a
+          // conditional privacy flag is one refactor from being inverted on the
+          // path that IS sensitive.
           hidePhoneNumber: true,
           // NOT waiting for the answer, deliberately (2026-08-29 RCA). With
           // `waitUntilAnswered: true` this call blocked until the SDK noticed

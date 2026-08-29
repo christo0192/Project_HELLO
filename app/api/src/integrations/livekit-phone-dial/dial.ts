@@ -289,11 +289,24 @@ export async function dialPhoneAttempt(
   }
 
   // ── Originate ───────────────────────────────────────────────────────
+  // ── BOUNCE MODE: dial the Plivo voice-app endpoint, not the candidate ──
+  // The candidate number has ALREADY passed every admission/allowlist gate
+  // above (admission reads `request.number.digest`); bounce changes only what
+  // LiveKit dials. LiveKit dials the bounce ENDPOINT down the bounce TRUNK; the
+  // endpoint answers instantly (satisfying LiveKit's outbound-SIP answer
+  // timers, which never register a real answer on this Plivo trunk), and
+  // Plivo's app then dials the candidate — resolved server-side from the
+  // correlation attempt id carried on the `x-hello-attempt` attribute — and
+  // bridges. Off, this is byte-identical: the direct trunk, the candidate
+  // number, no correlation attribute.
+  const bounce = dialConfig.bounceMode;
   let originated: PhoneOriginateResult;
   try {
     originated = await deps.sip.createSipParticipant({
-      trunkId: dialConfig.sipTrunkId,
-      number: request.number,
+      trunkId: bounce ? dialConfig.bounceTrunkId : dialConfig.sipTrunkId,
+      target: bounce
+        ? { kind: 'bounce', bounceUser: dialConfig.bounceSipUser }
+        : { kind: 'number', number: request.number },
       roomName: room.roomName,
       attemptId,
       epoch,

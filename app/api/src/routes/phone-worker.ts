@@ -66,6 +66,7 @@ import { Queue } from '../lib/queue/index.js';
 import { PgAdapter } from '../lib/queue/pg-adapter.js';
 import { PHONE_ASSESSMENT_QUEUE, phoneAssessmentDedupKey } from '../lib/phone-runtime/assessment-handler.js';
 import { phoneRoomName } from '../integrations/livekit-phone-dial/phone-room.js';
+import { createPlivoBounceStore } from '../integrations/plivo-phone/stores.js';
 import { startPhoneAttemptRecording } from '../integrations/livekit-phone-dial/recording.js';
 import { purgePhoneEngagementRecordings } from '../integrations/livekit-phone-dial/recording-purge.js';
 import { supabaseStorageRecordingStorage } from '../lib/retention.js';
@@ -348,6 +349,18 @@ export interface PhoneWorkerRouterDeps {
   readonly scoreSession?: (sessionId: string) => Promise<void>;
   /** Existing durable queue seam; production uses the phone runtime queue. */
   readonly assessmentQueue?: Pick<Queue, 'enqueue'>;
+  /**
+   * Answer-first ("bounce") state read for the worker poll. In bounce mode the
+   * worker polls `GET /attempt/:attemptId/answered` before speaking the
+   * disclosure, because the Plivo bridge means the LiveKit participant is
+   * present (the bounce endpoint) BEFORE the candidate has actually answered.
+   * Injected so a test needs no DB; production reads the bounce store.
+   * FAIL-CLOSED: an absent seam reports not-answered.
+   */
+  readonly readAnsweredState?: (attemptId: string) => Promise<{
+    answered: boolean;
+    terminal: boolean;
+  }>;
 }
 
 
@@ -764,6 +777,38 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       });
     } catch {
       return res.status(500).json({ ok: false, status: 'phone_heartbeat_error' });
+    }
+  });
+
+  // ── GET /attempt/:attemptId/answered ──────────────────────────────
+  // The answer-first ("bounce") readiness poll. In bounce mode LiveKit dials a
+  // Plivo endpoint that answers INSTANTLY, so the LiveKit participant is present
+  // before the CANDIDATE has answered — the worker must not speak the disclosure
+  // to a leg that is really just the bounce endpoint. It polls this until
+  // `answered` (the attempt's `answered_at` is set OR its state is in the
+  // answered family) or `terminal` (the engagement is terminal, so stop).
+  //
+  // Tiny and PII-free: two booleans derived from the attempt/engagement rows.
+  // Same worker auth as every other endpoint. A malformed id is a flat 400; an
+  // absent read seam fails closed to `answered:false, terminal:false`.
+  router.get('/attempt/:attemptId/answered', requireWorkerPhoneAuth, async (req, res) => {
+    try {
+      if (!config().screeningEnabled) {
+        return res.status(503).json({ ok: false, error: 'phone_screening_disabled' });
+      }
+      const attemptId = req.params.attemptId;
+      if (typeof attemptId !== 'string' || !UUID_RE.test(attemptId)) {
+        return res.status(400).json({ ok: false, error: 'invalid_request' });
+      }
+      if (deps.readAnsweredState === undefined) {
+        // No seam wired: the safe answer is "not answered, not terminal" so the
+        // worker keeps polling rather than speaking prematurely.
+        return res.json({ ok: true, answered: false, terminal: false });
+      }
+      const state = await deps.readAnsweredState(attemptId);
+      return res.json({ ok: true, answered: state.answered === true, terminal: state.terminal === true });
+    } catch {
+      return res.status(500).json({ ok: false, error: 'phone_answered_state_error' });
     }
   });
 
@@ -1215,6 +1260,9 @@ export const phoneWorkerRouter = createPhoneWorkerRouter({
   // Explicit production wiring enables durable post-call scoring. Test routers
   // that intentionally inject only the legacy scoring seam remain synchronous.
   assessmentQueue: new Queue(new PgAdapter(supabase as never), { defaultMaxAttempts: 5 }),
+  async readAnsweredState(attemptId) {
+    return createPlivoBounceStore(supabase as never).readAnsweredState(attemptId);
+  },
   async verifySessionHint({ sessionId, engagementId }) {
     // Two narrow reads, both by primary key, both fail-closed: any error, any
     // missing row, any null candidate refuses the hint. The predicate is the
