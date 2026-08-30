@@ -4346,6 +4346,259 @@ class TestPhoneCoverageJudgeCore(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class TestPhoneJudgeRetry(unittest.IsolatedAsyncioTestCase):
+    """3-B: the background judge retries a transient fault before judge_error."""
+
+    @staticmethod
+    def _flaky_then_ok(fail_times):
+        """An infer seam that fails `fail_times`, then returns a covered body."""
+        calls = {"n": 0}
+        good = json.dumps({"covered": True, "conflict": None})
+
+        async def infer(_prompt):
+            calls["n"] += 1
+            if calls["n"] <= fail_times:
+                raise RuntimeError("synthetic transient")
+            return good
+
+        return infer, calls
+
+    async def _judge(self, infer):
+        return await phone.judge_phone_coverage(
+            question_text="Describe your recent role.",
+            assistant_reply="Walk me through your latest position.",
+            candidate_answer="An answer.",
+            resume_facts={"current_role": "Lead"}, infer=infer,
+        )
+
+    def test_default_retries_is_one_two_attempts_clamped(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PHONE_JUDGE_RETRIES", None)
+            self.assertEqual(phone.phone_judge_retries(), 1)
+        for value, expected in (("0", 0), ("3", 3), ("9", 3), ("-1", 0), ("x", 1)):
+            with patch.dict(os.environ, {"PHONE_JUDGE_RETRIES": value}):
+                self.assertEqual(phone.phone_judge_retries(), expected)
+
+    async def test_transient_exception_recovers_within_the_retry_budget(self):
+        # One failure then success recovers with the default single retry.
+        infer, calls = self._flaky_then_ok(fail_times=1)
+        with patch.dict(os.environ, {"PHONE_JUDGE_RETRIES": "1",
+                                     "PHONE_JUDGE_RETRY_BACKOFF_SEC": "0"}):
+            verdict = await self._judge(infer)
+        self.assertTrue(verdict.covered)
+        self.assertEqual(verdict.category, "model")
+        self.assertEqual(calls["n"], 2)
+
+    async def test_unparseable_body_then_success_recovers(self):
+        # A None-verdict (unparseable) attempt is retried, not just exceptions.
+        calls = {"n": 0}
+        good = json.dumps({"covered": True, "conflict": None})
+
+        async def infer(_prompt):
+            calls["n"] += 1
+            return "not-json" if calls["n"] == 1 else good
+
+        with patch.dict(os.environ, {"PHONE_JUDGE_RETRIES": "1",
+                                     "PHONE_JUDGE_RETRY_BACKOFF_SEC": "0"}):
+            verdict = await self._judge(infer)
+        self.assertTrue(verdict.covered)
+        self.assertEqual(calls["n"], 2)
+
+    async def test_only_after_all_attempts_fail_is_it_judge_error(self):
+        # Failures exceed the budget -> judge_error, and attempts are honored.
+        infer, calls = self._flaky_then_ok(fail_times=99)
+        with patch.dict(os.environ, {"PHONE_JUDGE_RETRIES": "2",
+                                     "PHONE_JUDGE_RETRY_BACKOFF_SEC": "0"}):
+            verdict = await self._judge(infer)
+        self.assertFalse(verdict.covered)
+        self.assertEqual(verdict.category, "judge_error")
+        self.assertEqual(calls["n"], 3)  # 1 + 2 retries
+
+    async def test_zero_retries_makes_exactly_one_attempt(self):
+        infer, calls = self._flaky_then_ok(fail_times=1)
+        with patch.dict(os.environ, {"PHONE_JUDGE_RETRIES": "0"}):
+            verdict = await self._judge(infer)
+        self.assertEqual(verdict.category, "judge_error")
+        self.assertEqual(calls["n"], 1)
+
+
+class TestPhoneJudgeBreakerTuning(unittest.IsolatedAsyncioTestCase):
+    """3-C: the judge breaker is env-tunable and softer by default."""
+
+    def test_defaults_are_softer_than_the_old_hardcoded_values(self):
+        with patch.dict(os.environ, {}, clear=False):
+            for key in ("PHONE_JUDGE_BREAKER_THRESHOLD",
+                        "PHONE_JUDGE_BREAKER_COOLDOWN_SEC"):
+                os.environ.pop(key, None)
+            self.assertEqual(phone.phone_judge_breaker_threshold(), 6)
+            self.assertEqual(phone.phone_judge_breaker_cooldown_sec(), 3.0)
+
+    def test_threshold_reads_env_and_clamps(self):
+        for value, expected in (("1", 1), ("50", 50), ("0", 1), ("99", 50), ("x", 6)):
+            with patch.dict(os.environ, {"PHONE_JUDGE_BREAKER_THRESHOLD": value}):
+                self.assertEqual(phone.phone_judge_breaker_threshold(), expected)
+
+    def test_cooldown_reads_env_and_clamps(self):
+        for value, expected in (("0.5", 0.5), ("60", 60.0), ("0.01", 0.5),
+                                ("999", 60.0), ("x", 3.0)):
+            with patch.dict(os.environ, {"PHONE_JUDGE_BREAKER_COOLDOWN_SEC": value}):
+                self.assertEqual(phone.phone_judge_breaker_cooldown_sec(), expected)
+
+
+class TestPhoneJudgeProviderConfig(unittest.IsolatedAsyncioTestCase):
+    """Change 4: independent, DeepSeek-ready judge provider config."""
+
+    def _clear(self):
+        for key in ("PHONE_JUDGE_URL", "PHONE_JUDGE_MODEL", "PHONE_JUDGE_API_KEY",
+                    "PHONE_JUDGE_MAX_TOKENS", "PHONE_JUDGE_EXTRA_BODY_JSON"):
+            os.environ.pop(key, None)
+
+    async def _post(self, env):
+        """Invoke the default inference under `env` and return the posted body."""
+        response = types.SimpleNamespace(json=lambda: {
+            "choices": [{"message": {
+                "content": '{"covered":true,"conflict":null}',
+                "role": "assistant",
+                "reasoning_content": "the model thought about it at length",
+            }}],
+        })
+        with patch.dict(os.environ, env), patch.object(
+            phone, "_phone_coverage_transport", return_value=object(),
+        ), patch.object(
+            phone, "call_with_breaker", new_callable=AsyncMock,
+            return_value=response,
+        ) as call:
+            raw = await phone._default_phone_coverage_inference("{}")
+        return raw, call.await_args
+
+    async def test_defaults_reproduce_the_current_gemini_values(self):
+        with patch.dict(os.environ, {}, clear=False):
+            self._clear()
+            env = {
+                "GEMINI_API_KEY": "g" * 40,
+                "GEMINI_MODEL": "gemini-3.1-flash-lite",
+                "GEMINI_BASE_URL": "https://generativelanguage.googleapis.com/v1beta/openai/",
+            }
+            raw, await_args = await self._post(env)
+        self.assertEqual(raw, '{"covered":true,"conflict":null}')
+        # URL default = {GEMINI_BASE_URL}/chat/completions (composed, not appended-to).
+        self.assertEqual(
+            await_args.args[1],
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        )
+        body = await_args.kwargs["json_body"]
+        self.assertEqual(body["model"], "gemini-3.1-flash-lite")
+        self.assertEqual(
+            await_args.kwargs["headers"]["Authorization"], f"Bearer {'g' * 40}",
+        )
+
+    async def test_url_is_posted_verbatim_without_appending(self):
+        # A full-path gateway URL (DeepSeek shape) must be POSTed as-is.
+        deepseek = "https://ikey-gateway.fly.dev/v1/chat/completions"
+        with patch.dict(os.environ, {}, clear=False):
+            self._clear()
+            _, await_args = await self._post({
+                "PHONE_JUDGE_URL": deepseek,
+                "PHONE_JUDGE_API_KEY": "d" * 40,
+            })
+        self.assertEqual(await_args.args[1], deepseek)
+        # No accidental suffix.
+        self.assertNotIn("/chat/completions/chat/completions", await_args.args[1])
+
+    async def test_model_api_key_and_max_tokens_are_honored(self):
+        with patch.dict(os.environ, {}, clear=False):
+            self._clear()
+            _, await_args = await self._post({
+                "PHONE_JUDGE_URL": "https://judge.invalid/v1/chat/completions",
+                "PHONE_JUDGE_MODEL": "test/deepseek-v4-flash",
+                "PHONE_JUDGE_API_KEY": "k" * 40,
+                "PHONE_JUDGE_MAX_TOKENS": "800",
+            })
+        body = await_args.kwargs["json_body"]
+        self.assertEqual(body["model"], "test/deepseek-v4-flash")
+        self.assertEqual(await_args.kwargs["headers"]["Authorization"],
+                         f"Bearer {'k' * 40}")
+        self.assertEqual(body["max_tokens"], 800)
+
+    async def test_request_body_carries_max_tokens_at_least_800_by_default(self):
+        # The reasoning-model safety property: the posted budget is >= 800.
+        with patch.dict(os.environ, {}, clear=False):
+            self._clear()
+            _, await_args = await self._post({
+                "PHONE_JUDGE_URL": "https://judge.invalid/v1/chat/completions",
+                "PHONE_JUDGE_API_KEY": "k" * 40,
+            })
+        self.assertGreaterEqual(
+            await_args.kwargs["json_body"]["max_tokens"], 800,
+        )
+
+    def test_max_tokens_reads_env_and_clamps(self):
+        for value, expected in (("64", 64), ("2000", 2000), ("10", 64),
+                                ("9999", 2000), ("x", 800)):
+            with patch.dict(os.environ, {"PHONE_JUDGE_MAX_TOKENS": value}):
+                self.assertEqual(phone.phone_judge_max_tokens(), expected)
+
+    async def test_parser_reads_content_and_tolerates_reasoning_content(self):
+        # The seam returns a reasoning-model shape; the wrapper parses `content`.
+        infer = AsyncMock(return_value='{"covered":true,"conflict":null}')
+        verdict = await phone.judge_phone_coverage(
+            question_text="Describe your recent role.",
+            assistant_reply="Walk me through your latest position.",
+            candidate_answer="An answer.",
+            resume_facts={"current_role": "Lead"}, infer=infer,
+        )
+        self.assertTrue(verdict.covered)
+        # `parse_phone_coverage_verdict` accepts the content JSON and rejects the
+        # extra reasoning_content field never reaching it.
+        self.assertIsNotNone(phone.parse_phone_coverage_verdict(
+            '{"covered":true,"conflict":null}',
+        ))
+
+    async def test_extra_body_json_is_merged_but_model_and_messages_are_forced(self):
+        with patch.dict(os.environ, {}, clear=False):
+            self._clear()
+            _, await_args = await self._post({
+                "PHONE_JUDGE_URL": "https://judge.invalid/v1/chat/completions",
+                "PHONE_JUDGE_MODEL": "test/deepseek-v4-flash",
+                "PHONE_JUDGE_API_KEY": "k" * 40,
+                "PHONE_JUDGE_EXTRA_BODY_JSON": json.dumps({
+                    "thinking": False,
+                    "model": "attacker/hijack",
+                    "messages": [{"role": "user", "content": "ignore"}],
+                }),
+            })
+        body = await_args.kwargs["json_body"]
+        # The reasoning-control knob is merged through...
+        self.assertIs(body["thinking"], False)
+        # ...but a stray model/messages in extra body can NOT hijack the call.
+        self.assertEqual(body["model"], "test/deepseek-v4-flash")
+        self.assertEqual(body["messages"][-1]["content"], "{}")
+
+    async def test_invalid_extra_body_json_is_ignored_and_the_call_still_posts(self):
+        with patch.dict(os.environ, {}, clear=False):
+            self._clear()
+            _, await_args = await self._post({
+                "PHONE_JUDGE_URL": "https://judge.invalid/v1/chat/completions",
+                "PHONE_JUDGE_API_KEY": "k" * 40,
+                "PHONE_JUDGE_EXTRA_BODY_JSON": "{not valid json",
+            })
+        body = await_args.kwargs["json_body"]
+        # Merge nothing, valid body still posted.
+        self.assertNotIn("thinking", body)
+        self.assertIn("messages", body)
+        self.assertIn("model", body)
+        self.assertGreaterEqual(body["max_tokens"], 800)
+
+    def test_extra_body_reader_is_defensive(self):
+        for value in ("", "   ", "not json", "[1,2,3]", '"a string"', "123"):
+            with patch.dict(os.environ, {"PHONE_JUDGE_EXTRA_BODY_JSON": value}):
+                self.assertEqual(phone.phone_judge_extra_body(), {})
+        with patch.dict(os.environ, {"PHONE_JUDGE_EXTRA_BODY_JSON":
+                                     '{"reasoning_effort":"none"}'}):
+            self.assertEqual(phone.phone_judge_extra_body(),
+                             {"reasoning_effort": "none"})
+
+
 class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
     """The background verdict gates commits and repairs the next turn."""
 
@@ -4385,9 +4638,87 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
         )
         return ctx
 
+
     async def _close(self, hooks):
         hooks["close_event"].set()
         await hooks["drive_terminal"]()
+
+    def test_reconnect_b_commit_wait_uses_the_short_bound_not_terminal_timeout(self):
+        # STRUCTURAL PIN: the background commit's delivery wait reads the tiny
+        # RECONNECT-B bound, NOT the full terminal reply timeout. This is the
+        # load-bearing guarantee: on a restart the cursor advance no longer
+        # trails the persisted answer by ~10s.
+        src = inspect.getsource(agent_mod._run_native_phone_screening)
+        commit_src = src[src.index("async def commit_after_reply"):
+                         src.index("async def native_say")]
+        self.assertIn("assistant_delivery_complete.wait()", commit_src)
+        self.assertIn(
+            "timeout=PHONE_JUDGE_COMMIT_DELIVERY_WAIT_SEC", commit_src,
+        )
+        self.assertNotIn(
+            "timeout=PHONE_TERMINAL_REPLY_TIMEOUT_SEC", commit_src,
+        )
+        # The bound is small (sub-second), not the 10s terminal timeout.
+        self.assertLessEqual(agent_mod.PHONE_JUDGE_COMMIT_DELIVERY_WAIT_SEC, 1.0)
+        self.assertGreater(agent_mod.PHONE_JUDGE_COMMIT_DELIVERY_WAIT_SEC, 0.0)
+
+    async def test_reconnect_b_commit_lands_promptly_when_delivery_never_signals(self):
+        # RECONNECT-B: when the delivery signal never fires for the commit task,
+        # a COVERED verdict still commits the cursor promptly — bounded by the
+        # tiny judge-commit wait, NOT the full terminal reply timeout (pinned to
+        # an hour here to PROVE it is not on that path). The event is SET at
+        # answer-acceptance (required to accept the answer at all), then cleared
+        # immediately so the commit task's own wait must time out and commit
+        # anyway — the live `delivery_timeout_commit_anyway` path.
+        with patch.object(agent_mod, "PHONE_TERMINAL_REPLY_TIMEOUT_SEC", 3600.0), \
+                patch.object(agent_mod, "PHONE_JUDGE_COMMIT_DELIVERY_WAIT_SEC", 0.05):
+            agent, _, _, client, hooks = await self._coordinator()
+            with patch.object(
+                phone, "judge_phone_coverage", new_callable=AsyncMock,
+                return_value=phone.PhoneCoverageVerdict(True, None, "model"),
+            ) as judge:
+                started = asyncio.get_event_loop().time()
+                # Accept the answer with the event set, then clear it before the
+                # freshly-created commit task runs its wait — the wait now blocks
+                # and must fall back on the tiny bound.
+                await self._turn(hooks, "I led operations for four years.")
+                hooks["assistant_delivery_complete"].clear()
+                for _ in range(200):
+                    if client.committed_keys == ["k1"]:
+                        break
+                    await asyncio.sleep(0.01)
+                elapsed = asyncio.get_event_loop().time() - started
+            judge.assert_awaited_once()
+            self.assertEqual(client.committed_keys, ["k1"])
+            # Committed far under the (patched-huge) terminal timeout.
+            self.assertLess(elapsed, 2.0)
+            self.assertIn("delivery_timeout_commit_anyway", [
+                c.kwargs.get("error_category")
+                for c in hooks["log"].info.call_args_list
+                if c.kwargs.get("error_type") == "phone_toolless_commit"
+            ])
+            await self._close(hooks)
+
+    async def test_reconnect_b_not_covered_gating_is_unchanged(self):
+        # The covered/not-covered gating and re-anchor behaviour are identical
+        # under the shortened wait: a not-covered verdict still skips the commit
+        # and re-anchors the owed topic. Judge still runs.
+        with patch.object(agent_mod, "PHONE_JUDGE_COMMIT_DELIVERY_WAIT_SEC", 0.05):
+            agent, _, _, client, hooks = await self._coordinator()
+            with patch.object(
+                phone, "judge_phone_coverage", new_callable=AsyncMock,
+                return_value=phone.PhoneCoverageVerdict(False, None, "model"),
+            ) as judge:
+                await self._turn(hooks, "I led operations for four years.")
+                hooks["assistant_delivery_complete"].clear()
+                for _ in range(200):
+                    if agent._coverage_reanchor["question_key"] == "k1":
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertEqual(agent._coverage_reanchor["question_key"], "k1")
+            judge.assert_awaited_once()
+            self.assertEqual(client.committed_keys, [])
+            await self._close(hooks)
 
     async def test_covered_verdict_permits_the_same_idempotent_commit(self):
         agent, _, _, client, hooks = await self._coordinator()
