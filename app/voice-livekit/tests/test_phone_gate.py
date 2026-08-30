@@ -3957,7 +3957,10 @@ class _InertSession:
         return _FakeSpeech()
 
 
-async def _make_native_coordinator(*, turn_mode="toolfirst", client=None, state=None):
+async def _make_native_coordinator(
+    *, turn_mode="toolfirst", client=None, state=None,
+    coverage_judge_enabled=False,
+):
     """Start a REAL `_run_native_phone_screening` and return its live turn hook.
 
     Returns `(agent, session, state, client, hooks)` where `hooks` exposes the
@@ -4012,6 +4015,7 @@ async def _make_native_coordinator(*, turn_mode="toolfirst", client=None, state=
             agent_activity_changed=agent_activity_changed,
             close_event=close_event,
             turn_mode=turn_mode,
+            coverage_judge_enabled=coverage_judge_enabled,
         )
     )
     # Let the coordinator install its hook and deliver the (inert) first question.
@@ -4143,6 +4147,373 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
         await self._finish(hooks, interrupted=True)
         self.assertIn(phone.PHONE_ASSESSMENT_CLOSING_TEXT, session.spoken)
         self.assertIn("assessment.completed", client.event_types)
+
+
+class TestPhoneCoverageJudgeCore(unittest.IsolatedAsyncioTestCase):
+    """Pure precheck/parser plus the async fail-closed wrapper."""
+
+    def test_flag_defaults_on_and_only_literal_off_disables(self):
+        for value, expected in (
+            ("", True), ("on", True), ("garbage", True),
+            ("OFF", False), (" off ", False),
+        ):
+            with patch.dict(phone.os.environ, {"PHONE_COVERAGE_JUDGE": value}):
+                self.assertEqual(phone.phone_coverage_judge_enabled(), expected)
+
+    def test_mode_is_logged_exactly_once_at_session_start(self):
+        source = inspect.getsource(agent_mod._run_phone_session)
+        self.assertEqual(source.count('error_type="phone_coverage_judge_mode"'), 1)
+        self.assertIn('"on" if coverage_judge_enabled else "off"', source)
+
+    def test_precheck_accepts_strong_topic_overlap_and_defers_paraphrases(self):
+        self.assertTrue(phone.phone_coverage_precheck(
+            "What is your current notice period?",
+            "Could you tell me your current notice period?",
+        ))
+        self.assertIsNone(phone.phone_coverage_precheck(
+            "What is your current notice period?",
+            "How soon could you join us?",
+        ))
+        self.assertFalse(phone.phone_coverage_precheck("Notice period", ""))
+
+    def test_parser_is_strict_and_bounds_conflict_text(self):
+        verdict = phone.parse_phone_coverage_verdict(json.dumps({
+            "covered": True,
+            "conflict": {
+                "resume_fact": "  Six years at Example Co  ",
+                "spoken_claim": "I joined last month",
+            },
+        }))
+        self.assertEqual(verdict.covered, True)
+        self.assertEqual(verdict.conflict["resume_fact"], "Six years at Example Co")
+        for bad in (
+            "not-json", {"covered": "yes", "conflict": None},
+            {"covered": True, "conflict": {"resume_fact": "x"}},
+            {"covered": True, "conflict": None, "reason": "extra"},
+        ):
+            self.assertIsNone(phone.parse_phone_coverage_verdict(bad))
+
+    async def test_deterministic_covered_skips_inference_without_resume_evidence(self):
+        infer = AsyncMock()
+        verdict = await phone.judge_phone_coverage(
+            question_text="What is your current notice period?",
+            assistant_reply="Could you share your current notice period?",
+            candidate_answer="Thirty days.", resume_facts={}, infer=infer,
+        )
+        self.assertTrue(verdict.covered)
+        self.assertEqual(verdict.category, "deterministic_covered")
+        infer.assert_not_awaited()
+
+    async def test_default_inference_reuses_the_configured_gemini_endpoint(self):
+        response = types.SimpleNamespace(json=lambda: {
+            "choices": [{"message": {"content": '{"covered":true,"conflict":null}'}}],
+        })
+        transport = object()
+        with patch.dict(phone.os.environ, {
+            "GEMINI_API_KEY": "x" * 40,
+            "GEMINI_MODEL": "gemini-test-model",
+            "GEMINI_BASE_URL": "https://example.invalid/v1beta/openai/",
+        }), patch.object(
+            phone, "_phone_coverage_transport", return_value=transport,
+        ), patch.object(
+            phone, "call_with_breaker", new_callable=AsyncMock,
+            return_value=response,
+        ) as call:
+            raw = await phone._default_phone_coverage_inference("{}")
+        self.assertEqual(raw, '{"covered":true,"conflict":null}')
+        self.assertEqual(call.await_args.args[:2], (
+            "POST", "https://example.invalid/v1beta/openai/chat/completions",
+        ))
+        self.assertIs(call.await_args.kwargs["transport"], transport)
+        self.assertEqual(
+            call.await_args.kwargs["json_body"]["model"], "gemini-test-model",
+        )
+        self.assertEqual(call.await_args.kwargs["json_body"]["temperature"], 0)
+
+    async def test_model_result_can_return_coverage_and_a_conflict(self):
+        infer = AsyncMock(return_value=json.dumps({
+            "covered": True,
+            "conflict": {
+                "resume_fact": "Six years at Example Co",
+                "spoken_claim": "I joined last month",
+            },
+        }))
+        verdict = await phone.judge_phone_coverage(
+            question_text="Describe your recent role.",
+            assistant_reply="Walk me through your latest position.",
+            candidate_answer="I joined last month.",
+            resume_facts={"recent_role": {"period": "2020-2026"}},
+            infer=infer,
+        )
+        self.assertTrue(verdict.covered)
+        self.assertIsNotNone(verdict.conflict)
+        infer.assert_awaited_once()
+
+    async def test_timeout_or_unparseable_output_fails_toward_not_covered(self):
+        async def raises(_prompt):
+            raise TimeoutError("synthetic")
+
+        for infer in (raises, AsyncMock(return_value="not-json")):
+            verdict = await phone.judge_phone_coverage(
+                question_text="Describe your recent role.",
+                assistant_reply="Walk me through your latest position.",
+                candidate_answer="An answer.",
+                resume_facts={"current_role": "Lead"}, infer=infer,
+            )
+            self.assertFalse(verdict.covered)
+            self.assertEqual(verdict.category, "judge_error")
+            self.assertIsNone(verdict.conflict)
+
+    async def test_hanging_inference_is_bounded_by_the_async_wrapper(self):
+        async def hangs(_prompt):
+            await asyncio.Event().wait()
+
+        with patch.object(phone, "_PHONE_COVERAGE_PROVIDER_TIMEOUT_SEC", 0.01):
+            verdict = await phone.judge_phone_coverage(
+                question_text="Describe your recent role.",
+                assistant_reply="Walk me through your latest position.",
+                candidate_answer="An answer.",
+                resume_facts={"current_role": "Lead"}, infer=hangs,
+            )
+        self.assertFalse(verdict.covered)
+        self.assertEqual(verdict.category, "judge_error")
+
+    def test_repair_composer_prioritises_one_safe_conflict_probe(self):
+        conflict = {
+            "resume_fact": "Six years at Example Co",
+            "spoken_claim": "I joined last month",
+        }
+        instruction = phone.phone_judge_turn_instruction(
+            "What is your notice period?", reanchor=True, conflict=conflict,
+        )
+        self.assertIn("exactly ONE polite clarifying question", instruction)
+        self.assertIn("untrusted evidence", instruction)
+        self.assertIn("Never accuse", instruction)
+        self.assertNotIn("Owed topic", instruction)
+        self.assertEqual(
+            phone.phone_conflict_key(conflict), phone.phone_conflict_key(dict(conflict)),
+        )
+        self.assertEqual(
+            phone.phone_conflict_key(conflict),
+            phone.phone_conflict_key({
+                "resume_fact": conflict["resume_fact"],
+                "spoken_claim": "the same contradiction, paraphrased",
+            }),
+        )
+
+
+class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
+    """The background verdict gates commits and repairs the next turn."""
+
+    @staticmethod
+    def _state():
+        return _default_state(questions=[
+            {"key": "k1", "text": "Tell me about your recent role.", "mandatory": True, "hint": None},
+            {"key": "k2", "text": "What is your notice period?", "mandatory": True, "hint": None},
+            {"key": "k3", "text": "What compensation do you expect?", "mandatory": True, "hint": None},
+        ])
+
+    @staticmethod
+    async def _drain(predicate, tries=300):
+        for _ in range(tries):
+            await asyncio.sleep(0)
+            if predicate():
+                return True
+        return False
+
+    async def _coordinator(self, *, enabled=True):
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless", state=self._state(),
+            coverage_judge_enabled=enabled,
+        )
+        hooks["latest_assistant"][0] = "Tell me about your recent role."
+        hooks["latest_assistant_anchor"][0] = 1
+        hooks["assistant_delivery_complete"].set()
+        return agent, session, state, client, hooks
+
+    @staticmethod
+    async def _turn(hooks, text, assistant_text=None):
+        if isinstance(assistant_text, str):
+            hooks["latest_assistant"][0] = assistant_text
+        ctx = types.SimpleNamespace(items=[])
+        await hooks["on_native_turn"](
+            text, types.SimpleNamespace(text_content=text), ctx,
+        )
+        return ctx
+
+    async def _close(self, hooks):
+        hooks["close_event"].set()
+        await hooks["drive_terminal"]()
+
+    async def test_covered_verdict_permits_the_same_idempotent_commit(self):
+        agent, _, _, client, hooks = await self._coordinator()
+        private_answer = "I led operations for four years, private-marker-zeta."
+        with patch.object(
+            phone, "judge_phone_coverage", new_callable=AsyncMock,
+            return_value=phone.PhoneCoverageVerdict(True, None, "model"),
+        ) as judge:
+            await self._turn(hooks, private_answer)
+            self.assertTrue(await self._drain(lambda: client.committed_keys == ["k1"]))
+        judge.assert_awaited_once()
+        self.assertNotIn("private-marker-zeta", repr(
+            hooks["log"].info.call_args_list + hooks["log"].warn.call_args_list,
+        ))
+        self.assertIn("covered_model", [
+            c.kwargs.get("error_category")
+            for c in hooks["log"].info.call_args_list
+            if c.kwargs.get("error_type") == "phone_coverage_judge"
+        ])
+        self.assertEqual(client.boundaries[0]["source_event_id"], phone.plan_source_event_id("k1"))
+        await self._close(hooks)
+
+    async def test_not_covered_skips_commit_and_reanchors_the_next_turn(self):
+        agent, _, _, client, hooks = await self._coordinator()
+        with patch.object(
+            phone, "judge_phone_coverage", new_callable=AsyncMock,
+            return_value=phone.PhoneCoverageVerdict(False, None, "model"),
+        ):
+            await self._turn(hooks, "I led operations for four years.")
+            self.assertTrue(await self._drain(
+                lambda: agent._coverage_reanchor["question_key"] == "k1",
+            ))
+            self.assertEqual(client.committed_keys, [])
+            repaired = await self._turn(hooks, "Here is more detail.")
+        injected = str(repaired.items)
+        self.assertIn("not_covered_model", [
+            c.kwargs.get("error_category")
+            for c in hooks["log"].info.call_args_list
+            if c.kwargs.get("error_type") == "phone_coverage_judge"
+        ])
+        self.assertIn("NOT yet asked the owed topic", injected)
+        self.assertIn("Tell me about your recent role", injected)
+        self.assertEqual(client.committed_keys, [])
+        await self._close(hooks)
+
+    async def test_judge_error_skips_commit_and_logs_loudly(self):
+        agent, _, _, client, hooks = await self._coordinator()
+        with patch.object(
+            phone, "judge_phone_coverage", new_callable=AsyncMock,
+            return_value=phone.PhoneCoverageVerdict(False, None, "judge_error"),
+        ):
+            await self._turn(hooks, "I led operations for four years.")
+            self.assertTrue(await self._drain(
+                lambda: agent._coverage_reanchor["question_key"] == "k1",
+            ))
+        self.assertEqual(client.committed_keys, [])
+        categories = [
+            c.kwargs.get("error_category") for c in hooks["log"].warn.call_args_list
+            if c.kwargs.get("error_type") == "phone_coverage_judge"
+        ]
+        self.assertIn("judge_error", categories)
+        await self._close(hooks)
+
+    async def test_conflict_is_injected_exactly_once_for_the_same_discrepancy(self):
+        agent, _, state, client, hooks = await self._coordinator()
+        state.resume_facts = {"recent_role": {"period": "2020-2026"}}
+        conflict = {
+            "resume_fact": "Six years at Example Co",
+            "spoken_claim": "I joined last month",
+        }
+        verdict = phone.PhoneCoverageVerdict(True, conflict, "model")
+        with patch.object(
+            phone, "judge_phone_coverage", new_callable=AsyncMock,
+            return_value=verdict,
+        ):
+            await self._turn(hooks, "I joined last month.")
+            self.assertTrue(await self._drain(lambda: client.committed_keys == ["k1"]))
+            hooks["latest_assistant"][0] = "What is your notice period?"
+            second = await self._turn(hooks, "Thirty days.")
+            self.assertIn("Six years at Example Co", str(second.items))
+            self.assertIn("Never accuse", str(second.items))
+            self.assertTrue(await self._drain(lambda: client.committed_keys == ["k1", "k2"]))
+            hooks["latest_assistant"][0] = "What compensation do you expect?"
+            third = await self._turn(hooks, "A market-aligned package.")
+        self.assertNotIn("Six years at Example Co", str(third.items))
+        self.assertEqual(len(agent._asked_conflicts), 1)
+        await self._close(hooks)
+
+    async def test_slow_prior_judge_never_blocks_speech_and_rebases_next_answer(self):
+        _, _, _, client, hooks = await self._coordinator()
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def verdict(**kwargs):
+            if "recent role" in kwargs["question_text"].lower():
+                first_started.set()
+                await release_first.wait()
+            return phone.PhoneCoverageVerdict(True, None, "model")
+
+        with patch.object(phone, "judge_phone_coverage", side_effect=verdict) as judge:
+            await self._turn(hooks, "I led operations for four years.")
+            await asyncio.wait_for(first_started.wait(), timeout=0.1)
+            # This speech hook returns while the prior judge is blocked.
+            await asyncio.wait_for(self._turn(
+                hooks,
+                "My notice period is thirty days.",
+                assistant_text="What is your notice period?",
+            ), timeout=0.1)
+            self.assertEqual(client.committed_keys, [])
+            release_first.set()
+            self.assertTrue(await self._drain(
+                lambda: client.committed_keys == ["k1", "k2"],
+            ))
+        self.assertEqual(judge.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["question_text"] for call in judge.call_args_list],
+            ["Tell me about your recent role.", "What is your notice period?"],
+        )
+        await self._close(hooks)
+
+    async def test_slow_prior_judge_never_blocks_speech_and_rebases_next_answer(self):
+        _, _, _, client, hooks = await self._coordinator()
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def verdict(**kwargs):
+            if "recent role" in kwargs["question_text"].lower():
+                first_started.set()
+                await release_first.wait()
+            return phone.PhoneCoverageVerdict(True, None, "model")
+
+        with patch.object(phone, "judge_phone_coverage", side_effect=verdict) as judge:
+            await self._turn(hooks, "I led operations for four years.")
+            await asyncio.wait_for(first_started.wait(), timeout=0.1)
+            # This speech hook returns while the prior judge is blocked.
+            await asyncio.wait_for(self._turn(
+                hooks,
+                "My notice period is thirty days.",
+                assistant_text="What is your notice period?",
+            ), timeout=0.1)
+            self.assertEqual(client.committed_keys, [])
+            release_first.set()
+            self.assertTrue(await self._drain(
+                lambda: client.committed_keys == ["k1", "k2"],
+            ))
+        self.assertEqual(judge.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["question_text"] for call in judge.call_args_list],
+            ["Tell me about your recent role.", "What is your notice period?"],
+        )
+        await self._close(hooks)
+
+    async def test_flag_off_is_the_pre_judge_commit_path(self):
+        _, _, _, client, hooks = await self._coordinator(enabled=False)
+        with patch.object(
+            phone, "judge_phone_coverage", new_callable=AsyncMock,
+        ) as judge:
+            await self._turn(hooks, "I led operations for four years.")
+            self.assertTrue(await self._drain(lambda: client.committed_keys == ["k1"]))
+        judge.assert_not_awaited()
+        await self._close(hooks)
+
+    def test_judge_task_is_created_not_awaited_on_the_speech_path(self):
+        source = inspect.getsource(agent_mod._run_native_phone_screening)
+        turn_source = source[source.index("async def on_native_turn"):source.index("async def on_probe")]
+        self.assertIn("task = asyncio.create_task(", turn_source)
+        self.assertIn("commit_after_reply(dict(pending)", turn_source)
+        self.assertIn("and not coverage_judge_enabled", turn_source)
+        self.assertNotIn("await commit_after_reply", turn_source)
+        self.assertNotIn("await phone.judge_phone_coverage", turn_source)
 
 
 class TestSilentRoomKillGuard(unittest.IsolatedAsyncioTestCase):
@@ -4578,7 +4949,11 @@ class TestToollessSessionFlow(unittest.IsolatedAsyncioTestCase):
         self._harness = TestPhoneSessionFlow()
 
     async def _run_session(self, **kwargs):
-        with patch.dict(phone.os.environ, {"PHONE_TURN_MODE": "toolless"}):
+        # These are the explicit rollback-path regressions: judge OFF must keep
+        # the pre-PR-9 reply-driven commits byte-for-byte.
+        with patch.dict(phone.os.environ, {
+            "PHONE_TURN_MODE": "toolless", "PHONE_COVERAGE_JUDGE": "off",
+        }):
             return await self._harness._run_session(**kwargs)
 
     async def test_toolless_commits_every_key_in_order_and_completes(self):
