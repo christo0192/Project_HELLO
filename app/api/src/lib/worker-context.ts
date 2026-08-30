@@ -31,6 +31,12 @@ export interface WorkerContext {
   role_required_skills: string[];
   screening_template: unknown[];
   interviewer_instructions: string;
+  /**
+   * Phone rooms only: an allowlisted structured projection of parsed resume
+   * evidence. Browser rooms receive an empty object, so their prompt and data
+   * surface remain unchanged. Raw resume text and contact fields never cross.
+   */
+  candidate_evidence: Record<string, unknown>;
 }
 
 export interface WorkerContextResultOk {
@@ -44,6 +50,60 @@ export interface WorkerContextResultErr {
 }
 
 export type WorkerContextResult = WorkerContextResultOk | WorkerContextResultErr;
+
+const PHONE_ROOM_RE = /^phone-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/**
+ * Return only the structured resume fields the phone prompt is allowed to see.
+ *
+ * The phone agent must be constructed with its complete prompt before its
+ * first generation; returning raw `candidates.parsed` would solve that timing
+ * problem by creating a much larger privacy problem. Keep the allowlist next
+ * to the authenticated worker-context boundary instead.
+ */
+function phoneCandidateEvidence(parsed: unknown, roomName: string): Record<string, unknown> {
+  if (!PHONE_ROOM_RE.test(roomName) || !parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return {};
+  }
+  const source = parsed as Record<string, unknown>;
+  const evidence: Record<string, unknown> = {};
+  for (const key of ['name', 'current_role', 'experience_years']) {
+    const value = source[key];
+    if (typeof value === 'string') evidence[key] = value.slice(0, 300);
+    else if (typeof value === 'number' && Number.isFinite(value)) evidence[key] = value;
+  }
+  if (typeof source.summary === 'string') evidence.summary = source.summary.slice(0, 500);
+  if (Array.isArray(source.skills)) {
+    evidence.skills = source.skills.filter((v): v is string => typeof v === 'string').slice(0, 12);
+  }
+  const projectRole = (value: unknown): Record<string, unknown> | null => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const role = value as Record<string, unknown>;
+    const projected: Record<string, unknown> = {};
+    for (const key of ['title', 'employer', 'period']) {
+      if (typeof role[key] === 'string') projected[key] = role[key].slice(0, 300);
+    }
+    if (Array.isArray(role.highlights)) {
+      projected.highlights = role.highlights
+        .filter((v): v is string => typeof v === 'string')
+        .slice(0, 2)
+        .map((v) => v.slice(0, 500));
+    }
+    return projected;
+  };
+  const recentRole = projectRole(source.recent_role);
+  if (recentRole) evidence.recent_role = recentRole;
+  if (Array.isArray(source.prior_roles)) {
+    evidence.prior_roles = source.prior_roles.slice(0, 2).map(projectRole).filter(Boolean);
+  }
+  if (Array.isArray(source.career_highlights)) {
+    evidence.career_highlights = source.career_highlights
+      .filter((v): v is string => typeof v === 'string')
+      .slice(0, 3)
+      .map((v) => v.slice(0, 500));
+  }
+  return evidence;
+}
 
 /**
  * Resolve worker context from a session_id and room_name.
@@ -90,10 +150,11 @@ export async function resolveWorkerContext(
     return { ok: false, code: ERR_SESSION_NOT_ACTIVE };
   }
 
-  // Resolve candidate name (minimal — no resume facts/email/phone)
+  // Resolve name plus parsed structure. `phoneCandidateEvidence` immediately
+  // projects the phone-only allowlist; raw/contact fields never cross the API.
   const { data: candidate } = await supabase
     .from('candidates')
-    .select('name')
+    .select('name,parsed')
     .eq('id', data.candidate_id)
     .single();
 
@@ -122,6 +183,7 @@ export async function resolveWorkerContext(
       role_required_skills: Array.isArray(role?.required_skills) ? role.required_skills : [],
       screening_template: Array.isArray(role?.screening_template) ? role.screening_template : [],
       interviewer_instructions: typeof role?.interviewer_instructions === 'string' ? role.interviewer_instructions : '',
+      candidate_evidence: phoneCandidateEvidence(candidate?.parsed, roomName),
     },
   };
 }

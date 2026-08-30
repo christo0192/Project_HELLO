@@ -596,7 +596,13 @@ class TestEntrypointIsolation(unittest.TestCase):
 
     def test_attempt_id_comes_off_the_dispatch_not_the_room_name(self):
         ctx = FakeCtx(_PHONE_ROOM, dispatch=_dispatch_metadata())
+        instruction_context = self._WC()
         with patch.object(agent_mod, "_phone_agent_name", return_value="p"), \
+             patch.object(agent_mod, "WorkerContext", self._WC), \
+             patch.object(
+                 agent_mod, "_resolve_worker_context_with_retry",
+                 new_callable=AsyncMock, return_value=instruction_context,
+             ), \
              patch.object(agent_mod, "_run_phone_session", new_callable=AsyncMock) as run:
             _run(agent_mod._run_phone_entrypoint(ctx, _PHONE_ROOM))
         run.assert_awaited_once()
@@ -605,6 +611,7 @@ class TestEntrypointIsolation(unittest.TestCase):
         self.assertNotEqual(run.await_args.args[2], _SESSION_ID)
         # P5: the epoch rides the same blob and reaches the session.
         self.assertEqual(run.await_args.args[3], _EPOCH)
+        self.assertIs(run.await_args.kwargs["instruction_context"], instruction_context)
 
     def test_unresolvable_dispatch_speaks_nothing_posts_nothing_records_nothing(self):
         """B-1: with no attempt id there is nothing safe to do — so nothing is done."""
@@ -3391,107 +3398,61 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         self.assertNotIn("text_content", rendered)
 
 
-# ── H-3: the instructions must actually be DELIVERED ──────────────────
+# ── PR-8: complete instructions are present at CONSTRUCTION ───────────
 
-class TestInstructionDelivery(unittest.IsolatedAsyncioTestCase):
-    """`render_resume_context` being a well-tested pure function proves nothing
-    about whether its output ever reaches the model.
+class TestInstructionConstruction(unittest.TestCase):
+    """Prompt delivery is structural: the constructor receives the full text."""
 
-    `Agent.instructions` is a read-only property on livekit-agents 1.6 and the
-    supported mutator is `await agent.update_instructions(...)`. A bare
-    `setattr` raises on the real SDK and succeeds on a stub — the worst
-    combination, because the suite would be green while the candidate's name,
-    the question flow and the resume replay never reached the model at all.
-    """
+    def _state(self, *, turns=None, resume_facts=None):
+        state = phone.PhoneAssessmentState.parse(_plan_payload(turns=turns))
+        state.role_title = "Data Engineer"
+        state.role_focus = "Reliable analytics pipelines"
+        state.resume_facts = resume_facts or {
+            "current_role": "Analytics Lead", "skills": ["Python", "SQL"],
+        }
+        return state
 
-    def _state(self, *, turns=None):
-        return phone.PhoneAssessmentState.parse(_plan_payload(turns=turns))
+    def test_constructor_payload_contains_role_resume_and_every_phone_policy(self):
+        state = self._state()
+        with patch.object(agent_mod, "system_prompt", return_value="ROLE+RESUME") as build, \
+             patch.object(
+                 agent_mod, "prompting_format_resume_facts",
+                 return_value="resume: Analytics Lead",
+             ):
+            instructions = agent_mod._phone_instructions_text(state)
 
-    async def test_it_prefers_the_SDK_mutator_over_a_bare_attribute_write(self):
-        class RealisticAgent:
-            """`instructions` is read-only, exactly as the SDK declares it."""
+        class BaseAgent:
+            def __init__(self, instructions=""):
+                self.instructions = instructions
 
-            def __init__(self):
-                self.delivered = []
+        agent = phone.phone_agent_class(BaseAgent)(
+            instructions, client=FakeEventClient(), attempt_id=_ATTEMPT_ID,
+            say=AsyncMock(), native_turns=True,
+        )
+        self.assertEqual(agent.instructions, instructions)
+        self.assertEqual(build.call_args.kwargs["role_title"], "Data Engineer")
+        self.assertIn("Analytics Lead", build.call_args.kwargs["resume_facts"])
+        self.assertIn(phone.PHONE_CALLBACK_POLICY_TEXT, instructions)
+        self.assertIn(phone.PHONE_ROLE_GROUNDING_TEXT, instructions)
+        self.assertIn(phone.PHONE_TURN_DISCIPLINE_TEXT, instructions)
+        self.assertIn(phone.PHONE_EXPRESSIVENESS_TEXT, instructions)
+        self.assertIn(phone.PHONE_RESUME_CONFLICT_TEXT, instructions)
 
-            @property
-            def instructions(self):
-                return "base"
+    def test_reconnect_history_is_in_the_same_constructor_payload(self):
+        instructions = agent_mod._phone_instructions_text(self._state(turns=[
+            {"speaker": "bot", "text": "How many years?"},
+            {"speaker": "candidate", "text": "About four."},
+        ]))
+        self.assertIn("Candidate: About four.", instructions)
+        self.assertIn("do NOT ask these again", instructions)
 
-            async def update_instructions(self, text):
-                self.delivered.append(text)
-
-        agent = RealisticAgent()
-        # The prompt builders are spied rather than asserted on by their
-        # OUTPUT: `test_agent.py` swaps `sys.modules["prompting"]` for a mock
-        # at import time, so what `system_prompt` returns depends on module
-        # load order. What must be true regardless is that the PLAN and the
-        # candidate's name are what get built into the instructions, and that
-        # the result is delivered through the SDK mutator.
-        with patch.object(agent_mod, "system_prompt", return_value="BUILT") as build:
-            ok = await agent_mod._apply_phone_instructions(agent, self._state())
-        self.assertTrue(ok)
-        self.assertEqual(len(agent.delivered), 1)
-        self.assertEqual(agent.delivered[0], "BUILT" + phone.PHONE_CALLBACK_POLICY_TEXT + phone.PHONE_ROLE_GROUNDING_TEXT + phone.PHONE_TURN_DISCIPLINE_TEXT + phone.PHONE_EXPRESSIVENESS_TEXT)
-        self.assertEqual(build.call_args.kwargs["candidate_name"], "Asha")
-        self.assertIn("exact currently owed question", build.call_args.kwargs["questions"])
-        self.assertNotIn("First question?", build.call_args.kwargs["questions"])
-        self.assertNotIn("Second question?", build.call_args.kwargs["questions"])
-
-    async def test_the_RESUME_replay_is_actually_delivered(self):
-        class RealisticAgent:
-            def __init__(self):
-                self.delivered = []
-
-            async def update_instructions(self, text):
-                self.delivered.append(text)
-
-        agent = RealisticAgent()
-        with patch.object(agent_mod, "system_prompt", return_value="BUILT"):
-            ok = await agent_mod._apply_phone_instructions(agent, self._state(turns=[
-                {"speaker": "bot", "text": "How many years?"},
-                {"speaker": "candidate", "text": "About four."},
-            ]))
-        self.assertTrue(ok)
-        self.assertIn("Candidate: About four.", agent.delivered[0])
-        self.assertIn("do NOT ask these again", agent.delivered[0])
-
-    async def test_the_attribute_write_is_the_FALLBACK_not_the_path(self):
-        class LegacyAgent:
-            instructions = "base"
-
-        agent = LegacyAgent()
-        with patch.object(agent_mod, "system_prompt", return_value="BUILT"):
-            ok = await agent_mod._apply_phone_instructions(agent, self._state())
-        self.assertTrue(ok)
-        self.assertEqual(agent.instructions, "BUILT" + phone.PHONE_CALLBACK_POLICY_TEXT + phone.PHONE_ROLE_GROUNDING_TEXT + phone.PHONE_TURN_DISCIPLINE_TEXT + phone.PHONE_EXPRESSIVENESS_TEXT)
-
-    async def test_a_FAILED_delivery_is_reported_rather_than_swallowed(self):
-        class HostileAgent:
-            @property
-            def instructions(self):
-                return "base"
-
-            async def update_instructions(self, text):
-                raise RuntimeError("not supported")
-
-        # `instructions` has no setter, so the fallback raises too.
-        ok = await agent_mod._apply_phone_instructions(HostileAgent(), self._state())
-        self.assertFalse(ok)
-
-    async def test_a_RAISING_mutator_still_falls_back(self):
-        class FlakyAgent:
-            def __init__(self):
-                self.instructions = "base"
-
-            async def update_instructions(self, text):
-                raise RuntimeError("nope")
-
-        agent = FlakyAgent()
-        with patch.object(agent_mod, "system_prompt", return_value="BUILT"):
-            ok = await agent_mod._apply_phone_instructions(agent, self._state())
-        self.assertTrue(ok)
-        self.assertEqual(agent.instructions, "BUILT" + phone.PHONE_CALLBACK_POLICY_TEXT + phone.PHONE_ROLE_GROUNDING_TEXT + phone.PHONE_TURN_DISCIPLINE_TEXT + phone.PHONE_EXPRESSIVENESS_TEXT)
+    def test_running_agent_mutation_seams_are_deleted(self):
+        source = inspect.getsource(agent_mod)
+        self.assertNotIn("def _apply_phone_instructions", source)
+        self.assertNotIn("def _deliver_phone_instructions", source)
+        self.assertNotIn("def _verify_role_instructions_applied", source)
+        screening = inspect.getsource(agent_mod._run_native_phone_screening)
+        self.assertNotIn("update_instructions", screening)
 
 
 # ── F3: role-title grounding (phone side only) ─────────────────────────
@@ -4073,6 +4034,8 @@ async def _make_native_coordinator(*, turn_mode="toolfirst", client=None, state=
         "latest_assistant": latest_assistant,
         "latest_assistant_anchor": latest_assistant_anchor,
         "assistant_delivery_complete": assistant_delivery_complete,
+        "reply_started": reply_started,
+        "reply_handle": reply_handle,
         "close_event": close_event,
         "log": spy,
         "task": task,
@@ -4080,6 +4043,106 @@ async def _make_native_coordinator(*, turn_mode="toolfirst", client=None, state=
         "drive_terminal": drive_terminal,
     }
     return agent, session, state, client, hooks
+
+
+class _QnaEventClient(FakeEventClient):
+    async def record_probe(self, *args, **kwargs):
+        return phone.PhoneApiOutcome(True, "probe_recorded")
+
+
+class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
+    """PR-8: post-plan Q&A loops, then closes only on done or the cap."""
+
+    @staticmethod
+    def _one_question_state():
+        return _default_state(questions=[
+            {"key": "k1", "text": "First question?", "mandatory": True, "hint": None},
+        ])
+
+    async def _enter_qna(self):
+        client = _QnaEventClient()
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless", client=client, state=self._one_question_state(),
+        )
+        agent._pending.update({
+            "question": state.question_at(0),
+            "prompt": "First question?",
+            "candidate": "A substantive answer.",
+            "message": None,
+            "turn_ctx": types.SimpleNamespace(items=[]),
+            "probe_used": False,
+            "source_event_id": phone.plan_source_event_id("k1"),
+        })
+        outcome = await agent._on_advance()
+        self.assertIn("whether the candidate has any questions", outcome)
+        self.assertEqual(client.committed_keys, ["k1"])
+        return agent, session, state, client, hooks
+
+    async def _finish(self, hooks, *, interrupted=False):
+        hooks["reply_handle"][0] = _FakeSpeech(interrupted=interrupted)
+        hooks["reply_started"].set()
+        await hooks["drive_terminal"]()
+
+    def test_done_classifier_is_narrow(self):
+        for text in ("No", "No, that's all", "Nothing else, thanks", "I'm good"):
+            self.assertTrue(phone.phone_qna_done(text), text)
+        for text in ("No, I actually have another question", "How large is the team?", "Maybe"):
+            self.assertFalse(phone.phone_qna_done(text), text)
+
+    async def test_question_is_answered_then_candidate_is_reinvited(self):
+        agent, _, _, client, hooks = await self._enter_qna()
+        turn_ctx = types.SimpleNamespace(items=[])
+        await hooks["on_native_turn"](
+            "How large is the team?",
+            types.SimpleNamespace(text_content="How large is the team?"),
+            turn_ctx,
+        )
+        injected = str(turn_ctx.items)
+        self.assertIn("Anything else you'd like to ask?", injected)
+        self.assertIn("do not say goodbye yet", injected.lower())
+        self.assertNotIn("final q&a round", injected.lower())
+        self.assertNotIn("assessment.completed", client.event_types)
+
+        done_ctx = types.SimpleNamespace(items=[])
+        await hooks["on_native_turn"](
+            "No, that's all, thanks",
+            types.SimpleNamespace(text_content="No, that's all, thanks"),
+            done_ctx,
+        )
+        self.assertIn("say goodbye", str(done_ctx.items).lower())
+        await self._finish(hooks)
+        self.assertIn("assessment.completed", client.event_types)
+
+    async def test_third_question_answers_then_wraps_at_the_cap(self):
+        _, _, _, client, hooks = await self._enter_qna()
+        for index in range(phone.PHONE_QNA_MAX_ROUNDS):
+            turn_ctx = types.SimpleNamespace(items=[])
+            text = f"Candidate question {index + 1}?"
+            await hooks["on_native_turn"](
+                text, types.SimpleNamespace(text_content=text), turn_ctx,
+            )
+            injected = str(turn_ctx.items).lower()
+            if index + 1 < phone.PHONE_QNA_MAX_ROUNDS:
+                self.assertIn("anything else", injected)
+                self.assertIn("do not say goodbye yet", injected)
+                self.assertNotIn("final q&a round", injected)
+            else:
+                self.assertIn("final q&a round", injected)
+                self.assertIn("say goodbye", injected)
+        await self._finish(hooks)
+        self.assertIn("assessment.completed", client.event_types)
+
+    async def test_interrupted_terminal_reply_uses_the_fixed_goodbye(self):
+        _, session, _, client, hooks = await self._enter_qna()
+        turn_ctx = types.SimpleNamespace(items=[])
+        await hooks["on_native_turn"](
+            "Nothing else",
+            types.SimpleNamespace(text_content="Nothing else"),
+            turn_ctx,
+        )
+        await self._finish(hooks, interrupted=True)
+        self.assertIn(phone.PHONE_ASSESSMENT_CLOSING_TEXT, session.spoken)
+        self.assertIn("assessment.completed", client.event_types)
 
 
 class TestSilentRoomKillGuard(unittest.IsolatedAsyncioTestCase):
@@ -4653,76 +4716,28 @@ class TestPhoneRoleDeterminism(unittest.TestCase):
         line = agent_mod._role_turn_line("Data Engineer")
         self.assertIn('"Data Engineer"', line)
 
-    def test_apply_instructions_noop_mutation_does_not_falsely_alarm(self):
-        """X3b end-to-end: a fake agent whose update_instructions is a no-op
-        (does not update the readable property) still gets the role into the
-        DELIVERED text, so the verifier reads it back from what we delivered and
-        does NOT falsely alarm. (`system_prompt` is patched to a role-bearing
-        string because `test_agent.py` swaps `sys.modules['prompting']` for a
-        mock at import time — the same reason the sibling `_apply_phone_
-        instructions` test patches the builder rather than asserting its output.)
-        """
+    def test_role_is_in_the_constructor_payload_not_a_later_mutation(self):
         role = "Sales Advisor / Program Advisor - Synthetic Canary"
         st = phone.PhoneAssessmentState(ok=True)
         st.candidate_name = "Test Candidate"
         st.role_title = role
         st.role_focus = "advising"
+        with patch.object(
+            agent_mod, "system_prompt",
+            return_value=f"You are Christy screening for the {role} role.",
+        ):
+            instructions = agent_mod._phone_instructions_text(st)
 
-        applied = {}
+        class BaseAgent:
+            def __init__(self, instructions=""):
+                self.instructions = instructions
 
-        class _Agent:
-            instructions = "base prompt with no role"  # stays stale (no-op)
-
-            async def update_instructions(self, text):
-                applied["text"] = text  # routed to live activity, not property
-
-        spy = MagicMock(wraps=agent_mod._log)
-        built = f"You are Christy screening for the {role} role."
-
-        async def run():
-            with patch.object(agent_mod, "_log", spy), \
-                 patch.object(agent_mod, "system_prompt", return_value=built):
-                return await agent_mod._apply_phone_instructions(_Agent(), st)
-
-        ok = asyncio.run(run())
-        self.assertTrue(ok)
-        self.assertIn(role, applied["text"])
-        categories = [
-            c.kwargs.get("error_category")
-            for c in list(spy.info.call_args_list) + list(spy.warn.call_args_list)
-            if c.kwargs.get("error_type") == "phone_instructions_not_applied"
-        ]
-        self.assertEqual(categories, [])
-
-    def test_apply_instructions_flags_when_builder_drops_the_role(self):
-        """X3b: if the delivered prompt does NOT name the role (and the readable
-        property is stale), the verifier logs loudly — this is the observability
-        that was missing when a live call spoke the wrong job title."""
-        st = phone.PhoneAssessmentState(ok=True)
-        st.candidate_name = "Test Candidate"
-        st.role_title = "Data Engineer"
-        st.role_focus = "pipelines"
-
-        class _Agent:
-            instructions = "base prompt with no role"
-
-            async def update_instructions(self, text):
-                return None
-
-        spy = MagicMock(wraps=agent_mod._log)
-
-        async def run():
-            with patch.object(agent_mod, "_log", spy), \
-                 patch.object(agent_mod, "system_prompt", return_value="no title here"):
-                return await agent_mod._apply_phone_instructions(_Agent(), st)
-
-        asyncio.run(run())
-        categories = [
-            c.kwargs.get("error_category")
-            for c in list(spy.info.call_args_list) + list(spy.warn.call_args_list)
-            if c.kwargs.get("error_type") == "phone_instructions_not_applied"
-        ]
-        self.assertIn("role_title_absent", categories)
+        agent = phone.phone_agent_class(BaseAgent)(
+            instructions, client=FakeEventClient(), attempt_id=_ATTEMPT_ID,
+            say=AsyncMock(), native_turns=True,
+        )
+        self.assertIn(role, agent.instructions)
+        self.assertFalse(hasattr(agent_mod, "_apply_phone_instructions"))
 
 
 class TestCall24Regressions(unittest.TestCase):

@@ -6425,7 +6425,7 @@ components:
 
     WorkerContext:
       type: object
-      required: [session_id, candidate_id, role_id, candidate_name, room_name, status, role_title, role_focus, role_required_skills, screening_template, interviewer_instructions]
+      required: [session_id, candidate_id, role_id, candidate_name, room_name, status, role_title, role_focus, role_required_skills, screening_template, interviewer_instructions, candidate_evidence]
       properties:
         session_id:
           type: string
@@ -6461,6 +6461,10 @@ components:
             additionalProperties: true
         interviewer_instructions:
           type: string
+        candidate_evidence:
+          type: object
+          description: Phone-room-only allowlisted structured resume evidence; empty for browser rooms.
+          additionalProperties: true
       additionalProperties: false
 
     WorkerContextResponse:

@@ -2060,16 +2060,14 @@ async def _aiter_text(text: Any) -> Any:
         yield chunk if isinstance(chunk, str) else str(chunk)
 
 
-#: COMPACT per-turn style reminder (F2, call 24). The full expressiveness /
-#: discipline / resume-conflict blocks are appended in `_phone_instructions_text`,
-#: which rides `update_instructions` — a NO-OP on livekit-agents 1.6.4's read-only
-#: `Agent.instructions`, so on call 24 none of them reached the live model (flat
-#: tone, stacked questions, markdown asterisks, no conflict probe). The per-turn
-#: developer message is the surface the model provably reads every turn, so a
-#: SHORT reminder of the same rules rides here. It is deliberately compact: the
-#: authoritative long-form copy lives in the construction-time payload
-#: (`_phone_instructions_text`) AND, for the toolless lane, in the first-turn
-#: injection, so per-turn payloads do not balloon by ~2 KB every turn.
+#: COMPACT per-turn style reminder (F2, call 24). LiveKit 1.6.4's supported
+#: `update_instructions` path does update the internal ChatContext, but several
+#: live calls behaviorally ignored the long-form blocks delivered after start
+#: (flat tone, stacked questions, markdown, no conflict probe). PR-8 therefore
+#: puts the authoritative copy in the Agent constructor. The per-turn developer
+#: message remains because it is the surface the model demonstrably followed;
+#: keeping this short reminder is cheap defense in depth without repeating the
+#: ~2 KB long-form payload every turn.
 PHONE_PER_TURN_STYLE_TEXT = (
     "Style (phone line): plain spoken text only — never markdown, asterisks, "
     "underscores or backticks. Ask exactly ONE question this turn, never two. "
@@ -3056,6 +3054,30 @@ _END_CALL_RE = re.compile(
 def is_explicit_end_call_request(text: Any) -> bool:
     """Recognise an unambiguous request to end the current call only."""
     return isinstance(text, str) and _END_CALL_RE.search(text) is not None
+
+
+# Post-plan candidate Q&A is deliberately bounded. Three real questions is
+# enough space for a candidate to understand the role without turning a phone
+# screen into an unbounded support call that holds a fleet slot indefinitely.
+PHONE_QNA_MAX_ROUNDS = 3
+_QNA_DONE_RE = re.compile(
+    r"^\s*(?:"
+    r"no(?:pe)?(?:\s*,?\s*(?:that(?:'s|\s+is)\s+all|nothing\s+else))?|"
+    r"that(?:'s|\s+is)\s+all|nothing\s+else|no\s+(?:more\s+)?questions?|"
+    r"i(?:'m|\s+am)\s+(?:all\s+)?good|all\s+good"
+    r")(?:\s*,?\s*(?:thank\s+you|thanks)(?:\s+very\s+much)?)?[\s.!]*$",
+    re.IGNORECASE,
+)
+
+
+def phone_qna_done(text: Any) -> bool:
+    """Recognise only a high-confidence post-plan 'no more questions' reply.
+
+    This intentionally is narrower than sentiment classification: a sentence
+    such as "No, I actually have another question" must stay in Q&A. Unknown
+    language therefore consumes one bounded round rather than ending the call.
+    """
+    return isinstance(text, str) and _QNA_DONE_RE.fullmatch(text) is not None
 
 
 _HESITATION_ONLY_RE = re.compile(

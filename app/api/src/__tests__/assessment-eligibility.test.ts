@@ -268,6 +268,36 @@ describe('VOI-08 assessment eligibility preflight', () => {
     expect(eqCalls.some((c) => c.args[0] === 'session_id' && c.args[1] === SESSION_ID)).toBe(true);
   });
 
+  it('sends every ordered non-gate item turn to scoring, including probes and QnA', async () => {
+    const fullTranscript = [
+      { speaker: 'bot', text: 'planned-topic-marker' },
+      { speaker: 'candidate', text: 'candidate-answer-marker' },
+      { speaker: 'bot', text: 'conflict-probe-marker' },
+      { speaker: 'candidate', text: 'conflict-resolution-marker' },
+      { speaker: 'bot', text: 'candidate-qna-marker' },
+      { speaker: 'candidate', text: 'candidate-qna-answer-marker' },
+    ];
+    configureTable('call_sessions', ok(sessionRow('completed', 'conversation_complete')));
+    configureTable('transcript_turns', ok(fullTranscript));
+    configureTable('roles', ok({ title: 'Frontend Engineer', required_skills: ['TypeScript'] }));
+    configureTable('candidates', ok({ name: 'Alice Example', parsed: { summary: 'Senior engineer' } }));
+    configureTable('assessments', ok({ id: ASSESSMENT_ID }));
+
+    await runAssessment(SESSION_ID);
+
+    const prompt = String(runClaudeJSONWithProvenance.mock.calls[0]?.[0] ?? '');
+    let previous = -1;
+    for (const turn of fullTranscript) {
+      const index = prompt.indexOf(turn.text);
+      expect(index, `${turn.text} must reach the scorer`).toBeGreaterThan(previous);
+      previous = index;
+    }
+    const orderCalls = callsFor('transcript_turns', 'order');
+    expect(orderCalls).toContainEqual({
+      method: 'order', args: ['turn_index', { ascending: true }],
+    });
+  });
+
   // ══════════════════════════════════════════════════════════════════
   //  3. NOT_FOUND — existing session-not-found error preserved
   // ══════════════════════════════════════════════════════════════════

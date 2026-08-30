@@ -760,78 +760,32 @@ class TestWorkerContextResolveRetry(unittest.IsolatedAsyncioTestCase):
         )
 
 
-class TestRoleInstructionVerification(unittest.TestCase):
-    """X3b: the verifier logs loudly only when the role landed in NEITHER the
-    readable instructions property NOR the text we delivered. (Integration
-    through `_apply_phone_instructions` with the REAL prompt lives in
-    test_phone_gate.py, where prompting is not stubbed.)"""
+class TestPhoneInstructionStateProjection(unittest.TestCase):
+    """The construction-time phone prompt is projected from authenticated context."""
 
-    @staticmethod
-    def _categories(spy, error_type):
-        calls = list(spy.info.call_args_list) + list(spy.warn.call_args_list)
-        return [
-            c.kwargs.get("error_category")
-            for c in calls
-            if c.kwargs.get("error_type") == error_type
-        ]
-
-    def test_no_alarm_when_delivered_text_carries_the_role(self):
-        """Stale property (no-op mutation) but the delivered text has the role
-        verbatim → no false alarm."""
-
-        class _Agent:
-            instructions = "base prompt with no role"  # stale (no-op mutation)
-
-        spy = MagicMock(wraps=agent_mod._log)
-        with patch.object(agent_mod, "_log", spy):
-            agent_mod._verify_role_instructions_applied(
-                _Agent(), "Data Engineer",
-                "delivered prompt naming the Data Engineer role",
-            )
-        self.assertEqual(
-            self._categories(spy, "phone_instructions_not_applied"), [],
+    def test_projects_role_guidance_and_allowlisted_resume_evidence(self):
+        context = types.SimpleNamespace(
+            candidate_name="Asha",
+            role_title="Data Engineer",
+            role_focus="Build reliable pipelines",
+            role_required_skills=["Python", "SQL"],
+            interviewer_instructions="Probe for ownership",
+            candidate_evidence={"current_role": "Analytics Lead", "skills": ["Python"]},
         )
 
-    def test_no_alarm_when_no_role_to_assert(self):
-        class _Agent:
-            instructions = "base"
+        state = agent_mod._phone_instruction_state(context)
 
-        spy = MagicMock(wraps=agent_mod._log)
-        with patch.object(agent_mod, "_log", spy):
-            agent_mod._verify_role_instructions_applied(_Agent(), None, "text")
-            agent_mod._verify_role_instructions_applied(_Agent(), "  ", "text")
-        self.assertEqual(
-            self._categories(spy, "phone_instructions_not_applied"), [],
-        )
+        self.assertTrue(state.ok)
+        self.assertEqual(state.candidate_name, "Asha")
+        self.assertEqual(state.role_title, "Data Engineer")
+        self.assertEqual(state.role_required_skills, ["Python", "SQL"])
+        self.assertEqual(state.resume_facts["current_role"], "Analytics Lead")
 
-    def test_logs_when_role_missing_from_both_surfaces(self):
-        class _Agent:
-            instructions = "base prompt without the title"
-
-        spy = MagicMock(wraps=agent_mod._log)
-        with patch.object(agent_mod, "_log", spy):
-            agent_mod._verify_role_instructions_applied(
-                _Agent(), "Data Engineer", "delivered text also lacks it",
-            )
-        self.assertIn(
-            "role_title_absent",
-            self._categories(spy, "phone_instructions_not_applied"),
-        )
-
-    def test_reads_the_role_from_the_property_when_present(self):
-        """When the readable property DID take the mutation, that is enough."""
-
-        class _Agent:
-            instructions = "live prompt naming the Data Engineer role"
-
-        spy = MagicMock(wraps=agent_mod._log)
-        with patch.object(agent_mod, "_log", spy):
-            agent_mod._verify_role_instructions_applied(
-                _Agent(), "Data Engineer", "delivered text lacks it entirely",
-            )
-        self.assertEqual(
-            self._categories(spy, "phone_instructions_not_applied"), [],
-        )
+    def test_missing_context_produces_no_invented_prompt_facts(self):
+        state = agent_mod._phone_instruction_state(None)
+        self.assertFalse(state.ok)
+        self.assertIsNone(state.role_title)
+        self.assertEqual(state.resume_facts, {})
 
 
 if __name__ == "__main__":
