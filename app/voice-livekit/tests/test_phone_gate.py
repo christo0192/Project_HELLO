@@ -3397,6 +3397,49 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         self.assertNotIn("must never", rendered)
         self.assertNotIn("text_content", rendered)
 
+    def test_endpoint_delay_emits_plausible_duration_content_free(self):
+        """PR-2 change 2: the EOU->LLM-invoke endpoint delay fires with a
+        plausible duration and carries NO transcript text.
+
+        t_EOU and t_invoke are monotonic timestamps; the emit records the delta
+        as a histogram AND a structured log using the existing instrumentation
+        vocabulary. Both surfaces must be content-free.
+        """
+        t_eou = 100.000
+        t_invoke = 102.900  # the ~2.9 s gap the change exists to measure
+        with patch.object(agent_mod, "histogram_metric") as hist, \
+             patch.object(agent_mod._log, "info") as log_info:
+            agent_mod._emit_phone_endpoint_delay(t_eou, t_invoke)
+
+        # Histogram: name, plausible duration, phone channel + eou_to_llm schema.
+        self.assertEqual(hist.call_count, 1)
+        name, value = hist.call_args.args[0], hist.call_args.args[1]
+        labels = hist.call_args.args[2] if len(hist.call_args.args) > 2 else hist.call_args.kwargs.get("labels")
+        self.assertEqual(name, "voice_endpoint_delay_sec")
+        self.assertAlmostEqual(value, 2.9, places=3)
+        self.assertEqual(labels.get("channel"), "phone")
+        self.assertEqual(labels.get("schema"), "eou_to_llm")
+
+        # Structured log: existing vocabulary, duration only.
+        self.assertEqual(log_info.call_count, 1)
+        _, kwargs = log_info.call_args
+        self.assertEqual(kwargs.get("error_type"), "voice_endpoint_delay")
+        self.assertEqual(kwargs.get("schema"), "eou_to_llm")
+        self.assertAlmostEqual(kwargs.get("duration_sec"), 2.9, places=3)
+        # No transcript / PII: the only dynamic value anywhere is the duration.
+        rendered = repr(hist.call_args_list) + repr(log_info.call_args_list)
+        for banned in ("transcript", "candidate", "room", "attempt", "text_content"):
+            self.assertNotIn(banned, rendered)
+
+    def test_endpoint_delay_drops_negative_delta(self):
+        """A stale stamp / clock skew (t_invoke < t_EOU) must NOT emit a bogus
+        negative endpoint delay — the emit is dropped, not fabricated."""
+        with patch.object(agent_mod, "histogram_metric") as hist, \
+             patch.object(agent_mod._log, "info") as log_info:
+            agent_mod._emit_phone_endpoint_delay(200.0, 199.5)
+        self.assertEqual(hist.call_count, 0)
+        self.assertEqual(log_info.call_count, 0)
+
 
 # ── PR-8: complete instructions are present at CONSTRUCTION ───────────
 
@@ -5368,6 +5411,167 @@ class TestCall24Regressions(unittest.TestCase):
         self.assertNotIn("_", spoken)
         self.assertIn("there", spoken)
         self.assertIn("code", spoken)
+
+    def test_tts_node_early_flushes_first_fragment_before_full_text(self):
+        """PR-2 change 1 non-vacuity: the first speakable SEGMENT is closed and
+        handed to the downstream TTS (flushed) BEFORE the whole multi-sentence
+        text stream has been consumed.
+
+        THE MECHANISM this defends: the SDK default drives ONE ``tts_node`` call
+        for the entire reply, so Sarvam's internal sentence tokenizer buffers
+        until a full sentence exists. The phone lane instead opens a NEW
+        downstream segment per early fragment and CLOSES it (its input stream
+        ends → the SDK's ``end_input`` flushes Sarvam) the moment a clause
+        boundary is hit. So the test records, per downstream segment, how much
+        of the SOURCE had been consumed when that segment's input ENDED, and the
+        FIRST segment must end while the source is not yet drained.
+
+        CONTROL — this FAILS against the pre-change behavior: with early-flush
+        OFF (``PHONE_TTS_FLUSH_MIN_CHARS=0`` → per-chunk passthrough, exactly
+        the old ``super().tts_node(_cleaned())`` single-call shape) there is only
+        ONE downstream segment and it closes only after the WHOLE stream is
+        consumed — see the companion assertion below.
+        """
+        yielded = {"count": 0}
+        # (consumed-at-open, consumed-at-close) for each downstream segment.
+        segment_spans: list[tuple[int, int]] = []
+        # A multi-sentence stream. The first clause boundary (the comma) lands
+        # inside chunk 1; the remaining chunks are NOT yet consumed when it does.
+        source_chunks = [
+            "Hello there, ",          # clause boundary -> early flush point
+            "let me ask you ",
+            "one quick question. ",
+            "What is your name? ",
+            "Take your time answering.",
+        ]
+
+        class BaseAgent:
+            def __init__(self, instructions=""):
+                self.instructions = instructions
+
+            async def tts_node(self, text, model_settings):
+                opened_at = yielded["count"]
+                async for chunk in text:
+                    yield chunk
+                # The input stream ENDED here — this is the flush boundary the
+                # SDK turns into Sarvam's ``end_input``.
+                segment_spans.append((opened_at, yielded["count"]))
+
+        agent = phone.phone_agent_class(BaseAgent)(
+            "sys", client=FakeEventClient(), attempt_id=_ATTEMPT_ID, say=AsyncMock(),
+            on_user_turn=lambda *a, **k: None, native_turns=True,
+        )
+
+        async def _src():
+            for chunk in source_chunks:
+                yielded["count"] += 1
+                yield chunk
+
+        async def run(spans):
+            out = []
+            async for frame in agent.tts_node(_src(), None):
+                out.append(frame)
+            return "".join(out)
+
+        with patch.dict(phone.os.environ, {"PHONE_TTS_FLUSH_MIN_CHARS": "40"}):
+            spoken = asyncio.run(run(segment_spans))
+
+        # The full text still comes through, in order, uncorrupted (ignoring the
+        # inter-segment whitespace the re-chunker may collapse).
+        self.assertEqual(spoken.replace(" ", ""), "".join(source_chunks).replace(" ", ""))
+        # More than one downstream segment: the reply was flushed in pieces.
+        self.assertGreater(len(segment_spans), 1)
+        # THE NON-VACUITY ASSERTION: the FIRST segment closed (flushed) while the
+        # source stream was NOT yet fully consumed.
+        first_open, first_close = segment_spans[0]
+        self.assertLess(
+            first_close, len(source_chunks),
+            msg="first segment must flush before the whole stream is read",
+        )
+        # Tighter: the first clause is the comma inside chunk 1.
+        self.assertEqual(first_close, 1)
+
+    def test_tts_node_early_flush_control_single_segment_when_disabled(self):
+        """CONTROL for the non-vacuity test: with early-flush OFF the phone lane
+        opens exactly ONE downstream segment that closes only after the ENTIRE
+        stream is consumed — i.e. the pre-change behavior, which the assertion
+        above (>1 segment, first close < total) would FAIL against.
+        """
+        yielded = {"count": 0}
+        segment_spans: list[tuple[int, int]] = []
+        source_chunks = [
+            "Hello there, ", "let me ask you ", "one quick question. ",
+            "What is your name? ", "Take your time answering.",
+        ]
+
+        class BaseAgent:
+            def __init__(self, instructions=""):
+                self.instructions = instructions
+
+            async def tts_node(self, text, model_settings):
+                opened_at = yielded["count"]
+                async for chunk in text:
+                    yield chunk
+                segment_spans.append((opened_at, yielded["count"]))
+
+        agent = phone.phone_agent_class(BaseAgent)(
+            "sys", client=FakeEventClient(), attempt_id=_ATTEMPT_ID, say=AsyncMock(),
+            on_user_turn=lambda *a, **k: None, native_turns=True,
+        )
+
+        async def _src():
+            for chunk in source_chunks:
+                yielded["count"] += 1
+                yield chunk
+
+        async def run():
+            out = []
+            async for frame in agent.tts_node(_src(), None):
+                out.append(frame)
+            return "".join(out)
+
+        with patch.dict(phone.os.environ, {"PHONE_TTS_FLUSH_MIN_CHARS": "0"}):
+            asyncio.run(run())
+
+        # Exactly one segment, closing only after the whole stream is drained.
+        self.assertEqual(len(segment_spans), 1)
+        self.assertEqual(segment_spans[0][1], len(source_chunks))
+
+    def test_tts_node_early_flush_still_strips_markdown(self):
+        """PR-2 change 1 must NOT regress F4: markdown emphasis is still stripped
+        across the re-chunked fragments (the strip runs per fragment).
+        """
+        class BaseAgent:
+            def __init__(self, instructions=""):
+                self.instructions = instructions
+
+            async def tts_node(self, text, model_settings):
+                async for chunk in text:
+                    yield chunk
+
+        agent = phone.phone_agent_class(BaseAgent)(
+            "sys", client=FakeEventClient(), attempt_id=_ATTEMPT_ID, say=AsyncMock(),
+            on_user_turn=lambda *a, **k: None, native_turns=True,
+        )
+
+        async def _src():
+            for chunk in ("Hi **there**, ", "`code` blocks, ", "and _more_ done."):
+                yield chunk
+
+        async def run():
+            out = []
+            async for frame in agent.tts_node(_src(), None):
+                out.append(frame)
+            return "".join(out)
+
+        with patch.dict(phone.os.environ, {"PHONE_TTS_FLUSH_MIN_CHARS": "40"}):
+            spoken = asyncio.run(run())
+
+        for glyph in "*`_":
+            self.assertNotIn(glyph, spoken)
+        self.assertIn("there", spoken)
+        self.assertIn("code", spoken)
+        self.assertIn("more", spoken)
 
     # ── F1: deterministic role opening ────────────────────────────────
     def test_role_opening_text_names_the_exact_role(self):

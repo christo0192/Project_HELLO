@@ -261,6 +261,34 @@ def _record_provider_metrics(event: Any) -> None:
         )
 
 
+def _emit_phone_endpoint_delay(t_eou: float, now: float) -> None:
+    """Emit the PHONE endpoint delay (EOU -> LLM-invoke) — content-free.
+
+    PR-2 change 2. ``t_eou`` and ``now`` are MONOTONIC timestamps stamped at the
+    top of the phone EOU callback and at reply creation respectively. Emits a
+    ``voice_endpoint_delay_sec`` histogram and a matching structured log using
+    the existing instrumentation vocabulary (mirrors ``_record_provider_metrics``:
+    ``error_type`` + ``schema`` + ``duration_sec``). It carries a DURATION only —
+    never transcript, room, candidate, or request IDs. A negative delta (clock
+    skew / a stale stamp) is dropped rather than emitted. Defensive: an
+    instrumentation failure must never perturb the reply lifecycle.
+    """
+    try:
+        delta = now - t_eou
+        if delta < 0.0:
+            return
+        _safe_emit(
+            histogram_metric, "voice_endpoint_delay_sec", delta,
+            {"channel": "phone", "schema": "eou_to_llm"},
+        )
+        _log.info(
+            "unknown_event", error_type="voice_endpoint_delay",
+            schema="eou_to_llm", duration_sec=round(delta, 3),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _start_span_guarded(name: str, parent: Span | None = None) -> Span | None:
     """Start a span defensively — a broken tracer must never break the flow."""
     try:
@@ -1234,6 +1262,7 @@ async def _run_native_phone_screening(
     agent_listening: asyncio.Event,
     agent_activity_changed: asyncio.Event,
     close_event: asyncio.Event,
+    endpoint_delay_eou: list[float | None] | None = None,
     turn_mode: str = phone.PHONE_TURN_MODE_TOOLFIRST,
     coverage_judge_enabled: bool = False,
 ) -> phone.PhoneGateResult:
@@ -1431,6 +1460,16 @@ async def _run_native_phone_screening(
     ) -> None:
         # This hook routes and buffers only. It never changes the cursor or
         # writes transcript evidence; those effects belong to the tools below.
+        #
+        # PR-2 change 2: stamp t_EOU (end-of-utterance) here, at the TOP of the
+        # phone EOU callback — the earliest point the worker knows the candidate
+        # turn is complete. `_on_phone_speech_created` reads it when the reply is
+        # created and emits the EOU->LLM-invoke endpoint delay. Monotonic clock,
+        # content-free (no transcript touched), and it never mutates the
+        # ChatContext. The stamp is a plain assignment so it cannot fail the
+        # routing below.
+        if endpoint_delay_eou is not None:
+            endpoint_delay_eou[0] = _monotonic()
         reply_plan[0] = None
         if finished.is_set():
             from livekit.agents import StopResponse  # noqa: PLC0415
@@ -2436,10 +2475,27 @@ async def _run_phone_session(
     reply_started = asyncio.Event()
     assistant_delivery_complete = asyncio.Event()
     reply_handle: list[Any] = [None]
+    # PR-2 change 2: the ENDPOINT DELAY (EOU -> LLM-invoke), previously
+    # unlogged. `on_native_turn` stamps `[0]` with a MONOTONIC time at the top
+    # of the phone EOU callback; the reply-creation handler below reads it and
+    # emits the delta. A shared single-slot list so the two callbacks (which
+    # live in different functions) can hand the timestamp across. `None` means
+    # "no EOU stamped yet" — the first turn / a reply not triggered by a
+    # candidate turn — and the log is skipped rather than fabricated.
+    endpoint_delay_eou: list[float | None] = [None]
 
     @session.on("speech_created")
     def _on_phone_speech_created(event):  # noqa: ANN001
         reply_handle[0] = getattr(event, "speech_handle", None)
+        # PR-2 change 2: reply generation is starting (t_invoke). If a candidate
+        # turn stamped t_EOU, emit the endpoint delay and CONSUME the stamp so a
+        # later reply on the same session cannot re-fire against a stale EOU.
+        # Content-free (a duration only) and defensively guarded — an
+        # instrumentation failure must never perturb the reply lifecycle.
+        t_eou = endpoint_delay_eou[0]
+        if t_eou is not None:
+            endpoint_delay_eou[0] = None
+            _emit_phone_endpoint_delay(t_eou, _monotonic())
         reply_started.set()
         # Once an authorized reply has been created, the next interim
         # generation must default to substantive tool-first policy. The
@@ -2935,6 +2991,7 @@ async def _run_phone_session(
             agent_listening=agent_listening,
             agent_activity_changed=agent_activity_changed,
             close_event=close_event,
+            endpoint_delay_eou=endpoint_delay_eou,
             turn_mode=turn_mode,
             coverage_judge_enabled=coverage_judge_enabled,
         )

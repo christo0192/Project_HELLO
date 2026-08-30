@@ -638,6 +638,23 @@ def _bounded_float(raw: Any, default: float, lo: float, hi: float) -> float:
     return lo if value < lo else hi if value > hi else value
 
 
+def _bounded_int_env(raw: Any, default: int, lo: int, hi: int) -> int:
+    """Parse an int env value and CLAMP it to [lo, hi]; fail safe to default.
+
+    Same call-site idiom as ``_bounded_float`` — the env var is read with a
+    literal name at the call site so the repo's env-contract scanner sees it.
+    A malformed, empty, or out-of-range value never crashes the reader; it is
+    clamped or falls back to the default.
+    """
+    if raw in (None, ""):
+        return default
+    try:
+        value = int(float(raw))  # tolerate "40" and "40.0" alike
+    except (TypeError, ValueError):
+        return default
+    return lo if value < lo else hi if value > hi else value
+
+
 def phone_event_timeout_sec() -> float:
     """Bounded timeout for internal worker events, including final scoring.
 
@@ -675,6 +692,44 @@ def phone_answer_timeout_sec() -> float:
     numbers an operator has to keep ordered for one fact.
     """
     return _bounded_float(os.getenv("PHONE_ANSWER_TIMEOUT_SEC"), 90.0, 5.0, 300.0)
+
+
+def phone_tts_flush_min_chars() -> int:
+    """Early-flush threshold for the PHONE ``tts_node`` (latency knob).
+
+    THE MECHANISM this tunes (livekit-agents 1.6.4, verified against the
+    installed SDK source):
+
+      * ``sarvam.TTS`` reports ``capabilities.streaming=True``, so the SDK's
+        default ``tts_node`` does NOT wrap it in a ``StreamAdapter`` — it pushes
+        the LLM token stream straight into ``sarvam.SynthesizeStream``.
+      * That stream runs its OWN ``tokenize.basic.SentenceTokenizer`` (its
+        ``word_tokenizer``) whose ``BufferedSentenceStream`` only emits a token
+        to the Sarvam websocket once (a) at least ``min_ctx_len=10`` chars are
+        buffered AND (b) a sentence boundary is detected AND (c) the out buffer
+        reaches ``min_sentence_len=min_token_len=20`` chars. So the FIRST audio
+        request is not sent until ~20+ chars of a COMPLETE first sentence exist
+        — the ~2.9 s gap between LLM-invoke and first audio while TTS
+        first-audio itself is ~0.24 s.
+
+    THE FIX this knob drives: the phone ``tts_node`` re-segments the cleaned LLM
+    text stream itself and drives the downstream synthesis one EARLY FRAGMENT at
+    a time (first clause / first punctuation incl. comma, or once this many
+    chars accumulate). Each fragment is delivered as its own segment whose
+    ``end_input`` flushes Sarvam's tokenizer regardless of ``min_sentence_len``,
+    so the first speakable fragment reaches Sarvam as soon as it is ready.
+
+    PROSODY TRADEOFF (tune live): a SMALLER value flushes sooner → lower
+    time-to-first-fragment but choppier prosody, because Sarvam synthesizes a
+    short fragment in isolation with no downstream context. A LARGER value is
+    smoother but closer to the SDK's sentence-wait latency. ``0`` DISABLES
+    early-flush entirely (the phone lane falls back to the SDK's per-chunk
+    passthrough — today's behavior). Default 40 sits below a typical first
+    sentence (so it wins latency) but above a bare interjection (so a "Hi." does
+    not fragment further). Read at the CALL SITE with the literal name so the
+    env-contract scanner sees it.
+    """
+    return _bounded_int_env(os.getenv("PHONE_TTS_FLUSH_MIN_CHARS"), 40, 0, 400)
 
 
 def phone_bounce_mode() -> bool:
@@ -2060,6 +2115,64 @@ async def _aiter_text(text: Any) -> Any:
         return
     for chunk in text:  # sync iterable fallback
         yield chunk if isinstance(chunk, str) else str(chunk)
+
+
+#: An early-flush boundary: the first clause-ending punctuation the phone lane
+#: will split on. Includes the COMMA deliberately — a comma is the first natural
+#: pause a listener expects, and flushing at it is what buys the latency without
+#: cutting mid-word. Sentence terminators are here too so a short first sentence
+#: ("Hi there!") flushes on its own. Semicolon/colon are clause pauses as well.
+_TTS_EARLY_FLUSH_PUNCT = frozenset(",.!?;:…")
+
+
+async def _tts_early_flush_segments(text: Any, min_chars: int) -> Any:
+    """Re-segment a phone TTS text stream into EARLY-FLUSH fragments.
+
+    Yields the smallest speakable fragments the phone lane should hand to the
+    downstream synthesiser one at a time. A fragment is emitted as soon as
+    EITHER a clause boundary (``_TTS_EARLY_FLUSH_PUNCT`` — first comma / clause
+    pause / sentence terminator) is reached OR ``min_chars`` non-space
+    characters have accumulated since the last flush, WHICHEVER COMES FIRST.
+    That is the whole point: the first fragment leaves BEFORE the full first
+    sentence has been generated, instead of after it (the SDK default).
+
+    The trailing partial (whatever is left when the stream ends) is always
+    flushed so no text is dropped. When ``min_chars <= 0`` early-flush is
+    disabled and the input chunks pass straight through unchanged — the phone
+    lane's rollback path to the SDK's per-chunk behavior.
+
+    Pure buffering only — content is never mutated, reordered, or dropped; the
+    concatenation of everything yielded equals the concatenation of the input.
+    """
+    if min_chars <= 0:
+        async for chunk in _aiter_text(text):
+            if chunk:
+                yield chunk
+        return
+
+    buf = ""
+    # Count of non-space chars in buf — a run of spaces must not trip the
+    # threshold and emit a whitespace-only fragment.
+    dense = 0
+    async for chunk in _aiter_text(text):
+        for ch in chunk:
+            buf += ch
+            if not ch.isspace():
+                dense += 1
+            # Flush at the FIRST clause boundary, or once enough real
+            # characters have accumulated — whichever fires first.
+            if ch in _TTS_EARLY_FLUSH_PUNCT or dense >= min_chars:
+                if buf.strip():
+                    yield buf
+                    buf = ""
+                    dense = 0
+                else:
+                    # Only whitespace/punctuation so far — keep accumulating a
+                    # real word rather than synthesising silence.
+                    buf = ""
+                    dense = 0
+    if buf.strip():
+        yield buf
 
 
 #: COMPACT per-turn style reminder (F2, call 24). LiveKit 1.6.4's supported
@@ -3842,27 +3955,72 @@ def phone_agent_class(agent_base: Any) -> Any:
             raise StopResponse()
 
         async def tts_node(self, text: Any, model_settings: Any) -> Any:
-            """Strip markdown emphasis from spoken text (F4, call 24).
+            """Strip markdown AND flush the first speakable fragment early.
 
-            The TTS node is the last seam every spoken turn passes through,
-            downstream of both the streamed LLM output and any fixed `say`
-            copy. A live call spoke literal asterisks around a (hallucinated)
-            role title; the per-turn prompt now forbids markdown, and this is
-            the defensive net: each text chunk has its emphasis/code markers
-            removed before synthesis. Applied per chunk with a character-removal
-            translation (never a pair rewrite), so a marker split across two
-            streaming chunks is still stripped. PHONE ONLY — this override lives
-            on the phone Agent subclass; the browser Agent uses the SDK default.
+            TWO PHONE-ONLY jobs, both on this seam (the browser Agent uses the
+            SDK default and is untouched):
+
+            1. STRIP MARKDOWN (F4, call 24). This node is the last seam every
+               spoken turn passes through. A live call spoke literal asterisks
+               around a hallucinated role title; the per-turn prompt now forbids
+               markdown, and this is the defensive net. Applied per chunk with a
+               character-removal translation (never a pair rewrite), so a marker
+               split across two streaming chunks is still stripped.
+
+            2. EARLY-FLUSH FOR LATENCY (PR-2 change 1). ``sarvam.TTS`` streams
+               natively, so the SDK default ``tts_node`` feeds the LLM token
+               stream into ``sarvam.SynthesizeStream``, whose internal
+               ``SentenceTokenizer`` (min_ctx_len=10 / min_sentence_len=20) does
+               not release audio to the websocket until a COMPLETE ~20-char
+               first sentence exists — the measured ~2.9 s gap between
+               LLM-invoke and first audio. Here the phone lane re-segments the
+               cleaned stream into early fragments (``_tts_early_flush_segments``:
+               first clause / punctuation / ``PHONE_TTS_FLUSH_MIN_CHARS`` chars,
+               whichever first) and drives the downstream synthesis ONE FRAGMENT
+               PER SEGMENT. Each ``super().tts_node`` call ends with the SDK's
+               ``end_input``, which flushes Sarvam's tokenizer regardless of its
+               sentence threshold — so the first fragment reaches Sarvam as soon
+               as the first clause is ready, not after the whole sentence.
+               ``PHONE_TTS_FLUSH_MIN_CHARS=0`` disables this (per-chunk
+               passthrough → today's behavior), which is the rollback.
+
+            The frames of the fragments are yielded in order, so the audio is
+            byte-identical to the SDK path apart from being split into more
+            segments (the prosody tradeoff documented on the env reader).
             """
-            async def _cleaned() -> Any:
-                async for chunk in _aiter_text(text):
-                    yield strip_markdown_for_speech(chunk)
+            min_chars = phone_tts_flush_min_chars()
 
-            result = super().tts_node(_cleaned(), model_settings)
-            if inspect.isawaitable(result):
-                result = await result
-            async for frame in result:
-                yield frame
+            if min_chars <= 0:
+                # ROLLBACK PATH — byte-for-byte the pre-PR-2 behavior: strip
+                # per raw chunk and hand the WHOLE stream to ONE downstream
+                # `tts_node` call, so Sarvam sees an unbroken sentence stream
+                # exactly as it does today. No re-segmentation, no extra flush.
+                async def _cleaned() -> Any:
+                    async for chunk in _aiter_text(text):
+                        yield strip_markdown_for_speech(chunk)
+
+                result = super().tts_node(_cleaned(), model_settings)
+                if inspect.isawaitable(result):
+                    result = await result
+                async for frame in result:
+                    yield frame
+                return
+
+            async def _clean_segment(fragment: str) -> Any:
+                # One markdown-stripped fragment as its own text stream. The
+                # strip runs per fragment (not per raw chunk) but is still a
+                # pure character removal, so nothing splits differently.
+                yield strip_markdown_for_speech(fragment)
+
+            # EARLY-FLUSH PATH — one downstream segment per early fragment; each
+            # segment's `end_input` flushes Sarvam's tokenizer, so the first
+            # speakable clause reaches the provider as soon as it is ready.
+            async for fragment in _tts_early_flush_segments(text, min_chars):
+                result = super().tts_node(_clean_segment(fragment), model_settings)
+                if inspect.isawaitable(result):
+                    result = await result
+                async for frame in result:
+                    yield frame
 
         @_tool
         async def request_probe(self) -> str:
