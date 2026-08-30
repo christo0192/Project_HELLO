@@ -1540,33 +1540,12 @@ async def _run_native_phone_screening(
             if question is not None:
                 add_turn_instruction(turn_ctx, phone_question_instructions(question, state.role_title))
             return
-        # A proposal is a two-turn protocol. Its pending state is local to this
-        # live worker and the server confirmation RPC is the durable boundary.
-        if getattr(agent, "callback_confirmation_pending", lambda: False)():
-            decision = phone.callback_confirmation_decision(text)
-            setattr(agent, "_turn_policy", "callback")
-            if decision == "confirmed":
-                add_turn_instruction(
-                    turn_ctx,
-                    "The candidate explicitly confirmed the exact callback read-back. "
-                    "Call confirm_callback now and do not speak before its result.",
-                )
-            elif decision == "declined":
-                getattr(agent, "clear_callback_proposal")()
-                add_turn_instruction(
-                    turn_ctx,
-                    "The candidate did not confirm that time. Ask for an exact new "
-                    "IST date and time, then call propose_callback only after it is clear. "
-                    "Do not book or advance the interview.",
-                )
-            else:
-                setattr(agent, "_turn_policy", "clarification")
-                add_turn_instruction(
-                    turn_ctx,
-                    "Ask only whether the exact callback date and India time you just "
-                    "read back are correct. Do not book until the candidate says yes.",
-                )
-            return
+        # DE-LOOPED (this PR): the old two-turn propose→read-back→confirm
+        # callback booking handshake is removed. No proposal is ever made in
+        # call, so no `callback_confirmation_pending` state can arise; a "call me
+        # back later" is handled terminally in the route block below (acknowledge
+        # → team will reach out → end). The confirmation-pending branch that
+        # drove the loop is intentionally gone.
         # ROUTE CHECKS FIRST (X10). The bounded conversational routes —
         # end-call, callback deferral, role/general clarification, connectivity —
         # are recognised BEFORE the patience gate so a SHORT clarification like
@@ -1589,16 +1568,31 @@ async def _run_native_phone_screening(
                 if question is not None:
                     add_turn_instruction(turn_ctx, "Answer briefly from verified role context, then ask this same planned topic again as ONE natural spoken question in your own words:\n" + question.text)
                 return
-            setattr(agent, "_turn_policy", "callback" if route == "callback_deferral" else "clarification")
-            if question is not None and route == "callback_deferral":
+            if route == "callback_deferral":
+                # DE-LOOPED (this PR): a "call me back later" is TERMINAL. Do NOT
+                # ask for a time, propose, confirm, or book — that handshake
+                # looped. Acknowledge warmly, tell the candidate the team will
+                # reach out to arrange another time, then end the call. This
+                # mirrors the candidate-end terminal path exactly (fixed spoken
+                # reply + terminal reason + finished), so it cannot loop. The
+                # assessment is aborted for this leg (not opted out); the team's
+                # follow-up happens out of band.
+                setattr(agent, "_turn_policy", "closing")
+                reply_plan[0] = phone.PHONE_CALLBACK_DEFERRAL_TEXT
                 add_turn_instruction(
                     turn_ctx,
-                    "Address the callback request. Ask for an exact IST date and time "
-                    "if needed, then call propose_callback. It only validates and reads "
-                    "back the time; it does not book anything. Do not answer or advance "
-                    "the planned question.",
+                    "The candidate asked to be called back later. Warmly "
+                    "acknowledge, tell them the team will reach out to arrange "
+                    "another time, thank them, and say goodbye. Do NOT ask for a "
+                    "time, do NOT try to schedule, and do NOT ask another "
+                    "question.",
                 )
-            elif question is not None:
+                terminal_reply_required["value"] = True
+                terminal_reason["reason"] = phone.HALT_CANDIDATE_ENDED
+                finished.set()
+                return
+            setattr(agent, "_turn_policy", "clarification")
+            if question is not None:
                 add_turn_instruction(turn_ctx, "Answer briefly from verified role context, then ask this same planned topic again as ONE natural spoken question in your own words:\n" + question.text)
             return
         # THE PATIENCE GATE (X10). Not a recognised route: classify the final as
@@ -1991,6 +1985,14 @@ async def _run_native_phone_screening(
                     False, None, "judge_error",
                 )
             else:
+                # Rolling window: the prior committed turns plus the in-flight
+                # bot/candidate pair, so a claim fragmented across turns is
+                # visible to the judge against the résumé. Same source as
+                # `render_resume_context(state.turns)`; text is never logged.
+                window_turns = list(state.turns) + [
+                    {"speaker": "bot", "text": prompt},
+                    {"speaker": "candidate", "text": candidate},
+                ]
                 verdict = await phone.judge_phone_coverage(
                     question_text=question.text,
                     assistant_reply=prompt,
@@ -1999,6 +2001,7 @@ async def _run_native_phone_screening(
                     # The candidate genuinely has résumé facts on the state, so
                     # empty compacted evidence means it was dropped, not absent.
                     resume_expected=bool(state.resume_facts),
+                    recent_transcript=phone.render_recent_transcript(window_turns),
                 )
 
             source_category = verdict.category if verdict.category in {
@@ -2112,8 +2115,10 @@ async def _run_native_phone_screening(
     # spoken. This is fixed copy around a verbatim value (see
     # `phone.phone_role_opening_text` / `is_gate_copy`), so it is never captured
     # as a screening boundary. None when no role is known → byte-unchanged.
+    # The gate now speaks the role-opening line itself (masking the commit +
+    # egress start), so agent.py must NOT speak it again when it already did.
     role_opening = phone.phone_role_opening_text(state.role_title)
-    if role_opening is not None:
+    if role_opening is not None and not getattr(result, "role_opening_spoken", False):
         role_speech = session.say(role_opening, allow_interruptions=True)
         role_wait = getattr(role_speech, "wait_for_playout", None)
         if callable(role_wait):

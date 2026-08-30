@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import prompting  # noqa: E402
 
 
-_PINNED_SHA256 = "b4ec75e092d316a6665cb7b8f08f4571f2d13d6df9faac656d51dc5488bfbd9c"
+_PINNED_SHA256 = "164e954cf4a9a41a3676c403bc5507f3ca0f609e842ef8de73647d039312bf80"
 
 
 def _surface() -> str:

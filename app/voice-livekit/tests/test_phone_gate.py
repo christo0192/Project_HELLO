@@ -170,7 +170,7 @@ _NUMBER_LIKE = "+919812345670"
 
 # ── Fakes ─────────────────────────────────────────────────────────────
 
-def _plan_payload(questions=None, cursor=0, completed=None, turns=None, name="Asha"):
+def _plan_payload(questions=None, cursor=0, completed=None, turns=None, name="Asha", role_title=None):
     """The exact body `/assessment/start` returns, built here rather than
     hand-mocked as a `PhoneAssessmentState`, so `PhoneAssessmentState.parse`
     — the projection that actually runs in production — is under test too."""
@@ -178,10 +178,13 @@ def _plan_payload(questions=None, cursor=0, completed=None, turns=None, name="As
         {"key": "k1", "text": "First question?", "mandatory": True, "hint": None},
         {"key": "k2", "text": "Second question?", "mandatory": False, "hint": None},
     ]
+    context = {"session_id": _SESSION_ID, "candidate_name": name, "status": "in_progress"}
+    if role_title is not None:
+        context["role_title"] = role_title
     return {
         "ok": True,
         "status": "ok",
-        "context": {"session_id": _SESSION_ID, "candidate_name": name, "status": "in_progress"},
+        "context": context,
         "plan": {
             "source": "role_template",
             "question_count": len(questions),
@@ -1143,11 +1146,12 @@ class _AtomicEventClient(FakeEventClient):
     """A production-shaped client: exposes the atomic consent/start RPC and the
     gate-turn commit, both scripted and recorded."""
 
-    def __init__(self, *, consent=None, gate=None, gate_raises=False, **kwargs):
+    def __init__(self, *, consent=None, gate=None, gate_raises=False, state=None, **kwargs):
         super().__init__(**kwargs)
         self._consent = consent
         self._gate = gate
         self._gate_raises = gate_raises
+        self._state = state
         self.consent_calls: list[tuple] = []
         self.gate_commits: list[dict] = []
 
@@ -1156,6 +1160,8 @@ class _AtomicEventClient(FakeEventClient):
         self.timeline.append("consent_and_start")
         if self._consent is not None:
             return self._consent
+        if self._state is not None:
+            return self._state
         return _default_state()
 
     async def commit_gate_turns(self, session_id, turns, source_event_id):
@@ -1332,30 +1338,74 @@ class TestPhoneParity2Gate(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(phone._opening_is_verified(""))
         self.assertFalse(phone._opening_is_verified(None))
 
-    # ── consent bridge ───────────────────────────────────────────────────
+    # ── post-consent role opening (CHANGE 2: bridge removed) ─────────────
 
-    async def test_consent_bridge_is_spoken_after_human_and_is_gate_copy(self):
-        result, client, recorder = await self._atomic_gate()
+    async def test_the_throwaway_consent_bridge_line_is_gone(self):
+        # "Awesome, thank you!" no longer exists and is never spoken.
+        self.assertFalse(hasattr(phone, "PHONE_CONSENT_BRIDGE_TEXT"))
+        result, client, recorder = await self._atomic_gate(
+            client=_AtomicEventClient(state=_default_state(role_title="Sales Program Advisor"))
+        )
+        self.assertNotIn("Awesome, thank you!", recorder.spoken)
+
+    async def test_role_line_is_spoken_by_the_gate_and_masks_commit_and_egress(self):
+        client = _AtomicEventClient(state=_default_state(role_title="Sales Program Advisor"))
+        result, client, recorder = await self._atomic_gate(client=client)
         self.assertTrue(result.assessment_allowed)
-        self.assertIn(phone.PHONE_CONSENT_BRIDGE_TEXT, recorder.spoken)
-        self.assertTrue(phone.is_gate_copy(phone.PHONE_CONSENT_BRIDGE_TEXT))
-        # It overlaps the RPC: the bridge say and the consent RPC both happen,
-        # and the bridge is reaped before the gate returns.
-        self.assertIn("consent_and_start", client.timeline)
+        # The gate itself spoke the role line (so agent.py must not repeat it).
+        self.assertTrue(result.role_opening_spoken)
+        role_line = phone.phone_role_opening_text("Sales Program Advisor")
+        # Spoken exactly once, by the gate.
+        self.assertEqual(recorder.spoken.count(role_line), 1)
+        # It masks BOTH the gate-turn commit and the egress start: those run
+        # while the role line plays, and all three happen before the gate
+        # returns.
+        self.assertIn("gate_turns", client.timeline)
+        self.assertIn("recording", recorder.order)
 
-    async def test_a_failing_bridge_never_fails_the_gate(self):
-        class _BridgeBoomRecorder(Recorder):
+    async def test_egress_is_awaited_before_the_gate_returns(self):
+        # Recording-before-Q1 invariant: start_recording must have been awaited
+        # by the time the gate returns an assessment-allowed verdict.
+        client = _AtomicEventClient(state=_default_state(role_title="Sales Program Advisor"))
+        result, client, recorder = await self._atomic_gate(client=client)
+        self.assertTrue(result.assessment_allowed)
+        self.assertTrue(result.recording_allowed)
+        self.assertEqual(recorder.recording_calls, 1)
+
+    async def test_role_line_names_interview_kickstart_and_is_gate_copy(self):
+        role_line = phone.phone_role_opening_text("Sales Program Advisor")
+        self.assertIn("at Interview Kickstart", role_line)
+        self.assertTrue(phone.is_gate_copy(role_line))
+
+    async def test_no_role_title_speaks_no_role_line_and_still_records(self):
+        # role_title None → no role line (byte-unchanged), no bridge, but the
+        # commit + egress are still awaited before the gate returns.
+        client = _AtomicEventClient(state=_default_state(role_title=None))
+        result, client, recorder = await self._atomic_gate(client=client)
+        self.assertTrue(result.assessment_allowed)
+        self.assertFalse(result.role_opening_spoken)
+        self.assertNotIn("Awesome, thank you!", recorder.spoken)
+        self.assertEqual(recorder.recording_calls, 1)
+        self.assertIn("gate_turns", client.timeline)
+
+    async def test_a_failing_role_line_never_fails_the_gate(self):
+        role_line = phone.phone_role_opening_text("Sales Program Advisor")
+
+        class _RoleBoomRecorder(Recorder):
             async def say(self, text):
-                if text == phone.PHONE_CONSENT_BRIDGE_TEXT:
-                    raise RuntimeError("bridge playout failed")
+                if text == role_line:
+                    raise RuntimeError("role line playout failed")
                 await super().say(text)
 
+        client = _AtomicEventClient(state=_default_state(role_title="Sales Program Advisor"))
         result, client, recorder = await self._atomic_gate(
-            recorder=_BridgeBoomRecorder()
+            client=client, recorder=_RoleBoomRecorder()
         )
-        # The gate still consents and starts despite the bridge raising.
+        # The gate still consents, starts, and records despite the say raising.
         self.assertTrue(result.assessment_allowed)
+        self.assertFalse(result.role_opening_spoken)
         self.assertEqual(len(client.consent_calls), 1)
+        self.assertEqual(recorder.recording_calls, 1)
 
     # ── gate-turn commit failure ─────────────────────────────────────────
 
@@ -3830,6 +3880,9 @@ class TestToollessLlmNode(unittest.IsolatedAsyncioTestCase):
             types.SimpleNamespace(name="request_probe"),
             types.SimpleNamespace(name="advance_screening"),
             types.SimpleNamespace(name="schedule_callback"),
+            types.SimpleNamespace(name="propose_callback"),
+            types.SimpleNamespace(name="confirm_callback"),
+            types.SimpleNamespace(name="book_appointment"),
         ]
 
     @staticmethod
@@ -3857,18 +3910,25 @@ class TestToollessLlmNode(unittest.IsolatedAsyncioTestCase):
         tools, choice = calls[-1]
         self.assertEqual(choice, "auto")
 
-    async def test_coordinator_tools_are_stripped_governed_tools_stay(self):
+    async def test_coordinator_and_callback_tools_are_stripped(self):
         # The cursor is owned by the background commit, so the coordinator tools
         # (advance_screening / request_probe) are REMOVED — leaving them under
         # `auto` let the model fire a concurrent second on_advance that raced the
-        # cursor into a spurious HALT_PERSISTENCE. The governed callback tools
-        # stay available so the model can still act on a callback request.
+        # cursor into a spurious HALT_PERSISTENCE.
+        #
+        # CHANGE 5 (this PR): the callback booking tools (propose_callback,
+        # confirm_callback, schedule_callback, book_appointment) are ALSO removed
+        # from a substantive toolless turn — in-call booking is de-looped, so the
+        # model must not be able to initiate a booking handshake here.
         agent, calls = self._agent()
         await self._run_node(agent)
         tools, _choice = calls[-1]
         self.assertNotIn("advance_screening", tools)
         self.assertNotIn("request_probe", tools)
-        self.assertIn("schedule_callback", tools)
+        self.assertNotIn("propose_callback", tools)
+        self.assertNotIn("confirm_callback", tools)
+        self.assertNotIn("schedule_callback", tools)
+        self.assertNotIn("book_appointment", tools)
 
     async def test_no_required_leg_even_across_repeated_turns(self):
         agent, calls = self._agent()
@@ -3909,6 +3969,181 @@ class TestToollessLlmNode(unittest.IsolatedAsyncioTestCase):
         tools, choice = agent.last
         self.assertEqual(choice, "required")
         self.assertEqual(sorted(tools), ["advance_screening", "request_probe"])
+
+
+# ── Fakes modelling the real livekit ChatContext / ChatMessage shape ──────
+# The real livekit-agents wheels do not import under CI-Linux from the Windows
+# venv, so these fakes replicate the exact surface `_ensure_not_ending_on_model_turn`
+# reads: `chat_ctx.items` (list of items), each item with `.type` == "message"
+# and `.role`, and `chat_ctx.add_message(role=, content=)` appending a new item.
+class _FakeChatMessage:
+    def __init__(self, role, content):
+        self.type = "message"
+        self.role = role
+        self.content = [content] if isinstance(content, str) else list(content)
+
+
+class _FakeFunctionCall:
+    def __init__(self):
+        self.type = "function_call"
+        self.role = None
+
+
+class _FakeChatContext:
+    def __init__(self, items=None):
+        self.items = list(items or [])
+
+    def add_message(self, *, role, content):
+        msg = _FakeChatMessage(role, content)
+        self.items.append(msg)
+        return msg
+
+
+class TestGeminiModelTurnGuard(unittest.IsolatedAsyncioTestCase):
+    """CHANGE 4: never let the phone context end on a model turn.
+
+    ``gemini-flash-lite-latest`` returns "400: Requests ending with a model
+    turn are not supported". The phone llm_node appends a minimal neutral user
+    turn before the Gemini call when the last item is an assistant message, and
+    is a no-op otherwise.
+    """
+
+    def _agent(self):
+        seen: list = []
+
+        class BaseAgent:
+            def __init__(self, instructions=""):
+                self.instructions = instructions
+
+            async def llm_node(self, chat_ctx, tools, model_settings):
+                # Snapshot the context the SUPER call actually receives.
+                seen.append(list(getattr(chat_ctx, "items", [])))
+
+                async def chunks():
+                    yield "chunk"
+                return chunks()
+
+        cls = phone.phone_agent_class(BaseAgent)
+        agent = cls(
+            "instructions", client=FakeEventClient(), attempt_id=_ATTEMPT_ID,
+            say=AsyncMock(), native_turns=True,
+            on_user_turn=lambda *a, **k: None, turn_mode="toolless",
+        )
+        agent.authorize_screening()
+        return agent, seen
+
+    @staticmethod
+    def _settings():
+        from dataclasses import dataclass
+
+        @dataclass
+        class Settings:
+            tool_choice: str = "auto"
+        return Settings()
+
+    async def _run(self, agent, chat_ctx):
+        async for _ in agent.llm_node(chat_ctx, [], self._settings()):
+            pass
+
+    async def test_trailing_assistant_turn_gets_a_neutral_user_turn(self):
+        agent, seen = self._agent()
+        ctx = _FakeChatContext([
+            _FakeChatMessage("user", "hello"),
+            _FakeChatMessage("assistant", "hi there"),
+        ])
+        await self._run(agent, ctx)
+        # A user turn was appended so the context no longer ends on a model turn.
+        self.assertEqual(ctx.items[-1].role, "user")
+        self.assertEqual(len(ctx.items), 3)
+        # And the super() call saw the repaired context (ends on user).
+        self.assertEqual(seen[-1][-1].role, "user")
+
+    async def test_trailing_user_turn_is_a_no_op(self):
+        agent, seen = self._agent()
+        ctx = _FakeChatContext([
+            _FakeChatMessage("assistant", "a question?"),
+            _FakeChatMessage("user", "my answer"),
+        ])
+        await self._run(agent, ctx)
+        # Unchanged: still exactly two items, still ends on the user turn.
+        self.assertEqual(len(ctx.items), 2)
+        self.assertEqual(ctx.items[-1].role, "user")
+
+    async def test_trailing_non_message_item_is_a_no_op(self):
+        # A function_call / function_call_output tail is not the rejected shape.
+        agent, seen = self._agent()
+        ctx = _FakeChatContext([
+            _FakeChatMessage("user", "hello"),
+            _FakeFunctionCall(),
+        ])
+        await self._run(agent, ctx)
+        self.assertEqual(len(ctx.items), 2)
+        self.assertEqual(ctx.items[-1].type, "function_call")
+
+    async def test_empty_context_is_a_no_op(self):
+        agent, seen = self._agent()
+        ctx = _FakeChatContext([])
+        await self._run(agent, ctx)
+        self.assertEqual(ctx.items, [])
+
+
+class TestCallbackPolicyDelooped(unittest.IsolatedAsyncioTestCase):
+    """CHANGE 5: the "callback" turn policy no longer forces a booking tool.
+
+    Before this PR the callback policy set `tool_choice="required"` on
+    propose/confirm — a loop. Now it is an ordinary spoken turn: no tools,
+    `tool_choice="none"`, no booking handshake ever initiated in-call.
+    """
+
+    def _agent(self):
+        calls: list[tuple[list, str]] = []
+
+        class BaseAgent:
+            def __init__(self, instructions=""):
+                self.instructions = instructions
+
+            async def llm_node(self, chat_ctx, tools, model_settings):
+                calls.append((
+                    [str(getattr(t, "name", "")) for t in tools],
+                    getattr(model_settings, "tool_choice", None),
+                ))
+
+                async def chunks():
+                    yield "chunk"
+                return chunks()
+
+        cls = phone.phone_agent_class(BaseAgent)
+        agent = cls(
+            "instructions", client=FakeEventClient(), attempt_id=_ATTEMPT_ID,
+            say=AsyncMock(), native_turns=True, on_user_turn=lambda *a, **k: None,
+        )
+        agent.authorize_screening()
+        return agent, calls
+
+    @staticmethod
+    def _tools():
+        return [
+            types.SimpleNamespace(name="propose_callback"),
+            types.SimpleNamespace(name="confirm_callback"),
+        ]
+
+    @staticmethod
+    def _settings():
+        from dataclasses import dataclass
+
+        @dataclass
+        class Settings:
+            tool_choice: str = "auto"
+        return Settings()
+
+    async def test_callback_policy_is_a_toolless_spoken_turn(self):
+        agent, calls = self._agent()
+        agent.set_turn_policy("callback")
+        async for _ in agent.llm_node(None, self._tools(), self._settings()):
+            pass
+        tools, choice = calls[-1]
+        self.assertEqual(tools, [])
+        self.assertEqual(choice, "none")
 
 
 class _RacedTrackingSession(_FakePhoneSession):
@@ -4420,6 +4655,75 @@ class TestPhoneJudgeRetry(unittest.IsolatedAsyncioTestCase):
             verdict = await self._judge(infer)
         self.assertEqual(verdict.category, "judge_error")
         self.assertEqual(calls["n"], 1)
+
+
+class TestJudgeRollingTranscriptWindow(unittest.IsolatedAsyncioTestCase):
+    """CHANGE 3: a bounded rolling transcript reaches the judge payload, so a
+    résumé conflict fragmented across two turns is visible to the judge."""
+
+    def test_render_recent_transcript_is_bounded_and_labelled(self):
+        turns = [
+            {"speaker": "bot", "text": "How many years?"},
+            {"speaker": "candidate", "text": "About six."},
+            {"speaker": "bot", "text": "Where?"},
+            {"speaker": "candidate", "text": "At Example Co."},
+        ]
+        rendered = phone.render_recent_transcript(turns)
+        self.assertIn("Candidate: At Example Co.", rendered)
+        self.assertIn("You: Where?", rendered)
+        # Bounded to the last few turns.
+        self.assertLessEqual(len(rendered), phone.JUDGE_WINDOW_TOTAL_MAX_CHARS)
+        self.assertEqual(phone.render_recent_transcript(None), "")
+        self.assertEqual(phone.render_recent_transcript([]), "")
+
+    async def test_recent_transcript_reaches_the_judge_payload(self):
+        captured: dict = {}
+
+        async def infer(prompt):
+            captured["prompt"] = prompt
+            return json.dumps({"covered": True, "conflict": None})
+
+        await phone.judge_phone_coverage(
+            question_text="Tell me about your recent role.",
+            assistant_reply="Walk me through your latest position.",
+            candidate_answer="At Example Co.",
+            resume_facts={"recent_role": {"period": "2020-2026"}},
+            recent_transcript="You: How long there?\nCandidate: Just two months.",
+            infer=infer,
+        )
+        payload = json.loads(captured["prompt"])
+        self.assertIn("recent_transcript", payload)
+        self.assertIn("Just two months", payload["recent_transcript"])
+
+    async def test_conflict_fragmented_across_turns_surfaces(self):
+        # The single owed Q/A ("At Example Co.") is not itself a conflict; the
+        # conflict lives in the WINDOW (résumé says 6 years, candidate said "two
+        # months" a turn earlier). A judge weighing the window can surface it.
+        def _infer_reads_window(prompt):
+            payload = json.loads(prompt)
+            window = payload.get("recent_transcript", "")
+            # A judge that reads the window sees the fragmented tenure claim.
+            if "two months" in window and "2020-2026" in payload.get("resume_evidence_json", ""):
+                return json.dumps({"covered": True, "conflict": {
+                    "resume_fact": "recent_role 2020-2026",
+                    "spoken_claim": "two months",
+                }})
+            return json.dumps({"covered": True, "conflict": None})
+
+        async def infer(prompt):
+            return _infer_reads_window(prompt)
+
+        verdict = await phone.judge_phone_coverage(
+            question_text="Tell me about your recent role.",
+            assistant_reply="Walk me through your latest position.",
+            candidate_answer="At Example Co.",
+            resume_facts={"recent_role": {"period": "2020-2026"}},
+            recent_transcript="You: How long have you been there?\nCandidate: Just two months.",
+            infer=infer,
+        )
+        self.assertTrue(verdict.covered)
+        self.assertIsNotNone(verdict.conflict)
+        self.assertEqual(verdict.conflict["spoken_claim"], "two months")
 
 
 class TestPhoneJudgeBreakerTuning(unittest.IsolatedAsyncioTestCase):
@@ -5461,26 +5765,38 @@ class TestToollessGovernedActions(unittest.IsolatedAsyncioTestCase):
             await hooks["drive_terminal"]()
         self.assertIn("assessment.aborted", client.event_types)
 
-    async def test_a_callback_deferral_routes_to_the_callback_policy_in_toolless(self):
+    async def test_a_callback_deferral_ends_the_call_with_no_booking_in_toolless(self):
+        # CHANGE 5 (this PR): in-call callback booking is DE-LOOPED. A recognised
+        # "call me back later" is now TERMINAL: acknowledge, tell them the team
+        # will reach out, and end the call — no propose/confirm, no booking, and
+        # never a loop. It must NOT commit the boundary.
         agent, session, state, client, hooks = await _make_native_coordinator(
             turn_mode="toolless",
         )
         on_turn = hooks["on_native_turn"]
-        # A recognised "call me back" defers: it must set the callback policy and
-        # inject the propose_callback instruction, NOT commit the boundary.
         text = "Can you call me back later? Now is not a good time."
         route = phone.candidate_turn_route(text)
         self.assertEqual(route, "callback_deferral")
         turn_ctx = types.SimpleNamespace(items=[])
         await on_turn(text, types.SimpleNamespace(text_content=text), turn_ctx)
-        self.assertEqual(getattr(agent, "_turn_policy"), "callback")
+        # It closes, not loops: closing policy, never the booking-loop "callback".
+        self.assertEqual(getattr(agent, "_turn_policy"), "closing")
         injected = " ".join(
             m["content"] if isinstance(m, dict) else "" for m in turn_ctx.items
         ).lower()
-        self.assertIn("propose_callback", injected)
+        # No booking-tool handshake is ever initiated.
+        self.assertNotIn("propose_callback", injected)
+        self.assertNotIn("confirm_callback", injected)
+        self.assertNotIn("book_appointment", injected)
+        # The instruction tells the candidate the team will reach out and ends.
+        self.assertIn("reach out", injected)
+        self.assertIn("goodbye", injected)
         self.assertEqual(client.committed_keys, [])
-        hooks["close_event"].set()
-        await hooks["drive_terminal"]()
+        # It is a terminal reply: the coordinator waits for the closing playout,
+        # then aborts the assessment for this leg (candidate-ended semantics).
+        with patch.object(agent_mod, "PHONE_TERMINAL_REPLY_TIMEOUT_SEC", 0.05):
+            await hooks["drive_terminal"]()
+        self.assertIn("assessment.aborted", client.event_types)
 
 
 class TestToollessSessionFlow(unittest.IsolatedAsyncioTestCase):
