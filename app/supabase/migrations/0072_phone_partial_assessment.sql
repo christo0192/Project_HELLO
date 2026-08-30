@@ -45,11 +45,25 @@
 -- 0071 selects on the RECORDING shape (active egress, null object key) and
 -- drives to `expired`. This selects on the SESSION being ended (its attempt is
 -- terminal/dead) REGARDLESS of egress state — because the scorecard must land
--- even when egress never started or produced nothing — and drives to
--- `completed` so scoring is owed. The shorter grace (default 180s, always far
--- below 0071's 7200s) makes this WIN the race for a genuinely-ended call, and
--- the `status='in_progress'` guard on the UPDATE makes it a no-op the moment
--- any other path has already terminalized the session.
+-- even when egress never started or produced nothing — and drives an
+-- `in_progress` session to `completed` so scoring is owed. The shorter grace
+-- (default 180s, always far below 0071's 7200s) makes this WIN the race for a
+-- genuinely-ended call, and the `status='in_progress'` guard on the UPDATE
+-- makes it a no-op the moment any other path has already terminalized the
+-- session.
+--
+-- ── THE TWO PATHS 0071 CREATED THAT THIS MUST COVER ───────────────────
+-- 0071's 30s reclaim wins the race to terminalize a crashed call: it sets the
+-- attempt `abandoned` and drives the session `expired`/`grace_timeout` (which
+-- finalizes the MP3 via the 0038 trigger) well before this sweep's 180s grace
+-- elapses — but it NEVER enqueues scoring. So a crashed call is ALREADY
+-- terminal by the time this sweep sees it, and if this sweep only looked at
+-- `in_progress` it would never see the crash residue at all and the scorecard
+-- would never come. This sweep therefore ALSO selects the `abandoned`-attempt
+-- `expired`/`grace_timeout` residue, leaves it terminal (its MP3 is already
+-- finalized — re-transitioning `expired -> completed` is not a legal 0006
+-- edge), and RETURNS it with `transitioned=false` so the caller enqueues its
+-- scoring. The `not exists` assessment guard makes that self-terminating.
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- 1. assessments.partial — the partial-screening flag
@@ -78,24 +92,41 @@ comment on column screening_v2.assessments.partial is
 -- can enqueue partial scoring independently.
 --
 -- A session qualifies when ALL hold:
---   * `mode='live'`, `status='in_progress'`, `started_at` present (never
---     reached a terminal status).
---   * its LATEST attempt is genuinely over — EITHER terminal
---     (`state in ('ended','human','machine')` with `ended_at` set) OR its
---     lease has expired (the crash case, mirroring 0071's reclaim cursor) —
---     and that terminal/expiry instant is older than the grace.
+--   * `mode='live'`, `started_at` present, and it has NO phone assessment yet
+--     (the `not exists` below is BOTH the idempotency self-terminator AND the
+--     re-score guard: once the scorecard has landed the session is never
+--     re-selected).
+--   * its status is one of:
+--       - `in_progress` (never reached a terminal status — the hangup /
+--         network-drop path, and the crash path BEFORE 0071's reclaim has run);
+--       OR
+--       - `expired` with `terminal_reason='grace_timeout'` — the WORKER-CRASH
+--         residue: 0071's 30s reclaim already set the attempt `abandoned` and
+--         drove the session terminal (finalizing the MP3), but NEVER enqueued
+--         scoring. Without this branch a crashed call gets an MP3 and no
+--         scorecard, violating the owner's hard requirement.
+--   * its LATEST attempt is genuinely over — ANY of:
+--       - terminal (`state in ('ended','human','machine')` with `ended_at`
+--         set), the deliberate-hangup / classified-end case;
+--       - lease-expired in a LIVE state (`admitted`..`machine` with
+--         `lease_expires_at` past), the crash case BEFORE reclaim;
+--       - `state='abandoned'` (reclaim's crash terminal) with `ended_at` OR
+--         `lease_expires_at` past — the crash case AFTER reclaim;
+--     and the deciding instant (ended_at / lease_expires_at) is older than the
+--     grace, so a live leg that touched a moment ago is never taken.
 --
 -- Selection is on SESSION-ENDED, never on egress state: the scorecard must be
 -- delivered even if egress never started or produced nothing. If egress did
 -- produce nothing, 0038's finalize job defers `object_absent` (existing
 -- behaviour) and the scorecard still lands — the two are independent.
 --
--- Idempotent and self-limiting: a session already terminal is skipped by the
--- `status='in_progress'` guard on the UPDATE, a session already carrying a
--- phone assessment is reported `assessment_present=true` (the caller's dedup
--- key then makes the enqueue a no-op), and `for update skip locked` means a
--- concurrent live completion is never blocked. Safe to run every tick until
--- both the MP3 and the assessment exist.
+-- Idempotent and self-limiting: a session already carrying a phone assessment
+-- is excluded by the `not exists` (so a re-run never re-scores and the sweep
+-- self-terminates), a session already terminal is NOT re-transitioned (the
+-- `status='in_progress'` guard on the UPDATE) but is STILL RETURNED so the
+-- caller can enqueue its scoring independently, and `for update skip locked`
+-- means a concurrent live completion is never blocked. Safe to run every tick
+-- until both the MP3 and the assessment exist.
 create or replace function screening_v2.finalize_phone_partial_sessions(
   p_limit         integer     default 25,
   p_grace_seconds integer     default 180,
@@ -142,12 +173,29 @@ begin
          limit 1
       ) a on true
      where s.mode = 'live'
-       and s.status = 'in_progress'
        and s.started_at is not null
-       -- The call is genuinely over, not merely briefly quiet: either the
-       -- attempt is terminal with an ended_at, or its lease has lapsed (the
-       -- crash case). In BOTH cases the deciding instant must be older than
-       -- the grace so a live leg that touched a moment ago is never taken.
+       -- Idempotency + no-re-score, in one predicate: a session that already
+       -- carries a phone assessment is NEVER re-selected. This self-terminates
+       -- the sweep for a scored session and makes a redundant enqueue
+       -- impossible from the SQL side (belt to the dedup-key braces).
+       and not exists (
+         select 1 from screening_v2.assessments a2
+          where a2.session_id = s.id and a2.source = 'phone'
+       )
+       -- The session must be ENDABLE-but-unscored. Either it is still
+       -- `in_progress` (hangup / network drop / crash before 0071's reclaim),
+       -- or it is the crash residue 0071 already terminalized to
+       -- `expired`/`grace_timeout` (MP3 finalized, scoring never enqueued).
+       and (
+         s.status = 'in_progress'
+         or (s.status = 'expired' and s.terminal_reason = 'grace_timeout')
+       )
+       -- The call is genuinely over, not merely briefly quiet: the attempt is
+       -- terminal with an ended_at, OR its lease lapsed in a live state (crash
+       -- before reclaim), OR it is `abandoned` (reclaim's crash terminal) with
+       -- an ended_at/lease past. In EVERY case the deciding instant must be
+       -- older than the grace so a live leg that touched a moment ago is never
+       -- taken.
        and (
          (a.state in ('ended','human','machine')
             and a.ended_at is not null
@@ -156,6 +204,11 @@ begin
          (a.lease_expires_at is not null
             and a.lease_expires_at <= p_now - (v_grace * interval '1 second')
             and a.state in ('admitted','ringing','answered_unclassified','human','machine'))
+         or
+         (a.state = 'abandoned'
+            and coalesce(a.ended_at, a.lease_expires_at) is not null
+            and coalesce(a.ended_at, a.lease_expires_at)
+                  <= p_now - (v_grace * interval '1 second'))
        )
      order by s.started_at asc
      limit v_limit
@@ -171,10 +224,23 @@ begin
       from screening_v2.phone_session_plans p
      where p.session_id = v_row.session_id;
 
-    -- disconnect_reason: a candidate hangup is the attempt outcome
-    -- 'disconnected'; anything else is a generic 'disconnected' bucket. No PII.
+    -- disconnect_reason (no PII, one of three fixed tokens):
+    --   * 'candidate_hangup' — the attempt ended with outcome 'disconnected'
+    --     (the deliberate-hangup path);
+    --   * 'worker_crash' — the residue 0071's reclaim produced: the attempt is
+    --     `abandoned` (reclaim nulls its outcome_class) or its lease expired in
+    --     a live state without a terminal outcome. This is the mode where the
+    --     session is already `expired`/`grace_timeout` (or was, before this
+    --     sweep saw it) and the MP3 was finalized by reclaim, not by us;
+    --   * 'disconnected' — any other genuine end (e.g. an `ended` attempt with
+    --     a non-'disconnected' outcome).
     v_reason := case
       when v_row.attempt_outcome = 'disconnected' then 'candidate_hangup'
+      when v_row.attempt_state = 'abandoned'
+        or (v_row.lease_expires_at is not null
+            and v_row.attempt_state in
+                ('admitted','ringing','answered_unclassified','human','machine'))
+        then 'worker_crash'
       else 'disconnected'
     end;
 
@@ -191,8 +257,12 @@ begin
     -- The SAME transition the worker's happy path uses: completed /
     -- conversation_complete. It fires trg_enqueue_recording_finalize (0038) in
     -- THIS transaction and makes the session eligible for scoring. A row that
-    -- is no longer in_progress is left untouched — this is the idempotent
-    -- re-run guard, not a failure.
+    -- is no longer in_progress is left untouched — this covers BOTH the
+    -- idempotent re-run (a session already completed) AND the worker-crash
+    -- residue this sweep also selects (`expired`/`grace_timeout`, MP3 already
+    -- finalized by 0071's reclaim): re-transitioning `expired -> completed` is
+    -- not a legal 0006 edge, so we deliberately leave it terminal and report
+    -- `transitioned=false`. Its scoring is still owed and still returned below.
     update screening_v2.call_sessions s
        set status          = 'completed',
            terminal_reason = 'conversation_complete',

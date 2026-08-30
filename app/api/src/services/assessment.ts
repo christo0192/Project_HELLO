@@ -122,10 +122,30 @@ async function runAssessmentImpl(
   // completed with the authoritative initial scoring reason. Blocks
   // failed/cancelled/expired/in_progress/created/waiting, missing/null or
   // malformed reasons, and the assessment_done repeat path.
-  if (
-    session.status !== 'completed' ||
-    session.terminal_reason !== 'conversation_complete'
-  ) {
+  const isCleanTerminal =
+    session.status === 'completed' &&
+    session.terminal_reason === 'conversation_complete';
+
+  // 0072: the WORKER-CRASH partial. When a worker crashes, 0071's 30s reclaim
+  // sets the attempt `abandoned` and drives the SESSION `expired`/`grace_timeout`
+  // (finalizing the MP3) long before the 0072 sweep's 180s grace elapses — so
+  // the sweep sees an ALREADY-terminal `expired`/`grace_timeout` session, leaves
+  // it terminal (re-transitioning `expired -> completed` is not a legal edge),
+  // and enqueues its scoring with `partial:true`. Without admitting this exact
+  // shape here the crash scorecard would DLQ against the `completed` guard and
+  // never land — the owner's hard requirement (scorecard AND MP3 on EVERY
+  // disconnect mode) would fail on the crash path. Narrow on purpose: ONLY the
+  // phone path, ONLY a caller-declared partial, ONLY the `grace_timeout` reason
+  // 0071 stamps — an ordinary `expired`/`failed`/`cancelled` session is still
+  // rejected. Scoring itself is unchanged: it reads `transcript_turns`, exactly
+  // the turns captured before the crash, and never depends on the recording.
+  const isCrashPartialTerminal =
+    isPhone &&
+    options?.partial === true &&
+    session.status === 'expired' &&
+    session.terminal_reason === 'grace_timeout';
+
+  if (!isCleanTerminal && !isCrashPartialTerminal) {
     // 0044: for the PHONE path only, an already-scored session is a SUCCESS,
     // not a refusal. Two legs racing a completion is the ordinary case a
     // reconnect creates: the winner scores and flips `terminal_reason` to
@@ -347,10 +367,11 @@ async function runAssessmentImpl(
 
   // ── Ashby completion observer ─────────────────────────────────────────
   // This is the authoritative terminal path: we only reach here after the
-  // eligibility guard above (status='completed' AND terminal_reason=
-  // 'conversation_complete') and after the assessment row is durably
-  // inserted, so a failed/cancelled/expired/in-flight session can never be
-  // parked. For an Ashby-originated session the application link becomes
+  // eligibility guard above (a clean `completed`/`conversation_complete`
+  // session, OR a 0072 worker-crash partial — `expired`/`grace_timeout` with a
+  // caller-declared `partial:true`) and after the assessment row is durably
+  // inserted, so an in-flight or arbitrarily-failed/cancelled session can never
+  // be parked. For an Ashby-originated session the application link becomes
   // `writeback_pending` — screened, awaiting manual publication, because no
   // tenant-verified Ashby result sink exists. It publishes NOTHING: no
   // scorecard write, no stage move, no auto-reject.

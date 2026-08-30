@@ -316,6 +316,56 @@ describe('the partial-finalize tick delivers the scorecard on a disconnect', () 
     expect(seen).toContain(SESSION_B);
   });
 
+  it('REPAIR A: a WORKER-CRASH residue (expired/grace_timeout, transitioned=false) is enqueued for scoring', async () => {
+    // 0071's reclaim already drove the crashed session terminal
+    // (expired/grace_timeout) and finalized its MP3, but never enqueued scoring.
+    // 0072 now ALSO selects that residue and returns it with transitioned=false
+    // and disconnect_reason='worker_crash'; the tick must still enqueue its
+    // scorecard — otherwise a crashed call gets an MP3 and no scorecard.
+    const enqueues: EnqueueCall[] = [];
+    const stores = makeStores({
+      onFinalize: () => ({
+        status: 'ok',
+        // The RPC transitions nothing on this pass (the session was already
+        // terminal), so finalized=0 — but the session is still RETURNED.
+        finalized: 0,
+        sessions: [
+          partialSession({
+            transitioned: false,
+            disconnectReason: 'worker_crash',
+            recordingPresent: true, // MP3 already finalized by reclaim.
+          }),
+        ],
+      }),
+    });
+    const runtime = buildRuntime({ stores, queue: makeQueue(enqueues) });
+    runtime.scheduler.start();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await drainMicrotasks(() => enqueues.length > 0);
+
+    expect(enqueues).toHaveLength(1);
+    expect(enqueues[0].name).toBe('phone.assessment');
+    expect((enqueues[0].payload as { partial: boolean }).partial).toBe(true);
+    expect((enqueues[0].payload as { disconnect_reason: string }).disconnect_reason).toBe('worker_crash');
+    expect(enqueues[0].options?.dedupKey).toBe(phoneAssessmentDedupKey(SESSION_A));
+  });
+
+  it('REPAIR A: a session that already carries an assessment is NOT re-selected, so nothing is enqueued', async () => {
+    // The RPC self-terminates on the `not exists (phone assessment)` guard: once
+    // the scorecard has landed the session is never returned again. The tick can
+    // only enqueue what the RPC returns, so an empty selection enqueues nothing.
+    const enqueues: EnqueueCall[] = [];
+    const stores = makeStores({
+      onFinalize: () => ({ status: 'ok', finalized: 0, sessions: [] }),
+    });
+    const runtime = buildRuntime({ stores, queue: makeQueue(enqueues) });
+    runtime.scheduler.start();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await drainMicrotasks(() => false, 50);
+
+    expect(enqueues).toHaveLength(0);
+  });
+
   it('re-running does not double-enqueue: every enqueue carries the same dedup key', async () => {
     // The loop is idempotent per session — the queue dedup key deduplicates.
     // Two passes over the same still-selected session both enqueue under the
@@ -343,14 +393,54 @@ describe('the partial-finalize tick delivers the scorecard on a disconnect', () 
   });
 });
 
+/**
+ * A Supabase-client double that records every `apply_phone_event` rpc call and
+ * answers `from(...).select(...).eq(...).maybeSingle()` for the two lookups the
+ * partial completion path performs: the attempt's engagement id and whether a
+ * phone assessment row exists. `engagementId`/`assessmentExists` are configurable
+ * per test; `rpcResult` lets a test force a not-applied status.
+ */
+function makeAssessmentClient(opts: {
+  engagementId?: string | null;
+  assessmentExists?: boolean;
+  rpcResult?: { data: unknown; error: unknown };
+}): { client: unknown; rpcCalls: Array<Record<string, unknown>> } {
+  const rpcCalls: Array<Record<string, unknown>> = [];
+  const client = {
+    async rpc(_name: string, args: Record<string, unknown>) {
+      rpcCalls.push(args);
+      return opts.rpcResult ?? { data: { status: 'applied' }, error: null };
+    },
+    from(table: string) {
+      const builder = {
+        select() { return builder; },
+        eq() { return builder; },
+        async maybeSingle() {
+          if (table === 'phone_call_attempts') {
+            return opts.engagementId === undefined
+              ? { data: null, error: null }
+              : { data: { engagement_id: opts.engagementId }, error: null };
+          }
+          if (table === 'assessments') {
+            return { data: opts.assessmentExists ? { id: 'a1' } : null, error: null };
+          }
+          return { data: null, error: null };
+        },
+      };
+      return builder;
+    },
+  };
+  return { client, rpcCalls };
+}
+
+const ENGAGEMENT_A = 'cccccccc-cccc-4ccc-cccc-cccccccccccc';
+
 describe('the scorer plumbing forwards the partial fields', () => {
   it('a partial job scores with partial:true + coverage + disconnect_reason', async () => {
     const seen: Array<{ sessionId: string; options: unknown }> = [];
-    const client = {
-      async rpc() { return { data: { status: 'applied' }, error: null }; },
-    } as never;
+    const { client } = makeAssessmentClient({ engagementId: ENGAGEMENT_A });
     const handler = createPhoneAssessmentHandler({
-      client,
+      client: client as never,
       score: async (sessionId, options) => { seen.push({ sessionId, options }); },
     });
     await handler({
@@ -377,11 +467,9 @@ describe('the scorer plumbing forwards the partial fields', () => {
 
   it('a clean-hangup job (no partial fields) scores as a COMPLETE screening', async () => {
     const seen: Array<{ options: unknown }> = [];
-    const client = {
-      async rpc() { return { data: { status: 'applied' }, error: null }; },
-    } as never;
+    const { client } = makeAssessmentClient({});
     const handler = createPhoneAssessmentHandler({
-      client,
+      client: client as never,
       score: async (_sessionId, options) => { seen.push({ options }); },
     });
     await handler({
@@ -396,5 +484,104 @@ describe('the scorer plumbing forwards the partial fields', () => {
       total: null,
       disconnectReason: undefined,
     });
+  });
+
+  it('REPAIR B: the PARTIAL completion posts the STRANDED shape (attempt_id null)', async () => {
+    // The engagement after a hangup/crash is reconnecting/scheduled, never
+    // in_call. An attempt-scoped post matches no branch there; the stranded post
+    // (p_attempt_id null, p_engagement_id resolved) is the one that completes it.
+    const { client, rpcCalls } = makeAssessmentClient({ engagementId: ENGAGEMENT_A });
+    const handler = createPhoneAssessmentHandler({
+      client: client as never,
+      score: async () => {},
+    });
+    await handler({
+      payload: {
+        session_id: SESSION_A,
+        attempt_id: ATTEMPT_A,
+        partial: true,
+        covered: 2,
+        total: 3,
+        disconnect_reason: 'worker_crash',
+      },
+    } as never);
+
+    expect(rpcCalls).toHaveLength(1);
+    expect(rpcCalls[0].p_event_type).toBe('assessment.completed');
+    // The load-bearing assertion: the partial path posts NO attempt id and
+    // names the engagement — the stranded shape.
+    expect(rpcCalls[0].p_attempt_id).toBeNull();
+    expect(rpcCalls[0].p_engagement_id).toBe(ENGAGEMENT_A);
+  });
+
+  it('REPAIR B: the CLEAN completion still posts the ATTEMPT shape (unchanged)', async () => {
+    // The clean path (engagement still in_call) must keep posting attempt-scoped
+    // so 0067's in_call completion branch ends the attempt in the same edge.
+    const { client, rpcCalls } = makeAssessmentClient({});
+    const handler = createPhoneAssessmentHandler({
+      client: client as never,
+      score: async () => {},
+    });
+    await handler({
+      payload: { session_id: SESSION_A, attempt_id: ATTEMPT_A },
+    } as never);
+
+    expect(rpcCalls).toHaveLength(1);
+    expect(rpcCalls[0].p_attempt_id).toBe(ATTEMPT_A);
+    expect(rpcCalls[0].p_engagement_id).toBeNull();
+  });
+
+  it('REPAIR B: a not-applied completion does NOT throw when the scorecard already landed', async () => {
+    // The scorecard is written before the completion posts. If the completion
+    // cannot apply (e.g. a redelivery raced the engagement past the stranded
+    // states) but a phone assessment row exists, the job must SUCCEED — DLQ'ing a
+    // job whose scorecard already landed is the failure this repair removes.
+    const { client } = makeAssessmentClient({
+      engagementId: ENGAGEMENT_A,
+      assessmentExists: true,
+      rpcResult: { data: { status: 'unexpected_event' }, error: null },
+    });
+    const handler = createPhoneAssessmentHandler({
+      client: client as never,
+      score: async () => {},
+    });
+    await expect(
+      handler({
+        payload: {
+          session_id: SESSION_A,
+          attempt_id: ATTEMPT_A,
+          partial: true,
+          covered: 2,
+          total: 3,
+          disconnect_reason: 'worker_crash',
+        },
+      } as never),
+    ).resolves.toBeUndefined();
+  });
+
+  it('REPAIR B: a not-applied completion STILL throws when nothing was scored', async () => {
+    // The safety valve: a not-applied status with NO assessment row is a genuine
+    // anomaly, so the job must still throw and let the bounded retry recover.
+    const { client } = makeAssessmentClient({
+      engagementId: ENGAGEMENT_A,
+      assessmentExists: false,
+      rpcResult: { data: { status: 'unexpected_event' }, error: null },
+    });
+    const handler = createPhoneAssessmentHandler({
+      client: client as never,
+      score: async () => {},
+    });
+    await expect(
+      handler({
+        payload: {
+          session_id: SESSION_A,
+          attempt_id: ATTEMPT_A,
+          partial: true,
+          covered: 2,
+          total: 3,
+          disconnect_reason: 'worker_crash',
+        },
+      } as never),
+    ).rejects.toThrow('phone_assessment_completion_not_applied');
   });
 });

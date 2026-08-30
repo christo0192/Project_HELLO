@@ -17,6 +17,15 @@
 --   * the returned coverage (covered=cursor, total=plan question_count)
 --     and disconnect_reason ('candidate_hangup') are correct.
 --
+-- It ALSO seeds a CRASH session — the residue 0071's reclaim leaves: the
+-- attempt is `abandoned` (reclaim nulls its outcome_class) 600s ago and
+-- the SESSION was already driven to `expired`/`grace_timeout` (its MP3
+-- finalized by reclaim, its scoring never enqueued). The assert proves
+-- 0072 ALSO selects this residue, RETURNS it with transitioned=false and
+-- disconnect_reason='worker_crash' WITHOUT attempting the illegal
+-- `expired -> completed` re-transition, and that once an assessment row
+-- exists it is not re-selected (idempotency / no re-score).
+--
 -- Run (standalone; not yet wired into scripts/supabase-test.sh):
 --   psql -v ON_ERROR_STOP=1 -f phone_partial_finalize_setup.sql
 --   psql -v ON_ERROR_STOP=1 -f phone_partial_finalize_assert.sql
@@ -68,10 +77,15 @@ begin
 
   -- ── Build one engagement's chain, returning the ids we bind below. ──
   -- STRANDED (slug 'stranded'): attempt ended (outcome disconnected)
-  -- 600s ago — older than the 180s grace, so it MUST be selected.
+  -- 600s ago — older than the 180s grace, so it MUST be selected. Session
+  -- stays `in_progress` (the hangup path) → driven to completed.
   -- CONTROL  (slug 'control'):  attempt ended 10s ago — inside the grace,
   -- so it MUST NOT be selected.
-  for v_s in select unnest(array['stranded','control']) loop
+  -- CRASH    (slug 'crash'):    attempt `abandoned` (outcome NULL) 600s ago
+  -- and the SESSION already `expired`/`grace_timeout` — the residue 0071's
+  -- reclaim leaves. MUST be selected, returned with transitioned=false and
+  -- disconnect_reason='worker_crash', and NOT re-transitioned.
+  for v_s in select unnest(array['stranded','control','crash']) loop
     insert into screening_v2.candidates (role_id, name, email, phone_e164, phone_valid)
     values (v_role, 'pf72 ' || v_s, 'pf72-' || v_s || '@example.test',
             '+9199988' || lpad((abs(hashtext(v_s)) % 100000)::text, 5, '0'), true)
@@ -122,6 +136,19 @@ begin
            updated_at              = v_now - interval '900 seconds'
      where id = v_sess;
 
+    -- CRASH residue: 0071's reclaim already drove this session terminal to
+    -- `expired`/`grace_timeout` (a valid in_progress -> expired edge), keeping
+    -- the stuck-recording egress shape (egress id set, object key null, status
+    -- 'active') that finalized the MP3. 0072 must select it terminal.
+    if v_s = 'crash' then
+      update screening_v2.call_sessions
+         set status          = 'expired',
+             terminal_reason = 'grace_timeout',
+             ended_at        = v_now - interval '600 seconds',
+             updated_at      = v_now - interval '600 seconds'
+       where id = v_sess;
+    end if;
+
     update screening_v2.phone_engagements set session_id = v_sess where id = v_eng;
 
     -- The immutable plan: the deterministic default plan (its questions are
@@ -133,20 +160,25 @@ begin
            jsonb_array_length(q)
       from (select screening_v2.phone_default_question_plan() as q) s;
 
-    -- The attempt: terminal `ended` with outcome `disconnected` (candidate
-    -- hangup). The stranded one ended 600s ago; the control one 10s ago.
+    -- The attempt:
+    --   * stranded/control: terminal `ended` with outcome `disconnected`
+    --     (candidate hangup). Stranded ended 600s ago; control 10s ago.
+    --   * crash: `abandoned` with outcome NULL (reclaim's crash terminal),
+    --     ended 600s ago — the residue 0072's abandoned-branch must select.
     insert into screening_v2.phone_call_attempts
       (engagement_id, attempt_seq, epoch, kind, state, outcome_class,
        ist_date, prior_engagement_state, session_id, admitted_at, answered_at, ended_at)
-    values (v_eng, 1, 0, 'initial', 'ended', 'disconnected',
+    values (v_eng, 1, 0, 'initial',
+            case when v_s = 'crash' then 'abandoned' else 'ended' end,
+            case when v_s = 'crash' then null else 'disconnected' end,
             '2026-08-24', 'eligible', v_sess,
             v_now - interval '1200 seconds', v_now - interval '1100 seconds',
-            case when v_s = 'stranded'
-                 then v_now - interval '600 seconds'
-                 else v_now - interval '10 seconds' end)
+            case when v_s = 'control'
+                 then v_now - interval '10 seconds'
+                 else v_now - interval '600 seconds' end)
     returning id into v_att;
   end loop;
 
-  raise notice 'pf72: stranded + control engagements ready at %', v_now;
+  raise notice 'pf72: stranded + control + crash engagements ready at %', v_now;
 end;
 $$;
