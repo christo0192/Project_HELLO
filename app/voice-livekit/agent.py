@@ -1235,6 +1235,7 @@ async def _run_native_phone_screening(
     agent_activity_changed: asyncio.Event,
     close_event: asyncio.Event,
     turn_mode: str = phone.PHONE_TURN_MODE_TOOLFIRST,
+    coverage_judge_enabled: bool = False,
 ) -> phone.PhoneGateResult:
     """Run post-consent screening through LiveKit's native turn lifecycle.
 
@@ -1282,6 +1283,13 @@ async def _run_native_phone_screening(
     # the terminal teardown can cancel any still in flight; a small, bounded set
     # (one per candidate turn) that lives only for the leg.
     commit_tasks: set[asyncio.Task] = set()
+    commit_lock = asyncio.Lock()
+    # PR-9 state is in-memory and session-bounded. Evidence text is never logged
+    # or persisted here; only the existing transcript path stores candidate
+    # words. A hash prevents the same discrepancy being asked twice.
+    coverage_reanchor: dict[str, str | None] = {"question_key": None}
+    pending_conflict: dict[str, Any] = {"value": None}
+    asked_conflicts: set[str] = set()
 
     async def wait_for_activity(timeout: float) -> str:
         """Wait on LiveKit activity or close without creating a turn queue."""
@@ -1596,7 +1604,11 @@ async def _run_native_phone_screening(
         # empty read at this same cursor gets its own recovery attempt rather than
         # inheriting a stale "already recovered here" mark.
         malformed_guard["recovered_cursor"] = None
-        if turn_mode == phone.PHONE_TURN_MODE_TOOLLESS and commit_tasks:
+        if (
+            turn_mode == phone.PHONE_TURN_MODE_TOOLLESS
+            and not coverage_judge_enabled
+            and commit_tasks
+        ):
             # TOOLLESS ORDERING GUARD. The background commit reads shared `pending`
             # via `on_advance`. Turn-taking normally means the previous turn's
             # commit has already run by the time the next answer arrives, but the
@@ -1617,6 +1629,27 @@ async def _run_native_phone_screening(
                         "unknown_event", error_type="phone_toolless_commit",
                         error_category="prior_commit_drain_timeout",
                     )
+
+        judge_instruction: str | None = None
+        if turn_mode == phone.PHONE_TURN_MODE_TOOLLESS and coverage_judge_enabled:
+            conflict = pending_conflict.get("value")
+            if isinstance(conflict, dict):
+                conflict_key = phone.phone_conflict_key(conflict)
+                if conflict_key not in asked_conflicts:
+                    judge_instruction = phone.phone_judge_turn_instruction(
+                        question.text, conflict=conflict,
+                    )
+                    if judge_instruction is not None:
+                        # Mark asked when the instruction enters this turn's
+                        # model context, not when the judge merely proposes it.
+                        asked_conflicts.add(conflict_key)
+                pending_conflict["value"] = None
+            elif coverage_reanchor.get("question_key") == question.key:
+                judge_instruction = phone.phone_judge_turn_instruction(
+                    question.text, reanchor=True,
+                )
+                coverage_reanchor["question_key"] = None
+
         pending.update({
             "question": question,
             "prompt": prompt,
@@ -1625,6 +1658,7 @@ async def _run_native_phone_screening(
             "turn_ctx": turn_ctx,
             "probe_used": False,
             "source_event_id": phone.plan_source_event_id(question.key),
+            "expected_index": cursor,
         })
         last_advance["text"] = None
         latest_candidate_anchor[0] = None
@@ -1636,15 +1670,19 @@ async def _run_native_phone_screening(
             # current-question context, minus the "call exactly ONE coordinator
             # tool" requirement). The durable boundary is committed in the
             # BACKGROUND after the reply is delivered — see `commit_after_reply`.
-            add_turn_instruction(
-                turn_ctx,
+            turn_instruction = judge_instruction or (
                 phone_question_instructions(question, state.role_title)
                 + "\n\nBriefly acknowledge one specific detail from the candidate's "
                 "answer, then ask the next planned topic — or, if their answer was "
                 "thin, one natural same-topic follow-up (your judgment) — as ONE "
-                "question in your own words.",
+                "question in your own words."
             )
-            task = asyncio.create_task(commit_after_reply())
+            add_turn_instruction(turn_ctx, turn_instruction)
+            # The judge/commit task is CREATED and returned to the event loop;
+            # it is never awaited on this candidate→reply speech path.
+            task = asyncio.create_task(
+                commit_after_reply(dict(pending) if coverage_judge_enabled else None)
+            )
             commit_tasks.add(task)
             task.add_done_callback(commit_tasks.discard)
             return
@@ -1685,12 +1723,16 @@ async def _run_native_phone_screening(
             "in your own natural words on this same topic: " + question.text + hint
         )
 
-    async def on_advance() -> str:
+    async def on_advance(exchange: dict[str, Any] | None = None) -> str:
         nonlocal cursor
-        question = pending.get("question")
-        prompt = pending.get("prompt")
-        candidate = pending.get("candidate")
-        message = pending.get("message")
+        boundary = exchange if isinstance(exchange, dict) else pending
+        question = boundary.get("question")
+        prompt = boundary.get("prompt")
+        candidate = boundary.get("candidate")
+        message = boundary.get("message")
+        expected_index = boundary.get("expected_index")
+        if not isinstance(expected_index, int):
+            expected_index = cursor
         if question is None or not prompt or not isinstance(candidate, str):
             # A duplicate advance in the SAME reply (the first one cleared
             # `pending`) is answered idempotently, never by ending the call.
@@ -1704,34 +1746,44 @@ async def _run_native_phone_screening(
             {"speaker": "bot", "text": prompt, "turn_started_at_ms": latest_assistant_anchor[0]},
             {"speaker": "candidate", "text": candidate, "turn_started_at_ms": _turn_anchor_ms(message) if message is not None else None},
         ]
-        outcome = await events.commit_boundary(session_id, question.key, cursor, pending["source_event_id"], turns)
-        if outcome.ok and outcome.cursor == cursor and last_advance["text"] is not None:
-            # A concurrent duplicate of an advance that already applied: the
-            # commit is idempotent on `source_event_id` and the local cursor
-            # has already moved. Repeat the authorization; do not halt.
-            return last_advance["text"]
-        if not outcome.ok or outcome.cursor != cursor + 1:
+        outcome = await events.commit_boundary(
+            session_id, question.key, expected_index,
+            boundary["source_event_id"], turns,
+        )
+        if outcome.ok and outcome.cursor == cursor and expected_index < cursor:
+            # A later snapshot of the same keyed boundary finished after the
+            # first one. The server idempotently returned the already-applied
+            # cursor; never turn harmless async reordering into a call halt.
+            return last_advance["text"] or "Advance already applied."
+        if (
+            not outcome.ok
+            or outcome.cursor != expected_index + 1
+            or cursor != expected_index
+        ):
             terminal_reason["reason"] = phone.HALT_PERSISTENCE
             finished.set()
             return "The screening cannot safely continue. Do not ask another question."
         if question.key not in completed:
             completed.append(question.key)
         cursor = outcome.cursor
-        pending["question"] = None
+        if coverage_reanchor.get("question_key") == question.key:
+            coverage_reanchor["question_key"] = None
+        if boundary is pending:
+            pending["question"] = None
         next_question = state.question_at(cursor)
         if next_question is None:
             if callable(getattr(events, "record_probe", None)):
                 closing.plan_completed()
                 closing.wind_down_delivered()
-                if pending.get("turn_ctx") is not None:
-                    add_turn_instruction(pending["turn_ctx"], "The screening is complete. Ask the candidate whether they have any questions about the role, team, company, or process. Do not say goodbye yet.")
+                if boundary.get("turn_ctx") is not None:
+                    add_turn_instruction(boundary["turn_ctx"], "The screening is complete. Ask the candidate whether they have any questions about the role, team, company, or process. Do not say goodbye yet.")
                 last_advance["text"] = "Advance authorized. Ask whether the candidate has any questions. Do not close the call yet."
                 return last_advance["text"]
             terminal_reply_required["value"] = True
             terminal_reason["reason"] = "completed"
             finished.set()
-            if pending.get("turn_ctx") is not None:
-                add_turn_instruction(pending["turn_ctx"], "Thank the candidate briefly, say goodbye, and complete the final closing. Do not ask another question.")
+            if boundary.get("turn_ctx") is not None:
+                add_turn_instruction(boundary["turn_ctx"], "Thank the candidate briefly, say goodbye, and complete the final closing. Do not ask another question.")
             last_advance["text"] = "Advance authorized. Thank the candidate briefly, say goodbye, and complete the final closing."
             return last_advance["text"]
         pending["probe_used"] = False
@@ -1743,8 +1795,28 @@ async def _run_native_phone_screening(
         )
         return last_advance["text"]
 
-    async def commit_after_reply() -> None:
-        """TOOLLESS: commit the boundary in the background after the reply.
+    async def apply_background_advance(
+        exchange: dict[str, Any] | None = None,
+    ) -> None:
+        """Apply/log one off-path boundary without raising into a bare task."""
+        try:
+            await on_advance(exchange)
+        except Exception:  # noqa: BLE001
+            _log.warn(
+                "unknown_event", error_type="phone_toolless_commit",
+                error_category="background_commit_failed",
+            )
+            return
+        if terminal_reason.get("reason") == phone.HALT_PERSISTENCE:
+            _log.warn(
+                "unknown_event", error_type="phone_toolless_commit",
+                error_category="commit_halted_persistence",
+            )
+
+    async def commit_after_reply(
+        exchange: dict[str, Any] | None = None,
+    ) -> None:
+        """TOOLLESS: verify and commit a boundary in the background.
 
         The tool-first lane commits INSIDE a muzzled `advance_screening` leg
         before the speech leg runs — two sequential Gemini calls per turn. In
@@ -1763,9 +1835,10 @@ async def _run_native_phone_screening(
         ALREADY-CAPTURED answer, the model's reply does not depend on the commit
         (toolless strips the coordinator tools and the per-turn instruction is
         already injected), and the commit is idempotent on `source_event_id`. The
-        only effect of an early commit is the cursor advancing a moment sooner —
-        and the next candidate turn is serialized behind this task by the toolless
-        ordering guard in `on_native_turn`, so `pending` cannot be corrupted.
+        only effect of an early commit is the cursor advancing a moment sooner.
+        With the judge enabled each task owns an immutable exchange snapshot and
+        background tasks serialize on `commit_lock`, so the next speech hook
+        never waits for judge latency and cannot overwrite another turn's data.
 
         `on_advance` is idempotent and self-guarding: a duplicate or stale commit
         is answered without ending the call, and a genuine persistence failure
@@ -1782,12 +1855,13 @@ async def _run_native_phone_screening(
         task is only ever scheduled for a substantive turn — but as
         defense-in-depth (and to honour the never-advance-without-substance
         contract even if a fragment slips past the gate), re-classify the exact
-        `pending['candidate']` text here and SKIP the commit when it is not
+        snapshot candidate text here and SKIP the commit when it is not
         substantive. Skipping leaves the cursor where it is, so the next answer
         commits under the same still-owed key; the server-owned resume is
         untouched. Bypassed when the gate is off, restoring the pre-X10 path.
         """
-        candidate_text = pending.get("candidate")
+        boundary = exchange if isinstance(exchange, dict) else pending
+        candidate_text = boundary.get("candidate")
         if (
             phone.phone_patience_gate_enabled()
             and phone.phone_turn_substance(candidate_text)
@@ -1804,34 +1878,104 @@ async def _run_native_phone_screening(
                 timeout=PHONE_TERMINAL_REPLY_TIMEOUT_SEC,
             )
         except asyncio.TimeoutError:
-            # The reply never signalled delivery. Commit anyway: the boundary is
-            # about the candidate's answer, not the bot's playout, and the
-            # server-keyed idempotency makes an early commit safe. Do not drop
-            # the call on a missing delivery signal.
+            # The reply never signalled delivery. The boundary is about the
+            # already-captured ask/answer; the judge still runs fail-closed.
             _log.info(
                 "unknown_event", error_type="phone_toolless_commit",
                 error_category="delivery_timeout_commit_anyway",
             )
-        try:
-            outcome = await on_advance()
-        except Exception:  # noqa: BLE001
-            # A background commit must never take the call down by raising into
-            # a bare task. Log loudly; the server remains the durable authority
-            # and resume re-asks the topic. `finished` is untouched here.
-            _log.warn(
-                "unknown_event", error_type="phone_toolless_commit",
-                error_category="background_commit_failed",
-            )
+
+        if not coverage_judge_enabled:
+            await apply_background_advance()
             return
-        # `on_advance` returns an instruction string on success and on its
-        # idempotent duplicate/stale paths; it sets HALT_PERSISTENCE + finished
-        # itself on a genuine failure. Surface a loud line either way so a lost
-        # commit (resume will re-ask that topic) is observable in the logs.
-        if terminal_reason.get("reason") == phone.HALT_PERSISTENCE:
-            _log.warn(
-                "unknown_event", error_type="phone_toolless_commit",
-                error_category="commit_halted_persistence",
+
+        # Multiple short answers can arrive before an earlier judge settles.
+        # Snapshot inputs above keep candidate text isolated; this lock orders
+        # only the BACKGROUND judge/commit tasks. No speech hook waits on it.
+        async with commit_lock:
+            # A very short candidate turn can arrive before the previous judge
+            # settles. Rebase that immutable exchange onto the CURRENT earliest
+            # owed topic, then let the same coverage verdict decide it. If the
+            # assistant really asked that next topic, it commits in order; if it
+            # did not, fail-to-reask keeps the cursor there. Nothing is skipped.
+            expected_index = boundary.get("expected_index")
+            if isinstance(expected_index, int) and expected_index < cursor:
+                current_question = state.question_at(cursor)
+                if current_question is None:
+                    return
+                boundary = dict(boundary)
+                boundary.update({
+                    "question": current_question,
+                    "expected_index": cursor,
+                    "source_event_id": phone.plan_source_event_id(
+                        current_question.key,
+                    ),
+                })
+
+            question = boundary.get("question")
+            prompt = boundary.get("prompt")
+            candidate = boundary.get("candidate")
+            if (
+                not isinstance(question, phone.PhonePlanQuestion)
+                or not isinstance(prompt, str)
+                or not isinstance(candidate, str)
+            ):
+                verdict = phone.PhoneCoverageVerdict(
+                    False, None, "judge_error",
+                )
+            else:
+                verdict = await phone.judge_phone_coverage(
+                    question_text=question.text,
+                    assistant_reply=prompt,
+                    candidate_answer=candidate,
+                    resume_facts=_compact_phone_resume_evidence(state.resume_facts),
+                )
+
+            source_category = verdict.category if verdict.category in {
+                "deterministic_covered", "deterministic_not_covered",
+                "model", "judge_error",
+            } else "judge_error"
+            if source_category == "judge_error":
+                log_category = "judge_error"
+            elif source_category.startswith("deterministic_"):
+                log_category = (
+                    "covered_deterministic" if verdict.covered
+                    else "not_covered_deterministic"
+                )
+            else:
+                log_category = (
+                    "covered_model" if verdict.covered
+                    else "not_covered_model"
+                )
+            log = _log.warn if log_category == "judge_error" else _log.info
+            log(
+                "unknown_event", error_type="phone_coverage_judge",
+                error_category=log_category,
             )
+
+            conflict = verdict.conflict
+            if isinstance(conflict, dict):
+                key = phone.phone_conflict_key(conflict)
+                queued = pending_conflict.get("value")
+                queued_key = (
+                    phone.phone_conflict_key(queued)
+                    if isinstance(queued, dict) else None
+                )
+                if key not in asked_conflicts and key != queued_key:
+                    pending_conflict["value"] = dict(conflict)
+                    _log.info(
+                        "unknown_event", error_type="phone_coverage_conflict",
+                        error_category="probe_queued",
+                    )
+
+            if not verdict.covered:
+                if isinstance(question, phone.PhonePlanQuestion):
+                    coverage_reanchor["question_key"] = question.key
+                # Fail toward re-asking. No cursor write, and no terminal halt:
+                # the next turn receives the explicit owed-topic repair.
+                return
+
+            await apply_background_advance(boundary)
 
     async def native_say(text: str) -> None:
         speech = session.say(text, allow_interruptions=True)
@@ -1860,6 +2004,9 @@ async def _run_native_phone_screening(
     # first. Not read on any production path.
     setattr(agent, "_commit_after_reply", commit_after_reply)
     setattr(agent, "_pending", pending)
+    setattr(agent, "_coverage_reanchor", coverage_reanchor)
+    setattr(agent, "_pending_conflict", pending_conflict)
+    setattr(agent, "_asked_conflicts", asked_conflicts)
     setattr(agent, "_native_turns", True)
     authorize = getattr(agent, "authorize_screening", None)
     if not callable(authorize):
@@ -2246,6 +2393,11 @@ async def _run_phone_session(
     _log.info(
         "unknown_event", error_type="phone_turn_mode",
         error_category=turn_mode,
+    )
+    coverage_judge_enabled = phone.phone_coverage_judge_enabled()
+    _log.info(
+        "unknown_event", error_type="phone_coverage_judge_mode",
+        error_category="on" if coverage_judge_enabled else "off",
     )
     session = _build_phone_provider_session(turn_mode)
     reply_started = asyncio.Event()
@@ -2751,6 +2903,7 @@ async def _run_phone_session(
             agent_activity_changed=agent_activity_changed,
             close_event=close_event,
             turn_mode=turn_mode,
+            coverage_judge_enabled=coverage_judge_enabled,
         )
 
     heartbeat_task = asyncio.create_task(
