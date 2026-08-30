@@ -447,6 +447,10 @@ describe('errors and malformed answers', () => {
       // PostgREST error still quotes the failing statement.
       ['phone_sweep_stranded_recordings_error', () => stores.sweepStrandedRecordings!({
         now: NOW })],
+      // 0072. The partial-finalize sweep returns session ids in its `sessions`
+      // array, so a leaked PostgREST error must not escape either.
+      ['phone_finalize_partial_sessions_error', () => stores.finalizePartialSessions!({
+        now: NOW })],
     ];
     expect(attempts).toHaveLength(PHONE_RPC_NAMES.length);
     for (const [code, run] of attempts) {

@@ -138,6 +138,12 @@ export const MIGRATION_0071_PATH = fileURLToPath(
 
 export const MIGRATION_0071 = readFileSync(MIGRATION_0071_PATH, 'utf8');
 
+export const MIGRATION_0072_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0072_phone_partial_assessment.sql', import.meta.url),
+);
+
+export const MIGRATION_0072 = readFileSync(MIGRATION_0072_PATH, 'utf8');
+
 /**
  * Every phone migration, NEWEST FIRST. Extraction walks this in order and the
  * first file that declares a thing wins, which is what "the latest declaration
@@ -145,6 +151,9 @@ export const MIGRATION_0071 = readFileSync(MIGRATION_0071_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    // 0072 adds finalize_phone_partial_sessions (server-side partial-finalize)
+    // and the assessments.partial column. Newest-first so its declaration wins.
+    { name: '0072', sql: MIGRATION_0072 },
     // 0071 re-declares commit_phone_question_boundary (authorship-guarded turn
     // insert) and reclaim_phone_attempt_leases (crashed-session terminalize) in
     // full, and adds commit_phone_item_turn + sweep_phone_stranded_recordings,
@@ -289,6 +298,8 @@ export const RPC_NAMES = [
   // recording-finalization backstop sweep (X5).
   'commit_phone_item_turn',
   'sweep_phone_stranded_recordings',
+  // 0072 — server-side partial-finalize on a non-terminal-ending call.
+  'finalize_phone_partial_sessions',
 ] as const;
 
 /**

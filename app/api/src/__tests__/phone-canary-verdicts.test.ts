@@ -187,6 +187,7 @@ function fakeRuntime(over: {
       lastRolled: null,
       lastStranded: null,
       lastRecStranded: null,
+      lastPartialFinalized: null,
       sweepNotOk: {},
       ...over.snapshot,
     }),

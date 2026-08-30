@@ -72,6 +72,8 @@ export const PHONE_RPC_NAMES = [
   // recording-finalization backstop sweep (X5b).
   'commit_phone_item_turn',
   'sweep_phone_stranded_recordings',
+  // 0072 — server-side partial-finalize on a non-terminal-ending call.
+  'finalize_phone_partial_sessions',
 ] as const;
 
 export type PhoneRpcName = (typeof PHONE_RPC_NAMES)[number];
@@ -204,6 +206,10 @@ export const PHONE_RPC_PARAMETERS: Readonly<Record<PhoneRpcName, readonly string
       'p_turn_started_at_ms', 'p_now',
     ],
     sweep_phone_stranded_recordings: [
+      'p_limit', 'p_grace_seconds', 'p_now',
+    ],
+    // 0072.
+    finalize_phone_partial_sessions: [
       'p_limit', 'p_grace_seconds', 'p_now',
     ],
   });
@@ -591,6 +597,11 @@ export const SWEEP_PHONE_STRANDED_RECORDINGS_STATUSES = ['ok'] as const;
 export type SweepPhoneStrandedRecordingsStatus =
   (typeof SWEEP_PHONE_STRANDED_RECORDINGS_STATUSES)[number];
 
+/** `finalize_phone_partial_sessions` (0072) — a bounded sweep answers `ok`. */
+export const FINALIZE_PHONE_PARTIAL_SESSIONS_STATUSES = ['ok'] as const;
+export type FinalizePhonePartialSessionsStatus =
+  (typeof FINALIZE_PHONE_PARTIAL_SESSIONS_STATUSES)[number];
+
 /** The per-RPC vocabularies, keyed by RPC name. */
 export const PHONE_RPC_STATUSES: Readonly<Record<PhoneRpcName, readonly string[]>> =
   Object.freeze({
@@ -624,6 +635,7 @@ export const PHONE_RPC_STATUSES: Readonly<Record<PhoneRpcName, readonly string[]
     admit_phone_test_attempt: ADMIT_PHONE_TEST_ATTEMPT_STATUSES,
     commit_phone_item_turn: COMMIT_PHONE_ITEM_TURN_STATUSES,
     sweep_phone_stranded_recordings: SWEEP_PHONE_STRANDED_RECORDINGS_STATUSES,
+    finalize_phone_partial_sessions: FINALIZE_PHONE_PARTIAL_SESSIONS_STATUSES,
   });
 
 /**

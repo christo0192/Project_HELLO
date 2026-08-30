@@ -145,6 +145,10 @@ const KNOB_ENV: Readonly<Record<keyof PhoneRuntimeConfig, string>> = {
   dueLimit: 'PHONE_RUNTIME_DUE_LIMIT',
   reclaimLimit: 'PHONE_RUNTIME_RECLAIM_LIMIT',
   jobLeaseSeconds: 'PHONE_RUNTIME_JOB_LEASE_SECONDS',
+  // 0072. Note the env name is NOT `PHONE_RUNTIME_`-prefixed: the grace is a
+  // property of the partial-finalize behaviour, registered in the env contract
+  // as `PHONE_PARTIAL_FINALIZE_GRACE_SEC`.
+  partialFinalizeGraceSec: 'PHONE_PARTIAL_FINALIZE_GRACE_SEC',
 };
 
 const KNOBS = Object.keys(KNOB_ENV) as (keyof PhoneRuntimeConfig)[];
@@ -220,7 +224,7 @@ describe('phone runtime config: every knob clamps at BOTH ends', () => {
     // silently untested; a case left behind after a knob is removed would
     // silently test nothing.
     expect(new Set(KNOBS)).toEqual(new Set(Object.keys(PHONE_RUNTIME_BOUNDS)));
-    expect(KNOBS.length).toBe(7);
+    expect(KNOBS.length).toBe(8);
   });
 
   for (const knob of KNOBS) {
@@ -283,7 +287,7 @@ describe('phone runtime config: the published shape is integers and nothing else
     );
     const entries = Object.entries(described as Record<string, unknown>);
     // Fail closed: an empty projection would make the loop below vacuous.
-    expect(entries).toHaveLength(7);
+    expect(entries).toHaveLength(8);
     for (const [key, value] of entries) {
       expect(typeof value, key).toBe('number');
       expect(Number.isInteger(value as number), key).toBe(true);
@@ -313,6 +317,7 @@ describe('phone runtime config: the published shape is integers and nothing else
       due_limit: 3,
       reclaim_limit: 25,
       job_lease_seconds: 60,
+      partial_finalize_grace_sec: 180,
     });
   });
 });

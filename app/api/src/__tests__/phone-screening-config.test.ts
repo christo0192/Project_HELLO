@@ -356,6 +356,9 @@ describe('the env contract holds in BOTH directions', () => {
     'PHONE_RUNTIME_DUE_LIMIT',
     'PHONE_RUNTIME_RECLAIM_LIMIT',
     'PHONE_RUNTIME_JOB_LEASE_SECONDS',
+    // D1 partial-finalize grace (reconnect window before a disconnected
+    // session is scored + finalized), read in `lib/phone-runtime/config.ts`.
+    'PHONE_PARTIAL_FINALIZE_GRACE_SEC',
   ];
 
   it('every variable is declared, exampled, and read', () => {

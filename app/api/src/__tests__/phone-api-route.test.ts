@@ -1160,6 +1160,7 @@ function fakeRuntime(over: {
       lastRolled: null,
       lastStranded: null,
       lastRecStranded: null,
+      lastPartialFinalized: null,
       // No sweep has answered non-`ok`. Empty rather than absent: the view
       // reads this map, and a fake that omitted it would be a fake the real
       // runtime can never produce.

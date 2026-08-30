@@ -3103,7 +3103,39 @@ _COVERAGE_STOP_WORDS = frozenset({
 _COVERAGE_TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 _PHONE_COVERAGE_MAX_TEXT = 1_500
 _PHONE_COVERAGE_MAX_EVIDENCE = 3_000
-_PHONE_COVERAGE_PROVIDER_TIMEOUT_SEC = 2.0
+
+
+def phone_coverage_timeout_sec() -> float:
+    """Bounded provider wall clock for one judge inference.
+
+    Gemini's first-token latency spikes to ~3.7s in production; a 2.0s bound
+    tripped the breaker on normal latency, opening it so every judge call for
+    the cooldown window fast-failed to `judge_error`. Default 4.0 covers the
+    observed spike. Read at the CALL SITE with the literal name so the repo's
+    env-contract scanner sees the variable this module consumes. The +0.25
+    async wrapper (see `judge_phone_coverage`) sits on top of this bound.
+    """
+    return _bounded_float(os.getenv("PHONE_COVERAGE_TIMEOUT_SEC"), 4.0, 1.0, 30.0)
+
+
+def phone_coverage_max_consec_errors() -> int:
+    """Bound on consecutive judge_errors before a caution-advance.
+
+    A breaker-open storm produces a run of `judge_error` verdicts, each of
+    which pins the cursor. After this many consecutive errors the coordinator
+    advances past the stalled topic instead of holding indefinitely. Bounded so
+    an operator cannot set it to zero (advance on the first error) or absurdly
+    high (never advance). Read at the CALL SITE with the literal name so the
+    env-contract scanner sees the variable this module consumes.
+    """
+    return int(_bounded_float(
+        os.getenv("PHONE_COVERAGE_MAX_CONSEC_ERRORS"), 3.0, 1.0, 20.0,
+    ))
+
+
+# Module-level default, computed once at import from the bounded env reader.
+# Kept as a patchable attribute so tests can pin a short timeout directly.
+_PHONE_COVERAGE_PROVIDER_TIMEOUT_SEC = phone_coverage_timeout_sec()
 _PHONE_COVERAGE_BREAKER = CircuitBreaker(CircuitBreakerConfig(
     failure_threshold=3,
     cooldown_sec=10.0,
@@ -3287,6 +3319,7 @@ async def judge_phone_coverage(
     assistant_reply: str,
     candidate_answer: str,
     resume_facts: dict[str, Any] | None,
+    resume_expected: bool = False,
     infer: Callable[[str], Awaitable[Any]] | None = None,
 ) -> PhoneCoverageVerdict:
     """Judge off the speech path; every fault fails toward NOT advancing."""
@@ -3294,7 +3327,18 @@ async def judge_phone_coverage(
     evidence = resume_facts if isinstance(resume_facts, dict) else {}
     if precheck is False:
         return PhoneCoverageVerdict(False, None, "deterministic_not_covered")
-    if precheck is True and not evidence:
+    # Résumé-always-present guard: when the caller expected résumé facts but the
+    # bounded evidence arrived empty, the résumé was dropped upstream. Taking the
+    # no-evidence deterministic shortcut here would SILENTLY disable conflict
+    # detection for this turn, so log the miss (bounded, no PII) and fall through
+    # to the model instead. A candidate who legitimately has no résumé
+    # (resume_expected False) keeps the fast deterministic-covered path.
+    if resume_expected and not evidence:
+        _log.warn(
+            "unknown_event", error_type="phone_coverage_judge",
+            error_category="resume_missing",
+        )
+    elif precheck is True and not evidence:
         return PhoneCoverageVerdict(True, None, "deterministic_covered")
 
     evidence_json = json.dumps(

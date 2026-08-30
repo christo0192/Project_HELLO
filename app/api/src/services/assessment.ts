@@ -33,6 +33,21 @@ export interface RunAssessmentOptions {
    * partition, because the caller does not get to decide what a session is.
    */
   readonly source?: 'browser' | 'phone';
+  /**
+   * 0072: the phone call ended before the plan completed (candidate hangup,
+   * network drop, worker crash), so this scores a PARTIAL transcript. It sets
+   * `assessments.partial = true` and records the coverage / disconnect detail
+   * in `raw`. Scoring itself is unchanged — it reads `transcript_turns`, which
+   * carry exactly the turns that were captured before the disconnect, and never
+   * depends on the recording. Absent/false means a complete screening.
+   */
+  readonly partial?: boolean;
+  /** 0072: questions covered when the call dropped (cursor). */
+  readonly covered?: number | null;
+  /** 0072: plan length; null when unresolvable (still scored). */
+  readonly total?: number | null;
+  /** 0072: `candidate_hangup` | `disconnected`. No PII. */
+  readonly disconnectReason?: string;
 }
 
 export interface AssessmentRunner {
@@ -211,6 +226,27 @@ async function runAssessmentImpl(
     basePayload.source = 'phone';
   }
 
+  // 0072: a PARTIAL screening (phone disconnect). The flag is a first-class
+  // column so a recruiter query can filter partials; the coverage/reason detail
+  // rides in `raw` so no further columns are needed. Only ever set for the phone
+  // path, and only when the caller declares it partial — a complete screening is
+  // byte-identical to before. Written under a fallback so a database that has
+  // not yet applied 0072's column still scores (the flag is best-effort, the
+  // scorecard is not).
+  const isPartial = isPhone && options?.partial === true;
+  if (isPartial) {
+    const partialMeta = {
+      partial: true,
+      covered: options?.covered ?? null,
+      total: options?.total ?? null,
+      disconnect_reason: options?.disconnectReason ?? 'disconnected',
+    };
+    basePayload.partial = true;
+    // Attach to `raw` non-destructively: the full LLM object is preserved and a
+    // `partial` block is added alongside it.
+    basePayload.raw = { ...(assessment as unknown as Record<string, unknown>), partial: partialMeta };
+  }
+
   let { data: row, error: aErr } = await supabase
     .from('assessments')
     .insert(basePayload)
@@ -223,6 +259,18 @@ async function runAssessmentImpl(
   // insert fails closed (the migration is a prerequisite).
   if (aErr && /(resume_conflicts|communication|motivation)/i.test(aErr.message)) {
     const { resume_conflicts, communication, motivation, ...base } = basePayload;
+    ({ data: row, error: aErr } = await supabase
+      .from('assessments')
+      .insert(base)
+      .select()
+      .single());
+  }
+  // 0072: if the `partial` column has not been migrated yet, retry WITHOUT it.
+  // The coverage/reason detail still lands because it also rides in `raw` (a
+  // jsonb column that is always present), so a stale schema loses only the
+  // filterable boolean, never the scorecard.
+  if (aErr && /\bpartial\b/i.test(aErr.message)) {
+    const { partial, ...base } = basePayload;
     ({ data: row, error: aErr } = await supabase
       .from('assessments')
       .insert(base)

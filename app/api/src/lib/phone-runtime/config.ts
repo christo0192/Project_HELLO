@@ -41,6 +41,10 @@ const _contractVisibleEnvReads = [
   process.env.PHONE_RUNTIME_DUE_LIMIT,
   process.env.PHONE_RUNTIME_RECLAIM_LIMIT,
   process.env.PHONE_RUNTIME_JOB_LEASE_SECONDS,
+  // 0072: the SHORT reconnect grace before a non-terminal-ending phone session
+  // is partial-finalized. Read functionally through the injectable `source`
+  // below; this literal keeps it visible to `check-env-contract.mjs`.
+  process.env.PHONE_PARTIAL_FINALIZE_GRACE_SEC,
 ];
 void _contractVisibleEnvReads;
 
@@ -119,6 +123,14 @@ export const PHONE_RUNTIME_BOUNDS: Readonly<Record<string, PhoneRuntimeBound>> =
   reclaimLimit: { def: 25, min: 1, max: 200 },
   /** Lease seconds for the `phone.dial` QUEUE job — not the attempt lease. */
   jobLeaseSeconds: { def: 60, min: 5, max: 900 },
+  /**
+   * 0072. SHORT reconnect grace (SECONDS) before a phone session that ended
+   * non-terminally is partial-finalized. It must be far BELOW 0071's stranded
+   * 7200s so this wins the race for a genuinely-ended call and delivers the
+   * scorecard first; the max clamps it under that ceiling. The min keeps a
+   * brief network hiccup from being finalized as a disconnect.
+   */
+  partialFinalizeGraceSec: { def: 180, min: 30, max: 7200 },
 });
 
 export interface PhoneRuntimeConfig {
@@ -129,6 +141,8 @@ export interface PhoneRuntimeConfig {
   readonly dueLimit: number;
   readonly reclaimLimit: number;
   readonly jobLeaseSeconds: number;
+  /** 0072. Reconnect grace (seconds) before a partial-finalize. */
+  readonly partialFinalizeGraceSec: number;
 }
 
 /**
@@ -156,6 +170,9 @@ export function loadPhoneRuntimeConfig(
     dueLimit: boundedInt(source.PHONE_RUNTIME_DUE_LIMIT, b.dueLimit!),
     reclaimLimit: boundedInt(source.PHONE_RUNTIME_RECLAIM_LIMIT, b.reclaimLimit!),
     jobLeaseSeconds: boundedInt(source.PHONE_RUNTIME_JOB_LEASE_SECONDS, b.jobLeaseSeconds!),
+    partialFinalizeGraceSec: boundedInt(
+      source.PHONE_PARTIAL_FINALIZE_GRACE_SEC, b.partialFinalizeGraceSec!,
+    ),
   });
 }
 
@@ -174,5 +191,6 @@ export function describePhoneRuntimeConfig(
     due_limit: config.dueLimit,
     reclaim_limit: config.reclaimLimit,
     job_lease_seconds: config.jobLeaseSeconds,
+    partial_finalize_grace_sec: config.partialFinalizeGraceSec,
   };
 }
