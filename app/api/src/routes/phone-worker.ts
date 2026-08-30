@@ -63,10 +63,13 @@ import {
   istWindowOpen,
   istWallClock,
   istDayInstantRange,
+  buildPhoneSlotGrid,
+  parseIstCalendarDate,
   loadPhoneScreeningConfig,
   type PhoneAssessmentState,
   type PhoneReadStore,
   type PhoneStores,
+  type PhoneSlot,
 } from '../lib/phone-screening/index.js';
 import { supabase } from '../lib/supabase.js';
 import { Queue } from '../lib/queue/index.js';
@@ -468,6 +471,85 @@ export function sanitizeAssessmentState(state: PhoneAssessmentState): Record<str
   };
 }
 
+/** One offered fallback slot, projected from the same occupancy the refusal used. */
+interface CallbackAlternative {
+  readonly starts_at: string;
+  readonly ends_at: string;
+  readonly ist_time: string;
+  readonly weekday: string;
+}
+
+/** How many alternatives the worker is offered on `slot_full`. The bot offers
+ *  at most two of these; three is a small deterministic pool it can pick from. */
+const CALLBACK_ALTERNATIVES_MAX = 3;
+
+/** Grid occupancy read bound for the alternatives projection. Mirrors the
+ *  `GET /calendar/slots` cap so the two projections read the same shape of the
+ *  day; a fuller day than this simply yields fewer confidently-free offers. */
+const PHONE_CALLBACK_ALTERNATIVES_OCCUPANCY_LIMIT = 400;
+
+/**
+ * Nearest FREE slots to a requested instant, for the `slot_full` refusal.
+ *
+ * Deterministic and bounded. The grid is the SAME projection `GET
+ * /calendar/slots` builds — `buildPhoneSlotGrid` over the day's live occupancy
+ * — so an offered alternative is `bookable` under exactly the rule that just
+ * refused the requested one. A slot is eligible only when it is `bookable`
+ * (not in the past, projected capacity remaining) AND still respects the same
+ * minimum lead the proposal enforces, so an alternative is never a slot the
+ * subsequent propose/confirm would itself refuse. Ordered by absolute distance
+ * from the requested start (earlier wins ties, so the nearest slot before is
+ * preferred to an equidistant one after), truncated to `CALLBACK_ALTERNATIVES_MAX`.
+ *
+ * Occupancy is read once, in the caller, and passed in — this function does no
+ * IO and reads no clock; every input is a parameter, exactly like the grid it
+ * calls.
+ */
+function nearestFreeAlternatives(input: {
+  readonly requestedStart: Date;
+  readonly istDateStr: string;
+  readonly slotSeconds: number;
+  readonly now: Date;
+  readonly minLeadSeconds: number;
+  readonly occupancy: readonly { startsAt: string; endsAt: string }[];
+}): CallbackAlternative[] {
+  let grid: readonly PhoneSlot[];
+  try {
+    grid = buildPhoneSlotGrid({
+      date: parseIstCalendarDate(input.istDateStr),
+      slotSeconds: input.slotSeconds,
+      now: input.now,
+      occupancy: input.occupancy,
+    });
+  } catch {
+    // A malformed date or an out-of-envelope step is not worth failing the
+    // whole refusal over: the worker still gets `slot_full`, just with no
+    // suggestions. Never throw out of the refusal path.
+    return [];
+  }
+  const requestedMs = input.requestedStart.getTime();
+  const earliestBookableMs = input.now.getTime() + input.minLeadSeconds * 1000;
+  const eligible = grid.filter(
+    (s) => s.bookable && Date.parse(s.startsAt) >= earliestBookableMs,
+  );
+  eligible.sort((a, b) => {
+    const da = Math.abs(Date.parse(a.startsAt) - requestedMs);
+    const db = Math.abs(Date.parse(b.startsAt) - requestedMs);
+    if (da !== db) return da - db;
+    // Deterministic tie-break: the earlier instant first.
+    return Date.parse(a.startsAt) - Date.parse(b.startsAt);
+  });
+  return eligible.slice(0, CALLBACK_ALTERNATIVES_MAX).map((s) => ({
+    starts_at: s.startsAt,
+    ends_at: s.endsAt,
+    ist_time: s.istStart,
+    weekday: new Intl.DateTimeFormat('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      weekday: 'long',
+    }).format(new Date(s.startsAt)),
+  }));
+}
+
 function requireWorkerPhoneAuth(
   req: import('express').Request,
   res: import('express').Response,
@@ -726,7 +808,30 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       ).length;
       if (overlapping >= PHONE_MAX_CONCURRENT) {
         phoneWorkerLog.info('unknown_event', { schema: 'callback_proposal', error_category: 'slot_full' });
-        return res.json({ ok: false, status: 'slot_full' });
+        // Offer nearest free slots so the bot has a bounded, deterministic set
+        // to propose next. Read the day's occupancy again with a grid-sized
+        // limit (the overlap probe above fetched only MAX_CONCURRENT+1, which is
+        // enough to DECIDE `slot_full` but not to project a whole-day grid). Any
+        // failure here degrades to no alternatives — never to a thrown refusal.
+        let alternatives: CallbackAlternative[] = [];
+        try {
+          const dayOccupancy = await readStore().listLiveAppointmentsByStart({
+            fromIso: day.fromIso,
+            toIso: day.toIso,
+            limit: PHONE_CALLBACK_ALTERNATIVES_OCCUPANCY_LIMIT,
+          });
+          alternatives = nearestFreeAlternatives({
+            requestedStart: startsAt,
+            istDateStr: istDate(startsAt),
+            slotSeconds: config().slotSeconds,
+            now: at,
+            minLeadSeconds: PHONE_VOICE_CALLBACK_MIN_LEAD_SECONDS,
+            occupancy: dayOccupancy.map((a) => ({ startsAt: a.startsAt, endsAt: a.endsAt })),
+          });
+        } catch {
+          alternatives = [];
+        }
+        return res.json({ ok: false, status: 'slot_full', alternatives });
       }
       const wall = istWallClock(startsAt);
       phoneWorkerLog.info('unknown_event', { schema: 'callback_proposal', error_category: 'proposal_valid' });

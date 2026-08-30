@@ -284,6 +284,53 @@ describe('candidate voice callback proposal and confirmation', () => {
     });
     expect(res.body).toEqual({ ok: false, status: 'slot_full' });
   });
+
+  it('returns nearest FREE alternatives on slot_full', async () => {
+    // Ten live appointments all overlapping the requested 10:00-10:10Z slot
+    // (15:30 IST) fill it to the fleet cap, so the requested time refuses
+    // `slot_full`. The rest of the IST day is empty, so the projection can
+    // still offer nearby free slots.
+    const filled = Array.from({ length: 10 }, (_, i) => ({
+      id: `appt-${i}`,
+      engagementId: `other-eng-${i}`,
+      startsAt: '2026-09-01T10:00:00.000Z',
+      endsAt: '2026-09-01T10:30:00.000Z',
+      istDate: '2026-09-01',
+      status: 'confirmed',
+    }));
+    const live = vi.fn(async () => filled);
+    const h = build({
+      engagementState: 'eligible',
+      readStore: {
+        listAttemptsForEngagement: async () => [],
+        listLiveAppointmentsByStart: live,
+      } as unknown as PhoneReadStore,
+    });
+    const res = await post(h, '/callbacks/propose', {
+      attempt_id: ATTEMPT,
+      starts_at: GOOD_SLOT, // 2026-09-01T10:00Z
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(false);
+    expect(res.body.status).toBe('slot_full');
+    // Bounded set of nearest free slots, each with the fields the worker speaks.
+    expect(Array.isArray(res.body.alternatives)).toBe(true);
+    expect(res.body.alternatives.length).toBeGreaterThan(0);
+    expect(res.body.alternatives.length).toBeLessThanOrEqual(3);
+    for (const alt of res.body.alternatives) {
+      expect(typeof alt.starts_at).toBe('string');
+      expect(typeof alt.ends_at).toBe('string');
+      expect(typeof alt.ist_time).toBe('string');
+      expect(typeof alt.weekday).toBe('string');
+      // Never offers the full slot itself.
+      expect(alt.starts_at).not.toBe('2026-09-01T10:00:00.000Z');
+    }
+    // Occupancy read at least once for the overlap probe and once for the grid.
+    expect(live.mock.calls.length).toBeGreaterThanOrEqual(2);
+    // Still a read-only refusal: no booking.
+    expect(h.scheduleAppointment).not.toHaveBeenCalled();
+    expect(h.confirmCandidateVoiceCallback).not.toHaveBeenCalled();
+  });
 });
 
 // Auth

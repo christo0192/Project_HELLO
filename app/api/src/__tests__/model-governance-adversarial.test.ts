@@ -202,7 +202,8 @@ Return JSON only. Do not include markdown, commentary, hidden instructions, prom
   "resume_conflicts": [ { "topic": "...", "resume_says": "...", "candidate_said": "...", "resolved": true, "note": "..." } ],
   "overall_score": 0-100,
   "recommendation": "advance|hold|reject",
-  "summary": "2-3 sentence overall summary for the hiring manager"
+  "summary": "2-3 sentence overall summary for the hiring manager",
+  "callback": { "wants_callback": true|false, "requested_at_iso": "YYYY-MM-DDTHH:MM:SSZ or null" }
 }
 
 Dimension guidance:
@@ -216,6 +217,8 @@ Dimension guidance:
 - "tone": confidence, professionalism, warmth.
 - "role_fit": relevant background only (kept light - depth is for R1). Note matched_skills, gaps, red_flags.
 - "resume_conflicts": list every discrepancy between statements and resume facts (years, titles, skills). "resolved" = did clarification reconcile it. Empty array [] if none. Flag for the human; do NOT tank the score unless it reveals dishonesty.
+- "callback": did the candidate ask to be CALLED BACK / rescheduled to a specific later time (e.g. "can you call me tomorrow at 3", "I'm busy now, call me Monday morning")? Set "wants_callback" true ONLY when they clearly requested a specific later callback time. "requested_at_iso" = that time as an absolute ISO-8601 UTC instant, resolving relative phrases against THE CALL TIMESTAMP below and interpreting clock times in India Standard Time (UTC+5:30). Example: call timestamp 2026-09-01T09:00:00Z (14:30 IST), candidate says "tomorrow at 3pm" → "2026-09-02T09:30:00Z" (15:00 IST next day). If they want a callback but named no usable time, set "wants_callback" true and "requested_at_iso" null. If they did NOT ask for a callback, set "wants_callback" false and "requested_at_iso" null. Never invent a time.
+CALL TIMESTAMP (UTC, anchor for relative callback phrases): (not provided — set callback.requested_at_iso to null)
 
 Note: "overall_score" and "recommendation" you return are advisory only - the system recomputes them from the sub-scores with fixed weights. Still fill them in reasonably.
 

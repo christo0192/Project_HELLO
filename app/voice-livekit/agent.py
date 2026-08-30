@@ -12,6 +12,7 @@ import asyncio
 import inspect
 import logging
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
 from dotenv import load_dotenv
@@ -1290,6 +1291,11 @@ async def _run_native_phone_screening(
     closing = ClosingStateMachine()
     qna_rounds = {"value": 0}
     silence_prompted = {"value": False}
+    # The bounded in-call callback negotiation. `None` until the candidate first
+    # asks for a callback; then a forward-only state machine that CANNOT loop
+    # (see phone.run_callback_turn). While it is active and not DONE, the turn
+    # hook routes every candidate turn to it instead of the ordinary flow.
+    callback_flow: dict[str, Any] = {"state": None}
     # The coordinator owns pending evidence; durable effects happen only from
     # coordinator-bound tools after LiveKit authorizes the scheduled reply.
     reply_plan: list[str | None] = [None]
@@ -1432,6 +1438,28 @@ async def _run_native_phone_screening(
             return
         raise RuntimeError("phone_turn_context_unavailable")
 
+    def _apply_callback_decision(turn_ctx: Any, decision: Any) -> None:
+        """Make the bot SPEAK a callback decision, and end the call if terminal.
+
+        Gemini remains a mouthpiece: the decision's fixed line is injected as the
+        exact reply text (both as `reply_plan` and as a speak-verbatim
+        instruction), and NO tool is added to the toolless turn. A terminal
+        decision ends the call with its own reason (`HALT_CALLBACK_SCHEDULED` on
+        a booking — retryable/post-nothing so the booking owns the redial —
+        or `HALT_CANDIDATE_ENDED` on the deferral).
+        """
+        setattr(agent, "_turn_policy", "closing" if decision.terminal else "clarification")
+        reply_plan[0] = decision.spoken
+        add_turn_instruction(
+            turn_ctx,
+            "Say this to the candidate, in these words, and nothing else. Do NOT "
+            "ask a screening question and do NOT add anything:\n" + decision.spoken,
+        )
+        if decision.terminal:
+            terminal_reply_required["value"] = True
+            terminal_reason["reason"] = decision.terminal_reason
+            finished.set()
+
     async def wait_for_terminal_reply() -> bool:
         """Wait for the model's goodbye to PLAY TO COMPLETION.
 
@@ -1490,6 +1518,20 @@ async def _run_native_phone_screening(
             terminal_reply_required["value"] = True
             terminal_reason["reason"] = phone.HALT_CANDIDATE_ENDED
             finished.set()
+            return
+        # ACTIVE CALLBACK NEGOTIATION. Once the candidate has asked for a
+        # callback, every subsequent turn belongs to the bounded flow (naming a
+        # time, picking an alternative) — NOT to the screening plan. Routed here,
+        # before the ordinary route/patience logic, so a bare "tomorrow at 3pm"
+        # or "the first one" is orchestrated rather than mis-read as an answer.
+        # The flow CANNOT loop (phone.run_callback_turn is forward-only); when it
+        # reaches DONE it has already ended the call.
+        active_flow = callback_flow["state"]
+        if active_flow is not None and active_flow.phase != phone.CALLBACK_PHASE_DONE:
+            decision = await phone.run_callback_turn(
+                active_flow, events, attempt_id, text, datetime.now(timezone.utc),
+            )
+            _apply_callback_decision(turn_ctx, decision)
             return
         question = state.question_at(cursor)
         if closing.state is ClosingState.CANDIDATE_QNA:
@@ -1569,27 +1611,20 @@ async def _run_native_phone_screening(
                     add_turn_instruction(turn_ctx, "Answer briefly from verified role context, then ask this same planned topic again as ONE natural spoken question in your own words:\n" + question.text)
                 return
             if route == "callback_deferral":
-                # DE-LOOPED (this PR): a "call me back later" is TERMINAL. Do NOT
-                # ask for a time, propose, confirm, or book — that handshake
-                # looped. Acknowledge warmly, tell the candidate the team will
-                # reach out to arrange another time, then end the call. This
-                # mirrors the candidate-end terminal path exactly (fixed spoken
-                # reply + terminal reason + finished), so it cannot loop. The
-                # assessment is aborted for this leg (not opted out); the team's
-                # follow-up happens out of band.
-                setattr(agent, "_turn_policy", "closing")
-                reply_plan[0] = phone.PHONE_CALLBACK_DEFERRAL_TEXT
-                add_turn_instruction(
-                    turn_ctx,
-                    "The candidate asked to be called back later. Warmly "
-                    "acknowledge, tell them the team will reach out to arrange "
-                    "another time, thank them, and say goodbye. Do NOT ask for a "
-                    "time, do NOT try to schedule, and do NOT ask another "
-                    "question.",
+                # RE-LOOPED SAFELY (this PR): a "call me back later" now ENTERS a
+                # BOUNDED negotiation. The worker resolves the requested time
+                # deterministically, proposes+confirms against the server, and
+                # ends `HALT_CALLBACK_SCHEDULED` on success — or falls back to the
+                # exact PR-1 terminal deferral when it cannot resolve/book within
+                # the bound. The flow is forward-only (phone.run_callback_turn),
+                # so it CANNOT loop; the confirm handshake that used to spin is
+                # gone. Gemini only speaks the decision's line; no tool is added.
+                flow = phone.CallbackFlowState()
+                callback_flow["state"] = flow
+                decision = await phone.run_callback_turn(
+                    flow, events, attempt_id, text, datetime.now(timezone.utc),
                 )
-                terminal_reply_required["value"] = True
-                terminal_reason["reason"] = phone.HALT_CANDIDATE_ENDED
-                finished.set()
+                _apply_callback_decision(turn_ctx, decision)
                 return
             setattr(agent, "_turn_policy", "clarification")
             if question is not None:

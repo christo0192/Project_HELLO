@@ -105,4 +105,14 @@ export interface Assessment {
     resolved: boolean;      // did the clarification resolve it?
     note: string;
   }[];
+  // POST-CALL CALLBACK BACKSTOP. The scorer extracts whether the candidate
+  // asked to be called back and, if so, the time they asked for, resolved to
+  // an absolute UTC instant against the call timestamp (relative phrases like
+  // "tomorrow 3pm" are resolved in IST). Advisory only: the API re-validates
+  // the window and books best-effort. Optional so browser rows and pre-existing
+  // phone rows are unaffected.
+  callback?: {
+    wants_callback: boolean;
+    requested_at_iso: string | null; // ISO-8601 UTC, or null if unknown/none
+  };
 }

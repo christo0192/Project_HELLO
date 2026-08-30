@@ -243,6 +243,43 @@ class FakeEventClient:
         # A test asserting the answer WAIT is not perturbed by the other calls.
         self.answered_calls: list[str] = []
         self._answers = list(answers or [])
+        # Callback booking: scripted proposal/confirm outcomes keyed by the
+        # resolved `starts_at` instant, recorded so a test can assert the exact
+        # propose→confirm handshake the bounded flow performs.
+        self.propose_calls: list[tuple[str, str]] = []
+        self.confirm_calls: list[tuple[str, str]] = []
+        self._proposals: dict = {}
+        self._confirms: dict = {}
+
+    def script_proposal(self, starts_at, status, alternatives=None):
+        """Script one `propose_callback` outcome for a resolved instant."""
+        self._proposals[starts_at] = (status, alternatives or [])
+
+    def script_confirm(self, starts_at, ok, status):
+        """Script one `confirm_callback` outcome for a resolved instant."""
+        self._confirms[starts_at] = (ok, status)
+
+    async def propose_callback(self, attempt_id, starts_at):
+        self.propose_calls.append((attempt_id, starts_at))
+        status, alternatives = self._proposals.get(starts_at, ("window_closed", []))
+        if status == "proposal_valid":
+            proposal = phone.CallbackProposal({
+                "starts_at": starts_at,
+                "ends_at": starts_at,
+                "weekday": "Wednesday",
+                "ist_date": "2026-09-02",
+                "ist_time": "15:00",
+                "time_zone": "Asia/Kolkata",
+            })
+            return phone.PhoneApiOutcome(True, "proposal_valid"), proposal
+        outcome = phone.PhoneApiOutcome(False, status)
+        outcome.alternatives = [phone.CallbackAlternative(a) for a in alternatives]
+        return outcome, None
+
+    async def confirm_callback(self, attempt_id, starts_at):
+        self.confirm_calls.append((attempt_id, starts_at))
+        ok, status = self._confirms.get(starts_at, (True, "ok"))
+        return phone.PhoneApiOutcome(ok, status)
 
     async def attempt_answered(self, attempt_id):
         self.answered_calls.append(attempt_id)
@@ -5765,11 +5802,12 @@ class TestToollessGovernedActions(unittest.IsolatedAsyncioTestCase):
             await hooks["drive_terminal"]()
         self.assertIn("assessment.aborted", client.event_types)
 
-    async def test_a_callback_deferral_ends_the_call_with_no_booking_in_toolless(self):
-        # CHANGE 5 (this PR): in-call callback booking is DE-LOOPED. A recognised
-        # "call me back later" is now TERMINAL: acknowledge, tell them the team
-        # will reach out, and end the call — no propose/confirm, no booking, and
-        # never a loop. It must NOT commit the boundary.
+    async def test_a_callback_deferral_without_a_time_asks_once_then_defers(self):
+        # CHANGE 5 (this PR): in-call callback booking is a BOUNDED negotiation,
+        # not the old de-looped terminal deferral. A "call me back later" with no
+        # time asks ONCE for a specific time (non-terminal clarification), and if
+        # the candidate still gives no usable time the flow falls back to the
+        # exact terminal deferral. It never commits a boundary and never loops.
         agent, session, state, client, hooks = await _make_native_coordinator(
             turn_mode="toolless",
         )
@@ -5777,26 +5815,148 @@ class TestToollessGovernedActions(unittest.IsolatedAsyncioTestCase):
         text = "Can you call me back later? Now is not a good time."
         route = phone.candidate_turn_route(text)
         self.assertEqual(route, "callback_deferral")
+
+        # Turn 1: no time named → ask once for a specific time (NOT terminal).
         turn_ctx = types.SimpleNamespace(items=[])
         await on_turn(text, types.SimpleNamespace(text_content=text), turn_ctx)
-        # It closes, not loops: closing policy, never the booking-loop "callback".
-        self.assertEqual(getattr(agent, "_turn_policy"), "closing")
+        self.assertEqual(getattr(agent, "_turn_policy"), "clarification")
         injected = " ".join(
             m["content"] if isinstance(m, dict) else "" for m in turn_ctx.items
         ).lower()
-        # No booking-tool handshake is ever initiated.
-        self.assertNotIn("propose_callback", injected)
-        self.assertNotIn("confirm_callback", injected)
-        self.assertNotIn("book_appointment", injected)
-        # The instruction tells the candidate the team will reach out and ends.
-        self.assertIn("reach out", injected)
-        self.assertIn("goodbye", injected)
+        self.assertIn("what day and time", injected)
         self.assertEqual(client.committed_keys, [])
-        # It is a terminal reply: the coordinator waits for the closing playout,
-        # then aborts the assessment for this leg (candidate-ended semantics).
+        # No booking was attempted — no time to propose yet.
+        self.assertEqual(client.propose_calls, [])
+        self.assertEqual(client.confirm_calls, [])
+
+        # Turn 2: still no usable time → terminal deferral (team will reach out).
+        turn_ctx2 = types.SimpleNamespace(items=[])
+        await on_turn(
+            "Uh, I'm not sure, whenever.",
+            types.SimpleNamespace(text_content="Uh, I'm not sure, whenever."),
+            turn_ctx2,
+        )
+        self.assertEqual(getattr(agent, "_turn_policy"), "closing")
+        injected2 = " ".join(
+            m["content"] if isinstance(m, dict) else "" for m in turn_ctx2.items
+        ).lower()
+        self.assertIn("reach out", injected2)
+        # Bounded: exactly one clarification, then terminal — the flow never
+        # proposed or confirmed anything.
+        self.assertEqual(client.propose_calls, [])
+        self.assertEqual(client.confirm_calls, [])
+        self.assertEqual(client.committed_keys, [])
         with patch.object(agent_mod, "PHONE_TERMINAL_REPLY_TIMEOUT_SEC", 0.05):
             await hooks["drive_terminal"]()
         self.assertIn("assessment.aborted", client.event_types)
+
+
+class TestBoundedCallbackBookingFlow(unittest.IsolatedAsyncioTestCase):
+    """The bounded in-call callback negotiation, driven through the REAL hook.
+
+    Every case uses an EXPLICIT ISO date in the utterance so the resolved
+    instant is independent of the wall clock the hook reads. The scripted fake
+    keys its proposal/confirm outcomes on that instant.
+    """
+
+    # "2026-09-05 at 11am" IST → 05:30Z.
+    RESOLVED = "2026-09-05T05:30:00Z"
+
+    async def test_a_valid_time_proposes_confirms_and_ends_scheduled(self):
+        client = FakeEventClient()
+        client.script_proposal(self.RESOLVED, "proposal_valid")
+        client.script_confirm(self.RESOLVED, True, "ok")
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless", client=client,
+        )
+        on_turn = hooks["on_native_turn"]
+        # Turn 1: "call me back later" routes into the flow and asks for a time.
+        opener = "Can you call me back later?"
+        turn_ctx0 = types.SimpleNamespace(items=[])
+        await on_turn(opener, types.SimpleNamespace(text_content=opener), turn_ctx0)
+        self.assertEqual(getattr(agent, "_turn_policy"), "clarification")
+        # Turn 2: the specific time → propose THEN confirm the resolved instant.
+        text = "Sure, on 2026-09-05 at 11am."
+        turn_ctx = types.SimpleNamespace(items=[])
+        await on_turn(text, types.SimpleNamespace(text_content=text), turn_ctx)
+        self.assertEqual(client.propose_calls, [(_ATTEMPT_ID, self.RESOLVED)])
+        self.assertEqual(client.confirm_calls, [(_ATTEMPT_ID, self.RESOLVED)])
+        self.assertEqual(getattr(agent, "_turn_policy"), "closing")
+        # Ends scheduled: the booking owns the redial, so the leg posts NOTHING
+        # (callback_scheduled is a retryable/post-nothing halt).
+        with patch.object(agent_mod, "PHONE_TERMINAL_REPLY_TIMEOUT_SEC", 0.05):
+            await hooks["drive_terminal"]()
+        self.assertNotIn("assessment.aborted", client.event_types)
+        self.assertNotIn("assessment.completed", client.event_types)
+
+    async def test_slot_full_offers_alternatives_and_books_the_pick(self):
+        client = FakeEventClient()
+        alt_iso = "2026-09-05T06:30:00Z"
+        client.script_proposal(self.RESOLVED, "slot_full", alternatives=[
+            {"starts_at": alt_iso, "ends_at": alt_iso, "ist_time": "12:00", "weekday": "Saturday"},
+            {"starts_at": "2026-09-05T07:30:00Z", "ends_at": "x", "ist_time": "13:00", "weekday": "Saturday"},
+        ])
+        client.script_proposal(alt_iso, "proposal_valid")
+        client.script_confirm(alt_iso, True, "ok")
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless", client=client,
+        )
+        on_turn = hooks["on_native_turn"]
+        # Turn 1: "call me back later" enters the flow, asks for a time.
+        opener = "Can you call me back later?"
+        turn_ctx0 = types.SimpleNamespace(items=[])
+        await on_turn(opener, types.SimpleNamespace(text_content=opener), turn_ctx0)
+        # Turn 2: the requested full slot → offer alternatives (non-terminal).
+        text = "On 2026-09-05 at 11am."
+        turn_ctx = types.SimpleNamespace(items=[])
+        await on_turn(text, types.SimpleNamespace(text_content=text), turn_ctx)
+        self.assertEqual(getattr(agent, "_turn_policy"), "clarification")
+        offer = " ".join(m["content"] for m in turn_ctx.items).lower()
+        self.assertIn("already full", offer)
+        self.assertIn("12:00", offer)
+        # Turn 3: pick the first offered slot → propose+confirm the pick, end.
+        turn_ctx2 = types.SimpleNamespace(items=[])
+        await on_turn("The first one please", types.SimpleNamespace(text_content="The first one please"), turn_ctx2)
+        self.assertIn((_ATTEMPT_ID, alt_iso), client.propose_calls)
+        self.assertEqual(client.confirm_calls, [(_ATTEMPT_ID, alt_iso)])
+        self.assertEqual(getattr(agent, "_turn_policy"), "closing")
+
+    async def test_never_giving_a_valid_time_terminates_within_the_bound(self):
+        # The no-loop proof: a candidate who NEVER names a usable time is driven
+        # to the terminal deferral within the bound (initial + one clarification),
+        # and further turns after DONE stay terminal — the hook never re-enters
+        # the flow and never proposes anything.
+        client = FakeEventClient()
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless", client=client,
+        )
+        on_turn = hooks["on_native_turn"]
+        first = "Can you call me back later?"
+        self.assertEqual(phone.candidate_turn_route(first), "callback_deferral")
+        stop_exc = sys.modules["livekit.agents"].StopResponse
+        # Drive FOUR turns of a candidate who never names a time. The flow must
+        # reach terminal within the bound; every turn AFTER it terminates is
+        # short-circuited by the coordinator's `finished` guard (StopResponse),
+        # which is exactly the no-loop property — a terminated flow is never
+        # re-entered.
+        for i, utterance in enumerate([
+            first,
+            "I don't know, sometime.",
+            "Still not sure.",
+            "Whatever works.",
+        ]):
+            turn_ctx = types.SimpleNamespace(items=[])
+            try:
+                await on_turn(utterance, types.SimpleNamespace(text_content=utterance), turn_ctx)
+            except stop_exc:
+                # Post-terminal turn: the call is already ending. Correct.
+                pass
+        # Bounded: at most one clarification then terminal; NOTHING was ever
+        # proposed or confirmed because no usable time was given.
+        self.assertEqual(client.propose_calls, [])
+        self.assertEqual(client.confirm_calls, [])
+        self.assertEqual(getattr(agent, "_turn_policy"), "closing")
+        self.assertEqual(client.committed_keys, [])
 
 
 class TestToollessSessionFlow(unittest.IsolatedAsyncioTestCase):

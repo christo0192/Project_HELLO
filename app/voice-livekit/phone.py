@@ -47,7 +47,9 @@ import os
 import re
 import time as time_module
 from dataclasses import dataclass
+from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
+from zoneinfo import ZoneInfo
 
 from observability import StructuredLogger, get_correlation_id
 from provider_resilience import (
@@ -875,6 +877,11 @@ class PhoneApiOutcome:
         # the next beat, already clamped. Never a lease token: the response
         # carries none and never will.
         "next_heartbeat_seconds",
+        # Callback booking: carried only by `propose_callback` on a `slot_full`
+        # refusal — the server's nearest FREE slots. Empty on every other
+        # outcome, so a caller that reads it always gets a list, never an
+        # AttributeError.
+        "alternatives",
     )
 
     def __init__(
@@ -896,9 +903,45 @@ class PhoneApiOutcome:
         self.expected_key: str | None = None
         self.adopted: bool = False
         self.next_heartbeat_seconds: float | None = None
+        self.alternatives: list["CallbackAlternative"] = []
 
     def __repr__(self) -> str:  # pragma: no cover - diagnostics only
         return f"PhoneApiOutcome(ok={self.ok}, status={self.status!r})"
+
+
+class CallbackAlternative:
+    """One server-offered fallback slot on a `slot_full` refusal.
+
+    Every field is server-normalized; the worker speaks these, never a
+    model-generated time. Malformed entries are dropped, not raised (the caller
+    still has the refusal even with zero usable alternatives).
+    """
+
+    __slots__ = ("starts_at", "ends_at", "ist_time", "weekday")
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        required = ("starts_at", "ends_at", "ist_time", "weekday")
+        if any(not isinstance(data.get(key), str) or not data[key].strip() for key in required):
+            raise ValueError("callback_alternative_malformed")
+        self.starts_at = data["starts_at"]
+        self.ends_at = data["ends_at"]
+        self.ist_time = data["ist_time"]
+        self.weekday = data["weekday"]
+
+
+def _parse_callback_alternatives(raw: Any) -> list[CallbackAlternative]:
+    """Best-effort parse of the server's `alternatives` array. Never raises."""
+    if not isinstance(raw, list):
+        return []
+    out: list[CallbackAlternative] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            out.append(CallbackAlternative(item))
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 class CallbackProposal:
@@ -1268,7 +1311,15 @@ class PhoneEventClient:
             return PhoneApiOutcome(False, error_category=_ERR_MALFORMED), None
         status = data.get("status")
         if data.get("ok") is not True or status != "proposal_valid":
-            return PhoneApiOutcome(False, str(status) if status is not None else _ERR_MALFORMED), None
+            refusal = PhoneApiOutcome(
+                False, str(status) if status is not None else _ERR_MALFORMED
+            )
+            # A `slot_full` refusal carries nearest FREE alternatives. Parse them
+            # onto the outcome so the orchestrator can offer them; any other
+            # refusal simply has none.
+            if status == "slot_full":
+                refusal.alternatives = _parse_callback_alternatives(data.get("alternatives"))
+            return refusal, None
         try:
             proposal = CallbackProposal(data)
         except (TypeError, ValueError):
@@ -2459,6 +2510,181 @@ BOOKED_STATUSES: frozenset[str] = frozenset(["ok", "ok_prereqs_pending"])
 MIN_CALLBACK_DURATION_SEC = 900
 MAX_CALLBACK_DURATION_SEC = 3600
 
+# ── Deterministic IST-aware callback-time parser ──────────────────────
+#
+# The WORKER resolves the requested time, not the LLM: a model-generated ISO
+# instant is exactly the sort of confident-but-wrong value this project has been
+# burned by (03:00 IST proposals, timezone-off-by-5:30). This parser is
+# dependency-free (stdlib `datetime` + `zoneinfo` only), anchored on an injected
+# `now` (the call's instant), and returns an ABSOLUTE UTC ISO-8601 instant or
+# None. It NEVER guesses: an utterance it cannot resolve to a specific day AND a
+# specific clock time returns None, and the caller then asks one clarification
+# or falls back to the terminal deferral. The server still re-validates the
+# window, lead time and duration — this only turns speech into a candidate
+# instant to propose.
+
+_IST_ZONE = ZoneInfo("Asia/Kolkata")
+
+# Clock-time phrases: "3pm", "3 pm", "3:30pm", "15:30", "at 3", "9 in the
+# morning". Hour 1..12 with am/pm, or 0..23 in 24h form. Minutes optional.
+_TIME_RE = re.compile(
+    r"\b(?P<at>at\s+)?"
+    r"(?P<hour>\d{1,2})"
+    r"(?::(?P<minute>\d{2}))?"
+    r"\s*"
+    r"(?P<ampm>a\.?m\.?|p\.?m\.?|o'?clock)?"
+    r"\s*"
+    r"(?:in\s+the\s+(?P<part>morning|afternoon|evening|night))?"
+    r"\b",
+    re.IGNORECASE,
+)
+
+_WEEKDAYS = {
+    "monday": 0, "mon": 0,
+    "tuesday": 1, "tue": 1, "tues": 1,
+    "wednesday": 2, "wed": 2,
+    "thursday": 3, "thu": 3, "thurs": 3,
+    "friday": 4, "fri": 4,
+    "saturday": 5, "sat": 5,
+    "sunday": 6, "sun": 6,
+}
+_WEEKDAY_RE = re.compile(
+    r"\b(" + "|".join(sorted(_WEEKDAYS, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+# ISO date the candidate (or a downstream) might have already resolved.
+_EXPLICIT_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+
+
+def _resolve_ist_hour(hour: int, minute: int, ampm: str | None, part: str | None) -> tuple[int, int] | None:
+    """Turn a spoken clock into a 24h IST (hour, minute), or None if impossible."""
+    if not 0 <= minute <= 59:
+        return None
+    ampm_norm = (ampm or "").replace(".", "").replace("'", "").lower()
+    part_norm = (part or "").lower()
+    is_pm = ampm_norm == "pm" or part_norm in {"afternoon", "evening", "night"}
+    is_am = ampm_norm == "am" or part_norm == "morning"
+    if ampm_norm in {"", "oclock"} and not part_norm:
+        # 24h reading. Accept 0..23 as-is.
+        if 0 <= hour <= 23:
+            return hour, minute
+        return None
+    # 12h reading with an am/pm or a daypart word.
+    if not 1 <= hour <= 12:
+        # "13pm" is nonsense; if a 24h hour was given with a daypart word,
+        # reject rather than guess.
+        return None
+    h = hour % 12
+    if is_pm:
+        h += 12
+    elif is_am:
+        h = hour % 12
+    else:
+        return None
+    return h, minute
+
+
+def parse_callback_time_ist(text: Any, now: datetime) -> str | None:
+    """Resolve a candidate's spoken callback time to a UTC ISO-8601 instant.
+
+    Deterministic and IST-aware. `now` is the anchor instant (tz-aware; the
+    call's time). Returns an ISO-8601 UTC string (``...Z``) or None when the
+    utterance does not name BOTH a resolvable day and a specific clock time.
+
+    Handled: "tomorrow at 3pm", "today 5:30pm", "monday 10am", an explicit
+    ``YYYY-MM-DD`` with a time, "3 in the afternoon tomorrow". Garbage, a
+    day with no time, or a time with no resolvable day → None.
+    """
+    if not isinstance(text, str):
+        return None
+    clean = " ".join(text.strip().split())
+    if not clean:
+        return None
+    low = clean.lower()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now_ist = now.astimezone(_IST_ZONE)
+
+    # 1) Resolve the DAY (IST calendar date).
+    target_date = None
+    m_date = _EXPLICIT_DATE_RE.search(clean)
+    if m_date:
+        try:
+            target_date = datetime(
+                int(m_date.group(1)), int(m_date.group(2)), int(m_date.group(3)),
+            ).date()
+        except ValueError:
+            return None
+    elif re.search(r"\bday after tomorrow\b", low):
+        target_date = (now_ist + timedelta(days=2)).date()
+    elif re.search(r"\btomorrow\b", low):
+        target_date = (now_ist + timedelta(days=1)).date()
+    elif re.search(r"\btoday\b", low):
+        target_date = now_ist.date()
+    else:
+        m_wd = _WEEKDAY_RE.search(low)
+        if m_wd:
+            target_wd = _WEEKDAYS[m_wd.group(1).lower()]
+            # The NEXT occurrence of that weekday, strictly ahead (0 days would
+            # mean "today", which the candidate would have said as "today").
+            delta = (target_wd - now_ist.weekday()) % 7
+            if delta == 0:
+                delta = 7
+            target_date = (now_ist + timedelta(days=delta)).date()
+
+    # 2) Resolve the TIME. Strip the day words first so "tomorrow" cannot be read
+    # as an hour, then find the first clock phrase carrying real time evidence
+    # (an am/pm, a daypart, a colon, or an explicit "at"/"o'clock").
+    time_search = _EXPLICIT_DATE_RE.sub(" ", clean)
+    time_search = re.sub(
+        r"\b(day after tomorrow|tomorrow|today|"
+        + "|".join(_WEEKDAYS)
+        + r")\b",
+        " ",
+        time_search,
+        flags=re.IGNORECASE,
+    )
+    resolved_hm = None
+    for m_time in _TIME_RE.finditer(time_search):
+        has_evidence = (
+            m_time.group("ampm")
+            or m_time.group("part")
+            or m_time.group("minute") is not None
+            or m_time.group("at")
+        )
+        if not has_evidence:
+            continue
+        hour = int(m_time.group("hour"))
+        minute = int(m_time.group("minute") or 0)
+        resolved_hm = _resolve_ist_hour(
+            hour, minute, m_time.group("ampm"), m_time.group("part"),
+        )
+        if resolved_hm is not None:
+            break
+
+    if resolved_hm is None:
+        return None
+
+    # 3) If no day was named but a time was, default to TODAY when that instant
+    # is still ahead of now, otherwise TOMORROW — the natural reading of a bare
+    # "call me at 4pm".
+    hh, mm = resolved_hm
+    if target_date is None:
+        candidate_ist = datetime.combine(
+            now_ist.date(), dt_time(hh, mm), tzinfo=_IST_ZONE,
+        )
+        if candidate_ist <= now_ist:
+            candidate_ist = candidate_ist + timedelta(days=1)
+    else:
+        candidate_ist = datetime.combine(
+            target_date, dt_time(hh, mm), tzinfo=_IST_ZONE,
+        )
+
+    utc = candidate_ist.astimezone(timezone.utc)
+    # Normalize to the ...Z form the server and the proposal client expect.
+    return utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 # One distinct line per refusal code. Distinct because a single "sorry, that
 # didn't work" teaches the candidate nothing and teaches us nothing from the
 # transcript either; none of them contains a confirmation.
@@ -2628,6 +2854,233 @@ async def schedule_callback_turn(
     # `ok` with an unrecognised status is NOT a booking. A future server status
     # must be added here deliberately, never confirmed by default.
     return ScheduleTurn(schedule_refusal_text(outcome.status), False, outcome.status)
+
+
+# ── The BOUNDED in-call callback orchestrator ─────────────────────────
+#
+# The WORKER runs this state machine; Gemini is a mouthpiece that speaks the
+# `spoken` text and nothing else. It CANNOT loop: every candidate turn advances
+# a strictly forward phase counter, and there are at most FOUR terminating
+# outcomes — booked, or the terminal deferral — reachable within
+# * one time capture (+ at most one clarification),
+# * one alternatives round,
+# * one confirm.
+# When the bound is exhausted the flow returns the PR-1 terminal deferral
+# (acknowledge → team will reach out → end), which is why it can never spin.
+#
+# The read-back-then-confirm handshake that the de-loop PR removed is NOT
+# reintroduced: a valid proposal is confirmed in the SAME turn (propose then
+# confirm), and the bot speaks the booked confirmation. There is no separate
+# "is that correct?" round to loop on.
+
+# Phases. Strictly forward; a flow only ever moves DOWN this list or terminates.
+CALLBACK_PHASE_AWAITING_TIME = "awaiting_time"          # first "call me back"
+CALLBACK_PHASE_AWAITING_CLARIFY = "awaiting_clarify"    # asked once for a time
+CALLBACK_PHASE_AWAITING_ALT_PICK = "awaiting_alt_pick"  # offered alternatives
+CALLBACK_PHASE_DONE = "done"                            # terminal (booked or deferred)
+
+# What the bot says when it needs the candidate to name a specific time. Asked
+# AT MOST ONCE (the clarification), then the flow falls back to the deferral.
+_CALLBACK_ASK_TIME_TEXT = (
+    "Sure, I can set up a callback. What day and time works for you? "
+    "You can say something like tomorrow at 3 in the afternoon."
+)
+
+
+def _alternatives_offer_text(alternatives: list[CallbackAlternative]) -> str:
+    """One spoken line offering the nearest one or two free slots."""
+    offered = alternatives[:2]
+    parts = [f"{a.weekday} at {a.ist_time} India time" for a in offered]
+    if len(parts) == 1:
+        return (
+            f"That time is already full. The nearest I have is {parts[0]}. "
+            "Would that work?"
+        )
+    return (
+        f"That time is already full. The nearest I have are {parts[0]} or "
+        f"{parts[1]}. Which of those works for you?"
+    )
+
+
+def _match_alternative(text: Any, alternatives: list[CallbackAlternative]) -> CallbackAlternative | None:
+    """Pick the offered alternative the candidate chose. Deterministic.
+
+    Matches on the spoken IST time ("3:30", "15:30") or a first/second-choice
+    word, over the (at most two) OFFERED slots only. An ambiguous or unmatched
+    reply returns None, and the caller then falls back to the deferral rather
+    than guessing which slot to book.
+    """
+    if not isinstance(text, str) or not alternatives:
+        return None
+    offered = alternatives[:2]
+    low = " ".join(text.strip().split()).lower()
+    if not low:
+        return None
+    # Ordinal / positional picks.
+    if len(offered) >= 1 and re.search(r"\b(first|1st|former|earlier|the one)\b", low):
+        return offered[0]
+    if len(offered) >= 2 and re.search(r"\b(second|2nd|latter|later)\b", low):
+        return offered[1]
+    # Clock-time picks: match the HH:MM or the bare hour of an offered slot.
+    for alt in offered:
+        hhmm = alt.ist_time.strip()
+        hour = hhmm.split(":")[0].lstrip("0") or "0"
+        minute = hhmm.split(":")[1] if ":" in hhmm else ""
+        if hhmm and hhmm in low:
+            return alt
+        # "3:30", "3 30", or a bare "3" when the slot is on the hour.
+        if minute in {"", "00"}:
+            if re.search(rf"\b{re.escape(hour)}\s*(?:o'?clock|pm|am|p\.?m\.?|a\.?m\.?)?\b", low):
+                return alt
+        else:
+            if re.search(rf"\b{re.escape(hour)}[:\s]{re.escape(minute)}\b", low):
+                return alt
+    # A bare yes when exactly one slot was offered = accept that one.
+    if len(offered) == 1 and _CALLBACK_CONFIRMATION_YES.search(low) and not _CALLBACK_CONFIRMATION_NO.search(low):
+        return offered[0]
+    return None
+
+
+class CallbackFlowState:
+    """The bounded, forward-only state of one in-call callback negotiation."""
+
+    __slots__ = ("phase", "alternatives")
+
+    def __init__(self) -> None:
+        self.phase = CALLBACK_PHASE_AWAITING_TIME
+        self.alternatives: list[CallbackAlternative] = []
+
+
+class CallbackDecision:
+    """What the worker tells the SDK to do after one callback turn.
+
+    ``spoken`` is the line the bot must say. When ``terminal`` is True the call
+    ends with ``terminal_reason`` (``HALT_CALLBACK_SCHEDULED`` on a booking,
+    ``HALT_CANDIDATE_ENDED`` on the deferral); when False the bot speaks
+    ``spoken`` and waits for the candidate's next turn (still inside the bound).
+    """
+
+    __slots__ = ("spoken", "terminal", "terminal_reason", "booked")
+
+    def __init__(
+        self,
+        spoken: str,
+        *,
+        terminal: bool,
+        terminal_reason: str | None = None,
+        booked: bool = False,
+    ) -> None:
+        self.spoken = spoken
+        self.terminal = terminal
+        self.terminal_reason = terminal_reason
+        self.booked = booked
+
+
+def _deferral_decision() -> CallbackDecision:
+    """The PR-1 terminal fallback: acknowledge, team will reach out, end."""
+    return CallbackDecision(
+        PHONE_CALLBACK_DEFERRAL_TEXT,
+        terminal=True,
+        terminal_reason=HALT_CANDIDATE_ENDED,
+    )
+
+
+async def _propose_and_confirm(
+    client: PhoneEventClient,
+    attempt_id: str,
+    starts_at: str,
+    flow: CallbackFlowState,
+) -> CallbackDecision:
+    """Propose a resolved instant and, if valid, confirm it in the same turn.
+
+    Returns a booked decision on success; captures `slot_full` alternatives for
+    ONE alternatives round; otherwise falls back to the terminal deferral. This
+    is the only place a booking is confirmed, and it always ends the flow.
+    """
+    # Use the client's `propose_callback` DIRECTLY (not `propose_callback_turn`)
+    # so the `slot_full` alternatives on the outcome are visible here. The turn
+    # helper returns only a spoken `ScheduleTurn` and discards the alternatives.
+    proposer = getattr(client, "propose_callback", None)
+    if not callable(proposer):
+        flow.phase = CALLBACK_PHASE_DONE
+        return _deferral_decision()
+    try:
+        outcome, _proposal = await proposer(attempt_id, starts_at)
+    except Exception:  # noqa: BLE001
+        flow.phase = CALLBACK_PHASE_DONE
+        return _deferral_decision()
+    if outcome.ok and outcome.status == "proposal_valid":
+        confirm = await client.confirm_callback(attempt_id, starts_at)
+        flow.phase = CALLBACK_PHASE_DONE
+        if confirm.ok and confirm.status in {"ok", "already_confirmed"}:
+            return CallbackDecision(
+                _SCHEDULE_CONFIRMED_TEXT,
+                terminal=True,
+                terminal_reason=HALT_CALLBACK_SCHEDULED,
+                booked=True,
+            )
+        # Validated but could not be confirmed (a race, a transport failure):
+        # never claim a booking that did not happen — fall back to the deferral.
+        return _deferral_decision()
+    if outcome.status == "slot_full" and outcome.alternatives and flow.phase != CALLBACK_PHASE_AWAITING_ALT_PICK:
+        # ONE alternatives round. Record the offered set and ask the candidate to
+        # pick; the next turn is handled by the AWAITING_ALT_PICK branch.
+        flow.alternatives = outcome.alternatives
+        flow.phase = CALLBACK_PHASE_AWAITING_ALT_PICK
+        return CallbackDecision(
+            _alternatives_offer_text(outcome.alternatives), terminal=False,
+        )
+    # Any other refusal (window closed, lead too short, slot_full with no
+    # alternatives, or a slot_full reached from the alternatives round itself):
+    # do not loop, fall back to the terminal deferral.
+    flow.phase = CALLBACK_PHASE_DONE
+    return _deferral_decision()
+
+
+async def run_callback_turn(
+    flow: CallbackFlowState,
+    client: PhoneEventClient,
+    attempt_id: str,
+    candidate_text: Any,
+    now: datetime,
+) -> CallbackDecision:
+    """Advance the bounded callback flow by exactly one candidate turn.
+
+    STRUCTURALLY loop-free: each call either terminates the flow or moves it to
+    a strictly later phase, and there is no phase that can return to an earlier
+    one. A candidate who never names a valid time reaches the terminal deferral
+    within: initial parse → one clarification → deferral.
+    """
+    phase = flow.phase
+
+    if phase == CALLBACK_PHASE_AWAITING_TIME:
+        starts_at = parse_callback_time_ist(candidate_text, now)
+        if starts_at is not None:
+            return await _propose_and_confirm(client, attempt_id, starts_at, flow)
+        # Unparseable: ask ONCE for a specific time.
+        flow.phase = CALLBACK_PHASE_AWAITING_CLARIFY
+        return CallbackDecision(_CALLBACK_ASK_TIME_TEXT, terminal=False)
+
+    if phase == CALLBACK_PHASE_AWAITING_CLARIFY:
+        starts_at = parse_callback_time_ist(candidate_text, now)
+        if starts_at is not None:
+            return await _propose_and_confirm(client, attempt_id, starts_at, flow)
+        # Still unparseable after the one clarification: terminal deferral.
+        flow.phase = CALLBACK_PHASE_DONE
+        return _deferral_decision()
+
+    if phase == CALLBACK_PHASE_AWAITING_ALT_PICK:
+        picked = _match_alternative(candidate_text, flow.alternatives)
+        if picked is not None:
+            return await _propose_and_confirm(client, attempt_id, picked.starts_at, flow)
+        # No clear pick from the offered slots: terminal deferral. ONE round only.
+        flow.phase = CALLBACK_PHASE_DONE
+        return _deferral_decision()
+
+    # CALLBACK_PHASE_DONE or any unexpected phase: the flow is over. Anything
+    # further is deferred rather than looped.
+    flow.phase = CALLBACK_PHASE_DONE
+    return _deferral_decision()
 
 
 # ── LLM tool binding ──────────────────────────────────────────────────

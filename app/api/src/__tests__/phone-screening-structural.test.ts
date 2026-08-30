@@ -379,6 +379,15 @@ describe('2. no provider, no dialing, no network, no Ashby mutation', () => {
       // P-1 role admission uses the same pure question contract so malformed
       // candidate-facing templates cannot be written.
       'schemas/roles.ts',
+      // Post-call callback backstop. The assessment scorer, when the candidate
+      // asked to be called back, books a `system_deferral` appointment through
+      // the PURE `scheduleAppointment` write (and reads a live appointment to
+      // stay idempotent) — exactly like the route handlers above, never
+      // re-implementing a transition. It is request-scoped (it runs once per
+      // completed session, off the call-complete handler); it is NOT a worker,
+      // timer, scheduler, or dialer, so the module's "nothing here dials/loops"
+      // posture is preserved.
+      'services/assessment.ts',
     ]);
     const seen = new Set<string>();
     for (const file of allSourceFiles(SRC_DIR)) {
