@@ -21,6 +21,7 @@ import asyncio
 import inspect
 import json
 import os
+import re
 import sys
 import types
 import unittest
@@ -5413,24 +5414,30 @@ class TestCall24Regressions(unittest.TestCase):
         self.assertIn("code", spoken)
 
     def test_tts_node_early_flushes_first_fragment_before_full_text(self):
-        """PR-2 change 1 non-vacuity: the first speakable SEGMENT is closed and
-        handed to the downstream TTS (flushed) BEFORE the whole multi-sentence
-        text stream has been consumed.
+        """PR-2 change 1 non-vacuity (revised, call 28): the FIRST speakable
+        clause is closed and handed to the downstream TTS (flushed) BEFORE the
+        whole multi-sentence text stream has been consumed, AND the whole rest
+        of the reply goes as exactly ONE further synth call — so EXACTLY TWO
+        downstream ``tts_node`` calls per turn, never N (the over-fragmentation
+        call 28 exposed).
 
         THE MECHANISM this defends: the SDK default drives ONE ``tts_node`` call
         for the entire reply, so Sarvam's internal sentence tokenizer buffers
-        until a full sentence exists. The phone lane instead opens a NEW
-        downstream segment per early fragment and CLOSES it (its input stream
-        ends → the SDK's ``end_input`` flushes Sarvam) the moment a clause
-        boundary is hit. So the test records, per downstream segment, how much
-        of the SOURCE had been consumed when that segment's input ENDED, and the
-        FIRST segment must end while the source is not yet drained.
+        until a full sentence exists. The phone lane instead flushes the first
+        clause as its own segment (its input stream ends → the SDK's
+        ``end_input`` flushes Sarvam) the moment a clause boundary is hit, then
+        streams the ENTIRE REMAINDER as one further segment. So the test records,
+        per downstream segment, how much of the SOURCE had been consumed when
+        that segment's input ENDED: the FIRST segment must end while the source
+        is not yet drained, and there must be exactly TWO segments total.
 
-        CONTROL — this FAILS against the pre-change behavior: with early-flush
-        OFF (``PHONE_TTS_FLUSH_MIN_CHARS=0`` → per-chunk passthrough, exactly
-        the old ``super().tts_node(_cleaned())`` single-call shape) there is only
-        ONE downstream segment and it closes only after the WHOLE stream is
-        consumed — see the companion assertion below.
+        CONTROL — this FAILS against the pre-change per-fragment loop (which
+        opened N segments, one per fragment) AND against the pre-#191 single-call
+        shape (one segment). With early-flush OFF
+        (``PHONE_TTS_FLUSH_MIN_CHARS=0`` → per-chunk passthrough, exactly the old
+        ``super().tts_node(_cleaned())`` single-call shape) there is only ONE
+        downstream segment that closes only after the WHOLE stream is consumed —
+        see the companion assertion below.
         """
         yielded = {"count": 0}
         # (consumed-at-open, consumed-at-close) for each downstream segment.
@@ -5479,8 +5486,14 @@ class TestCall24Regressions(unittest.TestCase):
         # The full text still comes through, in order, uncorrupted (ignoring the
         # inter-segment whitespace the re-chunker may collapse).
         self.assertEqual(spoken.replace(" ", ""), "".join(source_chunks).replace(" ", ""))
-        # More than one downstream segment: the reply was flushed in pieces.
-        self.assertGreater(len(segment_spans), 1)
+        # EXACTLY TWO downstream segments: first clause early, whole rest as ONE
+        # further synth call. NOT N (the per-fragment loop this replaces) and NOT
+        # one (the pre-#191 single call). This is the anti-over-fragmentation
+        # guarantee (at most 2 synths per turn).
+        self.assertEqual(
+            len(segment_spans), 2,
+            msg="first clause early + whole remainder as one → exactly 2 synths",
+        )
         # THE NON-VACUITY ASSERTION: the FIRST segment closed (flushed) while the
         # source stream was NOT yet fully consumed.
         first_open, first_close = segment_spans[0]
@@ -5488,8 +5501,17 @@ class TestCall24Regressions(unittest.TestCase):
             first_close, len(source_chunks),
             msg="first segment must flush before the whole stream is read",
         )
-        # Tighter: the first clause is the comma inside chunk 1.
-        self.assertEqual(first_close, 1)
+        # Tighter: the first clause flushes near the very front of the stream.
+        # The comma is inside chunk 1; the remainder-lead fold then does a
+        # BOUNDED PEEK into the remainder to prove its lead carries a letter
+        # (here the next char after the space is "l" in chunk 2), so the first
+        # segment may close at chunk 1 or 2 — never later. That bounded peek is
+        # the latency contract: at most the first word of the remainder, not the
+        # whole stream. Assert the invariant (front-of-stream), not a brittle
+        # exact index the fold legitimately shifts by one word.
+        self.assertLessEqual(first_close, 2)
+        # And the SECOND (final) segment drains the rest of the stream.
+        self.assertEqual(segment_spans[1][1], len(source_chunks))
 
     def test_tts_node_early_flush_control_single_segment_when_disabled(self):
         """CONTROL for the non-vacuity test: with early-flush OFF the phone lane
@@ -5572,6 +5594,276 @@ class TestCall24Regressions(unittest.TestCase):
         self.assertIn("there", spoken)
         self.assertIn("code", spoken)
         self.assertIn("more", spoken)
+
+    def test_tts_node_early_flush_alpha_guard_never_emits_letter_free_fragment(self):
+        """PR-2 change 1 alpha-guard (call 28: 36 Sarvam ``400: Text must contain
+        at least one character from the alphabet``): when the FIRST clause
+        boundary follows only digits/punctuation, that letter-free run must NOT
+        be flushed as its own segment — it merges FORWARD into the first clause
+        that actually carries a letter. Every downstream text stream the phone
+        lane opens must contain at least one alphabetic character.
+        """
+        # The first comma follows only digits ("2019,") — a letter-free first
+        # fragment that Sarvam would reject 400. It must merge forward into the
+        # next clause that has a letter.
+        source_chunks = [
+            "2019, ",                 # letter-free boundary — must NOT flush alone
+            "I have five ",
+            "years of ",
+            "experience. ",
+            "What about you?",
+        ]
+        # Each downstream segment's full concatenated input text.
+        segment_texts: list[str] = []
+
+        class BaseAgent:
+            def __init__(self, instructions=""):
+                self.instructions = instructions
+
+            async def tts_node(self, text, model_settings):
+                buf = []
+                async for chunk in text:
+                    buf.append(chunk)
+                    yield chunk
+                segment_texts.append("".join(buf))
+
+        agent = phone.phone_agent_class(BaseAgent)(
+            "sys", client=FakeEventClient(), attempt_id=_ATTEMPT_ID, say=AsyncMock(),
+            on_user_turn=lambda *a, **k: None, native_turns=True,
+        )
+
+        async def _src():
+            for chunk in source_chunks:
+                yield chunk
+
+        async def run():
+            out = []
+            async for frame in agent.tts_node(_src(), None):
+                out.append(frame)
+            return "".join(out)
+
+        with patch.dict(phone.os.environ, {"PHONE_TTS_FLUSH_MIN_CHARS": "40"}):
+            spoken = asyncio.run(run())
+
+        # Whole reply still comes through in order.
+        self.assertEqual(
+            spoken.replace(" ", ""), "".join(source_chunks).replace(" ", "")
+        )
+        # THE ALPHA-GUARD: no downstream stream is letter-free.
+        self.assertTrue(segment_texts, "at least one segment must be synthesized")
+        for seg in segment_texts:
+            self.assertTrue(
+                any(c.isalpha() for c in seg),
+                msg=f"letter-free text must never reach Sarvam: {seg!r}",
+            )
+        # And still at most two synth calls per turn.
+        self.assertLessEqual(len(segment_texts), 2)
+        # The first flushed clause carried the digits merged forward with a
+        # letter (so "2019" and a real word are in the SAME first segment).
+        self.assertIn("2019", segment_texts[0])
+        self.assertTrue(any(c.isalpha() for c in segment_texts[0]))
+
+    def test_tts_node_early_flush_short_reply_is_a_single_synth(self):
+        """A short reply with no clause boundary and no min_chars trip must be
+        synthesized as EXACTLY ONE downstream call — no over-fragmentation, the
+        single-call shape (matches the `not found` path).
+        """
+        segment_count = {"n": 0}
+
+        class BaseAgent:
+            def __init__(self, instructions=""):
+                self.instructions = instructions
+
+            async def tts_node(self, text, model_settings):
+                segment_count["n"] += 1
+                async for chunk in text:
+                    yield chunk
+
+        agent = phone.phone_agent_class(BaseAgent)(
+            "sys", client=FakeEventClient(), attempt_id=_ATTEMPT_ID, say=AsyncMock(),
+            on_user_turn=lambda *a, **k: None, native_turns=True,
+        )
+
+        async def _src():
+            # Short, no boundary punctuation, well under min_chars=40.
+            for chunk in ("Hi there ", "friend"):
+                yield chunk
+
+        async def run():
+            out = []
+            async for frame in agent.tts_node(_src(), None):
+                out.append(frame)
+            return "".join(out)
+
+        with patch.dict(phone.os.environ, {"PHONE_TTS_FLUSH_MIN_CHARS": "40"}):
+            spoken = asyncio.run(run())
+
+        self.assertEqual(spoken.replace(" ", ""), "Hitherefriend")
+        self.assertEqual(
+            segment_count["n"], 1,
+            msg="a short boundary-free reply is one synth, not fragmented",
+        )
+
+    # ── The letter-free-SENTENCE oracle (call 28 follow-up) ───────────
+    #
+    # THE INVARIANT (what actually causes the live 400): no text stream handed
+    # to super().tts_node may contain a letter-free "sentence", where a sentence
+    # is a maximal run ending at `.`/`!`/`?` (or the end of the stream). Sarvam's
+    # tokenizer splits each stream on those terminators and rejects any resulting
+    # sentence with no alphabetic character: `400: Text must contain at least one
+    # character from the alphabet`. The first-fragment alpha-guard covers the
+    # FIRST call only; this oracle covers BOTH calls — the exact gap that dropped
+    # "2019" on live call 28 (`"Great question, 2019."` → first="Great question,"
+    # remainder=" 2019." → 400).
+    @staticmethod
+    def _run_tts_capture_streams(source_chunks, min_chars="40"):
+        """Drive the phone tts_node over `source_chunks`, capturing the FULL text
+        of every downstream super().tts_node stream. Returns (spoken, streams).
+        """
+        streams: list[str] = []
+
+        class BaseAgent:
+            def __init__(self, instructions=""):
+                self.instructions = instructions
+
+            async def tts_node(self, text, model_settings):
+                buf = []
+                async for chunk in text:
+                    buf.append(chunk)
+                    yield chunk
+                streams.append("".join(buf))
+
+        agent = phone.phone_agent_class(BaseAgent)(
+            "sys", client=FakeEventClient(), attempt_id=_ATTEMPT_ID, say=AsyncMock(),
+            on_user_turn=lambda *a, **k: None, native_turns=True,
+        )
+
+        async def _src():
+            for chunk in source_chunks:
+                yield chunk
+
+        async def run():
+            out = []
+            async for frame in agent.tts_node(_src(), None):
+                out.append(frame)
+            return "".join(out)
+
+        with patch.dict(phone.os.environ, {"PHONE_TTS_FLUSH_MIN_CHARS": min_chars}):
+            spoken = asyncio.run(run())
+        return spoken, streams
+
+    def _assert_no_letter_free_sentence(self, streams):
+        """THE ORACLE: split each captured stream on `.!?` and assert EVERY
+        resulting sentence carries at least one alphabetic character.
+        """
+        self.assertTrue(streams, "at least one downstream stream must exist")
+        for stream in streams:
+            for sentence in re.split(r"[.!?]", stream):
+                if sentence.strip() == "":
+                    continue  # empty tail after a terminator is not a sentence
+                self.assertTrue(
+                    any(c.isalpha() for c in sentence),
+                    msg=(
+                        "a letter-free sentence would be rejected 400 by Sarvam: "
+                        f"{sentence!r} in stream {stream!r}"
+                    ),
+                )
+
+    def test_tts_node_oracle_short_letter_free_tail_not_dropped(self):
+        """Case 1 (the live call-28 defect): `"Great question, 2019."` — the
+        comma flushes `first="Great question,"` and orphans `" 2019."` (a
+        letter-free sentence) onto the remainder. Pre-fix this hands Sarvam a
+        letter-free sentence (400) AND drops "2019". The fix folds the
+        letter-free tail forward so the whole reply goes as ONE combined call.
+        """
+        spoken, streams = self._run_tts_capture_streams(["Great question, 2019."])
+        self._assert_no_letter_free_sentence(streams)
+        # "2019" must survive somewhere in the spoken output — never dropped.
+        self.assertIn("2019", spoken)
+        self.assertIn("2019", "".join(streams))
+        # Order/content preserved end to end.
+        self.assertEqual(spoken.replace(" ", ""), "Greatquestion,2019.")
+
+    def test_tts_node_oracle_number_tail_across_chunks_not_dropped(self):
+        """Case 2: the number tail arrives in a SEPARATE chunk from the clause —
+        `["I have been an engineer since ", "2019."]`. The min_chars/boundary
+        flush must not split so the trailing `"2019."` becomes a letter-free
+        remainder sentence. "2019" is spoken; no letter-free sentence anywhere.
+        """
+        spoken, streams = self._run_tts_capture_streams(
+            ["I have been an engineer since ", "2019."]
+        )
+        self._assert_no_letter_free_sentence(streams)
+        self.assertIn("2019", spoken)
+        self.assertIn("2019", "".join(streams))
+        self.assertEqual(
+            spoken.replace(" ", ""), "Ihavebeenanengineersince2019."
+        )
+
+    def test_tts_node_oracle_multi_sentence_still_early_flushes(self):
+        """Case 3: a normal multi-sentence reply with a mid-clause comma STILL
+        early-flushes the first clause (the first synth closes before the source
+        is fully drained) AND produces no letter-free sentence anywhere.
+        """
+        source_chunks = [
+            "Thanks for sharing. I worked at Acme, then moved on. What next?"
+        ]
+        # Capture, per downstream segment, how much of the SOURCE had been read
+        # when that segment's input stream ENDED (its Sarvam end_input flush).
+        yielded = {"count": 0}
+        segment_spans: list[tuple[int, int]] = []
+        stream_texts: list[str] = []
+
+        class BaseAgent:
+            def __init__(self, instructions=""):
+                self.instructions = instructions
+
+            async def tts_node(self, text, model_settings):
+                opened_at = yielded["count"]
+                buf = []
+                async for chunk in text:
+                    buf.append(chunk)
+                    yield chunk
+                stream_texts.append("".join(buf))
+                segment_spans.append((opened_at, yielded["count"]))
+
+        agent = phone.phone_agent_class(BaseAgent)(
+            "sys", client=FakeEventClient(), attempt_id=_ATTEMPT_ID, say=AsyncMock(),
+            on_user_turn=lambda *a, **k: None, native_turns=True,
+        )
+
+        async def _src():
+            for chunk in source_chunks:
+                yielded["count"] += 1
+                yield chunk
+
+        async def run():
+            out = []
+            async for frame in agent.tts_node(_src(), None):
+                out.append(frame)
+            return "".join(out)
+
+        with patch.dict(phone.os.environ, {"PHONE_TTS_FLUSH_MIN_CHARS": "40"}):
+            spoken = asyncio.run(run())
+
+        # No letter-free sentence in any downstream stream.
+        self._assert_no_letter_free_sentence(stream_texts)
+        # Content preserved end to end.
+        self.assertEqual(
+            spoken.replace(" ", ""), "".join(source_chunks).replace(" ", "")
+        )
+        # STILL early-flushes: the FIRST segment closed before the whole single
+        # source chunk was consumed is impossible to measure with one chunk, so
+        # assert instead there are TWO segments and the first is a strict PREFIX
+        # of the reply (i.e. the early flush really carved a leading clause off).
+        self.assertGreaterEqual(len(segment_spans), 2)
+        first_stream = stream_texts[0]
+        whole = "".join(source_chunks)
+        self.assertTrue(
+            len(first_stream) < len(whole),
+            msg="first synth must be a strict prefix (early flush happened)",
+        )
+        self.assertTrue(first_stream.strip().startswith("Thanks"))
 
     # ── F1: deterministic role opening ────────────────────────────────
     def test_role_opening_text_names_the_exact_role(self):

@@ -2124,6 +2124,32 @@ async def _aiter_text(text: Any) -> Any:
 #: ("Hi there!") flushes on its own. Semicolon/colon are clause pauses as well.
 _TTS_EARLY_FLUSH_PUNCT = frozenset(",.!?;:…")
 
+#: The SENTENCE terminators Sarvam's own tokenizer splits on. NARROWER than
+#: ``_TTS_EARLY_FLUSH_PUNCT`` on purpose: a comma/semicolon/colon is a clause
+#: pause the phone lane may flush at, but it does NOT end a sentence for Sarvam,
+#: so it is NOT a boundary at which a letter-free run becomes a rejectable
+#: letter-free "sentence". This set is what the remainder-lead fold uses to
+#: decide where a letter-free sentence-run ends.
+_TTS_SENTENCE_TERMINATORS = frozenset(".!?…")
+
+
+async def _leftover_then_src(leftover: str, src: Any) -> Any:
+    """Yield the remainder ONE CHARACTER AT A TIME for the letter-free-lead peek.
+
+    The remainder of a phone reply is ``leftover`` (the tail of the chunk the
+    early boundary landed in) followed by whatever chunks ``src`` has not yet
+    produced. The fold that guards the SECOND synth call against a letter-free
+    lead needs to inspect the remainder character by character and stop the
+    instant it has decided — a letter or a sentence terminator — so it is fed
+    characters, not chunks. Only as many characters as the peek actually pulls
+    are drawn from ``src``; the rest stay in ``src`` for the remainder stream.
+    """
+    for ch in leftover:
+        yield ch
+    async for chunk in src:
+        for ch in chunk:
+            yield ch
+
 
 async def _tts_early_flush_segments(text: Any, min_chars: int) -> Any:
     """Re-segment a phone TTS text stream into EARLY-FLUSH fragments.
@@ -3967,26 +3993,41 @@ def phone_agent_class(agent_base: Any) -> Any:
                character-removal translation (never a pair rewrite), so a marker
                split across two streaming chunks is still stripped.
 
-            2. EARLY-FLUSH FOR LATENCY (PR-2 change 1). ``sarvam.TTS`` streams
-               natively, so the SDK default ``tts_node`` feeds the LLM token
-               stream into ``sarvam.SynthesizeStream``, whose internal
-               ``SentenceTokenizer`` (min_ctx_len=10 / min_sentence_len=20) does
-               not release audio to the websocket until a COMPLETE ~20-char
-               first sentence exists — the measured ~2.9 s gap between
-               LLM-invoke and first audio. Here the phone lane re-segments the
-               cleaned stream into early fragments (``_tts_early_flush_segments``:
-               first clause / punctuation / ``PHONE_TTS_FLUSH_MIN_CHARS`` chars,
-               whichever first) and drives the downstream synthesis ONE FRAGMENT
-               PER SEGMENT. Each ``super().tts_node`` call ends with the SDK's
-               ``end_input``, which flushes Sarvam's tokenizer regardless of its
-               sentence threshold — so the first fragment reaches Sarvam as soon
-               as the first clause is ready, not after the whole sentence.
+            2. FIRST-FRAGMENT-ONLY EARLY-FLUSH FOR LATENCY (PR-2 change 1,
+               revised after call 28). ``sarvam.TTS`` streams natively, so the
+               SDK default ``tts_node`` feeds the LLM token stream into
+               ``sarvam.SynthesizeStream``, whose internal ``SentenceTokenizer``
+               (min_ctx_len=10 / min_sentence_len=20) does not release audio to
+               the websocket until a COMPLETE ~20-char first sentence exists —
+               the measured ~2.9 s gap between LLM-invoke and first audio.
+
+               The FIX flushes ONLY the FIRST speakable clause early: the phone
+               lane reads the stream until the first clause boundary (or
+               ``PHONE_TTS_FLUSH_MIN_CHARS`` chars) THAT ALSO CARRIES A LETTER,
+               synthesizes that first clause ALONE as one ``super().tts_node``
+               call (whose ``end_input`` flushes Sarvam's tokenizer regardless
+               of its sentence threshold → fast first audio), then hands the
+               ENTIRE REMAINDER of the reply to ONE further ``super().tts_node``
+               call so Sarvam's own sentence streaming gives natural prosody for
+               the body. So AT MOST TWO downstream synth calls per turn — never
+               the N-per-turn over-fragmentation of the original approach (call
+               28: ~4+ isolated synths → choppy prosody).
+
+               ALPHA-GUARD (call 28: 36 Sarvam ``400: Text must contain at least
+               one character from the alphabet``): a letter-free first fragment
+               (``"2019."``, ``"5,"``) is rejected by Sarvam and dropped, so the
+               first fragment is only flushed once it carries a real alphabetic
+               character — digits/punctuation before the first letter merge
+               FORWARD into the first real clause. No letter-free text is ever
+               handed downstream.
+
                ``PHONE_TTS_FLUSH_MIN_CHARS=0`` disables this (per-chunk
                passthrough → today's behavior), which is the rollback.
 
             The frames of the fragments are yielded in order, so the audio is
-            byte-identical to the SDK path apart from being split into more
-            segments (the prosody tradeoff documented on the env reader).
+            byte-identical to the SDK path apart from the first clause being
+            flushed as its own segment (the prosody tradeoff documented on the
+            env reader).
             """
             min_chars = phone_tts_flush_min_chars()
 
@@ -4006,20 +4047,175 @@ def phone_agent_class(agent_base: Any) -> Any:
                     yield frame
                 return
 
-            async def _clean_segment(fragment: str) -> Any:
-                # One markdown-stripped fragment as its own text stream. The
-                # strip runs per fragment (not per raw chunk) but is still a
-                # pure character removal, so nothing splits differently.
-                yield strip_markdown_for_speech(fragment)
+            async def _one_text(payload: str) -> Any:
+                # A single markdown-stripped text as its own one-chunk stream.
+                # The strip is a pure character removal, so nothing splits
+                # differently than a per-chunk strip would.
+                yield strip_markdown_for_speech(payload)
 
-            # EARLY-FLUSH PATH — one downstream segment per early fragment; each
-            # segment's `end_input` flushes Sarvam's tokenizer, so the first
-            # speakable clause reaches the provider as soon as it is ready.
-            async for fragment in _tts_early_flush_segments(text, min_chars):
-                result = super().tts_node(_clean_segment(fragment), model_settings)
+            async def _drive(stream: Any) -> Any:
+                # Run ONE downstream super().tts_node over `stream`, handling the
+                # awaitable-vs-async-iterable return exactly like the rollback
+                # path, and yield its frames in order. No new tasks — the two
+                # sequential calls inherit the SDK's cancellation exactly like a
+                # single call would, so interruption behavior is unchanged.
+                result = super(PhoneScreeningAgent, self).tts_node(
+                    stream, model_settings
+                )
                 if inspect.isawaitable(result):
                     result = await result
                 async for frame in result:
+                    yield frame
+
+            # FIRST-FRAGMENT-ONLY early flush. Read the source until the first
+            # clause boundary (or `min_chars`) THAT ALSO CARRIES A LETTER; that
+            # first clause is synthesized alone (fast first audio) and the whole
+            # remainder goes as ONE further call (Sarvam-native prosody).
+            src = _aiter_text(text)
+            first = ""
+            dense = 0
+            leftover = ""
+            found = False
+            async for chunk in src:
+                for idx, ch in enumerate(chunk):
+                    first += ch
+                    if not ch.isspace():
+                        dense += 1
+                    # Flush the FIRST fragment at the first clause boundary OR
+                    # min_chars, but ONLY once it carries a speakable LETTER
+                    # (alpha-guard: a letter-free first fragment like "2019."
+                    # would be rejected 400 by Sarvam). A boundary reached before
+                    # any letter keeps accumulating so digits/punct merge FORWARD
+                    # into the first real clause.
+                    if (
+                        ch in _TTS_EARLY_FLUSH_PUNCT or dense >= min_chars
+                    ) and any(c.isalpha() for c in first):
+                        leftover = chunk[idx + 1:]
+                        found = True
+                        break
+                if found:
+                    break
+
+            if not found:
+                # Whole reply consumed with no flushable fragment (short reply /
+                # no boundary / no letter). Synthesize it as ONE call — no
+                # over-fragmentation, matches the single-call shape. Only emit if
+                # it carries a letter (else nothing speakable).
+                if any(c.isalpha() for c in first):
+                    async for frame in _drive(_one_text(first)):
+                        yield frame
+                return
+
+            # FOLD A LETTER-FREE REMAINDER LEAD FORWARD (call 28 follow-up: the
+            # remainder half of the alpha-guard). Splitting `first` at the early
+            # boundary can orphan a LETTER-FREE SENTENCE onto the front of the
+            # remainder — e.g. `"Great question, 2019."` flushes `first="Great
+            # question,"` and leaves `" 2019."`, which Sarvam's sentence tokenizer
+            # reads as a complete letter-free sentence and rejects `400: Text must
+            # contain at least one character from the alphabet`, dropping "2019".
+            # The first-fragment alpha-guard above does NOT cover this — it only
+            # guards the FIRST call. So here we BOUNDED-PEEK the remainder and fold
+            # a leading letter-free sentence-run (a maximal run ending at
+            # `.`/`!`/`?`, or the end of the stream) into `first`, until the
+            # remainder either begins with a real letter or is empty. The peek is
+            # bounded: it stops the instant it sees an alphabetic char OR a
+            # sentence terminator, so first-audio is delayed by at most the first
+            # word/clause of the remainder — the latency win is preserved.
+            #
+            # ONE INVARIANT ON THE FOLD ITSELF: a letter-free run is folded
+            # backward ONLY while `first` does not already END at a sentence
+            # terminator. If the early boundary WAS a terminator (`first="Wow."`),
+            # appending `" 2019."` would make `"Wow. 2019."` — a SECOND, letter-
+            # free sentence inside the first stream, i.e. relocating the 400
+            # rather than fixing it. In that case the letter-free run is the LLM's
+            # OWN sentence (it exists in the source regardless of any split), so it
+            # stays on the remainder exactly as the single-call baseline would
+            # emit it — the fold never INTRODUCES a letter-free sentence.
+            #
+            # `pending` holds the peeked remainder chars that are NOT folded into
+            # `first`; they lead the remainder stream. `leftover_iter` still holds
+            # whatever the peek never had to read.
+            leftover_iter = _leftover_then_src(leftover, src)
+            pending = ""              # peeked-but-not-folded remainder prefix
+            run = ""                  # current in-progress remainder sentence-run
+            remainder_exhausted = True
+            # Fold only while `first`'s trailing clause is still OPEN (no sentence
+            # terminator at its end). `first.rstrip()` ignores a trailing space.
+            can_fold = (
+                not first.rstrip() or first.rstrip()[-1] not in _TTS_SENTENCE_TERMINATORS
+            )
+            async for ch in leftover_iter:
+                run += ch
+                if ch.isalpha():
+                    # A real letter in this run: the remainder lead is speakable.
+                    # Everything peeked so far (this run) stays on the remainder.
+                    pending += run
+                    run = ""
+                    remainder_exhausted = False
+                    break
+                if ch in _TTS_SENTENCE_TERMINATORS:
+                    if can_fold:
+                        # A complete LETTER-FREE sentence (e.g. "2019.") folded
+                        # into `first`'s still-open clause so it never reaches
+                        # Sarvam as its own sentence. `first` now ends at a
+                        # terminator, so no FURTHER run may fold backward — stop
+                        # folding and let the rest lead the remainder.
+                        first += run
+                        run = ""
+                        can_fold = False
+                    else:
+                        # `first` already closed a sentence: this letter-free run
+                        # is the LLM's own sentence and stays on the remainder,
+                        # exactly as the single-call baseline emits it.
+                        pending += run
+                        run = ""
+                        remainder_exhausted = False
+                        break
+                # else: a non-letter, non-terminator char (digit/space/punct) —
+                # keep accumulating the current run.
+            else:
+                # The remainder was fully drained by the peek. Whatever is left in
+                # `run` is a trailing partial with no terminator; if it carries no
+                # letter AND we may still fold, it is a letter-free tail that must
+                # be folded into `first` (never emitted alone), otherwise it stays
+                # on the remainder.
+                remainder_exhausted = True
+                if run and can_fold and not any(c.isalpha() for c in run):
+                    first += run
+                    run = ""
+                else:
+                    pending += run
+                    run = ""
+
+            # Any partial `run` from a mid-peek break belongs on the remainder.
+            pending += run
+
+            # 1) Synthesize the first speakable clause ALONE → fast first-audio.
+            #    `first` carries a letter and the fold never introduced a letter-
+            #    free sentence into it, so this call cannot hand Sarvam one.
+            async for frame in _drive(_one_text(first)):
+                yield frame
+
+            # 2) Synthesize the ENTIRE REMAINDER as ONE call → Sarvam native
+            #    streaming, smooth prosody for the body of the reply. If the whole
+            #    remainder folded into `first` (short letter-free tail like
+            #    "Great question, 2019."), there is nothing left — the reply went
+            #    out as ONE combined call, digits intact, no 400.
+            #
+            #    The remainder is `pending` (the peeked-but-not-folded prefix)
+            #    followed by whatever `leftover_iter` still holds. It MUST drain
+            #    `leftover_iter`, not `src`: the peek pulled characters out of
+            #    `src` through `leftover_iter`, so `src` has already advanced past
+            #    them and reading it directly would DROP the tail of the chunk the
+            #    peek broke inside.
+            if pending or not remainder_exhausted:
+                async def _rest() -> Any:
+                    if pending:
+                        yield strip_markdown_for_speech(pending)
+                    async for ch in leftover_iter:
+                        yield strip_markdown_for_speech(ch)
+
+                async for frame in _drive(_rest()):
                     yield frame
 
         @_tool
