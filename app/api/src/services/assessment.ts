@@ -7,6 +7,15 @@ import { buildAssessmentPrompt, formatResumeFacts } from '../lib/prompts.js';
 import { insertNotificationIntent } from '../lib/notification-intent.js';
 import type { Assessment, TranscriptTurn } from '../lib/types.js';
 import { scoringProvenance } from '../lib/model-provenance.js';
+import {
+  createPhoneStores,
+  createPhoneReadStore,
+  PHONE_SYSTEM_ACTOR,
+  PHONE_VOICE_CALLBACK_DURATION_SECONDS,
+} from '../lib/phone-screening/index.js';
+import { createLogger } from '../lib/logger.js';
+
+const assessmentLog = createLogger('assessment');
 
 // ── Scoring eligibility ─────────────────────────────────────────────────
 
@@ -93,7 +102,7 @@ async function runAssessmentImpl(
 ): Promise<Assessment & { id: string }> {
   const { data: session, error: sErr } = await supabase
     .from('call_sessions')
-    .select('id,candidate_id,owner_id,role_id,status,terminal_reason,external_call_id')
+    .select('id,candidate_id,owner_id,role_id,status,terminal_reason,external_call_id,started_at')
     .eq('id', sessionId)
     .single();
   if (sErr || !session) throw new Error(`session not found: ${sErr?.message}`);
@@ -210,6 +219,13 @@ async function runAssessmentImpl(
       candidateName: candidate?.name ?? null,
       transcript,
       resumeFacts: formatResumeFacts((candidate?.parsed as any) ?? null),
+      // Anchor for any relative callback phrase the candidate used. The phone
+      // path always has a session start; the browser path never asks for a
+      // callback, so a missing anchor there is harmless.
+      callTimestampIso:
+        typeof (session as { started_at?: unknown }).started_at === 'string'
+          ? ((session as { started_at?: string }).started_at as string)
+          : undefined,
     }),
     { model: env.deepseekScoringModel },
   );
@@ -383,7 +399,109 @@ async function runAssessmentImpl(
     stores: createWorkflowStores(supabase as never),
   });
 
+  // ── POST-CALL CALLBACK BACKSTOP ─────────────────────────────────────
+  // If the candidate asked for a callback and the in-call flow did NOT already
+  // book one (a dropped call, an unparsed time, a candidate who hung up before
+  // confirming), the scorer's extraction is our second chance to honour it.
+  //
+  // Four invariants, all enforced here:
+  //   * PHONE ONLY. The browser path never asks for a callback and must not run
+  //     any of this — its byte-identical payload is preserved above, and this
+  //     block is gated on `isPhone`.
+  //   * IDEMPOTENT. If a live appointment already exists for the engagement —
+  //     which is exactly what an in-call `confirm` produced (engagement
+  //     `scheduled`, a `scheduled`/`confirmed` row) — we skip. So an in-call
+  //     booking is never doubled.
+  //   * BEST-EFFORT. Everything is wrapped so a booking failure NEVER fails the
+  //     assessment: the scorecard is the product, the backstop is a courtesy.
+  //   * NO PII IN LOGS. Only bounded reason codes and the extracted flag.
+  if (isPhone) {
+    await bookPostCallCallbackBestEffort(sessionId, assessment).catch(() => {
+      // Unreachable — the helper never throws — but a second belt so a
+      // programming error inside it can never discard a scored assessment.
+    });
+  }
+
   return { ...assessment, id: row.id };
+}
+
+/**
+ * Book a system-deferral callback from the scorer's post-call extraction, if
+ * and only if the candidate asked for one and no live appointment already
+ * exists for the engagement. Phone-only caller. NEVER throws — every failure is
+ * logged and swallowed so scoring is never disturbed.
+ */
+async function bookPostCallCallbackBestEffort(
+  sessionId: string,
+  assessment: Assessment,
+): Promise<void> {
+  try {
+    const callback = assessment.callback;
+    if (!callback || callback.wants_callback !== true) return;
+    const requestedIso = callback.requested_at_iso;
+    if (typeof requestedIso !== 'string' || requestedIso.trim() === '') {
+      assessmentLog.info('unknown_event', { error_category: 'callback_backstop_no_time' });
+      return;
+    }
+    const startsAt = new Date(requestedIso);
+    if (Number.isNaN(startsAt.getTime())) {
+      assessmentLog.info('unknown_event', { error_category: 'callback_backstop_bad_time' });
+      return;
+    }
+
+    // Resolve the engagement from the session. `phone_engagements.session_id` is
+    // the link the dialer set; `version` gates the schedule RPC's optimistic
+    // update. Read only what the RPC needs.
+    const { data: engagement, error: eErr } = await supabase
+      .from('phone_engagements')
+      .select('id,version')
+      .eq('session_id', sessionId)
+      .maybeSingle();
+    if (eErr || !engagement?.id) {
+      assessmentLog.info('unknown_event', { error_category: 'callback_backstop_no_engagement' });
+      return;
+    }
+    const engagementId = engagement.id as string;
+
+    // IDEMPOTENCY. A live (`scheduled`/`confirmed`) appointment already booked
+    // for this engagement — the in-call confirm, or a prior backstop run — means
+    // the callback is already owned. Skip rather than double-book.
+    const readStore = createPhoneReadStore(supabase as never);
+    const existing = await readStore.getLiveAppointmentForEngagement(engagementId);
+    if (existing) {
+      assessmentLog.info('unknown_event', { error_category: 'callback_backstop_already_booked' });
+      return;
+    }
+
+    const endsAt = new Date(startsAt.getTime() + PHONE_VOICE_CALLBACK_DURATION_SECONDS * 1000);
+    const stores = createPhoneStores(supabase as never);
+    const result = await stores.scheduleAppointment({
+      engagementId,
+      startsAt,
+      endsAt,
+      source: 'system_deferral',
+      actorId: PHONE_SYSTEM_ACTOR,
+      // The version we just read. A concurrent booking that moves the version
+      // makes this a no-op (`version_conflict`), which is the safe outcome:
+      // whoever won already booked, and this backstop must not clobber it.
+      expectedVersion: (engagement.version as number | null) ?? null,
+      now: new Date(),
+    });
+    // `ok`/`ok_prereqs_pending` booked; `appointment_exists` means the RPC's own
+    // one-live guard caught a race we didn't (still success, not a failure);
+    // everything else (window_closed, slot_in_past, version_conflict, …) is a
+    // truthful refusal we simply report — the candidate's request is on record
+    // in the scorecard regardless.
+    if (result.status === 'ok' || result.status === 'ok_prereqs_pending' || result.status === 'appointment_exists') {
+      assessmentLog.info('unknown_event', { error_category: `callback_backstop_${result.status}` });
+    } else {
+      assessmentLog.warn('unknown_event', { error_category: `callback_backstop_refused_${result.status}` });
+    }
+  } catch {
+    // A read error, an RPC error, a driver hiccup — none of it may disturb the
+    // assessment. Log a bare code and move on.
+    assessmentLog.warn('unknown_event', { error_category: 'callback_backstop_error' });
+  }
 }
 
 /**
