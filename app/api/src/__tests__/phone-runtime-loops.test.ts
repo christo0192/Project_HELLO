@@ -126,6 +126,10 @@ const LOOP_KNOBS = {
   // 0071 / X5b. The crashed-session recording-finalization backstop, on the
   // EXPIRE cadence too: a dead call does not need sub-minute detection.
   'phone-recstrand': 'expireMs',
+  // 0072. The partial-finalize pass — deliver the MP3 + scorecard on a
+  // disconnect. On the EXPIRE cadence: a disconnect does not need sub-minute
+  // detection, and the reconnect grace already dominates the latency.
+  'phone-partial-finalize': 'expireMs',
 } as const satisfies Readonly<Record<string, keyof PhoneRuntimeConfig>>;
 
 const LOOP_NAMES = Object.keys(LOOP_KNOBS) as ReadonlyArray<keyof typeof LOOP_KNOBS>;
@@ -168,6 +172,7 @@ function runtimeConfig(over: Partial<PhoneRuntimeConfig> = {}): PhoneRuntimeConf
     dueLimit: 3,
     reclaimLimit: 25,
     jobLeaseSeconds: 60,
+    partialFinalizeGraceSec: 180,
     ...over,
   };
 }
@@ -200,12 +205,15 @@ interface Counters {
   strandedSweeps: number;
   /** 0071 / X5b. Crashed-session recording-finalization sweep passes. */
   recStrandedSweeps: number;
+  /** 0072. Partial-finalize sweep passes. */
+  partialFinalizeSweeps: number;
 }
 
 function counters(): Counters {
   return {
     duePasses: 0, backlogReads: 0, reclaims: 0, expires: 0, claims: [],
     sweepClaims: [], dayRolls: 0, strandedSweeps: 0, recStrandedSweeps: 0,
+    partialFinalizeSweeps: 0,
   };
 }
 
@@ -263,6 +271,13 @@ function makeStores(
     async sweepStrandedRecordings() {
       c.recStrandedSweeps += 1;
       return { status: 'ok' as const, examined: 0, finalized: 0, skipped: 0 };
+    },
+    // 0072. Same reason as the sweeps above: the loop CALLS this, so a fake
+    // missing it would leave the new loop uncovered. Returns no sessions by
+    // default, so no enqueue is driven unless a test overrides it.
+    async finalizePartialSessions() {
+      c.partialFinalizeSweeps += 1;
+      return { status: 'ok' as const, examined: 0, finalized: 0, skipped: 0, sessions: [] };
     },
     ...over,
   } as unknown as PhoneStores;
@@ -1634,14 +1649,14 @@ describe('F. M-1 — a reconcile sweep that is NOT RUNNING is not a sweep that f
     // rather than as unknown, and `sweeps_not_ok` would look clean because
     // nothing had written to it yet.
     //
-    // Six since 0071 added the crashed-session recording-finalization sweep
-    // (recstrand) to the 0045 five. Asserted as an exact set both ways, so a
+    // Seven since 0072 added the partial-finalize sweep (partialfin) to 0071's
+    // six (recstrand + the 0045 five). Asserted as an exact set both ways, so a
     // sweep added without a key here — the shape that makes an unrun sweep
     // invisible — fails rather than passes.
     const c = counters();
     const runtime = buildRuntime({ stores: makeStores(c), queue: makeEmptyQueue(c) });
     expect(Object.keys(runtime.snapshot().sweepNotOk).sort())
-      .toEqual(['dayroll', 'expire', 'reclaim', 'reconcile', 'recstrand', 'stranded']);
+      .toEqual(['dayroll', 'expire', 'partialfin', 'reclaim', 'reconcile', 'recstrand', 'stranded']);
   });
 });
 
@@ -1667,8 +1682,11 @@ describe('the day-roll and stranded sweeps run, and the claim gates them', () =>
     expect(c.dayRolls).toBeGreaterThan(0);
     expect(c.strandedSweeps).toBeGreaterThan(0);
     // Separate claim names: one sweep taking the other's claim would let a
-    // single replica silently monopolise both. 0071 adds `recstrand`.
-    expect(new Set(c.sweepClaims)).toEqual(new Set(['dayroll', 'stranded', 'recstrand']));
+    // single replica silently monopolise both. 0071 adds `recstrand`; 0072
+    // adds `partialfin`.
+    expect(new Set(c.sweepClaims)).toEqual(
+      new Set(['dayroll', 'stranded', 'recstrand', 'partialfin']),
+    );
   });
 
   it('a claim HELD BY ANOTHER replica stops the sweep from running at all', async () => {

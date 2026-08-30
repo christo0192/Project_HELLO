@@ -608,6 +608,34 @@ fi
 log 'GOV-06: Synthetic seed SQL integration tests passed.'
 
 # =====================================================================
+# 0072 partial-finalize — a candidate disconnect must ALWAYS yield a
+# scored partial + a finalizable recording. Seeds a stranded-disconnected
+# phone session (attempt terminal, ended past the grace) plus a control
+# still within grace, then proves finalize_phone_partial_sessions selects
+# only the stranded one, drives it to completed/conversation_complete
+# (the transition the 0038 recording trigger fires on), reports the right
+# coverage/disconnect_reason, and is idempotent. Assertions RAISE on any
+# violation, so ON_ERROR_STOP makes psql exit non-zero → harness fails.
+# =====================================================================
+log '0072: partial-finalize — seeding stranded + control fixture...'
+docker exec -i "$SUPABASE_DB_CONTAINER" \
+  psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+  < app/supabase/tests/phone_partial_finalize_setup.sql 2>&1 | tee -a "$RESULTS_FILE"
+if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+  log 'ERROR: 0072 partial-finalize setup failed.'
+  exit 1
+fi
+log '0072: partial-finalize — asserting selection / transition / coverage / idempotency...'
+docker exec -i "$SUPABASE_DB_CONTAINER" \
+  psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+  < app/supabase/tests/phone_partial_finalize_assert.sql 2>&1 | tee -a "$RESULTS_FILE"
+if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+  log 'ERROR: 0072 partial-finalize assertions FAILED.'
+  exit 1
+fi
+log '0072: PASS — partial-finalize selects the stranded disconnect, drives it completed, leaves the control, idempotent.'
+
+# =====================================================================
 # TST-15 rollback rehearsal — clean reset / roll-forward / restore
 # (Phase 6 lane L4). No reverse SQL exists or is invented; this proves the
 # sanctioned recovery path: the committed migration set can always be

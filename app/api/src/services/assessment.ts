@@ -33,6 +33,21 @@ export interface RunAssessmentOptions {
    * partition, because the caller does not get to decide what a session is.
    */
   readonly source?: 'browser' | 'phone';
+  /**
+   * 0072: the phone call ended before the plan completed (candidate hangup,
+   * network drop, worker crash), so this scores a PARTIAL transcript. It sets
+   * `assessments.partial = true` and records the coverage / disconnect detail
+   * in `raw`. Scoring itself is unchanged — it reads `transcript_turns`, which
+   * carry exactly the turns that were captured before the disconnect, and never
+   * depends on the recording. Absent/false means a complete screening.
+   */
+  readonly partial?: boolean;
+  /** 0072: questions covered when the call dropped (cursor). */
+  readonly covered?: number | null;
+  /** 0072: plan length; null when unresolvable (still scored). */
+  readonly total?: number | null;
+  /** 0072: `candidate_hangup` | `disconnected`. No PII. */
+  readonly disconnectReason?: string;
 }
 
 export interface AssessmentRunner {
@@ -107,10 +122,30 @@ async function runAssessmentImpl(
   // completed with the authoritative initial scoring reason. Blocks
   // failed/cancelled/expired/in_progress/created/waiting, missing/null or
   // malformed reasons, and the assessment_done repeat path.
-  if (
-    session.status !== 'completed' ||
-    session.terminal_reason !== 'conversation_complete'
-  ) {
+  const isCleanTerminal =
+    session.status === 'completed' &&
+    session.terminal_reason === 'conversation_complete';
+
+  // 0072: the WORKER-CRASH partial. When a worker crashes, 0071's 30s reclaim
+  // sets the attempt `abandoned` and drives the SESSION `expired`/`grace_timeout`
+  // (finalizing the MP3) long before the 0072 sweep's 180s grace elapses — so
+  // the sweep sees an ALREADY-terminal `expired`/`grace_timeout` session, leaves
+  // it terminal (re-transitioning `expired -> completed` is not a legal edge),
+  // and enqueues its scoring with `partial:true`. Without admitting this exact
+  // shape here the crash scorecard would DLQ against the `completed` guard and
+  // never land — the owner's hard requirement (scorecard AND MP3 on EVERY
+  // disconnect mode) would fail on the crash path. Narrow on purpose: ONLY the
+  // phone path, ONLY a caller-declared partial, ONLY the `grace_timeout` reason
+  // 0071 stamps — an ordinary `expired`/`failed`/`cancelled` session is still
+  // rejected. Scoring itself is unchanged: it reads `transcript_turns`, exactly
+  // the turns captured before the crash, and never depends on the recording.
+  const isCrashPartialTerminal =
+    isPhone &&
+    options?.partial === true &&
+    session.status === 'expired' &&
+    session.terminal_reason === 'grace_timeout';
+
+  if (!isCleanTerminal && !isCrashPartialTerminal) {
     // 0044: for the PHONE path only, an already-scored session is a SUCCESS,
     // not a refusal. Two legs racing a completion is the ordinary case a
     // reconnect creates: the winner scores and flips `terminal_reason` to
@@ -211,6 +246,27 @@ async function runAssessmentImpl(
     basePayload.source = 'phone';
   }
 
+  // 0072: a PARTIAL screening (phone disconnect). The flag is a first-class
+  // column so a recruiter query can filter partials; the coverage/reason detail
+  // rides in `raw` so no further columns are needed. Only ever set for the phone
+  // path, and only when the caller declares it partial — a complete screening is
+  // byte-identical to before. Written under a fallback so a database that has
+  // not yet applied 0072's column still scores (the flag is best-effort, the
+  // scorecard is not).
+  const isPartial = isPhone && options?.partial === true;
+  if (isPartial) {
+    const partialMeta = {
+      partial: true,
+      covered: options?.covered ?? null,
+      total: options?.total ?? null,
+      disconnect_reason: options?.disconnectReason ?? 'disconnected',
+    };
+    basePayload.partial = true;
+    // Attach to `raw` non-destructively: the full LLM object is preserved and a
+    // `partial` block is added alongside it.
+    basePayload.raw = { ...(assessment as unknown as Record<string, unknown>), partial: partialMeta };
+  }
+
   let { data: row, error: aErr } = await supabase
     .from('assessments')
     .insert(basePayload)
@@ -223,6 +279,18 @@ async function runAssessmentImpl(
   // insert fails closed (the migration is a prerequisite).
   if (aErr && /(resume_conflicts|communication|motivation)/i.test(aErr.message)) {
     const { resume_conflicts, communication, motivation, ...base } = basePayload;
+    ({ data: row, error: aErr } = await supabase
+      .from('assessments')
+      .insert(base)
+      .select()
+      .single());
+  }
+  // 0072: if the `partial` column has not been migrated yet, retry WITHOUT it.
+  // The coverage/reason detail still lands because it also rides in `raw` (a
+  // jsonb column that is always present), so a stale schema loses only the
+  // filterable boolean, never the scorecard.
+  if (aErr && /\bpartial\b/i.test(aErr.message)) {
+    const { partial, ...base } = basePayload;
     ({ data: row, error: aErr } = await supabase
       .from('assessments')
       .insert(base)
@@ -299,10 +367,11 @@ async function runAssessmentImpl(
 
   // ── Ashby completion observer ─────────────────────────────────────────
   // This is the authoritative terminal path: we only reach here after the
-  // eligibility guard above (status='completed' AND terminal_reason=
-  // 'conversation_complete') and after the assessment row is durably
-  // inserted, so a failed/cancelled/expired/in-flight session can never be
-  // parked. For an Ashby-originated session the application link becomes
+  // eligibility guard above (a clean `completed`/`conversation_complete`
+  // session, OR a 0072 worker-crash partial — `expired`/`grace_timeout` with a
+  // caller-declared `partial:true`) and after the assessment row is durably
+  // inserted, so an in-flight or arbitrarily-failed/cancelled session can never
+  // be parked. For an Ashby-originated session the application link becomes
   // `writeback_pending` — screened, awaiting manual publication, because no
   // tenant-verified Ashby result sink exists. It publishes NOTHING: no
   // scorecard write, no stage move, no auto-reject.

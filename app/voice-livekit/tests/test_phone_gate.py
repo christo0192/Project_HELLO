@@ -4407,6 +4407,193 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
         self.assertIn("judge_error", categories)
         await self._close(hooks)
 
+    async def test_timeout_env_knob_is_honored_by_the_judge_wrapper(self):
+        # The bounded reader clamps and defaults; the module constant is the
+        # patchable attribute the async wrapper actually reads.
+        self.assertEqual(phone.phone_coverage_timeout_sec.__module__, phone.__name__)
+        with patch.dict(os.environ, {"PHONE_COVERAGE_TIMEOUT_SEC": "6.5"}):
+            self.assertEqual(phone.phone_coverage_timeout_sec(), 6.5)
+        with patch.dict(os.environ, {"PHONE_COVERAGE_TIMEOUT_SEC": ""}, clear=False):
+            os.environ.pop("PHONE_COVERAGE_TIMEOUT_SEC", None)
+            self.assertEqual(phone.phone_coverage_timeout_sec(), 4.0)
+        # Out-of-range values clamp rather than pass through unbounded.
+        with patch.dict(os.environ, {"PHONE_COVERAGE_TIMEOUT_SEC": "999"}):
+            self.assertEqual(phone.phone_coverage_timeout_sec(), 30.0)
+        with patch.dict(os.environ, {"PHONE_COVERAGE_TIMEOUT_SEC": "0.01"}):
+            self.assertEqual(phone.phone_coverage_timeout_sec(), 1.0)
+
+        # The wrapper bounds a hanging inference by the (patchable) module
+        # timeout + 0.25, so pinning the attribute short forces judge_error.
+        async def hangs(_prompt):
+            await asyncio.Event().wait()
+
+        with patch.object(phone, "_PHONE_COVERAGE_PROVIDER_TIMEOUT_SEC", 0.01):
+            verdict = await phone.judge_phone_coverage(
+                question_text="Describe your recent role.",
+                assistant_reply="Walk me through your latest position.",
+                candidate_answer="An answer.",
+                resume_facts={"current_role": "Lead"}, infer=hangs,
+            )
+        self.assertEqual(verdict.category, "judge_error")
+
+    async def test_consecutive_judge_errors_caution_advance_at_the_bound(self):
+        # N-1 errors hold (no commit); the Nth error caution-advances the
+        # cursor. Default bound is 3, pinned explicitly for the assertion.
+        with patch.dict(os.environ, {"PHONE_COVERAGE_MAX_CONSEC_ERRORS": "3"}):
+            self.assertEqual(phone.phone_coverage_max_consec_errors(), 3)
+            agent, _, _, client, hooks = await self._coordinator()
+            with patch.object(
+                phone, "judge_phone_coverage", new_callable=AsyncMock,
+                return_value=phone.PhoneCoverageVerdict(False, None, "judge_error"),
+            ):
+                # First two errors: hold, cursor pinned at k1, run counts up.
+                await self._turn(hooks, "First answer.")
+                self.assertTrue(await self._drain(
+                    lambda: agent._coverage_error_run["count"] == 1,
+                ))
+                await self._turn(hooks, "Second answer.")
+                self.assertTrue(await self._drain(
+                    lambda: agent._coverage_error_run["count"] == 2,
+                ))
+                self.assertEqual(client.committed_keys, [])
+                # Third error reaches the bound -> caution-advance commits k1.
+                await self._turn(hooks, "Third answer.")
+                self.assertTrue(await self._drain(
+                    lambda: client.committed_keys == ["k1"],
+                ))
+        # The run resets after the caution-advance and it logged distinctly.
+        self.assertEqual(agent._coverage_error_run["count"], 0)
+        self.assertIn("caution_advance", [
+            c.kwargs.get("error_category")
+            for c in hooks["log"].warn.call_args_list
+            if c.kwargs.get("error_type") == "phone_coverage_judge"
+        ])
+        await self._close(hooks)
+
+    async def test_a_run_of_not_covered_model_never_caution_advances(self):
+        # A legitimate "keep probing" run must never trip the caution-advance,
+        # no matter how long it runs — the counter stays reset at zero.
+        with patch.dict(os.environ, {"PHONE_COVERAGE_MAX_CONSEC_ERRORS": "2"}):
+            agent, _, _, client, hooks = await self._coordinator()
+            with patch.object(
+                phone, "judge_phone_coverage", new_callable=AsyncMock,
+                return_value=phone.PhoneCoverageVerdict(False, None, "model"),
+            ):
+                for answer in ("One.", "Two.", "Three.", "Four."):
+                    await self._turn(hooks, answer)
+                    self.assertTrue(await self._drain(
+                        lambda: agent._coverage_reanchor["question_key"] == "k1",
+                    ))
+        # Never committed, run never advanced past zero, no caution log.
+        self.assertEqual(client.committed_keys, [])
+        self.assertEqual(agent._coverage_error_run["count"], 0)
+        self.assertNotIn("caution_advance", [
+            c.kwargs.get("error_category")
+            for c in hooks["log"].warn.call_args_list
+            if c.kwargs.get("error_type") == "phone_coverage_judge"
+        ])
+        await self._close(hooks)
+
+    async def test_a_real_verdict_between_errors_resets_the_error_run(self):
+        # covered_model between two errors resets the counter, so a subsequent
+        # single error does not carry the earlier run to the bound.
+        with patch.dict(os.environ, {"PHONE_COVERAGE_MAX_CONSEC_ERRORS": "2"}):
+            agent, _, _, client, hooks = await self._coordinator()
+            error = phone.PhoneCoverageVerdict(False, None, "judge_error")
+            covered = phone.PhoneCoverageVerdict(True, None, "model")
+            script = [error, covered, error]
+            with patch.object(
+                phone, "judge_phone_coverage", new_callable=AsyncMock,
+                side_effect=script,
+            ):
+                await self._turn(hooks, "err one")
+                self.assertTrue(await self._drain(
+                    lambda: agent._coverage_error_run["count"] == 1,
+                ))
+                hooks["latest_assistant"][0] = "What is your notice period?"
+                await self._turn(hooks, "covered")
+                self.assertTrue(await self._drain(
+                    lambda: agent._coverage_error_run["count"] == 0,
+                ))
+                await self._turn(hooks, "err two")
+                self.assertTrue(await self._drain(
+                    lambda: agent._coverage_error_run["count"] == 1,
+                ))
+        # Only the covered verdict advanced the cursor; the lone trailing error
+        # did NOT reach the bound-of-2, so no caution-advance happened.
+        self.assertEqual(client.committed_keys, ["k1"])
+        self.assertNotIn("caution_advance", [
+            c.kwargs.get("error_category")
+            for c in hooks["log"].warn.call_args_list
+            if c.kwargs.get("error_type") == "phone_coverage_judge"
+        ])
+        await self._close(hooks)
+
+    async def test_resume_missing_logs_and_does_not_skip_conflict_detection(self):
+        # resume_expected but empty evidence: log resume_missing and STILL run
+        # the model (conflict detection stays enabled), never the deterministic
+        # no-evidence shortcut.
+        log_spy = MagicMock(wraps=phone._log)
+        infer = AsyncMock(return_value=json.dumps({"covered": True, "conflict": None}))
+        with patch.object(phone, "_log", log_spy):
+            verdict = await phone.judge_phone_coverage(
+                question_text="What is your current notice period?",
+                assistant_reply="Could you share your current notice period?",
+                candidate_answer="Thirty days.",
+                resume_facts={}, resume_expected=True, infer=infer,
+            )
+        # The model was consulted (no deterministic shortcut) and the miss logged.
+        infer.assert_awaited_once()
+        self.assertNotEqual(verdict.category, "deterministic_covered")
+        self.assertIn("resume_missing", [
+            c.kwargs.get("error_category")
+            for c in log_spy.warn.call_args_list
+            if c.kwargs.get("error_type") == "phone_coverage_judge"
+        ])
+
+    async def test_legitimately_absent_resume_keeps_the_deterministic_shortcut(self):
+        # No résumé expected -> the deterministic-covered fast path is preserved
+        # and the model is NOT consulted (no resume_missing log).
+        log_spy = MagicMock(wraps=phone._log)
+        infer = AsyncMock()
+        with patch.object(phone, "_log", log_spy):
+            verdict = await phone.judge_phone_coverage(
+                question_text="What is your current notice period?",
+                assistant_reply="Could you share your current notice period?",
+                candidate_answer="Thirty days.",
+                resume_facts={}, resume_expected=False, infer=infer,
+            )
+        self.assertEqual(verdict.category, "deterministic_covered")
+        infer.assert_not_awaited()
+        self.assertNotIn("resume_missing", [
+            c.kwargs.get("error_category")
+            for c in log_spy.warn.call_args_list
+            if c.kwargs.get("error_type") == "phone_coverage_judge"
+        ])
+
+    async def test_judge_payload_always_carries_populated_resume_evidence(self):
+        # GUARD: when resume_facts is non-empty the model payload must always
+        # include a populated resume_evidence_json. Protects a future edit from
+        # silently dropping the conflict-detector fields.
+        captured: dict[str, str] = {}
+
+        async def capture(prompt):
+            captured["prompt"] = prompt
+            return json.dumps({"covered": True, "conflict": None})
+
+        await phone.judge_phone_coverage(
+            question_text="Describe your recent role.",
+            assistant_reply="Walk me through your latest position.",
+            candidate_answer="I joined last month.",
+            resume_facts={"recent_role": {"period": "2020-2026"}},
+            resume_expected=True, infer=capture,
+        )
+        payload = json.loads(captured["prompt"])
+        self.assertIn("resume_evidence_json", payload)
+        evidence = json.loads(payload["resume_evidence_json"])
+        self.assertTrue(evidence)
+        self.assertEqual(evidence["recent_role"]["period"], "2020-2026")
+
     async def test_conflict_is_injected_exactly_once_for_the_same_discrepancy(self):
         agent, _, state, client, hooks = await self._coordinator()
         state.resume_facts = {"recent_role": {"period": "2020-2026"}}

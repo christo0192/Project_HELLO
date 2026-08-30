@@ -173,6 +173,39 @@ export interface SweepPhoneStrandedRecordingsResult {
   readonly skipped?: number;
 }
 
+/**
+ * 0072 — one selected partial-finalize session. The tick enqueues scoring for
+ * every returned session INDEPENDENTLY of `transitioned`, so a session whose
+ * transition was skipped this pass (already terminal, or lost the lock) is
+ * still returned and still gets its scorecard.
+ */
+export interface PhonePartialFinalizeSession {
+  readonly sessionId: string;
+  readonly attemptId: string | null;
+  /** Questions covered = `call_sessions.current_question_index`. */
+  readonly covered: number | null;
+  /** Plan length; `null` when the plan row is unresolvable (still score). */
+  readonly total: number | null;
+  readonly disconnectReason: string;
+  /** Whether THIS pass drove the session `in_progress -> completed`. */
+  readonly transitioned: boolean;
+  /** Whether a phone assessment already exists (enqueue is then a no-op). */
+  readonly assessmentPresent: boolean;
+  /** Whether the session already carries a finalized recording object key. */
+  readonly recordingPresent: boolean;
+}
+
+/** 0072 — the server-side partial-finalize sweep. */
+export interface FinalizePhonePartialSessionsResult {
+  readonly status: OrUnknown<'ok'>;
+  readonly examined?: number;
+  /** Sessions driven `in_progress -> completed` on this pass. */
+  readonly finalized?: number;
+  readonly skipped?: number;
+  /** Every SELECTED session, whether or not it transitioned this pass. */
+  readonly sessions: readonly PhonePartialFinalizeSession[];
+}
+
 /** 0071 / X4 — the per-item phone transcript writer. */
 export interface CommitPhoneItemTurnResult {
   readonly status: OrUnknown<
@@ -663,6 +696,19 @@ export interface PhoneStores {
     readonly now: Date;
     readonly graceSeconds?: number;
   }): Promise<SweepPhoneStrandedRecordingsResult>;
+
+  /**
+   * 0072. Selects phone sessions that ended non-terminally past a SHORT
+   * reconnect grace, drives each to completed/conversation_complete (firing the
+   * 0038 finalize trigger + attempt-MP3 promotion), and RETURNS the coverage /
+   * attempt facts so the runtime tick can enqueue PARTIAL scoring independently.
+   * Optional so legacy test doubles need not implement it.
+   */
+  finalizePartialSessions?(input: {
+    readonly limit?: number;
+    readonly now: Date;
+    readonly graceSeconds?: number;
+  }): Promise<FinalizePhonePartialSessionsResult>;
 
   /** 0045. Bounded leader CLAIM — not an election. See the migration. */
   claimSweep(input: {

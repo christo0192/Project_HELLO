@@ -101,6 +101,8 @@ import type {
   SweepPhoneDayRolledResult,
   SweepPhoneStrandedSessionsResult,
   SweepPhoneStrandedRecordingsResult,
+  FinalizePhonePartialSessionsResult,
+  PhonePartialFinalizeSession,
   CommitPhoneItemTurnResult,
   ClaimPhoneSweepResult,
 } from './ports.js';
@@ -491,6 +493,52 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
         examined: num(row, 'examined'),
         finalized: num(row, 'finalized'),
         skipped: num(row, 'skipped'),
+      };
+    },
+
+    async finalizePartialSessions(input): Promise<FinalizePhonePartialSessionsResult> {
+      const { data, error } = await client.rpc('finalize_phone_partial_sessions', {
+        p_limit: input.limit ?? 25,
+        // `?? null` sends an explicit null the RPC coalesces to its own
+        // default (180s), keeping the arg-name contract while letting the
+        // caller override with the env-derived grace.
+        p_grace_seconds: input.graceSeconds ?? null,
+        p_now: isoInstant(input.now),
+      });
+      if (error) throw new Error('phone_finalize_partial_sessions_error');
+      const row = asRow(data);
+      // The `sessions` array carries one object per SELECTED session. Each is
+      // parsed field by field — a malformed entry is dropped rather than
+      // forwarded, and a session with no valid id is unusable so it is dropped
+      // whole (the caller cannot enqueue scoring without a session id).
+      const rawSessions = row?.sessions;
+      const sessions: PhonePartialFinalizeSession[] = Array.isArray(rawSessions)
+        ? rawSessions
+            .map((entry): PhonePartialFinalizeSession | null => {
+              const e = asRow(entry);
+              const sessionId = str(e, 'session_id');
+              if (sessionId === undefined) return null;
+              const total = num(e, 'total');
+              const covered = num(e, 'covered');
+              return {
+                sessionId,
+                attemptId: str(e, 'attempt_id') ?? null,
+                covered: covered ?? null,
+                total: total ?? null,
+                disconnectReason: str(e, 'disconnect_reason') ?? 'disconnected',
+                transitioned: bool(e, 'transitioned') ?? false,
+                assessmentPresent: bool(e, 'assessment_present') ?? false,
+                recordingPresent: bool(e, 'recording_present') ?? false,
+              };
+            })
+            .filter((s): s is PhonePartialFinalizeSession => s !== null)
+        : [];
+      return {
+        status: narrowPhoneRpcStatus<'ok'>('finalize_phone_partial_sessions', row),
+        examined: num(row, 'examined'),
+        finalized: num(row, 'finalized'),
+        skipped: num(row, 'skipped'),
+        sessions,
       };
     },
 

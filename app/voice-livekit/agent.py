@@ -1290,6 +1290,13 @@ async def _run_native_phone_screening(
     coverage_reanchor: dict[str, str | None] = {"question_key": None}
     pending_conflict: dict[str, Any] = {"value": None}
     asked_conflicts: set[str] = set()
+    # A run of judge_ERRORS (breaker-open storm) is silent: every error leaves
+    # the cursor pinned, so the topic stalls and the candidate hangs up. Count
+    # ONLY consecutive judge_error verdicts; ANY real verdict (covered_model or
+    # not_covered_model) resets it. Once the run reaches the bound, advance past
+    # the stalled topic with caution rather than hold forever. A legitimate run
+    # of not_covered_model ("keep probing") must NEVER trip this — it resets.
+    coverage_error_run: dict[str, int] = {"count": 0}
 
     async def wait_for_activity(timeout: float) -> str:
         """Wait on LiveKit activity or close without creating a turn queue."""
@@ -1929,6 +1936,9 @@ async def _run_native_phone_screening(
                     assistant_reply=prompt,
                     candidate_answer=candidate,
                     resume_facts=_compact_phone_resume_evidence(state.resume_facts),
+                    # The candidate genuinely has résumé facts on the state, so
+                    # empty compacted evidence means it was dropped, not absent.
+                    resume_expected=bool(state.resume_facts),
                 )
 
             source_category = verdict.category if verdict.category in {
@@ -1953,6 +1963,15 @@ async def _run_native_phone_screening(
                 error_category=log_category,
             )
 
+            # Track ONLY a run of judge_ERRORS. Any real verdict (a model or
+            # deterministic covered/not-covered) is the judge working, so it
+            # resets the run — a legitimate string of not_covered_model ("keep
+            # probing") therefore never trips the caution-advance below.
+            if source_category == "judge_error":
+                coverage_error_run["count"] += 1
+            else:
+                coverage_error_run["count"] = 0
+
             conflict = verdict.conflict
             if isinstance(conflict, dict):
                 key = phone.phone_conflict_key(conflict)
@@ -1969,6 +1988,19 @@ async def _run_native_phone_screening(
                     )
 
             if not verdict.covered:
+                # Advance-with-caution: a run of judge_ERRORS (not a run of
+                # legitimate not_covered_model — that resets the counter above)
+                # has pinned the cursor long enough to stall the topic. Rather
+                # than hold forever and let the candidate hang up, advance past
+                # the stalled topic and reset the run. Distinct bounded log.
+                if coverage_error_run["count"] >= phone.phone_coverage_max_consec_errors():
+                    coverage_error_run["count"] = 0
+                    _log.warn(
+                        "unknown_event", error_type="phone_coverage_judge",
+                        error_category="caution_advance",
+                    )
+                    await apply_background_advance(boundary)
+                    return
                 if isinstance(question, phone.PhonePlanQuestion):
                     coverage_reanchor["question_key"] = question.key
                 # Fail toward re-asking. No cursor write, and no terminal halt:
@@ -2007,6 +2039,7 @@ async def _run_native_phone_screening(
     setattr(agent, "_coverage_reanchor", coverage_reanchor)
     setattr(agent, "_pending_conflict", pending_conflict)
     setattr(agent, "_asked_conflicts", asked_conflicts)
+    setattr(agent, "_coverage_error_run", coverage_error_run)
     setattr(agent, "_native_turns", True)
     authorize = getattr(agent, "authorize_screening", None)
     if not callable(authorize):

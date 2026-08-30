@@ -91,6 +91,7 @@ import { env } from '../env.js';
 import {
   PHONE_DIAL_QUEUE,
   PHONE_ASSESSMENT_QUEUE,
+  phoneAssessmentDedupKey,
   describePhoneRuntimeConfig,
   loadPhoneRuntimeConfig,
   type PhoneRuntimeConfig,
@@ -137,6 +138,14 @@ export interface PhoneRuntimeSnapshot {
    * so a crashed call's recording could finalize. Distinct from lastStranded.
    */
   readonly lastRecStranded: number | null;
+  /**
+   * 0072. Sessions the last partial-finalize pass drove `in_progress ->
+   * completed` (candidate hangup / network drop / worker crash), each of which
+   * fired the MP3 promotion and had partial scoring enqueued. Distinct from
+   * lastRecStranded: this selects on the session being ENDED, drives to
+   * `completed` (not `expired`), and enqueues a scorecard.
+   */
+  readonly lastPartialFinalized: number | null;
   /**
    * Sweeps whose LAST run answered with a non-`ok` RPC status, by name.
    *
@@ -353,7 +362,7 @@ export function createPhoneRuntime(
   // not happen" must reach the health surface as different answers.
   const sweepNotOk: Record<string, boolean> = {
     reclaim: false, expire: false, reconcile: false, dayroll: false, stranded: false,
-    recstrand: false,
+    recstrand: false, partialfin: false,
   };
   let lastRolled: number | null = null;
   let lastStranded: number | null = null;
@@ -361,6 +370,9 @@ export function createPhoneRuntime(
   // finalize. Kept apart from `stranded` (0045), which resolves the opposite
   // shape — an engagement pointing at an already-terminal session.
   let lastRecStranded: number | null = null;
+  // 0072: sessions partial-finalized (ended non-terminally, driven to
+  // `completed`, MP3 promoted + partial scoring enqueued) by the last pass.
+  let lastPartialFinalized: number | null = null;
 
   /**
    * The bounded leader CLAIM in front of a fleet-wide sweep.
@@ -422,6 +434,7 @@ export function createPhoneRuntime(
     if (sweep === 'dayroll') lastRolled = null;
     if (sweep === 'stranded') lastStranded = null;
     if (sweep === 'recstrand') lastRecStranded = null;
+    if (sweep === 'partialfin') lastPartialFinalized = null;
     if (sweep === 'reconcile') lastReconciled = null;
     return false;
   };
@@ -761,6 +774,98 @@ export function createPhoneRuntime(
       },
     },
     {
+      name: 'phone-partial-finalize',
+      intervalMs: runtimeConfig.expireMs,
+      tick: async () => {
+        // ── 0072: DELIVER THE MP3 AND THE SCORECARD ON A DISCONNECT ─────
+        // A candidate hangup / network drop / worker crash returns the voice
+        // worker's non-terminal `disconnect` branch, leaving the session
+        // `in_progress` forever. The 0038 trigger + 0071 sweep only fire on a
+        // terminal status, and 0071 drives to `expired` after ~2h and NEVER
+        // enqueues scoring — so today a disconnect produces neither MP3 nor
+        // scorecard. This pass closes the gap with a SHORT reconnect grace
+        // (default 180s, far below 0071's 7200s, so it wins the race).
+        //
+        // The RPC selects the ended-but-not-terminal sessions, drives each to
+        // `completed`/`conversation_complete` (firing the MP3 promotion in its
+        // own transaction), and RETURNS the coverage/attempt facts. This tick
+        // then enqueues PARTIAL scoring per returned session — INDEPENDENTLY of
+        // whether the transition landed on this pass, because a session whose
+        // transition was skipped is still returned. The scorer reads
+        // `transcript_turns` only; it never depends on the recording. So the two
+        // guarantees hold separately: the MP3 comes from the trigger, the
+        // scorecard from the queue, and neither blocks the other.
+        //
+        // Idempotent: re-running is safe (the transition is a no-op once
+        // terminal, and the assessment dedup key makes a redundant enqueue a
+        // no-op). Rides the same bounded leader CLAIM as the other sweeps, on
+        // the EXPIRE cadence — a disconnect does not need sub-minute detection,
+        // and the grace already dominates the latency.
+        // M-7: `theirs` holds, `broken`/non-`ok` backs off.
+        const verdict = await claimed('partialfin');
+        if (!applyClaim('partialfin', verdict)) {
+          return verdict === 'theirs' ? HOLD_BASE_CADENCE : ALLOW_IDLE_BACKOFF;
+        }
+        const finalize = stores.finalizePartialSessions;
+        if (typeof finalize !== 'function') {
+          // A store double without the method: publish a truthful null and
+          // idle-back-off rather than throw on a tick no test happens to drive.
+          lastPartialFinalized = null;
+          return ALLOW_IDLE_BACKOFF;
+        }
+        const resolved = await finalize({
+          limit: runtimeConfig.reclaimLimit,
+          graceSeconds: runtimeConfig.partialFinalizeGraceSec,
+          now: new Date(),
+        });
+        sweepNotOk.partialfin = resolved.status !== 'ok';
+        if (resolved.status !== 'ok') {
+          lastPartialFinalized = null;
+          return ALLOW_IDLE_BACKOFF;
+        }
+        // Enqueue partial scoring for EVERY selected session, each in its own
+        // try/catch so one enqueue failing never denies another session its
+        // scorecard — and never denies the MP3, which the RPC already fired. An
+        // enqueue that throws is retried on the next pass (the RPC re-selects
+        // the same session until it carries an assessment).
+        for (const s of resolved.sessions) {
+          try {
+            await queue.enqueue(
+              PHONE_ASSESSMENT_QUEUE,
+              {
+                session_id: s.sessionId,
+                attempt_id: s.attemptId,
+                partial: true,
+                covered: s.covered,
+                total: s.total,
+                disconnect_reason: s.disconnectReason,
+              },
+              { dedupKey: phoneAssessmentDedupKey(s.sessionId), maxAttempts: 5 },
+            );
+          } catch {
+            // Best-effort: the next pass re-selects and re-enqueues. Do not let
+            // one session's enqueue failure abort the loop for the others.
+          }
+          // Bounded, PII-free structured line. The logger allowlist carries
+          // only `error_category`/`error_type` for this event, so coverage and
+          // the two already-present signals are encoded into a single bounded,
+          // SAFE_IDENT-shaped composite category (max 64 chars, no PII): e.g.
+          // `phone_partial_finalize:c3:t5:mp3.1:sc.0`. `error_type` carries the
+          // disconnect reason. No transcript, no candidate data, no session id.
+          const cov = s.covered ?? -1;
+          const tot = s.total ?? -1;
+          logger.info('unknown_event', {
+            error_category:
+              `phone_partial_finalize:c${cov}:t${tot}` +
+              `:mp3.${s.recordingPresent ? 1 : 0}:sc.${s.assessmentPresent ? 1 : 0}`,
+            error_type: s.disconnectReason,
+          });
+        }
+        lastPartialFinalized = resolved.finalized ?? 0;
+        return HOLD_BASE_CADENCE;
+      },
+    },
+    {
       name: 'phone-reconcile',
       intervalMs: runtimeConfig.reconcileMs,
       tick: async () => {
@@ -839,6 +944,7 @@ export function createPhoneRuntime(
       lastRolled,
       lastStranded,
       lastRecStranded,
+      lastPartialFinalized,
       sweepNotOk: { ...sweepNotOk },
     }),
     async tickAll(): Promise<void> {
