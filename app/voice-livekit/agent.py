@@ -110,6 +110,15 @@ def _float_env(name: str, default: float) -> float:
 CANDIDATE_SILENCE_PROMPT_SEC = _float_env("CANDIDATE_SILENCE_PROMPT_SEC", 30.0)
 CANDIDATE_SILENCE_END_SEC = _float_env("CANDIDATE_SILENCE_END_SEC", 20.0)
 PHONE_TERMINAL_REPLY_TIMEOUT_SEC = _float_env("PHONE_TERMINAL_REPLY_TIMEOUT_SEC", 10.0)
+# RECONNECT-B: the BACKGROUND boundary commit must not wait the full terminal
+# reply timeout on `assistant_delivery_complete`. That event is unreliable and
+# routinely times out the full 10s (`delivery_timeout_commit_anyway`); a restart
+# in that window loses the cursor advance while keeping the persisted answer, so
+# resume re-asks the answered question. The wait is BEST-EFFORT, not a
+# correctness fence (the boundary `source_event_id` is fully determined at
+# answer-receipt and the commit is idempotent), so bound it to a tiny window and
+# let the judge + commit run essentially immediately on the captured answer.
+PHONE_JUDGE_COMMIT_DELIVERY_WAIT_SEC = 0.25
 
 
 def _bounded_float_env(name: str, default: float, lo: float, hi: float) -> float:
@@ -1873,11 +1882,17 @@ async def _run_native_phone_screening(
         committed keys the scorer aligns on are produced — just off the speech
         path.
 
-        The delivery wait is BEST-EFFORT, not a correctness fence.
-        `assistant_delivery_complete` is a session-lifetime event that may still
-        be set from the PREVIOUS reply when this task starts, so the wait can
-        return immediately and the commit can land before the current reply
-        finishes playing. That is harmless: the boundary is the candidate's
+        The delivery wait is BEST-EFFORT, not a correctness fence, and is
+        bounded to a tiny window (`PHONE_JUDGE_COMMIT_DELIVERY_WAIT_SEC`) rather
+        than the full terminal reply timeout (RECONNECT-B): the boundary is
+        fully determined at answer-receipt, so blocking the commit on an
+        unreliable delivery signal only risked losing the cursor advance across
+        a restart while keeping the persisted answer, making resume re-ask the
+        answered question. `assistant_delivery_complete` is a session-lifetime
+        event that may still be set from the PREVIOUS reply when this task
+        starts, so the wait can return immediately and the commit can land
+        before the current reply finishes playing. That is harmless: the
+        boundary is the candidate's
         ALREADY-CAPTURED answer, the model's reply does not depend on the commit
         (toolless strips the coordinator tools and the per-turn instruction is
         already injected), and the commit is idempotent on `source_event_id`. The
@@ -1919,9 +1934,15 @@ async def _run_native_phone_screening(
             )
             return
         try:
+            # RECONNECT-B: bound the BEST-EFFORT delivery wait to a tiny window
+            # instead of the full terminal reply timeout, so the judge + commit
+            # run essentially immediately on the already-captured answer. A
+            # restart no longer loses the cursor advance for ~10s while the
+            # persisted answer survives (which caused resume to re-ask the
+            # answered question). The boundary is idempotent on `source_event_id`.
             await asyncio.wait_for(
                 assistant_delivery_complete.wait(),
-                timeout=PHONE_TERMINAL_REPLY_TIMEOUT_SEC,
+                timeout=PHONE_JUDGE_COMMIT_DELIVERY_WAIT_SEC,
             )
         except asyncio.TimeoutError:
             # The reply never signalled delivery. The boundary is about the
