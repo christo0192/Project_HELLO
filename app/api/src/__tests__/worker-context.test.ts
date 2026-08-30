@@ -128,3 +128,28 @@ describe('resolveWorkerContext', () => {
     }
   });
 });
+
+// ── The route-schema regression that silenced call 26 (2026-08-30) ──────
+// The LIB understood phone rooms (PR #186's evidence projection) but the
+// ROUTE schema admitted only `screening-<uuid>`, so every PHONE worker
+// context lookup 400'd at validation, the worker mapped the failure to
+// context_not_found, failed closed pre-connect, and the candidate answered
+// to dead silence. The schema is the seam these tests must pin.
+import { workerContextSchema } from '../schemas/livekit.js';
+
+describe('workerContextSchema room_name admits BOTH lanes', () => {
+  const sid = '90dd3699-6426-4aab-a716-3528b7388649';
+
+  it('accepts a browser room (screening-<uuid>)', () => {
+    expect(workerContextSchema.safeParse({ session_id: sid, room_name: `screening-${sid}` }).success).toBe(true);
+  });
+
+  it('accepts a phone room (phone-<uuid>) — the call-26 silence regression', () => {
+    expect(workerContextSchema.safeParse({ session_id: sid, room_name: `phone-${sid}` }).success).toBe(true);
+  });
+
+  it('still rejects arbitrary prefixes and free-form names', () => {
+    expect(workerContextSchema.safeParse({ session_id: sid, room_name: `canary-${sid}` }).success).toBe(false);
+    expect(workerContextSchema.safeParse({ session_id: sid, room_name: 'phone-not-a-uuid' }).success).toBe(false);
+  });
+});

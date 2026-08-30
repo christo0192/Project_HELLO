@@ -24,7 +24,13 @@ export const livekitRecordingBodySchema = z.object({}).strict();
 export const workerContextSchema = z
   .object({
     session_id: z.string().uuid('session_id must be a valid UUID'),
-    room_name: z.string().regex(/^screening-[0-9a-f-]{36}$/i).max(64),
+    // Browser rooms are `screening-<uuid>`; phone rooms are `phone-<uuid>`.
+    // PR #186 made the PHONE worker resolve its prompt context through this
+    // route, but the schema still admitted only browser rooms — every phone
+    // lookup 400'd at validation, the worker mapped it to context_not_found
+    // and failed closed, and the candidate answered to dead silence
+    // (2026-08-30, call 26). Both shapes are exact: a prefix and one UUID.
+    room_name: z.string().regex(/^(screening|phone)-[0-9a-f-]{36}$/i).max(64),
   })
   .strict();
 
