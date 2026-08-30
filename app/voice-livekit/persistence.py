@@ -738,9 +738,13 @@ _ERR_CONTEXT_API_ERROR = "context_api_error"
 
 
 class WorkerContext:
-    """Minimal server-side worker context — no PII, no resume data."""
+    """Server-verified prompt context with phone-only allowlisted resume evidence.
 
-    __slots__ = ("session_id", "candidate_id", "role_id", "candidate_name", "room_name", "status", "role_title", "role_focus", "role_required_skills", "screening_template", "interviewer_instructions")
+    Contact fields and raw resume text are never present. Browser callers receive
+    an empty ``candidate_evidence`` mapping from the API.
+    """
+
+    __slots__ = ("session_id", "candidate_id", "role_id", "candidate_name", "room_name", "status", "role_title", "role_focus", "role_required_skills", "screening_template", "interviewer_instructions", "candidate_evidence")
 
     def __init__(
         self,
@@ -755,6 +759,7 @@ class WorkerContext:
         role_required_skills: list[str] | None = None,
         screening_template: list[dict[str, Any]] | None = None,
         interviewer_instructions: str = "",
+        candidate_evidence: dict[str, Any] | None = None,
     ) -> None:
         self.session_id = session_id
         self.candidate_id = candidate_id
@@ -767,6 +772,7 @@ class WorkerContext:
         self.role_required_skills = role_required_skills or []
         self.screening_template = screening_template or []
         self.interviewer_instructions = interviewer_instructions
+        self.candidate_evidence = candidate_evidence or {}
 
 
 def parse_worker_context(data: dict) -> WorkerContext:
@@ -783,6 +789,10 @@ def parse_worker_context(data: dict) -> WorkerContext:
         role_required_skills=data.get("role_required_skills"),
         screening_template=data.get("screening_template"),
         interviewer_instructions=str(data.get("interviewer_instructions", "")),
+        candidate_evidence=(
+            data.get("candidate_evidence")
+            if isinstance(data.get("candidate_evidence"), dict) else {}
+        ),
     )
 
 

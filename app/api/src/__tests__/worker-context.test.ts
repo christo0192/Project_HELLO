@@ -43,7 +43,7 @@ const ROOM = `screening-${SID}`;
 
 describe('resolveWorkerContext', () => {
   beforeEach(() => {
-    candidateResult = { data: { name: 'Rijo J John' }, error: null };
+    candidateResult = { data: { name: 'Rijo J John', parsed: null }, error: null };
   });
 
   it('returns ERR_DB_FAILED (retryable) when the session query errors transiently', async () => {
@@ -88,6 +88,43 @@ describe('resolveWorkerContext', () => {
       expect(r.context.candidate_name).toBe('Rijo J John');
       expect(r.context.status).toBe('waiting');
       expect(r.context.room_name).toBe(ROOM);
+      expect(r.context.candidate_evidence).toEqual({});
+    }
+  });
+
+  it('returns only allowlisted bounded resume evidence for a canonical phone room', async () => {
+    const phoneRoom = `phone-${SID}`;
+    sessionResult = {
+      data: { id: SID, candidate_id: 'cand-1', role_id: null, status: 'waiting', external_call_id: phoneRoom },
+      error: null,
+    };
+    candidateResult = {
+      data: {
+        name: 'Rijo J John',
+        parsed: {
+          current_role: 'Operations Lead', experience_years: 6,
+          skills: ['Sales', 'Operations'], summary: 'Customer-facing operator',
+          recent_role: {
+            title: 'Lead', employer: 'Example Co', period: '2022–2026',
+            highlights: ['Improved conversion'], private_contact: 'must-not-cross',
+          },
+          email: 'must-not-cross', phone: 'must-not-cross', raw_text: 'must-not-cross',
+        },
+      },
+      error: null,
+    };
+
+    const r = await resolveWorkerContext(SID, phoneRoom);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.context.candidate_evidence).toMatchObject({
+        current_role: 'Operations Lead', experience_years: 6,
+        skills: ['Sales', 'Operations'], summary: 'Customer-facing operator',
+        recent_role: { title: 'Lead', employer: 'Example Co', period: '2022–2026' },
+      });
+      expect(JSON.stringify(r.context.candidate_evidence)).not.toMatch(
+        /must-not-cross|email|phone|raw_text|private_contact/,
+      );
     }
   });
 });

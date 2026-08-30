@@ -864,9 +864,8 @@ def _role_turn_line(role_title: str | None) -> str | None:
     than a hollow "the role is exactly: none". The title is used VERBATIM from
     the server-verified assessment state — never invented, never a placeholder
     like "software engineer" (the exact wrong title a live call spoke on
-    2026-08-29 when the role reached the LLM only through the best-effort
-    `update_instructions` mutation, which is a no-op on the read-only 1.6.4
-    `Agent.instructions` property).
+    2026-08-29 when the role reached the LLM only through a post-start prompt
+    mutation rather than the construction-time prompt).
     """
     role = (role_title or "").strip()
     if not role:
@@ -889,8 +888,8 @@ def phone_question_instructions(
     from the key committed with the answer.
 
     X3c: the verbatim role line is appended here so EVERY per-turn instruction
-    carries the role, independent of whether the system-prompt mutation reached
-    the live LLM context. `role_title` defaults to None (no line) so the browser
+    carries the role as defense in depth, independent of model attention to the
+    construction-time system prompt. `role_title` defaults to None (no line) so the browser
     lane and any role-less caller are byte-unchanged.
     """
     lines = [
@@ -909,9 +908,9 @@ def phone_question_instructions(
     if role_line is not None:
         lines.append(role_line)
     # F2 (call 24): the compact style reminder rides the SAME per-turn developer
-    # message the model provably reads, because the full expressiveness /
-    # discipline / no-markdown blocks in `_phone_instructions_text` never reach
-    # the live model on livekit-agents 1.6.4 (read-only `Agent.instructions`).
+    # message the model provably reads. PR-8 also puts the full expressiveness /
+    # discipline / no-markdown blocks in the construction-time prompt; this
+    # short copy remains as cheap, battle-tested defense in depth.
     lines.append(phone.PHONE_PER_TURN_STYLE_TEXT)
     return "\n".join(lines)
 
@@ -981,107 +980,28 @@ def _phone_instructions_text(state: "phone.PhoneAssessmentState") -> str:
     return f"{text}\n\n{resume}" if resume else text
 
 
-async def _apply_phone_instructions(agent: Any, state: "phone.PhoneAssessmentState") -> bool:
-    """Give the agent the REAL instructions, once the plan is known.
+def _phone_instruction_state(worker_ctx: WorkerContext | None) -> "phone.PhoneAssessmentState":
+    """Project authenticated pre-call context into the phone prompt state.
 
-    The full question bank is deliberately NOT repeated in the system prompt:
-    the durable loop supplies exactly one owed question to each generation.
-    The plan's `key` is also absent: the model is never asked to report which
-    question it covered, because identity comes from the call site and the
-    committed key — never from prose.
-
-    A RESUMING leg also gets the persisted exchange replayed into the prompt,
-    bounded by `phone.render_resume_context`, so the model can refer to what the
-    candidate already said instead of starting the conversation over. It is
-    never asked to work out from that transcript which questions REMAIN — that
-    comes from the cursor, and inferring question identity from prose is the
-    failure this whole phase exists to prevent.
-
-    Best effort by design. If the SDK's Agent has no writable `instructions`,
-    the screening still runs on the base prompt and every boundary is still
-    keyed and committed correctly; the questions are simply less tailored.
-
-    X3b (2026-08-29 role-determinism): after delivery, VERIFY the role title
-    actually reached the agent instead of trusting the mutation blindly. On
-    livekit-agents 1.6.4 `update_instructions` routes to the live `_activity`
-    when the session is running and does NOT update the readable `instructions`
-    property, so a read-back can be stale even on success — the check is
-    therefore best-effort and only ever RAISES A LOUD LOG, never fails the leg.
-    Determinism does not depend on this mutation landing: the role is appended
-    to every per-turn instruction (see `_role_turn_line`), which is the path the
-    live LLM provably reads. This log is the observability that was missing when
-    a call spoke the wrong job title on 2026-08-29.
+    A fresh call has no durable phone plan until affirmative consent, but the
+    room-bound worker-context read already owns every fact needed to construct
+    the agent correctly: candidate/role guidance and a phone-only allowlisted
+    resume projection. Constructing from that read removes the post-start SDK
+    mutation that failed to influence several live calls. A reconnect later
+    prefers the full read-only assessment state, which additionally carries the
+    bounded non-gate transcript replay.
     """
-    text = _phone_instructions_text(state)
-    try:
-        delivered = await _deliver_phone_instructions(agent, text)
-    except Exception:  # noqa: BLE001
-        _log.warn(
-            "unknown_event", error_type="phone_instructions_not_applied",
-            error_category="agent_instructions",
-        )
-        return False
-    _verify_role_instructions_applied(agent, state.role_title, text)
-    return delivered
-
-
-def _verify_role_instructions_applied(
-    agent: Any, role_title: str | None, applied_text: str,
-) -> None:
-    """Log loudly if the role title is absent from the effective instructions.
-
-    Read-back never fails the leg (see `_apply_phone_instructions`). It reads the
-    best surface 1.6.4 exposes — the `instructions` property when it is a plain
-    string — and falls back to the text WE built and handed to the mutator, so a
-    stale property read does not produce a false alarm. Fixed error categories
-    only; never the title, transcript, ids or room name.
-    """
-    role = (role_title or "").strip()
-    if not role:
-        # No role to assert — nothing to verify, and nothing was owed.
-        return
-    effective = getattr(agent, "instructions", None)
-    if not isinstance(effective, str) or role not in effective:
-        # Fall back to what we actually delivered: the mutator may have routed
-        # the update to the live activity, leaving the readable property stale.
-        effective = applied_text
-    if role not in effective:
-        _log.warn(
-            "unknown_event", error_type="phone_instructions_not_applied",
-            error_category="role_title_absent",
-        )
-
-
-async def _deliver_phone_instructions(agent: Any, text: str) -> bool:
-    """Hand new instructions to a RUNNING agent, and say whether it took.
-
-    `Agent.instructions` is a read-only property on livekit-agents 1.6; the
-    supported mutator is `await agent.update_instructions(...)`. A bare
-    `setattr` therefore raises on the real SDK and succeeds on a stub — which
-    is the worst possible combination, because the tests would be green while
-    the candidate's name, the question flow and the resume replay never reached
-    the model at all.
-
-    So the mutator is tried FIRST and the attribute write is the fallback, and
-    the function REPORTS whether either worked rather than swallowing it. The
-    caller logs a failure; the screening still runs, and every boundary is
-    still keyed and committed correctly, because the question text is passed to
-    `generate_reply` directly and never read back out of the prompt.
-    """
-    update = getattr(agent, "update_instructions", None)
-    if callable(update):
-        try:
-            result = update(text)
-            if inspect.isawaitable(result):
-                await result
-            return True
-        except Exception:  # noqa: BLE001
-            pass
-    try:
-        setattr(agent, "instructions", text)
-        return True
-    except Exception:  # noqa: BLE001
-        return False
+    state = phone.PhoneAssessmentState(ok=worker_ctx is not None)
+    if worker_ctx is None:
+        return state
+    state.candidate_name = worker_ctx.candidate_name
+    state.role_title = worker_ctx.role_title
+    state.role_focus = worker_ctx.role_focus
+    state.role_required_skills = list(worker_ctx.role_required_skills)
+    state.interviewer_instructions = worker_ctx.interviewer_instructions
+    evidence = getattr(worker_ctx, "candidate_evidence", {})
+    state.resume_facts = dict(evidence) if isinstance(evidence, dict) else {}
+    return state
 
 
 def _build_provider_session(*, phone_mode: bool = False, turn_mode: str | None = None) -> Any:
@@ -1262,7 +1182,35 @@ async def _run_phone_entrypoint(ctx: JobContext, room_name: str) -> None:
             error_category="epoch_missing",
         )
         return
-    await _run_phone_session(ctx, room_name, attempt_id, epoch)
+
+    # PR-8: resolve the authenticated, room-bound prompt context BEFORE the
+    # Agent exists. The previous phone path constructed a minimal gate Agent,
+    # started it, then tried to replace its instructions after consent. Even
+    # though LiveKit 1.6.4 can mutate its internal ChatContext, live behavior
+    # repeatedly ignored long-form role/resume/style policy. Construction-time
+    # delivery makes that timing/version-sensitive seam unreachable.
+    session_id = phone.session_id_from_room_name(room_name)
+    if session_id is None:
+        _log.warn(
+            "unknown_event", error_type="phone_prompt_context_unresolved",
+            error_category="session_unresolved",
+        )
+        return
+    resolved = await _resolve_worker_context_with_retry(
+        session_id,
+        room_name,
+        attempts=max(1, _int_env("WORKER_CONTEXT_RESOLVE_ATTEMPTS", 3)),
+        backoff_sec=_float_env("WORKER_CONTEXT_RESOLVE_BACKOFF_SEC", 1.5),
+    )
+    if not isinstance(resolved, WorkerContext):
+        _log.warn(
+            "unknown_event", error_type="phone_prompt_context_unresolved",
+            error_category=str(resolved),
+        )
+        return
+    await _run_phone_session(
+        ctx, room_name, attempt_id, epoch, instruction_context=resolved,
+    )
 
 
 async def _run_native_phone_screening(
@@ -1301,6 +1249,7 @@ async def _run_native_phone_screening(
     terminal_reason: dict[str, str] = {}
     terminal_reply_required = {"value": False}
     closing = ClosingStateMachine()
+    qna_rounds = {"value": 0}
     silence_prompted = {"value": False}
     # The coordinator owns pending evidence; durable effects happen only from
     # coordinator-bound tools after LiveKit authorizes the scheduled reply.
@@ -1481,25 +1430,47 @@ async def _run_native_phone_screening(
             return
         question = state.question_at(cursor)
         if closing.state is ClosingState.CANDIDATE_QNA:
-            # F3 (call 24): `completed` is UNREACHABLE while a planned question
-            # remains. CANDIDATE_QNA is only entered when the cursor exhausted
-            # the plan (see `on_advance`), but a background commit race or a
-            # future edit could leave a question owed while the FSM sits in QNA;
-            # ending here then would drop the interview with questions unasked
-            # (the call-24 failure: notice period / CTC / expected CTC never
-            # asked, yet the call ended "completed"). If a question is still
-            # owed, do NOT complete — answer the candidate briefly and return to
-            # that owed question, exactly like the mid-plan question route below.
+            # `completed` remains UNREACHABLE while a planned question is owed.
+            # A raced cursor must return to that topic instead of laundering a
+            # partial plan into a successful closing.
             if question is not None:
                 setattr(agent, "_turn_policy", "clarification")
                 add_turn_instruction(turn_ctx, "Answer the candidate's question briefly, then continue the screening by asking this same planned topic again as ONE natural spoken question in your own words:\n" + question.text)
                 return
+
+            # PR-8: Q&A is a bounded LOOP, not the old one-answer trapdoor. A
+            # clear "nothing else" closes immediately; otherwise answer and
+            # re-invite until the third real question, then answer and wrap.
+            if phone.phone_qna_done(text):
+                close_instruction = (
+                    "The candidate has no more questions. Thank them warmly, "
+                    "say the team will be in touch, and say goodbye. Do not ask "
+                    "another question."
+                )
+            else:
+                qna_rounds["value"] += 1
+                if qna_rounds["value"] < phone.PHONE_QNA_MAX_ROUNDS:
+                    setattr(agent, "_turn_policy", "clarification")
+                    add_turn_instruction(
+                        turn_ctx,
+                        "Answer the candidate's question briefly from verified "
+                        "role context. Then ask exactly: Anything else you'd "
+                        "like to ask? Do not say goodbye yet.",
+                    )
+                    return
+                close_instruction = (
+                    "Answer the candidate's question briefly from verified role "
+                    "context. This is the final Q&A round: then thank them, say "
+                    "the team will be in touch, and say goodbye. Do not ask "
+                    "another question."
+                )
+
             closing.candidate_questions_handled()
             setattr(agent, "_turn_policy", "closing")
             terminal_reply_required["value"] = True
             terminal_reason["reason"] = "completed"
             finished.set()
-            add_turn_instruction(turn_ctx, "Answer the candidate's question briefly if they asked one. Then thank them, say the team will be in touch, and say goodbye. Do not ask another question.")
+            add_turn_instruction(turn_ctx, close_instruction)
             return
         if silence_prompted["value"]:
             silence_prompted["value"] = False
@@ -1875,10 +1846,9 @@ async def _run_native_phone_screening(
             terminal_reason["reason"] = phone.HALT_CALLBACK_SCHEDULED
             finished.set()
 
-    # The same Agent instance was installed at SIP answer. Consent changes
-    # authorization and instructions; it never swaps the scheduler's agent.
-    if not await _apply_phone_instructions(agent, state):
-        raise RuntimeError("phone_instructions_unavailable")
+    # The same fully instructed Agent instance was installed at SIP answer.
+    # Consent changes authorization only; there is no post-start prompt
+    # mutation, read-back verifier, or scheduler swap.
     setattr(agent, "_on_user_turn", on_native_turn)
     setattr(agent, "_on_booking", on_booking)
     setattr(agent, "_on_probe", on_probe)
@@ -2159,10 +2129,32 @@ async def _run_phone_session(
     *,
     client: Any = None,
     classifier: Callable[..., Any] | None = None,
+    instruction_context: WorkerContext | None = None,
 ) -> phone.PhoneGateResult:
     """Connect, wait, disclose, classify — then, and only then, screen."""
     await ctx.connect()
     events = client if client is not None else phone.PhoneEventClient()
+
+    # Construct from server-verified context, never from a post-start mutation.
+    # On a reconnect the read-only assessment state additionally carries the
+    # bounded non-gate transcript replay, so prefer it when available. A fresh
+    # call legitimately has no plan yet (`plan_missing`) and uses the pre-call
+    # worker context resolved by `_run_phone_entrypoint`.
+    instruction_state = _phone_instruction_state(instruction_context)
+    preloaded_assessment_state: phone.PhoneAssessmentState | None = None
+    instruction_session_id = phone.session_id_from_room_name(room_name)
+    fetch_instruction_state = getattr(events, "fetch_assessment_state", None)
+    if instruction_session_id is not None and callable(fetch_instruction_state):
+        try:
+            candidate_state = await fetch_instruction_state(instruction_session_id)
+            if isinstance(candidate_state, phone.PhoneAssessmentState) and candidate_state.ok:
+                preloaded_assessment_state = candidate_state
+                instruction_state = candidate_state
+        except Exception:  # noqa: BLE001
+            # The authenticated worker-context projection remains sufficient for
+            # a fresh leg. The gate's own durable-consent read keeps its existing
+            # fail-closed behavior if this was a reconnect.
+            pass
 
     # Candidate-only queue used exclusively by the pre-consent disclosure
     # classifier. Post-consent turns remain inside LiveKit AgentSession.
@@ -2431,14 +2423,10 @@ async def _run_phone_session(
             candidate_end_requested.set()
 
     agent = phone.phone_agent_class(Agent)(
-        # The prompt is built AFTER the gate, once the plan is known — see
-        # `_start_phone_assessment` below. Until then the agent carries the
-        # base instructions only, because the gate does not screen anybody and
-        # must not be handed the question flow.
-        system_prompt(
-            candidate_name=None, role_title=None, role_focus=None,
-            resume_facts=None, questions=None,
-        ),
+        # Complete and immutable from construction. The exact owed question is
+        # still supplied only per turn; this prompt carries role, resume,
+        # phone-policy/style blocks and bounded reconnect history.
+        _phone_instructions_text(instruction_state),
         client=events,
         attempt_id=attempt_id,
         say=say,
@@ -2548,6 +2536,8 @@ async def _run_phone_session(
         sid = phone.session_id_from_room_name(room_name)
         if sid is None:
             return None
+        if preloaded_assessment_state is not None:
+            return preloaded_assessment_state
         fetch = getattr(events, "fetch_assessment_state", None)
         if not callable(fetch):
             # A legacy client without the read-only seam: consult nothing and

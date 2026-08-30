@@ -100,6 +100,18 @@ class TestWorkerContext(unittest.TestCase):
         ctx = parse_worker_context(data)
         self.assertIsNone(ctx.candidate_name)
 
+    def test_parse_worker_context_carries_only_the_server_projection_as_data(self):
+        evidence = {"current_role": "Operations Lead", "skills": ["Sales"]}
+        ctx = parse_worker_context({
+            "session_id": SESSION_ID,
+            "candidate_id": CANDIDATE_ID,
+            "candidate_name": "Test Candidate",
+            "room_name": f"phone-{SESSION_ID}",
+            "status": "waiting",
+            "candidate_evidence": evidence,
+        })
+        self.assertEqual(ctx.candidate_evidence, evidence)
+
 
 class TestResolveWorkerContext(unittest.TestCase):
     """Tests for resolve_worker_context.
