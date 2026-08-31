@@ -10,6 +10,10 @@ const repair = readFileSync(
   resolve(process.cwd(), '../supabase/migrations/0073_phone_owner_callback_ashby.sql'),
   'utf8',
 );
+const convergence = readFileSync(
+  resolve(process.cwd(), '../supabase/migrations/0074_phone_generative_convergence.sql'),
+  'utf8',
+);
 
 describe('0068 candidate voice callback confirmation contract', () => {
   it('declares the dedicated service RPC and exact reservation rules', () => {
@@ -36,6 +40,12 @@ describe('0068 candidate voice callback confirmation contract', () => {
     expect(repair).toContain('between 900 and 3600');
     expect(repair).toContain("'duration_seconds', 900");
     expect(repair).toContain("interval '15 minutes'");
+  });
+
+  it('evolves the closed audit vocabulary used inside the atomic confirmation', () => {
+    expect(convergence).toContain("'phone_callback_confirmed'");
+    expect(convergence).toContain("'phone_callback_recovery_required'");
+    expect(convergence).toContain('validate constraint chk_audit_action');
   });
 
 });

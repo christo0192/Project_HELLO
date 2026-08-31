@@ -746,6 +746,20 @@ PHONE_TURN_MODE_TOOLFIRST = "toolfirst"
 PHONE_TURN_MODE_TOOLLESS = "toolless"
 
 
+def phone_generative_objective_guard_enabled() -> bool:
+    """Rollback control for phone-only generative objective validation."""
+    return (os.getenv("PHONE_GENERATIVE_OBJECTIVE_GUARD") or "on").strip().lower() not in {
+        "0", "false", "off", "no",
+    }
+
+
+def phone_objective_preemptive_enabled() -> bool:
+    """Overlap stable-objective LLM work with the bounded EOU tail."""
+    return (os.getenv("PHONE_OBJECTIVE_PREEMPTIVE") or "on").strip().lower() not in {
+        "0", "false", "off", "no",
+    }
+
+
 def phone_turn_mode() -> str:
     """Per-turn coordination mode. Default `toolfirst` (today's behavior).
 
@@ -1810,6 +1824,10 @@ HALT_LEASE_UNCONFIRMED = "lease_unconfirmed"
 # post NOTHING: `assessment.aborted` would terminalise an engagement the
 # server just scheduled, and `assessment.completed` would be a lie.
 HALT_CALLBACK_SCHEDULED = "callback_scheduled"
+# A validated callback proposal could not be committed because the API/DB path
+# failed. This is infrastructure truth, never candidate-ended truth. The
+# durable post-call extractor/reconciliation path owns recovery.
+HALT_CALLBACK_RECOVERY = "callback_recovery_required"
 # The candidate explicitly asked to end THIS call. This is not an opt-out from
 # future contact, so it must not write the digest suppression used by
 # `candidate.opt_out`; the assessment is aborted and the room is closed.
@@ -1822,7 +1840,7 @@ HALT_CANDIDATE_ENDED = "candidate_ended_call"
 #: because it is retryable: the booking already owns the engagement's future.)
 RETRYABLE_HALTS: frozenset[str] = frozenset([
     HALT_PERSISTENCE, HALT_SCORING, HALT_LEASE_LOST, HALT_LEASE_UNCONFIRMED,
-    HALT_CALLBACK_SCHEDULED,
+    HALT_CALLBACK_SCHEDULED, HALT_CALLBACK_RECOVERY,
 ])
 
 
@@ -3093,11 +3111,20 @@ class CallbackDecision:
 
 
 def _deferral_decision() -> CallbackDecision:
-    """The PR-1 terminal fallback: acknowledge, team will reach out, end."""
+    """The bounded conversational fallback when no bookable time was resolved."""
     return CallbackDecision(
         PHONE_CALLBACK_DEFERRAL_TEXT,
         terminal=True,
         terminal_reason=HALT_CANDIDATE_ENDED,
+    )
+
+
+def _confirmation_failure_decision() -> CallbackDecision:
+    """Validated time but infrastructure could not prove the booking."""
+    return CallbackDecision(
+        PHONE_CALLBACK_DEFERRAL_TEXT,
+        terminal=True,
+        terminal_reason=HALT_CALLBACK_RECOVERY,
     )
 
 
@@ -3136,8 +3163,9 @@ async def _propose_and_confirm(
                 booked=True,
             )
         # Validated but could not be confirmed (a race, a transport failure):
-        # never claim a booking that did not happen — fall back to the deferral.
-        return _deferral_decision()
+        # never claim a booking and never classify infrastructure as the
+        # candidate ending the assessment.
+        return _confirmation_failure_decision()
     if outcome.status == "slot_full" and outcome.alternatives and flow.phase != CALLBACK_PHASE_AWAITING_ALT_PICK:
         # ONE alternatives round. Record the offered set and ask the candidate to
         # pick; the next turn is handled by the AWAITING_ALT_PICK branch.
@@ -4099,6 +4127,80 @@ def _coverage_keywords(text: Any) -> set[str]:
     }
 
 
+_GENERATED_CLOSING_RE = re.compile(
+    r"\b(?:reached the end|end of (?:our|the) questions|that(?:'s| is) all(?: the)? questions|"
+    r"team will (?:review|be in touch)|next steps soon|have a great (?:day|evening)|goodbye)\b",
+    re.IGNORECASE,
+)
+_COMPENSATION_OBJECTIVE_RE = re.compile(
+    r"\b(?:salary|compensation|package|ctc|lpa)\b", re.IGNORECASE,
+)
+_CURRENT_COMPENSATION_RE = re.compile(
+    r"\b(?:my\s+)?current(?:\s+(?:ctc|salary|compensation|package))?\s+(?:is|was|would be|:)\s*"
+    r"(?:(?:around|about|roughly|like)\s+)?(?P<value>\d+(?:\.\d+)?\s*(?:lpa|lakhs?|k|m)?)\b",
+    re.IGNORECASE,
+)
+_EXPECTED_COMPENSATION_RE = re.compile(
+    r"\b(?:my\s+)?expected(?:\s+(?:ctc|salary|compensation|package))?\s+(?:is|would be|:)\s*"
+    r"(?:around\s+|about\s+|roughly\s+)?(?P<value>\d+(?:\.\d+)?\s*(?:lpa|lakhs?|k|m)?)\b|"
+    r"\b(?:expect|prefer|looking for)\s+(?:around\s+|about\s+)?(?P<value2>\d+(?:\.\d+)?\s*(?:lpa|lakhs?|k|m)?)\b",
+    re.IGNORECASE,
+)
+
+
+def phone_compensation_slots(text: Any) -> dict[str, str]:
+    """Extract only explicitly labelled compensation slots from one turn.
+
+    Ambiguous bare numbers are deliberately ignored. The values are bounded
+    conversational evidence used to avoid a duplicate ask, never normalized
+    into a hiring decision or logged.
+    """
+    if not isinstance(text, str):
+        return {}
+    slots: dict[str, str] = {}
+    current = _CURRENT_COMPENSATION_RE.search(text)
+    expected = _EXPECTED_COMPENSATION_RE.search(text)
+    if current is not None:
+        slots["current"] = " ".join(current.group("value").split())[:48]
+    if expected is not None:
+        value = expected.group("value") or expected.group("value2")
+        if value:
+            slots["expected"] = " ".join(value.split())[:48]
+    return slots
+
+
+def phone_is_compensation_objective(text: Any) -> bool:
+    return isinstance(text, str) and bool(
+        re.search(r"\b(?:ctc|salary|compensation|package)\b", text, re.IGNORECASE)
+    )
+
+
+def phone_generated_reply_authorized(
+    speech: Any, objective_text: Any, *, allow_closing: bool,
+) -> bool:
+    """Fail closed on clear action/objective violations, not natural wording.
+
+    The controller authorizes a semantic objective; Gemini remains free to
+    phrase it naturally. This validator intentionally rejects only high-signal
+    violations observed in production: empty/non-speakable output, premature
+    closing, multiple stacked questions, and an invented compensation topic.
+    It is not a brittle phrase renderer or a semantic answer judge.
+    """
+    if not isinstance(speech, str) or not any(ch.isalpha() for ch in speech):
+        return False
+    compact = " ".join(speech.split())
+    if not allow_closing and _GENERATED_CLOSING_RE.search(compact):
+        return False
+    question_marks = compact.count("?")
+    if (not allow_closing and question_marks != 1) or question_marks > 1:
+        return False
+    objective_is_comp = phone_is_compensation_objective(objective_text)
+    speech_mentions_comp = bool(_COMPENSATION_OBJECTIVE_RE.search(compact))
+    if speech_mentions_comp and not objective_is_comp:
+        return False
+    return True
+
+
 def phone_coverage_precheck(question_text: Any, assistant_reply: Any) -> bool | None:
     """Return a deterministic high-confidence answer, else ``None``.
 
@@ -4390,9 +4492,9 @@ _CALLBACK_DEFERRAL_RE = re.compile(
     r"\b(?:call|ring)\s+me\s+(?:back\s+)?(?:later|tomorrow|another\s+time)\b|"
     r"\b(?:can|could|would)\s+(?:you|we)\s+(?:(?:please\s+)?(?:call\s+back|reschedule)|"
     r"(?:please\s+)?(?:book|schedule|arrange|set\s+up)\s+(?:me\s+)?"
-    r"(?:an?\s+|another\s+|the\s+)?(?:call|callback|appointment|meeting))\b|"
+    r"(?:an?\s+|another\s+|the\s+)?(?:call|callback|appointment|meeting|follow[ -]?up(?:\s+call)?))\b|"
     r"\b(?:book|schedule|arrange|set\s+up)\s+(?:me\s+)?"
-    r"(?:an?\s+|another\s+|the\s+)?(?:call|callback|appointment|meeting)\b|"
+    r"(?:an?\s+|another\s+|the\s+)?(?:call|callback|appointment|meeting|follow[ -]?up(?:\s+call)?)\b|"
     r"\b(?:i(?:'m|\s+am)\s+busy\s+(?:right\s+now|at\s+the\s+moment)|"
     r"i\s+(?:cannot|can't)\s+talk\s+(?:right\s+now|at\s+the\s+moment)|"
     r"this\s+is\s+not\s+a\s+good\s+time)\b",
@@ -4691,7 +4793,22 @@ def phone_agent_class(agent_base: Any) -> Any:
             # stays the sole consent authority.
             self._gate_opening = False
             self._callback_proposal: CallbackProposal | None = None
+            # One session-bounded semantic authorization for the next generated
+            # spoken reply. It controls objective/action only; Gemini still owns
+            # every spoken word. Values are never logged.
+            self._generation_objective: str | None = None
+            self._generation_allow_closing = False
             self.bookings: list[ScheduleTurn] = []
+
+        def authorize_generation(
+            self, objective_text: str | None, *, allow_closing: bool = False,
+        ) -> None:
+            self._generation_objective = (
+                " ".join(objective_text.split())[:800]
+                if isinstance(objective_text, str) and objective_text.strip()
+                else None
+            )
+            self._generation_allow_closing = bool(allow_closing)
 
         def set_gate_opening(self, opening: bool) -> None:
             """Toggle the gate-opening stream window (see `_gate_opening`)."""
@@ -4827,7 +4944,71 @@ def phone_agent_class(agent_base: Any) -> Any:
                 async for _ in result:
                     pass
                 return
-            async for chunk in result:
+
+            objective = self._generation_objective
+            if (
+                not phone_generative_objective_guard_enabled()
+                or objective is None
+                or self._turn_policy not in {"substantive", "closing"}
+            ):
+                async for chunk in result:
+                    yield chunk
+                return
+
+            async def _collect(stream: Any) -> tuple[list[Any], str]:
+                chunks: list[Any] = []
+                parts: list[str] = []
+                async for chunk in stream:
+                    chunks.append(chunk)
+                    delta = getattr(chunk, "delta", None)
+                    content = getattr(delta, "content", None)
+                    if isinstance(content, str):
+                        parts.append(content)
+                    elif isinstance(chunk, str):
+                        parts.append(chunk)
+                return chunks, "".join(parts).strip()
+
+            chunks, speech = await _collect(result)
+            authorized = phone_generated_reply_authorized(
+                speech, objective,
+                allow_closing=self._generation_allow_closing,
+            )
+            if not authorized:
+                # One generative repair, never deterministic routine copy. The
+                # copied temporary context is scoped to this reply and leaves
+                # the durable chat history untouched.
+                repair_ctx = chat_ctx.copy() if callable(getattr(chat_ctx, "copy", None)) else chat_ctx
+                add_message = getattr(repair_ctx, "add_message", None)
+                if callable(add_message):
+                    add_message(
+                        role="developer",
+                        content=(
+                            "Repair the prior unsent draft. Respond naturally with exactly one "
+                            "spoken question for this authorized objective and no other topic. "
+                            "Do not close the call unless explicitly allowed. Authorized objective: "
+                            + objective
+                        ),
+                    )
+                repaired = super().llm_node(repair_ctx, tools, model_settings)
+                if inspect.isawaitable(repaired):
+                    repaired = await repaired
+                chunks, speech = await _collect(repaired)
+                authorized = phone_generated_reply_authorized(
+                    speech, objective,
+                    allow_closing=self._generation_allow_closing,
+                )
+            if not authorized:
+                # Tell the correlated recovery controller that generation has
+                # completed without publishable speech. It can cancel/drain and
+                # recover immediately instead of waiting the generic four-second
+                # first-audio deadline.
+                on_empty = getattr(self, "_on_generation_empty", None)
+                if callable(on_empty):
+                    observed = on_empty()
+                    if inspect.isawaitable(observed):
+                        await observed
+                return
+            for chunk in chunks:
                 yield chunk
 
         async def on_user_turn_completed(self, turn_ctx: Any, new_message: Any) -> None:
