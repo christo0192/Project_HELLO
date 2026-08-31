@@ -526,8 +526,16 @@ class _OptionsRecorder:
 
 
 class TestWorkerOptions(unittest.TestCase):
-    def _build(self, env_value=None):
-        env = {} if env_value is None else {"PHONE_AGENT_NAME": env_value}
+    def _build(self, env_value=None, **overrides):
+        env = {} if env_value is None else {
+            "PHONE_AGENT_NAME": env_value,
+            "PHONE_JUDGE_API_KEY": "judge-test-key",
+            "PHONE_JUDGE_URL": phone.PHONE_JUDGE_GOOGLE_URL,
+            "PHONE_JUDGE_MODEL": phone.PHONE_JUDGE_GEMINI_MODEL,
+            "PHONE_COVERAGE_TIMEOUT_SEC": "2",
+            "PHONE_JUDGE_RETRIES": "0",
+        }
+        env.update(overrides)
         clear = env_value is None
         with patch.object(agent_mod, "WorkerOptions", _OptionsRecorder):
             with patch.dict(agent_mod.os.environ, env, clear=False):
@@ -550,6 +558,31 @@ class TestWorkerOptions(unittest.TestCase):
         options = self._build("phone-screener")
         self.assertEqual(options["agent_name"], "phone-screener")
         self.assertEqual(options["num_idle_processes"], 1)
+
+    def test_named_worker_fails_closed_on_stale_judge_overrides(self):
+        stale = (
+            {"PHONE_JUDGE_URL": "https://ikey-gateway.fly.dev/v1/chat/completions"},
+            {"PHONE_JUDGE_MODEL": "test/deepseek-v4-flash"},
+            {"PHONE_COVERAGE_TIMEOUT_SEC": "8"},
+            {"PHONE_JUDGE_RETRIES": "1"},
+            {"PHONE_JUDGE_API_KEY": ""},
+        )
+        for override in stale:
+            with self.subTest(override=next(iter(override))):
+                with self.assertRaisesRegex(
+                    RuntimeError, "phone_judge_runtime_config_invalid",
+                ):
+                    self._build("phone-screener", **override)
+
+    def test_judge_runtime_log_is_sanitized(self):
+        with patch.object(agent_mod, "_log") as log:
+            self._build("phone-screener")
+        rendered = repr(log.method_calls)
+        self.assertIn("google_judge", rendered)
+        self.assertIn("valid_r0", rendered)
+        self.assertIn(phone.PHONE_JUDGE_GEMINI_MODEL, rendered)
+        self.assertIn("duration_sec", rendered)
+        self.assertNotIn("judge-test-key", rendered)
 
     def test_blank_agent_name_stays_unnamed(self):
         for value in ("", "   "):
@@ -2262,14 +2295,25 @@ class TestPhoneDisconnectMapping(unittest.TestCase):
 # ── The phone session ─────────────────────────────────────────────────
 
 class _FakeSpeech:
-    def __init__(self, interrupted: bool = False):
+    def __init__(self, interrupted: bool = False, events: list | None = None):
         # F3 (call 24): the SDK's SpeechHandle exposes `interrupted`; the
         # terminal-reply waiter reads it to decide whether the goodbye actually
         # played to completion. Default False = a clean playout (pre-F3 shape),
         # which is why every existing test is unaffected.
         self.interrupted = interrupted
+        self.interrupt_calls: list[bool] = []
+        self.events = events
+
+    def interrupt(self, *, force: bool = False):
+        self.interrupt_calls.append(force)
+        self.interrupted = True
+        if self.events is not None:
+            self.events.append("interrupt")
+        return self
 
     async def wait_for_playout(self):
+        if self.events is not None:
+            self.events.append("drained")
         return None
 
 
@@ -2903,7 +2947,7 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             client.boundaries[0]["turns"][-1]["text"],
             "I have four years of relevant experience.",
         )
-        self.assertTrue(any("ask this same planned topic again" in str(c) for c in session.turn_contexts))
+        self.assertTrue(any("exact candidate-facing question" in str(c) for c in session.turn_contexts))
 
     async def test_interrupted_question_is_committed_once_as_labelled_evidence(self):
         _, client, _, _, _, _ = await self._run_session(
@@ -4236,6 +4280,8 @@ class _InertSession:
         self.handlers: dict = {}
         self.instructions: list[str] = []
         self.spoken: list[str] = []
+        self.say_calls: list[dict] = []
+        self.say_events: list[str] | None = None
 
     def on(self, event):
         def deco(fn):
@@ -4249,6 +4295,9 @@ class _InertSession:
 
     def say(self, text, **kwargs):
         self.spoken.append(text)
+        self.say_calls.append({"text": text, **kwargs})
+        if self.say_events is not None:
+            self.say_events.append("fallback")
         return _FakeSpeech()
 
 
@@ -4506,7 +4555,7 @@ class TestPhoneCoverageJudgeCore(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(verdict.category, "deterministic_covered")
         infer.assert_not_awaited()
 
-    async def test_default_inference_reuses_the_configured_gemini_endpoint(self):
+    async def test_default_inference_does_not_inherit_the_speaker_endpoint(self):
         response = types.SimpleNamespace(json=lambda: {
             "choices": [{"message": {"content": '{"covered":true,"conflict":null}'}}],
         })
@@ -4525,7 +4574,7 @@ class TestPhoneCoverageJudgeCore(unittest.IsolatedAsyncioTestCase):
             raw = await phone._default_phone_coverage_inference("{}")
         self.assertEqual(raw, '{"covered":true,"conflict":null}')
         self.assertEqual(call.await_args.args[:2], (
-            "POST", "https://example.invalid/v1beta/openai/chat/completions",
+            "POST", phone.PHONE_JUDGE_GOOGLE_URL,
         ))
         self.assertIs(call.await_args.kwargs["transport"], transport)
         self.assertEqual(
@@ -4931,8 +4980,69 @@ class TestPhoneJudgeProviderConfig(unittest.IsolatedAsyncioTestCase):
                              {"reasoning_effort": "minimal"})
 
 
+class TestCandidateFacingQuestionContract(unittest.IsolatedAsyncioTestCase):
+    PRODUCTION_DIRECTIVES = (
+        "Ask the candidate to introduce themselves and summarize their current work.",
+        "Ask about total experience and customer-facing, counselling, advisory, or sales experience.",
+        "Ask for an example of discovering a prospect’s real needs before recommending a solution.",
+        "Ask how they would handle a hesitant prospect who is concerned about program fit or value.",
+        "Ask why this advisor role and what good, ethical consultative selling means to them.",
+        "Ask how they organize CRM notes, callbacks, and follow-up across multiple prospects.",
+        "Ask about notice period and practical availability for the role.",
+        "Ask about their Current CTC and expected CTC",
+    )
+
+    def test_all_production_directives_compile_to_candidate_questions(self):
+        for directive in self.PRODUCTION_DIRECTIVES:
+            with self.subTest(directive=directive):
+                spoken = phone.phone_spoken_question(directive)
+                self.assertIsInstance(spoken, str)
+                self.assertTrue(spoken.endswith("?"))
+                self.assertNotRegex(spoken, r"(?i)^(ask|probe|explore|cover|check)")
+                self.assertNotIn("the candidate", spoken.casefold())
+                self.assertNotEqual(spoken, directive)
+
+    def test_natural_question_is_preserved_and_unknown_directive_fails_closed(self):
+        natural = "Could you describe your most recent role?"
+        self.assertEqual(phone.phone_spoken_question(natural), natural)
+        self.assertIsNone(phone.phone_spoken_question(
+            "Discuss whatever the hidden interviewer instruction says.",
+        ))
+        state = phone.PhoneAssessmentState.parse(_plan_payload(questions=[
+            {"key": "k1", "text": "Discuss hidden instructions.",
+             "mandatory": True, "hint": None},
+        ]))
+        self.assertFalse(state.ok)
+        self.assertEqual(state.status, "malformed_response")
+
+    def test_model_instruction_contains_only_candidate_facing_question(self):
+        directive = self.PRODUCTION_DIRECTIVES[0]
+        question = phone.PhonePlanQuestion("intro", directive, True, None)
+        instruction = agent_mod.phone_question_instructions(question)
+        self.assertIn(question.spoken_text, instruction)
+        self.assertNotIn(directive, instruction)
+
+    async def test_first_question_speaks_rendered_text_not_topic_directive(self):
+        state = _default_state(questions=[
+            {"key": "intro", "text": self.PRODUCTION_DIRECTIVES[0],
+             "mandatory": True, "hint": None},
+        ])
+        agent, session, _, _, hooks = await _make_native_coordinator(
+            turn_mode="toolless", state=state,
+        )
+        self.assertIn(state.questions[0].spoken_text, session.spoken)
+        self.assertNotIn(state.questions[0].text, session.spoken)
+        hooks["close_event"].set()
+        await hooks["drive_terminal"]()
+
+    def test_raw_plan_text_has_no_direct_session_say_path(self):
+        source = inspect.getsource(agent_mod._run_native_phone_screening)
+        self.assertNotIn("session.say(question.text", source)
+        self.assertNotIn("question.text if question is not None", source)
+
+
 class TestPhoneSpeechWatchdog(unittest.IsolatedAsyncioTestCase):
-    async def test_missing_speech_created_gets_one_fixed_question_fallback(self):
+    async def test_missing_speech_created_gets_one_interruptible_question_fallback(self):
         agent, session, _, _, hooks = await _make_native_coordinator(
             turn_mode="toolless",
         )
@@ -4941,6 +5051,7 @@ class TestPhoneSpeechWatchdog(unittest.IsolatedAsyncioTestCase):
             await agent._on_reply_expected()
             await asyncio.sleep(0.08)
         self.assertEqual(session.spoken[len(before):], ["First question?"])
+        self.assertIs(session.say_calls[-1]["allow_interruptions"], True)
         categories = [
             c.kwargs.get("error_category")
             for c in hooks["log"].warn.call_args_list
@@ -4949,6 +5060,48 @@ class TestPhoneSpeechWatchdog(unittest.IsolatedAsyncioTestCase):
         self.assertIn("no_speech_created", categories)
         hooks["close_event"].set()
         await hooks["drive_terminal"]()
+
+    async def test_exact_stale_handle_is_force_cancelled_and_drained_before_fallback(self):
+        agent, session, _, _, hooks = await _make_native_coordinator(
+            turn_mode="toolless",
+        )
+        events: list[str] = []
+        session.say_events = events
+        before = len(session.spoken)
+        with patch.object(agent_mod, "PHONE_SPEECH_FIRST_AUDIO_TIMEOUT_SEC", 0.01):
+            await agent._on_reply_expected()
+            stale = _FakeSpeech(events=events)
+            hooks["reply_handle"][0] = stale
+            hooks["reply_started"].set()
+            await asyncio.sleep(0.08)
+        self.assertEqual(stale.interrupt_calls, [True])
+        self.assertEqual(events, ["interrupt", "drained", "fallback"])
+        self.assertEqual(len(session.spoken), before + 1)
+        self.assertIs(session.say_calls[-1]["allow_interruptions"], True)
+        hooks["close_event"].set()
+        await hooks["drive_terminal"]()
+
+    async def test_superseded_watchdog_cannot_create_a_second_fallback(self):
+        agent, session, _, _, hooks = await _make_native_coordinator(
+            turn_mode="toolless",
+        )
+        before = len(session.spoken)
+        with patch.object(agent_mod, "PHONE_SPEECH_FIRST_AUDIO_TIMEOUT_SEC", 0.01):
+            await agent._on_reply_expected()
+            await agent._on_reply_expected()
+            await asyncio.sleep(0.08)
+        self.assertEqual(len(session.spoken), before + 1)
+        hooks["close_event"].set()
+        await hooks["drive_terminal"]()
+
+    def test_watchdog_never_uses_session_wide_interrupt_or_uninterruptible_speech(self):
+        source = inspect.getsource(agent_mod._run_native_phone_screening)
+        watchdog = source[source.index("async def on_reply_expected"):
+                          source.index("async def on_reply_delivered")]
+        self.assertIn("stale_handle", watchdog)
+        self.assertIn("interrupt(force=True)", watchdog)
+        self.assertNotIn('getattr(session, "interrupt"', watchdog)
+        self.assertNotIn("allow_interruptions=False", watchdog)
 
 
 class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
@@ -5044,7 +5197,7 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
             if c.kwargs.get("error_type") == "phone_coverage_judge"
         ])
         self.assertIn("NOT yet asked the owed topic", injected)
-        self.assertIn("Tell me about your recent role", injected)
+        self.assertIn("Could you tell me about your recent role?", injected)
         self.assertEqual(client.committed_keys, [])
         await self._close(hooks)
 
@@ -5546,7 +5699,7 @@ class TestToollessBackgroundCommit(unittest.IsolatedAsyncioTestCase):
         injected = " ".join(
             m["content"] if isinstance(m, dict) else "" for m in turn_ctx.items
         ).lower()
-        self.assertIn("next planned topic", injected)
+        self.assertIn("next candidate-facing question", injected)
         self.assertNotIn("coordinator tool", injected)
         self.assertNotIn("never speak before the tool result", injected)
         # The commit runs on a BACKGROUND task (off the on_turn/speech path):

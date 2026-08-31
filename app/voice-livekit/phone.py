@@ -1828,14 +1828,113 @@ def _bounded_int(raw: Any) -> int | None:
     return raw if 0 <= raw <= 1000 else None
 
 
-class PhonePlanQuestion:
-    """One question in the immutable, session-scoped plan."""
+_DIRECTIVE_PREFIX_RE = re.compile(
+    r"^(?:ask|probe|explore|cover|check|confirm|discuss|understand|find)\b",
+    re.IGNORECASE,
+)
+_QUESTION_MARKUP_RE = re.compile(r"[\[\]{}<>]")
+_PRODUCTION_SPOKEN_QUESTIONS = {
+    "ask the candidate to introduce themselves and summarize their current work.":
+        "Could you introduce yourself and summarize your current work?",
+    "ask about total experience and customer-facing, counselling, advisory, or sales experience.":
+        "How many years of total experience do you have, and what customer-facing, counselling, advisory, or sales experience have you had?",
+    "ask for an example of discovering a prospect’s real needs before recommending a solution.":
+        "Could you share an example of how you discovered a prospect’s real needs before recommending a solution?",
+    "ask how they would handle a hesitant prospect who is concerned about program fit or value.":
+        "How would you handle a hesitant prospect who was concerned about program fit or value?",
+    "ask why this advisor role and what good, ethical consultative selling means to them.":
+        "Why are you interested in this advisor role, and what does good, ethical consultative selling mean to you?",
+    "ask how they organize crm notes, callbacks, and follow-up across multiple prospects.":
+        "How do you organize CRM notes, callbacks, and follow-up across multiple prospects?",
+    "ask about notice period and practical availability for the role.":
+        "What is your notice period, and when would you be available to start?",
+    "ask about their current ctc and expected ctc":
+        "What are your current CTC and expected CTC?",
+}
 
-    __slots__ = ("key", "text", "mandatory", "hint")
+
+def _candidate_pronouns(text: str) -> str:
+    """Convert the narrow third-person grammar accepted for plan directives."""
+    substitutions = (
+        (r"\bthe candidate's\b", "your"),
+        (r"\bthe candidate\b", "you"),
+        (r"\bthemselves\b", "yourself"),
+        (r"\btheir\b", "your"),
+        (r"\bthem\b", "you"),
+        (r"\bthey\b", "you"),
+    )
+    rendered = text
+    for pattern, replacement in substitutions:
+        rendered = re.sub(pattern, replacement, rendered, flags=re.IGNORECASE)
+    return rendered
+
+
+def phone_spoken_question(text: Any) -> str | None:
+    """Compile a stored topic/directive into text that is safe to send to TTS.
+
+    The immutable plan deliberately stores recruiter-authored TOPICS.  A topic
+    is not speech.  This is the single conversion boundary: callers retain the
+    raw text for coverage judging, while every model/TTS path consumes this
+    candidate-facing form. Unknown directive grammar fails closed instead of
+    repeating internal instructions to a candidate.
+    """
+    if not isinstance(text, str):
+        return None
+    raw = " ".join(text.split()).strip()
+    if not raw or len(raw) > 2_000 or _QUESTION_MARKUP_RE.search(raw):
+        return None
+    canonical = _PRODUCTION_SPOKEN_QUESTIONS.get(raw.casefold())
+    if canonical is not None:
+        return canonical
+    if raw.endswith("?") and _DIRECTIVE_PREFIX_RE.match(raw) is None:
+        return raw
+
+    lowered = raw.casefold()
+    rendered: str | None = None
+    for prefix in ("tell me ", "describe ", "walk me through ", "explain "):
+        if lowered.startswith(prefix):
+            action = raw.rstrip(".?! ")
+            rendered = f"Could you {action[0].lower() + action[1:]}?"
+            break
+    if lowered.startswith("ask about "):
+        topic = _candidate_pronouns(raw[len("ask about "):].rstrip(".?! "))
+        rendered = f"Could you tell me about {topic}?"
+    elif lowered.startswith("ask for "):
+        topic = _candidate_pronouns(raw[len("ask for "):].rstrip(".?! "))
+        rendered = f"Could you share {topic}?"
+    elif lowered.startswith("ask the candidate to "):
+        action = _candidate_pronouns(
+            raw[len("ask the candidate to "):].rstrip(".?! ")
+        )
+        rendered = f"Could you {action}?"
+    elif lowered.startswith("ask how they would "):
+        action = _candidate_pronouns(
+            raw[len("ask how they would "):].rstrip(".?! ")
+        )
+        rendered = f"How would you {action}?"
+
+    if (
+        rendered is None
+        or _DIRECTIVE_PREFIX_RE.match(rendered) is not None
+        or _QUESTION_MARKUP_RE.search(rendered)
+        or not rendered.endswith("?")
+    ):
+        return None
+    return rendered
+
+
+class PhonePlanQuestion:
+    """One question in the immutable plan, with topic and speech separated."""
+
+    __slots__ = ("key", "text", "spoken_text", "mandatory", "hint")
 
     def __init__(self, key: str, text: str, mandatory: bool, hint: str | None) -> None:
+        spoken_text = phone_spoken_question(text)
+        if spoken_text is None:
+            raise ValueError("phone_question_not_candidate_facing")
         self.key = key
         self.text = text
+        self.spoken_text = spoken_text
         self.mandatory = mandatory
         self.hint = hint
 
@@ -1938,12 +2037,16 @@ class PhoneAssessmentState:
                     if not isinstance(text, str) or not text.strip():
                         continue
                     hint = entry.get("hint")
-                    state.questions.append(PhonePlanQuestion(
-                        key,
-                        text.strip(),
-                        entry.get("mandatory") is True,
-                        str(hint) if isinstance(hint, str) and hint else None,
-                    ))
+                    try:
+                        question = PhonePlanQuestion(
+                            key,
+                            text.strip(),
+                            entry.get("mandatory") is True,
+                            str(hint) if isinstance(hint, str) and hint else None,
+                        )
+                    except ValueError:
+                        continue
+                    state.questions.append(question)
 
         if not state.questions or declared != len(state.questions):
             _log.warn(
@@ -3756,12 +3859,11 @@ _PHONE_COVERAGE_MAX_EVIDENCE = 3_000
 def phone_coverage_timeout_sec() -> float:
     """Bounded provider wall clock for one judge inference.
 
-    Gemini's first-token latency spikes to ~3.7s in production; a 2.0s bound
-    tripped the breaker on normal latency, opening it so every judge call for
-    the cooldown window fast-failed to `judge_error`. Default 4.0 covers the
-    observed spike. Read at the CALL SITE with the literal name so the repo's
-    env-contract scanner sees the variable this module consumes. The +0.25
-    async wrapper (see `judge_phone_coverage`) sits on top of this bound.
+    The judge is background-only but still has a strict two-second resource
+    budget. Effective production configuration is validated at phone-worker
+    startup so a stale Fly override cannot silently restore the old eight-second
+    path. The +0.25 async wrapper (see `judge_phone_coverage`) is the final
+    cancellation margin on top of this provider bound.
     """
     return _bounded_float(os.getenv("PHONE_COVERAGE_TIMEOUT_SEC"), 2.0, 1.0, 30.0)
 
@@ -3826,24 +3928,24 @@ def phone_judge_max_tokens() -> int:
     return _bounded_int_env(os.getenv("PHONE_JUDGE_MAX_TOKENS"), 800, 64, 2000)
 
 
+PHONE_JUDGE_GOOGLE_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+)
+PHONE_JUDGE_GEMINI_MODEL = "gemini-3.5-flash-lite"
+
+
 def phone_judge_url() -> str:
     """FULL chat/completions endpoint the judge POSTs to, VERBATIM.
 
-    Independent of the speaking LLM's ``GEMINI_BASE_URL`` so the judge can be
-    pointed at a different provider (e.g. DeepSeek's
-    ``https://ikey-gateway.fly.dev/v1/chat/completions``) without touching the
-    speech path. The value is posted with NO suffix appended — a full path is
-    required. The DEFAULT reproduces today's Gemini behavior exactly: the same
-    URL the judge previously composed as ``{GEMINI_BASE_URL}/chat/completions``.
+    Independent of the speaking LLM's ``GEMINI_BASE_URL`` so stale speaker or
+    gateway configuration cannot move isolated judge credentials across a trust
+    boundary. The value is posted with NO suffix appended. The named production
+    worker validates the effective value against the direct Google endpoint.
     """
     explicit = os.getenv("PHONE_JUDGE_URL", "")
     if explicit:
         return explicit
-    base_url = os.getenv(
-        "GEMINI_BASE_URL",
-        "https://generativelanguage.googleapis.com/v1beta/openai/",
-    ).rstrip("/")
-    return f"{base_url}/chat/completions"
+    return PHONE_JUDGE_GOOGLE_URL
 
 
 def phone_primary_model() -> str:
@@ -3856,12 +3958,58 @@ def phone_judge_model() -> str:
     explicit = os.getenv("PHONE_JUDGE_MODEL", "")
     if explicit:
         return explicit
-    return "gemini-3.5-flash-lite"
+    return PHONE_JUDGE_GEMINI_MODEL
 
 
 def phone_judge_api_key() -> str:
     """Dedicated judge credential; never falls back to the interviewer key."""
     return os.getenv("PHONE_JUDGE_API_KEY", "")
+
+
+@dataclass(frozen=True)
+class PhoneJudgeRuntimeConfig:
+    """Sanitized effective judge configuration; never contains credentials."""
+
+    ok: bool
+    error: str | None
+    endpoint_host: str
+    model: str
+    timeout_sec: float
+    retries: int
+
+
+def phone_judge_runtime_config() -> PhoneJudgeRuntimeConfig:
+    """Validate the production judge trust boundary and latency contract.
+
+    Deployment-time defaults are insufficient because Fly secrets survive code
+    releases.  The owner call proved stale model/URL/timeout values can silently
+    override correct code.  This reader validates EFFECTIVE values and returns
+    only fields safe for startup logs.
+    """
+    url = phone_judge_url().strip().rstrip("/")
+    model = phone_judge_model().strip()
+    timeout_sec = phone_coverage_timeout_sec()
+    retries = phone_judge_retries()
+    endpoint_host = "generativelanguage.googleapis.com" if url == PHONE_JUDGE_GOOGLE_URL else "invalid"
+    error: str | None = None
+    if not phone_judge_api_key().strip():
+        error = "missing_isolated_key"
+    elif url != PHONE_JUDGE_GOOGLE_URL:
+        error = "invalid_endpoint"
+    elif model != PHONE_JUDGE_GEMINI_MODEL:
+        error = "invalid_model"
+    elif timeout_sec > 2.0:
+        error = "timeout_exceeds_budget"
+    elif retries != 0:
+        error = "retries_not_zero"
+    return PhoneJudgeRuntimeConfig(
+        ok=error is None,
+        error=error,
+        endpoint_host=endpoint_host,
+        model=model,
+        timeout_sec=timeout_sec,
+        retries=retries,
+    )
 
 
 def phone_judge_extra_body() -> dict[str, Any]:

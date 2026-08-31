@@ -739,6 +739,24 @@ def build_worker_options() -> WorkerOptions:
     }
     agent_name = _phone_agent_name()
     if agent_name:
+        if phone.phone_coverage_judge_enabled():
+            judge_config = phone.phone_judge_runtime_config()
+            log_method = _log.info if judge_config.ok else _log.error
+            log_method(
+                "unknown_event",
+                error_type="phone_judge_runtime_config",
+                error_category="valid_r0" if judge_config.ok else judge_config.error,
+                schema=(
+                    "google_judge"
+                    if judge_config.endpoint_host == "generativelanguage.googleapis.com"
+                    else "invalid_judge"
+                ),
+                model=judge_config.model,
+                duration_sec=judge_config.timeout_sec,
+            )
+            if not judge_config.ok:
+                # Fixed exception: credentials and raw URLs are never included.
+                raise RuntimeError("phone_judge_runtime_config_invalid")
         options["agent_name"] = agent_name
     return WorkerOptions(**options)
 
@@ -925,8 +943,8 @@ def phone_question_instructions(
     lane and any role-less caller are byte-unchanged.
     """
     lines = [
-        "Continue the live phone conversation naturally, then ask this one planned question:",
-        question.text,
+        "Continue the live phone conversation naturally, then ask this candidate-facing question:",
+        question.spoken_text,
         "",
         "Briefly acknowledge the candidate's latest substantive answer when "
         "there is one. Ask exactly ONE question in this response. Do not move "
@@ -1563,7 +1581,7 @@ async def _run_native_phone_screening(
             # partial plan into a successful closing.
             if question is not None:
                 setattr(agent, "_turn_policy", "clarification")
-                add_turn_instruction(turn_ctx, "Answer the candidate's question briefly, then continue the screening by asking this same planned topic again as ONE natural spoken question in your own words:\n" + question.text)
+                add_turn_instruction(turn_ctx, "Answer the candidate's question briefly, then continue the screening by asking this exact candidate-facing question:\n" + question.spoken_text)
                 return
 
             # PR-8: Q&A is a bounded LOOP, not the old one-answer trapdoor. A
@@ -1629,7 +1647,7 @@ async def _run_native_phone_screening(
                 # Gate off: preserve the pre-X10 re-ask behaviour exactly.
                 setattr(agent, "_turn_policy", "clarification")
                 if question is not None:
-                    add_turn_instruction(turn_ctx, "Answer briefly from verified role context, then ask this same planned topic again as ONE natural spoken question in your own words:\n" + question.text)
+                    add_turn_instruction(turn_ctx, "Answer briefly from verified role context, then ask this exact candidate-facing question:\n" + question.spoken_text)
                 return
             if route == "callback_deferral":
                 if closing.state in {ClosingState.CANDIDATE_QNA, ClosingState.CLOSING_PENDING}:
@@ -1654,7 +1672,7 @@ async def _run_native_phone_screening(
                 return
             setattr(agent, "_turn_policy", "clarification")
             if question is not None:
-                add_turn_instruction(turn_ctx, "Answer briefly from verified role context, then ask this same planned topic again as ONE natural spoken question in your own words:\n" + question.text)
+                add_turn_instruction(turn_ctx, "Answer briefly from verified role context, then ask this exact candidate-facing question:\n" + question.spoken_text)
             return
         # THE PATIENCE GATE (X10). Not a recognised route: classify the final as
         # substantive / hesitation / thinking. A thinking statement earns ONE
@@ -1757,7 +1775,7 @@ async def _run_native_phone_screening(
                 conflict_key = phone.phone_conflict_key(conflict)
                 if conflict_key not in asked_conflicts:
                     judge_instruction = phone.phone_judge_turn_instruction(
-                        question.text, conflict=conflict,
+                        question.spoken_text, conflict=conflict,
                     )
                     if judge_instruction is not None:
                         # Mark asked when the instruction enters this turn's
@@ -1767,7 +1785,7 @@ async def _run_native_phone_screening(
                 pending_conflict["value"] = None
             elif coverage_reanchor.get("question_key") == question.key:
                 judge_instruction = phone.phone_judge_turn_instruction(
-                    question.text, reanchor=True,
+                    question.spoken_text, reanchor=True,
                 )
                 coverage_reanchor["question_key"] = None
 
@@ -1806,16 +1824,16 @@ async def _run_native_phone_screening(
                     )
                 else:
                     planned_instruction = (
-                        "Briefly acknowledge one specific detail, then ask exactly "
-                        "ONE natural question covering this next planned topic: "
-                        + next_question.text
+                        "Briefly acknowledge one specific detail, then ask "
+                        "this exact next candidate-facing question: "
+                        + next_question.spoken_text
                     )
             else:
                 # Uncertain/failed coverage never speculates forward. The judge
                 # may commit in the background, but this speech safely re-asks
                 # the same keyed topic and cannot skip it.
                 planned_instruction = phone.phone_judge_turn_instruction(
-                    question.text, reanchor=True,
+                    question.spoken_text, reanchor=True,
                 ) or phone_question_instructions(question, state.role_title)
             turn_instruction = judge_instruction or planned_instruction
             add_turn_instruction(turn_ctx, turn_instruction)
@@ -1861,7 +1879,7 @@ async def _run_native_phone_screening(
         hint = f" The most useful angle: {question.hint}" if question.hint else ""
         return (
             "Probe authorized. Acknowledge briefly, then ask ONE follow-up question "
-            "in your own natural words on this same topic: " + question.text + hint
+            "before returning to this candidate-facing question: " + question.spoken_text + hint
         )
 
     async def on_advance(exchange: dict[str, Any] | None = None) -> str:
@@ -1929,8 +1947,8 @@ async def _run_native_phone_screening(
         hint = f" The most useful angle if their answer is thin: {next_question.hint}" if next_question.hint else ""
         last_advance["text"] = (
             "Advance authorized. Briefly acknowledge one specific detail from their "
-            "answer, then ask ONE question in your own natural words covering exactly "
-            "this topic: " + next_question.text + hint
+            "answer, then ask this exact candidate-facing question: "
+            + next_question.spoken_text + hint
         )
         return last_advance["text"]
 
@@ -2142,11 +2160,25 @@ async def _run_native_phone_screening(
             if inspect.isawaitable(value):
                 await value
 
+    expected_reply_generation: list[int] = [0]
+    fallback_generation: list[int | None] = [None]
+
     async def on_reply_expected() -> None:
-        """Arm one bounded generated-speech watchdog for this accepted turn."""
+        """Arm one generation-correlated first-audio watchdog.
+
+        LiveKit 1.6.4 exposes cancellation on the SpeechHandle itself.  A
+        session-wide interrupt can target the wrong queued speech and does not
+        prove the stale generation stopped.  This path therefore force-cancels
+        the exact handle observed for this expected reply, drains it, and only
+        then creates one interruptible deterministic fallback.
+        """
         previous = speech_watchdog_task[0]
         if previous is not None and not previous.done():
             previous.cancel()
+        expected_reply_generation[0] += 1
+        generation = expected_reply_generation[0]
+        fallback_generation[0] = None
+        reply_handle[0] = None
 
         async def monitor() -> None:
             try:
@@ -2166,26 +2198,53 @@ async def _run_native_phone_screening(
             except asyncio.CancelledError:
                 return
 
-            # Cancel the stale/late primary before creating one fixed fallback.
-            interrupt = getattr(session, "interrupt", None)
-            if callable(interrupt):
+            if generation != expected_reply_generation[0]:
+                return
+            stale_handle = reply_handle[0]
+            if stale_handle is not None:
+                interrupt = getattr(stale_handle, "interrupt", None)
+                if not callable(interrupt):
+                    _log.warn(
+                        "unknown_event", error_type="phone_speech_lifecycle",
+                        error_category="stale_handle_not_interruptible",
+                    )
+                    return
                 try:
-                    value = interrupt()
-                    if inspect.isawaitable(value):
-                        await value
-                except Exception:  # noqa: BLE001
-                    pass
+                    interrupt(force=True)
+                    wait = getattr(stale_handle, "wait_for_playout", None)
+                    if callable(wait):
+                        value = wait()
+                        if inspect.isawaitable(value):
+                            await asyncio.wait_for(value, timeout=1.0)
+                except (Exception, asyncio.TimeoutError):  # noqa: BLE001
+                    _log.warn(
+                        "unknown_event", error_type="phone_speech_lifecycle",
+                        error_category="stale_handle_cancel_failed",
+                    )
+                    return
+
+            # A newer candidate turn/reply supersedes this recovery. At most one
+            # fallback may be created for the still-current generation.
+            if (
+                generation != expected_reply_generation[0]
+                or fallback_generation[0] == generation
+            ):
+                return
+            fallback_generation[0] = generation
             question = state.question_at(cursor)
             fallback = reply_plan[0]
             if not isinstance(fallback, str) or not fallback.strip():
                 fallback = (
-                    question.text if question is not None
+                    question.spoken_text if question is not None
                     else phone.PHONE_ASSESSMENT_CLOSING_TEXT
                 )
             if pending_terminal_reason.get("value") is not None:
                 pending_terminal_speech_seq["value"] = speech_sequence[0] + 1
             try:
-                speech = session.say(fallback, allow_interruptions=False)
+                # Candidate speech must always be able to barge into recovery.
+                # Disabling interruptions caused LiveKit to discard the owner's
+                # next utterance in the production failure.
+                speech = session.say(fallback, allow_interruptions=True)
                 wait = getattr(speech, "wait_for_playout", None)
                 if callable(wait):
                     value = wait()
@@ -2274,7 +2333,7 @@ async def _run_native_phone_screening(
         # which Gemini rejects as "Requests ending with a model turn are not
         # supported." Later generated replies always originate from a real
         # candidate turn.
-        speech = session.say(question.text, allow_interruptions=True)
+        speech = session.say(question.spoken_text, allow_interruptions=True)
         wait = getattr(speech, "wait_for_playout", None)
         if callable(wait):
             value = wait()
@@ -2312,7 +2371,7 @@ async def _run_native_phone_screening(
         # the committed key — WHICH question is authoritative is unchanged.
         if question is not None:
             if not (latest_assistant[0] or "").strip():
-                latest_assistant[0] = question.text
+                latest_assistant[0] = question.spoken_text
             if latest_assistant_anchor[0] is None:
                 latest_assistant_anchor[0] = int(round(time.time() * 1000))
             if not assistant_delivery_complete.is_set():
