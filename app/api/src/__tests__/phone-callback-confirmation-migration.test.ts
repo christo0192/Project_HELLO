@@ -6,6 +6,10 @@ const migration = readFileSync(
   resolve(process.cwd(), '../supabase/migrations/0068_phone_voice_callback_confirmation.sql'),
   'utf8',
 );
+const repair = readFileSync(
+  resolve(process.cwd(), '../supabase/migrations/0073_phone_owner_callback_ashby.sql'),
+  'utf8',
+);
 
 describe('0068 candidate voice callback confirmation contract', () => {
   it('declares the dedicated service RPC and exact reservation rules', () => {
@@ -28,4 +32,10 @@ describe('0068 candidate voice callback confirmation contract', () => {
   it('does not carry a phone value or an external calendar integration', () => {
     expect(migration).not.toMatch(/phone_e164|phone_raw|google|outlook|email|sms/i);
   });
+  it('the owner repair restores the 900-second callback envelope', () => {
+    expect(repair).toContain('between 900 and 3600');
+    expect(repair).toContain("'duration_seconds', 900");
+    expect(repair).toContain("interval '15 minutes'");
+  });
+
 });

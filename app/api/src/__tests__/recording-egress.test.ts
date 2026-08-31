@@ -76,6 +76,7 @@ function fakeDb(
       rpc,
       storage: {
         from: vi.fn(() => ({
+          upload: vi.fn(async () => ({ data: null, error: null })),
           download: vi.fn(async () => ({
             data: new Blob([bytes], { type: 'audio/ogg' }),
             error: null,
@@ -163,7 +164,10 @@ describe('authoritative recording egress', () => {
         recording_egress_status: 'active',
         mode: 'live',
       },
-    ], Buffer.from('synthetic mp3'), [{ recording_object_key: attemptKey }]);
+    ], Buffer.from('synthetic mp3'), [{
+      recording_object_key: attemptKey,
+      recording_manifest_key: `${attemptKey}.json`,
+    }]);
     const result = await finalizeAuthoritativeRecording(
       '00000000-0000-4000-8000-000000000001',
       { db, client: fakeClient(), sleep: async () => undefined },
@@ -669,6 +673,7 @@ describe('0038: manifest key and configuration probe', () => {
     expect([...RECORDING_FINALIZE_DEFER_REASONS].sort()).toEqual([
       'egress_disabled',
       'egress_identity_mismatch',
+      'manifest_unwritable',
       'object_absent',
       'object_unreadable',
       'poll_timeout',

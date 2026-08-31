@@ -3763,22 +3763,7 @@ def phone_coverage_timeout_sec() -> float:
     env-contract scanner sees the variable this module consumes. The +0.25
     async wrapper (see `judge_phone_coverage`) sits on top of this bound.
     """
-    return _bounded_float(os.getenv("PHONE_COVERAGE_TIMEOUT_SEC"), 4.0, 1.0, 30.0)
-
-
-def phone_coverage_max_consec_errors() -> int:
-    """Bound on consecutive judge_errors before a caution-advance.
-
-    A breaker-open storm produces a run of `judge_error` verdicts, each of
-    which pins the cursor. After this many consecutive errors the coordinator
-    advances past the stalled topic instead of holding indefinitely. Bounded so
-    an operator cannot set it to zero (advance on the first error) or absurdly
-    high (never advance). Read at the CALL SITE with the literal name so the
-    env-contract scanner sees the variable this module consumes.
-    """
-    return int(_bounded_float(
-        os.getenv("PHONE_COVERAGE_MAX_CONSEC_ERRORS"), 3.0, 1.0, 20.0,
-    ))
+    return _bounded_float(os.getenv("PHONE_COVERAGE_TIMEOUT_SEC"), 2.0, 1.0, 30.0)
 
 
 def phone_judge_retries() -> int:
@@ -3793,7 +3778,7 @@ def phone_judge_retries() -> int:
     module consumes. Clamped to [0, 3] — zero disables retry (one attempt), and
     an operator cannot demand an unbounded retry storm.
     """
-    return _bounded_int_env(os.getenv("PHONE_JUDGE_RETRIES"), 1, 0, 3)
+    return _bounded_int_env(os.getenv("PHONE_JUDGE_RETRIES"), 0, 0, 3)
 
 
 def phone_judge_retry_backoff_sec() -> float:
@@ -3861,20 +3846,22 @@ def phone_judge_url() -> str:
     return f"{base_url}/chat/completions"
 
 
+def phone_primary_model() -> str:
+    """Phone-only interviewer model; browser keeps the global GEMINI_MODEL."""
+    return (os.getenv("PHONE_PRIMARY_MODEL") or "gemini-3.5-flash-lite").strip()
+
+
 def phone_judge_model() -> str:
-    """Judge model id; defaults to the speaking LLM's ``GEMINI_MODEL`` value."""
+    """Dedicated judge model; never inherits the speaking-model selection."""
     explicit = os.getenv("PHONE_JUDGE_MODEL", "")
     if explicit:
         return explicit
-    return os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+    return "gemini-3.5-flash-lite"
 
 
 def phone_judge_api_key() -> str:
-    """Judge API key; defaults to the speaking LLM's ``GEMINI_API_KEY``."""
-    explicit = os.getenv("PHONE_JUDGE_API_KEY", "")
-    if explicit:
-        return explicit
-    return os.getenv("GEMINI_API_KEY", "")
+    """Dedicated judge credential; never falls back to the interviewer key."""
+    return os.getenv("PHONE_JUDGE_API_KEY", "")
 
 
 def phone_judge_extra_body() -> dict[str, Any]:
@@ -3889,13 +3876,17 @@ def phone_judge_extra_body() -> dict[str, Any]:
     """
     raw = os.getenv("PHONE_JUDGE_EXTRA_BODY_JSON", "")
     if not raw or not raw.strip():
-        return {}
+        # Gemini 3 models reject reasoning_effort=none. `minimal` is the tested
+        # low-latency setting and keeps the judge distinct from the speaker.
+        return {"reasoning_effort": "minimal"}
     try:
         parsed = json.loads(raw)
     except (TypeError, ValueError, json.JSONDecodeError):
         return {}
     if not isinstance(parsed, dict):
         return {}
+    if str(parsed.get("reasoning_effort", "")).lower() == "none":
+        parsed["reasoning_effort"] = "minimal"
     return parsed
 
 
@@ -4073,6 +4064,9 @@ async def _default_phone_coverage_inference(prompt: str) -> Any:
         # must stay high enough (default 800) that content is non-empty.
         "max_tokens": phone_judge_max_tokens(),
         "response_format": {"type": "json_object"},
+        # Gemini 3-family reasoning cannot be disabled; minimal is the tested
+        # low-latency setting. An invalid optional overlay cannot remove it.
+        "reasoning_effort": "minimal",
         "messages": messages,
     }
     json_body.update(phone_judge_extra_body())
@@ -4086,6 +4080,7 @@ async def _default_phone_coverage_inference(prompt: str) -> Any:
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
+            "Cache-Control": "no-store",
         },
         json_body=json_body,
         endpoint_hint="unknown",
@@ -4155,6 +4150,11 @@ async def judge_phone_coverage(
     backoff = phone_judge_retry_backoff_sec()
     parsed: PhoneCoverageVerdict | None = None
     for attempt in range(attempts):
+        started = time_module.monotonic()
+        _log.info(
+            "unknown_event", error_type="phone_coverage_judge_attempt",
+            error_category="start", turn_index=attempt + 1,
+        )
         try:
             raw = await asyncio.wait_for(
                 infer_fn(prompt),
@@ -4163,6 +4163,12 @@ async def judge_phone_coverage(
             parsed = parse_phone_coverage_verdict(raw)
         except Exception:  # noqa: BLE001
             parsed = None
+        duration = max(0.0, time_module.monotonic() - started)
+        _log.info(
+            "unknown_event", error_type="phone_coverage_judge_attempt",
+            error_category="success" if parsed is not None else "failure",
+            turn_index=attempt + 1, duration_sec=round(duration, 3),
+        )
         if parsed is not None:
             return parsed
         if attempt + 1 < attempts and backoff > 0:
@@ -4449,6 +4455,8 @@ def phone_agent_class(agent_base: Any) -> Any:
             self._say = say
             self._on_user_turn = on_user_turn
             self._on_booking = on_booking
+            self._on_reply_expected: Callable[[], Any] | None = None
+            self._on_reply_delivered: Callable[[bool], Any] | None = None
             self._on_probe = on_probe
             self._on_advance = on_advance
             # `toolfirst` (default) forces the muzzled required-tool pass on every
@@ -4503,44 +4511,6 @@ def phone_agent_class(agent_base: Any) -> Any:
         @staticmethod
         def _tool_name(tool: Any) -> str:
             return str(getattr(tool, "name", None) or getattr(tool, "__name__", ""))
-
-        @staticmethod
-        def _ensure_not_ending_on_model_turn(chat_ctx: Any) -> None:
-            """Gemini flash-lite rejects a context ending on a model turn.
-
-            ``gemini-flash-lite-latest`` returns "400: Requests ending with a
-            model turn are not supported" when the last message is an
-            assistant/model turn with no following user turn. That can happen on
-            the phone lane when a prepared/streamed assistant reply is the last
-            item before the next generation. This appends a MINIMAL neutral user
-            turn so the context ends on a user turn. It is a NO-OP when the
-            context already ends with a user turn (or a non-message item such as
-            a function call/output), and it never removes anything, so no prior
-            turn is lost. Best-effort: any adapter-shape surprise leaves the
-            context untouched rather than raising into the speech path.
-            """
-            try:
-                items = getattr(chat_ctx, "items", None)
-                if items is None and isinstance(chat_ctx, list):
-                    items = chat_ctx
-                if not items:
-                    return
-                last = items[-1]
-                # Only a MESSAGE turn can be the offending "model turn"; a
-                # function_call / function_call_output tail is not what the
-                # provider rejects, so leave those alone.
-                if getattr(last, "type", None) != "message":
-                    return
-                if getattr(last, "role", None) != "assistant":
-                    return
-                adder = getattr(chat_ctx, "add_message", None)
-                if callable(adder):
-                    # A single space is the smallest non-empty user turn; an
-                    # empty string can be dropped by the content normalizer.
-                    adder(role="user", content=" ")
-            except Exception:  # noqa: BLE001
-                # Never let the guard fault the generation.
-                return
 
         async def llm_node(self, chat_ctx: Any, tools: list[Any], model_settings: Any) -> Any:
             """Use a prepared fixed reply without starting a second LLM call.
@@ -4644,11 +4614,10 @@ def phone_agent_class(agent_base: Any) -> Any:
                     model_settings = replace(model_settings, tool_choice="none")
                 except (TypeError, ValueError):
                     pass
-            # Phone-only guard: Gemini flash-lite rejects a context that ends on
-            # a model turn ("400: Requests ending with a model turn are not
-            # supported"). Ensure a trailing user turn before the call. No-op
-            # when the context already ends on a user turn.
-            self._ensure_not_ending_on_model_turn(chat_ctx)
+            # Generated phone replies reach this node only from a real candidate
+            # turn. Never fabricate a neutral user item to repair history: doing
+            # so pollutes the durable transcript and hides an invalid scheduler
+            # call instead of preventing it.
             result = super().llm_node(chat_ctx, tools, model_settings)
             if inspect.isawaitable(result):
                 result = await result
@@ -4684,6 +4653,10 @@ def phone_agent_class(agent_base: Any) -> Any:
                     observed = self._on_user_turn(text, new_message, turn_ctx)
                     if inspect.isawaitable(observed):
                         await observed
+                    if self._on_reply_expected is not None:
+                        expected = self._on_reply_expected()
+                        if inspect.isawaitable(expected):
+                            await expected
                 return
 
             items = getattr(turn_ctx, "items", None)

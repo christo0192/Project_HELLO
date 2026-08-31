@@ -58,11 +58,9 @@ export function egressObjectKey(sessionId: string): string {
 }
 
 /**
- * The manifest object LiveKit writes alongside every egress file.
- *
- * `startAuthoritativeRecording` sets `disableManifest: false`, so a manifest
- * exists for EVERY egress-recorded session — and nothing in this repository
- * ever deleted it, on the erasure path or anywhere else.
+ * The canonical manifest object written by the application finalizer alongside
+ * each authoritative egress file. Provider generation is disabled for phone
+ * egress; the finalizer writes this key after hashing verified bytes.
  *
  * The name is `<filepath>.json`, i.e. `<session-id>-egress.ogg.json` — NOT
  * `<session-id>-egress.json`. That distinction matters: deleting the wrong key
@@ -98,6 +96,7 @@ export const RECORDING_FINALIZE_DEFER_REASONS = [
   'poll_timeout',
   'object_unreadable',
   'object_absent',
+  'manifest_unwritable',
   'provider_error',
   'egress_identity_mismatch',
   'provenance_conflict',
@@ -418,7 +417,11 @@ export async function finalizeAuthoritativeRecording(
   if (error || !session) throw new Error('recording session not found');
   // I‑1: a linked key is only authoritative when it came from the egress.
   // A browser_upload key with a live egress must fall through and be repointed.
-  if (session.recording_object_key && session.recording_provenance === 'livekit_egress') return 'ready';
+  if (
+    session.recording_object_key
+    && session.recording_provenance === 'livekit_egress'
+    && session.mode !== 'live'
+  ) return 'ready';
   if (!session.recording_egress_id) {
     // No egress to defer to. An already-linked key (legacy row, or a fallback
     // the server previously licensed) is final — asking for another upload
@@ -435,6 +438,7 @@ export async function finalizeAuthoritativeRecording(
   const client = deps.client ?? egressClient();
   const egressId = String(session.recording_egress_id);
   let objectKey = egressObjectKey(sessionId);
+  let manifestKey: string | null = null;
   let contentType = 'audio/ogg';
 
   // Phone egress writes an attempt-scoped MP3. The session row stores the
@@ -444,7 +448,7 @@ export async function finalizeAuthoritativeRecording(
   if (session.mode === 'live') {
     const { data: attempt, error: attemptError } = await db
       .from('phone_call_attempts')
-      .select('recording_object_key')
+      .select('recording_object_key, recording_manifest_key')
       .eq('session_id', sessionId)
       .eq('egress_id', egressId)
       .not('recording_object_key', 'is', null)
@@ -454,6 +458,9 @@ export async function finalizeAuthoritativeRecording(
     if (attemptError) throw new Error('phone recording binding read failed');
     if (!attempt?.recording_object_key) return defer('object_absent');
     objectKey = String(attempt.recording_object_key);
+    manifestKey = typeof attempt.recording_manifest_key === 'string'
+      ? attempt.recording_manifest_key
+      : null;
     contentType = 'audio/mpeg';
   }
 
@@ -502,6 +509,46 @@ export async function finalizeAuthoritativeRecording(
   }
 
   const sha256 = createHash('sha256').update(bytes).digest('hex');
+
+  // Phone manifests have exactly one writer: this finalizer. Write only after
+  // the MP3 bytes are bounded and hashed, and verify an existing object by
+  // exact canonical bytes so retries are idempotent rather than overwriting.
+  if (session.mode === 'live') {
+    if (manifestKey !== `${objectKey}.json`) return defer('manifest_unwritable');
+    const manifestInfo = info as unknown as {
+      duration?: bigint | null;
+      endedAt?: bigint | null;
+    };
+    const durationMs = typeof manifestInfo.duration === 'bigint' && manifestInfo.duration > 0n
+      ? Number(manifestInfo.duration / 1_000_000n)
+      : null;
+    const endedMs = typeof manifestInfo.endedAt === 'bigint' && manifestInfo.endedAt > 0n
+      ? Number(manifestInfo.endedAt / 1_000_000n)
+      : null;
+    const manifest = Buffer.from(JSON.stringify({
+      schema_version: 1,
+      object_key: objectKey,
+      content_type: contentType,
+      sha256,
+      size_bytes: bytes.length,
+      provider_duration_ms: Number.isSafeInteger(durationMs) ? durationMs : null,
+      egress_id: egressId,
+      finalized_at: Number.isSafeInteger(endedMs)
+        ? new Date(endedMs as number).toISOString()
+        : null,
+    }));
+    const bucket = db.storage.from(env.recordingsBucket);
+    const uploaded = await bucket.upload(manifestKey, manifest, {
+      contentType: 'application/json',
+      upsert: false,
+    });
+    if (uploaded.error) {
+      const existing = await bucket.download(manifestKey);
+      if (existing.error || !existing.data) return defer('manifest_unwritable');
+      const existingBytes = Buffer.from(await existing.data.arrayBuffer());
+      if (!existingBytes.equals(manifest)) return defer('manifest_unwritable');
+    }
+  }
 
   // ── 0026: authoritative recording-timeline origin ──────────────────
   // EgressInfo.startedAt is bigint nanoseconds on the LiveKit server

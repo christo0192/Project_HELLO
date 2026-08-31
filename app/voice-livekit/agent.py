@@ -111,15 +111,9 @@ def _float_env(name: str, default: float) -> float:
 CANDIDATE_SILENCE_PROMPT_SEC = _float_env("CANDIDATE_SILENCE_PROMPT_SEC", 30.0)
 CANDIDATE_SILENCE_END_SEC = _float_env("CANDIDATE_SILENCE_END_SEC", 20.0)
 PHONE_TERMINAL_REPLY_TIMEOUT_SEC = _float_env("PHONE_TERMINAL_REPLY_TIMEOUT_SEC", 10.0)
-# RECONNECT-B: the BACKGROUND boundary commit must not wait the full terminal
-# reply timeout on `assistant_delivery_complete`. That event is unreliable and
-# routinely times out the full 10s (`delivery_timeout_commit_anyway`); a restart
-# in that window loses the cursor advance while keeping the persisted answer, so
-# resume re-asks the answered question. The wait is BEST-EFFORT, not a
-# correctness fence (the boundary `source_event_id` is fully determined at
-# answer-receipt and the commit is idempotent), so bound it to a tiny window and
-# let the judge + commit run essentially immediately on the captured answer.
-PHONE_JUDGE_COMMIT_DELIVERY_WAIT_SEC = 0.25
+PHONE_SPEECH_FIRST_AUDIO_TIMEOUT_SEC = _float_env(
+    "PHONE_SPEECH_FIRST_AUDIO_TIMEOUT_SEC", 4.0,
+)
 
 
 def _bounded_float_env(name: str, default: float, lo: float, hi: float) -> float:
@@ -1075,17 +1069,13 @@ def _build_provider_session(*, phone_mode: bool = False, turn_mode: str | None =
         # Disabling it here matches what this comment has always claimed.
         # AgentSession still owns EOU, interruption, scheduling and playout.
         #
-        # TOOLLESS re-enables speculation. The reason it was disabled above is
-        # the tool-first lane's DISCARD: the muzzled required-tool pass ran a
-        # Gemini request the lane threw away every substantive turn. Toolless has
-        # no muzzled pass — it is one ordinary generation — so speculating it is
-        # a real latency win. The per-turn instruction is still injected in
-        # `on_user_turn_completed`; if the SDK invalidates the speculation
-        # because of that, it simply falls back to a normal generation, which is
-        # no worse than today's always-normal path — so leave it ON regardless.
-        session_options["preemptive_generation"] = (
-            turn_mode == phone.PHONE_TURN_MODE_TOOLLESS
-        )
+        # Keep speculation OFF for every phone lane. Both tool-first and
+        # toolless inject a per-turn developer instruction in
+        # `on_user_turn_completed`; LiveKit 1.6.4 invalidates a speculative
+        # generation when that context changes. Production showed completed LLM
+        # requests with no TTS on this exact path. Browser/WebRTC construction
+        # never enters this block and retains its existing behavior.
+        session_options["preemptive_generation"] = False
         # X8 (2026-08-29 CPU-starvation): rollback-first endpointing offload. On
         # `local` (DEFAULT) nothing is added here — the SDK's default local
         # endpointing (Silero VAD + v1-mini EOU) runs exactly as today, so
@@ -1112,7 +1102,7 @@ def _build_provider_session(*, phone_mode: bool = False, turn_mode: str | None =
             speaker=os.getenv("SARVAM_TTS_VOICE", "simran"),
         ),
         llm=openai.LLM(
-            model=GEMINI_MODEL,
+            model=phone.phone_primary_model() if phone_mode else GEMINI_MODEL,
             api_key=os.getenv("GEMINI_API_KEY"),
             base_url=GEMINI_BASE_URL,
         ),
@@ -1266,6 +1256,8 @@ async def _run_native_phone_screening(
     latest_candidate_anchor: list[int | None],
     candidate_end_requested: asyncio.Event,
     reply_started: asyncio.Event,
+    speech_first_audio: asyncio.Event,
+    speech_sequence: list[int],
     reply_handle: list[Any],
     assistant_delivery_complete: asyncio.Event,
     candidate_activity: asyncio.Event,
@@ -1288,6 +1280,11 @@ async def _run_native_phone_screening(
     finished = asyncio.Event()
     terminal_reason: dict[str, str] = {}
     terminal_reply_required = {"value": False}
+    # A terminal reply is only a proposal until its speech handle completes.
+    # This keeps callback intent able to cancel an authored closing.
+    pending_terminal_reason: dict[str, str | None] = {"value": None}
+    pending_terminal_speech_seq: dict[str, int | None] = {"value": None}
+    speech_watchdog_task: list[asyncio.Task | None] = [None]
     closing = ClosingStateMachine()
     qna_rounds = {"value": 0}
     silence_prompted = {"value": False}
@@ -1302,6 +1299,7 @@ async def _run_native_phone_screening(
     pending: dict[str, Any] = {
         "question": None, "prompt": None, "candidate": None,
         "message": None, "probe_used": False, "source_event_id": None,
+        "ask_delivered": False,
     }
     # The last successful advance result for the CURRENT reply. Gemini may
     # emit two advance calls in one step, or a second one after the first
@@ -1333,15 +1331,8 @@ async def _run_native_phone_screening(
     # words. A hash prevents the same discrepancy being asked twice.
     coverage_reanchor: dict[str, str | None] = {"question_key": None}
     pending_conflict: dict[str, Any] = {"value": None}
+    conflict_reply_pending: dict[str, bool] = {"value": False}
     asked_conflicts: set[str] = set()
-    # A run of judge_ERRORS (breaker-open storm) is silent: every error leaves
-    # the cursor pinned, so the topic stalls and the candidate hangs up. Count
-    # ONLY consecutive judge_error verdicts; ANY real verdict (covered_model or
-    # not_covered_model) resets it. Once the run reaches the bound, advance past
-    # the stalled topic with caution rather than hold forever. A legitimate run
-    # of not_covered_model ("keep probing") must NEVER trip this — it resets.
-    coverage_error_run: dict[str, int] = {"count": 0}
-
     async def wait_for_activity(timeout: float) -> str:
         """Wait on LiveKit activity or close without creating a turn queue."""
         activity = asyncio.create_task(candidate_activity.wait())
@@ -1438,8 +1429,19 @@ async def _run_native_phone_screening(
             return
         raise RuntimeError("phone_turn_context_unavailable")
 
+    def arm_terminal_reply(reason: str) -> None:
+        terminal_reply_required["value"] = True
+        pending_terminal_reason["value"] = reason
+        # Tool-first may arm terminal intent from a coordinator tool inside the
+        # already-created speech handle; toolless arms it in the user hook before
+        # the next handle exists. Correlate correctly in both lanes.
+        pending_terminal_speech_seq["value"] = (
+            speech_sequence[0] if reply_started.is_set()
+            else speech_sequence[0] + 1
+        )
+
     def _apply_callback_decision(turn_ctx: Any, decision: Any) -> None:
-        """Make the bot SPEAK a callback decision, and end the call if terminal.
+        """Make the bot SPEAK a callback decision, and end after clean playout.
 
         Gemini remains a mouthpiece: the decision's fixed line is injected as the
         exact reply text (both as `reply_plan` and as a speak-verbatim
@@ -1456,9 +1458,7 @@ async def _run_native_phone_screening(
             "ask a screening question and do NOT add anything:\n" + decision.spoken,
         )
         if decision.terminal:
-            terminal_reply_required["value"] = True
-            terminal_reason["reason"] = decision.terminal_reason
-            finished.set()
+            arm_terminal_reply(decision.terminal_reason)
 
     async def wait_for_terminal_reply() -> bool:
         """Wait for the model's goodbye to PLAY TO COMPLETION.
@@ -1507,6 +1507,10 @@ async def _run_native_phone_screening(
         # routing below.
         if endpoint_delay_eou is not None:
             endpoint_delay_eou[0] = _monotonic()
+        # Per-turn speech evidence. A prior reply must never satisfy the current
+        # turn's watchdog or terminal-delivery wait.
+        reply_started.clear()
+        speech_first_audio.clear()
         reply_plan[0] = None
         if finished.is_set():
             from livekit.agents import StopResponse  # noqa: PLC0415
@@ -1515,9 +1519,7 @@ async def _run_native_phone_screening(
             candidate_end_requested.set()
             reply_plan[0] = phone.PHONE_CANDIDATE_END_TEXT
             add_turn_instruction(turn_ctx, "Say exactly the candidate-end compliance closing: end the call now, thank the candidate, and say goodbye. Do not ask another question.")
-            terminal_reply_required["value"] = True
-            terminal_reason["reason"] = phone.HALT_CANDIDATE_ENDED
-            finished.set()
+            arm_terminal_reply(phone.HALT_CANDIDATE_ENDED)
             return
         # ACTIVE CALLBACK NEGOTIATION. Once the candidate has asked for a
         # callback, every subsequent turn belongs to the bounded flow (naming a
@@ -1527,6 +1529,9 @@ async def _run_native_phone_screening(
         # The flow CANNOT loop (phone.run_callback_turn is forward-only); when it
         # reaches DONE it has already ended the call.
         active_flow = callback_flow["state"]
+        if active_flow is not None and active_flow.phase == phone.CALLBACK_PHASE_DONE:
+            from livekit.agents import StopResponse  # noqa: PLC0415
+            raise StopResponse()
         if active_flow is not None and active_flow.phase != phone.CALLBACK_PHASE_DONE:
             decision = await phone.run_callback_turn(
                 active_flow, events, attempt_id, text, datetime.now(timezone.utc),
@@ -1534,6 +1539,24 @@ async def _run_native_phone_screening(
             _apply_callback_decision(turn_ctx, decision)
             return
         question = state.question_at(cursor)
+        # Callback intent outranks Q&A and authored closing. Until the goodbye
+        # has cleanly played, teardown is cancellable and the bounded callback
+        # flow owns subsequent candidate turns.
+        if (
+            closing.state in {ClosingState.CANDIDATE_QNA, ClosingState.CLOSING_PENDING}
+            and phone.candidate_turn_route(text) == "callback_deferral"
+        ):
+            closing.cancel_for_callback()
+            pending_terminal_reason["value"] = None
+            pending_terminal_speech_seq["value"] = None
+            terminal_reply_required["value"] = False
+            flow = phone.CallbackFlowState()
+            callback_flow["state"] = flow
+            decision = await phone.run_callback_turn(
+                flow, events, attempt_id, text, datetime.now(timezone.utc),
+            )
+            _apply_callback_decision(turn_ctx, decision)
+            return
         if closing.state is ClosingState.CANDIDATE_QNA:
             # `completed` remains UNREACHABLE while a planned question is owed.
             # A raced cursor must return to that topic instead of laundering a
@@ -1572,9 +1595,7 @@ async def _run_native_phone_screening(
 
             closing.candidate_questions_handled()
             setattr(agent, "_turn_policy", "closing")
-            terminal_reply_required["value"] = True
-            terminal_reason["reason"] = "completed"
-            finished.set()
+            arm_terminal_reply("completed")
             add_turn_instruction(turn_ctx, close_instruction)
             return
         if silence_prompted["value"]:
@@ -1611,6 +1632,11 @@ async def _run_native_phone_screening(
                     add_turn_instruction(turn_ctx, "Answer briefly from verified role context, then ask this same planned topic again as ONE natural spoken question in your own words:\n" + question.text)
                 return
             if route == "callback_deferral":
+                if closing.state in {ClosingState.CANDIDATE_QNA, ClosingState.CLOSING_PENDING}:
+                    closing.cancel_for_callback()
+                    pending_terminal_reason["value"] = None
+                    pending_terminal_speech_seq["value"] = None
+                    terminal_reply_required["value"] = False
                 # RE-LOOPED SAFELY (this PR): a "call me back later" now ENTERS a
                 # BOUNDED negotiation. The worker resolves the requested time
                 # deterministically, proposes+confirms against the server, and
@@ -1647,6 +1673,16 @@ async def _run_native_phone_screening(
                 setattr(agent, "_turn_policy", "patience_suppressed")
                 from livekit.agents import StopResponse  # noqa: PLC0415
                 raise StopResponse()
+        if conflict_reply_pending["value"]:
+            # This candidate turn answers the one bounded resume-conflict
+            # clarification, not a screening-plan question. Consume it and ask
+            # the still-owed deterministic topic; never commit it under the
+            # cursor merely because a judge result arrived asynchronously.
+            conflict_reply_pending["value"] = False
+            setattr(agent, "_turn_policy", "clarification")
+            if question is not None:
+                add_turn_instruction(turn_ctx, phone_question_instructions(question, state.role_title))
+            return
         if _native_turn_predates_question(message, latest_assistant_anchor[0]):
             from livekit.agents import StopResponse  # noqa: PLC0415
             raise StopResponse()
@@ -1727,6 +1763,7 @@ async def _run_native_phone_screening(
                         # Mark asked when the instruction enters this turn's
                         # model context, not when the judge merely proposes it.
                         asked_conflicts.add(conflict_key)
+                        conflict_reply_pending["value"] = True
                 pending_conflict["value"] = None
             elif coverage_reanchor.get("question_key") == question.key:
                 judge_instruction = phone.phone_judge_turn_instruction(
@@ -1734,6 +1771,7 @@ async def _run_native_phone_screening(
                 )
                 coverage_reanchor["question_key"] = None
 
+        coverage_hint = phone.phone_coverage_precheck(question.text, prompt)
         pending.update({
             "question": question,
             "prompt": prompt,
@@ -1743,6 +1781,10 @@ async def _run_native_phone_screening(
             "probe_used": False,
             "source_event_id": phone.plan_source_event_id(question.key),
             "expected_index": cursor,
+            # Snapshot the exact preceding ask's delivery evidence before
+            # LiveKit creates/clears state for the current reply.
+            "ask_delivered": True,
+            "coverage_hint": coverage_hint,
         })
         last_advance["text"] = None
         latest_candidate_anchor[0] = None
@@ -1754,13 +1796,28 @@ async def _run_native_phone_screening(
             # current-question context, minus the "call exactly ONE coordinator
             # tool" requirement). The durable boundary is committed in the
             # BACKGROUND after the reply is delivered — see `commit_after_reply`.
-            turn_instruction = judge_instruction or (
-                phone_question_instructions(question, state.role_title)
-                + "\n\nBriefly acknowledge one specific detail from the candidate's "
-                "answer, then ask the next planned topic — or, if their answer was "
-                "thin, one natural same-topic follow-up (your judgment) — as ONE "
-                "question in your own words."
-            )
+            next_question = state.question_at(cursor + 1)
+            if coverage_hint is True:
+                if next_question is None:
+                    planned_instruction = (
+                        "Briefly acknowledge one specific detail, then ask exactly: "
+                        "Do you have any questions about the role, team, company, "
+                        "or process? Do not say goodbye yet."
+                    )
+                else:
+                    planned_instruction = (
+                        "Briefly acknowledge one specific detail, then ask exactly "
+                        "ONE natural question covering this next planned topic: "
+                        + next_question.text
+                    )
+            else:
+                # Uncertain/failed coverage never speculates forward. The judge
+                # may commit in the background, but this speech safely re-asks
+                # the same keyed topic and cannot skip it.
+                planned_instruction = phone.phone_judge_turn_instruction(
+                    question.text, reanchor=True,
+                ) or phone_question_instructions(question, state.role_title)
+            turn_instruction = judge_instruction or planned_instruction
             add_turn_instruction(turn_ctx, turn_instruction)
             # The judge/commit task is CREATED and returned to the event loop;
             # it is never awaited on this candidate→reply speech path.
@@ -1863,9 +1920,7 @@ async def _run_native_phone_screening(
                     add_turn_instruction(boundary["turn_ctx"], "The screening is complete. Ask the candidate whether they have any questions about the role, team, company, or process. Do not say goodbye yet.")
                 last_advance["text"] = "Advance authorized. Ask whether the candidate has any questions. Do not close the call yet."
                 return last_advance["text"]
-            terminal_reply_required["value"] = True
-            terminal_reason["reason"] = "completed"
-            finished.set()
+            arm_terminal_reply("completed")
             if boundary.get("turn_ctx") is not None:
                 add_turn_instruction(boundary["turn_ctx"], "Thank the candidate briefly, say goodbye, and complete the final closing. Do not ask another question.")
             last_advance["text"] = "Advance authorized. Thank the candidate briefly, say goodbye, and complete the final closing."
@@ -1952,6 +2007,12 @@ async def _run_native_phone_screening(
         """
         boundary = exchange if isinstance(exchange, dict) else pending
         candidate_text = boundary.get("candidate")
+        if boundary.get("ask_delivered") is not True:
+            _log.info(
+                "unknown_event", error_type="phone_toolless_commit",
+                error_category="ask_not_delivered_commit_skipped",
+            )
+            return
         if (
             phone.phone_patience_gate_enabled()
             and phone.phone_turn_substance(candidate_text)
@@ -1962,25 +2023,9 @@ async def _run_native_phone_screening(
                 error_category="non_substantive_commit_skipped",
             )
             return
-        try:
-            # RECONNECT-B: bound the BEST-EFFORT delivery wait to a tiny window
-            # instead of the full terminal reply timeout, so the judge + commit
-            # run essentially immediately on the already-captured answer. A
-            # restart no longer loses the cursor advance for ~10s while the
-            # persisted answer survives (which caused resume to re-ask the
-            # answered question). The boundary is idempotent on `source_event_id`.
-            await asyncio.wait_for(
-                assistant_delivery_complete.wait(),
-                timeout=PHONE_JUDGE_COMMIT_DELIVERY_WAIT_SEC,
-            )
-        except asyncio.TimeoutError:
-            # The reply never signalled delivery. The boundary is about the
-            # already-captured ask/answer; the judge still runs fail-closed.
-            _log.info(
-                "unknown_event", error_type="phone_toolless_commit",
-                error_category="delivery_timeout_commit_anyway",
-            )
-
+        # Judge/commit starts immediately from the immutable ask/answer
+        # snapshot. Current-reply delivery is an independent speech lifecycle
+        # concern and never gates this background work.
         if not coverage_judge_enabled:
             await apply_background_advance()
             return
@@ -1989,24 +2034,12 @@ async def _run_native_phone_screening(
         # Snapshot inputs above keep candidate text isolated; this lock orders
         # only the BACKGROUND judge/commit tasks. No speech hook waits on it.
         async with commit_lock:
-            # A very short candidate turn can arrive before the previous judge
-            # settles. Rebase that immutable exchange onto the CURRENT earliest
-            # owed topic, then let the same coverage verdict decide it. If the
-            # assistant really asked that next topic, it commits in order; if it
-            # did not, fail-to-reask keeps the cursor there. Nothing is skipped.
+            # A boundary is immutable. A late result may be an idempotent result
+            # for an already-advanced key, but it is NEVER rebound to the current
+            # cursor (which would attach one answer to another question).
             expected_index = boundary.get("expected_index")
-            if isinstance(expected_index, int) and expected_index < cursor:
-                current_question = state.question_at(cursor)
-                if current_question is None:
-                    return
-                boundary = dict(boundary)
-                boundary.update({
-                    "question": current_question,
-                    "expected_index": cursor,
-                    "source_event_id": phone.plan_source_event_id(
-                        current_question.key,
-                    ),
-                })
+            if not isinstance(expected_index, int) or expected_index != cursor:
+                return
 
             question = boundary.get("question")
             prompt = boundary.get("prompt")
@@ -2020,6 +2053,15 @@ async def _run_native_phone_screening(
                     False, None, "judge_error",
                 )
             else:
+                # Strict deterministic coverage owns obvious question asks and
+                # advances before provider latency. With résumé evidence the
+                # model still runs in shadow for conflicts, but its coverage
+                # disagreement cannot undo or delay the deterministic commit.
+                deterministic_commit = boundary.get("coverage_hint") is True
+                if deterministic_commit:
+                    await apply_background_advance(boundary)
+                    if terminal_reason.get("reason") == phone.HALT_PERSISTENCE:
+                        return
                 # Rolling window: the prior committed turns plus the in-flight
                 # bot/candidate pair, so a claim fragmented across turns is
                 # visible to the judge against the résumé. Same source as
@@ -2061,15 +2103,6 @@ async def _run_native_phone_screening(
                 error_category=log_category,
             )
 
-            # Track ONLY a run of judge_ERRORS. Any real verdict (a model or
-            # deterministic covered/not-covered) is the judge working, so it
-            # resets the run — a legitimate string of not_covered_model ("keep
-            # probing") therefore never trips the caution-advance below.
-            if source_category == "judge_error":
-                coverage_error_run["count"] += 1
-            else:
-                coverage_error_run["count"] = 0
-
             conflict = verdict.conflict
             if isinstance(conflict, dict):
                 key = phone.phone_conflict_key(conflict)
@@ -2085,24 +2118,18 @@ async def _run_native_phone_screening(
                         error_category="probe_queued",
                     )
 
-            if not verdict.covered:
-                # Advance-with-caution: a run of judge_ERRORS (not a run of
-                # legitimate not_covered_model — that resets the counter above)
-                # has pinned the cursor long enough to stall the topic. Rather
-                # than hold forever and let the candidate hang up, advance past
-                # the stalled topic and reset the run. Distinct bounded log.
-                if coverage_error_run["count"] >= phone.phone_coverage_max_consec_errors():
-                    coverage_error_run["count"] = 0
-                    _log.warn(
+            if boundary.get("coverage_hint") is True:
+                if not verdict.covered:
+                    _log.info(
                         "unknown_event", error_type="phone_coverage_judge",
-                        error_category="caution_advance",
+                        error_category="shadow_coverage_disagreement",
                     )
-                    await apply_background_advance(boundary)
-                    return
+                return
+            if not verdict.covered:
                 if isinstance(question, phone.PhonePlanQuestion):
                     coverage_reanchor["question_key"] = question.key
-                # Fail toward re-asking. No cursor write, and no terminal halt:
-                # the next turn receives the explicit owed-topic repair.
+                # Timeout, malformed output, breaker-open, and a real negative
+                # all fail toward re-asking. No error count can advance a topic.
                 return
 
             await apply_background_advance(boundary)
@@ -2115,16 +2142,91 @@ async def _run_native_phone_screening(
             if inspect.isawaitable(value):
                 await value
 
+    async def on_reply_expected() -> None:
+        """Arm one bounded generated-speech watchdog for this accepted turn."""
+        previous = speech_watchdog_task[0]
+        if previous is not None and not previous.done():
+            previous.cancel()
+
+        async def monitor() -> None:
+            try:
+                await asyncio.wait_for(
+                    speech_first_audio.wait(),
+                    timeout=max(0.05, PHONE_SPEECH_FIRST_AUDIO_TIMEOUT_SEC),
+                )
+                return
+            except asyncio.TimeoutError:
+                _log.warn(
+                    "unknown_event", error_type="phone_speech_lifecycle",
+                    error_category=(
+                        "no_first_audio" if reply_started.is_set()
+                        else "no_speech_created"
+                    ),
+                )
+            except asyncio.CancelledError:
+                return
+
+            # Cancel the stale/late primary before creating one fixed fallback.
+            interrupt = getattr(session, "interrupt", None)
+            if callable(interrupt):
+                try:
+                    value = interrupt()
+                    if inspect.isawaitable(value):
+                        await value
+                except Exception:  # noqa: BLE001
+                    pass
+            question = state.question_at(cursor)
+            fallback = reply_plan[0]
+            if not isinstance(fallback, str) or not fallback.strip():
+                fallback = (
+                    question.text if question is not None
+                    else phone.PHONE_ASSESSMENT_CLOSING_TEXT
+                )
+            if pending_terminal_reason.get("value") is not None:
+                pending_terminal_speech_seq["value"] = speech_sequence[0] + 1
+            try:
+                speech = session.say(fallback, allow_interruptions=False)
+                wait = getattr(speech, "wait_for_playout", None)
+                if callable(wait):
+                    value = wait()
+                    if inspect.isawaitable(value):
+                        await value
+            except Exception:  # noqa: BLE001
+                _log.warn(
+                    "unknown_event", error_type="phone_speech_lifecycle",
+                    error_category="fallback_failed",
+                )
+
+        speech_watchdog_task[0] = asyncio.create_task(monitor())
+
+    async def on_reply_delivered(
+        interrupted: bool = False, delivered_seq: int | None = None,
+    ) -> None:
+        """Commit terminal intent only for its correlated speech handle."""
+        reason = pending_terminal_reason.get("value")
+        expected_seq = pending_terminal_speech_seq.get("value")
+        if delivered_seq is None:
+            delivered_seq = expected_seq  # explicit direct-test/fallback seam
+        if reason is None or interrupted or delivered_seq != expected_seq:
+            return
+        pending_terminal_reason["value"] = None
+        pending_terminal_speech_seq["value"] = None
+        terminal_reason["reason"] = reason
+        if reason == "completed" and closing.state is ClosingState.CLOSING_PENDING:
+            closing.closing_delivered()
+        finished.set()
+
     async def on_booking(turn: Any) -> None:
         if bool(getattr(turn, "booked", False)):
-            terminal_reason["reason"] = phone.HALT_CALLBACK_SCHEDULED
-            finished.set()
+            arm_terminal_reply(phone.HALT_CALLBACK_SCHEDULED)
 
     # The same fully instructed Agent instance was installed at SIP answer.
     # Consent changes authorization only; there is no post-start prompt
     # mutation, read-back verifier, or scheduler swap.
     setattr(agent, "_on_user_turn", on_native_turn)
     setattr(agent, "_on_booking", on_booking)
+    setattr(agent, "_on_reply_expected", on_reply_expected)
+    setattr(agent, "_on_reply_delivered", on_reply_delivered)
     setattr(agent, "_on_probe", on_probe)
     setattr(agent, "_on_advance", on_advance)
     # Test seam (same idiom as `_on_advance`/`_on_probe`): the background commit
@@ -2136,8 +2238,8 @@ async def _run_native_phone_screening(
     setattr(agent, "_pending", pending)
     setattr(agent, "_coverage_reanchor", coverage_reanchor)
     setattr(agent, "_pending_conflict", pending_conflict)
+    setattr(agent, "_conflict_reply_pending", conflict_reply_pending)
     setattr(agent, "_asked_conflicts", asked_conflicts)
-    setattr(agent, "_coverage_error_run", coverage_error_run)
     setattr(agent, "_native_turns", True)
     authorize = getattr(agent, "authorize_screening", None)
     if not callable(authorize):
@@ -2166,47 +2268,18 @@ async def _run_native_phone_screening(
         terminal_reason["reason"] = "completed"
         finished.set()
     else:
-        # The first post-consent question is delivered through Gemini in the
-        # tool-less "opening" policy so it is phrased naturally — the same
-        # behavior the browser lane has always had. PR #157 pinned this to
-        # fixed `session.say` because a stale policy transition could trap the
-        # opening generation in a required-tool loop until LiveKit exhausted
-        # its function-step budget and closed the room. That trap is now
-        # structurally disarmed: the tool-resolved latch releases speech after
-        # one tool resolution and a duplicate advance is answered
-        # idempotently, so the worst a raced generation can do is speak. The
-        # fixed-text path remains as the fallback when the LLM path is
-        # unavailable, and the WHICH-question authority is unchanged — it is
-        # this call site and the committed key, never the spoken prose.
-        spoke = False
-        generate = getattr(session, "generate_reply", None)
-        if callable(generate):
-            setattr(agent, "_turn_policy", "opening")
-            try:
-                handle = generate(instructions=phone_question_instructions(question, state.role_title))
-                if inspect.isawaitable(handle):
-                    handle = await handle
-                wait = getattr(handle, "wait_for_playout", None)
-                if callable(wait):
-                    value = wait()
-                    if inspect.isawaitable(value):
-                        await value
-                spoke = True
-            except Exception:  # noqa: BLE001
-                _log.warn(
-                    "unknown_event", error_type="phone_first_question_fallback",
-                    error_category="generate_reply_failed",
-                )
-                spoke = False
-            finally:
-                setattr(agent, "_turn_policy", "substantive")
-        if not spoke:
-            speech = session.say(question.text, allow_interruptions=True)
-            wait = getattr(speech, "wait_for_playout", None)
-            if callable(wait):
-                value = wait()
-                if inspect.isawaitable(value):
-                    await value
+        # The first planned question is deterministic fixed speech. Starting a
+        # second instruction-only Gemini generation here can serialize a context
+        # whose last conversational item is the assistant role-opening line,
+        # which Gemini rejects as "Requests ending with a model turn are not
+        # supported." Later generated replies always originate from a real
+        # candidate turn.
+        speech = session.say(question.text, allow_interruptions=True)
+        wait = getattr(speech, "wait_for_playout", None)
+        if callable(wait):
+            value = wait()
+            if inspect.isawaitable(value):
+                await value
         # F0a — PRIME THE NATIVE TURN TRACKING AT THE GATE HANDOFF.
         # The first planned question is delivered HERE, at the consent→screening
         # handoff, through `generate_reply`/`say`. The native turn hook
@@ -2254,6 +2327,10 @@ async def _run_native_phone_screening(
     finally:
         silence_task.cancel()
         await asyncio.gather(silence_task, return_exceptions=True)
+        watchdog = speech_watchdog_task[0]
+        if watchdog is not None and not watchdog.done():
+            watchdog.cancel()
+            await asyncio.gather(watchdog, return_exceptions=True)
         # TOOLLESS: let any in-flight background commit finish so a boundary the
         # candidate already answered is not lost to teardown, but bound the wait
         # so a wedged commit cannot hold the leg open. A commit that does not
@@ -2272,8 +2349,12 @@ async def _run_native_phone_screening(
                     await asyncio.gather(*pending_commits, return_exceptions=True)
 
     reason = terminal_reason.get("reason")
-    if terminal_reply_required["value"]:
-        terminal_reply_played = await wait_for_terminal_reply()
+    if terminal_reply_required["value"] and reason != "disconnect":
+        # Reaching a non-disconnect terminal reason now means the correlated
+        # speech handle already completed: `on_reply_delivered` is the only
+        # place that commits pending terminal intent. Do not wait on a reused
+        # session event that a later turn can clear.
+        terminal_reply_played = pending_terminal_reason.get("value") is None
         # F3 (call 24): the goodbye MUST be spoken. When the model's terminal
         # reply did not play to completion — it was interrupted mid-sentence
         # ("...your time and", room closed), or it never started — speak the
@@ -2534,6 +2615,8 @@ async def _run_phone_session(
     )
     session = _build_phone_provider_session(turn_mode)
     reply_started = asyncio.Event()
+    speech_first_audio = asyncio.Event()
+    speech_sequence: list[int] = [0]
     assistant_delivery_complete = asyncio.Event()
     reply_handle: list[Any] = [None]
     # PR-2 change 2: the ENDPOINT DELAY (EOU -> LLM-invoke), previously
@@ -2547,6 +2630,8 @@ async def _run_phone_session(
 
     @session.on("speech_created")
     def _on_phone_speech_created(event):  # noqa: ANN001
+        speech_sequence[0] += 1
+        created_seq = speech_sequence[0]
         reply_handle[0] = getattr(event, "speech_handle", None)
         # PR-2 change 2: reply generation is starting (t_invoke). If a candidate
         # turn stamped t_EOU, emit the endpoint delay and CONSUME the stamp so a
@@ -2574,7 +2659,16 @@ async def _run_phone_session(
                     value = wait()
                     if inspect.isawaitable(value):
                         await value
-                    assistant_delivery_complete.set()
+                    interrupted = bool(getattr(handle, "interrupted", False))
+                    if interrupted:
+                        assistant_delivery_complete.clear()
+                    else:
+                        assistant_delivery_complete.set()
+                    delivered = getattr(agent, "_on_reply_delivered", None)
+                    if callable(delivered):
+                        observed = delivered(interrupted, created_seq)
+                        if inspect.isawaitable(observed):
+                            await observed
                 except Exception:
                     assistant_delivery_complete.clear()
             asyncio.create_task(mark_delivered())
@@ -2617,6 +2711,7 @@ async def _run_phone_session(
         new_state = getattr(event, "new_state", None)
         if new_state == "speaking":
             latest_assistant_anchor[0] = int(round(time.time() * 1000))
+            speech_first_audio.set()
         if new_state in {"idle", "listening"}:
             agent_listening.set()
         else:
@@ -3046,6 +3141,8 @@ async def _run_phone_session(
             latest_candidate_anchor=latest_candidate_anchor,
             candidate_end_requested=candidate_end_requested,
             reply_started=reply_started,
+            speech_first_audio=speech_first_audio,
+            speech_sequence=speech_sequence,
             reply_handle=reply_handle,
             assistant_delivery_complete=assistant_delivery_complete,
             candidate_activity=candidate_activity,
@@ -3221,9 +3318,16 @@ async def _run_session(
 ) -> None:
     # LLM-06: claim provenance before any provider construction. The same
     # configured model is then supplied directly to Gemini below.
+    # Phone has an explicit speaker model while browser/WebRTC retains the
+    # existing global model. Record the actual requested model for provenance.
+    provenance_model = (
+        phone.phone_primary_model()
+        if phone.is_phone_room(room_name)
+        else GEMINI_MODEL
+    )
     claim = await persistence.set_session_provenance(
         session_id,
-        screening_provenance(GEMINI_MODEL),
+        screening_provenance(provenance_model),
     )
     if claim not in {
         persistence.ClaimResult.CLAIMED,

@@ -125,8 +125,9 @@ describe('enqueueScorecardWrite — one scorecard per application link, ever', (
     expect(result).toEqual({ status: 'inserted' });
     expect(rpc).toHaveBeenCalledTimes(1);
     const [fn, args] = rpc.mock.calls[0] as unknown as [string, Record<string, unknown>];
-    expect(fn).toBe('enqueue_ashby_operation');
-    expect(args.p_operation_type).toBe('scorecard_write');
+    expect(fn).toBe('enqueue_ashby_cycle_scorecard');
+    expect(args.p_application_link_id).toBe(LINK_ID);
+    expect(args.p_session_id).toBe(SESSION_ID);
     expect(args.p_operation_key).toBe(`ashby:scorecard:link:${LINK_ID}`);
     // The key must NOT carry the content marker: a marker change must never
     // mint a second operation_key and slip past uq_ashby_operations_key.

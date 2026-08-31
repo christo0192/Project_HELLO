@@ -439,25 +439,19 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
       };
       const built = buildScorecard(source, { min: 1, max: 4 });
       if (!built.ok) return { status: `scorecard_${built.reason}` };
-      const result = cycleNumber > 1
-        ? await client.rpc('enqueue_ashby_cycle_scorecard', {
-          p_application_link_id: applicationLinkId,
-          p_session_id: sessionId,
-          p_operation_key: `ashby:scorecard:cycle:${applicationLinkId}:${sessionId}`,
-          p_marker: built.marker,
-          p_actor_id: actorId,
-          p_now: new Date().toISOString(),
-        })
-        : await client.rpc('enqueue_ashby_operation', {
-          p_application_link_id: applicationLinkId,
-          p_operation_type: 'scorecard_write',
-          // Link-derived and marker-INDEPENDENT for the initial cycle: the
-          // existing unique key remains the durable one-scorecard guard.
-          p_operation_key: `ashby:scorecard:link:${applicationLinkId}`,
-          p_depends_on: null,
-          p_marker: built.marker,
-          p_actor_id: actorId,
-        });
+      // Every cycle, including the initial one, must bind the exact assessment
+      // session before the operation can be claimed. The link-derived initial
+      // key preserves the existing one-scorecard-per-link idempotency guard.
+      const result = await client.rpc('enqueue_ashby_cycle_scorecard', {
+        p_application_link_id: applicationLinkId,
+        p_session_id: sessionId,
+        p_operation_key: cycleNumber > 1
+          ? `ashby:scorecard:cycle:${applicationLinkId}:${sessionId}`
+          : `ashby:scorecard:link:${applicationLinkId}`,
+        p_marker: built.marker,
+        p_actor_id: actorId,
+        p_now: new Date().toISOString(),
+      });
       if (result.error) throw new Error('ashby_scorecard_enqueue_error');
       return { status: statusOf(result.data) };
     },

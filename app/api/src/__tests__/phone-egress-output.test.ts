@@ -143,7 +143,7 @@ describe('createPhoneEgressOutput — the descriptor the recording is written th
     process.env.RECORDINGS_BUCKET = 'recordings_v2';
   });
 
-  it('writes to the EXACT key it is given, as MP3, with the manifest ENABLED', async () => {
+  it('writes to the EXACT key it is given, as MP3, with provider manifest generation disabled', async () => {
     const mod = await load();
     await mod.createPhoneEgressOutput('phone-abc-egress.mp3');
 
@@ -154,7 +154,7 @@ describe('createPhoneEgressOutput — the descriptor the recording is written th
     // The manifest is WANTED. 0043 stores its key alongside the recording's
     // precisely so a purge deletes both; disabling it would make that column
     // dead weight and leave the purge describing an object that never existed.
-    expect(options.disableManifest).toBe(false);
+    expect(options.disableManifest).toBe(true);
   });
 
   it('does not rewrite, prefix or sanitize the key it is handed', async () => {
