@@ -11,6 +11,7 @@ import time
 import asyncio
 import inspect
 import logging
+import math
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
@@ -265,8 +266,25 @@ def _record_provider_metrics(event: Any) -> None:
         )
 
 
+def _emit_phone_latency_segment(schema: str, duration: float) -> None:
+    """Emit one bounded, content-free phone latency segment."""
+    try:
+        if not math.isfinite(duration) or duration < 0.0 or duration > 120.0:
+            return
+        _safe_emit(
+            histogram_metric, "voice_phone_latency_segment_sec", duration,
+            {"channel": "phone", "schema": schema},
+        )
+        _log.info(
+            "unknown_event", error_type="voice_phone_latency_segment",
+            schema=schema, duration_sec=round(duration, 3),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _emit_phone_endpoint_delay(t_eou: float, now: float) -> None:
-    """Emit the PHONE endpoint delay (EOU -> LLM-invoke) — content-free.
+    """Emit completed-turn callback -> reply creation, content-free.
 
     PR-2 change 2. ``t_eou`` and ``now`` are MONOTONIC timestamps stamped at the
     top of the phone EOU callback and at reply creation respectively. Emits a
@@ -283,11 +301,11 @@ def _emit_phone_endpoint_delay(t_eou: float, now: float) -> None:
             return
         _safe_emit(
             histogram_metric, "voice_endpoint_delay_sec", delta,
-            {"channel": "phone", "schema": "eou_to_llm"},
+            {"channel": "phone", "schema": "turn_callback_to_reply_created"},
         )
         _log.info(
             "unknown_event", error_type="voice_endpoint_delay",
-            schema="eou_to_llm", duration_sec=round(delta, 3),
+            schema="turn_callback_to_reply_created", duration_sec=round(delta, 3),
         )
     except Exception:  # noqa: BLE001
         pass
@@ -1103,12 +1121,24 @@ def _build_provider_session(*, phone_mode: bool = False, turn_mode: str | None =
         # this whole block is `phone_mode`-gated, so the browser session never
         # receives `turn_detection`. Logged once below at construction.
         turn_detection = phone.phone_turn_detection()
+        endpoint_min, endpoint_max = phone.phone_local_endpointing_delays()
         if turn_detection == phone.PHONE_TURN_DETECTION_STT:
             session_options["turn_detection"] = "stt"
+        else:
+            # Local Silero VAD + LiveKit v1-mini EOU, with a bounded tail.
+            session_options["min_endpointing_delay"] = endpoint_min
+            session_options["max_endpointing_delay"] = endpoint_max
         _log.info(
             "unknown_event", error_type="phone_turn_detection",
             error_category=turn_detection,
+            duration_sec=endpoint_max if turn_detection == phone.PHONE_TURN_DETECTION_LOCAL else None,
         )
+        if turn_detection == phone.PHONE_TURN_DETECTION_LOCAL:
+            _log.info(
+                "unknown_event", error_type="phone_endpointing_bounds",
+                schema="silero_v1_mini", duration_sec=endpoint_min,
+                max_duration_sec=endpoint_max,
+            )
 
     session = AgentSession(
         stt=sarvam.STT(
@@ -1118,6 +1148,8 @@ def _build_provider_session(*, phone_mode: bool = False, turn_mode: str | None =
         tts=sarvam.TTS(
             model=os.getenv("SARVAM_TTS_MODEL", "bulbul:v3"),
             speaker=os.getenv("SARVAM_TTS_VOICE", "simran"),
+            pace=1.0,
+            temperature=0.8,
         ),
         llm=openai.LLM(
             model=phone.phone_primary_model() if phone_mode else GEMINI_MODEL,
@@ -1283,6 +1315,7 @@ async def _run_native_phone_screening(
     agent_activity_changed: asyncio.Event,
     close_event: asyncio.Event,
     endpoint_delay_eou: list[float | None] | None = None,
+    latency_state: dict[str, float | None] | None = None,
     turn_mode: str = phone.PHONE_TURN_MODE_TOOLFIRST,
     coverage_judge_enabled: bool = False,
 ) -> phone.PhoneGateResult:
@@ -1523,8 +1556,33 @@ async def _run_native_phone_screening(
         # content-free (no transcript touched), and it never mutates the
         # ChatContext. The stamp is a plain assignment so it cannot fail the
         # routing below.
+        callback_mono = _monotonic()
+        callback_wall = time.time()
         if endpoint_delay_eou is not None:
-            endpoint_delay_eou[0] = _monotonic()
+            endpoint_delay_eou[0] = callback_mono
+        if latency_state is not None:
+            latency_state["turn_callback_mono"] = callback_mono
+            metrics = getattr(message, "metrics", None)
+            stopped_ms = (
+                persistence.normalize_turn_anchor_ms(metrics.get("stopped_speaking_at"))
+                if isinstance(metrics, Mapping) else None
+            )
+            stopped_wall = stopped_ms / 1000.0 if stopped_ms is not None else None
+            latency_state["speech_end_wall"] = stopped_wall
+            final_wall = latency_state.get("final_transcript_wall")
+            if stopped_wall is not None:
+                _emit_phone_latency_segment(
+                    "speech_end_to_turn_callback", callback_wall - stopped_wall,
+                )
+                if final_wall is not None and final_wall >= stopped_wall:
+                    _emit_phone_latency_segment(
+                        "speech_end_to_final_transcript", final_wall - stopped_wall,
+                    )
+            if final_wall is not None and callback_wall >= final_wall:
+                _emit_phone_latency_segment(
+                    "final_transcript_to_turn_callback", callback_wall - final_wall,
+                )
+            latency_state["final_transcript_wall"] = None
         # Per-turn speech evidence. A prior reply must never satisfy the current
         # turn's watchdog or terminal-delivery wait.
         reply_started.clear()
@@ -1575,6 +1633,20 @@ async def _run_native_phone_screening(
             )
             _apply_callback_decision(turn_ctx, decision)
             return
+        if closing.state in {ClosingState.CLOSING_PENDING, ClosingState.CLOSING_PLAYED}:
+            # Callback intent was handled above. Every other utterance after the
+            # bounded Q&A has entered closing is terminal acknowledgement/noise,
+            # never a new screening exchange. Completion wins idempotently even
+            # if final STT races the goodbye playout callback.
+            pending_terminal_reason["value"] = None
+            pending_terminal_speech_seq["value"] = None
+            terminal_reply_required["value"] = False
+            terminal_reason["reason"] = "completed"
+            if closing.state is ClosingState.CLOSING_PENDING:
+                closing.closing_delivered()
+            finished.set()
+            from livekit.agents import StopResponse  # noqa: PLC0415
+            raise StopResponse()
         if closing.state is ClosingState.CANDIDATE_QNA:
             # `completed` remains UNREACHABLE while a planned question is owed.
             # A raced cursor must return to that topic instead of laundering a
@@ -1595,20 +1667,24 @@ async def _run_native_phone_screening(
                 )
             else:
                 qna_rounds["value"] += 1
+                company_review = phone.is_company_review_question(text)
+                grounded_answer = (
+                    "Say exactly: " + phone.PHONE_COMPANY_REVIEW_RESPONSE + " "
+                    if company_review else
+                    "Answer the candidate's question briefly using only verified role context. "
+                )
                 if qna_rounds["value"] < phone.PHONE_QNA_MAX_ROUNDS:
                     setattr(agent, "_turn_policy", "clarification")
                     add_turn_instruction(
                         turn_ctx,
-                        "Answer the candidate's question briefly from verified "
-                        "role context. Then ask exactly: Anything else you'd "
-                        "like to ask? Do not say goodbye yet.",
+                        grounded_answer + "Then ask exactly: Anything else you'd "
+                        "like to ask? Do not say goodbye yet and do not add unsupported claims.",
                     )
                     return
                 close_instruction = (
-                    "Answer the candidate's question briefly from verified role "
-                    "context. This is the final Q&A round: then thank them, say "
+                    grounded_answer + "This is the final Q&A round: then thank them, say "
                     "the team will be in touch, and say goodbye. Do not ask "
-                    "another question."
+                    "another question and do not add unsupported claims."
                 )
 
             closing.candidate_questions_handled()
@@ -2299,6 +2375,9 @@ async def _run_native_phone_screening(
     setattr(agent, "_pending_conflict", pending_conflict)
     setattr(agent, "_conflict_reply_pending", conflict_reply_pending)
     setattr(agent, "_asked_conflicts", asked_conflicts)
+    setattr(agent, "_closing_state_machine", closing)
+    setattr(agent, "_native_finished", finished)
+    setattr(agent, "_native_terminal_reason", terminal_reason)
     setattr(agent, "_native_turns", True)
     authorize = getattr(agent, "authorize_screening", None)
     if not callable(authorize):
@@ -2686,6 +2765,12 @@ async def _run_phone_session(
     # "no EOU stamped yet" — the first turn / a reply not triggered by a
     # candidate turn — and the log is skipped rather than fabricated.
     endpoint_delay_eou: list[float | None] = [None]
+    latency_state: dict[str, float | None] = {
+        "speech_end_wall": None,
+        "final_transcript_wall": None,
+        "turn_callback_mono": None,
+        "speech_created_mono": None,
+    }
 
     @session.on("speech_created")
     def _on_phone_speech_created(event):  # noqa: ANN001
@@ -2697,10 +2782,12 @@ async def _run_phone_session(
         # later reply on the same session cannot re-fire against a stale EOU.
         # Content-free (a duration only) and defensively guarded — an
         # instrumentation failure must never perturb the reply lifecycle.
+        created_mono = _monotonic()
+        latency_state["speech_created_mono"] = created_mono
         t_eou = endpoint_delay_eou[0]
         if t_eou is not None:
             endpoint_delay_eou[0] = None
-            _emit_phone_endpoint_delay(t_eou, _monotonic())
+            _emit_phone_endpoint_delay(t_eou, created_mono)
         reply_started.set()
         # Once an authorized reply has been created, the next interim
         # generation must default to substantive tool-first policy. The
@@ -2764,12 +2851,28 @@ async def _run_phone_session(
     def _on_phone_transcript_activity(event):  # noqa: ANN001
         if str(getattr(event, "transcript", "") or "").strip():
             candidate_activity.set()
+            if bool(getattr(event, "is_final", False)):
+                latency_state["final_transcript_wall"] = time.time()
 
     @session.on("agent_state_changed")
     def _on_phone_agent_state_changed(event):  # noqa: ANN001
         new_state = getattr(event, "new_state", None)
         if new_state == "speaking":
-            latest_assistant_anchor[0] = int(round(time.time() * 1000))
+            first_audio_mono = _monotonic()
+            first_audio_wall = time.time()
+            latest_assistant_anchor[0] = int(round(first_audio_wall * 1000))
+            created_mono = latency_state.get("speech_created_mono")
+            if created_mono is not None:
+                _emit_phone_latency_segment(
+                    "reply_created_to_first_audio", first_audio_mono - created_mono,
+                )
+            stopped_wall = latency_state.get("speech_end_wall")
+            if stopped_wall is not None:
+                _emit_phone_latency_segment(
+                    "speech_end_to_first_audio", first_audio_wall - stopped_wall,
+                )
+            latency_state["speech_created_mono"] = None
+            latency_state["speech_end_wall"] = None
             speech_first_audio.set()
         if new_state in {"idle", "listening"}:
             agent_listening.set()
@@ -3209,6 +3312,7 @@ async def _run_phone_session(
             agent_activity_changed=agent_activity_changed,
             close_event=close_event,
             endpoint_delay_eou=endpoint_delay_eou,
+            latency_state=latency_state,
             turn_mode=turn_mode,
             coverage_judge_enabled=coverage_judge_enabled,
         )

@@ -496,6 +496,20 @@ async function bookPostCallCallbackBestEffort(
       assessmentLog.info('unknown_event', { error_category: `callback_backstop_${result.status}` });
     } else {
       assessmentLog.warn('unknown_event', { error_category: `callback_backstop_refused_${result.status}` });
+      if (result.status === 'engagement_terminal') {
+        // Durable, PII-free operator visibility. The ordinary appointment RPC
+        // correctly refuses to resurrect a terminal engagement; losing the
+        // candidate's explicit request in a transient log would be worse.
+        await supabase.from('audit_events').insert({
+          actor_id: PHONE_SYSTEM_ACTOR,
+          actor_type: 'system',
+          action: 'phone_callback_recovery_required',
+          target_type: 'call_session',
+          target_id: sessionId,
+          result: 'failure',
+          metadata: { reason: 'engagement_terminal', engagement_id: engagementId },
+        });
+      }
     }
   } catch {
     // A read error, an RPC error, a driver hiccup — none of it may disturb the

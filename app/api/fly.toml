@@ -76,6 +76,10 @@ primary_region = "sin"
   # ASHBY_API_KEY and ASHBY_WEBHOOK_SECRET Fly SECRETS (never [env], never the
   # repo) and ASHBY_INTEGRATION_ENABLED. See docs/runbooks/ashby-runtime-activation.md.
   ASHBY_RUNTIME_ENABLED = "false"
+  # Session-scoped scorecards for explicitly created re-screen cycles. Runtime
+  # provider writes remain independently gated by ASHBY_RUNTIME_ENABLED and the
+  # enabled tenant mapping.
+  ASHBY_RESCREEN_SCORECARD_ENABLED = "true"
   # Empty ⇒ the resume-download SSRF allowlist stays DISABLED (fail-closed).
   ASHBY_RESUME_HOSTS = ""
   ASHBY_SIGNAL_POLL_MS = "5000"

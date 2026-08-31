@@ -189,6 +189,17 @@ describe('post-call callback backstop', () => {
     expect(mockRpc).not.toHaveBeenCalledWith('schedule_phone_appointment', expect.anything());
   });
 
+  it('terminal refusal leaves a durable operator-visible recovery record', async () => {
+    mockRpc.mockResolvedValue({ data: { status: 'engagement_terminal' }, error: null });
+    const result = await runAssessment(SESSION_ID, { source: 'phone' });
+    expect(result.id).toBeDefined();
+    expect(callsFor('audit_events', 'insert').some((c) => {
+      const row = c.args[0] as Record<string, unknown>;
+      return row.action === 'phone_callback_recovery_required'
+        && row.target_id === SESSION_ID;
+    })).toBe(true);
+  });
+
   it('a booking failure NEVER fails the assessment', async () => {
     mockRpc.mockRejectedValue(new Error('rpc exploded'));
     const result = await runAssessment(SESSION_ID, { source: 'phone' });

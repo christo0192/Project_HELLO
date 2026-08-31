@@ -25,6 +25,7 @@ import re
 import sys
 import types
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
@@ -3482,8 +3483,29 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         self.assertEqual(phone.candidate_turn_route("Yeah, can you hear me?"), "connectivity_check")
         self.assertEqual(phone.candidate_turn_route("I'm busy right now"), "callback_deferral")
         self.assertEqual(phone.candidate_turn_route("Please call me back tomorrow"), "callback_deferral")
+        self.assertEqual(
+            phone.candidate_turn_route("Can you schedule a call tomorrow at 10:00 AM?"),
+            "callback_deferral",
+        )
+        self.assertEqual(phone.candidate_turn_route("Please book an appointment for Monday"), "callback_deferral")
+        self.assertEqual(
+            phone.parse_callback_time_ist(
+                "Can you schedule a call tomorrow at 10:00 AM?",
+                datetime(2026, 8, 31, 16, 47, tzinfo=timezone.utc),
+            ),
+            "2026-09-01T04:30:00Z",
+        )
         self.assertEqual(phone.candidate_turn_route("Um"), "hesitation")
         self.assertIsNone(phone.candidate_turn_route("I led the support team for four years."))
+        self.assertTrue(phone.is_company_review_question(
+            "I saw bad reviews on Glassdoor. Is it safe to work there?"
+        ))
+        self.assertIn("don't have verified context", phone.PHONE_COMPANY_REVIEW_RESPONSE)
+
+    def test_post_goodbye_acknowledgements_are_bounded(self):
+        self.assertTrue(phone.is_post_goodbye_acknowledgement("Yeah, thank you."))
+        self.assertTrue(phone.is_post_goodbye_acknowledgement("Goodbye"))
+        self.assertFalse(phone.is_post_goodbye_acknowledgement("I have another question"))
 
     def test_silence_copy_cannot_become_boundary_evidence(self):
         self.assertTrue(phone.is_gate_copy(phone.PHONE_SILENCE_PROMPT_TEXT))
@@ -3524,25 +3546,44 @@ class TestNativePhoneArchitecture(unittest.TestCase):
              patch.object(agent_mod._log, "info") as log_info:
             agent_mod._emit_phone_endpoint_delay(t_eou, t_invoke)
 
-        # Histogram: name, plausible duration, phone channel + eou_to_llm schema.
+        # Histogram: completed-turn callback to reply creation (not physical EOU).
         self.assertEqual(hist.call_count, 1)
         name, value = hist.call_args.args[0], hist.call_args.args[1]
         labels = hist.call_args.args[2] if len(hist.call_args.args) > 2 else hist.call_args.kwargs.get("labels")
         self.assertEqual(name, "voice_endpoint_delay_sec")
         self.assertAlmostEqual(value, 2.9, places=3)
         self.assertEqual(labels.get("channel"), "phone")
-        self.assertEqual(labels.get("schema"), "eou_to_llm")
+        self.assertEqual(labels.get("schema"), "turn_callback_to_reply_created")
 
         # Structured log: existing vocabulary, duration only.
         self.assertEqual(log_info.call_count, 1)
         _, kwargs = log_info.call_args
         self.assertEqual(kwargs.get("error_type"), "voice_endpoint_delay")
-        self.assertEqual(kwargs.get("schema"), "eou_to_llm")
+        self.assertEqual(kwargs.get("schema"), "turn_callback_to_reply_created")
         self.assertAlmostEqual(kwargs.get("duration_sec"), 2.9, places=3)
         # No transcript / PII: the only dynamic value anywhere is the duration.
         rendered = repr(hist.call_args_list) + repr(log_info.call_args_list)
         for banned in ("transcript", "candidate", "room", "attempt", "text_content"):
             self.assertNotIn(banned, rendered)
+
+    def test_full_gap_latency_segments_are_content_free(self):
+        with patch.object(agent_mod, "histogram_metric") as hist, \
+             patch.object(agent_mod._log, "info") as log_info:
+            agent_mod._emit_phone_latency_segment("speech_end_to_final_transcript", 1.2)
+            agent_mod._emit_phone_latency_segment("speech_end_to_first_audio", 2.1)
+        self.assertEqual(hist.call_count, 2)
+        self.assertEqual(
+            [c.args[0] for c in hist.call_args_list],
+            ["voice_phone_latency_segment_sec", "voice_phone_latency_segment_sec"],
+        )
+        self.assertEqual(
+            [c.kwargs["schema"] for c in log_info.call_args_list],
+            ["speech_end_to_final_transcript", "speech_end_to_first_audio"],
+        )
+        for call in log_info.call_args_list:
+            self.assertNotIn("text", call.kwargs)
+            self.assertNotIn("candidate", call.kwargs)
+            self.assertNotIn("room", call.kwargs)
 
     def test_endpoint_delay_drops_negative_delta(self):
         """A stale stamp / clock skew (t_invoke < t_EOU) must NOT emit a bogus
@@ -4484,6 +4525,28 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("say goodbye", injected)
         await self._finish(hooks)
         self.assertIn("assessment.completed", client.event_types)
+
+    async def test_post_goodbye_thank_you_completes_instead_of_malformed_abort(self):
+        agent, _, _, client, hooks = await self._enter_qna()
+        close_ctx = types.SimpleNamespace(items=[])
+        await hooks["on_native_turn"](
+            "Nothing else", types.SimpleNamespace(text_content="Nothing else"), close_ctx,
+        )
+        self.assertEqual(agent._closing_state_machine.state.value, "closing_pending")
+        with self.assertRaises(sys.modules["livekit.agents"].StopResponse):
+            await hooks["on_native_turn"](
+                "Yeah, thank you.",
+                types.SimpleNamespace(text_content="Yeah, thank you."),
+                types.SimpleNamespace(items=[]),
+            )
+        await self._finish(hooks)
+        self.assertIn("assessment.completed", client.event_types)
+        self.assertNotIn("assessment.aborted", client.event_types)
+        guard_logs = [
+            c for c in hooks["log"].info.call_args_list
+            if c.kwargs.get("error_type") == "phone_turn_guard"
+        ]
+        self.assertEqual(guard_logs, [])
 
     async def test_interrupted_terminal_reply_uses_the_fixed_goodbye(self):
         _, session, _, client, hooks = await self._enter_qna()
@@ -6051,12 +6114,23 @@ class TestPhoneTurnDetectionFlag(unittest.TestCase):
             agent_mod._build_phone_provider_session()
         self.assertEqual(_CapturingSession.last_kwargs.get("turn_detection"), "stt")
 
-    def test_phone_session_has_no_turn_detection_when_local(self):
+    def test_phone_session_uses_locked_local_endpointing_bounds(self):
         _CapturingSession.last_kwargs = None
         with patch.object(agent_mod, "AgentSession", _CapturingSession), \
              patch.dict(os.environ, {"PHONE_TURN_DETECTION": "local"}, clear=False):
             agent_mod._build_phone_provider_session()
         self.assertNotIn("turn_detection", _CapturingSession.last_kwargs)
+        self.assertEqual(_CapturingSession.last_kwargs.get("min_endpointing_delay"), 0.5)
+        self.assertEqual(_CapturingSession.last_kwargs.get("max_endpointing_delay"), 1.5)
+
+    def test_phone_tts_uses_locked_voice_tuning(self):
+        with patch.object(agent_mod, "AgentSession", _CapturingSession), \
+             patch.object(agent_mod.sarvam, "TTS", return_value=object()) as tts:
+            agent_mod._build_phone_provider_session()
+        self.assertEqual(tts.call_args.kwargs["speaker"], "simran")
+        self.assertEqual(tts.call_args.kwargs["pace"], 1.0)
+        self.assertEqual(tts.call_args.kwargs["temperature"], 0.8)
+        self.assertNotIn("output_audio_codec", tts.call_args.kwargs)
 
     def test_browser_session_never_gets_turn_detection(self):
         # Even with the flag set to stt, the browser (non-phone) build path is
@@ -6279,32 +6353,43 @@ class TestCall24Regressions(unittest.TestCase):
         # The full text still comes through, in order, uncorrupted (ignoring the
         # inter-segment whitespace the re-chunker may collapse).
         self.assertEqual(spoken.replace(" ", ""), "".join(source_chunks).replace(" ", ""))
-        # EXACTLY TWO downstream segments: first clause early, whole rest as ONE
-        # further synth call. NOT N (the per-fragment loop this replaces) and NOT
-        # one (the pre-#191 single call). This is the anti-over-fragmentation
-        # guarantee (at most 2 synths per turn).
-        self.assertEqual(
-            len(segment_spans), 2,
-            msg="first clause early + whole remainder as one → exactly 2 synths",
+        # One uninterrupted downstream segment preserves acknowledgement and
+        # question prosody as a single coherent utterance.
+        self.assertEqual(len(segment_spans), 1)
+        self.assertEqual(segment_spans[0][1], len(source_chunks))
+
+    def test_tts_node_defaults_to_one_coherent_synthesis(self):
+        spans = []
+
+        class BaseAgent:
+            def __init__(self, instructions=""):
+                self.instructions = instructions
+
+            async def tts_node(self, text, model_settings):
+                chunks = []
+                async for chunk in text:
+                    chunks.append(chunk)
+                    yield chunk
+                spans.append("".join(chunks))
+
+        agent = phone.phone_agent_class(BaseAgent)(
+            "sys", client=FakeEventClient(), attempt_id=_ATTEMPT_ID,
+            say=AsyncMock(), on_user_turn=lambda *a, **k: None,
+            native_turns=True,
         )
-        # THE NON-VACUITY ASSERTION: the FIRST segment closed (flushed) while the
-        # source stream was NOT yet fully consumed.
-        first_open, first_close = segment_spans[0]
-        self.assertLess(
-            first_close, len(source_chunks),
-            msg="first segment must flush before the whole stream is read",
-        )
-        # Tighter: the first clause flushes near the very front of the stream.
-        # The comma is inside chunk 1; the remainder-lead fold then does a
-        # BOUNDED PEEK into the remainder to prove its lead carries a letter
-        # (here the next char after the space is "l" in chunk 2), so the first
-        # segment may close at chunk 1 or 2 — never later. That bounded peek is
-        # the latency contract: at most the first word of the remainder, not the
-        # whole stream. Assert the invariant (front-of-stream), not a brittle
-        # exact index the fold legitimately shifts by one word.
-        self.assertLessEqual(first_close, 2)
-        # And the SECOND (final) segment drains the rest of the stream.
-        self.assertEqual(segment_spans[1][1], len(source_chunks))
+
+        async def source():
+            for chunk in ("A specific acknowledgement, ", "and one natural question?"):
+                yield chunk
+
+        async def run():
+            return "".join([frame async for frame in agent.tts_node(source(), None)])
+
+        with patch.dict(phone.os.environ, {}, clear=False):
+            phone.os.environ.pop("PHONE_TTS_FLUSH_MIN_CHARS", None)
+            spoken = asyncio.run(run())
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(spoken, "A specific acknowledgement, and one natural question?")
 
     def test_tts_node_early_flush_control_single_segment_when_disabled(self):
         """CONTROL for the non-vacuity test: with early-flush OFF the phone lane
@@ -6645,18 +6730,10 @@ class TestCall24Regressions(unittest.TestCase):
         self.assertEqual(
             spoken.replace(" ", ""), "".join(source_chunks).replace(" ", "")
         )
-        # STILL early-flushes: the FIRST segment closed before the whole single
-        # source chunk was consumed is impossible to measure with one chunk, so
-        # assert instead there are TWO segments and the first is a strict PREFIX
-        # of the reply (i.e. the early flush really carved a leading clause off).
-        self.assertGreaterEqual(len(segment_spans), 2)
-        first_stream = stream_texts[0]
-        whole = "".join(source_chunks)
-        self.assertTrue(
-            len(first_stream) < len(whole),
-            msg="first synth must be a strict prefix (early flush happened)",
-        )
-        self.assertTrue(first_stream.strip().startswith("Thanks"))
+        # One stream is intentional: splitting at a comma or sentence boundary
+        # resets Sarvam prosody and was the source of the robotic cadence.
+        self.assertEqual(len(segment_spans), 1)
+        self.assertEqual(stream_texts[0], "".join(source_chunks))
 
     # ── F1: deterministic role opening ────────────────────────────────
     def test_role_opening_text_names_the_exact_role(self):
@@ -6769,6 +6846,16 @@ class TestPatienceSubstanceClassifier(unittest.TestCase):
                 phone.PHONE_SUBSTANCE_HESITATION,
                 f"{text!r} should be a hesitation",
             )
+
+    def test_production_courtesy_fragment_does_not_advance(self):
+        self.assertEqual(
+            phone.phone_turn_substance("Um yeah, so, before that, Thank you Shrim"),
+            phone.PHONE_SUBSTANCE_HESITATION,
+        )
+        self.assertEqual(
+            phone.candidate_turn_route("What do you mean by ethical consultative?"),
+            "candidate_question",
+        )
 
     def test_mid_thought_dangling_fragments_are_suppressed(self):
         for text in (
@@ -7053,9 +7140,10 @@ class TestPhoneInstructionAssembly(unittest.TestCase):
         self.assertIn("ask exactly one question per turn", low)
         self.assertIn("do not move to the next topic", low)
         self.assertIn("restate the current question only", low)
-        # Fix 4 — lexical expressiveness / light professional humor.
-        self.assertIn("the telephone line flattens your voice", low)
-        self.assertIn("light, professional humor", low)
+        # Natural delivery is specific, one-thought, and never speaks stage directions.
+        self.assertIn("one coherent spoken thought", low)
+        self.assertIn("specific detail the candidate actually gave", low)
+        self.assertIn("never output stage directions", low)
         self.assertIn("at the candidate's expense", low)
 
     def test_resume_conflict_directive_only_when_resume_evidence_exists(self):

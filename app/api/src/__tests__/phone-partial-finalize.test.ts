@@ -465,6 +465,26 @@ describe('the scorer plumbing forwards the partial fields', () => {
     });
   });
 
+  it('8/8 durable coverage is complete even when the recovery payload said partial', async () => {
+    const seen: Array<{ options: unknown }> = [];
+    const { client } = makeAssessmentClient({ engagementId: ENGAGEMENT_A });
+    const handler = createPhoneAssessmentHandler({
+      client: client as never,
+      score: async (_sessionId, options) => { seen.push({ options }); },
+    });
+    await handler({
+      payload: {
+        session_id: SESSION_A, attempt_id: ATTEMPT_A,
+        partial: true, covered: 8, total: 8,
+        disconnect_reason: 'candidate_hangup',
+      },
+    } as never);
+    expect(seen[0].options).toEqual({
+      source: 'phone', partial: false, covered: 8, total: 8,
+      disconnectReason: undefined,
+    });
+  });
+
   it('a clean-hangup job (no partial fields) scores as a COMPLETE screening', async () => {
     const seen: Array<{ options: unknown }> = [];
     const { client } = makeAssessmentClient({});
