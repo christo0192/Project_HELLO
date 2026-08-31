@@ -710,17 +710,17 @@ def phone_tts_flush_min_chars() -> int:
     ``end_input`` flushes Sarvam's tokenizer regardless of ``min_sentence_len``,
     so the first speakable fragment reaches Sarvam as soon as it is ready.
 
-    PROSODY TRADEOFF (tune live): a SMALLER value flushes sooner → lower
-    time-to-first-fragment but choppier prosody, because Sarvam synthesizes a
-    short fragment in isolation with no downstream context. A LARGER value is
-    smoother but closer to the SDK's sentence-wait latency. ``0`` DISABLES
-    early-flush entirely (the phone lane falls back to the SDK's per-chunk
-    passthrough — today's behavior). Default 40 sits below a typical first
-    sentence (so it wins latency) but above a bare interjection (so a "Hi." does
-    not fragment further). Read at the CALL SITE with the literal name so the
-    env-contract scanner sees it.
+    PROSODY TRADEOFF: non-zero values retain the legacy split first-fragment
+    compatibility path. Production/default is ``0`` so one uninterrupted parent
+    TTS stream owns the complete response and acknowledgement/question prosody
+    cannot reset between two independent syntheses. Read at the CALL SITE with
+    the literal name so the env-contract scanner sees it.
     """
-    return _bounded_int_env(os.getenv("PHONE_TTS_FLUSH_MIN_CHARS"), 40, 0, 400)
+    # Locked contract: one uninterrupted Sarvam synthesis stream per bot
+    # response. Read the legacy knob so environment-contract validation remains
+    # explicit, but deliberately ignore it: no production value may split TTS.
+    _bounded_int_env(os.getenv("PHONE_TTS_FLUSH_MIN_CHARS"), 0, 0, 400)
+    return 0
 
 
 def phone_bounce_mode() -> bool:
@@ -776,6 +776,8 @@ def phone_turn_mode() -> str:
 # The two endpointing shapes the phone lane can run (X8, 2026-08-29).
 PHONE_TURN_DETECTION_LOCAL = "local"
 PHONE_TURN_DETECTION_STT = "stt"
+PHONE_LOCAL_ENDPOINTING_MIN_DELAY_SEC = 0.5
+PHONE_LOCAL_ENDPOINTING_MAX_DELAY_SEC = 1.5
 
 
 def phone_turn_detection() -> str:
@@ -801,6 +803,14 @@ def phone_turn_detection() -> str:
     """
     value = (os.getenv("PHONE_TURN_DETECTION") or "").strip().lower()
     return PHONE_TURN_DETECTION_STT if value == PHONE_TURN_DETECTION_STT else PHONE_TURN_DETECTION_LOCAL
+
+
+def phone_local_endpointing_delays() -> tuple[float, float]:
+    """Locked phone-local Silero/v1-mini endpointing bounds."""
+    return (
+        PHONE_LOCAL_ENDPOINTING_MIN_DELAY_SEC,
+        PHONE_LOCAL_ENDPOINTING_MAX_DELAY_SEC,
+    )
 
 
 # ── P5: the heartbeat cadence envelope ────────────────────────────────
@@ -2212,17 +2222,20 @@ PHONE_RESUME_CONFLICT_TEXT = (
 #: browser prompt (the browser lane has full-band audio and needs no lexical
 #: compensation).
 PHONE_EXPRESSIVENESS_TEXT = (
-    "\n\nExpressiveness on the phone line (mandatory):\n"
-    "- The telephone line flattens your voice, so put the energy in your "
-    "words: react with genuine, varied expressiveness (\"Oh nice!\", \"That's "
-    "a great way to put it\", a warm chuckle in words), mirror the candidate's "
-    "energy, and use light, professional humor sparingly — a friendly quip "
-    "here and there is welcome.\n"
-    "- Never joke at the candidate's expense, never about the quality of their "
-    "answers, and never during the consent or recording disclosure, or when "
-    "discussing compensation or a resume discrepancy.\n"
-    "- Keep it natural — at most one playful remark every few turns, never "
-    "forced."
+    "\n\nNatural phone delivery (mandatory):\n"
+    "- Respond as one coherent spoken thought: one brief, varied reaction tied "
+    "to a specific detail the candidate actually gave, followed naturally by "
+    "the single authorized question. Do not fall into a repeated generic "
+    "acknowledgement template from turn to turn.\n"
+    "- Use ordinary contractions and punctuation that creates a natural pause "
+    "and clear question intonation. Mirror the candidate's energy while staying "
+    "warm and professional.\n"
+    "- Never output stage directions or performance labels such as chuckles, "
+    "laughs, warmly, smiling, or with enthusiasm; the voice system may speak "
+    "those words literally. Never put such directions in brackets or parentheses.\n"
+    "- Never joke at the candidate's expense or during consent, compensation, "
+    "callback confirmation, or a resume discrepancy. Keep any light humor rare "
+    "and grounded in verified context."
 )
 
 
@@ -3823,6 +3836,18 @@ _QNA_DONE_RE = re.compile(
 )
 
 
+_POST_GOODBYE_ACK_RE = re.compile(
+    r"^\s*(?:(?:yeah|yes|okay|ok)[\s,.!-]*)?(?:thank\s+you|thanks|bye|"
+    r"goodbye|have\s+a\s+(?:good|great|nice)\s+day)[\s.!-]*$",
+    re.IGNORECASE,
+)
+
+
+def is_post_goodbye_acknowledgement(text: Any) -> bool:
+    """High-confidence acknowledgement after the bot has entered closing."""
+    return isinstance(text, str) and _POST_GOODBYE_ACK_RE.fullmatch(text) is not None
+
+
 def phone_qna_done(text: Any) -> bool:
     """Recognise only a high-confidence post-plan 'no more questions' reply.
 
@@ -4363,12 +4388,31 @@ _CONNECTIVITY_RE = re.compile(
 )
 _CALLBACK_DEFERRAL_RE = re.compile(
     r"\b(?:call|ring)\s+me\s+(?:back\s+)?(?:later|tomorrow|another\s+time)\b|"
-    r"\b(?:can|could)\s+(?:you|we)\s+(?:call\s+back|reschedule)\b|"
+    r"\b(?:can|could|would)\s+(?:you|we)\s+(?:(?:please\s+)?(?:call\s+back|reschedule)|"
+    r"(?:please\s+)?(?:book|schedule|arrange|set\s+up)\s+(?:me\s+)?"
+    r"(?:an?\s+|another\s+|the\s+)?(?:call|callback|appointment|meeting))\b|"
+    r"\b(?:book|schedule|arrange|set\s+up)\s+(?:me\s+)?"
+    r"(?:an?\s+|another\s+|the\s+)?(?:call|callback|appointment|meeting)\b|"
     r"\b(?:i(?:'m|\s+am)\s+busy\s+(?:right\s+now|at\s+the\s+moment)|"
     r"i\s+(?:cannot|can't)\s+talk\s+(?:right\s+now|at\s+the\s+moment)|"
     r"this\s+is\s+not\s+a\s+good\s+time)\b",
     re.IGNORECASE,
 )
+_COMPANY_REVIEW_QUESTION_RE = re.compile(
+    r"\b(?:glassdoor|google\s+reviews?|company\s+reviews?|bad\s+reviews?|"
+    r"negative\s+reviews?|safe\s+to\s+work|workplace\s+reviews?)\b",
+    re.IGNORECASE,
+)
+
+PHONE_COMPANY_REVIEW_RESPONSE = (
+    "I understand why you'd want to check that. I don't have verified context "
+    "to assess public reviews or make claims about employee experiences, so the "
+    "hiring team is the right source for specific questions about the workplace."
+)
+
+
+def is_company_review_question(text: Any) -> bool:
+    return isinstance(text, str) and bool(_COMPANY_REVIEW_QUESTION_RE.search(text))
 
 
 def candidate_turn_route(text: Any) -> str | None:
@@ -4461,6 +4505,12 @@ _HESITATION_FRAGMENT_RE = re.compile(
 
 # Conjunctions / prepositions / fillers that, when a SHORT fragment ends on one,
 # mark it as an unfinished thought (mid-thought/incomplete) rather than an answer.
+_COURTESY_FRAGMENT_RE = re.compile(
+    r"^\s*(?:(?:um+|uh+|yeah|yes|so|okay|ok)[\s,.!-]+){0,4}"
+    r"(?:before\s+that[\s,.!-]+)?(?:thank\s+you|thanks)(?:\s+[a-z]+)?[\s,.!-]*$",
+    re.IGNORECASE,
+)
+
 _DANGLING_TAIL_RE = re.compile(
     r"\b(?:"
     r"and|but|or|so|because|that|which|the|a|an|to|of|in|on|for|with|"
@@ -4514,7 +4564,7 @@ def phone_turn_substance(text: Any) -> str:
     if _SUBSTANTIVE_SHORT_RE.fullmatch(clean) or _CONTENT_DIGIT_RE.search(clean):
         return PHONE_SUBSTANCE_SUBSTANTIVE
     # Pure hesitation / thinking fragment → suppress.
-    if _HESITATION_FRAGMENT_RE.fullmatch(clean):
+    if _HESITATION_FRAGMENT_RE.fullmatch(clean) or _COURTESY_FRAGMENT_RE.fullmatch(clean):
         return PHONE_SUBSTANCE_HESITATION
     # Mid-thought/incomplete: a SHORT fragment (< ~4 words) that trails off on a
     # dangling conjunction/preposition/filler. Conservative — only a short,

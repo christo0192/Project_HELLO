@@ -217,7 +217,10 @@ export class PgAdapter implements ILeasedQueueAdapter {
     const now = new Date().toISOString();
     const { error } = await this.supabase
       .from('job_queue')
-      .update({ status: 'completed', completed_at: now })
+      .update({
+        status: 'completed', completed_at: now,
+        failed_at: null, error_message: null,
+      })
       .eq('id', jobId);
 
     if (error) throw error;

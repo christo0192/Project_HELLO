@@ -48,8 +48,11 @@ function payloadPartial(payload: unknown): PhonePartialFields {
     : {};
   const covered = typeof p.covered === 'number' && Number.isFinite(p.covered) ? p.covered : null;
   const total = typeof p.total === 'number' && Number.isFinite(p.total) ? p.total : null;
-  const reason = typeof p.disconnect_reason === 'string' ? p.disconnect_reason : undefined;
-  return { partial: p.partial === true, covered, total, disconnectReason: reason };
+  const fullyCovered = covered !== null && total !== null && total > 0 && covered >= total;
+  const partial = p.partial === true && !fullyCovered;
+  const reason = partial && typeof p.disconnect_reason === 'string'
+    ? p.disconnect_reason : undefined;
+  return { partial, covered, total, disconnectReason: reason };
 }
 
 export interface PhoneAssessmentHandlerOptions {
