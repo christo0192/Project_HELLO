@@ -63,6 +63,7 @@ import type { RuntimeWorkflowStores, OperationClaimRow } from './orchestration.j
 import { bindFeedbackForm, buildScorecard, HELLO_CHRISTY_SCORECARD_BINDING } from './scorecard.js';
 import { materializeInvite, type MaterializationStore, type MaterializationMapping } from './materialize.js';
 import type { EmailProviderState } from './invite-delivery.js';
+import { isAshbyError } from './errors.js';
 
 /**
  * The ONLY operation types this runtime executes. Deliberately excludes
@@ -349,18 +350,28 @@ export async function runClaimedAshbyOperation(
       committed: false, staleLease: blocked === 'not_owned',
       code: result.delivery,
     };
-  } catch {
-    // Sanitized: a thrown adapter/provider error never leaks its message.
+  } catch (error) {
+    // Preserve only the Ashby client's already-sanitized taxonomy. A provider
+    // success:false is permanent unless the client explicitly classified it
+    // retriable; retrying the identical invalid scorecard five times obscured
+    // the owner-call failure and could never heal it.
+    const endpoint = isAshbyError(error)
+      ? error.endpointCodes.find((code) => /^[a-z0-9_.:-]{1,40}$/.test(code.toLowerCase()))?.toLowerCase()
+      : undefined;
+    const code = isAshbyError(error)
+      ? (`ashby_${error.category}${endpoint ? `:${endpoint}` : ''}`).slice(0, 64)
+      : 'operation_error';
+    const retryable = isAshbyError(error) ? error.retriable : true;
     try {
-      const r = await deps.stores.failOperation(claim.id, claim.leaseToken, 'operation_error', true);
+      const r = await deps.stores.failOperation(claim.id, claim.leaseToken, code, retryable);
       return {
         claimed: true, operationType: claim.operationType, committed: false,
-        staleLease: r === 'not_owned', code: 'operation_error',
+        staleLease: r === 'not_owned', code,
       };
     } catch {
       return {
         claimed: true, operationType: claim.operationType, committed: false,
-        staleLease: false, code: 'operation_error',
+        staleLease: false, code,
       };
     }
   }

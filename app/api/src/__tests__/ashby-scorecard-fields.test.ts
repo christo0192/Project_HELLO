@@ -45,6 +45,7 @@ import {
   type ScorecardSource,
 } from '../integrations/ashby/scorecard.js';
 import { runClaimedAshbyOperation } from '../integrations/ashby/operation-worker.js';
+import { AshbyError } from '../integrations/ashby/errors.js';
 import {
   enqueueScorecard,
   type RuntimeWorkflowStores,
@@ -97,6 +98,7 @@ function fieldsOf(over: Partial<ScorecardSource> = {}, origin = ORIGIN) {
 /** A claim row + stores pair that drives the worker's scorecard branch only. */
 function workerFixture(over: Partial<ScorecardSource> = {}) {
   const failures: string[] = [];
+  const retryability: boolean[] = [];
   const claim: OperationClaimRow = {
     id: 'op_1',
     operationType: 'scorecard_write',
@@ -122,13 +124,14 @@ function workerFixture(over: Partial<ScorecardSource> = {}) {
       terminalState: null,
     }),
     readScorecardSource: async () => source(over),
-    failOperation: async (_id: string, _token: string, reason: string) => {
+    failOperation: async (_id: string, _token: string, reason: string, retryable: boolean) => {
       failures.push(reason);
+      retryability.push(retryable);
       return { outcome: 'failed' as const };
     },
     completeOperation: async () => 'ok' as const,
   } as unknown as RuntimeWorkflowStores;
-  return { stores, failures };
+  return { stores, failures, retryability };
 }
 
 // ── 1. The exact approved field set ─────────────────────────────────────────
@@ -391,7 +394,36 @@ describe('an untrusted dashboard origin or review path fails the whole binding c
     expect(JSON.stringify(req)).not.toMatch(/transcript|recording|bearer|presigned|secret|apikey/i);
   });
 
-  it('keeps a provider failure sanitized and attempt-bounded', async () => {
+  it('keeps a permanent logical failure sanitized, diagnostic, and non-retryable', async () => {
+    const submit = vi.fn(async () => {
+      throw new AshbyError('logical_failure', {
+        operation: 'applicationFeedback.submit',
+        retriable: false,
+        endpointCodes: ['invalid_feedback_form'],
+      });
+    });
+    const { stores, failures, retryability } = workerFixture();
+
+    const outcome = await runClaimedAshbyOperation({
+      stores,
+      materialization: {} as never,
+      scorecard: { submit, dashboardOrigin: ORIGIN },
+      resolveMappingForLink: async () => null,
+      reissuePathFor: () => '/x',
+      email: { providerApproved: false, domainVerified: false },
+      owner: 'w1',
+      leaseSeconds: 30,
+    });
+
+    expect(failures).toEqual(['ashby_logical_failure:invalid_feedback_form']);
+    expect(retryability).toEqual([false]);
+    expect(outcome).toMatchObject({
+      code: 'ashby_logical_failure:invalid_feedback_form',
+      committed: false,
+    });
+  });
+
+  it('keeps an unknown provider failure sanitized and attempt-bounded', async () => {
     const submit = vi.fn(async () => {
       throw new Error('Ashby 500: SENTINEL_APIKEY_should_never_surface');
     });

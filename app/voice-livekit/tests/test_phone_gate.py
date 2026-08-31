@@ -3489,6 +3489,13 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         )
         self.assertEqual(phone.candidate_turn_route("Please book an appointment for Monday"), "callback_deferral")
         self.assertEqual(
+            phone.candidate_turn_route("Can you schedule a follow-up for tomorrow at 10 AM?"),
+            "callback_deferral",
+        )
+        self.assertIsNone(phone.candidate_turn_route(
+            "I organize CRM callbacks and follow-up across multiple prospects."
+        ))
+        self.assertEqual(
             phone.parse_callback_time_ist(
                 "Can you schedule a call tomorrow at 10:00 AM?",
                 datetime(2026, 8, 31, 16, 47, tzinfo=timezone.utc),
@@ -3501,6 +3508,46 @@ class TestNativePhoneArchitecture(unittest.TestCase):
             "I saw bad reviews on Glassdoor. Is it safe to work there?"
         ))
         self.assertIn("don't have verified context", phone.PHONE_COMPANY_REVIEW_RESPONSE)
+
+    def test_generative_objective_authorization_and_compensation_slots(self):
+        self.assertTrue(phone.phone_generated_reply_authorized(
+            "That workflow sounds disciplined. When would you be available to start?",
+            "Ask about notice period and practical availability.",
+            allow_closing=False,
+        ))
+        self.assertFalse(phone.phone_generated_reply_authorized(
+            "That workflow sounds disciplined.",
+            "Ask about notice period and practical availability.",
+            allow_closing=False,
+        ))
+        self.assertFalse(phone.phone_generated_reply_authorized(
+            "We've reached the end of our questions. Have a great day!",
+            "Ask about notice period and practical availability.",
+            allow_closing=False,
+        ))
+        self.assertFalse(phone.phone_generated_reply_authorized(
+            "What are your salary expectations?",
+            "Ask about notice period and practical availability.",
+            allow_closing=False,
+        ))
+        self.assertTrue(phone.phone_generated_reply_authorized(
+            "And where does your current package stand?",
+            "Ask for the missing current compensation slot.",
+            allow_closing=False,
+        ))
+        self.assertEqual(
+            phone.phone_compensation_slots(
+                "My current CTC is 10 LPA and my expected compensation is 20 LPA."
+            ),
+            {"current": "10 LPA", "expected": "20 LPA"},
+        )
+        self.assertEqual(
+            phone.phone_compensation_slots("My current CTC is like 10 LPA."),
+            {"current": "10 LPA"},
+        )
+        self.assertEqual(phone.phone_compensation_slots("Around twenty would be nice."), {})
+        with patch.dict(os.environ, {"PHONE_GENERATIVE_OBJECTIVE_GUARD": "off"}):
+            self.assertFalse(phone.phone_generative_objective_guard_enabled())
 
     def test_post_goodbye_acknowledgements_are_bounded(self):
         self.assertTrue(phone.is_post_goodbye_acknowledgement("Yeah, thank you."))
@@ -5144,6 +5191,25 @@ class TestPhoneSpeechWatchdog(unittest.IsolatedAsyncioTestCase):
         hooks["close_event"].set()
         await hooks["drive_terminal"]()
 
+    async def test_completed_empty_generation_recovers_without_four_second_wait(self):
+        agent, session, _, _, hooks = await _make_native_coordinator(
+            turn_mode="toolless",
+        )
+        before = len(session.spoken)
+        with patch.object(agent_mod, "PHONE_SPEECH_FIRST_AUDIO_TIMEOUT_SEC", 4.0):
+            await agent._on_reply_expected()
+            agent._on_generation_empty()
+            await asyncio.sleep(0.05)
+        self.assertEqual(len(session.spoken), before + 1)
+        categories = [
+            c.kwargs.get("error_category")
+            for c in hooks["log"].warn.call_args_list
+            if c.kwargs.get("error_type") == "phone_speech_lifecycle"
+        ]
+        self.assertIn("generation_completed_empty", categories)
+        hooks["close_event"].set()
+        await hooks["drive_terminal"]()
+
     async def test_superseded_watchdog_cannot_create_a_second_fallback(self):
         agent, session, _, _, hooks = await _make_native_coordinator(
             turn_mode="toolless",
@@ -5168,7 +5234,7 @@ class TestPhoneSpeechWatchdog(unittest.IsolatedAsyncioTestCase):
 
 
 class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
-    """The background verdict gates commits and repairs the next turn."""
+    """The background verdict is shadow/conflict-only and never owns flow."""
 
     @staticmethod
     def _state():
@@ -5240,7 +5306,7 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.boundaries[0]["source_event_id"], phone.plan_source_event_id("k1"))
         await self._close(hooks)
 
-    async def test_not_covered_skips_commit_and_reanchors_the_next_turn(self):
+    async def test_not_covered_is_shadow_only_and_never_reanchors(self):
         agent, _, _, client, hooks = await self._coordinator()
         with patch.object(
             phone, "judge_phone_coverage", new_callable=AsyncMock,
@@ -5248,23 +5314,16 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
         ):
             await self._turn(hooks, "I led operations for four years.",
                              assistant_text="Could you elaborate?")
-            self.assertTrue(await self._drain(
-                lambda: agent._coverage_reanchor["question_key"] == "k1",
-            ))
-            self.assertEqual(client.committed_keys, [])
-            repaired = await self._turn(hooks, "Here is more detail.")
-        injected = str(repaired.items)
+            self.assertTrue(await self._drain(lambda: client.committed_keys == ["k1"]))
+        self.assertIsNone(agent._coverage_reanchor["question_key"])
         self.assertIn("not_covered_model", [
             c.kwargs.get("error_category")
             for c in hooks["log"].info.call_args_list
             if c.kwargs.get("error_type") == "phone_coverage_judge"
         ])
-        self.assertIn("NOT yet asked the owed topic", injected)
-        self.assertIn("Could you tell me about your recent role?", injected)
-        self.assertEqual(client.committed_keys, [])
         await self._close(hooks)
 
-    async def test_judge_error_skips_commit_and_logs_loudly(self):
+    async def test_judge_error_commits_before_logging_and_never_reanchors(self):
         agent, _, _, client, hooks = await self._coordinator()
         with patch.object(
             phone, "judge_phone_coverage", new_callable=AsyncMock,
@@ -5272,10 +5331,8 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
         ):
             await self._turn(hooks, "I led operations for four years.",
                              assistant_text="Could you elaborate?")
-            self.assertTrue(await self._drain(
-                lambda: agent._coverage_reanchor["question_key"] == "k1",
-            ))
-        self.assertEqual(client.committed_keys, [])
+            self.assertTrue(await self._drain(lambda: client.committed_keys == ["k1"]))
+        self.assertIsNone(agent._coverage_reanchor["question_key"])
         categories = [
             c.kwargs.get("error_category") for c in hooks["log"].warn.call_args_list
             if c.kwargs.get("error_type") == "phone_coverage_judge"
@@ -5312,18 +5369,16 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(verdict.category, "judge_error")
 
-    async def test_repeated_judge_errors_never_advance_the_cursor(self):
+    async def test_repeated_judge_errors_cannot_rewind_or_duplicate_cursor(self):
         agent, _, _, client, hooks = await self._coordinator()
         with patch.object(
             phone, "judge_phone_coverage", new_callable=AsyncMock,
             return_value=phone.PhoneCoverageVerdict(False, None, "judge_error"),
         ):
-            for answer in ("One.", "Two.", "Three."):
-                await self._turn(hooks, answer, assistant_text="Could you elaborate?")
-                await self._drain(
-                    lambda: agent._coverage_reanchor["question_key"] == "k1",
-                )
-        self.assertEqual(client.committed_keys, [])
+            await self._turn(hooks, "One substantive answer.", assistant_text="Could you elaborate?")
+            self.assertTrue(await self._drain(lambda: client.committed_keys == ["k1"]))
+        self.assertEqual(client.committed_keys, ["k1"])
+        self.assertIsNone(agent._coverage_reanchor["question_key"])
         self.assertNotIn("caution_advance", repr(hooks["log"].mock_calls))
         await self._close(hooks)
 
@@ -5938,6 +5993,24 @@ class TestBoundedCallbackBookingFlow(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("assessment.aborted", client.event_types)
         self.assertNotIn("assessment.completed", client.event_types)
 
+    async def test_confirmation_infrastructure_failure_is_not_candidate_aborted(self):
+        client = FakeEventClient()
+        client.script_proposal(self.RESOLVED, "proposal_valid")
+        client.script_confirm(self.RESOLVED, False, "phone_callback_confirmation_error")
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless", client=client,
+        )
+        on_turn = hooks["on_native_turn"]
+        text = "Can you schedule a follow-up on 2026-09-05 at 11am?"
+        turn_ctx = types.SimpleNamespace(items=[])
+        await on_turn(text, types.SimpleNamespace(text_content=text), turn_ctx)
+        self.assertEqual(client.propose_calls, [(_ATTEMPT_ID, self.RESOLVED)])
+        self.assertEqual(client.confirm_calls, [(_ATTEMPT_ID, self.RESOLVED)])
+        with patch.object(agent_mod, "PHONE_TERMINAL_REPLY_TIMEOUT_SEC", 0.05):
+            await hooks["drive_terminal"]()
+        self.assertNotIn("assessment.aborted", client.event_types)
+        self.assertNotIn("assessment.completed", client.event_types)
+
     async def test_slot_full_offers_alternatives_and_books_the_pick(self):
         client = FakeEventClient()
         alt_iso = "2026-09-05T06:30:00Z"
@@ -6122,6 +6195,23 @@ class TestPhoneTurnDetectionFlag(unittest.TestCase):
         self.assertNotIn("turn_detection", _CapturingSession.last_kwargs)
         self.assertEqual(_CapturingSession.last_kwargs.get("min_endpointing_delay"), 0.5)
         self.assertEqual(_CapturingSession.last_kwargs.get("max_endpointing_delay"), 1.5)
+
+    def test_toolless_objective_preemption_is_phone_only_and_rollbackable(self):
+        _CapturingSession.last_kwargs = None
+        with patch.object(agent_mod, "AgentSession", _CapturingSession), \
+             patch.dict(os.environ, {"PHONE_OBJECTIVE_PREEMPTIVE": "on"}, clear=False):
+            agent_mod._build_phone_provider_session(phone.PHONE_TURN_MODE_TOOLLESS)
+        self.assertIs(_CapturingSession.last_kwargs.get("preemptive_generation"), True)
+
+        with patch.object(agent_mod, "AgentSession", _CapturingSession), \
+             patch.dict(os.environ, {"PHONE_OBJECTIVE_PREEMPTIVE": "off"}, clear=False):
+            agent_mod._build_phone_provider_session(phone.PHONE_TURN_MODE_TOOLLESS)
+        self.assertIs(_CapturingSession.last_kwargs.get("preemptive_generation"), False)
+
+        with patch.object(agent_mod, "AgentSession", _CapturingSession), \
+             patch.dict(os.environ, {"PHONE_OBJECTIVE_PREEMPTIVE": "on"}, clear=False):
+            agent_mod._build_provider_session()
+        self.assertNotIn("preemptive_generation", _CapturingSession.last_kwargs)
 
     def test_phone_tts_uses_locked_voice_tuning(self):
         with patch.object(agent_mod, "AgentSession", _CapturingSession), \

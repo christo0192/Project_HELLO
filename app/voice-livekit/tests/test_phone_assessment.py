@@ -202,11 +202,14 @@ class TestHaltTaxonomy(unittest.TestCase):
             # already moved the engagement to `scheduled` — not because it is
             # retryable in any sense.
             phone.HALT_CALLBACK_SCHEDULED,
+            # A validated callback that infrastructure could not commit is not
+            # candidate-ended truth; durable recovery owns it.
+            phone.HALT_CALLBACK_RECOVERY,
             # Explicitly ending this call is terminal but not a future-contact
             # opt-out, so it is classified outside the post-nothing family.
             phone.HALT_CANDIDATE_ENDED,
         }
-        self.assertEqual(len(declared), 8)
+        self.assertEqual(len(declared), 9)
         self.assertTrue(phone.RETRYABLE_HALTS.issubset(declared))
         self.assertTrue(phone.halt_is_retryable(phone.HALT_LEASE_LOST))
         self.assertTrue(phone.halt_is_retryable(phone.HALT_LEASE_UNCONFIRMED))
