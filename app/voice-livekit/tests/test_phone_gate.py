@@ -2454,6 +2454,9 @@ class _FakePhoneSession:
         handler = self.handlers.get("speech_created")
         if handler is not None and (instructions or self.emit_auto_speech):
             handler(types.SimpleNamespace(speech_handle=speech))
+        state_handler = self.handlers.get("agent_state_changed")
+        if state_handler is not None and (instructions or self.emit_auto_speech):
+            state_handler(types.SimpleNamespace(new_state="speaking"))
         # The GATE-OPENING window: before consent, the gate asks the model for a
         # warm opening. Model it as a verified opening bot turn (it discloses
         # recording and asks) and do NOT consume a screening answer — the consent
@@ -2471,6 +2474,8 @@ class _FakePhoneSession:
         for line in self.mid_turn_says:
             # Through `say`, exactly as the callback tool does it.
             self.say(line)
+        if state_handler is not None and (instructions or self.emit_auto_speech):
+            state_handler(types.SimpleNamespace(new_state="idle"))
         if self.answers:
             reply = self.answers.pop(0)
             if reply is not None:
@@ -2829,33 +2834,17 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             errored = await client.commit_item_turn("sid-1", "bot", "q", "phone-item-8")
         self.assertFalse(errored.ok)
 
-    async def test_first_post_consent_question_is_llm_phrased_in_tool_less_opening(self):
-        """The first question is delivered through the model, phrased naturally.
-
-        PR #157 pinned this to fixed `session.say` because a raced opening
-        generation under the substantive tool policy could loop on
-        advance_screening until the SDK step ceiling closed the room. The
-        tool-resolved latch and the idempotent duplicate-advance reply disarm
-        that trap structurally, so the opening returns to `generate_reply` in
-        the tool-less "opening" policy — the browser lane's behavior. The
-        WHICH-question authority is unchanged: the committed keys still come
-        from the call site, never from the spoken prose.
-        """
+    async def test_first_post_consent_question_is_fixed_and_history_safe(self):
+        """The first question avoids an assistant-ended Gemini request."""
         _, client, _, _, session, _ = await self._run_session(
             answers=("Yes, that's fine.",),
             replies=["First answer.", "Second answer."],
         )
-        # instructions[0] is the GATE opening (greeting + disclosure), generated
-        # before consent. The first planned question is the next generation.
         self.assertIn("okay to continue", session.instructions[0].lower())
-        # The planned text reaches the model as an instruction, not the ear
-        # as verbatim speech.
-        self.assertIn("First question?", session.instructions[1])
-        self.assertIn("planned question", session.instructions[1])
-        self.assertNotIn("First question?", session.spoken)
+        self.assertIn("First question?", session.spoken)
         self.assertEqual(client.committed_keys, ["k1", "k2"])
-        # Gate opening + first-question generation + the two answer-mediated replies.
-        self.assertEqual(len(session.instructions), 4)
+        # Gate opening plus the two answer-mediated Gemini replies.
+        self.assertEqual(len(session.instructions), 3)
 
     async def test_first_question_falls_back_to_fixed_playout_without_generate_reply(self):
         """A session without `generate_reply` still asks the exact planned text."""
@@ -2972,22 +2961,15 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         for line in session.spoken:
             self.assertFalse(line.startswith("Before we dive in, just to confirm"))
 
-    async def test_an_INTERRUPTED_goodbye_still_speaks_the_fixed_closing(self):
-        """F3 (call 24): the goodbye started, was interrupted mid-sentence
-        ("...your time and"), and the room closed with no complete goodbye. The
-        terminal path now speaks the FIXED closing before teardown whenever the
-        model's goodbye did not play to completion — and it stays `completed`
-        (the screening finished; only the goodbye was cut off)."""
+    async def test_an_INTERRUPTED_goodbye_does_not_terminalize_or_block_callback(self):
+        """An authored but interrupted closing is not a completed screening."""
         _FakePhoneSession.default_terminal_reply_interrupted = True
         _, client, _, delete, session, _ = await self._run_session(
             answers=("Yes, that's fine.",),
         )
-        self.assertIn(phone.PHONE_ASSESSMENT_CLOSING_TEXT, session.spoken)
-        # The assessment is still complete — the fallback is a goodbye, not a
-        # downgrade to an abort.
-        self.assertIn("assessment.completed", client.event_types)
+        self.assertNotIn("assessment.completed", client.event_types)
         self.assertNotIn("assessment.aborted", client.event_types)
-        delete.assert_awaited()
+        delete.assert_not_awaited()
 
     async def test_a_CLEAN_goodbye_does_NOT_double_speak_the_fixed_closing(self):
         """The fixed-closing fallback fires ONLY on an interrupted/absent reply.
@@ -3199,9 +3181,8 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             close_after=False,
         )
 
-        # The gate opening, the LLM-phrased first question, plus one
-        # LiveKit-native terminal response.
-        self.assertEqual(len(session.instructions), 3)
+        # The gate opening plus one LiveKit-native terminal response.
+        self.assertEqual(len(session.instructions), 2)
         self.assertEqual(client.committed_keys, [])
         self.assertIn("assessment.aborted", client.event_types)
         terminal_context = str(session.turn_contexts[-1]).lower()
@@ -4082,18 +4063,16 @@ class TestGeminiModelTurnGuard(unittest.IsolatedAsyncioTestCase):
         async for _ in agent.llm_node(chat_ctx, [], self._settings()):
             pass
 
-    async def test_trailing_assistant_turn_gets_a_neutral_user_turn(self):
+    async def test_trailing_assistant_turn_is_never_repaired_with_fake_user_data(self):
         agent, seen = self._agent()
         ctx = _FakeChatContext([
             _FakeChatMessage("user", "hello"),
             _FakeChatMessage("assistant", "hi there"),
         ])
         await self._run(agent, ctx)
-        # A user turn was appended so the context no longer ends on a model turn.
-        self.assertEqual(ctx.items[-1].role, "user")
-        self.assertEqual(len(ctx.items), 3)
-        # And the super() call saw the repaired context (ends on user).
-        self.assertEqual(seen[-1][-1].role, "user")
+        self.assertEqual(len(ctx.items), 2)
+        self.assertEqual(ctx.items[-1].role, "assistant")
+        self.assertEqual(seen[-1][-1].role, "assistant")
 
     async def test_trailing_user_turn_is_a_no_op(self):
         agent, seen = self._agent()
@@ -4324,7 +4303,8 @@ async def _make_native_coordinator(
             latest_assistant_anchor=latest_assistant_anchor,
             latest_candidate_anchor=latest_candidate_anchor,
             candidate_end_requested=candidate_end_requested,
-            reply_started=reply_started, reply_handle=reply_handle,
+            reply_started=reply_started, speech_first_audio=asyncio.Event(),
+            speech_sequence=[0], reply_handle=reply_handle,
             assistant_delivery_complete=assistant_delivery_complete,
             candidate_activity=candidate_activity,
             agent_listening=agent_listening,
@@ -4341,16 +4321,20 @@ async def _make_native_coordinator(
             break
 
     async def drive_terminal():
-        # Let the coordinator run its terminal handling to completion. The
-        # room delete is patched so the teardown does not touch the SDK; the
-        # `assessment.*` posting and the teardown log are the observable
-        # terminal effects the test asserts on.
+        # Direct coordinator tests bypass AgentSession's speech lifecycle, so
+        # model one clean terminal playout before awaiting teardown.
+        delivered = getattr(agent, "_on_reply_delivered", None)
+        if callable(delivered):
+            value = delivered(False)
+            if inspect.isawaitable(value):
+                await value
         with patch.object(agent_mod, "_delete_livekit_room", new_callable=AsyncMock):
             await asyncio.wait_for(task, timeout=5)
         log_patch.stop()
 
     hooks = {
         "on_native_turn": agent._on_user_turn,
+        "agent": agent,
         "latest_assistant": latest_assistant,
         "latest_assistant_anchor": latest_assistant_anchor,
         "assistant_delivery_complete": assistant_delivery_complete,
@@ -4461,7 +4445,9 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
             turn_ctx,
         )
         await self._finish(hooks, interrupted=True)
-        self.assertIn(phone.PHONE_ASSESSMENT_CLOSING_TEXT, session.spoken)
+        # Direct coordinator tests do not create a second LiveKit speech handle;
+        # they verify that interruption does not claim clean playout.
+        self.assertNotIn(phone.PHONE_ASSESSMENT_CLOSING_TEXT, session.spoken)
         self.assertIn("assessment.completed", client.event_types)
 
 
@@ -4526,8 +4512,9 @@ class TestPhoneCoverageJudgeCore(unittest.IsolatedAsyncioTestCase):
         })
         transport = object()
         with patch.dict(phone.os.environ, {
-            "GEMINI_API_KEY": "x" * 40,
-            "GEMINI_MODEL": "gemini-test-model",
+            "GEMINI_API_KEY": "synthetic-speaker-credential",
+            "PHONE_JUDGE_API_KEY": "x" * 40,
+            "PHONE_JUDGE_MODEL": "gemini-test-model",
             "GEMINI_BASE_URL": "https://example.invalid/v1beta/openai/",
         }), patch.object(
             phone, "_phone_coverage_transport", return_value=transport,
@@ -4643,11 +4630,11 @@ class TestPhoneJudgeRetry(unittest.IsolatedAsyncioTestCase):
             resume_facts={"current_role": "Lead"}, infer=infer,
         )
 
-    def test_default_retries_is_one_two_attempts_clamped(self):
+    def test_default_retries_is_zero_one_attempt_clamped(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("PHONE_JUDGE_RETRIES", None)
-            self.assertEqual(phone.phone_judge_retries(), 1)
-        for value, expected in (("0", 0), ("3", 3), ("9", 3), ("-1", 0), ("x", 1)):
+            self.assertEqual(phone.phone_judge_retries(), 0)
+        for value, expected in (("0", 0), ("3", 3), ("9", 3), ("-1", 0), ("x", 0)):
             with patch.dict(os.environ, {"PHONE_JUDGE_RETRIES": value}):
                 self.assertEqual(phone.phone_judge_retries(), expected)
 
@@ -4812,26 +4799,26 @@ class TestPhoneJudgeProviderConfig(unittest.IsolatedAsyncioTestCase):
             raw = await phone._default_phone_coverage_inference("{}")
         return raw, call.await_args
 
-    async def test_defaults_reproduce_the_current_gemini_values(self):
+    async def test_defaults_use_dedicated_gemini_35_credential(self):
         with patch.dict(os.environ, {}, clear=False):
             self._clear()
-            env = {
-                "GEMINI_API_KEY": "g" * 40,
-                "GEMINI_MODEL": "gemini-3.1-flash-lite",
+            raw, await_args = await self._post({
+                "GEMINI_API_KEY": "synthetic-speaker-credential",
+                "PHONE_JUDGE_API_KEY": "j" * 40,
                 "GEMINI_BASE_URL": "https://generativelanguage.googleapis.com/v1beta/openai/",
-            }
-            raw, await_args = await self._post(env)
+            })
         self.assertEqual(raw, '{"covered":true,"conflict":null}')
-        # URL default = {GEMINI_BASE_URL}/chat/completions (composed, not appended-to).
         self.assertEqual(
             await_args.args[1],
             "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
         )
         body = await_args.kwargs["json_body"]
-        self.assertEqual(body["model"], "gemini-3.1-flash-lite")
+        self.assertEqual(body["model"], "gemini-3.5-flash-lite")
+        self.assertEqual(body["reasoning_effort"], "minimal")
         self.assertEqual(
-            await_args.kwargs["headers"]["Authorization"], f"Bearer {'g' * 40}",
+            await_args.kwargs["headers"]["Authorization"], f"Bearer {'j' * 40}",
         )
+        self.assertEqual(await_args.kwargs["headers"]["Cache-Control"], "no-store")
 
     async def test_url_is_posted_verbatim_without_appending(self):
         # A full-path gateway URL (DeepSeek shape) must be POSTed as-is.
@@ -4931,13 +4918,37 @@ class TestPhoneJudgeProviderConfig(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(body["max_tokens"], 800)
 
     def test_extra_body_reader_is_defensive(self):
-        for value in ("", "   ", "not json", "[1,2,3]", '"a string"', "123"):
+        for value in ("", "   "):
+            with patch.dict(os.environ, {"PHONE_JUDGE_EXTRA_BODY_JSON": value}):
+                self.assertEqual(phone.phone_judge_extra_body(),
+                                 {"reasoning_effort": "minimal"})
+        for value in ("not json", "[1,2,3]", '"a string"', "123"):
             with patch.dict(os.environ, {"PHONE_JUDGE_EXTRA_BODY_JSON": value}):
                 self.assertEqual(phone.phone_judge_extra_body(), {})
         with patch.dict(os.environ, {"PHONE_JUDGE_EXTRA_BODY_JSON":
                                      '{"reasoning_effort":"none"}'}):
             self.assertEqual(phone.phone_judge_extra_body(),
-                             {"reasoning_effort": "none"})
+                             {"reasoning_effort": "minimal"})
+
+
+class TestPhoneSpeechWatchdog(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_speech_created_gets_one_fixed_question_fallback(self):
+        agent, session, _, _, hooks = await _make_native_coordinator(
+            turn_mode="toolless",
+        )
+        before = list(session.spoken)
+        with patch.object(agent_mod, "PHONE_SPEECH_FIRST_AUDIO_TIMEOUT_SEC", 0.01):
+            await agent._on_reply_expected()
+            await asyncio.sleep(0.08)
+        self.assertEqual(session.spoken[len(before):], ["First question?"])
+        categories = [
+            c.kwargs.get("error_category")
+            for c in hooks["log"].warn.call_args_list
+            if c.kwargs.get("error_type") == "phone_speech_lifecycle"
+        ]
+        self.assertIn("no_speech_created", categories)
+        hooks["close_event"].set()
+        await hooks["drive_terminal"]()
 
 
 class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
@@ -4984,82 +4995,13 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
         hooks["close_event"].set()
         await hooks["drive_terminal"]()
 
-    def test_reconnect_b_commit_wait_uses_the_short_bound_not_terminal_timeout(self):
-        # STRUCTURAL PIN: the background commit's delivery wait reads the tiny
-        # RECONNECT-B bound, NOT the full terminal reply timeout. This is the
-        # load-bearing guarantee: on a restart the cursor advance no longer
-        # trails the persisted answer by ~10s.
+    def test_background_commit_never_waits_on_current_reply_delivery(self):
         src = inspect.getsource(agent_mod._run_native_phone_screening)
         commit_src = src[src.index("async def commit_after_reply"):
                          src.index("async def native_say")]
-        self.assertIn("assistant_delivery_complete.wait()", commit_src)
-        self.assertIn(
-            "timeout=PHONE_JUDGE_COMMIT_DELIVERY_WAIT_SEC", commit_src,
-        )
-        self.assertNotIn(
-            "timeout=PHONE_TERMINAL_REPLY_TIMEOUT_SEC", commit_src,
-        )
-        # The bound is small (sub-second), not the 10s terminal timeout.
-        self.assertLessEqual(agent_mod.PHONE_JUDGE_COMMIT_DELIVERY_WAIT_SEC, 1.0)
-        self.assertGreater(agent_mod.PHONE_JUDGE_COMMIT_DELIVERY_WAIT_SEC, 0.0)
-
-    async def test_reconnect_b_commit_lands_promptly_when_delivery_never_signals(self):
-        # RECONNECT-B: when the delivery signal never fires for the commit task,
-        # a COVERED verdict still commits the cursor promptly — bounded by the
-        # tiny judge-commit wait, NOT the full terminal reply timeout (pinned to
-        # an hour here to PROVE it is not on that path). The event is SET at
-        # answer-acceptance (required to accept the answer at all), then cleared
-        # immediately so the commit task's own wait must time out and commit
-        # anyway — the live `delivery_timeout_commit_anyway` path.
-        with patch.object(agent_mod, "PHONE_TERMINAL_REPLY_TIMEOUT_SEC", 3600.0), \
-                patch.object(agent_mod, "PHONE_JUDGE_COMMIT_DELIVERY_WAIT_SEC", 0.05):
-            agent, _, _, client, hooks = await self._coordinator()
-            with patch.object(
-                phone, "judge_phone_coverage", new_callable=AsyncMock,
-                return_value=phone.PhoneCoverageVerdict(True, None, "model"),
-            ) as judge:
-                started = asyncio.get_event_loop().time()
-                # Accept the answer with the event set, then clear it before the
-                # freshly-created commit task runs its wait — the wait now blocks
-                # and must fall back on the tiny bound.
-                await self._turn(hooks, "I led operations for four years.")
-                hooks["assistant_delivery_complete"].clear()
-                for _ in range(200):
-                    if client.committed_keys == ["k1"]:
-                        break
-                    await asyncio.sleep(0.01)
-                elapsed = asyncio.get_event_loop().time() - started
-            judge.assert_awaited_once()
-            self.assertEqual(client.committed_keys, ["k1"])
-            # Committed far under the (patched-huge) terminal timeout.
-            self.assertLess(elapsed, 2.0)
-            self.assertIn("delivery_timeout_commit_anyway", [
-                c.kwargs.get("error_category")
-                for c in hooks["log"].info.call_args_list
-                if c.kwargs.get("error_type") == "phone_toolless_commit"
-            ])
-            await self._close(hooks)
-
-    async def test_reconnect_b_not_covered_gating_is_unchanged(self):
-        # The covered/not-covered gating and re-anchor behaviour are identical
-        # under the shortened wait: a not-covered verdict still skips the commit
-        # and re-anchors the owed topic. Judge still runs.
-        with patch.object(agent_mod, "PHONE_JUDGE_COMMIT_DELIVERY_WAIT_SEC", 0.05):
-            agent, _, _, client, hooks = await self._coordinator()
-            with patch.object(
-                phone, "judge_phone_coverage", new_callable=AsyncMock,
-                return_value=phone.PhoneCoverageVerdict(False, None, "model"),
-            ) as judge:
-                await self._turn(hooks, "I led operations for four years.")
-                hooks["assistant_delivery_complete"].clear()
-                for _ in range(200):
-                    if agent._coverage_reanchor["question_key"] == "k1":
-                        break
-                    await asyncio.sleep(0.01)
-                self.assertEqual(agent._coverage_reanchor["question_key"], "k1")
-            judge.assert_awaited_once()
-            self.assertEqual(client.committed_keys, [])
-            await self._close(hooks)
+        self.assertNotIn("assistant_delivery_complete.wait()", commit_src)
+        self.assertNotIn("delivery_timeout_commit_anyway", commit_src)
+        self.assertIn('boundary.get("ask_delivered") is not True', commit_src)
 
     async def test_covered_verdict_permits_the_same_idempotent_commit(self):
         agent, _, _, client, hooks = await self._coordinator()
@@ -5088,7 +5030,8 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
             phone, "judge_phone_coverage", new_callable=AsyncMock,
             return_value=phone.PhoneCoverageVerdict(False, None, "model"),
         ):
-            await self._turn(hooks, "I led operations for four years.")
+            await self._turn(hooks, "I led operations for four years.",
+                             assistant_text="Could you elaborate?")
             self.assertTrue(await self._drain(
                 lambda: agent._coverage_reanchor["question_key"] == "k1",
             ))
@@ -5111,7 +5054,8 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
             phone, "judge_phone_coverage", new_callable=AsyncMock,
             return_value=phone.PhoneCoverageVerdict(False, None, "judge_error"),
         ):
-            await self._turn(hooks, "I led operations for four years.")
+            await self._turn(hooks, "I led operations for four years.",
+                             assistant_text="Could you elaborate?")
             self.assertTrue(await self._drain(
                 lambda: agent._coverage_reanchor["question_key"] == "k1",
             ))
@@ -5131,7 +5075,7 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(phone.phone_coverage_timeout_sec(), 6.5)
         with patch.dict(os.environ, {"PHONE_COVERAGE_TIMEOUT_SEC": ""}, clear=False):
             os.environ.pop("PHONE_COVERAGE_TIMEOUT_SEC", None)
-            self.assertEqual(phone.phone_coverage_timeout_sec(), 4.0)
+            self.assertEqual(phone.phone_coverage_timeout_sec(), 2.0)
         # Out-of-range values clamp rather than pass through unbounded.
         with patch.dict(os.environ, {"PHONE_COVERAGE_TIMEOUT_SEC": "999"}):
             self.assertEqual(phone.phone_coverage_timeout_sec(), 30.0)
@@ -5152,97 +5096,19 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(verdict.category, "judge_error")
 
-    async def test_consecutive_judge_errors_caution_advance_at_the_bound(self):
-        # N-1 errors hold (no commit); the Nth error caution-advances the
-        # cursor. Default bound is 3, pinned explicitly for the assertion.
-        with patch.dict(os.environ, {"PHONE_COVERAGE_MAX_CONSEC_ERRORS": "3"}):
-            self.assertEqual(phone.phone_coverage_max_consec_errors(), 3)
-            agent, _, _, client, hooks = await self._coordinator()
-            with patch.object(
-                phone, "judge_phone_coverage", new_callable=AsyncMock,
-                return_value=phone.PhoneCoverageVerdict(False, None, "judge_error"),
-            ):
-                # First two errors: hold, cursor pinned at k1, run counts up.
-                await self._turn(hooks, "First answer.")
-                self.assertTrue(await self._drain(
-                    lambda: agent._coverage_error_run["count"] == 1,
-                ))
-                await self._turn(hooks, "Second answer.")
-                self.assertTrue(await self._drain(
-                    lambda: agent._coverage_error_run["count"] == 2,
-                ))
-                self.assertEqual(client.committed_keys, [])
-                # Third error reaches the bound -> caution-advance commits k1.
-                await self._turn(hooks, "Third answer.")
-                self.assertTrue(await self._drain(
-                    lambda: client.committed_keys == ["k1"],
-                ))
-        # The run resets after the caution-advance and it logged distinctly.
-        self.assertEqual(agent._coverage_error_run["count"], 0)
-        self.assertIn("caution_advance", [
-            c.kwargs.get("error_category")
-            for c in hooks["log"].warn.call_args_list
-            if c.kwargs.get("error_type") == "phone_coverage_judge"
-        ])
-        await self._close(hooks)
-
-    async def test_a_run_of_not_covered_model_never_caution_advances(self):
-        # A legitimate "keep probing" run must never trip the caution-advance,
-        # no matter how long it runs — the counter stays reset at zero.
-        with patch.dict(os.environ, {"PHONE_COVERAGE_MAX_CONSEC_ERRORS": "2"}):
-            agent, _, _, client, hooks = await self._coordinator()
-            with patch.object(
-                phone, "judge_phone_coverage", new_callable=AsyncMock,
-                return_value=phone.PhoneCoverageVerdict(False, None, "model"),
-            ):
-                for answer in ("One.", "Two.", "Three.", "Four."):
-                    await self._turn(hooks, answer)
-                    self.assertTrue(await self._drain(
-                        lambda: agent._coverage_reanchor["question_key"] == "k1",
-                    ))
-        # Never committed, run never advanced past zero, no caution log.
+    async def test_repeated_judge_errors_never_advance_the_cursor(self):
+        agent, _, _, client, hooks = await self._coordinator()
+        with patch.object(
+            phone, "judge_phone_coverage", new_callable=AsyncMock,
+            return_value=phone.PhoneCoverageVerdict(False, None, "judge_error"),
+        ):
+            for answer in ("One.", "Two.", "Three."):
+                await self._turn(hooks, answer, assistant_text="Could you elaborate?")
+                await self._drain(
+                    lambda: agent._coverage_reanchor["question_key"] == "k1",
+                )
         self.assertEqual(client.committed_keys, [])
-        self.assertEqual(agent._coverage_error_run["count"], 0)
-        self.assertNotIn("caution_advance", [
-            c.kwargs.get("error_category")
-            for c in hooks["log"].warn.call_args_list
-            if c.kwargs.get("error_type") == "phone_coverage_judge"
-        ])
-        await self._close(hooks)
-
-    async def test_a_real_verdict_between_errors_resets_the_error_run(self):
-        # covered_model between two errors resets the counter, so a subsequent
-        # single error does not carry the earlier run to the bound.
-        with patch.dict(os.environ, {"PHONE_COVERAGE_MAX_CONSEC_ERRORS": "2"}):
-            agent, _, _, client, hooks = await self._coordinator()
-            error = phone.PhoneCoverageVerdict(False, None, "judge_error")
-            covered = phone.PhoneCoverageVerdict(True, None, "model")
-            script = [error, covered, error]
-            with patch.object(
-                phone, "judge_phone_coverage", new_callable=AsyncMock,
-                side_effect=script,
-            ):
-                await self._turn(hooks, "err one")
-                self.assertTrue(await self._drain(
-                    lambda: agent._coverage_error_run["count"] == 1,
-                ))
-                hooks["latest_assistant"][0] = "What is your notice period?"
-                await self._turn(hooks, "covered")
-                self.assertTrue(await self._drain(
-                    lambda: agent._coverage_error_run["count"] == 0,
-                ))
-                await self._turn(hooks, "err two")
-                self.assertTrue(await self._drain(
-                    lambda: agent._coverage_error_run["count"] == 1,
-                ))
-        # Only the covered verdict advanced the cursor; the lone trailing error
-        # did NOT reach the bound-of-2, so no caution-advance happened.
-        self.assertEqual(client.committed_keys, ["k1"])
-        self.assertNotIn("caution_advance", [
-            c.kwargs.get("error_category")
-            for c in hooks["log"].warn.call_args_list
-            if c.kwargs.get("error_type") == "phone_coverage_judge"
-        ])
+        self.assertNotIn("caution_advance", repr(hooks["log"].mock_calls))
         await self._close(hooks)
 
     async def test_resume_missing_logs_and_does_not_skip_conflict_detection(self):
@@ -5335,7 +5201,7 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(agent._asked_conflicts), 1)
         await self._close(hooks)
 
-    async def test_slow_prior_judge_never_blocks_speech_and_rebases_next_answer(self):
+    async def test_slow_shadow_judge_never_blocks_speech_or_rebinds_answers(self):
         _, _, _, client, hooks = await self._coordinator()
         first_started = asyncio.Event()
         release_first = asyncio.Event()
@@ -5349,45 +5215,12 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
         with patch.object(phone, "judge_phone_coverage", side_effect=verdict) as judge:
             await self._turn(hooks, "I led operations for four years.")
             await asyncio.wait_for(first_started.wait(), timeout=0.1)
-            # This speech hook returns while the prior judge is blocked.
+            # Deterministic coverage committed k1 before shadow-judge latency.
+            self.assertEqual(client.committed_keys, ["k1"])
             await asyncio.wait_for(self._turn(
-                hooks,
-                "My notice period is thirty days.",
+                hooks, "My notice period is thirty days.",
                 assistant_text="What is your notice period?",
             ), timeout=0.1)
-            self.assertEqual(client.committed_keys, [])
-            release_first.set()
-            self.assertTrue(await self._drain(
-                lambda: client.committed_keys == ["k1", "k2"],
-            ))
-        self.assertEqual(judge.call_count, 2)
-        self.assertEqual(
-            [call.kwargs["question_text"] for call in judge.call_args_list],
-            ["Tell me about your recent role.", "What is your notice period?"],
-        )
-        await self._close(hooks)
-
-    async def test_slow_prior_judge_never_blocks_speech_and_rebases_next_answer(self):
-        _, _, _, client, hooks = await self._coordinator()
-        first_started = asyncio.Event()
-        release_first = asyncio.Event()
-
-        async def verdict(**kwargs):
-            if "recent role" in kwargs["question_text"].lower():
-                first_started.set()
-                await release_first.wait()
-            return phone.PhoneCoverageVerdict(True, None, "model")
-
-        with patch.object(phone, "judge_phone_coverage", side_effect=verdict) as judge:
-            await self._turn(hooks, "I led operations for four years.")
-            await asyncio.wait_for(first_started.wait(), timeout=0.1)
-            # This speech hook returns while the prior judge is blocked.
-            await asyncio.wait_for(self._turn(
-                hooks,
-                "My notice period is thirty days.",
-                assistant_text="What is your notice period?",
-            ), timeout=0.1)
-            self.assertEqual(client.committed_keys, [])
             release_first.set()
             self.assertTrue(await self._drain(
                 lambda: client.committed_keys == ["k1", "k2"],
@@ -5713,7 +5546,7 @@ class TestToollessBackgroundCommit(unittest.IsolatedAsyncioTestCase):
         injected = " ".join(
             m["content"] if isinstance(m, dict) else "" for m in turn_ctx.items
         ).lower()
-        self.assertIn("planned question", injected)
+        self.assertIn("next planned topic", injected)
         self.assertNotIn("coordinator tool", injected)
         self.assertNotIn("never speak before the tool result", injected)
         # The commit runs on a BACKGROUND task (off the on_turn/speech path):
@@ -7015,6 +6848,8 @@ class TestSubstanceGatedCommit(unittest.IsolatedAsyncioTestCase):
             "message": None,
             "source_event_id": phone.plan_source_event_id("k1"),
             "probe_used": False,
+            "ask_delivered": True,
+            "expected_index": 0,
         })
         hooks["assistant_delivery_complete"].set()
         await agent._commit_after_reply()
@@ -7038,6 +6873,8 @@ class TestSubstanceGatedCommit(unittest.IsolatedAsyncioTestCase):
             "message": None,
             "source_event_id": phone.plan_source_event_id("k1"),
             "probe_used": False,
+            "ask_delivered": True,
+            "expected_index": 0,
         })
         hooks["assistant_delivery_complete"].set()
         await agent._commit_after_reply()

@@ -30,6 +30,12 @@ class ClosingStateMachine:
             raise RuntimeError("closing_invalid_qna_transition")
         self.state = ClosingState.CLOSING_PENDING
 
+    def cancel_for_callback(self) -> None:
+        """Cancel authored-but-unplayed closing when callback intent arrives."""
+        if self.state not in {ClosingState.CANDIDATE_QNA, ClosingState.CLOSING_PENDING}:
+            raise RuntimeError("closing_invalid_callback_transition")
+        self.state = ClosingState.SCREENING
+
     def closing_delivered(self) -> None:
         if self.state is not ClosingState.CLOSING_PENDING:
             raise RuntimeError("closing_invalid_close_transition")

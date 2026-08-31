@@ -227,7 +227,7 @@ describe('candidate voice callback proposal and confirmation', () => {
       ok: true,
       status: 'proposal_valid',
       starts_at: '2026-09-01T10:00:00.000Z',
-      duration_seconds: 600,
+      duration_seconds: 900,
       time_zone: 'Asia/Kolkata',
       ist_time: '15:30',
     });

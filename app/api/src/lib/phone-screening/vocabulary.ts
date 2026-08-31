@@ -237,7 +237,7 @@ export const PHONE_APPOINTMENT_MIN_SECONDS = 900;
 export const PHONE_APPOINTMENT_MAX_SECONDS = 3600;
 
 /** Storage and candidate voice callback contract. */
-export const PHONE_VOICE_CALLBACK_DURATION_SECONDS = 600;
+export const PHONE_VOICE_CALLBACK_DURATION_SECONDS = 900;
 export const PHONE_VOICE_CALLBACK_MIN_LEAD_SECONDS = 300;
 
 // ═══════════════════════════════════════════════════════════════════════

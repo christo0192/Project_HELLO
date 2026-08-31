@@ -51,18 +51,17 @@ export function phoneEgressConfigured(): boolean {
  * constraint that keeps `recording-egress.ts`'s `terminalEgressStatuses()` a
  * function rather than a const.
  *
- * `disableManifest` is left FALSE — the manifest is WANTED. It is a second
- * object with its own `.json` suffix, and 0043 stores its key alongside the
- * recording's precisely so a purge deletes both. Suppressing it would make the
- * manifest column dead weight; forgetting it in the purge is the documented
- * trap this lane has already hit once.
+ * Provider manifest generation is disabled. The application finalizer writes
+ * and verifies the canonical `<object>.json` only after it has downloaded and
+ * hashed the MP3, giving the manifest exactly one owner while preserving the
+ * prebound purge key.
  */
 export async function createPhoneEgressOutput(objectKey: string): Promise<unknown> {
   const { EncodedFileOutput, EncodedFileType, S3Upload } = await import('livekit-server-sdk');
   return new EncodedFileOutput({
     fileType: EncodedFileType.MP3,
     filepath: objectKey,
-    disableManifest: false,
+    disableManifest: true,
     output: {
       case: 's3',
       value: new S3Upload({
