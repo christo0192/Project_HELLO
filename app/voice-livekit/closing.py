@@ -36,6 +36,12 @@ class ClosingStateMachine:
             raise RuntimeError("closing_invalid_callback_transition")
         self.state = ClosingState.SCREENING
 
+    def reopen_qna(self) -> None:
+        """Let a real candidate question preempt an authored, unplayed close."""
+        if self.state is not ClosingState.CLOSING_PENDING:
+            raise RuntimeError("closing_invalid_qna_reopen_transition")
+        self.state = ClosingState.CANDIDATE_QNA
+
     def closing_delivered(self) -> None:
         if self.state is not ClosingState.CLOSING_PENDING:
             raise RuntimeError("closing_invalid_close_transition")
