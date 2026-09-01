@@ -792,6 +792,17 @@ PHONE_TURN_DETECTION_LOCAL = "local"
 PHONE_TURN_DETECTION_STT = "stt"
 PHONE_LOCAL_ENDPOINTING_MIN_DELAY_SEC = 0.5
 PHONE_LOCAL_ENDPOINTING_MAX_DELAY_SEC = 1.5
+PHONE_DYNAMIC_ENDPOINTING_ENV = "PHONE_DYNAMIC_ENDPOINTING"
+
+
+def phone_dynamic_endpointing_enabled() -> bool:
+    """Whether phone-local EOU may adapt within the fixed safety envelope.
+
+    Opt-in only: fixed 0.5/1.5s endpointing remains the rollback/default path.
+    """
+    return (os.getenv("PHONE_DYNAMIC_ENDPOINTING") or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 
 def phone_turn_detection() -> str:
@@ -2466,6 +2477,40 @@ def render_resume_context(turns: list[dict[str, str]]) -> str:
 JUDGE_WINDOW_MAX_TURNS = 4
 JUDGE_WINDOW_MAX_CHARS = 300
 JUDGE_WINDOW_TOTAL_MAX_CHARS = 1_500
+PHONE_CONTEXT_MAX_ITEMS = 32
+PHONE_CONTEXT_RECENT_ITEMS = 20
+
+
+def bounded_phone_chat_context(chat_ctx: Any) -> Any:
+    """Return a bounded copy without mutating durable LiveKit history.
+
+    System/developer instructions are retained because they carry the current
+    controller authorization and structured semantic state; older conversational
+    turns are dropped only after the bounded threshold is exceeded. The durable
+    transcript remains complete for assessment and audit.
+    """
+    items = getattr(chat_ctx, "items", None)
+    copy_ctx = getattr(chat_ctx, "copy", None)
+    if not isinstance(items, list) or len(items) <= PHONE_CONTEXT_MAX_ITEMS or not callable(copy_ctx):
+        return chat_ctx
+    authority = [
+        item for item in items
+        if str(getattr(item, "role", "")).lower() in {"system", "developer"}
+    ]
+    # Keep the initial policy plus the newest authorization instructions; old
+    # per-turn developer hints are superseded by the latest controller state.
+    stable = authority[:4] + authority[-4:]
+    recent = items[-PHONE_CONTEXT_RECENT_ITEMS:]
+    retained: list[Any] = []
+    seen: set[int] = set()
+    for item in [*stable, *recent]:
+        marker = id(item)
+        if marker not in seen:
+            seen.add(marker)
+            retained.append(item)
+    bounded = copy_ctx()
+    bounded.items = retained
+    return bounded
 
 
 def render_recent_transcript(turns: list[dict[str, str]] | None) -> str:
@@ -4836,6 +4881,7 @@ def phone_agent_class(agent_base: Any) -> Any:
             AgentSession. Clarification/callback turns leave the plan empty and
             use the same Gemini node as the browser agent.
             """
+            generation_ctx = bounded_phone_chat_context(chat_ctx)
             if self._gate_opening:
                 # The gate's spoken opening: tool-less and streamed, even though
                 # screening is not yet authorized. This is the ONE pre-consent
@@ -4847,7 +4893,7 @@ def phone_agent_class(agent_base: Any) -> Any:
                     model_settings = replace(model_settings, tool_choice="none")
                 except (TypeError, ValueError):
                     pass
-                result = super().llm_node(chat_ctx, tools, model_settings)
+                result = super().llm_node(generation_ctx, tools, model_settings)
                 if inspect.isawaitable(result):
                     result = await result
                 async for chunk in result:
@@ -4933,7 +4979,7 @@ def phone_agent_class(agent_base: Any) -> Any:
             # turn. Never fabricate a neutral user item to repair history: doing
             # so pollutes the durable transcript and hides an invalid scheduler
             # call instead of preventing it.
-            result = super().llm_node(chat_ctx, tools, model_settings)
+            result = super().llm_node(generation_ctx, tools, model_settings)
             if inspect.isawaitable(result):
                 result = await result
             if not self._screening_authorized:
