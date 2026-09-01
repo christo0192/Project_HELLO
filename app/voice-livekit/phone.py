@@ -4493,6 +4493,43 @@ def _private_phone_control_text(control_text: Any, objective_text: Any) -> str |
     return private
 
 
+_GENERATED_REQUEST_QUESTION_RE = re.compile(
+    r"(?:^|[,:;—–-]\s*)(?:(?:could|would|can|will)\s+you\s+)?"
+    r"(?:tell\s+me|walk\s+me\s+through|take\s+me\s+through|"
+    r"talk\s+me\s+through|share|describe|explain|help\s+me\s+understand)\b",
+    re.IGNORECASE,
+)
+_GENERATED_QUOTED_TEXT_RE = re.compile(r'"[^"\n]*"|“[^”\n]*”')
+
+
+def phone_generated_question_act_count(speech: Any) -> int:
+    """Count candidate-directed question acts, not literal question marks.
+
+    Spoken interview questions are often natural imperatives ("Walk me
+    through...") with a period, while quoted candidate wording may contain a
+    question mark. Treating punctuation as intent rejected both shapes. This
+    bounded structural parser accepts one request/interrogative and still
+    rejects stacked questions without adding a model call.
+    """
+    if not isinstance(speech, str):
+        return 0
+    compact = " ".join(speech.split())
+    if not compact:
+        return 0
+    unquoted = _GENERATED_QUOTED_TEXT_RE.sub(" ", compact)
+    count = 0
+    for match in re.finditer(r"([^.!?]*)([.!?]+|$)", unquoted):
+        clause = match.group(1).strip(" —–-,:;()")
+        punctuation = match.group(2)
+        if not clause:
+            continue
+        if "?" in punctuation:
+            count += len(re.findall(r"\?+", punctuation))
+        else:
+            count += len(_GENERATED_REQUEST_QUESTION_RE.findall(clause))
+    return count
+
+
 def phone_generated_prefix_authorized(
     speech: Any, objective_text: Any, *, control_text: Any = None,
 ) -> bool:
@@ -4500,7 +4537,7 @@ def phone_generated_prefix_authorized(
     if not isinstance(speech, str) or not any(ch.isalpha() for ch in speech):
         return False
     compact = " ".join(speech.split())
-    if "?" in compact or _GENERATED_CLOSING_RE.search(compact):
+    if phone_generated_question_act_count(compact) or _GENERATED_CLOSING_RE.search(compact):
         return False
     private_control = _private_phone_control_text(control_text, objective_text)
     if phone_instruction_echo_detected(compact, private_control):
@@ -4520,8 +4557,11 @@ def phone_generated_reply_rejection_reason(
     compact = " ".join(speech.split())
     if not allow_closing and _GENERATED_CLOSING_RE.search(compact):
         return "premature_closing"
-    question_marks = compact.count("?")
-    if (not allow_closing and question_marks != 1) or question_marks > 1:
+    question_acts = phone_generated_question_act_count(compact)
+    if (not allow_closing and question_acts != 1) or question_acts > 1:
+        # Preserve the existing sanitized telemetry category for dashboard and
+        # historical-series compatibility even though validation now counts
+        # spoken question acts rather than punctuation glyphs.
         return "question_mark_count"
     objective_is_comp = phone_is_compensation_objective(objective_text)
     if _COMPENSATION_OBJECTIVE_RE.search(compact) and not objective_is_comp:
