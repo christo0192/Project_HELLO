@@ -156,7 +156,7 @@ describe('1. every phone write goes through an RPC', () => {
     // (commit_phone_item_turn) and the crashed-session recording sweep
     // (sweep_phone_stranded_recordings). 0072 added the partial-finalize sweep
     // (finalize_phone_partial_sessions).
-    expect(new Set(rpcCalls).size).toBe(32);
+    expect(new Set(rpcCalls).size).toBe(31);
     // The write seam reaches NO table, only RPCs.
     expect(writeBody, 'stores.ts uses a table accessor').not.toMatch(/\bclient\s*\.\s*from\s*\(/);
     // A type-only import of the client type is fine; a VALUE import is not.

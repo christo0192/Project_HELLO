@@ -274,6 +274,9 @@ const assessmentTurnSchema = z
     expected_index: z.number().int().min(0).max(99),
     source_event_id: z.string().trim().regex(/^[A-Za-z0-9_.:-]{1,200}$/),
     turns: z.array(boundaryTurnSchema).min(2).max(12),
+    covered_question_keys: z.array(
+      z.string().trim().regex(/^[A-Za-z0-9_.:-]{1,100}$/),
+    ).max(3).default([]),
   })
   .strict();
 
@@ -1223,6 +1226,9 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
         expectedIndex: parsed.data.expected_index,
         sourceEventId: parsed.data.source_event_id,
         turns: parsed.data.turns,
+        ...(parsed.data.covered_question_keys.length > 0
+          ? { coveredQuestionKeys: parsed.data.covered_question_keys }
+          : {}),
         now: now(),
       });
       // `applied` is read from the RPC's own flag, never inferred from the
