@@ -589,8 +589,16 @@ export function createPhoneRuntime(
           const diagGate = reader.activeTestGate
             ? await reader.activeTestGate({ now })
             : null;
-          const diagSkip = Object.keys(result.skipped ?? {}).join('.') || 'none';
-          const diagRef = Object.keys(result.refusals ?? {}).join('.') || 'none';
+          // Sanitise each sub-code so a `:detail` cannot form the entropy /
+          // token pattern the logger's value-defense drops (which silently
+          // nulled the whole field last iteration). Non-alphanumerics collapse
+          // to `_`, each code caps at 28 chars, and codes join with `-` — no
+          // 30+ alphanumeric run, no colon, no path.
+          const sanitizeCodes = (keys: string[]): string =>
+            keys.map((raw) => raw.replace(/[^a-z0-9]+/gi, '_').slice(0, 28)).join('-')
+            || 'none';
+          const diagSkip = sanitizeCodes(Object.keys(result.skipped ?? {}));
+          const diagRef = sanitizeCodes(Object.keys(result.refusals ?? {}));
           if (
             diagGate !== null
             || diagSkip !== 'none'
