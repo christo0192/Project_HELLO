@@ -62,6 +62,10 @@ primary_region = "sin"
   # Controller selects the objective; Gemini authors one natural bridge and
   # paraphrased question in a single phone-only generation.
   PHONE_TURN_MODE = "toolless"
+  # Keep preemptive generation explicitly disabled in production. The phone
+  # coordinator owns objective order; preloading a future objective can create
+  # repeated introductions or stale questions after an interruption.
+  PHONE_OBJECTIVE_PREEMPTIVE = "off"
   PHONE_TTS_FLUSH_MIN_CHARS = "0"
   LIVEKIT_WORKER_DRAIN_SEC = "10"
   CANDIDATE_SILENCE_PROMPT_SEC = "30"

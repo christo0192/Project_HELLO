@@ -1478,20 +1478,32 @@ async def _run_native_phone_screening(
 
     def set_reply_snapshot(
         fallback: str | None, *, objective: str | None = None, phase: str = "screening",
+        fallback_without_prefix: str | None = None,
     ) -> None:
         reply_snapshot.clear()
         reply_snapshot.update({
             "fallback": fallback,
+            "fallback_without_prefix": fallback_without_prefix,
             "objective": objective,
             "phase": phase,
         })
 
+    def set_question_reply_snapshot(question: Any, answer: Any = None) -> None:
+        """Snapshot both ordinary and acknowledgement-free recovery paths."""
+        if question is None:
+            set_reply_snapshot(phone.PHONE_ASSESSMENT_CLOSING_TEXT, phase="closing")
+            return
+        set_reply_snapshot(
+            phone.phone_fallback_reply(question, answer),
+            objective=question.spoken_text,
+            fallback_without_prefix=question.spoken_text,
+        )
+
     initial_question = state.question_at(cursor)
-    set_reply_snapshot(
-        phone.phone_fallback_reply(initial_question) if initial_question is not None else phone.PHONE_ASSESSMENT_CLOSING_TEXT,
-        objective=initial_question.spoken_text if initial_question is not None else None,
-        phase="screening" if initial_question is not None else "closing",
-    )
+    if initial_question is not None:
+        set_question_reply_snapshot(initial_question)
+    else:
+        set_reply_snapshot(phone.PHONE_ASSESSMENT_CLOSING_TEXT, phase="closing")
     pending: dict[str, Any] = {
         "question": None, "prompt": None, "candidate": None,
         "message": None, "probe_used": False, "source_event_id": None,
@@ -1852,10 +1864,7 @@ async def _run_native_phone_screening(
             return
         question = state.question_at(cursor)
         if question is not None:
-            set_reply_snapshot(
-                phone.phone_fallback_reply(question, text),
-                objective=question.spoken_text,
-            )
+            set_question_reply_snapshot(question, text)
         else:
             set_reply_snapshot(phone.PHONE_ASSESSMENT_CLOSING_TEXT, phase="closing")
         # Callback intent outranks Q&A and authored closing. Until the goodbye
@@ -1896,10 +1905,7 @@ async def _run_native_phone_screening(
             # partial plan into a successful closing.
             if question is not None:
                 setattr(agent, "_turn_policy", "clarification")
-                set_reply_snapshot(
-                    phone.phone_fallback_reply(question, text),
-                    objective=question.spoken_text,
-                )
+                set_question_reply_snapshot(question, text)
                 add_turn_instruction(turn_ctx, phone_question_instructions(question, state.role_title))
                 return
 
@@ -1980,10 +1986,7 @@ async def _run_native_phone_screening(
                 # Gate off: preserve the pre-X10 re-ask behaviour exactly.
                 setattr(agent, "_turn_policy", "clarification")
                 if question is not None:
-                    set_reply_snapshot(
-                        phone.phone_fallback_reply(question, text),
-                        objective=question.spoken_text,
-                    )
+                    set_question_reply_snapshot(question, text)
                     add_turn_instruction(turn_ctx, phone_question_instructions(question, state.role_title))
                 return
             if route == "callback_deferral":
@@ -2009,10 +2012,7 @@ async def _run_native_phone_screening(
                 return
             setattr(agent, "_turn_policy", "clarification")
             if question is not None:
-                set_reply_snapshot(
-                    phone.phone_fallback_reply(question, text),
-                    objective=question.spoken_text,
-                )
+                set_question_reply_snapshot(question, text)
                 add_turn_instruction(turn_ctx, phone_question_instructions(question, state.role_title))
             return
         # THE PATIENCE GATE (X10). Not a recognised route: classify the final as
@@ -2243,10 +2243,7 @@ async def _run_native_phone_screening(
                     objective=objective_text, phase="wind_down",
                 )
             else:
-                set_reply_snapshot(
-                    phone.phone_fallback_reply(next_question, text),
-                    objective=objective_text,
-                )
+                set_question_reply_snapshot(next_question, text)
             if (
                 next_question is not None
                 and phone.phone_is_compensation_objective(next_question.text)
@@ -2412,10 +2409,7 @@ async def _run_native_phone_screening(
             return last_advance["text"]
         pending["probe_used"] = False
         hint = f" The most useful angle if their answer is thin: {next_question.hint}" if next_question.hint else ""
-        set_reply_snapshot(
-            phone.phone_fallback_reply(next_question, candidate),
-            objective=next_question.spoken_text,
-        )
+        set_question_reply_snapshot(next_question, candidate)
         authorize_generated_reply(
             next_question.spoken_text,
             control_text="React to the answer without revealing private controller rules.",
@@ -2709,9 +2703,10 @@ async def _run_native_phone_screening(
             ):
                 return
             fallback_generation[0] = generation
-            fallback = snapshot.get("fallback")
-            if not isinstance(fallback, str) or not fallback.strip():
-                fallback = phone.PHONE_ASSESSMENT_CLOSING_TEXT
+            fallback = phone.phone_recovery_fallback(
+                snapshot,
+                prefix_released=bool(getattr(agent, "_generation_prefix_released", False)),
+            )
             if pending_terminal_reason.get("value") is not None:
                 pending_terminal_speech_seq["value"] = speech_sequence[0] + 1
             try:
