@@ -578,6 +578,37 @@ export function createPhoneRuntime(
           { now, limit: runtimeConfig.dueLimit },
         );
         lastDue = result;
+        // ── TEMP DIAG (revert after diagnosis) ──────────────────────
+        // Bounded, PII-free dial-decision telemetry for the owner test
+        // gate that is not being originated. Emits only on interesting
+        // ticks (a gate is present, or a skip/refusal occurred, or the
+        // pass halted). The re-read of the gate is deliberate: it lets a
+        // `halted` status be told apart from a missing gate. Only counts
+        // and stable sub-codes are logged — never a number, name or id.
+        try {
+          const diagGate = reader.activeTestGate
+            ? await reader.activeTestGate({ now })
+            : null;
+          const diagSkip = Object.keys(result.skipped ?? {}).join('.') || 'none';
+          const diagRef = Object.keys(result.refusals ?? {}).join('.') || 'none';
+          if (
+            diagGate !== null
+            || diagSkip !== 'none'
+            || diagRef !== 'none'
+            || result.status !== 'ok'
+          ) {
+            logger.info('unknown_event', {
+              error_type: 'phone_due_diag',
+              error_category: (
+                `gate.${diagGate !== null ? 1 : 0}:st.${result.status}`
+                + `:ex${result.examined}:of${result.offered}:di${result.dialing}`
+                + `:skip.${diagSkip}:ref.${diagRef}`
+              ).slice(0, 180),
+            });
+          }
+        } catch {
+          // Diagnostics must never affect the tick.
+        }
         // ── M-4: THE RECONNECT BOUND IS THIS LOOP'S CADENCE ─────────
         // `return result.dialing > 0` let a pass that dialled nothing back
         // off toward the 60s ceiling. A dropped call becomes due
