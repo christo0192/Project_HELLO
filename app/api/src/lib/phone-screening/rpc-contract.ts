@@ -54,6 +54,7 @@ export const PHONE_RPC_NAMES = [
   'start_phone_assessment',
   'get_phone_assessment_state',
   'commit_phone_question_boundary',
+  'commit_phone_question_boundary_with_coverage',
   // 0045
   'heartbeat_phone_attempt_by_epoch',
   'sweep_phone_day_rolled',
@@ -152,6 +153,15 @@ export const PHONE_RPC_PARAMETERS: Readonly<Record<PhoneRpcName, readonly string
       'p_expected_index',
       'p_source_event_id',
       'p_turns',
+      'p_now',
+    ],
+    commit_phone_question_boundary_with_coverage: [
+      'p_session_id',
+      'p_question_key',
+      'p_expected_index',
+      'p_source_event_id',
+      'p_turns',
+      'p_covered_question_keys',
       'p_now',
     ],
     // ── 0045 ──────────────────────────────────────────────────────────
@@ -560,6 +570,14 @@ export const COMMIT_PHONE_QUESTION_BOUNDARY_STATUSES = [
 export type CommitPhoneQuestionBoundaryStatus =
   (typeof COMMIT_PHONE_QUESTION_BOUNDARY_STATUSES)[number];
 
+export const COMMIT_PHONE_QUESTION_BOUNDARY_WITH_COVERAGE_STATUSES = [
+  ...COMMIT_PHONE_QUESTION_BOUNDARY_STATUSES,
+  'invalid_coverage',
+  'duplicate',
+] as const;
+export type CommitPhoneQuestionBoundaryWithCoverageStatus =
+  (typeof COMMIT_PHONE_QUESTION_BOUNDARY_WITH_COVERAGE_STATUSES)[number];
+
 export const RECORD_PHONE_PROBE_STATUSES = [
   'probe_recorded', 'probe_denied', 'duplicate', 'invalid_input',
   'unknown_session', 'plan_missing', 'session_not_active', 'stale_cursor', 'key_not_current',
@@ -624,6 +642,7 @@ export const PHONE_RPC_STATUSES: Readonly<Record<PhoneRpcName, readonly string[]
     start_phone_assessment: START_PHONE_ASSESSMENT_STATUSES,
     get_phone_assessment_state: GET_PHONE_ASSESSMENT_STATE_STATUSES,
     commit_phone_question_boundary: COMMIT_PHONE_QUESTION_BOUNDARY_STATUSES,
+    commit_phone_question_boundary_with_coverage: COMMIT_PHONE_QUESTION_BOUNDARY_WITH_COVERAGE_STATUSES,
     heartbeat_phone_attempt_by_epoch: HEARTBEAT_PHONE_ATTEMPT_BY_EPOCH_STATUSES,
     sweep_phone_day_rolled: SWEEP_PHONE_DAY_ROLLED_STATUSES,
     sweep_phone_stranded_sessions: SWEEP_PHONE_STRANDED_SESSIONS_STATUSES,
@@ -679,7 +698,7 @@ export const PHONE_RPC_STATUS_UNION: readonly string[] = Object.freeze(
  * two-RPC migration moves the count by one. The exact number is RE-DERIVED by
  * the drift test from the migration text; this constant is only a tripwire.
  */
-export const PHONE_RPC_STATUS_COUNT = 103;
+export const PHONE_RPC_STATUS_COUNT = 104;
 
 /**
  * RESULT KEYS the API's behaviour DEPENDS on, per RPC.

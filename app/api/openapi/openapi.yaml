@@ -6869,6 +6869,13 @@ components:
                 minLength: 1
                 maxLength: 8000
             additionalProperties: false
+        covered_question_keys:
+          type: array
+          maxItems: 3
+          description: Contiguous future objective keys already covered by the same real candidate answer. The server records coverage provenance without fabricating spoken turns.
+          items:
+            type: string
+            pattern: '^[A-Za-z0-9_.:-]{1,100}$'
       additionalProperties: false
 
     PhoneAssessmentTurnResponse:

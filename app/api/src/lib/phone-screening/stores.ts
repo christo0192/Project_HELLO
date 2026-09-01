@@ -49,6 +49,7 @@ import {
   type ListPhoneEngagementRecordingsStatus,
   type ClearPhoneAttemptRecordingsStatus,
   type CommitPhoneQuestionBoundaryStatus,
+  type CommitPhoneQuestionBoundaryWithCoverageStatus,
   type CommitPhoneItemTurnStatus,
   type GetPhoneAssessmentStateStatus,
   type RecordPhoneProbeStatus,
@@ -955,7 +956,11 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
     async commitQuestionBoundary(
       input: CommitPhoneQuestionBoundaryInput,
     ): Promise<CommitPhoneQuestionBoundaryResult> {
-      const { data, error } = await client.rpc('commit_phone_question_boundary', {
+      const coveredQuestionKeys = Array.from(input.coveredQuestionKeys ?? []);
+      const rpcName: 'commit_phone_question_boundary' | 'commit_phone_question_boundary_with_coverage' = coveredQuestionKeys.length > 0
+        ? 'commit_phone_question_boundary_with_coverage'
+        : 'commit_phone_question_boundary';
+      const { data, error } = await client.rpc(rpcName, {
         p_session_id: input.sessionId,
         p_question_key: input.questionKey,
         p_expected_index: input.expectedIndex,
@@ -968,14 +973,16 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
           text: t.text,
           turn_started_at_ms: t.turnStartedAtMs ?? null,
         })),
+        ...(coveredQuestionKeys.length > 0
+          ? { p_covered_question_keys: coveredQuestionKeys }
+          : {}),
         p_now: isoInstant(input.now),
       });
       if (error) throw new Error('phone_commit_boundary_error');
       const row = asRow(data);
-      const status = narrowPhoneRpcStatus<CommitPhoneQuestionBoundaryStatus>(
-        'commit_phone_question_boundary',
-        row,
-      );
+      const status = narrowPhoneRpcStatus<
+        CommitPhoneQuestionBoundaryStatus | CommitPhoneQuestionBoundaryWithCoverageStatus
+      >(rpcName, row);
       return {
         status,
         // `applied` is read from the ANSWER, never inferred from the status:

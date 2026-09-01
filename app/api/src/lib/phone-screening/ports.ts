@@ -30,6 +30,7 @@ import type {
   ClearPhoneAttemptRecordingsStatus,
   StampPhoneSessionEgressStatus,
   CommitPhoneQuestionBoundaryStatus,
+  CommitPhoneQuestionBoundaryWithCoverageStatus,
   GetPhoneAssessmentStateStatus,
   RecordPhoneProbeStatus,
   ConsentAndStartPhoneAssessmentStatus,
@@ -548,11 +549,13 @@ export interface CommitPhoneQuestionBoundaryInput {
   /** The caller's idempotency key. A retry MUST reuse it. */
   readonly sourceEventId: string;
   readonly turns: readonly PhoneBoundaryTurn[];
+  /** Contiguous future objectives covered by the same real candidate answer. */
+  readonly coveredQuestionKeys?: readonly string[];
   readonly now: Date;
 }
 
 export interface CommitPhoneQuestionBoundaryResult {
-  readonly status: CommitPhoneQuestionBoundaryStatus | typeof PHONE_RPC_UNKNOWN_STATUS;
+  readonly status: CommitPhoneQuestionBoundaryStatus | CommitPhoneQuestionBoundaryWithCoverageStatus | typeof PHONE_RPC_UNKNOWN_STATUS;
   readonly applied: boolean;
   readonly duplicate: boolean;
   readonly questionKey?: string;

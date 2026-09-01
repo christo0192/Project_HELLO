@@ -115,6 +115,10 @@ PHONE_TERMINAL_REPLY_TIMEOUT_SEC = _float_env("PHONE_TERMINAL_REPLY_TIMEOUT_SEC"
 PHONE_SPEECH_FIRST_AUDIO_TIMEOUT_SEC = _float_env(
     "PHONE_SPEECH_FIRST_AUDIO_TIMEOUT_SEC", 4.0,
 )
+# Sarvam can emit two finalized items roughly 0.5 s apart for one continuous
+# answer. Boundary persistence waits off the speech path for that narrow merge
+# window; reply generation itself is not delayed.
+PHONE_CONTINUATION_SETTLE_SEC = 0.65
 
 
 def _bounded_float_env(name: str, default: float, lo: float, hi: float) -> float:
@@ -1394,18 +1398,29 @@ async def _run_native_phone_screening(
     # or persisted here; only the existing transcript path stores candidate
     # words. A hash prevents the same discrepancy being asked twice.
     coverage_reanchor: dict[str, str | None] = {"question_key": None}
-    pending_conflict: dict[str, Any] = {"value": None}
+    # A semantic conflict is source-bound. Background judge results are retained
+    # for assessment diagnostics only; they never sit in an unversioned slot and
+    # interrupt an unrelated later objective. Obvious deterministic conflicts
+    # may be asked in the immediate reply and become reply-pending only after
+    # that exact speech sequence completes cleanly.
+    pending_conflict: dict[str, Any] = {"value": None}  # compatibility/test seam; never late-injected
     conflict_reply_pending: dict[str, bool] = {"value": False}
+    conflict_delivery: dict[str, Any] = {"sequence": None, "key": None}
     asked_conflicts: set[str] = set()
+    active_exchange: dict[str, Any] | None = None
     compensation_slots: dict[str, str] = {}
     preloaded_objective: dict[str, str | None] = {"text": None, "message_id": None}
 
     def authorize_generated_reply(
         objective: str | None, *, allow_closing: bool = False,
+        control_text: str | None = None,
     ) -> None:
         authorize = getattr(agent, "authorize_generation", None)
         if callable(authorize):
-            authorize(objective, allow_closing=allow_closing)
+            authorize(
+                objective, allow_closing=allow_closing,
+                control_text=control_text,
+            )
 
     async def prime_preemptive_objective(
         target: phone.PhonePlanQuestion | None,
@@ -1614,6 +1629,7 @@ async def _run_native_phone_screening(
     async def on_native_turn(
         text: str, message: Any = None, turn_ctx: Any = None,
     ) -> None:
+        nonlocal active_exchange
         # This hook routes and buffers only. It never changes the cursor or
         # writes transcript evidence; those effects belong to the tools below.
         #
@@ -1772,6 +1788,7 @@ async def _run_native_phone_screening(
             authorize_generated_reply(
                 "Close the completed screening without making promises or asking another question.",
                 allow_closing=True,
+                control_text=close_instruction,
             )
             arm_terminal_reply("completed")
             add_turn_instruction(turn_ctx, close_instruction)
@@ -1851,34 +1868,40 @@ async def _run_native_phone_screening(
                 setattr(agent, "_turn_policy", "patience_suppressed")
                 from livekit.agents import StopResponse  # noqa: PLC0415
                 raise StopResponse()
-        if conflict_reply_pending["value"]:
-            # This candidate turn answers the one bounded resume-conflict
-            # clarification, not a screening-plan question. Consume it and ask
-            # the still-owed deterministic topic; never commit it under the
-            # cursor merely because a judge result arrived asynchronously.
-            conflict_reply_pending["value"] = False
-            setattr(agent, "_turn_policy", "clarification")
-            if question is not None:
-                add_turn_instruction(turn_ctx, phone_question_instructions(question, state.role_title))
-            return
         if _native_turn_predates_question(message, latest_assistant_anchor[0]):
             from livekit.agents import StopResponse  # noqa: PLC0415
             raise StopResponse()
         if not assistant_delivery_complete.is_set():
-            # A second final that lands after this answer's reply handle was
-            # created but before first audio is a continuation/split final, not
-            # another interview exchange. The first immutable boundary already
-            # owns the reply; suppress this competing generation so it cannot
-            # repeat or skip a topic. A genuine interruption before any reply
-            # handle exists retains the explicit same-topic recovery.
+            # Route split finals BEFORE conflict/clarification state. A second
+            # final before the next reply's first audio still belongs to the
+            # answer already being processed; it may extend that immutable
+            # boundary but can never consume a conflict reply or schedule a
+            # duplicate question.
             if reply_started.is_set():
+                if isinstance(active_exchange, dict):
+                    prior = str(active_exchange.get("candidate") or "").strip()
+                    fragment = str(text or "").strip()
+                    if fragment and fragment.casefold() not in prior.casefold():
+                        active_exchange["candidate"] = (prior + " " + fragment).strip()[:8000]
+                        active_exchange["revision"] = int(active_exchange.get("revision") or 1) + 1
                 _log.info(
                     "unknown_event", error_type="phone_turn_fragment",
-                    error_category="continuation_before_first_audio_suppressed",
+                    error_category="continuation_before_first_audio_coalesced",
                 )
                 from livekit.agents import StopResponse  # noqa: PLC0415
                 raise StopResponse()
             add_turn_instruction(turn_ctx, "The previous question was interrupted. Ask that same topic again in your own natural words and wait; do not advance.")
+            return
+        if conflict_reply_pending["value"]:
+            # This turn answers a clarification proven delivered by its exact
+            # speech sequence. Consume it and ask the still-owed planned topic;
+            # it cannot advance an unrelated objective.
+            conflict_reply_pending["value"] = False
+            setattr(agent, "_turn_policy", "clarification")
+            if question is not None:
+                instruction = phone_question_instructions(question, state.role_title)
+                add_turn_instruction(turn_ctx, instruction)
+                authorize_generated_reply(question.spoken_text, control_text=None)
             return
         prompt = (latest_assistant[0] or "").strip()
         if question is None or not prompt:
@@ -1941,7 +1964,11 @@ async def _run_native_phone_screening(
 
         judge_instruction: str | None = None
         if turn_mode == phone.PHONE_TURN_MODE_TOOLLESS and coverage_judge_enabled:
-            conflict = pending_conflict.get("value")
+            # Only a high-confidence conflict derived from THIS answer may alter
+            # THIS reply. Background semantic results never enter a later turn.
+            conflict = phone.phone_deterministic_resume_conflict(
+                text, _compact_phone_resume_evidence(state.resume_facts),
+            )
             if isinstance(conflict, dict):
                 conflict_key = phone.phone_conflict_key(conflict)
                 if conflict_key not in asked_conflicts:
@@ -1949,11 +1976,11 @@ async def _run_native_phone_screening(
                         question.spoken_text, conflict=conflict,
                     )
                     if judge_instruction is not None:
-                        # Mark asked when the instruction enters this turn's
-                        # model context, not when the judge merely proposes it.
                         asked_conflicts.add(conflict_key)
-                        conflict_reply_pending["value"] = True
-                pending_conflict["value"] = None
+                        conflict_delivery.update({
+                            "sequence": speech_sequence[0] + 1,
+                            "key": conflict_key,
+                        })
             elif coverage_reanchor.get("question_key") == question.key:
                 judge_instruction = phone.phone_judge_turn_instruction(
                     question.spoken_text, reanchor=True,
@@ -1961,6 +1988,18 @@ async def _run_native_phone_screening(
                 coverage_reanchor["question_key"] = None
 
         coverage_hint = phone.phone_coverage_precheck(question.text, prompt)
+        covered_following: list[str] = []
+        probe_index = cursor + 1
+        # A candidate may volunteer a later structured objective early. Skip
+        # only contiguous, high-confidence matches; ambiguous objectives remain
+        # owed. The same source exchange is committed for each key in order.
+        while len(covered_following) < 3:
+            future = state.question_at(probe_index)
+            if future is None or not phone.phone_answer_covers_objective(future.text, text):
+                break
+            covered_following.append(future.key)
+            probe_index += 1
+
         pending.update({
             "question": question,
             "prompt": prompt,
@@ -1974,6 +2013,8 @@ async def _run_native_phone_screening(
             # LiveKit creates/clears state for the current reply.
             "ask_delivered": True,
             "coverage_hint": coverage_hint,
+            "covered_following_keys": covered_following,
+            "revision": 1,
         })
         last_advance["text"] = None
         latest_candidate_anchor[0] = None
@@ -1986,7 +2027,7 @@ async def _run_native_phone_screening(
             # tool" requirement). Every substantive answer consumes its bound
             # objective; coverage quality is shadow/scoring data and can never
             # force the speaking model to repeat it.
-            next_question = state.question_at(cursor + 1)
+            next_question = state.question_at(probe_index)
             if next_question is None:
                 planned_instruction = (
                     "Briefly acknowledge one specific detail, then ask exactly: "
@@ -2026,7 +2067,10 @@ async def _run_native_phone_screening(
                         + ". Do not ask for a known slot again."
                     )
                     objective_text += " Missing compensation slots only: " + ", ".join(missing)
-            authorize_generated_reply(objective_text, allow_closing=False)
+            authorize_generated_reply(
+                objective_text, allow_closing=False,
+                control_text=turn_instruction,
+            )
             preloaded_matches = (
                 phone.phone_objective_preemptive_enabled()
                 and judge_instruction is None
@@ -2036,9 +2080,8 @@ async def _run_native_phone_screening(
                 add_turn_instruction(turn_ctx, turn_instruction)
             # The judge/commit task is CREATED and returned to the event loop;
             # it is never awaited on this candidate→reply speech path.
-            task = asyncio.create_task(
-                commit_after_reply(dict(pending) if coverage_judge_enabled else None)
-            )
+            active_exchange = dict(pending)
+            task = asyncio.create_task(commit_after_reply(active_exchange))
             commit_tasks.add(task)
             task.add_done_callback(commit_tasks.discard)
             return
@@ -2105,15 +2148,18 @@ async def _run_native_phone_screening(
         outcome = await events.commit_boundary(
             session_id, question.key, expected_index,
             boundary["source_event_id"], turns,
+            list(boundary.get("covered_following_keys") or []),
         )
         if outcome.ok and outcome.cursor == cursor and expected_index < cursor:
             # A later snapshot of the same keyed boundary finished after the
             # first one. The server idempotently returned the already-applied
             # cursor; never turn harmless async reordering into a call halt.
             return last_advance["text"] or "Advance already applied."
+        covered_count = len(boundary.get("covered_following_keys") or [])
+        expected_cursor = expected_index + 1 + covered_count
         if (
             not outcome.ok
-            or outcome.cursor != expected_index + 1
+            or outcome.cursor != expected_cursor
             or cursor != expected_index
         ):
             terminal_reason["reason"] = phone.HALT_PERSISTENCE
@@ -2121,6 +2167,9 @@ async def _run_native_phone_screening(
             return "The screening cannot safely continue. Do not ask another question."
         if question.key not in completed:
             completed.append(question.key)
+        for covered_key in list(boundary.get("covered_following_keys") or []):
+            if covered_key not in completed:
+                completed.append(covered_key)
         cursor = outcome.cursor
         if coverage_reanchor.get("question_key") == question.key:
             coverage_reanchor["question_key"] = None
@@ -2221,6 +2270,22 @@ async def _run_native_phone_screening(
         untouched. Bypassed when the gate is off, restoring the pre-X10 path.
         """
         boundary = exchange if isinstance(exchange, dict) else pending
+        # Let a split final revise the same source exchange before it becomes
+        # durable. Only a reply still awaiting first audio needs the merge
+        # window; completed test/replay handles and normal delivered turns are
+        # not delayed. This wait is entirely off the reply/TTS path.
+        if (
+            isinstance(exchange, dict)
+            and PHONE_CONTINUATION_SETTLE_SEC > 0
+            and not assistant_delivery_complete.is_set()
+        ):
+            try:
+                await asyncio.wait_for(
+                    speech_first_audio.wait(),
+                    timeout=PHONE_CONTINUATION_SETTLE_SEC,
+                )
+            except asyncio.TimeoutError:
+                pass
         candidate_text = boundary.get("candidate")
         if boundary.get("ask_delivered") is not True:
             _log.info(
@@ -2255,6 +2320,9 @@ async def _run_native_phone_screening(
             await apply_background_advance(boundary)
             if terminal_reason.get("reason") == phone.HALT_PERSISTENCE:
                 return
+            # The server RPC atomically records any contiguous volunteered
+            # objectives, preserving the real exchange as provenance without
+            # fabricating an unspoken bot question in the transcript.
             committed_cursor = cursor
 
         if not coverage_judge_enabled:
@@ -2303,22 +2371,16 @@ async def _run_native_phone_screening(
             error_category=log_category,
         )
 
-        # A conflict result expires once conversation has progressed beyond the
-        # objective immediately following its source. This prevents a slow
-        # shadow result from interrupting an unrelated later topic.
-        conflict = verdict.conflict
-        if isinstance(conflict, dict) and cursor == committed_cursor:
-            key = phone.phone_conflict_key(conflict)
-            queued = pending_conflict.get("value")
-            queued_key = (
-                phone.phone_conflict_key(queued) if isinstance(queued, dict) else None
+        # Background semantic results are assessment-only. They cannot be
+        # injected after the source reply because that is exactly how a CRM
+        # answer was followed by a stale employment clarification. Obvious
+        # conflicts are handled synchronously above; ambiguous/late ones expire
+        # from live flow while remaining present in assessment evidence.
+        if isinstance(verdict.conflict, dict):
+            _log.info(
+                "unknown_event", error_type="phone_coverage_conflict",
+                error_category="assessment_only_expired",
             )
-            if key not in asked_conflicts and key != queued_key:
-                pending_conflict["value"] = dict(conflict)
-                _log.info(
-                    "unknown_event", error_type="phone_coverage_conflict",
-                    error_category="probe_queued",
-                )
 
     async def native_say(text: str) -> None:
         speech = session.say(text, allow_interruptions=True)
@@ -2345,6 +2407,9 @@ async def _run_native_phone_screening(
             previous.cancel()
         expected_reply_generation[0] += 1
         generation = expected_reply_generation[0]
+        arm_generation = getattr(agent, "arm_reply_generation", None)
+        if callable(arm_generation):
+            arm_generation(generation)
         fallback_generation[0] = None
         reply_handle[0] = None
 
@@ -2440,16 +2505,46 @@ async def _run_native_phone_screening(
 
         speech_watchdog_task[0] = asyncio.create_task(monitor())
 
+    def _on_tts_first_frame(
+        generation: int | None, first_audio_mono: float, first_audio_wall: float,
+    ) -> None:
+        """Record the first TTS frame for the current generation."""
+        if generation is not None and generation != expected_reply_generation[0]:
+            _log.info(
+                "unknown_event", error_type="phone_speech_lifecycle",
+                error_category="stale_tts_frame_discarded",
+            )
+            return
+        speech_first_audio.set()
+        stopped_wall = latency_state.get("speech_end_wall")
+        created_mono = latency_state.get("speech_created_mono")
+        if created_mono is not None:
+            _emit_phone_latency_segment(
+                "reply_created_to_first_tts_frame", first_audio_mono - created_mono,
+            )
+        if stopped_wall is not None:
+            _emit_phone_latency_segment(
+                "speech_end_to_first_tts_frame", first_audio_wall - stopped_wall,
+            )
+
+    setattr(agent, "_on_tts_first_frame", _on_tts_first_frame)
+
     async def on_reply_delivered(
         interrupted: bool = False, delivered_seq: int | None = None,
     ) -> None:
         """Commit terminal intent only for its correlated speech handle."""
         reason = pending_terminal_reason.get("value")
         expected_seq = pending_terminal_speech_seq.get("value")
+        conflict_seq = conflict_delivery.get("sequence")
         if delivered_seq is None:
-            delivered_seq = expected_seq  # explicit direct-test/fallback seam
+            delivered_seq = expected_seq if expected_seq is not None else conflict_seq
         if interrupted:
+            if delivered_seq == conflict_seq:
+                conflict_delivery.update({"sequence": None, "key": None})
             return
+        if delivered_seq == conflict_seq and conflict_delivery.get("key") is not None:
+            conflict_reply_pending["value"] = True
+            conflict_delivery.update({"sequence": None, "key": None})
         if reason is None:
             await prime_preemptive_objective(state.question_at(cursor + 1))
             return

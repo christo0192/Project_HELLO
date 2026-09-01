@@ -369,6 +369,35 @@ describe('the parsers narrow against the SHARED vocabularies', () => {
   });
 });
 
+describe('objective coverage adapter', () => {
+  it('uses the atomic coverage RPC only when future keys are supplied', async () => {
+    const { client, calls } = fakeClient({
+      status: 'applied', applied: true, duplicate: false, cursor: 2,
+      question_key: 'k1', question_index: 0, first_turn_index: 0,
+      last_turn_index: 1, question_count: 3, plan_complete: false,
+    });
+    const result = await createPhoneStores(client).commitQuestionBoundary({
+      sessionId: 's', questionKey: 'k1', expectedIndex: 0,
+      sourceEventId: 'q:k1',
+      turns: [{ speaker: 'bot', text: 'How much experience?' }, { speaker: 'candidate', text: 'Three years.' }],
+      coveredQuestionKeys: ['k2'], now: NOW,
+    });
+    expect(calls[0]).toEqual({
+      name: 'commit_phone_question_boundary_with_coverage',
+      args: {
+        p_session_id: 's', p_question_key: 'k1', p_expected_index: 0,
+        p_source_event_id: 'q:k1',
+        p_turns: [
+          { speaker: 'bot', text: 'How much experience?', turn_started_at_ms: null },
+          { speaker: 'candidate', text: 'Three years.', turn_started_at_ms: null },
+        ],
+        p_covered_question_keys: ['k2'], p_now: NOW.toISOString(),
+      },
+    });
+    expect(result.cursor).toBe(2);
+  });
+});
+
 describe('errors and malformed answers', () => {
   it('a transport error becomes a stable sanitized code, never the raw object', async () => {
     const raw = {
@@ -420,6 +449,11 @@ describe('errors and malformed answers', () => {
       ['phone_assessment_state_error', () => stores.assessmentState({ sessionId: 's' })],
       ['phone_commit_boundary_error', () => stores.commitQuestionBoundary({
         sessionId: 's', questionKey: 'k1', expectedIndex: 0, sourceEventId: 'ev-1',
+        turns: [{ speaker: 'bot', text: 'A?' }, { speaker: 'candidate', text: 'Y' }],
+        now: NOW })],
+      ['phone_commit_boundary_error', () => stores.commitQuestionBoundary({
+        sessionId: 's', questionKey: 'k1', expectedIndex: 0, sourceEventId: 'ev-1',
+        coveredQuestionKeys: ['k2'],
         turns: [{ speaker: 'bot', text: 'A?' }, { speaker: 'candidate', text: 'Y' }],
         now: NOW })],
       // 0045. The heartbeat carries no transcript, but it DOES carry an

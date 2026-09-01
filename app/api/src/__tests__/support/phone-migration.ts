@@ -144,6 +144,12 @@ export const MIGRATION_0072_PATH = fileURLToPath(
 
 export const MIGRATION_0072 = readFileSync(MIGRATION_0072_PATH, 'utf8');
 
+export const MIGRATION_0075_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0075_phone_objective_coverage.sql', import.meta.url),
+);
+
+export const MIGRATION_0075 = readFileSync(MIGRATION_0075_PATH, 'utf8');
+
 /**
  * Every phone migration, NEWEST FIRST. Extraction walks this in order and the
  * first file that declares a thing wins, which is what "the latest declaration
@@ -151,6 +157,7 @@ export const MIGRATION_0072 = readFileSync(MIGRATION_0072_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    { name: '0075', sql: MIGRATION_0075 },
     // 0072 adds finalize_phone_partial_sessions (server-side partial-finalize)
     // and the assessments.partial column. Newest-first so its declaration wins.
     { name: '0072', sql: MIGRATION_0072 },
@@ -282,6 +289,7 @@ export const RPC_NAMES = [
   'start_phone_assessment',
   'get_phone_assessment_state',
   'commit_phone_question_boundary',
+  'commit_phone_question_boundary_with_coverage',
   // 0045 — the two obligations 0042 assigned to P5, plus the sweep claim.
   'heartbeat_phone_attempt_by_epoch',
   'sweep_phone_day_rolled',
@@ -378,6 +386,11 @@ export function functionStatuses(name: string): Set<string> {
     } else {
       throw new Error(`phone unrecognised status form in ${name}`);
     }
+  }
+  // The coverage wrapper deliberately delegates the base boundary's refusal
+  // vocabulary and adds only its own duplicate/invalid_coverage outcomes.
+  if (name === 'commit_phone_question_boundary_with_coverage') {
+    for (const status of functionStatuses('commit_phone_question_boundary')) out.add(status);
   }
   if (out.size === 0) throw new Error(`phone no statuses extracted for ${name}`);
   return out;
