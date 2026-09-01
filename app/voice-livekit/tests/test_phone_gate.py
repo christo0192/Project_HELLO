@@ -3579,6 +3579,16 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         discovery = "Ask for an example of discovering a prospect’s real needs before recommending a solution."
         self.assertTrue(phone.phone_answer_covers_objective(experience, intro))
         self.assertFalse(phone.phone_answer_covers_objective(discovery, intro))
+        # An ambiguous mention must not mark a compound objective complete;
+        # otherwise the controller can skip needed detail or later re-ask the
+        # wrong total-experience question after advancing.
+        self.assertFalse(phone.phone_answer_covers_objective(
+            experience, "I have some sales experience, but let me explain.",
+        ))
+        self.assertTrue(phone.phone_answer_covers_objective(
+            experience,
+            "I have two years of sales and program advisory experience.",
+        ))
         conflict = phone.phone_deterministic_resume_conflict(
             intro, {"recent_role": {"title": "Proprietary Trader"}},
         )
@@ -3620,6 +3630,27 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         self.assertNotIn(
             "fair question",
             phone.phone_fallback_reply(question, "I learned what customers needed."),
+        )
+
+    def test_recovery_fallback_drops_already_released_acknowledgement(self):
+        snapshot = {
+            "fallback": "Thanks for walking me through that. What did you learn?",
+            "fallback_without_prefix": "What did you learn?",
+        }
+        self.assertEqual(
+            phone.phone_recovery_fallback(snapshot, prefix_released=True),
+            "What did you learn?",
+        )
+        self.assertEqual(
+            phone.phone_recovery_fallback(snapshot, prefix_released=False),
+            "Thanks for walking me through that. What did you learn?",
+        )
+        # A legacy snapshot without the new field remains recoverable.
+        self.assertEqual(
+            phone.phone_recovery_fallback(
+                {"fallback": "What did you learn?"}, prefix_released=True,
+            ),
+            "What did you learn?",
         )
 
     def test_post_goodbye_acknowledgements_are_bounded(self):

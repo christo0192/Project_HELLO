@@ -4458,6 +4458,26 @@ def phone_fallback_reply(
     return f"{acknowledgement} {spoken_question}".strip()
 
 
+def phone_recovery_fallback(snapshot: Any, *, prefix_released: bool) -> str:
+    """Choose a fallback that cannot repeat an already streamed acknowledgement.
+
+    A guarded Gemini reply may release its acknowledgement before the complete
+    question is authorized. If that later draft is rejected, recovery must use
+    the acknowledgement-free snapshot variant; otherwise the candidate hears
+    the same acknowledgement twice. Older/incomplete snapshots safely fall
+    back to their ordinary value.
+    """
+    if not isinstance(snapshot, dict):
+        return PHONE_ASSESSMENT_CLOSING_TEXT
+    key = "fallback_without_prefix" if prefix_released else "fallback"
+    fallback = snapshot.get(key)
+    if prefix_released and not isinstance(fallback, str):
+        fallback = snapshot.get("fallback")
+    if not isinstance(fallback, str) or not fallback.strip():
+        return PHONE_ASSESSMENT_CLOSING_TEXT
+    return " ".join(fallback.split())
+
+
 def _private_phone_control_text(control_text: Any, objective_text: Any) -> str | None:
     """Remove authorized objective wording before scanning private instructions.
 
