@@ -5165,6 +5165,11 @@ def phone_agent_class(agent_base: Any) -> Any:
         def arm_reply_generation(self, generation: int) -> None:
             """Bind subsequent LLM/TTS work to one controller revision."""
             self._reply_generation = generation
+            # Prefix release is scoped to this generation. Reset before the
+            # watchdog can observe a new clarification/substantive reply so a
+            # prior turn's streamed acknowledgement cannot change this turn's
+            # recovery fallback.
+            self._generation_prefix_released = False
 
         def set_gate_opening(self, opening: bool) -> None:
             """Toggle the gate-opening stream window (see `_gate_opening`)."""

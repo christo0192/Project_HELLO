@@ -3653,6 +3653,19 @@ class TestNativePhoneArchitecture(unittest.TestCase):
             "What did you learn?",
         )
 
+    def test_prefix_release_is_reset_for_each_reply_generation(self):
+        class BaseAgent:
+            def __init__(self, instructions=""):
+                self.instructions = instructions
+
+        screening_agent = phone.phone_agent_class(BaseAgent)(
+            "phone", client=FakeEventClient(), attempt_id=_ATTEMPT_ID,
+            say=AsyncMock(), native_turns=True,
+        )
+        screening_agent._generation_prefix_released = True
+        screening_agent.arm_reply_generation(2)
+        self.assertFalse(screening_agent._generation_prefix_released)
+
     def test_post_goodbye_acknowledgements_are_bounded(self):
         self.assertTrue(phone.phone_qna_done("No, that’s it."))
         self.assertTrue(phone.phone_qna_done("I’m done, thanks."))
