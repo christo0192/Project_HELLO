@@ -3586,6 +3586,28 @@ class TestNativePhoneArchitecture(unittest.TestCase):
             "That is helpful. What changed? What happened next?",
             "Ask what changed.", allow_closing=False,
         ))
+        discovery = "Could you share an example of how you discovered a prospect’s real needs before recommending a solution?"
+        self.assertEqual(
+            phone.phone_generated_reply_rejection_reason(
+                "Five years in EdTech is a solid background. What is the biggest challenge a student faces in an intensive program?",
+                discovery, allow_closing=False,
+            ),
+            "objective_mismatch",
+        )
+        self.assertTrue(phone.phone_generated_reply_authorized(
+            "That context is useful. How did you uncover what the prospect needed before deciding what solution to offer?",
+            discovery, allow_closing=False,
+        ))
+        self.assertTrue(phone.phone_generated_reply_authorized(
+            phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT,
+            phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT,
+            allow_closing=False,
+        ))
+        self.assertEqual(phone.phone_generated_reply_rejection_reason(
+            "Thanks for explaining. Could you clarify your recent work?",
+            phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT,
+            allow_closing=False,
+        ), "conflict_clarification_drift")
         self.assertFalse(phone.phone_generated_prefix_authorized(
             "Walk me through one concrete example.",
             "Ask for one concrete example.",
@@ -3698,6 +3720,30 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         screening_agent._generation_prefix_released = True
         screening_agent.arm_reply_generation(2)
         self.assertFalse(screening_agent._generation_prefix_released)
+
+    def test_high_confidence_incomplete_tails_wait_for_continuation(self):
+        for text in (
+            "Um yeah, so my name is Cristo and I have",
+            "When a candidate comes in they will have a lot of",
+            "My notice period is about",
+            "I have 5 years of sales experience and",
+        ):
+            self.assertEqual(
+                phone.phone_turn_substance(text),
+                phone.PHONE_SUBSTANCE_HESITATION,
+                text,
+            )
+        for complete in (
+            "I have five years of sales experience.",
+            "My notice period is about thirty days.",
+            "I organize CRM notes right after each call.",
+            "I have",
+        ):
+            self.assertEqual(
+                phone.phone_turn_substance(complete),
+                phone.PHONE_SUBSTANCE_SUBSTANTIVE,
+                complete,
+            )
 
     def test_post_goodbye_acknowledgements_are_bounded(self):
         self.assertTrue(phone.phone_qna_done("No, that’s it."))
@@ -4746,6 +4792,53 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
         await self._finish(hooks)
         self.assertIn("assessment.completed", client.event_types)
 
+    async def test_qna_hesitation_does_not_consume_a_round_or_arm_closing(self):
+        agent, _, _, client, hooks = await self._enter_qna()
+        with self.assertRaises(sys.modules["livekit.agents"].StopResponse):
+            await hooks["on_native_turn"](
+                "Hmm", types.SimpleNamespace(text_content="Hmm"),
+                types.SimpleNamespace(items=[]),
+            )
+        self.assertEqual(agent._closing_state_machine.state.value, "candidate_qna")
+        self.assertNotIn("assessment.completed", client.event_types)
+
+        question_ctx = types.SimpleNamespace(items=[])
+        await hooks["on_native_turn"](
+            "Do you know the work hours and weekly offs for this role?",
+            types.SimpleNamespace(text_content="Do you know the work hours and weekly offs for this role?"),
+            question_ctx,
+        )
+        rendered = str(question_ctx.items).lower()
+        self.assertIn("anything else", rendered)
+        self.assertIn("do not say goodbye yet", rendered)
+        self.assertEqual(agent._closing_state_machine.state.value, "candidate_qna")
+
+    async def test_real_question_cancels_an_authored_but_unplayed_close(self):
+        agent, _, _, client, hooks = await self._enter_qna()
+        close_ctx = types.SimpleNamespace(items=[])
+        await hooks["on_native_turn"](
+            "Nothing else", types.SimpleNamespace(text_content="Nothing else"), close_ctx,
+        )
+        self.assertEqual(agent._closing_state_machine.state.value, "closing_pending")
+        stale = _FakeSpeech()
+        hooks["reply_handle"][0] = stale
+
+        question_ctx = types.SimpleNamespace(items=[])
+        await hooks["on_native_turn"](
+            "What are the work timings for this role?",
+            types.SimpleNamespace(text_content="What are the work timings for this role?"),
+            question_ctx,
+        )
+        self.assertEqual(stale.interrupt_calls, [True])
+        self.assertEqual(agent._closing_state_machine.state.value, "candidate_qna")
+        self.assertIn("anything else", str(question_ctx.items).lower())
+        self.assertNotIn("assessment.completed", client.event_types)
+        interlocks = [
+            c.kwargs.get("error_category") for c in hooks["log"].info.call_args_list
+            if c.kwargs.get("error_type") == "phone_qna_terminal_interlock"
+        ]
+        self.assertEqual(interlocks, ["pending_close_cancelled"])
+
     async def test_third_question_answers_then_wraps_at_the_cap(self):
         _, _, _, client, hooks = await self._enter_qna()
         for index in range(phone.PHONE_QNA_MAX_ROUNDS):
@@ -4940,9 +5033,10 @@ class TestPhoneCoverageJudgeCore(unittest.IsolatedAsyncioTestCase):
         instruction = phone.phone_judge_turn_instruction(
             "What is your notice period?", reanchor=True, conflict=conflict,
         )
-        self.assertIn("exactly ONE polite clarifying question", instruction)
-        self.assertIn("untrusted evidence", instruction)
-        self.assertIn("Never accuse", instruction)
+        self.assertIn("Say exactly this neutral clarification", instruction)
+        self.assertIn(phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT, instruction)
+        self.assertNotIn("Six years at Example Co", instruction)
+        self.assertNotIn("I joined last month", instruction)
         self.assertNotIn("Owed topic", instruction)
         self.assertEqual(
             phone.phone_conflict_key(conflict), phone.phone_conflict_key(dict(conflict)),
@@ -5691,8 +5785,9 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
         )
         ctx = await self._turn(hooks, answer)
         rendered = str(ctx.items)
-        self.assertIn("Proprietary Trader", rendered)
-        self.assertIn("Never accuse", rendered)
+        self.assertIn(phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT, rendered)
+        self.assertNotIn("Proprietary Trader", rendered)
+        self.assertNotIn(answer, rendered)
         self.assertNotIn("notice period", rendered.lower())
         self.assertTrue(await self._drain(lambda: client.committed_keys == ["k1"]))
         self.assertEqual(agent._asked_conflicts, {
@@ -5701,6 +5796,26 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
                 "spoken_claim": answer,
             }),
         })
+        await self._close(hooks)
+
+    async def test_incomplete_intro_waits_then_complete_claim_gets_one_conflict_probe(self):
+        agent, _, state, client, hooks = await self._coordinator()
+        state.resume_facts = {
+            "recent_role": {"title": "Proprietary Trader", "employer": "Quant Tekel"},
+        }
+        with self.assertRaises(sys.modules["livekit.agents"].StopResponse):
+            await self._turn(hooks, "Um yeah, my name is Cristo and I have")
+        self.assertEqual(client.committed_keys, [])
+
+        answer = (
+            "Five years of experience in EdTech companies like Scalar, Upgrad, "
+            "and Great Learning, all in sales and program advisory."
+        )
+        ctx = await self._turn(hooks, answer)
+        self.assertIn(phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT, str(ctx.items))
+        self.assertNotIn("Quant Tekel", str(ctx.items))
+        self.assertTrue(await self._drain(lambda: client.committed_keys == ["k1"]))
+        self.assertEqual(len(agent._asked_conflicts), 1)
         await self._close(hooks)
 
     async def test_split_resume_claim_is_clarified_on_the_immediate_next_reply(self):
@@ -5716,10 +5831,43 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
             "I worked at upGrad and Great Learning as a sales and program advisor.",
         )
         rendered = str(second.items)
-        self.assertIn("Quant Tekel", rendered)
-        self.assertIn("Never accuse", rendered)
+        self.assertIn(phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT, rendered)
+        self.assertNotIn("Quant Tekel", rendered)
+        self.assertNotIn("upGrad", rendered)
         self.assertTrue(hooks["reply_handle"][0].interrupt_calls)
         self.assertEqual(len(agent._asked_conflicts), 1)
+        await self._close(hooks)
+
+    async def test_delivered_off_plan_question_cannot_advance_the_owed_objective(self):
+        state = _default_state(questions=[
+            {
+                "key": "discovery",
+                "text": "Ask for an example of discovering a prospect’s real needs before recommending a solution.",
+                "mandatory": True,
+                "hint": None,
+            },
+        ])
+        _, _, _, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless", state=state, coverage_judge_enabled=False,
+        )
+        hooks["latest_assistant"][0] = (
+            "What is the biggest challenge a student faces in an intensive program?"
+        )
+        hooks["latest_assistant_anchor"][0] = 1
+        hooks["assistant_delivery_complete"].set()
+        ctx = types.SimpleNamespace(items=[])
+        await hooks["on_native_turn"](
+            "They may have trouble finding enough time.",
+            types.SimpleNamespace(text_content="They may have trouble finding enough time."),
+            ctx,
+        )
+        await asyncio.sleep(0)
+        self.assertEqual(client.committed_keys, [])
+        self.assertIn("real needs", str(ctx.items).lower())
+        self.assertIn("delivered_objective_mismatch", [
+            c.kwargs.get("error_category") for c in hooks["log"].warn.call_args_list
+            if c.kwargs.get("error_type") == "phone_objective_delivery"
+        ])
         await self._close(hooks)
 
     async def test_early_answer_advances_contiguous_covered_objective_atomically(self):
