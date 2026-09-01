@@ -183,6 +183,8 @@ def _provider_metric_component(metric: Any) -> str | None:
         return "llm"
     if "tts" in name:
         return "tts"
+    if "stt" in name or "transcription" in name:
+        return "stt"
     return None
 
 
@@ -228,9 +230,8 @@ def _record_turn_metrics(item: Any, channel: str) -> None:
 
 
 def _record_provider_metrics(event: Any) -> None:
-    """Log bounded LLM/TTS timings emitted by LiveKit Agents, when available.
+    """Log bounded provider timings emitted by LiveKit Agents, when available.
 
-    We intentionally skip STT/EOU here for now per the latency work order.
     Field names differ slightly across SDK versions, so this function probes a
     small allowlist and never logs transcript, room, candidate, request IDs, or
     raw provider payloads.
@@ -1152,10 +1153,18 @@ def _build_provider_session(*, phone_mode: bool = False, turn_mode: str | None =
                 max_duration_sec=endpoint_max,
             )
 
+    sarvam_vad_options = phone.phone_sarvam_vad_options() if phone_mode else {}
+    if phone_mode:
+        _log.info(
+            "unknown_event", error_type="phone_sarvam_vad_config",
+            error_category="experiment" if sarvam_vad_options else "default",
+            option_count=len(sarvam_vad_options),
+        )
     session = AgentSession(
         stt=sarvam.STT(
             model=os.getenv("SARVAM_STT_MODEL", "saaras:v3"),
             language=os.getenv("SARVAM_LANGUAGE", "en-IN"),
+            **sarvam_vad_options,
         ),
         tts=sarvam.TTS(
             model=os.getenv("SARVAM_TTS_MODEL", "bulbul:v3"),
@@ -1353,6 +1362,7 @@ async def _run_native_phone_screening(
     pending_terminal_speech_seq: dict[str, int | None] = {"value": None}
     speech_watchdog_task: list[asyncio.Task | None] = [None]
     generation_empty = asyncio.Event()
+    generation_empty_reason: list[str | None] = [None]
     closing = ClosingStateMachine()
     qna_rounds = {"value": 0}
     silence_prompted = {"value": False}
@@ -1646,6 +1656,11 @@ async def _run_native_phone_screening(
             endpoint_delay_eou[0] = callback_mono
         if latency_state is not None:
             latency_state["turn_callback_mono"] = callback_mono
+            local_vad_end = latency_state.get("local_vad_end_wall")
+            if local_vad_end is not None:
+                _emit_phone_latency_segment(
+                    "local_vad_end_to_turn_callback", callback_wall - local_vad_end,
+                )
             metrics = getattr(message, "metrics", None)
             stopped_ms = (
                 persistence.normalize_turn_anchor_ms(metrics.get("stopped_speaking_at"))
@@ -1676,11 +1691,15 @@ async def _run_native_phone_screening(
                     error_category="stale_final_transcript_discarded",
                 )
             latency_state["final_transcript_wall"] = None
-        # Per-turn speech evidence. A prior reply must never satisfy the current
-        # turn's watchdog or terminal-delivery wait.
+        # Per-turn speech evidence. Capture the prior reply state before clearing
+        # it: a second STT final can arrive while the first fragment's reply is
+        # being created, and that second final belongs to the same source turn.
+        prior_reply_started = reply_started.is_set()
+        prior_speech_first_audio = speech_first_audio.is_set()
         reply_started.clear()
         speech_first_audio.clear()
         generation_empty.clear()
+        generation_empty_reason[0] = None
         reply_plan[0] = None
         compensation_slots.update(phone.phone_compensation_slots(text))
         authorize_generated_reply(None)
@@ -1871,25 +1890,52 @@ async def _run_native_phone_screening(
         if _native_turn_predates_question(message, latest_assistant_anchor[0]):
             from livekit.agents import StopResponse  # noqa: PLC0415
             raise StopResponse()
+        # Route split finals BEFORE conflict/clarification state. A second
+        # final before the next reply's first audio still belongs to the answer
+        # already being processed. Re-run the synchronous conflict detector on
+        # the merged source exchange before allowing the planned question out.
+        conflict_rerouted = False
+        if prior_reply_started and not prior_speech_first_audio and isinstance(active_exchange, dict):
+            prior = str(active_exchange.get("candidate") or "").strip()
+            fragment = str(text or "").strip()
+            if fragment and fragment.casefold() not in prior.casefold():
+                active_exchange["candidate"] = (prior + " " + fragment).strip()[:8000]
+                active_exchange["revision"] = int(active_exchange.get("revision") or 1) + 1
+            merged_candidate = str(active_exchange.get("candidate") or "").strip()
+            conflict = phone.phone_deterministic_resume_conflict(
+                merged_candidate, _compact_phone_resume_evidence(state.resume_facts),
+            )
+            if turn_ctx is not None and isinstance(conflict, dict):
+                conflict_key = phone.phone_conflict_key(conflict)
+                if conflict_key not in asked_conflicts:
+                    conflict_instruction = phone.phone_judge_turn_instruction(
+                        str(active_exchange.get("prompt") or ""), conflict=conflict,
+                    )
+                    if conflict_instruction is not None:
+                        asked_conflicts.add(conflict_key)
+                        conflict_delivery.update({
+                            "sequence": speech_sequence[0] + 1,
+                            "key": conflict_key,
+                        })
+                        stale_handle = reply_handle[0]
+                        interrupt = getattr(stale_handle, "interrupt", None)
+                        if callable(interrupt):
+                            interrupt(force=True)
+                        setattr(agent, "_turn_policy", "clarification")
+                        authorize_generated_reply(
+                            conflict_instruction, control_text=conflict_instruction,
+                        )
+                        add_turn_instruction(turn_ctx, conflict_instruction)
+                        conflict_rerouted = True
+            _log.info(
+                "unknown_event", error_type="phone_turn_fragment",
+                error_category="continuation_before_first_audio_coalesced",
+            )
+            if conflict_rerouted:
+                return
+            from livekit.agents import StopResponse  # noqa: PLC0415
+            raise StopResponse()
         if not assistant_delivery_complete.is_set():
-            # Route split finals BEFORE conflict/clarification state. A second
-            # final before the next reply's first audio still belongs to the
-            # answer already being processed; it may extend that immutable
-            # boundary but can never consume a conflict reply or schedule a
-            # duplicate question.
-            if reply_started.is_set():
-                if isinstance(active_exchange, dict):
-                    prior = str(active_exchange.get("candidate") or "").strip()
-                    fragment = str(text or "").strip()
-                    if fragment and fragment.casefold() not in prior.casefold():
-                        active_exchange["candidate"] = (prior + " " + fragment).strip()[:8000]
-                        active_exchange["revision"] = int(active_exchange.get("revision") or 1) + 1
-                _log.info(
-                    "unknown_event", error_type="phone_turn_fragment",
-                    error_category="continuation_before_first_audio_coalesced",
-                )
-                from livekit.agents import StopResponse  # noqa: PLC0415
-                raise StopResponse()
             add_turn_instruction(turn_ctx, "The previous question was interrupted. Ask that same topic again in your own natural words and wait; do not advance.")
             return
         if conflict_reply_pending["value"]:
@@ -2428,6 +2474,7 @@ async def _run_native_phone_screening(
                     _log.warn(
                         "unknown_event", error_type="phone_speech_lifecycle",
                         error_category="generation_completed_empty",
+                        rejection_reason=generation_empty_reason[0],
                     )
                 else:
                     _log.warn(
@@ -2481,10 +2528,16 @@ async def _run_native_phone_screening(
             question = state.question_at(cursor)
             fallback = reply_plan[0]
             if not isinstance(fallback, str) or not fallback.strip():
-                fallback = (
-                    question.spoken_text if question is not None
-                    else phone.PHONE_ASSESSMENT_CLOSING_TEXT
-                )
+                if question is not None:
+                    fallback = (
+                        question.spoken_text
+                        if getattr(agent, "_generation_prefix_released", False)
+                        else phone.phone_fallback_reply(
+                            question, pending.get("candidate")
+                        )
+                    )
+                else:
+                    fallback = phone.PHONE_ASSESSMENT_CLOSING_TEXT
             if pending_terminal_reason.get("value") is not None:
                 pending_terminal_speech_seq["value"] = speech_sequence[0] + 1
             try:
@@ -2567,7 +2620,11 @@ async def _run_native_phone_screening(
     setattr(agent, "_on_user_turn", on_native_turn)
     setattr(agent, "_on_booking", on_booking)
     setattr(agent, "_on_reply_expected", on_reply_expected)
-    setattr(agent, "_on_generation_empty", generation_empty.set)
+    def on_generation_empty(reason: str | None = None) -> None:
+        generation_empty_reason[0] = reason if isinstance(reason, str) else None
+        generation_empty.set()
+
+    setattr(agent, "_on_generation_empty", on_generation_empty)
     setattr(agent, "_on_reply_delivered", on_reply_delivered)
     setattr(agent, "_on_probe", on_probe)
     setattr(agent, "_on_advance", on_advance)
@@ -2976,6 +3033,7 @@ async def _run_phone_session(
     endpoint_delay_eou: list[float | None] = [None]
     latency_state: dict[str, float | None] = {
         "speech_end_wall": None,
+        "local_vad_end_wall": None,
         "final_transcript_wall": None,
         "turn_callback_mono": None,
         "speech_created_mono": None,
@@ -3033,6 +3091,19 @@ async def _run_phone_session(
     @session.on("user_state_changed")
     def _on_phone_user_state_changed(event):  # noqa: ANN001
         new_state = getattr(event, "new_state", None)
+        old_state = getattr(event, "old_state", None)
+        if old_state == "speaking" and new_state in {"listening", "idle"}:
+            vad_end_wall = time.time()
+            latency_state["local_vad_end_wall"] = vad_end_wall
+            _log.info(
+                "unknown_event", error_type="voice_phone_boundary",
+                error_category="local_vad_end",
+            )
+            final_wall = latency_state.get("final_transcript_wall")
+            if final_wall is not None:
+                _emit_phone_latency_segment(
+                    "local_vad_end_to_final_transcript", final_wall - vad_end_wall,
+                )
         if new_state == "speaking":
             candidate_activity.set()
             # LiveKit 1.6.4 does not guarantee speech-start metrics on every
@@ -3044,7 +3115,6 @@ async def _run_phone_session(
         # muted leg leaves behind, and the live call had no record of it. Log
         # the transition to/from 'away' in FIXED strings only — no transcript,
         # no ids, no dynamic values.
-        old_state = getattr(event, "old_state", None)
         if new_state == "away":
             _log.info(
                 "unknown_event", error_type="phone_user_state",
@@ -3061,7 +3131,12 @@ async def _run_phone_session(
         if str(getattr(event, "transcript", "") or "").strip():
             candidate_activity.set()
             if bool(getattr(event, "is_final", False)):
-                latency_state["final_transcript_wall"] = time.time()
+                final_wall = time.time()
+                latency_state["final_transcript_wall"] = final_wall
+                _log.info(
+                    "unknown_event", error_type="voice_phone_boundary",
+                    error_category="stt_final_arrived",
+                )
 
     @session.on("agent_state_changed")
     def _on_phone_agent_state_changed(event):  # noqa: ANN001
@@ -3080,8 +3155,14 @@ async def _run_phone_session(
                 _emit_phone_latency_segment(
                     "speech_end_to_first_audio", first_audio_wall - stopped_wall,
                 )
+            local_vad_end_wall = latency_state.get("local_vad_end_wall")
+            if local_vad_end_wall is not None:
+                _emit_phone_latency_segment(
+                    "local_vad_end_to_first_audio", first_audio_wall - local_vad_end_wall,
+                )
             latency_state["speech_created_mono"] = None
             latency_state["speech_end_wall"] = None
+            latency_state["local_vad_end_wall"] = None
             speech_first_audio.set()
         if new_state in {"idle", "listening"}:
             agent_listening.set()

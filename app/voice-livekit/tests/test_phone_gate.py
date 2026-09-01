@@ -3505,6 +3505,12 @@ class TestNativePhoneArchitecture(unittest.TestCase):
             "2026-09-01T04:30:00Z",
         )
         self.assertEqual(phone.candidate_turn_route("Um"), "hesitation")
+        self.assertEqual(
+            phone.candidate_turn_route(
+                "Um, yeah, so when can I receive the next update and what are the working hours?"
+            ),
+            "candidate_question",
+        )
         self.assertIsNone(phone.candidate_turn_route("I led the support team for four years."))
         self.assertTrue(phone.is_company_review_question(
             "I saw bad reviews on Glassdoor. Is it safe to work there?"
@@ -3548,6 +3554,19 @@ class TestNativePhoneArchitecture(unittest.TestCase):
             {"current": "10 LPA"},
         )
         self.assertEqual(phone.phone_compensation_slots("Around twenty would be nice."), {})
+        self.assertEqual(
+            phone.phone_generated_reply_rejection_reason(
+                "Thanks for sharing.", "Ask about notice period.", allow_closing=False,
+            ),
+            "question_mark_count",
+        )
+        self.assertEqual(
+            phone.phone_fallback_reply(
+                phone.PhonePlanQuestion("k", "What is your notice period?", True, None),
+                "I worked toward my target for two years.",
+            ),
+            "That’s helpful context, thank you. What is your notice period?",
+        )
         with patch.dict(os.environ, {"PHONE_GENERATIVE_OBJECTIVE_GUARD": "off"}):
             self.assertFalse(phone.phone_generative_objective_guard_enabled())
 
@@ -3564,6 +3583,20 @@ class TestNativePhoneArchitecture(unittest.TestCase):
             intro, {"recent_role": {"title": "Proprietary Trader"}},
         )
         self.assertEqual(conflict["resume_fact"], "Current or most recent resume role: Proprietary Trader")
+        split_claim = (
+            "I have around two years of experience in EdTech companies like upGrad, "
+            "Great Learning, and KLR, working as a sales and program advisor."
+        )
+        split_conflict = phone.phone_deterministic_resume_conflict(
+            split_claim,
+            {
+                "recent_role": {
+                    "title": "Proprietary Trader", "employer": "Quant Tekel",
+                },
+            },
+        )
+        self.assertIsNotNone(split_conflict)
+        self.assertIn("Quant Tekel", split_conflict["resume_fact"])
         self.assertIn("three years", conflict["spoken_claim"])
 
     def test_instruction_echo_detection_is_generic_not_phrase_blacklist(self):
@@ -3577,6 +3610,9 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         ))
 
     def test_post_goodbye_acknowledgements_are_bounded(self):
+        self.assertTrue(phone.phone_qna_done("No, that’s it."))
+        self.assertTrue(phone.phone_qna_done("I’m done, thanks."))
+        self.assertTrue(phone.phone_qna_done("We’re good."))
         self.assertTrue(phone.is_post_goodbye_acknowledgement("Yeah, thank you."))
         self.assertTrue(phone.is_post_goodbye_acknowledgement("Goodbye"))
         self.assertFalse(phone.is_post_goodbye_acknowledgement("I have another question"))
@@ -5577,6 +5613,25 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
         })
         await self._close(hooks)
 
+    async def test_split_resume_claim_is_clarified_on_the_immediate_next_reply(self):
+        agent, _, state, _, hooks = await self._coordinator()
+        state.resume_facts = {
+            "recent_role": {"title": "Proprietary Trader", "employer": "Quant Tekel"},
+        }
+        await self._turn(hooks, "I have around two years of experience.")
+        hooks["reply_started"].set()
+        hooks["reply_handle"][0] = _FakeSpeech()
+        second = await self._turn(
+            hooks,
+            "I worked at upGrad and Great Learning as a sales and program advisor.",
+        )
+        rendered = str(second.items)
+        self.assertIn("Quant Tekel", rendered)
+        self.assertIn("Never accuse", rendered)
+        self.assertTrue(hooks["reply_handle"][0].interrupt_calls)
+        self.assertEqual(len(agent._asked_conflicts), 1)
+        await self._close(hooks)
+
     async def test_early_answer_advances_contiguous_covered_objective_atomically(self):
         state = self._state()
         state.questions[0] = phone.PhonePlanQuestion(
@@ -6317,12 +6372,56 @@ class TestPhoneTurnDetectionFlag(unittest.TestCase):
                     phone.phone_turn_detection(), phone.PHONE_TURN_DETECTION_STT,
                 )
 
+    def test_preemptive_generation_is_disabled_by_default(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PHONE_OBJECTIVE_PREEMPTIVE", None)
+            self.assertFalse(phone.phone_objective_preemptive_enabled())
+
+    def test_sarvam_vad_experiment_is_off_by_default_and_phone_only(self):
+        with patch.dict(os.environ, {}, clear=False):
+            for name in (
+                "PHONE_SARVAM_HIGH_VAD_SENSITIVITY",
+                "PHONE_SARVAM_NEGATIVE_SPEECH_THRESHOLD",
+                "PHONE_SARVAM_NEGATIVE_FRAMES_COUNT",
+                "PHONE_SARVAM_NEGATIVE_FRAMES_WINDOW",
+            ):
+                os.environ.pop(name, None)
+            self.assertEqual(phone.phone_sarvam_vad_options(), {})
+        with patch.dict(os.environ, {
+            "PHONE_SARVAM_HIGH_VAD_SENSITIVITY": "true",
+            "PHONE_SARVAM_NEGATIVE_SPEECH_THRESHOLD": "0.4",
+            "PHONE_SARVAM_NEGATIVE_FRAMES_COUNT": "20",
+            "PHONE_SARVAM_NEGATIVE_FRAMES_WINDOW": "40",
+        }):
+            self.assertEqual(phone.phone_sarvam_vad_options(), {
+                "high_vad_sensitivity": True,
+                "negative_speech_threshold": 0.4,
+                "negative_frames_count": 20,
+                "negative_frames_window": 40,
+            })
+
+    def test_static_endpointing_experiment_is_bounded_and_default_is_locked(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC", None)
+            self.assertEqual(phone.phone_local_endpointing_delays(), (0.5, 1.5))
+        with patch.dict(os.environ, {"PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC": "0.1"}):
+            self.assertEqual(phone.phone_local_endpointing_delays(), (0.3, 1.5))
+        with patch.dict(os.environ, {"PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC": "0.9"}):
+            self.assertEqual(phone.phone_local_endpointing_delays(), (0.5, 1.5))
+
     def test_phone_session_gets_stt_turn_detection_when_flagged(self):
         _CapturingSession.last_kwargs = None
         with patch.object(agent_mod, "AgentSession", _CapturingSession), \
              patch.dict(os.environ, {"PHONE_TURN_DETECTION": "stt"}, clear=False):
             agent_mod._build_phone_provider_session()
         self.assertEqual(_CapturingSession.last_kwargs.get("turn_detection"), "stt")
+
+    def test_phone_sarvam_options_never_reach_browser_session(self):
+        with patch.object(agent_mod, "AgentSession", _CapturingSession), \
+             patch.object(agent_mod.sarvam, "STT", return_value=object()) as stt, \
+             patch.dict(os.environ, {"PHONE_SARVAM_HIGH_VAD_SENSITIVITY": "on"}, clear=False):
+            agent_mod._build_provider_session()
+        self.assertNotIn("high_vad_sensitivity", stt.call_args.kwargs)
 
     def test_phone_session_uses_locked_local_endpointing_bounds(self):
         _CapturingSession.last_kwargs = None
@@ -6354,6 +6453,19 @@ class TestPhoneTurnDetectionFlag(unittest.TestCase):
             with patch.object(agent_mod, "AgentSession", _CapturingSession):
                 agent_mod._build_provider_session()
             self.assertNotIn("turn_handling", _CapturingSession.last_kwargs)
+
+    def test_phone_sarvam_options_reach_phone_session_only(self):
+        with patch.object(agent_mod, "AgentSession", _CapturingSession), \
+             patch.object(agent_mod.sarvam, "STT", return_value=object()) as stt, \
+             patch.dict(os.environ, {"PHONE_SARVAM_HIGH_VAD_SENSITIVITY": "on"}, clear=False):
+            agent_mod._build_phone_provider_session()
+        self.assertTrue(stt.call_args.kwargs["high_vad_sensitivity"])
+
+    def test_empty_generation_has_no_second_repair_provider_call(self):
+        source = inspect.getsource(phone.phone_agent_class)
+        self.assertNotIn("repair_ctx", source)
+        self.assertIn("phone_generated_reply_rejection_reason", source)
+        self.assertIn("_on_generation_empty", source)
 
     def test_phone_llm_uses_warm_temperature_browser_keeps_default(self):
         class _CapturingLLM:
