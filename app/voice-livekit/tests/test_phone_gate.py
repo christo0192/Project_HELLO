@@ -6194,7 +6194,7 @@ class TestPhoneTurnDetectionFlag(unittest.TestCase):
             agent_mod._build_phone_provider_session()
         self.assertNotIn("turn_detection", _CapturingSession.last_kwargs)
         self.assertEqual(_CapturingSession.last_kwargs.get("min_endpointing_delay"), 0.5)
-        self.assertEqual(_CapturingSession.last_kwargs.get("max_endpointing_delay"), 1.0)
+        self.assertEqual(_CapturingSession.last_kwargs.get("max_endpointing_delay"), 1.5)
 
     def test_phone_llm_uses_warm_temperature_browser_keeps_default(self):
         class _CapturingLLM:
