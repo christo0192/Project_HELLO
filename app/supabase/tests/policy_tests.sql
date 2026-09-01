@@ -12887,7 +12887,12 @@ begin
     end if;
   end if;
 
-  update screening_v2.phone_engagements set session_id = v_sess where id = v_eng;
+  -- Keep the fixture's mutation clock aligned with each test's injected p_now;
+  -- production callers provide real timestamps, while this helper must not
+  -- inherit the database wall clock and accidentally fall outside the grace.
+  update screening_v2.phone_engagements
+     set session_id = v_sess, updated_at = '2026-09-01T06:00:00Z'::timestamptz
+   where id = v_eng;
 
   if p_scored then
     insert into screening_v2.assessments
