@@ -6194,7 +6194,24 @@ class TestPhoneTurnDetectionFlag(unittest.TestCase):
             agent_mod._build_phone_provider_session()
         self.assertNotIn("turn_detection", _CapturingSession.last_kwargs)
         self.assertEqual(_CapturingSession.last_kwargs.get("min_endpointing_delay"), 0.5)
-        self.assertEqual(_CapturingSession.last_kwargs.get("max_endpointing_delay"), 1.5)
+        self.assertEqual(_CapturingSession.last_kwargs.get("max_endpointing_delay"), 1.0)
+
+    def test_phone_llm_uses_warm_temperature_browser_keeps_default(self):
+        class _CapturingLLM:
+            last_kwargs = None
+
+            def __init__(self, **kwargs):
+                _CapturingLLM.last_kwargs = kwargs
+
+        with patch.object(agent_mod.openai, "LLM", _CapturingLLM):
+            _CapturingLLM.last_kwargs = None
+            agent_mod._build_phone_provider_session()
+            self.assertEqual(_CapturingLLM.last_kwargs.get("temperature"), 0.9)
+
+            # Browser/WebRTC keeps the provider default — no temperature passed.
+            _CapturingLLM.last_kwargs = None
+            agent_mod._build_provider_session()
+            self.assertNotIn("temperature", _CapturingLLM.last_kwargs)
 
     def test_toolless_objective_preemption_is_phone_only_and_rollbackable(self):
         _CapturingSession.last_kwargs = None

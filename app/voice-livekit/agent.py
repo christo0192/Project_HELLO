@@ -1103,7 +1103,7 @@ def _build_provider_session(*, phone_mode: bool = False, turn_mode: str | None =
         # keeps speculation off. Toolless may preload the NEXT stable semantic
         # objective before listening; ordinary substantive turns then need no
         # completed-hook mutation, allowing LiveKit to overlap Gemini with the
-        # 0.5–1.5s EOU tail. Clarification/callback/conflict turns still mutate
+        # 0.5–1.0s EOU tail. Clarification/callback/conflict turns still mutate
         # and correctly invalidate speculation. The phone-only env switch is an
         # immediate rollback; browser/WebRTC construction never enters here.
         session_options["preemptive_generation"] = bool(
@@ -1153,6 +1153,10 @@ def _build_provider_session(*, phone_mode: bool = False, turn_mode: str | None =
             model=phone.phone_primary_model() if phone_mode else GEMINI_MODEL,
             api_key=os.getenv("GEMINI_API_KEY"),
             base_url=GEMINI_BASE_URL,
+            # PHONE ONLY: warmer sampling for more natural, less repetitive
+            # turns. The browser/WebRTC path keeps the provider default so its
+            # sha-pinned behaviour is untouched.
+            **({"temperature": 0.9} if phone_mode else {}),
         ),
         **session_options,
     )
