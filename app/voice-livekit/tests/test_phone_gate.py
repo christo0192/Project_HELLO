@@ -3560,6 +3560,39 @@ class TestNativePhoneArchitecture(unittest.TestCase):
             ),
             "question_mark_count",
         )
+        # Validate spoken question acts rather than punctuation glyphs. Natural
+        # request forms and quoted candidate wording stay on the one-call path;
+        # two actual questions still fail closed to deterministic recovery.
+        self.assertEqual(
+            phone.phone_generated_question_act_count(
+                "That sounds useful — walk me through one concrete example."
+            ),
+            1,
+        )
+        self.assertTrue(phone.phone_generated_reply_authorized(
+            "That sounds useful — walk me through one concrete example.",
+            "Ask for one concrete example.", allow_closing=False,
+        ))
+        self.assertTrue(phone.phone_generated_reply_authorized(
+            'Your “what does success look like?” framing is thoughtful. '
+            "How did the prospect respond?",
+            "Ask how the prospect responded.", allow_closing=False,
+        ))
+        self.assertTrue(phone.phone_generated_reply_authorized(
+            "That is quite a turnaround. What changed??",
+            "Ask what changed.", allow_closing=False,
+        ))
+        self.assertFalse(phone.phone_generated_reply_authorized(
+            "That is helpful. What changed? What happened next?",
+            "Ask what changed.", allow_closing=False,
+        ))
+        self.assertFalse(phone.phone_generated_prefix_authorized(
+            "Walk me through one concrete example.",
+            "Ask for one concrete example.",
+        ))
+        self.assertTrue(phone.phone_generated_prefix_authorized(
+            "That sounds useful.", "Ask for one concrete example.",
+        ))
         self.assertEqual(
             phone.phone_fallback_reply(
                 phone.PhonePlanQuestion("k", "What is your notice period?", True, None),
@@ -3652,6 +3685,19 @@ class TestNativePhoneArchitecture(unittest.TestCase):
             ),
             "What did you learn?",
         )
+
+    def test_prefix_release_is_reset_for_each_reply_generation(self):
+        class BaseAgent:
+            def __init__(self, instructions=""):
+                self.instructions = instructions
+
+        screening_agent = phone.phone_agent_class(BaseAgent)(
+            "phone", client=FakeEventClient(), attempt_id=_ATTEMPT_ID,
+            say=AsyncMock(), native_turns=True,
+        )
+        screening_agent._generation_prefix_released = True
+        screening_agent.arm_reply_generation(2)
+        self.assertFalse(screening_agent._generation_prefix_released)
 
     def test_post_goodbye_acknowledgements_are_bounded(self):
         self.assertTrue(phone.phone_qna_done("No, that’s it."))
