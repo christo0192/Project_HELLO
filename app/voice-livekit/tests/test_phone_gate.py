@@ -2950,7 +2950,7 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             client.boundaries[0]["turns"][-1]["text"],
             "I have four years of relevant experience.",
         )
-        self.assertTrue(any("exact candidate-facing question" in str(c) for c in session.turn_contexts))
+        self.assertTrue(any("authorized objective" in str(c) for c in session.turn_contexts))
 
     async def test_interrupted_question_is_committed_once_as_labelled_evidence(self):
         _, client, _, _, _, _ = await self._run_session(
@@ -3565,7 +3565,7 @@ class TestNativePhoneArchitecture(unittest.TestCase):
                 phone.PhonePlanQuestion("k", "What is your notice period?", True, None),
                 "I worked toward my target for two years.",
             ),
-            "That’s helpful context, thank you. What is your notice period?",
+            "Thanks for walking me through that. What is your notice period?",
         )
         with patch.dict(os.environ, {"PHONE_GENERATIVE_OBJECTIVE_GUARD": "off"}):
             self.assertFalse(phone.phone_generative_objective_guard_enabled())
@@ -3608,6 +3608,19 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         self.assertFalse(phone.phone_generated_reply_authorized(
             leaked, "close", allow_closing=True, control_text=control,
         ))
+        objective = "What kind of customer conversations did you handle?"
+        self.assertTrue(phone.phone_generated_reply_authorized(
+            "That is helpful context. What kind of customer conversations did you handle?",
+            objective, allow_closing=False,
+            control_text="Ask this exact candidate-facing question: " + objective,
+        ))
+
+    def test_fallback_acknowledgement_uses_route_state_not_question_keywords(self):
+        question = phone.PhonePlanQuestion("k", "What did you learn?", True, None)
+        self.assertNotIn(
+            "fair question",
+            phone.phone_fallback_reply(question, "I learned what customers needed."),
+        )
 
     def test_post_goodbye_acknowledgements_are_bounded(self):
         self.assertTrue(phone.phone_qna_done("No, that’s it."))
@@ -4641,7 +4654,7 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
             turn_ctx,
         )
         injected = str(turn_ctx.items)
-        self.assertIn("Anything else you'd like to ask?", injected)
+        self.assertIn("anything else they'd like to ask", injected)
         self.assertIn("do not say goodbye yet", injected.lower())
         self.assertNotIn("final q&a round", injected.lower())
         self.assertNotIn("assessment.completed", client.event_types)
@@ -6009,7 +6022,7 @@ class TestToollessBackgroundCommit(unittest.IsolatedAsyncioTestCase):
         injected = " ".join(
             m["content"] if isinstance(m, dict) else "" for m in turn_ctx.items
         ).lower()
-        self.assertIn("next candidate-facing question", injected)
+        self.assertIn("authorized objective", injected)
         self.assertNotIn("coordinator tool", injected)
         self.assertNotIn("never speak before the tool result", injected)
         # The commit runs on a BACKGROUND task (off the on_turn/speech path):
@@ -6408,6 +6421,19 @@ class TestPhoneTurnDetectionFlag(unittest.TestCase):
             self.assertEqual(phone.phone_local_endpointing_delays(), (0.3, 1.5))
         with patch.dict(os.environ, {"PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC": "0.9"}):
             self.assertEqual(phone.phone_local_endpointing_delays(), (0.5, 1.5))
+
+    def test_phone_session_owns_an_explicit_vad_and_browser_does_not(self):
+        explicit_vad = object()
+        with patch.object(agent_mod, "AgentSession", _CapturingSession), \
+             patch.object(agent_mod, "_build_phone_vad", return_value=explicit_vad) as build_vad:
+            agent_mod._build_phone_provider_session()
+            self.assertIs(_CapturingSession.last_kwargs.get("vad"), explicit_vad)
+            build_vad.assert_called_once()
+
+            build_vad.reset_mock()
+            agent_mod._build_provider_session()
+            build_vad.assert_not_called()
+            self.assertNotIn("vad", _CapturingSession.last_kwargs)
 
     def test_phone_session_gets_stt_turn_detection_when_flagged(self):
         _CapturingSession.last_kwargs = None

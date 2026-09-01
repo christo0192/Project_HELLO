@@ -816,27 +816,17 @@ def phone_static_endpointing_min_delay() -> float:
 
 
 def phone_turn_mode() -> str:
-    """Per-turn coordination mode. Default `toolfirst` (today's behavior).
+    """Per-turn coordination mode.
 
-    `toolfirst` (DEFAULT): every substantive candidate turn costs TWO sequential
-    Gemini legs — a muzzled `tool_choice="required"` pass that calls exactly one
-    coordinator tool (request_probe / advance_screening), the durable
-    `commit_boundary` RPC, then a `tool_choice="none"` speech pass. This is the
-    lane that ships today; when this reader returns `toolfirst` the byte-path is
-    unchanged, which is the rollback story.
+    ``toolless`` is the production phone contract: the controller selects the
+    authorized objective and Gemini writes one answer-led bridge plus one
+    paraphrased question. The durable boundary commit runs off the speech path,
+    so the candidate does not pay for a second, muzzled Gemini leg.
 
-    `toolless`: the browser lane's ONE-call-per-turn shape. `llm_node` passes the
-    substantive turn straight through to generation with `tool_choice="auto"`
-    (no muzzled first leg, no latch), question-plan adherence rides the per-turn
-    prompt, and the same idempotent `commit_boundary` fires in the BACKGROUND
-    after the reply is delivered. The four jobs the mandatory tool call did are
-    preserved: the cursor moves off the speech path (background commit), plan
-    integrity moves to the prompt + server-owned resume, scoring alignment stays
-    on the SAME committed `source_event_id` keys, and the governed mid-call
-    actions (callback, candidate-end) keep their existing triggers.
-
-    Unknown or empty values FAIL SAFE to `toolfirst`. Read at the call site with
-    the literal name so the env-contract scanner sees it.
+    ``toolfirst`` remains an explicit rollback mode. Unknown or empty values
+    still fail safe to it; production opts into ``toolless`` in the phone app
+    configuration. Read at the call site with the literal name so the
+    environment contract scanner sees it.
     """
     value = (os.getenv("PHONE_TURN_MODE") or "").strip().lower()
     return PHONE_TURN_MODE_TOOLLESS if value == PHONE_TURN_MODE_TOOLLESS else PHONE_TURN_MODE_TOOLFIRST
@@ -4441,25 +4431,46 @@ def phone_instruction_echo_detected(speech: Any, control_text: Any) -> bool:
     return any(tuple(spoken[i:i + 6]) in windows for i in range(len(spoken) - 5))
 
 
-def phone_fallback_acknowledgement(answer: Any) -> str:
-    """Select a short safe reaction when generation cannot publish a reply."""
+def phone_fallback_acknowledgement(answer: Any, *, answer_is_question: bool = False) -> str:
+    """Select a safe fallback reaction from explicit route state only.
+
+    Candidate words are evidence, not a keyword classifier: ordinary answers
+    can contain ``what``, ``how`` or ``question`` without being questions to the
+    interviewer.
+    """
     if not isinstance(answer, str) or not answer.strip():
         return ""
-    clean = " ".join(answer.split()).casefold()
-    if any(word in clean for word in ("achieved", "target", "quota", "hit")):
-        return "That’s helpful context, thank you."
-    if any(word in clean for word in ("question", "when", "what", "how", "why")):
+    if answer_is_question:
         return "That’s a fair question, thank you."
     return "Thanks for walking me through that."
 
 
-def phone_fallback_reply(question: Any, answer: Any = None) -> str:
-    """Build one interruptible fallback: optional reaction plus one exact question."""
+def phone_fallback_reply(
+    question: Any, answer: Any = None, *, answer_is_question: bool = False,
+) -> str:
+    """Build one interruptible fallback for the snapshotted objective."""
     spoken_question = getattr(question, "spoken_text", None)
     if not isinstance(spoken_question, str) or not spoken_question.strip():
         return ""
-    acknowledgement = phone_fallback_acknowledgement(answer)
+    acknowledgement = phone_fallback_acknowledgement(
+        answer, answer_is_question=answer_is_question,
+    )
     return f"{acknowledgement} {spoken_question}".strip()
+
+
+def _private_phone_control_text(control_text: Any, objective_text: Any) -> str | None:
+    """Remove authorized objective wording before scanning private instructions.
+
+    The controller may place the candidate-facing objective next to its private
+    rules in one developer message. That objective is allowed to be repeated by
+    Gemini and must not be mistaken for leaked controller prose.
+    """
+    if not isinstance(control_text, str):
+        return None
+    private = control_text
+    if isinstance(objective_text, str) and objective_text.strip():
+        private = re.sub(re.escape(objective_text.strip()), " ", private, flags=re.IGNORECASE)
+    return private
 
 
 def phone_generated_prefix_authorized(
@@ -4471,7 +4482,8 @@ def phone_generated_prefix_authorized(
     compact = " ".join(speech.split())
     if "?" in compact or _GENERATED_CLOSING_RE.search(compact):
         return False
-    if phone_instruction_echo_detected(compact, control_text):
+    private_control = _private_phone_control_text(control_text, objective_text)
+    if phone_instruction_echo_detected(compact, private_control):
         return False
     if _COMPENSATION_OBJECTIVE_RE.search(compact) and not phone_is_compensation_objective(objective_text):
         return False
@@ -4494,7 +4506,8 @@ def phone_generated_reply_rejection_reason(
     objective_is_comp = phone_is_compensation_objective(objective_text)
     if _COMPENSATION_OBJECTIVE_RE.search(compact) and not objective_is_comp:
         return "compensation_drift"
-    if phone_instruction_echo_detected(compact, control_text):
+    private_control = _private_phone_control_text(control_text, objective_text)
+    if phone_instruction_echo_detected(compact, private_control):
         return "instruction_echo"
     return None
 
