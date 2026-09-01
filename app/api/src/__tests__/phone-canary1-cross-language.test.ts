@@ -276,10 +276,11 @@ describe('4. the worker halves are wired as the design requires', () => {
     expect(AGENT_PY).toContain('def _build_provider_session(');
     // PR #180: the factory takes the turn mode so toolless can re-enable
     // preemptive generation without touching the browser path.
-    expect(AGENT_PY).toContain('def _build_phone_provider_session(turn_mode: str | None = None)');
+    expect(AGENT_PY).toContain('def _build_phone_provider_session(');
+    expect(AGENT_PY).toContain('vad_event_callback: Callable[[Any], None] | None = None');
     expect(AGENT_PY).toContain('session = AgentSession(');
     expect(AGENT_PY).toContain('return session');
-    expect(AGENT_PY).toContain('session = _build_phone_provider_session(turn_mode)');
+    expect(AGENT_PY).toContain('session = _build_phone_provider_session(');
     expect(AGENT_PY).toContain('session_factory=_build_phone_provider_session');
 
     // Browser uses the shared factory and retains its own recording start policy.
