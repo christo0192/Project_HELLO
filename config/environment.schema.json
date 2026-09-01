@@ -168,6 +168,7 @@
         "PHONE_GENERATIVE_OBJECTIVE_GUARD": { "requiredInProduction": false, "secret": false },
         "PHONE_OBJECTIVE_PREEMPTIVE": { "requiredInProduction": false, "secret": false },
         "PHONE_TURN_DETECTION": { "requiredInProduction": false, "secret": false },
+        "PHONE_DYNAMIC_ENDPOINTING": { "requiredInProduction": false, "secret": false },
         "PHONE_TTS_FLUSH_MIN_CHARS": { "requiredInProduction": false, "secret": false },
         "PHONE_PATIENCE_GATE": { "requiredInProduction": false, "secret": false },
         "PHONE_COVERAGE_JUDGE": { "requiredInProduction": false, "secret": false },

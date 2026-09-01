@@ -1122,6 +1122,16 @@ def _build_provider_session(*, phone_mode: bool = False, turn_mode: str | None =
         endpoint_min, endpoint_max = phone.phone_local_endpointing_delays()
         if turn_detection == phone.PHONE_TURN_DETECTION_STT:
             session_options["turn_detection"] = "stt"
+        elif phone.phone_dynamic_endpointing_enabled():
+            # Opt-in phone-only adaptation, hard-bounded to the fixed safety
+            # envelope. Fixed endpointing remains the default/rollback path.
+            session_options["turn_handling"] = {
+                "endpointing": {
+                    "mode": "dynamic",
+                    "min_delay": endpoint_min,
+                    "max_delay": endpoint_max,
+                },
+            }
         else:
             # Local Silero VAD + LiveKit v1-mini EOU, with a bounded tail.
             session_options["min_endpointing_delay"] = endpoint_min

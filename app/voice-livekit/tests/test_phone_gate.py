@@ -4844,6 +4844,29 @@ class TestJudgeRollingTranscriptWindow(unittest.IsolatedAsyncioTestCase):
     """CHANGE 3: a bounded rolling transcript reaches the judge payload, so a
     résumé conflict fragmented across two turns is visible to the judge."""
 
+    def test_bounded_phone_chat_context_preserves_authority_without_mutation(self):
+        class Item:
+            def __init__(self, role, text):
+                self.role, self.text = role, text
+
+        class Context:
+            def __init__(self, items):
+                self.items = items
+
+            def copy(self):
+                return Context(list(self.items))
+
+        items = [Item("system", "stable instructions")]
+        items.extend(Item("user" if i % 2 else "assistant", str(i)) for i in range(40))
+        items.append(Item("developer", "current objective authorization"))
+        ctx = Context(items)
+        bounded = phone.bounded_phone_chat_context(ctx)
+        self.assertIsNot(bounded, ctx)
+        self.assertEqual(len(ctx.items), 42)
+        self.assertIn(items[0], bounded.items)
+        self.assertIn(items[-1], bounded.items)
+        self.assertLessEqual(len(bounded.items), 22)
+
     def test_render_recent_transcript_is_bounded_and_labelled(self):
         turns = [
             {"speaker": "bot", "text": "How many years?"},
@@ -6195,6 +6218,28 @@ class TestPhoneTurnDetectionFlag(unittest.TestCase):
         self.assertNotIn("turn_detection", _CapturingSession.last_kwargs)
         self.assertEqual(_CapturingSession.last_kwargs.get("min_endpointing_delay"), 0.5)
         self.assertEqual(_CapturingSession.last_kwargs.get("max_endpointing_delay"), 1.5)
+
+    def test_dynamic_endpointing_is_opt_in_and_phone_only(self):
+        for value in (None, "", "0", "false", "off"):
+            env = {} if value is None else {"PHONE_DYNAMIC_ENDPOINTING": value}
+            with patch.dict(os.environ, env, clear=False):
+                if value is None:
+                    os.environ.pop("PHONE_DYNAMIC_ENDPOINTING", None)
+                self.assertFalse(phone.phone_dynamic_endpointing_enabled())
+
+        with patch.dict(os.environ, {"PHONE_DYNAMIC_ENDPOINTING": "on", "PHONE_TURN_DETECTION": "local"}, clear=False):
+            self.assertTrue(phone.phone_dynamic_endpointing_enabled())
+            _CapturingSession.last_kwargs = None
+            with patch.object(agent_mod, "AgentSession", _CapturingSession):
+                agent_mod._build_phone_provider_session()
+            self.assertEqual(
+                _CapturingSession.last_kwargs["turn_handling"]["endpointing"],
+                {"mode": "dynamic", "min_delay": 0.5, "max_delay": 1.5},
+            )
+            _CapturingSession.last_kwargs = None
+            with patch.object(agent_mod, "AgentSession", _CapturingSession):
+                agent_mod._build_provider_session()
+            self.assertNotIn("turn_handling", _CapturingSession.last_kwargs)
 
     def test_phone_llm_uses_warm_temperature_browser_keeps_default(self):
         class _CapturingLLM:
