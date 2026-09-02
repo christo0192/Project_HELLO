@@ -26,7 +26,7 @@ from typing import Any, Optional
 # ── Allowlists ──────────────────────────────────────────────────────────
 
 # Keep historical DeepSeek rows valid while new screening claims use Gemini.
-ALLOWLISTED_PROVIDERS = frozenset({"deepseek", "gemini", "openai"})
+ALLOWLISTED_PROVIDERS = frozenset({"deepseek", "gemini"})
 ALLOWLISTED_WORKLOADS = frozenset({"screening", "scoring"})
 SAFE_INFERENCE_KEYS = frozenset({"temperature", "max_tokens"})
 
@@ -404,19 +404,14 @@ def create_provenance(
 def screening_provenance(
     requested_model: str,
     clock: Optional[dict] = None,
-    provider: str = "gemini",
 ) -> dict[str, Any]:
     """Build a screening provenance for the given requested model identifier.
-
-    ``provider`` defaults to ``gemini`` (browser/WebRTC and the legacy phone
-    path). The phone lane passes ``openai`` when it runs an OpenAI interviewer
-    so the audit records the actual provider that spoke, not an inherited one.
 
     Returns a deep copy.  The caller may safely mutate the result without
     affecting provenance tracking.
     """
     return create_provenance(
-        provider=provider,
+        provider="gemini",
         requested_model=requested_model,
         workload="screening",
         prompt_template_version=SCREENING_PROVENANCE_VERSION,
