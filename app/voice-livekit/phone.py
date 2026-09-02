@@ -459,7 +459,7 @@ def phone_role_opening_text(role_title: str | None) -> str | None:
         return None
     return (
         f"{_PHONE_ROLE_OPENING_PREFIX}this is about the {role} role at "
-        "Interview Kickstart. Let's get started."
+        "Interview Kickstart. Really glad you could hop on — let's dive in!"
     )
 
 
@@ -875,11 +875,25 @@ def phone_turn_detection() -> str:
     return PHONE_TURN_DETECTION_STT if value == PHONE_TURN_DETECTION_STT else PHONE_TURN_DETECTION_LOCAL
 
 
+def phone_static_endpointing_max_delay() -> float:
+    """Read an optional phone-only max-delay override, defaulting to 1.5s. Bounded
+    to [1.0, 2.0]; tightening it (e.g. 1.25) shortens the slow-speaker tail and the
+    dead-air after the candidate stops."""
+    raw = os.getenv("PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC")
+    if raw in (None, ""):
+        return PHONE_LOCAL_ENDPOINTING_MAX_DELAY_SEC
+    try:
+        value = float(raw)
+    except ValueError:
+        return PHONE_LOCAL_ENDPOINTING_MAX_DELAY_SEC
+    return min(2.0, max(1.0, value))
+
+
 def phone_local_endpointing_delays() -> tuple[float, float]:
-    """Phone-local endpointing bounds with a rollback-safe min-delay experiment."""
+    """Phone-local endpointing bounds with rollback-safe min/max overrides."""
     return (
         phone_static_endpointing_min_delay(),
-        PHONE_LOCAL_ENDPOINTING_MAX_DELAY_SEC,
+        phone_static_endpointing_max_delay(),
     )
 
 
@@ -2300,6 +2314,25 @@ PHONE_RESUME_CONFLICT_TEXT = (
 #: never contradicts — the "no spoken stage directions" rule below: emotion lives
 #: in the words and punctuation, NEVER in bracketed directions the TTS would read
 #: aloud. Phone-only; the sha-pinned browser prompt (full-band audio) never sees it.
+#: Persona / backstory (owner request, 2026-09-03; research: a defined persona
+#: with a short backstory yields a stable, human-feeling character even on small
+#: models). Prepended at the VERY TOP of the phone prompt, before the TTS primer,
+#: so it frames who Christy IS before how she sounds. Deliberately tight — a long
+#: bio bloats the prompt and adds nothing. Phone-only; the sha-pinned browser
+#: prompt never sees it. Reinforces, never overrides, the safety and turn rules.
+PHONE_PERSONA_TEXT = (
+    "WHO YOU ARE — Christy:\n"
+    "You're Christy, a friendly recruiting coordinator at Interview Kickstart. "
+    "You've spoken with hundreds of candidates, so you're relaxed, genuinely "
+    "curious about people's stories, and quick to put a nervous caller at ease. "
+    "You love a good detail and you're a little playful, but you never lose the "
+    "thread of what you need to find out. You talk like a real person on the "
+    "phone — warm, concise, natural Indian English with easy contractions. "
+    "You're on the candidate's side: this is a friendly first chat, not an "
+    "interrogation.\n\n"
+)
+
+
 PHONE_TTS_EMOTION_TEXT = (
     "SPOKEN DELIVERY — READ THIS FIRST:\n"
     "Everything you write is spoken aloud by a voice that draws ALL of its warmth "
@@ -3981,7 +4014,7 @@ def is_explicit_end_call_request(text: Any) -> bool:
 # Post-plan candidate Q&A is deliberately bounded. Three real questions is
 # enough space for a candidate to understand the role without turning a phone
 # screen into an unbounded support call that holds a fleet slot indefinitely.
-PHONE_QNA_MAX_ROUNDS = 3
+PHONE_QNA_MAX_ROUNDS = 5
 _QNA_DONE_RE = re.compile(
     r"^\s*(?:"
     r"no(?:pe)?(?:\s*,?\s*(?:that(?:'s|\s+is)\s+(?:all|it)|nothing\s+else))?|"
@@ -4016,6 +4049,31 @@ def phone_qna_done(text: Any) -> bool:
         return False
     normalized = text.replace("’", "'").replace("‘", "'")
     return _QNA_DONE_RE.fullmatch(normalized) is not None
+
+
+#: A Q&A-phase utterance that is pure filler or a dangling, unfinished thought
+#: ("Uh, yeah, so"). During wind-down these must NOT burn a Q&A round or trigger
+#: the close — a live call (2026-09-02) tore the room down on exactly this while
+#: the candidate was mid-sentence, cutting them off with no goodbye.
+_QNA_INCOMPLETE_RE = re.compile(
+    r"^\s*(?:(?:um+|uh+|er+|ah+|h+m+|so|and|but|well|yeah|yea|ya|yes|"
+    r"okay|ok|like|actually|i\s+mean|just|now|right)[\s,.!?-]*)+$",
+    re.IGNORECASE,
+)
+
+
+def phone_qna_incomplete(text: Any) -> bool:
+    """True when a Q&A-phase utterance is filler or an unfinished thought, so it
+    must not count as a Q&A round or trigger the close. A recognisable question
+    (interrogative, or content with digits) is always complete."""
+    if not isinstance(text, str):
+        return False
+    clean = " ".join(text.strip().split())
+    if not clean:
+        return True
+    if _QUESTION_OPEN_RE.match(clean) or _CONTENT_DIGIT_RE.search(clean) or clean.endswith("?"):
+        return False
+    return bool(_QNA_INCOMPLETE_RE.fullmatch(clean))
 
 
 # ── PR-9: shadow coverage + resume-conflict judge ─────────────────────
@@ -4751,21 +4809,33 @@ def phone_judge_turn_instruction(
         resume_fact = " ".join(conflict.get("resume_fact", "").split())[:300]
         spoken_claim = " ".join(conflict.get("spoken_claim", "").split())[:300]
         if resume_fact and spoken_claim:
-            # Evidence decides the route but never becomes spoken/model-authored
-            # copy. One neutral fixed clarification avoids quoting untrusted text,
-            # accidental accusation, and provider paraphrase drift.
+            # The judge DETECTS; the model PHRASES. Handing the model the finding
+            # (instead of a fixed sentence) lets Christy raise it warmly and in
+            # flow, and hold it once if the candidate deflects — while the strict
+            # guards below preserve the old safety: no accusation, no verbatim
+            # resume quoting, no loaded wording. Model authorship is the whole
+            # point (the canned line read robotic and dropped after one dodge).
             return (
-                "Say exactly this neutral clarification and nothing else: "
-                + PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT
+                "The candidate's last answer does not line up with their resume. "
+                "For your context only — do NOT read these aloud or quote them — "
+                "the resume shows: \"" + resume_fact + "\"; they just implied: \""
+                + spoken_claim + "\". In THIS turn, ask ONE warm, genuinely "
+                "curious clarifying question about that specific gap, in your own "
+                "natural words. Never accuse, never quote or read the resume "
+                "verbatim, and do not use the word \"discrepancy\". If they brush "
+                "it off or ask what you mean, kindly explain what you meant in one "
+                "sentence and gently hold the question once more before moving on."
             )
     if reanchor:
         bounded_question = " ".join(str(question_text or "").split())[:600]
         if bounded_question:
             return (
-                "You have NOT yet asked the owed topic. Ask it now, by itself, "
-                "as exactly ONE natural spoken question. Do not advance, combine "
-                "it with another topic, or say goodbye. Owed topic: "
-                + bounded_question
+                "The candidate went off-topic or hasn't answered yet. FIRST, if "
+                "they said something social or off-topic (a festival, a match, "
+                "small talk), acknowledge it warmly in a few words — never ignore "
+                "it. THEN ask the owed topic by itself as exactly ONE natural "
+                "spoken question. Do not advance, combine it with another topic, "
+                "or say goodbye. Owed topic: " + bounded_question
             )
     return None
 
@@ -5123,6 +5193,25 @@ _CONTENT_DIGIT_RE = re.compile(r"\d")
 PHONE_SUBSTANCE_SUBSTANTIVE = "substantive"
 PHONE_SUBSTANCE_HESITATION = "hesitation"
 PHONE_SUBSTANCE_THINKING = "thinking"
+PHONE_SUBSTANCE_CLARIFICATION = "clarification"
+
+
+#: Deflections / clarification requests that are NOT answers to the owed question
+#: — the bot must re-ask (rephrase) rather than advance the plan. A live call
+#: (2026-09-02) advanced past "I don't understand what discrepancy you found" and
+#: "I just mentioned that, right?" because the substance gate only caught bare
+#: hesitation. These complement `_GENERAL_CLARIFICATION_RE` (repeat/rephrase/
+#: explain/what do you mean). Kept short-anchored so a long real answer that
+#: happens to contain one of these phrases is not misread as a deflection.
+_DEFLECTION_RE = re.compile(
+    r"\b(?:i\s+(?:already\s+)?(?:just\s+)?(?:mentioned|said|told\s+you|answered|covered)\s+(?:that|this|it)|"
+    r"(?:i\s+)?did(?:n'?t| not)\s+(?:i\s+)?(?:just\s+)?(?:say|mention|cover|answer)|"
+    r"come\s+again|say\s+that\s+again|which\s+(?:one|question)|"
+    r"not\s+sure\s+what\s+you\s+mean|what\s+do\s+you\s+mean\s+by|"
+    r"i\s+(?:don'?t|do\s+not)\s+(?:understand|get\s+it|follow)|"
+    r"can\s+you\s+be\s+more\s+specific|what\s+(?:discrepancy|conflict|mismatch))\b",
+    re.IGNORECASE,
+)
 
 
 def phone_turn_substance(text: Any) -> str:
@@ -5144,6 +5233,14 @@ def phone_turn_substance(text: Any) -> str:
     # substantive-short allowlist so a leading "okay" filler cannot mask it.
     if _THINKING_STATEMENT_RE.fullmatch(clean):
         return PHONE_SUBSTANCE_THINKING
+    # A deflection / clarification request is NOT an answer: keep the cursor where
+    # it is so the bot RE-ASKS the owed question rather than advancing past a
+    # non-answer. Short-anchored (<= 14 words) so a long real answer that merely
+    # contains such a phrase stays substantive.
+    if len(clean.split()) <= 14 and (
+        _DEFLECTION_RE.search(clean) or _GENERAL_CLARIFICATION_RE.search(clean)
+    ):
+        return PHONE_SUBSTANCE_CLARIFICATION
     # A recognised complete short answer or any digit content is substantive.
     if _SUBSTANTIVE_SHORT_RE.fullmatch(clean) or _CONTENT_DIGIT_RE.search(clean):
         return PHONE_SUBSTANCE_SUBSTANTIVE

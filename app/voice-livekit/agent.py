@@ -1023,9 +1023,11 @@ def phone_question_instructions(
         "authorized objective below.",
         "Authorized objective: " + question.spoken_text,
         "",
-        "React briefly to one concrete detail from the candidate's latest "
-        "substantive answer when there is one. Then ask one clear question that "
-        "reaches the authorized objective in your own words; paraphrasing is "
+        "Open with a SHORT, varied acknowledgement — a quick genuine beat of a "
+        "few words tied to a specific thing they just said (\"Oh nice —\", "
+        "\"Haha, fair enough —\", \"Mm, got it —\"), never the same opener twice "
+        "in a row and never a whole recap sentence. Then ask one clear question "
+        "that reaches the authorized objective in your own words; paraphrasing is "
         "allowed and verbatim wording is not required. Do not introduce another "
         "objective, summarize the call, or say goodbye. Treat resume details as "
         "unverified claims: never present them as confirmed employment history.",
@@ -1085,7 +1087,7 @@ def _phone_instructions_text(state: "phone.PhoneAssessmentState") -> str:
     # speaking model writes expressive, well-punctuated lines the Sarvam voice can
     # render with tone. Prepended (not merged into the sha-pinned `system_prompt`),
     # so the browser prompt surface is byte-identical.
-    text = phone.PHONE_TTS_EMOTION_TEXT + system_prompt(
+    text = phone.PHONE_PERSONA_TEXT + phone.PHONE_TTS_EMOTION_TEXT + system_prompt(
         candidate_name=state.candidate_name,
         role_title=state.role_title,
         role_focus=(state.role_focus or ", ".join(state.role_required_skills))[:600],
@@ -2000,6 +2002,25 @@ async def _run_native_phone_screening(
             # PR-8: Q&A is a bounded LOOP, not the old one-answer trapdoor. A
             # clear "nothing else" closes immediately; otherwise answer and
             # re-invite until the third real question, then answer and wrap.
+            # A filler or half-finished utterance ("Uh, yeah, so") is the
+            # candidate still forming a thought — it must NOT burn a Q&A round or
+            # trigger the close mid-sentence (2026-09-02: the room was torn down on
+            # exactly this, cutting the candidate off with no goodbye). Give them a
+            # warm moment and re-invite, staying in Q&A.
+            if phone.phone_qna_incomplete(text):
+                set_reply_snapshot(
+                    "No rush at all — is there anything else you'd like to ask, "
+                    "or anything I can help with from my side?",
+                    phase="candidate_qna",
+                )
+                setattr(agent, "_turn_policy", "clarification")
+                add_turn_instruction(
+                    turn_ctx,
+                    "The candidate hasn't finished their thought. Warmly give them "
+                    "a moment and gently invite anything else they'd like to ask. "
+                    "Do NOT say goodbye and do NOT move on.",
+                )
+                return
             if phone.phone_qna_done(text):
                 close_instruction = (
                     "The candidate has no more questions. Thank them warmly, "
