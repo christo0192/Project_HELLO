@@ -3587,13 +3587,16 @@ class TestNativePhoneArchitecture(unittest.TestCase):
             "Ask what changed.", allow_closing=False,
         ))
         discovery = "Could you share an example of how you discovered a prospect’s real needs before recommending a solution?"
-        self.assertEqual(
-            phone.phone_generated_reply_rejection_reason(
-                "Five years in EdTech is a solid background. What is the biggest challenge a student faces in an intensive program?",
-                discovery, allow_closing=False,
-            ),
-            "objective_mismatch",
-        )
+        # Objective semantics are shadow-only on the live path. Natural wording
+        # must not trigger a scripted re-ask or a double penalty.
+        self.assertIsNone(phone.phone_generated_reply_rejection_reason(
+            "Five years in EdTech is a solid background. What is the biggest challenge a student faces in an intensive program?",
+            discovery, allow_closing=False,
+        ))
+        self.assertIsNone(phone.phone_generated_reply_rejection_reason(
+            "What concerns might make someone hesitate, and how would you address them?",
+            discovery, allow_closing=False,
+        ))
         self.assertTrue(phone.phone_generated_reply_authorized(
             "That context is useful. How did you uncover what the prospect needed before deciding what solution to offer?",
             discovery, allow_closing=False,
@@ -3721,16 +3724,18 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         screening_agent.arm_reply_generation(2)
         self.assertFalse(screening_agent._generation_prefix_released)
 
-    def test_high_confidence_incomplete_tails_wait_for_continuation(self):
+    def test_natural_pause_finals_are_not_suppressed_as_incomplete(self):
         for text in (
             "Um yeah, so my name is Cristo and I have",
             "When a candidate comes in they will have a lot of",
             "My notice period is about",
             "I have 5 years of sales experience and",
+            "That is something I really care about.",
+            "I would say the most challenging part is the handoff.",
         ):
             self.assertEqual(
                 phone.phone_turn_substance(text),
-                phone.PHONE_SUBSTANCE_HESITATION,
+                phone.PHONE_SUBSTANCE_SUBSTANTIVE,
                 text,
             )
         for complete in (
@@ -4656,6 +4661,7 @@ async def _make_native_coordinator(
     latest_candidate_anchor: list = [None]
     candidate_end_requested = asyncio.Event()
     reply_started = asyncio.Event()
+    speech_first_audio = asyncio.Event()
     reply_handle: list = [None]
     assistant_delivery_complete = asyncio.Event()
     candidate_activity = asyncio.Event()
@@ -4678,7 +4684,7 @@ async def _make_native_coordinator(
             latest_assistant_anchor=latest_assistant_anchor,
             latest_candidate_anchor=latest_candidate_anchor,
             candidate_end_requested=candidate_end_requested,
-            reply_started=reply_started, speech_first_audio=asyncio.Event(),
+            reply_started=reply_started, speech_first_audio=speech_first_audio,
             speech_sequence=[0], reply_handle=reply_handle,
             assistant_delivery_complete=assistant_delivery_complete,
             candidate_activity=candidate_activity,
@@ -4714,6 +4720,7 @@ async def _make_native_coordinator(
         "latest_assistant_anchor": latest_assistant_anchor,
         "assistant_delivery_complete": assistant_delivery_complete,
         "reply_started": reply_started,
+        "speech_first_audio": speech_first_audio,
         "reply_handle": reply_handle,
         "close_event": close_event,
         "log": spy,
@@ -5798,15 +5805,20 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
         })
         await self._close(hooks)
 
-    async def test_incomplete_intro_waits_then_complete_claim_gets_one_conflict_probe(self):
+    async def test_long_split_fragment_is_not_suppressed_before_conflict_probe(self):
         agent, _, state, client, hooks = await self._coordinator()
         state.resume_facts = {
             "recent_role": {"title": "Proprietary Trader", "employer": "Quant Tekel"},
         }
-        with self.assertRaises(sys.modules["livekit.agents"].StopResponse):
-            await self._turn(hooks, "Um yeah, my name is Cristo and I have")
-        self.assertEqual(client.committed_keys, [])
-
+        first = "Um yeah, my name is Cristo and I have"
+        ctx = await self._turn(hooks, first)
+        self.assertNotEqual(getattr(agent, "_turn_policy", None), "patience_suppressed")
+        self.assertNotEqual(str(ctx.items), "[]")
+        # A later final during the same reply is coalesced independently of the
+        # substance classifier and can still trigger the source-bound probe.
+        hooks["reply_started"].set()
+        hooks["speech_first_audio"].clear()
+        hooks["reply_handle"][0] = _FakeSpeech()
         answer = (
             "Five years of experience in EdTech companies like Scalar, Upgrad, "
             "and Great Learning, all in sales and program advisory."
@@ -5838,7 +5850,7 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(agent._asked_conflicts), 1)
         await self._close(hooks)
 
-    async def test_delivered_off_plan_question_cannot_advance_the_owed_objective(self):
+    async def test_delivered_off_plan_question_is_shadowed_without_live_reask(self):
         state = _default_state(questions=[
             {
                 "key": "discovery",
@@ -5861,11 +5873,12 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
             types.SimpleNamespace(text_content="They may have trouble finding enough time."),
             ctx,
         )
-        await asyncio.sleep(0)
-        self.assertEqual(client.committed_keys, [])
-        self.assertIn("real needs", str(ctx.items).lower())
-        self.assertIn("delivered_objective_mismatch", [
-            c.kwargs.get("error_category") for c in hooks["log"].warn.call_args_list
+        self.assertTrue(await TestPhoneCoverageJudgeCoordinator._drain(
+            lambda: client.committed_keys == ["discovery"],
+        ))
+        self.assertNotIn("real needs", str(ctx.items).lower())
+        self.assertIn("objective_mismatch_shadow", [
+            c.kwargs.get("error_category") for c in hooks["log"].info.call_args_list
             if c.kwargs.get("error_type") == "phone_objective_delivery"
         ])
         await self._close(hooks)
@@ -7464,11 +7477,9 @@ class TestPatienceSubstanceClassifier(unittest.TestCase):
                 f"{text!r} should be substantive",
             )
 
-    def test_hesitation_fragments_are_suppressed(self):
+    def test_bare_hesitations_are_suppressed(self):
         for text in (
-            "Hmm", "hmm", "Um", "uh", "So the most", "so the most",
-            "I would say", "I'd say", "yeah so", "well", "and",
-            "the biggest", "challenging part",
+            "Hmm", "hmm", "Um", "uh", "yeah so", "well", "and",
         ):
             self.assertEqual(
                 phone.phone_turn_substance(text),
@@ -7486,14 +7497,18 @@ class TestPatienceSubstanceClassifier(unittest.TestCase):
             "candidate_question",
         )
 
-    def test_mid_thought_dangling_fragments_are_suppressed(self):
-        for text in (
-            "would say is", "it is about", "the thing is", "so it's",
-        ):
+    def test_only_bare_fillers_remain_suppressible(self):
+        for text in ("um", "hmm", "yeah so", "okay"):
             self.assertEqual(
                 phone.phone_turn_substance(text),
                 phone.PHONE_SUBSTANCE_HESITATION,
-                f"{text!r} should be a mid-thought fragment",
+                f"{text!r} should remain a bare hesitation",
+            )
+        for text in ("would say is", "it is about", "the thing is", "so it's"):
+            self.assertEqual(
+                phone.phone_turn_substance(text),
+                phone.PHONE_SUBSTANCE_SUBSTANTIVE,
+                f"{text!r} must not be suppressed by a dangling-tail guess",
             )
 
     def test_explicit_thinking_statements_route_to_encouragement(self):
@@ -7564,7 +7579,7 @@ class TestPatienceGateTurnHook(unittest.IsolatedAsyncioTestCase):
         hooks["latest_assistant_anchor"][0] = 1
         hooks["assistant_delivery_complete"].set()
 
-    async def test_a_hesitation_fragment_is_suppressed_and_never_commits(self):
+    async def test_a_bare_hesitation_is_suppressed_and_never_commits(self):
         agent, session, state, client, hooks = await _make_native_coordinator(
             turn_mode="toolless",
         )
@@ -7573,10 +7588,11 @@ class TestPatienceGateTurnHook(unittest.IsolatedAsyncioTestCase):
         turn_ctx = types.SimpleNamespace(items=[])
         with self.assertRaises(self._stop_response()):
             await on_turn(
-                "So the most", types.SimpleNamespace(text_content="So the most"),
+                "Hmm", types.SimpleNamespace(text_content="Hmm"),
                 turn_ctx,
             )
-        # No reply instruction injected, no commit scheduled, cursor untouched.
+        # No reply instruction is injected, no commit is scheduled, and the
+        # cursor remains untouched.
         self.assertEqual(turn_ctx.items, [])
         self.assertEqual(getattr(agent, "_turn_policy"), "patience_suppressed")
         # Give any (erroneously scheduled) background commit a chance to run.
@@ -7618,8 +7634,8 @@ class TestPatienceGateTurnHook(unittest.IsolatedAsyncioTestCase):
         self._ready_turn(hooks)
         turn_ctx = types.SimpleNamespace(items=[])
         await on_turn(
-            "I led the support team for four years and cut resolution time in half.",
-            types.SimpleNamespace(text_content="I led the support team for four years and cut resolution time in half."),
+            "That is something I really care about.",
+            types.SimpleNamespace(text_content="That is something I really care about."),
             turn_ctx,
         )
         self.assertEqual(getattr(agent, "_turn_policy"), "substantive")
@@ -7707,13 +7723,13 @@ class TestSubstanceGatedCommit(unittest.IsolatedAsyncioTestCase):
         agent, session, state, client, hooks = await _make_native_coordinator(
             turn_mode="toolless",
         )
-        # Seed the coordinator's pending buffer with a NON-substantive candidate
-        # (the live hook can never do this — it suppresses first — so this is the
-        # defense-in-depth path), then run the background commit directly.
+        # Seed the coordinator's pending buffer with a bare NON-substantive
+        # candidate (the live hook suppresses it first), then run the background
+        # commit directly.
         agent._pending.update({
             "question": state.question_at(0),
             "prompt": "First question?",
-            "candidate": "So the most",  # a hesitation fragment, not an answer
+            "candidate": "Hmm",  # a bare hesitation, not an answer
             "message": None,
             "source_event_id": phone.plan_source_event_id("k1"),
             "probe_used": False,

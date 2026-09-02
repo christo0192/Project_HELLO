@@ -4618,8 +4618,6 @@ def phone_generated_reply_rejection_reason(
     objective_is_comp = phone_is_compensation_objective(objective_text)
     if _COMPENSATION_OBJECTIVE_RE.search(compact) and not objective_is_comp:
         return "compensation_drift"
-    if not allow_closing and not phone_generated_objective_covered(compact, objective_text):
-        return "objective_mismatch"
     if (
         objective_text == PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT
         and compact != PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT
@@ -5031,34 +5029,29 @@ _THINKING_STATEMENT_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-# Pure-hesitation / thinking-fragment finals that carry no answer content. These
-# ARE suppressed (StopResponse): the fragment stays in the chat context and the
-# bot waits for the substantive final. Extended cautiously from the observed
-# live fillers — bare fillers, "yeah so", "I would say", and mid-thought
-# fragments that trail off on a conjunction/preposition. Real short answers
-# ("yes", "no", "twelve lakhs", "12 LPA") must NOT match — they are validated by
-# the substantive-short allowlist below, which is checked FIRST.
+# Bare hesitation finals that carry no answer content. These are suppressed
+# (StopResponse) so the bot does not answer a standalone filler. Longer finals
+# are intentionally not classified from their grammatical tail: STT can emit a
+# final during a natural pause, and the live path must not create dead air for a
+# complete answer.
 _HESITATION_FRAGMENT_RE = re.compile(
     r"^\s*(?:"
     r"um+|uh+|h+m+|er+|ah+|oh+|hmph+|"
     r"well|so|and|but|okay|ok|right|like|"
-    r"yeah\s+so|yeah\s+um|so\s+the|so\s+the\s+most|"
-    r"i\s+(?:would|will|wanna|want\s+to)\s+say|i'?d\s+say|"
-    r"the\s+(?:most|main|hardest|biggest)|challenging\s+part|"
-    r"how\s+(?:do|can)\s+i\s+(?:put|say|phrase)|"
-    r"what\s+i\s+mean\s+is"
-    r")\s*(?:is|was|would|,|\.|\.\.\.|…)?\s*$",
+    r"yeah\s+so|yeah\s+um"
+    r")\s*[,.!?-]*\s*$",
     re.IGNORECASE,
 )
 
-# Conjunctions / prepositions / fillers that, when a SHORT fragment ends on one,
-# mark it as an unfinished thought (mid-thought/incomplete) rather than an answer.
+# Courtesy acknowledgements are not candidate answers, but they are not evidence
+# of an incomplete grammatical tail.
 _COURTESY_FRAGMENT_RE = re.compile(
     r"^\s*(?:(?:um+|uh+|yeah|yes|so|okay|ok)[\s,.!-]+){0,4}"
     r"(?:before\s+that[\s,.!-]+)?(?:thank\s+you|thanks)(?:\s+[a-z]+)?[\s,.!-]*$",
     re.IGNORECASE,
 )
 
+# Retained only as historical documentation; no dangling-tail classifier is live.
 _DANGLING_TAIL_RE = re.compile(
     r"\b(?:"
     r"and|but|or|so|because|that|which|the|a|an|to|of|in|on|for|with|"
@@ -5067,6 +5060,7 @@ _DANGLING_TAIL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Retained only as historical documentation; no incomplete-tail classifier is live.
 _HIGH_CONFIDENCE_INCOMPLETE_TAIL_RE = re.compile(
     r"\b(?:and\s+i\s+have|a\s+lot\s+of|is\s+about|was\s+about|"
     r"would\s+be|and|but|or|because|to|of|with|about)\s*[,\.\-…]*\s*$",
@@ -5114,22 +5108,15 @@ def phone_turn_substance(text: Any) -> str:
     # substantive-short allowlist so a leading "okay" filler cannot mask it.
     if _THINKING_STATEMENT_RE.fullmatch(clean):
         return PHONE_SUBSTANCE_THINKING
-    # High-confidence unfinished grammar outranks digits: "I have 5 years and"
-    # is still incomplete, while complete money/duration answers do not match.
-    if _HIGH_CONFIDENCE_INCOMPLETE_TAIL_RE.search(clean):
-        return PHONE_SUBSTANCE_HESITATION
     # A recognised complete short answer or any digit content is substantive.
     if _SUBSTANTIVE_SHORT_RE.fullmatch(clean) or _CONTENT_DIGIT_RE.search(clean):
         return PHONE_SUBSTANCE_SUBSTANTIVE
-    # Pure hesitation / thinking fragment → suppress.
+    # Only a bare filler is suppressible. Do not infer that a longer final is
+    # incomplete from its last preposition/conjunction: phone STT emits finals
+    # during natural pauses, and suppressing a complete answer creates dead air.
+    # Split finals are coalesced by the coordinator using its immutable
+    # active-exchange snapshot instead.
     if _HESITATION_FRAGMENT_RE.fullmatch(clean) or _COURTESY_FRAGMENT_RE.fullmatch(clean):
-        return PHONE_SUBSTANCE_HESITATION
-    # Mid-thought/incomplete. A narrow set of high-confidence tails remains
-    # incomplete regardless of utterance length (the production fragments
-    # "...I have", "...a lot of", and "...is about"). The broader dangling
-    # vocabulary stays short-only to avoid suppressing complete long answers.
-    words = clean.split()
-    if len(words) < 4 and _DANGLING_TAIL_RE.search(clean):
         return PHONE_SUBSTANCE_HESITATION
     return PHONE_SUBSTANCE_SUBSTANTIVE
 
