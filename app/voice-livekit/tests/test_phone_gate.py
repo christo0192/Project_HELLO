@@ -1717,6 +1717,49 @@ class TestAnswerClassifier(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN)
 
+    def test_natural_affirmatives_that_used_to_fall_through(self):
+        # The 2026-09-02 room-teardown regression: a cooperating human answered,
+        # but real STT phrasing matched none of yes/yeah/sure/okay, fell through
+        # to the fail-closed MACHINE default, and the room was deleted. Every
+        # phrase below is an ordinary "go ahead" a candidate actually says.
+        for text in (
+            "mm, yes go ahead",
+            "ya sure",
+            "yeah, go for it",
+            "absolutely",
+            "definitely, please continue",
+            "of course",
+            "sounds good",
+            "that works",
+            "you can",
+            "uh-huh",
+            "haan, yes",
+            "ji haan",
+            "so like, yeah okay",
+            "I'm ready",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN)
+
+    def test_widened_affirmatives_still_never_read_a_refusal_as_consent(self):
+        # The one false positive this whole file exists to prevent, plus the
+        # refusal/opt-out phrasings that must keep beating the affirmative branch
+        # even after the vocabulary was widened.
+        self.assertIsNone(agent_mod.classify_answer_text("I'm not sure"))
+        self.assertIsNone(agent_mod.classify_answer_text("not sure yet"))
+        self.assertIsNone(agent_mod.classify_answer_text("um, who is this?"))
+        self.assertEqual(
+            agent_mod.classify_answer_text("No thanks."), phone.CLASSIFY_REFUSED
+        )
+        self.assertEqual(
+            agent_mod.classify_answer_text("I'm not comfortable with that."),
+            phone.CLASSIFY_REFUSED,
+        )
+        self.assertEqual(
+            agent_mod.classify_answer_text("No, don't call me again."),
+            phone.CLASSIFY_OPT_OUT,
+        )
+
     def test_unreadable_answers_are_not_consent(self):
         for text in ("", "   ", "Hmm, who is this exactly?"):
             with self.subTest(text=text):
@@ -1751,6 +1794,39 @@ class TestAnswerClassifier(unittest.TestCase):
             return await agent_mod._classify_phone_answer(turns, say)
 
         self.assertEqual(_run(_test()), phone.CLASSIFY_HUMAN)
+
+    def test_fallback_machine_logs_responsive_versus_silence(self):
+        # A MACHINE default is invisible today: the one path that destroys the
+        # call records nothing about WHY. This asserts the fixed-category signal
+        # that distinguishes a misclassified responsive human from real silence
+        # — the diagnostic that was missing on 2026-09-02. No utterance text.
+        def _run_case(first, second):
+            async def _test():
+                turns: asyncio.Queue = asyncio.Queue()
+                turns.put_nowait(first)
+                turns.put_nowait(second)
+
+                async def say(text):
+                    return None
+
+                with patch.object(agent_mod, "_log") as log:
+                    decision = await agent_mod._classify_phone_answer(turns, say)
+                return decision, log
+
+            return _run(_test())
+
+        decision, log = _run_case("who is this exactly?", "still not sure what you want")
+        self.assertEqual(decision, phone.CLASSIFY_MACHINE)
+        log.warn.assert_called_once()
+        self.assertEqual(
+            log.warn.call_args.kwargs.get("error_category"), "responsive_unmatched"
+        )
+
+        decision, log = _run_case("", "   ")
+        self.assertEqual(decision, phone.CLASSIFY_MACHINE)
+        self.assertEqual(
+            log.warn.call_args.kwargs.get("error_category"), "no_speech"
+        )
 
 
 # ── The event client ──────────────────────────────────────────────────

@@ -840,10 +840,30 @@ _REFUSED_RE = re.compile(
 # Anchored deliberately. An affirmative has to BE the answer: matching "sure"
 # anywhere in the sentence reads "I'm not sure" as consent, which is the one
 # false positive this whole file exists to prevent.
+#
+# The affirmative must still BE the answer, after at most a short run of
+# hesitation fillers. The vocabulary and the (now repeatable) filler run were
+# widened after a live call on 2026-09-02 where a cooperating human was
+# classified MACHINE and the room was torn down: real Sarvam STT output like
+# "mm, yes go ahead", "ya sure", "absolutely", "go for it" or "sounds good"
+# matched none of yes/yeah/sure/okay and fell through to the fail-closed
+# MACHINE default. Every token added here is an UNAMBIGUOUS affirmative that
+# does NOT begin with "no"/"not" (those anchor the refusal/opt-out branches
+# checked before this one), so widening cannot turn a refusal into consent.
 _AFFIRMATIVE_RE = re.compile(
-    r"^\s*(?:well|um|uh|so|hi|hello|hey)?[\s,]*"
-    r"(?:yes|yeah|yep|yup|sure|okay|ok|go ahead|that(?:'s| is) fine|"
-    r"fine|please do|carry on|of course)\b",
+    r"^\s*(?:(?:well|um+|uh+|er+|ah+|oh|so|hi|hello|hey|hmm+|mm+|"
+    r"yeah|ok|okay|like|actually|i\s*mean|see)[\s,]*){0,4}"
+    r"(?:yes|yeah|yea|yah|yep|yup|ya|yaa|"
+    r"sure(?:\s+thing)?|okay|ok|"
+    r"absolutely|definitely|certainly|of\s+course|"
+    r"go\s+ahead|go\s+for\s+it|carry\s+on|continue|proceed|"
+    r"please\s+(?:do|go|continue|proceed)|"
+    r"that(?:'s| is)\s+fine|that\s+works|works\s+for\s+me|"
+    r"sounds\s+(?:good|great|fine)|fine|"
+    r"you\s+(?:can|may)|we\s+can|"
+    r"i'?m\s+(?:here|ready|good)|i\s+am\s+(?:here|ready|good)|ready|"
+    r"uh[\s-]*huh|mm[\s-]*hmm|mhm|"
+    r"haan|han|ji(?:\s+haan)?|theek(?:\s+hai)?)\b",
     re.IGNORECASE,
 )
 
@@ -922,15 +942,29 @@ async def _classify_phone_answer(
     HUMAN on and commit it as the candidate half of the gate transcript. The
     classifier reads it; the gate records it — no text is inferred after.
     """
+    responsive = 0
     for attempt in range(max(1, attempts)):
         text = await turns.get()
-        if consumed is not None and isinstance(text, str) and text.strip():
-            consumed.append(text)
+        if isinstance(text, str) and text.strip():
+            responsive += 1
+            if consumed is not None:
+                consumed.append(text)
         decision = classify_answer_text(text)
         if decision is not None:
             return decision
         if attempt + 1 < attempts:
             await say(phone.PHONE_REASK_TEXT)
+    # Fail closed to MACHINE — but make WHY visible. A line that WAS responsive
+    # (the human spoke) yet still defaulted here is the 2026-09-02 signature: a
+    # cooperating candidate whose phrasing missed every classifier branch, which
+    # then tore the room down. Distinguishing it from genuine silence is the
+    # difference between "widen the classifier" and "it really was a machine".
+    # Counts and a fixed category only — never the utterance text (PII).
+    _log.warn(
+        "unknown_event",
+        error_type="phone_classify_fallback_machine",
+        error_category="responsive_unmatched" if responsive else "no_speech",
+    )
     return phone.CLASSIFY_MACHINE
 
 
