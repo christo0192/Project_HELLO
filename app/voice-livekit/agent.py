@@ -1822,9 +1822,9 @@ async def _run_native_phone_screening(
                     error_category="stale_final_transcript_discarded",
                 )
             latency_state["final_transcript_wall"] = None
-        # Per-turn speech evidence. Capture the prior reply state before clearing
-        # it: a second STT final can arrive while the first fragment's reply is
-        # being created, and that second final belongs to the same source turn.
+        # Per-turn speech evidence. A second STT final can arrive while the
+        # first fragment's reply is being created; retain that signal so the
+        # shared per-turn snapshot can be extended without a new reply.
         prior_reply_started = reply_started.is_set()
         prior_speech_first_audio = speech_first_audio.is_set()
         reply_started.clear()
@@ -1895,7 +1895,7 @@ async def _run_native_phone_screening(
             setattr(agent, "_turn_policy", "patience_suppressed")
             _log.info(
                 "unknown_event", error_type="phone_turn_completion",
-                error_category="incomplete_suppressed",
+                error_category="bare_hesitation_suppressed",
             )
             from livekit.agents import StopResponse  # noqa: PLC0415
             raise StopResponse()
@@ -2050,22 +2050,28 @@ async def _run_native_phone_screening(
             return
         # THE PATIENCE GATE (X10). Not a recognised route: classify the final as
         # substantive / hesitation / thinking. A thinking statement earns ONE
-        # short encouragement (no advance, no new question); a hesitation
-        # fragment is suppressed so the bot waits for the real answer; a
-        # substantive final falls through to the normal flow. Consecutive
-        # suppressed fragments accumulate in the SDK chat context, so when the
-        # substantive final lands the reply naturally sees the whole thought.
+        # short encouragement (no advance, no new question); only a bare filler
+        # is suppressed; longer finals fall through to the normal flow. This is
+        # deliberately not a grammatical completeness detector because STT can
+        # finalize complete answers during natural pauses.
         # Completion was already classified before Q&A/closing above. Reaching
         # here means this is substantive under the same phone-only gate.
         if _native_turn_predates_question(message, latest_assistant_anchor[0]):
             from livekit.agents import StopResponse  # noqa: PLC0415
             raise StopResponse()
         # Route split finals BEFORE conflict/clarification state. A second
-        # final before the next reply's first audio still belongs to the answer
-        # already being processed. Re-run the synchronous conflict detector on
-        # the merged source exchange before allowing the planned question out.
+        # final before the reply's first audio belongs to the same source answer.
+        # Accumulate it on the shared per-turn snapshot and re-run the
+        # deterministic conflict detector on the merged text. This boundary is
+        # structural and does not depend on classifying the first fragment as
+        # incomplete or suppressing it.
         conflict_rerouted = False
-        if prior_reply_started and not prior_speech_first_audio and isinstance(active_exchange, dict):
+        if (
+            prior_reply_started
+            and not prior_speech_first_audio
+            and isinstance(active_exchange, dict)
+            and active_exchange.get("expected_index") == cursor
+        ):
             prior = str(active_exchange.get("candidate") or "").strip()
             fragment = str(text or "").strip()
             if fragment and fragment.casefold() not in prior.casefold():
@@ -2154,28 +2160,18 @@ async def _run_native_phone_screening(
             terminal_reason["reason"] = phone.HALT_MALFORMED_EXCHANGE
             finished.set()
             return
-        # A delivered question must prove it reached the server-owned objective.
-        # One-question syntax alone allowed an unrelated student-challenge
-        # question to be committed as discovery. Actual delivered transcript +
-        # completed playout is the fail-safe; clear mismatch re-asks the owed
-        # objective and writes no boundary.
+        # The deterministic objective contract remains shadow telemetry only.
+        # Natural paraphrases must not be rejected or re-asked on the live path;
+        # the controller still owns the durable question order and the one-
+        # question generation validator still protects reply shape.
         ask_covers_objective = phone.phone_generated_objective_covered(
             prompt, question.spoken_text,
         )
         if not ask_covers_objective:
-            setattr(agent, "_turn_policy", "clarification")
-            set_question_reply_snapshot(question, text)
-            instruction = phone_question_instructions(question, state.role_title)
-            authorize_generated_reply(
-                question.spoken_text,
-                control_text="Do not reveal private controller instructions.",
-            )
-            add_turn_instruction(turn_ctx, instruction)
-            _log.warn(
+            _log.info(
                 "unknown_event", error_type="phone_objective_delivery",
-                error_category="delivered_objective_mismatch",
+                error_category="objective_mismatch_shadow",
             )
-            return
         # A well-formed exchange clears the one-shot recovery latch, so a later
         # empty read at this same cursor gets its own recovery attempt rather than
         # inheriting a stale "already recovered here" mark.
@@ -2253,9 +2249,9 @@ async def _run_native_phone_screening(
             "probe_used": False,
             "source_event_id": phone.plan_source_event_id(question.key),
             "expected_index": cursor,
-            # Snapshot proof from the actual delivered assistant transcript,
-            # not an unconditional controller assumption.
-            "ask_delivered": ask_covers_objective,
+            # The live objective contract is shadow-only. Reply playout remains
+            # the delivery proof; a natural paraphrase must not block progress.
+            "ask_delivered": True,
             "coverage_hint": coverage_hint,
             "covered_following_keys": covered_following,
             "revision": 1,
