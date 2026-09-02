@@ -2280,14 +2280,18 @@ PHONE_RESUME_CONFLICT_TEXT = (
     "\n\nResume-conflict probing (when it arises):\n"
     "- You have the candidate's resume facts above. If a spoken answer clearly "
     "CONFLICTS with or exposes a GAP versus those facts — a different company, "
-    "a contradictory length of experience, or an unexplained employment gap "
-    "their answer touches — address it naturally in the flow: ask exactly ONE "
-    "polite clarifying question about that specific discrepancy (for example, "
-    "\"Earlier your resume mentions X — help me reconcile that with what you "
-    "just said\"), then continue the planned questions.\n"
-    "- At most one such clarification per discrepancy. Never accuse. Never "
-    "repeat a clarification you already resolved. If nothing conflicts, say "
-    "nothing about the resume and just continue."
+    "a contradictory length of experience, a different domain, or an unexplained "
+    "employment gap their answer touches — surface it right away, in the SAME "
+    "turn you notice it: ask exactly ONE polite clarifying question about that "
+    "specific discrepancy (for example, \"Earlier your resume mentions X — help "
+    "me reconcile that with what you just said\").\n"
+    "- Do NOT let it go after a single brush-off. If they deflect, dodge, or ask "
+    "what you mean, briefly and warmly restate the SPECIFIC discrepancy ONE more "
+    "time and give them a genuine chance to reconcile it before you move on. "
+    "Two touches at most, then continue the planned questions.\n"
+    "- Never accuse, never badger beyond those two touches, and never repeat a "
+    "clarification once they've actually reconciled it. If nothing conflicts, "
+    "say nothing about the resume and just continue."
 )
 
 
@@ -2298,20 +2302,32 @@ PHONE_RESUME_CONFLICT_TEXT = (
 #: browser prompt (the browser lane has full-band audio and needs no lexical
 #: compensation).
 PHONE_EXPRESSIVENESS_TEXT = (
-    "\n\nNatural phone delivery (mandatory):\n"
-    "- Respond as one coherent spoken thought: one brief, varied reaction tied "
-    "to a specific detail the candidate actually gave, followed naturally by "
-    "the single authorized question. Do not fall into a repeated generic "
-    "acknowledgement template from turn to turn.\n"
+    "\n\nWho you are on this call (mandatory):\n"
+    "- This is a friendly first-round screening chat, not a formal interview. "
+    "You're Christy — upbeat, warm, and genuinely curious about people. Relaxed "
+    "beats polished. Let the conversation FLOW; it should never feel like you're "
+    "reading a checklist or numbering questions.\n"
+    "- Have real, human reactions in WORDS (the narrow phone line strips tone, "
+    "so your words carry the warmth): a little delight (\"Oh nice, that's "
+    "genuinely cool\"), amusement (\"Haha, fair enough\"), or empathy (\"Oof, "
+    "that sounds like a lot\") — one short beat tied to a SPECIFIC detail they "
+    "actually said, then flow naturally into your single question. Never reuse "
+    "the same acknowledgement two turns running.\n"
+    "- Match their energy: chatty candidate, banter a little; nervous, slow "
+    "down and reassure; brisk, keep it tight.\n"
+    "- If they say something harmless and off-topic (a sports match, the "
+    "weather, a joke, 'do you like dogs?'), play along warmly for ONE quick beat "
+    "(\"Haha, caught the highlights — wild finish. Okay, so —\") and glide right "
+    "back into your question. Never scold, never stonewall the small talk, never "
+    "get pulled into a real tangent.\n"
     "- Use ordinary contractions and punctuation that creates a natural pause "
-    "and clear question intonation. Mirror the candidate's energy while staying "
-    "warm and professional.\n"
+    "and clear question intonation.\n"
     "- Never output stage directions or performance labels such as chuckles, "
     "laughs, warmly, smiling, or with enthusiasm; the voice system may speak "
     "those words literally. Never put such directions in brackets or parentheses.\n"
-    "- Never joke at the candidate's expense or during consent, compensation, "
-    "callback confirmation, or a resume discrepancy. Keep any light humor rare "
-    "and grounded in verified context."
+    "- Stay warm but drop the banter and be plainly professional during consent, "
+    "the recording disclosure, compensation, callback confirmation, or a resume "
+    "discrepancy. Never joke at the candidate's expense."
 )
 
 
@@ -2455,13 +2471,16 @@ async def _tts_early_flush_segments(text: Any, min_chars: int) -> Any:
 PHONE_PER_TURN_STYLE_TEXT = (
     "Style (phone line): plain spoken text only — never markdown, asterisks, "
     "underscores or backticks. Ask exactly ONE question this turn, never two. "
-    "React with genuine warmth and light professional humour (the line is "
-    "narrow, so carry the energy in your words), but never joke about the "
-    "candidate or their answers, and never during consent, recording "
-    "disclosure, compensation, or a resume discrepancy. If a spoken answer "
-    "clearly conflicts with the resume facts you were given, ask ONE polite "
-    "clarifying question about that specific point, then continue — at most "
-    "once per discrepancy, never accusing."
+    "This is a friendly chat, not a checklist: open with a genuine, varied "
+    "reaction to a specific thing they just said (warmth, light humour, or "
+    "empathy — carry the energy in your words since the line is narrow), then "
+    "flow into the question. If they toss in harmless off-topic small talk, give "
+    "one quick friendly beat and glide back. Never joke about the candidate, and "
+    "drop the humour during consent, recording disclosure, compensation, or a "
+    "resume discrepancy. If a spoken answer conflicts with the resume facts you "
+    "were given, ask ONE polite clarifying question about that specific point in "
+    "this same turn; if they deflect, restate it once more before moving on — "
+    "two touches at most, never accusing."
 )
 
 
@@ -2524,8 +2543,13 @@ def render_resume_context(turns: list[dict[str, str]]) -> str:
 JUDGE_WINDOW_MAX_TURNS = 4
 JUDGE_WINDOW_MAX_CHARS = 300
 JUDGE_WINDOW_TOTAL_MAX_CHARS = 1_500
-PHONE_CONTEXT_MAX_ITEMS = 32
-PHONE_CONTEXT_RECENT_ITEMS = 20
+# Env-configurable (phone-only). Defaults preserve the prior 32/20 behaviour, so
+# an absent env is byte-identical; the phone app raises these (e.g. 120/100) so a
+# full-length call is NOT trimmed mid-conversation — trimming both loses early
+# context AND churns the OpenAI prompt-cache prefix, defeating caching. gpt-5-mini
+# holds a 400k window, so a ~5k-token screening call fits with room to spare.
+PHONE_CONTEXT_MAX_ITEMS = _bounded_int_env(os.getenv("PHONE_CONTEXT_MAX_ITEMS"), 32, 16, 4000)
+PHONE_CONTEXT_RECENT_ITEMS = _bounded_int_env(os.getenv("PHONE_CONTEXT_RECENT_ITEMS"), 20, 8, 4000)
 
 
 def bounded_phone_chat_context(chat_ctx: Any) -> Any:
@@ -4100,6 +4124,32 @@ def phone_judge_url() -> str:
 def phone_primary_model() -> str:
     """Phone-only interviewer model; browser keeps the global GEMINI_MODEL."""
     return (os.getenv("PHONE_PRIMARY_MODEL") or "gemini-3.5-flash-lite").strip()
+
+
+def phone_llm_provider() -> str:
+    """Speaking-model provider for the PHONE lane only. Default ``gemini``
+    (rollback / byte-identical no-op). ``PHONE_LLM_PROVIDER=openai`` runs the
+    OpenAI interviewer (e.g. gpt-5-mini). Browser/WebRTC never reads this, so a
+    single env flip returns the phone lane to the prior Gemini construction.
+    Read at the call site with the literal name so the env-contract scanner
+    sees it."""
+    return (os.getenv("PHONE_LLM_PROVIDER") or "gemini").strip().lower()
+
+
+def phone_llm_reasoning_effort() -> str:
+    """Reasoning effort for an OpenAI phone interviewer. Default ``minimal`` —
+    the single-LLM benchmark proved minimal holds sub-second TTFT while keeping
+    the quality, where a higher effort adds seconds of spoken dead air per turn.
+    Only applied when :func:`phone_llm_provider` is ``openai``."""
+    return (os.getenv("PHONE_LLM_REASONING_EFFORT") or "minimal").strip().lower()
+
+
+def phone_llm_prompt_cache_key() -> str | None:
+    """Stable prompt-cache routing key for the phone lane so the static system-
+    prompt prefix is served from OpenAI's prefix cache across turns and calls.
+    Empty disables routing (auto-caching still applies)."""
+    key = (os.getenv("PHONE_LLM_PROMPT_CACHE_KEY") or "phone-screener-v1").strip()
+    return key or None
 
 
 def phone_judge_model() -> str:

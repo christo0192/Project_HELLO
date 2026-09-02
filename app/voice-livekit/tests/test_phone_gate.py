@@ -7861,9 +7861,9 @@ class TestPhoneInstructionAssembly(unittest.TestCase):
         self.assertIn("ask exactly one question per turn", low)
         self.assertIn("do not move to the next topic", low)
         self.assertIn("restate the current question only", low)
-        # Natural delivery is specific, one-thought, and never speaks stage directions.
-        self.assertIn("one coherent spoken thought", low)
-        self.assertIn("specific detail the candidate actually gave", low)
+        # Natural delivery is specific, jovial-but-safe, and never speaks stage directions.
+        self.assertIn("friendly first-round screening", low)
+        self.assertIn("a specific detail they actually said", low)
         self.assertIn("never output stage directions", low)
         self.assertIn("at the candidate's expense", low)
 
@@ -7878,7 +7878,7 @@ class TestPhoneInstructionAssembly(unittest.TestCase):
         )
         self.assertIn("resume-conflict probing", with_facts.lower())
         self.assertIn("help me reconcile", with_facts.lower())
-        self.assertIn("at most one such clarification", with_facts.lower())
+        self.assertIn("two touches at most", with_facts.lower())
 
     def test_browser_prompt_surface_is_byte_identical(self):
         # The phone-only blocks must never leak into the shared system_prompt.
@@ -7898,6 +7898,95 @@ class TestPhoneInstructionAssembly(unittest.TestCase):
             "light, professional humor",
         ):
             self.assertNotIn(leaked, low, f"{leaked!r} leaked into the browser prompt")
+
+
+class TestPhoneSingleLLMRevamp(unittest.TestCase):
+    """The gpt-5-mini phone interviewer: OpenAI provider branch at
+    reasoning=minimal with prompt caching (phone-only; browser untouched), plus
+    the enriched jovial character and hold-through-deflection resume-conflict
+    directives. The controller/cursor/guard are intentionally left in place."""
+
+    @staticmethod
+    def _capturing_llm():
+        class _CapturingLLM:
+            last_kwargs = None
+
+            def __init__(self, **kwargs):
+                _CapturingLLM.last_kwargs = kwargs
+        return _CapturingLLM
+
+    def test_openai_provider_builds_gpt5_minimal_cached_no_temperature(self):
+        cap = self._capturing_llm()
+        with patch.object(agent_mod.openai, "LLM", cap), \
+             patch.dict(os.environ, {
+                 "PHONE_LLM_PROVIDER": "openai",
+                 "PHONE_PRIMARY_MODEL": "gpt-5-mini",
+                 "PHONE_LLM_REASONING_EFFORT": "minimal",
+                 "OPENAI_API_KEY": "sk-test-key",
+             }, clear=False):
+            cap.last_kwargs = None
+            agent_mod._build_phone_provider_session()
+        k = cap.last_kwargs
+        self.assertEqual(k.get("model"), "gpt-5-mini")
+        self.assertEqual(k.get("reasoning_effort"), "minimal")
+        self.assertEqual(k.get("api_key"), "sk-test-key")
+        self.assertTrue(k.get("prompt_cache_key"))         # prefix-cache routing
+        self.assertNotIn("temperature", k)                 # gpt-5 locks temperature
+        self.assertNotIn("base_url", k)                    # OpenAI default endpoint
+
+    def test_default_phone_lane_stays_gemini_and_warm(self):
+        cap = self._capturing_llm()
+        with patch.object(agent_mod.openai, "LLM", cap), \
+             patch.dict(os.environ, {"PHONE_LLM_PROVIDER": ""}, clear=False):
+            cap.last_kwargs = None
+            agent_mod._build_phone_provider_session()
+        k = cap.last_kwargs
+        self.assertEqual(k.get("temperature"), 0.9)        # unchanged gemini phone path
+        self.assertIn("base_url", k)                       # gemini endpoint
+        self.assertNotIn("reasoning_effort", k)
+
+    def test_browser_lane_ignores_phone_openai_switch(self):
+        cap = self._capturing_llm()
+        with patch.object(agent_mod.openai, "LLM", cap), \
+             patch.dict(os.environ, {
+                 "PHONE_LLM_PROVIDER": "openai", "PHONE_PRIMARY_MODEL": "gpt-5-mini",
+             }, clear=False):
+            cap.last_kwargs = None
+            agent_mod._build_provider_session()            # browser/WebRTC
+        k = cap.last_kwargs
+        self.assertNotIn("reasoning_effort", k)            # never reaches browser
+        self.assertNotIn("temperature", k)                 # browser keeps provider default
+        self.assertIn("base_url", k)
+
+    def test_phone_llm_config_helpers(self):
+        with patch.dict(os.environ, {"PHONE_LLM_PROVIDER": ""}, clear=False):
+            self.assertEqual(phone.phone_llm_provider(), "gemini")
+        with patch.dict(os.environ, {"PHONE_LLM_PROVIDER": "OpenAI"}, clear=False):
+            self.assertEqual(phone.phone_llm_provider(), "openai")
+        with patch.dict(os.environ, {"PHONE_LLM_REASONING_EFFORT": ""}, clear=False):
+            self.assertEqual(phone.phone_llm_reasoning_effort(), "minimal")
+        self.assertTrue(phone.phone_llm_prompt_cache_key())
+
+    def test_character_and_conflict_directives(self):
+        expr = phone.PHONE_EXPRESSIVENESS_TEXT.lower()
+        self.assertIn("friendly first-round screening", expr)     # jovial framing
+        self.assertIn("off-topic", expr)                          # small-talk handling
+        self.assertIn("match their energy", expr)
+        self.assertIn("never output stage directions", expr)      # safety rail retained
+        conf = phone.PHONE_RESUME_CONFLICT_TEXT.lower()
+        self.assertIn("same turn", conf)                          # probe immediately
+        self.assertIn("deflect", conf)                            # hold through deflection
+        self.assertIn("two touches at most", conf)
+        style = phone.PHONE_PER_TURN_STYLE_TEXT.lower()           # the message the model reads
+        self.assertIn("two touches at most", style)
+
+    def test_context_bounds_default_preserved_and_env_wired(self):
+        # Absent env: byte-identical to the prior 32/20 behaviour.
+        self.assertEqual(phone.PHONE_CONTEXT_MAX_ITEMS, 32)
+        self.assertEqual(phone.PHONE_CONTEXT_RECENT_ITEMS, 20)
+        # The module reads the bound through this same helper; an override is honoured.
+        self.assertEqual(phone._bounded_int_env("120", 32, 16, 4000), 120)
+        self.assertEqual(phone._bounded_int_env("100", 20, 8, 4000), 100)
 
 
 if __name__ == "__main__":
