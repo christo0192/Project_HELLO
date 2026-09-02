@@ -11726,6 +11726,54 @@ begin
 end;
 $$;
 
+-- ── D4b: coverage advances the durable cursor by the current objective plus
+--        every contiguous volunteered objective (0075 regression)
+do $$
+declare
+  v_ids uuid[]; v_role uuid; v_res jsonb;
+begin
+  v_ids := _policy_tests.phone44_fixture('pol44-coverage');
+  select role_id into v_role from screening_v2.phone_engagements where id = v_ids[1];
+  update screening_v2.roles
+     set screening_template = '[{"id":"k1","question":"First?","mandatory":true},
+                                {"id":"k2","question":"Second?","mandatory":true},
+                                {"id":"k3","question":"Third?","mandatory":true}]'::jsonb
+   where id = v_role;
+  perform screening_v2.start_phone_assessment(
+            v_ids[2], v_ids[3], '2026-09-01T06:00:00Z'::timestamptz);
+
+  v_res := screening_v2.commit_phone_question_boundary_with_coverage(
+             v_ids[3], 'k1', 0, 'ev-coverage-1',
+             '[{"speaker":"bot","text":"First?"},
+               {"speaker":"candidate","text":"First and second answered."}]'::jsonb,
+             array['k2'], '2026-09-01T06:01:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0044-D4b: coverage returns and persists cursor 2 after k1 plus k2',
+    v_res ->> 'status' = 'applied'
+    and (v_res ->> 'cursor')::int = 2
+    and (select current_question_index from screening_v2.call_sessions where id = v_ids[3]) = 2
+    and (select count(*) from screening_v2.phone_session_progress where session_id = v_ids[3]) = 2
+    and (select question_key from screening_v2.phone_session_progress
+           where session_id = v_ids[3] and question_index = 1) = 'k2'
+    and (select count(*) from screening_v2.transcript_turns where session_id = v_ids[3]) = 2,
+    'coverage cursor diverged from the returned cursor: ' || v_res::text);
+
+  v_res := screening_v2.commit_phone_question_boundary_with_coverage(
+             v_ids[3], 'k3', 2, 'ev-coverage-2',
+             '[{"speaker":"bot","text":"Third?"},
+               {"speaker":"candidate","text":"Third answered."}]'::jsonb,
+             '{}'::text[], '2026-09-01T06:02:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0044-D4b: the next boundary accepts the persisted covered cursor',
+    v_res ->> 'status' = 'applied'
+    and (v_res ->> 'cursor')::int = 3
+    and (select current_question_index from screening_v2.call_sessions where id = v_ids[3]) = 3,
+    'the next boundary was rejected after coverage: ' || v_res::text);
+
+  perform _policy_tests.phone44_teardown('pol44-coverage');
+end;
+$$;
+
 -- ── D5: a malformed exchange writes NOTHING, and a failing insert takes
 --        the whole boundary with it
 do $$

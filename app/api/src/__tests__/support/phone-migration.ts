@@ -150,6 +150,12 @@ export const MIGRATION_0075_PATH = fileURLToPath(
 
 export const MIGRATION_0075 = readFileSync(MIGRATION_0075_PATH, 'utf8');
 
+export const MIGRATION_0077_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0077_phone_objective_coverage_cursor_fix.sql', import.meta.url),
+);
+
+export const MIGRATION_0077 = readFileSync(MIGRATION_0077_PATH, 'utf8');
+
 /**
  * Every phone migration, NEWEST FIRST. Extraction walks this in order and the
  * first file that declares a thing wins, which is what "the latest declaration
@@ -157,6 +163,7 @@ export const MIGRATION_0075 = readFileSync(MIGRATION_0075_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    { name: '0077', sql: MIGRATION_0077 },
     { name: '0075', sql: MIGRATION_0075 },
     // 0072 adds finalize_phone_partial_sessions (server-side partial-finalize)
     // and the assessments.partial column. Newest-first so its declaration wins.
