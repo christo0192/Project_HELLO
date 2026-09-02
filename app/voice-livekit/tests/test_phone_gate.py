@@ -3834,6 +3834,80 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         self.assertTrue(phone.is_post_goodbye_acknowledgement("Goodbye"))
         self.assertFalse(phone.is_post_goodbye_acknowledgement("I have another question"))
 
+    def test_qna_incomplete_never_counts_a_filler_or_dangling_turn(self):
+        # The live-call teardown trigger: filler / an unfinished thought must not
+        # burn a Q&A round or fire the close.
+        for filler in [
+            "Uh, yeah, so", "Um...", "so and", "well, actually", "Okay so",
+            "yeah I mean", "   ", "and", "hmm, right",
+        ]:
+            self.assertTrue(phone.phone_qna_incomplete(filler), filler)
+        # A recognisable question or content-bearing answer is always complete.
+        for complete in [
+            "Is there anything else you need from me?",
+            "What is the CTC for this role?",
+            "I have 5 years of experience.",
+            "No, that's it, thank you.",
+            "Could you tell me about the team?",
+        ]:
+            self.assertFalse(phone.phone_qna_incomplete(complete), complete)
+        self.assertFalse(phone.phone_qna_incomplete(None))
+        self.assertFalse(phone.phone_qna_incomplete(123))
+
+    def test_deflection_is_classified_clarification_not_substantive(self):
+        # Non-answers that a live call wrongly advanced past — they must keep the
+        # cursor put so the bot RE-ASKS rather than moving on.
+        for deflection in [
+            "I don't understand what discrepancy you found",
+            "I just mentioned that, right?",
+            "Can you explain the question?",
+            "What do you mean by that?",
+            "Sorry, could you repeat the question?",
+            "I already said that.",
+            "What discrepancy?",
+        ]:
+            self.assertEqual(
+                phone.phone_turn_substance(deflection),
+                phone.PHONE_SUBSTANCE_CLARIFICATION,
+                deflection,
+            )
+        # A long genuine answer that merely contains such a phrase stays an answer.
+        long_answer = (
+            "I already said I have about six years, but to add more detail I led "
+            "the pricing team at Acme and shipped three major launches last year."
+        )
+        self.assertEqual(
+            phone.phone_turn_substance(long_answer),
+            phone.PHONE_SUBSTANCE_SUBSTANTIVE,
+        )
+
+    def test_static_endpointing_max_delay_env_is_bounded(self):
+        import os as _os
+        key = "PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC"
+        prior = _os.environ.get(key)
+        try:
+            for raw, expected in [("1.25", 1.25), ("0.2", 1.0), ("9", 2.0)]:
+                _os.environ[key] = raw
+                self.assertAlmostEqual(phone.phone_static_endpointing_max_delay(), expected)
+            _os.environ[key] = "not-a-number"
+            self.assertAlmostEqual(
+                phone.phone_static_endpointing_max_delay(),
+                phone.PHONE_LOCAL_ENDPOINTING_MAX_DELAY_SEC,
+            )
+            _os.environ.pop(key, None)
+            self.assertAlmostEqual(
+                phone.phone_static_endpointing_max_delay(),
+                phone.PHONE_LOCAL_ENDPOINTING_MAX_DELAY_SEC,
+            )
+            # the max feeds the pair used by the local turn detector
+            _os.environ[key] = "1.25"
+            self.assertEqual(phone.phone_local_endpointing_delays()[1], 1.25)
+        finally:
+            if prior is None:
+                _os.environ.pop(key, None)
+            else:
+                _os.environ[key] = prior
+
     def test_silence_copy_cannot_become_boundary_evidence(self):
         self.assertTrue(phone.is_gate_copy(phone.PHONE_SILENCE_PROMPT_TEXT))
         self.assertTrue(phone.is_gate_copy(phone.PHONE_SILENCE_GOODBYE_TEXT))
@@ -5116,10 +5190,20 @@ class TestPhoneCoverageJudgeCore(unittest.IsolatedAsyncioTestCase):
         instruction = phone.phone_judge_turn_instruction(
             "What is your notice period?", reanchor=True, conflict=conflict,
         )
-        self.assertIn("Say exactly this neutral clarification", instruction)
-        self.assertIn(phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT, instruction)
-        self.assertNotIn("Six years at Example Co", instruction)
-        self.assertNotIn("I joined last month", instruction)
+        low = instruction.lower()
+        # The judge DETECTS; the model PHRASES — no canned line is forced.
+        self.assertNotIn("say exactly this neutral clarification", low)
+        self.assertNotIn(phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT, instruction)
+        # the finding is handed to the model as PRIVATE context, explicitly not to
+        # be read aloud, and the safety guards are stated in-line
+        self.assertIn("for your context only", low)
+        self.assertIn("do not read these aloud", low)
+        self.assertIn("in your own", low)
+        self.assertIn("never accuse", low)
+        self.assertIn('do not use the word "discrepancy"', low)
+        self.assertIn("Six years at Example Co", instruction)
+        self.assertIn("I joined last month", instruction)
+        # conflict clarification takes the whole turn — the owed topic is held
         self.assertNotIn("Owed topic", instruction)
         self.assertEqual(
             phone.phone_conflict_key(conflict), phone.phone_conflict_key(dict(conflict)),
@@ -5868,9 +5952,12 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
         )
         ctx = await self._turn(hooks, answer)
         rendered = str(ctx.items)
-        self.assertIn(phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT, rendered)
-        self.assertNotIn("Proprietary Trader", rendered)
-        self.assertNotIn(answer, rendered)
+        # model-phrased probe injected (no canned line); finding rides as private
+        # context flagged not-to-be-read-aloud (it is already in the system prompt)
+        self.assertNotIn(phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT, rendered)
+        self.assertIn("for your context only", rendered.lower())
+        self.assertIn("in your own", rendered.lower())
+        self.assertIn("Proprietary Trader", rendered)
         self.assertNotIn("notice period", rendered.lower())
         self.assertTrue(await self._drain(lambda: client.committed_keys == ["k1"]))
         self.assertEqual(agent._asked_conflicts, {
@@ -5900,8 +5987,13 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
             "and Great Learning, all in sales and program advisory."
         )
         ctx = await self._turn(hooks, answer)
-        self.assertIn(phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT, str(ctx.items))
-        self.assertNotIn("Quant Tekel", str(ctx.items))
+        rendered = str(ctx.items)
+        self.assertNotIn(phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT, rendered)
+        self.assertIn("for your context only", rendered.lower())
+        # the resume finding (role + employer) rides as private, not-read-aloud
+        # context — it is already present in the system-prompt evidence block
+        self.assertIn("Quant Tekel", rendered)
+        self.assertIn("do not read these aloud", rendered.lower())
         self.assertTrue(await self._drain(lambda: client.committed_keys == ["k1"]))
         self.assertEqual(len(agent._asked_conflicts), 1)
         await self._close(hooks)
@@ -5919,9 +6011,12 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
             "I worked at upGrad and Great Learning as a sales and program advisor.",
         )
         rendered = str(second.items)
-        self.assertIn(phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT, rendered)
-        self.assertNotIn("Quant Tekel", rendered)
-        self.assertNotIn("upGrad", rendered)
+        self.assertNotIn(phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT, rendered)
+        self.assertIn("for your context only", rendered.lower())
+        # the finding (resume role/employer) and the candidate's own spoken claim
+        # both ride as private, not-read-aloud context
+        self.assertIn("Quant Tekel", rendered)
+        self.assertIn("upGrad", rendered)
         self.assertTrue(hooks["reply_handle"][0].interrupt_calls)
         self.assertEqual(len(agent._asked_conflicts), 1)
         await self._close(hooks)
@@ -7900,22 +7995,26 @@ class TestPhoneInstructionAssembly(unittest.TestCase):
         ):
             self.assertNotIn(leaked, low, f"{leaked!r} leaked into the browser prompt")
 
-    def test_tts_emotion_primer_is_prepended_at_the_very_top(self):
+    def test_persona_then_emotion_primer_are_prepended_at_the_very_top(self):
         text = agent_mod._phone_instructions_text(self._state())
-        # present, phone-only, and literally the first thing in the phone prompt
-        self.assertIn("spoken delivery", text.lower())
-        self.assertIn("exclamation", text.lower())
+        low = text.lower()
+        # persona backstory is FIRST, then the TTS emotion primer, then the base
         self.assertTrue(
-            text.lstrip().lower().startswith("spoken delivery"),
-            "emotion primer must be at the very beginning of the phone prompt",
+            low.lstrip().startswith("who you are"),
+            "the Christy persona must be at the very beginning of the phone prompt",
         )
-        # and it sits ABOVE the shared persona base
-        self.assertLess(
-            text.lower().index("spoken delivery"),
-            text.index('You are "Christy"') if 'You are "Christy"' in text else 10**9,
-        )
-        # it must NOT instruct spoken stage directions (Sarvam speaks them literally)
-        self.assertIn("never write stage directions", text.lower())
+        self.assertIn("recruiting coordinator", low)          # backstory present
+        self.assertIn("spoken delivery", low)                 # emotion primer present
+        self.assertIn("exclamation", low)
+        self.assertLess(low.index("who you are"), low.index("spoken delivery"))
+        base_ix = text.index('You are "Christy"') if 'You are "Christy"' in text else 10**9
+        self.assertLess(low.index("spoken delivery"), base_ix)
+        # the emotion primer must NOT instruct spoken stage directions
+        self.assertIn("never write stage directions", low)
+        # persona/primer are phone-only — never in the shared browser prompt
+        browser = prompting.system_prompt(candidate_name="X", role_title="R", role_focus="f",
+                                          resume_facts="rf", questions="q", interviewer_instructions="i")
+        self.assertNotIn("who you are — christy", browser.lower())
 
 
 class TestPhoneContextBounds(unittest.TestCase):
