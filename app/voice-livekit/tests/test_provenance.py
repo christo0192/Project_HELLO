@@ -148,9 +148,7 @@ class TestProvenanceValidation(unittest.TestCase):
     # ── Allowlist violations ─────────────────────────────────────────
 
     def test_rejects_unknown_provider(self):
-        # openai is now allowlisted (phone gpt-5-mini interviewer); use a provider
-        # that is still off the allowlist to prove rejection still works.
-        result = validate_provenance(valid_payload(provider="anthropic"), fixed_clock)
+        result = validate_provenance(valid_payload(provider="openai"), fixed_clock)
         self.assertFalse(result["valid"])
 
     def test_rejects_empty_provider(self):
@@ -460,15 +458,6 @@ class TestProvenanceValidation(unittest.TestCase):
         self.assertEqual(p["workload"], "screening")
         self.assertEqual(p["requestedModel"], "gemini-3.1-flash-lite")
         self.assertEqual(p["prompt_template_version"], SCREENING_PROVENANCE_VERSION)
-
-    def test_screening_provenance_openai_phone_interviewer(self):
-        # The phone lane may speak through an OpenAI interviewer (gpt-5-mini);
-        # the audit must record the REAL provider, and openai must be allowlisted
-        # so the claim is not rejected. Browser default stays gemini.
-        p = screening_provenance("gpt-5-mini", fixed_clock, provider="openai")
-        self.assertEqual(p["provider"], "openai")
-        self.assertEqual(p["workload"], "screening")
-        self.assertEqual(p["requestedModel"], "gpt-5-mini")
 
     # ── legacy provenance ────────────────────────────────────────────
 

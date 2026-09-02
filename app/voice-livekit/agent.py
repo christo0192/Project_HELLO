@@ -269,6 +269,21 @@ def _record_provider_metrics(event: Any) -> None:
             schema=component,
             duration_sec=round(ttf, 3),
         )
+    # Cache-hit visibility (Gemini implicit prompt caching). Fires only when the
+    # provider metric exposes a cached-input-token count, so it is a safe no-op
+    # otherwise; the count rides the numeric field. Confirms the wider stable
+    # in-call prefix is actually being served from Gemini's cache.
+    cached = _provider_metric_number(
+        metric, "cache_read_input_tokens", "cached_tokens",
+        "prompt_cached_tokens", "cached_input_tokens",
+    )
+    if cached is not None:
+        _log.info(
+            "unknown_event",
+            error_type="voice_provider_cached_tokens",
+            schema=component,
+            duration_sec=round(cached, 0),
+        )
 
 
 def _emit_phone_latency_segment(schema: str, duration: float) -> None:
@@ -1066,7 +1081,11 @@ def _phone_instructions_text(state: "phone.PhoneAssessmentState") -> str:
     carries a dangling reference to facts the model was not given.
     """
     compact_resume = _compact_phone_resume_evidence(state.resume_facts)
-    text = system_prompt(
+    # PHONE ONLY (owner request): a TTS-prosody primer at the VERY TOP so the
+    # speaking model writes expressive, well-punctuated lines the Sarvam voice can
+    # render with tone. Prepended (not merged into the sha-pinned `system_prompt`),
+    # so the browser prompt surface is byte-identical.
+    text = phone.PHONE_TTS_EMOTION_TEXT + system_prompt(
         candidate_name=state.candidate_name,
         role_title=state.role_title,
         role_focus=(state.role_focus or ", ".join(state.role_required_skills))[:600],
@@ -1185,44 +1204,6 @@ def _build_phone_vad(on_event: Callable[[Any], None] | None = None) -> Any:
     return _observe_phone_vad(factory(model="silero"), on_event)
 
 
-def _build_interviewer_llm(phone_mode: bool) -> Any:
-    """Construct the speaking model. Browser/WebRTC is UNCHANGED (Gemini on the
-    provider default), so its sha-pinned behaviour is untouched.
-
-    The PHONE lane may run an OpenAI interviewer (``PHONE_LLM_PROVIDER=openai``,
-    e.g. gpt-5-mini at ``reasoning_effort=minimal``): the single-LLM benchmark
-    showed that pairing tops the rubric while holding sub-second TTFT, where a
-    higher reasoning effort would add seconds of spoken dead air. This is the
-    ONE phone-only switch — a missing or ``gemini`` provider is byte-identical
-    to the prior construction, so rollback is a single env flip. A stable
-    prompt-cache key routes the static system-prompt prefix through OpenAI's
-    prefix cache across turns and calls.
-    """
-    if phone_mode and phone.phone_llm_provider() == "openai":
-        kwargs: dict[str, Any] = {
-            "model": phone.phone_primary_model(),
-            "api_key": os.getenv("OPENAI_API_KEY"),
-            "reasoning_effort": phone.phone_llm_reasoning_effort(),
-        }
-        cache_key = phone.phone_llm_prompt_cache_key()
-        if cache_key:
-            kwargs["prompt_cache_key"] = cache_key
-        _log.info(
-            "unknown_event", error_type="phone_interviewer_llm",
-            error_category="openai", model=kwargs["model"],
-            schema=kwargs["reasoning_effort"],
-        )
-        return openai.LLM(**kwargs)
-    return openai.LLM(
-        model=phone.phone_primary_model() if phone_mode else GEMINI_MODEL,
-        api_key=os.getenv("GEMINI_API_KEY"),
-        base_url=GEMINI_BASE_URL,
-        # PHONE ONLY (Gemini path): warmer sampling for more natural, less
-        # repetitive turns. The browser/WebRTC path keeps the provider default.
-        **({"temperature": 0.9} if phone_mode else {}),
-    )
-
-
 def _build_provider_session(
     *, phone_mode: bool = False, turn_mode: str | None = None,
     vad_event_callback: Callable[[Any], None] | None = None,
@@ -1336,7 +1317,15 @@ def _build_provider_session(
             pace=1.0,
             temperature=0.8,
         ),
-        llm=_build_interviewer_llm(phone_mode),
+        llm=openai.LLM(
+            model=phone.phone_primary_model() if phone_mode else GEMINI_MODEL,
+            api_key=os.getenv("GEMINI_API_KEY"),
+            base_url=GEMINI_BASE_URL,
+            # PHONE ONLY: warmer sampling for more natural, less repetitive
+            # turns. The browser/WebRTC path keeps the provider default so its
+            # sha-pinned behaviour is untouched.
+            **({"temperature": 0.9} if phone_mode else {}),
+        ),
         **session_options,
     )
 
@@ -4111,18 +4100,14 @@ async def _run_session(
     # configured model is then supplied directly to Gemini below.
     # Phone has an explicit speaker model while browser/WebRTC retains the
     # existing global model. Record the actual requested model for provenance.
-    _is_phone = phone.is_phone_room(room_name)
     provenance_model = (
-        phone.phone_primary_model() if _is_phone else GEMINI_MODEL
-    )
-    # The phone lane may speak through an OpenAI interviewer; record the real
-    # provider so the audit is not an inherited "gemini". Browser is unchanged.
-    provenance_provider = (
-        "openai" if _is_phone and phone.phone_llm_provider() == "openai" else "gemini"
+        phone.phone_primary_model()
+        if phone.is_phone_room(room_name)
+        else GEMINI_MODEL
     )
     claim = await persistence.set_session_provenance(
         session_id,
-        screening_provenance(provenance_model, provider=provenance_provider),
+        screening_provenance(provenance_model),
     )
     if claim not in {
         persistence.ClaimResult.CLAIMED,

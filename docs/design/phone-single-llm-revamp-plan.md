@@ -43,31 +43,6 @@ Tests: `test_natural_affirmatives_that_used_to_fall_through`, `test_widened_affi
 
 ---
 
-## Implementation as shipped (one PR — `feat/phone-single-llm-revamp`)
-
-An exploration of the live turn machinery (before touching it) changed the approach from "from-scratch prompt" to **surgical**, and it de-risked the biggest fear:
-
-- **The controller and cursor are the RELIABILITY mechanism, not the thing fighting the model.** The worker injects the owed question as an *ephemeral per-turn developer message* — live calls proved the model follows that, and largely *ignores* long-form system-prompt blocks. The coverage matcher (`phone_generated_objective_covered`) is **shadow telemetry only** (agent.py:2197) — it does not gate advancement. The cursor is **server-driven and idempotent** (`commit_boundary`), and the `stale_cursor` teardown is triggered by RPC failure/mismatch, never by the model's wording. **So gpt-5-mini's free-flowing paraphrases cannot wedge the cursor, and the controller/cursor/reply-guard are KEPT** (gpt-5-mini follows them even better than gemini).
-- **Turning the judge off is safe**: `coverage_judge_enabled` only gates the *canned conflict-clarification injection* (agent.py:2240) — the exact robotic "catch-then-drop" we want gone — and skips the stale-judge startup hard-fail. Advancement is unaffected.
-- **Résumé facts already flow**: `state.resume_facts = candidate_evidence` (agent.py:1115) → `_phone_instructions_text` injects them; the `resume_facts=None` in the base `system_prompt()` call is a red herring (the phone lane rebuilds its own instruction text). Workstream 2 was already done.
-
-**What this PR actually changes (all phone-only; browser/WebRTC byte-identical; no migration):**
-1. **LLM swap** — `_build_interviewer_llm` (agent.py): `PHONE_LLM_PROVIDER=openai` → `openai.LLM(model=gpt-5-mini, reasoning_effort=minimal, prompt_cache_key=…)`, no temperature (gpt-5 locks it). The plugin natively supports `reasoning_effort`/`prompt_cache_key` (verified). Default `gemini` = byte-identical rollback. Helpers `phone_llm_provider/reasoning_effort/prompt_cache_key` (phone.py).
-2. **Character + conflict** — enriched the three blocks the model provably reads: `PHONE_EXPRESSIVENESS_TEXT` (jovial, vibe-matching, one-beat off-topic handling; safety rails kept), `PHONE_RESUME_CONFLICT_TEXT` (probe in the SAME turn, **hold through one deflection**, two touches max), `PHONE_PER_TURN_STYLE_TEXT` (same, compact).
-3. **Judge off** — `PHONE_COVERAGE_JUDGE=off` (existing flag; conflict now handled natively by gpt-5-mini + the prompt). Deterministic detector remains shadow telemetry.
-4. **Caching** — `prompt_cache_key` on the LLM + context bounds made env-configurable and raised (`PHONE_CONTEXT_MAX_ITEMS=120`, `PHONE_CONTEXT_RECENT_ITEMS=100`) so a full call isn't trimmed mid-conversation (which both loses context and churns the cache prefix).
-5. **Provenance** — `openai` allowlisted; the phone claim records `provider=openai` for gpt-5-mini (audit truth).
-6. **TTS** — Sarvam `simran` kept (owner decision).
-7. **Controller / cursor / reply-guard** — deliberately KEPT (per the exploration). If a live call shows them fighting gpt-5-mini, each already has an env seam to soften next.
-
-**Env set as app-scoped fly secrets on `project-hello-phone-voice` (NOT in the shared fly.toml → browser app untouched):**
-`PHONE_LLM_PROVIDER=openai · PHONE_PRIMARY_MODEL=gpt-5-mini · PHONE_LLM_REASONING_EFFORT=minimal · PHONE_COVERAGE_JUDGE=off · PHONE_CONTEXT_MAX_ITEMS=120 · PHONE_CONTEXT_RECENT_ITEMS=100 · OPENAI_API_KEY=<pasted test key, rotate after testing>`.
-**Rollback:** revert the PR (code defaults to gemini) or `fly secrets unset PHONE_LLM_PROVIDER`.
-
-Tests: full voice-livekit suite green (1101 passed); new `TestPhoneSingleLLMRevamp` covers the provider branch, browser isolation, config helpers, character/conflict directives, and context-bound wiring.
-
----
-
 ## Workstream 1 — New phone prompt (best-of-both + Christy character)
 
 **Files:** `app/voice-livekit/prompting.py` (add `phone_system_prompt()`), call site agent.py:4068.
