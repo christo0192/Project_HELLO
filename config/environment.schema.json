@@ -27,6 +27,7 @@
         "RECORDINGS_BUCKET": { "requiredInProduction": true, "secret": false },
         "RECORDING_DOWNLOAD_TTL_SEC": { "requiredInProduction": false, "secret": false },
         "RECORDING_MAX_BYTES": { "requiredInProduction": false, "secret": false },
+        "RECORDING_PROVIDER": { "requiredInProduction": false, "secret": false },
         "RECORDING_EGRESS_ENABLED": { "requiredInProduction": true, "secret": false },
         "RECORDING_EGRESS_REQUIRED": { "requiredInProduction": true, "secret": false },
         "RECORDING_EGRESS_S3_ENDPOINT": { "requiredInProduction": true, "secret": false, "external": true },
