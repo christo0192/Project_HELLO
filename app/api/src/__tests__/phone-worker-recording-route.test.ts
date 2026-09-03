@@ -45,6 +45,8 @@ interface BuildOpts {
   attachDuplicate?: boolean;
   finalizeStatus?: 'ready' | 'fallback_required' | 'pending';
   finalizeThrows?: boolean;
+  markFailedStatus?: 'failed_latched' | 'already_linked' | 'not_worker_inband' | 'attempt_mismatch' | 'session_not_found' | 'latch_failed';
+  markFailedThrows?: boolean;
   /** When set, wires a resolveEngagement dep so an omitted engagement_id can be
    *  resolved server-side (PR A in-worker recorder path). */
   resolveEngagement?: ((attemptId: string) => Promise<{
@@ -83,6 +85,11 @@ function build(opts: BuildOpts = {}) {
     return opts.finalizeStatus ?? 'ready';
   });
 
+  const markRecordingFailed = vi.fn(async () => {
+    if (opts.markFailedThrows) throw new Error('synthetic latch failure');
+    return opts.markFailedStatus ?? 'failed_latched';
+  });
+
   const app = express();
   app.use(express.json());
   app.use(
@@ -93,11 +100,12 @@ function build(opts: BuildOpts = {}) {
       recordingProvider: opts.recordingProvider ?? 'egress',
       uploadSigner: opts.withSigner === false ? undefined : uploadSigner,
       finalizeRecording,
+      markRecordingFailed,
       resolveEngagement: opts.resolveEngagement,
     }),
   );
 
-  return { app, list, attach, finalizeAttemptRecording, stampSessionEgress, createUploadUrl, finalizeRecording };
+  return { app, list, attach, finalizeAttemptRecording, stampSessionEgress, createUploadUrl, finalizeRecording, markRecordingFailed };
 }
 
 function authed(app: express.Express, path: string, body: object) {
@@ -270,6 +278,58 @@ describe('provider=worker complete — drives the finalizer worker branch', () =
     const res = await authed(h.app, COMPLETE, { ...COMPLETE_BODY, sha256: 'tooshort' });
     expect(res.status).toBe(400);
     expect(h.finalizeRecording).not.toHaveBeenCalled();
+  });
+});
+
+describe('provider=worker failed — latches a permanently lost recording', () => {
+  // Live 2026-09-03 (EG_worker_a6cc612d): the worker's upload failed silently,
+  // nothing told the server, and the finalizer retried a never-uploaded key to
+  // exhaustion while the dashboard said "Recording is still processing". The
+  // worker now reports the permanent loss and the server latches the session.
+  const FAILED = '/api/internal/phone-worker/recording/failed';
+  const FAILED_BODY = { attempt_id: ATTEMPT, session_id: SESSION, reason: 'upload_failed' };
+
+  it('latches ⇒ ok:true, and the latch dep receives the session', async () => {
+    const h = build({ recordingProvider: 'worker' });
+    const res = await authed(h.app, FAILED, FAILED_BODY);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, status: 'failed_latched' });
+    expect(h.markRecordingFailed).toHaveBeenCalledWith(SESSION, ATTEMPT);
+  });
+
+  it('an already-linked recording is not clobbered ⇒ ok:false, truthful status', async () => {
+    const h = build({ recordingProvider: 'worker', markFailedStatus: 'already_linked' });
+    const res = await authed(h.app, FAILED, FAILED_BODY);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: false, status: 'already_linked' });
+  });
+
+  it('404s on the egress provider — the endpoint does not exist there', async () => {
+    const h = build({ recordingProvider: 'egress' });
+    const res = await authed(h.app, FAILED, FAILED_BODY);
+    expect(res.status).toBe(404);
+    expect(h.markRecordingFailed).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unbounded reason with 400', async () => {
+    const h = build({ recordingProvider: 'worker' });
+    const res = await authed(h.app, FAILED, { ...FAILED_BODY, reason: 'X'.repeat(65) });
+    expect(res.status).toBe(400);
+    expect(h.markRecordingFailed).not.toHaveBeenCalled();
+  });
+
+  it('requires worker auth', async () => {
+    const h = build({ recordingProvider: 'worker' });
+    const res = await request(h.app).post(FAILED).send(FAILED_BODY);
+    expect(res.status).toBe(401);
+    expect(h.markRecordingFailed).not.toHaveBeenCalled();
+  });
+
+  it('a latch throw is a sanitized 500', async () => {
+    const h = build({ recordingProvider: 'worker', markFailedThrows: true });
+    const res = await authed(h.app, FAILED, FAILED_BODY);
+    expect(res.status).toBe(500);
+    expect(res.body.status).toBe('phone_recording_failed_error');
   });
 });
 

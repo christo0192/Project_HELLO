@@ -242,6 +242,67 @@ class TestInWorkerRecorderLifecycle(unittest.TestCase):
         _begin(r)
         self.assertIsNone(_finish(r))
 
+    # ── finish_failure — the failure must be NAMEABLE (live 2026-09-03) ──
+    # finish() fail-opened to a bare None on every failure, so the caller could
+    # not distinguish "failed" from "nothing to do": the API was never told, its
+    # finalizer retried a never-uploaded object key to exhaustion
+    # (`object_unreadable` x6) and the session sat at "Recording is still
+    # processing" forever. Each failure leg now stamps a bounded reason the
+    # caller reports via /recording/failed.
+    def test_finish_failure_names_the_transcode_leg(self):
+        async def boom_transcode(ogg, mp3):
+            raise RuntimeError("codec_died")
+
+        r, _session, _holder = _make(transcode=boom_transcode)
+        r.wire()
+        _begin(r)
+        self.assertIsNone(_finish(r))
+        self.assertEqual(r.finish_failure, "transcode_failed")
+
+    def test_finish_failure_names_the_empty_output_as_transcode(self):
+        async def empty_transcode(ogg, mp3):
+            Path(mp3).write_bytes(b"")
+
+        r, _session, _holder = _make(transcode=empty_transcode)
+        r.wire()
+        _begin(r)
+        self.assertIsNone(_finish(r))
+        self.assertEqual(r.finish_failure, "transcode_failed")
+
+    def test_finish_failure_names_the_upload_leg(self):
+        async def boom_upload(url, body):
+            raise RuntimeError("upload_failed_status_403")
+
+        r, _session, _holder = _make(upload=boom_upload)
+        r.wire()
+        _begin(r)
+        self.assertIsNone(_finish(r))
+        self.assertEqual(r.finish_failure, "upload_failed")
+
+    def test_finish_failure_names_the_recorder_close_leg(self):
+        r, _session, holder = _make()
+        r.wire()
+        _begin(r)
+
+        async def boom_close():
+            raise RuntimeError("encoder_wedged")
+
+        holder["recorder"].aclose = boom_close
+        self.assertIsNone(_finish(r))
+        self.assertEqual(r.finish_failure, "recorder_close_failed")
+
+    def test_finish_failure_is_none_on_success_and_when_never_begun(self):
+        ok, _session, _holder = _make()
+        ok.wire()
+        _begin(ok)
+        self.assertIsNotNone(_finish(ok))
+        self.assertIsNone(ok.finish_failure)
+
+        never, _s2, _h2 = _make()
+        never.wire()
+        self.assertIsNone(_finish(never))  # nothing begun — not a failure
+        self.assertIsNone(never.finish_failure)
+
 
 @unittest.skipUnless(_HAS_AV, "PyAV/numpy not installed (CI worker env) — validated where present")
 class TestRealPyAvTranscode(unittest.TestCase):

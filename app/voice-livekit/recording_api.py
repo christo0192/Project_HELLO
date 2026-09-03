@@ -129,6 +129,42 @@ async def prepare_recording(
     return {"object_key": object_key, "upload_url": upload_url}
 
 
+async def fail_recording(
+    attempt_id: str,
+    session_id: str,
+    reason: str,
+    *,
+    post: PostFn = _default_post,
+) -> bool:
+    """Tell the server the in-worker recording is PERMANENTLY gone.
+
+    The worker deletes its local OGG/MP3 in ``finish()``'s cleanup, so a failed
+    close/transcode/upload can never be retried from this side — without this
+    report the finalizer keeps re-downloading an object that was never PUT until
+    it exhausts (`object_unreadable` x6, live 2026-09-03) and the session stays
+    `active` ("Recording is still processing") forever. Returns True iff the
+    server latched the failure. Fail-open (False on any error)."""
+    headers = _headers()
+    if headers is None:
+        return False
+    body: dict[str, Any] = {
+        "attempt_id": attempt_id, "session_id": session_id,
+        "reason": str(reason)[:64],
+    }
+    try:
+        resp = await post("POST", f"{API_BASE}{_RECORDING_BASE}/failed", headers, body)
+        data = getattr(resp, "json", lambda: {})()
+    except (ProviderError, BusinessError):
+        _log.info("unknown_event", error_type="phone_recording_failed_report",
+                  error_category="api_error")
+        return False
+    except Exception:  # noqa: BLE001
+        _log.info("unknown_event", error_type="phone_recording_failed_report",
+                  error_category="unexpected")
+        return False
+    return bool(isinstance(data, dict) and data.get("ok"))
+
+
 async def complete_recording(
     attempt_id: str,
     session_id: str,

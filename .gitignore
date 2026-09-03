@@ -13,6 +13,7 @@ service-account*.json
 
 # JavaScript dependencies and build output
 node_modules/
+node_modules
 dist/
 dist-ssr/
 build/

@@ -48,12 +48,27 @@ import asyncio
 import hashlib
 import logging
 import os
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 logger = logging.getLogger("voice-livekit.recording")
+
+# ── LOG VISIBILITY (live 2026-09-03): this logger relied on propagating to a
+# root handler the worker never explicitly configures, and NO recording
+# lifecycle line (started / uploaded / finish_failed) ever reached `fly logs` —
+# a silently-lost upload was indistinguishable from a silent success, and the
+# finalizer retried a key that was never PUT until exhaustion. A dedicated
+# stdout handler guarantees emission regardless of the framework's root logging
+# config; propagation is disabled so a configured root cannot double-print.
+if not logger.handlers:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(logging.Formatter("%(name)s %(levelname)s %(message)s"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
 
 # 48 kHz stereo matches RecorderIO's default mixing rate.
 _SAMPLE_RATE = 48_000
@@ -168,11 +183,25 @@ class InWorkerRecorder:
         self._wired = False
         self._begun = False
         self._failed = False
+        self._finish_failure: Optional[str] = None
 
     @property
     def active(self) -> bool:
         """True once recording has actually begun and has not failed."""
         return self._begun and not self._failed
+
+    @property
+    def finish_failure(self) -> Optional[str]:
+        """Bounded reason code when :meth:`finish` failed AFTER a recording had
+        begun (close/transcode/upload/empty output), else ``None``.
+
+        Live 2026-09-03: `finish()` fail-opened to a bare ``None``, the caller
+        could not distinguish "failed" from "nothing to do", so the API was
+        never told and its finalizer retried a never-uploaded object key to
+        exhaustion (`object_unreadable` x6, egress stuck `active`). The caller
+        reports this reason via `/recording/failed` so the server can latch the
+        session truthfully instead of retrying forever."""
+        return self._finish_failure
 
     def wire(self) -> bool:
         """Install the input/output taps around the session's LIVE audio I/O.
@@ -256,18 +285,33 @@ class InWorkerRecorder:
                 "in_worker_recording_close_failed", extra={"object_key": self._object_key},
                 exc_info=True,
             )
+            self._finish_failure = "recorder_close_failed"
+            # The failure is about to be REPORTED as a permanent loss — the
+            # documented invariant is that a reported failure retains no audio,
+            # so the local OGG must not survive this branch either.
+            self._cleanup()
             return None
 
         mp3_path = self._ogg_path.with_suffix(".mp3")
         try:
-            await self._transcode_fn(self._ogg_path, mp3_path)
-            body = mp3_path.read_bytes()
-            if not body:
-                raise RuntimeError("empty_mp3")
-            await self._upload_fn(upload_url, body)
+            try:
+                await self._transcode_fn(self._ogg_path, mp3_path)
+                body = mp3_path.read_bytes()
+                if not body:
+                    raise RuntimeError("empty_mp3")
+            except Exception:
+                self._finish_failure = "transcode_failed"
+                raise
+            try:
+                await self._upload_fn(upload_url, body)
+            except Exception:
+                self._finish_failure = "upload_failed"
+                raise
         except Exception:  # noqa: BLE001
             logger.warning(
-                "in_worker_recording_finish_failed", extra={"object_key": self._object_key},
+                "in_worker_recording_finish_failed %s",
+                self._finish_failure,
+                extra={"object_key": self._object_key},
                 exc_info=True,
             )
             return None
