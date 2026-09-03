@@ -143,6 +143,19 @@ class TestInWorkerRecorderLifecycle(unittest.TestCase):
         self.assertEqual(uploaded["url"], "https://example.test/put?sig=x")
         self.assertEqual(uploaded["body"], b"ID3fake-mp3-bytes")
 
+    def test_discard_closes_without_uploading_and_disables_finish(self):
+        # No-consent path: close the recorder, upload NOTHING, and a later
+        # finish() must be a no-op so a non-consenting call is never retained.
+        uploaded = {}
+        r, _session, holder = _make(uploaded=uploaded)
+        r.wire()
+        _run(r.begin())
+        _run(r.discard())
+        self.assertIn("aclose", holder["recorder"].calls)
+        self.assertNotIn("url", uploaded)
+        self.assertIsNone(_run(r.finish()))
+        self.assertNotIn("url", uploaded)
+
     def test_finish_without_begin_returns_none(self):
         r, _session, _holder = _make()
         r.wire()

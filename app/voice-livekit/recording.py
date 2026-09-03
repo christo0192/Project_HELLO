@@ -8,14 +8,20 @@ at the moment it is actually played), mixes both onto one synchronized stereo
 timeline (candidate = left, agent = right), resamples, and stream-encodes to
 OGG/Opus with constant memory. No second AudioStream, no hand-rolled mixer.
 
-── ASK FIRST, RECORD SECOND ────────────────────────────────────────────────
-The taps are WIRED at session construction, but recording does not begin until
-:meth:`begin` is called at the consent moment. This is safe because
-``RecorderAudioInput.__anext__`` only accumulates a frame while
-``RecorderIO.recording`` is True (verified against the 1.6.4 wheel), so every
-frame that flows through the tap BEFORE ``start()`` is passed to STT but NEVER
-recorded. The pre-consent disclosure exchange is therefore never captured, with
-no mid-session reassignment of ``session.input/output.audio`` and no race.
+── CONSENT POSTURE: RECORD FROM ANSWER, KEEP ONLY IF CONSENT ────────────────
+This matches the egress posture since migration 0067 (PR160): recording begins
+at ``call.answered`` so the greeting + consent exchange itself is captured, and
+the recording is KEPT only if consent is delivered. If consent is refused (a
+machine pickup, an explicit refusal, or a pre-disclosure deferral), the audio
+must be destroyed — the caller invokes :meth:`discard` instead of :meth:`finish`
+so the local file is deleted and NOTHING is uploaded (there is therefore no
+object for the server-side purge to race against). The upload in :meth:`finish`
+is thus gated by the CALLER on the consent outcome, never performed blindly.
+
+The taps are wired at session construction and :meth:`begin` starts recording at
+answer; ``RecorderAudioInput`` only accumulates while ``RecorderIO.recording`` is
+True (verified against the 1.6.4 wheel), so begin/discard cleanly bound the
+captured window with no mid-session reassignment of ``session.input/output.audio``.
 
 ── FAIL-OPEN ───────────────────────────────────────────────────────────────
 Recording is strictly secondary to the screening happening. Every step here is
@@ -235,6 +241,21 @@ class InWorkerRecorder:
             extra={"object_key": self._object_key, "size_bytes": len(body)},
         )
         return RecordingManifest(sha256=sha256, size_bytes=len(body), duration_ms=duration_ms)
+
+    async def discard(self) -> None:
+        """No-consent path: stop recording and delete the local file WITHOUT
+        uploading. Called instead of :meth:`finish` when consent was refused /
+        a machine answered / a pre-disclosure deferral occurred, so no audio of
+        a non-consenting call is ever retained or uploaded. Fail-open and
+        idempotent."""
+        if self._recorder is not None and self._begun and not self._failed:
+            try:
+                await self._recorder.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+        self._failed = True  # a subsequent finish() becomes a no-op
+        self._cleanup()
+        logger.info("in_worker_recording_discarded", extra={"object_key": self._object_key})
 
     def _probe_duration_ms(self) -> Optional[int]:
         """Best-effort duration from the recorder's started-at anchor. Never

@@ -31,8 +31,13 @@ LiveKit Build free wall = **concurrent egress = 2** (owner hit 3/2). Agent-sessi
 4. **Migration:** add `worker_inband` to the `recording_provenance` domain/enum + any status; additive only. Default flag = egress ⇒ zero behavior change on merge.
 5. **Guardrails:** recording is **fail-open** (if RecorderIO/transcode/upload fails, log + the call proceeds; consent gate already prevents audio-without-binding). Never block the screening. Preserve purge/erasure/quarantine/revocation (they key off objectKey — unchanged).
 
-### Consent timing (MOCK-TEST THIS FIRST)
-Must NOT record the consent ask. Approach: install `record_input`/`record_output` taps at session construction but call `recorder.start(output_path)` only when the consent trigger fires; verify the produced OGG contains NO pre-consent audio (t0 at start()). If pre-start frames leak, fall back to wiring+start both at consent (verify mid-session re-assignment of session.input/output.audio works). This is the single riskiest correctness point.
+### Consent posture — CORRECTED to match 0067/PR160 (record-from-answer, keep-if-consent)
+The egress posture SINCE migration 0067 is **record from `call.answered` (before consent, to capture the greeting + consent exchange), keep ONLY if consent is delivered, PURGE otherwise** (`app/api/src/routes/phone-worker.ts:103,356` — `startRecordingForAttempt` is called on `call.answered` AND idempotently on `disclosure.delivered`; purge events = `disclosure.refused` / machine pickup / `candidate.deferred_pre_disclosure`). The in-worker recorder MUST match this, NOT an ask-first-start:
+- `wire()` at session construction; `begin()` at **`call.answered`** (record from answer).
+- On a terminal that KEEPS (consent delivered): `finish()` → transcode + upload to the objectKey.
+- On a terminal that PURGES (refusal / machine / pre-disclosure deferral): `discard()` → close + delete local, **upload NOTHING** (so there is no object for the server-side purge to race). The caller gates upload on the consent outcome; the recorder never uploads blindly.
+- The attempt-scoped objectKey binding (attach consent gate) still governs findability; the existing purge (keyed by objectKey) already deletes a kept-then-revoked object.
+- MOCK-TEST: begin→discard uploads nothing + disables finish; begin→finish uploads; both audio streams present in a real RecorderIO run.
 
 ### Tests (PR A)
 - API: provider=worker branch returns presigned PUT + preserves the attach consent gate/roles; refusal/pre-disclosure paths still record nothing; finalize worker-branch downloads+hashes+links; provenance migration.
