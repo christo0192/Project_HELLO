@@ -44,7 +44,6 @@ import asyncio
 import hashlib
 import logging
 import os
-import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,9 +53,7 @@ logger = logging.getLogger("voice-livekit.recording")
 
 # 48 kHz stereo matches RecorderIO's default mixing rate.
 _SAMPLE_RATE = 48_000
-# Bounded transcode wall clock — a one-shot ffmpeg burst after the call ends.
-_TRANSCODE_TIMEOUT_SEC = 120
-_MP3_BITRATE = "64k"
+_MP3_BITRATE_BPS = 64_000
 
 
 def recording_provider() -> str:
@@ -89,20 +86,37 @@ def _default_recorder_factory(session: Any, sample_rate: int) -> Any:
 
 
 async def _default_transcode(ogg_path: Path, mp3_path: Path) -> None:
-    """One-shot OGG→MP3 transcode via ffmpeg, off the hot path. Runs in a thread
-    so the event loop is never blocked by the subprocess."""
+    """One-shot OGG→MP3 transcode, off the hot path, IN-PROCESS via PyAV.
+
+    Deliberately NOT an ``ffmpeg`` subprocess: the worker image is
+    ``python:3.12-slim`` with no ffmpeg BINARY, so shelling out silently failed
+    and dropped the recording. PyAV (``av``) is already a guaranteed worker
+    dependency — RecorderIO itself encodes the OGG with it — and its wheel
+    bundles ``libmp3lame``, so the MP3 encode needs no extra binary or image
+    change. Runs in a thread so the encode never blocks the event loop.
+    """
     def _run() -> None:
-        subprocess.run(
-            [
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                "-i", str(ogg_path),
-                "-c:a", "libmp3lame", "-b:a", _MP3_BITRATE,
-                str(mp3_path),
-            ],
-            check=True,
-            timeout=_TRANSCODE_TIMEOUT_SEC,
-            stdin=subprocess.DEVNULL,
-        )
+        import av  # noqa: PLC0415
+
+        in_container = av.open(str(ogg_path))
+        out_container = av.open(str(mp3_path), mode="w")
+        try:
+            in_stream = in_container.streams.audio[0]
+            out_stream = out_container.add_stream("libmp3lame", rate=in_stream.rate)
+            out_stream.bit_rate = _MP3_BITRATE_BPS
+            try:
+                out_stream.layout = in_stream.layout  # preserve stereo (candidate|bot)
+            except Exception:  # noqa: BLE001 — some builds infer layout from frames
+                pass
+            for frame in in_container.decode(in_stream):
+                frame.pts = None
+                for packet in out_stream.encode(frame):
+                    out_container.mux(packet)
+            for packet in out_stream.encode(None):  # flush the encoder tail
+                out_container.mux(packet)
+        finally:
+            in_container.close()
+            out_container.close()
 
     await asyncio.to_thread(_run)
 
