@@ -292,6 +292,48 @@ describe('CandidateJoinPage', () => {
     expect(screen.getAllByText('Hello there')).toHaveLength(1);
   });
 
+  it('shows "Preparing your interview…" on a 202 preparing exchange, then joins when ready', async () => {
+    // On-demand orchestration (§2.3b B-i): the exchange returns
+    // {status:'preparing'} while a cold worker boots (no token, invite
+    // unconsumed), then returns the join token. The client must show a Preparing
+    // state and recover — never drop the candidate into an agent-less room.
+    candidateConsentStatus.mockResolvedValue({
+      has_consent: true,
+      template_version: '1.0',
+      locale: 'en-IN',
+      required_consents: ['ai_interview', 'recording'],
+    });
+    // First call preparing, second call ready.
+    exchangeCandidateInvite
+      .mockResolvedValueOnce({ status: 'preparing' })
+      .mockResolvedValueOnce({
+        url: 'wss://livekit.example.invalid',
+        livekit_token: 'synthetic-livekit-token',
+        session_id: '00000000-0000-4000-8000-000000000001',
+        grant_token: 'b'.repeat(64),
+      });
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+      window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+      renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
+      await user.click(await screen.findByRole('button', { name: 'Join screening' }));
+
+      // The preparing card renders (no token was issued yet).
+      expect(await screen.findByText('Preparing your interview…')).toBeInTheDocument();
+      expect(exchangeCandidateInvite).toHaveBeenCalledTimes(1);
+
+      // Advance past the retry backoff so the second exchange fires and joins.
+      await vi.advanceTimersByTimeAsync(3100);
+      await screen.findByRole('region', { name: 'Live transcript' });
+      expect(exchangeCandidateInvite).toHaveBeenCalledTimes(2);
+      expect(screen.queryByText('Preparing your interview…')).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('mute and unmute toggle the microphone state and accessible label', async () => {
     const track = {
       isMuted: false,

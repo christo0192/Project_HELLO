@@ -11,6 +11,7 @@ import {
 } from 'livekit-client';
 import { api, ApiError } from '../api';
 import type { CandidateConsentTemplate } from '../types';
+import { isPreparingExchange } from '../types';
 import { Button } from '../components/ui';
 import { AudioReadinessStep } from '../components/candidate-join/AudioReadinessStep';
 import { InterviewerAura } from '../components/candidate-join/InterviewerAura';
@@ -55,6 +56,11 @@ const LOCALE = 'en-IN';
 const CANDIDATE_FINALIZE_ATTEMPTS = 6;
 const CANDIDATE_FINALIZE_RETRY_MS = 2000;
 const MAX_LIVE_TRANSCRIPT_SEGMENTS = 100;
+// On-demand orchestration (§2.3b B-i): a cold worker takes ~15-25s to boot. The
+// exchange returns 202 {status:'preparing'} until a worker is ready; the client
+// polls the exchange (invite is NOT consumed) up to this bound before giving up.
+const CANDIDATE_PREPARING_ATTEMPTS = 12;
+const CANDIDATE_PREPARING_RETRY_MS = 3000;
 
 interface LiveTranscriptSegment {
   id: string;
@@ -149,7 +155,7 @@ function plainText(markdown: string): string {
 
 export function CandidateJoinPage() {
   const [phase, setPhase] = useState<JoinPhase>('loading');
-  const [status, setStatus] = useState<'ready' | 'joining' | 'live' | 'ending' | 'ended'>('ready');
+  const [status, setStatus] = useState<'ready' | 'joining' | 'preparing' | 'live' | 'ending' | 'ended'>('ready');
   const [error, setError] = useState<string | null>(null);
   const [template, setTemplate] = useState<CandidateConsentTemplate | null>(null);
   const [checked, setChecked] = useState<Record<string, boolean>>({});
@@ -483,7 +489,26 @@ export function CandidateJoinPage() {
       setMicrophoneMuted(false);
 
       joinStep = 'exchange';
-      const access = await api.exchangeCandidateInvite(invite);
+      // On-demand orchestration (§2.3b B-i): the exchange returns
+      // {status:'preparing'} (HTTP 202) while a cold worker boots — no token,
+      // invite unconsumed. Show "Preparing your interview…" and poll the same
+      // exchange until a worker is ready or the bound is hit. When orchestration
+      // is off (default) the FIRST call returns the join token and this loop
+      // runs exactly once.
+      let access = await api.exchangeCandidateInvite(invite);
+      let preparingAttempts = 0;
+      while (isPreparingExchange(access)) {
+        if (preparingAttempts >= CANDIDATE_PREPARING_ATTEMPTS) {
+          throw new ApiError('screening_room_unavailable', 202);
+        }
+        setStatus('preparing');
+        preparingAttempts += 1;
+        await sleep(CANDIDATE_PREPARING_RETRY_MS);
+        // The invite is still valid — the same one-time token is re-exchanged
+        // (it was NOT consumed by a preparing response).
+        access = await api.exchangeCandidateInvite(invite);
+      }
+      setStatus('joining');
       inviteRef.current = null;
       grantTokenRef.current = access.grant_token;
       sessionIdRef.current = access.session_id;
@@ -624,11 +649,16 @@ export function CandidateJoinPage() {
           </section>
         )}
 
-        {phase === 'granted' && candidateStage === 'readiness' && modernFlow && status !== 'live' && (
+        {phase === 'granted' && candidateStage === 'readiness' && modernFlow && status !== 'live' && status !== 'preparing' && (
           capabilityStatus === 'unsupported'
             ? <div className="candidate-glass-card candidate-landing candidate-status-card" role="alert"><h1>Browser not supported</h1><p className="candidate-error">Your browser does not support the microphone and WebRTC features this screening requires. Please use a current browser over HTTPS.</p></div>
             : <AudioReadinessStep inviteToken={inviteRef.current ?? ''} roleTitle={roleTitle} onBack={() => setCandidateStage(inviteHasConsent ? 'landing' : 'consent')} onReady={(track) => { localTrackRef.current = track; void join(track); }} />
         )}
+
+        {/* On-demand orchestration (§2.3b B-i): a cold worker is booting. No token
+            was issued; the candidate waits here instead of dropping into an
+            agent-less room. Never rendered when orchestration is off. */}
+        {phase === 'granted' && status === 'preparing' && <div className="candidate-glass-card candidate-landing candidate-status-card" role="status" aria-live="polite"><p className="candidate-eyebrow">Almost ready</p><h1>Preparing your interview…</h1><p className="candidate-muted">We’re getting your private interviewer ready. This can take a few moments — please keep this tab open.</p></div>}
 
         {phase === 'granted' && status === 'live' && (
           <section className="candidate-interview" aria-label="Live audio interview">
@@ -641,7 +671,7 @@ export function CandidateJoinPage() {
 
         {phase === 'granted' && status === 'ended' && <div className="candidate-glass-card candidate-landing candidate-status-card"><p className="candidate-eyebrow">{completionKind === 'completed' ? 'Screening complete' : 'Screening closed'}</p><h1>{completionKind === 'completed' ? 'Your screening is complete.' : 'Your screening has been closed.'}</h1><p className="candidate-muted">{completionKind === 'completed' ? 'Thank you for your time. You can now close this browser tab.' : 'You can now close this browser tab.'}</p></div>}
 
-        {phase === 'granted' && status !== 'live' && status !== 'ending' && status !== 'ended' && !modernFlow && (capabilityStatus === 'unsupported' ? <div role="alert" className="candidate-glass-card candidate-landing candidate-status-card"><h1>Browser not supported</h1><p className="candidate-error">Your browser does not support the microphone and WebRTC features this screening requires.</p></div> : <Button className="candidate-primary-cta candidate-fallback-cta" onClick={() => void join()} loading={status === 'joining'}>Join screening</Button>)}
+        {phase === 'granted' && status !== 'live' && status !== 'ending' && status !== 'ended' && status !== 'preparing' && !modernFlow && (capabilityStatus === 'unsupported' ? <div role="alert" className="candidate-glass-card candidate-landing candidate-status-card"><h1>Browser not supported</h1><p className="candidate-error">Your browser does not support the microphone and WebRTC features this screening requires.</p></div> : <Button className="candidate-primary-cta candidate-fallback-cta" onClick={() => void join()} loading={status === 'joining'}>Join screening</Button>)}
 
         {error && phase !== 'error' && <p className="candidate-error" role="alert">{error}</p>}
         <audio ref={remoteAudioRef} autoPlay playsInline className="hidden" />

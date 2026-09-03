@@ -72,13 +72,17 @@ COPY --from=builder /opt/venv /opt/venv
 # `import recording_api` in agent.py, for the PR A in-worker recording glue) and
 # MUST ship for the same reason — a worker that cannot import them crash-loops at
 # startup even though recording is gated OFF unless RECORDING_PROVIDER=worker.
+# worker_ready_api.py was added the same way (`import worker_ready_api` in
+# agent.py, for the PR B on-demand orchestration readiness ping) and MUST ship
+# for the same reason — a worker that cannot import it crash-loops at startup
+# even though the ping is gated OFF unless WORKER_ORCHESTRATION=worker.
 # Deliberately excluded (not on the runtime import path): voice_quality_harness.py,
 # model_governance/, tests/ — see .dockerignore.
 # Limitation: the static closure resolves absolute, relative, and literal-string
 # dynamic imports (importlib.import_module("x")/__import__("x")); a first-party
 # module pulled in only via a computed/non-literal import name cannot be seen
 # statically and must be added here by hand.
-COPY agent.py closing.py observability.py persistence.py phone.py phone_canary.py prompting.py provenance.py provider_resilience.py recording.py recording_api.py ./
+COPY agent.py closing.py observability.py persistence.py phone.py phone_canary.py prompting.py provenance.py provider_resilience.py recording.py recording_api.py worker_ready_api.py ./
 
 USER 1000:1000
 

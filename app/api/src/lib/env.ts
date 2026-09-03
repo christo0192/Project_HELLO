@@ -32,6 +32,10 @@ const _contractVisibleEnvReads = [
   process.env.RECORDING_JOB_REAP_MS,
   process.env.RECORDING_JOB_REAP_AGE_SEC,
   process.env.RECORDING_JOB_REAP_LIMIT,
+  process.env.WORKER_ORCHESTRATION,
+  process.env.FLY_API_TOKEN,
+  process.env.FLY_API_BASE_URL,
+  process.env.WORKER_REAPER_GRACE_SEC,
 ];
 void _contractVisibleEnvReads;
 
@@ -216,4 +220,43 @@ export const env = {
   claudeMaxOutputBytes: positiveInt(
     'CLAUDE_MAX_OUTPUT_BYTES', 5 * 1024 * 1024, 1024, 100 * 1024 * 1024,
   ),
+  // ── PR B: on-demand Fly worker orchestration ──────────────────────────────
+  // Everything here defaults OFF / to a proven value, so a deploy of this build
+  // changes nothing about a running API. The Fly Machines client and the future
+  // reaper are constructed only when `workerOrchestration` is true; until then
+  // no machine is ever started or stopped by this code.
+  /**
+   * Master gate for the whole orchestration. False (default) ⇒ the on-demand
+   * worker lifecycle is inert: no claim/start/wait/reap, no Fly API calls.
+   */
+  workerOrchestration: booleanEnv('WORKER_ORCHESTRATION', false),
+  /**
+   * App-scoped Fly deploy token (secret) used as the Machines API bearer. A
+   * blank token does NOT crash import: the Fly client constructs and every call
+   * fails closed with code 'auth', so callers degrade rather than throw at
+   * startup. Only meaningful when `workerOrchestration` is true.
+   */
+  flyApiToken: process.env.FLY_API_TOKEN ?? '',
+  /** Fly Machines API base origin. Defaults to the allowlisted production origin. */
+  flyApiBaseUrl: process.env.FLY_API_BASE_URL ?? 'https://api.fly.io/v1',
+  /**
+   * Grace period (seconds) a machine may sit `started` with no active session
+   * before the future reaper stops it — the cost-safety backstop (§2.5). Bounds
+   * one grace window of possible cost leak; clamped 30..3600.
+   */
+  workerReaperGraceSec: positiveInt('WORKER_REAPER_GRACE_SEC', 180, 30, 3600),
+  /**
+   * The dispatch name of the NAMED browser worker (design §2.3b B-i). EMPTY by
+   * default, which is byte-identical to today: the browser worker stays UNNAMED
+   * and auto-dispatches into every screening room, and the browser exchange
+   * flow performs NO explicit dispatch and NO worker gate. Only when this is set
+   * AND `workerOrchestration` is on does the exchange flow (1) confirm a ready
+   * on-demand worker before minting a join token and (2) explicitly dispatch
+   * that named worker into the room. The name the API dispatches to MUST equal
+   * the name the worker registers under (BROWSER_AGENT_NAME on the worker) — a
+   * `names_agree` check surfaces a mismatch loudly (PR100 lesson). Naming and
+   * dispatch are introduced TOGETHER behind the same flag precisely because
+   * naming the browser worker silently stops its auto-dispatch.
+   */
+  browserAgentName: process.env.BROWSER_AGENT_NAME ?? '',
 };

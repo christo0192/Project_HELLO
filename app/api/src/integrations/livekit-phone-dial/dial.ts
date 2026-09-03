@@ -77,6 +77,13 @@ export const PHONE_DIAL_REFUSALS = [
   'lease_too_short_for_gate',
   'room_unavailable',
   'lease_too_short',
+  // On-demand orchestration (phone-cost-and-scale-plan §2.3): when the worker
+  // orchestration gate is armed and no ready worker could be confirmed for this
+  // session, the dial is DEFERRED, never placed. Distinct on its own (no
+  // detail), exactly like `runtime_disabled` — the candidate is not dialled
+  // into a room that has no worker to answer. It is inert (never returned) when
+  // no `workerGate` dep is injected, which is the default.
+  'worker_not_ready',
   'originate_failed',
 ] as const;
 
@@ -96,6 +103,14 @@ export interface PhoneDialResult {
   readonly synthetic?: boolean;
   /** Whether the SDK was reached. Asserted directly by the structural tests. */
   readonly providerContacted: boolean;
+  /**
+   * The on-demand Fly machine this dial was gated onto, when the worker
+   * orchestration gate was armed and confirmed a ready worker. Present ONLY on
+   * a `dialing` result that passed the gate; `undefined` otherwise (gate off,
+   * or the dial was refused). Surfaced so a terminal handler can `releaseWorker`
+   * the exact machine; the reaper is the backstop if that release is missed.
+   */
+  readonly machineId?: string;
 }
 
 export interface PhoneDialRequest {
@@ -110,6 +125,41 @@ export interface PhoneDialRequest {
   readonly testGateId?: string;
 }
 
+/**
+ * The on-demand worker gate — the narrow slice of the worker-orchestration
+ * service the dial controller needs (phone-cost-and-scale-plan §2.3).
+ *
+ * ADDITIVE AND OPTIONAL. When this dep is ABSENT (the default, and every path
+ * with `env.workerOrchestration=false`), the controller does not consult it at
+ * all and the dial path is byte-identical to today: no claim, no Fly call, no
+ * new refusal. When it is present, the gate runs after the room/dispatch and
+ * before the originate, and a non-`ready` verdict DEFERS the dial (never
+ * dials).
+ *
+ * `ensureReadyWorker` mirrors the service method, narrowed to the one shape the
+ * controller passes; `releaseWorker` is best-effort teardown of a claim that
+ * was made for a dial this controller then refused before placing it. Both are
+ * kept as a bundle so the controller can never claim a worker it has no way to
+ * release.
+ */
+export interface PhoneWorkerReadyGate {
+  ensureReadyWorker(input: {
+    app: string;
+    pipeline: 'phone';
+    sessionId: string;
+    epoch: number;
+  }): Promise<
+    | { status: 'ready'; machineId: string }
+    | { status: 'no_capacity' }
+    | { status: 'timeout' }
+    | { status: 'error'; code: string }
+    | { status: 'disabled' }
+  >;
+  releaseWorker(input: { app: string; machineId: string; sessionId: string }): Promise<void>;
+  /** The Fly app the phone worker pool lives in. */
+  readonly app: string;
+}
+
 export interface PhoneDialDeps {
   readonly config: PhoneScreeningConfig;
   /** TRANSPORT config, separate from the domain flags. Both must permit. */
@@ -120,6 +170,12 @@ export interface PhoneDialDeps {
   readonly room: ProvisionPhoneRoomDeps;
   /** LiveKit credentials, only to decide "is a room even possible". */
   readonly leaseOwner: string;
+  /**
+   * The on-demand worker gate. ABSENT by default ⇒ the dial path is exactly as
+   * today (no gate, no new refusal). Present ONLY when `env.workerOrchestration`
+   * is on and the runtime wires it — see `runtime.ts`.
+   */
+  readonly workerGate?: PhoneWorkerReadyGate;
 }
 
 /**
@@ -274,12 +330,76 @@ export async function dialPhoneAttempt(
     };
   }
 
+  // ── Gate 4-bis: a READY on-demand worker (only when the gate is armed) ─
+  // phone-cost-and-scale-plan §2.3: with on-demand orchestration on, the phone
+  // worker pool is scaled to zero, so before a carrier is reached we must have
+  // a machine STARTED, REGISTERED and confirmed READY for THIS session. The
+  // dispatch above told a warm/starting worker which room to take; the worker
+  // posts `/internal/voice-worker/ready` once it has resolved that room, and
+  // `ensureReadyWorker` returns 'ready' only after it has READ that state.
+  //
+  // Any non-`ready` verdict DEFERS the dial — no originate, no fabricated
+  // dialed state. The candidate is never dialled into a room with no worker.
+  // The claim `ensureReadyWorker` made for the failing verdicts already cleans
+  // itself up inside the service (invariant I2), so there is nothing to release
+  // on `no_capacity`/`timeout`/`error`. On a `ready` verdict the machine id is
+  // carried out so a terminal handler can release it (reaper backstops).
+  //
+  // ABSENT gate ⇒ this whole block is skipped and the path is byte-identical
+  // to today. `disabled` (the service's own flag-off answer) is treated exactly
+  // like an absent gate: proceed to dial as before.
+  let gatedMachineId: string | undefined;
+  if (deps.workerGate !== undefined) {
+    const gate = await deps.workerGate.ensureReadyWorker({
+      app: deps.workerGate.app,
+      pipeline: 'phone',
+      sessionId: request.sessionId,
+      epoch,
+    });
+    if (gate.status === 'ready') {
+      gatedMachineId = gate.machineId;
+    } else if (gate.status !== 'disabled') {
+      // no_capacity | timeout | error — defer, and touch no carrier. The
+      // service already released/stopped any machine it claimed for this
+      // attempt, so we do not release here.
+      return {
+        status: 'refused',
+        refusal: 'worker_not_ready',
+        detail: gate.status,
+        attemptId,
+        roomName: room.roomName,
+        providerContacted: false,
+      };
+    }
+    // status === 'disabled' falls through: the service's flag is off, so the
+    // gate is inert and the dial proceeds exactly as it does with no gate.
+  }
+
+  // Best-effort release of the worker we gated onto, for the refusal paths
+  // BELOW this point (lease-too-short, originate-failed). A claim we made and
+  // then declined to use must not sit `busy`/`ready`; the reaper would stop it
+  // within one grace window, but releasing promptly returns the pool slot now.
+  // Fail-open: a release failure never changes the refusal we return.
+  const releaseGatedWorker = async (): Promise<void> => {
+    if (gatedMachineId === undefined || deps.workerGate === undefined) return;
+    try {
+      await deps.workerGate.releaseWorker({
+        app: deps.workerGate.app,
+        machineId: gatedMachineId,
+        sessionId: request.sessionId,
+      });
+    } catch {
+      /* fail-open: the reaper backstops */
+    }
+  };
+
   // ── Gate 5: the lease must outlive the originate ────────────────────
   const required = dialConfig.originateTimeoutSeconds + LEASE_MARGIN_SECONDS;
   if (!(await leaseOutlivesOriginate(
     { attemptId, leaseToken, leaseExpiresAt, required, now: request.now },
     deps,
   ))) {
+    await releaseGatedWorker();
     return {
       status: 'refused',
       refusal: 'lease_too_short',
@@ -322,6 +442,7 @@ export async function dialPhoneAttempt(
     // chargeable, and an operator reading the outcome, both need the
     // difference between "we refused" and "we tried and it failed". The error
     // itself is discarded: a provider message may quote the dialled number.
+    await releaseGatedWorker();
     return {
       status: 'refused',
       refusal: 'originate_failed',
@@ -343,6 +464,9 @@ export async function dialPhoneAttempt(
     // reported `providerContacted: true` would make the "synthetic places no
     // call" assertion unfalsifiable.
     providerContacted: !originated.synthetic,
+    // Carried ONLY when the worker gate was armed and confirmed ready. A
+    // terminal handler releases this exact machine; the reaper is the backstop.
+    machineId: gatedMachineId,
   };
 }
 

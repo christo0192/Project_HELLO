@@ -13827,6 +13827,351 @@ end;
 $$;
 
 -- ═══════════════════════════════════════════════════════════════════════
+-- 0079 — voice_worker_leases (on-demand Fly orchestration substrate)
+-- ═══════════════════════════════════════════════════════════════════════
+-- Proves the lease substrate: the table denies anon/authenticated and has
+-- RLS enabled+forced; claim picks exactly one stopped machine and is
+-- idempotent per session; the partial-unique one-active index blocks a
+-- second live claim on one machine AND the same session on two machines;
+-- mark_ready CAS rejects a stale epoch/session; release+reset return the
+-- lease to stopped; list_reapable surfaces only stale non-stopped rows.
+--
+-- The cross-PROCESS "two racing claims never take the same machine"
+-- property (FOR UPDATE SKIP LOCKED under genuine contention) is invisible
+-- from a single session, exactly like the 0040/0042 row-lock races; the
+-- shell harness proves it with a parked blocker. What is proven HERE is
+-- the deterministic consequence a serialisation defect would surface as:
+-- the one-active partial-unique index makes a double-claim on one machine
+-- or one session UNINSERTABLE, so even if two racers reached the UPDATE
+-- the second would be rejected by the index rather than double-book.
+
+select _policy_tests.assert(
+  '0079: voice_worker_leases exists with RLS enabled and forced',
+  to_regclass('screening_v2.voice_worker_leases') is not null
+  and exists (
+    select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'screening_v2' and c.relname = 'voice_worker_leases'
+       and c.relrowsecurity and c.relforcerowsecurity
+  ),
+  'the lease table must have RLS enabled AND forced');
+
+select _policy_tests.assert(
+  '0079: anon and authenticated have zero privilege on voice_worker_leases',
+  not (
+    has_table_privilege('anon', 'screening_v2.voice_worker_leases', 'SELECT')
+    or has_table_privilege('anon', 'screening_v2.voice_worker_leases', 'INSERT')
+    or has_table_privilege('authenticated', 'screening_v2.voice_worker_leases', 'SELECT')
+    or has_table_privilege('authenticated', 'screening_v2.voice_worker_leases', 'INSERT')
+    or has_table_privilege('authenticated', 'screening_v2.voice_worker_leases', 'UPDATE')
+    or has_table_privilege('authenticated', 'screening_v2.voice_worker_leases', 'DELETE')
+  ),
+  'browser roles must have no table privilege on the lease ledger');
+
+select _policy_tests.assert(
+  '0079: the claim/ready RPCs are SECURITY DEFINER, service-role-only',
+  (select bool_and(p.prosecdef
+                   and p.proconfig @> array['search_path=pg_catalog, screening_v2']
+                   and has_function_privilege('service_role', p.oid, 'EXECUTE')
+                   and not has_function_privilege('anon', p.oid, 'EXECUTE')
+                   and not has_function_privilege('authenticated', p.oid, 'EXECUTE'))
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname in ('claim_voice_worker','mark_voice_worker_ready',
+                        'mark_voice_worker_ready_machine',
+                        'mark_voice_worker_busy','heartbeat_voice_worker',
+                        'release_voice_worker','reset_voice_worker',
+                        'list_reapable_voice_workers','register_voice_worker')),
+  'every voice-worker RPC must be SECURITY DEFINER, pinned search_path, service-role-only');
+
+select _policy_tests.assert(
+  '0079: the one-active-session index is UNIQUE and partial over live states',
+  exists (
+    select 1
+      from pg_index i
+      join pg_class ic on ic.oid = i.indexrelid
+     where ic.relname = 'uq_voice_worker_leases_one_active'
+       and i.indisunique
+       and pg_get_expr(i.indpred, i.indrelid) is not null
+       and pg_get_expr(i.indpred, i.indrelid) like '%starting%'
+       and pg_get_expr(i.indpred, i.indrelid) like '%draining%'),
+  'one-session-per-machine must be a PARTIAL UNIQUE index over the non-terminal claim states');
+
+do $$
+declare
+  v_app  constant text := 'pol79-app';
+  v_res  jsonb;
+  v_m1   text; v_m2 text; v_m3 text;
+  v_s1   constant uuid := '79000000-0000-4000-8000-000000000001';
+  v_s2   constant uuid := '79000000-0000-4000-8000-000000000002';
+  v_ep1  bigint; v_ep2 bigint;
+  v_now  constant timestamptz := '2026-09-20T06:00:00Z';
+  v_state text; v_sess uuid; v_count integer; v_reap integer;
+  v_blocked boolean;
+begin
+  -- Clean any prior run of this tag.
+  delete from screening_v2.voice_worker_leases where app = v_app;
+
+  -- Register a three-machine stopped pool (idempotent).
+  perform screening_v2.register_voice_worker(v_app, 'phone', 'm-1', v_now);
+  perform screening_v2.register_voice_worker(v_app, 'phone', 'm-2', v_now);
+  perform screening_v2.register_voice_worker(v_app, 'phone', 'm-3', v_now);
+  -- Re-register one: must not duplicate.
+  v_res := screening_v2.register_voice_worker(v_app, 'phone', 'm-1', v_now);
+
+  select count(*) into v_count from screening_v2.voice_worker_leases where app = v_app;
+  perform _policy_tests.assert(
+    '0079: register is idempotent — three stopped rows, re-register is a no-op',
+    v_count = 3 and v_res->>'status' = 'exists',
+    'expected 3 rows and exists on re-register; got ' || v_count || ' / ' || (v_res->>'status'));
+
+  -- ── claim picks exactly ONE stopped machine, transitions it to starting ──
+  v_res := screening_v2.claim_voice_worker(v_app, 'phone', v_s1, null, v_now);
+  v_m1  := v_res->>'machine_id';
+  v_ep1 := (v_res->>'epoch')::bigint;
+  select count(*) into v_count from screening_v2.voice_worker_leases
+   where app = v_app and state = 'starting';
+  perform _policy_tests.assert(
+    '0079: claim picks exactly one stopped machine and marks it starting',
+    v_res->>'status' = 'claimed' and v_m1 is not null and v_count = 1 and v_ep1 >= 1,
+    'expected one starting machine with a bumped epoch; got status=' || (v_res->>'status')
+      || ' count=' || v_count);
+
+  -- ── claim is idempotent for the SAME session (no second machine) ──
+  v_res := screening_v2.claim_voice_worker(v_app, 'phone', v_s1, null, v_now);
+  select count(*) into v_count from screening_v2.voice_worker_leases
+   where app = v_app and state <> 'stopped';
+  perform _policy_tests.assert(
+    '0079: a re-claim of the same session returns the existing machine, starts no second',
+    v_res->>'machine_id' = v_m1 and v_count = 1,
+    'a retried admit must never start a second machine; got machine=' || (v_res->>'machine_id')
+      || ' active=' || v_count);
+
+  -- ── a DIFFERENT session claims a DIFFERENT machine ──
+  v_res := screening_v2.claim_voice_worker(v_app, 'phone', v_s2, null, v_now);
+  v_m2  := v_res->>'machine_id';
+  perform _policy_tests.assert(
+    '0079: a distinct session is never handed the same machine as another live session',
+    v_res->>'status' = 'claimed' and v_m2 is not null and v_m2 <> v_m1,
+    'two sessions must map to two machines; got ' || v_m1 || ' and ' || coalesce(v_m2,'null'));
+
+  -- ── the partial-unique index blocks a SECOND live claim on ONE machine ──
+  -- Force the exact double-book a SKIP-LOCKED escape would produce: two
+  -- non-terminal rows both bound to a session on the same machine is
+  -- impossible via unique(app,machine_id); instead prove the session side —
+  -- binding ONE session to a second machine is refused by the one-active
+  -- partial unique index.
+  begin
+    update screening_v2.voice_worker_leases
+       set state = 'starting', claimed_session_id = v_s1, epoch = 99, started_at = v_now
+     where app = v_app and machine_id = v_m2;  -- m2 currently holds v_s2
+    v_blocked := false;
+  exception when unique_violation then
+    v_blocked := true;
+  end;
+  perform _policy_tests.assert(
+    '0079: the one-active index refuses binding one session to a second machine',
+    v_blocked,
+    'uq_voice_worker_leases_one_active must make a session double-book UNINSERTABLE');
+
+  -- ── mark_ready CAS: stale epoch is rejected, correct epoch promotes ──
+  v_res := screening_v2.mark_voice_worker_ready(v_app, v_m1, v_s1, v_ep1 - 1, v_now);
+  perform _policy_tests.assert(
+    '0079: mark_ready rejects a stale (lower) epoch as stale',
+    v_res->>'status' = 'stale',
+    'a superseded readiness ping must be fenced; got ' || (v_res->>'status'));
+
+  v_res := screening_v2.mark_voice_worker_ready(v_app, v_m1, v_s1, v_ep1, v_now);
+  select state into v_state from screening_v2.voice_worker_leases
+   where app = v_app and machine_id = v_m1;
+  perform _policy_tests.assert(
+    '0079: mark_ready on the live epoch promotes starting -> ready',
+    v_res->>'status' = 'ready' and v_state = 'ready',
+    'the matching readiness ping must promote to ready; got status=' || (v_res->>'status')
+      || ' state=' || v_state);
+
+  -- ── mark_ready with a WRONG session is rejected ──
+  v_res := screening_v2.mark_voice_worker_ready(v_app, v_m1, v_s2, v_ep1, v_now);
+  perform _policy_tests.assert(
+    '0079: mark_ready rejects a mismatched session',
+    v_res->>'status' = 'stale',
+    'readiness for another session must not promote this machine');
+
+  -- ── busy transition then heartbeat ──
+  v_res := screening_v2.mark_voice_worker_busy(v_app, v_m1, v_s1, v_ep1, v_now);
+  perform _policy_tests.assert(
+    '0079: ready -> busy CAS succeeds on the live claim',
+    v_res->>'status' = 'busy',
+    'the dispatch transition must move ready to busy; got ' || (v_res->>'status'));
+
+  v_res := screening_v2.heartbeat_voice_worker(v_app, v_m1, v_s1,
+             v_now + interval '30 seconds');
+  perform _policy_tests.assert(
+    '0079: heartbeat bumps liveness for a claimed machine',
+    v_res->>'status' = 'ok',
+    'a claimed machine must accept its own heartbeat; got ' || (v_res->>'status'));
+
+  -- ── list_reapable surfaces only STALE non-stopped rows ──
+  -- m1 (busy) last heartbeat at now+30s; m2 (starting) at now; m3 stopped.
+  -- With a 60s grace evaluated at now+120s, m1 (age 90s) and m2 (age 120s)
+  -- are stale; m3 is stopped and must never appear.
+  select count(*) into v_reap
+    from screening_v2.list_reapable_voice_workers(v_app, 60, v_now + interval '120 seconds');
+  perform _policy_tests.assert(
+    '0079: list_reapable surfaces the two stale non-stopped machines, not the stopped one',
+    v_reap = 2
+    and not exists (
+      select 1 from screening_v2.list_reapable_voice_workers(v_app, 60, v_now + interval '120 seconds')
+       where state = 'stopped'),
+    'the reaper candidate list must be exactly the stale non-stopped machines; got ' || v_reap);
+
+  -- A fresh machine within grace is NOT reapable.
+  select count(*) into v_reap
+    from screening_v2.list_reapable_voice_workers(v_app, 600, v_now + interval '10 seconds');
+  perform _policy_tests.assert(
+    '0079: a machine within its grace window is not reapable',
+    v_reap = 0,
+    'nothing past a generous grace should be surfaced; got ' || v_reap);
+
+  -- ── release -> draining, then reset -> stopped, idempotent ──
+  v_res := screening_v2.release_voice_worker(v_app, v_m1, v_s1, v_now);
+  select state into v_state from screening_v2.voice_worker_leases
+   where app = v_app and machine_id = v_m1;
+  perform _policy_tests.assert(
+    '0079: release marks the lease draining',
+    v_res->>'status' = 'draining' and v_state = 'draining',
+    'release must set draining; got status=' || (v_res->>'status') || ' state=' || v_state);
+
+  v_res := screening_v2.reset_voice_worker(v_app, v_m1, v_now);
+  select state, claimed_session_id into v_state, v_sess
+    from screening_v2.voice_worker_leases where app = v_app and machine_id = v_m1;
+  perform _policy_tests.assert(
+    '0079: reset returns the lease to stopped and clears the session',
+    v_res->>'status' = 'stopped' and v_state = 'stopped' and v_sess is null,
+    'reset must free the pool slot; got state=' || v_state
+      || ' session=' || coalesce(v_sess::text,'null'));
+
+  -- Idempotent double release/reset on an already-stopped machine.
+  v_res := screening_v2.release_voice_worker(v_app, v_m1, v_s1, v_now);
+  perform _policy_tests.assert(
+    '0079: releasing an already-reset lease is a safe no-op',
+    v_res->>'status' = 'already_released',
+    'a duplicate release must not error or resurrect the claim; got ' || (v_res->>'status'));
+
+  v_res := screening_v2.reset_voice_worker(v_app, v_m1, v_now);
+  perform _policy_tests.assert(
+    '0079: resetting an already-stopped lease is idempotent',
+    v_res->>'status' = 'stopped',
+    'a duplicate reset must remain stopped; got ' || (v_res->>'status'));
+
+  -- ── the freed machine can be re-claimed (pool cycles) ──
+  v_res := screening_v2.claim_voice_worker(v_app, 'phone', v_s1, null,
+             v_now + interval '5 minutes');
+  perform _policy_tests.assert(
+    '0079: a reset machine returns to the pool and can be re-claimed',
+    v_res->>'status' = 'claimed' and v_res->>'machine_id' is not null,
+    'reset must genuinely return the machine to stopped; got ' || (v_res->>'status'));
+
+  -- ── no_capacity when the pool is exhausted ──
+  -- m1 re-claimed above, m2 still holds v_s2 (starting), m3 stopped -> claim
+  -- m3 then a further claim must report no_capacity.
+  perform screening_v2.claim_voice_worker(v_app, 'phone',
+            '79000000-0000-4000-8000-000000000003'::uuid, null, v_now + interval '5 minutes');
+  v_res := screening_v2.claim_voice_worker(v_app, 'phone',
+            '79000000-0000-4000-8000-000000000004'::uuid, null, v_now + interval '5 minutes');
+  perform _policy_tests.assert(
+    '0079: an exhausted pool returns no_capacity, never a double-booked machine',
+    v_res->>'status' = 'no_capacity',
+    'with every machine claimed a further claim must be refused; got ' || (v_res->>'status'));
+
+  perform _policy_tests.assert(
+    '0079: at most one live claim per machine across the whole run',
+    not exists (
+      select machine_id from screening_v2.voice_worker_leases
+       where app = v_app and state <> 'stopped'
+       group by machine_id having count(*) > 1),
+    'unique(app,machine_id) must keep one live claim per machine');
+
+  perform _policy_tests.assert(
+    '0079: at most one machine per live session across the whole run',
+    not exists (
+      select claimed_session_id from screening_v2.voice_worker_leases
+       where app = v_app and claimed_session_id is not null
+         and state in ('starting','ready','busy','draining')
+       group by claimed_session_id having count(*) > 1),
+    'the one-active index must keep one machine per session');
+
+  -- Leave the database as we found it.
+  delete from screening_v2.voice_worker_leases where app = v_app;
+end;
+$$;
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- 0080 — mark_voice_worker_ready_machine (browser machine-level readiness)
+-- ═══════════════════════════════════════════════════════════════════════
+-- Self-contained (its own app tag + cleanup) so it never perturbs 0079's
+-- carefully-sequenced pool/no_capacity block. Proves the session-less CAS:
+-- it promotes a claimed 'starting' row to 'ready' WITHOUT naming the session
+-- or epoch (the row already carries them from the claim), it is idempotent on
+-- an already-ready row, and it is 'stale' for an unknown/stopped machine.
+do $$
+declare
+  v_app  constant text := 'pol80-app';
+  v_res  jsonb;
+  v_m    text;
+  v_s    constant uuid := '80000000-0000-4000-8000-000000000001';
+  v_now  constant timestamptz := '2026-09-21T06:00:00Z';
+  v_state text;
+begin
+  delete from screening_v2.voice_worker_leases where app = v_app;
+
+  -- A stopped browser pool machine, then a claim binds the session at claim time.
+  perform screening_v2.register_voice_worker(v_app, 'browser', 'b-1', v_now);
+  v_res := screening_v2.claim_voice_worker(v_app, 'browser', v_s, null, v_now);
+  v_m   := v_res->>'machine_id';
+  perform _policy_tests.assert(
+    '0080: a browser claim binds the session and starts the machine',
+    v_res->>'status' = 'claimed' and v_m is not null,
+    'expected a claimed browser machine; got ' || (v_res->>'status'));
+
+  -- Machine-level ready: no session or epoch is passed, yet it promotes.
+  v_res := screening_v2.mark_voice_worker_ready_machine(v_app, v_m, v_now);
+  select state into v_state from screening_v2.voice_worker_leases
+   where app = v_app and machine_id = v_m;
+  perform _policy_tests.assert(
+    '0080: machine-level ready promotes starting -> ready with no session/epoch',
+    v_res->>'status' = 'ready' and v_state = 'ready'
+      and (v_res->>'machine_id') = v_m,
+    'the session-less ready must promote the claimed row; got status='
+      || (v_res->>'status') || ' state=' || v_state);
+
+  -- Idempotent on an already-ready row.
+  v_res := screening_v2.mark_voice_worker_ready_machine(v_app, v_m, v_now);
+  perform _policy_tests.assert(
+    '0080: machine-level ready is idempotent on a ready row',
+    v_res->>'status' = 'ready',
+    'a repeat machine-level ready must stay ready; got ' || (v_res->>'status'));
+
+  -- Unknown / stopped machine has no starting|ready row → stale.
+  v_res := screening_v2.mark_voice_worker_ready_machine(v_app, 'no-such-machine', v_now);
+  perform _policy_tests.assert(
+    '0080: machine-level ready on an unknown machine is stale',
+    v_res->>'status' = 'stale',
+    'a machine with no claimed-starting row must be fenced; got ' || (v_res->>'status'));
+
+  -- After a reset (back to stopped) a machine-level ready is stale — no live
+  -- claim to flip, so a late prewarm ping never resurrects a finished claim.
+  perform screening_v2.reset_voice_worker(v_app, v_m, v_now);
+  v_res := screening_v2.mark_voice_worker_ready_machine(v_app, v_m, v_now);
+  perform _policy_tests.assert(
+    '0080: machine-level ready on a reset (stopped) machine is stale',
+    v_res->>'status' = 'stale',
+    'a stopped row has no starting/ready state to promote; got ' || (v_res->>'status'));
+
+  delete from screening_v2.voice_worker_leases where app = v_app;
+end;
+$$;
+
+-- ═══════════════════════════════════════════════════════════════════════
 -- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)
 -- ═══════════════════════════════════════════════════════════════════════
 

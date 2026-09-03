@@ -8,6 +8,7 @@ import { candidatesRouter } from './routes/candidates.js';
 import { screeningRouter } from './routes/screening.js';
 import { assessRouter, workerAssessRouter } from './routes/assess.js';
 import { phoneWorkerRouter } from './routes/phone-worker.js';
+import { voiceWorkerRouter } from './routes/voice-worker.js';
 import { livekitRouter } from './routes/livekit.js';
 import { invitesRouter } from './routes/invites.js';
 import { recordingsRouter } from './routes/recordings.js';
@@ -243,6 +244,19 @@ export function createApp(opts: CreateAppOptions = {}) {
   // schema's bounds means re-deriving this number — the regression test pins
   // a near-maximum payload so the two cannot drift apart silently.
   app.use('/api/internal/phone', express.json({ limit: '1mb' }), phoneWorkerRouter);
+
+  // Internal readiness surface for the on-demand voice worker (PR B / cost &
+  // scale plan §2). ONE endpoint — POST /ready — which the worker calls on
+  // LiveKit registration so the orchestrator can flip its lease to `ready`
+  // before admitting a caller/candidate. Same constant-time WORKER_CONTEXT_SECRET
+  // boundary as the phone-worker surface, not a recruiter session, and mounted
+  // before recruiter auth for the same reason. A scoped JSON parser is required
+  // here too: the global express.json() is mounted far below (after recruiter
+  // auth), so without this the readiness body is undefined at this router. The
+  // limit is small — four short ids — so 16kb is generous. Disabled by default:
+  // the route 404s while WORKER_ORCHESTRATION is off, having performed no
+  // database work.
+  app.use('/api/internal/voice-worker', express.json({ limit: '16kb' }), voiceWorkerRouter);
 
   // Inbound Ashby webhook receiver. Mounted before recruiter auth because its
   // trust boundary is the HMAC-SHA256 Ashby-Signature verified over the raw

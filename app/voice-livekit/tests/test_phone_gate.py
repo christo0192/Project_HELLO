@@ -593,6 +593,100 @@ class TestWorkerOptions(unittest.TestCase):
                 self.assertNotIn("agent_name", self._build(value))
 
 
+class TestBrowserWorkerNaming(unittest.TestCase):
+    """§2.3b B-i: naming the browser worker + its prewarm readiness post are
+    introduced TOGETHER behind the SAME flag (WORKER_ORCHESTRATION=worker +
+    BROWSER_AGENT_NAME). OFF must be byte-identical to today: unnamed, no
+    prewarm, zero idle processes."""
+
+    def _build(self, env):
+        base = {}
+        with patch.object(agent_mod, "WorkerOptions", _OptionsRecorder):
+            # Clear the two vars first so a leaked value can't taint the run.
+            with patch.dict(agent_mod.os.environ, base, clear=False):
+                for k in ("PHONE_AGENT_NAME", "BROWSER_AGENT_NAME", "WORKER_ORCHESTRATION"):
+                    agent_mod.os.environ.pop(k, None)
+                for k, v in env.items():
+                    agent_mod.os.environ[k] = v
+                try:
+                    agent_mod.build_worker_options()
+                finally:
+                    for k in ("PHONE_AGENT_NAME", "BROWSER_AGENT_NAME", "WORKER_ORCHESTRATION"):
+                        agent_mod.os.environ.pop(k, None)
+        return dict(_OptionsRecorder.last)
+
+    def test_off_flag_with_name_stays_unnamed_no_prewarm(self):
+        # Name present but orchestration OFF ⇒ byte-identical to today: no
+        # agent_name, no prewarm, zero idle. This is the fly.toml-safe property:
+        # the deploy-time name is INERT until the runtime flag is on.
+        opts = self._build({"BROWSER_AGENT_NAME": "browser-screener"})
+        self.assertNotIn("agent_name", opts)
+        self.assertNotIn("prewarm_fnc", opts)
+        self.assertEqual(opts["num_idle_processes"], 0)
+
+    def test_on_flag_without_name_stays_unnamed(self):
+        # Orchestration on but no name ⇒ still unnamed + auto-dispatch (no
+        # half-change). No agent_name, no prewarm.
+        opts = self._build({"WORKER_ORCHESTRATION": "worker"})
+        self.assertNotIn("agent_name", opts)
+        self.assertNotIn("prewarm_fnc", opts)
+        self.assertEqual(opts["num_idle_processes"], 0)
+
+    def test_on_flag_and_name_names_and_prewarms_together(self):
+        opts = self._build({
+            "WORKER_ORCHESTRATION": "worker",
+            "BROWSER_AGENT_NAME": "browser-screener",
+        })
+        self.assertEqual(opts["agent_name"], "browser-screener")
+        # naming and readiness are INSEPARABLE: prewarm posts machine readiness.
+        self.assertIs(opts["prewarm_fnc"], agent_mod._prewarm_post_machine_ready)
+        # one idle process so the prewarm actually fires on a cold machine.
+        self.assertEqual(opts["num_idle_processes"], 1)
+
+    def test_phone_worker_wins_over_browser_name(self):
+        # On the phone app PHONE_AGENT_NAME is set; the browser naming path must
+        # never engage, so the phone worker is UNTOUCHED.
+        opts = self._build({
+            "PHONE_AGENT_NAME": "phone-screener",
+            "WORKER_ORCHESTRATION": "worker",
+            "BROWSER_AGENT_NAME": "browser-screener",
+            "PHONE_JUDGE_API_KEY": "judge-test-key",
+            "PHONE_JUDGE_URL": phone.PHONE_JUDGE_GOOGLE_URL,
+            "PHONE_JUDGE_MODEL": phone.PHONE_JUDGE_GEMINI_MODEL,
+            "PHONE_COVERAGE_TIMEOUT_SEC": "2",
+            "PHONE_JUDGE_RETRIES": "0",
+        })
+        self.assertEqual(opts["agent_name"], "phone-screener")
+        # phone worker does NOT get the browser prewarm.
+        self.assertNotIn("prewarm_fnc", opts)
+
+    def test_prewarm_posts_machine_ready_only_when_named(self):
+        # The prewarm is a no-op unless the browser worker is named + on.
+        # An AsyncMock returns an awaitable that asyncio.run consumes cleanly.
+        with patch.object(
+            agent_mod.worker_ready_api, "post_worker_ready_machine",
+            new=AsyncMock(return_value=True),
+        ) as post:
+            # Not named ⇒ no post.
+            with patch.object(agent_mod, "_browser_worker_named", return_value=False):
+                agent_mod._prewarm_post_machine_ready(None)
+            post.assert_not_called()
+            # Named ⇒ posts exactly once.
+            with patch.object(agent_mod, "_browser_worker_named", return_value=True):
+                agent_mod._prewarm_post_machine_ready(None)
+            post.assert_called_once()
+
+    def test_prewarm_is_fail_open(self):
+        # A prewarm post that raises must NEVER propagate out of process init.
+        with patch.object(agent_mod, "_browser_worker_named", return_value=True):
+            with patch.object(
+                agent_mod.worker_ready_api, "post_worker_ready_machine",
+                side_effect=RuntimeError("boom"),
+            ):
+                # Must not raise.
+                agent_mod._prewarm_post_machine_ready(None)
+
+
 class TestWorkerRoomOwnership(unittest.TestCase):
     def _handles(self, room_name, metadata=None, agent_name=""):
         with patch.object(agent_mod, "_phone_agent_name", return_value=agent_name):

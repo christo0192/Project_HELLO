@@ -27,6 +27,7 @@ import phone
 import phone_canary
 import recording
 import recording_api
+import worker_ready_api
 from closing import ClosingState, ClosingStateMachine
 from observability import (
     Span,
@@ -737,6 +738,64 @@ def _phone_agent_name() -> str:
     return (os.getenv("PHONE_AGENT_NAME") or "").strip()
 
 
+def _browser_agent_name() -> str:
+    """The NAMED browser worker's dispatch name, or "" for the default UNNAMED
+    auto-dispatching browser worker (design §2.3b B-i).
+
+    EMPTY (the default) is byte-identical to today: the browser worker registers
+    with NO ``agent_name`` and LiveKit auto-dispatches it into every screening
+    room. It becomes named ONLY when this is set AND on-demand orchestration is
+    on (``build_worker_options`` requires both), because naming the browser
+    worker silently STOPS auto-dispatch — so the name and the API's explicit
+    dispatch must be introduced together, behind the same flag. Read at call
+    time so the default is observable.
+
+    Only meaningful on the BROWSER app (where PHONE_AGENT_NAME is empty). On the
+    phone app PHONE_AGENT_NAME wins and this is never consulted.
+    """
+    return (os.getenv("BROWSER_AGENT_NAME") or "").strip()
+
+
+def _browser_worker_named() -> bool:
+    """True iff THIS process is the browser worker AND it should run NAMED with
+    explicit dispatch: on-demand orchestration is on, a BROWSER_AGENT_NAME is
+    set, and this is not the phone worker (PHONE_AGENT_NAME wins). This is the
+    single predicate that gates BOTH the ``agent_name`` on WorkerOptions and the
+    prewarm machine-readiness post, so naming and readiness are inseparable."""
+    return (
+        not _phone_agent_name()
+        and bool(_browser_agent_name())
+        and worker_ready_api.worker_orchestration_enabled()
+    )
+
+
+def _prewarm_post_machine_ready(_proc: Any) -> None:
+    """WorkerOptions.prewarm_fnc for the NAMED browser worker: post MACHINE-level
+    readiness (design §2.3b B-i, ready-before-dispatch).
+
+    Fires once per idle process as the worker warms its pool after registering
+    with LiveKit — the earliest session-less moment at which "this machine's
+    worker is up" is true. Posts {app, machine_id} to /ready-machine so the
+    API's ``ensureReadyWorker`` poll can observe `ready` and THEN dispatch. The
+    browser worker never posts the session-keyed ``/ready`` (it does not yet
+    know its session); the phone worker's session-keyed ping is UNTOUCHED.
+
+    prewarm_fnc is called synchronously in the job subprocess, so the async post
+    is driven on a private event loop here. FAIL-OPEN and best-effort: any
+    failure degrades to the API's start-wait budget + reaper and must never
+    raise out of process init (which would fail the warmup)."""
+    if not _browser_worker_named():
+        return
+    try:
+        asyncio.run(worker_ready_api.post_worker_ready_machine())
+    except Exception:  # noqa: BLE001
+        _log.info(
+            "unknown_event",
+            error_type="voice_worker_ready_machine",
+            error_category="prewarm_post_failed",
+        )
+
+
 def _room_metadata_from_context(ctx: JobContext) -> Any:
     """Room metadata blob, if the SDK has one yet. Never logged, never parsed
     for anything except the channel marker."""
@@ -767,20 +826,35 @@ def build_worker_options() -> WorkerOptions:
 
     Unset/empty PHONE_AGENT_NAME must produce byte-for-byte the options the
     browser worker has always had — no `agent_name` key at all, so automatic
-    dispatch is untouched.
+    dispatch is untouched — UNLESS the browser worker is deliberately named for
+    on-demand orchestration (`_browser_worker_named()`), in which case it takes
+    `agent_name = BROWSER_AGENT_NAME` and a prewarm that posts machine-level
+    readiness. Naming and readiness are wired TOGETHER (both behind the same
+    predicate) because naming silently stops auto-dispatch: an off-flag deploy
+    must be byte-identical to today; an on-flag deploy names AND dispatches AND
+    signals readiness, never one without the others.
     """
+    browser_named = _browser_worker_named()
     options: dict[str, Any] = {
         "entrypoint_fnc": entrypoint,
-        # The browser worker keeps its zero-idle memory posture. The named
-        # phone worker is a separate 2 GB app and keeps ONE process warm: the
-        # production call at 09:00 waited for an on-demand process before the
-        # first turn, an avoidable cold-path delay that did not exist at the
-        # conversational layer.
-        "num_idle_processes": 1 if _phone_agent_name() else 0,
+        # The browser worker keeps its zero-idle memory posture WHEN unnamed.
+        # The named phone worker (and the named browser worker under
+        # orchestration) keep ONE process warm: the production call at 09:00
+        # waited for an on-demand process before the first turn, an avoidable
+        # cold-path delay. A named browser worker also needs one idle process so
+        # its prewarm (machine-readiness post) actually fires on a cold machine.
+        "num_idle_processes": 1 if (_phone_agent_name() or browser_named) else 0,
         "initialize_process_timeout": 60.0,
         "job_memory_warn_mb": 1400,
         "job_memory_limit_mb": 0,
     }
+    if browser_named:
+        # The browser worker becomes NAMED + explicit-dispatch. Its prewarm
+        # posts machine-level readiness (ready-before-dispatch). The API
+        # dispatches to this EXACT name (env.browserAgentName) — names_agree.
+        options["agent_name"] = _browser_agent_name()
+        options["prewarm_fnc"] = _prewarm_post_machine_ready
+        return WorkerOptions(**options)
     agent_name = _phone_agent_name()
     if agent_name:
         if phone.phone_coverage_judge_enabled():
@@ -3200,6 +3274,27 @@ async def _run_phone_session(
 ) -> phone.PhoneGateResult:
     """Connect, wait, disclose, classify — then, and only then, screen."""
     await ctx.connect()
+
+    # ── ON-DEMAND ORCHESTRATION: SIGNAL READY BEFORE WAITING FOR ANYONE ──
+    # phone-cost-and-scale-plan §2.3. The moment we are connected to the room
+    # we were dispatched into, tell the API this worker is registered + ready
+    # so its `ensureReadyWorker` poll can stop and let the dial proceed — the
+    # whole point of on-demand start-then-dial is that the candidate is never
+    # dialled before a worker is present. Posted HERE, before the participant
+    # wait, because waiting for the SIP participant is exactly the latency this
+    # signal exists to unblock. Gated OFF by default (WORKER_ORCHESTRATION !=
+    # "worker") and FAIL-OPEN: a lost ping degrades to the API's start-wait
+    # budget + reaper, never to a raised exception into the call path.
+    if worker_ready_api.worker_orchestration_enabled():
+        ready_session_id = phone.session_id_from_room_name(room_name)
+        if ready_session_id is not None:
+            try:
+                await worker_ready_api.post_worker_ready(ready_session_id, epoch)
+            except Exception:  # noqa: BLE001
+                # Belt-and-braces: the client is already fail-open, but the
+                # readiness signal must never be able to fail the screening.
+                pass
+
     events = client if client is not None else phone.PhoneEventClient()
 
     # Construct from server-verified context, never from a post-start mutation.
