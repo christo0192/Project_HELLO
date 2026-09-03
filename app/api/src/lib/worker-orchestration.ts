@@ -469,7 +469,17 @@ function boundReadyTimeout(readyTimeoutSec: number | undefined): number {
  * 0079); the room-liveness check lazily constructs a LiveKit RoomServiceClient
  * from the EXISTING credentials and reports a room live iff it has participants.
  */
-export function createDefaultWorkerOrchestrationService(): WorkerOrchestrationService {
+export function createDefaultWorkerOrchestrationService(
+  overrides: {
+    /**
+     * Room-name scheme for the reaper's liveness cross-check. Defaults to the
+     * phone naming (`phone-<sessionId>`). The browser pipeline injects its own
+     * (`screening-<sessionId>`) so a browser reap checks the correct LiveKit
+     * room. Only the reaper reads this; ensure/release never derive a room name.
+     */
+    roomNameForSession?: (sessionId: string) => string;
+  } = {},
+): WorkerOrchestrationService {
   const client = supabase as unknown as SupabaseClient;
   const fly = createFlyMachinesClient({
     token: env.flyApiToken,
@@ -520,5 +530,8 @@ export function createDefaultWorkerOrchestrationService(): WorkerOrchestrationSe
     fly,
     readLeaseState,
     roomIsLive,
+    ...(overrides.roomNameForSession
+      ? { roomNameForSession: overrides.roomNameForSession }
+      : {}),
   });
 }

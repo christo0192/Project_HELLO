@@ -13877,6 +13877,7 @@ select _policy_tests.assert(
      from pg_proc p join pg_namespace n on n.oid = p.pronamespace
     where n.nspname = 'screening_v2'
       and p.proname in ('claim_voice_worker','mark_voice_worker_ready',
+                        'mark_voice_worker_ready_machine',
                         'mark_voice_worker_busy','heartbeat_voice_worker',
                         'release_voice_worker','reset_voice_worker',
                         'list_reapable_voice_workers','register_voice_worker')),
@@ -14100,6 +14101,72 @@ begin
     'the one-active index must keep one machine per session');
 
   -- Leave the database as we found it.
+  delete from screening_v2.voice_worker_leases where app = v_app;
+end;
+$$;
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- 0080 — mark_voice_worker_ready_machine (browser machine-level readiness)
+-- ═══════════════════════════════════════════════════════════════════════
+-- Self-contained (its own app tag + cleanup) so it never perturbs 0079's
+-- carefully-sequenced pool/no_capacity block. Proves the session-less CAS:
+-- it promotes a claimed 'starting' row to 'ready' WITHOUT naming the session
+-- or epoch (the row already carries them from the claim), it is idempotent on
+-- an already-ready row, and it is 'stale' for an unknown/stopped machine.
+do $$
+declare
+  v_app  constant text := 'pol80-app';
+  v_res  jsonb;
+  v_m    text;
+  v_s    constant uuid := '80000000-0000-4000-8000-000000000001';
+  v_now  constant timestamptz := '2026-09-21T06:00:00Z';
+  v_state text;
+begin
+  delete from screening_v2.voice_worker_leases where app = v_app;
+
+  -- A stopped browser pool machine, then a claim binds the session at claim time.
+  perform screening_v2.register_voice_worker(v_app, 'browser', 'b-1', v_now);
+  v_res := screening_v2.claim_voice_worker(v_app, 'browser', v_s, null, v_now);
+  v_m   := v_res->>'machine_id';
+  perform _policy_tests.assert(
+    '0080: a browser claim binds the session and starts the machine',
+    v_res->>'status' = 'claimed' and v_m is not null,
+    'expected a claimed browser machine; got ' || (v_res->>'status'));
+
+  -- Machine-level ready: no session or epoch is passed, yet it promotes.
+  v_res := screening_v2.mark_voice_worker_ready_machine(v_app, v_m, v_now);
+  select state into v_state from screening_v2.voice_worker_leases
+   where app = v_app and machine_id = v_m;
+  perform _policy_tests.assert(
+    '0080: machine-level ready promotes starting -> ready with no session/epoch',
+    v_res->>'status' = 'ready' and v_state = 'ready'
+      and (v_res->>'machine_id') = v_m,
+    'the session-less ready must promote the claimed row; got status='
+      || (v_res->>'status') || ' state=' || v_state);
+
+  -- Idempotent on an already-ready row.
+  v_res := screening_v2.mark_voice_worker_ready_machine(v_app, v_m, v_now);
+  perform _policy_tests.assert(
+    '0080: machine-level ready is idempotent on a ready row',
+    v_res->>'status' = 'ready',
+    'a repeat machine-level ready must stay ready; got ' || (v_res->>'status'));
+
+  -- Unknown / stopped machine has no starting|ready row → stale.
+  v_res := screening_v2.mark_voice_worker_ready_machine(v_app, 'no-such-machine', v_now);
+  perform _policy_tests.assert(
+    '0080: machine-level ready on an unknown machine is stale',
+    v_res->>'status' = 'stale',
+    'a machine with no claimed-starting row must be fenced; got ' || (v_res->>'status'));
+
+  -- After a reset (back to stopped) a machine-level ready is stale — no live
+  -- claim to flip, so a late prewarm ping never resurrects a finished claim.
+  perform screening_v2.reset_voice_worker(v_app, v_m, v_now);
+  v_res := screening_v2.mark_voice_worker_ready_machine(v_app, v_m, v_now);
+  perform _policy_tests.assert(
+    '0080: machine-level ready on a reset (stopped) machine is stale',
+    v_res->>'status' = 'stale',
+    'a stopped row has no starting/ready state to promote; got ' || (v_res->>'status'));
+
   delete from screening_v2.voice_worker_leases where app = v_app;
 end;
 $$;

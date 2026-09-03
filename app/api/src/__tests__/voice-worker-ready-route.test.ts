@@ -113,3 +113,76 @@ describe('POST /internal/voice-worker/ready', () => {
     expect(res.body).toEqual({ ok: false, error: 'voice_worker_ready_error' });
   });
 });
+
+// ── Browser (§2.3b B-i): the MACHINE-level, session-less readiness ping ──
+const BROWSER_APP = 'project-hello-voice';
+const machineBody = { app: BROWSER_APP, machine_id: MACHINE };
+
+describe('POST /internal/voice-worker/ready-machine', () => {
+  it('marks ready via the session-less RPC (no session_id/epoch sent)', async () => {
+    let seen: { name: string; args: Record<string, unknown> } | null = null;
+    const rpc: VoiceWorkerRpcCaller = async (name, args) => {
+      seen = { name, args };
+      return { data: { status: 'ready', machine_id: MACHINE, epoch: 7 }, error: null };
+    };
+    const res = await request(appWith(rpc))
+      .post('/internal/voice-worker/ready-machine')
+      .set('authorization', `Bearer ${SECRET}`)
+      .send(machineBody);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, status: 'ready' });
+    expect(seen!.name).toBe('mark_voice_worker_ready_machine');
+    // Only app + machine + now — NEVER a session id or epoch.
+    expect(seen!.args).toMatchObject({ p_app: BROWSER_APP, p_machine_id: MACHINE });
+    expect(seen!.args).not.toHaveProperty('p_session_id');
+    expect(seen!.args).not.toHaveProperty('p_epoch');
+  });
+
+  it('stale on no claim: ok:false status:stale', async () => {
+    const rpc: VoiceWorkerRpcCaller = async () => ({ data: { status: 'stale' }, error: null });
+    const res = await request(appWith(rpc))
+      .post('/internal/voice-worker/ready-machine')
+      .set('authorization', `Bearer ${SECRET}`)
+      .send(machineBody);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: false, status: 'stale' });
+  });
+
+  it('404 when disabled, having done NO database work', async () => {
+    let called = false;
+    const rpc: VoiceWorkerRpcCaller = async () => { called = true; return { data: {}, error: null }; };
+    const res = await request(appWith(rpc, false))
+      .post('/internal/voice-worker/ready-machine')
+      .set('authorization', `Bearer ${SECRET}`)
+      .send(machineBody);
+    expect(res.status).toBe(404);
+    expect(called).toBe(false);
+  });
+
+  it('auth required: no bearer → 401', async () => {
+    const rpc: VoiceWorkerRpcCaller = async () => ({ data: { status: 'ready' }, error: null });
+    const res = await request(appWith(rpc))
+      .post('/internal/voice-worker/ready-machine')
+      .send(machineBody);
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects a body carrying a session_id (strict schema) → 400', async () => {
+    const rpc: VoiceWorkerRpcCaller = async () => ({ data: { status: 'ready' }, error: null });
+    const res = await request(appWith(rpc))
+      .post('/internal/voice-worker/ready-machine')
+      .set('authorization', `Bearer ${SECRET}`)
+      .send({ ...machineBody, session_id: SESSION, epoch: 1 });
+    expect(res.status).toBe(400);
+  });
+
+  it('driver error → sanitized 500', async () => {
+    const rpc: VoiceWorkerRpcCaller = async () => ({ data: null, error: { message: 'boom' } });
+    const res = await request(appWith(rpc))
+      .post('/internal/voice-worker/ready-machine')
+      .set('authorization', `Bearer ${SECRET}`)
+      .send(machineBody);
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ ok: false, error: 'voice_worker_ready_error' });
+  });
+});

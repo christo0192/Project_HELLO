@@ -52,6 +52,22 @@ const readySchema = z
   .strict();
 
 /**
+ * The BROWSER worker's readiness ping — MACHINE-level, session-less.
+ *
+ * The named browser worker learns its session only from the dispatch it has
+ * not yet received (ready-before-dispatch, design §2.3b B-i). At registration
+ * it knows only (app, machine_id), so it posts THIS shape and the API flips the
+ * row it already claimed (which already carries session + epoch) to `ready`.
+ * See migration 0080 for the epoch-safety argument.
+ */
+const readyMachineSchema = z
+  .object({
+    app: z.string().regex(FLY_ID_RE),
+    machine_id: z.string().regex(FLY_ID_RE),
+  })
+  .strict();
+
+/**
  * The service-role RPC caller. Mirrors `supabase.rpc(name, args)`; injected so
  * a test needs no database. Returns the jsonb `{status,...}` envelope.
  */
@@ -138,6 +154,45 @@ export function createVoiceWorkerRouter(deps: VoiceWorkerRouterDeps = {}): Route
       // answer — is forwarded as not-ok so the worker does not proceed on a
       // fenced or unknown claim.
       log.info('unknown_event', { error_category: 'voice_worker_ready_stale' });
+      return res.json({ ok: false, status: typeof status === 'string' ? status : 'stale' });
+    } catch {
+      return res.status(500).json({ ok: false, error: 'voice_worker_ready_error' });
+    }
+  });
+
+  // ── POST /ready-machine — the BROWSER worker's session-less readiness ──
+  // Same auth, same master gate, same 404-when-disabled posture as /ready.
+  // Drops session_id/epoch: the browser worker posts this at registration,
+  // before it knows its session (ready-before-dispatch). The API flips the
+  // already-claimed row for (app, machine_id) to `ready` via the session-less
+  // RPC 0080. A stale/absent claim answers `stale` and the worker does not
+  // proceed — but the worker treats readiness as fail-open anyway, so the
+  // API's start-wait budget + reaper are the true backstops.
+  router.post('/ready-machine', requireWorkerPhoneAuth, async (req, res) => {
+    try {
+      if (!enabled) {
+        return res.status(404).json({ ok: false, error: 'not_found' });
+      }
+      const parsed = readyMachineSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ ok: false, error: 'invalid_request' });
+      }
+      const { data, error } = await rpc('mark_voice_worker_ready_machine', {
+        p_app: parsed.data.app,
+        p_machine_id: parsed.data.machine_id,
+        p_now: now().toISOString(),
+      });
+      if (error) {
+        return res.status(500).json({ ok: false, error: 'voice_worker_ready_error' });
+      }
+      const status = (data && typeof data === 'object' && !Array.isArray(data)
+        ? (data as Record<string, unknown>).status
+        : undefined);
+      if (status === 'ready') {
+        log.info('unknown_event', { error_category: 'voice_worker_ready_machine' });
+        return res.json({ ok: true, status: 'ready' });
+      }
+      log.info('unknown_event', { error_category: 'voice_worker_ready_machine_stale' });
       return res.json({ ok: false, status: typeof status === 'string' ? status : 'stale' });
     } catch {
       return res.status(500).json({ ok: false, error: 'voice_worker_ready_error' });

@@ -1054,7 +1054,11 @@ describe('OpenAPI document integrity', () => {
     // on-demand voice worker's readiness handshake. Same worker-authenticated
     // surface (WORKER_CONTEXT_SECRET), gated on WORKER_ORCHESTRATION and 404 when
     // off; widens no recruiter-facing route. 114 + 1 = 115.
-    expect(Object.keys(paths).length).toBe(115);
+    // PR B (browser, §2.3b B-i) adds ONE more internal path —
+    // /api/internal/voice-worker/ready-machine — the named browser worker's
+    // session-less MACHINE-level readiness ping (ready-before-dispatch). Same
+    // worker-authenticated surface, same 404-when-off posture. 115 + 1 = 116.
+    expect(Object.keys(paths).length).toBe(116);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -1120,7 +1124,11 @@ describe('OpenAPI document integrity', () => {
     // strict request/response pair of the on-demand worker readiness ping. Both
     // carry additionalProperties:false; the response documents only {ok, status}
     // and never a session id or token. 230 + 2 = 232.
-    expect(Object.keys(schemas).length).toBe(232);
+    // PR B (browser, §2.3b B-i) adds ONE: VoiceWorkerReadyMachineRequest, the
+    // strict {app, machine_id} body of the session-less machine-level readiness
+    // ping. additionalProperties:false, no session/epoch (the worker does not yet
+    // know its session); the response reuses VoiceWorkerReadyResponse. 232 + 1 = 233.
+    expect(Object.keys(schemas).length).toBe(233);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.
@@ -1350,6 +1358,9 @@ describe('auth boundary vs spec security model', () => {
     // is off it 404s, but the auth middleware sits BEFORE the flag check, so an
     // unauthenticated request is refused 401 regardless.)
     'POST /api/internal/voice-worker/ready',
+    // PR B (browser, §2.3b B-i): the session-less machine-level readiness ping,
+    // same worker-authenticated surface, same 401/404 boundary as /ready.
+    'POST /api/internal/voice-worker/ready-machine',
     // Ashby webhook: HMAC-gated (not recruiter-authenticated), mounted pre-auth.
     'POST /api/integrations/ashby/webhook',
     // LiveKit phone webhook: JWT-gated (not recruiter-authenticated), mounted

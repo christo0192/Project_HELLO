@@ -253,6 +253,30 @@ export interface CandidateInviteExchangeResult {
   livekit_token: string;
 }
 
+/**
+ * On-demand orchestration (design §2.3b B-i): when the browser worker pool is
+ * scaled to zero and no ready worker could be confirmed for this session, the
+ * exchange returns 202 `{status:'preparing'}` instead of a join token. The
+ * candidate is shown "Preparing your interview…" and retries; the one-time
+ * invite is NOT consumed, so a retry is meaningful. When orchestration is off
+ * (default) this shape never occurs and the exchange always returns the full
+ * `CandidateInviteExchangeResult`.
+ */
+export interface CandidateInvitePreparingResult {
+  status: 'preparing';
+}
+
+export type CandidateInviteExchangeResponse =
+  | CandidateInviteExchangeResult
+  | CandidateInvitePreparingResult;
+
+/** Narrow the exchange response to the preparing (no-token) branch. */
+export function isPreparingExchange(
+  r: CandidateInviteExchangeResponse,
+): r is CandidateInvitePreparingResult {
+  return (r as CandidateInvitePreparingResult).status === 'preparing';
+}
+
 export interface TurnResult {
   message: string;
   done: boolean;

@@ -245,4 +245,18 @@ export const env = {
    * one grace window of possible cost leak; clamped 30..3600.
    */
   workerReaperGraceSec: positiveInt('WORKER_REAPER_GRACE_SEC', 180, 30, 3600),
+  /**
+   * The dispatch name of the NAMED browser worker (design §2.3b B-i). EMPTY by
+   * default, which is byte-identical to today: the browser worker stays UNNAMED
+   * and auto-dispatches into every screening room, and the browser exchange
+   * flow performs NO explicit dispatch and NO worker gate. Only when this is set
+   * AND `workerOrchestration` is on does the exchange flow (1) confirm a ready
+   * on-demand worker before minting a join token and (2) explicitly dispatch
+   * that named worker into the room. The name the API dispatches to MUST equal
+   * the name the worker registers under (BROWSER_AGENT_NAME on the worker) — a
+   * `names_agree` check surfaces a mismatch loudly (PR100 lesson). Naming and
+   * dispatch are introduced TOGETHER behind the same flag precisely because
+   * naming the browser worker silently stops its auto-dispatch.
+   */
+  browserAgentName: process.env.BROWSER_AGENT_NAME ?? '',
 };

@@ -164,5 +164,63 @@ class TestPostWorkerReady(unittest.TestCase):
                 self.assertFalse(_run(api.post_worker_ready("s", 1, post=post)))
 
 
+class TestPostWorkerReadyMachine(unittest.TestCase):
+    """The BROWSER worker's session-less machine-level readiness ping."""
+
+    def test_ready_machine_shapes_request_and_returns_true(self):
+        with _EnvGuard():
+            _arm()
+            os.environ["FLY_APP_NAME"] = "project-hello-voice"
+            cap = {}
+            post = _poster({"ok": True, "status": "ready"}, captured=cap)
+            ok = _run(api.post_worker_ready_machine(post=post))
+            self.assertTrue(ok)
+            self.assertEqual(cap["method"], "POST")
+            self.assertTrue(cap["url"].endswith(
+                "/api/internal/voice-worker/ready-machine"))
+            self.assertEqual(cap["headers"]["Authorization"], "Bearer s3cr3t")
+            # NO session_id / epoch — only app + machine_id.
+            self.assertEqual(cap["body"], {
+                "app": "project-hello-voice", "machine_id": "d891ee23",
+            })
+            self.assertNotIn("session_id", cap["body"])
+            self.assertNotIn("epoch", cap["body"])
+
+    def test_noop_when_flag_off(self):
+        with _EnvGuard():
+            _arm()
+            os.environ["WORKER_ORCHESTRATION"] = "off"
+            called = {"n": 0}
+
+            async def post(*_a, **_k):
+                called["n"] += 1
+                return _Resp({"ok": True})
+
+            self.assertFalse(_run(api.post_worker_ready_machine(post=post)))
+            self.assertEqual(called["n"], 0)
+
+    def test_fails_closed_without_identity(self):
+        with _EnvGuard():
+            _arm()
+            os.environ.pop("FLY_MACHINE_ID", None)
+            post = _poster({"ok": True})
+            self.assertFalse(_run(api.post_worker_ready_machine(post=post)))
+
+    def test_explicit_overrides(self):
+        with _EnvGuard():
+            _arm()
+            cap = {}
+            post = _poster({"ok": True}, captured=cap)
+            _run(api.post_worker_ready_machine(app="b-app", machine_id="mX", post=post))
+            self.assertEqual(cap["body"], {"app": "b-app", "machine_id": "mX"})
+
+    def test_fail_open_on_errors(self):
+        with _EnvGuard():
+            _arm()
+            for exc in (ProviderError("x"), BusinessError(), RuntimeError("z")):
+                post = _poster(raise_exc=exc)
+                self.assertFalse(_run(api.post_worker_ready_machine(post=post)))
+
+
 if __name__ == "__main__":
     unittest.main()

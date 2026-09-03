@@ -41,6 +41,7 @@ _log = StructuredLogger("worker-ready-api")
 
 API_BASE = os.getenv("API_BASE", "http://localhost:8787")
 _READY_URL = "/api/internal/voice-worker/ready"
+_READY_MACHINE_URL = "/api/internal/voice-worker/ready-machine"
 _API_TIMEOUT_SEC = 15.0
 
 _READY_BREAKER = CircuitBreaker(CircuitBreakerConfig(
@@ -157,6 +158,53 @@ async def post_worker_ready(
         return False
     except Exception:  # noqa: BLE001
         _log.info("unknown_event", error_type="voice_worker_ready",
+                  error_category="unexpected")
+        return False
+    return bool(isinstance(data, dict) and data.get("ok"))
+
+
+async def post_worker_ready_machine(
+    *,
+    app: Optional[str] = None,
+    machine_id: Optional[str] = None,
+    post: PostFn = _default_post,
+) -> bool:
+    """Tell the API this MACHINE's worker process is up and registered.
+
+    The BROWSER worker (named, explicit dispatch — design §2.3b B-i) posts THIS
+    at registration/prewarm, BEFORE it knows its session, so the API's
+    ready-before-dispatch gate can confirm readiness and only THEN dispatch. It
+    carries only {app, machine_id}; the API flips the row it already claimed
+    (which already holds the session + epoch) to `ready` via the session-less
+    RPC (migration 0080). See ``post_worker_ready`` for the session-keyed phone
+    variant, which is UNCHANGED by this.
+
+    Same gate, auth, transport and fail-open contract as ``post_worker_ready``:
+    a no-op returning False when orchestration is off or the Fly identity /
+    worker secret is unavailable, and False (never a raised exception) on any
+    transport/HTTP failure. Fail-open — the caller must NOT block on the result;
+    the API's start-wait budget and the reaper are the backstops."""
+    if not worker_orchestration_enabled():
+        return False
+    resolved_app = app if app is not None else worker_app_name()
+    resolved_machine = machine_id if machine_id is not None else worker_machine_id()
+    if not resolved_app or not resolved_machine:
+        _log.info("unknown_event", error_type="voice_worker_ready_machine",
+                  error_category="identity_missing")
+        return False
+    headers = _headers()
+    if headers is None:
+        return False
+    body: dict[str, Any] = {"app": resolved_app, "machine_id": resolved_machine}
+    try:
+        resp = await post("POST", f"{API_BASE}{_READY_MACHINE_URL}", headers, body)
+        data = getattr(resp, "json", lambda: {})()
+    except (ProviderError, BusinessError):
+        _log.info("unknown_event", error_type="voice_worker_ready_machine",
+                  error_category="api_error")
+        return False
+    except Exception:  # noqa: BLE001
+        _log.info("unknown_event", error_type="voice_worker_ready_machine",
                   error_category="unexpected")
         return False
     return bool(isinstance(data, dict) and data.get("ok"))

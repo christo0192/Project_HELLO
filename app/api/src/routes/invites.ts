@@ -51,8 +51,29 @@ import {
   requireLiveKitConfigured,
 } from '../lib/room-provisioning.js';
 import { validateInvite, STABLE_INVITE_ERROR } from '../lib/invite-validation.js';
+import {
+  browserOrchestrationGate,
+  type BrowserWorkerGate,
+} from '../lib/browser-orchestration.js';
 
 export const invitesRouter = Router();
+
+/**
+ * The browser on-demand worker gate, or null when the naming+dispatch pairing
+ * is OFF (design §2.3b B-i). Injectable so a test can drive both the ready and
+ * the preparing paths without Fly/LiveKit; production defaults to the env-gated
+ * `browserOrchestrationGate`, which returns null unless `workerOrchestration`
+ * is on AND `browserAgentName` is set — i.e. the exchange flow is
+ * byte-identical to today by default.
+ */
+let resolveBrowserGate: () => BrowserWorkerGate | null = () => browserOrchestrationGate();
+
+/** Test seam: override the browser gate resolver. */
+export function __setBrowserGateResolverForTest(
+  resolver: () => BrowserWorkerGate | null,
+): void {
+  resolveBrowserGate = resolver;
+}
 
 // LiveKit configuration guard, deterministic room naming, PII-free room
 // metadata and room/egress provisioning all live in lib/room-provisioning.ts,
@@ -425,6 +446,49 @@ invitesRouter.post(
         return res.status(404).json({ error: STABLE_EXPIRY_MSG });
       }
 
+      // ── Step 2c: READY-BEFORE-DISPATCH browser worker gate ──────────────
+      // design §2.3b B-i. When on-demand orchestration is on AND the browser
+      // worker is NAMED (browserAgentName set), the pool is scaled to zero, so
+      // before we mint a join token we must (1) confirm a machine STARTED,
+      // REGISTERED and READY for THIS session, then (2) EXPLICITLY dispatch the
+      // named worker into the room. Naming stops auto-dispatch, so the explicit
+      // dispatch is introduced in the SAME gate — never a token into an
+      // agent-less room.
+      //
+      // Ordered BEFORE the one-time invite is consumed (Step 3) so any
+      // non-ready verdict — no_capacity / timeout / error, or a failed dispatch
+      // — leaves the invite REUSABLE and returns a "preparing/try-again" status
+      // (202) instead of a broken join. The candidate is shown "Preparing your
+      // interview…" and retries; the reaper stops any machine we claimed.
+      //
+      // OFF (default) ⇒ `gate` is null: the block is skipped entirely, the
+      // unnamed worker auto-dispatches, and this path is byte-identical to
+      // today. `disabled` (the service's own flag-off answer) is treated like a
+      // null gate.
+      const browserGate = resolveBrowserGate();
+      let gatedMachineId: string | undefined;
+      if (browserGate !== null) {
+        const ready = await browserGate.ensureReadyWorker({ sessionId: session.id as string });
+        if (ready.status === 'ready') {
+          gatedMachineId = ready.machineId;
+          const dispatched = await browserGate.dispatch({ sessionId: session.id as string, roomName });
+          if (!dispatched) {
+            // The worker is ready but the room could not be given an agent.
+            // Release the claim and defer — never mint a token into an
+            // agent-less room. Invite stays unconsumed.
+            await browserGate.releaseWorker({ machineId: gatedMachineId, sessionId: session.id as string });
+            return res.status(202).json({ status: 'preparing' });
+          }
+        } else if (ready.status !== 'disabled') {
+          // no_capacity | timeout | error — the service already released/stopped
+          // any machine it claimed for this session (invariant I2), so there is
+          // nothing to release here. Defer with the invite unconsumed.
+          return res.status(202).json({ status: 'preparing' });
+        }
+        // status === 'disabled' falls through: the service's flag is off, so the
+        // gate is inert and the exchange proceeds exactly as with no gate.
+      }
+
       // Step 3: Atomic CAS — update consumed_at where consumed_at IS NULL.
       const nowIso = new Date().toISOString();
       const { data: consumed, error: consumeErr } = await supabase
@@ -454,6 +518,12 @@ invitesRouter.post(
         invite.session_id,
         roomName,
       );
+
+      // The claimed browser machine (when the gate is on) is released at
+      // session end — the terminal transition + the reaper own its lifecycle,
+      // exactly as the phone path leaves release to the terminal handler and
+      // the reaper backstop. We do NOT release here: the session is now live.
+      void gatedMachineId;
 
       res.status(200).json({
         grant_token: grant.grantToken,

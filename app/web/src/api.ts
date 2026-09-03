@@ -44,7 +44,7 @@ import type {
   CandidatePreflightResult,
   CandidateDetail,
   CandidatesSummary,
-  CandidateInviteExchangeResult,
+  CandidateInviteExchangeResponse,
   CandidateInviteResult,
   ConsentCheckResponse,
   ConsentSubmitInput,
@@ -230,7 +230,11 @@ export const api = {
       body: JSON.stringify({ candidate_id: candidateId, session_id: sessionId }),
     }),
   exchangeCandidateInvite: (token: string) =>
-    request<CandidateInviteExchangeResult>('/api/livekit/exchange', {
+    // 200 → full CandidateInviteExchangeResult (join token). 202 → a
+    // {status:'preparing'} body when on-demand orchestration could not confirm a
+    // ready worker (design §2.3b B-i); the invite is not consumed, so the caller
+    // shows "Preparing your interview…" and retries.
+    request<CandidateInviteExchangeResponse>('/api/livekit/exchange', {
       method: 'POST',
       body: JSON.stringify({ token }),
     }),
