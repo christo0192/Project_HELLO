@@ -85,6 +85,66 @@ class TestDeflectionGateOpened(unittest.TestCase):
             phone.PHONE_SUBSTANCE_CLARIFICATION,
         )
 
+    # ── Review repairs (2026-09-03): the gate must not EAT real answers ──
+    def test_sorry_with_question_mark_is_a_clarification(self):
+        # The first draft's `sorry\s*\?` sat inside a \b-closed group; \b after
+        # a literal '?' never matches at end-of-utterance, so the canonical
+        # didn't-hear-you deflection scored substantive (review find).
+        for text in ("Sorry?", "sorry ?", "Sorry? I missed that."):
+            with self.subTest(text):
+                self.assertEqual(
+                    phone.phone_turn_substance(text),
+                    phone.PHONE_SUBSTANCE_CLARIFICATION,
+                )
+
+    def test_exemplifier_and_reported_speech_answers_stay_substantive(self):
+        # Every one of these is a COMPLETE answer that the first draft's
+        # loosening misclassified (verified live by the review agents):
+        # 'as in' exemplifiers, third-person 'didn't mention', reported
+        # speech, and long narratives around weak phrases.
+        for text in (
+            "Around 55,000 as in hand salary per month.",
+            "I joined as in-house sales counsel in 2021 and grew the desk.",
+            "My manager didn't mention the deadline had moved, so I set up a "
+            "weekly sync with the ops team to keep everyone aligned.",
+            "We had two microservices and the team debated which one to "
+            "migrate first, so I built a scoring matrix comparing blast "
+            "radius, traffic, and rollback cost before we committed to either "
+            "of them in production.",
+            "In retail we always thank the customer and say come again, and I "
+            "carried that same warmth into my counseling calls every single "
+            "day because people remember exactly how you make them feel.",
+            "If you mean the AI programs I built two of them last year and "
+            "both are still in production today.",
+        ):
+            with self.subTest(text[:40]):
+                self.assertEqual(
+                    phone.phone_turn_substance(text),
+                    phone.PHONE_SUBSTANCE_SUBSTANTIVE,
+                )
+
+    def test_route_and_substance_gate_share_one_classifier(self):
+        # The live turn hook consults candidate_turn_route FIRST; the commit
+        # gate consults phone_turn_substance. The first draft gave them
+        # different vocabularies and different length bounds, so one utterance
+        # could be spoken to as an answer while its commit was skipped —
+        # desynchronizing the cursor (review find). Pin the alignment on both
+        # the clarification and the substantive side.
+        clarifying = "Like you're talking about the notice period?"
+        self.assertEqual(phone.candidate_turn_route(clarifying), "candidate_question")
+        self.assertEqual(
+            phone.phone_turn_substance(clarifying), phone.PHONE_SUBSTANCE_CLARIFICATION,
+        )
+        narrative = (
+            "I've closed admissions for two years — as in, direct B2C "
+            "counseling and closing roles — and exceeded quota every quarter "
+            "while mentoring the two newest advisors on my team."
+        )
+        self.assertIsNone(phone.candidate_turn_route(narrative))
+        self.assertEqual(
+            phone.phone_turn_substance(narrative), phone.PHONE_SUBSTANCE_SUBSTANTIVE,
+        )
+
 
 class TestConflictRepursuit(unittest.TestCase):
     """F7 — one concrete, kind re-pursuit when the probe is brushed off."""

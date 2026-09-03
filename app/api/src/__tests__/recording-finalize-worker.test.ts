@@ -296,7 +296,7 @@ describe('worker-inband failure latching (live 2026-09-03, EG_worker_a6cc612d)',
         { recording_egress_id: WORKER_EGRESS_ID, recording_object_key: null },
       ],
     });
-    const status = await markWorkerRecordingFailed(SESSION, { db });
+    const status = await markWorkerRecordingFailed(SESSION, ATTEMPT, { db });
     expect(status).toBe('failed_latched');
     const latch = updates.find((u) => u.recording_egress_status === 'failed');
     expect(latch).toBeDefined();
@@ -310,7 +310,7 @@ describe('worker-inband failure latching (live 2026-09-03, EG_worker_a6cc612d)',
         { recording_egress_id: WORKER_EGRESS_ID, recording_object_key: OBJECT_KEY },
       ],
     });
-    expect(await markWorkerRecordingFailed(SESSION, { db })).toBe('already_linked');
+    expect(await markWorkerRecordingFailed(SESSION, ATTEMPT, { db })).toBe('already_linked');
     expect(updates).toHaveLength(0);
   });
 
@@ -320,7 +320,7 @@ describe('worker-inband failure latching (live 2026-09-03, EG_worker_a6cc612d)',
         { recording_egress_id: 'EG_realegress123', recording_object_key: null },
       ],
     });
-    expect(await markWorkerRecordingFailed(SESSION, { db })).toBe('not_worker_inband');
+    expect(await markWorkerRecordingFailed(SESSION, ATTEMPT, { db })).toBe('not_worker_inband');
     expect(updates).toHaveLength(0);
   });
 
@@ -380,5 +380,19 @@ describe('worker-inband failure latching (live 2026-09-03, EG_worker_a6cc612d)',
     const status = await finalizeWorkerInbandRecording(SESSION, { db });
     expect(status).toBe('pending');
     expect(updates.find((u) => u.recording_egress_status === 'failed')).toBeUndefined();
+  });
+});
+
+describe('markWorkerRecordingFailed — attempt binding + truthful latch outcome (review repairs)', () => {
+  it("a STALE attempt's late report cannot latch a session a newer attempt re-prepared", async () => {
+    const NEWER_ATTEMPT = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
+    const { db, updates } = fakeDb({
+      callSessionRows: [
+        // The session's CURRENT binding belongs to the newer attempt.
+        { recording_egress_id: `EG_worker_${NEWER_ATTEMPT}`, recording_object_key: null },
+      ],
+    });
+    expect(await markWorkerRecordingFailed(SESSION, ATTEMPT, { db })).toBe('attempt_mismatch');
+    expect(updates).toHaveLength(0);
   });
 });

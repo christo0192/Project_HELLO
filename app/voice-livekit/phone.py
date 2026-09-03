@@ -3623,6 +3623,7 @@ class PhoneGateResult:
         "spoken",
         "assessment_state",
         "role_opening_spoken",
+        "scoring_queue_owned",
     )
 
     def __init__(
@@ -3649,6 +3650,13 @@ class PhoneGateResult:
         # the caller does not pay a second `/assessment/start` round trip in
         # the audible consent→first-question gap. None on legacy paths.
         self.assessment_state = assessment_state
+        # Set by the screening coordinator when scoring was handed to the
+        # durable queue: the caller must finish the recording upload FIRST and
+        # then hold the attempt lease until the terminal event lands (live
+        # 2026-09-03: returning immediately let the 180 s lease expire
+        # mid-scoring and the reclaim sweep marked a finished screening
+        # `abandoned`). Not a constructor arg — only the coordinator sets it.
+        self.scoring_queue_owned = False
 
     def __repr__(self) -> str:  # pragma: no cover - diagnostics only
         return (
@@ -5118,16 +5126,23 @@ _GENERAL_CLARIFICATION_RE = re.compile(
     r"\b(?:can|could|would)\s+you\s+(?:please\s+)?"
     r"(?:repeat|rephrase|explain|clarify|say\s+that\s+again)\b|"
     r"\b(?:i\s+did(?:n't|\s+not)\s+(?:hear|understand)|what\s+do\s+you\s+mean)\b|"
-    r"\b(?:forgot|not\s+sure)\b.{0,40}\bwhich\b|"
-    # Confirm-question shapes: the candidate is checking WHAT was asked, not
-    # answering it — "Like you're talking about the notice period?", "You mean
-    # LPA?" (both live 2026-09-03, both previously scored substantive; the first
-    # skipped the owed joining-availability question forever). These phrases can
-    # also appear inside long genuine narratives ("if you mean the AI
-    # programs…"), so they live here under the length bound, not in the
-    # uncapped _DEFLECTION_RE.
+    r"\b(?:forgot|not\s+sure)\b.{0,40}\bwhich\b",
+    re.IGNORECASE,
+)
+
+#: Confirm-question shapes: the candidate is checking WHAT was asked, not
+#: answering it — "Like you're talking about the notice period?", "You mean
+#: LPA?" (both live 2026-09-03, both previously scored substantive; the first
+#: skipped the owed joining-availability question forever). These phrases are
+#: ALSO common inside genuine answers as exemplifiers ("as in my last role…",
+#: "if you mean the AI programs, I built two"), so `phone_clarification_shape`
+#: accepts them only when the utterance actually reads as a question (ends
+#: with '?') AND is short. `as in` is deliberately absent — "as in hand
+#: salary" / "as in-house counsel" are near-universal Indian-English answer
+#: fragments and a confirm-shape match on them re-asks an answered question.
+_CONFIRM_QUESTION_RE = re.compile(
     r"\byou(?:'re|\s+are)?\s+(?:talking|asking)\s+about\b|"
-    r"\byou\s+mean\b|\bas\s+in\b|\bis\s+it\s+about\b",
+    r"\byou\s+mean\b|\bis\s+it\s+about\b",
     re.IGNORECASE,
 )
 _CONNECTIVITY_RE = re.compile(
@@ -5193,7 +5208,11 @@ def candidate_turn_route(text: Any) -> str | None:
         return "connectivity_check"
     if _CALLBACK_DEFERRAL_RE.search(clean):
         return "callback_deferral"
-    if _GENERAL_CLARIFICATION_RE.search(clean):
+    # ONE classifier with route AND the substance gate (phone_turn_substance):
+    # before this, a deflection-shaped final could be spoken to as an answer
+    # here while the background commit gate skipped it as a clarification,
+    # leaving the cursor behind the conversation (review find, 2026-09-03).
+    if phone_clarification_shape(clean):
         return "candidate_question"
     if clean.endswith("?") and _QUESTION_OPEN_RE.search(clean):
         return "candidate_question"
@@ -5304,24 +5323,76 @@ PHONE_SUBSTANCE_CLARIFICATION = "clarification"
 #: — the bot must re-ask (rephrase) rather than advance the plan. A live call
 #: (2026-09-02) advanced past "I don't understand what discrepancy you found" and
 #: "I just mentioned that, right?" because the substance gate only caught bare
-#: hesitation. These complement `_GENERAL_CLARIFICATION_RE` (repeat/rephrase/
-#: explain/what do you mean). Kept short-anchored so a long real answer that
-#: happens to contain one of these phrases is not misread as a deflection.
-_DEFLECTION_RE = re.compile(
-    r"\b(?:i\s+(?:already\s+)?(?:just\s+)?(?:mentioned|said|told\s+you|answered|covered)\s+(?:that|this|it)|"
-    r"(?:i\s+)?did(?:n'?t| not)\s+(?:i\s+)?(?:just\s+)?(?:say|mention|cover|answer)|"
-    r"come\s+again|say\s+that\s+again|which\s+(?:one|question|part|role|clarification|conflict)|"
-    r"not\s+sure\s+what\s+you(?:\s+are|'re)?\s+(?:mean|asking|referring)|"
+#: hesitation; a live call (2026-09-03) advanced past a 26-word "I don't
+#: understand what conflicts my answer and the resume" because the regex matched
+#: and a 14-word cap discarded the match anyway.
+#:
+#: SPLIT BY CONFIDENCE (post-review, 2026-09-03). STRONG phrases are
+#: first-person confusion that essentially never appears inside a genuine
+#: answer — they classify at ANY length (owner directive: the gate must not
+#: block a real deflection). WEAK phrases are real deflections that ALSO occur
+#: verbatim inside long genuine narratives ("we decided which one to migrate
+#: first", "my manager didn't mention the deadline", "customers say come
+#: again"), so they keep a length bound: a short utterance built around them is
+#: a deflection; a long story containing them is evidence.
+_DEFLECTION_STRONG_RE = re.compile(
+    r"\b(?:not\s+sure\s+what\s+you(?:\s+are|'re)?\s+(?:mean|asking|referring)|"
     r"not\s+sure\s+what\s+you\s+mean|what\s+do\s+you\s+mean(?:\s+by)?|"
     r"i\s+(?:don'?t|do\s+not)\s+(?:understand|get\s+(?:it|that|you)|follow)|"
     r"can\s+you\s+be\s+more\s+specific|"
-    # Plural/loose noun forms: "what conflicts", "what clarification you need".
-    r"what\s+(?:discrepanc(?:y|ies)|conflicts?|mismatch(?:es)?|clarifications?)|"
-    r"what\s+are\s+you\s+(?:referring|talking)\s+(?:to|about)|"
-    r"(?:i\s+)?did(?:n'?t| not)\s+(?:get|catch|hear)\s+(?:that|you|it)|"
-    r"sorry\s*\?|pardon(?:\s+me)?)\b",
+    r"what\s+are\s+you\s+(?:referring|talking)\s+(?:to|about))\b",
     re.IGNORECASE,
 )
+_DEFLECTION_WEAK_RE = re.compile(
+    r"\b(?:i\s+(?:already\s+)?(?:just\s+)?(?:mentioned|said|told\s+you|answered|covered)\s+(?:that|this|it)|"
+    # First-person only: "my manager didn't mention the deadline" is a story,
+    # not a deflection — the old optional-subject form matched third persons.
+    r"i\s+did(?:n'?t| not)\s+(?:just\s+)?(?:say|mention|cover|answer)|"
+    r"did(?:n'?t| not)\s+i\s+(?:just\s+)?(?:say|mention|cover|answer)|"
+    r"come\s+again|say\s+that\s+again|"
+    r"which\s+(?:one|question|part|role|clarification|conflict)|"
+    # Plural/loose noun forms: "what conflicts", "what clarification you need".
+    r"what\s+(?:discrepanc(?:y|ies)|conflicts?|mismatch(?:es)?|clarifications?)|"
+    r"(?:i\s+)?did(?:n'?t| not)\s+(?:get|catch|hear)\s+(?:that|you|it)|"
+    r"pardon(?:\s+me)?)\b"
+    # OUTSIDE the \b-closed group: '?' is a non-word character, so a trailing
+    # \b after it can never match at end-of-utterance — inside the group this
+    # alternative was dead code and 'Sorry?' scored substantive (review find).
+    r"|\bsorry\s*\?",
+    re.IGNORECASE,
+)
+
+#: Word bound for the WEAK/GENERAL/CONFIRM clarification shapes. Deliberately
+#: generous (the owner's directive is that real deflections must never be
+#: blocked) while still leaving long multi-clause narratives as evidence.
+_CLARIFICATION_MAX_WORDS = 30
+
+
+def phone_clarification_shape(text: Any) -> bool:
+    """THE single clarification classifier — one vocabulary, one length policy.
+
+    Consumed by BOTH `candidate_turn_route` (which drives the live re-ask) and
+    `phone_turn_substance` (which gates the background commit). Before this
+    existed the two consumers applied different vocabularies and different
+    length bounds to the same utterance, so a turn could be spoken to as an
+    answer while its commit was skipped as a clarification — desynchronizing
+    the cursor from the conversation (review find, 2026-09-03).
+    """
+    if not isinstance(text, str):
+        return False
+    clean = " ".join(text.strip().split())
+    if not clean:
+        return False
+    if _DEFLECTION_STRONG_RE.search(clean):
+        return True
+    if len(clean.split()) > _CLARIFICATION_MAX_WORDS:
+        return False
+    if _DEFLECTION_WEAK_RE.search(clean) or _GENERAL_CLARIFICATION_RE.search(clean):
+        return True
+    # Confirm-questions must actually read as questions: "You mean LPA?" is a
+    # clarification; "if you mean the AI programs, I built two of them" is an
+    # answer that happens to contain the phrase.
+    return clean.endswith("?") and _CONFIRM_QUESTION_RE.search(clean) is not None
 
 
 def phone_turn_substance(text: Any) -> str:
@@ -5351,14 +5422,10 @@ def phone_turn_substance(text: Any) -> str:
     # blocked the live call's 26-word "…I don't understand what conflicts my
     # answer and the resume" — the regex MATCHED and the cap alone discarded it,
     # so the deflection was committed as a substantive answer and the cursor
-    # advanced. A strong _DEFLECTION_RE phrase now classifies as clarification at
-    # ANY length: the cost of over-matching (one warm re-ask inside a long real
-    # answer) is far smaller than the cost of committing a non-answer as an
-    # answer. The looser _GENERAL_CLARIFICATION_RE keeps a (raised) length bound
-    # because its phrases appear more often inside genuine narrative answers.
-    if _DEFLECTION_RE.search(clean):
-        return PHONE_SUBSTANCE_CLARIFICATION
-    if len(clean.split()) <= 30 and _GENERAL_CLARIFICATION_RE.search(clean):
+    # advanced. Classification is delegated to `phone_clarification_shape`, the
+    # SAME classifier `candidate_turn_route` consults, so the live re-ask and
+    # this commit gate can never disagree about one utterance.
+    if phone_clarification_shape(clean):
         return PHONE_SUBSTANCE_CLARIFICATION
     # A recognised complete short answer or any digit content is substantive.
     if _SUBSTANTIVE_SHORT_RE.fullmatch(clean) or _CONTENT_DIGIT_RE.search(clean):

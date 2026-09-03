@@ -45,7 +45,7 @@ interface BuildOpts {
   attachDuplicate?: boolean;
   finalizeStatus?: 'ready' | 'fallback_required' | 'pending';
   finalizeThrows?: boolean;
-  markFailedStatus?: 'failed_latched' | 'already_linked' | 'not_worker_inband' | 'session_not_found';
+  markFailedStatus?: 'failed_latched' | 'already_linked' | 'not_worker_inband' | 'attempt_mismatch' | 'session_not_found' | 'latch_failed';
   markFailedThrows?: boolean;
   /** When set, wires a resolveEngagement dep so an omitted engagement_id can be
    *  resolved server-side (PR A in-worker recorder path). */
@@ -294,7 +294,7 @@ describe('provider=worker failed — latches a permanently lost recording', () =
     const res = await authed(h.app, FAILED, FAILED_BODY);
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ ok: true, status: 'failed_latched' });
-    expect(h.markRecordingFailed).toHaveBeenCalledWith(SESSION);
+    expect(h.markRecordingFailed).toHaveBeenCalledWith(SESSION, ATTEMPT);
   });
 
   it('an already-linked recording is not clobbered ⇒ ok:false, truthful status', async () => {

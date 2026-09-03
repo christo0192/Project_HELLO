@@ -6971,7 +6971,9 @@ components:
             - failed_latched
             - already_linked
             - not_worker_inband
+            - attempt_mismatch
             - session_not_found
+            - latch_failed
             - invalid_request
             - phone_recording_failed_error
             - phone_screening_disabled

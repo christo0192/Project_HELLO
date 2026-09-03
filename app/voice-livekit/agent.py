@@ -1620,7 +1620,6 @@ async def _run_native_phone_screening(
     completed = list(state.completed_keys)
     finished = asyncio.Event()
     terminal_reason: dict[str, str] = {}
-    terminal_reply_required = {"value": False}
     # A terminal reply is only a proposal until its speech handle completes.
     # This keeps callback intent able to cancel an authored closing.
     pending_terminal_reason: dict[str, str | None] = {"value": None}
@@ -1719,7 +1718,7 @@ async def _run_native_phone_screening(
     # may be asked in the immediate reply and become reply-pending only after
     # that exact speech sequence completes cleanly.
     pending_conflict: dict[str, Any] = {"value": None}  # compatibility/test seam; never late-injected
-    conflict_reply_pending: dict[str, bool] = {"value": False}
+    conflict_reply_pending: dict[str, Any] = {"value": False, "conflict": None, "repursued": False}
     conflict_delivery: dict[str, Any] = {"sequence": None, "key": None}
     asked_conflicts: set[str] = set()
     active_exchange: dict[str, Any] | None = None
@@ -1879,7 +1878,6 @@ async def _run_native_phone_screening(
         raise RuntimeError("phone_turn_context_unavailable")
 
     def arm_terminal_reply(reason: str) -> None:
-        terminal_reply_required["value"] = True
         pending_terminal_reason["value"] = reason
         # Tool-first may arm terminal intent from a coordinator tool inside the
         # already-created speech handle; toolless arms it in the user hook before
@@ -1888,6 +1886,26 @@ async def _run_native_phone_screening(
             speech_sequence[0] if reply_started.is_set()
             else speech_sequence[0] + 1
         )
+
+    def _arm_conflict_delivery(key: str, conflict: Any) -> None:
+        """The ONLY writer that arms conflict delivery tracking — one shape,
+        three callers (both probe sites and the re-pursuit), so a field added
+        here can never be missed at one site (review find, 2026-09-03)."""
+        conflict_delivery.update({
+            "sequence": speech_sequence[0] + 1,
+            "key": key,
+            "conflict": dict(conflict) if isinstance(conflict, dict) else None,
+        })
+
+    def _consume_conflict_reply(turn_ctx: Any, text: str) -> bool:
+        """Consume the pending conflict-probe reply; True when the ONE
+        permitted re-pursuit took the turn. Every mutation of
+        conflict_reply_pending's consumption lives here so the routed and
+        unrouted reply paths cannot drift (review find, 2026-09-03)."""
+        conflict_reply_pending["value"] = False
+        probe_conflict = conflict_reply_pending.get("conflict")
+        conflict_reply_pending["conflict"] = None
+        return _begin_conflict_repursuit(turn_ctx, text, probe_conflict)
 
     def _begin_conflict_repursuit(
         turn_ctx: Any, text: str, probe_conflict: Any,
@@ -1908,11 +1926,7 @@ async def _run_native_phone_screening(
         if repursuit is None:
             return False
         conflict_reply_pending["repursued"] = True
-        conflict_delivery.update({
-            "sequence": speech_sequence[0] + 1,
-            "key": "conflict_repursuit",
-            "conflict": None,
-        })
+        _arm_conflict_delivery("conflict_repursuit", None)
         setattr(agent, "_turn_policy", "clarification")
         set_reply_snapshot(
             phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT,
@@ -1946,38 +1960,6 @@ async def _run_native_phone_screening(
         )
         if decision.terminal:
             arm_terminal_reply(decision.terminal_reason)
-
-    async def wait_for_terminal_reply() -> bool:
-        """Wait for the model's goodbye to PLAY TO COMPLETION.
-
-        F3 (call 24): the goodbye was authored and started but the candidate's
-        overlapping turn INTERRUPTED it mid-sentence ("...your time and"), the
-        room closed, and no complete goodbye was ever spoken. This used to
-        return `handle is not None` — true even for an interrupted reply — so
-        the caller believed a goodbye played. It now returns True only when the
-        reply finished WITHOUT interruption, so the caller can speak the fixed
-        closing when the model's goodbye did not fully land. `interrupted` is
-        read defensively: an SDK/stub that does not expose it is treated as a
-        clean completion (the pre-F3 behaviour) rather than forcing a fallback.
-        """
-        try:
-            await asyncio.wait_for(
-                reply_started.wait(), timeout=PHONE_TERMINAL_REPLY_TIMEOUT_SEC,
-            )
-        except asyncio.TimeoutError:
-            return False
-        handle = reply_handle[0]
-        wait = getattr(handle, "wait_for_playout", None)
-        if callable(wait):
-            value = wait()
-            if inspect.isawaitable(value):
-                await value
-        if handle is None:
-            return False
-        interrupted = bool(getattr(handle, "interrupted", False))
-        if not interrupted and closing.state is ClosingState.CLOSING_PENDING:
-            closing.closing_delivered()
-        return not interrupted
 
     async def on_native_turn(
         text: str, message: Any = None, turn_ctx: Any = None,
@@ -2095,7 +2077,6 @@ async def _run_native_phone_screening(
             closing.cancel_for_callback()
             pending_terminal_reason["value"] = None
             pending_terminal_speech_seq["value"] = None
-            terminal_reply_required["value"] = False
             flow = phone.CallbackFlowState()
             callback_flow["state"] = flow
             decision = await phone.run_callback_turn(
@@ -2127,7 +2108,6 @@ async def _run_native_phone_screening(
             closing.reopen_qna()
             pending_terminal_reason["value"] = None
             pending_terminal_speech_seq["value"] = None
-            terminal_reply_required["value"] = False
             _log.info(
                 "unknown_event", error_type="phone_qna_terminal_interlock",
                 error_category="pending_close_cancelled",
@@ -2137,18 +2117,19 @@ async def _run_native_phone_screening(
             # bounded Q&A has entered closing is terminal acknowledgement/noise,
             # never a new screening exchange. Completion wins idempotently even
             # if final STT races the goodbye playout callback.
-            pending_terminal_reason["value"] = None
-            pending_terminal_speech_seq["value"] = None
-            terminal_reply_required["value"] = False
-            terminal_reason["reason"] = "completed"
+            #
             # F8 (live 2026-09-03): this branch used to CLAIM the goodbye was
-            # delivered (`closing_delivered()`) with no proof — a candidate
-            # acknowledging DURING the goodbye ("okay, bye") interrupted its
-            # playout, this fired on their utterance, and the room came down on
-            # a half-spoken goodbye recorded as clean. The state now advances to
-            # CLOSING_PLAYED only on proof (on_reply_delivered, or the teardown's
-            # fixed-closing say); left CLOSING_PENDING here, the teardown speaks
-            # the fixed goodbye before the room is deleted.
+            # delivered (`closing_delivered()`) with no proof AND cleared the
+            # armed terminal intent — a candidate acknowledging DURING the
+            # goodbye interrupted its playout, this fired on their utterance,
+            # and the room came down on a half-spoken goodbye recorded as
+            # clean. The pending terminal intent is now deliberately LEFT
+            # ARMED: when the goodbye playout actually completes, its delivery
+            # callback still lands the proof (the common clean race where the
+            # ack's STT final beats the callback by milliseconds), and the
+            # teardown waits a short bounded window for exactly that before
+            # concluding a fixed goodbye is owed.
+            terminal_reason["reason"] = "completed"
             finished.set()
             from livekit.agents import StopResponse  # noqa: PLC0415
             raise StopResponse()
@@ -2304,7 +2285,6 @@ async def _run_native_phone_screening(
                     closing.cancel_for_callback()
                     pending_terminal_reason["value"] = None
                     pending_terminal_speech_seq["value"] = None
-                    terminal_reply_required["value"] = False
                 # RE-LOOPED SAFELY (this PR): a "call me back later" now ENTERS a
                 # BOUNDED negotiation. The worker resolves the requested time
                 # deterministically, proposes+confirms against the server, and
@@ -2325,9 +2305,7 @@ async def _run_native_phone_screening(
             # path runs before the conflict consumption below and used to
             # swallow exactly the deflection the re-pursuit exists for.
             if conflict_reply_pending["value"]:
-                conflict_reply_pending["value"] = False
-                routed_conflict = conflict_reply_pending.pop("conflict", None)
-                if _begin_conflict_repursuit(turn_ctx, text, routed_conflict):
+                if _consume_conflict_reply(turn_ctx, text):
                     return
             setattr(agent, "_turn_policy", "clarification")
             if question is not None:
@@ -2375,11 +2353,7 @@ async def _run_native_phone_screening(
                     )
                     if conflict_instruction is not None:
                         asked_conflicts.add(conflict_key)
-                        conflict_delivery.update({
-                            "sequence": speech_sequence[0] + 1,
-                            "key": conflict_key,
-                            "conflict": dict(conflict),
-                        })
+                        _arm_conflict_delivery(conflict_key, conflict)
                         stale_handle = reply_handle[0]
                         interrupt = getattr(stale_handle, "interrupt", None)
                         if callable(interrupt):
@@ -2411,8 +2385,6 @@ async def _run_native_phone_screening(
             # This turn answers a clarification proven delivered by its exact
             # speech sequence. Consume it; it cannot advance an unrelated
             # objective.
-            conflict_reply_pending["value"] = False
-            probe_conflict = conflict_reply_pending.pop("conflict", None)
             # F7 (owner-approved, live 2026-09-03): the probe's own instruction
             # said "hold once if they deflect", but this controller branch
             # unconditionally yanked the turn back to the plan — the hold was
@@ -2424,7 +2396,7 @@ async def _run_native_phone_screening(
             # accusatory) and asks one final direct question. Whatever comes
             # back, the next consumption returns to the plan — bounded by the
             # `repursued` latch, never a loop.
-            if _begin_conflict_repursuit(turn_ctx, text, probe_conflict):
+            if _consume_conflict_reply(turn_ctx, text):
                 return
             setattr(agent, "_turn_policy", "clarification")
             if question is not None:
@@ -2518,11 +2490,7 @@ async def _run_native_phone_screening(
                     )
                     if judge_instruction is not None:
                         asked_conflicts.add(conflict_key)
-                        conflict_delivery.update({
-                            "sequence": speech_sequence[0] + 1,
-                            "key": conflict_key,
-                            "conflict": dict(conflict),
-                        })
+                        _arm_conflict_delivery(conflict_key, conflict)
             elif coverage_reanchor.get("question_key") == question.key:
                 judge_instruction = phone.phone_judge_turn_instruction(
                     question.spoken_text, reanchor=True,
@@ -3299,6 +3267,18 @@ async def _run_native_phone_screening(
     # without an audible goodbye. The fixed line is gate copy (never a
     # boundary) and is markdown-free by construction.
     if reason == "completed" and not goodbye_delivered["value"]:
+        # THE CLEAN RACE: a candidate acknowledgement STT final can beat the
+        # goodbye's own playout-delivered callback by milliseconds. The armed
+        # terminal intent is left in place by the ack branch precisely so that
+        # callback can still land its proof — give it a short bounded window
+        # before concluding the goodbye needs re-speaking, or every clean close
+        # where the ack wins the race would get a duplicate goodbye.
+        if pending_terminal_reason.get("value") == "completed" and reply_started.is_set():
+            for _ in range(20):
+                if goodbye_delivered["value"]:
+                    break
+                await asyncio.sleep(0.1)
+    if reason == "completed" and not goodbye_delivered["value"]:
         _log.info(
             "unknown_event", error_type="phone_terminal_reply",
             error_category="fixed_closing_fallback",
@@ -3311,9 +3291,12 @@ async def _run_native_phone_screening(
             if callable(closing_wait):
                 closing_value = closing_wait()
                 if inspect.isawaitable(closing_value):
-                    await closing_value
+                    # BOUNDED: no watchdog covers a teardown say, and a wedged
+                    # TTS websocket (the proven X2 class) would otherwise hold
+                    # this leg — and its still-beating heartbeat — forever.
+                    await asyncio.wait_for(closing_value, timeout=10.0)
             goodbye_delivered["value"] = True
-        except Exception:  # noqa: BLE001
+        except (Exception, asyncio.TimeoutError):  # noqa: BLE001
             # A failed goodbye must not change the truthful terminal reason
             # or take the leg down; the assessment is still complete.
             _log.warn(
@@ -3322,11 +3305,11 @@ async def _run_native_phone_screening(
             )
         if closing.state is ClosingState.CLOSING_PENDING:
             closing.closing_delivered()
-    if reason == "completed":
-        # Let the PSTN leg flush the goodbye's tail before ANY room delete —
-        # deleting the room kills the SIP audio buffers instantly, and a goodbye
-        # clipped on its last words is perceived as a rude hangup.
-        await asyncio.sleep(phone.PHONE_CLOSE_TAIL_GRACE_SEC)
+    # Anchor for the pre-delete tail grace: the goodbye's last audio is flushed
+    # relative to THIS instant. The grace itself is applied immediately before
+    # each room delete (queue-owned branch and the shared tail), minus whatever
+    # network time has already elapsed — so the common path adds no dead-air.
+    goodbye_finished_monotonic = time.monotonic()
 
     if reason == "completed":
         done = None
@@ -3345,51 +3328,28 @@ async def _run_native_phone_screening(
                 queue_owned = True
                 break
         if queue_owned:
-            # ── HOLD THE LEASE THROUGH QUEUED SCORING (live 2026-09-03) ──────
-            # The old behavior returned here immediately, cancelling the
-            # heartbeat while the queue worker took ~4 minutes to score. The
-            # 180 s lease expired mid-scoring, the reclaim sweep marked the
-            # cleanly-completed screening `abandoned`, and the queue worker's
-            # later completion post found the attempt already reclaimed and was
-            # (correctly) not applied. The PSTN leg is torn down FIRST — the
-            # candidate hears nothing of this — then the worker process simply
-            # stays alive, heartbeating (the heartbeat task is cancelled only
-            # when this function returns), and probes the idempotent completion
-            # endpoint until the row lands. Once it does, this worker posts the
-            # attempt-scoped terminal event itself (idempotent with the queue
-            # worker's post via 0042's deterministic event id), so the attempt
-            # reaches `ended` before the lease is ever allowed to lapse.
-            # Bounded by wall clock; 0 disables the hold entirely.
+            # ── QUEUED SCORING: CLOSE THE LEG, HAND THE HOLD TO THE CALLER ───
+            # The old behavior returned straight through the caller's finally,
+            # cancelling the heartbeat while the queue worker took ~4 minutes
+            # to score: the 180 s lease expired mid-scoring and the reclaim
+            # sweep marked the cleanly-completed screening `abandoned` (live
+            # 2026-09-03, attempt a6cc612d). The PSTN leg is torn down HERE —
+            # the candidate hears nothing further — but the LEASE HOLD itself
+            # runs in `_run_phone_session`, AFTER `_finish_recording`: holding
+            # first would delay the recording upload by up to the hold budget,
+            # long enough for the finalize deferrals to exhaust and latch a
+            # recording that was about to arrive (review find, 2026-09-03).
+            close_grace = phone.PHONE_CLOSE_TAIL_GRACE_SEC - (
+                time.monotonic() - goodbye_finished_monotonic
+            )
+            if close_grace > 0:
+                await asyncio.sleep(close_grace)
             _log.info(
                 "unknown_event", error_type="phone_room_teardown",
                 error_category=_teardown_label(reason),
             )
             await _close_phone_room(room_name)
-            hold_deadline = time.monotonic() + phone.phone_queued_scoring_hold_sec()
-            while time.monotonic() < hold_deadline:
-                await asyncio.sleep(phone.PHONE_QUEUED_SCORING_POLL_SEC)
-                probe = await events.complete_assessment(attempt_id, session_id)
-                if probe.ok:
-                    outcome = await events.post_event(attempt_id, "assessment.completed")
-                    _log.info(
-                        "unknown_event", error_type="phone_scoring_hold",
-                        error_category=(
-                            "terminal_posted" if outcome.ok else "terminal_post_failed"
-                        ),
-                    )
-                    return result
-                if probe.status == phone.ASSESSMENT_QUEUED_STATUS:
-                    continue
-                if not phone.retryable_completion(probe):
-                    # A known non-score verdict: truthfully terminal.
-                    await _post_phone_event_with_retry(
-                        events, attempt_id, "assessment.aborted",
-                    )
-                    return result
-            _log.warn(
-                "unknown_event", error_type="phone_scoring_hold",
-                error_category="hold_deadline_exhausted",
-            )
+            result.scoring_queue_owned = True
             return result
         if done is not None and done.ok and not done.adopted:
             await _post_phone_event_with_retry(
@@ -3465,6 +3425,17 @@ async def _run_native_phone_screening(
     # NOT `_bounded_outcome` (a session-OUTCOME allowlist that mapped every HALT
     # reason to `other_failure`, making a candidate goodbye and a crash
     # indistinguishable in the one log line that says WHY a room was deleted).
+    if reason == "completed":
+        # Pre-delete tail grace, minus whatever the completion round-trips
+        # already spent: deleting the room kills the SIP audio buffers
+        # instantly and a goodbye clipped on its last words is perceived as a
+        # rude hangup. On the common path the network time already exceeds the
+        # grace and this sleeps 0.
+        tail_grace = phone.PHONE_CLOSE_TAIL_GRACE_SEC - (
+            time.monotonic() - goodbye_finished_monotonic
+        )
+        if tail_grace > 0:
+            await asyncio.sleep(tail_grace)
     _log.info(
         "unknown_event", error_type="phone_room_teardown",
         error_category=_teardown_label(reason),
@@ -4411,7 +4382,60 @@ async def _run_phone_session(
             screening = asyncio.ensure_future(_screen())
             running["screening"] = screening
             try:
-                return await screening
+                screened = await screening
+                if getattr(screened, "scoring_queue_owned", False):
+                    # ── HOLD THE LEASE THROUGH QUEUED SCORING ────────────────
+                    # (live 2026-09-03, attempt a6cc612d): scoring on the
+                    # durable queue took ~4 minutes; returning immediately
+                    # cancelled the heartbeat, the 180 s lease expired
+                    # mid-scoring, and the reclaim sweep marked a finished
+                    # screening `abandoned`. The PSTN leg is already closed —
+                    # the candidate hears none of this. Ordering is deliberate:
+                    # the RECORDING uploads FIRST (holding first would delay
+                    # the upload past the finalize deferrals' exhaustion and
+                    # latch a recording that was about to arrive), then the
+                    # worker stays alive — heartbeat still beating, it is
+                    # cancelled only in the finally below — polling the
+                    # terminal post.
+                    #
+                    # The poll is `post_event("assessment.completed")`
+                    # DIRECTLY, never `complete_assessment`: on a queue
+                    # deployment that endpoint answers `scoring_queued`
+                    # unconditionally BEFORE any row check and RE-ENQUEUES a
+                    # scoring job per call, so a probe loop against it can
+                    # never succeed and spams jobs (review find). The post is
+                    # refused by 0044's interlock while the assessment row is
+                    # absent, applies the moment the row lands (ending the
+                    # attempt before the lease can lapse), and is a duplicate
+                    # no-op if the queue worker's own post won the race —
+                    # idempotent by 0042's deterministic internal event id.
+                    # Each iteration IS the retry. Wall-clock bounded; on
+                    # exhaustion the queue worker's own post remains the
+                    # backstop and the residual is logged.
+                    await _finish_recording()
+                    # The outer finally calls _finish_recording again; a second
+                    # finish() on an already-finished recorder would re-close
+                    # and mis-report. Clearing the holder makes it a no-op.
+                    recorder_holder[0] = None
+                    hold_deadline = (
+                        time.monotonic() + phone.phone_queued_scoring_hold_sec()
+                    )
+                    while time.monotonic() < hold_deadline:
+                        await asyncio.sleep(phone.PHONE_QUEUED_SCORING_POLL_SEC)
+                        outcome = await events.post_event(
+                            attempt_id, "assessment.completed",
+                        )
+                        if outcome.ok:
+                            _log.info(
+                                "unknown_event", error_type="phone_scoring_hold",
+                                error_category="terminal_posted",
+                            )
+                            return screened
+                    _log.warn(
+                        "unknown_event", error_type="phone_scoring_hold",
+                        error_category="hold_deadline_exhausted",
+                    )
+                return screened
             except asyncio.CancelledError:
                 reason = lease_halt.get("reason")
                 if reason is None:

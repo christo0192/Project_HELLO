@@ -581,8 +581,16 @@ export async function finalizeWorkerInbandRecording(
  */
 export async function markWorkerRecordingFailed(
   sessionId: string,
+  attemptId: string,
   deps: RecordingEgressDeps = {},
-): Promise<'failed_latched' | 'already_linked' | 'not_worker_inband' | 'session_not_found'> {
+): Promise<
+  | 'failed_latched'
+  | 'already_linked'
+  | 'not_worker_inband'
+  | 'attempt_mismatch'
+  | 'session_not_found'
+  | 'latch_failed'
+> {
   const db = deps.db ?? supabase;
   const { data: session, error } = await db
     .from('call_sessions')
@@ -593,7 +601,12 @@ export async function markWorkerRecordingFailed(
   if (session.recording_object_key) return 'already_linked';
   const egressId = session.recording_egress_id ? String(session.recording_egress_id) : '';
   if (!isWorkerInbandEgressId(egressId)) return 'not_worker_inband';
-  await db.from('call_sessions')
+  // The synthetic egress id embeds the attempt that owns the CURRENT recording
+  // binding (workerRecordingEgressId). A stale attempt's late failure report
+  // must not latch a session a newer attempt has re-prepared — its upload may
+  // be converging right now (review find, 2026-09-03).
+  if (egressId !== `${WORKER_INBAND_EGRESS_ID_PREFIX}${attemptId}`) return 'attempt_mismatch';
+  const { data: latched, error: latchError } = await db.from('call_sessions')
     .update({
       recording_egress_status: 'failed',
       // Bounded 0038 CHECK vocabulary: the worker (this pipeline's provider)
@@ -602,7 +615,12 @@ export async function markWorkerRecordingFailed(
       recording_finalize_defer_reason: 'provider_error',
     })
     .eq('id', sessionId)
-    .is('recording_object_key', null);
+    .is('recording_object_key', null)
+    .select('id');
+  // The worker's report is one-shot (its recorder dies with the process), so a
+  // false success here would silently recreate the retry-to-exhaustion defect.
+  if (latchError) return 'latch_failed';
+  if (!latched || latched.length === 0) return 'already_linked';
   return 'failed_latched';
 }
 

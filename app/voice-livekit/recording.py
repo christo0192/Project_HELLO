@@ -286,6 +286,10 @@ class InWorkerRecorder:
                 exc_info=True,
             )
             self._finish_failure = "recorder_close_failed"
+            # The failure is about to be REPORTED as a permanent loss — the
+            # documented invariant is that a reported failure retains no audio,
+            # so the local OGG must not survive this branch either.
+            self._cleanup()
             return None
 
         mp3_path = self._ogg_path.with_suffix(".mp3")

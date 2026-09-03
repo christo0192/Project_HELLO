@@ -3313,6 +3313,29 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         self.assertIn("assessment.completed", client.event_types)
         self.assertNotIn(phone.PHONE_ASSESSMENT_CLOSING_TEXT, session.spoken)
 
+    async def test_queue_owned_scoring_holds_the_lease_and_posts_terminal(self):
+        """Live 2026-09-03 (attempt a6cc612d): the queued-scoring handoff used
+        to return immediately, cancelling the heartbeat while the scorer took
+        ~4 minutes — the lease expired and the reclaim sweep marked a FINISHED
+        screening `abandoned`. The worker now closes the leg, finishes the
+        recording, and stays alive polling the idempotent terminal post until
+        it applies (the poll is post_event directly — /assessment/complete on a
+        queue deployment answers scoring_queued unconditionally and re-enqueues
+        a job per call, so probing it can never succeed)."""
+        client = FakeEventClient(
+            complete=phone.PhoneApiOutcome(False, phone.ASSESSMENT_QUEUED_STATUS),
+        )
+        with patch.object(phone, "PHONE_QUEUED_SCORING_POLL_SEC", 0.01), \
+             patch.dict(phone.os.environ, {"PHONE_QUEUED_SCORING_HOLD_SEC": "5"}):
+            _, client, _, delete, _, _ = await self._run_session(
+                answers=("Yes, that's fine.",), client=client,
+            )
+        # The hold posted the attempt-scoped terminal event itself, so the
+        # attempt reaches `ended` while the lease is still provably held.
+        self.assertIn("assessment.completed", client.event_types)
+        # And the PSTN leg was torn down BEFORE the hold, not after it.
+        delete.assert_awaited()
+
     async def test_a_PERSISTENCE_failure_posts_nothing_at_all(self):
         """The one path that must post NEITHER terminal event.
 

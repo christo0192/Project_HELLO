@@ -477,8 +477,13 @@ export interface PhoneWorkerRouterDeps {
    * an object that was never uploaded. Injected for tests; production defaults
    * to `markWorkerRecordingFailed`.
    */
-  readonly markRecordingFailed?: (sessionId: string) => Promise<
-    'failed_latched' | 'already_linked' | 'not_worker_inband' | 'session_not_found'
+  readonly markRecordingFailed?: (sessionId: string, attemptId: string) => Promise<
+    | 'failed_latched'
+    | 'already_linked'
+    | 'not_worker_inband'
+    | 'attempt_mismatch'
+    | 'session_not_found'
+    | 'latch_failed'
   >;
   readonly configSource?: NodeJS.ProcessEnv;
   readonly now?: () => Date;
@@ -1721,7 +1726,7 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
         return res.status(400).json({ ok: false, status: 'invalid_request' });
       }
       const latch = deps.markRecordingFailed ?? markWorkerRecordingFailed;
-      const status = await latch(parsed.data.session_id);
+      const status = await latch(parsed.data.session_id, parsed.data.attempt_id);
       // The worker's bounded reason code is observability, not state — the
       // persisted defer reason stays inside the 0038 CHECK vocabulary.
       phoneWorkerLog.warn('unknown_event', {
