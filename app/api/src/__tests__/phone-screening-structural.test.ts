@@ -338,6 +338,13 @@ describe('2. no provider, no dialing, no network, no Ashby mutation', () => {
       // guarantee.
       'integrations/livekit-phone-dial/dial.ts',
       'integrations/livekit-phone-dial/recording.ts',
+      // PR A — the WORKER-INBAND recording twin of `recording.ts`. It reads the
+      // SAME derived object/manifest keys (`phoneAttemptRecordingObjectKey`,
+      // `phoneAttemptRecordingManifestKey`) for the `RECORDING_PROVIDER=worker`
+      // branch, so it imports the domain core for exactly the reason the egress
+      // sibling does. Additive and flag-gated; it dials nothing and loops
+      // nowhere, so the directory's posture is unchanged.
+      'integrations/livekit-phone-dial/worker-recording.ts',
       'integrations/livekit-phone-dial/recording-purge.ts',
       'integrations/livekit-phone-dial/sip.ts',
       'routes/phone-worker.ts',
