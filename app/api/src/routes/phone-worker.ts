@@ -343,7 +343,14 @@ const recordingPrepareSchema = z
   .object({
     attempt_id: z.string().regex(UUID_RE),
     session_id: z.string().regex(UUID_RE),
-    engagement_id: z.string().regex(UUID_RE),
+    // OPTIONAL: the in-worker recorder runs from a session function that has no
+    // engagement id in scope (WorkerContext carries none). When the worker
+    // omits it, the server resolves it authoritatively from the attempt via the
+    // router's existing `resolveEngagement` dep — the same read the callback and
+    // finalize paths use. When present, it is taken verbatim (the egress path
+    // and every existing caller keep passing it, so their behavior is
+    // unchanged).
+    engagement_id: z.string().regex(UUID_RE).optional(),
   })
   .strict();
 
@@ -1570,9 +1577,26 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       if (deps.uploadSigner === undefined) {
         return res.status(503).json({ ok: false, status: 'recording_unavailable' });
       }
+      // Resolve the engagement id server-side when the worker omitted it. The
+      // in-worker recorder calls this from a session function that has no
+      // engagement id in scope, so the server derives it from the attempt via
+      // the same `resolveEngagement` read the callback/finalize paths use.
+      // FAIL-CLOSED: an omitted id that cannot be resolved (no resolver wired,
+      // or an unknown attempt) binds nothing and is reported truthfully — never
+      // fabricated.
+      let engagementId = parsed.data.engagement_id;
+      if (engagementId === undefined) {
+        const resolved = deps.resolveEngagement
+          ? await deps.resolveEngagement(parsed.data.attempt_id)
+          : null;
+        if (!resolved) {
+          return res.json({ ok: false, status: 'unknown_attempt' });
+        }
+        engagementId = resolved.engagementId;
+      }
       const result = await prepareWorkerRecording(
         {
-          engagementId: parsed.data.engagement_id,
+          engagementId,
           attemptId: parsed.data.attempt_id,
           sessionId: parsed.data.session_id,
           now: now(),

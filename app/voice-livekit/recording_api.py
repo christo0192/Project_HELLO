@@ -87,22 +87,29 @@ def _headers() -> Optional[dict]:
 async def prepare_recording(
     attempt_id: str,
     session_id: str,
-    engagement_id: str,
+    engagement_id: Optional[str] = None,
     *,
     post: PostFn = _default_post,
 ) -> Optional[dict[str, str]]:
     """Run the consent gate + mint an upload URL. Returns
     ``{"object_key": ..., "upload_url": ...}`` when the server BOUND the
     recording for upload, else ``None`` (refusal, no secret, or any error).
-    Fail-open."""
+    Fail-open.
+
+    ``engagement_id`` is OPTIONAL: the in-worker recorder calls this from the
+    phone-session function, which has no engagement id in scope. When it is
+    omitted the field is left OUT of the request body entirely and the server
+    resolves it authoritatively from ``attempt_id``. Existing callers that pass
+    it keep the current wire shape unchanged."""
     headers = _headers()
     if headers is None:
         return None
+    body: dict[str, Any] = {"attempt_id": attempt_id, "session_id": session_id}
+    if engagement_id is not None:
+        body["engagement_id"] = engagement_id
     try:
         resp = await post(
-            "POST", f"{API_BASE}{_RECORDING_BASE}/prepare", headers,
-            {"attempt_id": attempt_id, "session_id": session_id,
-             "engagement_id": engagement_id},
+            "POST", f"{API_BASE}{_RECORDING_BASE}/prepare", headers, body,
         )
         data = getattr(resp, "json", lambda: {})()
     except (ProviderError, BusinessError):

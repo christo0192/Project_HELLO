@@ -25,6 +25,8 @@ from livekit.plugins import openai, sarvam
 import persistence
 import phone
 import phone_canary
+import recording
+import recording_api
 from closing import ClosingState, ClosingStateMachine
 from observability import (
     Span,
@@ -3238,6 +3240,16 @@ async def _run_phone_session(
     latest_candidate_stopped_anchor: list[int | None] = [None]
     participant_present_anchor: list[int | None] = [None]
 
+    # ── PR A: IN-WORKER RECORDER HOLDER ────────────────────────────────────
+    # A single enclosing-scope holder threaded through the three recording
+    # seams (wire → prepare/begin → finish/complete). Index 0 keeps a STRONG
+    # reference to the `InWorkerRecorder` for the whole call (the RecorderIO
+    # encode task is GC-collected mid-call otherwise); index 1 stashes the
+    # presigned upload URL the consent seam mints so teardown can finish the
+    # upload. Both stay None on the egress provider and on every canary /
+    # preflight / no-consent path, so those paths are byte-identical to today.
+    recorder_holder: list[Any] = [None, None]  # [InWorkerRecorder | None, upload_url | None]
+
     # ── 0071 / X4: PER-ITEM TRANSCRIPT DURABILITY IN THE PHONE PATH ────────
     # The browser path persists every turn as it happens; the phone path
     # buffered turns and persisted them only in pairs at question boundaries,
@@ -3645,6 +3657,28 @@ async def _run_phone_session(
         if participant is None:
             return None
         participant_present_anchor[0] = int(round(time.time() * 1000))
+        # ── PR A SEAM 1: WIRE THE IN-WORKER RECORDER BEFORE THE SESSION STARTS ──
+        # RecorderIO's input/output taps must be installed before
+        # `session.start`. This ONLY wires the taps — no frame is captured until
+        # `begin()` at the consent seam, so wiring here records nothing on a call
+        # that never consents. Provider-gated (worker only) and excluded on
+        # canary / preflight rooms, which have their own session lifecycles and
+        # must never be recorded. The `record=` kwarg below is left UNCHANGED —
+        # the Agents-session recorder stays off; the in-worker recorder is a
+        # separate mechanism. Fail-open: any exception here is swallowed so the
+        # call proceeds with no recording rather than crashing.
+        try:
+            if recording.recording_provider() == "worker":
+                room_meta = _room_metadata_from_context(ctx)
+                if not phone.is_canary_room(room_meta) and not phone.is_preflight_room(room_meta):
+                    rec = recording.InWorkerRecorder(session)
+                    if rec.wire():
+                        recorder_holder[0] = rec
+        except Exception:  # noqa: BLE001 — recording is strictly secondary
+            _log.warn(
+                "unknown_event", error_type="phone_recording_wire",
+                error_category="wire_failed",
+            )
         await session.start(agent=agent, room=ctx.room, record=dict(_PHONE_NO_RECORDING))
         return participant
 
@@ -3745,13 +3779,48 @@ async def _run_phone_session(
         except Exception:  # noqa: BLE001
             return None
 
+    async def _phone_recording_permitted_and_begin() -> None:
+        """PR A SEAM 2: the consent-permitted moment.
+
+        Called by the gate ONLY after consent is delivered — the gate already
+        guards it against machine / refusal / opt-out / no-participant. First
+        runs the existing `_phone_recording_permitted` (its log line + ordering
+        contract are preserved unchanged), then, on the worker provider with a
+        recorder wired, asks the API to run the server-side consent gate and
+        mint a presigned upload URL (`prepare_recording`). On a non-None result
+        it starts capture (`begin`) and stashes the upload URL in the holder for
+        teardown. Fail-open: any failure degrades to no recording and never
+        touches the consent decision. Byte-identical to today when the provider
+        is not `worker`."""
+        await _phone_recording_permitted()
+        try:
+            recorder = recorder_holder[0]
+            if recording.recording_provider() != "worker" or recorder is None:
+                return
+            sid = phone.session_id_from_room_name(room_name)
+            if sid is None:
+                return
+            # engagement_id is NOT in scope in this function (WorkerContext
+            # carries none), so it is resolved server-side from attempt_id: the
+            # client omits it and the /recording/prepare route derives it.
+            prepared = await recording_api.prepare_recording(attempt_id, sid)
+            if not prepared:
+                return  # refusal / no binding ⇒ do NOT record
+            if await recorder.begin(prepared["object_key"]):
+                recorder_holder[1] = prepared["upload_url"]
+        except Exception:  # noqa: BLE001 — recording is strictly secondary
+            _log.warn(
+                "unknown_event", error_type="phone_recording_begin",
+                error_category="begin_failed",
+            )
+
     result = await phone.run_phone_gate(
         attempt_id=attempt_id,
         client=events,
         wait_for_participant=wait_for_participant,
         classify=classify,
         say=say,
-        start_recording=_phone_recording_permitted,
+        start_recording=_phone_recording_permitted_and_begin,
         epoch=epoch,
         # F2 (2026-08-29 consent replay): consulted once before the disclosure
         # so a mid-call re-dispatch resumes instead of re-asking for consent.
@@ -3776,240 +3845,280 @@ async def _run_phone_session(
         session_id=phone.session_id_from_room_name(room_name),
     )
 
-    if not result.assessment_allowed:
-        # Machine, refusal, opt-out, wrong number, silent line: the attempt is
-        # over. No scoring is triggered and no writeback is attempted, because
-        # neither is reachable from here at all.
-        await _close_phone_room(room_name)
-        return result
+    async def _finish_recording() -> None:
+        """PR A SEAM 3: the SINGLE common teardown for the recording.
 
-    # ── 0044: the DURABLE screening ───────────────────────────────────
-    # The session id comes from the ROOM NAME, which the dialer derives from it
-    # — `phone-<sessionId>` — and the server re-verifies that binding before it
-    # will bind anything. A room whose name does not parse is one the worker
-    # cannot account for, so it screens nobody.
-    session_id = phone.session_id_from_room_name(room_name)
-    if session_id is None:
-        _log.warn(
-            "unknown_event", error_type="phone_assessment_unstarted",
-            error_category="session_unresolved",
-        )
-        await _close_phone_room(room_name)
-        return result
+        Called from the `finally` below, so it covers EVERY terminal return of
+        the post-gate body — the adopt/recover/abort branches inside `_screen`,
+        the lease-halt cancel, the normal completion, and any exception path.
+        A recording only EXISTS here when consent was durably applied (the gate
+        invokes `begin` at exactly one point, after which `assessment_allowed`
+        is always True), so `finish()` — upload + complete — is the correct
+        normal terminal; `discard()` is unnecessary because no recording is ever
+        begun on a non-consenting path. No-op unless a recording was begun AND
+        an upload URL was minted. Fail-open: nothing here can affect the
+        screening verdict, which has already been decided."""
+        recorder = recorder_holder[0]
+        upload_url = recorder_holder[1]
+        if recorder is None or upload_url is None or not recorder.active:
+            return
+        try:
+            manifest = await recorder.finish(upload_url)
+            if manifest is None:
+                return
+            sid = phone.session_id_from_room_name(room_name)
+            if sid is None:
+                return
+            await recording_api.complete_recording(
+                attempt_id, sid, manifest.sha256, manifest.size_bytes,
+                manifest.duration_ms,
+            )
+        except Exception:  # noqa: BLE001 — recording is strictly secondary
+            _log.warn(
+                "unknown_event", error_type="phone_recording_finish",
+                error_category="finish_failed",
+            )
 
-    # ── P5: THE LEASE MUST OUTLIVE THE CONVERSATION ───────────────────
-    # Everything below this point is the conversation itself, and the
-    # concurrency lease this leg holds was sized to cover the ORIGINATE — 75-odd
-    # seconds from the dial, of which a candidate who answered on the last ring
-    # has already spent most. A screening runs for minutes. Unrenewed, the lease
-    # lapses mid-call: the fleet slot is released the instant it does (the cap
-    # counts `lease_expires_at > now`), an eleventh call becomes admissible
-    # while the tenth is still talking, the reclaim sweep marks this attempt
-    # `abandoned` and moves the engagement out of `in_call`, and the assessment
-    # this leg goes on to score is then ignored because that edge is gated on
-    # `in_call`. A screening that was conducted and scored is lost, silently.
-    #
-    # WHY HERE. The gate above is not a conversation — it is a ring, a fixed
-    # disclosure line and a classification, which is what the originate lease
-    # was sized for and which ends with no candidate on the line at all on every
-    # branch but one. The heartbeat starts at the first instant the call IS a
-    # consented human conversation, and it covers all of it: the assessment
-    # start, the recovery branches, every question boundary and the completion.
-    # It is cancelled in a `finally`, so no exception path can leave it beating.
-    lease_halt: dict[str, str] = {}
-    running: dict[str, Any] = {}
+    try:
+        if not result.assessment_allowed:
+            # Machine, refusal, opt-out, wrong number, silent line: the attempt is
+            # over. No scoring is triggered and no writeback is attempted, because
+            # neither is reachable from here at all.
+            await _close_phone_room(room_name)
+            return result
 
-    async def halt_for_lease(reason: str) -> None:
-        """Stop the conversation. Called only when the slot cannot be proved.
-
-        Cancelling the screening task is the whole mechanism: it is how a call
-        conducted by one task is ended by another without an exception escaping
-        a background beat that nobody awaits. The reason is recorded FIRST so
-        the cancellation can be told apart from a real one at the await.
-        """
-        lease_halt["reason"] = reason
-        task = running.get("screening")
-        if task is not None and not task.done():
-            task.cancel()
-
-    async def _screen() -> phone.PhoneGateResult:
-        # The atomic consent/start RPC already returned the full assessment
-        # state; a second `/assessment/start` round trip here was pure audible
-        # dead air between consent and the first question. Legacy gate paths
-        # (no combined RPC) still fetch it.
-        gate_state = getattr(result, "assessment_state", None)
-        state = gate_state if gate_state is not None and gate_state.ok \
-            else await events.start_assessment(attempt_id, session_id)
-        if not state.ok:
-            # ── A REFUSED START IS NOT PROOF THAT NOTHING HAPPENED ────────
-            # `session_not_active` is exactly what a session that is ALREADY
-            # COMPLETED presents — which is the state a scored-but-unacknowledged
-            # screening is in. The chain that produces it: the completion endpoint
-            # succeeded, inserted the assessment and lost its response; this leg
-            # halted and posted nothing (correct); the webhook granted a reconnect;
-            # and now the reconnecting leg is being told the session is not active.
-            #
-            # Aborting here would drive the engagement to terminal `failed` over a
-            # screening that exists and is scored, and terminal is unrecoverable —
-            # `apply_phone_event` short-circuits every later post with
-            # `ignored: terminal`. So the completion endpoint is asked FIRST. It is
-            # idempotent by construction and answers `scored` when the row is
-            # there, so this recovers the acknowledgement without re-screening
-            # anybody and without inventing a claim: the row still decides.
+        # ── 0044: the DURABLE screening ───────────────────────────────────
+        # The session id comes from the ROOM NAME, which the dialer derives from it
+        # — `phone-<sessionId>` — and the server re-verifies that binding before it
+        # will bind anything. A room whose name does not parse is one the worker
+        # cannot account for, so it screens nobody.
+        session_id = phone.session_id_from_room_name(room_name)
+        if session_id is None:
             _log.warn(
                 "unknown_event", error_type="phone_assessment_unstarted",
-                error_category=state.status,
+                error_category="session_unresolved",
             )
-            # ── ADOPT A SCORED SCREENING, DO NOT RE-DO IT ────────────────
-            # `already_scored` is the database saying: this session is
-            # `completed` and a phone-sourced assessment row exists. There is
-            # nothing to screen, nothing to score and nothing to write — the only
-            # thing missing is the acknowledgement, which the leg that produced it
-            # could not deliver.
-            #
-            # So this posts the completion DIRECTLY. It does not call the
-            # completion endpoint, which would re-enter the scoring path to reach
-            # the same row; it does not re-ask a question; and it cannot produce a
-            # second writeback, because it performs no write at all. The post is
-            # idempotent by 0042's deterministic internal event id, so a leg that
-            # does this twice converges on the first verdict rather than writing a
-            # second ledger row — and 0044's interlock accepts it precisely
-            # because the row the RPC just found is there.
-            if state.status == phone.ASSESSMENT_ALREADY_SCORED_STATUS:
-                _log.info(
-                    "unknown_event", error_type="phone_assessment_adopted",
+            await _close_phone_room(room_name)
+            return result
+
+        # ── P5: THE LEASE MUST OUTLIVE THE CONVERSATION ───────────────────
+        # Everything below this point is the conversation itself, and the
+        # concurrency lease this leg holds was sized to cover the ORIGINATE — 75-odd
+        # seconds from the dial, of which a candidate who answered on the last ring
+        # has already spent most. A screening runs for minutes. Unrenewed, the lease
+        # lapses mid-call: the fleet slot is released the instant it does (the cap
+        # counts `lease_expires_at > now`), an eleventh call becomes admissible
+        # while the tenth is still talking, the reclaim sweep marks this attempt
+        # `abandoned` and moves the engagement out of `in_call`, and the assessment
+        # this leg goes on to score is then ignored because that edge is gated on
+        # `in_call`. A screening that was conducted and scored is lost, silently.
+        #
+        # WHY HERE. The gate above is not a conversation — it is a ring, a fixed
+        # disclosure line and a classification, which is what the originate lease
+        # was sized for and which ends with no candidate on the line at all on every
+        # branch but one. The heartbeat starts at the first instant the call IS a
+        # consented human conversation, and it covers all of it: the assessment
+        # start, the recovery branches, every question boundary and the completion.
+        # It is cancelled in a `finally`, so no exception path can leave it beating.
+        lease_halt: dict[str, str] = {}
+        running: dict[str, Any] = {}
+
+        async def halt_for_lease(reason: str) -> None:
+            """Stop the conversation. Called only when the slot cannot be proved.
+
+            Cancelling the screening task is the whole mechanism: it is how a call
+            conducted by one task is ended by another without an exception escaping
+            a background beat that nobody awaits. The reason is recorded FIRST so
+            the cancellation can be told apart from a real one at the await.
+            """
+            lease_halt["reason"] = reason
+            task = running.get("screening")
+            if task is not None and not task.done():
+                task.cancel()
+
+        async def _screen() -> phone.PhoneGateResult:
+            # The atomic consent/start RPC already returned the full assessment
+            # state; a second `/assessment/start` round trip here was pure audible
+            # dead air between consent and the first question. Legacy gate paths
+            # (no combined RPC) still fetch it.
+            gate_state = getattr(result, "assessment_state", None)
+            state = gate_state if gate_state is not None and gate_state.ok \
+                else await events.start_assessment(attempt_id, session_id)
+            if not state.ok:
+                # ── A REFUSED START IS NOT PROOF THAT NOTHING HAPPENED ────────
+                # `session_not_active` is exactly what a session that is ALREADY
+                # COMPLETED presents — which is the state a scored-but-unacknowledged
+                # screening is in. The chain that produces it: the completion endpoint
+                # succeeded, inserted the assessment and lost its response; this leg
+                # halted and posted nothing (correct); the webhook granted a reconnect;
+                # and now the reconnecting leg is being told the session is not active.
+                #
+                # Aborting here would drive the engagement to terminal `failed` over a
+                # screening that exists and is scored, and terminal is unrecoverable —
+                # `apply_phone_event` short-circuits every later post with
+                # `ignored: terminal`. So the completion endpoint is asked FIRST. It is
+                # idempotent by construction and answers `scored` when the row is
+                # there, so this recovers the acknowledgement without re-screening
+                # anybody and without inventing a claim: the row still decides.
+                _log.warn(
+                    "unknown_event", error_type="phone_assessment_unstarted",
                     error_category=state.status,
                 )
-                # The candidate is on the line and has just heard the recording
-                # disclosure. Hanging up without a word on a leg that SUCCEEDED —
-                # which is what an adoption is — would make a recovered screening
-                # end worse than a failed one. The closing line is fixed copy and
-                # is not a transcript turn, so saying it records nothing.
-                await say(phone.PHONE_ASSESSMENT_CLOSING_TEXT)
-                await events.post_event(attempt_id, "assessment.completed")
-                await _close_phone_room(room_name)
-                return result
-
-            # `session_not_active` WITHOUT a row is the other half: the session was
-            # completed but never scored. The completion endpoint can still finish
-            # that, so it is asked — and the ROW still decides.
-            if state.status == "session_not_active":
-                recovered = await events.complete_assessment(attempt_id, session_id)
-                if recovered.ok:
+                # ── ADOPT A SCORED SCREENING, DO NOT RE-DO IT ────────────────
+                # `already_scored` is the database saying: this session is
+                # `completed` and a phone-sourced assessment row exists. There is
+                # nothing to screen, nothing to score and nothing to write — the only
+                # thing missing is the acknowledgement, which the leg that produced it
+                # could not deliver.
+                #
+                # So this posts the completion DIRECTLY. It does not call the
+                # completion endpoint, which would re-enter the scoring path to reach
+                # the same row; it does not re-ask a question; and it cannot produce a
+                # second writeback, because it performs no write at all. The post is
+                # idempotent by 0042's deterministic internal event id, so a leg that
+                # does this twice converges on the first verdict rather than writing a
+                # second ledger row — and 0044's interlock accepts it precisely
+                # because the row the RPC just found is there.
+                if state.status == phone.ASSESSMENT_ALREADY_SCORED_STATUS:
                     _log.info(
-                        "unknown_event", error_type="phone_assessment_recovered",
-                        error_category=recovered.status,
+                        "unknown_event", error_type="phone_assessment_adopted",
+                        error_category=state.status,
                     )
+                    # The candidate is on the line and has just heard the recording
+                    # disclosure. Hanging up without a word on a leg that SUCCEEDED —
+                    # which is what an adoption is — would make a recovered screening
+                    # end worse than a failed one. The closing line is fixed copy and
+                    # is not a transcript turn, so saying it records nothing.
                     await say(phone.PHONE_ASSESSMENT_CLOSING_TEXT)
                     await events.post_event(attempt_id, "assessment.completed")
                     await _close_phone_room(room_name)
                     return result
-                if phone.retryable_completion(recovered):
-                    # Still no answer we can act on. Post NOTHING rather than
-                    # terminalising a screening whose state we do not know.
-                    _log.warn(
-                        "unknown_event", error_type="phone_assessment_halted_leg",
-                        error_category=phone.HALT_SCORING,
-                    )
-                    await _close_phone_room(room_name)
-                    return result
-            # No plan and nothing to recover. The leg ends without claiming
-            # anything; `assessment.aborted` is the truthful terminal.
-            await events.post_event(attempt_id, "assessment.aborted")
-            await _close_phone_room(room_name)
-            return result
 
-        # 0071 / X4: the session is `in_progress` and the plan is snapshotted,
-        # so every conversation item from here is a scored assessment turn.
-        # Arm per-item persistence: `_on_phone_item` now writes each turn as it
-        # lands (is_gate=false), giving the phone path the browser path's crash
-        # durability. Gate-phase items above this line stay unpersisted here —
-        # they belong to the is_gate=true gate writer.
-        assessment_persist_active[0] = True
+                # `session_not_active` WITHOUT a row is the other half: the session was
+                # completed but never scored. The completion endpoint can still finish
+                # that, so it is asked — and the ROW still decides.
+                if state.status == "session_not_active":
+                    recovered = await events.complete_assessment(attempt_id, session_id)
+                    if recovered.ok:
+                        _log.info(
+                            "unknown_event", error_type="phone_assessment_recovered",
+                            error_category=recovered.status,
+                        )
+                        await say(phone.PHONE_ASSESSMENT_CLOSING_TEXT)
+                        await events.post_event(attempt_id, "assessment.completed")
+                        await _close_phone_room(room_name)
+                        return result
+                    if phone.retryable_completion(recovered):
+                        # Still no answer we can act on. Post NOTHING rather than
+                        # terminalising a screening whose state we do not know.
+                        _log.warn(
+                            "unknown_event", error_type="phone_assessment_halted_leg",
+                            error_category=phone.HALT_SCORING,
+                        )
+                        await _close_phone_room(room_name)
+                        return result
+                # No plan and nothing to recover. The leg ends without claiming
+                # anything; `assessment.aborted` is the truthful terminal.
+                await events.post_event(attempt_id, "assessment.aborted")
+                await _close_phone_room(room_name)
+                return result
 
-        return await _run_native_phone_screening(
-            session=session,
-            agent=agent,
-            events=events,
-            state=state,
-            attempt_id=attempt_id,
-            session_id=session_id,
-            room_name=room_name,
-            result=result,
-            latest_assistant=latest_assistant,
-            latest_assistant_anchor=latest_assistant_anchor,
-            latest_candidate_anchor=latest_candidate_anchor,
-            candidate_end_requested=candidate_end_requested,
-            reply_started=reply_started,
-            speech_first_audio=speech_first_audio,
-            speech_sequence=speech_sequence,
-            reply_handle=reply_handle,
-            assistant_delivery_complete=assistant_delivery_complete,
-            candidate_activity=candidate_activity,
-            agent_listening=agent_listening,
-            agent_activity_changed=agent_activity_changed,
-            close_event=close_event,
-            endpoint_delay_eou=endpoint_delay_eou,
-            latency_state=latency_state,
-            turn_mode=turn_mode,
-            coverage_judge_enabled=coverage_judge_enabled,
-        )
+            # 0071 / X4: the session is `in_progress` and the plan is snapshotted,
+            # so every conversation item from here is a scored assessment turn.
+            # Arm per-item persistence: `_on_phone_item` now writes each turn as it
+            # lands (is_gate=false), giving the phone path the browser path's crash
+            # durability. Gate-phase items above this line stay unpersisted here —
+            # they belong to the is_gate=true gate writer.
+            assessment_persist_active[0] = True
 
-    heartbeat_task = asyncio.create_task(
-        phone.run_phone_heartbeat(
-            attempt_id=attempt_id,
-            session_id=session_id,
-            epoch=epoch,
-            client=events,
-            halt=halt_for_lease,
-        )
-    )
-    try:
-        screening = asyncio.ensure_future(_screen())
-        running["screening"] = screening
-        try:
-            return await screening
-        except asyncio.CancelledError:
-            reason = lease_halt.get("reason")
-            if reason is None:
-                # Not ours. Someone cancelled this session for another reason
-                # and swallowing that would hide a shutdown.
-                raise
-            # A LOST OR UNPROVABLE LEASE POSTS NOTHING — it is a retryable halt
-            # in `phone.RETRYABLE_HALTS` for the same reason a failed boundary
-            # is. The conversation is interrupted, not over: the reclaim sweep
-            # has already restored the engagement's previous state, so
-            # `assessment.aborted` would be untrue AND ignored (that edge is
-            # gated on `in_call`), and `assessment.completed` would be a claim
-            # about a screening that did not finish. 0042's reconnect budget
-            # owns what happens next. The room is closed so the SIP leg on the
-            # slot we no longer hold actually goes away.
-            _log.warn(
-                "unknown_event", error_type="phone_assessment_halted_leg",
-                error_category=reason,
+            return await _run_native_phone_screening(
+                session=session,
+                agent=agent,
+                events=events,
+                state=state,
+                attempt_id=attempt_id,
+                session_id=session_id,
+                room_name=room_name,
+                result=result,
+                latest_assistant=latest_assistant,
+                latest_assistant_anchor=latest_assistant_anchor,
+                latest_candidate_anchor=latest_candidate_anchor,
+                candidate_end_requested=candidate_end_requested,
+                reply_started=reply_started,
+                speech_first_audio=speech_first_audio,
+                speech_sequence=speech_sequence,
+                reply_handle=reply_handle,
+                assistant_delivery_complete=assistant_delivery_complete,
+                candidate_activity=candidate_activity,
+                agent_listening=agent_listening,
+                agent_activity_changed=agent_activity_changed,
+                close_event=close_event,
+                endpoint_delay_eou=endpoint_delay_eou,
+                latency_state=latency_state,
+                turn_mode=turn_mode,
+                coverage_judge_enabled=coverage_judge_enabled,
             )
-            await _close_phone_room(room_name)
-            return result
+
+        heartbeat_task = asyncio.create_task(
+            phone.run_phone_heartbeat(
+                attempt_id=attempt_id,
+                session_id=session_id,
+                epoch=epoch,
+                client=events,
+                halt=halt_for_lease,
+            )
+        )
+        try:
+            screening = asyncio.ensure_future(_screen())
+            running["screening"] = screening
+            try:
+                return await screening
+            except asyncio.CancelledError:
+                reason = lease_halt.get("reason")
+                if reason is None:
+                    # Not ours. Someone cancelled this session for another reason
+                    # and swallowing that would hide a shutdown.
+                    raise
+                # A LOST OR UNPROVABLE LEASE POSTS NOTHING — it is a retryable halt
+                # in `phone.RETRYABLE_HALTS` for the same reason a failed boundary
+                # is. The conversation is interrupted, not over: the reclaim sweep
+                # has already restored the engagement's previous state, so
+                # `assessment.aborted` would be untrue AND ignored (that edge is
+                # gated on `in_call`), and `assessment.completed` would be a claim
+                # about a screening that did not finish. 0042's reconnect budget
+                # owns what happens next. The room is closed so the SIP leg on the
+                # slot we no longer hold actually goes away.
+                _log.warn(
+                    "unknown_event", error_type="phone_assessment_halted_leg",
+                    error_category=reason,
+                )
+                await _close_phone_room(room_name)
+                return result
+        finally:
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+            # 0071 / X4: drain any in-flight per-item transcript writes so a clean
+            # end does not drop the last turn's persistence. Best-effort and
+            # bounded: a wedged write must not stall teardown, and the boundary
+            # path remains the durable authority for anything not yet flushed.
+            if persist_tasks:
+                inflight = [t for t in persist_tasks if not t.done()]
+                if inflight:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(*inflight, return_exceptions=True),
+                            timeout=PHONE_TERMINAL_REPLY_TIMEOUT_SEC,
+                        )
+                    except asyncio.TimeoutError:
+                        _log.warn(
+                            "unknown_event", error_type="phone_item_persist",
+                            error_category="item_persist_drain_timeout",
+                        )
     finally:
-        heartbeat_task.cancel()
-        await asyncio.gather(heartbeat_task, return_exceptions=True)
-        # 0071 / X4: drain any in-flight per-item transcript writes so a clean
-        # end does not drop the last turn's persistence. Best-effort and
-        # bounded: a wedged write must not stall teardown, and the boundary
-        # path remains the durable authority for anything not yet flushed.
-        if persist_tasks:
-            inflight = [t for t in persist_tasks if not t.done()]
-            if inflight:
-                try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*inflight, return_exceptions=True),
-                        timeout=PHONE_TERMINAL_REPLY_TIMEOUT_SEC,
-                    )
-                except asyncio.TimeoutError:
-                    _log.warn(
-                        "unknown_event", error_type="phone_item_persist",
-                        error_category="item_persist_drain_timeout",
-                    )
+        # PR A SEAM 3: finish + complete the in-worker recording on EVERY
+        # terminal path of the post-gate body. No-op unless a recording was
+        # begun after consent; fail-open by construction.
+        await _finish_recording()
 
 
 

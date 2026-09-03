@@ -45,6 +45,14 @@ interface BuildOpts {
   attachDuplicate?: boolean;
   finalizeStatus?: 'ready' | 'fallback_required' | 'pending';
   finalizeThrows?: boolean;
+  /** When set, wires a resolveEngagement dep so an omitted engagement_id can be
+   *  resolved server-side (PR A in-worker recorder path). */
+  resolveEngagement?: ((attemptId: string) => Promise<{
+    engagementId: string;
+    engagementState: string;
+    version: number;
+    sessionId?: string;
+  } | null>) | undefined;
 }
 
 function build(opts: BuildOpts = {}) {
@@ -85,6 +93,7 @@ function build(opts: BuildOpts = {}) {
       recordingProvider: opts.recordingProvider ?? 'egress',
       uploadSigner: opts.withSigner === false ? undefined : uploadSigner,
       finalizeRecording,
+      resolveEngagement: opts.resolveEngagement,
     }),
   );
 
@@ -192,6 +201,38 @@ describe('provider=worker prepare — reuses the consent gate', () => {
     const h = build({ recordingProvider: 'worker' });
     const res = await request(h.app).post(PREPARE).send(PREPARE_BODY);
     expect(res.status).toBe(401);
+  });
+
+  it('resolves engagement_id server-side when the worker omits it', async () => {
+    // PR A: the in-worker recorder has no engagement id in scope, so it omits
+    // the field and the server derives it from the attempt via resolveEngagement.
+    const resolveEngagement = vi.fn(async () => ({
+      engagementId: ENGAGEMENT,
+      engagementState: 'in_call',
+      version: 1,
+    }));
+    const h = build({ recordingProvider: 'worker', resolveEngagement });
+    const res = await authed(h.app, PREPARE, { attempt_id: ATTEMPT, session_id: SESSION });
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.status).toBe('prepared');
+    expect(res.body.object_key).toBe(`phone-${ATTEMPT}-egress.mp3`);
+    expect(resolveEngagement).toHaveBeenCalledWith(ATTEMPT);
+    // The consent gate still ran with the server-resolved engagement.
+    expect(h.attach).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails closed with unknown_attempt when engagement_id is omitted and unresolvable', async () => {
+    // No resolver wired ⇒ an omitted engagement id cannot be derived; bind
+    // nothing and say so truthfully rather than fabricate an id.
+    const h = build({ recordingProvider: 'worker' });
+    const res = await authed(h.app, PREPARE, { attempt_id: ATTEMPT, session_id: SESSION });
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(false);
+    expect(res.body.status).toBe('unknown_attempt');
+    expect(res.body.upload_url).toBeUndefined();
+    expect(h.attach).not.toHaveBeenCalled();
+    expect(h.createUploadUrl).not.toHaveBeenCalled();
   });
 });
 
