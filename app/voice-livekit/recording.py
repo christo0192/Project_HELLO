@@ -126,8 +126,6 @@ class InWorkerRecorder:
         self,
         session: Any,
         *,
-        object_key: str,
-        upload_url: str,
         sample_rate: int = _SAMPLE_RATE,
         work_dir: Optional[Path] = None,
         recorder_factory: RecorderFactory = _default_recorder_factory,
@@ -135,8 +133,10 @@ class InWorkerRecorder:
         upload_fn: UploadFn = _default_upload,
     ) -> None:
         self._session = session
-        self._object_key = object_key
-        self._upload_url = upload_url
+        # object_key + upload_url arrive from the API /recording/prepare call at
+        # the consent-permitted moment — NOT at construction — because prepare
+        # runs the consent gate and only then mints them.
+        self._object_key: Optional[str] = None
         self._sample_rate = sample_rate
         self._work_dir = work_dir
         self._recorder_factory = recorder_factory
@@ -171,25 +171,25 @@ class InWorkerRecorder:
             self._wired = True
             return True
         except Exception:  # noqa: BLE001 — fail-open by contract
-            logger.warning(
-                "in_worker_recording_wire_failed", extra={"object_key": self._object_key},
-                exc_info=True,
-            )
+            logger.warning("in_worker_recording_wire_failed", exc_info=True)
             self._failed = True
             self._recorder = None
             return False
 
-    async def begin(self) -> bool:
-        """Start recording at the consent moment. Everything spoken from here on
-        is captured; nothing before it is. Idempotent and fail-open."""
+    async def begin(self, object_key: str) -> bool:
+        """Start recording at the recording-permitted moment, using the object
+        key the API bound in /recording/prepare. Everything from here on is
+        captured; nothing before it is (RecorderAudioInput only accumulates while
+        RecorderIO.recording is True). Idempotent and fail-open."""
         if self._failed or not self._wired or self._recorder is None:
             return False
         if self._begun:
             return True
         try:
+            self._object_key = object_key
             base = self._work_dir or Path(tempfile.gettempdir()) / "inworker-recordings"
             base.mkdir(parents=True, exist_ok=True)
-            self._ogg_path = base / (Path(self._object_key).name + ".ogg")
+            self._ogg_path = base / (Path(object_key).name + ".ogg")
             await self._recorder.start(output_path=self._ogg_path)
             self._begun = True
             logger.info("in_worker_recording_started", extra={"object_key": self._object_key})
@@ -202,11 +202,11 @@ class InWorkerRecorder:
             self._failed = True
             return False
 
-    async def finish(self) -> Optional[RecordingManifest]:
-        """Close the recorder, transcode OGG→MP3, upload to the presigned URL,
-        and return the manifest. Returns None (fail-open) if recording never
-        began or any step fails — the call is already over, so nothing here can
-        harm the screening."""
+    async def finish(self, upload_url: str) -> Optional[RecordingManifest]:
+        """Close the recorder, transcode OGG→MP3, upload to the presigned URL
+        the API minted, and return the manifest. Returns None (fail-open) if
+        recording never began or any step fails — the call is already over, so
+        nothing here can harm the screening."""
         if not self._begun or self._failed or self._recorder is None or self._ogg_path is None:
             return None
         try:
@@ -224,7 +224,7 @@ class InWorkerRecorder:
             body = mp3_path.read_bytes()
             if not body:
                 raise RuntimeError("empty_mp3")
-            await self._upload_fn(self._upload_url, body)
+            await self._upload_fn(upload_url, body)
         except Exception:  # noqa: BLE001
             logger.warning(
                 "in_worker_recording_finish_failed", extra={"object_key": self._object_key},

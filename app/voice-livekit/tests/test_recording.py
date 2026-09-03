@@ -85,14 +85,24 @@ def _make(session=None, *, fail_wire=False, fail_start=False, transcode=None, up
 
     r = rec.InWorkerRecorder(
         session,
-        object_key="phone/attempts/abc123.mp3",
-        upload_url="https://example.test/put?sig=x",
         work_dir=tmp,
         recorder_factory=factory,
         transcode_fn=transcode or default_transcode,
         upload_fn=upload or default_upload,
     )
     return r, session, holder
+
+
+OBJECT_KEY = "phone/attempts/abc123.mp3"
+UPLOAD_URL = "https://example.test/put?sig=x"
+
+
+def _begin(r):
+    return _run(r.begin(OBJECT_KEY))
+
+
+def _finish(r):
+    return _run(r.finish(UPLOAD_URL))
 
 
 class TestInWorkerRecorderLifecycle(unittest.TestCase):
@@ -120,8 +130,8 @@ class TestInWorkerRecorderLifecycle(unittest.TestCase):
     def test_begin_starts_recording_once_and_is_idempotent(self):
         r, _session, holder = _make()
         r.wire()
-        self.assertTrue(_run(r.begin()))
-        self.assertTrue(_run(r.begin()))  # idempotent
+        self.assertTrue(_begin(r))
+        self.assertTrue(_begin(r))  # idempotent
         rec_obj = holder["recorder"]
         starts = [c for c in rec_obj.calls if isinstance(c, tuple) and c[0] == "start"]
         self.assertEqual(len(starts), 1)
@@ -134,8 +144,8 @@ class TestInWorkerRecorderLifecycle(unittest.TestCase):
         uploaded = {}
         r, _session, holder = _make(uploaded=uploaded)
         r.wire()
-        _run(r.begin())
-        manifest = _run(r.finish())
+        _begin(r)
+        manifest = _finish(r)
         self.assertIsNotNone(manifest)
         self.assertEqual(manifest.size_bytes, len(b"ID3fake-mp3-bytes"))
         self.assertEqual(len(manifest.sha256), 64)
@@ -149,17 +159,17 @@ class TestInWorkerRecorderLifecycle(unittest.TestCase):
         uploaded = {}
         r, _session, holder = _make(uploaded=uploaded)
         r.wire()
-        _run(r.begin())
+        _begin(r)
         _run(r.discard())
         self.assertIn("aclose", holder["recorder"].calls)
         self.assertNotIn("url", uploaded)
-        self.assertIsNone(_run(r.finish()))
+        self.assertIsNone(_finish(r))
         self.assertNotIn("url", uploaded)
 
     def test_finish_without_begin_returns_none(self):
         r, _session, _holder = _make()
         r.wire()
-        self.assertIsNone(_run(r.finish()))
+        self.assertIsNone(_finish(r))
 
     # ── fail-open guarantees ─────────────────────────────────────────────
     def test_wire_failure_is_fail_open(self):
@@ -168,15 +178,15 @@ class TestInWorkerRecorderLifecycle(unittest.TestCase):
         self.assertFalse(r.active)
         # audio untouched — the call proceeds with no recording, not a crash
         self.assertEqual(session.input.audio, "candidate_audio")
-        self.assertFalse(_run(r.begin()))
-        self.assertIsNone(_run(r.finish()))
+        self.assertFalse(_begin(r))
+        self.assertIsNone(_finish(r))
 
     def test_begin_failure_is_fail_open(self):
         r, _session, _holder = _make(fail_start=True)
         r.wire()
-        self.assertFalse(_run(r.begin()))
+        self.assertFalse(_begin(r))
         self.assertFalse(r.active)
-        self.assertIsNone(_run(r.finish()))
+        self.assertIsNone(_finish(r))
 
     def test_transcode_failure_is_fail_open(self):
         async def boom_transcode(ogg, mp3):
@@ -184,8 +194,8 @@ class TestInWorkerRecorderLifecycle(unittest.TestCase):
 
         r, _session, _holder = _make(transcode=boom_transcode)
         r.wire()
-        _run(r.begin())
-        self.assertIsNone(_run(r.finish()))  # swallowed, no raise
+        _begin(r)
+        self.assertIsNone(_finish(r))  # swallowed, no raise
 
     def test_upload_failure_is_fail_open(self):
         async def boom_upload(url, body):
@@ -193,8 +203,8 @@ class TestInWorkerRecorderLifecycle(unittest.TestCase):
 
         r, _session, _holder = _make(upload=boom_upload)
         r.wire()
-        _run(r.begin())
-        self.assertIsNone(_run(r.finish()))
+        _begin(r)
+        self.assertIsNone(_finish(r))
 
 
 class TestRecordingProvider(unittest.TestCase):
