@@ -70,6 +70,7 @@ export {
   type PhoneDialRefusal,
   type PhoneDialRequest,
   type PhoneDialResult,
+  type PhoneWorkerReadyGate,
 } from './dial.js';
 
 export {

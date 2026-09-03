@@ -27,6 +27,7 @@ import phone
 import phone_canary
 import recording
 import recording_api
+import worker_ready_api
 from closing import ClosingState, ClosingStateMachine
 from observability import (
     Span,
@@ -3200,6 +3201,27 @@ async def _run_phone_session(
 ) -> phone.PhoneGateResult:
     """Connect, wait, disclose, classify — then, and only then, screen."""
     await ctx.connect()
+
+    # ── ON-DEMAND ORCHESTRATION: SIGNAL READY BEFORE WAITING FOR ANYONE ──
+    # phone-cost-and-scale-plan §2.3. The moment we are connected to the room
+    # we were dispatched into, tell the API this worker is registered + ready
+    # so its `ensureReadyWorker` poll can stop and let the dial proceed — the
+    # whole point of on-demand start-then-dial is that the candidate is never
+    # dialled before a worker is present. Posted HERE, before the participant
+    # wait, because waiting for the SIP participant is exactly the latency this
+    # signal exists to unblock. Gated OFF by default (WORKER_ORCHESTRATION !=
+    # "worker") and FAIL-OPEN: a lost ping degrades to the API's start-wait
+    # budget + reaper, never to a raised exception into the call path.
+    if worker_ready_api.worker_orchestration_enabled():
+        ready_session_id = phone.session_id_from_room_name(room_name)
+        if ready_session_id is not None:
+            try:
+                await worker_ready_api.post_worker_ready(ready_session_id, epoch)
+            except Exception:  # noqa: BLE001
+                # Belt-and-braces: the client is already fail-open, but the
+                # readiness signal must never be able to fail the screening.
+                pass
+
     events = client if client is not None else phone.PhoneEventClient()
 
     # Construct from server-verified context, never from a post-start mutation.

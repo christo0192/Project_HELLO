@@ -80,7 +80,13 @@ import {
   phoneRoomName,
   resolvePhoneSipClient,
   type PhoneDialConfig,
+  type PhoneWorkerReadyGate,
 } from '../../integrations/livekit-phone-dial/index.js';
+import {
+  createDefaultWorkerOrchestrationService,
+  type WorkerOrchestrationService,
+} from '../worker-orchestration.js';
+import { PHONE_FLY_APP } from '../worker-orchestration-runtime.js';
 import {
   loadLiveKitPhoneConfig,
   runPhoneReconciliation,
@@ -446,6 +452,33 @@ export function createPhoneRuntime(
   };
   const roomClients = createPhoneRoomClients(credentials, dialConfig.agentName);
 
+  // ── THE ON-DEMAND WORKER GATE, ARMED ONLY BEHIND THE MASTER FLAG ─────
+  // phone-cost-and-scale-plan §2.3. When `env.workerOrchestration` is off
+  // (the default), `workerGate` is undefined and every dial is byte-identical
+  // to today: `dialPhoneAttempt` never consults a gate, claims no machine and
+  // makes no Fly call. When it is on, the gate defers a dial that has no ready
+  // worker (`worker_not_ready`) instead of dialling a candidate into a room
+  // nothing will answer. The service is built once and shared; it is itself
+  // inert unless the same flag is on, so this construction is also cheap and
+  // safe on the off path — but we still only build it behind the flag so a
+  // deploy with the flag off constructs no Fly client at all.
+  const orchestrationService: WorkerOrchestrationService | null =
+    env.workerOrchestration ? createDefaultWorkerOrchestrationService() : null;
+  const workerGate: PhoneWorkerReadyGate | undefined =
+    orchestrationService === null
+      ? undefined
+      : {
+          app: PHONE_FLY_APP,
+          ensureReadyWorker: (input) =>
+            orchestrationService.ensureReadyWorker({
+              app: input.app,
+              pipeline: input.pipeline,
+              sessionId: input.sessionId,
+              epoch: input.epoch,
+            }),
+          releaseWorker: (input) => orchestrationService.releaseWorker(input),
+        };
+
   // ── THE CLAIM GATE, CACHED AND FAIL-CLOSED ───────────────────────────
   // The header of this file promised a `shouldClaim` that inverts recording's
   // fail-OPEN halt, and for one commit it promised it without passing one.
@@ -560,6 +593,9 @@ export function createPhoneRuntime(
                   sip: sip.client,
                   room: roomClients,
                   leaseOwner: owner,
+                  // Undefined unless `env.workerOrchestration` is on ⇒ the dial
+                  // path is byte-identical to today by default.
+                  workerGate,
                 });
                 // `detail` is carried, not dropped. It is admission's
                 // stable sub-code, and dropping it here is precisely how

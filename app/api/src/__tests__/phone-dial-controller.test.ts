@@ -138,6 +138,8 @@ interface Harness {
   createRoom: ReturnType<typeof vi.fn>;
   updateRoomMetadata: ReturnType<typeof vi.fn>;
   dispatch: ReturnType<typeof vi.fn>;
+  ensureReadyWorker: ReturnType<typeof vi.fn>;
+  releaseWorker: ReturnType<typeof vi.fn>;
 }
 
 function harness(opts: {
@@ -149,6 +151,17 @@ function harness(opts: {
   roomFails?: boolean;
   sip?: PhoneSipClient;
   originate?: () => Promise<never> | Promise<unknown>;
+  /**
+   * When set, the worker orchestration gate is injected. `undefined` (default)
+   * leaves it OUT of deps ⇒ the dial path is byte-identical to today. A string
+   * is the ready machine id; the other statuses defer.
+   */
+  worker?:
+    | { status: 'ready'; machineId: string }
+    | { status: 'no_capacity' }
+    | { status: 'timeout' }
+    | { status: 'error'; code: string }
+    | { status: 'disabled' };
 } = {}): Harness {
   const admit = vi.fn(async () => {
     order.push('admit');
@@ -221,6 +234,15 @@ function harness(opts: {
 
   const sip: PhoneSipClient = opts.sip ?? { mode: 'live', createSipParticipant: originate };
 
+  const ensureReadyWorker = vi.fn(async () => {
+    order.push('ensureReadyWorker');
+    return (opts.worker ?? { status: 'ready', machineId: 'm-1' }) as never;
+  });
+  const releaseWorker = vi.fn(async () => {
+    order.push('releaseWorker');
+    return undefined;
+  });
+
   const deps: PhoneDialDeps = {
     config: opts.config ?? screeningConfig(),
     dialConfig: opts.dialConfig ?? DIAL_CONFIG,
@@ -232,9 +254,23 @@ function harness(opts: {
       dispatch: { createDispatch: dispatch },
     },
     leaseOwner: LEASE_OWNER,
+    // The gate is injected ONLY when a `worker` outcome is requested. Absent by
+    // default ⇒ the byte-identical path.
+    ...(opts.worker === undefined
+      ? {}
+      : {
+          workerGate: {
+            app: 'project-hello-phone-voice',
+            ensureReadyWorker,
+            releaseWorker,
+          },
+        }),
   };
 
-  return { deps, admit, heartbeat, originate, createRoom, updateRoomMetadata, dispatch };
+  return {
+    deps, admit, heartbeat, originate, createRoom, updateRoomMetadata, dispatch,
+    ensureReadyWorker, releaseWorker,
+  };
 }
 
 function run(h: Harness, now: Date = NOW) {
@@ -878,5 +914,140 @@ describe('a lease that cannot span ring + opening gate is REFUSED, not stretched
     const res = await run(h);
     expect(res.refusal).not.toBe('lease_too_short_for_gate');
     expect(h.admit).toHaveBeenCalled();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// GATE 4-bis — the on-demand worker gate (phone-cost-and-scale-plan §2.3).
+//
+// Three properties, each a mandated invariant:
+//   * BYTE-IDENTICAL when no gate is injected — the default path.
+//   * PROCEEDS on `ready` (and on the service's own `disabled`), after
+//     the room/dispatch and before the originate; carries the machine id.
+//   * DEFERS (worker_not_ready, NO carrier) on no_capacity / timeout / error,
+//     and releases nothing (the service cleaned up its own claim).
+//   * a claim made then declined AFTER the gate (lease too short / originate
+//     failed) is RELEASED, best-effort.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('P5 dial — the on-demand worker gate', () => {
+  it('is INERT when no gate is injected: no ensure/release, dial proceeds as today', async () => {
+    const h = harness({}); // opts.worker undefined ⇒ no workerGate dep at all
+    const res = await run(h);
+
+    expect(res.status).toBe('dialing');
+    expect(res.providerContacted).toBe(true);
+    expect(res.machineId).toBeUndefined();
+    // The gate is never consulted, and the originate happened.
+    expect(h.ensureReadyWorker).not.toHaveBeenCalled();
+    expect(h.releaseWorker).not.toHaveBeenCalled();
+    expect(h.originate).toHaveBeenCalledTimes(1);
+  });
+
+  it('proceeds on READY: gate runs AFTER the room and BEFORE the originate; machine id is carried', async () => {
+    const h = harness({ worker: { status: 'ready', machineId: 'm-42' } });
+    const res = await run(h);
+
+    expect(res.status).toBe('dialing');
+    expect(res.providerContacted).toBe(true);
+    expect(res.machineId).toBe('m-42');
+    expect(h.ensureReadyWorker).toHaveBeenCalledTimes(1);
+    // Ordering: the dispatch (room) precedes the gate, which precedes the
+    // originate. The candidate is never dialled before a ready worker exists,
+    // and the worker had a room to resolve before it posted ready.
+    expect(order.indexOf('room')).toBeLessThan(order.indexOf('ensureReadyWorker'));
+    expect(order.indexOf('ensureReadyWorker')).toBeLessThan(order.indexOf('originate'));
+    expect(h.releaseWorker).not.toHaveBeenCalled();
+  });
+
+  it('passes the SESSION id and epoch, and the phone app + pipeline, to the gate', async () => {
+    const h = harness({ worker: { status: 'ready', machineId: 'm-1' } });
+    await run(h);
+    expect(h.ensureReadyWorker).toHaveBeenCalledWith({
+      app: 'project-hello-phone-voice',
+      pipeline: 'phone',
+      sessionId: SESSION,
+      epoch: EPOCH,
+    });
+  });
+
+  for (const outcome of [
+    { status: 'no_capacity' as const },
+    { status: 'timeout' as const },
+    { status: 'error' as const, code: 'fly_5xx' },
+  ]) {
+    it(`DEFERS with worker_not_ready on ${outcome.status}, and reaches no carrier`, async () => {
+      const h = harness({ worker: outcome });
+      const res = await run(h);
+
+      expect(res.status).toBe('refused');
+      expect(res.refusal).toBe('worker_not_ready');
+      expect(res.detail).toBe(outcome.status);
+      // Two witnesses of "no call": the flag and the spy.
+      expectNoNetwork(res, h);
+      // The service already released its own claim on a failing verdict, so the
+      // controller does NOT double-release.
+      expect(h.releaseWorker).not.toHaveBeenCalled();
+    });
+  }
+
+  it('treats the service `disabled` verdict as a passthrough — dial proceeds, no machine id', async () => {
+    const h = harness({ worker: { status: 'disabled' } });
+    const res = await run(h);
+
+    expect(res.status).toBe('dialing');
+    expect(res.providerContacted).toBe(true);
+    expect(res.machineId).toBeUndefined();
+    expect(h.originate).toHaveBeenCalledTimes(1);
+    expect(h.releaseWorker).not.toHaveBeenCalled();
+  });
+
+  it('RELEASES the gated worker when the lease is then too short to dial', async () => {
+    // A ready worker was claimed, but the lease gate below it refuses. The
+    // claim must not sit busy — release it (best-effort), and place no call.
+    const h = harness({
+      worker: { status: 'ready', machineId: 'm-7' },
+      admit: admitOk({ leaseExpiresAt: after(1), leaseToken: undefined }),
+    });
+    const res = await run(h);
+
+    expect(res.status).toBe('refused');
+    expect(res.refusal).toBe('lease_too_short');
+    expectNoNetwork(res, h);
+    expect(h.ensureReadyWorker).toHaveBeenCalledTimes(1);
+    expect(h.releaseWorker).toHaveBeenCalledWith({
+      app: 'project-hello-phone-voice',
+      machineId: 'm-7',
+      sessionId: SESSION,
+    });
+  });
+
+  it('RELEASES the gated worker when the originate then fails', async () => {
+    const h = harness({
+      worker: { status: 'ready', machineId: 'm-9' },
+      originate: async () => { throw new Error('provider exploded'); },
+    });
+    const res = await run(h);
+
+    expect(res.status).toBe('refused');
+    expect(res.refusal).toBe('originate_failed');
+    expect(res.providerContacted).toBe(true); // the SDK WAS reached
+    expect(h.releaseWorker).toHaveBeenCalledWith({
+      app: 'project-hello-phone-voice',
+      machineId: 'm-9',
+      sessionId: SESSION,
+    });
+  });
+
+  it('a release failure does not change the refusal (fail-open)', async () => {
+    const h = harness({
+      worker: { status: 'ready', machineId: 'm-x' },
+      originate: async () => { throw new Error('provider exploded'); },
+    });
+    h.releaseWorker.mockRejectedValueOnce(new Error('release blew up'));
+    const res = await run(h);
+
+    expect(res.status).toBe('refused');
+    expect(res.refusal).toBe('originate_failed');
   });
 });
