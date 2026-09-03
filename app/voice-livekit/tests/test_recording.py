@@ -9,10 +9,18 @@ never starts recording before consent and never raises into the call path.
 
 import asyncio
 import os
+import tempfile
 import unittest
 from pathlib import Path
 
 import recording as rec
+
+try:
+    import av as _av  # PyAV — present on the worker (livekit-agents[codecs]), absent in CI
+    import numpy as _np
+    _HAS_AV = True
+except Exception:  # noqa: BLE001
+    _HAS_AV = False
 
 
 def _run(coro):
@@ -205,6 +213,46 @@ class TestInWorkerRecorderLifecycle(unittest.TestCase):
         r.wire()
         _begin(r)
         self.assertIsNone(_finish(r))
+
+
+@unittest.skipUnless(_HAS_AV, "PyAV/numpy not installed (CI worker env) — validated where present")
+class TestRealPyAvTranscode(unittest.TestCase):
+    """The real fix: OGG→MP3 must transcode IN-PROCESS via PyAV (no ffmpeg binary,
+    which the python:3.12-slim worker image lacks). Round-trips a synthesized
+    stereo OGG through `_default_transcode` and asserts a valid stereo MP3."""
+
+    def test_pyav_transcode_produces_valid_stereo_mp3(self):
+        with tempfile.TemporaryDirectory() as d:
+            ogg = Path(d) / "in.ogg"
+            mp3 = Path(d) / "out.mp3"
+            # synth ~0.4s stereo OGG (libopus): L=tone, R=tone
+            oc = _av.open(str(ogg), mode="w")
+            st = oc.add_stream("libopus", rate=48000, layout="stereo")
+            sr = 48000
+            t = _np.arange(int(sr * 0.4)) / sr
+            l = (0.4 * _np.sin(2 * _np.pi * 440 * t) * 32767).astype(_np.int16)
+            r = (0.4 * _np.sin(2 * _np.pi * 880 * t) * 32767).astype(_np.int16)
+            inter = _np.empty(l.size + r.size, dtype=_np.int16)
+            inter[0::2] = l
+            inter[1::2] = r
+            frame = _av.AudioFrame.from_ndarray(inter.reshape(1, -1), format="s16", layout="stereo")
+            frame.sample_rate = sr
+            for p in st.encode(frame):
+                oc.mux(p)
+            for p in st.encode(None):
+                oc.mux(p)
+            oc.close()
+
+            _run(rec._default_transcode(ogg, mp3))
+
+            self.assertTrue(mp3.exists() and mp3.stat().st_size > 0)
+            c = _av.open(str(mp3))
+            try:
+                astream = c.streams.audio[0]
+                self.assertEqual(len(astream.layout.channels), 2)  # stereo preserved
+                self.assertGreater(sum(1 for _ in c.decode(astream)), 0)  # decodes
+            finally:
+                c.close()
 
 
 class TestRecordingProvider(unittest.TestCase):
