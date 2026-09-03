@@ -1815,6 +1815,64 @@ paths:
               schema:
                 $ref: '#/components/schemas/PhoneWorkerError'
 
+  /api/internal/phone/recording/failed:
+    post:
+      tags: [phone]
+      operationId: failPhoneWorkerRecording
+      summary: Latch a worker recording the worker reports permanently lost
+      description: Internal, service-authenticated. The worker's recording finish (close, transcode, upload) failed AFTER a recording had begun, and the worker's local audio is already deleted, so the object can never arrive. This latches the session recording_egress_status to failed so the finalize convergence stops retrying a key that was never PUT (live 2026-09-03 - six object_unreadable deferrals to exhaustion while the dashboard said "Recording is still processing"). The audited reopen_recording_finalize RPC remains the only path back to active. Guarded - only a worker-inband egress id may be latched, never over a linked object. ACTIVE ONLY on the worker provider; on the default egress provider it 404s. Disabled by default.
+      security:
+        - workerBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PhoneRecordingFailedRequest'
+      responses:
+        '200':
+          description: ok=true with status failed_latched means the session is latched. already_linked, not_worker_inband and session_not_found are truthful refusals (ok=false) that change nothing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneRecordingFailedResponse'
+        '400':
+          description: Request body failed validation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneRecordingFailedResponse'
+        '401':
+          description: Worker bearer credential required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '403':
+          description: Worker bearer credential invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '404':
+          description: The worker recording provider is not active (RECORDING_PROVIDER is not worker); the endpoint does not exist on this deployment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '500':
+          description: phone_recording_failed_error - sanitized stable code.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneRecordingFailedResponse'
+        '503':
+          description: Phone screening disabled, or the worker credential is not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+
   # ── Internal voice-worker orchestration surface (PR B) ─────────────
   /api/internal/voice-worker/ready:
     post:
@@ -6881,6 +6939,41 @@ components:
             - fallback_required
             - invalid_request
             - phone_recording_complete_error
+            - phone_screening_disabled
+      additionalProperties: false
+
+    PhoneRecordingFailedRequest:
+      type: object
+      required: [attempt_id, session_id, reason]
+      description: The worker reports a PERMANENTLY lost in-worker recording. reason is a bounded lowercase code (recorder_close_failed, transcode_failed, upload_failed) used for observability only - the persisted defer reason stays inside the 0038 CHECK vocabulary.
+      properties:
+        attempt_id:
+          type: string
+          format: uuid
+        session_id:
+          type: string
+          format: uuid
+        reason:
+          type: string
+          pattern: '^[a-z0-9_]{1,64}$'
+      additionalProperties: false
+
+    PhoneRecordingFailedResponse:
+      type: object
+      required: [ok, status]
+      description: ok=true only for failed_latched. already_linked, not_worker_inband and session_not_found are truthful refusals; invalid_request and phone_recording_failed_error are the validation and transport codes.
+      properties:
+        ok:
+          type: boolean
+        status:
+          type: string
+          enum:
+            - failed_latched
+            - already_linked
+            - not_worker_inband
+            - session_not_found
+            - invalid_request
+            - phone_recording_failed_error
             - phone_screening_disabled
       additionalProperties: false
 

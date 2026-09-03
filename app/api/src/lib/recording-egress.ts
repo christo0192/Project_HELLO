@@ -442,7 +442,19 @@ export async function finalizeWorkerInbandRecording(
   const db = deps.db ?? supabase;
   const maxAttempts = env.recordingFinalizeMaxAttempts;
   const defer = async (reason: RecordingFinalizeDeferReason): Promise<'pending'> => {
-    await recordFinalizeDeferral(db, sessionId, reason, maxAttempts);
+    const record = await recordFinalizeDeferral(db, sessionId, reason, maxAttempts);
+    // A worker-inband recording that exhausted its deferrals has no other
+    // recovery path (the worker deleted its local audio at finish()) — leaving
+    // the status `active` forever showed "Recording is still processing" for a
+    // recording that will never arrive (live 2026-09-03, EG_worker_a6cc612d).
+    // Latch to `failed` so the surface is truthful; the audited
+    // `reopen_recording_finalize` RPC remains the reset lifecycle.
+    if (record.exhausted) {
+      await db.from('call_sessions')
+        .update({ recording_egress_status: 'failed' })
+        .eq('id', sessionId)
+        .is('recording_object_key', null);
+    }
     return 'pending';
   };
 
@@ -451,12 +463,16 @@ export async function finalizeWorkerInbandRecording(
   // its object key is owned by the bound attempt, never guessed.
   const { data: session, error } = await db
     .from('call_sessions')
-    .select('recording_egress_id, recording_object_key, recording_provenance')
+    .select('recording_egress_id, recording_object_key, recording_provenance, recording_egress_status')
     .eq('id', sessionId)
     .single();
   if (error || !session) throw new Error('recording session not found');
   if (session.recording_object_key) return 'ready';
   if (!session.recording_egress_id) return 'fallback_required';
+  // Latched failed — the worker reported the upload permanently lost (or the
+  // deferrals exhausted). There is nothing to download; do not spend another
+  // retry cycle misreading the absence as `object_unreadable`.
+  if (session.recording_egress_status === 'failed') return 'fallback_required';
   const egressId = String(session.recording_egress_id);
 
   const { data: attempt, error: attemptError } = await db
@@ -548,6 +564,48 @@ export async function finalizeWorkerInbandRecording(
   void linked;
   return 'ready';
 }
+
+/**
+ * Latch a WORKER-INBAND recording as permanently failed on the worker's own
+ * report.
+ *
+ * The worker deletes its local OGG/MP3 inside `finish()`'s cleanup, so a failed
+ * close/transcode/upload can never be retried from the worker side — yet before
+ * this existed the failure was reported to NOBODY: the finalizer kept
+ * re-downloading an object that was never PUT, misread every 404 as
+ * `object_unreadable`, exhausted its deferrals, and the session sat at
+ * `recording_egress_status='active'` ("Recording is still processing") forever
+ * (live 2026-09-03, `EG_worker_a6cc612d`). Guarded: only a worker-inband
+ * egress id may be latched, and never over a linked object. The audited
+ * `reopen_recording_finalize` RPC remains the only path back to `active`.
+ */
+export async function markWorkerRecordingFailed(
+  sessionId: string,
+  deps: RecordingEgressDeps = {},
+): Promise<'failed_latched' | 'already_linked' | 'not_worker_inband' | 'session_not_found'> {
+  const db = deps.db ?? supabase;
+  const { data: session, error } = await db
+    .from('call_sessions')
+    .select('recording_egress_id, recording_object_key')
+    .eq('id', sessionId)
+    .single();
+  if (error || !session) return 'session_not_found';
+  if (session.recording_object_key) return 'already_linked';
+  const egressId = session.recording_egress_id ? String(session.recording_egress_id) : '';
+  if (!isWorkerInbandEgressId(egressId)) return 'not_worker_inband';
+  await db.from('call_sessions')
+    .update({
+      recording_egress_status: 'failed',
+      // Bounded 0038 CHECK vocabulary: the worker (this pipeline's provider)
+      // reported the loss. The worker's finer-grained reason code is logged at
+      // the route, not persisted — the CHECK'd column stays closed.
+      recording_finalize_defer_reason: 'provider_error',
+    })
+    .eq('id', sessionId)
+    .is('recording_object_key', null);
+  return 'failed_latched';
+}
+
 
 export async function finalizeAuthoritativeRecording(
   sessionId: string,

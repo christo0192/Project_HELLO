@@ -1058,7 +1058,12 @@ describe('OpenAPI document integrity', () => {
     // /api/internal/voice-worker/ready-machine — the named browser worker's
     // session-less MACHINE-level readiness ping (ready-before-dispatch). Same
     // worker-authenticated surface, same 404-when-off posture. 115 + 1 = 116.
-    expect(Object.keys(paths).length).toBe(116);
+    // Call-quality round 1 adds ONE internal path —
+    // /api/internal/phone/recording/failed — the worker's permanent-loss
+    // report that latches a never-uploaded recording to `failed` instead of
+    // letting the finalizer retry to exhaustion (live 2026-09-03). Same
+    // worker-authenticated surface, same 404-when-off posture. 116 + 1 = 117.
+    expect(Object.keys(paths).length).toBe(117);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -1128,7 +1133,9 @@ describe('OpenAPI document integrity', () => {
     // strict {app, machine_id} body of the session-less machine-level readiness
     // ping. additionalProperties:false, no session/epoch (the worker does not yet
     // know its session); the response reuses VoiceWorkerReadyResponse. 232 + 1 = 233.
-    expect(Object.keys(schemas).length).toBe(233);
+    // Call-quality round 1 adds the /recording/failed request/response pair
+    // (PhoneRecordingFailedRequest + PhoneRecordingFailedResponse). 233 + 2 = 235.
+    expect(Object.keys(schemas).length).toBe(235);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.
@@ -1346,6 +1353,9 @@ describe('auth boundary vs spec security model', () => {
     // request is refused 401 regardless of provider.)
     'POST /api/internal/phone/recording/prepare',
     'POST /api/internal/phone/recording/complete',
+    // Same surface and same boundary: the worker's permanent-loss report that
+    // latches a never-uploaded recording to failed (live 2026-09-03).
+    'POST /api/internal/phone/recording/failed',
     // Answer-first ("bounce") readiness poll, same surface and same boundary:
     // the worker GETs it behind WORKER_CONTEXT_SECRET, answering the worker's
     // 401 `authentication_required` rather than the recruiter middleware's

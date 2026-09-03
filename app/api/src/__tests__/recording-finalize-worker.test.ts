@@ -39,6 +39,7 @@ import {
   finalizeAuthoritativeRecording,
   finalizeWorkerInbandRecording,
   isWorkerInbandEgressId,
+  markWorkerRecordingFailed,
 } from '../lib/recording-egress.js';
 
 const SESSION = '99999999-8888-4777-8666-555555555555';
@@ -279,5 +280,105 @@ describe('finalizeWorkerInbandRecording — no egress stop/poll', () => {
     const status = await finalizeWorkerInbandRecording(SESSION, { db });
     expect(status).toBe('ready');
     expect(updates.some((u) => u.recording_provenance === 'worker_inband')).toBe(true);
+  });
+});
+
+describe('worker-inband failure latching (live 2026-09-03, EG_worker_a6cc612d)', () => {
+  // The worker's finish() failed silently, its local audio was already deleted,
+  // and the finalizer retried the never-uploaded key to exhaustion while the
+  // session sat at `recording_egress_status='active'` ("Recording is still
+  // processing") forever. These pin the three repairs: the worker-report latch,
+  // the finalizer fast-fail on a latched session, and the exhaustion latch.
+
+  it('markWorkerRecordingFailed latches an unlinked worker session to failed', async () => {
+    const { db, updates } = fakeDb({
+      callSessionRows: [
+        { recording_egress_id: WORKER_EGRESS_ID, recording_object_key: null },
+      ],
+    });
+    const status = await markWorkerRecordingFailed(SESSION, { db });
+    expect(status).toBe('failed_latched');
+    const latch = updates.find((u) => u.recording_egress_status === 'failed');
+    expect(latch).toBeDefined();
+    // The persisted defer reason stays inside the 0038 CHECK vocabulary.
+    expect(latch!.recording_finalize_defer_reason).toBe('provider_error');
+  });
+
+  it('markWorkerRecordingFailed never clobbers a linked recording', async () => {
+    const { db, updates } = fakeDb({
+      callSessionRows: [
+        { recording_egress_id: WORKER_EGRESS_ID, recording_object_key: OBJECT_KEY },
+      ],
+    });
+    expect(await markWorkerRecordingFailed(SESSION, { db })).toBe('already_linked');
+    expect(updates).toHaveLength(0);
+  });
+
+  it('markWorkerRecordingFailed refuses a real (non-worker) egress id', async () => {
+    const { db, updates } = fakeDb({
+      callSessionRows: [
+        { recording_egress_id: 'EG_realegress123', recording_object_key: null },
+      ],
+    });
+    expect(await markWorkerRecordingFailed(SESSION, { db })).toBe('not_worker_inband');
+    expect(updates).toHaveLength(0);
+  });
+
+  it('the finalizer fast-fails a latched session — no download, no retry cycle', async () => {
+    const { db, updates } = fakeDb({
+      callSessionRows: [
+        {
+          recording_egress_id: WORKER_EGRESS_ID,
+          recording_object_key: null,
+          recording_provenance: 'worker_inband',
+          recording_egress_status: 'failed',
+        },
+      ],
+      downloadError: true,
+    });
+    const status = await finalizeWorkerInbandRecording(SESSION, { db });
+    expect(status).toBe('fallback_required');
+    // No deferral write, no further status update — the latch already answered.
+    expect(updates).toHaveLength(0);
+    expect(db.rpc).not.toHaveBeenCalled();
+  });
+
+  it('an EXHAUSTED deferral latches the status to failed instead of active-forever', async () => {
+    const { db, updates } = fakeDb({
+      callSessionRows: [
+        {
+          recording_egress_id: WORKER_EGRESS_ID,
+          recording_object_key: null,
+          recording_provenance: 'worker_inband',
+          recording_egress_status: 'active',
+        },
+      ],
+      phoneAttemptRow: { recording_object_key: OBJECT_KEY, recording_manifest_key: MANIFEST_KEY },
+      downloadError: true,
+    });
+    db.rpc.mockResolvedValue({ data: { attempts: 6, exhausted: true }, error: null });
+    const status = await finalizeWorkerInbandRecording(SESSION, { db });
+    expect(status).toBe('pending');
+    const latch = updates.find((u) => u.recording_egress_status === 'failed');
+    expect(latch).toBeDefined();
+  });
+
+  it('a non-exhausted deferral does NOT latch — the retry budget still owns it', async () => {
+    const { db, updates } = fakeDb({
+      callSessionRows: [
+        {
+          recording_egress_id: WORKER_EGRESS_ID,
+          recording_object_key: null,
+          recording_provenance: 'worker_inband',
+          recording_egress_status: 'active',
+        },
+      ],
+      phoneAttemptRow: { recording_object_key: OBJECT_KEY, recording_manifest_key: MANIFEST_KEY },
+      downloadError: true,
+    });
+    db.rpc.mockResolvedValue({ data: { attempts: 2, exhausted: false }, error: null });
+    const status = await finalizeWorkerInbandRecording(SESSION, { db });
+    expect(status).toBe('pending');
+    expect(updates.find((u) => u.recording_egress_status === 'failed')).toBeUndefined();
   });
 });

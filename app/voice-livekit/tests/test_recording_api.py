@@ -105,5 +105,45 @@ class TestCompleteRecording(unittest.TestCase):
         self.assertFalse(_run(api.complete_recording("a", "s", "d" * 64, 1, 2, post=post)))
 
 
+class TestFailRecording(unittest.TestCase):
+    """/recording/failed — the worker's permanent-loss report (live 2026-09-03:
+    without it the finalizer retried a never-uploaded key to exhaustion and the
+    dashboard said "Recording is still processing" forever)."""
+
+    def setUp(self):
+        os.environ["WORKER_CONTEXT_SECRET"] = "s3cr3t"
+
+    def tearDown(self):
+        os.environ.pop("WORKER_CONTEXT_SECRET", None)
+
+    def test_failed_ok_true_and_shapes_body(self):
+        cap = {}
+        post = _poster({"ok": True, "status": "failed_latched"}, captured=cap)
+        ok = _run(api.fail_recording("att1", "sess1", "upload_failed", post=post))
+        self.assertTrue(ok)
+        self.assertTrue(cap["url"].endswith("/recording/failed"))
+        self.assertEqual(cap["body"], {
+            "attempt_id": "att1", "session_id": "sess1", "reason": "upload_failed",
+        })
+
+    def test_failed_bounds_the_reason(self):
+        cap = {}
+        post = _poster({"ok": True, "status": "failed_latched"}, captured=cap)
+        _run(api.fail_recording("a", "s", "x" * 200, post=post))
+        self.assertEqual(len(cap["body"]["reason"]), 64)
+
+    def test_failed_not_latched_false(self):
+        post = _poster({"ok": False, "status": "already_linked"})
+        self.assertFalse(_run(api.fail_recording("a", "s", "upload_failed", post=post)))
+
+    def test_failed_fail_open_on_error_and_no_secret(self):
+        for exc in (ProviderError("x"), BusinessError(), RuntimeError("z")):
+            post = _poster(raise_exc=exc)
+            self.assertFalse(_run(api.fail_recording("a", "s", "r", post=post)))
+        os.environ.pop("WORKER_CONTEXT_SECRET", None)
+        post = _poster({"ok": True})
+        self.assertFalse(_run(api.fail_recording("a", "s", "r", post=post)))
+
+
 if __name__ == "__main__":
     unittest.main()

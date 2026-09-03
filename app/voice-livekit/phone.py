@@ -710,17 +710,46 @@ def phone_tts_flush_min_chars() -> int:
     ``end_input`` flushes Sarvam's tokenizer regardless of ``min_sentence_len``,
     so the first speakable fragment reaches Sarvam as soon as it is ready.
 
-    PROSODY TRADEOFF: non-zero values retain the legacy split first-fragment
-    compatibility path. Production/default is ``0`` so one uninterrupted parent
-    TTS stream owns the complete response and acknowledgement/question prosody
-    cannot reset between two independent syntheses. Read at the CALL SITE with
-    the literal name so the env-contract scanner sees it.
+    PROSODY TRADEOFF: a non-zero value splits the reply into AT MOST TWO
+    downstream syntheses (first clause, then the whole remainder), so the
+    acknowledgement/question prosody can reset once between them. ``0`` keeps
+    one uninterrupted parent TTS stream and is the instant rollback.
+
+    RE-ENABLED (owner-approved, 2026-09-03): the hardcoded ``return 0`` made the
+    deployed ``PHONE_TTS_FLUSH_MIN_CHARS=60`` secret inert while the untouched
+    ~2.9 s LLM-invoke→first-audio gap kept every turn's latency floor near the
+    4.0 s first-audio watchdog — so deterministic recovery fallbacks, not the
+    model, spoke several turns of the 2026-09-03 live call. The env var is live
+    again; ``0`` (or unset) disables. Read at the CALL SITE with the literal
+    name so the env-contract scanner sees it.
     """
-    # Locked contract: one uninterrupted Sarvam synthesis stream per bot
-    # response. Read the legacy knob so environment-contract validation remains
-    # explicit, but deliberately ignore it: no production value may split TTS.
-    _bounded_int_env(os.getenv("PHONE_TTS_FLUSH_MIN_CHARS"), 0, 0, 400)
-    return 0
+    return _bounded_int_env(os.getenv("PHONE_TTS_FLUSH_MIN_CHARS"), 0, 0, 400)
+
+
+def phone_queued_scoring_hold_sec() -> float:
+    """How long the worker keeps its lease alive after the durable scoring
+    handoff, waiting for the assessment row and the terminal event to land.
+
+    Live 2026-09-03 (attempt a6cc612d): the worker handed scoring to the durable
+    queue and returned immediately, cancelling its heartbeat. Scoring took ~4
+    minutes; the 180 s lease expired mid-scoring; the reclaim sweep marked a
+    cleanly-completed screening `abandoned` and the queue worker's later
+    completion post found the attempt already reclaimed. The PSTN leg is closed
+    BEFORE this hold begins — only the worker process (and its heartbeat) stays
+    alive, which is exactly what keeps the reclaim sweep honest. Bounded by wall
+    clock, never a counter. ``0`` disables the hold (pre-fix behavior)."""
+    return _bounded_float(os.getenv("PHONE_QUEUED_SCORING_HOLD_SEC"), 600.0, 0.0, 900.0)
+
+
+#: Poll cadence inside the queued-scoring hold. Each poll is an idempotent
+#: `complete_assessment` probe; the heartbeat task renews the lease in parallel.
+PHONE_QUEUED_SCORING_POLL_SEC = 10.0
+
+#: Post-goodbye grace before the room delete. Deleting the LiveKit room tears
+#: the SIP leg down instantly, and a goodbye whose last words are still in the
+#: PSTN buffers gets clipped — perceived as a rude hangup even when the full
+#: closing line was synthesized.
+PHONE_CLOSE_TAIL_GRACE_SEC = 1.5
 
 
 def phone_bounce_mode() -> bool:
@@ -4712,11 +4741,16 @@ def phone_generated_reply_rejection_reason(
     objective_is_comp = phone_is_compensation_objective(objective_text)
     if _COMPENSATION_OBJECTIVE_RE.search(compact) and not objective_is_comp:
         return "compensation_drift"
-    if (
-        objective_text == PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT
-        and compact != PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT
-    ):
-        return "conflict_clarification_drift"
+    # REMOVED (2026-09-03): the exact-match `conflict_clarification_drift` clause
+    # rejected any conflict-turn reply that was not PHONE_RESUME_CONFLICT_
+    # CLARIFICATION_TEXT character-for-character — while phone_judge_turn_
+    # instruction simultaneously ordered the model to phrase the probe "in your
+    # own natural words". Unsatisfiable by construction: EVERY model-phrased
+    # conflict probe was rejected and the watchdog spoke the canned line instead
+    # (live 2026-09-03, session 1a22e510). A conflict turn is now authorized by
+    # the same general checks as every other turn (exactly one question act, no
+    # instruction echo, no premature closing, no compensation drift); the canned
+    # text remains only as the deterministic recovery fallback.
     private_control = _private_phone_control_text(control_text, objective_text)
     if phone_instruction_echo_detected(compact, private_control):
         return "instruction_echo"
@@ -4838,6 +4872,67 @@ def phone_judge_turn_instruction(
                 "or say goodbye. Owed topic: " + bounded_question
             )
     return None
+
+
+#: Short non-answers to the conflict probe that mean the gap was NOT addressed
+#: ("I don't know", "can't say"). Complements the deflection/clarification gate.
+_CONFLICT_NONANSWER_RE = re.compile(
+    r"\b(?:i\s+(?:don'?t|do\s+not)\s+know|no\s+idea|"
+    r"can'?t\s+(?:really\s+)?(?:explain|say|tell)|not\s+sure)\b",
+    re.IGNORECASE,
+)
+
+
+def phone_conflict_reply_unresolved(text: Any) -> bool:
+    """True when the candidate's reply to the conflict probe did not engage it.
+
+    A deflection/clarification ("I don't understand what conflicts…"), a bare
+    filler, or a short "I don't know" leaves the gap unaddressed — the ONE
+    permitted re-pursuit may fire. A substantive explanation (right or wrong —
+    quality is the assessment judge's job, not this gate's) counts as engaged.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return True
+    if phone_turn_substance(text) != PHONE_SUBSTANCE_SUBSTANTIVE:
+        return True
+    if phone_qna_incomplete(text):
+        # A dangling filler ("Um, yeah, so") is not an engagement either.
+        return True
+    clean = " ".join(text.split())
+    return len(clean.split()) <= 12 and _CONFLICT_NONANSWER_RE.search(clean) is not None
+
+
+def phone_conflict_repursuit_instruction(conflict: Any) -> str | None:
+    """Compose the ONE follow-up when the conflict probe was brushed off.
+
+    The first probe (phone_judge_turn_instruction) asks in the model's own
+    words without revealing specifics. If the candidate deflects — live
+    2026-09-03: "I don't understand what conflicts my answer and the resume" —
+    the controller used to yank the turn straight back to the plan, so the
+    instruction's own "hold once" was structurally unreachable. This second ask
+    is allowed to EXPLAIN the gap in one plain sentence (paraphrased, attributed
+    to the resume, never accusatory, never verbatim), ask ONE final direct
+    question, and then the controller moves on regardless of the answer.
+    """
+    if not isinstance(conflict, dict):
+        return None
+    resume_fact = " ".join(str(conflict.get("resume_fact", "")).split())[:300]
+    spoken_claim = " ".join(str(conflict.get("spoken_claim", "")).split())[:300]
+    if not resume_fact or not spoken_claim:
+        return None
+    return (
+        "The candidate asked what you meant (or brushed the clarification off), "
+        "so this time be concrete — kindly. For your context only — do NOT read "
+        "these aloud or quote them verbatim — the resume shows: \"" + resume_fact
+        + "\"; they described: \"" + spoken_claim + "\". In THIS turn: first "
+        "explain in ONE plain, warm sentence what seems not to line up, "
+        "paraphrasing and attributing it to the resume you received (e.g. 'the "
+        "resume we have describes a somewhat different recent role'). Then ask "
+        "exactly ONE direct, friendly question inviting them to square the two. "
+        "Never accuse, never use the word \"discrepancy\", never read the resume "
+        "verbatim. Whatever they answer next, accept it gracefully and move on "
+        "— do not raise this again."
+    )
 
 
 async def _default_phone_coverage_inference(prompt: str) -> Any:
@@ -5023,7 +5118,16 @@ _GENERAL_CLARIFICATION_RE = re.compile(
     r"\b(?:can|could|would)\s+you\s+(?:please\s+)?"
     r"(?:repeat|rephrase|explain|clarify|say\s+that\s+again)\b|"
     r"\b(?:i\s+did(?:n't|\s+not)\s+(?:hear|understand)|what\s+do\s+you\s+mean)\b|"
-    r"\b(?:forgot|not\s+sure)\b.{0,40}\bwhich\b",
+    r"\b(?:forgot|not\s+sure)\b.{0,40}\bwhich\b|"
+    # Confirm-question shapes: the candidate is checking WHAT was asked, not
+    # answering it — "Like you're talking about the notice period?", "You mean
+    # LPA?" (both live 2026-09-03, both previously scored substantive; the first
+    # skipped the owed joining-availability question forever). These phrases can
+    # also appear inside long genuine narratives ("if you mean the AI
+    # programs…"), so they live here under the length bound, not in the
+    # uncapped _DEFLECTION_RE.
+    r"\byou(?:'re|\s+are)?\s+(?:talking|asking)\s+about\b|"
+    r"\byou\s+mean\b|\bas\s+in\b|\bis\s+it\s+about\b",
     re.IGNORECASE,
 )
 _CONNECTIVITY_RE = re.compile(
@@ -5206,10 +5310,16 @@ PHONE_SUBSTANCE_CLARIFICATION = "clarification"
 _DEFLECTION_RE = re.compile(
     r"\b(?:i\s+(?:already\s+)?(?:just\s+)?(?:mentioned|said|told\s+you|answered|covered)\s+(?:that|this|it)|"
     r"(?:i\s+)?did(?:n'?t| not)\s+(?:i\s+)?(?:just\s+)?(?:say|mention|cover|answer)|"
-    r"come\s+again|say\s+that\s+again|which\s+(?:one|question)|"
-    r"not\s+sure\s+what\s+you\s+mean|what\s+do\s+you\s+mean\s+by|"
-    r"i\s+(?:don'?t|do\s+not)\s+(?:understand|get\s+it|follow)|"
-    r"can\s+you\s+be\s+more\s+specific|what\s+(?:discrepancy|conflict|mismatch))\b",
+    r"come\s+again|say\s+that\s+again|which\s+(?:one|question|part|role|clarification|conflict)|"
+    r"not\s+sure\s+what\s+you(?:\s+are|'re)?\s+(?:mean|asking|referring)|"
+    r"not\s+sure\s+what\s+you\s+mean|what\s+do\s+you\s+mean(?:\s+by)?|"
+    r"i\s+(?:don'?t|do\s+not)\s+(?:understand|get\s+(?:it|that|you)|follow)|"
+    r"can\s+you\s+be\s+more\s+specific|"
+    # Plural/loose noun forms: "what conflicts", "what clarification you need".
+    r"what\s+(?:discrepanc(?:y|ies)|conflicts?|mismatch(?:es)?|clarifications?)|"
+    r"what\s+are\s+you\s+(?:referring|talking)\s+(?:to|about)|"
+    r"(?:i\s+)?did(?:n'?t| not)\s+(?:get|catch|hear)\s+(?:that|you|it)|"
+    r"sorry\s*\?|pardon(?:\s+me)?)\b",
     re.IGNORECASE,
 )
 
@@ -5235,11 +5345,20 @@ def phone_turn_substance(text: Any) -> str:
         return PHONE_SUBSTANCE_THINKING
     # A deflection / clarification request is NOT an answer: keep the cursor where
     # it is so the bot RE-ASKS the owed question rather than advancing past a
-    # non-answer. Short-anchored (<= 14 words) so a long real answer that merely
-    # contains such a phrase stays substantive.
-    if len(clean.split()) <= 14 and (
-        _DEFLECTION_RE.search(clean) or _GENERAL_CLARIFICATION_RE.search(clean)
-    ):
+    # non-answer.
+    #
+    # GATE OPENED (owner directive, 2026-09-03): the old `<= 14 words` cap
+    # blocked the live call's 26-word "…I don't understand what conflicts my
+    # answer and the resume" — the regex MATCHED and the cap alone discarded it,
+    # so the deflection was committed as a substantive answer and the cursor
+    # advanced. A strong _DEFLECTION_RE phrase now classifies as clarification at
+    # ANY length: the cost of over-matching (one warm re-ask inside a long real
+    # answer) is far smaller than the cost of committing a non-answer as an
+    # answer. The looser _GENERAL_CLARIFICATION_RE keeps a (raised) length bound
+    # because its phrases appear more often inside genuine narrative answers.
+    if _DEFLECTION_RE.search(clean):
+        return PHONE_SUBSTANCE_CLARIFICATION
+    if len(clean.split()) <= 30 and _GENERAL_CLARIFICATION_RE.search(clean):
         return PHONE_SUBSTANCE_CLARIFICATION
     # A recognised complete short answer or any digit content is substantive.
     if _SUBSTANTIVE_SHORT_RE.fullmatch(clean) or _CONTENT_DIGIT_RE.search(clean):
@@ -5584,7 +5703,13 @@ def phone_agent_class(agent_base: Any) -> Any:
                     not self._generation_allow_closing
                     and not prefix_released
                     and "?" not in candidate_prefix
-                    and candidate_prefix.endswith((".", "!", ",", ";", ":"))
+                    # Any clause boundary releases the acknowledgement prefix —
+                    # em/en dash and ellipsis included (Gemini writes both).
+                    # The prefix is still question-act-free and authorized, so a
+                    # wider boundary set only lets the SAFE part speak sooner.
+                    and candidate_prefix.endswith(
+                        (".", "!", ",", ";", ":", "—", "–", "…")
+                    )
                     and phone_generated_prefix_authorized(
                         candidate_prefix, objective,
                         control_text=self._generation_control_text,

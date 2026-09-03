@@ -82,7 +82,10 @@ import {
   prepareWorkerRecording,
   type WorkerRecordingUploadSigner,
 } from '../integrations/livekit-phone-dial/worker-recording.js';
-import { finalizeAuthoritativeRecording } from '../lib/recording-egress.js';
+import {
+  finalizeAuthoritativeRecording,
+  markWorkerRecordingFailed,
+} from '../lib/recording-egress.js';
 import { purgePhoneEngagementRecordings } from '../integrations/livekit-phone-dial/recording-purge.js';
 import { supabaseStorageRecordingStorage } from '../lib/retention.js';
 import { env } from '../lib/env.js';
@@ -373,6 +376,22 @@ const recordingCompleteSchema = z
   })
   .strict();
 
+/**
+ * PR A — `POST /recording/failed` body.
+ *
+ * The worker reports a PERMANENTLY lost in-worker recording (its local audio is
+ * already deleted, so no retry can ever produce the object). `reason` is a
+ * bounded code for logging only — the persisted defer reason stays inside the
+ * 0038 CHECK vocabulary. Active ONLY when `RECORDING_PROVIDER=worker`.
+ */
+const recordingFailedSchema = z
+  .object({
+    attempt_id: z.string().regex(UUID_RE),
+    session_id: z.string().regex(UUID_RE),
+    reason: z.string().regex(/^[a-z0-9_]{1,64}$/),
+  })
+  .strict();
+
 export interface PhoneWorkerRouterDeps {
   readonly stores?: PhoneStores;
   /** Read-only appointment/attempt seam for proposal validation. */
@@ -452,6 +471,15 @@ export interface PhoneWorkerRouterDeps {
    * its worker branch on the synthetic `EG_worker_` egress id.
    */
   readonly finalizeRecording?: (sessionId: string) => Promise<'ready' | 'fallback_required' | 'pending'>;
+  /**
+   * PR A — latches a worker-inband recording the worker reported PERMANENTLY
+   * lost (`recording_egress_status='failed'`), so the finalizer stops retrying
+   * an object that was never uploaded. Injected for tests; production defaults
+   * to `markWorkerRecordingFailed`.
+   */
+  readonly markRecordingFailed?: (sessionId: string) => Promise<
+    'failed_latched' | 'already_linked' | 'not_worker_inband' | 'session_not_found'
+  >;
   readonly configSource?: NodeJS.ProcessEnv;
   readonly now?: () => Date;
   /**
@@ -1669,6 +1697,40 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       return res.json({ ok: status === 'ready', status });
     } catch {
       return res.status(500).json({ ok: false, status: 'phone_recording_complete_error' });
+    }
+  });
+
+  // ── POST /recording/failed ────────────────────────────────────────
+  // The worker's recording finish (close → transcode → upload) failed AFTER a
+  // recording had begun, and its local audio is already deleted — the object
+  // can never arrive. Latch the session `failed` so the finalize convergence
+  // stops retrying a key that was never PUT (live 2026-09-03: six
+  // `object_unreadable` deferrals to exhaustion, dashboard stuck on "Recording
+  // is still processing"). The audited `reopen_recording_finalize` RPC remains
+  // the only path back.
+  router.post('/recording/failed', requireWorkerPhoneAuth, async (req, res) => {
+    try {
+      if (!config().screeningEnabled) {
+        return res.status(503).json({ ok: false, error: 'phone_screening_disabled' });
+      }
+      if (!workerRecordingActive) {
+        return res.status(404).json({ ok: false, error: 'not_found' });
+      }
+      const parsed = recordingFailedSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ ok: false, status: 'invalid_request' });
+      }
+      const latch = deps.markRecordingFailed ?? markWorkerRecordingFailed;
+      const status = await latch(parsed.data.session_id);
+      // The worker's bounded reason code is observability, not state — the
+      // persisted defer reason stays inside the 0038 CHECK vocabulary.
+      phoneWorkerLog.warn('unknown_event', {
+        schema: 'recording_failed_report',
+        error_category: `${status}:${parsed.data.reason}`.slice(0, 96),
+      });
+      return res.json({ ok: status === 'failed_latched', status });
+    } catch {
+      return res.status(500).json({ ok: false, status: 'phone_recording_failed_error' });
     }
   });
 

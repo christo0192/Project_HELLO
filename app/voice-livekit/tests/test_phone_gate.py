@@ -3891,11 +3891,30 @@ class TestNativePhoneArchitecture(unittest.TestCase):
             phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT,
             allow_closing=False,
         ))
-        self.assertEqual(phone.phone_generated_reply_rejection_reason(
+        # THE 2026-09-03 UNSATISFIABLE-GUARD REGRESSION. The removed
+        # `conflict_clarification_drift` clause rejected any conflict-turn reply
+        # that was not the canned sentence char-for-char, while the judge
+        # instruction simultaneously demanded the model phrase the probe "in
+        # your own natural words" — so EVERY model-phrased probe was rejected
+        # and the watchdog spoke the robotic canned line (session 1a22e510).
+        # A natural paraphrase with exactly one question act must now PASS…
+        self.assertIsNone(phone.phone_generated_reply_rejection_reason(
             "Thanks for explaining. Could you clarify your recent work?",
             phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT,
             allow_closing=False,
-        ), "conflict_clarification_drift")
+        ))
+        # …while the general guards still bound the conflict turn: two question
+        # acts and premature closings stay rejected.
+        self.assertEqual(phone.phone_generated_reply_rejection_reason(
+            "Could you clarify your role? And when did you leave?",
+            phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT,
+            allow_closing=False,
+        ), "question_mark_count")
+        self.assertEqual(phone.phone_generated_reply_rejection_reason(
+            "Thanks, that's everything — have a great day. Goodbye!",
+            phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT,
+            allow_closing=False,
+        ), "premature_closing")
         self.assertFalse(phone.phone_generated_prefix_authorized(
             "Walk me through one concrete example.",
             "Ask for one concrete example.",
@@ -5205,9 +5224,13 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(interlocks, ["pending_close_cancelled"])
 
-    async def test_third_question_answers_then_wraps_at_the_cap(self):
+    async def test_the_cap_round_invites_one_last_question_then_wraps(self):
+        """F8 (owner spec, live 2026-09-03): the round cap must not slam the
+        door. The cap round still ANSWERS, then warns we're wrapping up and
+        invites one last quick thing; only the round AFTER the cap answers
+        briefly and says goodbye. Q&A stays bounded at MAX+1 rounds."""
         _, _, _, client, hooks = await self._enter_qna()
-        for index in range(phone.PHONE_QNA_MAX_ROUNDS):
+        for index in range(phone.PHONE_QNA_MAX_ROUNDS + 1):
             turn_ctx = types.SimpleNamespace(items=[])
             text = f"Candidate question {index + 1}?"
             await hooks["on_native_turn"](
@@ -5217,9 +5240,15 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
             if index + 1 < phone.PHONE_QNA_MAX_ROUNDS:
                 self.assertIn("anything else", injected)
                 self.assertIn("do not say goodbye yet", injected)
-                self.assertNotIn("final q&a round", injected)
+                self.assertNotIn("final exchange", injected)
+            elif index + 1 == phone.PHONE_QNA_MAX_ROUNDS:
+                # The cap round: answer + wrap-up invite, NOT a goodbye.
+                self.assertIn("before you wrap up", injected)
+                self.assertIn("do not say goodbye yet", injected)
+                self.assertNotIn("final exchange", injected)
             else:
-                self.assertIn("final q&a round", injected)
+                # One past the cap: answer briefly, thank, goodbye.
+                self.assertIn("final exchange", injected)
                 self.assertIn("say goodbye", injected)
         await self._finish(hooks)
         self.assertIn("assessment.completed", client.event_types)
@@ -5259,6 +5288,122 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
         # they verify that interruption does not claim clean playout.
         self.assertNotIn(phone.PHONE_ASSESSMENT_CLOSING_TEXT, session.spoken)
         self.assertIn("assessment.completed", client.event_types)
+
+    async def test_barged_goodbye_still_gets_a_spoken_fixed_closing(self):
+        """F8 (live 2026-09-03): a candidate talking over the goodbye used to
+        make the closing-ack branch CLAIM the goodbye was delivered with no
+        proof — the room came down on a half-spoken goodbye recorded as clean.
+        Only `on_reply_delivered` committing an UNINTERRUPTED closing playout
+        may claim delivery now; an interrupted playout followed by the ack
+        branch reaches teardown unproven, and the coordinator speaks the FIXED
+        warm closing before any room delete."""
+        agent, session, _, client, hooks = await self._enter_qna()
+        close_ctx = types.SimpleNamespace(items=[])
+        await hooks["on_native_turn"](
+            "Nothing else", types.SimpleNamespace(text_content="Nothing else"), close_ctx,
+        )
+        self.assertEqual(agent._closing_state_machine.state.value, "closing_pending")
+        # The candidate barges in: the goodbye playout ends INTERRUPTED — the
+        # delivery notifier must NOT commit or claim delivery…
+        delivered = agent._on_reply_delivered
+        await delivered(True)
+        self.assertEqual(agent._closing_state_machine.state.value, "closing_pending")
+        # …and their overlapping talk lands in the closing-ack branch, which
+        # completes the screening but may no longer claim the goodbye played.
+        ack = "Alright then, goodbye to you too, thanks for the call today."
+        with self.assertRaises(sys.modules["livekit.agents"].StopResponse):
+            await hooks["on_native_turn"](
+                ack, types.SimpleNamespace(text_content=ack),
+                types.SimpleNamespace(items=[]),
+            )
+        with patch.object(agent_mod, "_delete_livekit_room", new_callable=AsyncMock):
+            await asyncio.wait_for(hooks["task"], timeout=10)
+        hooks["log_patch"].stop()
+        # The unproven goodbye earned the FIXED closing before teardown, and the
+        # screening still completed truthfully.
+        self.assertIn(phone.PHONE_ASSESSMENT_CLOSING_TEXT, session.spoken)
+        self.assertIn("assessment.completed", client.event_types)
+
+
+class TestConflictRepursuitFlow(unittest.IsolatedAsyncioTestCase):
+    """F7 (live 2026-09-03): a brushed-off conflict probe earns ONE concrete,
+    kind re-pursuit — then the controller moves on regardless."""
+
+    CONFLICT = {
+        "resume_fact": "Proprietary trader at Alpha Markets since 2024",
+        "spoken_claim": "Two years in EdTech sales and advisory roles",
+    }
+    # The candidate's exact live deflection (route-neutral: no "?"-shape, no
+    # general-clarification phrase, so it reaches the conflict consumption).
+    DEFLECTION = (
+        "Yeah, sure, but before that I am not, I don't understand like which "
+        "clarification you need. I don't understand what conflicts my answer "
+        "and the recipe."
+    )
+
+    async def _coordinator_with_pending_conflict(self):
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless", coverage_judge_enabled=True,
+        )
+        hooks["assistant_delivery_complete"].set()
+        hooks["latest_assistant"][0] = state.questions[0].spoken_text
+        hooks["latest_assistant_anchor"][0] = 1
+        # The state on_reply_delivered leaves after the conflict probe played.
+        agent._conflict_reply_pending.update(
+            {"value": True, "conflict": dict(self.CONFLICT)},
+        )
+        return agent, session, state, client, hooks
+
+    async def test_deflection_earns_one_concrete_repursuit_then_moves_on(self):
+        agent, _, state, _, hooks = await self._coordinator_with_pending_conflict()
+        turn_ctx = types.SimpleNamespace(items=[])
+        await hooks["on_native_turn"](
+            self.DEFLECTION,
+            types.SimpleNamespace(text_content=self.DEFLECTION), turn_ctx,
+        )
+        injected = str(turn_ctx.items)
+        # The second ask is CONCRETE (names the finding as private context)…
+        self.assertIn(self.CONFLICT["resume_fact"], injected)
+        self.assertIn("explain in ONE plain, warm sentence", injected)
+        # …and remains guarded.
+        self.assertIn("Never accuse", injected)
+        self.assertTrue(agent._conflict_reply_pending.get("repursued"))
+
+        # The re-pursuit's own reply is consumed like a clarification: a SECOND
+        # deflection gets the owed planned question, never a third conflict ask.
+        agent._conflict_reply_pending["value"] = True
+        second_ctx = types.SimpleNamespace(items=[])
+        await hooks["on_native_turn"](
+            "I still don't understand what you mean by that.",
+            types.SimpleNamespace(
+                text_content="I still don't understand what you mean by that.",
+            ),
+            second_ctx,
+        )
+        second = str(second_ctx.items)
+        self.assertNotIn(self.CONFLICT["resume_fact"], second)
+        self.assertNotIn("explain in ONE plain, warm sentence", second)
+        hooks["task"].cancel()
+        await asyncio.gather(hooks["task"], return_exceptions=True)
+        hooks["log_patch"].stop()
+
+    async def test_an_engaged_answer_returns_to_the_plan_without_repursuit(self):
+        agent, _, state, _, hooks = await self._coordinator_with_pending_conflict()
+        engaged = (
+            "Right, so the trading role was a family business I helped part-time "
+            "while my full-time employment stayed in EdTech sales — the resume "
+            "lists both and the dates overlap."
+        )
+        turn_ctx = types.SimpleNamespace(items=[])
+        await hooks["on_native_turn"](
+            engaged, types.SimpleNamespace(text_content=engaged), turn_ctx,
+        )
+        injected = str(turn_ctx.items)
+        self.assertNotIn(self.CONFLICT["resume_fact"], injected)
+        self.assertFalse(agent._conflict_reply_pending.get("repursued"))
+        hooks["task"].cancel()
+        await asyncio.gather(hooks["task"], return_exceptions=True)
+        hooks["log_patch"].stop()
 
 
 class TestPhoneCoverageJudgeCore(unittest.IsolatedAsyncioTestCase):
@@ -7375,10 +7520,15 @@ class TestCall24Regressions(unittest.TestCase):
         # The full text still comes through, in order, uncorrupted (ignoring the
         # inter-segment whitespace the re-chunker may collapse).
         self.assertEqual(spoken.replace(" ", ""), "".join(source_chunks).replace(" ", ""))
-        # One uninterrupted downstream segment preserves acknowledgement and
-        # question prosody as a single coherent utterance.
-        self.assertEqual(len(segment_spans), 1)
-        self.assertEqual(segment_spans[0][1], len(source_chunks))
+        # RE-ENABLED (owner-approved, 2026-09-03): with a nonzero min-chars the
+        # phone lane flushes the FIRST clause as its own segment BEFORE the
+        # source is drained, then streams the remainder as exactly ONE further
+        # segment — two total, never N. (During the hardcoded `return 0`
+        # rollback this test asserted a single segment; the env knob is live
+        # again and 0 remains the instant rollback — see the control test.)
+        self.assertEqual(len(segment_spans), 2)
+        self.assertLess(segment_spans[0][1], len(source_chunks))
+        self.assertEqual(segment_spans[1][1], len(source_chunks))
 
     def test_tts_node_defaults_to_one_coherent_synthesis(self):
         spans = []
@@ -7752,10 +7902,13 @@ class TestCall24Regressions(unittest.TestCase):
         self.assertEqual(
             spoken.replace(" ", ""), "".join(source_chunks).replace(" ", "")
         )
-        # One stream is intentional: splitting at a comma or sentence boundary
-        # resets Sarvam prosody and was the source of the robotic cadence.
-        self.assertEqual(len(segment_spans), 1)
-        self.assertEqual(stream_texts[0], "".join(source_chunks))
+        # RE-ENABLED (owner-approved, 2026-09-03): the first clause flushes as
+        # its own segment before the source is drained, the remainder rides ONE
+        # further segment — two total. The single-stream shape remains available
+        # as the instant rollback (`PHONE_TTS_FLUSH_MIN_CHARS=0`, control test).
+        self.assertEqual(len(segment_spans), 2)
+        self.assertEqual("".join(stream_texts).replace(" ", ""),
+                         "".join(source_chunks).replace(" ", ""))
 
     # ── F1: deterministic role opening ────────────────────────────────
     def test_role_opening_text_names_the_exact_role(self):
