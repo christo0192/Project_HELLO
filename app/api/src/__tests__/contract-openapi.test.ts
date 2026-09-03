@@ -1050,7 +1050,11 @@ describe('OpenAPI document integrity', () => {
     // /recording/complete — the worker-inband recording twin of the egress
     // path, on the SAME worker-authenticated surface (they widen no
     // recruiter-facing route). 112 + 2 = 114.
-    expect(Object.keys(paths).length).toBe(114);
+    // PR B adds ONE internal path — /api/internal/voice-worker/ready — the
+    // on-demand voice worker's readiness handshake. Same worker-authenticated
+    // surface (WORKER_CONTEXT_SECRET), gated on WORKER_ORCHESTRATION and 404 when
+    // off; widens no recruiter-facing route. 114 + 1 = 115.
+    expect(Object.keys(paths).length).toBe(115);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -1112,7 +1116,11 @@ describe('OpenAPI document integrity', () => {
     // of the two worker-inband recording endpoints. All carry
     // additionalProperties:false, and the responses never document upload_url on
     // a refusal. 226 + 4 = 230.
-    expect(Object.keys(schemas).length).toBe(230);
+    // PR B adds TWO: VoiceWorkerReadyRequest and VoiceWorkerReadyResponse, the
+    // strict request/response pair of the on-demand worker readiness ping. Both
+    // carry additionalProperties:false; the response documents only {ok, status}
+    // and never a session id or token. 230 + 2 = 232.
+    expect(Object.keys(schemas).length).toBe(232);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.
@@ -1335,6 +1343,13 @@ describe('auth boundary vs spec security model', () => {
     // 401 `authentication_required` rather than the recruiter middleware's
     // `authentication_error`.
     'GET /api/internal/phone/attempt/{attemptId}/answered',
+    // PR B, same surface and same boundary: the on-demand voice worker's
+    // readiness ping. Mounted pre-auth behind WORKER_CONTEXT_SECRET, so it
+    // answers the worker's 401 `authentication_required` rather than the
+    // recruiter middleware's `authentication_error`. (When WORKER_ORCHESTRATION
+    // is off it 404s, but the auth middleware sits BEFORE the flag check, so an
+    // unauthenticated request is refused 401 regardless.)
+    'POST /api/internal/voice-worker/ready',
     // Ashby webhook: HMAC-gated (not recruiter-authenticated), mounted pre-auth.
     'POST /api/integrations/ashby/webhook',
     // LiveKit phone webhook: JWT-gated (not recruiter-authenticated), mounted

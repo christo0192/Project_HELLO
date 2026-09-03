@@ -1815,6 +1815,65 @@ paths:
               schema:
                 $ref: '#/components/schemas/PhoneWorkerError'
 
+  # ── Internal voice-worker orchestration surface (PR B) ─────────────
+  /api/internal/voice-worker/ready:
+    post:
+      tags: [phone]
+      operationId: postVoiceWorkerReady
+      summary: Readiness ping from an on-demand voice worker on LiveKit registration
+      description: Internal, service-authenticated readiness handshake for on-demand Fly worker scaling (cost & scale plan §2). When the orchestrator starts a claimed pool machine and the worker finishes booting and registering with LiveKit, the worker POSTs its (app, machine_id, session_id, epoch) here; the API CASes the lease to `ready` via mark_voice_worker_ready. Only a `ready` lease may receive a caller/candidate, so this is the signal the orchestrator's ensureReadyWorker poll observes before it dials/admits. Same constant-time WORKER_CONTEXT_SECRET boundary as the phone-worker surface, not a recruiter session, and mounted before recruiter auth. Disabled by default — the endpoint 404s (as if it did not exist) unless WORKER_ORCHESTRATION is on. A stale ping (wrong session, superseded epoch, machine already stopped/draining) is ok=false status=stale, so a fenced claim does not proceed.
+      security:
+        - workerBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VoiceWorkerReadyRequest'
+      responses:
+        '200':
+          description: The lease CAS reached a verdict. ok=true status=ready means the machine is now ready to admit; ok=false status=stale means the claim was fenced and the worker must not proceed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VoiceWorkerReadyResponse'
+        '400':
+          description: Request body failed validation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '401':
+          description: Worker bearer credential required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '403':
+          description: Worker bearer credential invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '404':
+          description: Worker orchestration is disabled (WORKER_ORCHESTRATION is off); the endpoint does not exist on this deployment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '500':
+          description: voice_worker_ready_error — sanitized stable code, never a driver message.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '503':
+          description: The worker credential is not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+
   # ── Ashby integration ──────────────────────────────────────────────
   /api/integrations/livekit-phone/webhook:
     post:
@@ -6615,6 +6674,39 @@ components:
         error:
           type: string
           description: Stable snake_case code. Never a driver message and never a phone number.
+      additionalProperties: false
+
+    VoiceWorkerReadyRequest:
+      type: object
+      required: [app, machine_id, session_id, epoch]
+      description: PR B. The on-demand voice worker's readiness ping. Names the Fly app, its machine id, the claimed session id and the fencing epoch minted at claim time. The API CASes the lease to `ready` on (app, machine_id, session_id, epoch); any mismatch is stale.
+      properties:
+        app:
+          type: string
+          description: Fly app name that owns this machine (project-hello-phone-voice or project-hello-voice).
+        machine_id:
+          type: string
+          description: Fly machine id, the join key back to the lease and the Fly Machines API.
+        session_id:
+          type: string
+          format: uuid
+          description: The phone attempt id or browser session id this machine was claimed for.
+        epoch:
+          type: integer
+          minimum: 0
+          description: The fencing token from the claim; a superseded epoch is rejected as stale.
+      additionalProperties: false
+
+    VoiceWorkerReadyResponse:
+      type: object
+      required: [ok, status]
+      description: PR B. The readiness verdict. ok=true status=ready means the lease became ready and the machine may admit; ok=false status=stale (or another non-ready status) means the claim was fenced and the worker must not proceed.
+      properties:
+        ok:
+          type: boolean
+        status:
+          type: string
+          description: ready or stale (or a forwarded non-ready RPC status).
       additionalProperties: false
 
     PhoneAnsweredStateResponse:
