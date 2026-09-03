@@ -1699,6 +1699,122 @@ paths:
               schema:
                 $ref: '#/components/schemas/PhoneWorkerError'
 
+  /api/internal/phone/recording/prepare:
+    post:
+      tags: [phone]
+      operationId: preparePhoneWorkerRecording
+      summary: Bind the worker-inband recording and mint a presigned upload URL
+      description: Internal, service-authenticated. PR A. The RECORDING_PROVIDER=worker twin of the LiveKit-Cloud egress path — ACTIVE ONLY on the worker provider; on the default egress provider it 404s as if it did not exist, so the egress recording path is byte-for-byte unaffected. Runs the SAME consent gate the egress path uses (attach_phone_attempt_recording plus the authoritative/supplementary role decision), stamps worker_inband provenance and an active egress status, and mints a presigned PUT for the DERIVED attempt object key. A refusal — role undecidable, attach refused, unknown attempt, or no signer configured — returns NO upload_url and binds nothing, exactly as the egress path guarantees. The worker PUTs the transcoded MP3 to the returned url, then calls /recording/complete. Disabled by default.
+      security:
+        - workerBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PhoneRecordingPrepareRequest'
+      responses:
+        '200':
+          description: ok=true with status prepared or already_prepared carries the object_key and the presigned upload_url. Every refusal — role_undecidable, unknown_attempt, upload_url_failed, or a forwarded attach refusal — is ok=false and carries NO upload_url.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneRecordingPrepareResponse'
+        '400':
+          description: Request body failed validation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneRecordingPrepareResponse'
+        '401':
+          description: Worker bearer credential required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '403':
+          description: Worker bearer credential invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '404':
+          description: The worker recording provider is not active (RECORDING_PROVIDER is not worker); the endpoint does not exist on this deployment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '500':
+          description: phone_recording_prepare_error — sanitized stable code.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneRecordingPrepareResponse'
+        '503':
+          description: Phone screening disabled, the worker credential is not configured, or no upload signer is wired (recording_unavailable).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneRecordingPrepareResponse'
+
+  /api/internal/phone/recording/complete:
+    post:
+      tags: [phone]
+      operationId: completePhoneWorkerRecording
+      summary: Finalize a worker-uploaded recording (download, re-hash, verify, link)
+      description: Internal, service-authenticated. PR A. The worker has PUT the MP3 to the presigned URL minted by /recording/prepare; this marks the session egress complete and runs the finalizer's worker branch (download + re-hash + size-check + manifest + link). The finalizer RE-DOWNLOADS and RE-HASHES the object itself and never trusts the worker's reported sha256/size_bytes for the integrity columns — those are advisory to the worker's own logging only. ACTIVE ONLY on the worker provider; on the default egress provider it 404s. Disabled by default.
+      security:
+        - workerBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PhoneRecordingCompleteRequest'
+      responses:
+        '200':
+          description: ok=true with status ready means the recording is linked and servable. status pending is a bounded deferral the finalize convergence will retry; status fallback_required is latched (oversize / no egress). All three are forwarded truthfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneRecordingCompleteResponse'
+        '400':
+          description: Request body failed validation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneRecordingCompleteResponse'
+        '401':
+          description: Worker bearer credential required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '403':
+          description: Worker bearer credential invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '404':
+          description: The worker recording provider is not active (RECORDING_PROVIDER is not worker); the endpoint does not exist on this deployment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '500':
+          description: phone_recording_complete_error — sanitized stable code.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneRecordingCompleteResponse'
+        '503':
+          description: Phone screening disabled, or the worker credential is not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+
   # ── Ashby integration ──────────────────────────────────────────────
   /api/integrations/livekit-phone/webhook:
     post:
@@ -6513,6 +6629,96 @@ components:
           type: boolean
         terminal:
           type: boolean
+      additionalProperties: false
+
+    PhoneRecordingPrepareRequest:
+      type: object
+      required: [attempt_id, session_id]
+      description: PR A. The worker names the attempt and its session; engagement_id is OPTIONAL because the in-worker recorder runs from a session function that has no engagement id in scope, in which case the server resolves it authoritatively from the attempt (fail-closed on an unknown attempt). All ids are UUID-shaped; the server re-derives the object key and the consent gate authorizes the binding.
+      properties:
+        attempt_id:
+          type: string
+          format: uuid
+        session_id:
+          type: string
+          format: uuid
+        engagement_id:
+          type: string
+          format: uuid
+          description: Optional. Omitted, the server resolves it from the attempt; present, it is taken verbatim.
+      additionalProperties: false
+
+    PhoneRecordingPrepareResponse:
+      type: object
+      required: [ok, status]
+      description: PR A. ok=true only for prepared / already_prepared, which carry the presigned upload_url and the derived object_key. Every refusal is ok=false and carries NO upload_url — the worker cannot upload audio for a binding that was refused.
+      properties:
+        ok:
+          type: boolean
+        status:
+          type: string
+          description: prepared / already_prepared are the two success states; the rest are refusals or transport codes.
+          enum:
+            - prepared
+            - already_prepared
+            - refused
+            - upload_url_failed
+            - unknown_attempt
+            - invalid_request
+            - recording_unavailable
+            - phone_recording_prepare_error
+            - phone_screening_disabled
+        object_key:
+          type: string
+          description: The DERIVED attempt-scoped object key. Present on a successful prepare.
+        upload_url:
+          type: string
+          description: The presigned PUT the worker uploads the MP3 to. Present ONLY on prepared / already_prepared, NEVER on a refusal.
+        reason:
+          type: string
+          nullable: true
+          description: The stable DB refusal code when the consent gate or role decision refused (e.g. role_undecidable). Null otherwise.
+      additionalProperties: false
+
+    PhoneRecordingCompleteRequest:
+      type: object
+      required: [attempt_id, session_id, sha256, size_bytes]
+      description: PR A. The worker reports the sha256, byte size and (optionally) duration of the MP3 it uploaded. These are advisory to the worker's own logging; the finalizer re-downloads and re-hashes the object itself and never trusts these numbers for the integrity columns.
+      properties:
+        attempt_id:
+          type: string
+          format: uuid
+        session_id:
+          type: string
+          format: uuid
+        sha256:
+          type: string
+          description: Lowercase hex SHA-256 of the uploaded object (64 chars). Advisory only.
+        size_bytes:
+          type: integer
+          description: Byte size of the uploaded object. Advisory only.
+        duration_ms:
+          type: integer
+          nullable: true
+          description: Optional duration in milliseconds.
+      additionalProperties: false
+
+    PhoneRecordingCompleteResponse:
+      type: object
+      required: [ok, status]
+      description: PR A. ok=true with status ready means the recording is linked and servable. status pending is a bounded deferral the finalize convergence will retry; status fallback_required is latched (oversize / no egress). invalid_request and phone_recording_complete_error are the validation and transport codes.
+      properties:
+        ok:
+          type: boolean
+        status:
+          type: string
+          enum:
+            - ready
+            - pending
+            - fallback_required
+            - invalid_request
+            - phone_recording_complete_error
+            - phone_screening_disabled
       additionalProperties: false
 
     PhoneWorkerEventRequest:

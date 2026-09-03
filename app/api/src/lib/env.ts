@@ -100,6 +100,16 @@ export const env = {
   recordingEgressS3Region: process.env.RECORDING_EGRESS_S3_REGION ?? 'ap-south-1',
   recordingEgressS3AccessKeyId: process.env.RECORDING_EGRESS_S3_ACCESS_KEY_ID ?? '',
   recordingEgressS3SecretAccessKey: process.env.RECORDING_EGRESS_S3_SECRET_ACCESS_KEY ?? '',
+  /**
+   * PR A: recording PRODUCER selection. 'egress' (default) uses LiveKit Cloud
+   * room-composite egress, which the Build plan caps at 2 concurrent jobs.
+   * 'worker' records inside the agent worker (RecorderIO mixes candidate + bot
+   * TTS → OGG → transcoded MP3 → presigned-PUT upload to the attempt object
+   * key), which removes the egress-concurrency limit. Any value other than the
+   * exact string 'worker' resolves to 'egress' — fail-safe to the proven path.
+   */
+  recordingProvider: (process.env.RECORDING_PROVIDER === 'worker' ? 'worker' : 'egress') as
+    'egress' | 'worker',
   recordingEgressFinalizeTimeoutMs: positiveInt(
     'RECORDING_EGRESS_FINALIZE_TIMEOUT_MS', 20_000, 1_000, 120_000,
   ),

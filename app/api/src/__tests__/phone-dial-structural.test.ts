@@ -113,6 +113,7 @@ describe('1. the module exists and the extractor does not swallow code', () => {
       'recording-purge.ts',
       'recording.ts',
       'sip.ts',
+      'worker-recording.ts',
     ]);
   });
 
@@ -129,6 +130,7 @@ describe('1. the module exists and the extractor does not swallow code', () => {
       'recording-purge.ts': 'export async function purgePhoneEngagementRecordings(',
       'recording.ts': 'export async function startPhoneAttemptRecording(',
       'sip.ts': SYNTHETIC_DECL,
+      'worker-recording.ts': 'export async function prepareWorkerRecording(',
     };
     for (const { name, source } of FILES) {
       const body = code(source);

@@ -1046,7 +1046,11 @@ describe('OpenAPI document integrity', () => {
     // 0071 adds ONE internal path — /assessment/item-turn, the per-item
     // transcript writer (X4). Same worker-authenticated surface; widens no
     // recruiter-facing route.
-    expect(Object.keys(paths).length).toBe(112);
+    // PR A adds TWO internal phone-worker paths — /recording/prepare and
+    // /recording/complete — the worker-inband recording twin of the egress
+    // path, on the SAME worker-authenticated surface (they widen no
+    // recruiter-facing route). 112 + 2 = 114.
+    expect(Object.keys(paths).length).toBe(114);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -1103,7 +1107,12 @@ describe('OpenAPI document integrity', () => {
     // 0071 adds TWO: PhoneItemTurnRequest and PhoneItemTurnResponse, the
     // per-item transcript writer's strict body and its {ok, status, duplicate}
     // answer (X4). Neither ever carries the turn text back.
-    expect(Object.keys(schemas).length).toBe(226);
+    // PR A adds FOUR: PhoneRecordingPrepareRequest/Response and
+    // PhoneRecordingCompleteRequest/Response, the strict request/response pairs
+    // of the two worker-inband recording endpoints. All carry
+    // additionalProperties:false, and the responses never document upload_url on
+    // a refusal. 226 + 4 = 230.
+    expect(Object.keys(schemas).length).toBe(230);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.
@@ -1312,6 +1321,15 @@ describe('auth boundary vs spec security model', () => {
     // 401 `authentication_required` rather than the middleware's
     // `authentication_error`.
     'POST /api/internal/phone/attempt/heartbeat',
+    // PR A, same surface and same boundary: the worker-inband recording twin of
+    // the egress path. Both are mounted pre-auth behind WORKER_CONTEXT_SECRET,
+    // so they answer the worker's 401 `authentication_required` rather than the
+    // recruiter middleware's `authentication_error` — the property this
+    // allowlist records. (On the default egress provider they 404, but the
+    // auth middleware sits BEFORE the provider check, so an unauthenticated
+    // request is refused 401 regardless of provider.)
+    'POST /api/internal/phone/recording/prepare',
+    'POST /api/internal/phone/recording/complete',
     // Answer-first ("bounce") readiness poll, same surface and same boundary:
     // the worker GETs it behind WORKER_CONTEXT_SECRET, answering the worker's
     // 401 `authentication_required` rather than the recruiter middleware's
