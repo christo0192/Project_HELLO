@@ -205,6 +205,7 @@
         "SUPABASE_SCHEMA": { "requiredInProduction": true, "secret": false },
         "API_BASE": { "requiredInProduction": true, "secret": false },
         "WORKER_CONTEXT_SECRET": { "requiredInProduction": true, "secret": true },
+        "RECORDING_PROVIDER": { "requiredInProduction": false, "secret": false },
         "WORKER_CONTEXT_TIMEOUT_SEC": { "requiredInProduction": false, "secret": false },
         "WORKER_CONTEXT_RESOLVE_ATTEMPTS": { "requiredInProduction": false, "secret": false },
         "WORKER_CONTEXT_RESOLVE_BACKOFF_SEC": { "requiredInProduction": false, "secret": false },

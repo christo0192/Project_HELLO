@@ -404,6 +404,151 @@ async function waitForTerminalEgress(
   return { kind: 'timeout', sawIdentityMismatch };
 }
 
+/**
+ * The synthetic-egress-id prefix the in-worker recorder mints (see
+ * `worker-recording.ts` / `workerRecordingEgressId`). A session carrying one of
+ * these has a worker-uploaded object, not a LiveKit egress, and finalizes
+ * through `finalizeWorkerInbandRecording` rather than the egress poll.
+ */
+const WORKER_INBAND_EGRESS_ID_PREFIX = 'EG_worker_';
+
+export function isWorkerInbandEgressId(egressId: string): boolean {
+  return egressId.startsWith(WORKER_INBAND_EGRESS_ID_PREFIX);
+}
+
+/**
+ * PR A — finalize a WORKER-INBAND recording.
+ *
+ * The worker already recorded the call, transcoded it to MP3, and PUT it to the
+ * attempt-scoped object key. There is therefore NO egress to stop or poll: this
+ * does exactly the tail of the egress branch — download the object, enforce the
+ * size cap, SHA-256 it, write the canonical `<object>.json` manifest, and link
+ * the integrity columns — but sets `recording_provenance = 'worker_inband'`
+ * (0078) and writes the session columns directly, because
+ * `finalize_authoritative_recording` (0054) hard-codes `livekit_egress` and
+ * would answer `provenance_conflict` for this origin.
+ *
+ * Deferral/latch semantics MIRROR the egress branch: a zero-byte or unreadable
+ * download is a bounded DEFERRAL (transient storage), an oversize object is a
+ * deterministic latch to `failed` (`fallback_required`), a bad manifest is a
+ * deferral, and a converged session clears the deferral markers on the way out.
+ * Idempotent: a second finalize of an already-linked worker recording returns
+ * `ready` from the caller before this function is reached.
+ */
+export async function finalizeWorkerInbandRecording(
+  sessionId: string,
+  deps: RecordingEgressDeps = {},
+): Promise<RecordingFinalizeStatus> {
+  const db = deps.db ?? supabase;
+  const maxAttempts = env.recordingFinalizeMaxAttempts;
+  const defer = async (reason: RecordingFinalizeDeferReason): Promise<'pending'> => {
+    await recordFinalizeDeferral(db, sessionId, reason, maxAttempts);
+    return 'pending';
+  };
+
+  // Re-read the egress id so the attempt binding lookup uses the SAME id the
+  // 0051 stamp wrote. A worker recording is always a `live` (phone) session and
+  // its object key is owned by the bound attempt, never guessed.
+  const { data: session, error } = await db
+    .from('call_sessions')
+    .select('recording_egress_id, recording_object_key, recording_provenance')
+    .eq('id', sessionId)
+    .single();
+  if (error || !session) throw new Error('recording session not found');
+  if (session.recording_object_key) return 'ready';
+  if (!session.recording_egress_id) return 'fallback_required';
+  const egressId = String(session.recording_egress_id);
+
+  const { data: attempt, error: attemptError } = await db
+    .from('phone_call_attempts')
+    .select('recording_object_key, recording_manifest_key')
+    .eq('session_id', sessionId)
+    .eq('egress_id', egressId)
+    .not('recording_object_key', 'is', null)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (attemptError) throw new Error('phone recording binding read failed');
+  if (!attempt?.recording_object_key) return defer('object_absent');
+  const objectKey = String(attempt.recording_object_key);
+  const manifestKey = typeof attempt.recording_manifest_key === 'string'
+    ? attempt.recording_manifest_key
+    : null;
+  const contentType = 'audio/mpeg';
+
+  const { data: object, error: downloadError } = await db.storage
+    .from(env.recordingsBucket)
+    .download(objectKey);
+  if (downloadError) return defer('object_unreadable');
+  if (!object) return defer('object_absent');
+  const bytes = Buffer.from(await object.arrayBuffer());
+  // Same latch split as the egress branch: a zero-byte read is STORAGE
+  // evidence (transient) → bounded deferral; an oversize object is a
+  // DETERMINISTIC property of the bytes → latch to `failed`.
+  if (bytes.length === 0) return defer('object_unreadable');
+  if (bytes.length > env.recordingMaxBytes) {
+    await db.from('call_sessions')
+      .update({ recording_egress_status: 'failed' })
+      .eq('id', sessionId);
+    return 'fallback_required';
+  }
+
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+
+  // The manifest has exactly one writer: this finalizer. Verify an existing
+  // object by exact canonical bytes so retries are idempotent.
+  if (manifestKey !== `${objectKey}.json`) return defer('manifest_unwritable');
+  const manifest = Buffer.from(JSON.stringify({
+    schema_version: 1,
+    object_key: objectKey,
+    content_type: contentType,
+    sha256,
+    size_bytes: bytes.length,
+    provider_duration_ms: null,
+    egress_id: egressId,
+    finalized_at: null,
+  }));
+  const bucket = db.storage.from(env.recordingsBucket);
+  const uploaded = await bucket.upload(manifestKey, manifest, {
+    contentType: 'application/json',
+    upsert: false,
+  });
+  if (uploaded.error) {
+    const existing = await bucket.download(manifestKey);
+    if (existing.error || !existing.data) return defer('manifest_unwritable');
+    const existingBytes = Buffer.from(await existing.data.arrayBuffer());
+    if (!existingBytes.equals(manifest)) return defer('manifest_unwritable');
+  }
+
+  // Link the integrity columns directly. `finalize_authoritative_recording`
+  // cannot be used: it forces `livekit_egress` provenance and rejects any other
+  // non-null origin. The write is conditioned on a still-null object key so two
+  // finalizers racing the same session cannot both link (the loser's update
+  // matches zero rows and it falls through to the idempotent `ready`).
+  const { data: linked, error: linkError } = await db
+    .from('call_sessions')
+    .update({
+      recording_object_key: objectKey,
+      recording_sha256: sha256,
+      recording_size_bytes: bytes.length,
+      recording_content_type: contentType,
+      recording_provenance: 'worker_inband',
+      recording_egress_status: 'complete',
+      recording_finalize_defer_reason: null,
+      recording_finalize_exhausted_at: null,
+    })
+    .eq('id', sessionId)
+    .is('recording_object_key', null)
+    .select('id');
+  if (linkError) return defer('rpc_unknown');
+  // Whether THIS update linked the row (one row) or a concurrent finalizer
+  // linked it first (zero rows), the outcome is the same: the object is linked.
+  // `linked` is referenced so the CAS result is not silently discarded — a
+  // future reader can distinguish the winner from the loser here if needed.
+  void linked;
+  return 'ready';
+}
+
 export async function finalizeAuthoritativeRecording(
   sessionId: string,
   deps: RecordingEgressDeps = {},
@@ -415,6 +560,23 @@ export async function finalizeAuthoritativeRecording(
     .eq('id', sessionId)
     .single();
   if (error || !session) throw new Error('recording session not found');
+  // ── PR A: the WORKER-INBAND branch ──────────────────────────────────
+  // A session whose egress id was minted by the in-worker recorder (0051
+  // stamp with the synthetic `EG_worker_` id) has NO LiveKit egress to stop or
+  // poll — the worker already uploaded the MP3 to the derived object key. Route
+  // it to the branch that downloads + hashes + size-checks + manifests + links
+  // that object directly. The default `egress` provider never mints this id, so
+  // this dispatch is inert unless a deployment opted into `RECORDING_PROVIDER=
+  // worker`. Guarded by `!recording_object_key` so an already-linked worker
+  // recording (a completed finalize, or an idempotent retry) is `ready` without
+  // re-downloading.
+  if (
+    typeof session.recording_egress_id === 'string'
+    && isWorkerInbandEgressId(session.recording_egress_id)
+  ) {
+    if (session.recording_object_key) return 'ready';
+    return finalizeWorkerInbandRecording(sessionId, deps);
+  }
   // I‑1: a linked key is only authoritative when it came from the egress.
   // A browser_upload key with a live egress must fall through and be repointed.
   if (

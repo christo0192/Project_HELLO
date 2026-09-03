@@ -78,6 +78,11 @@ import { PHONE_ASSESSMENT_QUEUE, phoneAssessmentDedupKey } from '../lib/phone-ru
 import { phoneRoomName } from '../integrations/livekit-phone-dial/phone-room.js';
 import { createPlivoBounceStore } from '../integrations/plivo-phone/stores.js';
 import { startPhoneAttemptRecording } from '../integrations/livekit-phone-dial/recording.js';
+import {
+  prepareWorkerRecording,
+  type WorkerRecordingUploadSigner,
+} from '../integrations/livekit-phone-dial/worker-recording.js';
+import { finalizeAuthoritativeRecording } from '../lib/recording-egress.js';
 import { purgePhoneEngagementRecordings } from '../integrations/livekit-phone-dial/recording-purge.js';
 import { supabaseStorageRecordingStorage } from '../lib/retention.js';
 import { env } from '../lib/env.js';
@@ -326,6 +331,41 @@ const itemTurnSchema = z
   })
   .strict();
 
+/**
+ * PR A — `POST /recording/prepare` body.
+ *
+ * The worker names the attempt, its session, and the engagement it belongs to.
+ * All three are UUID-shaped by schema; the server re-derives nothing it can
+ * read, and the consent gate (`attach_phone_attempt_recording`) is what
+ * actually authorizes a binding. Active ONLY when `RECORDING_PROVIDER=worker`.
+ */
+const recordingPrepareSchema = z
+  .object({
+    attempt_id: z.string().regex(UUID_RE),
+    session_id: z.string().regex(UUID_RE),
+    engagement_id: z.string().regex(UUID_RE),
+  })
+  .strict();
+
+/**
+ * PR A — `POST /recording/complete` body.
+ *
+ * The worker reports the SHA-256, byte size and duration of the MP3 it uploaded
+ * to the presigned PUT. These are advisory to the worker's own logging; the
+ * finalizer RE-DOWNLOADS and RE-HASHES the object itself and never trusts the
+ * worker's numbers for the integrity columns. Active ONLY when
+ * `RECORDING_PROVIDER=worker`.
+ */
+const recordingCompleteSchema = z
+  .object({
+    attempt_id: z.string().regex(UUID_RE),
+    session_id: z.string().regex(UUID_RE),
+    sha256: z.string().regex(/^[a-f0-9]{64}$/),
+    size_bytes: z.number().int().positive().max(52_428_800),
+    duration_ms: z.number().int().positive().lt(4_102_444_800_000).nullable().optional(),
+  })
+  .strict();
+
 export interface PhoneWorkerRouterDeps {
   readonly stores?: PhoneStores;
   /** Read-only appointment/attempt seam for proposal validation. */
@@ -382,6 +422,29 @@ export interface PhoneWorkerRouterDeps {
     sessionId: string;
     now: Date;
   }) => Promise<{ status: string; egressStarted: boolean }>;
+  /**
+   * PR A — the recording PROVIDER for THIS router. Defaults to
+   * `env.recordingProvider` ('egress'). The two `/recording/*` endpoints are
+   * ACTIVE only when this is `'worker'`; on `'egress'` they 404, so the egress
+   * path is byte-for-byte unaffected. Injected so a test can flip the provider
+   * without mocking the env module.
+   */
+  readonly recordingProvider?: 'egress' | 'worker';
+  /**
+   * PR A — mints the presigned PUT the worker uploads the MP3 to (worker
+   * provider only). Injected so a test needs no Supabase Storage. In production
+   * it is supplied ONLY when an S3 destination is configured; an unconfigured
+   * deployment simply cannot prepare a worker upload, which is the safe
+   * direction (recording less than promised harms nobody).
+   */
+  readonly uploadSigner?: WorkerRecordingUploadSigner;
+  /**
+   * PR A — finalizes a worker-inband recording (download + hash + size-check +
+   * manifest + link). Injected so a test can observe the call without a DB;
+   * production defaults to `finalizeAuthoritativeRecording`, which dispatches to
+   * its worker branch on the synthetic `EG_worker_` egress id.
+   */
+  readonly finalizeRecording?: (sessionId: string) => Promise<'ready' | 'fallback_required' | 'pending'>;
   readonly configSource?: NodeJS.ProcessEnv;
   readonly now?: () => Date;
   /**
@@ -1475,6 +1538,103 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
     }
   });
 
+  // ── PR A: the WORKER-INBAND recording endpoints ───────────────────────
+  // Additive and flag-gated. `recordingProvider` defaults to
+  // `env.recordingProvider` ('egress'), and on 'egress' BOTH routes 404 as if
+  // they did not exist — the egress recording path is untouched. They activate
+  // only on `RECORDING_PROVIDER=worker`.
+  const recordingProvider = deps.recordingProvider ?? env.recordingProvider;
+  const workerRecordingActive = recordingProvider === 'worker';
+
+  // ── POST /recording/prepare ───────────────────────────────────────
+  // Runs the SAME consent gate the egress path uses (attach + role decision),
+  // stamps `worker_inband` provenance + `active` egress status, and mints a
+  // presigned PUT for the DERIVED attempt object key. A refusal (role
+  // undecidable, attach refused, pre-disclosure) returns NO uploadUrl and binds
+  // nothing.
+  router.post('/recording/prepare', requireWorkerPhoneAuth, async (req, res) => {
+    try {
+      if (!config().screeningEnabled) {
+        return res.status(503).json({ ok: false, error: 'phone_screening_disabled' });
+      }
+      // On the egress provider this endpoint does not exist.
+      if (!workerRecordingActive) {
+        return res.status(404).json({ ok: false, error: 'not_found' });
+      }
+      const parsed = recordingPrepareSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ ok: false, status: 'invalid_request' });
+      }
+      // No signer wired ⇒ the deployment cannot record inband. Refuse cleanly;
+      // never pretend to have bound something the worker cannot upload to.
+      if (deps.uploadSigner === undefined) {
+        return res.status(503).json({ ok: false, status: 'recording_unavailable' });
+      }
+      const result = await prepareWorkerRecording(
+        {
+          engagementId: parsed.data.engagement_id,
+          attemptId: parsed.data.attempt_id,
+          sessionId: parsed.data.session_id,
+          now: now(),
+        },
+        { stores: stores(), signer: deps.uploadSigner },
+      );
+      // An unstamped recording is unfindable by the session-keyed read path;
+      // say so out loud here (the dialer package is console-free by pin).
+      if (result.boundForUpload && result.sessionStamped !== true) {
+        phoneWorkerLog.warn('unknown_event', {
+          schema: 'worker_recording_prepare',
+          error_category: `session_egress_stamp_missed:${result.stampStatus ?? 'unknown'}`,
+        });
+      }
+      if (result.status === 'prepared' || result.status === 'already_prepared') {
+        return res.json({
+          ok: true,
+          status: result.status,
+          object_key: result.objectKey,
+          upload_url: result.uploadUrl,
+        });
+      }
+      // Every refusal is forwarded WITHOUT an upload_url, so the worker cannot
+      // upload audio for a binding that was refused.
+      return res.json({
+        ok: false,
+        status: result.status,
+        reason: result.refusal ?? null,
+      });
+    } catch {
+      return res.status(500).json({ ok: false, status: 'phone_recording_prepare_error' });
+    }
+  });
+
+  // ── POST /recording/complete ──────────────────────────────────────
+  // The worker has PUT the MP3 to the presigned URL. Mark the session egress
+  // `complete` and run the finalizer's worker branch (download + hash +
+  // size-check + manifest + link). The finalizer re-hashes the object itself;
+  // the worker's reported sha/size are advisory only.
+  router.post('/recording/complete', requireWorkerPhoneAuth, async (req, res) => {
+    try {
+      if (!config().screeningEnabled) {
+        return res.status(503).json({ ok: false, error: 'phone_screening_disabled' });
+      }
+      if (!workerRecordingActive) {
+        return res.status(404).json({ ok: false, error: 'not_found' });
+      }
+      const parsed = recordingCompleteSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ ok: false, status: 'invalid_request' });
+      }
+      const finalize = deps.finalizeRecording ?? finalizeAuthoritativeRecording;
+      const status = await finalize(parsed.data.session_id);
+      // `ready` = linked and servable; `pending` = a bounded deferral (transient
+      // storage) the finalize convergence will retry; `fallback_required` =
+      // latched (oversize / no egress). All are forwarded truthfully.
+      return res.json({ ok: status === 'ready', status });
+    } catch {
+      return res.status(500).json({ ok: false, status: 'phone_recording_complete_error' });
+    }
+  });
+
   return router;
 }
 
@@ -1672,5 +1832,24 @@ export const phoneWorkerRouter = createPhoneWorkerRouter({
           egress: await createPhoneEgressClient(),
           buildOutput: createPhoneEgressOutput,
         })
+    : undefined,
+  // PR A. The presigned-PUT signer is supplied ONLY on the worker provider with
+  // a configured storage destination; otherwise `/recording/prepare` refuses
+  // `recording_unavailable`. On the default egress provider the two
+  // `/recording/*` routes 404 regardless, so this is inert.
+  uploadSigner: env.recordingProvider === 'worker' && phoneEgressConfigured()
+    ? {
+        async createUploadUrl(objectKey: string): Promise<{ uploadUrl: string } | null> {
+          try {
+            const { data, error } = await supabase.storage
+              .from(env.recordingsBucket)
+              .createSignedUploadUrl(objectKey);
+            if (error || !data?.signedUrl) return null;
+            return { uploadUrl: data.signedUrl };
+          } catch {
+            return null;
+          }
+        },
+      }
     : undefined,
 });
