@@ -96,6 +96,17 @@ jobs:
       phone: ${{ steps.decide.outputs.phone }}
       database: ${{ steps.decide.outputs.database }}
       sha: ${{ steps.decide.outputs.sha }}
+      # On-demand orchestration signal, read from the checked-out Fly config of
+      # EACH voice app (not live Fly state): an app is orchestration-ON iff its
+      # config declares `WORKER_ORCHESTRATION = "worker"` in [env] — the SAME
+      # exact-string the worker runtime reads (worker_ready_api.py) to decide
+      # whether it scales to zero, so the deploy gate and the worker can never
+      # disagree. Config-as-signal is deliberate over a live `flyctl secrets`
+      # probe: it is in the reviewed diff at the deploy SHA, needs no app token
+      # before the branch decision, and is deterministic. Absent/"off"/anything
+      # else ⇒ OFF ⇒ the always-on deploy path runs byte-identically to today.
+      voice_orchestration: ${{ steps.decide.outputs.voice_orchestration }}
+      phone_orchestration: ${{ steps.decide.outputs.phone_orchestration }}
     steps:
       - name: Resolve target SHA
         id: sha
@@ -129,6 +140,13 @@ jobs:
             echo "phone=$phone" >> "$GITHUB_OUTPUT"
             # Manual application deploys still apply every pending migration first.
             echo "database=true" >> "$GITHUB_OUTPUT"
+            # A manual dispatch reconciles against the SAME config-flag signal as
+            # a push, so a scaled-to-zero app can be recovered via the dispatch
+            # valve without a false "no current registration" failure.
+            if grep -Eq '^[[:space:]]*WORKER_ORCHESTRATION[[:space:]]*=[[:space:]]*"worker"[[:space:]]*$' app/voice-livekit/fly.toml 2>/dev/null; then
+              echo "voice_orchestration=worker" >> "$GITHUB_OUTPUT"; else echo "voice_orchestration=off" >> "$GITHUB_OUTPUT"; fi
+            if grep -Eq '^[[:space:]]*WORKER_ORCHESTRATION[[:space:]]*=[[:space:]]*"worker"[[:space:]]*$' app/voice-livekit/fly.phone.toml 2>/dev/null; then
+              echo "phone_orchestration=worker" >> "$GITHUB_OUTPUT"; else echo "phone_orchestration=off" >> "$GITHUB_OUTPUT"; fi
             exit 0
           fi
           # Path diff of the merge commit (fallback to single-commit file list).
@@ -152,6 +170,20 @@ jobs:
               echo "database=false" >> "$GITHUB_OUTPUT"
             fi
           }
+          # On-demand orchestration signal per voice app, read from the checked-out
+          # Fly config's [env]. ON iff `WORKER_ORCHESTRATION = "worker"` (the exact
+          # string the worker runtime gates on). Absent/"off"/other ⇒ OFF, and the
+          # emitted value is exactly "off" so the byte-identical always-on path runs.
+          orch() { # $1 = config path relative to app/voice-livekit
+            local cfg="app/voice-livekit/$1"
+            if grep -Eq '^[[:space:]]*WORKER_ORCHESTRATION[[:space:]]*=[[:space:]]*"worker"[[:space:]]*$' "$cfg" 2>/dev/null; then
+              echo "worker"
+            else
+              echo "off"
+            fi
+          }
+          echo "voice_orchestration=$(orch fly.toml)"       >> "$GITHUB_OUTPUT"
+          echo "phone_orchestration=$(orch fly.phone.toml)" >> "$GITHUB_OUTPUT"
 
   migrate-production:
     needs: detect
@@ -212,8 +244,14 @@ jobs:
         with:
           ref: ${{ needs.detect.outputs.sha }}
       - uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be # v1.5
+      # ── ALWAYS-ON path (orchestration OFF). BYTE-IDENTICAL to the historical
+      #    steps: the only addition is the `if:` guard selecting this branch when
+      #    the browser app is NOT orchestration-ON. With the shipped config
+      #    (WORKER_ORCHESTRATION = "off") this is the path that runs, exactly as
+      #    before. ──
       - name: Deploy browser voice worker
         id: deploy
+        if: needs.detect.outputs.voice_orchestration != 'worker'
         working-directory: app/voice-livekit
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_VOICE }}
@@ -224,6 +262,7 @@ jobs:
           echo "watermark=$(date -u +%Y-%m-%dT%H:%M:%S)" >> "$GITHUB_OUTPUT"
           flyctl deploy --remote-only --config fly.toml
       - name: Verify CURRENT worker registration (run policy ALWAYS_ON)
+        if: needs.detect.outputs.voice_orchestration != 'worker'
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_VOICE }}
           WATERMARK: ${{ steps.deploy.outputs.watermark }}
@@ -253,6 +292,26 @@ jobs:
           # failure is distinguishable from a genuinely unregistered worker.
           flyctl logs -a project-hello-voice --no-tail || true
           echo "::error::no current 'registered worker' log at/after watermark $WATERMARK on project-hello-voice"; exit 1
+      # ── ON-DEMAND path (orchestration ON). Runs ONLY when the browser app
+      #    declares WORKER_ORCHESTRATION = "worker" (scaled to zero). It starts a
+      #    pool machine, runs the SAME watermarked current-registration proof
+      #    against it, deploys, re-verifies, and returns the machine to STOPPED —
+      #    cleaning up (only) a machine it started, on success OR failure. This
+      #    lets a scaled-to-zero app deploy without a false "no current
+      #    registration" failure, without discarding the registration safety. ──
+      - name: Deploy browser voice worker on-demand (orchestration ON)
+        if: needs.detect.outputs.voice_orchestration == 'worker'
+        working-directory: app/voice-livekit
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_VOICE }}
+          APP: project-hello-voice
+          FLY_CONFIG: fly.toml
+        run: |
+          set -euo pipefail
+          # Pre-start watermark: captured BEFORE this script starts the machine,
+          # so the pre-deploy registration proof cannot be satisfied by a stale line.
+          export WATERMARK="$(date -u +%Y-%m-%dT%H:%M:%S)"
+          bash "$GITHUB_WORKSPACE/scripts/deploy-voice-orchestration.sh"
 
   deploy-phone-voice:
     needs: [detect, migrate-production]
@@ -266,8 +325,15 @@ jobs:
         with:
           ref: ${{ needs.detect.outputs.sha }}
       - uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be # v1.5
+      # ── ALWAYS-ON path (orchestration OFF). BYTE-IDENTICAL to the historical
+      #    §6-flip steps; the only addition is the `if:` guard selecting this
+      #    branch when the phone app is NOT orchestration-ON. With the shipped
+      #    config (fly.phone.toml has no WORKER_ORCHESTRATION) this is the path
+      #    that runs, exactly as before. The §6 flip's ban on any re-zeroing in
+      #    THIS branch stands (it must never scale a live always-on canary to 0). ──
       - name: Deploy phone voice worker (run policy ALWAYS_ON; dispatched by API name)
         id: deploy
+        if: needs.detect.outputs.phone_orchestration != 'worker'
         working-directory: app/voice-livekit
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_PHONE_VOICE }}
@@ -281,6 +347,7 @@ jobs:
           echo "watermark=$(date -u +%Y-%m-%dT%H:%M:%S)" >> "$GITHUB_OUTPUT"
           flyctl deploy --remote-only --config fly.phone.toml
       - name: Verify CURRENT worker registration (run policy ALWAYS_ON)
+        if: needs.detect.outputs.phone_orchestration != 'worker'
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_PHONE_VOICE }}
           WATERMARK: ${{ steps.deploy.outputs.watermark }}
@@ -311,3 +378,23 @@ jobs:
           # failure is distinguishable from a genuinely unregistered worker.
           flyctl logs -a project-hello-phone-voice --no-tail || true
           echo "::error::no current 'registered worker' log at/after watermark $WATERMARK on project-hello-phone-voice"; exit 1
+      # ── ON-DEMAND path (orchestration ON). Runs ONLY when fly.phone.toml
+      #    declares WORKER_ORCHESTRATION = "worker" (scaled to zero). Delegates to
+      #    the shared reconciliation script: start pool machine -> verify CURRENT
+      #    registration -> deploy -> re-verify -> STOP (only a machine it started,
+      #    on success OR failure). The re-zeroing ban in the OFF branch above does
+      #    NOT apply here: with orchestration ON the app's steady state IS stopped,
+      #    so returning the pool machine to STOPPED is the intended posture, not a
+      #    canary kill. The scale/stop lives in the SCRIPT, not this YAML. ──
+      - name: Deploy phone voice worker on-demand (orchestration ON)
+        if: needs.detect.outputs.phone_orchestration == 'worker'
+        working-directory: app/voice-livekit
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_PHONE_VOICE }}
+          APP: project-hello-phone-voice
+          FLY_CONFIG: fly.phone.toml
+        run: |
+          set -euo pipefail
+          # Pre-start watermark: captured BEFORE the script starts the machine.
+          export WATERMARK="$(date -u +%Y-%m-%dT%H:%M:%S)"
+          bash "$GITHUB_WORKSPACE/scripts/deploy-voice-orchestration.sh"

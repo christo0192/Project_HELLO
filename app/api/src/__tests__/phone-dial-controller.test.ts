@@ -922,10 +922,11 @@ describe('a lease that cannot span ring + opening gate is REFUSED, not stretched
 //
 // Three properties, each a mandated invariant:
 //   * BYTE-IDENTICAL when no gate is injected — the default path.
-//   * PROCEEDS on `ready` (and on the service's own `disabled`), after
+//   * PROCEEDS on `ready` (and on the service's own `disabled`), BEFORE
 //     the room/dispatch and before the originate; carries the machine id.
-//   * DEFERS (worker_not_ready, NO carrier) on no_capacity / timeout / error,
-//     and releases nothing (the service cleaned up its own claim).
+//   * DEFERS (worker_not_ready, NO carrier, NO room/dispatch) on
+//     no_capacity / timeout / error, and releases nothing (the service
+//     cleaned up its own claim).
 //   * a claim made then declined AFTER the gate (lease too short / originate
 //     failed) is RELEASED, best-effort.
 // ═══════════════════════════════════════════════════════════════════════
@@ -944,7 +945,7 @@ describe('P5 dial — the on-demand worker gate', () => {
     expect(h.originate).toHaveBeenCalledTimes(1);
   });
 
-  it('proceeds on READY: gate runs AFTER the room and BEFORE the originate; machine id is carried', async () => {
+  it('proceeds on READY: gate runs BEFORE the room/dispatch and BEFORE the originate; machine id is carried', async () => {
     const h = harness({ worker: { status: 'ready', machineId: 'm-42' } });
     const res = await run(h);
 
@@ -952,11 +953,12 @@ describe('P5 dial — the on-demand worker gate', () => {
     expect(res.providerContacted).toBe(true);
     expect(res.machineId).toBe('m-42');
     expect(h.ensureReadyWorker).toHaveBeenCalledTimes(1);
-    // Ordering: the dispatch (room) precedes the gate, which precedes the
-    // originate. The candidate is never dialled before a ready worker exists,
-    // and the worker had a room to resolve before it posted ready.
-    expect(order.indexOf('room')).toBeLessThan(order.indexOf('ensureReadyWorker'));
-    expect(order.indexOf('ensureReadyWorker')).toBeLessThan(order.indexOf('originate'));
+    // Ordering (design §2.3 PR-B — READY-BEFORE-DISPATCH): the gate precedes
+    // the room/dispatch, which precedes the originate. The dispatch must land
+    // on an already-registered worker (never a still-cold machine), and the
+    // candidate is never dialled before a ready worker exists.
+    expect(order.indexOf('ensureReadyWorker')).toBeLessThan(order.indexOf('room'));
+    expect(order.indexOf('room')).toBeLessThan(order.indexOf('originate'));
     expect(h.releaseWorker).not.toHaveBeenCalled();
   });
 
@@ -976,7 +978,7 @@ describe('P5 dial — the on-demand worker gate', () => {
     { status: 'timeout' as const },
     { status: 'error' as const, code: 'fly_5xx' },
   ]) {
-    it(`DEFERS with worker_not_ready on ${outcome.status}, and reaches no carrier`, async () => {
+    it(`DEFERS with worker_not_ready on ${outcome.status}, provisions no room and reaches no carrier`, async () => {
       const h = harness({ worker: outcome });
       const res = await run(h);
 
@@ -985,6 +987,12 @@ describe('P5 dial — the on-demand worker gate', () => {
       expect(res.detail).toBe(outcome.status);
       // Two witnesses of "no call": the flag and the spy.
       expectNoNetwork(res, h);
+      // READY-BEFORE-DISPATCH: the gate defers BEFORE the room, so no room is
+      // created and no agent is dispatched — nothing to undo.
+      expect(h.createRoom).not.toHaveBeenCalled();
+      expect(h.dispatch).not.toHaveBeenCalled();
+      // No room name is reported, because none was provisioned.
+      expect(res.roomName).toBeUndefined();
       // The service already released its own claim on a failing verdict, so the
       // controller does NOT double-release.
       expect(h.releaseWorker).not.toHaveBeenCalled();
@@ -1049,5 +1057,28 @@ describe('P5 dial — the on-demand worker gate', () => {
 
     expect(res.status).toBe('refused');
     expect(res.refusal).toBe('originate_failed');
+  });
+
+  it('RELEASES the gated worker when the room then fails to provision', async () => {
+    // The gate runs BEFORE the room now (READY-BEFORE-DISPATCH), so a room
+    // failure is the earliest point that can strand a claimed-and-ready worker.
+    // It must be released, and no carrier reached.
+    const h = harness({
+      worker: { status: 'ready', machineId: 'm-room' },
+      roomFails: true,
+    });
+    const res = await run(h);
+
+    expect(res.status).toBe('refused');
+    expect(res.refusal).toBe('room_unavailable');
+    expectNoNetwork(res, h);
+    expect(h.ensureReadyWorker).toHaveBeenCalledTimes(1);
+    // The gate ran before the room: ensureReadyWorker precedes the room attempt.
+    expect(order.indexOf('ensureReadyWorker')).toBeLessThan(order.indexOf('room'));
+    expect(h.releaseWorker).toHaveBeenCalledWith({
+      app: 'project-hello-phone-voice',
+      machineId: 'm-room',
+      sessionId: SESSION,
+    });
   });
 });
