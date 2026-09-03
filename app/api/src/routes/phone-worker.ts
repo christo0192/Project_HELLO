@@ -647,6 +647,19 @@ function requireWorkerPhoneAuth(
   next();
 }
 
+/**
+ * The egress recording producer is armed ONLY on the egress provider with a
+ * configured storage destination. On `RECORDING_PROVIDER=worker` it must be OFF
+ * even though egress is configured — the worker records itself to the same
+ * attempt object key, and arming both would double-record the call.
+ */
+export function egressRecordingEnabled(
+  provider: 'egress' | 'worker',
+  egressConfigured: boolean,
+): boolean {
+  return egressConfigured && provider !== 'worker';
+}
+
 export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Router {
   const router = Router();
   const now = deps.now ?? ((): Date => new Date());
@@ -1849,7 +1862,14 @@ export const phoneWorkerRouter = createPhoneWorkerRouter({
       },
     );
   },
-  startRecording: phoneEgressConfigured()
+  // The EGRESS producer. Wired only on the egress provider: on
+  // `RECORDING_PROVIDER=worker` the worker records itself (RecorderIO ->
+  // /recording/prepare+complete) to the SAME attempt object key, so leaving the
+  // egress path armed would DOUBLE-record the call (two producers, one key).
+  // The worker path still needs egress *configured* (its presigned-upload signer
+  // gate below reuses `phoneEgressConfigured()` as the storage-config proxy),
+  // which is exactly why the provider gate here is required, not the config check.
+  startRecording: egressRecordingEnabled(env.recordingProvider, phoneEgressConfigured())
     ? async (input): Promise<{ status: string; egressStarted: boolean }> =>
         startPhoneAttemptRecording(input, {
           stores: createPhoneStores(supabase as never),

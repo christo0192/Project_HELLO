@@ -16,7 +16,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import express from 'express';
 import request from 'supertest';
-import { createPhoneWorkerRouter } from '../routes/phone-worker.js';
+import { createPhoneWorkerRouter, egressRecordingEnabled } from '../routes/phone-worker.js';
 import type { PhoneStores } from '../lib/phone-screening/index.js';
 import type { WorkerRecordingUploadSigner } from '../integrations/livekit-phone-dial/worker-recording.js';
 
@@ -270,5 +270,17 @@ describe('provider=worker complete — drives the finalizer worker branch', () =
     const res = await authed(h.app, COMPLETE, { ...COMPLETE_BODY, sha256: 'tooshort' });
     expect(res.status).toBe(400);
     expect(h.finalizeRecording).not.toHaveBeenCalled();
+  });
+});
+
+describe('egressRecordingEnabled — no double-record on the worker provider', () => {
+  it('arms egress only on the egress provider with storage configured', () => {
+    // worker provider: egress MUST be off even though storage is configured
+    // (the worker records the same key itself — arming both double-records).
+    expect(egressRecordingEnabled('worker', true)).toBe(false);
+    expect(egressRecordingEnabled('worker', false)).toBe(false);
+    // egress provider: unchanged — armed iff storage is configured.
+    expect(egressRecordingEnabled('egress', true)).toBe(true);
+    expect(egressRecordingEnabled('egress', false)).toBe(false);
   });
 });
