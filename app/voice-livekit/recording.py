@@ -18,10 +18,14 @@ so the local file is deleted and NOTHING is uploaded (there is therefore no
 object for the server-side purge to race against). The upload in :meth:`finish`
 is thus gated by the CALLER on the consent outcome, never performed blindly.
 
-The taps are wired at session construction and :meth:`begin` starts recording at
+The taps are wired immediately AFTER ``session.start()`` (which is when RoomIO
+attaches the live ``session.input.audio`` / ``session.output.audio`` the taps must
+wrap — before start they are ``None``), and :meth:`begin` starts recording at
 answer; ``RecorderAudioInput`` only accumulates while ``RecorderIO.recording`` is
 True (verified against the 1.6.4 wheel), so begin/discard cleanly bound the
-captured window with no mid-session reassignment of ``session.input/output.audio``.
+captured window. Reassigning the streams once, right after start, is a supported
+operation (the ``AgentInput``/``AgentOutput`` ``.audio`` setters fire
+on_attached/on_detached + ``_audio_changed``, re-wiring the running session).
 
 ── FAIL-OPEN ───────────────────────────────────────────────────────────────
 Recording is strictly secondary to the screening happening. Every step here is
@@ -171,17 +175,39 @@ class InWorkerRecorder:
         return self._begun and not self._failed
 
     def wire(self) -> bool:
-        """Install the input/output taps at session construction. Recording does
-        NOT begin here — no frame is captured until :meth:`begin`. Fail-open:
-        returns False (and self-disables) if wiring fails, so the call proceeds
-        with no recording rather than crashing."""
+        """Install the input/output taps around the session's LIVE audio I/O.
+
+        MUST be called AFTER ``session.start()``: RoomIO only attaches the room
+        audio to ``session.input.audio`` / ``session.output.audio`` during start,
+        so before that both are ``None``. Wrapping ``None`` yields a tap whose
+        ``__anext__`` raises ``NoneType`` at runtime and an output tap that feeds a
+        null sink — a silent call in both directions. This method therefore
+        REFUSES to wire (and self-disables) when either stream is absent, so the
+        call always proceeds with no recording rather than a broken audio path.
+
+        Recording does NOT begin here — no frame is captured until :meth:`begin`.
+        Fail-open: returns False if wiring fails or is refused."""
         if self._wired:
             return True
         try:
+            # Both live streams must exist BEFORE we wrap them. If either is None
+            # (wire() called too early, or a room with no audio I/O), refuse and
+            # self-disable — never build a tap around None.
+            in_src = self._session.input.audio
+            out_src = self._session.output.audio
+            if in_src is None or out_src is None:
+                logger.warning(
+                    "in_worker_recording_wire_skipped_no_audio_io "
+                    "has_input=%s has_output=%s",
+                    in_src is not None, out_src is not None,
+                )
+                self._failed = True
+                return False
             self._recorder = self._recorder_factory(self._session, self._sample_rate)
-            # record_input/record_output must both be called before start().
-            self._session.input.audio = self._recorder.record_input(self._session.input.audio)
-            self._session.output.audio = self._recorder.record_output(self._session.output.audio)
+            # record_input/record_output must both be called before the recorder's
+            # own start() (invoked from begin() at the consent seam).
+            self._session.input.audio = self._recorder.record_input(in_src)
+            self._session.output.audio = self._recorder.record_output(out_src)
             self._wired = True
             return True
         except Exception:  # noqa: BLE001 — fail-open by contract

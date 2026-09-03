@@ -189,6 +189,34 @@ class TestInWorkerRecorderLifecycle(unittest.TestCase):
         self.assertFalse(_begin(r))
         self.assertIsNone(_finish(r))
 
+    def test_wire_refuses_when_audio_io_absent(self):
+        # THE SILENT-CALL REGRESSION (both-directions-dead). RoomIO attaches
+        # session.input.audio / .output.audio only DURING session.start(); before
+        # that (or if the room has no audio I/O) either is None. wire() MUST refuse
+        # to wrap None — a None-wrapped RecorderAudioInput raises NoneType in
+        # __anext__ and the output tap feeds a null sink, silencing the call in
+        # both directions. So: return False, self-disable, construct no recorder,
+        # and leave the session's real audio streams untouched.
+        for label, in_audio, out_audio in (
+            ("both_none", None, None),
+            ("input_none", None, "bot_audio"),
+            ("output_none", "candidate_audio", None),
+        ):
+            with self.subTest(label):
+                session = _FakeSession()
+                session.input.audio = in_audio
+                session.output.audio = out_audio
+                r, _s, holder = _make(session=session)
+                self.assertFalse(r.wire())              # refused
+                self.assertFalse(r.active)              # self-disabled
+                self.assertNotIn("recorder", holder)    # RecorderIO never built
+                # the real room I/O is left exactly as-is — no tap installed
+                self.assertEqual(session.input.audio, in_audio)
+                self.assertEqual(session.output.audio, out_audio)
+                # begin() is a no-op after a refused wire; finish() records nothing
+                self.assertFalse(_begin(r))
+                self.assertIsNone(_finish(r))
+
     def test_begin_failure_is_fail_open(self):
         r, _session, _holder = _make(fail_start=True)
         r.wire()
