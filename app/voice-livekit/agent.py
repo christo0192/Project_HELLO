@@ -769,22 +769,45 @@ def _browser_worker_named() -> bool:
     )
 
 
+def _phone_worker_orchestrated() -> bool:
+    """True iff THIS process is the NAMED phone worker AND on-demand
+    orchestration is on (design §2.3, PR B phone-path retrofit). The phone
+    parallel of :func:`_browser_worker_named`: it gates BOTH the phone worker's
+    ``prewarm_fnc`` (machine-level readiness) and — as the caller in
+    ``_run_phone_session`` reads it — the retirement of the OLD session-keyed
+    ``/ready`` ping, so naming and machine-level readiness stay inseparable on
+    the phone path exactly as they are on the browser path.
+
+    OFF (the default, ``WORKER_ORCHESTRATION`` unset) ⇒ False ⇒ byte-identical
+    to today: the named phone worker gets no prewarm, and the session-keyed
+    ping (which was itself already gated OFF by the same flag) never fired
+    either. Read at call time so the default is observable."""
+    return bool(_phone_agent_name()) and worker_ready_api.worker_orchestration_enabled()
+
+
 def _prewarm_post_machine_ready(_proc: Any) -> None:
-    """WorkerOptions.prewarm_fnc for the NAMED browser worker: post MACHINE-level
-    readiness (design §2.3b B-i, ready-before-dispatch).
+    """WorkerOptions.prewarm_fnc for a NAMED worker under on-demand
+    orchestration: post MACHINE-level readiness (design §2.3b B-i for browser,
+    §2.3 PR-B retrofit for phone — ready-before-dispatch).
 
     Fires once per idle process as the worker warms its pool after registering
     with LiveKit — the earliest session-less moment at which "this machine's
     worker is up" is true. Posts {app, machine_id} to /ready-machine so the
-    API's ``ensureReadyWorker`` poll can observe `ready` and THEN dispatch. The
-    browser worker never posts the session-keyed ``/ready`` (it does not yet
-    know its session); the phone worker's session-keyed ping is UNTOUCHED.
+    API's ``ensureReadyWorker`` poll can observe `ready` and THEN dispatch.
+
+    Shared by BOTH the named browser worker (``_browser_worker_named``) and the
+    named phone worker under orchestration (``_phone_worker_orchestrated``); it
+    is a no-op for any OTHER process (unnamed browser worker, or a named worker
+    with the flag off). Neither worker posts anything session-keyed from here —
+    it does not yet know its session. The phone worker's LEGACY session-keyed
+    ``/ready`` (posted after ``ctx.connect``) is SUPERSEDED by this machine-level
+    ready and is inert whenever this prewarm is active.
 
     prewarm_fnc is called synchronously in the job subprocess, so the async post
     is driven on a private event loop here. FAIL-OPEN and best-effort: any
     failure degrades to the API's start-wait budget + reaper and must never
     raise out of process init (which would fail the warmup)."""
-    if not _browser_worker_named():
+    if not (_browser_worker_named() or _phone_worker_orchestrated()):
         return
     try:
         asyncio.run(worker_ready_api.post_worker_ready_machine())
@@ -876,6 +899,20 @@ def build_worker_options() -> WorkerOptions:
                 # Fixed exception: credentials and raw URLs are never included.
                 raise RuntimeError("phone_judge_runtime_config_invalid")
         options["agent_name"] = agent_name
+        # ── PHONE-PATH RETROFIT: machine-level ready-before-dispatch ─────
+        # design §2.3, PR B RISK "dispatch ordering vs cold start". When
+        # orchestration is on, the phone worker posts MACHINE-level readiness
+        # at prewarm (session-less, at LiveKit registration, BEFORE any job) —
+        # exactly like the named browser worker — so the API can ready-BEFORE
+        # -dispatch and the cold-starting worker can never miss a dispatch it
+        # was not yet up to receive. The legacy session-keyed ``/ready`` posted
+        # after ``ctx.connect`` is thereby SUPERSEDED (and is inert whenever
+        # this predicate holds — see ``_run_phone_session``). OFF (the default)
+        # ⇒ no prewarm key at all, byte-identical to today; the phone worker
+        # keeps ``num_idle_processes=1`` regardless (already set above), so this
+        # adds ONLY the prewarm hook and nothing else drifts.
+        if _phone_worker_orchestrated():
+            options["prewarm_fnc"] = _prewarm_post_machine_ready
     return WorkerOptions(**options)
 
 
@@ -3275,17 +3312,29 @@ async def _run_phone_session(
     """Connect, wait, disclose, classify — then, and only then, screen."""
     await ctx.connect()
 
-    # ── ON-DEMAND ORCHESTRATION: SIGNAL READY BEFORE WAITING FOR ANYONE ──
-    # phone-cost-and-scale-plan §2.3. The moment we are connected to the room
-    # we were dispatched into, tell the API this worker is registered + ready
-    # so its `ensureReadyWorker` poll can stop and let the dial proceed — the
-    # whole point of on-demand start-then-dial is that the candidate is never
-    # dialled before a worker is present. Posted HERE, before the participant
-    # wait, because waiting for the SIP participant is exactly the latency this
-    # signal exists to unblock. Gated OFF by default (WORKER_ORCHESTRATION !=
-    # "worker") and FAIL-OPEN: a lost ping degrades to the API's start-wait
-    # budget + reaper, never to a raised exception into the call path.
-    if worker_ready_api.worker_orchestration_enabled():
+    # ── ON-DEMAND ORCHESTRATION: READINESS IS NOW MACHINE-LEVEL AT PREWARM ─
+    # design §2.3, PR B RISK "dispatch ordering vs cold start". The phone worker
+    # used to post a SESSION-keyed `/ready` HERE, after ``ctx.connect`` — i.e.
+    # only AFTER it had already received the dispatch. Under scale-to-zero that
+    # is a chicken-and-egg: the API created the dispatch while the machine was
+    # off, and a cold-starting worker could miss it and never reach this line,
+    # so the dial deferred forever. The phone path now mirrors the browser one:
+    # the worker posts MACHINE-level readiness ({app, machine_id}) at PREWARM,
+    # session-less and BEFORE any job (see ``_prewarm_post_machine_ready``), and
+    # the API readies-BEFORE-dispatch. That machine-level ping SUPERSEDES this
+    # session-keyed one, so the old post is inert whenever the prewarm is the
+    # active mechanism (``_phone_worker_orchestrated``).
+    #
+    # The legacy session-keyed post remains ONLY as a defensive fallback for a
+    # configuration where orchestration is on but this is NOT the named phone
+    # worker that prewarms (``_phone_worker_orchestrated`` false) — a shape that
+    # does not arise in the phone deployment but keeps the ping's original
+    # contract if the machine-level path was not wired. OFF (the default) it was
+    # already a no-op and remains one: byte-identical to today.
+    if (
+        worker_ready_api.worker_orchestration_enabled()
+        and not _phone_worker_orchestrated()
+    ):
         ready_session_id = phone.session_id_from_room_name(room_name)
         if ready_session_id is not None:
             try:

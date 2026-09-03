@@ -57,6 +57,11 @@ import { APPROVED_WORKER_REGIONS, assertPolicyConsistent, checkPrimaryRegion } f
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
+// When imported (e.g. by the test, for `checkOrchestrationPosture`) the module
+// must expose its pure helpers WITHOUT running the CLI validation or calling
+// process.exit. The executable body below is guarded on being the entrypoint.
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // Default to the real configs; directory arguments let the test drive
 // synthetic fixtures through the exact same checker.
@@ -140,6 +145,73 @@ function envFileValue(text, key) {
   return undefined;
 }
 
+/** Any `key = value` assignment anywhere in the file (any table), returning the
+ *  raw RHS token(s). Used by the orchestration-posture check, which cares about
+ *  a handful of scaling keys wherever Fly accepts them ([[vm]], [http_service],
+ *  [[services]].concurrency, or a bare top-level). Deliberately format-simple:
+ *  matches `key = <value>` with optional quotes, across the whole file. */
+function anyValueAll(text, key) {
+  const found = [];
+  for (const raw of text.split("\n")) {
+    const m = raw.match(new RegExp(`^\\s*${key}\\s*=\\s*("?)([^"#\\n]*?)\\1\\s*(#.*)?$`));
+    if (m) found.push(m[2].trim());
+  }
+  return found;
+}
+
+/**
+ * The orchestration-posture invariant (deliverable 2). Given one worker config's
+ * text, its declared orchestration state, and a label, return a list of posture
+ * failures (empty ⇒ consistent).
+ *
+ * Two directions, both about NOT defeating the deploy gate the other lane relies
+ * on:
+ *   • orchestration ON  ⇒ the app MUST be able to scale to zero. A config that
+ *     pins it always-on (`min_machines_running >= 1`, or auto-stop disabled)
+ *     both defeats the whole cost purpose AND makes the on-demand deploy path's
+ *     "start a stopped pool machine" premise false — there is no stopped machine
+ *     to start, and the app never returns to zero. Rejected.
+ *   • orchestration OFF ⇒ the always-on registration proof MUST stay reachable.
+ *     Pinning `min_machines_running = 0` (or enabling auto-stop) on an OFF worker
+ *     scales it to zero with NO orchestrator to start it on demand, so the
+ *     always-on deploy job's current-registration proof would fail closed on a
+ *     worker nothing is keeping up. Rejected. (Absent keys = Fly's always-on
+ *     default for these worker apps, which is correct for OFF — so silence is a
+ *     pass here; only an explicit scale-to-zero pin is the misconfig.)
+ */
+export function checkOrchestrationPosture(label, text, orchestrationOn) {
+  const problems = [];
+  const minRun = anyValueAll(text, "min_machines_running");
+  const autoStop = anyValueAll(text, "auto_stop_machines");
+  const minRunNums = minRun.map((v) => Number.parseInt(v, 10));
+  const autoStopOn = autoStop.some((v) => /^(true|"?stop"?|"?suspend"?)$/i.test(v));
+  const autoStopOff = autoStop.some((v) => /^(false|"?off"?)$/i.test(v));
+
+  if (orchestrationOn) {
+    // Must be able to reach zero.
+    for (const n of minRunNums) {
+      if (Number.isFinite(n) && n >= 1) {
+        problems.push(`${label} declares WORKER_ORCHESTRATION = "worker" (on-demand) but pins min_machines_running = ${n} (>= 1); an orchestration-on app must scale to zero — the on-demand deploy path starts a STOPPED pool machine and returns it to stopped, which a min-1 pin defeats`);
+      }
+    }
+    if (autoStopOff) {
+      problems.push(`${label} declares WORKER_ORCHESTRATION = "worker" (on-demand) but disables auto_stop_machines; an orchestration-on app must be allowed to stop (scale to zero)`);
+    }
+  } else {
+    // Must stay always-on so the current-registration proof is reachable.
+    for (const n of minRunNums) {
+      if (Number.isFinite(n) && n === 0) {
+        problems.push(`${label} is NOT orchestration-on (WORKER_ORCHESTRATION != "worker") yet pins min_machines_running = 0; with no orchestrator to start it on demand, the always-on deploy job's CURRENT-registration proof would fail closed on a worker nothing keeps up. Either keep it always-on (remove the pin) or turn orchestration ON (WORKER_ORCHESTRATION = "worker")`);
+      }
+    }
+    if (autoStopOn) {
+      problems.push(`${label} is NOT orchestration-on yet enables auto_stop_machines; the same always-on-proof hazard as a min-0 pin — an always-on worker must not auto-stop`);
+    }
+  }
+  return problems;
+}
+
+if (isMain) {
 const browser = read("fly.toml");
 const phoneCfg = read("fly.phone.toml");
 
@@ -257,10 +329,23 @@ ok(AGREEMENT_OK,
 // state must be visible/auditable, not merely absent (H-1 was invisible before).
 notes.push(`phone_agent_name_state=${agreementState}`);
 
+// ── 9. Orchestration posture (deliverable 2) ─────────────────────────────
+// An app that declares on-demand orchestration must be able to scale to zero
+// (no always-on pin), and an always-on worker must not be pinned to zero — the
+// deploy gate's always-on registration proof depends on it staying up. The
+// signal is the SAME exact string the worker runtime and the deploy workflow
+// read: WORKER_ORCHESTRATION = "worker" in [env].
+const browserOrchOn = envValue(browser, "WORKER_ORCHESTRATION") === "worker";
+const phoneOrchOn = envValue(phoneCfg, "WORKER_ORCHESTRATION") === "worker";
+for (const problem of checkOrchestrationPosture("fly.toml", browser, browserOrchOn)) ok(false, problem);
+for (const problem of checkOrchestrationPosture("fly.phone.toml", phoneCfg, phoneOrchOn)) ok(false, problem);
+notes.push(`orchestration_state=browser:${browserOrchOn ? "worker" : "off"},phone:${phoneOrchOn ? "worker" : "off"}`);
+
 if (failures.length) {
   console.error(`voice worker app config contract FAILED (${failures.length}):`);
   for (const f of failures) console.error(" - " + f);
   process.exit(1);
 }
 for (const n of notes) console.error(`voice worker app config note: ${n}`);
-console.log("voice worker app configs valid (browser unnamed; phone named & API-dispatched; isolated; no secrets; approved deployment region across all three Fly app configs; worker<->API name agreement surfaced).");
+console.log("voice worker app configs valid (browser unnamed; phone named & API-dispatched; isolated; no secrets; approved deployment region across all three Fly app configs; worker<->API name agreement surfaced; orchestration posture consistent with scale-to-zero vs always-on).");
+} // end if (isMain)

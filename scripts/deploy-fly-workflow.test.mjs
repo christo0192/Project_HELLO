@@ -273,9 +273,170 @@ ok(/both\)\s*api=true; voice=true ;;/.test(detect), "'both' must select api + br
 ok(/all\)\s*api=true; voice=true; phone=true ;;/.test(detect), "'all' must select api + browser-voice + phone-voice");
 ok(/phone-voice\)\s*phone=true ;;/.test(detect), "'phone-voice' must select only the phone app");
 
+// ── 11. On-demand orchestration deploy reconciliation ────────────────────
+// The always-on registration proof must stay EXACTLY as today when orchestration
+// is OFF, and switch to start->verify->deploy->stop when ON. These assertions
+// prove: (a) the OFF path is still gated + present (byte-identical safety), (b)
+// the signal is the config flag read at detect time, (c) an ON branch exists and
+// delegates to the shared script, (d) the ON branch does NOT require a
+// pre-existing current registration in the workflow YAML.
+
+// (a) OFF path unchanged: the historical always-on deploy+verify steps still
+//     exist, and are now GATED to run only when orchestration != 'worker'. The
+//     full always-on verification contract (§8 above) already asserts their
+//     bodies are intact; here we assert the guard that keeps them the OFF path.
+ok(/name: Deploy browser voice worker\n\s*id: deploy\n\s*if: needs\.detect\.outputs\.voice_orchestration != 'worker'/.test(voice),
+  "the browser always-on deploy step must be gated to orchestration OFF (voice_orchestration != 'worker')");
+ok(/name: Verify CURRENT worker registration[\s\S]*?if: needs\.detect\.outputs\.voice_orchestration != 'worker'/.test(voice),
+  "the browser always-on verify step must be gated to orchestration OFF");
+ok(/if: needs\.detect\.outputs\.phone_orchestration != 'worker'/.test(phone),
+  "the phone always-on steps must be gated to orchestration OFF (phone_orchestration != 'worker')");
+
+// (b) The signal is the config flag, read in detect from the checked-out tree,
+//     and emitted per voice app. Absent/"off"/other must resolve to "off".
+ok(/voice_orchestration:\s*\$\{\{\s*steps\.decide\.outputs\.voice_orchestration\s*\}\}/.test(detect), "detect must output voice_orchestration");
+ok(/phone_orchestration:\s*\$\{\{\s*steps\.decide\.outputs\.phone_orchestration\s*\}\}/.test(detect), "detect must output phone_orchestration");
+ok(/WORKER_ORCHESTRATION\[\[:space:\]\]\*=\[\[:space:\]\]\*"worker"/.test(detect),
+  "detect must read the orchestration signal from the config's WORKER_ORCHESTRATION = \"worker\" flag");
+ok(/orch fly\.toml/.test(detect) && /orch fly\.phone\.toml/.test(detect),
+  "detect must evaluate the flag against BOTH voice configs");
+ok(/echo "voice_orchestration=off"/.test(detect) && /echo "phone_orchestration=off"/.test(detect),
+  "the manual-dispatch branch must also emit the orchestration signal (default off)");
+
+// (c) An ON branch exists for BOTH voice apps, gated to orchestration ON, and
+//     delegates to the shared reconciliation script (start->verify->deploy->stop).
+ok(/name: Deploy browser voice worker on-demand \(orchestration ON\)\n\s*if: needs\.detect\.outputs\.voice_orchestration == 'worker'/.test(voice),
+  "the browser job must have an ON-demand branch gated to orchestration ON");
+ok(/name: Deploy phone voice worker on-demand \(orchestration ON\)\n\s*if: needs\.detect\.outputs\.phone_orchestration == 'worker'/.test(phone),
+  "the phone job must have an ON-demand branch gated to orchestration ON");
+ok(/scripts\/deploy-voice-orchestration\.sh/.test(voice) && /scripts\/deploy-voice-orchestration\.sh/.test(phone),
+  "both ON-demand branches must delegate to scripts/deploy-voice-orchestration.sh");
+ok(/APP: project-hello-voice\b/.test(voice) && /FLY_CONFIG: fly\.toml\b/.test(voice),
+  "the browser ON-demand branch must target project-hello-voice / fly.toml");
+ok(/APP: project-hello-phone-voice\b/.test(phone) && /FLY_CONFIG: fly\.phone\.toml\b/.test(phone),
+  "the phone ON-demand branch must target project-hello-phone-voice / fly.phone.toml");
+// Token isolation must hold in the ON branches too (each app, only its token).
+ok(!/FLY_API_TOKEN_API/.test(voice) && !/FLY_API_TOKEN_PHONE_VOICE/.test(voice),
+  "the browser ON-demand branch must not reference the api or phone token");
+ok(!/FLY_API_TOKEN_API/.test(phone) && !/FLY_API_TOKEN_VOICE\b/.test(phone),
+  "the phone ON-demand branch must not reference the api or browser token");
+
+// (d) The ON branch does NOT require a pre-existing current registration in the
+//     workflow YAML: the ON branch body carries no in-YAML "no current
+//     'registered worker'" fail-closed loop — that logic moved into the script,
+//     which starts a machine FIRST. Assert the ON branch is just the delegation.
+{
+  const onBranch = (voice.match(/name: Deploy browser voice worker on-demand[\s\S]*?bash "\$GITHUB_WORKSPACE\/scripts\/deploy-voice-orchestration\.sh"/) || [""])[0];
+  ok(onBranch && !/for i in \$\(seq 1 24\)/.test(onBranch),
+    "the ON-demand branch must not inline the always-on 24-attempt registration loop (it starts a machine first, in the script)");
+}
+
+// ── 11b. BEHAVIOUR: run the shared reconciliation SCRIPT against stubs ────
+// Prove the ON-path mechanism executes start->verify->deploy->stop and that its
+// cleanup returns ONLY a machine it started, on success AND on failure. Runs the
+// real script with stub flyctl/date/sleep on a replaced PATH; no token reaches
+// Fly (the stub never calls out).
+{
+  const scriptPath = path.join(root, "scripts/deploy-voice-orchestration.sh");
+  const scriptSrc = readFileSync(scriptPath, "utf8");
+  ok(/machine start/.test(scriptSrc) && /machine stop/.test(scriptSrc) && /flyctl deploy/.test(scriptSrc),
+    "the reconciliation script must start a machine, deploy, and stop a machine");
+  ok(/trap cleanup EXIT/.test(scriptSrc),
+    "the reconciliation script must clean up (stop the started machine) via an EXIT trap");
+  ok(/registered worker/.test(scriptSrc) && /WATERMARK/.test(scriptSrc),
+    "the reconciliation script must carry the same watermarked current-registration proof");
+
+  const makeStub = ({ logsMode = "registered", deployRc = 0 }) => {
+    const dir = mkdtempSync(path.join(tmpdir(), "orch-stub-"));
+    // flyctl stub: records each machine start/stop into a call log; emits a
+    // registration line for logs in "registered" mode; deploy exits deployRc.
+    const calls = path.join(dir, "calls.log");
+    const bin = path.join(dir, "flyctl");
+    writeFileSync(bin, [
+      "#!/usr/bin/env bash",
+      `echo "$@" >> ${JSON.stringify(calls)}`,
+      'case "$1" in',
+      '  logs)',
+      `    case "${logsMode}" in`,
+      "      registered) echo '2099-01-01T00:00:00 registered worker id=stub' ;;",
+      "      silent) : ;;",
+      "    esac ;;",
+      "  machine)",
+      '    if [ "$2" = "list" ]; then',
+      // one stopped machine 'm1'; after a start it reports started.
+      '      if [ -f ' + JSON.stringify(path.join(dir, "started")) + ' ]; then echo "m1 app started"; else echo "m1 app stopped"; fi',
+      '    elif [ "$2" = "start" ]; then touch ' + JSON.stringify(path.join(dir, "started")) + '; ',
+      '    elif [ "$2" = "stop" ]; then rm -f ' + JSON.stringify(path.join(dir, "started")) + '; ',
+      "    fi ;;",
+      `  deploy) exit ${deployRc} ;;`,
+      "esac",
+      "exit 0",
+    ].join("\n"));
+    chmodSync(bin, 0o755);
+    const slp = path.join(dir, "sleep"); writeFileSync(slp, "#!/usr/bin/env bash\nexit 0\n"); chmodSync(slp, 0o755);
+    return { dir, calls };
+  };
+  const runScript = (stub, env = {}) => {
+    const r = spawnSync("bash", [scriptPath], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${stub.dir}:/usr/bin:/bin`,
+        APP: "project-hello-phone-voice",
+        FLY_CONFIG: "fly.phone.toml",
+        WATERMARK: "2020-01-01T00:00:00",
+        READY_ATTEMPTS: "3", START_ATTEMPTS: "3", SLEEP_SECONDS: "0",
+        ...env,
+      },
+    });
+    const callLog = (() => { try { return readFileSync(stub.calls, "utf8"); } catch { return ""; } })();
+    return { code: r.status, out: (r.stdout || "") + (r.stderr || ""), callLog };
+  };
+
+  // (i) Happy path: registers, deploys, and STOPS the machine it started.
+  {
+    const stub = makeStub({ logsMode: "registered", deployRc: 0 });
+    const r = runScript(stub);
+    ok(r.code === 0, `on-demand happy path must succeed, got ${r.code}:\n${r.out}`);
+    ok(/machine start m1/.test(r.callLog), "on-demand must START a pool machine");
+    ok(/deploy --remote-only --config fly\.phone\.toml/.test(r.callLog), "on-demand must deploy the config");
+    ok(/machine stop m1/.test(r.callLog), "on-demand must STOP the machine it started (cleanup)");
+    rmSync(stub.dir, { recursive: true, force: true });
+  }
+  // (ii) Deploy fails ⇒ non-zero exit, but the started machine is STILL stopped
+  //      (the trap cleans up on failure — never leaves a started machine).
+  {
+    const stub = makeStub({ logsMode: "registered", deployRc: 7 });
+    const r = runScript(stub);
+    ok(r.code !== 0, `on-demand must FAIL when deploy fails, got ${r.code}:\n${r.out}`);
+    ok(/machine start m1/.test(r.callLog) && /machine stop m1/.test(r.callLog),
+      "on a failed deploy the started machine must STILL be stopped (fail-safe cleanup)");
+    rmSync(stub.dir, { recursive: true, force: true });
+  }
+  // (iii) Worker never registers ⇒ FAIL CLOSED, and still cleans up. This is the
+  //       registration safety: ON does not mean "skip the proof".
+  {
+    const stub = makeStub({ logsMode: "silent", deployRc: 0 });
+    const r = runScript(stub);
+    ok(r.code !== 0, `on-demand must FAIL CLOSED when the worker never registers, got ${r.code}:\n${r.out}`);
+    ok(/machine stop m1/.test(r.callLog),
+      "even on a registration failure the started machine must be stopped");
+    rmSync(stub.dir, { recursive: true, force: true });
+  }
+  // (iv) Empty watermark ⇒ refuse before doing anything (no machine started).
+  {
+    const stub = makeStub({ logsMode: "registered", deployRc: 0 });
+    const r = runScript(stub, { WATERMARK: "" });
+    ok(r.code !== 0, "on-demand must refuse an empty watermark");
+    ok(/empty pre-release watermark/.test(r.out), "must name the empty-watermark refusal");
+    ok(!/machine start/.test(r.callLog), "an empty watermark must refuse BEFORE starting any machine");
+    rmSync(stub.dir, { recursive: true, force: true });
+  }
+}
+
 if (failures.length) {
   console.error(`deploy-fly workflow contract FAILED (${failures.length}):`);
   for (const f of failures) console.error(" - " + f);
   process.exit(1);
 }
-console.log("deploy-fly workflow contract valid (three-app matrix, token isolation, policy-aware ALWAYS_ON verification on both voice apps).");
+console.log("deploy-fly workflow contract valid (three-app matrix, token isolation, policy-aware ALWAYS_ON verification on both voice apps; on-demand orchestration reconciliation start->verify->deploy->stop with fail-safe cleanup; OFF path byte-identical).");

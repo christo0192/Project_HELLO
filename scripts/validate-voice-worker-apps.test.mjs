@@ -316,9 +316,98 @@ for (const [label, phone, apiEnv, apiFly] of AGREE_NEG) {
   rmSync(voice, { recursive: true, force: true }); rmSync(api, { recursive: true, force: true });
 }
 
+// ── Orchestration posture (deliverable 2) ───────────────────────────────
+// The invariant: an app declaring on-demand orchestration (WORKER_ORCHESTRATION
+// = "worker") must be able to scale to zero (no always-on pin), and an always-on
+// worker (OFF) must not be pinned to zero — the deploy gate's always-on proof
+// depends on it staying up. Driven both as UNIT tests on the exported function
+// (so each direction is isolated) and as end-to-end fixture rejections through
+// the real validator subprocess (so the wiring is proven, not just the logic).
+{
+  const policy = await import(pathToFileURL(validator).href).catch(() => null);
+  // validate-voice-worker-apps.mjs runs top-level code on import (it validates
+  // the REAL configs), so import it only for its export by giving it a dir arg
+  // is not possible; instead re-import the module and read the named export.
+  // The module exports checkOrchestrationPosture without side effects that fail
+  // on the real configs (they are valid), so this is safe.
+  ok(policy && typeof policy.checkOrchestrationPosture === "function",
+    "validate-voice-worker-apps.mjs must export checkOrchestrationPosture");
+  if (policy && policy.checkOrchestrationPosture) {
+    const P = policy.checkOrchestrationPosture;
+    // ON + always-on pin ⇒ misconfig (min-1 defeats scale-to-zero).
+    ok(P("fly.phone.toml", '[env]\n  WORKER_ORCHESTRATION = "worker"\n[[vm]]\n  min_machines_running = 1\n', true)
+        .some((p) => /must scale to zero|min_machines_running/.test(p)),
+      "ON + min_machines_running=1 must be rejected");
+    // ON + auto_stop disabled ⇒ misconfig.
+    ok(P("fly.phone.toml", '  WORKER_ORCHESTRATION = "worker"\n  auto_stop_machines = false\n', true)
+        .some((p) => /auto_stop/.test(p)),
+      "ON + auto_stop_machines=false must be rejected");
+    // ON + can-reach-zero (no pin / explicit stop) ⇒ clean.
+    ok(P("fly.phone.toml", '  WORKER_ORCHESTRATION = "worker"\n', true).length === 0,
+      "ON with no always-on pin must PASS");
+    ok(P("fly.phone.toml", '  WORKER_ORCHESTRATION = "worker"\n  min_machines_running = 0\n  auto_stop_machines = "stop"\n', true).length === 0,
+      "ON pinned to zero / auto-stop must PASS");
+    // OFF + scale-to-zero pin ⇒ misconfig (nothing starts it for the proof).
+    ok(P("fly.toml", '  min_machines_running = 0\n', false)
+        .some((p) => /always-on|min_machines_running = 0/.test(p)),
+      "OFF + min_machines_running=0 must be rejected");
+    ok(P("fly.toml", '  auto_stop_machines = true\n', false)
+        .some((p) => /auto_stop|always-on/.test(p)),
+      "OFF + auto_stop_machines=true must be rejected");
+    // OFF + always-on (absent keys = Fly always-on default, or explicit min-1)
+    // ⇒ clean. Silence must be a pass, or every current worker would fail.
+    ok(P("fly.toml", '  COMPANY_NAME = "IK"\n', false).length === 0,
+      "OFF with no scale-to-zero keys (always-on default) must PASS");
+    ok(P("fly.toml", '  min_machines_running = 1\n', false).length === 0,
+      "OFF + min_machines_running=1 (explicit always-on) must PASS");
+  }
+}
+// End-to-end: a synthetic ON config pinned always-on must be REJECTED by the
+// real validator subprocess (proves the check is wired, not only exported).
+{
+  const ON_PINNED_PHONE = GOOD_PHONE.replace("[[vm]]\n", '[[vm]]\n  min_machines_running = 1\n')
+    .replace('PHONE_AGENT_NAME = "phone-screener"', 'PHONE_AGENT_NAME = "phone-screener"\n  WORKER_ORCHESTRATION = "worker"');
+  const dir = fixture(GOOD_BROWSER, ON_PINNED_PHONE);
+  const r = run(dir);
+  ok(r.code !== 0, `an orchestration-ON config pinned always-on (min-1) must FAIL the validator: ${r.out}`);
+  ok(/must scale to zero|min_machines_running/.test(r.out),
+    `the posture failure must name the scale-to-zero conflict, got:\n${r.out}`);
+  rmSync(dir, { recursive: true, force: true });
+}
+// End-to-end: an orchestration-ON config that CAN scale to zero passes.
+{
+  const ON_OK_PHONE = GOOD_PHONE.replace('PHONE_AGENT_NAME = "phone-screener"', 'PHONE_AGENT_NAME = "phone-screener"\n  WORKER_ORCHESTRATION = "worker"');
+  const dir = fixture(GOOD_BROWSER, ON_OK_PHONE);
+  const r = run(dir);
+  ok(r.code === 0, `an orchestration-ON config with no always-on pin must PASS: ${r.out}`);
+  ok(/orchestration_state=browser:off,phone:worker/.test(r.out),
+    `the validator must SURFACE the per-app orchestration state, got:\n${r.out}`);
+  rmSync(dir, { recursive: true, force: true });
+}
+// End-to-end: an OFF worker pinned to zero must be REJECTED (its always-on proof
+// would fail closed with nothing to keep it up).
+{
+  const OFF_ZEROED_BROWSER = GOOD_BROWSER.replace("[[vm]]\n", '[[vm]]\n  min_machines_running = 0\n');
+  const dir = fixture(OFF_ZEROED_BROWSER, GOOD_PHONE);
+  const r = run(dir);
+  ok(r.code !== 0, `an OFF worker pinned to zero must FAIL the validator: ${r.out}`);
+  ok(/always-on|min_machines_running = 0/.test(r.out),
+    `the OFF-zeroed failure must name the always-on-proof hazard, got:\n${r.out}`);
+  rmSync(dir, { recursive: true, force: true });
+}
+// The SHIPPED configs must be posture-consistent AND currently OFF (the branch
+// this task lands on keeps orchestration off until the owner activates).
+{
+  const r = spawnSync(process.execPath, [validator], { encoding: "utf8" });
+  const out = (r.stdout || "") + (r.stderr || "");
+  ok(r.status === 0, `shipped configs must pass the posture check: ${out}`);
+  ok(/orchestration_state=browser:off,phone:off/.test(out),
+    `the shipped configs must SURFACE both voice apps as orchestration OFF, got:\n${out}`);
+}
+
 if (failures.length) {
   console.error(`validate-voice-worker-apps.test FAILED (${failures.length}):`);
   for (const f of failures) console.error(" - " + f);
   process.exit(1);
 }
-console.log(`validate-voice-worker-apps.test OK (real configs + ${NEG.length} negative + region/mutation + agreement controls).`);
+console.log(`validate-voice-worker-apps.test OK (real configs + ${NEG.length} negative + region/mutation + agreement + orchestration-posture controls).`);

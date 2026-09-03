@@ -313,41 +313,31 @@ export async function dialPhoneAttempt(
   // unreachable branch reads as a safety net and is not one — the same reason
   // 0042 declines to write a "charged but no state change" branch. So the rule
   // lives in exactly one place, where it is reachable and tested.
-  // ── Gate 4: a room to originate into ────────────────────────────────
-  // The room is created BEFORE the dial and starts NO egress. A reconnect
-  // adopts the existing room, keeping one session and one transcript.
-  const room = await provisionPhoneRoom(
-    { sessionId: request.sessionId, attemptId, epoch, agentName: dialConfig.agentName },
-    deps.room,
-  );
-  if (room.status === 'not_configured' || room.status === 'provider_failed') {
-    return {
-      status: 'refused',
-      refusal: 'room_unavailable',
-      detail: room.reason,
-      attemptId,
-      providerContacted: false,
-    };
-  }
-
   // ── Gate 4-bis: a READY on-demand worker (only when the gate is armed) ─
-  // phone-cost-and-scale-plan §2.3: with on-demand orchestration on, the phone
-  // worker pool is scaled to zero, so before a carrier is reached we must have
-  // a machine STARTED, REGISTERED and confirmed READY for THIS session. The
-  // dispatch above told a warm/starting worker which room to take; the worker
-  // posts `/internal/voice-worker/ready` once it has resolved that room, and
-  // `ensureReadyWorker` returns 'ready' only after it has READ that state.
+  // phone-cost-and-scale-plan §2.3 + design §2.3 PR-B "dispatch ordering vs
+  // cold start". With on-demand orchestration on, the phone worker pool is
+  // scaled to zero, so before we DISPATCH into a room — and long before a
+  // carrier is reached — we must have a machine STARTED, REGISTERED and
+  // confirmed READY. This gate runs READY-BEFORE-DISPATCH, mirroring the
+  // browser path (invites.ts Step 2c): the phone worker posts a session-LESS
+  // MACHINE-level ready at prewarm (on LiveKit registration, BEFORE any job),
+  // and `ensureReadyWorker` (claim → start → wait for the lease to read
+  // `ready`) returns 'ready' only after it has READ that state. Only THEN does
+  // `provisionPhoneRoom` create the room and dispatch to the now-registered
+  // worker, so the dispatch can never be lost to a machine that was still cold.
   //
-  // Any non-`ready` verdict DEFERS the dial — no originate, no fabricated
-  // dialed state. The candidate is never dialled into a room with no worker.
-  // The claim `ensureReadyWorker` made for the failing verdicts already cleans
-  // itself up inside the service (invariant I2), so there is nothing to release
-  // on `no_capacity`/`timeout`/`error`. On a `ready` verdict the machine id is
-  // carried out so a terminal handler can release it (reaper backstops).
+  // Any non-`ready` verdict DEFERS the dial — NO room, NO dispatch, NO
+  // originate, no fabricated dialed state. The candidate is never dialled into
+  // a room with no worker. The claim `ensureReadyWorker` made for the failing
+  // verdicts already cleans itself up inside the service (invariant I2), so
+  // there is nothing to release on `no_capacity`/`timeout`/`error`. On a
+  // `ready` verdict the machine id is carried out so a terminal handler can
+  // release it (reaper backstops).
   //
   // ABSENT gate ⇒ this whole block is skipped and the path is byte-identical
-  // to today. `disabled` (the service's own flag-off answer) is treated exactly
-  // like an absent gate: proceed to dial as before.
+  // to today (room-then-originate, no claim, no Fly call). `disabled` (the
+  // service's own flag-off answer) is treated exactly like an absent gate:
+  // proceed exactly as before.
   let gatedMachineId: string | undefined;
   if (deps.workerGate !== undefined) {
     const gate = await deps.workerGate.ensureReadyWorker({
@@ -359,15 +349,15 @@ export async function dialPhoneAttempt(
     if (gate.status === 'ready') {
       gatedMachineId = gate.machineId;
     } else if (gate.status !== 'disabled') {
-      // no_capacity | timeout | error — defer, and touch no carrier. The
-      // service already released/stopped any machine it claimed for this
-      // attempt, so we do not release here.
+      // no_capacity | timeout | error — defer, and touch no carrier. No room
+      // was provisioned (we gate BEFORE the dispatch), so there is no room name
+      // to report and no dispatch to undo. The service already released/stopped
+      // any machine it claimed for this attempt, so we do not release here.
       return {
         status: 'refused',
         refusal: 'worker_not_ready',
         detail: gate.status,
         attemptId,
-        roomName: room.roomName,
         providerContacted: false,
       };
     }
@@ -376,10 +366,13 @@ export async function dialPhoneAttempt(
   }
 
   // Best-effort release of the worker we gated onto, for the refusal paths
-  // BELOW this point (lease-too-short, originate-failed). A claim we made and
-  // then declined to use must not sit `busy`/`ready`; the reaper would stop it
-  // within one grace window, but releasing promptly returns the pool slot now.
-  // Fail-open: a release failure never changes the refusal we return.
+  // BELOW this point (room-unavailable, lease-too-short, originate-failed). A
+  // claim we made and then declined to use must not sit `busy`/`ready`; the
+  // reaper would stop it within one grace window, but releasing promptly
+  // returns the pool slot now. Declared BEFORE the room provisioning because
+  // the gate now runs first, so a room failure is the earliest point that can
+  // strand a claim. Fail-open: a release failure never changes the refusal we
+  // return. A no-op when no machine was gated (gate off / `disabled`).
   const releaseGatedWorker = async (): Promise<void> => {
     if (gatedMachineId === undefined || deps.workerGate === undefined) return;
     try {
@@ -392,6 +385,31 @@ export async function dialPhoneAttempt(
       /* fail-open: the reaper backstops */
     }
   };
+
+  // ── Gate 4: a room to originate into ────────────────────────────────
+  // The room is created BEFORE the dial and starts NO egress. A reconnect
+  // adopts the existing room, keeping one session and one transcript. Created
+  // AFTER the worker-ready gate above (when armed) so the explicit dispatch
+  // lands on a worker already registered with LiveKit — never on a machine that
+  // is still cold. When the gate is absent (the default), this is exactly the
+  // first thing that happens after admission, byte-identical to today.
+  const room = await provisionPhoneRoom(
+    { sessionId: request.sessionId, attemptId, epoch, agentName: dialConfig.agentName },
+    deps.room,
+  );
+  if (room.status === 'not_configured' || room.status === 'provider_failed') {
+    // A room failure after we already claimed a worker (gate armed + ready)
+    // must release that claim — it will otherwise sit `ready`/`busy` until the
+    // reaper. Fail-open, as every release on this path is.
+    await releaseGatedWorker();
+    return {
+      status: 'refused',
+      refusal: 'room_unavailable',
+      detail: room.reason,
+      attemptId,
+      providerContacted: false,
+    };
+  }
 
   // ── Gate 5: the lease must outlive the originate ────────────────────
   const required = dialConfig.originateTimeoutSeconds + LEASE_MARGIN_SECONDS;

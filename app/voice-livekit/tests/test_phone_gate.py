@@ -645,7 +645,10 @@ class TestBrowserWorkerNaming(unittest.TestCase):
 
     def test_phone_worker_wins_over_browser_name(self):
         # On the phone app PHONE_AGENT_NAME is set; the browser naming path must
-        # never engage, so the phone worker is UNTOUCHED.
+        # never engage, so the worker takes the PHONE name (not the browser one).
+        # Under orchestration the phone worker DOES prewarm (machine-level
+        # ready-before-dispatch, design §2.3 PR-B retrofit) — but via the phone
+        # predicate, never the browser one; the name stays the phone name.
         opts = self._build({
             "PHONE_AGENT_NAME": "phone-screener",
             "WORKER_ORCHESTRATION": "worker",
@@ -657,8 +660,10 @@ class TestBrowserWorkerNaming(unittest.TestCase):
             "PHONE_JUDGE_RETRIES": "0",
         })
         self.assertEqual(opts["agent_name"], "phone-screener")
-        # phone worker does NOT get the browser prewarm.
-        self.assertNotIn("prewarm_fnc", opts)
+        # The phone worker prewarms (orchestration is on), posting MACHINE-level
+        # readiness via the SAME shared hook the browser worker uses.
+        self.assertIs(opts["prewarm_fnc"], agent_mod._prewarm_post_machine_ready)
+        self.assertEqual(opts["num_idle_processes"], 1)
 
     def test_prewarm_posts_machine_ready_only_when_named(self):
         # The prewarm is a no-op unless the browser worker is named + on.
@@ -685,6 +690,116 @@ class TestBrowserWorkerNaming(unittest.TestCase):
             ):
                 # Must not raise.
                 agent_mod._prewarm_post_machine_ready(None)
+
+
+class TestPhoneWorkerOrchestration(unittest.TestCase):
+    """design §2.3, PR B RISK "dispatch ordering vs cold start". The named
+    phone worker under orchestration mirrors the browser worker: it posts
+    MACHINE-level readiness at PREWARM (session-less, ready-before-dispatch),
+    and the OLD session-keyed `/ready` (after ctx.connect) is superseded. OFF
+    (the default) is byte-identical to today: no prewarm, and the session-keyed
+    ping — itself already flag-gated off — still never fires."""
+
+    def _build(self, env):
+        with patch.object(agent_mod, "WorkerOptions", _OptionsRecorder):
+            with patch.dict(agent_mod.os.environ, {}, clear=False):
+                for k in ("PHONE_AGENT_NAME", "BROWSER_AGENT_NAME",
+                          "WORKER_ORCHESTRATION", "PHONE_JUDGE_API_KEY",
+                          "PHONE_JUDGE_URL", "PHONE_JUDGE_MODEL",
+                          "PHONE_COVERAGE_TIMEOUT_SEC", "PHONE_JUDGE_RETRIES"):
+                    agent_mod.os.environ.pop(k, None)
+                for k, v in env.items():
+                    agent_mod.os.environ[k] = v
+                try:
+                    agent_mod.build_worker_options()
+                finally:
+                    for k in list(env):
+                        agent_mod.os.environ.pop(k, None)
+        return dict(_OptionsRecorder.last)
+
+    _JUDGE_ENV = {
+        "PHONE_JUDGE_API_KEY": "judge-test-key",
+        "PHONE_JUDGE_URL": phone.PHONE_JUDGE_GOOGLE_URL,
+        "PHONE_JUDGE_MODEL": phone.PHONE_JUDGE_GEMINI_MODEL,
+        "PHONE_COVERAGE_TIMEOUT_SEC": "2",
+        "PHONE_JUDGE_RETRIES": "0",
+    }
+
+    def test_predicate_true_only_when_named_and_flag_on(self):
+        cases = [
+            ({}, False),  # unnamed, off
+            ({"PHONE_AGENT_NAME": "phone-screener"}, False),  # named, flag off
+            ({"WORKER_ORCHESTRATION": "worker"}, False),  # flag on, unnamed
+            ({"PHONE_AGENT_NAME": "phone-screener",
+              "WORKER_ORCHESTRATION": "worker"}, True),  # both ⇒ orchestrated
+            ({"PHONE_AGENT_NAME": "phone-screener",
+              "WORKER_ORCHESTRATION": "true"}, False),  # only exact "worker"
+        ]
+        for env, expected in cases:
+            with self.subTest(env=env):
+                for k in ("PHONE_AGENT_NAME", "WORKER_ORCHESTRATION"):
+                    agent_mod.os.environ.pop(k, None)
+                for k, v in env.items():
+                    agent_mod.os.environ[k] = v
+                try:
+                    self.assertEqual(agent_mod._phone_worker_orchestrated(), expected)
+                finally:
+                    for k in ("PHONE_AGENT_NAME", "WORKER_ORCHESTRATION"):
+                        agent_mod.os.environ.pop(k, None)
+
+    def test_off_named_phone_worker_has_no_prewarm(self):
+        # Named phone worker, orchestration OFF ⇒ byte-identical to today: the
+        # phone worker is named and keeps one idle process, but NO prewarm hook.
+        opts = self._build({"PHONE_AGENT_NAME": "phone-screener", **self._JUDGE_ENV})
+        self.assertEqual(opts["agent_name"], "phone-screener")
+        self.assertNotIn("prewarm_fnc", opts)
+        self.assertEqual(opts["num_idle_processes"], 1)
+
+    def test_on_named_phone_worker_prewarms_machine_ready(self):
+        # Named phone worker + orchestration ON ⇒ the shared machine-level
+        # prewarm is wired (ready-before-dispatch), name unchanged, one idle.
+        opts = self._build({
+            "PHONE_AGENT_NAME": "phone-screener",
+            "WORKER_ORCHESTRATION": "worker",
+            **self._JUDGE_ENV,
+        })
+        self.assertEqual(opts["agent_name"], "phone-screener")
+        self.assertIs(opts["prewarm_fnc"], agent_mod._prewarm_post_machine_ready)
+        self.assertEqual(opts["num_idle_processes"], 1)
+
+    def test_shared_prewarm_fires_for_orchestrated_phone_worker(self):
+        # The shared prewarm posts machine readiness when EITHER predicate holds.
+        with patch.object(
+            agent_mod.worker_ready_api, "post_worker_ready_machine",
+            new=AsyncMock(return_value=True),
+        ) as post:
+            # Phone worker orchestrated (browser predicate false) ⇒ posts once.
+            with patch.object(agent_mod, "_browser_worker_named", return_value=False):
+                with patch.object(agent_mod, "_phone_worker_orchestrated", return_value=True):
+                    agent_mod._prewarm_post_machine_ready(None)
+            post.assert_called_once()
+            # Neither predicate ⇒ no post.
+            post.reset_mock()
+            with patch.object(agent_mod, "_browser_worker_named", return_value=False):
+                with patch.object(agent_mod, "_phone_worker_orchestrated", return_value=False):
+                    agent_mod._prewarm_post_machine_ready(None)
+            post.assert_not_called()
+
+    def test_legacy_session_keyed_ready_is_superseded_by_machine_prewarm(self):
+        # The OLD session-keyed `/ready` (posted after ctx.connect) must be
+        # inert whenever the machine-level prewarm is the active mechanism. The
+        # source-level guard proves the retirement without driving a full call:
+        # the post is reached ONLY when orchestration is on AND this is NOT the
+        # orchestrated phone worker.
+        source = inspect.getsource(agent_mod._run_phone_session)
+        # The session-keyed post survives only behind BOTH conditions.
+        self.assertIn("worker_orchestration_enabled()", source)
+        self.assertIn("not _phone_worker_orchestrated()", source)
+        # And the machine-level readiness is what supersedes it (wired in
+        # build_worker_options via the shared prewarm).
+        opts_src = inspect.getsource(agent_mod.build_worker_options)
+        self.assertIn("_phone_worker_orchestrated()", opts_src)
+        self.assertIn("prewarm_fnc", opts_src)
 
 
 class TestWorkerRoomOwnership(unittest.TestCase):
