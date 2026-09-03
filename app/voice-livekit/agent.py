@@ -3801,16 +3801,25 @@ async def _run_phone_session(
         if participant is None:
             return None
         participant_present_anchor[0] = int(round(time.time() * 1000))
-        # ── PR A SEAM 1: WIRE THE IN-WORKER RECORDER BEFORE THE SESSION STARTS ──
-        # RecorderIO's input/output taps must be installed before
-        # `session.start`. This ONLY wires the taps — no frame is captured until
-        # `begin()` at the consent seam, so wiring here records nothing on a call
-        # that never consents. Provider-gated (worker only) and excluded on
-        # canary / preflight rooms, which have their own session lifecycles and
-        # must never be recorded. The `record=` kwarg below is left UNCHANGED —
-        # the Agents-session recorder stays off; the in-worker recorder is a
-        # separate mechanism. Fail-open: any exception here is swallowed so the
-        # call proceeds with no recording rather than crashing.
+        await session.start(agent=agent, room=ctx.room, record=dict(_PHONE_NO_RECORDING))
+        # ── PR A SEAM 1: WIRE THE IN-WORKER RECORDER AFTER THE SESSION STARTS ──
+        # RecorderIO's taps must wrap the LIVE room audio I/O, and RoomIO only
+        # attaches that to `session.input.audio` / `session.output.audio` DURING
+        # `session.start()`. Wiring BEFORE start wrapped `None` for both streams,
+        # so the input tap's `__anext__` raised `NoneType` and the output tap fed
+        # a null sink — a totally silent call in both directions. Reassigning the
+        # streams after start is a first-class operation (the AgentInput/
+        # AgentOutput `.audio` setters fire on_attached/on_detached +
+        # `_audio_changed`), so the running session re-wires through the taps.
+        # This ONLY installs the taps — no frame is captured until `begin()` at
+        # the consent seam, so wiring here records nothing on a call that never
+        # consents. Provider-gated (worker only) and excluded on canary /
+        # preflight rooms, which have their own session lifecycles and must never
+        # be recorded. The `record=` kwarg above is left UNCHANGED — the
+        # Agents-session recorder stays off; the in-worker recorder is a separate
+        # mechanism. Fail-open: any failure here (including the room having no
+        # audio I/O to wrap) leaves the call running with no recording rather
+        # than crashing.
         try:
             if recording.recording_provider() == "worker":
                 room_meta = _room_metadata_from_context(ctx)
@@ -3823,7 +3832,6 @@ async def _run_phone_session(
                 "unknown_event", error_type="phone_recording_wire",
                 error_category="wire_failed",
             )
-        await session.start(agent=agent, room=ctx.room, record=dict(_PHONE_NO_RECORDING))
         return participant
 
     # The raw consent utterance the classifier consumed, threaded out so the
