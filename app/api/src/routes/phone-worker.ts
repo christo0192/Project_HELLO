@@ -693,6 +693,60 @@ export function egressRecordingEnabled(
   return egressConfigured && provider !== 'worker';
 }
 
+/**
+ * The narrow Supabase Storage slice `createSupabaseUploadSigner` needs — just the
+ * signed-upload-URL mint. Kept minimal so a test can supply a fake without a
+ * whole Supabase client.
+ */
+export interface SignedUploadUrlStorage {
+  createSignedUploadUrl(
+    path: string,
+    options?: { upsert?: boolean },
+  ): Promise<{ data: { signedUrl: string } | null; error: unknown }>;
+}
+
+/**
+ * v115 (2026-09-04) — mint the worker's presigned PUT with `upsert:true`.
+ *
+ * A Supabase signed upload URL is a JWT bound to the object PATH; it does NOT
+ * sign the Content-Type (that is a free header on the PUT), so the worker's
+ * raw-OGG transcode-failure fallback uploading `audio/ogg` bytes to the same
+ * `.mp3` key is NOT the problem. The problem is that WITHOUT `upsert`, the
+ * signed create is INSERT-ONLY: any second write to the key — a worker retry of
+ * finish(), or the OGG fallback re-PUTing after the MP3 leg touched the object —
+ * is rejected 409 Duplicate, which the worker's uploader surfaces as
+ * `upload_failed_status_409` → `in_worker_recording_finish_failed`, and NOTHING
+ * lands (live v115: the fallback fired but its upload also failed).
+ *
+ * `{ upsert: true }` makes the PUT idempotent so the fallback and any retry
+ * OVERWRITE rather than collide. The finalizer is unaffected: it still
+ * re-downloads, re-hashes and sniffs the object's real container bytes
+ * (`sniffRecordingContentType`), so an overwritten OGG finalizes as `audio/ogg`
+ * exactly as intended, and the insert-only manifest write keeps its own
+ * idempotency (verify by exact bytes). The object key and every downstream
+ * contract are unchanged — only the write mode on the presigned URL is.
+ *
+ * Returns `null` on any error so `prepareWorkerRecording` refuses cleanly rather
+ * than throwing a driver error at the worker.
+ */
+export function createSupabaseUploadSigner(
+  storage: SignedUploadUrlStorage,
+): WorkerRecordingUploadSigner {
+  return {
+    async createUploadUrl(objectKey: string): Promise<{ uploadUrl: string } | null> {
+      try {
+        const { data, error } = await storage.createSignedUploadUrl(objectKey, {
+          upsert: true,
+        });
+        if (error || !data?.signedUrl) return null;
+        return { uploadUrl: data.signedUrl };
+      } catch {
+        return null;
+      }
+    },
+  };
+}
+
 export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Router {
   const router = Router();
   const now = deps.now ?? ((): Date => new Date());
@@ -1949,18 +2003,6 @@ export const phoneWorkerRouter = createPhoneWorkerRouter({
   // `recording_unavailable`. On the default egress provider the two
   // `/recording/*` routes 404 regardless, so this is inert.
   uploadSigner: env.recordingProvider === 'worker' && phoneEgressConfigured()
-    ? {
-        async createUploadUrl(objectKey: string): Promise<{ uploadUrl: string } | null> {
-          try {
-            const { data, error } = await supabase.storage
-              .from(env.recordingsBucket)
-              .createSignedUploadUrl(objectKey);
-            if (error || !data?.signedUrl) return null;
-            return { uploadUrl: data.signedUrl };
-          } catch {
-            return null;
-          }
-        },
-      }
+    ? createSupabaseUploadSigner(supabase.storage.from(env.recordingsBucket))
     : undefined,
 });

@@ -4280,21 +4280,65 @@ def phone_judge_breaker_cooldown_sec() -> float:
 def phone_judge_max_tokens() -> int:
     """Completion-token budget for ONE coverage-judge inference.
 
-    CRITICAL: a REASONING judge model (e.g. DeepSeek V4 Flash) spends its
-    reasoning tokens BEFORE emitting ``message.content``, so a low budget
-    returns an EMPTY content string and the parser fails toward
+    CRITICAL: a REASONING judge model (e.g. sarvam-105b, DeepSeek V4 Flash)
+    spends its reasoning tokens BEFORE emitting ``message.content``, so a low
+    budget returns an EMPTY content string and the parser fails toward
     ``judge_error``. Empirically max_tokens=200 => empty content while
-    max_tokens=800 => the correct JSON verdict, so the default is 800 (well
-    above the ~180 the non-reasoning Gemini path needed). Clamped to
-    [64, 2000]. Read at the CALL SITE with the literal name for the scanner.
+    max_tokens=800 => the correct JSON verdict on the prior judge. Sarvam swap:
+    sarvam-105b bills its ``reasoning_content`` as completion tokens on top of
+    the verdict JSON, so the default is bumped to 1200 to keep the FINAL answer
+    non-empty after reasoning at the default "low" effort. Clamped to
+    [64, 4000]. Read at the CALL SITE with the literal name for the scanner.
     """
-    return _bounded_int_env(os.getenv("PHONE_JUDGE_MAX_TOKENS"), 800, 64, 2000)
+    return _bounded_int_env(os.getenv("PHONE_JUDGE_MAX_TOKENS"), 1200, 64, 4000)
+
+
+def phone_judge_reasoning_effort() -> str | None:
+    """Reasoning budget for a REASONING judge model (Sarvam swap).
+
+    sarvam-105b (the reasoning judge) has reasoning ON by default at "low";
+    the reasoning tokens bill as completion tokens and stream as
+    ``reasoning_content``. A background judge wants a small, deterministic
+    verdict, so the default is "low". An operator can raise it
+    ("medium"/"high") or DISABLE reasoning entirely — an empty value, "none",
+    or "off" all map to ``None`` (send ``reasoning_effort=null``). Read at the
+    call site with the literal env name so the env-contract scanner sees it.
+    """
+    raw = os.getenv("PHONE_JUDGE_REASONING_EFFORT")
+    if raw is None:
+        # Unset => the tuned default for a reasoning judge.
+        return "low"
+    value = raw.strip()
+    if not value or value.lower() in ("none", "off"):
+        # Explicit empty / none / off => DISABLE (send reasoning_effort=null).
+        return None
+    return value
 
 
 PHONE_JUDGE_GOOGLE_URL = (
     "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 )
 PHONE_JUDGE_GEMINI_MODEL = "gemini-3.5-flash-lite"
+
+
+def _phone_judge_is_sarvam(url: str) -> bool:
+    """True when the judge endpoint host is Sarvam.
+
+    The Google/Gemini judge (the rollback default) rejects an unknown
+    ``reasoning_effort`` value, so the reader-driven effort is applied ONLY for
+    a Sarvam endpoint; the Google path keeps its tested ``minimal`` body. Host
+    match is on the authority component (between ``//`` and the first ``/``), and
+    is an EXACT / suffix match on the registered domain — a substring test
+    (BUG 5) would false-positive on a look-alike like ``api.sarvamproxy.io`` or
+    ``sarvam-cache.corp.internal`` and leak the field to an untrusted endpoint.
+    Any port and userinfo are stripped before matching.
+    """
+    text = str(url or "").lower()
+    after_scheme = text.split("://", 1)[-1]
+    authority = after_scheme.split("/", 1)[0]
+    # Drop userinfo (user:pass@host) and any :port suffix.
+    host = authority.rsplit("@", 1)[-1].split(":", 1)[0]
+    return host == "sarvam.ai" or host == "api.sarvam.ai" or host.endswith(".sarvam.ai")
 
 
 def phone_judge_url() -> str:
@@ -4314,6 +4358,32 @@ def phone_judge_url() -> str:
 def phone_primary_model() -> str:
     """Phone-only interviewer model; browser keeps the global GEMINI_MODEL."""
     return (os.getenv("PHONE_PRIMARY_MODEL") or "gemini-3.5-flash-lite").strip()
+
+
+def phone_llm_base_url() -> str:
+    """Phone-only speaking-LLM base URL (OpenAI-compatible chat endpoint).
+
+    Sarvam swap: the phone interviewer now speaks through Sarvam's
+    OpenAI-compatible chat API (``https://api.sarvam.ai/v1``) instead of
+    Google's endpoint, which the v115 evidence flagged for phone-vs-WebRTC
+    dead-air / prosody drift. The browser/WebRTC lane is untouched — it keeps
+    reading ``GEMINI_BASE_URL`` in agent.py. ROLLBACK: point
+    ``PHONE_LLM_BASE_URL`` back at the Gemini URL (and
+    ``PHONE_PRIMARY_MODEL`` at a gemini model) to fully revert to Gemini.
+    """
+    return (os.getenv("PHONE_LLM_BASE_URL") or "https://api.sarvam.ai/v1").strip()
+
+
+def phone_llm_api_key() -> str:
+    """Phone-only speaking-LLM credential.
+
+    Prefers the dedicated ``PHONE_LLM_API_KEY`` and otherwise falls back to the
+    shared ``SARVAM_API_KEY`` already used by the phone STT/TTS, so the operator
+    can point the speaker at Sarvam without minting a second secret. Never
+    inherits the browser ``GEMINI_API_KEY`` — that key stays exclusive to the
+    sha-pinned WebRTC lane.
+    """
+    return (os.getenv("PHONE_LLM_API_KEY") or os.getenv("SARVAM_API_KEY") or "").strip()
 
 
 def phone_judge_model() -> str:
@@ -5181,6 +5251,7 @@ async def _default_phone_coverage_inference(prompt: str) -> Any:
         },
         {"role": "user", "content": prompt},
     ]
+    url = phone_judge_url()
     # Start from our explicit body, let the operator's extra-body overlay any
     # provider-specific knobs (e.g. reasoning controls), then FORCE model and
     # messages back to our values so a stray key can never hijack the call.
@@ -5188,7 +5259,10 @@ async def _default_phone_coverage_inference(prompt: str) -> Any:
         "model": model,
         "temperature": 0,
         # A reasoning judge spends tokens BEFORE emitting content; this budget
-        # must stay high enough (default 800) that content is non-empty.
+        # must stay high enough (default 1200) that the FINAL answer content is
+        # non-empty even after the model spends completion tokens on
+        # reasoning_content (Sarvam swap: sarvam-105b bills reasoning as
+        # completion tokens).
         "max_tokens": phone_judge_max_tokens(),
         "response_format": {"type": "json_object"},
         # Gemini 3-family reasoning cannot be disabled; minimal is the tested
@@ -5197,22 +5271,57 @@ async def _default_phone_coverage_inference(prompt: str) -> Any:
         "messages": messages,
     }
     json_body.update(phone_judge_extra_body())
+    # Sarvam swap: on a Sarvam judge endpoint, drive reasoning_effort from the
+    # dedicated reader (default "low", None to DISABLE) rather than the
+    # Gemini-only "minimal". Applied AFTER the extra-body overlay so it is the
+    # authoritative Sarvam knob, and ONLY for a Sarvam host — the Google/Gemini
+    # rollback default keeps its tested "minimal" body untouched. A None value
+    # sends reasoning_effort=null (disable). The robustness retry below still
+    # protects any endpoint that rejects the field with a 400.
+    force_effort = _phone_judge_is_sarvam(url)
+    if force_effort:
+        json_body["reasoning_effort"] = phone_judge_reasoning_effort()
     json_body["model"] = model
     json_body["messages"] = messages
-    response = await call_with_breaker(
-        "POST",
-        phone_judge_url(),
-        breaker=_PHONE_COVERAGE_BREAKER,
-        transport=_phone_coverage_transport(),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "Cache-Control": "no-store",
-        },
-        json_body=json_body,
-        endpoint_hint="unknown",
-        log_failures=False,
-    )
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "Cache-Control": "no-store",
+    }
+    try:
+        response = await call_with_breaker(
+            "POST",
+            url,
+            breaker=_PHONE_COVERAGE_BREAKER,
+            transport=_phone_coverage_transport(),
+            headers=headers,
+            json_body=json_body,
+            endpoint_hint="unknown",
+            log_failures=False,
+        )
+    except BusinessError:
+        # A 4xx (typically a 400 "unknown/unsupported param") is most often the
+        # judge endpoint rejecting reasoning_effort. Retry ONCE with the field
+        # stripped so a Google judge (rollback default) that dislikes the value
+        # still returns a verdict rather than failing the whole turn. If the
+        # field was never in the body, this simply re-raises on the second 4xx.
+        if "reasoning_effort" not in json_body:
+            raise
+        retry_body = {k: v for k, v in json_body.items() if k != "reasoning_effort"}
+        _log.info(
+            "unknown_event", error_type="phone_coverage_judge",
+            error_category="reasoning_effort_unsupported_retry",
+        )
+        response = await call_with_breaker(
+            "POST",
+            url,
+            breaker=_PHONE_COVERAGE_BREAKER,
+            transport=_phone_coverage_transport(),
+            headers=headers,
+            json_body=retry_body,
+            endpoint_hint="unknown",
+            log_failures=False,
+        )
     data = getattr(response, "json", lambda: {})()
     try:
         # A reasoning model returns choices[0].message = {content, role,
