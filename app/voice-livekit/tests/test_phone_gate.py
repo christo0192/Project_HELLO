@@ -3768,6 +3768,56 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         self.assertNotIn("exchange", source)
         self.assertNotIn("booking_made", source)
 
+    def test_phone_llm_uses_sarvam_endpoint_and_disables_reasoning(self):
+        # Item A (Sarvam swap): the phone LLM must reach chat.completions with
+        # reasoning_effort=None (disable), the Sarvam base_url + key, and
+        # temperature 0.6. is_given(None) is True in the plugin, so None is what
+        # forwards reasoning_effort=null. The browser branch must keep GEMINI_*
+        # and carry NEITHER temperature nor reasoning_effort.
+        captured = {}
+
+        class _RecLLM:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        class _RecSession:
+            def __init__(self, **kwargs):
+                pass
+
+            def on(self, _event):
+                return lambda fn: fn
+
+        with patch.object(agent_mod.openai, "LLM", _RecLLM), patch.object(
+            agent_mod, "AgentSession", _RecSession,
+        ), patch.dict(agent_mod.os.environ, {
+            "PHONE_LLM_BASE_URL": "https://api.sarvam.ai/v1",
+            "PHONE_LLM_API_KEY": "phone-key",
+            "PHONE_PRIMARY_MODEL": "sarvam-105b-conversations",
+        }, clear=False):
+            agent_mod._build_phone_provider_session()
+        self.assertEqual(captured["model"], "sarvam-105b-conversations")
+        self.assertEqual(captured["base_url"], "https://api.sarvam.ai/v1")
+        self.assertEqual(captured["api_key"], "phone-key")
+        self.assertEqual(captured["temperature"], 0.6)
+        self.assertIn("reasoning_effort", captured)
+        self.assertIsNone(captured["reasoning_effort"])
+
+        # Browser branch: GEMINI_* preserved, no phone-only kwargs.
+        browser = {}
+
+        class _RecLLM2:
+            def __init__(self, **kwargs):
+                browser.update(kwargs)
+
+        with patch.object(agent_mod.openai, "LLM", _RecLLM2), patch.object(
+            agent_mod, "AgentSession", _RecSession,
+        ):
+            agent_mod._build_provider_session(phone_mode=False)
+        self.assertEqual(browser["model"], agent_mod.GEMINI_MODEL)
+        self.assertEqual(browser["base_url"], agent_mod.GEMINI_BASE_URL)
+        self.assertNotIn("reasoning_effort", browser)
+        self.assertNotIn("temperature", browser)
+
     def test_phone_and_webrtc_share_one_agent_session_factory(self):
         self.assertIn(
             "_build_provider_session(",
@@ -6011,8 +6061,11 @@ class TestPhoneJudgeProviderConfig(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_max_tokens_reads_env_and_clamps(self):
+        # Sarvam swap: default bumped 800 -> 1200 and the upper clamp 2000 ->
+        # 4000 so a reasoning judge's reasoning_content cannot starve the JSON
+        # verdict.
         for value, expected in (("64", 64), ("2000", 2000), ("10", 64),
-                                ("9999", 2000), ("x", 800)):
+                                ("9999", 4000), ("x", 1200)):
             with patch.dict(os.environ, {"PHONE_JUDGE_MAX_TOKENS": value}):
                 self.assertEqual(phone.phone_judge_max_tokens(), expected)
 
@@ -6079,6 +6132,132 @@ class TestPhoneJudgeProviderConfig(unittest.IsolatedAsyncioTestCase):
                                      '{"reasoning_effort":"none"}'}):
             self.assertEqual(phone.phone_judge_extra_body(),
                              {"reasoning_effort": "minimal"})
+
+    # ---- Sarvam swap: reasoning_effort on the judge body (Item B) ----
+
+    def test_reasoning_effort_reader_default_and_disable(self):
+        # Default "low"; empty / none / off DISABLE (None => reasoning_effort=null).
+        for value, expected in (
+            (None, "low"), ("", None), ("none", None), ("OFF", None),
+            ("medium", "medium"), ("high", "high"), ("low", "low"),
+        ):
+            env = {} if value is None else {"PHONE_JUDGE_REASONING_EFFORT": value}
+            with patch.dict(os.environ, env, clear=False):
+                if value is None:
+                    os.environ.pop("PHONE_JUDGE_REASONING_EFFORT", None)
+                self.assertEqual(phone.phone_judge_reasoning_effort(), expected)
+
+    async def test_sarvam_judge_body_carries_reader_reasoning_effort(self):
+        with patch.dict(os.environ, {}, clear=False):
+            self._clear()
+            os.environ.pop("PHONE_JUDGE_REASONING_EFFORT", None)
+            _, await_args = await self._post({
+                "PHONE_JUDGE_URL": "https://api.sarvam.ai/v1/chat/completions",
+                "PHONE_JUDGE_MODEL": "sarvam-105b",
+                "PHONE_JUDGE_API_KEY": "s" * 40,
+            })
+        body = await_args.kwargs["json_body"]
+        # Sarvam host => reader-driven effort (default "low"), overriding the
+        # Gemini-only "minimal".
+        self.assertEqual(body["reasoning_effort"], "low")
+
+    async def test_sarvam_judge_body_can_disable_reasoning(self):
+        with patch.dict(os.environ, {}, clear=False):
+            self._clear()
+            _, await_args = await self._post({
+                "PHONE_JUDGE_URL": "https://api.sarvam.ai/v1/chat/completions",
+                "PHONE_JUDGE_MODEL": "sarvam-105b",
+                "PHONE_JUDGE_API_KEY": "s" * 40,
+                "PHONE_JUDGE_REASONING_EFFORT": "off",
+            })
+        body = await_args.kwargs["json_body"]
+        # "off" => reasoning_effort present and null (disable), not the string.
+        self.assertIn("reasoning_effort", body)
+        self.assertIsNone(body["reasoning_effort"])
+
+    def test_is_sarvam_rejects_lookalike_hosts(self):
+        # BUG 5: exact/suffix match on the registered domain — a substring test
+        # would false-positive on these look-alikes and leak reasoning_effort to
+        # an untrusted endpoint.
+        for bad in (
+            "https://api.sarvamproxy.io/v1/chat/completions",
+            "https://sarvam-cache.corp.internal/v1/chat/completions",
+            "https://notsarvam.ai/v1/chat/completions",
+            "https://sarvam.ai.evil.com/v1/chat/completions",
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        ):
+            self.assertFalse(phone._phone_judge_is_sarvam(bad), bad)
+        for good in (
+            "https://api.sarvam.ai/v1/chat/completions",
+            "https://sarvam.ai/v1/chat/completions",
+            "https://edge.sarvam.ai/v1/chat/completions",
+            "https://api.sarvam.ai:443/v1/chat/completions",
+        ):
+            self.assertTrue(phone._phone_judge_is_sarvam(good), good)
+
+    async def test_lookalike_sarvam_host_does_not_get_reasoning_effort(self):
+        with patch.dict(os.environ, {}, clear=False):
+            self._clear()
+            _, await_args = await self._post({
+                "PHONE_JUDGE_URL": "https://api.sarvamproxy.io/v1/chat/completions",
+                "PHONE_JUDGE_MODEL": "some-model",
+                "PHONE_JUDGE_API_KEY": "x" * 40,
+                "PHONE_JUDGE_REASONING_EFFORT": "high",
+            })
+        body = await_args.kwargs["json_body"]
+        # Not Sarvam => reader value NOT applied; keeps the default "minimal".
+        self.assertEqual(body["reasoning_effort"], "minimal")
+
+    async def test_google_judge_body_keeps_minimal_not_reader_value(self):
+        with patch.dict(os.environ, {}, clear=False):
+            self._clear()
+            # Even with a reader value set, a Google host must NOT adopt it.
+            _, await_args = await self._post({
+                "PHONE_JUDGE_URL": phone.PHONE_JUDGE_GOOGLE_URL,
+                "PHONE_JUDGE_API_KEY": "g" * 40,
+                "PHONE_JUDGE_REASONING_EFFORT": "high",
+            })
+        body = await_args.kwargs["json_body"]
+        self.assertEqual(body["reasoning_effort"], "minimal")
+
+    async def test_business_error_retries_once_without_reasoning_effort(self):
+        # A judge endpoint that 400s on reasoning_effort must be retried once
+        # with the field stripped rather than failing the whole turn.
+        response = types.SimpleNamespace(json=lambda: {
+            "choices": [{"message": {
+                "content": '{"covered":true,"conflict":null}', "role": "assistant",
+            }}],
+        })
+        first = {"n": 0}
+
+        async def flaky(*args, **kwargs):
+            first["n"] += 1
+            if first["n"] == 1:
+                raise phone.BusinessError()
+            return response
+
+        with patch.dict(os.environ, {}, clear=False):
+            self._clear()
+            with patch.dict(os.environ, {
+                "PHONE_JUDGE_URL": "https://api.sarvam.ai/v1/chat/completions",
+                "PHONE_JUDGE_MODEL": "sarvam-105b",
+                "PHONE_JUDGE_API_KEY": "s" * 40,
+                "PHONE_JUDGE_REASONING_EFFORT": "low",
+            }), patch.object(
+                phone, "_phone_coverage_transport", return_value=object(),
+            ), patch.object(
+                phone, "call_with_breaker", side_effect=flaky,
+            ) as call:
+                raw = await phone._default_phone_coverage_inference("{}")
+        self.assertEqual(raw, '{"covered":true,"conflict":null}')
+        self.assertEqual(first["n"], 2)
+        # First body carried reasoning_effort; retry body dropped it.
+        self.assertEqual(
+            call.await_args_list[0].kwargs["json_body"]["reasoning_effort"], "low",
+        )
+        self.assertNotIn(
+            "reasoning_effort", call.await_args_list[1].kwargs["json_body"],
+        )
 
 
 class TestCandidateFacingQuestionContract(unittest.IsolatedAsyncioTestCase):
@@ -6330,6 +6509,211 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertIn("judge_error", categories)
         await self._close(hooks)
+
+    # ---- B1 round 2: the ASYNC judge arms a BOUNDED verbal re-pursuit ----
+
+    ASYNC_CONFLICT = {
+        "resume_fact": "Proprietary trader at Alpha Markets since 2024",
+        "spoken_claim": "Two years in EdTech sales and advisory roles",
+    }
+    DEFLECTION = (
+        "Yeah sure, but I don't understand what conflicts my answer and the resume."
+    )
+
+    async def _arm_via_async_judge(self, hooks):
+        """Drive one turn whose ASYNC coverage judge returns a conflict; wait
+        until the bounded re-pursuit is armed on conflict_reply_pending."""
+        agent = hooks["agent"]
+        with patch.object(
+            phone, "judge_phone_coverage", new_callable=AsyncMock,
+            return_value=phone.PhoneCoverageVerdict(
+                False, dict(self.ASYNC_CONFLICT), "model",
+            ),
+        ):
+            await self._turn(hooks, "I have done EdTech sales for two years.",
+                             assistant_text="Tell me about your recent role.")
+            armed = await self._drain(
+                lambda: agent._conflict_reply_pending.get("value") is True
+            )
+        self.assertTrue(armed, "async judge conflict should arm a re-pursuit")
+
+    async def test_async_conflict_then_deflection_fires_specific_repursuit(self):
+        agent, _, _, _, hooks = await self._coordinator()
+        await self._arm_via_async_judge(hooks)
+        # The IMMEDIATE next candidate turn deflects -> the deterministic
+        # re-assertion fires, naming the SPECIFIC resume_fact (not a capitulation).
+        ctx = await self._turn(hooks, self.DEFLECTION)
+        injected = str(ctx.items)
+        self.assertIn(self.ASYNC_CONFLICT["resume_fact"], injected)
+        self.assertIn("explain in ONE plain, warm sentence", injected)
+        self.assertIn("Never accuse", injected)
+        self.assertTrue(agent._conflict_reply_pending.get("repursued"))
+        await self._close(hooks)
+
+    async def test_async_conflict_dropped_when_candidate_moved_on(self):
+        agent, _, _, _, hooks = await self._coordinator()
+        await self._arm_via_async_judge(hooks)
+        # The candidate moves on: two intervening turns elapse before any turn
+        # reaches the conflict-consume branch. Force the pending flag to persist
+        # across the intervening turns to prove the FRESHNESS bound (not just the
+        # normal single-turn consumption) drops the stale probe.
+        agent._conflict_reply_pending["value"] = True
+        await self._turn(hooks, "My notice period is one month.",
+                         assistant_text="What is your notice period?")
+        agent._conflict_reply_pending["value"] = True
+        ctx = await self._turn(hooks, self.DEFLECTION,
+                               assistant_text="What compensation do you expect?")
+        injected = str(ctx.items)
+        # No stale conflict probe fired; the re-pursuit never fired.
+        self.assertNotIn(self.ASYNC_CONFLICT["resume_fact"], injected)
+        self.assertFalse(agent._conflict_reply_pending.get("repursued"))
+        await self._close(hooks)
+
+    async def test_async_repursuit_fires_at_most_once_per_call(self):
+        agent, _, _, _, hooks = await self._coordinator()
+        await self._arm_via_async_judge(hooks)
+        # First deflection consumes the ONE permitted re-pursuit.
+        await self._turn(hooks, self.DEFLECTION)
+        self.assertTrue(agent._conflict_reply_pending.get("repursued"))
+        # A second async conflict must NOT re-arm (repursued latch); even if it
+        # somehow set the flag, the re-pursuit cannot fire twice.
+        await self._arm_via_async_judge_expect_no_rearm(hooks)
+        agent._conflict_reply_pending["value"] = True
+        ctx = await self._turn(hooks, self.DEFLECTION)
+        self.assertNotIn(self.ASYNC_CONFLICT["resume_fact"], str(ctx.items))
+        await self._close(hooks)
+
+    async def _arm_via_async_judge_expect_no_rearm(self, hooks):
+        agent = hooks["agent"]
+        with patch.object(
+            phone, "judge_phone_coverage", new_callable=AsyncMock,
+            return_value=phone.PhoneCoverageVerdict(
+                False, dict(self.ASYNC_CONFLICT), "model",
+            ),
+        ):
+            await self._turn(hooks, "Another answer entirely.",
+                             assistant_text="What is your notice period?")
+            # Give the background task a chance to run; the repursued latch must
+            # keep it from re-arming a fresh conflict.
+            await asyncio.sleep(0.05)
+
+    # ---- BUG 1: a coalesced STT fragment is ONE logical turn ----
+
+    async def test_coalesced_fragment_does_not_advance_logical_turn_counter(self):
+        agent, _, _, _, hooks = await self._coordinator()
+        seq = agent._native_turn_seq
+        with patch.object(agent_mod, "PHONE_SPEECH_FIRST_AUDIO_TIMEOUT_SEC", 0.12):
+            # First fragment is a NORMAL logical turn: creates active_exchange
+            # and advances the counter by one.
+            await self._turn(hooks, "My name is Gaurav who worked in sales")
+            after_first = seq[0]
+            # Set up mid-stream state so the SECOND final is coalesced.
+            hooks["assistant_delivery_complete"].clear()
+            hooks["reply_started"].set()
+            hooks["speech_first_audio"].clear()
+            hooks["reply_handle"][0] = _FakeSpeech()
+            await agent._on_reply_expected()
+            with self.assertRaises(Exception):
+                # a coalesced continuation raises StopResponse
+                await self._turn(
+                    hooks, "like tech companies such as Scaler and Great Learning",
+                )
+        # The continuation fragment must NOT have advanced the LOGICAL turn count
+        # (BUG 1): otherwise a fragmented follow-up would trip the freshness bound.
+        self.assertEqual(seq[0], after_first)
+        hooks["task"].cancel()
+        await asyncio.gather(hooks["task"], return_exceptions=True)
+        hooks["log_patch"].stop()
+
+    async def test_async_repursuit_survives_a_fragmented_next_answer(self):
+        # End-to-end BUG 1: async-arm at turn N, then the candidate's immediate
+        # next answer arrives as a coalesced STT continuation fragment FOLLOWED by
+        # the deflection final. The coalesced fragment must NOT advance the
+        # LOGICAL turn counter, so the deflection lands at armed_turn+1 and the
+        # re-pursuit fires (not dropped stale). Uses the proven coalesce recipe
+        # (mirrors test_coalesced_fragment_rearms_watchdog): a fragment coalesces
+        # only while a reply is mid-stream (reply_started, no first audio,
+        # delivery incomplete) and the cursor has not advanced.
+        agent, _, _, _, hooks = await self._coordinator()
+        seq = agent._native_turn_seq
+        with patch.object(agent_mod, "PHONE_SPEECH_FIRST_AUDIO_TIMEOUT_SEC", 0.12):
+            # First logical answer establishes active_exchange; keep delivery
+            # incomplete so the reply is mid-stream and the cursor has not
+            # advanced (both required by the coalesce guard).
+            await self._turn(hooks, "I have done EdTech sales for two years.")
+            # Simulate the async judge having armed the re-pursuit on THIS turn:
+            # stamp armed_turn at the current logical count (what the single
+            # writer does). This isolates the freshness arithmetic from the
+            # background-commit timing so the coalesce recipe stays deterministic.
+            armed_turn = seq[0]
+            agent._conflict_reply_pending.update({
+                "value": True, "conflict": dict(self.ASYNC_CONFLICT),
+                "repursued": False, "armed_turn": armed_turn,
+            })
+            hooks["assistant_delivery_complete"].clear()
+            hooks["reply_started"].set()
+            hooks["speech_first_audio"].clear()
+            hooks["reply_handle"][0] = _FakeSpeech()
+            await agent._on_reply_expected()
+            before_fragment = seq[0]
+            # A coalesced continuation fragment (mid-stream, no first audio).
+            with self.assertRaises(Exception):
+                await self._turn(hooks, "like tech firms such as Scaler")
+            # BUG 1: the coalesced fragment did NOT advance the logical counter.
+            self.assertEqual(seq[0], before_fragment)
+            # Delivery completes; the deflection is the fresh next logical turn
+            # (armed_turn+1) and must fire the re-pursuit, not drop it as stale.
+            hooks["assistant_delivery_complete"].set()
+            hooks["reply_started"].clear()
+            hooks["speech_first_audio"].clear()
+            ctx = await self._turn(hooks, self.DEFLECTION)
+        self.assertEqual(seq[0], armed_turn + 1)
+        self.assertIn(self.ASYNC_CONFLICT["resume_fact"], str(ctx.items))
+        self.assertTrue(agent._conflict_reply_pending.get("repursued"))
+        await self._close(hooks)
+
+    # ---- BUG 2: armed_turn never leaks across arm paths ----
+
+    async def test_sync_arm_after_async_arm_is_not_dropped_stale(self):
+        agent, _, _, _, hooks = await self._coordinator()
+        # Async-arm at some turn, stamping armed_turn.
+        await self._arm_via_async_judge(hooks)
+        self.assertIsNotNone(agent._conflict_reply_pending.get("armed_turn"))
+        # Advance several turns so the async stamp is now STALE — but do NOT
+        # consume (simulate the async probe never having been the next turn).
+        await self._turn(hooks, "My notice period is one month.",
+                         assistant_text="What is your notice period?")
+        await self._turn(hooks, "I expect twenty LPA.",
+                         assistant_text="What compensation do you expect?")
+        # A fresh SYNChronous probe now arms via on_reply_delivered's path. Route
+        # it exactly as production does: arm conflict_delivery, deliver its seq.
+        agent._conflict_reply_pending.update(
+            {"value": False, "conflict": None, "repursued": False, "armed_turn": None},
+        )
+        agent._arm_conflict_delivery = getattr(agent, "_arm_conflict_delivery", None)
+        # Simulate the sync arm through the single writer (armed_turn=None) the
+        # way on_reply_delivered does, then a deflection consumes it.
+        agent._conflict_reply_pending.update(
+            {"value": True, "conflict": dict(self.ASYNC_CONFLICT), "armed_turn": None},
+        )
+        ctx = await self._turn(hooks, self.DEFLECTION)
+        # A sync arm (armed_turn=None) is NEVER dropped stale — the re-pursuit
+        # fires even though many turns elapsed since the earlier async arm.
+        self.assertIn(self.ASYNC_CONFLICT["resume_fact"], str(ctx.items))
+        self.assertTrue(agent._conflict_reply_pending.get("repursued"))
+        await self._close(hooks)
+
+    async def test_single_writer_always_sets_armed_turn_no_residual(self):
+        # The single-writer discipline: an async arm sets a stamp; a subsequent
+        # sync arm through the same writer overwrites it with None (no leak).
+        src = inspect.getsource(agent_mod._run_native_phone_screening)
+        # Both arm paths route through the one writer, never a bare assignment.
+        self.assertIn("_arm_conflict_reply_pending(", src)
+        # The writer ALWAYS writes armed_turn (explicit key), so a residual stamp
+        # cannot survive across arm paths.
+        writer = src[src.index("def _arm_conflict_reply_pending"):
+                     src.index("def _consume_conflict_reply")]
+        self.assertIn('conflict_reply_pending["armed_turn"] = armed_turn', writer)
 
     async def test_timeout_env_knob_is_honored_by_the_judge_wrapper(self):
         # The bounded reader clamps and defaults; the module constant is the
@@ -8824,6 +9208,58 @@ class TestPhoneContextBounds(unittest.TestCase):
         # the module reads the bound through this helper; an override is honoured
         self.assertEqual(phone._bounded_int_env("120", 32, 16, 4000), 120)
         self.assertEqual(phone._bounded_int_env("100", 20, 8, 4000), 100)
+
+
+class TestPhoneLlmCacheObservability(unittest.TestCase):
+    """Item E (Sarvam swap): the phone LLM metric surfaces cached-vs-total
+    prompt tokens so automatic server-side prefix caching is verifiable."""
+
+    class _LLMMetrics:  # name must contain "llm" so the component probe matches
+        def __init__(self, prompt_tokens, cached):
+            self.prompt_tokens = prompt_tokens
+            self.prompt_cached_tokens = cached
+            self.total_tokens = prompt_tokens + 20
+
+    def _llm_metric(self, *, prompt_tokens, cached):
+        return types.SimpleNamespace(
+            metrics=self._LLMMetrics(prompt_tokens, cached),
+        )
+
+    def test_phone_channel_emits_cached_and_total(self):
+        event = self._llm_metric(prompt_tokens=1000, cached=800)
+        spy = MagicMock(wraps=agent_mod._log)
+        with patch.object(agent_mod, "_log", spy):
+            agent_mod._record_provider_metrics(event, channel="phone")
+        cache_logs = [
+            c for c in spy.info.call_args_list
+            if c.kwargs.get("error_type") == "voice_phone_llm_cache"
+        ]
+        self.assertEqual(len(cache_logs), 1)
+        # cached rides duration_sec, total rides turn_index (allowlisted keys).
+        self.assertEqual(cache_logs[0].kwargs["duration_sec"], 800.0)
+        self.assertEqual(cache_logs[0].kwargs["turn_index"], 1000)
+        self.assertEqual(cache_logs[0].kwargs["schema"], "prompt_cache")
+
+    def test_browser_channel_never_emits_phone_cache_metric(self):
+        event = self._llm_metric(prompt_tokens=1000, cached=800)
+        spy = MagicMock(wraps=agent_mod._log)
+        with patch.object(agent_mod, "_log", spy):
+            agent_mod._record_provider_metrics(event, channel=None)
+        self.assertFalse([
+            c for c in spy.info.call_args_list
+            if c.kwargs.get("error_type") == "voice_phone_llm_cache"
+        ])
+
+    def test_system_prompt_prefix_is_built_once_not_per_turn(self):
+        # STABLE PREFIX audit: the screener system prompt is assembled by
+        # _phone_instructions_text and handed to the Agent constructor ONCE.
+        # Per-turn dynamic content must be appended AFTER (developer messages via
+        # add_turn_instruction / update_chat_ctx), never mutating the prefix.
+        src = inspect.getsource(agent_mod._run_native_phone_screening)
+        # No per-turn re-render of the system prompt inside the turn hook.
+        self.assertNotIn("_phone_instructions_text(", src)
+        # The only per-turn context mutations are developer-role messages.
+        self.assertIn('role="developer"', inspect.getsource(agent_mod))
 
 
 if __name__ == "__main__":

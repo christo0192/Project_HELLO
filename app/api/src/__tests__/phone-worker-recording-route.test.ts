@@ -16,7 +16,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import express from 'express';
 import request from 'supertest';
-import { createPhoneWorkerRouter, egressRecordingEnabled } from '../routes/phone-worker.js';
+import {
+  createPhoneWorkerRouter,
+  egressRecordingEnabled,
+  createSupabaseUploadSigner,
+  type SignedUploadUrlStorage,
+} from '../routes/phone-worker.js';
 import type { PhoneStores } from '../lib/phone-screening/index.js';
 import type { WorkerRecordingUploadSigner } from '../integrations/livekit-phone-dial/worker-recording.js';
 
@@ -330,6 +335,69 @@ describe('provider=worker failed — latches a permanently lost recording', () =
     const res = await authed(h.app, FAILED, FAILED_BODY);
     expect(res.status).toBe(500);
     expect(res.body.status).toBe('phone_recording_failed_error');
+  });
+});
+
+describe('createSupabaseUploadSigner — the v115 upsert mint', () => {
+  const KEY = 'phone-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-egress.mp3';
+
+  it('mints the signed upload URL with upsert:true so the OGG fallback/retry can OVERWRITE', async () => {
+    // THE FIX. Before v115 the mint was insert-only, so the OGG fallback (or any
+    // retry) re-PUTing the same key 409'd and NOTHING landed. The signer must
+    // pass `{ upsert: true }` so the presigned PUT overwrites instead.
+    let seenOptions: { upsert?: boolean } | undefined;
+    const storage: SignedUploadUrlStorage = {
+      async createSignedUploadUrl(_path, options) {
+        seenOptions = options;
+        return { data: { signedUrl: 'https://storage.test/upload/sign/x?token=t' }, error: null };
+      },
+    };
+    const signer = createSupabaseUploadSigner(storage);
+    const res = await signer.createUploadUrl(KEY);
+    expect(res).toEqual({ uploadUrl: 'https://storage.test/upload/sign/x?token=t' });
+    // The load-bearing assertion: upsert was requested.
+    expect(seenOptions).toEqual({ upsert: true });
+  });
+
+  it('an insert-only mock (rejects unless upsert) now succeeds because upsert is passed', async () => {
+    // Models Supabase's insert-only behavior: the mint refuses unless upsert is
+    // set. This mock would have returned an error for the pre-fix (no-options)
+    // call; the fixed signer passes upsert:true and gets a URL.
+    const storage: SignedUploadUrlStorage = {
+      async createSignedUploadUrl(_path, options) {
+        if (options?.upsert !== true) {
+          return { data: null, error: { message: 'Duplicate' } };
+        }
+        return { data: { signedUrl: 'https://storage.test/upload/sign/x?token=t' }, error: null };
+      },
+    };
+    const signer = createSupabaseUploadSigner(storage);
+    expect(await signer.createUploadUrl(KEY)).toEqual({
+      uploadUrl: 'https://storage.test/upload/sign/x?token=t',
+    });
+  });
+
+  it('returns null (never throws at the worker) on an error, a missing URL, or a throw', async () => {
+    const errored = createSupabaseUploadSigner({
+      async createSignedUploadUrl() {
+        return { data: null, error: { message: 'boom' } };
+      },
+    });
+    expect(await errored.createUploadUrl(KEY)).toBeNull();
+
+    const noUrl = createSupabaseUploadSigner({
+      async createSignedUploadUrl() {
+        return { data: null, error: null };
+      },
+    });
+    expect(await noUrl.createUploadUrl(KEY)).toBeNull();
+
+    const threw = createSupabaseUploadSigner({
+      async createSignedUploadUrl() {
+        throw new Error('driver down');
+      },
+    });
+    expect(await threw.createUploadUrl(KEY)).toBeNull();
   });
 });
 

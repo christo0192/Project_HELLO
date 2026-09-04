@@ -441,6 +441,88 @@ class TestOggFallbackRetainsAudio(unittest.TestCase):
         self.assertEqual(r.finish_failure, "transcode_failed")
 
 
+class TestDefaultUploadUpsert(unittest.TestCase):
+    """v115 (2026-09-04): the OGG fallback FIRED but its upload failed and nothing
+    landed. Root cause: the presigned PUT was insert-only, so a second write to
+    the key (a retry, or the fallback re-PUT after the MP3 leg touched the object)
+    collided 409. The mint now uses `upsert:true` and the raw PUT mirrors
+    Supabase's own `uploadToSignedUrl` by sending `x-upsert: true`, so the write
+    OVERWRITES instead of colliding.
+
+    These exercise the REAL `_default_upload` against a fake httpx that models an
+    insert-only-vs-upsert Supabase signed-upload endpoint — a server that would
+    have rejected the fallback before the fix and accepts it now."""
+
+    def _patched_httpx(self, server):
+        """Return a context-manager patch installing a fake httpx module whose
+        AsyncClient.put delegates to `server(url, content, headers)`."""
+        import types
+        import unittest.mock as _mock
+
+        class _Resp:
+            def __init__(self, status_code):
+                self.status_code = status_code
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def put(self, url, content=None, headers=None):
+                return _Resp(server(url, content, headers or {}))
+
+        fake = types.ModuleType("httpx")
+        fake.AsyncClient = _Client
+        fake.Timeout = lambda *a, **k: None
+        return _mock.patch.dict("sys.modules", {"httpx": fake})
+
+    def test_upload_sends_x_upsert_and_content_type(self):
+        seen = {}
+
+        def server(url, content, headers):
+            seen["url"] = url
+            seen["content"] = content
+            seen["headers"] = {k.lower(): v for k, v in headers.items()}
+            return 200
+
+        with self._patched_httpx(server):
+            _run(rec._default_upload("https://s/put?token=x", b"OggS\x00audio", "audio/ogg"))
+        self.assertEqual(seen["content"], b"OggS\x00audio")
+        self.assertEqual(seen["headers"]["content-type"], "audio/ogg")
+        # THE FIX: the PUT declares upsert so an overwrite is permitted.
+        self.assertEqual(seen["headers"]["x-upsert"], "true")
+
+    def test_insert_only_server_would_reject_but_upsert_succeeds(self):
+        # Models Supabase: an insert-only signed PUT 409s when the key exists;
+        # an upsert PUT (x-upsert:true) overwrites and returns 200. Before the
+        # fix the header was absent, so this server would have failed the
+        # fallback with upload_failed_status_409.
+        existing = {"phone-obj.mp3"}
+
+        def server(url, content, headers):
+            hs = {k.lower(): v for k, v in headers.items()}
+            key = "phone-obj.mp3"
+            if key in existing and hs.get("x-upsert") != "true":
+                return 409  # insert-only collision — the v115 failure
+            existing.add(key)
+            return 200
+
+        # With the x-upsert header the fallback OVERWRITES rather than colliding.
+        with self._patched_httpx(server):
+            _run(rec._default_upload("https://s/put?token=x", b"OggS\x00fallback", "audio/ogg"))
+
+    def test_upload_surfaces_server_error_status(self):
+        with self._patched_httpx(lambda *a: 500):
+            with self.assertRaises(RuntimeError) as ctx:
+                _run(rec._default_upload("https://s/put?token=x", b"x", "audio/mpeg"))
+        self.assertIn("upload_failed_status_500", str(ctx.exception))
+
+
 @unittest.skipUnless(_HAS_AV, "PyAV/numpy not installed (CI worker env) — validated where present")
 class TestRealPyAvTranscode(unittest.TestCase):
     """The real fix: OGG→MP3 must transcode IN-PROCESS via PyAV (no ffmpeg binary,
@@ -524,6 +606,287 @@ class TestRealPyAvTranscode(unittest.TestCase):
                 self.assertGreater(sum(1 for _ in c.decode(astream)), 0)
             finally:
                 c.close()
+
+    def test_pyav_transcode_unequal_channel_length_yields_complete_mp3(self):
+        # THE v115 CASE, sharpened. The mixed OGG has channels of UNEQUAL length,
+        # so decoded frames arrive at VARYING sample counts (and a short tail).
+        # The v114 resampler-only path fed those odd-sized frames straight to
+        # libmp3lame, which needs frame_size (1152) input — so most frames were
+        # SKIPPED and the completeness floor tripped (`transcode_truncated`),
+        # dropping a fully-recoverable call to the OGG fallback. With the FIFO
+        # chunker the desync is absorbed into the sample timeline: the transcode
+        # must produce a COMPLETE, decodable MP3 and skip effectively nothing.
+        import logging as _logging
+
+        with tempfile.TemporaryDirectory() as d:
+            ogg = Path(d) / "in.ogg"
+            mp3 = Path(d) / "out.mp3"
+            oc = _av.open(str(ogg), mode="w")
+            st = oc.add_stream("libopus", rate=48000, layout="stereo")
+            sr = 48000
+
+            def _stereo_frame(n):
+                t = _np.arange(n) / sr
+                l = (0.4 * _np.sin(2 * _np.pi * 440 * t) * 32767).astype(_np.int16)
+                r = (0.4 * _np.sin(2 * _np.pi * 880 * t) * 32767).astype(_np.int16)
+                inter = _np.empty(l.size + r.size, dtype=_np.int16)
+                inter[0::2] = l
+                inter[1::2] = r
+                f = _av.AudioFrame.from_ndarray(
+                    inter.reshape(1, -1), format="s16", layout="stereo")
+                f.sample_rate = sr
+                return f
+
+            # A long run of IRREGULAR frame lengths (never a multiple of 1152),
+            # then a very short desync tail — the shape that previously skipped.
+            for n in (1000, 1500, 777, 2049, 333, 1201, 1153, 999, 60):
+                for p in st.encode(_stereo_frame(n)):
+                    oc.mux(p)
+            for p in st.encode(None):
+                oc.mux(p)
+            oc.close()
+
+            # Capture the recorder's warnings: after the fix a normal desynced
+            # call must skip ZERO frames (so no `transcode_skipped_frames`).
+            handler = _logging.getLogger("voice-livekit.recording")
+            records = []
+
+            class _Cap(_logging.Handler):
+                def emit(self, rec_):
+                    records.append(rec_.getMessage())
+
+            cap = _Cap()
+            handler.addHandler(cap)
+            try:
+                _run(rec._default_transcode(ogg, mp3))
+            finally:
+                handler.removeHandler(cap)
+
+            self.assertTrue(mp3.exists() and mp3.stat().st_size > 0)
+            c = _av.open(str(mp3))
+            try:
+                astream = c.streams.audio[0]
+                self.assertGreater(sum(1 for _ in c.decode(astream)), 0)
+            finally:
+                c.close()
+            # No frames were skipped — the desync was absorbed, not dropped.
+            self.assertFalse(
+                any("transcode_skipped_frames" in m or "transcode_truncated" in m
+                    for m in records),
+                f"unexpected skip/truncate on a normal desynced call: {records}",
+            )
+
+    def test_pyav_transcode_rebuilds_resampler_on_layout_change(self):
+        # THE TRUE v114/v115 ROOT CAUSE. `av.AudioResampler` locks to the layout
+        # of the FIRST frame and raises `ValueError: Frame does not match
+        # AudioResampler setup` on any later frame whose input layout differs —
+        # exactly what the channel-desync's short MONO tail frame is. The v114
+        # resampler-only path (and a FIFO alone) skipped that whole tail and the
+        # floor tripped. The fix REBUILDS the resampler for the new input shape
+        # and retries the same frame, dropping nothing.
+        #
+        # We drive `_default_transcode` with a decoder STUB that yields stereo
+        # frames then a mono tail — the shape a real desync produces — and assert
+        # a complete MP3 with ZERO skipped frames.
+        import logging as _logging
+        import unittest.mock as _mock
+
+        sr = 48000
+
+        def _frame(n, layout):
+            ch = 2 if layout == "stereo" else 1
+            a = (0.3 * _np.sin(2 * _np.pi * 440 * _np.arange(n) / sr) * 32767).astype(_np.int16)
+            arr = _np.tile(a, (ch, 1))  # planar s16p, ch planes
+            f = _av.AudioFrame.from_ndarray(arr, format="s16p", layout=layout)
+            f.sample_rate = sr
+            return f
+
+        # Stereo body, then a MONO desync tail (the frame that made the resampler
+        # raise mid-stream on the live calls).
+        frames = [_frame(1152, "stereo"), _frame(900, "stereo"),
+                  _frame(1152, "stereo"), _frame(240, "mono")]
+
+        class _FakeStream:
+            rate = sr
+
+            class layout:  # noqa: N801
+                channels = (0, 1)  # len==2 → out_layout stereo
+
+        class _FakeInContainer:
+            streams = type("S", (), {"audio": [_FakeStream()]})()
+
+            def decode(self, _stream):
+                yield from frames
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as d:
+            mp3 = Path(d) / "out.mp3"
+            real_open = _av.open
+
+            def fake_open(path, mode="r", **kw):
+                if mode == "r":
+                    return _FakeInContainer()
+                return real_open(path, mode=mode, **kw)
+
+            log = _logging.getLogger("voice-livekit.recording")
+            records = []
+
+            class _Cap(_logging.Handler):
+                def emit(self, rec_):
+                    records.append(rec_.getMessage())
+
+            cap = _Cap()
+            log.addHandler(cap)
+            try:
+                with _mock.patch.object(_av, "open", side_effect=fake_open):
+                    _run(rec._default_transcode(Path("ignored.ogg"), mp3))
+            finally:
+                log.removeHandler(cap)
+
+            self.assertTrue(mp3.exists() and mp3.stat().st_size > 0)
+            c = real_open(str(mp3))
+            try:
+                astream = c.streams.audio[0]
+                self.assertGreater(sum(1 for _ in c.decode(astream)), 0)
+            finally:
+                c.close()
+            # The mono tail was NOT skipped — the resampler rebuilt and absorbed it.
+            self.assertFalse(
+                any("transcode_skipped_frames" in m or "transcode_truncated" in m
+                    for m in records),
+                f"the mono desync tail was skipped, not absorbed: {records}",
+            )
+
+    def _transcode_with_decoded_frames(self, frames, out_channels):
+        """Drive `_default_transcode` with a decoder STUB yielding `frames`, and
+        return (mp3_total_samples, warning_messages). Lets a test control exact
+        sample counts and compare the output length against the input."""
+        import logging as _logging
+        import unittest.mock as _mock
+
+        class _FakeStream:
+            rate = 48000
+
+            class layout:  # noqa: N801
+                channels = tuple(range(out_channels))
+
+        class _FakeInContainer:
+            streams = type("S", (), {"audio": [_FakeStream()]})()
+
+            def decode(self, _stream):
+                yield from frames
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as d:
+            mp3 = Path(d) / "out.mp3"
+            real_open = _av.open
+
+            def fake_open(path, mode="r", **kw):
+                return _FakeInContainer() if mode == "r" else real_open(path, mode=mode, **kw)
+
+            log = _logging.getLogger("voice-livekit.recording")
+            records = []
+
+            class _Cap(_logging.Handler):
+                def emit(self, rec_):
+                    records.append(rec_.getMessage())
+
+            cap = _Cap()
+            log.addHandler(cap)
+            try:
+                with _mock.patch.object(_av, "open", side_effect=fake_open):
+                    _run(rec._default_transcode(Path("ignored.ogg"), mp3))
+            finally:
+                log.removeHandler(cap)
+
+            self.assertTrue(mp3.exists() and mp3.stat().st_size > 0)
+            c = real_open(str(mp3))
+            try:
+                astream = c.streams.audio[0]
+                total = sum(fr.samples for fr in c.decode(astream))
+            finally:
+                c.close()
+            return total, records
+
+    @staticmethod
+    def _pcm_frame(n, layout, sample_rate=48000):
+        ch = 2 if layout == "stereo" else 1
+        a = (0.3 * _np.sin(2 * _np.pi * 440 * _np.arange(n) / sample_rate) * 32767).astype(_np.int16)
+        arr = _np.tile(a, (ch, 1))  # planar s16p, ch planes
+        f = _av.AudioFrame.from_ndarray(arr, format="s16p", layout=layout)
+        f.sample_rate = sample_rate
+        return f
+
+    def test_pyav_transcode_layout_change_loses_zero_samples(self):
+        # BUG 3. Rebuilding the resampler on a layout change must FLUSH the old
+        # resampler's buffer first — otherwise its buffered conversion state
+        # vanishes silently (no skip increment, no short encode), so the floor
+        # never sees the loss and a truncated MP3 uploads as "clean".
+        #
+        # To make the loss OBSERVABLE the resampler must actually buffer: the
+        # stub stream advertises 48 kHz (so `_default_transcode` targets 48 kHz)
+        # but the frames are 44.1 kHz, forcing rate conversion — the old
+        # resampler then holds ~17 samples of conversion tail at EACH rebuild
+        # boundary. One boundary is sub-millisecond and encoder delay would mask
+        # it, so the input ALTERNATES layout ~120 times: the pre-fix path drops
+        # the buffer ~119 times for a cumulative loss of ~2000 samples (~45 ms),
+        # well over one MP3 frame. The fixed path flushes each time and loses
+        # none. Output must match the RESAMPLED input length within one MP3 frame.
+        n_frames = 120
+        per = 1200  # not a frame_size multiple; realistic decoded chunk
+        frames = [
+            self._pcm_frame(per, "stereo" if i % 2 == 0 else "mono", sample_rate=44100)
+            for i in range(n_frames)
+        ]
+        total, records = self._transcode_with_decoded_frames(frames, out_channels=2)
+
+        # Expected OUTPUT samples ≈ input × (48000/44100).
+        expected = round(n_frames * per * 48000 / 44100)
+        # One MP3 frame of slack for encoder delay/padding — but NOT the ~2000
+        # samples the pre-fix rebuild silently dropped across the boundaries.
+        self.assertGreaterEqual(
+            total, expected - 1152,
+            f"samples lost across the rebuilds: got {total}, expected ~{expected} "
+            f"(records={records})",
+        )
+        # And it must NOT have been laundered as a skip/truncate either.
+        self.assertFalse(
+            any("transcode_skipped_frames" in m or "transcode_truncated" in m for m in records),
+            f"a rebuild loss was hidden as a skip/truncate: {records}",
+        )
+
+    def test_pyav_transcode_final_tail_over_frame_size_is_fully_encoded(self):
+        # BUG 4 (robustness/guarantee). After the resampler's tail is flushed
+        # post-loop, the FIFO can hold MORE than frame_size (1152) samples. The
+        # final drain now CHUNKS those into frame_size frames plus the short
+        # remainder rather than encoding one oversized frame.
+        #
+        # NB: in the currently-pinned PyAV (18.1.0) libmp3lame happens to accept
+        # an oversized input frame and chunk it internally, so the OLD single
+        # `fifo.read()` did not lose audio HERE — this is therefore a GUARANTEE
+        # test, not a version-specific reproducer. The chunked drain removes the
+        # reliance on that undocumented tolerance (stricter FFmpeg/libmp3lame
+        # builds raise on a non-frame_size input frame, which the wrapping
+        # `except` would then silently swallow). Either way the invariant must
+        # hold: a >frame_size final tail is FULLY encoded, never truncated.
+        n = 5 * 1152  # 5760 samples, all delivered as one final-drain batch
+        frames = [self._pcm_frame(n, "stereo")]
+        total, records = self._transcode_with_decoded_frames(frames, out_channels=2)
+        # The whole tail must be encoded (within one MP3 frame of encoder slack),
+        # never truncated.
+        self.assertGreaterEqual(
+            total, n - 1152,
+            f"the >frame_size final tail was truncated: got {total} of {n} "
+            f"(records={records})",
+        )
+        self.assertFalse(
+            any("transcode_skipped_frames" in m or "transcode_truncated" in m for m in records),
+            f"the tail drop was hidden as a skip/truncate: {records}",
+        )
 
     def test_pyav_transcode_fails_when_most_frames_skipped(self):
         # THE COMPLETENESS-FLOOR GUARANTEE (adversarial-review MED). A desync

@@ -137,31 +137,41 @@ async def _default_transcode(ogg_path: Path, mp3_path: Path) -> None:
     bundles ``libmp3lame``, so the MP3 encode needs no extra binary or image
     change. Runs in a thread so the encode never blocks the event loop.
 
-    ── WHY IT IS HARDENED (live v114, 2026-09-04) ──────────────────────────
+    ── WHY IT IS HARDENED (live v114/v115, 2026-09-04) ─────────────────────
     A real call lost its recording to ``transcode_failed`` preceded by the
-    PyAV/librosa warning "Input is shorter by 46394 samples; silence has been
+    swresample warning "Input is shorter by 46394 samples; silence has been
     prepended to align". The two mixed channels (candidate=left, bot=right)
-    finished with mismatched sample counts, so a decoded frame arrived with an
-    unexpected shape/layout/rate and a SINGLE bad frame threw out of the whole
-    encode. Three hardening measures make the encode robust rather than
-    all-or-nothing:
+    finished with mismatched sample counts, so the OGG's decoded frames arrive
+    with VARYING sample counts (and a short/one-sided tail).
 
-      1. An explicit ``av.AudioResampler`` coerces every decoded frame to the
-         OUTPUT stream's exact rate + layout + a valid packed sample format
-         (``s16p`` is what libmp3lame wants), so a short/mono/desynced frame is
-         normalized instead of tripping the encoder.
-      2. The per-frame decode→resample→encode step is wrapped so ONE malformed
-         frame is skipped (counted + logged), never aborting the encode — BUT a
-         COMPLETENESS FLOOR (see ``_TRANSCODE_MAX_SKIPPED_FRACTION``) fails the
-         whole transcode if too large a fraction was skipped, so a badly
-         truncated MP3 is never passed off as a success (it drops to the OGG
-         fallback instead, preserving the complete raw audio).
-      3. The layout is set explicitly (mono vs stereo), the encoder tail is
-         always flushed, and the caller verifies a non-empty MP3 — so the
-         function only "succeeds" when it actually produced (near-)complete audio.
+    The v114 fix added an ``av.AudioResampler`` — that coerces every frame to
+    the encoder's rate/layout/format, but it does NOT chunk frames to the MP3
+    encoder's fixed input size. ``libmp3lame`` requires exactly ``frame_size``
+    (1152) samples per input frame: fed a shorter/longer frame it errors, so the
+    per-frame ``except`` SKIPPED it — and on a desynced call that is MOST frames,
+    tripping the completeness floor (``transcode_truncated_below_floor``) and
+    dropping to the OGG fallback on a call whose audio was entirely recoverable.
+    That is why v115 STILL failed the transcode with the resampler in place.
+
+    The robust idiom (PyAV canonical, confirmed against the docs) is
+    ``AudioResampler`` → ``AudioFifo`` → fixed-size ``read(frame_size)`` →
+    encode:
+
+      1. The resampler coerces rate/layout/packed format so a short/mono/desynced
+         frame is normalized rather than tripping the encoder.
+      2. An ``AudioFifo`` accumulates the resampled samples and hands the encoder
+         ONLY full ``frame_size`` chunks (plus one final short frame at flush),
+         so NO frame is ever the wrong size and NO audio is dropped for being an
+         odd length. The desync is absorbed into the sample timeline, not skipped.
+      3. The encoder tail is always flushed and the caller verifies a non-empty
+         MP3. The completeness floor still fails a transcode that genuinely could
+         not decode its input (so a truly-corrupt OGG still drops to the fallback
+         that preserves the raw bytes), but a normal desynced call now yields a
+         complete MP3 with zero skipped frames.
     """
     def _run() -> None:
         import av  # noqa: PLC0415
+        from av.audio.fifo import AudioFifo  # noqa: PLC0415
         from av.audio.resampler import AudioResampler  # noqa: PLC0415
 
         in_container = av.open(str(ogg_path))
@@ -189,34 +199,105 @@ async def _default_transcode(ogg_path: Path, mp3_path: Path) -> None:
                 pass
 
             # The desync-tolerant normalizer: coerce EVERY frame to the encoder's
-            # exact rate/layout/format. This is what turns "Input is shorter by N
-            # samples" (a fatal encode error at v114) into a silently-aligned
-            # frame the encoder accepts.
-            resampler = AudioResampler(format="s16p", layout=out_layout, rate=out_rate)
+            # exact rate/layout/format (packed s16 the FIFO + libmp3lame accept).
+            #
+            # ── WHY IT IS REBUILT ON MISMATCH (the TRUE v114/v115 root cause) ──
+            # ``av.AudioResampler`` LOCKS to the layout/format/rate of the FIRST
+            # frame it sees and raises ``ValueError: Frame does not match
+            # AudioResampler setup`` on any LATER frame whose input layout differs.
+            # A channel-desynced mix ends with a short/one-sided (mono) tail
+            # frame, so mid-stream the resampler hit exactly that and threw — the
+            # per-frame ``except`` then skipped a whole run of tail frames and the
+            # completeness floor tripped (``transcode_truncated_below_floor`` →
+            # OGG fallback) on a call whose audio was fully recoverable. The
+            # OUTPUT target is fixed; only the INPUT shape varies. So on a
+            # mismatch we REBUILD the resampler (fresh input lock) and retry the
+            # SAME frame once, rather than dropping it. This is the piece the v114
+            # resampler-only fix and the FIFO alone both lacked.
+            resampler = AudioResampler(format="s16", layout=out_layout, rate=out_rate)
+            # The chunker: accumulate resampled samples and pull encoder-sized
+            # frames — libmp3lame needs frame_size-sized input frames, so the FIFO
+            # absorbs the varying decoded-frame lengths without dropping audio.
+            fifo = AudioFifo()
+            # MP3 fixed frame size; fall back to the MPEG-1 Layer III constant if
+            # the encoder has not exposed it yet (it may be 0 before first use).
+            frame_size = getattr(out_stream, "frame_size", 0) or 1152
+
+            def _new_resampler() -> Any:
+                return AudioResampler(format="s16", layout=out_layout, rate=out_rate)
+
+            def _drain_fifo(*, final: bool) -> None:
+                # Pull full frame_size chunks out of the FIFO and encode each.
+                # When NOT finalizing, stop once fewer than frame_size samples
+                # remain (they wait for more input). When finalizing, first drain
+                # every full frame_size chunk (BUG 4: after the resampler's tail
+                # is flushed in the FIFO occupancy can exceed frame_size, and a
+                # single oversized read is rejected by libmp3lame and silently
+                # dropped), THEN encode the final short remainder as the one
+                # legitimately-undersized last frame. `fifo.read` returns None
+                # when fewer than the requested samples remain.
+                while fifo.samples >= frame_size:
+                    chunk = fifo.read(frame_size)
+                    if chunk is None:
+                        break
+                    chunk.pts = None
+                    for packet in out_stream.encode(chunk):
+                        out_container.mux(packet)
+                if final:
+                    # The true last frame: everything still buffered (< frame_size).
+                    tail = fifo.read()
+                    if tail is not None:
+                        tail.pts = None
+                        for packet in out_stream.encode(tail):
+                            out_container.mux(packet)
 
             for frame in in_container.decode(in_stream):
                 decoded_frames += 1
                 try:
                     frame.pts = None
+                    try:
+                        resampled = resampler.resample(frame)
+                    except ValueError:
+                        # The input layout/format changed under the resampler (the
+                        # desync tail). Before discarding the OLD resampler, FLUSH
+                        # its buffered conversion state into the FIFO (BUG 3:
+                        # dereferencing it without a `resample(None)` silently
+                        # loses whatever samples it had buffered — audio the floor
+                        # would never see, because the frame is neither encoded
+                        # short nor skip-counted). Then rebuild for the NEW input
+                        # shape and retry the SAME frame — never drop it. If the
+                        # retry still fails, the outer except counts it as one
+                        # skipped frame.
+                        try:
+                            for old_frame in resampler.resample(None):
+                                old_frame.pts = None
+                                fifo.write(old_frame)
+                        except Exception:  # noqa: BLE001 — a flush hiccup is not fatal
+                            pass
+                        resampler = _new_resampler()
+                        resampled = resampler.resample(frame)
                     # resample() returns a LIST of frames (it may split/merge).
-                    for r_frame in resampler.resample(frame):
-                        for packet in out_stream.encode(r_frame):
-                            out_container.mux(packet)
-                    # Count the INPUT frame as encoded once its resampled output
-                    # was muxed without error — so encoded_frames vs
-                    # decoded_frames is an apples-to-apples completeness ratio,
-                    # not inflated by the resampler splitting one frame into many.
+                    # Feed each into the FIFO; the FIFO owns the chunking so the
+                    # encoder only ever sees frame_size-sized input.
+                    for r_frame in resampled:
+                        r_frame.pts = None
+                        fifo.write(r_frame)
+                    _drain_fifo(final=False)
                     encoded_frames += 1
                 except Exception:  # noqa: BLE001 — skip ONE bad frame, not the file
                     skipped_frames += 1
                     continue
-            # Drain any samples the resampler is still buffering, then flush the
-            # encoder tail. Both are wrapped so a tail hiccup cannot lose the
-            # frames already muxed.
+            # Drain the resampler's own tail into the FIFO, then flush the FIFO
+            # (including the final short frame) and the encoder. Each stage is
+            # wrapped so a tail hiccup cannot lose the frames already muxed.
             try:
                 for r_frame in resampler.resample(None):
-                    for packet in out_stream.encode(r_frame):
-                        out_container.mux(packet)
+                    r_frame.pts = None
+                    fifo.write(r_frame)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                _drain_fifo(final=True)
             except Exception:  # noqa: BLE001
                 pass
             try:
@@ -245,6 +326,11 @@ async def _default_transcode(ogg_path: Path, mp3_path: Path) -> None:
         # one — and delete the intact OGG that still holds all of it. So fail the
         # transcode when the skipped fraction exceeds the floor, forcing the OGG
         # fallback that preserves the COMPLETE raw audio.
+        #
+        # After the FIFO fix a normal desynced call skips ZERO frames (the
+        # desync is absorbed into the sample timeline, not dropped), so this
+        # floor now only trips on a genuinely-undecodable input — exactly the
+        # case where the raw-OGG fallback is the right answer.
         if decoded_frames > 0:
             skipped_fraction = skipped_frames / decoded_frames
             if skipped_fraction > _TRANSCODE_MAX_SKIPPED_FRACTION:
@@ -266,12 +352,22 @@ async def _default_upload(
     import. ``content_type`` is ``audio/mpeg`` for the normal MP3 and
     ``audio/ogg`` for the v114 raw-OGG fallback, so the declared Content-Type
     matches the bytes actually sent (the finalizer still sniffs the object's
-    container bytes and does not trust this header)."""
+    container bytes and does not trust this header).
+
+    ── v115 (2026-09-04): ``x-upsert: true`` ────────────────────────────────
+    The API now mints the signed upload URL with ``upsert:true`` so a retry or
+    the OGG fallback can OVERWRITE the key instead of colliding 409 with an
+    earlier insert. Supabase's own ``uploadToSignedUrl`` sends this header on the
+    PUT; the raw PUT here mirrors it so the write mode the token was minted for
+    is actually exercised. The object PATH is signed into the token — this header
+    only selects insert-vs-upsert, it cannot retarget the write."""
     import httpx  # noqa: PLC0415
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
         resp = await client.put(
-            upload_url, content=body, headers={"Content-Type": content_type},
+            upload_url,
+            content=body,
+            headers={"Content-Type": content_type, "x-upsert": "true"},
         )
         if resp.status_code >= 400:
             raise RuntimeError(f"upload_failed_status_{resp.status_code}")

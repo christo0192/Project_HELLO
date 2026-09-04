@@ -232,12 +232,13 @@ def _record_turn_metrics(item: Any, channel: str) -> None:
         )
 
 
-def _record_provider_metrics(event: Any) -> None:
+def _record_provider_metrics(event: Any, channel: str | None = None) -> None:
     """Log bounded provider timings emitted by LiveKit Agents, when available.
 
     Field names differ slightly across SDK versions, so this function probes a
     small allowlist and never logs transcript, room, candidate, request IDs, or
-    raw provider payloads.
+    raw provider payloads. ``channel`` (e.g. "phone") is a content-free label
+    used only to scope the phone prompt-cache observability below.
     """
     metric = getattr(event, "metrics", event)
     component = _provider_metric_component(metric)
@@ -287,6 +288,41 @@ def _record_provider_metrics(event: Any) -> None:
             schema=component,
             duration_sec=round(cached, 0),
         )
+    # PHONE ONLY (Sarvam swap): Sarvam has a cached-input price but NO cache API,
+    # so caching is AUTOMATIC server-side prefix caching (like DeepSeek). The
+    # large static screener system prompt is a byte-identical STABLE PREFIX every
+    # turn (persona + résumé facts + flow set ONCE in the Agent constructor;
+    # per-turn bits are appended AFTER as developer messages, never mutating the
+    # prefix), so this taps the LiveKit plugin's surfaced usage — the base
+    # LLMStream copies ``usage.prompt_tokens_details.cached_tokens`` into
+    # ``prompt_cached_tokens`` on the LLM metric — and emits cached-vs-total
+    # prompt tokens so caching can be VERIFIED post-deploy. Content-free counts
+    # only. Scoped to the phone channel's LLM component.
+    if channel == "phone" and component == "llm":
+        prompt_total = _provider_metric_number(
+            metric, "prompt_tokens", "input_tokens", "total_prompt_tokens",
+        )
+        if cached is not None or prompt_total is not None:
+            cached_int = int(cached) if cached is not None else 0
+            total_int = int(prompt_total) if prompt_total is not None else 0
+            # The structured logger allowlists meta keys (only `duration_sec` and
+            # `turn_index` are numeric), so the counts ride those existing fields:
+            # cached prompt tokens on `duration_sec`, total prompt tokens on
+            # `turn_index`. One content-free line per turn; verifiable post-deploy
+            # by reading error_type="voice_phone_llm_cache".
+            _log.info(
+                "unknown_event",
+                error_type="voice_phone_llm_cache",
+                schema="prompt_cache",
+                duration_sec=round(float(cached_int), 0),
+                turn_index=total_int,
+            )
+            _safe_emit(
+                histogram_metric,
+                "voice_phone_llm_cache_ratio",
+                ((cached_int / total_int) if total_int else 0.0),
+                {"channel": "phone", "schema": "prompt_cache"},
+            )
 
 
 def _emit_phone_latency_segment(schema: str, duration: float) -> None:
@@ -1469,8 +1505,14 @@ def _build_provider_session(
         ),
         llm=openai.LLM(
             model=phone.phone_primary_model() if phone_mode else GEMINI_MODEL,
-            api_key=os.getenv("GEMINI_API_KEY"),
-            base_url=GEMINI_BASE_URL,
+            # PHONE ONLY (Sarvam swap): the phone interviewer speaks through
+            # Sarvam's OpenAI-compatible chat API — its base_url + key come from
+            # the phone-only readers so the browser/WebRTC lane is byte-for-byte
+            # untouched (still GEMINI_API_KEY + GEMINI_BASE_URL below). ROLLBACK:
+            # set PHONE_LLM_BASE_URL back to the Gemini URL + PHONE_PRIMARY_MODEL
+            # to a gemini model to fully revert.
+            api_key=(phone.phone_llm_api_key() if phone_mode else os.getenv("GEMINI_API_KEY")),
+            base_url=(phone.phone_llm_base_url() if phone_mode else GEMINI_BASE_URL),
             # PHONE ONLY: bounded sampling for stable-but-creative turns. The
             # browser/WebRTC path keeps the provider default so its sha-pinned
             # behaviour is untouched. v114: LOWERED 0.9 -> 0.6 — the live call's
@@ -1478,7 +1520,24 @@ def _build_provider_session(
             # total sense"), and a lower temperature reduces that hallucination
             # on the conflict path while keeping natural, non-repetitive phrasing
             # (the deterministic coverage judge stays at temperature=0).
-            **({"temperature": 0.6} if phone_mode else {}),
+            #
+            # PHONE ONLY (Sarvam swap): DISABLE reasoning on EVERY request.
+            # sarvam-105b-conversations has reasoning ON by default at "low", and
+            # the streamed reasoning_content bills as completion tokens and emits
+            # dead-air BEFORE speech (the exact v115 phone latency complaint).
+            # The LiveKit openai plugin forwards this constructor kwarg to
+            # chat.completions.create only when it `is_given` — and is_given(None)
+            # is True (None is not the NOT_GIVEN sentinel) — so passing None
+            # sends reasoning_effort=null on every turn. It must be EXPLICIT here
+            # because _supports_reasoning_effort() is False for a sarvam model, so
+            # the plugin would otherwise never send the field and Sarvam's
+            # server-side default ("low") would re-enable the dead-air. The
+            # browser branch omits the kwarg entirely, preserving its pinned
+            # behaviour.
+            **(
+                {"temperature": 0.6, "reasoning_effort": None}
+                if phone_mode else {}
+            ),
         ),
         **session_options,
     )
@@ -1489,7 +1548,10 @@ def _build_provider_session(
     # logs timings and component names only — never transcript, room or IDs.
     @session.on("metrics_collected")
     def _on_phone_metrics_collected(event):  # noqa: ANN001
-        _record_provider_metrics(event)
+        # PHONE ONLY (Sarvam swap): pass the phone channel so the prompt-cache
+        # observability (voice_phone_llm_cache) is emitted only for this lane.
+        # The browser/WebRTC lane is unaffected — it never labels the channel.
+        _record_provider_metrics(event, channel="phone" if phone_mode else None)
 
     return session
 
@@ -1768,8 +1830,16 @@ async def _run_native_phone_screening(
     # may be asked in the immediate reply and become reply-pending only after
     # that exact speech sequence completes cleanly.
     pending_conflict: dict[str, Any] = {"value": None}  # compatibility/test seam; never late-injected
-    conflict_reply_pending: dict[str, Any] = {"value": False, "conflict": None, "repursued": False}
+    conflict_reply_pending: dict[str, Any] = {
+        "value": False, "conflict": None, "repursued": False, "armed_turn": None,
+    }
     conflict_delivery: dict[str, Any] = {"sequence": None, "key": None}
+    # B1 round 2 (v115 live): a monotonic count of candidate turns seen by the
+    # turn hook. The ASYNC coverage judge stamps this when it arms a bounded
+    # conflict re-pursuit so the arm can be dropped if the candidate has already
+    # moved on (freshness bound), preserving the anti-stale-clarification
+    # invariant the ~3029-3038 comment protects.
+    native_turn_seq: list[int] = [0]
     asked_conflicts: set[str] = set()
     active_exchange: dict[str, Any] | None = None
     compensation_slots: dict[str, str] = {}
@@ -1915,6 +1985,19 @@ async def _run_native_phone_screening(
 
     silence_task = asyncio.create_task(native_silence_loop())
 
+    def _uncount_continuation_fragment() -> None:
+        """Roll back the logical-turn tick for a swallowed continuation final.
+
+        B1 round 2 freshness bound counts LOGICAL candidate turns. The turn hook
+        increments once per entry, but a coalesced STT fragment or a
+        predates-question final is NOT a new logical turn — it is part of the
+        same answer. Rolling the counter back here keeps a fragmented follow-up
+        from being seen as ">1 turn elapsed" and dropping a valid async-armed
+        re-pursuit. Clamped at 0 so it can never go negative.
+        """
+        if native_turn_seq[0] > 0:
+            native_turn_seq[0] -= 1
+
     def add_turn_instruction(turn_ctx: Any, text: str) -> None:
         """Add an instruction only to the SDK's temporary context for this reply."""
         add_message = getattr(turn_ctx, "add_message", None)
@@ -1947,6 +2030,24 @@ async def _run_native_phone_screening(
             "conflict": dict(conflict) if isinstance(conflict, dict) else None,
         })
 
+    def _arm_conflict_reply_pending(conflict: Any, *, armed_turn: int | None) -> None:
+        """The ONLY writer that arms `conflict_reply_pending` — one shape, both
+        callers (sync `on_reply_delivered`, async coverage judge).
+
+        BUG 2 fix: `armed_turn` is ALWAYS written explicitly — ``None`` for the
+        SYNChronous probe arm (never subject to the freshness drop) and the
+        candidate-turn stamp for the ASYNC arm. Setting it unconditionally means
+        a stamp from a prior async arm can never LEAK into a later sync arm (which
+        would wrongly drop a sync re-pursuit as stale), and the reverse clobber
+        of a live sync arm by a later async arm is now an explicit, single-writer
+        decision rather than a silent field drift.
+        """
+        conflict_reply_pending["value"] = True
+        conflict_reply_pending["conflict"] = (
+            dict(conflict) if isinstance(conflict, dict) else None
+        )
+        conflict_reply_pending["armed_turn"] = armed_turn
+
     def _consume_conflict_reply(turn_ctx: Any, text: str) -> bool:
         """Consume the pending conflict-probe reply; True when the ONE
         permitted re-pursuit took the turn. Every mutation of
@@ -1955,6 +2056,22 @@ async def _run_native_phone_screening(
         conflict_reply_pending["value"] = False
         probe_conflict = conflict_reply_pending.get("conflict")
         conflict_reply_pending["conflict"] = None
+        # B1 round 2 FRESHNESS BOUND: an ASYNC-armed re-pursuit carries a
+        # non-None `armed_turn` stamp (written by the single arming writer). It is
+        # valid ONLY on the immediate next candidate turn (armed_turn + 1). If the
+        # candidate has already moved on (>= 2 LOGICAL turns since detection), DROP
+        # it silently — firing a stale probe is exactly the anti-stale-
+        # clarification defect the ~3029-3038 comment guards against. The
+        # SYNChronous arm carries armed_turn=None and is never subject to this
+        # drop. Read-then-clear so the stamp cannot outlive one consumption.
+        armed_turn = conflict_reply_pending.get("armed_turn")
+        conflict_reply_pending["armed_turn"] = None
+        if armed_turn is not None and native_turn_seq[0] - armed_turn > 1:
+            _log.info(
+                "unknown_event", error_type="phone_coverage_conflict",
+                error_category="repursuit_dropped_stale",
+            )
+            return False
         return _begin_conflict_repursuit(turn_ctx, text, probe_conflict)
 
     def _begin_conflict_repursuit(
@@ -2025,6 +2142,16 @@ async def _run_native_phone_screening(
         # content-free (no transcript touched), and it never mutates the
         # ChatContext. The stamp is a plain assignment so it cannot fail the
         # routing below.
+        # B1 round 2: count LOGICAL candidate turns so the async judge's
+        # re-pursuit arm can enforce its freshness bound (fire only on the
+        # IMMEDIATE next turn). Incremented once per hook entry, but ROLLED BACK
+        # on the continuation-fragment exits below (coalesce / predates-question
+        # StopResponse) so a single logical answer that STT splits into several
+        # finals counts ONCE, not per fragment — otherwise a fragmented follow-up
+        # would trip `native_turn_seq - armed_turn > 1` and drop a VALID
+        # re-pursuit as stale (kills B1 on any fragmented answer, common on
+        # phone). See `_uncount_continuation_fragment`.
+        native_turn_seq[0] += 1
         callback_mono = _monotonic()
         callback_wall = time.time()
         if endpoint_delay_eou is not None:
@@ -2383,6 +2510,9 @@ async def _run_native_phone_screening(
         # Completion was already classified before Q&A/closing above. Reaching
         # here means this is substantive under the same phone-only gate.
         if _native_turn_predates_question(message, latest_assistant_anchor[0]):
+            # A final that predates the current question is not a new logical
+            # turn; roll back the freshness tick (BUG 1).
+            _uncount_continuation_fragment()
             from livekit.agents import StopResponse  # noqa: PLC0415
             raise StopResponse()
         # Route split finals BEFORE conflict/clarification state. A second
@@ -2446,6 +2576,11 @@ async def _run_native_phone_screening(
                 "unknown_event", error_type="phone_turn_fragment",
                 error_category="continuation_before_first_audio_coalesced",
             )
+            # A coalesced continuation fragment is part of the SAME logical
+            # answer, whichever way it exits below — roll back the freshness tick
+            # for both the conflict-rerouted return and the trailing StopResponse
+            # (BUG 1). Done once here since both exits are continuations.
+            _uncount_continuation_fragment()
             if conflict_rerouted:
                 return
             # FIX 1: this fragment was coalesced and `on_user_turn_completed` will
@@ -3045,6 +3180,32 @@ async def _run_native_phone_screening(
                 "unknown_event", error_type="phone_coverage_conflict",
                 error_category="assessment_only_expired",
             )
+            # B1 round 2 (owner-approved, v115 live): the async judge is the ONLY
+            # thing that finds this conflict, and it used to ONLY log — the
+            # synchronous re-pursuit machinery (conflict_reply_pending) was never
+            # armed, so a real conflict never drove a verbal re-pursuit. Arm a
+            # BOUNDED re-pursuit here without adding ANY per-turn latency (this
+            # runs off the speech path). Bounds, ALL required:
+            #   1. ONCE per call — the `repursued` latch in _begin_conflict_
+            #      repursuit still gates the actual fire; do not re-arm if it has
+            #      already fired.
+            #   2. FRESH ONLY — stamp the current candidate-turn count so the
+            #      arm is honored solely on the IMMEDIATE next turn; a stale probe
+            #      after the candidate moved on is dropped (see the consume-side
+            #      freshness guard). This is exactly the anti-stale-clarification
+            #      invariant this comment block protects.
+            #   3. NEVER block the turn — a plain assignment, no await.
+            # The immediate next candidate turn routes into _consume_conflict_
+            # reply -> _begin_conflict_repursuit -> the deterministic re-assertion
+            # (phone_conflict_repursuit_instruction + PR #227 anti-endorsement).
+            if not conflict_reply_pending.get("repursued"):
+                # ASYNC arm through the single writer, stamped with the current
+                # LOGICAL candidate-turn count so the freshness bound fires it
+                # only on the immediate next turn (BUG 2: one writer owns the
+                # armed_turn field for both arm paths).
+                _arm_conflict_reply_pending(
+                    verdict.conflict, armed_turn=native_turn_seq[0],
+                )
 
     async def native_say(text: str) -> None:
         speech = session.say(text, allow_interruptions=True)
@@ -3232,11 +3393,15 @@ async def _run_native_phone_screening(
                 conflict_delivery.update({"sequence": None, "key": None, "conflict": None})
             return
         if delivered_seq == conflict_seq and conflict_delivery.get("key") is not None:
-            conflict_reply_pending["value"] = True
-            # Carry the detected finding across to the reply turn so the ONE
-            # permitted re-pursuit (F7) can name the gap if the candidate
-            # deflects. Cleared on consumption; never persisted or logged.
-            conflict_reply_pending["conflict"] = conflict_delivery.get("conflict")
+            # SYNChronous arm: carry the detected finding across to the reply turn
+            # so the ONE permitted re-pursuit (F7) can name the gap if the
+            # candidate deflects. Routed through the single writer with
+            # armed_turn=None so it is NEVER dropped by the freshness bound and a
+            # residual async stamp cannot leak in (BUG 2). Cleared on consumption;
+            # never persisted or logged.
+            _arm_conflict_reply_pending(
+                conflict_delivery.get("conflict"), armed_turn=None,
+            )
             conflict_delivery.update({"sequence": None, "key": None, "conflict": None})
         if reason is None:
             await prime_preemptive_objective(state.question_at(cursor + 1))
@@ -3284,6 +3449,10 @@ async def _run_native_phone_screening(
     setattr(agent, "_pending_conflict", pending_conflict)
     setattr(agent, "_conflict_reply_pending", conflict_reply_pending)
     setattr(agent, "_asked_conflicts", asked_conflicts)
+    # B1 round 2 test seam (same idiom as `_conflict_reply_pending`): the
+    # LOGICAL candidate-turn counter the freshness bound reads, so a test can
+    # prove a coalesced continuation fragment does NOT advance it.
+    setattr(agent, "_native_turn_seq", native_turn_seq)
     setattr(agent, "_closing_state_machine", closing)
     setattr(agent, "_native_finished", finished)
     setattr(agent, "_native_terminal_reason", terminal_reason)
