@@ -4340,6 +4340,44 @@ class TestPhoneRoleGrounding(unittest.TestCase):
         self.assertNotIn("Role-title grounding", browser)
 
 
+class TestPhoneTtsDeliveryGuidance(unittest.TestCase):
+    """The NATURAL SPOKEN DELIVERY block (fillers/pauses tuning for Sarvam
+    bulbul:v3). It must reach the PHONE Gemini system prompt and must NOT touch
+    the sha-pinned browser surface."""
+
+    def _state(self):
+        return phone.PhoneAssessmentState.parse(_plan_payload())
+
+    def test_constant_carries_the_delivery_guidance_and_guardrails(self):
+        t = phone.PHONE_TTS_DELIVERY_TEXT
+        self.assertIn("NATURAL SPOKEN DELIVERY", t)
+        # sparing fillers, not decorative
+        self.assertIn("SPARINGLY", t)
+        for filler in ('"um"', '"hmm"', '"right"'):
+            self.assertIn(filler, t)
+        # ellipsis discipline
+        self.assertIn("do NOT stack ellipses", t)
+        # the sensitive-moment guardrail (mirrors the no-humor rule)
+        self.assertIn("NEVER use a filler", t)
+        self.assertIn("consent", t)
+        self.assertIn("compensation", t)
+        self.assertIn("resume-discrepancy", t)
+
+    def test_it_reaches_the_phone_gemini_system_prompt(self):
+        # The delivery block must be in the text the phone lane hands the LLM,
+        # sitting with the other spoken-delivery guidance (after the emotion
+        # primer). Mutation guard: removing the assembly append fails this.
+        with patch.object(agent_mod, "system_prompt", return_value="BUILT"):
+            built = agent_mod._phone_instructions_text(self._state())
+        self.assertIn(phone.PHONE_TTS_DELIVERY_TEXT, built)
+        self.assertIn(phone.PHONE_TTS_EMOTION_TEXT, built)
+
+    def test_it_does_NOT_appear_in_the_browser_system_prompt(self):
+        browser = prompting.system_prompt(candidate_name="Asha", role_title="Advisor")
+        self.assertNotIn(phone.PHONE_TTS_DELIVERY_TEXT, browser)
+        self.assertNotIn("NATURAL SPOKEN DELIVERY", browser)
+
+
 # ── Number safety ─────────────────────────────────────────────────────
 
 class TestNumberNeverCarried(unittest.IsolatedAsyncioTestCase):

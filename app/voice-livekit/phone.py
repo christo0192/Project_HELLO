@@ -2389,6 +2389,29 @@ PHONE_TTS_EMOTION_TEXT = (
 )
 
 
+#: NATURAL SPOKEN DELIVERY (extra) — Sarvam bulbul:v3 draws pacing and pauses
+#: from punctuation and spoken fillers, so a few, well-placed human touches make
+#: the narrowband phone voice sound like a person, not a reader. PHONE-ONLY:
+#: appended in `_phone_instructions_text` right after PHONE_TTS_EMOTION_TEXT,
+#: never in the sha-pinned browser prompt surface. Guardrails mirror the
+#: existing "no humor in sensitive moments" rule so a filler can never land in
+#: consent, compensation, a callback confirmation, or a resume-discrepancy probe.
+PHONE_TTS_DELIVERY_TEXT = (
+    "NATURAL SPOKEN DELIVERY (extra):\n"
+    "- Sprinkle in occasional, genuine fillers where a real recruiter would — a "
+    "light \"um\", \"hmm\", \"right\", \"you know\", \"I mean\" — but SPARINGLY, at "
+    "most once every few turns. They should feel unplanned, never decorative.\n"
+    "- Use commas for short pauses and full stops for a clean beat; reserve "
+    "\"...\" for a real moment of hesitation or empathy, and do NOT stack ellipses "
+    "across lines (it sounds choppy).\n"
+    "- NEVER use a filler or any lightness during the consent line, compensation, "
+    "callback confirmation, or a resume-discrepancy question — stay clean and "
+    "direct there.\n"
+    "- Keep each line short so the voice breathes naturally; one idea, then the "
+    "question.\n\n"
+)
+
+
 #: Lexical expressiveness + light professional humor (X10 Fix 4, T4 RCA). The
 #: PSTN 8 kHz band strips prosody and acoustic liveliness, so the phone must
 #: compensate LEXICALLY — the words carry the warmth the narrowband line drops.

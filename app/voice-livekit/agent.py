@@ -1230,7 +1230,7 @@ def _phone_instructions_text(state: "phone.PhoneAssessmentState") -> str:
     # speaking model writes expressive, well-punctuated lines the Sarvam voice can
     # render with tone. Prepended (not merged into the sha-pinned `system_prompt`),
     # so the browser prompt surface is byte-identical.
-    text = phone.PHONE_PERSONA_TEXT + phone.PHONE_TTS_EMOTION_TEXT + system_prompt(
+    text = phone.PHONE_PERSONA_TEXT + phone.PHONE_TTS_EMOTION_TEXT + phone.PHONE_TTS_DELIVERY_TEXT + system_prompt(
         candidate_name=state.candidate_name,
         role_title=state.role_title,
         role_focus=(state.role_focus or ", ".join(state.role_required_skills))[:600],
