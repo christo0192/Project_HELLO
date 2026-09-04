@@ -1875,6 +1875,12 @@ PHONE_ASSESSMENT_CLOSING_TEXT = (
 PHONE_CANDIDATE_END_TEXT = (
     "Of course. I'll end the call now. Thanks for your time. Goodbye."
 )
+#: FIX 2 (barge-in recovery): spoken when the candidate speaks again after the
+#: bot's turn was interrupted and there is NO planned question at the cursor
+#: (post-plan Q&A / wind-down) — a bare "hello" after an interrupt must never be
+#: met with silence. Named (not an inline literal) so the snapshot and the
+#: authorized objective cannot drift, matching the sibling canned lines.
+PHONE_POST_INTERRUPT_ACK_TEXT = "I'm still here — please go ahead."
 #: The terminal, warm acknowledgment for a "call me back later" request. This
 #: PR DE-LOOPS the callback route: the bot no longer proposes/confirms/books a
 #: time in-call (that handshake looped). It simply acknowledges warmly, tells

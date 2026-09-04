@@ -6514,6 +6514,266 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("await phone.judge_phone_coverage", turn_source)
 
 
+class TestPhoneTurnTakingRound2(unittest.IsolatedAsyncioTestCase):
+    """Round-2 call-quality fixes (live 2026-09-03, session ec9bd898, v112).
+
+    FIX 1 — the first-audio watchdog must re-arm when a fragment is coalesced,
+            so its 4.0 s deadline measures the bot's think time, never the
+            candidate's inter-fragment pause.
+    FIX 2 — a follow-up after an INTERRUPTED bot turn must be re-asked, never
+            swallowed into silence by the coalescing block.
+    FIX 3 — the headline latency metric is anchored on true end-of-speech.
+    """
+
+    @staticmethod
+    def _state():
+        return _default_state(questions=[
+            {"key": "k1", "text": "Tell me about your recent role.", "mandatory": True, "hint": None},
+            {"key": "k2", "text": "What is your notice period?", "mandatory": True, "hint": None},
+        ])
+
+    @staticmethod
+    async def _drain(predicate, tries=300):
+        for _ in range(tries):
+            await asyncio.sleep(0.01)
+            if predicate():
+                return True
+        return False
+
+    async def _coordinator(self):
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless", state=self._state(), coverage_judge_enabled=False,
+        )
+        hooks["latest_assistant"][0] = "Tell me about your recent role."
+        hooks["latest_assistant_anchor"][0] = 1
+        hooks["assistant_delivery_complete"].set()
+        return agent, session, state, client, hooks
+
+    @staticmethod
+    async def _turn(hooks, text):
+        ctx = types.SimpleNamespace(items=[])
+        await hooks["on_native_turn"](
+            text, types.SimpleNamespace(text_content=text), ctx,
+        )
+        return ctx
+
+    async def _close(self, hooks):
+        hooks["close_event"].set()
+        await hooks["drive_terminal"]()
+
+    # ── FIX 1 ────────────────────────────────────────────────────────────
+    async def test_coalesced_fragment_rearms_watchdog_no_fallback_during_pause(self):
+        """A fragmented answer with a >deadline inter-fragment pause must NOT
+        fire `no_first_audio` / speak a deterministic fallback while the
+        candidate is still talking.
+
+        The first fragment arms the watchdog; before its deadline the SECOND
+        fragment is coalesced, which restarts the deadline (rearm_only). With a
+        short deadline we then sleep PAST what the ORIGINAL arm would have been,
+        and prove nothing was spoken and no `no_first_audio` fired — i.e. the
+        clock genuinely restarted from the latest fragment rather than counting
+        through the pause.
+        """
+        agent, session, _, _, hooks = await self._coordinator()
+        before_spoken = len(session.spoken)
+        gen_before_arm = agent._expected_reply_generation_snapshot()
+        with patch.object(agent_mod, "PHONE_SPEECH_FIRST_AUDIO_TIMEOUT_SEC", 0.12):
+            # First fragment returns normally (creates the active_exchange), then
+            # the reply is created & starts streaming (no audio yet), and the
+            # watchdog is armed — exactly as phone.on_user_turn_completed does.
+            # Clear assistant_delivery_complete so the background commit BLOCKS on
+            # first audio (the merge window), mirroring a reply mid-stream: the
+            # cursor must NOT advance during the candidate's pause or the coalesce
+            # guard's `expected_index == cursor` would spuriously miss.
+            await self._turn(hooks, "My name is Gaurav who worked in sales")
+            hooks["assistant_delivery_complete"].clear()
+            hooks["reply_started"].set()
+            hooks["speech_first_audio"].clear()
+            hooks["reply_handle"][0] = _FakeSpeech()
+            await agent._on_reply_expected()
+            gen_after_first = agent._expected_reply_generation_snapshot()
+            # The candidate pauses, then continues with a SECOND fragment. This
+            # hits the coalescing block, which re-arms the deadline.
+            await asyncio.sleep(0.08)  # < 0.12: original deadline not yet due
+            hooks["reply_started"].set()
+            hooks["speech_first_audio"].clear()
+            hooks["reply_handle"][0] = _FakeSpeech()
+            with self.assertRaises(Exception):
+                # coalesced continuations raise StopResponse
+                await self._turn(
+                    hooks, "like tech companies such as Scaler and Great Learning",
+                )
+            gen_after_coalesce = agent._expected_reply_generation_snapshot()
+            # Sleep past the ORIGINAL deadline but within the RESTARTED one: if
+            # the clock had NOT restarted, the fallback would fire here.
+            await asyncio.sleep(0.09)  # 0.08 + 0.09 = 0.17 > 0.12 original
+            self.assertEqual(len(session.spoken), before_spoken,
+                             "a fallback was spoken during the candidate's pause")
+            # The model's real audio now arrives just after the pause.
+            hooks["speech_first_audio"].set()
+            await asyncio.sleep(0.06)
+        no_first_audio = [
+            c.kwargs.get("error_category")
+            for c in hooks["log"].warn.call_args_list
+            if c.kwargs.get("error_type") == "phone_speech_lifecycle"
+        ]
+        self.assertNotIn("no_first_audio", no_first_audio)
+        self.assertEqual(len(session.spoken), before_spoken,
+                         "no fallback should ever be spoken on this path")
+        # rearm_only preserves the in-flight reply's generation correlation: the
+        # coalesce did NOT bump the generation (which would orphan the handle).
+        self.assertEqual(gen_after_first, gen_after_coalesce)
+        self.assertGreater(gen_after_first, gen_before_arm)
+        await self._close(hooks)
+
+    def test_rearm_only_preserves_generation_and_handle(self):
+        """Static proof: the rearm path must not bump the generation, re-arm the
+        controller generation, or null the handle — doing any of those would
+        orphan an in-flight authorized reply's sequence correlation."""
+        source = inspect.getsource(agent_mod._run_native_phone_screening)
+        arm = source[source.index("async def on_reply_expected"):
+                     source.index("async def on_reply_delivered")]
+        self.assertIn("rearm_only", arm)
+        # The generation bump, controller re-arm, and handle null all live in the
+        # `else` (full-arm) branch, never on the rearm-only path. Slice ONLY the
+        # `if rearm_only:` body (up to the `else:`).
+        rearm_body = arm[arm.index("if rearm_only:"):arm.index("        else:")]
+        self.assertNotIn("expected_reply_generation[0] += 1", rearm_body)
+        self.assertNotIn("reply_handle[0] = None", rearm_body)
+        self.assertNotIn("arm_generation(generation)", rearm_body)
+        self.assertIn("generation = expected_reply_generation[0]", rearm_body)
+        # And the coalesce site calls it in rearm-only mode before StopResponse.
+        turn = source[source.index("async def on_native_turn"):source.index("async def on_probe")]
+        self.assertIn("on_reply_expected(rearm_only=True)", turn)
+
+    # ── FIX 2 ────────────────────────────────────────────────────────────
+    async def test_followup_after_interrupt_gets_a_reask_not_silence(self):
+        """After a barge-in, a short follow-up ("hello") must GENERATE a re-ask
+        (instruction injected / snapshot set), never be coalesced into silence."""
+        agent, session, state, client, hooks = await self._coordinator()
+        # Run a REAL first turn so `active_exchange` is populated with
+        # expected_index == cursor — i.e. the coalescing block is a genuinely
+        # competing path. (Clear assistant_delivery_complete so the background
+        # commit blocks and the cursor does not advance out from under the
+        # coalesce guard.) Without the interrupt flag, the follow-up below WOULD
+        # be swallowed by that block — the mutation test proves it.
+        await self._turn(hooks, "I led operations for four years at a startup")
+        hooks["assistant_delivery_complete"].clear()
+        # Model a bot turn that was INTERRUPTED mid-playout: reply started, no
+        # first audio, and the interrupt latch set exactly as `mark_delivered`
+        # does in its interrupted branch.
+        hooks["reply_started"].set()
+        hooks["speech_first_audio"].clear()
+        hooks["reply_handle"][0] = _FakeSpeech(interrupted=True)
+        agent._prior_turn_interrupted_snapshot()["value"] = True
+        # Clear the authorized objective so the assertion below proves the
+        # recovery ITSELF authorized a reply — reverting the load-bearing
+        # `authorize_generated_reply` call (keeping the pre-existing
+        # add_turn_instruction) must fail this test (review find R2a).
+        agent._generation_objective = None
+        # A bare connectivity follow-up arrives. It must NOT be swallowed.
+        ctx = await self._turn(hooks, "Hello")
+        rendered = str(ctx.items).lower()
+        self.assertIn("interrupted", rendered,
+                      "the follow-up after an interrupt must trigger the re-ask")
+        self.assertIn("ask that same topic again", rendered)
+        # The re-ask must be AUTHORIZED (not merely instructed) or the
+        # one-question validator can drop it, leaving the silence FIX 2 fixes.
+        self.assertIsNotNone(agent._generation_objective,
+                             "the interrupted re-ask must authorize a reply")
+        # The interrupt latch is cleared once its owed re-ask has been issued.
+        self.assertFalse(agent._prior_turn_interrupted_snapshot()["value"])
+        # No coalesced-fragment swallow was logged for this turn.
+        coalesced = [
+            c.kwargs.get("error_category")
+            for c in hooks["log"].info.call_args_list
+            if c.kwargs.get("error_type") == "phone_turn_fragment"
+        ]
+        self.assertNotIn("continuation_before_first_audio_coalesced", coalesced)
+        await self._close(hooks)
+
+    def test_post_interrupt_ack_uses_the_named_constant_not_an_inline_literal(self):
+        """FIX 2 else-branch (review find R2b): the post-interrupt reassurance
+        (spoken when no planned question remains) must reference the NAMED
+        constant so the snapshot and authorized objective cannot drift. The
+        branch itself is defensive (the QNA/closing states normally intercept a
+        question-is-None turn first), so this pins the constant usage at the
+        call site rather than driving the hard-to-reach full-flow state."""
+        src = inspect.getsource(agent_mod._run_native_phone_screening)
+        self.assertIn("phone.PHONE_POST_INTERRUPT_ACK_TEXT", src)
+        self.assertNotIn('"I\'m still here', src,
+                         "the ack line must be the named constant, not an inline literal")
+        # And the constant is what we expect (pins the copy).
+        self.assertEqual(phone.PHONE_POST_INTERRUPT_ACK_TEXT, "I'm still here — please go ahead.")
+
+    async def test_normal_split_final_still_coalesces_when_not_interrupted(self):
+        """Regression guard for FIX 2: a genuine mid-answer fragment (reply
+        streaming, NOT interrupted) must still coalesce via StopResponse — the
+        interrupt gate must not break normal split-final behaviour."""
+        agent, session, _, _, hooks = await self._coordinator()
+        await self._turn(hooks, "I have around two years of experience")
+        # Streaming, no first audio, NOT interrupted (fresh clean handle).
+        hooks["reply_started"].set()
+        hooks["speech_first_audio"].clear()
+        hooks["reply_handle"][0] = _FakeSpeech()
+        self.assertFalse(agent._prior_turn_interrupted_snapshot()["value"])
+        with self.assertRaises(Exception):
+            await self._turn(hooks, "at upGrad as a program advisor")
+        coalesced = [
+            c.kwargs.get("error_category")
+            for c in hooks["log"].info.call_args_list
+            if c.kwargs.get("error_type") == "phone_turn_fragment"
+        ]
+        self.assertIn("continuation_before_first_audio_coalesced", coalesced)
+        await self._close(hooks)
+
+    # ── FIX 3 ────────────────────────────────────────────────────────────
+    def test_headline_latency_is_anchored_on_local_vad_end(self):
+        """The headline metric measures true end-of-speech -> bot audio, is
+        content-free, and drops a negative/clock-skewed delta."""
+        with patch.object(agent_mod, "histogram_metric") as hist, \
+             patch.object(agent_mod._log, "info") as log_info:
+            # local VAD end at t=100.000, bot audio at t=100.393 => 0.393 s
+            agent_mod._emit_phone_headline_latency(100.000, 100.393)
+        self.assertEqual(hist.call_count, 1)
+        name, value = hist.call_args.args[0], hist.call_args.args[1]
+        labels = hist.call_args.args[2] if len(hist.call_args.args) > 2 else hist.call_args.kwargs.get("labels")
+        self.assertEqual(name, "voice_phone_headline_latency_sec")
+        self.assertAlmostEqual(value, 0.393, places=3)
+        self.assertEqual(labels.get("channel"), "phone")
+        self.assertEqual(labels.get("schema"), "candidate_speech_end_to_bot_audio")
+        self.assertEqual(log_info.call_count, 1)
+        _, kwargs = log_info.call_args
+        self.assertEqual(kwargs.get("error_type"), "voice_phone_headline_latency")
+        self.assertAlmostEqual(kwargs.get("duration_sec"), 0.393, places=3)
+        # Content-free: the ONLY dynamic value is the duration. (The fixed schema
+        # label legitimately contains the word "candidate"; PII would appear as a
+        # transcript/room/attempt value, so those are the banned tokens.)
+        self.assertNotIn("text_content", repr(log_info.call_args_list))
+        for key in kwargs:
+            self.assertIn(key, {"error_type", "schema", "duration_sec"})
+
+    def test_headline_latency_drops_negative_and_nonfinite(self):
+        with patch.object(agent_mod, "histogram_metric") as hist, \
+             patch.object(agent_mod._log, "info") as log_info:
+            agent_mod._emit_phone_headline_latency(200.0, 199.5)  # skew
+            agent_mod._emit_phone_headline_latency(1.0, float("inf"))  # nonfinite
+            agent_mod._emit_phone_headline_latency(0.0, 500.0)  # > 120 s bound
+        self.assertEqual(hist.call_count, 0)
+        self.assertEqual(log_info.call_count, 0)
+
+    def test_headline_metric_is_emitted_alongside_the_legacy_segment(self):
+        """The legacy speech_end_* segments stay (back-compat) AND the headline
+        metric is emitted from the same local-VAD anchor at first audio."""
+        source = inspect.getsource(agent_mod._run_phone_session)
+        block = source[source.index("local_vad_end_wall = latency_state.get"):
+                       source.index('latency_state["speech_created_mono"] = None')]
+        self.assertIn("local_vad_end_to_first_audio", block)  # legacy segment kept
+        self.assertIn("_emit_phone_headline_latency(local_vad_end_wall, first_audio_wall)", block)
+        # speech_end_to_first_audio (the pause-inflated segment) is still emitted.
+        self.assertIn("speech_end_to_first_audio", source)
+
+
 class TestSilentRoomKillGuard(unittest.IsolatedAsyncioTestCase):
     """PR-1 (F0a/F0b/F0c/F4): the worker must not delete a live room silently.
 
