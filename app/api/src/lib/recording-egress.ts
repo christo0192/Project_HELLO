@@ -417,6 +417,34 @@ export function isWorkerInbandEgressId(egressId: string): boolean {
 }
 
 /**
+ * Sniff the AUDIO container of a worker-uploaded object from its leading magic
+ * bytes, so the finalizer records the recording's REAL content type instead of
+ * assuming MP3.
+ *
+ * WHY (live v114, 2026-09-04): the in-worker recorder normally uploads an MP3,
+ * but when the OGG→MP3 transcode dies on a sample/channel desync it now falls
+ * back to uploading the RAW OGG rather than losing the audio. The object key is
+ * the same `.mp3` key either way (the presigned URL is minted for one key), so
+ * the key is NOT a reliable type signal — the bytes are. An OGG file starts
+ * with the ASCII capture pattern `OggS`; anything else finalizes as `audio/mpeg`
+ * (MP3 has no single universal magic — `ID3` tags, or a `0xFF 0xEx/Fx` frame
+ * sync — so MP3 is the correct default, and an `audio/ogg` result is the
+ * QA-visible "this was the fallback, the transcode failed" marker). This reads
+ * the object's own bytes and trusts no client-declared header.
+ */
+export function sniffRecordingContentType(bytes: Buffer): 'audio/ogg' | 'audio/mpeg' {
+  // "OggS" — the Ogg page capture pattern at byte 0 of every Ogg stream.
+  if (
+    bytes.length >= 4
+    && bytes[0] === 0x4f && bytes[1] === 0x67
+    && bytes[2] === 0x67 && bytes[3] === 0x53
+  ) {
+    return 'audio/ogg';
+  }
+  return 'audio/mpeg';
+}
+
+/**
  * PR A — finalize a WORKER-INBAND recording.
  *
  * The worker already recorded the call, transcoded it to MP3, and PUT it to the
@@ -490,7 +518,6 @@ export async function finalizeWorkerInbandRecording(
   const manifestKey = typeof attempt.recording_manifest_key === 'string'
     ? attempt.recording_manifest_key
     : null;
-  const contentType = 'audio/mpeg';
 
   const { data: object, error: downloadError } = await db.storage
     .from(env.recordingsBucket)
@@ -502,6 +529,12 @@ export async function finalizeWorkerInbandRecording(
   // evidence (transient) → bounded deferral; an oversize object is a
   // DETERMINISTIC property of the bytes → latch to `failed`.
   if (bytes.length === 0) return defer('object_unreadable');
+  // v114 (2026-09-04): record the object's REAL container type. A clean upload
+  // is an MP3 (`audio/mpeg`); the worker's raw-OGG transcode-failure fallback
+  // is an `audio/ogg` object at the SAME `.mp3` key, so we sniff the bytes
+  // rather than assume. An `audio/ogg` worker_inband recording is the QA signal
+  // that the MP3 transcode failed but the audio was retained.
+  const contentType = sniffRecordingContentType(bytes);
   if (bytes.length > env.recordingMaxBytes) {
     await db.from('call_sessions')
       .update({ recording_egress_status: 'failed' })

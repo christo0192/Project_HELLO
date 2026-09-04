@@ -74,6 +74,18 @@ if not logger.handlers:
 _SAMPLE_RATE = 48_000
 _MP3_BITRATE_BPS = 64_000
 
+# The transcode COMPLETENESS FLOOR (adversarial-review MED, v114 2026-09-04).
+# Per-frame skip tolerance makes the encode robust to a handful of malformed
+# boundary frames at a channel desync — but if a desync corrupts MOST frames,
+# tolerating them yields a non-empty yet severely TRUNCATED MP3 that would pass
+# the `if not mp3_body` check, upload as a clean `audio/mpeg`, and let
+# _cleanup() delete the intact OGG — silently substituting partial audio for the
+# full raw recording the OGG fallback would have preserved. Partial-as-success
+# is worse than the fallback it skips. So the transcode FAILS (raises → OGG
+# fallback) when more than this fraction of decoded frames was skipped. A couple
+# of boundary frames out of hundreds is fine; losing a large slice is not.
+_TRANSCODE_MAX_SKIPPED_FRACTION = 0.02  # allow up to 2% skipped, fail beyond
+
 
 def recording_provider() -> str:
     """'worker' only when explicitly selected; anything else is 'egress'."""
@@ -82,18 +94,29 @@ def recording_provider() -> str:
 
 @dataclass(frozen=True)
 class RecordingManifest:
-    """What the worker reports back to the API after a successful upload."""
+    """What the worker reports back to the API after a successful upload.
+
+    ``content_type`` distinguishes a clean MP3 upload (``audio/mpeg``) from the
+    v114 raw-OGG FALLBACK (``audio/ogg``) that survives a transcode failure. It
+    is advisory to the worker's own logging — the server sniffs the object's
+    real container bytes at finalize time — but carrying it here keeps the
+    worker's report honest and lets a caller tell the two apart without a
+    re-download."""
 
     sha256: str
     size_bytes: int
     duration_ms: Optional[int]
+    content_type: str = "audio/mpeg"
 
 
 # Injected seams (real defaults below) so the lifecycle is unit-testable with no
 # livekit/PyAV/ffmpeg/network present.
 RecorderFactory = Callable[[Any, int], Any]
 TranscodeFn = Callable[[Path, Path], Awaitable[None]]
-UploadFn = Callable[[str, bytes], Awaitable[None]]
+# (upload_url, body, content_type) — content_type is "audio/mpeg" for the normal
+# MP3 and "audio/ogg" for the v114 raw-OGG fallback, so the PUT declares the
+# real Content-Type of whichever body survived.
+UploadFn = Callable[[str, bytes, str], Awaitable[None]]
 
 
 def _default_recorder_factory(session: Any, sample_rate: int) -> Any:
@@ -113,40 +136,142 @@ async def _default_transcode(ogg_path: Path, mp3_path: Path) -> None:
     dependency — RecorderIO itself encodes the OGG with it — and its wheel
     bundles ``libmp3lame``, so the MP3 encode needs no extra binary or image
     change. Runs in a thread so the encode never blocks the event loop.
+
+    ── WHY IT IS HARDENED (live v114, 2026-09-04) ──────────────────────────
+    A real call lost its recording to ``transcode_failed`` preceded by the
+    PyAV/librosa warning "Input is shorter by 46394 samples; silence has been
+    prepended to align". The two mixed channels (candidate=left, bot=right)
+    finished with mismatched sample counts, so a decoded frame arrived with an
+    unexpected shape/layout/rate and a SINGLE bad frame threw out of the whole
+    encode. Three hardening measures make the encode robust rather than
+    all-or-nothing:
+
+      1. An explicit ``av.AudioResampler`` coerces every decoded frame to the
+         OUTPUT stream's exact rate + layout + a valid packed sample format
+         (``s16p`` is what libmp3lame wants), so a short/mono/desynced frame is
+         normalized instead of tripping the encoder.
+      2. The per-frame decode→resample→encode step is wrapped so ONE malformed
+         frame is skipped (counted + logged), never aborting the encode — BUT a
+         COMPLETENESS FLOOR (see ``_TRANSCODE_MAX_SKIPPED_FRACTION``) fails the
+         whole transcode if too large a fraction was skipped, so a badly
+         truncated MP3 is never passed off as a success (it drops to the OGG
+         fallback instead, preserving the complete raw audio).
+      3. The layout is set explicitly (mono vs stereo), the encoder tail is
+         always flushed, and the caller verifies a non-empty MP3 — so the
+         function only "succeeds" when it actually produced (near-)complete audio.
     """
     def _run() -> None:
         import av  # noqa: PLC0415
+        from av.audio.resampler import AudioResampler  # noqa: PLC0415
 
         in_container = av.open(str(ogg_path))
         out_container = av.open(str(mp3_path), mode="w")
+        decoded_frames = 0
+        encoded_frames = 0
+        skipped_frames = 0
         try:
             in_stream = in_container.streams.audio[0]
-            out_stream = out_container.add_stream("libmp3lame", rate=in_stream.rate)
+            out_rate = in_stream.rate or _SAMPLE_RATE
+            out_stream = out_container.add_stream("libmp3lame", rate=out_rate)
             out_stream.bit_rate = _MP3_BITRATE_BPS
+            # Handle the mono-vs-stereo mismatch EXPLICITLY. The candidate|bot mix
+            # is stereo, but a degenerate/one-sided capture can be mono; pick the
+            # decoder's channel count and pin the encoder layout to match, so the
+            # resampler below has a definite target rather than an inferred one.
             try:
-                out_stream.layout = in_stream.layout  # preserve stereo (candidate|bot)
+                in_channels = len(in_stream.layout.channels)
+            except Exception:  # noqa: BLE001 — layout may be absent on odd inputs
+                in_channels = 2
+            out_layout = "stereo" if in_channels >= 2 else "mono"
+            try:
+                out_stream.layout = out_layout
             except Exception:  # noqa: BLE001 — some builds infer layout from frames
                 pass
+
+            # The desync-tolerant normalizer: coerce EVERY frame to the encoder's
+            # exact rate/layout/format. This is what turns "Input is shorter by N
+            # samples" (a fatal encode error at v114) into a silently-aligned
+            # frame the encoder accepts.
+            resampler = AudioResampler(format="s16p", layout=out_layout, rate=out_rate)
+
             for frame in in_container.decode(in_stream):
-                frame.pts = None
-                for packet in out_stream.encode(frame):
+                decoded_frames += 1
+                try:
+                    frame.pts = None
+                    # resample() returns a LIST of frames (it may split/merge).
+                    for r_frame in resampler.resample(frame):
+                        for packet in out_stream.encode(r_frame):
+                            out_container.mux(packet)
+                    # Count the INPUT frame as encoded once its resampled output
+                    # was muxed without error — so encoded_frames vs
+                    # decoded_frames is an apples-to-apples completeness ratio,
+                    # not inflated by the resampler splitting one frame into many.
+                    encoded_frames += 1
+                except Exception:  # noqa: BLE001 — skip ONE bad frame, not the file
+                    skipped_frames += 1
+                    continue
+            # Drain any samples the resampler is still buffering, then flush the
+            # encoder tail. Both are wrapped so a tail hiccup cannot lose the
+            # frames already muxed.
+            try:
+                for r_frame in resampler.resample(None):
+                    for packet in out_stream.encode(r_frame):
+                        out_container.mux(packet)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                for packet in out_stream.encode(None):  # flush the encoder tail
                     out_container.mux(packet)
-            for packet in out_stream.encode(None):  # flush the encoder tail
-                out_container.mux(packet)
+            except Exception:  # noqa: BLE001
+                pass
         finally:
             in_container.close()
             out_container.close()
 
+        if skipped_frames:
+            logger.warning(
+                "in_worker_recording_transcode_skipped_frames "
+                "skipped=%d encoded=%d decoded=%d",
+                skipped_frames, encoded_frames, decoded_frames,
+            )
+        # A transcode that encoded NO audio is a real failure — drop to the OGG
+        # fallback (finish() will retain the raw OGG).
+        if encoded_frames == 0:
+            raise RuntimeError("transcode_produced_no_audio")
+        # THE COMPLETENESS FLOOR (adversarial-review MED, v114 2026-09-04).
+        # A few skipped boundary frames are fine, but if a desync corrupted a
+        # large FRACTION of the stream the resulting MP3 is truncated audio, and
+        # keeping it would silently substitute a partial recording for the full
+        # one — and delete the intact OGG that still holds all of it. So fail the
+        # transcode when the skipped fraction exceeds the floor, forcing the OGG
+        # fallback that preserves the COMPLETE raw audio.
+        if decoded_frames > 0:
+            skipped_fraction = skipped_frames / decoded_frames
+            if skipped_fraction > _TRANSCODE_MAX_SKIPPED_FRACTION:
+                logger.warning(
+                    "in_worker_recording_transcode_truncated "
+                    "skipped=%d decoded=%d fraction=%.3f floor=%.3f",
+                    skipped_frames, decoded_frames, skipped_fraction,
+                    _TRANSCODE_MAX_SKIPPED_FRACTION,
+                )
+                raise RuntimeError("transcode_truncated_below_floor")
+
     await asyncio.to_thread(_run)
 
 
-async def _default_upload(upload_url: str, body: bytes) -> None:
-    """PUT the MP3 bytes to the presigned URL the API minted. Lazy httpx import."""
+async def _default_upload(
+    upload_url: str, body: bytes, content_type: str = "audio/mpeg",
+) -> None:
+    """PUT the recording bytes to the presigned URL the API minted. Lazy httpx
+    import. ``content_type`` is ``audio/mpeg`` for the normal MP3 and
+    ``audio/ogg`` for the v114 raw-OGG fallback, so the declared Content-Type
+    matches the bytes actually sent (the finalizer still sniffs the object's
+    container bytes and does not trust this header)."""
     import httpx  # noqa: PLC0415
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
         resp = await client.put(
-            upload_url, content=body, headers={"Content-Type": "audio/mpeg"},
+            upload_url, content=body, headers={"Content-Type": content_type},
         )
         if resp.status_code >= 400:
             raise RuntimeError(f"upload_failed_status_{resp.status_code}")
@@ -293,21 +418,59 @@ class InWorkerRecorder:
             return None
 
         mp3_path = self._ogg_path.with_suffix(".mp3")
+        body: Optional[bytes] = None
+        content_type = "audio/mpeg"
         try:
+            # ── PRIMARY: OGG→MP3 transcode, then upload the MP3. ────────────
+            transcoded_ok = False
             try:
                 await self._transcode_fn(self._ogg_path, mp3_path)
-                body = mp3_path.read_bytes()
-                if not body:
+                mp3_body = mp3_path.read_bytes()
+                if not mp3_body:
                     raise RuntimeError("empty_mp3")
-            except Exception:
-                self._finish_failure = "transcode_failed"
-                raise
+                body = mp3_body
+                content_type = "audio/mpeg"
+                transcoded_ok = True
+            except Exception:  # noqa: BLE001 — DO NOT re-raise: try the fallback
+                # ── FALLBACK (live v114, 2026-09-04): NEVER lose the audio. ──
+                # The v114 call died here with `transcode_failed` on a
+                # sample/channel desync, and finish()'s `finally: _cleanup()`
+                # then DELETED the raw OGG — total loss of a recoverable call.
+                # So a failed MP3 transcode no longer discards everything: if a
+                # non-empty raw OGG exists, upload IT instead so a reviewable
+                # artifact survives. The server sniffs the object's container
+                # bytes and records `audio/ogg`, a status a human/QA can tell
+                # apart from a clean MP3 finalize.
+                logger.warning(
+                    "in_worker_recording_transcode_failed_trying_ogg_fallback",
+                    extra={"object_key": self._object_key},
+                    exc_info=True,
+                )
+                try:
+                    ogg_body = self._ogg_path.read_bytes()
+                except Exception:  # noqa: BLE001 — the OGG itself is unreadable
+                    ogg_body = b""
+                if not ogg_body:
+                    # No MP3, no OGG — genuinely nothing to keep.
+                    self._finish_failure = "transcode_failed"
+                    raise
+                body = ogg_body
+                content_type = "audio/ogg"
+
+            # ── UPLOAD (MP3 or the OGG fallback) to the presigned PUT. ──────
+            assert body is not None
             try:
-                await self._upload_fn(upload_url, body)
+                await self._upload_fn(upload_url, body, content_type)
             except Exception:
-                self._finish_failure = "upload_failed"
+                # An upload failure is a real loss regardless of which body we
+                # sent. Name the leg so the caller latches truthfully — a
+                # fallback whose upload also failed is still a total loss, not a
+                # silent success.
+                self._finish_failure = (
+                    "upload_failed" if transcoded_ok else "transcode_failed"
+                )
                 raise
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 — fail-open, the call is already over
             logger.warning(
                 "in_worker_recording_finish_failed %s",
                 self._finish_failure,
@@ -322,9 +485,18 @@ class InWorkerRecorder:
         duration_ms = self._probe_duration_ms()
         logger.info(
             "in_worker_recording_uploaded",
-            extra={"object_key": self._object_key, "size_bytes": len(body)},
+            extra={
+                "object_key": self._object_key,
+                "size_bytes": len(body),
+                "content_type": content_type,
+            },
         )
-        return RecordingManifest(sha256=sha256, size_bytes=len(body), duration_ms=duration_ms)
+        return RecordingManifest(
+            sha256=sha256,
+            size_bytes=len(body),
+            duration_ms=duration_ms,
+            content_type=content_type,
+        )
 
     async def discard(self) -> None:
         """No-consent path: stop recording and delete the local file WITHOUT

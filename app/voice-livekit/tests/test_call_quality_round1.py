@@ -154,6 +154,16 @@ class TestConflictRepursuit(unittest.TestCase):
         "spoken_claim": "Two years in EdTech sales and advisory roles",
     }
 
+    # v114 (live call): the candidate deflected the probe with a ~17-word
+    # counter-question that asked the interviewer to explain the conflict
+    # itself. It reads substantive and exceeds the old 12-word non-answer cap,
+    # so it was classified ENGAGED, re-pursuit was suppressed, and the bot
+    # capitulated + fabricated a reconciliation.
+    V114_CONFLICT_COUNTER_QUESTION = (
+        "yeah definitely I can do that, but can you explain what conflict is "
+        "between resume and what I told?"
+    )
+
     def test_unresolved_on_deflection_filler_and_dont_know(self):
         for text in (
             LIVE_CONFLICT_DEFLECTION,
@@ -165,12 +175,66 @@ class TestConflictRepursuit(unittest.TestCase):
             with self.subTest(repr(text)):
                 self.assertTrue(phone.phone_conflict_reply_unresolved(text))
 
+    def test_v114_interrogative_deflection_is_unresolved_despite_length(self):
+        # The EXACT live v114 counter-question — >12 words, question-shaped,
+        # asks the interviewer to explain the conflict — must read as a
+        # DEFLECTION so the ONE re-pursuit fires.
+        self.assertTrue(
+            phone.phone_conflict_reply_unresolved(self.V114_CONFLICT_COUNTER_QUESTION)
+        )
+
+    def test_other_conflict_counter_questions_are_unresolved(self):
+        # Same interrogative-deflection shape, other phrasings — all unresolved
+        # regardless of word count.
+        for text in (
+            "Wait, what conflict? I don't get which part doesn't line up.",
+            "Sorry, which part of my answer doesn't match the resume?",
+            "Can you clarify what you mean by the discrepancy with my resume?",
+            "What do you mean there's a mismatch with the resume exactly?",
+            # Adversarial-review MUST-DEFLECT cases:
+            "What do you mean? Which part doesn't line up?",
+        ):
+            with self.subTest(text):
+                self.assertTrue(phone.phone_conflict_reply_unresolved(text))
+
+    def test_engaged_candidate_who_also_asks_a_question_is_not_a_deflection(self):
+        # ADVERSARIAL-REVIEW REGRESSION (must NOT fire re-pursuit at an engaged
+        # candidate): each reply gives a real substantive clause — an account,
+        # a resolution, or a stated position — AND tacks on a clarifying
+        # question. The deflection is not the primary payload, so these are
+        # ENGAGED (False). Firing the one-shot re-pursuit here is the exact
+        # regression the interrogative gate must avoid.
+        for text in (
+            "I worked there for three years. Which part of my resume seems wrong?",
+            "Honestly I think my resume is accurate. What is the problem you are "
+            "seeing?",
+            "How I resolved it was by escalating to my manager; which part of the "
+            "resume seems wrong to you?",
+            "Could you tell me which role you mean, since my resume lists two and "
+            "I want to answer the right one?",
+        ):
+            with self.subTest(text):
+                self.assertFalse(phone.phone_conflict_reply_unresolved(text))
+
     def test_engaged_on_a_substantive_explanation(self):
         self.assertFalse(phone.phone_conflict_reply_unresolved(
             "Right, so the trading role was a family business I helped with "
             "part-time while my full-time employment stayed in EdTech sales — "
             "the resume lists both and the dates overlap."
         ))
+
+    def test_engaged_on_a_genuine_reconciliation_mentioning_resume(self):
+        # A real explanation that squares the two — even one that mentions the
+        # word "resume" — is ENGAGED (False). It is not a question, so the
+        # interrogative-deflection gate never fires on it.
+        for text in (
+            "Yes — I was a proprietary trader by title but my day-to-day was "
+            "advisory sales to clients.",
+            "My resume lists both roles because I did trading and EdTech "
+            "advisory sales in the same period, so the timeline overlaps.",
+        ):
+            with self.subTest(text):
+                self.assertFalse(phone.phone_conflict_reply_unresolved(text))
 
     def test_repursuit_instruction_names_the_gap_with_guards(self):
         instruction = phone.phone_conflict_repursuit_instruction(self.CONFLICT)
@@ -184,8 +248,22 @@ class TestConflictRepursuit(unittest.TestCase):
         # The second ask may EXPLAIN, and then must let go.
         self.assertIn("explain in one plain, warm sentence", low)
         self.assertIn("accept it gracefully and move on", low)
+        # It must reference BOTH facts so the re-assertion is concrete.
         self.assertIn(self.CONFLICT["resume_fact"], instruction)
         self.assertIn(self.CONFLICT["spoken_claim"], instruction)
+
+    def test_repursuit_instruction_forbids_endorsing_or_reconciling(self):
+        # v114 ANTI-CAPITULATION: the bot verbally validated the candidate's
+        # false account and invented a "start date" reconciliation. The
+        # instruction must explicitly forbid affirming/validating/reconciling
+        # and inventing any detail to smooth it over.
+        instruction = phone.phone_conflict_repursuit_instruction(self.CONFLICT)
+        low = instruction.lower()
+        self.assertIn("do not affirm", low)
+        for word in ("validate", "reconcile"):
+            self.assertIn(word, low)
+        self.assertIn("do not invent", low)
+        self.assertIn("makes total sense", low)
 
     def test_repursuit_refuses_malformed_findings(self):
         for bad in (None, {}, {"resume_fact": "x"}, {"spoken_claim": "y"},
