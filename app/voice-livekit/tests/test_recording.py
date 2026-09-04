@@ -38,24 +38,57 @@ class _FakeSession:
         self.output = _FakeIO("bot_audio")
 
 
+class _FakeInTap:
+    """Stand-in for the RecorderIO input tap (RecorderAudioInput). Async-iterable
+    with a `label`, so the counting input proxy can wrap it and forward through
+    it exactly as it would the real tap."""
+
+    label = "TAP_IN"
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration  # a fake never yields; live frames come from RoomIO
+
+
+class _FakeOutTap:
+    """Stand-in for the RecorderIO output tap (RecorderAudioOutput). Exposes an
+    async `capture_frame` and a `label`, so the counting output proxy can wrap it
+    and forward pushes through it exactly as it would the real tap."""
+
+    label = "TAP_OUT"
+
+    def __init__(self):
+        self.captured = []
+
+    async def capture_frame(self, frame):
+        self.captured.append(frame)
+
+
 class _FakeRecorder:
     """Records call order and the .recording flag transitions RecorderIO exposes."""
 
-    def __init__(self, session, sample_rate, *, fail_start=False):
+    def __init__(self, session, sample_rate, *, fail_start=False, write_ogg=True):
         self.session = session
         self.sample_rate = sample_rate
         self.calls = []
         self.recording = False
         self.recording_started_at = None
         self._fail_start = fail_start
+        # write_ogg=False models the LIVE zero-capture failure: start() runs and
+        # recording flips True, but NO OGG is ever written (the encode thread
+        # muxed nothing because zero frames were captured), so finish() finds a
+        # missing OGG. This is the v114/v115/v116 signature.
+        self._write_ogg = write_ogg
 
     def record_input(self, audio):
         self.calls.append(("record_input", audio))
-        return "TAP_IN"
+        return _FakeInTap()
 
     def record_output(self, audio):
         self.calls.append(("record_output", audio))
-        return "TAP_OUT"
+        return _FakeOutTap()
 
     async def start(self, *, output_path):
         if self._fail_start:
@@ -64,6 +97,15 @@ class _FakeRecorder:
         self.recording = True
         import time
         self.recording_started_at = time.time()
+        # A recorder that CAPTURED audio leaves a non-empty OGG on disk. The real
+        # RecorderIO defers file creation to the first muxed packet (PyAV 18.1.0),
+        # so "captured audio" ⇔ "OGG exists". The default fake writes one so the
+        # happy-path tests exercise the normal transcode/upload path; the
+        # zero-capture case is modelled explicitly by _NoOggRecorder below (which
+        # matches the LIVE v114/v115/v116 failure: no OGG written).
+        self._output_path = Path(output_path)
+        if self._write_ogg:
+            Path(output_path).write_bytes(b"OggS\x00fake-ogg-container-bytes")
 
     async def aclose(self):
         self.calls.append("aclose")
@@ -71,14 +113,14 @@ class _FakeRecorder:
 
 
 def _make(session=None, *, fail_wire=False, fail_start=False, transcode=None, upload=None,
-          uploaded=None, tmp=None):
+          uploaded=None, tmp=None, write_ogg=True):
     session = session or _FakeSession()
     holder = {}
 
     def factory(sess, sr):
         if fail_wire:
             raise RuntimeError("boom_wire")
-        r = _FakeRecorder(sess, sr, fail_start=fail_start)
+        r = _FakeRecorder(sess, sr, fail_start=fail_start, write_ogg=write_ogg)
         holder["recorder"] = r
         return r
 
@@ -122,9 +164,16 @@ class TestInWorkerRecorderLifecycle(unittest.TestCase):
         names = [c[0] for c in rec_obj.calls]
         self.assertIn("record_input", names)
         self.assertIn("record_output", names)
-        # taps are swapped into the session BEFORE any recording begins
-        self.assertEqual(session.input.audio, "TAP_IN")
-        self.assertEqual(session.output.audio, "TAP_OUT")
+        # taps are swapped into the session BEFORE any recording begins. Each is
+        # wrapped in a transparent counting proxy (zero-capture instrumentation),
+        # so assert the proxy is installed and DELEGATES to the real tap (the fake
+        # record_input/record_output return the sentinels "TAP_IN"/"TAP_OUT").
+        self.assertIsInstance(session.input.audio, rec._CountingAudioInput)
+        self.assertIsInstance(session.output.audio, rec._CountingAudioOutput)
+        # __getattr__ passthrough: the wrapped tap's `label` resolves THROUGH the
+        # proxy, proving it forwards non-frame attributes verbatim to the real tap.
+        self.assertEqual(session.input.audio.label, "TAP_IN")
+        self.assertEqual(session.output.audio.label, "TAP_OUT")
 
     def test_wire_does_not_start_recording_ask_first_record_second(self):
         # The invariant: wiring the taps must NOT begin recording. start() may
@@ -226,10 +275,14 @@ class TestInWorkerRecorderLifecycle(unittest.TestCase):
         self.assertIsNone(_finish(r))
 
     def test_transcode_failure_is_fail_open(self):
+        # A transcode failure on a call with NO OGG (the live zero-capture case)
+        # is swallowed — never raised into the call path. (With an OGG present a
+        # transcode failure instead falls back to the raw OGG; that is covered by
+        # TestOggFallbackRetainsAudio.)
         async def boom_transcode(ogg, mp3):
             raise RuntimeError("ffmpeg_missing")
 
-        r, _session, _holder = _make(transcode=boom_transcode)
+        r, _session, _holder = _make(transcode=boom_transcode, write_ogg=False)
         r.wire()
         _begin(r)
         self.assertIsNone(_finish(r))  # swallowed, no raise
@@ -250,25 +303,65 @@ class TestInWorkerRecorderLifecycle(unittest.TestCase):
     # (`object_unreadable` x6) and the session sat at "Recording is still
     # processing" forever. Each failure leg now stamps a bounded reason the
     # caller reports via /recording/failed.
-    def test_finish_failure_names_the_transcode_leg(self):
+    def test_finish_failure_names_the_transcode_leg_when_fallback_also_fails(self):
+        # `transcode_failed` is now reported ONLY as a genuine total loss: the
+        # transcode threw AND the raw-OGG fallback upload also failed (an OGG
+        # exists but nothing could be uploaded). With an OGG present but a working
+        # upload the transcode failure would instead succeed via the OGG fallback
+        # (see TestOggFallbackRetainsAudio) — so to name the transcode leg the
+        # fallback upload must also die.
         async def boom_transcode(ogg, mp3):
             raise RuntimeError("codec_died")
 
-        r, _session, _holder = _make(transcode=boom_transcode)
+        async def boom_upload(url, body, content_type="audio/mpeg"):
+            raise RuntimeError("s3_down")
+
+        r, _session, _holder = _make(transcode=boom_transcode, upload=boom_upload)
         r.wire()
         _begin(r)
         self.assertIsNone(_finish(r))
         self.assertEqual(r.finish_failure, "transcode_failed")
 
-    def test_finish_failure_names_the_empty_output_as_transcode(self):
-        async def empty_transcode(ogg, mp3):
-            Path(mp3).write_bytes(b"")
+    def test_finish_failure_names_missing_ogg_as_no_audio_captured(self):
+        # THE RCA (2026-09-04): the live zero-capture failure. The recorder wrote
+        # NO OGG (zero frames reached the encoder → PyAV never materialized the
+        # file). finish() must report `no_audio_captured` — NOT `transcode_failed`
+        # (the mislabel that misdirected #223/#227/#228 into fixing a desync that
+        # never existed). The transcode is not even attempted (the no-audio guard
+        # fires first).
+        async def never_called_transcode(ogg, mp3):  # pragma: no cover
+            raise AssertionError("transcode must not run when the OGG is missing")
 
-        r, _session, _holder = _make(transcode=empty_transcode)
+        r, _session, _holder = _make(transcode=never_called_transcode, write_ogg=False)
         r.wire()
         _begin(r)
         self.assertIsNone(_finish(r))
-        self.assertEqual(r.finish_failure, "transcode_failed")
+        self.assertEqual(r.finish_failure, "no_audio_captured")
+
+    def test_finish_failure_names_empty_ogg_as_no_audio_captured(self):
+        # A zero-BYTE OGG is the same class of failure as a missing one: the
+        # encode thread muxed nothing. Report `no_audio_captured`, not a transcode
+        # error. Model it with a recorder that writes an empty OGG at start().
+        class _EmptyOggRecorder(_FakeRecorder):
+            async def start(self, *, output_path):
+                # write_ogg=False so the base start() writes nothing; we then
+                # write a 0-byte file to model an OGG that exists but is empty.
+                await super().start(output_path=output_path)
+                Path(output_path).write_bytes(b"")  # 0-byte OGG
+
+        session = _FakeSession()
+        holder = {}
+
+        def factory(sess, sr):
+            r = _EmptyOggRecorder(sess, sr, write_ogg=False)
+            holder["recorder"] = r
+            return r
+
+        r = rec.InWorkerRecorder(session, recorder_factory=factory)
+        r.wire()
+        _begin(r)
+        self.assertIsNone(_finish(r))
+        self.assertEqual(r.finish_failure, "no_audio_captured")
 
     def test_finish_failure_names_the_upload_leg(self):
         async def boom_upload(url, body, content_type="audio/mpeg"):
@@ -321,6 +414,154 @@ class TestInWorkerRecorderLifecycle(unittest.TestCase):
     # finish()'s cleanup then DELETED the raw OGG: total loss of a recoverable
     # recording. A failed transcode must now retain the raw OGG by uploading it
     # as a fallback, so a reviewable artifact survives.
+
+
+class TestZeroCaptureInstrumentation(unittest.TestCase):
+    """RCA 2026-09-04: the live failure could not be diagnosed from the INFO logs
+    (wire OK + `started` fired + clean aclose, yet no OGG). These prove the
+    instrumentation the next test call relies on: the counting proxies COUNT
+    frames without altering them, and finish() emits the decisive capture line."""
+
+    def test_counting_input_proxy_is_transparent_and_counts(self):
+        # The proxy must forward __anext__ verbatim and increment the shared
+        # counter once per frame — never dropping, delaying, or mutating a frame.
+        counter = rec._FrameCounter()
+
+        class _Inner:
+            def __init__(self):
+                self.n = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                self.n += 1
+                if self.n > 3:
+                    raise StopAsyncIteration
+                return f"frame{self.n}"
+
+        proxy = rec._CountingAudioInput(_Inner(), counter)
+        got = []
+
+        async def drain():
+            it = proxy.__aiter__()
+            try:
+                while True:
+                    got.append(await it.__anext__())
+            except StopAsyncIteration:
+                pass
+
+        _run(drain())
+        self.assertEqual(got, ["frame1", "frame2", "frame3"])  # forwarded verbatim
+        self.assertEqual(counter.input, 3)                     # counted each
+        self.assertEqual(counter.output, 0)                    # untouched
+
+    def test_counting_output_proxy_is_transparent_and_counts(self):
+        counter = rec._FrameCounter()
+
+        class _Inner:
+            def __init__(self):
+                self.captured = []
+
+            async def capture_frame(self, frame):
+                self.captured.append(frame)
+
+        inner = _Inner()
+        proxy = rec._CountingAudioOutput(inner, counter)
+        _run(proxy.capture_frame("a"))
+        _run(proxy.capture_frame("b"))
+        self.assertEqual(inner.captured, ["a", "b"])  # forwarded to the real tap
+        self.assertEqual(counter.output, 2)           # counted each
+        self.assertEqual(counter.input, 0)
+
+    def test_output_proxy_delegates_attributes(self):
+        # __getattr__ passthrough: non-capture attributes/methods resolve on the
+        # wrapped tap so the SDK's pause/resume/flush/on_playback_finished path is
+        # untouched by the proxy.
+        counter = rec._FrameCounter()
+
+        class _Inner:
+            label = "RecorderIO"
+
+            def flush(self):
+                return "flushed"
+
+        proxy = rec._CountingAudioOutput(_Inner(), counter)
+        self.assertEqual(proxy.label, "RecorderIO")
+        self.assertEqual(proxy.flush(), "flushed")
+
+    def test_capture_log_reports_zero_capture_signature(self):
+        # THE DECISIVE LINE. On the live failure the log must show
+        # input_frames=0 output_frames=0 ogg_exists=false — the exact zero-capture
+        # signature (missing OGG, not a transcode desync). Assert finish() emits
+        # `in_worker_recording_capture` with those fields on a no-OGG recorder.
+        import logging as _logging
+
+        r, _session, _holder = _make(write_ogg=False)
+
+        log = _logging.getLogger("voice-livekit.recording")
+        msgs = []
+
+        class _Cap(_logging.Handler):
+            def emit(self, rec_):
+                msgs.append(rec_.getMessage())
+
+        cap = _Cap()
+        log.addHandler(cap)
+        try:
+            # Attach BEFORE the lifecycle so wired/started/capture are all seen.
+            r.wire()
+            _begin(r)
+            _finish(r)
+        finally:
+            log.removeHandler(cap)
+
+        capture = [m for m in msgs if m.startswith("in_worker_recording_capture")]
+        self.assertEqual(len(capture), 1, f"expected exactly one capture line: {msgs}")
+        line = capture[0]
+        self.assertIn("input_frames=0", line)
+        self.assertIn("output_frames=0", line)
+        self.assertIn("ogg_exists=False", line)
+        # and the lifecycle order lines were emitted with the state fields
+        self.assertTrue(any(m.startswith("in_worker_recording_wired recording=False") for m in msgs))
+        self.assertTrue(any(m.startswith("in_worker_recording_started recording=True") for m in msgs))
+
+    def test_capture_log_reports_engaged_capture(self):
+        # The POSITIVE control: a recorder that "captured" (OGG present) and whose
+        # taps saw frames must log ogg_exists=True with the frame counts it saw,
+        # so a healthy call is distinguishable from the zero-capture failure.
+        import logging as _logging
+
+        r, session, _holder = _make()  # default fake writes an OGG at start()
+        r.wire()
+        _begin(r)
+
+        # Simulate the live pipeline pushing frames THROUGH the installed proxies:
+        # the session pushes TTS into session.output.audio (our output proxy) and
+        # the recognition loop pulls candidate audio through session.input.audio
+        # (our input proxy). Both proxies share r._counter, so the counts they
+        # increment are exactly what the capture line reports.
+        _run(session.output.audio.capture_frame("bot_tts_frame"))
+
+        log = _logging.getLogger("voice-livekit.recording")
+        msgs = []
+
+        class _Cap(_logging.Handler):
+            def emit(self, rec_):
+                msgs.append(rec_.getMessage())
+
+        cap = _Cap()
+        log.addHandler(cap)
+        try:
+            manifest = _finish(r)
+        finally:
+            log.removeHandler(cap)
+
+        self.assertIsNotNone(manifest)  # healthy: transcodes + uploads
+        capture = [m for m in msgs if m.startswith("in_worker_recording_capture")]
+        self.assertEqual(len(capture), 1)
+        self.assertIn("ogg_exists=True", capture[0])
+        self.assertIn("output_frames=1", capture[0])  # the one push above
 
 
 class _OggWritingRecorder(_FakeRecorder):
@@ -428,17 +669,20 @@ class TestOggFallbackRetainsAudio(unittest.TestCase):
         self.assertIsNone(_finish(r))
         self.assertEqual(r.finish_failure, "transcode_failed")
 
-    def test_transcode_failure_with_no_ogg_is_total_loss(self):
-        # No MP3 AND no readable OGG (the default fake recorder writes no OGG):
-        # this is the only genuine total-loss case, reported as transcode_failed.
-        async def boom_transcode(ogg, mp3):
-            raise RuntimeError("desync")
+    def test_no_ogg_is_no_audio_captured_not_transcode_failed(self):
+        # RCA 2026-09-04: NO OGG written (zero frames captured — the LIVE
+        # failure). This is NOT a transcode failure: the transcode is never
+        # attempted because the no-audio guard fires first. finish() reports
+        # `no_audio_captured` so the failure names its real cause instead of the
+        # `transcode_failed` mislabel that misdirected #223/#227/#228.
+        async def never_called_transcode(ogg, mp3):  # pragma: no cover
+            raise AssertionError("transcode must not run when the OGG is missing")
 
-        r, _session, _holder = _make(transcode=boom_transcode)  # plain _FakeRecorder
+        r, _session, _holder = _make(transcode=never_called_transcode, write_ogg=False)
         r.wire()
         _begin(r)
         self.assertIsNone(_finish(r))
-        self.assertEqual(r.finish_failure, "transcode_failed")
+        self.assertEqual(r.finish_failure, "no_audio_captured")
 
 
 class TestDefaultUploadUpsert(unittest.TestCase):

@@ -50,6 +50,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
@@ -373,6 +374,91 @@ async def _default_upload(
             raise RuntimeError(f"upload_failed_status_{resp.status_code}")
 
 
+# ── ZERO-CAPTURE INSTRUMENTATION (RCA 2026-09-04, v114/v115/v116) ────────────
+# EVERY live phone call lost its recording to `transcode_failed`, whose REAL
+# exception was `FileNotFoundError: …-egress.mp3.ogg` — i.e. the OGG was NEVER
+# written. Confirmed against PyAV 18.1.0 (the worker's pinned wheel):
+# `av.open(path, "w", format="ogg")` DEFERS on-disk creation to the first muxed
+# packet, so a RecorderIO encode thread that muxes ZERO packets leaves no file.
+# The encode thread muxes only what the input/output taps accumulate, and the
+# taps accumulate only while `RecorderIO.recording` is True — so a missing OGG
+# means ZERO frames reached the encoder. The v116 log proved wire OK +
+# `in_worker_recording_started` fired + clean `aclose` yet still no OGG, so the
+# capture never engaged even though the flag flipped. The SDK 1.6.4 source shows
+# reassigning `session.input.audio`/`output.audio` AFTER `session.start()` IS a
+# supported reroute (the input `audio.setter` fires `_on_audio_input_changed`,
+# which cancels + restarts `_forward_audio_task` on the new tap; the output
+# reference is read fresh per speech turn) — so the wiring is mechanically
+# correct and the live failure cannot be diagnosed further from the INFO logs
+# alone. These two proxies wrap the RecorderIO taps to COUNT the frames each
+# side actually sees, so the next test call's log states — deterministically —
+# whether capture engaged (input_frames/output_frames > 0) and, if not, which
+# side is starved. They are pure pass-through: they never alter, drop, reorder,
+# or delay a frame, and hold no audio (a running COUNT only, PII-free).
+#
+# CONSENT NOTE: counting is NOT capture. A proxy increments an integer and
+# immediately forwards the frame; it retains nothing. RETENTION still happens
+# only inside the underlying tap, and only while `RecorderIO.recording` is True
+# (flipped True by begin() at the consent seam) — so the input count is
+# legitimately non-zero DURING the pre-consent exchange (the recognition loop is
+# pulling candidate audio to run the consent classifier), yet NO audio of that
+# window is ever kept. The count is a diagnostic number, not a recording.
+class _CountingAudioInput:
+    """Transparent async-iterator proxy over the RecorderIO input tap that counts
+    every frame the recognition loop pulls THROUGH the tap. Pass-through only —
+    it forwards `__anext__` verbatim and mirrors every other attribute onto the
+    wrapped tap, so the SDK sees the exact object it expects."""
+
+    def __init__(self, inner: Any, counter: "_FrameCounter") -> None:
+        self.__inner = inner
+        self.__counter = counter
+
+    def __aiter__(self) -> Any:
+        # RecorderAudioInput.__aiter__ returns self; keep our proxy as the iterator
+        # so __anext__ (and the count) stays on the pulled path.
+        self.__inner.__aiter__()
+        return self
+
+    async def __anext__(self) -> Any:
+        frame = await self.__inner.__anext__()
+        self.__counter.input += 1
+        return frame
+
+    def __getattr__(self, name: str) -> Any:
+        # Everything else (on_attached/on_detached/source/label/…) delegates to
+        # the real tap so re-wiring behaves identically to the un-proxied tap.
+        return getattr(self.__inner, name)
+
+
+class _CountingAudioOutput:
+    """Transparent proxy over the RecorderIO output tap that counts every TTS
+    frame the session PUSHES into the tap via `capture_frame`. Pass-through only:
+    `capture_frame` forwards verbatim (so playback + the tap's own accumulation
+    are untouched) and every other attribute/method mirrors onto the real tap."""
+
+    def __init__(self, inner: Any, counter: "_FrameCounter") -> None:
+        self.__inner = inner
+        self.__counter = counter
+
+    async def capture_frame(self, frame: Any) -> None:
+        await self.__inner.capture_frame(frame)
+        self.__counter.output += 1
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.__inner, name)
+
+
+class _FrameCounter:
+    """A tiny mutable counter shared by the two proxies. Booleans/ints only —
+    never touches audio bytes."""
+
+    __slots__ = ("input", "output")
+
+    def __init__(self) -> None:
+        self.input = 0
+        self.output = 0
+
+
 class InWorkerRecorder:
     """Owns the RecorderIO lifecycle for exactly one phone call."""
 
@@ -405,6 +491,14 @@ class InWorkerRecorder:
         self._begun = False
         self._failed = False
         self._finish_failure: Optional[str] = None
+
+        # ZERO-CAPTURE INSTRUMENTATION (RCA 2026-09-04). Frame counts the taps
+        # actually saw + a lifecycle-order/timing trail, so the next test call's
+        # log proves whether capture engaged and, if not, which side starved.
+        # Counts/booleans/millis only — never audio.
+        self._counter = _FrameCounter()
+        self._wired_at_ms: Optional[int] = None
+        self._begun_at_ms: Optional[int] = None
 
     @property
     def active(self) -> bool:
@@ -456,9 +550,27 @@ class InWorkerRecorder:
             self._recorder = self._recorder_factory(self._session, self._sample_rate)
             # record_input/record_output must both be called before the recorder's
             # own start() (invoked from begin() at the consent seam).
-            self._session.input.audio = self._recorder.record_input(in_src)
-            self._session.output.audio = self._recorder.record_output(out_src)
+            #
+            # ZERO-CAPTURE INSTRUMENTATION (RCA 2026-09-04): wrap each RecorderIO
+            # tap in a transparent counting proxy BEFORE reassigning it onto the
+            # session, so the frame count each side sees is observable at aclose.
+            # The proxy forwards __anext__/capture_frame verbatim and mirrors all
+            # other attributes onto the real tap, so re-wiring and accumulation
+            # behave exactly as the un-proxied tap (this is the piece that lets
+            # the next test call PROVE capture engaged rather than infer it).
+            in_tap = _CountingAudioInput(self._recorder.record_input(in_src), self._counter)
+            out_tap = _CountingAudioOutput(self._recorder.record_output(out_src), self._counter)
+            self._session.input.audio = in_tap
+            self._session.output.audio = out_tap
             self._wired = True
+            self._wired_at_ms = int(time.time() * 1000)
+            # ORDER + STATE trail (STEP 3): recording MUST still be False here —
+            # wiring installs the taps but begin() (consent) starts capture.
+            logger.info(
+                "in_worker_recording_wired recording=%s wired_at_ms=%d",
+                bool(getattr(self._recorder, "recording", False)),
+                self._wired_at_ms,
+            )
             return True
         except Exception:  # noqa: BLE001 — fail-open by contract
             logger.warning("in_worker_recording_wire_failed", exc_info=True)
@@ -482,7 +594,20 @@ class InWorkerRecorder:
             self._ogg_path = base / (Path(object_key).name + ".ogg")
             await self._recorder.start(output_path=self._ogg_path)
             self._begun = True
-            logger.info("in_worker_recording_started", extra={"object_key": self._object_key})
+            self._begun_at_ms = int(time.time() * 1000)
+            # ORDER + STATE trail (STEP 3): recording MUST be True immediately
+            # after start() (RecorderIO.recording == _started). If this logs
+            # recording=false the flag never flipped and the taps will accumulate
+            # nothing — the SECONDARY hypothesis. `wire_to_begin_ms` is the gap
+            # between installing the taps and starting capture (the pre-consent
+            # window during which NOTHING is retained).
+            logger.info(
+                "in_worker_recording_started recording=%s begun_at_ms=%d wire_to_begin_ms=%s",
+                bool(getattr(self._recorder, "recording", False)),
+                self._begun_at_ms,
+                (self._begun_at_ms - self._wired_at_ms) if self._wired_at_ms else -1,
+                extra={"object_key": self._object_key},
+            )
             return True
         except Exception:  # noqa: BLE001
             logger.warning(
@@ -499,6 +624,7 @@ class InWorkerRecorder:
         nothing here can harm the screening."""
         if not self._begun or self._failed or self._recorder is None or self._ogg_path is None:
             return None
+        recording_at_close = bool(getattr(self._recorder, "recording", False))
         try:
             await self._recorder.aclose()
         except Exception:  # noqa: BLE001
@@ -513,10 +639,53 @@ class InWorkerRecorder:
             self._cleanup()
             return None
 
+        # ── THE DECISIVE CAPTURE LOG (RCA 2026-09-04, STEP 3) ────────────────
+        # This single line answers the RCA question the INFO logs could not: did
+        # capture engage? `recording_at_close` is the RecorderIO.recording flag
+        # at teardown (paired with the recording=... field on the earlier
+        # `in_worker_recording_started` line: the SECONDARY-hypothesis signal —
+        # if the flag never flipped True the taps accumulate nothing).
+        # `input_frames`/`output_frames` are the counts the taps actually saw
+        # (the PRIMARY-hypothesis signal — if both are 0 the reassignment did not
+        # reroute the live audio into the taps). `ogg_exists`/`ogg_bytes` are the
+        # ground truth: PyAV writes NO ogg file until the first muxed packet, so
+        # ogg_exists=false with input/output_frames=0 is the exact zero-capture
+        # signature (missing OGG, not a transcode desync). Counts/booleans only.
+        ogg_exists = self._ogg_path.exists()
+        try:
+            ogg_bytes = self._ogg_path.stat().st_size if ogg_exists else 0
+        except Exception:  # noqa: BLE001
+            ogg_bytes = -1
+        logger.info(
+            "in_worker_recording_capture "
+            "recording_at_close=%s input_frames=%d output_frames=%d "
+            "ogg_exists=%s ogg_bytes=%d",
+            recording_at_close,
+            self._counter.input,
+            self._counter.output,
+            ogg_exists,
+            ogg_bytes,
+            extra={"object_key": self._object_key},
+        )
+
         mp3_path = self._ogg_path.with_suffix(".mp3")
         body: Optional[bytes] = None
         content_type = "audio/mpeg"
         try:
+            # ── NO-AUDIO GUARD (RCA 2026-09-04, STEP 4): the OGG is MISSING or
+            # EMPTY. This is the ACTUAL live failure on every phone call — zero
+            # frames reached the encoder, so PyAV never materialized the file —
+            # NOT a transcode desync. Previously the transcode ran anyway,
+            # `av.open` raised `FileNotFoundError`, and finish() mislabeled it
+            # `transcode_failed`, which sent the entire B2 line (#223/#227/#228)
+            # chasing a desync that never existed. Report `no_audio_captured` so
+            # the failure names its real cause. There is genuinely nothing to
+            # upload, so this is a truthful terminal loss (the caller latches it
+            # via /recording/failed exactly like any other named failure).
+            if not ogg_exists or ogg_bytes <= 0:
+                self._finish_failure = "no_audio_captured"
+                raise RuntimeError("no_audio_captured")
+
             # ── PRIMARY: OGG→MP3 transcode, then upload the MP3. ────────────
             transcoded_ok = False
             try:
