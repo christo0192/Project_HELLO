@@ -306,6 +306,36 @@ def _emit_phone_latency_segment(schema: str, duration: float) -> None:
         pass
 
 
+def _emit_phone_headline_latency(local_vad_end_wall: float, first_audio_wall: float) -> None:
+    """Emit the AUTHORITATIVE candidate-speech-end -> bot-audio latency.
+
+    FIX 3 (live 2026-09-03, session ec9bd898). The legacy ``speech_end_to_first_
+    audio`` segment is anchored on the SDK ``stopped_speaking_at`` of the FIRST
+    fragment, so a fragmented answer inflates it to ~5.5 s by counting the
+    candidate's own mid-answer pause. The truthful anchor is the LOCAL VAD end of
+    speech (``local_vad_end_wall``), which measured 0.393 s on the live call.
+    This is the headline metric operators should read for turn-taking latency;
+    the ``speech_end_*`` segments remain emitted for back-compat. Reporting only:
+    a duration, never transcript / room / candidate / request IDs. A negative or
+    non-finite delta (clock skew / stale anchor) is dropped, and an
+    instrumentation failure never perturbs the reply lifecycle.
+    """
+    try:
+        delta = first_audio_wall - local_vad_end_wall
+        if not math.isfinite(delta) or delta < 0.0 or delta > 120.0:
+            return
+        _safe_emit(
+            histogram_metric, "voice_phone_headline_latency_sec", delta,
+            {"channel": "phone", "schema": "candidate_speech_end_to_bot_audio"},
+        )
+        _log.info(
+            "unknown_event", error_type="voice_phone_headline_latency",
+            schema="candidate_speech_end_to_bot_audio", duration_sec=round(delta, 3),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _emit_phone_endpoint_delay(t_eou: float, now: float) -> None:
     """Emit completed-turn callback -> reply creation, content-free.
 
@@ -1606,6 +1636,7 @@ async def _run_native_phone_screening(
     close_event: asyncio.Event,
     endpoint_delay_eou: list[float | None] | None = None,
     latency_state: dict[str, float | None] | None = None,
+    prior_turn_interrupted: dict[str, bool] | None = None,
     turn_mode: str = phone.PHONE_TURN_MODE_TOOLFIRST,
     coverage_judge_enabled: bool = False,
 ) -> phone.PhoneGateResult:
@@ -1618,6 +1649,16 @@ async def _run_native_phone_screening(
     """
     cursor = state.cursor
     completed = list(state.completed_keys)
+    # FIX 2 (live 2026-09-03, session ec9bd898): shared interrupt latch. The
+    # session's `mark_delivered` (in `_run_phone_session`) sets this when a bot
+    # turn ends by INTERRUPTION, and the coalescing guard below reads it to route
+    # the candidate's follow-up to the interrupted re-ask path instead of
+    # swallowing it into doom-loop silence. `assistant_delivery_complete` alone
+    # cannot distinguish an interrupt from a normal reply still streaming before
+    # first audio. Defaulted here so a direct-coordinator test that does not
+    # thread it stays correct (the flag simply reads False = "not interrupted").
+    if prior_turn_interrupted is None:
+        prior_turn_interrupted = {"value": False}
     finished = asyncio.Event()
     terminal_reason: dict[str, str] = {}
     # A terminal reply is only a proposal until its speech handle completes.
@@ -2021,6 +2062,18 @@ async def _run_native_phone_screening(
         # shared per-turn snapshot can be extended without a new reply.
         prior_reply_started = reply_started.is_set()
         prior_speech_first_audio = speech_first_audio.is_set()
+        # FIX 2 (post-review): read the previous reply's interrupt state
+        # SYNCHRONOUSLY here, before any await, so it cannot race the background
+        # `mark_delivered` latch. `reply_handle[0]` still holds the prior reply's
+        # handle at the top of this hook (it is nulled only when
+        # `on_reply_expected` runs after this hook returns); the SDK sets
+        # `.interrupted` on the handle at barge-in. Either this synchronous read
+        # OR the generation-guarded background latch marks an interrupt — the two
+        # together close both the "latch set too late" and "stale latch" races
+        # the review flagged.
+        prior_handle_interrupted = bool(
+            getattr(reply_handle[0], "interrupted", False)
+        )
         reply_started.clear()
         speech_first_audio.clear()
         generation_empty.clear()
@@ -2333,6 +2386,16 @@ async def _run_native_phone_screening(
         if (
             prior_reply_started
             and not prior_speech_first_audio
+            # FIX 2: an INTERRUPTED prior turn must NOT be coalesced. When the bot
+            # was barged into, its follow-up ("which program", "hello") is a fresh
+            # turn owed a re-ask, not a continuation fragment of the last answer.
+            # Swallowing it via StopResponse shadowed the interrupted-recovery
+            # path at ~2381 and left the call in doom-loop silence (session
+            # ec9bd898). `assistant_delivery_complete` alone cannot distinguish
+            # this — it is also clear while a normal reply streams pre-audio — so
+            # we read the explicit interrupt latch set in `mark_delivered`.
+            and not prior_turn_interrupted["value"]
+            and not prior_handle_interrupted
             and isinstance(active_exchange, dict)
             and active_exchange.get("expected_index") == cursor
         ):
@@ -2376,10 +2439,52 @@ async def _run_native_phone_screening(
             )
             if conflict_rerouted:
                 return
+            # FIX 1: this fragment was coalesced and `on_user_turn_completed` will
+            # NOT re-call `on_reply_expected` (it re-arms only on a NORMAL return,
+            # not when we raise StopResponse). Restart the first-audio deadline
+            # for the CURRENT generation so its 4.0 s window measures the bot's
+            # real think time from this latest fragment — never the candidate's
+            # inter-fragment pause. `rearm_only=True` preserves the in-flight
+            # reply's generation/handle/sequence correlation; it only refreshes
+            # the deadline clock and the fallback snapshot. Best-effort: an arming
+            # failure must never perturb the coalesce (fail-open).
+            try:
+                await on_reply_expected(rearm_only=True)
+            except Exception:  # noqa: BLE001
+                _log.warn(
+                    "unknown_event", error_type="phone_speech_lifecycle",
+                    error_category="coalesce_rearm_failed",
+                )
             from livekit.agents import StopResponse  # noqa: PLC0415
             raise StopResponse()
         if not assistant_delivery_complete.is_set():
+            # FIX 2: the previous bot turn was interrupted (barge-in) or is not
+            # yet proven delivered, and the candidate has now spoken again —
+            # possibly just a connectivity check ("which program", "hello"). Owe
+            # an IMMEDIATE re-ask; never fall silent. Explicitly authorize the
+            # generation so the model actually speaks (a bare instruction with no
+            # armed objective could otherwise be dropped by the one-question
+            # validator), and clear the interrupt latch now that its owed re-ask
+            # is being issued.
+            prior_turn_interrupted["value"] = False
             add_turn_instruction(turn_ctx, "The previous question was interrupted. Ask that same topic again in your own natural words and wait; do not advance.")
+            if question is not None:
+                set_question_reply_snapshot(question, text)
+                authorize_generated_reply(
+                    question.spoken_text,
+                    control_text="The previous question was interrupted. Re-ask the same topic naturally and wait; do not advance.",
+                )
+            else:
+                # No planned question at this cursor (e.g. post-plan Q&A / wind-
+                # down) — still acknowledge presence so a bare "hello" after an
+                # interrupt is never met with silence.
+                set_reply_snapshot(
+                    phone.PHONE_POST_INTERRUPT_ACK_TEXT, phase="post_interrupt_ack",
+                )
+                authorize_generated_reply(
+                    phone.PHONE_POST_INTERRUPT_ACK_TEXT,
+                    control_text="Briefly reassure the candidate you are still on the line and invite them to continue. Do not advance or close.",
+                )
             return
         if conflict_reply_pending["value"]:
             # This turn answers a clarification proven delivered by its exact
@@ -2943,7 +3048,7 @@ async def _run_native_phone_screening(
     expected_reply_generation: list[int] = [0]
     fallback_generation: list[int | None] = [None]
 
-    async def on_reply_expected() -> None:
+    async def on_reply_expected(*, rearm_only: bool = False) -> None:
         """Arm one generation-correlated first-audio watchdog.
 
         LiveKit 1.6.4 exposes cancellation on the SpeechHandle itself.  A
@@ -2951,17 +3056,43 @@ async def _run_native_phone_screening(
         prove the stale generation stopped.  This path therefore force-cancels
         the exact handle observed for this expected reply, drains it, and only
         then creates one interruptible deterministic fallback.
+
+        FIX 1 (live 2026-09-03, session ec9bd898): `rearm_only=True` RESTARTS the
+        4.0 s first-audio deadline for the CURRENT generation without bumping
+        `expected_reply_generation`, re-arming `arm_reply_generation`, nulling
+        `reply_handle[0]`, or resetting `fallback_generation`. It is called when a
+        continuation fragment is coalesced (StopResponse, no new reply created),
+        so the watchdog measures the bot's real think time from the LATEST
+        fragment — never the candidate's own inter-fragment pause. Because the
+        generation number is preserved, an in-flight authorized reply keeps its
+        `speech_sequence`/`delivered_seq` correlation and its `reply_handle`; only
+        the deadline clock and the fallback snapshot are refreshed. A `no_first_
+        audio` fallback fired mid-answer on the live call because the deadline
+        kept counting through the pause; this stops that spurious fire.
         """
         previous = speech_watchdog_task[0]
         if previous is not None and not previous.done():
             previous.cancel()
-        expected_reply_generation[0] += 1
-        generation = expected_reply_generation[0]
-        arm_generation = getattr(agent, "arm_reply_generation", None)
-        if callable(arm_generation):
-            arm_generation(generation)
-        fallback_generation[0] = None
-        reply_handle[0] = None
+        if rearm_only:
+            # Restart the deadline for the reply already in flight. Do NOT bump
+            # the generation or touch the handle/correlation — only re-snapshot
+            # the fallback text (coalescing may have revised the reply snapshot)
+            # and restart the timer for the still-current generation.
+            generation = expected_reply_generation[0]
+            # FIX 1 (post-review): a rearm restarts the deadline for the SAME
+            # generation, so clear any fallback already recorded for it —
+            # otherwise the `fallback_generation[0] == generation` self-disarm
+            # guard in the monitor would make this re-armed deadline a no-op and
+            # a genuinely stalled reply would get no recovery on the new window.
+            fallback_generation[0] = None
+        else:
+            expected_reply_generation[0] += 1
+            generation = expected_reply_generation[0]
+            arm_generation = getattr(agent, "arm_reply_generation", None)
+            if callable(arm_generation):
+                arm_generation(generation)
+            fallback_generation[0] = None
+            reply_handle[0] = None
         snapshot = dict(reply_snapshot)
 
         async def monitor() -> None:
@@ -3148,6 +3279,11 @@ async def _run_native_phone_screening(
     setattr(agent, "_native_finished", finished)
     setattr(agent, "_native_terminal_reason", terminal_reason)
     setattr(agent, "_native_turns", True)
+    # Test seams (FIX 1 / FIX 2): the generation counter proves rearm_only does
+    # not bump the generation (in-flight correlation preserved), and the
+    # interrupt latch proves the coalesce/re-ask routing.
+    setattr(agent, "_expected_reply_generation_snapshot", lambda: expected_reply_generation[0])
+    setattr(agent, "_prior_turn_interrupted_snapshot", lambda: prior_turn_interrupted)
     authorize = getattr(agent, "authorize_screening", None)
     if not callable(authorize):
         raise RuntimeError("phone_consent_authorization_unavailable")
@@ -3623,6 +3759,10 @@ async def _run_phone_session(
     speech_sequence: list[int] = [0]
     assistant_delivery_complete = asyncio.Event()
     reply_handle: list[Any] = [None]
+    # FIX 2: session-lifetime interrupt latch (see the reader in
+    # `_run_native_phone_screening`). Set in `mark_delivered` when a turn is
+    # barged into; cleared when the next reply is created.
+    prior_turn_interrupted: dict[str, bool] = {"value": False}
     # PR-2 change 2: the ENDPOINT DELAY (EOU -> LLM-invoke), previously
     # unlogged. `on_native_turn` stamps `[0]` with a MONOTONIC time at the top
     # of the phone EOU callback; the reply-creation handler below reads it and
@@ -3699,6 +3839,12 @@ async def _run_phone_session(
             endpoint_delay_eou[0] = None
             _emit_phone_endpoint_delay(t_eou, created_mono)
         reply_started.set()
+        # FIX 2: a fresh reply is being created, so any previous interrupt is now
+        # superseded — clear the latch here (NOT in the interrupted branch, which
+        # runs on a background playout task and may resolve after this next turn
+        # has already started). This keeps normal split-final coalescing intact:
+        # the flag is False for every turn that was not itself barged into.
+        prior_turn_interrupted["value"] = False
         # Once an authorized reply has been created, the next interim
         # generation must default to substantive tool-first policy. The
         # current reply already captured its route-specific settings; this
@@ -3718,6 +3864,21 @@ async def _run_phone_session(
                     interrupted = bool(getattr(handle, "interrupted", False))
                     if interrupted:
                         assistant_delivery_complete.clear()
+                        # FIX 2: record that THIS turn ended by interruption, not
+                        # by a still-streaming reply. The coalescing guard reads
+                        # this to route the candidate's follow-up to the
+                        # interrupted re-ask path instead of swallowing it.
+                        # GENERATION-GUARDED (post-review): this runs on a
+                        # background playout task that may resolve AFTER a newer
+                        # reply was already created. Set the latch only if THIS
+                        # reply is still the latest (`created_seq` is still the
+                        # top of `speech_sequence`); otherwise a stale set would
+                        # wrongly route a later, non-interrupted follow-up into
+                        # the re-ask path. The synchronous `prior_handle_
+                        # interrupted` read in the turn hook covers the case
+                        # where this set has not landed yet.
+                        if created_seq == speech_sequence[0]:
+                            prior_turn_interrupted["value"] = True
                     else:
                         assistant_delivery_complete.set()
                     delivered = getattr(agent, "_on_reply_delivered", None)
@@ -3809,6 +3970,12 @@ async def _run_phone_session(
                 _emit_phone_latency_segment(
                     "local_vad_end_to_first_audio", first_audio_wall - local_vad_end_wall,
                 )
+                # FIX 3: the authoritative headline turn-taking latency, anchored
+                # on true end-of-speech (local VAD), not the first fragment's SDK
+                # stopped_speaking_at. Same anchor as the segment above; emitted
+                # under its own clearly-named metric so operators stop reading the
+                # pause-inflated speech_end_* number.
+                _emit_phone_headline_latency(local_vad_end_wall, first_audio_wall)
             latency_state["speech_created_mono"] = None
             latency_state["speech_end_wall"] = None
             latency_state["local_vad_end_wall"] = None
@@ -4365,6 +4532,7 @@ async def _run_phone_session(
                 close_event=close_event,
                 endpoint_delay_eou=endpoint_delay_eou,
                 latency_state=latency_state,
+                prior_turn_interrupted=prior_turn_interrupted,
                 turn_mode=turn_mode,
                 coverage_judge_enabled=coverage_judge_enabled,
             )
