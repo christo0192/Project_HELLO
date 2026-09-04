@@ -40,6 +40,7 @@ import {
   finalizeWorkerInbandRecording,
   isWorkerInbandEgressId,
   markWorkerRecordingFailed,
+  sniffRecordingContentType,
 } from '../lib/recording-egress.js';
 
 const SESSION = '99999999-8888-4777-8666-555555555555';
@@ -183,6 +184,53 @@ describe('finalizeWorkerInbandRecording — no egress stop/poll', () => {
     expect(link!.recording_size_bytes).toBe(bytes.length);
     expect(link!.recording_sha256).toBe(createHash('sha256').update(bytes).digest('hex'));
     expect(link!.recording_egress_status).toBe('complete');
+  });
+
+  // ── v114 (2026-09-04): the raw-OGG FALLBACK content type ──────────────
+  // When the worker's OGG→MP3 transcode dies on a channel desync it uploads the
+  // RAW OGG to the SAME `.mp3` key rather than lose the audio. The finalizer
+  // sniffs the object's container bytes, so it records `audio/ogg` — the
+  // QA-visible signal that the MP3 transcode failed but the audio was retained —
+  // instead of mislabeling OGG bytes as MP3.
+  it('records audio/ogg content type when the object is a raw-OGG fallback', async () => {
+    // A minimal object whose leading bytes are the Ogg capture pattern "OggS".
+    const bytes = Buffer.concat([Buffer.from('OggS'), Buffer.from('\x00 raw ogg fallback payload')]);
+    const { db, updates } = fakeDb({
+      callSessionRows: [
+        {
+          recording_object_key: null,
+          recording_provenance: 'worker_inband',
+          recording_egress_id: WORKER_EGRESS_ID,
+          recording_egress_status: 'complete',
+          mode: 'live',
+        },
+        { recording_egress_id: WORKER_EGRESS_ID, recording_object_key: null, recording_provenance: 'worker_inband' },
+      ],
+      phoneAttemptRow: { recording_object_key: OBJECT_KEY, recording_manifest_key: MANIFEST_KEY },
+      bytes,
+    });
+    const client = egressSpy();
+
+    const status = await finalizeAuthoritativeRecording(SESSION, { db, client });
+    expect(status).toBe('ready');
+    const link = updates.find((u) => 'recording_object_key' in u);
+    expect(link).toBeDefined();
+    // The honest fallback marker: a worker_inband recording carrying audio/ogg.
+    expect(link!.recording_content_type).toBe('audio/ogg');
+    expect(link!.recording_provenance).toBe('worker_inband');
+    // Audio was retained, not lost: the row still links + completes.
+    expect(link!.recording_egress_status).toBe('complete');
+    expect(link!.recording_sha256).toBe(createHash('sha256').update(bytes).digest('hex'));
+  });
+
+  it('sniffRecordingContentType distinguishes OGG from MP3 by magic bytes', () => {
+    expect(sniffRecordingContentType(Buffer.from('OggS\x00stuff'))).toBe('audio/ogg');
+    // ID3-tagged MP3, raw MPEG frame sync, and anything non-Ogg → audio/mpeg.
+    expect(sniffRecordingContentType(Buffer.from('ID3\x04mp3'))).toBe('audio/mpeg');
+    expect(sniffRecordingContentType(Buffer.from([0xff, 0xfb, 0x90, 0x00]))).toBe('audio/mpeg');
+    expect(sniffRecordingContentType(Buffer.from('random'))).toBe('audio/mpeg');
+    // Too short to carry the pattern → default to mpeg (never throws).
+    expect(sniffRecordingContentType(Buffer.from('Og'))).toBe('audio/mpeg');
   });
 
   it('enforces the size cap: an oversize object LATCHES to failed (fallback_required)', async () => {

@@ -4137,7 +4137,11 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         key = "PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC"
         prior = _os.environ.get(key)
         try:
-            for raw, expected in [("1.25", 1.25), ("0.2", 1.0), ("9", 2.0)]:
+            # v114: floor lowered 1.0 -> 0.5 so a desired 0.8 is honoured
+            # verbatim (not clamped to 1.0), while 0.3 still clamps up to 0.5.
+            for raw, expected in [
+                ("1.25", 1.25), ("0.8", 0.8), ("0.3", 0.5), ("0.2", 0.5), ("9", 2.0),
+            ]:
                 _os.environ[key] = raw
                 self.assertAlmostEqual(phone.phone_static_endpointing_max_delay(), expected)
             _os.environ[key] = "not-a-number"
@@ -4355,13 +4359,31 @@ class TestPhoneTtsDeliveryGuidance(unittest.TestCase):
         self.assertIn("SPARINGLY", t)
         for filler in ('"um"', '"hmm"', '"right"'):
             self.assertIn(filler, t)
+        # v114: richer, more human filler vocabulary
+        for filler in (
+            '"you know"', '"I mean"', '"sort of"', '"kind of"',
+            '"honestly"', '"look"', '"I guess"',
+        ):
+            self.assertIn(filler, t)
+        # v114: explicit "commas around fillers" punctuation guidance so Sarvam
+        # renders the micro-pause and the filler is never comma-less.
+        self.assertIn("COMMAS", t)
+        self.assertIn("comma-less", t)
         # ellipsis discipline
         self.assertIn("do NOT stack ellipses", t)
         # the sensitive-moment guardrail (mirrors the no-humor rule)
         self.assertIn("NEVER use a filler", t)
         self.assertIn("consent", t)
+        self.assertIn("recording disclosure", t)
         self.assertIn("compensation", t)
+        self.assertIn("callback confirmation", t)
         self.assertIn("resume-discrepancy", t)
+
+    def test_new_fillers_and_comma_guidance_absent_from_browser_prompt(self):
+        browser = prompting.system_prompt(candidate_name="Asha", role_title="Advisor")
+        for filler in ('"sort of"', '"kind of"', '"I guess"'):
+            self.assertNotIn(filler, browser)
+        self.assertNotIn("comma-less", browser)
 
     def test_it_reaches_the_phone_gemini_system_prompt(self):
         # The delivery block must be in the text the phone lane hands the LLM,
@@ -4376,6 +4398,84 @@ class TestPhoneTtsDeliveryGuidance(unittest.TestCase):
         browser = prompting.system_prompt(candidate_name="Asha", role_title="Advisor")
         self.assertNotIn(phone.PHONE_TTS_DELIVERY_TEXT, browser)
         self.assertNotIn("NATURAL SPOKEN DELIVERY", browser)
+
+
+class TestTtsFirstFragmentBoundary(unittest.TestCase):
+    """v114 — the FIRST speakable fragment must be a natural unit: a short
+    leading filler ("Mm,") merges forward instead of flushing as its own tiny
+    synthesis (Sarvam re-primes prosody per call → choppy). A sentence
+    terminator still flushes immediately, min_chars is the hard latency cap, and
+    the concatenation of fragments is always loss-less."""
+
+    @staticmethod
+    def _segments(text, min_chars, chunk_size=None):
+        async def _src():
+            if chunk_size is None:
+                yield text
+            else:
+                for i in range(0, len(text), chunk_size):
+                    yield text[i:i + chunk_size]
+
+        async def _run():
+            return [
+                frag async for frag in phone._tts_early_flush_segments(_src(), min_chars)
+            ]
+
+        return asyncio.run(_run())
+
+    def test_leading_filler_merges_forward_not_flushed_alone(self):
+        text = "Mm, got it, building trust makes all the difference."
+        # A generous cap so the comma gate (not min_chars) governs the first
+        # fragment; the filler must not be synthesised on its own.
+        frags = self._segments(text, 200)
+        self.assertNotEqual(frags[0], "Mm,")
+        self.assertFalse(frags[0].strip().startswith("Mm,") and len(frags[0].strip()) < 6)
+        # The first fragment reached the sentence terminator as a natural unit.
+        self.assertTrue(frags[0].rstrip().endswith("."))
+        self.assertEqual("".join(frags), text)
+
+    def test_min_chars_only_counts_alphabetic_for_the_clause_gate(self):
+        # "Oh," (2 letters) is below _TTS_FIRST_FRAGMENT_MIN_CHARS, so the comma
+        # after it does not flush; it merges into the first real clause.
+        text = "Oh, that is a really thoughtful approach, honestly."
+        frags = self._segments(text, 200)
+        self.assertNotEqual(frags[0], "Oh,")
+        self.assertEqual("".join(frags), text)
+
+    def test_normal_first_clause_still_flushes_promptly_at_a_comma(self):
+        # Once the fragment IS a natural unit (>= 14 letters), a comma flushes
+        # it — first-audio latency is not raised in the common case.
+        text = "I built two analytics programs last year, and they shipped on time."
+        frags = self._segments(text, 200)
+        self.assertGreaterEqual(len(frags), 2)
+        self.assertTrue(frags[0].rstrip().endswith(","))
+        self.assertEqual("".join(frags), text)
+
+    def test_sentence_terminator_flushes_immediately_even_if_short(self):
+        # A short first SENTENCE ("Hi there!") still flushes on its own — the
+        # min-chars merge applies only to clause pauses, never terminators.
+        text = "Hi there! What draws you to this role?"
+        frags = self._segments(text, 200)
+        self.assertEqual(frags[0], "Hi there!")
+        self.assertEqual("".join(frags), text)
+
+    def test_long_run_on_flushes_at_the_min_chars_cap(self):
+        # No punctuation at all: the hard latency cap must still fire so first
+        # audio is not starved.
+        text = ("well " * 19).strip() + " done"  # no boundary, no trailing space
+        frags = self._segments(text, 20)
+        self.assertGreater(len(frags), 1)
+        first_dense = len([c for c in frags[0] if not c.isspace()])
+        self.assertGreaterEqual(first_dense, 20)
+        self.assertEqual("".join(frags), text)
+
+    def test_lossless_across_streaming_chunk_boundaries(self):
+        # The re-chunker must be loss-less regardless of how the source is split.
+        text = "Mm, got it, building trust makes all the difference. What next?"
+        for cs in (1, 3, 7):
+            with self.subTest(chunk_size=cs):
+                frags = self._segments(text, 40, chunk_size=cs)
+                self.assertEqual("".join(frags), text)
 
 
 # ── Number safety ─────────────────────────────────────────────────────
@@ -7587,7 +7687,10 @@ class TestPhoneTurnDetectionFlag(unittest.TestCase):
         with patch.object(agent_mod.openai, "LLM", _CapturingLLM):
             _CapturingLLM.last_kwargs = None
             agent_mod._build_phone_provider_session()
-            self.assertEqual(_CapturingLLM.last_kwargs.get("temperature"), 0.9)
+            # v114: LOWERED 0.9 -> 0.6 for stable-but-creative turns — reduces
+            # the fabricated-reconciliation hallucination seen on the live B1
+            # conflict path while keeping natural, non-repetitive phrasing.
+            self.assertEqual(_CapturingLLM.last_kwargs.get("temperature"), 0.6)
 
             # Browser/WebRTC keeps the provider default — no temperature passed.
             _CapturingLLM.last_kwargs = None
@@ -7617,8 +7720,21 @@ class TestPhoneTurnDetectionFlag(unittest.TestCase):
             agent_mod._build_phone_provider_session()
         self.assertEqual(tts.call_args.kwargs["speaker"], "simran")
         self.assertEqual(tts.call_args.kwargs["pace"], 1.0)
-        self.assertEqual(tts.call_args.kwargs["temperature"], 0.8)
+        # v114 naturalness tuning: the PHONE Sarvam TTS temperature is warmer
+        # (0.8 -> 1.0) for more expressive prosody on the narrowband line.
+        # `pace` stays 1.0. The browser path stays frozen at 0.8 (below).
+        self.assertEqual(tts.call_args.kwargs["temperature"], 1.0)
         self.assertNotIn("output_audio_codec", tts.call_args.kwargs)
+
+    def test_browser_tts_temperature_stays_frozen(self):
+        # The browser/WebRTC build path is phone_mode=False and deliberately
+        # sha-pinned, so its Sarvam TTS temperature must remain 0.8 (v114 raised
+        # ONLY the phone path). `pace` is 1.0 on both paths.
+        with patch.object(agent_mod, "AgentSession", _CapturingSession), \
+             patch.object(agent_mod.sarvam, "TTS", return_value=object()) as tts:
+            agent_mod._build_provider_session()
+        self.assertEqual(tts.call_args.kwargs["temperature"], 0.8)
+        self.assertEqual(tts.call_args.kwargs["pace"], 1.0)
 
     def test_browser_session_never_gets_turn_detection(self):
         # Even with the flag set to stt, the browser (non-phone) build path is

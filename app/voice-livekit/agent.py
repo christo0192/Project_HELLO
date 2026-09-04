@@ -1460,16 +1460,25 @@ def _build_provider_session(
             model=os.getenv("SARVAM_TTS_MODEL", "bulbul:v3"),
             speaker=os.getenv("SARVAM_TTS_VOICE", "simran"),
             pace=1.0,
-            temperature=0.8,
+            # PHONE ONLY: warmer TTS sampling (0.8 -> 1.0) for more expressive,
+            # less flat prosody, matching the v114 naturalness tuning. The
+            # browser/WebRTC path is deliberately frozen/sha-pinned, so it keeps
+            # 0.8 untouched (mirrors the LLM temperature gating just below).
+            # `pace` stays 1.0 on both paths by owner request.
+            temperature=(1.0 if phone_mode else 0.8),
         ),
         llm=openai.LLM(
             model=phone.phone_primary_model() if phone_mode else GEMINI_MODEL,
             api_key=os.getenv("GEMINI_API_KEY"),
             base_url=GEMINI_BASE_URL,
-            # PHONE ONLY: warmer sampling for more natural, less repetitive
-            # turns. The browser/WebRTC path keeps the provider default so its
-            # sha-pinned behaviour is untouched.
-            **({"temperature": 0.9} if phone_mode else {}),
+            # PHONE ONLY: bounded sampling for stable-but-creative turns. The
+            # browser/WebRTC path keeps the provider default so its sha-pinned
+            # behaviour is untouched. v114: LOWERED 0.9 -> 0.6 — the live call's
+            # B1 defect was a FABRICATED reconciliation ("your timeline makes
+            # total sense"), and a lower temperature reduces that hallucination
+            # on the conflict path while keeping natural, non-repetitive phrasing
+            # (the deterministic coverage judge stays at temperature=0).
+            **({"temperature": 0.6} if phone_mode else {}),
         ),
         **session_options,
     )

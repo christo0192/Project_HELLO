@@ -87,9 +87,10 @@ def _make(session=None, *, fail_wire=False, fail_start=False, transcode=None, up
 
     sink = uploaded if uploaded is not None else {}
 
-    async def default_upload(url, body):
+    async def default_upload(url, body, content_type="audio/mpeg"):
         sink["url"] = url
         sink["body"] = body
+        sink["content_type"] = content_type
 
     r = rec.InWorkerRecorder(
         session,
@@ -234,7 +235,7 @@ class TestInWorkerRecorderLifecycle(unittest.TestCase):
         self.assertIsNone(_finish(r))  # swallowed, no raise
 
     def test_upload_failure_is_fail_open(self):
-        async def boom_upload(url, body):
+        async def boom_upload(url, body, content_type="audio/mpeg"):
             raise RuntimeError("s3_down")
 
         r, _session, _holder = _make(upload=boom_upload)
@@ -270,7 +271,7 @@ class TestInWorkerRecorderLifecycle(unittest.TestCase):
         self.assertEqual(r.finish_failure, "transcode_failed")
 
     def test_finish_failure_names_the_upload_leg(self):
-        async def boom_upload(url, body):
+        async def boom_upload(url, body, content_type="audio/mpeg"):
             raise RuntimeError("upload_failed_status_403")
 
         r, _session, _holder = _make(upload=boom_upload)
@@ -302,6 +303,142 @@ class TestInWorkerRecorderLifecycle(unittest.TestCase):
         never.wire()
         self.assertIsNone(_finish(never))  # nothing begun — not a failure
         self.assertIsNone(never.finish_failure)
+
+    def test_finish_success_declares_mpeg_content_type(self):
+        # The normal path uploads the MP3 and declares audio/mpeg to the PUT.
+        uploaded = {}
+        r, _session, _holder = _make(uploaded=uploaded)
+        r.wire()
+        _begin(r)
+        manifest = _finish(r)
+        self.assertIsNotNone(manifest)
+        self.assertEqual(manifest.content_type, "audio/mpeg")
+        self.assertEqual(uploaded["content_type"], "audio/mpeg")
+
+    # ── v114 (2026-09-04): the OGG FALLBACK — audio is NEVER silently gone ──
+    # On the live v114 call the OGG→MP3 transcode died on a sample/channel
+    # desync (`transcode_failed`, "Input is shorter by 46394 samples") and
+    # finish()'s cleanup then DELETED the raw OGG: total loss of a recoverable
+    # recording. A failed transcode must now retain the raw OGG by uploading it
+    # as a fallback, so a reviewable artifact survives.
+
+
+class _OggWritingRecorder(_FakeRecorder):
+    """A fake recorder whose start() writes a NON-EMPTY OGG at output_path, so
+    finish()'s transcode-failure fallback has a raw OGG to retain."""
+
+    async def start(self, *, output_path):
+        await super().start(output_path=output_path)
+        Path(output_path).write_bytes(b"OggS\x00fake-ogg-container-bytes")
+
+
+class TestOggFallbackRetainsAudio(unittest.TestCase):
+    def _make_with_ogg(self, *, transcode, upload=None, uploaded=None):
+        session = _FakeSession()
+        holder = {}
+
+        def factory(sess, sr):
+            r = _OggWritingRecorder(sess, sr)
+            holder["recorder"] = r
+            return r
+
+        sink = uploaded if uploaded is not None else {}
+
+        async def default_upload(url, body, content_type="audio/mpeg"):
+            sink["url"] = url
+            sink["body"] = body
+            sink["content_type"] = content_type
+
+        r = rec.InWorkerRecorder(
+            session,
+            recorder_factory=factory,
+            transcode_fn=transcode,
+            upload_fn=upload or default_upload,
+        )
+        return r, holder, sink
+
+    def test_transcode_failure_uploads_raw_ogg_and_returns_manifest(self):
+        # The v114 case: transcode throws, but a non-empty OGG exists. finish()
+        # must upload the OGG (audio/ogg) and return a manifest — NOT None, NOT a
+        # silent loss.
+        async def boom_transcode(ogg, mp3):
+            raise RuntimeError("Input is shorter by 46394 samples")
+
+        r, _holder, sink = self._make_with_ogg(transcode=boom_transcode)
+        r.wire()
+        _begin(r)
+        manifest = _finish(r)
+        self.assertIsNotNone(manifest, "audio must NOT be silently lost")
+        self.assertEqual(manifest.content_type, "audio/ogg")
+        self.assertEqual(sink["content_type"], "audio/ogg")
+        self.assertEqual(sink["body"], b"OggS\x00fake-ogg-container-bytes")
+        self.assertEqual(len(manifest.sha256), 64)
+        # The fallback is a retained artifact, not a reported failure.
+        self.assertIsNone(r.finish_failure)
+
+    def test_truncated_transcode_falls_back_to_raw_ogg(self):
+        # The completeness floor makes _default_transcode RAISE when most frames
+        # were skipped (a truncated MP3). finish() must then treat it exactly
+        # like any transcode failure and retain the FULL raw OGG — never upload
+        # the partial MP3 as a clean success. Here the fake transcode writes a
+        # short "truncated" MP3 AND raises, mimicking the floor's behavior.
+        async def truncating_transcode(ogg, mp3):
+            Path(mp3).write_bytes(b"ID3short-truncated-mp3")  # partial output...
+            raise RuntimeError("transcode_truncated_below_floor")  # ...but rejected
+
+        r, _holder, sink = self._make_with_ogg(transcode=truncating_transcode)
+        r.wire()
+        _begin(r)
+        manifest = _finish(r)
+        self.assertIsNotNone(manifest, "truncated audio must fall back, not be lost")
+        # The FULL raw OGG was uploaded, not the truncated MP3.
+        self.assertEqual(manifest.content_type, "audio/ogg")
+        self.assertEqual(sink["content_type"], "audio/ogg")
+        self.assertEqual(sink["body"], b"OggS\x00fake-ogg-container-bytes")
+
+    def test_empty_mp3_falls_back_to_raw_ogg(self):
+        # An empty MP3 (the encoder produced nothing usable) is treated exactly
+        # like a transcode throw: retain the raw OGG rather than lose everything.
+        async def empty_transcode(ogg, mp3):
+            Path(mp3).write_bytes(b"")
+
+        r, _holder, sink = self._make_with_ogg(transcode=empty_transcode)
+        r.wire()
+        _begin(r)
+        manifest = _finish(r)
+        self.assertIsNotNone(manifest)
+        self.assertEqual(manifest.content_type, "audio/ogg")
+        self.assertEqual(sink["content_type"], "audio/ogg")
+
+    def test_ogg_fallback_upload_failure_is_total_loss(self):
+        # If even the OGG fallback upload fails, there is genuinely nothing left:
+        # finish() returns None and names transcode_failed so the caller latches
+        # the loss truthfully (it does NOT fake a success).
+        async def boom_transcode(ogg, mp3):
+            raise RuntimeError("desync")
+
+        async def boom_upload(url, body, content_type="audio/mpeg"):
+            raise RuntimeError("s3_down")
+
+        r, _holder, _sink = self._make_with_ogg(
+            transcode=boom_transcode, upload=boom_upload,
+        )
+        r.wire()
+        _begin(r)
+        self.assertIsNone(_finish(r))
+        self.assertEqual(r.finish_failure, "transcode_failed")
+
+    def test_transcode_failure_with_no_ogg_is_total_loss(self):
+        # No MP3 AND no readable OGG (the default fake recorder writes no OGG):
+        # this is the only genuine total-loss case, reported as transcode_failed.
+        async def boom_transcode(ogg, mp3):
+            raise RuntimeError("desync")
+
+        r, _session, _holder = _make(transcode=boom_transcode)  # plain _FakeRecorder
+        r.wire()
+        _begin(r)
+        self.assertIsNone(_finish(r))
+        self.assertEqual(r.finish_failure, "transcode_failed")
 
 
 @unittest.skipUnless(_HAS_AV, "PyAV/numpy not installed (CI worker env) — validated where present")
@@ -342,6 +479,106 @@ class TestRealPyAvTranscode(unittest.TestCase):
                 self.assertGreater(sum(1 for _ in c.decode(astream)), 0)  # decodes
             finally:
                 c.close()
+
+    def test_pyav_transcode_survives_channel_desync(self):
+        # THE v114 REPRODUCER. The candidate (left) and bot (right) channels
+        # finished with MISMATCHED sample counts, so a decoded frame arrived
+        # short/desynced and the un-hardened encode threw `transcode_failed`
+        # ("Input is shorter by 46394 samples"). Feed a frame stream whose second
+        # frame is a SHORTER, MONO frame (the shape that previously threw) and
+        # assert the hardened resampler coerces it and still produces a valid MP3
+        # rather than losing the whole recording.
+        with tempfile.TemporaryDirectory() as d:
+            ogg = Path(d) / "in.ogg"
+            mp3 = Path(d) / "out.mp3"
+            oc = _av.open(str(ogg), mode="w")
+            st = oc.add_stream("libopus", rate=48000, layout="stereo")
+            sr = 48000
+
+            def _stereo_frame(n):
+                t = _np.arange(n) / sr
+                l = (0.4 * _np.sin(2 * _np.pi * 440 * t) * 32767).astype(_np.int16)
+                r = (0.4 * _np.sin(2 * _np.pi * 880 * t) * 32767).astype(_np.int16)
+                inter = _np.empty(l.size + r.size, dtype=_np.int16)
+                inter[0::2] = l
+                inter[1::2] = r
+                f = _av.AudioFrame.from_ndarray(
+                    inter.reshape(1, -1), format="s16", layout="stereo")
+                f.sample_rate = sr
+                return f
+
+            # A full stereo frame, then a SHORTER stereo frame (the desync tail).
+            for n in (int(sr * 0.30), int(sr * 0.05)):
+                for p in st.encode(_stereo_frame(n)):
+                    oc.mux(p)
+            for p in st.encode(None):
+                oc.mux(p)
+            oc.close()
+
+            # Must NOT raise, and must produce a non-empty, decodable MP3.
+            _run(rec._default_transcode(ogg, mp3))
+            self.assertTrue(mp3.exists() and mp3.stat().st_size > 0)
+            c = _av.open(str(mp3))
+            try:
+                astream = c.streams.audio[0]
+                self.assertGreater(sum(1 for _ in c.decode(astream)), 0)
+            finally:
+                c.close()
+
+    def test_pyav_transcode_fails_when_most_frames_skipped(self):
+        # THE COMPLETENESS-FLOOR GUARANTEE (adversarial-review MED). A desync
+        # that corrupts MOST frames but encodes a FEW must NOT pass a truncated
+        # MP3 off as success — it must RAISE so finish() takes the OGG fallback
+        # and preserves the full raw audio. We simulate the corruption by making
+        # the resampler throw on all but the first frame, driving the skipped
+        # fraction far above the 2% floor.
+        import unittest.mock as _mock
+
+        with tempfile.TemporaryDirectory() as d:
+            ogg = Path(d) / "in.ogg"
+            mp3 = Path(d) / "out.mp3"
+            oc = _av.open(str(ogg), mode="w")
+            st = oc.add_stream("libopus", rate=48000, layout="stereo")
+            sr = 48000
+            # ~1.5s of audio → enough Opus frames that "all but the first fail"
+            # is well above the 2% floor.
+            t = _np.arange(int(sr * 1.5)) / sr
+            l = (0.4 * _np.sin(2 * _np.pi * 440 * t) * 32767).astype(_np.int16)
+            r = (0.4 * _np.sin(2 * _np.pi * 880 * t) * 32767).astype(_np.int16)
+            inter = _np.empty(l.size + r.size, dtype=_np.int16)
+            inter[0::2] = l
+            inter[1::2] = r
+            frame = _av.AudioFrame.from_ndarray(
+                inter.reshape(1, -1), format="s16", layout="stereo")
+            frame.sample_rate = sr
+            for p in st.encode(frame):
+                oc.mux(p)
+            for p in st.encode(None):
+                oc.mux(p)
+            oc.close()
+
+            from av.audio.resampler import AudioResampler as _RealResampler
+
+            class _FlakyResampler:
+                """Encodes the first input frame, throws on every subsequent one
+                — the "most of the stream is corrupt" shape."""
+
+                def __init__(self, *a, **k):
+                    self._inner = _RealResampler(*a, **k)
+                    self._n = 0
+
+                def resample(self, frame):
+                    if frame is not None:
+                        self._n += 1
+                        if self._n > 1:
+                            raise RuntimeError("simulated desync corruption")
+                    return self._inner.resample(frame)
+
+            with _mock.patch(
+                "av.audio.resampler.AudioResampler", _FlakyResampler,
+            ):
+                with self.assertRaises(RuntimeError):
+                    _run(rec._default_transcode(ogg, mp3))
 
 
 class TestRecordingProvider(unittest.TestCase):

@@ -705,10 +705,12 @@ def phone_tts_flush_min_chars() -> int:
 
     THE FIX this knob drives: the phone ``tts_node`` re-segments the cleaned LLM
     text stream itself and drives the downstream synthesis one EARLY FRAGMENT at
-    a time (first clause / first punctuation incl. comma, or once this many
-    chars accumulate). Each fragment is delivered as its own segment whose
-    ``end_input`` flushes Sarvam's tokenizer regardless of ``min_sentence_len``,
-    so the first speakable fragment reaches Sarvam as soon as it is ready.
+    a time (first sentence terminator; OR a clause pause once the fragment is a
+    natural unit — see ``_TTS_FIRST_FRAGMENT_MIN_CHARS``, v114; OR once this many
+    chars accumulate as the hard cap). Each fragment is delivered as its own
+    segment whose ``end_input`` flushes Sarvam's tokenizer regardless of
+    ``min_sentence_len``, so the first speakable fragment reaches Sarvam as soon
+    as it is ready.
 
     PROSODY TRADEOFF: a non-zero value splits the reply into AT MOST TWO
     downstream syntheses (first clause, then the whole remainder), so the
@@ -906,8 +908,13 @@ def phone_turn_detection() -> str:
 
 def phone_static_endpointing_max_delay() -> float:
     """Read an optional phone-only max-delay override, defaulting to 1.5s. Bounded
-    to [1.0, 2.0]; tightening it (e.g. 1.25) shortens the slow-speaker tail and the
-    dead-air after the candidate stops."""
+    to [0.5, 2.0]; tightening it (e.g. 1.25, or an aggressive 0.8) shortens the
+    slow-speaker tail and the dead-air after the candidate stops.
+
+    v114 (live call): the floor was lowered from 1.0 to 0.5 so a desired 0.8s max
+    is honoured verbatim instead of being clamped up to 1.0 — the default (1.5)
+    when the env var is unset is unchanged, so this only affects an explicit,
+    rollback-safe override."""
     raw = os.getenv("PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC")
     if raw in (None, ""):
         return PHONE_LOCAL_ENDPOINTING_MAX_DELAY_SEC
@@ -915,7 +922,7 @@ def phone_static_endpointing_max_delay() -> float:
         value = float(raw)
     except ValueError:
         return PHONE_LOCAL_ENDPOINTING_MAX_DELAY_SEC
-    return min(2.0, max(1.0, value))
+    return min(2.0, max(0.5, value))
 
 
 def phone_local_endpointing_delays() -> tuple[float, float]:
@@ -2399,14 +2406,21 @@ PHONE_TTS_EMOTION_TEXT = (
 PHONE_TTS_DELIVERY_TEXT = (
     "NATURAL SPOKEN DELIVERY (extra):\n"
     "- Sprinkle in occasional, genuine fillers where a real recruiter would — a "
-    "light \"um\", \"hmm\", \"right\", \"you know\", \"I mean\" — but SPARINGLY, at "
-    "most once every few turns. They should feel unplanned, never decorative.\n"
+    "light \"um\", \"hmm\", \"right\", \"you know\", \"I mean\", \"sort of\", "
+    "\"kind of\", \"honestly\", \"look\", \"I guess\" — but SPARINGLY, at most "
+    "once every few turns. They should feel unplanned, never decorative.\n"
+    # v114 (live call): fillers need EXPLICIT punctuation guidance or Sarvam
+    # renders them comma-less and rushed, with no micro-pause. Always set a
+    # filler off with commas so the TTS pauses naturally around it.
+    "- Always set a filler off with COMMAS so the voice pauses naturally around "
+    "it — write \"So, you know, the way I'd approach it...\", never a comma-less "
+    "\"So you know the way...\". A filler without commas sounds rushed.\n"
     "- Use commas for short pauses and full stops for a clean beat; reserve "
     "\"...\" for a real moment of hesitation or empathy, and do NOT stack ellipses "
     "across lines (it sounds choppy).\n"
-    "- NEVER use a filler or any lightness during the consent line, compensation, "
-    "callback confirmation, or a resume-discrepancy question — stay clean and "
-    "direct there.\n"
+    "- NEVER use a filler or any lightness during the consent line, the recording "
+    "disclosure, compensation, callback confirmation, or a resume-discrepancy "
+    "question — stay clean and direct there.\n"
     "- Keep each line short so the voice breathes naturally; one idea, then the "
     "question.\n\n"
 )
@@ -2496,6 +2510,25 @@ _TTS_EARLY_FLUSH_PUNCT = frozenset(",.!?;:…")
 #: decide where a letter-free sentence-run ends.
 _TTS_SENTENCE_TERMINATORS = frozenset(".!?…")
 
+#: The clause-pause punctuation (comma / semicolon / colon) — the members of
+#: ``_TTS_EARLY_FLUSH_PUNCT`` that are NOT sentence terminators. A flush at one
+#: of these is held back until the first fragment is a natural unit (see
+#: ``_TTS_FIRST_FRAGMENT_MIN_CHARS``).
+_TTS_CLAUSE_PAUSE_PUNCT = _TTS_EARLY_FLUSH_PUNCT - _TTS_SENTENCE_TERMINATORS
+
+#: v114 (live call): the reply "Mm, got it, building trust makes all the
+#: difference. What draws you…" flushed "Mm," as its own tiny synthesis — Sarvam
+#: re-primes prosody per synthesis call, so a two-letter leading fragment sounds
+#: like a choppy prosodic reset mid-acknowledgement. The FIRST fragment must be
+#: a natural unit: a CLAUSE-PAUSE (comma/;/:) does not flush it until at least
+#: this many real (alphabetic) characters have accumulated, so short leading
+#: fillers ("Mm,", "Oh,", "Right,") merge FORWARD into the first real clause. A
+#: SENTENCE terminator (.!?…) still flushes immediately, and
+#: ``phone_tts_flush_min_chars()`` remains the hard latency cap that flushes
+#: regardless. Kept small so a normal first clause still flushes promptly and
+#: first-audio latency is not raised in the common case.
+_TTS_FIRST_FRAGMENT_MIN_CHARS = 14
+
 
 async def _leftover_then_src(leftover: str, src: Any) -> Any:
     """Yield the remainder ONE CHARACTER AT A TIME for the letter-free-lead peek.
@@ -2520,11 +2553,19 @@ async def _tts_early_flush_segments(text: Any, min_chars: int) -> Any:
 
     Yields the smallest speakable fragments the phone lane should hand to the
     downstream synthesiser one at a time. A fragment is emitted as soon as
-    EITHER a clause boundary (``_TTS_EARLY_FLUSH_PUNCT`` — first comma / clause
-    pause / sentence terminator) is reached OR ``min_chars`` non-space
-    characters have accumulated since the last flush, WHICHEVER COMES FIRST.
-    That is the whole point: the first fragment leaves BEFORE the full first
-    sentence has been generated, instead of after it (the SDK default).
+    EITHER a SENTENCE terminator (``_TTS_SENTENCE_TERMINATORS`` — ``.!?…``) is
+    reached, a CLAUSE PAUSE (comma / ``;`` / ``:``) is reached AFTER at least
+    ``_TTS_FIRST_FRAGMENT_MIN_CHARS`` alphabetic characters have accumulated, OR
+    ``min_chars`` non-space characters have accumulated since the last flush —
+    WHICHEVER COMES FIRST. That is the whole point: the first fragment leaves
+    BEFORE the full first sentence has been generated, instead of after it (the
+    SDK default).
+
+    v114 (live call): the clause-pause gate is why a short leading filler
+    ("Mm,", "Oh,", "Right,") MERGES FORWARD into the first real clause instead
+    of flushing as its own tiny synthesis — Sarvam re-primes prosody per call,
+    so a two-letter first fragment sounds choppy. A sentence terminator still
+    flushes immediately and ``min_chars`` remains the hard latency cap.
 
     The trailing partial (whatever is left when the stream ends) is always
     flushed so no text is dropped. When ``min_chars <= 0`` early-flush is
@@ -2542,25 +2583,38 @@ async def _tts_early_flush_segments(text: Any, min_chars: int) -> Any:
 
     buf = ""
     # Count of non-space chars in buf — a run of spaces must not trip the
-    # threshold and emit a whitespace-only fragment.
+    # `min_chars` hard cap and emit a whitespace-only fragment.
     dense = 0
+    # Count of ALPHABETIC chars in buf — the clause-pause gate holds a comma
+    # flush until the first fragment is a natural unit (v114 filler merge).
+    alpha = 0
     async for chunk in _aiter_text(text):
         for ch in chunk:
             buf += ch
             if not ch.isspace():
                 dense += 1
-            # Flush at the FIRST clause boundary, or once enough real
-            # characters have accumulated — whichever fires first.
-            if ch in _TTS_EARLY_FLUSH_PUNCT or dense >= min_chars:
+            if ch.isalpha():
+                alpha += 1
+            # Flush the FRAGMENT when: a sentence terminator is reached (always,
+            # immediately); OR a clause pause is reached once the fragment is a
+            # natural unit (>= _TTS_FIRST_FRAGMENT_MIN_CHARS letters, so short
+            # leading fillers merge forward); OR the hard latency cap is hit.
+            if (
+                ch in _TTS_SENTENCE_TERMINATORS
+                or (ch in _TTS_CLAUSE_PAUSE_PUNCT and alpha >= _TTS_FIRST_FRAGMENT_MIN_CHARS)
+                or dense >= min_chars
+            ):
                 if buf.strip():
                     yield buf
                     buf = ""
                     dense = 0
+                    alpha = 0
                 else:
                     # Only whitespace/punctuation so far — keep accumulating a
                     # real word rather than synthesising silence.
                     buf = ""
                     dense = 0
+                    alpha = 0
     if buf.strip():
         yield buf
 
@@ -4919,6 +4973,96 @@ _CONFLICT_NONANSWER_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: v114 (live call): the candidate answered the conflict probe with a
+#: COUNTER-QUESTION — "can you explain what conflict is between resume and what
+#: I told?" (~17 words). It reads as substantive and exceeds the 12-word
+#: non-answer cap, so it was classified ENGAGED and the ONE re-pursuit was
+#: suppressed; the bot then capitulated and fabricated a reconciliation. A
+#: candidate question directed BACK at the interviewer, asking THEM to explain
+#: the conflict / discrepancy / "what you mean", does not engage the gap. It
+#: must read as a DEFLECTION so re-pursuit fires. Two shapes:
+#:   * an interrogative about the discrepancy itself ("what conflict?", "which
+#:     part doesn't line up?", "what's the mismatch?"); and
+#:   * "(can/could you) explain / clarify / tell me what you mean / the
+#:     conflict/mismatch/discrepancy" turned back on the interviewer.
+#:
+#: ADVERSARIAL-REVIEW FIX (must not fire on an ENGAGED candidate who ALSO asks a
+#: clarifying question): the deflection is only the PRIMARY payload when it
+#: anchors at the START of the utterance AFTER stripping leading filler /
+#: acquiescence ("yeah", "sure", "but", "I can do that"), AND the utterance
+#: carries no substantive clause about their timeline/roles/experience/position.
+#: So "I worked there for three years. Which part of my resume seems wrong?" and
+#: "Could you tell me which role you mean, since my resume lists two…" stay
+#: ENGAGED — the substantive account comes first (fails the anchor) and/or a
+#: first-person account is present (fails the substantive-clause guard).
+#: The explain-branch is deliberately TIGHT (no bare "mean"/"resume"/"differ"
+#: target and a short window) so an engaged clarification is not swept in.
+_CONFLICT_INTERROGATIVE_DEFLECTION_RE = re.compile(
+    r"^(?:"
+    r"what(?:\s+(?:is|are|was))?(?:\s+the)?\s+"
+    r"(?:conflict|mismatch|discrepanc(?:y|ies)|difference|issue|problem)s?\b|"
+    r"what\s+conflicts?\b|"
+    r"which\s+part\b.{0,40}\b(?:conflict|line\s+up|match|wrong|differ|discrepanc)|"
+    r"what\s+do\s+you\s+mean\b|"
+    r"(?:can|could|would)\s+you\s+(?:please\s+)?"
+    r"(?:explain|clarify|tell\s+me|elaborate)\b.{0,30}"
+    r"\b(?:conflict|mismatch|discrepancy|what\s+you\s+mean|what\s+conflicts?)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+#: Leading filler / acquiescence a candidate may prepend to ANY reply. Stripped
+#: (trivial tokens ONLY — never substantive words like "honestly I think…") so
+#: the deflection regex can anchor on the FIRST real clause. If that clause is a
+#: real account, the anchor fails and the reply is ENGAGED.
+_CONFLICT_LEAD_FILLER_RE = re.compile(
+    r"^(?:\s*(?:yeah|yes|yep|sure|okay|ok|right|um+|uh+|hmm+|so|well|oh|"
+    r"definitely|absolutely|of\s+course|no\s+problem|sorry|wait|"
+    r"i\s+can\s+do\s+that|i\s+will|i\s+can|but|and|however)\b[\s,.!?-]*)+",
+    re.IGNORECASE,
+)
+
+#: A substantive clause: a first-person account of experience/roles/timeline, or
+#: an explicit position ("my resume is accurate"). Its PRESENCE anywhere means
+#: the candidate engaged, so a trailing clarifying question does not demote the
+#: reply to a deflection (adversarial-review guard, independent of the anchor).
+_CONFLICT_SUBSTANTIVE_CLAUSE_RE = re.compile(
+    # Action verbs are always substantive. Bare copulas (was/were/am) are NOT —
+    # "I am not sure", "I was confused" are non-answers — so a copula counts only
+    # when followed by an article/role/possessive ("I was a proprietary trader"),
+    # never when negated. `have/had` require a following word (a real object).
+    r"\bi\s+(?:worked|work|led|lead|managed|manage|built|build|did|do|handled|"
+    r"handle|resolved|resolve|joined|spent|ran|run|sold|sell|closed|close|"
+    r"reported|report|owned|own|have\s+\w|had\s+\w)\b|"
+    r"\bi\s+(?:was|were|am)\s+"
+    r"(?:a|an|the|my|working|leading|managing|responsible|in\s+charge)\b|"
+    r"\bmy\s+(?:resume|role|job|day-?to-?day|experience|title|timeline|"
+    r"position)\s+(?:is|was|lists|shows|says|has|reflects|states)\b|"
+    r"\bfor\s+\w+\s+years?\b|\bsince\s+\d{4}\b",
+    re.IGNORECASE,
+)
+
+
+def _conflict_reply_is_interrogative_deflection(clean: str) -> bool:
+    """True ONLY when a candidate counter-question about the conflict is the
+    PRIMARY payload — not when an engaged candidate merely tacks on a question.
+
+    Three guards, all required:
+      * the utterance reads as a question (ends '?' OR opens interrogatively);
+      * AFTER stripping leading filler/acquiescence, the tight deflection
+        pattern ANCHORS at the start (a substantive-clause-first reply fails
+        this — "I worked there three years. Which part is wrong?"); and
+      * no substantive clause appears anywhere (an account / a stated position
+        means engaged even with a trailing clarifying question).
+    """
+    if not (clean.endswith("?") or _QUESTION_OPEN_RE.match(clean)):
+        return False
+    if _CONFLICT_SUBSTANTIVE_CLAUSE_RE.search(clean):
+        return False
+    lead = _CONFLICT_LEAD_FILLER_RE.match(clean)
+    stripped = clean[lead.end():] if lead else clean
+    return _CONFLICT_INTERROGATIVE_DEFLECTION_RE.match(stripped) is not None
+
 
 def phone_conflict_reply_unresolved(text: Any) -> bool:
     """True when the candidate's reply to the conflict probe did not engage it.
@@ -4930,12 +5074,32 @@ def phone_conflict_reply_unresolved(text: Any) -> bool:
     """
     if not isinstance(text, str) or not text.strip():
         return True
+    clean = " ".join(text.split())
+    # v114 FIX (tightened after adversarial review): a candidate counter-question
+    # whose PRIMARY payload is asking the interviewer to explain the conflict is
+    # a DEFLECTION regardless of word count. This runs BEFORE the substantive
+    # short-circuit so a >12-word interrogative deflection (which reads as
+    # substantive) is still caught. It is narrowly scoped — anchored at the start
+    # after filler-stripping AND requiring no substantive clause — so an ENGAGED
+    # candidate who ALSO tacks on a clarifying question ("I worked there three
+    # years. Which part is wrong?") is NOT swept in and falls through to the
+    # substance gate unchanged.
+    if _conflict_reply_is_interrogative_deflection(clean):
+        return True
+    # ENGAGED short-circuit (adversarial-review guard): a reply that carries a
+    # real substantive clause about the candidate's timeline/roles/experience —
+    # or a stated position ("my resume is accurate") — HAS engaged the gap, even
+    # if it ALSO tacks on a clarifying question that would otherwise make
+    # `phone_turn_substance` read it as a bare clarification and demote it. It
+    # already failed the primary-payload deflection test above, so it is not a
+    # counter-question dressed up as an answer; treat it as engaged.
+    if _CONFLICT_SUBSTANTIVE_CLAUSE_RE.search(clean):
+        return False
     if phone_turn_substance(text) != PHONE_SUBSTANCE_SUBSTANTIVE:
         return True
     if phone_qna_incomplete(text):
         # A dangling filler ("Um, yeah, so") is not an engagement either.
         return True
-    clean = " ".join(text.split())
     return len(clean.split()) <= 12 and _CONFLICT_NONANSWER_RE.search(clean) is not None
 
 
@@ -4966,6 +5130,17 @@ def phone_conflict_repursuit_instruction(conflict: Any) -> str | None:
         "paraphrasing and attributing it to the resume you received (e.g. 'the "
         "resume we have describes a somewhat different recent role'). Then ask "
         "exactly ONE direct, friendly question inviting them to square the two. "
+        # v114 ANTI-CAPITULATION (live call): when the candidate deflected, the
+        # bot fabricated a reconciliation ("the resume lists a start date a bit
+        # further back, but your timeline makes total sense") and VERBALLY
+        # ENDORSED the unproven account. Forbid that explicitly: the model must
+        # not affirm, validate, or reconcile the candidate's version, and must
+        # not invent any detail (dates, titles, overlaps) to smooth it over.
+        "Do NOT affirm, agree with, validate, or reconcile their account, and "
+        "do NOT invent any reconciliation or detail (no dates, titles, or "
+        "overlaps you were not given) to smooth it over — never say anything "
+        "like 'that makes total sense' or 'no worries'. Simply state the resume "
+        "fact and ask your one question. "
         "Never accuse, never use the word \"discrepancy\", never read the resume "
         "verbatim. Whatever they answer next, accept it gracefully and move on "
         "— do not raise this again."
@@ -6007,6 +6182,11 @@ def phone_agent_class(agent_base: Any) -> Any:
             src = _aiter_text(text)
             first = ""
             dense = 0
+            # Count of ALPHABETIC chars in `first` — the clause-pause gate (v114)
+            # holds a comma flush until the first fragment is a natural unit, so
+            # a short leading filler ("Mm,", "Oh,") merges forward instead of
+            # being synthesized alone (Sarvam re-primes prosody per call).
+            alpha = 0
             leftover = ""
             found = False
             async for chunk in src:
@@ -6014,14 +6194,24 @@ def phone_agent_class(agent_base: Any) -> Any:
                     first += ch
                     if not ch.isspace():
                         dense += 1
-                    # Flush the FIRST fragment at the first clause boundary OR
-                    # min_chars, but ONLY once it carries a speakable LETTER
-                    # (alpha-guard: a letter-free first fragment like "2019."
-                    # would be rejected 400 by Sarvam). A boundary reached before
-                    # any letter keeps accumulating so digits/punct merge FORWARD
-                    # into the first real clause.
+                    if ch.isalpha():
+                        alpha += 1
+                    # Flush the FIRST fragment when: a SENTENCE terminator is
+                    # reached (always); OR a CLAUSE PAUSE (comma/;/:) is reached
+                    # once the fragment is a natural unit (v114:
+                    # >= _TTS_FIRST_FRAGMENT_MIN_CHARS letters, so short leading
+                    # fillers merge forward); OR the min_chars latency cap is hit.
+                    # ALWAYS gated on the fragment carrying a speakable LETTER
+                    # (alpha-guard: a letter-free first fragment like "2019." is
+                    # rejected 400 by Sarvam). A boundary reached before any
+                    # letter keeps accumulating so digits/punct merge FORWARD.
                     if (
-                        ch in _TTS_EARLY_FLUSH_PUNCT or dense >= min_chars
+                        ch in _TTS_SENTENCE_TERMINATORS
+                        or (
+                            ch in _TTS_CLAUSE_PAUSE_PUNCT
+                            and alpha >= _TTS_FIRST_FRAGMENT_MIN_CHARS
+                        )
+                        or dense >= min_chars
                     ) and any(c.isalpha() for c in first):
                         leftover = chunk[idx + 1:]
                         found = True
