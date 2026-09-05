@@ -8,27 +8,43 @@ import type { ParsedResume, ScreeningQuestion, TranscriptTurn } from './types.js
 export const SCREENING_PROMPT_TEMPLATE_VERSION = '2026-08-04.1';
 export const SCORING_PROMPT_TEMPLATE_VERSION = '2026-08-05.1';
 
-// Resume extraction
-export function buildExtractionPrompt(resumeText: string): string {
-  return `You are a resume parser. Extract structured data from the resume text below.
+// ── Resume extraction ────────────────────────────────────────────────────
+//
+// PROMPT ORDERING IS LOAD-BEARING FOR PREFIX CACHING. DeepSeek's automatic
+// context cache keys on the LONGEST IDENTICAL PREFIX across calls, so the
+// STATIC instruction block MUST come first and be byte-identical on every
+// call, and the VARIABLE résumé text MUST come LAST. Hundreds of ingestion
+// calls then all hit the same cached instruction prefix. Do NOT interleave
+// résumé content into the instructions, and do NOT move the résumé above them —
+// either change silently reduces the prompt to a 0% cache-hit rate.
+//
+// The instruction constant is exported so a test can assert this ordering
+// (prefix stable, résumé last) without reconstructing the string.
+export const EXTRACTION_INSTRUCTIONS = `You are a resume parser. Extract structured data from the resume text that follows the instructions below.
 
 Return a JSON object with EXACTLY these keys:
 - "name": full name (string or null)
 - "email": email address (string or null)
-- "phone": the candidate's phone number exactly as written, including any country code (string or null)
+- "phone": the candidate's phone number, including the country code with a leading "+" (string or null). Find it even when it is embedded in a header, footer, address block, or "contact" line, and even when it sits directly next to a postal/PIN code (e.g. "Handwara J&K 193302 9741076931"). Return ONLY the phone number itself — never include the postal/PIN code or any address text in this field. If a country code is present, keep it and prefix it with "+"; if none is present, return the number exactly as written.
 - "skills": array of technical/professional skills (string[])
 - "experience_years": total years of professional experience as a number (number or null)
 - "current_role": most recent job title (string or null)
-- "summary": a 1-2 sentence professional summary (string or null)
+- "summary": a 1-2 sentence professional summary (string or null). The summary must describe the candidate's experience ONLY — do NOT copy the contact block into it. Name, address, phone, and email belong in their own fields, never in "summary".
 - "recent_role": the most recent role as {"title": string|null, "employer": string|null, "period": string|null, "highlights": string[]} or null
 - "prior_roles": up to 5 earlier roles in the same shape (array)
 - "career_highlights": up to 8 concrete achievements stated in the resume (string[])
 - "education": up to 6 education entries stated in the resume (string[])
 - "certifications": up to 6 certifications stated in the resume (string[])
 
+Roles, employers, and titles are NOT only found under a dated "Experience" or "Work History" heading. They may appear inside a narrative professional summary or objective (e.g. "Senior Sales Consultant at Acme with 6 years advising clients"). Extract them into "recent_role"/"current_role"/"prior_roles" from that prose too, not only from a formal experience section.
+
 Copy evidence only. Do not infer employers, dates, achievements, education, or certifications that are not explicitly present.
 
-Resume text:
+Resume text:`;
+
+export function buildExtractionPrompt(resumeText: string): string {
+  // Static instructions FIRST (stable cache prefix), résumé text LAST.
+  return `${EXTRACTION_INSTRUCTIONS}
 """
 ${resumeText.slice(0, 12000)}
 """`;

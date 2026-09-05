@@ -514,7 +514,7 @@ describe('the provenance tag names no vendor', () => {
     expect(isDialableStructurer(MODEL_STRUCTURER_VERSION)).toBe(true);
   });
 
-  it('introduces no provider configuration of its own', () => {
+  it('introduces no PROVIDER configuration of its own', () => {
     const src = require('node:fs').readFileSync(
       require('node:path').join(process.cwd(), 'src/lib/resume-structurer.ts'),
       'utf8',
@@ -523,10 +523,15 @@ describe('the provenance tag names no vendor', () => {
     // prove we are reading the module we think we are.
     expect(src).toContain('export async function structureResumeWithModel');
     expect(src).toContain("from './claude.js'");
-    // No key, no endpoint, no flag, no env read — it composes the shared
-    // runner and nothing else.
-    for (const forbidden of ['process.env', 'API_KEY', 'apiKey', 'fetch(', 'https://', 'env.']) {
+    // No key, no endpoint, no provider URL, no provider model selection — those
+    // all live in the shared runner. This module composes that runner.
+    for (const forbidden of ['API_KEY', 'apiKey', 'fetch(', 'https://', 'DEEPSEEK', 'CLAUDE_', 'env.env']) {
       expect(src).not.toContain(forbidden);
     }
+    // The ONLY environment variable it may read is the concurrency cap — a
+    // call-rate bound, not provider config. Pinned so a stray `process.env`
+    // read of anything else would still be caught by the exact-name assertion.
+    const envReads = src.match(/process\.env\.[A-Z0-9_]+/g) ?? [];
+    expect(envReads).toEqual(['process.env.RESUME_MODEL_MAX_CONCURRENCY']);
   });
 });

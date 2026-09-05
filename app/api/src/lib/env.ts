@@ -12,6 +12,8 @@ const _contractVisibleEnvReads = [
   process.env.BREAKER_TIMEOUT_MS,
   process.env.CLAUDE_MAX_OUTPUT_BYTES,
   process.env.DEEPSEEK_MAX_OUTPUT_BYTES,
+  process.env.DEEPSEEK_REASONING_EFFORT,
+  process.env.RESUME_MODEL_MAX_CONCURRENCY,
   process.env.RECORDING_DOWNLOAD_TTL_SEC,
   process.env.RECORDING_MAX_BYTES,
   process.env.RECORDING_EGRESS_ENABLED,
@@ -82,8 +84,18 @@ export const env = {
   claudeModel: process.env.CLAUDE_MODEL ?? 'haiku',
   claudeScoringModel: process.env.CLAUDE_SCORING_MODEL ?? 'sonnet',
   deepseekApiKey: process.env.DEEPSEEK_API_KEY ?? '',
-  deepseekModel: process.env.DEEPSEEK_MODEL ?? 'deepseek-chat',
-  deepseekScoringModel: process.env.DEEPSEEK_SCORING_MODEL ?? 'deepseek-chat',
+  // Official DeepSeek gateway model. `deepseek-chat` (the legacy default) is
+  // being discontinued, so the code default now points at V4-Flash to match the
+  // official endpoint; fly.toml [env] pins the exact id explicitly.
+  deepseekModel: process.env.DEEPSEEK_MODEL ?? 'deepseek-v4-flash',
+  deepseekScoringModel: process.env.DEEPSEEK_SCORING_MODEL ?? 'deepseek-v4-flash',
+  /**
+   * DeepSeek reasoning_effort. EMPTY (default) ⇒ the field is OMITTED from the
+   * request body: fast JSON extraction, no 400 risk from an unsupported value.
+   * A non-empty string (documented values: 'high' / 'xhigh' for V4-Flash) is
+   * forwarded verbatim as `reasoning_effort`. Not required, not secret.
+   */
+  deepseekReasoningEffort: process.env.DEEPSEEK_REASONING_EFFORT ?? '',
   deepseekTimeoutMs: positiveInt('DEEPSEEK_TIMEOUT_MS', 120000, 1, 300000),
   deepseekMaxOutputBytes: positiveInt(
     'DEEPSEEK_MAX_OUTPUT_BYTES', 5 * 1024 * 1024, 1024, 100 * 1024 * 1024,

@@ -18,9 +18,14 @@ primary_region = "sin"
   SUPABASE_SCHEMA = "screening_v2"
   COMPANY_NAME = "Interview Kickstart"
   WEB_ORIGIN = "https://ib-ik-project-hello.vercel.app"
-  DEEPSEEK_MODEL = "test/deepseek-v4-flash"
-  DEEPSEEK_SCORING_MODEL = "test/deepseek-v4-flash"
-  DEEPSEEK_BASE_URL = "https://ikey-gateway.fly.dev/v1/chat/completions"
+  # Official DeepSeek gateway running V4-Flash. The former "test/" prefix +
+  # ikey-gateway origin belonged to the internal proxy and would 404 on the
+  # official endpoint, so both model ids and the base URL move together.
+  # NOTE (deploy prerequisite): the DEEPSEEK_API_KEY Fly SECRET must now be an
+  # OFFICIAL DeepSeek key — the ikey-gateway key will not authenticate here.
+  DEEPSEEK_MODEL = "deepseek-v4-flash"
+  DEEPSEEK_SCORING_MODEL = "deepseek-v4-flash"
+  DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1/chat/completions"
   DEEPSEEK_TIMEOUT_MS = "120000"
   DEEPSEEK_MAX_OUTPUT_BYTES = "5242880"
   RECORDINGS_BUCKET = "recordings_v2"

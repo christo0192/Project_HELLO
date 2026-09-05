@@ -13,10 +13,13 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   runResumeIngestion,
+  PARSE_TRANSIENT_CODES,
+  PARSE_CLASSIFIER,
   type IngestionPorts,
   type ParseOutput,
   type StructuredResume,
   type IngestionState,
+  type CompletenessSignal,
 } from '../integrations/ashby/resume-ingestion.js';
 import type { ResumeFetchOutcome } from '../integrations/ashby/resume-fetch.js';
 import type { UrlPolicy } from '../integrations/ashby/ssrf.js';
@@ -47,6 +50,10 @@ function makePorts(over: Partial<IngestionPorts> & { bytes?: Buffer } = {}): { p
     fallbackFromText: over.fallbackFromText ?? (() => GOOD),
     onState: over.onState ?? ((s) => { states.push(s); }),
     extractorVersion: 'x1',
+    ...(over.classifyScan ? { classifyScan: over.classifyScan } : {}),
+    ...(over.classifyParse ? { classifyParse: over.classifyParse } : {}),
+    ...(over.onCompleteness ? { onCompleteness: over.onCompleteness } : {}),
+    ...(over.persist ? { persist: over.persist } : {}),
   };
   return { ports, states, bytesRef };
 }
@@ -156,5 +163,121 @@ describe('runResumeIngestion — cancellation + hard failure', () => {
     const out = await runResumeIngestion(ports);
     expect(out.state).toBe('failed_review');
     expect(bytesRef.every((b) => b === 0)).toBe(true);
+  });
+});
+
+// ─── P1: LOAD-INDUCED parse failures defer instead of condemning ───────────
+
+/** A structural parser error double carrying the stable code/detail literals. */
+function parserError(code: string, detail?: string): Error {
+  const e = new Error('synthetic parser failure') as Error & { code: string; detail?: string };
+  e.code = code;
+  if (detail !== undefined) e.detail = detail;
+  return e;
+}
+
+describe('runResumeIngestion — transient parse reclassification (P1)', () => {
+  it('classifies parse_spawn_error as transient', () => {
+    expect(PARSE_TRANSIENT_CODES.has('parse_spawn_error')).toBe(true);
+    expect(PARSE_CLASSIFIER('parse_spawn_error')).toBe('transient');
+  });
+
+  it('a spawn failure DEFERS (no state change, no failure reason) rather than failing review', async () => {
+    const states: IngestionState[] = [];
+    const provenances: Array<unknown> = [];
+    const { ports } = makePorts({
+      // PARSER_ERROR + detail spawn_error → classifyParserFailure → parse_spawn_error.
+      parse: async () => { throw parserError('PARSER_ERROR', 'spawn_error'); },
+      classifyParse: PARSE_CLASSIFIER,
+      onState: (s, prov) => { states.push(s); provenances.push(prov); },
+    });
+    const out = await runResumeIngestion(ports);
+    expect(out).toEqual({
+      state: 'deferred', reason: 'parse_spawn_error', scanStatus: 'parse_spawn_error', deferSource: 'parse',
+    });
+    // The durable row keeps `extracting` and never records a failure reason.
+    expect(states).toEqual(['fetching', 'scanning', 'extracting']);
+    expect(states).not.toContain('failed_review');
+  });
+
+  it('keeps parse_bad_output / parse_extract_failed as PERMANENT verdicts', async () => {
+    for (const [code, detail, reason] of [
+      ['PARSER_ERROR', 'bad_output', 'parse_bad_output'],
+      ['PARSER_ERROR', 'extract_failed', 'parse_extract_failed'],
+    ] as const) {
+      const { ports } = makePorts({
+        parse: async () => { throw parserError(code, detail); },
+        classifyParse: PARSE_CLASSIFIER,
+      });
+      const out = await runResumeIngestion(ports);
+      expect(out).toEqual({ state: 'failed_review', reason });
+    }
+  });
+
+  it('keeps parse_child_exit a verdict (ambiguous OOM-vs-baddoc stays fail-safe)', async () => {
+    const { ports } = makePorts({
+      parse: async () => { throw parserError('PARSER_ERROR', 'child_exit'); },
+      classifyParse: PARSE_CLASSIFIER,
+    });
+    const out = await runResumeIngestion(ports);
+    expect(out).toEqual({ state: 'failed_review', reason: 'parse_child_exit' });
+  });
+});
+
+// ─── P0: empty-but-text-present completeness signal ────────────────────────
+
+/** A useful-but-role-less structured result over non-trivial text. */
+const NAME_ONLY: StructuredResume = {
+  name: 'Priya Nair', email: 'priya@example.com', phone: null, skills: ['Excel'],
+  experience_years: null, current_role: null, summary: null,
+  recent_role: null, prior_roles: [], career_highlights: [], education: [], certifications: [],
+};
+
+describe('runResumeIngestion — completeness signal (P0)', () => {
+  const longText = 'Priya Nair worked for many years advising clients on programs and outcomes across teams.';
+
+  it('emits resume_structured_empty_text_present when text is present but all roles are lost — WITHOUT failing', async () => {
+    const signals: CompletenessSignal[] = [];
+    const { ports } = makePorts({
+      parse: async (): Promise<ParseOutput> => ({ text: longText, structured: NAME_ONLY, structurerVersion: 'p1' }),
+      onCompleteness: (s) => { signals.push(s); },
+    });
+    const out = await runResumeIngestion(ports);
+    // It is a real résumé — ingestion SUCCEEDS.
+    expect(out.state).toBe('ready');
+    // …and the silent degrade is surfaced.
+    expect(signals).toHaveLength(1);
+    expect(signals[0].category).toBe('resume_structured_empty_text_present');
+    expect(signals[0].textLength).toBe(longText.length);
+  });
+
+  it('does NOT emit when the structured result carries a role', async () => {
+    const withRole: StructuredResume = { ...NAME_ONLY, current_role: 'Program Advisor' };
+    const signals: CompletenessSignal[] = [];
+    const { ports } = makePorts({
+      parse: async (): Promise<ParseOutput> => ({ text: longText, structured: withRole, structurerVersion: 'p1' }),
+      onCompleteness: (s) => { signals.push(s); },
+    });
+    await runResumeIngestion(ports);
+    expect(signals).toHaveLength(0);
+  });
+
+  it('does NOT emit on trivial text (an empty document is not a structuring miss)', async () => {
+    const signals: CompletenessSignal[] = [];
+    const { ports } = makePorts({
+      parse: async (): Promise<ParseOutput> => ({ text: 'hi', structured: NAME_ONLY, structurerVersion: 'p1' }),
+      onCompleteness: (s) => { signals.push(s); },
+    });
+    await runResumeIngestion(ports);
+    expect(signals).toHaveLength(0);
+  });
+
+  it('a throwing completeness sink never fails the ingestion', async () => {
+    const { ports } = makePorts({
+      parse: async (): Promise<ParseOutput> => ({ text: longText, structured: NAME_ONLY, structurerVersion: 'p1' }),
+      onCompleteness: () => { throw new Error('sink down'); },
+    });
+    const out = await runResumeIngestion(ports);
+    expect(out.state).toBe('ready');
   });
 });
