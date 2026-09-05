@@ -131,11 +131,18 @@ describe('classifyParserFailure', () => {
     expect(new Set(PARSE_FAILURE_CODES).size).toBe(PARSE_FAILURE_CODES.length);
   });
 
-  it('exactly two codes are transient, and they are the AVAILABILITY ones', () => {
-    expect([...PARSE_TRANSIENT_CODES].sort()).toEqual(['parse_overload', 'parse_timeout']);
-    // A broken deployment (spawn/exit/missing asset) must rest LOUDLY: waiting
-    // silently on it is a fault nobody is paged for.
-    for (const code of ['parse_spawn_error', 'parse_child_exit', 'parse_asset_missing']) {
+  it('the AVAILABILITY codes are transient (incl. spawn: a capacity blip, not a document verdict)', () => {
+    expect([...PARSE_TRANSIENT_CODES].sort()).toEqual(
+      ['parse_overload', 'parse_spawn_error', 'parse_timeout'],
+    );
+    // parse_spawn_error is a LOAD-INDUCED capacity condition at hundreds-parallel
+    // (fork/thread exhaustion), never a statement about the document — it defers
+    // and retries, BOUNDED by the attempt ceiling + wall-clock deadline, so a
+    // genuinely broken deployment still rests LOUDLY in failed_review after the
+    // bounded retries rather than condemning a good candidate on the first blip.
+    // parse_child_exit / parse_asset_missing stay IMMEDIATE verdicts (an
+    // OOM-vs-bad-doc ambiguity / a missing asset must page a human now).
+    for (const code of ['parse_child_exit', 'parse_asset_missing']) {
       expect(PARSE_CLASSIFIER(code)).toBe('verdict');
     }
     // Document verdicts too.
@@ -160,13 +167,16 @@ describe('runResumeIngestion — parse disposition', () => {
     expect(states.at(-1)).toEqual({ state: 'failed_review', reason: 'parse_extract_failed' });
   });
 
-  it('a broken deployment rests loudly rather than waiting', async () => {
+  it('a spawn failure DEFERS (capacity blip) — retries rather than condemning a good candidate on the first blip', async () => {
+    // Bounded: the attempt ceiling + wall-clock deadline still land a genuinely
+    // broken deployment in failed_review eventually; it just survives a transient
+    // fork/thread exhaustion under hundreds-parallel load first.
     const { ports, states } = portsFor(new ParserError('spawn_error'), {
       classifyParse: PARSE_CLASSIFIER,
     });
     const out = await runResumeIngestion(ports);
-    expect(out).toMatchObject({ state: 'failed_review', reason: 'parse_spawn_error' });
-    expect(states.map((s) => s.state)).toContain('failed_review');
+    expect(out).toMatchObject({ state: 'deferred', reason: 'parse_spawn_error' });
+    expect(states.map((s) => s.state)).not.toContain('failed_review');
   });
 
   it('an unknown failure still writes exactly `parse_error` — no regression in honesty', async () => {
