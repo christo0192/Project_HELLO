@@ -34,7 +34,8 @@ class TestOpeningAndIdentityDisclosure(unittest.TestCase):
         self.assertIn("Never claim to be human", prompt)
 
     def test_system_prompt_confirms_name_instead_of_asserting_record_name(self):
-        prompt = system_prompt(candidate_name="Rijo")
+        # PHONE lane (name_unverified=True): confirm-don't-assert.
+        prompt = system_prompt(candidate_name="Rijo", name_unverified=True)
 
         # The record name is no longer asserted as established fact.
         self.assertNotIn("The candidate is Rijo", prompt)
@@ -45,8 +46,18 @@ class TestOpeningAndIdentityDisclosure(unittest.TestCase):
         self.assertIn("do NOT argue", prompt)
         self.assertIn("use the name THEY give", prompt)
 
-    def test_closing_does_not_unconditionally_assert_record_name(self):
+    def test_browser_lane_keeps_original_name_assertion_byte_identical(self):
+        # BROWSER lane (default flag): the frozen surface must keep the ORIGINAL
+        # assertion — the phone-only confirm text must NOT leak here (guards the
+        # sha-pinned browser prompt surface).
         prompt = system_prompt(candidate_name="Rijo")
+        self.assertIn("The candidate is Rijo, applying for", prompt)
+        self.assertNotIn("UNVERIFIED record name", prompt)
+        self.assertIn("thank Rijo by name", prompt)
+
+    def test_closing_does_not_unconditionally_assert_record_name(self):
+        # PHONE lane: closing gated on a CONFIRMED name.
+        prompt = system_prompt(candidate_name="Rijo", name_unverified=True)
 
         # The closing no longer hard-asserts "thank Rijo by name".
         self.assertNotIn("thank Rijo by name", prompt)

@@ -1464,6 +1464,10 @@ def _phone_instructions_text(state: "phone.PhoneAssessmentState") -> str:
             "each response. Never select or advance a question yourself."
         ),
         interviewer_instructions=(state.interviewer_instructions or "")[:2000],
+        # PHONE-ONLY: confirm-don't-assert the record name (identity fix). The
+        # browser lane calls system_prompt() without this flag, so its sha-pinned
+        # surface stays byte-identical.
+        name_unverified=True,
     )
     text = (
         text
