@@ -1,8 +1,10 @@
 /**
- * Shared button style helpers for the Mission Control area (design-token
- * based). Kept in a pure module so component files stay fast-refresh clean.
+ * Shared button style helpers for the Mission Control area. Thin wrappers
+ * over the design-system `buttonClass` so every action in this area wears
+ * the same glass controls as the rest of the shell.
  */
-import { cx } from '../design/cx';
+import { buttonClass } from '../design/Button';
+import type { ButtonVariant } from '../design/Button';
 
 export type MissionButtonVariant = 'primary' | 'secondary' | 'danger';
 
@@ -10,26 +12,13 @@ export function buttonClassNames(
   variant: MissionButtonVariant = 'primary',
   extra?: string,
 ): string {
-  return cx(
-    // `min-h-[44px]` is the WCAG 2.5.5 target floor. `px-4 py-2 text-sm`
-    // alone renders ~36px tall, which is below it on touch — and these are
-    // the confirm/cancel controls of every destructive action in the app.
-    'inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors',
-    'focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-surface',
-    'disabled:cursor-not-allowed disabled:opacity-60',
-    variant === 'primary' &&
-      'bg-brand-600 text-white shadow-sm hover:bg-brand-700 focus-visible:ring-brand-500',
-    variant === 'secondary' &&
-      'border border-line bg-surface text-ink hover:bg-surface-tertiary focus-visible:ring-info',
-    variant === 'danger' &&
-      'bg-error text-white shadow-sm hover:bg-error/90 focus-visible:ring-error',
-    extra,
-  );
+  // Write controls default to the 44px target size (phone-calendar a11y gate).
+  return buttonClass(variant as ButtonVariant, 'lg', extra);
 }
 
 export function smallButtonClassNames(
   variant: MissionButtonVariant = 'secondary',
   extra?: string,
 ): string {
-  return buttonClassNames(variant, cx('px-2.5 py-1.5 text-xs', extra));
+  return buttonClass(variant as ButtonVariant, 'sm', extra);
 }

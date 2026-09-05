@@ -758,7 +758,7 @@ function ActionQueue({
                     <p className="mt-0.5 text-xs text-ink-tertiary">
                       {formatDateTime(intent.created_at)}
                       {intent.consent_verified && (
-                        <span className="ml-2 rounded bg-success-soft px-1.5 py-0.5 text-[11px] font-medium text-success">
+                        <span className="ml-2 rounded bg-success-soft px-1.5 py-0.5 text-[11px] font-medium text-success-text">
                           consent verified
                         </span>
                       )}

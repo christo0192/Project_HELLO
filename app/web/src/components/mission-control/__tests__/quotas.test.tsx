@@ -2,6 +2,10 @@
  * QuotasSection — abstract quota policy configuration.
  * Covers: scope clarity, create/update/toggle with explicit confirmation,
  * abstract-units-only (never currency/price), stable failure copy, axe.
+ *
+ * Glass redesign: policy rows are glass panels, not table rows, so row
+ * scoping uses `[data-policy-row]` instead of `tr`, and the row limit pills
+ * are sentence case ("Max sessions 10"). Behaviour assertions are unchanged.
  */
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -44,11 +48,11 @@ describe('QuotasSection', () => {
     renderQuotas();
     await screen.findByText('Quota policies');
 
-    const globalRow = screen.getByText('Global').closest('tr') as HTMLElement;
-    expect(within(globalRow).getByText(/max sessions 10/)).toBeInTheDocument();
+    const globalRow = screen.getByText('Global').closest('[data-policy-row]') as HTMLElement;
+    expect(within(globalRow).getByText(/Max sessions 10/)).toBeInTheDocument();
     expect(within(globalRow).getByText('disabled')).toBeInTheDocument();
 
-    const candidateRow = screen.getByText('Candidate').closest('tr') as HTMLElement;
+    const candidateRow = screen.getByText('Candidate').closest('[data-policy-row]') as HTMLElement;
     expect(within(candidateRow).getAllByText(/cand-1234-567/).length).toBeGreaterThan(0);
     expect(within(candidateRow).getByText('enabled')).toBeInTheDocument();
 
@@ -115,7 +119,7 @@ describe('QuotasSection', () => {
     renderQuotas();
     await screen.findByText('Quota policies');
 
-    const globalRow = screen.getByText('Global').closest('tr') as HTMLElement;
+    const globalRow = screen.getByText('Global').closest('[data-policy-row]') as HTMLElement;
     fireEvent.click(within(globalRow).getByRole('button', { name: 'Edit' }));
     await userEvent.clear(within(globalRow).getByLabelText(/Max sessions for p1/));
     await userEvent.type(within(globalRow).getByLabelText(/Max sessions for p1/), '25');

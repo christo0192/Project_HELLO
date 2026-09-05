@@ -1,26 +1,31 @@
 /**
- * HELLO Mission Control — premium admin/SRE area for nontechnical
- * operators (Lane 4).
+ * HELLO Mission Control — admin/SRE area for nontechnical operators.
  *
- * The page is a clear, separate surface from the legacy AdminDashboard:
- * every section below is writable ONLY through the existing audited admin
+ * Every section below is writable ONLY through the existing audited admin
  * API plus the Lane-2 allowlist endpoints. No direct DB/cloud/provider/
  * deploy/rollback/reconciliation controls are offered — nothing here
  * invents capabilities the API does not expose.
  *
  * Sections (internal accessible sub-navigation, keyboard + mobile safe):
- * Overview · Access · Sessions · Quotas · Audit · Maintenance.
+ * Overview · Access · Sessions · Quotas · Audit · Maintenance. The active
+ * section is mirrored into the URL hash (`#sessions`) so a section is
+ * shareable and survives a refresh; unknown hashes fall back to Overview.
  *
  * Role gate: non-admin operators see a truthful "admin access required"
  * panel and NO admin API calls are made (403-free by construction).
  */
 
 import { useCallback, useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { api, ApiError } from '../api';
 import type { MeResponse } from '../types';
-import { ErrorState, LoadingState } from '../components/ui';
-import { PageHeader } from '../components/design';
+import {
+  EmptyPanel,
+  ErrorPanel,
+  GlassPanel,
+  LoadingPanel,
+  PageHeader,
+} from '../components/design';
 import {
   AccessSection,
   AuditSection,
@@ -30,10 +35,22 @@ import {
   QuotasSection,
   SessionsSection,
 } from '../components/mission-control';
+import { CalendarIcon } from '../components/navigation';
+
+const SECTION_IDS = ['overview', 'access', 'sessions', 'quotas', 'audit', 'maintenance'] as const;
+type SectionId = (typeof SECTION_IDS)[number];
+
+function sectionFromHash(hash: string): SectionId {
+  const id = hash.replace(/^#/, '');
+  return (SECTION_IDS as ReadonlyArray<string>).includes(id) ? (id as SectionId) : 'overview';
+}
 
 export function MissionControlPage() {
   const [me, setMe] = useState<MeResponse | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const location = useLocation();
+  const navigate = useNavigate();
+  const selected = sectionFromHash(location.hash);
 
   const load = useCallback(() => {
     setLoadError(null);
@@ -46,31 +63,34 @@ export function MissionControlPage() {
 
   useEffect(load, [load]);
 
+  const selectSection = useCallback(
+    (id: string) => {
+      navigate({ pathname: location.pathname, search: location.search, hash: id === 'overview' ? '' : `#${id}` }, { replace: true });
+    },
+    [navigate, location.pathname, location.search],
+  );
+
   if (loadError) {
-    return <ErrorState message={loadError} onRetry={load} />;
+    return <ErrorPanel message={loadError} onRetry={load} />;
   }
   if (!me) {
-    return <LoadingState label="Checking access…" />;
+    return <LoadingPanel label="Checking access…" />;
   }
 
   if (me.role !== 'admin') {
     return (
       <div>
         <PageHeader
-          eyebrow="Mission Control"
+          eyebrow="Operations"
           title="Mission Control"
           description="Operational controls for the workspace."
         />
-        <div className="rounded-xl border border-line bg-surface p-10 text-center shadow-card">
-          <p className="text-sm font-medium text-ink-secondary">
-            Admin access required
-          </p>
-          <p className="mx-auto mt-1 max-w-md text-xs text-ink-tertiary">
-            Mission Control is available to admin operators only. Ask an
-            admin to add you to the access list, or use the Talent Workspace
-            for your daily work.
-          </p>
-        </div>
+        <GlassPanel className="mt-6">
+          <EmptyPanel
+            title="Admin access required"
+            hint="Mission Control is available to admin operators only. Ask an admin to add you to the access list, or use the Talent Workspace for your daily work."
+          />
+        </GlassPanel>
       </div>
     );
   }
@@ -78,143 +98,61 @@ export function MissionControlPage() {
   return (
     <div>
       <PageHeader
-        eyebrow="Mission Control"
+        eyebrow="Operations"
         title="Mission Control"
-        description="A clearly separated admin/SRE area for nontechnical operators. Every control writes through the audited admin API — nothing is estimated."
+        description="Every control here writes through the audited admin API. Nothing is estimated."
+        actions={
+          <>
+            {/*
+              Quick links to the two sibling operator surfaces. Real <Link>s
+              (keyboard reachable, open-in-new-tab friendly), rendered ABOVE
+              the section tabs so they never disturb tab state or lazy
+              mounting. Permissions are unchanged: both routes already sit
+              inside the same admin-gated route group.
+            */}
+            <Link to="/ashby-mission-control" className={quickLinkClass}>
+              <span aria-hidden="true" className="flex h-5 w-5 items-center justify-center rounded-md bg-info-soft text-[10px] font-semibold text-info">
+                AS
+              </span>
+              Ashby Mission Control
+              <ArrowIcon />
+            </Link>
+            <Link to="/phone-calendar" className={quickLinkClass}>
+              <span aria-hidden="true" className="flex h-5 w-5 items-center justify-center rounded-md bg-info-soft text-info">
+                <CalendarIcon className="h-3.5 w-3.5" />
+              </span>
+              Phone calendar
+              <ArrowIcon />
+            </Link>
+          </>
+        }
       />
 
-      {/*
-        Ashby Mission Control lives on its own route. Until now the only way
-        to reach it was to type the URL, which is not a navigation model.
-
-        This is a LINK, not a button with an onClick handler: it must be
-        keyboard reachable, focusable, and openable in a new tab by the same
-        habits every other link obeys. It renders ABOVE the section tabs so it
-        cannot disturb their state or lazy mounting.
-
-        PERMISSIONS ARE UNCHANGED. `/mission-control` and
-        `/ashby-mission-control` already sit inside the SAME
-        `<ProtectedRoute requireRole="admin">` in App.tsx, so surfacing the
-        destination grants nothing that was not already reachable — and the
-        API behind it stays authoritative regardless.
-
-        PALETTE: every colour utility here must resolve to a key in
-        `tailwind.config.js`. The ink scale's BASE is `ink` (`var(--ink)`) —
-        there is no `ink-primary`, and Tailwind emits nothing for an unknown
-        key without erroring, so a typo compiles to a silently colourless
-        class. The focus ring uses `ring-brand-500`, the token the other 11
-        focus rings in this app already use. A test below pins that every
-        colour token in this card exists in the theme.
-
-        ICON: the repository carries no Ashby brand asset (`public/icons.svg`
-        holds unused social glyphs only), and fetching one would be an
-        unlicensed third-party mark. So the treatment is a neutral, decorative
-        glyph drawn from the page's own palette tokens and marked
-        `aria-hidden` — it is deliberately NOT an imitation of the Ashby logo,
-        and the accessible name comes from the text.
-      */}
-      <Link
-        to="/ashby-mission-control"
-        className="mb-6 flex items-center gap-4 rounded-xl border border-line bg-surface p-5 shadow-card transition-colors hover:border-ink-tertiary focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 sm:mb-8 sm:p-6"
-      >
-        <span
-          aria-hidden="true"
-          className="flex h-10 w-10 flex-none items-center justify-center rounded-lg border border-line text-sm font-semibold text-ink-secondary"
-        >
-          AS
-        </span>
-        <span className="min-w-0">
-          <span className="block text-sm font-medium text-ink">
-            Ashby Mission Control
-          </span>
-          <span className="mt-0.5 block text-xs text-ink-tertiary">
-            Job mappings, application workflows and resume ingestion for the
-            Ashby integration.
-          </span>
-        </span>
-        <span aria-hidden="true" className="ml-auto hidden flex-none text-ink-tertiary sm:block">
-          &rarr;
-        </span>
-      </Link>
-
-      {/*
-        The phone calendar is a separate operator surface on its own route.
-        Like the Ashby card above this is a real <Link> — keyboard reachable,
-        focusable, and openable in a new tab — rendered ABOVE the section tabs
-        so it cannot disturb their state or their lazy mounting.
-
-        PERMISSIONS: `/phone-calendar` is authenticated but NOT admin-gated
-        (interviewers may read it; the page and the API both enforce that
-        writes are admin-only). Surfacing it here therefore grants nothing —
-        an admin could already reach it — and every admin reading this page
-        already has strictly more access than the link confers.
-
-        PALETTE: same rule as the card above. Every colour utility must
-        resolve to a key in `tailwind.config.js`; the ink scale's base is
-        `ink`, there is no `ink-primary`, and the focus ring is
-        `ring-brand-500`. The monogram is a neutral, decorative glyph drawn
-        from the page's own tokens — no external icon or logo is fetched.
-      */}
-      <Link
-        to="/phone-calendar"
-        className="mb-6 flex items-center gap-4 rounded-xl border border-line bg-surface p-5 shadow-card transition-colors hover:border-ink-tertiary focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 sm:mb-8 sm:p-6"
-      >
-        <span
-          aria-hidden="true"
-          className="flex h-10 w-10 flex-none items-center justify-center rounded-lg border border-line text-sm font-semibold text-ink-secondary"
-        >
-          PC
-        </span>
-        <span className="min-w-0">
-          <span className="block text-sm font-medium text-ink">
-            Phone calendar
-          </span>
-          <span className="mt-0.5 block text-xs text-ink-tertiary">
-            Internal phone screening schedule in India Standard Time — book,
-            reschedule and cancel calls inside the approved calling window.
-          </span>
-        </span>
-        <span aria-hidden="true" className="ml-auto hidden flex-none text-ink-tertiary sm:block">
-          &rarr;
-        </span>
-      </Link>
-
       <MissionControlSections
+        className="mt-6"
         ariaLabel="Mission Control sections"
-        defaultId="overview"
+        selectedId={selected}
+        onSelect={selectSection}
         sections={[
-          {
-            id: 'overview',
-            label: 'Overview',
-            render: () => <OverviewSection />,
-          },
-          {
-            id: 'access',
-            label: 'Access',
-            render: () => <AccessSection />,
-          },
-          {
-            id: 'sessions',
-            label: 'Sessions',
-            render: () => <SessionsSection />,
-          },
-          {
-            id: 'quotas',
-            label: 'Quotas',
-            render: () => <QuotasSection />,
-          },
-          {
-            id: 'audit',
-            label: 'Audit',
-            render: () => <AuditSection />,
-          },
-          {
-            id: 'maintenance',
-            label: 'Maintenance',
-            render: () => <MaintenanceSection />,
-          },
+          { id: 'overview', label: 'Overview', render: () => <OverviewSection /> },
+          { id: 'access', label: 'Access', render: () => <AccessSection /> },
+          { id: 'sessions', label: 'Sessions', render: () => <SessionsSection /> },
+          { id: 'quotas', label: 'Quotas', render: () => <QuotasSection /> },
+          { id: 'audit', label: 'Audit', render: () => <AuditSection /> },
+          { id: 'maintenance', label: 'Maintenance', render: () => <MaintenanceSection /> },
         ]}
       />
     </div>
+  );
+}
+
+const quickLinkClass =
+  'inline-flex h-9 items-center gap-2 rounded-control bg-white/70 pl-2 pr-3 text-[13px] font-medium text-ink shadow-[inset_0_0_0_1px_var(--glass-ring-strong)] transition-[background-color,box-shadow,transform] duration-200 ease-soft hover:-translate-y-px hover:bg-white hover:shadow-pill focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-2 focus-visible:ring-offset-surface-secondary';
+
+function ArrowIcon() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24" className="h-3.5 w-3.5 text-ink-tertiary" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M7 17 17 7M8 7h9v9" />
+    </svg>
   );
 }

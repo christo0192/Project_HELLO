@@ -6,7 +6,12 @@
 /* Project HELLO HR-approved light-first design tokens. The supplied palette is
    the application chrome as well as the candidate experience; the `.dark`
    class is kept only as a compatibility marker for old route tests and maps to
-   the same values rather than inventing an unapproved dark theme. */
+   the same values rather than inventing an unapproved dark theme.
+
+   Surface language (docs/design/hello-glass-design-system.md): frosted glass
+   panels on a softly lit ground. Every colour is a palette value or an
+   alpha of white / the ink; depth comes from translucency and shadow, never
+   from thick borders or coloured accent bars. */
 @layer base {
   :root,
   .dark {
@@ -17,16 +22,27 @@
     --ink: #0f172a;
     --ink-secondary: #334155;
     --ink-muted: #6b7391;
-    --ink-tertiary: #334155;
+    /* Small muted text: the approved muted grey is 4.33:1 on the page ground,
+       so small text takes this text-only derivative (≥4.5:1 on ground, glass
+       and white). The spec value stays for dots, hairlines and ≥18px figures. */
+    --ink-tertiary: #5f6785;
     --line: #dbe1ec;
     --line-strong: #dbe1ec;
-    --success: #1e7590;
+    --success: #398AA2;
+    --success-text: #2f7488;
     --success-soft: #eaf2f4;
     --warning: #a16207;
+    --warning-text: #955b06;
     --warning-soft: #fff8eb;
     --error: #b45a72;
+    --error-text: #9f4d63;
     --error-soft: #f7edf0;
     --info: #4e6ba6;
+    --info-soft: #eaeef6;
+    /* rgb triples for alpha-capable Tailwind tokens (same values as above). */
+    --ink-rgb: 15 23 42;
+    --ink-muted-rgb: 107 115 145;
+    --info-rgb: 78 107 166;
 
     /* Legacy brand utilities now resolve to the approved accent family. */
     --brand-50: #f4f6fb;
@@ -49,11 +65,36 @@
     --chart-red: #b45a72;
     --chart-violet: #938fb8;
 
+    /* Glass material */
+    --glass-bg: rgba(255, 255, 255, 0.66);
+    --glass-bg-strong: rgba(255, 255, 255, 0.82);
+    --glass-rail: rgba(255, 255, 255, 0.58);
+    --glass-sunken: rgba(15, 23, 42, 0.035);
+    --glass-ring: rgba(15, 23, 42, 0.07);
+    --glass-ring-strong: rgba(15, 23, 42, 0.12);
+    --glass-highlight: rgba(255, 255, 255, 0.85);
+    --glass-blur: 18px;
+    --shadow-glass:
+      0 1px 1px rgba(15, 23, 42, 0.03),
+      0 2px 6px -2px rgba(15, 23, 42, 0.05),
+      0 12px 32px -16px rgba(15, 23, 42, 0.16);
+    --shadow-glass-hover:
+      0 2px 3px rgba(15, 23, 42, 0.04),
+      0 6px 14px -6px rgba(15, 23, 42, 0.08),
+      0 24px 48px -20px rgba(15, 23, 42, 0.22);
+    --shadow-pop:
+      0 1px 2px rgba(15, 23, 42, 0.06),
+      0 10px 30px -10px rgba(15, 23, 42, 0.25);
+    --radius-card: 20px;
+    --radius-control: 12px;
+    --radius-pill: 999px;
+
     --duration-fast: 120ms;
     --duration-base: 200ms;
     --duration-slow: 320ms;
     --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
     --ease-emphasized: cubic-bezier(0.85, 0, 0.15, 1);
+    --ease-out-soft: cubic-bezier(0.2, 0.8, 0.2, 1);
   }
 
   html,
@@ -70,12 +111,13 @@
       'Helvetica Neue', Arial, sans-serif;
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
+    font-feature-settings: 'cv11', 'ss01';
   }
 
   :focus-visible {
     outline: 2px solid var(--info);
     outline-offset: 2px;
-    border-radius: 4px;
+    border-radius: 6px;
   }
 
   ::selection {
@@ -84,7 +126,7 @@
 
   * {
     scrollbar-width: thin;
-    scrollbar-color: var(--line-strong) transparent;
+    scrollbar-color: rgba(15, 23, 42, 0.18) transparent;
   }
 
   .tabular-nums {
@@ -93,6 +135,105 @@
 }
 
 @layer components {
+  /* ── Ground ─────────────────────────────────────────────────────────
+     A fixed, softly lit backdrop. Palette tints only (accent-light,
+     positive-light, negative-light) so the glass has something to
+     refract without introducing a hue. */
+  .app-ground {
+    position: relative;
+    isolation: isolate;
+    background-color: var(--surface-secondary);
+  }
+  .app-ground::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    background:
+      radial-gradient(64rem 40rem at 6% -12%, rgba(78, 107, 166, 0.24), transparent 62%),
+      radial-gradient(52rem 34rem at 102% -4%, rgba(57, 138, 162, 0.2), transparent 64%),
+      radial-gradient(40rem 30rem at 28% 58%, rgba(147, 143, 184, 0.14), transparent 60%),
+      radial-gradient(48rem 36rem at 88% 108%, rgba(216, 181, 190, 0.26), transparent 62%),
+      linear-gradient(180deg, #f6f7fc 0%, var(--surface-secondary) 55%);
+  }
+
+  /* ── Glass materials ───────────────────────────────────────────────── */
+  .glass,
+  .glass-strong,
+  .glass-rail {
+    background-color: var(--glass-bg);
+    border: 1px solid var(--glass-ring);
+    box-shadow: var(--shadow-glass), inset 0 1px 0 var(--glass-highlight);
+    border-radius: var(--radius-card);
+  }
+  .glass-strong {
+    background-color: var(--glass-bg-strong);
+  }
+  .glass-rail {
+    background-color: var(--glass-rail);
+    border: 0;
+    border-radius: 0;
+    box-shadow: inset -1px 0 0 var(--glass-ring);
+  }
+  .glass-sunken {
+    background-color: var(--glass-sunken);
+    border-radius: 14px;
+  }
+  .glass-interactive {
+    transition:
+      transform var(--duration-base) var(--ease-out-soft),
+      box-shadow var(--duration-base) var(--ease-out-soft),
+      background-color var(--duration-base) var(--ease-out-soft);
+  }
+  .glass-interactive:hover {
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-glass-hover), inset 0 1px 0 var(--glass-highlight);
+    background-color: var(--glass-bg-strong);
+  }
+  .hairline {
+    border-color: var(--glass-ring);
+  }
+
+  @supports ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+    .glass,
+    .glass-strong,
+    .glass-rail {
+      -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.35);
+      backdrop-filter: blur(var(--glass-blur)) saturate(1.35);
+    }
+  }
+  @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+    .glass,
+    .glass-strong { background-color: rgba(255, 255, 255, 0.94); }
+    .glass-rail { background-color: rgba(255, 255, 255, 0.92); }
+  }
+  @media (prefers-reduced-transparency: reduce) {
+    .glass,
+    .glass-strong,
+    .glass-rail {
+      -webkit-backdrop-filter: none;
+      backdrop-filter: none;
+      background-color: var(--surface);
+    }
+    .app-ground::before { background: var(--surface-secondary); }
+  }
+
+  /* ── Motion-free reveal (usable inside candidate-scoped files) ───── */
+  .fade-up {
+    animation: fade-up 0.45s var(--ease-out-soft) both;
+  }
+  .fade-up-stagger > * {
+    animation: fade-up 0.45s var(--ease-out-soft) both;
+  }
+  .fade-up-stagger > :nth-child(2) { animation-delay: 40ms; }
+  .fade-up-stagger > :nth-child(3) { animation-delay: 80ms; }
+  .fade-up-stagger > :nth-child(4) { animation-delay: 120ms; }
+  .fade-up-stagger > :nth-child(5) { animation-delay: 160ms; }
+  .fade-up-stagger > :nth-child(6) { animation-delay: 200ms; }
+  .fade-up-stagger > :nth-child(n + 7) { animation-delay: 240ms; }
+
+  /* ── Skeleton shimmer ─────────────────────────────────────────────── */
   .skeleton {
     position: relative;
     display: inline-block;
@@ -114,12 +255,34 @@
     );
     animation: skeleton-sweep 1.5s var(--ease-standard) infinite;
   }
+
+  /* ── Native control resets (select chevron, checkbox) ─────────────── */
+  .control-select {
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%235f6785' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='m6 9 6 6 6-6'/></svg>");
+    background-repeat: no-repeat;
+    background-position: right 0.65rem center;
+    background-size: 16px 16px;
+    padding-right: 2.25rem;
+  }
+
+  /* ── Scroll fade masks ────────────────────────────────────────────── */
+  .scroll-fade {
+    -webkit-mask-image: linear-gradient(180deg, transparent 0, #000 16px, #000 calc(100% - 16px), transparent 100%);
+    mask-image: linear-gradient(180deg, transparent 0, #000 16px, #000 calc(100% - 16px), transparent 100%);
+  }
 }
 
 @keyframes skeleton-sweep {
   0% { transform: translateX(-100%); }
   55% { transform: translateX(100%); }
   100% { transform: translateX(100%); }
+}
+
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -129,6 +292,7 @@
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
   }
+  .glass-interactive:hover { transform: none; }
 }
 
 /* Compatibility bridge for pages still carrying stock Tailwind utility

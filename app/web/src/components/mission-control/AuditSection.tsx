@@ -6,19 +6,32 @@
  * target_id, result, created_at). This surface renders exactly those
  * fields and nothing else: metadata, IPs, correlation IDs, tokens and
  * emails are never rendered, even if a payload were to contain them.
- * Pagination is bounded (50 per page, offset window).
+ * Pagination is bounded (50 per page, offset window) and stays server
+ * driven — `Pagination` is fed a state derived from the offset, never a
+ * client-side slice.
  */
 
 import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError } from '../../api';
 import type { AdminAuditRow } from '../../types';
-import { StatusBadge } from '../design';
-import { Table, THead, TBody, Tr, Th, Td } from '../design';
-import { ErrorState, LoadingState } from '../ui';
-import { LinkAction } from './ConfirmButton';
+import {
+  Button,
+  EmptyPanel,
+  ErrorPanel,
+  LoadingPanel,
+  Pagination,
+  SectionHeader,
+  StatusBadge,
+  TBody,
+  THead,
+  Table,
+  Td,
+  Th,
+  Tr,
+} from '../design';
 import { formatDateTime, shortId } from './statusMeta';
 
-const PAGE_SIZE = 50;
+const PAGE_SIZE = 50 as const;
 
 export function AuditSection() {
   const [audit, setAudit] = useState<AdminAuditRow[] | null>(null);
@@ -42,37 +55,49 @@ export function AuditSection() {
   }, [load]);
 
   if (loadError && !audit) {
-    return <ErrorState message={loadError} onRetry={() => load(offset)} />;
+    return <ErrorPanel message={loadError} onRetry={() => load(offset)} />;
   }
   if (!audit) {
-    return <LoadingState label="Loading audit log…" />;
+    return <LoadingPanel label="Loading audit log…" />;
   }
 
   const hasOlder = audit.length === PAGE_SIZE;
+  const page = Math.floor(offset / PAGE_SIZE) + 1;
+  // Offset paging: the window is authoritative, the total is only known up
+  // to the rows fetched so far, and one further page exists exactly when
+  // this one came back full.
+  const pageState = {
+    page,
+    pageSize: PAGE_SIZE,
+    pageCount: hasOlder ? page + 1 : page,
+    total: offset + audit.length,
+    from: audit.length === 0 ? 0 : offset + 1,
+    to: offset + audit.length,
+    setPage: (next: number) => load((next - 1) * PAGE_SIZE),
+    setPageSize: () => undefined,
+  };
 
   return (
-    <div>
-      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h2 className="text-sm font-semibold text-ink">Audit log</h2>
-          <p className="mt-0.5 text-xs text-ink-tertiary">
-            Bounded and redacted — metadata, IPs, correlation IDs, tokens and
-            emails are never returned, so none are rendered here.
-          </p>
-        </div>
-        <LinkAction onClick={() => load(offset)}>Refresh</LinkAction>
-      </div>
+    <div className="space-y-5">
+      <SectionHeader
+        level={2}
+        title="Audit log"
+        description="Bounded and redacted — metadata, IPs, correlation IDs, tokens and emails are never returned, so none are rendered here."
+        actions={
+          <Button size="sm" variant="secondary" onClick={() => load(offset)}>
+            Refresh
+          </Button>
+        }
+      />
 
       {audit.length === 0 ? (
-        <div className="rounded-xl border border-dashed border-line-strong bg-surface-secondary p-10 text-center">
-          <p className="text-sm font-medium text-ink-secondary">No audit events yet</p>
-          <p className="mt-1 text-xs text-ink-tertiary">
-            Actions recorded here once operators perform audited changes.
-          </p>
-        </div>
+        <EmptyPanel
+          title="No audit events yet"
+          hint="Actions recorded here once operators perform audited changes."
+        />
       ) : (
-        <>
-          <Table caption="Recent audit events — action, result, actor, target and time">
+        <div>
+          <Table caption="Recent audit events — action, result, actor, target and time" maxHeight="34rem">
             <THead>
               <Tr>
                 <Th>Action</Th>
@@ -86,7 +111,9 @@ export function AuditSection() {
               {audit.map((row) => (
                 <Tr key={row.id}>
                   <Td>
-                    <span className="font-medium text-ink">{row.action}</span>
+                    <span className="inline-block rounded-md bg-surface-tertiary px-1.5 py-0.5 font-mono text-xs text-ink">
+                      {row.action}
+                    </span>
                   </Td>
                   <Td>
                     <StatusBadge
@@ -121,24 +148,13 @@ export function AuditSection() {
             </TBody>
           </Table>
 
-          <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
-            <p className="text-xs text-ink-tertiary" role="status">
-              Showing the most recent {audit.length} events
-              {offset > 0 ? ` (starting at #${offset + 1})` : ''} — 50 per page.
-            </p>
-            <div className="flex gap-2">
-              <LinkAction
-                onClick={() => load(offset - PAGE_SIZE)}
-                disabled={offset === 0}
-              >
-                ← Newer
-              </LinkAction>
-              <LinkAction onClick={() => load(offset + PAGE_SIZE)} disabled={!hasOlder}>
-                Older →
-              </LinkAction>
-            </div>
-          </div>
-        </>
+          <Pagination state={pageState} noun="events" hidePageSize />
+
+          <p className="px-1 pt-2 text-xs text-ink-tertiary" role="status">
+            Showing the most recent {audit.length} events
+            {offset > 0 ? ` (starting at #${offset + 1})` : ''} — 50 per page.
+          </p>
+        </div>
       )}
     </div>
   );

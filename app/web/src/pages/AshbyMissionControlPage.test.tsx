@@ -1,7 +1,20 @@
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { MemoryRouter } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { AshbyMissionControlPage } from './AshbyMissionControlPage';
+
+/**
+ * The page header now carries a real <Link> back to Mission Control, so the
+ * page needs a router context. Routing itself is not under test here.
+ */
+function renderPage() {
+  return render(
+    <MemoryRouter initialEntries={['/ashby-mission-control']}>
+      <AshbyMissionControlPage />
+    </MemoryRouter>,
+  );
+}
 
 const { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation, deliverAshbyManualInvite, discoverAshbyFeedbackForm } = vi.hoisted(() => ({
   listAshbyMappings: vi.fn(),
@@ -56,11 +69,12 @@ describe('AshbyMissionControlPage', () => {
   });
 
   it('renders sanitized mappings + workflows (no PII/tokens)', async () => {
-    render(<AshbyMissionControlPage />);
+    renderPage();
     expect(await screen.findByText('job_1')).toBeInTheDocument();
     expect(screen.getByText('drift')).toBeInTheDocument();
     expect(screen.getByText('app_1')).toBeInTheDocument();
-    expect(screen.getByText(/ingest: failed_review/)).toBeInTheDocument();
+    // Enums are humanised for operators (raw value kept in `title`).
+    expect(screen.getByText(/Ingest · Failed review/)).toBeInTheDocument();
     // No candidate PII / token / URL leaks in the rendered surface.
     const text = document.body.textContent ?? '';
     expect(text).not.toMatch(/\S+@\S+\.\S+/); // no email
@@ -68,7 +82,7 @@ describe('AshbyMissionControlPage', () => {
   });
 
   it('pauses an enabled mapping and reloads', async () => {
-    render(<AshbyMissionControlPage />);
+    renderPage();
     await screen.findByText('job_1');
     const pauseButtons = screen.getAllByRole('button', { name: 'Pause' });
     await userEvent.click(pauseButtons[0]); // job_1 is enabled → pausable
@@ -77,7 +91,7 @@ describe('AshbyMissionControlPage', () => {
   });
 
   it('cancels a non-terminal workflow and retries a failed operation', async () => {
-    render(<AshbyMissionControlPage />);
+    renderPage();
     await screen.findByText('app_1');
     await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     await waitFor(() => expect(cancelAshbyWorkflow).toHaveBeenCalledWith('l1', 'manual_stage_cancel'));
@@ -87,12 +101,12 @@ describe('AshbyMissionControlPage', () => {
 
   it('surfaces a load error', async () => {
     listAshbyMappings.mockRejectedValue({ message: 'boom' });
-    render(<AshbyMissionControlPage />);
+    renderPage();
     expect(await screen.findByRole('alert')).toBeInTheDocument();
   });
 
   it('has no axe violations', async () => {
-    const { container } = render(<AshbyMissionControlPage />);
+    const { container } = renderPage();
     await screen.findByText('job_1');
     await expect(container).toHaveNoViolations();
   });
@@ -114,7 +128,7 @@ describe('AshbyMissionControlPage — manual invite delivery (B1)', () => {
   });
 
   it('lets an admin obtain a usable candidate link and shows its expiry', async () => {
-    render(<AshbyMissionControlPage />);
+    renderPage();
     const button = await screen.findByRole('button', { name: /get invite link/i });
     await userEvent.click(button);
 
@@ -128,7 +142,7 @@ describe('AshbyMissionControlPage — manual invite delivery (B1)', () => {
 
   it('keeps the token out of the URL, storage and telemetry', async () => {
     const setItem = vi.spyOn(Storage.prototype, 'setItem');
-    render(<AshbyMissionControlPage />);
+    renderPage();
     await userEvent.click(await screen.findByRole('button', { name: /get invite link/i }));
     const field = (await screen.findByLabelText(/candidate link/i)) as HTMLInputElement;
     const token = field.value.split('#')[1];
@@ -147,7 +161,7 @@ describe('AshbyMissionControlPage — manual invite delivery (B1)', () => {
   it('copies the link on demand', async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.assign(navigator, { clipboard: { writeText } });
-    render(<AshbyMissionControlPage />);
+    renderPage();
     await userEvent.click(await screen.findByRole('button', { name: /get invite link/i }));
     await screen.findByLabelText(/candidate link/i);
     await userEvent.click(screen.getByRole('button', { name: /^copy$/i }));
@@ -158,7 +172,7 @@ describe('AshbyMissionControlPage — manual invite delivery (B1)', () => {
 
   it('shows a truthful error and NO link when the server refuses', async () => {
     deliverAshbyManualInvite.mockResolvedValue({ ok: false, error: 'blocked_terminal' });
-    render(<AshbyMissionControlPage />);
+    renderPage();
     await userEvent.click(await screen.findByRole('button', { name: /get invite link/i }));
     expect(await screen.findByRole('alert')).toHaveTextContent(/blocked_terminal/i);
     expect(screen.queryByLabelText(/candidate link/i)).toBeNull();
@@ -166,7 +180,7 @@ describe('AshbyMissionControlPage — manual invite delivery (B1)', () => {
 
   it('shows a truthful error when the request throws', async () => {
     deliverAshbyManualInvite.mockRejectedValue(new Error('network down'));
-    render(<AshbyMissionControlPage />);
+    renderPage();
     await userEvent.click(await screen.findByRole('button', { name: /get invite link/i }));
     expect(await screen.findByRole('alert')).toBeInTheDocument();
     expect(screen.queryByLabelText(/candidate link/i)).toBeNull();
@@ -180,7 +194,7 @@ describe('AshbyMissionControlPage — manual invite delivery (B1)', () => {
         operations: [{ id: 'op2', type: 'invite_delivery', state: 'succeeded', errorCode: null }],
       }],
     });
-    render(<AshbyMissionControlPage />);
+    renderPage();
     expect(await screen.findByRole('button', { name: /reissue invite link/i })).toBeInTheDocument();
   });
 
@@ -189,7 +203,7 @@ describe('AshbyMissionControlPage — manual invite delivery (B1)', () => {
       ok: true,
       workflows: [{ ...WORKFLOWS.workflows[0], lifecycle: 'ready', sessionStatus: 'completed' }],
     });
-    render(<AshbyMissionControlPage />);
+    renderPage();
     // The completion observer is best-effort by design; this badge is what
     // makes a park that never landed visible instead of log-only.
     expect(await screen.findByText(/screened: not parked/i)).toBeInTheDocument();
@@ -200,7 +214,7 @@ describe('AshbyMissionControlPage — manual invite delivery (B1)', () => {
       ok: true,
       workflows: [{ ...WORKFLOWS.workflows[0], lifecycle: 'writeback_pending', sessionStatus: 'completed' }],
     });
-    render(<AshbyMissionControlPage />);
+    renderPage();
     expect(await screen.findByText('app_1')).toBeInTheDocument();
     expect(screen.queryByText(/screened: not parked/i)).toBeNull();
   });
@@ -210,7 +224,7 @@ describe('AshbyMissionControlPage — manual invite delivery (B1)', () => {
       ok: true,
       workflows: [{ ...WORKFLOWS.workflows[0], lifecycle: 'ready', sessionStatus: 'completed', terminalState: 'withdrawn' }],
     });
-    render(<AshbyMissionControlPage />);
+    renderPage();
     expect(await screen.findByText('app_1')).toBeInTheDocument();
     expect(screen.queryByText(/screened: not parked/i)).toBeNull();
   });
@@ -220,7 +234,7 @@ describe('AshbyMissionControlPage — manual invite delivery (B1)', () => {
       ok: true,
       workflows: [{ ...WORKFLOWS.workflows[0], terminalState: 'withdrawn' }],
     });
-    render(<AshbyMissionControlPage />);
+    renderPage();
     const button = await screen.findByRole('button', { name: /get invite link/i });
     expect(button).toBeDisabled();
     expect(deliverAshbyManualInvite).not.toHaveBeenCalled();
@@ -285,7 +299,7 @@ describe('AshbyMissionControlPage — feedback-form schema discovery (read-only)
   });
 
   it('renders ids, labels, types, required flags and the scale for the chosen job', async () => {
-    render(<AshbyMissionControlPage />);
+    renderPage();
     const buttons = await screen.findAllByRole('button', { name: /discover feedback form/i });
     await userEvent.click(buttons[0]);
 
@@ -308,7 +322,7 @@ describe('AshbyMissionControlPage — feedback-form schema discovery (read-only)
   });
 
   it('labels the surface read-only and unverified and never claims a binding', async () => {
-    render(<AshbyMissionControlPage />);
+    renderPage();
     await userEvent.click((await screen.findAllByRole('button', { name: /discover feedback form/i }))[0]);
     await screen.findByText(/form id: form_1/);
 
@@ -325,7 +339,7 @@ describe('AshbyMissionControlPage — feedback-form schema discovery (read-only)
   });
 
   it('renders no candidate PII, token, or URL — structure only', async () => {
-    render(<AshbyMissionControlPage />);
+    renderPage();
     await userEvent.click((await screen.findAllByRole('button', { name: /discover feedback form/i }))[0]);
     await screen.findByText(/form id: form_1/);
 
@@ -336,7 +350,7 @@ describe('AshbyMissionControlPage — feedback-form schema discovery (read-only)
 
   it('says plainly when the plan names no form at all', async () => {
     discoverAshbyFeedbackForm.mockResolvedValue({ ok: true, forms: [], empty: true, truncated: false });
-    render(<AshbyMissionControlPage />);
+    renderPage();
     await userEvent.click((await screen.findAllByRole('button', { name: /discover feedback form/i }))[0]);
     expect(await screen.findByText(/no feedback form is named/i)).toBeInTheDocument();
   });
@@ -358,7 +372,7 @@ describe('AshbyMissionControlPage — feedback-form schema discovery (read-only)
         schemaAvailable: false,
       }],
     });
-    render(<AshbyMissionControlPage />);
+    renderPage();
     await userEvent.click((await screen.findAllByRole('button', { name: /discover feedback form/i }))[0]);
     expect(await screen.findByText(/only\s+its id could be read/i)).toBeInTheDocument();
     expect(document.body.textContent ?? '').toMatch(/not a claim that the form has no fields/i);
@@ -366,14 +380,14 @@ describe('AshbyMissionControlPage — feedback-form schema discovery (read-only)
 
   it('warns when a safety bound clipped the result', async () => {
     discoverAshbyFeedbackForm.mockResolvedValue({ ...FORM_SCHEMA, truncated: true });
-    render(<AshbyMissionControlPage />);
+    renderPage();
     await userEvent.click((await screen.findAllByRole('button', { name: /discover feedback form/i }))[0]);
     expect(await screen.findByText(/truncated by a safety bound/i)).toBeInTheDocument();
   });
 
   it('surfaces a sanitized API error without rendering a schema', async () => {
     discoverAshbyFeedbackForm.mockResolvedValue({ ok: false, error: 'probe_unavailable' });
-    render(<AshbyMissionControlPage />);
+    renderPage();
     await userEvent.click((await screen.findAllByRole('button', { name: /discover feedback form/i }))[0]);
     expect(await screen.findByText('probe_unavailable')).toBeInTheDocument();
     expect(screen.queryByText(/form id:/)).not.toBeInTheDocument();
@@ -381,14 +395,14 @@ describe('AshbyMissionControlPage — feedback-form schema discovery (read-only)
 
   it('surfaces a thrown API error as an alert', async () => {
     discoverAshbyFeedbackForm.mockRejectedValue({ message: 'network down' });
-    render(<AshbyMissionControlPage />);
+    renderPage();
     await userEvent.click((await screen.findAllByRole('button', { name: /discover feedback form/i }))[0]);
     expect(await screen.findByRole('alert')).toBeInTheDocument();
     expect(screen.queryByText(/form id:/)).not.toBeInTheDocument();
   });
 
   it('shows the schema for one mapping at a time', async () => {
-    render(<AshbyMissionControlPage />);
+    renderPage();
     const buttons = await screen.findAllByRole('button', { name: /discover feedback form/i });
     await userEvent.click(buttons[0]);
     await screen.findByText(/form id: form_1/);
@@ -399,7 +413,7 @@ describe('AshbyMissionControlPage — feedback-form schema discovery (read-only)
   });
 
   it('has no axe violations with a schema rendered', async () => {
-    const { container } = render(<AshbyMissionControlPage />);
+    const { container } = renderPage();
     await userEvent.click((await screen.findAllByRole('button', { name: /discover feedback form/i }))[0]);
     await screen.findByText(/form id: form_1/);
     await expect(container).toHaveNoViolations();

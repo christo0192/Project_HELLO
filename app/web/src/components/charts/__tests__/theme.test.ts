@@ -9,14 +9,14 @@ describe('chartPalette', () => {
     const light = chartPalette('light');
     expect(light.colors.slice(0, 4)).toEqual(['#4E6BA6', '#398AA2', '#1E7590', '#D8B5BE']);
     expect(light.text).toBe('#0f172a');
-    expect(light.splitLine).toBe('#eaeef6');
+    expect(light.splitLine).toBe('#f1f5f9'); // spec: chart-support gridline
   });
 
   it('keeps the approved palette under the legacy dark compatibility mode', () => {
     const dark = chartPalette('dark');
     expect(dark.colors[0]).toBe('#4E6BA6');
     expect(dark.text).toBe('#0f172a');
-    expect(dark.splitLine).toBe('#eaeef6');
+    expect(dark.splitLine).toBe('#f1f5f9');
     expect(dark.tooltipBg).toBe('#ffffff');
   });
 });
@@ -34,7 +34,9 @@ describe('chartTheme', () => {
   it('includes a themed tooltip base', () => {
     const { base, palette } = chartTheme('dark', false);
     const tooltip = base.tooltip as Record<string, unknown>;
-    expect(tooltip.backgroundColor).toBe(palette.tooltipBg);
-    expect(tooltip.borderColor).toBe(palette.tooltipBorder);
+    // Glass tooltip: translucent white over the hairline ring; the opaque
+    // palette values remain available for chart chrome (slice borders).
+    expect(String(tooltip.backgroundColor)).toMatch(/^rgba\(255, 255, 255/);
+    expect(palette.tooltipBg).toBe('#ffffff');
   });
 });

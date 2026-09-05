@@ -172,8 +172,9 @@ describe('palette — every colour utility resolves to a real token', () => {
   function themeTokens(): Set<string> {
     const tokens = new Set<string>();
     const colorsBlock = config.slice(config.indexOf('colors: {'));
-    // Top-level semantic keys: `ink: 'var(--ink)'`, `'ink-secondary': …`
-    for (const m of colorsBlock.matchAll(/^\s{8}'?([a-z0-9-]+)'?:\s*'var\(/gm)) {
+    // Top-level semantic keys: `ink: 'var(--ink)'`, `'ink-secondary': …`,
+    // plus the alpha-capable form `ink: 'rgb(var(--ink-rgb) / <alpha-value>)'`.
+    for (const m of colorsBlock.matchAll(/^\s{8}'?([a-z0-9-]+)'?:\s*'(?:var|rgb)\(/gm)) {
       tokens.add(m[1]);
     }
     // Nested numeric scales: brand.50 … brand.950, accent.*
@@ -310,10 +311,9 @@ describe('status is never conveyed by colour alone', () => {
     await screen.findByRole('table');
 
     // Every StatusBadge carries a decorative dot plus text. Assert no badge
-    // is text-empty — a bare coloured dot would be a hue-only signal.
-    const badges = [...container.querySelectorAll('span')].filter((el) =>
-      /rounded-md/.test(el.className) && /ring-inset/.test(el.className),
-    );
+    // is text-empty — a bare coloured dot would be a hue-only signal. The
+    // badge is identified by its data attribute, not by its paint classes.
+    const badges = [...container.querySelectorAll('span[data-status-badge]')];
     expect(badges.length).toBeGreaterThan(0);
     for (const badge of badges) {
       expect((badge.textContent ?? '').trim().length).toBeGreaterThan(0);

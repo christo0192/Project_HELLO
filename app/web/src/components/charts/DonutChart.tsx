@@ -97,12 +97,13 @@ export function DonutChart({
       series: [
         {
           type: 'pie',
-          radius: ['60%', '82%'],
+          radius: ['62%', '84%'],
           center: ['50%', '46%'],
           avoidLabelOverlap: true,
-          itemStyle: { borderColor: palette.tooltipBg, borderWidth: 2, borderRadius: 4 },
+          padAngle: 2,
+          itemStyle: { borderColor: palette.tooltipBg, borderWidth: 2, borderRadius: 6 },
           label: { show: false },
-          emphasis: { scaleSize: 4 },
+          emphasis: { scaleSize: 5 },
           data: data.map((d) => ({ name: d.label, value: d.value })),
         },
       ],
@@ -157,7 +158,7 @@ export function DonutChart({
               const swatch = (
                 <span
                   aria-hidden="true"
-                  className="h-2 w-2 shrink-0 rounded-sm"
+                  className="h-2 w-2 shrink-0 rounded-full"
                   style={{ backgroundColor: palette.colors[index % palette.colors.length] }}
                 />
               );
@@ -168,7 +169,7 @@ export function DonutChart({
                 onBlur: () => setHoveredIndex(null),
               };
               const itemClass =
-                'flex items-center gap-1.5 rounded px-1 py-0.5 text-xs text-ink-secondary transition-colors hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500';
+                'flex items-center gap-1.5 rounded-md px-1.5 py-0.5 text-xs text-ink-secondary transition-colors hover:bg-white/70 hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-info';
               return (
                 <li key={d.label}>
                   {d.href ? (

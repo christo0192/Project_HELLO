@@ -10,8 +10,18 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError } from '../../api';
 import type { PublicStatus } from '../../types';
-import { StatusBadge } from '../design';
-import { ErrorState, LoadingState } from '../ui';
+import {
+  Button,
+  ErrorPanel,
+  Field,
+  GlassPanel,
+  InlineNotice,
+  LoadingPanel,
+  SectionHeader,
+  StatusBadge,
+  Switch,
+  TextField,
+} from '../design';
 import { ConfirmButton } from './ConfirmButton';
 import { maintenanceMeta, stableMutationMessage } from './statusMeta';
 
@@ -38,10 +48,10 @@ export function MaintenanceSection() {
   useEffect(load, [load]);
 
   if (loadError && !status) {
-    return <ErrorState message={loadError} onRetry={load} />;
+    return <ErrorPanel message={loadError} onRetry={load} />;
   }
   if (!status) {
-    return <LoadingState label="Loading maintenance state…" />;
+    return <LoadingPanel label="Loading maintenance state…" />;
   }
 
   const meta = maintenanceMeta(status);
@@ -76,79 +86,61 @@ export function MaintenanceSection() {
   const canSubmit = reason.trim().length > 0;
 
   return (
-    <div>
-      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h2 className="text-sm font-semibold text-ink">Maintenance</h2>
-          <p className="mt-0.5 text-xs text-ink-tertiary">
-            When enabled, new screening sessions are blocked. Changes are
-            confirmed and audited with a reason.
-          </p>
-        </div>
-        <button
-          type="button"
-          onClick={load}
-          className="inline-flex items-center rounded-lg border border-line bg-surface px-3 py-1.5 text-xs font-medium text-ink-secondary transition-colors hover:bg-surface-tertiary hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-info"
-        >
-          Refresh
-        </button>
-      </div>
+    <div className="space-y-5">
+      <SectionHeader
+        title="Maintenance"
+        description="When enabled, new screening sessions are blocked — every change is confirmed and audited with a reason."
+        actions={
+          <Button size="sm" onClick={load}>
+            Refresh
+          </Button>
+        }
+      />
 
       {message && (
-        <p
-          role="status"
-          className={`mb-4 rounded-lg border px-3 py-2 text-sm ${
-            message.tone === 'ok'
-              ? 'border-success/30 bg-success-soft text-success'
-              : 'border-error/30 bg-error-soft text-error'
-          }`}
-        >
+        <InlineNotice tone={message.tone === 'ok' ? 'success' : 'danger'} role="status">
           {message.text}
-        </p>
+        </InlineNotice>
       )}
 
-      <div className="rounded-xl border border-line bg-surface p-5 shadow-card">
-        <h3 className="text-sm font-semibold text-ink">Current state</h3>
-        <div className="mt-3 flex flex-wrap items-center gap-3">
+      <GlassPanel>
+        <SectionHeader level={3} title="Current state" />
+        <div className="glass-sunken mt-3 flex flex-wrap items-center gap-3 rounded-[14px] p-4">
           <StatusBadge tone={meta.tone}>{meta.label}</StatusBadge>
           <p className="text-sm text-ink-secondary">{meta.detail}</p>
         </div>
-        <p className="mt-2 text-xs text-ink-tertiary">
+        <p className="mt-3 text-[13px] text-ink-tertiary">
           Status updated {formatUpdatedAt(status.updated_at)} · last change{' '}
           {formatUpdatedAt(status.maintenance?.updated_at)}
         </p>
-      </div>
+      </GlassPanel>
 
-      <div className="mt-6 rounded-xl border border-line bg-surface p-5 shadow-card">
-        <h3 className="text-sm font-semibold text-ink">Change maintenance mode</h3>
-        <p className="mt-0.5 text-xs text-ink-tertiary">
-          A reason is required for both enabling and disabling — it is
-          written to the audit log.
-        </p>
+      <GlassPanel>
+        <SectionHeader
+          level={3}
+          title="Change maintenance mode"
+          description="A reason is required for both enabling and disabling — it is written to the audit log."
+        />
 
-        <label className="mt-4 flex items-center gap-2 text-sm text-ink">
-          <input
-            type="checkbox"
+        <div className="glass-sunken mt-4 rounded-[14px] p-4">
+          <Switch
             checked={enabled}
-            onChange={(e) => setEnabled(e.target.checked)}
-            className="h-4 w-4 rounded border-line-strong text-brand-600 focus:ring-brand-500"
-          />
-          Enable maintenance (block new sessions)
-        </label>
-
-        <div className="mt-4">
-          <label htmlFor="maintenance-reason" className="mb-1 block text-xs font-medium text-ink-secondary">
-            Reason (required)
-          </label>
-          <input
-            id="maintenance-reason"
-            value={reason}
-            onChange={(e) => setReason(e.target.value)}
-            maxLength={200}
-            placeholder="e.g. planned deployment window"
-            className="w-full rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink placeholder:text-ink-tertiary focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
+            onCheckedChange={setEnabled}
+            label="Enable maintenance (block new sessions)"
           />
         </div>
+
+        <Field label="Reason (required)" id="maintenance-reason" className="mt-4">
+          {({ id }) => (
+            <TextField
+              id={id}
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              maxLength={200}
+              placeholder="e.g. planned deployment window"
+            />
+          )}
+        </Field>
 
         <div className="mt-4">
           <ConfirmButton
@@ -166,7 +158,7 @@ export function MaintenanceSection() {
             onConfirm={applyToggle}
           />
         </div>
-      </div>
+      </GlassPanel>
     </div>
   );
 }

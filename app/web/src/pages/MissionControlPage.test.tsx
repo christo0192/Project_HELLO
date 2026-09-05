@@ -330,8 +330,10 @@ describe('Ashby Mission Control navigation card', () => {
     const link = await findCard();
 
     // A ring width with no ring colour renders in Tailwind's default blue.
+    // The glass shell's shared focus ring is the accent token `ring-info`
+    // (the same ring every design-system control uses).
     expect(link.className).toContain('focus-visible:ring-2');
-    expect(link.className).toContain('focus-visible:ring-brand-500');
+    expect(link.className).toContain('focus-visible:ring-info');
     expect(link.className).not.toContain('ink-primary');
   });
 
@@ -415,7 +417,7 @@ describe('Phone calendar navigation card', () => {
     renderAdmin();
     const link = await findCard();
     expect(link.className).toContain('focus-visible:ring-2');
-    expect(link.className).toContain('focus-visible:ring-brand-500');
+    expect(link.className).toContain('focus-visible:ring-info');
     expect(link.className).not.toContain('ink-primary');
   });
 
