@@ -88,7 +88,7 @@ export function ConfirmButton({
           <p className="text-sm text-ink">{summary}</p>
           <div className="mt-3 flex flex-wrap items-center gap-2">
             <Button
-        size="lg"
+              size="lg"
               variant={toButtonVariant(variant)}
               loading={busy}
               onClick={() => void run()}

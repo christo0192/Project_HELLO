@@ -85,13 +85,16 @@ export function Pagination({ state, noun, hidePageSize = false, className }: Pag
       <div className="flex items-center gap-2">
         {!hidePageSize && (
           <label className="flex items-center gap-2 text-xs text-ink-tertiary">
-            <span>Rows</span>
+            {/* Visible "Rows", accessible name "Rows per page" — the visible
+                text is a prefix of the name (WCAG 2.5.3 label-in-name). */}
+            <span>
+              Rows<span className="sr-only"> per page</span>
+            </span>
             <SelectField
               size="sm"
               value={pageSize}
               onChange={(event) => setPageSize(Number(event.target.value) as PageSize)}
               className="w-[4.75rem]"
-              aria-label="Rows per page"
             >
               {PAGE_SIZES.map((size) => (
                 <option key={size} value={size}>
