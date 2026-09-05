@@ -592,6 +592,10 @@ export const ARM_PHONE_TEST_GATE_STATUSES = [
   'halt_unreadable', 'test_gate_requires_halt', 'test_gate_halt_not_permitted',
   'candidate_mismatch', 'application_not_found',
   'engagement_not_found', 'test_gate_not_eligible', 'test_gate_already_armed',
+  // 0081: a `scheduled` engagement can be armed on its existing cycle only
+  // when its live appointment is genuinely due (starts_at <= now < ends_at);
+  // otherwise the RPC refuses with this status.
+  'test_gate_appointment_not_due',
   'idempotency_conflict',
 ] as const;
 export type ArmPhoneTestGateStatus = (typeof ARM_PHONE_TEST_GATE_STATUSES)[number];
@@ -697,8 +701,11 @@ export const PHONE_RPC_STATUS_UNION: readonly string[] = Object.freeze(
  * `sweep_phone_stranded_recordings` answers only `ok`, which was too — so a
  * two-RPC migration moves the count by one. The exact number is RE-DERIVED by
  * the drift test from the migration text; this constant is only a tripwire.
+ *
+ * 0081 takes it from 104 to 105: `arm_phone_test_gate` gains exactly ONE new
+ * member, `test_gate_appointment_not_due` (the scheduled-but-not-due refusal).
  */
-export const PHONE_RPC_STATUS_COUNT = 104;
+export const PHONE_RPC_STATUS_COUNT = 105;
 
 /**
  * RESULT KEYS the API's behaviour DEPENDS on, per RPC.

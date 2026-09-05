@@ -726,8 +726,13 @@ candidatesRouter.post(
 );
 
 // Arm a single candidate-scoped production test while the global operator
-// pause remains raised. The RPC creates the immutable rescreen intent first,
-// then arms an exclusive ten-minute gate; admission consumes it atomically.
+// pause remains raised. If the candidate already has a live non-terminal
+// engagement (0081: `eligible` or a `scheduled` due appointment), the exclusive
+// ten-minute gate is armed on THAT existing cycle — no new rescreen cycle is
+// minted. Only a candidate with no active cycle takes the original path, which
+// creates the immutable rescreen intent first and then arms. Either way,
+// admission (admit_phone_attempt) consumes the gate atomically and re-checks
+// every consent/allowlist/number/window/lease/capacity/cap prerequisite.
 candidatesRouter.post(
   '/:id/phone-test-gate',
   requireRole('admin'),
@@ -746,7 +751,119 @@ candidatesRouter.post(
     }
     const { request_id: requestId } = req.body as { request_id: string };
     const now = new Date();
+    const expiresAt = new Date(now.getTime() + 10 * 60 * 1000);
+
+    // Helper: arm the exclusive gate on a resolved engagement and answer with
+    // the shared 202 shape. Both the existing-engagement branch and the
+    // fresh-rescreen branch below funnel through this so the arm status matrix,
+    // the audit call and the response contract stay identical. The new
+    // `test_gate_appointment_not_due` refusal (a `scheduled` engagement whose
+    // slot is not currently due, 0081) is mapped exactly like the other gate
+    // refusals: a 409 carrying its status, mirroring `phone_test_gate_refused`.
+    const armGate = async (
+      engagementId: string,
+      cycleNumber: unknown,
+    ): Promise<boolean> => {
+      const { data: gate, error: gateError } = await supabase.rpc('arm_phone_test_gate', {
+        p_candidate_id: candidateId,
+        p_engagement_id: engagementId,
+        p_actor_id: actorId,
+        p_request_id: requestId,
+        p_expires_at: expiresAt.toISOString(),
+        p_now: now.toISOString(),
+      });
+      if (gateError) {
+        res.status(503).json({ ok: false, error: 'phone_test_gate_unavailable' });
+        return true;
+      }
+      const status = rpcStatus(gate);
+      if (status !== 'ok' && status !== 'already_armed') {
+        res.status(409).json({ ok: false, error: 'phone_test_gate_refused', status });
+        return true;
+      }
+      await recordAudit(req, 'resource.update', 202, {
+        metadata: { resource: 'phone_test_gate', outcome: status },
+      });
+      res.status(202).json({
+        ok: true,
+        status: 'armed',
+        engagement_id: engagementId,
+        cycle_number: typeof cycleNumber === 'number' ? cycleNumber : null,
+      });
+      return true;
+    };
+
     try {
+      // Owner-test the EXISTING engagement when one is live. Minting a fresh
+      // rescreen cycle refuses with `active_cycle` whenever the candidate
+      // already has a non-terminal cycle (e.g. a `scheduled` due appointment),
+      // which is exactly the legitimate owner-test case.
+      //
+      // SECURITY: this gate is a bypass of the global operator pause, so the
+      // engagement it arms MUST be unambiguous. A candidate can hold MULTIPLE
+      // non-terminal engagements — `cycle_number` is unique only PER
+      // application_link (0057 uq_phone_engagements_application_cycle), and a
+      // candidate can have several ashby_application_links — so an
+      // order-by-cycle_number-limit-1 could arm the pause-bypass on the WRONG
+      // application's engagement. We therefore fetch ALL non-terminal
+      // engagements and FAIL CLOSED on ambiguity:
+      //   * 0 non-terminal          -> fresh rescreen->arm path (below).
+      //   * exactly 1, armable       -> arm THAT engagement in place.
+      //   * exactly 1, non-armable   -> 409, never fall through to rescreen.
+      //   * more than 1              -> 409, never guess which one.
+      const { data: liveRows, error: existingError } = await supabase
+        .from('phone_engagements')
+        .select('id,state,application_link_id,cycle_number')
+        .eq('candidate_id', candidateId)
+        .is('terminal_at', null);
+      if (existingError) {
+        res.status(503).json({ ok: false, error: 'phone_test_gate_unavailable' });
+        return;
+      }
+      const nonTerminal = (Array.isArray(liveRows) ? liveRows : []) as Array<{
+        id?: unknown; state?: unknown; application_link_id?: unknown; cycle_number?: unknown;
+      }>;
+
+      if (nonTerminal.length > 1) {
+        // Ambiguous: an owner test must never arm a pause-bypass on a guessed
+        // engagement. Report the count and states, not identifiers.
+        res.status(409).json({
+          ok: false,
+          error: 'phone_test_gate_ambiguous_engagement',
+          count: nonTerminal.length,
+          states: nonTerminal.map((r) => (typeof r.state === 'string' ? r.state : 'unknown')),
+        });
+        return;
+      }
+
+      if (nonTerminal.length === 1) {
+        const only = nonTerminal[0];
+        const onlyId = typeof only.id === 'string' ? only.id : null;
+        const onlyState = typeof only.state === 'string' ? only.state : null;
+        if (!onlyId) {
+          res.status(503).json({ ok: false, error: 'phone_test_gate_unavailable' });
+          return;
+        }
+        // `eligible` and `scheduled` are the only gate-armable non-terminal
+        // states (0081). Any other live state (dialing, in_call, reconnecting,
+        // awaiting_retry, pending_prereqs, …) is not an owner-test target, and
+        // we refuse rather than minting a SECOND cycle for the same live
+        // engagement (which would re-trigger the very `active_cycle` bug this
+        // route fixes).
+        if (onlyState === 'eligible' || onlyState === 'scheduled') {
+          await armGate(onlyId, only.cycle_number);
+          return;
+        }
+        res.status(409).json({
+          ok: false,
+          error: 'phone_test_gate_engagement_not_armable',
+          state: onlyState ?? 'unknown',
+        });
+        return;
+      }
+
+      // Zero non-terminal engagements: a genuinely fresh candidate. Keep the
+      // original rescreen->arm path unchanged.
       const { data: rescreen, error: rescreenError } = await supabase.rpc('request_phone_rescreen', {
         p_candidate_id: candidateId,
         p_reason: 'technical_issue',
@@ -770,33 +887,11 @@ candidatesRouter.post(
         res.status(503).json({ ok: false, error: 'phone_test_gate_unavailable' });
         return;
       }
-      const expiresAt = new Date(now.getTime() + 10 * 60 * 1000);
-      const { data: gate, error: gateError } = await supabase.rpc('arm_phone_test_gate', {
-        p_candidate_id: candidateId,
-        p_engagement_id: engagementId,
-        p_actor_id: actorId,
-        p_request_id: requestId,
-        p_expires_at: expiresAt.toISOString(),
-        p_now: now.toISOString(),
-      });
-      if (gateError) {
-        res.status(503).json({ ok: false, error: 'phone_test_gate_unavailable' });
-        return;
-      }
-      const status = rpcStatus(gate);
-      if (status !== 'ok' && status !== 'already_armed') {
-        res.status(409).json({ ok: false, error: 'phone_test_gate_refused', status });
-        return;
-      }
-      await recordAudit(req, 'resource.update', 202, {
-        metadata: { resource: 'phone_test_gate', outcome: status },
-      });
-      res.status(202).json({
-        ok: true,
-        status: 'armed',
-        cycle_number: rescreen && typeof rescreen === 'object' && 'cycle_number' in rescreen
+      await armGate(
+        engagementId,
+        rescreen && typeof rescreen === 'object' && 'cycle_number' in rescreen
           ? (rescreen as { cycle_number?: unknown }).cycle_number : null,
-      });
+      );
     } catch {
       res.status(503).json({ ok: false, error: 'phone_test_gate_unavailable' });
     }

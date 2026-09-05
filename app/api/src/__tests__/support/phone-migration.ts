@@ -156,6 +156,12 @@ export const MIGRATION_0077_PATH = fileURLToPath(
 
 export const MIGRATION_0077 = readFileSync(MIGRATION_0077_PATH, 'utf8');
 
+export const MIGRATION_0081_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0081_owner_test_gate_scheduled.sql', import.meta.url),
+);
+
+export const MIGRATION_0081 = readFileSync(MIGRATION_0081_PATH, 'utf8');
+
 /**
  * Every phone migration, NEWEST FIRST. Extraction walks this in order and the
  * first file that declares a thing wins, which is what "the latest declaration
@@ -163,6 +169,10 @@ export const MIGRATION_0077 = readFileSync(MIGRATION_0077_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    // 0081 re-declares arm_phone_test_gate in full (owner-test path for a
+    // `scheduled` due engagement), so it must be NEWEST-FIRST for the extractor
+    // to read the effective body rather than 0065's.
+    { name: '0081', sql: MIGRATION_0081 },
     { name: '0077', sql: MIGRATION_0077 },
     { name: '0075', sql: MIGRATION_0075 },
     // 0072 adds finalize_phone_partial_sessions (server-side partial-finalize)

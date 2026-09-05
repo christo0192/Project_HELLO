@@ -16,9 +16,15 @@ describe('0063 candidate-scoped phone test gate', () => {
     ]);
   });
 
-  it('arms only during operator_pause and requires an eligible exact engagement', () => {
+  it('arms only during operator_pause and requires an exact-candidate engagement', () => {
     expect(ARM).toContain("v_ctl.halt_reason <> 'operator_pause'");
-    expect(ARM).toContain("v_state <> 'eligible'");
+    // 0081 widened the state guard from `<> 'eligible'` to
+    // `not in ('eligible', 'scheduled')`, keeping the terminal check.
+    expect(ARM).toContain("v_state not in ('eligible', 'scheduled')");
+    expect(ARM).toContain('v_terminal_at is not null');
+    // The pre-0081 sole-`eligible` guard is gone; asserting its absence keeps
+    // this tripwire honest about the actual effective body.
+    expect(ARM).not.toContain("v_state <> 'eligible'");
     expect(ARM).toContain('v_candidate_id <> p_candidate_id');
     expect(ARM).toContain('p_expires_at <= p_now + interval');
     expect(ARM).toContain('p_expires_at > p_now + interval');
@@ -27,7 +33,25 @@ describe('0063 candidate-scoped phone test gate', () => {
       'halt_unreadable', 'test_gate_requires_halt', 'test_gate_halt_not_permitted',
       'candidate_mismatch', 'application_not_found', 'engagement_not_found',
       'test_gate_not_eligible', 'test_gate_already_armed', 'idempotency_conflict',
+      // 0081.
+      'test_gate_appointment_not_due',
     ]));
+  });
+
+  it('0081: a `scheduled` engagement is armable only when its slot is genuinely due', () => {
+    // The due predicate reads the LIVE appointment and requires the window to
+    // contain p_now — cannot arm a future, expired or non-live slot.
+    expect(ARM).toContain("status in ('scheduled', 'confirmed')");
+    expect(ARM).toContain('starts_at <= p_now');
+    expect(ARM).toContain('ends_at > p_now');
+    // The refusal when it is not due.
+    expect(ARM).toContain("return jsonb_build_object('status', 'test_gate_appointment_not_due'");
+    // The due check is scoped to the scheduled branch, so `eligible` never
+    // reads an appointment (behaviour byte-for-byte unchanged from 0065).
+    expect(ARM).toContain("if v_state = 'scheduled' then");
+    // No global-halt mutation ever creeps in: the arm gate must not write the
+    // operator pause it depends on.
+    expect(ARM).not.toContain('update screening_v2.phone_control');
   });
 
   it('consumes atomically and never bypasses non-operator halts', () => {
