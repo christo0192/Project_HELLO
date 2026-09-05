@@ -125,15 +125,33 @@ export const DEFAULT_SCAN_CLASSIFIER: ScanClassifier = () => 'verdict';
 export type ParseClassifier = (code: string) => 'verdict' | 'transient';
 
 /**
- * The ONLY parse codes that may defer automatically.
+ * The parse codes that may defer automatically.
  *
- * Deliberately two, and deliberately not "everything that is not a document
- * verdict": `parse_spawn_error`, `parse_child_exit` and `parse_asset_missing`
- * describe a broken deployment, and a broken deployment that quietly waits is
- * a broken deployment nobody is paged for. Those rest loudly in
- * `failed_review` and are recoverable through the audited admin path.
+ * `parse_timeout` / `parse_overload` — the parser was UNAVAILABLE under load
+ * (killed by the wall-clock timeout on a contended CPU, or the bounded pool
+ * refused the submission). Nothing was learned about the file.
+ *
+ * `parse_spawn_error` — the child process could NOT BE SPAWNED at all. This is
+ * a resource/deployment condition (fork failure under memory pressure, thread
+ * exhaustion, transient OS refusal), never a statement about the document: the
+ * parser never ran, so it reached no conclusion. At hundreds-parallel this is
+ * the characteristic LOAD-INDUCED failure, and condemning a good candidate to
+ * `failed_review` because the box was momentarily out of process slots turns a
+ * capacity blip into a permanent lost hire. It defers and retries, bounded by
+ * the existing wall-clock deadline and attempt ceiling.
+ *
+ * DELIBERATELY EXCLUDED: `parse_child_exit` and `parse_asset_missing`.
+ * `parse_asset_missing` is a broken deployment that must be paged, not waited
+ * on. `parse_child_exit` is genuinely ambiguous at this boundary — an OOM kill
+ * and a parser that ran and rejected a malformed document both surface as a
+ * non-zero exit, and we cannot tell them apart from the stable code alone.
+ * Treating it as transient would silently retry real document verdicts forever,
+ * so it stays a verdict (fail-safe in the direction that pages a human rather
+ * than one that waits invisibly). `parse_bad_output` / `parse_extract_failed`
+ * are genuine DOCUMENT answers and remain permanent verdicts.
  */
-export const PARSE_TRANSIENT_CODES: ReadonlySet<string> = new Set(['parse_timeout', 'parse_overload']);
+export const PARSE_TRANSIENT_CODES: ReadonlySet<string> =
+  new Set(['parse_timeout', 'parse_overload', 'parse_spawn_error']);
 
 /**
  * Default classifier used when a caller injects none: every parse failure is a
@@ -253,6 +271,16 @@ export interface IngestionPorts {
    */
   classifyParse?: ParseClassifier;
   /**
+   * Best-effort completeness observation sink (see {@link CompletenessSignal}).
+   *
+   * Optional and defaulted to a no-op so every existing fake keeps compiling
+   * and the pure-domain unit tests are unaffected. Its ONLY job is to make a
+   * silent structuring degrade visible — the caller wires it to a metric/log.
+   * It must NOT throw and must NOT change the ingestion outcome; a throw is
+   * swallowed here so an observability sink can never fail a real résumé.
+   */
+  onCompleteness?: (signal: CompletenessSignal) => void | Promise<void>;
+  /**
    * Persist the parsed result into the approved candidate/resume rows.
    *
    * WHY THIS IS A PORT, AND WHY IT RUNS *BEFORE* `ready`
@@ -362,6 +390,45 @@ export type CancelCheck = () => boolean | Promise<boolean>;
 
 function usefulStructured(s: StructuredResume): boolean {
   return Boolean(s.name || s.email || s.phone || s.current_role || s.summary || (s.skills && s.skills.length > 0));
+}
+
+/**
+ * Whether the text extracted fine but the STRUCTURED result carries no ROLE
+ * evidence at all — no recent_role, no current_role, an empty prior_roles, and
+ * a null experience_years.
+ *
+ * Distinct from {@link usefulStructured}: a résumé can be "useful" on the
+ * strength of a name/email/skills alone and still have lost every role, which
+ * is precisely the silent-degrade the model's prose-role extraction is meant to
+ * prevent. `usefulStructured` keeps the ingestion succeeding (it IS a real
+ * résumé); this check makes the degrade VISIBLE so the parser's role recall can
+ * be measured rather than guessed at.
+ *
+ * `text` must be non-trivial: an empty structured result on empty text is just
+ * an empty document, not a structuring miss.
+ */
+function structuredMissingRoles(s: StructuredResume): boolean {
+  const hasRecent = Boolean(s.recent_role && (s.recent_role.title || s.recent_role.employer));
+  const hasCurrent = Boolean(s.current_role);
+  const hasPrior = Boolean(s.prior_roles && s.prior_roles.length > 0);
+  const hasYears = s.experience_years !== null && s.experience_years !== undefined;
+  return !hasRecent && !hasCurrent && !hasPrior && !hasYears;
+}
+
+/** Minimum extracted-text length below which "no roles" is not worth signalling. */
+const NON_TRIVIAL_TEXT_LEN = 40;
+
+/**
+ * Completeness observation emitted (best-effort) when the document parsed and
+ * the ingestion will still SUCCEED, but the structured result lost all role
+ * evidence despite non-trivial text. Purely observational — it does NOT change
+ * the ingestion outcome. `category` is a stable, sanitized code an operator can
+ * count on a dashboard.
+ */
+export interface CompletenessSignal {
+  category: 'resume_structured_empty_text_present';
+  textLength: number;
+  structurerVersion: string;
 }
 
 /**
@@ -481,6 +548,21 @@ export async function runResumeIngestion(
       wipe();
       await ports.onState('failed_review', { contentSha256, extractorVersion: ports.extractorVersion, structurerVersion, failedReason: 'no_extractable_fields' });
       return { state: 'failed_review', reason: 'no_extractable_fields' };
+    }
+
+    // ── completeness signal (observational; does NOT fail the ingestion) ──
+    // The document parsed and the ingestion WILL succeed, but if the structured
+    // result lost every role despite non-trivial text, make that silent degrade
+    // visible. Best-effort: a throwing sink must never turn a real résumé into a
+    // failed ingestion, so it is swallowed.
+    if (parsed.text.trim().length >= NON_TRIVIAL_TEXT_LEN && structuredMissingRoles(structured)) {
+      try {
+        await ports.onCompleteness?.({
+          category: 'resume_structured_empty_text_present',
+          textLength: parsed.text.trim().length,
+          structurerVersion,
+        });
+      } catch { /* observability must never fail an ingestion */ }
     }
 
     // ── ready ────────────────────────────────────────────────────────────

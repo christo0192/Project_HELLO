@@ -7,6 +7,7 @@
  */
 
 import { env } from './env.js';
+import { createLogger } from './logger.js';
 import {
   BusinessError,
   CircuitBreaker,
@@ -17,6 +18,8 @@ import {
   type Clock,
   type TimerSet,
 } from './provider-resilience.js';
+
+const deepseekLogger = createLogger('deepseek');
 
 export type DeepseekErrorCategory =
   | 'timeout'
@@ -48,7 +51,28 @@ export interface DeepseekOptions {
   system?: string;
   timeoutMs?: number;
   maxOutputBytes?: number;
+  /**
+   * reasoning_effort override. An empty string (or unset) OMITS the field from
+   * the request body — the fast, default JSON-extraction path. A non-empty
+   * string (V4-Flash documented values: 'high' / 'xhigh') is forwarded verbatim
+   * as `reasoning_effort`. Falls back to env.deepseekReasoningEffort when unset.
+   */
+  reasoningEffort?: string;
 }
+
+/**
+ * Prefix-cache accounting surfaced from the DeepSeek `usage` object. DeepSeek
+ * context caching is AUTOMATIC (no request flag); the provider reports how many
+ * prompt tokens were served from cache vs recomputed. Non-negative integers;
+ * a field the provider omitted (or a non-DeepSeek response) reports 0.
+ */
+export interface DeepseekCacheUsage {
+  hitTokens: number;
+  missTokens: number;
+}
+
+/** Sink for prefix-cache accounting. Never throws into the request path. */
+export type DeepseekCacheSink = (usage: DeepseekCacheUsage) => void;
 
 export interface DeepseekTransportRequest {
   url: string;
@@ -70,6 +94,8 @@ export interface DeepseekRunnerDeps {
   clock: Clock;
   timers: TimerSet;
   breaker: CircuitBreaker;
+  /** Prefix-cache accounting sink. Defaults to a structured-log emitter. */
+  cacheSink: DeepseekCacheSink;
 }
 
 export interface DeepseekRunner {
@@ -112,6 +138,14 @@ function validateRuntimeOverrides(opts: DeepseekOptions): void {
     if (typeof opts.system !== 'string') throw new TypeError('system must be a string');
     if (opts.system.length > 4000) throw new TypeError('system must not exceed 4000 characters');
   }
+  if (opts.reasoningEffort !== undefined) {
+    if (typeof opts.reasoningEffort !== 'string') {
+      throw new TypeError('reasoningEffort must be a string');
+    }
+    if (opts.reasoningEffort.length > 64) {
+      throw new TypeError('reasoningEffort must not exceed 64 characters');
+    }
+  }
 }
 
 function extractJson(raw: string): string {
@@ -140,10 +174,59 @@ function parseContent(rawBody: string): string {
   return content.trim();
 }
 
+/** Coerce a provider-reported token count to a non-negative safe integer. */
+function coerceTokenCount(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return 0;
+  return Math.floor(value);
+}
+
+/**
+ * Parse `usage.prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` from an
+ * already-successful response body. Never throws: a body that is not JSON, has
+ * no usage object, or omits the cache fields (older or non-DeepSeek responses)
+ * reports zeros so the caller can still record a metric point.
+ */
+function extractCacheUsage(rawBody: string): DeepseekCacheUsage {
+  try {
+    const parsed = JSON.parse(rawBody) as { usage?: unknown };
+    const usage = parsed.usage;
+    if (usage === null || typeof usage !== 'object') return { hitTokens: 0, missTokens: 0 };
+    const u = usage as Record<string, unknown>;
+    return {
+      hitTokens: coerceTokenCount(u.prompt_cache_hit_tokens),
+      missTokens: coerceTokenCount(u.prompt_cache_miss_tokens),
+    };
+  } catch {
+    return { hitTokens: 0, missTokens: 0 };
+  }
+}
+
+/**
+ * Default cache sink: emit ONE structured metric line per successful call. The
+ * logger's metadata allowlist does not carry cache-token keys, so counts ride
+ * the allowlisted `error_type` string as `resume_model_cache:hit-<n>:miss-<m>`
+ * — a stable, greppable marker for verifying prefix-cache hits at scale. The
+ * separators (`:` `-`) are inside the logger's SAFE_IDENT allowlist so the
+ * field is never dropped. Wrapped so a logging fault can never surface on the
+ * request path.
+ */
+export function formatCacheMarker(usage: DeepseekCacheUsage): string {
+  return `resume_model_cache:hit-${usage.hitTokens}:miss-${usage.missTokens}`;
+}
+
+function defaultCacheSink(usage: DeepseekCacheUsage): void {
+  try {
+    deepseekLogger.info('unknown_event', { error_type: formatCacheMarker(usage) });
+  } catch {
+    /* metric logging must never break inference */
+  }
+}
+
 export function createDeepseekRunner(deps?: Partial<DeepseekRunnerDeps>): DeepseekRunner {
   const transport = deps?.transport ?? defaultTransport;
   const clock = deps?.clock ?? MonotonicClock;
   const timers = deps?.timers ?? DefaultTimerSet;
+  const cacheSink = deps?.cacheSink ?? defaultCacheSink;
   const breaker = deps?.breaker ?? new CircuitBreaker({
     failureThreshold: env.breakerFailureThreshold,
     cooldownMs: env.breakerCooldownMs,
@@ -159,12 +242,27 @@ export function createDeepseekRunner(deps?: Partial<DeepseekRunnerDeps>): Deepse
     const model = opts.model ?? env.deepseekModel;
     const timeoutMs = opts.timeoutMs ?? env.deepseekTimeoutMs;
     const maxOutputBytes = opts.maxOutputBytes ?? env.deepseekMaxOutputBytes;
+    // Empty string ⇒ omit reasoning_effort (fast default, no 400 risk).
+    const reasoningEffort = opts.reasoningEffort ?? env.deepseekReasoningEffort;
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | null = null;
 
     const messages: Array<{ role: 'system' | 'user'; content: string }> = [];
     if (opts.system) messages.push({ role: 'system', content: opts.system });
     messages.push({ role: 'user', content: prompt });
+
+    // Stable request body. `reasoning_effort` is added ONLY when non-empty so
+    // the default fast path sends a byte-identical prompt prefix (the automatic
+    // prefix cache keys on that prefix — do not reorder or mutate it).
+    const requestBody: {
+      model: string;
+      messages: typeof messages;
+      temperature: number;
+      reasoning_effort?: string;
+    } = { model, messages, temperature: 0.2 };
+    if (typeof reasoningEffort === 'string' && reasoningEffort.length > 0) {
+      requestBody.reasoning_effort = reasoningEffort;
+    }
 
     return breaker.call(async () => {
       try {
@@ -178,7 +276,7 @@ export function createDeepseekRunner(deps?: Partial<DeepseekRunnerDeps>): Deepse
               'content-type': 'application/json',
               accept: 'application/json',
             },
-            body: JSON.stringify({ model, messages, temperature: 0.2 }),
+            body: JSON.stringify(requestBody),
             signal: controller.signal,
           },
         });
@@ -187,7 +285,11 @@ export function createDeepseekRunner(deps?: Partial<DeepseekRunnerDeps>): Deepse
           throw new DeepseekError('output_limit');
         }
         if (!response.ok) throw new DeepseekError('protocol', response.status);
-        return parseContent(raw);
+        const content = parseContent(raw);
+        // Surface automatic prefix-cache accounting. Extraction never throws;
+        // the sink is wrapped so it cannot fault the request path.
+        cacheSink(extractCacheUsage(raw));
+        return content;
       } catch (err) {
         if (err instanceof DeepseekError) throw err;
         if ((err as { name?: string })?.name === 'AbortError') throw new DeepseekError('timeout');

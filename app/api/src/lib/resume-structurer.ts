@@ -46,6 +46,139 @@ import { runClaudeJSON } from './claude.js';
  */
 export type ResumeModelRunner = (prompt: string) => Promise<unknown>;
 
+// ── Model-call concurrency bound (P1) ───────────────────────────────────────
+//
+// The runner spawns ONE external provider call per résumé. The parser pool
+// bounds how many DOCUMENTS parse at once, but the model call happens INSIDE
+// the parse port, so once pool concurrency is raised (a later change) hundreds
+// of model calls could be in flight at once and stampede the provider. This
+// counting semaphore bounds concurrent model calls INDEPENDENTLY of the parser
+// pool, so raising pool concurrency does not raise provider fan-out.
+//
+// This is a call-rate bound, not provider configuration: no key, no endpoint,
+// no model selection lives here — those remain entirely inside the shared
+// runner from `lib/claude.js`. The only env this module reads is this integer
+// cap. ENV CONTRACT: `RESUME_MODEL_MAX_CONCURRENCY` must be declared in the
+// environment schema by the env-schema owner (see the report accompanying this
+// change) — it is read here with a safe clamped default so a missing
+// declaration degrades to the default rather than crashing.
+
+/** Concurrency cap default and clamp bounds. */
+const MODEL_CONCURRENCY_DEFAULT = 4;
+const MODEL_CONCURRENCY_MIN = 1;
+const MODEL_CONCURRENCY_MAX = 64;
+
+/**
+ * How long a call may WAIT for a semaphore slot before it gives up. A wait that
+ * exceeds this falls through to `null` (deterministic fallback) — it NEVER
+ * throws into the caller and never becomes an ingestion failure. Bounds the
+ * worst-case queue latency a single résumé can add under saturation.
+ */
+const MODEL_ACQUIRE_TIMEOUT_MS = 30_000;
+
+/**
+ * Parse the concurrency cap from the environment, clamped into range. A missing
+ * or malformed value degrades to the default rather than throwing at import —
+ * this module must never be the reason a server fails to start.
+ */
+function resolveModelConcurrency(): number {
+  const raw = process.env.RESUME_MODEL_MAX_CONCURRENCY;
+  if (raw === undefined || raw === '') return MODEL_CONCURRENCY_DEFAULT;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n)) return MODEL_CONCURRENCY_DEFAULT;
+  if (n < MODEL_CONCURRENCY_MIN) return MODEL_CONCURRENCY_MIN;
+  if (n > MODEL_CONCURRENCY_MAX) return MODEL_CONCURRENCY_MAX;
+  return n;
+}
+
+/**
+ * A minimal in-module counting semaphore.
+ *
+ * `acquire` resolves when a slot is free, or resolves to `false` if the wait
+ * exceeds `timeoutMs` (the caller then falls back to the deterministic
+ * extractor). `release` frees a slot and hands it to the oldest waiter. No
+ * timers leak: the timeout handle is cleared whether the slot is granted or the
+ * wait expires, and an expired waiter is removed from the queue so a later
+ * `release` cannot hand a slot to a caller that already gave up.
+ */
+class CountingSemaphore {
+  private available: number;
+
+  /** Clamped once at construction so `available` and the `release` guard agree. */
+  private readonly capacity: number;
+
+  private readonly waiters: Array<{ grant: () => void }> = [];
+
+  constructor(capacity: number) {
+    // Clamp to a minimum of one slot. If both `available` started clamped but
+    // the release guard compared against the RAW `capacity` (0), the freed slot
+    // would never be restored and the semaphore would wedge after the first
+    // release. Storing the clamped value once keeps the two in lockstep.
+    this.capacity = Math.max(1, capacity);
+    this.available = this.capacity;
+  }
+
+  async acquire(timeoutMs: number): Promise<boolean> {
+    if (this.available > 0) {
+      this.available -= 1;
+      return true;
+    }
+    return new Promise<boolean>((resolve) => {
+      const entry = {
+        grant: () => {
+          clearTimeout(timer);
+          resolve(true);
+        },
+      };
+      const timer = setTimeout(() => {
+        const at = this.waiters.indexOf(entry);
+        if (at !== -1) this.waiters.splice(at, 1);
+        resolve(false);
+      }, timeoutMs);
+      // Node timers keep the event loop alive; a screening API should not be
+      // held open by a pending acquire wait.
+      if (typeof timer.unref === 'function') timer.unref();
+      this.waiters.push(entry);
+    });
+  }
+
+  release(): void {
+    const next = this.waiters.shift();
+    if (next) {
+      next.grant();
+      return;
+    }
+    if (this.available < this.capacity) this.available += 1;
+  }
+}
+
+/** Process-wide semaphore. Sized once at module load from the clamped env. */
+let modelSemaphore = new CountingSemaphore(resolveModelConcurrency());
+
+/** Wait budget for a slot; overridable in tests to force fast saturation. */
+let modelAcquireTimeoutMs = MODEL_ACQUIRE_TIMEOUT_MS;
+
+/**
+ * TEST SEAM ONLY. Re-sizes the module semaphore and (optionally) the acquire
+ * wait budget so a suite can prove the bound holds and that saturation falls
+ * through to `null` without a 30-second wait or a live provider. Returns a
+ * restore function. Not part of the production contract — production sizes the
+ * semaphore once from the clamped env at module load and never calls this.
+ */
+export function __setModelConcurrencyForTest(
+  capacity: number,
+  acquireTimeoutMs?: number,
+): () => void {
+  const prevSem = modelSemaphore;
+  const prevTimeout = modelAcquireTimeoutMs;
+  modelSemaphore = new CountingSemaphore(capacity);
+  if (acquireTimeoutMs !== undefined) modelAcquireTimeoutMs = acquireTimeoutMs;
+  return () => {
+    modelSemaphore = prevSem;
+    modelAcquireTimeoutMs = prevTimeout;
+  };
+}
+
 /** Production runner: the shared bounded provider path. */
 export const defaultResumeModelRunner: ResumeModelRunner = (prompt) =>
   runClaudeJSON<unknown>(prompt);
@@ -189,7 +322,14 @@ function coerceYears(v: unknown): number | null {
 function coercePhone(v: unknown): string | null {
   if (absent(v)) return null;
   if (typeof v !== 'string') throw new MalformedShape();
-  const trimmed = v.trim();
+  // Collapse a country-code plus written as "+ 91 ..." to the canonical "+91
+  // ..." a model sometimes emits when it echoes the leading-"+" instruction
+  // with a stray space. The downstream `normalizePhone` strips inner spaces
+  // anyway, but this stores the canonical form and — more importantly — keeps
+  // the "+" ADJACENT to the digits so the strict `^\+91[6-9]...` provenance
+  // gate cannot be defeated by a space the model inserted. Only the FIRST
+  // "+  " run is collapsed; a "+" appearing mid-string is left alone.
+  const trimmed = v.trim().replace(/^\+\s+/, '+');
   if (trimmed === '' || trimmed.length > MAX_PHONE_LEN) return null;
   return trimmed;
 }
@@ -333,6 +473,11 @@ export async function structureResumeWithModel(
   text: string,
   runner: ResumeModelRunner = defaultResumeModelRunner,
 ): Promise<ParsedResume | null> {
+  // Bound concurrent model calls. If no slot frees within the wait budget the
+  // call falls through to `null` (deterministic fallback) — saturation must
+  // degrade the answer, never throw into the caller or fail the ingestion.
+  const acquired = await modelSemaphore.acquire(modelAcquireTimeoutMs);
+  if (!acquired) return null;
   try {
     // `buildExtractionPrompt` already slices the text to 12k before it reaches
     // a provider — the prompt bound is not re-implemented here.
@@ -342,5 +487,9 @@ export async function structureResumeWithModel(
     // Provider outage, open breaker, timeout, output-limit, unparseable JSON.
     // All of them are "no model answer", none of them is an ingestion failure.
     return null;
+  } finally {
+    // Always released — including on the throw path above — so a failing call
+    // never permanently consumes a slot.
+    modelSemaphore.release();
   }
 }
