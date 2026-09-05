@@ -12,6 +12,7 @@ import asyncio
 import inspect
 import logging
 import math
+import statistics
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
@@ -232,13 +233,23 @@ def _record_turn_metrics(item: Any, channel: str) -> None:
         )
 
 
-def _record_provider_metrics(event: Any, channel: str | None = None) -> None:
+def _record_provider_metrics(
+    event: Any,
+    channel: str | None = None,
+    call_metrics: dict[str, Any] | None = None,
+) -> None:
     """Log bounded provider timings emitted by LiveKit Agents, when available.
 
     Field names differ slightly across SDK versions, so this function probes a
     small allowlist and never logs transcript, room, candidate, request IDs, or
     raw provider payloads. ``channel`` (e.g. "phone") is a content-free label
     used only to scope the phone prompt-cache observability below.
+
+    ``call_metrics`` (optional) is the per-call accumulator; when provided and a
+    first-signal duration is available for an llm/tts/stt component, the sample
+    is appended for the durable per-call observability snapshot. Purely
+    additive — a duration only, never transcript / IDs, and an accumulator
+    failure never perturbs the metric emission below.
     """
     metric = getattr(event, "metrics", event)
     component = _provider_metric_component(metric)
@@ -247,6 +258,17 @@ def _record_provider_metrics(event: Any, channel: str | None = None) -> None:
 
     duration = _provider_metric_number(metric, "duration", "duration_sec", "elapsed")
     ttf = _provider_metric_number(metric, "ttft", "ttfb", "time_to_first_token", "time_to_first_byte")
+    if (
+        call_metrics is not None
+        and ttf is not None
+        and component in ("llm", "tts", "stt")
+    ):
+        try:
+            samples = call_metrics.get("provider_first_signal_ms")
+            if isinstance(samples, dict) and component in samples:
+                samples[component].append(ttf * 1000.0)
+        except Exception:  # noqa: BLE001
+            pass
     if duration is not None:
         _safe_emit(
             histogram_metric,
@@ -342,7 +364,9 @@ def _emit_phone_latency_segment(schema: str, duration: float) -> None:
         pass
 
 
-def _emit_phone_headline_latency(local_vad_end_wall: float, first_audio_wall: float) -> None:
+def _emit_phone_headline_latency(
+    local_vad_end_wall: float, first_audio_wall: float,
+) -> float | None:
     """Emit the AUTHORITATIVE candidate-speech-end -> bot-audio latency.
 
     FIX 3 (live 2026-09-03, session ec9bd898). The legacy ``speech_end_to_first_
@@ -359,7 +383,7 @@ def _emit_phone_headline_latency(local_vad_end_wall: float, first_audio_wall: fl
     try:
         delta = first_audio_wall - local_vad_end_wall
         if not math.isfinite(delta) or delta < 0.0 or delta > 120.0:
-            return
+            return None
         _safe_emit(
             histogram_metric, "voice_phone_headline_latency_sec", delta,
             {"channel": "phone", "schema": "candidate_speech_end_to_bot_audio"},
@@ -368,8 +392,80 @@ def _emit_phone_headline_latency(local_vad_end_wall: float, first_audio_wall: fl
             "unknown_event", error_type="voice_phone_headline_latency",
             schema="candidate_speech_end_to_bot_audio", duration_sec=round(delta, 3),
         )
+        # Return the validated delta so the caller can append the ms sample to the
+        # per-call observability accumulator without re-deriving/re-bounding it.
+        return delta
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _new_phone_call_metrics() -> dict[str, Any]:
+    """Fresh per-call phone observability accumulator.
+
+    Additive-only: every field is incremented/appended at a site that already
+    executes on the call. Summarized once at completion into a compact snapshot
+    (see ``_summarize_phone_call_metrics``) and persisted last-write-wins.
+    """
+    return {
+        "watchdog_fired_count": 0,
+        "deterministic_fallback_count": 0,
+        "headline_samples_ms": [],
+        "provider_first_signal_ms": {"llm": [], "tts": [], "stt": []},
+    }
+
+
+def _p95(sorted_ms: list[float]) -> float:
+    """Nearest-rank p95 of an already-sorted, non-empty list."""
+    idx = int(math.ceil(0.95 * len(sorted_ms))) - 1
+    if idx < 0:
+        idx = 0
+    if idx >= len(sorted_ms):
+        idx = len(sorted_ms) - 1
+    return sorted_ms[idx]
+
+
+def _summarize_phone_call_metrics(call_metrics: dict[str, Any]) -> dict[str, Any]:
+    """Reduce the raw accumulator to a compact, JSON-serializable snapshot.
+
+    Content-free: counts and millisecond durations only. Empty sample lists are
+    omitted (``headline_latency_ms``) or recorded as ``None`` (per-provider
+    medians) so a call that never produced a sample writes an honest absence
+    rather than a fabricated zero. Never raises: any reduction failure falls
+    back to the two counts alone.
+    """
+    snapshot: dict[str, Any] = {
+        "watchdog_fired_count": int(call_metrics.get("watchdog_fired_count", 0) or 0),
+        "deterministic_fallback_count": int(
+            call_metrics.get("deterministic_fallback_count", 0) or 0
+        ),
+    }
+    try:
+        headline = [
+            float(x) for x in call_metrics.get("headline_samples_ms", [])
+            if isinstance(x, (int, float)) and math.isfinite(float(x))
+        ]
+        if headline:
+            ordered = sorted(headline)
+            snapshot["headline_latency_ms"] = {
+                "median": round(statistics.median(ordered), 3),
+                "p95": round(_p95(ordered), 3),
+                "max": round(ordered[-1], 3),
+                "count": len(ordered),
+            }
+        provider = call_metrics.get("provider_first_signal_ms", {}) or {}
+        provider_summary: dict[str, Any] = {}
+        for component in ("llm", "tts", "stt"):
+            samples = [
+                float(x) for x in provider.get(component, [])
+                if isinstance(x, (int, float)) and math.isfinite(float(x))
+            ]
+            provider_summary[component] = (
+                round(statistics.median(samples), 3) if samples else None
+            )
+        snapshot["provider_first_signal_ms"] = provider_summary
     except Exception:  # noqa: BLE001
         pass
+    return snapshot
 
 
 def _emit_phone_endpoint_delay(t_eou: float, now: float) -> None:
@@ -936,6 +1032,24 @@ def build_worker_options() -> WorkerOptions:
         "initialize_process_timeout": 60.0,
         "job_memory_warn_mb": 1400,
         "job_memory_limit_mb": 0,
+        # ── v117 RECORDING DURABILITY (RCA 2026-09-05, session 1a19cee4) ──────
+        # The in-worker recording was captured (3.9MB OGG) but never uploaded:
+        # `InWorkerRecorder.finish()` runs inline in the post-teardown shutdown
+        # path and its transcode→PUT was cancelled by the entrypoint-exit grace
+        # before the presigned PUT completed. The DURABILITY FIX lives in
+        # recording.py `finish()` — it now PUTs the raw OGG FIRST (before the slow
+        # transcode that the grace can cancel) and treats the MP3 as a best-effort
+        # upgrade, so the captured audio is durable regardless of the grace.
+        #
+        # Belt-and-suspenders NOT added here on purpose: a WorkerOptions
+        # shutdown/drain-grace kwarg was considered, but livekit-agents==1.6.4 is
+        # NOT importable in this dev env so the exact field name could not be
+        # verified against the pinned API — a wrong kwarg would silently no-op or
+        # raise, so per the fix brief we do not guess one. Re-wiring
+        # `_finish_recording` via `ctx.add_shutdown_callback` was also rejected:
+        # it is already awaited in `_screen`'s outer `finally`, so a shutdown
+        # callback would risk double-invoking it. The OGG-first reorder is what
+        # actually closes the durability gap, so it stands alone.
     }
     if browser_named:
         # The browser worker becomes NAMED + explicit-dispatch. Its prewarm
@@ -1551,7 +1665,14 @@ def _build_provider_session(
         # PHONE ONLY (Sarvam swap): pass the phone channel so the prompt-cache
         # observability (voice_phone_llm_cache) is emitted only for this lane.
         # The browser/WebRTC lane is unaffected — it never labels the channel.
-        _record_provider_metrics(event, channel="phone" if phone_mode else None)
+        # The per-call accumulator (if the phone run attached one to the session)
+        # rides through so provider first-signal medians are persisted post-call;
+        # absent (WebRTC / not attached) this is None and nothing is recorded.
+        _record_provider_metrics(
+            event,
+            channel="phone" if phone_mode else None,
+            call_metrics=getattr(session, "_call_metrics", None),
+        )
 
     return session
 
@@ -1707,6 +1828,7 @@ async def _run_native_phone_screening(
     close_event: asyncio.Event,
     endpoint_delay_eou: list[float | None] | None = None,
     latency_state: dict[str, float | None] | None = None,
+    call_metrics: dict[str, Any] | None = None,
     prior_turn_interrupted: dict[str, bool] | None = None,
     turn_mode: str = phone.PHONE_TURN_MODE_TOOLFIRST,
     coverage_judge_enabled: bool = False,
@@ -1730,6 +1852,13 @@ async def _run_native_phone_screening(
     # thread it stays correct (the flag simply reads False = "not interrupted").
     if prior_turn_interrupted is None:
         prior_turn_interrupted = {"value": False}
+    # Per-call observability accumulator. Threaded in from `_run_phone_session`
+    # (which also attaches it to the session so provider first-signal is
+    # captured); defaulted to a fresh one here so a direct-coordinator test that
+    # does not thread it stays correct — every increment site below and the
+    # completion-time summary can assume a dict.
+    if call_metrics is None:
+        call_metrics = _new_phone_call_metrics()
     finished = asyncio.Event()
     terminal_reason: dict[str, str] = {}
     # A terminal reply is only a proposal until its speech handle completes.
@@ -1780,7 +1909,7 @@ async def _run_native_phone_screening(
             set_reply_snapshot(phone.PHONE_ASSESSMENT_CLOSING_TEXT, phase="closing")
             return
         set_reply_snapshot(
-            phone.phone_fallback_reply(question, answer),
+            phone.phone_fallback_reply(question, answer, cursor_index=cursor),
             objective=question.spoken_text,
             fallback_without_prefix=question.spoken_text,
         )
@@ -3276,6 +3405,11 @@ async def _run_native_phone_screening(
                 )
                 if audio_wait in done and speech_first_audio.is_set():
                     return
+                # Past the audio-success early return, the watchdog has FIRED:
+                # either the generation completed empty or no first audio/speech
+                # arrived within the deadline. Count it for the per-call
+                # observability snapshot (additive; never perturbs recovery).
+                call_metrics["watchdog_fired_count"] += 1
                 if empty_wait in done and generation_empty.is_set():
                     _log.warn(
                         "unknown_event", error_type="phone_speech_lifecycle",
@@ -3331,6 +3465,10 @@ async def _run_native_phone_screening(
             ):
                 return
             fallback_generation[0] = generation
+            # At-most-once-per-generation claim: this is the deterministic
+            # recovery fallback being committed. Count it for the per-call
+            # observability snapshot (additive; the say below is unchanged).
+            call_metrics["deterministic_fallback_count"] += 1
             fallback = phone.phone_recovery_fallback(
                 snapshot,
                 prefix_released=bool(getattr(agent, "_generation_prefix_released", False)),
@@ -3628,8 +3766,18 @@ async def _run_native_phone_screening(
     if reason == "completed":
         done = None
         queue_owned = False
+        # Compute the per-call observability snapshot ONCE. It is a full snapshot
+        # (replace, last-write-wins), so re-sending it on every retry attempt is
+        # correct and idempotent. None when no accumulator was threaded (never in
+        # the phone lane, but keeps the call defensive).
+        observability_snapshot = (
+            _summarize_phone_call_metrics(call_metrics)
+            if call_metrics is not None else None
+        )
         for attempt in range(20):
-            done = await events.complete_assessment(attempt_id, session_id)
+            done = await events.complete_assessment(
+                attempt_id, session_id, metrics=observability_snapshot,
+            )
             if done.ok or not phone.retryable_completion(done):
                 break
             # `scoring_queued` is an acknowledged durable handoff, not a
@@ -3958,6 +4106,13 @@ async def _run_phone_session(
         "vad_last_inference_duration": None,
         "vad_last_silence_duration": None,
     }
+    # PER-CALL OBSERVABILITY ACCUMULATOR. Additive-only: incremented/appended at
+    # sites that already execute (watchdog fire, deterministic-fallback claim,
+    # headline latency, provider first-signal), summarized once at completion and
+    # persisted to call_sessions.observability (last-write-wins). Threaded into
+    # `_run_native_phone_screening` exactly like `latency_state`, and attached to
+    # the provider session below so the `metrics_collected` handler can reach it.
+    call_metrics: dict[str, Any] = _new_phone_call_metrics()
 
     def _on_phone_vad_event(event: Any) -> None:
         """Record the actual local VAD boundary and bounded event fields."""
@@ -3999,6 +4154,17 @@ async def _run_phone_session(
     session = _build_phone_provider_session(
         turn_mode, vad_event_callback=_on_phone_vad_event,
     )
+    # Expose the per-call accumulator to the shared `metrics_collected` handler
+    # (registered inside `_build_provider_session`), which reads it off the
+    # session so provider first-signal medians are persisted for this call. The
+    # WebRTC lane never attaches one, so that handler stays a no-op there.
+    # Guard the setattr: if a future livekit-agents makes AgentSession __slots__-ed
+    # this must NOT crash a live call — the metrics are best-effort, so on failure
+    # we simply lose provider first-signal medians (counts/headline still persist).
+    try:
+        setattr(session, "_call_metrics", call_metrics)
+    except (AttributeError, TypeError):
+        logger.warning("phone_call_metrics_attach_failed", exc_info=True)
 
     @session.on("speech_created")
     def _on_phone_speech_created(event):  # noqa: ANN001
@@ -4153,7 +4319,12 @@ async def _run_phone_session(
                 # stopped_speaking_at. Same anchor as the segment above; emitted
                 # under its own clearly-named metric so operators stop reading the
                 # pause-inflated speech_end_* number.
-                _emit_phone_headline_latency(local_vad_end_wall, first_audio_wall)
+                _headline_delta = _emit_phone_headline_latency(local_vad_end_wall, first_audio_wall)
+                # Append the validated (bounded, non-negative) headline sample in
+                # ms to the per-call observability accumulator for the durable
+                # snapshot. None means the delta was dropped by the emitter.
+                if _headline_delta is not None:
+                    call_metrics["headline_samples_ms"].append(_headline_delta * 1000.0)
             latency_state["speech_created_mono"] = None
             latency_state["speech_end_wall"] = None
             latency_state["local_vad_end_wall"] = None
@@ -4653,7 +4824,10 @@ async def _run_phone_session(
                 # completed but never scored. The completion endpoint can still finish
                 # that, so it is asked — and the ROW still decides.
                 if state.status == "session_not_active":
-                    recovered = await events.complete_assessment(attempt_id, session_id)
+                    recovered = await events.complete_assessment(
+                        attempt_id, session_id,
+                        metrics=_summarize_phone_call_metrics(call_metrics),
+                    )
                     if recovered.ok:
                         _log.info(
                             "unknown_event", error_type="phone_assessment_recovered",
@@ -4710,6 +4884,7 @@ async def _run_phone_session(
                 close_event=close_event,
                 endpoint_delay_eou=endpoint_delay_eou,
                 latency_state=latency_state,
+                call_metrics=call_metrics,
                 prior_turn_interrupted=prior_turn_interrupted,
                 turn_mode=turn_mode,
                 coverage_judge_enabled=coverage_judge_enabled,

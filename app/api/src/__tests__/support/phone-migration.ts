@@ -162,6 +162,12 @@ export const MIGRATION_0081_PATH = fileURLToPath(
 
 export const MIGRATION_0081 = readFileSync(MIGRATION_0081_PATH, 'utf8');
 
+export const MIGRATION_0082_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0082_phone_call_observability.sql', import.meta.url),
+);
+
+export const MIGRATION_0082 = readFileSync(MIGRATION_0082_PATH, 'utf8');
+
 /**
  * Every phone migration, NEWEST FIRST. Extraction walks this in order and the
  * first file that declares a thing wins, which is what "the latest declaration
@@ -169,6 +175,9 @@ export const MIGRATION_0081 = readFileSync(MIGRATION_0081_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    // 0082 adds the call_sessions.observability jsonb column (per-call phone
+    // observability, additive/columns-only). Newest-first per the scheme.
+    { name: '0082', sql: MIGRATION_0082 },
     // 0081 re-declares arm_phone_test_gate in full (owner-test path for a
     // `scheduled` due engagement), so it must be NEWEST-FIRST for the extractor
     // to read the effective body rather than 0065's.

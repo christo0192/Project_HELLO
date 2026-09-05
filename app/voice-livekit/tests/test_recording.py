@@ -199,17 +199,31 @@ class TestInWorkerRecorderLifecycle(unittest.TestCase):
         self.assertIn("abc123.mp3.ogg", starts[0][1])
 
     def test_finish_closes_transcodes_uploads_and_returns_manifest(self):
-        uploaded = {}
-        r, _session, holder = _make(uploaded=uploaded)
+        # v117 OGG-FIRST-THEN-MP3-UPGRADE order: finish() must PUT the raw OGG
+        # FIRST (the durability guarantee, before the slow transcode that the
+        # shutdown grace can cancel), then re-PUT the transcoded MP3 to the SAME
+        # key as a best-effort upgrade. Record EVERY PUT so the order is proven.
+        puts = []
+
+        async def recording_upload(url, body, content_type="audio/mpeg"):
+            puts.append((content_type, body))
+
+        r, _session, holder = _make(upload=recording_upload)
         r.wire()
         _begin(r)
         manifest = _finish(r)
         self.assertIsNotNone(manifest)
-        self.assertEqual(manifest.size_bytes, len(b"ID3fake-mp3-bytes"))
-        self.assertEqual(len(manifest.sha256), 64)
         self.assertIn("aclose", holder["recorder"].calls)
-        self.assertEqual(uploaded["url"], "https://example.test/put?sig=x")
-        self.assertEqual(uploaded["body"], b"ID3fake-mp3-bytes")
+        # Exactly two PUTs to the same key: OGG durable first, MP3 upgrade second.
+        self.assertEqual(len(puts), 2, f"expected OGG-then-MP3 PUTs: {puts}")
+        self.assertEqual(puts[0][0], "audio/ogg")   # durable OGG lands FIRST
+        self.assertEqual(puts[0][1], b"OggS\x00fake-ogg-container-bytes")
+        self.assertEqual(puts[1][0], "audio/mpeg")  # MP3 upgrade re-PUTs same key
+        self.assertEqual(puts[1][1], b"ID3fake-mp3-bytes")
+        # The returned manifest reflects what LANDED last — the MP3 upgrade.
+        self.assertEqual(manifest.size_bytes, len(b"ID3fake-mp3-bytes"))
+        self.assertEqual(manifest.content_type, "audio/mpeg")
+        self.assertEqual(len(manifest.sha256), 64)
 
     def test_discard_closes_without_uploading_and_disables_finish(self):
         # No-consent path: close the recorder, upload NOTHING, and a later
@@ -303,24 +317,23 @@ class TestInWorkerRecorderLifecycle(unittest.TestCase):
     # (`object_unreadable` x6) and the session sat at "Recording is still
     # processing" forever. Each failure leg now stamps a bounded reason the
     # caller reports via /recording/failed.
-    def test_finish_failure_names_the_transcode_leg_when_fallback_also_fails(self):
-        # `transcode_failed` is now reported ONLY as a genuine total loss: the
-        # transcode threw AND the raw-OGG fallback upload also failed (an OGG
-        # exists but nothing could be uploaded). With an OGG present but a working
-        # upload the transcode failure would instead succeed via the OGG fallback
-        # (see TestOggFallbackRetainsAudio) — so to name the transcode leg the
-        # fallback upload must also die.
-        async def boom_transcode(ogg, mp3):
-            raise RuntimeError("codec_died")
+    def test_finish_failure_names_upload_leg_when_store_unreachable(self):
+        # v117 OGG-FIRST: the durability PUT is the OGG and it happens BEFORE the
+        # transcode. If the store is unreachable, that first OGG PUT fails and
+        # finish() names `upload_failed` — the transcode is never even attempted
+        # (there is no "fallback upload after a transcode leg" anymore; the OGG
+        # IS the primary durable write). This is a genuine total loss.
+        async def never_called_transcode(ogg, mp3):  # pragma: no cover
+            raise AssertionError("transcode must not run if the OGG PUT failed")
 
         async def boom_upload(url, body, content_type="audio/mpeg"):
             raise RuntimeError("s3_down")
 
-        r, _session, _holder = _make(transcode=boom_transcode, upload=boom_upload)
+        r, _session, _holder = _make(transcode=never_called_transcode, upload=boom_upload)
         r.wire()
         _begin(r)
         self.assertIsNone(_finish(r))
-        self.assertEqual(r.finish_failure, "transcode_failed")
+        self.assertEqual(r.finish_failure, "upload_failed")
 
     def test_finish_failure_names_missing_ogg_as_no_audio_captured(self):
         # THE RCA (2026-09-04): the live zero-capture failure. The recorder wrote
@@ -408,12 +421,16 @@ class TestInWorkerRecorderLifecycle(unittest.TestCase):
         self.assertEqual(manifest.content_type, "audio/mpeg")
         self.assertEqual(uploaded["content_type"], "audio/mpeg")
 
-    # ── v114 (2026-09-04): the OGG FALLBACK — audio is NEVER silently gone ──
+    # ── v114/v117: the OGG is NEVER silently gone ──────────────────────────
     # On the live v114 call the OGG→MP3 transcode died on a sample/channel
     # desync (`transcode_failed`, "Input is shorter by 46394 samples") and
     # finish()'s cleanup then DELETED the raw OGG: total loss of a recoverable
-    # recording. A failed transcode must now retain the raw OGG by uploading it
-    # as a fallback, so a reviewable artifact survives.
+    # recording. On the live v117 call (session 1a19cee4) the OGG WAS captured
+    # (3.9MB) but the inline transcode→PUT was cancelled by the shutdown grace
+    # before the presigned PUT ran, so nothing landed. Both are closed by the
+    # OGG-FIRST reorder in finish(): the raw OGG is PUT durably BEFORE the slow
+    # transcode, and the MP3 is a best-effort upgrade — so a reviewable artifact
+    # always survives a transcode/upgrade failure OR a shutdown-grace cancel.
 
 
 class TestZeroCaptureInstrumentation(unittest.TestCase):
@@ -651,12 +668,15 @@ class TestOggFallbackRetainsAudio(unittest.TestCase):
         self.assertEqual(manifest.content_type, "audio/ogg")
         self.assertEqual(sink["content_type"], "audio/ogg")
 
-    def test_ogg_fallback_upload_failure_is_total_loss(self):
-        # If even the OGG fallback upload fails, there is genuinely nothing left:
-        # finish() returns None and names transcode_failed so the caller latches
-        # the loss truthfully (it does NOT fake a success).
-        async def boom_transcode(ogg, mp3):
-            raise RuntimeError("desync")
+    def test_ogg_upload_failure_is_total_loss(self):
+        # v117 OGG-FIRST: the durability PUT is the OGG, and it happens BEFORE
+        # the transcode is ever attempted. If that PUT fails the store is
+        # unreachable and nothing landed — a genuine total loss. finish() returns
+        # None and names `upload_failed` so the caller latches the loss truthfully
+        # (it does NOT fake a success, and it does NOT mislabel it transcode_failed
+        # since the transcode was never even reached).
+        async def boom_transcode(ogg, mp3):  # pragma: no cover — unreachable
+            raise AssertionError("transcode must not run if the OGG PUT failed")
 
         async def boom_upload(url, body, content_type="audio/mpeg"):
             raise RuntimeError("s3_down")
@@ -667,7 +687,98 @@ class TestOggFallbackRetainsAudio(unittest.TestCase):
         r.wire()
         _begin(r)
         self.assertIsNone(_finish(r))
-        self.assertEqual(r.finish_failure, "transcode_failed")
+        self.assertEqual(r.finish_failure, "upload_failed")
+
+    def test_v117_transcode_raises_after_ogg_put_keeps_durable_ogg(self):
+        # THE v117 PROD FAILURE (session 1a19cee4), covered directly. A valid OGG
+        # was captured (3.9MB) but the MP3 transcode/upgrade never completed
+        # (cancelled/failed) — pre-fix, nothing was ever PUT, so the object was
+        # `object_unreadable` and the session hung `recording_egress_status=active`
+        # forever. With OGG-first the raw OGG is PUT BEFORE the transcode, so a
+        # transcode that raises AFTER the OGG landed is NOT a total loss: the
+        # durable OGG remains and finish() returns a valid ogg manifest.
+        puts = []
+        ogg_put_happened = {"v": False}
+
+        async def upload(url, body, content_type="audio/mpeg"):
+            puts.append((content_type, body))
+            if content_type == "audio/ogg":
+                ogg_put_happened["v"] = True
+
+        async def transcode_raises_after_ogg(ogg, mp3):
+            # The OGG durability PUT must already have landed by the time the
+            # transcode runs — this is the whole point of the reorder.
+            assert ogg_put_happened["v"], "OGG must be PUT before transcode runs"
+            raise RuntimeError("Input is shorter by 46394 samples")
+
+        r, _holder, _sink = self._make_with_ogg(
+            transcode=transcode_raises_after_ogg, upload=upload,
+        )
+        r.wire()
+        _begin(r)
+        manifest = _finish(r)
+        self.assertIsNotNone(manifest, "the durable OGG must NOT be a total loss")
+        self.assertEqual(manifest.content_type, "audio/ogg")
+        self.assertEqual(manifest.size_bytes, len(b"OggS\x00fake-ogg-container-bytes"))
+        self.assertEqual(len(manifest.sha256), 64)
+        self.assertIsNone(r.finish_failure)  # a retained artifact, not a failure
+        # Only the OGG was PUT (the MP3 upgrade PUT never ran — transcode threw).
+        self.assertEqual(len(puts), 1)
+        self.assertEqual(puts[0][0], "audio/ogg")
+
+    def test_v117_transcode_cancelled_after_ogg_put_keeps_durable_ogg(self):
+        # THE SHUTDOWN-CANCEL SHAPE (v117 root cause): LiveKit's entrypoint-exit
+        # grace cancels finish() DURING the transcode. asyncio.CancelledError
+        # raised by the transcode step must leave the ALREADY-DURABLE OGG in
+        # place and still yield a valid ogg manifest (the audio is safely stored),
+        # rather than propagating a total loss.
+        puts = []
+
+        async def upload(url, body, content_type="audio/mpeg"):
+            puts.append((content_type, body))
+
+        async def transcode_cancelled(ogg, mp3):
+            raise asyncio.CancelledError()
+
+        r, _holder, _sink = self._make_with_ogg(
+            transcode=transcode_cancelled, upload=upload,
+        )
+        r.wire()
+        _begin(r)
+        manifest = _finish(r)
+        self.assertIsNotNone(manifest, "a cancel after the OGG PUT is not a loss")
+        self.assertEqual(manifest.content_type, "audio/ogg")
+        self.assertEqual(manifest.size_bytes, len(b"OggS\x00fake-ogg-container-bytes"))
+        self.assertIsNone(r.finish_failure)
+        self.assertEqual(len(puts), 1)
+        self.assertEqual(puts[0][0], "audio/ogg")
+
+    def test_v117_upgrade_put_fails_after_ogg_put_keeps_durable_ogg(self):
+        # The transcode SUCCEEDS but the upgrade re-PUT of the MP3 fails (e.g. a
+        # transient store error on the second write). The durable OGG already
+        # landed on the first PUT, so this is NOT a loss: keep the OGG manifest.
+        puts = []
+
+        async def upload(url, body, content_type="audio/mpeg"):
+            if content_type == "audio/mpeg":
+                raise RuntimeError("upgrade_put_500")
+            puts.append((content_type, body))
+
+        async def good_transcode(ogg, mp3):
+            Path(mp3).write_bytes(b"ID3fake-mp3-bytes")
+
+        r, _holder, _sink = self._make_with_ogg(
+            transcode=good_transcode, upload=upload,
+        )
+        r.wire()
+        _begin(r)
+        manifest = _finish(r)
+        self.assertIsNotNone(manifest, "a failed MP3 upgrade must keep the OGG")
+        self.assertEqual(manifest.content_type, "audio/ogg")
+        self.assertIsNone(r.finish_failure)
+        # The OGG PUT succeeded; the MP3 upgrade PUT raised and was swallowed.
+        self.assertEqual(len(puts), 1)
+        self.assertEqual(puts[0][0], "audio/ogg")
 
     def test_no_ogg_is_no_audio_captured_not_transcode_failed(self):
         # RCA 2026-09-04: NO OGG written (zero frames captured — the LIVE

@@ -886,5 +886,69 @@ class TestInstrumentationFailureIsolation(unittest.TestCase):
         persistence_mock.trigger_scoring.assert_awaited_once()
 
 
+class TestPhoneCallMetricsSummary(unittest.TestCase):
+    """0082: the per-call observability accumulator and its reduction.
+
+    The summary is what gets persisted last-write-wins to
+    ``call_sessions.observability``; these pin its arithmetic (median / p95 /
+    max / count and per-provider medians) and its honest handling of absence
+    (empty sample lists omit or record ``None`` rather than fabricating a zero).
+    """
+
+    def test_fresh_accumulator_has_the_expected_zeroed_shape(self) -> None:
+        m = agent_mod._new_phone_call_metrics()
+        self.assertEqual(m["watchdog_fired_count"], 0)
+        self.assertEqual(m["deterministic_fallback_count"], 0)
+        self.assertEqual(m["headline_samples_ms"], [])
+        self.assertEqual(
+            m["provider_first_signal_ms"], {"llm": [], "tts": [], "stt": []}
+        )
+
+    def test_p95_is_nearest_rank_on_a_sorted_list(self) -> None:
+        # ceil(0.95 * 20) - 1 = 18 (0-based) -> the 19th value.
+        self.assertEqual(agent_mod._p95(list(range(1, 21))), 19)
+        # A single sample is its own p95.
+        self.assertEqual(agent_mod._p95([42.0]), 42.0)
+
+    def test_summary_computes_median_p95_max_count_and_provider_medians(self) -> None:
+        m = agent_mod._new_phone_call_metrics()
+        m["watchdog_fired_count"] = 2
+        m["deterministic_fallback_count"] = 1
+        m["headline_samples_ms"] = [100.0, 200.0, 300.0, 400.0, 500.0]
+        m["provider_first_signal_ms"]["llm"] = [400.0, 420.0]
+        m["provider_first_signal_ms"]["tts"] = [250.0]
+        # stt left empty on purpose.
+        snap = agent_mod._summarize_phone_call_metrics(m)
+        self.assertEqual(snap["watchdog_fired_count"], 2)
+        self.assertEqual(snap["deterministic_fallback_count"], 1)
+        self.assertEqual(
+            snap["headline_latency_ms"],
+            {"median": 300.0, "p95": 500.0, "max": 500.0, "count": 5},
+        )
+        self.assertEqual(snap["provider_first_signal_ms"]["llm"], 410.0)
+        self.assertEqual(snap["provider_first_signal_ms"]["tts"], 250.0)
+        # An empty provider list is an honest None, not a zero.
+        self.assertIsNone(snap["provider_first_signal_ms"]["stt"])
+
+    def test_summary_omits_headline_when_no_sample_was_taken(self) -> None:
+        m = agent_mod._new_phone_call_metrics()
+        m["watchdog_fired_count"] = 3
+        snap = agent_mod._summarize_phone_call_metrics(m)
+        # No headline samples -> the bucket is omitted entirely (not a zero row).
+        self.assertNotIn("headline_latency_ms", snap)
+        self.assertEqual(snap["watchdog_fired_count"], 3)
+        self.assertEqual(
+            snap["provider_first_signal_ms"], {"llm": None, "tts": None, "stt": None}
+        )
+
+    def test_summary_drops_non_finite_and_still_returns_the_counts(self) -> None:
+        m = agent_mod._new_phone_call_metrics()
+        m["headline_samples_ms"] = [float("nan"), float("inf"), 200.0]
+        snap = agent_mod._summarize_phone_call_metrics(m)
+        # Only the one finite sample survives.
+        self.assertEqual(snap["headline_latency_ms"]["count"], 1)
+        self.assertEqual(snap["headline_latency_ms"]["median"], 200.0)
+
+
 if __name__ == "__main__":
     unittest.main()

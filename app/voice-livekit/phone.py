@@ -1753,14 +1753,24 @@ class PhoneEventClient:
         self,
         attempt_id: str,
         session_id: str,
+        metrics: dict[str, Any] | None = None,
     ) -> PhoneApiOutcome:
         """Complete the session, wait for scoring, and verify the row exists.
 
         ``ok`` here means an assessment EXISTS. It is the only thing that
         entitles the worker to post ``assessment.completed`` — and 0044 refuses
         that event anyway when the row is absent, so the claim is gated twice.
+
+        ``metrics`` (optional) is the compact per-call phone observability
+        snapshot. It is a FULL snapshot, included verbatim in the completion
+        body when present. This endpoint is retried up to 20x and re-driven by
+        reconnect legs; the API writes it last-write-wins (a replace, never an
+        increment), so re-sending the same snapshot on every attempt is correct
+        and idempotent. Absent (None) the body is byte-identical to before.
         """
         body = {"attempt_id": str(attempt_id), "session_id": str(session_id)}
+        if metrics is not None:
+            body["metrics"] = metrics
         response = await self._post(ASSESSMENT_COMPLETE_PATH, body, "assessment_complete")
         if isinstance(response, str):
             return PhoneApiOutcome(False, error_category=response)
@@ -4729,17 +4739,126 @@ def phone_fallback_acknowledgement(answer: Any, *, answer_is_question: bool = Fa
     return "Thanks for walking me through that."
 
 
-def phone_fallback_reply(
-    question: Any, answer: Any = None, *, answer_is_question: bool = False,
+#: Sensitivity vocabulary for the deterministic fallback path. The recovery/
+#: watchdog fallback bypasses the LLM (``session.say`` → TTS directly), so it
+#: cannot rely on the model to withhold warmth in a compliance moment. This
+#: mirrors the ``PHONE_TTS_DELIVERY_TEXT`` "never a filler in sensitive moments"
+#: rule: consent, recording disclosure, compensation, a callback confirmation,
+#: and a resume-discrepancy probe must stay clean and direct, never warm-shaped.
+# NOTE: this gate is the ONLY guard on the deterministic fallback path (the LLM's
+# own withhold-warmth rule is bypassed there), so it errs deliberately BROAD —
+# a false positive only costs a plainer opener, a false negative lands warm
+# filler on a compliance turn. Vocabulary widened after the v117 review found
+# real gaps: the idiomatic "call you back" (word between call/back), comp
+# synonyms (pay/wage/remuneration/in-hand/take-home/cost-to-company/comp),
+# consent synonyms (capture/taped), and "mismatch"/"inconsistency".
+_PHONE_SENSITIVE_OBJECTIVE_RE = re.compile(
+    r"\b(?:"
+    r"consent|record(?:ing|ed)?|disclos\w*|captur\w*|tape[ds]?|taping|"
+    r"salary|compensation|package|ctc|lpa|pay\w*|wage\w*|remunerat\w*|comp|"
+    r"in[-\s]?hand|take[-\s]?home|cost[-\s]+to[-\s]+company|"
+    r"call\s+(?:you\s+)?back|ring\s+(?:you\s+)?back|callback|"
+    r"discrepan\w*|mismatch|inconsist\w*|"
+    r"resume|r[eé]sum[eé]"
+    r")\b",
+    re.IGNORECASE,
+)
+
+#: Deterministic warm openers for the expressive fallback. Selected by
+#: ``cursor_index`` (mod length) so rotation is testable and never random. Each
+#: ends in melodic punctuation the first-fragment early-flush logic honours
+#: without producing a sub-``_TTS_FIRST_FRAGMENT_MIN_CHARS`` first fragment:
+#: either a terminal ``.``/``!`` at the end of a >=14-char clause, or a comma
+#: whose leading run is >=14 alphabetic chars. See
+#: ``phone_expressive_fallback`` for the invariant checks.
+_PHONE_EXPRESSIVE_FALLBACK_OPENERS = (
+    "Got it — thanks for that!",
+    "That’s really helpful, thank you.",
+    "Makes sense — appreciate it!",
+    "Perfect, thanks for sharing that.",
+)
+
+
+def phone_fallback_is_sensitive(objective: Any) -> bool:
+    """True when a fallback objective must stay clean and direct (no warmth).
+
+    Combines the compensation predicate with the broader sensitive vocabulary
+    (consent / recording disclosure / callback confirmation / resume
+    discrepancy) so the deterministic fallback never lands warm filler in a
+    compliance moment — the same rule the model prompt enforces for live turns.
+    """
+    if phone_is_compensation_objective(objective):
+        return True
+    return isinstance(objective, str) and bool(
+        _PHONE_SENSITIVE_OBJECTIVE_RE.search(objective)
+    )
+
+
+def phone_expressive_fallback(
+    acknowledgement: str,
+    spoken_question: str,
+    *,
+    cursor_index: int = 0,
+    sensitive: bool = False,
 ) -> str:
-    """Build one interruptible fallback for the snapshotted objective."""
+    """Shape the deterministic fallback so TTS delivers it expressively.
+
+    The recovery/watchdog path speaks via ``session.say`` — straight to Sarvam
+    bulbul:v3, which draws ALL prosody from punctuation because the narrowband
+    line strips acoustic liveliness. The two flat constant acknowledgements
+    therefore sound flat next to the LLM-authored turns (which carry rich
+    punctuation). This replaces the flat acknowledgement with a warm, melodic,
+    deterministically-rotated opener while keeping ``spoken_question`` intact as
+    the semantic payload (the coverage judge and durable transcript depend on
+    it).
+
+    Invariants (verified by tests):
+      * ``spoken_question`` is always a substring of the result.
+      * A SENSITIVE objective returns the PLAIN acknowledgement + question with
+        no warm filler (mirrors the sensitive-moment guard).
+      * The first early-flush fragment is >= ``_TTS_FIRST_FRAGMENT_MIN_CHARS``
+        real characters, so the v114 choppy-tiny-synth regression cannot recur.
+    """
+    spoken = spoken_question.strip() if isinstance(spoken_question, str) else ""
+    if not spoken:
+        return ""
+    if sensitive:
+        ack = (acknowledgement or "").strip()
+        return f"{ack} {spoken}".strip()
+    openers = _PHONE_EXPRESSIVE_FALLBACK_OPENERS
+    try:
+        index = int(cursor_index)
+    except (TypeError, ValueError):
+        index = 0
+    opener = openers[index % len(openers)]
+    return f"{opener} {spoken}"
+
+
+def phone_fallback_reply(
+    question: Any,
+    answer: Any = None,
+    *,
+    answer_is_question: bool = False,
+    cursor_index: int = 0,
+) -> str:
+    """Build one interruptible fallback for the snapshotted objective.
+
+    The acknowledgement is shaped for expressive TTS delivery (see
+    ``phone_expressive_fallback``) unless the objective is sensitive, in which
+    case it stays plain. ``spoken_text`` is preserved as the payload.
+    """
     spoken_question = getattr(question, "spoken_text", None)
     if not isinstance(spoken_question, str) or not spoken_question.strip():
         return ""
     acknowledgement = phone_fallback_acknowledgement(
         answer, answer_is_question=answer_is_question,
     )
-    return f"{acknowledgement} {spoken_question}".strip()
+    return phone_expressive_fallback(
+        acknowledgement,
+        spoken_question,
+        cursor_index=cursor_index,
+        sensitive=phone_fallback_is_sensitive(spoken_question),
+    )
 
 
 def phone_recovery_fallback(snapshot: Any, *, prefix_released: bool) -> str:
