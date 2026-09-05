@@ -4995,26 +4995,33 @@ class TestPhonePromptCacheEnrichment(unittest.TestCase):
             last = idx
 
     def test_stable_prefix_exceeds_gemini_implicit_cache_threshold(self):
+        # HONEST METRIC (2026-09-05): the load-bearing assertion is the Gemini
+        # chars/4 rule-of-thumb, NOT cl100k. Google documents ~4 chars/token for
+        # Gemini English prose, and Gemini's ~256k-vocab tokenizer counts English
+        # MORE SPARSELY than OpenAI's cl100k — so cl100k OVER-counts here and is
+        # the wrong floor. A prior version preferred cl100k when tiktoken was
+        # present (passed locally at ~4,125) but fell to chars/4 on CI (no
+        # tiktoken) where it FAILED at ~2,908. This made local and CI disagree
+        # and hid the real miss: by the conservative Gemini metric the prefix was
+        # UNDER 4,096, so Gemini would not have engaged implicit caching. The
+        # assertion below runs identically on local and CI and reflects Gemini
+        # reality; any cl100k reading is informational only and never gates.
         prefix = self._real_stable_prefix()
+        approx = len(prefix) / 4  # Gemini rule-of-thumb: ~4 chars/token (English)
+        self.assertGreaterEqual(
+            approx, 4096,
+            f"stable phone prefix is ~{approx:.0f} tokens by the Gemini chars/4 "
+            f"rule-of-thumb ({len(prefix)} chars); Gemini implicit caching needs "
+            ">= 4,096. Grow PHONE_PERSONA_DEPTH_TEXT / PHONE_CONVERSATION_FLOW_TEXT.",
+        )
+        # Informational only — cl100k over-counts English vs Gemini, so it must
+        # NOT gate (that is exactly the tokenizer mismatch this test corrects).
         try:
-            import tiktoken  # noqa: PLC0415 — optional; real count when present
-            tokens = len(tiktoken.get_encoding("cl100k_base").encode(prefix))
-            # cl100k is a conservative FLOOR: Gemini's tokenizer is at least as
-            # dense on English prose, so >= this count is the safe lower bound.
-            self.assertGreaterEqual(
-                tokens, 4096,
-                f"stable phone prefix is only {tokens} cl100k tokens; Gemini "
-                "implicit caching needs >= 4,096",
-            )
+            import tiktoken  # noqa: PLC0415 — optional; informational when present
+            _cl100k = len(tiktoken.get_encoding("cl100k_base").encode(prefix))
+            self.assertIsInstance(_cl100k, int)  # measured, never a floor here
         except ImportError:
-            # No tokenizer available: fall back to the documented ~4 chars/token
-            # estimate. This is stricter than cl100k here (4 < ~4.6 chars/token),
-            # so clearing it is a genuine floor, not a vacuous check.
-            approx = len(prefix) / 4
-            self.assertGreaterEqual(
-                approx, 4096,
-                f"stable phone prefix ~{approx:.0f} tokens (chars/4); needs >= 4,096",
-            )
+            pass
 
 
 class TestTtsFirstFragmentBoundary(unittest.TestCase):
